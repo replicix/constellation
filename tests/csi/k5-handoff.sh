@@ -403,7 +403,7 @@ if [ -n "$backup" ]; then
     held=$(k -n "$ns" logs "$backup" -c engine --since="$since" 2>/dev/null | nocolor \
         | grep -c 'holding the seal watch' || true)
     sealed=$(k -n "$ns" logs "$backup" -c engine --since="$since" 2>/dev/null | nocolor \
-        | grep -c 'holder silent: sealed its epoch' || true)
+        | grep -c 'sealed its epoch' || true)
     echo "   backup $backup: hold(s) received $held; sealed the holder's epoch $sealed time(s)"
 else
     echo "   no controller engine pod (no backup)"

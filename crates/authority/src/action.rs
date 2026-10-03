@@ -274,6 +274,9 @@ pub enum TimerKind {
     DelegExpiry,
     /// M11: a delegate renews its grant.
     DelegRenew,
+    /// M11: a delegate gives up a grant left unrenewed past the root's
+    /// reclaim horizon.
+    DelegLapse,
     /// M11: a delegate's stream tick (a batch to send, a lost ack).
     DelegStream,
     Placement,

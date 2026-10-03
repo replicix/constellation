@@ -89,7 +89,7 @@ node acts on it:
 - a continuation epoch's persisted state (the promise to a proposer,
   its membership, the hold) whenever it changes;
 - a backup's seal (and a delegate backup's), before the backup refuses
-  an append, reads the lease to take over, or acknowledges the seal;
+  an append, starts its takeover, or acknowledges the seal;
 - the read-grant horizon a restarted holder quarantines on.
 
 So a power loss can make a node forget work, never a promise it made.
@@ -166,10 +166,21 @@ it has caught up.
 A backup that has heard nothing from its holder for
 `CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s):
 
-1. **seals**: persists and fsyncs "epoch *e* sealed", and answers
+1. re-reads the lease, and continues only if it still names that holder
+   and epoch, still lists this backup, and the holder was not heard
+   while it was read. A backup the lease no longer lists was removed by
+   a live holder (which stops appending once the removal lands, so the
+   backup hears silence): it gives its role and tail up **without
+   sealing**, and the holder may invite it back as a candidate in the
+   same epoch. That is what happens across a `daemon --upgrade` or a K5
+   handoff of the backup node: the holder drops it during the restart
+   gap and brings it back once its link to the new incarnation is
+   connected again (5-23 s here, or longer: the P2P link recovery
+   after a peer restart is slow, an open bug; then the
+   reconfiguration rate limit and the catch-up), instead of
+   running without a backup for the rest of its epoch;
+2. **seals**: persists and fsyncs "epoch *e* sealed", and answers
    every later epoch-*e* append with `sealed`;
-2. re-reads the lease, and continues only if it still names that holder
-   and epoch and still lists this backup;
 3. takes the lease at epoch *e*+1 by CAS, tails S3 to head, and ships an
    epoch marker at the next log slot (a create-if-absent, which fences
    any late segment of the old holder);
@@ -212,6 +223,23 @@ backup gets there first. A new tenure starts with no backups and picks
 them again. A write-back file whose chunks never reached S3 before the
 holder died is held (see [Write-path hygiene](write-path-hygiene.md)),
 not published naming missing chunks.
+
+Without a listed backup (none in budget, or the holder dropped it
+before it died), the dead holder is replaced by a TTL takeover, which
+the lease path starts. A node with an op the holder (or a delegate
+whose stream the holder appends) already accepted, and that waits
+longer than `CONSTELLATION_INBOX_P2P_GRACE_MS` (3 s) for the log to
+carry it, reads the lease from the sync round and takes it over once it
+is claimable ("ops wait for a root whose lease ran out: taking the root
+over"). A lease it last saw live is not read again before the expiry it
+showed, so a slow but live holder costs about one read per renewal, and
+a suspended node reads nothing. A live holder's lease is never
+claimable, and nothing is asked of a live holder: the takeover neither
+registers in `wanted_by` nor requests a handoff, even when its own read
+finds the holder renewed. Such an op used to wait for its client
+deadline (2 × TTL) and end in doubt first. A delegate's own writes take
+the lease path once its unrenewed grant lapses (see
+[Delegations](delegations.md#failures)).
 
 ### Layer C: `ack=s3`
 
@@ -776,7 +804,8 @@ See [Configuration](../configuration.md) for parsing rules.
   `acks_waited`, `ack_wait_ms_total`, `acks_aborted`; streaming:
   `streamed_ahead`, `streamed_installed`, `streamed_dropped`; failover:
   `seals`, `backup_takeovers`, `backup_tail_applied`,
-  `s3_fast_takeovers` (triggers, not wins), `ack_floor_waits`,
+  `s3_fast_takeovers` (triggers, not wins), `dead_root_acquires` (TTL
+  takeovers started for ops waiting on a dead root), `ack_floor_waits`,
   `stale_liveness_refusals`, `epoch_carry_refused`,
   `refusals_journaled`, `reads_durability_blocked`;
 - `epoch`: `epoch_slack`, `carrier`, `promise_until_ms`,

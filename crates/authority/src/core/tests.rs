@@ -5403,8 +5403,9 @@ mod epoch_rules {
         assert_eq!(watch.len(), 1);
         h.advance(2_000);
         let out = h.step(Event::Timer { id: watch[0] });
-        assert_eq!(h.core.bk.sealed, 1, "silence after the close seals");
         assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
+        answer_takeover_read(&mut h, &out);
+        assert_eq!(h.core.bk.sealed, 1, "silence after the close seals");
     }
 
     /// Plan 37 §8: a holder replaced on its own state dir asks its backup
@@ -5457,11 +5458,12 @@ mod epoch_rules {
         let watch = timers(&out, TimerKind::BackupWatch)[0];
         h.advance(1_000);
         let out = h.step(Event::Timer { id: watch });
+        assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
+        answer_takeover_read(&mut h, &out);
         assert_eq!(
             h.core.bk.sealed, 1,
             "silence after the successor's append seals"
         );
-        assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
 
         // A holder that never comes back: sealed once the hold — capped
         // at `BACKUP_HOLD_MAX_MS`, whatever it asked — has passed.
@@ -5475,7 +5477,8 @@ mod epoch_rules {
         assert_eq!(h.core.bk.sealed, 0, "sealed inside the capped hold");
         watch = timers(&out, TimerKind::BackupWatch)[0];
         h.advance(2_000);
-        h.step(Event::Timer { id: watch });
+        let out = h.step(Event::Timer { id: watch });
+        answer_takeover_read(&mut h, &out);
         assert_eq!(h.core.bk.sealed, 1, "the hold outlived its cap");
     }
 }
@@ -7039,16 +7042,16 @@ mod backup_crash {
             },
         });
         let watch = timers(&out, TimerKind::BackupWatch)[0];
-        // The holder falls silent: seal, read the lease, take over.
+        // The holder falls silent: read the lease, seal, take over.
         h.advance(5_000);
         let out = h.step(Event::Timer { id: watch });
-        assert_eq!(h.core.bk.sealed, 1);
         let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
         let theirs = backup_lease(1, 1, h.now.plus(4_000).0, vec![2]);
         let out = h.step(Event::S3 {
             op: get,
             result: S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
         });
+        assert_eq!(h.core.bk.sealed, 1);
         let rewatch = timers(&out, TimerKind::BackupWatch)[0];
         let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
         let out = h.step(Event::S3 {
@@ -7502,10 +7505,11 @@ mod backup_crash {
             assert_eq!(h.core.stats.seals, 0, "{out:?}");
             let watch = timers(&out, TimerKind::BackupWatch)[0];
             h.advance(1_600);
-            h.step(Event::Timer { id: watch });
+            let out = h.step(Event::Timer { id: watch });
+            answer_takeover_read(&mut h, &out);
             assert_eq!(
                 h.core.stats.seals, 1,
-                "a holder silent over a live link is sealed"
+                "a holder silent over a live link (and still listing it) is sealed"
             );
         }
     }
@@ -13410,4 +13414,640 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
             .collect::<Vec<_>>(),
         vec![(dir, 2)]
     );
+}
+
+/// A replica of node `me` whose table delegates `/d` to `me` as
+/// generation 7 (the root is node 1). Returns the directory.
+fn delegated_to_me(meta: &Meta, me: NodeId) -> constellation_fs_core::Ino {
+    let dir = meta.allocate_ino(ROOT_INO).unwrap();
+    crate::replica::Replica::apply_segment(
+        meta,
+        1,
+        1,
+        0,
+        &[],
+        &[],
+        &[
+            LogRecord::Mkdir {
+                parent: ROOT_INO,
+                name: "d".into(),
+                ino: dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            },
+            LogRecord::Delegate {
+                dir,
+                node: me,
+                gen: 7,
+                designated: false,
+                range: (0, 0),
+            },
+        ],
+    )
+    .unwrap();
+    dir
+}
+
+fn renew_req(out: &[Action], gen: u64) -> Option<OpId> {
+    sends(out).into_iter().find_map(|(_, m)| match m {
+        PeerMsg::DelegRenew { req, gen: g, .. } if *g == gen => Some(*req),
+        _ => None,
+    })
+}
+
+fn renewed(req: OpId, gen: u64, ttl_ms: u64) -> Event {
+    Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegRenewed {
+            req,
+            gen,
+            ttl_ms,
+            locks: Vec::new(),
+            lock_grace_ms: 0,
+            lock_floor: Default::default(),
+        },
+    }
+}
+
+/// The K5a fix round's post-handoff stall: a delegate restarted with its
+/// node identity and journal (a K5 handoff, `daemon --upgrade`, a crash
+/// and remount) installed nothing at start — only a `Delegate`/`Recall`
+/// segment ran the table sync — so its writes under the subtree bounced
+/// between the root (`NotHolder` naming it) and itself until the root
+/// reclaimed the grant nobody renewed (about 4 s on kind, 7 s in the
+/// harness). Now `start` re-adopts it: installed and renewed at once,
+/// and the first renewal's answer lets it execute locally again.
+#[test]
+fn a_restarted_delegate_readopts_its_delegation_at_start() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_node_prefix(3).unwrap();
+    let dir = delegated_to_me(&meta, 3);
+    let mut cfg = Config::defaults(3, 1);
+    cfg.delegation = true;
+    cfg.p2p = true;
+    let mut core = Core::new(cfg);
+    core.lease.cached_holder = Some(1);
+    let now = Ms(1_000_000);
+    let mut out = Vec::new();
+    core.start(now, &meta, &mut out);
+    assert!(core.dl.mine.contains_key(&7), "not re-adopted at start");
+    let req = renew_req(&out, 7).expect("no renewal sent at start");
+    assert!(
+        sends(&out)
+            .iter()
+            .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::DelegRenew { gen: 7, .. })),
+        "{out:?}"
+    );
+    let mut h = Harness { core, meta, now };
+    h.advance(2);
+    h.step(renewed(req, 7, 5_000));
+    assert!(
+        h.core.dl.mine[&7].until > h.now,
+        "the renewal was not honoured"
+    );
+    // A write under the subtree executes here, as the delegate.
+    let rid = h.rid(1);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "f".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    assert!(
+        !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+        "forwarded instead of executed: {out:?}"
+    );
+    assert!(
+        replies(&out).iter().any(|(r, _)| *r == rid),
+        "not answered: {out:?}"
+    );
+    assert_eq!(h.core.dl.mine[&7].executed, 1);
+}
+
+/// A delegate of `/d` (generation 7, root node 1) whose renewal was
+/// granted once and which then lost the root: its own write under the
+/// subtree is parked on a renewal nobody answers. Returns the harness,
+/// the directory, the parked op's rid and the lapse watch to fire.
+fn delegate_parked_on_a_silent_root() -> (Harness, constellation_fs_core::Ino, Rid, TimerId) {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    let ttl = 5_000;
+    let margin = h.core.cfg.expiry_margin_ms;
+    let out = h.step(renewed(req, 7, ttl));
+    let until = h.core.dl.mine[&7].until;
+    assert_eq!(until, h.now.plus(ttl - margin));
+    let lapse = timers(&out, TimerKind::DelegLapse);
+    assert_eq!(
+        lapse.len(),
+        1,
+        "no lapse watch armed by the renewal: {out:?}"
+    );
+    // The root goes silent: past the grant, the delegate's write parks
+    // on a renewal nobody answers.
+    h.advance(ttl);
+    let rid = h.rid(1);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "f".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    assert_eq!(h.core.stats.deleg_parked_expired, 1, "{out:?}");
+    assert!(renew_req(&out, 7).is_some(), "no renewal for the parked op");
+    assert!(replies(&out).is_empty());
+    // Before the lapse point the watch only re-arms.
+    let at = until.plus(2 * margin);
+    assert!(h.now < at);
+    let out = h.step(Event::Timer { id: lapse[0] });
+    assert!(!h.core.dl.mine[&7].lapsed, "lapsed too early");
+    let lapse = timers(&out, TimerKind::DelegLapse);
+    assert_eq!(lapse.len(), 1, "the watch was not re-armed: {out:?}");
+    h.now = at;
+    (h, dir, rid, lapse[0])
+}
+
+/// The K5a fix round's minutes-long `fsync`: the root died while this
+/// node was its delegate (and no longer its backup, so only a TTL
+/// takeover can replace it). The delegate's own write parked on a
+/// renewal of the lapsed grant, which a dead root never answers, so it
+/// never took the forward, inbox and lease path that starts the TTL
+/// takeover: it waited for good. Now a grant left unrenewed past the
+/// root's earliest reclaim (`until + 2 × margin`) lapses: the parked op
+/// is forwarded to the root (whose silence leads to the inbox and the
+/// lease path), nothing executes or parks under the generation, and the
+/// renewals go on.
+#[test]
+fn a_delegate_gives_up_a_grant_its_dead_root_never_renews() {
+    let (mut h, dir, rid, lapse) = delegate_parked_on_a_silent_root();
+    let out = h.step(Event::Timer { id: lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 1);
+    let d = &h.core.dl.mine[&7];
+    assert!(d.lapsed && !d.stopped, "{d:?}");
+    assert!(d.parked.is_empty());
+    // The root is unreachable (no link): the op re-reads the lease to
+    // learn where to go (then the inbox, or the lease path).
+    learns_the_holder(&h, &out, rid);
+    // A new write under the subtree takes the same route, not a park.
+    let rid2 = h.rid(2);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "g".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: rid2,
+        op,
+    });
+    assert!(
+        h.core.dl.mine[&7].parked.is_empty(),
+        "parked again: {out:?}"
+    );
+    learns_the_holder(&h, &out, rid2);
+    // The renewals go on while the root stays silent: one per request
+    // timeout, on the lapsed generation's own timer.
+    for _ in 0..5 {
+        let retry = timers(&out_of_renew_timer(&mut h), TimerKind::DelegRenew);
+        assert_eq!(retry.len(), 1, "no renewal retry armed");
+    }
+    assert_eq!(h.core.dl.mine[&7].executed, 0);
+}
+
+/// `rid` left the delegate's park for the ordinary route to an
+/// unreachable root: the lease read that learns the holder is issued.
+fn learns_the_holder(h: &Harness, out: &[Action], rid: Rid) {
+    assert!(
+        matches!(h.core.clients[&rid].phase, client::Phase::LearnHolder),
+        "{:?}",
+        h.core.clients[&rid].phase
+    );
+    assert!(
+        s3_ops(out).iter().any(|(_, r)| matches!(r, S3Op::LeaseGet)),
+        "no lease read for the route: {out:?}"
+    );
+}
+
+/// Advances to the next renewal retry of generation 7 and fires it,
+/// expecting a renewal sent (the last one timed out). The actions.
+fn out_of_renew_timer(h: &mut Harness) -> Vec<Action> {
+    let t = h.core.dl.mine[&7].renew_timer.expect("no renewal timer");
+    h.advance(h.core.deleg_request_timeout_ms());
+    let out = h.step(Event::Timer { id: t });
+    assert!(renew_req(&out, 7).is_some(), "no renewal sent: {out:?}");
+    out
+}
+
+/// Review should-fix 4: a lapse is not the end of a delegation. A link
+/// that recovers before the root reclaims answers the renewal, the grant
+/// is honoured again and the next write under the subtree executes here;
+/// a refusal (the root reclaimed or recalls) stops the generation.
+#[test]
+fn a_lapsed_delegation_renewed_before_the_reclaim_executes_again() {
+    let (mut h, dir, _rid, lapse) = delegate_parked_on_a_silent_root();
+    h.step(Event::Timer { id: lapse });
+    assert!(h.core.dl.mine[&7].lapsed);
+    let out = out_of_renew_timer(&mut h);
+    let req = renew_req(&out, 7).unwrap();
+    h.advance(2);
+    h.step(renewed(req, 7, 5_000));
+    let d = &h.core.dl.mine[&7];
+    assert!(!d.lapsed && !d.stopped && d.until > h.now, "{d:?}");
+    let rid = h.rid(3);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "h".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+    });
+    assert!(
+        replies(&out).iter().any(|(r, _)| *r == rid),
+        "not executed here: {out:?}"
+    );
+    assert_eq!(h.core.dl.mine[&7].executed, 1);
+    // A fresh lapse watch, and a refusal after the next lapse stops it.
+    let (mut h, _dir, _rid, lapse) = delegate_parked_on_a_silent_root();
+    h.step(Event::Timer { id: lapse });
+    let out = out_of_renew_timer(&mut h);
+    let req = renew_req(&out, 7).unwrap();
+    h.step(renewed(req, 7, 0));
+    let d = &h.core.dl.mine[&7];
+    assert!(d.stopped, "{d:?}");
+    assert!(d.renew_timer.is_none());
+}
+
+fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {
+    Lease {
+        v: 1,
+        partition: "p0".into(),
+        holder,
+        epoch,
+        expires_unix_ms: expires.0,
+        released: false,
+        wanted_by: Vec::new(),
+        backups: Vec::new(),
+        config_version: 1,
+        ack_policy: constellation_store_s3::AckPolicy::Local,
+        granted_delegations: false,
+        retired: Vec::new(),
+    }
+}
+
+/// The K5a fix round's root loss, seen from a third node: its op was
+/// accepted (by the root, or a delegate whose stream the root appends)
+/// and waits for the log, and the root dies with no backup. Nothing put
+/// the node on the lease path, so the TTL takeover only came from the
+/// op's retry after its client deadline (2 × TTL, `EIO` in between).
+/// Now a node with such an op older than the inbox's P2P grace reads the
+/// lease each round and takes the root over once it ran out; a live
+/// root's lease is left alone (no acquisition, no `wanted_by`).
+#[test]
+fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_out() {
+    let (mut h, _rid, _) = awaiting_log_forward("dr");
+    let mut out = Vec::new();
+    h.core.dead_root_check(h.now, &mut out);
+    assert!(s3_ops(&out).is_empty(), "read within the grace: {out:?}");
+    h.advance(h.core.cfg.inbox_p2p_grace_ms);
+    let mut out = Vec::new();
+    h.core.dead_root_check(h.now, &mut out);
+    let read = s3_ops(&out);
+    assert!(
+        matches!(read.as_slice(), [(_, S3Op::LeaseGet)]),
+        "no lease read: {out:?}"
+    );
+    let op = read[0].0;
+    // One read at a time.
+    let mut again = Vec::new();
+    h.core.dead_root_check(h.now, &mut again);
+    assert!(s3_ops(&again).is_empty(), "{again:?}");
+    // A live root: nothing is asked of it.
+    let live = root_lease(1, 1, h.now.plus(5_000));
+    let out = h.step(Event::S3 {
+        op,
+        result: S3Result::LeaseGet(Ok(Some((live, tag())))),
+    });
+    assert_eq!(h.core.stats.dead_root_acquires, 0);
+    assert!(h.core.job.is_none(), "an acquisition against a live root");
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. })),
+        "{out:?}"
+    );
+    // Seen live, the lease is not read again before the expiry it showed.
+    h.advance(4_999);
+    let mut out = Vec::new();
+    h.core.dead_root_check(h.now, &mut out);
+    assert!(
+        s3_ops(&out).is_empty(),
+        "re-read a lease seen live: {out:?}"
+    );
+    // A released lease is no dead root's (it shipped everything).
+    h.advance(1);
+    let mut out = Vec::new();
+    h.core.dead_root_check(h.now, &mut out);
+    let op = s3_ops(&out)[0].0;
+    let mut released = root_lease(1, 1, Ms(h.now.0 - 1));
+    released.released = true;
+    h.step(Event::S3 {
+        op,
+        result: S3Result::LeaseGet(Ok(Some((released, tag())))),
+    });
+    assert_eq!(h.core.stats.dead_root_acquires, 0);
+    assert!(h.core.job.is_none(), "took a released lease");
+    // The root's lease ran out: the next round's read takes it over.
+    h.advance(6_000);
+    let mut out = Vec::new();
+    h.core.dead_root_check(h.now, &mut out);
+    let op = s3_ops(&out)[0].0;
+    let expired = root_lease(1, 1, Ms(h.now.0 - 1));
+    let out = h.step(Event::S3 {
+        op,
+        result: S3Result::LeaseGet(Ok(Some((expired, tag())))),
+    });
+    assert_eq!(h.core.stats.dead_root_acquires, 1);
+    assert_eq!(
+        h.core.job.as_ref().map(|j| j.kind()),
+        Some(super::jobs::JobKind::Acquire),
+        "no acquisition started: {out:?}"
+    );
+}
+
+/// Drives a dead-root check of `h` (an op waiting for the log past the
+/// grace) to its acquisition: the check's read sees node 1's lease run
+/// out. Returns the acquisition's actions so far.
+fn dead_root_acquisition(h: &mut Harness) -> Vec<Action> {
+    h.advance(h.core.cfg.inbox_p2p_grace_ms);
+    let mut out = Vec::new();
+    h.core.dead_root_check(h.now, &mut out);
+    let op = s3_ops(&out)[0].0;
+    let expired = root_lease(1, 1, Ms(h.now.0 - 1));
+    let out = h.step(Event::S3 {
+        op,
+        result: S3Result::LeaseGet(Ok(Some((expired, tag())))),
+    });
+    assert_eq!(h.core.stats.dead_root_acquires, 1);
+    out
+}
+
+/// Answers the acquisition job's own lease read with `lease`: the
+/// actions that follow.
+fn answer_job_read(h: &mut Harness, out: &[Action], lease: Lease) -> Vec<Action> {
+    let reads: Vec<_> = s3_ops(out)
+        .into_iter()
+        .filter(|(_, r)| matches!(r, S3Op::LeaseGet))
+        .collect();
+    let [(op, _)] = reads.as_slice() else {
+        panic!("expected the acquisition's lease read: {out:?}")
+    };
+    h.step(Event::S3 {
+        op: *op,
+        result: S3Result::LeaseGet(Ok(Some((lease, tag())))),
+    })
+}
+
+fn asks_nothing_of_the_holder(h: &Harness, out: &[Action]) {
+    assert!(
+        s3_ops(out)
+            .iter()
+            .all(|(_, r)| !matches!(r, S3Op::LeaseSwap { .. })),
+        "registered in wanted_by: {out:?}"
+    );
+    assert!(
+        !sends(out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::LeaseRequest { .. })),
+        "asked the holder for a handoff: {out:?}"
+    );
+    assert!(h.core.job.is_none(), "the acquisition did not end");
+    assert!(h.core.lease.held.is_none());
+}
+
+/// Review must-fix 1: a dead-root takeover only claims a lease that ran
+/// out. When the acquisition's own read finds the root live again (a
+/// slow root renewed between the check's read and the job's), the plan
+/// is `Busy` — and the node neither registers in `wanted_by` (which
+/// would make the live root hand over) nor asks it for the lease.
+#[test]
+fn a_dead_root_takeover_that_finds_the_root_renewed_asks_it_nothing() {
+    let (mut h, _rid, _) = awaiting_log_forward("drb");
+    let out = dead_root_acquisition(&mut h);
+    let live = root_lease(1, 1, h.now.plus(5_000));
+    let out = answer_job_read(&mut h, &out, live);
+    asks_nothing_of_the_holder(&h, &out);
+}
+
+/// Review must-fix 1, the backup case: the dead root's lease is a
+/// `Backup` lease listing another node, and this node is not a listed
+/// backup. Within `backup_claim_grace_ms` past the expiry the plan is
+/// `Busy`, and a `wanted_by` swap would replace the lease object under
+/// the listed backup's claim CAS: nothing is written.
+#[test]
+fn a_dead_root_takeover_leaves_a_backup_lease_in_its_claim_grace_alone() {
+    let (mut h, _rid, _) = awaiting_log_forward("drg");
+    let out = dead_root_acquisition(&mut h);
+    let mut lease = root_lease(1, 1, Ms(h.now.0 - 1));
+    lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+    lease.backups = vec![3];
+    let out = answer_job_read(&mut h, &out, lease);
+    asks_nothing_of_the_holder(&h, &out);
+}
+
+/// Review should-fix 1: under a root that is live but slow (its ship
+/// or an upload hold keeps an op waiting for the log), the dead-root
+/// check reads the lease about once per renewal period, not once per
+/// sync round. Here: 60 s of 500 ms rounds against a root renewing a
+/// 10 s lease every 5 s — 6 reads instead of 120.
+#[test]
+fn the_dead_root_check_reads_a_slow_live_roots_lease_once_per_renewal() {
+    let (mut h, _rid, _) = awaiting_log_forward("drs");
+    h.advance(h.core.cfg.inbox_p2p_grace_ms);
+    let start = h.now;
+    let renewal = 5_000;
+    let ttl = 10_000;
+    let mut reads = 0;
+    while h.now.since(start) < 60_000 {
+        let mut out = Vec::new();
+        h.core.dead_root_check(h.now, &mut out);
+        if let [(op, S3Op::LeaseGet)] = s3_ops(&out).as_slice() {
+            reads += 1;
+            // The root's last renewal, on its 5 s cadence.
+            let renewed = start.plus((h.now.since(start) as u64 / renewal) * renewal);
+            let out = h.step(Event::S3 {
+                op: *op,
+                result: S3Result::LeaseGet(Ok(Some((root_lease(1, 1, renewed.plus(ttl)), tag())))),
+            });
+            assert!(
+                h.core.job.is_none(),
+                "an acquisition against a live root: {out:?}"
+            );
+        }
+        h.advance(500);
+    }
+    assert_eq!(h.core.stats.dead_root_acquires, 0);
+    eprintln!("dead-root lease reads over 60 s of rounds: {reads}");
+    assert!(
+        reads <= 7,
+        "{reads} lease reads in 60 s (one per round would be 120)"
+    );
+    // Suspended: no read at all.
+    h.advance(ttl);
+    h.core.mode.suspended = true;
+    let mut out = Vec::new();
+    h.core.dead_root_check(h.now, &mut out);
+    assert!(s3_ops(&out).is_empty(), "read while suspended: {out:?}");
+}
+
+/// Answers the silence watch's lease read in `out` with node 1's live
+/// `Backup` lease at epoch 1 that lists node 2 (this backup).
+fn answer_takeover_read(h: &mut Harness, out: &[Action]) -> Vec<Action> {
+    let mut lease = root_lease(1, 1, h.now.plus(5_000));
+    lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+    lease.backups = vec![2];
+    answer_job_read(h, out, lease)
+}
+
+/// Should-fix 5 of the delegate-root-loss review: a backup the live
+/// holder removed (across its own restart gap — a `daemon --upgrade`, a
+/// K5 handoff — or under load) hears nothing once the removal lands.
+/// Before, that silence sealed the epoch 1.5 s later, the sealed node
+/// refused every later append of it, and the holder ran without a
+/// backup for the rest of its tenure (a TTL failover, not a seal). Now
+/// the watch reads the lease first: unlisted, it gives the role up
+/// without sealing, and the holder's next invitation (a candidate's
+/// append at the same epoch) is acknowledged.
+#[test]
+fn a_backup_its_live_holder_removed_does_not_seal_and_can_be_invited_back() {
+    let append = |req| Event::Peer {
+        from: 1,
+        msg: PeerMsg::BackupAppend {
+            req: OpId(req),
+            epoch: 1,
+            holder: 1,
+            config_version: 2,
+            from: 1,
+            txs: Vec::new(),
+            through: 0,
+        },
+    };
+    let mut h = Harness::new(2);
+    let out = h.step(append(7));
+    let watch = timers(&out, TimerKind::BackupWatch)[0];
+    // The holder removed this node and stopped appending.
+    h.advance(2_000);
+    let out = h.step(Event::Timer { id: watch });
+    assert_eq!(h.core.bk.sealed, 0, "sealed before reading the lease");
+    let mut unlisted = root_lease(1, 1, h.now.plus(50_000));
+    unlisted.config_version = 3;
+    answer_job_read(&mut h, &out, unlisted);
+    assert_eq!(h.core.bk.sealed, 0, "sealed a live holder that removed it");
+    assert_eq!(h.core.stats.seals, 0);
+    assert!(
+        h.core.bk.role.is_none(),
+        "kept the role it was removed from"
+    );
+    assert!(h.core.job.is_none(), "took over a live holder's lease");
+    // The holder invites it back as a candidate, in the same epoch.
+    h.advance(3_000);
+    let out = h.step(append(8));
+    assert!(
+        matches!(
+            sends(&out).as_slice(),
+            [(1, PeerMsg::BackupAck { sealed: false, .. })]
+        ),
+        "refused the invitation: {out:?}"
+    );
+}
+
+/// The read before the seal: a holder heard while it is in flight is
+/// alive, and its epoch is not sealed even though the lease (read
+/// before that append) lists this node.
+#[test]
+fn a_holder_heard_while_the_lease_is_read_is_not_sealed() {
+    let append = |req| Event::Peer {
+        from: 1,
+        msg: PeerMsg::BackupAppend {
+            req: OpId(req),
+            epoch: 1,
+            holder: 1,
+            config_version: 2,
+            from: 1,
+            txs: Vec::new(),
+            through: 0,
+        },
+    };
+    let mut h = Harness::new(2);
+    let out = h.step(append(7));
+    let watch = timers(&out, TimerKind::BackupWatch)[0];
+    h.advance(2_000);
+    let read = h.step(Event::Timer { id: watch });
+    h.advance(100);
+    h.step(append(8));
+    h.advance(100);
+    let out = answer_takeover_read(&mut h, &read);
+    assert_eq!(h.core.bk.sealed, 0, "sealed a holder that spoke: {out:?}");
+    assert!(h.core.job.is_none());
+    assert!(h.core.bk.role.is_some());
+}
+
+/// A continuation epoch that opens while the lease is read: a member of
+/// an open epoch never seals (rule (b)); `backup_watch_after_epoch`
+/// re-arms the watch once the epoch closes.
+#[test]
+fn a_continuation_epoch_opened_during_the_takeover_read_blocks_the_seal() {
+    let mut h = Harness::new(2);
+    let out = h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::BackupAppend {
+            req: OpId(7),
+            epoch: 1,
+            holder: 1,
+            config_version: 2,
+            from: 1,
+            txs: Vec::new(),
+            through: 0,
+        },
+    });
+    let watch = timers(&out, TimerKind::BackupWatch)[0];
+    h.advance(2_000);
+    let read = h.step(Event::Timer { id: watch });
+    h.core.epoch.open = true;
+    h.advance(100);
+    let out = answer_takeover_read(&mut h, &read);
+    assert_eq!(h.core.bk.sealed, 0, "sealed inside an open epoch: {out:?}");
+    assert_eq!(h.core.stats.seals, 0);
+    assert!(h.core.job.is_none());
 }

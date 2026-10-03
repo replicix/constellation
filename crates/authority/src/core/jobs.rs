@@ -1809,6 +1809,7 @@ impl Core {
                         ask_handoff: false,
                     });
                 }
+                self.dead_root_check(now, out);
                 // A holder with nothing else to ship may still sit on a
                 // stale backlog of read-time bumps (plan 29 M3b).
                 if attempts == 0
@@ -1821,6 +1822,98 @@ impl Core {
             }
             Err(error) => self.finish_round(now, Some(error), replica, out),
         }
+    }
+
+    /// A root that dies with no backup is replaced only by a TTL
+    /// takeover, and only the lease path starts one. An op a sequencer
+    /// accepted that waits for the log to carry it (`AwaitingLog`: the
+    /// root's append, or a delegate's stream appended by the root) is on
+    /// no path at all: with the root dead it waited out its client
+    /// deadline (2 × TTL) before its retry took the lease path. So a
+    /// node with such an op older than the inbox's P2P grace reads the
+    /// lease each round, and takes the root over once the lease ran out
+    /// unrenewed (`on_dead_root_get`); a live root's lease never does,
+    /// and nothing is asked of a live holder. A lease last seen live is
+    /// not read again before the expiry it showed (a holder that is only
+    /// slow renews before then), so the check costs about one read per
+    /// renewal period, not one per round; nor while suspended, where the
+    /// acquisition is refused anyway.
+    pub(crate) fn dead_root_check(&mut self, now: Ms, out: &mut Vec<Action>) {
+        // (This node's own unexpired lease, an epoch close's pending
+        // re-claim, is no dead root's either.)
+        let seen_live = self
+            .lease
+            .last_seen
+            .as_ref()
+            .is_some_and(|l| l.holder != 0 && !l.released && !l.is_expired(now.0));
+        if self.dead_root_get
+            || seen_live
+            || self.mode.suspended
+            || self.lease.held.is_some()
+            || self.lease.lost
+            || self.lease.gate.is_some()
+            || self.epoch.active
+            || self.lease.epoch_held()
+            || !self.awaits_dead_root(now)
+            || self
+                .queued_jobs
+                .iter()
+                .any(|j| matches!(j, JobReq::Acquire { .. }))
+        {
+            return;
+        }
+        self.dead_root_get = true;
+        self.issue_s3(S3Op::LeaseGet, S3For::DeadRoot, out);
+    }
+
+    fn awaits_dead_root(&self, now: Ms) -> bool {
+        let grace = self.cfg.inbox_p2p_grace_ms as i64;
+        self.clients.values().any(|c| {
+            matches!(c.phase, super::client::Phase::AwaitingLog { .. })
+                && now.since(c.submitted) >= grace
+        })
+    }
+
+    pub(crate) fn on_dead_root_get(
+        &mut self,
+        now: Ms,
+        result: S3Result,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.dead_root_get = false;
+        let S3Result::LeaseGet(Ok(Some((lease, _)))) = result else {
+            return;
+        };
+        self.lease.note_object(now, &lease);
+        // Only a lease that ran out unrenewed is a dead root's: a released
+        // one was let go with everything shipped (the op's records come
+        // with the next tail), and taking it would only move it.
+        if lease.holder == 0
+            || lease.holder == self.cfg.node_id
+            || lease.released
+            || !lease.is_expired(now.0)
+            || self.lease.held.is_some()
+            || !self.awaits_dead_root(now)
+        {
+            return;
+        }
+        self.stats.dead_root_acquires += 1;
+        tracing::warn!(
+            node = self.cfg.node_id,
+            holder = lease.holder,
+            epoch = lease.epoch,
+            "ops wait for a root whose lease ran out: taking the root over"
+        );
+        self.enqueue_job(
+            now,
+            JobReq::Acquire {
+                reason: "dead-root",
+                ask_handoff: false,
+            },
+            replica,
+            out,
+        );
     }
 
     fn round_publish(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
@@ -2467,11 +2560,16 @@ impl Core {
                 // released to a node whose burst had ended, while it was
                 // writing itself, and had to take the lease back through
                 // S3 (seconds of stalled writes and reads at 300 ms per
-                // request; EC2 campaign 6, visibility-s3-latency).
+                // request; EC2 campaign 6, visibility-s3-latency). Nor for
+                // a dead-root takeover: it only claims a lease that ran
+                // out, so a holder it finds live (renewed since the
+                // check's read, or a dead `Backup` holder whose listed
+                // backups are still in their claim grace) is asked for
+                // nothing.
                 let offered = matches!(
                     &self.job.as_ref().expect("job").what,
                     What::Acquire {
-                        reason: "claim-offer",
+                        reason: "claim-offer" | "dead-root",
                         ..
                     }
                 );

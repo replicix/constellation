@@ -100,6 +100,8 @@ fn staged(path: &Path, data: &[u8]) -> Result<std::fs::File> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .create(true)
+        .truncate(false)
         .open(path)?;
     f.write_all(data)?;
     Ok(f)

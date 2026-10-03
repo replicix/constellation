@@ -310,6 +310,8 @@ fn replay_seed() {
         Ok("delegated-epoch") => delegated_epoch_config(),
         Ok("delegated-faults") => delegated_faults_config(),
         Ok("delegated-root-crash") => delegated_root_crash_config(),
+        Ok("delegated-root-gone") => delegated_root_gone_config(),
+        Ok("delegated-delegate-restart") => delegated_delegate_restart_config(),
         Ok("delegated-two-gens-root-crash") => delegated_two_gens_root_crash_config(),
         Ok("delegated-backup") => delegated_backup_config(),
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
@@ -2592,6 +2594,8 @@ fn sweep_config() {
         "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
         "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
+        "delegated-root-gone" => delegated_root_gone_config(),
+        "delegated-delegate-restart" => delegated_delegate_restart_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
         "placement-hot" => placement_hot_config(),
         "backup-hot" => backup_hot_config(),
@@ -2814,6 +2818,56 @@ fn delegated_root_crash_config() -> SimConfig {
             at_ms: 1_500,
             kind: FaultKind::CrashHolder {
                 restart_ms: Some(5_000),
+                keep_journal: true,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// The K5a fix round's minutes-long `fsync`: the root dies with live
+/// delegates and no backup, so only a TTL takeover replaces it. A
+/// delegate's own writes parked on renewals the dead root never answered
+/// and never took the path that starts the takeover; now a grant left
+/// unrenewed past the root's earliest reclaim lapses and its writes
+/// take the ordinary route (forward, inbox, lease). The client deadline
+/// (2 × TTL, which ended the parked wait in doubt) is raised far past
+/// the TTL takeover, so a wait on a renewal shows as one.
+fn delegated_root_gone_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.acquire_deadline_ms = 60_000;
+            c
+        }),
+        cross_ratio: 0.0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            // Back long after the TTL takeover (so its own unshipped
+            // writes, lost with it under `Local`, replay as they do when
+            // a holder returns: forever gone, the session checker could
+            // not tell them from a violation).
+            kind: FaultKind::CrashHolder {
+                restart_ms: Some(40_000),
+                keep_journal: true,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// The K5a fix round's post-handoff stall: the delegate of `d1`
+/// restarts with its journal well inside its grant (a handoff, an
+/// upgrade). It re-adopts the generation at start and renews it, so the
+/// root never reclaims it.
+fn delegated_delegate_restart_config() -> SimConfig {
+    SimConfig {
+        cross_ratio: 0.0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CrashNode {
+                node: 2,
+                restart_ms: Some(200),
                 keep_journal: true,
             },
         }],
@@ -3063,6 +3117,10 @@ struct M11Totals {
     designated: u64,
     deleg_reads: u64,
     deleg_read_grants: u64,
+    lapsed: u64,
+    dead_root_acquires: u64,
+    in_doubt: usize,
+    longest_submit_ms: u64,
 }
 
 impl M11Totals {
@@ -3101,8 +3159,12 @@ impl M11Totals {
             self.designated += s.deleg_designated;
             self.deleg_reads += s.deleg_read_index_served;
             self.deleg_read_grants += s.deleg_read_grants;
+            self.lapsed += s.deleg_lapsed;
+            self.dead_root_acquires += s.dead_root_acquires;
         }
         self.marker_checks += r.marker_checks;
+        self.in_doubt += r.in_doubt_answers;
+        self.longest_submit_ms = self.longest_submit_ms.max(r.longest_submit_ms);
         self.dirs_checked += r.dirs_checked;
         self.epochs += r.epochs_formed;
     }
@@ -3213,6 +3275,63 @@ fn delegated_root_failover_keeps_every_ack() {
         "no successor inherited a generation: {t:?}"
     );
     assert!(t.restreams > 0, "no delegate re-streamed: {t:?}");
+}
+
+/// The root dies with live delegates and no backup (back only after
+/// 40 s): the delegates' unrenewed grants lapse, the ops waiting for the
+/// dead root's appends take the root over by TTL (the dead-root check),
+/// every
+/// acknowledged op survives and every op completes within the TTL
+/// takeover's bound.
+#[test]
+fn delegated_root_loss_hands_the_writes_to_a_ttl_successor() {
+    let t = run_m11(
+        "delegated-root-gone",
+        delegated_root_gone_config(),
+        66_500..66_530,
+    );
+    assert!(t.lapsed > 0, "no delegate's grant lapsed: {t:?}");
+    assert!(
+        t.dead_root_acquires > 0,
+        "no op waiting for the dead root's append took the root over: {t:?}"
+    );
+    assert!(
+        t.inherited > 0,
+        "no successor inherited a generation: {t:?}"
+    );
+    // The TTL takeover's bound: the lease's expiry (6 s at most after
+    // the crash), the 3 s a non-backup waits past it, the takeover and
+    // its gate; the grant's lapse (ttl + 2 × margin) falls inside it.
+    assert!(
+        t.longest_submit_ms <= 15_000,
+        "a write waited {} ms for the dead root: {t:?}",
+        t.longest_submit_ms
+    );
+    assert_eq!(t.in_doubt, 0, "writes ended in doubt: {t:?}");
+}
+
+/// A delegate restarts inside its grant: its new incarnation re-adopts
+/// the generation at start (its install is counted; before, it
+/// installed nothing until the log ended the generation), the root
+/// never reclaims it unrenewed, and every check holds (requesters'
+/// ops that reached the root while it was down still recall it).
+#[test]
+fn delegated_delegate_restart_readopts_its_generation() {
+    let t = run_m11(
+        "delegated-delegate-restart",
+        delegated_delegate_restart_config(),
+        66_700..66_730,
+    );
+    // One install per seed by `d2`'s delegate, one by `d1`'s restarted
+    // delegate (the stats are its new incarnation's).
+    assert!(
+        t.installed >= t.seeds * 2,
+        "the restarted delegate did not re-adopt: {t:?}"
+    );
+    assert_eq!(
+        t.reclaimed, 0,
+        "the root reclaimed a restarted delegate's generation unrenewed: {t:?}"
+    );
 }
 
 /// `git-under-flock-faults` fault #14: a root failover under a delegate

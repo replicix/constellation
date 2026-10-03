@@ -57,7 +57,7 @@
 //! | `Deliver(Append)` / `Deliver(AppendAck)` | `backup.rs` `on_backup_append` (persist, or `sealed`) / `on_backup_ack` → `durable_jseq` → `complete_ready` |
 //! | `Ship(h)` | `jobs.rs` `issue_ship` → `ship_landed` → `note_shipped` (`S3` acks) |
 //! | `Tail(i)` | `apply_incoming` (a higher epoch deposes the holder at once; a backup trims its tail) |
-//! | `Seal(b)` / `Takeover(b)` | `on_backup_watch` (persist the seal) → `on_takeover_get` (listed?) → `Acquire` with the permit → marker → `apply_backup_tail` |
+//! | `Seal(b)` / `Takeover(b)` | `on_backup_watch` (read the register) → `on_takeover_get` (listed? persist the seal; unlisted: give the role up, unsealed) → `Acquire` with the permit → marker → `apply_backup_tail` |
 //! | `TakeoverS3(i)` | `watch_s3_holder` → the permit → `classify` |
 //! | `Remove(h, b)` / `Add(h, b)` | `drop_backup` / `backup_promote` → `issue_reconfig` (a CAS on the object's version) |
 //! | `Crash(i)` | fail-stop; the sim's `CrashHolder` |

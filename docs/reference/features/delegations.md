@@ -165,6 +165,20 @@ delegated directory do not wait for its ship either. Status:
   its clock (the same discipline as read delegations and lock grants).
 - The root reclaims a grant nobody renewed (a crashed delegate) by
   itself, and grants no renewal once a recall or reclaim has begun.
+- The delegate's grant lapses when it cannot get it renewed by the
+  root's earliest reclaim: at `until + 2 × margin` (`until` is `sent +
+  ttl − margin`, the root reclaims at `granted + ttl + margin` with
+  `granted ≥ sent`, so the delegate lapses first, by the request's
+  one-way delay), or the reclaim horizon (`ttl + margin`) after the
+  install for a grant it never got renewed. The root is then dead or
+  cut off. Lapsed, the generation executes and parks nothing (it still
+  streams what it holds), and its ops, the parked ones first, take the
+  ordinary route: to a live root, which recalls the generation first,
+  else the inbox and the lease path. It keeps asking for a renewal
+  every request timeout: a link that recovers before the root reclaims
+  gets the grant back, and only a refusal or the log ends the
+  generation. Status: `lapsed`. A lapse is always safe: it only gives up
+  execution while the grant is not honoured anyway.
 - An acknowledgement from a stream that ended before the root appended
   it is tentative: the row is stranded and the requester replays the op
   by rid.
@@ -282,6 +296,28 @@ designations create no delegation.
 - **Delegate partitioned from the root**: it stops at `sent + ttl −
   margin`, before the root may reclaim; its unstreamed rows are stranded
   and replayed.
+- **Delegate restarts or is handed off** (a crash and remount, `daemon
+  --upgrade`, a K5 engine-pod handoff: the same node identity and
+  journal): it re-adopts the generations the table names for it when
+  it starts, renews them at once, and re-streams its unappended rows
+  from the log's index. Its writes wait for that first renewal (one
+  round trip), not for the root to reclaim the grant, which used to
+  hold them for about the grant's ttl (`delegate-handoff-renewal`). A
+  generation that ended meanwhile is refused at the renewal and dropped
+  when the log says so.
+- **Root dies and the delegate is no backup** (no backup in budget, or
+  the root dropped it before it died): only a TTL takeover replaces the
+  root. The delegate's grant lapses unrenewed (above), its writes take
+  the lease path, and it takes the root over once the lease is
+  claimable, then ends the generation itself: within the lease TTL plus
+  the 3 s a non-backup waits (`delegate-root-loss-ttl`). Before, its
+  writes parked on renewals the dead root never answered, and nothing
+  started the takeover (`fsync`s stuck for minutes on kind). A third
+  node whose op a delegate accepted waits for the root's append; it
+  takes the root over the same way (see
+  [Durability and failover](durability-and-failover.md#layer-b-a-backup-within-the-rtt-budget)).
+  With the delegate a listed backup, the seal-based failover applies
+  (`delegate-root-loss`, `delegate-root-blackhole`).
 - **Root fails over**: generations of the old root are inherited by the
   new one. The initial grant is capped by the old root's lease, so an
   inherited grant is already dead at a TTL takeover and the successor
@@ -339,7 +375,7 @@ writer whatever the share, and `MIN_OPS=0` drops the rate floor. See
 `constellation status` (JSON, under `delegation`) shows `enabled`, the
 table, `mine` (this node's generations), `gens`, `kinds`, `backups`, and
 `placement`: the busiest subtrees as `(dir, node, node_ops,
-subtree_ops)`. Counters include `executed`, `fast_path_executed`,
+subtree_ops)`. Counters include `executed`, `fast_path_executed`, `lapsed`,
 `fast_path_routed`, `forwarded_to_delegate`, `deps_waits`,
 `streamed_txs`, `appended_txs`, `cross_subtree`, `recalls_sent`,
 `recalls_drained`, `recalls_expired`, `reclaimed`, `ended`,
@@ -398,6 +434,8 @@ Recall the delegations, or turn placement off, to let it move.
 - Models: `crates/model/src/delegation.rs`, `crates/model/src/hotdir.rs`;
   harness: `delegated-subtrees`, `cross-subtree-rename`,
   `delegate-crash`, `marker-order`, `root-failover-with-delegates`,
-  `auto-placement`, `shared-dir-multi-writer`
+  `auto-placement`, `shared-dir-multi-writer`, `delegate-root-loss`,
+  `delegate-root-blackhole`, `delegate-root-loss-ttl`,
+  `delegate-handoff-renewal`
 - [Lease placement](lease-placement.md), [Forwarded mutations](forwarded-mutations.md),
   [Cluster locks](cluster-locks.md)

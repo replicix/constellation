@@ -251,6 +251,9 @@ pub(crate) struct BackupState {
     pub sealed: Epoch,
     pub watch_timer: Option<TimerId>,
     takeover_get: Option<OpId>,
+    /// When the silence watch issued `takeover_get`: the holder heard
+    /// after this is alive, and the epoch is not sealed.
+    takeover_read_at: Ms,
     /// Subscriber: the next journal seq a `StreamAhead` may install for
     /// `(epoch, jseq)` — contiguity with what the log and earlier batches
     /// gave us.
@@ -1806,14 +1809,21 @@ impl Core {
         self.bk.watch_timer = Some(id);
     }
 
-    /// The watch fired: silence past `backup_takeover_ms` seals the epoch
-    /// and reads the lease to take it over.
-    pub(crate) fn on_backup_watch(
-        &mut self,
-        now: Ms,
-        replica: &dyn Replica,
-        out: &mut Vec<Action>,
-    ) {
+    /// The watch fired: silence past `backup_takeover_ms` reads the lease,
+    /// and the epoch is sealed and taken over only if it still lists this
+    /// node (`on_takeover_get`). A holder that removed this node from its
+    /// backups stops appending to it once the removal lands, which is
+    /// silence too; sealed then, its epoch refused this node for good, so
+    /// the holder never brought it back and ran without a backup: a later
+    /// death of the holder was a TTL takeover (up to a minute), not a seal
+    /// (1.5 s). Every `daemon --upgrade` or K5 handoff of a backup did
+    /// this: the holder dropped it across the restart gap ("no
+    /// acknowledgement progress"), and the resumed node sealed 1.5 s after
+    /// the removal. Read first, a removed backup sees itself unlisted,
+    /// gives its role up unsealed and is invited back as a candidate. The
+    /// read costs no failover time: it was issued right after the seal
+    /// before, and the seal is a local write.
+    pub(crate) fn on_backup_watch(&mut self, now: Ms, out: &mut Vec<Action>) {
         let Some(role) = self.bk.role else {
             return;
         };
@@ -1848,25 +1858,16 @@ impl Core {
             self.bk.watch_timer = Some(id);
             return;
         }
-        if self.bk.sealed < role.epoch {
-            if !replica.backup_seal(role.epoch) {
-                // Could not persist the seal: try again shortly; never
-                // take over unsealed.
-                self.arm_backup_watch(now, out);
-                return;
-            }
-            self.bk.sealed = role.epoch;
-            self.stats.seals += 1;
-            tracing::warn!(
-                node = self.cfg.node_id,
-                holder = role.holder,
-                epoch = role.epoch,
-                silent_ms = silent,
-                "holder silent: sealed its epoch; reading the lease to take over"
-            );
-        }
+        tracing::info!(
+            node = self.cfg.node_id,
+            holder = role.holder,
+            epoch = role.epoch,
+            silent_ms = silent,
+            "holder silent: reading the lease before sealing its epoch"
+        );
         let op = self.issue_s3(S3Op::LeaseGet, S3For::TakeoverGet, out);
         self.bk.takeover_get = Some(op);
+        self.bk.takeover_read_at = now;
     }
 
     pub(crate) fn on_takeover_get(
@@ -1892,29 +1893,44 @@ impl Core {
                     && !lease.released
                     && lease.backups.contains(&self.cfg.node_id) =>
             {
-                if probe {
+                if probe && !lease.is_expired(now.0) {
                     // A restarted backup's probe (3b): the holder is
                     // renewing — alive; wait for its link. An expired
                     // lease is a holder gone: seal and take over now.
-                    if !lease.is_expired(now.0) {
-                        self.lease.note_object(now, &lease);
+                    self.lease.note_object(now, &lease);
+                    self.arm_backup_watch(now, out);
+                    return;
+                }
+                if !probe && self.bk.last_heard >= self.bk.takeover_read_at {
+                    // The holder spoke while the lease was read: alive.
+                    self.lease.note_object(now, &lease);
+                    self.arm_backup_watch(now, out);
+                    return;
+                }
+                if self.epoch.open {
+                    // A continuation epoch opened during the read: a
+                    // member never seals then (`backup_watch_after_epoch`
+                    // re-arms the watch).
+                    self.arm_backup_watch(now, out);
+                    return;
+                }
+                if self.bk.sealed < role.epoch {
+                    if !replica.backup_seal(role.epoch) {
+                        // Could not persist the seal: try again shortly;
+                        // never take over unsealed.
                         self.arm_backup_watch(now, out);
                         return;
                     }
-                    if self.bk.sealed < role.epoch {
-                        if !replica.backup_seal(role.epoch) {
-                            self.arm_backup_watch(now, out);
-                            return;
-                        }
-                        self.bk.sealed = role.epoch;
-                        self.stats.seals += 1;
-                        tracing::warn!(
-                            node = self.cfg.node_id,
-                            holder = role.holder,
-                            epoch = role.epoch,
-                            "restarted backup: the holder's lease expired; sealed its epoch to take over"
-                        );
-                    }
+                    self.bk.sealed = role.epoch;
+                    self.stats.seals += 1;
+                    tracing::warn!(
+                        node = self.cfg.node_id,
+                        holder = role.holder,
+                        epoch = role.epoch,
+                        restarted = probe,
+                        "holder silent (or its lease expired) and this node still listed: sealed \
+                         its epoch to take over"
+                    );
                 }
                 self.lease.note_object(now, &lease);
                 self.lease.takeover_permit = Some((role.epoch, role.holder));
@@ -1953,7 +1969,9 @@ impl Core {
             }
             Some((lease, _)) => {
                 // Not listed any more, or the lease moved on: our tail is
-                // void (a listed successor re-shipped what mattered).
+                // void (a listed successor re-shipped what mattered). Not
+                // sealed: a live holder that removed this node may invite
+                // it back as a candidate in the same epoch.
                 self.lease.note_object(now, &lease);
                 tracing::info!(
                     node = self.cfg.node_id,

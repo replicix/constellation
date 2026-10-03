@@ -1993,6 +1993,48 @@ relay of its own so requests can be attributed per role):
       mid-burst; the root seals the backup (`seals_sent`), drains its
       tail (`sealed_drained`), ends the generation and delegates `d1` to
       `c`, which writes locally; `b` remounts and converges.
+    - The K5a fix round's delegation findings (`delegroot.rs`): two
+      nodes, `a` the root and `b` the delegate of `/d1` writing,
+      `fsync`ing and closing files there; production timings (60 s
+      lease, 5 s grant), `dev-fuse`.
+      - `delegate-root-loss`: `b` is also `a`'s backup; `a` is
+        `kill -9`ed. `b` seals and takes the root over; no write waits
+        past 8 s (the seal-based failover plus slack); every write is on
+        `a` after its remount.
+      - `delegate-root-blackhole`: the same with `a` frozen (`SIGSTOP`)
+        instead, as a force-deleted pod's vanished address answers
+        nothing. When `a` dropped `b` from its backups before the freeze
+        (a false alarm under load), only the TTL takeover is left and
+        the bound is the lease TTL + 3 s + slack. Before the fix `b`'s
+        writes parked for good.
+      - `delegate-root-loss-ttl`: no backup at all (20 s lease), `a`
+        frozen: `b`'s unrenewed grant lapses (`lapsed`), its writes
+        take the lease path and `b` takes the root over by TTL, all
+        writes within 35 s. In all three, a `b` that `a` no longer
+        lists at the kill gets the TTL window, and the writes after the
+        takeover are bounded by the TTL bound too.
+      - `delegate-handoff-renewal`: `b` runs `daemon --upgrade` three
+        times under the writer. The resumed image keeps the generation
+        (the same one on both sides, nothing reclaimed or recalled, no
+        `NotHolder` bounce at `a`) and its create + close stay within
+        3 s (or twice the control's on a loaded host). Before the fix
+        the root outwaited the grant and the first write took 7 s.
+      - `delegate-backup-handoff-failover`: `b` (the backup) runs
+        `daemon --upgrade` first. `a` drops it across the restart gap;
+        `b` must not seal `a`'s live epoch, and `a` must list it again
+        (waits up to 90 s and reports the time: 5-23 s here, in some
+        runs not within 30 s, because `a`'s P2P link to the new
+        incarnation comes back slowly: an open bug, no tight bound).
+        Then `a` is `kill -9`ed and `b` must
+        take over by seal, as in `delegate-root-loss`. Before the fix
+        `b` sealed `a` about 1.5 s after the removal and was never
+        invited back, so the kill was a TTL failover.
+      - In the sim: `delegated_root_loss_hands_the_writes_to_a_ttl_successor`
+        (`delegated-root-gone`: the root dies with no backup and comes
+        back after 40 s; every submit within 15 s, none in doubt, with
+        the client deadline raised to 60 s) and
+        `delegated_delegate_restart_readopts_its_generation`
+        (`delegated-delegate-restart`).
     - `auto-placement`: no operator. `CONSTELLATION_DELEGATION_PLACEMENT=1`
       with a 4 s window, 20 ops, a 4 s dwell and a 2 s cool-down; `b`
       writes into `d1` steadily and the root delegates `d1` to `b` by

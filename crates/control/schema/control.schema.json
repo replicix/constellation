@@ -154,6 +154,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "dead_root_acquires": {
+          "description": "Root takeovers started because an op this node waits on (accepted,\nwaiting for the log) needed a root whose lease had run out.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "durable": {
           "default": 0,
           "description": "The durable journal seq (min over the backups' acks, or the\nshipped-through seq under `s3`); `u64::MAX` when nothing gates.",
@@ -275,6 +281,9 @@
           "type": "integer"
         }
       },
+      "required": [
+        "dead_root_acquires"
+      ],
       "type": "object"
     },
     "AtimeStatus": {
@@ -1355,6 +1364,12 @@
           },
           "type": "array"
         },
+        "lapsed": {
+          "description": "Grants this delegate gave up unrenewed past the root's reclaim\nhorizon (the root dead or cut off).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "mine": {
           "default": [],
           "description": "Delegations this node holds: `(dir, gen, until_ms, stopped,\nstreamed_through, executed, parked)`.",
@@ -1604,6 +1619,9 @@
           "type": "array"
         }
       },
+      "required": [
+        "lapsed"
+      ],
       "type": "object"
     },
     "DelegationStatus": {
@@ -7879,6 +7897,7 @@
             "backups_removed": 0,
             "candidate": null,
             "config_version": 0,
+            "dead_root_acquires": 0,
             "durable": 0,
             "epoch_carry_refused": 0,
             "gated": false,
@@ -8018,6 +8037,7 @@
             "inherited": 0,
             "installed": 0,
             "kinds": [],
+            "lapsed": 0,
             "mine": [],
             "not_owner": 0,
             "parked_expired": 0,

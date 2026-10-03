@@ -39003,3 +39003,336 @@ Gates (fix round 2, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
 
 `locks-blips-tight` 2723 is owned by `lock-release-drop` and was not
 re-run.
+
+## Fix: a delegate's `fsync`s hung for minutes after its root died, and stalled ~4 s after every handoff (`delegate-root-loss`)
+
+The K5a fix round's two kind findings. Topology: the controller's engine
+pod `a` holds the pool's root lease; the node's engine pod `b` is the
+delegate of the volume's subtree (M11) and was `a`'s backup.
+
+### Reproduction (harness, two nodes, production timings: 60 s lease, 5 s grant)
+
+New scenarios in `crates/harness/src/scenarios/delegroot.rs`:
+
+- **Finding 1 does not reproduce with a plain `kill -9`** on current
+  `main` while `b` is `a`'s listed backup. `b` seals after 1.5 s and
+  takes the root over; its writes waited at most 2.1 s
+  (`delegate-root-loss`).
+- **It reproduces when `b` is no longer a listed backup.** With `a`
+  frozen (`SIGSTOP`, like a force-deleted pod whose address answers
+  nothing; `delegate-root-blackhole`), `b` had not taken the root over
+  80 s after the freeze, and a `create` had hung for 77 s, stage
+  "mutation submitted to the core". `b` was off the backup list because
+  under load `a` had dropped it (`removing a backup … no
+  acknowledgement progress`; `b`'s core had blocked 823 ms on one step).
+  `b` then sealed `a`'s live epoch, read the lease, and found itself no
+  longer listed. A backup that sealed an epoch is never invited back in
+  it, so only a TTL takeover could replace `a`.
+- **Every `daemon --upgrade` of `b` produces exactly this state.** `a`
+  drops `b` across the restart gap ("no acknowledgement progress" about
+  1 s after the exec), the resumed `b` falsely seals, and `a` logs "a
+  backup sealed our epoch" when it tries to re-add `b`. So on kind,
+  after the K5a handoffs, the node pod was very likely no longer the
+  controller pod's backup when the controller pod was deleted.
+- **Finding 2** (`delegate-handoff-renewal`): after `daemon --upgrade`
+  of `b`, a write + `fsync` took 7.06 s. The root saw 58 `NotHolder`
+  bounces from `b`, recalled the generation and outwaited it (`recalls
+  sent 1`, `expired 1`).
+
+### Mechanisms
+
+1. **A delegate parks its own writes on a renewal that a dead root never
+   answers.** `delegate_try_execute` parks an op whose grant is not
+   honoured and renews. A parked op is released only by a renewal
+   answer, a recall, or the log ending the generation, and a dead root
+   sends none of these. The op never reaches the forward → inbox →
+   lease path, which is what starts a TTL takeover. Only its client
+   deadline (2 × TTL) ended it, in doubt, and the retry parked again:
+   minutes, with no takeover ever started. The root reclaims a grant
+   nobody renews, but a delegate had no counterpart rule.
+2. **A third node's accepted op waits for a dead root's append, and
+   nothing starts the takeover** (found by the new sim configuration).
+   An op that a delegate (or the root) accepted and that waits for the
+   log to carry it (`AwaitingLog`) is on no path either. With no backup
+   it waited out its client deadline (2 × TTL) before its retry took
+   the lease path.
+3. **A restarted or handed-off delegate installed nothing at start.**
+   `delegation_sync`, which installs the generations the table names for
+   this node and renews them at once, ran only when a `Delegate`/`Recall`
+   segment was applied or the lease was acquired. The resumed image's
+   ops resolved to "node 2 owns `/d1`" but found no installed grant, so
+   they were forwarded to the root, which answered `NotHolder` (owner
+   node 2). The root then recalled the generation and outwaited the
+   grant nobody renewed (ttl + margin), and the writes waited for that.
+
+### Fix (`crates/authority`)
+
+- `core::Core::start` runs `delegation_sync` once. A node re-adopts the
+  generations its replica's table names for it (a restart, `daemon
+  --upgrade`, a K5 handoff: the same node identity and journal),
+  renews them at once (`deleg_renew_now` already copes with an unknown
+  root), and re-streams its unappended rows from the log's index, as
+  `delegate-restream` does. A generation that ended meanwhile is
+  refused at the renewal and dropped when the log says so.
+- `core::delegate`: the delegate's unrenewed grant lapses at the root's
+  earliest reclaim. A new `Timer::DelegLapse` (`arm_deleg_lapse`,
+  armed at install and re-armed by every renewal; `on_deleg_lapse`;
+  `deleg_lapse_at` = `until + 2 × margin`, or `installed + ttl +
+  margin` for a grant never renewed here) marks the generation
+  `lapsed`: it still streams what it holds, executes and parks nothing,
+  and its parked ops take the ordinary route: to a live root, which
+  recalls first, else the inbox and the lease path. It keeps renewing
+  (`deleg_lapsed_retry`, one request timeout apart); a granted renewal
+  ends the lapse, a refusal or the log ends the generation (fix round,
+  review should-fix 4). A lapse only gives up execution while the grant
+  is not honoured anyway, so it is always safe. New `DelegateState`
+  fields are `installed`, `lapse_timer` and `lapsed`.
+  `drop_delegate_state` cancels the watch, and `on_deleg_renewed`
+  re-arms it.
+- `core::jobs`: the dead-root check (`dead_root_check` from the sync
+  round, `awaits_dead_root`, `on_dead_root_get`, `S3For::DeadRoot`). A
+  non-holder with an `AwaitingLog` op older than
+  `CONSTELLATION_INBOX_P2P_GRACE_MS` reads the lease from the sync
+  round, but not again before the expiry of a lease it last saw live,
+  and not while suspended (fix round, should-fix 1). If the lease ran
+  out unrenewed (not released, not held by this node), it acquires
+  (`reason: "dead-root"`, no handoff request; and, fix round must-fix
+  1, a `Busy` outcome registers nothing in `wanted_by`, as for
+  `claim-offer`, so a live holder is never asked for anything). An
+  expired lease is the only trigger.
+- Status: `delegation.lapsed` (control `DelegationStatus.lapsed`, schema
+  re-blessed); core stats `deleg_lapsed` and `dead_root_acquires`; the
+  log lines "delegation lapsed unrenewed past the root's earliest
+  reclaim: releasing its parked ops, still renewing" and "ops wait for
+  a root whose lease ran out: taking the root over". Fix round:
+  `ack.dead_root_acquires` in status too.
+
+Functions touched: `Core::start`, `Core::delegation_sync`,
+`Core::drop_delegate_state`, `Core::on_deleg_renewed`, new
+`Core::deleg_lapse_at`, `Core::arm_deleg_lapse`, `Core::on_deleg_lapse`,
+`Core::round_ship` (one call), new `Core::dead_root_check`,
+`Core::awaits_dead_root`, `Core::on_dead_root_get`; the `on_s3` and
+`on_timer` dispatch; `engine::control::service` (status). No forwarding,
+write-path, lock or backup code changed (parallel chunks
+`overload-cascade`, `busy-writer-loss`, `metered-own-rows`,
+`lock-fence-token`, `epoch-lock-grants`).
+
+### Bounds (DESIGN §9, durability-and-failover)
+
+- **The delegate is a listed backup:** seal-based failover,
+  `CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s) plus one CAS, about 1.5 s
+  in the harness. The scenarios assert ≤ 8 s per write (slack for a
+  loaded host).
+- **It is not** (none in budget, or the root dropped it before it died):
+  TTL takeover, the lease's expiry (at most one TTL after the root's
+  last renewal) plus the 3 s a non-backup waits. At the defaults that is
+  ≤ 63 s from the root's death. The scenarios assert TTL + 15 s. The
+  grant's lapse (≤ 6 s) falls inside it.
+
+### Tests
+
+- core: `a_restarted_delegate_readopts_its_delegation_at_start`,
+  `a_delegate_gives_up_a_grant_its_dead_root_never_renews`,
+  `an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_out`
+  (released and live leases are left alone).
+- sim: `delegated_root_loss_hands_the_writes_to_a_ttl_successor`
+  (`delegated-root-gone`: no backup, the root crashes at 1.5 s and
+  returns after 40 s, client deadline raised to 60 s; every submit
+  ≤ 15 s, none in doubt). Without the fix it never quiesced or reached
+  the 60 s deadline. `delegated_delegate_restart_readopts_its_generation`
+  (`delegated-delegate-restart`). The sim gained `longest_submit_ms` per
+  report.
+- harness: `delegate-root-loss`, `delegate-root-blackhole`,
+  `delegate-root-loss-ttl` (no backup, 20 s lease, root frozen),
+  `delegate-handoff-renewal` (three `daemon --upgrade`s; the same
+  generation on both sides, no reclaim, recall or `NotHolder`, and the
+  create + close latency checked against a control).
+
+### Results
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test` for every workspace package (debug in three calls; `constellation-authority` and `constellation-model` in release) | 987 + 523 + 484 debug; authority 190 + 4 + 113 sim; model 138; 0 failed |
+| sim `long_delegated` (3000 seeds), `long_backup`, `long_random` (`--ignored`) | pass |
+| `tests/smoke.sh` | SMOKE TEST PASSED |
+| `cargo build --release --workspace` | ok |
+| `delegate-root-loss` ×10 (final build) | 10/10, all seal-based: b held the root 1.52–1.99 s after the kill; longest write 57 ms–1.04 s |
+| `delegate-root-blackhole` ×10 | 10/10, seal-based: held after 1.52–1.56 s; longest write 0.57–0.62 s |
+| `delegate-root-loss-ttl` ×10 | 10/10, TTL: held after 15.5–26.2 s; longest write 13.6–22.6 s (bound 35 s; before the fix: never) |
+| `delegate-handoff-renewal` ×10 | 10/10: 30 handoffs, generation 1 → 1 every time, reclaimed/recalls/`NotHolder` +0; create + close after the resume p50 0.3–1.6 ms, max 346 ms; whole write + `fsync` up to 5.8 s (the chunk upload to the loaded host's floci). Before the fix: 7.06 s, generation recalled. One more run failed **environmentally**: `b`'s core blocked 6.8 s on one log-stream step right after a resume, so the next renewal was never sent and `a` reclaimed at its horizon. The 5 s grant cannot survive such a stall |
+| every `delegate-*` (crash, partition, crash-backup), `*failover*` (backup-failover, backup-failover-with-delegation, ack-s3-failover, lock-failover, root-failover-with-delegates), `backup-*` (departs, partition, takeover-holds-missing-chunks, takeover-drops-held-chunks), `fsync-*` (hard-outage, soft-timeout, interrupt), `session-handover-idle` ×1 | all PASSED |
+| also: delegated-subtrees, cross-subtree-rename, marker-order, p2p-off-no-delegation, upgrade-under-load, auto-placement, designation-as-delegation, shared-dir-multi-writer, hash-range-split-merge, cross-range-rename, cto-delegation-recall | all PASSED |
+
+Host load was 40–300 during the runs (other agents). An earlier version
+of the scenarios saw two blackhole runs where `a` had dropped `b` before
+the freeze: those went the TTL path and took 51 s and 63 s, within the
+TTL bound. The very first `delegate-root-loss` attempt hit the 280 s
+per-scenario timeout of my driver and kept no logs. It did not recur in
+24 later runs.
+
+### Open
+
+- ~~A backup's restart or handoff makes it seal its live holder, and it
+  is never invited back~~: fixed in the review fix round below.
+- **A returning old root's stranded replay idles until its deadline.**
+  Sim `delegated-root-gone` seeds 70044, 70439 and 71352
+  (`AUTHORITY_SIM_SEED=70044 AUTHORITY_SIM_CONFIG=delegated-root-gone`
+  `replay_seed`): node 1 returns at 41.5 s after the TTL takeover, and
+  its replay of `(1,1,12)` and its new ops log nothing for 60 s, then
+  one ends in doubt. `dead_root_acquires` is 0 in those seeds; it
+  reproduces with the start sync or the lapse disabled, and it is not in
+  the test's seed range. Owned by the `lock-release-drop` chunk
+  (coordinator, fix round).
+- With the root crashed for good (no restart), the session checker
+  reports `phantom_read`/`monotonic_reads` on the dead root's own early
+  reads (its unshipped `Local` writes are gone). Seed 70194 shows it on
+  `main` too. That is why the sim configuration restarts the root at
+  40 s.
+- Core steps blocking for 1–22 s (fjall I/O at high host load) outlast
+  the 5 s grant and the 1 s backup acknowledgement timeout. That causes
+  the drops and reclaims above, and it is `overload-cascade`'s subject.
+- **kind (`tests/csi/k5-handoff.sh`) was not run.** Another agent's kind
+  cluster (`bwl`) was up, and the host allows one at a time. The kind
+  repro needs the controller pod force-deleted after K5a handoffs, with
+  `b`'s `fsync`s measured: the expected bound is ≤ 63 s, the TTL
+  takeover.
+
+### Review fix round
+
+The review's verdict was "fix": one must-fix, five should-fixes, four
+nits. The coordinator rebased the change onto `d1e56cd`; the
+`crates/harness/src/scenarios.rs` conflict kept both sides' modules
+(`credrot`, `delegroot`) and scenario entries.
+
+- **Must-fix 1, a dead-root takeover registered in `wanted_by`.** When
+  the acquisition's own read found the root live (it renewed since the
+  check's read), or a dead `Backup` holder's lease inside the listed
+  backups' claim grace, the plan was `Busy` and the job swapped this
+  node into `wanted_by`: a live root would hand over, and the swap
+  replaced the lease object under the listed backup's claim CAS. The
+  `Busy` branch of `acquire_classified` now exempts `"dead-root"` as it
+  exempts `"claim-offer"`. Tests:
+  `a_dead_root_takeover_that_finds_the_root_renewed_asks_it_nothing`
+  and `a_dead_root_takeover_leaves_a_backup_lease_in_its_claim_grace_alone`
+  (no `LeaseSwap`, no `LeaseRequest`, no lease); both fail without the
+  exemption.
+- **Should-fix 1, one `LeaseGet` per round.** `dead_root_check` skips
+  the read while the lease it last saw (`lease.last_seen`, any read
+  updates it) is unreleased and unexpired, and while suspended (the
+  acquisition is refused there anyway).
+  `the_dead_root_check_reads_a_slow_live_roots_lease_once_per_renewal`:
+  60 s of 500 ms rounds against a root renewing a 10 s lease every 5 s
+  costs 6 reads (one per round was 120).
+- **Should-fix 2.** `delegated_root_loss_hands_the_writes_to_a_ttl_successor`
+  asserts `dead_root_acquires > 0` (10 over its 30 seeds). The 60 s
+  replay hang is noted under Open, owned by `lock-release-drop`.
+- **Should-fix 3.** `root_loss` uses the TTL window when `b` is not a
+  listed backup at the kill, and bounds the writes after the takeover
+  by the TTL bound instead of only printing them.
+- **Should-fix 4, the lapse.** The comment had the order backwards: the
+  root reclaims at `granted + ttl + margin ≥ sent + ttl + margin =
+  until + 2 × margin`, so the delegate lapses first. A lapse no longer
+  stops the generation: it releases the parked ops, executes and parks
+  nothing while lapsed, and keeps renewing every request timeout
+  (`deleg_lapsed_retry`; a transport failure also backs off to that
+  cadence); a granted renewal ends the lapse, a refusal or the log ends
+  the generation. Tests: `a_delegate_gives_up_a_grant_its_dead_root_never_renews`
+  (now also: a new write is routed, not parked; renewals go on) and
+  `a_lapsed_delegation_renewed_before_the_reclaim_executes_again`
+  (renewed: executes here again; refused: stopped, no retry timer).
+- **Should-fix 5, the backup's false seal after its restart or
+  handoff.** Mechanism: a holder that removes a backup keeps appending
+  to it until the removal CAS lands, then stops; the removed backup
+  hears silence and, 1.5 s later, sealed the epoch before reading the
+  lease. Sealed, it refused every later append of that epoch, so the
+  holder put it in `refused_epoch` and never invited it back. Every
+  `daemon --upgrade` of the backup did this: the holder's pooled
+  connection to the old process swallows its appends until the P2P
+  layer evicts it (2 s), the 1 s acknowledgement timeout drops the
+  backup, and the resumed node sealed. Fix (`backup.rs`
+  `on_backup_watch`, `on_takeover_get`): the silence watch reads the
+  lease first and seals only if the lease still lists this node for
+  that holder and epoch and the holder was not heard while it was read.
+  Unlisted, the backup gives its role and tail up unsealed and the
+  holder invites it back as a candidate in the same epoch. The read
+  costs the failover nothing: the old order sealed (a local write) and
+  then issued the same read. Safety is unchanged: the seal still
+  precedes the takeover CAS, which the acquisition makes against its
+  own read, and the model's `Seal` is allowed at any moment, so sealing
+  in fewer states is a subset of its behaviours. Tests:
+  `a_backup_its_live_holder_removed_does_not_seal_and_can_be_invited_back`,
+  `a_holder_heard_while_the_lease_is_read_is_not_sealed`; four existing
+  tests that asserted the seal at the watch now answer its read first
+  (the same seal, one event later). New harness scenario
+  `delegate-backup-handoff-failover`: after `b`'s upgrade, `a` lists `b`
+  again in 2.3–14.8 s (mostly `a`'s P2P link to the new incarnation
+  coming back after the eviction: "connected" in 35–80 % of the samples
+  meanwhile), `b` never seals, and `a`'s `kill -9` fails over by seal in
+  1.46–3.1 s. `tests/csi/k5-handoff.sh` counts "sealed its epoch" (the
+  log line changed).
+- **Nits.** `ack.dead_root_acquires` is in status (schema re-blessed);
+  the lapse test asserts the lease read that routes the op to an
+  unreachable root, not "forwarded or `LearnHolder`"; the handoff bound
+  no longer widens with the upgrade's duration; the
+  durability-and-failover paragraph is its own paragraph again.
+- **650acc8 (epoch-lock-grants).** An epoch close lets the node's own
+  lease go locally and re-claims it; the dead-root check never acts on
+  this node's own lease (`holder == me`), and with the backoff it does
+  not read it either while unexpired. A lapsed generation keeps no lock
+  grant alive (its `until` is past). No interaction found; the
+  `locks-*`, `flex-crash` and `delegated-*` sims below cover it.
+
+Functions touched in this round: `Core::acquire_classified` (`Busy`),
+`Core::dead_root_check`, `Core::my_generation_for`,
+`Core::arm_deleg_lapse`, `Core::on_deleg_lapse`, new
+`Core::deleg_lapsed_retry`, `Core::on_deleg_renew_timer`,
+`Core::on_deleg_request_failed` (renew), `Core::on_deleg_renewed`,
+`Core::on_backup_watch`, `Core::on_takeover_get`; status
+`AckStatus.dead_root_acquires`.
+
+| Gate (fix round) | Result |
+|---|---|
+| `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority` | 214 + 4 + 115 sim, 0 failed |
+| `cargo test --release -p constellation-model` | 138 passed, 0 failed |
+| `cargo test` for every other workspace package (debug, two calls) | 1027 + 1015 passed, 0 failed |
+| sim `long_backup`, `long_backup_hot`; `long_delegated` and `long_random` (3000 seeds each) | pass |
+| `sweep_config` 2000 seeds each: `delegated-root-gone`, `long-delegated-backup` (from 70000), `flex-crash`, `locks-failover-backup`, `delegated-backup`, `delegated-delegate-restart`, `long-backup` (from 80000) | no failing seed |
+| `cargo build --release --workspace`; `tests/smoke.sh` | ok; SMOKE TEST PASSED |
+| `delegate-root-loss` ×5 | 5/5, seal-based, b held the root 1.54–1.66 s after the kill |
+| `delegate-root-blackhole` ×5 | 5/5, seal-based, 1.53–2.03 s |
+| `delegate-root-loss-ttl` ×5 | 5/5, TTL, b held the root 15.3–23.9 s after the freeze, longest write 13.6–22.2 s (bound 35 s), one lapse each |
+| `delegate-handoff-renewal` ×5 | 5/5, 15 handoffs, generation kept, create + close after the resume max 19 ms |
+| `delegate-backup-handoff-failover` ×10 | 8 passed; 1 cut by my driver's timeout after its failover checks had passed (in the final "a sees every write" wait, load 126); 1 failed (the first run, before the link diagnostics): `a` did not list `b` again within 30 s, `b` did not seal |
+| `backup-*` (4), `ack-s3-failover`, `backup-failover-with-delegation`, `backup-partition`, `delegate-crash`, `delegate-partition`, `delegate-crash-backup`, `lock-failover`, `root-failover-with-delegates`, `session-handover-idle` ×1 | all PASSED |
+| `slow-s3-no-seal` (extra: the seal order changed) | PASSED at load 30–45; one earlier run at load ~250 failed on a 10 s status timeout after `a`'s core stalled 1.6–7.3 s per step and `b` sealed it (`overload-cascade`) |
+
+Open from this round:
+
+- One `delegate-backup-handoff-failover` run never saw `a` list `b`
+  again within 30 s (no seal on `b`). In every other run the delay was
+  `a`'s view of its P2P link to the restarted `b` (the eviction of the
+  old incarnation's pooled connection also closes the new one's gossip
+  link, and `connected` comes back with the next 5 s probe or a gossip
+  rejoin), then the 2 s stability window and the 3 s reconfiguration
+  rate limit. That link recovery is the P2P layer's, not this chunk's.
+- **OPEN BUG (P2P, for a network chunk): slow link recovery after a
+  peer restart.** After `b`'s `daemon --upgrade`, `a` evicts the pooled
+  connection 2 s after the restart and logs "gossip neighbor left"; it
+  then does not mark `b` connected again until "gossip neighbor joined"
+  17-19 s later, or not at all within 30 s (review: relisted at 22.1 s
+  and 23.1 s in two runs, never in two, 7.9-18.2 s in the passing ones;
+  `a` saw `b` connected in 9 of ~290 samples), although `b` is up and
+  talking to `a` throughout. The 5 s `probe_all`
+  (`crates/engine/src/node.rs:1283`) and the evict hook's immediate
+  `ping_node` (`crates/net/src/peers.rs:160`) do not bring it back; why
+  the pings fail or are overridden is undetermined. Consequence: `a`
+  cannot relist `b` as a backup meanwhile, so a root loss within that
+  window is a TTL failover (up to a minute), not the 1.5 s seal.
+  `delegate-backup-handoff-failover` therefore waits up to 90 s for the
+  relist, reports the time, and asserts no tight bound. Logs:
+  `/var/tmp/drlrev-logs`, `/var/tmp/drlrev/harness-m11-logs-*`.
+- kind (`tests/csi/k5-handoff.sh`) was not run again: two other
+  agents' kind clusters (`kind-37-k5b`, `kind-37-k6b`) were up.
+

@@ -302,6 +302,9 @@ pub struct DelegationReport {
     pub deps_waits: u64,
     #[serde(default)]
     pub parked_expired: u64,
+    /// Grants this delegate gave up unrenewed past the root's reclaim
+    /// horizon (the root dead or cut off).
+    pub lapsed: u64,
     #[serde(default)]
     pub not_owner: u64,
     #[serde(default)]
@@ -2091,6 +2094,9 @@ pub struct AckStatus {
     pub backup_tail_applied: u64,
     #[serde(default)]
     pub s3_fast_takeovers: u64,
+    /// Root takeovers started because an op this node waits on (accepted,
+    /// waiting for the log) needed a root whose lease had run out.
+    pub dead_root_acquires: u64,
     #[serde(default)]
     pub ack_floor_waits: u64,
     #[serde(default)]

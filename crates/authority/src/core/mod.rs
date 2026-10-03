@@ -686,6 +686,12 @@ pub struct Stats {
     pub deleg_forwarded: u64,
     pub deleg_deps_waits: u64,
     pub deleg_parked_expired: u64,
+    /// Delegate: grants given up unrenewed past the root's reclaim
+    /// horizon (the root is dead or cut off).
+    pub deleg_lapsed: u64,
+    /// Acquisitions started because ops waited for a root whose lease
+    /// ran out (`dead_root_check`).
+    pub dead_root_acquires: u64,
     pub deleg_not_owner: u64,
     /// Delegate: delegations installed here, transactions streamed,
     /// batches refused, renewals granted/refused, recalls received.
@@ -1023,6 +1029,9 @@ pub(crate) enum S3For {
     HeartbeatPut(u32),
     /// M10: the idle promise watch's lease read.
     PromiseWatch,
+    /// A non-holder whose ops wait for a root's append reading whether
+    /// that root's lease has run out (`Core::dead_root_check`).
+    DeadRoot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1060,6 +1069,7 @@ enum Timer {
     PromiseWatch,
     DelegExpiry(u64),
     DelegRenew(u64),
+    DelegLapse(u64),
     /// M14.
     LockRequestTimeout(OpId),
     LockRetry(OpId),
@@ -1113,6 +1123,7 @@ impl Timer {
             Timer::LockRenewTimeout(_) => TimerKind::LockRenewTimeout,
             Timer::LockTestTimeout(_) => TimerKind::LockTestTimeout,
             Timer::DelegRenew(_) => TimerKind::DelegRenew,
+            Timer::DelegLapse(_) => TimerKind::DelegLapse,
             Timer::DelegStream => TimerKind::DelegStream,
             Timer::Placement => TimerKind::Placement,
         }
@@ -1165,6 +1176,8 @@ pub struct Core {
     /// A nudge arrived while a round was in flight: run another right
     /// after it (`nudged` in the sync loop).
     nudged: bool,
+    /// The dead-root check's lease read is in flight (`dead_root_check`).
+    dead_root_get: bool,
     /// A client's control request waiting for a round (`PublishNow`,
     /// `Reintegrate`): answered when the round completes.
     round_waiters: Vec<(OpId, Control)>,
@@ -1263,6 +1276,7 @@ impl Core {
             epoch_probes: 0,
             epoch_s3_down: false,
             nudged: false,
+            dead_root_get: false,
             round_waiters: Vec::new(),
             barriers: Vec::new(),
             acquire_waiters: Vec::new(),
@@ -1417,6 +1431,13 @@ impl Core {
         if self.cfg.p2p && self.cfg.forwarding {
             self.issue_s3(crate::action::S3Op::LeaseGet, S3For::RefreshHolder, out);
         }
+        // Plan 30 §M11: the delegations the table names for this node are
+        // its own again (a restart, a `daemon --upgrade` or a K5 handoff
+        // keeps the node identity and the journal): installed now and
+        // renewed at once, their unstreamed rows re-streamed from what the
+        // log has — not left to the root's reclaim of a grant nobody
+        // renews, which held every write under them for the grant's ttl.
+        self.delegation_sync(now, replica, out);
     }
 
     /// Handle one event. Every action returned must be carried out by the
@@ -1833,6 +1854,7 @@ impl Core {
                     self.lease.note_object(now, &lease);
                 }
             }
+            S3For::DeadRoot => self.on_dead_root_get(now, result, replica, out),
         }
     }
 
@@ -1892,7 +1914,7 @@ impl Core {
             }
             Timer::BackupWatch => {
                 self.bk.watch_timer = None;
-                self.on_backup_watch(now, replica, out);
+                self.on_backup_watch(now, out);
             }
             Timer::PromiseWait => self.on_promise_wait(now, replica, out),
             Timer::PromiseWatch => {
@@ -1901,6 +1923,7 @@ impl Core {
             }
             Timer::DelegExpiry(gen) => self.on_deleg_expiry(now, gen, replica, out),
             Timer::DelegRenew(gen) => self.on_deleg_renew_timer(now, gen, out),
+            Timer::DelegLapse(gen) => self.on_deleg_lapse(now, gen, replica, out),
             Timer::LockRequestTimeout(req) => self.on_lock_request_timeout(now, req, out),
             Timer::LockRetry(op) => self.on_lock_retry(now, op, replica, out),
             Timer::LockHeldReply(w) => self.on_lock_held_reply_timer(w, out),

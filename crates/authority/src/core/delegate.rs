@@ -176,6 +176,14 @@ pub(crate) struct DelegateState {
     /// it was sent.
     pub renew: Option<(OpId, Ms)>,
     pub renew_timer: Option<TimerId>,
+    /// When this node installed the generation: a grant it never got
+    /// renewed lapses counting from here (`deleg_lapse_at`).
+    pub installed: Ms,
+    /// The lapse watch (`on_deleg_lapse`), re-armed by every renewal.
+    pub lapse_timer: Option<TimerId>,
+    /// The grant lapsed unrenewed (`on_deleg_lapse`): nothing executes
+    /// or parks here, but renewals go on — a granted one ends the lapse.
+    pub lapsed: bool,
     pub parked: Vec<ParkedDeleg>,
     /// Executed under this generation here (for `status`).
     pub executed: u64,
@@ -416,6 +424,9 @@ impl Core {
                     inflight: None,
                     renew: None,
                     renew_timer: None,
+                    installed: now,
+                    lapse_timer: None,
+                    lapsed: false,
                     parked: Vec::new(),
                     executed: 0,
                     designated: d.designated,
@@ -438,6 +449,7 @@ impl Core {
                 self.dl.mine.get_mut(&d.gen).expect("present").until = Ms(i64::MAX / 2);
             }
             self.deleg_renew_now(now, d.gen, out);
+            self.arm_deleg_lapse(now, d.gen, out);
         }
         // The root side.
         if self.root_usable(now) {
@@ -541,7 +553,7 @@ impl Core {
             return;
         };
         tracing::info!(node = self.me(), dir = d.dir, gen, "delegation ended here");
-        if let Some(t) = d.renew_timer {
+        for t in [d.renew_timer, d.lapse_timer].into_iter().flatten() {
             self.cancel_timer(t, out);
         }
         if let Some((req, _)) = d.inflight {
@@ -618,7 +630,7 @@ impl Core {
         match replica.resolve_ownership(keys) {
             Ownership::Delegated(d) if d.node == self.me() => {
                 let s = self.dl.mine.get(&d.gen)?;
-                (!s.stopped).then_some(d.gen)
+                (!s.stopped && !s.lapsed).then_some(d.gen)
             }
             _ => None,
         }
@@ -1449,7 +1461,7 @@ impl Core {
 
     /// How long a stream batch, backup append or renewal waits for its
     /// answer before it is sent again (a partition drops it silently).
-    fn deleg_request_timeout_ms(&self) -> u64 {
+    pub(crate) fn deleg_request_timeout_ms(&self) -> u64 {
         self.cfg
             .forward_timeout_ms
             .max(self.cfg.delegation_stream_tick_ms * 4)
@@ -1654,14 +1666,16 @@ impl Core {
                 self.arm_stream_tick(now, out);
             }
             ReqKind::Renew => {
+                // (A lapsed generation retries on its own cadence: the
+                // root is gone or cut off, not slow.)
+                let retry = match self.dl.mine.get(&gen) {
+                    Some(d) if d.lapsed => self.deleg_request_timeout_ms(),
+                    _ => self.cfg.delegation_stream_tick_ms,
+                };
                 if let Some(d) = self.dl.mine.get_mut(&gen) {
                     d.renew = None;
                     if d.renew_timer.is_none() {
-                        let t = self.set_timer(
-                            now.plus(self.cfg.delegation_stream_tick_ms),
-                            Timer::DelegRenew(gen),
-                            out,
-                        );
+                        let t = self.set_timer(now.plus(retry), Timer::DelegRenew(gen), out);
                         self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
                     }
                 }
@@ -1776,6 +1790,7 @@ impl Core {
             d.renew_timer = None;
         }
         self.deleg_renew_now(now, gen, out);
+        self.deleg_lapsed_retry(now, gen, out);
     }
 
     /// Root side: grant (or refuse) a renewal.
@@ -1848,6 +1863,116 @@ impl Core {
         });
     }
 
+    /// When this node stops counting on its grant of a generation it
+    /// cannot get renewed. This node honours a grant until
+    /// `sent + ttl − margin` from its request (`until`), the root until
+    /// `granted + ttl + margin` from the renewal it answered, and
+    /// `granted ≥ sent`; so the lapse point `until + 2 × margin` is the
+    /// root's earliest reclaim of a grant not renewed since — the
+    /// delegate lapses first, by the request's one-way delay. A grant never renewed here
+    /// (installed from the log, or re-adopted at a restart) lapses at
+    /// the reclaim horizon from the install.
+    fn deleg_lapse_at(&self, d: &DelegateState) -> Ms {
+        let renewed = if d.until.0 > 0 {
+            d.until.plus(2 * self.cfg.expiry_margin_ms)
+        } else {
+            Ms(0)
+        };
+        renewed.max(d.installed.plus(self.reclaim_horizon_ms()))
+    }
+
+    fn arm_deleg_lapse(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        let old = d.lapse_timer.take();
+        if let Some(t) = old {
+            self.cancel_timer(t, out);
+        }
+        let d = self.dl.mine.get(&gen).expect("present");
+        if d.designated || d.stopped || d.lapsed {
+            return;
+        }
+        let at = self.deleg_lapse_at(d).max(now.plus(1));
+        let t = self.set_timer(at, Timer::DelegLapse(gen), out);
+        self.dl.mine.get_mut(&gen).expect("present").lapse_timer = Some(t);
+    }
+
+    /// The lapse watch fired: a grant nobody renewed by the root's
+    /// earliest reclaim is not counted on any more. A live, reachable
+    /// root answers a renewal within a round trip, so the root is dead or
+    /// cut off, and the ops parked on the renewal would wait for an
+    /// answer that may never come — for minutes on kind, where the root's
+    /// engine pod was force-deleted and this node's `fsync`s never
+    /// returned. Lapsed, the generation executes and parks nothing more:
+    /// its ops take the ordinary route, to a live root (which recalls the
+    /// generation first), else the inbox and the lease path, where this
+    /// node takes the root over once the lease allows and ends the
+    /// generation itself (its own rows are then stranded and replayed by
+    /// rid, after the predecessor's tail). It still streams what it holds
+    /// and keeps asking for a renewal: a link that recovers before the
+    /// root reclaims gets the grant back (a granted renewal ends the
+    /// lapse); only a refusal or the log ends it. Lapsing is always safe:
+    /// it only gives up execution while the grant is not honoured anyway.
+    pub(crate) fn on_deleg_lapse(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        d.lapse_timer = None;
+        if d.designated || d.stopped || d.lapsed {
+            return;
+        }
+        let d = self.dl.mine.get(&gen).expect("present");
+        if now < d.until || now < self.deleg_lapse_at(d) {
+            self.arm_deleg_lapse(now, gen, out);
+            return;
+        }
+        tracing::warn!(
+            node = self.me(),
+            gen,
+            dir = d.dir,
+            root = self.root_node().unwrap_or(0),
+            until_ms = d.until.0,
+            "delegation lapsed unrenewed past the root's earliest reclaim: \
+             releasing its parked ops, still renewing"
+        );
+        self.stats.deleg_lapsed += 1;
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        d.lapsed = true;
+        let parked = std::mem::take(&mut d.parked);
+        let root = self.root_node().unwrap_or(0);
+        for p in parked {
+            self.answer_not_owner(now, p, root, replica, out);
+        }
+        self.deleg_renew_now(now, gen, out);
+        self.deleg_lapsed_retry(now, gen, out);
+        self.deleg_after_event(now, replica, out);
+    }
+
+    /// A lapsed generation asks for a renewal again every request
+    /// timeout: an unanswered one (a dead root never answers, nor fails
+    /// at the transport) has nothing else to bring it back.
+    fn deleg_lapsed_retry(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return;
+        };
+        if !d.lapsed || d.stopped || d.renew_timer.is_some() {
+            return;
+        }
+        let t = self.set_timer(
+            now.plus(self.deleg_request_timeout_ms()),
+            Timer::DelegRenew(gen),
+            out,
+        );
+        self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
+    }
+
     /// Plan 30 §M14: this node's honoured end of generation `gen` as its
     /// delegate (`None`: not held, stopped, or never renewed).
     pub(crate) fn deleg_mine_until(&self, gen: u64) -> Option<Ms> {
@@ -1891,6 +2016,13 @@ impl Core {
         let Some((_, sent)) = d.renew.take() else {
             return;
         };
+        if let Some(t) = d.renew_timer.take() {
+            // (A lapsed generation's retry.)
+            self.cancel_timer(t, out);
+        }
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
         if ttl_ms == 0 {
             // Refused: the generation is ending; stop executing (the log
             // ends it), keep the parked ops for `NotHolder` then.
@@ -1909,6 +2041,16 @@ impl Core {
         if until > d.until {
             d.until = until;
         }
+        if d.lapsed && now < d.until {
+            // The link came back before the root reclaimed: the grant is
+            // honoured again.
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen,
+                "a lapsed delegation was renewed"
+            );
+            d.lapsed = false;
+        }
         // Renew at half the ttl — at a quarter while this generation has
         // lock grants out: they are capped by what is left of it, and a
         // grant needs at least `2 × margin` of it (`lock_min_grant_ms`).
@@ -1918,8 +2060,9 @@ impl Core {
             sent.plus(ttl_ms / 2)
         };
         let t = self.set_timer(at.max(now.plus(1)), Timer::DelegRenew(gen), out);
+        self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
+        self.arm_deleg_lapse(now, gen, out);
         let d = self.dl.mine.get_mut(&gen).expect("present");
-        d.renew_timer = Some(t);
         if d.backup.is_some() && d.renew_backup != d.backup {
             // Phase 2b: the root seals the backup on a silent delegate
             // only once it knows it — tell it now, not at the next timer.

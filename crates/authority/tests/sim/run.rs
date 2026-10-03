@@ -495,6 +495,8 @@ pub struct Report {
     /// Plan 30 §M9: per holder crash, simulated ms from the crash to the
     /// first mutation any node acknowledged afterwards.
     pub failover_ms: Vec<u64>,
+    /// The longest a client's single submit waited (simulated ms).
+    pub longest_submit_ms: u64,
     /// Plan 30 §M10: continuation epochs formed (and with a roster node
     /// missing), and the authority samples taken.
     pub epochs_formed: usize,
@@ -550,6 +552,9 @@ pub struct Cluster {
     pub claim_ms: i64,
     /// Plan 30 §M14: the mutual-exclusion ghost and the lock files.
     pub locks: Arc<super::locks::LockGhost>,
+    /// The longest a client's single submit waited for its answer
+    /// (simulated ms).
+    pub longest_submit_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Cluster {
@@ -1048,7 +1053,12 @@ async fn client_thread(
                 abandoned.lock().unwrap().insert(rid);
                 break;
             }
+            let submitted = cluster.env.clock.elapsed_ms();
             let answer = handle.submit(rid, mop.clone()).await;
+            cluster.longest_submit_ms.fetch_max(
+                cluster.env.clock.elapsed_ms().saturating_sub(submitted),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             super::node::note_waiting(&format!("client t{thread}"), "answered".into());
             match answer {
                 // Plan 30 §M10: a frozen continuation epoch refuses writes
@@ -1997,6 +2007,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         nodes: Mutex::new(BTreeMap::new()),
         env,
         failovers: Mutex::new(Vec::new()),
+        longest_submit_ms: Default::default(),
         budget_exceeded: Mutex::new(Vec::new()),
         down: Mutex::new(BTreeMap::new()),
         claim_ms: 4 * cfg.s3_latency.1 as i64,
@@ -2541,6 +2552,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             ));
         }
     }
+    report.longest_submit_ms = cluster
+        .longest_submit_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
     report.failover_ms = cluster
         .failovers
         .lock()

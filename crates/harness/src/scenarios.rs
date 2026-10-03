@@ -25,6 +25,9 @@ mod cluster_restart;
 mod confinement;
 mod coop_churn;
 mod credrot;
+/// The K5a fix round: a delegate that is the root's backup loses the
+/// root, or is handed off.
+mod delegroot;
 mod ec2;
 /// Plan 39: `fsync` under S3 outages (hard, soft, interrupted) and
 /// `fsyncdir`.
@@ -1348,6 +1351,53 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: m11::delegate_crash_with_backup,
+    },
+    Scenario {
+        name: "delegate-root-loss",
+        desc: "two nodes, b the root's backup and the delegate of /d1, writing and fsyncing \
+               there; the root is kill -9ed: b takes the root over and no write + fsync waits \
+               past the seal-based failover bound; every write survives",
+        requires: &[],
+        caps: &[],
+        run: delegroot::delegate_root_loss,
+    },
+    Scenario {
+        name: "delegate-root-blackhole",
+        desc: "delegate-root-loss with the root frozen (SIGSTOP) instead of killed, as a \
+               force-deleted pod's vanished address answers nothing: b takes the root over \
+               within the same bound and every write survives",
+        requires: &[],
+        caps: &[],
+        run: delegroot::delegate_root_blackhole,
+    },
+    Scenario {
+        name: "delegate-root-loss-ttl",
+        desc: "two nodes, no backup (20 s lease), b the delegate of /d1 writing and fsyncing \
+               there; the root is frozen: b's grant lapses unrenewed, its writes take the \
+               lease path and b takes the root over by TTL within the lease TTL + 3 s (+ \
+               slack); every write survives",
+        requires: &[],
+        caps: &[],
+        run: delegroot::delegate_root_loss_ttl,
+    },
+    Scenario {
+        name: "delegate-handoff-renewal",
+        desc: "two nodes, b the root's backup and the delegate of /d1, writing and fsyncing \
+               there; b is handed off three times (daemon --upgrade): the resumed image \
+               re-adopts its delegation, its first writes wait for no renewal or reclaim",
+        requires: &[],
+        caps: &[],
+        run: delegroot::delegate_handoff_renewal,
+    },
+    Scenario {
+        name: "delegate-backup-handoff-failover",
+        desc: "two nodes, b the root's backup and the delegate of /d1, writing and fsyncing \
+               there; b is handed off (daemon --upgrade) and the root lists it as its backup \
+               again within seconds (b never seals the live root's epoch); the root is then \
+               kill -9ed and b takes it over by seal, within the seal-based bound",
+        requires: &[],
+        caps: &[],
+        run: delegroot::delegate_backup_handoff_failover,
     },
     Scenario {
         name: "auto-placement",

@@ -29,17 +29,17 @@ pub(super) fn deleg_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["delegation"].clone())
 }
 
-fn n(v: &serde_json::Value, key: &str) -> u64 {
+pub(super) fn n(v: &serde_json::Value, key: &str) -> u64 {
     v[key].as_u64().unwrap_or(0)
 }
 
-fn node_id(c: &Client) -> Result<u64> {
+pub(super) fn node_id(c: &Client) -> Result<u64> {
     c.control_status()?["node_id"]
         .as_u64()
         .with_context(|| format!("{} reports no node id", c.name))
 }
 
-fn print_deleg(scenario: &str, who: &str, d: &serde_json::Value) {
+pub(super) fn print_deleg(scenario: &str, who: &str, d: &serde_json::Value) {
     eprintln!(
         "    {scenario}: {who} delegation: enabled {} table {} mine {} gens {} | executed {} \
          forwarded-to-delegate {} deps-waits {} parked-expired {} not-owner {} installed {} \
@@ -1235,7 +1235,7 @@ impl Drop for StopOnDrop {
 }
 
 /// The lease holder of `clients`, if any holds.
-fn holder_of(clients: &[Client]) -> Option<usize> {
+pub(super) fn holder_of(clients: &[Client]) -> Option<usize> {
     (0..clients.len()).find(|i| lease_of(&clients[*i]).is_ok_and(|l| l["held"] == true))
 }
 
