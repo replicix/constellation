@@ -7297,6 +7297,15 @@ fn forwarded_mutations(_seed: u64) -> Result<()> {
 /// `connected` again within [`RESTART_REACH_BOUND`] of the remount, and
 /// (2) once it holds the lease again, a write on each of c0 and c1 is
 /// forwarded to it over P2P (not the S3 inbox), promptly.
+///
+/// No backups (`CONSTELLATION_BACKUPS=0`, a `Local` lease): with one, the
+/// crash is a seal-based failover by design (the listed backup seals the
+/// silent holder after 1.5 s and takes the lease at the next epoch), and
+/// c2's writes after its restart are forwarded to that new holder, which
+/// never moves the lease back. Whether the scenario met a backup depended
+/// on whether c2's backup tick ran before the crash, so it failed about
+/// one run in three. Unbacked, the dead holder's lease stays in force and
+/// c2's first write after the restart retakes it at the same epoch.
 fn p2p_same_identity_restart(_seed: u64) -> Result<()> {
     const RESTART_REACH_BOUND: Duration = Duration::from_secs(5);
     const FORWARD_BOUND: Duration = Duration::from_secs(5);
@@ -7304,10 +7313,12 @@ fn p2p_same_identity_restart(_seed: u64) -> Result<()> {
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/p2p-restart-{}", ts());
     // c2 creates the filesystem and writes first, so it takes the lease
-    // and keeps it (a sticky holder the others forward to).
+    // and keeps it (a sticky holder the others forward to), through its
+    // crash too: no backup may take it over.
     let tune = |c: Client| {
         c.with_own_node_key()
             .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "60000")
+            .with_env("CONSTELLATION_BACKUPS", "0")
     };
     let mut c0 = tune(Client::new(root.path(), "c0", &env.endpoint, &backend)?);
     let mut c1 = tune(Client::new(root.path(), "c1", &env.endpoint, &backend)?);
@@ -7368,6 +7379,7 @@ fn p2p_same_identity_restart(_seed: u64) -> Result<()> {
     };
 
     c2_holds(&c2, "c2-first", &mut write)?;
+    let epoch = lease_of(&c2)?["epoch"].clone();
     for c in [&c0, &c1] {
         // A cold start may still have c2 refusing a node it has not read
         // from the registry yet (its allowlist refresh is rate-limited),
@@ -7416,6 +7428,14 @@ fn p2p_same_identity_restart(_seed: u64) -> Result<()> {
     );
 
     c2_holds(&c2, "c2-again", &mut write)?;
+    // Nobody else held it meanwhile: unbacked and with no write pending
+    // elsewhere, nothing may claim a crashed holder's lease before it
+    // expires, so c2 retook its own at the same epoch.
+    let again = lease_of(&c2)?;
+    anyhow::ensure!(
+        again["epoch"] == epoch,
+        "the lease moved while c2 was down (epoch {epoch} before the crash): {again}"
+    );
     for c in [&c0, &c1] {
         let (p2p, took) = forward(c, &format!("after-{}", c.name), &mut write)?;
         eprintln!(

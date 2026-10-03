@@ -38266,3 +38266,83 @@ single-node `constellation mount` lost nothing.
 - The kind lane needs `fsGroup` and `requiresRepublish` to reproduce. A
   workload with no third party changing attributes (the single-node
   `mount` repro) never triggered it.
+
+## Fix: `p2p-same-identity-restart` met a seal-based failover about one run in three (`p2p-same-identity`)
+
+`harness run p2p-same-identity-restart` failed on main 3 of the first 5
+runs here, always at "c2 holds the lease (c2-again)": the lease was at
+epoch 2, holder 2 (c0), and c2 did not hold it.
+
+### Who advanced the epoch, and why
+
+Logs kept with `CHAOS_KEEP_TMP=1` (node ids: c2 = 1, c0 = 2, c1 = 3). A
+failing run:
+
+1. `04:07:37.786` c2 acquires the lease, epoch 1, `Local`.
+2. `04:07:43.050` c2's backup tick brings up c0 (its link to c2 is up
+   ≥ 2 s); `04:07:43.303` "backup set reconfigured backups=[2]
+   policy=Backup config_version=2".
+3. The scenario SIGKILLs c2 (just after c1's mount).
+4. `04:07:47.965` c0: "holder silent: sealed its epoch; reading the lease
+   to take over holder=1 epoch=1 silent_ms=1500", then "acquired the
+   lease node=2 epoch=2 takeover=true marker=true" and ships the epoch
+   marker. Later it picks c1 as its own backup (`config_version=4`).
+5. c2 remounts (same state, same node key). Its `c2-again` write is
+   forwarded to c0 over P2P. Forwards never move the lease, so c2 never
+   holds it again and the 30 s wait fails.
+
+So c0 advanced the epoch, through a **backup seal**: it was the listed
+backup of a holder that went silent. No write was pending, and none is
+needed. In the passing runs c2 was killed before its first backup tick
+(about 6 s after it acquired the lease), so the lease stayed `Local`.
+Nobody could take it before its expiry, and c2's first write after the
+restart retook its own lease at epoch 1 ("acquired the lease node=1
+epoch=1 takeover=true"). Whether the scenario passed depended only on
+whether c2's backup tick ran before the kill.
+
+### Expectation
+
+The product is right. In durability-and-failover.md, "Seal-based
+failover": a listed backup that hears nothing from its holder for
+`CONSTELLATION_BACKUP_TAKEOVER_MS` (1.5 s) seals the epoch and takes the
+lease at *e*+1. That is Layer B's purpose: a crashed holder with a backup
+fails over in seconds, not after a TTL. "A lease taken with no pending
+write" is exactly what this path does, and c2 really had failed. The
+scenario's bug was assuming the lease would wait for c2.
+
+### Fix (scenario only, no product change)
+
+`crates/harness/src/scenarios.rs`, `p2p_same_identity_restart`:
+
+- Every client mounts with `CONSTELLATION_BACKUPS=0`, the established
+  idiom for an unbacked `Local` lease (`lifecycle.rs` `CloseRace::Unbacked`,
+  `ec2.rs`). The scenario is about the P2P reach of a restarted node with
+  the same `EndpointId`: c0 and c1 must see it `connected` and *forward
+  to it*. That second half needs c2 to be the holder after its restart.
+  With a backup, the holder after the crash is c0, and "forwards to the
+  restarted node" cannot be tested. Seal-based failover is covered by
+  `backup-failover`, `backup-failover-with-delegation`, `ack-s3-failover`
+  and `lock-failover`.
+- New assertion: after `c2-again`, the lease epoch equals the one before
+  the crash. An unbacked lease of a crashed holder must not move while no
+  other node writes, so a product regression of that kind now fails the
+  scenario rather than passing by luck.
+- The doc comment records why there is no backup.
+
+The other reading ("assert c2's writes succeed through the current
+holder") was rejected: with a backup, c2's restart-time write is a
+forward *from* the restarted node, which dials out over a fresh
+connection. It does not exercise the pooled connections to the dead
+incarnation that the scenario exists to check.
+
+### Gates (this host, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `psi`, `TMPDIR=/var/tmp/psi/tmp`)
+
+| Command | Result |
+|---|---|
+| `harness run p2p-same-identity-restart` on main, `CHAOS_KEEP_TMP=1` | 2 PASSED, 3 FAILED of 5 (each failure is the seal above; logs read) |
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean, clean |
+| `cargo test -p constellation-authority --release` (sim included) | 182 + 4 + 111 passed, 0 failed, 11 ignored. With `TMPDIR` on `/var/tmp`, a concurrent run took over 4 h (fsync measured at 310 ms on the shared disk), and `a_panicking_node_fails_the_seed_promptly` missed its 20 s wall-clock bound under that load. It passed alone, and so did the whole suite with `TMPDIR=/dev/shm/psi` (80 s) |
+| `cargo test -p constellation-engine` | 551 + 1 passed, 0 failed, 9 ignored |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `harness run p2p-same-identity-restart` ×20 (fixed) | **20/20 PASSED**. c0/c1 see c2 connected 2–2800 ms after the remount; forwards to it go over P2P in about 1.2–1.6 s |
+| `harness run p2p-invalidation p2p-handover p2p-partition-tolerance p2p-same-identity-restart p2p-partition-one-node backup-failover ack-s3-failover backup-failover-with-delegation p2p-off-no-delegation lock-failover root-failover-with-delegates` | All PASSED. Two failed in the first pass, which ran next to the slow sim under heavy disk load: `root-failover-with-delegates` ("too few writes landed: 27") passed on its next run. `p2p-partition-one-node` ("b (majority side) had a write take 13–15 s during the partition") failed twice and passed on the third run, once the IO pressure had dropped. It is the load-sensitive failure plan 32 M3c recorded. This change touches neither scenario |
