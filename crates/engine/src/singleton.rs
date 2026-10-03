@@ -119,6 +119,14 @@ impl SingletonLease {
         self.lease.epoch
     }
 
+    /// When this holder's lease lapses by its own last write (Unix ms):
+    /// the expiry it computed before its latest acquire or renewal, so no
+    /// later than what the store holds. Past it, another node may take
+    /// the lease; this holder no longer leads by its own clock.
+    pub fn expires_unix_ms(&self) -> i64 {
+        self.lease.expires_unix_ms
+    }
+
     /// Push the expiry out by one TTL, by a CAS on the object this holder
     /// last wrote. [`Fenced`] when another holder replaced it: the caller
     /// must stop. Any other error is the store's.

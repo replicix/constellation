@@ -972,6 +972,17 @@ pub struct SnapSchedStatus {
     /// message)`.
     #[serde(default)]
     pub last_parse_error: Option<(String, usize, String)>,
+    /// The `_snapsched` lease epoch this node last took or renewed (0 =
+    /// never). Two nodes reporting `leader` with the same epoch would be
+    /// two leaders; a lower epoch is a predecessor that has not yet seen
+    /// it was replaced.
+    #[serde(default)]
+    pub lease_epoch: u64,
+    /// While `leader`: when the lease lapses by this node's last renewal
+    /// (Unix ms; `leader` turns false at it, a stalled leader included);
+    /// 0 otherwise.
+    #[serde(default)]
+    pub lease_until_unix_ms: u64,
 }
 
 /// Plan 32 Step 9's `SnapAcctStats`: the node-local space-accounting

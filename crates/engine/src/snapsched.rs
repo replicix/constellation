@@ -141,8 +141,16 @@ use std::time::Duration;
 pub struct SnapSchedStats {
     /// Scheduler ticks run on this node.
     pub ticks: AtomicU64,
-    /// Whether this node holds the `_snapsched` singleton lease.
+    /// Whether this node holds the `_snapsched` singleton lease, as of
+    /// its last tick. [`Self::status`] reports it only until
+    /// `lease_until_unix_ms`: a leader stalled past its lease's deadline
+    /// no longer leads by its own clock, whatever its last tick saw.
     pub leader: AtomicBool,
+    /// The `_snapsched` lease's epoch this node last took or renewed (0 =
+    /// never), and when that lease lapses (Unix ms, from the holder's last
+    /// acquire or renewal at the start of a tick; 0 = not leading).
+    pub lease_epoch: AtomicU64,
+    pub lease_until_unix_ms: AtomicU64,
     /// Policy roots seen by the last tick, and how many of them were
     /// paused, unparseable (skipped fail-closed), or capped
     /// (`CONSTELLATION_SNAPSCHED_MAX_PER_ROOT`).
@@ -197,12 +205,38 @@ impl SnapSchedStats {
         }
     }
 
+    /// This node took or renewed the `_snapsched` lease: it leads until
+    /// the lease's deadline.
+    fn set_leading(&self, lease: &SingletonLease) {
+        self.lease_epoch.store(lease.epoch(), Ordering::Relaxed);
+        self.lease_until_unix_ms.store(
+            u64::try_from(lease.expires_unix_ms()).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.leader.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this node leads at `now_unix_ms` by its own clock: its last
+    /// tick held the lease, and the lease has not lapsed since.
+    pub fn leading_at(&self, now_unix_ms: u64) -> bool {
+        self.leader.load(Ordering::Relaxed)
+            && now_unix_ms < self.lease_until_unix_ms.load(Ordering::Relaxed)
+    }
+
     /// The counters as `node.status` reports them.
     pub fn status(&self) -> constellation_control::proto::types::SnapSchedStatus {
         let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let now = crate::prune::now_unix_ms();
+        let leader = self.leading_at(now);
         constellation_control::proto::types::SnapSchedStatus {
             ticks: load(&self.ticks),
-            leader: self.leader.load(Ordering::Relaxed),
+            leader,
+            lease_epoch: load(&self.lease_epoch),
+            lease_until_unix_ms: if leader {
+                load(&self.lease_until_unix_ms)
+            } else {
+                0
+            },
             roots: load(&self.roots),
             paused_roots: load(&self.paused_roots),
             unparseable_roots: load(&self.unparseable_roots),
@@ -219,7 +253,7 @@ impl SnapSchedStats {
             refused_lag: load(&self.refused_lag),
             refused_state: load(&self.refused_state),
             last_refused_unix_ms: load(&self.last_refused_unix_ms),
-            now_unix_ms: crate::prune::now_unix_ms(),
+            now_unix_ms: now,
             last_create_unix_ms: load(&self.last_create_unix_ms),
             last_error: self.last_error.lock().ok().and_then(|g| g.clone()),
             last_parse_error: self.last_parse_error.lock().ok().and_then(|g| g.clone()),
@@ -697,7 +731,7 @@ impl Scheduler {
         if let Some(lease) = state.lease.as_mut() {
             match lease.renew().await {
                 Ok(()) => {
-                    stats.leader.store(true, Ordering::Relaxed);
+                    stats.set_leading(lease);
                     return Ok(true);
                 }
                 Err(error) if error.downcast_ref::<Fenced>().is_some() => {
@@ -722,9 +756,9 @@ impl Scheduler {
         {
             Ok(lease) => {
                 tracing::info!(epoch = lease.epoch(), "snapshot scheduler: leading");
+                stats.set_leading(&lease);
                 state.lease = Some(lease);
                 state.settled.clear();
-                stats.leader.store(true, Ordering::Relaxed);
                 Ok(true)
             }
             // Held, or another node won the create/swap race for it
@@ -1777,6 +1811,55 @@ mod tests {
             6,
             "one audit per tick that created"
         );
+    }
+
+    /// A leader that stops ticking (a stalled runtime) keeps its last
+    /// tick's `leader` flag, but its status stops claiming leadership the
+    /// moment its lease's deadline passes — before any other node can
+    /// take the lease, so two nodes never report `leader` at once. The
+    /// successor reports the next epoch; the stalled node's next tick is
+    /// fenced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_leader_past_its_lease_deadline_reports_not_leading() {
+        let (store, a, b, data, _) = holder_b().await;
+        bind(&b, &[&a], data, "10s:1m; skip-empty=no").await;
+        let now = test_clock();
+        // A TTL long against one in-process tick, so a loaded host does not
+        // run a's first tick past its own deadline.
+        let cfg = SchedConfig {
+            lease_ttl_ms: 3000,
+            ..config()
+        };
+        let ttl = Duration::from_millis(cfg.lease_ttl_ms);
+        let sa = scheduler(&a, store.clone(), &now, cfg.clone());
+        let sb = scheduler(&b, store.clone(), &now, cfg);
+        assert!(sa.tick(Run::Periodic).await.leader, "a takes the lease");
+        let led = sa.deps.stats.status();
+        assert!(led.leader, "{led:?}");
+        assert!(led.lease_epoch > 0, "{led:?}");
+        assert!(
+            led.lease_until_unix_ms > led.now_unix_ms,
+            "the deadline is ahead: {led:?}"
+        );
+        // a stalls: no tick, its flag stays as the last tick left it.
+        tokio::time::sleep(ttl + Duration::from_millis(100)).await;
+        assert!(sa.deps.stats.leader.load(Ordering::Relaxed));
+        let stalled = sa.deps.stats.status();
+        assert!(!stalled.leader, "past its deadline: {stalled:?}");
+        assert_eq!(stalled.lease_until_unix_ms, 0, "{stalled:?}");
+        assert_eq!(stalled.lease_epoch, led.lease_epoch, "{stalled:?}");
+        // b takes the lapsed lease at the next epoch; a still says no.
+        assert!(sb.tick(Run::Periodic).await.leader, "b takes over");
+        let took = sb.deps.stats.status();
+        assert!(took.leader, "{took:?}");
+        assert_eq!(took.lease_epoch, led.lease_epoch + 1, "{took:?}");
+        assert!(!sa.deps.stats.status().leader);
+        // a's next tick finds the lease taken: no longer leading at all.
+        let r = sa.tick(Run::Periodic).await;
+        assert!(!r.leader, "{r:?}");
+        assert!(!sa.deps.stats.leader.load(Ordering::Relaxed));
+        assert!(!sa.deps.stats.status().leader);
+        assert!(sb.deps.stats.status().leader);
     }
 
     /// Plan 32 Step 11: two schedulers race for `_snapsched` and exactly one

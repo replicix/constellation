@@ -1478,6 +1478,8 @@ mod tests {
             last_create_unix_ms: 1_790_000_000_000,
             last_error: Some("s3 down".into()),
             last_parse_error: None,
+            lease_epoch: 3,
+            lease_until_unix_ms: 1_790_000_010_000,
         };
         let report = SnapSchedReport {
             roots: vec![

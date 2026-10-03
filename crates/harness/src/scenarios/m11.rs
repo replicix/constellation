@@ -218,7 +218,10 @@ pub(super) fn kept_logs_dir() -> &'static std::path::Path {
 }
 
 /// A failed scenario's daemon logs, kept under [`kept_logs_dir`] (the
-/// mounts' temp dir goes with the scenario).
+/// mounts' temp dir goes with the scenario): every incarnation's, so a
+/// node killed and mounted again keeps its log from before the kill
+/// (`<scenario>-<name>.<n>.log`, oldest first) next to the current one
+/// (`<scenario>-<name>.log`).
 pub(super) fn dump_logs_on_failure(scenario: &str, clients: &[Client], result: &Result<()>) {
     // `HARNESS_KEEP_LOGS=1` keeps a passing scenario's logs too.
     if result.is_ok() && std::env::var_os("HARNESS_KEEP_LOGS").is_none() {
@@ -227,14 +230,32 @@ pub(super) fn dump_logs_on_failure(scenario: &str, clients: &[Client], result: &
     let dir = kept_logs_dir();
     let _ = std::fs::create_dir_all(dir);
     for c in clients {
-        let path = dir.join(format!("{scenario}-{}.log", c.name));
-        let _ = std::fs::write(&path, c.tail_log_n(400_000));
-        eprintln!(
-            "    {scenario}: {}'s log kept at {}",
-            c.name,
-            path.display()
-        );
+        let files = c.log_files();
+        let rotated = files.len().saturating_sub(1);
+        for (i, file) in files.iter().enumerate() {
+            let path = if i < rotated {
+                dir.join(format!("{scenario}-{}.{}.log", c.name, i + 1))
+            } else {
+                dir.join(format!("{scenario}-{}.log", c.name))
+            };
+            let _ = std::fs::write(&path, tail_lines(file, 400_000));
+            eprintln!(
+                "    {scenario}: {}'s log kept at {}",
+                c.name,
+                path.display()
+            );
+        }
     }
+}
+
+/// The last `n` lines of the file at `path` (empty if unreadable).
+fn tail_lines(path: &std::path::Path, n: usize) -> String {
+    std::fs::read_to_string(path)
+        .map(|s| {
+            let lines: Vec<&str> = s.lines().rev().take(n).collect();
+            lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default()
 }
 
 /// `constellation delegate <path> --to <node>` through the root's

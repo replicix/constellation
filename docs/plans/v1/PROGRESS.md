@@ -37783,3 +37783,363 @@ table. No interaction.
   `overload-cascade`.
 - `stress-ng-fs-faults` passed 8/8 with all six stressors, so it can leave
   `KNOWN_BUG_REPROS` once the reviewer agrees.
+
+## Plan 32 M4 — expiry
+
+**Milestone M4 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 4,
+plus Step 5's `policy rm --expire` and Step 11's two harness scenarios and a
+grace scenario): closed.** Two chunks: `32-m4a` (expiry, grace, the never-delete
+set; "Plan 32 M4a (expiry)" above keeps its detail, decisions and tests) and
+`32-m4b` (this one: the end-to-end proof in the harness and the milestone
+gate). Policies delete snapshots, and three harness scenarios now show across
+processes, a leader kill and an S3 outage that the deletions are exactly what
+`retention::evaluate` says over the audit journal.
+
+| Item | State | Where |
+|---|---|---|
+| **M4a** Step 4.1 one expiry run per root after creation (renew + re-read before every delete batch, holder-side `Delete { force: false }`, audit with reasons), Step 4.2 never-delete set (manual, held of every owner, orphaned, paused, refused), Step 4.3 grace state `snapsched/state.json` (format 2, ETag CAS), Step 5 `policy rm --expire`, the real grace note, `KEPT BY`/`EXPIRES`, the carried M3c "unreachable holder" gap (resign) | DONE (`32-m4a`) | `crates/engine/src/snapexpire.rs`, `crates/engine/src/snapsched.rs`, `crates/store-s3/src/snapsched.rs`, `crates/engine/src/control/snapsched.rs`, `crates/cli/src/{policy_cli,snapshot_cli}.rs` |
+| The **retention oracle** in the harness: the audit journal (`snapsched/journal/*.json`) and `state.json` read back from the bucket with `constellation-store-s3`'s own types (now a regular harness dependency); the creation list (journal `created`, plus by id its `deleted` and every auto snapshot seen listed; unjournaled ones fail outside a window the scenario names); `retention::evaluate` itself (linked from `constellation-meta`) over it with the held ones marked held; the side-by-side table; the per-tick deletion check; the fixed point (survivors = keep set within an expiry period + 20 s, then two more periods with no journal deletion) | DONE | `crates/harness/src/scenarios/snapsched.rs` (`read_audit`, `creation_list`, `check_oracle`, `check_deletions`, `render`, `grace_window`) |
+| Harness **`snapsched`** (replaces `snapsched-create`; no creation-only variant kept: every creation check it had runs here too, over the full creation list) | DONE | same, `snapsched` |
+| Harness **`snapsched-s3-outage`**: short grace; the cut starts once expiry deletes for real; nothing expires during it; expiry resumes; the oracle | DONE | same, `snapsched_s3_outage` |
+| Harness **`snapsched-grace`** (new) | DONE | same, `snapsched_grace` |
+| Registered in `SCENARIOS`; TESTING.md describes all three with their tolerances | DONE | `crates/harness/src/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+| Unit tests of the oracle itself: `the_oracle_is_evaluates_keep_set` (one survivor too many / too few / a stranger fail; a held one is kept and does not count against the rest), `the_deletion_check_judges_each_run_by_its_own_past` (a deletion is judged by the creations up to its tick; too early for the bucket, before the grace window, or of a held snapshot fails), `a_late_snapshot_covers_the_next_bucket_and_nothing_more` (fix round) | DONE | `crates/harness/src/scenarios/snapsched.rs` (6 tests with the 3 kept from M3c) |
+| **Product fix (fix round):** a scheduler stalled past its `_snapsched` lease deadline kept reporting `leader=true` until its next tick, so "two leaders at once" could not be told from a stale flag. `SnapSchedStats::status()` now reports `leader` only while the node's own lease deadline (`expires_unix_ms` of its last acquire or renewal) is ahead, and `snapshot.sched.status` / `node.status`'s `snapsched` carry `lease_epoch` and `lease_until_unix_ms` (schema re-blessed). Test `a_stalled_leader_past_its_lease_deadline_reports_not_leading` | DONE | `crates/engine/src/{snapsched,singleton}.rs`, `crates/control/src/proto/types.rs`, `docs/reference/configuration.md` |
+| **Test fix (not product):** `snapsched-s3-outage`'s "exactly one snapshot within a tick of the catch-up" (from M3c) counted the *next* bucket's scheduled snapshot when the catch-up landed in its bucket's last second (seen in the matrix: catch-up `…021950Z` at :59.212, `…022000Z` at :00.211). A burst means snapshots for missed buckets, so the count is now limited to the catch-up's bucket and earlier ones; the backfill guards (no name of a bucket that ended during the cut; each created within a bucket + tick + 5 s of its name) are unchanged | DONE | `outage_body` |
+
+The review's fix round made one product change (the `leader` flag above, a
+reporting fix: the lease itself and every fence were already right) and found
+no plan-32 scheduling bug; see "Fix round" below.
+
+### Scenario designs and tolerances
+
+All three: `CONSTELLATION_SNAPSCHED_TICK_MS=1000`, a seeded writer renaming a
+fresh counter value into `/proj/counter` every 0.8–1.2 s (every 10 s bucket has
+a change; a snapshot never freezes a half-written file), and at the end the
+writer stops and, once the newest snapshot holds the last value (skip-empty
+then creates nothing), the oracle runs.
+
+**`snapsched`** (two nodes with their own node keys, `10s:1m 1m:4m; last=2`,
+`CONSTELLATION_LEASE_TTL_MS=10000`, `CONSTELLATION_SNAPSCHED_GRACE_S=120`,
+`CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S=10`, 390–460 s):
+
+1. `b` creates the filesystem, holds the root lease, runs the writer; `a`
+   sets the policy and runs `snapshot sched run`, so `a` usually leads and
+   creates and deletes through `b` (in every gate run `a` led; in one earlier
+   development run `b` won the race and the scenario ran with the leader at
+   the holder and the kill moving the root lease too).
+2. Within 4–10 s of the policy: `snapshot create /proj@manual`, `snapshot
+   hold <first auto>`, `snapshot hold <second auto> --by csi:test-uid`
+   (asserted: under half the grace window).
+3. 150 s of schedule, sampled every 5 s on both nodes: never two leaders
+   (fix round: two nodes reporting `leader` fail only with the same
+   `lease_epoch`, or when the older epoch's `lease_until_unix_ms` is later
+   than the moment the newer one was read leading — the nodes are read one
+   after the other, so a read can straddle a handover);
+   root lease **holder 1 epoch 1 before and after** (every run); `expired > 0`.
+4. `kill -9` of the leader right after a snapshot lands; the survivor leads
+   within TTL + 5 ticks + 10 s; the killed node is mounted again; 100 s more.
+5. Skip-empty: 40 s idle → no creation, `skipped_empty` 0 → 4; one write →
+   exactly one snapshot holding it, in the write's bucket or the next.
+6. Final: the oracle on **both** mounts; over the full creation list no
+   bucket/name/id twice, every name stamped no earlier than its bucket, gaps
+   ≤ 16 s and every bucket covered while the writer ran — named for it, or
+   (fix round, plan Step 3.3's documented late-holder case) created inside it
+   — with one miss allowed across the kill only when the killed leader was
+   `b`, the writer; at most one
+   unjournaled creation, in the two buckets before the kill (none seen); the
+   first-sighting window in `state.json` is 120 s, opened within an expiry
+   period of the first creation, no deletion before it closed, and the
+   leader's `skipped_grace` rose (6–8: real victims were held back); every
+   deletion `no tier keeps it`, expired by `evaluate` at its tick, never a
+   held one; both mounts list the same `/proj` snapshots; the manual one and
+   both held ones survive, still held by `""` and `csi:test-uid`; frozen
+   counters never go backwards in `created` order on either mount and the
+   newest holds the last write; and (fix round) `evaluate` *without* the holds
+   expires both held snapshots, so the holds are what keeps them.
+   `skipped_empty` is summed over both nodes (fix round: the remounted node
+   may lead during the idle phase).
+
+**Why grace 120 s is safe (and not vacuous).** The holds land in the first
+~10 s, well inside the window, so no hold can race a deletion: the oracle marks
+them held for every expiry run and "no deleted snapshot was held" needs no
+timing. With the first two snapshots held, the first victim (a candidate that
+is not its minute's `1m` representative leaving the six-bucket `10s:1m`
+window) appears 90–100 s in, depending on where the UTC minute falls; 120 s
+keeps it back for two or three expiry runs, which `skipped_grace > 0` asserts.
+The first try used 90 s and failed exactly that assertion (`skipped_grace stayed
+0`: the window had closed before the first victim), which is why it is 120.
+The window still leaves expiry running for real for ~3 of the ~5 minutes the
+writer runs, across the kill, and through the `1m:4m` tier's first
+expirations (the minute representatives `…0106…`/`…0107…` below).
+
+**Gap tolerance** (unchanged from M3c, now applied to the creation list):
+`MAX_GAP_MS = TTL 10 000 + tick 1 000 + margin 5 000 = 16 000`. The margin
+covers noticing the last snapshot through a replica, the kill, the new
+leader's batch on a loaded host, and a root lease takeover when the dead leader
+held it. `snap-drain-busy` made the holder's batch fast under load, but the
+margin never was for a slow batch alone, so it stays. Measured takeover gaps:
+**10 602, 10 204, 10 280 ms** in the three gate runs (11 778 and 10 625 ms in
+development runs, one with `b` killed).
+
+**`snapsched-s3-outage`** (one node, same policy, default lease TTL 60 s,
+grace 20 s, expiry every 10 s, 210–350 s): waits until `expired > 0`
+(expiry deleting for real, so "nothing expires" is about a scheduler that was
+expiring), then cuts S3 for 90 s. Polled every 5 s: no new snapshot (one
+stamped in the first 2 s tolerated; none seen), **`expired` unchanged (1 → 1
+in every run) and every pre-cut snapshot still listed (7)**, `create_failed`
+rises (0 → 74 / 81 / 90 / 85). After the heal: one catch-up 908–928 ms after
+it (3.5 s once at load ~56), no snapshot naming a bucket that ended in the
+cut, each within a bucket + tick + 5 s of its name, exactly one for the
+catch-up's bucket or an earlier one within a tick of it, at least four in
+the next 40 s, `expired` rises again (1 → 6); then the oracle (an unjournaled
+creation is allowed only for a snapshot in flight at the cut; none seen) and
+no journal deletion from a tick inside the cut.
+
+**`snapsched-grace`** (one node, `10s:5m` → `10s:1m`, grace 30 s, expiry
+every 5 s, 135–175 s): ten snapshots under `10s:5m` (`expired` 0), then
+`setxattr` to `10s:1m`. `state.json` must show current `10s:1m`, prior
+`10s:5m`, a 30 s window dated within two expiry periods of the `setxattr`.
+Polled every second until the window's end: nothing vanishes, `expired`
+unchanged, while `skipped_grace` rises (0 → 30 / 32 / 33: the new policy
+wanted to delete). After it: `expired` rises within an expiry period + 15 s
+(the first deletion's tick was 0–4 000 ms after the window closed), and the
+oracle holds with the new policy (8 of 14 deleted); the journal carries
+exactly the two policies, no deletion's tick before the window's end. Fix
+round: right after the change, inside the window, the scenario holds the
+oldest snapshot — one `evaluate` with the new policy expires (asserted over
+what exists then, and the hold must land at least 5 s before the window
+closes); it survives, still held, and the oracle passes with it marked held
+(7 of 14 deleted).
+
+### Survivors vs `retention::evaluate` (one `snapsched` run, gate round 1, 444.6 s)
+
+The scenario log's table, verbatim (`created` = seconds after the first
+creation; the creation list is the audit journal's, 30 creations in 44
+journal entries, 0 unjournaled; 22 deletions journaled). `a` led and was
+killed at ~178 s (between `…010850Z` and `…010900Z`, gap 10 602 ms); `b`
+led from then on. The same check passed on `a`'s mount (remounted after the
+kill).
+
+```
+creation (journal)         created  retention::evaluate        survives
+auto-20261003T010610Z         0.0s  keep (held)                yes
+auto-20261003T010620Z         3.6s  keep (held: csi:test-uid)  yes
+auto-20261003T010630Z        13.6s  expire                     no
+auto-20261003T010640Z        23.9s  expire                     no
+auto-20261003T010650Z        34.4s  expire                     no
+auto-20261003T010700Z        43.7s  expire                     no
+auto-20261003T010710Z        53.6s  expire                     no
+auto-20261003T010720Z        63.8s  expire                     no
+auto-20261003T010730Z        73.6s  expire                     no
+auto-20261003T010740Z        83.7s  expire                     no
+auto-20261003T010750Z        93.7s  expire                     no
+auto-20261003T010800Z       103.6s  keep (1m)                  yes
+auto-20261003T010810Z       113.7s  expire                     no
+auto-20261003T010820Z       125.9s  expire                     no
+auto-20261003T010830Z       136.2s  expire                     no
+auto-20261003T010840Z       149.3s  expire                     no
+auto-20261003T010850Z       155.6s  expire                     no
+auto-20261003T010900Z       166.2s  keep (1m)                  yes
+auto-20261003T010910Z       173.2s  expire                     no
+auto-20261003T010920Z       183.2s  expire                     no
+auto-20261003T010930Z       193.2s  expire                     no
+auto-20261003T010940Z       203.5s  expire                     no
+auto-20261003T010950Z       213.2s  expire                     no
+auto-20261003T011000Z       223.2s  keep (1m)                  yes
+auto-20261003T011010Z       233.2s  expire                     no
+auto-20261003T011020Z       243.2s  expire                     no
+auto-20261003T011030Z       253.2s  expire                     no
+auto-20261003T011040Z       263.2s  keep (10s)                 yes
+auto-20261003T011050Z       273.2s  keep (10s·last)            yes
+auto-20261003T011130Z       314.2s  keep (10s·1m·last)         yes
+```
+
+Reading it: the anchor is `…011130Z` (the single write after 40 idle
+seconds). `10s:1m` keeps the buckets after `01:10:30`: `…011040Z`,
+`…011050Z` and the anchor. `1m:4m` keeps the first candidate of the minutes
+`01:08`–`01:11` (`…010800Z`, `…010900Z`, `…011000Z`, the anchor; `01:11`'s
+first is the anchor itself). The minutes `01:06` and `01:07` fell out of the
+window, so their representatives `…010630Z` and `…010700Z` went (the `1m`
+tier expiring for real). `last=2` keeps `…011050Z` and the anchor. The two
+held snapshots are outside the candidate set and kept; `/proj@manual` (not
+auto) survives too: 9 snapshots of `/proj` on both mounts, 8 auto.
+
+### Decisions taken here
+
+- **`snapsched-create` is renamed `snapsched`, with no creation-only fast
+  variant.** Every creation assertion it had (same set on both mounts,
+  names, gaps, consecutive buckets, the takeover, skip-empty, the root lease)
+  runs in `snapsched` over the full creation list, so a second scenario would
+  only repeat them without expiry.
+- **The gap and consecutive-bucket checks run over the full creation list,
+  not over the survivors.** The carried note suggested restricting the
+  consecutive check to kept buckets; with the journal as the creation list
+  every bucket the writer covered can be checked, which is stronger.
+- **The creation list also takes the journal's `deleted` entries and every
+  auto snapshot seen listed.** A leader killed between its holder's create and
+  its audit write loses the `created` entry (its successor's retry answers
+  `AlreadyExists`, journaled as skipped). Without this the oracle would miss
+  that snapshot; with it, an unjournaled snapshot is visible and allowed only
+  in the two buckets before the kill (or, in the outage scenario, in flight at
+  the cut). None appeared in any run.
+- **The per-tick deletion check uses the creations journaled up to that tick
+  (plus unjournaled ones created before it).** By monotonicity (adding newer
+  snapshots never revives an expired one) that set is a superset of what the
+  leader saw, so `deleted ⊆ evaluate's expire set over it` is a sound,
+  exact-direction bound, with no grace modelling needed (grace only removes
+  deletions).
+- **Expiry period 10 s in `snapsched`/`snapsched-s3-outage`, 5 s in
+  `snapsched-grace`** (default 60 s): one run per bucket keeps the fixed point
+  within 30 s of the stream stopping.
+- **The scenario lengths fit one 10-minute tool call** (`snapsched` 150 s +
+  100 s of schedule around the kill, ~7.5 min in all). "About 6 minutes"
+  of writer time is what the plan asks; the writer runs ~5 minutes here,
+  enough for the `1m:4m` tier to expire (see the table).
+- **`orphaned_snapshots` reading 0 with no policy root anywhere stays as is
+  (not fixed in M4).** Counting orphans needs a pass over every snapshot row
+  on every tick, while "no policy root at all" is exactly the case the plan
+  makes free (one index lookup, Goal / M3a). The gauge is right whenever any
+  policy exists, `policy ls` and `snapshot ls --orphaned` list orphaned streams
+  in every case, and nothing decides on the gauge. If M8's `/metrics` export
+  wants it exact, the cheap fix is to count on policy removal and on the
+  scheduler's first tick, not on every tick.
+
+### Gates (2026-10-03, this worktree, base `310d23b`, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+The host was very loaded throughout (load average 56 at the start, 130–300
+during the matrix and compliance; other agents' full harness shards and kind
+clusters).
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all` | no diff |
+| `cargo clippy --workspace --all-targets -- -D warnings` | exit 0, clean |
+| `cargo test --no-fail-fast` in groups (each under the 10-minute tool limit): `-p constellation -p constellation-harness -p constellation-engine -p constellation-control`; `-p constellation-meta -p constellation-store-s3 -p constellation-authority -p constellation-net`; the ten small crates; `--release -p constellation-model` | **2338 passed, 0 failed** (814 + 918 + 468 + 138), 47 ignored |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `bash tests/integration.sh` | port 4566 held by another agent's floci (`32-m3a-1002-070039-floci-1`): the script's body against it with its `AWS_*` settings (`tests/smoke.sh s3://constellation-ci/run-m4b-1790989479-1891737`): `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | exit 0 |
+| `target/release/harness run snapsched snapsched-s3-outage snapsched-grace` ×3 (prefix `m4b`, `TMPDIR=/var/tmp/m4b`; one scenario per call, since the three together exceed the 10-minute tool limit) | round 1: `snapsched` PASSED 444.6 s, `snapsched-s3-outage` PASSED 345.9 s (a first attempt was cut by my own 290 s call guard before it printed anything, at load 56; not a scenario failure), `snapsched-grace` PASSED 166.3 s; round 2: 390.0 / 217.5 / 174.8 s, all PASSED; round 3: 460.5 / 217.6 / 140.5 s, all PASSED. Then the full matrix ran `snapsched` 390.2 s PASSED, `snapsched-grace` 134.6 s PASSED and `snapsched-s3-outage` FAILED once on the catch-up burst check (the test bug fixed above). **After the fix, `snapsched-s3-outage` ×3 in a row: PASSED 295.3 s (the matrix's solo rerun), 238.0 s, 243.7 s** (the other two scenarios' code did not change after their three rounds) |
+| `target/release/harness run` (full matrix, 206 scenarios) | Run by name in slices of 1–14 per call (`timeout -k 15 480`, a pending list struck off by `=== <name> PASSED/FAILED/SKIPPED`; a slice cut by the guard had its unfinished scenario re-queued). **193 PASSED, 7 SKIPPED, 6 FAILED** after one solo rerun of every failure. The 7 skips are `passthrough-*` (need `CAP_SYS_ADMIN`); run as root (`sudo env -u XDG_RUNTIME_DIR HOME=/root … CONSTELLATION_HARNESS_DOCKER_PREFIX=m4b-root`) all 7 PASSED, and `subtree-confinement` PASSED as root too. Passed on the solo rerun: `backup-failover`, `lock-holder-killed-contention`, `root-failover-with-delegates`, `inbox-sporadic-write-p2p-off`, `prefetch-abandon-e2e` (its first try hit a docker name conflict with containers my own cut slice had left). Failed twice: see below |
+| `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed**, `COMPLIANCE TEST PASSED (baseline: 0 known failures)`, dev_fuse transport; the scheduler on (default) with no policy: inert. Ran as `SMOKE_IMAGE=m4b-smoke:local docker compose -f docker-compose.yml -f <override> --profile test run --rm compliance` (project = the worktree name); the override is `floci: ports: !reset []`, because 4566 was held by another agent's floci. A first attempt at load ~295 failed before pjdfstest started (`tests/lib.sh`'s 10 s mount wait: `FAIL: mount did not appear`); the retry at load ~240 passed |
+
+**The six matrix failures.** None runs a snapshot policy (the scheduler is
+inert without one), and this chunk changed no product code: the daemon in
+these runs is built from `310d23b`'s sources unchanged (the diff is
+`crates/harness/src/scenarios{.rs,/snapsched.rs}`, the harness `Cargo.toml`
+and docs). So they fail on a clean base build by construction. Each failed
+twice, at load 220–300:
+- `transport-lock-wait-budget`: `the holder said "lock: Resource temporarily
+  unavailable (os error 11)"` both times. Known to fail on its own base
+  (an earlier note: "fails on b458669 itself"); another chunk works on it.
+- `git-under-flock-rounds` (rerun only; it is 8–15 min alone, so it ran
+  last in its own call): `git add` got `Input/output error` writing objects
+  (3 turns failed). The `git-under-flock` family is on the known-bugs list.
+- `sqlite-first-touch-latency`: `disk I/O error`, `no such table: t`,
+  `database is locked` in 6 of 50 rounds, both runs. Same EIO-under-load
+  signature as the previous item.
+- `fuse-inval-storm`: `the holder must exit, not linger: … did not exit within
+  5s of kill -9: … thread (kernel-inval): D`, both runs: a daemon thread stuck
+  in the kernel in a FUSE reverse invalidation (the campaign-6 B-1 class) on
+  this 7.3-rc4 kernel under this load.
+- `distant-bigfile-stable`: a throughput floor, two different assertions
+  (`worst post-ramp-up block ran at 7.9 MiB/s (floor 10.0)`, then `cold read
+  took 5.7s; naive serial estimate is 38.4s — the prefetcher is not
+  pipelining enough`).
+- `takeover-marker-strands-promptly`: first `the first segment of the new
+  epoch (seq 4) must be B's (node 2) empty epoch-2 marker; it is node 2,
+  epoch 2, 1 record(s)`, then `a mount did not appear within 120s` (the
+  load).
+
+### Fix round (review of 32-m4b)
+
+Base: the coordinator's rebase onto `de53bd1`. Host load 36–186 during the
+runs; `TMPDIR=/var/tmp/m4bfix/tmp`, prefix `m4bfix`, one scenario per call
+(`timeout -k 10 575`).
+
+What changed:
+- **`skipped_empty` summed over both nodes** (must fix 1): the remounted
+  node may legitimately lead during the idle phase.
+- **The `leader` flag (should fix 1), a product fix** (table above), and the
+  harness's two-leader check rewritten on `lease_epoch` /
+  `lease_until_unix_ms`. The kill step's "exactly one leader" read is an
+  `eventually` (30 s) now, since a stalled leader correctly reads `false`.
+- **Every incarnation's log is kept on failure** (should fix 2):
+  `dump_logs_on_failure` writes `<scenario>-<node>.<n>.log` for each
+  `mount.log.<n>` next to the current one (all callers benefit).
+- **A failed series/consecutive check carries its evidence**: the kill and
+  phase times, both nodes' scheduler status, and a digest of every journal
+  entry (tick, node, created / skipped / failed / deleted), because the
+  journal goes with the scenario's bucket.
+- **Status reads wait out a stall**: `sched_status` calls
+  `snapshot.sched.status` over the control socket bounded at 60 s (it ran the
+  CLI, whose 10 s handshake timeout failed run 2 below), the `snapshot.list`
+  poll is bounded at 60 s, and the harness's `control_call_at` applies the
+  caller's bound to the Hello handshake too (it was a fixed 10 s). A status
+  read is not an assertion.
+- **The bucket check follows plan Step 3.3** (`check_consecutive`): a bucket
+  is covered when a snapshot is named for it *or* was created inside it. The
+  plan says so explicitly ("if the holder executed late and crossed into the
+  next bucket, the next bucket counts as covered. That is cosmetic, and
+  documented"), and `retention::due` implements exactly that. The old check
+  looked only at names, so it failed a correct scheduler (run 8 below). A
+  bucket covered by neither still fails, as do two snapshots in one bucket
+  (`a_late_snapshot_covers_the_next_bucket_and_nothing_more`).
+- Nits: the hold non-vacuity check; `snapsched-grace`'s hold inside the
+  window; `snapsched-s3-outage` reads its `expired` and listing baseline after
+  the cut is in place.
+
+**Every run** (`snapsched` 11 times, 7 passed):
+
+| Run | Code | Result | Failure mode |
+|---|---|---|---|
+| 1 | fix 1–2 | PASSED 417 s, takeover gap 10 089 ms | |
+| 2 | same | FAILED 264 s | both daemons froze for the same 17.23 s (a `slow core step event="Peer" handled_us=17230715`, b `event="S3" handled_us=17229631`, 08:34:23.7–40.97); a `sched status` CLI read timed out in its 10 s handshake. Harness fixed: status reads wait out a stall |
+| 3 | + 60 s reads, digest | FAILED 390 s | dropped bucket at the takeover: a (leader, not the writer) killed at 08:40:11.08 just after `…084010Z`; b's log is silent from 08:40:13.6 to 08:40:32.9 (a FUSE create of the writer took 18.3 s; "this node's S3 path is stalled" logged on waking), and b took the lease (epoch 2) 8 ms after it woke and created `…084030Z`. a's lease had lapsed at ~08:40:21, so `…084020Z` fell entirely inside b's stall. Correct behavior (catch-up, not backfill); the stall is the cause |
+| 4 | same | FAILED 391 s | gap 34.3 s, no bucket missing: b's tick for `…085230Z` ran its batch while b's S3 path stalled (snapshot created +20 084 ms); b's lease lapsed meanwhile and the remounted a correctly took epoch 3 (the two-leader check did not fire) |
+| 5–7 | same | PASSED 408 / 420 / 411 s, takeover gaps 9 881 / 10 908 / 10 995 ms | |
+| 8 | same | FAILED 404 s | gap 19.8 s: a's batch for `…091820Z` took 10 s (b, the holder, waited on its backup's acknowledgements: "removing a backup … no acknowledgement progress"), so it was created at :30.764, *inside* bucket `…091830`, which then counted as covered (plan Step 3.3) and got no snapshot of its own name. The gap is the load; the "missing" `…091830Z` was a harness bug, fixed above |
+| 9–11 | final | PASSED 406 / 444 / 413 s, takeover gaps 10 675 / 10 563 / 10 420 ms | |
+
+`snapsched-s3-outage` (final code): PASSED 242 s, `create_failed` 0 → 89,
+`expired` 1 → 1 during the cut, catch-up 960 ms after the heal, 6 deletions.
+`snapsched-grace`: PASSED 146 s (before the last harness change), then 137 s
+and 129 s on the final code; 7 deletions each, the first 1.0–2.0 s after the
+window closed, the held snapshot surviving.
+
+**The review's run 3** (a bucket dropped at the start, before the holds)
+cannot be re-examined: its logs and journal are gone. Two failure modes seen
+here produce exactly its signature (`X then X+20 s`): a late batch crossing
+into the next bucket (run 8, a harness bug, now fixed), or a node stalled for
+a whole bucket (run 3, environmental).
+
+**Why the stalls are not the scheduler's:** in each, the whole node was
+stuck (FUSE creates of 9–18 s, core steps of 17 s, S3 path flagged
+stalled), and the scheduler acted on its first tick after the node came
+back. `/var` is btrfs, 87 % full, with I/O `full` pressure up to 5.9 %
+(avg300) while these ran: the overload class already on record
+(multi-second core steps from fsync under the fjall journal lock / the
+writer mutex), outside plan 32. What remains open is that class itself, and
+the M3c `MAX_GAP_MS` bound (16 s) failing whenever such a stall hits a
+batch. That assertion was kept as it is (rule 4); under this host's load,
+expect `snapsched` to fail about one run in three.
+
+**Gates of the fix round:** `cargo fmt --all -- --check` no diff; `cargo
+clippy --workspace --all-targets -- -D warnings` clean; `cargo test -p
+constellation-harness -p constellation-engine -p constellation-control -p
+constellation` **840 passed, 0 failed** (a first run failed the unrelated
+`completion::tests::an_idle_thread_is_reused_and_idle_threads_exit`, a
+100 ms idle-exit timing test, at load 100; it passed alone and on the full
+rerun); `cargo build --release --workspace` ok; the harness runs above.
+
+### Exit criteria (plan 32 Step 12, M4)
+
+- [x] Step 4.1: one run per root, renew + re-read before every delete batch, holder-side `Delete { force: false }`, audit with reasons (`32-m4a`); end to end, every journaled deletion is one `evaluate` expires at its tick (`snapsched`, `snapsched-s3-outage`, `snapsched-grace`).
+- [x] Step 4.2: manual, held (plain and `csi:`), orphaned, paused, refused → never deleted (`32-m4a` tests); end to end, the manual and both held snapshots survive a 7-minute run with a leader kill, and no deleted snapshot was ever held.
+- [x] Step 4.3: grace state with an ETag CAS (`32-m4a`); end to end, nothing deleted before a first sighting's window closes (with `skipped_grace` showing real victims held back), and a policy shortened by `setfattr` deletes nothing until its window closes, then exactly what the new policy's `evaluate` says (`snapsched-grace`).
+- [x] Step 5: `policy rm --expire [--yes]`, the real grace delta, `KEPT BY` / `EXPIRES` (`32-m4a`).
+- [x] Step 11 `snapsched`: identical lists on both mounts; survivors = `retention::evaluate` over the journal's creations (table above); counters consistent with `created` order; manual and held survive; leader `kill -9`: no duplicate bucket, no gap over TTL + tick + margin.
+- [x] Step 11 `snapsched-s3-outage`: `create_failed` rises, nothing expires, one catch-up, no backfill.
+- [x] Expiry never moves the root lease: holder 1 / epoch 1 before and after in every `snapsched` run.
+- [x] Gates: fmt, clippy, tests (2338/0), smoke, integration, release build, the three scenarios 3/3 in the first round, the full matrix (193 PASSED + the 7 root-only PASSED as root; 6 load-exposed failures outside this chunk, listed above), compliance (see the table).
+- [ ] **`snapsched` is not reliable under this host's load**: the review measured 1 pass in 4, the fix round 7 in 11 (the last 3 in a row on the final code); every failure traced to a 10–20 s stall of a daemon's metadata/S3 path, not to a scheduling decision (see "Fix round"). Recorded as a known load flake.

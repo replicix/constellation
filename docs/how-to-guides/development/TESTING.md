@@ -1088,61 +1088,125 @@ roots:
   another snapshotted directory (`rm -r`, `mkdir`) and reads the old
   directory's snapshot under the new one (the path rule, unchanged).
 
-Plan 32 M3 (automatic snapshot creation) adds two scenarios
-(`crates/harness/src/scenarios/snapsched.rs`). Both put the policy
-`10s:1m 1m:4m; last=2` on `/proj` by `setxattr`, tick the scheduler every
-second (`CONSTELLATION_SNAPSCHED_TICK_MS=1000`), and run a seeded writer that
+Plan 32 M3 and M4 (automatic snapshot creation and expiry) add three
+scenarios (`crates/harness/src/scenarios/snapsched.rs`). Each puts a policy on
+`/proj` by `setxattr`, ticks the scheduler every second
+(`CONSTELLATION_SNAPSCHED_TICK_MS=1000`), shortens the grace window
+(`CONSTELLATION_SNAPSCHED_GRACE_S`) and the expiry period
+(`CONSTELLATION_SNAPSCHED_EXPIRE_EVERY_S`), and runs a seeded writer that
 renames a fresh counter value into `/proj/counter` every 0.8–1.2 s, so every
-10 s bucket has a change (`skip-empty` is on). Nothing is deleted: expiry
-(plan 32 M4a) runs, but `/proj` is a first sighting, which expires nothing
-for the default 24 h grace window, so the auto set only grows. `32-m4b`
-replaces the growth checks with the retention oracle (a short grace; the
-survivors equal `retention::evaluate` over the audit journal's creations).
-Expiry itself is covered by the in-process tests in
-`crates/engine/src/snapsched.rs` (steady state against `evaluate`, a hold
-racing the delete, grace, orphans, an unparseable policy, a fenced renewal,
-a lost `state.json` CAS, held `csi:` snapshots, an unreachable holder).
+10 s bucket has a change (`skip-empty` is on).
 
-- `snapsched-create`: two nodes with their own node keys. `b` creates the
+**The retention oracle.** Each scenario ends by stopping the writer; once the
+newest snapshot holds the last value (skip-empty then creates nothing), the
+surviving auto set must equal `retention::evaluate` — the real function from
+`constellation-meta` — over the *creation list*, with the snapshots the
+scenario held marked held. The creation list is read back from the
+scheduler's audit journal (`snapsched/journal/*.json`, parsed with
+`constellation-store-s3`'s own types), plus by id its `deleted` entries and
+every auto snapshot the scenario saw listed; an auto snapshot the journal
+does not record as created fails, except where the scenario allows it (the
+killed leader's last tick in `snapsched`, a snapshot in flight when the cut
+landed in `snapsched-s3-outage`). The scenario log prints both side by side,
+one line per creation: name, `created` (s after the first), `evaluate`'s
+verdict with its reasons (`keep (10s·1m·last)`, `keep (held: csi:test-uid)`,
+`expire`) and whether it survives. The survivors must reach that keep set
+within one expiry period + 20 s and stay there for two more periods (no
+journal deletion after it). Independently, every journaled deletion must have
+the reason `no tier keeps it`, be a snapshot `evaluate` expires over the
+creations journaled up to that tick (by monotonicity the exact bound: a later
+creation only expires more), not be held, and come from a tick no earlier
+than the grace window `snapsched/state.json` records for the root.
+
+- `snapsched`: two nodes with their own node keys, `10s:1m 1m:4m; last=2`,
+  lease TTL 10 s, grace 120 s, expiry every 10 s, ~7 min. `b` creates the
   filesystem, holds the root lease and runs the writer; `a` binds the policy
-  and runs `snapshot sched run` at once, so `a` leads the scheduler and
-  every snapshot is created at `b` through the holder-side batch (forwarded
-  over P2P). If `b`'s own tick wins that race, the scenario runs anyway with
-  the leader at the holder, and its log says so. After three minutes: at most
-  one leader in every 5 s sample (`snapshot sched status --json` on both);
-  the root lease's holder and epoch unchanged; both nodes' `snapshot ls
-  --json` list the same set (at least 15 snapshots); every name is
-  `auto-<UTC>` of a distinct 10 s bucket, stamped no earlier than the bucket
-  began; the counter read through `.constellation/snapshot/<name>/counter` on
-  both mounts never goes backwards in `created` order. Then it `kill -9`s
-  the leader (the node whose `sched status` says `leader`) right after a
-  snapshot lands. The survivor must lead within TTL + 5 ticks + margin, the
-  next minute must add at least 4 snapshots, no bucket may appear twice, no
-  gap between consecutive snapshots may exceed 16 s, and (the check that
-  catches a dropped bucket) while the writer runs consecutive snapshots must
-  name consecutive 10 s buckets (including across the kill, so a new leader
-  that skips its first bucket fails), except that when the killed leader is
-  `b`, which also carries the writer, the pair straddling the kill may miss
-  one bucket (its writes stall until `a` holds the root lease). The 16 s bound is lease
-  TTL (`CONSTELLATION_LEASE_TTL_MS=10000`) + one tick + a 5 s margin for
-  noticing the last snapshot through a replica, the kill, the new leader's
-  batch on a loaded host, and (when the dead leader held the root lease) the
-  root lease takeover. Measured gaps across the takeover are 10.5–10.9 s;
-  steady-state gaps are 10.0 s ± 30 ms. Skip-empty: the writer stops; once
-  the newest snapshot holds the last value, 40 s pass with no new snapshot
-  while `skipped_empty` rises (the leader asked, the holder said
-  "unchanged"). One write then gives exactly one snapshot, holding that
-  value, named for the bucket of the write or the next one.
-- `snapsched-s3-outage`: one node, default lease TTL (60 s, shorter than the
-  cut). After three healthy snapshots, toxiproxy cuts S3 for 90 s. No
-  snapshot may appear during the cut (a snapshot stamped in its first 2 s,
-  already past its S3 writes, is tolerated), and `create_failed` must rise.
-  After the heal: one catch-up snapshot, every new snapshot created within a
-  bucket + tick + 10 s of the bucket it names, and no snapshot naming a bucket
-  that ended during the cut (no backfill). Exactly one snapshot falls in the
-  catch-up's first tick (no burst), and at least four arrive in the 40 s
-  after it, at most a bucket + tick + 10 s apart. The snapshots from before
-  the cut are all still there.
+  and runs `snapshot sched run` at once, so `a` usually leads the scheduler
+  and every snapshot is created at `b` through the holder-side batch
+  (forwarded over P2P). If `b`'s own tick wins that race, the scenario runs
+  anyway with the leader at the holder, and its log says so. Within the
+  first ~10 s (asserted: under half the grace window) it creates the manual
+  snapshot `/proj@manual`, holds the first auto snapshot (plain) and the
+  second (`--by csi:test-uid`). Then 150 s of schedule, sampled every 5 s
+  (`snapshot.sched.status` and `snapshot.list` on both nodes, each read
+  bounded at 60 s so a node stalled with the host answers late rather than
+  failing the read): never two leaders. A node reports `leader` only until
+  its own `_snapsched` lease deadline, and the nodes are read one after the
+  other, so two `leader` answers fail only with the same `lease_epoch`, or
+  when the older epoch's `lease_until_unix_ms` is later than the moment the
+  newer one was read. The root lease's holder and epoch are unchanged after it, and
+  `expired` is above 0 by then. Then it `kill -9`s the leader right after a
+  snapshot lands; the survivor must lead within TTL + 5 ticks + 10 s; the
+  killed node is mounted again; 100 s more of schedule. Skip-empty: the
+  writer stops; 40 s pass with no new snapshot while `skipped_empty` (summed
+  over both nodes: the remounted one may lead by then) rises;
+  one write then gives exactly one snapshot, holding that value, named for
+  the bucket of the write or the next one. Final assertions:
+  - the oracle above, on **both** mounts;
+  - over the whole creation list (kept and expired): no bucket twice, no
+    name or id journaled twice, every name `auto-<UTC>` stamped no earlier
+    than its bucket began, consecutive creations at most 16 s apart while the
+    writer ran (lease TTL 10 s + one tick + a 5 s margin for noticing the last
+    snapshot through a replica, the kill, the new leader's batch on a loaded
+    host, and a root lease takeover when the dead leader held it; measured
+    takeover gaps 9.9–11.8 s), and every bucket covered while the writer
+    ran: a snapshot is named for it or was created inside it (plan 32 Step
+    3.3: a batch that lands after its bucket ended covers the next bucket,
+    which then gets no snapshot of its own name). An uncovered bucket fails,
+    except one across the kill when the killed leader was `b`, which also
+    carried the writer. On such a failure the error carries both nodes'
+    scheduler status and a digest of every journal entry;
+  - at most one unjournaled creation, created in the two buckets before the
+    kill;
+  - grace: `state.json`'s first-sighting window is 120 s, opened within an
+    expiry period of the first creation; no deletion before it closed; the
+    leader's `skipped_grace` rose above 0 (the window held real victims
+    back: with the first two snapshots held, the first victim appears
+    90–100 s in); the holds landed before it closed;
+  - both mounts list the same snapshots of `/proj` (auto, manual, held); the
+    manual one survives, both held ones survive still held by their owners;
+    `evaluate` *without* the holds expires both (the holds are what keeps
+    them);
+  - each surviving snapshot's counter, read through
+    `.constellation/snapshot/<name>/counter` on both mounts, never goes
+    backwards in `created` order, and the newest holds the last write.
+
+  Under heavy host load (`/var` I/O pressure) a node can stall for 10–20 s.
+  A stall that holds up a batch fails the 16 s gap bound, and one that
+  covers a whole bucket at the takeover drops it (correctly: no backfill).
+  The fix round of 32-m4b measured 7 passes in 11 runs at load 36–186. A
+  failed run keeps every incarnation's log, the killed node's pre-kill
+  `mount.log.<n>` included (`<scenario>-<node>.<n>.log`).
+- `snapsched-s3-outage`: one node, `10s:1m 1m:4m; last=2`, default lease TTL
+  (60 s, shorter than the cut), grace 20 s, expiry every 10 s, ~3.5 min. Once
+  `expired` is above 0 (expiry deleting for real), toxiproxy cuts S3 for 90 s.
+  The `expired` count and the listing are read once the cut is in place.
+  Polled every 5 s during the cut: no snapshot may appear (one stamped in its
+  first 2 s, already past its S3 writes, is tolerated), **nothing expires**
+  (`expired` unchanged, every snapshot listed before the cut still listed),
+  and `create_failed` must rise. After the heal: one catch-up snapshot, every
+  new snapshot created within a bucket + tick + 5 s of the bucket it names,
+  and no snapshot naming a bucket that ended during the cut (no backfill).
+  Exactly one snapshot naming the catch-up's bucket or an earlier one falls
+  in the catch-up's first tick (no burst; the next bucket's own snapshot may
+  follow within a tick when the catch-up lands in its bucket's last second),
+  and at least four arrive in the 40 s after it, at most a bucket + tick + 5 s
+  apart. `expired` rises again (the catch-up moved the anchor past the cut). Then the
+  oracle, and no journaled deletion from a tick during the cut.
+- `snapsched-grace`: one node, grace 30 s, expiry every 5 s, ~2.5 min.
+  `10s:5m` until ten snapshots exist (`expired` still 0), then `setxattr`
+  shortens it to `10s:1m`. `state.json` must record the change (current
+  `10s:1m`, prior `10s:5m`) with a 30 s window dated within two expiry
+  periods of the `setxattr`. Until the window closes, polled every second:
+  no snapshot disappears and `expired` does not move, while `skipped_grace`
+  rises (the new policy wanted to delete; the window held it back). Right
+  after the change, inside the window, it holds the oldest snapshot: one the
+  new policy expires (checked with `evaluate` over what exists then; the hold
+  must land at least 5 s before the window closes). After the window,
+  `expired` must rise within an expiry period + 15 s, and the oracle holds
+  with the new policy and that snapshot marked held. The held one survives,
+  still held; the journal carries exactly the two policies, and no deletion
+  is of a held snapshot or from a tick before the window's end.
 
 Phase 6b scenarios exercise E2E passphrase mode:
 

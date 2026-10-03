@@ -6639,6 +6639,20 @@
           "description": "This node holds the scheduler's singleton lease.",
           "type": "boolean"
         },
+        "lease_epoch": {
+          "default": 0,
+          "description": "The `_snapsched` lease epoch this node last took or renewed (0 =\nnever). Two nodes reporting `leader` with the same epoch would be\ntwo leaders; a lower epoch is a predecessor that has not yet seen\nit was replaced.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lease_until_unix_ms": {
+          "default": 0,
+          "description": "While `leader`: when the lease lapses by this node's last renewal\n(Unix ms; `leader` turns false at it, a stalled leader included);\n0 otherwise.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "now_unix_ms": {
           "default": 0,
           "format": "uint64",
@@ -8486,6 +8500,8 @@
             "last_parse_error": null,
             "last_refused_unix_ms": 0,
             "leader": false,
+            "lease_epoch": 0,
+            "lease_until_unix_ms": 0,
             "now_unix_ms": 0,
             "orphaned_snapshots": 0,
             "paused_roots": 0,

@@ -23,7 +23,14 @@ pub fn control_call_at(
     })?;
     control_runtime().block_on(async {
         let call = async {
-            let client = constellation_control::Client::connect_unix(&sock).await?;
+            // The caller's bound covers the handshake too: a daemon frozen
+            // with its host (a stalled core step, seen for 17 s on the
+            // shared build host) answers Hello late, not never.
+            let options = constellation_control::ClientOptions {
+                handshake_timeout: within,
+                ..Default::default()
+            };
+            let client = constellation_control::Client::connect_unix_with(&sock, options).await?;
             client.call_json(method, params).await
         };
         match tokio::time::timeout(within, call).await {

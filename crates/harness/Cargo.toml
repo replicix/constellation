@@ -29,6 +29,10 @@ constellation-platform.workspace = true
 constellation-meta.workspace = true
 # Plan 31 C5: the daemons' control protocol (client, socket discovery).
 constellation-control.workspace = true
+# Plan 32 M4: the snapshot scheduler's audit journal and grace state
+# (`snapsched/journal/*.json`, `snapsched/state.json`), read back with the
+# writer's own types by the `snapsched*` scenarios' retention oracle.
+constellation-store-s3.workspace = true
 tokio.workspace = true
 fjall = { version = "3.1", package = "fjall" }
 # `s3auth`: SigV4 for the harness's own raw S3 requests against the process
@@ -48,7 +52,7 @@ ureq = { version = "2", features = ["json"] }
 zstd.workspace = true
 
 [dev-dependencies]
-# `tests/s3_cut_heal.rs`: the daemons' own S3 client through the counting
-# relay, across a cut and a heal.
-constellation-store-s3.workspace = true
+# `tests/s3_cut_heal.rs`: the daemons' own S3 client (`constellation-store-s3`,
+# a regular dependency above) through the counting relay, across a cut and a
+# heal.
 object_store.workspace = true

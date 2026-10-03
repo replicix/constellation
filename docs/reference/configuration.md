@@ -883,6 +883,11 @@ The `_snapsched` lease's TTL is `CONSTELLATION_LEASE_TTL_MS` (default
 60 s), raised to at least three ticks. `constellation snapshot sched status`
 shows, per node, whether it leads, the counters, and every policy root's
 state and next snapshot; `snapshot sched run [--dry-run]` runs one tick now.
+A node reports `leader` only until its own lease deadline passes: a leader
+whose runtime stalled past it says "not leading" even before its next tick
+finds the lease taken. The JSON (`--json`, and `node.status`'s `snapsched`)
+also carries `lease_epoch` (the epoch this node last took or renewed) and,
+while leading, `lease_until_unix_ms`.
 A leader that cannot reach the store (an S3 outage) counts every due root's
 snapshot as `create_failed` on each tick, and catches up with one snapshot
 (not one per missed bucket) once the store is back. `create_failed` counts

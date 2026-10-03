@@ -65,7 +65,7 @@ mod slowseal;
 mod snapacct;
 /// Fix snap-drain-busy: snapshots of a busy holder under S3 latency.
 mod snapbusy;
-/// Plan 32 M3: automatic snapshot creation (`snapsched-*`).
+/// Plan 32 M3 + M4: automatic snapshot creation and expiry (`snapsched*`).
 mod snapsched;
 /// stress-ng's filesystem stressors, all at once, with verification.
 mod stressfs;
@@ -455,24 +455,34 @@ pub const SCENARIOS: &[Scenario] = &[
         run: crate::snapchurn::run,
     },
     Scenario {
-        name: "snapsched-create",
-        desc: "plan 32 M3: a 10s policy on /proj, two nodes, a writer on b: 3 min of one \
-               auto-<UTC> snapshot per bucket, the same set on both mounts, frozen counters \
-               never go backwards, the root lease never moves; kill -9 the scheduler leader: no \
-               bucket twice, no gap over TTL + tick + margin; skip-empty: 40 s idle gives none, \
-               one write exactly one",
+        name: "snapsched",
+        desc: "plan 32 M3+M4: `10s:1m 1m:4m; last=2` on /proj, two nodes, a writer, 120 s grace: \
+               ~6 min of one auto-<UTC> snapshot per bucket with expiry, a manual and two held \
+               (plain, csi:) snapshots; kill -9 the scheduler leader mid-run (no bucket twice, \
+               no gap over TTL + tick + margin); skip-empty; then the survivors equal \
+               retention::evaluate over the audit journal's creations on both mounts, every \
+               deletion was expired by evaluate at its tick, none before the grace window closed",
         requires: &[],
         caps: &[],
-        run: snapsched::snapsched_create,
+        run: snapsched::snapsched,
     },
     Scenario {
         name: "snapsched-s3-outage",
-        desc: "plan 32 M3: a 10s policy through a 90 s S3 cut: create_failed rises, no snapshot \
-               appears during the cut, exactly one catch-up after the heal (no backfill), then \
-               one per bucket again",
+        desc: "plan 32 M3+M4: a 10s policy, expiring, through a 90 s S3 cut: create_failed rises, \
+               nothing appears and nothing expires during the cut, exactly one catch-up after \
+               the heal (no backfill), expiry resumes, survivors equal retention::evaluate",
         requires: &[],
         caps: &[],
         run: snapsched::snapsched_s3_outage,
+    },
+    Scenario {
+        name: "snapsched-grace",
+        desc: "plan 32 M4: ~10 snapshots under 10s:5m, shortened to 10s:1m by setxattr: nothing \
+               is deleted until the (30 s) grace window state.json records closes, then exactly \
+               what retention::evaluate says under the new policy",
+        requires: &[],
+        caps: &[],
+        run: snapsched::snapsched_grace,
     },
     Scenario {
         name: "e2e-basic",
