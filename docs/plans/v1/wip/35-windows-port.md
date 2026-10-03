@@ -636,7 +636,7 @@ Questions:
   `FspFileSystemNotify*`, the `FspPosixMap*` helpers, and `FspLoad`-style
   dynamic DLL resolution via the registry install path (`HKLM ...\WinFsp` —
   confirmed present by W0's probe).
-- `CONSTELLATION-PATCH.md`/`UPSTREAM-ISSUE.md`-style notes are not needed
+- `CONSTELLATION-PATCH.md`/`vendor/ISSUE-<lib>.md`-style notes are not needed
   here (this is bindings we wrote, not a vendored fork of someone else's
   source, unlike `vendor/fjall`/`vendor/embednfs`) — but the crate's
   `README.md` documents exactly which WinFsp release (`2.1.25156` at time of

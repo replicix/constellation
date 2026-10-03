@@ -146,7 +146,7 @@ window, so the logger widens the window the way a preempted worker would.
 
 ## Dropping the patch
 
-Once upstream fixes this (see `UPSTREAM-ISSUE.md`):
+Once upstream fixes this (see `../ISSUE-fjall.md`, the issue to file):
 
 1. Remove the `[patch.crates-io]` table and the `"vendor/fjall"` entry in
    `exclude` from the workspace `Cargo.toml`.

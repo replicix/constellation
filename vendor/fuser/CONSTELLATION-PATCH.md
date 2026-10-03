@@ -922,3 +922,5 @@ the same dispatcher, while the request they name may be served on one of
 
 Regenerated as `git diff --no-index <pristine-plus-0001-and-0002>
 vendor/fuser`; `tools/vendor-fuser.sh --check` verifies the series.
+
+The upstream issue to file for this patch, with a verified reproducer, is `../ISSUE-fuser.md`.

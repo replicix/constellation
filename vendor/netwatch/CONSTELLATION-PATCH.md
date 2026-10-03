@@ -97,3 +97,5 @@ Upstream iroh also has a fragility of its own that this patch does not
 change: the socket actor awaits a send to each `RemoteStateActor` inbox,
 so any one stuck actor stalls every other peer of the endpoint. That is
 worth an upstream issue too.
+
+The upstream issue to file for this patch, with a verified reproducer, is `../ISSUE-netwatch.md`.
