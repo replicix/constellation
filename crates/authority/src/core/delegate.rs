@@ -1309,13 +1309,22 @@ impl Core {
             return;
         }
         // Phase 2b: a new root (a failover) gets every unretired
-        // transaction again; it deduplicates by cursor and rid.
+        // transaction again; it deduplicates by cursor and rid. What the
+        // log carries counts as acknowledged, as at install: the new
+        // root replayed the log before it serves, and those rows are
+        // retired here — no batch can carry them, so no answer would
+        // ever acknowledge them. From 0, a generation whose first
+        // unretired row depends on another generation of this node waits
+        // for that one's acknowledgement (`deleg_stream`), and two that
+        // depend on each other never send at all (git-under-flock-faults
+        // fault #14: rows 19.. of gen 4 behind (6, 2), row 2 of gen 6
+        // behind (4, 18); every op parked on the new root for 120 s).
         let root = self.root_node();
         let mut stale_reqs = Vec::new();
         for d in self.dl.mine.values_mut() {
             if d.last_root != root {
                 if d.last_root.is_some() && root.is_some() {
-                    d.streamed_through = 0;
+                    d.streamed_through = replica.log_stream_idx(d.gen);
                     // The old root's answer to the batch in flight must
                     // not count for the new one (see
                     // `on_delegate_stream_ack`).
@@ -1496,8 +1505,12 @@ impl Core {
             // locally). The root must hold that first: the batch stops
             // before a transaction whose own-generation deps the root has
             // not acknowledged, and goes out once it has.
+            // A row the log carries is the root's whatever it answered
+            // (an acknowledgement lost, then the row retired here).
             let acked_here = |h: u64, i: u64, mine: &BTreeMap<u64, DelegateState>| -> bool {
-                h == gen || mine.get(&h).is_none_or(|o| o.streamed_through >= i)
+                h == gen
+                    || mine.get(&h).is_none_or(|o| o.streamed_through >= i)
+                    || replica.log_stream_idx(h) >= i
             };
             if let Some(stop) = txs.iter().position(|t| {
                 t.deps

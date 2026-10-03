@@ -308,6 +308,7 @@ fn replay_seed() {
         Ok("delegated-epoch") => delegated_epoch_config(),
         Ok("delegated-faults") => delegated_faults_config(),
         Ok("delegated-root-crash") => delegated_root_crash_config(),
+        Ok("delegated-two-gens-root-crash") => delegated_two_gens_root_crash_config(),
         Ok("delegated-backup") => delegated_backup_config(),
         Ok("delegated-backup-crash") => delegated_backup_crash_config(),
         Ok("delegated-designated") => delegated_designated_config(),
@@ -2514,6 +2515,7 @@ fn sweep_config() {
         "long-sessions" => long_sessions_config(),
         "long-strict" => long_strict_config(),
         "delegated-backup" => delegated_backup_config(),
+        "delegated-two-gens-root-crash" => delegated_two_gens_root_crash_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
         "placement-hot" => placement_hot_config(),
         "backup-hot" => backup_hot_config(),
@@ -2720,6 +2722,33 @@ fn delegated_root_crash_config() -> SimConfig {
             at_ms: 1_500,
             kind: FaultKind::CrashHolder {
                 restart_ms: Some(5_000),
+                keep_journal: true,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// `git-under-flock-faults` fault #14: one delegate holds two
+/// generations (all of `d1`, half of `d2`'s names: a node holds one
+/// whole delegation, the harness's delegate held a whole directory and
+/// a range of `/`) and its marker writer
+/// alternates between them, so each generation's transactions depend
+/// on the other's; the root dies once rows of both are in the log (the
+/// delegate retired them) and a successor inherits the table.
+fn delegated_two_gens_root_crash_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        delegations: vec![("d1".into(), 2)],
+        range_delegations: vec![("d2".into(), 2, (1, 0))],
+        // `d2`'s halves have different owners: linearizable per range.
+        check_range_bits: 1,
+        marker_pairs: 10,
+        cross_ratio: 0.0,
+        faults: vec![ScheduledFault {
+            at_ms: 2_000,
+            kind: FaultKind::CrashHolder {
+                restart_ms: Some(6_000),
                 keep_journal: true,
             },
         }],
@@ -3086,6 +3115,27 @@ fn delegated_root_failover_keeps_every_ack() {
         "delegated-root-crash",
         delegated_root_crash_config(),
         66_000..66_030,
+    );
+    assert!(
+        t.inherited > 0,
+        "no successor inherited a generation: {t:?}"
+    );
+    assert!(t.restreams > 0, "no delegate re-streamed: {t:?}");
+}
+
+/// `git-under-flock-faults` fault #14: a root failover under a delegate
+/// of two generations whose rows depend on each other. The re-stream
+/// restarted both from 0 while their early rows were already retired
+/// (the log carried them): each generation's first unretired row waited
+/// for the other's acknowledgement, no batch was ever sent, and every op
+/// parked on the new root until its deadline (seeds 18, 85 and 92 never
+/// quiesced). The re-stream now starts where the log is.
+#[test]
+fn delegated_two_generations_re_stream_after_a_root_failover() {
+    let t = run_m11(
+        "delegated-two-gens-root-crash",
+        delegated_two_gens_root_crash_config(),
+        0..100,
     );
     assert!(
         t.inherited > 0,

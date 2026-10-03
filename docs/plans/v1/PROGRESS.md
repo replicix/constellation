@@ -35796,3 +35796,122 @@ the remaining small crates 467, `constellation-model` (release) 138 — 0 failed
 | `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
 | `harness run` `lock-holder-partitioned lock-failover lock-fence-at-close lock-holder-killed-contention lock-latency lock-grant-dead-generation` | all PASSED. lock-failover's first attempt died at mount: "Disk quota exceeded" on the shared `/tmp` tmpfs. With `TMPDIR` on `/var` it PASSED |
 | `harness run` `backup-failover backup-departs backup-partition backup-takeover-holds-missing-chunks backup-takeover-drops-held-chunks backup-failover-with-delegation ack-s3-failover root-failover-with-delegates` | all PASSED. `backup-takeover-drops-held-chunks` failed once: "c1 daemon did not exit after unmount within 120s" after `fusermount3: … Device or resource busy`. It then passed 2/2 alone |
+
+## Fix: a two-generation delegate's re-stream deadlocks after a root failover; the placement skips a writer its roster has not caught up with (`delegate-restream`)
+
+### 1. `git-under-flock-faults` fault #14: the re-stream never sent a batch (product)
+
+The main-gate run (`/tmp/main-gate-artifacts/uring-git-under-flock-faults-1/`)
+looked like a lost batch: a logged "re-streaming to a new root" while b
+was still in its takeover gate. Nothing in the counters supports that:
+
+- a reports 0 `stream_refused`, and b reports 0 `stream_refusals` and 0
+  `appended_txs`. A batch sent into the gate would have been refused and
+  retried on the backoff.
+- a's `streamed_txs` since its restart is 19. That is exactly gen 4 rows
+  1–18 plus gen 6 row 1, which c had appended and b inherited.
+
+So after the re-stream, a sent nothing at all.
+
+**Mechanism.** a held two generations: gen 4, all of `/gitrepo/d-a`,
+and gen 6, a range of `/`. The git writer's session made the rows of
+each depend on the other: gen 6 row 2 depends on (4, 18), and gen 4
+rows 19 onwards depend on (6, 2). Plan 30 §M12 holds a batch back
+before a row whose other-generation deps the root has not acknowledged
+(`deleg_stream`'s `acked_here`). The re-stream reset both cursors
+(`streamed_through`) to 0. Rows 1–18 of gen 4 and row 1 of gen 6 were
+already retired, because the log carried them, so no batch could
+carry them again and no acknowledgement would ever raise either cursor.
+Each generation's first unretired row then waited for the other's
+acknowledgement, and neither batch was sent. b parked every op that
+depended on (4, 24) or (6, 2) (`exec_parked` 4, `deps_waits` 4) until
+the 120 s deadline (EIO, "in doubt"). The gate timing was incidental:
+the same deadlock follows any re-stream once both generations have
+retired rows.
+
+**Fix:** `crates/authority/src/core/delegate.rs`.
+
+- A re-stream starts each generation at the log's index
+  (`log_stream_idx`), as a newly installed delegation already does, not
+  at 0. A new root has replayed the log before it serves, and the rows
+  the log carries are retired here.
+- The cross-generation check also counts a dep the log carries as
+  acknowledged. This covers a lost acknowledgement followed by the
+  row's retirement, without a re-stream.
+
+There is no timer: the cursor simply starts where the root's must be.
+
+**Regression test:** sim
+`delegated_two_generations_re_stream_after_a_root_failover`
+(`AUTHORITY_SIM_CONFIG=delegated-two-gens-root-crash`, seeds 0..100).
+Node 2 holds all of `d1` and half of `d2`'s names (a node holds one
+whole delegation). Its marker writer alternates between the two
+directories, and the root crashes at 2 s. Before the fix, seed 18 never
+quiesced: it re-streamed at t=6436 and sent no batch afterwards, and 7
+of seeds 0..300 failed the same way. After the fix, seeds 0..2000 pass.
+
+### 2. `auto-placement`: the root lease moved to b before d1 was placed (product, not the test)
+
+In the failing runs, the delegation placement never acted during b's
+first ~5 s of writes, whereas it normally acts within 0.4 s. At the
+root lease placement's first 5 s evaluation, the lease went to b, the
+only writer. With a diagnostic dump: `place_evaluations` 12,
+`place_skipped_unreachable` 9. During that time b was forwarding 326
+ops to the root over P2P.
+
+The root's write-eligible roster is read at mount and then every 5 s
+(`node.rs`). b registered after the root mounted, so for up to 5 s the
+placement treated an active, connected writer as unreachable. The
+failures were the runs whose setup finished quickly enough for b to
+start writing inside that window.
+
+**Verdict:** the product was wrong, not the test.
+
+- Moving the lease to b is correct root-lease placement for a node that
+  writes everything. The design, however, makes subtree placement the
+  main mechanism. A live generation stops the root lease from moving,
+  so the lease only moved because the subtree placement skipped b for a
+  stale reason.
+- The scenario rightly leaves root lease placement on, the default.
+
+**Fix:** `crates/authority/src/core/placement.rs`, `place_eligible`. A
+connected candidate that the roster does not list makes the root
+re-read the roster (`Action::RefreshRoster`, at most once a second), and
+the next tick places it. This applies to whole-subtree and range
+candidates alike. A node that is genuinely not write-eligible is still
+skipped.
+
+**Regression test:**
+`core::tests::placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list`.
+Before the fix it fails with "the roster was not re-read".
+
+### Exit criteria / gates
+
+| gate | result |
+|---|---|
+| `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` (run per package; `ulimit -n 65536`), `-p constellation-model --release` | 0 failed (authority 158 + 4 + 108 sim, engine 520, …) |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED (private `CONSTELLATION_REGISTRY`) |
+| `cargo build --release --workspace` | ok |
+| `harness run auto-placement` ×20 (10 `dev-fuse` seeds 101–110, 10 `uring` seeds 201–210) | **20/20 PASSED**; d1 placed after 0.31–1.02 s |
+| `harness run git-under-flock-faults` ×30 (`dev-fuse` 1001–1015, `uring` 2001–2015, prefix `drs-<transport>`) | **28/30 PASSED**: `uring` 15/15, `dev-fuse` 13/15. The two failures are not this mechanism (no re-stream involved), see below |
+| every `delegate-*`, `lock-*`, `*failover*`, `p2p-*` scenario (19), one pass per transport | **38/38 PASSED** |
+| `docker compose -p drs --profile test run --rm compliance` (`SMOKE_IMAGE=drs-smoke:local`, floci host port dropped) | **8798 passed, 0 failed** |
+
+### Open
+
+- `git-under-flock-faults` seed 1001 (`dev-fuse`, logs:
+  `/tmp/harness-git-under-flock-faults-logs-1790975746311810873`). Fault
+  #6, a `kill -9` of the whole cluster. After the restart, c's and d's
+  forwards to the root a timed out for 56 s and >120 s. a's gossip dials
+  to c and d timed out, and from 21:14:32 a logged inbound QUIC
+  "authentication failed". d's `gitflock-alive` setattr hit EIO after
+  120 s. No delegation re-streamed. This looks like stale peer addresses
+  after a simultaneous restart: every node gets a new port, and a port
+  may be reused by another node. That is a P2P addressing issue for the
+  `net` crate.
+- `git-under-flock-faults` seed 1013 (`dev-fuse`). a's fjall journal hit
+  `Disk quota exceeded` (EDQUOT) on the host's shared `/tmp` tmpfs
+  (`usrquota`, 23–24 G used by all agents). The store was poisoned
+  (`last_ship_error: fjall: FjallError: Poisoned`), so "a drains" never
+  happened. This is environmental. No delegation existed in that run.

@@ -108,7 +108,12 @@ pub(crate) struct PlacementState {
     /// The last evaluation's top subtrees, `(dir, node, node_ops,
     /// subtree_ops)`, for `status` (and M12's split decision).
     pub top: Vec<(Ino, NodeId, u64, u64)>,
+    /// When a candidate outside the roster last had it re-read.
+    roster_refreshed: Option<Ms>,
 }
+
+/// How often a candidate the roster does not list has it re-read.
+const ROSTER_REFRESH_MS: i64 = 1_000;
 
 /// The hash bucket of a name (its range at the histogram's resolution).
 pub fn bucket_of(name: &str) -> u8 {
@@ -276,6 +281,38 @@ impl Core {
         self.place_evaluate(now, replica, out);
     }
 
+    /// Whether `node` may be given a subtree: connected and in the
+    /// write-eligible roster. A connected node the roster does not list
+    /// has it re-read (at most once a second): the roster is read at
+    /// mount and every 5 s after, so a peer that registered after this
+    /// node mounted and writes at once was skipped as unreachable for up
+    /// to 5 s while its forwards streamed in — long enough for the root
+    /// lease placement to hand it the lease first (harness
+    /// `auto-placement`, 2 in 11: `place_skipped_unreachable` 9, the
+    /// lease on b at the 5 s evaluation, `d1` never delegated).
+    fn place_eligible(&mut self, now: Ms, node: NodeId, out: &mut Vec<Action>) -> bool {
+        if !self.links.get(&node).is_some_and(|l| l.connected) {
+            return false;
+        }
+        if self.roster.contains(&node) {
+            return true;
+        }
+        if self
+            .pl
+            .roster_refreshed
+            .is_none_or(|at| now.since(at) >= ROSTER_REFRESH_MS)
+        {
+            self.pl.roster_refreshed = Some(now);
+            tracing::debug!(
+                node = self.cfg.node_id,
+                candidate = node,
+                "placement: a connected writer outside the roster; re-reading it"
+            );
+            out.push(Action::RefreshRoster);
+        }
+        false
+    }
+
     fn place_evaluate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.stats.place_evaluations += 1;
         let per_dir = self.pl.per_dir();
@@ -415,9 +452,7 @@ impl Core {
                 self.stats.place_skipped_cooldown += 1;
                 continue;
             }
-            let reachable =
-                self.links.get(&node).is_some_and(|l| l.connected) && self.roster.contains(&node);
-            if !reachable {
+            if !self.place_eligible(now, node, out) {
                 self.stats.place_skipped_unreachable += 1;
                 continue;
             }
@@ -477,15 +512,12 @@ impl Core {
                 if qualifiers.len() < 2 {
                     continue;
                 }
-                let delegates: Vec<NodeId> = qualifiers
-                    .iter()
-                    .copied()
-                    .filter(|n| {
-                        *n != me
-                            && self.links.get(n).is_some_and(|l| l.connected)
-                            && self.roster.contains(n)
-                    })
-                    .collect();
+                let mut delegates: Vec<NodeId> = Vec::new();
+                for n in qualifiers.iter().copied() {
+                    if n != me && self.place_eligible(now, n, out) {
+                        delegates.push(n);
+                    }
+                }
                 if delegates.is_empty() {
                     self.stats.place_skipped_unreachable += 1;
                     continue;

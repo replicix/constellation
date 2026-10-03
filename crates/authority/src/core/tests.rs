@@ -9976,3 +9976,74 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
     let (done, _) = drive_until_answered(&mut h, first, settled, 200, |_| {});
     assert_eq!(done, Some(Ok(ControlOk::Done)));
 }
+
+/// Harness `auto-placement` (2 in 11): the root's roster is read at
+/// mount and every 5 s; a peer that registered after it mounted and
+/// writes at once is connected, forwarding, and dominant, but not in the
+/// roster. The placement skipped it as unreachable until the next read,
+/// and the root lease placement handed that writer the lease first. A
+/// connected candidate outside the roster has it re-read now (not every
+/// tick), and the next tick delegates.
+#[test]
+fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core.cfg.placement = true;
+    h.core.cfg.placement_min_ops = 20;
+    h.hold(1, None);
+    let op = h.create("d1");
+    constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+    let MutateOp::Create { ino: dir, .. } = op else {
+        unreachable!()
+    };
+    h.step(Event::Roster {
+        write_eligible: vec![1],
+    });
+    h.step(Event::Peers {
+        links: vec![crate::event::PeerLink {
+            node: 2,
+            connected: true,
+            last_seen: Some(h.now),
+            rtt_ms: Some(1),
+            since: Some(h.now),
+        }],
+    });
+    for i in 0..40 {
+        let bucket = super::placement::bucket_of(&format!("b-{i}"));
+        h.core.place_note(2, [(dir, Some(bucket))]);
+    }
+    let tick = |h: &mut Harness| {
+        let (now, mut out) = (h.now, Vec::new());
+        h.core.on_placement_timer(now, &h.meta, &mut out);
+        out
+    };
+    let refreshes = |out: &[Action]| {
+        out.iter()
+            .filter(|a| matches!(a, Action::RefreshRoster))
+            .count()
+    };
+    let out = tick(&mut h);
+    assert_eq!(refreshes(&out), 1, "the roster was not re-read: {out:?}");
+    assert_eq!(h.core.stats.place_delegated, 0);
+    assert_eq!(h.core.stats.place_skipped_unreachable, 1);
+    // The answer is not in yet: no second read within the second.
+    h.advance(400);
+    let out = tick(&mut h);
+    assert_eq!(refreshes(&out), 0, "re-read on every tick: {out:?}");
+    // It lists the writer: the next tick delegates `d1` to it.
+    h.step(Event::Roster {
+        write_eligible: vec![1, 2],
+    });
+    h.advance(400);
+    let out = tick(&mut h);
+    assert_eq!(h.core.stats.place_delegated, 1, "not delegated: {out:?}");
+    assert_eq!(
+        h.core
+            .dl
+            .gens
+            .values()
+            .map(|g| (g.dir, g.node))
+            .collect::<Vec<_>>(),
+        vec![(dir, 2)]
+    );
+}

@@ -1754,7 +1754,21 @@ relay of its own so requests can be attributed per role):
       the writes over and `b` stops: after the dwell the placement
       recalls `b`'s generation (`place_recalled`) and after the cool-down
       delegates `d1` to `c`; the counters bound the moves (no flapping);
-      everything converges.
+      everything converges. The root lease placement stays on: once `d1`
+      is delegated, the live generation keeps the root lease where it is.
+      The root re-reads its roster for a connected writer it does not
+      list, so `b` writing within 5 s of the root's mount is placed at
+      once (`place_skipped_unreachable` counts the ticks it waited).
+      Before that fix the root lease moved to `b` first in about 1 run in 5.
+    - `git-under-flock-faults` fault #14 in the sim:
+      `delegated_two_generations_re_stream_after_a_root_failover`
+      (`AUTHORITY_SIM_CONFIG=delegated-two-gens-root-crash`). Node 2
+      holds all of `d1` and half of `d2`'s names, and its marker writer
+      makes each generation depend on the other. The root crashes once
+      rows of both are in the log. Before the fix, seeds 18, 85 and 92
+      never quiesced: the re-stream restarted both generations from 0,
+      their first unretired rows waited on each other, and no batch was
+      sent.
     - `designation-as-delegation` (plans 03–05): `offline /site` on `b`
       becomes a designated generation in the root's table (the 10 s
       designation poll syncs it, `designated: true`); `c`'s and the
