@@ -3,6 +3,7 @@
 mod control;
 mod daemon_lock;
 mod daemonize;
+mod handoff_socket;
 mod handover;
 mod node_runtime;
 mod parallelism;
@@ -289,6 +290,12 @@ enum Command {
         /// Chunk close policy: "through" (default) or "back".
         #[arg(long)]
         write_mode: Option<String>,
+        /// Plan 37 §8: when another process holds the state dir (the
+        /// engine pod this one replaces), wait as a handoff standby on this
+        /// socket instead of failing, and serve once its sessions are
+        /// handed over and it has exited.
+        #[arg(long)]
+        handoff_socket: Option<PathBuf>,
     },
     /// (internal) Relay stdin/stdout to a control socket, so a caller with
     /// only an exec stream into this host (the CSI controller, plan 37)
@@ -300,6 +307,11 @@ enum Command {
         socket: PathBuf,
         #[arg(long)]
         ping: bool,
+        /// With `--ping`: also answered by a ping on this socket (an engine
+        /// pod's startup and liveness probes: a handoff standby answers on
+        /// its handoff socket only, plan 37 §8).
+        #[arg(long, requires = "ping")]
+        or_socket: Option<PathBuf>,
     },
     /// (internal) The daemon's zombie reaper: watches the daemon that
     /// spawned it and, once the kernel has killed it but a thread wedged
@@ -1306,6 +1318,7 @@ fn main() -> Result<()> {
         e2e,
         cache_size,
         write_mode,
+        handoff_socket,
     } = cli.command
     {
         return serve::cmd_serve(
@@ -1320,6 +1333,7 @@ fn main() -> Result<()> {
                 e2e,
                 cache_size,
                 write_mode,
+                handoff_socket,
             },
             log_buffer,
         );
@@ -2139,7 +2153,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::ControlRelay { socket, ping } => rt.block_on(serve::control_relay(&socket, ping)),
+        Command::ControlRelay {
+            socket,
+            ping,
+            or_socket,
+        } => rt.block_on(serve::control_relay(&socket, ping, or_socket.as_deref())),
         Command::Serve { .. } => unreachable!("Command::Serve is handled earlier in main()"),
         Command::Mount { .. } => unreachable!(
             "Command::Mount is handled earlier in main(), before the shared runtime is built"

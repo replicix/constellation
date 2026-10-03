@@ -355,6 +355,20 @@ pub enum SyncRequest {
         through: u64,
         reply: tokio::sync::oneshot::Sender<(u64, bool)>,
     },
+    /// Plan 37 §8: the holder this node backs is being replaced on its
+    /// own state dir (`Payload::BackupHold`).
+    PeerBackupHold {
+        holder: u64,
+        epoch: u64,
+        for_ms: u64,
+    },
+    /// Plan 37 §8: this node, the holder, is about to be replaced on its
+    /// own state dir: ask each committed backup to hold its seal watch
+    /// for `for_ms`; answered with the backups that confirmed.
+    HoldBackups {
+        for_ms: u64,
+        reply: tokio::sync::oneshot::Sender<Vec<u64>>,
+    },
     /// Plan 30 §M9: backup-acked transactions streamed ahead of S3 by
     /// the holder this node follows.
     PeerStreamAhead {

@@ -75,7 +75,11 @@ pub fn daemon_router(
 /// allowlist file and the bound socket without an engine: load `path`, fall
 /// back to owner-only on any error, and tell the result which socket this
 /// daemon actually bound (plan 33 U1).
-fn load_policy(path: Option<&Path>, owner: u32, bound_socket: Option<PathBuf>) -> Policy {
+pub(crate) fn load_policy(
+    path: Option<&Path>,
+    owner: u32,
+    bound_socket: Option<PathBuf>,
+) -> Policy {
     let mut policy = match path {
         Some(path) => Policy::load(path, Some(owner)).unwrap_or_else(|e| {
             // A broken authorization file must be loud, and must not widen
@@ -297,13 +301,15 @@ impl ControlHost for DaemonHost {
         let binary = match &p.target {
             HandoffTarget::Exec { binary } => binary.clone(),
             HandoffTarget::Socket => {
-                return Err(ControlError::unsupported(
-                    "handing sessions to another process over a socket is plan 37's; \
-                     this daemon hands over in place (`exec`)",
-                )
-                .with_remediation("use target Exec (`constellation daemon --upgrade`)"))
+                return crate::handoff_socket::sender(&self.node()?, p, _fd);
             }
         };
+        if p.phase.is_some() || p.deadline_ms.is_some() {
+            return Err(ControlError::invalid(
+                "an in-place upgrade has no phases: phase and deadline_ms are for a handoff to a \
+                 socket",
+            ));
+        }
         if !p.views.is_empty() {
             return Err(ControlError::invalid(
                 "an in-place upgrade hands every view over; `views` must be empty",
@@ -322,11 +328,16 @@ impl ControlHost for DaemonHost {
                 id: m.id.as_u64(),
                 mountpoint: m.mountpoint.display().to_string(),
                 handles: 0,
+                transport: m.fuse.transport().name().to_string(),
             })
             .collect();
         let detail =
             crate::handover::upgrade(&node, binary.as_deref()).map_err(ControlError::failed)?;
-        Ok(HandoffReport { detail, views })
+        Ok(HandoffReport {
+            detail,
+            views,
+            ..Default::default()
+        })
     }
 }
 

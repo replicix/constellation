@@ -842,6 +842,9 @@ pub struct Stats {
     /// seal, and how many transactions a takeover re-applied.
     pub backup_persisted: u64,
     pub seals: u64,
+    /// Plan 37 §8: holds a holder replaced on its own state dir asked of
+    /// this backup's seal watch (`PeerMsg::BackupHold`).
+    pub backup_holds: u64,
     pub backup_takeovers: u64,
     pub backup_tail_applied: u64,
     /// Any peer: fast takeovers of an `ack=s3` lease.
@@ -1606,6 +1609,7 @@ impl Core {
             PeerMsg::StreamAhead { epoch, base, txs } => {
                 self.on_stream_ahead(now, from, epoch, base, txs, replica, out)
             }
+            PeerMsg::BackupHold { epoch, for_ms } => self.on_backup_hold(now, from, epoch, for_ms),
             PeerMsg::PromiseRequest {
                 req,
                 expires_unix_ms,

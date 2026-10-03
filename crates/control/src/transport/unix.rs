@@ -261,7 +261,7 @@ impl Transport for UnixSocket {
 /// One non-blocking `sendmsg`, with `fds` as one `SCM_RIGHTS` message when
 /// non-empty (the transport sends at most one; tests send more).
 /// `WouldBlock` is returned as-is for `async_io` to wait on.
-fn send_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
+pub(crate) fn send_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
     let mut iov = libc::iovec {
         iov_base: data.as_ptr() as *mut libc::c_void,
         iov_len: data.len(),
@@ -309,7 +309,11 @@ fn send_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> io::Result<usize> {
 
 /// One non-blocking `recvmsg` into `buf`, pushing received descriptors onto
 /// `fds`. Returns the byte count (0: end of stream).
-fn recv_with_fds(sock: RawFd, buf: &mut [u8], fds: &mut VecDeque<OwnedFd>) -> io::Result<usize> {
+pub(crate) fn recv_with_fds(
+    sock: RawFd,
+    buf: &mut [u8],
+    fds: &mut VecDeque<OwnedFd>,
+) -> io::Result<usize> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
         iov_len: buf.len(),

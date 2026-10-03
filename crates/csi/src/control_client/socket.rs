@@ -219,6 +219,14 @@ impl ControlClient for SocketControlClient {
         self.call::<NodeHandoff>(params).await
     }
 
+    async fn node_handoff_fd(
+        &self,
+        params: HandoffParams,
+        fd: OwnedFd,
+    ) -> Result<HandoffReport, ControlError> {
+        self.call_fd::<NodeHandoff>(params, fd).await
+    }
+
     async fn node_leave(&self, params: LeaveParams) -> Result<Ack, ControlError> {
         self.call::<NodeLeave>(params).await
     }

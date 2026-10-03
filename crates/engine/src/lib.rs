@@ -79,7 +79,8 @@ pub mod writeback;
 
 pub use host::{EngineHost, FsId, ResourceBudget};
 pub use node::{
-    default_state_dir, DeferredEvents, Engine, EngineConfig, PassphraseSource, PhaseHook, ViewInfo,
+    default_state_dir, DeferredEvents, Engine, EngineConfig, PassphraseSource, PhaseHook,
+    Preopened, ViewInfo, LOCAL_HANDOFF_BACKUP_HOLD,
 };
 pub use profile::{
     BackgroundMode, EngineProfile, FuseTransportMode, LeaseMode, P2pMode, UploadMode,

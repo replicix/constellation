@@ -2765,6 +2765,11 @@
         },
         "mountpoint": {
           "type": "string"
+        },
+        "transport": {
+          "default": "",
+          "description": "The transport its connection is served over (`dev_fuse`: the only\none that can be handed over, plan 38 §3(e)).",
+          "type": "string"
         }
       },
       "required": [
@@ -2775,8 +2780,18 @@
       "type": "object"
     },
     "HandoffParams": {
-      "description": "`node.handoff` (plan 31 §6.11). With [`HandoffTarget::Socket`] the\nrequest carries a descriptor and needs a transport with fd passing;\n[`HandoffTarget::Exec`] (the default) does not.",
+      "description": "`node.handoff` (plan 31 §6.11). With [`HandoffTarget::Socket`] every\nrequest names its [`HandoffPhase`], and `Transfer`/`Receive` carry a\ndescriptor and need a transport with fd passing; [`HandoffTarget::Exec`]\n(the default) takes no phase and no descriptor.",
       "properties": {
+        "deadline_ms": {
+          "default": null,
+          "description": "`Prepare`: how long the sender stays prepared without a `Commit`\nbefore it aborts on its own (and after which it refuses one).\n`Seal`: how long the receiver waits for the sender to commit before\nit gives up (dropping what it received).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "drain_timeout_ms": {
           "default": null,
           "description": "How long to wait for in-flight operations to drain.",
@@ -2786,6 +2801,18 @@
             "integer",
             "null"
           ]
+        },
+        "phase": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HandoffPhase"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`Socket` only: which step this request is."
         },
         "target": {
           "$ref": "#/$defs/HandoffTarget",
@@ -2807,6 +2834,46 @@
       },
       "type": "object"
     },
+    "HandoffPhase": {
+      "description": "The steps of a [`HandoffTarget::Socket`] handoff (plan 37 §8). Every\nsender step before `Commit` is undone by `Abort`; the state dir's lock\ndecides which process serves, so the two never serve at once (the\nreceiver serves only once it holds the lock, the sender gives it up\nonly by exiting after `Commit`).",
+      "oneOf": [
+        {
+          "const": "prepare",
+          "description": "Sender, §8 steps 1-3: stop reading every session, drain what was\naccepted (bounded by `drain_timeout_ms`), publish pending writes and\nexport the handle tables. Nothing leaves the process; until\n`deadline_ms` passes without a `Commit` (then the sender aborts on\nits own: a plugin that died must not leave the mounts stalled).",
+          "type": "string"
+        },
+        {
+          "const": "transfer",
+          "description": "Sender, §8 step 4: write one record per prepared view, each with its\n`/dev/fuse` descriptor, onto the unix stream socket attached to the\nrequest (`crate::handoff_wire`), then an end mark. The sender keeps\nits own copies until `Commit` or `Abort`.",
+          "type": "string"
+        },
+        {
+          "const": "commit",
+          "description": "Sender, §8 step 6: mark the state dir committed, close the views,\nstop the engine without draining it (the receiver is the same node\non the same state dir: it ships the journal and the pending uploads\nand re-adopts the lease) and exit, which frees the state dir for the\nreceiver. Refused once `Prepare`'s `deadline_ms` has passed. The\npoint of no return.",
+          "type": "string"
+        },
+        {
+          "const": "abort",
+          "description": "Sender: serve every prepared session again, in place. A no-op when\nnothing is prepared.",
+          "type": "string"
+        },
+        {
+          "const": "receive",
+          "description": "Receiver: read records and their descriptors, exactly as a\n`Transfer` wrote them, from the unix stream socket attached to the\nrequest (`crate::handoff_wire`), and hold them without serving them.",
+          "type": "string"
+        },
+        {
+          "const": "seal",
+          "description": "Receiver: every record is in; take the state dir as soon as the\nsender has freed it, start the node and resume every view (§8 step\n5). Answered at once; `Status` follows it. Past `deadline_ms` with no\ncommit by the sender, the receiver gives up; once the sender has\ncommitted it waits for the state dir without a bound.",
+          "type": "string"
+        },
+        {
+          "const": "status",
+          "description": "Receiver: where the adoption stands ([`HandoffReport::state`]).",
+          "type": "string"
+        }
+      ]
+    },
     "HandoffReport": {
       "description": "`node.handoff`'s result: answered once the sessions are detached; the\nreceiving image then serves them (for `Exec`, `node.status` reports\n`handover.generation` one higher).",
       "properties": {
@@ -2814,6 +2881,25 @@
           "default": "",
           "description": "A human-readable summary (the old `Upgrade` answer).",
           "type": "string"
+        },
+        "elapsed_ms": {
+          "default": 0,
+          "description": "How long the step took.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HandoffState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "`Socket` only: the state the step left."
         },
         "views": {
           "items": {
@@ -2826,6 +2912,102 @@
         "views"
       ],
       "type": "object"
+    },
+    "HandoffState": {
+      "description": "Where a [`HandoffTarget::Socket`] handoff stands, on either side.",
+      "oneOf": [
+        {
+          "const": "serving",
+          "description": "Sender: serving, nothing prepared (also after an `Abort`).",
+          "type": "string"
+        },
+        {
+          "const": "prepared",
+          "description": "Sender: sessions stopped and exported, still held here.",
+          "type": "string"
+        },
+        {
+          "const": "transferred",
+          "description": "Sender: records written; its copies still held.",
+          "type": "string"
+        },
+        {
+          "const": "committed",
+          "description": "Sender: committed, exiting.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Receiver: waiting for records (`received` so far).",
+          "properties": {
+            "standby": {
+              "properties": {
+                "received": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "received"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "standby"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "sealed",
+          "description": "Receiver: sealed, waiting for the state dir or starting the node.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Receiver: serving the views it resumed (failed ones listed in\n`failed`: their sessions ended).",
+          "properties": {
+            "resumed": {
+              "properties": {
+                "failed": {
+                  "default": [],
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "required": [
+            "resumed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Receiver: gave up (aborted, or the deadline passed); it exits.",
+          "properties": {
+            "failed": {
+              "properties": {
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "failed"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "HandoffTarget": {
       "description": "Where `node.handoff` sends the FUSE sessions (plan 31 §6.11).",
@@ -2854,7 +3036,7 @@
         },
         {
           "const": "Socket",
-          "description": "Drain the sessions of `views` (all when empty), export their handle\ntables and send the session descriptors to the process listening on\nthe unix socket **attached to this request** (fd passing), which\nthen resumes them — plan 37's engine-pod replacement.",
+          "description": "Plan 37 §8: hand the sessions of `views` (all when empty) to\nanother process — a CSI engine pod's replacement — in the phases of\n[`HandoffPhase`], driven step by step by the node plugin. The sender\nis the serving daemon (`Prepare`, `Transfer`, `Commit`, `Abort`);\nthe receiver a standby `constellation serve --handoff-socket`\n(`Receive`, `Seal`, `Status`). `Transfer` and `Receive` carry a\ndescriptor (see [`HandoffPhase`]).",
           "type": "string"
         }
       ]

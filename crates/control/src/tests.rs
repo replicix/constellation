@@ -1978,6 +1978,7 @@ async fn fd_methods_on_a_transport_without_fd_passing_fail_promptly() {
     let err = client
         .call::<NodeHandoff>(HandoffParams {
             target: HandoffTarget::Socket,
+            phase: Some(HandoffPhase::Transfer),
             ..HandoffParams::default()
         })
         .await

@@ -752,6 +752,17 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
+    fn backup_hold(&self, holder: u64, epoch: u64, for_ms: u64) {
+        if crate::fault::p2p_denied(holder) {
+            return;
+        }
+        let _ = self.nudge.send(sync::SyncRequest::PeerBackupHold {
+            holder,
+            epoch,
+            for_ms,
+        });
+    }
+
     fn stream_ahead(&self, from: u64, epoch: u64, base: u64, txs: Vec<u8>) {
         if crate::fault::p2p_denied(from) {
             return;
@@ -985,23 +996,47 @@ impl constellation_net::PeerService for P2pBridge {
     }
 }
 
-/// Start the P2P fast path, or return a disabled handle.
-///
-/// Everything here is best-effort by design (plan 02 / DESIGN.md §8): a
-/// missing node key, an unbindable endpoint, or an unreachable gossip
-/// topic all degrade to the S3 polling path rather than failing the
-/// mount. `CONSTELLATION_P2P=off` skips it entirely.
-pub(crate) async fn start_p2p(
+/// A P2P endpoint bound before the engine that will use it starts
+/// ([`crate::Engine::preopen`]): the node key loaded, the endpoint bound
+/// and its first interface scan done. Nobody can reach it until the
+/// engine publishes its address (relays off) or it dials anyone — so it
+/// may be bound while another process of the same node identity still
+/// serves (plan 37 §8's standby), and is dropped unused if no start
+/// takes it.
+pub struct BoundP2p {
+    p2p: constellation_net::P2p,
+    topic: constellation_net::TopicId,
+}
+
+/// The filesystem's gossip topic: E2E filesystems seed it from the
+/// keyring (never on S3 in the clear); non-E2E uses `meta.json`. A
+/// pre-secret filesystem with no seed at all falls back to the UUID.
+fn gossip_topic(
+    fsmeta: &constellation_store_s3::FsMeta,
+    e2e_keys: Option<&constellation_store_s3::SharedE2eKeys>,
+) -> constellation_net::TopicId {
+    let e2e_seed = e2e_keys.map(|keys| *keys.gossip_secret());
+    let seed = e2e_seed.or_else(|| fsmeta.gossip_seed());
+    if seed.is_none() {
+        tracing::info!(
+            "filesystem predates gossip_secret; deriving the topic from its UUID \
+             (weaker: the UUID is not a secret)"
+        );
+    }
+    constellation_net::topic_for(seed.as_ref(), &fsmeta.uuid.to_string())
+}
+
+/// Bind the endpoint [`start_p2p`] would (key, topic, bind, the first
+/// interface scan), or `None` (P2P off, no usable key, unbindable): the
+/// start then degrades exactly as it would have.
+pub(crate) async fn bind_p2p(
     host: &constellation_platform::HostServices,
     fsmeta: &constellation_store_s3::FsMeta,
     e2e_keys: Option<&constellation_store_s3::SharedE2eKeys>,
-    store: std::sync::Arc<dyn object_store::ObjectStore>,
-    node_id: u64,
-    version: &str,
-) -> constellation_net::Peers {
+) -> Option<BoundP2p> {
     if !constellation_net::enabled() {
         tracing::info!("P2P disabled by CONSTELLATION_P2P; using the S3 path only");
-        return constellation_net::Peers::disabled();
+        return None;
     }
     let (keys, key_name) = constellation_net::identity::default_key_store(host);
     let key_path = keys.describe(&key_name);
@@ -1010,30 +1045,55 @@ pub(crate) async fn start_p2p(
         Err(e) => {
             tracing::warn!(error = %e, path = %key_path,
                 "no usable node key; running without the P2P fast path");
-            return constellation_net::Peers::disabled();
+            return None;
         }
     };
     if generated {
         tracing::info!(path = %key_path, "generated a host node key");
     }
-    // E2E filesystems seed the topic from the keyring (never on S3 in the
-    // clear); non-E2E uses `meta.json`. A pre-secret filesystem with no
-    // seed at all falls back to the UUID.
-    let e2e_seed = e2e_keys.map(|keys| *keys.gossip_secret());
-    let seed = e2e_seed.or_else(|| fsmeta.gossip_seed());
-    let topic = constellation_net::topic_for(seed.as_ref(), &fsmeta.uuid.to_string());
-    if seed.is_none() {
-        tracing::info!(
-            "filesystem predates gossip_secret; deriving the topic from its UUID \
-             (weaker: the UUID is not a secret)"
-        );
-    }
+    let topic = gossip_topic(fsmeta, e2e_keys);
     let p2p = match constellation_net::P2p::spawn(key, topic).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "could not bind the P2P endpoint; using the S3 path only");
-            return constellation_net::Peers::disabled();
+            return None;
         }
+    };
+    // The first interface scan (bounded): what the start publishes.
+    let _ = p2p.advertised_addr().await;
+    Some(BoundP2p { p2p, topic })
+}
+
+/// Start the P2P fast path, or return a disabled handle.
+///
+/// Everything here is best-effort by design (plan 02 / DESIGN.md §8): a
+/// missing node key, an unbindable endpoint, or an unreachable gossip
+/// topic all degrade to the S3 polling path rather than failing the
+/// mount. `CONSTELLATION_P2P=off` skips it entirely. `bound`: an endpoint
+/// [`bind_p2p`] bound ahead (used if its topic is this filesystem's).
+pub(crate) async fn start_p2p(
+    host: &constellation_platform::HostServices,
+    fsmeta: &constellation_store_s3::FsMeta,
+    e2e_keys: Option<&constellation_store_s3::SharedE2eKeys>,
+    store: std::sync::Arc<dyn object_store::ObjectStore>,
+    node_id: u64,
+    version: &str,
+    bound: Option<BoundP2p>,
+) -> constellation_net::Peers {
+    let bound = match bound {
+        Some(b) if b.topic == gossip_topic(fsmeta, e2e_keys) => Some(b),
+        Some(_) => {
+            tracing::warn!("the pre-bound P2P endpoint is for another topic; binding anew");
+            None
+        }
+        None => None,
+    };
+    let bound = match bound {
+        Some(b) => Some(b),
+        None => bind_p2p(host, fsmeta, e2e_keys).await,
+    };
+    let Some(BoundP2p { p2p, .. }) = bound else {
+        return constellation_net::Peers::disabled();
     };
     let relay = p2p.relay_label().to_string();
     let addr = p2p.advertised_addr().await;

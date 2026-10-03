@@ -471,6 +471,14 @@ pub enum PeerMsg {
         base: Seq,
         txs: Vec<BackupTx>,
     },
+    /// Plan 37 §8: the holder is about to be replaced by a successor on
+    /// its own state dir (same node, lease and epoch): a backup of it at
+    /// `epoch` counts no silence for `for_ms` (capped,
+    /// `core::backup::BACKUP_HOLD_MAX_MS`). One-way.
+    BackupHold {
+        epoch: Epoch,
+        for_ms: u64,
+    },
     /// Plan 30 §M10: a would-be taker of the expired lease that expires
     /// at `expires_unix_ms` asks for a promise ("join no continuation
     /// epoch before …"). The peer persists one and publishes it (unless

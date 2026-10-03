@@ -1295,6 +1295,10 @@ pub trait PeerService: Send + Sync + 'static {
     /// Plan 30 §M9: backup-acked transactions streamed ahead of S3.
     /// Default ignores them.
     fn stream_ahead(&self, _from: u64, _epoch: u64, _base: u64, _txs: Vec<u8>) {}
+    /// Plan 37 §8: the holder this node backs is being replaced on its
+    /// own state dir; hold the seal watch (`Payload::BackupHold`).
+    /// Default ignores it.
+    fn backup_hold(&self, _holder: u64, _epoch: u64, _for_ms: u64) {}
     /// Plan 30 §M14: a node asks this one, as the owning sequencer, for
     /// a lock grant. Default: busy (no lock service here).
     fn lock_requested(

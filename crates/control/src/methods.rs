@@ -214,7 +214,8 @@ define_methods! {
     /// (C4b's upgrade), or to another process over an attached socket fd.
     NodeHandoff { name: "node.handoff", role: Admin, mutating: true, stream: None,
         params: HandoffParams, result: HandoffReport,
-        requires_fd: |p| matches!(p.target, HandoffTarget::Socket) }
+        requires_fd: |p| matches!(p.target, HandoffTarget::Socket)
+            && matches!(p.phase, Some(HandoffPhase::Transfer | HandoffPhase::Receive)) }
     /// Inject a host lifecycle event (plan 31 §10, C8): the engine applies
     /// it (a `Suspending` runs its whole sequence) before this answers.
     NodeLifecycle { name: "node.lifecycle", role: Admin, mutating: true, stream: None,
@@ -729,10 +730,23 @@ mod tests {
         assert!(!ViewMount::requires_fd(&path_mount));
         assert!(ViewMount::requires_fd(&fd_mount));
         assert!(!NodeHandoff::requires_fd(&HandoffParams::default()));
-        assert!(NodeHandoff::requires_fd(&HandoffParams {
-            target: HandoffTarget::Socket,
-            ..HandoffParams::default()
-        }));
+        for (phase, fd) in [
+            (None, false),
+            (Some(HandoffPhase::Prepare), false),
+            (Some(HandoffPhase::Transfer), true),
+            (Some(HandoffPhase::Commit), false),
+            (Some(HandoffPhase::Abort), false),
+            (Some(HandoffPhase::Receive), true),
+            (Some(HandoffPhase::Seal), false),
+            (Some(HandoffPhase::Status), false),
+        ] {
+            let p = HandoffParams {
+                target: HandoffTarget::Socket,
+                phase,
+                ..HandoffParams::default()
+            };
+            assert_eq!(NodeHandoff::requires_fd(&p), fd, "{phase:?}");
+        }
         assert!(!NodePing::requires_fd(&Empty {}));
     }
 }

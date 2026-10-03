@@ -59,6 +59,19 @@ spec:
             - {name: CONSTELLATION_CSI_ENGINE_RESOURCES, value: {{ .Values.engineProfile.resources | toJson | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_LOG_LEVEL, value: {{ .Values.engineProfile.logLevel | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ .Values.engineProfile.readyTimeout | quote }}}
+            # Plan 37 §8: engine-pod rollouts by FUSE session handoff.
+            - {name: CONSTELLATION_CSI_HANDOFF_DRAIN_TIMEOUT_MS, value: {{ .Values.engineProfile.handoff.drainTimeoutMs | quote }}}
+            - {name: CONSTELLATION_CSI_HANDOFF_TOTAL_TIMEOUT_MS, value: {{ .Values.engineProfile.handoff.totalTimeoutMs | quote }}}
+            - {name: CONSTELLATION_CSI_HANDOFF_RESUME_TIMEOUT_MS, value: {{ .Values.engineProfile.handoff.resumeTimeoutMs | quote }}}
+            - {name: CONSTELLATION_CSI_HANDOFF_MAX_ATTEMPTS, value: {{ .Values.engineProfile.handoff.maxAttempts | quote }}}
+            - {name: CONSTELLATION_CSI_ROLLOUT_INTERVAL_S, value: {{ .Values.engineProfile.handoff.rolloutInterval | quote }}}
+            {{- if .Values.node.metricsPort }}
+            - {name: CONSTELLATION_CSI_METRICS_ADDR, value: {{ printf "0.0.0.0:%v" .Values.node.metricsPort | quote }}}
+            {{- end }}
+          {{- if .Values.node.metricsPort }}
+          ports:
+            - {name: metrics, containerPort: {{ .Values.node.metricsPort }}, protocol: TCP}
+          {{- end }}
           securityContext:
             privileged: true
             runAsUser: 0

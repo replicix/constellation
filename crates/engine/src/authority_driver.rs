@@ -1455,6 +1455,57 @@ impl Driver {
                     },
                 }))
             }
+            SyncRequest::PeerBackupHold {
+                holder,
+                epoch,
+                for_ms,
+            } => Some(Internal::Event(Event::Peer {
+                from: holder,
+                msg: PeerMsg::BackupHold { epoch, for_ms },
+            })),
+            SyncRequest::HoldBackups { for_ms, reply } => {
+                // Plan 37 §8: only the committed backups can seal; a
+                // candidate being brought up is not in the lease object.
+                let epoch = self
+                    .core
+                    .lease()
+                    .held
+                    .as_ref()
+                    .map(|(lease, _)| lease.epoch);
+                let backups = self.core.ack_view().backups;
+                let (Some(epoch), false) = (epoch, backups.is_empty()) else {
+                    let _ = reply.send(Vec::new());
+                    return None;
+                };
+                let peers = self.deps.peers.clone();
+                let holder = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
+                tokio::spawn(async move {
+                    let payload = Payload::BackupHold {
+                        holder,
+                        epoch,
+                        for_ms,
+                    };
+                    let asks = backups.into_iter().map(|backup| {
+                        let (peers, payload) = (peers.clone(), payload.clone());
+                        async move {
+                            let answer = tokio::time::timeout(
+                                timeout,
+                                peers.request_to_node_timeout(backup, &payload, timeout),
+                            )
+                            .await;
+                            matches!(answer, Ok(Ok(_))).then_some(backup)
+                        }
+                    });
+                    let held = futures::future::join_all(asks)
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    let _ = reply.send(held);
+                });
+                None
+            }
             SyncRequest::PeerStreamAhead {
                 from,
                 epoch,
@@ -2960,6 +3011,25 @@ impl Driver {
                             let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                         }
                     }
+                });
+            }
+            PeerMsg::BackupHold { epoch, for_ms } => {
+                // Sent by `SyncRequest::HoldBackups`, which waits for the
+                // answers; one the core asked for is fire and forget.
+                let peers = self.deps.peers.clone();
+                let holder = self.node_id;
+                let timeout = Duration::from_millis(self.core.config().backup_ack_timeout_ms);
+                tokio::spawn(async move {
+                    let payload = Payload::BackupHold {
+                        holder,
+                        epoch,
+                        for_ms,
+                    };
+                    let _ = tokio::time::timeout(
+                        timeout,
+                        peers.request_to_node_timeout(to, &payload, timeout),
+                    )
+                    .await;
                 });
             }
             PeerMsg::StreamAhead { epoch, base, txs } => {

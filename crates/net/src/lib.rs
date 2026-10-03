@@ -54,6 +54,8 @@ pub use epoch::{
 };
 pub use handoff::{handle_request, interpret_reply, Handoff, RequestOutcome};
 pub use identity::{load_or_create, parse_pubkey, pubkey_hex};
+/// The gossip topic type ([`topic_for`]).
+pub use iroh_gossip::proto::TopicId;
 pub use message::{
     ChunkDecline, ChunkStatus, EpochCarrier, EpochClaim, LockOutcomeWire, LockRenewResultWire,
     LockRenewWire, LockTestOutcomeWire, Payload, Signed, SnapshotBatchOutcome, SnapshotItem,

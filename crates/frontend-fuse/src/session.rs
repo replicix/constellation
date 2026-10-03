@@ -760,6 +760,9 @@ type DetachReply = mpsc::SyncSender<Result<(OwnedFd, NegotiatedInit), DetachErro
 struct Pending {
     reply: Option<DetachReply>,
     ended: bool,
+    /// The detach under way bounds its read drain by this, not by
+    /// [`read_drain_wait`] ([`SessionControl::detach_within`]).
+    drain: Option<Duration>,
 }
 
 /// State shared by a session, its thread and its [`SessionControl`]s.
@@ -819,6 +822,98 @@ pub fn mount<V: Vfs>(
     mount_source(view, opts.source(mountpoint), opts, caps)
 }
 
+/// Clear `O_NONBLOCK` on `fd`'s open file description.
+fn set_blocking(fd: &OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let raw = fd.as_raw_fd();
+    // SAFETY: F_GETFL/F_SETFL on a descriptor we own.
+    unsafe {
+        let flags = libc::fcntl(raw, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK != 0
+            && libc::fcntl(raw, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// How long a [`MountSource::PreopenedFd`] connection may take to show its
+/// `FUSE_INIT` (`CONSTELLATION_PREOPENED_INIT_WAIT_MS`, default 10000).
+fn preopened_init_wait() -> Duration {
+    Duration::from_millis(
+        std::env::var("CONSTELLATION_PREOPENED_INIT_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000),
+    )
+}
+
+/// A sanity check before the `FUSE_INIT` handshake (fuser's stock
+/// `from_fd`) on a pre-opened descriptor — not the guard. A connection
+/// somebody just mounted has its `FUSE_INIT` queued by `mount(2)` itself,
+/// so it is readable at once and nobody has set it non-blocking. A
+/// *handed-over* one (plan 37 §8) never sends `FUSE_INIT` again: the
+/// handshake would wait forever on it — spinning a core if it is still
+/// non-blocking (K0 question 1), or answer `EIO` to a real request it
+/// mistook for the handshake. Such a descriptor must go to
+/// [`FuseSession::resume`], and what keeps it from coming here is the
+/// type split: the production paths carry a handed-over connection as a
+/// `FuseHandoff`, which only `resume` takes, never as a
+/// `MountSource::PreopenedFd`. This check cannot tell the two apart in
+/// general (a handed-over connection with a request queued is readable
+/// and, since `detach` clears `O_NONBLOCK`, blocking too); it turns the
+/// cases it can see — non-blocking, or nothing to read within `wait` —
+/// into a refusal instead of a hang.
+fn fresh_connection(fd: &OwnedFd, wait: Duration) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let raw = fd.as_raw_fd();
+    // SAFETY: F_GETFL on a descriptor we own.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing a non-blocking FUSE descriptor as a new mount: it belongs to a running \
+             session (a handed-over connection is resumed, never re-initialised)",
+        ));
+    }
+    let mut pfd = libc::pollfd {
+        fd: raw,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let ms = left.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: one live pollfd for the duration of the call.
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n > 0 {
+            return Ok(());
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "no FUSE_INIT on the preopened descriptor within {wait:?}: not a fresh \
+                 connection (a handed-over one is resumed, never re-initialised)"
+            ),
+        ));
+    }
+}
+
 /// Whether this process may call `mount(2)` itself.
 fn privileged() -> bool {
     // SAFETY: geteuid has no preconditions.
@@ -856,6 +951,7 @@ pub fn mount_source<V: Vfs>(
             let mut config = config;
             config.io_uring = false;
             share_fd_without_a_device(&mut config);
+            fresh_connection(&fd, preopened_init_wait())?;
             let session = fuser::Session::from_fd(fs, fd, config.acl, config.clone())?;
             FuseSession::new(
                 session,
@@ -1321,7 +1417,11 @@ impl<V: Vfs> FuseSession<V> {
             // fuser has given the mount up; from here it is unmounted by
             // path whatever happens.
             shared.fuser_unmounter.lock().unwrap().take();
-            let reply = shared.pending.lock().unwrap().reply.take();
+            let (reply, drain) = {
+                let mut pending = shared.pending.lock().unwrap();
+                (pending.reply.take(), pending.drain.take())
+            };
+            let drain = drain.unwrap_or_else(read_drain_wait);
             if shared.ending.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(end_detached(detached, &shared, &*vfs, reply));
             }
@@ -1333,18 +1433,34 @@ impl<V: Vfs> FuseSession<V> {
                         shared.deferred.count()
                     ),
                 ))
-            } else if !drain_reads(&shared.deferred, read_drain_wait()) {
+            } else if !drain_reads(&shared.deferred, drain) {
                 Err(refused(
                     Code::Busy,
                     format!(
                         "{} deferred read(s) or fsync(s) still unanswered after {:?}",
                         shared.deferred.bounded(),
-                        read_drain_wait()
+                        drain
                     ),
                 ))
             } else {
                 sync_view(&*vfs)
             };
+            // Plan 37 K0 (gap 4): an armed session's channel is
+            // non-blocking, and the flag lives on the open file
+            // description, which travels with the descriptor through
+            // `SCM_RIGHTS`. Handed out like that, any reader but
+            // `from_fd_resumed` (which `poll`s first) spins on `EAGAIN` —
+            // a full core, measured. Blocking again before it leaves, so a
+            // misuse is at worst a parked thread; the resuming session sets
+            // the mode it wants itself.
+            let verdict = verdict.and_then(|()| {
+                set_blocking(&detached.fd).map_err(|e| {
+                    refused(
+                        Code::Io,
+                        format!("clearing O_NONBLOCK on the handed-out descriptor: {e}"),
+                    )
+                })
+            });
             match (verdict, reply) {
                 (Ok(()), Some(reply)) => {
                     let _ = reply.send(Ok((detached.fd, detached.init)));
@@ -1511,6 +1627,20 @@ impl SessionControl {
     /// session) and its result travels with the connection. On any
     /// refusal the session keeps serving and nothing was exported.
     pub fn detach<S>(&self, export: impl FnOnce() -> S) -> Result<SessionHandoff<S>, DetachError> {
+        self.detach_within(None, export)
+    }
+
+    /// [`Self::detach`], with the wait for the reads and `fsync`s the
+    /// engine is still answering bounded by `drain` (`None`: the default,
+    /// `CONSTELLATION_HANDOVER_READ_DRAIN_MS`). Plan 37 §8's
+    /// `--handoff-drain-timeout`: past it the detach refuses and the
+    /// session goes on serving, so a slow drain costs a retry, never an
+    /// abandoned request.
+    pub fn detach_within<S>(
+        &self,
+        drain: Option<Duration>,
+        export: impl FnOnce() -> S,
+    ) -> Result<SessionHandoff<S>, DetachError> {
         // First, before anything is quiesced: a session served over a ring
         // can never be handed over. Its entries belong to this process's
         // io_uring instance and die with it; the kernel does not route the
@@ -1554,6 +1684,7 @@ impl SessionControl {
                 return Err(refused(Code::NotConnected, "the session has ended"));
             }
             pending.reply = Some(tx);
+            pending.drain = drain;
         }
         match self.shared.detacher.lock().unwrap().as_ref() {
             Some(detacher) => detacher.detach(),
@@ -2058,8 +2189,36 @@ mod tests {
         crate::caps(false)
     }
 
+    /// A test's mountpoint. Dropped — a failed assertion's unwinding
+    /// included — it is lazily unmounted before the directory is removed:
+    /// a test that fails with a detached, unserved connection then fails,
+    /// instead of hanging in the removal's `statx` on the mount (37-k5a's
+    /// review, `detach_waits_for_an_op_in_flight` under host load).
+    struct MountDir(Option<tempfile::TempDir>);
+
+    impl MountDir {
+        fn new() -> MountDir {
+            MountDir(Some(tempfile::tempdir().unwrap()))
+        }
+
+        fn path(&self) -> &Path {
+            self.0.as_ref().expect("until dropped").path()
+        }
+    }
+
+    impl Drop for MountDir {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.take() {
+                // Not mounted any more (the test ended its session): a
+                // harmless refusal.
+                let _ = unmount_path(dir.path(), true);
+                drop(dir);
+            }
+        }
+    }
+
     struct Mounted {
-        dir: tempfile::TempDir,
+        dir: MountDir,
         control: SessionControl,
         thread: std::thread::JoinHandle<std::io::Result<SessionExit>>,
     }
@@ -2078,7 +2237,7 @@ mod tests {
         if !kernel_available() {
             return None;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = MountDir::new();
         let session = match mount(Arc::new(vfs.clone()), dir.path(), &options(), caps()) {
             Ok(session) => session,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -2135,6 +2294,37 @@ mod tests {
         assert_eq!(thread.join().unwrap().unwrap(), SessionExit::Unmounted);
     }
 
+    /// The guard on the stock handshake (`fresh_connection`), without a
+    /// kernel: a non-blocking descriptor is refused at once, a blocking one
+    /// with nothing to read once the wait is over, a readable one passes.
+    #[test]
+    fn the_stock_handshake_takes_only_a_fresh_connection() {
+        let (r, w) = std::io::pipe().unwrap();
+        let r: OwnedFd = r.into();
+        let started = std::time::Instant::now();
+        let err = fresh_connection(&r, Duration::from_millis(150)).unwrap_err();
+        assert!(err.to_string().contains("no FUSE_INIT"), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        let mut w = std::fs::File::from(OwnedFd::from(w));
+        std::io::Write::write_all(&mut w, b"x").unwrap();
+        fresh_connection(&r, Duration::from_millis(150)).expect("readable: a queued FUSE_INIT");
+        // SAFETY: F_GETFL/F_SETFL on a descriptor we own.
+        unsafe {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&r);
+            let flags = libc::fcntl(raw, libc::F_GETFL);
+            libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+        let started = std::time::Instant::now();
+        let err = fresh_connection(&r, Duration::from_secs(30)).unwrap_err();
+        assert!(err.to_string().contains("non-blocking"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused at once"
+        );
+        set_blocking(&r).unwrap();
+        fresh_connection(&r, Duration::from_millis(150)).expect("blocking again");
+    }
+
     #[test]
     fn detach_with_nothing_in_flight_hands_out_a_live_connection() {
         let vfs = MockVfs::reference(caps());
@@ -2153,6 +2343,40 @@ mod tests {
             SessionExit::Detached,
             "the session thread hands the connection out"
         );
+        // Handed out blocking (K0 gap 4): whatever reads it next cannot
+        // spin on EAGAIN.
+        // SAFETY: F_GETFL on a live descriptor.
+        let flags = unsafe {
+            libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(&handoff.fuse.fuse_fd),
+                libc::F_GETFL,
+            )
+        };
+        assert_eq!(
+            flags & libc::O_NONBLOCK,
+            0,
+            "the handed-out descriptor blocks"
+        );
+        // And the stock handshake refuses it rather than waiting for a
+        // FUSE_INIT that never comes (or spinning) — unless a request is
+        // queued on it right now (the kernel's own, say), which makes it
+        // readable: the guard's known limit (`fresh_connection`'s doc).
+        // Only then may it pass, and only because the poll saw one.
+        let dup = handoff.fuse.fuse_fd.try_clone().unwrap();
+        match fresh_connection(&dup, Duration::ZERO) {
+            Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}"),
+            Ok(()) => {
+                let mut pfd = libc::pollfd {
+                    fd: std::os::fd::AsRawFd::as_raw_fd(&dup),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one live pollfd for the duration of the call.
+                let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+                assert_eq!(ready, 1, "passed the guard with nothing queued");
+            }
+        }
+        drop(dup);
         let init = handoff.fuse.init;
         assert_eq!(init.proto_major, 7);
         assert!(init.max_write > 0 && init.kernel_minor > 0);
@@ -2182,7 +2406,7 @@ mod tests {
         if !kernel_available() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = MountDir::new();
         let mut kernel = constellation_platform::MountOpts::new("constellation-preopened-test");
         kernel.allow_other = true;
         let fd = match mount_fd(dir.path(), &kernel) {
@@ -2411,7 +2635,7 @@ mod tests {
             return;
         }
         let vfs = MockVfs::reference(caps());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = MountDir::new();
         let session = match mount(Arc::new(vfs.clone()), dir.path(), &uring_options(), caps()) {
             Ok(session) => session,
             Err(e) => {
@@ -2506,7 +2730,7 @@ mod tests {
             return;
         }
         let vfs = MockVfs::reference(caps());
-        let dir = tempfile::tempdir().unwrap();
+        let dir = MountDir::new();
         // `allow_other` off (what `uring_options` differs in, besides the
         // fs name), so `fusermount3` mounts this where tests run unprivileged
         // and without `user_allow_other`: the refusal is then a gate on an

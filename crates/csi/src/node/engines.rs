@@ -56,11 +56,96 @@ pub trait NodeEngines: Send + Sync {
     /// `last-view-count` annotation, and since when it has served none: the
     /// idle GC of 37-k6b reads them).
     async fn set_view_count(&self, unit: &str, views: usize) -> Result<(), ControlError>;
+
+    // ---- plan 37 §8: rollouts (crate::node::rollout) ----
+
+    /// This node's engine pods (ready, serving) whose spec differs from the
+    /// one this plugin would create now — an image or engine setting
+    /// changed by a chart upgrade.
+    async fn drifted(&self) -> Result<Vec<Drift>, ControlError> {
+        Ok(Vec::new())
+    }
+
+    /// Start `unit`'s replacement from the desired spec, beside the pod
+    /// serving it; once it waits as a handoff standby (the state dir is
+    /// the serving pod's), its handoff socket's client.
+    async fn start_replacement(&self, unit: &str) -> Result<Replacement, ControlError> {
+        Err(ControlError::unsupported(format!(
+            "no rollouts here ({unit})"
+        )))
+    }
+
+    /// The replacement has taken over (the handoff cut over): once it is
+    /// ready, it becomes `unit`'s pod and the old one is deleted. Its
+    /// connection.
+    async fn adopt_replacement(
+        &self,
+        unit: &str,
+        replacement: &Replacement,
+    ) -> Result<NodeEngine, ControlError> {
+        let _ = replacement;
+        Err(ControlError::unsupported(format!(
+            "no rollouts here ({unit})"
+        )))
+    }
+
+    /// The replacement is not needed (a rolled-back handoff): delete it.
+    async fn discard_replacement(&self, unit: &str, replacement: Replacement) {
+        let _ = (unit, replacement);
+    }
+
+    /// Whether the replacement's pod has ended — deleted, terminated, or
+    /// its container restarted (what it received is gone then): `Some(why)`
+    /// once it has.
+    async fn replacement_ended(&self, unit: &str, replacement: &Replacement) -> Option<String> {
+        let _ = (unit, replacement);
+        None
+    }
+
+    /// Delete `unit`'s serving pod outright: it serves no staged volume
+    /// (the next stage starts one from the desired spec), or a handoff was
+    /// lost after its commit.
+    async fn retire(&self, unit: &str) -> Result<(), ControlError> {
+        Err(ControlError::unsupported(format!(
+            "no rollouts here ({unit})"
+        )))
+    }
+
+    /// A rollout gave up on `unit` (§8 "Failure handling"): say so where an
+    /// operator looks (the pod's annotations, an event).
+    async fn report_fallback(&self, unit: &str, why: &str) {
+        let _ = (unit, why);
+    }
+}
+
+/// An engine pod whose spec drifted ([`NodeEngines::drifted`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drift {
+    pub unit: String,
+    pub pod: String,
+    /// The desired spec's fingerprint: what a rollout's attempts count
+    /// against (a further change starts the count again).
+    pub desired: String,
+    /// What differs, for the log.
+    pub why: String,
+}
+
+/// A replacement engine pod, waiting as a handoff standby.
+#[derive(Clone)]
+pub struct Replacement {
+    pub pod: String,
+    /// Its handoff socket (`node.handoff`'s receiving phases).
+    pub handoff: Arc<dyn ControlClient>,
 }
 
 struct FakeEngine {
     incarnation: u64,
     control: Arc<InMemoryControl>,
+    /// The spec it was started with (a test changes the desired one with
+    /// [`InMemoryNodeEngines::set_desired`]).
+    spec: String,
+    /// Its replacement, waiting as a standby.
+    standby: Option<Arc<InMemoryControl>>,
 }
 
 /// [`NodeEngines`] over [`InMemoryControl`]s, one per unit, serving the
@@ -76,6 +161,18 @@ pub struct InMemoryNodeEngines {
     views: Mutex<BTreeMap<String, usize>>,
     next: AtomicU64,
     created: AtomicU64,
+    /// The spec new pods are started with.
+    desired: Mutex<String>,
+    /// Replacements that fail to start (each failing one start).
+    fail_starts: AtomicU64,
+    /// Units reported as fallen back, with why.
+    fallbacks: Mutex<Vec<(String, String)>>,
+    /// The next replacement's resume fails with this.
+    fail_resume: Mutex<Option<String>>,
+    /// The next replacement resumes only this long after the commit.
+    resume_after: Mutex<Option<std::time::Duration>>,
+    /// Adoptions that fail (each failing one).
+    fail_adoptions: AtomicU64,
 }
 
 impl InMemoryNodeEngines {
@@ -87,7 +184,62 @@ impl InMemoryNodeEngines {
             views: Mutex::default(),
             next: AtomicU64::new(1),
             created: AtomicU64::new(0),
+            desired: Mutex::new("spec-1".into()),
+            fail_starts: AtomicU64::new(0),
+            fallbacks: Mutex::default(),
+            fail_resume: Mutex::default(),
+            resume_after: Mutex::default(),
+            fail_adoptions: AtomicU64::new(0),
         }
+    }
+
+    /// The next replacement started resumes only `after` its commit.
+    pub fn resume_next_standby_after(&self, after: std::time::Duration) {
+        *self.resume_after.lock().unwrap() = Some(after);
+    }
+
+    /// The next `n` adoptions of a replacement fail (an API hiccup).
+    pub fn fail_adoptions(&self, n: u64) {
+        self.fail_adoptions.store(n, Ordering::SeqCst);
+    }
+
+    /// From now on new pods start from `spec`: the running ones drift.
+    pub fn set_desired(&self, spec: &str) {
+        *self.desired.lock().unwrap() = spec.to_string();
+    }
+
+    /// The spec `unit`'s pod runs.
+    pub fn spec_of(&self, unit: &str) -> Option<String> {
+        self.engines
+            .lock()
+            .unwrap()
+            .get(unit)
+            .map(|e| e.spec.clone())
+    }
+
+    /// The next `n` replacements fail to start.
+    pub fn fail_replacement_starts(&self, n: u64) {
+        self.fail_starts.store(n, Ordering::SeqCst);
+    }
+
+    /// `unit`'s replacement while it is a standby (a test injects faults
+    /// into it).
+    pub fn standby(&self, unit: &str) -> Option<Arc<InMemoryControl>> {
+        self.engines
+            .lock()
+            .unwrap()
+            .get(unit)
+            .and_then(|e| e.standby.clone())
+    }
+
+    /// The next replacement started fails to resume, with `why`.
+    pub fn fail_resume_of_next_standby(&self, why: &str) {
+        *self.fail_resume.lock().unwrap() = Some(why.to_string());
+    }
+
+    /// The fallbacks reported, `(unit, why)`.
+    pub fn fallbacks(&self) -> Vec<(String, String)> {
+        self.fallbacks.lock().unwrap().clone()
     }
 
     /// For `--in-memory-backend` (see `any_path`).
@@ -116,6 +268,8 @@ impl InMemoryNodeEngines {
             FakeEngine {
                 incarnation: self.next.fetch_add(1, Ordering::SeqCst),
                 control: Arc::new(control),
+                spec: self.desired.lock().unwrap().clone(),
+                standby: None,
             }
         });
         engine.control.clone()
@@ -189,5 +343,108 @@ impl NodeEngines for InMemoryNodeEngines {
     async fn set_view_count(&self, unit: &str, views: usize) -> Result<(), ControlError> {
         self.views.lock().unwrap().insert(unit.to_string(), views);
         Ok(())
+    }
+
+    async fn drifted(&self) -> Result<Vec<Drift>, ControlError> {
+        let desired = self.desired.lock().unwrap().clone();
+        Ok(self
+            .engines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.spec != desired)
+            .map(|(unit, e)| Drift {
+                unit: unit.clone(),
+                pod: format!("constellation-engine-{unit}-{}", self.node),
+                desired: desired.clone(),
+                why: format!("spec {} -> {desired}", e.spec),
+            })
+            .collect())
+    }
+
+    async fn start_replacement(&self, unit: &str) -> Result<Replacement, ControlError> {
+        if self
+            .fail_starts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ControlError::unavailable(
+                "injected: the replacement did not start",
+            ));
+        }
+        let mut engines = self.engines.lock().unwrap();
+        let engine = engines
+            .get_mut(unit)
+            .ok_or_else(|| ControlError::not_found(format!("no engine pod for {unit}")))?;
+        let standby = Arc::new(InMemoryControl::standby_for(&engine.control));
+        if let Some(why) = self.fail_resume.lock().unwrap().take() {
+            standby.fail_resume(&why);
+        }
+        if let Some(after) = self.resume_after.lock().unwrap().take() {
+            standby.resume_after(after);
+        }
+        engine.standby = Some(standby.clone());
+        Ok(Replacement {
+            pod: format!("constellation-engine-{unit}-{}-next", self.node),
+            handoff: standby,
+        })
+    }
+
+    async fn adopt_replacement(
+        &self,
+        unit: &str,
+        _replacement: &Replacement,
+    ) -> Result<NodeEngine, ControlError> {
+        if self
+            .fail_adoptions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ControlError::unavailable(
+                "injected: the replacement is not ready yet",
+            ));
+        }
+        {
+            let mut engines = self.engines.lock().unwrap();
+            let engine = engines
+                .get_mut(unit)
+                .ok_or_else(|| ControlError::not_found(format!("no engine pod for {unit}")))?;
+            let standby = engine
+                .standby
+                .take()
+                .ok_or_else(|| ControlError::not_found("no replacement to adopt"))?;
+            engine.control = standby;
+            engine.incarnation = self.next.fetch_add(1, Ordering::SeqCst);
+            engine.spec = self.desired.lock().unwrap().clone();
+        }
+        Ok(self.connect(unit).expect("adopted"))
+    }
+
+    async fn discard_replacement(&self, unit: &str, _replacement: Replacement) {
+        if let Some(engine) = self.engines.lock().unwrap().get_mut(unit) {
+            engine.standby = None;
+        }
+    }
+
+    /// The next pod serves the same tree (as [`Self::crash`]), from the
+    /// desired spec, with no view.
+    async fn retire(&self, unit: &str) -> Result<(), ControlError> {
+        let desired = self.desired.lock().unwrap().clone();
+        if let Some(engine) = self.engines.lock().unwrap().get_mut(unit) {
+            if let Some(standby) = engine.standby.take() {
+                engine.control = standby;
+            }
+            engine.control.drop_views();
+            engine.incarnation = self.next.fetch_add(1, Ordering::SeqCst);
+            engine.spec = desired;
+        }
+        Ok(())
+    }
+
+    async fn report_fallback(&self, unit: &str, why: &str) {
+        self.fallbacks
+            .lock()
+            .unwrap()
+            .push((unit.to_string(), why.to_string()));
     }
 }

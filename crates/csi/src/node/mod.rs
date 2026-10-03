@@ -63,7 +63,9 @@
 //! engine pod ([`NodeEngines`]).
 
 pub mod engines;
+pub mod handoff;
 pub mod mounter;
+pub mod rollout;
 pub mod state;
 
 use crate::control_client::PoolRef;
@@ -84,7 +86,7 @@ use constellation_control::proto::types::{
     ViewStatsParams, ViewUnmountParams,
 };
 use constellation_control::proto::{ErrorKind, Secret};
-pub use engines::{InMemoryNodeEngines, NodeEngine, NodeEngines};
+pub use engines::{Drift, InMemoryNodeEngines, NodeEngine, NodeEngines, Replacement};
 pub use mounter::{FakeMounter, FuseMountOptions, LinuxMounter, MountState, Mounter};
 use state::{StateStore, VolumeRecord};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -145,6 +147,13 @@ pub struct NodeService {
     views_annotation: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// [`ANNOTATION_TIMEOUT`]; tests shorten it.
     annotation_timeout: Duration,
+    /// Plan 37 §8: one gate per engine-pod unit. Stages and unstages hold
+    /// it shared; a rollout's handoff holds it alone, so no view comes or
+    /// goes while the unit's sessions change hands ([`rollout`]).
+    unit_gates: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
+    /// The handoff's bounds and the rollouts' bookkeeping.
+    handoff: handoff::HandoffConfig,
+    rollout: rollout::RolloutState,
 }
 
 impl NodeService {
@@ -163,7 +172,40 @@ impl NodeService {
             unlocked: Mutex::default(),
             views_annotation: Mutex::default(),
             annotation_timeout: ANNOTATION_TIMEOUT,
+            unit_gates: Mutex::default(),
+            handoff: handoff::HandoffConfig::default(),
+            rollout: rollout::RolloutState::default(),
         }
+    }
+
+    /// Rollouts hand sessions over within `cfg` ([`handoff::HandoffConfig`]).
+    pub fn with_handoff(mut self, cfg: handoff::HandoffConfig) -> NodeService {
+        self.handoff = cfg;
+        self
+    }
+
+    /// The handoff counters (the node plugin's metrics endpoint).
+    pub fn handoff_metrics(&self) -> Arc<handoff::HandoffMetrics> {
+        self.rollout.metrics.clone()
+    }
+
+    fn unit_gate(&self, unit: &str) -> Arc<tokio::sync::RwLock<()>> {
+        self.unit_gates
+            .lock()
+            .unwrap()
+            .entry(unit.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// `unit`'s gate, shared: what every RPC that touches a staging mount
+    /// or its engine holds, so none of them meets a session that is
+    /// changing hands (its mount would not answer — a `stat` of the
+    /// staging path blocks until the handoff ends) — it waits for the
+    /// handoff instead ([`rollout`]). Taken once per RPC: a second shared
+    /// acquisition behind a waiting rollout would deadlock.
+    async fn shared_gate(&self, unit: &str) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.unit_gate(unit).read_owned().await
     }
 
     fn engines(&self) -> Result<&Arc<dyn NodeEngines>, Status> {
@@ -291,6 +333,7 @@ impl NodeService {
     }
 
     /// Stage `id` at `staging` (module docs, steps 1-5) and record it.
+    /// The caller holds the pool's unit gate ([`Self::shared_gate`]).
     #[allow(clippy::too_many_arguments)]
     async fn stage(
         &self,
@@ -621,6 +664,9 @@ impl NodeRpc for NodeService {
         let engines = self.engines()?.clone();
         let _lock = self.locks.try_lock(req.volume_id.clone())?;
         let staging = PathBuf::from(&req.staging_target_path);
+        let pool = location(&req.volume_context, &id, &req.secrets)?;
+        // Never while the unit's sessions change hands (`rollout`).
+        let _gate = self.shared_gate(&engines.names(&pool).0).await;
 
         let mut published = Default::default();
         if let Some(record) = self.state.get(&req.volume_id) {
@@ -643,7 +689,6 @@ impl NodeRpc for NodeService {
                 }
             }
         }
-        let pool = location(&req.volume_context, &id, &req.secrets)?;
         let reads_secret = !pool.secrets.is_empty();
         self.stage(
             engines.as_ref(),
@@ -668,6 +713,12 @@ impl NodeRpc for NodeService {
         required(&req.staging_target_path, "staging_target_path")?;
         let _lock = self.locks.try_lock(req.volume_id.clone())?;
         let staging = PathBuf::from(&req.staging_target_path);
+        // Never while the unit's sessions change hands (`rollout`).
+        let unit = self.state.get(&req.volume_id).map(|r| r.unit);
+        let _gate = match unit {
+            Some(unit) => Some(self.shared_gate(&unit).await),
+            None => None,
+        };
         // The plugin made the mount; unmounting it also ends the engine's
         // session on it (the kernel aborts the connection).
         self.unmount(&staging).await?;
@@ -735,6 +786,9 @@ impl NodeRpc for NodeService {
                     staging.display()
                 ))
             })?;
+        // Never while the unit's sessions change hands (`rollout`): the
+        // staging mount's probe would wait for it anyway.
+        let _gate = self.shared_gate(&record.unit).await;
         if mode == Mode::SingleNodeSingleWriter {
             if let Some(other) = record.published.iter().find(|p| **p != target) {
                 return Err(Status::failed_precondition(format!(
@@ -833,6 +887,12 @@ impl NodeRpc for NodeService {
         required(&req.target_path, "target_path")?;
         let _lock = self.locks.try_lock(req.volume_id.clone())?;
         let target = PathBuf::from(&req.target_path);
+        // Never while the unit's sessions change hands (`rollout`).
+        let unit = self.state.get(&req.volume_id).map(|r| r.unit);
+        let _gate = match unit {
+            Some(unit) => Some(self.shared_gate(&unit).await),
+            None => None,
+        };
         self.unmount(&target).await?;
         // The CSI spec: the plugin removes what it created at the path.
         match std::fs::remove_dir(&target) {
@@ -865,6 +925,8 @@ impl NodeRpc for NodeService {
         let record = self.state.get(&req.volume_id).ok_or_else(|| {
             Status::not_found(format!("volume {} is not staged here", req.volume_id))
         })?;
+        // Never while the unit's sessions change hands (`rollout`).
+        let _gate = self.shared_gate(&record.unit).await;
         let path = PathBuf::from(&req.volume_path);
         if path != record.staging_path && !record.published.contains(&path) {
             return Err(Status::not_found(format!(
@@ -932,6 +994,8 @@ impl NodeRpc for NodeService {
         let record = self.state.get(&req.volume_id).ok_or_else(|| {
             Status::not_found(format!("volume {} is not staged here", req.volume_id))
         })?;
+        // Never while the unit's sessions change hands (`rollout`).
+        let _gate = self.shared_gate(&record.unit).await;
         let mut statuses = Vec::new();
         match self.probe(&record.staging_path).await {
             Probe::State(MountState::Alive { .. }) => {}

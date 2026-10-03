@@ -113,6 +113,20 @@ pub trait ControlClient: Send + Sync {
 
     async fn node_ping(&self) -> Result<Pong, ControlError>;
     async fn node_handoff(&self, params: HandoffParams) -> Result<HandoffReport, ControlError>;
+    /// `node.handoff` with a descriptor attached: a `Transfer`'s receiving
+    /// socket, or a `Receive`'s record stream (plan 37 §8,
+    /// [`crate::node::handoff`]). Consumed like [`Self::view_mount_fd`]'s.
+    /// `NotSupported` where descriptors cannot travel.
+    async fn node_handoff_fd(
+        &self,
+        params: HandoffParams,
+        fd: OwnedFd,
+    ) -> Result<HandoffReport, ControlError> {
+        let _ = (params, fd);
+        Err(ControlError::unsupported(
+            "this connection cannot pass file descriptors",
+        ))
+    }
     async fn node_leave(&self, params: LeaveParams) -> Result<Ack, ControlError>;
 }
 

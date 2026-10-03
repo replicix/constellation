@@ -49,7 +49,7 @@ mod path;
 mod pipe;
 mod stream;
 #[cfg(unix)]
-mod unix;
+pub(crate) mod unix;
 
 pub use inprocess::InProcess;
 pub use path::{

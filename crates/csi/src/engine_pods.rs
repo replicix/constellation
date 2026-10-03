@@ -105,7 +105,7 @@
 //! (the daemon refuses an `fs.create` that does).
 
 use crate::control_client::{ControlClient, Engines, Handle, PoolRef, SocketControlClient};
-use crate::node::{NodeEngine, NodeEngines};
+use crate::node::{Drift, NodeEngine, NodeEngines, Replacement};
 use crate::params::ClassParams;
 use crate::volume_id::VolumeId;
 use async_trait::async_trait;
@@ -164,6 +164,16 @@ pub const LABEL_UNIT: &str = "constellation.dev/unit";
 /// has served none.
 pub const ANNOTATION_VIEWS: &str = "constellation.dev/last-view-count";
 pub const ANNOTATION_IDLE_SINCE: &str = "constellation.dev/idle-since";
+/// Plan 37 §8: a node-owned pod's place in its unit's chain of
+/// replacements (`0` for the first). Its name and its sockets follow from
+/// it ([`node_pod_name_gen`], [`control_socket_file`]).
+pub const LABEL_GENERATION: &str = "constellation.dev/generation";
+/// The fingerprint of the engine settings a node-owned pod was created
+/// from ([`engine_config_fingerprint`]): a pod whose fingerprint is not
+/// the plugin's own drifted, and is rolled (`crate::node::rollout`).
+pub const ANNOTATION_ENGINE_CONFIG: &str = "constellation.dev/engine-config";
+/// Why a rollout gave up on this pod (§8 "Failure handling").
+pub const ANNOTATION_HANDOFF_FALLBACK: &str = "constellation.dev/handoff-fallback";
 const ANNOTATION_S3: &str = "constellation.dev/s3";
 const ANNOTATION_ENDPOINT: &str = "constellation.dev/endpoint";
 
@@ -384,16 +394,189 @@ pub fn label_value(s: &str) -> String {
 /// in the method table); the engine's own uid stays admin as the
 /// daemon's owner. Written by the node plugin into
 /// `<hostRoot>/policy/<unit>/`, which the pod mounts read-only.
+///
+/// One grant per socket a pod of the unit may bind: the control socket and
+/// the handoff standby's socket (§8) of both generation slots — the
+/// serving pod and its replacement share the unit's sockets directory, and
+/// this one file.
 pub fn node_engine_policy() -> String {
-    format!(
-        "# Written by the constellation-csi node plugin (plan 37 §7).\n\
-         [[grant]]\n\
-         kind = \"service\"\n\
-         principal = \"uid:0\"\n\
-         socket = \"{POD_SOCKET}\"\n\
-         role = \"admin\"\n\
-         label = \"csi-node-plugin\"\n"
-    )
+    let mut policy =
+        String::from("# Written by the constellation-csi node plugin (plan 37 §7, §8).\n");
+    for slot in 0..2 {
+        for file in [control_socket_file(slot), handoff_socket_file(slot)] {
+            policy.push_str(&format!(
+                "[[grant]]\n\
+                 kind = \"service\"\n\
+                 principal = \"uid:0\"\n\
+                 socket = \"{POD_SOCKET_DIR}/{file}\"\n\
+                 role = \"admin\"\n\
+                 label = \"csi-node-plugin\"\n"
+            ));
+        }
+    }
+    policy
+}
+
+/// The control socket's file name of a generation-`generation` node pod:
+/// two slots, alternating, so a pod and its replacement never share one.
+pub fn control_socket_file(generation: u32) -> &'static str {
+    if generation.is_multiple_of(2) {
+        "control.sock"
+    } else {
+        "control-b.sock"
+    }
+}
+
+/// Where a generation-`generation` node pod waits as a handoff standby.
+pub fn handoff_socket_file(generation: u32) -> &'static str {
+    if generation.is_multiple_of(2) {
+        "handoff.sock"
+    } else {
+        "handoff-b.sock"
+    }
+}
+
+/// `constellation-engine-<unit>-<node>` for generation 0, with `-g<n>`
+/// after the node for a later one (still a pod name under the same
+/// limits, still `constellation-engine-<unit>-…`).
+pub fn node_pod_name_gen(unit: &str, node: &str, generation: u32) -> String {
+    match generation {
+        0 => node_pod_name(unit, node),
+        g => node_pod_name(unit, &format!("{node}-g{g}")),
+    }
+}
+
+/// Bump when the node pods' template changes in a way running pods must
+/// be rolled for (the fingerprint then differs for every pod).
+const POD_TEMPLATE_REVISION: u32 = 1;
+
+/// The fingerprint of the engine settings node pods are created from
+/// ([`ANNOTATION_ENGINE_CONFIG`]): image, pull policy, resources, log
+/// level and the template revision.
+pub fn engine_config_fingerprint(cfg: &EnginePodConfig) -> String {
+    let settings = serde_json::json!({
+        "image": cfg.image,
+        "pull": cfg.image_pull_policy,
+        "resources": cfg.resources,
+        "log": cfg.log_level,
+        "template": POD_TEMPLATE_REVISION,
+    });
+    blake3::hash(settings.to_string().as_bytes()).to_hex()[..16].to_string()
+}
+
+/// Point `pod` (a node pod) at generation `generation`: its name, its
+/// generation label, and its control and handoff sockets (arguments and
+/// probes) in that generation's slot.
+fn set_generation(pod: &mut Pod, unit: &str, node: &str, generation: u32) {
+    pod.metadata.name = Some(node_pod_name_gen(unit, node, generation));
+    pod.metadata
+        .labels
+        .get_or_insert_with(BTreeMap::new)
+        .insert(LABEL_GENERATION.to_string(), generation.to_string());
+    let control = format!("{POD_SOCKET_DIR}/{}", control_socket_file(generation));
+    let handoff = format!("{POD_SOCKET_DIR}/{}", handoff_socket_file(generation));
+    let Some(container) = pod.spec.as_mut().and_then(|s| s.containers.first_mut()) else {
+        return;
+    };
+    let args = container.args.get_or_insert_with(Vec::new);
+    for (flag, value) in [
+        ("--control-socket", &control),
+        ("--handoff-socket", &handoff),
+    ] {
+        match args.iter().position(|a| a == flag) {
+            Some(i) if i + 1 < args.len() => args[i + 1] = value.clone(),
+            _ => args.extend([flag.to_string(), value.clone()]),
+        }
+    }
+    // Readiness asks the control socket only: a pod is `Ready` once it
+    // serves. Startup and liveness also take the handoff socket's answer
+    // (plan 37 §8): a replacement waits there as a standby, without a
+    // control socket, for as long as the handoff takes — kubelet must not
+    // kill it for that (it would restart into another standby, and the
+    // sessions it holds would be gone).
+    let ping = |or: Option<&str>| {
+        let mut command = vec![
+            ENGINE_BIN.to_string(),
+            "control-relay".into(),
+            "--ping".into(),
+            "--socket".into(),
+            control.clone(),
+        ];
+        if let Some(or) = or {
+            command.extend(["--or-socket".to_string(), or.to_string()]);
+        }
+        command
+    };
+    for (probe, or) in [
+        (container.startup_probe.as_mut(), Some(handoff.as_str())),
+        (container.readiness_probe.as_mut(), None),
+        (container.liveness_probe.as_mut(), Some(handoff.as_str())),
+    ] {
+        if let Some(exec) = probe.and_then(|p| p.exec.as_mut()) {
+            exec.command = Some(ping(or));
+        }
+    }
+}
+
+/// The replacement of a running node pod (`current`, its unit's
+/// generation `generation - 1`): its spec — the pool, credentials and
+/// hostPaths it serves — with the engine settings of `cfg` (image, pull
+/// policy, resources, log level), in generation `generation`'s name and
+/// sockets. Pure, so it is unit-tested.
+pub fn replacement_pod(current: &Pod, cfg: &EnginePodConfig, generation: u32) -> Option<Pod> {
+    let labels = current.metadata.labels.clone().unwrap_or_default();
+    let unit = labels.get(LABEL_UNIT)?.clone();
+    let mut spec = current.spec.clone()?;
+    let node = spec.node_name.clone()?;
+    for c in spec
+        .containers
+        .iter_mut()
+        .chain(spec.init_containers.iter_mut().flatten())
+    {
+        c.image = Some(cfg.image.clone());
+        c.image_pull_policy = cfg.image_pull_policy.clone();
+    }
+    if let Some(engine) = spec.containers.first_mut() {
+        engine.resources = cfg.resources.clone();
+        let envs = engine.env.get_or_insert_with(Vec::new);
+        envs.retain(|e| e.name != "RUST_LOG");
+        envs.insert(0, env("RUST_LOG", cfg.log_level.clone()));
+    }
+    let mut annotations = current.metadata.annotations.clone().unwrap_or_default();
+    for gone in [
+        ANNOTATION_VIEWS,
+        ANNOTATION_IDLE_SINCE,
+        ANNOTATION_HANDOFF_FALLBACK,
+    ] {
+        annotations.remove(gone);
+    }
+    annotations.insert(
+        ANNOTATION_ENGINE_CONFIG.to_string(),
+        engine_config_fingerprint(cfg),
+    );
+    let mut pod = Pod {
+        metadata: ObjectMeta {
+            namespace: current.metadata.namespace.clone(),
+            labels: Some(labels),
+            annotations: Some(annotations),
+            owner_references: current.metadata.owner_references.clone(),
+            ..Default::default()
+        },
+        spec: Some(spec),
+        status: None,
+    };
+    set_generation(&mut pod, &unit, &node, generation);
+    Some(pod)
+}
+
+/// A node pod's generation ([`LABEL_GENERATION`]; `0` without one).
+pub fn pod_generation(pod: &Pod) -> u32 {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(LABEL_GENERATION))
+        .and_then(|g| g.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Where a node-owned engine pod reads [`node_engine_policy`] from: its
@@ -597,6 +780,32 @@ pub fn node_engine_pod(
         labels.insert(LABEL_UNIT.to_string(), unit_name(pool));
         labels.insert(LABEL_FS_UUID.to_string(), label_value(fs_uuid));
     }
+    pod.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(
+            ANNOTATION_ENGINE_CONFIG.to_string(),
+            engine_config_fingerprint(cfg),
+        );
+    // Every node pod can wait as a handoff standby (§8): it does when the
+    // state dir is held, i.e. only as a replacement.
+    set_generation(&mut pod, &unit_name(pool), node, 0);
+    pod
+}
+
+/// [`node_engine_pod`] in generation `generation` (a unit whose serving
+/// pod is a replacement's replacement).
+pub fn node_engine_pod_gen(
+    pool: &PoolRef,
+    cfg: &EnginePodConfig,
+    node: &str,
+    owner: Option<&OwnerReference>,
+    reads_secret: bool,
+    fs_uuid: &str,
+    generation: u32,
+) -> Pod {
+    let mut pod = node_engine_pod(pool, cfg, node, owner, reads_secret, fs_uuid);
+    set_generation(&mut pod, &unit_name(pool), node, generation);
     pod
 }
 
@@ -1802,8 +2011,55 @@ impl NodeEnginePods {
         }
     }
 
-    fn pod_of(&self, unit: &str) -> String {
-        node_pod_name(unit, &self.node)
+    /// Every live (not terminated, not being deleted) node pod of `unit`
+    /// on this node, by generation.
+    async fn unit_pods(&self, unit: &str) -> Result<Vec<Pod>, ControlError> {
+        let selector = format!(
+            "{LABEL_OWNER}=node,{LABEL_UNIT}={unit},{LABEL_NODE}={}",
+            label_value(&self.node)
+        );
+        let mut pods: Vec<Pod> = self
+            .pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| kube_err("listing the engine pods", e))?
+            .items
+            .into_iter()
+            .filter(|p| p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(&self.node))
+            .collect();
+        pods.sort_by_key(pod_generation);
+        Ok(pods)
+    }
+
+    /// The pod serving `unit` on this node: the newest ready one. During a
+    /// handoff the replacement is not ready (it binds its control socket
+    /// only once it serves), so this is the old pod until the cutover.
+    async fn serving(&self, unit: &str) -> Result<Option<Pod>, ControlError> {
+        Ok(self
+            .unit_pods(unit)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|p| pod_ready(p) && p.metadata.deletion_timestamp.is_none()))
+    }
+
+    /// The generation `unit`'s pod is (or is to be) created in: the
+    /// serving pod's, else the newest live one's, else 0.
+    async fn generation_of(&self, unit: &str) -> Result<u32, ControlError> {
+        if let Some(pod) = self.serving(unit).await? {
+            return Ok(pod_generation(&pod));
+        }
+        Ok(self
+            .unit_pods(unit)
+            .await?
+            .iter()
+            .filter(|p| {
+                p.metadata.deletion_timestamp.is_none()
+                    && !matches!(pod_phase(p), "Failed" | "Succeeded")
+            })
+            .map(pod_generation)
+            .next()
+            .unwrap_or(0))
     }
 
     fn sockets_dir(&self, unit: &str) -> std::path::PathBuf {
@@ -1850,7 +2106,9 @@ impl NodeEnginePods {
         let client = match cached {
             Some((have, client)) if have == uid && client.is_connected() => client,
             _ => {
-                let socket = self.sockets_dir(unit).join("control.sock");
+                let socket = self
+                    .sockets_dir(unit)
+                    .join(control_socket_file(pod_generation(pod)));
                 let client = Arc::new(SocketControlClient::connect_unix(&socket).await.map_err(
                     |e| {
                         ControlError::unavailable(format!(
@@ -1874,13 +2132,86 @@ impl NodeEnginePods {
             incarnation: uid,
         })
     }
+
+    async fn delete_pod(&self, name: &str) {
+        match self.pods.delete(name, &DeleteParams::default()).await {
+            Ok(_) => tracing::info!(pod = name, "deleted engine pod"),
+            Err(e) if is_status(&e, 404) => {}
+            Err(e) => tracing::warn!(pod = name, error = %e, "deleting an engine pod"),
+        }
+        self.clients.lock().unwrap().remove(name);
+    }
+
+    /// Wait until pod `name` is gone (bounded by the ready timeout).
+    async fn wait_gone(&self, name: &str) -> Result<(), ControlError> {
+        let deadline = Instant::now() + self.cfg.ready_timeout;
+        loop {
+            match self.pods.get_opt(name).await {
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(500)).await
+                }
+                Ok(Some(_)) => {
+                    return Err(ControlError::unavailable(format!(
+                        "engine pod {name} is still being deleted"
+                    )))
+                }
+                Err(e) => return Err(kube_err("reading the engine pod", e)),
+            }
+        }
+    }
+
+    /// The desired engine settings, as a fingerprint.
+    fn desired(&self) -> String {
+        engine_config_fingerprint(&self.cfg)
+    }
+
+    /// An event on engine pod `pod` (best effort).
+    async fn event(&self, pod: &Pod, reason: &str, message: &str, warning: bool) {
+        use k8s_openapi::api::core::v1::{Event, ObjectReference};
+        let name = pod.metadata.name.clone().unwrap_or_default();
+        let now = k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::now(),
+        );
+        let event = Event {
+            metadata: ObjectMeta {
+                generate_name: Some(format!("{name}.")),
+                namespace: Some(self.cfg.namespace.clone()),
+                ..Default::default()
+            },
+            involved_object: ObjectReference {
+                api_version: Some("v1".into()),
+                kind: Some("Pod".into()),
+                name: Some(name.clone()),
+                namespace: Some(self.cfg.namespace.clone()),
+                uid: pod.metadata.uid.clone(),
+                ..Default::default()
+            },
+            reason: Some(reason.into()),
+            message: Some(message.into()),
+            type_: Some(if warning { "Warning" } else { "Normal" }.into()),
+            first_timestamp: Some(now.clone()),
+            last_timestamp: Some(now),
+            count: Some(1),
+            source: Some(k8s_openapi::api::core::v1::EventSource {
+                component: Some("constellation-csi-node".into()),
+                host: Some(self.node.clone()),
+            }),
+            ..Default::default()
+        };
+        let events: Api<Event> =
+            Api::namespaced(self.pods.clone().into_client(), &self.cfg.namespace);
+        if let Err(e) = events.create(&PostParams::default(), &event).await {
+            tracing::warn!(pod = %name, reason, error = %e, "recording an event");
+        }
+    }
 }
 
 #[async_trait]
 impl NodeEngines for NodeEnginePods {
     fn names(&self, pool: &PoolRef) -> (String, String) {
         let unit = unit_name(pool);
-        let pod = self.pod_of(&unit);
+        let pod = node_pod_name(&unit, &self.node);
         (unit, pod)
     }
 
@@ -1890,39 +2221,38 @@ impl NodeEngines for NodeEnginePods {
         fs_uuid: &str,
         reads_secret: bool,
     ) -> Result<NodeEngine, ControlError> {
-        let (unit, name) = self.names(pool);
-        let lock = self.bringup_lock(&name);
+        let unit = unit_name(pool);
+        // One bring-up per unit, whatever generation its pod is.
+        let lock = self.bringup_lock(&unit);
         let _guard = lock.lock().await;
         self.write_policy(&unit)?;
-        let spec = node_engine_pod(
+        let generation = self.generation_of(&unit).await?;
+        let spec = node_engine_pod_gen(
             pool,
             &self.cfg,
             &self.node,
             self.owner.as_ref(),
             reads_secret,
             fs_uuid,
+            generation,
         );
+        let name = node_pod_name_gen(&unit, &self.node, generation);
         let pod = ensure_pod_ready(&self.pods, &name, Some(&spec), self.cfg.ready_timeout).await?;
         self.dial(&pod, &unit).await
     }
 
     async fn existing(&self, unit: &str) -> Result<Option<NodeEngine>, ControlError> {
-        let name = self.pod_of(unit);
-        let pod = self
-            .pods
-            .get_opt(&name)
-            .await
-            .map_err(|e| kube_err("reading the engine pod", e))?;
-        match pod {
-            Some(pod) if pod_ready(&pod) && pod.metadata.deletion_timestamp.is_none() => {
-                self.dial(&pod, unit).await.map(Some)
-            }
-            _ => Ok(None),
+        match self.serving(unit).await? {
+            Some(pod) => self.dial(&pod, unit).await.map(Some),
+            None => Ok(None),
         }
     }
 
     async fn set_view_count(&self, unit: &str, views: usize) -> Result<(), ControlError> {
-        let name = self.pod_of(unit);
+        let Some(pod) = self.serving(unit).await? else {
+            return Ok(());
+        };
+        let name = pod.metadata.name.clone().unwrap_or_default();
         let idle_since = (views == 0).then(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1944,6 +2274,240 @@ impl NodeEngines for NodeEnginePods {
             Err(e) if is_status(&e, 404) => Ok(()),
             Err(e) => Err(kube_err("annotating the engine pod", e)),
         }
+    }
+
+    async fn drifted(&self) -> Result<Vec<Drift>, ControlError> {
+        let selector = format!(
+            "{LABEL_OWNER}=node,{LABEL_NODE}={}",
+            label_value(&self.node)
+        );
+        let pods = self
+            .pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| kube_err("listing the engine pods", e))?
+            .items;
+        let desired = self.desired();
+        let mut units: BTreeMap<String, Pod> = BTreeMap::new();
+        for pod in pods.into_iter().filter(|p| {
+            pod_ready(p)
+                && p.metadata.deletion_timestamp.is_none()
+                && p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(&self.node)
+        }) {
+            let Some(unit) = pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_UNIT))
+                .cloned()
+            else {
+                continue;
+            };
+            // The newest ready pod is the one serving (`serving`).
+            match units.get(&unit) {
+                Some(have) if pod_generation(have) >= pod_generation(&pod) => {}
+                _ => {
+                    units.insert(unit, pod);
+                }
+            }
+        }
+        Ok(units
+            .into_iter()
+            .filter_map(|(unit, pod)| {
+                let have = pod
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(ANNOTATION_ENGINE_CONFIG))
+                    .cloned();
+                (have.as_deref() != Some(desired.as_str())).then(|| {
+                    let image = pod
+                        .spec
+                        .as_ref()
+                        .and_then(|s| s.containers.first())
+                        .and_then(|c| c.image.clone())
+                        .unwrap_or_default();
+                    Drift {
+                        unit,
+                        pod: pod.metadata.name.clone().unwrap_or_default(),
+                        desired: desired.clone(),
+                        why: format!(
+                            "engine settings {} -> {desired} (image {image} -> {})",
+                            have.as_deref().unwrap_or("(none)"),
+                            self.cfg.image
+                        ),
+                    }
+                })
+            })
+            .collect())
+    }
+
+    async fn start_replacement(&self, unit: &str) -> Result<Replacement, ControlError> {
+        let current = self
+            .serving(unit)
+            .await?
+            .ok_or_else(|| ControlError::unavailable(format!("no engine pod serves {unit}")))?;
+        self.write_policy(unit)?;
+        let generation = pod_generation(&current) + 1;
+        let spec = replacement_pod(&current, &self.cfg, generation).ok_or_else(|| {
+            ControlError::failed(format!(
+                "engine pod {} is not a node pod this plugin can replace",
+                current.metadata.name.as_deref().unwrap_or_default()
+            ))
+        })?;
+        let name = spec.metadata.name.clone().unwrap_or_default();
+        // A pod of that name is a leftover of an earlier attempt.
+        if self
+            .pods
+            .get_opt(&name)
+            .await
+            .map_err(|e| kube_err("reading the engine pod", e))?
+            .is_some()
+        {
+            self.delete_pod(&name).await;
+            self.wait_gone(&name).await?;
+        }
+        self.pods
+            .create(&PostParams::default(), &spec)
+            .await
+            .map_err(|e| kube_err("creating the replacement engine pod", e))?;
+        tracing::info!(pod = %name, unit, generation, image = %self.cfg.image,
+            "created a replacement engine pod");
+        // Up once its handoff socket answers as a standby.
+        let socket = self.sockets_dir(unit).join(handoff_socket_file(generation));
+        let deadline = Instant::now() + self.cfg.ready_timeout;
+        let mut why: String;
+        loop {
+            match self.pods.get_opt(&name).await {
+                Ok(Some(pod)) if matches!(pod_phase(&pod), "Failed" | "Succeeded") => {
+                    why = format!("it ended ({}) before waiting as a standby", pod_phase(&pod));
+                    break;
+                }
+                Ok(Some(pod)) => why = pod_waiting_on(&pod),
+                Ok(None) => why = "it was deleted".into(),
+                Err(e) => why = e.to_string(),
+            }
+            if let Ok(client) = SocketControlClient::connect_unix(&socket).await {
+                let client = client.with_timeout(Duration::from_secs(10));
+                let status = client
+                    .node_handoff(constellation_control::proto::types::HandoffParams {
+                        target: constellation_control::proto::types::HandoffTarget::Socket,
+                        phase: Some(constellation_control::proto::types::HandoffPhase::Status),
+                        ..Default::default()
+                    })
+                    .await;
+                match status.map(|r| r.state) {
+                    Ok(Some(constellation_control::proto::types::HandoffState::Standby {
+                        ..
+                    })) => {
+                        return Ok(Replacement {
+                            pod: name,
+                            handoff: Arc::new(client),
+                        })
+                    }
+                    Ok(state) => why = format!("its handoff socket answers {state:?}"),
+                    Err(e) => why = e.message,
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        self.delete_pod(&name).await;
+        Err(ControlError::unavailable(format!(
+            "replacement engine pod {name} did not wait as a handoff standby: {why}"
+        )))
+    }
+
+    async fn adopt_replacement(
+        &self,
+        unit: &str,
+        replacement: &Replacement,
+    ) -> Result<NodeEngine, ControlError> {
+        let pod =
+            ensure_pod_ready(&self.pods, &replacement.pod, None, self.cfg.ready_timeout).await?;
+        let engine = self.dial(&pod, unit).await?;
+        // The old pod exited after its commit; its object goes now.
+        for old in self.unit_pods(unit).await? {
+            let name = old.metadata.name.clone().unwrap_or_default();
+            if name != replacement.pod {
+                self.delete_pod(&name).await;
+            }
+        }
+        self.event(
+            &pod,
+            "EngineHandoff",
+            &format!("serving {unit}'s volumes, handed over without unmounting them (plan 37 §8)"),
+            false,
+        )
+        .await;
+        Ok(engine)
+    }
+
+    async fn discard_replacement(&self, _unit: &str, replacement: Replacement) {
+        self.delete_pod(&replacement.pod).await;
+    }
+
+    async fn replacement_ended(&self, _unit: &str, replacement: &Replacement) -> Option<String> {
+        let pod = match self.pods.get_opt(&replacement.pod).await {
+            Ok(Some(pod)) => pod,
+            Ok(None) => return Some(format!("replacement pod {} was deleted", replacement.pod)),
+            // The API server, not the pod: ask again later.
+            Err(_) => return None,
+        };
+        if pod.metadata.deletion_timestamp.is_some() {
+            return Some(format!(
+                "replacement pod {} is being deleted",
+                replacement.pod
+            ));
+        }
+        if matches!(pod_phase(&pod), "Failed" | "Succeeded") {
+            return Some(format!(
+                "replacement pod {} ended ({})",
+                replacement.pod,
+                pod_phase(&pod)
+            ));
+        }
+        let restarts: i32 = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.container_statuses.as_ref())
+            .map(|cs| cs.iter().map(|c| c.restart_count).sum())
+            .unwrap_or(0);
+        (restarts > 0).then(|| {
+            format!(
+                "replacement pod {}'s container restarted: the sessions it held are gone",
+                replacement.pod
+            )
+        })
+    }
+
+    async fn retire(&self, unit: &str) -> Result<(), ControlError> {
+        for pod in self.unit_pods(unit).await? {
+            self.delete_pod(&pod.metadata.name.clone().unwrap_or_default())
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn report_fallback(&self, unit: &str, why: &str) {
+        let pod = match self.serving(unit).await {
+            Ok(Some(pod)) => pod,
+            _ => return,
+        };
+        let name = pod.metadata.name.clone().unwrap_or_default();
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { ANNOTATION_HANDOFF_FALLBACK: why } }
+        });
+        if let Err(e) = self
+            .pods
+            .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            tracing::warn!(pod = %name, error = %e, "annotating the handoff fallback");
+        }
+        self.event(&pod, "EngineHandoffFallback", why, true).await;
     }
 }
 
@@ -2322,6 +2886,149 @@ mod tests {
             .as_ref()
             .unwrap()
             .contains(&"--create".to_string()));
+    }
+
+    /// Plan 37 §8: a replacement is its predecessor's pod (pool, hostPaths,
+    /// credentials) with the desired engine settings, in the next
+    /// generation's name and socket slot; every node pod can wait as a
+    /// standby; a settings change shows as a different fingerprint.
+    #[test]
+    fn a_replacement_keeps_the_pod_and_moves_to_the_next_slot() {
+        let p = pool(&[("bucket", "b"), ("prefix", "pool")], 0);
+        let node = "w1";
+        let unit = unit_name(&p);
+        let first = node_engine_pod(&p, &cfg(), node, None, true, "uuid-1");
+        let args = |pod: &Pod| {
+            pod.spec.as_ref().unwrap().containers[0]
+                .args
+                .clone()
+                .unwrap()
+        };
+        let flag = |pod: &Pod, f: &str| {
+            let a = args(pod);
+            a[a.iter().position(|x| x == f).unwrap() + 1].clone()
+        };
+        assert_eq!(pod_generation(&first), 0);
+        assert_eq!(flag(&first, "--control-socket"), POD_SOCKET);
+        assert_eq!(
+            flag(&first, "--handoff-socket"),
+            "/run/constellation-csi/handoff.sock"
+        );
+        let fingerprint = engine_config_fingerprint(&cfg());
+        assert_eq!(
+            first.metadata.annotations.as_ref().unwrap()[ANNOTATION_ENGINE_CONFIG],
+            fingerprint
+        );
+
+        let mut upgraded = cfg();
+        upgraded.image = "constellation-csi:next".into();
+        upgraded.log_level = "debug".into();
+        assert_ne!(engine_config_fingerprint(&upgraded), fingerprint);
+        let mut running = first.clone();
+        running.metadata.uid = Some("uid-old".into());
+        running
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(ANNOTATION_VIEWS.into(), "3".into());
+        let next = replacement_pod(&running, &upgraded, 1).unwrap();
+        assert_eq!(
+            next.metadata.name.as_deref(),
+            Some(format!("constellation-engine-{unit}-{node}-g1").as_str())
+        );
+        assert_eq!(next.metadata.uid, None);
+        assert_eq!(pod_generation(&next), 1);
+        let annotations = next.metadata.annotations.as_ref().unwrap();
+        assert_eq!(
+            annotations[ANNOTATION_ENGINE_CONFIG],
+            engine_config_fingerprint(&upgraded)
+        );
+        assert!(!annotations.contains_key(ANNOTATION_VIEWS));
+        assert_eq!(
+            flag(&next, "--control-socket"),
+            "/run/constellation-csi/control-b.sock"
+        );
+        assert_eq!(
+            flag(&next, "--handoff-socket"),
+            "/run/constellation-csi/handoff-b.sock"
+        );
+        // Each flag once, the pool's own arguments untouched.
+        assert_eq!(
+            args(&next)
+                .iter()
+                .filter(|a| *a == "--control-socket")
+                .count(),
+            1
+        );
+        assert_eq!(args(&next)[..3], args(&first)[..3]);
+        let spec = next.spec.as_ref().unwrap();
+        let engine = &spec.containers[0];
+        assert_eq!(engine.image.as_deref(), Some("constellation-csi:next"));
+        assert_eq!(
+            spec.init_containers.as_ref().unwrap()[0].image.as_deref(),
+            Some("constellation-csi:next")
+        );
+        let probe = engine.readiness_probe.as_ref().unwrap();
+        let command = probe.exec.as_ref().unwrap().command.as_ref().unwrap();
+        assert_eq!(
+            command.last().map(String::as_str),
+            Some("/run/constellation-csi/control-b.sock")
+        );
+        // A standby answers on its handoff socket only: startup and
+        // liveness take that answer too (should-fix 6 of 37-k5a's review),
+        // readiness does not.
+        assert!(!command.contains(&"--or-socket".to_string()));
+        for probe in [&engine.startup_probe, &engine.liveness_probe] {
+            let command = probe
+                .as_ref()
+                .unwrap()
+                .exec
+                .as_ref()
+                .unwrap()
+                .command
+                .clone();
+            let command = command.unwrap();
+            assert_eq!(
+                command[command.len() - 4..],
+                [
+                    "--socket",
+                    "/run/constellation-csi/control-b.sock",
+                    "--or-socket",
+                    "/run/constellation-csi/handoff-b.sock"
+                ]
+            );
+        }
+        let log = engine
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == "RUST_LOG");
+        assert_eq!(
+            log.map(|e| e.value.clone().unwrap()).collect::<Vec<_>>(),
+            ["debug"]
+        );
+        assert_eq!(spec.node_name.as_deref(), Some(node));
+        assert_eq!(
+            spec.volumes,
+            first.spec.as_ref().unwrap().volumes,
+            "the same hostPaths"
+        );
+        // And back to the first slot for the next one.
+        let third = replacement_pod(&next, &cfg(), 2).unwrap();
+        assert_eq!(flag(&third, "--control-socket"), POD_SOCKET);
+        assert_eq!(
+            third.metadata.name.as_deref(),
+            Some(format!("constellation-engine-{unit}-{node}-g2").as_str())
+        );
+        // Every socket either slot binds is granted to the node plugin.
+        let policy = node_engine_policy();
+        for g in 0..2 {
+            for file in [control_socket_file(g), handoff_socket_file(g)] {
+                assert!(policy.contains(&format!("socket = \"{POD_SOCKET_DIR}/{file}\"")));
+            }
+        }
     }
 
     #[test]

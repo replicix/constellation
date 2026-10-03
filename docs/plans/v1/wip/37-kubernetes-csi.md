@@ -1235,6 +1235,12 @@ duplicate of that fd changes:
    under 2 seconds for the fd-passing round trip itself (excluding step 2's
    drain wait, which is data-dependent) — measured and gated in K5.
 
+   *As built (37-k5a, see the K5 notes):* the engine moves with the
+   sessions (the state dir is exclusive), so step 6 is where the old engine
+   lets go — a replica sync and an exit, not a flush — and K5b gates the
+   **client-visible pause**: from the drain's start (`Prepare` received)
+   until the first request is served by the new pod.
+
 **Failure handling and rollback.** Every step above is designed so that a
 failure leaves the **old** pod as the source of truth until step 6's commit:
 
@@ -2151,7 +2157,199 @@ can honestly recommend a `shards` value.
   runs (flake-proofing this specific claim, since it is this plan's
   headline guarantee and a one-in-twenty failure rate would be a real
   regression hiding behind a green checkmark); the handoff wall-clock stays
-  under the §8 "under 2 seconds" target at p99.
+  under the §8 "under 2 seconds" target at p99 — measured as the
+  client-visible pause the K5 notes define (drain start to the first
+  request the new pod serves).
+
+**K5 notes (37-k5a, part 1: the protocol, the rollout, one kind run).**
+What §8 became against real engine pods, where it had to differ:
+
+- **The state dir's lock decides who serves, so the engine moves with the
+  sessions.** The replacement mounts the same `node-identity/<unit>/`
+  (§7), and an engine opens its state dir exclusively (`daemon.lock`). It
+  cannot resume a view before the old engine has let the state dir go, so
+  §8 step 6 is not log hygiene: the old pod's `Commit` writes a commit
+  marker into the state dir (`handoff.committed`), closes its views, stops
+  its engine and exits 0, and the replacement — waiting as a *standby*
+  (`serve --handoff-socket`, entered when the state dir is held) — takes
+  the lock and resumes (`open_view_resumed`, `FuseSession::resume`). The
+  lock makes double-serving impossible by construction. Everything before
+  `Commit` is undone by `Abort`; after it nothing can be (the receiver
+  failing to resume ends those mounts; kubelet's republish restages them,
+  the §8 fallback).
+- **The commit drains nothing (37-k5a fix round).** The receiver is the
+  same node identity on the same `meta.db`, so the old engine stops with
+  `Engine::stop_for_local_handoff` — replica synced, background loops
+  stopped — and leaves the journal, the pending chunk uploads, the held set
+  and the lease exactly where a restart finds them: the receiver drains the
+  uploads, ships the journal, and re-adopts the unreleased lease at its
+  epoch — through the takeover gate, not a plain renewal (M4's own-lease
+  `Plan::Claim`; its log line reads `takeover=true marker=true`, epoch
+  unchanged). What the
+  stop leaves is what a process crash leaves at that instant (commits reach
+  the OS on commit; a crash is already lossless and re-adopted) plus the
+  sync. Nothing has to reach S3 before the receiver may open the state dir.
+  The first version flushed (`shutdown_for_handover`: chunk uploads,
+  journal ship, lease release — stall limit 120 s, longer while it makes
+  progress) inside the commit, which a busy writer on real S3 could stretch
+  past every deadline. Proof: `engine` `node::tests::a_local_handoff_stop_leaves_everything_to_the_successor`
+  (write-back data whose chunks the bucket refuses, an open file whose
+  handle travels; a successor on the same state dir ships it all, the lease
+  keeps its epoch, an `fsync` through the handed handle succeeds, and a
+  third node reads every byte from the bucket), and the root
+  `serve` test `a_busy_write_back_writer_crosses_a_handoff`.
+- **The backup holds its seal watch across the commit (37-k5a fix
+  round).** While the receiver's engine starts, the holder is silent on
+  P2P, and a backup seals the epoch after `backup_takeover_ms` (1.5 s):
+  the review saw `holder silent: sealed its epoch` on every cycle, then
+  the receiver without a backup (`a backup sealed our epoch`) and a
+  backup brought up again ~7 s later. Two options were weighed: a mark
+  the backup could see (it reads nothing of the holder's state dir, and
+  an S3 mark would need a lease read before every seal, which the watch
+  deliberately does not do) or the old engine telling its backup before
+  it stops. The second is built: `stop_for_local_handoff` first asks
+  each committed backup to hold (`PeerMsg::BackupHold` /
+  `Payload::BackupHold`, one backup round trip, bounded at 2 s), and a
+  backup of that holder at that epoch counts no silence for 15 s
+  (`LOCAL_HANDOFF_BACKUP_HOLD`; capped at 30 s by the backup,
+  `BACKUP_HOLD_MAX_MS`); the receiver's first append ends the hold. It is
+  sound because it only delays a seal (liveness, like every timeout of
+  M9): nothing is acknowledged without a write-all ack either way, a
+  holder that never comes back is still sealed 15 s later, and only the
+  backed holder at its own epoch can ask (the P2P layer drops a hold in
+  another node's name). Not covered: an `ack=s3` lease's fast takeover by
+  a non-backup (no such lease on the CSI pools). Proof: authority
+  `a_backup_hold_defers_the_seal_until_the_successor_or_its_end`, net
+  `a_backup_hold_reaches_the_backups_service`. On kind the hold went
+  unused in the fix round's runs: there the controller's engine pod held
+  the pool's root lease and the node pod was its *delegate* for the
+  volume's subtree (and its backup); the pre-open below shrank the
+  silence under the 1.5 s budget anyway (no seal in any run).
+- **The standby pre-opens (37-k5a fix round).** The receiver's engine
+  start is the pause the sessions' callers see, and most of it needs no
+  state dir: a standby pre-opens, on a thread of its own while it waits,
+  the backend client, `meta.json` and the conditional-write probe, and
+  binds the P2P endpoint (`Engine::preopen`; under the node key the old
+  engine still uses — harmless, as nobody can reach the new endpoint
+  before its start publishes it, relays off; an E2E filesystem binds at
+  start, its topic needing the keyring). The start then only reloads
+  `meta.json`, opens `meta.db`, publishes its address and reads the
+  registry. Measured on kind (host load 60-150, the three fix-round
+  runs): `meta.db` open 163 / 843 / 90 ms, registry 34 / 49 / 69 ms, P2P
+  5 / 5 / 4 ms, every other phase under 10 ms, the standby's wait from
+  the seal to the lock 253 / 609 / 1055 ms (the old engine's commit —
+  views closed, replica synced — and its exit); the plugin's `elapsed`
+  342 ms / 1.35 s / 733 ms and the busy writer's longest call overlapping
+  the handoff 292 ms / 1.29 s / 666 ms, against 2.1-9.0 s before (P2P
+  bind 4.5 s, `meta.db` 2.5 s). §8's 2 s target is met on this host; what
+  is left is `meta.db`'s open and the old engine's commit and exit, both
+  load-bound. K5b's p99 should still watch the old engine's exit (the
+  lock wait above), which nothing pre-opens.
+- **Views detach concurrently (37-k5a fix round).** `Prepare` detaches
+  up to 8 views at once (`handover::detach_targets`, shared with `daemon
+  --upgrade`): each view's session, drain, barrier and export are its
+  own, so the first view stopped no longer waits for every later view's
+  drain and publication. A failure still serves every detached view
+  again in place, once all were tried.
+- **For K5b: a restarted delegate's first writes wait out its
+  delegation.** In the fix round's kind runs the node pod was the
+  delegate of the volume's subtree (M11) under the controller's engine
+  pod. The receiver does not carry the delegation over: its first
+  forwarded mutations back off against the root until the root reclaims
+  the unrenewed generation at its expiry (~4 s; `reclaiming an unrenewed
+  delegation`), then re-delegates. A `fsync` right after the resume took
+  3.8 s / 4.7 s / 3.4 s — after the gated handoff window, but a call K5b's
+  writers will see. K5b's options: the sender gives its delegations back
+  before stopping (a delegate-side release), or the receiver re-adopts
+  them as it re-adopts the lease.
+- **The pre-commit drain still publishes.** `Prepare`'s detach runs the
+  view's `sync_view` barrier: open write sessions are published
+  write-through (their chunks uploaded) and the journal made as durable as
+  `fsync` makes it. That is bounded by the dirty data since each file's
+  last close or `fsync`, and it is part of the pause K5b measures; a
+  bucket that is down fails the prepare (rollback), never the commit.
+- **After the commit, nothing gives the sessions up.** From the marker on,
+  the standby's descriptors are the only ones: it refuses `Abort`, and its
+  seal deadline no longer applies (it waits for the old process to exit
+  however long that takes). Before the marker, the seal deadline is set
+  past the old engine's own (which refuses a commit after it), so a
+  standby never gives up on a commit that can still come. The plugin's
+  wait for `Resumed` after the commit has its own bound
+  (`engineProfile.handoff.resumeTimeoutMs`, 300 s) and ends early only on
+  the replacement's `Failed` or its pod ending (deleted, terminated, a
+  container restart); past the bound the handoff is *unresolved* and the
+  replacement stays pending — never deleted on a timeout — and is adopted
+  once it serves. A served replacement whose adoption fails (readiness, a
+  dial, the API server) is likewise retried, never retired.
+- **No partial split across two pods.** §8's "some views on the new pod,
+  the failed ones back on the old" needs two engines on one state dir; one
+  engine owns every view of a unit, so a view that fails to resume ends.
+- **Phases.** `node.handoff{target: Socket}` carries `phase`: the sender's
+  `Prepare` (quiesce, drain, export; the old engine aborts by itself once
+  `deadline_ms` passes without a commit, so a plugin dying half way stalls
+  nothing for long), `Transfer` (records and `/dev/fuse` descriptors over a
+  socketpair the plugin reads, `constellation_control::handoff_wire`),
+  `Commit`, `Abort`; the receiver's `Receive` (every record and descriptor
+  on a second socketpair: a handle table of any size, nothing rides in a
+  control frame), `Seal`, `Status`, `Abort`. `daemon --upgrade` (`target:
+  Exec`) takes no phase and is unchanged.
+- **What the drain timeout bounds.** §8 wanted ops past the drain deadline
+  carried in the handle table. `drain_timeout_ms` bounds only the reads and
+  `fsync`s the engine answers off its FUSE workers (deferred); past it the
+  detach refuses and the session resumes in place. fuser's detach joins
+  its workers without a bound, so an op held *on* a worker (a write behind
+  the backpressure barrier, a forwarded mutation, a slow S3 request) holds
+  `Prepare` as long as it lasts: the plugin's step timeout gives up, sends
+  `Abort`, and the old engine records it — the prepare then serves its
+  sessions again the moment it ends (or if it outlived its own deadline),
+  instead of parking them until the watchdog.
+- **K0's gaps.** Gap 1 and 2 above. Gap 4: `detach` clears `O_NONBLOCK`
+  before the descriptor leaves, and the stock `FUSE_INIT` path
+  (`MountSource::PreopenedFd`) refuses a non-blocking descriptor or one
+  with nothing to read (a handed-over connection never sends `FUSE_INIT`
+  again); in the plugin, relayed descriptors go only to `Receive`.
+- **Timing.** Drain 5 s, the steps up to the commit 30 s (§8's defaults;
+  K0 showed a 10 s pause only delays callers), the old engine's own
+  deadline 5 s past that, the seal's 10 s past the old engine's, the
+  post-commit resume 300 s; the old engine exits 50 ms after answering its
+  commit; the transfer writes its records outside the sender's state lock
+  (so `Status` and `Abort` answer while a slow reader holds the stream;
+  an `Abort` landing mid-write fails the transfer, and no commit can
+  follow). 3 attempts per pod and desired spec, then the §8 fallback: the
+  old pod keeps serving (an event, `constellation.dev/handoff-fallback`,
+  `constellation_csi_handoff_fallback_total`; logged once) until it ends
+  and the republish restages its volumes on the new spec.
+- **For K5b: the gated pause is client-visible.** From the drain's start
+  (the old engine receives `Prepare` and stops reading) until the first
+  request is served by the new pod — what a writer sees as its longest
+  call. It includes the drain (and its publication), the relay, the old
+  engine's sync and exit, and the new engine's start; not the replacement
+  pod's own start (image pull, process start), which happens before the
+  drain. `elapsed` in the plugin's log (prepare sent to `Resumed` seen) is
+  an upper bound of it; the root test `a_busy_write_back_writer_crosses_a_handoff`
+  and `tests/csi/k5-handoff.sh`'s busy writer report it as the longest
+  call.
+- **Rollout trigger.** Each node pod carries the fingerprint of the engine
+  settings it was made from (`constellation.dev/engine-config`: image, pull
+  policy, resources, log level); a node plugin whose own settings (chart
+  values, through its DaemonSet) differ rolls its drifted pods one at a
+  time, at start and every 30 s. Replacements alternate between two socket
+  slots (`control.sock`/`handoff.sock`, `-b` variants) and are named
+  `…-g<generation>`; a pod serving no staged volume is simply deleted. A
+  standby has no control socket, so the pod's startup and liveness probes
+  also take an answer on its handoff socket (`control-relay --ping
+  --or-socket`); readiness does not (a standby is not `Ready`).
+- **The unit gate.** Stage, unstage, publish, unpublish,
+  `NodeGetVolumeStats` and `NodeGetVolumeHealth` hold their unit's gate
+  shared; a handoff holds it alone from `Prepare` to the end of the resume
+  wait. So a kubelet RPC waits for the handoff instead of meeting a staging
+  mount that does not answer.
+- **Not rolled: controller-owned engine pods** (K6/K7). The controller's
+  per-pool engine pods (K2) serve no FUSE session, so a chart upgrade does
+  not hand them over: they keep the old image until they are recreated
+  (the controller's idle GC, an operator's delete). K6/K7 must decide how
+  they follow an upgrade (a plain delete-and-recreate suffices: they hold
+  no mounts).
 
 ### K6 — Credentials, security, drain, purge, GC
 

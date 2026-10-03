@@ -52,6 +52,9 @@ pub struct ServeArgs {
     pub e2e: bool,
     pub cache_size: Option<u64>,
     pub write_mode: Option<String>,
+    /// Plan 37 §8: where to wait as a handoff standby when another
+    /// process holds the state dir (`crate::handoff_socket`).
+    pub handoff_socket: Option<PathBuf>,
 }
 
 pub fn cmd_serve(
@@ -69,6 +72,7 @@ pub fn cmd_serve(
         e2e,
         cache_size,
         write_mode,
+        handoff_socket,
     } = args;
     let initial_write_mode: crate::writeback::WriteMode = write_mode
         .as_deref()
@@ -89,13 +93,38 @@ pub fn cmd_serve(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     startup::phase("taking daemon.lock");
-    match crate::take_state_dir_lock(&state_dir)? {
-        crate::LockOutcome::BecomeDaemon => {}
-        crate::LockOutcome::Attach => bail!(
+    let mut preopened = None;
+    let adoption = match (crate::take_state_dir_lock(&state_dir)?, &handoff_socket) {
+        (crate::LockOutcome::BecomeDaemon, _) => {
+            crate::handoff_socket::clear_stale_marker(&state_dir);
+            None
+        }
+        (crate::LockOutcome::Attach, None) => bail!(
             "another daemon already serves {}; one `serve` per state dir",
             state_dir.display()
         ),
-    }
+        // Plan 37 §8: the pod this one replaces still serves; wait for its
+        // sessions (`crate::handoff_socket`).
+        (crate::LockOutcome::Attach, Some(socket)) => {
+            let preopen = preopen(&s3, rt.handle());
+            match crate::handoff_socket::standby(rt.handle(), socket, &state_dir)? {
+                crate::handoff_socket::StandbyOutcome::Adopt(adoption) => {
+                    preopened = preopen.take();
+                    Some(adoption)
+                }
+                crate::handoff_socket::StandbyOutcome::GiveUp(why) => {
+                    // Exit 0: the pod ends `Succeeded` instead of being
+                    // restarted into another standby; its node plugin
+                    // deletes it.
+                    tracing::warn!(reason = %why, "the handoff did not happen; exiting");
+                    // An `Abort`'s answer is still being written.
+                    std::thread::sleep(Duration::from_millis(300));
+                    rt.shutdown_timeout(Duration::from_secs(5));
+                    return Ok(());
+                }
+            }
+        }
+    };
     startup::phase("starting the node runtime");
     let node = node_runtime::NodeRuntime::start(
         node_runtime::NodeConfig {
@@ -113,11 +142,15 @@ pub fn cmd_serve(
                     crate::passphrase("CONSTELLATION_PASSPHRASE", "")
                 })),
                 version: env!("CONSTELLATION_VERSION").to_string(),
+                preopened,
                 ..constellation_engine::EngineConfig::new(s3.clone())
             },
             web_ui: 0,
             log_buffer,
-            resumed: None,
+            resumed: adoption.as_ref().map(|a| node_runtime::Resumed {
+                generation: a.generation(),
+                control: None,
+            }),
             // A headless node makes no mount of its own, but `view.mount`
             // with a path (control.rs) makes a plain one — CSI engine pods
             // included — and it follows the same transport policy as a
@@ -136,7 +169,24 @@ pub fn cmd_serve(
             persistent: true,
         },
         rt.handle().clone(),
-    )?;
+    );
+    let node = match (node, adoption) {
+        (Ok(node), Some(adoption)) => {
+            // The handed-off views first: their requests have been queued
+            // in the kernel since the sender stopped reading.
+            startup::phase("resuming the handed-off views");
+            let served = crate::handoff_socket::resume(&node, adoption);
+            tracing::info!(served, "handoff complete: serving");
+            node
+        }
+        (Ok(node), None) => node,
+        (Err(e), adoption) => {
+            if let Some(adoption) = adoption {
+                crate::handoff_socket::failed(adoption, format!("starting the node: {e:#}"));
+            }
+            return Err(e);
+        }
+    };
     startup::phase("starting the control API");
     if let Err(e) = node.serve_headless() {
         let _ = node.shutdown();
@@ -157,6 +207,69 @@ pub fn cmd_serve(
         Some(message) => bail!(message),
         None => Ok(()),
     }
+}
+
+/// Plan 37 §8: a standby's [`constellation_engine::Engine::preopen`],
+/// started at once on a thread of its own, so the backend client, its
+/// probe and the P2P endpoint are ready when the sender commits — the
+/// engine start that follows is the pause its sessions' callers see.
+struct Preopen(Option<std::thread::JoinHandle<Option<constellation_engine::Preopened>>>);
+
+impl Preopen {
+    /// What it opened, once it has (it usually has long since: the
+    /// standby waits for the plugin's whole prepare and transfer). Bounded:
+    /// past [`PREOPEN_WAIT`] the start opens everything itself.
+    fn take(mut self) -> Option<constellation_engine::Preopened> {
+        let handle = self.0.take()?;
+        let deadline = std::time::Instant::now() + PREOPEN_WAIT;
+        while !handle.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!("the pre-open is still running; the start opens everything itself");
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().ok().flatten()
+    }
+}
+
+/// How long a sealed standby waits for its pre-open to finish.
+const PREOPEN_WAIT: Duration = Duration::from_secs(10);
+
+fn preopen(s3: &str, rt: &tokio::runtime::Handle) -> Preopen {
+    let (s3, rt) = (s3.to_string(), rt.clone());
+    let spawned = std::thread::Builder::new()
+        .name("handoff-preopen".into())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            // As `NodeRuntime::start` picks it.
+            let p2p = constellation_engine::EngineProfile::from_env(
+                constellation_engine::EngineProfile::desktop(),
+            )
+            .map(|profile| profile.p2p_enabled())
+            .unwrap_or(true);
+            match constellation_engine::Engine::preopen(
+                &s3,
+                constellation_engine::EngineConfig::new(s3.clone()).credentials,
+                &constellation_platform::HostServices::native(),
+                p2p,
+                &rt,
+            ) {
+                Ok(preopened) => {
+                    tracing::info!(
+                        ms = started.elapsed().as_millis() as u64,
+                        "pre-opened the backend and the P2P endpoint for the handoff"
+                    );
+                    Some(preopened)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        "pre-opening for the handoff failed; the start opens everything itself");
+                    None
+                }
+            }
+        });
+    Preopen(spawned.ok())
 }
 
 /// `fs create`'s backend half (module docs): a no-op when `meta.json`
@@ -198,17 +311,30 @@ async fn create_if_missing(s3: &str, chunk_size: u32, compression: &str, e2e: bo
 }
 
 /// `control-relay`: pipe stdin → `socket` and `socket` → stdout until
-/// either side closes; with `ping`, one `node.ping` instead.
-pub async fn control_relay(socket: &Path, ping: bool) -> Result<()> {
+/// either side closes; with `ping`, one `node.ping` instead (on `socket`,
+/// else on `or_socket`).
+pub async fn control_relay(socket: &Path, ping: bool, or_socket: Option<&Path>) -> Result<()> {
     if ping {
-        let client = constellation_control::Client::connect_unix(socket).await?;
-        client
-            .call_bounded::<constellation_control::methods::NodePing>(
-                Default::default(),
-                Duration::from_secs(5),
-            )
-            .await?;
-        return Ok(());
+        let ping = |socket: &Path| {
+            let socket = socket.to_path_buf();
+            async move {
+                let client = constellation_control::Client::connect_unix(&socket).await?;
+                client
+                    .call_bounded::<constellation_control::methods::NodePing>(
+                        Default::default(),
+                        Duration::from_secs(2),
+                    )
+                    .await?;
+                anyhow::Ok(())
+            }
+        };
+        return match (ping(socket).await, or_socket) {
+            (Ok(()), _) => Ok(()),
+            (Err(e), None) => Err(e),
+            (Err(e), Some(other)) => ping(other)
+                .await
+                .with_context(|| format!("and {}: {e:#}", socket.display())),
+        };
     }
     let stream = tokio::net::UnixStream::connect(socket)
         .await

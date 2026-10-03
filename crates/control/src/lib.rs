@@ -46,6 +46,8 @@ pub mod audit;
 pub mod authz;
 pub mod client;
 pub mod fd;
+#[cfg(unix)]
+pub mod handoff_wire;
 pub mod methods;
 pub mod proto;
 pub mod schema;

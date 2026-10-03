@@ -648,6 +648,20 @@ pub enum Payload {
         req_id: u64,
         outcome: SnapshotBatchOutcome,
     },
+    // ---- Plan 37 §8 (37-k5a): a holder replaced on its own state dir
+    // (appended, as above) ----
+    /// The lease holder `holder` is about to be replaced by a successor
+    /// on its own state dir (an engine-pod handoff): the same node, lease
+    /// and epoch, silent while the successor starts. A backup of `holder`
+    /// at `epoch` counts no silence for `for_ms` (capped by the
+    /// recipient) instead of sealing the epoch after its usual budget;
+    /// the successor's first append ends the hold. Answered with
+    /// [`Payload::Ok`].
+    BackupHold {
+        holder: u64,
+        epoch: u64,
+        for_ms: u64,
+    },
 }
 
 /// Plan 30 §M14: `constellation_authority::LockOutcome` on the wire.

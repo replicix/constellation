@@ -4,8 +4,9 @@
 # `*-secret-name` and pass the bytes in the request.
 #
 # The node plugin additionally (37-k3a): `pods` patch (its engine pods'
-# view-count annotations, §7) and `daemonsets` get on its own DaemonSet
-# (the engine pods' owner). No Secret permission at all: its engine pods
+# view-count annotations, §7), `daemonsets` get on its own DaemonSet
+# (the engine pods' owner), and (37-k5a) `events` create: an engine-pod
+# handoff and a rollout's fallback are reported on the pod (§8, §10). No Secret permission at all: its engine pods
 # reference the pool's credentials Secret the controller writes (kubelet
 # resolves a pod's own secretKeyRefs through the node authorizer), and the
 # node-stage secret reaches a running engine through fs.unlock. It never
@@ -55,6 +56,10 @@ rules:
     resources: [daemonsets]
     resourceNames: [constellation-csi-node]
     verbs: [get]
+  # Plan 37 §8: a rollout's handoff and its fallback, on the engine pod.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create]
   {{- end }}
   {{- if eq $role "controller" }}
   - apiGroups: [""]

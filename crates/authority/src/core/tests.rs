@@ -4964,6 +4964,78 @@ mod epoch_rules {
         assert_eq!(h.core.bk.sealed, 1, "silence after the close seals");
         assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
     }
+
+    /// Plan 37 §8: a holder replaced on its own state dir asks its backup
+    /// to hold the seal watch (`PeerMsg::BackupHold`). Silence inside the
+    /// hold neither seals nor reads the lease; the successor's first
+    /// append ends the hold (the usual window counts from it); a hold
+    /// from anyone but the backed holder at its epoch is ignored; and a
+    /// holder that never comes back is still sealed once the (capped)
+    /// hold has passed.
+    #[test]
+    fn a_backup_hold_defers_the_seal_until_the_successor_or_its_end() {
+        let append = |req| Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(req),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                from: 1,
+                txs: Vec::new(),
+                through: 0,
+            },
+        };
+        let hold = |from, epoch, for_ms| Event::Peer {
+            from,
+            msg: PeerMsg::BackupHold { epoch, for_ms },
+        };
+        let mut h = Harness::new(2);
+        let out = h.step(append(7));
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        // Holds that are not the backed holder's at its epoch: ignored.
+        h.step(hold(3, 1, 10_000));
+        h.step(hold(1, 2, 10_000));
+        assert_eq!(h.core.stats.backup_holds, 0);
+        // The holder's own hold, then silence well past the budget.
+        h.step(hold(1, 1, 10_000));
+        assert_eq!(h.core.stats.backup_holds, 1);
+        h.advance(5_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed inside the hold");
+        assert!(s3_ops(&out).is_empty(), "read the lease: {out:?}");
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        // The successor's first append ends the hold: its silence counts
+        // from there, with the usual budget.
+        h.advance(1_000);
+        h.step(append(8));
+        h.advance(1_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed before a full window");
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(1_000);
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(
+            h.core.bk.sealed, 1,
+            "silence after the successor's append seals"
+        );
+        assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
+
+        // A holder that never comes back: sealed once the hold — capped
+        // at `BACKUP_HOLD_MAX_MS`, whatever it asked — has passed.
+        let mut h = Harness::new(2);
+        let out = h.step(append(7));
+        let mut watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.step(hold(1, 1, u64::MAX));
+        let cap = super::super::backup::BACKUP_HOLD_MAX_MS as i64;
+        h.advance(cap as u64);
+        let out = h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 0, "sealed inside the capped hold");
+        watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(2_000);
+        h.step(Event::Timer { id: watch });
+        assert_eq!(h.core.bk.sealed, 1, "the hold outlived its cap");
+    }
 }
 
 /// Plan 30 §M9: a definitive refusal of a forwarded op is an outcome.

@@ -3677,10 +3677,13 @@ pub enum HandoffTarget {
         #[serde(default)]
         binary: Option<PathBuf>,
     },
-    /// Drain the sessions of `views` (all when empty), export their handle
-    /// tables and send the session descriptors to the process listening on
-    /// the unix socket **attached to this request** (fd passing), which
-    /// then resumes them — plan 37's engine-pod replacement.
+    /// Plan 37 §8: hand the sessions of `views` (all when empty) to
+    /// another process — a CSI engine pod's replacement — in the phases of
+    /// [`HandoffPhase`], driven step by step by the node plugin. The sender
+    /// is the serving daemon (`Prepare`, `Transfer`, `Commit`, `Abort`);
+    /// the receiver a standby `constellation serve --handoff-socket`
+    /// (`Receive`, `Seal`, `Status`). `Transfer` and `Receive` carry a
+    /// descriptor (see [`HandoffPhase`]).
     Socket,
 }
 
@@ -3690,9 +3693,53 @@ impl Default for HandoffTarget {
     }
 }
 
-/// `node.handoff` (plan 31 §6.11). With [`HandoffTarget::Socket`] the
-/// request carries a descriptor and needs a transport with fd passing;
-/// [`HandoffTarget::Exec`] (the default) does not.
+/// The steps of a [`HandoffTarget::Socket`] handoff (plan 37 §8). Every
+/// sender step before `Commit` is undone by `Abort`; the state dir's lock
+/// decides which process serves, so the two never serve at once (the
+/// receiver serves only once it holds the lock, the sender gives it up
+/// only by exiting after `Commit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffPhase {
+    /// Sender, §8 steps 1-3: stop reading every session, drain what was
+    /// accepted (bounded by `drain_timeout_ms`), publish pending writes and
+    /// export the handle tables. Nothing leaves the process; until
+    /// `deadline_ms` passes without a `Commit` (then the sender aborts on
+    /// its own: a plugin that died must not leave the mounts stalled).
+    Prepare,
+    /// Sender, §8 step 4: write one record per prepared view, each with its
+    /// `/dev/fuse` descriptor, onto the unix stream socket attached to the
+    /// request (`crate::handoff_wire`), then an end mark. The sender keeps
+    /// its own copies until `Commit` or `Abort`.
+    Transfer,
+    /// Sender, §8 step 6: mark the state dir committed, close the views,
+    /// stop the engine without draining it (the receiver is the same node
+    /// on the same state dir: it ships the journal and the pending uploads
+    /// and re-adopts the lease) and exit, which frees the state dir for the
+    /// receiver. Refused once `Prepare`'s `deadline_ms` has passed. The
+    /// point of no return.
+    Commit,
+    /// Sender: serve every prepared session again, in place. A no-op when
+    /// nothing is prepared.
+    Abort,
+    /// Receiver: read records and their descriptors, exactly as a
+    /// `Transfer` wrote them, from the unix stream socket attached to the
+    /// request (`crate::handoff_wire`), and hold them without serving them.
+    Receive,
+    /// Receiver: every record is in; take the state dir as soon as the
+    /// sender has freed it, start the node and resume every view (§8 step
+    /// 5). Answered at once; `Status` follows it. Past `deadline_ms` with no
+    /// commit by the sender, the receiver gives up; once the sender has
+    /// committed it waits for the state dir without a bound.
+    Seal,
+    /// Receiver: where the adoption stands ([`HandoffReport::state`]).
+    Status,
+}
+
+/// `node.handoff` (plan 31 §6.11). With [`HandoffTarget::Socket`] every
+/// request names its [`HandoffPhase`], and `Transfer`/`Receive` carry a
+/// descriptor and need a transport with fd passing; [`HandoffTarget::Exec`]
+/// (the default) takes no phase and no descriptor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HandoffParams {
     #[serde(default)]
@@ -3702,6 +3749,41 @@ pub struct HandoffParams {
     /// How long to wait for in-flight operations to drain.
     #[serde(default)]
     pub drain_timeout_ms: Option<u64>,
+    /// `Socket` only: which step this request is.
+    #[serde(default)]
+    pub phase: Option<HandoffPhase>,
+    /// `Prepare`: how long the sender stays prepared without a `Commit`
+    /// before it aborts on its own (and after which it refuses one).
+    /// `Seal`: how long the receiver waits for the sender to commit before
+    /// it gives up (dropping what it received).
+    #[serde(default)]
+    pub deadline_ms: Option<u64>,
+}
+
+/// Where a [`HandoffTarget::Socket`] handoff stands, on either side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffState {
+    /// Sender: serving, nothing prepared (also after an `Abort`).
+    Serving,
+    /// Sender: sessions stopped and exported, still held here.
+    Prepared,
+    /// Sender: records written; its copies still held.
+    Transferred,
+    /// Sender: committed, exiting.
+    Committed,
+    /// Receiver: waiting for records (`received` so far).
+    Standby { received: u64 },
+    /// Receiver: sealed, waiting for the state dir or starting the node.
+    Sealed,
+    /// Receiver: serving the views it resumed (failed ones listed in
+    /// `failed`: their sessions ended).
+    Resumed {
+        #[serde(default)]
+        failed: Vec<String>,
+    },
+    /// Receiver: gave up (aborted, or the deadline passed); it exits.
+    Failed { reason: String },
 }
 
 /// One session handed over.
@@ -3711,6 +3793,10 @@ pub struct HandedOffView {
     pub mountpoint: String,
     /// Open handles exported with it.
     pub handles: u64,
+    /// The transport its connection is served over (`dev_fuse`: the only
+    /// one that can be handed over, plan 38 §3(e)).
+    #[serde(default)]
+    pub transport: String,
 }
 
 /// `node.handoff`'s result: answered once the sessions are detached; the
@@ -3722,6 +3808,12 @@ pub struct HandoffReport {
     #[serde(default)]
     pub detail: String,
     pub views: Vec<HandedOffView>,
+    /// `Socket` only: the state the step left.
+    #[serde(default)]
+    pub state: Option<HandoffState>,
+    /// How long the step took.
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 /// One sample of `stats.subscribe`: named counters (monotonic) and gauges

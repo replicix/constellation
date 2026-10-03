@@ -154,6 +154,8 @@ pub struct HandoverState {
     /// package upgrade replaces the file: this path then names the new
     /// binary, `/proc/self/exe` the deleted old one).
     exe: Option<PathBuf>,
+    /// Plan 37 §8: a handoff to another process (`crate::handoff_socket`).
+    pub(crate) socket: crate::handoff_socket::SenderState,
 }
 
 impl HandoverState {
@@ -164,7 +166,33 @@ impl HandoverState {
             last_error: Mutex::new(None),
             control: Mutex::new(None),
             exe: std::env::current_exe().ok(),
+            socket: Default::default(),
         }
+    }
+
+    /// This image's place in its chain of handovers.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Mark a handover under way; `false` when one already is.
+    pub(crate) fn begin(&self) -> bool {
+        !self.upgrading.swap(true, Ordering::SeqCst)
+    }
+
+    /// The handover under way failed (and nothing changed): recorded for
+    /// `status`, and no longer under way.
+    pub(crate) fn fail_with(&self, why: String) -> String {
+        self.fail(why)
+    }
+
+    /// The handover under way ended without handing anything over
+    /// (`why`, if it is worth reporting).
+    pub(crate) fn finish(&self, why: Option<String>) {
+        if let Some(why) = why {
+            *self.last_error.lock().unwrap() = Some(why);
+        }
+        self.upgrading.store(false, Ordering::SeqCst);
     }
 
     /// A handover is under way (the daemon must not exit when its session
@@ -325,23 +353,23 @@ impl NodeHandoff {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MountHandoff {
     /// Its mount record in the previous image (replaced by the new one's).
-    old_id: u64,
-    subtree: String,
-    mountpoint: PathBuf,
-    fs_name: String,
-    allow_other: bool,
-    read_only: bool,
-    fuse_threads: usize,
-    fuse_fd: RawFd,
-    init: NegotiatedInit,
+    pub(crate) old_id: u64,
+    pub(crate) subtree: String,
+    pub(crate) mountpoint: PathBuf,
+    pub(crate) fs_name: String,
+    pub(crate) allow_other: bool,
+    pub(crate) read_only: bool,
+    pub(crate) fuse_threads: usize,
+    pub(crate) fuse_fd: RawFd,
+    pub(crate) init: NegotiatedInit,
     /// Somebody else made the mount (`view.mount{PreopenedFd}`): the next
     /// image ends the session rather than unmounting `mountpoint`, which
     /// is only its name (`FuseHandoff::foreign`).
-    foreign: bool,
+    pub(crate) foreign: bool,
     /// Plan 38 Z3b: the session's passthrough table, its backing ids
     /// still registered (`FuseHandoff::passthrough`).
-    passthrough: constellation_frontend_fuse::PassthroughHandoff,
-    view: ViewHandoff,
+    pub(crate) passthrough: constellation_frontend_fuse::PassthroughHandoff,
+    pub(crate) view: ViewHandoff,
 }
 
 /// Everything the next image receives (JSON in a memfd).
@@ -533,25 +561,25 @@ fn preflight(binary: &Path) -> Result<(), String> {
 }
 
 /// One mounted view, as the upgrade handles it.
-struct Target {
-    id: MountId,
-    info: SessionInfoParts,
-    control: constellation_frontend_fuse::SessionControl,
-    view: Arc<constellation_engine::View>,
+pub(crate) struct Target {
+    pub(crate) id: MountId,
+    pub(crate) info: SessionInfoParts,
+    pub(crate) control: constellation_frontend_fuse::SessionControl,
+    pub(crate) view: Arc<constellation_engine::View>,
 }
 
 #[derive(Clone)]
-struct SessionInfoParts {
-    subtree: String,
-    mountpoint: PathBuf,
-    fs_name: String,
-    allow_other: bool,
-    read_only: bool,
-    fuse_threads: usize,
-    sink: constellation_frontend_fuse::FuseNotifySink,
-    caps: constellation_vfs::FrontendCaps,
-    qos: constellation_engine::ViewQos,
-    confine_links: bool,
+pub(crate) struct SessionInfoParts {
+    pub(crate) subtree: String,
+    pub(crate) mountpoint: PathBuf,
+    pub(crate) fs_name: String,
+    pub(crate) allow_other: bool,
+    pub(crate) read_only: bool,
+    pub(crate) fuse_threads: usize,
+    pub(crate) sink: constellation_frontend_fuse::FuseNotifySink,
+    pub(crate) caps: constellation_vfs::FrontendCaps,
+    pub(crate) qos: constellation_engine::ViewQos,
+    pub(crate) confine_links: bool,
 }
 
 impl SessionInfoParts {
@@ -583,7 +611,7 @@ impl SessionInfoParts {
     }
 }
 
-type Detached = (
+pub(crate) type Detached = (
     Target,
     constellation_frontend_fuse::SessionHandoff<Result<ViewHandoff>>,
 );
@@ -637,11 +665,23 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
                 .into(),
         );
     }
-    let targets: Vec<Target> = node
-        .mounts
-        .lock()
-        .unwrap()
+    let targets = targets(node, &[])?;
+    check_targets(&targets, "upgrade")?;
+    detach_targets(node, targets, None)
+}
+
+/// The mounted views to hand over: `ids`, or every one when empty.
+pub(crate) fn targets(node: &Arc<NodeRuntime>, ids: &[u64]) -> Result<Vec<Target>, String> {
+    let mounts = node.mounts.lock().unwrap();
+    if let Some(missing) = ids
         .iter()
+        .find(|id| !mounts.keys().any(|m| m.as_u64() == **id))
+    {
+        return Err(format!("no view {missing} is mounted"));
+    }
+    let targets: Vec<Target> = mounts
+        .iter()
+        .filter(|(id, _)| ids.is_empty() || ids.contains(&id.as_u64()))
         .map(|(id, m)| Target {
             id: *id,
             info: SessionInfoParts {
@@ -663,6 +703,13 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
     if targets.is_empty() {
         return Err("no view is mounted".into());
     }
+    Ok(targets)
+}
+
+/// What refuses a handover of `targets` before anything is detached: a
+/// session served over a ring, a cluster lock, a blocking lock wait.
+/// `what` names the handover in the refusal.
+pub(crate) fn check_targets(targets: &[Target], what: &str) -> Result<(), String> {
     // Plan 38 §3(e): a session served over a ring can be handed over
     // **never**, not "once something is released" -- so it is refused
     // here, by name, before anything is detached, rather than as a
@@ -683,7 +730,7 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
         .collect();
     if !ring.is_empty() {
         return Err(format!(
-            "refusing the upgrade: a FUSE session served over io_uring cannot be handed to \
+            "refusing the {what}: a FUSE session served over io_uring cannot be handed to \
              another process image, on any kernel through 7.3 (plan 38 §3(e)) -- unmount and \
              remount these views, or mount them with --fuse-transport dev-fuse to keep them \
              upgradable in place: {}",
@@ -691,7 +738,7 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
         ));
     }
     let mut blockers = Vec::new();
-    for t in &targets {
+    for t in targets {
         for b in t.view.handover_blockers() {
             blockers.push(format!("{}: {b}", t.info.mountpoint.display()));
         }
@@ -705,14 +752,59 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
     }
     if !blockers.is_empty() {
         return Err(format!(
-            "refusing the upgrade (retry once these are released): {}",
+            "refusing the {what} (retry once these are released): {}",
             blockers.join("; ")
         ));
     }
+    Ok(())
+}
+
+/// How many views [`detach_targets`] detaches at once.
+const DETACH_PARALLEL: usize = 8;
+
+/// Detach every target (its session stops reading, drains — bounded by
+/// `drain`, else the session's own default — publishes and exports); on
+/// any failure the ones already detached are resumed in place and nothing
+/// is handed over.
+///
+/// The views are detached concurrently ([`DETACH_PARALLEL`] at a time):
+/// each one's session, drain, barrier and export are its own, so a view's
+/// callers wait for its own drain and publication, not for every other
+/// view's as well (with N views, serially, the first view stopped would
+/// wait for all N). Every view stopped is still served again only once
+/// all have been tried, and only on a failure.
+pub(crate) fn detach_targets(
+    node: &Arc<NodeRuntime>,
+    targets: Vec<Target>,
+    drain: Option<Duration>,
+) -> Result<Vec<Detached>, String> {
+    let engine = node.engine();
+    let mut results = Vec::with_capacity(targets.len());
+    let mut targets = targets.into_iter().peekable();
+    while targets.peek().is_some() {
+        let batch: Vec<Target> = targets.by_ref().take(DETACH_PARALLEL).collect();
+        let detach = |t: Target| {
+            let view = t.view.clone();
+            let result = t.control.detach_within(drain, || engine.export_view(&view));
+            (t, result)
+        };
+        if batch.len() == 1 {
+            results.extend(batch.into_iter().map(detach));
+            continue;
+        }
+        std::thread::scope(|scope| {
+            let running: Vec<_> = batch
+                .into_iter()
+                .map(|t| scope.spawn(|| detach(t)))
+                .collect();
+            for handle in running {
+                results.push(handle.join().expect("a detach thread panicked"));
+            }
+        });
+    }
     let mut done: Vec<Detached> = Vec::new();
-    for t in targets {
-        let view = t.view.clone();
-        let result = t.control.detach(|| engine.export_view(&view));
+    let mut failure = None;
+    for (t, result) in results {
         match result {
             Ok(handoff) if handoff.view.is_ok() => done.push((t, handoff)),
             other => {
@@ -720,23 +812,24 @@ fn prepare(node: &Arc<NodeRuntime>, binary: &Path) -> Result<Vec<Detached>, Stri
                     Err(e) => e.to_string(),
                     Ok(h) => format!("{:#}", h.view.as_ref().expect_err("an export error")),
                 };
-                let mut undo = done;
+                failure.get_or_insert(format!("detaching a view failed: {why}"));
                 if let Ok(handoff) = other {
-                    undo.push((t, handoff));
+                    done.push((t, handoff));
                 }
-                let why = format!("detaching a view failed: {why}");
-                for (t, handoff) in undo {
-                    resume_in_place(node, t, handoff.fuse);
-                }
-                return Err(why);
             }
         }
+    }
+    if let Some(why) = failure {
+        for (t, handoff) in done {
+            resume_in_place(node, t, handoff.fuse);
+        }
+        return Err(why);
     }
     Ok(done)
 }
 
 /// Serve a detached session again in this image (an abandoned upgrade).
-fn resume_in_place(node: &Arc<NodeRuntime>, t: Target, fuse: FuseHandoff) {
+pub(crate) fn resume_in_place(node: &Arc<NodeRuntime>, t: Target, fuse: FuseHandoff) {
     let mountpoint = t.info.mountpoint.clone();
     match FuseSession::resume(
         fuse,
@@ -978,7 +1071,7 @@ fn handover_options(
 }
 
 /// Reopen one view and resume its session on the inherited descriptor.
-fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
+pub(crate) fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<MountId> {
     // SAFETY: the inherited connection, ours from here (closing it on an
     // error below ends the mount, as there is nobody else to serve it).
     let fuse_fd = unsafe { OwnedFd::from_raw_fd(m.fuse_fd) };

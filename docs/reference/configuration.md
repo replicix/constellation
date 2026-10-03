@@ -907,7 +907,21 @@ object with its reason.
 | `CONSTELLATION_BLOCKING_THREADS` | `clamp(4×CPUs, 4..256)` | threads | Tokio blocking-pool ceiling |
 | `CONSTELLATION_COMPLETION_THREADS` | `64` | threads, `1..1024` | the engine's completion pool (one per process): threads that finish a deferred op — today a *cold* read, whose chunk is in no local cache — so the FUSE worker that took the request is free at once. Started on demand, exit after 30 s idle; past the bound, deferred reads queue (plan 31 C7b) |
 | `CONSTELLATION_DEFER_COLD_READS` | on | `0`/`false`/`off` disable | whether a cold read defers to the completion pool (on) or waits on the FUSE worker as before plan 31 C7b (off; a diagnostic switch — with 4 workers and 16 concurrent cold reads behind 200 ms of S3 latency, a cached `open`+`read` then waits up to ~1.3 s for a worker) |
-| `CONSTELLATION_HANDOVER_READ_DRAIN_MS` | `30000` | milliseconds | how long a FUSE session handover (`daemon --upgrade`) waits for deferred reads still being answered before it gives up and keeps serving in place |
+| `CONSTELLATION_HANDOVER_READ_DRAIN_MS` | `30000` | milliseconds | how long a FUSE session handover (`daemon --upgrade`) waits for deferred reads still being answered before it gives up and keeps serving in place (a socket handoff's `drain_timeout_ms`, plan 37 §8, overrides it per request) |
+| `CONSTELLATION_HANDOFF_STANDBY_TIMEOUT_S` | `300` | seconds | how long `serve --handoff-socket`, finding its state dir held, waits as a handoff standby for a sealed handoff before it exits 0 (plan 37 §8; a CSI engine pod's startup and liveness probes also ask the handoff socket, so kubelet lets it wait). Once sealed, it waits for the sender's commit until the seal's `deadline_ms`, and after the commit for the state dir without a bound |
+| `CONSTELLATION_PREOPENED_INIT_WAIT_MS` | `10000` | milliseconds | how long a `view.mount{PreopenedFd}` waits for the connection's `FUSE_INIT` before refusing the descriptor as not a fresh mount (a handed-over connection is resumed, never re-initialised) |
+
+The CSI node plugin (`constellation-csi --node`; the chart sets these from
+`engineProfile.handoff` and `node.metricsPort`):
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_CSI_HANDOFF_DRAIN_TIMEOUT_MS` | `5000` | milliseconds | plan 37 §8 step 2: how long an engine pod being replaced may wait for the reads and `fsync`s it answers off its FUSE workers (an op held on a worker is not bounded by it: the total is) |
+| `CONSTELLATION_CSI_HANDOFF_TOTAL_TIMEOUT_MS` | `30000` | milliseconds | every step of an engine-pod handoff up to its commit; the old pod serves again by itself (and refuses a commit) 5 s after it |
+| `CONSTELLATION_CSI_HANDOFF_RESUME_TIMEOUT_MS` | `300000` | milliseconds | after the commit, how long the replacement may take to serve before the handoff is left unresolved (the replacement is kept, pending, and adopted once it serves — never deleted on this timeout) |
+| `CONSTELLATION_CSI_HANDOFF_MAX_ATTEMPTS` | `3` | attempts | handoffs tried per engine pod and desired spec before the rollout leaves the old pod serving |
+| `CONSTELLATION_CSI_ROLLOUT_INTERVAL_S` | `30` | seconds, `0` off | how often the node plugin looks for engine pods whose spec drifted |
+| `CONSTELLATION_CSI_METRICS_ADDR` | unset (off) | `host:port` | the node plugin's `constellation_csi_handoff_*` counters as Prometheus text at `GET /metrics` (the chart sets it from `node.metricsPort`, off by default) |
 
 ### Filesystem stats and quota
 

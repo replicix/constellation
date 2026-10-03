@@ -928,3 +928,339 @@ async fn a_hung_view_count_patch_holds_up_neither_other_units_nor_its_own() {
     );
     assert_eq!(inner.view_count("hung"), None);
 }
+
+// ---- plan 37 §8: rollouts by session handoff ----
+
+use super::handoff::{Outcome, Step};
+use super::rollout::Rolled;
+use constellation_control::proto::types::HandoffPhase;
+
+#[tokio::test]
+async fn a_drifted_engine_pod_hands_its_views_to_a_replacement() {
+    let rig = Rig::new();
+    let old = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    let target = rig.target(1);
+    rig.publish(&target, Mode::MultiNodeMultiWriter)
+        .await
+        .unwrap();
+    let mount = dev(&rig.mounter, &staging);
+
+    // Nothing drifted: nothing to do.
+    assert!(rig.node.rollout_once().await.is_empty());
+
+    rig.engines.set_desired("spec-2");
+    let rolled = rig.node.rollout_once().await;
+    assert!(
+        matches!(&rolled[..], [(unit, Rolled::HandedOff(Outcome::Succeeded { views: 1, .. }))] if *unit == rig.unit()),
+        "{rolled:?}"
+    );
+    // The old engine is gone; the new one serves the very same mount (the
+    // kernel connection was handed over, nothing was remounted).
+    assert!(old.handed_off());
+    assert_eq!(rig.engines.spec_of(&rig.unit()).as_deref(), Some("spec-2"));
+    let new = rig.engines.control(&rig.unit()).unwrap();
+    assert!(!Arc::ptr_eq(&new, &old));
+    assert_eq!(new.view_mountpoints(), [staging.display().to_string()]);
+    assert_eq!(dev(&rig.mounter, &staging), mount, "the same mount");
+    assert!(matches!(
+        rig.mounter.state(&target),
+        MountState::Alive { .. }
+    ));
+    let record = rig.node.state.get(&volume_id()).unwrap();
+    assert_eq!(record.unit, rig.unit());
+    assert_eq!(rig.engines.view_count(&rig.unit()), Some(1));
+    assert!(rig.health().await.is_empty());
+    // Converged: the next pass has nothing to do, and the volume unstages
+    // from the new engine.
+    assert!(rig.node.rollout_once().await.is_empty());
+    rig.unpublish(&target).await.unwrap();
+    rig.unstage().await.unwrap();
+    assert!(new.view_mountpoints().is_empty());
+    let metrics = rig.node.handoff_metrics().render();
+    assert!(metrics.contains("constellation_csi_handoff_total{outcome=\"succeeded\"} 1"));
+}
+
+#[tokio::test]
+async fn an_idle_drifted_engine_pod_is_retired_not_handed_over() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    rig.engines.set_desired("spec-2");
+    let rolled = rig.node.rollout_once().await;
+    assert!(matches!(&rolled[..], [(_, Rolled::Retired)]), "{rolled:?}");
+    assert!(control.handoff_calls().is_empty());
+    assert!(rig.engines.drifted().await.unwrap().is_empty());
+}
+
+/// §8 "Failure handling": a handoff that fails rolls back (the old pod
+/// serves on), is retried at the next pass, and after `max_attempts` the
+/// rollout gives up on the unit and says so.
+#[tokio::test]
+async fn failed_handoffs_roll_back_then_fall_back_after_max_attempts() {
+    let rig = Rig::new();
+    let old = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    rig.engines.set_desired("spec-2");
+
+    // First a replacement that never starts, then two prepares that fail.
+    rig.engines.fail_replacement_starts(1);
+    old.fail_handoff(HandoffPhase::Prepare);
+    old.fail_handoff(HandoffPhase::Prepare);
+    let first = rig.node.rollout_once().await;
+    assert!(
+        matches!(&first[..], [(_, Rolled::NoReplacement(_))]),
+        "{first:?}"
+    );
+    for _ in 0..2 {
+        let rolled = rig.node.rollout_once().await;
+        assert!(
+            matches!(
+                &rolled[..],
+                [(
+                    _,
+                    Rolled::HandedOff(Outcome::RolledBack {
+                        step: Step::Prepare,
+                        restored: true,
+                        ..
+                    })
+                )]
+            ),
+            "{rolled:?}"
+        );
+        // The old pod still serves, and the replacement went.
+        assert_eq!(old.view_mountpoints(), [staging.display().to_string()]);
+        assert!(rig.engines.standby(&rig.unit()).is_none());
+    }
+    assert_eq!(rig.engines.fallbacks().len(), 1, "reported once");
+    assert!(rig.engines.fallbacks()[0].1.contains("giving up"));
+    // Given up for this desired spec: no more attempts.
+    let rolled = rig.node.rollout_once().await;
+    assert!(matches!(&rolled[..], [(_, Rolled::GaveUp)]), "{rolled:?}");
+    assert_eq!(
+        old.handoff_calls()
+            .iter()
+            .filter(|p| **p == HandoffPhase::Prepare)
+            .count(),
+        2
+    );
+    let metrics = rig.node.handoff_metrics().render();
+    assert!(metrics.contains("constellation_csi_handoff_fallback_total 1"));
+    // A further spec change starts the count again — and succeeds.
+    rig.engines.set_desired("spec-3");
+    let rolled = rig.node.rollout_once().await;
+    assert!(
+        matches!(
+            &rolled[..],
+            [(_, Rolled::HandedOff(Outcome::Succeeded { .. }))]
+        ),
+        "{rolled:?}"
+    );
+}
+
+/// A handoff lost after its commit cannot be undone: both pods go, and
+/// the next publish restages the volume onto a fresh one (§8's
+/// `requiresRepublish` fallback).
+#[tokio::test]
+async fn a_handoff_lost_after_its_commit_is_restaged_by_the_republish() {
+    let rig = Rig::new();
+    rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    let target = rig.target(1);
+    rig.publish(&target, Mode::MultiNodeMultiWriter)
+        .await
+        .unwrap();
+    rig.engines.set_desired("spec-2");
+    let unit = rig.unit();
+    // The replacement the rollout starts will not resume.
+    rig.engines
+        .fail_resume_of_next_standby("its engine did not start");
+    let rolled = rig.node.rollout_once().await;
+    assert!(
+        matches!(
+            &rolled[..],
+            [(
+                _,
+                Rolled::HandedOff(Outcome::Lost {
+                    step: Step::Resume,
+                    ..
+                })
+            )]
+        ),
+        "{rolled:?}"
+    );
+    // The mount died with the old engine; kubelet's republish restages it.
+    rig.mounter.kill(&staging);
+    rig.publish(&target, Mode::MultiNodeMultiWriter)
+        .await
+        .unwrap();
+    let control = rig.engines.control(&unit).unwrap();
+    assert_eq!(control.view_mountpoints(), [staging.display().to_string()]);
+    assert_eq!(rig.engines.spec_of(&unit).as_deref(), Some("spec-2"));
+}
+
+/// An engine pod that lost its views (it restarted: their mounts are dead)
+/// has nothing to hand over: the rollout deletes it rather than failing
+/// prepares until it gives up, and the republish restages onto the next.
+#[tokio::test]
+async fn a_drifted_pod_that_lost_its_views_is_retired() {
+    let rig = Rig::new();
+    let old = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    old.drop_views();
+    rig.engines.set_desired("spec-2");
+    let rolled = rig.node.rollout_once().await;
+    assert!(matches!(&rolled[..], [(_, Rolled::Retired)]), "{rolled:?}");
+    assert!(old.handoff_calls().is_empty());
+    assert!(rig.engines.fallbacks().is_empty());
+}
+
+/// Should-fix 3 of 37-k5a's review: the replacement served, but adopting it
+/// failed (its readiness, the API server): it is never retired for that —
+/// it holds the sessions — but adopted at a later pass.
+#[tokio::test]
+async fn an_adoption_error_after_the_cutover_never_retires_the_serving_replacement() {
+    let rig = Rig::new();
+    let old = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    rig.engines.set_desired("spec-2");
+    rig.engines.fail_adoptions(4);
+    let rolled = rig.node.rollout_once().await;
+    assert!(
+        matches!(
+            &rolled[..],
+            [(_, Rolled::HandedOff(Outcome::Succeeded { .. }))]
+        ),
+        "{rolled:?}"
+    );
+    assert!(old.handed_off());
+    // Not adopted yet, and nothing deleted: the replacement serves the view.
+    let standby = rig.engines.standby(&rig.unit()).expect("still there");
+    assert_eq!(standby.view_mountpoints(), [staging.display().to_string()]);
+    // The next pass adopts it (one more failure, then a retry).
+    let rolled = rig.node.rollout_once().await;
+    assert!(matches!(&rolled[..], [(_, Rolled::Adopted)]), "{rolled:?}");
+    let new = rig.engines.control(&rig.unit()).unwrap();
+    assert!(Arc::ptr_eq(&new, &standby));
+    assert_eq!(rig.engines.spec_of(&rig.unit()).as_deref(), Some("spec-2"));
+    assert!(rig.node.rollout_once().await.is_empty(), "converged");
+    rig.unstage().await.unwrap();
+    assert!(new.view_mountpoints().is_empty());
+}
+
+/// Must-fix 1 of 37-k5a's review, at the rollout: a replacement that
+/// neither serves nor fails within the resume budget is left pending —
+/// never deleted on a timeout — and adopted once it serves.
+#[tokio::test]
+async fn an_unresolved_handoff_stays_pending_until_its_replacement_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let mounter = Arc::new(FakeMounter::default());
+    let engines = Arc::new(InMemoryNodeEngines::new("node-a"));
+    let rig = Rig {
+        node: Rig::service(&dir, &mounter, &engines).with_handoff(handoff::HandoffConfig {
+            drain: Duration::from_millis(500),
+            total: Duration::from_secs(5),
+            resume: Duration::from_millis(300),
+            max_attempts: 3,
+        }),
+        dir,
+        mounter,
+        engines,
+    };
+    let old = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    rig.engines.set_desired("spec-2");
+    rig.engines
+        .resume_next_standby_after(Duration::from_millis(1500));
+    let rolled = rig.node.rollout_once().await;
+    assert!(
+        matches!(
+            &rolled[..],
+            [(_, Rolled::HandedOff(Outcome::Unresolved { .. }))]
+        ),
+        "{rolled:?}"
+    );
+    assert!(old.handed_off());
+    let standby = rig.engines.standby(&rig.unit()).expect("left alone");
+    assert!(!standby.handoff_calls().contains(&HandoffPhase::Abort));
+    // Still not serving: pending, and no new handoff is started for it.
+    let rolled = rig.node.rollout_once().await;
+    assert!(matches!(&rolled[..], [(_, Rolled::Pending)]), "{rolled:?}");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let rolled = rig.node.rollout_once().await;
+    assert!(matches!(&rolled[..], [(_, Rolled::Adopted)]), "{rolled:?}");
+    assert_eq!(standby.view_mountpoints(), [staging.display().to_string()]);
+    let metrics = rig.node.handoff_metrics().render();
+    assert!(metrics.contains("constellation_csi_handoff_total{outcome=\"unresolved\"} 1"));
+}
+
+/// Should-fix 4 of 37-k5a's review: publish, unpublish, stats and health
+/// meet a staging mount whose session may be changing hands — they wait
+/// for the unit's handoff (its gate) rather than stall on the mount.
+#[tokio::test]
+async fn publish_unpublish_and_stats_wait_for_a_running_handoff() {
+    let rig = Rig::new();
+    rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    let first = rig.target(1);
+    rig.publish(&first, Mode::MultiNodeMultiWriter)
+        .await
+        .unwrap();
+    // One at a time: a second RPC on the volume would meet the first's
+    // per-volume lock (`ABORTED`), not the gate.
+    let pause = Duration::from_millis(300);
+    let gate = || rig.node.unit_gate(&rig.unit()).write_owned();
+    let second = rig.target(2);
+
+    let held = gate().await;
+    let publish = rig.publish(&second, Mode::MultiNodeMultiWriter);
+    tokio::pin!(publish);
+    assert!(
+        tokio::time::timeout(pause, &mut publish).await.is_err(),
+        "publish waits"
+    );
+    drop(held);
+    publish.await.unwrap();
+
+    let held = gate().await;
+    let unpublish = rig.unpublish(&first);
+    tokio::pin!(unpublish);
+    assert!(
+        tokio::time::timeout(pause, &mut unpublish).await.is_err(),
+        "unpublish waits"
+    );
+    drop(held);
+    unpublish.await.unwrap();
+
+    let held = gate().await;
+    let stats = rig
+        .node
+        .node_get_volume_stats(Request::new(NodeGetVolumeStatsRequest {
+            volume_id: volume_id(),
+            volume_path: rig.staging().display().to_string(),
+            ..Default::default()
+        }));
+    tokio::pin!(stats);
+    assert!(
+        tokio::time::timeout(pause, &mut stats).await.is_err(),
+        "stats wait"
+    );
+    drop(held);
+    stats.await.unwrap();
+
+    let held = gate().await;
+    let health = rig.health();
+    tokio::pin!(health);
+    assert!(
+        tokio::time::timeout(pause, &mut health).await.is_err(),
+        "health waits"
+    );
+    drop(held);
+    assert!(health.await.is_empty());
+}

@@ -9,16 +9,17 @@ use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::proto::types::{
     Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsInfo, FsListing, FsUnlockParams,
-    HandoffParams, HandoffReport, LeaveParams, MkdirParams, MountSource, Pong, QuotaStatus,
-    RenameParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld,
-    SnapshotHoldParams, SnapshotListParams, SnapshotListing, SnapshotStatus, ViewInfo,
-    ViewListParams, ViewListing, ViewMountParams, ViewStatsParams, ViewStatsReport,
-    ViewUnmountParams, XattrOp, XattrParams, XattrResult,
+    HandedOffView, HandoffParams, HandoffPhase, HandoffReport, HandoffState, HandoffTarget,
+    LeaveParams, MkdirParams, MountSource, Pong, QuotaStatus, RenameParams, SnapshotCreateParams,
+    SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams, SnapshotListParams,
+    SnapshotListing, SnapshotStatus, ViewInfo, ViewListParams, ViewListing, ViewMountParams,
+    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrOp, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// One directory entry: its extended attributes and its own subtree quota
 /// (plan 37 §5's `quota.set{subtree}`; the root's is the filesystem-wide
@@ -35,7 +36,7 @@ struct DirEntry {
     used_bytes: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct Mounted {
     /// What the view is known by, as the daemon names it: the `Path`
     /// mountpoint, a `PreopenedFd` view's sender-given mountpoint, or a
@@ -114,6 +115,43 @@ pub struct InMemoryControl {
     clone_failures: AtomicU32,
     /// Every `snapshot.list` call.
     snapshot_lists: AtomicU64,
+    /// Plan 37 §8's socket handoff, as a sender and as a standby.
+    handoff: Mutex<FakeHandoff>,
+}
+
+/// [`InMemoryControl`]'s side of a socket handoff (plan 37 §8): the
+/// daemon's sender phases and its standby's, with injected failures. A
+/// standby resumes once it is sealed and its sender has committed — the
+/// fake's stand-in for "the state dir's lock is free".
+#[derive(Default)]
+struct FakeHandoff {
+    prepared: Vec<(u64, Mounted)>,
+    transferred: bool,
+    /// Committed: the process is gone; every later call fails.
+    exited: bool,
+    /// A standby: the engine it takes over from.
+    from: Option<Arc<InMemoryControl>>,
+    received: Vec<Mounted>,
+    sealed: bool,
+    aborted: bool,
+    resumed: bool,
+    /// Phases that fail (each once), and a resume that fails.
+    fail: Vec<HandoffPhase>,
+    fail_resume: Option<String>,
+    /// The transport `Prepare` reports (default `dev_fuse`).
+    transport: Option<String>,
+    /// As a standby: how long after its sender's commit it resumes (a
+    /// slow engine start), or never.
+    resume_after: Option<Duration>,
+    resume_never: bool,
+    committed_at: Option<std::time::Instant>,
+    /// The parameters of every phase asked, the last of each.
+    params: Vec<(HandoffPhase, HandoffParams)>,
+    /// Its own deadline serves the sessions again just before the commit
+    /// arrives: the commit fails, `Status` answers `Serving`.
+    deadline_before_commit: bool,
+    /// Every socket phase asked, in order.
+    calls: Vec<HandoffPhase>,
 }
 
 impl Default for InMemoryControl {
@@ -146,6 +184,292 @@ impl InMemoryControl {
             clones: AtomicU64::new(0),
             clone_failures: AtomicU32::new(0),
             snapshot_lists: AtomicU64::new(0),
+            handoff: Mutex::default(),
+        }
+    }
+
+    /// A standby replacing `old` (plan 37 §8): the same filesystem (its
+    /// tree, copied — nothing changes it while the views are stopped), no
+    /// view until a handoff is resumed.
+    pub fn standby_for(old: &Arc<InMemoryControl>) -> InMemoryControl {
+        let c = InMemoryControl::with_registry(old.registry.clone());
+        c.state.lock().unwrap().tree = old.state.lock().unwrap().tree.clone();
+        *c.own_uuid.lock().unwrap() = old.own_uuid.lock().unwrap().clone();
+        c.any_path
+            .store(old.any_path.load(Ordering::SeqCst), Ordering::SeqCst);
+        c.handoff.lock().unwrap().from = Some(old.clone());
+        c
+    }
+
+    /// Fail the next `node.handoff` of `phase` (once).
+    pub fn fail_handoff(&self, phase: HandoffPhase) {
+        self.handoff.lock().unwrap().fail.push(phase);
+    }
+
+    /// As a standby: fail the resume (after the sender committed).
+    pub fn fail_resume(&self, reason: &str) {
+        self.handoff.lock().unwrap().fail_resume = Some(reason.to_string());
+    }
+
+    /// As a standby: resume only `after` its sender committed.
+    pub fn resume_after(&self, after: Duration) {
+        self.handoff.lock().unwrap().resume_after = Some(after);
+    }
+
+    /// As a standby: never resume (nor fail) once sealed.
+    pub fn resume_never(&self) {
+        self.handoff.lock().unwrap().resume_never = true;
+    }
+
+    /// The parameters the last `node.handoff` of `phase` was asked with.
+    pub fn handoff_params(&self, phase: HandoffPhase) -> Option<HandoffParams> {
+        self.handoff
+            .lock()
+            .unwrap()
+            .params
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == phase)
+            .map(|(_, params)| params.clone())
+    }
+
+    /// Abort by its own deadline just before the commit arrives.
+    pub fn deadline_before_commit(&self) {
+        self.handoff.lock().unwrap().deadline_before_commit = true;
+    }
+
+    /// Report `transport` for every prepared view.
+    pub fn report_transport(&self, transport: &str) {
+        self.handoff.lock().unwrap().transport = Some(transport.to_string());
+    }
+
+    /// The socket handoff phases asked of this engine, in order.
+    pub fn handoff_calls(&self) -> Vec<HandoffPhase> {
+        self.handoff.lock().unwrap().calls.clone()
+    }
+
+    /// Committed and gone.
+    pub fn handed_off(&self) -> bool {
+        self.handoff.lock().unwrap().exited
+    }
+
+    /// Prepared (its sessions stopped) and not yet committed or aborted.
+    pub fn handoff_prepared(&self) -> bool {
+        !self.handoff.lock().unwrap().prepared.is_empty()
+    }
+
+    fn handoff_report(&self, h: &FakeHandoff, state: HandoffState) -> HandoffReport {
+        let transport = h.transport.clone().unwrap_or_else(|| "dev_fuse".into());
+        let views = if h.from.is_some() {
+            h.received
+                .iter()
+                .map(|m| HandedOffView {
+                    mountpoint: m.mountpoint.clone(),
+                    transport: transport.clone(),
+                    ..Default::default()
+                })
+                .collect()
+        } else {
+            h.prepared
+                .iter()
+                .map(|(id, m)| HandedOffView {
+                    id: *id,
+                    mountpoint: m.mountpoint.clone(),
+                    handles: 0,
+                    transport: transport.clone(),
+                })
+                .collect()
+        };
+        HandoffReport {
+            detail: format!("fake {state:?}"),
+            views,
+            state: Some(state),
+            elapsed_ms: 0,
+        }
+    }
+
+    /// `node.handoff{Socket}` (the doc of [`FakeHandoff`]).
+    fn socket_handoff(
+        &self,
+        params: HandoffParams,
+        fd: Option<OwnedFd>,
+    ) -> Result<HandoffReport, ControlError> {
+        let mut h = self.handoff.lock().unwrap();
+        if h.exited {
+            return Err(ControlError::unavailable("the engine pod has exited"));
+        }
+        let phase = params
+            .phase
+            .ok_or_else(|| ControlError::invalid("a socket handoff names its phase"))?;
+        h.calls.push(phase);
+        h.params.push((phase, params.clone()));
+        if let Some(i) = h.fail.iter().position(|p| *p == phase) {
+            h.fail.remove(i);
+            return Err(ControlError::failed(format!("injected {phase:?} failure")));
+        }
+        if h.from.is_some() {
+            return self.standby_handoff(&mut h, phase, fd);
+        }
+        match phase {
+            HandoffPhase::Prepare => {
+                if !h.prepared.is_empty() {
+                    return Err(ControlError::failed("a handover is already under way"));
+                }
+                let views: Vec<(u64, Mounted)> = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .views
+                    .iter()
+                    .map(|(id, m)| (*id, m.clone()))
+                    .collect();
+                if views.is_empty() {
+                    return Err(ControlError::failed("no view is mounted"));
+                }
+                h.prepared = views;
+                Ok(self.handoff_report(&h, HandoffState::Prepared))
+            }
+            HandoffPhase::Transfer => {
+                if h.prepared.is_empty() {
+                    return Err(ControlError::invalid("nothing is prepared"));
+                }
+                let fd = fd.ok_or_else(|| ControlError::invalid("transfer needs a socket"))?;
+                let mut sock = std::os::unix::net::UnixStream::from(fd);
+                let io = |e: std::io::Error| ControlError::failed(e.to_string());
+                for (_, m) in &h.prepared {
+                    let record = serde_json::to_vec(m).expect("a view record");
+                    let conn = std::fs::File::open("/dev/null").map_err(io)?;
+                    constellation_control::handoff_wire::write_record(
+                        &mut sock,
+                        &record,
+                        std::os::fd::AsFd::as_fd(&conn),
+                    )
+                    .map_err(io)?;
+                }
+                constellation_control::handoff_wire::write_end(&mut sock).map_err(io)?;
+                h.transferred = true;
+                Ok(self.handoff_report(&h, HandoffState::Transferred))
+            }
+            HandoffPhase::Commit => {
+                if h.deadline_before_commit {
+                    h.prepared.clear();
+                    h.transferred = false;
+                    return Err(ControlError::invalid("nothing is prepared to commit"));
+                }
+                if !h.transferred {
+                    return Err(ControlError::invalid("nothing was transferred"));
+                }
+                let report = self.handoff_report(&h, HandoffState::Committed);
+                h.prepared.clear();
+                h.exited = true;
+                h.committed_at = Some(std::time::Instant::now());
+                self.state.lock().unwrap().views.clear();
+                self.unreachable.store(true, Ordering::SeqCst);
+                Ok(report)
+            }
+            HandoffPhase::Abort => {
+                h.prepared.clear();
+                h.transferred = false;
+                Ok(self.handoff_report(&h, HandoffState::Serving))
+            }
+            HandoffPhase::Status => {
+                let state = match (h.prepared.is_empty(), h.transferred) {
+                    (true, _) => HandoffState::Serving,
+                    (false, false) => HandoffState::Prepared,
+                    (false, true) => HandoffState::Transferred,
+                };
+                Ok(self.handoff_report(&h, state))
+            }
+            HandoffPhase::Receive | HandoffPhase::Seal => Err(ControlError::invalid(
+                "this engine is serving, not a standby",
+            )),
+        }
+    }
+
+    fn standby_handoff(
+        &self,
+        h: &mut FakeHandoff,
+        phase: HandoffPhase,
+        fd: Option<OwnedFd>,
+    ) -> Result<HandoffReport, ControlError> {
+        match phase {
+            HandoffPhase::Receive => {
+                if h.sealed || h.aborted {
+                    return Err(ControlError::invalid("this standby is sealed"));
+                }
+                let fd = fd.ok_or_else(|| ControlError::invalid("receive needs the stream"))?;
+                let mut sock = std::os::unix::net::UnixStream::from(fd);
+                let io = |e: std::io::Error| ControlError::failed(e.to_string());
+                let mut records = Vec::new();
+                while let Some((record, _conn)) =
+                    constellation_control::handoff_wire::read_record(&mut sock).map_err(io)?
+                {
+                    let record: Mounted = serde_json::from_slice(&record)
+                        .map_err(|e| ControlError::invalid(format!("an unreadable record: {e}")))?;
+                    records.push(record);
+                }
+                self.fds_received
+                    .fetch_add(records.len() as u64, Ordering::SeqCst);
+                h.received.extend(records);
+                let received = h.received.len() as u64;
+                Ok(self.handoff_report(h, HandoffState::Standby { received }))
+            }
+            HandoffPhase::Seal => {
+                if h.received.is_empty() {
+                    return Err(ControlError::invalid("nothing was received to seal"));
+                }
+                h.sealed = true;
+                Ok(self.handoff_report(h, HandoffState::Sealed))
+            }
+            HandoffPhase::Abort => {
+                if h.resumed {
+                    return Err(ControlError::invalid("too late to abort"));
+                }
+                h.aborted = true;
+                h.received.clear();
+                Ok(self.handoff_report(
+                    h,
+                    HandoffState::Failed {
+                        reason: "aborted by request".into(),
+                    },
+                ))
+            }
+            HandoffPhase::Status => {
+                let committed_at = h
+                    .from
+                    .as_ref()
+                    .and_then(|from| from.handoff.lock().unwrap().committed_at);
+                let committed = committed_at.is_some_and(|at| {
+                    !h.resume_never && at.elapsed() >= h.resume_after.unwrap_or_default()
+                });
+                let state = if h.aborted {
+                    HandoffState::Failed {
+                        reason: "aborted by request".into(),
+                    }
+                } else if h.resumed {
+                    HandoffState::Resumed { failed: Vec::new() }
+                } else if h.sealed && committed {
+                    if let Some(reason) = h.fail_resume.clone() {
+                        HandoffState::Failed { reason }
+                    } else {
+                        let mut state = self.state.lock().unwrap();
+                        for m in h.received.drain(..) {
+                            let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
+                            state.views.insert(id, m);
+                        }
+                        h.resumed = true;
+                        HandoffState::Resumed { failed: Vec::new() }
+                    }
+                } else if h.sealed {
+                    HandoffState::Sealed
+                } else {
+                    HandoffState::Standby {
+                        received: h.received.len() as u64,
+                    }
+                };
+                Ok(self.handoff_report(h, state))
+            }
+            _ => Err(ControlError::invalid("a standby only receives")),
         }
     }
 
@@ -912,18 +1236,34 @@ impl ControlClient for InMemoryControl {
     }
 
     async fn node_handoff(&self, params: HandoffParams) -> Result<HandoffReport, ControlError> {
+        if params.target == HandoffTarget::Socket {
+            return self.socket_handoff(params, None);
+        }
         Ok(HandoffReport {
             detail: "fake handoff".to_string(),
             views: params
                 .views
                 .into_iter()
-                .map(|id| constellation_control::proto::types::HandedOffView {
+                .map(|id| HandedOffView {
                     id,
-                    mountpoint: String::new(),
-                    handles: 0,
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         })
+    }
+
+    async fn node_handoff_fd(
+        &self,
+        params: HandoffParams,
+        fd: OwnedFd,
+    ) -> Result<HandoffReport, ControlError> {
+        if params.target != HandoffTarget::Socket {
+            return Err(ControlError::invalid(
+                "only a socket handoff carries a descriptor",
+            ));
+        }
+        self.socket_handoff(params, Some(fd))
     }
 
     async fn node_leave(&self, _params: LeaveParams) -> Result<Ack, ControlError> {

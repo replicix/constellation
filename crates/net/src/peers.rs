@@ -1322,7 +1322,9 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | LockMirror { from, .. } => *from,
         DelegRecall { root, .. } | DelegSeal { root, .. } => *root,
         // `BackupAppend::from` is a journal seq; `holder` is the sender.
-        ReadRecall { holder, .. } | BackupAppend { holder, .. } => *holder,
+        ReadRecall { holder, .. } | BackupAppend { holder, .. } | BackupHold { holder, .. } => {
+            *holder
+        }
         LockRecall { owner, .. } => *owner,
         EpochPropose { proposer, .. } | EpochAbort { proposer, .. } => *proposer,
         PeerRtts { node_id, .. } => *node_id,
@@ -1536,6 +1538,14 @@ async fn handle_stream<S: PeerService>(
             txs,
         } => {
             service.stream_ahead(from, epoch, base, txs);
+            Some(Payload::Ok { req_id: 0 })
+        }
+        Payload::BackupHold {
+            holder,
+            epoch,
+            for_ms,
+        } => {
+            service.backup_hold(holder, epoch, for_ms);
             Some(Payload::Ok { req_id: 0 })
         }
         Payload::DelegBackupAppend {
@@ -1864,6 +1874,8 @@ mod tests {
         release: bool,
         /// Plan 30 §M7: subscriptions seen, as `(requester, req_id, from)`.
         log_subs: Mutex<Vec<(u64, u64, u64)>>,
+        /// Plan 37 §8: backup holds seen, as `(holder, epoch, for_ms)`.
+        holds: Mutex<Vec<(u64, u64, u64)>>,
     }
 
     impl PeerService for Recorder {
@@ -1896,6 +1908,9 @@ mod tests {
         }
         fn cache_digest(&self, digest: crate::endpoint::DigestSnapshot) {
             self.digests.lock().unwrap().push(digest);
+        }
+        fn backup_hold(&self, holder: u64, epoch: u64, for_ms: u64) {
+            self.holds.lock().unwrap().push((holder, epoch, for_ms));
         }
         fn node_id(&self) -> u64 {
             7
@@ -1970,6 +1985,33 @@ mod tests {
         let svc = service.clone();
         tokio::spawn(async move { serving.serve(svc).await });
         (holder, asker, service)
+    }
+
+    /// Plan 37 §8: a holder's `BackupHold` reaches its backup's service
+    /// and is answered; one that names a node other than its sender is
+    /// dropped before any service sees it.
+    #[tokio::test]
+    async fn a_backup_hold_reaches_the_backups_service() {
+        let (_holder, asker, service) = pair(false).await;
+        let hold = |holder| Payload::BackupHold {
+            holder,
+            epoch: 3,
+            for_ms: 15_000,
+        };
+        let reply = asker
+            .request_to_node_timeout(1, &hold(2), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(matches!(reply, Payload::Ok { .. }), "{reply:?}");
+        assert_eq!(*service.holds.lock().unwrap(), vec![(2, 3, 15_000)]);
+        let _ = asker
+            .request_to_node_timeout(1, &hold(5), Duration::from_secs(2))
+            .await;
+        assert_eq!(
+            service.holds.lock().unwrap().len(),
+            1,
+            "a hold in another node's name was dispatched"
+        );
     }
 
     /// A peer's re-published record probes the connection pooled to it

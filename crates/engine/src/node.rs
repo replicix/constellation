@@ -114,6 +114,21 @@ pub struct EngineConfig {
     /// The space-accounting service's knobs (plan 32 §6.3); `None`:
     /// `CONSTELLATION_SNAPACCT*` ([`crate::snapacct::SnapAcctConfig::from_env`]).
     pub snapacct: Option<crate::snapacct::SnapAcctConfig>,
+    /// What [`Engine::preopen`] opened ahead of this start (used if it
+    /// opened this `backend`).
+    pub preopened: Option<Preopened>,
+}
+
+/// What an engine start can open before it holds its state dir
+/// ([`Engine::preopen`]): the backend's client, its conditional-write
+/// probe and the P2P endpoint — everything of the start that needs
+/// neither `meta.db` nor the node's identity in it.
+pub struct Preopened {
+    url: String,
+    backend: Arc<dyn object_store::ObjectStore>,
+    backend_info: crate::backend::BackendInfo,
+    caps: constellation_store_s3::Capabilities,
+    p2p: Option<crate::p2p::BoundP2p>,
 }
 
 impl EngineConfig {
@@ -140,6 +155,7 @@ impl EngineConfig {
             runtime: None,
             on_phase: None,
             snapacct: None,
+            preopened: None,
         }
     }
 }
@@ -337,7 +353,60 @@ pub struct Engine {
     lifecycle: Arc<crate::lifecycle::Lifecycle>,
 }
 
+/// How long a node stopping for a successor on its own state dir
+/// ([`Engine::stop_for_local_handoff`]) asks its backups to hold their
+/// seal watch: the successor's engine start (2-9 s measured on a loaded
+/// kind host, 37-k5a) with room to spare. It ends early, at the
+/// successor's first append; a successor that never starts costs a
+/// takeover this much later than the backup's usual budget.
+pub const LOCAL_HANDOFF_BACKUP_HOLD: Duration = Duration::from_secs(15);
+
 impl Engine {
+    /// Open what [`Self::start`] can open without the state dir (see
+    /// [`Preopened`]) — for plan 37 §8's standby, which may not touch the
+    /// state dir while the engine it replaces still serves, and whose
+    /// start is the pause the handed-over sessions' callers see. The
+    /// endpoint is bound under the node key, which the serving engine
+    /// uses too: harmless, as nobody can reach the new one before its
+    /// start publishes it ([`crate::p2p::BoundP2p`]). `credentials` must
+    /// be the start's; `p2p`: the start's profile runs P2P.
+    pub fn preopen(
+        backend_url: &str,
+        credentials: CredentialSource,
+        host: &HostServices,
+        p2p: bool,
+        rt: &tokio::runtime::Handle,
+    ) -> Result<Preopened> {
+        let credentials = Arc::new(credentials);
+        rt.block_on(async {
+            let (backend, backend_info) =
+                crate::backend::open_backend_described_with(backend_url, Some(&credentials))
+                    .await
+                    .context("opening backend")?;
+            let fsmeta = crate::backend::load_fs_explained(&backend, &backend_info, None)
+                .await
+                .context("loading filesystem")?;
+            let caps = ChunkStore::new(backend.clone())
+                .probe_conditional_writes()
+                .await
+                .context("probing backend conditional writes")?;
+            // An E2E filesystem's topic comes from its keyring, which
+            // needs the passphrase: the start binds that one itself.
+            let p2p = if p2p && !fsmeta.e2e {
+                crate::p2p::bind_p2p(host, &fsmeta, None).await
+            } else {
+                None
+            };
+            Ok(Preopened {
+                url: backend_url.to_string(),
+                backend,
+                backend_info,
+                caps,
+                p2p,
+            })
+        })
+    }
+
     /// Open and start one node (see the module doc): no view is open yet.
     pub fn start(
         cfg: EngineConfig,
@@ -375,6 +444,7 @@ impl Engine {
             runtime,
             on_phase,
             snapacct: snapacct_config,
+            preopened,
         } = cfg;
         let snapacct_config =
             snapacct_config.unwrap_or_else(crate::snapacct::SnapAcctConfig::from_env);
@@ -395,13 +465,23 @@ impl Engine {
             );
         }
 
-        phase(&on_phase, "opening the backend and meta.json");
-        let (backend, backend_info) = rt
-            .block_on(crate::backend::open_backend_described_with(
-                &backend_url,
-                Some(&credentials),
-            ))
-            .context("opening backend")?;
+        let preopened = preopened.filter(|p| p.url == backend_url);
+        match &preopened {
+            Some(_) => phase(&on_phase, "loading meta.json (the backend was pre-opened)"),
+            None => phase(&on_phase, "opening the backend and meta.json"),
+        }
+        let (backend, backend_info, preopened_caps, preopened_p2p) = match preopened {
+            Some(p) => (p.backend, p.backend_info, Some(p.caps), p.p2p),
+            None => {
+                let (backend, info) = rt
+                    .block_on(crate::backend::open_backend_described_with(
+                        &backend_url,
+                        Some(&credentials),
+                    ))
+                    .context("opening backend")?;
+                (backend, info, None, None)
+            }
+        };
         let fsmeta = rt
             .block_on(crate::backend::load_fs_explained(
                 &backend,
@@ -648,10 +728,14 @@ impl Engine {
         // If-Match; a backend without it can only be driven safely by one
         // node at a time, so say so loudly and fall back to create-only
         // lease semantics instead of refusing to mount at all.
-        phase(&on_phase, "probing the backend's conditional writes");
-        let caps = rt
-            .block_on(store.probe_conditional_writes())
-            .context("probing backend conditional writes")?;
+        let caps = match preopened_caps {
+            Some(caps) => caps,
+            None => {
+                phase(&on_phase, "probing the backend's conditional writes");
+                rt.block_on(store.probe_conditional_writes())
+                    .context("probing backend conditional writes")?
+            }
+        };
         if !caps.create_if_absent {
             bail!(
                 "backend lacks create-if-absent (If-None-Match); unusable as a constellation backend"
@@ -740,6 +824,7 @@ impl Engine {
                 store.inner().clone(),
                 node_id,
                 &version,
+                preopened_p2p,
             ))
         } else {
             tracing::info!("P2P off by the engine profile; using the S3 path only");
@@ -1949,6 +2034,75 @@ impl Engine {
         result
     }
 
+    /// Stop for a handoff to a **successor on this very state dir**, with
+    /// no drain at all (plan 37 §8's engine-pod replacement): new views are
+    /// refused, the background loops stop, and the replica is synced. The
+    /// journal, the `pending_upload` rows, the held set and the cached
+    /// chunks stay where they are, the lease and the open-orphan claims
+    /// stay this node's — and the successor, the same node identity on the
+    /// same `meta.db`, picks every one of them up as it would after a
+    /// restart: the sync task drains the pending uploads and ships the
+    /// journal, and the lease, still naming this node and unreleased, is
+    /// re-adopted at its epoch through the takeover gate (M4,
+    /// `Plan::Claim` over our own lease) instead of being released and
+    /// re-acquired.
+    ///
+    /// So the caller must exit (or otherwise give the state dir up) at
+    /// once, never serve again, and never let anything but this state dir's
+    /// next opener use the identity. What it leaves is exactly what a
+    /// process crash at this instant leaves — commits reach the OS on
+    /// commit (`Meta::sync`'s doc), and a crash at any point is already
+    /// lossless and re-adopted — plus the sync, which closes the power-loss
+    /// window; anything the core still does before the exit (a ship in
+    /// flight, a renewal) is what it could have been doing at a crash.
+    /// What it saves is the drain: chunk uploads and the journal's ship,
+    /// unbounded under a busy writer on a slow bucket, no longer stand
+    /// between the old process and the new one serving.
+    ///
+    /// First, though, the lease's committed backups are asked to hold
+    /// their seal watch for [`LOCAL_HANDOFF_BACKUP_HOLD`] (bounded by one
+    /// backup round trip): the successor is silent until its engine has
+    /// started, longer than a backup's takeover budget, and a backup that
+    /// sealed the epoch meanwhile would leave the successor without one
+    /// (`PeerMsg::BackupHold`). Returns the backups that confirmed.
+    pub fn stop_for_local_handoff(&self) -> Result<Vec<u64>> {
+        let held = self.hold_backups_for_handoff();
+        self.shutdown_started.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::Relaxed);
+        let backlog = constellation_meta::MetaStore::journal_len(&*self.meta).unwrap_or(0);
+        let pending = self.meta.pending_upload_count().unwrap_or(0);
+        tracing::info!(
+            journal_backlog = backlog,
+            pending_uploads = pending,
+            backups_holding = ?held,
+            "stopping for a handoff on this state dir: the successor ships what is left"
+        );
+        self.meta
+            .sync()
+            .context("syncing the replica before the handoff")?;
+        Ok(held)
+    }
+
+    /// [`Self::stop_for_local_handoff`]'s backup hold: the backups that
+    /// confirmed (none when this node holds no lease, has no backup, or
+    /// the authority task is gone).
+    fn hold_backups_for_handoff(&self) -> Vec<u64> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let for_ms = LOCAL_HANDOFF_BACKUP_HOLD.as_millis() as u64;
+        if self
+            .sync_tx
+            .send(crate::sync::SyncRequest::HoldBackups { for_ms, reply })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        self.rt
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), answer).await })
+            .ok()
+            .and_then(|answer| answer.ok())
+            .unwrap_or_default()
+    }
+
     fn shutdown_inner(&self, withdraw_holds: bool) -> Result<()> {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return Ok(());
@@ -2697,6 +2851,259 @@ mod tests {
             "no views once shutting down"
         );
         assert_eq!(engine.shutdown_error(), None);
+    }
+
+    /// Plan 37 §8 (37-k5a): `stop_for_local_handoff` drains nothing, and a
+    /// successor on the same state dir picks everything up. A write-back
+    /// writer leaves chunks it cannot upload (the bucket's chunk prefix is
+    /// read-only here) and an open file whose handle travels; the old
+    /// engine stops with uploads pending and the journal unshipped, its
+    /// runtime is torn down (the process exit), and a second engine on the
+    /// same state dir resumes the view, keeps writing through the handed
+    /// handle, and — the bucket writable again — ships it all. A third
+    /// node, on a state dir of its own, then reads every byte from the
+    /// bucket: nothing was lost, nothing written twice, and the lease
+    /// stayed this node's at its epoch.
+    #[test]
+    fn a_local_handoff_stop_leaves_everything_to_the_successor() {
+        use constellation_vfs::{Durability, LockOwner, WriteData};
+        use std::os::unix::fs::PermissionsExt;
+        let root_user = HostServices::native().process.effective_ids().0 == 0;
+        let root = tempfile::tempdir().unwrap();
+        let backend_dir = root.path().join("backend");
+        let backend = format!("file://{}", backend_dir.display());
+        let state = root.path().join("state");
+        let caller = Caller::root();
+        let cx = |kind| OpCtx::new(kind, &caller);
+        let start = |rt: &tokio::runtime::Runtime, state: PathBuf| {
+            let mut cfg = config(rt, &backend, state);
+            cfg.initial_write_mode = writeback::WriteMode::Back;
+            Engine::start(cfg, HostServices::native(), offline()).expect("Engine::start")
+        };
+        let runtime = || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let block = |n: u64| vec![(n % 251) as u8; 256 * 1024];
+        let write = |view: &View, ino, fh, n: u64| {
+            Blocking::run(|r| {
+                view.write(
+                    &cx(OpKind::Write),
+                    ino,
+                    fh,
+                    n * 256 * 1024,
+                    WriteData::Borrowed(&block(n)),
+                    OpenFlags::WRITE,
+                    r,
+                )
+            })
+            .unwrap()
+        };
+
+        let rt1 = runtime();
+        create_fs(&rt1, &backend);
+        let old = start(&rt1, state.clone());
+        let caps = FrontendCaps::linux_fuse(false);
+        let view = old
+            .open_view(ViewSpec::new("/"), caps.clone(), DeferredEvents::new())
+            .unwrap();
+        let node_id = old.node_id();
+        // The bucket refuses new chunks from here on (packs too).
+        let refuse = |mode: u32| {
+            for dir in ["chunks", "packs"] {
+                let dir = backend_dir.join(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        };
+        // A file kept open, its handle handed over: written and `fsync`ed
+        // while the bucket still takes chunks (the detach's barrier
+        // publishes a write session write-through, so one left open over
+        // a refusing bucket would fail the detach — the prepare's
+        // rollback, not this test).
+        let (open, handle) = Blocking::run(|r| {
+            view.create(
+                &cx(OpKind::Create),
+                ROOT_INO,
+                Name::new("open"),
+                0o644,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap();
+        for n in 0..6 {
+            write(&view, open.attr.ino, handle.fh, n);
+        }
+        Blocking::run(|r| {
+            view.fsync(
+                &cx(OpKind::Fsync),
+                open.attr.ino,
+                handle.fh,
+                Durability::Configured,
+                r,
+            )
+        })
+        .unwrap();
+        refuse(0o555);
+        // Then a closed file whose chunks only this node has (`back`).
+        let (closed, opened) = Blocking::run(|r| {
+            view.create(
+                &cx(OpKind::Create),
+                ROOT_INO,
+                Name::new("closed"),
+                0o644,
+                OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap();
+        for n in 0..8 {
+            write(&view, closed.attr.ino, opened.fh, n);
+        }
+        Blocking::run(|r| {
+            view.flush(
+                &cx(OpKind::Flush),
+                closed.attr.ino,
+                opened.fh,
+                LockOwner(0),
+                r,
+            )
+        })
+        .unwrap();
+        Blocking::run(|r| {
+            view.release(
+                &cx(OpKind::Release),
+                closed.attr.ino,
+                opened.fh,
+                OpenFlags::WRITE,
+                None,
+                r,
+            )
+        })
+        .unwrap();
+        // The detach's barrier and export (`SessionControl::detach`).
+        Blocking::run(|r| view.sync_view(&cx(OpKind::SyncView), r)).unwrap();
+        let handoff = old.export_view(&view).unwrap();
+        old.close_view_for_handover(&view);
+        let held = old.lease().status();
+        assert!(held.held && held.holder == node_id, "{held:?}");
+        let epoch = held.epoch;
+        old.stop_for_local_handoff().expect("the local stop");
+        let pending = old.meta().pending_upload_count().unwrap();
+        let backlog = constellation_meta::MetaStore::journal_len(&**old.meta()).unwrap();
+        if root_user {
+            eprintln!("root ignores the read-only prefix: pending {pending}, backlog {backlog}");
+        } else {
+            eprintln!("left for the successor: {pending} upload(s), {backlog} record(s)");
+            assert!(pending > 0, "the stop uploaded nothing");
+            assert!(backlog > 0, "the stop shipped nothing");
+        }
+        // The exit: nothing of the old process runs past this point.
+        drop(view);
+        drop(old);
+        rt1.shutdown_timeout(Duration::from_secs(5));
+        refuse(0o755);
+
+        let rt2 = runtime();
+        let new = start(&rt2, state.clone());
+        // The same identity (the state dir's), re-adopting its lease.
+        assert_eq!(new.node_id(), node_id);
+        let view = new
+            .open_view_resumed(
+                handoff.spec,
+                handoff.handles,
+                caps.clone(),
+                DeferredEvents::new(),
+            )
+            .unwrap();
+        for n in 6..12 {
+            write(&view, open.attr.ino, handle.fh, n);
+        }
+        Blocking::run(|r| {
+            view.fsync(
+                &cx(OpKind::Fsync),
+                open.attr.ino,
+                handle.fh,
+                Durability::Configured,
+                r,
+            )
+        })
+        .expect("an fsync through the handed-over handle");
+        let lease = new.lease().status();
+        assert!(lease.held && !lease.lost, "{lease:?}");
+        assert_eq!(lease.epoch, epoch, "the lease re-adopted at its epoch");
+        Blocking::run(|r| {
+            view.release(
+                &cx(OpKind::Release),
+                open.attr.ino,
+                handle.fh,
+                OpenFlags::READ | OpenFlags::WRITE,
+                None,
+                r,
+            )
+        })
+        .unwrap();
+        assert!(new.close_view(&view));
+        new.shutdown().expect("the successor drains everything");
+        assert_eq!(new.meta().pending_upload_count().unwrap(), 0);
+        assert_eq!(
+            constellation_meta::MetaStore::journal_len(&**new.meta()).unwrap(),
+            0
+        );
+        drop(view);
+        drop(new);
+        rt2.shutdown_timeout(Duration::from_secs(5));
+
+        // Another node, from the bucket alone.
+        let rt3 = runtime();
+        let other = start(&rt3, root.path().join("other"));
+        let view = other
+            .open_view(ViewSpec::new("/"), caps, DeferredEvents::new())
+            .unwrap();
+        let read = |name: &str, blocks: u64| {
+            let entry =
+                Blocking::run(|r| view.lookup(&cx(OpKind::Lookup), ROOT_INO, Name::new(name), r))
+                    .unwrap();
+            assert_eq!(entry.attr.size, blocks * 256 * 1024, "{name}");
+            let opened = Blocking::run(|r| {
+                view.open(
+                    &cx(OpKind::Open),
+                    entry.attr.ino,
+                    OpenFlags::READ,
+                    OpenOwner::NONE,
+                    r,
+                )
+            })
+            .unwrap();
+            for n in 0..blocks {
+                let data = Blocking::run(|r| {
+                    view.read(
+                        &cx(OpKind::Read),
+                        entry.attr.ino,
+                        opened.fh,
+                        n * 256 * 1024,
+                        256 * 1024,
+                        r,
+                    )
+                })
+                .unwrap();
+                assert_eq!(
+                    data.contiguous().as_ref(),
+                    &block(n)[..],
+                    "{name} block {n}"
+                );
+            }
+        };
+        read("closed", 8);
+        read("open", 12);
+        assert!(other.close_view(&view));
+        other.shutdown().unwrap();
     }
 
     /// An `EngineHost` starts its engines on its runtime within their

@@ -120,6 +120,9 @@ const RECONFIG_ATTEMPTS: u32 = 3;
 /// How often the holder's backup bookkeeping (selection, timeouts,
 /// promotion) runs between ticks.
 const HOUSEKEEPING_MS: i64 = 50;
+/// The longest a holder's [`PeerMsg::BackupHold`] holds this node's seal
+/// watch, whatever it asks.
+pub const BACKUP_HOLD_MAX_MS: u64 = 30_000;
 
 /// One backup (committed, or a candidate being brought up) as the holder
 /// tracks it.
@@ -1697,6 +1700,45 @@ impl Core {
             replica.backup_trim(epoch, through, &[]);
         }
         self.arm_backup_watch(now, out);
+    }
+
+    /// Plan 37 §8: the holder this node backs is about to be replaced by
+    /// a successor on its own state dir — the same node, which re-adopts
+    /// the same lease at the same epoch once it has started, and is
+    /// silent until then. Sealing the epoch meanwhile costs the successor
+    /// its backup for nothing (a seal, a reconfiguration, durability acks
+    /// without a backup until one is brought up again), so the seal watch
+    /// counts the silence from `for_ms` from now (at most
+    /// [`BACKUP_HOLD_MAX_MS`]); the successor's first append ends the hold
+    /// (`on_backup_append` sets `last_heard` to its arrival). Liveness
+    /// only, like every timeout here: a hold delays a seal and never
+    /// acknowledges anything, so a holder that never comes back is still
+    /// sealed and taken over, `for_ms` later.
+    pub(crate) fn on_backup_hold(&mut self, now: Ms, from: NodeId, epoch: Epoch, for_ms: u64) {
+        let ours = self
+            .bk
+            .role
+            .is_some_and(|role| role.holder == from && role.epoch == epoch);
+        if !ours || self.bk.sealed >= epoch {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                from,
+                epoch,
+                role = ?self.bk.role,
+                "a backup hold from a holder this node does not back at that epoch: ignored"
+            );
+            return;
+        }
+        let until = now.plus(for_ms.min(BACKUP_HOLD_MAX_MS));
+        self.bk.last_heard = self.bk.last_heard.max(until);
+        self.stats.backup_holds += 1;
+        tracing::info!(
+            node = self.cfg.node_id,
+            holder = from,
+            epoch,
+            hold_ms = for_ms.min(BACKUP_HOLD_MAX_MS),
+            "the holder is being replaced on its own state dir: holding the seal watch"
+        );
     }
 
     /// Plan 30 §M10's claim rule (enforced since M9): whether a

@@ -45,12 +45,30 @@ hostRoot: /var/lib/constellation-csi
 # Engine pods (plan 37 §7). The controller starts one controller-owned
 # engine pod per pool filesystem (K2); the node plugin starts one per pool
 # filesystem per node with a staged volume of it (K3). `resources`,
-# `readyTimeout` and `logLevel` apply to both; idleTtl (37-k6b) and the
-# handoff timeouts (K5) are not read yet.
+# `readyTimeout` and `logLevel` apply to both; idleTtl (37-k6b) is not read
+# yet.
 engineProfile:
   idleTtl: 10m
-  handoffDrainTimeout: 30s
-  handoffTotalTimeout: 120s
+  # Plan 37 §8 (K5): when `image` or an engine setting here changes, each
+  # node plugin replaces its engine pods one at a time by handing their
+  # FUSE sessions to the replacement — a stall for writers, never ENOTCONN.
+  handoff:
+    # How long the old engine may drain the requests it already accepted
+    # (K0: a 10 s pause only delays callers, so this is a liveness bound).
+    drainTimeoutMs: 5000
+    # Every step up to the commit; the old engine serves again by itself
+    # (and refuses a commit) a few seconds after it.
+    totalTimeoutMs: 30000
+    # After the commit, how long the replacement may take to serve before
+    # the rollout leaves it pending (it then holds the only copies of the
+    # sessions, so it is waited for, never deleted on a timeout).
+    resumeTimeoutMs: 300000
+    # Attempts per pod and spec before the rollout leaves the old pod
+    # serving (an event and the constellation.dev/handoff-fallback
+    # annotation say so; its volumes move at the next republish).
+    maxAttempts: 3
+    # Seconds between rollout passes (and at the plugin's start); 0: off.
+    rolloutInterval: 30
   # How long a controller RPC (or NodeStageVolume) waits for a pool's
   # engine pod to become ready (image pull, first start), in seconds. Keep
   # it below sidecars.timeout (and kubelet's 2 min staging timeout), so the
@@ -146,6 +164,10 @@ node:
   tolerations:
     - operator: Exists
   livenessPort: 9809
+  # The handoff counters (constellation_csi_handoff_*) as Prometheus text
+  # at GET /metrics on this port of the node plugin's pod (a `metrics`
+  # containerPort); 0: off. Opt-in: nothing scrapes it by default.
+  metricsPort: 0
   # Mounts in running pods depend on the node plugin: schedule it first.
   priorityClassName: system-node-critical
   maxUnavailable: 1

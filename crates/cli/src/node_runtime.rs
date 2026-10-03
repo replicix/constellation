@@ -947,6 +947,26 @@ impl NodeRuntime {
         Ok(())
     }
 
+    /// Close the headless view (`serve`'s), if any: a socket handoff's
+    /// commit closes every view before the engine drains.
+    pub(crate) fn close_headless_view(&self) {
+        if let Some(view) = self.headless_view.lock().unwrap().take() {
+            self.engine.close_view(&view);
+        }
+    }
+
+    /// Remove this daemon's control socket and its records (`control.path`,
+    /// `daemon.pid`): a socket handoff's sender, about to exit, so nothing
+    /// finds a socket nobody will answer once the receiver binds its own.
+    pub(crate) fn forget_control_socket(&self) {
+        let state_dir = self.engine.state_dir();
+        if let Some(path) = &self.control_socket {
+            let _ = std::fs::remove_file(path);
+        }
+        constellation_control::transport::forget_socket(state_dir);
+        let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
+    }
+
     /// Block until [`Self::shutdown`] has finished.
     pub fn wait_stopped(&self) {
         let (stopped, cv) = &self.stopped;
