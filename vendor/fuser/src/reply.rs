@@ -9,6 +9,7 @@
 use std::convert::AsRef;
 use std::ffi::OsStr;
 use std::io::IoSlice;
+use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 use std::time::Duration;
 #[cfg(target_os = "macos")]
@@ -165,9 +166,42 @@ impl ReplySender {
     pub(crate) fn transport(&self) -> crate::Transport {
         match self {
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
-            ReplySender::Ring(_) => crate::Transport::Uring,
+            ReplySender::Ring(commit) => commit.transport(),
             _ => crate::Transport::DevFuse,
         }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): whether the request's pages are registered for
+    /// `READ_FIXED` (plan 38 Z4); see [`ReplyData::zero_copy`].
+    pub(crate) fn zero_copied(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            ReplySender::Ring(commit) => commit.zero_copied(),
+            _ => false,
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a reply of `len` bytes of `src` from `offset`; see
+    /// [`ReplyData::read_fixed`]. Over `/dev/fuse` (and over a ring whose request payload is
+    /// still borrowed) it is `fill` with a `pread(2)` into the buffer.
+    pub(crate) fn read_fixed(
+        &self,
+        unique: ll::RequestId,
+        src: Box<dyn AsFd + Send>,
+        offset: u64,
+        len: usize,
+    ) -> std::io::Result<()> {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        let src = match self {
+            ReplySender::Ring(commit) => match commit.read_fixed(src, offset, len)? {
+                None => return Ok(()),
+                Some(src) => src,
+            },
+            _ => src,
+        };
+        self.fill_with(unique, len, false, |buf| {
+            pread_full(src.as_fd(), buf, offset).map_err(Errno::from)
+        })
     }
 
     /// Records that a reply object was created for the request, so a transport that answers
@@ -208,6 +242,29 @@ impl ReplySender {
 
 /// The largest payload `fuse_out_header.len` can describe.
 const MAX_PAYLOAD: usize = u32::MAX as usize - size_of::<ll::fuse_abi::fuse_out_header>();
+
+/// CONSTELLATION PATCH (io-uring): `pread(2)` until `buf` is full or the file ends; the count
+/// read. Short only at the end of the file, as a read reply must be.
+pub(crate) fn pread_full(
+    fd: BorrowedFd<'_>,
+    buf: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        let at = offset
+            .checked_add(done as u64)
+            .and_then(|at| libc::off_t::try_from(at).ok())
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        match nix::sys::uio::pread(fd, &mut buf[done..], at) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(done)
+}
 
 /// Answers `EIO` if a `fill` closure unwinds, so the request gets its one reply; disarmed with
 /// `mem::forget` once the reply is sent.
@@ -289,6 +346,18 @@ impl ReplyRaw {
         self.sender
             .as_ref()
             .map_or(crate::Transport::DevFuse, ReplySender::transport)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyData::zero_copy`].
+    pub(crate) fn zero_copied(&self) -> bool {
+        self.sender.as_ref().is_some_and(ReplySender::zero_copied)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see [`ReplyData::read_fixed`].
+    pub(crate) fn send_read_fixed(mut self, src: Box<dyn AsFd + Send>, offset: u64, len: usize) {
+        assert!(self.sender.is_some());
+        let sender = self.sender.take().unwrap();
+        log_send(sender.read_fixed(self.unique, src, offset, len));
     }
 
     /// Reply to a request with the given error code and data. Must be called
@@ -460,10 +529,57 @@ impl ReplyData {
 
     /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over --
     /// [`crate::Transport::Uring`] when the request came over an io_uring entry, whose payload
-    /// buffer [`Self::fill`] and [`Self::gather`] write in place, and
+    /// buffer [`Self::fill`] and [`Self::gather`] write in place,
+    /// [`crate::Transport::UringZeroCopy`] when the session's queues are all zero-copy queues
+    /// (plan 38 Z4; whether *this* request was zero-copied is [`Self::zero_copy`]), and
     /// [`crate::Transport::DevFuse`] otherwise.
     pub fn transport(&self) -> crate::Transport {
         self.reply.transport()
+    }
+
+    /// CONSTELLATION PATCH (io-uring): whether this request's pages are registered for a
+    /// `READ_FIXED`: a read of a file opened with [`ReplyOpen::opened_zero_copy`] that the
+    /// kernel queued on a zero-copy queue (plan 38 Z4). [`Self::read_fixed`] then moves the
+    /// data from the file to the reader with no copy by this process; any other reply to it
+    /// is bounced through a memfd into those pages, one copy more than over a ring without
+    /// zero-copy. `false` over `/dev/fuse` and on any other request.
+    pub fn zero_copy(&self) -> bool {
+        self.reply.zero_copied()
+    }
+
+    /// CONSTELLATION PATCH (io-uring): reply with `len` bytes of the file `src`, from `offset`
+    /// (plan 38 §3(d), Z4).
+    ///
+    /// On a zero-copied request ([`Self::zero_copy`]) the ring's thread issues one
+    /// `IORING_OP_READ_FIXED` from `src` into the pages the kernel registered for the request
+    /// -- the reader's page cache, or its own buffer under `O_DIRECT` -- and commits the reply
+    /// once the read completed: the bytes it read, fewer at the end of the file, or its error.
+    /// No byte passes through this process. Anywhere else the bytes are read with `pread(2)`
+    /// into the transport's reply buffer, as [`Self::fill`] would be with a closure doing the
+    /// same: the ring entry's payload buffer, or a heap buffer sent with `writev(2)` over
+    /// `/dev/fuse`. Either way the request gets exactly one reply, and `src` stays open (it is
+    /// owned here) until the read is done, on whatever thread finishes it.
+    ///
+    /// Callable from any thread, like [`Self::fill`]. Pass the request's `size` as `len`, at
+    /// most what `max_write` allows. A `len` the reply buffer cannot hold is answered `EINVAL`
+    /// where the bytes go through one; on a zero-copied request a `len` past the request's
+    /// registered pages is the kernel's to refuse, and the reply is `READ_FIXED`'s error,
+    /// `EFAULT`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::fs::File;
+    /// use std::sync::Arc;
+    ///
+    /// use fuser::ReplyData;
+    ///
+    /// fn read(file: &Arc<File>, offset: u64, size: u32, reply: ReplyData) {
+    ///     reply.read_fixed(Arc::clone(file), offset, size as usize);
+    /// }
+    /// ```
+    pub fn read_fixed(self, src: impl AsFd + Send + 'static, offset: u64, len: usize) {
+        self.reply.send_read_fixed(Box::new(src), offset, len);
     }
 
     /// Reply to a request with the given error code
@@ -644,6 +760,25 @@ impl ReplyOpen {
     pub unsafe fn wrap_backing(&self, id: u32) -> BackingId {
         // TODO: assert passthrough capability is enabled.
         unsafe { self.reply.sender.as_ref().unwrap().wrap_backing(id) }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): reply to an open with `FOPEN_IO_URING_ZERO_COPY` set
+    /// (plan 38 Z4): the kernel registers the pages of every read of this open that it queues
+    /// on a zero-copy io_uring queue ([`crate::Transport::UringZeroCopy`]) for the reply to fill
+    /// with [`ReplyData::read_fixed`]. Elsewhere -- `/dev/fuse`, a ring without zero-copy --
+    /// the flag is ignored and the open behaves as with [`Self::opened`].
+    ///
+    /// Only for opens that cannot write (`O_RDONLY`): the kernel zero-copies the writes of
+    /// such an open too, and this crate cannot hand a zero-copied write's data to
+    /// [`crate::Filesystem::write`] -- it answers one `EIO`.
+    ///
+    /// # Panics
+    /// When `flags` asks for kernel passthrough.
+    pub fn opened_zero_copy(self, fh: ll::FileHandle, flags: FopenFlags) {
+        assert!(!flags.contains(FopenFlags::FOPEN_PASSTHROUGH));
+        let flags = flags | FopenFlags::FOPEN_IO_URING_ZERO_COPY;
+        self.reply
+            .send_ll(&ll::ResponseStruct::new_open(fh, flags, 0));
     }
 
     /// Reply to a request with an opened backing id. Call [`ReplyOpen::open_backing()`]

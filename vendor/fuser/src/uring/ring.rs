@@ -9,15 +9,23 @@
 //! `state`, then `live`; neither is held while buffers are written or the io_uring is used.
 
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::io::IoSlice;
 use std::mem::ManuallyDrop;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::ptr;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread;
 use std::thread::ThreadId;
@@ -39,9 +47,12 @@ use zerocopy::IntoBytes;
 use crate::dev_fuse::DevFuse;
 use crate::ll::Errno;
 use crate::ll::fuse_abi as abi;
+use crate::reply::pread_full;
 use crate::uring::mem::FLAGS_OFFSET;
 use crate::uring::mem::HEADER_SZ;
 use crate::uring::mem::PAYLOAD_SZ_OFFSET;
+use crate::uring::mem::POOL_OFFSET_OFFSET;
+use crate::uring::mem::PoolMemory;
 use crate::uring::mem::RingMemory;
 use crate::uring::staging::StagingError;
 use crate::uring::staging::stage_request;
@@ -53,6 +64,18 @@ const SQE_LEN_OFFSET: usize = 24;
 const OUT_HEADER_SZ: usize = size_of::<abi::fuse_out_header>();
 /// Largest SQ io_uring accepts; the CQ may be twice that.
 pub(crate) const IORING_MAX_ENTRIES: usize = 32768;
+/// CONSTELLATION PATCH (io-uring): `user_data` bit of an entry's `IORING_OP_READ_FIXED`
+/// (`RingCommit::read_fixed`). Entry `user_data` stays below bit 48, and `WAKE`, which has
+/// every bit set, is told apart before this bit is looked at.
+const READ_TAG: u64 = 1 << 63;
+/// CONSTELLATION PATCH (io-uring): `user_data` of the setup commands (`ADD_QUEUE`,
+/// `ADD_BUFPOOL`), which complete before anything else is submitted.
+const SETUP_TAG: u64 = 1 << 62;
+/// CONSTELLATION PATCH (io-uring): the buffer-table index of a registered buffer pool. The
+/// entries' zero-copy slots follow it: entry `i` owns slot `i + 1`, as libfuse's draft does.
+const POOL_BUF_INDEX: u16 = 0;
+/// CONSTELLATION PATCH (io-uring): io_uring's largest buffer table, `IORING_MAX_REG_BUFFERS`.
+const IORING_MAX_REG_BUFFERS: usize = 1 << 14;
 
 /// Called once per fetched request with the commit handle and the contiguous request bytes.
 /// The slice is valid only for the duration of the call.
@@ -206,6 +229,68 @@ impl RingIo {
             .map_err(|_| io::Error::other("submission queue still full after submit"))
     }
 
+    /// CONSTELLATION PATCH (io-uring): registers this ring's buffer table: `slots` sparse
+    /// slots for the kernel to register zero-copied requests' pages into, and `pool` -- the
+    /// ring's buffer pools as one fixed buffer, which pins every page of it -- at
+    /// `POOL_BUF_INDEX`. Only before the first REGISTER, from the ring's own thread.
+    fn register_buffer_table(&mut self, pool: Option<libc::iovec>, slots: u32) -> io::Result<()> {
+        match &mut self.io {
+            Backend::Kernel(io) => {
+                io.submitter().register_buffers_sparse(slots)?;
+                if let Some(iov) = pool {
+                    // SAFETY: the pool is mapped until the ring's buffers are unregistered or
+                    // its io_uring is closed (`Drop for Ring` leaks it while commands pend).
+                    let updated =
+                        unsafe { io.submitter().register_buffers_update(0, &[iov], None) };
+                    if let Err(err) = updated {
+                        let _ = io.submitter().unregister_buffers();
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            }
+            Backend::Memory(m) => m.register_buffer_table(pool, slots),
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): undoes `register_buffer_table`, releasing the pins.
+    fn unregister_buffer_table(&mut self) -> io::Result<()> {
+        match &mut self.io {
+            Backend::Kernel(io) => io.submitter().unregister_buffers(),
+            Backend::Memory(m) => m.unregister_buffer_table(),
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): issues one setup command and returns its result. The
+    /// kernel completes `ADD_QUEUE` and `ADD_BUFPOOL` inline (they never return
+    /// `-EIOCBQUEUED`), so the wait for the one CQE cannot hang; nothing else is in flight on
+    /// the ring yet.
+    fn setup_cmd(&mut self, sqe: squeue::Entry128) -> io::Result<()> {
+        let sqe = sqe.user_data(SETUP_TAG);
+        self.push_or_submit(&sqe)?;
+        #[cfg(test)]
+        self.hooks.before_submit()?;
+        let res = match &mut self.io {
+            Backend::Kernel(io) => {
+                io.submit_and_wait(1)?;
+                io.completion()
+                    .find(|c| c.user_data() == SETUP_TAG)
+                    .map(|c| c.result())
+            }
+            Backend::Memory(m) => {
+                m.submit()?;
+                let mut cqes: SmallVec<[(u64, i32, u32); 4]> = SmallVec::new();
+                m.reap(&mut cqes);
+                cqes.iter().find(|c| c.0 == SETUP_TAG).map(|c| c.1)
+            }
+        };
+        match res {
+            Some(res) if res < 0 => Err(io::Error::from_raw_os_error(-res)),
+            Some(_) => Ok(()),
+            None => Err(io::Error::other("no completion for a setup command")),
+        }
+    }
+
     /// Every CQE available now, as `(user_data, res, flags)`, the early ones first.
     fn reap(&mut self) -> SmallVec<[(u64, i32, u32); 64]> {
         let mut cqes: SmallVec<[(u64, i32, u32); 64]> = self.early.drain(..).collect();
@@ -220,6 +305,46 @@ impl RingIo {
         }
         cqes
     }
+}
+
+/// CONSTELLATION PATCH (io-uring): why `Ring::locate_payload` refused a fetch, each kind
+/// logged once.
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    Offset = 0,
+    Oversize = 1,
+    ZeroCopied = 2,
+}
+
+/// CONSTELLATION PATCH (io-uring): whether the kernel reads a payload from the reply to
+/// `opcode`, i.e. whether its `fuse_args.out_numargs` is non-zero. Those without (and the
+/// ones never answered) get no pool buffer unless they carry input to copy, so on a pool queue
+/// their reply may carry no payload (`Ring::locate_payload`). Unknown opcodes count as having
+/// out args: the kernel would not send them, and a wrong `true` only costs the guard.
+fn has_out_args(opcode: u32) -> bool {
+    use abi::fuse_opcode::*;
+    !matches!(
+        abi::fuse_opcode::try_from(opcode),
+        Ok(FUSE_FORGET
+            | FUSE_UNLINK
+            | FUSE_RMDIR
+            | FUSE_RENAME
+            | FUSE_RENAME2
+            | FUSE_RELEASE
+            | FUSE_RELEASEDIR
+            | FUSE_FSYNC
+            | FUSE_FSYNCDIR
+            | FUSE_SETXATTR
+            | FUSE_REMOVEXATTR
+            | FUSE_FLUSH
+            | FUSE_SETLK
+            | FUSE_SETLKW
+            | FUSE_ACCESS
+            | FUSE_INTERRUPT
+            | FUSE_DESTROY
+            | FUSE_BATCH_FORGET
+            | FUSE_FALLOCATE)
+    )
 }
 
 /// An SQE as the 128 bytes the kernel reads.
@@ -254,8 +379,88 @@ pub(crate) struct Ring {
     /// (`HeldRequest::downgrade_lock_wait`). Set only through
     /// `Config::io_uring_lock_wait_downgrades`, before any request is served.
     lock_wait_downgrades: OnceLock<super::LockWaitDowngrades>,
+    /// CONSTELLATION PATCH (io-uring): the pool memory reserved for this ring's queues and
+    /// whether to register it as a fixed buffer (`Ring::reserve_pools`), until `set_up_queues`
+    /// either hands it to the kernel or drops it.
+    pool_plan: Mutex<Option<(PoolMemory, bool)>>,
+    /// CONSTELLATION PATCH (io-uring): set by `set_up_queues`, before the first REGISTER, when
+    /// this ring's queues take their payload buffers from pools; unset, every entry has its
+    /// own payload buffer, as on 7.42.
+    pools: OnceLock<Pools>,
+    /// CONSTELLATION PATCH (io-uring): the barriers `RingSet::start` holds between the buffer
+    /// tables of every ring and the first `ADD_QUEUE` of any, and between the pool setup of
+    /// every ring and the first REGISTER of any: where this ring reports each round, and the
+    /// answers it waits for. `None` for a ring outside a `RingSet` (the unit tests), which
+    /// registers at once.
+    setup_gate: Mutex<Option<SetupGate>>,
+    /// CONSTELLATION PATCH (io-uring): whether the whole session is zero-copy, as
+    /// `RingSet::start` settled it before any ring registered (`RingCommit::transport`).
+    /// Unset outside a `RingSet`.
+    session_zero_copy: OnceLock<bool>,
+    /// CONSTELLATION PATCH (io-uring): the memfd a reply to a zero-copied request is bounced
+    /// through when it is given as bytes rather than with `read_fixed` (`Ring::bounce_in`).
+    /// Created on first use.
+    bounce: OnceLock<Result<File, String>>,
     #[cfg(test)]
     hooks: test::RingHooks,
+}
+
+/// CONSTELLATION PATCH (io-uring): see `Ring::setup_gate`. Two rounds, each a report to
+/// `RingSet::start` and its answer: the buffer table (`table`, then `queues`: whether every
+/// ring's table is in place, so this one goes on to its zero-copy queues), then the queues and
+/// pools (`setup`, then `proceed`: register).
+pub(crate) struct SetupGate {
+    pub(crate) table: mpsc::Sender<io::Result<TableSetup>>,
+    pub(crate) queues: mpsc::Receiver<bool>,
+    pub(crate) setup: mpsc::Sender<io::Result<PoolSetup>>,
+    pub(crate) proceed: mpsc::Receiver<()>,
+}
+
+/// CONSTELLATION PATCH (io-uring): how the first round of one ring's pool setup ended, its
+/// buffer table (`Ring::set_up_table`).
+#[derive(Debug)]
+pub(crate) enum TableSetup {
+    /// The session did not ask for zero-copy.
+    NotAsked,
+    /// The table was refused, which leaves nothing in the kernel; this is why.
+    Refused(String),
+    /// The table is registered; the ring waits to hear whether every other ring's is too.
+    Ready,
+}
+
+/// CONSTELLATION PATCH (io-uring): how the pool setup of one ring ended (`Ring::set_up_queues`).
+#[derive(Debug)]
+pub(crate) enum PoolSetup {
+    /// The session did not ask for zero-copy: every entry has its own payload buffer.
+    NotAsked,
+    /// Zero-copy was asked for and refused before anything was created in the kernel; every
+    /// entry has its own payload buffer, and this is why.
+    Degraded(String),
+    /// The ring's queues take their payload buffers from pools; `zero_copy` when every one of
+    /// them is a zero-copy queue. `note` names a partial refusal (a queue the kernel would
+    /// only create without zero-copy, a pool it would only take unregistered).
+    Pools {
+        zero_copy: bool,
+        note: Option<String>,
+    },
+}
+
+/// CONSTELLATION PATCH (io-uring): the pools of a ring whose queues have them.
+struct Pools {
+    /// Dropped only with the ring and only when `live.in_kernel` is zero; see `Drop for Ring`.
+    mem: ManuallyDrop<PoolMemory>,
+    /// Per queue of the ring, by `RingEntry::queue`.
+    queues: Vec<QueuePool>,
+}
+
+/// CONSTELLATION PATCH (io-uring): one queue's pool setup, as the kernel accepted it.
+#[derive(Debug, Clone, Copy)]
+struct QueuePool {
+    /// Created with `FUSE_URING_ZERO_COPY`: its entries carry their buffer-table slot.
+    zero_copy: bool,
+    /// The pool is reached through the fixed buffer at `POOL_BUF_INDEX`, so every REGISTER and
+    /// COMMIT_AND_FETCH of the queue must name it (`fuse_uring_cmd_index_ok`).
+    fixed: bool,
 }
 
 /// Exit decision, in-kernel accounting and the commit queue, under one lock.
@@ -356,6 +561,23 @@ pub(crate) struct RingEntry {
     /// a non-blocking one (`HeldRequest::downgrade_lock_wait`), so a contended answer
     /// (`EAGAIN`) is committed as `ENOLCK`. Reset at every fetch.
     lock_downgraded: std::sync::atomic::AtomicBool,
+    /// CONSTELLATION PATCH (io-uring): the REGISTER iovecs on a queue with a buffer pool: the
+    /// header, and an empty payload, which the kernel requires there (it picks a pool buffer
+    /// per request instead). Points into `Ring::mem` like `iov`.
+    pool_iov: EntryIov,
+    /// CONSTELLATION PATCH (io-uring): this entry's slot in the ring's buffer table, where the
+    /// kernel registers a zero-copied request's pages (`POOL_BUF_INDEX` + 1 + index).
+    zc_slot: u16,
+    /// CONSTELLATION PATCH (io-uring): where the current fetch's reply payload goes -- the
+    /// entry's own payload buffer, or the pool buffer the kernel picked for the request --
+    /// and how many bytes it holds. The ring thread writes both at every fetch before the
+    /// entry becomes `Dispatching`, so whoever commits read them after taking `state`.
+    reply_at: AtomicPtr<u8>,
+    reply_cap: AtomicUsize,
+    /// CONSTELLATION PATCH (io-uring): the current fetch's pages are registered in `zc_slot`
+    /// (`FUSE_URING_ENT_ZERO_COPY`), so its data reply reaches the caller only through a
+    /// `READ_FIXED` into them: the kernel copies nothing from the payload buffer.
+    zero_copied: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -370,13 +592,19 @@ enum EntryState {
         commit_id: u64,
     },
     /// A reply arrived during dispatch while the payload was borrowed; written after dispatch.
-    Deferred { bytes: ReplyBytes, commit_id: u64 },
+    Deferred { reply: Stashed, commit_id: u64 },
     /// Dispatch returned, reply still to come.
     Dispatched { commit_id: u64 },
     /// Buffers being written by exactly one thread.
     Committing,
     /// Buffers written, `idx` is in `live.pending`, awaiting the ring thread's push.
     Pending { commit_id: u64 },
+    /// CONSTELLATION PATCH (io-uring): `idx` is in `live.pending` for the ring thread to push
+    /// a `READ_FIXED` into the request's registered pages; the commit follows its completion.
+    /// Counted in `in_kernel` from here on, like `Pending`.
+    PendingRead { commit_id: u64, read: ReadFixed },
+    /// CONSTELLATION PATCH (io-uring): that `READ_FIXED` is in the kernel.
+    Reading { commit_id: u64, read: ReadFixed },
     /// Not in the kernel and not coming back: before REGISTER, after ENOTCONN, a fatal
     /// error, or ring exit.
     Dead,
@@ -401,6 +629,43 @@ struct ReplyBytes(Vec<u8>);
 impl fmt::Debug for ReplyBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} bytes", self.0.len())
+    }
+}
+
+/// CONSTELLATION PATCH (io-uring): a reply stashed during dispatch (`EntryState::Deferred`).
+#[derive(Debug)]
+enum Stashed {
+    Bytes(ReplyBytes),
+    Read(ReadFixed),
+}
+
+/// CONSTELLATION PATCH (io-uring): one `IORING_OP_READ_FIXED` of `len` bytes at `offset` of
+/// `src` into a zero-copied request's registered pages (plan 38 §3(d)).
+pub(crate) struct ReadFixed {
+    src: ReadSource,
+    offset: u64,
+    len: u32,
+}
+
+/// CONSTELLATION PATCH (io-uring): where a `ReadFixed` reads from.
+enum ReadSource {
+    /// The filesystem's file (`ReplyData::read_fixed`), kept open until the read completes.
+    Caller(Box<dyn AsFd + Send>),
+    /// The ring's bounce memfd (`Ring::bounce_in`), whose range is released afterwards.
+    Bounce,
+}
+
+impl fmt::Debug for ReadFixed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let src = match &self.src {
+            ReadSource::Caller(fd) => format!("fd {}", fd.as_fd().as_raw_fd()),
+            ReadSource::Bounce => "bounce".to_owned(),
+        };
+        f.debug_struct("ReadFixed")
+            .field("src", &src)
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish()
     }
 }
 
@@ -459,11 +724,49 @@ impl RingCommit {
         &self.ring.device
     }
 
+    /// CONSTELLATION PATCH (io-uring): the transport this reply goes out over: the ring, with
+    /// zero-copy when the session is (plan 38 Z4) -- every queue of every ring a zero-copy
+    /// queue, as `RingSet::start` settled it, so that every reply of a session names the one
+    /// transport the session reports. A ring outside a `RingSet` (the unit tests) answers for
+    /// its own queues.
+    pub(crate) fn transport(&self) -> crate::Transport {
+        let zero_copy = self
+            .ring
+            .session_zero_copy
+            .get()
+            .copied()
+            .unwrap_or_else(|| {
+                self.ring
+                    .pools
+                    .get()
+                    .is_some_and(|p| p.queues.iter().all(|q| q.zero_copy))
+            });
+        if zero_copy {
+            crate::Transport::UringZeroCopy
+        } else {
+            crate::Transport::Uring
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): whether this request's pages are registered for a
+    /// `READ_FIXED` (`read_fixed`), i.e. a reply's data reaches them with no copy by this
+    /// process.
+    pub(crate) fn zero_copied(&self) -> bool {
+        self.entry().zero_copied.load(Ordering::Relaxed)
+    }
+
     /// `live` is released before the reply is copied; `hand_off` re-checks `exited` under both
     /// locks. A refused commit is `NotConnected` when the connection ended (expected after
     /// unmount) and `Other` for a duplicate (a filesystem bug). `iov` is stashed when the
     /// payload is borrowed; `None` leaves the state alone then.
-    fn begin(&self, iov: Option<&[IoSlice<'_>]>) -> io::Result<Begun> {
+    ///
+    /// CONSTELLATION PATCH (io-uring): so is `read`, a `READ_FIXED` reply (`read_fixed`),
+    /// taken out of the option when it is stashed.
+    fn begin(
+        &self,
+        iov: Option<&[IoSlice<'_>]>,
+        read: &mut Option<ReadFixed>,
+    ) -> io::Result<Begun> {
         let e = self.entry();
         let mut state = e.state.lock();
         let (exited, conn_dead) = {
@@ -500,7 +803,12 @@ impl RingCommit {
                     let mut bytes = Vec::with_capacity(iov.iter().map(|s| s.len()).sum());
                     iov.iter().for_each(|s| bytes.extend_from_slice(s));
                     *state = EntryState::Deferred {
-                        bytes: ReplyBytes(bytes),
+                        reply: Stashed::Bytes(ReplyBytes(bytes)),
+                        commit_id: self.commit_id,
+                    };
+                } else if let Some(read) = read.take() {
+                    *state = EntryState::Deferred {
+                        reply: Stashed::Read(read),
                         commit_id: self.commit_id,
                     };
                 }
@@ -542,14 +850,59 @@ impl RingCommit {
     }
 
     fn commit_unmapped(&self, iov: &[IoSlice<'_>]) -> io::Result<()> {
-        if let Begun::Direct = self.begin(Some(iov))? {
-            // SAFETY: `Committing` makes this thread the only writer; a request slice can
-            // only be live if the request had no payload, and it never covers the header
-            // or the payload area.
-            unsafe { self.entry().write_reply(self.commit_id, iov) };
-            self.ring.hand_off(self.entry(), self.commit_id);
+        if let Begun::Direct = self.begin(Some(iov), &mut None)? {
+            // `Committing` makes this thread the only writer; a request slice can only be
+            // live if the request had no payload, and it never covers the header or the
+            // payload area.
+            self.ring.deliver(self.entry(), self.commit_id, iov);
         }
         Ok(())
+    }
+
+    /// CONSTELLATION PATCH (io-uring): replies with `len` bytes of `src` from `offset` (plan 38
+    /// §3(d)). On a zero-copied request -- a read of a file opened with
+    /// `FOPEN_IO_URING_ZERO_COPY` on a zero-copy queue -- the ring thread issues one
+    /// `IORING_OP_READ_FIXED` from `src` straight into the request's registered pages, and
+    /// commits once it completes: the bytes it read (fewer at the end of the file) or its
+    /// error. Otherwise the bytes are read into the entry's payload buffer with `pread(2)`, as
+    /// `fill_with` writes any reply there. `Ok(Some(src))` hands `src` back when the request's
+    /// payload is borrowed and it was not zero-copied, as `fill_with` hands back its closure;
+    /// `Ok(None)` means the reply is done or under way. `src` stays open until the read
+    /// completed, on the ring thread.
+    pub(crate) fn read_fixed(
+        &self,
+        src: Box<dyn AsFd + Send>,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<Option<Box<dyn AsFd + Send>>> {
+        let e = self.entry();
+        if !e.zero_copied.load(Ordering::Relaxed) {
+            let back = self.fill_with(len, false, |buf| {
+                pread_full(src.as_fd(), buf, offset).map_err(Errno::from)
+            })?;
+            return Ok(back.map(drop).map(|()| src));
+        }
+        let Ok(len) = u32::try_from(len) else {
+            let header = errno_header(self.commit_id, Errno::EINVAL);
+            return self
+                .commit(&[IoSlice::new(header.as_bytes())])
+                .map(|()| None);
+        };
+        let mut read = Some(ReadFixed {
+            src: ReadSource::Caller(src),
+            offset,
+            len,
+        });
+        match self.begin(None, &mut read)? {
+            // A held request stashed the read for `finish_dispatch`
+            Begun::Dropped | Begun::Deferred => Ok(None),
+            Begun::Direct => {
+                if let Some(read) = read {
+                    self.ring.hand_off_read(e, self.commit_id, read);
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// `fill_with` with a zeroed buffer, for the tests (replies go through `fill_with`).
@@ -576,18 +929,19 @@ impl RingCommit {
         F: FnOnce(&mut [u8]) -> Result<usize, Errno>,
     {
         let e = self.entry();
-        if max_len > e.payload_cap {
+        if max_len > e.reply_cap() {
             error!(
                 "io_uring: reply buffer of {max_len} bytes for unique {} exceeds the {} byte \
                  payload buffer; replying EINVAL",
-                self.commit_id, e.payload_cap
+                self.commit_id,
+                e.reply_cap()
             );
             let header = errno_header(self.commit_id, Errno::EINVAL);
             return self
                 .commit(&[IoSlice::new(header.as_bytes())])
                 .map(|()| None);
         }
-        match self.begin(None)? {
+        match self.begin(None, &mut None)? {
             Begun::Dropped => Ok(None),
             Begun::Deferred => Ok(Some(f)),
             Begun::Direct => {
@@ -597,11 +951,42 @@ impl RingCommit {
                     .direct_fills
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let guard = FillGuard(self);
+                // CONSTELLATION PATCH (io-uring): a zero-copied request's data can only reach
+                // its pages through a `READ_FIXED`, so `f` writes into the entry's own payload
+                // buffer -- unused by a request that had no payload -- and the bytes are
+                // bounced from there (`Ring::bounce_in`)
+                let zero_copied = e.zero_copied.load(Ordering::Relaxed);
+                let at = if zero_copied {
+                    e.own_payload()
+                } else {
+                    e.reply_payload()
+                };
                 // SAFETY: `Committing` makes this thread the only writer, and a request slice
                 // can only be live if the request had no payload, so it ends before the
-                // payload area; `max_len <= payload_cap` keeps the slice inside it.
-                let res = unsafe { e.with_payload(max_len, zero, f) };
+                // payload area; `max_len <= reply_cap <= payload_cap` keeps the slice inside
+                // either buffer.
+                let res = unsafe { e.with_payload(at, max_len, zero, f) };
                 std::mem::forget(guard);
+                if zero_copied {
+                    match self.checked(res, max_len) {
+                        Ok(n) => {
+                            // SAFETY: `f` is done with the buffer; `n <= max_len`.
+                            let bytes = unsafe { slice::from_raw_parts(at, n as usize) };
+                            let header = abi::fuse_out_header {
+                                len: OUT_HEADER_SZ as u32 + n,
+                                error: 0,
+                                unique: self.commit_id,
+                            };
+                            self.ring.deliver(
+                                e,
+                                self.commit_id,
+                                &[IoSlice::new(header.as_bytes()), IoSlice::new(bytes)],
+                            );
+                        }
+                        Err(errno) => self.write_errno_and_hand_off(errno),
+                    }
+                    return Ok(None);
+                }
                 match self.checked(res, max_len) {
                     Ok(n) => {
                         let header = abi::fuse_out_header {
@@ -849,7 +1234,10 @@ fn errno_header(unique: u64, errno: Errno) -> abi::fuse_out_header {
 impl RingEntry {
     /// Writes a reply: header into `[0, 16)`, payload into `[gap, ..)`, then the trailer. A
     /// payload larger than the buffer, or `iov[0]` that is not a `fuse_out_header`, becomes an
-    /// `EINVAL` reply, as `/dev/fuse` would make an oversized one.
+    /// `EINVAL` reply, as `/dev/fuse` would make an oversized one. CONSTELLATION PATCH
+    /// (io-uring): on a pool queue "the buffer" is `reply_cap`, 0 for a request whose reply the
+    /// kernel reads no payload from, which may have been given no pool buffer of its own
+    /// (`Ring::locate_payload`).
     ///
     /// # Safety
     ///
@@ -860,24 +1248,25 @@ impl RingEntry {
         let header = iov.first().filter(|h| h.len() == OUT_HEADER_SZ);
         let payload_sz = u32::try_from(payload_len)
             .ok()
-            .filter(|_| payload_len <= self.payload_cap);
+            .filter(|_| payload_len <= self.reply_cap());
         // `commit` already answered a malformed header, so only the payload can fail here
         let (Some(header), Some(payload_sz)) = (header, payload_sz) else {
             error!(
                 "io_uring: reply of {payload_len} bytes exceeds the {} byte payload buffer; \
                  replying EINVAL",
-                self.payload_cap
+                self.reply_cap()
             );
             // SAFETY: the caller's guarantee.
             unsafe { self.write_errno(commit_id, Errno::EINVAL) };
             return;
         };
-        let base = self.base.0.as_ptr();
-        // SAFETY: the payload fits in `payload_cap`, so every chunk lands inside the stride.
+        let at = self.reply_payload();
+        // SAFETY: the payload fits in `reply_cap`, so every chunk lands inside the reply
+        // buffer (the stride's payload, or the pool buffer the kernel picked).
         unsafe {
-            let mut off = self.gap;
+            let mut off = 0;
             for chunk in iov.iter().skip(1) {
-                ptr::copy_nonoverlapping(chunk.as_ptr(), base.add(off), chunk.len());
+                ptr::copy_nonoverlapping(chunk.as_ptr(), at.add(off), chunk.len());
                 off += chunk.len();
             }
             self.write_header(header, payload_sz);
@@ -901,25 +1290,51 @@ impl RingEntry {
         }
     }
 
-    /// Runs `f` on the first `len` bytes of the payload area, zeroed when `zero`.
+    /// Runs `f` on the first `len` bytes of the payload buffer at `at`, zeroed when `zero`.
+    ///
+    /// CONSTELLATION PATCH (io-uring): `at` is `reply_payload()` or `own_payload()`.
     ///
     /// # Safety
     ///
-    /// As for `write_reply`, `len <= payload_cap`, and no other reference into the payload
-    /// area exists while `f` runs.
-    unsafe fn with_payload<R>(&self, len: usize, zero: bool, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        // SAFETY: `[gap, gap + len)` is inside the stride and, by the caller's guarantee,
+    /// As for `write_reply`, `at` is one of this entry's payload buffers, `len` is at most
+    /// what that buffer holds, and no other reference into it exists while `f` runs.
+    unsafe fn with_payload<R>(
+        &self,
+        at: *mut u8,
+        len: usize,
+        zero: bool,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> R {
+        // SAFETY: `[at, at + len)` is inside the buffer and, by the caller's guarantee,
         // aliased by nothing else while the slice is live. Unzeroed, its bytes are still
-        // initialized: the mapping is anonymous memory, written since only by the kernel and
-        // this entry's own requests and replies.
+        // initialized: both mappings are anonymous memory, written since only by the kernel
+        // and this ring's own requests and replies.
         let buf = unsafe {
-            let payload = self.base.0.as_ptr().add(self.gap);
             if zero {
-                ptr::write_bytes(payload, 0, len);
+                ptr::write_bytes(at, 0, len);
             }
-            slice::from_raw_parts_mut(payload, len)
+            slice::from_raw_parts_mut(at, len)
         };
         f(buf)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the entry's own payload buffer in its stride, where a
+    /// fetched request's payload is staged to follow its header.
+    fn own_payload(&self) -> *mut u8 {
+        // SAFETY: gap < stride, inside the entry's stride.
+        unsafe { self.base.0.as_ptr().add(self.gap) }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): where the current fetch's reply payload goes
+    /// (`reply_at`).
+    fn reply_payload(&self) -> *mut u8 {
+        self.reply_at.load(Ordering::Relaxed)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): how many bytes a reply payload of the current fetch
+    /// may have (`reply_cap`).
+    fn reply_cap(&self) -> usize {
+        self.reply_cap.load(Ordering::Relaxed)
     }
 
     /// # Safety
@@ -1007,6 +1422,13 @@ impl Ring {
                         iov_len: mem.payload_cap(),
                     },
                 ];
+                let pool_iov = [
+                    iov[0],
+                    libc::iovec {
+                        iov_base: ptr::null_mut(),
+                        iov_len: 0,
+                    },
+                ];
                 RingEntry {
                     idx: idx as u32,
                     qid,
@@ -1019,6 +1441,14 @@ impl Ring {
                     queue: idx as u32 / depth,
                     lock_wait: std::sync::atomic::AtomicBool::new(false),
                     lock_downgraded: std::sync::atomic::AtomicBool::new(false),
+                    pool_iov: EntryIov(pool_iov),
+                    // `n` fits a u32 and is at most 32768 per ring (`RingSet::new`); a ring
+                    // with more entries than a buffer table has slots never asks for zero-copy
+                    zc_slot: (idx + 1).min(usize::from(u16::MAX)) as u16 + POOL_BUF_INDEX,
+                    // SAFETY: gap < stride, inside the entry's stride.
+                    reply_at: AtomicPtr::new(unsafe { base.add(mem.gap()) }.as_ptr()),
+                    reply_cap: AtomicUsize::new(mem.payload_cap()),
+                    zero_copied: AtomicBool::new(false),
                 }
             })
             .collect();
@@ -1044,9 +1474,50 @@ impl Ring {
             mem: ManuallyDrop::new(mem),
             malformed_register: std::sync::atomic::AtomicBool::new(false),
             lock_wait_downgrades: OnceLock::new(),
+            pool_plan: Mutex::new(None),
+            pools: OnceLock::new(),
+            setup_gate: Mutex::new(None),
+            session_zero_copy: OnceLock::new(),
+            bounce: OnceLock::new(),
             #[cfg(test)]
             hooks: test::RingHooks::default(),
         }))
+    }
+
+    /// CONSTELLATION PATCH (io-uring): asks for zero-copy queues (plan 38 Z4), with `pool` --
+    /// one slice of `depth` buffers per queue of this ring -- as their buffer pools, registered
+    /// as a fixed buffer when `register`. `set_up_table` and `set_up_queues` decide, before the
+    /// first REGISTER.
+    pub(crate) fn reserve_pools(&self, pool: PoolMemory, register: bool) {
+        *self.pool_plan.lock() = Some((pool, register));
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see `Ring::setup_gate`.
+    pub(crate) fn set_setup_gate(&self, gate: SetupGate) {
+        *self.setup_gate.lock() = Some(gate);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): see `Ring::session_zero_copy`.
+    pub(crate) fn set_session_zero_copy(&self, zero_copy: bool) {
+        let _ = self.session_zero_copy.set(zero_copy);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): address space reserved for buffer pools, if any.
+    pub(crate) fn pool_bytes(&self) -> usize {
+        self.pool_plan
+            .lock()
+            .as_ref()
+            .map(|(pool, _)| pool.len())
+            .or_else(|| self.pools.get().map(|p| p.mem.len()))
+            .unwrap_or(0)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): this ring's queue `q` (by `RingEntry::queue`), as its
+    /// pool setup left it; `None` when its entries have their own payload buffers.
+    fn queue_pool(&self, q: u32) -> Option<QueuePool> {
+        self.pools
+            .get()
+            .and_then(|p| p.queues.get(q as usize).copied())
     }
 
     /// How many `fill` replies were written straight into an entry.
@@ -1080,12 +1551,23 @@ impl Ring {
     }
 
     fn register_sqe(&self, e: &RingEntry) -> squeue::Entry128 {
+        // CONSTELLATION PATCH (io-uring): on a queue with a pool the payload iovec is empty,
+        // a zero-copy queue's entry names its buffer-table slot, and a registered pool's
+        // index goes with every command of its queue
+        let pool = self.queue_pool(e.queue);
+        let mut cmd = cmd_bytes(e.qid, 0);
+        if pool.is_some_and(|q| q.zero_copy) {
+            let at = abi::FUSE_URING_CMD_REQ_UNION_OFFSET;
+            cmd[at..at + 2].copy_from_slice(&e.zc_slot.to_ne_bytes());
+        }
+        let iov = if pool.is_some() { &e.pool_iov } else { &e.iov };
         let sqe = opcode::UringCmd80::new(
             types::Fd(self.device.as_raw_fd()),
             abi::fuse_uring_cmd::FUSE_IO_URING_CMD_REGISTER as u32,
         )
-        .cmd(cmd_bytes(e.qid, 0))
-        .addr(Some(e.iov.0.as_ptr() as u64))
+        .cmd(cmd)
+        .addr(Some(iov.0.as_ptr() as u64))
+        .buf_index(pool.filter(|q| q.fixed).map(|_| POOL_BUF_INDEX))
         .build()
         .user_data(user_data(e.qid, e.idx));
         let segments = if self
@@ -1116,8 +1598,209 @@ impl Ring {
             abi::fuse_uring_cmd::FUSE_IO_URING_CMD_COMMIT_AND_FETCH as u32,
         )
         .cmd(cmd_bytes(e.qid, commit_id))
+        // CONSTELLATION PATCH (io-uring): see `register_sqe`
+        .buf_index(
+            self.queue_pool(e.queue)
+                .filter(|q| q.fixed)
+                .map(|_| POOL_BUF_INDEX),
+        )
         .build()
         .user_data(user_data(e.qid, e.idx))
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `FUSE_IO_URING_CMD_ADD_QUEUE` for `qid`, a zero-copy
+    /// queue when `zero_copy`.
+    fn add_queue_sqe(&self, qid: u16, zero_copy: bool) -> squeue::Entry128 {
+        let mut cmd = cmd_bytes(qid, 0);
+        if zero_copy {
+            cmd[..8].copy_from_slice(&abi::FUSE_URING_ZERO_COPY.to_ne_bytes());
+        }
+        opcode::UringCmd80::new(
+            types::Fd(self.device.as_raw_fd()),
+            abi::fuse_uring_cmd::FUSE_IO_URING_CMD_ADD_QUEUE as u32,
+        )
+        .cmd(cmd)
+        .build()
+    }
+
+    /// CONSTELLATION PATCH (io-uring): `FUSE_IO_URING_CMD_ADD_BUFPOOL` giving `qid` the pool
+    /// `[start, start + len)`, reached through the fixed buffer at `POOL_BUF_INDEX` when
+    /// `fixed` (the kernel takes the SQE's `IORING_URING_CMD_FIXED` and `buf_index` as that).
+    fn add_bufpool_sqe(
+        &self,
+        qid: u16,
+        start: NonNull<u8>,
+        len: usize,
+        fixed: bool,
+    ) -> squeue::Entry128 {
+        let mut cmd = cmd_bytes(qid, 0);
+        let pool = abi::fuse_uring_bufpool {
+            uaddr: start.as_ptr() as u64,
+            len: len as u32,
+            reserved: 0,
+        };
+        let at = abi::FUSE_URING_CMD_REQ_UNION_OFFSET;
+        cmd[at..at + size_of::<abi::fuse_uring_bufpool>()].copy_from_slice(pool.as_bytes());
+        opcode::UringCmd80::new(
+            types::Fd(self.device.as_raw_fd()),
+            abi::fuse_uring_cmd::FUSE_IO_URING_CMD_ADD_BUFPOOL as u32,
+        )
+        .cmd(cmd)
+        .buf_index(fixed.then_some(POOL_BUF_INDEX))
+        .build()
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the `READ_FIXED` of `read` into `e`'s slot. The
+    /// destination address is an offset into the registered pages: a buffer the kernel
+    /// registers itself (`io_buffer_register_bvec`) starts at 0.
+    fn read_sqe(&self, e: &RingEntry, read: &ReadFixed) -> squeue::Entry128 {
+        let fd = match &read.src {
+            ReadSource::Caller(src) => src.as_fd().as_raw_fd(),
+            ReadSource::Bounce => self.bounce_fd().unwrap_or(-1),
+        };
+        opcode::ReadFixed::new(types::Fd(fd), ptr::null_mut(), read.len, e.zc_slot)
+            .offset(read.offset)
+            .build()
+            .user_data(READ_TAG | user_data(e.qid, e.idx))
+            .into()
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the queues of this ring and their entries' pools:
+    /// whatever the session's handshake asked for (`reserve_pools`), what the kernel granted.
+    /// In two rounds, each followed by `RingSet::start`'s barrier: this ring's buffer table
+    /// (`set_up_table`), then -- only once every ring of the session has its table -- its
+    /// queues and their pools (`set_up_queues`).
+    ///
+    /// Both run on the ring thread once the ring is enabled and before its first REGISTER --
+    /// which is what makes a refusal here harmless. On 7.3 one failed REGISTER disables the
+    /// ring for the whole connection, and a queue created for zero-copy refuses an entry with
+    /// its own payload buffer; so nothing is registered until this has decided, for every
+    /// queue, the one way its entries will be registered. The order puts the likeliest refusal
+    /// first, while it still leaves nothing behind: a buffer table the process may not pin or
+    /// account (`RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`, `ENOMEM`), on any ring, then the first
+    /// queue's `ADD_QUEUE` with `FUSE_URING_ZERO_COPY` (`EPERM` where the kernel's
+    /// `capable(CAP_SYS_ADMIN)` says no, as in a user namespace whose `CapEff` shows it). Either
+    /// one leaves every entry with its own payload buffer -- plain `Uring` -- and says why
+    /// (`TableSetup::Refused`, `PoolSetup::Degraded`). A table refused on one ring withdraws
+    /// every other ring's before any queue exists, so a session never ends up with zero-copy
+    /// queues on some rings and not on others for that reason.
+    fn set_up_table(&self, io: &mut RingIo) -> TableSetup {
+        let mut plan = self.pool_plan.lock();
+        let Some((mem, register)) = plan.as_ref() else {
+            return TableSetup::NotAsked;
+        };
+        let slots = self.entries.len() + 1;
+        let refused = if slots > IORING_MAX_REG_BUFFERS || self.entries.is_empty() {
+            Some(format!(
+                "ring {} has {} entries, more than the {} slots of an io_uring buffer table",
+                self.index,
+                self.entries.len(),
+                IORING_MAX_REG_BUFFERS - 1
+            ))
+        } else {
+            io.register_buffer_table(register.then(|| mem.iovec()), slots as u32)
+                .err()
+                .map(|err| {
+                    format!(
+                        "registering the buffer table of ring {} ({} bytes of pool, {slots} \
+                         slots) failed ({err})",
+                        self.index,
+                        mem.len()
+                    )
+                })
+        };
+        match refused {
+            Some(why) => {
+                plan.take();
+                TableSetup::Refused(why)
+            }
+            None => TableSetup::Ready,
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the second round of `set_up_table`: with `go` (every
+    /// ring's table is registered) the queues and their pools, else this ring's table is
+    /// released again and its entries keep their own payload buffers.
+    ///
+    /// Past the first `ADD_QUEUE` that queue exists as a zero-copy queue, which only ever
+    /// accepts entries without a payload buffer, so the ring stays on pools: a later queue the
+    /// kernel will not create for zero-copy is created without it (and the session is not
+    /// zero-copy then), a pool it will not take as a fixed buffer is given unregistered, and
+    /// only a queue or pool refused outright fails the ring -- `RegistrationRefused`, the
+    /// session's constructor error, as for a refused REGISTER.
+    fn set_up_queues(&self, io: &mut RingIo, go: bool) -> io::Result<PoolSetup> {
+        let Some((mem, register)) = self.pool_plan.lock().take() else {
+            return Ok(PoolSetup::NotAsked);
+        };
+        let release = |io: &mut RingIo| {
+            if let Err(err) = io.unregister_buffer_table() {
+                warn!(
+                    "io_uring: ring {}: releasing the buffer table failed ({err})",
+                    self.index
+                );
+            }
+        };
+        if !go {
+            release(io);
+            return Ok(PoolSetup::Degraded(format!(
+                "ring {} withdrew its buffer table: another ring could not register one",
+                self.index
+            )));
+        }
+        let depth = self.depth.max(1) as usize;
+        let qids: Vec<u16> = self.entries.iter().step_by(depth).map(|e| e.qid).collect();
+        if let Err(err) = io.setup_cmd(self.add_queue_sqe(qids[0], true)) {
+            release(io);
+            return Ok(PoolSetup::Degraded(format!(
+                "the kernel refused zero-copy queue {} ({err})",
+                qids[0]
+            )));
+        }
+        let mut queues = vec![
+            QueuePool {
+                zero_copy: true,
+                fixed: false,
+            };
+            qids.len()
+        ];
+        let mut note = None;
+        let refused = |qid: u16, err: io::Error| {
+            crate::uring::RegistrationRefused::error(self.index, qid, err)
+        };
+        for (q, &qid) in qids.iter().enumerate().skip(1) {
+            if let Err(err) = io.setup_cmd(self.add_queue_sqe(qid, true)) {
+                note.get_or_insert(format!(
+                    "the kernel created queue {qid} only without zero-copy ({err})"
+                ));
+                io.setup_cmd(self.add_queue_sqe(qid, false))
+                    .map_err(|err| refused(qid, err))?;
+                queues[q].zero_copy = false;
+            }
+        }
+        for (q, &qid) in qids.iter().enumerate() {
+            let (start, len) = mem.slice(q);
+            if register {
+                match io.setup_cmd(self.add_bufpool_sqe(qid, start, len, true)) {
+                    Ok(()) => {
+                        queues[q].fixed = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        note.get_or_insert(format!(
+                            "the kernel took queue {qid}'s pool only unregistered ({err})"
+                        ));
+                    }
+                }
+            }
+            io.setup_cmd(self.add_bufpool_sqe(qid, start, len, false))
+                .map_err(|err| refused(qid, err))?;
+        }
+        let zero_copy = queues.iter().all(|q| q.zero_copy);
+        let _ = self.pools.set(Pools {
+            mem: ManuallyDrop::new(mem),
+            queues,
+        });
+        Ok(PoolSetup::Pools { zero_copy, note })
     }
 
     fn wake_sqe(&self) -> squeue::Entry128 {
@@ -1143,7 +1826,30 @@ impl Ring {
             // Nothing was registered, so `in_kernel` is 0 and `Drop` unmaps
             return Ok(());
         }
-        let reg = io.enable().and_then(|()| self.register_all(&mut io));
+        let reg = match (io.enable(), self.setup_gate.lock().take()) {
+            (Err(err), None) => Err(err),
+            (Ok(()), None) => self.register_all(&mut io),
+            // CONSTELLATION PATCH (io-uring): the buffer table, then the queues and pools,
+            // each followed by `RingSet::start`'s answer, which comes once every ring reported;
+            // without one (a ring of the set failed) nothing is registered and the session
+            // fails
+            (enabled, Some(gate)) => {
+                let table = enabled.map(|()| self.set_up_table(&mut io));
+                let ok = table.is_ok();
+                let _ = gate.table.send(table);
+                let go = match gate.queues.recv() {
+                    Ok(go) if ok => go,
+                    _ => return Ok(()),
+                };
+                let setup = self.set_up_queues(&mut io, go);
+                let ok = setup.is_ok();
+                let _ = gate.setup.send(setup);
+                if !ok || gate.proceed.recv().is_err() {
+                    return Ok(());
+                }
+                self.register_all(&mut io)
+            }
+        };
         let ok = reg.is_ok();
         let _ = registered.send(reg);
         if !ok {
@@ -1267,21 +1973,28 @@ impl Ring {
         let pending = std::mem::take(&mut self.live.lock().pending);
         for idx in pending {
             let e = &self.entries[idx as usize];
-            let commit_id = {
+            let (sqe, commit_id) = {
                 let mut state = e.state.lock();
-                match *state {
+                match std::mem::replace(&mut *state, EntryState::Dead) {
                     EntryState::Pending { commit_id } => {
                         *state = EntryState::InKernel { last: commit_id };
-                        commit_id
+                        (self.commit_sqe(e, commit_id), commit_id)
                     }
-                    ref other => panic!(
+                    // CONSTELLATION PATCH (io-uring): the `READ_FIXED` goes first; its
+                    // completion pushes the commit (`read_done`)
+                    EntryState::PendingRead { commit_id, read } => {
+                        let sqe = self.read_sqe(e, &read);
+                        *state = EntryState::Reading { commit_id, read };
+                        (sqe, commit_id)
+                    }
+                    other => panic!(
                         "io_uring: entry {idx} queued in pending is {other:?}; every queued index \
                          is Pending (the ring thread stops; the mapping is leaked if any command \
                          is still counted)"
                     ),
                 }
             };
-            if let Err(err) = io.push_or_submit(&self.commit_sqe(e, commit_id)) {
+            if let Err(err) = io.push_or_submit(&sqe) {
                 if is_ring_failure(&err) {
                     return Err(err);
                 }
@@ -1338,6 +2051,207 @@ impl Ring {
 
     /// The buffers are written; queues the entry for the ring thread.
     fn hand_off(&self, e: &RingEntry, commit_id: u64) {
+        self.hand_off_as(e, commit_id, EntryState::Pending { commit_id });
+    }
+
+    /// CONSTELLATION PATCH (io-uring): queues a `READ_FIXED` reply for the ring thread,
+    /// which commits once the read completed (`read_done`).
+    fn hand_off_read(&self, e: &RingEntry, commit_id: u64, read: ReadFixed) {
+        self.hand_off_as(e, commit_id, EntryState::PendingRead { commit_id, read });
+    }
+
+    /// CONSTELLATION PATCH (io-uring): writes a reply (`iov[0]` the out header) the way the
+    /// current fetch takes it, and hands the entry off. A zero-copied request's payload cannot
+    /// go through the payload buffer -- the kernel copies nothing from it into the request's
+    /// pages -- so a reply with data is bounced into them with a `READ_FIXED`
+    /// (`bounce_in`); anything else is `write_reply`'s. The caller made the entry
+    /// `Committing`, and no request slice is live.
+    fn deliver(&self, e: &RingEntry, commit_id: u64, iov: &[IoSlice<'_>]) {
+        let payload = iov.get(1..).unwrap_or_default();
+        if e.zero_copied.load(Ordering::Relaxed) && payload.iter().any(|s| !s.is_empty()) {
+            match self.bounce_in(e, payload) {
+                Ok(read) => return self.hand_off_read(e, commit_id, read),
+                Err(err) => {
+                    error!(
+                        "io_uring: bouncing the reply to zero-copied unique {commit_id} failed \
+                         ({err}); replying EIO"
+                    );
+                    // SAFETY: the caller's guarantee.
+                    unsafe { e.write_errno(commit_id, Errno::EIO) };
+                    return self.hand_off(e, commit_id);
+                }
+            }
+        }
+        // SAFETY: the caller's guarantee.
+        unsafe { e.write_reply(commit_id, iov) };
+        self.hand_off(e, commit_id);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the bounce memfd's descriptor, creating it on first use.
+    fn bounce_fd(&self) -> Result<std::os::fd::RawFd, String> {
+        self.bounce
+            .get_or_init(|| {
+                // SAFETY: a plain syscall with a static, NUL-terminated name.
+                let fd = unsafe {
+                    libc::memfd_create(c"fuser-zero-copy-bounce".as_ptr(), libc::MFD_CLOEXEC)
+                };
+                if fd < 0 {
+                    return Err(format!(
+                        "memfd_create failed ({})",
+                        io::Error::last_os_error()
+                    ));
+                }
+                debug!(
+                    "io_uring: ring {} bounces replies to zero-copied requests given as bytes \
+                     through a memfd",
+                    self.index
+                );
+                // SAFETY: `fd` was just created and is owned by nothing else.
+                Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+            })
+            .as_ref()
+            .map(|f| f.as_raw_fd())
+            .map_err(Clone::clone)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): writes `payload` into the bounce memfd at entry `e`'s
+    /// own range and returns the `READ_FIXED` that carries it into the request's pages: two
+    /// copies (into the memfd's pages, out of them), against the one a non-zero-copy queue
+    /// makes -- the price of answering a zero-copy open from memory rather than a file, which
+    /// the read path of plan 38 §3(d) leaves to reads that span chunks. The range is punched
+    /// out again once the read completed (`read_done`), so the memfd holds only replies in
+    /// flight.
+    fn bounce_in(&self, e: &RingEntry, payload: &[IoSlice<'_>]) -> io::Result<ReadFixed> {
+        let fd = self.bounce_fd().map_err(io::Error::other)?;
+        // SAFETY: `bounce` owns the descriptor for the ring's lifetime.
+        let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        let total: usize = payload.iter().map(|s| s.len()).sum();
+        let len = u32::try_from(total)
+            .ok()
+            .filter(|_| total <= e.reply_cap().max(e.payload_cap))
+            .ok_or_else(|| io::Error::other(format!("a reply of {total} bytes")))?;
+        let at = u64::from(e.idx) * e.payload_cap as u64;
+        let mut written = 0usize;
+        let mut slices: SmallVec<[IoSlice<'_>; 4]> = payload.iter().copied().collect();
+        let mut rest: &mut [IoSlice<'_>] = &mut slices;
+        while written < total {
+            let n = nix::sys::uio::pwritev(file, &*rest, (at + written as u64) as libc::off_t)?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            written += n;
+            IoSlice::advance_slices(&mut rest, n);
+        }
+        Ok(ReadFixed {
+            src: ReadSource::Bounce,
+            offset: at,
+            len,
+        })
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the completion of entry `ud`'s `READ_FIXED`: its result
+    /// becomes the reply -- `res` bytes, now in the request's pages, or `-res` as the error --
+    /// and the entry's COMMIT_AND_FETCH is pushed. A short read of a bounced reply is `EIO`:
+    /// the memfd held all of it. `Err` only for a ring-level failure.
+    fn read_done(&self, io: &mut RingIo, ud: u64, res: i32) -> io::Result<()> {
+        let (qid, idx) = decode(ud);
+        let Some(e) = self.entries.get(idx as usize).filter(|e| e.qid == qid) else {
+            error!("io_uring: READ_FIXED CQE for unknown entry qid={qid} idx={idx}");
+            return Ok(());
+        };
+        let mut state = e.state.lock();
+        let commit_id = match &*state {
+            EntryState::Reading { commit_id, .. } => *commit_id,
+            other => {
+                error!(
+                    "io_uring: READ_FIXED CQE for qid {qid} entry {idx} which is {other:?}, not \
+                     reading"
+                );
+                return Ok(());
+            }
+        };
+        if res == -libc::EAGAIN || res == -libc::EINTR {
+            let EntryState::Reading { read, .. } = &*state else {
+                unreachable!("matched just above");
+            };
+            let sqe = self.read_sqe(e, read);
+            drop(state);
+            return match io.push_or_submit(&sqe) {
+                Err(err) if is_ring_failure(&err) => Err(err),
+                Err(err) => {
+                    self.retire(e, Some(err));
+                    Ok(())
+                }
+                Ok(()) => Ok(()),
+            };
+        }
+        let EntryState::Reading { read, .. } =
+            std::mem::replace(&mut *state, EntryState::InKernel { last: commit_id })
+        else {
+            unreachable!("matched just above");
+        };
+        drop(state);
+        if let ReadSource::Bounce = read.src {
+            if let Ok(fd) = self.bounce_fd() {
+                // SAFETY: `bounce` owns the descriptor for the ring's lifetime.
+                let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+                let punched = nix::fcntl::fallocate(
+                    file,
+                    nix::fcntl::FallocateFlags::FALLOC_FL_PUNCH_HOLE
+                        | nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                    read.offset as libc::off_t,
+                    libc::off_t::from(read.len),
+                );
+                if let Err(err) = punched {
+                    debug!("io_uring: releasing a bounced reply failed ({err})");
+                }
+            }
+        }
+        let len = read.len;
+        // A bounced reply is all in the memfd: fewer bytes than were written to it is a
+        // failure, not the end of a file, and must not reach the reader as a short read
+        let whole = matches!(read.src, ReadSource::Bounce);
+        drop(read);
+        // SAFETY: the entry is the ring thread's alone: its state names a command in the
+        // kernel, so no committer writes it, and the kernel holds no command for it until the
+        // commit below is pushed.
+        unsafe {
+            match u32::try_from(res) {
+                Ok(n) if n == len || (n < len && !whole) => {
+                    let header = abi::fuse_out_header {
+                        len: OUT_HEADER_SZ as u32 + n,
+                        error: 0,
+                        unique: commit_id,
+                    };
+                    e.write_header(header.as_bytes(), n);
+                }
+                Ok(n) => {
+                    error!(
+                        "io_uring: READ_FIXED of {len} bytes{} returned {n}; replying EIO",
+                        if whole { " of a bounced reply" } else { "" }
+                    );
+                    e.write_errno(commit_id, Errno::EIO);
+                }
+                Err(_) => e.write_errno(commit_id, Errno::from_i32(-res)),
+            }
+        }
+        match io.push_or_submit(&self.commit_sqe(e, commit_id)) {
+            Err(err) if is_ring_failure(&err) => Err(err),
+            Err(err) => {
+                error!(
+                    "io_uring: could not submit commit for unique {commit_id} on qid {qid}: \
+                     {err}; the kernel request will not complete"
+                );
+                self.retire(e, Some(err));
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
+    /// The buffers are written (or, CONSTELLATION PATCH (io-uring), a `READ_FIXED` is to
+    /// write them); queues the entry for the ring thread in state `next`.
+    fn hand_off_as(&self, e: &RingEntry, commit_id: u64, next: EntryState) {
         {
             let mut state = e.state.lock();
             let mut live = self.live.lock();
@@ -1353,7 +2267,7 @@ impl Ring {
             }
             dec(&mut live.outstanding, e, "outstanding");
             live.release_lock_wait(e);
-            *state = EntryState::Pending { commit_id };
+            *state = next;
             live.in_kernel += 1;
             live.pending.push(e.idx);
         }
@@ -1448,6 +2362,11 @@ impl Ring {
                     }
                     continue;
                 }
+                // CONSTELLATION PATCH (io-uring): a `READ_FIXED` into a request's pages
+                if ud & READ_TAG != 0 {
+                    self.read_done(io, ud & !READ_TAG, res)?;
+                    continue;
+                }
                 let (qid, idx) = decode(ud);
                 let Some(e) = self.entries.get(idx as usize).filter(|e| e.qid == qid) else {
                     error!("io_uring: CQE for unknown entry qid={qid} idx={idx}");
@@ -1519,6 +2438,11 @@ impl Ring {
 
     /// A CQE with `res == 0`: stage, dispatch, and finish whatever dispatch left behind.
     fn handle_fetch(self: &Arc<Self>, e: &RingEntry, handler: &mut dyn FetchHandler) {
+        // CONSTELLATION PATCH (io-uring): where this fetch's payload is, and whether it is
+        // served at all; see `locate_payload`
+        // SAFETY: the CQE for this entry just arrived, so the kernel is done writing the
+        // header and the request's payload buffer, and no reference into either exists.
+        let refusal = unsafe { self.locate_payload(e) };
         // SAFETY: the CQE for this entry just arrived, so the kernel is done writing the
         // stride and no reference into it exists.
         let staged = match unsafe { stage_request(e.base.0, e.gap, e.payload_cap) } {
@@ -1547,6 +2471,16 @@ impl Ring {
             }
         };
         let commit_id = staged.commit_id;
+        if let Some((kind, why)) = refusal {
+            // Once per kind of refusal, so a second kind still shows up in the log
+            static ONCE: [std::sync::Once; 3] = [const { std::sync::Once::new() }; 3];
+            ONCE[kind as usize].call_once(|| error!("io_uring: {why}; replying EIO (logged once)"));
+            // SAFETY: as above, the ring thread is the entry's only writer right now.
+            unsafe { e.write_errno(commit_id, Errno::EIO) };
+            *e.state.lock() = EntryState::Pending { commit_id };
+            self.live.lock().pending.push(e.idx);
+            return;
+        }
         {
             let mut state = e.state.lock();
             *state = EntryState::Dispatching {
@@ -1580,6 +2514,96 @@ impl Ring {
         self.finish_dispatch(e, commit_id, false);
     }
 
+    /// CONSTELLATION PATCH (io-uring): records where the reply of the fetch that just arrived
+    /// in `e` goes and whether the request was zero-copied, and on a queue with a pool copies
+    /// the request's payload from the pool buffer the kernel picked to the entry's own payload
+    /// buffer, where `stage_request` expects it to continue the staged header (a `FUSE_WRITE`'s
+    /// data is then one copy away from the kernel's, where without a pool it is none).
+    /// `Some(why)` refuses the request with `EIO`: a pool offset the kernel never hands out, a
+    /// payload larger than a pool buffer, or a zero-copied request that is not a read -- a
+    /// zero-copied write's data is only in the registered pages, which nothing here reads
+    /// (`ReplyOpen::opened_zero_copy` is for read-only opens).
+    ///
+    /// # Safety
+    ///
+    /// The entry's fetch CQE just arrived and no reference into its buffers exists.
+    ///
+    /// A request the kernel gives no pool buffer (nothing to copy either way: `FLUSH`,
+    /// `RELEASE`, `FSYNC`, ...) arrives at offset 0, indistinguishable from the pool's first
+    /// buffer, which another entry may hold. Its `reply_cap` is 0 (`has_out_args`), so a reply
+    /// with a payload becomes `EINVAL` in `write_reply` rather than landing in that buffer.
+    unsafe fn locate_payload(&self, e: &RingEntry) -> Option<(Refusal, String)> {
+        let own = e.own_payload();
+        let Some(pools) = self.pools.get() else {
+            e.reply_at.store(own, Ordering::Relaxed);
+            e.reply_cap.store(e.payload_cap, Ordering::Relaxed);
+            e.zero_copied.store(false, Ordering::Relaxed);
+            return None;
+        };
+        let base = e.base.0.as_ptr();
+        // SAFETY: the trailer fields lie inside the entry's header area; the reads are
+        // unaligned so no reference is formed over kernel-shared memory.
+        let (flags, offset, payload_sz, opcode) = unsafe {
+            (
+                ptr::read_unaligned(base.add(FLAGS_OFFSET).cast::<u64>()),
+                ptr::read_unaligned(base.add(POOL_OFFSET_OFFSET).cast::<u32>()),
+                ptr::read_unaligned(base.add(PAYLOAD_SZ_OFFSET).cast::<u32>()),
+                ptr::read_unaligned(base.add(4).cast::<u32>()),
+            )
+        };
+        let queue = pools.queues.get(e.queue as usize).copied();
+        let zero_copied =
+            queue.is_some_and(|q| q.zero_copy) && flags & abi::FUSE_URING_ENT_ZERO_COPY != 0;
+        let buf_size = pools.mem.buf_size();
+        e.zero_copied.store(zero_copied, Ordering::Relaxed);
+        e.reply_at.store(own, Ordering::Relaxed);
+        let reply_cap = if has_out_args(opcode) {
+            buf_size.min(e.payload_cap)
+        } else {
+            0
+        };
+        e.reply_cap.store(reply_cap, Ordering::Relaxed);
+        let Some(buf) = pools.mem.buffer(e.queue as usize, offset) else {
+            return Some((
+                Refusal::Offset,
+                format!(
+                    "the kernel put a request of qid {} at offset {offset} of its pool, which \
+                     is not one of its buffers",
+                    e.qid
+                ),
+            ));
+        };
+        e.reply_at.store(buf.as_ptr(), Ordering::Relaxed);
+        if zero_copied {
+            return (opcode != abi::fuse_opcode::FUSE_READ as u32).then(|| {
+                (
+                    Refusal::ZeroCopied,
+                    format!(
+                        "the kernel zero-copied a request with opcode {opcode} on qid {}, \
+                         which this crate does not serve: only reads of a \
+                         FOPEN_IO_URING_ZERO_COPY open can be answered from the request's pages",
+                        e.qid
+                    ),
+                )
+            });
+        }
+        let len = payload_sz as usize;
+        if len > buf_size.min(e.payload_cap) {
+            return Some((
+                Refusal::Oversize,
+                format!(
+                    "a request of qid {} claims a {len} byte payload, more than a {buf_size} \
+                     byte pool buffer",
+                    e.qid
+                ),
+            ));
+        }
+        // SAFETY: `len` bytes lie inside both the pool buffer and the entry's own payload
+        // buffer, which are separate mappings; the caller's guarantee covers both.
+        unsafe { ptr::copy_nonoverlapping(buf.as_ptr(), own, len) };
+        None
+    }
+
     /// The end of a dispatch: a reply stashed during it is written now, a request the
     /// filesystem was given no reply object for is answered with an empty one, and otherwise
     /// the entry waits for its reply as `Dispatched`. Run by the ring thread right after its
@@ -1590,10 +2614,31 @@ impl Ring {
         let reply: Option<(Vec<u8>, u64)> = {
             let mut state = e.state.lock();
             match &mut *state {
-                EntryState::Deferred { bytes, commit_id } => {
+                EntryState::Deferred {
+                    reply: Stashed::Bytes(bytes),
+                    commit_id,
+                } => {
                     let reply = (std::mem::take(&mut bytes.0), *commit_id);
                     *state = EntryState::Committing;
                     Some(reply)
+                }
+                // CONSTELLATION PATCH (io-uring): a `read_fixed` made while the request was
+                // held goes to the ring thread now
+                EntryState::Deferred {
+                    reply: Stashed::Read(_),
+                    commit_id,
+                } => {
+                    let commit_id = *commit_id;
+                    let EntryState::Deferred {
+                        reply: Stashed::Read(read),
+                        ..
+                    } = std::mem::replace(&mut *state, EntryState::Committing)
+                    else {
+                        unreachable!("matched just above");
+                    };
+                    drop(state);
+                    self.hand_off_read(e, commit_id, read);
+                    return;
                 }
                 EntryState::Dispatching {
                     reply_taken: false, ..
@@ -1613,7 +2658,10 @@ impl Ring {
                     None
                 }
                 // A reply already happened, or another thread is writing one right now
-                EntryState::Pending { .. } | EntryState::Committing => None,
+                EntryState::Pending { .. }
+                | EntryState::PendingRead { .. }
+                | EntryState::Reading { .. }
+                | EntryState::Committing => None,
                 // The ring exited while a held dispatch ran; a reply would have nowhere to go
                 EntryState::Dead if held => None,
                 other @ (EntryState::InKernel { .. }
@@ -1628,9 +2676,8 @@ impl Ring {
         };
         if let Some((bytes, commit_id)) = reply {
             let (header, payload) = bytes.split_at(bytes.len().min(OUT_HEADER_SZ));
-            // SAFETY: `Committing`, and the request slice is gone.
-            unsafe { e.write_reply(commit_id, &[IoSlice::new(header), IoSlice::new(payload)]) };
-            self.hand_off(e, commit_id);
+            // `Committing`, and the request slice is gone
+            self.deliver(e, commit_id, &[IoSlice::new(header), IoSlice::new(payload)]);
         }
     }
 }
@@ -1643,10 +2690,16 @@ impl Drop for Ring {
         if in_kernel == 0 {
             // SAFETY: dropped exactly once, here, and never used afterwards.
             unsafe { ManuallyDrop::drop(&mut self.mem) };
+            // CONSTELLATION PATCH (io-uring): the pools, likewise
+            if let Some(pools) = self.pools.get_mut() {
+                // SAFETY: as above.
+                unsafe { ManuallyDrop::drop(&mut pools.mem) };
+            }
         } else {
             error!(
-                "io_uring: leaking {} bytes of ring buffers because {in_kernel} commands are \
-                 still pending in the kernel",
+                "io_uring: ring {} leaking {} bytes of ring buffers because {in_kernel} \
+                 commands are still pending in the kernel",
+                self.index,
                 self.mem.len()
             );
         }
@@ -1820,6 +2873,8 @@ pub(crate) mod test {
             EntryState::Dispatched { .. } => "Dispatched",
             EntryState::Committing => "Committing",
             EntryState::Pending { .. } => "Pending",
+            EntryState::PendingRead { .. } => "PendingRead",
+            EntryState::Reading { .. } => "Reading",
             EntryState::Dead => "Dead",
         }
     }
@@ -2870,7 +3925,13 @@ pub(crate) mod test {
         let ring = fake_ring(2, true);
         ring.ring_thread.set(thread::current().id()).ok();
         for idx in 0..2 {
-            fake_fetch(&ring.entries[idx], 20 + idx as u64, fuse_opcode::FUSE_FLUSH, &[0u8; 24], &[]);
+            fake_fetch(
+                &ring.entries[idx],
+                20 + idx as u64,
+                fuse_opcode::FUSE_FLUSH,
+                &[0u8; 24],
+                &[],
+            );
             set_in_kernel(&ring, idx, 0);
         }
         let mut held = Vec::new();
@@ -3156,7 +4217,7 @@ pub(crate) mod test {
             .unwrap();
         match &*e.state.lock() {
             EntryState::Deferred {
-                bytes,
+                reply: Stashed::Bytes(bytes),
                 commit_id: 33,
             } => {
                 assert_eq!(bytes.0.len(), 16);
@@ -3301,7 +4362,10 @@ pub(crate) mod test {
         assert!(live.pending.is_empty());
         assert_eq!(errno_of(live.fatal.as_ref().unwrap()), Some(libc::EBUSY));
         drop(live);
-        assert!(io.uring().submission().is_full(), "the SQE was never pushed");
+        assert!(
+            io.uring().submission().is_full(),
+            "the SQE was never pushed"
+        );
 
         // A ring-level errno from the room-making submit ends the loop with the entry neither
         // pushed nor retired, which is why the mapping is then leaked
@@ -3825,12 +4889,12 @@ pub(crate) mod test {
             "RingCommit { ring: 7, idx: 0, commit_id: 5 }"
         );
         let deferred = EntryState::Deferred {
-            bytes: ReplyBytes(vec![0xAB; 4096]),
+            reply: Stashed::Bytes(ReplyBytes(vec![0xAB; 4096])),
             commit_id: 8,
         };
         assert_eq!(
             format!("{deferred:?}"),
-            "Deferred { bytes: 4096 bytes, commit_id: 8 }"
+            "Deferred { reply: Bytes(4096 bytes), commit_id: 8 }"
         );
         assert_eq!(
             format!("{:?}", EntryState::InKernel { last: 0 }),

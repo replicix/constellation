@@ -124,6 +124,15 @@ pub(crate) fn fallback_reported(c: &Client, expected: Option<&str>) -> Result<St
     Ok(reason)
 }
 
+/// Whether `transport` (as `node.status` names it) is a ring: `uring`,
+/// or `uring_zc` where the kernel offers buffer pools (7.3+) and the
+/// daemon has `CAP_SYS_ADMIN` (plan 38 Z4) — the same rung of the
+/// ladder for every scenario here, which asks for the ring, not for
+/// zero-copy.
+pub(crate) fn is_ring(transport: &str) -> bool {
+    matches!(transport, "uring" | "uring_zc")
+}
+
 /// The transport `node.status` reports for the daemon's one mount
 /// (`dev_fuse` / `uring` / `uring_zc`, plan 38 §5).
 fn negotiated_transport(c: &Client) -> Result<String> {
@@ -397,7 +406,7 @@ fn control_round(c: &mut Client, seed: u64) -> Result<()> {
     c.mount()?;
     let negotiated = negotiated_transport(c)?;
     ensure!(
-        negotiated == "uring",
+        is_ring(&negotiated),
         "without the fault this host and binary must grant the ring, got {negotiated}\n{}",
         c.tail_log()
     );
@@ -482,12 +491,25 @@ pub fn transport_seccomp_denied(seed: u64) -> Result<()> {
 /// on its own; but the session maps every ring's before it serves, so the
 /// mapping that crosses the limit fails, the mount falls back, and nothing
 /// else in the daemon notices the limit.
+///
+/// Zero-copy queues are off for that round (plan 38 Z4a): the arithmetic is
+/// the plain ring's, 16 MiB of `max_write` per entry. A daemon that may use
+/// zero-copy (root on 7.3+) lowers `max_write` to one request's pages
+/// (1 MiB) and maps buffer pools besides, so the same limit would cut
+/// somewhere else. That is the second round, run where the daemon does get
+/// `uring_zc` (root, a 7.3+ kernel; anywhere else it says why it is
+/// skipped): zero-copy `auto`, the limit placed so that the ring's own
+/// entries fit and its buffer pools -- which fuser maps last for exactly
+/// this reason -- do not. The rung that gives way is zero-copy, not the
+/// ring: the mount comes up on plain `uring`, with no fallback recorded and
+/// the reason logged once.
 pub fn transport_enomem_ring(seed: u64) -> Result<()> {
     const DEPTH: u64 = 64;
     let (env, root) = setup("transport-enomem-ring")?;
     let _proxy = env.s3_proxy()?;
     let mut c = ring_client(&env, root.path(), "transport-enomem-ring")?
-        .with_env("CONSTELLATION_FUSE_URING_QUEUE_DEPTH", &DEPTH.to_string());
+        .with_env("CONSTELLATION_FUSE_URING_QUEUE_DEPTH", &DEPTH.to_string())
+        .with_env("CONSTELLATION_FUSE_URING_ZERO_COPY", "off");
     let result = (|| -> Result<()> {
         control_round(&mut c, seed)?;
         // What the daemon needs without a ring, under the same workload.
@@ -511,11 +533,103 @@ pub fn transport_enomem_ring(seed: u64) -> Result<()> {
             limit >> 20
         );
         c.set_address_space_limit(Some(limit));
-        fallback_round(&mut c, seed, &["ring buffers failed", "ENOMEM"])
+        fallback_round(&mut c, seed, &["ring buffers failed", "ENOMEM"])?;
+        c.set_address_space_limit(None);
+        enomem_zero_copy_round(&mut c, seed, peak, DEPTH, cpus)
     })();
     c.set_address_space_limit(None);
     let _ = c.unmount();
     result
+}
+
+/// [`transport_enomem_ring`]'s second round: the address-space limit cuts
+/// the buffer pools of zero-copy `auto`, and only them.
+fn enomem_zero_copy_round(
+    c: &mut Client,
+    seed: u64,
+    peak: u64,
+    depth: u64,
+    cpus: u64,
+) -> Result<()> {
+    const WHY: &str = "io_uring zero-copy unavailable";
+    let zero_copy_lines = |c: &Client| {
+        c.log_text()
+            .lines()
+            .filter(|l| l.contains(WHY))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    c.set_env("CONSTELLATION_FUSE_URING_ZERO_COPY", "auto");
+    c.mount()?;
+    let negotiated = negotiated_transport(c)?;
+    c.unmount()?;
+    if negotiated != "uring_zc" {
+        let why = zero_copy_lines(c);
+        eprintln!(
+            "    zero-copy round skipped: the daemon negotiated {negotiated} with zero-copy auto \
+             (needs root -- CAP_SYS_ADMIN -- and a kernel with io_uring buffer pools, 7.3+){}",
+            why.first()
+                .map(|l| format!("; {}", l.trim()))
+                .unwrap_or_default()
+        );
+        return Ok(());
+    }
+    ensure!(
+        zero_copy_lines(c).is_empty(),
+        "zero-copy refused without a limit"
+    );
+    // A pool buffer, and an entry's payload, is one request's pages
+    let pages: u64 = std::fs::read_to_string("/proc/sys/fs/fuse/max_pages_limit")?
+        .trim()
+        .parse()?;
+    let page = 4096;
+    let buf = pages.min(4096) * page;
+    let entries = cpus * depth * (buf + page);
+    let pools = cpus * depth * buf;
+    let limit = peak + entries + pools / 2;
+    eprintln!(
+        "    zero-copy auto: entries {} MiB, buffer pools {} MiB ({cpus} queues x {depth} x {} \
+         KiB); RLIMIT_AS {} MiB",
+        entries >> 20,
+        pools >> 20,
+        buf >> 10,
+        limit >> 20
+    );
+    let before = downgrades(c).len();
+    c.set_address_space_limit(Some(limit));
+    c.mount_within(Duration::from_secs(60))
+        .context("a mount whose buffer pools were refused must still come up")?;
+    let negotiated = negotiated_transport(c)?;
+    ensure!(
+        negotiated == "uring",
+        "the pools refused, the mount negotiated {negotiated} rather than plain uring\n{}",
+        c.tail_log()
+    );
+    let mount = fuse_mount(c)?;
+    ensure!(
+        mount["last_fallback"].is_null(),
+        "giving up zero-copy is not a transport fallback: {mount}"
+    );
+    serve_check(&c.mnt, seed + 2, "zero-copy-refused")?;
+    ensure!(
+        downgrades(c).len() == before,
+        "the ring itself was refused:\n{}",
+        downgrades(c).join("\n")
+    );
+    let lines = zero_copy_lines(c);
+    ensure!(
+        lines.len() == 1 && lines[0].contains("buffer pools failed") && lines[0].contains("ENOMEM"),
+        "expected the pools' ENOMEM logged exactly once:\n{}",
+        lines.join("\n")
+    );
+    eprintln!(
+        "    pools refused, plain uring, logged once: {}",
+        lines[0].trim()
+    );
+    no_alarms(c)?;
+    c.unmount()?;
+    c.set_address_space_limit(None);
+    Ok(())
 }
 
 fn vm_peak(pid: u32) -> Result<u64> {
@@ -559,7 +673,7 @@ pub fn transport_abort_while_armed(seed: u64) -> Result<()> {
         c.mount()?;
         let negotiated = negotiated_transport(&c)?;
         ensure!(
-            negotiated == "uring",
+            is_ring(&negotiated),
             "auto negotiated {negotiated} on a ring host"
         );
         serve_check(&c.mnt, seed, "armed")?;
@@ -659,10 +773,7 @@ pub fn transport_abort_while_armed(seed: u64) -> Result<()> {
         no_alarms(&c)?;
         // The mountpoint is reusable, on the ring again.
         c.mount()?;
-        ensure!(
-            negotiated_transport(&c)? == "uring",
-            "the remount fell back"
-        );
+        ensure!(is_ring(&negotiated_transport(&c)?), "the remount fell back");
         serve_check(&c.mnt, seed + 1, "after-abort")?;
         c.unmount()
     })();
@@ -739,7 +850,7 @@ pub fn transport_cluster_locks_auto(seed: u64) -> Result<()> {
         let mount = fuse_mount(&c)?;
         if ring_host {
             ensure!(
-                negotiated == "uring" && mount["last_fallback"].is_null(),
+                is_ring(&negotiated) && mount["last_fallback"].is_null(),
                 "auto with local locks on a ring host negotiated {negotiated}: {mount}"
             );
             ensure!(
@@ -767,7 +878,7 @@ pub fn transport_cluster_locks_auto(seed: u64) -> Result<()> {
         let mount = fuse_mount(&c)?;
         if ring_host {
             ensure!(
-                negotiated == "uring" && mount["last_fallback"].is_null(),
+                is_ring(&negotiated) && mount["last_fallback"].is_null(),
                 "uring with cluster locks on a ring host negotiated {negotiated}: {mount}"
             );
             ensure!(
@@ -943,7 +1054,7 @@ fn lock_wait_round(c: &Client, depth: u64, extra: u64, round: &str) -> Result<u6
     use std::process::{Child, Command, Stdio};
     let mount = fuse_mount(c)?;
     ensure!(
-        mount["transport"] == "uring",
+        mount["transport"].as_str().is_some_and(is_ring),
         "the cluster-lock mount must be on the ring here: {mount}"
     );
     ensure!(

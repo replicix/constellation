@@ -505,7 +505,7 @@ This patch is where that refusal lives:
 
 - New public `Transport { DevFuse, Uring, UringZeroCopy }` (`Display` and
   `name()` for logs, metric labels and error text). `UringZeroCopy` is a
-  declared-but-never-negotiated placeholder for plan 38 Z4.
+  ring session whose queues are all zero-copy queues (plan 38 Z4a, below).
 - `NegotiatedInit` gains `transport: Transport`, set by the handshake to
   whatever the session ended up with. `Session::transport()` reports it.
   The field is `#[serde(default)]` (to `DevFuse`, which is what every
@@ -527,6 +527,298 @@ are **not** behind `#[cfg(feature = "io-uring")]`, deliberately: a build
 *without* the feature must still refuse to resume a connection a build
 *with* it negotiated over a ring, rather than silently read `/dev/fuse` and
 hang.
+
+### Plan 38 Z4a: zero-copy queues on 7.3 (ABI 7.46)
+
+Plan 38 §3(d) and milestone Z4, fuser side. A session that gets the ring
+also tries **zero-copy queues** when the kernel offers buffer pools and the
+process has `CAP_SYS_ADMIN`; `Transport::UringZeroCopy` is what it then
+negotiates. A filesystem marks an open for zero-copy with
+`ReplyOpen::opened_zero_copy` and answers its reads with
+`ReplyData::read_fixed(fd, offset, len)`. Routing Constellation's reads to it
+is plan 38 Z4b; nothing in `crates/frontend-fuse` opens a file for zero-copy
+yet.
+
+#### The ABI, re-verified against the running kernel (2026-10-02)
+
+The plan assumed (REPORTED, from Joanne Koong's `[PATCH v7 0/6] fuse: add
+io-uring buffer pools`) that this ABI lands in 7.3. It does. The zero-copy
+box runs `7.3.0-0.rc4.260925g165768bb7026.42.fc46.x86_64` (Fedora Rawhide,
+`fuse.enable_uring=Y`, `CONFIG_FUSE_IO_URING=y`). The constants and structs
+below are copied from `include/uapi/linux/fuse.h` of that exact commit
+(`torvalds/linux` `165768bb70265b5c38cf0b73fafd75be235f8b14`, `Makefile`
+`7.3.0-rc4`, `FUSE_KERNEL_MINOR_VERSION 46`). The installed
+`kernel-headers-7.3.0-0.rc5` `/usr/include/linux/fuse.h` is identical apart
+from the `#ifdef __KERNEL__` include guard.
+
+| Item | Value (uapi) | Where this patch uses it |
+|---|---|---|
+| ABI version | 7.46: "add `FUSE_IO_URING_CMD_ADD_QUEUE`, `FUSE_HAS_IO_URING_BUFPOOL`, `fuse_uring_cmd_req` bufpool struct, bufpool offset field to `fuse_uring_ent_in_out`, `FUSE_URING_ZERO_COPY`, `FUSE_URING_ENT_ZERO_COPY` and `FOPEN_IO_URING_ZERO_COPY`" | `ll/fuse_abi.rs` |
+| `FUSE_IO_URING_CMD_ADD_QUEUE` | `3` (`enum fuse_uring_cmd`) | `fuse_uring_cmd`, `Ring::add_queue_sqe` |
+| `FUSE_IO_URING_CMD_ADD_BUFPOOL` | `4` | `fuse_uring_cmd`, `Ring::add_bufpool_sqe` |
+| `FUSE_URING_ZERO_COPY` | `(1 << 0)`, `fuse_uring_cmd_req.flags` of an `ADD_QUEUE`; "only supported for queues with bufpools on privileged servers" | `abi::FUSE_URING_ZERO_COPY` |
+| `FUSE_URING_ENT_ZERO_COPY` | `(1 << 0)`, `fuse_uring_ent_in_out.flags` on fetch: "the ent's payload is zero-copied" | `abi::FUSE_URING_ENT_ZERO_COPY` |
+| `FUSE_HAS_IO_URING_BUFPOOL` | `(1ULL << 43)`, INIT flag: "kernel supports io-uring buffer pools" | `InitFlags::FUSE_HAS_IO_URING_BUFPOOL` |
+| `FOPEN_IO_URING_ZERO_COPY` | `(1 << 8)`; "Honored only when the serving io-uring queue was set up for zero-copy (`FUSE_URING_ZERO_COPY`) and the request carries page payload. Otherwise reads/writes fall back to copying." | `FopenFlags::FOPEN_IO_URING_ZERO_COPY` |
+| `struct fuse_uring_ent_in_out` | `u64 flags; u64 commit_id; u32 payload_sz; u32 offset; u64 reserved` (`offset`: "Offset into the bufpool, if bufpools are used"; 7.42's `padding`) | `fuse_uring_ent_in_out::offset`, `mem::POOL_OFFSET_OFFSET` (276) |
+| `struct fuse_uring_cmd_req` | `u64 flags; u64 commit_id; u16 qid; u8 padding[6]; union { struct { u64 uaddr; u32 len; u32 reserved; } bufpool; u16 ent_zero_copy_buf_index; }` | `FUSE_URING_CMD_REQ_UNION_OFFSET` (24), `fuse_uring_bufpool` |
+| `IORING_URING_CMD_FIXED` | `(1U << 0)` in `sqe->uring_cmd_flags` (`include/uapi/linux/io_uring.h`) | set by `io-uring`'s `UringCmd80::buf_index(Some(_))` |
+| `IORING_OP_READ_FIXED` | `4` | `opcode::ReadFixed` |
+
+And from `fs/fuse/dev_uring.c` at the same commit (source reading), the
+behaviour the code relies on:
+
+- **`ADD_QUEUE`** (`fuse_uring_add_queue`): `-EINVAL` for an unknown flag or
+  `qid >= nr_queues`; **`-EPERM` for `FUSE_URING_ZERO_COPY` without
+  `capable(CAP_SYS_ADMIN)`** (checked in the initial user namespace);
+  `-EEXIST` for a queue that already exists (a REGISTER creates a missing
+  queue itself, without zero-copy). Completes inline, never `-EIOCBQUEUED`.
+- **`ADD_BUFPOOL`** (`fuse_uring_add_bufpool`): the queue must exist (so
+  after `ADD_QUEUE`) and have no payload mode yet (so before its first
+  REGISTER); `flags` and `reserved` must be 0; the pool is cut into
+  `len / max_payload_sz` buffers; it is *registered* iff the SQE carries
+  `IORING_URING_CMD_FIXED`, and `sqe->buf_index` is then its fixed-buffer
+  index, which **every REGISTER and COMMIT_AND_FETCH of that queue must name
+  again** (`fuse_uring_cmd_index_ok`). The fixed buffer is only looked up
+  when a payload is imported, in the ring the command came from.
+- **REGISTER on a pool queue** must name an empty payload iovec; **a
+  zero-copy queue refuses an entry without a pool** ("Can only use zero copy
+  with bufpools", `-EINVAL`), and `ent_zero_copy_buf_index` must be 0 on a
+  queue that is not zero-copy.
+- **The zero-copy read** (`fuse_uring_set_up_zero_copy`, `can_zero_copy_req`):
+  only `FUSE_READ`/`FUSE_WRITE` with page arguments, of an open whose
+  `FOPEN_IO_URING_ZERO_COPY` was set, on a zero-copy queue. The kernel
+  registers the request's folios (pinned user pages under `O_DIRECT`, page
+  cache folios otherwise) with `io_buffer_register_bvec` into the entry's
+  slot of the **issuing ring's** buffer table, sets `FUSE_URING_ENT_ZERO_COPY`
+  and selects no pool buffer for a read (nothing copyable). A
+  kernel-registered buffer starts at address 0, so `READ_FIXED` names offsets
+  into the request's pages. On commit the kernel skips the folio copy
+  (`skip_folio_copy`) and takes `payload_sz` as the reply's length; the slot
+  is unregistered when the request ends. Writes are zero-copied the same way:
+  their data is only in the registered pages.
+- **A failed `ADD_QUEUE` or `ADD_BUFPOOL` does not disable the ring** (only a
+  failed REGISTER sets `fch->io_uring = 0`, Z0a's trap): the command returns
+  its error with a `pr_info_once`, and the connection is still a ring
+  connection. What *does* trap is the order: a queue created for zero-copy
+  refuses an entry with its own payload buffer, and that refusal is a failed
+  REGISTER. So every decision is made before the first REGISTER (below).
+
+**Observed on the real kernel** (`session::uring_test::read_fixed_serves_a_real_mount_on_whatever_transport_it_gets`,
+run as root inside `unshare -U -r -m`, where `CapEff` shows `CAP_SYS_ADMIN`
+but the kernel's `capable()` does not): the first zero-copy `ADD_QUEUE` came
+back `-EPERM` synchronously (dmesg: `FUSE_IO_URING_CMD_ADD_QUEUE failed
+err=-1`, once), the session logged `io_uring zero-copy unavailable: the
+kernel refused zero-copy queue 0 (Operation not permitted (os error 1));
+serving io_uring without it` once, registered every entry with its own
+payload buffer, and the mount served `dd iflag=direct` and buffered reads
+byte for byte on plain `Uring`. In the same namespace with the pool
+registered, the first refusal is the buffer table's: pinning the pool is
+charged to `RLIMIT_MEMLOCK` there (`ENOMEM`), and the session degraded the
+same way.
+
+**Operator-visible:** a session that tries zero-copy negotiates `max_write`
+= `max_pages x PAGE_SIZE` (1 MiB at the default `max_pages_limit` of 256),
+not fuser's 16 MiB, so the INIT reply, `NegotiatedInit::max_write` and the
+daemon's own debug line (`INIT response: ... max write 1048576`) say 1 MiB on
+a `uring_zc` mount -- and on a mount that tried zero-copy and degraded to
+`uring`, since the value is settled before the INIT reply. No request changes
+size (the kernel never sends more than `max_pages` pages). Neither
+`node.status` nor the harness's transport census reports `max_write` today.
+
+#### What the patch does
+
+- **Negotiation** (`Session::zero_copy_plan`, at INIT, before the reply):
+  tried only when `Config::io_uring_zero_copy` (default `true`), the kernel's
+  INIT offers `FUSE_HAS_IO_URING_BUFPOOL` (never assumed from a version) and
+  the process has `CAP_SYS_ADMIN` (`capget(2)`; an `InMemoryRingKernel` stands
+  in for it in tests). Each "no" is a debug line, not a failure: without the
+  capability nothing is attempted at all.
+- **Pool sizing** (plan 38 §4): a pool buffer is the kernel's
+  `max_payload_sz = max(8192, max_write, max_pages * PAGE_SIZE)`, with
+  `max_pages` as the kernel holds it (clamped to
+  `/proc/sys/fs/fuse/max_pages_limit`, or 32 without `FUSE_MAX_PAGES`). It must
+  be exact (`PoolMemory`): the kernel reports a buffer by its byte offset and a
+  reply written past it would land in the next one. A session that tries
+  zero-copy lowers `max_write` to `max_pages * PAGE_SIZE` first, because no
+  read or write request carries more than `max_pages` pages whatever
+  `max_write` says: fuser's default 16 MiB `max_write` becomes 1 MiB (256
+  pages), which changes no request and keeps each buffer the size of a
+  request. Each queue gets `depth` buffers (`io_uring_queue_depth x
+  max_payload_sz`), so a request is never held back for want of a buffer that
+  plain `Uring` would have had. One mapping per ring (per worker) holds its
+  queues' pools, mapped after everything else the ring needs (entries, ring
+  threads), so a limited address space (`RLIMIT_AS`) costs zero-copy before
+  it costs the ring. Slot `i + 1` of the ring's buffer table is entry `i`'s
+  zero-copy slot (libfuse's draft uses the same layout).
+- **Registered or not** (`Config::io_uring_register_pool`, **default
+  `false`**). Unregistered, the pool is plain memory the kernel imports per
+  request (`import_ubuf`, `fs/fuse/dev_uring.c`): no `IORING_URING_CMD_FIXED`,
+  no `buf_index` on REGISTER/COMMIT_AND_FETCH, nothing pinned up front. Its
+  pages become resident as requests first use them **and are never given
+  back**, so a busy session converges on the whole pool, `possible CPUs x
+  depth x max_payload_sz` (256 MiB at 32 CPUs, depth 8, 1 MiB; 1 GiB at depth
+  32) -- measured below. Registered (`true`, Constellation's `pinned`), the
+  pool is the fixed buffer at index 0 of the ring's buffer table, every page
+  pinned and resident from the mount on and charged to `RLIMIT_MEMLOCK`
+  without `CAP_IPC_LOCK`; the kernel then skips the per-request import.
+- **Setup before the first REGISTER** (`Ring::set_up_table`,
+  `Ring::set_up_queues`, `RingSet::start`), three session-wide barriers:
+  each ring thread, once enabled, registers its buffer table and reports;
+  only if **every** ring's table was taken does any ring go on (otherwise
+  every ring withdraws its table, nothing having been created in the kernel),
+  sending `ADD_QUEUE(FUSE_URING_ZERO_COPY)` for its first queue, then the
+  rest, then `ADD_BUFPOOL` for every queue; `RingSet::start` waits for every
+  ring's outcome, settles the session's transport, tells every ring
+  (`Ring::set_session_zero_copy`) and logs it once, and only then lets any
+  ring register. So the likeliest refusal -- a table the process may not pin
+  or account (`ENOMEM`) -- can never leave one ring zero-copy and another not:
+  one session, one transport, and `ReplyData::transport` reports the
+  session's on every reply. A refused table or first `ADD_QUEUE` leaves
+  nothing in the kernel: the entries register with their own payload buffers
+  (plain `Uring`), and the reason is logged once. Past the first queue
+  the ring is committed to pools (a zero-copy queue accepts nothing else): a
+  later queue the kernel only creates without zero-copy, or a pool it only
+  takes unregistered, is a note in that one log line (the session is then
+  `Uring` resp. still `UringZeroCopy`); only a queue or pool refused outright
+  fails the session's constructor with `RegistrationRefused`, as a refused
+  REGISTER does, so the caller's existing fallback (a fresh mount on
+  `/dev/fuse`) applies.
+- **Fetches on a pool queue** (`Ring::locate_payload`): the reply goes to the
+  pool buffer the kernel picked (`fuse_uring_ent_in_out.offset`), and a
+  request's payload is copied from it to the entry's own buffer, where the
+  staged header continues into it as before (`stage_request` is unchanged).
+  A request the kernel gave no buffer (nothing to copy either way: `FLUSH`,
+  `RELEASE`, `FSYNC`, ... -- `fuse_uring_req_has_copyable_payload`) arrives
+  at offset 0, indistinguishable from the pool's first buffer, which another
+  entry may hold; an opcode whose reply the kernel reads no payload from
+  (`has_out_args`) therefore gets a reply capacity of 0, so a reply with a
+  payload is `EINVAL` (`write_reply`) rather than a write into that buffer.
+  Each kind of refused fetch (bad offset, oversized payload, zero-copied
+  non-read) is logged once on its own.
+  The trade-off, stated: a `FUSE_WRITE`'s data is one copy away from the
+  kernel's on a pool queue, where an entry's own buffer lends it with none.
+  A zero-copied request that is not a read is answered `EIO`, logged once:
+  its data is only in the registered pages, which nothing here hands to
+  `Filesystem::write` (`opened_zero_copy` is documented as read-only opens
+  only).
+- **`ReplyData::read_fixed(src, offset, len)`** (`RingCommit::read_fixed`):
+  on a zero-copied request the entry goes `PendingRead` -> `Reading` (two new
+  states, counted `in_kernel`, so the ring never exits under a read), the ring
+  thread pushes one `IORING_OP_READ_FIXED` from `src` into the entry's slot
+  (`user_data` bit 63), and its completion writes the out header and
+  `payload_sz = res` (or the error) and pushes the COMMIT_AND_FETCH. `src` is
+  owned until then. Callable from any thread, like `fill`: a foreign caller
+  queues the read and wakes the ring thread. Anywhere else -- `/dev/fuse`, a
+  ring without zero-copy, a read the kernel did not zero-copy -- it is a
+  `pread(2)` into the reply buffer through `fill_with`. A read stashed while
+  its request is held (`Stashed::Read`) goes out from `finish_dispatch`.
+- **Any other reply to a zero-copied request** (`data`, `fill`, `gather`,
+  which is what Constellation's adapter sends today) is bounced into the
+  pages (`Ring::bounce_in`): written into a per-ring memfd at the entry's own
+  range, then one `READ_FIXED` from it, the range punched out afterwards. A
+  short `READ_FIXED` from the memfd is `EIO`, never a truncated reply (from
+  the caller's file a short read is the end of the file and is replied as
+  such). Two copies instead of a ring's one; this is the path plan 38 §3(d) leaves to
+  chunk-spanning reads, and it means `opened_zero_copy` can never make a reply
+  silently wrong. (libfuse's draft bounces through a pipe, whose capacity a
+  1 MiB reply exceeds.)
+- **`ReplyOpen::opened_zero_copy(fh, flags)`** sets `FOPEN_IO_URING_ZERO_COPY`;
+  **`ReplyData::zero_copy()`** says whether this request's pages are
+  registered; **`ReplyData::transport()`** reports `UringZeroCopy` on a
+  session whose queues all are.
+- `Transport::UringZeroCopy` is negotiated now: `Session::transport()` and
+  `NegotiatedInit::transport` (updated after `start`) report it, and
+  `check_resumable`/`detacher` refuse it like `Uring`.
+
+#### Tests
+
+- `InMemoryRingKernel::with_buffer_pools(capable)` models a 7.3 kernel:
+  `ADD_QUEUE`/`ADD_BUFPOOL` (with `EPERM` for an incapable process and knobs
+  to refuse zero-copy queues, registered pools or one ring's buffer table, and
+  to make every `READ_FIXED` short), pool buffers and their offsets, the
+  fixed-index check, the buffer table, `send_zero_copy` (a read whose data the
+  "kernel" expects in registered pages) and `READ_FIXED` served with
+  `pread(2)`.
+- `session::uring_test`: `zero_copy_queues_serve_reads_through_registered_pages`
+  (once with the pools unregistered, the default, once registered:
+  `read_fixed`, short at EOF; `data`/`gather` bounced; a read not
+  zero-copied is a `pread`; getattr and a write's payload through pool
+  buffers; a zero-copied write answered `EIO`; `max_write` lowered; every
+  reply's transport `UringZeroCopy`),
+  `without_buffer_pools_or_cap_sys_admin_the_ring_is_plain` (an INIT without
+  `FUSE_HAS_IO_URING_BUFPOOL` -- a 7.0-7.2 kernel -- and a process without
+  the capability: no `ADD_QUEUE`, no pool, plain `Uring`),
+  `a_refused_zero_copy_queue_degrades_to_plain_uring_before_any_register`,
+  `a_refused_registered_pool_is_handed_over_unregistered`,
+  `a_refused_buffer_table_on_one_ring_keeps_every_ring_plain` (ring 1's table
+  `ENOMEM` after ring 0's was taken: ring 0 withdraws it, no queue anywhere is
+  zero-copy, every reply says `Uring`),
+  `a_short_bounce_read_is_an_error_and_a_short_file_read_is_not`, and the
+  real-kernel `read_fixed_serves_a_real_mount_on_whatever_transport_it_gets`
+  (above), run with the pool unregistered -- the shipped default -- and, in
+  the initial user namespace, registered too: as root on 7.3 both negotiate
+  `UringZeroCopy` and zero-copy the `O_DIRECT` and buffered reads.
+- Root-only teardown fixes found on 7.3 (the suite is 172/172 as root and as a
+  user): `MountImpl::umount_impl` (`mnt/fuse_pure.rs`) treats root's `EBUSY`
+  like the unprivileged `EPERM` and detaches lazily -- a session dropped
+  with a caller still inside its mount was otherwise left mounted, its ring
+  answering `EIO` until something ended the connection
+  (`dropped_session_unmounts_and_drains`,
+  `panic_in_fill_on_a_ring_thread_answers_eio`,
+  `teardown_ends_a_ring_whose_entries_are_all_held`). The abandoned
+  `from_fd` ring already cancels its registered commands the only way the
+  kernel offers -- closing the ring, whose teardown sends each cancelable
+  `URING_CMD` `IO_URING_F_CANCEL` (`io_uring_try_cancel_uring_cmd`;
+  `IORING_OP_ASYNC_CANCEL` does not reach `URING_CMD`s, `io_try_cancel`), and
+  the connection aborts within milliseconds; what failed in
+  `dropped_from_fd_session_aborts_the_connection` was the test: a request
+  that reached an entry while its ring was torn down is ended `ECANCELED`
+  (`fuse_uring_send_in_task`, `tw.cancel`), which it now accepts beside
+  `ENOTCONN`/`ECONNABORTED`, and its leak check now sizes the entries from
+  the negotiated `max_write` (1 MiB on a zero-copy session). The leak line
+  names its ring (`ring 0 leaking N bytes`), so the session tests tell their
+  ring from the ring unit tests' (numbered 7) without relying on a size.
+- `crates/frontend-fuse/tests/wire_uring.rs` runs its byte-for-byte parity
+  round and its foreign-thread cold read on a third leg, zero-copy queues,
+  with every read sent zero-copied: the adapter's `gather` replies arrive
+  through the bounce, byte-identical to `/dev/fuse`.
+
+#### Memory, measured (plan 38 §4)
+
+Re-measured for the fix round (2026-10-02, kernel 7.3.0-rc4): 32 possible
+CPUs, the daemon's 12 FUSE workers (12 rings), `--locks local`,
+`CONSTELLATION_FUSE_TRANSPORT=uring`, depth 8 unless noted, one view
+(`constellation mount --foreground` on a local backend). Columns: `VmSize`
+and `VmRSS` of the daemon idle (2 s after the mount); `VmRSS` after **one
+256 MiB workload** (256 MiB written, `drop_caches`, read back with `dd
+iflag=direct bs=1M` and buffered); `VmRSS` after a **sustained** one on top
+(three passes of 8 `O_DIRECT` 1 MiB readers pinned to each of the 32 CPUs,
+256 concurrent, 32 MiB each); and the resident part of the buffer-pool
+mapping itself (`Rss` of its VMA in `/proc/<pid>/smaps`) at the three points.
+
+| run | transport | `VmSize` | `VmRSS` idle | after one | after sustained | pool resident idle / one / sustained |
+|---|---|---|---|---|---|---|
+| user, `uring` | `uring` | 6.20 GB | 44 MB | 299 MB | 781 MB | -- |
+| root, zero-copy `off` | `uring` | 6.20 GB | 44-52 MB | 405-482 MB | 759-841 MB | -- |
+| root, `auto` (unpinned, the default) | `uring_zc` | 2.70 GB | 43-50 MB | 347-471 MB | 731-845 MB | 0 / 14-30 / **256 MB** |
+| root, `pinned` | `uring_zc` | 2.70 GB | 299-303 MB | 643-713 MB | 732-862 MB | **256 / 256 / 256 MB** |
+| root, `auto`, depth 32 | `uring_zc` | 4.21 GB | 44-48 MB | 425-518 MB | 827-918 MB | not isolated (*) |
+| root, `pinned`, depth 32 | `uring_zc` | 4.21 GB | 1,071-1,074 MB | 1,355-1,469 MB | 1,518-1,628 MB | 1,024 / 1,024 / 1,024 MB |
+
+(Ranges: two or three runs each.) The pinned pool is exactly its budget,
+resident from the mount on: 32 queues x 8 x 1 MiB = 256 MiB, 1 GiB at depth
+32 (the default for a cluster-lock mount on `uring`). The unpinned pool
+costs nothing idle and a few MB after one sequential workload, but **a busy
+mount converges on the same 256 MiB and keeps it**: the sustained workload,
+eight requests in flight per CPU, touched every buffer of every queue, and
+nothing gives a touched page back. By the same mechanism depth 32 converges
+on 1 GiB under 32 requests in flight per CPU (not driven here: the sustained
+workload keeps 8 in flight). (*) At depth 32 the kernel merged the
+pool's VMA with a neighbour, so `smaps` does not isolate it. `VmSize` drops
+because the lowered `max_write` shrinks every entry's reservation from 16 MiB
+to 1 MiB. The totals are dominated by the daemon's own caches and vary by
+tens of MB between runs; the pool column is the exact one.
 
 ### What a build without the feature does and does not get
 
@@ -550,6 +842,7 @@ What the patch does add unconditionally, and why each has to be there:
 | `add_capabilities` refusing `FUSE_OVER_IO_URING` | Echoing the bit without registered queues makes a mount unservable, feature or no feature. |
 | `ReplyData::fill` (and `ReplySender::fill`, `EioOnUnwind`, `log_send`) | `fill` is a transport-independent API: over a ring it writes the entry's payload in place, over `/dev/fuse` it fills a heap buffer and `writev`s it, behaving exactly like `data()`. Gating it would make the caller (`crates/frontend-fuse`'s `ReadReply`, plan 38 Z2) need two code paths for no gain. |
 | `RequestWithSender` holding a `ReplySender` rather than a `ChannelSender` | One field's type; `ReplySender::Channel` is what a `/dev/fuse` request carries, exactly as before. |
+| `ReplyData::read_fixed`, `ReplyData::zero_copy`, `ReplyOpen::opened_zero_copy`, `Config::io_uring_zero_copy`/`io_uring_register_pool`, the 7.46 ABI constants (plan 38 Z4a) | Transport-independent, as `fill` is: over `/dev/fuse` `read_fixed` is a `pread(2)` into a heap buffer sent with `writev(2)`, `zero_copy()` is `false`, and the kernel ignores `FOPEN_IO_URING_ZERO_COPY` outside a zero-copy queue. |
 
 So a feature-off build is not *byte*-identical to pre-0002 fuser — it
 carries the table above — but it contains **no io_uring code, no io_uring

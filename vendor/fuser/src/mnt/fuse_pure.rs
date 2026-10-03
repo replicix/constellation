@@ -95,6 +95,17 @@ impl MountImpl {
                 // library go through the setuid-root "fusermount -u" to unmount.
                 fuse_unmount_pure(&self.mountpoint);
                 return Ok(());
+            } else if err == nix::errno::Errno::EBUSY {
+                // CONSTELLATION PATCH (io-uring): root's plain umount2 refuses a mount with a
+                // request in flight (a caller still in a lookup or stat holds the mountpoint),
+                // which is exactly the mount of a session dropped while it was serving. Giving
+                // up would leave it mounted with nothing to end the connection -- a ring thread
+                // then answers EIO until something does. Detach lazily instead, as every
+                // unprivileged unmount does: the mount leaves the namespace now and the
+                // connection ends once the last caller inside it was answered, while an idle
+                // mount still gets the plain unmount above.
+                fuse_unmount_pure(&self.mountpoint);
+                return Ok(());
             } else {
                 return Err(err.into());
             }

@@ -521,6 +521,9 @@ fn run(opts: RunOpts) -> Result<()> {
         without_caps,
     } = opts;
     results::check_frontend(&frontend)?;
+    // Before any scenario: a census that cannot be written fails the run
+    // now, not as an empty file noticed after an hour of scenarios.
+    constellation_harness::client::check_transport_census()?;
     let mut frontend_caps = caps::caps_of(&caps::frontend_caps(&frontend)?);
     frontend_caps.retain(|c| !without_caps.contains(c));
     // Set once, before any scenario starts an S3Env.
@@ -606,12 +609,26 @@ fn run(opts: RunOpts) -> Result<()> {
         report.write(path)?;
         eprintln!("results written to {}", path.display());
     }
+    // An append to the transport census failed mid-run (each failure was
+    // reported as it happened): the census is incomplete, so the run
+    // fails even if every scenario passed.
+    let census = constellation_harness::client::transport_census_failed().then(|| {
+        format!(
+            "the transport census ({}) is incomplete: an append failed (see the \
+             TRANSPORT CENSUS errors above)",
+            constellation_harness::client::TRANSPORT_CENSUS_ENV
+        )
+    });
     if !failures.is_empty() {
         bail!(
-            "{} scenario(s) failed: {}",
+            "{} scenario(s) failed: {}{}",
             failures.len(),
-            failures.join(", ")
+            failures.join(", "),
+            census.map(|c| format!("; also {c}")).unwrap_or_default()
         );
+    }
+    if let Some(census) = census {
+        bail!("{census}");
     }
     if skipped.is_empty() {
         eprintln!("ALL SCENARIOS PASSED");

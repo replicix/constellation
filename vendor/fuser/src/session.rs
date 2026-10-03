@@ -54,14 +54,23 @@ use crate::request::RequestWithSender;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use crate::uring::RingSet;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
-use crate::uring::ring::RingCommit;
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
 use crate::uring::ring::HeldRequest;
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+use crate::uring::ring::RingCommit;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
 /// and 128k on other systems.
 pub(crate) const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
+
+/// CONSTELLATION PATCH (io-uring): the kernel's `max_pages` without `FUSE_MAX_PAGES`
+/// (`fs/fuse/fuse_i.h`), for the size of a zero-copy queue's pool buffers.
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+const FUSE_DEFAULT_MAX_PAGES_PER_REQ: usize = 32;
+/// CONSTELLATION PATCH (io-uring): the kernel's floor under a ring payload buffer
+/// (`fs/fuse/fuse_i.h`, `fuse_uring_create`).
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+const FUSE_MIN_READ_BUFFER: usize = 8192;
 
 // CONSTELLATION PATCH (io-uring): the ring session's thread supervisor
 // reports a panic with the same text upstream's join loop does.
@@ -872,7 +881,10 @@ impl<FS: Filesystem> Session<FS> {
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             if self.config.io_uring {
                 if init.capabilities().contains(InitFlags::FUSE_OVER_IO_URING) {
-                    match self.create_rings(&config) {
+                    // CONSTELLATION PATCH (io-uring): plan 38 Z4, before the reply because it
+                    // may lower `max_write`
+                    let zero_copy = self.zero_copy_plan(init.capabilities(), &mut config);
+                    match self.create_rings(&config, zero_copy) {
                         Ok(ring) => {
                             config.enable_io_uring();
                             self.ring = Some(ring);
@@ -969,6 +981,12 @@ impl<FS: Filesystem> Session<FS> {
                 if let Some(ring) = &mut self.ring {
                     ring.start()?;
                 }
+                // CONSTELLATION PATCH (io-uring): `start` settled whether the queues are
+                // zero-copy queues (plan 38 Z4)
+                let transport = self.transport();
+                if let Some(negotiated) = &mut self.negotiated {
+                    negotiated.transport = transport;
+                }
                 return Ok(());
             }
             <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
@@ -982,10 +1000,17 @@ impl<FS: Filesystem> Session<FS> {
     /// negotiated buffer sizes: the kernel's REGISTER requires a payload of
     /// `max(8192, max_write, max_pages * PAGE_SIZE)` bytes per entry.
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
-    fn create_rings(&self, config: &KernelConfig) -> io::Result<RingSet> {
+    fn create_rings(
+        &self,
+        config: &KernelConfig,
+        zero_copy: Option<crate::uring::ZeroCopyPlan>,
+    ) -> io::Result<RingSet> {
         let payload_cap = (config.max_write as usize)
             .max(usize::from(config.max_pages()) * page_size::get())
             .max(8192);
+        if let (Some(kernel), Some(plan)) = (&self.config.io_uring_kernel, zero_copy) {
+            kernel.negotiated(plan.buf_size);
+        }
         let set = RingSet::new(
             self.ch.device(),
             self.mount.mount.lock().is_some(),
@@ -994,11 +1019,82 @@ impl<FS: Filesystem> Session<FS> {
             payload_cap,
             self.config.io_uring_kernel.as_ref(),
             self.config.io_uring_malformed_register,
+            zero_copy,
         )?;
         if let Some(hook) = &self.config.io_uring_lock_wait_downgrades {
             set.set_lock_wait_downgrades(hook);
         }
         Ok(set)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): whether this session tries zero-copy queues (plan 38
+    /// Z4), and with which pool buffers. Only when asked to (`Config::io_uring_zero_copy`),
+    /// when the kernel offers buffer pools (`FUSE_HAS_IO_URING_BUFPOOL`, 7.3+: re-verified
+    /// against what *this* kernel's INIT offers, never assumed from a version), and when the
+    /// process has `CAP_SYS_ADMIN` -- the kernel refuses a zero-copy queue without it, and a
+    /// session without it never asks. Each "no" is logged at debug: none is a failure.
+    ///
+    /// A pool buffer is the kernel's `max_payload_sz`: `max(FUSE_MIN_READ_BUFFER, max_write,
+    /// max_pages * PAGE_SIZE)`, with `max_pages` as the kernel will hold it -- the INIT
+    /// reply's, clamped to `/proc/sys/fs/fuse/max_pages_limit`, or 32 without
+    /// `FUSE_MAX_PAGES`. It has to be that exactly (`PoolMemory`), so the limit must be
+    /// readable. No read or write request is larger than `max_pages` pages, whatever
+    /// `max_write` says, so a `max_write` above that is lowered to it here, before the INIT
+    /// reply: it changes no request and keeps every pool buffer as small as a request
+    /// (fuser's default 16 MiB `max_write` against the default 1 MiB of 256 pages).
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    fn zero_copy_plan(
+        &self,
+        offered: InitFlags,
+        config: &mut KernelConfig,
+    ) -> Option<crate::uring::ZeroCopyPlan> {
+        if !self.config.io_uring_zero_copy {
+            debug!("io_uring zero-copy not asked for");
+            return None;
+        }
+        if !offered.contains(InitFlags::FUSE_HAS_IO_URING_BUFPOOL) {
+            debug!(
+                "io_uring zero-copy unavailable: the kernel did not offer \
+                 FUSE_HAS_IO_URING_BUFPOOL (kernel < 7.3)"
+            );
+            return None;
+        }
+        let capable = match &self.config.io_uring_kernel {
+            Some(kernel) => kernel.capable_sys_admin(),
+            None => crate::uring::has_cap_sys_admin(),
+        };
+        if !capable {
+            debug!("io_uring zero-copy unavailable: the process lacks CAP_SYS_ADMIN");
+            return None;
+        }
+        let limit = match crate::uring::max_pages_limit() {
+            Ok(limit) => limit,
+            Err(err) => {
+                warn!(
+                    "io_uring zero-copy unavailable: the kernel's max_pages_limit is unknown ({err})"
+                );
+                return None;
+            }
+        };
+        let page = page_size::get();
+        let kernel_pages = |config: &KernelConfig| {
+            if (config.requested & offered).contains(InitFlags::FUSE_MAX_PAGES) {
+                usize::from(config.max_pages()).clamp(1, limit)
+            } else {
+                FUSE_DEFAULT_MAX_PAGES_PER_REQ
+            }
+        };
+        let carried = kernel_pages(config) * page;
+        if config.max_write as usize > carried {
+            let _ = config.set_max_write(carried as u32);
+        }
+        let buf_size = (config.max_write as usize)
+            .max(kernel_pages(config) * page)
+            .max(FUSE_MIN_READ_BUFFER);
+        Some(crate::uring::ZeroCopyPlan {
+            buf_size,
+            register_pool: self.config.io_uring_register_pool,
+        })
     }
 
     /// Unmount the filesystem
@@ -1017,8 +1113,13 @@ impl<FS: Filesystem> Session<FS> {
     /// its connection over. `DevFuse` until the handshake registers rings.
     pub fn transport(&self) -> Transport {
         #[cfg(all(feature = "io-uring", target_os = "linux"))]
-        if self.ring.is_some() {
-            return Transport::Uring;
+        if let Some(ring) = &self.ring {
+            // CONSTELLATION PATCH (io-uring): plan 38 Z4
+            return if ring.zero_copy() {
+                Transport::UringZeroCopy
+            } else {
+                Transport::Uring
+            };
         }
         Transport::DevFuse
     }
@@ -1271,7 +1372,9 @@ fn serve_ring<FS: Filesystem>(
         Ok(threads) => threads,
         // The ring threads dispatch everything themselves then (`RingHandler::handle`)
         Err(err) => {
-            error!("spawning the io_uring offload threads failed ({err}); dispatching on the rings");
+            error!(
+                "spawning the io_uring offload threads failed ({err}); dispatching on the rings"
+            );
             Vec::new()
         }
     };
@@ -1427,9 +1530,7 @@ impl<FS: Filesystem> SessionEventLoop<FS> {
             // when a request is pending or the detach pipe says stop.
             let received = match &self.detach {
                 None => self.ch.receive_retrying(buf).map(Some),
-                Some(d) => self
-                    .ch
-                    .receive_or_wake(buf, d.wake_read.as_fd(), &d.stop),
+                Some(d) => self.ch.receive_or_wake(buf, d.wake_read.as_fd(), &d.stop),
             };
             match received {
                 Ok(None) => return Ok(LoopEnd::Stopped),
@@ -2141,14 +2242,6 @@ mod uring_test {
         }
     }
 
-    /// What a ring of `depth` entries per queue reserves with the default 16 MiB `max_write`,
-    /// to tell this session's mapping apart from the ring unit tests' fake rings in the log
-    fn reserved_bytes(depth: usize) -> usize {
-        usize::from(crate::uring::possible_cpus().unwrap())
-            * depth
-            * (page_size::get() + MAX_WRITE_SIZE)
-    }
-
     const HELLO_INO: INodeNo = INodeNo(2);
     const HELLO: &[u8] = b"Hello World!\n";
     const BIG_INO: INodeNo = INodeNo(3);
@@ -2700,10 +2793,8 @@ mod uring_test {
                 },
                 ours,
             );
-            let parsed =
-                ll::AnyRequest::try_from(&bytes[..]).expect("a well-formed request");
-            let req =
-                RequestWithSender::from_request(ReplySender::Channel(se.ch.sender()), parsed);
+            let parsed = ll::AnyRequest::try_from(&bytes[..]).expect("a well-formed request");
+            let req = RequestWithSender::from_request(ReplySender::Channel(se.ch.sender()), parsed);
             req.dispatch(&se);
             let mut buf = vec![0u8; 1 << 16];
             let n = theirs.recv(&mut buf).expect("a reply on the socket pair");
@@ -2883,7 +2974,7 @@ mod uring_test {
         assert!(exited[0].contains("in_kernel=0"), "{exited:?}");
         // The ring unit tests run alongside and log errors for their fake rings, numbered 7
         assert!(logged(log::Level::Error, "ring 0").is_empty());
-        assert!(logged(log::Level::Error, &format!("leaking {}", reserved_bytes(8))).is_empty());
+        assert!(logged(log::Level::Error, "ring 0 leaking").is_empty());
         m.finish();
     }
 
@@ -3366,7 +3457,7 @@ mod uring_test {
             logged(log::Level::Debug, "ring 0 exited, in_kernel=0").len(),
             1
         );
-        assert!(logged(log::Level::Error, &format!("leaking {}", reserved_bytes(8))).is_empty());
+        assert!(logged(log::Level::Error, "ring 0 leaking").is_empty());
     }
 
     #[test]
@@ -3411,6 +3502,9 @@ mod uring_test {
         let session =
             Session::from_fd(RingFs::default(), fd, SessionACL::Owner, ring_config()).unwrap();
         assert!(session.ring.is_some());
+        // As root on 7.3+ the session has zero-copy queues and a `max_write` lowered to one
+        // request's pages, which sizes its entries
+        let max_write = session.negotiated_init().unwrap().max_write as usize;
         let before = wait_logged(log::Level::Debug, "ring 0 registered", 1);
         assert_eq!(before.len(), 1, "{before:?}");
         drop(session);
@@ -3424,10 +3518,13 @@ mod uring_test {
             .recv_timeout(Duration::from_secs(5))
             .expect("the connection was not aborted")
             .unwrap_err();
+        // `ECANCELED` when the request reached a ring entry as the ring was being torn down:
+        // the kernel ends a request whose dispatch task work is cancelled with it
+        // (`fuse_uring_send_in_task`, `tw.cancel`), which is the connection ending too
         assert!(
             matches!(
                 err.raw_os_error(),
-                Some(libc::ENOTCONN | libc::ECONNABORTED)
+                Some(libc::ENOTCONN | libc::ECONNABORTED | libc::ECANCELED)
             ),
             "{err}"
         );
@@ -3436,7 +3533,10 @@ mod uring_test {
         let abandoned = wait_logged(log::Level::Error, "ring 0 abandoning", 1);
         assert_eq!(abandoned.len(), 1, "{abandoned:?}");
         assert!(abandoned[0].contains("from_fd session was dropped before it was run"));
-        let leaked = format!("leaking {} bytes", reserved_bytes(8));
+        let reserved = usize::from(crate::uring::possible_cpus().unwrap())
+            * 8
+            * (page_size::get() + max_write);
+        let leaked = format!("ring 0 leaking {reserved} bytes");
         assert_eq!(wait_logged(log::Level::Error, &leaked, 1).len(), 1);
         drop(detach);
         assert_not_mounted(&mountpoint);
@@ -3571,7 +3671,7 @@ mod uring_test {
             )
             .is_empty()
         );
-        assert!(logged(log::Level::Error, &format!("leaking {}", reserved_bytes(1))).is_empty());
+        assert!(logged(log::Level::Error, "ring 0 leaking").is_empty());
 
         // The dead mount stays in the table after an abort, as after any abort
         let _ = nix::mount::umount2(&m.mountpoint, nix::mount::MntFlags::MNT_DETACH);
@@ -3759,11 +3859,10 @@ mod uring_test {
             .and_then(|e| e.downcast_ref::<crate::RegistrationRefused>())
             .unwrap();
         assert_eq!(refused.kernel_error().raw_os_error(), Some(libc::EINVAL));
-        // Every REGISTER was refused, so nothing is in the kernel and nothing is leaked (the
-        // size names this session's one ring, not a ring unit test's running alongside)
-        let leaked = format!("leaking {} bytes", reserved_bytes(8));
+        // Every REGISTER was refused, so nothing is in the kernel and nothing is leaked (ring
+        // 0 is this session's one ring; the ring unit tests running alongside number theirs 7)
         assert!(
-            logged(log::Level::Error, &leaked).is_empty(),
+            logged(log::Level::Error, "ring 0 leaking").is_empty(),
             "{:?}",
             logged(log::Level::Error, "")
         );
@@ -3774,7 +3873,10 @@ mod uring_test {
         );
         assert_not_mounted(&m.mountpoint);
         // The host is fine; the same mountpoint takes a ring session at once
-        let bg = m.session(RingFs::default(), &ring_config()).spawn().unwrap();
+        let bg = m
+            .session(RingFs::default(), &ring_config())
+            .spawn()
+            .unwrap();
         assert_eq!(std::fs::read(m.path("hello.txt")).unwrap(), HELLO);
         bg.umount_and_join().unwrap();
         m.finish();
@@ -3966,7 +4068,7 @@ mod uring_test {
             1
         );
         assert!(logged(log::Level::Debug, "ring 0 registered").is_empty());
-        assert!(logged(log::Level::Error, &format!("leaking {}", reserved_bytes(1))).is_empty());
+        assert!(logged(log::Level::Error, "ring 0 leaking").is_empty());
         assert!(logged(log::Level::Error, "Failed to send FUSE reply: Broken pipe").is_empty());
 
         let (session, _kernel) =
@@ -3979,5 +4081,698 @@ mod uring_test {
             logged(log::Level::Error, "Failed to send FUSE reply: Broken pipe").len(),
             1
         );
+    }
+
+    /// CONSTELLATION PATCH (io-uring): plan 38 Z4 -- zero-copy queues. A file served with
+    /// `ReplyData::read_fixed` from an `O_RDONLY` open answered with
+    /// `ReplyOpen::opened_zero_copy`; `mode` switches its reads to `data` or `gather` (the
+    /// bounce path), and every write's bytes are kept.
+    struct ZcFs {
+        file: Arc<std::fs::File>,
+        len: u64,
+        /// 0: `read_fixed`; 1: `data`; 2: `gather` of two halves
+        mode: Arc<std::sync::atomic::AtomicU8>,
+        /// Reads whose pages were registered (`ReplyData::zero_copy`)
+        zero_copied: Arc<AtomicUsize>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// `ReplyData::transport` of every read
+        transports: Arc<Mutex<Vec<Transport>>>,
+    }
+
+    const ZC_INO: INodeNo = INodeNo(2);
+
+    impl ZcFs {
+        fn new(content: &[u8]) -> Self {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(content).unwrap();
+            Self {
+                file: Arc::new(file),
+                len: content.len() as u64,
+                mode: Arc::default(),
+                zero_copied: Arc::default(),
+                writes: Arc::default(),
+                transports: Arc::default(),
+            }
+        }
+
+        fn attr(&self, ino: INodeNo) -> FileAttr {
+            let (kind, size, perm) = if ino == ZC_INO {
+                (FileType::RegularFile, self.len, 0o644)
+            } else {
+                (FileType::Directory, 0, 0o755)
+            };
+            FileAttr {
+                ino,
+                size,
+                blocks: size.div_ceil(512),
+                atime: SystemTime::UNIX_EPOCH,
+                mtime: SystemTime::UNIX_EPOCH,
+                ctime: SystemTime::UNIX_EPOCH,
+                crtime: SystemTime::UNIX_EPOCH,
+                kind,
+                perm,
+                nlink: 1,
+                uid: geteuid().as_raw(),
+                gid: 0,
+                rdev: 0,
+                blksize: 4096,
+                flags: 0,
+            }
+        }
+    }
+
+    impl Filesystem for ZcFs {
+        fn lookup(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+            if name.as_bytes() == b"data.bin" {
+                reply.entry(&Duration::from_secs(60), &self.attr(ZC_INO), Generation(0));
+            } else {
+                reply.error(Errno::ENOENT);
+            }
+        }
+        fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+            reply.attr(&Duration::from_secs(60), &self.attr(ino));
+        }
+        fn open(
+            &self,
+            _req: &Request,
+            _ino: INodeNo,
+            flags: crate::OpenFlags,
+            reply: crate::ReplyOpen,
+        ) {
+            if flags.0 & libc::O_ACCMODE == libc::O_RDONLY {
+                reply.opened_zero_copy(FileHandle(1), crate::FopenFlags::empty());
+            } else {
+                reply.opened(FileHandle(1), crate::FopenFlags::empty());
+            }
+        }
+        fn read(
+            &self,
+            _req: &Request,
+            _ino: INodeNo,
+            _fh: FileHandle,
+            offset: u64,
+            size: u32,
+            _flags: crate::OpenFlags,
+            _lock_owner: Option<crate::LockOwner>,
+            reply: ReplyData,
+        ) {
+            if reply.zero_copy() {
+                self.zero_copied.fetch_add(1, Ordering::SeqCst);
+            }
+            self.transports.lock().push(reply.transport());
+            let bytes = || {
+                let mut buf = vec![0; size as usize];
+                let n = crate::reply::pread_full(self.file.as_fd(), &mut buf, offset).unwrap();
+                buf.truncate(n);
+                buf
+            };
+            match self.mode.load(Ordering::SeqCst) {
+                0 => reply.read_fixed(Arc::clone(&self.file), offset, size as usize),
+                1 => reply.data(&bytes()),
+                _ => {
+                    let bytes = bytes();
+                    let (a, b) = bytes.split_at(bytes.len() / 2);
+                    reply.gather(&[a, b]);
+                }
+            }
+        }
+        fn write(
+            &self,
+            _req: &Request,
+            _ino: INodeNo,
+            _fh: FileHandle,
+            _offset: u64,
+            data: &[u8],
+            _write_flags: crate::WriteFlags,
+            _flags: crate::OpenFlags,
+            _lock_owner: Option<crate::LockOwner>,
+            reply: ReplyWrite,
+        ) {
+            self.writes.lock().push(data.to_vec());
+            reply.written(data.len() as u32);
+        }
+    }
+
+    fn zc_content(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i % 253) as u8 ^ (i >> 12) as u8)
+            .collect()
+    }
+
+    /// The kernel's end of an in-memory zero-copy session: `FUSE_INIT` and `DESTROY` over a
+    /// datagram socket pair standing in for `/dev/fuse`, everything else over the
+    /// `InMemoryRingKernel`.
+    struct ZcKernel {
+        sock: std::os::unix::net::UnixDatagram,
+        ring: crate::InMemoryRingKernel,
+        session: Option<thread::JoinHandle<io::Result<()>>>,
+        transport: Transport,
+        negotiated: NegotiatedInit,
+        /// `max_write` of the INIT reply
+        max_write: u32,
+        next_unique: u64,
+    }
+
+    /// `fuse_read_in`: fh, offset, size, read_flags, lock_owner, flags, padding.
+    fn read_in(offset: u64, size: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u64.to_ne_bytes());
+        b.extend_from_slice(&offset.to_ne_bytes());
+        b.extend_from_slice(&size.to_ne_bytes());
+        b.extend_from_slice(&0u32.to_ne_bytes());
+        b.extend_from_slice(&0u64.to_ne_bytes());
+        b.extend_from_slice(&(libc::O_RDONLY as u32).to_ne_bytes());
+        b.extend_from_slice(&0u32.to_ne_bytes());
+        b
+    }
+
+    /// `fuse_write_in`: fh, offset, size, write_flags, lock_owner, flags, padding.
+    fn write_in(offset: u64, size: u32) -> Vec<u8> {
+        let mut b = read_in(offset, size);
+        b[32..36].copy_from_slice(&(libc::O_WRONLY as u32).to_ne_bytes());
+        b
+    }
+
+    impl ZcKernel {
+        /// With fuser's default `Config`: zero-copy asked for, pools unregistered.
+        fn start(fs: ZcFs, offered: InitFlags, ring: crate::InMemoryRingKernel) -> ZcKernel {
+            Self::start_with(fs, offered, ring, Config::default().io_uring_register_pool)
+        }
+
+        /// `register_pool`: `Config::io_uring_register_pool`.
+        fn start_with(
+            fs: ZcFs,
+            offered: InitFlags,
+            ring: crate::InMemoryRingKernel,
+            register_pool: bool,
+        ) -> ZcKernel {
+            use zerocopy::IntoBytes;
+
+            use crate::ll::fuse_abi::fuse_init_in;
+            use crate::ll::fuse_abi::fuse_opcode;
+            use crate::uring::staging::test::in_header;
+
+            let (sock, daemon) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let (flags_lo, flags_hi) =
+                (offered | InitFlags::FUSE_OVER_IO_URING | InitFlags::FUSE_INIT_EXT).pair();
+            let len = (size_of::<crate::ll::fuse_abi::fuse_in_header>() + size_of::<fuse_init_in>())
+                as u32;
+            let header = in_header(len, fuse_opcode::FUSE_INIT as u32, 1);
+            let arg = fuse_init_in {
+                major: 7,
+                minor: 46,
+                max_readahead: 128 << 10,
+                flags: flags_lo,
+                flags2: flags_hi,
+                unused: [0; 11],
+            };
+            sock.send(&[&header[..], arg.as_bytes()].concat()).unwrap();
+            let config = Config {
+                io_uring: true,
+                io_uring_queue_depth: 2,
+                n_threads: Some(2),
+                io_uring_kernel: Some(ring.clone()),
+                io_uring_register_pool: register_pool,
+                ..Config::default()
+            };
+            let session = Session::from_fd(
+                fs,
+                std::os::fd::OwnedFd::from(daemon),
+                SessionACL::All,
+                config,
+            )
+            .unwrap();
+            let mut reply = vec![0u8; 512];
+            let n = sock.recv(&mut reply).unwrap();
+            assert!(n >= 16 + 24, "an INIT reply");
+            assert_eq!(i32::from_ne_bytes(reply[4..8].try_into().unwrap()), 0);
+            // fuse_out_header (16), then fuse_init_out: max_write at 20
+            let max_write = u32::from_ne_bytes(reply[16 + 20..16 + 24].try_into().unwrap());
+            let transport = session.transport();
+            let negotiated = session.negotiated_init().unwrap();
+            ZcKernel {
+                sock,
+                ring,
+                session: Some(thread::spawn(move || session.run())),
+                transport,
+                negotiated,
+                max_write,
+                next_unique: 2,
+            }
+        }
+
+        fn request(&mut self, opcode: u32, op_in: &[u8], payload: &[u8]) -> (u64, Vec<u8>) {
+            let unique = self.next_unique;
+            self.next_unique += 1;
+            let len = (40 + op_in.len() + payload.len()) as u32;
+            let mut msg = crate::uring::staging::test::in_header(len, opcode, unique).to_vec();
+            msg[16..24].copy_from_slice(&ZC_INO.0.to_ne_bytes());
+            msg.extend_from_slice(op_in);
+            msg.extend_from_slice(payload);
+            (unique, msg)
+        }
+
+        /// The reply to `msg`: its error and data, after the out header.
+        fn reply(&self, unique: u64) -> (i32, Vec<u8>) {
+            let reply = self.ring.recv(Duration::from_secs(20)).expect("a reply");
+            assert_eq!(u64::from_ne_bytes(reply[8..16].try_into().unwrap()), unique);
+            let error = i32::from_ne_bytes(reply[4..8].try_into().unwrap());
+            (error, reply[16..].to_vec())
+        }
+
+        /// A read of `size` bytes at `offset`, sent to be zero-copied when `zero_copy`.
+        fn read(&mut self, offset: u64, size: u32, zero_copy: bool) -> (i32, Vec<u8>) {
+            use crate::ll::fuse_abi::fuse_opcode::FUSE_READ;
+            let (unique, msg) = self.request(FUSE_READ as u32, &read_in(offset, size), &[]);
+            if zero_copy {
+                self.ring.send_zero_copy(0, &msg, 40, size as usize);
+            } else {
+                self.ring.send(0, &msg, 40);
+            }
+            self.reply(unique)
+        }
+
+        fn write(&mut self, data: &[u8], zero_copy: bool) -> i32 {
+            use crate::ll::fuse_abi::fuse_opcode::FUSE_WRITE;
+            let (unique, msg) =
+                self.request(FUSE_WRITE as u32, &write_in(0, data.len() as u32), data);
+            if zero_copy {
+                self.ring.send_zero_copy(0, &msg, 40, data.len());
+            } else {
+                self.ring.send(0, &msg, 40);
+            }
+            self.reply(unique).0
+        }
+
+        fn getattr(&mut self) -> (i32, Vec<u8>) {
+            use crate::ll::fuse_abi::fuse_opcode::FUSE_GETATTR;
+            let (unique, msg) = self.request(FUSE_GETATTR as u32, &[0; 16], &[]);
+            self.ring.send(0, &msg, 16);
+            self.reply(unique)
+        }
+
+        fn finish(mut self) {
+            use crate::ll::fuse_abi::fuse_opcode::FUSE_DESTROY;
+            let (unique, msg) = self.request(FUSE_DESTROY as u32, &[], &[]);
+            self.sock.send(&msg).unwrap();
+            let mut reply = vec![0u8; 64];
+            let n = self.sock.recv(&mut reply).unwrap();
+            assert_eq!(
+                u64::from_ne_bytes(reply[8..16].try_into().unwrap()),
+                unique,
+                "{:?}",
+                &reply[..n]
+            );
+            self.ring.hang_up();
+            let session = self.session.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(session.join());
+            });
+            rx.recv_timeout(Duration::from_secs(20))
+                .expect("the session ends")
+                .expect("the session thread")
+                .expect("the session ends without error");
+        }
+    }
+
+    fn zc_offered() -> InitFlags {
+        InitFlags::FUSE_HAS_IO_URING_BUFPOOL
+            | InitFlags::FUSE_MAX_PAGES
+            | InitFlags::FUSE_ASYNC_READ
+    }
+
+    fn queues() -> usize {
+        usize::from(crate::uring::possible_cpus().unwrap())
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a 7.3 kernel that offers buffer pools, and a process the
+    /// kernel's `capable(CAP_SYS_ADMIN)` admits, get zero-copy queues with buffer pools --
+    /// unregistered, fuser's default, and registered (pinned), `io_uring_register_pool`:
+    /// `read_fixed` lands the file's bytes in the request's registered pages (short at the end
+    /// of the file), a reply given as bytes (`data`, `gather`) is bounced into them, a read
+    /// that was not zero-copied is answered with `pread(2)` into its pool buffer, and every
+    /// other request travels in a pool buffer -- a write's payload reaches the filesystem
+    /// whole. `max_write` is lowered to what a request can carry.
+    #[test]
+    fn zero_copy_queues_serve_reads_through_registered_pages() {
+        for pinned in [false, true] {
+            zero_copy_round(pinned);
+        }
+    }
+
+    fn zero_copy_round(pinned: bool) {
+        let _serial = serial();
+        let content = zc_content(3 * 8192 + 123);
+        let fs = ZcFs::new(&content);
+        let (mode, zero_copied, writes) =
+            (fs.mode.clone(), fs.zero_copied.clone(), fs.writes.clone());
+        let ring = crate::InMemoryRingKernel::with_buffer_pools(true);
+        let transports = fs.transports.clone();
+        let mut k = ZcKernel::start_with(fs, zc_offered(), ring.clone(), pinned);
+        assert_eq!(k.transport, Transport::UringZeroCopy);
+        assert_eq!(k.negotiated.transport, Transport::UringZeroCopy);
+        assert_eq!(ring.zero_copy_queues(), queues());
+        assert_eq!(
+            ring.pools(),
+            (queues(), if pinned { queues() } else { 0 }),
+            "a pool per queue, registered when pinned"
+        );
+        let limit = crate::uring::max_pages_limit().unwrap();
+        assert_eq!(k.max_write as usize, limit.min(4096) * page_size::get());
+        assert_eq!(k.negotiated.max_write, k.max_write);
+        assert_eq!(
+            logged(log::Level::Debug, "zero-copy on every queue").len(),
+            1
+        );
+        assert!(logged(log::Level::Warn, "zero-copy").is_empty());
+
+        // read_fixed: the bytes go from the file to the pages, none through this process
+        for (offset, size) in [
+            (0u64, 8192u32),
+            (8192, 4096),
+            (3 * 8192, 8192),
+            (1 << 20, 4096),
+        ] {
+            let (error, data) = k.read(offset, size, true);
+            assert_eq!(error, 0);
+            let start = (offset as usize).min(content.len());
+            let end = (start + size as usize).min(content.len());
+            assert_eq!(data, &content[start..end], "read of {size} at {offset}");
+        }
+        assert_eq!(ring.read_fixed_served(), 4);
+        assert_eq!(zero_copied.load(Ordering::SeqCst), 4);
+
+        // Any other reply to a zero-copied read is bounced into the pages
+        for m in [1, 2] {
+            mode.store(m, Ordering::SeqCst);
+            let served = ring.read_fixed_served();
+            let (error, data) = k.read(100, 5000, true);
+            assert_eq!(
+                (error, data.as_slice()),
+                (0, &content[100..5100]),
+                "mode {m}"
+            );
+            assert_eq!(ring.read_fixed_served(), served + 1, "mode {m} bounced");
+        }
+
+        // A read the kernel did not zero-copy: read_fixed is a pread into its pool buffer
+        mode.store(0, Ordering::SeqCst);
+        let served = ring.read_fixed_served();
+        let (error, data) = k.read(1000, 7000, false);
+        assert_eq!((error, data.as_slice()), (0, &content[1000..8000]));
+        assert_eq!(ring.read_fixed_served(), served);
+
+        // Requests with payloads travel in pool buffers
+        let (error, attr) = k.getattr();
+        assert_eq!(error, 0);
+        assert!(!attr.is_empty());
+        let payload = zc_content(6000);
+        assert_eq!(k.write(&payload, false), 0);
+        assert_eq!(writes.lock().as_slice(), [payload]);
+
+        // A zero-copied write's data is in its pages, which nothing here reads: EIO, logged
+        assert_eq!(k.write(b"lost", true), -libc::EIO);
+        assert_eq!(writes.lock().len(), 1);
+        assert_eq!(
+            logged(log::Level::Error, "zero-copied a request with opcode").len() <= 1,
+            true
+        );
+        let transports = transports.lock().clone();
+        assert!(
+            !transports.is_empty() && transports.iter().all(|t| *t == Transport::UringZeroCopy),
+            "every reply names the session's transport: {transports:?}"
+        );
+        k.finish();
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the ladder's rung below zero-copy, decided at INIT. A
+    /// kernel that does not offer `FUSE_HAS_IO_URING_BUFPOOL` (7.0-7.2, faked here by leaving
+    /// the bit out of the INIT) or a process without `CAP_SYS_ADMIN` never makes a pool or a
+    /// zero-copy queue: plain `Uring`, `max_write` untouched, and `read_fixed` is `pread(2)`
+    /// into the entry's own buffer.
+    #[test]
+    fn without_buffer_pools_or_cap_sys_admin_the_ring_is_plain() {
+        let _serial = serial();
+        let content = zc_content(20000);
+        for (offered, capable) in [
+            (InitFlags::FUSE_MAX_PAGES | InitFlags::FUSE_ASYNC_READ, true),
+            (zc_offered(), false),
+        ] {
+            let ring = crate::InMemoryRingKernel::with_buffer_pools(capable);
+            let mut k = ZcKernel::start(ZcFs::new(&content), offered, ring.clone());
+            assert_eq!(k.transport, Transport::Uring, "capable={capable}");
+            assert_eq!(k.negotiated.transport, Transport::Uring);
+            assert_eq!(ring.zero_copy_queues(), 0, "no ADD_QUEUE");
+            assert_eq!(ring.pools(), (0, 0), "no ADD_BUFPOOL");
+            assert_eq!(k.max_write as usize, MAX_WRITE_SIZE);
+            let (error, data) = k.read(4096, 8192, true);
+            assert_eq!((error, data.as_slice()), (0, &content[4096..12288]));
+            assert_eq!(ring.read_fixed_served(), 0);
+            k.finish();
+        }
+        assert!(
+            logged(log::Level::Warn, "zero-copy").is_empty(),
+            "not a failure"
+        );
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a zero-copy queue the kernel refuses (`EPERM`: its
+    /// `capable()` disagrees with the process's `CapEff`, as in a user namespace) degrades the
+    /// session to plain `Uring` before any entry is registered -- nothing is left behind that
+    /// would refuse an entry with its own payload buffer -- and says so once.
+    #[test]
+    fn a_refused_zero_copy_queue_degrades_to_plain_uring_before_any_register() {
+        let _serial = serial();
+        let content = zc_content(10000);
+        let ring = crate::InMemoryRingKernel::with_buffer_pools(true)
+            .refusing_zero_copy_queues(libc::EPERM);
+        let mut k = ZcKernel::start(ZcFs::new(&content), zc_offered(), ring.clone());
+        assert_eq!(k.transport, Transport::Uring);
+        assert_eq!(k.negotiated.transport, Transport::Uring);
+        assert_eq!((ring.zero_copy_queues(), ring.pools()), (0, (0, 0)));
+        assert_eq!(
+            ring.registered(),
+            queues() * 2,
+            "every entry, each with its own buffer"
+        );
+        let warned = logged(log::Level::Warn, "zero-copy unavailable");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0]
+                .starts_with("io_uring zero-copy unavailable: the kernel refused zero-copy queue"),
+            "{warned:?}"
+        );
+        let (error, data) = k.read(0, 10000, true);
+        assert_eq!((error, data.as_slice()), (0, &content[..]));
+        k.finish();
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a pool the kernel will not take as a registered fixed
+    /// buffer is handed over unregistered; the queues stay zero-copy queues.
+    #[test]
+    fn a_refused_registered_pool_is_handed_over_unregistered() {
+        let _serial = serial();
+        let content = zc_content(10000);
+        let ring = crate::InMemoryRingKernel::with_buffer_pools(true)
+            .refusing_registered_pools(libc::ENOMEM);
+        let mut k = ZcKernel::start_with(ZcFs::new(&content), zc_offered(), ring.clone(), true);
+        assert_eq!(k.transport, Transport::UringZeroCopy);
+        assert_eq!(ring.pools(), (queues(), 0));
+        assert_eq!(
+            logged(
+                log::Level::Warn,
+                "zero-copy on every queue, but the kernel took queue"
+            )
+            .len(),
+            1
+        );
+        let (error, data) = k.read(10, 9000, true);
+        assert_eq!((error, data.as_slice()), (0, &content[10..9010]));
+        assert_eq!(ring.read_fixed_served(), 1);
+        let (error, _) = k.getattr();
+        assert_eq!(error, 0);
+        k.finish();
+    }
+
+    /// CONSTELLATION PATCH (io-uring): one session, one transport. Ring 1's buffer table is
+    /// refused (`ENOMEM`, as pinning past `RLIMIT_MEMLOCK` is) after ring 0's was taken: ring 0
+    /// withdraws its table before either ring creates a queue, so no queue anywhere is a
+    /// zero-copy queue, the session is plain `Uring`, every reply -- ring 0's included -- says
+    /// so, and the refusal is the one reason logged.
+    #[test]
+    fn a_refused_buffer_table_on_one_ring_keeps_every_ring_plain() {
+        let _serial = serial();
+        let content = zc_content(10000);
+        let fs = ZcFs::new(&content);
+        let transports = fs.transports.clone();
+        let ring = crate::InMemoryRingKernel::with_buffer_pools(true)
+            .refusing_buffer_table(1, libc::ENOMEM);
+        let mut k = ZcKernel::start_with(fs, zc_offered(), ring.clone(), true);
+        assert_eq!(k.transport, Transport::Uring);
+        assert_eq!(k.negotiated.transport, Transport::Uring);
+        assert_eq!(ring.buffer_tables(), 0, "ring 0 withdrew its table");
+        assert_eq!((ring.zero_copy_queues(), ring.pools()), (0, (0, 0)));
+        assert_eq!(
+            ring.registered(),
+            queues() * 2,
+            "every entry, each with its own buffer"
+        );
+        let warned = logged(log::Level::Warn, "zero-copy unavailable");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].starts_with(
+                "io_uring zero-copy unavailable: registering the buffer table of ring 1"
+            ),
+            "{warned:?}"
+        );
+        let (error, data) = k.read(0, 10000, true);
+        assert_eq!((error, data.as_slice()), (0, &content[..]));
+        assert_eq!(ring.read_fixed_served(), 0);
+        assert_eq!(transports.lock().as_slice(), [Transport::Uring]);
+        k.finish();
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a `READ_FIXED` that reads less than asked. From the
+    /// caller's file that is the end of the file, and the reply is short; from the bounce
+    /// memfd, which held the whole reply, it is a failure, and the reply is `EIO` rather than
+    /// a silently truncated read.
+    #[test]
+    fn a_short_bounce_read_is_an_error_and_a_short_file_read_is_not() {
+        let _serial = serial();
+        let content = zc_content(10000);
+        let fs = ZcFs::new(&content);
+        let mode = fs.mode.clone();
+        let ring = crate::InMemoryRingKernel::with_buffer_pools(true).short_read_fixed(4096);
+        let mut k = ZcKernel::start(fs, zc_offered(), ring.clone());
+        assert_eq!(k.transport, Transport::UringZeroCopy);
+        let (error, data) = k.read(0, 8192, true);
+        assert_eq!(
+            (error, data.as_slice()),
+            (0, &content[..4096]),
+            "read_fixed"
+        );
+        mode.store(1, Ordering::SeqCst);
+        let (error, data) = k.read(0, 8192, true);
+        assert_eq!((error, data.len()), (-libc::EIO, 0), "bounced data()");
+        assert_eq!(
+            logged(log::Level::Error, "of a bounced reply returned 4096").len(),
+            1
+        );
+        // The ring goes on serving
+        mode.store(0, Ordering::SeqCst);
+        let (error, data) = k.read(100, 1000, true);
+        assert_eq!((error, data.as_slice()), (0, &content[100..1100]));
+        k.finish();
+    }
+
+    /// CONSTELLATION PATCH (io-uring): plan 38 Z4 on a real kernel. Mounts `ZcFs`, whose
+    /// `data.bin` is served with `read_fixed`, and reads it back with `dd iflag=direct` (the
+    /// kernel registers the reader's pinned pages) and buffered (it registers the page cache's
+    /// folios). Where the kernel offers buffer pools and this process has `CAP_SYS_ADMIN` (root
+    /// on 7.3+) the session must negotiate `UringZeroCopy` and the reads must reach the
+    /// filesystem zero-copied; anywhere else -- unprivileged, or a kernel before 7.3 -- the very
+    /// same mount negotiates plain `Uring` and `read_fixed` is a `pread(2)`.
+    ///
+    /// Run as root inside a user namespace (`unshare -U -r -m`), the process's `CapEff` shows
+    /// `CAP_SYS_ADMIN` but the kernel's `capable()` -- which `ADD_QUEUE` checks against the
+    /// initial namespace -- does not: the session tries zero-copy, the kernel refuses the first
+    /// queue with `EPERM`, and the mount serves on plain `Uring` all the same, the refusal
+    /// logged once. That is a real kernel's failed `ADD_QUEUE`.
+    ///
+    /// Run once with the pools unregistered, fuser's default and what Constellation ships, and
+    /// -- in the initial user namespace -- once more with them registered (pinned). Not in a
+    /// user namespace: pinning is charged to `RLIMIT_MEMLOCK` there, and that refusal, which
+    /// comes first, would be the one observed instead of the `ADD_QUEUE`'s.
+    #[test]
+    fn read_fixed_serves_a_real_mount_on_whatever_transport_it_gets() {
+        if let Some(why) = uring_unavailable() {
+            eprintln!(
+                "skipping read_fixed_serves_a_real_mount_on_whatever_transport_it_gets: {why}"
+            );
+            return;
+        }
+        // The kernel's `capable()` is checked in the initial user namespace
+        let init_userns = std::fs::read_to_string("/proc/self/uid_map")
+            .is_ok_and(|m| m.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"]);
+        assert!(!Config::default().io_uring_register_pool);
+        real_mount_round(init_userns, false);
+        if init_userns {
+            real_mount_round(init_userns, true);
+        }
+    }
+
+    fn real_mount_round(init_userns: bool, register_pool: bool) {
+        let _serial = serial();
+        let content = zc_content((4 << 20) + 12345);
+        let fs = ZcFs::new(&content);
+        let zero_copied = fs.zero_copied.clone();
+        let m = Mounted::new();
+        let config = Config {
+            n_threads: Some(2),
+            io_uring_register_pool: register_pool,
+            ..ring_config()
+        };
+        let session = Session::new(fs, &m.mountpoint, &config).unwrap();
+        let negotiated = session.negotiated_init().unwrap();
+        let offered = InitFlags::from_bits_retain(negotiated.kernel_flags)
+            .contains(InitFlags::FUSE_HAS_IO_URING_BUFPOOL);
+        let tried = offered && crate::uring::has_cap_sys_admin();
+        let expected = if tried && init_userns {
+            Transport::UringZeroCopy
+        } else {
+            Transport::Uring
+        };
+        if tried && !init_userns {
+            let refused = logged(log::Level::Warn, "the kernel refused zero-copy queue");
+            eprintln!("in a user namespace: {refused:?}");
+            assert_eq!(refused.len(), 1, "{refused:?}");
+            assert!(
+                refused[0].contains(&format!("({})", io::Error::from_raw_os_error(libc::EPERM)))
+            );
+        }
+        eprintln!(
+            "kernel offers buffer pools: {offered}, CAP_SYS_ADMIN: {}, pool registered: \
+             {register_pool}, negotiated {}",
+            crate::uring::has_cap_sys_admin(),
+            session.transport()
+        );
+        assert_eq!(session.transport(), expected);
+        assert_eq!(negotiated.transport, expected);
+        let bg = session.spawn().unwrap();
+        let path = m.path("data.bin");
+
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let dd = std::process::Command::new("dd")
+            .arg(format!("if={}", path.display()))
+            .arg(format!("of={}", out.path().display()))
+            .args(["iflag=direct", "bs=1M", "status=none"])
+            .status()
+            .unwrap();
+        assert!(dd.success(), "dd iflag=direct: {dd}");
+        let direct = std::fs::read(out.path()).unwrap();
+        assert!(direct == content, "dd iflag=direct read different bytes");
+        let after_direct = zero_copied.load(Ordering::SeqCst);
+
+        let buffered = std::fs::read(&path).unwrap();
+        assert!(buffered == content, "a buffered read read different bytes");
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut tail = vec![0; 5000];
+        use std::os::unix::fs::FileExt;
+        let n = f.read_at(&mut tail, (4 << 20) + 10000).unwrap();
+        assert_eq!(&tail[..n], &content[(4 << 20) + 10000..]);
+        drop(f);
+        let total = zero_copied.load(Ordering::SeqCst);
+        eprintln!("zero-copied reads: {after_direct} direct, {total} in all");
+        if expected == Transport::UringZeroCopy {
+            assert!(after_direct > 0, "O_DIRECT reads were zero-copied");
+            assert!(total > after_direct, "buffered reads were zero-copied");
+        } else {
+            assert_eq!(total, 0, "nothing is zero-copied without zero-copy queues");
+        }
+        umount_and_join_within(bg, Duration::from_secs(20)).unwrap();
+        m.finish();
     }
 }

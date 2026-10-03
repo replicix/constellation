@@ -99,6 +99,20 @@ knob, `CONSTELLATION_FUSE_PASSTHROUGH`, and what it changes. Zero-copy reads
 (plan 38 Z4) are counted (`fuse.mounts[].zero_copy_reads`,
 `constellation_fuse_zero_copy_reads_total`) and are 0 until then.
 
+**io_uring zero-copy queues** (plan 38 Z4a): a mount that gets the ring
+also sets its queues up for zero-copy where the kernel offers buffer pools
+(7.3+) and the daemon has `CAP_SYS_ADMIN`; it then reports the transport
+`uring_zc` instead of `uring` (`fuse.mounts[].transport`, the `transport`
+label). Until the read path uses them (plan 38 Z4b) a `uring_zc` mount
+serves exactly as a `uring` one does, its requests' payloads in the
+queues' buffer pools — which cost memory. Such a mount (and one that tried
+zero-copy and was refused) negotiates `max_write` = one request's pages,
+1 MiB, instead of 16 MiB; no request changes size.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `CONSTELLATION_FUSE_URING_ZERO_COPY` | `auto` | `auto`: zero-copy queues where allowed, their buffer pools handed to the kernel **unregistered**: nothing is resident at mount time, a pool page becomes resident when a request first uses it and **is never given back**, so a busy mount converges on the whole pool — **possible CPUs x queue depth x 1 MiB per mount**: 256 MiB at 32 CPUs and depth 8 (the default), 1 GiB at depth 32 (a cluster-lock mount on `uring`); with 8 CPUs, 64 MiB and 256 MiB. `pinned` (opt-in): the same pools registered with io_uring, all of that resident and pinned **from the moment the mount is made**, charged to `RLIMIT_MEMLOCK` unless the daemon has `CAP_IPC_LOCK`; it saves the kernel a per-request import of the buffer. `off`: no zero-copy queues and no pools; the mount negotiates `uring`. Any other value fails the mount, as an unparseable `CONSTELLATION_FUSE_TRANSPORT` does. Read once, when the daemon starts. A kernel, capability or limit that refuses is not a failure: the mount negotiates `uring`, and a refusal after the attempt began is logged once (`io_uring zero-copy unavailable: …`) |
+
 > **Note — the ring transport, and why `auto` keeps cluster-lock mounts
 > on `/dev/fuse`.** Since plan 38 Z2c `auto` is the default for plain mounts
 > (the mobile profile excepted). It only reaches the ring on a kernel with

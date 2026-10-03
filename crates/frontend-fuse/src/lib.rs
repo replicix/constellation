@@ -34,8 +34,8 @@ pub use reply::reply_code;
 pub use session::{
     mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, HandoverCapable,
     MountOptions, MountSource, SessionControl, SessionExit, SessionHandoff, TransportConfig,
-    TransportPolicy, CLUSTER_LOCKS_URING_QUEUE_DEPTH, DEFAULT_URING_QUEUE_DEPTH, TRANSPORT_ENV,
-    URING_QUEUE_DEPTH_ENV,
+    TransportPolicy, UringZeroCopy, CLUSTER_LOCKS_URING_QUEUE_DEPTH, DEFAULT_URING_QUEUE_DEPTH,
+    TRANSPORT_ENV, URING_QUEUE_DEPTH_ENV, URING_ZERO_COPY_ENV,
 };
 pub use stats::{FallbackReason, LockWaitCounter, SessionStats, TransportFallback};
 

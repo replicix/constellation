@@ -22,6 +22,10 @@ bitflags! {
         const FOPEN_PARALLEL_DIRECT_WRITES = 1 << 6;
         /// the file is fd-backed (via the backing_id field)
         const FOPEN_PASSTHROUGH = 1 << 7;
+        /// CONSTELLATION PATCH (io-uring): reads and writes of this open file are zero-copied
+        /// on a zero-copy io_uring queue (`ReplyOpen::opened_zero_copy`); ignored elsewhere.
+        /// Since ABI 7.46
+        const FOPEN_IO_URING_ZERO_COPY = 1 << 8;
         /// purge cached attributes on open
         #[cfg(target_os = "macos")]
         const FOPEN_PURGE_ATTR = 1 << 30;

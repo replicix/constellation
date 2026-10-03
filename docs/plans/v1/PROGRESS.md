@@ -35303,3 +35303,57 @@ this scenario, whose files are one byte.
 | `harness run` on the 14 scenarios named `*create*`, `*rename*`, `*mkdir*`, `*forward*`, `*mutate*` plus `session-exists-observed`, `dev-fuse` and `auto` | 15/15 and 15/15 PASSED |
 | `docker compose -p crfix --profile test run --rm --build compliance` (private image tag, floci port unbound; image rebuilt from this tree) | `8798 passed, 0 failed` |
 | Revert checks | post-forward branch on `unlinked`: `a_close_the_sequencer_answers_not_found…` fails (`Ok(())` vs `Err(Stale)`); supersession rule off: both `a_later_*_of_a_hinted_name_ends_the_hint` fail (`p19` put back) |
+
+## Plan 38 Z4a — zero-copy queues, fuser side
+
+Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z4,
+its fuser half: the 7.3 zero-copy ABI re-verified against the running
+kernel (7.3.0-rc4, `165768bb7026`), `ADD_QUEUE`/`ADD_BUFPOOL`/`READ_FIXED`
+and `FOPEN_IO_URING_ZERO_COPY` in patch 0002, and `Transport::UringZeroCopy`
+negotiated. No read is routed to zero-copy yet (Z4b). The ABI record, the
+design and the measured memory are in `vendor/fuser/CONSTELLATION-PATCH.md`
+("Plan 38 Z4a").
+
+### Z4a items
+
+| Item | State | Where |
+|---|---|---|
+| ABI re-verification record (constants, structs, observed failed `ADD_QUEUE`) | done | `vendor/fuser/CONSTELLATION-PATCH.md` "The ABI, re-verified"; layout tests in `ll/fuse_abi.rs` |
+| `ADD_QUEUE(FUSE_URING_ZERO_COPY)` + `ADD_BUFPOOL`, only with `FUSE_HAS_IO_URING_BUFPOOL` offered and `CAP_SYS_ADMIN` | done | patch 0002: `Session::zero_copy_plan`, `Ring::set_up_table`/`set_up_queues`, `RingSet::start` |
+| Degrade to `Uring` before any REGISTER, logged once; one transport per session | done | three session-wide barriers (tables on every ring → queues/pools → REGISTER); a table refused on one ring withdraws every ring's; `RingCommit::transport` reads the session's decision |
+| Pools: unregistered by default, `pinned` opt-in, mapped after everything the ring needs | done | `Config::io_uring_register_pool` default `false`; `CONSTELLATION_FUSE_URING_ZERO_COPY` = `auto` (unpinned) / `pinned` / `off` (`crates/frontend-fuse/src/session.rs`, `docs/reference/configuration.md`) |
+| `ReplyOpen::opened_zero_copy`, `ReplyData::read_fixed` (any thread), `ReplyData::zero_copy` | done | `vendor/fuser/src/reply.rs`, `uring/ring.rs`; bounce through a memfd for byte replies; a short bounced `READ_FIXED` is `EIO` |
+| Pool-queue safety: no-out-arg requests get reply capacity 0; refusals logged once per kind | done | `has_out_args`, `Ring::locate_payload`, `handle_fetch` |
+| In-memory 7.3 kernel + tests | done | `InMemoryRingKernel::with_buffer_pools` (+ refusing tables/queues/fixed pools, short `READ_FIXED`); `session::uring_test` zero-copy tests (pinned and unpinned, ring-1 table refusal, short reads); `wire_uring.rs` third leg |
+| Real kernel: mount, `uring_zc`, `read_fixed`, `dd iflag=direct` + buffered | done | `read_fixed_serves_a_real_mount_on_whatever_transport_it_gets`, root: unregistered and registered pools both `uring_zc`; user: `uring` |
+| Exact transport expectation in the frontend mount test | done | `a_mount_that_asks_for_the_ring_serves_on_whatever_it_gets`: `uring_zc` iff INIT offered bufpools and `CAP_SYS_ADMIN` in the initial userns |
+| `transport-enomem-ring` zero-copy round | done | root on 7.3: `RLIMIT_AS` between the entries and the pools → plain `uring`, no fallback, pools' `ENOMEM` logged once; skipped with the reason elsewhere |
+| Root-only fuser failures | done | `umount_impl` treats `EBUSY` as `EPERM` (lazy detach); `dropped_from_fd_session_aborts_the_connection` accepts the kernel's `ECANCELED` and sizes its leak line from the negotiated `max_write`; leak lines name their ring. Fuser suite 172/172 as root and as user |
+| Harness `/tmp` hygiene | done | node keys in the scenario's own tempdir (`scenario_key`: coop, snapshot-lifecycle, p2p-invalidation, epoch, node-leave, p2p-handover, forwarded-mutations, scratch-publish, partition); m14 logs per run; the transport census is checked at start and a failed append fails the run |
+| RSS, unpinned vs pinned (§4) | done | CONSTELLATION-PATCH.md "Memory, measured": pinned pool 256 MiB resident from the mount (1 GiB at depth 32); unpinned 0 idle, 14-30 MB after one 256 MiB workload, the full 256 MiB under a sustained one, never returned |
+| Read routing, chunk-spanning fallback, `--cache-verify always`, 7.3 CI lane | Z4b | — |
+
+### Gates (this host, kernel 7.3.0-0.rc4, `fuse.enable_uring=Y`, `CARGO_TARGET_DIR` unset)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` (feature on) / `-p constellation-frontend-fuse` (feature off) | clean / clean |
+| `cargo test --workspace` (run as three slices under the tool time cap) | 2308 passed, 0 failed, 47 ignored |
+| fuser suite, `--features io-uring`: user / root / feature off | 172/172 / 172/172 (×3 on the final code, ×6 before the pool-order change) / 73/73 |
+| `tools/vendor-fuser.sh --check` | ok |
+| `bash tests/smoke.sh`: user default / user `uring` / root `uring` (zero-copy auto) | PASSED ×3 |
+| `harness run e2e-basic cold-cache readahead coop-cache-hit fio-latency transport-detach-refused`, `CONSTELLATION_FUSE_TRANSPORT=uring`: user / root | ALL PASSED, census 13 `uring` / ALL PASSED, census 13 `uring_zc` |
+| `harness run transport-enomem-ring`: root ×3 / user | PASSED (zero-copy round ran) / PASSED (round skipped, reason printed) |
+| `tests/transport-matrix.sh` (legs run one at a time) | 17/18 per leg; census dev-fuse 29 dev_fuse, 11 uring, 3 ring_setup_failed, 3 cluster_locks; auto 31 cluster_locks, 11 uring, 3 ring_setup_failed, 1 dev_fuse; uring 39 uring, 3 ring_setup_failed, 3 cluster_locks, 1 dev_fuse. The one failure per leg is `transport-lock-wait-budget` (below) |
+
+### Open
+
+- **`transport-lock-wait-budget` fails on main `b458669`** (the rebase base,
+  "fence the lapsed lock owner's process … grant TTL 20 s"), not only on this
+  tree: in its `default-depth` round (the second mount of the same client)
+  the holder's first `F_SETLK` on a fresh file returns `EAGAIN`. Reproduced
+  3/3 on this tree and 2/2 with main's own release binaries
+  (`/var/tmp` export of `b458669`), as a user, so no zero-copy is involved.
+  The `explicit-depth` round passes. Not bisected; the lock-fencing change
+  in `b458669` is the suspect.

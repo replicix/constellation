@@ -865,7 +865,7 @@ pub fn on_every_transport(seed: u64) -> Result<()> {
                     "{leg}: asked for no ring: {mount}"
                 ),
                 _ if ring_host => ensure!(
-                    transport == "uring" && mount["last_fallback"].is_null(),
+                    super::transport::is_ring(&transport) && mount["last_fallback"].is_null(),
                     "{leg}: a ring host must grant the ring: {mount}"
                 ),
                 _ => {

@@ -2675,13 +2675,12 @@ fn snapshot_lifecycle(_seed: u64) -> Result<()> {
     // while c0 holds the lease and writes. A long idle release keeps the
     // lease with c0 between its writes.
     let tune = |c: Client, key: &str| {
-        let _ = std::fs::remove_file(key);
         c.with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "30000")
             .with_env("CONSTELLATION_NODE_KEY", key)
     };
     let mut client = tune(
         Client::new(root.path(), "c0", &env.endpoint, &backend)?,
-        "/tmp/.constellation-snap-life-c0.key",
+        &scenario_key(root.path(), "snap-life-c0"),
     );
     client.fs_create()?;
     client.mount()?;
@@ -2720,7 +2719,7 @@ fn snapshot_lifecycle(_seed: u64) -> Result<()> {
     // where it is (holder and epoch), while the holder keeps writing.
     let mut other = tune(
         Client::new(root.path(), "c1", &env.endpoint, &backend)?,
-        "/tmp/.constellation-snap-life-c1.key",
+        &scenario_key(root.path(), "snap-life-c1"),
     );
     other.mount()?;
     wait_for_p2p(&[&client, &other])?;
@@ -3512,18 +3511,16 @@ fn p2p_invalidation(_seed: u64) -> Result<()> {
     let (env, root) = setup("p2p-invalidation")?;
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/p2pinval-{}", ts());
+    // Distinct host keys: the node key is per host, and both "hosts"
+    // here share one machine.
     let mut c0 = slow(Client::new(root.path(), "c0", &env.endpoint, &backend)?).with_env(
         "CONSTELLATION_NODE_KEY",
-        "/tmp/.constellation-harness-c0.key",
+        &scenario_key(root.path(), "harness-c0"),
     );
     let mut c1 = slow(Client::new(root.path(), "c1", &env.endpoint, &backend)?).with_env(
         "CONSTELLATION_NODE_KEY",
-        "/tmp/.constellation-harness-c1.key",
+        &scenario_key(root.path(), "harness-c1"),
     );
-    // Distinct host keys: the node key is per host, and both "hosts"
-    // here share one machine.
-    let _ = std::fs::remove_file("/tmp/.constellation-harness-c0.key");
-    let _ = std::fs::remove_file("/tmp/.constellation-harness-c1.key");
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;
@@ -3641,6 +3638,23 @@ fn wait_for_p2p(clients: &[&Client]) -> Result<()> {
     wait_for_peers(clients)
 }
 
+/// A node key path private to this scenario run: `<root>/.<tag>.key`,
+/// handed to the daemon as `CONSTELLATION_NODE_KEY` (the daemon creates
+/// the key on first mount and reuses it on later mounts, so a node keeps
+/// its identity across restarts within the scenario).
+///
+/// The scenarios used fixed `/tmp/.constellation-*.key` paths before,
+/// shared by every run and every user on the host. With
+/// `fs.protected_regular=1` in the sticky `/tmp`, a key left behind by a
+/// root run could not be opened by an unprivileged run (nor the reverse),
+/// so the daemon came up without a fast path ("p2p.enabled: false"); and
+/// two concurrent runs gave their nodes the same identity. The scenario's
+/// own tempdir is per run and owned by whoever runs it, and starts empty,
+/// so no stale key needs deleting first.
+fn scenario_key(root: &std::path::Path, tag: &str) -> String {
+    root.join(format!(".{tag}.key")).display().to_string()
+}
+
 fn coop_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["coop"].clone())
 }
@@ -3651,8 +3665,7 @@ fn coop_client(
     endpoint: &str,
     backend: &str,
 ) -> Result<Client> {
-    let key = format!("/tmp/.constellation-coop-{name}.key");
-    let _ = std::fs::remove_file(&key);
+    let key = scenario_key(root, &format!("coop-{name}"));
     Ok(Client::new(root, name, endpoint, backend)?
         .with_env("CONSTELLATION_NODE_KEY", &key)
         .with_env("CONSTELLATION_DIGEST_INTERVAL_S", "1"))
@@ -4549,11 +4562,11 @@ fn epoch_clients(env: &S3Env, root: &std::path::Path, backend: &str) -> Result<(
     Ok((
         tune(
             Client::new(root, "c0", &env.endpoint, backend)?,
-            "/tmp/.constellation-epoch-c0.key",
+            &scenario_key(root, "epoch-c0"),
         ),
         tune(
             Client::new(root, "c1", &env.endpoint, backend)?,
-            "/tmp/.constellation-epoch-c1.key",
+            &scenario_key(root, "epoch-c1"),
         ),
     ))
 }
@@ -5764,15 +5777,15 @@ fn node_leave(_seed: u64) -> Result<()> {
     };
     let mut c0 = tune(
         Client::new(root.path(), "c0", &env.endpoint, &backend)?,
-        "/tmp/.constellation-leave-c0.key",
+        &scenario_key(root.path(), "leave-c0"),
     );
     let mut c1 = tune(
         Client::new(root.path(), "c1", &env.endpoint, &backend)?,
-        "/tmp/.constellation-leave-c1.key",
+        &scenario_key(root.path(), "leave-c1"),
     );
     let mut c2 = tune(
         Client::new(root.path(), "c2", &env.endpoint, &backend)?,
-        "/tmp/.constellation-leave-c2.key",
+        &scenario_key(root.path(), "leave-c2"),
     );
     c0.fs_create()?;
     c0.mount()?;
@@ -5864,7 +5877,7 @@ fn node_leave(_seed: u64) -> Result<()> {
     // Remount C under a *fresh* state dir so it claims a new id, then leave.
     let mut c3 = tune(
         Client::new(root.path(), "c3", &env.endpoint, &backend)?,
-        "/tmp/.constellation-leave-c3.key",
+        &scenario_key(root.path(), "leave-c3"),
     );
     c3.mount()?;
     eventually("C3 peers with A+B", Duration::from_secs(30), || {
@@ -6944,15 +6957,13 @@ fn p2p_handover(_seed: u64) -> Result<()> {
             .with_env("CONSTELLATION_FORWARD", "off")
             .with_env("CONSTELLATION_NODE_KEY", key)
     };
-    let _ = std::fs::remove_file("/tmp/.constellation-hand-c0.key");
-    let _ = std::fs::remove_file("/tmp/.constellation-hand-c1.key");
     let mut c0 = tune(
         Client::new(root.path(), "c0", &env.endpoint, &backend)?,
-        "/tmp/.constellation-hand-c0.key",
+        &scenario_key(root.path(), "hand-c0"),
     );
     let mut c1 = tune(
         Client::new(root.path(), "c1", &env.endpoint, &backend)?,
-        "/tmp/.constellation-hand-c1.key",
+        &scenario_key(root.path(), "hand-c1"),
     );
     c0.fs_create()?;
     c0.mount()?;
@@ -7016,10 +7027,8 @@ fn forwarded_mutations(_seed: u64) -> Result<()> {
         c.with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", &idle_ms.to_string())
             .with_env("CONSTELLATION_NODE_KEY", key)
     };
-    let c0_key = "/tmp/.constellation-forward-c0.key";
-    let c1_key = "/tmp/.constellation-forward-c1.key";
-    let _ = std::fs::remove_file(c0_key);
-    let _ = std::fs::remove_file(c1_key);
+    let c0_key = &scenario_key(root.path(), "forward-c0");
+    let c1_key = &scenario_key(root.path(), "forward-c1");
     let mut c0 = tune(
         Client::new(root.path(), "c0", &env.endpoint, &backend)?,
         c0_key,
@@ -7251,10 +7260,8 @@ fn scratch_publish(_seed: u64) -> Result<()> {
     let (env, root) = setup("scratch-publish")?;
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/scratch-publish-{}", ts());
-    let c0_key = "/tmp/.constellation-scratch-c0.key";
-    let c1_key = "/tmp/.constellation-scratch-c1.key";
-    let _ = std::fs::remove_file(c0_key);
-    let _ = std::fs::remove_file(c1_key);
+    let c0_key = &scenario_key(root.path(), "scratch-c0");
+    let c1_key = &scenario_key(root.path(), "scratch-c1");
     let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?
         .with_env("CONSTELLATION_NODE_KEY", c0_key);
     let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?
@@ -7325,10 +7332,11 @@ fn p2p_partition_tolerance(seed: u64) -> Result<()> {
     let backend = format!("s3://{BUCKET}/p2ppart-{}", ts());
     let mut c0 = Client::new(root.path(), "c0", &env.endpoint, &backend)?;
     // Only c1 has the fast path; c0 cannot participate at all.
-    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_NODE_KEY", "/tmp/.constellation-part-c1.key");
+    let mut c1 = Client::new(root.path(), "c1", &env.endpoint, &backend)?.with_env(
+        "CONSTELLATION_NODE_KEY",
+        &scenario_key(root.path(), "part-c1"),
+    );
     c0 = c0.with_env("CONSTELLATION_P2P", "off");
-    let _ = std::fs::remove_file("/tmp/.constellation-part-c1.key");
     c0.fs_create()?;
     c0.mount()?;
     c1.mount()?;

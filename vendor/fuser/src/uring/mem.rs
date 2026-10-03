@@ -37,6 +37,10 @@ pub(crate) const COMMIT_ID_OFFSET: usize =
     ENT_IN_OUT_OFFSET + offset_of!(abi::fuse_uring_ent_in_out, commit_id);
 pub(crate) const PAYLOAD_SZ_OFFSET: usize =
     ENT_IN_OUT_OFFSET + offset_of!(abi::fuse_uring_ent_in_out, payload_sz);
+/// CONSTELLATION PATCH (io-uring): `fuse_uring_ent_in_out.offset` (ABI 7.46): where in its
+/// queue's buffer pool a fetched request's payload buffer lies.
+pub(crate) const POOL_OFFSET_OFFSET: usize =
+    ENT_IN_OUT_OFFSET + offset_of!(abi::fuse_uring_ent_in_out, offset);
 
 /// Size of the header area of every entry, and so the offset of its payload.
 pub(crate) fn header_area() -> usize {
@@ -137,6 +141,129 @@ impl Drop for RingMemory {
     }
 }
 
+/// CONSTELLATION PATCH (io-uring): the buffer pools of one zero-copy ring (plan 38 Z4): one
+/// anonymous mapping, cut into one slice of `depth` buffers of `buf_size` bytes per queue of
+/// the ring, each slice handed to the kernel with `FUSE_IO_URING_CMD_ADD_BUFPOOL`.
+///
+/// ```text
+/// queue q of the ring (its position among the ring's queues) at base + q * depth * buf_size
+///   [i * buf_size, (i + 1) * buf_size)   buffer i, chosen by the kernel per request
+/// ```
+///
+/// `buf_size` must be the kernel's own `max_payload_sz` exactly: the kernel cuts the slice
+/// into `len / max_payload_sz` buffers at that stride and reports a request's buffer by its
+/// byte offset (`fuse_uring_ent_in_out.offset`), so a reply this side writes up to a larger
+/// cap would spill into the next buffer. The whole mapping is registered as one io_uring fixed
+/// buffer when the pool is registered, which pins (and so faults in) every page of it.
+/// Unmapped on drop, so the owner must only drop it once no SQE naming it is pending.
+#[derive(Debug)]
+pub(crate) struct PoolMemory {
+    base: NonNull<u8>,
+    len: usize,
+    slice: usize,
+    buf_size: usize,
+}
+
+// SAFETY: as for `RingMemory`: plain memory owned by this value, reached only through raw
+// pointers under the entry state machine.
+unsafe impl Send for PoolMemory {}
+unsafe impl Sync for PoolMemory {}
+
+impl PoolMemory {
+    /// Maps `queues` slices of `depth` buffers of `buf_size` bytes. `buf_size` must be a page
+    /// multiple (the kernel's `max_payload_sz` always is: at least 8192, else `max_write` or
+    /// `max_pages * PAGE_SIZE`) and every slice must fit the ADD_BUFPOOL's `u32` length.
+    pub(crate) fn new(queues: usize, depth: usize, buf_size: usize) -> io::Result<Self> {
+        let overflow = || io::Error::other("buffer pool size overflows");
+        if buf_size == 0 || buf_size % header_area() != 0 {
+            return Err(io::Error::other(format!(
+                "buffer pool buffers of {buf_size} bytes are not a page multiple"
+            )));
+        }
+        let slice = depth
+            .checked_mul(buf_size)
+            .filter(|s| *s > 0 && u32::try_from(*s).is_ok())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "a queue's pool of {depth} x {buf_size} bytes exceeds the 4 GiB an \
+                     ADD_BUFPOOL can name"
+                ))
+            })?;
+        let len = queues
+            .checked_mul(slice)
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(overflow)?;
+        // SAFETY: an anonymous private mapping at a kernel-chosen address aliases nothing.
+        let base = unsafe {
+            nix::sys::mman::mmap_anonymous(
+                None,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_NORESERVE,
+            )
+        }
+        .map_err(|err| {
+            io::Error::new(
+                io::Error::from(err).kind(),
+                format!("reserving {len} bytes for buffer pools failed ({err})"),
+            )
+        })?;
+        let pool = Self {
+            base: base.cast(),
+            len: len.get(),
+            slice,
+            buf_size,
+        };
+        // As for the entry buffers: the kernel writes here on behalf of this process only
+        // SAFETY: the range is the mapping just created.
+        unsafe { nix::sys::mman::madvise(base, pool.len, MmapAdvise::MADV_DONTFORK)? };
+        Ok(pool)
+    }
+
+    /// The whole mapping, as the one io_uring fixed buffer that registers it.
+    pub(crate) fn iovec(&self) -> libc::iovec {
+        libc::iovec {
+            iov_base: self.base.as_ptr().cast(),
+            iov_len: self.len,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn buf_size(&self) -> usize {
+        self.buf_size
+    }
+
+    /// Start and length of the slice of the ring's `q`-th queue: the ADD_BUFPOOL's pool.
+    pub(crate) fn slice(&self, q: usize) -> (NonNull<u8>, usize) {
+        assert!((q + 1) * self.slice <= self.len, "queue {q} of the pool");
+        // SAFETY: q * slice < len, so the result stays inside the mapping.
+        (unsafe { self.base.add(q * self.slice) }, self.slice)
+    }
+
+    /// The buffer at `offset` into queue `q`'s slice, as the kernel reports it on a fetch;
+    /// `None` when that is not the start of a whole buffer of the slice, which a well-behaved
+    /// kernel never reports.
+    pub(crate) fn buffer(&self, q: usize, offset: u32) -> Option<NonNull<u8>> {
+        let offset = offset as usize;
+        if offset % self.buf_size != 0 || offset + self.buf_size > self.slice {
+            return None;
+        }
+        let (start, _) = self.slice(q);
+        // SAFETY: inside queue q's slice, checked just above.
+        Some(unsafe { start.add(offset) })
+    }
+}
+
+impl Drop for PoolMemory {
+    fn drop(&mut self) {
+        // SAFETY: base/len describe the mapping created in `new`, which nothing else unmaps.
+        let _ = unsafe { nix::sys::mman::munmap(self.base.cast(), self.len) };
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test {
     use std::fs;
@@ -218,6 +345,7 @@ pub(crate) mod test {
         assert_eq!(FLAGS_OFFSET, 256);
         assert_eq!(COMMIT_ID_OFFSET, 264);
         assert_eq!(PAYLOAD_SZ_OFFSET, 272);
+        assert_eq!(POOL_OFFSET_OFFSET, 276);
         assert!(header_area() >= HEADER_SZ + STAGING_SZ);
     }
 
@@ -257,6 +385,49 @@ pub(crate) mod test {
         let mem = RingMemory::new(1, 8192 + 1).unwrap();
         assert_eq!(mem.payload_cap(), 8193usize.next_multiple_of(page));
         assert_eq!(RingMemory::new(1, page).unwrap().payload_cap(), page);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): a pool's queue slices and buffers sit where the kernel
+    /// reports them, and only whole buffers of a slice are ever handed out.
+    #[test]
+    fn pool_slices_and_buffers() {
+        let page = page_size::get();
+        let pool = PoolMemory::new(3, 4, 2 * page).unwrap();
+        assert_eq!(pool.len(), 3 * 4 * 2 * page);
+        assert_eq!(pool.buf_size(), 2 * page);
+        let base = pool.iovec().iov_base as usize;
+        assert_eq!(pool.iovec().iov_len, pool.len());
+        for q in 0..3 {
+            let (start, len) = pool.slice(q);
+            assert_eq!(start.as_ptr() as usize, base + q * 8 * page);
+            assert_eq!(len, 8 * page);
+            for i in 0..4u32 {
+                let at = pool.buffer(q, i * 2 * page as u32).unwrap().as_ptr() as usize;
+                assert_eq!(at, base + q * 8 * page + i as usize * 2 * page);
+            }
+            assert!(
+                pool.buffer(q, 4 * 2 * page as u32).is_none(),
+                "past the slice"
+            );
+            assert!(
+                pool.buffer(q, page as u32).is_none(),
+                "not a buffer's start"
+            );
+        }
+        let flags = vm_flags(base);
+        assert!(
+            flags.split(' ').any(|f| f == "dc"),
+            "MADV_DONTFORK: {flags}"
+        );
+        assert!(
+            PoolMemory::new(1, 1, page + 1).is_err(),
+            "not a page multiple"
+        );
+        assert!(
+            PoolMemory::new(1, 1 << 20, 1 << 20).is_err(),
+            "a slice past 4 GiB"
+        );
+        assert!(PoolMemory::new(0, 1, page).is_err());
     }
 
     #[test]

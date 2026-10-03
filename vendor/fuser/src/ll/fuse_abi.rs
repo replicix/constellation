@@ -767,7 +767,9 @@ pub(crate) const FUSE_URING_IN_OUT_HEADER_SZ: usize = 128;
 pub(crate) const FUSE_URING_OP_IN_OUT_SZ: usize = 128;
 
 /// Commands carried in `io_uring_sqe.cmd_op` for `IORING_OP_URING_CMD` on `/dev/fuse`.
-/// Since ABI 7.42. 7.46 adds `ADD_QUEUE = 3` and `ADD_BUFPOOL = 4`, not declared here
+/// Since ABI 7.42; `ADD_QUEUE` and `ADD_BUFPOOL` since 7.46 (kernel 7.3, CONSTELLATION PATCH
+/// (io-uring), plan 38 Z4: re-verified against the running kernel's uapi header,
+/// vendor/fuser/CONSTELLATION-PATCH.md "Zero-copy").
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
 #[allow(non_camel_case_types)]
@@ -775,10 +777,23 @@ pub(crate) enum fuse_uring_cmd {
     FUSE_IO_URING_CMD_INVALID = 0,
     FUSE_IO_URING_CMD_REGISTER = 1,
     FUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+    /// Creates a queue before its first REGISTER, with `fuse_uring_cmd_req.flags`
+    FUSE_IO_URING_CMD_ADD_QUEUE = 3,
+    /// Gives a queue created by `ADD_QUEUE` its buffer pool (`fuse_uring_bufpool`)
+    FUSE_IO_URING_CMD_ADD_BUFPOOL = 4,
 }
 
+/// `fuse_uring_cmd_req.flags` of an `ADD_QUEUE`: the queue's entries register a slot of the
+/// server's io_uring buffer table, into which the kernel registers a request's pages for
+/// `READ_FIXED`/`WRITE_FIXED`. Needs a buffer pool and `CAP_SYS_ADMIN`. Since ABI 7.46
+pub(crate) const FUSE_URING_ZERO_COPY: u64 = 1 << 0;
+
+/// `fuse_uring_ent_in_out.flags` on fetch: the request's page payload is registered in the
+/// entry's buffer-table slot instead of being copied into the payload buffer. Since ABI 7.46
+pub(crate) const FUSE_URING_ENT_ZERO_COPY: u64 = 1 << 0;
+
 /// Trailer of `fuse_uring_req_header`, written by the kernel on fetch and by userspace on
-/// commit. Since ABI 7.42. `padding` becomes `offset` in 7.46 and must be sent as zero
+/// commit. Since ABI 7.42; `offset` (the `padding` of 7.42-7.45) since 7.46
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct fuse_uring_ent_in_out {
@@ -787,7 +802,10 @@ pub(crate) struct fuse_uring_ent_in_out {
     pub(crate) commit_id: u64,
     /// Bytes valid in the payload buffer, in either direction
     pub(crate) payload_sz: u32,
-    pub(crate) padding: u32,
+    /// On a fetch from a queue with a buffer pool: where in the pool the kernel put the
+    /// request's payload buffer. 0 when the request got none, which is indistinguishable from
+    /// the pool's first buffer; must be sent as zero
+    pub(crate) offset: u32,
     pub(crate) reserved: u64,
 }
 
@@ -803,7 +821,9 @@ pub(crate) struct fuse_uring_req_header {
 }
 
 /// The command data in the 80-byte area of an SQE128. Since ABI 7.42. 7.46 grows this to
-/// 40 bytes with a trailing union; the rest of the 80-byte cmd area must be zero
+/// 40 bytes with a trailing union (`fuse_uring_bufpool` for an `ADD_BUFPOOL`, a `u16`
+/// `ent_zero_copy_buf_index` for a REGISTER on a zero-copy queue), written at
+/// [`FUSE_URING_CMD_REQ_UNION_OFFSET`]; the rest of the 80-byte cmd area must be zero
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub(crate) struct fuse_uring_cmd_req {
@@ -812,6 +832,20 @@ pub(crate) struct fuse_uring_cmd_req {
     pub(crate) commit_id: u64,
     pub(crate) qid: u16,
     pub(crate) padding: [u8; 6],
+}
+
+/// Byte offset of the 7.46 union in `fuse_uring_cmd_req`, just past the 7.42 fields.
+pub(crate) const FUSE_URING_CMD_REQ_UNION_OFFSET: usize = size_of::<fuse_uring_cmd_req>();
+
+/// The `bufpool` arm of `fuse_uring_cmd_req`'s union: the pool of an `ADD_BUFPOOL`, which the
+/// kernel cuts into `len / max_payload` buffers. Since ABI 7.46
+#[repr(C)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub(crate) struct fuse_uring_bufpool {
+    pub(crate) uaddr: u64,
+    pub(crate) len: u32,
+    /// Must be zero
+    pub(crate) reserved: u32,
 }
 
 #[cfg(test)]
@@ -827,7 +861,7 @@ mod test {
         assert_eq!(offset_of!(fuse_uring_ent_in_out, flags), 0);
         assert_eq!(offset_of!(fuse_uring_ent_in_out, commit_id), 8);
         assert_eq!(offset_of!(fuse_uring_ent_in_out, payload_sz), 16);
-        assert_eq!(offset_of!(fuse_uring_ent_in_out, padding), 20);
+        assert_eq!(offset_of!(fuse_uring_ent_in_out, offset), 20);
         assert_eq!(offset_of!(fuse_uring_ent_in_out, reserved), 24);
     }
 
@@ -848,6 +882,21 @@ mod test {
         assert_eq!(offset_of!(fuse_uring_cmd_req, commit_id), 8);
         assert_eq!(offset_of!(fuse_uring_cmd_req, qid), 16);
         assert_eq!(offset_of!(fuse_uring_cmd_req, padding), 18);
+    }
+
+    /// CONSTELLATION PATCH (io-uring): the 7.46 union of `include/uapi/linux/fuse.h` (kernel
+    /// 7.3): `struct { u64 uaddr; u32 len; u32 reserved; } bufpool` or `u16
+    /// ent_zero_copy_buf_index`, right after `padding[6]`, making the struct 40 bytes.
+    #[test]
+    fn uring_cmd_req_union_layout() {
+        assert_eq!(FUSE_URING_CMD_REQ_UNION_OFFSET, 24);
+        assert_eq!(size_of::<fuse_uring_bufpool>(), 16);
+        assert_eq!(offset_of!(fuse_uring_bufpool, uaddr), 0);
+        assert_eq!(offset_of!(fuse_uring_bufpool, len), 8);
+        assert_eq!(offset_of!(fuse_uring_bufpool, reserved), 12);
+        assert!(FUSE_URING_CMD_REQ_UNION_OFFSET + size_of::<fuse_uring_bufpool>() <= 80);
+        assert_eq!(fuse_uring_cmd::FUSE_IO_URING_CMD_ADD_QUEUE as u32, 3);
+        assert_eq!(fuse_uring_cmd::FUSE_IO_URING_CMD_ADD_BUFPOOL as u32, 4);
     }
 
     #[test]
@@ -890,7 +939,7 @@ mod test {
         assert_eq!(hdr.ring_ent_in_out.flags, 0x0102_0304_0506_0708);
         assert_eq!(hdr.ring_ent_in_out.commit_id, 0x1112_1314_1516_1718);
         assert_eq!(hdr.ring_ent_in_out.payload_sz, 0x2122_2324);
-        assert_eq!(hdr.ring_ent_in_out.padding, 0x3132_3334);
+        assert_eq!(hdr.ring_ent_in_out.offset, 0x3132_3334);
         assert_eq!(hdr.ring_ent_in_out.reserved, 0x5152_5354_5556_5758);
         assert_eq!(hdr.as_bytes(), &bytes);
     }
@@ -909,7 +958,16 @@ mod test {
             fuse_uring_cmd::try_from(2),
             Ok(FUSE_IO_URING_CMD_COMMIT_AND_FETCH)
         );
-        assert_eq!(fuse_uring_cmd::try_from(3).unwrap_err().number, 3);
+        // CONSTELLATION PATCH (io-uring): 3 and 4 are 7.46's ADD_QUEUE and ADD_BUFPOOL
+        assert_eq!(
+            fuse_uring_cmd::try_from(3),
+            Ok(fuse_uring_cmd::FUSE_IO_URING_CMD_ADD_QUEUE)
+        );
+        assert_eq!(
+            fuse_uring_cmd::try_from(4),
+            Ok(fuse_uring_cmd::FUSE_IO_URING_CMD_ADD_BUFPOOL)
+        );
+        assert_eq!(fuse_uring_cmd::try_from(5).unwrap_err().number, 5);
         assert!(fuse_uring_cmd::try_from(u32::MAX).is_err());
     }
 

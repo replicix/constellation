@@ -92,6 +92,10 @@ bitflags! {
         const FUSE_OVER_IO_URING = 1 << 41;
         /// kernel supports request timeout
         const FUSE_REQUEST_TIMEOUT = 1 << 42;
+        /// CONSTELLATION PATCH (io-uring): kernel supports io_uring buffer pools
+        /// (`FUSE_IO_URING_CMD_ADD_QUEUE`/`ADD_BUFPOOL`) and, with them, zero-copy queues.
+        /// Offered, never echoed: the kernel reads nothing from the reply's bit. Since ABI 7.46
+        const FUSE_HAS_IO_URING_BUFPOOL = 1 << 43;
 
         /// pre-allocate space for a file
         #[cfg(target_os = "macos")]

@@ -1071,9 +1071,13 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
     result
 }
 
-/// On failure, the nodes' logs survive the tempdir (`/tmp/harness-m14-logs`).
+/// On failure, the nodes' logs survive the tempdir, under this run's own
+/// [`super::m11::kept_logs_dir`]. A fixed `/tmp/harness-m14-logs` was
+/// shared by every run and every user on the host: concurrent runs
+/// overwrote each other's logs, and with `fs.protected_regular=1` a run
+/// as one user could not overwrite a log another user had left there.
 fn keep_logs(scenario: &str, clients: &[Client]) {
-    let dir = Path::new("/tmp/harness-m14-logs");
+    let dir = super::m11::kept_logs_dir();
     let _ = std::fs::create_dir_all(dir);
     for c in clients {
         let log = c.mnt.parent().map(|p| p.join("mount.log"));

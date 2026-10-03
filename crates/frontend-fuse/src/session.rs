@@ -153,6 +153,65 @@ pub const TRANSPORT_ENV: &str = "CONSTELLATION_FUSE_TRANSPORT";
 /// Env override of `--fuse-uring-queue-depth` ([`TransportConfig::resolve`]).
 pub const URING_QUEUE_DEPTH_ENV: &str = "CONSTELLATION_FUSE_URING_QUEUE_DEPTH";
 
+/// Plan 38 Z4: whether a mount that gets the ring tries io_uring
+/// zero-copy queues ([`UringZeroCopy`], resolved with the rest of the
+/// transport knob by [`TransportConfig::resolve`]):
+///
+/// - `auto` (the default): zero-copy queues wherever the kernel offers
+///   buffer pools (`FUSE_HAS_IO_URING_BUFPOOL`, 7.3+) and the daemon has
+///   `CAP_SYS_ADMIN`, their buffer pools handed to the kernel unregistered:
+///   a pool page becomes resident when a request first uses it and is never
+///   given back, so a busy mount converges on the whole pool -- possible
+///   CPUs x queue depth x one request's payload (1 MiB): 256 MiB at 32
+///   CPUs and depth 8, 1 GiB at depth 32. The session negotiates `uring_zc`
+///   then; anything short of that is plain `uring`, logged once by fuser.
+/// - `pinned`: the same, with the pools registered as an io_uring fixed
+///   buffer: all of it resident and pinned from the mount on, charged to
+///   `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`, in exchange for the kernel
+///   not importing a request's buffer per request. Opt-in.
+/// - `off`: never; the ring stays `uring` with an entry buffer each.
+///
+/// Zero-copy only changes how replies reach the reader when a file is
+/// opened for it, which nothing in the adapter does yet (plan 38 Z4b);
+/// until then a `uring_zc` session serves exactly as a `uring` one, its
+/// requests' payloads travelling in pool buffers. An unknown value is an
+/// error, as for the other transport knobs.
+pub const URING_ZERO_COPY_ENV: &str = "CONSTELLATION_FUSE_URING_ZERO_COPY";
+
+/// Plan 38 Z4: [`URING_ZERO_COPY_ENV`]'s three answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UringZeroCopy {
+    /// Zero-copy queues where the kernel and the capability allow, their
+    /// pools unregistered (resident as requests touch them).
+    #[default]
+    Auto,
+    /// The same, the pools registered (pinned, all resident from the start).
+    Pinned,
+    /// No zero-copy queues.
+    Off,
+}
+
+impl UringZeroCopy {
+    /// `auto` / `pinned` / `off`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "pinned" => Some(Self::Pinned),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// fuser's `(io_uring_zero_copy, io_uring_register_pool)`.
+    fn fuser(self) -> (bool, bool) {
+        match self {
+            Self::Auto => (true, false),
+            Self::Pinned => (true, true),
+            Self::Off => (false, false),
+        }
+    }
+}
+
 /// Ring entries per kernel queue, when the ring is what a mount gets.
 /// The Skory fork's default, and libfuse's; plan 38 §4 works the ring's
 /// memory budget out as `queues x depth x payload`, so this is one of the
@@ -193,6 +252,9 @@ pub struct TransportConfig {
     /// [`Self::with_cache_verify_always`]). Independent of `policy`:
     /// passthrough needs no ring (plan 38 §2.4).
     pub passthrough: PassthroughPolicy,
+    /// Plan 38 Z4: whether a mount that gets the ring tries zero-copy
+    /// queues ([`URING_ZERO_COPY_ENV`]).
+    pub uring_zero_copy: UringZeroCopy,
 }
 
 impl Default for TransportConfig {
@@ -201,6 +263,7 @@ impl Default for TransportConfig {
             policy: TransportPolicy::default(),
             uring_queue_depth: None,
             passthrough: PassthroughPolicy::platform_default(),
+            uring_zero_copy: UringZeroCopy::default(),
         }
     }
 }
@@ -268,6 +331,12 @@ impl TransportConfig {
         // unknown value is an error, as for the transport above — an
         // operator who typed it wanted one answer or the other, and either
         // silent default is the opposite of one of them.
+        let uring_zero_copy = match get(URING_ZERO_COPY_ENV) {
+            Some(raw) => UringZeroCopy::parse(&raw).ok_or_else(|| {
+                format!("{URING_ZERO_COPY_ENV}={raw}: expected auto, pinned or off")
+            })?,
+            None => UringZeroCopy::default(),
+        };
         let passthrough = match get(PASSTHROUGH_ENV) {
             Some(raw) => match raw.to_ascii_lowercase().as_str() {
                 "1" | "on" | "true" | "yes" => PassthroughPolicy::On,
@@ -280,6 +349,7 @@ impl TransportConfig {
             policy,
             uring_queue_depth: depth,
             passthrough,
+            uring_zero_copy,
         })
     }
 
@@ -352,6 +422,9 @@ pub struct MountOptions {
     /// A handover-capable session asks too: the backing ids it registers
     /// cross a handover with the session (`FuseHandoff::passthrough`).
     pub passthrough: PassthroughPolicy,
+    /// Plan 38 Z4: whether a ring mount tries zero-copy queues, from
+    /// [`TransportConfig::uring_zero_copy`].
+    uring_zero_copy: UringZeroCopy,
 }
 
 impl MountOptions {
@@ -377,6 +450,7 @@ impl MountOptions {
             uring_queue_depth: cfg.uring_queue_depth,
             handover: false,
             passthrough: cfg.passthrough,
+            uring_zero_copy: cfg.uring_zero_copy,
         }
     }
 
@@ -502,6 +576,8 @@ impl MountOptions {
         // exists for -- and fuser logs that once.
         if plan.ring {
             config.io_uring = true;
+            (config.io_uring_zero_copy, config.io_uring_register_pool) =
+                self.uring_zero_copy.fuser();
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             {
                 config.io_uring_malformed_register = uring_fault_malformed_register();
@@ -1818,6 +1894,55 @@ mod tests {
         assert!(!dev.config(plan, &LockWaitCounter::default()).io_uring);
     }
 
+    /// Plan 38 Z4: `CONSTELLATION_FUSE_URING_ZERO_COPY` resolves with the
+    /// rest of the transport knob -- `auto` by default, an unknown value
+    /// refused -- and reaches fuser as its two zero-copy switches.
+    #[test]
+    fn the_zero_copy_knob_reaches_fuser() {
+        let resolve = |pairs: Vec<(&'static str, String)>| {
+            let get = move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.clone())
+            };
+            TransportConfig::resolve_from(get, None, None, TransportPolicy::Uring)
+        };
+        assert_eq!(
+            resolve(vec![]).unwrap().uring_zero_copy,
+            UringZeroCopy::Auto
+        );
+        assert_eq!(
+            TransportConfig::default().uring_zero_copy,
+            UringZeroCopy::Auto
+        );
+        assert!(
+            !fuser::Config::default().io_uring_register_pool,
+            "fuser's default is the unregistered pool too"
+        );
+        for (raw, knob, fuser) in [
+            ("auto", UringZeroCopy::Auto, (true, false)),
+            (" Pinned ", UringZeroCopy::Pinned, (true, true)),
+            ("off", UringZeroCopy::Off, (false, false)),
+        ] {
+            let cfg = resolve(vec![(URING_ZERO_COPY_ENV, raw.to_owned())]).unwrap();
+            assert_eq!(cfg.uring_zero_copy, knob, "{raw}");
+            let opts = MountOptions::new("zc", 2, KernelTuning::for_workers(2), cfg);
+            let plan = opts.plan(&crate::caps(false), true);
+            let config = opts.config(plan, &LockWaitCounter::default());
+            assert_eq!(
+                (config.io_uring_zero_copy, config.io_uring_register_pool),
+                fuser,
+                "{raw}"
+            );
+        }
+        for old in ["unpinned", "yes"] {
+            let err =
+                resolve(vec![(URING_ZERO_COPY_ENV, old.to_owned())]).expect_err("an unknown value");
+            assert!(err.contains(URING_ZERO_COPY_ENV), "{err}");
+        }
+    }
+
     /// Plan 38 Z2c, the maintainer's decision: under `auto` a mount with
     /// cluster locks stays on `/dev/fuse` (and says so as its fallback);
     /// `uring` puts it on the ring with the deeper queue; an explicit
@@ -2299,10 +2424,25 @@ mod tests {
             "mounted with transport auto; this host grants {expected}, the session reports {}",
             session.transport()
         );
+        // Plan 38 Z4: a ring is `uring_zc` exactly where the kernel offered
+        // buffer pools (7.3+) and the process has `CAP_SYS_ADMIN` as the
+        // kernel checks it (in the initial user namespace) -- a test run as
+        // root on such a kernel -- and `uring` anywhere else.
+        let negotiated = session.negotiated_init().expect("negotiated");
+        let bufpool = fuser::InitFlags::from_bits_retain(negotiated.kernel_flags)
+            .contains(fuser::InitFlags::FUSE_HAS_IO_URING_BUFPOOL);
+        let init_userns = std::fs::read_to_string("/proc/self/uid_map")
+            .is_ok_and(|m| m.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"]);
+        let expected = match expected {
+            Transport::Uring if bufpool && crate::has_cap_sys_admin() && init_userns => {
+                Transport::UringZeroCopy
+            }
+            other => other,
+        };
+        eprintln!("buffer pools offered: {bufpool}; expecting {expected}");
         assert_eq!(session.transport(), expected);
         assert_eq!(
-            session.negotiated_init().expect("negotiated").transport,
-            expected,
+            negotiated.transport, expected,
             "the negotiated record and the session agree"
         );
         // Plan 38 §2.4/§5: the session's stats say what it got, and a

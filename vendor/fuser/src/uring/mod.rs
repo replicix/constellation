@@ -24,14 +24,19 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 
 use log::debug;
+use log::warn;
 use nix::unistd::SysconfVar;
 
 use crate::dev_fuse::DevFuse;
 use crate::session::spawn_named;
+use crate::uring::mem::PoolMemory;
 use crate::uring::ring::FetchHandler;
 use crate::uring::ring::IORING_MAX_ENTRIES;
+use crate::uring::ring::PoolSetup;
 use crate::uring::ring::Ring;
 use crate::uring::ring::RingIo;
+use crate::uring::ring::SetupGate;
+use crate::uring::ring::TableSetup;
 use crate::uring::ring::ring_sizes;
 
 /// The kernel's `cpu_possible_mask`, which is the number of queues `REGISTER` must populate
@@ -41,6 +46,61 @@ const POSSIBLE_CPUS: &str = "/sys/devices/system/cpu/possible";
 /// The fuse module's knob: `Y` only on 6.14+ booted with `fuse.enable_uring=1`. The kernel
 /// advertises `FUSE_OVER_IO_URING` in `FUSE_INIT` exactly when this is `Y`.
 const ENABLE_URING: &str = "/sys/module/fuse/parameters/enable_uring";
+
+/// CONSTELLATION PATCH (io-uring): the most pages a FUSE request may carry
+/// (`fs.fuse.max_pages_limit`, default 256), to which the kernel clamps a connection's
+/// `max_pages` when it is created.
+const MAX_PAGES_LIMIT: &str = "/proc/sys/fs/fuse/max_pages_limit";
+
+/// CONSTELLATION PATCH (io-uring): `fs.fuse.max_pages_limit` (`MAX_PAGES_LIMIT`).
+pub(crate) fn max_pages_limit() -> io::Result<usize> {
+    let text = fs::read_to_string(MAX_PAGES_LIMIT)?;
+    text.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{MAX_PAGES_LIMIT} reads {:?}", text.trim()),
+            )
+        })
+}
+
+/// CONSTELLATION PATCH (io-uring): whether the effective capability set holds
+/// `CAP_SYS_ADMIN`, which the kernel's `ADD_QUEUE` demands of a zero-copy queue (plan 38 Z4).
+/// Not proof the kernel's `capable()` agrees -- in a user namespace it does not -- which is why
+/// a refused zero-copy queue degrades the session instead of failing it (`Ring::set_up_queues`).
+pub(crate) fn has_cap_sys_admin() -> bool {
+    const CAP_SYS_ADMIN: u32 = 21;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut header = Header {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [Data::default(); 2];
+    // SAFETY: `capget(2)` with a version 3 header writes two `Data` structs, which `data` is.
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut Header,
+            data.as_mut_ptr(),
+        )
+    };
+    res == 0 && data[0].effective & (1 << CAP_SYS_ADMIN) != 0
+}
 
 /// Every ring of a session and the thread serving each.
 ///
@@ -55,6 +115,30 @@ pub(crate) struct RingSet {
     go: Vec<mpsc::Sender<()>>,
     registered: Vec<mpsc::Receiver<io::Result<()>>>,
     handler_tx: Vec<mpsc::Sender<Box<dyn FetchHandler>>>,
+    /// CONSTELLATION PATCH (io-uring): each ring's buffer table (`Ring::setup_gate`).
+    tables: Vec<mpsc::Receiver<io::Result<TableSetup>>>,
+    /// CONSTELLATION PATCH (io-uring): each ring's go-ahead for its zero-copy queues, once all
+    /// tables are in place (`true`), or to withdraw its table (`false`).
+    queues: Vec<mpsc::Sender<bool>>,
+    /// CONSTELLATION PATCH (io-uring): each ring's pool setup (`Ring::setup_gate`).
+    setup: Vec<mpsc::Receiver<io::Result<PoolSetup>>>,
+    /// CONSTELLATION PATCH (io-uring): each ring's go-ahead to register, once all set up.
+    proceed: Vec<mpsc::Sender<()>>,
+    /// CONSTELLATION PATCH (io-uring): zero-copy was asked for (`ZeroCopyPlan`).
+    zero_copy_asked: bool,
+    /// CONSTELLATION PATCH (io-uring): every queue of every ring is a zero-copy queue; known
+    /// once `start` returned.
+    zero_copy: bool,
+}
+
+/// CONSTELLATION PATCH (io-uring): what the handshake grants a session that may use zero-copy
+/// queues (plan 38 Z4, `Session::zero_copy_plan`): the size of a pool buffer, which must be the
+/// kernel's `max_payload_sz` for the negotiated INIT exactly, and whether the pools are
+/// registered as an io_uring fixed buffer (pinned) or handed over as plain memory.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ZeroCopyPlan {
+    pub(crate) buf_size: usize,
+    pub(crate) register_pool: bool,
 }
 
 impl fmt::Debug for RingSet {
@@ -115,6 +199,10 @@ impl RingSet {
     /// CONSTELLATION PATCH (io-uring): `backend` serves the rings from an `InMemoryRingKernel`
     /// instead of `io_uring_setup(2)`; `malformed_register` makes every REGISTER one the kernel
     /// refuses (`Ring::set_malformed_register`), for the fault-injection tests of the fallback.
+    /// `zero_copy` reserves each ring's buffer pools for `start` to try zero-copy queues with,
+    /// after everything else; a reservation that fails leaves the whole set without it, logged
+    /// here.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         device: Arc<DevFuse>,
         mounted: bool,
@@ -123,6 +211,7 @@ impl RingSet {
         payload_cap: usize,
         backend: Option<&memory::InMemoryRingKernel>,
         malformed_register: bool,
+        zero_copy: Option<ZeroCopyPlan>,
     ) -> io::Result<Self> {
         let n_queues = possible_cpus().map_err(|err| {
             io::Error::other(format!("the possible CPU count is unknown ({err})"))
@@ -143,8 +232,15 @@ impl RingSet {
             go: Vec::new(),
             registered: Vec::new(),
             handler_tx: Vec::new(),
+            tables: Vec::new(),
+            queues: Vec::new(),
+            setup: Vec::new(),
+            proceed: Vec::new(),
+            zero_copy_asked: false,
+            zero_copy: false,
         };
         let mut bodies = Vec::new();
+        let ring_queues: Vec<usize> = rings.iter().map(Vec::len).collect();
         for (index, qids) in rings.into_iter().enumerate() {
             // The cheapest and likeliest refusal (a sandbox without io_uring) comes first
             let (sq, cq) = ring_sizes(qids.len() * depth as usize);
@@ -157,6 +253,20 @@ impl RingSet {
             if malformed_register {
                 ring.set_malformed_register();
             }
+            let (table_tx, table_rx) = mpsc::channel();
+            let (queues_tx, queues_rx) = mpsc::channel();
+            let (setup_tx, setup_rx) = mpsc::channel();
+            let (proceed_tx, proceed_rx) = mpsc::channel();
+            ring.set_setup_gate(SetupGate {
+                table: table_tx,
+                queues: queues_rx,
+                setup: setup_tx,
+                proceed: proceed_rx,
+            });
+            set.tables.push(table_rx);
+            set.queues.push(queues_tx);
+            set.setup.push(setup_rx);
+            set.proceed.push(proceed_tx);
             let (go_tx, go_rx) = mpsc::channel();
             let (registered_tx, registered_rx) = mpsc::channel();
             let (handler_tx, handler_rx) = mpsc::channel();
@@ -171,23 +281,155 @@ impl RingSet {
         }
         set.threads = spawn_named(bodies)
             .map_err(|err| io::Error::other(format!("creating the ring threads failed ({err})")))?;
+        // CONSTELLATION PATCH (io-uring): the pools last, once everything the ring itself needs
+        // is in place, so that a limit on the address space (`RLIMIT_AS`) costs zero-copy
+        // before it costs the ring: the optional rung gives way first. Address space only
+        // (`MAP_NORESERVE`) until a ring registers its pool as a fixed buffer, which pins it.
+        if let Some(plan) = zero_copy {
+            let pools: io::Result<Vec<PoolMemory>> = ring_queues
+                .iter()
+                .map(|&queues| PoolMemory::new(queues, depth as usize, plan.buf_size))
+                .collect();
+            match pools {
+                Ok(pools) => {
+                    for (ring, pool) in set.rings.iter().zip(pools) {
+                        ring.reserve_pools(pool, plan.register_pool);
+                    }
+                    set.zero_copy_asked = true;
+                }
+                Err(err) => {
+                    warn!("io_uring zero-copy unavailable: {err}; serving io_uring without it");
+                }
+            }
+        }
         debug!(
             "io_uring: {n_queues} queues over {} rings, depth {depth}, payload {payload_cap} \
-             bytes per entry, {} bytes reserved",
+             bytes per entry, {} bytes reserved, {} bytes of buffer pools",
             set.rings.len(),
-            set.rings.iter().map(|r| r.reserved_bytes()).sum::<usize>()
+            set.rings.iter().map(|r| r.reserved_bytes()).sum::<usize>(),
+            set.rings.iter().map(|r| r.pool_bytes()).sum::<usize>()
         );
         Ok(set)
+    }
+
+    /// CONSTELLATION PATCH (io-uring): whether every queue is a zero-copy queue (plan 38 Z4),
+    /// as `start` settled it.
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.zero_copy
     }
 
     /// Releases the parked threads to register their queues and waits for every ring's
     /// REGISTER submit. Only valid once the INIT reply echoing the flag was written; an
     /// error here leaves the mount blocked on queues nobody serves, so the caller must end
     /// the session, and the rings that did register are abandoned (`Ring::abandon`).
+    ///
+    /// CONSTELLATION PATCH (io-uring): in three steps, each a barrier across every ring. Each
+    /// ring registers its buffer table (`Ring::set_up_table`); only if every ring could does any
+    /// ring create a queue, else every ring withdraws its table; then each ring sets up its
+    /// queues and their pools (`Ring::set_up_queues`), and only once every ring has done so
+    /// does any ring register an entry. So the likeliest refusal, a table the process may not
+    /// pin, can never leave one ring zero-copy and another not; whether zero-copy happens is
+    /// settled for the whole session -- one transport for every reply of it
+    /// (`Ring::set_session_zero_copy`), logged once with the reason when it does not -- before
+    /// the first REGISTER, after which the kernel would refuse to change a queue's mind.
     pub(crate) fn start(&mut self) -> io::Result<()> {
         for go in self.go.drain(..) {
-            // A thread that is already gone shows up as a disconnected `registered` below
+            // A thread that is already gone shows up as a disconnected `tables` below
             let _ = go.send(());
+        }
+        let mut tables = Vec::new();
+        let mut failed = None;
+        for (index, table) in self.tables.drain(..).enumerate() {
+            let result = table.recv().map_err(|_| {
+                io::Error::other(format!(
+                    "io_uring: ring {index} thread exited before setting up its buffer table"
+                ))
+            });
+            match result.and_then(|r| r) {
+                Ok(table) => tables.push(table),
+                Err(err) => {
+                    failed.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(err) = failed {
+            // Dropping `queues` releases the waiting rings without creating anything
+            self.queues.clear();
+            self.proceed.clear();
+            for ring in &self.rings {
+                ring.abandon();
+            }
+            self.handler_tx.clear();
+            return Err(err);
+        }
+        let refused_table = tables.iter().find_map(|t| match t {
+            TableSetup::Refused(why) => Some(why.clone()),
+            _ => None,
+        });
+        let go_queues =
+            self.zero_copy_asked && tables.iter().all(|t| matches!(t, TableSetup::Ready));
+        for queues in self.queues.drain(..) {
+            // A thread that is already gone shows up as a disconnected `setup` below
+            let _ = queues.send(go_queues);
+        }
+        let mut setups = Vec::new();
+        let mut failed = None;
+        for (index, setup) in self.setup.drain(..).enumerate() {
+            let result = setup.recv().map_err(|_| {
+                io::Error::other(format!(
+                    "io_uring: ring {index} thread exited before setting up its queues"
+                ))
+            });
+            match result.and_then(|r| r) {
+                Ok(setup) => setups.push(setup),
+                Err(err) => {
+                    failed.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(err) = failed {
+            // Dropping `proceed` releases the waiting rings without registering anything
+            self.proceed.clear();
+            for ring in &self.rings {
+                ring.abandon();
+            }
+            self.handler_tx.clear();
+            return Err(err);
+        }
+        self.zero_copy = go_queues
+            && !setups.is_empty()
+            && setups.iter().all(|s| {
+                matches!(
+                    s,
+                    PoolSetup::Pools {
+                        zero_copy: true,
+                        ..
+                    }
+                )
+            });
+        if self.zero_copy_asked {
+            // A refused table is the reason the others were withdrawn, so it comes first
+            let why = refused_table.as_deref().or_else(|| {
+                setups.iter().find_map(|s| match s {
+                    PoolSetup::Degraded(why) => Some(why.as_str()),
+                    PoolSetup::Pools { note, .. } => note.as_deref(),
+                    PoolSetup::NotAsked => None,
+                })
+            });
+            match (self.zero_copy, why) {
+                (true, None) => debug!("io_uring: zero-copy on every queue"),
+                (true, Some(why)) => warn!("io_uring: zero-copy on every queue, but {why}"),
+                (false, why) => warn!(
+                    "io_uring zero-copy unavailable: {}; serving io_uring without it",
+                    why.unwrap_or("a ring did not set up its queues")
+                ),
+            }
+        }
+        for ring in &self.rings {
+            ring.set_session_zero_copy(self.zero_copy);
+        }
+        for proceed in self.proceed.drain(..) {
+            let _ = proceed.send(());
         }
         for (index, registered) in self.registered.drain(..).enumerate() {
             let result = registered.recv().map_err(|_| {
@@ -434,13 +676,14 @@ mod test {
         let device = Arc::new(DevFuse(fs::File::open("/dev/zero").unwrap()));
         let queues = usize::from(possible_cpus().unwrap());
         let depth = (IORING_MAX_ENTRIES / queues + 1) as u32;
-        let err = RingSet::new(device.clone(), true, 1, depth, 8192, None, false).unwrap_err();
+        let err =
+            RingSet::new(device.clone(), true, 1, depth, 8192, None, false, None).unwrap_err();
         assert!(
             err.to_string()
                 .starts_with(&format!("{queues} queues x depth {depth} exceed")),
             "{err}"
         );
-        assert!(RingSet::new(device, true, 1, u32::MAX, 8192, None, false).is_err());
+        assert!(RingSet::new(device, true, 1, u32::MAX, 8192, None, false, None).is_err());
     }
 
     #[test]

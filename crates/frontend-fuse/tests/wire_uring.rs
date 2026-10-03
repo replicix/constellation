@@ -16,9 +16,17 @@
 //! `FUSE_DESTROY` still travel over the socket pair, as they travel over
 //! `/dev/fuse` in the kernel.
 //!
+//! Plan 38 Z4 adds a third leg, a ring with zero-copy queues
+//! (`InMemoryRingKernel::with_buffer_pools`, `FUSE_HAS_IO_URING_BUFPOOL`
+//! offered): every request's payload travels in a pool buffer the "kernel"
+//! picks, and each read is sent as a zero-copied one, its data expected in
+//! registered pages rather than in the payload buffer — which the adapter,
+//! answering with `gather` as it does on any ring, reaches through fuser's
+//! bounce `READ_FIXED`.
+//!
 //! What this proves: the same requests, against the same scripted
 //! [`MockVfs`], produce **byte-identical replies and identical `Vfs`
-//! calls** on both transports — reads of one segment, of several, short and
+//! calls** on every transport — reads of one segment, of several, short and
 //! empty, writes, opens, getattrs, lookups, the close path; a cold read
 //! answered from a foreign thread completes over the ring; and a request
 //! that blocks in the filesystem (a flush waiting on S3) does not stall an
@@ -138,6 +146,8 @@ impl Reply {
 enum Leg {
     DevFuse,
     Ring,
+    /// Plan 38 Z4: a ring of zero-copy queues with buffer pools.
+    RingZeroCopy,
 }
 
 /// The kernel's end, over either transport.
@@ -156,6 +166,8 @@ const KERNEL_INIT_FLAGS: u32 = (1 << 1) | (1 << 10) | (1 << 18);
 const FUSE_INIT_EXT: u32 = 1 << 30;
 /// `FUSE_OVER_IO_URING`, bit 41: bit 9 of `flags2`.
 const FUSE_OVER_IO_URING_HI: u32 = 1 << 9;
+/// `FUSE_HAS_IO_URING_BUFPOOL`, bit 43: bit 11 of `flags2` (7.3+).
+const FUSE_HAS_IO_URING_BUFPOOL_HI: u32 = 1 << 11;
 /// Entries per queue: two, so a queue whose one entry is held by a
 /// blocked request still has one to fetch the next.
 const DEPTH: u32 = 2;
@@ -182,7 +194,13 @@ impl Kernel {
         let (sock, daemon) = UnixDatagram::pair().expect("socketpair");
         sock.set_read_timeout(Some(Duration::from_secs(20)))
             .unwrap();
-        let ring = (leg == Leg::Ring).then(|| kernel.unwrap_or_default());
+        let ring = match leg {
+            Leg::DevFuse => None,
+            Leg::Ring => Some(kernel.unwrap_or_default()),
+            Leg::RingZeroCopy => {
+                Some(kernel.unwrap_or_else(|| InMemoryRingKernel::with_buffer_pools(true)))
+            }
+        };
         let mut k = Kernel {
             sock,
             ring: ring.clone(),
@@ -194,6 +212,10 @@ impl Kernel {
         let (flags, flags2) = match leg {
             Leg::DevFuse => (KERNEL_INIT_FLAGS, 0),
             Leg::Ring => (KERNEL_INIT_FLAGS | FUSE_INIT_EXT, FUSE_OVER_IO_URING_HI),
+            Leg::RingZeroCopy => (
+                KERNEL_INIT_FLAGS | FUSE_INIT_EXT,
+                FUSE_OVER_IO_URING_HI | FUSE_HAS_IO_URING_BUFPOOL_HI,
+            ),
         };
         let body = Body::default()
             .u32(7)
@@ -209,8 +231,8 @@ impl Kernel {
         // woken at the end (nothing plays the kernel's `ENODEV`), so the
         // dev leg has one, as `wire.rs` does; the ring leg has two rings
         // and its single `/dev/fuse` reader ends with `DESTROY`.
-        config.n_threads = Some(if leg == Leg::Ring { 2 } else { 1 });
-        config.io_uring = leg == Leg::Ring;
+        config.n_threads = Some(if leg == Leg::DevFuse { 1 } else { 2 });
+        config.io_uring = leg != Leg::DevFuse;
         config.io_uring_queue_depth = DEPTH;
         config.io_uring_kernel = ring;
         config.io_uring_lock_wait_downgrades = Some(fuser::LockWaitDowngrades::new({
@@ -267,7 +289,13 @@ impl Kernel {
             None => self.send_dev(opcode, nodeid, &body.0),
             Some(ring) => {
                 let (unique, msg) = self.message(opcode, nodeid, &body.0);
-                ring.send(qid, &msg, op_in_len(opcode));
+                if opcode == op::READ && self.transport == Transport::UringZeroCopy {
+                    // `fuse_read_in.size`: the pages the kernel would register
+                    let size = u32::from_le_bytes(body.0[16..20].try_into().unwrap());
+                    ring.send_zero_copy(qid, &msg, op_in_len(opcode), size as usize);
+                } else {
+                    ring.send(qid, &msg, op_in_len(opcode));
+                }
                 unique
             }
         }
@@ -381,6 +409,7 @@ fn round(leg: Leg) -> (Vec<Reply>, Vec<Args>) {
     let expected = match leg {
         Leg::DevFuse => Transport::DevFuse,
         Leg::Ring => Transport::Uring,
+        Leg::RingZeroCopy => Transport::UringZeroCopy,
     };
     assert_eq!(
         k.transport, expected,
@@ -397,6 +426,11 @@ fn round(leg: Leg) -> (Vec<Reply>, Vec<Args>) {
     ];
     for size in [64, 8192, 64, 64] {
         replies.push(k.call(op::READ, 9, &read_body(3, 4096, size)));
+    }
+    if leg == Leg::RingZeroCopy {
+        // Each read with data reached its pages through one bounce
+        // `READ_FIXED`; the empty one at EOF needed none
+        assert_eq!(k.ring.as_ref().unwrap().read_fixed_served(), 3);
     }
     replies.push(
         k.call(
@@ -438,6 +472,17 @@ fn the_ring_and_dev_fuse_answer_byte_for_byte_alike() {
         assert_eq!(d, r, "reply {i} differs between the transports");
     }
     assert_eq!(dev_calls, ring_calls, "the Vfs saw different calls");
+    // Plan 38 Z4: the same on zero-copy queues, every payload in a pool
+    // buffer and every read's data bounced into its registered pages
+    let (zc, zc_calls) = round(Leg::RingZeroCopy);
+    assert_eq!(dev.len(), zc.len());
+    for (i, (d, z)) in dev.iter().zip(&zc).enumerate() {
+        assert_eq!(d, z, "reply {i} differs on zero-copy queues");
+    }
+    assert_eq!(
+        dev_calls, zc_calls,
+        "the Vfs saw different calls on zero-copy queues"
+    );
     // And they are the right bytes, not merely the same ones.
     assert_eq!(ring[3].body(), b"hello", "a one-segment read");
     let joined = multi_segment().contiguous().into_owned();
@@ -606,10 +651,12 @@ fn a_blocked_flush_does_not_stall_its_queue() {
 
 /// A cold read — the engine answers it from its completion pool, long
 /// after the ring thread moved on — completes over the ring, and the ring
-/// served other requests meanwhile.
+/// served other requests meanwhile. On zero-copy queues (plan 38 Z4) the
+/// foreign thread's reply is a bounce `READ_FIXED` the ring thread issues
+/// once woken.
 #[test]
 fn a_cold_read_answered_from_a_foreign_thread_completes() {
-    for leg in [Leg::DevFuse, Leg::Ring] {
+    for leg in [Leg::DevFuse, Leg::Ring, Leg::RingZeroCopy] {
         let mock = MockVfs::new();
         mock.on_read(Script::Defer {
             after: Duration::from_millis(300),

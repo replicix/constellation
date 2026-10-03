@@ -68,6 +68,33 @@ pub struct Config {
     /// (73 per queue on a 448-CPU machine with one ring); a larger product falls back to
     /// `/dev/fuse` with a warning.
     pub io_uring_queue_depth: u32,
+    /// CONSTELLATION PATCH (io-uring): try zero-copy queues (plan 38 Z4) when `io_uring` is
+    /// set. Default `true`. Tried only when the kernel offers `FUSE_HAS_IO_URING_BUFPOOL`
+    /// (7.3+) and the process has `CAP_SYS_ADMIN`; never otherwise. A kernel that refuses the
+    /// first zero-copy queue (or any ring's buffer table) leaves the session on the ring
+    /// without it, logged once with the reason; `Session::transport` says which it got
+    /// (`Transport::UringZeroCopy`).
+    ///
+    /// A zero-copy queue takes its payload buffers from a pool of `io_uring_queue_depth`
+    /// buffers of the kernel's `max_payload_sz` (`max(8192, max_write, max_pages *
+    /// PAGE_SIZE)`), so a session that tries it lowers `max_write` to what one request can
+    /// actually carry (`max_pages`, which the kernel clamps to `/proc/sys/fs/fuse/
+    /// max_pages_limit`, default 256 pages), which changes no request's size. The pools of all
+    /// queues are possible CPUs x depth x that size: 256 MiB for 32 CPUs at depth 8 and 1 MiB,
+    /// 1 GiB at depth 32. Unregistered (`io_uring_register_pool`, the default) a pool page is
+    /// resident once a request first used it and stays so, so a busy session converges on the
+    /// whole of it; registered, all of it is resident from the start. Requests then carry
+    /// their payload in a pool buffer, so a `FUSE_WRITE`'s data is copied once on its way to
+    /// the filesystem, where an entry's own buffer lends it with no copy.
+    pub io_uring_zero_copy: bool,
+    /// CONSTELLATION PATCH (io-uring): register the zero-copy queues' buffer pools as an
+    /// io_uring fixed buffer (`ADD_BUFPOOL` with `IORING_URING_CMD_FIXED`). Default `false`:
+    /// the pools are handed over as plain memory, which the kernel imports per request
+    /// (`import_ubuf`, looking its pages up as it copies a payload), and whose pages become
+    /// resident only as requests touch them -- though once touched they are never given back. `true` pins every pool page from
+    /// the start, charged to `RLIMIT_MEMLOCK` without `CAP_IPC_LOCK`, and saves the kernel the
+    /// per-request import. Read only when zero-copy is tried.
+    pub io_uring_register_pool: bool,
     /// CONSTELLATION PATCH (io-uring): serve the rings from this in-memory stand-in for the
     /// kernel instead of `io_uring_setup(2)` (`InMemoryRingKernel`), for tests that drive a
     /// whole ring session over a socket pair with no io_uring, mount or root. `None` (the
@@ -102,6 +129,8 @@ impl Default for Config {
             clone_fd: false,
             io_uring: false,
             io_uring_queue_depth: 8,
+            io_uring_zero_copy: true,
+            io_uring_register_pool: false,
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             io_uring_kernel: None,
             #[cfg(all(feature = "io-uring", target_os = "linux"))]

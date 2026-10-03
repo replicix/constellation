@@ -1080,14 +1080,69 @@ impl Client {
             return;
         }
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        // A census that silently lost rows reads as "no mounts on this
+        // transport", which is exactly the wrong conclusion for a matrix
+        // leg; so a failed append is loud here and fails the run at the
+        // end (`transport_census_failed`), even if every scenario passed.
+        let appended = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
-        {
-            let _ = f.write_all(rows.as_bytes());
+            .open(&path)
+            .and_then(|mut f| f.write_all(rows.as_bytes()));
+        if let Err(e) = appended {
+            CENSUS_WRITE_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+            eprintln!(
+                "!!! TRANSPORT CENSUS: cannot append {}'s rows to {} ({TRANSPORT_CENSUS_ENV}): {e}; \
+                 this run's census is incomplete and the run will exit non-zero",
+                self.name,
+                std::path::Path::new(&path).display()
+            );
         }
     }
+}
+
+/// Set when an append to the transport census failed mid-run: `harness
+/// run` then exits non-zero after its summary, so an incomplete census is
+/// never mistaken for a complete one.
+static CENSUS_WRITE_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any client failed to append its rows to the transport census
+/// during this process (see [`CENSUS_WRITE_FAILED`]).
+pub fn transport_census_failed() -> bool {
+    CENSUS_WRITE_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `harness run`'s startup check of [`TRANSPORT_CENSUS_ENV`]: when it is
+/// set, the file must be creatable and appendable now, before any
+/// scenario runs, rather than each client's drop finding out later.
+///
+/// The case this exists for: with `fs.protected_regular=1` (the default
+/// on Fedora and others), a regular file in a sticky world-writable
+/// directory such as `/tmp` that belongs to another user cannot be
+/// opened with `O_CREAT` even by root. A root run pointed at a census a
+/// user run left in `/tmp` used to write nothing and say nothing.
+pub fn check_transport_census() -> anyhow::Result<()> {
+    use anyhow::Context;
+    let Some(path) = std::env::var_os(TRANSPORT_CENSUS_ENV) else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "{TRANSPORT_CENSUS_ENV}={}: cannot open the transport census for appending. \
+                 If it is another user's file in a sticky directory such as /tmp, \
+                 fs.protected_regular forbids opening it with O_CREAT, even as root; \
+                 point the census at a path under this run's own results directory \
+                 (tests/transport-matrix.sh uses $RESULTS_DIR/<transport>.census.tsv)",
+                path.display()
+            )
+        })?;
+    Ok(())
 }
 
 /// What `/proc` says about a process that did not exit after `kill -9`:
