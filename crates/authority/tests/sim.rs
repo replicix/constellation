@@ -331,6 +331,8 @@ fn replay_seed() {
         Ok("locks-failover") => locks_failover_config(),
         Ok("locks-failover-backup") => locks_failover_backup_config(),
         Ok("locks-faults") => locks_faults_config(),
+        Ok("locks-blips") => locks_blips_config(),
+        Ok("locks-blips-tight") => locks_blips_tight_config(),
         Ok("locks-pause") => locks_pause_config(),
         Ok("locks-delegated") => locks_delegated_config(),
         Ok("locks-released-delegated") => locks_released_delegated_config(),
@@ -2604,6 +2606,8 @@ fn sweep_config() {
         "locks-failover" => locks_failover_config(),
         "locks-failover-backup" => locks_failover_backup_config(),
         "locks-faults" => locks_faults_config(),
+        "locks-blips" => locks_blips_config(),
+        "locks-blips-tight" => locks_blips_tight_config(),
         "locks-pause" => locks_pause_config(),
         "locks-delegated" => locks_delegated_config(),
         "locks-released-delegated" => locks_released_delegated_config(),
@@ -3829,6 +3833,77 @@ fn locks_pause_config() -> SimConfig {
     }
 }
 
+/// `stress-ng-fs-faults` (bug B): short S3 outages of the whole cluster
+/// (P2P stays up), each long enough for a continuation epoch carrying
+/// the holder's lease, under the lock workload with long critical
+/// sections. Every close used to drop the holder's lock grants with the
+/// lease it re-claimed a moment later: every critical section across a
+/// blip was fenced (`EIO`), and a lock asked for before the re-claim
+/// was refused (`ENOLCK`). Some lease PUTs land but answer a timeout
+/// (an S3 cut beginning while the re-claim's CAS is in flight): the
+/// re-claim in doubt that landed is the same tenure (the review's
+/// must-fix 1: it dropped the grants and released the lease).
+fn locks_blips_config() -> SimConfig {
+    let mut faults: Vec<ScheduledFault> = (0..4)
+        .map(|i| ScheduledFault {
+            at_ms: 700 + i * 2_600,
+            kind: FaultKind::EpochOutage {
+                members: 3,
+                for_ms: 1_500,
+            },
+        })
+        .collect();
+    faults.push(ScheduledFault {
+        at_ms: 0,
+        kind: FaultKind::S3Rule(Rule::new(
+            None,
+            OpKind::Put,
+            "leases/",
+            When::Random(0.1),
+            Fault::AppliedThenTimeout,
+        )),
+    });
+    SimConfig {
+        ops_per_client: 8,
+        lock_ios: (6, 16),
+        lock_io_ms: (40, 200),
+        faults,
+        ..locks_config()
+    }
+}
+
+/// `locks-blips` with outages in back-to-back pairs: the gaps (300 to
+/// 900 ms) put some second cuts between an epoch's close and the
+/// lease's re-claim. The node claims the lease the close let go, and the
+/// next epoch carries it (the review's should-fix 4: it formed an epoch
+/// carrying no lease, which refused every write). S3 is back for 2.5 s
+/// between pairs: a lease no re-claim reached for longer than its ttl
+/// (every window too short) has expired, and anyone could take it, so
+/// nothing carries it and its grants lapse — not this schedule's case.
+/// Without `locks-blips`' in-doubt lease PUTs: under back-to-back cuts
+/// they reach two holes that are not this one's (an acquisition CAS in
+/// doubt that landed is re-adopted by no lock request until the lease
+/// expires, and a lock waiter times out; a directory history out of
+/// order — main fails so too, and most seeds on mutual exclusion first).
+fn locks_blips_tight_config() -> SimConfig {
+    let mut c = locks_blips_config();
+    c.faults.clear();
+    let mut at = 700;
+    for gap in [300, 500, 700, 900] {
+        for start in [at, at + 1_500 + gap] {
+            c.faults.push(ScheduledFault {
+                at_ms: start,
+                kind: FaultKind::EpochOutage {
+                    members: 3,
+                    for_ms: 1_500,
+                },
+            });
+        }
+        at += 1_500 + gap + 1_500 + 2_500;
+    }
+    c
+}
+
 /// The CI faults (two random ones per seed) under the lock workload.
 fn locks_faults_config() -> SimConfig {
     SimConfig {
@@ -4100,6 +4175,57 @@ fn locks_survive_backup_failover() {
     assert!(
         t.backup_takeovers > 20,
         "the backup rarely took over (with the mirror): {t:?}"
+    );
+}
+
+/// `stress-ng-fs-faults` (bug B): a node that keeps its lease through an
+/// S3 blip keeps its lock grants. Epochs form and close around critical
+/// sections, yet no grant is lost, no I/O under a lock is fenced, and no
+/// lock is refused for want of a sequencer.
+#[test]
+fn locks_survive_s3_blips() {
+    let mut epochs = 0;
+    let mut t = M14Totals::default();
+    for seed in 99_000..99_060 {
+        let report = run_seed(seed, locks_blips_config()).unwrap_or_else(|e| {
+            panic!("locks-blips seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips")
+        });
+        epochs += report.epochs_formed;
+        t.add(&report);
+    }
+    eprintln!("locks-blips: {epochs} epochs, {t:#?}");
+    assert!(epochs > 120, "epochs rarely formed: {epochs}");
+    assert!(t.grants > 500, "{t:?}");
+    assert_eq!(t.lost, 0, "grants lost across blips: {t:?}");
+    assert_eq!(t.clients.fenced_ios, 0, "I/O fenced across blips: {t:?}");
+    assert_eq!(
+        t.clients.unavailable, 0,
+        "locks refused across blips: {t:?}"
+    );
+    // Cuts between a close and the lease's re-claim: the next epoch
+    // carries the lease the close let go.
+    let mut reheld = 0;
+    let mut t = M14Totals::default();
+    for seed in 99_100..99_160 {
+        let report = run_seed(seed, locks_blips_tight_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-blips-tight seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight"
+            )
+        });
+        reheld += report
+            .stats
+            .values()
+            .map(|s| s.epoch_closed_leases_reheld)
+            .sum::<u64>();
+        t.add(&report);
+    }
+    eprintln!("locks-blips-tight: {reheld} closed leases held again, {t:#?}");
+    assert!(reheld > 0, "no cut fell inside a re-claim window");
+    assert_eq!(t.lost, 0, "grants lost across blips: {t:?}");
+    assert_eq!(t.clients.fenced_ios, 0, "I/O fenced across blips: {t:?}");
+    assert_eq!(
+        t.clients.unavailable, 0,
+        "locks refused across blips: {t:?}"
     );
 }
 

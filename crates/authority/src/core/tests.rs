@@ -9573,6 +9573,879 @@ mod locks {
         assert_eq!(lock_answer(&out, 80), LockAnswer::Unavailable);
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
+    /// Answers every S3 request against `object` (a lease swap or create
+    /// replaces it), completes uploads, fires polls and lock retries, and
+    /// reports the close the core asks for as the driver does
+    /// (`flushing`), until this node holds a usable lease outside any
+    /// epoch with its gate open (then a few steps more for the lock
+    /// retries armed by then).
+    /// Returns the lock answers seen.
+    fn epoch_pump(
+        h: &mut Harness,
+        members: &[NodeId],
+        object: &mut Lease,
+        out: Vec<Action>,
+    ) -> Vec<(OpId, LockAnswer)> {
+        epoch_pump_with(h, members, object, out, &mut PumpFaults::default())
+    }
+
+    /// What [`epoch_pump_with`] does wrong: the next `swaps_in_doubt`
+    /// lease swaps land but answer a failure (a timeout), and every S3
+    /// request fails until `s3_down_until`.
+    #[derive(Default)]
+    struct PumpFaults {
+        swaps_in_doubt: u32,
+        s3_down_until: Option<Ms>,
+    }
+
+    fn epoch_pump_with(
+        h: &mut Harness,
+        members: &[NodeId],
+        object: &mut Lease,
+        mut out: Vec<Action>,
+        faults: &mut PumpFaults,
+    ) -> Vec<(OpId, LockAnswer)> {
+        if let Some(id) = h.core.poll_timer {
+            out.extend(h.step(Event::Timer { id }));
+        }
+        let mut answers = Vec::new();
+        let mut after = 0;
+        for _ in 0..400 {
+            if after == 10 {
+                return answers;
+            }
+            let last = !h.core.epoch.open
+                && h.core.lease.usable(h.now, &h.core.cfg)
+                && !h.core.lease.fenced();
+            if last {
+                after += 1;
+            }
+            let mut next = Vec::new();
+            for action in std::mem::take(&mut out) {
+                match action {
+                    Action::ControlDone {
+                        op,
+                        result: Ok(ControlOk::Lock(answer)),
+                    } => answers.push((op, answer)),
+                    Action::SetTimer {
+                        id,
+                        kind: TimerKind::LockRetry,
+                        ..
+                    } => next.extend(h.step(Event::Timer { id })),
+                    Action::EpochClose => next.extend(h.step(epoch_report(
+                        false,
+                        false,
+                        true,
+                        members,
+                        h.core.pr.carried,
+                    ))),
+                    Action::UploadDirtyChunks { op, .. } => {
+                        next.extend(h.step(Event::UploadsDone {
+                            op,
+                            result: UploadResult::Done { held: 0 },
+                        }))
+                    }
+                    Action::S3 { op, req } => {
+                        let down = faults.s3_down_until.is_some_and(|t| h.now < t);
+                        let result = match req {
+                            S3Op::LeaseGet if down => {
+                                S3Result::LeaseGet(Err(crate::event::S3Failure("cut".into())))
+                            }
+                            S3Op::LeaseSwap { .. } | S3Op::LeaseCreate { .. } if down => {
+                                S3Result::LeasePut(Err(CasFailure::Failed("cut".into())))
+                            }
+                            S3Op::SegmentRun { .. } if down => {
+                                S3Result::SegmentRun(Err(crate::event::S3Failure("cut".into())))
+                            }
+                            S3Op::SegmentPut { .. } if down => {
+                                S3Result::SegmentPut(Err(CasFailure::Failed("cut".into())))
+                            }
+                            _ if down => continue,
+                            S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((object.clone(), tag())))),
+                            S3Op::LeaseSwap { lease, .. } | S3Op::LeaseCreate { lease } => {
+                                *object = lease;
+                                if faults.swaps_in_doubt > 0 {
+                                    faults.swaps_in_doubt -= 1;
+                                    S3Result::LeasePut(Err(CasFailure::Failed("timeout".into())))
+                                } else {
+                                    S3Result::LeasePut(Ok(tag()))
+                                }
+                            }
+                            S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                            S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                            S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
+                            S3Op::HeartbeatRead => S3Result::Heartbeats(Ok(Vec::new())),
+                            _ => continue,
+                        };
+                        next.extend(h.step(Event::S3 { op, result }));
+                    }
+                    Action::SetTimer {
+                        id,
+                        kind: TimerKind::Poll,
+                        ..
+                    } => next.extend(h.step(Event::Timer { id })),
+                    _ => {}
+                }
+            }
+            h.advance(10);
+            out = next;
+        }
+        panic!(
+            "never held again outside the epoch: open {} held {:?} lost {}",
+            h.core.epoch.open, h.core.lease.held, h.core.lease.lost
+        );
+    }
+
+    fn epoch_report(
+        open: bool,
+        active: bool,
+        flushing: bool,
+        members: &[NodeId],
+        carrier: Option<crate::event::Carrier>,
+    ) -> Event {
+        Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open,
+                active,
+                frozen: false,
+                flushing,
+                base: 0,
+                members: members.to_vec(),
+                carrier,
+                stale_below: 1,
+            },
+        }
+    }
+
+    /// The holder's own lock (a local lock under it, as an application
+    /// holding its `flock`) and a peer's grant, then a continuation
+    /// epoch carrying the holder's lease opens (an S3 cut).
+    fn holder_with_grants_in_an_epoch() -> (Harness, Ino, Ino, GrantId, Lease) {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.p2p = true;
+        h.core.start(h.now, &h.meta, &mut Vec::new());
+        let op = h.create("peer");
+        let MutateOp::Create { ino: peer_ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: false,
+            },
+        });
+        assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
+        assert_eq!(
+            h.meta.locks().local_set(
+                ino,
+                LocalLock {
+                    owner: 9,
+                    pid: 1,
+                    pid_start: 0,
+                    write: true,
+                    start: 0,
+                    end: u64::MAX
+                },
+                h.now.0
+            ),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        let out = request(&mut h, 2, 7, peer_ino, X, false);
+        let replies = lock_replies(&out);
+        let [(2, OpId(7), outcome)] = replies.as_slice() else {
+            panic!("{out:?}")
+        };
+        let (peer_grant, _) = granted(outcome);
+        let object = h.core.lease.held.as_ref().unwrap().0.clone();
+        let carrier = crate::event::Carrier {
+            node: 1,
+            epoch: object.epoch,
+            expires_unix_ms: object.expires_unix_ms,
+        };
+        h.step(epoch_report(true, true, false, &[1, 2], Some(carrier)));
+        assert!(h.core.lease.epoch_held(), "the epoch carries the lease");
+        assert_eq!(h.meta.locks().grants_len(), 2);
+        (h, ino, peer_ino, peer_grant, object)
+    }
+
+    /// `stress-ng-fs-faults` (bug B): every S3 blip opens a continuation
+    /// epoch, and its close let the holder's lease go locally with every
+    /// lock grant, though the flush re-claimed the very same lease a
+    /// moment later: the holder's renewal of its own grant answered
+    /// `Lost` (its lock holders fenced: `EIO`), and a peer's too. The
+    /// grants now stand across a close the re-claim continues.
+    #[test]
+    fn lock_grants_survive_an_epoch_close_whose_reclaim_continues_the_tenure() {
+        let (mut h, ino, peer_ino, peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        // A grant made inside the epoch, too.
+        let out = request(&mut h, 3, 8, ino + 1_000, X, false);
+        assert!(matches!(
+            lock_replies(&out).as_slice(),
+            [(3, OpId(8), LockOutcome::Granted { .. })]
+        ));
+        h.advance(500);
+        // S3 is back: the hold owner flushes, closes and re-claims.
+        epoch_pump(&mut h, &[1, 2, 3], &mut object, Vec::new());
+        assert_eq!(object.holder, 1);
+        assert_eq!(
+            h.core.stats.releases, 0,
+            "the flush keeps a lease with live grants"
+        );
+        assert_eq!(h.meta.locks().grants_len(), 3, "the grants stand");
+        assert!(
+            h.core.pr.closed_tenure.is_empty(),
+            "settled by the re-claim"
+        );
+        // The holder's own renewal, once due, is served.
+        let held = h.meta.locks().held(ino).expect("still held");
+        assert!(held.until_ms > h.now.0, "lapsed during the re-claim");
+        h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
+        let mut out = Vec::new();
+        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        assert_eq!(h.core.stats.lock_lost, 0, "fenced: {out:?}");
+        assert!(h.core.stats.lock_renewals > 0, "{out:?}");
+        assert!(h
+            .meta
+            .locks()
+            .held(ino)
+            .is_some_and(|g| g.until_ms > h.now.0));
+        // And the peer's.
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(70),
+                entries: vec![LockRenewEntry {
+                    ino: peer_ino,
+                    grant: peer_grant,
+                    mode: X,
+                }],
+            },
+        });
+        let renewed = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::LockRenewed { results, .. } if to == 2 => Some(results.clone()),
+                _ => None,
+            })
+            .expect("a renewal answer");
+        assert!(
+            matches!(renewed.as_slice(), [(_, _, LockRenewResult::Ok { .. })]),
+            "{renewed:?}"
+        );
+    }
+
+    /// The other side of the rule: a close keeps the grants only for the
+    /// lease it let go. When the lease this node acquires next is not
+    /// that object (another node held it meanwhile), they are dropped.
+    #[test]
+    fn lock_grants_kept_at_an_epoch_close_go_if_another_tenure_intervened() {
+        let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
+        // The close, as the driver reports it once S3 is back (flushed:
+        // a flushing node would release the lease it acquires below).
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        assert!(h.core.lease.held.is_none());
+        assert_eq!(h.meta.locks().grants_len(), 2, "kept for the re-claim");
+        assert!(h.core.epoch_reclaim_pending(h.now));
+        // Node 2 took the lease over meanwhile, and released it later:
+        // this node's acquisition replaces node 2's object.
+        let mut other = lease_of(2, object.epoch + 1, h.now.0 + 5_000);
+        other.released = true;
+        // A lock request brings the acquisition.
+        let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(9),
+            req: Control::Lock {
+                ino: fresh,
+                mode: X,
+                blocking: true,
+            },
+        });
+        epoch_pump(&mut h, &[1, 2], &mut other, out);
+        assert_eq!(other.holder, 1);
+        assert_eq!(h.meta.locks().grants_len(), 0, "a tenure intervened");
+        assert!(h.core.pr.closed_tenure.is_empty());
+    }
+
+    /// The frozen-epoch `EROFS` of `stress-ng-fs-faults`: between an
+    /// epoch's close and the lease's re-claim this node holds nothing
+    /// locally, so it claimed nothing, and an S3 cut then formed an epoch
+    /// carrying no lease, which refuses every write (`EROFS`) — on the
+    /// node whose lease stood all along. Meanwhile it claims the lease the
+    /// close let go (bounded by that lease's expiry), and the activation
+    /// carrying it adopts the hold: writes go on, the grants stand, and
+    /// the next close re-claims the lease as before.
+    #[test]
+    fn an_outage_inside_the_reclaim_window_forms_an_epoch_carrying_the_lease() {
+        let (mut h, ino, _peer_ino, _peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        // The close as the driver reports it once S3 is back (flushed).
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        assert!(h.core.epoch_reclaim_pending(h.now));
+        let view = h.core.epoch_claim_view(h.now);
+        assert_eq!(view.held.as_ref(), Some(&object), "{view:?}");
+        let claim = view.claim(&[1, 2]).expect("claims the lease");
+        assert_eq!(claim, (object.epoch, object.expires_unix_ms, true));
+        // Bounded by the lease it let go: past its expiry (less the
+        // margin) it claims nothing.
+        let late = Ms(object.expires_unix_ms - h.core.cfg.expiry_margin_ms as i64);
+        assert!(h.core.epoch_claim_view(late).held.is_none());
+        // S3 is cut again before the re-claim: the epoch carries it.
+        let (carrier, stale_below) =
+            crate::core::resolve_epoch_claims(&[(1, Some(claim), view.known), (2, None, 0)]);
+        let carrier = carrier.expect("carried");
+        assert_eq!(carrier.node, 1);
+        let out = h.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: true,
+                active: true,
+                frozen: false,
+                flushing: false,
+                base: 0,
+                members: vec![1, 2],
+                carrier: Some(carrier),
+                stale_below,
+            },
+        });
+        assert!(h.core.lease.epoch_held(), "the hold is adopted: {out:?}");
+        assert!(!h.core.epoch_refuses_writes());
+        assert_eq!(h.meta.locks().grants_len(), 2, "the grants stand");
+        // A grant inside the new epoch, and its own lock's renewal.
+        let out = request(&mut h, 3, 8, ino + 1_000, X, false);
+        assert!(matches!(
+            lock_replies(&out).as_slice(),
+            [(3, OpId(8), LockOutcome::Granted { .. })]
+        ));
+        // S3 back: the close, the flush and the re-claim of the very
+        // object; the grants stand and the lease stays.
+        h.advance(500);
+        epoch_pump(&mut h, &[1, 2], &mut object, Vec::new());
+        assert_eq!(object.holder, 1);
+        assert_eq!(h.meta.locks().grants_len(), 3, "the grants stand");
+        assert_eq!(h.core.stats.releases, 0);
+        assert!(h.core.pr.closed_tenure.is_empty());
+        assert!(h
+            .meta
+            .locks()
+            .held(ino)
+            .is_some_and(|g| g.until_ms > h.now.0));
+    }
+
+    /// A member that knows a later epoch than the lease the close let go
+    /// (taken over meanwhile) makes the claim stale: the tenure is over,
+    /// and its grants go.
+    #[test]
+    fn a_stale_claim_of_the_closed_lease_ends_its_tenure() {
+        let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        let view = h.core.epoch_claim_view(h.now);
+        let claim = view.claim(&[1, 2]);
+        let (carrier, stale_below) = crate::core::resolve_epoch_claims(&[
+            (1, claim, view.known),
+            (2, None, object.epoch + 1),
+        ]);
+        assert!(carrier.is_none());
+        h.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: true,
+                active: true,
+                frozen: false,
+                flushing: false,
+                base: 0,
+                members: vec![1, 2],
+                carrier,
+                stale_below,
+            },
+        });
+        assert!(!h.core.lease.epoch_held());
+        assert_eq!(h.meta.locks().grants_len(), 0);
+        assert!(h.core.pr.closed_tenure.is_empty());
+        assert!(!h.core.epoch_reclaim_pending(h.now));
+    }
+
+    /// Must-fix 1 of the review: S3 is cut while the re-claim's CAS is in
+    /// flight; it lands but answers a timeout. The object is then
+    /// `(me, e, X')`, which the close never saw: the next acquisition
+    /// replaced it and dropped every grant (and the flush then released
+    /// the lease, its table empty) although nobody else had held it.
+    #[test]
+    fn a_reclaim_cas_in_doubt_that_landed_keeps_the_grants() {
+        let (mut h, ino, _peer_ino, _peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        let before = object.clone();
+        h.advance(500);
+        let mut faults = PumpFaults {
+            swaps_in_doubt: 1,
+            ..Default::default()
+        };
+        epoch_pump_with(&mut h, &[1, 2], &mut object, Vec::new(), &mut faults);
+        assert_eq!(faults.swaps_in_doubt, 0, "no CAS was in doubt");
+        assert_eq!(object.holder, 1);
+        assert_ne!(object.expires_unix_ms, before.expires_unix_ms);
+        assert_eq!(h.meta.locks().grants_len(), 2, "the grants stand");
+        assert_eq!(h.core.stats.releases, 0, "the lease stays");
+        assert!(h.core.pr.closed_tenure.is_empty());
+        let held = h.meta.locks().held(ino).expect("still held");
+        h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
+        let mut out = Vec::new();
+        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        assert_eq!(h.core.stats.lock_lost, 0, "fenced: {out:?}");
+    }
+
+    /// The other side of must-fix 1: an in-doubt CAS of the kept tenure
+    /// adds its object to the tenure, nothing else does.
+    #[test]
+    fn only_a_kept_tenures_cas_in_doubt_joins_it() {
+        let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        let it = |l: &Lease| (l.holder, l.epoch, l.expires_unix_ms);
+        assert_eq!(h.core.pr.closed_tenure, vec![it(&object)]);
+        let other = lease_of(2, object.epoch + 1, object.expires_unix_ms + 1);
+        let mine = lease_of(1, object.epoch + 2, object.expires_unix_ms + 2);
+        h.core.epoch_tenure_cas_in_doubt(&other, &mine);
+        assert_eq!(
+            h.core.pr.closed_tenure,
+            vec![it(&object)],
+            "not this tenure's"
+        );
+        let next = lease_of(1, object.epoch, object.expires_unix_ms + 9);
+        h.core.epoch_tenure_cas_in_doubt(&object, &next);
+        assert_eq!(h.core.pr.closed_tenure, vec![it(&object), it(&next)]);
+    }
+
+    /// Must-fix 2 of the review: a local lock asked for between the
+    /// close and the re-claim, without P2P (`Route::Unknown` answered
+    /// `ENOLCK` at once) — a free file waits for the re-claim and is
+    /// granted; one a kept grant conflicts with would block.
+    #[test]
+    fn a_local_lock_in_the_reclaim_window_without_p2p_waits_for_the_reclaim() {
+        let (mut h, _ino, peer_ino, _peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        h.core.cfg.p2p = false;
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        assert!(h.core.epoch_reclaim_pending(h.now));
+        let out = h.step(Event::Control {
+            op: OpId(10),
+            req: Control::Lock {
+                ino: peer_ino,
+                mode: X,
+                blocking: false,
+            },
+        });
+        assert_eq!(lock_answer(&out, 10), LockAnswer::WouldBlock);
+        let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(9),
+            req: Control::Lock {
+                ino: fresh,
+                mode: X,
+                blocking: false,
+            },
+        });
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(9), .. })),
+            "answered at once: {out:?}"
+        );
+        let answers = epoch_pump(&mut h, &[1, 2], &mut object, out);
+        assert!(
+            matches!(answers.as_slice(), [(OpId(9), LockAnswer::Granted { .. })]),
+            "{answers:?}"
+        );
+        assert_eq!(h.core.stats.lock_unavailable, 0);
+        assert_eq!(h.meta.locks().grants_len(), 3);
+    }
+
+    /// Must-fix 2 of the review: S3 is cut again before the re-claim
+    /// lands (every lease read fails): a non-blocking lock waits for the
+    /// re-claim rather than spending its attempts and failing `ENOLCK`.
+    #[test]
+    fn a_lock_in_the_reclaim_window_waits_through_failing_lease_reads() {
+        let (mut h, _ino, _peer_ino, _peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(9),
+            req: Control::Lock {
+                ino: fresh,
+                mode: X,
+                blocking: false,
+            },
+        });
+        let mut faults = PumpFaults {
+            s3_down_until: Some(h.now.plus(1_500)),
+            ..Default::default()
+        };
+        let answers = epoch_pump_with(&mut h, &[1, 2], &mut object, out, &mut faults);
+        assert!(
+            h.now.0 >= faults.s3_down_until.unwrap().0,
+            "answered in the cut"
+        );
+        assert!(
+            matches!(answers.as_slice(), [(OpId(9), LockAnswer::Granted { .. })]),
+            "{answers:?}"
+        );
+        assert_eq!(h.core.stats.lock_unavailable, 0);
+        assert_eq!(h.meta.locks().grants_len(), 3, "the kept grants stand");
+    }
+
+    /// A peer's request to the node in its re-claim window: a conflict
+    /// would block, anything else is told to wait (`Waiting`, which
+    /// spends no attempt), not `NotOwner` (to the lease, which names this
+    /// node) nor `Busy`.
+    #[test]
+    fn a_resuming_owner_tells_a_peer_to_wait() {
+        let (mut h, _ino, peer_ino, _peer_grant, _object) = holder_with_grants_in_an_epoch();
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        let out = request(&mut h, 3, 20, peer_ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(20), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = request(&mut h, 3, 21, fresh, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(21), LockOutcome::Waiting { .. })]
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// Should-fix 3 of the review: only an owner about to own the root
+    /// again makes a non-blocking request wait (`Waiting`, up to
+    /// `s3_less_deadline_ms`); an owner answering `Busy` for any other
+    /// reason (no fresh S3 liveness, an unmarked lease) still fails it
+    /// fast (`ENOLCK` after the attempts and one lease read), as before.
+    #[test]
+    fn busy_fails_a_non_blocking_lock_fast_and_waiting_does_not() {
+        let mut r = requester();
+        let start = r.now;
+        let mut out = lock_control_out(&mut r, 80, 42, false);
+        let mut answered = None;
+        for _ in 0..20 {
+            if let Some(a) = out.iter().find_map(|a| match a {
+                Action::ControlDone {
+                    op: OpId(80),
+                    result: Ok(ControlOk::Lock(answer)),
+                } => Some(*answer),
+                _ => None,
+            }) {
+                answered = Some(a);
+                break;
+            }
+            let mut next = Vec::new();
+            for (to, m) in sends(&out) {
+                if let PeerMsg::LockRequest { req, .. } = m {
+                    next.extend(r.step(Event::Peer {
+                        from: to,
+                        msg: PeerMsg::LockReply {
+                            req: *req,
+                            outcome: LockOutcome::Busy,
+                        },
+                    }));
+                }
+            }
+            for (op, req) in s3_ops(&out) {
+                if matches!(req, S3Op::LeaseGet) {
+                    let expires = r.now.0 + 10_000;
+                    next.extend(r.step(Event::S3 {
+                        op,
+                        result: S3Result::LeaseGet(Ok(Some((lease_of(1, 2, expires), tag())))),
+                    }));
+                }
+            }
+            for t in timers(&out, TimerKind::LockRetry) {
+                r.advance(300);
+                next.extend(r.step(Event::Timer { id: t }));
+            }
+            out = next;
+        }
+        assert_eq!(answered, Some(LockAnswer::Unavailable));
+        assert!(
+            r.now.0 - start.0 < 5_000,
+            "Busy waited {} ms",
+            r.now.0 - start.0
+        );
+        // `Waiting` to a non-blocking request: retried without failing,
+        // until the bound.
+        let mut r = requester();
+        let start = r.now;
+        let mut out = lock_control_out(&mut r, 81, 42, false);
+        let mut answered = None;
+        for _ in 0..1_000 {
+            if let Some(a) = out.iter().find_map(|a| match a {
+                Action::ControlDone {
+                    op: OpId(81),
+                    result: Ok(ControlOk::Lock(answer)),
+                } => Some(*answer),
+                _ => None,
+            }) {
+                answered = Some(a);
+                break;
+            }
+            let mut next = Vec::new();
+            for (to, m) in sends(&out) {
+                if let PeerMsg::LockRequest { req, .. } = m {
+                    next.extend(r.step(Event::Peer {
+                        from: to,
+                        msg: PeerMsg::LockReply {
+                            req: *req,
+                            outcome: LockOutcome::Waiting { retry_ms: 50 },
+                        },
+                    }));
+                }
+            }
+            for (op, req) in s3_ops(&out) {
+                if matches!(req, S3Op::LeaseGet) {
+                    let expires = r.now.0 + 60_000;
+                    next.extend(r.step(Event::S3 {
+                        op,
+                        result: S3Result::LeaseGet(Ok(Some((lease_of(1, 2, expires), tag())))),
+                    }));
+                }
+            }
+            for t in timers(&out, TimerKind::LockRetry) {
+                r.advance(100);
+                next.extend(r.step(Event::Timer { id: t }));
+            }
+            out = next;
+        }
+        let waited = r.now.0 - start.0;
+        assert_eq!(answered, Some(LockAnswer::Unavailable));
+        assert!(
+            waited >= r.core.cfg.s3_less_deadline_ms as i64,
+            "gave up after {waited} ms"
+        );
+    }
+
+    /// A close that keeps the grants keeps its waiters asking here:
+    /// `Waiting`, not `NotOwner { owner: 0 }`, which made the peer forget
+    /// this node as the holder — and with S3 cut again before the
+    /// re-claim it could not learn it back, so its own grant's renewals
+    /// found no owner until the grant lapsed under its I/O
+    /// (`locks-blips-tight`).
+    #[test]
+    fn a_close_that_keeps_the_grants_tells_its_waiters_to_wait() {
+        let (mut h, _ino, peer_ino, _peer_grant, _object) = holder_with_grants_in_an_epoch();
+        let out = request(&mut h, 3, 30, peer_ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let out = h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(30), LockOutcome::Waiting { .. })]
+            ),
+            "{out:?}"
+        );
+        // A close that does not keep them (the lease is lost) still
+        // sends its waiters to the lease.
+        let (mut h, _ino, peer_ino, _peer_grant, _object) = holder_with_grants_in_an_epoch();
+        let out = request(&mut h, 3, 30, peer_ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        h.core.lease.force_lost();
+        let out = h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(30), LockOutcome::NotOwner { owner: 0 })]
+            ),
+            "{out:?}"
+        );
+        assert_eq!(h.meta.locks().grants_len(), 0);
+    }
+
+    /// A holder whose acquisition gate is pending serves renewals — its
+    /// own lockers' too, as a peer's (`lock_renew_one`). Its own found no
+    /// owner (`lock_route` fences the view for new grants) and spun on
+    /// relearning until the grant lapsed under the I/O: a re-claim whose
+    /// marker an S3 cut held back (`locks-blips-tight`).
+    #[test]
+    fn own_renewals_are_served_while_the_gate_is_pending() {
+        let (mut h, ino) = holder_with_file();
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: false,
+            },
+        });
+        assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
+        h.hold(
+            1,
+            Some(PendingGate {
+                epoch: 1,
+                takeover: true,
+                marker_shipped: false,
+                drained: true,
+                fast_prev: None,
+                backup_tail_epoch: None,
+                shippable: false,
+            }),
+        );
+        assert!(h.core.lease.fenced());
+        let held = h.meta.locks().held(ino).expect("held");
+        h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
+        let renewals = h.core.stats.lock_renewals;
+        let mut out = Vec::new();
+        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        assert!(h.core.stats.lock_renewals > renewals, "{out:?}");
+        assert!(
+            s3_ops(&out).is_empty(),
+            "relearned the owner from the lease: {out:?}"
+        );
+        let renewed = h.meta.locks().held(ino).expect("held");
+        assert!(renewed.until_ms > held.until_ms);
+    }
+
+    /// Re-adopting its own lease keeps the granting mark: the tenure goes
+    /// on. Dropped, a re-claim that S3 cut again could not mark the lease
+    /// again, and every lock request was answered `Busy` (`ENOLCK` for a
+    /// non-blocking one) until S3 returned (`locks-blips-tight`). Another
+    /// node's lease is never inherited marked.
+    #[test]
+    fn a_re_adopted_own_lease_keeps_its_granting_mark() {
+        let h = Harness::new(1);
+        assert!(!h.core.cfg.strict_mounts);
+        let mut own = lease_of(1, 4, h.now.0 + 5_000);
+        own.granted_delegations = true;
+        let next = h.core.lease.granted_lease(h.now, &h.core.cfg, Some(&own));
+        assert_eq!(next.epoch, 4);
+        assert!(next.granted_delegations);
+        let mut other = lease_of(2, 4, h.now.0 + 5_000);
+        other.granted_delegations = true;
+        let next = h.core.lease.granted_lease(h.now, &h.core.cfg, Some(&other));
+        assert_eq!(next.epoch, 5);
+        assert!(!next.granted_delegations);
+        own.released = true;
+        let next = h.core.lease.granted_lease(h.now, &h.core.cfg, Some(&own));
+        assert!(
+            !next.granted_delegations,
+            "a released lease ended its tenure"
+        );
+    }
+
+    fn lock_control_out(r: &mut Harness, op: u64, ino: Ino, blocking: bool) -> Vec<Action> {
+        r.step(Event::Control {
+            op: OpId(op),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking,
+            },
+        })
+    }
+
+    /// An open epoch's rounds are its probes: the sync interval at first
+    /// (an epoch carrying no lease used to probe every 10 s once idle,
+    /// refusing writes with `EROFS` that long after S3 returned), backed
+    /// off to four times it while nothing changes (a frozen epoch can
+    /// stay open for hours with S3 reachable), and back to the sync
+    /// interval once S3 answers after a failure.
+    #[test]
+    fn an_open_epochs_probes_back_off_and_reset_when_s3_returns() {
+        let mut h = Harness::new(2);
+        h.core.idle_rounds = 10;
+        let base = h.core.cfg.sync_interval_ms;
+        assert_eq!(h.core.next_poll_ms(h.now), h.core.cfg.idle_max_ms);
+        h.step(epoch_report(true, true, false, &[1, 2], None));
+        assert!(h.core.epoch_refuses_writes());
+        let mut seen = Vec::new();
+        let poll = |h: &mut Harness| {
+            let now = h.now;
+            h.core.on_poll(now, &h.meta, &mut Vec::new());
+        };
+        for _ in 0..5 {
+            seen.push(h.core.next_poll_ms(h.now));
+            poll(&mut h);
+        }
+        assert_eq!(seen, vec![base, base, 2 * base, 4 * base, 4 * base]);
+        let down = S3Result::SegmentRun(Err(crate::event::S3Failure("cut".into())));
+        h.core.note_epoch_probe(&down);
+        assert_eq!(
+            h.core.next_poll_ms(h.now),
+            4 * base,
+            "a failure changes nothing"
+        );
+        h.core
+            .note_epoch_probe(&S3Result::SegmentRun(Ok(Vec::new())));
+        assert_eq!(h.core.next_poll_ms(h.now), base, "S3 is back");
+        h.core
+            .note_epoch_probe(&S3Result::SegmentRun(Ok(Vec::new())));
+        poll(&mut h);
+        poll(&mut h);
+        assert_eq!(
+            h.core.next_poll_ms(h.now),
+            2 * base,
+            "only a return after a failure resets"
+        );
+        // Closed: the idle backoff again.
+        h.step(epoch_report(false, false, false, &[1, 2], None));
+        assert_ne!(h.core.next_poll_ms(h.now), 4 * base);
+    }
 }
 
 // ---- M16 fixes ----

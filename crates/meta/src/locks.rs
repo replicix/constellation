@@ -759,6 +759,16 @@ impl LockTables {
         self.lock().grants.len()
     }
 
+    /// Grants still live at `now_ms` (`grants_len` counts the expired
+    /// ones too, until a `conflicting` call purges them).
+    pub fn live_grants_len(&self, now_ms: i64) -> usize {
+        self.lock()
+            .grants
+            .values()
+            .filter(|g| g.until_ms > now_ms)
+            .count()
+    }
+
     /// Whether this owner's table has a grant made under generation `gen`.
     pub fn has_grants_of_gen(&self, gen: u64) -> bool {
         self.lock().grants.values().any(|g| g.gen == gen)

@@ -388,10 +388,16 @@ impl LeaseState {
     /// keeps the epoch, a real handover bumps it). Plan 30 §M9: a new
     /// tenure starts with no backups (`Local`, or `S3` when this mount
     /// asks for `ack=s3`) and a `config_version` above the predecessor's.
+    /// Re-adopting its own lease, the holder keeps the granting mark
+    /// (`ensure_granting_marked`): the same tenure goes on, its grants
+    /// with it, and its successor still waits their horizon out. Dropped,
+    /// a re-claim that S3 cut again could not mark the lease, and every
+    /// lock request was answered `Busy` (then `ENOLCK`) until S3 returned.
     pub fn granted_lease(&self, now: Ms, cfg: &Config, prev: Option<&Lease>) -> Lease {
+        let own = prev.filter(|p| p.holder == cfg.node_id && !p.released);
         let epoch = match prev {
             None => 1,
-            Some(prev) if prev.holder == cfg.node_id && !prev.released => prev.epoch.max(1),
+            Some(prev) if own.is_some() => prev.epoch.max(1),
             Some(prev) => prev.epoch + 1,
         };
         Lease {
@@ -409,7 +415,7 @@ impl LeaseState {
             } else {
                 AckPolicy::Local
             },
-            granted_delegations: cfg.strict_mounts,
+            granted_delegations: cfg.strict_mounts || own.is_some_and(|p| p.granted_delegations),
             retired: prev.map(|p| p.retired.clone()).unwrap_or_default(),
         }
     }

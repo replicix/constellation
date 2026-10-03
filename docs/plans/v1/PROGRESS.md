@@ -37481,3 +37481,305 @@ Gates (load average 30–140 during the runs):
 | AWS 1 | excused 1, pending 1; 4/4; 0.29 s | 5, 8, 0; 20 ms | 5; 0.31 s |
 | AWS 2 | excused 1, pending 1; 4/4; 0.16 s | 5, 8, 0; 40 ms | 5; 0.50 s |
 | OVH 1 | excused 1, pending 1; 4/4; 1.88 s | 5, 8, 0; 20 ms | 5; 1.73 s |
+
+## Fix: a single node dropped all its lock grants on every S3 blip (`epoch-lock-grants`)
+
+Found by the stress-ng-fs lane (bug B, `stress-ng-fs-faults`): one node,
+40 ± 20 ms S3 latency, a 1.5 s S3 cut every 4–7 s. Lock holders got `EIO`
+and new locks `ENOLCK`. In one run a later create got `EROFS`.
+
+### Mechanism
+
+- Each cut opens a continuation epoch on the lone node. The epoch carries
+  its lease, and the node adopts the hold. When S3 returns, the hold owner
+  closes the epoch (`jobs::on_uploads_done`, and again on the driver's
+  report in `on_epoch_state`). The close does `release_local` +
+  `deleg_on_lease_gone`, and `lock_on_lease_gone` then **cleared the owner's
+  grant table** (`lease gone: lock grants dropped grants=6` at every close
+  in the pre-fix harness log). The flush re-claimed *the same lease object*
+  about 350 ms later (`acquired the lease epoch=1 takeover=true`). The
+  holder's next renewal of its own grant was answered `Lost`, so its lock
+  holders were fenced (`lock grant lost … fenced`, `discarded writes … (EIO)`).
+- In the gap between close and re-claim, a lock request read the lease,
+  found it named this node and not claimable, so nothing acquired it. A
+  peer's request got `NotOwner{0}`. A non-blocking request ran out of
+  retries and failed `ENOLCK`.
+- After the flush, `round_release` released the lease whenever the journal
+  was empty, with live grants or not (the idle release refuses that). The
+  grants were dropped again.
+- Multi-node, the same gap breaks **mutual exclusion**. The new
+  `locks-blips` sim config on the unmodified `main` code fails its first
+  seed: `seed 99000: ino 0x10000000401: node 1 (t16, Exclusive, in I/O
+  since t=1505) and node 2 (t32, Shared) at t=3353`. The owner forgot the
+  holder's own grant at the close and granted a conflicting one. The
+  holder renewed it only later.
+- `EROFS`: a lone node's epoch never *freezes* (`note_live_members` always
+  counts itself). The `EROFS` is an epoch that **carries no lease**
+  (`writes_refused = frozen || carrierless`). Between close and re-claim
+  the node holds nothing locally, so its claim view is empty. An S3 cut
+  starting in that window (or one that fails the re-claim) forms an epoch
+  with no carrier, which refuses every write. The docs prescribe exactly
+  that for a carrierless epoch, but this one should never have formed: the
+  node's lease was standing all along. Such an epoch also lasted too long:
+  a member with nothing to ship backs its probe rounds off to
+  `idle_max_ms` (10 s), so it kept refusing writes up to 10 s after S3
+  returned. The harness check's create probably ran inside that window.
+
+### Decision (from `durability-and-failover.md` / `cluster-locks.md`)
+
+A grant is the lease's to answer for until somebody else holds the lease,
+and nobody can without a CAS on the lease object. If the re-claim's CAS
+replaces exactly the object the close let go, nobody held it in between
+and the tenure continues, single-node or multi-node. So the grants stand
+across a blip. Nothing in the design requires dropping them. Grants made
+inside the epoch are not capped by the lease (`lock_cap_ms`), which is
+why the table must survive. A tenure that did intervene (any other
+object replaced) drops the table, as before.
+
+### Fix
+
+Functions touched (for `lock-fence-token` and `overload-cascade`), after
+the review round below:
+
+- `core/promise.rs`
+  - `PromiseState::closed_tenure`: the lease objects `(holder, epoch,
+    expiry)` of the tenure an epoch's close let go. Never non-empty unless
+    the grants are kept.
+  - `PromiseState::closed_lease`: that S3 lease object, with its tag.
+  - `epoch_close_release`: both close paths call it; it keeps the grant
+    table.
+  - `epoch_tenure_resumed(from, hold)`: the next acquisition's CAS
+    (`acquire_won`) or epoch hold (`adopt_epoch_hold`) keeps the table if
+    `from` is one of those objects. Otherwise it drops the table and
+    quarantines new grants until the dropped ones lapse.
+  - `epoch_tenure_cas_in_doubt`: a re-claim CAS that fails in doubt adds
+    the object it may have written.
+  - `epoch_reclaim_pending`.
+  - `epoch_closed_claim` and `epoch_closed_carried`: the claim view
+    (`epoch_claim_view`) claims the closed lease while it stands.
+- `core/mod.rs`
+  - `on_epoch_state`: an activation carrying the closed lease makes this
+    node hold it again (`lease.adopt`); the existing `carries_mine` branch
+    then adopts the hold. A stale claim of it ends the tenure. Both close
+    paths go through `epoch_close_release`.
+  - Open-epoch probe backoff: `next_poll_ms`, `on_poll`,
+    `note_epoch_probe`, and `Core::{epoch_probes, epoch_s3_down}`.
+  - `Stats::epoch_closed_leases_reheld`.
+- `core/locks.rs`
+  - `LockState::keep_grants` and `lock_keep_grants_at_close`.
+  - `lock_on_lease_gone`: when the close keeps the table, it answers parked
+    waiters `Waiting` instead of `NotOwner{0}`.
+  - `lock_owner_resuming`.
+  - `lock_serve`: a resuming owner answers `WouldBlock` on a conflict with
+    a kept grant and `Waiting` otherwise.
+  - New `lock_conflict_refusal` (one copy of the conflict check, also used
+    by the `strict_answer_allowed` branch) and `lock_resume_retry_ms`.
+  - New `lock_op_while_resuming`, called from `lock_route_op`
+    (`Route::Unknown`) and `on_lock_holder_learned`.
+  - `lock_op_outcome`: `Busy` is back to `lock_retry`, and `Waiting` is
+    bounded for a non-blocking request.
+  - `on_lock_renew_tick`: routes like a peer's renewal (`renewal = true`).
+- `core/jobs.rs`
+  - `on_uploads_done`.
+  - `round_ship`: re-claims the closed lease while grants are live.
+  - `round_release`: keeps the flushed lease while grants are live, and
+    uses `live_grants_len` in the idle rule.
+  - `acquire_won`.
+  - The `Phase::Cas` failure arm.
+- `core/lease.rs` `granted_lease`: re-adopting its own unreleased lease
+  keeps the lease's granting mark.
+- `meta/src/locks.rs`: `LockTables::live_grants_len`.
+- `harness/src/scenarios/stressfs.rs` `no_lock_fencing`: prints the lock
+  counters it checks, plus `unavailable`.
+
+The previous round's engine change (`EpochManager` declining an epoch while
+`reclaiming`) and its sim mirror (`try_form`) are reverted. A node in the
+re-claim window now claims its standing lease instead of keeping out of
+epochs.
+
+### Review round 1 (findings → resolution)
+
+1. **Must-fix 1, a re-claim CAS in doubt that landed.** Fixed in the
+   `Phase::Cas` `Failed` arm. When `prev` is in `closed_tenure`, `sent`
+   joins it (`epoch_tenure_cas_in_doubt`). The next acquisition replaces
+   `(me, e, X')`, finds it in the tenure, and keeps the grants.
+   - Two follow-on gaps closed: `round_ship` now re-claims while grants
+     are live even when `epoch_reclaim_due` no longer holds (the object
+     moved to `X'`). And a hold of the closed lease keeps the list, so an
+     in-doubt object survives the hold's own close.
+   - Core tests: `a_reclaim_cas_in_doubt_that_landed_keeps_the_grants`
+     (fails without the fix: the grants are dropped and nothing re-claims)
+     and `only_a_kept_tenures_cas_in_doubt_joins_it`.
+   - Sim: `locks-blips` now makes one lease PUT in ten land and answer a
+     timeout (`Fault::AppliedThenTimeout`). Replays show the in-doubt path
+     taken in 3 of 6 seeds. Without the fix, `locks_survive_s3_blips`
+     fails on seed 99002 with a **mutual-exclusion violation**
+     (`node 3 (t49, Shared, in I/O since t=6911) and node 2 (t32,
+     Exclusive) at t=8379`).
+   - Drop path: `epoch_tenure_resumed` now quarantines new grants until the
+     dropped ones lapse, should no tenure have intervened after all.
+2. **Must-fix 2, a local lock in the re-claim window.** Fixed.
+   `lock_route_op` (`Route::Unknown`) and `on_lock_holder_learned` call
+   `lock_op_while_resuming`:
+   - a conflict with a kept grant is `WouldBlock`;
+   - otherwise the request queues the re-claim and retries every
+     `forward_backoff/4` without spending attempts, up to
+     `s3_less_deadline_ms`.
+
+   Tests: `a_local_lock_in_the_reclaim_window_without_p2p_waits_for_the_reclaim`
+   (`p2p = false`: `EAGAIN` on the kept grant's inode, a grant on a free
+   one, `lock_unavailable` 0) and
+   `a_lock_in_the_reclaim_window_waits_through_failing_lease_reads` (every
+   S3 request fails for 1.5 s).
+3. **Should-fix 3, global `Busy` patience.** Fixed. `Busy` is back to
+   `lock_retry`, so its fast `ENOLCK` returns. The resuming owner answers
+   the existing wire outcome `LockOutcome::Waiting { retry_ms }`, which
+   spends no attempt (no protocol change). A non-blocking requester
+   honours it only up to `s3_less_deadline_ms`, then retries as for
+   `Busy`.
+   - Test: `busy_fails_a_non_blocking_lock_fast_and_waiting_does_not`.
+     `Busy` gives `Unavailable` in under 5 s of simulated time; `Waiting`
+     keeps retrying for at least 20 s.
+   - Also `a_resuming_owner_tells_a_peer_to_wait`.
+   - `transport-lock-wait-budget` PASSED.
+4. **Should-fix 4, an outage that starts in the window.** Fixed as the
+   reviewer suggested:
+   - `epoch_claim_view().held` is the closed lease while the re-claim is
+     pending, bounded by expiry − margin. It also holds while a re-claim
+     CAS is in doubt, as a holder whose renewal is in doubt still claims;
+     the claim is the earlier expiry. An earlier version skipped the claim
+     in that case, and the sim showed this is the usual one: a cut that
+     lands mid re-claim fails the CAS.
+   - The activation carrying it calls `lease.adopt(lease, tag)`, then
+     `adopt_epoch_hold` → `epoch_tenure_resumed(carried, hold)`.
+   - The node holds the S3 lease beside the hold, exactly as a carried
+     holder does. Holding the hold alone was not enough:
+     `ensure_granting_marked` needs `lease.held`, and every lock was `Busy`.
+   - Core test: `an_outage_inside_the_reclaim_window_forms_an_epoch_carrying_the_lease`.
+     The claim equals the closed lease. The epoch's hold is adopted,
+     writes are not refused, the grants stand, a grant can be made inside
+     the epoch, and the next close re-claims with the grants standing.
+   - Core test: `a_stale_claim_of_the_closed_lease_ends_its_tenure`.
+   - Sim: `locks-blips-tight` (outages in pairs 300–900 ms apart): 11
+     closed leases held again over 60 seeds, with no lost grant, no fenced
+     I/O and no `ENOLCK`.
+5. **Should-fix 5, open-epoch probes never backed off.** Fixed.
+   - The interval is the sync interval at first, doubling to 4× (500 ms →
+     1 s → 2 s by default), and returns to the sync interval at the first
+     S3 success after a failure (`note_epoch_probe`).
+   - A frozen member with S3 reachable makes one round every 2 s. That is
+     30 tail reads (`SegmentRun`) a minute, plus 30 lease reads on a member
+     of an epoch carrying another member's lease: about 60 requests a
+     minute. Before this chunk it was 12 a minute (10 s idle backoff); the
+     reviewed version made about 240.
+   - Cost: a carrierless epoch now ends up to 2 s, not 0.5 s, after S3
+     returns.
+   - Test: `an_open_epochs_probes_back_off_and_reset_when_s3_returns`.
+6. **Should-fix 6, PROGRESS conflict.** The coordinator rebased the tree
+   onto `c28d849`. This section is still the file's last.
+7. **Nits.**
+   - The duplicated conflict check is now `lock_conflict_refusal`.
+   - `lock_owner_resuming`'s doc now names the gate-pending clause and why
+     it is safe (a refusal grants nothing). `lock_op_while_resuming` queues
+     an acquisition only when the re-claim is pending, never while the
+     lease is held.
+   - `cluster-locks.md` gives the measured 0.35–6 s.
+   - `round_release` (flush and idle rule) uses the new
+     `live_grants_len(now)`.
+
+Found while testing the review fixes (with `locks-blips-tight`):
+
+- A close answered parked waiters `NotOwner{0}`, which cleared the peer's
+  `cached_holder`. With S3 cut again, the peer's renewals found no owner and
+  its grant lapsed under its I/O. Now a keeping close answers `Waiting`.
+  Test: `a_close_that_keeps_the_grants_tells_its_waiters_to_wait`.
+- A holder whose gate was pending (the re-claim's marker held back by a new
+  cut) served peers' renewals but not its own: `on_lock_renew_tick` used
+  `lock_route`, not `lock_route_for(.., true)`. Its own grant lapsed. Test:
+  `own_renewals_are_served_while_the_gate_is_pending`.
+- A re-claimed own lease lost its granting mark (`granted_lease` set it
+  from `strict_mounts` only). With S3 cut again the mark could not be
+  rewritten, and every lock was `Busy`, then `ENOLCK`. Test:
+  `a_re_adopted_own_lease_keeps_its_granting_mark`.
+
+K5a: the backup seal hold only delays a backup's seal watch.
+`closed_tenure` is in memory and dies with the process, so a handoff to a
+successor on the same state dir takes the ordinary restart path. A seal
+or takeover changes the lease object, and the re-claim then drops the
+table. No interaction.
+
+### Tests
+
+- Core (`core/tests.rs`, `mod locks`): two from the first round
+  (`lock_grants_survive_an_epoch_close_whose_reclaim_continues_the_tenure`,
+  `lock_grants_kept_at_an_epoch_close_go_if_another_tenure_intervened`;
+  the other two were replaced) plus the twelve named above. All 48 lock
+  tests pass.
+- Sim: `locks_survive_s3_blips` covers `locks-blips` (60 seeds: 240
+  epochs, 0 lost, 0 fenced, 0 unavailable) and `locks-blips-tight` (60
+  seeds, `epoch_closed_leases_reheld` = 11, 0/0/0).
+
+### Gates (round 2: kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, load average 60–260)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean, clean |
+| `cargo test --workspace` in four groups (`--no-fail-fast`, debug) | 987 + 523 + 484 passed, 0 failed |
+| `cargo test --release -p constellation-authority` | lib 198 (2 ignored), meta_repro 4, sim 112 (11 ignored), 0 failed |
+| `cargo test --release -p constellation-model` (three calls) | 75 + 56 + 7 passed, 0 failed |
+| `sweep_config`, release, 2,000 seeds each: `locks-blips` (99000.., 300000..), `locks-blips-tight` (400000.., 402000..), `locks`, `locks-partition`, `locks-skew`, `locks-failover`, `locks-failover-backup`, `locks-faults`, `locks-delegated`, `locks-pause`, `locks-released-delegated`, `locks-writes`, `locks-delegated-writes`, `locks-released-writes`, `locks-failover-backup-writes` (the `long_locks` seed bases), `flex`, `flex-crash` | 0 failing in every sweep |
+| the same, 1,000 seeds: `long-backup`, `delegated-holder-cut`, `long-strict`, `long-delegated`, `long-acks3`, `long-sessions`, `delegated-backup`, `long-delegated-backup`, `backup-hot`, `placement-hot` | 0 failing |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `cargo build --release --workspace` | ok |
+| `docker compose -p elgfix … --profile test run --rm compliance` (`ports: !reset []`, 4566 taken) | `8798 passed, 0 failed`, `COMPLIANCE TEST PASSED`. The first attempt died before pjdfstest started (`FAIL: mount did not appear`); the retry passed |
+| `STRESS_NG_FS_ONLY=fcntl,lockofd,lockf,locka,flock,lockmix STRESS_NG_FS_SECS=60 harness run stress-ng-fs-faults --seed N`, N = 44–51 | **8/8 PASSED**. Every seed: `unavailable 0 lost 0 fenced_io 0 owners_fenced 0 owner_fenced_ops 0` (granted 9–13, would_block 0). 7–12 closes per run, all "lock grants kept". The only drop was at the clean unmount. 0 `lock grant lost`, 0 `discarded writes`. Largest `slow core step` per seed: 1.2, 2.0, 1.3, 4.5, 0.9, 0.9, 1.2, 3.5 s. No run failed on a stall |
+| `harness run` `fsync-hard-outage s3-cut-one-node continuation-epoch epoch-member-lost epoch-peer-reaching-s3-declines epoch-member-dies-with-chunk epoch-slack-zero-unchanged lock-latency lock-holder-partitioned lock-failover lock-fence-at-close lock-grant-dead-generation transport-lock-wait-budget git-under-flock-faults stress-ng-flap s3-flap fio-blips` (prefix `elgfix`) | PASSED |
+| `epoch-missing-node` | 1 FAILED (the epoch formed with `carrier: null`), then 2/2 PASSED. Timing: "formed 9.4 s / 5.6 s after the cut" |
+| `lock-holder-killed-contention` | 1 FAILED (a 7.9 s stall against a 7.0 s bound, at load ~230; no epoch, no lease movement in its kept logs), then 2/2 PASSED at 3.4–3.8 s (main: 3.4–4.1 s) |
+| `epoch-holder-retired` | **pre-existing, fails on main `c28d849`**: main 3/12 FAILED, this tree 7/14, this tree with the probe backoff disabled 2/5. All fail with `A's unflushed write surfaced` |
+
+`epoch-holder-retired` mechanism, from a kept failing run:
+- B held A's epoch write as streamed speculation.
+- After `leave --node-id A` and C's takeover, B replays it as a stranded
+  *foreign* entry: `stranded op replayed by rid … rid=Rid { node: 1, … }`.
+  That is the M9 rule in `replay::on_replay_outcome`: a foreign entry
+  waits only for the successor's verdict.
+- So A's acknowledged, never-flushed write lands. Whether it does depends
+  on whether A's stream reached B before `kill9`.
+- None of this chunk's code runs on B in that scenario: B holds no lease
+  and the scenario takes no locks. The only change that does run there is
+  the probe backoff, and with it disabled the scenario still fails.
+
+### Open, not done here
+
+- **In-doubt acquisition CAS, lock-only traffic.** An acquisition CAS that
+  lands but reports a timeout leaves the lease this node's without its
+  knowing.
+  - Peers' lock requests get `NotOwner{0}` from it. Nothing makes it
+    re-adopt its own lease (`readopt_own_lease_for_forward` covers
+    forwards, and only when `last_seen` names it), so lock waiters stall
+    until the lease expires.
+  - The sim's `locks-blips-tight` with in-doubt lease PUTs reaches it:
+    seed 403387, a waiter times out after 60 s. It also does so without
+    this chunk's backoff (seeds 400587, 401059). Main fails the same
+    "lock client … not acquired" class under that schedule, behind its
+    mutual-exclusion failures.
+  - Fixing it means acquiring from `lock_serve`, which `lock-fence-token`
+    is also editing. `locks-blips-tight` therefore runs without the
+    in-doubt PUTs; `locks-blips` keeps them.
+- **Directory history out of order.** Under back-to-back cuts with in-doubt
+  lease PUTs, a directory history is out of order: seed 400903 here,
+  401007 on main. Not investigated.
+- **Carried lease past its S3 expiry.** If every re-claim window between
+  back-to-back cuts is too short, the carried lease passes its S3 expiry.
+  It can then be neither claimed nor re-claimed by its holder alone, and
+  its grants lapse (`locks-blips-tight` seed 99109 before the schedule
+  was paired). This is inherent: past expiry anyone may take the lease.
+- **Renewal busy loop.** A renewal with no reachable owner re-ticks every
+  1 ms while the relearn read fails (seen in the sim with S3 cut). This
+  predates this chunk.
+- Carried over from round 1: delegations are still dropped at the close,
+  and the re-claim's takeover gate under heavy load belongs to
+  `overload-cascade`.
+- `stress-ng-fs-faults` passed 8/8 with all six stressors, so it can leave
+  `KNOWN_BUG_REPROS` once the reviewer agrees.

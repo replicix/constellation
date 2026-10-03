@@ -64,7 +64,7 @@ mod stream;
 mod tests;
 
 use crate::action::{Action, ControlOk, TimerKind};
-use crate::event::{Control, Event, PeerLink, PeerMsg, S3Result};
+use crate::event::{CasFailure, Control, Event, PeerLink, PeerMsg, S3Result};
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_meta::Rid;
@@ -889,6 +889,10 @@ pub struct Stats {
     /// M12 round 2: epoch holds adopted by a member that restarted into
     /// an open epoch carrying its own lease (flex-crash seed 30299).
     pub epoch_holds_adopted_late: u64,
+    /// Continuation epochs that carried the lease the previous epoch's
+    /// close let go, claimed while its re-claim was pending: held again
+    /// (`epoch_closed_claim`).
+    pub epoch_closed_leases_reheld: u64,
     /// Continuation-epoch handoffs declined because the requester had not
     /// applied this holder's whole log (flex-crash seed 30702).
     pub epoch_handoffs_behind: u64,
@@ -1153,6 +1157,11 @@ pub struct Core {
     poll_timer: Option<TimerId>,
     drain_timer: Option<TimerId>,
     idle_rounds: u32,
+    /// Polls while a continuation epoch is open, since it opened or S3
+    /// was last seen back (`next_poll_ms`'s probe backoff), and whether
+    /// an S3 request failed since.
+    epoch_probes: u32,
+    epoch_s3_down: bool,
     /// A nudge arrived while a round was in flight: run another right
     /// after it (`nudged` in the sync loop).
     nudged: bool,
@@ -1251,6 +1260,8 @@ impl Core {
             poll_timer: None,
             drain_timer: None,
             idle_rounds: 0,
+            epoch_probes: 0,
+            epoch_s3_down: false,
             nudged: false,
             round_waiters: Vec::new(),
             barriers: Vec::new(),
@@ -1791,6 +1802,7 @@ impl Core {
             return;
         };
         self.note_s3_liveness(now, op, &result);
+        self.note_epoch_probe(&result);
         match purpose {
             S3For::Job => self.on_job_s3(now, op, result, replica, out),
             S3For::LearnHolder(rid) => self.on_holder_learned(now, rid, result, replica, out),
@@ -2149,6 +2161,10 @@ impl Core {
     ) {
         let before = self.epoch;
         self.epoch = state;
+        if state.open != before.open {
+            self.epoch_probes = 0;
+            self.epoch_s3_down = false;
+        }
         tracing::debug!(
             node = self.cfg.node_id,
             open = state.open,
@@ -2163,6 +2179,32 @@ impl Core {
         );
         self.deleg_on_epoch(now, state.active && !state.frozen, replica, out);
         if state.active && !before.active {
+            if let Some((lease, tag)) = self.epoch_closed_carried(now) {
+                // The activation carries the lease this node's last
+                // epoch close let go, claimed while its re-claim was
+                // pending (`epoch_closed_claim`): it stood in S3 all
+                // along, this node's, and nobody else held it since (it
+                // is the claim at the highest epoch, and taking it needs
+                // a CAS on that very object, or this epoch's members'
+                // promises). Held again as before the close, the epoch
+                // carries it below as it carries any holder's, and the
+                // hold continues the tenure and its lock grants
+                // (`epoch_tenure_resumed`). Claiming nothing, the epoch
+                // carried no lease and refused every write (`EROFS`).
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    epoch = lease.epoch,
+                    "the continuation epoch carries the lease its predecessor's close let go: \
+                     holding it again"
+                );
+                if self.hold_ended_is(lease.epoch, lease.expires_unix_ms)
+                    && replica.persist_epoch_hold_ended(None).is_ok()
+                {
+                    self.pr.hold_ended = None;
+                }
+                self.lease.adopt(now, lease, tag, None);
+                self.stats.epoch_closed_leases_reheld += 1;
+            }
             self.skip_ship = true;
             // Plan 30 §M10's claim resolution: a member whose lease claim
             // is below an epoch another member knows of was taken over
@@ -2185,6 +2227,13 @@ impl Core {
                 // epoch is open, so no taker gets past the promise check.
                 let epoch = self.lease.epoch().unwrap_or(1);
                 self.adopt_epoch_hold(now, epoch, replica);
+            } else if self
+                .epoch_closed_claim(now)
+                .is_some_and(|(l, _)| l.epoch < stale_below)
+            {
+                // A member knows a later epoch: the lease the close let go
+                // was taken over meanwhile, and its tenure is over.
+                self.epoch_tenure_resumed(None, false, replica);
             }
         } else if state.active
             && self.lease.usable(now, &self.cfg)
@@ -2248,9 +2297,7 @@ impl Core {
         }
         if !state.active && before.active && !state.frozen {
             self.skip_ship = false;
-            self.lease.release_local();
-            self.deleg_on_lease_gone(now, replica, out);
-            replica.set_holder_epoch(0);
+            self.epoch_close_release(now, replica, out);
             self.nudge(now, out);
         }
         if !state.open && !state.flushing {
@@ -2340,6 +2387,9 @@ impl Core {
     /// The periodic poll fired: run a round unless a job holds the slot,
     /// in which case the round follows it.
     fn on_poll(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+        if self.epoch.open {
+            self.epoch_probes = self.epoch_probes.saturating_add(1);
+        }
         if self.job.is_some() {
             self.nudged = true;
             return;
@@ -2350,7 +2400,17 @@ impl Core {
     /// `next_poll_ms`: doubling idle backoff, capped by the ceiling and,
     /// while holding, by a quarter of the TTL so renewal is never slept
     /// through (`lease_poll_cap_ms`); M13: by the hot tail interval
-    /// while an op waits on its inbox outcome.
+    /// while an op waits on its inbox outcome. While a continuation epoch
+    /// is open its rounds are the probes that close it once S3 is back:
+    /// the sync interval at first, doubling to at most four times it
+    /// (500 ms → 2 s by default), and the sync interval again once S3
+    /// answers after a failure (`note_epoch_probe`). Backed off as idle
+    /// rounds, a member with nothing to ship (no hold, or an epoch that
+    /// carries no lease and refuses writes with `EROFS`) probed only
+    /// every `idle_max_ms` (10 s), still refusing writes that long after
+    /// S3 returned (`stress-ng-fs-faults`: a create after the run failed
+    /// `EROFS`); never backed off, a frozen epoch whose dead member
+    /// waits for an admin probed twice a second for hours.
     pub(crate) fn next_poll_ms(&self, now: Ms) -> u64 {
         let base = self.cfg.sync_interval_ms.max(1);
         let mut next = base
@@ -2362,6 +2422,47 @@ impl Core {
         if !self.inbox.pending.is_empty() {
             next = next.min(self.cfg.inbox_tail_ms.max(1));
         }
+        if self.epoch.open {
+            let probe = base
+                .saturating_mul(1u64 << self.epoch_probes.saturating_sub(1).min(2))
+                .min(base.saturating_mul(4));
+            next = probe;
+            if self.lease.ship_epoch(now, &self.cfg).is_some() {
+                next = next.min((self.cfg.ttl_ms / 4).max(1));
+            }
+            if !self.inbox.pending.is_empty() {
+                next = next.min(self.cfg.inbox_tail_ms.max(1));
+            }
+        }
         next
+    }
+
+    /// An S3 result while a continuation epoch is open: a failure marks
+    /// S3 away; the first success after one is the evidence that S3 is
+    /// back, and the probes return to the sync interval for the close.
+    fn note_epoch_probe(&mut self, result: &S3Result) {
+        if !self.epoch.open {
+            return;
+        }
+        let failed = match result {
+            S3Result::LeaseGet(r) => r.is_err(),
+            S3Result::LeasePut(r) => matches!(r, Err(CasFailure::Failed(_))),
+            S3Result::SegmentPut(r) | S3Result::InboxPut(r) => {
+                matches!(r, Err(CasFailure::Failed(_)))
+            }
+            S3Result::SegmentRun(r) => r.is_err(),
+            S3Result::SegmentGap(r) => r.is_err(),
+            S3Result::InboxRun(r) | S3Result::InboxDrain(r) => r.is_err(),
+            S3Result::InboxDelete(r) | S3Result::InboxTombstone(r) => r.is_err(),
+            S3Result::InboxLastN(r) => r.is_err(),
+            S3Result::Heartbeats(r) => r.is_err(),
+            S3Result::HeartbeatPut(r) => r.is_err(),
+        };
+        if failed {
+            self.epoch_s3_down = true;
+        } else if self.epoch_s3_down {
+            self.epoch_s3_down = false;
+            self.epoch_probes = 0;
+        }
     }
 }

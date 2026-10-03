@@ -55,7 +55,7 @@ use crate::replica::Replica;
 use constellation_store_s3::heartbeat::{
     effective_slack, takeover_check, Promise, PromiseConfig, PROMISE_TTL_LEASE_DIVISOR,
 };
-use constellation_store_s3::{AckPolicy, Lease};
+use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 use std::collections::BTreeMap;
 
 /// Whether a continuation epoch of `members` may carry `lease` (plan 30
@@ -163,6 +163,24 @@ pub(crate) struct PromiseState {
     /// has not all reached the log yet: it is still the epoch's
     /// authority, and promises nothing.
     pub flush_pending: bool,
+    /// The leases `(holder, epoch, expiry)` this node held when it last
+    /// closed a continuation epoch — its own S3 lease, and the carried
+    /// lease whose hold it owned — until it next acquires. The close let
+    /// them go locally but kept the lock grants made under them
+    /// (`epoch_close_release`); the acquisition that CASes exactly one
+    /// of these objects continues that tenure, any other ends it
+    /// (`epoch_tenure_resumed`). An epoch hold of one of them continues
+    /// the tenure too, and keeps the list: the S3 object is still one of
+    /// them. Holds the object a re-claim CAS in doubt may have written
+    /// (`(me, e, X')` replacing `(me, e, X)`): it is this tenure's if it
+    /// landed. Empty whenever the grants were dropped
+    /// (`lock_on_lease_gone`).
+    pub closed_tenure: Vec<(NodeId, Epoch, i64)>,
+    /// The S3 lease object (and its tag) this node held at that close,
+    /// while it is in `closed_tenure`: what it claims for a continuation
+    /// epoch until the re-claim lands (`epoch_claim_view`), and holds
+    /// again if one carries it (`on_epoch_state`).
+    pub closed_lease: Option<(Lease, LeaseTag)>,
 }
 
 #[derive(Debug)]
@@ -440,13 +458,23 @@ impl Core {
         let held = if self.lease.usable(now, &self.cfg) && !self.lease.epoch_held() {
             self.lease.held.as_ref().map(|(l, _)| l.clone())
         } else {
-            None
+            // Between an epoch's close and its re-claim the lease stands
+            // in S3, this node's, though let go locally: it claims it as
+            // it would hold it. Claiming nothing formed an epoch that
+            // carried no lease and refused every write (`EROFS`) for the
+            // rest of an outage that began in that window, on the node
+            // whose lease stood all along (`stress-ng-fs-faults`); the
+            // activation adopts the hold (`on_epoch_state`).
+            self.epoch_closed_claim(now).map(|(l, _)| l.clone())
         };
         let mut known = self.ship.max_epoch;
         if self.bk.sealed > 0 {
             known = known.max(self.bk.sealed + 1);
         }
         if let Some((l, _)) = &self.lease.held {
+            known = known.max(l.epoch);
+        }
+        if let Some(l) = &held {
             known = known.max(l.epoch);
         }
         if self.lease.lost && self.lease.lost_floor != u64::MAX {
@@ -459,6 +487,201 @@ impl Core {
             advertised_slack: self.pr.advertised,
             epoch_held: self.lease.epoch_held(),
         }
+    }
+
+    /// The lease an epoch's close let go here, while its re-claim is
+    /// pending and it is usable as a held lease would be (unexpired past
+    /// the margin): what this node claims for a continuation epoch
+    /// meanwhile ([`Self::epoch_claim_view`]). Also while a re-claim CAS
+    /// is in doubt (S3 cut again while it was in flight: the usual case),
+    /// as a holder whose renewal is in doubt claims the lease it holds:
+    /// if the CAS landed, the object is the later one, of this tenure
+    /// too (`epoch_tenure_cas_in_doubt`), and the claim is the earlier
+    /// expiry.
+    pub(crate) fn epoch_closed_claim(&self, now: Ms) -> Option<&(Lease, LeaseTag)> {
+        if !self.epoch_reclaim_pending(now) {
+            return None;
+        }
+        let me = self.cfg.node_id;
+        self.pr.closed_lease.as_ref().filter(|(l, _)| {
+            let it = (l.holder, l.epoch, l.expires_unix_ms);
+            l.holder == me
+                && !l.released
+                && l.expires_in_ms(now.0) > self.cfg.expiry_margin_ms as i64
+                && self.pr.closed_tenure.contains(&it)
+        })
+    }
+
+    /// A continuation epoch closed (S3 is back): the hold and the S3
+    /// lease go locally (the next acquisition re-adopts the lease through
+    /// the gate: the flush's re-claim, `epoch_reclaim_due`), the tenure's
+    /// delegations with them. Its lock grants stay until that acquisition
+    /// decides (`epoch_tenure_resumed`): a node that kept its lease
+    /// through an S3 blip keeps its grants, where dropping them failed
+    /// every lock holder's I/O with `EIO` (fenced) and its next lock with
+    /// `ENOLCK` at every close (`stress-ng-fs-faults`). Safe because the
+    /// grants are this lease's to answer for until somebody else holds
+    /// it, and nobody can without a CAS on the very object the re-claim
+    /// CASes: if the re-claim lands, nobody held it in between.
+    pub(crate) fn epoch_close_release(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let me = self.cfg.node_id;
+        // The tenure's objects so far: a close reported again (the
+        // driver's report of a close this core made itself), or an epoch
+        // hold that continued an earlier close's tenure (and a re-claim
+        // in doubt meanwhile), adds to them. Empty unless grants are
+        // kept, so nothing older than this tenure is in it.
+        let mut tenure = std::mem::take(&mut self.pr.closed_tenure);
+        let mut object = self.pr.closed_lease.take();
+        let before = tenure.len();
+        if self.lease.lost {
+            tenure.clear();
+        } else {
+            if let Some((l, _)) = self
+                .lease
+                .held
+                .as_ref()
+                .filter(|(l, _)| l.holder == me && !l.released)
+            {
+                let it = (l.holder, l.epoch, l.expires_unix_ms);
+                if !tenure.contains(&it) {
+                    tenure.push(it);
+                }
+                object = self.lease.held.clone();
+            }
+            if self.lease.epoch_held() {
+                if let Some(c) = self.pr.carried {
+                    let c = (c.node, c.epoch, c.expires_unix_ms);
+                    if !tenure.contains(&c) {
+                        tenure.push(c);
+                    }
+                }
+            }
+        }
+        self.lease.release_local();
+        self.pr.closed_lease =
+            object.filter(|(l, _)| tenure.contains(&(l.holder, l.epoch, l.expires_unix_ms)));
+        let added = tenure.len() > before;
+        self.pr.closed_tenure = tenure;
+        if !self.pr.closed_tenure.is_empty() {
+            let grants = replica.locks().grants_len();
+            if grants > 0 && added {
+                tracing::info!(
+                    node = me,
+                    grants,
+                    "continuation epoch closed: lock grants kept for the lease's re-claim"
+                );
+            }
+            self.lock_keep_grants_at_close();
+        }
+        self.deleg_on_lease_gone(now, replica, out);
+        replica.set_holder_epoch(0);
+    }
+
+    /// This node holds again — by an acquisition whose CAS replaced
+    /// `from` (`hold` false), or a hold of the carried lease `from` —
+    /// after an epoch close kept its lock grants: they stand if `from`
+    /// is one of the objects the close let go (the tenure continues), and
+    /// are dropped otherwise. A hold keeps the list: the S3 object is
+    /// still that one, for the re-claim after the hold's own close.
+    pub(crate) fn epoch_tenure_resumed(
+        &mut self,
+        from: Option<(NodeId, Epoch, i64)>,
+        hold: bool,
+        replica: &dyn Replica,
+    ) {
+        if self.pr.closed_tenure.is_empty() {
+            return;
+        }
+        if from.is_some_and(|f| self.pr.closed_tenure.contains(&f)) {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                grants = replica.locks().grants_len(),
+                hold,
+                "the lease a continuation epoch's close let go is held again: its lock grants stand"
+            );
+            if !hold {
+                self.pr.closed_tenure.clear();
+                self.pr.closed_lease = None;
+            }
+            return;
+        }
+        self.pr.closed_tenure.clear();
+        self.pr.closed_lease = None;
+        // Their holders honour them until they lapse (a peer's, and this
+        // node's own lockers'): nothing is granted over them meanwhile,
+        // should no other tenure have intervened after all.
+        let until = replica
+            .locks()
+            .grants_snapshot()
+            .iter()
+            .map(|g| g.until_ms)
+            .max();
+        let n = replica.locks().clear_grants();
+        if let Some(until) = until {
+            replica.locks().set_quarantine(until);
+        }
+        if n > 0 {
+            tracing::info!(
+                node = self.cfg.node_id,
+                grants = n,
+                "the lease a continuation epoch's close let go was not re-claimed: lock grants dropped"
+            );
+        }
+    }
+
+    /// A lease CAS replacing `prev` failed in doubt: had it landed, `sent`
+    /// is the S3 object now, written by this node over a lease of the
+    /// tenure an epoch's close kept the grants of — the same tenure. The
+    /// next acquisition then replaces `sent`, and must keep the grants
+    /// (a cut that began while the re-claim CAS was in flight dropped
+    /// them, and released the lease).
+    pub(crate) fn epoch_tenure_cas_in_doubt(&mut self, prev: &Lease, sent: &Lease) {
+        let p = (prev.holder, prev.epoch, prev.expires_unix_ms);
+        let s = (sent.holder, sent.epoch, sent.expires_unix_ms);
+        if !prev.released
+            && !sent.released
+            && sent.holder == self.cfg.node_id
+            && self.pr.closed_tenure.contains(&p)
+            && !self.pr.closed_tenure.contains(&s)
+        {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                epoch = sent.epoch,
+                "a lease CAS of a kept tenure is in doubt: its object is the tenure's too"
+            );
+            self.pr.closed_tenure.push(s);
+        }
+    }
+
+    /// The lease object [`Self::epoch_closed_claim`] claims, when the
+    /// activation's carrier is exactly it.
+    pub(crate) fn epoch_closed_carried(&self, now: Ms) -> Option<(Lease, LeaseTag)> {
+        let c = self.pr.carried?;
+        self.epoch_closed_claim(now)
+            .filter(|(l, _)| {
+                (c.node, c.epoch, c.expires_unix_ms) == (l.holder, l.epoch, l.expires_unix_ms)
+            })
+            .cloned()
+    }
+
+    /// This node closed an epoch holding a lease that still stands (as
+    /// far as it knows: unexpired past the margin) and has not acquired
+    /// since: its re-claim is pending (meanwhile it claims that lease for
+    /// a continuation epoch: [`Self::epoch_closed_claim`]).
+    pub(crate) fn epoch_reclaim_pending(&self, now: Ms) -> bool {
+        !self.lease.lost
+            && self.lease.held.is_none()
+            && !self.lease.epoch_held()
+            && self
+                .pr
+                .closed_tenure
+                .iter()
+                .any(|(_, _, expires)| *expires - self.cfg.expiry_margin_ms as i64 > now.0)
     }
 
     /// This node lets its epoch hold go for good (a handoff, the close):
@@ -560,6 +783,11 @@ impl Core {
     /// `(epoch, jseq)` is reached by the flush's segments and by nothing
     /// earlier: see [`Self::epoch_hold_epoch_for`].
     pub(crate) fn adopt_epoch_hold(&mut self, now: Ms, epoch: Epoch, replica: &dyn Replica) {
+        let carried = self
+            .pr
+            .carried
+            .map(|c| (c.node, c.epoch, c.expires_unix_ms));
+        self.epoch_tenure_resumed(carried, true, replica);
         self.lease.adopt_epoch_hold(now, epoch);
         replica.set_holder_epoch(self.lease.epoch_hold().unwrap_or(0));
     }

@@ -560,6 +560,37 @@ Operational rules:
   nothing waits for the lease in it.)
   Once S3 is back, any member closes it, frozen or not (nothing was
   written under it), and the lease is decided by CAS again.
+- An open epoch's members probe S3 at the sync interval
+  (`CONSTELLATION_SYNC_INTERVAL_MS`, 500 ms) at first, backing off to
+  four times it (2 s) while nothing changes, and return to the sync
+  interval as soon as an S3 request succeeds after a failure (S3 is
+  back). A member with nothing to ship (an epoch carrying no lease, or
+  one carrying another member's) used to go idle and probe only every
+  `CONSTELLATION_SYNC_IDLE_MAX_MS` (10 s), so it kept refusing writes
+  with `EROFS` up to 10 s after S3 returned; now that ends within 2 s
+  and the close's few S3 requests. A frozen epoch that stays open with
+  S3 reachable (a dead member waiting for `leave`) costs each member
+  one probe round every 2 s: about 30 tail reads a minute, and as many
+  lease reads on a member of an epoch carrying another member's lease.
+- A node that closed an epoch while holding a lease that still stands,
+  and has not re-claimed it yet, claims that lease for a new epoch as
+  if it held it (until the lease would expire, less the margin). The
+  close lets the lease go locally; claiming nothing, an epoch formed in
+  that window (an S3 cut starting just after the last one ended, often
+  while the re-claim's CAS was in flight) carried no lease and refused
+  every write with `EROFS` on the node whose lease had been standing
+  all along (`stress-ng-fs-faults`). An epoch carrying it makes the node
+  hold the lease again, as before the close, with its epoch hold: writes
+  and locks go on, and the next close re-claims it.
+- The close keeps the lease's [cluster lock](cluster-locks.md#failover)
+  grants. The re-claim's CAS replacing the lease the close let go (or
+  the object a re-claim CAS in doubt may have written over it) proves
+  that nobody held it in between, so they stand. Any other acquisition
+  drops them, and grants nothing over them until they lapse. After the
+  flush, a lease with live grants is kept rather than released (it is
+  released as an idle lease is, once they are gone). A node re-adopting
+  its own lease keeps the lease's granting mark, so a re-claim that S3
+  cuts again before it could mark the lease does not refuse every lock.
 - A member of an epoch that carries a lease closes it once S3 is back
   and the lease object is no longer the carried lease (the hold owner's
   flush re-claimed it), frozen or not: a missing member (paused, dead)

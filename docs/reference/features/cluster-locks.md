@@ -346,6 +346,34 @@ owner has replaced it.
   itself died with its process (its local locks and held grants live in
   memory, and a handover is refused while a cluster lock is held), so a
   lone node that remounts grants at once.
+- **An S3 blip** (a [continuation
+  epoch](durability-and-failover.md#flexible-continuation-epochs)
+  carrying the holder's lease): the grants stand. Inside the epoch the
+  hold owner keeps granting and renewing. When S3 returns, the close
+  lets the lease go locally until the flush re-claims it, but the grant
+  table stays. If the re-claim's CAS replaces exactly the lease the
+  close let go (or the object a re-claim CAS in doubt wrote over it),
+  nobody held it in between and every grant goes on. If anything else
+  is acquired next, the table is dropped, and nothing is granted over
+  the dropped grants until they lapse. Until the re-claim lands (a few
+  S3 round trips: 0.35 to 6 s were measured under load), a request for
+  a new grant is answered `EAGAIN` if a kept grant conflicts with it,
+  and otherwise waits for the re-claim, up to
+  `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (20 s), not refused `ENOLCK`; P2P
+  or not, and also when S3 is cut again before the re-claim lands (then
+  the next epoch carries the lease again, see
+  [continuation epochs](durability-and-failover.md#flexible-continuation-epochs)).
+  Requests parked at the close are told to ask again. Renewals keep
+  going to the holder. After the flush, the lease stays while grants are
+  live, as with any idle holder. Any other `Busy` from an owner (no
+  fresh S3 liveness, a lease not marked as granting yet) still fails a
+  non-blocking request with `ENOLCK` after the usual few attempts.
+  Before, every close dropped
+  the table: each lock holder's next renewal was answered `lost` (its
+  I/O fenced with `EIO`), a new lock could fail with `ENOLCK`, and in a
+  cluster the owner could grant a conflicting lock while the old holder
+  was still in its critical section (`stress-ng-fs-faults`; the
+  `locks-blips` simulation).
 
 While any grant is live, the holder does not release the root lease
 when idle and declines a cooperative handoff. A cached grant (up to
@@ -526,7 +554,11 @@ The node's grant lapsed: `fenced_io` rises on the locked file,
 `owner_fenced_ops` on the lock owner's operations elsewhere, and `lost`
 counts the grants. The usual cause is a stall of the node, or a
 partition from the owning sequencer, longer than
-`CONSTELLATION_LOCK_TTL_MS`, or a TTL takeover of the root lease. Close
+`CONSTELLATION_LOCK_TTL_MS` (on the holder itself, a stall of its
+authority core: renewals of its own grants run there too, so a
+`slow core step` of that length in the log fences them), or a TTL
+takeover of the root lease. An S3 blip no longer does (see
+[Failover](#failover)). Close
 the file or unlock, then lock again. The application must assume that
 another node may have taken the lock in between. If `close` or `fsync`
 returns `EIO`, the writes it made under the lapsed grant, and not yet

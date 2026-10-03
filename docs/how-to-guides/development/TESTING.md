@@ -2559,7 +2559,18 @@ that lose state, an outwaited delegate without grace; the design clean).
 Simulation: `cargo test -p constellation-authority --release` runs the
 lock configurations (`locks`, `locks-partition`, `locks-skew`,
 `locks-failover`, `locks-failover-backup`, `locks-faults`,
-`locks-delegated`) with a mutual-exclusion ghost; replay one with
+`locks-delegated`, `locks-blips`, `locks-blips-tight`) with a
+mutual-exclusion ghost;
+`locks-blips` (`locks_survive_s3_blips`) cuts the whole cluster from S3
+for 1.5 s four times, so continuation epochs carrying the holder's lease
+open and close around critical sections, with one lease PUT in ten
+landing but answering a timeout (a re-claim in doubt), and requires no
+lost grant, no fenced I/O and no `ENOLCK` (before the `epoch-lock-grants`
+fix the first seed already broke mutual exclusion: every close dropped
+the grant table). `locks-blips-tight` cuts in back-to-back pairs (300 to
+900 ms apart), so some cuts start between a close and the lease's
+re-claim, and requires the next epoch to carry the lease again
+(`epoch_closed_leases_reheld`). Replay one with
 `AUTHORITY_SIM_SEED=<seed> AUTHORITY_SIM_CONFIG=<config> RUST_LOG=sim=debug,constellation_authority::core::locks=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
 
 Harness scenarios (the harness process is the application: it calls

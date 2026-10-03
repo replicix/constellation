@@ -1589,9 +1589,7 @@ impl Core {
                         }
                         out.push(Action::EpochClose);
                         self.skip_ship = false;
-                        self.lease.release_local();
-                        self.deleg_on_lease_gone(now, replica, out);
-                        replica.set_holder_epoch(0);
+                        self.epoch_close_release(now, replica, out);
                         if let Some(Job {
                             what: What::Round { epoch_closed, .. },
                             ..
@@ -1786,12 +1784,20 @@ impl Core {
                         ask_handoff: self.cfg.p2p,
                     });
                 } else if self.lease.gate.is_none()
-                    && self.epoch_reclaim_due()
+                    && (self.epoch_reclaim_due()
+                        || (!self.epoch.open
+                            && self.epoch_reclaim_pending(now)
+                            && replica.locks().live_grants_len(now.0) > 0))
                     && !self
                         .queued_jobs
                         .iter()
                         .any(|j| matches!(j, JobReq::Acquire { .. }))
                 {
+                    // Or the lease a close let go with lock grants kept
+                    // under it: their holders' renewals wait for it,
+                    // whether or not this node owed the carried lease's
+                    // re-claim (an S3 holder the epoch did not carry, or
+                    // a re-claim whose CAS was in doubt and landed).
                     self.queued_jobs.push_back(JobReq::Acquire {
                         reason: "epoch-close-reclaim",
                         ask_handoff: false,
@@ -1857,13 +1863,19 @@ impl Core {
     fn round_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         let backlog = replica.journal_len().unwrap_or(0);
         // The continuation epoch's flush: its journal is in S3 and the
-        // lease taken for it can go.
-        if self.epoch.flushing
+        // lease taken for it can go — unless lock grants are live under
+        // it: then the flush is over and the lease stays, as an idle
+        // holder's would (below). Releasing dropped every grant a moment
+        // after the close kept them (`epoch_close_release`), fencing the
+        // lock holders with `EIO` all the same.
+        let flushed = self.epoch.flushing
             && self.lease.held.is_some()
             && !self.lease.lost
             && !self.lease.epoch_held()
-            && backlog == 0
-        {
+            && backlog == 0;
+        if flushed && replica.locks().live_grants_len(now.0) > 0 {
+            out.push(Action::EpochFlushed);
+        } else if flushed {
             self.lease.releasing = true;
             if let Some(Job {
                 what:
@@ -1892,8 +1904,12 @@ impl Core {
             self.finish_round(now, None, replica, out);
             return;
         }
-        // Plan 30 §M14: nor while lock grants are live (a successor would
-        // start a grace; the holders keep their locks instead).
+        // Plan 30 §M14: nor while the table holds any grant, expired ones
+        // included (a successor would start a grace; the holders keep their
+        // locks instead). Counting only live grants here let a fresh
+        // takeover idle-release with waiters parked behind expired entries
+        // and left two non-holders pointing at each other
+        // (`locks-failover-backup` seed 1593).
         if replica.locks().grants_len() > 0 {
             self.finish_round(now, None, replica, out);
             return;
@@ -2652,6 +2668,13 @@ impl Core {
         // although it applied, 603631). The tail and the role are on
         // disk; nobody else can have held in between.
         let sealed = self.bk.sealed;
+        // An epoch's close kept its tenure's lock grants: they stand if
+        // this CAS replaced exactly the lease the close let go.
+        let replaced = prev
+            .as_ref()
+            .filter(|p| !p.released)
+            .map(|p| (p.holder, p.epoch, p.expires_unix_ms));
+        self.epoch_tenure_resumed(replaced, false, replica);
         // Plan 30 §M14: a released (unexpired) lease's lock grants may
         // still be honoured: a grace before any new grant.
         if prev.as_ref().is_some_and(|p| {
@@ -3451,6 +3474,9 @@ impl Core {
             }
             (Phase::Cas { plan, sent }, S3Result::LeasePut(Err(CasFailure::Failed(e)))) => {
                 tracing::warn!(node = self.cfg.node_id, error = %e, "lease CAS failed");
+                if let Plan::Claim { prev, .. } = &plan {
+                    self.epoch_tenure_cas_in_doubt(prev, &sent);
+                }
                 if let Plan::Claim {
                     prev,
                     takeover: true,

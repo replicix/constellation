@@ -257,6 +257,11 @@ pub(crate) struct LockState {
     /// to be reclaimed, and by then the requester's link was down —
     /// 451 s).
     tenure_minted: std::collections::BTreeSet<u64>,
+    /// The next `lock_on_lease_gone` is a continuation epoch's close
+    /// that this node's next acquisition may continue: the grant table
+    /// stays, for that acquisition to keep or drop
+    /// (`Core::epoch_tenure_resumed`).
+    keep_grants: bool,
 }
 
 /// How many subtree floors an owner keeps before folding them into one
@@ -394,6 +399,21 @@ impl Core {
         }
     }
 
+    /// The root lease is this node's again in a moment, with the grant
+    /// table it has: an epoch's close let it go and its re-claim is
+    /// pending (`epoch_reclaim_pending`), or it holds the lease and the
+    /// gate of the acquisition that took it is still closed (any
+    /// acquisition's: a takeover's, the re-claim's, a first one's). It
+    /// answers from that table once the lease is usable: a request it
+    /// conflicts with would block now, any other waits for it. A refusal
+    /// grants nothing, so a table that is not the whole truth yet (a
+    /// takeover's, whose predecessor's grants are still being learned)
+    /// only refuses early what would have waited.
+    fn lock_owner_resuming(&self, now: Ms) -> bool {
+        self.epoch_reclaim_pending(now)
+            || (self.lease.usable(now, &self.cfg) && self.lease.fenced() && !self.lease.releasing)
+    }
+
     /// The root's grants never outlive its lease's usable end (under a
     /// continuation epoch the lease has no expiry; the ttl stands).
     fn lock_cap_ms(&self, now: Ms) -> i64 {
@@ -512,6 +532,23 @@ impl Core {
         let (cap_ms, gen) = match self.lock_route(now, ino, replica) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
             Route::Node(n) => return Served::Outcome(LockOutcome::NotOwner { owner: n }),
+            Route::Unknown if self.lock_owner_resuming(now) => {
+                // This node is the owner again in a moment (an epoch's
+                // close re-claims the lease it let go, or the gate of the
+                // acquisition is still pending), and its grant table is
+                // the one it will answer from: a conflict is `EAGAIN`
+                // now, anything else waits — `Waiting`, which the
+                // requester retries without spending its attempts.
+                // `NotOwner` sent the requester to the lease, which names
+                // this node: its retries ran out and a non-blocking lock
+                // failed `ENOLCK` (`stress-ng-fs-faults`'s blips).
+                return Served::Outcome(
+                    self.lock_conflict_refusal(now, from, ino, mode, blocking, replica)
+                        .unwrap_or(LockOutcome::Waiting {
+                            retry_ms: self.lock_resume_retry_ms(),
+                        }),
+                );
+            }
             Route::Unknown => return Served::Outcome(LockOutcome::NotOwner { owner: 0 }),
         };
         // Plan 30 §M9: a tenure that may be taken over before its lease
@@ -528,16 +565,10 @@ impl Core {
             // tenure may grant (a fresh successor whose lease is not
             // marked yet: the harness's lock-failover contender got
             // `Busy`, then `ENOLCK`, while the locker held its grant).
-            if !blocking
-                && !replica
-                    .locks()
-                    .conflicting(ino, from, mode, now.0)
-                    .is_empty()
-            {
-                self.stats.lock_would_block += 1;
-                return Served::Outcome(LockOutcome::WouldBlock);
-            }
-            return Served::Outcome(LockOutcome::Busy);
+            return Served::Outcome(
+                self.lock_conflict_refusal(now, from, ino, mode, blocking, replica)
+                    .unwrap_or(LockOutcome::Busy),
+            );
         }
         if self.lock_grace_active(now, ino, replica) {
             self.stats.lock_grace_refusals += 1;
@@ -563,6 +594,37 @@ impl Core {
             self.stats.lock_would_block += 1;
             Served::Outcome(LockOutcome::WouldBlock)
         }
+    }
+
+    /// A non-blocking request that a live grant conflicts with, asked of
+    /// an owner that may not grant yet: `WouldBlock` now (a refusal
+    /// grants nothing). `None`: it waits.
+    #[allow(clippy::too_many_arguments)]
+    fn lock_conflict_refusal(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        ino: Ino,
+        mode: LockMode,
+        blocking: bool,
+        replica: &dyn Replica,
+    ) -> Option<LockOutcome> {
+        if blocking
+            || replica
+                .locks()
+                .conflicting(ino, from, mode, now.0)
+                .is_empty()
+        {
+            return None;
+        }
+        self.stats.lock_would_block += 1;
+        Some(LockOutcome::WouldBlock)
+    }
+
+    /// How soon a request waiting for this node to own the root again
+    /// (`lock_owner_resuming`) asks again.
+    fn lock_resume_retry_ms(&self) -> u64 {
+        (self.cfg.forward_backoff_ms / 4).max(10)
     }
 
     /// Grant `mode` to `from` — re-affirming or upgrading *in place* a
@@ -1693,6 +1755,9 @@ impl Core {
                 });
             }
             Route::Unknown => {
+                if self.lock_op_while_resuming(now, op, replica, out) {
+                    return;
+                }
                 if !self.cfg.p2p {
                     self.lock_op_unreachable(now, op, out);
                     return;
@@ -1806,6 +1871,12 @@ impl Core {
                 return;
             }
         }
+        // This node is the owner again in a moment (an epoch's close let
+        // the lease go and its re-claim is pending, S3 maybe cut again
+        // before it landed; or its own acquisition's gate is pending).
+        if self.lock_op_while_resuming(now, op, replica, out) {
+            return;
+        }
         // Nobody usable holds it: a lock needs a sequencer as a write
         // does — acquire (the sim found blocked lockers with nobody
         // taking the lease). Non-blocking: unavailable after the retries.
@@ -1823,6 +1894,54 @@ impl Core {
             );
         }
         self.lock_retry(now, op, out);
+    }
+
+    /// A local request while this node is about to own the root again
+    /// (`lock_owner_resuming`): its own grant table answers a conflict
+    /// (`WouldBlock` for a non-blocking request), anything else waits for
+    /// the lease — the re-claim queued if it is one — without spending
+    /// the request's attempts, up to the bound an op without its
+    /// sequencer has (`s3_less_deadline_ms`). Routed as before, the
+    /// request asked the lease, which names this node (or S3 was cut
+    /// again, or P2P is off), and a non-blocking lock failed `ENOLCK`
+    /// once its retries ran out (`stress-ng-fs-faults`). `false`: not
+    /// resuming, or past the bound — route it as any other.
+    fn lock_op_while_resuming(
+        &mut self,
+        now: Ms,
+        op: OpId,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.lock_owner_resuming(now) {
+            return false;
+        }
+        let Some(o) = self.lk.ops.get(&op) else {
+            return true;
+        };
+        if now.0 - o.since.0 >= self.cfg.s3_less_deadline_ms as i64 {
+            return false;
+        }
+        let (ino, mode, blocking) = (o.ino, o.mode, o.blocking);
+        let me = self.cfg.node_id;
+        if let Some(outcome) = self.lock_conflict_refusal(now, me, ino, mode, blocking, replica) {
+            self.lock_op_outcome(now, op, me, outcome, replica, out);
+            return true;
+        }
+        if self.epoch_reclaim_pending(now) {
+            self.enqueue_job(
+                now,
+                super::jobs::JobReq::Acquire {
+                    reason: "lock",
+                    ask_handoff: self.cfg.p2p,
+                },
+                replica,
+                out,
+            );
+        }
+        let retry = self.lock_resume_retry_ms();
+        self.set_timer(now.plus(retry), Timer::LockRetry(op), out);
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2053,7 +2172,16 @@ impl Core {
                 }
             }
             LockOutcome::Waiting { retry_ms } => {
-                self.set_timer(now.plus(retry_ms), Timer::LockRetry(op), out);
+                // A non-blocking request is told to wait only by an owner
+                // about to own the root again (`lock_serve`): within the
+                // bound an op without its sequencer has; past it, as
+                // `Busy`.
+                let late = !o.blocking && now.0 - o.since.0 >= self.cfg.s3_less_deadline_ms as i64;
+                if late {
+                    self.lock_retry(now, op, out);
+                } else {
+                    self.set_timer(now.plus(retry_ms), Timer::LockRetry(op), out);
+                }
             }
             LockOutcome::WouldBlock => {
                 self.lk.ops.remove(&op);
@@ -2216,7 +2344,11 @@ impl Core {
         }
         let mut by_owner: BTreeMap<NodeId, Vec<(Ino, HeldGrant)>> = BTreeMap::new();
         for (ino, h) in due {
-            match self.lock_route(now, ino, replica) {
+            // Routed as a peer's renewal is (`lock_renew_one`): a lease
+            // whose gate is pending serves renewals. Its own lockers'
+            // found no owner and spun until their grants lapsed under
+            // their I/O (a re-claim whose marker S3 cut again).
+            match self.lock_route_for(now, ino, replica, true) {
                 Route::Me { .. } => {
                     let me = self.cfg.node_id;
                     let r = self.lock_renew_one(now, me, ino, h.id, h.mode, replica);
@@ -2951,22 +3083,37 @@ impl Core {
         }
     }
 
+    /// A continuation epoch closes and this node's next acquisition may
+    /// continue the tenure it lets go: the next `lock_on_lease_gone`
+    /// keeps the grant table (see `Core::epoch_close_release`).
+    pub(crate) fn lock_keep_grants_at_close(&mut self) {
+        self.lk.keep_grants = true;
+    }
+
     /// The lease is gone (deposed, released, an epoch closed): this
     /// tenure's grants are void (capped by the lease), its waiters retry
-    /// elsewhere.
+    /// elsewhere. An epoch's close keeps the grants when the lease's
+    /// re-claim may continue the tenure (`lock_keep_grants_at_close`).
     pub(crate) fn lock_on_lease_gone(
         &mut self,
         now: Ms,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let n = replica.locks().clear_grants();
-        if n > 0 {
-            tracing::info!(
-                node = self.cfg.node_id,
-                grants = n,
-                "lease gone: lock grants dropped"
-            );
+        // Kept at an epoch's close (`Core::epoch_close_release`). Else
+        // the tenure is over: nothing continues it any more.
+        let kept = std::mem::take(&mut self.lk.keep_grants);
+        if !kept {
+            self.pr.closed_tenure.clear();
+            self.pr.closed_lease = None;
+            let n = replica.locks().clear_grants();
+            if n > 0 {
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    grants = n,
+                    "lease gone: lock grants dropped"
+                );
+            }
         }
         for (_, r) in std::mem::take(&mut self.lk.recalls) {
             self.cancel_timer(r.timer, out);
@@ -2982,6 +3129,18 @@ impl Core {
         self.lk.tenure_waiting = None;
         self.lk.tenure_heads.clear();
         self.lk.tenure_minted.clear();
+        // A tenure the close keeps is this node's again in a moment
+        // (`lock_owner_resuming`): its waiters ask here again. `NotOwner`
+        // made a peer forget this node as the holder, and with S3 cut
+        // again it could not learn it back: its own grant's renewals
+        // found no owner until the grant lapsed under its I/O.
+        let outcome = if kept {
+            LockOutcome::Waiting {
+                retry_ms: self.lock_resume_retry_ms(),
+            }
+        } else {
+            LockOutcome::NotOwner { owner: 0 }
+        };
         let waiters = std::mem::take(&mut self.lk.waiters);
         for w in waiters {
             if let Some(t) = w.held_timer {
@@ -2994,7 +3153,7 @@ impl Core {
                 w.req,
                 w.op,
                 w.sent,
-                LockOutcome::NotOwner { owner: 0 },
+                outcome.clone(),
                 replica,
                 out,
             );

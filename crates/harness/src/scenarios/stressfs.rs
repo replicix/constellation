@@ -789,6 +789,19 @@ fn seed_files(c: &Client, seed: u64) -> Result<()> {
 /// tolerates some of those errors, so its verdicts alone miss them.
 fn no_lock_fencing(c: &Client) -> Result<()> {
     let l = &c.control_status()?["locks"];
+    let n = |key: &str| l[key].as_u64().unwrap_or(0);
+    eprintln!(
+        "    {}: locks: granted {} would_block {} unavailable {} lost {} fenced_io {} \
+         owners_fenced {} owner_fenced_ops {}",
+        c.name,
+        n("granted"),
+        n("would_block"),
+        n("unavailable"),
+        n("lost"),
+        n("fenced_io"),
+        n("owners_fenced"),
+        n("owner_fenced_ops"),
+    );
     for key in ["lost", "fenced_io", "owners_fenced", "owner_fenced_ops"] {
         ensure!(
             l[key].as_u64().unwrap_or(0) == 0,
