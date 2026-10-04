@@ -16,7 +16,10 @@
 //!   compare-and-swap on the pod's `resourceVersion`, on the first use
 //!   after none in that replica, and renews it while any RPC of the
 //!   replica still uses the pod. A hold write also clears a stale
-//!   retiring mark.
+//!   retiring mark. The renewal is a compare-and-swap too, and refuses a
+//!   pod another replica has marked meanwhile (this replica's hold had
+//!   lapsed, say the API server was out of reach): the retire goes on,
+//!   the RPCs using the pod fail, and their retries hold a fresh one.
 //! - A retire first **marks** the pod: `constellation.dev/retiring` =
 //!   `<its replica's key> <unix ms>`, by a compare-and-swap too, and only
 //!   when no other replica's hold is live (and no RPC of its own uses
@@ -36,6 +39,12 @@
 //! hold that expires ([`HOLD_FOR`], plus [`HOLD_SKEW`] for clocks), or a
 //! mark that does ([`RETIRING_TTL`], plus [`HOLD_SKEW`] for the others;
 //! its own replica trusts it for the TTL only).
+//!
+//! A retire whose engine left the registry but whose fenced delete was
+//! refused (another replica held the pod after all) marks the pod
+//! [`ANNOTATION_LEFT`]: a left engine must not go on serving a pool with
+//! volumes, so the next hold or bring-up of any replica deletes it and
+//! starts a fresh one.
 //!
 //! **Pool records** (the `constellation-csi-pools` ConfigMap): which pools
 //! may have trash, so the purge worker can bring a pool's pod back after
@@ -58,6 +67,9 @@ pub const HOLD_FOR: Duration = Duration::from_secs(120);
 const HOLD_RENEW_BELOW: Duration = Duration::from_secs(60);
 /// The clock skew between replicas a hold's expiry tolerates.
 pub const HOLD_SKEW: Duration = Duration::from_secs(30);
+/// A pod whose engine left the registry but which was not deleted
+/// (module docs): `<holder key> <unix ms>`.
+pub const ANNOTATION_LEFT: &str = "constellation.dev/left";
 /// A retiring mark older than this is stale: its replica died mid-retire.
 pub const RETIRING_TTL: Duration = Duration::from_secs(120);
 /// A recorded pool no PV names is given up on after failing to come up in
@@ -67,6 +79,74 @@ pub const GIVE_UP_PASSES: u32 = 3;
 pub const GIVE_UP_AFTER: Duration = Duration::from_secs(3600);
 /// How many pools one purge pass brings up at once.
 const BRINGUP_CONCURRENCY: usize = 8;
+
+/// What the PersistentVolumes say about a recorded pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PvWord {
+    /// They could not be listed: nothing is known.
+    Unknown,
+    /// A PV of this driver names the pool.
+    Named,
+    /// None does.
+    Unnamed,
+}
+
+/// What becomes of a recorded pool's record after it failed to come up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GiveUp {
+    Keep,
+    /// Due to go: list the PVs once more, then ask again.
+    Recheck,
+    Drop,
+}
+
+/// Whether to give up on a recorded pool that failed to come up in
+/// `passes` purge passes in a row over `failing_for`, the PVs this pass
+/// listed saying `this_pass` and, listed again just before a drop,
+/// `recheck` (`None`: not yet). Only a record no PV vouches for by two
+/// listings that both succeeded goes, after [`GIVE_UP_PASSES`] passes
+/// spanning [`GIVE_UP_AFTER`].
+pub fn give_up(
+    passes: u32,
+    failing_for: Duration,
+    this_pass: PvWord,
+    recheck: Option<PvWord>,
+) -> GiveUp {
+    if this_pass != PvWord::Unnamed || passes < GIVE_UP_PASSES || failing_for < GIVE_UP_AFTER {
+        return GiveUp::Keep;
+    }
+    match recheck {
+        None => GiveUp::Recheck,
+        Some(PvWord::Unnamed) => GiveUp::Drop,
+        Some(_) => GiveUp::Keep,
+    }
+}
+
+/// Count a failed bring-up of recorded pool `name` at `now` into
+/// `failures` (pod name → since when, how many passes in a row): a PV
+/// naming the pool starts the count over, a pass that could not list
+/// the PVs does not count. The passes in a row, and since how long.
+pub fn count_bringup_failure(
+    failures: &mut HashMap<String, (Instant, u32)>,
+    name: &str,
+    now: Instant,
+    this_pass: PvWord,
+) -> (u32, Duration) {
+    let so_far =
+        |(since, passes): &(Instant, u32)| (*passes, now.saturating_duration_since(*since));
+    match this_pass {
+        PvWord::Named => {
+            failures.remove(name);
+            (0, Duration::ZERO)
+        }
+        PvWord::Unknown => failures.get(name).map_or((0, Duration::ZERO), so_far),
+        PvWord::Unnamed => {
+            let entry = failures.entry(name.to_string()).or_insert((now, 0));
+            entry.1 += 1;
+            so_far(entry)
+        }
+    }
+}
 /// The pool records' ConfigMap, in the driver's namespace.
 pub const POOLS_CONFIGMAP: &str = "constellation-csi-pools";
 
@@ -124,15 +204,53 @@ pub fn own_mark_fresh(pod: &Pod, me: &str, now_ms: u64) -> bool {
     })
 }
 
-/// `pod`'s annotations without any hold or retiring mark (a pod made
-/// from another's spec starts unheld).
+/// Whether `pod`'s engine left the registry ([`ANNOTATION_LEFT`]).
+pub fn has_left(pod: &Pod) -> bool {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(ANNOTATION_LEFT))
+}
+
+/// `pod`'s annotations without any hold, retiring mark or left mark (a
+/// pod made from another's spec starts unheld, with an engine that never
+/// left).
 pub fn without_holds(
     annotations: Option<BTreeMap<String, String>>,
 ) -> Option<BTreeMap<String, String>> {
     annotations.map(|mut a| {
-        a.retain(|k, _| !k.starts_with(ANNOTATION_HELD_PREFIX) && k != ANNOTATION_RETIRING);
+        a.retain(|k, _| {
+            !k.starts_with(ANNOTATION_HELD_PREFIX)
+                && k != ANNOTATION_RETIRING
+                && k != ANNOTATION_LEFT
+        });
         a
     })
+}
+
+/// Delete pod `name` as read (`pod`, marked [`ANNOTATION_LEFT`]), fenced by
+/// its uid: a fresh incarnation under its name is not touched.
+pub(super) async fn delete_left(
+    pods: &Api<Pod>,
+    name: &str,
+    pod: &Pod,
+) -> Result<(), ControlError> {
+    tracing::warn!(
+        pod = name,
+        "the engine pod's engine left its pool's registry but the pod stayed; replacing it"
+    );
+    let params = DeleteParams {
+        preconditions: Some(Preconditions {
+            resource_version: None,
+            uid: pod.metadata.uid.clone(),
+        }),
+        ..Default::default()
+    };
+    match pods.delete(name, &params).await {
+        Ok(_) => Ok(()),
+        Err(e) if is_status(&e, 404) || is_status(&e, 409) => Ok(()),
+        Err(e) => Err(kube_err("deleting a left engine pod", e)),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -201,6 +319,17 @@ pub fn pool_volume_of(pv: &PersistentVolume) -> Option<(String, u32)> {
     }
 }
 
+/// The class parameters among `m` (a PV's `volumeAttributes`, a class's
+/// parameters): no CO keys (`csi.storage.k8s.io/*`, external-provisioner's
+/// `storage.kubernetes.io/csiProvisionerIdentity`), and not the volume's
+/// own shard (the record carries it apart).
+pub fn own_parameters(m: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    m.iter()
+        .filter(|(k, _)| !k.contains('/') && k.as_str() != crate::params::SHARD_KEY)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
 impl PoolRecord {
     /// The record of pool volume `pv` (see [`pool_volume_of`]), from the PV
     /// itself so a deleted class loses nothing: the parameters its
@@ -213,26 +342,18 @@ impl PoolRecord {
         class: Option<&StorageClass>,
     ) -> Result<PoolRecord, String> {
         let (fs_uuid, shard) = pool_volume_of(pv).ok_or("not a pool volume of this driver")?;
-        // Class parameters only: no CO keys (`csi.storage.k8s.io/*`,
-        // external-provisioner's `storage.kubernetes.io/csiProvisionerIdentity`).
-        let own = |m: &BTreeMap<String, String>| -> BTreeMap<String, String> {
-            m.iter()
-                .filter(|(k, _)| !k.contains('/') && k.as_str() != crate::params::SHARD_KEY)
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
         let attributes = pv
             .spec
             .as_ref()
             .and_then(|s| s.csi.as_ref())
             .and_then(|c| c.volume_attributes.as_ref())
-            .map(own)
+            .map(own_parameters)
             .unwrap_or_default();
         let class_params = class.and_then(|c| c.parameters.clone()).unwrap_or_default();
         let parameters = if !attributes.is_empty() {
             attributes
         } else if class.is_some() {
-            own(&class_params)
+            own_parameters(&class_params)
         } else {
             return Err("its volumeAttributes are empty and its StorageClass is gone".into());
         };
@@ -310,15 +431,17 @@ impl EnginePodManager {
             // Held by another RPC of this process: its hold is live (and
             // renewed), so no mark can have been set since — unless this
             // incarnation does not carry it (the pod was recreated under
-            // the RPC): then it is written again below.
+            // the RPC), its engine left, or the hold lapsed (a renewal
+            // failed or was refused): then it is looked at again below.
             let carries = pod
                 .metadata
                 .annotations
                 .as_ref()
                 .is_some_and(|a| a.contains_key(&self.hold_key));
+            let now = now_ms();
             let mut holds = self.holds.lock().unwrap();
             let h = holds.entry(name.to_string()).or_default();
-            if h.count > 0 && carries {
+            if h.count > 0 && carries && !has_left(pod) && h.until_ms > now {
                 h.count += 1;
                 return Ok(Held::Yes(held()));
             }
@@ -327,6 +450,11 @@ impl EnginePodManager {
         for _ in 0..8 {
             let now = now_ms();
             if pod.metadata.deletion_timestamp.is_some() {
+                return Ok(Held::Retiring);
+            }
+            if has_left(&pod) {
+                // Gone once deleted: the caller starts a fresh one.
+                delete_left(&self.pods, name, &pod).await?;
                 return Ok(Held::Retiring);
             }
             if retiring_by(&pod, now).is_some_and(|who| who != self.hold_key) {
@@ -372,45 +500,97 @@ impl EnginePodManager {
     }
 
     /// Renew this process's live holds that run low (module docs), every
-    /// 15 s while it runs.
+    /// 15 s while it runs. A hold that cannot be renewed any more
+    /// ([`Self::renew_hold`]) is forgotten: the next RPC looks at the pod
+    /// again ([`Self::hold`]).
     pub(super) fn spawn_hold_renewal(this: std::sync::Weak<EnginePodManager>) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 let Some(m) = this.upgrade() else { return };
-                let now = now_ms();
-                let due: Vec<String> = m
-                    .holds
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(_, h)| {
-                        h.count > 0 && h.until_ms < now + HOLD_RENEW_BELOW.as_millis() as u64
-                    })
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                for name in due {
-                    let until = now_ms() + HOLD_FOR.as_millis() as u64;
-                    let patch = serde_json::json!({"metadata": {"annotations": {
-                        m.hold_key.as_str(): until.to_string(),
-                    }}});
-                    match m
-                        .pods
-                        .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await
-                    {
-                        Ok(_) => {
-                            if let Some(h) = m.holds.lock().unwrap().get_mut(&name) {
-                                h.until_ms = until;
-                            }
-                        }
-                        Err(e) if is_status(&e, 404) => {}
-                        Err(e) => tracing::warn!(pod = %name, error = %e,
-                            "renewing this replica's hold on an engine pod"),
-                    }
-                }
+                m.renew_holds().await;
             }
         });
+    }
+
+    /// One round of [`Self::spawn_hold_renewal`].
+    pub(super) async fn renew_holds(&self) {
+        let now = now_ms();
+        let due: Vec<(String, u64)> = self
+            .holds
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| h.count > 0 && h.until_ms < now + HOLD_RENEW_BELOW.as_millis() as u64)
+            .map(|(name, h)| (name.clone(), h.until_ms))
+            .collect();
+        for (name, was) in due {
+            let renewed = match self.renew_hold(&name).await {
+                Ok(renewed) => renewed,
+                Err(e) => {
+                    tracing::warn!(pod = %name, error = %e.message,
+                        "renewing this replica's hold on an engine pod");
+                    continue;
+                }
+            };
+            if renewed.is_none() && was != 0 {
+                tracing::info!(pod = %name,
+                    "this replica's hold on the engine pod is lost (another replica retires \
+                     it, or it is gone); the RPCs using it fail over to a fresh pod");
+            }
+            if let Some(h) = self.holds.lock().unwrap().get_mut(&name) {
+                h.until_ms = renewed.unwrap_or(0);
+            }
+        }
+    }
+
+    /// Renew this replica's hold on `name` (a compare-and-swap): until when
+    /// (unix ms), or `None` when the hold is lost — the pod is gone or
+    /// terminating, does not carry this replica's hold (another
+    /// incarnation), its engine left, or another replica marked it
+    /// retiring (this hold had lapsed: the retire goes on).
+    pub(super) async fn renew_hold(&self, name: &str) -> Result<Option<u64>, ControlError> {
+        for _ in 0..4 {
+            let Some(pod) = self
+                .pods
+                .get_opt(name)
+                .await
+                .map_err(|e| kube_err("reading the engine pod", e))?
+            else {
+                return Ok(None);
+            };
+            let now = now_ms();
+            let carries = pod
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.contains_key(&self.hold_key));
+            if pod.metadata.deletion_timestamp.is_some()
+                || !carries
+                || has_left(&pod)
+                || retiring_by(&pod, now).is_some_and(|who| who != self.hold_key)
+            {
+                return Ok(None);
+            }
+            let until = now + HOLD_FOR.as_millis() as u64;
+            let patch = serde_json::json!({"metadata": {
+                "resourceVersion": pod.metadata.resource_version,
+                "annotations": {self.hold_key.as_str(): until.to_string()},
+            }});
+            match self
+                .pods
+                .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+            {
+                Ok(_) => return Ok(Some(until)),
+                Err(e) if is_status(&e, 409) => continue,
+                Err(e) if is_status(&e, 404) => return Ok(None),
+                Err(e) => return Err(kube_err("renewing the hold on the engine pod", e)),
+            }
+        }
+        Err(ControlError::unavailable(format!(
+            "engine pod {name} keeps changing; its hold is not renewed now"
+        )))
     }
 
     /// Mark pod `name` retiring (module docs) unless an RPC of this or
@@ -595,8 +775,7 @@ impl EnginePodManager {
                         tracing::warn!(
                             pod = name,
                             "another controller replica took the engine pod over while it was \
-                             being retired; kept (its engine may have left the registry: the \
-                             next retire of it deletes it)"
+                             being retired; kept"
                         );
                         return Ok(false);
                     }
@@ -645,10 +824,59 @@ impl EnginePodManager {
             );
             return Ok(false);
         };
-        if let Some(relay) = relay {
-            leave_before_delete(name, relay.client.as_ref()).await;
+        let left = match relay {
+            Some(relay) => leave_before_delete(name, relay.client.as_ref()).await,
+            None => false,
+        };
+        self.delete_after_leave(name, fenced, left).await
+    }
+
+    /// [`Self::delete_fenced`] once the engine left the registry (`left`)
+    /// or not. A pod that stays although its engine left is marked
+    /// [`ANNOTATION_LEFT`] (module docs): the next hold or bring-up of any
+    /// replica replaces it.
+    pub(super) async fn delete_after_leave(
+        &self,
+        name: &str,
+        fenced: Pod,
+        left: bool,
+    ) -> Result<bool, ControlError> {
+        let uid = fenced.metadata.uid.clone();
+        let deleted = self.delete_fenced(name, fenced).await;
+        if left && !matches!(deleted, Ok(true)) {
+            self.mark_left(name, uid).await;
         }
-        self.delete_fenced(name, fenced).await
+        deleted
+    }
+
+    /// Mark incarnation `uid` of pod `name` [`ANNOTATION_LEFT`], whoever
+    /// holds it (no resourceVersion: the mark must land). Best effort,
+    /// logged: an unmarked left pod serves until it is retired again.
+    async fn mark_left(&self, name: &str, uid: Option<String>) {
+        let mut meta = serde_json::json!({
+            "annotations": {ANNOTATION_LEFT: format!("{} {}", self.hold_key, now_ms())},
+        });
+        // The uid fences it: a merge patch naming another uid conflicts.
+        if let Some(uid) = uid {
+            meta["uid"] = serde_json::Value::String(uid);
+        }
+        let patch = serde_json::json!({ "metadata": meta });
+        match self
+            .pods
+            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+        {
+            Ok(_) => tracing::warn!(
+                pod = name,
+                "the engine pod's engine left the registry but the pod could not be deleted; \
+                 marked left, so the next request replaces it"
+            ),
+            // Gone, or another incarnation by now (a uid is immutable).
+            Err(e) if is_status(&e, 404) || is_status(&e, 409) || is_status(&e, 422) => {}
+            Err(e) => tracing::error!(pod = name, error = %e,
+                "marking an engine pod whose engine left the registry; it serves on until it is \
+                 retired again"),
+        }
     }
 
     /// [`Engines::retire`]: stop pod `name`, which a delete started only
@@ -750,9 +978,11 @@ impl EnginePodManager {
             return Ok(None);
         }
         let csi = pv.spec.as_ref().and_then(|s| s.csi.as_ref());
+        // What `PoolRecord::from_pv` takes from them: a PV carrying only
+        // its shard there needs its class.
         let has_attributes = csi
             .and_then(|c| c.volume_attributes.as_ref())
-            .is_some_and(|a| a.keys().any(|k| !k.contains('/')));
+            .is_some_and(|a| !own_parameters(a).is_empty());
         let has_secret = pv.metadata.annotations.as_ref().is_some_and(|a| {
             a.contains_key(ANNOTATION_DELETION_SECRET_NAME)
                 && a.contains_key(ANNOTATION_DELETION_SECRET_NAMESPACE)
@@ -998,30 +1228,40 @@ impl EnginePodManager {
         self.bring_up_recorded(name, rec).await.map(Some)
     }
 
-    /// Recorded pool `name`, which no PV names, failed to come up this
-    /// pass: after [`GIVE_UP_PASSES`] such passes in a row spanning
-    /// [`GIVE_UP_AFTER`], its record (and its pod, unless held) goes —
-    /// its trash, if any, stays in the bucket, logged.
-    async fn note_bringup_failure(&self, name: &str, rec: &PoolRecord, why: &str) {
-        let give_up = {
-            let mut failures = self.bringup_failures.lock().unwrap();
-            let (since, passes) = failures
-                .entry(name.to_string())
-                .or_insert_with(|| (Instant::now(), 0));
-            *passes += 1;
-            *passes >= GIVE_UP_PASSES && since.elapsed() >= GIVE_UP_AFTER
-        };
-        if !give_up {
+    /// Recorded pool `name` failed to come up this pass, the PVs this
+    /// pass listed saying `this_pass` about it: once [`give_up`] says so,
+    /// its record (and its pod, unless held) goes — its trash, if any,
+    /// stays in the bucket, logged.
+    async fn note_bringup_failure(
+        &self,
+        name: &str,
+        rec: &PoolRecord,
+        this_pass: PvWord,
+        why: &str,
+    ) {
+        let (passes, failing_for) = count_bringup_failure(
+            &mut self.bringup_failures.lock().unwrap(),
+            name,
+            Instant::now(),
+            this_pass,
+        );
+        if give_up(passes, failing_for, this_pass, None) != GiveUp::Recheck {
             return;
         }
         // A PV naming it since (a new volume in that pool) keeps it.
-        match self.pool_named_by_pv(&rec.fs_uuid).await {
-            Ok(false) => {}
-            Ok(true) => return,
+        let recheck = match self.pool_named_by_pv(&rec.fs_uuid).await {
+            Ok(false) => PvWord::Unnamed,
+            Ok(true) => {
+                self.bringup_failures.lock().unwrap().remove(name);
+                PvWord::Named
+            }
             Err(e) => {
                 tracing::info!(pod = name, error = %e.message, "not dropping a pool record now");
-                return;
+                PvWord::Unknown
             }
+        };
+        if give_up(passes, failing_for, this_pass, Some(recheck)) != GiveUp::Drop {
+            return;
         }
         let lock = self.bringup_lock(name);
         let guard = lock.lock().await;
@@ -1094,7 +1334,13 @@ impl PurgeBackend for EnginePodManager {
         let mut named_by_pvs: Option<BTreeSet<String>> = None;
         match self.records_from_pvs().await {
             Ok(from_pvs) => {
-                named_by_pvs = Some(from_pvs.keys().cloned().collect());
+                let named: BTreeSet<String> = from_pvs.keys().cloned().collect();
+                // A pool named again starts its failures over.
+                self.bringup_failures
+                    .lock()
+                    .unwrap()
+                    .retain(|pod, _| !named.contains(pod));
+                named_by_pvs = Some(named);
                 for (pod, rec) in from_pvs {
                     if records.get(&pod) != Some(&rec) {
                         if let Err(e) = self.write_record(&pod, Some(&rec)).await {
@@ -1131,7 +1377,8 @@ impl PurgeBackend for EnginePodManager {
             })
             .collect();
         // Concurrently: a pool that cannot come up waits out the ready
-        // timeout without holding up the others.
+        // timeout alongside the others, not ahead of them (the pass still
+        // ends only once it gave up: one ready timeout, not one per pool).
         let opened: Vec<_> = futures::stream::iter(candidates)
             .map(|(name, unit)| {
                 let rec = records.get(&name);
@@ -1161,11 +1408,15 @@ impl PurgeBackend for EnginePodManager {
                         "not purging through this engine pod now");
                     // Only a record nothing else vouches for is ever given
                     // up on: a PV naming the pool keeps it, and so does a
-                    // pass that could not list the PVs.
-                    if let (Some(rec), Some(named)) = (records.get(&name), &named_by_pvs) {
-                        if !named.contains(&name) {
-                            self.note_bringup_failure(&name, rec, &e.message).await;
-                        }
+                    // pass that could not list the PVs ([`give_up`]).
+                    if let Some(rec) = records.get(&name) {
+                        let this_pass = match &named_by_pvs {
+                            None => PvWord::Unknown,
+                            Some(named) if named.contains(&name) => PvWord::Named,
+                            Some(_) => PvWord::Unnamed,
+                        };
+                        self.note_bringup_failure(&name, rec, this_pass, &e.message)
+                            .await;
                     }
                 }
             }
@@ -1550,5 +1801,562 @@ mod tests {
         let mut fewer = rec;
         fewer.parameters.insert("shards".into(), "1".into());
         assert!(fewer.pool().is_err());
+    }
+
+    #[test]
+    fn a_record_is_given_up_on_only_when_no_pv_vouches_for_it_twice() {
+        use GiveUp::*;
+        use PvWord::*;
+        let (n, after) = (GIVE_UP_PASSES, GIVE_UP_AFTER);
+        let hour = Duration::from_secs(3600);
+        // Not yet: too few passes, or not long enough.
+        assert_eq!(give_up(n - 1, after + hour, Unnamed, None), Keep);
+        assert_eq!(
+            give_up(n, after - Duration::from_secs(1), Unnamed, None),
+            Keep
+        );
+        // Due: the PVs are listed once more first.
+        assert_eq!(give_up(n, after, Unnamed, None), Recheck);
+        assert_eq!(give_up(n + 5, after + hour, Unnamed, None), Recheck);
+        assert_eq!(give_up(n, after, Unnamed, Some(Unnamed)), Drop);
+        // A PV naming the pool since keeps it; so does a re-check that
+        // could not list the PVs.
+        assert_eq!(give_up(n, after, Unnamed, Some(Named)), Keep);
+        assert_eq!(give_up(n, after, Unnamed, Some(Unknown)), Keep);
+        // A pass whose own listing failed, or named the pool, drops nothing.
+        for recheck in [None, Some(Unnamed), Some(Named), Some(Unknown)] {
+            assert_eq!(give_up(n + 5, after + hour, Unknown, recheck), Keep);
+            assert_eq!(give_up(n + 5, after + hour, Named, recheck), Keep);
+        }
+    }
+
+    #[test]
+    fn bringup_failures_count_passes_in_a_row_without_a_pv() {
+        let mut failures = HashMap::new();
+        let t0 = Instant::now();
+        let at = |m: u64| t0 + Duration::from_secs(60 * m);
+        let count = |f: &mut HashMap<_, _>, m, w| count_bringup_failure(f, "p", at(m), w);
+        assert_eq!(
+            count(&mut failures, 0, PvWord::Unnamed),
+            (1, Duration::ZERO)
+        );
+        // A pass that could not list the PVs does not count, nor reset.
+        assert_eq!(
+            count(&mut failures, 30, PvWord::Unknown),
+            (1, Duration::from_secs(1800))
+        );
+        assert_eq!(
+            count(&mut failures, 40, PvWord::Unnamed),
+            (2, Duration::from_secs(2400))
+        );
+        assert_eq!(
+            count(&mut failures, 60, PvWord::Unnamed),
+            (3, GIVE_UP_AFTER)
+        );
+        assert_eq!(
+            give_up(3, GIVE_UP_AFTER, PvWord::Unnamed, None),
+            GiveUp::Recheck
+        );
+        // Named by a PV again: the count starts over.
+        assert_eq!(count(&mut failures, 61, PvWord::Named), (0, Duration::ZERO));
+        assert!(failures.is_empty());
+        assert_eq!(
+            count(&mut failures, 62, PvWord::Unnamed),
+            (1, Duration::ZERO)
+        );
+        // Other pools are counted apart.
+        count_bringup_failure(&mut failures, "q", at(63), PvWord::Unnamed);
+        assert_eq!(failures.len(), 2);
+    }
+
+    #[test]
+    fn a_pv_carrying_only_its_shard_has_no_own_parameters() {
+        let attrs = BTreeMap::from([
+            (crate::params::SHARD_KEY.to_string(), "1".to_string()),
+            (
+                "storage.kubernetes.io/csiProvisionerIdentity".to_string(),
+                "1700-csi".to_string(),
+            ),
+        ]);
+        assert!(own_parameters(&attrs).is_empty());
+        let mut more = attrs;
+        more.insert("bucket".into(), "b".into());
+        assert_eq!(
+            own_parameters(&more),
+            BTreeMap::from([("bucket".to_string(), "b".to_string())])
+        );
+    }
+
+    /// An in-memory pod API for one pod (GET, merge PATCH with the
+    /// resourceVersion/uid fences, DELETE with preconditions, POST), with
+    /// hooks that run another writer's change just before a request.
+    mod fake_api {
+        use super::*;
+        use http::{Method, Request, Response};
+        use kube::client::Body;
+        use std::collections::VecDeque;
+
+        type Hook = Box<dyn FnOnce(&mut PodStore) + Send>;
+
+        #[derive(Default)]
+        pub struct PodStore {
+            pub pod: Option<Pod>,
+            rv: u64,
+            uids: u64,
+            hooks: VecDeque<(Method, Hook)>,
+            /// Every request's method, in order.
+            pub requests: Vec<Method>,
+        }
+
+        impl PodStore {
+            /// Store `pod` as a write: a new resourceVersion, a uid if
+            /// it has none (a new incarnation).
+            pub fn put(&mut self, mut pod: Pod) {
+                self.rv += 1;
+                pod.metadata.resource_version = Some(self.rv.to_string());
+                if pod.metadata.uid.is_none() {
+                    self.uids += 1;
+                    pod.metadata.uid = Some(format!("uid-{}", self.uids));
+                }
+                self.pod = Some(pod);
+            }
+
+            /// Another writer sets (or removes) one annotation.
+            pub fn annotate(&mut self, key: &str, value: Option<String>) {
+                let mut pod = self.pod.clone().expect("a pod");
+                let a = pod.metadata.annotations.get_or_insert_with(BTreeMap::new);
+                match value {
+                    Some(v) => a.insert(key.to_string(), v),
+                    None => a.remove(key),
+                };
+                self.put(pod);
+            }
+
+            pub fn annotation(&self, key: &str) -> Option<String> {
+                self.pod
+                    .as_ref()?
+                    .metadata
+                    .annotations
+                    .as_ref()?
+                    .get(key)
+                    .cloned()
+            }
+
+            /// Run `hook` just before the next `method` request.
+            pub fn before(
+                &mut self,
+                method: Method,
+                hook: impl FnOnce(&mut PodStore) + Send + 'static,
+            ) {
+                self.hooks.push_back((method, Box::new(hook)));
+            }
+
+            pub fn count(&self, method: &Method) -> usize {
+                self.requests.iter().filter(|m| *m == method).count()
+            }
+        }
+
+        fn json(code: u16, value: &impl Serialize) -> Response<Body> {
+            Response::builder()
+                .status(code)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(value).unwrap()))
+                .unwrap()
+        }
+
+        fn status(code: u16, reason: &str) -> Response<Body> {
+            json(
+                code,
+                &serde_json::json!({"kind": "Status", "apiVersion": "v1", "metadata": {},
+                    "status": "Failure", "message": reason, "reason": reason, "code": code}),
+            )
+        }
+
+        fn handle(store: &mut PodStore, method: Method, path: &str, body: &[u8]) -> Response<Body> {
+            if store.hooks.front().is_some_and(|(m, _)| *m == method) {
+                let (_, hook) = store.hooks.pop_front().unwrap();
+                hook(store);
+            }
+            store.requests.push(method.clone());
+            let named = path.contains("/pods/");
+            let body: serde_json::Value = if body.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(body).unwrap()
+            };
+            let differs = |want: &serde_json::Value, have: &Option<String>| {
+                want.as_str().is_some_and(|w| Some(w) != have.as_deref())
+            };
+            match method {
+                Method::GET if named => match &store.pod {
+                    Some(pod) => json(200, pod),
+                    None => status(404, "NotFound"),
+                },
+                Method::PATCH if named => {
+                    let Some(mut pod) = store.pod.clone() else {
+                        return status(404, "NotFound");
+                    };
+                    let meta = &body["metadata"];
+                    if differs(&meta["resourceVersion"], &pod.metadata.resource_version) {
+                        return status(409, "Conflict");
+                    }
+                    if differs(&meta["uid"], &pod.metadata.uid) {
+                        return status(422, "Invalid");
+                    }
+                    if let Some(annotations) = meta["annotations"].as_object() {
+                        let a = pod.metadata.annotations.get_or_insert_with(BTreeMap::new);
+                        for (k, v) in annotations {
+                            match v.as_str() {
+                                Some(v) => a.insert(k.clone(), v.to_string()),
+                                None => a.remove(k),
+                            };
+                        }
+                    }
+                    store.put(pod);
+                    json(200, store.pod.as_ref().unwrap())
+                }
+                Method::DELETE if named => {
+                    let Some(pod) = &store.pod else {
+                        return status(404, "NotFound");
+                    };
+                    let pre = &body["preconditions"];
+                    if differs(&pre["resourceVersion"], &pod.metadata.resource_version)
+                        || differs(&pre["uid"], &pod.metadata.uid)
+                    {
+                        return status(409, "Conflict");
+                    }
+                    let gone = store.pod.take().unwrap();
+                    json(200, &gone)
+                }
+                Method::POST if !named => {
+                    if store.pod.is_some() {
+                        return status(409, "AlreadyExists");
+                    }
+                    let mut pod: Pod = serde_json::from_value(body).unwrap();
+                    pod.metadata.uid = None;
+                    pod.status = Some(k8s_openapi::api::core::v1::PodStatus {
+                        phase: Some("Running".into()),
+                        conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                            type_: "Ready".into(),
+                            status: "True".into(),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    });
+                    store.put(pod);
+                    json(201, store.pod.as_ref().unwrap())
+                }
+                _ => status(405, "MethodNotAllowed"),
+            }
+        }
+
+        pub fn client(store: Arc<Mutex<PodStore>>) -> kube::Client {
+            let service = tower::service_fn(move |req: Request<Body>| {
+                let store = store.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let body = body.collect_bytes().await.unwrap();
+                    let response = handle(
+                        &mut store.lock().unwrap(),
+                        parts.method,
+                        parts.uri.path(),
+                        &body,
+                    );
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            });
+            kube::Client::new(service, "constellation-csi")
+        }
+    }
+
+    use fake_api::PodStore;
+    use http::Method;
+
+    const POD: &str = "constellation-engine-pool-0123456789-controller";
+
+    /// A controller replica named `identity` over `store`'s API (no
+    /// renewal task: the tests run its rounds).
+    fn replica(store: &Arc<Mutex<PodStore>>, identity: &str) -> Arc<EnginePodManager> {
+        let client = fake_api::client(store.clone());
+        let cfg = EnginePodConfig {
+            namespace: "constellation-csi".into(),
+            image: "constellation-csi:dev".into(),
+            image_pull_policy: None,
+            host_root: "/var/lib/constellation-csi".into(),
+            owner_deployment: None,
+            owner_daemonset: None,
+            resources: None,
+            log_level: "info".into(),
+            ready_timeout: Duration::from_secs(10),
+            service_account: None,
+        };
+        let refresher = Refresher::new(Arc::new(crate::credentials::KubeSecrets::new(
+            client.clone(),
+        )));
+        Arc::new_cyclic(|this| EnginePodManager {
+            pods: Api::namespaced(client.clone(), &cfg.namespace),
+            client,
+            cfg,
+            owner: None,
+            relays: Mutex::default(),
+            by_uuid: Mutex::default(),
+            specs: Mutex::default(),
+            bringup: Mutex::default(),
+            secrets: Mutex::default(),
+            watched: Mutex::default(),
+            refresher,
+            hold_key: hold_key(identity),
+            holds: Mutex::default(),
+            bringup_failures: Mutex::default(),
+            this: this.clone(),
+        })
+    }
+
+    fn engine_pod_named(annotations: &[(&str, String)]) -> Pod {
+        let mut pod = pod_with(annotations);
+        pod.metadata.name = Some(POD.into());
+        pod
+    }
+
+    fn store_with(annotations: &[(&str, String)]) -> Arc<Mutex<PodStore>> {
+        let store = Arc::new(Mutex::new(PodStore::default()));
+        store.lock().unwrap().put(engine_pod_named(annotations));
+        store
+    }
+
+    fn current(store: &Arc<Mutex<PodStore>>) -> Pod {
+        store.lock().unwrap().pod.clone().expect("the pod")
+    }
+
+    #[tokio::test]
+    async fn a_hold_renewal_is_a_compare_and_swap_that_yields_to_a_fresh_mark() {
+        let (a, b) = (hold_key("replica-a"), hold_key("replica-b"));
+        let now = now_ms();
+        let store = store_with(&[(a.as_str(), (now + 1_000).to_string())]);
+        let ra = replica(&store, "replica-a");
+        ra.holds.lock().unwrap().insert(
+            POD.into(),
+            HoldState {
+                count: 1,
+                until_ms: now + 1_000,
+            },
+        );
+
+        // Unmarked: renewed, and the write that raced it is retried.
+        store.lock().unwrap().before(Method::PATCH, |s| {
+            s.annotate("status-update", Some("x".into()))
+        });
+        let until = ra.renew_hold(POD).await.unwrap().expect("renewed");
+        assert!(until >= now + HOLD_FOR.as_millis() as u64);
+        assert_eq!(
+            store.lock().unwrap().annotation(&a),
+            Some(until.to_string())
+        );
+        assert_eq!(store.lock().unwrap().count(&Method::PATCH), 2);
+
+        // A stale mark of another replica does not stop it.
+        let stale = now - (RETIRING_TTL + HOLD_SKEW).as_millis() as u64 - 1;
+        store
+            .lock()
+            .unwrap()
+            .annotate(ANNOTATION_RETIRING, Some(format!("{b} {stale}")));
+        assert!(ra.renew_hold(POD).await.unwrap().is_some());
+
+        // A fresh one does: nothing is written, the retire goes on.
+        store
+            .lock()
+            .unwrap()
+            .annotate(ANNOTATION_RETIRING, Some(format!("{b} {}", now_ms())));
+        let before = current(&store);
+        assert_eq!(ra.renew_hold(POD).await.unwrap(), None);
+        assert_eq!(current(&store), before);
+
+        // The renewal round forgets the hold; the next RPC does not take
+        // the fast path but finds the mark and waits for the pod to go.
+        ra.holds.lock().unwrap().get_mut(POD).unwrap().until_ms = now;
+        ra.renew_holds().await;
+        assert_eq!(ra.holds.lock().unwrap()[POD].until_ms, 0);
+        assert!(matches!(
+            ra.hold(POD, &current(&store)).await.unwrap(),
+            Held::Retiring
+        ));
+        assert_eq!(ra.held_here(POD), 1);
+        assert_eq!(current(&store), before);
+
+        // Another incarnation (no hold of this replica on it): lost too.
+        store.lock().unwrap().pod = None;
+        store.lock().unwrap().put(engine_pod_named(&[]));
+        assert_eq!(ra.renew_hold(POD).await.unwrap(), None);
+        // Gone: lost.
+        store.lock().unwrap().pod = None;
+        assert_eq!(ra.renew_hold(POD).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn the_hold_fast_path_needs_a_live_hold() {
+        let a = hold_key("replica-a");
+        let now = now_ms();
+        let store = store_with(&[(a.as_str(), (now + 60_000).to_string())]);
+        let ra = replica(&store, "replica-a");
+        ra.holds.lock().unwrap().insert(
+            POD.into(),
+            HoldState {
+                count: 1,
+                until_ms: now + 60_000,
+            },
+        );
+        // Live: no request at all.
+        let Held::Yes(second) = ra.hold(POD, &current(&store)).await.unwrap() else {
+            panic!("held");
+        };
+        assert!(store.lock().unwrap().requests.is_empty());
+        assert_eq!(ra.held_here(POD), 2);
+        drop(second);
+        // Lapsed: written again (a compare-and-swap).
+        ra.holds.lock().unwrap().get_mut(POD).unwrap().until_ms = now - 1;
+        let Held::Yes(_third) = ra.hold(POD, &current(&store)).await.unwrap() else {
+            panic!("held");
+        };
+        assert_eq!(store.lock().unwrap().count(&Method::PATCH), 1);
+        assert!(ra.holds.lock().unwrap()[POD].until_ms > now);
+    }
+
+    #[tokio::test]
+    async fn renew_mark_goes_on_only_with_its_own_fresh_mark_and_no_other_hold() {
+        let (a, b) = (hold_key("replica-a"), hold_key("replica-b"));
+        let store = store_with(&[(ANNOTATION_RETIRING, format!("{b} {}", now_ms()))]);
+        let rb = replica(&store, "replica-b");
+        // A racing status update: the swap is retried.
+        store.lock().unwrap().before(Method::PATCH, |s| {
+            s.annotate("status-update", Some("x".into()))
+        });
+        let renewed = rb.renew_mark(POD).await.unwrap().expect("renewed");
+        assert_eq!(Some(renewed), store.lock().unwrap().pod.clone());
+        assert_eq!(store.lock().unwrap().count(&Method::PATCH), 2);
+
+        // Another replica's live hold: not renewed.
+        store
+            .lock()
+            .unwrap()
+            .annotate(&a, Some((now_ms() + 60_000).to_string()));
+        assert_eq!(rb.renew_mark(POD).await.unwrap(), None);
+        store.lock().unwrap().annotate(&a, None);
+        // Its own mark gone stale by its own clock, or someone else's.
+        let stale = now_ms() - RETIRING_TTL.as_millis() as u64;
+        store
+            .lock()
+            .unwrap()
+            .annotate(ANNOTATION_RETIRING, Some(format!("{b} {stale}")));
+        assert_eq!(rb.renew_mark(POD).await.unwrap(), None);
+        store
+            .lock()
+            .unwrap()
+            .annotate(ANNOTATION_RETIRING, Some(format!("{a} {}", now_ms())));
+        assert_eq!(rb.renew_mark(POD).await.unwrap(), None);
+        store.lock().unwrap().pod = None;
+        assert_eq!(rb.renew_mark(POD).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn delete_fenced_deletes_only_what_its_fresh_mark_still_fences() {
+        let (a, b) = (hold_key("replica-a"), hold_key("replica-b"));
+        let marked = || store_with(&[(ANNOTATION_RETIRING, format!("{b} {}", now_ms()))]);
+
+        // Untouched since the renewal: deleted.
+        let store = marked();
+        let rb = replica(&store, "replica-b");
+        let fenced = rb.renew_mark(POD).await.unwrap().unwrap();
+        assert!(rb.delete_fenced(POD, fenced).await.unwrap());
+        assert!(store.lock().unwrap().pod.is_none());
+
+        // A status update in between: re-read, still fenced, deleted.
+        let store = marked();
+        let rb = replica(&store, "replica-b");
+        let fenced = rb.renew_mark(POD).await.unwrap().unwrap();
+        store.lock().unwrap().before(Method::DELETE, |s| {
+            s.annotate("status-update", Some("x".into()))
+        });
+        assert!(rb.delete_fenced(POD, fenced).await.unwrap());
+        assert!(store.lock().unwrap().pod.is_none());
+        assert_eq!(store.lock().unwrap().count(&Method::DELETE), 2);
+
+        // Another replica's hold in between: kept.
+        let store = marked();
+        let rb = replica(&store, "replica-b");
+        let fenced = rb.renew_mark(POD).await.unwrap().unwrap();
+        let hold = (a.clone(), (now_ms() + 120_000).to_string());
+        store
+            .lock()
+            .unwrap()
+            .before(Method::DELETE, move |s| s.annotate(&hold.0, Some(hold.1)));
+        assert!(!rb.delete_fenced(POD, fenced).await.unwrap());
+        assert!(store.lock().unwrap().annotation(&a).is_some());
+
+        // Another incarnation in between: not this retire's, left alone.
+        let store = marked();
+        let rb = replica(&store, "replica-b");
+        let fenced = rb.renew_mark(POD).await.unwrap().unwrap();
+        store.lock().unwrap().before(Method::DELETE, |s| {
+            s.pod = None;
+            s.put(engine_pod_named(&[]));
+        });
+        assert!(rb.delete_fenced(POD, fenced.clone()).await.unwrap());
+        assert_ne!(current(&store).metadata.uid, fenced.metadata.uid);
+    }
+
+    #[tokio::test]
+    async fn a_pod_kept_after_its_engine_left_is_marked_and_replaced() {
+        let (a, b) = (hold_key("replica-a"), hold_key("replica-b"));
+        let marked = || store_with(&[(ANNOTATION_RETIRING, format!("{b} {}", now_ms()))]);
+        let take_over = |store: &Arc<Mutex<PodStore>>| {
+            let hold = (a.clone(), (now_ms() + 120_000).to_string());
+            store
+                .lock()
+                .unwrap()
+                .before(Method::DELETE, move |s| s.annotate(&hold.0, Some(hold.1)));
+        };
+
+        // The engine did not leave: a refused delete marks nothing.
+        let store = marked();
+        let rb = replica(&store, "replica-b");
+        let fenced = rb.renew_mark(POD).await.unwrap().unwrap();
+        take_over(&store);
+        assert!(!rb.delete_after_leave(POD, fenced, false).await.unwrap());
+        assert!(!has_left(&current(&store)));
+
+        // It left: the pod is marked left, whoever holds it.
+        let store = marked();
+        let rb = replica(&store, "replica-b");
+        let fenced = rb.renew_mark(POD).await.unwrap().unwrap();
+        take_over(&store);
+        assert!(!rb.delete_after_leave(POD, fenced, true).await.unwrap());
+        let kept = current(&store);
+        assert!(has_left(&kept));
+        let first_uid = kept.metadata.uid.clone();
+
+        // The holding replica's next hold, even with its hold live and
+        // counted here, deletes it and waits for a fresh one.
+        let ra = replica(&store, "replica-a");
+        ra.holds.lock().unwrap().insert(
+            POD.into(),
+            HoldState {
+                count: 1,
+                until_ms: now_ms() + 120_000,
+            },
+        );
+        assert!(matches!(ra.hold(POD, &kept).await.unwrap(), Held::Retiring));
+        assert!(store.lock().unwrap().pod.is_none());
+
+        // A bring-up replaces a left pod with a fresh, unmarked one (here
+        // from its own spec).
+        store.lock().unwrap().put(kept.clone());
+        let fresh = ra.ensure_ready(POD, None).await.unwrap();
+        assert_ne!(fresh.metadata.uid, first_uid);
+        assert!(!has_left(&fresh));
+        assert!(fresh.metadata.annotations.as_ref().unwrap().is_empty());
+        let Held::Yes(_hold) = ra.hold(POD, &fresh).await.unwrap() else {
+            panic!("held");
+        };
+        assert!(store.lock().unwrap().annotation(&a).is_some());
     }
 }

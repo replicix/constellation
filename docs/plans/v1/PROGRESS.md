@@ -42785,3 +42785,100 @@ configs.
 - `locks-blips-tight-delegated` fences I/O in 459 of 4000 seeds (main:
   687), through delegate lapses in the cuts. That is not this gap, and
   it needs its own look.
+
+### K6b follow-up (should-fixes of the final review; on main `8180f68`)
+
+- **Hold renewals honour retiring marks.** The renewal is now a
+  compare-and-swap on the pod's `resourceVersion` (`renew_hold`). It renews
+  only a pod that still carries this replica's hold and has no deletion
+  timestamp, no `left` mark and no fresh retiring mark of another replica.
+  Before, a replica whose hold had lapsed (renewals failing, say) wrote it
+  back blindly onto a pod another replica had marked meanwhile. That broke
+  the retire after its `node.leave`: the fenced delete conflicted, saw the
+  live hold and kept a pod whose engine had left. Now the retire goes on.
+  The lost hold is forgotten (`until_ms` 0), the RPCs using the pod fail,
+  and their retries hold a fresh pod. `hold()`'s fast path also requires
+  `until_ms` to be live, so a lapsed or refused hold is looked at again
+  (and waits on the mark) instead of being counted on.
+- **A left engine never keeps serving.** When `delete_fenced` refuses (or
+  fails) after the engine already left the registry, the pod is annotated
+  `constellation.dev/left` (`delete_after_leave`, `mark_left`: a merge patch
+  with no resourceVersion, so it lands whoever holds the pod, fenced by the
+  pod's uid). The next `hold()` of any replica deletes such a pod
+  (uid-fenced) and waits like a retire. `ensure_pod_ready` replaces it as
+  it does a terminated pod. `respawn`/`controller_replacement` strip the
+  mark with the holds. The exec policy's comment names the annotation
+  (metadata updates were already allowed).
+- **The give-up decision is pure**: `give_up(passes, failing_for,
+  this_pass, recheck) -> Keep | Recheck | Drop` over `PvWord {Unknown,
+  Named, Unnamed}`, and `count_bringup_failure` keeps the per-pool count. A
+  pass that could not list the PVs neither counts nor drops anything. A PV
+  naming the pool starts the count over. A record goes only once two
+  successful listings (the pass's and the re-check's) found no PV naming
+  it, after `GIVE_UP_PASSES` passes spanning `GIVE_UP_AFTER`.
+- **Nits**:
+  - `bringup_failures` is reset for every pool a pass's PV listing names
+    (not only when its pod comes up).
+  - The concurrency comment no longer says a failing pool does not hold up
+    the others. The pass still waits out one ready timeout for it, once,
+    not once per pool.
+  - `record_of_pv`'s `has_attributes` uses the same filter as
+    `PoolRecord::from_pv` (the new `own_parameters`, which drops the CO's
+    `/` keys and `shard`). A PV that carries only its shard now has its
+    class read.
+- **Tests** (csi 163 → 171): pure tests of `give_up`,
+  `count_bringup_failure` and `own_parameters`. Against an in-memory pod
+  API behind `kube::Client::new` (`fake_api`: GET, merge PATCH with
+  resourceVersion/uid fences, DELETE with preconditions, POST; hooks inject
+  another writer's change just before a request; dev-dependency `http`):
+  - the renewal's swap, retried on a conflict, ignoring a stale mark,
+    refusing a fresh one without writing, and losing the hold on another
+    incarnation or a deleted pod;
+  - the renewal round forgetting the hold, after which `hold()` waits on
+    the mark;
+  - the fast path needing a live hold;
+  - `renew_mark` (own fresh mark only, no other live hold, conflict
+    retried);
+  - `delete_fenced` (deleted untouched or after a status update; kept
+    after another replica's hold; another incarnation left alone);
+  - a refused delete after a leave marking the pod left (and not without
+    a leave), the holder's next `hold()` deleting it, and `ensure_ready`
+    bringing up a fresh, unmarked incarnation.
+
+  Each of the three behaviour changes was reverted on its own to check
+  that its test fails.
+
+Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, inotify
+`max_user_instances` 512):
+- `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+  -- -D warnings`: both clean.
+- `cargo test -p constellation-csi -p constellation-harness`: 0 failed
+  (csi 171, harness 84, plus the small binaries).
+- On a fresh private `kind-k6bf` (`tests/csi/kind-up.sh`, image
+  `constellation-csi:k6bf-1`, two controller replicas), `harness
+  k8s-scenario --kubeconfig …`, one scenario per call:
+  - `csi-node-drain`: PASSED in 119.4 s. The drain completed in 10.1 s and
+    registry id 2 left. The controller-owned pod came back on the other
+    worker with the class gone, the entry was purged through it, and
+    registry id 1 was retired.
+  - `csi-trash-purge-under-load`: PASSED in 562.2 s.
+    - del-many: 100 101 ops in 312.0 s (321/s, no fallback).
+    - del-big: 16.7 MB/s against 16 MiB/s.
+    - All three entries were purged 379.3 s after the delete (deadline
+      741 s).
+    - del-big's 64 chunks stayed referenced while trashed.
+    - Longest writer iterations: 1.3 s and 3.0 s. Zero errors, data
+      intact.
+
+    A first attempt failed at setup: `target/release/constellation` (for
+    `gc verify`) was not built. It passed once that was built.
+- `PSC_STORAGE_CLASS=psc tests/csi/podsecurity-check.sh` on the same
+  cluster, with a private floci and a `psc` class: 37 PASS, 0 FAIL. The
+  controller logs had no hold-renewal warning and no left mark, and the
+  pool's controller-owned pod carried both replicas' holds.
+- The cluster and the floci were deleted.
+
+Not run: the full `harness run` matrix, `compliance`,
+`tests/integration.sh` and the other eight kind scenarios. The brief's
+gate list leaves them out, and only `crates/csi`, a chart comment and docs
+changed.

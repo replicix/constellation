@@ -1051,7 +1051,13 @@ unix-ms expiry, written by compare-and-swap on the pod's
 delete's own stop first *marks* it (`constellation.dev/retiring`, by
 compare-and-swap too, only when no other replica's hold is live); a hold
 that finds a fresh mark waits for the pod to go and starts it again. The
-two swaps on one object serialize, so no RPC of any replica is cut off
+two swaps on one object serialize, so no RPC of any replica whose hold
+stays live is cut off; a renewal is a compare-and-swap too and refuses a
+pod another replica marked once the hold had lapsed, so those RPCs fail
+and their retries get a fresh pod (37-k6b follow-up). A pod whose engine
+left the registry but whose fenced delete was refused is annotated
+`constellation.dev/left`, and the next hold or bring-up of any replica
+replaces it: a left engine never serves a pool with volumes
 (`crates/csi/src/engine_pods/controller_pods.rs`).
 
 **Node identity.** Constellation's per-node roster identity (the node key,

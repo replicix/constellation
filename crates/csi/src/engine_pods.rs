@@ -1394,7 +1394,8 @@ fn pod_waiting_on(pod: &Pod) -> String {
 }
 
 /// Pod `name`, created from `spec` when absent and recreated (from `spec`,
-/// else from its own) when it has terminated, once it is `Ready`: polled
+/// else from its own) when it has terminated or its engine left the
+/// registry ([`controller_pods::ANNOTATION_LEFT`]), once it is `Ready`: polled
 /// with exponential backoff (200 ms doubling to 3 s) for at most
 /// `ready_timeout`. The timeout is `Timeout`, naming what the pod waits on.
 async fn ensure_pod_ready(
@@ -1439,6 +1440,12 @@ async fn ensure_pod_ready(
                     "engine pod terminated; replacing it"
                 );
                 let _ = pods.delete(name, &DeleteParams::default()).await;
+                last = Some(pod);
+            }
+            // Its engine left the registry (`controller_pods`): never
+            // served from again.
+            Some(pod) if controller_pods::has_left(&pod) => {
+                controller_pods::delete_left(pods, name, &pod).await?;
                 last = Some(pod);
             }
             Some(pod) if pod_ready(&pod) => return Ok(pod),
@@ -2306,8 +2313,8 @@ fn unix_ms() -> u128 {
 /// pool's registry first (its state is an `emptyDir`: whatever runs next
 /// under its name is a new node). Best effort: a refusal (an open epoch, a
 /// stranded journal) is logged and the pod goes anyway; the purge worker's
-/// registry sweep retires the record later.
-async fn leave_before_delete(name: &str, client: &SocketControlClient) {
+/// registry sweep retires the record later. Whether the engine left.
+async fn leave_before_delete(name: &str, client: &SocketControlClient) -> bool {
     match client
         .node_leave(LeaveParams {
             node_id: None,
@@ -2315,9 +2322,15 @@ async fn leave_before_delete(name: &str, client: &SocketControlClient) {
         })
         .await
     {
-        Ok(_) => tracing::info!(pod = name, "engine pod left the pool's registry"),
-        Err(e) => tracing::warn!(pod = name, error = %e.message,
-            "engine pod could not leave the registry; its record is swept later"),
+        Ok(_) => {
+            tracing::info!(pod = name, "engine pod left the pool's registry");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(pod = name, error = %e.message,
+                "engine pod could not leave the registry; its record is swept later");
+            false
+        }
     }
 }
 
