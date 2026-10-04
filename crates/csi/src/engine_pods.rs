@@ -23,8 +23,10 @@
 //! `volume_id` — find it again. Its `ownerReference` is the controller
 //! `Deployment` (when the chart names it), so uninstalling the driver
 //! garbage-collects the pods, while a controller *pod* restart or a leader
-//! change leaves them running. Reaping a pool's pod once the pool is empty
-//! is 37-k6b's (with the purge worker), not this module's.
+//! change leaves them running. A pool's pod is reaped once the pool is
+//! empty, and replaced when its engine settings drift, by the purge worker
+//! ([`crate::purge`], 37-k6b; the [`crate::purge::PurgeBackend`] impl
+//! below); either way it leaves the pool's registry before it is deleted.
 //!
 //! **No hostPath, no init container.** The controller-owned pod never
 //! holds a view and nobody but the controller reaches it (through the exec
@@ -122,28 +124,38 @@ use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::methods::FsList;
 use constellation_control::proto::types::{
-    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsListing, FsUnlockParams,
-    HandoffParams, HandoffReport, LeaveParams, MkdirParams, Pong, QuotaStatus, RenameParams,
-    SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams,
-    SnapshotListParams, SnapshotListing, ViewInfo, ViewListParams, ViewListing, ViewMountParams,
-    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrParams, XattrResult,
+    Ack, CloneParams, DeleteParams as BrowseDeleteParams, DirectoryListing, FileStat,
+    FsCreateParams, FsCreated, FsListing, FsUnlockParams, HandoffParams, HandoffReport,
+    LeaveParams, MkdirParams, PeerListing, Pong, QuotaStatus, RenameParams, SnapshotCreateParams,
+    SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams, SnapshotListParams,
+    SnapshotListing, ViewInfo, ViewListParams, ViewListing, ViewMountParams, ViewStatsParams,
+    ViewStatsReport, ViewUnmountParams, XattrParams, XattrResult,
 };
 use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_control::transport::StreamTransport;
 use constellation_control::{Client, ClientOptions, Principal};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, ExecAction, HostPathVolumeSource,
-    PersistentVolume, Pod, PodSecurityContext, PodSpec, Probe, ResourceRequirements,
-    SeccompProfile, Secret, SecurityContext, Toleration, Volume, VolumeMount,
+    Capabilities, ConfigMap, Container, EmptyDirVolumeSource, EnvVar, ExecAction,
+    HostPathVolumeSource, PersistentVolume, Pod, PodSecurityContext, PodSpec, Probe,
+    ResourceRequirements, SeccompProfile, Secret, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::api::storage::v1::StorageClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
-use kube::api::{Api, AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams};
+use kube::api::{
+    Api, AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
+
+mod controller_pods;
+pub use controller_pods::{
+    hold_key, live_holds, retiring_by, PoolRecord, ANNOTATION_HELD_PREFIX, ANNOTATION_RETIRING,
+    POOLS_CONFIGMAP,
+};
+use controller_pods::{Held, Hold, HoldState};
 
 /// The engine container's name in every engine pod.
 pub const ENGINE_CONTAINER: &str = "engine";
@@ -307,6 +319,40 @@ pub fn node_pod_name(unit: &str, node: &str) -> String {
     let hash = blake3::hash(full.as_bytes()).to_hex();
     let head = full[..MAX - 11].trim_end_matches(['-', '.']);
     format!("{head}-{}", &hash[..10])
+}
+
+/// The prefix of every node-owned engine pod's hostname
+/// ([`node_engine_hostname`]).
+pub const NODE_ENGINE_HOST_PREFIX: &str = "csi-node-";
+
+/// A node-owned engine pod's hostname (`spec.hostname`): what its registry
+/// record carries, so the controller's registry sweep (`crate::purge`) can
+/// tell a record of a node that is gone from one of a node that is not.
+/// The default hostname, the pod name cut to 63 bytes, loses the node in
+/// most names. `csi-node-<readable head of the node>-<10 hex of BLAKE3 of
+/// it>`: a DNS label (at most 56 bytes), the same for every pod of every
+/// unit on the node.
+pub fn node_engine_hostname(node: &str) -> String {
+    let head: String = node
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(35)
+        .collect();
+    let head = head.trim_matches('-');
+    let hash = blake3::hash(node.as_bytes()).to_hex();
+    if head.is_empty() {
+        format!("{NODE_ENGINE_HOST_PREFIX}{}", &hash[..10])
+    } else {
+        format!("{NODE_ENGINE_HOST_PREFIX}{head}-{}", &hash[..10])
+    }
+}
+
+/// The hostname kubelet gives a pod named `name` that sets none: the name,
+/// cut to 63 bytes, without a trailing `-` or `.`.
+pub fn pod_hostname(name: &str) -> String {
+    let cut = &name[..name.len().min(63)];
+    cut.trim_end_matches(['-', '.']).to_string()
 }
 
 /// Who owns an engine pod and where it runs (plan 37 §7).
@@ -827,7 +873,57 @@ fn env(name: &str, value: impl Into<String>) -> EnvVar {
 /// The controller-owned engine pod of `pool` (module docs). Pure: no API
 /// call, so the spec is unit-tested.
 pub fn engine_pod(pool: &PoolRef, cfg: &EnginePodConfig, owner: Option<&OwnerReference>) -> Pod {
-    build_engine_pod(pool, cfg, owner, &EngineRole::Controller)
+    let mut pod = build_engine_pod(pool, cfg, owner, &EngineRole::Controller);
+    // What the purge worker's roll compares (`crate::purge`, 37-k6b).
+    pod.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(
+            ANNOTATION_ENGINE_CONFIG.to_string(),
+            engine_config_fingerprint(cfg),
+        );
+    pod
+}
+
+/// The replacement of controller-owned pod `current` whose engine settings
+/// drifted from `cfg` (37-k6b: K5a's handoff rolls only node-owned pods;
+/// this one serves no view, so the purge worker replaces it plainly): its
+/// own spec — pool, arguments, volumes — under the same name, with `cfg`'s
+/// image, pull policy, resources and log level, placed by the scheduler
+/// anew. Pure, so it is unit-tested.
+pub fn controller_replacement(current: &Pod, cfg: &EnginePodConfig) -> Pod {
+    let mut pod = respawn(current);
+    if let Some(spec) = pod.spec.as_mut() {
+        for c in spec.containers.iter_mut() {
+            c.image = Some(cfg.image.clone());
+            c.image_pull_policy = cfg.image_pull_policy.clone();
+        }
+        if let Some(engine) = spec.containers.first_mut() {
+            engine.resources = cfg.resources.clone();
+            let envs = engine.env.get_or_insert_with(Vec::new);
+            envs.retain(|e| e.name != "RUST_LOG");
+            envs.insert(0, env("RUST_LOG", cfg.log_level.clone()));
+        }
+    }
+    pod.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(
+            ANNOTATION_ENGINE_CONFIG.to_string(),
+            engine_config_fingerprint(cfg),
+        );
+    pod
+}
+
+/// Whether engine pod `pod` was made from settings other than `cfg`'s
+/// (its [`ANNOTATION_ENGINE_CONFIG`]; none counts as drifted).
+pub fn drifted_from(pod: &Pod, cfg: &EnginePodConfig) -> bool {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(ANNOTATION_ENGINE_CONFIG))
+        .map(String::as_str)
+        != Some(engine_config_fingerprint(cfg).as_str())
 }
 
 /// The node-owned engine pod of `pool` on `node` (plan 37 §7), owned by
@@ -845,6 +941,9 @@ pub fn node_engine_pod(
         node: node.to_string(),
     };
     let mut pod = build_engine_pod(pool, cfg, owner, &role);
+    if let Some(spec) = pod.spec.as_mut() {
+        spec.hostname = Some(node_engine_hostname(node));
+    }
     if let Some(labels) = pod.metadata.labels.as_mut() {
         labels.insert(LABEL_NODE.to_string(), label_value(node));
         labels.insert(LABEL_UNIT.to_string(), unit_name(pool));
@@ -1413,6 +1512,13 @@ pub struct EnginePodManager {
     /// pod name → its pool's watched Secret (`refreshing` classes).
     watched: Mutex<HashMap<String, SecretRef>>,
     refresher: Arc<Refresher>,
+    /// This replica's hold annotation ([`hold_key`] of its pod name).
+    hold_key: String,
+    /// pod name → this process's uses of it (`controller_pods`).
+    holds: Mutex<HashMap<String, HoldState>>,
+    /// pod name → since when, and in how many purge passes in a row, its
+    /// recorded pool failed to come up (`controller_pods`).
+    bringup_failures: Mutex<HashMap<String, (Instant, u32)>>,
     this: std::sync::Weak<EnginePodManager>,
 }
 
@@ -1446,7 +1552,13 @@ impl EnginePodManager {
             }
             None => None,
         };
-        Arc::new_cyclic(|this| EnginePodManager {
+        // The replica's name (the chart passes the pod's), else one of
+        // this process's own: what its holds on engine pods are keyed by.
+        let identity = std::env::var("POD_NAME")
+            .ok()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("constellation-csi-{}", std::process::id()));
+        let manager = Arc::new_cyclic(|this| EnginePodManager {
             pods: Api::namespaced(client.clone(), &cfg.namespace),
             client,
             cfg,
@@ -1458,8 +1570,13 @@ impl EnginePodManager {
             secrets: Mutex::default(),
             watched: Mutex::default(),
             refresher,
+            hold_key: hold_key(&identity),
+            holds: Mutex::default(),
+            bringup_failures: Mutex::default(),
             this: this.clone(),
-        })
+        });
+        Self::spawn_hold_renewal(Arc::downgrade(&manager));
+        manager
     }
 
     fn bringup_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1592,17 +1709,36 @@ impl EnginePodManager {
     /// Bring `name` up (from `spec` if it must be created), unlock it if it
     /// waits for its credentials, push `secrets` to it if they are new to
     /// it, and connect (module docs).
+    ///
+    /// The RPC holds the pod while it uses the client (`controller_pods`):
+    /// a pod another replica is retiring is waited out (bounded by the
+    /// ready timeout), then brought up again.
     async fn connect(
         &self,
         name: &str,
         spec: Option<&Pod>,
         secrets: &Secrets,
-    ) -> Result<Arc<Relay>, ControlError> {
+    ) -> Result<PoolClient, ControlError> {
         let lock = self.bringup_lock(name);
         let _guard = lock.lock().await;
         self.remember(name, secrets);
-        let pod = self.ensure_ready(name, spec).await?;
-        self.attach(name, &pod, secrets).await
+        let deadline = Instant::now() + self.cfg.ready_timeout;
+        loop {
+            let pod = self.ensure_ready(name, spec).await?;
+            match self.hold(name, &pod).await? {
+                Held::Yes(hold) => {
+                    let relay = self.attach(name, &pod, secrets).await?;
+                    return Ok(PoolClient {
+                        relay,
+                        _hold: Some(hold),
+                    });
+                }
+                Held::Retiring if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_secs(1)).await
+                }
+                Held::Retiring => return Err(retiring_error(name)),
+            }
+        }
     }
 
     /// Keep `secrets` (if they hold credentials) as pod `name`'s, to unlock
@@ -1917,29 +2053,49 @@ impl EnginePodManager {
             ControlError::unavailable(format!("rebuilding {pv_name}'s pool: {why}"))
         })?;
         if let Some((namespace, name)) = secret_ref {
-            let secrets: Api<Secret> = Api::namespaced(self.client.clone(), &namespace);
-            match secrets.get_opt(&name).await {
-                Ok(Some(secret)) => {
-                    pool.secrets = secret
-                        .data
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(k, v)| (k, String::from_utf8_lossy(&v.0).into_owned()))
-                        .collect();
-                }
-                // Not readable by the controller (another namespace, plan
-                // §9) or gone: the pod comes up and waits, and a request
-                // that carries the secret unlocks it.
-                Ok(None) => tracing::warn!(fs_uuid, secret = %format!("{namespace}/{name}"),
-                    "the rebuilt pool's provisioner secret does not exist"),
-                Err(e) => tracing::warn!(fs_uuid, secret = %format!("{namespace}/{name}"),
-                    error = %e, "cannot read the rebuilt pool's provisioner secret"),
+            if let Some(data) = self.read_secret(&namespace, &name, fs_uuid).await {
+                pool.secrets = data;
             }
         }
         tracing::info!(fs_uuid, pv = %pv_name, class = %class_name,
             "rebuilding a lost engine pod's spec from its PersistentVolume");
         Ok(pool)
     }
+
+    /// A rebuilt pool's provisioner secret's data, if the controller may
+    /// read it. Not readable (another namespace, plan §9) or gone: the pod
+    /// comes up and waits, and a request that carries the secret unlocks
+    /// it.
+    async fn read_secret(&self, namespace: &str, name: &str, fs_uuid: &str) -> Option<Secrets> {
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        match secrets.get_opt(name).await {
+            Ok(Some(secret)) => Some(
+                secret
+                    .data
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| (k, String::from_utf8_lossy(&v.0).into_owned()))
+                    .collect(),
+            ),
+            Ok(None) => {
+                tracing::warn!(fs_uuid, secret = %format!("{namespace}/{name}"),
+                    "the rebuilt pool's provisioner secret does not exist");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(fs_uuid, secret = %format!("{namespace}/{name}"),
+                    error = %e, "cannot read the rebuilt pool's provisioner secret");
+                None
+            }
+        }
+    }
+}
+
+fn retiring_error(name: &str) -> ControlError {
+    ControlError::unavailable(format!(
+        "engine pod {name} is being retired (reaped or replaced) by another controller replica; \
+         retry"
+    ))
 }
 
 /// The `fs.unlock` target of a running engine pod: the `--s3` URL its
@@ -1960,7 +2116,7 @@ fn respawn(old: &Pod) -> Pod {
             name: old.metadata.name.clone(),
             namespace: old.metadata.namespace.clone(),
             labels: old.metadata.labels.clone(),
-            annotations: old.metadata.annotations.clone(),
+            annotations: controller_pods::without_holds(old.metadata.annotations.clone()),
             owner_references: old.metadata.owner_references.clone(),
             ..Default::default()
         },
@@ -1984,8 +2140,9 @@ impl Engines for EnginePodManager {
             .unwrap()
             .insert(name.clone(), spec.clone());
         self.watch_rotations(&name, pool);
-        let relay = self.connect(&name, Some(&spec), &pool.secrets).await?;
-        Ok(Arc::new(PoolClient(relay)))
+        Ok(Arc::new(
+            self.connect(&name, Some(&spec), &pool.secrets).await?,
+        ))
     }
 
     async fn filesystem(
@@ -2004,8 +2161,7 @@ impl Engines for EnginePodManager {
                     .map_err(|e| kube_err("reading the engine pod", e))?
                     .is_some();
             if present {
-                let relay = self.connect(&name, spec.as_ref(), secrets).await?;
-                return Ok(Arc::new(PoolClient(relay)));
+                return Ok(Arc::new(self.connect(&name, spec.as_ref(), secrets).await?));
             }
         }
         // No pod and no spec: rebuild both from the cluster (module docs).
@@ -2020,7 +2176,7 @@ impl Engines for EnginePodManager {
             .unwrap()
             .insert(name.clone(), spec.clone());
         self.watch_rotations(&name, &pool);
-        let relay = self.connect(&name, Some(&spec), &pool.secrets).await?;
+        let client = self.connect(&name, Some(&spec), &pool.secrets).await?;
         let serves = self.by_uuid.lock().unwrap().get(fs_uuid).cloned();
         if serves.as_deref() != Some(name.as_str()) {
             return Err(ControlError::failed(format!(
@@ -2028,7 +2184,7 @@ impl Engines for EnginePodManager {
                  filesystem: its pool's S3 prefix no longer holds {fs_uuid}"
             )));
         }
-        Ok(Arc::new(PoolClient(relay)))
+        Ok(Arc::new(client))
     }
 
     async fn running(
@@ -2041,13 +2197,29 @@ impl Engines for EnginePodManager {
         };
         let lock = self.bringup_lock(&name);
         let _guard = lock.lock().await;
-        let Some(pod) = wait_existing_ready(&self.pods, &name, self.cfg.ready_timeout).await?
-        else {
-            return Ok(None);
-        };
-        self.remember(&name, secrets);
-        let relay = self.attach(&name, &pod, secrets).await?;
-        Ok(Some(Arc::new(PoolClient(relay))))
+        let deadline = Instant::now() + self.cfg.ready_timeout;
+        loop {
+            let Some(pod) = wait_existing_ready(&self.pods, &name, self.cfg.ready_timeout).await?
+            else {
+                return Ok(None);
+            };
+            // Held for the delete's calls; a pod being retired by another
+            // replica is waited out (gone: none runs).
+            match self.hold(&name, &pod).await? {
+                Held::Yes(hold) => {
+                    self.remember(&name, secrets);
+                    let relay = self.attach(&name, &pod, secrets).await?;
+                    return Ok(Some(Arc::new(PoolClient {
+                        relay,
+                        _hold: Some(hold),
+                    })));
+                }
+                Held::Retiring if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_secs(1)).await
+                }
+                Held::Retiring => return Err(retiring_error(&name)),
+            }
+        }
     }
 
     async fn named(&self, handle: Handle<'_>) -> Result<bool, ControlError> {
@@ -2057,33 +2229,18 @@ impl Engines for EnginePodManager {
         }
     }
 
-    /// Deleted only when no other caller holds a client into it: every
-    /// [`PoolClient`] shares the cached relay, so the relay map's own
-    /// reference is then the only one left.
+    /// Deleted only when no RPC of this or another controller replica
+    /// uses it (`controller_pods`: holds and the retiring mark), after it
+    /// left the pool's registry.
     async fn retire(&self, fs_uuid: &str) -> Result<(), ControlError> {
         let Some(name) = self.pod_for(fs_uuid).await? else {
             return Ok(());
         };
-        let lock = self.bringup_lock(&name);
-        let _guard = lock.lock().await;
-        {
-            let mut relays = self.relays.lock().unwrap();
-            if let Some(relay) = relays.get(&name) {
-                if Arc::strong_count(relay) > 1 {
-                    tracing::debug!(pod = %name, "engine pod in use; not retiring it");
-                    return Ok(());
-                }
-            }
-            relays.remove(&name);
-        }
-        match self.pods.delete(&name, &DeleteParams::default()).await {
-            Ok(_) => {
-                tracing::info!(pod = %name, "stopped the engine pod a delete started");
-                Ok(())
-            }
-            Err(e) if is_status(&e, 404) => Ok(()),
-            Err(e) => Err(kube_err("deleting the engine pod", e)),
-        }
+        self.retire_started(&name).await
+    }
+
+    async fn record_trash(&self, fs_uuid: &str, volume_id: &str) -> Result<(), ControlError> {
+        self.record_pool_of(fs_uuid, volume_id).await
     }
 
     async fn running_filesystems(&self) -> Result<Vec<String>, ControlError> {
@@ -2103,6 +2260,64 @@ impl Engines for EnginePodManager {
         uuids.sort();
         uuids.dedup();
         Ok(uuids)
+    }
+}
+
+/// Taints that say a node is going away (plan 37 §7 "Drain"): the
+/// cluster autoscaler's, before it drains a node to delete it, and the
+/// out-of-service taint of a node that is down for good.
+const DRAIN_TAINTS: [&str; 2] = [
+    "ToBeDeletedByClusterAutoscaler",
+    "node.kubernetes.io/out-of-service",
+];
+
+/// Whether and how `node` is being drained: deleted or tainted to go
+/// (condemned), else cordoned.
+pub fn node_drain(node: &k8s_openapi::api::core::v1::Node) -> crate::node::Drain {
+    use crate::node::Drain;
+    let spec = node.spec.as_ref();
+    if node.metadata.deletion_timestamp.is_some()
+        || spec
+            .and_then(|s| s.taints.as_ref())
+            .is_some_and(|t| t.iter().any(|t| DRAIN_TAINTS.contains(&t.key.as_str())))
+    {
+        Drain::Condemned
+    } else if spec.and_then(|s| s.unschedulable).unwrap_or(false) {
+        Drain::Cordoned
+    } else {
+        Drain::No
+    }
+}
+
+/// Where a unit's node identity waits while its engine leaves the pool's
+/// registry ([`NodeEngines::set_identity_aside`]).
+fn leaving_name(unit: &str) -> String {
+    format!(".leaving-{unit}")
+}
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// A controller-owned pod about to be deleted on purpose leaves the
+/// pool's registry first (its state is an `emptyDir`: whatever runs next
+/// under its name is a new node). Best effort: a refusal (an open epoch, a
+/// stranded journal) is logged and the pod goes anyway; the purge worker's
+/// registry sweep retires the record later.
+async fn leave_before_delete(name: &str, client: &SocketControlClient) {
+    match client
+        .node_leave(LeaveParams {
+            node_id: None,
+            force: false,
+        })
+        .await
+    {
+        Ok(_) => tracing::info!(pod = name, "engine pod left the pool's registry"),
+        Err(e) => tracing::warn!(pod = name, error = %e.message,
+            "engine pod could not leave the registry; its record is swept later"),
     }
 }
 
@@ -2276,6 +2491,11 @@ impl NodeEnginePods {
             .map(pod_generation)
             .next()
             .unwrap_or(0))
+    }
+
+    /// `<hostRoot>/node-identity/`.
+    fn identities_dir(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.cfg.host_root).join("node-identity")
     }
 
     fn sockets_dir(&self, unit: &str) -> std::path::PathBuf {
@@ -2633,6 +2853,236 @@ impl NodeEngines for NodeEnginePods {
             .collect())
     }
 
+    async fn units(&self) -> Result<Vec<crate::node::UnitPod>, ControlError> {
+        let selector = format!(
+            "{LABEL_OWNER}=node,{LABEL_NODE}={}",
+            label_value(&self.node)
+        );
+        let pods = self
+            .pods
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .map_err(|e| kube_err("listing the engine pods", e))?
+            .items;
+        let mut units: BTreeMap<String, Pod> = BTreeMap::new();
+        for pod in pods.into_iter().filter(|p| {
+            p.metadata.deletion_timestamp.is_none()
+                && p.spec.as_ref().and_then(|s| s.node_name.as_deref()) == Some(&self.node)
+        }) {
+            let Some(unit) = pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_UNIT))
+                .cloned()
+            else {
+                continue;
+            };
+            match units.get(&unit) {
+                Some(have) if pod_generation(have) >= pod_generation(&pod) => {}
+                _ => {
+                    units.insert(unit, pod);
+                }
+            }
+        }
+        Ok(units
+            .into_iter()
+            .map(|(unit, pod)| {
+                let annotation = |k: &str| {
+                    pod.metadata
+                        .annotations
+                        .as_ref()
+                        .and_then(|a| a.get(k))
+                        .and_then(|v| v.parse::<u64>().ok())
+                };
+                crate::node::UnitPod {
+                    unit,
+                    pod: pod.metadata.name.clone().unwrap_or_default(),
+                    ready: pod_ready(&pod),
+                    views: annotation(ANNOTATION_VIEWS),
+                    idle_since: annotation(ANNOTATION_IDLE_SINCE),
+                    created: pod
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|t| t.0.as_second().max(0) as u64),
+                }
+            })
+            .collect())
+    }
+
+    async fn draining(&self) -> Result<crate::node::Drain, ControlError> {
+        use k8s_openapi::api::core::v1::Node;
+        let nodes: Api<Node> = Api::all(self.pods.clone().into_client());
+        let node = nodes
+            .get(&self.node)
+            .await
+            .map_err(|e| kube_err("reading this node", e))?;
+        Ok(node_drain(&node))
+    }
+
+    async fn set_identity_aside(&self, unit: &str) -> Result<(), ControlError> {
+        let identities = self.identities_dir();
+        let (current, leaving) = (identities.join(unit), identities.join(leaving_name(unit)));
+        if current.symlink_metadata().is_err() || leaving.symlink_metadata().is_ok() {
+            // Aside already (a pass that ended early), or never made.
+            return Ok(());
+        }
+        std::fs::rename(&current, &leaving).map_err(|e| {
+            ControlError::failed(format!(
+                "moving the node identity {} aside: {e}",
+                current.display()
+            ))
+        })?;
+        // A rename keeps the directory's mtime, which
+        // `identities_aside` reads as "aside since": stamp it now.
+        if let Err(e) = std::fs::File::open(&leaving)
+            .and_then(|dir| dir.set_modified(std::time::SystemTime::now()))
+        {
+            tracing::warn!(unit, error = %e, "stamping the node identity set aside");
+        }
+        Ok(())
+    }
+
+    async fn restore_identity(&self, unit: &str) -> Result<(), ControlError> {
+        let identities = self.identities_dir();
+        let (current, leaving) = (identities.join(unit), identities.join(leaving_name(unit)));
+        if leaving.symlink_metadata().is_err() {
+            return Ok(());
+        }
+        if current.symlink_metadata().is_ok() {
+            return Err(ControlError::failed(format!(
+                "a fresh node identity {} is in place; the one aside cannot go back",
+                current.display()
+            )));
+        }
+        std::fs::rename(&leaving, &current).map_err(|e| {
+            ControlError::failed(format!(
+                "moving the node identity {} back: {e}",
+                current.display()
+            ))
+        })
+    }
+
+    async fn discard_superseded_aside(&self, unit: &str) -> Result<bool, ControlError> {
+        let identities = self.identities_dir();
+        let (current, leaving) = (identities.join(unit), identities.join(leaving_name(unit)));
+        if current.symlink_metadata().is_err() {
+            return Ok(false);
+        }
+        let Ok(meta) = leaving.symlink_metadata() else {
+            return Ok(false);
+        };
+        let since = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs() as i64);
+        // Out of the way first (no restore can pick it up any more), then
+        // removed unless a pod of the unit older than the move may still
+        // mount it: `forget_unit` removes it after that pod then.
+        let spent = identities.join(format!(".left-{unit}-{}-s", unix_ms()));
+        std::fs::rename(&leaving, &spent).map_err(|e| {
+            ControlError::failed(format!(
+                "retiring the superseded node identity {}: {e}",
+                leaving.display()
+            ))
+        })?;
+        tracing::warn!(
+            unit,
+            "a node identity set aside for a leave was superseded by a fresh one; retired. \
+             If its engine never ran the leave, its registry record stays behind"
+        );
+        let older = self.unit_pods(unit).await?.iter().any(|p| {
+            p.metadata
+                .creation_timestamp
+                .as_ref()
+                .is_none_or(|t| t.0.as_second() <= since)
+        });
+        if !older {
+            if let Err(e) = std::fs::remove_dir_all(&spent) {
+                tracing::warn!(path = %spent.display(), error = %e,
+                    "removing a superseded node identity");
+            }
+        }
+        Ok(true)
+    }
+
+    async fn identities_aside(&self) -> Result<Vec<(String, u64)>, ControlError> {
+        let Ok(dir) = std::fs::read_dir(self.identities_dir()) else {
+            return Ok(Vec::new());
+        };
+        Ok(dir
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let unit = name.strip_prefix(".leaving-")?.to_string();
+                let since = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs());
+                Some((unit, since))
+            })
+            .collect())
+    }
+
+    async fn forget_unit(&self, unit: &str) -> Result<(), ControlError> {
+        let identities = self.identities_dir();
+        // Aside first, atomically (a rename inside the root-owned
+        // `node-identity/`): from here on no pod can start on the spent
+        // state, whatever fails below. It may be aside for the leave
+        // already (`.leaving-<unit>`).
+        let at = unix_ms();
+        for (i, spent) in [identities.join(unit), identities.join(leaving_name(unit))]
+            .into_iter()
+            .enumerate()
+        {
+            if spent.symlink_metadata().is_ok() {
+                let aside = identities.join(format!(".left-{unit}-{at}-{i}"));
+                std::fs::rename(&spent, &aside).map_err(|e| {
+                    ControlError::failed(format!(
+                        "moving the spent node identity {} aside: {e}",
+                        spent.display()
+                    ))
+                })?;
+            }
+        }
+        let pods = self.unit_pods(unit).await?;
+        for pod in &pods {
+            self.delete_pod(&pod.metadata.name.clone().unwrap_or_default())
+                .await;
+        }
+        for pod in &pods {
+            self.wait_gone(&pod.metadata.name.clone().unwrap_or_default())
+                .await?;
+        }
+        self.unlocked.lock().unwrap().retain(|name, _| {
+            !pods
+                .iter()
+                .any(|p| p.metadata.name.as_deref() == Some(name))
+        });
+        // The old identities of this unit, now that no pod mounts them
+        // (`remove_dir_all` never follows a link it meets).
+        let prefix = format!(".left-{unit}-");
+        if let Ok(dir) = std::fs::read_dir(&identities) {
+            for entry in dir.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                        tracing::warn!(path = %entry.path().display(), error = %e,
+                            "removing a spent node identity");
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            unit,
+            "node identity retired; the unit's next pod is a new node"
+        );
+        Ok(())
+    }
+
     async fn start_replacement(&self, unit: &str) -> Result<Replacement, ControlError> {
         let current = self
             .serving(unit)
@@ -2804,12 +3254,16 @@ impl NodeEngines for NodeEnginePods {
 
 /// A pool's client: the relay's, with `fs.create` stripped of the endpoint
 /// and region the pod already has in its environment (module docs). Holds
-/// the relay, so the stream outlives every RPC using it.
-struct PoolClient(Arc<Relay>);
+/// the relay, so the stream outlives every RPC using it, and the RPC's
+/// hold on the pod (`controller_pods`; none for the purge worker's own).
+struct PoolClient {
+    relay: Arc<Relay>,
+    _hold: Option<Hold>,
+}
 
 impl PoolClient {
     fn c(&self) -> &SocketControlClient {
-        &self.0.client
+        &self.relay.client
     }
 }
 
@@ -2834,6 +3288,15 @@ impl ControlClient for PoolClient {
     }
     async fn browse_rename(&self, params: RenameParams) -> Result<Ack, ControlError> {
         self.c().browse_rename(params).await
+    }
+    async fn browse_readdir(&self, path: &str) -> Result<DirectoryListing, ControlError> {
+        self.c().browse_readdir(path).await
+    }
+    async fn browse_stat(&self, path: &str) -> Result<FileStat, ControlError> {
+        self.c().browse_stat(path).await
+    }
+    async fn browse_delete(&self, params: BrowseDeleteParams) -> Result<Ack, ControlError> {
+        self.c().browse_delete(params).await
     }
     async fn quota_get(&self, subtree: &str) -> Result<QuotaStatus, ControlError> {
         self.c().quota_get(subtree).await
@@ -2899,6 +3362,12 @@ impl ControlClient for PoolClient {
     }
     async fn node_leave(&self, params: LeaveParams) -> Result<Ack, ControlError> {
         self.c().node_leave(params).await
+    }
+    async fn node_id(&self) -> Result<u64, ControlError> {
+        self.c().node_id().await
+    }
+    async fn peers_list(&self) -> Result<PeerListing, ControlError> {
+        self.c().peers_list().await
     }
 }
 
@@ -3081,6 +3550,134 @@ mod tests {
     }
 
     /// PodSecurity `restricted`'s container rules (plan 37 §9).
+    /// 37-k6b: a controller-owned pod records its settings, and its
+    /// replacement keeps its spec (pool, arguments, volumes, name) with the
+    /// new settings, unpinned again.
+    #[test]
+    fn a_drifted_controller_pod_is_replaced_from_its_own_spec() {
+        let p = pool(&[("bucket", "b"), ("prefix", "pool")], 0);
+        let old_cfg = cfg();
+        let mut pod = engine_pod(&p, &old_cfg, None);
+        assert!(!drifted_from(&pod, &old_cfg));
+        pod.spec.as_mut().unwrap().node_name = Some("w1".into());
+        pod.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(LABEL_FS_UUID.into(), "uuid-1".into());
+        let mut new_cfg = cfg();
+        new_cfg.image = "constellation-csi:next".into();
+        new_cfg.log_level = "debug".into();
+        assert!(drifted_from(&pod, &new_cfg));
+        let next = controller_replacement(&pod, &new_cfg);
+        assert!(!drifted_from(&next, &new_cfg));
+        assert_eq!(next.metadata.name, pod.metadata.name);
+        assert_eq!(
+            next.metadata.labels.as_ref().unwrap()[LABEL_FS_UUID],
+            "uuid-1"
+        );
+        let (old_spec, spec) = (pod.spec.as_ref().unwrap(), next.spec.as_ref().unwrap());
+        assert_eq!(spec.node_name, None, "placed by the scheduler anew");
+        assert_eq!(spec.volumes, old_spec.volumes);
+        let (old_c, c) = (&old_spec.containers[0], &spec.containers[0]);
+        assert_eq!(c.args, old_c.args);
+        assert_eq!(c.image.as_deref(), Some("constellation-csi:next"));
+        let log = c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == "RUST_LOG")
+            .map(|e| e.value.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(log, ["debug"]);
+        assert_restricted(c);
+        // An unannotated pod (made before K6b) counts as drifted.
+        pod.metadata.annotations = None;
+        assert!(drifted_from(&pod, &old_cfg));
+    }
+
+    #[test]
+    fn engine_hostnames_are_dns_labels_that_keep_their_node() {
+        let is_label = |s: &str| {
+            !s.is_empty()
+                && s.len() <= 63
+                && s.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !s.starts_with('-')
+                && !s.ends_with('-')
+        };
+        for node in [
+            "kind-37-k6b-worker",
+            "ip-10-0-12-34.us-west-2.compute.internal",
+            &"n".repeat(253),
+            "...",
+        ] {
+            let h = node_engine_hostname(node);
+            assert!(is_label(&h), "{h:?}");
+            assert!(h.starts_with(NODE_ENGINE_HOST_PREFIX));
+            assert_eq!(h, node_engine_hostname(node), "stable");
+        }
+        assert_ne!(node_engine_hostname("w1"), node_engine_hostname("w2"));
+        let p = pool(&[("bucket", "b"), ("prefix", "pool")], 0);
+        let pod = node_engine_pod(&p, &cfg(), "w1", None, "uuid");
+        assert_eq!(pod.spec.unwrap().hostname, Some(node_engine_hostname("w1")));
+        // kubelet's own default.
+        let long = "constellation-engine-csi-node-drain-d6123c0dab-kind-37-k6b-worker";
+        assert_eq!(
+            pod_hostname(long),
+            "constellation-engine-csi-node-drain-d6123c0dab-kind-37-k6b-work"
+        );
+        assert_eq!(pod_hostname("a-b"), "a-b");
+        assert_eq!(
+            pod_hostname(&format!("{}-x", "a".repeat(62))),
+            "a".repeat(62)
+        );
+    }
+
+    #[test]
+    fn a_cordoned_or_condemned_node_is_draining() {
+        use k8s_openapi::api::core::v1::{Node, NodeSpec, Taint};
+        let node = |spec: NodeSpec| Node {
+            spec: Some(spec),
+            ..Default::default()
+        };
+        use crate::node::Drain;
+        assert_eq!(node_drain(&node(NodeSpec::default())), Drain::No);
+        assert_eq!(
+            node_drain(&node(NodeSpec {
+                unschedulable: Some(true),
+                ..Default::default()
+            })),
+            Drain::Cordoned
+        );
+        let tainted = |key: &str| {
+            node(NodeSpec {
+                taints: Some(vec![Taint {
+                    key: key.into(),
+                    effect: "NoSchedule".into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            node_drain(&tainted("ToBeDeletedByClusterAutoscaler")),
+            Drain::Condemned
+        );
+        assert_eq!(
+            node_drain(&tainted("node.kubernetes.io/out-of-service")),
+            Drain::Condemned
+        );
+        assert_eq!(node_drain(&tainted("dedicated")), Drain::No);
+        let mut deleted = node(NodeSpec::default());
+        deleted.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::now(),
+            ));
+        assert_eq!(node_drain(&deleted), Drain::Condemned);
+    }
+
     fn assert_restricted(c: &Container) {
         let sc = c.security_context.as_ref().unwrap();
         assert_eq!(sc.allow_privilege_escalation, Some(false));

@@ -8,12 +8,13 @@ use super::{ControlClient, Engines, Handle, PoolRef, SubtreeQuotaParams};
 use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::proto::types::{
-    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsInfo, FsListing, FsUnlockParams,
-    HandedOffView, HandoffParams, HandoffPhase, HandoffReport, HandoffState, HandoffTarget,
-    LeaveParams, MkdirParams, MountSource, Pong, QuotaStatus, RenameParams, SnapshotCreateParams,
-    SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams, SnapshotListParams,
-    SnapshotListing, SnapshotStatus, ViewInfo, ViewListParams, ViewListing, ViewMountParams,
-    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrOp, XattrParams, XattrResult,
+    Ack, CloneParams, DeleteParams, DirectoryEntry, DirectoryListing, FileStat, FsCreateParams,
+    FsCreated, FsInfo, FsListing, FsUnlockParams, HandedOffView, HandoffParams, HandoffPhase,
+    HandoffReport, HandoffState, HandoffTarget, LeaveParams, MkdirParams, MountSource, PeerListing,
+    Pong, QuotaStatus, RenameParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams,
+    SnapshotHeld, SnapshotHoldParams, SnapshotListParams, SnapshotListing, SnapshotStatus,
+    ViewInfo, ViewListParams, ViewListing, ViewMountParams, ViewStatsParams, ViewStatsReport,
+    ViewUnmountParams, XattrOp, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,6 +35,10 @@ struct DirEntry {
     xattrs: BTreeMap<String, Vec<u8>>,
     quota: Option<u64>,
     used_bytes: u64,
+    /// A regular file of this size (planted by a test,
+    /// [`InMemoryControl::plant_file`]) rather than a directory: what the
+    /// purge worker walks and unlinks.
+    file: Option<u64>,
 }
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -127,6 +132,24 @@ pub struct InMemoryControl {
     snapshot_lists: AtomicU64,
     /// Plan 37 §8's socket handoff, as a sender and as a standby.
     handoff: Mutex<FakeHandoff>,
+    /// Every `browse.delete` that removed something.
+    deletes: AtomicU64,
+    /// How many of the next `browse.delete` calls fail (transiently).
+    delete_failures: AtomicU32,
+    /// How many more `browse.delete` calls may succeed before every later
+    /// one fails ([`InMemoryControl::allow_deletes`]).
+    delete_allowance: AtomicU64,
+    /// The node id `node.status` reports.
+    node_id: AtomicU64,
+    /// The registry members `peers.list` reports; an admin `node.leave`
+    /// removes one.
+    peers: Mutex<Vec<constellation_control::proto::types::PeerStatus>>,
+    /// Every `node.leave`'s `node_id` (`None`: this node itself).
+    leaves: Mutex<Vec<Option<u64>>>,
+    /// path → the error the next `browse.readdir` of it answers (once).
+    readdir_failures: Mutex<BTreeMap<String, ControlError>>,
+    /// How many of the next `node.leave` calls are refused.
+    leave_refusals: AtomicU32,
 }
 
 /// [`InMemoryControl`]'s side of a socket handoff (plan 37 §8): the
@@ -198,6 +221,14 @@ impl InMemoryControl {
             clone_failures: AtomicU32::new(0),
             snapshot_lists: AtomicU64::new(0),
             handoff: Mutex::default(),
+            deletes: AtomicU64::new(0),
+            delete_failures: AtomicU32::new(0),
+            delete_allowance: AtomicU64::new(u64::MAX),
+            node_id: AtomicU64::new(1),
+            peers: Mutex::default(),
+            leaves: Mutex::default(),
+            readdir_failures: Mutex::default(),
+            leave_refusals: AtomicU32::new(0),
         }
     }
 
@@ -609,6 +640,74 @@ impl InMemoryControl {
         }
     }
 
+    /// Create regular file `path` of `size` bytes (and its ancestors).
+    pub fn plant_file(&self, path: &str, size: u64) {
+        let path = normalize(path);
+        if let Some(parent) = parent_of(&path) {
+            self.plant_dir(&parent);
+        }
+        self.state.lock().unwrap().tree.insert(
+            path,
+            DirEntry {
+                file: Some(size),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// How many `browse.delete` calls removed something.
+    pub fn deletes(&self) -> u64 {
+        self.deletes.load(Ordering::SeqCst)
+    }
+
+    /// Fail the next `n` `browse.delete` calls (`Unavailable`, as a relay
+    /// that broke would).
+    pub fn fail_next_deletes(&self, n: u32) {
+        self.delete_failures.store(n, Ordering::SeqCst);
+    }
+
+    /// Let `n` more `browse.delete` calls succeed, then fail every later
+    /// one (`Unavailable`: a relay that broke mid-purge); `u64::MAX` heals.
+    pub fn allow_deletes(&self, n: u64) {
+        self.delete_allowance.store(n, Ordering::SeqCst);
+    }
+
+    /// Refuse the next `n` `node.leave` calls (as an open continuation
+    /// epoch does).
+    pub fn refuse_next_leaves(&self, n: u32) {
+        self.leave_refusals.store(n, Ordering::SeqCst);
+    }
+
+    /// The next `browse.readdir` of `path` fails with `error` (once).
+    pub fn fail_next_readdir(&self, path: &str, error: ControlError) {
+        self.readdir_failures
+            .lock()
+            .unwrap()
+            .insert(normalize(path), error);
+    }
+
+    /// Report `id` as this engine's node id (`node.status`).
+    pub fn set_node_id(&self, id: u64) {
+        self.node_id.store(id, Ordering::SeqCst);
+    }
+
+    /// Add a registry member `peers.list` reports.
+    pub fn plant_peer(&self, node_id: u64, hostname: &str) {
+        self.peers
+            .lock()
+            .unwrap()
+            .push(constellation_control::proto::types::PeerStatus {
+                node_id,
+                hostname: Some(hostname.to_string()),
+                ..Default::default()
+            });
+    }
+
+    /// Every `node.leave` so far, by its `node_id`.
+    pub fn leaves(&self) -> Vec<Option<u64>> {
+        self.leaves.lock().unwrap().clone()
+    }
+
     /// Remove `path` and everything under it (a human's `rm -rf`).
     pub fn remove_tree(&self, path: &str) {
         let path = normalize(path);
@@ -980,6 +1079,94 @@ impl ControlClient for InMemoryControl {
             state.tree.insert(p, entry);
         }
         Ok(Ack::new(format!("{from} -> {to}")))
+    }
+
+    async fn browse_readdir(&self, path: &str) -> Result<DirectoryListing, ControlError> {
+        self.note("browse.readdir");
+        self.gate_check()?;
+        let dir = normalize(path);
+        if let Some(e) = self.readdir_failures.lock().unwrap().remove(&dir) {
+            return Err(e);
+        }
+        let state = self.state.lock().unwrap();
+        match state.tree.get(&dir) {
+            None => return Err(ControlError::not_found(format!("{dir} does not exist"))),
+            Some(e) if e.file.is_some() => {
+                return Err(ControlError::from(constellation_types::Code::NotDir))
+            }
+            Some(_) => {}
+        }
+        let entries = state
+            .tree
+            .iter()
+            .filter(|(p, _)| p.as_str() != dir && parent_of(p).as_deref() == Some(dir.as_str()))
+            .map(|(p, e)| DirectoryEntry {
+                name: p.rsplit('/').next().unwrap_or_default().to_string(),
+                path: p.clone(),
+                ino: 0,
+                kind: if e.file.is_some() { "file" } else { "dir" }.to_string(),
+            })
+            .collect();
+        Ok(DirectoryListing { path: dir, entries })
+    }
+
+    async fn browse_stat(&self, path: &str) -> Result<FileStat, ControlError> {
+        self.note("browse.stat");
+        self.gate_check()?;
+        let path = normalize(path);
+        let state = self.state.lock().unwrap();
+        let entry = state
+            .tree
+            .get(&path)
+            .ok_or_else(|| ControlError::not_found(format!("{path} does not exist")))?;
+        Ok(FileStat {
+            kind: if entry.file.is_some() { "file" } else { "dir" }.to_string(),
+            size: entry.file.unwrap_or(0),
+            path,
+            ..Default::default()
+        })
+    }
+
+    async fn browse_delete(&self, params: DeleteParams) -> Result<Ack, ControlError> {
+        self.note("browse.delete");
+        self.gate_check()?;
+        if self
+            .delete_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ControlError::unavailable("injected browse.delete failure"));
+        }
+        if self
+            .delete_allowance
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                if n != u64::MAX {
+                    n.checked_sub(1)
+                } else {
+                    Some(n)
+                }
+            })
+            .is_err()
+        {
+            return Err(ControlError::unavailable("the relay broke"));
+        }
+        let path = normalize(&params.path);
+        if path == "/" {
+            return Err(ControlError::invalid("cannot delete the root"));
+        }
+        let mut state = self.state.lock().unwrap();
+        if !state.tree.contains_key(&path) {
+            return Err(ControlError::not_found(format!("{path} does not exist")));
+        }
+        let under = InMemoryControl::subtree_of(&state.tree, &path);
+        if under.len() > 1 && !params.recursive {
+            return Err(ControlError::from(constellation_types::Code::NotEmpty));
+        }
+        for p in under {
+            state.tree.remove(&p);
+        }
+        self.deletes.fetch_add(1, Ordering::SeqCst);
+        Ok(Ack::new(format!("deleted {path}")))
     }
 
     async fn quota_get(&self, subtree: &str) -> Result<QuotaStatus, ControlError> {
@@ -1425,10 +1612,43 @@ impl ControlClient for InMemoryControl {
         self.socket_handoff(params, Some(fd))
     }
 
-    async fn node_leave(&self, _params: LeaveParams) -> Result<Ack, ControlError> {
+    async fn node_leave(&self, params: LeaveParams) -> Result<Ack, ControlError> {
         self.note("node.leave");
         self.gate_check()?;
+        if self
+            .leave_refusals
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ControlError::failed(
+                "cannot leave while a continuation epoch is open",
+            ));
+        }
+        self.leaves.lock().unwrap().push(params.node_id);
+        if let Some(id) = params.node_id {
+            self.peers.lock().unwrap().retain(|p| p.node_id != id);
+        }
         Ok(Ack::new("left"))
+    }
+
+    async fn node_enrolled(&self) -> Result<bool, ControlError> {
+        self.note("node.status");
+        self.gate_check()?;
+        Ok(!self.leaves.lock().unwrap().contains(&None))
+    }
+
+    async fn node_id(&self) -> Result<u64, ControlError> {
+        self.note("node.status");
+        self.gate_check()?;
+        Ok(self.node_id.load(Ordering::SeqCst))
+    }
+
+    async fn peers_list(&self) -> Result<PeerListing, ControlError> {
+        self.note("peers.list");
+        self.gate_check()?;
+        Ok(PeerListing {
+            peers: self.peers.lock().unwrap().clone(),
+        })
     }
 }
 
@@ -1452,6 +1672,10 @@ pub struct InMemoryEngines {
     starts: AtomicU64,
     retires: AtomicU64,
     named: Mutex<Option<BTreeSet<String>>>,
+    /// Every [`Engines::record_trash`], in order.
+    recorded: Mutex<Vec<String>>,
+    /// How many of the next [`Engines::record_trash`] calls fail.
+    record_failures: AtomicU32,
 }
 
 impl InMemoryEngines {
@@ -1475,6 +1699,16 @@ impl InMemoryEngines {
     /// How many [`Engines::retire`] calls stopped a pod.
     pub fn retires(&self) -> u64 {
         self.retires.load(Ordering::SeqCst)
+    }
+
+    /// Every pool [`Engines::record_trash`] recorded, in order.
+    pub fn recorded(&self) -> Vec<String> {
+        self.recorded.lock().unwrap().clone()
+    }
+
+    /// Fail the next `n` [`Engines::record_trash`] calls (`Unavailable`).
+    pub fn fail_next_records(&self, n: u32) {
+        self.record_failures.store(n, Ordering::SeqCst);
     }
 
     /// Whether an engine pod serves `uuid` now.
@@ -1560,6 +1794,18 @@ impl Engines for InMemoryEngines {
 
     async fn running_filesystems(&self) -> Result<Vec<String>, ControlError> {
         Ok(self.running.lock().unwrap().iter().cloned().collect())
+    }
+
+    async fn record_trash(&self, fs_uuid: &str, _volume_id: &str) -> Result<(), ControlError> {
+        if self
+            .record_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ControlError::unavailable("injected record failure"));
+        }
+        self.recorded.lock().unwrap().push(fs_uuid.to_string());
+        Ok(())
     }
 }
 

@@ -3696,7 +3696,7 @@ real store with no spawned tasks.
   subtree walk costs about 0.45 µs per entry warm; no CSI controller RPC
   pays it on a capped volume.
 
-### Kubernetes lane: `harness k8s-scenario` (plan 37 §12, K3, K4, K5)
+### Kubernetes lane: `harness k8s-scenario` (plan 37 §12, K3, K4, K5, K6)
 
 Scenarios that only exist behind the CSI driver run in their own harness
 mode, `harness k8s-scenario <name>... | --all` (`--list` names them; they
@@ -3735,7 +3735,12 @@ target: `Model::verify_observed`). Cross-node expectations use
   `--namespace` (PodSecurity `privileged`), with
   `credentials.watchedSecrets` naming the Secret `csi-secret-rotation`
   rotates (`constellation-k8s-harness-rotating`); a private in-memory floci runs
-  on the `kind` network for the run (`<cluster>-k8s-floci-<run id>`). Each scenario gets a namespace and a
+  on the `kind` network for the run (`<cluster>-k8s-floci-<run id>`). The
+  chart is installed with the K6b lifecycle on scenario timescales: engine
+  pods idle for 60 s are collected (`engineProfile.idleTtl=60s`, a GC pass
+  every 5 s, which also notices a cordoned node), and the purge worker runs
+  every 10 s with a 60 s grace, 500 ops/s, 16 MiB/s and 8 deletes in flight
+  per pool (`k8s.rs` `HARNESS_PURGE`). Each scenario gets a namespace and a
   pool `StorageClass` whose prefix carries the run id, so a reused cluster
   never meets engine state of an earlier run's filesystem.
 - **Teardown, checked.** A scenario ends by deleting its pods and asserting
@@ -3743,8 +3748,8 @@ target: `Model::verify_observed`). Cross-node expectations use
   kubelet's staging path, `<sha256(volume handle)>/globalmount`; `csi-pod-rw`
   is the positive control), then deleting its namespace (its
   `VolumeSnapshot`s with it), waiting for its PVs and `VolumeSnapshotContent`s
-  to go, deleting its classes, and removing its pools' engine pods (their GC
-  is K6b's) once. They stay gone: a `DeleteVolume`/`DeleteSnapshot` the
+  to go, deleting its classes, and removing its pools' engine pods once
+  (the driver's idle GC and purge-worker reap would only minutes later). They stay gone: a `DeleteVolume`/`DeleteSnapshot` the
   sidecars repeat after their object is gone starts no engine pod (plan 37
   K4; until then the controller recreated one to answer it, and the
   teardown had to delete until none had come back for 30 s).
@@ -3785,6 +3790,8 @@ target: `Model::verify_observed`). Cross-node expectations use
 | `csi-rwx-across-nodes` | Two pods on two workers, one RWX PVC. Six rounds alternate the writer; each writer starts once its node shows the model (an open after the other's close) and the other node must then converge. Then both write concurrently into their own directories and both converge on the merged model. Close-to-open in its default `bounded` form: visibility is eventual (`CONVERGE` = 120 s), and nothing is asserted about what a lagging reader sees meanwhile. |
 | `csi-many-pvs-one-pool` | 50 PVCs of one pool class, 10 pods alternating workers with 5 PVs each: one pool filesystem; each PV its own seeded tree, verified independently; exactly two node-owned engine pods (one per worker, 25 views each) and one controller-owned one; quotas per PV: a full 16 MiB PV refuses with `ENOSPC` while a 64 MiB one beside it (same pod, same engine) takes 24 MiB, and a 32 MiB PV on the other worker takes 24 MiB then refuses (2 MiB slack either way: the caps are soft, above, and a refusal may not come early either); the trees are intact afterwards and unstaging all 50 annotates both engine pods with 0 views. |
 | `csi-secret-rotation` | Plan 37 K6a, `Refreshing(callback)`: a `credentialSource: refreshing` class (the watched Secret is also its provisioner and node-stage secret). A writer pod on worker 1 and a reader on worker 2 (as in `csi-plugin-restart-survives`) run while the Secret is rotated twice. After each rotation every engine pod of the pool — both node-owned ones and the controller-owned one — reports through `fs.list` (over `kubectl exec … control-relay`) a credentials generation one higher and its S3 clients signing with it (`credentials_in_use`), within 180 s; the writer keeps going; a PVC created afterwards binds (the controller provisions with the new pair). Each node engine's audit log has an `fs.unlock` line per unlock (the start and both rotations) by the `csi-node-plugin` service principal (uid 0), with the params digest withheld, the rotations `on_behalf_of` `secret:<namespace>/<name>`, and the stage's `view.mount` by the same principal with `on_behalf_of` naming the PV; every line of the controller-owned engine's audit log is by the `csi-controller` service principal (uid 65532, the image's allowlist), with the start and both rotations among them and a CSI call naming the PV. No pod spec, engine-process environment (`/proc/1/environ`), engine or plugin log, audit log, or file under either worker's hostRoot holds a key pair of any generation (the hostRoot is searched before and after the rotations). Every engine pod and both plugins run with `RLIMIT_CORE` 0, and the unprivileged ones are not dumpable. Zero I/O errors, the tree matches the model on both workers, the staging mounts keep their mount ids and the engine pods their uids and restart counts: no remount. floci accepts any key pair, so "the old pair stops working" is shown from the engines' side (the generation in use), not by S3 refusing it; `harness run csi-credential-revocation` shows the refusal on versitygw. |
+| `csi-node-drain` | Plan 37 §7 "Drain", K6b: a `Deployment` pod preferring worker 1 mounts an RWO PVC and writes 20 files; `kubectl drain <worker 1> --ignore-daemonsets --delete-emptydir-data --force` completes (the chart's `PodDisruptionBudget` refuses the node-owned engine pod's eviction until the node plugin, seeing the node cordoned and the pod's views gone, has it `node.leave` and deletes it — the plugin's log says so, "draining"); no node-owned engine pod is left on worker 1, the pod comes up on worker 2 with the tree intact and writes on, the drained engine's registry id is gone from `peers.list` (seen from worker 2's engine: no ghost roster entry), and its node identity (`<hostRoot>/node-identity/<unit>`, and the `.left-*` copy it is moved to first) is gone from worker 1's disk. Uncordoned, worker 1 gets no engine pod back. The drain itself took 6 s on the dev box. Then a second PVC of the pool is written and deleted into the trash, and the worker running the pool's controller-owned engine pod is drained at once (a bare `emptyDir` pod: evicted with no leave, nobody asks for it again): the purge worker brings it back on another node, the trashed entry is purged through the new incarnation (its `purged trash entry` line no earlier than the new pod's creation) and is gone from `/.trash`, and the drained incarnation's registry id is retired from the roster. |
+| `csi-trash-purge-under-load` | Plan 37 §"Deletion and purge", K6b, with the large-many-small-files case: five PVCs of one pool. Three are filled — 10 × 4 KiB, 64 × 1 MiB of known content (one chunk each, so the harness knows their 64 chunk keys), 100 directories × 1000 empty files (the per-entry cost; non-empty files would add a chunk PUT each) — and deleted while timed writers on both workers write the other two. Every trash entry is purged (the controller's `purged trash entry` log lines; the 100 000-file one in exactly 100 101 unlinks and rmdirs, no recursive fallback), within 3× the budgets' time plus the grace and two intervals, and none faster than its budget allows; the trash is empty through the controller-owned pod. The writers keep going with zero errors and no iteration over 10 s, and their volumes match the model. GC (`constellation gc verify` from the host with the horizon at 0) finds none of del-big's chunks unreferenced before the delete, none while del-big sits in the trash unpurged (looked at inside the grace, the entry seen whole — 64 files — before and after the look), and all 64 after the purge, and the chunk-object census did not shrink: the purge deleted no S3 object (that stays GC's). |
 | `csi-pod-security` | Plan 37 §9 / K6 gate, a kube-bench-style check of the privilege split: every driver pod's spec is re-created by a server dry run in a throwaway namespace enforcing PodSecurity `restricted` (ServiceAccount, node and priority stripped). The controller replicas and the controller-owned engine pod are admitted; the node-owned engine pod is refused for its hostPath volumes and nothing else (its containers meet `restricted`'s rules: non-root, no capability, no escalation, read-only root, `RuntimeDefault` seccomp); the node plugin is refused as privileged. |
 | `csi-plugin-restart-survives` | A writer pod on worker 1 (a 4 KiB file + a log line + a read-back every 100 ms) and a reader on worker 2 run while every node-plugin pod and every controller replica is deleted. They are replaced and Ready, both loops go on with zero errors, the tree matches the model on both nodes and in a new pod published by the restarted plugin, a PVC created afterwards binds and stages, and the engine pods holding the FUSE sessions are the same incarnations with no restarts. |
 | `csi-snapshot-clone-mount` | A pod on worker 1 writes a seeded tree and a 64 MiB file into a PVC; a `VolumeSnapshot` of it is ready with the handle `<volume handle>@snapshot-<uid>` and a `restoreSize` of at least the data; the source then moves on (more ops, the big file removed). A PVC restored from the snapshot and a PVC cloned from the source bind in the source's pool filesystem, and the controller logged a metadata-only `clone.create` for each (under 10 s with the 64 MiB file in the tree; the run prints the times). A pod on worker 2 sees the restore as the tree at the snapshot (big file's SHA-256 intact) and the clone as the tree now; writes into the clone and the restore leave the source's tree as it was. |
@@ -3812,6 +3819,27 @@ make csi-image CSI_IMAGE=constellation-csi:k5b
 KIND_CLUSTER=kind-37-k5b target/release/harness k8s-scenario \
     csi-engine-pod-handoff-under-load csi-snapshot-clone-mount --repeat 20 \
     --image constellation-csi:k5b --results-json handoff.json
+```
+
+**PodSecurity check (plan 37 K6 gate).** `tests/csi/podsecurity-check.sh`
+asserts, kube-bench style (`[PASS]`/`[FAIL] <id> <what>`, non-zero exit on
+any FAIL), that the installed driver's pods hold exactly §9's privilege
+split: the node plugin's `constellation-csi` container privileged with
+`Bidirectional` propagation on exactly its three host mounts and its
+sidecars unprivileged; the controller non-root, read-only, unprivileged, no
+hostPath; both kinds of engine pod non-root 65532 with `RuntimeDefault`
+seccomp, no token, the permission-less engine ServiceAccount, no host
+namespace or init container, one container under `restricted`'s rules; the
+controller-owned one on `emptyDir`s only, the node-owned one on its own
+unit's three `type: Directory` hostPaths (the grant read-only); and across
+the namespace no added capability and no privileged container but the node
+plugins'. With `PSC_STORAGE_CLASS=<a pool class>` it first stages a volume
+of that class on a worker so both kinds of engine pod exist (a missing
+kind is a FAIL):
+
+```bash
+KUBECONFIG=/tmp/kubeconfig PSC_STORAGE_CLASS=<class> PSC_IMAGE=<image> \
+    tests/csi/podsecurity-check.sh
 ```
 
 CI: `csi-unit` (`ci.yml`) runs `cargo test -p constellation-csi`; nightly's

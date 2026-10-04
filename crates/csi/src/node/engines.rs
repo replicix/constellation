@@ -66,6 +66,62 @@ pub trait NodeEngines: Send + Sync {
     /// idle GC of 37-k6b reads them).
     async fn set_view_count(&self, unit: &str, views: usize) -> Result<(), ControlError>;
 
+    // ---- plan 37 §7: idle GC and drain (crate::node::gc, 37-k6b) ----
+
+    /// This node's engine pods, one per unit (its newest pod), with what
+    /// the idle GC reads off them. Found by their labels, so a restarted
+    /// plugin owns the pods its predecessor made.
+    async fn units(&self) -> Result<Vec<UnitPod>, ControlError> {
+        Ok(Vec::new())
+    }
+
+    /// Whether this node is being drained ([`Drain`]).
+    async fn draining(&self) -> Result<Drain, ControlError> {
+        Ok(Drain::No)
+    }
+
+    /// Before `unit`'s engine is asked to leave the pool's registry: move
+    /// its node identity (`<hostRoot>/node-identity/<unit>/`) aside to
+    /// `.leaving-<unit>`, atomically, so that from the leave on no new pod
+    /// can start on a state dir that may have left. The running pod keeps
+    /// using it (its mount follows the directory, not the name).
+    async fn set_identity_aside(&self, unit: &str) -> Result<(), ControlError> {
+        let _ = unit;
+        Ok(())
+    }
+
+    /// The leave was refused: `unit`'s identity goes back where it was
+    /// (an error when a fresh identity took its place meanwhile).
+    async fn restore_identity(&self, unit: &str) -> Result<(), ControlError> {
+        let _ = unit;
+        Ok(())
+    }
+
+    /// `unit`'s identity aside belongs to an older incarnation when a fresh
+    /// identity is in place next to it (a pod started on a new one while
+    /// it was aside): it can never be restored, so retire it — without
+    /// touching the fresh identity or its pods. `false`: no fresh identity,
+    /// nothing done.
+    async fn discard_superseded_aside(&self, unit: &str) -> Result<bool, ControlError> {
+        let _ = unit;
+        Ok(false)
+    }
+
+    /// Units whose identity is aside for a leave (a pass that ended between
+    /// moving it and finishing), with since when (unix seconds).
+    async fn identities_aside(&self) -> Result<Vec<(String, u64)>, ControlError> {
+        Ok(Vec::new())
+    }
+
+    /// `unit`'s engine has left the pool's registry: retire its node
+    /// identity (whether still in place or aside), delete every pod of the
+    /// unit, and remove the old identity once they are gone. The unit's
+    /// next pod starts as a fresh node.
+    async fn forget_unit(&self, unit: &str) -> Result<(), ControlError> {
+        let _ = unit;
+        Ok(())
+    }
+
     // ---- plan 37 §8: rollouts (crate::node::rollout) ----
 
     /// This node's engine pods (ready, serving) whose spec differs from the
@@ -127,6 +183,38 @@ pub trait NodeEngines: Send + Sync {
     }
 }
 
+/// How a node is going away (plan 37 §7 "Drain").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drain {
+    No,
+    /// Cordoned (`unschedulable`): `kubectl drain` evicts its workloads,
+    /// and the idle GC collects each engine pod once its views are gone —
+    /// but the node plugin (a DaemonSet pod the drain leaves alone) stopping
+    /// now is a plain restart (a rollout of the plugin on a cordoned node).
+    Cordoned,
+    /// Going for good: tainted for deletion by the cluster autoscaler, out
+    /// of service, or being deleted. The plugin's `preStop` waits for its
+    /// engine pods to be collected.
+    Condemned,
+}
+
+/// One unit's engine pod on this node, as the idle GC sees it
+/// ([`NodeEngines::units`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitPod {
+    pub unit: String,
+    pub pod: String,
+    /// Running and ready (a pod that is not cannot be asked anything).
+    pub ready: bool,
+    /// `constellation.dev/last-view-count`; `None`: never counted (a stage
+    /// that failed after bringing it up).
+    pub views: Option<u64>,
+    /// `constellation.dev/idle-since` (unix seconds), set with a count of 0.
+    pub idle_since: Option<u64>,
+    /// When the pod was created (unix seconds).
+    pub created: Option<u64>,
+}
+
 /// An engine pod whose spec drifted ([`NodeEngines::drifted`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Drift {
@@ -160,6 +248,11 @@ struct FakeEngine {
     awaits: bool,
     /// The `--s3` URL its `fs.unlock` names.
     target: String,
+    /// Up (false once [`NodeEngines::forget_unit`] removed it; the tree,
+    /// the pool's S3 data, stays for the next one).
+    running: bool,
+    /// Started at (unix seconds).
+    started_at: u64,
     /// (incarnation, fingerprint) of the last unlock.
     unlocked: Option<(u64, [u8; 32])>,
 }
@@ -189,6 +282,25 @@ pub struct InMemoryNodeEngines {
     resume_after: Mutex<Option<std::time::Duration>>,
     /// Adoptions that fail (each failing one).
     fail_adoptions: AtomicU64,
+    /// unit → when its view count last went to 0 (unix seconds).
+    idle: Mutex<BTreeMap<String, u64>>,
+    /// How the node is being drained.
+    drain: Mutex<Drain>,
+    /// Units whose identity is aside, since when.
+    aside: Mutex<BTreeMap<String, u64>>,
+    /// Units whose identity was forgotten, in order.
+    forgotten: Mutex<Vec<String>>,
+    /// Units with a fresh identity in place while an older one is aside.
+    fresh: Mutex<std::collections::BTreeSet<String>>,
+    /// Units whose superseded aside identity was retired, in order.
+    discarded: Mutex<Vec<String>>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl InMemoryNodeEngines {
@@ -206,7 +318,52 @@ impl InMemoryNodeEngines {
             fail_resume: Mutex::default(),
             resume_after: Mutex::default(),
             fail_adoptions: AtomicU64::new(0),
+            idle: Mutex::default(),
+            drain: Mutex::new(Drain::No),
+            aside: Mutex::default(),
+            forgotten: Mutex::default(),
+            fresh: Mutex::default(),
+            discarded: Mutex::default(),
         }
+    }
+
+    /// The node is (or is no longer) cordoned for a drain.
+    pub fn set_draining(&self, draining: bool) {
+        self.set_drain(if draining { Drain::Cordoned } else { Drain::No });
+    }
+
+    pub fn set_drain(&self, drain: Drain) {
+        *self.drain.lock().unwrap() = drain;
+    }
+
+    /// The units whose identity is aside now.
+    pub fn aside(&self) -> Vec<String> {
+        self.aside.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// A pod of `unit` started on a fresh identity while its old one is
+    /// aside (the plugin and the pod died mid-collect; a stage came first).
+    pub fn make_fresh_identity(&self, unit: &str) {
+        self.fresh.lock().unwrap().insert(unit.to_string());
+    }
+
+    /// The units whose superseded aside identity was retired.
+    pub fn discarded(&self) -> Vec<String> {
+        self.discarded.lock().unwrap().clone()
+    }
+
+    /// The units whose identity [`NodeEngines::forget_unit`] retired.
+    pub fn forgotten(&self) -> Vec<String> {
+        self.forgotten.lock().unwrap().clone()
+    }
+
+    /// Whether `unit`'s pod is up.
+    pub fn is_running(&self, unit: &str) -> bool {
+        self.engines
+            .lock()
+            .unwrap()
+            .get(unit)
+            .is_some_and(|e| e.running)
     }
 
     /// The next replacement started resumes only `after` its commit.
@@ -275,6 +432,17 @@ impl InMemoryNodeEngines {
 
     fn get_or_start(&self, unit: &str, pool: &PoolRef, fs_uuid: &str) -> Arc<InMemoryControl> {
         let mut engines = self.engines.lock().unwrap();
+        if let Some(engine) = engines.get_mut(unit).filter(|e| !e.running) {
+            // A new pod of a forgotten unit: a new node on the same tree.
+            self.created.fetch_add(1, Ordering::SeqCst);
+            engine.running = true;
+            engine.started_at = unix_now();
+            engine.incarnation = self.next.fetch_add(1, Ordering::SeqCst);
+            engine.unlocked = None;
+            if engine.awaits {
+                engine.control.gate();
+            }
+        }
         let engine = engines.entry(unit.to_string()).or_insert_with(|| {
             self.created.fetch_add(1, Ordering::SeqCst);
             let control = InMemoryControl::serving(fs_uuid);
@@ -293,6 +461,8 @@ impl InMemoryNodeEngines {
                 awaits,
                 target: unlock_target(pool),
                 unlocked: None,
+                running: true,
+                started_at: unix_now(),
             }
         });
         engine.control.clone()
@@ -358,7 +528,7 @@ impl InMemoryNodeEngines {
 
     fn connect(&self, unit: &str) -> Option<NodeEngine> {
         let engines = self.engines.lock().unwrap();
-        let engine = engines.get(unit)?;
+        let engine = engines.get(unit).filter(|e| e.running)?;
         Some(NodeEngine {
             client: engine.control.clone(),
             unit: unit.to_string(),
@@ -400,6 +570,88 @@ impl NodeEngines for InMemoryNodeEngines {
 
     async fn set_view_count(&self, unit: &str, views: usize) -> Result<(), ControlError> {
         self.views.lock().unwrap().insert(unit.to_string(), views);
+        let mut idle = self.idle.lock().unwrap();
+        if views == 0 {
+            idle.insert(unit.to_string(), unix_now());
+        } else {
+            idle.remove(unit);
+        }
+        Ok(())
+    }
+
+    async fn units(&self) -> Result<Vec<UnitPod>, ControlError> {
+        let views = self.views.lock().unwrap().clone();
+        let idle = self.idle.lock().unwrap().clone();
+        Ok(self
+            .engines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.running)
+            .map(|(unit, e)| UnitPod {
+                unit: unit.clone(),
+                pod: format!("constellation-engine-{unit}-{}", self.node),
+                ready: true,
+                views: views.get(unit).map(|v| *v as u64),
+                idle_since: idle.get(unit).copied(),
+                created: Some(e.started_at),
+            })
+            .collect())
+    }
+
+    async fn draining(&self) -> Result<Drain, ControlError> {
+        Ok(*self.drain.lock().unwrap())
+    }
+
+    async fn set_identity_aside(&self, unit: &str) -> Result<(), ControlError> {
+        self.aside
+            .lock()
+            .unwrap()
+            .entry(unit.to_string())
+            .or_insert_with(unix_now);
+        Ok(())
+    }
+
+    async fn restore_identity(&self, unit: &str) -> Result<(), ControlError> {
+        if self.fresh.lock().unwrap().contains(unit) {
+            return Err(ControlError::failed(format!(
+                "a fresh identity of {unit} is in place"
+            )));
+        }
+        self.aside.lock().unwrap().remove(unit);
+        Ok(())
+    }
+
+    async fn discard_superseded_aside(&self, unit: &str) -> Result<bool, ControlError> {
+        if !self.fresh.lock().unwrap().contains(unit)
+            || self.aside.lock().unwrap().remove(unit).is_none()
+        {
+            return Ok(false);
+        }
+        self.discarded.lock().unwrap().push(unit.to_string());
+        Ok(true)
+    }
+
+    async fn identities_aside(&self) -> Result<Vec<(String, u64)>, ControlError> {
+        Ok(self
+            .aside
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, t)| (u.clone(), *t))
+            .collect())
+    }
+
+    async fn forget_unit(&self, unit: &str) -> Result<(), ControlError> {
+        if let Some(engine) = self.engines.lock().unwrap().get_mut(unit) {
+            engine.running = false;
+            engine.standby = None;
+            engine.control.drop_views();
+        }
+        self.views.lock().unwrap().remove(unit);
+        self.idle.lock().unwrap().remove(unit);
+        self.aside.lock().unwrap().remove(unit);
+        self.forgotten.lock().unwrap().push(unit.to_string());
         Ok(())
     }
 

@@ -42,10 +42,23 @@ spec:
       {{- with .Values.node.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
+      # Plan 37 §7 "Drain" (K6b): on a draining node the preStop hook waits
+      # until this plugin has collected every engine pod of the node (each
+      # leaves the pool's registry first); the grace period must cover it.
+      terminationGracePeriodSeconds: {{ add .Values.node.drain.preStopTimeoutSeconds 30 }}
       containers:
         - name: constellation-csi
           image: {{ include "csi.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /usr/local/bin/constellation-csi
+                  - --node
+                  - --pre-stop
+                  - --endpoint=unix:///csi/csi.sock
+                  - --host-root={{ .Values.hostRoot }}
           args:
             - --node
             - --node-id=$(NODE_NAME)
@@ -70,6 +83,10 @@ spec:
             - {name: CONSTELLATION_CSI_HANDOFF_RESUME_TIMEOUT_MS, value: {{ .Values.engineProfile.handoff.resumeTimeoutMs | quote }}}
             - {name: CONSTELLATION_CSI_HANDOFF_MAX_ATTEMPTS, value: {{ .Values.engineProfile.handoff.maxAttempts | quote }}}
             - {name: CONSTELLATION_CSI_ROLLOUT_INTERVAL_S, value: {{ .Values.engineProfile.handoff.rolloutInterval | quote }}}
+            # Plan 37 §7 (K6b): idle GC and drain (crates/csi/src/node/gc.rs).
+            - {name: CONSTELLATION_CSI_ENGINE_IDLE_TTL, value: {{ .Values.engineProfile.idleTtl | quote }}}
+            - {name: CONSTELLATION_CSI_IDLE_GC_INTERVAL_S, value: {{ .Values.engineProfile.idleGcInterval | quote }}}
+            - {name: CONSTELLATION_CSI_PRESTOP_TIMEOUT_S, value: {{ .Values.node.drain.preStopTimeoutSeconds | quote }}}
             {{- if .Values.node.metricsPort }}
             - {name: CONSTELLATION_CSI_METRICS_ADDR, value: {{ printf "0.0.0.0:%v" .Values.node.metricsPort | quote }}}
             {{- end }}

@@ -68,7 +68,8 @@
 //! its namespace (its `VolumeSnapshot`s with it), waiting for its PVs and
 //! `VolumeSnapshotContent`s to be deleted, then its StorageClasses and
 //! `VolumeSnapshotClass`, and finally removing its pools' engine pods
-//! (engine-pod GC is plan 37 K6b's, so nothing else would). Once deleted
+//! (the driver's own idle GC and purge-worker reap would, minutes later:
+//! [`IDLE_TTL_S`], [`HARNESS_PURGE`]). Once deleted
 //! they stay deleted: a delete the sidecars repeat after their object is
 //! gone starts no engine pod (plan 37 K4 fixed the controller, which used
 //! to recreate one to answer it).
@@ -77,6 +78,7 @@
 //! is reported SKIPPED with the missing tool, as `harness run` does for a
 //! missing `fio`.
 
+pub mod lifecycle;
 pub mod remote;
 pub mod scenarios;
 
@@ -102,7 +104,34 @@ pub use scenarios::{K8sScenario, K8S_SCENARIOS};
 pub const HARNESS_CLUSTER: &str = "kind-harness";
 /// Results-file lane of a `k8s-scenario` run.
 pub const DEFAULT_LANE: &str = "linux-k8s-kind";
-const BUCKET: &str = "k8s-harness";
+pub(crate) const BUCKET: &str = "k8s-harness";
+
+/// The engine-pod idle TTL the harness installs the chart with (plan 37
+/// K6b): an engine pod idle this long leaves its pool and goes, so a
+/// scenario that unstages everything sees its engine pods collected.
+pub const IDLE_TTL_S: u64 = 60;
+
+/// The purge worker's settings the harness installs the chart with.
+pub struct PurgeSettings {
+    pub interval_s: u64,
+    pub grace_s: u64,
+    pub ops_per_s: u64,
+    pub bytes_per_s: u64,
+    pub concurrency: u64,
+}
+
+/// Fast enough for a scenario, slow enough that the budgets show:
+/// `csi-trash-purge-under-load` checks every purged entry kept to them.
+pub const HARNESS_PURGE: PurgeSettings = PurgeSettings {
+    interval_s: 10,
+    // Long enough for `csi-trash-purge-under-load` to look at a trashed,
+    // unpurged volume, and for `csi-node-drain` to drain the controller-
+    // owned pod's node before the worker purges.
+    grace_s: 60,
+    ops_per_s: 500,
+    bytes_per_s: 16 << 20,
+    concurrency: 8,
+};
 const CREDS_SECRET: &str = "constellation-k8s-harness-creds";
 /// The Secret `csi-secret-rotation` rotates (`credentialSource: refreshing`).
 pub const ROTATING_SECRET: &str = "constellation-k8s-harness-rotating";
@@ -635,6 +664,23 @@ impl Env {
                 &format!("credentials.watchedSecrets[0].namespace={ns}"),
                 "--set",
                 &format!("credentials.watchedSecrets[0].name={ROTATING_SECRET}"),
+            ])
+            // Plan 37 K6b: the idle GC, the drain watch and the purge
+            // worker on scenario timescales ([`HARNESS_PURGE`]).
+            .args(["--set", &format!("engineProfile.idleTtl={IDLE_TTL_S}s")])
+            .args(["--set", "engineProfile.idleGcInterval=5"])
+            .args([
+                "--set",
+                &format!("purge.interval={}s", HARNESS_PURGE.interval_s),
+            ])
+            .args(["--set", &format!("purge.grace={}s", HARNESS_PURGE.grace_s)])
+            .args([
+                "--set",
+                &format!("purge.opsPerSecond={}", HARNESS_PURGE.ops_per_s),
+                "--set",
+                &format!("purge.bytesPerSecond={}", HARNESS_PURGE.bytes_per_s),
+                "--set",
+                &format!("purge.maxConcurrentDeletes={}", HARNESS_PURGE.concurrency),
             ])
             .args(["--wait", "--timeout", "300s"]);
         run_cmd(h, None, Duration::from_secs(420)).context("helm upgrade --install")?;
@@ -1362,6 +1408,55 @@ impl<'a> Scope<'a> {
             .with_context(|| format!("parsing snapshot ls output {out:?}"))
     }
 
+    /// Drop the scope's pools from the purge worker's records (the
+    /// driver's `constellation-csi-pools` ConfigMap; keys are the
+    /// controller-owned pods' names, `constellation-engine-<pool>[-shard-<k>]-controller`).
+    fn forget_pool_records(&self, ns: &str) -> Result<()> {
+        let cm = self.kube().run(&[
+            "get",
+            "configmap",
+            "-n",
+            ns,
+            "constellation-csi-pools",
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ])?;
+        if cm.trim().is_empty() {
+            return Ok(());
+        }
+        let cm: Value = serde_json::from_str(&cm)?;
+        let mine: serde_json::Map<String, Value> = cm["data"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+            .filter(|k| {
+                self.classes.iter().any(|(_, pool)| {
+                    **k == format!("constellation-engine-{pool}-controller")
+                        || k.starts_with(&format!("constellation-engine-{pool}-shard-"))
+                })
+            })
+            .map(|k| (k.clone(), Value::Null))
+            .collect();
+        if mine.is_empty() {
+            return Ok(());
+        }
+        let patch = json!({"data": mine}).to_string();
+        self.kube()
+            .run(&[
+                "patch",
+                "configmap",
+                "-n",
+                ns,
+                "constellation-csi-pools",
+                "--type=merge",
+                "-p",
+                &patch,
+            ])
+            .map(|_| ())
+    }
+
     /// Have `finish` also check that, once the scope's engine pods are
     /// deleted, none comes back: a `DeleteVolume`/`DeleteSnapshot` the
     /// sidecars repeat for an object that is gone must start nothing
@@ -1512,8 +1607,13 @@ impl<'a> Scope<'a> {
         // Every engine pod of the scope's pools, node- and controller-owned
         // (the latter carries no `fs-uuid` label). Deleted once: the
         // controller starts no engine pod for a delete the provisioner
-        // repeats after the PV is gone (plan 37 K4), so none comes back.
+        // repeats after the PV is gone (plan 37 K4), so none comes back —
+        // once the purge worker's records of the pools are gone too (it
+        // brings back the pod of a recorded pool, plan 37 K6b).
         let ns = self.env.driver_ns.as_str();
+        if let Err(e) = self.forget_pool_records(ns) {
+            eprintln!("   forgetting the scope's pool records: {e:#}");
+        }
         for (_, pool) in &self.classes {
             let sel = format!("constellation.dev/pool={pool}");
             let _ = kube.run(&[

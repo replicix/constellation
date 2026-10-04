@@ -1016,6 +1016,44 @@ genuinely abandoned pools/filesystems). The controller-owned pod above is
 explicitly outside this loop — its lifecycle is the controller's, not the
 node plugin's.
 
+*As built (37-k6b):* `crates/csi/src/node/gc.rs`. The loop polls every
+`engineProfile.idleGcInterval` (30 s) with the TTL `engineProfile.idleTtl`
+(10 m; `0` keeps idle pods), finds this node's pods by their labels (so a
+restarted plugin owns its predecessor's), and never collects a unit with a
+staged volume recorded, a pending rollout, or a busy unit gate (it takes the
+gate exclusively). The annotation is never trusted alone: under the gate
+the pod is asked `view.list` and kept if it serves any view. **Collecting
+is `node.leave`, then the pod goes** — a deviation from "deletes any engine
+pod": a pod deleted without leaving stays a write-eligible roster member
+that never comes back (it blocks continuation epochs while "away" and is a
+ghost for good once its node is gone). The node identity is moved aside
+atomically *before* the leave (`.leaving-<unit>`; back if the leave is
+refused), then the unit's pods are deleted and the identity removed; the
+next volume starts a fresh node. A pass that stops between those steps is
+settled by the next one, which asks the pod `node.status` (`enrolled`:
+the identity goes back; left: forgotten; no pod to ask: forgotten — at
+worst an old record, never a pod crash-looping on a state dir that has
+left; 37-k6b review). Identity still survives a crash, an OOM and a
+rollout's handoff, which is what "Node identity" below needs. A pod still
+waiting for its credentials (never enrolled by this incarnation) is deleted
+without a leave and keeps its identity; a refused leave keeps the pod for
+the next pass. **Controller-owned pods (K5a left their lifecycle open):**
+the purge worker reaps one whose pool has been empty for a while, and
+replaces one whose engine settings drifted (a chart upgrade) by leave,
+delete and re-create from its own spec — it serves no view, so no handoff;
+every deliberate delete of one leaves the registry first, and the registry
+sweep (§"Deletion and purge") retires the records rescheduled incarnations
+left behind (37-k6a review). With two controller replicas the one retiring
+a pod may not be the one using it, so (37-k6b review) every RPC first
+*holds* the pod — a `constellation.dev/held-by-<replica>` annotation of
+unix-ms expiry, written by compare-and-swap on the pod's
+`resourceVersion` and renewed while in use — and a reap, roll or a
+delete's own stop first *marks* it (`constellation.dev/retiring`, by
+compare-and-swap too, only when no other replica's hold is live); a hold
+that finds a fresh mark waits for the pod to go and starts it again. The
+two swaps on one object serialize, so no RPC of any replica is cut off
+(`crates/csi/src/engine_pods/controller_pods.rs`).
+
 **Node identity.** Constellation's per-node roster identity (the node key,
 whatever `authority`/`registry` state a live node needs to rejoin its peer
 group) is keyed by (pool|sc, k8s node), not by pod — it lives on the
@@ -1045,6 +1083,32 @@ optimization: an autoscaler that kills nodes without a drain hook would
 bloat the roster with dead entries on every scale-down, exactly the failure
 mode the design brief calls out ("Autoscaled churn must not bloat the
 roster").
+
+*As built (37-k6b):* the node watch is the idle GC's pass
+(`crates/csi/src/node/gc.rs`): a node that is cordoned, carries
+`ToBeDeletedByClusterAutoscaler` or `node.kubernetes.io/out-of-service`, or
+is being deleted makes every engine pod with no view left due at once
+(leave, delete, identity retired). The ordering is a
+`PodDisruptionBudget` over node-owned engine pods
+(`templates/engine-pdb.yaml`, an integer `minAvailable` no pod count
+reaches: bare pods admit no other form) that refuses every eviction, so
+`kubectl drain` retries the engine pods while it evicts the workloads, and
+completes once the plugin has collected them. Engine pods are bare pods:
+`kubectl drain` needs `--force` to touch them at all (without it the drain
+refuses to start). The `preStop` hook (`constellation-csi --node --pre-stop`)
+returns at once unless the node is going for good (being deleted, tainted
+for deletion or out of service — a cordon alone is a drain, which leaves
+the plugin alone, so the plugin stopping then is a rollout of it and must
+not wait for volumes that stay staged), and then waits (up to
+`node.drain.preStopTimeoutSeconds`, 300 s; the DaemonSet's grace is 30 s
+more) for the plugin to have collected every engine pod. Found on the way:
+both plugins are their container's PID 1 and handled no `SIGTERM`, so a
+pod deletion always waited out its grace; they now stop on
+`SIGTERM`/`SIGINT`. Node-owned pods set `spec.hostname` to
+`csi-node-<node head>-<hash>` (the default hostname, the pod name cut to 63
+bytes, loses the node), so the controller's registry sweep can also retire
+the record of an engine whose node vanished without a drain.
+`csi-node-drain` (`crates/harness/src/k8s/lifecycle.rs`) is the proof.
 
 ## Deletion and purge
 
@@ -1111,6 +1175,46 @@ future incremental/resumable purge (checkpointing progress within one
 trashed subtree rather than treating `browse.delete` as atomic) is a
 documented, not-yet-built refinement if K6's testing shows this matters in
 practice.
+
+*As built (37-k6b):* `crates/csi/src/purge.rs`. Built incremental from the
+start: a trash entry is walked depth first (`browse.readdir`), each file's
+size read (`browse.stat`) and the file unlinked, each directory removed once
+empty — a single recursive `browse.delete` could neither be paced nor
+resumed. The budgets are per pool and per second for unlinks/rmdirs
+(`purge.opsPerSecond`, 500) and file bytes (`purge.bytesPerSecond`,
+256 Mi), with `purge.maxConcurrentDeletes` (4) unlinks of a directory in
+flight; a generic cell rate pace, so one budget idling while the other rules
+banks no credit. Every pool has a task of its own each tick and a pool still
+being purged is not started twice. Defaults follow this section: every 5 m,
+a 1 m grace (the chart had 1 h / 24 h placeholders). The leader is the
+replica holding the `constellation-csi-purge` Lease (this binary's own
+election with the sidecars' timing, `controller.leaderElection.*`, and
+client-go's rules: every call bounded by the retry period, leadership
+until the renew deadline after the start of the last successful write, a
+rival's record taken only once seen unchanged for the lease duration by
+the taker's own clock). It purges through controller-owned pods (the exec
+policy keeps the controller off node-owned ones), and **finds its pools in
+the cluster** (37-k6b review): every pool a PV of the driver names, every
+pool on record in the `constellation-csi-pools` ConfigMap (`DeleteVolume`
+records a pool before it trashes into it; each pass records the pools its
+PVs name), and every controller-owned pod that is up — bringing up the pod
+of any that has none, since a drain, an eviction or a node loss takes that
+bare `emptyDir` pod with nobody asking for it again. A pool's record goes
+when its pod is reaped. A `DeleteVolume` that started a pod and trashed a
+volume leaves that pod up for the purge when the worker runs (it is
+stopped as before with `purge.interval: 0`). Only a directory whose listing
+exceeds one control frame (`EOVERFLOW`: no paging, ~90 000 entries) falls
+back to one recursive delete, logged; any other listing failure leaves the
+entry for the next pass. After a pass:
+the registry sweep (records of the pod's hostname but not its node id, and
+`csi-node-*` records of nodes that no longer exist, retired by admin
+`node.leave` — refused, and retried, while the dead node's lease is live),
+then the reap (empty for at least two passes and a minute, and no PV
+naming the pool; re-checked once the pod is marked retiring: a
+`CreateVolume` finds a new pool empty too) or the drift roll. No double accounting: the purge touches no quota and deletes
+no S3 object; the chunks become GC's (`csi-trash-purge-under-load` checks
+both). `layout: dedicated` volumes are still refused by `DeleteVolume`
+(removing a filesystem's bucket prefix is no control operation).
 
 ## 8. FUSE session handover protocol
 

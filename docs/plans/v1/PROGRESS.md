@@ -42154,3 +42154,311 @@ Host shared with other agents (load 10–40). `CARGO_TARGET_DIR` unset,
 | `target/release/harness run` (full matrix; one scenario per process via a queue script, prefix `m8c`, `TMPDIR=/var/tmp/m8c`; `fuse-inval-storm` excluded, a known bug; the two known-bug reproductions not run) | **222 scenarios: 208 PASSED first time, 11 SKIPPED** (passthrough/zero-copy, need root), **3 FAILED first time, all PASSED on rerun**: `csi-credential-revocation` (no versitygw on PATH; PASSED 8.2 s with `CONSTELLATION_VERSITYGW_BIN`), `lock-grant-dead-generation` (`designation.undelegate: directory … is not delegated`, 5.4 s; then PASSED 2/2, 10.1 s each), `delegate-backup-handoff-failover` (`a did not list b as its backup again within 90s of its upgrade`; then PASSED 2/2, 37.8 s / 114.5 s). Neither flake touches snapshots. Every plan 32 scenario passed first time: `snapsched` 381.1 s, `snapsched-s3-outage` 206.7 s, `snapsched-grace` 136.5 s, `snapsched-budget` 219.8 s, `snapsched-write-overhead` 400.2 s, `snapacct` 40.5 s, `snapshot-*`, `web-ui-smoke` |
 | `docker compose --profile test run --rm compliance` (private `SMOKE_IMAGE`, floci host port reset) | `== results: 8798 passed, 0 failed`, `COMPLIANCE TEST PASSED (baseline: 0 known failures)`, scheduler `enabled=true ticks=16 policy_roots=0` |
 | `bash tests/webui-headless.sh` (`CHROME_BIN` = Chromium from `zenika/alpine-chrome` in docker) | `PASS: webui-headless` |
+
+## Plan 37 K6 — Credentials, security, drain, purge, GC (K6 closed)
+
+Milestone K6 of [plan 37](wip/37-kubernetes-csi.md) (§15), in two chunks:
+37-k6a (credentials and security, merged as d1e56cd) and 37-k6b (engine-pod
+idle GC, node drain, the controller's purge worker, the K6 gate). The
+plan's §7 "Ownership and GC" / "Drain", §"Deletion and purge" and §9 carry
+*As built* notes for both.
+
+### 37-k6a — credentials and security (d1e56cd)
+
+| Item | State | Where |
+|---|---|---|
+| Credentials reach an engine pod only as `fs.unlock` over its control socket: `serve --await-unlock` answers only `node.ping` and `fs.unlock` until unlocked (checked against the bucket, an E2E passphrase against the keyring), then starts on the same socket; no Secret, env var or file carries them (K2's per-pool Secret and the controller's Secret writes are gone) | DONE | `crates/cli/src/serve.rs`, `crates/csi/src/credentials.rs`, `crates/csi/src/engine_pods.rs` |
+| Three `credentialSource`s: `static-ephemeral` (the request's secret), `refreshing` (a watched Secret pushed to running engines, RBAC by `resourceNames` only), `aws-default-chain` (IRSA / Pod Identity); a rotation is probed against S3 before it replaces the working pair, in place, no remount | DONE | `crates/csi/src/params.rs`, `credentials.rs`, `crates/engine/src/backend.rs` |
+| Handoff `Credentials` phase: a standby gets its credentials from the old engine before anything pauses, only for the `csi-node-plugin` service principal and only while a handoff is pending | DONE | `crates/cli/src/handoff_socket.rs`, `crates/control/src/handoff_wire.rs`, `crates/csi/src/node/handoff.rs` |
+| S3 error bodies cut to their code (no key id / string to sign in any log or event); core dumps off in engines and plugins; a waiting engine stops on `SIGTERM` | DONE | `crates/store-s3/src/aws_auth.rs`, `crates/platform` |
+| Labelled service grants (`csi-node-plugin`, `csi-controller`); every CSI call carries the PV as `on_behalf_of` in the audit log | DONE | `crates/control/src/audit.rs`, `crates/csi/src/engine_pods.rs` |
+| Controller-owned engine pods PodSecurity-`restricted` (emptyDir state, no init container) | DONE | `engine_pods.rs`, `templates/exec-policy.yaml` |
+| Scenarios: `harness run csi-credential-revocation` (versitygw), `k8s-scenario csi-secret-rotation`, `csi-pod-security` | DONE | `crates/harness/src/scenarios.rs`, `crates/harness/src/k8s/scenarios.rs` |
+
+### 37-k6b — idle GC, drain, purge
+
+| Item | State | Where |
+|---|---|---|
+| **Idle GC** in the node plugin: every `engineProfile.idleGcInterval` (30 s) a pass over the node's engine pods, found by their labels (a restarted plugin owns its predecessor's pods). A pod whose `last-view-count` has said 0 for longer than `engineProfile.idleTtl` (10 m; never counted: since its creation) is a candidate; under the unit's gate, held exclusively, it is asked `view.list` and kept if it serves any view (the 37-k3b review: never trust the annotation alone). A unit with a staged volume recorded, a pending rollout, or a busy gate is left alone. The controller-owned pods are exempt | DONE | `crates/csi/src/node/gc.rs`, `crates/csi/src/node/engines.rs` (`units`, `forget_unit`), `engine_pods.rs` (`NodeEnginePods`) |
+| **Collecting is `node.leave`, then the pod goes**: the engine flushes, releases its leases and tombstones its record; the spent node identity is moved aside atomically (`.left-<unit>-<ms>`), the unit's pods deleted, the identity removed; the next volume starts a fresh node. A refused leave keeps the pod for the next pass; an engine still waiting for its credentials, or a pod that is not ready, is deleted without a leave and keeps its identity | DONE | `gc.rs`, `engine_pods.rs` (`forget_unit`) |
+| **Drain**: the GC pass also reads the node — cordoned, `ToBeDeletedByClusterAutoscaler`, `node.kubernetes.io/out-of-service`, or being deleted makes every engine pod with no view left due at once. A `PodDisruptionBudget` refuses every eviction of a node-owned engine pod, so `kubectl drain` evicts the workloads first and completes once the plugin has collected the engines. `preStop` (`constellation-csi --node --pre-stop`) returns at once unless the node drains, else waits (≤ `node.drain.preStopTimeoutSeconds`, 300 s) for the node to have no engine pod | DONE | `gc.rs` (`pre_stop`), `templates/engine-pdb.yaml`, `templates/node.yaml`, `crates/csi/src/main.rs` |
+| **Purge worker** in the controller replica holding the `constellation-csi-purge` Lease (its own election, 15 s / 5 s): every `purge.interval` (5 m) each pool's `/.trash`, through its controller-owned pod (never started for it), entries older than `purge.grace` (1 m, by the timestamp in the name) walked depth first and removed a file at a time, paced per pool by `purge.opsPerSecond` (500) and `purge.bytesPerSecond` (256 Mi) with `purge.maxConcurrentDeletes` (4) in flight; a task per pool, a pool never started twice. Resumable and idempotent: no state but `/.trash` itself (a crash mid-entry leaves a smaller subtree, the next pass finishes it; `NotFound` is done) | DONE | `crates/csi/src/purge.rs`, `templates/controller.yaml`, `values.yaml` |
+| GC interaction: the purge touches no quota (released at `DeleteVolume`) and deletes no S3 object; the chunks become the engine GC's | DONE | `purge.rs` (module docs), checked by `csi-trash-purge-under-load` |
+| **Registry sweep** after each pass (the 37-k6a review's churn): records with the controller-owned pod's hostname but not its node id (earlier emptyDir incarnations), and `csi-node-*` records of nodes that no longer exist, retired by admin `node.leave` (refused while the dead node's lease is live, retried). Node-owned pods set `spec.hostname` = `csi-node-<node head>-<hash>`: the default hostname (the pod name cut to 63 bytes) loses the node — the first kind run retired a live node's record that way | DONE | `purge.rs` (`sweep_registry`), `engine_pods.rs` (`node_engine_hostname`, `pod_hostname`) |
+| **Controller-owned pod lifecycle** (K5a left it open): reaped once its pool has been empty (no `/volumes`, no `/.trash`) over two passes and at least a minute, re-checked under its bring-up lock (a `CreateVolume` finds a new pool empty too — the first kind run reaped one mid-`CreateVolume`); replaced (leave, delete, re-create from its own spec with the new settings) when its engine settings drifted; every deliberate delete leaves the registry first. A `DeleteVolume` that started a pod and trashed a volume now leaves it up for the purge | DONE | `engine_pods.rs` (`PurgeBackend for EnginePodManager`, `controller_replacement`, `drifted_from`, `retire`), `controller.rs` |
+| Both plugins stop on `SIGTERM`/`SIGINT` (they are PID 1 and handled none: every pod deletion waited out its grace, now 330 s for the node plugin) | DONE | `main.rs` (`stop_signal`) |
+| RBAC: node `nodes` get; controller `nodes` list and `leases` get/create/update | DONE | `templates/rbac.yaml` |
+| `ControlClient` gains `browse_readdir`/`browse_stat`/`browse_delete`/`node_id`/`peers_list`; the in-memory fake models files, deletes (with injected failures), node ids, peers and admin leaves | DONE | `crates/csi/src/control_client.rs`, `control_client/{socket,fake}.rs` |
+| Scenarios `csi-node-drain`, `csi-trash-purge-under-load`; the harness installs the chart with the lifecycle on scenario timescales (idle TTL 60 s, purge every 10 s, 5 s grace, 500 ops/s, 16 MiB/s, 8 in flight) | DONE | `crates/harness/src/k8s/lifecycle.rs`, `k8s.rs`, TESTING.md |
+| `tests/csi/podsecurity-check.sh`: kube-bench-style check of §9's privilege split | DONE | `tests/csi/`, TESTING.md |
+
+### Decisions taken here (the brief left them open)
+
+- **Idle GC leaves the registry** rather than only deleting the pod (§7
+  said "deletes"): a deleted-but-enrolled pod is a write-eligible roster
+  member that may never return. The cost is a cold replica for the next
+  volume of that pool on that node; identity still survives crashes and
+  handoffs.
+- **The purge is a walk, not `browse.delete{recursive}`**: the only way to
+  honour bytes/s and ops/s budgets and to resume mid-entry. The one
+  exception is a directory whose listing exceeds a control frame (no
+  paging, ~90 000 entries), removed with one recursive delete and logged.
+- **The drain ordering is a PodDisruptionBudget** (integer `minAvailable`
+  no count reaches; bare pods allow no other form). `kubectl drain` needs
+  `--force` for engine pods because they have no controller; without it
+  the drain refuses to start rather than half-draining.
+- **Purge leadership is this binary's own Lease**, not Constellation's
+  `singleton` (settled decision 19) and not the sidecars' leases.
+- **The reap waits** (two passes, ≥ 1 min) and re-checks under the pod's
+  bring-up lock, after the first kind run reaped a pool's pod between a
+  `CreateVolume`'s calls.
+- **The many-small-files case uses empty files** (100 directories × 1000):
+  the purge's cost is per entry; a 16-byte file adds a chunk PUT each,
+  which made the fill take an hour at load 150 and is no purge cost.
+- **The harness scenarios set `fsGroupChangePolicy: OnRootMismatch` on the
+  filler**: kubelet re-applies a pod's fsGroup on every republish
+  (`requiresRepublish`), walking the whole volume — 40 000 chowns through
+  FUSE mid-fill swamped the engine in one run. Workloads with large
+  volumes should do the same (K7's how-to).
+- `layout: dedicated` `DeleteVolume` stays `FAILED_PRECONDITION` (message
+  reworded): removing a filesystem's bucket prefix is no control operation.
+
+### Findings (not fixed here)
+
+- `browse.readdir` has no paging: a directory over ~90 000 entries cannot be
+  listed in one frame (the purge falls back to a recursive delete for it).
+- The many-files purge ran at 400–870 deletes/s through the exec relay
+  (stat + unlink per file), under its budget; the engine, not the pace,
+  was the limit at 1000/s.
+- Root harness runs on this host leave root-owned
+  `/tmp/.constellation-snap-busy-c{0,1}.key` behind (another agent's run at
+  10:10); `snapshot-busy-latency` then fails "no fast path" for every
+  unprivileged run until they are removed.
+
+### PodSecurity check (`tests/csi/podsecurity-check.sh`, final kind cluster)
+
+```
+== staging a volume of psc on kind-37-k6b-worker (namespace psc-…)
+== plan 37 §9 privilege split, namespace constellation-csi
+[PASS] 1.1 constellation-csi-node-…: constellation-csi is privileged (CAP_SYS_ADMIN for fuse_mount_fd and bind mounts)
+[PASS] 1.2 constellation-csi-node-…: Bidirectional propagation on exactly plugin-dir, kubelet-dir, host-root
+[PASS] 1.3 constellation-csi-node-…: every sidecar unprivileged, no escalation, ALL dropped, nothing added
+[PASS] 1.4 constellation-csi-node-…: no host network, PID or IPC namespace
+        (1.1-1.4 for each of the 3 node-plugin pods)
+[PASS] 2.1 constellation-csi-controller-…: runs as non-root uid 65532 under RuntimeDefault seccomp
+[PASS] 2.2 constellation-csi-controller-…: every container unprivileged, no escalation, ALL dropped, nothing added, read-only root
+[PASS] 2.3 constellation-csi-controller-…: no hostPath volume, no host namespace
+        (2.1-2.3 for each of the 2 controller replicas)
+[PASS] 3.1-3.4 constellation-engine-pool-…-controller: non-root 65532, RuntimeDefault; no token, the engine ServiceAccount; no host namespace, no init container, one container; restricted's container rules
+[PASS] 3.5 constellation-engine-pool-…-controller (controller-owned): emptyDir volumes only — no hostPath
+[PASS] 3.1-3.4 constellation-engine-pool-…-kind-37-k6b-worker: (as above)
+[PASS] 3.6 … (node-owned): hostPaths only <hostRoot>/{node-identity,sockets,policy}/<its unit>, type Directory
+[PASS] 3.7 … (node-owned): the policy hostPath (its grant) is mounted read-only
+[PASS] 4.1 the privileged containers are exactly the node plugins' constellation-csi containers
+[PASS] 4.2 no container anywhere adds a capability
+== Summary: 31 checks PASS, 0 checks FAIL
+```
+
+A negative control (`CSI_HOST_ROOT=/elsewhere`) fails 3.6 and exits 1.
+
+### Scenario summary (final run: fresh `kind-37-k6b`, image `constellation-csi:k6b-5`)
+
+| Scenario | Result |
+|---|---|
+| `csi-node-drain` | PASSED 57.7 s: `kubectl drain --ignore-daemonsets --delete-emptydir-data --force` of the worker holding the mounted PV completed in 10.4 s; the pod moved with its data; the drained engine (registry id 2) left the roster ("draining" in the plugin's log), no engine pod or identity left on the worker, none came back after the uncordon |
+| `csi-trash-purge-under-load` | PASSED 426.5 s: del-big 64 MiB in 4.0 s (16.7 MB/s, budget 16 MiB/s), del-many 100 101 ops in 248.6 s (403/s, budget 500/s, no fallback), del-small 11 ops; all purged 263 s after the delete (deadline 686 s); writers 1743 and 1267 iterations, longest 2.2 s and 2.9 s, zero errors, data intact; GC: 0 of del-big's 64 chunks unreferenced before, 64 of 64 after, chunk objects 669 → 6094 (none deleted by the purge) |
+| `csi-pod-rw`, `csi-rwx-across-nodes`, `csi-many-pvs-one-pool`, `csi-plugin-restart-survives`, `csi-snapshot-clone-mount`, `csi-clone-cross-pool-refused`, `csi-secret-rotation`, `csi-pod-security` | PASSED (38.8 s, 51.0 s, 131.3 s, 73.5 s, 115.9 s, 172.5 s, 46.8 s, 47.9 s) with the K6b lifecycle on (idle TTL 60 s, purge every 10 s) |
+
+### Gates (37-k6b worktree, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `k6b`, `TMPDIR=/var/tmp/k6b/tmp`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean, clean |
+| `cargo test --workspace` (in package groups under the 600 s tool cap, `--no-fail-fast`) | **2508 passed, 0 failed**, 49 ignored |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `tests/integration.sh` | its floci could not bind 4566 (held by another agent's `32-m3a-…-floci-1`); the script's body (`tests/smoke.sh s3://constellation-ci/k6b-run-…` with its `AWS_*`) against that endpoint: SMOKE TEST PASSED |
+| `target/release/harness run --shard {1,2,3,4}/4` (211 scenarios) | 195 PASSED, 9 FAILED, 7 SKIPPED (root-only). Re-run in isolation: `snapshot-busy-latency` (root-owned `/tmp/.constellation-snap-busy-c{0,1}.key` left by another agent's 10:10 sudo run; removed → 3/3 PASSED), `csi-credential-revocation` (needs native versitygw; with `CONSTELLATION_VERSITYGW_BIN` → PASSED), `readahead-adaptive`, `holder-crash-phantom-new-holder` → PASSED. Known: `fuse-inval-storm` (zombie holder, kernel-inval thread in `fuse_reverse_inval_entry`). Pre-existing, also failing on a `git archive` build of d1e56cd: `takeover-marker-strands-promptly` (2/5 there, 3/5 here; "the first segment of the new epoch must be B's empty marker; it is node 2, epoch 2, 1 record"), `fsyncdir-barrier` (ENOENT at its rename/`fsync(dir)` step, deterministic on both), `distant-bigfile-stable` (worst 4 MiB block 8.5–9.7 MiB/s against a 10 MiB/s floor at load 50–90, on both). Load-sensitive: `sqlite-first-touch-latency` failed 2/6 at load 50–70 ("no such table", "database is locked"), passed 3/3 at load ~30 (d1e56cd 4/4 at ~30). This chunk changes no code on the `harness run` path (only `crates/csi` and the harness's `k8s` module) |
+| `sudo env -u XDG_RUNTIME_DIR HOME=/root … CONSTELLATION_HARNESS_DOCKER_PREFIX=k6b-root harness run subtree-confinement passthrough-…` (the 7 skipped + subtree-confinement) | 8 PASSED; no root-owned file left in `/tmp/.constellation-*.key` or under `$HOME` |
+| `docker compose -p k6bc -f docker-compose.yml -f <floci ports reset> --profile test run --rm compliance` (`SMOKE_IMAGE=k6b-smoke:local`) | **8798 passed, 0 failed**, COMPLIANCE TEST PASSED (baseline: 0 known failures) |
+| `target/release/harness k8s-scenario --all --kubeconfig <fresh kind-37-k6b> --image constellation-csi:k6b-5` | **10 PASSED**, ALL K8S SCENARIOS PASSED (table above) |
+| `PSC_STORAGE_CLASS=psc tests/csi/podsecurity-check.sh` (same cluster) | 31 PASS, 0 FAIL (output above) |
+| `kind delete cluster --name kind-37-k6b` | deleted |
+
+### Exit criteria (plan 37 §15 K6)
+
+- [x] `EphemeralSecretStore` wiring for all three `CredentialSource`s, the secret-rotation scenario, the service-principal grant, PodSecurity posture (37-k6a; `csi-secret-rotation`, `csi-pod-security`, `csi-credential-revocation` pass).
+- [x] Secret RBAC: only the watched Secrets, by name (37-k6a).
+- [x] Engine-pod idle GC per §7 (re-checked with `view.list`, never while a view is mounted, controller-owned pods exempt, ownership recovered from labels after a plugin restart).
+- [x] Node drain (`preStop` and the node watch → `node.leave`, views block until the workloads are evicted): `csi-node-drain` passes with a clean roster and no ghost engine pod.
+- [x] Purge worker and controller-owned engine pod per settled decision 19 and §"Deletion and purge" (listing, rate limiting, resumable, GC interaction): `csi-trash-purge-under-load` passes, the 100 000-file trashed volume included.
+- [x] Carried: idle GC never trusts `last-view-count` alone (37-k3b); controller-owned pods' lifecycle decided (reap when empty, plain replacement on drift; K5a); dead registry records of rescheduled controller-owned pods GC'd (37-k6a review).
+- [x] kube-bench-style PodSecurity check (`tests/csi/podsecurity-check.sh`) confirms the privilege split of §9 exactly.
+- [x] CONVENTIONS gates (above; every harness failure re-run and explained: environmental, known, or failing identically on d1e56cd).
+
+### Review round 1 (37-k6b review 20261003-183158, verdict fix)
+
+- **Must 1, a controller-owned pod deleted outside the purge worker
+  stranded its pool's trash**: the purge worker now derives its pools from
+  the cluster (`PurgeBackend::pools`: this driver's PVs and classes, the
+  `constellation-csi-pools` ConfigMap that `DeleteVolume` writes before it
+  trashes and every pass refreshes from the PVs, plus the controller-owned
+  pods that are up), and brings up the controller-owned pod of any pool
+  with volumes or trash that has none. A reaped pool's record goes with
+  its pod. `csi-node-drain` now also drains the worker running the pool's
+  controller-owned pod right after a delete into the trash and asserts the
+  pod comes back elsewhere, the entry is purged by the new incarnation,
+  and the drained incarnation's registry record is retired.
+- **Should 1, the reap/roll lock covered one replica**: every RPC holds
+  the pod it calls into (`constellation.dev/held-by-<replica>` annotation,
+  compare-and-swap on the pod's resourceVersion, renewed while used); a
+  reap, roll or a delete's retire first marks the pod
+  (`constellation.dev/retiring`, compare-and-swap too, refused while
+  another replica's hold is live), and only then re-checks and deletes. A
+  hold that finds a fresh mark waits for the pod to go (then starts it
+  again) or for the mark to lift; stale holds and marks expire
+  (`engine_pods/controller_pods.rs`). The exec policy allows the
+  annotations (metadata only). Every kind scenario ran with the chart's
+  two controller replicas.
+- **Should 2**: the recursive fallback fires only on `EOVERFLOW`; any other
+  listing failure leaves the entry for the next pass. `browse.readdir`
+  answers a missing path `NotFound` (engine control: was a bare `Failed`).
+- **Should 3**: the purge Lease follows client-go: each API call bounded by
+  `retryPeriod`, leadership derived from the local instant the last
+  successful write started (+ `renewDeadline`, read at use, so a hung call
+  ends it on time), a rival's record taken only once seen unchanged for
+  `leaseDuration` by the local clock. Timings from
+  `controller.leaderElection.*`.
+- **Should 4**: a pod a `DeleteVolume` started stays up only when the purge
+  worker runs (`ControllerConfig::purge_worker`).
+- **Should 5**: idle GC moves the identity aside (`.leaving-<unit>`,
+  stamped) before `node.leave` and back on a refused leave; each pass first
+  settles identities left aside (enrolled: back; left: forgotten; no
+  engine to ask, or five minutes of no answer: forgotten).
+- **Nits**: `reap` attaches to the marked pod for its re-check and leave
+  (no skipped check without a cached relay); `leases` narrowed to
+  `resourceNames: [constellation-csi-purge]` for get/update (create cannot
+  be narrowed), the ConfigMap the same way; `not_found` is
+  `ErrorKind::NotFound` only; `pre_stop` waits only on a condemned node
+  (deleted, deletion taint, out of service), not on a plain cordon;
+  `csi-trash-purge-under-load` checks, inside the grace window, that all of
+  del-big's chunks are still referenced while it sits whole in the trash,
+  and bounds a writer stall at 10 s; `podsecurity-check.sh` 3.6 compares the
+  exact hostPath set (no vacuous pass), 1.5 asserts the node plugin's
+  root, 1.6 its exact hostPath set.
+
+Gates (round 1): `cargo fmt --all -- --check` clean; `cargo clippy
+--workspace --all-targets -- -D warnings` clean; `cargo test -p
+constellation-csi -p constellation-harness -p constellation-control`
+(162 + 72 + 140 + small binaries, 0 failed) and `-p constellation-engine`
+(560 passed, 0 failed); `bash tests/smoke.sh` PASSED; on a fresh
+`kind-37-k6b` with `constellation-csi:k6b-r5`, `harness k8s-scenario` in
+three runs (each call is capped at 10 min) covering all ten:
+`csi-trash-purge-under-load` PASSED 431.7 s (del-many 100 101 ops in
+233 s, 429/s, no fallback; del-big 16.7 MB/s against 16 MiB/s; all purged
+302.9 s after the delete; longest writer iterations 359/365 ms; del-big's
+64 chunks referenced while trashed), `csi-node-drain` PASSED 115.0 s
+(controller-owned pod back on the other worker, entry purged through it,
+registry id 4 retired), `csi-pod-rw`, `csi-rwx-across-nodes`,
+`csi-pod-security`, `csi-plugin-restart-survives`, `csi-many-pvs-one-pool`,
+`csi-snapshot-clone-mount`, `csi-clone-cross-pool-refused`,
+`csi-secret-rotation` PASSED; `PSC_STORAGE_CLASS=psc
+tests/csi/podsecurity-check.sh` 37 PASS, 0 FAIL (negative control
+`CSI_HOST_ROOT=/elsewhere`: 1.6 ×3 and 3.6 FAIL, exit 1); cluster deleted.
+Not re-run this round: the full `harness run` matrix, `compliance`,
+`tests/integration.sh` (no engine, CLI or FUSE path changed besides
+`browse.readdir`'s error kind).
+
+### Review round 2 (37-k6b re-review, verdict fix)
+
+- **Must 1, a StorageClass deleted before its PVCs stranded the trash**:
+  a pool record is now built from the PV itself
+  (`PoolRecord::from_pv`). The parameters come from
+  `spec.csi.volumeAttributes`, without the CO's `/` keys (external-provisioner
+  adds `storage.kubernetes.io/csiProvisionerIdentity` there). The secret comes
+  from the `volume.kubernetes.io/provisioner-deletion-secret-{name,namespace}`
+  annotations. The class is read only for what the PV lacks. A pool PV of
+  this driver that yields no record is logged at `warn`, and so is a
+  record written without credentials. `DeleteVolume` reads its own PV
+  (one `get`, not a list of every PV) and lists PVs only when that PV is
+  missing. On the cluster, external-provisioner v6.3.0 sets both
+  annotations. `csi-node-drain` now deletes the scope's StorageClass before
+  it deletes the doomed PVC. It then asserts the pool record (fs uuid,
+  bucket and secret) and drains the controller-owned pod's node. The pod is
+  brought back without any class, and the entry is purged through it. The
+  class is put back afterwards.
+- **Should 1, stale `recorded` cache**: the cache is gone, and every
+  `DeleteVolume` merge-patches its record before it trashes.
+- **Should 2, retire not fenced**: just before `node.leave`, the retire
+  renews its mark with a compare-and-swap. The renewal happens only while
+  the mark is still its own, fresh by its own clock (TTL, no skew), and no
+  other hold is live. The delete then carries `Preconditions {
+  resourceVersion, uid }` from that write. On a conflict, the pod is
+  re-read and the delete retried only if the same conditions still hold
+  (`delete_fenced`). Other replicas honour a mark for `RETIRING_TTL +
+  HOLD_SKEW` (`retiring_by`).
+- **Should 3, unbringable records**: a recorded pool can fail to come up
+  in `GIVE_UP_PASSES` (3) passes in a row spanning `GIVE_UP_AFTER` (1 h).
+  If no PV names it, its record is dropped with a `warn` naming the bucket
+  and prefix whose trash stays behind. Its pod is retired too, unless held.
+  The PVs are re-checked before the drop. A pass that could not list the
+  PVs drops nothing. Pools now come up concurrently (up to 8), so one
+  failing pool no longer delays the others by `readyTimeout`.
+- **Should 4, superseded aside identity**: each settle pass first calls
+  `NodeEngines::discard_superseded_aside`. When `node-identity/<unit>`
+  exists next to `.leaving-<unit>`, the aside directory belongs to an older
+  incarnation:
+  - It is renamed to `.left-<unit>-<ms>-s` and logged as a possible ghost
+    record.
+  - It is removed at once unless a pod of the unit older than the move may
+    still mount it. In that case `forget_unit` removes it later.
+
+  The fresh identity and its pod are left alone, whether the fresh engine
+  is enrolled yet or not, because the aside identity can never come back.
+  `restore_identity` now errors instead of returning `Ok` without doing
+  anything when a fresh identity is in place. Test:
+  `an_identity_aside_superseded_by_a_fresh_one_is_retired`.
+- **Nits**:
+  - `expect_no_engine_return` has its doc comment back.
+  - `hold()` takes its fast path only when the pod it read carries this
+    replica's hold, so a recreated pod gets the hold written again.
+  - The purge worker's clients now hold their pods, renewed through long
+    passes and dropped before a reap or roll.
+  - The registry sweep judges only hostnames of the exact
+    `node_engine_hostname` shape (`csi-node-[<head>-]<10 hex>`); a mount
+    named just `csi-node-…` is not judged.
+  - Listing every PV on each delete: see Must 1.
+
+Gates (round 2), run from this worktree with `CARGO_TARGET_DIR` unset and
+`ulimit -n` 65536:
+- `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+  -- -D warnings`: both clean.
+- `cargo test -p constellation-csi -p constellation-harness -p
+  constellation-control -p constellation-engine`: 0 failed. csi 163,
+  harness 72, control 153, engine 560 (9 ignored), plus the small binaries.
+- `bash tests/smoke.sh`: SMOKE TEST PASSED.
+- On a fresh `kind-37-k6b` (`tests/csi/kind-up.sh`, image
+  `constellation-csi:k6b-r6`, two controller replicas), `harness
+  k8s-scenario --kubeconfig … --image constellation-csi:k6b-r6` ran in four
+  calls (each under the 10 min tool cap) and covered all ten scenarios:
+  - `csi-node-drain`: PASSED in 120.0 s. The pool was recorded with the
+    class gone, the pod came back on the other worker, the entry was purged
+    through it, and registry id 4 was retired.
+  - `csi-trash-purge-under-load`: PASSED in 545.1 s.
+    - del-many: 100 101 ops in 281.6 s.
+    - del-big: 16.6 MB/s.
+    - All three entries were purged 351.6 s after the delete (deadline
+      741 s).
+    - The longest writer iterations were 4.5 s and 9.4 s, both before the
+      delete, during the fill. Zero errors.
+  - `csi-pod-rw`, `csi-rwx-across-nodes`, `csi-many-pvs-one-pool`,
+    `csi-plugin-restart-survives`, `csi-pod-security`,
+    `csi-snapshot-clone-mount`, `csi-clone-cross-pool-refused` and
+    `csi-secret-rotation`: all PASSED.
+- `PSC_STORAGE_CLASS=psc tests/csi/podsecurity-check.sh` on the same
+  cluster, with a private floci and a `psc` class: 37 PASS, 0 FAIL.
+- The cluster was deleted.
+
+Not re-run this round: the full `harness run` matrix, `compliance` and
+`tests/integration.sh`. The coordinator's gate list for this round leaves
+them out, and this round changes only `crates/csi`, the harness `k8s`
+module and docs.

@@ -97,6 +97,20 @@ pub const K8S_SCENARIOS: &[K8sScenario] = &[
         }),
     },
     K8sScenario {
+        name: "csi-node-drain",
+        desc: "kubectl drain of the worker holding a mounted PV: the pod moves to the other worker with its data, the drained worker's engine pod leaves the pool's registry before it goes (no ghost roster entry), no engine pod or node identity is left on it; then the worker running the pool's controller-owned engine pod is drained right after a delete into the trash made with the StorageClass already deleted: the pool is recorded from the PV itself, and the purge worker brings the pod back elsewhere, purges through it and retires the drained incarnation's record",
+        workers: 2,
+        run: super::lifecycle::csi_node_drain,
+        gate: None,
+    },
+    K8sScenario {
+        name: "csi-trash-purge-under-load",
+        desc: "three PVs of one pool deleted (a few small files, 64 MiB, 100 000 empty files in 100 directories) while two others are written on both workers: every trash entry purged within the purge budgets, the writers never fail nor stall, GC finds the purged chunks unreferenced only after the purge, which itself deleted no S3 object",
+        workers: 2,
+        run: super::lifecycle::csi_trash_purge_under_load,
+        gate: None,
+    },
+    K8sScenario {
         name: "csi-pod-security",
         desc: "the privilege split of plan 37 §9, as PodSecurity admission judges it (server dry runs in a `restricted` namespace): controller and controller-owned engine pod admitted, node-owned engine pods refused for their hostPaths only, the node plugin refused as privileged",
         workers: 1,
@@ -699,7 +713,7 @@ fn logged_clone_ms(log: &str, subtree: &str) -> Option<u64> {
         })
 }
 
-fn strip_ansi(s: &str) -> String {
+pub(super) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

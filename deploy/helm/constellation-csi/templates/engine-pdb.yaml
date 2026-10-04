@@ -1,0 +1,30 @@
+{{- /*
+Plan 37 §7 "Drain" (K6b): a node-owned engine pod is never evicted. It
+holds its node's FUSE sessions, and it must leave the pool's registry
+before it goes, which only its node plugin can ask it to do once no view is
+left (crates/csi/src/node/gc.rs). So every eviction of one is refused —
+`kubectl drain` retries a refused eviction until the pod is gone, which is
+the plugin's doing: it watches its node, and once the drain has evicted the
+workloads (kubelet unstages their volumes through the plugin) it has each
+idle engine pod leave and deletes it. A DELETE is not an eviction; the
+plugin, an operator and kubelet's own node-pressure and shutdown handling
+are not held back.
+
+Engine pods are bare pods (no controller), for which a budget can only be
+an integer `minAvailable`: one no count of engine pods reaches, so the
+budget never allows a disruption.
+*/}}
+{{- if .Values.node.drain.engineDisruptionBudget }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: constellation-csi-node-engines
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1000000
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: engine
+      constellation.dev/owner: node
+{{- end }}

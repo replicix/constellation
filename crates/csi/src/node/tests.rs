@@ -1659,3 +1659,270 @@ async fn publish_unpublish_and_stats_wait_for_a_running_handoff() {
     drop(held);
     assert!(health.await.is_empty());
 }
+
+// ---- plan 37 §7: idle GC and drain (37-k6b, `gc`) ----
+
+fn gc_cfg() -> gc::GcConfig {
+    gc::GcConfig {
+        interval: Duration::from_secs(1),
+        idle_ttl: Some(Duration::from_secs(600)),
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// §7: a pod that has served nothing for longer than the TTL leaves the
+/// registry and goes; before the TTL, or while a volume is staged, it
+/// stays. Its next volume starts a new pod (a new node).
+#[tokio::test]
+async fn an_idle_engine_pod_leaves_the_registry_after_the_ttl() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    let staging = rig.staging();
+    rig.stage(&staging).await.unwrap();
+    let unit = rig.unit();
+    // Staged: never a candidate, however late.
+    let done = rig.node.gc_once(&gc_cfg(), now() + 100_000).await;
+    assert!(done.is_empty(), "{done:?}");
+    rig.unstage().await.unwrap();
+    assert_eq!(rig.engines.view_count(&unit), Some(0));
+    // Idle, but not for long enough.
+    assert!(rig.node.gc_once(&gc_cfg(), now() + 10).await.is_empty());
+    assert!(control.leaves().is_empty());
+    // Past the TTL: it leaves (self-leave), then the unit is forgotten.
+    let done = rig.node.gc_once(&gc_cfg(), now() + 601).await;
+    assert_eq!(done, vec![(unit.clone(), gc::Collected::Left)]);
+    assert_eq!(control.leaves(), vec![None]);
+    assert_eq!(rig.engines.forgotten(), vec![unit.clone()]);
+    assert!(!rig.engines.is_running(&unit));
+    // Nothing left to collect; the next stage starts a new pod.
+    assert!(rig.node.gc_once(&gc_cfg(), now() + 10_000).await.is_empty());
+    let started = rig.engines.started();
+    rig.stage(&staging).await.unwrap();
+    assert_eq!(rig.engines.started(), started + 1);
+    // TTL 0: idle pods stay.
+    rig.unstage().await.unwrap();
+    let off = gc::GcConfig {
+        idle_ttl: None,
+        ..gc_cfg()
+    };
+    assert!(rig.node.gc_once(&off, now() + 100_000).await.is_empty());
+}
+
+/// The 37-k3b review: the annotation is never trusted alone. A pod whose
+/// count says 0 but which serves a view (a lost patch) is kept.
+#[tokio::test]
+async fn an_idle_annotation_is_checked_against_view_list() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    rig.stage(&rig.staging()).await.unwrap();
+    let unit = rig.unit();
+    // The view count's patch was lost, and the record too (a restarted
+    // plugin, say): only the engine knows it serves a view.
+    rig.engines.set_view_count(&unit, 0).await.unwrap();
+    rig.node.state.remove(&volume_id()).unwrap();
+    let done = rig.node.gc_once(&gc_cfg(), now() + 601).await;
+    assert!(
+        matches!(&done[..], [(u, gc::Collected::Kept(why))] if *u == unit && why.contains("view")),
+        "{done:?}"
+    );
+    assert!(control.leaves().is_empty());
+    assert!(rig.engines.is_running(&unit));
+}
+
+/// §7 "Drain": on a draining node an engine pod with no view left leaves
+/// at once, whatever the TTL; one still serving a volume blocks until it is
+/// unstaged.
+#[tokio::test]
+async fn a_draining_node_collects_its_engines_once_their_views_are_gone() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    rig.stage(&rig.staging()).await.unwrap();
+    let unit = rig.unit();
+    rig.engines.set_draining(true);
+    assert!(rig.node.gc_once(&gc_cfg(), now()).await.is_empty());
+    assert!(control.leaves().is_empty());
+    // Merely cordoned, the plugin stopping is a rollout of it: its preStop
+    // does not wait for the volume, which stays staged.
+    gc::pre_stop(rig.engines.as_ref(), Duration::ZERO)
+        .await
+        .unwrap();
+    // Going for good, the pre-stop hook waits while the pod is there.
+    rig.engines.set_drain(Drain::Condemned);
+    let waited = tokio::time::timeout(
+        Duration::from_millis(300),
+        gc::pre_stop(rig.engines.as_ref(), Duration::from_secs(60)),
+    )
+    .await;
+    assert!(waited.is_err(), "preStop must wait for the engine pod");
+    rig.unstage().await.unwrap();
+    let done = rig.node.gc_once(&gc_cfg(), now()).await;
+    assert_eq!(done, vec![(unit.clone(), gc::Collected::Left)]);
+    assert_eq!(control.leaves(), vec![None]);
+    gc::pre_stop(rig.engines.as_ref(), Duration::from_secs(1))
+        .await
+        .unwrap();
+    // Not draining: preStop returns at once even with pods around.
+    rig.engines.set_draining(false);
+    rig.plant().await;
+    gc::pre_stop(rig.engines.as_ref(), Duration::ZERO)
+        .await
+        .unwrap();
+}
+
+/// The identity moves aside before the leave, and back when the leave is
+/// refused (the 37-k6b review: a stop between the leave and the cleanup
+/// must not leave a retired identity in place).
+#[tokio::test]
+async fn the_identity_is_aside_through_the_leave_and_back_if_refused() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    rig.stage(&rig.staging()).await.unwrap();
+    rig.unstage().await.unwrap();
+    let unit = rig.unit();
+    control.refuse_next_leaves(1);
+    let done = rig.node.gc_once(&gc_cfg(), now() + 601).await;
+    assert!(
+        matches!(&done[..], [(u, gc::Collected::Kept(why))] if *u == unit && why.contains("node.leave")),
+        "{done:?}"
+    );
+    assert!(rig.engines.aside().is_empty(), "restored after the refusal");
+    assert!(rig.engines.is_running(&unit));
+    let done = rig.node.gc_once(&gc_cfg(), now() + 601).await;
+    assert_eq!(done, vec![(unit.clone(), gc::Collected::Left)]);
+    assert!(rig.engines.aside().is_empty());
+    assert_eq!(rig.engines.forgotten(), vec![unit]);
+}
+
+/// A pass that ended with the identity aside is settled by the next: an
+/// engine that never left gets it back; one that left is forgotten; with
+/// no engine to ask, the unit is forgotten (a fresh node next).
+#[tokio::test]
+async fn an_identity_left_aside_is_settled_by_the_next_pass() {
+    // Stopped between moving it aside and the leave.
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    rig.stage(&rig.staging()).await.unwrap();
+    let unit = rig.unit();
+    rig.engines.set_identity_aside(&unit).await.unwrap();
+    let done = rig.node.gc_once(&gc_cfg(), now()).await;
+    assert!(
+        matches!(&done[..], [(u, gc::Collected::Kept(_))] if *u == unit),
+        "{done:?}"
+    );
+    assert!(rig.engines.aside().is_empty(), "the identity is back");
+    assert!(rig.engines.forgotten().is_empty());
+    assert!(control.leaves().is_empty());
+
+    // Stopped between the leave and the cleanup.
+    rig.unstage().await.unwrap();
+    rig.engines.set_identity_aside(&unit).await.unwrap();
+    control
+        .node_leave(constellation_control::proto::types::LeaveParams {
+            node_id: None,
+            force: false,
+        })
+        .await
+        .unwrap();
+    let done = rig.node.gc_once(&gc_cfg(), now()).await;
+    assert_eq!(done, vec![(unit.clone(), gc::Collected::Left)]);
+    assert_eq!(rig.engines.forgotten(), vec![unit.clone()]);
+    assert!(rig.engines.aside().is_empty());
+
+    // Aside with no engine at all to ask: forgotten.
+    rig.engines.set_identity_aside("gone-unit").await.unwrap();
+    let done = rig.node.gc_once(&gc_cfg(), now()).await;
+    assert_eq!(done, vec![("gone-unit".to_string(), gc::Collected::Left)]);
+    assert!(rig.engines.aside().is_empty());
+}
+
+/// An identity aside next to a fresh one (the plugin and the pod died
+/// mid-collect, and a stage started a pod on a new identity before the
+/// next pass) is an older incarnation's: retired once, the fresh one and
+/// its engine untouched, and no pass "restores" it again.
+#[tokio::test]
+async fn an_identity_aside_superseded_by_a_fresh_one_is_retired() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    rig.stage(&rig.staging()).await.unwrap();
+    let unit = rig.unit();
+    rig.engines.set_identity_aside(&unit).await.unwrap();
+    rig.engines.make_fresh_identity(&unit);
+    let done = rig.node.gc_once(&gc_cfg(), now()).await;
+    assert!(
+        matches!(&done[..], [(u, gc::Collected::Kept(why))] if *u == unit && why.contains("superseded")),
+        "{done:?}"
+    );
+    assert!(rig.engines.aside().is_empty());
+    assert_eq!(rig.engines.discarded(), vec![unit.clone()]);
+    assert!(
+        rig.engines.forgotten().is_empty(),
+        "the fresh identity stays"
+    );
+    assert!(rig.engines.is_running(&unit));
+    assert!(control.leaves().is_empty());
+    // Settled for good: the next pass has nothing aside to look at.
+    let done = rig.node.gc_once(&gc_cfg(), now()).await;
+    assert!(done.is_empty(), "{done:?}");
+    assert_eq!(rig.engines.discarded(), vec![unit]);
+}
+
+/// A pod still waiting for its credentials never joined the registry: it
+/// is deleted without a leave, and its identity kept.
+#[tokio::test]
+async fn an_engine_waiting_for_credentials_is_deleted_without_a_leave() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    assert!(control.is_gated());
+    let unit = rig.unit();
+    rig.engines.set_draining(true);
+    let done = rig.node.gc_once(&gc_cfg(), now()).await;
+    assert_eq!(done, vec![(unit, gc::Collected::Deleted)]);
+    assert!(control.leaves().is_empty());
+    assert!(rig.engines.forgotten().is_empty());
+}
+
+/// A unit busy with a stage (its gate held) is not collected in that pass.
+#[tokio::test]
+async fn a_busy_unit_is_left_for_the_next_pass() {
+    let rig = Rig::new();
+    let control = rig.plant().await;
+    rig.stage(&rig.staging()).await.unwrap();
+    rig.unstage().await.unwrap();
+    let unit = rig.unit();
+    let held = rig.node.shared_gate(&unit).await;
+    let done = rig.node.gc_once(&gc_cfg(), now() + 601).await;
+    assert!(
+        matches!(&done[..], [(_, gc::Collected::Kept(why))] if why.contains("busy")),
+        "{done:?}"
+    );
+    drop(held);
+    let done = rig.node.gc_once(&gc_cfg(), now() + 601).await;
+    assert_eq!(done, vec![(unit, gc::Collected::Left)]);
+    assert_eq!(control.leaves(), vec![None]);
+}
+
+#[test]
+fn gc_settings_come_from_the_environment() {
+    let cfg = gc::GcConfig::from_vars(|k| match k {
+        "CONSTELLATION_CSI_ENGINE_IDLE_TTL" => Some("45s".into()),
+        "CONSTELLATION_CSI_IDLE_GC_INTERVAL_S" => Some("5".into()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(cfg.idle_ttl, Some(Duration::from_secs(45)));
+    assert_eq!(cfg.interval, Duration::from_secs(5));
+    let off =
+        gc::GcConfig::from_vars(|k| (k == "CONSTELLATION_CSI_ENGINE_IDLE_TTL").then(|| "0".into()))
+            .unwrap();
+    assert_eq!(off.idle_ttl, None);
+    assert_eq!(
+        gc::GcConfig::from_vars(|_| None).unwrap(),
+        gc::GcConfig::default()
+    );
+}

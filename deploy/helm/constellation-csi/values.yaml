@@ -45,10 +45,19 @@ hostRoot: /var/lib/constellation-csi
 # Engine pods (plan 37 §7). The controller starts one controller-owned
 # engine pod per pool filesystem (K2); the node plugin starts one per pool
 # filesystem per node with a staged volume of it (K3). `resources`,
-# `readyTimeout` and `logLevel` apply to both; idleTtl (37-k6b) is not read
-# yet.
+# `readyTimeout` and `logLevel` apply to both.
 engineProfile:
+  # Plan 37 §7 (K6b): a node-owned engine pod that has served no volume for
+  # this long leaves the pool's registry and is deleted by its node plugin
+  # (never while a view is mounted: the plugin asks the pod first). The
+  # next volume of its pool on that node starts a new one, as a new node.
+  # A duration (90s, 10m, 1h); 0 keeps idle pods (a drain still collects
+  # them). The controller-owned pods are exempt: the purge worker reaps
+  # one once its pool has no volume left.
   idleTtl: 10m
+  # Seconds between the node plugin's idle-GC passes, which also notice a
+  # cordoned (draining) node.
+  idleGcInterval: 30
   # Plan 37 §8 (K5): when `image` or an engine setting here changes, each
   # node plugin replaces its engine pods one at a time by handing their
   # FUSE sessions to the replacement — a stall for writers, never ENOTCONN.
@@ -164,11 +173,23 @@ credentials:
   #   - {namespace: constellation-csi, name: constellation-s3-creds}
   watchedSecrets: []
 
-# Purge worker (controller; K4).
+# Purge worker (plan 37 §"Deletion and purge", K6b; crates/csi/src/purge.rs):
+# the controller replica holding the constellation-csi-purge Lease walks
+# every pool's /.trash every `interval` and removes the entries trashed
+# more than `grace` ago, a file at a time, through the pool's
+# controller-owned engine pod. The budgets are per pool: unlinks and rmdirs
+# per second, file bytes per second (0: unpaced), and unlinks in flight.
+# The worker brings back the pod of any pool with volumes or trash (a drain
+# or node loss takes it with nobody asking; the constellation-csi-pools
+# ConfigMap remembers the pools whose last PV is gone), and reaps the pod
+# of a pool left with neither. interval 0 turns the worker off (a pod a
+# DeleteVolume started is then stopped again right away).
 purge:
-  interval: 1h
-  grace: 24h
+  interval: 5m
+  grace: 1m
   maxConcurrentDeletes: 4
+  opsPerSecond: 500
+  bytesPerSecond: 256Mi
 
 controller:
   replicas: 2
@@ -178,6 +199,7 @@ controller:
   # (templates/exec-policy.yaml, plan 37 §9). Turn off only on clusters
   # older than 1.30.
   podAccessPolicy: true
+  # The sidecars' leader election, and the controller's own purge Lease.
   leaderElection:
     leaseDuration: 15s
     renewDeadline: 10s
@@ -210,6 +232,17 @@ node:
   # Mounts in running pods depend on the node plugin: schedule it first.
   priorityClassName: system-node-critical
   maxUnavailable: 1
+  # Plan 37 §7 "Drain" (K6b). `kubectl drain --ignore-daemonsets --force`
+  # evicts the workload pods but not the node-owned engine pods (a
+  # PodDisruptionBudget refuses their eviction): the node plugin, seeing the
+  # node cordoned, has each engine pod whose views are gone leave the
+  # pool's registry and deletes it, and the drain then completes. The
+  # plugin's preStop waits up to this long for the same on a draining node.
+  drain:
+    preStopTimeoutSeconds: 300
+    # The PodDisruptionBudget over node-owned engine pods. Turn off only if
+    # something else orders engine pods after their workloads.
+    engineDisruptionBudget: true
 
 # Log filter (RUST_LOG).
 logLevel: info

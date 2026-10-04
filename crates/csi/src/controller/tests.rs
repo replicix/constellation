@@ -402,7 +402,8 @@ fn dedicated_req(name: &str, required: i64) -> CreateVolumeRequest {
 }
 
 /// Should-fix 4 of the 37-k3a review: `layout: dedicated` creates a whole
-/// filesystem per volume (§2.3); deleting one waits for K6b's purge.
+/// filesystem per volume (§2.3); this driver does not delete filesystems
+/// (the purge worker empties pool trash only, 37-k6b).
 #[tokio::test]
 async fn a_dedicated_volume_is_a_filesystem_of_its_own() {
     let f = fixture();
@@ -461,10 +462,11 @@ async fn a_dedicated_volume_is_a_filesystem_of_its_own() {
         fs.quota_get("/").await.unwrap().max_bytes,
         Some(2 * GIB as u64)
     );
-    // No purge primitive yet: refused, clearly, and nothing is touched.
+    // Filesystems are never deleted: refused, clearly, and nothing is
+    // touched.
     let e = f.delete(&v.volume_id).await.unwrap_err();
     assert_eq!(e.code(), GrpcCode::FailedPrecondition, "{e}");
-    assert!(e.message().contains("K6b"), "{e}");
+    assert!(e.message().contains("does not delete filesystems"), "{e}");
     assert_eq!(record(&fs, "/").await[X_PV], "pvc-d");
 }
 
@@ -1414,10 +1416,15 @@ async fn a_repeated_delete_after_the_pv_is_gone_starts_no_engine() {
 }
 
 /// A delete that does need the engine (the PV still exists, no pod is up)
-/// starts it, and stops it again afterwards.
+/// starts it, and stops it again afterwards — unless it moved a volume
+/// into the trash and the purge worker runs: that pod stays for the worker
+/// (37-k6b), which reaps it once the pool is empty.
 #[tokio::test]
 async fn a_delete_that_needs_the_engine_starts_it_and_stops_it() {
-    let f = fixture();
+    let f = fixture_with(ControllerConfig {
+        purge_worker: true,
+        ..ControllerConfig::default()
+    });
     let v = f.create(create_req("pvc-1", GIB)).await.unwrap();
     let s = f.snapshot("snap", &v.volume_id).await.unwrap();
     let uuid = VolumeId::parse(&v.volume_id).unwrap().fs_uuid().to_string();
@@ -1431,9 +1438,21 @@ async fn a_delete_that_needs_the_engine_starts_it_and_stops_it() {
     let starts = f.engines.starts();
     f.delete_snapshot(&s.snapshot_id).await.unwrap();
     assert!(fs.snapshots().is_empty(), "the snapshot is deleted");
+    assert_eq!(
+        f.engines.retires(),
+        1,
+        "the snapshot's delete stopped its pod"
+    );
+    assert!(!f.engines.is_running(&uuid));
     f.delete(&v.volume_id).await.unwrap();
     assert!(!fs.exists("/volumes/pvc-1"), "the volume is trashed");
     assert_eq!(f.engines.starts(), starts + 2);
+    assert_eq!(f.engines.retires(), 1, "a pod with trash to purge stays");
+    assert!(f.engines.is_running(&uuid));
+    // A delete that finds the volume gone already stops what it started.
+    f.engines.stop_all();
+    f.delete(&v.volume_id).await.unwrap();
+    assert_eq!(f.engines.starts(), starts + 3);
     assert_eq!(f.engines.retires(), 2);
     assert!(!f.engines.is_running(&uuid));
     // With a pod up, a delete uses it and leaves it up.
@@ -1465,4 +1484,45 @@ async fn get_snapshot_is_list_by_id_with_not_found() {
     ] {
         assert_eq!(get(id).await.unwrap_err().code(), code);
     }
+}
+
+/// With the purge worker off, nothing would ever purge through or reap a
+/// pod a delete started: it is stopped even when the volume went into the
+/// trash (the 37-k6b review).
+#[tokio::test]
+async fn without_the_purge_worker_a_trashing_delete_stops_its_pod() {
+    let f = fixture();
+    assert!(!ControllerConfig::default().purge_worker);
+    let v = f.create(create_req("pvc-1", GIB)).await.unwrap();
+    let uuid = VolumeId::parse(&v.volume_id).unwrap().fs_uuid().to_string();
+    let fs = f.fs_of(&v.volume_id).await;
+    f.engines
+        .set_named(Some([v.volume_id.clone()].into_iter().collect()));
+    f.engines.stop_all();
+    let starts = f.engines.starts();
+    f.delete(&v.volume_id).await.unwrap();
+    assert!(!fs.exists("/volumes/pvc-1"), "the volume is trashed");
+    assert_eq!(f.engines.starts(), starts + 1);
+    assert_eq!(f.engines.retires(), 1, "stopped: no worker would reap it");
+    assert!(!f.engines.is_running(&uuid));
+}
+
+/// A pool goes on record before a delete trashes into it (the purge
+/// worker's way back to a pool whose pod and PVs are gone); a delete that
+/// cannot record it trashes nothing and fails retryably.
+#[tokio::test]
+async fn a_delete_records_the_pool_before_it_trashes() {
+    let f = fixture();
+    let v = f.create(create_req("pvc-1", GIB)).await.unwrap();
+    let uuid = VolumeId::parse(&v.volume_id).unwrap().fs_uuid().to_string();
+    let fs = f.fs_of(&v.volume_id).await;
+    f.engines.fail_next_records(1);
+    let err = f.delete(&v.volume_id).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unavailable, "{err:?}");
+    assert!(fs.exists("/volumes/pvc-1"), "nothing trashed unrecorded");
+    assert!(fs.children("/.trash").is_empty());
+    f.delete(&v.volume_id).await.unwrap();
+    assert!(!fs.exists("/volumes/pvc-1"));
+    assert_eq!(fs.children("/.trash").len(), 1);
+    assert_eq!(f.engines.recorded(), vec![uuid]);
 }

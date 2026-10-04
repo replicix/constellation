@@ -15,6 +15,13 @@
 # never from a Secret. It never execs: it reaches its engine pods through
 # their hostPath sockets.
 #
+# 37-k6b: the node plugin reads its own Node (`nodes` get: is it cordoned,
+# tainted to go, being deleted — the drain); the controller lists Nodes
+# (the purge worker's registry sweep), holds the constellation-csi-purge
+# Lease and keeps the constellation-csi-pools ConfigMap (the pools with
+# trash to purge), get/patch by name and create (which RBAC cannot
+# narrow by name) in this namespace.
+#
 # The controller additionally (37-k2b, crates/csi/src/engine_pods.rs):
 # - `pods` patch: labels a controller-owned engine pod with the filesystem
 #   uuid it serves, which is how DeleteVolume/ControllerExpandVolume find it;
@@ -73,6 +80,21 @@ rules:
     verbs: [create]
   {{- end }}
   {{- if eq $role "controller" }}
+  # K6b: the purge worker's own leader election, and its pool records.
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [constellation-csi-purge]
+    verbs: [get, update]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [constellation-csi-pools]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
   - apiGroups: [""]
     resources: [secrets]
     verbs: [get]
@@ -105,7 +127,18 @@ rules:
   - apiGroups: [""]
     resources: [persistentvolumes, persistentvolumeclaims]
     verbs: [get]
+  {{- if eq $role "node" }}
+  # K6b: whether its own node is cordoned or going away (drain).
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get]
+  {{- end }}
   {{- if eq $role "controller" }}
+  # K6b: the purge worker's registry sweep retires records of node-owned
+  # engine pods whose node no longer exists.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [list]
   - apiGroups: [""]
     resources: [persistentvolumes]
     verbs: [list]

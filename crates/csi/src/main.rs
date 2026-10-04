@@ -9,6 +9,7 @@ use constellation_csi::credentials::{KubeSecrets, Refresher};
 use constellation_csi::engine_pods::NodeEnginePods;
 use constellation_csi::engine_pods::{EnginePodConfig, EnginePodManager};
 use constellation_csi::identity::IdentityService;
+use constellation_csi::node::gc::{self, GcConfig};
 use constellation_csi::node::handoff::{HandoffConfig, HandoffMetrics};
 use constellation_csi::node::state::StateStore;
 use constellation_csi::node::{
@@ -17,6 +18,7 @@ use constellation_csi::node::{
 use constellation_csi::proto::csi::v1::controller_server::ControllerServer;
 use constellation_csi::proto::csi::v1::identity_server::IdentityServer;
 use constellation_csi::proto::csi::v1::node_server::NodeServer;
+use constellation_csi::purge::{Leader, LeaderTiming, PurgeConfig, PurgeWorker};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -56,6 +58,13 @@ struct Cli {
     /// never for a real cluster.
     #[arg(long)]
     in_memory_backend: bool,
+    /// With `--node`: the node plugin's `preStop` hook (plan 37 §7
+    /// "Drain"). On a draining node, wait until the running plugin has
+    /// collected every engine pod of the node (each leaves the pool's
+    /// registry first), at most `CONSTELLATION_CSI_PRESTOP_TIMEOUT_S`
+    /// (default 300); on any other node exit at once. Serves nothing.
+    #[arg(long, requires = "node")]
+    pre_stop: bool,
 }
 
 fn main() -> Result<()> {
@@ -75,7 +84,9 @@ fn main() -> Result<()> {
         (true, false) if cli.node_id.is_some() => {
             bail!("--node-id only applies to --node")
         }
-        (false, true) if cli.node_id.is_none() => bail!("--node requires --node-id"),
+        (false, true) if cli.node_id.is_none() && !cli.pre_stop => {
+            bail!("--node requires --node-id")
+        }
         _ => {}
     }
 
@@ -86,6 +97,9 @@ fn main() -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if cli.pre_stop {
+        return pre_stop(cli).await;
+    }
     let path = socket_path(&cli.endpoint)?;
     if path.exists() {
         std::fs::remove_file(&path)
@@ -101,7 +115,13 @@ async fn run(cli: Cli) -> Result<()> {
 
     if cli.controller {
         tracing::info!(endpoint = %path.display(), "constellation-csi starting (controller)");
-        let config = ControllerConfig::from_env().map_err(anyhow::Error::msg)?;
+        let mut config = ControllerConfig::from_env().map_err(anyhow::Error::msg)?;
+        // The purge worker runs only against engine pods (in a cluster).
+        let purge = PurgeConfig::from_env().map_err(anyhow::Error::msg)?;
+        let purge = (!cli.in_memory_backend
+            && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some())
+        .then_some(purge);
+        config.purge_worker = purge.as_ref().is_some_and(|p| p.interval.is_some());
         let engines: Option<Arc<dyn Engines>> = if cli.in_memory_backend {
             tracing::warn!(
                 "--in-memory-backend: volumes are in-process fakes and vanish with this process"
@@ -121,7 +141,23 @@ async fn run(cli: Cli) -> Result<()> {
             );
             // `credentialSource: refreshing` classes' Secrets, watched.
             let refresher = Refresher::new(Arc::new(KubeSecrets::new(client.clone())));
-            Some(EnginePodManager::new(client, config, refresher).await)
+            let namespace = config.namespace.clone();
+            let manager = EnginePodManager::new(client.clone(), config, refresher).await;
+            // Plan 37 §"Deletion and purge": the purge worker, in the
+            // replica holding the purge lease.
+            if let Some(purge) = purge.clone().filter(|p| p.interval.is_some()) {
+                let identity = std::env::var("POD_NAME")
+                    .ok()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| format!("constellation-csi-{}", std::process::id()));
+                let timing = LeaderTiming::from_env().map_err(anyhow::Error::msg)?;
+                tracing::info!(?purge, ?timing, identity, "purge worker on (when leading)");
+                let leader = Leader::spawn(client, &namespace, identity, timing);
+                PurgeWorker::new(manager.clone(), purge).spawn(leader.flag());
+            } else {
+                tracing::info!("purge worker off (CONSTELLATION_CSI_PURGE_INTERVAL=0)");
+            }
+            Some(manager)
         } else {
             // Outside a cluster there is nowhere to start engine pods:
             // every volume RPC answers UNAVAILABLE.
@@ -136,7 +172,7 @@ async fn run(cli: Cli) -> Result<()> {
         Server::builder()
             .add_service(identity)
             .add_service(controller)
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, stop_signal())
             .await?;
     } else {
         let node_id = cli.node_id.expect("checked in main()");
@@ -201,6 +237,13 @@ async fn run(cli: Cli) -> Result<()> {
             }
             _ => tracing::info!("engine-pod rollouts are off"),
         }
+        // Plan 37 §7: idle engine pods and a draining node's engine pods
+        // leave the registry and go.
+        if rollouts {
+            let gc = GcConfig::from_env().map_err(anyhow::Error::msg)?;
+            tracing::info!(?gc, "engine-pod idle GC and drain");
+            NodeService::spawn_gc(service.clone(), gc);
+        }
         if let Some(addr) = std::env::var("CONSTELLATION_CSI_METRICS_ADDR")
             .ok()
             .filter(|a| !a.trim().is_empty())
@@ -212,10 +255,66 @@ async fn run(cli: Cli) -> Result<()> {
         Server::builder()
             .add_service(identity)
             .add_service(node)
-            .serve_with_incoming(incoming)
+            .serve_with_incoming_shutdown(incoming, stop_signal())
             .await?;
     }
     Ok(())
+}
+
+/// `SIGTERM` or `SIGINT`. Each plugin is its container's PID 1, for which
+/// the kernel ignores any signal it installs no handler for: without this a
+/// pod deletion waits out the whole grace period (the node plugin's covers
+/// its `preStop` drain, minutes) before kubelet's `SIGKILL`. The mounts and
+/// the engine pods do not depend on this process, so stopping at once is
+/// safe (plan 37 §4).
+async fn stop_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (Ok(mut term), Ok(mut int)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        tracing::warn!("cannot install the SIGTERM/SIGINT handlers");
+        return std::future::pending().await;
+    };
+    let name = tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = int.recv() => "SIGINT",
+    };
+    tracing::info!(signal = name, "stopping");
+}
+
+/// `--pre-stop` (see the flag): the node plugin's `preStop` hook.
+async fn pre_stop(cli: Cli) -> Result<()> {
+    // A `preStop` exec command is not expanded like the container's
+    // arguments: the node name comes from the environment there.
+    let node_id = cli
+        .node_id
+        .clone()
+        .filter(|n| !n.starts_with("$("))
+        .or_else(|| std::env::var("NODE_NAME").ok().filter(|n| !n.is_empty()))
+        .context("--pre-stop needs --node-id or $NODE_NAME")?;
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_none() {
+        tracing::info!("preStop: not in a cluster; nothing to wait for");
+        return Ok(());
+    }
+    let timeout = match std::env::var("CONSTELLATION_CSI_PRESTOP_TIMEOUT_S") {
+        Ok(v) if !v.trim().is_empty() => std::time::Duration::from_secs(
+            v.trim()
+                .parse()
+                .context("CONSTELLATION_CSI_PRESTOP_TIMEOUT_S must be seconds")?,
+        ),
+        _ => std::time::Duration::from_secs(300),
+    };
+    let mut config = EnginePodConfig::from_env().map_err(anyhow::Error::msg)?;
+    config.host_root = cli.host_root.display().to_string();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = kube::Client::try_default()
+        .await
+        .context("connecting to the Kubernetes API")?;
+    let engines = NodeEnginePods::new(client, config, node_id).await;
+    gc::pre_stop(&engines, timeout)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
 /// `CONSTELLATION_CSI_METRICS_ADDR` (e.g. `0.0.0.0:9810`): the node

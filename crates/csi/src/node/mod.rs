@@ -41,7 +41,8 @@
 //! then asks the engine for `view.unmount` by the same name, which answers
 //! at once whether the session already ended or not (it ends a session it
 //! did not mount rather than unmounting it), and records the pod's view
-//! count; GC of an idle pod is 37-k6b's.
+//! count. An idle pod leaves the pool's registry and is deleted by the idle
+//! GC ([`gc`], 37-k6b), which also collects a draining node's pods.
 //!
 //! **`NodePublishVolume`** checks the staging mount on every call
 //! (`requiresRepublish: true`, settled decision 12): alive, it bind-mounts
@@ -72,6 +73,7 @@
 //! engine pod ([`NodeEngines`]).
 
 pub mod engines;
+pub mod gc;
 pub mod handoff;
 pub mod mounter;
 pub mod rollout;
@@ -95,7 +97,9 @@ use constellation_control::proto::types::{
     MountSource, MountViewOpts, ViewListParams, ViewMountParams, ViewStatsParams, ViewUnmountParams,
 };
 use constellation_control::proto::ErrorKind;
-pub use engines::{Drift, InMemoryNodeEngines, NodeEngine, NodeEngines, Replacement};
+pub use engines::{
+    Drain, Drift, InMemoryNodeEngines, NodeEngine, NodeEngines, Replacement, UnitPod,
+};
 pub use mounter::{FakeMounter, FuseMountOptions, LinuxMounter, MountState, Mounter};
 use state::{StateStore, VolumeRecord};
 use std::collections::{BTreeMap, HashMap};

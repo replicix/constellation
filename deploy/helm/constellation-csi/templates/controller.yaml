@@ -1,7 +1,8 @@
 # Controller Deployment (plan 37 §4). Unprivileged. The provisioner and
 # resizer sidecars drive the Controller service (K2); the snapshotter is
 # K4's (sidecars.*.enabled). Each takes leader election, so replicas: 2 is
-# active/standby. The controller starts and reaches the controller-owned
+# active/standby; constellation-csi itself takes the constellation-csi-purge
+# Lease for its purge worker (K6b, crates/csi/src/purge.rs). The controller starts and reaches the controller-owned
 # engine pods (§7) through the Kubernetes API (templates/rbac.yaml).
 apiVersion: apps/v1
 kind: Deployment
@@ -65,6 +66,19 @@ spec:
             - {name: CONSTELLATION_CSI_ENGINE_RESOURCES, value: {{ .Values.engineProfile.resources | toJson | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_LOG_LEVEL, value: {{ .Values.engineProfile.logLevel | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ .Values.engineProfile.readyTimeout | quote }}}
+            # Plan 37 §"Deletion and purge" (K6b): the purge worker, in the
+            # replica holding the constellation-csi-purge Lease.
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: CONSTELLATION_CSI_PURGE_INTERVAL, value: {{ .Values.purge.interval | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_GRACE, value: {{ .Values.purge.grace | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_MAX_CONCURRENT_DELETES, value: {{ .Values.purge.maxConcurrentDeletes | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_OPS_PER_SECOND, value: {{ .Values.purge.opsPerSecond | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_BYTES_PER_SECOND, value: {{ .Values.purge.bytesPerSecond | quote }}}
+            # The purge Lease's timing: the sidecars' own.
+            - {name: CONSTELLATION_CSI_LEADER_LEASE_DURATION, value: {{ .Values.controller.leaderElection.leaseDuration | quote }}}
+            - {name: CONSTELLATION_CSI_LEADER_RENEW_DEADLINE, value: {{ .Values.controller.leaderElection.renewDeadline | quote }}}
+            - {name: CONSTELLATION_CSI_LEADER_RETRY_PERIOD, value: {{ .Values.controller.leaderElection.retryPeriod | quote }}}
           securityContext: &unpriv
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}

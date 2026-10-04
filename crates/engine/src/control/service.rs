@@ -1334,15 +1334,20 @@ impl EngineControl {
     pub(crate) fn read_dir(
         &self,
         path: &str,
-    ) -> std::result::Result<Vec<api::DirectoryEntry>, String> {
+    ) -> std::result::Result<Vec<api::DirectoryEntry>, ControlError> {
         use constellation_meta::MetaStore;
         let normalized = normalize_control_path(path);
+        // A missing directory is `NotFound` (its errno), not a bare
+        // `Failed`: callers (the CSI purge worker) tell it from a failure.
         let ino = self
             .meta
             .resolve_path(&normalized)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("{normalized}: not found"))?;
-        let entries = self.meta.readdir(ino).map_err(|error| error.to_string())?;
+            .map_err(|error| ControlError::failed(error.to_string()))?
+            .ok_or_else(|| ControlError::not_found(format!("{normalized}: not found")))?;
+        let entries = self
+            .meta
+            .readdir(ino)
+            .map_err(|error| ControlError::failed(error.to_string()))?;
         Ok(entries
             .into_iter()
             .map(|entry| api::DirectoryEntry {

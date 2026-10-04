@@ -348,6 +348,64 @@ fn join(prefix: &str, leaf: &str) -> String {
     }
 }
 
+/// A chart duration: `90`, `90s`, `10m`, `1h`, `500ms` (a bare number is
+/// seconds), or a sum of them (`1h30m`) — what the chart's `*Ttl`,
+/// `purge.interval` and `purge.grace` values are written as.
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let bad = || format!("{s:?} is not a duration like \"90s\", \"10m\" or \"1h\"");
+    let t = s.trim();
+    if t.is_empty() {
+        return Err(bad());
+    }
+    if let Ok(secs) = t.parse::<u64>() {
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+    let mut total = std::time::Duration::ZERO;
+    let mut rest = t;
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 {
+            return Err(bad());
+        }
+        let n: u64 = rest[..digits].parse().map_err(|_| bad())?;
+        rest = &rest[digits..];
+        let unit = rest.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+        let ms = match &rest[..unit] {
+            "ms" => 1,
+            "s" => 1_000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            _ => return Err(bad()),
+        };
+        rest = &rest[unit..];
+        total += std::time::Duration::from_millis(n.checked_mul(ms).ok_or_else(bad)?);
+    }
+    Ok(total)
+}
+
+/// A chart quantity: `1000`, `64Mi`, `1Gi`, `500k` (binary `Ki`/`Mi`/`Gi`,
+/// decimal `k`/`M`/`G`).
+pub fn parse_quantity(s: &str) -> Result<u64, String> {
+    let bad = || format!("{s:?} is not a quantity like \"1000\" or \"64Mi\"");
+    let t = s.trim();
+    let digits = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return Err(bad());
+    }
+    let n: u64 = t[..digits].parse().map_err(|_| bad())?;
+    let mult: u64 = match &t[digits..] {
+        "" => 1,
+        "k" => 1_000,
+        "M" => 1_000_000,
+        "G" => 1_000_000_000,
+        "Ki" => 1 << 10,
+        "Mi" => 1 << 20,
+        "Gi" => 1 << 30,
+        _ => return Err(bad()),
+    };
+    n.checked_mul(mult).ok_or_else(bad)
+}
+
 /// `4MiB`, `512KiB`, `1048576`: a positive byte count that fits `u32`.
 fn parse_chunk_size(s: &str) -> Result<u32, String> {
     let bad = || format!("chunkSize {s:?} must be a byte count like \"4MiB\"");
@@ -375,6 +433,25 @@ mod tests {
         kv.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn chart_durations_and_quantities() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("10m").unwrap(), Duration::from_secs(600));
+        assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5400));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        for bad in ["", "m", "10x", "1.5h", "-1s"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(parse_quantity("1000").unwrap(), 1000);
+        assert_eq!(parse_quantity("64Mi").unwrap(), 64 << 20);
+        assert_eq!(parse_quantity("2k").unwrap(), 2000);
+        assert!(parse_quantity("lots").is_err());
+        assert!(parse_quantity("1Ti").is_err());
     }
 
     #[test]

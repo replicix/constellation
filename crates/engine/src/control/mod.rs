@@ -702,12 +702,10 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
 
     // ---- browse ----
     unary::<BrowseReaddir>(r, svc, |s, _, p| {
-        s.read_dir(&p.path)
-            .map(|entries| DirectoryListing {
-                path: p.path,
-                entries,
-            })
-            .map_err(failed)
+        s.read_dir(&p.path).map(|entries| DirectoryListing {
+            path: p.path,
+            entries,
+        })
     });
     unary::<BrowseInspect>(r, svc, |s, _, p| s.inspect(&p.path).map_err(failed));
     unary::<BrowseStat>(r, svc, |s, c, p| -> Result<FileStat, ControlError> {

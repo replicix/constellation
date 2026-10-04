@@ -16,11 +16,12 @@ use crate::params::ClassParams;
 use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::proto::types::{
-    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsListing, FsUnlockParams,
-    HandoffParams, HandoffReport, LeaveParams, MkdirParams, Pong, QuotaStatus, RenameParams,
-    SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams,
-    SnapshotListParams, SnapshotListing, ViewInfo, ViewListParams, ViewListing, ViewMountParams,
-    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrParams, XattrResult,
+    Ack, CloneParams, DeleteParams, DirectoryListing, FileStat, FsCreateParams, FsCreated,
+    FsListing, FsUnlockParams, HandoffParams, HandoffReport, LeaveParams, MkdirParams, PeerListing,
+    Pong, QuotaStatus, RenameParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams,
+    SnapshotHeld, SnapshotHoldParams, SnapshotListParams, SnapshotListing, ViewInfo,
+    ViewListParams, ViewListing, ViewMountParams, ViewStatsParams, ViewStatsReport,
+    ViewUnmountParams, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use std::collections::BTreeMap;
@@ -60,6 +61,28 @@ pub trait ControlClient: Send + Sync {
     async fn browse_mkdir(&self, params: MkdirParams) -> Result<FileStat, ControlError>;
     async fn browse_xattr(&self, params: XattrParams) -> Result<XattrResult, ControlError>;
     async fn browse_rename(&self, params: RenameParams) -> Result<Ack, ControlError>;
+    /// `browse.readdir`: one directory's entries (name, path, kind), whole
+    /// — the protocol has no paging, so a directory whose listing exceeds
+    /// a frame fails (the purge worker falls back to a recursive delete
+    /// for it, [`crate::purge`]).
+    async fn browse_readdir(&self, path: &str) -> Result<DirectoryListing, ControlError> {
+        let _ = path;
+        Err(ControlError::unsupported(
+            "browse.readdir is not wired here",
+        ))
+    }
+    /// `browse.stat`: one entry's attributes (the purge worker reads a
+    /// file's size from it for its bytes-per-second budget).
+    async fn browse_stat(&self, path: &str) -> Result<FileStat, ControlError> {
+        let _ = path;
+        Err(ControlError::unsupported("browse.stat is not wired here"))
+    }
+    /// `browse.delete`: unlink a file or remove a directory (empty, or with
+    /// everything under it when `recursive`).
+    async fn browse_delete(&self, params: DeleteParams) -> Result<Ack, ControlError> {
+        let _ = params;
+        Err(ControlError::unsupported("browse.delete is not wired here"))
+    }
 
     /// `quota.get` for `subtree` (see [`SubtreeQuotaParams`]): the cap and
     /// the bytes under it. `NotFound` when the subtree does not exist. For
@@ -128,6 +151,22 @@ pub trait ControlClient: Send + Sync {
         ))
     }
     async fn node_leave(&self, params: LeaveParams) -> Result<Ack, ControlError>;
+    /// `node.status`'s `node_id`: the engine's own registry id (the
+    /// registry sweep of [`crate::purge`] keeps it).
+    async fn node_id(&self) -> Result<u64, ControlError> {
+        Err(ControlError::unsupported("node.status is not wired here"))
+    }
+    /// `peers.list`: the registry's live members as this engine sees them
+    /// (their hostnames are their pods' names).
+    async fn peers_list(&self) -> Result<PeerListing, ControlError> {
+        Err(ControlError::unsupported("peers.list is not wired here"))
+    }
+    /// `node.status`'s `enrolled`: `false` once the engine left the pool's
+    /// registry (`node.leave`) — what the node plugin's idle GC asks after
+    /// a pass that died between its leave and its cleanup.
+    async fn node_enrolled(&self) -> Result<bool, ControlError> {
+        Err(ControlError::unsupported("node.status is not wired here"))
+    }
 }
 
 /// One pool filesystem (one shard of a pool `StorageClass`), as
@@ -218,6 +257,15 @@ pub trait Engines: Send + Sync {
     /// Every filesystem an engine pod serves now (an unfiltered
     /// `ListSnapshots` lists their snapshots; it starts no pod).
     async fn running_filesystems(&self) -> Result<Vec<String>, ControlError>;
+
+    /// `DeleteVolume` is about to move volume `volume_id` of pool
+    /// filesystem `fs_uuid` into its trash: record the pool, so the purge worker
+    /// finds it even once its last PV and its engine pod are gone
+    /// ([`crate::purge`]). Without a CO there is nothing to record.
+    async fn record_trash(&self, fs_uuid: &str, volume_id: &str) -> Result<(), ControlError> {
+        let _ = (fs_uuid, volume_id);
+        Ok(())
+    }
 }
 
 /// A CO object's handle, for [`Engines::named`].

@@ -127,6 +127,12 @@ impl RolloutState {
     fn done(&self, unit: &str) {
         self.attempts.lock().unwrap().retain(|(u, _), _| u != unit);
     }
+
+    /// Whether `unit` has a replacement committed to and not adopted yet
+    /// (the idle GC leaves such a unit alone).
+    pub(super) fn is_pending(&self, unit: &str) -> bool {
+        self.pending.lock().unwrap().contains_key(unit)
+    }
 }
 
 /// Whether `unit`'s serving pod serves any view (an unreachable one counts

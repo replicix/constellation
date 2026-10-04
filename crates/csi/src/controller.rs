@@ -34,9 +34,10 @@
 //! through that filesystem's own controller-owned engine pod, writes the
 //! record on its root and the quota as its filesystem-wide cap
 //! (`quota.set{/}`), and puts the filesystem's prefix in the volume
-//! context. `DeleteVolume` of one is `FAILED_PRECONDITION` until plan 37
-//! K6b's purge primitive exists: dropping a whole filesystem is not a
-//! rename into `/.trash`.
+//! context. `DeleteVolume` of one is `FAILED_PRECONDITION`: dropping a
+//! whole filesystem is not a rename into `/.trash`, and the purge worker
+//! (37-k6b, [`crate::purge`]) only empties pool trash — removing a
+//! filesystem's bucket prefix is no control-protocol operation.
 //!
 //! **A delete never brings an engine pod back.** external-provisioner may
 //! call `DeleteVolume` again after it deleted the PV (seen 18 s later, after
@@ -47,7 +48,9 @@
 //! ask the cluster whether the PV (the `VolumeSnapshotContent`) still
 //! exists — the sidecar deletes it only after the RPC succeeded — and
 //! answer `OK` at once if not. Only a delete that genuinely needs the
-//! engine starts one, and stops it again afterwards ([`Engines::retire`]).
+//! engine starts one, and stops it again afterwards ([`Engines::retire`])
+//! — unless it moved a volume into the trash: that pod stays for the purge
+//! worker, which reaps it once the pool is empty ([`crate::purge`]).
 //!
 //! **`DeleteVolume` checks existence first** (`browse.xattr list` →
 //! `NotFound` → `OK`), before releasing the quota: a retried delete of a
@@ -148,6 +151,11 @@ pub struct ControllerConfig {
     /// clean on every host, so this is a secondary bound behind the retry).
     pub pool_create_concurrency: usize,
     pub quota_retry: QuotaRetry,
+    /// The purge worker runs in this deployment (`crate::purge`): a pod a
+    /// `DeleteVolume` started and trashed a volume through stays up for
+    /// it; without the worker nothing would purge or reap it, so it is
+    /// stopped like any other pod a delete started.
+    pub purge_worker: bool,
 }
 
 impl Default for ControllerConfig {
@@ -155,6 +163,7 @@ impl Default for ControllerConfig {
         ControllerConfig {
             pool_create_concurrency: 4,
             quota_retry: QuotaRetry::default(),
+            purge_worker: false,
         }
     }
 }
@@ -559,13 +568,14 @@ impl ControllerService {
 
     /// `DeleteVolume` of a pool volume through `fs` (module docs): gone
     /// already → `OK`; else release the quota, then rename into `/.trash`.
+    /// Whether it moved anything into the trash.
     async fn trash_volume(
         &self,
         fs: &dyn ControlClient,
         id: &VolumeId,
         name: &str,
         subtree: &str,
-    ) -> Result<(), Status> {
+    ) -> Result<bool, Status> {
         // Gone already (trashed by an earlier attempt, or never made):
         // decided here, not by how `quota.set` fails, and in O(1) — never
         // a walk of the volume (module docs).
@@ -577,14 +587,14 @@ impl ControllerService {
             .await
         {
             Ok(_) => {}
-            Err(e) if e.kind == ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(status(&format!("browse.xattr list {subtree}"), e)),
         }
         // Release the quota first (§"Deletion and purge"), then trash. A
         // `NotFound` now is a concurrent delete outside this process.
         match self.set_quota(fs, subtree, Some(0)).await {
             Ok(_) => {}
-            Err(e) if e.kind == ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind == ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(quota_status(subtree, e)),
         }
         fs.browse_mkdir(MkdirParams {
@@ -603,11 +613,13 @@ impl ControllerService {
             })
             .await
         {
-            Ok(_) => tracing::info!(volume_id = %id, trashed, "deleted pool volume"),
-            Err(e) if e.kind == ErrorKind::NotFound => {}
-            Err(e) => return Err(status("browse.rename to trash", e)),
+            Ok(_) => {
+                tracing::info!(volume_id = %id, trashed, "deleted pool volume");
+                Ok(true)
+            }
+            Err(e) if e.kind == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(status("browse.rename to trash", e)),
         }
-        Ok(())
     }
 }
 
@@ -924,9 +936,9 @@ impl ControllerRpc for ControllerService {
                 VolumeId::Dedicated { fs_uuid } => {
                     return Err(Status::failed_precondition(format!(
                         "volume {} is a whole filesystem ({fs_uuid}, layout \"dedicated\"), and \
-                     deleting one needs the purge primitive of plan 37 K6b, which does not exist \
-                     yet: retain it (persistentVolumeReclaimPolicy: Retain), or remove the \
-                     filesystem's bucket prefix by hand once its PV is gone",
+                     this driver does not delete filesystems (its purge worker empties pool \
+                     trash only): retain it (persistentVolumeReclaimPolicy: Retain), or remove \
+                     the filesystem's bucket prefix by hand once its PV is gone",
                         req.volume_id
                     )))
                 }
@@ -947,12 +959,23 @@ impl ControllerRpc for ControllerService {
                 self.created.lock().unwrap().remove(&req.volume_id);
                 return Ok(Response::new(DeleteVolumeResponse {}));
             };
-            let result = self.trash_volume(fs.as_ref(), &id, &name, &subtree).await;
-            self.retire_if_started(engines, fs, &uuid, started).await;
+            // The pool goes on record before anything lands in its trash,
+            // so the purge worker finds it even once its last PV and its
+            // pod are gone (`crate::purge`, 37-k6b).
+            let result = match engines.record_trash(&uuid, &req.volume_id).await {
+                Ok(()) => self.trash_volume(fs.as_ref(), &id, &name, &subtree).await,
+                Err(e) => Err(status("recording the pool for the purge worker", e)),
+            };
+            // A pod this delete started stays up when the volume went into
+            // the trash and the purge worker runs: it purges through it, and
+            // reaps it once the pool is empty.
+            let keep = self.config.purge_worker && matches!(result, Ok(true));
+            self.retire_if_started(engines, fs, &uuid, started && !keep)
+                .await;
             if result.is_ok() {
                 self.created.lock().unwrap().remove(&req.volume_id);
             }
-            result.map(|()| Response::new(DeleteVolumeResponse {}))
+            result.map(|_| Response::new(DeleteVolumeResponse {}))
         })
         .await
     }

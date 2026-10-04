@@ -10,4 +10,5 @@ pub mod identity;
 pub mod node;
 pub mod params;
 pub mod proto;
+pub mod purge;
 pub mod volume_id;

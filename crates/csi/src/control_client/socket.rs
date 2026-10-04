@@ -21,17 +21,18 @@ use super::{ControlClient, SubtreeQuotaParams};
 use async_trait::async_trait;
 use constellation_control::fd::OwnedFd;
 use constellation_control::methods::{
-    BrowseMkdir, BrowseRename, BrowseXattr, CloneCreate, FsCreate, FsList, FsUnlock, Method,
-    NodeHandoff, NodeLeave, NodePing, QuotaGet, QuotaSet, SnapshotCreate, SnapshotDelete,
-    SnapshotHold, SnapshotList, ViewList, ViewMount, ViewStats, ViewUnmount,
+    BrowseDelete, BrowseMkdir, BrowseReaddir, BrowseRename, BrowseStat, BrowseXattr, CloneCreate,
+    FsCreate, FsList, FsUnlock, Method, NodeHandoff, NodeLeave, NodePing, NodeStatus, PeersList,
+    QuotaGet, QuotaSet, SnapshotCreate, SnapshotDelete, SnapshotHold, SnapshotList, ViewList,
+    ViewMount, ViewStats, ViewUnmount,
 };
 use constellation_control::proto::types::{
-    Ack, CloneParams, FileStat, FsCreateParams, FsCreated, FsListing, FsUnlockParams,
-    HandoffParams, HandoffReport, LeaveParams, MkdirParams, Pong, QuotaGetParams, QuotaStatus,
-    RenameParams, SetQuotaParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams,
-    SnapshotHeld, SnapshotHoldParams, SnapshotListParams, SnapshotListing, ViewInfo,
-    ViewListParams, ViewListing, ViewMountParams, ViewStatsParams, ViewStatsReport,
-    ViewUnmountParams, XattrParams, XattrResult,
+    Ack, CloneParams, DeleteParams, DirectoryListing, FileStat, FsCreateParams, FsCreated,
+    FsListing, FsUnlockParams, HandoffParams, HandoffReport, LeaveParams, MkdirParams, PathParams,
+    PeerListing, Pong, QuotaGetParams, QuotaStatus, RenameParams, SetQuotaParams,
+    SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams,
+    SnapshotListParams, SnapshotListing, ViewInfo, ViewListParams, ViewListing, ViewMountParams,
+    ViewStatsParams, ViewStatsReport, ViewUnmountParams, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use constellation_control::Client;
@@ -128,6 +129,24 @@ impl ControlClient for SocketControlClient {
 
     async fn browse_rename(&self, params: RenameParams) -> Result<Ack, ControlError> {
         self.call::<BrowseRename>(params).await
+    }
+
+    async fn browse_readdir(&self, path: &str) -> Result<DirectoryListing, ControlError> {
+        self.call::<BrowseReaddir>(PathParams {
+            path: path.to_string(),
+        })
+        .await
+    }
+
+    async fn browse_stat(&self, path: &str) -> Result<FileStat, ControlError> {
+        self.call::<BrowseStat>(PathParams {
+            path: path.to_string(),
+        })
+        .await
+    }
+
+    async fn browse_delete(&self, params: DeleteParams) -> Result<Ack, ControlError> {
+        self.call::<BrowseDelete>(params).await
     }
 
     async fn quota_get(&self, subtree: &str) -> Result<QuotaStatus, ControlError> {
@@ -229,6 +248,18 @@ impl ControlClient for SocketControlClient {
 
     async fn node_leave(&self, params: LeaveParams) -> Result<Ack, ControlError> {
         self.call::<NodeLeave>(params).await
+    }
+
+    async fn node_id(&self) -> Result<u64, ControlError> {
+        Ok(self.call::<NodeStatus>(Default::default()).await?.node_id)
+    }
+
+    async fn peers_list(&self) -> Result<PeerListing, ControlError> {
+        self.call::<PeersList>(Default::default()).await
+    }
+
+    async fn node_enrolled(&self) -> Result<bool, ControlError> {
+        Ok(self.call::<NodeStatus>(Default::default()).await?.enrolled)
     }
 }
 

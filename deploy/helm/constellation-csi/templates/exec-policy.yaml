@@ -24,7 +24,7 @@ Secret), and only emptyDir volumes (state, socket, scratch), each at its
 own path — no hostPath at all — plus, for `credentialSource:
 aws-default-chain`, the projected token the EKS IRSA or Pod Identity
 webhook injects (csi.awsTokenVolume, _helpers.tpl). A pod update may change metadata (the
-fs-uuid label), never the spec.
+fs-uuid label; 37-k6b's hold and retiring annotations), never the spec.
 
 The only subresource it may touch is `exec`, the control relay
 (engine_pods.rs `ExecRelay`), and admission sees that request's
@@ -160,7 +160,7 @@ spec:
         socket, scratch) and at most an EKS projected token: no hostPath
     - expression: >-
         request.operation != 'UPDATE' || object.spec == oldObject.spec
-      message: the CSI controller may relabel its engine pods, never change their spec
+      message: the CSI controller may relabel or annotate its engine pods, never change their spec
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
