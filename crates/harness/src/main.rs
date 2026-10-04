@@ -8,6 +8,7 @@
 //!   harness smoke [BACKEND]
 //!   harness interop write|verify --bucket-dir DIR
 //!   harness k8s-scenario <name>...|--all [--kubeconfig PATH] [--chart DIR] [--image IMG]
+//!                        [--repeat N]
 //!
 //! Requires: fusermount3, a release `constellation` binary
 //! (CONSTELLATION_BIN or target/release/constellation), and for the default
@@ -133,6 +134,13 @@ enum Command {
         /// Keep a cluster this run created (its kubeconfig path is printed).
         #[arg(long)]
         keep: bool,
+        /// Run the selected scenarios this many times in a row on the one
+        /// cluster (plan 37 K5's 20 consecutive handoffs); every round is
+        /// reported, and a scenario's gated measurement (the writer's
+        /// pause across the handoff) has its p99 taken across all of them,
+        /// failed rounds included.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        repeat: u32,
     },
     /// Port of tests/smoke.sh: create a fs, mount, exercise POSIX ops,
     /// remount and verify persistence. BACKEND is a local directory (the
@@ -347,6 +355,7 @@ fn main() -> Result<()> {
             results_json,
             lane,
             keep,
+            repeat,
         } => k8s::run(k8s::Opts {
             names,
             all,
@@ -360,6 +369,7 @@ fn main() -> Result<()> {
             results_json,
             lane,
             keep,
+            repeat,
         }),
         Command::Smoke { backend } => smoke::run(backend),
         Command::Interop { action } => match action {

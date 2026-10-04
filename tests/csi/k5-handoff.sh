@@ -37,15 +37,9 @@
 #      holder's epoch during the handoff (37-k5a's backup hold should
 #      keep it from doing so), and the replacement's startup phases.
 #
-# TODO(busy-writer-loss): the busy file comes up short at EOF on some runs
-# with no handoff at all (a pre-existing engine bug, chunk
-# `busy-writer-loss`). Until that chunk merges, a byte mismatch on a run
-# with no other error (0 errors, a clean close) is reported as
-# "KNOWN LOSS BUG (busy-writer-loss)" and does not fail the lane; remove
-# the exception (`known_loss`) once it has merged.
-#
 # One run is this script's gate; the 20-run gate and the p99 report are
-# 37-k5b's.
+# 37-k5b's (`harness k8s-scenario csi-engine-pod-handoff-under-load
+# --repeat 20`).
 #
 # Usage: tests/csi/k5-handoff.sh
 # Knobs:
@@ -354,24 +348,14 @@ blocks=$(k exec w1 -- cat /tmp/busy.count)
 closed=$(k exec w1 -- cat /tmp/busy.close)
 size=$(k exec w1 -- stat -c %s /data/k5-a/busy)
 echo "   busy writer: close status $closed"
-known_loss=""
 if [ "$size" != $((blocks * 65536)) ]; then
     echo "the busy file has $size bytes, the writer wrote $blocks blocks of 64 KiB"
-    for _ in 1 2 3; do
-        sleep 3
-        echo "   again: $(k exec w1 -- stat -c %s /data/k5-a/busy) bytes"
-    done
     k exec w1 -- bash -c 'for i in $(seq '"$blocks"'); do cat /tmp/block; done | cmp - /data/k5-a/busy' || true
-    # TODO(busy-writer-loss): drop this exception once that chunk merges.
-    # Reached only with 0 errors and a clean close (both checked above).
-    known_loss="$(( blocks * 65536 - size )) bytes short"
-    echo "   KNOWN LOSS BUG (busy-writer-loss): $known_loss with 0 errors and close status 0;" \
-        "not a handoff failure (it reproduces with no handoff)"
-else
-    k exec w1 -- bash -c 'cmp -s <(tail -c 65536 /data/k5-a/busy) /tmp/block && cmp -s <(head -c 65536 /data/k5-a/busy) /tmp/block' \
-        || { echo "the busy file's first or last block is not the writer's"; exit 1; }
-    echo "   busy file: exactly the $blocks blocks written"
+    exit 1
 fi
+k exec w1 -- bash -c 'cmp -s <(tail -c 65536 /data/k5-a/busy) /tmp/block && cmp -s <(head -c 65536 /data/k5-a/busy) /tmp/block' \
+    || { echo "the busy file's first or last block is not the writer's"; exit 1; }
+echo "   busy file: exactly the $blocks blocks written"
 longest=$(k exec w1 -- cat /tmp/busy.longest)
 echo "   busy writer: $blocks blocks of 64 KiB ($((size / 1048576)) MiB), 0 errors; longest call ${longest} ms"
 slow=$(k exec w1 -- cat /tmp/busy.slow)
@@ -424,4 +408,4 @@ for _ in $(seq 60); do
 done
 [ -z "$(fuse_mount)" ] || { echo "the staging mount is still there after the pod went"; exit 1; }
 k delete pvc k5-a --wait=true >/dev/null
-echo "== k5-handoff PASSED: $old -> $new under two writers: 0 errors, close status $closed, $lines contiguous lines, $blocks busy blocks${known_loss:+ (KNOWN LOSS BUG (busy-writer-loss): $known_loss)} (client-visible pause ${pause:-?} ms, longest call ${longest} ms), the staging mount handed over in place"
+echo "== k5-handoff PASSED: $old -> $new under two writers: 0 errors, close status $closed, $lines contiguous lines, $blocks busy blocks (client-visible pause ${pause:-?} ms, longest call ${longest} ms), the staging mount handed over in place"

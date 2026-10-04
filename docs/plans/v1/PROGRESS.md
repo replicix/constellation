@@ -40894,3 +40894,259 @@ Gates (this round, `AUTHORITY_SIM_THREADS=8`):
 | every lock config (the 20 of `sweep_config`, `locks` … `locks-failover-backup-writes`): 0..6000 | 0 failing |
 | `locks-failover` 6000..12000; `flex`, `flex-crash` 0..3000; `locks-blips-tight-in-doubt` 400000..403000 | 0 failing |
 | `harness run lock-grant-dead-generation lock-holder-partitioned lock-failover lock-holder-killed-contention lock-fence-at-close lock-latency` | ALL SCENARIOS PASSED |
+
+## Plan 37 K5 — FUSE session handover in production (K5 closed)
+
+Milestone K5 of [plan 37](wip/37-kubernetes-csi.md) (§8, §15). Part 1
+(37-k5a, merged as c28d849): the protocol against real engine pods, the
+node plugin's rollout, one kind run. Part 2 (37-k5b, this section's gate):
+the `csi-engine-pod-handoff-under-load` k8s-scenario, its 20-run gate and
+the `upgrade-under-load` CI job. The plan's "K5 notes" (parts 1 and 2)
+hold the design reasoning.
+
+| Item | State | Where |
+|---|---|---|
+| **37-k5a:** `node.handoff{target: Socket}` phases: the sender's `Prepare` (quiesce, drain, export; aborts by itself past `deadline_ms`), `Transfer` (records and `/dev/fuse` descriptors over a socketpair the plugin reads, `handoff_wire`), `Commit`, `Abort`; the receiver's `Receive`, `Seal`, `Status`, `Abort`. `daemon --upgrade` (`target: Exec`) unchanged | DONE | `crates/control/src/handoff_wire.rs`, `crates/cli/src/handoff_socket.rs` |
+| **37-k5a:** the replacement waits as a *standby* on the held state dir (`serve --handoff-socket`), pre-opens backend, `meta.json`, conditional-write probe and P2P endpoint; the old engine's `Commit` writes `handoff.committed`, stops with `Engine::stop_for_local_handoff` (replica synced, nothing drained to S3) and exits; the standby takes the lock and resumes (`open_view_resumed`, `FuseSession::resume`), re-adopting the lease through the takeover gate | DONE | `crates/cli/src/serve.rs`, `crates/cli/src/handoff_socket.rs`, `crates/engine/src/node.rs` |
+| **37-k5a:** the plugin's orchestration and rollback: every failure before `Commit` serves the old pod again; after it, the resume has its own bound (300 s) and an unresolved replacement is kept, never deleted; 3 attempts per pod and spec, then §8's fallback (`constellation.dev/handoff-fallback`, `constellation_csi_handoff_fallback_total`) | DONE | `crates/csi/src/node/handoff.rs`, `crates/csi/src/node/rollout.rs` |
+| **37-k5a:** rollout trigger: the engine-config fingerprint on each node pod; drifted pods roll one at a time at start and every 30 s; replacements alternate socket slots and are named `…-g<generation>`; the unit gate holds kubelet RPCs for the handoff | DONE | `crates/csi/src/node/rollout.rs`, `crates/csi/src/node/engines.rs`, chart |
+| **37-k5a:** backup hold across the commit (`PeerMsg::BackupHold`, 15 s), concurrent view detach (up to 8), the K0 gap guards (no stock `FUSE_INIT` on a handed descriptor) | DONE | `crates/authority/src/core/backup.rs`, `crates/cli/src/handover.rs` |
+| **37-k6a (merged before K5b):** the `Credentials` step: the old pod's `fs.unlock` credentials relayed to the replacement, so a `static-ephemeral` class survives a plugin restart | DONE | `crates/csi/src/node/handoff.rs` |
+| **37-k5b:** `crates/pod-load` (`constellation-pod-load`): `upgrade-under-load`'s writer/creator/reader as a std-only static binary; every call timed, every failure counted by its errno's POSIX name (short writes and wrong reads too), `close(2)` checked; summary JSON; in the CSI image (Dockerfile) | DONE | `crates/pod-load/`, `deploy/docker/constellation-csi.Dockerfile` |
+| **37-k5b:** scenario `csi-engine-pod-handoff-under-load`: the trio on an RWO `static-ephemeral` PV, the chart's image tag flipped (`<tag>` ↔ `<tag>-next`), the handoff found in the plugin's log (first attempt, no rollback/loss/partial), credentials over the handoff, the same staging mount id, the trio going on 10 s past the cutover, zero errors, every acknowledged byte read back on the other worker against the model, a `VolumeSnapshot` asked for as the replacement waits as a standby, its cut bracketed (request or content creation .. the engine's row, `status.creationTime`), restored and checked for a state the trio went through holding at least every record `fsync`ed and every file closed before the cut's lower bound; measurements `pause_ms` (gated), `handoff_ms`, the longest call, rollout time, the snapshot's bracket and records; on a call that outlasts the window or a snapshot cut > 5 s after its request, what the engines logged meanwhile; on an error, what the old engine pod and the pool's root logged around it (followed with `kubectl logs -f` from before the upgrade; a root appearing later is followed too, a follow that cannot start is printed) | DONE | `crates/harness/src/k8s/scenarios.rs` |
+| **37-k5b:** `harness k8s-scenario --repeat N` (rounds on namespaces and pools of their own, every round reported with its measurements in `--results-json`), `K8sScenario::gate` (a measurement's nearest-rank p99 across rounds, failed rounds included, must stay under a bound; `pause_ms` < 2000 ms) | DONE | `crates/harness/src/k8s.rs`, `crates/harness/src/results.rs`, `crates/harness/src/main.rs` |
+| **37-k5b (coordinator):** the k8s mode's checkout is the harness binary's own (`<checkout>/target/<profile>/harness`), else the working directory's or the nearest one above it — never the compile-time `CARGO_MANIFEST_DIR`; printed as `=== checkout …`; unit test `the_checkout_is_the_binarys_then_the_working_directorys`. (On this host the kind config still came from main once: `$KIND_CONFIG_DRAFT` is set to main's `tests/csi/kind-config.yaml` in the agents' environment and overrides it, as documented.) | DONE | `crates/harness/src/k8s.rs` |
+| **37-k5b:** `tests/csi/k5-handoff.sh`: the `KNOWN LOSS BUG (busy-writer-loss)` exception and its TODO removed — any byte mismatch fails the lane (busy-writer-loss fixed in d860148) | DONE | `tests/csi/k5-handoff.sh`, TESTING.md |
+| **37-k5b:** nightly `upgrade-under-load` (§13): after `kind-e2e` on the self-hosted FUSE runner, `--repeat 20`, the harness itself fails it on any error, any unread byte or a `pause_ms` p99 ≥ 2 s; results and log uploaded; leftover-cluster cleanup | DONE | `.github/workflows/nightly.yml` |
+| TESTING.md (the scenario row, `--repeat`, the checkout rule, the gate command, the CI job), plan 37 K5 notes part 2 | DONE | docs |
+| **37-k5b review fixes:** the trio keeps *every* call of 100 ms or more (it kept the first 200, so after a long rollout `pause_ms` read 0: rounds 4, 7-10 below), test `a_window_after_many_slow_calls_still_sees_its_own`; the gate moved from `handoff_ms` to `pause_ms` (the writer's view); the trio timestamps each acknowledgement (`synced`, `closed`) and the snapshot check has a lower bound (`check_trio_snapshot`'s records/files, tested); the snapshot's cut time is the content's `status.creationTime`, reported, not claimed to fall in the handoff | DONE | `crates/pod-load/src/lib.rs`, `crates/harness/src/k8s/scenarios.rs`, `crates/harness/src/k8s.rs` |
+
+### The first 20-run gate, on `handoff_ms` (2026-10-03, `kind-37-k5b`, kindest/node v1.37.0, kernel 7.3.0-rc4, host load average 12-195)
+
+`harness k8s-scenario csi-engine-pod-handoff-under-load csi-snapshot-clone-mount --repeat 20 --image constellation-csi:k5b --kubeconfig …`:
+**20/20 handoff runs passed, 0 errors of any kind in 284,480 calls;
+`csi-snapshot-clone-mount` 20/20.** Times are relative to the handoff's
+start (the plugin's `Prepare`). `pause_ms` is the trio's longest call
+overlapping the plugin's window. This trio kept only its first 200 calls
+of 100 ms or more, so in rounds 4 and 7-10 (long rollouts) it had
+recorded nothing by the handoff and `pause_ms` read 0: those are
+*unmeasured*, not 0 (review finding; fixed, re-measured below). The
+snapshot columns are when the `VolumeSnapshot` was requested and how
+many 4 KiB records its restore held.
+
+| Round | Outcome | `handoff_ms` | `pause_ms` | Longest call, ms (op, start) | Rollout s | Calls | Errors | Snapshot at ms | Snapshot records |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | passed | 458 | 449 | 25867 (writer: fsync, -90174 ms) | 168.8 | 16725 | 0 | 311 | 5712 |
+| 2 | passed | 298 | 294 | 991 (writer: fsync, -29301 ms) | 38.0 | 8397 | 0 | 655 | 3184 |
+| 3 | passed | 680 | 4995 | 4995 (creator: open, +60 ms) | 42.8 | 9072 | 0 | 397 | 4072 |
+| 4 | passed | 1025 | unmeasured | 3330 (creator: close, -113968 ms) | 222.2 | 34412 | 0 | 538 | 16928 |
+| 5 | passed | 273 | 228 | 2087 (writer: fsync, -11223 ms) | 75.6 | 14128 | 0 | 506 | 6432 |
+| 6 | passed | 286 | 270 | 1047 (writer: fsync, +10165 ms) | 71.0 | 12459 | 0 | 255 | 5520 |
+| 7 | passed | 567 | unmeasured | 1502 (creator: close, -38945 ms) | 107.7 | 15526 | 0 | 402 | 6192 |
+| 8 | passed | 613 | unmeasured | 10613 (writer: fsync, -68382 ms) | 174.5 | 23967 | 0 | 134 | 11762 |
+| 9 | passed | 553 | unmeasured | 5935 (writer: fsync, -109104 ms) | 190.3 | 25968 | 0 | 27 | 12320 |
+| 10 | passed | 1057 | unmeasured | 16396 (writer: pwrite, -147667 ms) | 221.1 | 22556 | 0 | 647 | 7520 |
+| 11 | passed | 539 | 499 | 2272 (creator: close, -61885 ms) | 79.1 | 13166 | 0 | 317 | 5808 |
+| 12 | passed | 341 | 5540 | 10004 (writer: pwrite, -61587 ms) | 105.3 | 12949 | 0 | 390 | 4960 |
+| 13 | passed | 427 | 423 | 2093 (writer: fsync, -10249 ms) | 38.1 | 7830 | 0 | 545 | 3136 |
+| 14 | passed | 342 | 737 | 7005 (writer: fsync, -18538 ms) | 70.5 | 10890 | 0 | 279 | 4320 |
+| 15 | passed | 442 | 457 | 611 (writer: fsync, +526 ms) | 38.1 | 8016 | 0 | 915 | 3184 |
+| 16 | passed | 460 | 5485 | 5485 (creator: open, +15 ms) | 39.5 | 7258 | 0 | 213 | 3069 |
+| 17 | passed | 294 | 253 | 454 (writer: fsync, -27538 ms) | 35.5 | 8616 | 0 | 400 | 3600 |
+| 18 | passed | 345 | 333 | 5272 (writer: fsync, +10108 ms) | 72.8 | 12941 | 0 | 34 | 6996 |
+| 19 | passed | 515 | 463 | 1810 (creator: close, -13338 ms) | 71.5 | 13158 | 0 | 395 | 6048 |
+| 20 | passed | 322 | 5218 | 5218 (creator: open, +88 ms) | 38.5 | 6446 | 0 | 960 | 2464 |
+
+- **`handoff_ms` (gated): p50 442 ms, p99 1057 ms (nearest rank: the
+  slowest of 20), max 1057 ms — under §8's 2 s.**
+- `pause_ms` (reported then), over the 15 measured rounds: p50 423 ms,
+  max 5540 ms; over 2 s in rounds 3, 12, 16 and 20 (the delegation wait,
+  next section).
+- The writers' longest calls outside the window (up to 25.9 s, round 1)
+  fall in the minutes the chart upgrade spends rolling the DaemonSet and
+  the controller, before the handoff. Rounds 1, 4 and 8-10 ran while the
+  harness matrix and `cargo test` shared the host (load average 100-195).
+
+### Where the time goes, and what a writer still sees
+
+- **Inside the window** (`handoff_ms`): `Prepare` (drain and publication
+  of open write sessions), the relay, the old engine's replica sync and
+  exit, and the replacement's start. The startup phases the standby
+  logged: the wait from its seal to the state dir's lock 250-710 ms, then
+  `meta.db` open and the registry read in tens of ms (37-k5a's pre-open
+  holds). The two runs over 1 s (rounds 4 and 10) had rollouts over 220 s,
+  that is, a loaded host.
+- **After the window: the delegation wait** (what `pause_ms` adds). A create
+  (`open(O_CREAT)`, a forwarded mutation) issued during the drain is
+  answered only when the pool's root, the controller-owned engine pod,
+  ends the delegation the old engine held. If the replacement's request
+  reaches it first, the root recalls it (`recalling a delegation`, 1.0-1.8 s
+  after the window); otherwise it reclaims it at its expiry (`reclaiming
+  an unrenewed delegation`, 3.4-5.7 s after). The scenario prints what both
+  engines logged while such a call waited: in the 52 runs after the gate,
+  17 of 17 calls that outlasted the window by more than 1 s (3 + 5 + 9,
+  below) ended at one of those two lines. None ended at anything else. This is 37-k5a's "a restarted delegate's first writes
+  wait out its delegation", and chunk `delegate-root-loss` is fixing it.
+  Not an error, and not inside §8's window. `delegate-root-loss` merged
+  (f3052f4); the re-measure below saw no call outlast the window by more
+  than 1 s, and the gate is now `pause_ms`.
+
+### The re-measure and the gate on `pause_ms` (review round, 2026-10-03, `kind-37-k5b`, main with f3052f4, host load average 20-30)
+
+Four batches on one cluster (the tool's 10-minute command limit): a created
+one with `--keep`, then three with `--kubeconfig`:
+`harness k8s-scenario csi-engine-pod-handoff-under-load --repeat 4 --keep --image constellation-csi:k5b`,
+then `… --repeat 2 --kubeconfig …` three times. **10/10 consecutive runs
+passed, 0 errors of any kind in 147,975 calls.** The trio keeps every slow
+call; the snapshot check has its lower bound. The snapshot columns are the
+request and the latest possible cut (the engine's row) relative to the
+handoff's start, the records its restore held, and the records `fsync`ed
+before the cut's lower bound (all of which it had to hold). (This run's
+logs were lost with the attempt that made it, and its harness gained the
+late-snapshot diagnostic after the first batch; the final run below is
+on the finished code.)
+
+| Round | Outcome | `pause_ms` (gated) | `handoff_ms` | Longest call, ms (op, start) | Rollout s | Calls | Errors | Snapshot asked / cut by, ms | Snapshot records (acked before) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | passed | 321 | 325 | 386 (writer: fsync, -1987 ms) | 99.0 | 21481 | 0 | -57 / 31276 | 12720 (11232) |
+| 2 | passed | 362 | 337 | 362 (creator: open, +5 ms) | 69.3 | 15159 | 0 | 413 / 878 | 7360 (7328) |
+| 3 | passed | 224 | 241 | 273 (creator: close, -32326 ms) | 37.1 | 9310 | 0 | 315 / 661 | 3968 (3952) |
+| 4 | passed | 266 | 290 | 305 (writer: fsync, -1977 ms) | 69.3 | 15455 | 0 | -100 / 31223 | 9135 (7536) |
+| 5 | passed | 200 | 206 | 352 (creator: close, -2358 ms) | 37.2 | 9957 | 0 | -16 / 585 | 4339 (4320) |
+| 6 | passed | 308 | 338 | 745 (writer: fsync, -2614 ms) | 106.8 | 22010 | 0 | -61 / 31293 | 12888 (10944) |
+| 7 | passed | 271 | 281 | 2134 (writer: fsync, -4277 ms) | 104.6 | 21552 | 0 | 79 / 1277 | 10816 (10784) |
+| 8 | passed | 204 | 242 | 2190 (writer: fsync, -6981 ms) | 35.7 | 8597 | 0 | 163 / 435 | 3408 (3392) |
+| 9 | passed | 238 | 283 | 1903 (writer: fsync, -3954 ms) | 70.5 | 15447 | 0 | -6 / 31290 | 9032 (7440) |
+| 10 | passed | 575 | 467 | 1006 (writer: fsync, -9200 ms) | 37.2 | 9007 | 0 | 447 / 1309 | 3760 (3728) |
+
+- **`pause_ms` (gated): p50 266 ms, p99 (= max) 575 ms — under §8's 2 s.**
+  `handoff_ms`: p50 283 ms, p99 467 ms. `pause_ms` exceeded `handoff_ms`
+  in 2 rounds (a call caught by the handoff counts whole).
+- No call outlasted the window by more than 1 s. The longest calls (up to
+  2.2 s) fell during the rollout, 2-10 s before the handoff.
+- **Open: a snapshot asked for just before `Prepare` is 31 s late.** In
+  rounds 1, 4, 6 and 9 the request came 6-100 ms before the plugin's
+  `Prepare` (round 5's, 16 ms before, was not affected). The root's
+  `snapshot.create` then did not finish within the CSI controller's 30 s
+  (the csi-snapshotter logged `DeadlineExceeded … snapshot.create did not
+  finish within 30s`, and no row was made). The snapshotter's retry 1 s
+  later cut it at once, after the trio had stopped. Every snapshot was
+  consistent and held what had been acknowledged. This is an engine-side
+  race between a snapshot barrier and the delegate's handoff; the engines
+  log nothing about it at `info`. It is not part of this harness chunk,
+  so it is not fixed here. The scenario now prints what the engines logged
+  whenever a cut comes over 5 s after its request.
+
+### The final re-measure (review round, 2026-10-04, `kind-37-k5b`, the finished harness and trio, host load average 30-35, another agent's kind cluster running)
+
+Two batches on one cluster (the 30-minute command limit):
+`KIND_CLUSTER=kind-37-k5b harness k8s-scenario csi-engine-pod-handoff-under-load --repeat 4 --keep --image constellation-csi:k5b`,
+then `… --repeat 6 --kubeconfig <kept> …` (`$KIND_CONFIG_DRAFT` unset).
+**10/10 consecutive runs passed, 0 errors of any kind in 148,302 calls;
+every acknowledged byte read back on the other worker; every snapshot a
+state the trio went through holding everything acknowledged before its
+earliest cut.** Columns as in the table above.
+
+| Round | Outcome | `pause_ms` (gated) | `handoff_ms` | Longest call, ms (op, start) | Rollout s | Calls | Errors | Snapshot asked / cut by, ms | Snapshot records (acked before) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | passed | 300 | 334 | 300 (writer: pwrite, +1 ms) | 97.6 | 21483 | 0 | -31 / 31209 | 12819 (11296) |
+| 2 | passed | 372 | 358 | 386 (writer: fsync, +409 ms) | 36.6 | 9209 | 0 | 208 / 1051 | 3936 (3904) |
+| 3 | passed | 203 | 237 | 484 (creator: close, -857 ms) | 41.3 | 9650 | 0 | 90 / 775 | 4144 (4128) |
+| 4 | passed | 365 | 380 | 2308 (writer: fsync, -40479 ms) | 71.8 | 14797 | 0 | 367 / 886 | 6944 (6896) |
+| 5 | passed | 648 | 288 | 5351 (writer: fsync, -41990 ms) | 74.0 | 15010 | 0 | 124 / 1249 | 7248 (7232) |
+| 6 | passed | 1161 | 299 | 4291 (writer: fsync, -54753 ms) | 132.5 | 24202 | 0 | -51 / 5145 | 11008 (10720) |
+| 7 | passed | 221 | 273 | 1641 (creator: close, -26681 ms) | 69.6 | 14145 | 0 | 39 / 31359 | 8017 (6592) |
+| 8 | passed | 322 | 222 | 689 (writer: fsync, +10096 ms) | 37.1 | 9082 | 0 | 9 / 871 | 3984 (3968) |
+| 9 | passed | 267 | 271 | 478 (creator: open, -6060 ms) | 89.5 | 17706 | 0 | 173 / 1455 | 8384 (8352) |
+| 10 | passed | 249 | 287 | 4607 (creator: close, -39596 ms) | 67.6 | 13018 | 0 | 140 / 31374 | 7298 (5776) |
+
+- **`pause_ms` (gated): p50 300 ms, p99 (= max) 1161 ms — under §8's
+  2 s.** `handoff_ms`: p50 287 ms, p99 380 ms. `pause_ms` exceeded
+  `handoff_ms` in 4 rounds.
+- One call outlasted the window by more than 1 s: round 6's writer
+  `fsync`, started 294 ms into a 299 ms window, took 1161 ms. The root
+  logged only its backup hold and a gossip neighbour meanwhile (no recall
+  or reclaim of a delegation); the replacement's 40-line budget was spent
+  on its meta.db recovery (those lines are filtered out of the printout
+  now), so what it did in that second is not known.
+- The late snapshot again, in 4 rounds: requests 31 ms and 51 ms before
+  `Prepare` and 39 ms and 140 ms after it were cut 31 s (three) and 5 s
+  (one) later, the csi-snapshotter logging the same `DeadlineExceeded`;
+  requests 9-367 ms after `Prepare` in the other 6 were cut within 1.5 s.
+  So the race is with the handoff's first ~150 ms, not only with a
+  request that precedes it.
+
+### More runs (same cluster, after the first gate)
+
+| Run | Code | Outcome | `handoff_ms` p50 / p99 | `pause_ms` over 2 s | Errors |
+|---|---|---|---|---|---|
+| first single run (fresh cluster) | gate code | 1/1 passed | 349 | 0 | 0 |
+| `--repeat 8` | + outlasting-call diagnostic | 8/8 passed | 299 / 730 | 0 | 0 |
+| `--repeat 12` | same | **11/12 passed** | 546 / 1145 | 3 | **2 (round 7)** |
+| `--repeat 12` | + engine log taps | 12/12 passed | 354 / 627 | 4 | 0 |
+| `--repeat 20` (final code) | same | **20/20 passed** | 338 / 535 | 4 | 0 |
+| `k8s-scenario --all` (reused cluster) | — | 9/9 passed | 1 run | — | 0 |
+
+**The one failure, not reproduced since: 2 `EIO`s 150 s before a
+handoff.** In the second `--repeat 12` (round 7), during the chart's
+rollout and before any handoff started, the old engine pod answered one
+writer `fsync` and one creator `close` with `EIO` (3.3 s apart, ~50 s
+after `helm upgrade`). The writer's next `fsync` then took 120.1 s and
+succeeded. The run failed as it must. Its handoff 2.5 minutes later was
+clean (1145 ms; the bytes and the snapshot checked). Context: the host
+was running harness shard 2 beside it. In the kind control plane,
+`kube-controller-manager` and `kube-scheduler` had restarted 17 times (leader
+election under load) and the controller replicas 3 times during the
+rollout. The old engine pod, the one that answered `EIO`, was deleted by
+the handoff before the verdict, so its log was lost. The tail of the
+controller-owned engine pod's log (the pool's root) starts later. The
+scenario now follows both pods' logs (`kubectl logs -f`) from before the
+upgrade and prints them around every error. The 32 runs since (12 + 20,
+consecutive) had no error, so nothing was captured. It is therefore
+open, not explained: an `EIO` from a node engine while the node plugin
+and the controller restart under a loaded control plane, *not* in the
+handoff. The 120 s `fsync` that followed matches the stuck-`fsync` shape
+`delegate-root-loss` is chasing (a delegate whose root's renewals stop),
+but that is a guess without the log.
+
+### Gates (this worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `k5b`, `TMPDIR=/var/tmp/k5b/htmp`; host load average 12-195, other agents' kind lanes running)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean; clean |
+| `cargo test --workspace` (in package groups, each under the 600 s tool cap) | 0 failed: control+platform+csi+pod-load+constellation+harness, engine 556+1, the rest 526, chaos+frontend-fuse+fs-core+meta 489, authority 322, model 75+56+7 |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | INTEGRATION TEST PASSED (against the floci already bound to :4566 by another agent, with the script's AWS_* settings: the compose `up` line skipped) |
+| `harness run --shard 1/2`, `--shard 2/2` (211 scenarios) | 186 passed, 18 failed, 7 skipped (the root-only `passthrough-*`, run below). Every failure was rerun: see the next list |
+| reruns of the 18 | **passed on rerun:** `epoch-member-lost`, `snapshot-busy-latency`, `distant-bigfile-stable-e2e`, `idle-cluster-is-quiet`, `takeover-marker-strands-promptly`, `sqlite-first-touch-latency`, `commit-strips-pending-upload`, `visibility-s3-latency`, `shared-dir-multi-writer`, `git-under-flock-rounds` (load: the shards ran beside the kind gate at load 100-195); `slow-s3-no-seal` (failed 3×, "b sealed a live holder" at t+73/140 s, then passed; main d1e56cd built from `git archive` passed it too); `distant-bigfile-stable` (failed 3× at a 9.7 MiB/s block against a 10.0 floor, then passed twice at 10.5-11.1; main passed at 10.3); `csi-credential-revocation` (no native versitygw on the host at first: installed with `tests/ci/install-native-s3.sh`). **Mine:** `transport-lock-wait-budget` and `transport-seccomp-denied` failed because I rebuilt `target/release/harness` while shard 1 ran (`taskset: failed to execute …/harness (deleted)`); both passed on rerun. `fsyncdir-barrier` (ENOENT on every run, also on main: fixed on main by f3052f4, after this run). **Known:** `fuse-inval-storm` (holder zombie after kill -9), `epoch-holder-retired` ("A's unflushed write surfaced") |
+| root: `sudo env -u XDG_RUNTIME_DIR HOME=/root … harness run` the 7 `passthrough-*` + `subtree-confinement` | 8/8 PASSED; no root-owned file left in `~` or the coop key glob |
+| `docker compose --profile test run --rm compliance` (`-p 37-k5b-1003-110437`, `SMOKE_IMAGE=k5b-smoke:local`, floci ports reset: 4566 taken) | 8798 passed, 0 failed — COMPLIANCE TEST PASSED |
+| `harness k8s-scenario csi-engine-pod-handoff-under-load csi-snapshot-clone-mount --repeat 20` | 20/20 + 20/20 PASSED, `handoff_ms` p50 442 / p99 1057 ms (table above) |
+| `harness k8s-scenario --all` | 9/9 PASSED (reused cluster); and 9/9 PASSED with the final `target/release/harness` on a cluster it created from the worktree's `tests/csi/kind-config.yaml` (`$KIND_CONFIG_DRAFT` unset) and deleted (handoff 286 ms) |
+| `kind-37-k5b` | deleted |
+| **Review round (2026-10-04):** `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test -p constellation-pod-load -p constellation-harness`; `bash tests/smoke.sh` | clean; clean; 0 failed; SMOKE TEST PASSED |
+| **Review round:** `harness k8s-scenario csi-engine-pod-handoff-under-load --repeat 4 --keep`, then `--repeat 6 --kubeconfig …` (`make csi-image CSI_IMAGE=constellation-csi:k5b`) | 10/10 PASSED, `pause_ms` p50 300 / p99 1161 ms (the final re-measure, above); `kind-37-k5b` deleted. After it, only the outlasting-call printout's filter and a message's wording changed. Not re-run this round (no product code changed): `cargo test --workspace`, `tests/integration.sh`, the full `harness run`, compliance, `k8s-scenario --all` |
+
+### Exit criteria (plan 37 §15 K5, §18 items 1, 2, 8)
+
+- [x] §8 implemented against real engine pods: `node.handoff`, the
+  rollout orchestration for image upgrades, rollback (37-k5a).
+- [x] The `engine-pod-handoff-under-load` k8s-scenario
+  (`csi-engine-pod-handoff-under-load`) shows zero `ENOTCONN`/`EIO`
+  (zero errors of any kind) across 20 consecutive runs: the gate, and 20
+  more on the final code.
+- [x] The handoff's wall-clock stays under §8's 2 s at p99, as the
+  writer sees it: `pause_ms` (gated since the review round) p99 575 ms
+  and 1161 ms over the two 10-run re-measures; the plugin's `handoff_ms`
+  p99 1057 ms (first gate), 535 ms (final 20), 467 and 380 ms
+  (re-measures).
+- [x] `upgrade-under-load` CI job in `nightly.yml`, failing on any error
+  or a `pause_ms` p99 ≥ 2 s (a release gate; it needs the self-hosted FUSE
+  runner, as `kind-e2e` does).
+- [x] The K5 p50/p99 and the 20-run tally (§18 item 8): above.
+- [ ] Open, reported: one unreproduced `EIO` pair during a rollout under
+  load, before the handoff (above). A snapshot asked for around the
+  handoff's start (-100..+140 ms from `Prepare`) waits out the CSI
+  controller's 30 s and is cut on the retry, in 8 of the 20 re-measure
+  runs (above): an engine-side race, not in this chunk. The delegation wait a writer's create saw during
+  the drain is gone with `delegate-root-loss` (f3052f4).

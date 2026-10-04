@@ -10,11 +10,12 @@ use super::{
     data_dir, fs_uuid_of, rotating_key, rotating_secret, EnginePod, Env, Scope, ROTATING_SECRET,
 };
 use crate::docker::docker;
+use crate::model::Observed;
 use crate::model::{Model, Node};
 use crate::scenarios::eventually;
 use anyhow::{bail, ensure, Context, Result};
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub struct K8sScenario {
@@ -24,6 +25,15 @@ pub struct K8sScenario {
     /// it, saying so).
     pub workers: usize,
     pub run: fn(&Env, u64) -> Result<()>,
+    /// A measurement ([`Env::measure`]) whose p99 across every run of
+    /// `--repeat` must stay under a bound: the run fails otherwise.
+    pub gate: Option<Gate>,
+}
+
+/// [`K8sScenario::gate`].
+pub struct Gate {
+    pub metric: &'static str,
+    pub p99_under_ms: u64,
 }
 
 pub const K8S_SCENARIOS: &[K8sScenario] = &[
@@ -32,48 +42,66 @@ pub const K8S_SCENARIOS: &[K8sScenario] = &[
         desc: "a pod writes a seeded workload through a PVC, verified against the model; a pod on the other worker remounts it and sees the same tree",
         workers: 2,
         run: csi_pod_rw,
+        gate: None,
     },
     K8sScenario {
         name: "csi-rwx-across-nodes",
         desc: "two pods on two workers share one RWX PVC: alternating and concurrent writes converge to the model on both (close-to-open, bounded: eventual, nothing stronger)",
         workers: 2,
         run: csi_rwx_across_nodes,
+        gate: None,
     },
     K8sScenario {
         name: "csi-many-pvs-one-pool",
         desc: "50 PVs of one pool StorageClass across both workers: each its own tree, one engine pod per (pool, node), each PV's quota enforced on its own",
         workers: 2,
         run: csi_many_pvs_one_pool,
+        gate: None,
     },
     K8sScenario {
         name: "csi-plugin-restart-survives",
         desc: "node-plugin and controller pods deleted under a writing pod: mounts survive, zero errors, the engine pods untouched, the restarted plugins stage, publish and unstage",
         workers: 2,
         run: csi_plugin_restart_survives,
+        gate: None,
     },
     K8sScenario {
         name: "csi-snapshot-clone-mount",
         desc: "VolumeSnapshot of a written PVC, then a PVC restored from it and a PVC cloned from the source, both mounted on the other worker: the restore is the tree at the snapshot, the clone the tree now, both metadata-only clones in the source's pool, independent of the source",
         workers: 2,
         run: csi_snapshot_clone_mount,
+        gate: None,
     },
     K8sScenario {
         name: "csi-clone-cross-pool-refused",
         desc: "clone and restore into the source's own pool bind and hold its data; the same clone and restore into another pool's StorageClass are refused (INVALID_ARGUMENT naming both filesystems) and stay Pending",
         workers: 2,
         run: csi_clone_cross_pool_refused,
+        gate: None,
     },
     K8sScenario {
         name: "csi-secret-rotation",
         desc: "a `refreshing` class's Secret rotated twice under a writing pod and a reader on the other worker: no remount, no engine restart, zero errors; every engine pod's S3 clients sign with the new pair (fs.list generations), each push is in its audit log under the node plugin's service principal, and no pod spec, environment or hostPath file holds a credential",
         workers: 2,
         run: csi_secret_rotation,
+        gate: None,
+    },
+    K8sScenario {
+        name: "csi-engine-pod-handoff-under-load",
+        desc: "upgrade-under-load's writer, creator and reader in a pod on an RWO PV while the chart's image tag changes: the node plugin hands the engine pod's FUSE session to a replacement (credentials over the handoff), the staging mount stays; zero errors of any kind, every acknowledged byte read back on the other worker, a snapshot asked for as the replacement waits as a standby restores to a state the trio went through holding everything acknowledged before it was asked for; the trio's longest call overlapping the plugin's handoff window (pause_ms) is gated at p99 < 2 s across --repeat",
+        workers: 2,
+        run: csi_engine_pod_handoff_under_load,
+        gate: Some(Gate {
+            metric: "pause_ms",
+            p99_under_ms: PAUSE_P99_MS,
+        }),
     },
     K8sScenario {
         name: "csi-pod-security",
         desc: "the privilege split of plan 37 §9, as PodSecurity admission judges it (server dry runs in a `restricted` namespace): controller and controller-owned engine pod admitted, node-owned engine pods refused for their hostPaths only, the node plugin refused as privileged",
         workers: 1,
         run: csi_pod_security,
+        gate: None,
     },
 ];
 
@@ -1427,7 +1455,7 @@ fn csi_pod_security(env: &Env, _seed: u64) -> Result<()> {
         node_engine.len() == 1 && ctl_engine.len() == 1,
         "engine pods: {node_engine:?} {ctl_engine:?}"
     );
-    let probe_ns = format!("k8s-psa-{}", env.run_id);
+    let probe_ns = format!("k8s-psa-{}", env.scope_id());
     env.kube.apply(&serde_json::json!({
         "apiVersion": "v1", "kind": "Namespace",
         "metadata": {"name": probe_ns, "labels": {
@@ -1509,6 +1537,816 @@ fn csi_pod_security(env: &Env, _seed: u64) -> Result<()> {
         .run(&["delete", "namespace", &probe_ns, "--wait=false"]);
     judged?;
     s.finish()
+}
+
+/// Where the load pod's trio keeps its control files (the pod's own
+/// `/tmp`, not the PV).
+const LOAD_CTL: &str = "/tmp/load";
+
+/// How long an image upgrade may take to roll onto the load's worker:
+/// kubelet can take minutes to roll the node DaemonSet on a loaded host
+/// (`tests/csi/k5-handoff.sh`'s `K5_ROLLOUT_S`).
+const ROLLOUT: Duration = Duration::from_secs(900);
+
+/// How long the trio goes on after the cutover: past the replacement's
+/// first `fsync`s, which wait out the delegation the old engine held
+/// (plan 37 K5 notes, "a restarted delegate's first writes").
+const AFTER_CUTOVER: Duration = Duration::from_secs(10);
+
+/// Plan 37 §8 step 6 / K5 gate: the client-visible pause's p99 bound.
+const PAUSE_P99_MS: u64 = 2000;
+
+/// `2026-10-03T11:04:42.123456Z` (tracing's UTC timestamps) in ms since
+/// the epoch.
+fn rfc3339_ms(ts: &str) -> Option<u64> {
+    let ts = ts.strip_suffix('Z')?;
+    let (date, time) = ts.split_once('T')?;
+    let mut d = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut t = hms.splitn(3, ':').map(|p| p.parse::<i64>().ok());
+    let (hh, mm, ss) = (t.next()??, t.next()??, t.next()??);
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let ms: i64 = format!("{frac:0<3}")[..3].parse().ok()?;
+    u64::try_from(((days * 24 + hh) * 60 + mm) * 60 * 1000 + ss * 1000 + ms).ok()
+}
+
+/// A `Duration`'s `Debug` text (`342.1ms`, `1.35s`, `980µs`) in ms.
+fn debug_duration_ms(text: &str) -> Option<f64> {
+    for (suffix, scale) in [
+        ("ns", 1e-6),
+        ("µs", 1e-3),
+        ("us", 1e-3),
+        ("ms", 1.0),
+        ("s", 1e3),
+    ] {
+        if let Some(n) = text.strip_suffix(suffix) {
+            return n.parse::<f64>().ok().map(|v| v * scale);
+        }
+    }
+    None
+}
+
+/// `key=value` of a tracing log line (the value unquoted).
+fn log_field<'l>(line: &'l str, key: &str) -> Option<&'l str> {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+        .map(|v| v.trim_matches('"'))
+}
+
+/// What the node plugin logged about the handoff to `to`: the outcome line's
+/// end (ms since the epoch) and its `elapsed`, and every line about the
+/// same unit that is not a success.
+#[derive(Debug, PartialEq)]
+struct PluginHandoff {
+    end_ms: u64,
+    elapsed_ms: f64,
+    unit: String,
+    failed: Vec<String>,
+}
+
+fn plugin_handoff(log: &str, to: &str) -> Option<PluginHandoff> {
+    let plain = strip_ansi(log);
+    let line = plain
+        .lines()
+        .filter(|l| l.contains("engine-pod handoff succeeded"))
+        .find(|l| log_field(l, "to") == Some(to))?;
+    let unit = log_field(line, "unit")?.to_string();
+    let failed = plain
+        .lines()
+        .filter(|l| l.contains("engine-pod handoff") && !l.contains("handoff succeeded"))
+        .filter(|l| log_field(l, "unit") == Some(unit.as_str()))
+        .map(str::to_string)
+        .collect();
+    Some(PluginHandoff {
+        end_ms: rfc3339_ms(line.split_whitespace().next()?)?,
+        elapsed_ms: debug_duration_ms(log_field(line, "elapsed")?)?,
+        unit,
+        failed,
+    })
+}
+
+/// The node plugin on `node` running `image` (not a terminating
+/// predecessor).
+fn node_plugin_on(env: &Env, node: &str, image: &str) -> Result<Option<String>> {
+    let list = env.kube.get(&[
+        "pods",
+        "-n",
+        &env.driver_ns,
+        "-l",
+        "app.kubernetes.io/component=node",
+        "--field-selector",
+        &format!("spec.nodeName={node}"),
+    ])?;
+    Ok(list["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["metadata"]["deletionTimestamp"].is_null())
+        .filter(|p| {
+            p["spec"]["containers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c["name"] == "constellation-csi" && c["image"] == image)
+        })
+        .find_map(|p| p["metadata"]["name"].as_str().map(str::to_string)))
+}
+
+/// An engine pod's log (`""` while it has none to give).
+fn engine_log(env: &Env, pod: &str) -> String {
+    env.kube
+        .run(&["logs", "-n", &env.driver_ns, pod, "-c", "engine"])
+        .map(|l| strip_ansi(&l))
+        .unwrap_or_default()
+}
+
+/// A pod's log followed from now on (`kubectl logs -f` into a file), so
+/// what a pod said is still there after the pod is gone: the handoff's old
+/// engine pod is deleted before the trio's outcome is known.
+struct LogTap {
+    pod: String,
+    child: std::process::Child,
+    file: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl LogTap {
+    fn start(env: &Env, pod: &str, container: &str) -> Result<LogTap> {
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("log");
+        let out = std::fs::File::create(&file)?;
+        let mut cmd = env.kube.kubectl_command();
+        cmd.args(["logs", "-f", "-n", &env.driver_ns, pod, "-c", container])
+            .stdin(std::process::Stdio::null())
+            .stdout(out)
+            .stderr(std::process::Stdio::null());
+        let child = cmd.spawn().context("spawning kubectl logs -f")?;
+        Ok(LogTap {
+            pod: pod.to_string(),
+            child,
+            file,
+            _dir: dir,
+        })
+    }
+
+    /// The lines it logged between `from_ms` and `to_ms` (ms since the
+    /// epoch), at most `max`.
+    fn between(&self, from_ms: u64, to_ms: u64, max: usize) -> Vec<String> {
+        self.matching(from_ms, to_ms, max, |_| true)
+    }
+
+    /// [`LogTap::between`], only the lines `keep` takes.
+    fn matching(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        max: usize,
+        keep: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let text = std::fs::read_to_string(&self.file).unwrap_or_default();
+        strip_ansi(&text)
+            .lines()
+            .filter(|l| {
+                l.split_whitespace()
+                    .next()
+                    .and_then(rfc3339_ms)
+                    .is_some_and(|t| (from_ms..=to_ms).contains(&t))
+                    && keep(l)
+            })
+            .take(max)
+            .map(|l| l.chars().take(300).collect())
+            .collect()
+    }
+}
+
+impl LogTap {
+    /// Its `kubectl logs -f` ended without a line (the pod had not started,
+    /// or the API refused): worth starting again.
+    fn died_empty(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+            && std::fs::metadata(&self.file).map_or(true, |m| m.len() == 0)
+    }
+}
+
+/// Follow the engine container of every pod of `pods` not followed yet (a
+/// tap that died empty is started again). A tap that cannot start is said,
+/// never dropped silently.
+fn tap_engines(env: &Env, taps: &mut Vec<LogTap>, pods: impl IntoIterator<Item = String>) {
+    for pod in pods {
+        if let Some(i) = taps.iter().position(|t| t.pod == pod) {
+            if !taps[i].died_empty() {
+                continue;
+            }
+            eprintln!("   following {pod}'s log ended with nothing; again");
+            taps.remove(i);
+        }
+        match LogTap::start(env, &pod, "engine") {
+            Ok(tap) => taps.push(tap),
+            Err(e) => eprintln!("   cannot follow {pod}'s log: {e:#}"),
+        }
+    }
+}
+
+impl Drop for LogTap {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The running controller-owned engine pods of the driver's namespace: a
+/// pool's root lease holder (a scope's own, as every scope deletes its
+/// pools' engine pods at its end).
+fn controller_engines(env: &Env) -> Vec<String> {
+    env.kube
+        .run(&[
+            "get",
+            "pods",
+            "-n",
+            &env.driver_ns,
+            "-l",
+            "app.kubernetes.io/component=engine,constellation.dev/owner=controller",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "name",
+        ])
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim_start_matches("pod/").to_string())
+        .collect()
+}
+
+/// The trio's files as they must be after `summary` (`fixed`, every record
+/// of `appended`, `created/f0..`).
+fn trio_model(summary: &constellation_pod_load::Summary) -> Model {
+    use constellation_pod_load as load;
+    let mut model = Model::default();
+    model.mkdir(Path::new("created"));
+    model.write_file(Path::new("fixed"), load::fixed_data(summary.seed));
+    model.write_file(
+        Path::new("appended"),
+        load::appended_data(summary.seed, summary.appended),
+    );
+    for i in 0..summary.created {
+        model.write_file(
+            &Path::new("created").join(format!("f{i}")),
+            load::created_data(summary.seed, i),
+        );
+    }
+    model
+}
+
+/// A snapshot of the trio taken while it ran holds a state it went
+/// through: every file one of `model`'s (the final one) cut at some
+/// length — `fixed` whole (written before the trio started) — and nothing
+/// else; and at least what was acknowledged before it was cut: the first
+/// `records` records of `appended` (an `fsync` returned) and `created/f0`
+/// .. `f<files - 1>` whole (a `close` returned). Returns the snapshot's
+/// `appended` length.
+fn check_trio_snapshot(
+    seen: &BTreeMap<PathBuf, Observed>,
+    model: &Model,
+    records: u64,
+    files: u64,
+) -> Result<u64> {
+    let mut appended = 0;
+    for (rel, o) in seen {
+        let node = model
+            .nodes
+            .get(rel)
+            .with_context(|| format!("the snapshot holds {rel:?}, which the trio never made"))?;
+        match (node, o) {
+            (Node::Dir, Observed::Dir) => {}
+            (Node::File { data }, Observed::File { size, sha256 }) => {
+                let size = *size as usize;
+                ensure!(
+                    size <= data.len() && crate::model::sha256_of(&data[..size]) == *sha256,
+                    "the snapshot's {rel:?} ({size} bytes) is not a prefix of what the trio wrote \
+                     ({} bytes)",
+                    data.len()
+                );
+                if rel == Path::new("fixed") {
+                    ensure!(size == data.len(), "the snapshot's fixed is {size} bytes");
+                }
+                if rel == Path::new("appended") {
+                    appended = size as u64;
+                }
+            }
+            (n, o) => bail!("the snapshot's {rel:?} is {o:?}, the trio's is {n:?}"),
+        }
+    }
+    ensure!(
+        seen.contains_key(Path::new("fixed")),
+        "the snapshot has no fixed"
+    );
+    let acked = records * constellation_pod_load::RECORD as u64;
+    ensure!(
+        appended >= acked,
+        "the snapshot's appended is {appended} bytes; {records} records ({acked} bytes) were \
+         fsynced before it was cut"
+    );
+    for i in 0..files {
+        let rel = Path::new("created").join(format!("f{i}"));
+        let whole = match (model.nodes.get(&rel), seen.get(&rel)) {
+            (Some(Node::File { data }), Some(Observed::File { size, .. })) => {
+                *size == data.len() as u64
+            }
+            _ => false,
+        };
+        ensure!(
+            whole,
+            "the snapshot's {rel:?} is {:?}; it was closed before the snapshot was cut",
+            seen.get(&rel)
+        );
+    }
+    Ok(appended)
+}
+
+/// Plan 37 K5's headline gate (§8, §12, §15): an engine-pod image upgrade
+/// under `upgrade-under-load`'s writer, creator and reader is a pause,
+/// never an error, and the pause stays under 2 s.
+fn csi_engine_pod_handoff_under_load(env: &Env, seed: u64) -> Result<()> {
+    use constellation_pod_load::{now_ms, Summary};
+    const CLAIM: &str = "load";
+    let (w1, w2) = (&env.workers[0], &env.workers[1]);
+    // `static-ephemeral` (37-k6a): the upgraded node plugin holds no
+    // credential, so the replacement must get the old pod's over the
+    // handoff's `Credentials` step.
+    let mut s = Scope::with_params(
+        env,
+        "csi-handoff",
+        &[("credentialSource", "static-ephemeral".into())],
+    )?;
+    s.pvc(CLAIM, "8Gi", false)?;
+    s.wait_bound(Duration::from_secs(300))?;
+    let handle = s.volume_handle(CLAIM)?;
+    let fs = fs_uuid_of(&handle)?;
+    let trio = format!("{}/trio", data_dir(CLAIM));
+    s.spawn_pod(
+        "load",
+        w1,
+        &[CLAIM],
+        Some(&format!(
+            "constellation-pod-load run --dir {trio} --ctl {LOAD_CTL} --seed {seed} \
+             --write-kib-s 512 --creates-s 10 --reads-s 10 --slow-ms 100; exec sleep infinity"
+        )),
+    )?;
+    s.wait_ready("load", Duration::from_secs(300))?;
+    let progress = |s: &Scope| -> Result<u64> {
+        let out = s.exec(
+            "load",
+            &format!(
+                "if [ -e {LOAD_CTL}/failed ]; then cat {LOAD_CTL}/failed; exit 3; fi; \
+                 cat {LOAD_CTL}/progress 2>/dev/null || echo 0"
+            ),
+        )?;
+        Ok(out.trim().parse().unwrap_or(0))
+    };
+    eventually("the trio under way", Duration::from_secs(120), || {
+        ensure!(progress(&s)? >= 200, "fewer than 200 calls so far");
+        Ok(())
+    })?;
+    let on_w1 = |s: &Scope| -> Result<Vec<EnginePod>> {
+        Ok(s.engine_pods(&fs, "node")?
+            .into_iter()
+            .filter(|p| &p.node == w1)
+            .collect())
+    };
+    let old = match on_w1(&s)?.as_slice() {
+        [one] => one.clone(),
+        other => bail!("expected one engine pod of {fs} on {w1}: {other:?}"),
+    };
+    let mount_before = s
+        .staging_mount_id(w1, &handle)?
+        .with_context(|| format!("{handle} is not staged on {w1}"))?;
+    let target = if env.chart_image() == env.image {
+        env.next_image()?
+    } else {
+        env.image.clone()
+    };
+    ensure!(
+        old.image != target,
+        "the engine pod {} already runs {target}",
+        old.name
+    );
+
+    eprintln!(
+        "   trio under way on {w1}; engine pod {} on {}; helm upgrade to {target}",
+        old.name, old.image
+    );
+    // What the old engine pod and the pool's root say from here on, kept
+    // for the verdict (the old pod is gone by then); a root recreated
+    // meanwhile is followed from when it appears.
+    let mut taps: Vec<LogTap> = Vec::new();
+    tap_engines(env, &mut taps, [old.name.clone()]);
+    tap_engines(env, &mut taps, controller_engines(env));
+    let upgraded_ms = now_ms();
+    env.set_chart_image(&target)?;
+    // Watch the rollout reach the load's worker. A `VolumeSnapshot` is
+    // asked for as soon as the replacement waits as a standby (the node
+    // plugin starts the handoff right after), so it is usually cut during
+    // or just after the handoff: when is measured, not enforced.
+    let mut snapshot_asked = None;
+    let mut new = None;
+    eventually(
+        &format!("an engine pod on {target} Ready on {w1}, {} gone", old.name),
+        ROLLOUT,
+        || {
+            tap_engines(env, &mut taps, controller_engines(env));
+            let pods = on_w1(&s)?;
+            if snapshot_asked.is_none() {
+                if let Some(r) = pods.iter().find(|p| p.name != old.name) {
+                    if r.ready || engine_log(env, &r.name).contains("waiting as a handoff standby")
+                    {
+                        // Taken before the request: the cut comes after.
+                        let asked = now_ms();
+                        s.volume_snapshot("across", CLAIM)?;
+                        snapshot_asked = Some(asked);
+                    }
+                }
+            }
+            let gone = env
+                .kube
+                .run(&[
+                    "get",
+                    "pod",
+                    "-n",
+                    &env.driver_ns,
+                    &old.name,
+                    "--ignore-not-found",
+                    "-o",
+                    "name",
+                ])?
+                .trim()
+                .is_empty();
+            match pods
+                .iter()
+                .find(|p| p.name != old.name && p.image == target && p.ready)
+            {
+                Some(p) if gone => {
+                    new = Some(p.clone());
+                    Ok(())
+                }
+                found => bail!("replacement {found:?}, {} gone: {gone}", old.name),
+            }
+        },
+    )?;
+    let new = new.expect("set when the wait ends");
+    let rollout_s = (now_ms() - upgraded_ms) as f64 / 1000.0;
+    eprintln!(
+        "   {} -> {} in {rollout_s:.1} s after the upgrade",
+        old.name, new.name
+    );
+    // `kubectl logs -f` starts at the container's first line: the
+    // replacement's log is whole, and outlives its pod.
+    tap_engines(env, &mut taps, [new.name.clone()]);
+
+    // The handoff as the node plugin logged it: its window is prepare sent
+    // to `Resumed` seen, an upper bound of the client-visible pause (plan
+    // 37 K5 notes).
+    let mut handoff = None;
+    eventually(
+        &format!("the node plugin on {w1} logged the handoff to {}", new.name),
+        Duration::from_secs(60),
+        || {
+            let plugin = node_plugin_on(env, w1, &target)?
+                .with_context(|| format!("no node plugin on {target} runs on {w1}"))?;
+            let log = env.kube.run(&[
+                "logs",
+                "-n",
+                &env.driver_ns,
+                &plugin,
+                "-c",
+                "constellation-csi",
+            ])?;
+            handoff = Some(
+                plugin_handoff(&log, &new.name)
+                    .with_context(|| format!("{plugin} logged no handoff to {}", new.name))?,
+            );
+            Ok(())
+        },
+    )?;
+    let handoff = handoff.expect("set when the wait ends");
+    ensure!(
+        handoff.failed.is_empty(),
+        "the handoff of {} did not succeed at the first attempt:\n{}",
+        handoff.unit,
+        handoff.failed.join("\n")
+    );
+    let window = (
+        handoff.end_ms - handoff.elapsed_ms.round() as u64,
+        handoff.end_ms,
+    );
+    let new_log = engine_log(env, &new.name);
+    ensure!(
+        new_log.contains("handed-over credentials accepted"),
+        "the replacement {} did not take its credentials from the handoff",
+        new.name
+    );
+    let mount_after = s.staging_mount_id(w1, &handle)?;
+    ensure!(
+        mount_after.as_deref() == Some(mount_before.as_str()),
+        "the staging mount changed: {mount_before} -> {mount_after:?} (remounted, not handed over)"
+    );
+    eprintln!(
+        "   handed over in place (mount id {mount_before}); the plugin's window {:.0} ms",
+        handoff.elapsed_ms
+    );
+
+    let at_cutover = progress(&s)?;
+    std::thread::sleep(AFTER_CUTOVER);
+    let after = progress(&s)?;
+    ensure!(
+        after >= at_cutover + 100,
+        "the trio stalled after the cutover ({at_cutover} -> {after} calls)"
+    );
+    tap_engines(env, &mut taps, controller_engines(env));
+    s.exec("load", &format!("touch {LOAD_CTL}/stop"))?;
+    let mut summary = Summary::default();
+    eventually("the trio's summary", Duration::from_secs(180), || {
+        let out = s.exec("load", &format!("cat {LOAD_CTL}/summary.json"))?;
+        summary = serde_json::from_str(&out).context("parsing the trio's summary")?;
+        Ok(())
+    })?;
+    // The gated pause, as the workload saw it: its longest call caught by
+    // the handoff (counted whole, so it can exceed the window; 0 when none
+    // took `--slow-ms` 100).
+    let pause_ms = summary.longest_within(window.0, window.1);
+    let longest = summary
+        .longest
+        .clone()
+        .unwrap_or(constellation_pod_load::SlowCall {
+            op: "none".into(),
+            start_ms: 0,
+            ms: 0,
+        });
+    // A call caught by the handoff that outlasted its window waited on
+    // something after the resume (37-k5a saw a restarted delegate's first
+    // forwarded mutations wait out the delegation its predecessor held):
+    // what the replacement and the pool's root (the controller-owned engine
+    // pod) logged while it waited says what.
+    if let Some(c) = summary
+        .slow
+        .iter()
+        .find(|c| c.start_ms <= window.1 && c.start_ms + c.ms > window.1 + 1000)
+    {
+        eprintln!(
+            "   {} (started {:+} ms, {} ms) outlasted the handoff's window by {} ms; what \
+             the engines logged meanwhile:",
+            c.op,
+            c.start_ms as i64 - window.0 as i64,
+            c.ms,
+            c.start_ms + c.ms - window.1
+        );
+        let (from, to) = (c.start_ms.saturating_sub(500), c.start_ms + c.ms + 500);
+        // The roots and the replacement (the old pod, first, is gone),
+        // without the replacement's meta.db recovery, which would fill
+        // the budget.
+        let notable = |l: &str| !l.contains(" lsm_tree::") && !l.contains(" fjall::");
+        for tap in taps.iter().skip(1) {
+            for line in tap.matching(from, to, 40, notable) {
+                eprintln!("     {}: {line}", tap.pod);
+            }
+        }
+    }
+    env.measure("handoff_ms", handoff.elapsed_ms.round());
+    env.measure("pause_ms", pause_ms);
+    env.measure("longest_call_ms", longest.ms);
+    env.measure(
+        "longest_call",
+        format!(
+            "{} at {:+} ms from the handoff's start",
+            longest.op,
+            longest.start_ms as i64 - window.0 as i64
+        ),
+    );
+    env.measure("rollout_s", (rollout_s * 10.0).round() / 10.0);
+    env.measure("calls", summary.calls);
+    env.measure("errors", summary.error_count());
+    if summary.error_count() > 0 {
+        eprintln!("   what the old engine pod and the pool's root logged around the errors:");
+        for e in summary.errors.iter().take(5) {
+            eprintln!(
+                "   - {} {} at {:+} ms:",
+                e.op,
+                e.code,
+                e.at_ms as i64 - window.0 as i64
+            );
+            for tap in &taps {
+                for line in tap.between(e.at_ms.saturating_sub(10_000), e.at_ms + 3_000, 60) {
+                    eprintln!("     {}: {line}", tap.pod);
+                }
+            }
+        }
+        let first: Vec<String> = summary
+            .errors
+            .iter()
+            .take(20)
+            .map(|e| {
+                format!(
+                    "  {:+} ms {} {}: {}",
+                    e.at_ms as i64 - window.0 as i64,
+                    e.op,
+                    e.code,
+                    e.message
+                )
+            })
+            .collect();
+        bail!(
+            "the trio saw {} error(s) {:?} (times from the handoff's start):\n{}",
+            summary.error_count(),
+            summary.errors_by_code,
+            first.join("\n")
+        );
+    }
+    let slow: Vec<String> = summary
+        .slow
+        .iter()
+        .filter(|c| c.ms >= 500)
+        .map(|c| {
+            format!(
+                "{} {}ms@{:+}",
+                c.op,
+                c.ms,
+                c.start_ms as i64 - window.0 as i64
+            )
+        })
+        .collect();
+    eprintln!(
+        "   trio: {} calls, 0 errors; {} records, {} files, {} reads; pause {pause_ms} ms \
+         within the window, longest call {} ms ({}); calls >= 500 ms: {slow:?}",
+        summary.calls, summary.appended, summary.created, summary.reads, longest.ms, longest.op
+    );
+
+    // Every acknowledged byte, read on the other worker (its own engine
+    // pod) once the load's pod is gone and the volume unstaged there.
+    s.delete_pods(&["load"])?;
+    eventually(
+        &format!("{handle} unstaged from {w1}"),
+        Duration::from_secs(180),
+        || {
+            ensure!(!s.staged_on(w1, &handle)?, "still staged");
+            Ok(())
+        },
+    )?;
+    s.wait_snapshot_ready("across", Duration::from_secs(300))?;
+    let asked = snapshot_asked.context("the rollout ended before a snapshot was asked for")?;
+    // When the snapshot was cut, bracketed: not before the request, nor
+    // before the snapshot controller made its content object (which the
+    // CSI sidecar's `CreateSnapshot` waits for; whole seconds, rounded
+    // down); not after the engine's snapshot row was made, after its
+    // barrier (the content's `status.creationTime`, in ns).
+    let content = s.snapshot_content("across")?;
+    let cut_from = content["metadata"]["creationTimestamp"]
+        .as_str()
+        .and_then(rfc3339_ms)
+        .map_or(asked, |t| t.max(asked));
+    let cut_by = content["status"]["creationTime"]
+        .as_u64()
+        .context("the snapshot's content has no status.creationTime")?
+        / 1_000_000;
+    ensure!(
+        cut_by >= cut_from,
+        "the snapshot's row ({cut_by}) predates its request ({cut_from})"
+    );
+    // A `snapshot.create` that raced the handoff once waited out its 30 s
+    // deadline and was cut on the sidecar's retry: what the engines said.
+    if cut_by > asked + 5_000 {
+        eprintln!(
+            "   the snapshot was cut {} ms after it was asked for; what the engines logged \
+             meanwhile about snapshots, or as warnings:",
+            cut_by - asked
+        );
+        let notable = |l: &str| {
+            l.contains("snapshot")
+                || l.contains("barrier")
+                || l.contains(" WARN ")
+                || l.contains(" ERROR ")
+        };
+        for tap in &taps {
+            for line in tap.matching(asked.saturating_sub(1_000), cut_by + 1_000, 60, notable) {
+                eprintln!("     {}: {line}", tap.pod);
+            }
+        }
+    }
+    let (acked_records, acked_files) = summary.acked_before(cut_from);
+    let rel = |t: u64| t as i64 - window.0 as i64;
+    env.measure("snapshot_asked_ms", rel(asked));
+    env.measure("snapshot_cut_from_ms", rel(cut_from));
+    env.measure("snapshot_cut_by_ms", rel(cut_by));
+    s.pvc_from("restored", "8Gi", None, snapshot_source("across"))?;
+    s.wait_bound_claims(&["restored"], Duration::from_secs(300))?;
+    s.pod("verify", w2, &[CLAIM, "restored"])?;
+    let model = trio_model(&summary);
+    verify_dir(&s, "verify", &trio, &model)
+        .context("every acknowledged byte, read on the other worker")?;
+    let seen = s.listing("verify", &format!("{}/trio", data_dir("restored")))?;
+    let snap_records = check_trio_snapshot(&seen, &model, acked_records, acked_files)?
+        / constellation_pod_load::RECORD as u64;
+    env.measure("snapshot_records", snap_records);
+    env.measure("snapshot_acked_records", acked_records);
+    let span = |t: u64| -> String {
+        if t < window.0 {
+            format!("{} ms before", window.0 - t)
+        } else if t <= window.1 {
+            format!("{} ms into", t - window.0)
+        } else {
+            format!("{} ms after", t - window.1)
+        }
+    };
+    eprintln!(
+        "   on {w2}: the volume holds every byte the trio wrote; the snapshot, cut between {} \
+         and {} the handoff's window, is a state it went through: {snap_records} of {} \
+         records ({acked_records} fsynced before its earliest cut), every one of the \
+         {acked_files} files closed by then",
+        span(cut_from),
+        span(cut_by),
+        summary.appended
+    );
+    s.finish()
+}
+
+#[cfg(test)]
+mod k5_tests {
+    use super::*;
+
+    #[test]
+    fn the_plugins_handoff_line_gives_the_window() {
+        let log = "\u{1b}[2m2026-10-03T11:04:42.250000Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m constellation_csi::node::rollout: engine-pod handoff succeeded unit=u1 views=1 elapsed=342.5ms from=e-a to=e-a-g1\n\
+                   2026-10-03T11:09:00.000000Z  WARN constellation_csi::node::rollout: engine-pod handoff rolled back; the old pod serves unit=u2 step=\"prepare\" error=x restored=true\n\
+                   2026-10-03T11:10:00.000000Z  INFO constellation_csi::node::rollout: engine-pod handoff succeeded unit=u2 views=2 elapsed=1.5s from=e-b to=e-b-g1\n";
+        let a = plugin_handoff(log, "e-a-g1").unwrap();
+        assert_eq!(a.end_ms, 1_791_025_482_250);
+        assert_eq!(a.elapsed_ms, 342.5);
+        assert!(a.failed.is_empty());
+        let b = plugin_handoff(log, "e-b-g1").unwrap();
+        assert_eq!(b.elapsed_ms, 1500.0);
+        assert_eq!(b.failed.len(), 1, "{b:?}");
+        assert!(plugin_handoff(log, "e-c").is_none());
+        assert_eq!(rfc3339_ms("1970-01-01T00:00:01Z"), Some(1000));
+        assert_eq!(rfc3339_ms("2000-03-01T00:00:00.5Z"), Some(951_868_800_500));
+        assert_eq!(debug_duration_ms("980µs"), Some(0.98));
+    }
+
+    #[test]
+    fn a_snapshot_of_the_trio_is_a_state_it_went_through() {
+        let summary = constellation_pod_load::Summary {
+            seed: 3,
+            appended: 10,
+            created: 4,
+            ..Default::default()
+        };
+        let model = trio_model(&summary);
+        let obs = |data: &[u8]| Observed::File {
+            size: data.len() as u64,
+            sha256: crate::model::sha256_of(data),
+        };
+        let app = constellation_pod_load::appended_data(3, 10);
+        let mut seen = BTreeMap::new();
+        seen.insert(PathBuf::from("created"), Observed::Dir);
+        seen.insert(
+            PathBuf::from("fixed"),
+            obs(&constellation_pod_load::fixed_data(3)),
+        );
+        seen.insert(PathBuf::from("appended"), obs(&app[..5000]));
+        let f1 = constellation_pod_load::created_data(3, 1);
+        seen.insert(PathBuf::from("created/f1"), obs(&f1[..10]));
+        let f0 = constellation_pod_load::created_data(3, 0);
+        seen.insert(PathBuf::from("created/f0"), obs(&f0));
+        assert_eq!(check_trio_snapshot(&seen, &model, 1, 1).unwrap(), 5000);
+        // Bytes the trio never wrote there.
+        let mut bad = seen.clone();
+        bad.insert(PathBuf::from("appended"), obs(&app[1..5000]));
+        assert!(check_trio_snapshot(&bad, &model, 0, 0).is_err());
+        // A file it never made.
+        let mut bad = seen.clone();
+        bad.insert(PathBuf::from("created/f9"), obs(b""));
+        assert!(check_trio_snapshot(&bad, &model, 0, 0).is_err());
+        // `fixed` cut short.
+        let mut bad = seen.clone();
+        bad.insert(
+            PathBuf::from("fixed"),
+            obs(&constellation_pod_load::fixed_data(3)[..9]),
+        );
+        assert!(check_trio_snapshot(&bad, &model, 0, 0).is_err());
+        // Fewer records than were fsynced before the cut: 5000 bytes hold
+        // one whole record, not two.
+        assert!(check_trio_snapshot(&seen, &model, 2, 1).is_err());
+        // A file closed before the cut missing (f1 is only a prefix), or
+        // missing altogether (f2, f3).
+        assert!(check_trio_snapshot(&seen, &model, 1, 2).is_err());
+        let mut gone = seen;
+        gone.remove(Path::new("created/f0"));
+        assert!(check_trio_snapshot(&gone, &model, 1, 1).is_err());
+        assert!(check_trio_snapshot(&gone, &model, 1, 0).is_ok());
+    }
 }
 
 #[cfg(test)]

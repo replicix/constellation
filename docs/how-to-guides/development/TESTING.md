@@ -3528,13 +3528,10 @@ real store with no spawned tasks.
   `Credentials` step (the upgraded node plugin holds none). `helm upgrade` runs
   without `--wait` (kubelet can take minutes to roll the node DaemonSet on
   a loaded host); the replacement engine pod is polled for up to
-  `K5_ROLLOUT_S` (900 s). **Known exception, temporary:** the busy file
-  comes up short at EOF on some runs with no handoff at all — a
-  pre-existing engine bug, tracked as chunk `busy-writer-loss`. Until that
-  chunk merges, a byte mismatch on a run with no other error (0 errors, a
-  clean close) is reported as `KNOWN LOSS BUG (busy-writer-loss)` and does
-  not fail the lane (`TODO(busy-writer-loss)` in the script: remove the
-  exception with that chunk). Builds the image unless `CSI_SKIP_BUILD=1`
+  `K5_ROLLOUT_S` (900 s). The busy file must hold exactly the blocks
+  written: any byte mismatch fails the lane (the short-at-EOF loss it once
+  showed was the engine's `busy-writer-loss` bug, fixed in d860148). Builds
+  the image unless `CSI_SKIP_BUILD=1`
   (the second tag is the same image retagged, `CSI_IMAGE_NEXT`); deletes
   the cluster (`kind-37-k5a` by default) unless `CSI_KEEP=1`.
 - `tests/csi/sanity-kind.sh`: csi-sanity's Node group (`CSI_SANITY_FOCUS`)
@@ -3587,7 +3584,7 @@ real store with no spawned tasks.
   subtree walk costs about 0.45 µs per entry warm; no CSI controller RPC
   pays it on a capped volume.
 
-### Kubernetes lane: `harness k8s-scenario` (plan 37 §12, K3, K4)
+### Kubernetes lane: `harness k8s-scenario` (plan 37 §12, K3, K4, K5)
 
 Scenarios that only exist behind the CSI driver run in their own harness
 mode, `harness k8s-scenario <name>... | --all` (`--list` names them; they
@@ -3654,7 +3651,21 @@ target: `Model::verify_observed`). Cross-node expectations use
   selected scenario is reported SKIPPED with the missing tool. A cluster
   with fewer than two workers skips the scenarios that need two.
 - `--results-json` writes `harness run`'s results format (lane
-  `linux-k8s-kind`).
+  `linux-k8s-kind`); a scenario's measurements (the handoff's durations)
+  ride along in each result's `measurements`.
+- **`--repeat N`** runs the selected scenarios N rounds in a row on the one
+  cluster, each round on namespaces and pools of its own (the run id plus
+  `-r<round>`), and reports every round. A scenario may gate one of its
+  measurements: `csi-engine-pod-handoff-under-load` fails the run unless
+  the p99 (nearest rank, so at 20 rounds the slowest) of its `pause_ms`
+  over every round is under 2000 ms. A failed round's value is folded
+  into the p99 as well (that round has already failed the run).
+- **The checkout** (chart, `tests/csi/kind-config.yaml`, the scripts) is the
+  one the harness binary was built in (`<checkout>/target/<profile>/harness`),
+  else the working directory or the nearest checkout above it; never the
+  compile-time `CARGO_MANIFEST_DIR`, which on a host with several worktrees
+  can name another one. The run prints it (`=== checkout …`).
+  `$KIND_CONFIG_DRAFT` still overrides the kind config.
 
 | Scenario | What it proves |
 |---|---|
@@ -3665,6 +3676,7 @@ target: `Model::verify_observed`). Cross-node expectations use
 | `csi-pod-security` | Plan 37 §9 / K6 gate, a kube-bench-style check of the privilege split: every driver pod's spec is re-created by a server dry run in a throwaway namespace enforcing PodSecurity `restricted` (ServiceAccount, node and priority stripped). The controller replicas and the controller-owned engine pod are admitted; the node-owned engine pod is refused for its hostPath volumes and nothing else (its containers meet `restricted`'s rules: non-root, no capability, no escalation, read-only root, `RuntimeDefault` seccomp); the node plugin is refused as privileged. |
 | `csi-plugin-restart-survives` | A writer pod on worker 1 (a 4 KiB file + a log line + a read-back every 100 ms) and a reader on worker 2 run while every node-plugin pod and every controller replica is deleted. They are replaced and Ready, both loops go on with zero errors, the tree matches the model on both nodes and in a new pod published by the restarted plugin, a PVC created afterwards binds and stages, and the engine pods holding the FUSE sessions are the same incarnations with no restarts. |
 | `csi-snapshot-clone-mount` | A pod on worker 1 writes a seeded tree and a 64 MiB file into a PVC; a `VolumeSnapshot` of it is ready with the handle `<volume handle>@snapshot-<uid>` and a `restoreSize` of at least the data; the source then moves on (more ops, the big file removed). A PVC restored from the snapshot and a PVC cloned from the source bind in the source's pool filesystem, and the controller logged a metadata-only `clone.create` for each (under 10 s with the 64 MiB file in the tree; the run prints the times). A pod on worker 2 sees the restore as the tree at the snapshot (big file's SHA-256 intact) and the clone as the tree now; writes into the clone and the restore leave the source's tree as it was. |
+| `csi-engine-pod-handoff-under-load` | Plan 37 K5's headline gate (§8). A pod on worker 1 runs `upgrade-under-load`'s trio against an RWO PV of a `static-ephemeral` pool class: `constellation-pod-load` (`crates/pod-load`, a static binary in the CSI image) appends 4 KiB records through one held descriptor at 512 KiB/s with an `fsync` every 16, creates and closes 10 files a second, and re-reads a 256 KiB file 10 times a second through a held descriptor and a fresh `open`; every call is timed, every failure counted by errno (a short write or a wrong read counts as one), the final `fsync` and every `close(2)` checked. Then the chart's image tag flips (`<image>` ↔ `<image>-next`, the same image under a second tag; `helm upgrade --reuse-values`, no `--wait`), and the restarted node plugin hands the engine pod's FUSE session to a replacement. Checks: the replacement on the new image is Ready on worker 1 and the old pod is gone (within 900 s); the plugin logged the handoff as succeeded at the first attempt (no rollback, loss or partial resume for the unit); the replacement took its credentials from the handoff; the staging mount has the same mount id; the trio keeps going 10 s past the cutover; **zero errors of any kind**. A `VolumeSnapshot` is requested as soon as the replacement waits as a standby; when it was cut is reported (bracketed by the request, or the `VolumeSnapshotContent`'s creation if later, and the engine's snapshot row, the content's `status.creationTime`), not required to fall inside the handoff. After the load pod is gone and the volume unstaged, a pod on worker 2 (its own engine pod) reads every file back: the tree equals the model rebuilt from the seed and the trio's counts (sizes and SHA-256, every acknowledged byte); the PVC restored from the snapshot holds a state the trio went through (`fixed` whole, every other file a prefix of its final contents, nothing else) and at least what was acknowledged before the cut's lower bound (every record a returned `fsync` covered, every `created/` file a returned `close` ended; the trio timestamps each). Measured per run: `pause_ms` (the trio's longest call overlapping the plugin's window, counted whole: the client-visible pause, and the gated value; 0 when no call of 100 ms or more overlapped it), `handoff_ms` (the plugin's `elapsed`, `Prepare` sent to `Resumed` seen), the longest call overall and when it started relative to the window, the rollout time, the call count, and the snapshot's request and cut bracket relative to the window (`snapshot_asked_ms`, `snapshot_cut_from_ms`, `snapshot_cut_by_ms`) with its records and the records acknowledged before it. Diagnostics: the old engine pod's, the replacement's and the pool's root's logs are followed (`kubectl logs -f`; a root that appears later is followed from then, and a follow that cannot start is printed), and printed around every error (the old pod is gone by the verdict); a call caught by the handoff that outlasts its window by over 1 s prints what the replacement and the root logged meanwhile; a snapshot cut over 5 s after its request prints what the engines logged about snapshots or as warnings meanwhile. |
 | `csi-clone-cross-pool-refused` | Two pool classes (two filesystems). Within the source's pool, a PVC clone and a restore from a `VolumeSnapshot` bind in the source's filesystem and hold its tree (read on the other worker). The same clone and restore with the other pool's class get a `ProvisioningFailed` warning with `InvalidArgument` naming both filesystems, and stay `Pending` (plan 37 settled decision 8: never a silent full copy). |
 
 Gate run on the dev box (a created cluster, a prebuilt image; the tag must
@@ -3680,13 +3692,30 @@ On an existing cluster, `kind get kubeconfig --name <cluster> >
 /tmp/kubeconfig` and add `--kubeconfig /tmp/kubeconfig` (it is taken over,
 above).
 
+K5's gate is 20 consecutive handoffs (plan 37 §15), with a snapshot
+across each and `csi-snapshot-clone-mount` beside them:
+
+```bash
+make csi-image CSI_IMAGE=constellation-csi:k5b
+KIND_CLUSTER=kind-37-k5b target/release/harness k8s-scenario \
+    csi-engine-pod-handoff-under-load csi-snapshot-clone-mount --repeat 20 \
+    --image constellation-csi:k5b --results-json handoff.json
+```
+
 CI: `csi-unit` (`ci.yml`) runs `cargo test -p constellation-csi`; nightly's
 `csi-sanity` runs `make csi-sanity` on a hosted runner and `kind-e2e` runs
 `tests/csi/sanity-kind.sh` and `harness k8s-scenario --all` on a
 self-hosted runner labelled `fuse` (plan 37 "K0 results", question 5: a
 hosted runner's kind nodes are unverified). `kind-e2e` runs only when the
 repository variable `CONSTELLATION_FUSE_RUNNER` is `true`, so a nightly
-without such a runner skips it instead of queueing forever.
+without such a runner skips it instead of queueing forever. Nightly's
+`upgrade-under-load` (plan 37 §13, after `kind-e2e`, same runner and
+condition) is the release gate for §8's headline guarantee: `harness
+k8s-scenario csi-engine-pod-handoff-under-load --repeat 20` on a cluster of
+its own, failing on any error in any round or a `pause_ms` p99 of 2 s or
+more; its results file carries every round's measurements. `kind-e2e`'s
+`--all` runs the handoff scenario too (one round, gated the same way),
+and leaves the chart on the `<tag>-next` image it flipped to.
 
 ### Credential revocation on a signature-checking S3 (plan 37 K6a)
 

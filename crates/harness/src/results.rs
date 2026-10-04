@@ -148,6 +148,10 @@ pub struct ScenarioResult {
     pub outcome: Outcome,
     pub seconds: f64,
     pub reason: Option<String>,
+    /// What the scenario measured (`k8s-scenario`'s handoff durations),
+    /// absent when it measured nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurements: Option<serde_json::Value>,
 }
 
 /// The whole results file; see the module docs for the format.
@@ -191,11 +195,24 @@ impl RunResults {
     }
 
     pub fn push(&mut self, name: &str, outcome: Outcome, seconds: f64, reason: Option<String>) {
+        self.push_measured(name, outcome, seconds, reason, None);
+    }
+
+    /// [`RunResults::push`] with what the scenario measured.
+    pub fn push_measured(
+        &mut self,
+        name: &str,
+        outcome: Outcome,
+        seconds: f64,
+        reason: Option<String>,
+        measurements: Option<serde_json::Value>,
+    ) {
         self.scenarios.push(ScenarioResult {
             name: name.to_string(),
             outcome,
             seconds,
             reason,
+            measurements,
         });
     }
 

@@ -1314,6 +1314,7 @@ dependencies = [
  "constellation-control",
  "constellation-meta",
  "constellation-platform",
+ "constellation-pod-load",
  "constellation-store-s3",
  "constellation-types",
  "constellation-vfs",
@@ -1400,6 +1401,17 @@ dependencies = [
  "libc",
  "tempfile",
  "zeroize",
+]
+
+[[package]]
+name = "constellation-pod-load"
+version = "1.0.0"
+dependencies = [
+ "constellation-types",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

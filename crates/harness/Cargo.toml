@@ -29,6 +29,9 @@ constellation-platform.workspace = true
 constellation-meta.workspace = true
 # Plan 31 C5: the daemons' control protocol (client, socket discovery).
 constellation-control.workspace = true
+# Plan 37 K5b: the in-pod writer/creator/reader of
+# `csi-engine-pod-handoff-under-load` — its seeded contents and its summary.
+constellation-pod-load.workspace = true
 # Plan 32 M4: the snapshot scheduler's audit journal and grace state
 # (`snapsched/journal/*.json`, `snapsched/state.json`), read back with the
 # writer's own types by the `snapsched*` scenarios' retention oracle.

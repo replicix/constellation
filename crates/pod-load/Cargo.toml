@@ -1,0 +1,23 @@
+[package]
+name = "constellation-pod-load"
+description = "The writer/creator/reader trio of `upgrade-under-load`, as a static binary a Kubernetes workload pod runs (plan 37 K5b; not part of the product, shipped in the CSI image for the harness's k8s scenarios)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "constellation_pod_load"
+path = "src/lib.rs"
+
+[[bin]]
+name = "constellation-pod-load"
+path = "src/main.rs"
+
+[dependencies]
+constellation-types.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

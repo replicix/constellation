@@ -19,6 +19,7 @@ members = [
     "crates/model",
     "crates/authority",
     "crates/csi",
+    "crates/pod-load",
     "bench/uploadbench",
 ]
 # Bare `cargo build`/`cargo test` at the root only touch the product
@@ -78,6 +79,7 @@ constellation-control = { path = "crates/control" }
 constellation-upload-concurrency = { path = "crates/upload-concurrency" }
 constellation-chaos = { path = "crates/chaos" }
 constellation-authority = { path = "crates/authority" }
+constellation-pod-load = { path = "crates/pod-load" }
 
 anyhow = "1"
 thiserror = "2"

@@ -2514,6 +2514,117 @@ What §8 became against real engine pods, where it had to differ:
   they follow an upgrade (a plain delete-and-recreate suffices: they hold
   no mounts).
 
+**K5 notes (37-k5b, part 2: the gate; K5 closed).**
+
+- **The scenario is `harness k8s-scenario csi-engine-pod-handoff-under-load`**
+  (§12's "engine-pod upgrade with writers running"; §13 called it
+  `engine-pod-handoff-under-load`). The load is `upgrade-under-load`'s
+  trio, in a pod: `constellation-pod-load` (`crates/pod-load`, std only,
+  built static into the CSI image next to the driver because workload
+  pods run that image anyway). It appends 4 KiB records through one held
+  descriptor (512 KiB/s, `fsync` every 16), creates and closes 10 files a
+  second, and re-reads a file 10 times a second through a held descriptor
+  and through a fresh `open`. Every call is timed and counted; a failure
+  is recorded by its errno's POSIX name (`Code::from_io_error`), and a
+  short write or a wrong read counts as one. The final `fsync` and every
+  `close(2)` are checked. The PV is RWO, of a `static-ephemeral` class.
+- **The trigger is the chart.** The scenario flips `image.tag` between the
+  run's image and the same image under a second tag (`<tag>-next`, loaded
+  once), with `helm upgrade --reuse-values` and no `--wait`, and polls for
+  up to 900 s until a replacement on the new image is Ready on the load's
+  worker and the old pod is gone. Rounds alternate the direction.
+- **Duration: the writer's view, gated; the plugin's window, reported.**
+  The gated value is `pause_ms`: the trio's longest call that overlapped
+  the node plugin's handoff window (pod and plugin share the node's
+  clock). That is §8's client-visible pause as the K5a review defined it,
+  from the drain's start until the new pod serves. The window is the
+  plugin's own `elapsed` from its `engine-pod handoff succeeded` line
+  (`Prepare` sent to `Resumed` seen, plus at most one 50 ms status poll),
+  reported as `handoff_ms`. The run fails unless the p99 of `pause_ms`
+  (nearest rank: at 20 runs the slowest) is under 2 s. A call caught by
+  the handoff counts whole, so `pause_ms` can be a little over
+  `handoff_ms` as well as under it; it is 0 when no call of 100 ms or more
+  overlapped the window. The trio keeps every call of 100 ms or more. The
+  first gate's trio kept only the first 200, so after a long rollout it
+  recorded nothing in the window and `pause_ms` read 0: rounds 4 and 7-10
+  of that gate are unmeasured.
+- **The delegation wait, gone with `delegate-root-loss`.** Before f3052f4,
+  in 4 of the first gate's 20 runs (and 11 of the 52 after it) a create
+  (`open(O_CREAT)`) issued during the drain took 2-6 s. It was answered
+  only when the pool's root, the controller-owned engine pod, ended the
+  old engine's delegation: by a recall once the replacement asked (1.0-1.8
+  s after the window) or by a reclaim at its expiry (3.4-5.7 s after).
+  That was the part-1 note "a restarted delegate's first writes wait out
+  its delegation". On a tree with `delegate-root-loss` merged, one call
+  in 30 runs (the review's 10 and two re-measures of 10) outlasted the
+  window by more than 1 s (an `fsync` of 1161 ms, with no recall or
+  reclaim in the root's log), so the gate moved to `pause_ms`. The scenario
+  still prints what the engines logged while such a call waited.
+- **Bytes are checked on a third node.** Not with `stat`: after the load
+  pod is deleted and the volume unstaged from its worker, a pod on the
+  other worker (its own engine pod) lists the trio's tree (sizes and
+  SHA-256) against the model rebuilt from the seed and the trio's counts.
+  That is every acknowledged record, every created file, the read file.
+- **A snapshot near the handoff (with K4).** A `VolumeSnapshot` of the
+  PV is requested as soon as the replacement logs that it waits as a
+  standby. When it is cut is measured, not enforced, and bracketed: not
+  before the request (or the `VolumeSnapshotContent`'s creation, whichever
+  is later), and not after the engine's snapshot row (the content's
+  `status.creationTime`, made after the barrier). The PVC restored from
+  it must hold a state the trio went through (`fixed` whole, every other
+  file a prefix of its final contents, nothing else). It must also hold at
+  least what was acknowledged before the cut's lower bound: every record a
+  returned `fsync` covered, and every `created/` file a returned `close`
+  ended (the trio timestamps each). In the two re-measures (20 runs) the
+  cut fell 0.4-1.5 s after the handoff's start in 12. In the other 8, the
+  request came between 100 ms before and 140 ms after `Prepare` (others
+  in that range were not affected). There the root's `snapshot.create`
+  hung until the CSI controller's 30 s deadline (`DeadlineExceeded`, no
+  row made), and the snapshotter's retry cut it 31 s later (5 s once). This is open: an
+  engine-side race between a snapshot barrier and the delegate's handoff
+  (the engines log nothing about it at `info`). It is not an error to the
+  workload; the snapshot is late. `csi-snapshot-clone-mount` ran beside
+  the handoff in every round of the first gate.
+- **The gate (2026-10-03, kind on this host, load average 12-195).**
+  20/20 consecutive runs passed with 0 errors of any kind (283,000 calls).
+  Every acknowledged byte read back on the other worker, every snapshot
+  was consistent, and `csi-snapshot-clone-mount` passed 20/20.
+  `handoff_ms`: p50 442 ms, p99 (= max) 1057 ms. `pause_ms` (reported
+  then, before `delegate-root-loss`) was over 2 s in 4 runs and is
+  unmeasured in 5 (the trio's 200-call cap, above). After the gate: 8/8,
+  11/12, 12/12, and 20/20 (`handoff_ms` p50 338 ms, p99 535 ms).
+  **The re-measure, gated on `pause_ms`** (the fixed trio, main with
+  f3052f4, load average 20-30): 10/10 consecutive runs, 0 errors in
+  147,975 calls. `pause_ms` p50 266 ms, p99 (= max) 575 ms; `handoff_ms`
+  p50 283 ms, p99 467 ms. The final re-measure, on the finished harness
+  (load average 30-35): 10/10, 0 errors in 148,302 calls, `pause_ms` p50
+  300 ms, p99 (= max) 1161 ms; `handoff_ms` p50 287 ms, p99 380 ms. Every
+  snapshot held everything acknowledged before its earliest cut. The one
+  failed run had 2 `EIO`s during the chart's rollout,
+  150 s before its (clean) handoff. That pod's log was lost with the pod,
+  and the cause is open; the scenario now follows the old engine's and
+  the root's logs from before the upgrade to catch it. The tables are in
+  PROGRESS.md, "Plan 37 K5".
+- **Before the handoff, not in it.** In the loaded rounds, the trio's
+  longest call (up to 26 s, an `fsync`) fell in the minutes the chart
+  upgrade spends rolling the DaemonSet and the controller, before the
+  handoff starts. Those rounds ran at load averages of 100-195, with
+  `cargo test` and the harness matrix sharing the host. At lower load the
+  longest call outside the window was 0.5-2 s. Not investigated further:
+  it is latency, never an error.
+- **`--repeat N`** in the k8s-scenario runner: N rounds on one cluster,
+  each on a namespace and pool of its own (`<run id>-r<round>`), each
+  reported with its measurements in `--results-json`. `K8sScenario::gate`
+  names the measurement whose p99 across the rounds must stay under a
+  bound. A failed round's value counts too (the round has failed the run
+  already).
+- **CI.** Nightly's `upgrade-under-load` (§13) runs the scenario with
+  `--repeat 20` on the self-hosted FUSE runner after `kind-e2e`. The
+  harness fails it on any error, any byte that does not read back, or a
+  `pause_ms` p99 of 2 s or more, so no separate assertion script is needed (§13's
+  `assert-zero-enotconn.py` was not written). It is the release gate §18
+  item 2 lists.
+
 ### K6 — Credentials, security, drain, purge, GC
 
 - `EphemeralSecretStore` wiring for all three `CredentialSource` variants,

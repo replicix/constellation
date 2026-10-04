@@ -408,6 +408,47 @@ jobs:
           kind delete cluster --name nightly-k8s-harness || true
           docker ps -aq --filter name='^nightly-k8s-harness-k8s-floci' | xargs -r docker rm -f || true
 
+  # Plan 37 §13 / K5: the release gate for §8's headline guarantee — an
+  # engine-pod image upgrade under an actively writing, creating and
+  # reading pod is a pause, never an error. 20 consecutive handoffs (§15's
+  # K5 gate), each with a snapshot asked for as the handoff starts; the
+  # harness fails the job on any error in any round, on bytes that do not
+  # read back on the other worker, on a snapshot missing what was
+  # acknowledged before it, and on a writer's pause (`pause_ms`) p99 of 2 s
+  # or more. csi-snapshot-clone-mount runs in kind-e2e's --all. Same self-hosted
+  # FUSE runner and condition as kind-e2e, after it (one kind cluster at a
+  # time on the runner).
+  upgrade-under-load:
+    needs: kind-e2e
+    if: vars.CONSTELLATION_FUSE_RUNNER == 'true'
+    runs-on: [self-hosted, linux, x64, fuse]
+    timeout-minutes: 240
+    env:
+      CSI_IMAGE: constellation-csi:nightly-handoff
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p constellation-harness
+      - run: make csi-image CSI_IMAGE="$CSI_IMAGE"
+      - run: |
+          set -o pipefail
+          KIND_CLUSTER=nightly-upgrade-under-load target/release/harness k8s-scenario \
+            csi-engine-pod-handoff-under-load --repeat 20 --image "$CSI_IMAGE" \
+            --results-json results-upgrade-under-load.json 2>&1 | tee upgrade-under-load.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: upgrade-under-load
+          path: |
+            upgrade-under-load.log
+            results-upgrade-under-load.json
+      - name: Remove leftover clusters
+        if: always()
+        run: |
+          kind delete cluster --name nightly-upgrade-under-load || true
+          docker ps -aq --filter name='^nightly-upgrade-under-load-k8s-floci' | xargs -r docker rm -f || true
+
   macos:
     needs: lint
     runs-on: macos-latest
@@ -427,7 +468,7 @@ jobs:
 
   summary:
     if: always()
-    needs: [lint, unit, integration, compliance, harness, harness-lanes-linux, conformance, parity, xfstests, performance, transport-matrix, zero-copy-7-3, linux-package, csi-sanity, kind-e2e, macos]
+    needs: [lint, unit, integration, compliance, harness, harness-lanes-linux, conformance, parity, xfstests, performance, transport-matrix, zero-copy-7-3, linux-package, csi-sanity, kind-e2e, upgrade-under-load, macos]
     runs-on: ubuntu-latest
     steps:
       - name: Publish summary

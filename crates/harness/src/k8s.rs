@@ -91,6 +91,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use scenarios::{K8sScenario, K8S_SCENARIOS};
@@ -123,18 +125,39 @@ pub struct Opts {
     pub results_json: Option<PathBuf>,
     pub lane: Option<String>,
     pub keep: bool,
+    /// Rounds of the selected scenarios (`--repeat`, at least 1).
+    pub repeat: u32,
 }
 
-/// The repository root: the checkout this harness was built from, else
-/// the working directory (a harness binary copied elsewhere and run from
-/// a checkout).
-fn repo_root() -> PathBuf {
-    let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    if built.join("deploy/helm/constellation-csi").is_dir() {
-        built.canonicalize().unwrap_or(built)
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
+/// The repository root the run reads its chart, kind config and scripts
+/// from ([`find_repo_root`] of this binary and the working directory).
+fn repo_root() -> Result<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    let cwd = std::env::current_dir().ok();
+    find_repo_root(exe.as_deref(), cwd.as_deref()).with_context(|| {
+        format!(
+            "no Constellation checkout above the harness binary ({}) or the working directory \
+             ({}): run it from one",
+            exe.as_deref().unwrap_or(Path::new("?")).display(),
+            cwd.as_deref().unwrap_or(Path::new("?")).display()
+        )
+    })
+}
+
+/// The checkout the binary `exe` was built in (`<root>/target/<profile>/
+/// harness`), else the working directory `cwd` or the nearest parent of it
+/// that is one. Never the compile-time `CARGO_MANIFEST_DIR`: on a host with
+/// several worktrees that names whichever checkout compiled the crate, and
+/// a run then took another branch's chart and kind config.
+fn find_repo_root(exe: Option<&Path>, cwd: Option<&Path>) -> Option<PathBuf> {
+    let is_checkout = |d: &&Path| {
+        d.join("deploy/helm/constellation-csi").is_dir() && d.join("tests/csi").is_dir()
+    };
+    exe.into_iter()
+        .flat_map(|e| e.ancestors().skip(1))
+        .chain(cwd.into_iter().flat_map(Path::ancestors))
+        .find(is_checkout)
+        .map(Path::to_path_buf)
 }
 
 fn kind_bin() -> String {
@@ -219,6 +242,12 @@ pub struct Kube {
 }
 
 impl Kube {
+    /// A `kubectl` command against this cluster, for a caller that runs it
+    /// itself (a follower that outlives one call).
+    pub fn kubectl_command(&self) -> Command {
+        self.kubectl()
+    }
+
     fn kubectl(&self) -> Command {
         let mut c = Command::new("kubectl");
         c.arg("--kubeconfig").arg(&self.kubeconfig);
@@ -520,6 +549,18 @@ pub struct Env {
     /// The cluster goes with the run (created, no `--keep`): an
     /// interrupted scenario leaves its objects to the cluster's deletion.
     disposable: bool,
+    /// The chart and the image it runs now, which
+    /// `csi-engine-pod-handoff-under-load` moves between `image` and
+    /// [`Env::next_image`].
+    chart: PathBuf,
+    chart_image: Mutex<String>,
+    next_image: OnceLock<String>,
+    /// The `--repeat` round running now (0 without `--repeat`): a scope's
+    /// namespace and pool carry it, so every round starts on a filesystem
+    /// of its own.
+    round: AtomicU32,
+    /// What the running scenario measured ([`Env::measure`]).
+    measurements: Mutex<serde_json::Map<String, Value>>,
     _floci: Container,
 }
 
@@ -581,12 +622,7 @@ impl Env {
             .chart
             .clone()
             .unwrap_or_else(|| root.join("deploy/helm/constellation-csi"));
-        // repo[:tag]; a ':' before the last '/' is a registry port.
-        let (repo, tag) = match image.rsplit_once('/') {
-            Some((_, last)) if last.contains(':') => image.rsplit_once(':').unwrap(),
-            None if image.contains(':') => image.rsplit_once(':').unwrap(),
-            _ => (image.as_str(), "latest"),
-        };
+        let (repo, tag) = split_image(&image);
         eprintln!("=== helm upgrade --install {RELEASE} {}", chart.display());
         let mut h = kube.helm();
         h.args(["upgrade", "--install", RELEASE])
@@ -667,12 +703,81 @@ impl Env {
             cluster: cluster.name.clone(),
             workers: cluster.workers.clone(),
             driver_ns: ns,
+            chart_image: Mutex::new(image.clone()),
             image,
             endpoint,
             run_id,
             disposable: cluster.created && !cluster.keep,
+            chart,
+            next_image: OnceLock::new(),
+            round: AtomicU32::new(0),
+            measurements: Mutex::new(serde_json::Map::new()),
             _floci: floci,
         })
+    }
+
+    /// The suffix of this round's names: the run id, and the round when
+    /// the scenarios repeat.
+    pub fn scope_id(&self) -> String {
+        match self.round.load(Ordering::Relaxed) {
+            0 => self.run_id.clone(),
+            r => format!("{}-r{r}", self.run_id),
+        }
+    }
+
+    /// Record a measurement of the running scenario (reported with its
+    /// outcome, and in `--results-json`).
+    pub fn measure(&self, key: &str, value: impl Into<Value>) {
+        let value = value.into();
+        eprintln!("   measured {key} = {value}");
+        self.measurements
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value);
+    }
+
+    fn take_measurements(&self) -> Option<Value> {
+        let m = std::mem::take(&mut *self.measurements.lock().unwrap());
+        (!m.is_empty()).then_some(Value::Object(m))
+    }
+
+    /// The image the chart runs now.
+    pub fn chart_image(&self) -> String {
+        self.chart_image.lock().unwrap().clone()
+    }
+
+    /// The driver image under a second tag (`<tag>-next`), loaded into the
+    /// cluster on first use: to the chart an image change, with the very
+    /// same binary (what a rollout reacts to is the spec, not the bytes).
+    pub fn next_image(&self) -> Result<String> {
+        if let Some(i) = self.next_image.get() {
+            return Ok(i.clone());
+        }
+        let (repo, tag) = split_image(&self.image);
+        let next = format!("{repo}:{tag}-next");
+        docker(&["tag", &self.image, &next])?;
+        eprintln!("=== loading {next} into {}", self.cluster);
+        let mut c = Command::new(kind_bin());
+        c.args(["load", "docker-image", &next, "--name", &self.cluster]);
+        run_cmd(c, None, Duration::from_secs(600)).context("kind load docker-image")?;
+        Ok(self.next_image.get_or_init(|| next).clone())
+    }
+
+    /// `helm upgrade` the driver's release onto `image`, every other value
+    /// kept. No `--wait`: the subject of the caller is the rollout that
+    /// follows (kubelet may take minutes to roll the node DaemonSet on a
+    /// loaded host), which it polls for itself.
+    pub fn set_chart_image(&self, image: &str) -> Result<()> {
+        let (repo, tag) = split_image(image);
+        let mut h = self.kube.helm();
+        h.args(["upgrade", RELEASE])
+            .arg(&self.chart)
+            .args(["-n", &self.driver_ns, "--reuse-values"])
+            .args(["--set", &format!("image.repository={repo}")])
+            .args(["--set", &format!("image.tag={tag}")]);
+        run_cmd(h, None, Duration::from_secs(300)).context("helm upgrade")?;
+        *self.chart_image.lock().unwrap() = image.to_string();
+        Ok(())
     }
 
     /// What a failed scenario leaves for the reader: pods everywhere, the
@@ -720,6 +825,16 @@ impl Env {
             }
         }
         eprintln!("--- end of diagnostics");
+    }
+}
+
+/// `repo[:tag]` of an image reference; a ':' before the last '/' is a
+/// registry port.
+fn split_image(image: &str) -> (&str, &str) {
+    match image.rsplit_once('/') {
+        Some((_, last)) if last.contains(':') => image.rsplit_once(':').unwrap(),
+        None if image.contains(':') => image.rsplit_once(':').unwrap(),
+        _ => (image, "latest"),
     }
 }
 
@@ -782,6 +897,11 @@ impl<'a> Scope<'a> {
         Self::with_class(env, scenario, CREDS_SECRET, &[])
     }
 
+    /// [`Scope::new`] whose class carries `extra` parameters besides.
+    pub fn with_params(env: &'a Env, scenario: &str, extra: &[(&str, String)]) -> Result<Self> {
+        Self::with_class(env, scenario, CREDS_SECRET, extra)
+    }
+
     /// [`Scope::new`] whose class reads `secret` (provisioner and
     /// node-stage) and carries `extra` parameters besides.
     pub fn with_class(
@@ -790,7 +910,7 @@ impl<'a> Scope<'a> {
         secret: &str,
         extra: &[(&str, String)],
     ) -> Result<Self> {
-        let ns = format!("k8s-{scenario}-{}", env.run_id);
+        let ns = format!("k8s-{scenario}-{}", env.scope_id());
         env.kube.apply(&json!({
             "apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}
         }))?;
@@ -812,7 +932,7 @@ impl<'a> Scope<'a> {
             done: false,
         };
         let sc = scope.sc.clone();
-        scope.class(&sc, &format!("k8s-harness/{}/{scenario}", env.run_id))?;
+        scope.class(&sc, &format!("k8s-harness/{}/{scenario}", env.scope_id()))?;
         Ok(scope)
     }
 
@@ -929,6 +1049,15 @@ impl<'a> Scope<'a> {
             },
         )?;
         Ok(found)
+    }
+
+    /// The `VolumeSnapshotContent` bound to `VolumeSnapshot` `name`.
+    pub fn snapshot_content(&self, name: &str) -> Result<serde_json::Value> {
+        let vs = self.kube().get(&["volumesnapshot", "-n", &self.ns, name])?;
+        let content = vs["status"]["boundVolumeSnapshotContentName"]
+            .as_str()
+            .with_context(|| format!("VolumeSnapshot {name} has no bound content"))?;
+        self.kube().get(&["volumesnapshotcontent", content])
     }
 
     pub fn kube(&self) -> &Kube {
@@ -1459,6 +1588,10 @@ pub struct EnginePod {
     /// `constellation.dev/last-view-count`: the views it served when the
     /// node plugin last staged or unstaged through it.
     pub views: Option<u64>,
+    /// Its engine container's image.
+    pub image: String,
+    /// Its `Ready` condition.
+    pub ready: bool,
 }
 
 impl EnginePod {
@@ -1476,6 +1609,15 @@ impl EnginePod {
             views: p["metadata"]["annotations"]["constellation.dev/last-view-count"]
                 .as_str()
                 .and_then(|v| v.parse().ok()),
+            image: p["spec"]["containers"][0]["image"]
+                .as_str()
+                .unwrap_or_default()
+                .into(),
+            ready: p["status"]["conditions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|c| c["type"] == "Ready" && c["status"] == "True"),
         }
     }
 }
@@ -1513,6 +1655,15 @@ pub fn fs_uuid_of(handle: &str) -> Result<String> {
     }
 }
 
+/// The nearest-rank `p` quantile of `values` (non-empty): at 20 runs the
+/// p99 is the slowest one.
+fn percentile(values: &[f64], p: f64) -> f64 {
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    let rank = ((p * v.len() as f64).ceil() as usize).clamp(1, v.len());
+    v[rank - 1]
+}
+
 /// `harness k8s-scenario`.
 pub fn run(opts: Opts) -> Result<()> {
     let selected: Vec<&K8sScenario> = if opts.all {
@@ -1534,7 +1685,7 @@ pub fn run(opts: Opts) -> Result<()> {
     };
     let lane = opts.lane.clone().unwrap_or_else(|| DEFAULT_LANE.into());
     let mut report = RunResults::new(&lane, opts.seed, None);
-    let finish = |report: RunResults, failures: Vec<&str>, skipped: Vec<&str>| -> Result<()> {
+    let finish = |report: RunResults, failures: Vec<String>, skipped: Vec<String>| -> Result<()> {
         if let Some(p) = &opts.results_json {
             report.write(p)?;
             eprintln!("results written to {}", p.display());
@@ -1568,15 +1719,18 @@ pub fn run(opts: Opts) -> Result<()> {
         for s in &selected {
             eprintln!("=== {} SKIPPED ({why})", s.name);
             report.push(s.name, Outcome::Skipped, 0.0, Some(why.clone()));
-            skipped.push(s.name);
+            skipped.push(s.name.to_string());
         }
         return finish(report, Vec::new(), skipped);
     }
 
     interrupt::install().context("installing the SIGINT/SIGTERM handler")?;
-    let root = repo_root();
-    let setup = Cluster::acquire(&opts, &root)
-        .and_then(|cluster| Env::up(&cluster, &opts, &root).map(|env| (cluster, env)));
+    let setup = repo_root()
+        .and_then(|root| {
+            eprintln!("=== checkout {}", root.display());
+            Cluster::acquire(&opts, &root).map(|c| (c, root))
+        })
+        .and_then(|(cluster, root)| Env::up(&cluster, &opts, &root).map(|env| (cluster, env)));
     let (cluster, env) = match setup {
         Ok(ce) => ce,
         Err(e) => {
@@ -1586,50 +1740,102 @@ pub fn run(opts: Opts) -> Result<()> {
             for s in &selected {
                 report.push(s.name, Outcome::Failed, 0.0, Some(why.clone()));
             }
-            let names = selected.iter().map(|s| s.name).collect();
+            let names = selected.iter().map(|s| s.name.to_string()).collect();
             if let Err(fe) = finish(report, names, Vec::new()) {
                 eprintln!("{fe:#}");
             }
             return Err(e.context("k8s-scenario setup"));
         }
     };
-    let mut failures = Vec::new();
-    let mut skipped = Vec::new();
-    for s in selected {
-        if interrupt::interrupted() {
-            eprintln!("=== {} SKIPPED (interrupted)", s.name);
-            report.push(s.name, Outcome::Skipped, 0.0, Some("interrupted".into()));
-            skipped.push(s.name);
-            continue;
+    let mut failures: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    // Every round's gated measurement, per scenario.
+    let mut gated: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for round in 1..=opts.repeat {
+        if opts.repeat > 1 {
+            env.round.store(round, Ordering::Relaxed);
+            eprintln!("=== round {round}/{}", opts.repeat);
         }
-        if env.workers.len() < s.workers {
-            let why = format!(
-                "needs {} workers, the cluster has {}",
-                s.workers,
-                env.workers.len()
-            );
-            eprintln!("=== {} SKIPPED ({why})", s.name);
-            report.push(s.name, Outcome::Skipped, 0.0, Some(why));
-            skipped.push(s.name);
-            continue;
-        }
-        let t0 = Instant::now();
-        eprintln!("=== {} (seed {}) ===", s.name, opts.seed);
-        match (s.run)(&env, opts.seed) {
-            Ok(()) => {
-                eprintln!("=== {} PASSED in {:.1?}", s.name, t0.elapsed());
-                report.push(s.name, Outcome::Passed, t0.elapsed().as_secs_f64(), None);
+        for s in &selected {
+            let label = if opts.repeat > 1 {
+                format!("{} (round {round}/{})", s.name, opts.repeat)
+            } else {
+                s.name.to_string()
+            };
+            if interrupt::interrupted() {
+                eprintln!("=== {label} SKIPPED (interrupted)");
+                report.push(s.name, Outcome::Skipped, 0.0, Some("interrupted".into()));
+                skipped.push(label);
+                continue;
             }
-            Err(e) => {
-                eprintln!("=== {} FAILED in {:.1?}: {e:#}", s.name, t0.elapsed());
-                report.push(
-                    s.name,
-                    Outcome::Failed,
-                    t0.elapsed().as_secs_f64(),
-                    Some(format!("{e:#}")),
+            if env.workers.len() < s.workers {
+                let why = format!(
+                    "needs {} workers, the cluster has {}",
+                    s.workers,
+                    env.workers.len()
                 );
-                failures.push(s.name);
+                eprintln!("=== {label} SKIPPED ({why})");
+                report.push(s.name, Outcome::Skipped, 0.0, Some(why));
+                skipped.push(label);
+                continue;
             }
+            let t0 = Instant::now();
+            eprintln!("=== {label} (seed {}) ===", opts.seed);
+            let result = (s.run)(&env, opts.seed);
+            let mut measured = env.take_measurements();
+            if opts.repeat > 1 {
+                let m = measured.get_or_insert_with(|| json!({}));
+                m["round"] = json!(round);
+            }
+            if let Some(v) = s
+                .gate
+                .as_ref()
+                .and_then(|g| measured.as_ref()?[g.metric].as_f64())
+            {
+                gated.entry(s.name).or_default().push(v);
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            match result {
+                Ok(()) => {
+                    eprintln!("=== {label} PASSED in {:.1?}", t0.elapsed());
+                    report.push_measured(s.name, Outcome::Passed, secs, None, measured);
+                }
+                Err(e) => {
+                    eprintln!("=== {label} FAILED in {:.1?}: {e:#}", t0.elapsed());
+                    report.push_measured(
+                        s.name,
+                        Outcome::Failed,
+                        secs,
+                        Some(format!("{e:#}")),
+                        measured,
+                    );
+                    failures.push(label);
+                }
+            }
+        }
+    }
+    for s in &selected {
+        let (Some(gate), Some(values)) = (&s.gate, gated.get(s.name)) else {
+            continue;
+        };
+        let (p50, p99, max) = (
+            percentile(values, 0.50),
+            percentile(values, 0.99),
+            percentile(values, 1.0),
+        );
+        eprintln!(
+            "=== {}: {} over {} run(s): p50 {p50:.0} ms, p99 {p99:.0} ms, max {max:.0} ms \
+             (gate: p99 under {} ms)",
+            s.name,
+            gate.metric,
+            values.len(),
+            gate.p99_under_ms
+        );
+        if p99 >= gate.p99_under_ms as f64 {
+            failures.push(format!(
+                "{} (p99 {} {p99:.0} ms, not under {} ms)",
+                s.name, gate.metric, gate.p99_under_ms
+            ));
         }
     }
     drop(env);
@@ -1646,6 +1852,55 @@ pub fn run(opts: Opts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_checkout_is_the_binarys_then_the_working_directorys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = |name: &str| {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(root.join("deploy/helm/constellation-csi")).unwrap();
+            std::fs::create_dir_all(root.join("tests/csi")).unwrap();
+            std::fs::create_dir_all(root.join("target/release")).unwrap();
+            root
+        };
+        let (built, other) = (checkout("built"), checkout("other"));
+        let elsewhere = tmp.path().join("bin");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let exe = built.join("target/release/harness");
+        // The binary's own checkout wins over the working directory's.
+        assert_eq!(
+            find_repo_root(Some(&exe), Some(&other.join("tests"))),
+            Some(built.clone())
+        );
+        // A binary outside any checkout: the working directory, or the
+        // checkout above it.
+        let copied = elsewhere.join("harness");
+        assert_eq!(
+            find_repo_root(Some(&copied), Some(&other.join("tests/csi"))),
+            Some(other.clone())
+        );
+        assert_eq!(find_repo_root(Some(&copied), Some(&elsewhere)), None);
+        assert_eq!(find_repo_root(None, None), None);
+    }
+
+    #[test]
+    fn percentiles_are_nearest_rank() {
+        let v: Vec<f64> = (1..=20).map(f64::from).collect();
+        assert_eq!(percentile(&v, 0.5), 10.0);
+        assert_eq!(percentile(&v, 0.99), 20.0);
+        assert_eq!(percentile(&v, 1.0), 20.0);
+        assert_eq!(percentile(&[7.0], 0.99), 7.0);
+    }
+
+    #[test]
+    fn image_references_split_at_the_tag() {
+        assert_eq!(
+            split_image("constellation-csi:dev"),
+            ("constellation-csi", "dev")
+        );
+        assert_eq!(split_image("reg:5000/csi"), ("reg:5000/csi", "latest"));
+        assert_eq!(split_image("reg:5000/csi:k5"), ("reg:5000/csi", "k5"));
+    }
 
     #[test]
     fn pool_handles_name_their_filesystem() {
