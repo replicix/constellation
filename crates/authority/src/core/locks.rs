@@ -590,7 +590,11 @@ impl Core {
     /// Send an owner's answer to a peer: at once if the horizon it needs
     /// (`lock_need_horizon`) is durable, else once the write lands
     /// (`on_lock_horizon_persisted`). Answers to one peer keep their
-    /// order: one made after a held one waits behind it.
+    /// order: one made after a held one waits behind it. Only the
+    /// answers pass through here: a direct send (a `LockRecall`) can
+    /// overtake a held grant, and so reach the holder before the grant
+    /// it recalls — covered on the holder's side by `note_pending_recall`
+    /// and `tombstone_unheld`.
     fn lock_answer(&mut self, to: NodeId, msg: PeerMsg, out: &mut Vec<Action>) {
         let need = std::mem::take(&mut self.lk.horizon_need);
         let behind = self.lk.horizon_held.iter().any(|(_, n, _)| *n == to);
@@ -1692,6 +1696,9 @@ impl Core {
             // up by a quarter TTL: a durable write per quarter TTL, not per
             // second, while peers hold grants. A node's own grants die with
             // its process and leave no horizon (`lock_try_grant`).
+            // The renewal is applied to the table before its horizon is
+            // durable; a failed write only makes the owner wait longer
+            // (it refuses the answer, the table keeps the later expiry).
             if let Some((mode, recalled)) = replica.locks().extend(target, from, until, now.0) {
                 if from != self.cfg.node_id {
                     self.lock_need_horizon(until, until + ttl / 4);

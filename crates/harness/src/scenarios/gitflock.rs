@@ -1636,7 +1636,8 @@ fn judge_turns(
                 && head.as_ref().is_some_and(|h| {
                     (read_eio(&stale.seen.0) || &stale.seen.0 == h)
                         && (read_eio(&stale.seen.1)
-                            || stale.seen.1 == stale.want
+                            || (stale.seen.1 == stale.want
+                                && !x.writes.iter().any(|w| w.0 == "marker"))
                             || &stale.seen.1 == h)
                 })
                 && wrote_landed(x).is_empty();
@@ -1681,7 +1682,15 @@ fn judge_turns(
                     .filter_map(|g| execs.get(g).copied())
                     .max();
                 let executed_in_time = executed_before(prev, got_ms);
-                let fenced_in_time = prev.fenced && fence_first && late.is_empty();
+                // A write whose close errored does not count as completed,
+                // so no late write is no proof: no executor may have let
+                // an op of the turn's grants through once the other turn
+                // had the lock (no grant on record is no op on record).
+                let none_through = prev
+                    .grants
+                    .iter()
+                    .all(|g| execs.get(g).is_none_or(|at| *at < got_ms));
+                let fenced_in_time = prev.fenced && fence_first && late.is_empty() && none_through;
                 let in_flight = prev.fenced
                     && fence_first
                     && !late.is_empty()
@@ -3403,6 +3412,51 @@ mod tests {
             1,
             "an op of its grant executed after it got the lock"
         );
+        // The marker reads `want`, not the last landed commit: fine only
+        // if the turn wrote no marker.
+        let wanted = |write: Option<(f64, f64)>| {
+            let mut x = half((eio, "w"), write);
+            x.stale.as_mut().unwrap().want = "w".into();
+            x
+        };
+        assert_eq!(judge(wanted(None), &before), 0, "no marker written");
+        assert_eq!(
+            judge(wanted(Some((6.1, 6.2))), &before),
+            1,
+            "a marker written"
+        );
+        let mut began = wanted(None);
+        began.writes = vec![("marker", began.got, began.got)];
+        assert_eq!(judge(began, &before), 1, "a marker write on record");
+    }
+
+    /// A fenced turn with no late completed write is fenced in time only
+    /// if no executor let an op of its grants through at or after the
+    /// other turn got the lock (a write whose close errored is not
+    /// completed, yet it may have been published).
+    #[test]
+    fn a_fenced_turn_needs_no_executor_op_after_the_other_got_the_lock() {
+        let base = Instant::now();
+        let judge = |execs: &[((u64, u64), i64)]| {
+            let execs: HashMap<(u64, u64), i64> = execs.iter().copied().collect();
+            let j = judge_turns(
+                &[
+                    turn(base, "a", 0.0, 11.0, Some(8.0), None),
+                    turn(base, "b", 10.0, 12.0, None, None),
+                ],
+                base,
+                1_000_000,
+                500,
+                &execs,
+                &[],
+                &HashMap::new(),
+            );
+            (j.fenced.len(), j.overlaps.len())
+        };
+        assert_eq!(judge(&[]), (1, 0), "no op on record");
+        assert_eq!(judge(&[((1, 7), 1_000_000 + 9_000)]), (1, 0), "before");
+        assert_eq!(judge(&[((1, 7), 1_000_000 + 10_500)]), (0, 1), "after");
+        assert_eq!(judge(&[((1, 7), 1_000_000 + 10_000)]), (0, 1), "at");
     }
 
     use super::*;
