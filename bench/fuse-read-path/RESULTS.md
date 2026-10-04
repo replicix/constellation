@@ -27,7 +27,7 @@ Priority for Constellation (S3-backed, disk chunk cache, portable frontends stil
 mmap > splice ≈ vmsplice (rejected)**. The portable fallback path is unchanged: `ReadData`
 (`Bytes`) → fuser `writev` on `/dev/fuse` (works on FreeBSD; NFS/WinFsp frontends
 untouched). See `README.md` for the mode/column reference and plan 38
-(`docs/plans/v1/wip/38-fuse-read-path-transport.md`) for the full architectural reasoning,
+(`docs/plans/v1/done/38-fuse-read-path-transport.md`) for the full architectural reasoning,
 including the trust-model change that zero-copy and passthrough imply (verification moves
 from "every read" to "on cache admission").
 

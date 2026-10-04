@@ -84,6 +84,24 @@ startup; blocking workers are created lazily rather than at startup. The FUSE
 kernel background queue scales with the worker count, and Linux parallel
 directory dispatch is requested when the kernel supports it.
 
+**Read-path transports (Linux).** A mount's reads reach the kernel over a
+runtime-negotiated ladder, and every rung falls back to the portable
+`/dev/fuse` path (the only one on FreeBSD) without failing the mount. On
+kernel 6.14+ with `fuse.enable_uring=Y` (and a sandbox that allows
+`io_uring_setup(2)`; Docker's default seccomp profile does not) the default
+`auto` serves a mount over FUSE-over-io_uring, no privilege needed — except
+that a mount with cluster locks (the default with P2P) stays on `/dev/fuse`
+unless you pass `--fuse-transport uring`. Read-only opens of single-chunk files
+in a snapshot view can be served by the kernel straight from the chunk cache
+(FUSE passthrough, kernel 6.9+, needs `CAP_SYS_ADMIN`), and kernel 7.3+ adds
+opt-in zero-copy queues (`CONSTELLATION_FUSE_URING_ZERO_COPY=auto`, also
+`CAP_SYS_ADMIN`). `--cache-verify always` trades that speed for re-hashing
+every cache read. A mount served over a ring cannot be handed to a new process: `daemon
+--upgrade` refuses it by name (remount instead), and mounts a CSI engine pod or
+an upgrade resumes stay on `/dev/fuse`. What each mount got is `node.status`'s
+`fuse` section and the `transport` label on `/metrics`; every knob is in
+[docs/reference/configuration.md](docs/reference/configuration.md#read-path-transports-at-a-glance-plan-38).
+
 ## Documentation
 
 Docs follow [Diátaxis](https://diataxis.fr/). Start at

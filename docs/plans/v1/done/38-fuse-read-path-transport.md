@@ -1,5 +1,12 @@
 # Plan 38 — FUSE read-path transport: io_uring, zero-copy, passthrough
 
+> **Status: done (Z0–Z5).** What shipped, with Constellation's own measured
+> numbers per transport, is `docs/plans/v1/PROGRESS.md` "Plan 38 — close-out".
+> Where this document and that section differ, PROGRESS is what the tree does:
+> zero-copy (§3(d)) shipped **opt-in** (`CONSTELLATION_FUSE_URING_ZERO_COPY`
+> defaults to `off`), `auto` keeps cluster-lock mounts on `/dev/fuse` (Z2c),
+> and passthrough is on by default for read-only mounts only (Z3b review).
+
 Read `docs/plans/v1/CONVENTIONS.md` first. This plan replaces the Linux
 read path's fixed shape — one kernel copy through `/dev/fuse` `writev(2)`,
 plus an in-process memory cache of verified chunk bytes (plan 31 C7b's

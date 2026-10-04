@@ -156,7 +156,7 @@ scenarios.
 
 ## The io-uring transport (`patches/0002-io-uring-transport.patch`)
 
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) §3(a),
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) §3(a),
 milestone Z1. `patches/0002-io-uring-transport.patch` adds the userspace
 half of **FUSE-over-io_uring** (kernel 6.14+, ABI 7.42) behind a new cargo
 feature `io-uring`, **off by default**: without the feature this directory

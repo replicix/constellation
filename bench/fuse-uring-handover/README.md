@@ -1,6 +1,6 @@
 # fuse-uring-handover: can a FUSE-over-io_uring session be handed over?
 
-Plan 38 milestone Z0a (`docs/plans/v1/wip/38-fuse-read-path-transport.md` §3(e), §7).
+Plan 38 milestone Z0a (`docs/plans/v1/done/38-fuse-read-path-transport.md` §3(e), §7).
 Constellation's session handover (`FuseSession::detach` → `SessionHandoff` →
 `Session::from_fd_resumed`, plan 31 §6.11) passes the `/dev/fuse` fd to a freshly exec'd
 process B and lets process A exit. With the `/dev/fuse` transport the kernel keeps queuing

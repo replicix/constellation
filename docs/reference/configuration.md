@@ -10,6 +10,8 @@ AWS credentials follow the ordinary AWS SDK chain (`AWS_REGION`,
 
 - [Mount and filesystem options](#mount-and-filesystem-options)
   - [Mount flags](#mount-flags)
+  - [Read-path transports at a glance (plan 38)](#read-path-transports-at-a-glance-plan-38)
+  - [FUSE passthrough](#fuse-passthrough)
   - [Per-filesystem settings](#per-filesystem-settings)
   - [Precedence](#precedence)
   - [Plan 30 commands](#plan-30-commands)
@@ -90,6 +92,56 @@ resolved them when it started, and a connection's transport is fixed for its
 life); such a `mount` prints a warning and carries on with the daemon's.
 Stop the daemon, or set the environment variable before the mount that
 starts it.
+
+### Read-path transports at a glance (plan 38)
+
+Every knob that decides how a Linux mount's reads reach the kernel (plan 38),
+in one place; each is explained in the rows and sections around it. All are
+**daemon-wide**, read once when the daemon starts, and none exists on other
+platforms (macOS, Windows and Android mounts do not go through `/dev/fuse`).
+
+| Knob | Default | Values | Needs |
+|---|---|---|---|
+| `--cache-verify` / `CONSTELLATION_CACHE_VERIFY` | `admit` | `admit`, `always` | nothing. `always` turns passthrough and zero-copy off |
+| `--fuse-transport` / `CONSTELLATION_FUSE_TRANSPORT` | `auto`; `dev-fuse` under `CONSTELLATION_PROFILE=mobile` | `auto`, `uring`, `dev-fuse` | the ring: kernel 6.14+ with `fuse.enable_uring=Y`, `io_uring_setup(2)` allowed by the sandbox (Docker's default seccomp denies it). No privilege |
+| `--fuse-uring-queue-depth` / `CONSTELLATION_FUSE_URING_QUEUE_DEPTH` | `8`; `32` for a cluster-lock mount on `uring` | positive integer | a mount that gets the ring |
+| `CONSTELLATION_FUSE_PASSTHROUGH` | unset: read-only mounts only | `1`/`on`/`true`/`yes`, `0`/`off`/`false`/`no` | kernel 6.9+ (`CONFIG_FUSE_PASSTHROUGH`), `CAP_SYS_ADMIN` in the initial user namespace, a cache directory on a filesystem the kernel accepts as a backing file (not overlayfs). Works on every transport and without the `io-uring` feature |
+| `CONSTELLATION_FUSE_URING_ZERO_COPY` | `off` | `off`, `auto`, `pinned` | the ring, kernel 7.3+ with io_uring buffer pools, `CAP_SYS_ADMIN` |
+| `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ` | `512k` | bytes, `<n>k`, `<n>m` | a `uring_zc` mount |
+
+**Precedence.** For `--fuse-transport` and `--fuse-uring-queue-depth` the
+**environment wins over the flag**, and the flag over the default (the engine
+profile's: `auto`, or `dev-fuse` on `mobile`), so one host can be put on one
+transport without editing what starts the daemon; `--cache-verify` is the same
+(`CONSTELLATION_CACHE_VERIFY` wins over the flag). The passthrough and
+zero-copy knobs are environment-only. An unparseable value fails the mount,
+**except** `CONSTELLATION_CACHE_VERIFY`, which is warned about and ignored
+(see above). The transport and queue depth belong to the daemon: a `mount`
+that only attaches a view to a running daemon cannot change them.
+
+**What a mount gets, in order** (the first rule that applies wins; the
+per-mount `node.status` `transport` and `last_fallback` say which did):
+
+1. **Handover-capable mounts are `dev_fuse`, whatever the knobs say**: a
+   `view.mount` on a descriptor somebody else opened (plan 37's CSI engine pods)
+   and every mount `daemon --upgrade` resumes. A ring session cannot be handed
+   to another process image, so these never take the ring (`handover_capable`).
+2. **The mobile profile defaults to `dev-fuse`**: the ring's buffers are not
+   worth a phone's memory budget. `CONSTELLATION_FUSE_TRANSPORT` still overrides
+   it on a Linux host running that profile.
+3. **`dev-fuse`** asks for no ring. **`auto`** asks for the ladder but keeps a
+   mount with cluster locks (the default with P2P) on `/dev/fuse`
+   (`cluster_locks`); `--locks local`, no-P2P and read-only snapshot mounts take
+   the ladder. **`uring`** asks for the ladder for every plain mount.
+4. The ladder takes the ring where the build, kernel and sandbox grant it and
+   falls back to `/dev/fuse` otherwise, logged once with the reason, never as a
+   failed mount. Zero-copy queues are added only when
+   `CONSTELLATION_FUSE_URING_ZERO_COPY` is `auto` or `pinned`, and the mount
+   is then `uring_zc`.
+
+Whether `auto` should also give cluster-lock mounts the ring is an **open
+decision** (plan 38 close-out in `docs/plans/v1/PROGRESS.md`); the default is
+unchanged.
 
 **FUSE passthrough** (plan 38 §3(c): the kernel reads a single-chunk file
 straight from its cached chunk) is on by default for **read-only** mounts
@@ -201,8 +253,10 @@ backups, datasets read through), not for ones that re-read a working set.
 > against 7 at the ordinary depth 8; the price is address space, not
 > memory — see plan 38 §4 and PROGRESS "Plan 38 Z2"). Use it where the
 > applications on the mount do not pile dozens of contended blocking locks
-> onto one CPU, or where they handle `ENOLCK` by retrying. This default is
-> to be revisited after plan 38 Z4's zero-copy numbers.
+> onto one CPU, or where they handle `ENOLCK` by retrying. Z4's zero-copy
+> numbers gave no CPU argument either way; whether `auto` should put
+> cluster-lock mounts on the ring is an open decision for the project owner
+> (plan 38 close-out in PROGRESS), and the default stays as described.
 >
 > `CONSTELLATION_FUSE_URING_FAULT=malformed-register` is **fault injection
 > for the test harness only** (`transport-refused-registration`): a mount

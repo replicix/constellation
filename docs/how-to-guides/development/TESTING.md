@@ -2295,6 +2295,24 @@ falls more than the baseline's 20% tolerance (the harness bench needs
 noise in the sub-second metadata and warm-cache probes does not create a
 spurious regression.
 
+## Read-path lanes at a glance (plan 38)
+
+Four lanes cover the Linux read-path transports; what a host needs decides
+which of them can say anything there. Each is explained in the section named.
+
+| Lane | Command | Proves | Needs |
+|---|---|---|---|
+| Cost gate | `make read-cpu-gate` | daemon CPU-s/GiB and peak RSS per lane and transport (a leg is the `CONSTELLATION_FUSE_TRANSPORT` the gate runs under; zero-copy and passthrough through their own variables) | fio, Linux; root for `uring_zc` and passthrough. See "Read-path cost gate" |
+| Transport matrix | `make transport-matrix` (`harness-transport-matrix` for the full matrix) | the read-path scenarios (or all of them) once per leg: `dev-fuse`, `auto`, `uring`, with a census of what each mount negotiated | any host; the ring legs are fallback legs unless the kernel grants the ring. See "FUSE transport matrix" |
+| Ring host or **KVM guest** | the guest procedure in "Running the ring legs" | the ring itself: a 6.14+ kernel booted with `fuse.enable_uring=1`, the matrix over `dev-fuse auto uring`, `make compliance-uring` (pjdfstest on the ring) | a host or guest with that kernel; CI: a self-hosted `fuse-uring` runner |
+| **7.3 lane** | the four `zero-copy-*` scenarios as root | `uring_zc`: the chunk-spanning fallback, eviction while a read is in flight, `--cache-verify always` turning it off | Linux 7.3+ with buffer pools, root; SKIPs loudly elsewhere. CI: a self-hosted `fuse-uring-zc` runner. See "FUSE zero-copy reads: the 7.3 lane" |
+
+Passthrough has its own scenarios (`passthrough-*`, `CAP_SYS_ADMIN` and Linux
+6.9+, SKIP loudly otherwise; "FUSE passthrough (plan 38 Z3)"). pjdfstest has
+been run on `dev_fuse`, `uring` and `uring_zc` with no exception added;
+`docs/plans/v1/PROGRESS.md` "Plan 38 — close-out" has the tallies and the
+measured numbers per transport.
+
 ## Read-path cost gate: `make read-cpu-gate` (plan 38 §6)
 
 `tests/read-cpu-gate.sh` measures what the **daemon spends** to serve
@@ -2357,8 +2375,10 @@ to the `performance-logs` artifact. The reason is that the committed
 `tests/read-cpu-baseline.json` belongs to one developer host and a shared
 runner's CPU per GiB is neither comparable to it nor stable enough to gate
 on — what the nightly run buys is that the lane cannot rot unnoticed.
-Gating against the committed baseline is operator-run on a stable host
-until plan 38's Z1 establishes a runner baseline.
+Gating against the committed baseline is operator-run on a stable host. The
+ring legs of the nightly `transport-matrix` job are the exception: each leg
+compares with its own baseline, created by the leg's first run on the runner
+(see "The ring legs in CI").
 
 ## FUSE transport matrix (plan 38 §6)
 

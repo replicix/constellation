@@ -29133,7 +29133,7 @@ which are the gate run's.
 
 ## Plan 38 Z0a — FUSE-over-io_uring session handover spike
 
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) §3(e) left one
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) §3(e) left one
 question open: can a FUSE session that uses the io_uring transport go through
 plan 31 §6.11's handover (`/dev/fuse` fd passed to a freshly exec'd process,
 the old one exits and takes its io_uring instance with it)? The answer decides
@@ -29163,7 +29163,7 @@ both a way to quiesce a server's ring entries and dispatch-on-register.
 
 ## Plan 38 Z0b — Verify-once reads, `--cache-verify`, and the read-path cost gate
 
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) §2.3's two
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) §2.3's two
 verify-once changes, the `--cache-verify` knob that names the trust model they
 imply, the fio-based CPU-s/GiB + RSS gate of §6 that later milestones compare
 against, and the transport matrix lane's skeleton. No transport work: Z1
@@ -30698,7 +30698,7 @@ chunk writes the full section.
 
 ## Plan 38 Z1 — the vendored FUSE-over-io_uring transport and `TransportPolicy`
 
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z1,
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) milestone Z1,
 landed in two chunks: **Z1a** vendored the userspace half of
 FUSE-over-io_uring into `vendor/fuser` behind the `io-uring` cargo feature
 (commit `a73d103`), and **Z1b** — this chunk — put the user-facing policy on
@@ -32675,15 +32675,6 @@ handled signal does not: killable, not interruptible, as NFS `hard`), and
 for data that is still only local. What each `--fsync-mode` waits *for* is
 unchanged (§6 leaves `local`'s chunk wait to the maintainer).
 
-## Plan 38 Z3 — FUSE passthrough for single-chunk read-only opens
-
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z3,
-in two chunks: **Z3a** (engine side, `8a8516c`) decides eligibility at open
-and pins the chunk, and **Z3b** (FUSE side, this section) turns
-`Opened::backing` into a `FOPEN_PASSTHROUGH` reply on a kernel and process
-that allow it, reports it, keeps it consistent with the kernel's per-inode
-I/O-mode rule, and carries it across `daemon --upgrade`. **Z3 is closed.**
-
 ### What landed
 
 | Item | State | Where |
@@ -33324,6 +33315,19 @@ and no serde alias is added.
 | fresh `kind-37-k3a`, `tests/csi/k2-smoke.sh` (image `constellation-csi:k3a-fix2`, musl fast path) | k2-smoke PASSED, policies type-check, 1 positive control admitted, 12 controller-SA negatives denied |
 | fresh `kind-37-k3a`, `tests/csi/k3-smoke.sh` (same image) | k3-smoke PASSED, 12 node-SA negatives denied |
 
+## Plan 38 Z3 — FUSE passthrough for single-chunk read-only opens
+
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) milestone Z3,
+in two chunks: **Z3a** (engine side, `8a8516c`) decides eligibility at open
+and pins the chunk, and **Z3b** (FUSE side, this section) turns
+`Opened::backing` into a `FOPEN_PASSTHROUGH` reply on a kernel and process
+that allow it, reports it, keeps it consistent with the kernel's per-inode
+I/O-mode rule, and carries it across `daemon --upgrade`. **Z3 is closed.**
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
 | `Opened::backing` / `PassthroughChunk` (fd, len, hash) | done (Z3a) | `crates/vfs/src/types.rs`; `FrontendCaps::passthrough` (`crates/vfs/src/caps.rs`) gates whether the engine offers one at all |
 | Eligibility at open | done (Z3a), extended in Z3b | `View::passthrough_backing` (`crates/engine/src/view/passthrough.rs`): read-only, no write intent, regular non-empty file, no write session (attached or pending flush), one inline chunk, `file_len == size`, resident **and verified**, `--cache-verify admit`. Z3b adds: no other handle of the inode open for writing (`View::writers`, counted from the `OpenFlags` that `open`/`create` and `release` carry), and the frontend's *negotiated* capability (`passthrough_on`, set through the new `Vfs::frontend_negotiated`) instead of the one it declared before `FUSE_INIT` |
 | Pin-while-open | done (Z3a) | `DiskCache::pin_open`/`OpenPin` (`crates/fs-core/src/cache.rs`): a per-chunk refcount that keeps the chunk un-evictable without changing accounting; `release` trims an inode's pins to its handles still open. Z3b adds `DiskCache::open_pin_total` → `node.status` `cache.open_pins`, `/metrics` `constellation_cache_open_pins`, `stats.subscribe` `cache_open_pins` |
@@ -33932,7 +33936,7 @@ upstream through the cut (it was `served <= served_at_cut + BURST`).
 
 ## Plan 38 Z2 — adapter integration, observability, and `auto` on by default
 
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z2,
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) milestone Z2,
 landed in three chunks: **Z2b** (commit `5a56fb9`) made the transport
 observable, **Z2a** (`5ead388`) made the ring safe to serve a real
 filesystem on, and **Z2c** — this chunk — turned `TransportPolicy::Auto` on
@@ -35306,7 +35310,7 @@ this scenario, whose files are one byte.
 
 ## Plan 38 Z4a — zero-copy queues, fuser side
 
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z4,
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) milestone Z4,
 its fuser half: the 7.3 zero-copy ABI re-verified against the running
 kernel (7.3.0-rc4, `165768bb7026`), `ADD_QUEUE`/`ADD_BUFPOOL`/`READ_FIXED`
 and `FOPEN_IO_URING_ZERO_COPY` in patch 0002, and `Transport::UringZeroCopy`
@@ -35360,7 +35364,7 @@ design and the measured memory are in `vendor/fuser/CONSTELLATION-PATCH.md`
 
 ## Plan 38 Z4 — zero-copy reads on 7.3 (Z4a fuser side + Z4b routing)
 
-Plan 38 (`docs/plans/v1/wip/38-fuse-read-path-transport.md`) milestone Z4,
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) milestone Z4,
 §3(d): a read that lies inside one verified, resident chunk is answered by
 the kernel reading that chunk file straight into the reader's pages (one
 `IORING_OP_READ_FIXED` on a zero-copy io_uring queue), with no byte passing
@@ -40454,3 +40458,234 @@ tests/webui-headless.sh` PASS; harness (prefix `m7f`, `TMPDIR=/var/tmp/m7f`):
 PASSED; `snapshot-busy-latency` FAILED once at load ~90 (9.3 s vs a 3.6 s
 bound on a busy holder; no budget in it), then PASSED twice in a row (12.1 s,
 12.2 s) at load ~30.
+
+
+## Plan 38 — close-out (Z5): the read-path transports as shipped
+
+Plan 38 (`docs/plans/v1/done/38-fuse-read-path-transport.md`) is closed and has
+moved from `wip/` to `done/`. This section records what the tree does, with
+Constellation's own numbers. The per-milestone sections above (Z0a, Z0b, Z1,
+Z2, Z3, Z3c, Z4a, Z4) hold the evidence; this one is the summary a reader
+needs first. No code changed in Z5.
+
+### What shipped, and what did not
+
+| Milestone | State | What the tree does |
+|---|---|---|
+| Z0a handover spike | shipped | A ring session cannot be handed over losslessly, so handover-capable sessions (`daemon --upgrade`'s target, plan 37's `PreopenedFd` mounts) are `dev_fuse` for good, and `FuseSession::detach` refuses a ring session by name |
+| Z0b verify-once + gate | shipped | `--cache-verify {admit,always}` (default `admit`), direct memcache admission, `make read-cpu-gate`, `tests/read-cpu-baseline.json` (32-CPU host, kernel 7.0), the matrix lane's skeleton |
+| Z1 vendored ring (Z1a, Z1b) | shipped | `vendor/fuser` patch 0002 behind the `io-uring` feature; `TransportPolicy`; `CONSTELLATION_FUSE_TRANSPORT`, `CONSTELLATION_FUSE_URING_QUEUE_DEPTH`; ring RSS measured (+3.2 MiB resident against a 1 GiB `MAP_NORESERVE` reservation on 8 CPUs). Z1's ring-leg exit criterion (one blocked request stalls its queue) moved to Z2a and was met there |
+| Z2 adapter, observability, default (Z2a, Z2b, Z2c) | shipped | `auto` is the default for plain mounts; ring threads dispatch only reads; `node.status.fuse`, the `transport` label, `constellation_fuse_*`; the `io-uring` feature is in every Linux build. **`auto` keeps cluster-lock mounts on `/dev/fuse`** (maintainer decision 2026-10-02, option (b)); `--fuse-transport uring` opts them in, depth 32 |
+| Z3 passthrough (Z3a, Z3b, Z3c) | shipped | Single-chunk read-only opens, verified and **not held in the memory tier**. On by default for **read-only mounts only** (snapshot views); `CONSTELLATION_FUSE_PASSTHROUGH=1` opts a writable mount in, with the `ETXTBSY` caveat. Works without the `io-uring` feature |
+| Z4 zero-copy on 7.3 (Z4a, Z4b) | shipped **opt-in** | `uring_zc` queues are **off by default** (`CONSTELLATION_FUSE_URING_ZERO_COPY=off`); `auto`/`pinned` turn them on. Reads of at least `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ` (512 KiB) inside one verified chunk are one `READ_FIXED` from the chunk file. Cold sequential reads gain; warm and small random reads cost more CPU than plain `uring` |
+| Z5 close-out | this section | |
+
+Slipped or not done, plainly:
+
+- **The ring and 7.3 lanes run in CI only where a self-hosted runner exists.**
+  `nightly.yml`'s `transport-matrix` and `zero-copy-7-3` jobs need runners
+  labelled `fuse-uring` / `fuse-uring-zc` and the repository variables
+  `FUSE_URING_RUNNER` / `FUSE_URING_ZC_RUNNER`; without them the jobs skip and
+  the nightly summary says so. Every ring and zero-copy result in this plan was
+  taken on a developer host or KVM guest. Hosted CI runs the `dev-fuse` leg and
+  the smoke test on `auto` (a fallback there).
+- **The read-cost gate records in CI, it does not gate.** Only the committed
+  Z0b baseline is a hard limit, and it belongs to one host. The ring legs'
+  per-leg baselines are created by the first run on a runner.
+- **The kernel < 6.14 rung** is covered by a unit test on the classification
+  (`an_init_without_the_ring_bit_is_kernel_not_offered`), not by a real old
+  kernel.
+- **Follow-ups found, not done:** the `READ_FIXED` io-wq hop on `uring_zc`
+  (likely avoidable); `View::chunk_list` re-reading a spilled chunk list on
+  every read, on every transport (visible on 4 KiB reads); `ring_setup_failed`
+  under `vm.overcommit_memory=2` or a tight `RLIMIT_AS` (the reservation needs
+  address space).
+
+### Constellation's own numbers, per transport
+
+Source: `tests/read-cpu-gate.sh` (Z0b's gate; five lanes, local file backend,
+4 MiB chunks, 1 GiB memory tier, fio). It writes one JSON line per lane per
+repeat to `$READ_CPU_OUT` (default `$WORK/results.jsonl`) carrying
+`cpu_s_per_gib`, `rss_hwm_mib`, `bw_mib_s`, the asked-for and `negotiated`
+transport. **Only the Z0b baseline is committed** (`tests/read-cpu-baseline.json`,
+the medians of its three-repeat idle-host run); the later columns are medians
+of those lines as quoted in the section named in each header, and the raw
+result files were left in run directories (`/var/tmp`, `/tmp`) that this
+repository does not keep. The columns come from **different hosts and loads**:
+compare within a column group, never across. Z0b: 32 CPU, kernel 7.0, idle;
+Z1: 8-CPU KVM guest, kernel 7.0; Z2, Z3, Z4: 32 CPU, kernel 7.3.0-rc4, load
+13–60 from other sessions (Z3 and Z4 as root).
+
+Daemon CPU-s/GiB (median):
+
+| lane | Z0b `dev_fuse` | Z1 `dev_fuse` → `uring` | Z2 `dev_fuse` → `uring` | Z3 passthrough off → **on** (`dev_fuse`) | Z4 `dev_fuse` | Z4 `uring` | Z4 `uring_zc` |
+|---|---|---|---|---|---|---|---|
+| `cold-seq-1m` | 3.50 | 2.50 → 2.48 | 3.44 → 2.86 | 2.52 → 2.10 | 3.21 | 2.49 | 2.96 |
+| `warm-disk-seq-1m` | 0.98 | 0.80 → 0.76 | 0.65 → 0.58 | 0.60 → 0.62 | 0.66 | 0.57 | 0.64 |
+| `warm-mem-seq-1m` | 0.22 | 0.16 → 0.14 | 0.24 → 0.14 | 0.20 → 0.20 | 0.22 | 0.12 | 0.14 |
+| `rand-4k-dio` | 7.15 | 5.12 → 3.81 | 17.28 → 5.98 | 10.14 → 6.86 | 14.05 | 6.36 | 9.40 |
+| `smallfiles` | 13.48 | 23.48 → 25.28 | 13.02 → 6.76 | 16.2 → **12.1** | 14.72 | 7.20 | 7.04 |
+
+Peak RSS, MiB (`VmHWM`), and bandwidth where the section gives it:
+
+| lane | Z0b | Z1 `dev_fuse` → `uring` | Z2 `dev_fuse` → `uring` | Z4 `dev_fuse` / `uring` / `uring_zc` | Z4 MiB/s, same order |
+|---|---|---|---|---|---|
+| `cold-seq-1m` | 808 | 741 → 735 | 772 → 815 | 771 / 816 / **296** | 1 662 / 1 881 / **3 402** |
+| `warm-disk-seq-1m` | 595 | 594 → 594 | 598 → 608 | 603 / 616 / 610 | 1 595 / 1 744 / 1 531 |
+| `warm-mem-seq-1m` | 596 | 595 → 595 | 598 → 618 | 604 / 618 / 610 | 4 511 / 6 361 / 5 508 |
+| `rand-4k-dio` | 995 | 977 → 976 | 967 → 1 006 | 967 / 1 008 / 760 | 514 / 643 / 410 |
+| `smallfiles` | 345 | 344 → 344 | 348 → 349 | 355 / 354 / 352 | 131 / 236 / 247 |
+
+Notes on reading them:
+
+- **Passthrough** (Z3) has no RSS column: the Z3 section recorded none. It can
+  only act on `smallfiles` (the other lanes read 256/512 MiB multi-chunk
+  files, which are never eligible), where `memcache_misses` fall 10 → 0 and
+  smallfiles bandwidth goes 95 → 181 MiB/s; every other lane's difference is
+  noise. The unprivileged run (no `CAP_SYS_ADMIN`) measured 2.30 / 0.60 / 0.18 /
+  7.04 / 13.84 and is the same path as "off". Z3c made frozen snapshot files
+  eligible; on a snapshot view it is parity with passthrough off when the
+  memory tier holds the chunks, and it is only taken for chunks the tier does
+  not hold (a cold page cache made it 3x slower before that rule).
+- **Smallfiles at Z1** (+8%) was the one lane the ring made worse; Z2a's
+  offload split and `ReplyData::fill` turned it into −48%.
+- **Z4's `uring_zc`** reached the throughput it was built for only on the
+  cold sequential lane (1.8x the throughput at a third of the peak RSS,
+  CPU inside the host's spread). `rand-4k-dio` costs +48% CPU-s/GiB and −36%
+  MiB/s against plain `uring` (an io-wq worker hop per `READ_FIXED`, plus a
+  second ring round trip); the warm lanes cost +12–17%. After the fix rounds
+  (threshold 512 KiB, memory-tier refusal dropped) the final A/B on the same
+  load was cold 1.86 → 1.52 CPU-s/GiB with 1 014 → 1 459 MiB/s and
+  856 → 354 MiB RSS, warm-disk 0.64 → 0.70, warm-mem 0.10 → 0.18 (a noisy lane;
+  the earlier 0.14 vs 0.15 is the better estimate), `rand-4k-dio` 3.41 → 5.86.
+  That is why it is opt-in.
+- Every run passed its own recorded baseline gate.
+
+Against the bench (the reference column, `bench/fuse-read-path/RESULTS.md`;
+a minimal libfuse filesystem, not Constellation, so ratios are the comparison,
+not magnitudes):
+
+| shape | bench `copy` → `uring` → `uring-zc` | Constellation, `dev_fuse` → `uring` → `uring_zc` (Z4) |
+|---|---|---|
+| hot 4 KiB random, O_DIRECT, concurrent (CPU-s/GiB) | 3.71 → 0.78 (4.7x) → ≈ `uring` | 14.05 → 6.36 (2.2x) → 9.40; Z2's interleaved pair was 2.9x |
+| buffered sequential, warm (CPU-s/GiB) | 0.14 → 0.08 → 0.044 | `warm-disk` 0.66 → 0.57 → 0.64 |
+| cold sequential (CPU-s/GiB) | 0.24 → 0.17 → 0.12 | 3.21 → 2.49 → 2.96 |
+| small files (MiB/s) | 1 430 → 2 170 → 2 844 | 131 → 236 → 247 |
+| passthrough-eligible opens | 0 daemon CPU, 5 MiB RSS | `smallfiles` daemon sees none of the reads (misses 10 → 0); the daemon still pays for the fetches |
+
+The ring's win is real and in the predicted places, but Constellation's own
+per-read work (manifest lookup, op lock, prefetch bookkeeping, memcache lookup)
+is most of what the gate measures, so the 4.7x of the bench is 2–3x here and
+the bench's sequential zero-copy win (0.044 vs 0.121) did not reproduce.
+
+### pjdfstest per transport (8798 tests each)
+
+| transport | milestone | tally |
+|---|---|---|
+| `dev_fuse` | Z1, Z2c, Z3, Z4 | 8798 passed, 0 failed, every milestone it ran |
+| `dev_fuse` with `CONSTELLATION_FUSE_TRANSPORT=auto` (a compliance-container mount keeps cluster locks, so `auto` negotiates `dev_fuse`) | Z2c, Z4 | 8798 / 0 |
+| `uring` (`make compliance-uring`, `seccomp:unconfined`) | Z1, Z2c | 8798 / 0 |
+| `uring_zc`, default threshold and threshold 0 | Z4 | 8798 / 0 each |
+| `dev_fuse` with passthrough: writable default (off, `writable_mount`), opt-in on overlayfs (`backing_open`, off), opt-in with `/tmp` on tmpfs (on, `opens_total=1`) | Z3 | 8798 / 0 each |
+
+No exception was added at any milestone; the baseline stays empty. Z0b did not
+run pjdfstest (its gate run was separate). The two failures Z1's ring box
+showed (`truncate/12.t:2`, `ftruncate/12.t:2`) were not a transport difference:
+`staging_code` mapped the state directory's `EFBIG` to `EIO`; fixed there.
+
+### Decision record: §2.1 row 1 (REJECT `splice`) and plan 31 C7b's candidate (b) (REJECT `splice`)
+
+Two sections of this file say "REJECT splice", and they do not contradict.
+**Plan 31 C7b candidate (b)** (the "Plan 31 C7b" section, row "(b) Userspace
+buffer pool vs `splice(2)`") asked whether Constellation needed a
+`splice`-based buffer pool to avoid per-op *userspace allocation* on the read
+path. It measured allocations per op, fixed the real sources (hex formatting,
+path building: 60 → 21 allocs/op), and rejected `splice` because `ReadData`'s
+`Bytes` segments already give zero-copy in userspace. **Plan 38 §2.1 row 1**
+asked a different question: would `splice(2)` from the chunk file into
+`/dev/fuse` avoid the *kernel-side* copy, the RAM triplication or the CPU that
+the plan measured later. It would not: `fs/fuse/dev.c` copies a spliced reply as
+`writev` does, libfuse falls back to `writev` for replies under 8 KiB,
+`SPLICE_F_MOVE` steals the chunk file's page-cache pages and so evicts
+Constellation's own disk cache, cold reads fall back to copy, and the only win
+(O_DIRECT sequential) is one `io_uring` already matches. Both verdicts are
+REJECT, for different reasons and on different measurements; neither reopens the
+other. C7b's own follow-up finding (every read of a cached chunk loaded and
+re-hashed the whole chunk) is what the chunk memory cache (the "Chunk memory
+cache" section) and then plan 38 §2.3's verify-once answered. What replaced
+`splice` for the kernel-side copy is the transport ladder above, not a
+`splice` variant; no `splice(2)` or `vmsplice(2)` call exists on the read path.
+
+### Open decision (project owner): should `auto` give cluster-lock mounts the ring?
+
+**Not decided; the default is unchanged.** Under `auto`, a mount with cluster
+locks (`--locks cluster`, the default with P2P) stays on `dev_fuse`
+(`last_fallback.reason = cluster_locks`); `--fuse-transport uring` puts it on
+the ring with depth 32. Z2c's maintainer decision said "revisit after Z4".
+What bears on it:
+
+- **What staying on `/dev/fuse` costs.** In the full matrix (189 scenarios) 54
+  of 576 non-transport mounts (9.4%) got the ring under `auto`, 514 (89.2%)
+  stayed on `/dev/fuse` for their cluster locks. A default desktop or server
+  daemon runs `dev_fuse`.
+- **What the ring buys on this code** (Z2, same host, `dev_fuse` → `uring`):
+  `rand-4k-dio` −65% CPU-s/GiB, `smallfiles` −48%, warm-memory −42%,
+  cold sequential −17%, peak RSS within +4%.
+- **What it costs.** Over a ring a request holds its entry until it is answered.
+  A queue lends at most `depth − 1` entries to blocking lock requests; the next
+  contended blocking `F_SETLKW`/`flock` on that CPU's queue gets **`ENOLCK`**
+  instead of waiting (counted in `lock_wait_downgrades`). Depth 32 gives 31
+  waiters per CPU against 7 at depth 8 and measured **0 MiB** extra resident
+  memory, for 16 GiB instead of 4 GiB of `MAP_NORESERVE` address space on 32
+  CPUs (the ring mount falls back with `ring_setup_failed` where address space is
+  limited). `transport-lock-wait-budget` on a real kernel: depth 4 → 3 waited,
+  4 `ENOLCK`; depth 32 → 31 waited, 4 `ENOLCK`; the mount never hung.
+- **What Z4 adds: nothing for or against.** Zero-copy gives no CPU saving on
+  these lanes, so it is no argument for the flip; in a forced-`uring` root run
+  where every mount including the cluster-lock ones was `uring_zc` (`sqlite-two-nodes`,
+  `passwd-live-cluster`, `two-clients-shared`, `git-workflow`, …) no lock scenario
+  failed with `ENOLCK`. That is evidence that the common workloads do not pile
+  dozens of contended blocking locks on one CPU, not a guarantee.
+- Handover-capable mounts and the mobile profile stay `dev_fuse` regardless.
+
+The choice is between a documented, rare, POSIX-legal `ENOLCK` for a 2–3x cut in
+daemon CPU on every default mount, and the safe default. Changing it is one
+line in `MountOptions::plan` (the `cluster_locks` rung) plus the default depth;
+the tests that pin the current rule are `transport-cluster-locks-auto` and the
+Z2c unit tests.
+
+### Documentation
+
+`docs/reference/configuration.md` has one "Read-path transports at a glance"
+section listing every knob (`--cache-verify`, `--fuse-transport` /
+`CONSTELLATION_FUSE_TRANSPORT`, `--fuse-uring-queue-depth` /
+`CONSTELLATION_FUSE_URING_QUEUE_DEPTH`, `CONSTELLATION_FUSE_PASSTHROUGH`,
+`CONSTELLATION_FUSE_URING_ZERO_COPY`, `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ`)
+with defaults, precedence, the handover-capable exception and the mobile
+default; `README.md` has a paragraph on the transports and the privileges each
+needs; `TESTING.md` has an index of the transport lanes (matrix, KVM guest, 7.3
+lane, fio gate) at "Read-path lanes at a glance".
+
+### Inconsistencies found while closing
+
+- **Z3b's report was filed under the wrong headings.** The "Plan 38 Z3" heading
+  and intro sat above plan 39's F1–F5 body (a merge accident), and Z3b's
+  table, gate runs and exit criteria sat inside the "Plan 37 K3a" section. The
+  heading and intro now sit with the Z3b table (`## Plan 38 Z3` follows K3a's
+  gate table); plan 39's section is back under its own heading. Text unchanged.
+  The "Plan 39" section still carries four stray lines from plan 32 M2's gate
+  tables and an "Exit criteria (plan 32 Step 12, M2)" list, which belong to
+  "Plan 32 M2" (not moved here).
+- Z0b's section says the handoff field was `#[serde(default)]`; `ea8049a`
+  removed it and the handoff has no compatibility since (`HANDOVER_VERSION` is
+  now 6 in `crates/cli/src/handover.rs`, which the plan's Z2c paragraph also
+  says). The Z0b text is history.
+- Z1's section names `make build-uring` and a `compliance-uring` image built
+  with a feature flag; Z2c removed both (the feature is in every Linux build).
+  The section is history; `TESTING.md` is current.
+- `configuration.md` and plan §7's Z2c text said the cluster-lock default is
+  "to be revisited after Z4's numbers"; the numbers are in, the decision is
+  open (above), and both now say so.
+- Z0b's and the TESTING.md gate text said the CI cost gate would gate "until
+  Z1 establishes a runner baseline". It records in the `performance` job and
+  gates per leg in `transport-matrix` (first run blesses); TESTING.md is fixed.
