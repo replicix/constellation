@@ -2211,11 +2211,26 @@ impl Core {
         let Some(cur) = replica.locks().held(ino) else {
             return;
         };
-        if cur.id.node != id.node || cur.id.seq >= id.seq || cur.owner != from {
+        if cur.id.node != id.node || cur.id.seq > id.seq || cur.owner != from {
             return;
         }
         let margin = self.lock_margin_ms();
         let ttl = ttl_ms as i64;
+        if cur.id == id {
+            // The owner's recall of the new id came first and adopted it
+            // (`LockTables::recall_held`): the reply extends that grant
+            // like a renewal answer, its local locks and flags kept.
+            // Dropped, the grant kept the window of the push it replaced,
+            // counted from the waiter's first request, and lapsed under
+            // the I/O it was finishing before its release (sim
+            // `locks-blips-tight-long-lease` seed 3270: fenced 236 ms
+            // after the push's install).
+            replica
+                .locks()
+                .renewed(ino, id, id, mode, now.0, ttl, margin, false);
+            self.stats.lock_late_replies_installed += 1;
+            return;
+        }
         let held = HeldGrant {
             id,
             mode,

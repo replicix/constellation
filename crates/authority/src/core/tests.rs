@@ -8970,6 +8970,101 @@ mod locks {
         assert_eq!(flush, GrantId { node: 1, seq: 3 });
     }
 
+    /// Sim `locks-blips-tight-long-lease` seed 3270: the owner's recall of
+    /// the re-affirmed id comes before the reply that carries it, and the
+    /// recall adopts the id (`LockTables::recall_held`). The reply then
+    /// extends the grant from its arrival, as a renewal answer would; the
+    /// local lock and the recall continue. Dropped, the grant kept the
+    /// push's window (counted from the first request) and lapsed under
+    /// the I/O it was finishing.
+    #[test]
+    fn a_reply_whose_id_a_recall_already_adopted_extends_the_grant() {
+        let mut r = requester();
+        let sent = r.now;
+        let req = lock_control(&mut r, 50, 42, true);
+        r.advance(300);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockGranted {
+                ino: 42,
+                sent,
+                outcome: grant_msg(2),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let pushed_until = r.meta.locks().held(42).unwrap().until_ms;
+        assert!(
+            pushed_until <= sent.0 + 5_000,
+            "the push's window counts from the first request"
+        );
+        assert_eq!(
+            r.meta.locks().local_set(
+                42,
+                LocalLock {
+                    owner: 9,
+                    pid: 1,
+                    pid_start: 0,
+                    write: true,
+                    start: 0,
+                    end: u64::MAX
+                },
+                r.now.0
+            ),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 3 },
+            },
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(1, PeerMsg::LockRecalled { req: OpId(77) })]
+        ));
+        assert_eq!(
+            r.meta.locks().held(42).unwrap().id,
+            GrantId { node: 1, seq: 3 }
+        );
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(3),
+            },
+        });
+        assert!(sends(&out).is_empty(), "nothing to say: {out:?}");
+        let held = r.meta.locks().held(42).unwrap();
+        assert_eq!(held.id, GrantId { node: 1, seq: 3 });
+        assert!(
+            held.until_ms >= pushed_until + 320,
+            "extended from the reply: {} vs {pushed_until}",
+            held.until_ms
+        );
+        assert!(held.recalled && !held.first_use && !held.releasing);
+        assert_eq!(r.core.stats.lock_late_replies_installed, 1);
+        // The I/O ends; the release names the adopted id.
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.now.0));
+        let out = r.step(Event::Control {
+            op: OpId(51),
+            req: Control::LockIdle { ino: 42 },
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::LockFlush {
+                    ino: 42,
+                    grant: GrantId { node: 1, seq: 3 }
+                }
+            )),
+            "{out:?}"
+        );
+    }
+
     /// The holder is a lock user: its own request is answered in place,
     /// with no message; a second local request under the cached grant
     /// never reaches the core (the FUSE layer resolves it) but a
@@ -11618,6 +11713,103 @@ mod locks {
         assert!(!h.core.epoch_reclaim_pending(h.now));
     }
 
+    /// Chunk epoch-liveness-gap, a member's side: node 2, in an epoch
+    /// carrying node 1's lease, is promised to node 1's fresh epoch (node 1
+    /// closed and was cut again before its re-claim) and then activated in
+    /// it, carrying the same lease. Its core never sees the epoch closed:
+    /// no close, no S3 write (no acquisition, no promise) on the way, and
+    /// it goes on as a member of an epoch carrying another node's lease.
+    #[test]
+    fn a_member_goes_from_the_open_epoch_to_its_carriers_fresh_one_without_closing() {
+        let mut h = Harness::new(2);
+        h.core.cfg.p2p = true;
+        h.core.cfg.epoch_slack = 1;
+        h.core.start(h.now, &h.meta, &mut Vec::new());
+        let carrier = crate::event::Carrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: h.now.0 + 5_000,
+        };
+        let members = [1, 2, 3];
+        let mut out = h.step(epoch_report(true, true, false, &members, Some(carrier)));
+        h.advance(200);
+        // Promised to the new epoch (open, not active), then its activation.
+        out.extend(h.step(epoch_report(true, false, false, &members, Some(carrier))));
+        h.advance(20);
+        out.extend(h.step(epoch_report(true, true, false, &members, Some(carrier))));
+        assert!(h.core.epoch.open && h.core.epoch.active);
+        assert_eq!(h.core.pr.carried, Some(carrier));
+        assert!(!h.core.lease.epoch_held() && h.core.lease.held.is_none());
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::EpochClose)),
+            "{out:?}"
+        );
+        let writes: Vec<_> = s3_ops(&out)
+            .into_iter()
+            .filter(|(_, op)| {
+                matches!(
+                    op,
+                    S3Op::LeaseCreate { .. } | S3Op::LeaseSwap { .. } | S3Op::HeartbeatPut { .. }
+                )
+            })
+            .collect();
+        assert!(writes.is_empty(), "{writes:?}");
+        assert!(!h.core.epoch_reclaim_pending(h.now));
+    }
+
+    /// Review of chunk epoch-liveness-gap (should-fix 4): the member's
+    /// transient report (promised to the carrier's fresh epoch: open,
+    /// neither active nor frozen) is not a close. Shipping stays off, the
+    /// delegates stay stopped (`dl.epoch_active`: no delegation is granted
+    /// or accepted meanwhile), and no round is nudged. If the new epoch
+    /// activates, nothing ran; if it is aborted instead, the close-release
+    /// runs at that close.
+    #[test]
+    fn a_replaced_epochs_transient_report_is_not_a_close() {
+        for aborted in [false, true] {
+            let mut h = Harness::new(2);
+            h.core.cfg.p2p = true;
+            h.core.cfg.epoch_slack = 1;
+            h.core.start(h.now, &h.meta, &mut Vec::new());
+            let carrier = crate::event::Carrier {
+                node: 1,
+                epoch: 1,
+                expires_unix_ms: h.now.0 + 5_000,
+            };
+            let members = [1, 2, 3];
+            h.step(epoch_report(true, true, false, &members, Some(carrier)));
+            assert!(h.core.skip_ship && h.core.dl.epoch_active);
+            h.advance(200);
+            // A nudge with no round in flight arms the poll now.
+            let nudged = |h: &Harness, out: &[Action]| {
+                h.core.nudged
+                    || out
+                        .iter()
+                        .any(|a| matches!(a, Action::SetTimer { at, .. } if *at == h.now))
+            };
+            let out = h.step(epoch_report(true, false, false, &members, Some(carrier)));
+            assert!(h.core.epoch_replacing);
+            assert!(h.core.skip_ship, "shipping stays off");
+            assert!(h.core.dl.epoch_active, "the delegates stay stopped");
+            assert!(!nudged(&h, &out), "no round: {out:?}");
+            h.advance(20);
+            if aborted {
+                let out = h.step(epoch_report(false, false, false, &members, Some(carrier)));
+                assert!(!h.core.epoch_replacing);
+                assert!(!h.core.skip_ship && !h.core.dl.epoch_active);
+                assert!(
+                    nudged(&h, &out),
+                    "the close-release nudges a round: {out:?}"
+                );
+            } else {
+                h.step(epoch_report(true, true, false, &members, Some(carrier)));
+                assert!(!h.core.epoch_replacing);
+                assert!(h.core.skip_ship && h.core.dl.epoch_active);
+                assert!(!h.core.lease.epoch_held());
+            }
+        }
+    }
+
     /// Must-fix 1 of the review: S3 is cut while the re-claim's CAS is in
     /// flight; it lands but answers a timeout. The object is then
     /// `(me, e, X')`, which the close never saw: the next acquisition
@@ -11671,6 +11863,104 @@ mod locks {
         let next = lease_of(1, object.epoch, object.expires_unix_ms + 9);
         h.core.epoch_tenure_cas_in_doubt(&object, &next);
         assert_eq!(h.core.pr.closed_tenure, vec![it(&object), it(&next)]);
+    }
+
+    /// Chunk epoch-liveness-gap (`locks-blips-tight` seed 66): the
+    /// re-claim's CAS answered in doubt, S3 cut again. The closed node
+    /// claims the latest object of its tenure (what the CAS wrote if it
+    /// landed), carriable in an epoch with others: their members stay in
+    /// it while S3 shows that object or the earlier one. An activation
+    /// carrying it holds it again and keeps the grants. The claim is
+    /// usable only while the earliest object is (a taker outside the
+    /// epoch waits for that one's expiry).
+    #[test]
+    fn a_closed_claim_in_doubt_claims_the_latest_object_and_is_held_again() {
+        let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        let next = lease_of(1, object.epoch, object.expires_unix_ms + 3_000);
+        h.core.epoch_tenure_cas_in_doubt(&object, &next);
+        let view = h.core.epoch_claim_view(h.now);
+        let claimed = view.held.as_ref().expect("the closed lease is claimed");
+        assert_eq!(
+            (claimed.holder, claimed.epoch, claimed.expires_unix_ms),
+            (1, next.epoch, next.expires_unix_ms)
+        );
+        assert!(!view.in_doubt);
+        assert_eq!(
+            view.claim(&[1, 2]),
+            Some((next.epoch, next.expires_unix_ms, true))
+        );
+        // Past the earliest object's margin, nothing is claimed although
+        // the later one is unexpired.
+        let margin = h.core.cfg.expiry_margin_ms as i64;
+        let at = Ms(object.expires_unix_ms - margin + 1);
+        assert!(h.core.epoch_claim_view(at).held.is_none());
+        let carrier = crate::event::Carrier {
+            node: 1,
+            epoch: next.epoch,
+            expires_unix_ms: next.expires_unix_ms,
+        };
+        // Promised with the carrier its last activation named, then the
+        // activation carrying the claim.
+        let last = h.core.pr.carried;
+        h.step(epoch_report(true, false, false, &[1, 2], last));
+        assert!(!h.core.lease.epoch_held());
+        h.step(epoch_report(true, true, false, &[1, 2], Some(carrier)));
+        assert!(h.core.lease.epoch_held(), "held again");
+        assert_eq!(h.core.stats.epoch_closed_leases_reheld, 1);
+        assert_eq!(h.core.stats.epoch_holds_adopted_late, 0);
+        assert_eq!(h.meta.locks().grants_len(), 2, "the grants stand");
+    }
+
+    /// Chunk epoch-liveness-gap (`flex-tight` seed 1913): the activation
+    /// carrying the closed lease reaches its node only after that lease's
+    /// expiry (a paused process). It holds it again all the same, as a
+    /// held lease is (`carries_mine`): the claim was usable when acked,
+    /// and nobody takes the object over while the epoch is open. Before,
+    /// nobody held the epoch, and it never closed.
+    #[test]
+    fn a_late_activation_holds_the_closed_lease_again_past_its_expiry() {
+        let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
+        let carrier = h.core.pr.carried;
+        h.step(epoch_report(false, false, false, &[1, 2], carrier));
+        assert!(h.core.epoch_claim_view(h.now).held.is_some());
+        h.step(epoch_report(true, false, false, &[1, 2], carrier));
+        assert!(!h.core.lease.epoch_held());
+        h.advance((object.expires_unix_ms - h.now.0 + 100) as u64);
+        assert!(h.core.epoch_claim_view(h.now).held.is_none(), "expired");
+        h.step(epoch_report(true, true, false, &[1, 2], carrier));
+        assert!(h.core.lease.epoch_held(), "the late activation holds it");
+        assert_eq!(h.core.stats.epoch_closed_leases_reheld, 1);
+        assert_eq!(h.meta.locks().grants_len(), 2, "the grants stand");
+    }
+
+    /// The refusing side: a CAS in doubt of the kept tenure wrote another
+    /// lease epoch, so the object may be one no claim covers. Carried
+    /// only by an epoch of this node alone; activated with others
+    /// carrying it, the node owes the move and holds nothing.
+    #[test]
+    fn a_closed_claim_whose_cas_wrote_another_epoch_is_carried_alone_only() {
+        let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
+        let carrier = h.core.pr.carried;
+        h.step(epoch_report(false, false, false, &[1, 2], carrier));
+        let other = lease_of(1, object.epoch + 1, object.expires_unix_ms + 3_000);
+        h.core.epoch_tenure_cas_in_doubt(&object, &other);
+        let view = h.core.epoch_claim_view(h.now);
+        assert!(view.in_doubt);
+        let claim = |members: &[NodeId]| view.claim(members).map(|c| c.2);
+        assert_eq!(claim(&[1, 2]), Some(false));
+        assert_eq!(claim(&[1]), Some(true));
+        h.step(epoch_report(true, false, false, &[1, 2], carrier));
+        assert!(!h.core.lease.epoch_held());
+        h.step(epoch_report(true, true, false, &[1, 2], carrier));
+        assert!(!h.core.lease.epoch_held(), "no hold");
+        assert!(h.core.pr.owes_move.is_some(), "the move is owed");
     }
 
     /// Must-fix 2 of the review: a local lock asked for between the
@@ -14586,6 +14876,42 @@ fn a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile() {
             "closed while the carrier may still hold the epoch: {out:?}"
         );
         assert!(h.core.epoch.open, "the epoch stays open");
+        // An earlier object of the carried holder and lease epoch: the
+        // carrier claimed the object its re-claim CAS in doubt may have
+        // written, and that CAS did not land (chunk epoch-liveness-gap).
+        // The carried lease is not reached yet: close nothing. Released,
+        // or at another lease epoch, it has moved.
+        for (object, closes) in [
+            (lease_of(1, 1, h.now.0 + 13_000), false),
+            (
+                Lease {
+                    released: true,
+                    ..lease_of(1, 1, h.now.0 + 13_000)
+                },
+                true,
+            ),
+            (lease_of(1, 0, h.now.0 + 13_000), true),
+            (lease_of(2, 1, h.now.0 + 13_000), true),
+        ] {
+            let mut h = Harness::new(2);
+            let expires = h.now.0 + 20_000;
+            let get = open(&mut h, expires);
+            let out = h.step(Event::S3 {
+                op: get,
+                result: S3Result::LeaseGet(Ok(Some((object.clone(), tag())))),
+            });
+            let (upload, complete) = upload_of(&out);
+            assert_eq!(complete, closes, "{object:?}");
+            let out = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+            assert_eq!(
+                out.iter().any(|a| matches!(a, Action::EpochClose)),
+                closes,
+                "{object:?}: {out:?}"
+            );
+        }
         // The holder re-claimed it (a new expiry): the epoch is over.
         let mut h = Harness::new(2);
         let expires = h.now.0 + 20_000;

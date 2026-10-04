@@ -195,6 +195,8 @@ impl EpochManager {
         *self.carrier.lock().unwrap()
     }
 
+    /// Called with the machine lock held, by the activation the carrier
+    /// belongs to (lock order: machine, then carrier, as `sync_flags`).
     fn set_carrier(&self, carrier: Option<EpochCarrier>, stale_below: u64) {
         *self.carrier.lock().unwrap() = (carrier, stale_below);
         let _ = self
@@ -393,11 +395,43 @@ impl EpochManager {
         }
         let base: BTreeMap<String, u64> = base.into_iter().collect();
         let p = EpochPromise::new(epoch_id.clone(), members.clone(), base, now_ms());
-        let accepted = {
+        // Chunk epoch-liveness-gap: the open epoch's carrier, closed (it
+        // proposes) and cut from S3 again before its re-claim landed,
+        // proposes a fresh epoch, and this member (not the hold's owner)
+        // takes it in place of the open one
+        // (`EpochMachine::persist_promise_proposed`). The carrier and the
+        // hold are read under the machine lock, which `handle_activate`
+        // also holds while it sets the carrier with the activation: the
+        // carrier read is always the open epoch's own, never the previous
+        // epoch's beside a just-activated one.
+        let (accepted, replaced) = {
             let mut m = self.machine.lock().unwrap();
-            m.persist_promise(p).is_ok()
+            let carrier = self.carrier().0.map(|c| c.node);
+            let holds = self.claim.lock().unwrap().epoch_held;
+            let open = m
+                .current()
+                .filter(|_| m.is_open())
+                .map(|c| c.epoch_id.clone());
+            let accepted = m
+                .persist_promise_proposed(p, proposer, carrier, holds)
+                .is_ok();
+            (accepted, open.filter(|id| accepted && *id != epoch_id))
         };
         self.sync_flags();
+        if let Some(replaced) = replaced {
+            // `sync_flags` persisted the new epoch; the replaced one's row
+            // would otherwise stay open on disk and be loaded again at a
+            // restart once the new one closes. Closed after the new one is
+            // written: a crash in between loads the new one (the later
+            // promise).
+            let _ = self.meta.set_epoch_state(&replaced, "closed");
+            tracing::info!(
+                epoch_id,
+                replaced,
+                proposer,
+                "joined a proposal in place of the open epoch"
+            );
+        }
         let (claim, known) = self.my_claim(&members);
         Payload::EpochAck {
             epoch_id,
@@ -409,14 +443,14 @@ impl EpochManager {
     }
 
     pub fn handle_activate(&self, activation: EpochActivation) {
-        let ok = self
-            .machine
-            .lock()
-            .unwrap()
-            .activate(&activation.epoch_id)
-            .is_ok();
-        if ok {
-            self.set_carrier(activation.carrier, activation.stale_below);
+        // The carrier is set under the machine lock that activates: a
+        // proposal handled meanwhile (`handle_propose_checked`) sees either
+        // the promised epoch or the active one with its own carrier.
+        {
+            let mut m = self.machine.lock().unwrap();
+            if m.activate(&activation.epoch_id).is_ok() {
+                self.set_carrier(activation.carrier, activation.stale_below);
+            }
         }
         self.sync_flags();
         tracing::info!(
@@ -619,10 +653,10 @@ impl EpochManager {
             epoch: c.epoch,
             expires_unix_ms: c.expires_unix_ms,
         });
-        self.set_carrier(carrier, stale_below);
         {
             let mut m = self.machine.lock().unwrap();
             m.activate(&epoch_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.set_carrier(carrier, stale_below);
         }
         self.sync_flags();
         let activation = EpochActivation {
@@ -1045,6 +1079,180 @@ mod tests {
                 carrier.is_none(),
                 "{carrier:?}"
             );
+        }
+    }
+
+    /// Chunk epoch-liveness-gap: a member of an active epoch carrying
+    /// node 1's lease takes node 1's fresh proposal in place of it (node 1
+    /// closed that epoch and was cut from S3 again before its re-claim
+    /// landed), and stays open throughout (no promise in between). Another
+    /// proposer is refused, and so is node 1 at a member owning the hold.
+    #[test]
+    fn a_member_takes_the_carriers_fresh_epoch_in_place_of_the_open_one() {
+        let carried = |node| {
+            Some(EpochCarrier {
+                node,
+                epoch: 1,
+                expires_unix_ms: 5,
+            })
+        };
+        let activated = |carrier| {
+            let (mgr, meta) = manager(2, 0);
+            let ack = mgr.handle_propose_checked("1-1".into(), vec![1, 2, 3], vec![], 1, 0, false);
+            assert!(accepted(&ack), "{ack:?}");
+            mgr.handle_activate(EpochActivation {
+                epoch_id: "1-1".into(),
+                members: vec![1, 2, 3],
+                base: vec![],
+                carrier,
+                stale_below: 1,
+            });
+            assert!(mgr.is_active());
+            (mgr, meta)
+        };
+        let (mgr, meta) = activated(carried(1));
+        let ack = mgr.handle_propose_checked("3-2".into(), vec![1, 2, 3], vec![], 3, 0, false);
+        assert!(!accepted(&ack), "another proposer: {ack:?}");
+        assert!(mgr.is_active());
+        let ack = mgr.handle_propose_checked("1-2".into(), vec![1, 2, 3], vec![], 1, 0, false);
+        assert!(accepted(&ack), "{ack:?}");
+        assert!(mgr.is_open() && !mgr.is_active(), "promised to the new one");
+        assert_eq!(mgr.status().epoch_id.as_deref(), Some("1-2"));
+        assert!(
+            !meta.promise_issue(now_ms() + 60_000).unwrap(),
+            "the join gate stayed held"
+        );
+        mgr.handle_activate(EpochActivation {
+            epoch_id: "1-2".into(),
+            members: vec![1, 2, 3],
+            base: vec![],
+            carrier: carried(1),
+            stale_below: 1,
+        });
+        assert!(mgr.is_active());
+        // The hold's owner (handed the hold by node 1 in the epoch) never
+        // takes it: node 1 cannot have closed while it holds, and a second
+        // hold would stand beside its own.
+        let (mgr, _meta) = activated(carried(1));
+        mgr.set_claim_view(EpochClaimView {
+            epoch_held: true,
+            known: 1,
+            ..Default::default()
+        });
+        let ack = mgr.handle_propose_checked("1-2".into(), vec![1, 2, 3], vec![], 1, 0, false);
+        assert!(!accepted(&ack), "the hold owner: {ack:?}");
+        assert_eq!(mgr.status().epoch_id.as_deref(), Some("1-1"));
+        // An epoch carrying no lease (or another node's) is not node 1's.
+        for carrier in [None, carried(3)] {
+            let (mgr, _meta) = activated(carrier);
+            let ack = mgr.handle_propose_checked("1-2".into(), vec![1, 2, 3], vec![], 1, 0, false);
+            assert!(!accepted(&ack), "carrier {carrier:?}: {ack:?}");
+        }
+    }
+
+    /// Review of chunk epoch-liveness-gap: the carrier aborts its fresh
+    /// proposal (another member refused it) after this member took it in
+    /// place of the open epoch. The member closes without the carried
+    /// lease having moved, and is then any closed node: the join gate is
+    /// released (a promise may be issued) and another proposer's epoch is
+    /// taken. Safe: the carrier closed the old epoch, so no hold of it
+    /// remains, and its closed claim ends at the closed lease's expiry.
+    #[test]
+    fn an_abort_after_a_replacement_closes_the_member() {
+        let carried = Some(EpochCarrier {
+            node: 1,
+            epoch: 1,
+            expires_unix_ms: 5,
+        });
+        let (mgr, meta) = manager(2, 0);
+        let ack = mgr.handle_propose_checked("1-1".into(), vec![1, 2, 3], vec![], 1, 0, false);
+        assert!(accepted(&ack), "{ack:?}");
+        mgr.handle_activate(EpochActivation {
+            epoch_id: "1-1".into(),
+            members: vec![1, 2, 3],
+            base: vec![],
+            carrier: carried,
+            stale_below: 1,
+        });
+        let ack = mgr.handle_propose_checked("1-2".into(), vec![1, 2, 3], vec![], 1, 0, false);
+        assert!(accepted(&ack), "replaced: {ack:?}");
+        assert!(!mgr.handle_abort("1-1", 1), "the replaced epoch's id");
+        assert!(mgr.is_open());
+        assert!(mgr.handle_abort("1-2", 1));
+        assert!(!mgr.is_open() && !mgr.is_active() && !mgr.is_frozen());
+        assert_eq!(mgr.status().epoch_id, None);
+        // Neither epoch is open on disk: a restart stays closed (the
+        // replaced epoch's row was closed at the replacement).
+        assert!(meta.load_open_epoch().unwrap().is_none());
+        assert!(
+            !EpochManager::new(2, meta.clone(), constellation_net::Peers::disabled()).is_open()
+        );
+        // The last activated epoch's carrier is kept (as at any close).
+        assert_eq!(mgr.carrier(), (carried, 1));
+        assert!(!mgr.writes_refused.load(Ordering::Relaxed));
+        assert!(mgr.members_open.lock().unwrap().is_empty());
+        // The join gate is released: a promise is issued (one already
+        // expired, so the next join is not held back by it).
+        assert!(meta.promise_issue(now_ms() - 1).unwrap());
+        // Closed: another proposer's epoch is taken like any node's.
+        let ack = mgr.handle_propose_checked("3-3".into(), vec![1, 2, 3], vec![], 3, 0, false);
+        assert!(accepted(&ack), "{ack:?}");
+        assert_eq!(mgr.status().epoch_id.as_deref(), Some("3-3"));
+    }
+
+    /// Review of chunk epoch-liveness-gap: an activation and a proposal
+    /// handled at once. The member closed node 3's epoch and promised node
+    /// 1's, whose activation carries node 1's lease; node 3 proposes
+    /// meanwhile. Node 3 is not the carrier of any epoch the member is
+    /// active in, so it is refused whichever runs first: the carrier is
+    /// set under the lock that activates, never read stale beside it.
+    #[test]
+    fn a_proposal_racing_an_activation_never_sees_the_previous_carrier() {
+        let carried = |node| {
+            Some(EpochCarrier {
+                node,
+                epoch: 1,
+                expires_unix_ms: 5,
+            })
+        };
+        for round in 0..200 {
+            let (mgr, _meta) = manager(2, 0);
+            let ack = mgr.handle_propose_checked("3-1".into(), vec![1, 2, 3], vec![], 3, 0, false);
+            assert!(accepted(&ack), "{ack:?}");
+            mgr.handle_activate(EpochActivation {
+                epoch_id: "3-1".into(),
+                members: vec![1, 2, 3],
+                base: vec![],
+                carrier: carried(3),
+                stale_below: 1,
+            });
+            mgr.close();
+            let ack = mgr.handle_propose_checked("1-5".into(), vec![1, 2, 3], vec![], 1, 0, false);
+            assert!(accepted(&ack), "{ack:?}");
+            let gate = std::sync::Barrier::new(2);
+            let ack = std::thread::scope(|s| {
+                s.spawn(|| {
+                    gate.wait();
+                    mgr.handle_activate(EpochActivation {
+                        epoch_id: "1-5".into(),
+                        members: vec![1, 2, 3],
+                        base: vec![],
+                        carrier: carried(1),
+                        stale_below: 1,
+                    });
+                });
+                let proposal = s.spawn(|| {
+                    gate.wait();
+                    // A larger id than the promised one: only the carrier
+                    // rule could take it.
+                    mgr.handle_propose_checked("3-9".into(), vec![1, 2, 3], vec![], 3, 0, false)
+                });
+                proposal.join().unwrap()
+            });
+            assert!(!accepted(&ack), "round {round}: {ack:?}");
+            assert!(mgr.is_active());
+            assert_eq!(mgr.status().epoch_id.as_deref(), Some("1-5"));
+            assert_eq!(mgr.carrier().0.map(|c| c.node), Some(1));
         }
     }
 

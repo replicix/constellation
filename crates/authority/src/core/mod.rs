@@ -1252,6 +1252,13 @@ pub struct Core {
     /// Continuation epoch: journal locally, never PUT a segment.
     skip_ship: bool,
     epoch: EpochState,
+    /// The active epoch was replaced by its carrier's fresh proposal,
+    /// not activated yet (chunk epoch-liveness-gap: the member reports
+    /// open, neither active nor frozen, in between). The activated
+    /// epoch's close-release is not run for that transient state: it runs
+    /// if the epoch closes from it (an aborted proposal), and not at all
+    /// once the new epoch activates, as at any open-to-open step.
+    epoch_replacing: bool,
     /// What the last deposition recovery did (`Control::Reintegrate`).
     last_recovery: Option<String>,
     roster: Vec<NodeId>,
@@ -1336,6 +1343,7 @@ impl Core {
             publish_forced: false,
             skip_ship: false,
             epoch: EpochState::default(),
+            epoch_replacing: false,
             last_recovery: None,
             roster: Vec::new(),
             links: BTreeMap::new(),
@@ -2258,6 +2266,15 @@ impl Core {
     ) {
         let before = self.epoch;
         self.epoch = state;
+        // Chunk epoch-liveness-gap: the member took its carrier's fresh
+        // proposal in place of the active epoch (`epoch_replacing`).
+        let replaced = state.open && !state.active && !state.frozen && before.active;
+        let was_replacing = self.epoch_replacing;
+        if replaced {
+            self.epoch_replacing = true;
+        } else if state.active || !state.open {
+            self.epoch_replacing = false;
+        }
         if state.open != before.open {
             self.epoch_probes = 0;
             self.epoch_s3_down = false;
@@ -2274,9 +2291,29 @@ impl Core {
             lost = self.lease.lost,
             "epoch state"
         );
-        self.deleg_on_epoch(now, state.active && !state.frozen, replica, out);
+        if !replaced {
+            // Replaced, the delegates stay stopped through the transient
+            // state: the next activation finds them so.
+            self.deleg_on_epoch(now, state.active && !state.frozen, replica, out);
+        }
         if state.active && !before.active {
-            if let Some((lease, tag)) = self.epoch_closed_carried(now) {
+            let closed_carried = self.epoch_closed_carried();
+            let alone = members.iter().all(|m| *m == self.cfg.node_id);
+            if closed_carried.is_some() && !alone && self.epoch_closed_claim_in_doubt() {
+                // The activation carries the lease this node's close let
+                // go, but a CAS of its own replacing it is out (or wrote
+                // another lease epoch): it may land and move the object
+                // past the carried one, and the other members close once
+                // it has (`EpochClaimView::claim`; chunk
+                // epoch-liveness-gap, `locks-blips-tight-faults` seed
+                // 409: the CAS landed after the hold was taken, the
+                // members closed and took the lease over at its expiry,
+                // and the hold owner, crashed meanwhile, re-adopted its
+                // persisted hold). No hold: this node owes the epoch's
+                // close and the lease's re-claim instead (`owes_move`),
+                // as for a lease it was releasing at the activation.
+                self.owe_epoch_move(replica);
+            } else if let Some((lease, tag)) = closed_carried {
                 // The activation carries the lease this node's last
                 // epoch close let go, claimed while its re-claim was
                 // pending (`epoch_closed_claim`): it stood in S3 all
@@ -2430,7 +2467,9 @@ impl Core {
             // fresh silence window for the holder's re-acquisition.
             self.backup_watch_after_epoch(now, out);
         }
-        if !state.active && before.active && !state.frozen {
+        if (!state.active && before.active && !state.frozen && !replaced)
+            || (!state.open && was_replacing)
+        {
             self.skip_ship = false;
             self.epoch_close_release(now, replica, out);
             self.nudge(now, out);

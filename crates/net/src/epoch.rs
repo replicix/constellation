@@ -107,6 +107,79 @@ impl Machine {
         }
     }
 
+    /// [`Self::persist_promise`] for a proposal from `proposer`, which may
+    /// also replace this node's open epoch: the closed hold owner's fresh
+    /// epoch (chunk epoch-liveness-gap). `carrier` is the node whose lease
+    /// the open epoch carries (`None` if unknown), `holds` whether this
+    /// node owns that epoch's hold.
+    ///
+    /// The members of an epoch carrying another node's lease stay in it
+    /// until the carried lease has moved in S3 (the core's
+    /// `epoch_carrier_checked`). Its hold owner closes as soon as S3 is
+    /// back, and its re-claim moves the lease; if S3 is cut again before
+    /// the re-claim lands, every other member is still in the last epoch,
+    /// so no new one can form and the lease, with the lock grants it kept,
+    /// lapses at its expiry. So an activated (active or frozen) epoch is
+    /// replaced by a proposal from its carrier, when this node does not
+    /// own the hold itself. That is safe because:
+    ///
+    /// - The proposer is in no open epoch (`maybe_propose` returns while
+    ///   one is), so it closed this one, which leaves no hold of it
+    ///   anywhere. A carrier that owned the hold ended it at its close. A
+    ///   carrier that had handed the hold on closes only once the carried
+    ///   lease has moved, and that lease moves only by the hold owner's
+    ///   flush after its own close (the members promise nothing while
+    ///   open, so nobody else can take it). A carrier that owed the move
+    ///   (`owes_move`) never held. The carrier never abandons the epoch
+    ///   for its own retirement (`abandon_if_carrier_retired`), the one
+    ///   path that leaves a member closed beside a live hold.
+    /// - This node goes from the open epoch straight to the proposal, but
+    ///   it may still close before the carried lease moved: the proposer
+    ///   aborts a proposal another member refused (`EpochAbort`), or the
+    ///   new epoch carries no lease and closes on the first S3 probe.
+    ///   That is safe for another reason: no hold of the old epoch
+    ///   remains (above), and the carrier's remaining authority, its
+    ///   closed claim, ends at the closed lease's expiry. It holds again
+    ///   only through the activation of an epoch it acked while that
+    ///   claim was usable, and an aborted proposal is never activated. So
+    ///   this node, closed, is any closed node: a taker outside an epoch
+    ///   waits out the expiry it reads, and the promises and the join
+    ///   gate keep takers and epochs apart.
+    /// - The new epoch is formed and resolved like any other: its carrier
+    ///   is the claim at the highest epoch among its members' acks. The
+    ///   closed hold owner claims the lease its close let go while the
+    ///   re-claim is pending (`epoch_closed_claim`), so the new epoch
+    ///   usually carries that same lease, and the members again wait for
+    ///   it to move.
+    ///
+    /// Only an activated epoch: a merely promised one may not have been
+    /// activated here, and the carrier this node knows is then an older
+    /// epoch's.
+    pub fn persist_promise_proposed(
+        &mut self,
+        p: Promise,
+        proposer: u64,
+        carrier: Option<u64>,
+        holds: bool,
+    ) -> Result<(), &'static str> {
+        let refused = match self.persist_promise(p.clone()) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let succeeds = self.current.as_ref().is_some_and(|cur| {
+            matches!(cur.state, EpochState::Active | EpochState::Frozen)
+                && carrier == Some(proposer)
+                && !holds
+                && cur.members.contains(&proposer)
+                && p.members.contains(&proposer)
+        });
+        if !succeeds {
+            return Err(refused);
+        }
+        self.current = Some(p);
+        Ok(())
+    }
+
     pub fn activate(&mut self, epoch_id: &str) -> Result<(), &'static str> {
         let cur = self.current.as_mut().ok_or("no promise to activate")?;
         if cur.epoch_id != epoch_id {
@@ -272,6 +345,86 @@ mod tests {
             m.persist_promise(Promise::new("e2", vec![1, 2], BTreeMap::new(), 2)),
             Err("an open epoch promise already exists")
         );
+    }
+
+    fn active(members: &[u64]) -> Machine {
+        let mut m = promised(members);
+        m.activate("e1").unwrap();
+        m
+    }
+
+    fn proposal(id: &str, members: &[u64]) -> Promise {
+        Promise::new(id, members.to_vec(), BTreeMap::new(), 2)
+    }
+
+    /// Chunk epoch-liveness-gap: a member of an activated epoch carrying
+    /// node 1's lease accepts node 1's fresh proposal (node 1 closed that
+    /// epoch, its re-claim cut off), active or frozen.
+    #[test]
+    fn the_carriers_fresh_epoch_replaces_an_activated_one() {
+        for frozen in [false, true] {
+            let mut m = active(&[1, 2, 3]);
+            if frozen {
+                m.note_live_members(&[2, 3]);
+                assert!(m.is_frozen());
+            }
+            m.persist_promise_proposed(proposal("e2", &[1, 2, 3]), 1, Some(1), false)
+                .unwrap();
+            let cur = m.current().unwrap();
+            assert_eq!(
+                (cur.epoch_id.as_str(), cur.state),
+                ("e2", EpochState::Promised)
+            );
+            assert!(m.is_open(), "never closed in between");
+            m.activate("e2").unwrap();
+            assert!(m.is_active());
+        }
+    }
+
+    /// The cases that keep refusing: another proposer (a competing closed
+    /// node, or a member that abandoned the epoch beside a live hold), an
+    /// unknown carrier, a member owning the hold (handed to it by the
+    /// carrier), a merely promised epoch (its carrier is not known here),
+    /// and a proposer outside the open epoch.
+    #[test]
+    fn only_the_carrier_replaces_an_open_epoch_and_never_at_the_hold_owner() {
+        let refused = Err("an open epoch promise already exists");
+        let mut m = active(&[1, 2, 3]);
+        let p = proposal("e2", &[1, 2, 3]);
+        assert_eq!(
+            m.persist_promise_proposed(p.clone(), 3, Some(1), false),
+            refused
+        );
+        assert_eq!(
+            m.persist_promise_proposed(p.clone(), 1, None, false),
+            refused
+        );
+        assert_eq!(
+            m.persist_promise_proposed(p.clone(), 1, Some(1), true),
+            refused
+        );
+        assert_eq!(m.current().unwrap().epoch_id, "e1");
+        assert!(m.is_active());
+        let mut m = promised(&[1, 2, 3]);
+        assert_eq!(
+            m.persist_promise_proposed(proposal("e2", &[1, 2, 3]), 1, Some(1), false),
+            refused
+        );
+        let mut m = active(&[2, 3]);
+        assert_eq!(
+            m.persist_promise_proposed(proposal("e2", &[1, 2, 3]), 1, Some(1), false),
+            refused
+        );
+        // The ordinary rules are unchanged: the same id is idempotent, and
+        // a closed epoch takes anyone's proposal.
+        let mut m = active(&[1, 2, 3]);
+        m.persist_promise_proposed(proposal("e1", &[1, 2, 3]), 3, Some(1), false)
+            .unwrap();
+        assert!(m.is_active());
+        m.close();
+        m.persist_promise_proposed(proposal("e3", &[2, 3]), 3, Some(1), true)
+            .unwrap();
+        assert_eq!(m.current().unwrap().epoch_id, "e3");
     }
 
     /// Discipline rule 1: lose any member → freeze (read-only).

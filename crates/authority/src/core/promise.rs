@@ -89,17 +89,38 @@ pub struct EpochClaimView {
     pub advertised_slack: Option<u32>,
     /// This node holds a continuation-epoch hold now.
     pub epoch_held: bool,
+    /// `held` is the lease an epoch's close let go, and an acquisition
+    /// CAS of this node's replacing it is out, or wrote another lease
+    /// epoch: the S3 object may become one the claim does not cover
+    /// (`Core::epoch_closed_claim_in_doubt`).
+    pub in_doubt: bool,
 }
 
 impl EpochClaimView {
     /// The claim for an epoch of `members`: `(lease epoch, expires,
     /// may carry)`.
+    ///
+    /// A claim in doubt (`in_doubt`) may be carried only by an epoch of
+    /// this node alone (chunk epoch-liveness-gap). The other members of
+    /// an epoch close once the lease object in S3 has moved past the
+    /// carried one (`jobs::epoch_carrier_checked`), and a CAS still out
+    /// may land after the activation and move it while this node holds
+    /// the epoch: closed, they promise and may take the object over at
+    /// its expiry, beside a hold that has none (`locks-blips-tight-faults`
+    /// seed 409: the hold owner crashed holding, and re-adopted its
+    /// persisted hold at its restart, after a member had taken the lease
+    /// over). Not carried, the epoch carries no lease (the claim is the
+    /// highest, `resolve_epoch_claims`), no hold is adopted, and the
+    /// re-claim after S3's return settles which object stands. A CAS
+    /// answered in doubt is no such case: the claim covers the object it
+    /// may have written (`Core::epoch_closed_claim`).
     pub fn claim(&self, members: &[NodeId]) -> Option<(Epoch, i64, bool)> {
         self.held.as_ref().map(|l| {
+            let alone = members.iter().all(|m| *m == l.holder);
             (
                 l.epoch,
                 l.expires_unix_ms,
-                lease_may_carry(l, members, self.reconfig_busy),
+                lease_may_carry(l, members, self.reconfig_busy) && (!self.in_doubt || alone),
             )
         })
     }
@@ -500,6 +521,7 @@ impl Core {
         // Claiming nothing, an outage that began during a release's flush
         // formed an epoch carrying no lease, which refused every write
         // (`EROFS`) until the heal even when the release failed.
+        let mut in_doubt = false;
         let held = if self.lease.usable(now, &self.cfg) && !self.lease.epoch_held() {
             self.lease.held.as_ref().map(|(l, _)| l.clone())
         } else {
@@ -510,7 +532,9 @@ impl Core {
             // rest of an outage that began in that window, on the node
             // whose lease stood all along (`stress-ng-fs-faults`); the
             // activation adopts the hold (`on_epoch_state`).
-            self.epoch_closed_claim(now).map(|(l, _)| l.clone())
+            let closed = self.epoch_closed_claim(now).map(|(l, _)| l);
+            in_doubt = closed.is_some() && self.epoch_closed_claim_in_doubt();
+            closed
         };
         let mut known = self.ship.max_epoch;
         if self.bk.sealed > 0 {
@@ -531,30 +555,99 @@ impl Core {
             known,
             advertised_slack: self.pr.advertised,
             epoch_held: self.lease.epoch_held(),
+            in_doubt,
         }
     }
 
     /// The lease an epoch's close let go here, while its re-claim is
     /// pending and it is usable as a held lease would be (unexpired past
     /// the margin): what this node claims for a continuation epoch
-    /// meanwhile ([`Self::epoch_claim_view`]). Also while a re-claim CAS
-    /// is in doubt (S3 cut again while it was in flight: the usual case),
-    /// as a holder whose renewal is in doubt claims the lease it holds:
-    /// if the CAS landed, the object is the later one, of this tenure
-    /// too (`epoch_tenure_cas_in_doubt`), and the claim is the earlier
-    /// expiry.
-    pub(crate) fn epoch_closed_claim(&self, now: Ms) -> Option<&(Lease, LeaseTag)> {
+    /// meanwhile ([`Self::epoch_claim_view`]).
+    ///
+    /// Also while a re-claim CAS is in doubt (S3 cut again while it was
+    /// in flight: the usual case): if it landed, the object is
+    /// `(me, e, X')` replacing the closed `(me, e, X)`, of this tenure too
+    /// (`epoch_tenure_cas_in_doubt`). The claim is then the latest object
+    /// of the tenure, at the lease epoch the close let go: the other
+    /// members of an epoch carrying it stay in it while S3 shows that
+    /// object or an earlier one of the same holder and lease epoch (the
+    /// CAS did not land), and close only once the object has moved past
+    /// it (`jobs::epoch_carrier_checked`), which nothing but this node's
+    /// re-claim after its own close can do. Claiming the earlier object,
+    /// a CAS that landed made the members close beside this node's hold,
+    /// and claiming nothing (chunk epoch-liveness-gap, before) formed an
+    /// epoch with no lease, whose lock grants lapsed at the closed
+    /// lease's expiry (`locks-blips-tight` seed 66). Usable only while the
+    /// earliest of those objects is. The tag is the closed object's:
+    /// nothing CASes on it under a hold (`renew_due`), and the re-claim
+    /// reads the object first.
+    pub(crate) fn epoch_closed_claim(&self, now: Ms) -> Option<(Lease, LeaseTag)> {
         if !self.epoch_reclaim_pending(now) {
             return None;
         }
+        // Usable while the earliest object it may be is: the object in S3
+        // is one of them, and a taker outside the epoch waits for its
+        // expiry only. Every entry at the lease epoch counts, also one
+        // kept through an earlier hold whose object has since been
+        // replaced: conservative (the claim may end sooner than the
+        // object in S3 does, a liveness cost on a long chain of re-holds),
+        // never later than a taker's wait.
         let me = self.cfg.node_id;
-        self.pr.closed_lease.as_ref().filter(|(l, _)| {
-            let it = (l.holder, l.epoch, l.expires_unix_ms);
+        let (l, tag) = self.epoch_closed_latest()?;
+        let earliest = self
+            .pr
+            .closed_tenure
+            .iter()
+            .filter(|(holder, epoch, _)| *holder == me && *epoch == l.epoch)
+            .map(|(_, _, expires)| *expires)
+            .min()?;
+        (earliest - now.0 > self.cfg.expiry_margin_ms as i64).then_some((l, tag))
+    }
+
+    /// [`Self::epoch_closed_claim`] without its clock: the latest object
+    /// of the tenure the close let go, while nothing since has ended the
+    /// tenure or held a lease. What an activation carrying it holds
+    /// again, whenever it arrives (`epoch_closed_carried`).
+    fn epoch_closed_latest(&self) -> Option<(Lease, LeaseTag)> {
+        if self.lease.lost || self.lease.held.is_some() || self.lease.epoch_held() {
+            return None;
+        }
+        let me = self.cfg.node_id;
+        let (l, tag) = self.pr.closed_lease.as_ref().filter(|(l, _)| {
             l.holder == me
                 && !l.released
-                && l.expires_in_ms(now.0) > self.cfg.expiry_margin_ms as i64
-                && self.pr.closed_tenure.contains(&it)
-        })
+                && self
+                    .pr
+                    .closed_tenure
+                    .contains(&(l.holder, l.epoch, l.expires_unix_ms))
+        })?;
+        let mut latest = l.clone();
+        for (holder, epoch, expires) in &self.pr.closed_tenure {
+            if *holder == me && *epoch == l.epoch {
+                latest.expires_unix_ms = latest.expires_unix_ms.max(*expires);
+            }
+        }
+        Some((latest, tag.clone()))
+    }
+
+    /// The object in S3 may become one the closed lease's claim does not
+    /// cover: an acquisition CAS of this node's is out
+    /// (`acquire_cas_unsettled`; it may land after an activation, a
+    /// later object than any claimed), or one in doubt wrote another
+    /// lease epoch than the closed lease's. Such a claim is carried, and
+    /// held again, only in an epoch of this node alone
+    /// (`EpochClaimView::claim`, `on_epoch_state`).
+    pub(crate) fn epoch_closed_claim_in_doubt(&self) -> bool {
+        let Some((l, _)) = self.epoch_closed_latest() else {
+            return false;
+        };
+        let me = self.cfg.node_id;
+        self.acquire_cas_unsettled()
+            || self
+                .pr
+                .closed_tenure
+                .iter()
+                .any(|t| t.0 == me && t.1 != l.epoch)
     }
 
     /// A continuation epoch closed (S3 is back): the hold and the S3
@@ -704,14 +797,18 @@ impl Core {
     }
 
     /// The lease object [`Self::epoch_closed_claim`] claims, when the
-    /// activation's carrier is exactly it.
-    pub(crate) fn epoch_closed_carried(&self, now: Ms) -> Option<(Lease, LeaseTag)> {
+    /// activation's carrier is exactly it. Whether or not it is still
+    /// usable now, as `carries_mine` holds a held lease again: the claim
+    /// was usable when acked, and nobody can take the object over while
+    /// the epoch is open (its members promise nothing). Checked against
+    /// the clock, an activation that reached a paused carrier past the
+    /// expiry margin adopted no hold, nobody held the epoch, and it never
+    /// closed (chunk epoch-liveness-gap, `flex-tight` seed 1913).
+    pub(crate) fn epoch_closed_carried(&self) -> Option<(Lease, LeaseTag)> {
         let c = self.pr.carried?;
-        self.epoch_closed_claim(now)
-            .filter(|(l, _)| {
-                (c.node, c.epoch, c.expires_unix_ms) == (l.holder, l.epoch, l.expires_unix_ms)
-            })
-            .cloned()
+        self.epoch_closed_latest().filter(|(l, _)| {
+            (c.node, c.epoch, c.expires_unix_ms) == (l.holder, l.epoch, l.expires_unix_ms)
+        })
     }
 
     /// This node closed an epoch holding a lease that still stands (as
@@ -1062,9 +1159,20 @@ impl Core {
             return;
         }
         self.pr.restored_hold = None;
-        if self.pr.hold_ended.map(|(e, _, _)| e) == Some(epoch) {
-            // Handed away before the crash (persisted before the reply):
-            // the successor owns it.
+        // Handed away before the crash (persisted before the reply): the
+        // successor owns it. Matched on the carried lease, epoch and
+        // expiry, when the epoch's carrier is known: the record of an
+        // earlier epoch's hold, let go at its close, names the same lease
+        // epoch (the carrier re-claims at it), and matching the epoch alone
+        // dropped this epoch's hold at a restart, so nobody held the epoch
+        // and it never closed (chunk epoch-liveness-gap, `flex-tight` seed
+        // 138: the closed carrier's fresh epoch, held, then both members
+        // crashed).
+        let handed = match self.pr.carried {
+            Some(c) => self.hold_ended_is(c.epoch, c.expires_unix_ms),
+            None => self.pr.hold_ended.map(|(e, _, _)| e) == Some(epoch),
+        };
+        if handed {
             return;
         }
         if self.epoch_carries_let_go() {

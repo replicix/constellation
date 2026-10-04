@@ -1435,7 +1435,17 @@ impl LockTables {
 
     /// A renewal of `id` sent at `sent_ms` was answered: the owner holds
     /// `now_id` (the same, or a newer grant of this node whose reply was
-    /// lost — adopted here, with its mode) in `mode`.
+    /// lost — adopted here, with its mode) in `mode`. Applied too when
+    /// the grant held here already has `now_id`: a recall of the newer id
+    /// moved it there while the renewal was out (`recall_held`), and the
+    /// answer is that grant's extension. Dropped, the grant kept the
+    /// window of the push that installed it, which a waiter's push sets
+    /// from its first request (sim `locks-blips-tight` seeds 568, 1713,
+    /// 1887, 2762: lapsed under I/O 350 ms after its install, the
+    /// renewal of the old id answered `Ok` 10 ms after it). That answer
+    /// also clears `renewing` when a renewal of `now_id` itself is out:
+    /// harmless, the grant is at worst renewed once more (a duplicate
+    /// renewal, whose answer extends it again).
     #[allow(clippy::too_many_arguments)]
     pub fn renewed(
         &self,
@@ -1449,15 +1459,21 @@ impl LockTables {
         recalled: bool,
     ) {
         let mut g = self.lock();
-        if let Some(h) = g.held.get_mut(&ino).filter(|h| h.id == id) {
+        if let Some(h) = g
+            .held
+            .get_mut(&ino)
+            .filter(|h| h.id == id || h.id == now_id)
+        {
             h.renewing = None;
             h.until_ms = h.until_ms.max(sent_ms + ttl_ms - margin_ms);
             h.renew_at_ms = h.renew_at_ms.max(renew_point(sent_ms, ttl_ms, margin_ms));
             h.recalled |= recalled;
-            if now_id != id {
+            if h.id != now_id {
                 h.id = now_id;
                 h.mode = h.mode.max(mode);
                 g.tombstone(id);
+            } else if now_id != id {
+                h.mode = h.mode.max(mode);
             }
             g.stats.renewals += 1;
             self.refence(&g);
@@ -2598,6 +2614,29 @@ mod tests {
         assert_eq!(t.held(7).unwrap().until_ms, 150);
         // Lapsed: never.
         assert!(t.due_renewals(200).is_empty());
+    }
+
+    /// Sim `locks-blips-tight` seed 568: a renewal of id 1 is answered
+    /// "renewed as id 2" after a recall of id 2 already moved the held
+    /// grant to id 2. The answer extends that grant; a stale answer for
+    /// some other id still does not.
+    #[test]
+    fn a_renewal_answered_under_the_id_a_recall_moved_to_extends_the_grant() {
+        let t = LockTables::default();
+        let mut h = held(LockMode::Exclusive, 100);
+        h.renew_at_ms = 50;
+        t.install_held(7, h);
+        assert_eq!(t.due_renewals(60).len(), 1);
+        let newer = GrantId { node: 1, seq: 2 };
+        assert_eq!(t.recall_held(7, newer), Some(false));
+        assert_eq!(t.held(7).unwrap().id, newer);
+        t.renewed(7, h.id, newer, LockMode::Exclusive, 60, 1_000, 10, false);
+        let now = t.held(7).unwrap();
+        assert_eq!((now.id, now.until_ms, now.recalled), (newer, 1_050, true));
+        assert!(now.renewing.is_none());
+        let other = GrantId { node: 1, seq: 3 };
+        t.renewed(7, h.id, other, LockMode::Exclusive, 500, 1_000, 10, false);
+        assert_eq!(t.held(7).unwrap().until_ms, 1_050, "not this grant's");
     }
 
     #[test]

@@ -2899,13 +2899,21 @@ epoch, and the open one goes on (`epochs_continued`; a member of an open
 epoch neither proposes nor joins another). Seeds 200 and 8398 are pinned
 (`locks_blips_tight_an_open_epoch_is_not_formed_over`: a second epoch
 formed over the open one carried no lease, and a member took the lease
-over beside the owner's hold). With three nodes no cut can begin a new
-epoch inside the hold owner's re-claim window (the others are still in
-the last epoch, waiting for that re-claim), so the re-held lease
-(`epoch_closed_leases_reheld`) is required of `locks-blips-tight-single`
-(one node), and no fenced I/O of `locks-blips-tight-long-lease` (a 10 s
-lease: with 6 s, the lease a close let go can expire inside a pair of
-cuts no re-claim reached, and its grants with it). Seed 2723 is pinned
+over beside the owner's hold). The one exception is a proposal from the
+open epoch's carrier once it has closed (chunk epoch-liveness-gap): a
+cut that begins inside the hold owner's re-claim window finds the others
+still in the last epoch, and they take the carrier's fresh epoch in its
+place (`epochs_superseded`), which carries the lease the close let go
+again. `locks-blips-tight` (`locks_survive_s3_blips`, 6 s lease) requires
+no fenced I/O, at least one replaced epoch and one re-held closed lease
+(`epoch_closed_leases_reheld`); seeds 8, 66 and 568 are pinned
+(`locks_blips_tight_seeds_8_66_and_568_no_grant_lapses`). Sweep-only
+configs for this: `locks-blips-tight-faults` (random faults on top),
+`locks-blips-tight-delegated` (the cuts over `locks-delegated`, so
+replaced epochs have delegates among their members) and `flex-tight`
+(`flex`'s two-member outages in back-to-back pairs); their seeds are
+pinned in `epoch_liveness_gap_fault_seeds`. `sweep_config` prints the
+fenced I/Os per seed (`SWEEP-FENCED`). Seed 2723 is pinned
 (`locks_blips_tight_seed_2723_release_keeps_exclusion`: a handoff that
 dropped two live exclusive grants, and a successor whose release grace
 went with its own tenure). `locks-blips-tight-in-doubt` (sweep only, plus

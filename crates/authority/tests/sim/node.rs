@@ -138,6 +138,8 @@ pub struct Shared {
     next_seq: AtomicU64,
     pub alive: AtomicBool,
     paused_until: Mutex<Option<tokio::time::Instant>>,
+    /// When the last pause began.
+    paused_since: Mutex<Option<tokio::time::Instant>>,
     pub conflict_copies: AtomicU64,
     /// Rids whose effects were rolled back at some point (see
     /// `history.rs`): read from the replay queue whenever the core's
@@ -245,6 +247,7 @@ impl NodeHandle {
             next_seq: AtomicU64::new(0),
             alive: AtomicBool::new(true),
             paused_until: Mutex::new(None),
+            paused_since: Mutex::new(None),
             conflict_copies: AtomicU64::new(0),
             tentative: Mutex::new(BTreeSet::new()),
             journaled_refusals: Mutex::new(BTreeSet::new()),
@@ -361,6 +364,7 @@ impl NodeHandle {
     /// are handled, late, once the pause ends.
     pub fn pause_until(&self, until: tokio::time::Instant) {
         *self.shared.paused_until.lock().unwrap() = Some(until);
+        *self.shared.paused_since.lock().unwrap() = Some(tokio::time::Instant::now());
     }
 
     /// Whether a pause holds this node's event loop now (its view is the
@@ -371,6 +375,17 @@ impl NodeHandle {
             .lock()
             .unwrap()
             .is_some_and(|until| tokio::time::Instant::now() < until)
+    }
+
+    /// Paused, and since at least `d` ago.
+    pub fn paused_for(&self, d: std::time::Duration) -> bool {
+        self.paused()
+            && self
+                .shared
+                .paused_since
+                .lock()
+                .unwrap()
+                .is_some_and(|since| since + d <= tokio::time::Instant::now())
     }
 }
 

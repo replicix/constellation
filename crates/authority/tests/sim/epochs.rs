@@ -130,8 +130,11 @@ pub async fn holder_cut_epoch(
     unfreeze_after_heal(&cluster, &candidates).await;
 }
 
-/// Form an epoch among `cut` (after a grace, every 100 ms) and keep its
-/// liveness (freeze and thaw) until `for_ms` has passed.
+/// How often `drive_epoch` tries to form an epoch.
+const FORM_EVERY: Duration = Duration::from_millis(100);
+
+/// Form an epoch among `cut` (after a grace, every [`FORM_EVERY`]) and
+/// keep its liveness (freeze and thaw) until `for_ms` has passed.
 async fn drive_epoch(
     cluster: &Arc<Cluster>,
     at_ms: u64,
@@ -144,29 +147,56 @@ async fn drive_epoch(
     // The member whose epoch the liveness watch follows: the one formed
     // here, or the open one it continues.
     let mut follow: Option<NodeId> = None;
+    // The followed epoch is a continued one: formation is tried again
+    // (every closed member keeps proposing, `maybe_propose`), and the
+    // carrier's fresh epoch replaces it once the carrier has closed
+    // (`try_form`).
+    let mut continuing = false;
     let mut frozen = false;
     while elapsed < for_ms {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        elapsed += 100;
+        tokio::time::sleep(FORM_EVERY).await;
+        elapsed += FORM_EVERY.as_millis() as u64;
         if elapsed < grace {
             continue;
         }
-        let Some(followed) = follow else {
+        if follow.is_none() || continuing {
             match try_form(cluster, cut) {
-                Formation::Formed(members) => {
+                Formation::Formed(members, replaced) => {
+                    let how = if replaced {
+                        // It met an open epoch, as a continued one did.
+                        if !continuing {
+                            *cluster.epochs_continued.lock().unwrap() += 1;
+                        }
+                        *cluster.epochs_superseded.lock().unwrap() += 1;
+                        " (the closed carrier's, in place of the open one)"
+                    } else {
+                        ""
+                    };
                     follow = Some(cut[0]);
-                    note(format!("t={} epoch formed: {members:?}", at_ms + elapsed));
-                }
-                Formation::Continues(node, members) => {
-                    follow = Some(node);
-                    *cluster.epochs_continued.lock().unwrap() += 1;
+                    continuing = false;
+                    frozen = false;
                     note(format!(
-                        "t={} epoch still open, continues: {members:?}",
+                        "t={} epoch formed{how}: {members:?}",
                         at_ms + elapsed
                     ));
+                    continue;
+                }
+                Formation::Continues(node, members) => {
+                    if follow.is_none() {
+                        *cluster.epochs_continued.lock().unwrap() += 1;
+                        note(format!(
+                            "t={} epoch still open, continues: {members:?}",
+                            at_ms + elapsed
+                        ));
+                        follow = Some(node);
+                        continuing = true;
+                        continue;
+                    }
                 }
                 Formation::Refused => {}
             }
+        }
+        let Some(followed) = follow else {
             continue;
         };
         // Liveness: a member that died, or cannot reach another member,
@@ -249,8 +279,9 @@ async fn unfreeze_after_heal(cluster: &Arc<Cluster>, cut: &[NodeId]) {
 
 /// What one formation attempt found.
 enum Formation {
-    /// A new epoch of these members activated.
-    Formed(Vec<NodeId>),
+    /// A new epoch of these members activated; `true`: in place of the
+    /// open one of its closed carrier.
+    Formed(Vec<NodeId>, bool),
     /// This member's epoch (of these members) is still open: no epoch
     /// forms, and that one goes on.
     Continues(NodeId, Vec<NodeId>),
@@ -270,28 +301,71 @@ enum Formation {
 /// owner claims nothing while it holds), and its other members, seeing
 /// an epoch that carries no lease, closed on S3's return and took the
 /// lease over beside the owner's hold (seeds 200 and 8398).
+///
+/// Except a proposal from the open epoch's carrier once it has closed
+/// (`Machine::persist_promise_proposed`, chunk epoch-liveness-gap): every
+/// open member that does not own the hold takes it in place of the open
+/// epoch. The carrier closed as the hold's owner and was cut from S3
+/// again before its re-claim landed; it claims the lease its close let
+/// go, so the new epoch carries that lease again and the carrier holds
+/// it. Without this, no epoch could form until the re-claim, and the
+/// lease and the lock grants it kept lapsed at its expiry.
 fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
     let roster = cluster.ids();
     let f = cluster.slack as usize;
+    // A paused node answers no ping and acks no proposal (the daemon's
+    // `maybe_propose` counts the nodes whose ping answered): it is no
+    // member, like a dead one (`locks-blips-tight-faults` seed 5379: an
+    // epoch formed with node 1 paused for 1.9 s carried its held lease,
+    // acked in its name; it resumed past that lease's expiry, adopted no
+    // hold, and the epoch never closed). Except one paused since the last
+    // attempt (`FORM_EVERY`): it may have acked a proposal just before it
+    // stopped, and handles the activation when it resumes (flex-crash
+    // seed 30908: such a member crashed and restarted into the epoch).
     let members: Vec<NodeId> = cut
         .iter()
         .copied()
-        .filter(|n| cluster.get(*n).alive())
+        .filter(|n| {
+            let n = cluster.get(*n);
+            n.alive() && !n.paused_for(FORM_EVERY)
+        })
         .collect();
-    if let Some(node) = members
+    let open: Vec<NodeId> = members
         .iter()
         .copied()
-        .find(|n| cluster.get(*n).shared.epoch.lock().unwrap().open)
-    {
-        let members = cluster
-            .get(node)
-            .shared
-            .epoch
-            .lock()
-            .unwrap()
-            .members
-            .clone();
-        return Formation::Continues(node, members);
+        .filter(|n| cluster.get(*n).shared.epoch.lock().unwrap().open)
+        .collect();
+    if let Some(&node) = open.first() {
+        // The daemon's member rule, at every open member: an activated
+        // epoch (the sim's open epochs all are) whose carrier is the
+        // proposer, a closed member, and whose hold is not its own.
+        let takes = |n: NodeId, proposer: NodeId| {
+            let node = cluster.get(n);
+            let e = node.shared.epoch.lock().unwrap().clone();
+            (e.active || e.frozen)
+                && e.carrier.map(|c| c.node) == Some(proposer)
+                && e.members.contains(&proposer)
+                && !node.view().epoch_held
+        };
+        // The proposer is the carrier's daemon itself (`maybe_propose`),
+        // so not a paused one (`locks-blips-tight-faults` seed 945: the
+        // epoch replaced in the carrier's name 450 ms into a 4.8 s pause).
+        let proposer = members
+            .iter()
+            .copied()
+            .filter(|p| !open.contains(p) && !cluster.get(*p).paused())
+            .find(|p| open.iter().all(|n| takes(*n, *p)));
+        if proposer.is_none() {
+            let members = cluster
+                .get(node)
+                .shared
+                .epoch
+                .lock()
+                .unwrap()
+                .members
+                .clone();
+            return Formation::Continues(node, members);
+        }
     }
     let Some(quorum) = roster.len().checked_sub(f).map(|q| q.max(1)) else {
         return Formation::Refused;
@@ -316,9 +390,13 @@ fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
         return Formation::Refused;
     }
     // The join gates: every member's own promise has expired in its own
-    // clock; a member that is not ready undoes the others' gates.
+    // clock; a member that is not ready undoes the others' gates. An open
+    // member holds its gate already, and keeps it.
     let mut gated = Vec::new();
     for n in &nodes {
+        if open.contains(&n.id) {
+            continue;
+        }
         if n.meta.promise_join_begin(n.clock.now().0).unwrap_or(false) {
             gated.push(n.clone());
         } else {
@@ -336,14 +414,29 @@ fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
         })
         .collect();
     let (carrier, stale_below) = resolve_epoch_claims(&acks);
+    // An open member is promised to the new epoch before its activation:
+    // open, neither active nor frozen, still with the carrier it knows
+    // (the daemon's `EpochManager` between `persist_promise_proposed` and
+    // `handle_activate`).
+    for n in nodes.iter().filter(|n| open.contains(&n.id)) {
+        {
+            let mut e = n.shared.epoch.lock().unwrap();
+            e.active = false;
+            e.frozen = false;
+        }
+        n.report_epoch();
+    }
     for n in &nodes {
         {
             let mut e = n.shared.epoch.lock().unwrap();
+            if !e.open {
+                // The driver keeps an open epoch's base (`report_epoch`).
+                e.base = n.view().applied_seq;
+            }
             e.open = true;
             e.active = true;
             e.frozen = false;
             e.flushing = false;
-            e.base = n.view().applied_seq;
             e.members = members.clone();
             e.carrier = carrier;
             e.stale_below = stale_below;
@@ -357,7 +450,7 @@ fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
         "sim: continuation epoch formed"
     );
     cluster.epochs.lock().unwrap().push(members.clone());
-    Formation::Formed(members)
+    Formation::Formed(members, !open.is_empty())
 }
 
 /// Every 25 ms: no continuation-epoch hold alongside another node's

@@ -297,6 +297,7 @@ fn replay_seed() {
         Ok("flex") => flex_config(),
         Ok("flex-unchecked") => flex_unchecked_config(),
         Ok("flex-crash") => flex_crash_config(),
+        Ok("flex-tight") => flex_tight_config(),
         Ok("flex-long") => flex_config(),
         Ok("flex-backup") => flex_backup_config(),
         Ok("flex-zero") => flex_zero_config(),
@@ -335,6 +336,8 @@ fn replay_seed() {
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-blips") => locks_blips_config(),
         Ok("locks-blips-tight") => locks_blips_tight_config(),
+        Ok("locks-blips-tight-faults") => locks_blips_tight_faults_config(),
+        Ok("locks-blips-tight-delegated") => locks_blips_tight_delegated_config(),
         Ok("locks-blips-tight-single") => locks_blips_tight_single_config(),
         Ok("locks-blips-tight-long-lease") => locks_blips_tight_long_lease_config(),
         Ok("locks-blips-tight-in-doubt") => locks_blips_tight_in_doubt_config(),
@@ -2111,6 +2114,35 @@ fn flex_crash_config() -> SimConfig {
     }
 }
 
+/// Chunk epoch-liveness-gap (sweep only): `flex`'s two-member outages
+/// (`f = 1`, the third node keeps S3) in `locks-blips-tight`'s
+/// back-to-back pairs, so a closed hold owner's fresh epoch replaces the
+/// open one beside a node that may take the lease over through the
+/// promise check, with the CI's random faults (crashes, partitions,
+/// pauses, S3 cuts and errors) on top.
+fn flex_tight_config() -> SimConfig {
+    let mut faults = Vec::new();
+    let mut at = 700;
+    for gap in [300, 500, 700, 900] {
+        for start in [at, at + 1_500 + gap] {
+            faults.push(ScheduledFault {
+                at_ms: start,
+                kind: FaultKind::EpochOutage {
+                    members: 2,
+                    for_ms: 1_500,
+                },
+            });
+        }
+        at += 1_500 + gap + 1_500 + 2_500;
+    }
+    SimConfig {
+        random_faults: 2,
+        join_fresh: false,
+        faults,
+        ..flex_config()
+    }
+}
+
 /// `f = 0` under the same outage: two of three is not a quorum, no epoch
 /// forms, the cut nodes stall and the third takes over as today.
 fn flex_zero_config() -> SimConfig {
@@ -2604,6 +2636,7 @@ fn sweep_config() {
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
         "flex-crash" => flex_crash_config(),
+        "flex-tight" => flex_tight_config(),
         "metered-shared" => metered_shared_config(),
         "metered-shared-unbacked" => metered_shared_unbacked_config(),
         // The lock configurations (`long_locks` runs them in sequence).
@@ -2618,6 +2651,8 @@ fn sweep_config() {
         "locks-blips-tight-single" => locks_blips_tight_single_config(),
         "locks-blips-tight-long-lease" => locks_blips_tight_long_lease_config(),
         "locks-blips-tight-in-doubt" => locks_blips_tight_in_doubt_config(),
+        "locks-blips-tight-faults" => locks_blips_tight_faults_config(),
+        "locks-blips-tight-delegated" => locks_blips_tight_delegated_config(),
         "locks-pause" => locks_pause_config(),
         "locks-delegated" => locks_delegated_config(),
         "locks-released-delegated" => locks_released_delegated_config(),
@@ -2642,6 +2677,16 @@ fn sweep_config() {
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
     ]);
+    // The lock configurations: [I/Os fenced, grants lost], and the seeds
+    // with any (`SWEEP-FENCED`; not failures: a lease nobody can renew
+    // fences its grants by design).
+    let fenced = std::sync::Arc::new([
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ]);
+    let fenced_seeds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Open epochs replaced by their closed carrier's (`epochs::try_form`).
+    let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
     let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut handles = Vec::new();
@@ -2650,6 +2695,8 @@ fn sweep_config() {
         let (streamed, streamed_deleg) = (streamed.clone(), streamed_deleg.clone());
         let epoch_streamed = epoch_streamed.clone();
         let chunks = chunks.clone();
+        let (fenced, fenced_seeds) = (fenced.clone(), fenced_seeds.clone());
+        let superseded = superseded.clone();
         handles.push(std::thread::spawn(move || loop {
             let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if seed >= start + seeds {
@@ -2669,6 +2716,17 @@ fn sweep_config() {
                     chunks[2].fetch_add(report.remote_dropped, ord);
                     chunks[4].fetch_add(report.held_back, ord);
                     chunks[5].fetch_add(report.awaited_uploaded, ord);
+                    let lost: u64 = report.stats.values().map(|s| s.lock_lost).sum();
+                    superseded.fetch_add(report.epochs_superseded as u64, ord);
+                    fenced[0].fetch_add(report.locks.fenced_ios, ord);
+                    fenced[1].fetch_add(lost, ord);
+                    if report.locks.fenced_ios > 0 || lost > 0 {
+                        eprintln!(
+                            "SWEEP-FENCED {label} seed {seed}: {} I/Os fenced, {lost} grants lost",
+                            report.locks.fenced_ios
+                        );
+                        fenced_seeds.lock().unwrap().push(seed);
+                    }
                 }
                 Err(e) => {
                     let head: String = e.lines().take(3).collect::<Vec<_>>().join(" | ");
@@ -2687,7 +2745,7 @@ fn sweep_config() {
         "sweep {label} {start}..{}: {} failing: {f:?}; answered from the stream: {} ({} a delegate's); \
          installed from an epoch's stream: {}; remote chunks enrolled: {}, ship plans deferring: {}, \
          dropped for a departed member: {}; replies excusing own rows: {}, own chunks held \
-         back: {}, uploaded past the hold: {}",
+         back: {}, uploaded past the hold: {}; epochs replaced by their closed carrier's: {}; lock I/Os fenced: {}, grants lost: {}, in seeds {:?}",
         start + seeds,
         f.len(),
         streamed.load(std::sync::atomic::Ordering::Relaxed),
@@ -2699,6 +2757,14 @@ fn sweep_config() {
         chunks[3].load(std::sync::atomic::Ordering::Relaxed),
         chunks[4].load(std::sync::atomic::Ordering::Relaxed),
         chunks[5].load(std::sync::atomic::Ordering::Relaxed),
+        superseded.load(std::sync::atomic::Ordering::Relaxed),
+        fenced[0].load(std::sync::atomic::Ordering::Relaxed),
+        fenced[1].load(std::sync::atomic::Ordering::Relaxed),
+        {
+            let mut s = fenced_seeds.lock().unwrap().clone();
+            s.sort_unstable();
+            s
+        },
     );
     assert!(f.is_empty(), "failing seeds: {f:?}");
 }
@@ -3711,12 +3777,16 @@ fn long_sessions_seed_10146_recovered_segment_is_in_the_base_window() {
 /// The retention gap check (an extra S3 LIST before a takeover CAS and
 /// on a follower's first empty probe) changed the schedule, and seed
 /// 30299 no longer restarts a member into its own carried epoch; seed
-/// 30908 does (`find_late_adopted_hold_seeds`). 30299 still runs clean.
+/// 30908 did (`find_late_adopted_hold_seeds`). 30299 still runs clean.
+/// Since the review of chunk epoch-liveness-gap, a node paused for longer
+/// than a formation attempt's interval is no member (it could not have
+/// acked); 30908's member was paused longer, and seed 32708 adopts late.
 #[test]
 fn flex_crash_seed_30299_restarted_member_adopts_the_carried_hold() {
     run_seed(30299, flex_crash_config()).unwrap_or_else(|e| panic!("flex-crash seed 30299: {e}"));
-    let report = run_seed(30908, flex_crash_config())
-        .unwrap_or_else(|e| panic!("flex-crash seed 30908: {e}"));
+    run_seed(30908, flex_crash_config()).unwrap_or_else(|e| panic!("flex-crash seed 30908: {e}"));
+    let report = run_seed(32708, flex_crash_config())
+        .unwrap_or_else(|e| panic!("flex-crash seed 32708: {e}"));
     let adopted: u64 = report
         .stats
         .values()
@@ -4048,12 +4118,12 @@ fn locks_blips_tight_config() -> SimConfig {
     c
 }
 
-/// `locks-blips-tight` on one node (`stress-ng-fs-faults`' topology).
-/// With three, the members of the last epoch stay in it until the
-/// carried lease has moved, that is past the holder's re-claim, and a
-/// member of an open epoch joins no other (`Machine::persist_promise`):
-/// so only a lone node's next epoch can begin inside the re-claim
-/// window and carry the lease its close let go.
+/// `locks-blips-tight` on one node (`stress-ng-fs-faults`' topology): its
+/// every second cut that falls inside the re-claim window begins an epoch
+/// carrying the lease its close let go. With three, the members of the
+/// last epoch stay in it until the carried lease has moved, and the next
+/// epoch begins only once the hold owner has closed and proposes it
+/// (`Machine::persist_promise_proposed`).
 fn locks_blips_tight_single_config() -> SimConfig {
     SimConfig {
         nodes: 1,
@@ -4061,15 +4131,16 @@ fn locks_blips_tight_single_config() -> SimConfig {
     }
 }
 
-/// `locks-blips-tight` with a 10 s lease. A pair of cuts whose gap no
-/// re-claim reached (the hold owner closed in a short S3 window and was
-/// cut again) has no next epoch: the other members are still in the
-/// last one, waiting for that re-claim. The grants the close kept are
-/// renewed under the closed lease up to its expiry, and with the sim's
-/// 6 s lease, last renewed up to half a TTL before the pair, that expiry
-/// can fall inside the pair (1.5 + 0.9 + 1.5 s at most): the grants lapse,
-/// as for any lease nobody could renew. 10 s outlasts it, so the schedule
-/// tests what it is for: grants surviving the blips.
+/// `locks-blips-tight` with a 10 s lease. Before chunk
+/// epoch-liveness-gap, a pair of cuts whose gap no re-claim reached (the
+/// hold owner closed in a short S3 window and was cut again) had no next
+/// epoch: the other members were still in the last one, waiting for that
+/// re-claim. The grants the close kept are renewed under the closed lease
+/// up to its expiry, and with the sim's 6 s lease, last renewed up to half
+/// a TTL before the pair, that expiry could fall inside the pair: the
+/// grants lapsed. Now the hold owner's fresh epoch replaces the open one
+/// (`Machine::persist_promise_proposed`), so the 6 s lease survives too;
+/// this run keeps the lease out of the picture.
 fn locks_blips_tight_long_lease_config() -> SimConfig {
     let c = locks_blips_tight_config();
     let core = c.core.clone();
@@ -4080,6 +4151,34 @@ fn locks_blips_tight_long_lease_config() -> SimConfig {
             k
         }),
         ..c
+    }
+}
+
+/// Chunk epoch-liveness-gap (sweep only): `locks-blips-tight` with the
+/// CI's random faults on top: a hold owner that crashes or pauses
+/// between its close and its fresh epoch, members partitioned from it,
+/// S3 errors on the re-claim.
+fn locks_blips_tight_faults_config() -> SimConfig {
+    SimConfig {
+        random_faults: 3,
+        join_fresh: false,
+        ..locks_blips_tight_config()
+    }
+}
+
+/// Review of chunk epoch-liveness-gap (sweep only): `locks-blips-tight`'s
+/// back-to-back cuts over `locks-delegated` (the lock files in `d1`,
+/// delegated to node 2, `d2` to node 3). Every epoch replaced by its
+/// closed carrier's has delegates among its members, which stay stopped
+/// through the transient promised state (`Core::epoch_replacing`).
+fn locks_blips_tight_delegated_config() -> SimConfig {
+    let c = locks_blips_tight_config();
+    SimConfig {
+        ops_per_client: c.ops_per_client,
+        lock_ios: c.lock_ios,
+        lock_io_ms: c.lock_io_ms,
+        faults: c.faults,
+        ..locks_delegated_config()
     }
 }
 
@@ -4404,8 +4503,14 @@ fn locks_survive_s3_blips() {
         "locks refused across blips: {t:?}"
     );
     // Cuts in back-to-back pairs: some begin before the last epoch has
-    // closed everywhere, and that epoch goes on.
+    // closed everywhere, and that epoch goes on; once its hold owner has
+    // closed (its re-claim cut off), its fresh epoch replaces the open one
+    // and carries the lease the close let go, so no grant lapses with the
+    // 6 s lease either (chunk epoch-liveness-gap: 4 fenced I/Os here
+    // before).
     let mut continued = 0;
+    let mut superseded = 0;
+    let mut reheld = 0;
     let mut t = M14Totals::default();
     for seed in 99_100..99_160 {
         let report = run_seed(seed, locks_blips_tight_config()).unwrap_or_else(|e| {
@@ -4414,18 +4519,31 @@ fn locks_survive_s3_blips() {
             )
         });
         continued += report.epochs_continued;
+        superseded += report.epochs_superseded as u64;
+        reheld += report
+            .stats
+            .values()
+            .map(|s| s.epoch_closed_leases_reheld)
+            .sum::<u64>();
         t.add(&report);
     }
-    eprintln!("locks-blips-tight: {continued} epochs continued, {t:#?}");
+    eprintln!(
+        "locks-blips-tight: {continued} epochs continued, {superseded} replaced by the \
+         carrier's, {reheld} closed leases held again, {t:#?}"
+    );
     assert!(continued > 0, "no cut fell before an epoch's close");
+    assert!(
+        superseded > 0,
+        "no closed carrier's epoch replaced an open one"
+    );
+    assert!(reheld > 0, "no cut fell inside a re-claim window");
     assert_eq!(t.lost, 0, "grants lost across blips: {t:?}");
+    assert_eq!(t.clients.fenced_ios, 0, "I/O fenced across blips: {t:?}");
     assert_eq!(
         t.clients.unavailable, 0,
         "locks refused across blips: {t:?}"
     );
-    // No fenced I/O once the lease outlives a pair of cuts no re-claim
-    // reached (see `locks_blips_tight_long_lease_config`; with the 6 s
-    // lease it can expire inside the pair, and its grants with it).
+    // The same with a 10 s lease.
     let mut t = M14Totals::default();
     for seed in 99_100..99_160 {
         let report = run_seed(seed, locks_blips_tight_long_lease_config()).unwrap_or_else(|e| {
@@ -4476,13 +4594,13 @@ fn locks_survive_s3_blips() {
 /// I/O; the successor's grace went with its own epoch-flush release, and
 /// its re-claim of that lease granted over the live exclusive grant.
 ///
-/// No I/O is fenced with the 10 s lease. With the 6 s one, one I/O is:
-/// the hold owner closed its epoch at t=8701 on a probe that landed as
-/// S3 was cut again (t=8500), the other members stayed in that epoch
-/// waiting for its re-claim, so none formed, and the closed lease, last
-/// renewed before the cut, expired at t≈9.8 s inside it with the grants
-/// it kept (`locks_blips_tight_long_lease_config`). It passed with 0
-/// only while the sim formed a second epoch over the open one.
+/// No I/O is fenced with either lease. With the 6 s one, one I/O was
+/// before chunk epoch-liveness-gap: the hold owner closed its epoch at
+/// t=8701 on a probe that landed as S3 was cut again (t=8500), the other
+/// members stayed in that epoch waiting for its re-claim, so none formed,
+/// and the closed lease, last renewed before the cut, expired at t≈9.8 s
+/// inside it with the grants it kept. The owner's fresh epoch now
+/// replaces the open one and carries that lease.
 #[test]
 fn locks_blips_tight_seed_2723_release_keeps_exclusion() {
     let report = run_seed(2723, locks_blips_tight_config()).unwrap_or_else(|e| {
@@ -4491,7 +4609,7 @@ fn locks_blips_tight_seed_2723_release_keeps_exclusion() {
     let mut t = M14Totals::default();
     t.add(&report);
     assert_eq!(t.lost, 0, "grants lost: {t:?}");
-    assert!(t.clients.fenced_ios <= 1, "I/O fenced: {t:?}");
+    assert_eq!(t.clients.fenced_ios, 0, "I/O fenced: {t:?}");
     let report = run_seed(2723, locks_blips_tight_long_lease_config()).unwrap_or_else(|e| {
         panic!(
             "locks-blips-tight-long-lease seed 2723: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight-long-lease"
@@ -4542,7 +4660,9 @@ fn locks_blips_tight_in_doubt_seed_1383_an_overtaken_release_keeps_exclusion() {
 /// no lease, and one of them took the expired lease over (seed 200: the
 /// dead-root check, seed 8398: a lock acquisition) beside node 1's hold.
 /// The epoch now goes on instead, and its members wait for the carried
-/// lease to move.
+/// lease to move — or, once its carrier has closed, the carrier's fresh
+/// epoch replaces it (chunk epoch-liveness-gap: seed 8398's outage at
+/// t=2.5 s does). Each seed must meet an open epoch.
 #[test]
 fn locks_blips_tight_an_open_epoch_is_not_formed_over() {
     for seed in [200, 8398] {
@@ -4555,6 +4675,111 @@ fn locks_blips_tight_an_open_epoch_is_not_formed_over() {
             report.epochs_continued > 0,
             "seed {seed}: no outage met an open epoch"
         );
+    }
+}
+
+/// Chunk epoch-liveness-gap, `locks-blips-tight` seed 8: the hold owner
+/// (node 1) closed the epoch formed at t=12.8 s at t=14825, after S3 was
+/// cut again at t=14.7 s and before its re-claim could land. Nodes 2 and
+/// 3 were still in that epoch, waiting for the carried lease to move, so
+/// no epoch formed, and node 3's exclusive grant, kept by the close and
+/// renewable only up to the closed lease's expiry, lapsed under its I/O
+/// at t=15709. Node 1's fresh epoch now replaces the open one at every
+/// member and carries the closed lease, which node 1 holds again.
+///
+/// Seed 66: the same pair of cuts, with node 1's re-claim CAS in flight
+/// as S3 was cut again at t=8.5 s (answered in doubt, its re-read cut
+/// off). Node 1 now claims the object that CAS may have written, the
+/// fresh epoch carries it, and nodes 2 and 3 stay in it whichever of the
+/// two objects S3 shows. While a claim in doubt was carried by no epoch
+/// with others, the epoch at t=8.8 s carried no lease and two I/Os were
+/// fenced at the closed lease's expiry.
+///
+/// Seed 568: a lock renewal crossing a recall. Node 3's grant came by a
+/// waiter's push (its window counted from the request 770 ms earlier), a
+/// recall moved it to the owner's re-affirmed id, and the answer to the
+/// renewal sent under the old id ("renewed, now the new id") was dropped,
+/// so the grant lapsed under I/O 350 ms after its install
+/// (`LockTables::renewed`).
+#[test]
+fn locks_blips_tight_seeds_8_66_and_568_no_grant_lapses() {
+    for seed in [8, 66, 568] {
+        let report = run_seed(seed, locks_blips_tight_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-blips-tight seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight"
+            )
+        });
+        let mut t = M14Totals::default();
+        t.add(&report);
+        assert_eq!(t.lost, 0, "seed {seed}: grants lost: {t:?}");
+        assert_eq!(t.clients.fenced_ios, 0, "seed {seed}: I/O fenced: {t:?}");
+    }
+    // The mechanism itself (a closed carrier's fresh epoch replacing an open
+    // one, and the closed lease held again) is asserted over a seed range
+    // rather than per seed: which seed reaches it depends on lock timing.
+    let (mut superseded, mut reheld) = (0u64, 0u64);
+    for seed in 0..64 {
+        let report = run_seed(seed, locks_blips_tight_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-blips-tight seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight"
+            )
+        });
+        superseded += report.epochs_superseded as u64;
+        reheld += report
+            .stats
+            .values()
+            .map(|s| s.epoch_closed_leases_reheld)
+            .sum::<u64>();
+    }
+    assert!(
+        superseded > 0,
+        "seeds 0..64: no closed carrier's epoch replaced an open one"
+    );
+    assert!(reheld > 0, "seeds 0..64: no closed lease was held again");
+}
+
+/// Chunk epoch-liveness-gap, with random faults on top of the paired
+/// cuts (sweep-only configs `flex-tight`, `locks-blips-tight-faults`):
+///
+/// - `flex-tight` 1913: node 3 closed (t=2495) and was paused (t=2769)
+///   as its fresh epoch replaced the open one (t=2800); the activation
+///   reached it at t=5662, past the closed lease's expiry margin, and it
+///   held nothing (the clock check on the closed claim), so nobody held
+///   the epoch, it never closed, and an unlink answered `ENOENT` against
+///   the history. An activation carrying the closed lease now holds it
+///   whenever it arrives, as one carrying a held lease does.
+/// - `locks-blips-tight-faults` 409: the re-claim's CAS landed while the
+///   hold owner held its fresh epoch, its members closed on the moved
+///   object, and the owner, crashed meanwhile, re-adopted its hold beside
+///   their takeover: two authorities. No acquisition CAS goes out once an
+///   epoch is open, and none is out under a carried closed claim.
+/// - `locks-blips-tight-faults` 945: the sim replaced the open epoch in
+///   the name of a carrier paused for 4.8 s; a daemon proposes only
+///   while it runs.
+/// - `locks-blips-tight-faults` 5379 (failed on main too, with the
+///   config): the sim formed an epoch with node 1 paused, acking in its
+///   name; it carried node 1's held lease, node 1 resumed past that
+///   lease's expiry and adopted no hold, and the epoch never closed (a
+///   lock waiter timed out after 60 s). A paused node is no member: it
+///   answers no ping.
+#[test]
+fn epoch_liveness_gap_fault_seeds() {
+    for (config, seed) in [
+        ("flex-tight", 1913),
+        ("locks-blips-tight-faults", 409),
+        ("locks-blips-tight-faults", 945),
+        ("locks-blips-tight-faults", 5379),
+    ] {
+        let cfg = match config {
+            "flex-tight" => flex_tight_config(),
+            _ => locks_blips_tight_faults_config(),
+        };
+        let report = run_seed(seed, cfg).unwrap_or_else(|e| {
+            panic!("{config} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={config}")
+        });
+        let mut t = M14Totals::default();
+        t.add(&report);
+        assert_eq!(t.lost, 0, "{config} seed {seed}: grants lost: {t:?}");
     }
 }
 

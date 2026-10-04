@@ -671,7 +671,30 @@ Operational rules:
   every write with `EROFS` on the node whose lease had been standing
   all along (`stress-ng-fs-faults`). An epoch carrying it makes the node
   hold the lease again, as before the close, with its epoch hold: writes
-  and locks go on, and the next close re-claims it.
+  and locks go on, and the next close re-claims it. If the re-claim's
+  CAS was answered in doubt (S3 cut while it was in flight), the node
+  claims the object that CAS may have written (same lease epoch, the
+  later expiry), usable only while the earlier object is. If a CAS of
+  its own is still out, or one in doubt wrote another lease epoch, the
+  claim is carried only by an epoch of that node alone.
+- If S3 is cut again after the hold owner closed but before its
+  re-claim lands, the other members are still in the last epoch (they
+  wait for the carried lease to move, below), and a member of an open
+  epoch joins no other. So a member accepts one proposal in place of
+  its open epoch: from that epoch's carrier, a member of it that has
+  closed it (it proposes only when it is in no open epoch), once the
+  epoch was activated here, and only if this member does not own the
+  epoch's hold itself. It goes from one epoch to the next without
+  closing, so it promises and takes over nothing in between. If that
+  proposal is aborted (another member refused it), the member closes
+  although the carried lease has not moved: no hold of the old epoch
+  remains (its carrier closed it), and the carrier's claim on the lease
+  its close let go ends at that lease's expiry, so the member is like
+  any closed node. The new
+  epoch resolves its claims as any other does, and the closed carrier's
+  claim is the lease its close let go. Before, no epoch could form until
+  the re-claim, and with a 6 s lease the lease and its lock grants could
+  lapse inside two back-to-back cuts (fenced I/O).
 - A lease being released is a different state from one an epoch's close
   let go. The close sends no release: the lease stays in S3 as this
   node's, and nobody can take it without a CAS on that object or the
@@ -705,14 +728,19 @@ Operational rules:
   its own lease keeps the lease's granting mark, so a re-claim that S3
   cuts again before it could mark the lease does not refuse every lock.
 - A member of an epoch that carries a lease closes it once S3 is back
-  and the lease object is no longer the carried lease (the hold owner's
-  flush re-claimed it), frozen or not: a missing member (paused, dead)
-  does not keep the others in the epoch after the owner's flush. The
+  and the lease object has moved past the carried lease (the hold
+  owner's flush re-claimed it), frozen or not: a missing member (paused,
+  dead) does not keep the others in the epoch after the owner's flush.
+  An earlier object of the same holder and lease epoch has not moved
+  past it: the carrier claimed what its re-claim CAS in doubt may have
+  written, and that CAS did not land. The
   owner ends its log streams at the close; a member follows it again as
   soon as the flush's first segment is announced (gossip) or tailed.
 - A holder whose carried lease reaches it after the lease margin (the
   activation took a moment) still adopts the hold: members promise
   nothing while the epoch is open, so no taker can act on the expiry.
+  The same holds for the lease an epoch's close let go (an activation
+  that reaches a paused node late).
 - A member that can still reach S3 declines to join an epoch. A node
   whose own S3 fails asks every live member to probe S3 (`PingS3`,
   answered by a lease GET bounded at 300 ms: `Pong.s3_ok`); if any

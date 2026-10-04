@@ -42462,3 +42462,326 @@ Not re-run this round: the full `harness run` matrix, `compliance` and
 `tests/integration.sh`. The coordinator's gate list for this round leaves
 them out, and this round changes only `crates/csi`, the harness `k8s`
 module and docs.
+
+## Fix: a second S3 cut before the hold owner's re-claim left no epoch able to form, and the lease and its lock grants lapsed (`epoch-liveness-gap`)
+
+The open item of `two-authorities`: with the faithful coordinator, a
+member of an open epoch joins no other. The members of an epoch carrying
+the hold owner's lease stay in it until that lease has moved in S3, and
+only the owner's re-claim after its own close moves it. If S3 is cut
+again after the close and before the re-claim lands, no epoch can form.
+The closed lease and the lock grants it kept are renewable only up to its
+expiry, so with the sim's 6 s lease they lapse inside the pair of cuts:
+fenced I/O, `EIO`.
+
+Reproduced on main: `locks-blips-tight` seed 8. Node 1 closed the epoch
+formed at t=12.8 s at t=14825, after S3 was cut again at t=14.7 s. Nodes
+2 and 3 stayed in that epoch, and node 3's exclusive grant lapsed under
+its I/O at t=15709. Main's run of `locks_survive_s3_blips` (seeds
+99100..99160) shows 4 fenced I/Os.
+
+### The rule
+
+Fix: a member accepts one proposal in place of its open epoch: from that
+epoch's carrier (`Machine::persist_promise_proposed`, called from
+`EpochManager::handle_propose_checked`). All of these must hold:
+- the open epoch is activated here (active or frozen, not just
+  promised);
+- its carrier is the proposer, and the proposer is a member of both the
+  open epoch and the proposal;
+- this node does not own the epoch's hold (`EpochClaimView::epoch_held`).
+
+The member goes from one open epoch to the next without closing, and its
+join gate stays held. The new epoch resolves its claims like any other.
+The closed carrier claims the lease its close let go
+(`epoch_closed_claim`), so the new epoch carries that lease, the
+carrier holds it again, and the members again wait for it to move. The
+sim's `epochs::try_form` mirrors this: every open member takes the
+proposal under the same conditions, the proposer is a closed, live
+member (no paused node is a member: it answers no ping), and the open
+members' state goes through "promised" before the activation.
+
+### Why it can't produce two authorities (plan 30 §M10)
+
+The invariant: at no time do an epoch hold and another node's usable S3
+lease coexist, or two epoch holds.
+
+1. **The open epoch has no hold anywhere when its carrier proposes.**
+   `maybe_propose` returns while the proposer's epoch is open, so the
+   carrier has closed it. There are three ways the carrier closes:
+   - It owned the hold: the hold ends at the close.
+   - It had handed the hold to a member: as a non-holding member it
+     closes only once the carried object has moved past the carried lease
+     (`epoch_carrier_checked`). Only the hold owner's flush after its
+     own close writes such an object: members promise nothing while
+     open, and no CAS of the carrier's is in play (point 3).
+   - It owed the move: it never held.
+
+   `abandon_if_carrier_retired`, the one path that leaves a member
+   closed beside a live hold, is taken by the other members, never by
+   the carrier. Even if some node still owned a hold, it refuses the
+   proposal (`holds`).
+2. **A member that missed the close is the case the rule is for.** Every
+   member that has not seen the object move is still in the old epoch
+   and goes straight to the new one. A member that has seen the object
+   move has closed and joins like any closed node, through the join
+   gate. A member whose open epoch is only promised (it never saw the
+   activation, so it doesn't know the carrier) refuses.
+
+   A member that took the proposal can still close before the object
+   moved: the carrier aborts a proposal another member refused
+   (`EpochAbort`, `handle_abort`), or the fresh epoch carries no lease
+   (a claim in doubt) and the members close on the first probe that
+   reaches S3. (An earlier version of this argument said the member
+   "never passes through a closed state"; the review of this chunk
+   found these two paths.) That is safe because no hold of the old
+   epoch remains (point 1), and the carrier's only remaining authority
+   is its closed claim, which ends at the closed lease's expiry. The
+   carrier holds again only through the activation of an epoch it acked
+   while that claim was usable (point 6), and an aborted proposal is
+   never activated. So the closed member is any closed node: a taker
+   outside an epoch waits out the expiry it reads, and the promises and
+   the join gate keep takers and epochs apart.
+3. **A crashed hold owner.**
+   - Crashed while holding: its persisted machine is still open at
+     restart, so it proposes nothing and re-adopts its persisted hold
+     (`restore_epoch_hold`), now matched on the carried lease rather
+     than the lease epoch alone. `flex-tight` seed 138: the record of an
+     earlier epoch's hold, let go at its close, names the same lease
+     epoch, and dropped the fresh epoch's hold at a restart.
+   - Crashed after its close: `closed_tenure` is in memory, so it claims
+     nothing. The new epoch carries no lease or another claim, and
+     nobody holds X. Liveness only.
+
+   The members can't be made to close beside a restored hold, because
+   nothing moves the object past the carried lease while the owner
+   holds. Three things guarantee that:
+   - No renewal under a hold (`renew_due`).
+   - An acquisition overtaken by an epoch ends before its CAS
+     (`acquire_overtaken_by_epoch`).
+   - A closed claim with an acquisition CAS still out (or one in doubt
+     at another lease epoch) is carried only by an epoch of that node
+     alone (`EpochClaimView::in_doubt`). Activated with others, the node
+     owes the move instead of holding (`on_epoch_state`).
+
+   `locks-blips-tight-faults` seed 409 failed exactly this way before
+   these three: the re-claim CAS landed under the fresh hold, the
+   members closed, and the owner crashed and re-adopted its hold beside
+   their takeover.
+4. **A re-claim CAS answered in doubt.** The object is X, or the X' that
+   CAS wrote (same holder and lease epoch, later expiry). The closed
+   owner claims the latest object, X', and members treat an earlier
+   object of the carried holder and lease epoch as "not moved yet"
+   (`l.expires_unix_ms <= c.expires_unix_ms`). Nothing but the carrier's
+   own post-close re-claim writes a later one: a holder's expiry only
+   grows, and the CAS orders writes on the object. The claim is usable
+   only while the earliest object is, because a taker outside the epoch
+   waits only for the expiry of the object it reads. Taker and epoch
+   stay apart through the promises and the join gate, as in any epoch.
+   Before, the claim was the earlier X, so a landed CAS made the members
+   close beside the hold. The first version of this chunk then carried
+   no lease at all, and `locks-blips-tight` seed 66 fenced 2 I/Os.
+5. **A competing proposer.** Any other proposer is refused by every open
+   member, as on main (`persist_promise`). Formation needs every
+   reachable roster node's promise (`component_quorum`), so the proposal
+   fails.
+6. **A late activation.** An activation carrying the closed lease is
+   adopted whenever it arrives (`epoch_closed_carried` has no clock), as
+   `carries_mine` already does for a held lease: the claim was usable
+   when acked, and nobody takes the object over while the epoch is
+   open. `flex-tight` seed 1913 failed before this change: node 3, paused, got
+   the activation past the expiry margin and held nothing, so nobody
+   held the epoch, it never closed, and an unlink answered `ENOENT`
+   against the history.
+
+### Also in the chunk (found by the new configs)
+
+- `LockTables::renewed` (meta): a renewal answered "renewed, now id N"
+  after a recall had already moved the held grant to N extends that
+  grant. `locks-blips-tight` seeds 568, 1713, 1887 and 2762 failed
+  before this change: the grant lapsed under I/O 350 ms after its install.
+- `restore_epoch_hold` matches the handed-away record on the carried
+  lease's epoch and expiry (point 3).
+- Sim: `try_form` never replaces an epoch in the name of a paused carrier
+  (`locks-blips-tight-faults` seed 945, 450 ms into a 4.8 s pause).
+- New sweep-only configs: `flex-tight`, which runs `flex`'s two-member
+  outages in back-to-back pairs with random faults, and
+  `locks-blips-tight-faults`, which adds random faults to
+  `locks-blips-tight`. `sweep_config` now reports fenced I/Os and lost
+  grants per seed (`SWEEP-FENCED`) and the epochs replaced
+  (`Report::epochs_superseded`).
+
+### Tests
+
+- net: `the_carriers_fresh_epoch_replaces_an_activated_one`,
+  `only_the_carrier_replaces_an_open_epoch_and_never_at_the_hold_owner`
+  (another proposer, unknown carrier, the hold owner, a merely promised
+  epoch, a proposer outside the epoch, idempotence, closed machine).
+- engine: `a_member_takes_the_carriers_fresh_epoch_in_place_of_the_open_one`.
+- core:
+  - `a_member_goes_from_the_open_epoch_to_its_carriers_fresh_one_without_closing`
+  - `a_closed_claim_in_doubt_claims_the_latest_object_and_is_held_again`
+  - `a_late_activation_holds_the_closed_lease_again_past_its_expiry`
+    (checked: it fails with the clock-checked lookup)
+  - `a_closed_claim_whose_cas_wrote_another_epoch_is_carried_alone_only`
+  - `a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile`,
+    extended: an earlier object of the carried tenure closes nothing; a
+    released one, another lease epoch or another holder does.
+- meta: `a_renewal_answered_under_the_id_a_recall_moved_to_extends_the_grant`.
+- sim:
+  - `locks_blips_tight_seeds_8_66_and_568_no_grant_lapses` (8: the
+    original repro, 66: the in-doubt re-claim; both assert an epoch was
+    replaced and the closed lease held again)
+  - `epoch_liveness_gap_fault_seeds` (`flex-tight` 1913,
+    `locks-blips-tight-faults` 409, 945)
+  - `locks_survive_s3_blips` now asserts 0 fenced I/Os with the 6 s
+    lease, at least one replacement, and at least one re-held closed
+    lease
+  - `locks_blips_tight_seed_2723_release_keeps_exclusion` is back to
+    `fenced_ios == 0`
+
+No check or test was weakened.
+
+### Gates (`AUTHORITY_SIM_THREADS=8`, `CARGO_TARGET_DIR` unset)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority -p constellation-meta -p constellation-net` (+ `-p constellation-engine --lib epoch`) | all passed, 0 failed |
+| every lock config (`locks` … `locks-failover-backup-writes`, the 19 of `sweep_config` with `locks-blips-tight-faults`): 0..4000 | 0 failing |
+| `locks-blips-tight` 0..4000 | 0 failing, **0 fenced I/Os** (2420 epochs replaced by the closed carrier's); `-long-lease` 0, `-single` 0 |
+| `flex`, `flex-crash`, `flex-tight` 0..3000 | 0 failing (`flex-tight` on main: 21) |
+| `delegated-holder-cut`, `long-delegated`, `long-backup`, `delegated-backup`, `delegated-two-gens-root-crash`, `delegated-root-gone`, `delegated-delegate-restart`, `long-delegated-backup`, `long-acks3`: 0..1000 | 0 failing |
+| `harness run` `epoch-*` (6) and `lock-*` (6), prefix `elg`, `TMPDIR=/var/tmp/elg/htmp` | ALL SCENARIOS PASSED |
+
+### Open
+
+- Fenced I/O left in the blips configs, all present on main with no
+  epoch replaced: `locks-blips` seeds 434 and 931 (1 each), and
+  `locks-blips-tight-in-doubt` seed 2733 (1; every epoch carried the
+  lease). Not this gap. `locks-blips-tight-faults` fences about 1800
+  I/Os in 4000 seeds (main: about 1400 in 3000), from random holder
+  crashes and partitions: by design.
+- A *live* holder whose renewal CAS is in doubt when an epoch forms
+  claims the earlier object (`Phase::Renew` keeps no record of `sent`
+  after `Failed`). If that renewal landed, the members see a later object
+  and close beside the hold. Present on main and not seen in any
+  sweep; the same fix (claim the later object) applies.
+- A proposal the members took but whose activation never comes leaves
+  them promised and not activated. They then refuse a further proposal
+  from the carrier, as for any promised epoch. The sim activates at
+  once, so this isn't exercised there.
+
+### Review round (2026-10-04): the review's should-fixes
+
+Verdict was approve, with no must-fix. Each should-fix and nit:
+
+1. **Carrier read racing an activation** (should-fix 3).
+   `handle_propose_checked` now reads the carrier and the hold under the
+   machine lock it decides under. `handle_activate`, and the proposer's
+   own activation, set the carrier under the lock that activates.
+   Lock order: machine, then carrier, as in `sync_flags`. A proposal
+   handled meanwhile sees either the promised epoch or the active one
+   with its own carrier, never the previous epoch's carrier beside it.
+   Test: `a_proposal_racing_an_activation_never_sees_the_previous_carrier`
+   (engine, 200 rounds of the two on threads behind a barrier).
+2. **The proof's "never passes through a closed state"** (should-fix 2).
+   Point 2 above and the `persist_promise_proposed` doc are corrected:
+   - A member that took the proposal can still close before the object
+     moved, through an aborted proposal or a fresh epoch carrying no
+     lease.
+   - That is safe because no hold of the old epoch remains, and the
+     closed claim ends at the closed lease's expiry.
+   - An aborted proposal is never activated, so it never re-holds.
+
+   Test: `an_abort_after_a_replacement_closes_the_member` (engine). It
+   pins the state after the replacement and `handle_abort`:
+   - the replaced epoch's id aborts nothing;
+   - the member is closed and not frozen, and no epoch is open on disk,
+     so a restart stays closed;
+   - the last carrier is kept, the join gate is released, and another
+     proposer's epoch is taken.
+3. **The transient promised report ran the close-release** (should-fix
+   4). `Core::epoch_replacing` marks the member's step from an active
+   epoch to its promise to the carrier's fresh one. On that report the
+   core:
+   - runs neither `epoch_close_release`, `nudge`, the `skip_ship`
+     reset, nor `deleg_on_epoch`, so delegates stay stopped through it;
+   - runs the close-release if the epoch closes from there (an aborted
+     proposal);
+   - runs nothing once the new epoch activates.
+
+   Test: `a_replaced_epochs_transient_report_is_not_a_close` (core).
+   New sweep-only config `locks-blips-tight-delegated`
+   (`locks-blips-tight`'s cuts over `locks-delegated`) replaces 2502
+   epochs in 0..4000 with delegates among the members, and 0 seeds fail.
+   It fences 490 I/Os, against 799 on main with the same config: all
+   are pre-existing delegate-side lapses through the cuts, none from
+   replacements.
+4. **Paused nodes acking in the sim** (should-fix 1). `try_form` no
+   longer counts as a member a node paused for at least `FORM_EVERY`
+   (100 ms), because a paused daemon acks nothing. A node paused for less
+   than that still counts: it may have acked just before it stopped, and
+   it handles the activation when it resumes. `flex-crash` seed 30908
+   failed when every paused node was excluded: such a member crashed
+   and restarted into the epoch. `locks-blips-tight-faults` seed 5379
+   (it failed on main too) now passes and is pinned in
+   `epoch_liveness_gap_fault_seeds`.
+5. **Nits.**
+   - `LockTables::renewed`'s doc now says that a stale answer for the
+     old id also clears `renewing` for a renewal of `now_id`. That is
+     harmless: at worst one duplicate renewal.
+   - `epoch_closed_claim`'s earliest expiry over the kept tenure is
+     left as it is, with a comment: it is conservative, and it may end
+     the claim sooner than needed on a long chain of re-holds.
+
+**Also fixed in this round** (found by the gate sweeps):
+`locks-blips-tight-long-lease` seed 3270 fenced 1 I/O. Main's code
+has the same race; this round's timing exposed it. The sequence on the
+waiter:
+1. It holds a pushed grant (id 803), whose window counts from its first
+   request, 764 ms earlier.
+2. The owner re-affirms the grant as 804 for the waiter's retried
+   request and recalls 804 at once for the next waiter.
+3. The recall arrives before the reply and adopts 804
+   (`recall_held`).
+4. `lock_late_reply` dropped the reply because the held id was not
+   older than the reply's (`>=`). The renewal answer for 803 was
+   dropped as well (the held id is 804).
+
+The grant lapsed at the push's window, 236 ms into its I/O.
+
+Fix: a late reply whose id a recall already adopted extends that grant
+from its arrival, like a renewal answer (`LockTables::renewed`). Its
+local locks, recall and release are kept. This is as safe as the
+existing late-reply install: same owner, same id, window counted from
+the reply's arrival, minus the margin. Test:
+`a_reply_whose_id_a_recall_already_adopted_extends_the_grant` (core;
+fails with `>=`). Seed 3270 now has 0 fenced I/Os.
+
+TESTING.md's `locks-blips-tight` paragraph no longer describes the gap
+as current. It now names the replacement, the pins and the sweep-only
+configs.
+
+### Gates (review round; `AUTHORITY_SIM_THREADS=8`, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --release -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority -p constellation-meta -p constellation-net` | 25 test binaries, 0 failed (authority lib 247, sim 123, meta 231, net 119) |
+| `cargo test --release -p constellation-engine --lib epoch` | 11 passed |
+| the 20 lock configs (incl. `locks-blips-tight-faults`, `-delegated`), 0..4000 | 0 failing. Fenced: `locks-blips-tight` 0 (2403 replaced); `-long-lease` 0; `-single` 0; `-in-doubt` 1 (2733, as before) |
+| `locks-blips-tight` and `locks-blips-tight-faults` 4000..8000 | 0 failing (`-tight`: 0 fenced) |
+| `flex`, `flex-crash`, `flex-tight` 0..3000; `flex-crash` 30000..33000; `flex-tight` 3000..6000 | 0 failing |
+| `delegated-holder-cut`, `long-delegated`, `long-backup`, `delegated-backup`, `delegated-two-gens-root-crash`, `delegated-root-gone`, `delegated-delegate-restart`, `long-delegated-backup`, `long-acks3`, 0..1000 | 0 failing |
+| harness `epoch-*` (6) and `lock-*` (6), prefix `elg`, `TMPDIR=/var/tmp/elg/htmp` | ALL SCENARIOS PASSED |
+
+### Open (review round)
+
+- The earlier Open items stand.
+- The sim forms epochs all or nothing, so the abort path after a
+  replacement (`EpochAbort` at a member that took the proposal) is
+  covered only by the engine test, not by a sweep.
+- `locks-blips-tight-delegated` fences I/O in 459 of 4000 seeds (main:
+  687), through delegate lapses in the cuts. That is not this gap, and
+  it needs its own look.

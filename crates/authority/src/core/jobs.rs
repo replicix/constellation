@@ -1646,9 +1646,19 @@ impl Core {
     }
 
     /// Whether the held lease should be renewed now: half its TTL is
-    /// gone (or a deposition hint asked for it).
+    /// gone (or a deposition hint asked for it). Never under an epoch
+    /// hold: the epoch carries exactly the lease object, and its other
+    /// members close once S3 shows another (`epoch_carrier_checked`), so a
+    /// renewal that lands changes what they wait on while this node still
+    /// holds the epoch (chunk epoch-liveness-gap, `locks-blips-tight-faults`
+    /// seed 409: a round begun before the activation renewed the lease it
+    /// held again, the renewal landed as S3 was cut, the hold owner
+    /// crashed, and the members closed and took the lease over at its
+    /// expiry beside the hold it re-adopted at its restart). The hold
+    /// needs no S3 lease; the flush's re-claim after the close renews it.
     fn renew_due(&self, now: Ms) -> bool {
         !self.lease.lost
+            && !self.lease.epoch_held()
             && match &self.lease.held {
                 Some((lease, _)) => {
                     self.ship.renew_now
@@ -2495,6 +2505,9 @@ impl Core {
         if let Some((lease, _)) = &object {
             self.lease.note_object(now, lease);
         }
+        if self.acquire_overtaken_by_epoch(now, replica, out) {
+            return;
+        }
         let plan = self.lease.classify(now, &self.cfg, object, self.bk.sealed);
         if let Some(What::Acquire {
             reason: READOPT_REASON,
@@ -2685,6 +2698,34 @@ impl Core {
             None,
         );
         self.issue_tail(out);
+    }
+
+    /// A continuation epoch opened while this acquisition's lease read
+    /// (or its takeover's tail, or promise check) was out: it ends here,
+    /// before its CAS. A member of an open epoch runs no S3 acquisition
+    /// (plan 30 §M10's rule (b)); the check at the job's start does not
+    /// cover one already running. Chunk epoch-liveness-gap,
+    /// `locks-blips-tight-faults` seed 409: the hold owner's re-claim,
+    /// queued at its close, had its lease read out (slow replies) when its
+    /// fresh epoch activated and it held the closed lease again; the CAS
+    /// that followed landed, the other members saw the carried object
+    /// replaced and closed while it held, and took the lease over at its
+    /// expiry beside the hold it re-adopted after a crash.
+    fn acquire_overtaken_by_epoch(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if !self.epoch.open {
+            return false;
+        }
+        tracing::debug!(
+            node = self.cfg.node_id,
+            "a continuation epoch opened during the acquisition: no S3 CAS"
+        );
+        self.finish_acquire(now, false, replica, out);
+        true
     }
 
     fn acquire_cas(&mut self, now: Ms, plan: Plan, out: &mut Vec<Action>) {
@@ -3781,6 +3822,9 @@ impl Core {
                     self.finish_acquire(now, false, replica, out);
                     return;
                 };
+                if self.acquire_overtaken_by_epoch(now, replica, out) {
+                    return;
+                }
                 self.acquire_cas(now, plan, out);
             }
             TailThen::CatchUp => {
@@ -3921,6 +3965,15 @@ impl Core {
         }
     }
 
+    /// An acquisition's lease CAS is out, or the re-read after one that
+    /// failed without an answer: the object it writes may stand in S3
+    /// now, or land later (`EpochClaimView::in_doubt`).
+    pub(crate) fn acquire_cas_unsettled(&self) -> bool {
+        self.job
+            .as_ref()
+            .is_some_and(|j| matches!(j.phase, Phase::Cas { .. } | Phase::CasReread { .. }))
+    }
+
     /// The epoch probe's round may close the epoch: mark it probed and
     /// run the complete upload pass; `on_uploads_done` closes.
     fn epoch_probe_close(&mut self, out: &mut Vec<Action>) {
@@ -3951,6 +4004,14 @@ impl Core {
     /// a `base` below the holder's pre-outage segments; tailing those
     /// after the heal closed its epoch, it promised, and a third node took
     /// the lease over while the paused holder still held the epoch.)
+    ///
+    /// An earlier object of the carried holder and lease epoch is the
+    /// carried lease not yet reached: the carrier claimed the latest
+    /// object its re-claim CAS in doubt may have written
+    /// (`Core::epoch_closed_claim`), and that CAS did not land. Nothing
+    /// but the carrier's own re-claim after its close writes a later one
+    /// (a holder's expiry only grows, and a CAS on the object orders its
+    /// writes).
     fn epoch_carrier_checked(
         &mut self,
         now: Ms,
@@ -3967,7 +4028,7 @@ impl Core {
                 !l.released
                     && l.holder == c.node
                     && l.epoch == c.epoch
-                    && l.expires_unix_ms == c.expires_unix_ms
+                    && l.expires_unix_ms <= c.expires_unix_ms
             }
             _ => false,
         };
