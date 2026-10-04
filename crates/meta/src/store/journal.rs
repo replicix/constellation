@@ -98,6 +98,40 @@ impl Drop for PendingLocalOpGuard {
 }
 
 thread_local! {
+    static PENDING_LOCK_TAG: std::cell::RefCell<Option<crate::locks::LockTag>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Plan 30 §M14 phase 2: the fencing token of the op whose transaction is
+/// being journaled on this thread, for its `journal_tx` row
+/// (`JournalTx::lock_tag`): a replay after a deposition carries it. Same
+/// thread-local scoping as [`PendingLocalOp`]. Set by
+/// `mutate::execute_tagged` and by [`crate::Meta::with_lock_tag`] (the
+/// holder's own manifest commit, which has no op).
+pub(crate) struct PendingLockTag;
+
+impl PendingLockTag {
+    pub(crate) fn set(tag: &crate::locks::LockTag) -> PendingLockTagGuard {
+        if !tag.is_empty() {
+            PENDING_LOCK_TAG.with(|c| *c.borrow_mut() = Some(tag.clone()));
+        }
+        PendingLockTagGuard
+    }
+
+    pub(crate) fn take() -> Option<crate::locks::LockTag> {
+        PENDING_LOCK_TAG.with(|c| c.borrow_mut().take())
+    }
+}
+
+pub(crate) struct PendingLockTagGuard;
+
+impl Drop for PendingLockTagGuard {
+    fn drop(&mut self) {
+        PENDING_LOCK_TAG.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+thread_local! {
     static PENDING_OBSERVED: std::cell::RefCell<Option<Vec<Vec<u8>>>> = const { std::cell::RefCell::new(None) };
 }
 

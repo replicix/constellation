@@ -1424,7 +1424,9 @@ fn a_root_appending_a_delegates_git_object_keeps_the_object() {
         ),
     ];
     for (r, op, recs) in &ops {
-        assert!(meta.install_shadow_from(*r, 1, gen, op, recs).unwrap());
+        assert!(meta
+            .install_shadow_from(*r, 1, gen, op, &Default::default(), recs)
+            .unwrap());
     }
     for (idx, (r, _, recs)) in ops.iter().enumerate() {
         let body: Vec<LogRecord> = recs

@@ -81,6 +81,11 @@ struct LockOp {
     reread: bool,
 }
 
+/// How often a release held back for tagged mutations in flight looks
+/// again (plan 30 §M14 phase 2). Only a fallback: the FUSE thread that
+/// ends the last of them wakes the release (`Control::LockReleaseWake`).
+const RELEASE_WAIT_POLL_MS: i64 = 250;
+
 /// How many `LockState::done_reqs` entries are kept.
 const DONE_REQS_KEPT: usize = 64;
 
@@ -145,6 +150,10 @@ pub(crate) struct LockState {
     relearning: bool,
     /// Flush attempts per inode with a release in flight.
     flushing: BTreeMap<Ino, u32>,
+    /// Phase 2: inodes whose release waits for tagged mutations
+    /// (`on_lock_flushed`; counted once per wait), with the timer that
+    /// looks again.
+    release_waiting: BTreeMap<Ino, (GrantId, crate::ids::TimerId)>,
     /// Node side: requests answered by a push while their RPC was still
     /// in flight, by that RPC's id → the inode: the RPC's own reply
     /// (the owner re-affirmed the grant under a *new* id) then installs
@@ -262,6 +271,25 @@ pub(crate) struct LockState {
     /// stays, for that acquisition to keep or drop
     /// (`Core::epoch_tenure_resumed`).
     keep_grants: bool,
+    /// Owner side: the restart horizon (`Meta::note_lock_grant_horizon`)
+    /// as far as it is known durable. A grant or renewal to a peer is
+    /// answered only once its window is covered; the write runs off the
+    /// core (`Action::PersistLockHorizon`), so a slow disk delays the
+    /// answers waiting for it, not every other event (`git-under-flock-b2b`
+    /// seed 7: a 7.6 s sync blocked the core 12 s, and another node's
+    /// grant lapsed meanwhile).
+    horizon_durable: i64,
+    /// The write in flight, if any (one at a time: later needs coalesce
+    /// into the next one, which carries the highest).
+    horizon_writing: Option<i64>,
+    /// The highest horizon asked for (rounded up), written next.
+    horizon_want: i64,
+    /// What the answer being built needs durable (`lock_need_horizon`),
+    /// taken by `lock_answer`.
+    horizon_need: i64,
+    /// Answers waiting for the horizon: `(needed, to, message)`, in the
+    /// order they were made.
+    horizon_held: Vec<(i64, NodeId, PeerMsg)>,
 }
 
 /// How many subtree floors an owner keeps before folding them into one
@@ -291,6 +319,7 @@ impl LockState {
             ("lk_waiters", self.waiters.len()),
             ("lk_recalls", self.recalls.len()),
             ("lk_renews", self.renews.len()),
+            ("lk_horizon_held", self.horizon_held.len()),
         ]
     }
 }
@@ -330,11 +359,11 @@ impl Core {
         }
     }
 
-    fn lock_ttl_ms(&self) -> i64 {
+    pub(crate) fn lock_ttl_ms(&self) -> i64 {
         self.cfg.lock_ttl_ms as i64
     }
 
-    fn lock_margin_ms(&self) -> i64 {
+    pub(crate) fn lock_margin_ms(&self) -> i64 {
         self.cfg.expiry_margin_ms as i64
     }
 
@@ -544,11 +573,129 @@ impl Core {
             replica,
             out,
         ) {
-            Served::Outcome(outcome) => out.push(Action::Send {
-                to: from,
-                msg: PeerMsg::LockReply { req, outcome },
-            }),
+            Served::Outcome(outcome) => {
+                self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out)
+            }
             Served::Parked => {}
+        }
+    }
+
+    /// Note that the answer being built needs the restart horizon durable
+    /// up to `need`; `target` (≥ `need`, rounded up) is what to write.
+    fn lock_need_horizon(&mut self, need: i64, target: i64) {
+        self.lk.horizon_need = self.lk.horizon_need.max(need);
+        self.lk.horizon_want = self.lk.horizon_want.max(target.max(need));
+    }
+
+    /// Send an owner's answer to a peer: at once if the horizon it needs
+    /// (`lock_need_horizon`) is durable, else once the write lands
+    /// (`on_lock_horizon_persisted`). Answers to one peer keep their
+    /// order: one made after a held one waits behind it.
+    fn lock_answer(&mut self, to: NodeId, msg: PeerMsg, out: &mut Vec<Action>) {
+        let need = std::mem::take(&mut self.lk.horizon_need);
+        let behind = self.lk.horizon_held.iter().any(|(_, n, _)| *n == to);
+        if need <= self.lk.horizon_durable && !behind {
+            out.push(Action::Send { to, msg });
+            return;
+        }
+        self.stats.lock_horizon_held += 1;
+        self.lk.horizon_held.push((need, to, msg));
+        self.lock_horizon_write(out);
+    }
+
+    fn lock_horizon_write(&mut self, out: &mut Vec<Action>) {
+        if self.lk.horizon_writing.is_some() || self.lk.horizon_want <= self.lk.horizon_durable {
+            return;
+        }
+        let until = self.lk.horizon_want;
+        self.lk.horizon_writing = Some(until);
+        self.stats.lock_horizon_writes += 1;
+        out.push(Action::PersistLockHorizon { until });
+    }
+
+    /// `Action::PersistLockHorizon` finished: `durable` is the horizon
+    /// now on disk (`None`: the write failed). The answers it covers go
+    /// out in order; on a failure the ones it should have covered are
+    /// refused instead — as a failed synchronous write refused them —
+    /// a grant answered `Busy` (and dropped here), a renewal
+    /// `NotOwner { 0 }` (the holder retries).
+    pub(crate) fn on_lock_horizon_persisted(
+        &mut self,
+        now: Ms,
+        until: i64,
+        durable: Option<i64>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.lk.horizon_writing == Some(until) {
+            self.lk.horizon_writing = None;
+        }
+        let failed = match durable {
+            Some(d) => {
+                self.lk.horizon_durable = self.lk.horizon_durable.max(d);
+                false
+            }
+            None => {
+                self.stats.lock_horizon_failed += 1;
+                // Asked again only by a later answer.
+                self.lk.horizon_want = self.lk.horizon_durable;
+                true
+            }
+        };
+        let durable = self.lk.horizon_durable;
+        let held = std::mem::take(&mut self.lk.horizon_held);
+        let mut keep: Vec<(i64, NodeId, PeerMsg)> = Vec::new();
+        let mut dropped = Vec::new();
+        for (need, to, mut msg) in held {
+            if failed {
+                // Everything held goes now, in order: what the write
+                // should have covered refused.
+                if need > durable && !Self::lock_refuse_answer(&mut msg, &mut dropped) {
+                    continue;
+                }
+                out.push(Action::Send { to, msg });
+            } else if need <= durable && !keep.iter().any(|(_, n, _)| *n == to) {
+                out.push(Action::Send { to, msg });
+            } else {
+                keep.push((need, to, msg));
+            }
+        }
+        self.lk.horizon_held = keep;
+        for id in dropped {
+            if let Some(g) = replica.locks().get(id) {
+                self.lock_grant_done(now, id, g.ino, replica, out);
+            }
+        }
+        self.lock_horizon_write(out);
+    }
+
+    /// A held answer whose horizon could not be persisted: its grants
+    /// refused (their ids into `dropped`), its renewals `NotOwner { 0 }`.
+    /// `false`: nothing to send (a push; the waiter asks again).
+    fn lock_refuse_answer(msg: &mut PeerMsg, dropped: &mut Vec<GrantId>) -> bool {
+        match msg {
+            PeerMsg::LockReply { outcome, .. } => {
+                if let LockOutcome::Granted { id, .. } = outcome {
+                    dropped.push(*id);
+                    *outcome = LockOutcome::Busy;
+                }
+                true
+            }
+            PeerMsg::LockGranted { outcome, .. } => {
+                if let LockOutcome::Granted { id, .. } = outcome {
+                    dropped.push(*id);
+                }
+                false
+            }
+            PeerMsg::LockRenewed { results, .. } => {
+                for (_, _, r) in results.iter_mut() {
+                    if matches!(r, LockRenewResult::Ok { .. }) {
+                        *r = LockRenewResult::NotOwner { owner: 0 };
+                    }
+                }
+                true
+            }
+            _ => true,
         }
     }
 
@@ -733,9 +880,10 @@ impl Core {
         // refused under a cluster lock), so it must not keep the restarted
         // node from granting: a lone node's remount answered every
         // non-blocking lock `EAGAIN` for a lock TTL
-        // (`transport-lock-wait-budget`).
-        if from != self.cfg.node_id && !replica.note_lock_grant_horizon(until) {
-            return Ok(LockOutcome::Busy);
+        // (`transport-lock-wait-budget`). The answer waits for it
+        // (`lock_answer`).
+        if from != self.cfg.node_id {
+            self.lock_need_horizon(until, until);
         }
         // Every grant is a new id, an own grant re-asked for included:
         // the node may have dropped (lapsed, released) the id the owner
@@ -1334,14 +1482,8 @@ impl Core {
             return;
         }
         match req {
-            Some(req) => out.push(Action::Send {
-                to: node,
-                msg: PeerMsg::LockReply { req, outcome },
-            }),
-            None => out.push(Action::Send {
-                to: node,
-                msg: PeerMsg::LockGranted { ino, sent, outcome },
-            }),
+            Some(req) => self.lock_answer(node, PeerMsg::LockReply { req, outcome }, out),
+            None => self.lock_answer(node, PeerMsg::LockGranted { ino, sent, outcome }, out),
         }
     }
 
@@ -1497,10 +1639,7 @@ impl Core {
             let r = self.lock_renew_one(now, from, e.ino, e.grant, e.mode, replica);
             results.push((e.ino, e.grant, r));
         }
-        out.push(Action::Send {
-            to: from,
-            msg: PeerMsg::LockRenewed { req, results },
-        });
+        self.lock_answer(from, PeerMsg::LockRenewed { req, results }, out);
         for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
             self.deleg_renew_now(now, gen, out);
         }
@@ -1532,25 +1671,36 @@ impl Core {
             self.lk.deleg_renew_wanted.insert(gen);
         }
         let until = now.0 + ttl + self.lock_margin_ms();
-        if let Some((mode, recalled)) = replica.locks().extend(id, from, until) {
-            self.stats.lock_renewals_served += 1;
-            return LockRenewResult::Ok {
-                ttl_ms: ttl as u64,
-                recalled,
-                id,
-                mode,
-            };
-        }
-        // Not that id, but this node holds a newer grant here (a reply
-        // that never arrived replaced it): renew that one and say so
-        // (sim seed 90013 fenced a healthy node otherwise).
-        if let Some(g) = replica.locks().own_grant(ino, from, now.0) {
-            if let Some((mode, recalled)) = replica.locks().extend(g.id, from, until) {
+        // The grant renewed: that id, or this node's newer grant here (a
+        // reply that never arrived replaced it: renew that one and say so
+        // — sim seed 90013 fenced a healthy node otherwise).
+        let target = match replica.locks().get(id) {
+            Some(g) if g.node == from => Some(g.id),
+            _ => replica.locks().own_grant(ino, from, now.0).map(|g| g.id),
+        };
+        if let Some(target) = target {
+            // A renewal moves the end of the window a peer honours, so the
+            // restart horizon moves with it, persisted before the answer as
+            // a grant's is: a sequencer that restarted inside its lease
+            // waited only for its last *grant*'s window, then regranted
+            // while the holder still honoured its renewed one
+            // (lock-fence-token review, `git-under-flock-faults` at 2 s
+            // TTL). The answer waits for the write (`lock_answer`); one
+            // that fails answers it `NotOwner { 0 }` and the holder
+            // retries. Only for a grant the renewal extends (an unknown id
+            // must not lengthen the next restart's quarantine), and rounded
+            // up by a quarter TTL: a durable write per quarter TTL, not per
+            // second, while peers hold grants. A node's own grants die with
+            // its process and leave no horizon (`lock_try_grant`).
+            if let Some((mode, recalled)) = replica.locks().extend(target, from, until, now.0) {
+                if from != self.cfg.node_id {
+                    self.lock_need_horizon(until, until + ttl / 4);
+                }
                 self.stats.lock_renewals_served += 1;
                 return LockRenewResult::Ok {
                     ttl_ms: ttl as u64,
                     recalled,
-                    id: g.id,
+                    id: target,
                     mode,
                 };
             }
@@ -1558,7 +1708,11 @@ impl Core {
         // Unknown: a reclaim during a grace period, if nothing conflicts.
         let grace = self.lock_grace_active(now, ino, replica);
         let conflicting = replica.locks().conflicting(ino, from, mode, now.0);
-        if grace && conflicting.is_empty() && replica.note_lock_grant_horizon(until) {
+        if grace && conflicting.is_empty() {
+            if from != self.cfg.node_id {
+                self.lock_need_horizon(until, until);
+            }
+            // Its holder's renewal: confirmed from now on.
             replica.locks().install(Grant {
                 id,
                 node: from,
@@ -1567,6 +1721,7 @@ impl Core {
                 until_ms: until,
                 recalled: false,
                 gen,
+                confirmed_ms: now.0,
             });
             self.stats.lock_reclaimed += 1;
             self.lk.mirror_dirty = true;
@@ -2726,6 +2881,40 @@ impl Core {
         });
     }
 
+    /// Phase 2: the end of the latest token window naming `grant` among
+    /// this node's own queued replays (stranded ops not resolved yet), if
+    /// one is still open at `now`.
+    fn replay_blocks_release(grant: GrantId, now: Ms, replica: &dyn Replica) -> Option<i64> {
+        let queued = replica.pending_replays().ok()?;
+        queued
+            .iter()
+            .filter(|q| q.refused.is_none() && !q.foreign)
+            .flat_map(|q| q.lock_tag.0.iter())
+            .filter(|t| t.grant == grant && t.until_ms > now.0)
+            .map(|t| t.until_ms)
+            .max()
+    }
+
+    /// Phase 2: the last tagged mutation in flight under `ino`'s recalled
+    /// grant was answered (`LockTables::set_release_wake`): a release
+    /// waiting for it looks again now, not at its next poll.
+    pub(crate) fn on_lock_release_wake(
+        &mut self,
+        now: Ms,
+        op: OpId,
+        ino: Ino,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if let Some(&(grant, _)) = self.lk.release_waiting.get(&ino) {
+            self.on_lock_flushed(now, ino, grant, true, replica, out);
+        }
+        out.push(Action::ControlDone {
+            op,
+            result: Ok(ControlOk::Done),
+        });
+    }
+
     /// Start releasing `ino`'s grant: flush its dirty data first.
     fn lock_release_begin(
         &mut self,
@@ -2765,6 +2954,48 @@ impl Core {
                 "releasing a recalled lock grant without a successful flush (its expiry would drop it anyway)"
             );
         }
+        // Plan 30 §M14 phase 2, release ordering: no release while a
+        // mutation tagged with this grant is in flight, or one left in
+        // doubt could still execute (until its token's window is over,
+        // when every executor refuses it). Released earlier, such an op
+        // could land after the next holder's writes at a sequencer that
+        // only checks the window. The grant is not renewed meanwhile
+        // (recalled, nothing pins it): if the wait outlasts its window it
+        // lapses here, and its owner outwaits it.
+        if replica.locks().held(ino).is_some_and(|h| h.id == grant) {
+            // A stranded op tagged with the grant, queued for replay by
+            // rid after a holder change, is in flight too: a release now
+            // would let it land, at an executor that only checks the
+            // window, after the next holder's writes. Waited for until it
+            // is resolved or its token's window is over.
+            let blocked = replica.locks().release_blocked(grant, now.0).or_else(|| {
+                Self::replay_blocks_release(grant, now, replica)
+                    .map(|until| Some(until.min(now.0 + RELEASE_WAIT_POLL_MS)))
+            });
+            if let Some(until) = blocked {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ino,
+                    ?grant,
+                    ?until,
+                    "a recalled grant's release waits for mutations tagged with it"
+                );
+                let at = until.unwrap_or(now.0 + RELEASE_WAIT_POLL_MS);
+                let timer = self.set_timer(
+                    Ms(at.max(now.0 + 1)),
+                    Timer::LockReleaseWait(ino, grant),
+                    out,
+                );
+                match self.lk.release_waiting.insert(ino, (grant, timer)) {
+                    None => replica.locks().with_stats(|s| s.release_waits += 1),
+                    Some((_, old)) => self.cancel_timer(old, out),
+                }
+                return;
+            }
+        }
+        if let Some((_, timer)) = self.lk.release_waiting.remove(&ino) {
+            self.cancel_timer(timer, out);
+        }
         self.lk.flushing.remove(&ino);
         if !replica.locks().end_release(ino, grant) {
             // Gone already, or a local lock (or the grant's first use)
@@ -2787,6 +3018,16 @@ impl Core {
                     position,
                 },
             }),
+            Route::Unknown if self.lock_owner_resuming(now) => {
+                // An epoch's close kept this node's grant table for the
+                // re-claim (`lock_keep_grants_at_close`): the grant is in
+                // it, and it is this node's to end. A release that waited
+                // through the close for tagged mutations (above) was
+                // dropped here, and the grant outwaited (`ttl + margin`)
+                // before its waiter was served.
+                let me = self.cfg.node_id;
+                self.on_lock_released(now, me, ino, grant, position, replica, out);
+            }
             Route::Unknown => {
                 // The owner (whoever it is) outwaits it.
             }
@@ -2823,9 +3064,13 @@ impl Core {
         let until = self.restamp(now);
         let n = grants.len();
         for g in grants {
+            // Unconfirmed: the mirror is asynchronous, and the previous
+            // holder may have ended a grant it still lists (released, or
+            // outwaited, and granted to another node since).
             replica.locks().install(Grant {
                 until_ms: until,
                 recalled: false,
+                confirmed_ms: Grant::UNCONFIRMED,
                 ..g
             });
         }
@@ -2938,7 +3183,14 @@ impl Core {
         back.extend(self.lk.handed.remove(&gen).unwrap_or_default());
         let mut n = 0;
         for g in back {
-            if g.until_ms > now.0 && replica.locks().install_if_consistent(Grant { gen: 0, ..g }) {
+            // This root's copy, unconfirmed: the delegate may have ended
+            // the grant (and granted another) before the generation ended.
+            let g = Grant {
+                gen: 0,
+                confirmed_ms: Grant::UNCONFIRMED,
+                ..g
+            };
+            if g.until_ms > now.0 && replica.locks().install_if_consistent(g) {
                 n += 1;
             }
         }
@@ -3204,6 +3456,11 @@ impl Core {
         replica
             .locks()
             .seed_ids(u64::from(self.cfg.incarnation) << 40);
+        // Phase 2: an ended grant's id is refused for as long as a token
+        // naming it could still be within its window somewhere.
+        replica
+            .locks()
+            .set_token_memory_ms(self.lock_ttl_ms() + 2 * self.lock_margin_ms());
         if !self.cfg.locks {
             return;
         }
@@ -3315,6 +3572,11 @@ impl Core {
             for dir in dirs {
                 self.lock_note_dir_floor(dir, &floor);
             }
+        }
+        // An expired record dropped on the way (a conflicting request's
+        // outwait, a token check) changed the table too.
+        if replica.locks().take_expired_dropped() {
+            self.lk.mirror_dirty = true;
         }
         if self.lk.mirror_dirty {
             self.lk.mirror_dirty = false;

@@ -294,7 +294,9 @@ fn a_grant_that_runs_out_fences_its_owner_without_any_event() {
     let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
     f.lock(turn.attr.ino, me, now_unix_ms() + 300);
     f.mkdir(&committer, "a").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(350));
+    // The grant's end passes on this thread's clock (no sleep: a loaded
+    // host could stretch a real one past anything the test assumes).
+    crate::locks::advance_test_clock(350);
     assert_eq!(code(f.mkdir(&committer, "b")), Code::Io);
     f.mkdir(&root, "c").unwrap();
     f.unlock(&committer, turn.attr.ino).unwrap();
@@ -511,4 +513,261 @@ fn a_cancelled_blocking_lock_wait_answers_intr_and_holds_nothing() {
     // Released, the next wait is granted.
     f.unlock(&root, ino).unwrap();
     wait(&constellation_vfs::CancelToken::new()).unwrap();
+}
+
+// ---- plan 30 §M14 phase 2: the fencing token ----
+
+/// The owner's mutations carry the grant its lock is under (the token:
+/// the grant and the window this node honours it for); another process's
+/// carry nothing. While the owner's op is in flight its grant is not
+/// released; a mutation it journals keeps the token in its replay row.
+#[test]
+fn the_lock_owners_mutations_carry_its_grant_and_nobody_elses_do() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let committer = Caller::new(0, 0, Some(me));
+    let other = Caller::new(0, 0, Some(std::os::unix::process::parent_id()));
+    let root = Caller::root();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    let until = now_unix_ms() + 60_000;
+    f.lock(turn.attr.ino, me, until);
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let grant = GrantId { node: 9, seq: 1 };
+    {
+        let _scope = locks.tag_scope(Some(me), None);
+        let tag = crate::locks::current_tag().unwrap();
+        assert_eq!(
+            tag.0,
+            vec![constellation_meta::locks::LockToken {
+                grant,
+                until_ms: until
+            }]
+        );
+        assert_eq!(
+            f.meta.locks().release_blocked(grant, now_unix_ms()),
+            Some(None),
+            "the op is in flight"
+        );
+    }
+    assert_eq!(f.meta.locks().release_blocked(grant, now_unix_ms()), None);
+    {
+        let _scope = locks.tag_scope(other.pid, None);
+        assert!(crate::locks::current_tag().unwrap().is_empty());
+    }
+    // Through the view: the owner's create journals its token.
+    f.meta.set_holder_epoch(1);
+    f.create(&committer, ROOT_INO, "obj").unwrap();
+    // Deposed: the unshipped create is rolled back and queued by rid.
+    f.meta.set_holder_epoch(0);
+    f.meta.strand_below_epoch(2).unwrap();
+    let queued = f.meta.pending_replays().unwrap();
+    let obj = queued
+        .iter()
+        .find(
+            |q| matches!(&q.op, constellation_meta::MutateOp::Create { name, .. } if name == "obj"),
+        )
+        .unwrap_or_else(|| panic!("the create is queued for replay: {queued:?}"));
+    assert_eq!(obj.lock_tag.0.len(), 1, "{obj:?}");
+    assert_eq!(obj.lock_tag.0[0].grant, grant);
+    assert!(f.meta.locks().stats().tagged_ops >= 2);
+}
+
+/// The gap phase 1 could not close, on the sequencer itself: the owner's
+/// op passes the node-local fence (its token is taken while the grant is
+/// honoured), the owner stalls past the grant, then the op reaches the
+/// journal — refused there (`EIO`), nothing created.
+#[test]
+fn an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let root = Caller::root();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    f.lock(turn.attr.ino, me, now_unix_ms() + 300);
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let _scope = locks.tag_scope(Some(me), None);
+    assert!(!locks.owner_fenced(Some(me), None), "the fence passes");
+    let tag = crate::locks::current_tag().unwrap();
+    assert_eq!(tag.0.len(), 1);
+    // The stall: the grant's window ends before the op executes.
+    crate::locks::advance_test_clock(400);
+    let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
+    let r = f.fs.mutate_op(
+        ROOT_INO,
+        constellation_meta::MutateOp::Create {
+            parent: ROOT_INO,
+            name: "late".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+    );
+    assert_eq!(r, Err(Code::Io));
+    assert!(f.meta.lookup(ROOT_INO, "late").unwrap().is_none());
+    assert_eq!(f.meta.locks().stats().token_rejections, 1);
+}
+
+/// Lock-fence-token review must-fix 2: a token is taken when its op is
+/// sent, not when the op began. A close (or any op) that set out under
+/// one window and was sent after its holder renewed carries the renewed
+/// window, so a continuously renewed holder is not refused because its
+/// op was slow; once the grant is no longer honoured here the op keeps
+/// its old window and is refused where it lands.
+#[test]
+fn an_op_sent_after_a_renewal_carries_the_renewed_window() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let root = Caller::root();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    let first = crate::locks::now_ms() + 300;
+    f.lock(turn.attr.ino, me, first);
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let _scope = locks.tag_scope(Some(me), None);
+    // Taken at the op's start (as `flush` and `release` do).
+    assert_eq!(crate::locks::current_tag().unwrap().0[0].until_ms, first);
+    // Renewed meanwhile, then the old window passes.
+    let renewed = crate::locks::now_ms() + 60_000;
+    let mut h = f.meta.locks().held(turn.attr.ino).unwrap();
+    h.until_ms = renewed;
+    f.meta.locks().install_held(turn.attr.ino, h);
+    crate::locks::advance_test_clock(400);
+    let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
+    let create = |name: &str, ino| constellation_meta::MutateOp::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    f.fs.mutate_op(ROOT_INO, create("slow", ino)).unwrap();
+    assert!(f.meta.lookup(ROOT_INO, "slow").unwrap().is_some());
+    assert_eq!(f.meta.locks().stats().token_rejections, 0);
+    // Past the renewed window too: refused.
+    crate::locks::advance_test_clock(61_000);
+    let ino = f.meta.allocate_ino(ROOT_INO).unwrap();
+    assert_eq!(f.fs.mutate_op(ROOT_INO, create("late", ino)), Err(Code::Io));
+    assert!(f.meta.lookup(ROOT_INO, "late").unwrap().is_none());
+}
+
+/// Must-fix 2's re-issue rule: an op refused for its token's window is
+/// sent again (fresh rid, fresh token) only while every grant it named is
+/// still held and honoured here under a window renewed since — never for
+/// a grant that is no longer honoured, and not for one whose window did
+/// not move (an ended grant is renewed no more), so it cannot loop.
+#[test]
+fn a_refused_op_is_reissued_only_under_a_renewed_honoured_grant() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let root = Caller::root();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    f.lock(turn.attr.ino, me, crate::locks::now_ms() + 300);
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let _scope = locks.tag_scope(Some(me), None);
+    assert!(!crate::locks::reissue_after_lapse(), "nothing sent yet");
+    crate::locks::current_tag().unwrap();
+    assert!(
+        !crate::locks::reissue_after_lapse(),
+        "the window did not move"
+    );
+    let mut h = f.meta.locks().held(turn.attr.ino).unwrap();
+    h.until_ms = crate::locks::now_ms() + 5_000;
+    f.meta.locks().install_held(turn.attr.ino, h);
+    assert!(crate::locks::reissue_after_lapse(), "renewed and honoured");
+    // The re-sent op takes the renewed window: nothing left to re-issue.
+    crate::locks::current_tag().unwrap();
+    assert!(!crate::locks::reissue_after_lapse());
+    crate::locks::advance_test_clock(6_000);
+    assert!(!crate::locks::reissue_after_lapse(), "no longer honoured");
+}
+
+/// Must-fix 2: a commit refused for a lock grant that truly ended (here
+/// it lapsed between the close's fence check and the commit) is not
+/// silently discarded: its content becomes a conflict copy (a replay
+/// already refused, which the drain materializes under the view's root), the
+/// file keeps what it had, and the close answers `EIO`.
+#[test]
+fn a_commit_refused_for_an_ended_grant_becomes_a_conflict_copy() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let owner = Caller::new(0, 0, Some(me));
+    let root = Caller::root();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    let (file, opened) = f.create(&root, ROOT_INO, "data").unwrap();
+    f.lock(turn.attr.ino, me, crate::locks::now_ms() + 300);
+    let ino = file.attr.ino;
+    let cx = OpCtx::new(OpKind::Write, &owner);
+    assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let _scope = locks.tag_scope(Some(me), None);
+    crate::locks::current_tag().unwrap();
+    // The grant lapses after the close's fence check, before its commit.
+    crate::locks::advance_test_clock(400);
+    assert_eq!(f.fs.flush_inode(ino, false), Err(Code::Io));
+    assert_eq!(
+        f.meta.getattr(ino).unwrap().unwrap().size,
+        0,
+        "not published"
+    );
+    let queued = f.meta.pending_replays().unwrap();
+    let copy = queued
+        .iter()
+        .find(|q| {
+            matches!(&q.op, constellation_meta::MutateOp::Publish { parent, name, size: 6, .. }
+                if *parent == ROOT_INO && name == "data")
+        })
+        .unwrap_or_else(|| panic!("a conflict copy is queued at the root: {queued:?}"));
+    assert!(copy.refused.is_some(), "already refused: never executed");
+    assert!(
+        f.fs.writes.detach(ino).is_none(),
+        "the session went with it"
+    );
+}
+
+/// Review round 2, must-fix 1: on a subtree view, the refused commit's
+/// copy is queued under the view's root (named after the path below it),
+/// not the filesystem root, and carries the file's owner and its owner
+/// bits only (`0640` → `0600`).
+#[test]
+fn a_refused_commits_copy_stays_in_the_view_and_keeps_its_owner() {
+    let mut f = fenced_fs();
+    let vol = f.meta.mkdir(ROOT_INO, "vol", 0o755, 1000, 1000).unwrap();
+    let db = f.meta.mkdir(vol.ino, "db", 0o700, 1000, 1000).unwrap();
+    f.fs.set_subtree_root("/vol").unwrap();
+    let me = std::process::id();
+    let owner = Caller::new(1000, 1001, Some(me));
+    let (turn, _) = f.create(&owner, ROOT_INO, "turn.lock").unwrap();
+    let (file, opened) = f.create(&owner, db.ino, "data").unwrap();
+    f.meta
+        .setattr(file.attr.ino, Some(0o640), None, None, None, None, None)
+        .unwrap();
+    f.lock(turn.attr.ino, me, crate::locks::now_ms() + 300);
+    let ino = file.attr.ino;
+    let cx = OpCtx::new(OpKind::Write, &owner);
+    assert_eq!(f.write(&cx, ino, opened.fh), Ok(6));
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let _scope = locks.tag_scope(Some(me), None);
+    crate::locks::current_tag().unwrap();
+    crate::locks::advance_test_clock(400);
+    assert_eq!(f.fs.flush_inode(ino, false), Err(Code::Io));
+    let queued = f.meta.pending_replays().unwrap();
+    let copy = queued
+        .iter()
+        .find(|q| matches!(&q.op, constellation_meta::MutateOp::Publish { size: 6, .. }))
+        .unwrap_or_else(|| panic!("a conflict copy is queued: {queued:?}"));
+    match &copy.op {
+        constellation_meta::MutateOp::Publish {
+            parent,
+            name,
+            mode,
+            uid,
+            gid,
+            ..
+        } => {
+            assert_eq!(*parent, vol.ino, "under the view's root");
+            assert_eq!(name, "db%2Fdata", "named below the view's root");
+            assert_eq!((*uid, *gid, *mode), (1000, 1001, 0o600));
+        }
+        other => panic!("{other:?}"),
+    }
 }

@@ -17,6 +17,7 @@ use crate::ids::{Epoch, Ms, NodeId, OpId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
+use constellation_meta::locks::LockTag;
 use constellation_meta::{
     CompletedOutcome, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position,
     Rid, TouchSet,
@@ -137,6 +138,9 @@ pub(crate) struct ClientOp {
     /// afresh before it proceeds, so they order after the replays it
     /// waited for.
     pub deps_held: bool,
+    /// Plan 30 §M14 phase 2: the op's fencing token, carried on every
+    /// forward and inbox batch and checked by every local execution.
+    pub tag: LockTag,
     /// When the op was submitted, and the states it went through since
     /// (`(ms after submission, state)`, at most [`HISTORY_CAP`]): a slow
     /// op is logged with them when it finishes (`finish`).
@@ -340,16 +344,18 @@ fn journal_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
 impl Core {
     // ---- entry ----
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_submit(
         &mut self,
         now: Ms,
         rid: Rid,
         op: MutateOp,
         policy: Policy,
+        tag: LockTag,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.submit(now, rid, op, policy, Origin::Client, replica, out);
+        self.submit(now, rid, op, policy, tag, Origin::Client, replica, out);
     }
 
     /// Plan 30 §M9 (`Control::InDoubt`): the next `submit` of `rid`
@@ -369,6 +375,7 @@ impl Core {
         rid: Rid,
         op: MutateOp,
         policy: Policy,
+        tag: LockTag,
         origin: Origin,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -435,6 +442,7 @@ impl Core {
                 own_record_inos: BTreeSet::new(),
                 own_record_uploaded: false,
                 excused: Vec::new(),
+                tag,
             },
         );
         // Causal order after a generation ended with this node's writes
@@ -447,12 +455,12 @@ impl Core {
         // the root, which recalls, when the observed stream table is
         // full or the delegate is unreachable).
         if self.cfg.delegation {
-            let op_ref = self
+            let (op_ref, tag) = self
                 .clients
                 .get(&rid)
-                .map(|c| c.op.clone())
+                .map(|c| (c.op.clone(), c.tag.clone()))
                 .expect("present");
-            if self.delegate_try_execute(now, 0, None, rid, &op_ref, deps, 0, replica, out) {
+            if self.delegate_try_execute(now, 0, None, rid, &op_ref, deps, 0, &tag, replica, out) {
                 return;
             }
             if self.cfg.forwarding && self.cfg.p2p {
@@ -905,6 +913,7 @@ impl Core {
                 acked_through,
                 deps,
                 applied: replica.applied_seq().unwrap_or(0),
+                tag: c.tag.clone(),
             },
         });
     }
@@ -1021,10 +1030,14 @@ impl Core {
                 self.nudge(now, out);
             }
             MutateOutcome::Accepted { epoch, records } => {
-                let Some(op) = self.clients.get(&rid).map(|c| c.op.clone()) else {
+                let Some((op, tag)) = self
+                    .clients
+                    .get(&rid)
+                    .map(|c| (c.op.clone(), c.tag.clone()))
+                else {
                     return;
                 };
-                match replica.install_shadow(rid, epoch, gen, &op, &records) {
+                match replica.install_shadow(rid, epoch, gen, &op, &tag, &records) {
                     Ok(true) => {
                         tracing::debug!(node = self.cfg.node_id, ?rid, epoch, "shadow installed");
                         self.stats.shadows_installed += 1;
@@ -1165,6 +1178,13 @@ impl Core {
                 }
                 self.finish(now, rid, outcome, replica, out);
             }
+            MutateOutcome::LockLapsed => {
+                // Plan 30 §M14 phase 2: a grant the op was issued under
+                // ended before it reached the executor. Nothing ran;
+                // final (`EIO`), never retried by rid.
+                self.stats.lock_lapsed_refusals += 1;
+                self.finish(now, rid, outcome, replica, out)
+            }
             outcome @ (MutateOutcome::Errno(_) | MutateOutcome::Conflict { .. }) => {
                 // Plan 30 §M6: a refusal observed the holder's state
                 // without installing anything here (this replaces plan 29
@@ -1296,7 +1316,12 @@ impl Core {
         if self.cfg.delegation {
             let own = self.clients.get(&rid).map(|c| (c.op.clone(), c.deps));
             if let Some((op, deps)) = own {
-                if self.delegate_try_execute(now, 0, None, rid, &op, deps, 0, replica, out) {
+                let tag = self
+                    .clients
+                    .get(&rid)
+                    .map(|c| c.tag.clone())
+                    .unwrap_or_default();
+                if self.delegate_try_execute(now, 0, None, rid, &op, deps, 0, &tag, replica, out) {
                     self.stats.deleg_retry_executed += 1;
                     return;
                 }
@@ -1750,10 +1775,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> MutateOutcome {
-        let Some((op, policy, deps)) = self
+        let Some((op, policy, deps, tag)) = self
             .clients
             .get(&rid)
-            .map(|c| (c.op.clone(), c.policy, c.deps))
+            .map(|c| (c.op.clone(), c.policy, c.deps, c.tag.clone()))
         else {
             // Already finished by a nested pass (see `release_gated`);
             // the outcome goes to `finish`, which drops it.
@@ -1803,7 +1828,7 @@ impl Core {
             let dirs = Core::dirs_of_keys(&super::holder::keys_of_op(&op), replica);
             self.place_note(self.cfg.node_id, dirs);
         }
-        let outcome = match replica.execute(&op, Some(rid)) {
+        let outcome = match replica.execute(&op, Some(rid), &tag, now.0) {
             Ok(records) => {
                 if policy == Policy::Client {
                     self.lease.touch(now);
@@ -1818,6 +1843,12 @@ impl Core {
                 (MutateOutcome::Accepted { epoch, records }, wait)
             }
             Err(MetaError::Conflict) => (MutateOutcome::Conflict { manifest: None }, None),
+            // Plan 30 §M14 phase 2: the op's lock grant ended; nothing was
+            // journaled, so there is nothing to wait for either.
+            Err(MetaError::LockLapsed) => {
+                self.stats.lock_lapsed_refusals += 1;
+                return MutateOutcome::LockLapsed;
+            }
             Err(error) => {
                 // Plan 30 §M9: a definitive refusal is journaled as an
                 // outcome (`record_refusal`), for the same reason as a
@@ -2154,10 +2185,14 @@ impl Core {
     /// both are fixed in the takeover, see `apply_backup_tail` and
     /// `Meta::strand_for_takeover`.)
     fn adopt_streamed(&mut self, rid: Rid, position: &Position, replica: &dyn Replica) -> bool {
-        let Some(op) = self.clients.get(&rid).map(|c| c.op.clone()) else {
+        let Some((op, tag)) = self
+            .clients
+            .get(&rid)
+            .map(|c| (c.op.clone(), c.tag.clone()))
+        else {
             return false;
         };
-        match replica.adopt_streamed(rid, &op) {
+        match replica.adopt_streamed(rid, &op, &tag) {
             Ok(true) => {
                 tracing::debug!(
                     node = self.cfg.node_id,

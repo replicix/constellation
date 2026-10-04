@@ -2022,6 +2022,55 @@
       },
       "type": "object"
     },
+    "FencedOwnerStatus": {
+      "description": "One lock owner fenced on this node (`LockStatus::fenced_owners`).",
+      "properties": {
+        "grant": {
+          "description": "The grant whose end fenced it, `[minter, seq]`, when known: every\nop the owner issued under that lock carried it as its fencing\ntoken (an executor logs each one it lets through, target\n`constellation::token_exec`).",
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          ],
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "owner": {
+          "description": "The kernel's lock owner id.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pid": {
+          "description": "The process that took the lock (0: unknown).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "since_ms": {
+          "description": "When it was fenced (unix ms, this node's clock).",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "owner",
+        "pid",
+        "since_ms"
+      ],
+      "type": "object"
+    },
     "FileStat": {
       "description": "`browse.stat`: `getattr` for one path.",
       "properties": {
@@ -3788,6 +3837,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "fenced_owners": {
+          "description": "The lock owners fenced on this node now, with when each was fenced\n(this node's clock, unix ms): what a harness compares with when\nanother node got the lock.",
+          "items": {
+            "$ref": "#/$defs/FencedOwnerStatus"
+          },
+          "type": "array"
+        },
         "first_use_abandoned": {
           "description": "Recalled grants given up before their first local lock (the\nrequester gave up, or the first-use budget ran out).",
           "format": "uint64",
@@ -3851,6 +3907,38 @@
           "minimum": 0,
           "type": "integer"
         },
+        "held_grants": {
+          "description": "The grants this node holds now, `[minter, seq]` each (a harness\nmatches them with the executors' log of tagged operations).",
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "horizon_held": {
+          "description": "Owner side: grant and renewal answers that waited for the restart\nhorizon's durable write (run off the authority core), and those\nwrites.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "horizon_writes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "local_conflicts": {
           "format": "uint64",
           "minimum": 0,
@@ -3867,6 +3955,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "margin_ms": {
+          "description": "The bounded clock-skew margin the lease and lock machinery assume\n(ms): a grant's holder honours it `margin` less than its owner\nrecords it, and a fence that came `2 × margin` before another\nnode's grant came first.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "mode": {
           "description": "`cluster` or `local`.",
           "type": "string"
@@ -3878,6 +3972,12 @@
         },
         "owners_fenced": {
           "description": "Lock owners fenced on this node (their grant lapsed under their\nlocal lock), and the ops of theirs refused with `EIO` for it, on\nany file.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "predecessor_waits": {
+          "description": "A new local lock that waited for an earlier turn's mutations\ntagged with the same grant (in flight, or in doubt inside their\nwindow) before it was taken.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3918,6 +4018,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "release_waits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "released": {
           "format": "uint64",
           "minimum": 0,
@@ -3947,6 +4052,18 @@
         },
         "requeued_in_place": {
           "description": "Waiters re-parked at their old queue position after a grant to\nthem went unused, and releases that named a grant id this owner\nhad replaced (both ended a grant that was otherwise outwaited).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tagged_ops": {
+          "description": "Plan 30 §M14 phase 2 (the fencing token): mutations issued here\ntagged with their owner's grants, and recalled grants whose\nrelease waited for such a mutation to be answered.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "token_rejections": {
+          "description": "Plan 30 §M14 phase 2: tagged mutations this node refused as their\nexecutor because a grant they named was no longer live (`EIO` to\ntheir issuer; nothing journaled).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3992,6 +4109,14 @@
         "owners_fenced",
         "owner_fenced_ops",
         "first_use_abandoned",
+        "fenced_owners",
+        "margin_ms",
+        "held_grants",
+        "tagged_ops",
+        "release_waits",
+        "predecessor_waits",
+        "horizon_held",
+        "horizon_writes",
         "grants_waited",
         "grant_wait_ms_total",
         "grants_degraded",
@@ -4003,6 +4128,7 @@
         "reclaimed",
         "waiters_parked",
         "grace_refusals",
+        "token_rejections",
         "requeued_in_place",
         "released_superseded",
         "requests_in_flight",

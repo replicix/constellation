@@ -10,6 +10,7 @@
 
 use constellation_authority::Replica;
 use constellation_fs_core::types::ROOT_INO;
+use constellation_meta::locks::LockTag;
 use constellation_meta::{execute_mutate, LogRecord, Meta, MetaStore, MutateOp, Rid};
 
 fn rid(node: u64, seq: u64) -> Rid {
@@ -130,7 +131,10 @@ fn shadows_installed_on_the_holders_base_converge() {
     for seq in 1..=19u64 {
         let (_, rid, op, records) = &segments[seq as usize - 1];
         if rid.node == 2 {
-            assert!(Replica::install_shadow(&requester, *rid, 1, 0, op, records).unwrap());
+            assert!(
+                Replica::install_shadow(&requester, *rid, 1, 0, op, &LockTag::NONE, records)
+                    .unwrap()
+            );
         }
         apply(&requester, &segments, seq);
         assert_eq!(
@@ -155,7 +159,9 @@ fn a_shadow_survives_an_unrelated_rename_tailed_under_it() {
     }
     let (_, rid18, op18, records18) = &segments[17];
     assert!(matches!(op18, MutateOp::Unlink { .. }));
-    assert!(Replica::install_shadow(&requester, *rid18, 1, 0, op18, records18).unwrap());
+    assert!(
+        Replica::install_shadow(&requester, *rid18, 1, 0, op18, &LockTag::NONE, records18).unwrap()
+    );
     apply(&requester, &segments, 17);
     let mut expected = listing_at(&segments, 17);
     expected.retain(|e| !e.starts_with("f0="));
@@ -251,7 +257,9 @@ fn forwarded_rename_flags_are_decided_by_the_holder_and_converge() {
     apply(&requester, &segments, 2);
     let (_, rid3, op3, records3) = &segments[2];
     assert!(matches!(records3[0], LogRecord::Exchange { .. }));
-    assert!(Replica::install_shadow(&requester, *rid3, 1, 0, op3, records3).unwrap());
+    assert!(
+        Replica::install_shadow(&requester, *rid3, 1, 0, op3, &LockTag::NONE, records3).unwrap()
+    );
     apply(&requester, &segments, 3);
     assert!(!requester.has_outstanding_speculation());
     assert_eq!(listing(&requester), listing_at(&segments, 3));

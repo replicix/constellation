@@ -926,9 +926,21 @@ of another node's `close()` out of band, with no lock between them
   the processes it started get `EIO` from every write and namespace
   operation until the owner's locks are gone, because an application that guards other files with the
   lock, as git does, must not write on once another node may hold it.
-  The limit: an operation checked before the lapse and applied after it
-  (a stalled forward) is not caught; a fencing token checked by the
-  sequencer would close that (PROGRESS, plan 30 M11 follow-up).
+- **Fencing token.** What the node-local fence cannot catch — an
+  operation admitted while the grant was honoured and applied after it
+  lapsed (a forward stalled in flight, a retry, a replay by rid) — is
+  refused where it is recorded: every mutation of a lock owner carries
+  its grants and the end of the window its node honours them for, taken
+  when the mutation is sent. A sequencer that holds the grant live (its
+  minter) judges it exactly: accepted while live, refused once released
+  or outwaited. Any other sequencer refuses it (`EIO`, nothing
+  journaled) once its own clock is past that window; the minter
+  outwaits a grant `2 × margin` past the holder's window, so no
+  conflicting grant exists while a token is still accepted anywhere. A
+  node re-sends an operation refused for a window it has renewed since,
+  keeps a refused close's content as a conflict copy, and releases a
+  grant only once every mutation tagged with it was answered (or, left
+  in doubt or queued for replay, its window is over).
 - **Failover.** After a TTL takeover every old grant has already lapsed,
   so there is nothing to reclaim. After a fast takeover the successor
   waits out a grace period and accepts reclaims. A delegation's first
@@ -1216,7 +1228,9 @@ grant and is fenced: `EIO` on the locked files until they are unlocked,
 and on every write or namespace operation of the lock's owner, on any
 file, until the owner's locks are gone.
 The sequencer outwaits the grant (`granted + ttl + margin`) before
-granting the lock elsewhere, so the fence always comes first. With P2P up
+granting the lock elsewhere, so the fence always comes first, and an
+operation of the owner already on its way is refused by whichever
+sequencer executes it (the fencing token). With P2P up
 but the sequencer unreachable, a non-blocking lock fails with `ENOLCK`
 and a blocking one keeps retrying.
 

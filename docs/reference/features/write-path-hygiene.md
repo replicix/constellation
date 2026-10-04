@@ -134,7 +134,7 @@ constellation repair drop-held myfs <ino>
 Discards an inode's held records:
 
 - each seed (the manifest naming the lost chunk) becomes a conflict copy
-  `<dir>/.constellation-conflict/<name>@<node>-<ts>`, full length, with
+  `<dir>/.constellation-conflict/<name>@<node>-<ts>-<seq>`, full length, with
   the lost chunks as holes (zeros); a spilled manifest's copy keeps only
   the length;
 - every held transaction that depended on it is rolled back and replayed

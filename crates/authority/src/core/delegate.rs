@@ -60,6 +60,7 @@ use crate::ids::{Ms, NodeId, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
+use constellation_meta::locks::LockTag;
 use constellation_meta::{
     LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, Rid, TouchSet,
 };
@@ -149,6 +150,8 @@ pub(crate) struct ParkedDeleg {
     /// the holder path (`answer_not_owner` → the requester re-sends).
     #[allow(dead_code)]
     pub acked_through: u64,
+    /// Plan 30 §M14 phase 2: the op's fencing token.
+    pub tag: LockTag,
 }
 
 /// This node as the delegate of one generation.
@@ -669,6 +672,7 @@ impl Core {
         op: &MutateOp,
         deps: Position,
         acked_through: u64,
+        tag: &LockTag,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -714,6 +718,7 @@ impl Core {
                 op: op.clone(),
                 deps,
                 acked_through,
+                tag: tag.clone(),
             });
             if from == 0 {
                 if let Some(c) = self.clients.get_mut(&rid) {
@@ -725,7 +730,7 @@ impl Core {
             }
             return true;
         }
-        self.delegate_execute_now(now, gen, from, req, rid, op, deps, replica, out);
+        self.delegate_execute_now(now, gen, from, req, rid, op, deps, tag, replica, out);
         true
     }
 
@@ -764,6 +769,7 @@ impl Core {
         rid: Rid,
         op: &MutateOp,
         deps: Position,
+        tag: &LockTag,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -781,7 +787,7 @@ impl Core {
                 }
                 let fresh = self.clients.get(&rid).map(|c| c.deps);
                 if let Some(fresh) = fresh.filter(|d| !replica.deps_lost(d)) {
-                    self.delegate_try_execute(now, 0, None, rid, op, fresh, 0, replica, out);
+                    self.delegate_try_execute(now, 0, None, rid, op, fresh, 0, tag, replica, out);
                 }
                 return;
             }
@@ -843,7 +849,7 @@ impl Core {
                 }
             }
         } else {
-            match replica.delegate_execute(op, Some(rid), gen, deps) {
+            match replica.delegate_execute(op, Some(rid), gen, deps, tag, now.0) {
                 Ok((records, idx)) => {
                     replica.remember_outcome(rid, &records);
                     if rid.node != self.cfg.node_id {
@@ -862,6 +868,12 @@ impl Core {
                     },
                     _ => MutateOutcome::Errno(Code::Again),
                 },
+                // Plan 30 §M14 phase 2: a grant the op was issued under
+                // ended. Nothing journaled or streamed.
+                Err(MetaError::LockLapsed) => {
+                    self.stats.lock_lapsed_refusals += 1;
+                    MutateOutcome::LockLapsed
+                }
                 Err(MetaError::Exists) => {
                     let code = Code::Exists;
                     self.record_delegate_refusal(rid, code, gen, deps, replica);
@@ -1453,7 +1465,7 @@ impl Core {
                     continue;
                 }
                 self.delegate_execute_now(
-                    now, gen, p.from, p.req, p.rid, &p.op, p.deps, replica, out,
+                    now, gen, p.from, p.req, p.rid, &p.op, p.deps, &p.tag, replica, out,
                 );
             }
         }

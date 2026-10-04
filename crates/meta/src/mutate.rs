@@ -231,6 +231,13 @@ pub enum MutateOutcome {
     Held {
         retry_ms: u64,
     },
+    /// Plan 30 §M14 phase 2 (the fencing token): refused because a grant
+    /// the op was issued under is no longer live at the executor
+    /// ([`MetaError::LockLapsed`]). Nothing was executed or journaled. A
+    /// definitive outcome: the requester answers `EIO` and never retries
+    /// or replays the op (a replay refused this way leaves a conflict
+    /// copy, never the op's effect).
+    LockLapsed,
 }
 
 /// What a forwarded op's transaction waits for from the node that
@@ -422,6 +429,29 @@ pub fn execute(
     op: &MutateOp,
     rid: Option<crate::rid::Rid>,
 ) -> Result<Vec<LogRecord>, MetaError> {
+    execute_tagged(meta, op, rid, &crate::locks::LockTag::NONE, 0)
+}
+
+/// [`execute`] for an op issued under cluster-lock grants (plan 30 §M14
+/// phase 2, the fencing token): refused with [`MetaError::LockLapsed`],
+/// executing and journaling nothing, when a grant `tag` names is no
+/// longer live at `now_ms` on this executor's clock
+/// ([`crate::locks::LockTables::check_tag`]). Every execution funnel —
+/// the holder's and a delegate's for a forwarded op, the lease path, a
+/// replay, the inbox drain, the FUSE fast paths — comes through here, so
+/// the check is where the write is recorded. The tag is recorded with the
+/// op's `journal_tx` row for a replay after a deposition.
+pub fn execute_tagged(
+    meta: &Meta,
+    op: &MutateOp,
+    rid: Option<crate::rid::Rid>,
+    tag: &crate::locks::LockTag,
+    now_ms: i64,
+) -> Result<Vec<LogRecord>, MetaError> {
+    if meta.locks().check_tag(tag, now_ms).is_err() {
+        return Err(MetaError::LockLapsed);
+    }
+    let _tag = crate::store::journal::PendingLockTag::set(tag);
     let _pending = crate::store::journal::PendingCompletion::set(rid);
     // Plan 30 §M3b: the op's own journaled transaction records `(rid, op)`
     // in its `journal_tx` row (`store::local`), so a deposition can replay

@@ -137,6 +137,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::ConflictCopyDone { .. } => "ConflictCopyDone",
         Event::RebuildDone { .. } => "RebuildDone",
         Event::LockFlushed { .. } => "LockFlushed",
+        Event::LockHorizonPersisted { .. } => "LockHorizonPersisted",
         Event::Roster { .. } => "Roster",
         Event::Slack { .. } => "Slack",
         Event::Peers { .. } => "Peers",
@@ -183,6 +184,7 @@ fn action_kind(action: &Action) -> &'static str {
         Action::ConflictCopy { .. } => "ConflictCopy",
         Action::RebuildReplica { .. } => "RebuildReplica",
         Action::LockFlush { .. } => "LockFlush",
+        Action::PersistLockHorizon { .. } => "PersistLockHorizon",
         Action::RoundDone { .. } => "RoundDone",
         Action::RefreshRoster => "RefreshRoster",
         Action::EpochClose => "EpochClose",
@@ -245,6 +247,11 @@ pub struct DriverDeps {
     /// blocking pool. Every mounted view's write state
     /// (`crate::locks::LockFlushers`).
     pub lock_flush: crate::locks::LockFlushHook,
+    /// Plan 30 §M14 phase 2: the mounted views' roots
+    /// (`crate::locks::LockFlushers::view_roots`): a refused replay of an
+    /// op issued under a lock keeps its conflict copy under the deepest
+    /// one above its file (`Action::ConflictCopy`'s `locked`).
+    pub view_roots: crate::locks::ViewRootsHook,
     /// Plan 30 M0's fault knob (`CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS`):
     /// delay every forwarded-mutation reply this node sends, after the
     /// op executed (bug A's trigger). 0 in production.
@@ -1691,6 +1698,7 @@ impl Driver {
                 deps,
                 pending,
                 applied,
+                tag,
                 reply,
             } => {
                 let deps = Position::from_postcard(&deps);
@@ -1753,6 +1761,7 @@ impl Driver {
                         acked_through,
                         deps,
                         applied,
+                        tag,
                     },
                 }))
             }
@@ -1859,6 +1868,7 @@ impl Driver {
                 rid,
                 policy,
                 in_doubt,
+                tag,
                 reply,
             } => {
                 self.replies.insert(rid, reply);
@@ -1875,7 +1885,12 @@ impl Driver {
                         acked_seqs: acked,
                     }));
                 }
-                Some(Internal::Event(Event::Submit { rid, op, policy }))
+                Some(Internal::Event(Event::Submit {
+                    rid,
+                    op,
+                    policy,
+                    tag,
+                }))
             }
             SyncRequest::ReadIndex {
                 ino,
@@ -2133,6 +2148,9 @@ impl Driver {
                 ControlReply::Lock(reply),
             ),
             SyncRequest::LockIdle { ino } => control(Control::LockIdle { ino }, ControlReply::None),
+            SyncRequest::LockReleaseWake { ino } => {
+                control(Control::LockReleaseWake { ino }, ControlReply::None)
+            }
             SyncRequest::LockTest { ino, mode, reply } => control(
                 Control::LockTest { ino, mode },
                 ControlReply::LockTest(reply),
@@ -2455,7 +2473,13 @@ impl Driver {
                     rid,
                     op,
                     reason,
+                    locked,
                 } => {
+                    let roots = if locked {
+                        (self.deps.view_roots)()
+                    } else {
+                        Vec::new()
+                    };
                     let tx = self.int_tx.clone();
                     let meta = self.deps.meta.clone();
                     let sync_tx = self.sync_tx.clone();
@@ -2467,7 +2491,7 @@ impl Driver {
                             ts_unix: constellation_fs_core::types::now_ns() / 1_000_000_000,
                         };
                         let ok = match crate::recovery::materialize_remote(
-                            &meta, &sync_tx, &forward, node_id, &op, &refusal,
+                            &meta, &sync_tx, &forward, node_id, rid, &op, &refusal, &roots,
                         )
                         .await
                         {
@@ -2515,8 +2539,31 @@ impl Driver {
                     let tx = self.int_tx.clone();
                     let flush = self.deps.lock_flush.clone();
                     tokio::task::spawn_blocking(move || {
-                        let ok = flush(ino);
+                        let ok = flush(ino, grant);
                         let _ = tx.send(Internal::Event(Event::LockFlushed { ino, grant, ok }));
+                    });
+                }
+                Action::PersistLockHorizon { until } => {
+                    // A durable write (seconds on a loaded disk): on the
+                    // blocking pool, never the driver loop. The core holds
+                    // the grant answers that need it until the event.
+                    let tx = self.int_tx.clone();
+                    let meta = self.deps.meta.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let durable = match meta.note_lock_grant_horizon(until) {
+                            Ok(d) => Some(d),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "persisting the lock-grant horizon failed; refusing the answers waiting for it"
+                                );
+                                None
+                            }
+                        };
+                        let _ = tx.send(Internal::Event(Event::LockHorizonPersisted {
+                            until,
+                            durable,
+                        }));
                     });
                 }
                 Action::RefreshRoster => {
@@ -3199,6 +3246,7 @@ impl Driver {
                 acked_through,
                 deps,
                 applied,
+                tag,
             } => {
                 // A manifest naming chunks still uploading here (a `back`
                 // close) says so; the recipient awaits them, and this
@@ -3218,6 +3266,7 @@ impl Driver {
                 let peers = self.deps.peers.clone();
                 let forward = self.deps.forward.clone();
                 let deps_bytes = deps.to_postcard();
+                let lock_tag = tag.to_wire();
                 let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
                 let requester = self.node_id;
                 let denied = crate::fault::p2p_denied(to);
@@ -3251,6 +3300,7 @@ impl Driver {
                         deps: deps_bytes,
                         pending,
                         applied,
+                        lock_tag,
                     };
                     let started = std::time::Instant::now();
                     if denied {
@@ -4988,6 +5038,7 @@ impl Standalone {
             rid,
             op,
             policy: Policy::Client,
+            tag: constellation_meta::locks::LockTag::NONE,
         });
         self.run_until(|s| s.replies.contains_key(&rid)).await?;
         Ok(self.replies.remove(&rid).expect("answered"))
@@ -5151,6 +5202,12 @@ impl Standalone {
                     grant,
                     ok: true,
                 }),
+                Action::PersistLockHorizon { until } => {
+                    self.queue.push_back(Event::LockHorizonPersisted {
+                        until,
+                        durable: Some(until),
+                    })
+                }
                 Action::CancelTimer { .. }
                 | Action::UploadAwaited { .. }
                 | Action::Announce { .. }

@@ -98,8 +98,11 @@ pub struct LockCounters {
     pub turns_written: u64,
     pub turn_reads: u64,
     pub stale_turn_reads: u64,
-    /// Reads that found an unacknowledged older turn landed late.
+    /// Reads that found an unacknowledged older turn landed late (plan
+    /// 30 §M14 phase 2: none, now that a write carries its fencing token).
     pub late_unacked_turns: u64,
+    /// Turn writes the executor refused for a lapsed grant (`LockLapsed`).
+    pub token_refused: u64,
     /// Fairness: acquisitions made while a client on *another* node had
     /// been waiting for the same lock for more than [`LOCK_FAIR_MS`]
     /// longer (it asked first, by a whole grant window and more, and was
@@ -656,7 +659,7 @@ pub async fn client_lock(
         let now = h.clock.now().0;
         match h.meta.locks().local_set(ino, lock, now) {
             LocalOutcome::Done => break,
-            LocalOutcome::Conflict(_) => {
+            LocalOutcome::Conflict(_) | LocalOutcome::Predecessor => {
                 ghost.count(|c| c.local_conflicts += 1);
                 after_grant = false;
                 if !step.blocking {
@@ -864,13 +867,28 @@ pub async fn client_lock(
                 // application's write + fsync would be).
                 let data = ghost.data_ino(step.file, ino);
                 let rid = h.next_rid();
+                // Plan 30 §M14 phase 2: the write carries the fencing
+                // token of the client's locks, as a FUSE thread's does,
+                // and counts in flight for their release.
+                let tag = match h.meta.locks().owner_tag(&[thread], h.clock.now().0) {
+                    Ok(tag) => tag,
+                    Err(_) => {
+                        // Lapsed since the fence check above: fenced.
+                        ghost.count(|c| c.fenced_ios += 1);
+                        ghost.leave(ino, node, thread, clock.elapsed_ms(), "fenced");
+                        entered = false;
+                        fenced = true;
+                        break;
+                    }
+                };
+                h.meta.locks().tag_begin(&tag, h.clock.now().0);
                 let turn = ghost.take_turn(rid);
                 // The holder is in I/O while the write is awaited, for as
                 // long as its grant is honoured; once it lapses the write
                 // may land after another node's grant (the fence's
                 // flush-start limit: the turn check exempts it as
                 // unacknowledged), so it leaves then.
-                let mut rx = h.submit(
+                let mut rx = h.submit_tagged(
                     rid,
                     constellation_meta::MutateOp::Setattr {
                         ino: data,
@@ -881,6 +899,7 @@ pub async fn client_lock(
                         atime_ns: None,
                         mtime_ns: Some(turn),
                     },
+                    tag.clone(),
                 );
                 let t_write = clock.elapsed_ms();
                 let under = h.meta.locks().honoured(ino, h.clock.now().0).map(|g| g.id);
@@ -914,6 +933,29 @@ pub async fn client_lock(
                         constellation_meta::MutateOutcome::Accepted { .. }
                     )))
                 );
+                // Answered definitively (executed or refused), or left in
+                // doubt: then its grants wait for its token's window.
+                let settled = matches!(
+                    reply,
+                    Some(Ok(constellation_authority::action::ClientReply::Outcome(
+                        constellation_meta::MutateOutcome::Accepted { .. }
+                            | constellation_meta::MutateOutcome::Errno(_)
+                            | constellation_meta::MutateOutcome::Exists { .. }
+                            | constellation_meta::MutateOutcome::Conflict { .. }
+                            | constellation_meta::MutateOutcome::LockLapsed
+                    )))
+                );
+                if matches!(
+                    reply,
+                    Some(Ok(constellation_authority::action::ClientReply::Outcome(
+                        constellation_meta::MutateOutcome::LockLapsed
+                    )))
+                ) {
+                    ghost.count(|c| c.token_refused += 1);
+                }
+                if let Some(h) = same(&cluster, node, inc) {
+                    h.meta.locks().tag_end(&tag, !settled, h.clock.now().0);
+                }
                 // Acknowledged while the grant it was written under is
                 // still honoured (not another thread's later one): the
                 // write is the holder's under its lock.

@@ -145,6 +145,8 @@ pub(crate) enum ParkedWhat {
         acked_through: u64,
         deps: Position,
         held_timer: Option<TimerId>,
+        /// Plan 30 §M14 phase 2: the op's fencing token.
+        tag: constellation_meta::locks::LockTag,
     },
     /// Plan 30 §M11: a local op of this root, executed (and finished)
     /// once the recall is done and its `deps` are here.
@@ -660,6 +662,7 @@ impl Core {
         rid: Rid,
         op: MutateOp,
         acked_through: u64,
+        tag: constellation_meta::locks::LockTag,
         out: &mut Vec<Action>,
     ) {
         self.stats.deleg_exec_parked += 1;
@@ -676,6 +679,7 @@ impl Core {
                 acked_through,
                 deps: deps.unwrap_or(Position::ZERO),
                 held_timer: None,
+                tag,
             },
         );
         self.rd.parked_rids.insert(rid, id);
@@ -1506,6 +1510,7 @@ impl Core {
                     acked_through,
                     deps,
                     held_timer,
+                    tag,
                 } => {
                     self.rd.parked_rids.remove(&rid);
                     if let Some(t) = held_timer {
@@ -1525,6 +1530,7 @@ impl Core {
                         // op is not kept: 0 is below it, so the reply's
                         // `own_chunks` are worked out (`Core::own_chunks_for`).
                         (deps, 0),
+                        tag,
                         replica,
                         out,
                     );

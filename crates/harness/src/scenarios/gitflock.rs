@@ -21,6 +21,16 @@
 //!   released the lock, and two turns that overlap are a broken lock
 //!   (campaign 5's `index.lock: File exists` stall began that way).
 //!
+//! The strict oracle (`GIT_FLOCK_STRICT=1`, [`judge_turns`]): a stale
+//! turn is judged against the last turn whose commit *landed*
+//! (acknowledged, or visible in the final history), skipping turns that
+//! wrote nothing; a turn whose every read under the lock was refused by
+//! the fence observed no state and is exempt from the stale-read rule,
+//! counted as fenced, provided nothing it wrote landed (its writing
+//! steps, the final history, the executors' log of its grants). A turn
+//! with one of its two reads refused is judged on the other, under the
+//! same proviso.
+//!
 //! Then every node drains, a fresh node mounts from the bucket, and on
 //! every node (the fresh one included) the repository tree (every `.git`
 //! file: path, size, nlink, content hash) is identical, `git fsck
@@ -73,7 +83,8 @@
 //! commit, so neither is the sequencer; causal: the sequencer then reads),
 //! `GIT_FLOCK_S3_LATENCY_MS`,
 //! `GIT_FLOCK_ENV=K=V,...` (extra mount environment), `GIT_FLOCK_RUST_LOG`
-//! (the daemons' `RUST_LOG`), `GIT_FLOCK_ROUNDS`,
+//! (the daemons' `RUST_LOG`), `GIT_FLOCK_STRICT=1` (an overlapping turn
+//! fails the faults variant too: plan 30 §M14 phase 2), `GIT_FLOCK_ROUNDS`,
 //! `GIT_FLOCK_MAX_TURN_S` (b2b/rounds/causal: a turn longer than this
 //! fails the run; default 30), `GIT_FLOCK_FSCK_EVERY_S`,
 //! `GIT_FLOCK_READER_RESTARTS`.
@@ -314,6 +325,28 @@ fn git_ok(repo: &Path, home: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Close `f`, reporting `close`'s error: a write-back mount reports a
+/// commit refused at close (a lapsed lock grant's fencing token: `EIO`)
+/// there, and `File`'s drop ignores it — as `std::fs::write` does. Git
+/// checks its closes; the workload's own writes must too, or a turn
+/// whose write was refused reads as one that succeeded.
+fn close_checked(f: std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    if unsafe { libc::close(f.into_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// `std::fs::write`, with the close checked ([`close_checked`]).
+fn write_checked(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(data.as_ref())?;
+    close_checked(f)
+}
+
 fn flock(f: &std::fs::File, op: libc::c_int) -> std::io::Result<()> {
     if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
         Ok(())
@@ -338,10 +371,10 @@ struct Turn {
     /// refused ops of a lapsed lock owner (its `owner_fenced_ops` rose
     /// during the turn): its lock grant lapsed under the turn, so the lock
     /// may have moved, and what git did after that was refused rather
-    /// than written. Not a turn whose git succeeded and whose marker
-    /// write then got `EIO`: git may have written under the lapsed grant
-    /// then. Also cleared when the node counted no fenced op during the
-    /// whole workload.
+    /// than written. Also a turn whose marker write got `EIO` that way
+    /// (phase 2: the fencing token refuses a late one where it lands;
+    /// [`judge_turns`] checks when git's own writes ended). Cleared when
+    /// the node counted no fenced op during the whole workload.
     fenced: bool,
     /// When the turn's last step that wrote to the repository or the
     /// marker (edit, git add, git commit, marker, git gc) completed.
@@ -349,6 +382,68 @@ struct Turn {
     /// When each step began (to tell, for a turn overlapping it, what
     /// ran before and after the other got the lock).
     began: Vec<(&'static str, Instant)>,
+    /// When the step that failed ended (the turn's error), if one did.
+    failed_at: Option<Instant>,
+    /// The writing steps that completed: `(step, began, ended)`.
+    writes: Vec<(&'static str, Instant, Instant)>,
+    /// Its node's daemon's uptime went backwards during the turn
+    /// (`Some(true)`; `None`: a sample is missing). [`judge_turns`] also
+    /// takes the harness's own kill log; an unknown is not a restart.
+    uptime_restarted: Option<bool>,
+    /// When the node fenced this committer's lock owner (its status'
+    /// `fenced_owners`, sampled right after the failure; unix ms, the
+    /// node's clock): a fenced turn's overlap counts as fenced only if
+    /// this came at least `2 × margin` before the other turn got the lock.
+    fenced_since_ms: Option<i64>,
+    /// The grants the turn's ops may have carried as their fencing token
+    /// (`[minter, seq]`): the one whose end fenced it, and those its node
+    /// held when the turn began and ended (the turn file is the only file
+    /// the committers lock). Every executor logs when it let an op tagged
+    /// with one through (`constellation::token_exec`).
+    grants: Vec<(u64, u64)>,
+    /// The commit this turn made (`git rev-parse HEAD` after its commit).
+    head: Option<String>,
+    /// What the turn read under the lock when it did not match the last
+    /// acknowledged commit (see [`StaleRead`]).
+    stale: Option<StaleRead>,
+}
+
+/// A turn's first read under the lock that did not match the last
+/// acknowledged commit: `refs/heads/master` and the marker, what was
+/// expected, and whether the reads came to match within 5 s.
+#[derive(Clone)]
+struct StaleRead {
+    want: String,
+    seen: (String, String),
+    caught_up: bool,
+    /// Every read of it (the first and the ones waiting to catch up),
+    /// the ref and the marker alike, was refused by the lock fence
+    /// (`EIO`): the turn observed no state at all.
+    refused: bool,
+}
+
+/// Whether a read under the lock was refused by the lock fence (`EIO`;
+/// [`master_ref`] and the marker read render an error as `<...>`).
+fn read_refused(seen: &(String, String)) -> bool {
+    read_eio(&seen.0) && read_eio(&seen.1)
+}
+
+/// Whether one read (the ref or the marker) was refused (`EIO`).
+fn read_eio(s: &str) -> bool {
+    s.starts_with('<') && s.contains("os error 5")
+}
+
+/// One `node.status` sample of a committer's node (see [`fence_sample`]).
+#[derive(Clone)]
+struct Sample {
+    owner_fenced_ops: u64,
+    /// The earliest fence of a lock owner of this process (unix ms).
+    since: Option<i64>,
+    /// That owner's fencing grant, `[minter, seq]`.
+    grant: Option<(u64, u64)>,
+    /// The grants the node holds.
+    held: Vec<(u64, u64)>,
+    uptime_s: u64,
 }
 
 /// Whether a turn's error is the lock fence's `EIO`.
@@ -357,22 +452,94 @@ fn is_fence_error(e: &anyhow::Error) -> bool {
     s.contains("os error 5") || s.contains("Input/output error")
 }
 
-/// The node's `owner_fenced_ops` (`None`: its daemon does not answer).
-fn owner_fenced_ops(state: &Path) -> Option<u64> {
-    crate::client::control_call_at(
+/// The node's `owner_fenced_ops`, when it fenced a lock owner of this
+/// process (the committers' `flock`s are this process's; the earliest
+/// such fence, unix ms), and its daemon's uptime (s) — `None`: its daemon
+/// does not answer.
+fn fence_sample(state: &Path) -> Option<Sample> {
+    let s = crate::client::control_call_at(
         state,
         "node.status",
         serde_json::json!({}),
         Duration::from_secs(5),
     )
-    .ok()?["locks"]["owner_fenced_ops"]
-        .as_u64()
+    .ok()?;
+    let l = &s["locks"];
+    let me = u64::from(std::process::id());
+    let first = l["fenced_owners"].as_array().and_then(|v| {
+        v.iter()
+            .filter(|f| f["pid"].as_u64() == Some(me))
+            .filter_map(|f| Some((f["since_ms"].as_i64()?, f)))
+            .min_by_key(|(since, _)| *since)
+            .map(|(since, f)| {
+                let grant = f["grant"]
+                    .as_array()
+                    .and_then(|g| Some((g.first()?.as_u64()?, g.get(1)?.as_u64()?)));
+                (since, grant)
+            })
+    });
+    Some(Sample {
+        owner_fenced_ops: l["owner_fenced_ops"].as_u64()?,
+        since: first.map(|f| f.0),
+        grant: first.and_then(|f| f.1),
+        held: l["held_grants"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .filter_map(|g| {
+                        let g = g.as_array()?;
+                        Some((g.first()?.as_u64()?, g.get(1)?.as_u64()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        uptime_s: s["uptime_s"].as_u64().unwrap_or(0),
+    })
 }
 
-/// The steps whose `EIO` shows the owner fence stopped the turn's git
-/// before it wrote under a lapsed grant: git's own, and the edit before
-/// git ran at all.
-const FENCEABLE_STEPS: [&str; 5] = ["edit", "add", "commit", "rev-parse", "gc"];
+/// The lease's expiry margin the nodes run with, as their `node.status`
+/// reports it (`locks.margin_ms`): a fence must have come `2 × margin`
+/// before another node got the lock. Without an answer, derived as the
+/// daemon does (`min(1 s, lease TTL / 4)`; the lease TTL from
+/// `GIT_FLOCK_ENV`, else the 60 s default).
+fn margin_ms(clients: &[Client]) -> i64 {
+    clients
+        .iter()
+        .find_map(|c| {
+            let s = c.control_status().ok()?;
+            s["locks"]["margin_ms"].as_i64().filter(|m| *m > 0)
+        })
+        .unwrap_or_else(lease_margin_ms)
+}
+
+fn lease_margin_ms() -> i64 {
+    let ttl = std::env::var("GIT_FLOCK_ENV")
+        .unwrap_or_default()
+        .split([',', ' '])
+        .find_map(|kv| kv.trim().strip_prefix("CONSTELLATION_LEASE_TTL_MS="))
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(60_000);
+    (ttl / 4).min(1_000)
+}
+
+/// `t` on the wall clock, from a pair of readings taken together.
+fn unix_ms_at(t: Instant, base: Instant, base_unix_ms: i64) -> i64 {
+    if t >= base {
+        base_unix_ms + (t - base).as_millis() as i64
+    } else {
+        base_unix_ms - (base - t).as_millis() as i64
+    }
+}
+
+/// The steps whose `EIO` shows the fence stopped the turn before it
+/// wrote under a lapsed grant: git's own, the edit before git ran at all,
+/// and (plan 30 §M14 phase 2) the marker write. Phase 1 left the marker
+/// out: its `open(O_TRUNC)`, forwarded before the lapse, could land after
+/// the next turn got the lock (the review saw an empty marker). The
+/// fencing token refuses it where it lands now, and [`judge_turns`]
+/// still requires every write that completed after the other turn got
+/// the lock to have begun before the fence.
+const FENCEABLE_STEPS: [&str; 6] = ["edit", "add", "commit", "rev-parse", "marker", "gc"];
 
 /// The steps that write.
 const WRITING_STEPS: [&str; 5] = ["edit", "add", "commit", "marker", "gc"];
@@ -424,13 +591,14 @@ fn campaign_edit(repo: &Path, name: &str, i: u64, rng: &mut StdRng) -> Result<()
         let data: Vec<u8> = (0..len).map(|_| rng.random_range(b'a'..=b'z')).collect();
         f.write_all(b"\n")?;
         f.write_all(&data)?;
+        close_checked(f)?;
     }
     let dir = repo.join(format!("node{name}"));
     std::fs::create_dir_all(&dir)?;
     for k in 0..n - n_modify {
         let len = rng.random_range(20..4000usize);
         let data: Vec<u8> = (0..len).map(|_| rng.random_range(b'a'..=b'z')).collect();
-        std::fs::write(dir.join(format!("f-{i}-{k}.dat")), data)?;
+        write_checked(&dir.join(format!("f-{i}-{k}.dat")), data)?;
     }
     Ok(())
 }
@@ -444,12 +612,12 @@ fn soak_edit(repo: &Path, name: &str, i: u64) -> Result<()> {
         .open(repo.join(format!("note-{name}.txt")))
         .context("note")?;
     writeln!(note, "{name} {i}")?;
-    drop(note);
+    close_checked(note)?;
     let dir = repo.join(format!("d-{name}"));
     std::fs::create_dir_all(&dir)?;
     for k in 0..3 {
-        std::fs::write(
-            dir.join(format!("f-{i}-{k}")),
+        write_checked(
+            &dir.join(format!("f-{i}-{k}")),
             format!("{name} commit {i} file {k}\n"),
         )?;
     }
@@ -491,8 +659,10 @@ fn committer(
                 .open(mnt.join(&paths.turn))
                 .context("opening the turn file")?;
             // The node's fenced-op count before the turn (no lock is held
-            // here, so nothing of ours can be fenced until the `flock`).
-            let fenced_before = owner_fenced_ops(&state);
+            // here, so nothing of ours can be fenced until the `flock`),
+            // and its daemon's uptime.
+            let before = fence_sample(&state);
+            let fenced_before = before.as_ref().map(|b| b.owner_fenced_ops);
             let asked = Instant::now();
             flock(&lf, libc::LOCK_EX).context("flock")?;
             let got = Instant::now();
@@ -501,15 +671,19 @@ fn committer(
             // The step in progress, and when the last writing one ended.
             let current = std::cell::Cell::new("check");
             let wrote_until = std::cell::Cell::new(None);
+            let writes = std::cell::RefCell::new(Vec::new());
             let step = |name: &'static str| {
                 let now = Instant::now();
                 steps.borrow_mut().push((name, now - mark.get()));
-                mark.set(now);
                 if WRITING_STEPS.contains(&name) {
                     wrote_until.set(Some(now));
+                    writes.borrow_mut().push((name, mark.get(), now));
                 }
+                mark.set(now);
             };
             let began = std::cell::RefCell::new(vec![("check", got)]);
+            let stale_read = std::cell::RefCell::new(None);
+            let made = std::cell::RefCell::new(None);
             let begin = |name: &'static str| {
                 current.set(name);
                 began.borrow_mut().push((name, Instant::now()));
@@ -530,22 +704,31 @@ fn committer(
                     if &seen.0 != want || &seen.1 != want {
                         let t = Instant::now();
                         let mut now = seen.clone();
+                        let mut refused = read_refused(&seen);
                         while (&now.0 != want || &now.1 != want)
                             && t.elapsed() < Duration::from_secs(5)
                         {
                             std::thread::sleep(Duration::from_millis(20));
                             now = read();
+                            refused &= read_refused(&now);
                         }
+                        let caught_up = &now.0 == want && &now.1 == want;
                         log.lock().unwrap().stale.push(format!(
                             "{name}#{i}: under the turn lock refs/heads/master read {}, the marker {}; the last acknowledged commit is {want}; {}",
                             seen.0,
                             seen.1,
-                            if &now.0 == want && &now.1 == want {
+                            if caught_up {
                                 format!("caught up after {:?}", t.elapsed())
                             } else {
                                 format!("still {now:?} after {:?}", t.elapsed())
                             }
                         ));
+                        *stale_read.borrow_mut() = Some(StaleRead {
+                            want: want.clone(),
+                            seen: seen.clone(),
+                            caught_up,
+                            refused,
+                        });
                     }
                 }
                 step("check");
@@ -583,8 +766,9 @@ fn committer(
                 step("commit");
                 begin("rev-parse");
                 let head = git_ok(&repo, &home, &["rev-parse", "HEAD"])?;
+                *made.borrow_mut() = Some(head.clone());
                 begin("marker");
-                std::fs::write(&marker, format!("{head}\n")).context("writing the marker")?;
+                write_checked(&marker, format!("{head}\n")).context("writing the marker")?;
                 step("marker");
                 *shared.last.lock().unwrap() = Some(head.clone());
                 log.lock().unwrap().acked.push(head);
@@ -596,6 +780,30 @@ fn committer(
                 }
                 Ok(())
             })();
+            let failed_at = inner.is_err().then(Instant::now);
+            // Sampled before the unlock below, which lifts the fence.
+            let after = fence_sample(&state);
+            // The daemon was killed during the turn (it does not answer,
+            // or its uptime started over): the `flock` died with the old
+            // mount, and whatever the turn did after the remount it did
+            // without the lock — the harness's committer does not notice
+            // (an application's descriptor would report `ENOTCONN`).
+            // Decided positively: the uptime went backwards; with a sample
+            // missing (a status call that timed out under load, a stopped
+            // daemon) it is unknown here, and only the harness's own kill
+            // log can say ([`judge_turns`]).
+            let turn_s = asked.elapsed().as_secs();
+            let uptime_restarted = match (&before, &after) {
+                (Some(b), Some(a)) => Some(a.uptime_s + 2 < b.uptime_s + turn_s),
+                _ => None,
+            };
+            let mut grants: Vec<(u64, u64)> =
+                after.as_ref().and_then(|a| a.grant).into_iter().collect();
+            for s in before.iter().chain(after.iter()) {
+                grants.extend(s.held.iter().copied());
+            }
+            grants.sort_unstable();
+            grants.dedup();
             shared.turns.lock().unwrap().push(Turn {
                 who: name.clone(),
                 i,
@@ -609,13 +817,20 @@ fn committer(
                         // the turn (git often drops the errno: "couldn't
                         // set 'refs/heads/master'"); with no answer (a
                         // dead daemon), the error itself must say `EIO`.
-                        && match (fenced_before, owner_fenced_ops(&state)) {
+                        && match (fenced_before, after.as_ref().map(|a| a.owner_fenced_ops)) {
                             (Some(was), Some(is)) => is > was || (is < was && is > 0),
                             _ => is_fence_error(e),
                         }
                 }),
                 wrote_until: wrote_until.get(),
                 began: began.take(),
+                failed_at,
+                writes: writes.take(),
+                fenced_since_ms: after.as_ref().and_then(|a| a.since),
+                grants,
+                uptime_restarted,
+                head: made.take(),
+                stale: stale_read.take(),
             });
             let _ = flock(&lf, libc::LOCK_UN);
             inner
@@ -1199,25 +1414,315 @@ fn reader(
     }
 }
 
-/// The turns, judged: `(overlaps, fenced overlaps, deciles, longest)` —
-/// two turns that held the lock at once (a broken lock), and the turn
-/// durations by decile. A turn that overlaps a *fenced* earlier one (its
-/// committer's grant lapsed and its node refused its git with `EIO` from
-/// then on) is not a broken lock, as long as the earlier turn wrote
-/// nothing after the later one got the lock: the fence is what keeps the
-/// two from both writing.
-fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, Vec<String>, String, Duration) {
+/// Per grant (`[minter, seq]`), the latest time any executor let an op
+/// tagged with it through (unix ms), from every incarnation's log of
+/// every node (`tagged op executed minter=.. seq=.. at_ms=..`, target
+/// `constellation::token_exec`).
+fn token_execs(clients: &[Client]) -> std::collections::HashMap<(u64, u64), i64> {
+    let mut out = std::collections::HashMap::new();
+    fn field<T: std::str::FromStr>(line: &str, key: &str) -> Option<T> {
+        let at = line.find(key)? + key.len();
+        let rest = &line[at..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len());
+        rest[..end].parse().ok()
+    }
+    for c in clients {
+        for path in c.log_files() {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in text.lines().filter(|l| l.contains("tagged op executed")) {
+                let (Some(minter), Some(seq), Some(at)) = (
+                    field::<u64>(line, "minter="),
+                    field::<u64>(line, "seq="),
+                    field::<i64>(line, "at_ms="),
+                ) else {
+                    continue;
+                };
+                let e = out.entry((minter, seq)).or_insert(at);
+                *e = (*e).max(at);
+            }
+        }
+    }
+    out
+}
+
+/// The turns, judged ([`Judged`]): two turns that held the lock at once
+/// are a broken lock, and the turn durations are reported by decile.
+///
+/// A turn that overlaps a *fenced* earlier one (the earlier committer's
+/// grant lapsed and its node refused its git with `EIO` from then on) is
+/// not a broken lock when the fence is proved to have come first — the
+/// node fenced the earlier turn's owner at least `2 × margin` before the
+/// later turn got the lock (`Turn::fenced_since_ms`, on the same host's
+/// clock) — and the earlier turn wrote nothing after the later one got
+/// the lock.
+///
+/// A writing step of the fenced turn that *completed* after the later
+/// turn got the lock is an overlap too (the strict rule, which phase 1's
+/// observed gap — a marker `open(O_TRUNC)` forwarded before the lapse,
+/// landing after — has the shape of), unless there is independent
+/// evidence that everything it sent executed before `got`: the step
+/// began before the fence (it was admitted under the grant), and no
+/// executor let an op tagged with the fenced grant through at or after
+/// `got` — each logs every one it lets through
+/// (`constellation::token_exec`, `execs`: per grant, the latest time on
+/// any node's log). Then only its acknowledgement came late (observed: a
+/// create executed by the holder under the grant, its acknowledgement
+/// held for its backup, then answered by the successor's dedup after the
+/// other turn got the lock); such overlaps are listed apart ("in flight
+/// with evidence").
+///
+/// A turn whose node's daemon was killed during it is listed apart too:
+/// its `flock` died with the old mount, so the next turn's grant was
+/// legitimate. Decided positively — the daemon's uptime went backwards,
+/// or the harness's own kill log (`kills`) has a kill of that node inside
+/// the turn; an unknown (a status call that timed out) stays an overlap.
+///
+/// A turn that began stale (its first read under the lock did not match
+/// the last acknowledged commit) is judged against the previous turn
+/// whose commit *landed* (`stale_unexplained`): acknowledged (`head`), or
+/// visible in the final state (`landed`: the final history's commits by
+/// subject, `<who>-<i>`). A turn that wrote nothing that landed is
+/// skipped, not taken as the previous turn. It may read what that turn
+/// left — its commit without its marker, or both — or come to match
+/// within its wait (replica lag, a replay by rid); anything else (an
+/// empty or foreign marker, a commit that never landed) is a write
+/// landing inside its turn.
+///
+/// A turn whose every read under the lock was refused by the fence
+/// (`StaleRead::refused`: `EIO` on the ref and the marker, each time)
+/// observed no state, so no stale-read rule applies to it — but it must
+/// have written nothing that landed: no completed writing step, no
+/// commit (acknowledged or in the final history), and no executor let
+/// an op tagged with one of its grants through at or after it got the
+/// lock (`execs`; no grant on record is no evidence). It counts as a
+/// fenced turn (`refused`); otherwise it is unexplained. A turn with only
+/// one of its two first reads refused (the grant lapsed between them) is
+/// judged on the other read alone — it must be what the last landed turn
+/// left — and, as above, nothing it wrote may have landed.
+struct Judged {
+    overlaps: Vec<String>,
+    fenced: Vec<String>,
+    in_flight: Vec<String>,
+    lost_with_daemon: Vec<String>,
+    stale_unexplained: Vec<String>,
+    /// Turns that observed nothing (every read refused) and wrote
+    /// nothing that landed.
+    refused: Vec<String>,
+    deciles: String,
+    max: Duration,
+}
+
+fn judge_turns(
+    turns: &[Turn],
+    base: Instant,
+    base_unix_ms: i64,
+    margin: i64,
+    execs: &std::collections::HashMap<(u64, u64), i64>,
+    kills: &[(String, Instant)],
+    landed: &std::collections::HashMap<String, String>,
+) -> Judged {
     let mut t: Vec<Turn> = turns.to_vec();
     t.sort_by_key(|x| x.got);
     let mut overlaps = Vec::new();
     let mut fenced = Vec::new();
+    let mut in_flight_list = Vec::new();
+    let mut lost_with_daemon = Vec::new();
+    let mut stale_unexplained = Vec::new();
+    let mut refused_turns = Vec::new();
+    // The commit a turn made, if it landed: acknowledged, or visible in
+    // the final history.
+    let landed_head = |q: &Turn| {
+        q.head
+            .clone()
+            .or_else(|| landed.get(&format!("{}-{}", q.who, q.i)).cloned())
+    };
+    // The executors' own record: every op tagged with one of the turn's
+    // grants went through before `at` (unix ms).
+    // No record at all is no evidence: the turn's writes executed
+    // somewhere, and the executor logs every one it lets through.
+    let executed_before = |p: &Turn, at: i64| {
+        let last: Vec<i64> = p
+            .grants
+            .iter()
+            .filter_map(|g| execs.get(g).copied())
+            .collect();
+        !last.is_empty() && last.iter().all(|l| *l < at)
+    };
+    let restarted = |p: &Turn| {
+        p.uptime_restarted == Some(true)
+            || kills
+                .iter()
+                .any(|(who, at)| who == &p.who && *at >= p.asked && *at <= p.released)
+    };
+    // What a turn wrote that landed: completed writing steps, its
+    // commit, ops of its grants executed at or after it got the lock.
+    let wrote_landed = |x: &Turn| -> Vec<String> {
+        let got_ms = unix_ms_at(x.got, base, base_unix_ms);
+        x.writes
+            .iter()
+            .map(|w| w.0.to_string())
+            .chain(landed_head(x).map(|h| format!("commit {h}")))
+            .chain(
+                x.grants
+                    .iter()
+                    .filter_map(|g| execs.get(g).filter(|at| **at >= got_ms).map(|at| (g, at)))
+                    .map(|(g, at)| {
+                        format!(
+                            "an op of grant {}/{} executed at {:+.3}s",
+                            g.0,
+                            g.1,
+                            (at - got_ms) as f64 / 1000.0
+                        )
+                    }),
+            )
+            .chain(
+                x.grants
+                    .is_empty()
+                    .then(|| "no grant on record".to_string()),
+            )
+            .collect()
+    };
     let mut open: Option<&Turn> = None;
-    for x in &t {
+    for (k, x) in t.iter().enumerate() {
+        if let Some(stale) = x.stale.as_ref().filter(|s| s.refused) {
+            // Observed nothing: exempt, if nothing it wrote landed.
+            let wrote = wrote_landed(x);
+            let note = format!(
+                "{}#{} read nothing under the lock (every read refused: {} / {})",
+                x.who, x.i, stale.seen.0, stale.seen.1
+            );
+            if wrote.is_empty() {
+                refused_turns.push(note);
+            } else {
+                stale_unexplained.push(format!(
+                    "{note}, yet what it wrote landed: {}",
+                    wrote.join(", ")
+                ));
+            }
+        } else if let Some(stale) = &x.stale {
+            // The last turn before it whose commit landed (a turn that
+            // wrote nothing that landed is skipped).
+            let p = t[..k].iter().rev().find(|p| landed_head(p).is_some());
+            let head = p.and_then(&landed_head);
+            // The immediately preceding turn of the other committer: its
+            // daemon killed under it (its writes return by replay).
+            let other = t[..k].iter().rev().find(|p| p.who != x.who);
+            // An empty marker: the `open(O_TRUNC)` of the last turn whose
+            // marker write began and did not complete (no marker written
+            // since), its content refused or lost. That turn's write, if it
+            // executed before this turn got the lock (the executors' log).
+            let cut = t[..k]
+                .iter()
+                .rposition(|q| q.began.iter().any(|(s, _)| *s == "marker"))
+                .map(|j| &t[j])
+                .filter(|q| !q.writes.iter().any(|w| w.0 == "marker"));
+            let got_ms = unix_ms_at(x.got, base, base_unix_ms);
+            let truncated = stale.seen.1.is_empty()
+                && cut.is_some_and(|q| {
+                    (stale.seen.0 == stale.want || Some(&stale.seen.0) == landed_head(q).as_ref())
+                        && (restarted(q) || executed_before(q, got_ms))
+                });
+            // One of its two reads refused by the fence (the grant lapsed
+            // between them; faults seed 34: a#144's ref read `EIO`, its
+            // marker the last landed commit): that read observed nothing,
+            // the other must be what the last landed turn left, and — as
+            // for a turn whose every read was refused — nothing it wrote
+            // may have landed.
+            let partly_refused = read_eio(&stale.seen.0) != read_eio(&stale.seen.1)
+                && head.as_ref().is_some_and(|h| {
+                    (read_eio(&stale.seen.0) || &stale.seen.0 == h)
+                        && (read_eio(&stale.seen.1)
+                            || stale.seen.1 == stale.want
+                            || &stale.seen.1 == h)
+                })
+                && wrote_landed(x).is_empty();
+            // Its commit without its marker, or both.
+            let explained = stale.caught_up
+                || truncated
+                || partly_refused
+                || head.as_ref().is_some_and(|h| {
+                    &stale.seen.0 == h && (stale.seen.1 == stale.want || &stale.seen.1 == h)
+                })
+                || p.is_some_and(&restarted)
+                || other.is_some_and(&restarted);
+            if !explained {
+                stale_unexplained.push(format!(
+                    "{}#{} read refs/heads/master {} and the marker {} under the lock; \
+                     the last acknowledged commit is {}, the last turn whose commit landed ({}) made {}",
+                    x.who,
+                    x.i,
+                    stale.seen.0,
+                    stale.seen.1,
+                    stale.want,
+                    p.map_or("none".into(), |p| format!("{}#{}", p.who, p.i)),
+                    head.as_deref().unwrap_or("none"),
+                ));
+            }
+        }
         if let Some(prev) = open {
             if x.got < prev.released && x.who != prev.who {
-                let fenced_in_time = prev.fenced && prev.wrote_until.is_none_or(|t| t <= x.got);
+                let got_ms = unix_ms_at(x.got, base, base_unix_ms);
+                let fence_first = prev
+                    .fenced_since_ms
+                    .is_some_and(|since| since + 2 * margin <= got_ms);
+                let late: Vec<&(&'static str, Instant, Instant)> =
+                    prev.writes.iter().filter(|w| w.2 > x.got).collect();
+                let admitted_under_grant = |w: &&(&'static str, Instant, Instant)| {
+                    prev.fenced_since_ms
+                        .is_some_and(|since| unix_ms_at(w.1, base, base_unix_ms) < since)
+                };
+                let last_exec = prev
+                    .grants
+                    .iter()
+                    .filter_map(|g| execs.get(g).copied())
+                    .max();
+                let executed_in_time = executed_before(prev, got_ms);
+                let fenced_in_time = prev.fenced && fence_first && late.is_empty();
+                let in_flight = prev.fenced
+                    && fence_first
+                    && !late.is_empty()
+                    && late.iter().all(admitted_under_grant)
+                    && executed_in_time;
+                let late_note = if late.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; written after it got the lock: {}; its grants {} last let an op through {}",
+                        late.iter()
+                            .map(|w| format!(
+                                "{} (began {:+.3}s, ended {:+.3}s)",
+                                w.0,
+                                w.1.saturating_duration_since(x.got).as_secs_f64()
+                                    - x.got.saturating_duration_since(w.1).as_secs_f64(),
+                                w.2.saturating_duration_since(x.got).as_secs_f64()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        if prev.grants.is_empty() {
+                            "(unknown)".to_string()
+                        } else {
+                            prev.grants
+                                .iter()
+                                .map(|g| format!("{}/{}", g.0, g.1))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
+                        last_exec.map_or("never (no evidence)".into(), |at| format!(
+                            "at {:+.3}s",
+                            (at - got_ms) as f64 / 1000.0
+                        )),
+                    )
+                };
                 let into = if fenced_in_time {
                     &mut fenced
+                } else if in_flight {
+                    &mut in_flight_list
+                } else if restarted(prev) {
+                    &mut lost_with_daemon
                 } else {
                     &mut overlaps
                 };
@@ -1237,7 +1742,7 @@ fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, Vec<String>, Stri
                     .collect();
                 into.push(format!(
                     "{}#{} held the lock {:?}..{:?} while {}#{} got it at {:?} \
-                     ({}#{}: {}, last write done {}, released {})",
+                     ({}#{}: {}, last write done {}, failing step ended {}, fenced {}, released {}{})",
                     prev.who,
                     prev.i,
                     prev.got - base,
@@ -1249,7 +1754,13 @@ fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, Vec<String>, Stri
                     prev.i,
                     timeline.join(" "),
                     prev.wrote_until.map_or("never".into(), rel),
+                    prev.failed_at.map_or("-".into(), rel),
+                    prev.fenced_since_ms.map_or("never seen".into(), |since| format!(
+                        "{:+.3}s",
+                        (since - got_ms) as f64 / 1000.0
+                    )),
                     rel(prev.released),
+                    late_note,
                 ));
             }
         }
@@ -1312,7 +1823,61 @@ fn judge_turns(turns: &[Turn], base: Instant) -> (Vec<String>, Vec<String>, Stri
         durations.sort();
         format!("{durations:?}")
     };
-    (overlaps, fenced, deciles, max)
+    Judged {
+        overlaps,
+        fenced,
+        in_flight: in_flight_list,
+        lost_with_daemon,
+        stale_unexplained,
+        refused: refused_turns,
+        deciles,
+        max,
+    }
+}
+
+/// The final history's commits by subject (`<committer>-<i>` → hash):
+/// what landed, for [`judge_turns`]. Read once the committers' mounts
+/// agree on `HEAD` (two minutes at most; then the first answer, and
+/// `verify` reports the divergence).
+fn final_history(
+    label: &str,
+    clients: &[Client],
+    committers: &[usize],
+    repo: &str,
+    home: &Path,
+) -> std::collections::HashMap<String, String> {
+    let read = |c: &Client| -> Result<Vec<(String, String)>> {
+        let out = git_within(
+            &c.mnt.join(repo),
+            home,
+            &["log", "--format=%H %s", "master"],
+            git_timeout(),
+        )?;
+        anyhow::ensure!(out.status.success(), "git log failed");
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .map(|(h, s)| (s.to_string(), h.to_string()))
+            .collect())
+    };
+    let mut last = None;
+    let agreed = eventually(
+        "the committers agree on the final history",
+        Duration::from_secs(120),
+        || {
+            let views: Vec<Vec<(String, String)>> = committers
+                .iter()
+                .map(|&k| read(&clients[k]))
+                .collect::<Result<_>>()?;
+            last = views.first().cloned();
+            anyhow::ensure!(views.windows(2).all(|w| w[0] == w[1]), "histories differ");
+            Ok(())
+        },
+    );
+    if let Err(e) = agreed {
+        eprintln!("    {label}: the final history: {e:#}; judging with the first committer's");
+    }
+    last.unwrap_or_default().into_iter().collect()
 }
 
 /// `refs/heads/master` as git resolves it, read straight from the files
@@ -1384,6 +1949,17 @@ fn crash(c: &mut Client) -> Result<()> {
     c.kill9()
 }
 
+impl Fleet<'_> {
+    /// `kill -9` of `c`, on the harness's kill log ([`judge_turns`]).
+    fn crash(&self, c: &mut Client) -> Result<()> {
+        self.kills
+            .lock()
+            .unwrap()
+            .push((c.name.clone(), Instant::now()));
+        crash(c)
+    }
+}
+
 struct Fleet<'a> {
     root: &'a Path,
     ids: Vec<u64>,
@@ -1394,6 +1970,10 @@ struct Fleet<'a> {
     /// (`fuse_stalls`): a request unanswered past the daemon's stall
     /// threshold is a bug whatever the faults (EC2 campaign 7 B-2).
     stalls: Mutex<Vec<String>>,
+    /// A workload saw overlapping turns (its logs are kept).
+    overlapped: Mutex<bool>,
+    /// Every `kill -9` the harness made: the node, and when.
+    kills: Mutex<Vec<(String, Instant)>>,
 }
 
 impl Fleet<'_> {
@@ -1442,7 +2022,7 @@ impl Fleet<'_> {
             0..=34 => {
                 mark_dead(&clients[target]);
                 std::thread::sleep(Duration::from_millis(rng.random_range(0..300)));
-                crash(&mut clients[target])?;
+                self.crash(&mut clients[target])?;
                 std::thread::sleep(Duration::from_millis(rng.random_range(500..3000)));
                 mount_live(&mut clients[target])?;
                 format!("#{n} kill -9 {name}")
@@ -1452,7 +2032,7 @@ impl Fleet<'_> {
                     mark_dead(c);
                 }
                 for c in clients.iter_mut() {
-                    crash(c)?;
+                    self.crash(c)?;
                 }
                 std::thread::sleep(Duration::from_millis(rng.random_range(500..2000)));
                 for c in clients.iter_mut() {
@@ -1611,12 +2191,15 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
         }
     }
     // `GIT_FLOCK_RUST_LOG`: the daemons' `RUST_LOG` (commas included).
-    if let Ok(filter) = std::env::var("GIT_FLOCK_RUST_LOG") {
-        clients = clients
-            .into_iter()
-            .map(|c| c.with_env("RUST_LOG", &filter))
-            .collect();
-    }
+    // Every executor logs each tagged op it lets through
+    // (`constellation::token_exec`): the evidence [`judge_turns`] needs
+    // for a fenced turn's late writes.
+    let filter = std::env::var("GIT_FLOCK_RUST_LOG").unwrap_or_else(|_| "info".into());
+    let filter = format!("{filter},constellation::token_exec=debug");
+    clients = clients
+        .into_iter()
+        .map(|c| c.with_env("RUST_LOG", &filter))
+        .collect();
     clients[0].fs_create()?;
     for c in clients.iter_mut() {
         mount_live(c)?;
@@ -1634,6 +2217,8 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
         ids,
         s3,
         stalls: Mutex::new(Vec::new()),
+        overlapped: Mutex::new(false),
+        kills: Mutex::new(Vec::new()),
     };
     let result = (|| -> Result<()> {
         let mut done: Vec<RoundResult> = Vec::new();
@@ -1700,7 +2285,7 @@ fn run(scenario: &str, seed: u64, variant: Variant) -> Result<()> {
     for p in &fleet.s3 {
         p.heal();
     }
-    if result.is_err() {
+    if result.is_err() || *fleet.overlapped.lock().unwrap() {
         let dir = std::env::temp_dir().join(format!("harness-{scenario}-logs-{}", ts()));
         if std::fs::create_dir_all(&dir).is_ok() {
             for c in &clients {
@@ -1817,6 +2402,9 @@ fn workload(
     };
     let mut tally = FenceTally::new(clients, &committers);
     let started = Instant::now();
+    let started_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
     let workers: Vec<_> = (0..2)
         .map(|k| {
             let c = &clients[committers[k]];
@@ -1902,7 +2490,7 @@ fn workload(
                 let _quiet = reader_quiet[k].lock().unwrap();
                 mark_dead(&clients[who]);
                 std::thread::sleep(Duration::from_millis(rng.random_range(0..300)));
-                crash(&mut clients[who])?;
+                fleet.crash(&mut clients[who])?;
                 std::thread::sleep(Duration::from_millis(rng.random_range(500..3000)));
                 mount_live(&mut clients[who])
             })();
@@ -1991,21 +2579,102 @@ fn workload(
         "    {label}: during the workload: {}",
         fence_counts.join("; ")
     );
-    let (overlaps, fenced_overlaps, deciles, max) = judge_turns(&turns, started);
+    let margin = margin_ms(clients);
+    let execs = token_execs(clients);
+    let kills = fleet.kills.lock().unwrap().clone();
+    // The commits that landed, by subject: the final history (only
+    // needed to judge stale turns).
+    let landed = if turns.iter().any(|t| t.stale.is_some()) {
+        final_history(label, clients, &committers, &paths.repo, home)
+    } else {
+        std::collections::HashMap::new()
+    };
+    let Judged {
+        overlaps,
+        fenced: fenced_overlaps,
+        in_flight,
+        lost_with_daemon,
+        stale_unexplained,
+        refused,
+        deciles,
+        max,
+    } = judge_turns(
+        &turns,
+        started,
+        started_unix_ms,
+        margin,
+        &execs,
+        &kills,
+        &landed,
+    );
+    if !overlaps.is_empty()
+        || !fenced_overlaps.is_empty()
+        || !in_flight.is_empty()
+        || !lost_with_daemon.is_empty()
+        || !stale_unexplained.is_empty()
+    {
+        // The daemon logs are kept whenever turns overlapped, however
+        // the overlap was classed, failed or not (faults make overlaps
+        // non-fatal).
+        *fleet.overlapped.lock().unwrap() = true;
+    }
     eprintln!(
         "    {label}: {} turns, median duration per decile (s): {deciles}; longest {max:?}; \
          {} overlapping, {} overlapping a fenced turn, {} fenced",
         turns.len(),
         overlaps.len(),
         fenced_overlaps.len(),
-        turns.iter().filter(|t| t.fenced).count()
+        // A turn that read nothing (every read refused) counts as fenced.
+        turns
+            .iter()
+            .filter(|t| t.fenced || t.stale.as_ref().is_some_and(|s| s.refused))
+            .count()
     );
+    for o in refused.iter().take(10) {
+        eprintln!(
+            "    {label}: a fenced turn that observed no state and wrote nothing that landed: {o}"
+        );
+    }
     for o in overlaps.iter().take(10) {
         eprintln!("    {label}: overlapping turns: {o}");
+    }
+    for o in lost_with_daemon.iter().take(5) {
+        eprintln!("    {label}: a turn overlapping one whose daemon was killed under it: {o}");
+    }
+    if !lost_with_daemon.is_empty() {
+        eprintln!(
+            "    {label}: {} turns overlapped a turn whose daemon was killed under it (its lock died with the mount; not a broken lock)",
+            lost_with_daemon.len()
+        );
     }
     for o in fenced_overlaps.iter().take(10) {
         eprintln!("    {label}: a turn overlapping a fenced turn (its git got EIO): {o}");
     }
+    for o in in_flight.iter().take(10) {
+        eprintln!(
+            "    {label}: a turn overlapping a fenced turn whose last writes were in flight \
+             (every op of its grant executed before the other got the lock): {o}"
+        );
+    }
+    for o in stale_unexplained.iter().take(10) {
+        eprintln!("    {label}: a stale turn its predecessor does not explain: {o}");
+    }
+    // The acceptance report's line (per seed): how each overlap was
+    // classed. Overlaps the oracle accepts need proof: the fence first
+    // (fenced), plus the executors' log for late writes (in flight with
+    // evidence), or a kill the harness itself made (daemon killed).
+    eprintln!(
+        "    {label}: overlap classes: {} overlapping (broken), {} fenced, {} in flight with evidence, \
+         {} daemon killed (positive); {} stale turns, {} unexplained; margin {margin} ms, \
+         {} grants with executions on record",
+        overlaps.len(),
+        fenced_overlaps.len(),
+        in_flight.len(),
+        lost_with_daemon.len(),
+        stale.len(),
+        stale_unexplained.len(),
+        execs.len(),
+    );
     for &k in &committers {
         if let Ok(s) = clients[k].control_status() {
             let l = &s["locks"];
@@ -2017,6 +2686,17 @@ fn workload(
                 l["owners_fenced"],
                 l["owner_fenced_ops"],
                 l["first_use_abandoned"]
+            );
+        }
+    }
+    // Plan 30 §M14 phase 2: the fencing token at work, on every node (a
+    // sequencer refuses; a committer's node tags and holds releases).
+    for c in clients.iter() {
+        if let Ok(s) = c.control_status() {
+            let l = &s["locks"];
+            eprintln!(
+                "    {label}: {} token: tagged_ops {}, release_waits {}, token_rejections {}",
+                c.name, l["tagged_ops"], l["release_waits"], l["token_rejections"]
             );
         }
     }
@@ -2035,6 +2715,25 @@ fn workload(
                 turns.len(),
                 overlaps.len()
             );
+        }
+        // Plan 30 §M14 phase 2's acceptance run: with the fencing token no
+        // turn may overlap even under faults (`GIT_FLOCK_STRICT=1`), and
+        // no turn may read what a late write left.
+        if env_u64("GIT_FLOCK_STRICT", 0) != 0 {
+            if !overlaps.is_empty() {
+                bail!(
+                    "{} turns held the turn lock at the same time as another (strict, under faults), e.g. {}",
+                    overlaps.len(),
+                    overlaps[0]
+                );
+            }
+            if !stale_unexplained.is_empty() {
+                bail!(
+                    "{} turns began reading a state no earlier turn left (strict, under faults), e.g. {}",
+                    stale_unexplained.len(),
+                    stale_unexplained[0]
+                );
+            }
         }
         return Ok(acked);
     }
@@ -2301,6 +3000,411 @@ fn verify(
 
 #[cfg(test)]
 mod tests {
+    use super::{judge_turns, StaleRead, Turn};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    /// `who`'s turn holding the lock from `got` to `released` (seconds
+    /// after `base`), fenced at `fenced_at` (seconds; unix ms = `base`
+    /// at 1 000 000 ms) under grant 1/7, with one write `(began, ended)`.
+    fn turn(
+        base: Instant,
+        who: &str,
+        got: f64,
+        released: f64,
+        fenced_at: Option<f64>,
+        write: Option<(f64, f64)>,
+    ) -> Turn {
+        let at = |s: f64| base + Duration::from_secs_f64(s);
+        Turn {
+            who: who.into(),
+            i: 1,
+            asked: at(got),
+            got: at(got),
+            released: at(released),
+            steps: Vec::new(),
+            fenced: fenced_at.is_some(),
+            wrote_until: write.map(|w| at(w.1)),
+            began: Vec::new(),
+            failed_at: None,
+            writes: write.map_or(Vec::new(), |w| vec![("marker", at(w.0), at(w.1))]),
+            uptime_restarted: Some(false),
+            fenced_since_ms: fenced_at.map(|s| 1_000_000 + (s * 1000.0) as i64),
+            grants: vec![(1, 7)],
+            head: None,
+            stale: None,
+        }
+    }
+
+    /// Lock-fence-token review must-fix 3: the strict oracle. A fenced
+    /// turn's write that began before the fence but completed after the
+    /// other turn got the lock is an overlap unless the executors' log
+    /// shows every op of its grant went through before `got`; a turn
+    /// whose daemon restart is unknown stays an overlap, a kill the
+    /// harness made does not.
+    #[test]
+    fn a_late_write_needs_the_executors_evidence_and_a_restart_needs_proof() {
+        let base = Instant::now();
+        let judge = |prev: Turn, execs: &[((u64, u64), i64)], kills: &[(String, Instant)]| {
+            let next = turn(base, "b", 10.0, 12.0, None, None);
+            let execs: HashMap<(u64, u64), i64> = execs.iter().copied().collect();
+            judge_turns(
+                &[prev, next],
+                base,
+                1_000_000,
+                500,
+                &execs,
+                kills,
+                &HashMap::new(),
+            )
+        };
+        // The fence 2 × margin before `got`, the marker sent before the
+        // fence, its step completing after `got`.
+        let late = || turn(base, "a", 0.0, 11.0, Some(8.0), Some((7.0, 10.5)));
+        let j = judge(late(), &[], &[]);
+        assert_eq!(j.overlaps.len(), 1, "no evidence: an overlap");
+        let j = judge(late(), &[((1, 7), 1_000_000 + 10_200)], &[]);
+        assert_eq!(j.overlaps.len(), 1, "executed after got: an overlap");
+        let j = judge(late(), &[((1, 7), 1_000_000 + 9_000)], &[]);
+        assert_eq!((j.overlaps.len(), j.in_flight.len()), (0, 1), "evidence");
+        // The fence too late (inside 2 × margin): an overlap whatever.
+        let j = judge(
+            turn(base, "a", 0.0, 11.0, Some(9.5), None),
+            &[((1, 7), 1_000_000)],
+            &[],
+        );
+        assert_eq!(j.overlaps.len(), 1);
+        let j = judge(turn(base, "a", 0.0, 11.0, Some(8.0), None), &[], &[]);
+        assert_eq!(j.fenced.len(), 1, "fenced first, nothing late");
+        // Not fenced, the daemon's uptime unknown: an overlap; killed by
+        // the harness inside the turn: its lock died with the mount.
+        let unknown = || Turn {
+            uptime_restarted: None,
+            ..turn(base, "a", 0.0, 11.0, None, None)
+        };
+        assert_eq!(judge(unknown(), &[], &[]).overlaps.len(), 1);
+        let killed = [("a".to_string(), base + Duration::from_secs(5))];
+        let j = judge(unknown(), &[], &killed);
+        assert_eq!((j.overlaps.len(), j.lost_with_daemon.len()), (0, 1));
+        let other = [("c".to_string(), base + Duration::from_secs(5))];
+        assert_eq!(judge(unknown(), &[], &other).overlaps.len(), 1);
+    }
+
+    /// A stale turn is explained by what the turn before it may have
+    /// left (nothing, its commit, its commit and marker) or by catching
+    /// up; an empty marker is a late write.
+    #[test]
+    fn a_stale_read_must_be_a_state_the_previous_turn_left() {
+        let base = Instant::now();
+        let prev = Turn {
+            head: Some("p".into()),
+            ..turn(base, "a", 0.0, 5.0, None, None)
+        };
+        let stale = |ref_: &str, marker: &str, caught_up| Turn {
+            stale: Some(StaleRead {
+                want: "w".into(),
+                seen: (ref_.into(), marker.into()),
+                caught_up,
+                refused: false,
+            }),
+            ..turn(base, "b", 6.0, 8.0, None, None)
+        };
+        let judge = |x: Turn| {
+            judge_turns(
+                &[prev.clone(), x],
+                base,
+                1_000_000,
+                500,
+                &HashMap::new(),
+                &[],
+                &HashMap::new(),
+            )
+            .stale_unexplained
+            .len()
+        };
+        assert_eq!(
+            judge(stale("p", "p", false)),
+            0,
+            "the previous turn's commit"
+        );
+        assert_eq!(judge(stale("old", "old", true)), 0, "caught up");
+        assert_eq!(judge(stale("p", "", false)), 1, "an empty marker");
+        assert_eq!(
+            judge(stale("w", "p", false)),
+            1,
+            "a marker ahead of the ref"
+        );
+    }
+
+    /// An empty marker is the `open(O_TRUNC)` of the last turn whose
+    /// marker write began and did not complete: explained only if the
+    /// executors' log shows every op of its grants went through before
+    /// the reader got the lock.
+    #[test]
+    fn an_empty_marker_needs_the_truncating_turns_evidence() {
+        let base = Instant::now();
+        let cut = Turn {
+            head: Some("p".into()),
+            began: vec![("marker", base + Duration::from_secs(4))],
+            ..turn(base, "a", 0.0, 5.0, None, None)
+        };
+        let reader = Turn {
+            stale: Some(StaleRead {
+                want: "w".into(),
+                seen: ("w".into(), String::new()),
+                caught_up: false,
+                refused: false,
+            }),
+            ..turn(base, "b", 6.0, 8.0, None, None)
+        };
+        let judge = |execs: &[((u64, u64), i64)]| {
+            let execs: HashMap<(u64, u64), i64> = execs.iter().copied().collect();
+            judge_turns(
+                &[cut.clone(), reader.clone()],
+                base,
+                1_000_000,
+                500,
+                &execs,
+                &[],
+                &HashMap::new(),
+            )
+            .stale_unexplained
+            .len()
+        };
+        assert_eq!(judge(&[]), 1, "no evidence");
+        assert_eq!(judge(&[((1, 7), 1_000_000 + 6_500)]), 1, "it landed late");
+        assert_eq!(
+            judge(&[((1, 7), 1_000_000 + 4_500)]),
+            0,
+            "it landed in time"
+        );
+        // The truncating turn's commit unacknowledged (its marker write's
+        // close reported the refusal): the reader may see it only if it
+        // landed (faults seed 31: b#41).
+        let unacked = Turn {
+            head: None,
+            ..cut.clone()
+        };
+        let reader = Turn {
+            stale: Some(StaleRead {
+                want: "w".into(),
+                seen: ("c".into(), String::new()),
+                caught_up: false,
+                refused: false,
+            }),
+            ..reader.clone()
+        };
+        let judge = |landed: &[(&str, &str)]| {
+            let execs: HashMap<(u64, u64), i64> = [((1, 7), 1_000_000 + 4_500)].into();
+            let landed: HashMap<String, String> = landed
+                .iter()
+                .map(|(s, h)| (s.to_string(), h.to_string()))
+                .collect();
+            judge_turns(
+                &[unacked.clone(), reader.clone()],
+                base,
+                1_000_000,
+                500,
+                &execs,
+                &[],
+                &landed,
+            )
+            .stale_unexplained
+            .len()
+        };
+        assert_eq!(judge(&[("a-1", "c")]), 0, "its commit landed");
+        assert_eq!(judge(&[]), 1, "its commit never landed");
+    }
+
+    /// Fix round 4 (the coordinator's refinement, not a weakening): a
+    /// stale turn is judged against the last turn whose commit *landed*
+    /// (acknowledged, or in the final history), skipping turns that wrote
+    /// nothing; reading an unacknowledged commit is fine only if it
+    /// landed (faults seed 33: a#16 read a#15's commit, b#14 between
+    /// them wrote nothing).
+    #[test]
+    fn a_stale_read_is_judged_against_the_last_turn_whose_commit_landed() {
+        let base = Instant::now();
+        // a#15 committed, unacknowledged (its marker step failed).
+        let a15 = Turn {
+            i: 15,
+            ..turn(base, "a", 0.0, 5.0, None, None)
+        };
+        // b#14 wrote nothing.
+        let b14 = Turn {
+            i: 14,
+            ..turn(base, "b", 6.0, 8.0, None, None)
+        };
+        let a16 = |seen: (&str, &str)| Turn {
+            i: 16,
+            stale: Some(StaleRead {
+                want: "w".into(),
+                seen: (seen.0.into(), seen.1.into()),
+                caught_up: false,
+                refused: false,
+            }),
+            ..turn(base, "a", 9.0, 10.0, None, None)
+        };
+        let judge = |x: Turn, landed: &[(&str, &str)]| {
+            let landed: HashMap<String, String> = landed
+                .iter()
+                .map(|(s, h)| (s.to_string(), h.to_string()))
+                .collect();
+            judge_turns(
+                &[a15.clone(), b14.clone(), x],
+                base,
+                1_000_000,
+                500,
+                &HashMap::new(),
+                &[],
+                &landed,
+            )
+            .stale_unexplained
+            .len()
+        };
+        // a#15's commit without its marker, and it landed.
+        assert_eq!(judge(a16(("c15", "w")), &[("a-15", "c15")]), 0);
+        // The same commit, but not in the final history: a violation.
+        assert_eq!(judge(a16(("c15", "w")), &[]), 1);
+        // A commit other than the last one that landed.
+        assert_eq!(judge(a16(("c9", "w")), &[("a-15", "c15")]), 1);
+        // Its commit with a foreign marker.
+        assert_eq!(judge(a16(("c15", "x")), &[("a-15", "c15")]), 1);
+    }
+
+    /// Fix round 4: a turn whose every read under the lock was refused
+    /// by the fence observed no state — exempt from the stale-read rule
+    /// only if nothing it wrote landed (the executors' log included).
+    #[test]
+    fn a_turn_that_read_nothing_must_have_written_nothing_that_landed() {
+        let base = Instant::now();
+        let prev = Turn {
+            head: Some("p".into()),
+            ..turn(base, "a", 0.0, 5.0, None, None)
+        };
+        let eio = "<Input/output error (os error 5)>";
+        let blind = |write: Option<(f64, f64)>| Turn {
+            stale: Some(StaleRead {
+                want: "p".into(),
+                seen: (eio.into(), format!("<marker: {}", &eio[1..])),
+                caught_up: false,
+                refused: true,
+            }),
+            ..turn(base, "b", 6.0, 8.0, Some(6.5), write)
+        };
+        let judge = |x: Turn, execs: &[((u64, u64), i64)], landed: &[(&str, &str)]| {
+            let execs: HashMap<(u64, u64), i64> = execs.iter().copied().collect();
+            let landed: HashMap<String, String> = landed
+                .iter()
+                .map(|(s, h)| (s.to_string(), h.to_string()))
+                .collect();
+            let j = judge_turns(
+                &[prev.clone(), x],
+                base,
+                1_000_000,
+                500,
+                &execs,
+                &[],
+                &landed,
+            );
+            (j.stale_unexplained.len(), j.refused.len())
+        };
+        // Nothing written, its grant's last op before it got the lock.
+        assert_eq!(
+            judge(blind(None), &[((1, 7), 1_000_000 + 5_000)], &[]),
+            (0, 1)
+        );
+        // An op of its grant executed after it got the lock.
+        assert_eq!(
+            judge(blind(None), &[((1, 7), 1_000_000 + 6_200)], &[]),
+            (1, 0)
+        );
+        // A completed writing step.
+        assert_eq!(judge(blind(Some((6.1, 6.2))), &[], &[]), (1, 0));
+        // Its commit is in the final history.
+        assert_eq!(judge(blind(None), &[], &[("b-1", "c")]), (1, 0));
+        // No grant on record: no evidence.
+        let no_grant = Turn {
+            grants: Vec::new(),
+            ..blind(None)
+        };
+        assert_eq!(judge(no_grant, &[], &[]), (1, 0));
+        // A read that was not refused is judged as a stale read.
+        let mut seen = blind(None);
+        seen.stale.as_mut().unwrap().refused = false;
+        assert_eq!(judge(seen, &[], &[]), (1, 0));
+        assert!(super::read_refused(&(
+            eio.into(),
+            format!("<marker: {}", &eio[1..])
+        )));
+        assert!(!super::read_refused(&(eio.into(), "p".into())));
+    }
+
+    /// One of a turn's two reads refused by the fence (faults seed 34:
+    /// the ref `EIO`, the marker the last landed commit): the refused
+    /// read observed nothing, the other must match the last landed
+    /// turn, and nothing the turn wrote may have landed.
+    #[test]
+    fn a_turn_with_one_read_refused_is_judged_on_the_other() {
+        let base = Instant::now();
+        let prev = Turn {
+            head: Some("p".into()),
+            ..turn(base, "a", 0.0, 5.0, None, None)
+        };
+        let eio = "<Input/output error (os error 5)>";
+        let half = |seen: (&str, &str), write: Option<(f64, f64)>| Turn {
+            stale: Some(StaleRead {
+                want: "p".into(),
+                seen: (seen.0.into(), seen.1.into()),
+                caught_up: false,
+                refused: false,
+            }),
+            ..turn(base, "b", 6.0, 8.0, Some(6.5), write)
+        };
+        let judge = |x: Turn, execs: &[((u64, u64), i64)]| {
+            let execs: HashMap<(u64, u64), i64> = execs.iter().copied().collect();
+            judge_turns(
+                &[prev.clone(), x],
+                base,
+                1_000_000,
+                500,
+                &execs,
+                &[],
+                &HashMap::new(),
+            )
+            .stale_unexplained
+            .len()
+        };
+        let before = [((1, 7), 1_000_000 + 5_000)];
+        assert_eq!(judge(half((eio, "p"), None), &before), 0, "the ref refused");
+        assert_eq!(
+            judge(half(("p", eio), None), &before),
+            0,
+            "the marker refused"
+        );
+        assert_eq!(
+            judge(half((eio, "x"), None), &before),
+            1,
+            "a foreign marker"
+        );
+        assert_eq!(judge(half((eio, ""), None), &before), 1, "an empty marker");
+        assert_eq!(
+            judge(half(("old", eio), None), &before),
+            1,
+            "a ref behind the last landed commit"
+        );
+        assert_eq!(
+            judge(half((eio, "p"), Some((6.1, 6.2))), &before),
+            1,
+            "a completed writing step"
+        );
+        assert_eq!(
+            judge(half((eio, "p"), None), &[((1, 7), 1_000_000 + 6_200)]),
+            1,
+            "an op of its grant executed after it got the lock"
+        );
+    }
+
     use super::*;
 
     /// A repository on a local disk, committed to as the workloads do;

@@ -149,6 +149,12 @@ pub struct InboxOp {
     /// delegate acknowledged (a marker after its data) is never
     /// appended ahead of it.
     pub deps: Vec<u8>,
+    /// Plan 30 §M14 phase 2: the op's fencing token,
+    /// `(minter, seq, until_ms)` per cluster-lock grant it was issued
+    /// under (`constellation_meta::locks::LockTag`), as a P2P forward
+    /// carries it. The holder's drain refuses the op once a named grant
+    /// is no longer live.
+    pub lock_tag: Vec<(u64, u64, i64)>,
 }
 
 /// One batch object. `epoch`, `node` and `n` are also the key; they are
@@ -1039,6 +1045,7 @@ mod tests {
             rid: rid(node, seq),
             op: format!("op-{node}-{seq}").into_bytes(),
             deps: Vec::new(),
+            lock_tag: Vec::new(),
         }
     }
 
@@ -1113,6 +1120,7 @@ mod tests {
                     },
                     op: vec![0u8; 64 * 1024],
                     deps: Vec::new(),
+                    lock_tag: Vec::new(),
                 })
                 .collect(),
             wants_lease: false,
@@ -1459,6 +1467,7 @@ mod tests {
                             },
                             op: vec![1],
                             deps: Vec::new(),
+                            lock_tag: Vec::new(),
                         }],
                         1,
                     )
@@ -1482,6 +1491,7 @@ mod tests {
                             },
                             op: vec![2],
                             deps: Vec::new(),
+                            lock_tag: Vec::new(),
                         }],
                         1,
                     )
@@ -1787,6 +1797,7 @@ mod tests {
                 rid: rid(5, 0),
                 op: secret.clone(),
                 deps: Vec::new(),
+                lock_tag: Vec::new(),
             }],
         );
         s.put_batch(&b).await.unwrap();

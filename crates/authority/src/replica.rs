@@ -15,8 +15,9 @@
 use crate::ids::{Epoch, NodeId, Seq};
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{DelegationTable, Ownership};
+use constellation_meta::locks::LockTag;
 use constellation_meta::{
-    execute_mutate, BackupRole, BackupTx, CompletedOutcome, DelegateTx, InboxAck, JournalBatch,
+    execute_tagged, BackupRole, BackupTx, CompletedOutcome, DelegateTx, InboxAck, JournalBatch,
     JournalPos, KeySet, LogRecord, Meta, MetaError, MetaStore, MutateOp, Position, ReadDelegations,
     Rid, Stranded, StrandedOp, TouchSet,
 };
@@ -34,8 +35,17 @@ pub struct Applied {
 pub trait Replica {
     // ---- executing ops (holder side, local fast path, lease path) ----
 
-    /// Validate and journal `op` under `rid` (`execute_mutate`).
-    fn execute(&self, op: &MutateOp, rid: Option<Rid>) -> Result<Vec<LogRecord>, MetaError>;
+    /// Validate and journal `op` under `rid` (`execute_mutate`). Plan 30
+    /// §M14 phase 2: refused with `MetaError::LockLapsed`, executing
+    /// nothing, when a grant the fencing token `tag` names is no longer
+    /// live at `now_ms` (`execute_tagged`).
+    fn execute(
+        &self,
+        op: &MutateOp,
+        rid: Option<Rid>,
+        tag: &LockTag,
+        now_ms: i64,
+    ) -> Result<Vec<LogRecord>, MetaError>;
     /// The records a same-tenure execution of `rid` produced, if still
     /// held (`Meta::recent_outcome`).
     fn recent_outcome(&self, rid: Rid) -> Option<Vec<LogRecord>>;
@@ -78,6 +88,8 @@ pub trait Replica {
         ack: InboxAck,
         op: &MutateOp,
         rid: Rid,
+        tag: &LockTag,
+        now_ms: i64,
     ) -> Result<Vec<LogRecord>, MetaError>;
     /// Journal a refusal (`Refused { rid, code }`) with its position.
     fn journal_inbox_refusal(
@@ -112,11 +124,12 @@ pub trait Replica {
         epoch: Epoch,
         gen: u64,
         op: &MutateOp,
+        tag: &LockTag,
         records: &[LogRecord],
     ) -> Result<bool, MetaError>;
     /// The pre-S3 stream installed `rid`'s transaction here already:
     /// adopt it as this node's own op (`Meta::adopt_streamed`).
-    fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError>;
+    fn adopt_streamed(&self, rid: Rid, op: &MutateOp, tag: &LockTag) -> Result<bool, MetaError>;
     /// Install the entry behind `rid`'s `Exists` refusal ahead of the
     /// log; it retires once the applied log reaches `at`, the reply's
     /// position. `false` when not installed: this replica already has the
@@ -215,6 +228,8 @@ pub trait Replica {
         rid: Option<Rid>,
         gen: u64,
         deps: Position,
+        tag: &LockTag,
+        now_ms: i64,
     ) -> Result<(Vec<LogRecord>, u64), MetaError>;
     /// The root appends a delegate's transaction with its origin
     /// (`Ok(false)`: the rid was completed already).
@@ -366,9 +381,6 @@ pub trait Replica {
     /// `until_ms` (the restart quarantine's horizon). `false`: it could not
     /// be persisted, and the grant must not be made.
     fn note_grant_horizon(&self, until_ms: i64) -> bool;
-    /// The same for a lock grant: its own horizon, which only new lock
-    /// grants wait for after a restart (`load_lock_quarantine`).
-    fn note_lock_grant_horizon(&self, until_ms: i64) -> bool;
     /// M16: the inodes whose read delegations an op not yet executed must
     /// recall (`Meta::recall_inos_of_op_now`: an unlink's or rename's
     /// victims included).
@@ -515,8 +527,14 @@ pub trait Replica {
 }
 
 impl Replica for Meta {
-    fn execute(&self, op: &MutateOp, rid: Option<Rid>) -> Result<Vec<LogRecord>, MetaError> {
-        execute_mutate(self, op, rid)
+    fn execute(
+        &self,
+        op: &MutateOp,
+        rid: Option<Rid>,
+        tag: &LockTag,
+        now_ms: i64,
+    ) -> Result<Vec<LogRecord>, MetaError> {
+        execute_tagged(self, op, rid, tag, now_ms)
     }
 
     fn recent_outcome(&self, rid: Rid) -> Option<Vec<LogRecord>> {
@@ -586,9 +604,11 @@ impl Replica for Meta {
         ack: InboxAck,
         op: &MutateOp,
         rid: Rid,
+        tag: &LockTag,
+        now_ms: i64,
     ) -> Result<Vec<LogRecord>, MetaError> {
         let armed = Meta::pending_inbox_ack(self, ack);
-        let r = execute_mutate(self, op, Some(rid));
+        let r = execute_tagged(self, op, Some(rid), tag, now_ms);
         drop(armed);
         r
     }
@@ -624,8 +644,8 @@ impl Replica for Meta {
         Meta::journal_unshipped_through(self, upto)
     }
 
-    fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError> {
-        Meta::adopt_streamed(self, rid, op)
+    fn adopt_streamed(&self, rid: Rid, op: &MutateOp, tag: &LockTag) -> Result<bool, MetaError> {
+        Meta::adopt_streamed(self, rid, op, tag)
     }
 
     fn install_shadow(
@@ -634,9 +654,10 @@ impl Replica for Meta {
         epoch: Epoch,
         gen: u64,
         op: &MutateOp,
+        tag: &LockTag,
         records: &[LogRecord],
     ) -> Result<bool, MetaError> {
-        Meta::install_shadow_from(self, rid, epoch, gen, op, records)
+        Meta::install_shadow_from(self, rid, epoch, gen, op, tag, records)
     }
 
     fn install_hint(
@@ -832,8 +853,10 @@ impl Replica for Meta {
         rid: Option<Rid>,
         gen: u64,
         deps: Position,
+        tag: &LockTag,
+        now_ms: i64,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
-        let (records, idx) = Meta::delegate_execute(self, op, rid, gen, deps)?;
+        let (records, idx) = Meta::delegate_execute(self, op, rid, gen, deps, tag, now_ms)?;
         self.session().note_stream(gen, idx);
         Ok((records, idx))
     }
@@ -1064,16 +1087,6 @@ impl Replica for Meta {
 
     fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64> {
         Meta::load_grant_quarantine(self, now_ms)
-    }
-
-    fn note_lock_grant_horizon(&self, until_ms: i64) -> bool {
-        match Meta::note_lock_grant_horizon(self, until_ms) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(%error, "persisting the lock-grant horizon failed; not granting");
-                false
-            }
-        }
     }
 
     fn load_lock_quarantine(&self, now_ms: i64) -> Option<i64> {

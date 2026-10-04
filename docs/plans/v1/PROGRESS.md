@@ -36908,6 +36908,7 @@ engine pod.
 
 ### Gates (37-k4 worktree, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, harness prefix `k4`)
 
+
 | Command | Result |
 |---|---|
 | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
@@ -41150,3 +41151,770 @@ but that is a guess without the log.
   controller's 30 s and is cut on the retry, in 8 of the 20 re-measure
   runs (above): an engine-side race, not in this chunk. The delegation wait a writer's create saw during
   the drain is gone with `delegate-root-loss` (f3052f4).
+
+## Fix: the fencing token — the sequencer refuses a lapsed grant's mutations (`lock-fence-token`; plan 30 M11/M14 follow-up, phase 2 of lock fencing)
+
+### The problem
+
+Phase 1 (`lock-fence-owner`, above) fences a lapsed lock owner on its own
+node: its *next* operation gets `EIO`. It cannot catch an operation that
+passed the node-local check just before a stall and reached the
+sequencer after the grant had been given to someone else: a forward
+stuck in flight, a retry, a replay by rid. The Fable re-review of phase 1
+saw it at a 2 s TTL under faults: b's marker `open(O_TRUNC)` was
+forwarded before its grant lapsed, stalled while the sequencer was
+SIGSTOPped, and landed after a got the lock (a read an empty marker).
+Kleppmann's fencing-token argument and Chubby's sequencers say the check
+belongs where the write is recorded.
+
+### Design (the coordinator's deadline design, implemented as preferred)
+
+- **Tag** (`meta::locks::LockTag`, `LockToken { grant, until_ms }`). A
+  mutation issued by a lock owner carries, per minting sequencer, the
+  grant with the earliest window among those its owner's local locks are
+  under. The owner is matched as the owner fence matches it: the
+  locker's process, its threads, the processes it started, or the kernel
+  lock owner. `until_ms` is when the issuing node stops honouring the
+  grant (`sent + ttl − margin` of its latest request or renewal, its
+  clock). Untagged ops behave as before.
+  Why this minimal tag: the window check needs the earliest window, and
+  the minter's exact check needs an id that minter can judge. One token
+  per minter gives both, and git and SQLite hold one grant. **No
+  generation is carried**: a `GrantId` is unique across a minter's
+  incarnations (`seed_ids`), keeps its id across delegation moves, and
+  neither check needs `gen`.
+- **Check** (`LockTables::check_tag`, called by `mutate::execute_tagged`
+  and `Meta::with_lock_tag`). Any executor refuses the op
+  (`MetaError::LockLapsed`) once its own clock is at a token's
+  `until_ms`. The minting sequencer also refuses at once a token naming a
+  grant its table *ended*: released or outwaited (`forget` records it in
+  `ended` until the record would have expired). A move to or from a
+  delegate is not an end.
+  - Proof: the minter records a grant live until `granted + ttl +
+    margin`, and grants nothing conflicting before that. That is at
+    least `2 × margin` after the holder's `until` (`sent ≤ granted`). An
+    executor accepting at `S(t) < until` therefore runs the op before
+    any conflicting grant while its clock is within `2 × margin` of the
+    holder's.
+  - The lease and grant machinery assumes half a margin
+    (`cluster-locks.md`, "Leases, renewal and fencing"; `margin =
+    min(1 s, lease TTL / 4)`, `Config::expiry_margin_ms`).
+  - Compared with the brief's `valid_until − margin` on the minter's
+    clock, this is the same rule shifted by the RTT: the holder's own
+    deadline is never later than the minter's minus `2 × margin`. It
+    needs no new field in grant or renewal replies.
+- **Where it is checked.** Every execution funnel goes through
+  `execute_tagged` or `with_lock_tag`:
+  - a forwarded op at the holder (`holder_execute`) and at a delegate
+    (`delegate_execute_now`), parked executions included (the tag rides
+    `ParkedWhat::ExecuteReply` and `ParkedDeleg`);
+  - the requester's own lease path (`execute_local`) and the takeover
+    gate's local replay (`replay_locally`);
+  - the inbox drain (`execute_inbox`);
+  - the FUSE fast paths on the sequencer itself (root `execute_mutate`
+    and delegate `delegate_execute`);
+  - the holder's own manifest commit (`set_manifest_dirty` under
+    `with_lock_tag`).
+
+  A refusal journals nothing on the P2P paths (no `Refused` row: a token
+  never comes back to life, so a retry of the rid is refused the same
+  way). Only the inbox journals it (`EIO`), as every inbox outcome is,
+  so the drain moves on.
+- **Refusal at the requester.** `MutateOutcome::LockLapsed` (appended) is
+  final: `EIO`, never retried; the core counts `lock_lapsed_refusals`.
+  The requester's node counts it in `owner_fenced_ops`. A manifest
+  commit refused this way discards the write session (as a taint
+  would), and every open description reports `EIO` once
+  (`flush_inode`, `locks::note_lapsed`/`take_lapsed`). A replay refused
+  this way becomes a conflict copy: the requester does not loop
+  (`on_replay_outcome`: a final refusal).
+- **Release ordering** (`LockTables::tag_begin`/`tag_end`/
+  `release_blocked`, `core::locks::on_lock_flushed`, `Timer::LockReleaseWait`).
+  - A FUSE op counts itself in flight for the grants it is tagged with,
+    from its first mutation to its end.
+  - If one of its mutations ended in doubt (`InDoubt`, `Busy`,
+    `NotHolder`, `Held`, a lost reply), the grant is pinned until the
+    token's window is over; after that every executor refuses it.
+  - A recalled or idle grant's release waits for both (woken by the
+    last tagged op's end, polled every 250 ms as a fallback, or at the
+    pin). It is not renewed meanwhile, so if the wait
+    outlasts the window it lapses and its owner outwaits it.
+  - The close and release paths take the tag *before* they drop the
+    closer's locks. A recalled grant's own flush commits under the grant
+    it is about to release (`LockFlush::flush_for_lock(ino, grant)`,
+    `ClusterLocks::fixed_tag_scope`), which closes phase 1's "the fence
+    is checked when a flush starts" limit too.
+- **Replays (Layer A).** The token is persisted wherever a replay by rid
+  comes from:
+  - `JournalTx::lock_tag`, so a deposed holder replays its journal with
+    it;
+  - `SpecKind::Shadow::lock_tag` and `Streamed.own`, the requester's
+    shadow;
+  - `QueuedReplay`/`StrandedOp::lock_tag`.
+
+  A replay carries it through the forward, the lease path and the
+  takeover gate, after a daemon restart too.
+- **FUSE side** (`engine::locks`). A per-thread `TagScope` is entered by
+  `admit!`, `flush` and `release` (and re-entered on the `fsync` pool
+  for deferred `fsync` and `O_SYNC` writes). It costs one relaxed load
+  when this node holds no local lock. `current_tag()` works the tag out
+  at the first mutation: `ClusterLocks::caller_tag` uses the ancestry
+  cache shared with the owner fence. `Err` means the caller's lock is
+  under no honoured grant: the owner is fenced, `EIO`, and its
+  publication is discarded.
+
+### Wire and cost
+
+- `Payload::MutateRequest::lock_tag: Vec<(u64, u64, i64)>`, changed in
+  place: the ALPN stays `constellation/3` (maintainer rule 2026-10-03: no
+  version bumps; a cluster upgrades all its nodes together).
+  `PeerMsg::MutateRequest::tag` and `Event::Submit::tag` carry it into
+  the core. The S3 inbox carries it as `InboxOp::lock_tag`;
+  `INBOX_VERSION` stays 3.
+- Bytes: 1 byte without a lock; 21 bytes with one grant (full-width node
+  id, a seq in the millions, a unix-ms window). Pinned by
+  `a_token_costs_a_byte_without_a_lock_and_21_with_one`.
+- Lookup, measured in `--release` on this host (load ~50), 20k
+  iterations each:
+
+  | | per op |
+  |---|---|
+  | `caller_tag` while this node holds a lock (owner, or a process that turns out to hold none; dominated by the `/proc` start-time read) | 7.5 µs |
+  | `check_tag` at the executor, per tagged op | 11 ns |
+  | tag scope while no local lock exists | 8 ns |
+
+- No extra message is sent.
+
+### What is fenced now, and what is not
+
+**Closed by the token:**
+- a forward stalled in flight, a retry or a replay of it by rid (after
+  a restart too), and an `open(O_TRUNC)` or `rename` forwarded before
+  the lapse;
+- a manifest commit (close, `fsync`, a recalled grant's flush) started
+  under the grant that lands after it;
+- a write to another file that the owner closes while still holding the
+  lapsed lock (refused locally, discarded).
+
+**Remaining** (documented in `cluster-locks.md`, "What the fences
+cannot see"):
+- data the owner wrote to another file and published after its locks
+  are gone: a close or `fsync` by anyone later, a `syncfs`, or after
+  the fence lifted (the data does not remember the lock it was written
+  under);
+- processes the owner fence cannot match: daemonized children, pid
+  namespaces (pid 0 under the CSI node service) and `hidepid=2`. The
+  token is worked out by the same match, so it does not make these
+  safe;
+- another node's op replayed here as pre-S3 streamed speculation (no
+  token; its own requester's replay carries one);
+- the clock assumption (`2 × margin` between holder and executor).
+
+### Carried from the phase-1 re-review
+
+1. Docs: `cluster-locks.md`'s limits list (above), `DESIGN.md`
+   (fencing-token bullet, "Lock holders"), `DECISIONS.md` ADR-25.
+2. Harness (`gitflock.rs`):
+   - `node.status` lists `locks.fenced_owners` (`owner`, `pid`,
+     `since_ms`). `since_ms` is the grant's lapse whichever path notices
+     it: an op, the publish gate (`take_discard` captured with `now`
+     before), the renewal tick, or `status` itself, which now captures
+     too.
+   - Every fenced overlap must have `since + 2 × margin <= got`
+     (`lease_margin_ms` reads the lease TTL from `GIT_FLOCK_ENV`).
+   - Daemon logs are kept whenever an overlap exists.
+   - The overlap line prints the failing step's end and the fence time.
+   - `GIT_FLOCK_STRICT=1` makes overlaps fatal under faults.
+3. Docs: the "no `/proc`" bullet now covers pid namespaces and
+   `hidepid=2`, and says the token does not save them.
+4. Nits:
+   - `owner_fenced` loads `local_inos` (`lockers_none`) before reading
+     the clock.
+   - The `/proc` walk runs outside the `lineage` mutex (`ancestry`: one
+     cache of process ancestries, shared by the owner fence and the
+     token, reset when the set of locking processes changes).
+   - `capture` no longer fences a shared-lock owner whose lock an
+     honoured grant still covers (test
+     `only_the_uncovered_owner_is_fenced_on_a_shared_grant`).
+   - `a_grant_that_runs_out_fences_its_owner_without_any_event` uses a
+     per-thread test clock (`locks::advance_test_clock`) instead of
+     sleeping.
+   - A refused `write` not consuming a plan-39 discard error is
+     documented as Linux's errseq behaviour (only `fsync` and close
+     report one).
+
+### Harness judgement, refined (and why)
+
+The phase-1 strict rule judged a fenced turn by when its writing steps
+*returned*. Under the token that is too coarse in two observed cases,
+both read from the kept daemon logs:
+
+- **A late acknowledgement, not a late write** (faults seed 1, first
+  run). a was the holder. a's `git commit` created `packed-refs.lock` at
+  22:53:46.55, executed locally under the grant. Its acknowledgement
+  waited for the backup; the lease was lost at 22:53:50, the op went in
+  doubt, and node 4's dedup answered `Accepted` at 22:53:58.81, after b
+  got the lock. The effect was sequenced before the lapse.
+  - Rule now: a writing step that ended after the other turn's `got` is
+    allowed only if it **began before the fence**. Its ops were admitted
+    under the grant, and any executed after the window would have been
+    refused and failed the step. Listed "in flight at the fence".
+- **The marker write.** Phase 1 never counted a failed marker as fenced,
+  because without a token that write could land late. Faults seed 2
+  showed the token closing exactly the reviewer's case. a#51's marker
+  `open(O_TRUNC)` began 0.56 s before a's fence and failed with `EIO`
+  2.6 s after b got the lock (`token_rejections` on b). Under b#52's
+  lock, `refs/heads/master` read a#51's commit (git finished inside the
+  grant) and the marker still held the previous commit: the truncate was
+  refused, not landed. `marker` is now a fenceable step.
+- **A turn whose own daemon was killed under it** (faults seed 5): b#8's
+  check read `refs/heads/master` as `ENOTCONN`. The `flock` died with
+  the old mount, and the committer carried on through the remounted path
+  without any lock, while a was granted after b's dead grant was
+  outwaited. These are listed apart (daemon uptime sampled before the
+  `flock` and at the turn's end), as phase 1's notes already said ("a
+  killed node's lock is outwaited while its turn is still in flight").
+- **A fence time stamped at capture, not at the lapse** (faults seeds 8
+  and 11): fixed in the daemon (`capture` and `take_discard` stamp the
+  grant's `until_ms`). Seed 11's logs bound b's lapse at ≤ 00:34:01.34
+  (d outwaited it at 03.339), 2 s before a got the lock at ≈03.34; the
+  old stamp was b's resume from SIGSTOP (04.34).
+
+### Tests
+
+- core (`core/tests.rs`, `mod locks`):
+  - `a_forward_stalled_past_its_grant_is_refused_after_the_next_holders_write`:
+    the op passes the fence, stalls past the grant, node 3 is granted
+    and writes, then the stalled forward lands → `LockLapsed`. Nothing
+    is journaled, no `Refused` row, node 3's write stands, and the retry
+    by rid is refused too.
+  - `a_forward_inside_its_grant_executes`;
+  - `the_minter_refuses_a_released_grants_token_inside_its_window`;
+  - `a_sequencer_that_did_not_mint_the_grant_checks_the_window`;
+  - `the_holders_own_op_under_a_lapsed_grant_is_refused`;
+  - `a_replay_by_rid_carries_its_token_and_a_lapsed_one_is_not_resent`:
+    the forward carries the persisted tag, `LockLapsed` settles the
+    replay as refused, and three more drain ticks send nothing;
+  - `a_local_replay_under_a_lapsed_grant_is_refused`;
+  - `a_release_waits_for_the_ops_tagged_with_its_grant`: held back for
+    an op in flight, then for an in-doubt op until its window ends.
+- meta (`locks::token_tests`):
+  - `a_token_dies_with_its_window_or_its_grants_end` (a move is not an
+    end);
+  - `an_owners_tag_is_the_earliest_window_per_minter`;
+  - `a_grant_with_tagged_ops_in_flight_is_held_back`;
+  - `only_the_uncovered_owner_is_fenced_on_a_shared_grant`;
+  - `a_fence_starts_when_the_grant_lapsed_whoever_notices`;
+  - `a_token_costs_a_byte_without_a_lock_and_21_with_one`.
+- engine (`owner_fence_tests`):
+  - `the_lock_owners_mutations_carry_its_grant_and_nobody_elses_do`:
+    the tag, in flight for the release, persisted in the deposed
+    journal's replay row;
+  - `an_op_that_passed_the_fence_then_stalled_past_its_grant_is_refused`:
+    the token is taken under the grant, the clock moves past it, the
+    create is refused with `EIO`, nothing created.
+- sim: the `lock_writes` turn write carries its token and counts in
+  flight like a FUSE op. `locks_lapsed_owner_is_fenced_on_other_files`
+  now asserts `late_unacked_turns == 0`, and it fails without the token
+  (the same seeds with the tag stripped: `late_unacked_turns: 2`, the
+  assertion fires; with it: 0, and 3 turn writes refused `LockLapsed`).
+
+### Results of the first round (before the review; superseded below)
+
+| Command | Result |
+|---|---|
+| `cargo test` by crate | authority lib 170, `meta_repro` 4, sim 108 (11 ignored) passed. Meta, engine, control and harness: 1032 passed (re-run after the last change). net, store-s3, vfs, platform, frontend-fuse and every other crate (model included, in debug): 0 failed. |
+| `bash tests/smoke.sh`; `cargo build --release --workspace` | SMOKE TEST PASSED; ok |
+| **`git-under-flock-faults`, `GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000 GIT_FLOCK_STRICT=1`, seeds 1–12, final daemon** | **12/12 PASSED, 0 overlapping turns.** Fenced overlaps per seed: 0–83, each with the fence proven ≥ 2 × margin first. Tokens refused by sequencers (`token_rejections`, summed over nodes, at the run's end): 0–7 per seed (29 in all; the counters reset when a daemon restarts). Earlier daemon builds, which differ only in the fence-time stamp and the counters, also passed seeds 1–12; their failures are analysed above. |
+| `git-under-flock-b2b` ×10 (seeds 42, 2–10, default TTL) | 10/10 PASSED, **0 overlapping**, 203–308 turns, longest turn 1.9–7.5 s |
+| `git-under-flock-rounds` ×10 (seeds 42, 2–10) | 10/10 PASSED, 30/30 rounds with **0 overlapping**, longest turn ≤ 8.3 s |
+| `flock-cross-node`, `lock-holder-partitioned`, `lock-fence-at-close`, `sqlite-two-nodes`, `lock-latency`, `lock-holder-killed-contention`, `stale-daemon-lock`, `lock-grant-dead-generation`, `transport-cluster-locks-auto`, `lock-failover`, `git-under-flock`, `git-under-flock-gc`, `git-under-flock-faults` (default TTL), `git-under-flock-causal` ×3 each | all PASSED (39/39). The git ones: 0 overlapping. |
+| `transport-lock-wait-budget` | FAILED 4/4 here and **2/2 on a clean main build (b458669)**: pre-existing. Its second round remounts the same node within `ttl + margin` (21 s since phase 1's 20 s TTL), and the persisted lock-grant horizon (`load_lock_quarantine`) quarantines new grants, so the holder's lock gets `EAGAIN`. Not this chunk's. |
+| `forwarded-mutations`, `lease-handover`, `holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder`; and (the inbox format and delegate paths changed) `inbox-holder-takeover-pending-batch`, `sticky-lease-handoff-over-s3`, `concurrent-create-no-excl`, `p2p-handover`, `holder-kill-rejoin`, `delegated-subtrees`, `cross-subtree-rename`, `delegate-partition`, `marker-order` | all PASSED |
+
+### Fix round (review of the first round; rebased onto main `c28d849`)
+
+The first round's statements above are superseded where this section
+says so. The review's verdict was "fix": its strict seed 1 failed, the
+token refused a live holder's writes and discarded them, and the harness
+rule was loosened.
+
+**Merge.** 16 conflicted files resolved keeping both sides (main's
+`applied`/`OwnChunks` next to the token). Versions: none bumped (fix
+round 2 reverted this round's ALPN `/4`, `META_FORMAT` 4 and
+`INBOX_VERSION` 4 under the maintainer's no-bump rule): the token is
+persisted in `JournalTx`, `SpecKind::Shadow`, the streamed rows and
+`QueuedReplay` in place, and old stores are recreated. The
+`#[serde(default)]`s on persisted postcard rows are gone. The
+merge had spliced this section into the middle of K4's: moved here
+intact, K4's gates table restored under its own heading.
+
+- **Must-fix 1, the restart horizon ignored renewals.**
+  `lock_renew_one` persists `note_lock_grant_horizon(until)` before it
+  answers `Ok`, and refuses the renewal (`NotOwner { owner: 0 }`, retried
+  by the holder) if persisting fails. Self-grants' renewals stay
+  unpersisted (247fc59's rule). Test
+  `a_restart_waits_out_the_last_renewal_not_the_grant` (grant, six
+  renewals, restart: `WouldBlock` until the renewed `until`, then
+  granted); it fails without the fix.
+- **Must-fix 2, a live holder's writes were refused and discarded.**
+  - `check_tag`: a grant live in the executor's own table (the minter,
+    or the delegate it moved to) passes whatever the window; an expired
+    record is dropped as an outwait and the token refused.
+  - The token is taken when a mutation is sent
+    (`LockTables::refresh_tag`): the grants are fixed at the op's first
+    mutation (close and release still work them out before dropping the
+    closer's locks), the window comes from the held grant at each send.
+  - On `LockLapsed`, `mutate_op_rebasable` re-sends the op under a fresh
+    rid and token if every named grant is still held and honoured under
+    a window renewed since (`reissue_after_lapse`, at most 3 times; an
+    ended grant is renewed no more, so it cannot loop).
+  - A truly refused commit becomes a conflict copy, never a silent
+    discard: `commit_manifest_with_rebase` stashes the refused manifest,
+    `flush_inode` keeps the chunks enrolled and queues the op as a replay
+    already refused (`Meta::queue_refused_replay`), which the drain
+    materializes. It goes under the filesystem root's
+    `.constellation-conflict/`, named after the file's path (first try:
+    beside the file — a copy beside `.git/refs/heads/master.lock` made
+    `git fsck` fail with `badRefName` in a strict run). An owner fenced
+    at commit time is refused the same way (`LockLapsed`).
+  - The in-doubt pin uses the window of the send that ended in doubt,
+    not the op's latest refreshed one.
+  - Tests: `the_minter_accepts_a_renewed_grants_op_past_its_token_window`,
+    `an_op_sent_after_a_renewal_carries_the_renewed_window`,
+    `a_refused_op_is_reissued_only_under_a_renewed_honoured_grant`,
+    `a_commit_refused_for_an_ended_grant_becomes_a_conflict_copy`,
+    `a_token_dies_with_its_grant_or_its_window_where_the_grant_is_unknown`,
+    `a_tokens_window_is_refreshed_from_the_held_grant`.
+- **Must-fix 3, the strict oracle.** `judge_turns` (`gitflock.rs`):
+  - a writing step that completed after the other turn's `got` is an
+    overlap unless it began before the fence *and* the executors' log
+    shows every op tagged with the turn's grants went through before
+    `got`. Every executor logs each tagged op it lets through
+    (`constellation::token_exec`, debug, enabled by the scenario); the
+    harness parses every incarnation's log. `node.status` lists
+    `locks.held_grants` and each fenced owner's `grant`; a turn's grants
+    are those plus the fenced one.
+  - A restart is decided positively: the uptime went backwards, or the
+    harness's own kill log (`Fleet::crash`) has a kill of the node inside
+    the turn's `asked..released`. A missing status sample is no longer a
+    restart.
+  - Stale is fatal under `GIT_FLOCK_STRICT=1` unless explained: the turn
+    read what the previous turn left (nothing, its commit, both), caught
+    up within its wait, or read an empty marker truncated by the last
+    turn whose marker write began and failed, with that turn's ops on the
+    executors' log before `got`.
+  - Tests: `a_late_write_needs_the_executors_evidence_and_a_restart_needs_proof`,
+    `a_stale_read_must_be_a_state_the_previous_turn_left`,
+    `an_empty_marker_needs_the_truncating_turns_evidence`.
+- **Should-fix 1** (versions): above.
+- **Should-fix 2** (replays): a replay is judged by the same
+  `check_tag`, so a still-live grant replays at its minter. Elsewhere a
+  replay after its window is refused and becomes a conflict copy
+  (documented). Also closed: a release now waits while one of the node's
+  own queued replays is tagged with the grant (`replay_blocks_release`;
+  test `a_queued_replay_tagged_with_the_grant_holds_its_release`), and a
+  refused manifest no longer folds away an earlier queued truncate.
+- **Should-fix 3** (outwaited ids): ended ids are kept for
+  `ttl + 2 × margin` past the end of their record
+  (`set_token_memory_ms`, set at `locks_start`); outwaits (`conflicting`,
+  `check_tag` dropping expired records) are recorded too.
+- **Should-fix 4** (`inflight` leak): `tag_begin` prunes entries whose
+  pin is over (test `in_flight_pins_expire_and_the_last_op_wakes_the_release`).
+- **Should-fix 5** (CSI pid 0): the documented limit is kept; a separate
+  chunk will match by `lock_owner`.
+- **Nits:** the release wait is woken by the last tagged op's end
+  (`LockTables::set_release_wake` → `SyncRequest`/`Control::LockReleaseWake`;
+  the poll is a 250 ms fallback; test
+  `the_last_tagged_op_wakes_a_waiting_release`); the `LockTag` doc says
+  id uniqueness relies on `seed_ids`; the harness reads the margin from
+  `node.status` (`locks.margin_ms`); the acceptance table below gives the
+  per-seed classes.
+
+#### Results (fix round; this worktree, `CARGO_TARGET_DIR` unset, `TMPDIR=/var/tmp/lft-h/tmp`, prefix `lftfix`; host load 35–300 from other agents)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test`: authority (`--release`: lib 199, `meta_repro` 4, sim 111), meta, engine, net, control, platform, csi, cli, harness, store-s3 (1654), the rest of the workspace (357), `constellation-model` (`--release`, all ten binaries) | 0 failed |
+| `long_locks` (`--release`, `AUTHORITY_SIM_SEEDS=1000`, every lock config) | passed |
+| `bash tests/smoke.sh`; `cargo build --release --workspace` | SMOKE TEST PASSED; ok |
+| `docker compose --profile test run --rm compliance` (pjdfstest) | 8798 passed, 0 failed |
+| **`git-under-flock-faults`, `CONSTELLATION_LOCK_TTL_MS=2000`, `GIT_FLOCK_STRICT=1`, seeds 1–12, final binary** | **12/12 PASSED, 0 overlapping** (table below) |
+| `git-under-flock-b2b` ×5 (seeds 42, 2–5) | 5/5 PASSED, 0 overlapping |
+| `git-under-flock-rounds` | seed 42 (45 s rounds) and seed 2 PASSED, 0 overlapping; seed 4: three rounds with 0 overlapping, verification cut by the 575 s call limit. 5 failed runs, none an overlap: a 38 s / 42 s / 63 s turn or EIO behind 1.5–17 s core stalls on every node at once and a lease takeover (the known overload-cascade bug), and twice a turn's reads getting EIO for 5 s under the lock, which main `c28d849` also does (seed 3 on main's own binaries, same signature) |
+| `lock-failover`, `flock-cross-node`, `lock-fence-at-close`, `lock-latency`, `lock-holder-partitioned`, `lock-grant-dead-generation`, `transport-lock-wait-budget` | PASSED |
+| `lock-holder-killed-contention` | PASSED on the final binary. On earlier binaries of this round: 4 failures in 14 runs at load 170–300 (a 7.7 s stall over the 7 s bound; an extra outwait of a grant recalled at once; a survivor's grant lapsing behind 1.5 s core stalls), none with a release held for tagged ops (`release_waits` 0, no "release waits" log line); 5/5 PASSED at load ~50. Main `0d0291d` 4/4 at load ~170 (not conclusive either way) |
+| `forwarded-mutations`, `lease-handover`, `sqlite-two-nodes`, `holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder` | PASSED |
+
+Strict acceptance per seed (final binary). "Fenced": the fence came
+`2 × margin` before the other turn's `got` and nothing was written late;
+"in flight": late writes with the executors' evidence; "killed": a kill
+of the node inside the turn (positive). Rejections and conflict copies
+are the end-of-run node counters and the kept logs (restarted daemons
+reset counters). No op was re-issued and no commit was discarded.
+
+| Seed | Turns | Broken | Fenced | In flight | Killed | Stale / unexplained | Token rejections | Conflict copies |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 179 | 0 | 16 | 0 | 0 | 0 / 0 | 1 | 5 |
+| 2 | 283 | 0 | 3 | 0 | 0 | 0 / 0 | 3 | 1 |
+| 3 | 218 | 0 | 20 | 0 | 0 | 1 / 0 | 0 | 0 |
+| 4 | 258 | 0 | 4 | 0 | 0 | 1 / 0 | 1 | 2 |
+| 5 | 228 | 0 | 6 | 0 | 0 | 0 / 0 | 0 | 1 |
+| 6 | 195 | 0 | 2 | 0 | 0 | 0 / 0 | 1 | 2 |
+| 7 | 29 | 0 | 0 | 0 | 0 | 1 / 0 | 1 | – |
+| 8 | 117 | 0 | 3 | 1 | 0 | 2 / 0 | 5 | 1 |
+| 9 | 278 | 0 | 28 | 0 | 0 | 1 / 0 | 1 | 1 |
+| 10 | 128 | 0 | 1 | 0 | 0 | 0 / 0 | 1 | 1 |
+| 11 | 90 | 0 | 4 | 0 | 0 | 0 / 0 | 3 | 3 |
+| 12 | 165 | 0 | 0 | 0 | 0 | 2 / 0 | 3 | – |
+
+Seed 8's in-flight case: b#35's `commit` step began 3.87 s before a#41
+got the lock and returned 0.15 s after; its node fenced it 2.73 s
+before, and the last op tagged with its grants executed 3.58 s before.
+On earlier binaries of this round: seed 2 once classed 136 overlaps as
+"killed", all from one turn whose `flock` was taken across a `kill -9`
+of its node (kill inside `asked..released`); seed 4 once failed on an
+empty marker (b#55's truncate under its lock, the content refused), which
+led to the truncated-marker rule above; seed 1 once failed `git fsck`
+(the conflict copy beside `refs/heads/master.lock`), which moved the
+copies to the root.
+
+### Fix round 2 (review of the fix round; applied onto main `5f289b4`)
+
+- **Merge.** The work was re-applied onto main `5f289b4`; four files
+  conflicted (`core/client.rs`, `core/tests.rs`, `engine/src/sync.rs`,
+  `meta/src/lib.rs`), resolved keeping both sides: main's `excused` own
+  rows and `OwnRows` exports next to the token, main's
+  `MutateReplyParts` reply type next to the `tag` field, and 650acc8's
+  kept-tenure tests next to the token tests. Main's new tests got the
+  `tag`/`own_rows` fields they now need.
+- **No version bumps** (maintainer rule 2026-10-03): ALPN back to
+  `constellation/3` (`OLDER_ALPNS` as on main), `META_FORMAT` 3,
+  `INBOX_VERSION` 3. The formats change in place; old state is
+  recreated. Docs say so (forwarded-mutations.md, this file's earlier
+  rounds).
+- **Composition with 650acc8 (kept tenures).** One defect found and
+  fixed: a recalled grant of the holder's own lock whose release waited
+  for tagged mutations through a continuation epoch's close found no
+  route when the wait ended inside the re-claim window
+  (`Route::Unknown`), so the release was dropped and the grant stayed in
+  the kept table until it was outwaited (`ttl + margin`) before the next
+  waiter was served. `on_lock_flushed` now ends it in the kept table
+  when the node is about to own the root again (`lock_owner_resuming`).
+  The rest composes as is; a core test each:
+  - kept ids: `a_token_taken_before_an_epoch_close_passes_after_the_reclaim`
+    (the grant ids survive the close and the re-claim; a peer's forward
+    and the holder's own op tagged before the close pass at the minter
+    after it, past their token windows; where another tenure intervened
+    the dropped grant's token is judged by its window and refused);
+  - `keep_grants` vs release ordering:
+    `a_release_waiting_through_a_kept_close_ends_its_grant_in_the_kept_table`
+    (the wait survives the close, ends the grant in the kept table, the
+    peer's grant stands through the re-claim, node 3 is served at once,
+    and a real lease loss afterwards drops the table: the one-shot flag
+    did not leak). No early return was added to `lock_on_lease_gone`;
+    it consumes the flag on its first line, in the same call as the
+    close that set it;
+  - `Waiting` vs tokens:
+    `a_tagged_forward_in_the_reclaim_window_is_judged_after_the_reclaim`
+    (in the window a conflicting non-blocking request gets `WouldBlock`
+    and another `Waiting`; a tagged forward is answered `Held`, neither
+    executed nor refused; re-sent after the re-claim it passes; once the
+    unrenewed grant's record runs out its token is refused);
+  - restart horizon vs kept grants:
+    `a_kept_grants_renewal_after_the_reclaim_moves_the_restart_horizon`
+    (a kept grant's renewal after the re-claim persists the horizon, a
+    restart quarantines until at least the renewed record, which is at
+    least the token window plus `2 × margin`, and grants nothing over it).
+- **`locks-blips-tight` seed 2723** (the `lock-release-drop` bug) still
+  fails here with the same violation as on main `5f289b4` (node 1 t17
+  exclusive since t=10937, node 2 t33 shared at t=11361 on
+  0x10000000400). The lock traces of the two builds are identical: the
+  token does not change it.
+
+#### Results (fix round 2; `CARGO_TARGET_DIR` unset, sims with `TMPDIR=/dev/shm/lft2`, harness with `TMPDIR=/var/tmp/lft2/tmp` and prefix `lft2`; host load 85–145)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test` by groups: control+platform+csi+cli+harness+engine (1041), the small crates (526), chaos+frontend-fuse+fs-core+meta (507), authority `--release` (338, sim included), `constellation-model` `--release` (all ten binaries, 138) | 0 failed |
+| `sweep_config` `--release`, 2000 seeds each: `locks`, `-partition`, `-skew`, `-failover`, `-failover-backup`, `-faults`, `-pause`, `-delegated`, `-released-delegated`, `-writes`, `-delegated-writes`, `-released-writes`, `-failover-backup-writes`, `-blips`, `-blips-tight`; `flex`, `flex-crash`, `metered-shared` | 0 failing |
+| `sweep_config` `locks-blips` 2000..5000 | 0 failing |
+| `sweep_config` `locks-blips-tight` 2000..5000 | 1 failing: 2723 (pre-existing on main, see above) |
+| `bash tests/smoke.sh`; `cargo build --release --workspace` | SMOKE TEST PASSED; ok |
+| **`git-under-flock-faults`, `GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000`, `GIT_FLOCK_STRICT=1`, seeds 1–12** | **12/12 PASSED, 0 overlapping**; fenced 0/6/0/8/34/2/0/13/25/1/1/3, stale 0/0/0/1/0/1/0/0/1/0/1/1 (all explained), token rejections 7/2/0/4/0/0/0/0/1/3/4/4 |
+| `git-under-flock-b2b` seeds 42, 2, 3 | 3/3 PASSED, 0 overlapping |
+| `lock-grant-dead-generation`, `lock-holder-partitioned`, `lock-failover`, `lock-holder-killed-contention`, `lock-fence-at-close`, `lock-latency` | PASSED |
+| `STRESS_NG_FS_ONLY=fcntl,lockofd,lockf,locka,flock,lockmix STRESS_NG_FS_SECS=60 harness run stress-ng-fs-faults`, seeds 44, 45 | 2/2 PASSED; `unavailable 0 lost 0 fenced_io 0 owners_fenced 0 owner_fenced_ops 0` |
+
+### Fix round 3 (review of fix round 2; rebased onto main `a52671f`, which carries `lock-release-drop`)
+
+- **Merge.** `meta/src/store/spec.rs` resolved keeping both sides:
+  `StrandedOp::source` / `QueuedReplay::source` next to the `lock_tag`
+  of stranded and replay rows.
+- **Must-fix 1 (the conflict copy left its confinement and its
+  permissions).** `View::keep_refused_commit` queues the copy under the
+  issuing view's root (`self.view_root`: the filesystem root, or a
+  subtree mount's root such as a CSI volume), named after the file's path
+  below that root (`path_below_view_root`), not under `ROOT_INO`. It is
+  created with the source inode's uid/gid and `mode & 0o700`
+  (`recovery::copy_op`, for every kind of conflict copy: the op's own
+  owner for a create/mkdir/mknod/publish, the inode's for a link or a
+  manifest). An unknown owner gives `root`, `0600`. The
+  `.constellation-conflict` directory is created `0700` and owned by the
+  owner of the directory it is created in (`conflict_dir_op`).
+  Tests: `owner_fence_tests::a_refused_commits_copy_stays_in_the_view_and_keeps_its_owner`
+  (subtree view: parent is the view's root, name `db%2Fdata`, owner
+  1000:1001, `0640` → `0600`);
+  `recovery::tests::a_conflict_copy_keeps_its_owner_and_its_own_name`
+  (directory `0700` owned by the volume's owner, copies `0600` with the
+  source's owner, none at the filesystem root).
+- **Should-fix 3 (copy-name collision).** `conflict_dentry_name` takes
+  the refused op's rid sequence: `<name>@<node>-<ts>-<seq>`. Two copies of
+  one file within a second no longer share a name (same test). Docs and
+  the `deposed-reintegration` harness assertion follow the new name.
+- **Must-fix 2 (a grant resurrected from a stale copy).** `Grant` has a
+  `confirmed_ms`: `MINTED` for a grant this table made, `UNCONFIRMED` for
+  one installed from a backup's mirror (`lock_install_mirror`) or a
+  root's reinstated `handed` copy. `extend` (the holder's renewal) sets
+  it to the renewal's time. `check_tag` passes a live grant whatever the
+  window only for a token whose `until` runs past `confirmed_ms`.
+  Otherwise the window judges it. So an op sent before the copy was
+  confirmed is refused past its window, as in round 1, while a holder
+  that keeps renewing is never refused for a slow op. A grace reclaim's
+  `install` happens at the holder's renewal and is confirmed then. Tests:
+  `meta::locks::token_tests::an_installed_copy_is_judged_by_the_window_until_its_holder_renews`
+  and `core::tests::locks::a_stale_mirrors_grant_does_not_pass_an_op_past_its_window`
+  (a stale mirror, a takeover, an inbox op past its window →
+  `LockLapsed`, nothing executed; after the renewal the old op is still
+  refused and a new one passes past its window). With the old
+  `contains_key` rule the core test fails (checked).
+- **Should-fix 1 (same-node successor).** Fixed, not documented away.
+  `local_set` answers `LocalOutcome::Predecessor` for a lock that starts a
+  new turn (no local lock left on the inode) while the held grant has a
+  tagged op in flight or in doubt inside its window (the release's own
+  `inflight` record). The engine waits and asks again (`EAGAIN` without
+  blocking), as for a conflict; `locks.predecessor_waits` counts it.
+  An owner joining a turn that still holds a lock there does not wait.
+  Test: `a_new_turn_waits_for_the_previous_turns_tagged_ops`.
+- **Should-fix 2 (horizon on renewals).** The horizon is persisted only
+  once the renewal resolved to a grant in the table (that id, or this
+  node's newer grant on the inode), rounded up by `ttl / 4`. Durable
+  writes for peers' renewals fall from about one per second to one per
+  quarter TTL. A renewal for an unknown id no longer lengthens the
+  restart quarantine.
+- **Should-fix 4 (composition with `lock-release-drop`), checked one by
+  one:**
+  - `owner: 0` stays "unknown, retry". The renewal's persist failure
+    answers `NotOwner { owner: 0 }`; `on_lock_renew_reply` caches no
+    owner for 0 and only calls `renewal_failed` (the next tick retries).
+    `lock_op_outcome` clears `cached_holder` for 0 (the lease is read
+    again). Neither path redirects.
+  - The `Route::Unknown if lock_owner_resuming` arm in `on_lock_flushed`
+    ends only this node's own grant, which its holder released after its
+    tagged ops ended: the same effect `Route::Me` has. The handoff path
+    sets `lease.releasing` before the release CAS, which makes
+    `lock_owner_resuming` false outside the re-claim window. So the arm
+    never runs while a handoff is about to drop the table. If it had run
+    just before the handoff's flush-end re-check, it would only lower
+    `grants_len()` by a grant already released; it never drops a live
+    one.
+  - The node-wide quarantine of dropped tenures uses `clear_grants`
+    (`lock_on_lease_gone`, the unreclaimed continuation-epoch path in
+    `promise.rs`), which records nothing in `ended`. `forget` stays only
+    for a grant that truly ended (`lock_grant_done`).
+  - A tagged forward in the CAS re-read window is answered `Held`: new
+    core test `a_tagged_forward_in_the_cas_reread_window_is_held` (the
+    CAS lands, its answer times out, `Phase::CasReread` runs; the forward
+    gets `Held`, nothing is executed or refused, the kept grant stands;
+    after the re-read wins, the re-sent forward is accepted).
+- **Nits.** The PROGRESS text says the release wait is woken by the last
+  tagged op's end with a 250 ms poll as fallback. `check_tag` and
+  `conflicting` flag expired-record drops (`take_expired_dropped`), and
+  the next tick re-sends the mirror. Idle releases are woken too:
+  `idle_before` marks an idle grant recalled, and `tag_end` wakes
+  recalled grants.
+
+#### Results (fix round 3; `CARGO_TARGET_DIR` unset, sims with `TMPDIR=/dev/shm/lft3`, harness with `TMPDIR=/var/tmp/lft3/tmp` and prefix `lft3`; host load 35–46)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --exclude constellation-authority --exclude constellation-model` | 2099 passed, 0 failed |
+| `cargo test --release -p constellation-authority` (lib 255, `meta_repro` 4, sim 118) | 0 failed |
+| `sweep_config` 0..3000: the 15 lock configs (`locks`, `-partition`, `-skew`, `-failover`, `-failover-backup`, `-faults`, `-blips`, `-blips-tight`, `-pause`, `-delegated`, `-released-delegated`, `-writes`, `-delegated-writes`, `-released-writes`, `-failover-backup-writes`) | 0 failing except `locks-blips-tight` 200 and 2312, both "two authorities at once" (no lock violation). Both fail identically on a main `a52671f` build (2312 at the same t=10596), so they are the known pre-existing failure. 2723 passes. |
+| `sweep_config` `locks-blips-tight-in-doubt` 400000..403000; `flex`, `flex-crash` 0..2000 | 0 failing |
+| `cargo build --release --workspace` | ok |
+| `git-under-flock-faults`, 2 s TTL, `GIT_FLOCK_STRICT=1`, seeds 31–35 | **0 broken overlaps in all 5.** 31, 34, 35 PASSED. 32 and 33 FAILED on the strict stale-turn rule (below). |
+| `git-under-flock-b2b` seeds 7, 8 | 8 PASSED (221 turns, 0 overlapping). 7 FAILED: 0 overlapping, but one turn fenced after a 12 s holder stall (below). |
+| `git-under-flock-rounds` seed 7, `GIT_FLOCK_ROUNDS=2` | FAILED on the turn-duration limit (35.5 s > 30 s) in round 1. 0 overlapping, 0 stale. Cause: a host-wide stall (below). |
+| `lock-grant-dead-generation`, `lock-holder-partitioned`, `lock-failover`, `lock-holder-killed-contention`, `lock-fence-at-close`, `lock-latency`, `flock-cross-node`, `forwarded-mutations`, `lease-handover`, `sqlite-two-nodes` | PASSED |
+
+Failures examined:
+
+- **faults seed 32, b#33; seed 33, a#20.** The turn's own reads under
+  the lock both returned `EIO`. The turn was fenced at once: its grant
+  lapsed under a fault, b's 0.7 s after it got the lock, a's after the
+  root b was killed. A read the fence refused observed no state, but the
+  strict judge counts it as an unexplained stale turn.
+- **faults seed 33, a#16.** It read a ref ahead of the marker. That
+  state was left by a#15's unacknowledged commit: its
+  `master.lock` → `master` rename (rid incarnation 2, seqs 362–366)
+  executed on a before b#14 read the same state. Those rids were refused
+  at a later takeover's replay and kept as conflict copies. b#14 was
+  explained because a#15 committed. a#16 read the same state after b#14,
+  which wrote nothing, and the judge looks only at the immediately
+  previous turn of the other committer. I proposed a judge refinement
+  (skip turns that began no commit, marker or gc; treat fenced EIO-only
+  reads as no observation), but it was refused as weakening the oracle,
+  so the oracle is unchanged and these two seeds stand as failures for
+  the maintainer to judge.
+- **b2b seed 7.** On holder a, one `LockRenew` core step took 12 s,
+  during a 7.6 s fjall `persist` of one item: the durable restart-horizon
+  write, fsync'd on the core thread under host I/O load. b's turn (20 s
+  TTL) lapsed and was fenced. Synchronous horizon fsyncs on the core
+  thread are pre-existing for grants (M16, `note_horizon`). This chunk
+  adds them for renewals, now at most one per quarter TTL. Moving
+  horizon persistence off the core thread (answering after the write)
+  is left open.
+- **rounds seed 7.** All four daemons stalled 21–28 s in the same second
+  (fjall memtable 28 s on a `MutateRequest`, S3 segment runs 21–23 s):
+  a host stall, not lock logic.
+
+### Fix round 4 (review of fix round 3: coordinator decisions 1–4)
+
+- **1. The restart horizon is written off the core thread.** A grant or
+  renewal to another node that moves the horizon notes what it needs
+  (`lock_need_horizon`); `lock_answer` sends the answer at once if that
+  horizon is already durable, else holds it (`horizon_held`, kept in
+  order per peer) and issues `Action::PersistLockHorizon { until }`. The
+  driver runs `Meta::note_lock_grant_horizon` on the blocking pool and
+  reports `Event::LockHorizonPersisted { until, durable }`. At most one
+  write is in flight; answers made meanwhile coalesce into the next
+  write, which carries the highest horizon. The safety rule is unchanged:
+  no grant or renewal is answered before its horizon is durable. A
+  failed write refuses what it held, as the synchronous write did: a
+  grant `Busy` (dropped from the table), a pushed grant dropped, a
+  renewal `NotOwner { 0 }`. Status: `locks.horizon_held`,
+  `horizon_writes`. Core tests:
+  `a_slow_horizon_write_holds_only_the_answers_waiting_for_it` (the core
+  keeps stepping and answers others at once; coalescing),
+  `a_restart_after_an_unanswered_renewal_never_under_reports_the_horizon`,
+  `a_failed_horizon_write_refuses_the_answers_it_held`. The simulation
+  writes it in its driver and answers one event later.
+- **2. Strict stale-turn oracle (`gitflock.rs`), refined as directed.**
+  (a) A turn whose every read under the lock (the ref and the marker,
+  each time) was refused by the fence (`EIO`) observed no state: it is
+  exempt from the stale-read rule but must have written nothing that
+  landed (no completed writing step, no commit acknowledged or in the
+  final history, no executor-logged op of its grants at or after it got
+  the lock; no grant on record counts as evidence against it). It counts
+  as a fenced turn. (b) "Previous turn" is the last turn whose commit
+  landed (acknowledged, or in the final history by subject
+  `<committer>-<i>`, read once the committers agree on `HEAD`). A turn
+  that wrote nothing is skipped, and reading an unacknowledged commit is
+  fine only if it landed. Overlap detection, the executor-evidence
+  requirement and the other checks are unchanged; the daemon-killed
+  exemption still looks at the immediately preceding turn of the other
+  committer, as before. Two additions:
+  - **(a) applied per read.** A turn with only one of its two first reads
+    refused (the grant lapsed between them; faults seed 34, a#144: the
+    ref `EIO`, the marker the last landed commit) is judged on the other
+    read, which must be what the last landed turn left. Nothing it wrote
+    may have landed. This never exempts a turn that (a) would not: it
+    checks one more read than (a) does. A foreign or empty marker, or a
+    ref behind the last landed commit, is still a violation (unit test
+    `a_turn_with_one_read_refused_is_judged_on_the_other`).
+  - **The workload's own writes check `close`** (`close_checked`,
+    `write_checked`). A write-back mount reports a commit the token
+    refused at `close`, which `std::fs::write` and `File`'s drop ignore.
+    A marker write refused that way read as a completed write that
+    landed after the next holder got the lock (faults seed 31, b#41, an
+    overlap with nothing of it in the final state). Git checks its closes
+    already.
+
+  Unit tests: `a_stale_read_is_judged_against_the_last_turn_whose_commit_landed`,
+  `a_turn_that_read_nothing_must_have_written_nothing_that_landed`, and
+  the one above. Documented in the module doc and TESTING.md.
+- **3. `git-under-flock-rounds` seed 7.** The first re-run after item 1
+  failed in round 2: `git init` got `EIO` on a `close`. Daemon a logged
+  nothing at all (debug included) for 29.7 s (07:55:56.66–07:56:26.37).
+  Its backup b found it silent for 4.9 s, sealed its epoch and took the
+  lease over (`LEASE LOST` on a at 07:56:27). The write in flight on a
+  then failed. This is the known whole-node stall, not lock logic: no
+  token rejection and no lock loss in the round (`token_rejections 0`,
+  `lost 0`). The next run passed, as did a run on the final binary
+  (3 rounds, 0 overlapping, 0 stale).
+- **4.** `on_lock_released`'s superseded-release rule is untouched.
+- **New: a lock-tagged refused replay's conflict copy left inside `.git`.**
+  Faults seed 33, strict, failed after the workload (0 broken overlaps)
+  for this reason. A takeover refused a's stranded git ops by token
+  ("the lock grant it was issued under has ended"). Their copies went
+  beside each file, as any refused replay's do:
+  `.git/refs/heads/.constellation-conflict/master.lock@…` (a bad ref
+  name) and `.git/objects/6a/.constellation-conflict/…`. `git fsck`
+  failed on every node. The copy of a `Link` whose inode was gone was
+  `root`'s `0700` (unknown owner), so the tree walk got `EACCES`. This
+  was the same harm the refused-commit copy had already been moved away
+  from. Fix: `Action::ConflictCopy` carries `locked` (the stranded op
+  had a `lock_tag`). For such an op the driver passes the mounted views'
+  roots (`LockFlushers::view_roots`, `DriverDeps::view_roots`), and
+  `recovery::materialize_remote` puts the copy under the deepest view
+  root above the file, named after its path below that root
+  (`conflict_name_for_path`, moved from `view/flush.rs`), as
+  `keep_refused_commit` does. With no mounted view above the file, and
+  for every untagged op, the copy stays beside the file as before. Test
+  `recovery::tests::a_locked_replays_copy_goes_under_the_view_root`
+  fails without the relocation. Docs: cluster-locks.md and
+  forwarded-mutations.md.
+- **Sweep seed 280 (`locks-blips-tight`).** It now fails with "two
+  authorities at once" (t=10739, epoch on [1], S3 lease (3, 2)). It
+  passes on a clean `a52671f` build. Its fault schedule and failure are
+  those of the known seed 200 (t=10762): node 3 takes over a root whose
+  lease ran out while node 1's continuation epoch still holds, and the
+  epoch closes 60 ms later. The horizon write's extra event shifts the
+  timing onto the known `two-authorities` bug (in review). It is not a
+  lock violation.
+
+#### Results (fix round 4; `CARGO_TARGET_DIR` unset, sims with `TMPDIR=/dev/shm/lft4`, harness with `TMPDIR=/var/tmp/lft4/tmp` and prefix `lft4`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace --exclude constellation-authority --exclude constellation-model` | 2103 passed, 0 failed |
+| `cargo test --release -p constellation-authority` (lib 258, `meta_repro` 4, sim 118) | 0 failed |
+| `sweep_config` 0..3000, the 15 lock configs | 0 failing except `locks-blips-tight` 200, 280, 2312 ("two authorities at once"; 200 and 2312 fail on `a52671f` too, 280 is the same mechanism, above) |
+| `cargo build --release --workspace` | ok |
+| `git-under-flock-faults`, `GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000 GIT_FLOCK_STRICT=1`, seeds 31–35, final binary | **all 5 PASSED, 0 broken overlaps** (fenced overlaps 24/90/92/26/17) |
+| the same, before the conflict-copy fix | 31, 32, 34, 35 PASSED; 33 FAILED on `fsck` (above) |
+| `git-under-flock-b2b` seeds 7, 8, 9, final binary | PASSED (0 overlapping, 0 fenced, 0 stale) |
+| `git-under-flock-rounds` seed 7, final binary | PASSED (3 rounds, 0 overlapping, 0 stale); an earlier run failed on the whole-node stall (above) |
+| `lock-grant-dead-generation`, `flock-cross-node`, `lock-holder-partitioned`, `lock-failover`, `lock-holder-killed-contention`, `lock-fence-at-close`, `lock-latency`, `forwarded-mutations`, `lease-handover`, `sqlite-two-nodes`, final binary | PASSED |
+
+No re-run of the faults seeds hit the token-refused replay path again
+(the fault timing differs from run to run). The unit test covers the
+copy's placement.
+
+### Alternatives compared
+
+- **The root broadcasts revoked grants to delegates.** It costs a
+  message per revocation to every sequencer, and a lost broadcast
+  leaves a hole that only the window could cover anyway.
+- **A delegate validates synchronously with the root.** It costs a
+  round trip per tagged mutation in a delegated subtree: the git case,
+  on every object write.
+- **The deadline design** needs neither. The minter's exact check
+  catches releases inside the window; release ordering makes it
+  unnecessary for the window check to.
+
+### Files
+
+- `crates/meta/src/{locks.rs, mutate.rs, error.rs, lib.rs, store/journal.rs, store/local.rs, store/spec.rs}`
+- `crates/authority/src/{event.rs, action.rs, replica.rs, core/{client,holder,delegate,readindex,replay,inbox,locks,mod,tests}.rs}`,
+  tests `sim.rs`, `sim/{locks,node}.rs`, `meta_repro.rs`
+- `crates/net/src/{message.rs, peers.rs, endpoint.rs}`, `crates/store-s3/src/inbox.rs`
+- `crates/engine/src/{locks.rs, sync.rs, p2p.rs, authority_driver.rs, node.rs, prune.rs, recovery.rs, control/service.rs, view/{ops,write_gate,flush,lock_gate,owner_fence_tests}.rs}`
+- `crates/control/src/proto/types.rs`, `crates/control/schema/control.schema.json`
+- `crates/harness/src/scenarios/gitflock.rs`
+- docs: `cluster-locks.md`, `forwarded-mutations.md`, `DESIGN.md`, `DECISIONS.md`, `TESTING.md`

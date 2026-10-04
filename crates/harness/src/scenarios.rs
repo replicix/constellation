@@ -5074,7 +5074,7 @@ fn epoch_member_lost(_seed: u64) -> Result<()> {
 /// replays every transaction by rid through B — with no operator
 /// `reintegrate` call. Only the genuine overlap is refused: `same` keeps
 /// B's winner and A's bytes land as exactly one
-/// `.constellation-conflict/same@<node>-<ts>` copy, while `clean-from-a`
+/// `.constellation-conflict/same@<node>-<ts>-<seq>` copy, while `clean-from-a`
 /// and `a-only` replay cleanly with no conflict copy at all.
 ///
 /// **Layer A only** (plan 30 §3's durability table, "no backup"): the
@@ -5270,7 +5270,7 @@ fn deposed_reintegration(_seed: u64) -> Result<()> {
                     .collect();
                 anyhow::ensure!(
                     entries.len() == 1 && names[0].starts_with("same@"),
-                    "{} must hold exactly one conflict copy, same@<node>-<ts>; found {names:?}",
+                    "{} must hold exactly one conflict copy, same@<node>-<ts>-<seq>; found {names:?}",
                     client.name
                 );
                 anyhow::ensure!(

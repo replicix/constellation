@@ -210,6 +210,8 @@ pub enum SyncRequest {
         /// The log sequence the requester had applied when it sent the
         /// op (`PeerMsg::MutateRequest::applied`).
         applied: u64,
+        /// Plan 30 §M14 phase 2: the op's fencing token.
+        tag: constellation_meta::locks::LockTag,
         reply: tokio::sync::oneshot::Sender<crate::authority_driver::MutateReplyParts>,
     },
     /// `from` reports chunks it forwarded as pending durable in S3: ack
@@ -233,6 +235,9 @@ pub enum SyncRequest {
         /// acknowledgement waited for durability): in doubt from the
         /// start, resolved against `completed` by rid.
         in_doubt: bool,
+        /// Plan 30 §M14 phase 2: the fencing token — the cluster-lock
+        /// grants the issuing process held (empty: none).
+        tag: constellation_meta::locks::LockTag,
         reply: tokio::sync::oneshot::Sender<constellation_authority::ClientReply>,
     },
     /// Plan 30 §M9: the fast path journaled a row under a durability
@@ -437,6 +442,12 @@ pub enum SyncRequest {
     /// Plan 30 §M14: the last local lock under a recalled grant on `ino`
     /// left; the core releases the grant (nobody waits).
     LockIdle {
+        ino: Ino,
+    },
+    /// Plan 30 §M14 phase 2: the last tagged mutation in flight under
+    /// `ino`'s recalled grant was answered; a release waiting for it goes
+    /// on now.
+    LockReleaseWake {
         ino: Ino,
     },
     /// Plan 30 §M14: `getlk` — does another node hold a conflicting

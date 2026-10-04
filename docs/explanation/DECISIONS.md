@@ -805,6 +805,16 @@ strict mode (cross-node byte-range locks) had never been built.
   locks are gone: an application guarding other files with the lock
   (git) must not write on without it. The TTL is long (20 s) so that
   lapses are rare; a crashed holder costs its waiters `ttl + margin`.
+- Each mutation of a lock owner carries a fencing token (Chubby's
+  sequencer, Kleppmann's argument): its grants and the end of the window
+  its node honours them for. A sequencer that holds the grant (its
+  minter) judges it exactly, live or ended; any other refuses it once
+  its own clock passes that window, so an operation admitted before a
+  lapse and delayed past it never lands. A
+  window, not only an id, because the sequencer executing a write often
+  did not mint the lock (a delegated subtree under a root-owned lock
+  file): checking the window costs no round trip to the minter and no
+  revocation broadcast.
 - A conflicting request recalls the other grants; a recalled node
   flushes the file's dirty data before it releases. The next grant
   carries a position the new holder waits for, and it drops its kernel

@@ -98,6 +98,11 @@ pub enum Action {
         rid: Rid,
         op: MutateOp,
         reason: String,
+        /// Plan 30 §M14 phase 2: the op was issued under a cluster lock
+        /// (it carried a fencing token): its copy goes under the mounted
+        /// view's root, not beside its file, whose directory means
+        /// something to the application the lock serves.
+        locked: bool,
     },
     /// A deposition recovery found journal rows with no before-images
     /// (holder capture off): rebuild the namespace from the shared log
@@ -112,6 +117,12 @@ pub enum Action {
         ino: Ino,
         grant: constellation_meta::locks::GrantId,
     },
+    /// Plan 30 §M14: persist the lock-grant restart horizon up to `until`
+    /// (`Meta::note_lock_grant_horizon`, a durable write) off the core,
+    /// then report `Event::LockHorizonPersisted`. The grant and renewal
+    /// answers that need it are held until then; at most one is in
+    /// flight.
+    PersistLockHorizon { until: i64 },
     /// A sync round finished (`failed` says how), for the driver's spool
     /// counters, pin refresh and continuation-epoch bookkeeping.
     RoundDone { failed: Option<String> },
@@ -260,6 +271,9 @@ pub enum TimerKind {
     LockWaiterTick,
     LockRenewTimeout,
     LockTestTimeout,
+    /// M14 phase 2: a recalled grant's release waits for the mutations
+    /// tagged with it.
+    LockReleaseWait,
     /// M9: the holder's append/heartbeat tick to its backups.
     BackupTick,
     /// M9: a backup's check that its holder is still heard from (silence

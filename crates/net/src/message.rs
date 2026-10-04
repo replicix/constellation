@@ -304,6 +304,13 @@ pub enum Payload {
         /// installed there at once, so the holder skips working out what
         /// the op's records wait for (`Core::own_chunks_for`).
         applied: u64,
+        /// Plan 30 §M14 phase 2, the fencing token
+        /// (`constellation_meta::locks::LockTag`): the cluster-lock grants
+        /// the op was issued under, as `(minter, seq, until_ms)` — the
+        /// grant's id and the end of the window the requester honoured it
+        /// for. Empty for an op whose issuer holds no lock (one byte). The
+        /// executor refuses the op once a named grant is no longer live.
+        lock_tag: Vec<(u64, u64, i64)>,
     },
     /// Holder's answer: postcard-encoded `MutateOutcome`.
     MutateReply {

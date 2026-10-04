@@ -33,6 +33,14 @@ pub enum MetaError {
     #[error("stale base: concurrent update")]
     Conflict,
 
+    /// Plan 30 §M14 phase 2 (the fencing token): the op was issued under
+    /// a lock grant that is no longer live — its holder's window passed
+    /// on this executor's clock, or the sequencer that minted it saw it
+    /// released or outwaited. Nothing was journaled; the caller answers
+    /// `EIO` and never replays the op.
+    #[error("the lock grant the op was issued under is no longer live")]
+    LockLapsed,
+
     #[error("fjall: {0}")]
     Fjall(#[from] fjall::Error),
 
@@ -70,6 +78,7 @@ impl MetaError {
             NoData => Code::NoData,
             Invalid(_) => Code::Invalid,
             Conflict => Code::Again,
+            LockLapsed => Code::Io,
             Fjall(_) | Io(_) | Record(_) | Key(_) | Json(_) | Postcard(_) => Code::Io,
         }
     }

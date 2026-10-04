@@ -4243,6 +4243,7 @@ impl M14Totals {
         c.turn_reads += l.turn_reads;
         c.stale_turn_reads += l.stale_turn_reads;
         c.late_unacked_turns += l.late_unacked_turns;
+        c.token_refused += l.token_refused;
         c.overtaken += l.overtaken;
         for s in r.stats.values() {
             self.grants += s.lock_grants;
@@ -4335,6 +4336,10 @@ fn locks_lapsed_owner_is_fenced_on_other_files() {
         assert!(t.clients.fenced_ios > 0, "{label}: nothing fenced: {t:?}");
         assert!(t.clients.turns_written > 100, "{label}: {t:?}");
         assert_eq!(t.clients.stale_turn_reads, 0, "{label}: {t:?}");
+        // Plan 30 §M14 phase 2: a turn written under a grant that lapsed
+        // before it landed is refused where it lands (the fencing token),
+        // never applied over a later holder's turn.
+        assert_eq!(t.clients.late_unacked_turns, 0, "{label}: {t:?}");
     }
 }
 

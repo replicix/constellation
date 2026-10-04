@@ -35,11 +35,20 @@ pub(crate) enum MutateFail {
     Conflict {
         manifest: Option<Vec<u8>>,
     },
+    /// Plan 30 §M14 phase 2: a cluster-lock grant the op was issued under
+    /// was no longer live where it executed (the fencing token). Nothing
+    /// ran; `EIO` to the caller, and what it publishes is discarded.
+    LockLapsed,
 }
+
+/// How many times one mutation refused for its token's window is sent
+/// again while its grant is still honoured (`View::mutate_op_rebasable`).
+const LAPSED_REISSUES: u32 = 3;
 
 pub(super) fn mutate_fail(e: MetaError) -> MutateFail {
     match e {
         MetaError::Conflict => MutateFail::Conflict { manifest: None },
+        MetaError::LockLapsed => MutateFail::LockLapsed,
         other => MutateFail::Errno(other.code()),
     }
 }
@@ -59,6 +68,7 @@ impl View {
                 // Callers that cannot rebase surface the conflict as a
                 // retryable error rather than losing the update.
                 MutateFail::Conflict { .. } => Code::Again,
+                MutateFail::LockLapsed => Code::Io,
             })
     }
 
@@ -261,16 +271,48 @@ impl View {
         // caller that needs a genuinely new op after a rebase (e.g.
         // `SetManifest`'s optimistic-concurrency retry) calls back into
         // this function again, which allocates a fresh one.
-        let rid = constellation_meta::Rid {
+        let new_rid = || constellation_meta::Rid {
             node: h.node_id,
             incarnation: h.incarnation,
             seq: h
                 .next_rid_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
+        let mut rid = new_rid();
         let started = std::time::Instant::now();
-        let result = self.mutate_op_rebasable_with_rid(h, part_hint_ino, &op, rid);
-        h.acked.lock().unwrap().push(rid.seq);
+        let mut reissued = 0;
+        let result = loop {
+            let result = self.mutate_op_rebasable_with_rid(h, part_hint_ino, &op, rid);
+            h.acked.lock().unwrap().push(rid.seq);
+            // Plan 30 §M14 phase 2: refused for a lapsed grant, but this
+            // node still holds and honours every grant the token named,
+            // under a window renewed since: the executor judged the old
+            // window (its clock, or a wait that outlasted it), not an
+            // ended grant. Nothing ran (a refusal is never journaled), so
+            // the op goes again under a fresh rid and token; dropped, a
+            // continuously renewed holder's write failed with `EIO`.
+            if matches!(result, Err(MutateFail::LockLapsed))
+                && reissued < LAPSED_REISSUES
+                && crate::locks::reissue_after_lapse()
+            {
+                reissued += 1;
+                let old = rid;
+                rid = new_rid();
+                tracing::info!(
+                    target: "constellation::locks",
+                    ?old,
+                    ?rid,
+                    "re-issuing a mutation refused for its token's window: its grant is still held and renewed"
+                );
+                continue;
+            }
+            break result;
+        };
+        if matches!(result, Err(MutateFail::LockLapsed)) {
+            // Plan 30 §M14 phase 2: refused for its owner's lapsed grant,
+            // where it was to execute: counted with the owner fence's own.
+            self.meta.locks().note_owner_fenced_op();
+        }
         let took = started.elapsed();
         if took >= slow_fuse_op() {
             tracing::warn!(?rid, ?took, ?op, ok = result.is_ok(), "slow FUSE mutation");
@@ -300,6 +342,13 @@ impl View {
         {
             return Err(MutateFail::Errno(Code::ReadOnly));
         }
+        // Plan 30 §M14 phase 2: the fencing token — the grants the calling
+        // process holds (empty, after one relaxed load, when this node
+        // holds no lock). Whoever executes the op checks it.
+        // An owner fenced here (its lock under no honoured grant) is
+        // refused as a lapsed grant is: `EIO`, and a close's content kept
+        // aside (`flush_inode`).
+        let tag = crate::locks::current_tag().map_err(|_| MutateFail::LockLapsed)?;
         // Plan 30 §M11: the delegate's own writes run here at local speed
         // (the sequencer's fast path, under a grant instead of the
         // lease); the core streams them from the journal. A write whose
@@ -316,7 +365,14 @@ impl View {
             // overflow) goes through the core, to the root.
             if let Some(deps) = session.deps().filter(|d| session.reaches(d)) {
                 constellation_vfs::watch::stage("delegate execute (meta)");
-                let result = self.meta.delegate_execute(op, Some(rid), gen, deps);
+                let result = self.meta.delegate_execute(
+                    op,
+                    Some(rid),
+                    gen,
+                    deps,
+                    &tag,
+                    crate::locks::now_ms(),
+                );
                 // Journaled (or refused): the admission ends here, before
                 // the core can answer a recall with a `through` this op
                 // would be past.
@@ -357,14 +413,20 @@ impl View {
         constellation_vfs::watch::stage("delegation gate");
         let Some(gate) = self.meta.root_fast_path(op) else {
             h.delegates.note_routed();
-            return self.submit_to_core(h, op, rid, false);
+            return self.submit_to_core(h, op, rid, &tag, false);
         };
         // Plan 30 §M3b: the fast path admits the op (counted in flight)
         // atomically with respect to a release's final flush + CAS — see
         // `lease.rs`'s module doc, "The releasing flag".
         if let Some(admitted) = h.lease.admit() {
             constellation_vfs::watch::stage("local execute (meta)");
-            let result = constellation_meta::execute_mutate(&self.meta, op, Some(rid));
+            let result = constellation_meta::execute_tagged(
+                &self.meta,
+                op,
+                Some(rid),
+                &tag,
+                crate::locks::now_ms(),
+            );
             // Plan 30 §M9: under a durability gate, the row this op
             // journaled (at or below the tip now) must reach the backups
             // or the log before the acknowledgement.
@@ -383,7 +445,7 @@ impl View {
                 Ok(records) => {
                     h.lease.touch();
                     if let Some(jseq) = jseq {
-                        if let Some(outcome) = self.ack_when_durable(h, rid, op, jseq) {
+                        if let Some(outcome) = self.ack_when_durable(h, rid, op, &tag, jseq) {
                             return outcome;
                         }
                     }
@@ -403,7 +465,7 @@ impl View {
         // refusal, which is an outcome too), the causal wait, the
         // deadline — is the authority core's client machine. One channel
         // round trip; the reply is the op's outcome or "in doubt".
-        self.submit_to_core(h, op, rid, false)
+        self.submit_to_core(h, op, rid, &tag, false)
     }
 
     /// Plan 30 §M9: the fast path's acknowledgement wait under a
@@ -418,12 +480,13 @@ impl View {
         h: &SyncHandle,
         rid: constellation_meta::Rid,
         op: &constellation_meta::MutateOp,
+        tag: &constellation_meta::locks::LockTag,
         jseq: u64,
     ) -> Option<Result<(), MutateFail>> {
         if self.local_ack_durable(h, jseq) {
             None
         } else {
-            Some(self.submit_to_core(h, op, rid, true))
+            Some(self.submit_to_core(h, op, rid, tag, true))
         }
     }
 
@@ -458,6 +521,7 @@ impl View {
         h: &SyncHandle,
         op: &constellation_meta::MutateOp,
         rid: constellation_meta::Rid,
+        tag: &constellation_meta::locks::LockTag,
         in_doubt: bool,
     ) -> Result<(), MutateFail> {
         constellation_vfs::watch::stage("mutation submitted to the core (reply)");
@@ -468,6 +532,7 @@ impl View {
                 rid,
                 policy: constellation_authority::Policy::Client,
                 in_doubt,
+                tag: tag.clone(),
                 reply: tx,
             })
             .is_err()
@@ -481,8 +546,12 @@ impl View {
         match crate::fsync_wait::recv(&self.rt, rx) {
             Ok(constellation_authority::ClientReply::Outcome(outcome)) => match outcome {
                 constellation_meta::MutateOutcome::Accepted { .. } => Ok(()),
+                // Plan 30 §M14 phase 2: the op's lock grant had ended where
+                // it was to execute; nothing ran.
+                constellation_meta::MutateOutcome::LockLapsed => Err(MutateFail::LockLapsed),
                 // Never a client outcome: the core retries it.
                 constellation_meta::MutateOutcome::Held { .. } => {
+                    crate::locks::note_tag_in_doubt();
                     crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
                         "metadata commit held".into(),
                     ));
@@ -500,6 +569,7 @@ impl View {
                 }
                 constellation_meta::MutateOutcome::Busy
                 | constellation_meta::MutateOutcome::NotHolder { .. } => {
+                    crate::locks::note_tag_in_doubt();
                     crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
                         "no sequencer answered the metadata commit".into(),
                     ));
@@ -512,12 +582,18 @@ impl View {
             // base check refuses a duplicate and the rebase lays the
             // flush over whatever survived).
             Ok(constellation_authority::ClientReply::InDoubt) => {
+                // It may still execute somewhere: its grants wait for its
+                // token's window before a release.
+                crate::locks::note_tag_in_doubt();
                 crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
                     "metadata commit in doubt (S3 or the sequencer unreachable)".into(),
                 ));
                 Err(MutateFail::Errno(Code::Io))
             }
-            Err(_) => Err(MutateFail::Errno(Code::Io)),
+            Err(_) => {
+                crate::locks::note_tag_in_doubt();
+                Err(MutateFail::Errno(Code::Io))
+            }
         }
     }
 

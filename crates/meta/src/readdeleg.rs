@@ -529,17 +529,20 @@ impl crate::store::Meta {
     /// of horizon growth.
     pub fn note_grant_horizon(&self, until_ms: i64) -> Result<(), crate::MetaError> {
         self.note_horizon(KV_READ_GRANT_HORIZON, until_ms)
+            .map(|_| ())
     }
 
-    /// [`Self::note_grant_horizon`] for a lock grant: a holder that
-    /// restarts inside its lease grants no lock until it has passed
-    /// ([`Self::load_lock_quarantine`]); acknowledgements do not wait for
-    /// it.
-    pub fn note_lock_grant_horizon(&self, until_ms: i64) -> Result<(), crate::MetaError> {
+    /// [`Self::note_grant_horizon`] for a lock grant (and a renewal): a
+    /// holder that restarts inside its lease grants no lock until it has
+    /// passed ([`Self::load_lock_quarantine`]); acknowledgements do not
+    /// wait for it. Returns the horizon now durable (≥ `until_ms`). Called
+    /// off the authority core (`Action::PersistLockHorizon`): the sync can
+    /// take seconds on a loaded disk.
+    pub fn note_lock_grant_horizon(&self, until_ms: i64) -> Result<i64, crate::MetaError> {
         self.note_horizon(KV_LOCK_GRANT_HORIZON, until_ms)
     }
 
-    fn note_horizon(&self, key: &str, until_ms: i64) -> Result<(), crate::MetaError> {
+    fn note_horizon(&self, key: &str, until_ms: i64) -> Result<i64, crate::MetaError> {
         let stored = self
             .kv_get(key)?
             .and_then(|v| v.parse::<i64>().ok())
@@ -550,8 +553,9 @@ impl crate::store::Meta {
             // M16: synced — a holder that forgot it on a power loss would
             // acknowledge writes behind grants still honoured elsewhere.
             self.kv_set_durable(key, &value.to_string())?;
+            return Ok(value);
         }
-        Ok(())
+        Ok(stored)
     }
 
     /// At start: grants the previous incarnation made may still be live
@@ -750,7 +754,10 @@ mod tests {
     fn the_lock_grant_horizon_is_kept_apart() {
         let meta = crate::store::Meta::open_in_memory().unwrap();
         assert_eq!(meta.load_lock_quarantine(0), None);
-        meta.note_lock_grant_horizon(21_000).unwrap();
+        // The horizon now durable: the write's (rounded up), then the
+        // stored one for a lower ask.
+        assert_eq!(meta.note_lock_grant_horizon(21_000).unwrap(), 22_000);
+        assert_eq!(meta.note_lock_grant_horizon(21_500).unwrap(), 22_000);
         assert_eq!(meta.load_grant_quarantine(1_000), None);
         assert_eq!(meta.read_delegations().quarantine_until(), 0);
         assert_eq!(meta.load_lock_quarantine(1_000), Some(22_000));

@@ -1147,7 +1147,11 @@ impl Engine {
                     config: core_config,
                     lock_flush: {
                         let flushers = lock_flushers.clone();
-                        Arc::new(move |ino| flushers.flush(ino))
+                        Arc::new(move |ino, grant| flushers.flush(ino, grant))
+                    },
+                    view_roots: {
+                        let flushers = lock_flushers.clone();
+                        Arc::new(move || flushers.view_roots())
                     },
                     fault_reply_delay_ms: fault_forward_delay_ms,
                     holds: Some(holds.clone()),
@@ -1809,6 +1813,13 @@ impl Engine {
                         self.meta
                             .locks()
                             .set_first_use_budget_ms(crate::locks::first_use_budget_ms(&self.meta));
+                        // Plan 30 §M14 phase 2: a recalled grant's release
+                        // that waits for tagged mutations goes on as soon
+                        // as the last of them is answered.
+                        let tx = self.sync_tx.clone();
+                        self.meta.locks().set_release_wake(Arc::new(move |ino| {
+                            let _ = tx.send(crate::sync::SyncRequest::LockReleaseWake { ino });
+                        }));
                         Arc::new(crate::locks::ClusterLocks {
                             meta: self.meta.clone(),
                             tx: self.sync_tx.clone(),
@@ -2494,6 +2505,7 @@ async fn atime_flush_once(
                 rid: forward.next_system_rid(node_id),
                 policy: constellation_authority::Policy::BestEffort,
                 in_doubt: false,
+                tag: constellation_meta::locks::LockTag::NONE,
                 reply,
             })
             .is_err()
@@ -2686,6 +2698,7 @@ async fn adopt_root_once(
             rid: forward.next_system_rid(node_id),
             policy: constellation_authority::Policy::System,
             in_doubt: false,
+            tag: constellation_meta::locks::LockTag::NONE,
             reply,
         })
         .map_err(|_| anyhow::anyhow!("sync task is not running"))?;

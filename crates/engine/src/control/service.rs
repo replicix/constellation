@@ -493,6 +493,9 @@ impl EngineControl {
                     requests: stats.lock_requests,
                     local_hits: l.local_hits,
                     local_conflicts: l.local_conflicts,
+                    predecessor_waits: l.predecessor_waits,
+                    horizon_held: stats.lock_horizon_held,
+                    horizon_writes: stats.lock_horizon_writes,
                     granted: l.granted,
                     would_block: stats.lock_would_block,
                     unavailable: stats.lock_unavailable,
@@ -507,6 +510,20 @@ impl EngineControl {
                     owners_fenced: l.owners_fenced,
                     owner_fenced_ops: l.owner_fenced_ops,
                     first_use_abandoned: l.first_use_abandoned,
+                    fenced_owners: t
+                        .fenced_owners_snapshot(constellation_store_s3::lease::now_unix_ms())
+                        .into_iter()
+                        .map(|f| api::FencedOwnerStatus {
+                            owner: f.owner,
+                            pid: f.pid,
+                            since_ms: f.since_ms,
+                            grant: f.grant.map(|g| (g.node, g.seq)),
+                        })
+                        .collect(),
+                    margin_ms: crate::lease::expiry_margin_ms().max(0) as u64,
+                    held_grants: t.held_ids().into_iter().map(|g| (g.node, g.seq)).collect(),
+                    tagged_ops: l.tagged_ops,
+                    release_waits: l.release_waits,
                     grants_waited: l.grants_waited,
                     grant_wait_ms_total: l.grant_wait_ms_total,
                     grants_degraded: l.grants_degraded,
@@ -518,6 +535,7 @@ impl EngineControl {
                     reclaimed: stats.lock_reclaimed,
                     waiters_parked: stats.lock_waiters_parked,
                     grace_refusals: stats.lock_grace_refusals,
+                    token_rejections: l.token_rejections,
                     requeued_in_place: stats.lock_requeued_in_place,
                     released_superseded: stats.lock_released_superseded,
                     requests_in_flight: core.lock_requests_in_flight as u64,

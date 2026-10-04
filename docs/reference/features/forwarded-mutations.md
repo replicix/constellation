@@ -84,6 +84,19 @@ Both messages are signed iroh payloads. Mutation bodies use postcard encoding.
   then. The inbox path carries no such list: a manifest goes there only
   after its chunks are up. See
   [Durability and failover](durability-and-failover.md#--fsync-mode-and---write-mode).
+- `lock_tag` (plan 30 M14 phase 2, the fencing token): the cluster-lock
+  grants the op was issued under, one `(minter, seq, until)` per minting
+  sequencer: the grant's id, and when the requester stops honouring it,
+  on the requester's clock. Empty (one byte) for an op whose issuing
+  process holds no lock. An executor that holds the grant live (its
+  minter, or the delegate it moved to) accepts the op whatever the
+  `until`, and refuses it once it ended the grant (a grant it installed
+  from a backup's mirror or a reinstated handoff copy is judged by the
+  `until` until its holder renews it there); any other executor
+  refuses it once its own clock reaches an `until` (`LockLapsed`
+  below). A retry and a replay by rid carry the same tag; an op the
+  requester sends again after a `LockLapsed` gets a fresh rid and a
+  fresh tag. See [Cluster locks](cluster-locks.md#the-fencing-token).
 
 `MutateReply` contains the matching `req_id`, an encoded
 `MutateOutcome`, and:
@@ -117,6 +130,17 @@ The outcomes:
   forward timeout; the requester retries the same `rid` after `retry_ms`
   without spending an attempt, and the retry is answered from the
   holder's dedup once the wait is over (or re-attaches to it).
+
+- `LockLapsed` (plan 30 M14 phase 2): refused because a grant the op's
+  `lock_tag` names is no longer live where it was to execute. Nothing was
+  executed or journaled, and a retry of the rid is refused the same way.
+  If the requester still holds and honours every grant named, under a
+  window renewed since, it sends the op again under a fresh rid and tag
+  (at most 3 times). Otherwise it answers `EIO`; a manifest commit
+  refused this way is never published into the file, and its content
+  becomes a conflict copy, owned by the file's owner with the owner's
+  permission bits only, under the `.constellation-conflict/` of the
+  writing mount's root (see Cluster locks).
 
 An empty or undecodable outcome is treated as `Busy`.
 
@@ -322,9 +346,17 @@ always a prefix of the durable log plus speculation it can take back:
   A manifest replay first uploads the inode's pending chunks, so the
   holder never receives a manifest naming a chunk S3 does not have.
 - **Refusals.** A replay the log no longer admits (the name was taken in
-  the meantime, the target is gone, a manifest's base moved on) is a
-  genuine conflict. It is materialized as a
-  `.constellation-conflict/<name>@<node>-<ts>` copy and counted. An
+  the meantime, the target is gone, a manifest's base moved on, or,
+  since plan 30 M14 phase 2, a cluster-lock grant its `lock_tag` names
+  has ended: `LockLapsed`) is a genuine conflict. It is materialized as a
+  `.constellation-conflict/<name>@<node>-<ts>-<seq>` copy (`<seq>`: the
+  refused op's rid sequence) and counted. The copy keeps the op's (or
+  the inode's) owner and only the owner's permission bits, in a `0700`
+  directory owned by the directory it is created in. The copy sits
+  beside its file, except for an op that carried a `lock_tag`: that one
+  goes under the root of the deepest mounted view above the file, named
+  after the file's path below it (`a%2Fb%2Fc@...`), as a refused
+  commit's copy is (see Cluster locks). An
   `unlink`/`rmdir` refused with `ENOENT` is not a conflict: the name is
   gone either way. A size-only `setattr` (the `O_TRUNC` half of a
   truncating write) queued before a manifest commit for the same inode is
@@ -591,7 +623,8 @@ batch before the overwrite deduplicates the copies.
 
 1. The op, with its rid and its `deps` (what this node had observed,
    including the delegate streams it was answered from, as a P2P
-   forward carries them; batch format version 3), goes into the next
+   forward carries them) and its `lock_tag` (batch format version 3),
+   goes into the next
    **batch object**
    `inbox/<epoch>/<node>/<n>` under the epoch the lease object currently
    shows (one CAS-created PUT; everything a node's FUSE threads queue

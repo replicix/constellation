@@ -91,6 +91,9 @@ fn folded_into_later_manifest(op: &StrandedOp, queue: &[StrandedOp]) -> bool {
     op.refused.is_none()
         && queue.iter().any(|later| {
             later.queue_seq > op.queue_seq
+                // A refused manifest (a conflict copy to make, e.g. a
+                // close refused for its lock grant) replaces nothing.
+                && later.refused.is_none()
                 && matches!(&later.op, MutateOp::SetManifest { ino: m, .. } if m == ino)
         })
 }
@@ -228,6 +231,7 @@ impl Core {
                 head.rid,
                 head.op.clone(),
                 Policy::Client,
+                head.lock_tag.clone(),
                 Origin::Replay {
                     queue_seq: head.queue_seq,
                 },
@@ -393,6 +397,7 @@ impl Core {
             rid: queued.rid,
             op: queued.op.clone(),
             reason,
+            locked: !queued.lock_tag.is_empty(),
         });
     }
 
@@ -461,6 +466,7 @@ impl Core {
                     MutateOutcome::Errno(_)
                         | MutateOutcome::Exists { .. }
                         | MutateOutcome::Conflict { .. }
+                        | MutateOutcome::LockLapsed
                 )
             )
         {
@@ -492,6 +498,13 @@ impl Core {
             Some(MutateOutcome::Errno(code)) => format!("refused with {code}"),
             Some(MutateOutcome::Exists { .. }) => "the name now exists".to_string(),
             Some(MutateOutcome::Conflict { .. }) => "stale manifest base".to_string(),
+            // Plan 30 §M14 phase 2: the replay carried the fencing token
+            // of a grant that has ended since. Final: what the op would
+            // have written is kept aside (the conflict copy), never
+            // applied over the next lock holder's writes.
+            Some(MutateOutcome::LockLapsed) => {
+                "the lock grant it was issued under has ended".to_string()
+            }
         };
         self.replay.stuck_since = None;
         self.refuse_replay(now, &queued, reason, replica, out);
@@ -597,7 +610,10 @@ impl Core {
             }
             return Ok(());
         }
-        match replica.execute(&queued.op, Some(queued.rid)) {
+        // Plan 30 §M14 phase 2: with the op's fencing token — a replay
+        // under a grant that has ended is refused (`LockLapsed`) and
+        // becomes a conflict copy below, as any refusal does.
+        match replica.execute(&queued.op, Some(queued.rid), &queued.lock_tag, now.0) {
             Ok(_) => {
                 tracing::info!(node = self.cfg.node_id, rid = ?queued.rid, "stranded op replayed locally");
                 self.stats.stranded_replayed += 1;

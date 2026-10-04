@@ -11,8 +11,10 @@
 
 pub const CONFLICT_DIR: &str = ".constellation-conflict";
 
-pub fn conflict_dentry_name(name: &str, node_id: u64, ts_unix: i64) -> String {
-    format!("{name}@{node_id}-{ts_unix}")
+/// `rid_seq` is the refused op's rid sequence: two copies of one file
+/// made by one node within the same second still get distinct names.
+pub fn conflict_dentry_name(name: &str, node_id: u64, ts_unix: i64, rid_seq: u64) -> String {
+    format!("{name}@{node_id}-{ts_unix}-{rid_seq}")
 }
 
 #[cfg(test)]
@@ -22,8 +24,8 @@ mod tests {
     #[test]
     fn conflict_names_carry_node_and_time() {
         assert_eq!(
-            conflict_dentry_name("foo", 7, 1_700_000_000),
-            "foo@7-1700000000"
+            conflict_dentry_name("foo", 7, 1_700_000_000, 42),
+            "foo@7-1700000000-42"
         );
         assert_eq!(CONFLICT_DIR, ".constellation-conflict");
     }

@@ -140,6 +140,11 @@ pub(crate) struct JournalTx {
     /// them as dependencies (`store::held`). Empty for a transaction
     /// that wrote what it read.
     pub observed: Vec<Vec<u8>>,
+    /// Plan 30 §M14 phase 2: the grants the op was issued under (its
+    /// fencing token; `journal::PendingLockTag`). A replay after a
+    /// deposition carries it, so a replay under a grant that ended is
+    /// rejected as the first execution would have been.
+    pub lock_tag: crate::locks::LockTag,
 }
 
 /// The leading fields of a [`JournalTx`], decoded without the (possibly
@@ -392,6 +397,7 @@ impl Meta {
                 op,
                 deps,
                 observed: journal::PendingObserved::take().unwrap_or_default(),
+                lock_tag: journal::PendingLockTag::take().unwrap_or_default(),
             },
         )
     }
@@ -400,15 +406,20 @@ impl Meta {
     /// `gen` (the caller checked ownership and the grant): journaled with
     /// the generation's next stream index and the requester's `deps`.
     /// Returns the records and the index.
+    ///
+    /// `tag`, `now_ms`: the op's fencing token, checked at `now_ms` on this
+    /// node's clock ([`crate::mutate::execute_tagged`]).
     pub fn delegate_execute(
         &self,
         op: &MutateOp,
         rid: Option<Rid>,
         gen: u64,
         deps: crate::session::Position,
+        tag: &crate::locks::LockTag,
+        now_ms: i64,
     ) -> Result<(Vec<LogRecord>, u64), MetaError> {
         let _d = journal::PendingDelegate::set(gen, None, deps);
-        let records = crate::mutate::execute(self, op, rid)?;
+        let records = crate::mutate::execute_tagged(self, op, rid, tag, now_ms)?;
         let idx = self.delegate_idx(gen)?;
         Ok((records, idx))
     }

@@ -394,16 +394,59 @@ still fails the end-state check.
 Every variant also checks the marker file the previous turn wrote under
 the lock after its commit (campaign 5's check, done right: one marker for
 the last commit by anyone), and that no two turns held the lock at once
-(each turn records when it got and released it). A turn whose git (or
-the edit before it) failed while its node counted refused ops of a lapsed
-lock owner (`owner_fenced_ops` rose during the turn) is *fenced*: a turn
-overlapping it is reported apart, not as a broken lock, unless the fenced
-turn completed a writing step after the other got the lock. A turn whose
-git succeeded and whose marker write then failed is not fenced. Each
-overlap prints the earlier turn's steps relative to the later turn's
-`got`, and each workload prints the committers' `lost`, `owners_fenced`
-and `owner_fenced_ops`. With `GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000`
-the faults variant provokes real lapses.
+(each turn records when it got and released it). A turn whose git, the
+edit before it or its marker write failed (the workload's own writes
+check `close`, where a write-back mount reports a commit the fencing
+token refused) while its node counted refused
+ops of a lapsed lock owner (`owner_fenced_ops` rose during the turn,
+counting the fencing token's refusals too) is *fenced*. A turn
+overlapping it is reported apart, not as a broken lock, when the strict
+rule holds (plan 30 M14 phase 2):
+- the node fenced the owner (`locks.fenced_owners[].since_ms` in
+  `node.status`, the grant's lapse) at least `2 × margin` before the
+  other turn got the lock;
+- and it wrote nothing after the other turn got the lock, or every
+  writing step that ended after that began before the fence *and* the
+  executors' own log shows every operation tagged with the fenced grant
+  went through before the other turn's `got` (each executor logs every
+  tagged operation it lets through, target `constellation::token_exec`,
+  which the scenario enables). Those are listed "in flight with
+  evidence"; without the evidence the turn is an overlap.
+
+A turn whose node's daemon was killed during it is listed apart too: its
+`flock` died with the old mount, and the committer carries on through
+the remounted path without any lock. The restart must be proved: the
+daemon's uptime went backwards, or the harness's own kill log has a kill
+of that node inside the turn; a status call that did not answer leaves
+it an overlap. A turn that began stale must have read what the last
+turn whose commit *landed* left — acknowledged, or visible in the final
+history (matched by its subject, `<committer>-<i>`); a turn that wrote
+nothing that landed is skipped, and reading an unacknowledged commit is
+fine only if that commit landed — its commit without its marker, or
+both; or an empty marker truncated by the last turn whose marker write
+began and failed (its commit acknowledged or landed) — only if the
+executors' log shows that turn's operations went through before this one
+got the lock — or caught up
+within its wait. A turn whose every read under the lock (the ref and
+the marker, each time) was refused by the fence (`EIO`) observed no
+state: no stale-read rule applies, but nothing it wrote may have landed
+— no completed writing step, no commit in the final history, and no
+executor let an operation tagged with its grants through at or after it
+got the lock (no grant on record is no evidence); it counts as a fenced
+turn. A turn with only one of its first two reads refused (the grant
+lapsed between them) is judged on the other read alone, which must be
+what the last landed turn left, and nothing it wrote may have landed
+either. Anything else is fatal under `GIT_FLOCK_STRICT=1`. Each workload prints one "overlap classes" line
+(broken, fenced, in flight with evidence, daemon killed). Each overlap
+prints the earlier
+turn's steps relative to the later turn's `got`, when its last write and
+its failing step ended, and when it was fenced. Each workload prints the
+committers' `lost`, `owners_fenced` and `owner_fenced_ops`, and every
+node's `tagged_ops`, `release_waits` and `token_rejections`. Daemon logs
+are kept whenever a turn overlapped, failed or not. With
+`GIT_FLOCK_ENV=CONSTELLATION_LOCK_TTL_MS=2000` the faults variant
+provokes real lapses, and `GIT_FLOCK_STRICT=1` makes an overlap fatal
+under faults too (the fencing token's acceptance run).
 `git-under-flock-b2b` is campaign 5's shape: back to back, 5–20 files per
 commit (new files and appends to any tracked file), with the turn
 duration reported per decile and the slowest turns broken into steps; a
@@ -835,7 +878,7 @@ stranded-branch recovery:
   transaction by rid through B. On both mounts `same` keeps B's winner,
   `clean-from-a` and `a-only` carry A's content, and
   `shared/.constellation-conflict` holds exactly one entry,
-  `same@<node>-<ts>`, with A's losing bytes: a conflict copy only for the
+  `same@<node>-<ts>-<seq>`, with A's losing bytes: a conflict copy only for the
   genuine overlap. Non-vacuity on A: `speculation.local > 0` before the
   pause (holder capture), then `depositions >= 1`,
   `local_rolled_back >= 1`, `replay_conflicts >= 1` (mirrored in

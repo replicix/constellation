@@ -50,11 +50,15 @@ macro_rules! enter {
 /// Per-view admission (`ViewQos`): held until the op has answered, or
 /// answer `Again`/`Intr` and return.
 macro_rules! admit {
-    ($self:expr, $cx:expr, $r:ident) => {
-        match $self.admission.admit($cx) {
+    ($self:expr, $cx:expr, $r:ident, $admitted:ident) => {
+        let $admitted = match $self.admission.admit($cx) {
             Ok(admitted) => {
                 // Plan 30 §M14: the caller is a lock owner (or its
-                // process) whose grant lapsed: `EIO`, on any file.
+                // process) whose grant lapsed: `EIO`, on any file. A
+                // refused `write` does not count as the report of a
+                // pending discard error (plan 39 §3.7): as with Linux's
+                // errseq, only `fsync` and close report one — `fsync`
+                // checks this fence itself, after `enter!`, for that.
                 if $self.lock_owner_fenced($cx) {
                     $r.done(Err(Code::Io.into()));
                     return;
@@ -65,17 +69,22 @@ macro_rules! admit {
                 $r.done(Err(code.into()));
                 return;
             }
-        }
+        };
+        // Plan 30 §M14 phase 2: the op's mutations carry the fencing
+        // token of the locks its caller holds (one relaxed load while
+        // this node holds none). Dropped before the admission.
+        let _lock_tag = $self.lock_tag_scope($cx);
     };
     // The caller checks the owner fence itself (`fsync`: after `enter!`).
-    ($self:expr, $cx:expr, $r:ident, owner_fence_checked_later) => {
-        match $self.admission.admit($cx) {
+    ($self:expr, $cx:expr, $r:ident, $admitted:ident, owner_fence_checked_later) => {
+        let $admitted = match $self.admission.admit($cx) {
             Ok(admitted) => admitted,
             Err(code) => {
                 $r.done(Err(code.into()));
                 return;
             }
-        }
+        };
+        let _lock_tag = $self.lock_tag_scope($cx);
     };
 }
 
@@ -115,7 +124,7 @@ impl Vfs for View {
 
     fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("lookup", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
@@ -216,7 +225,7 @@ impl Vfs for View {
 
     fn getattr<R: Responder<Attr>>(&self, cx: &OpCtx<'_>, ino: Ino, _fh: Option<Fh>, r: R) {
         let _w = self.watch.enter("getattr", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let requested_ino = ino;
         let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
@@ -262,7 +271,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("setattr", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         let atime_ns = set.atime.map(time_ns);
@@ -356,7 +365,7 @@ impl Vfs for View {
 
     fn readlink<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
         let _w = self.watch.enter("readlink", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
@@ -391,7 +400,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("mknod", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
@@ -453,7 +462,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("mkdir", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
@@ -497,7 +506,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("symlink", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
@@ -534,7 +543,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("link", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let new_parent = enter!(self, new_parent, r);
         let _inflight = self.inflight.enter(&[ino, new_parent]);
@@ -565,7 +574,7 @@ impl Vfs for View {
 
     fn unlink<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("unlink", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
@@ -620,7 +629,7 @@ impl Vfs for View {
 
     fn rmdir<R: Responder<()>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let _w = self.watch.enter("rmdir", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
@@ -668,7 +677,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("rename", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         // renameat2(2): `EINVAL` for a flag the filesystem does not
         // support (`RENAME_WHITEOUT`, anything unknown) and for
         // `NOREPLACE|EXCHANGE` together — never `ENOSYS`/`EOPNOTSUPP`,
@@ -853,7 +862,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("open", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         // Plan 30 §M14: opening for writing is a write (a read-only open
         // is not fenced: the fence must not stop a fenced owner from
         // reaching its own close).
@@ -947,7 +956,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("create", parent);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
@@ -980,7 +989,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("read", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         // §6.12: a handle addresses only the inode it was opened on (the
         // view hands out one per open and knows its inode); anything else
@@ -1049,7 +1058,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("write", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         if View::is_synthetic(ino) {
@@ -1090,8 +1099,12 @@ impl Vfs for View {
         };
         let admitted = _admitted.defer();
         let (watch, inflight) = (_w, _inflight);
+        // Plan 30 §M14 phase 2: the publication carries the caller's
+        // fencing token on the pool thread too.
+        let caller = crate::locks::scope_caller();
         crate::fsync_wait::pool().submit(move || {
             watch.adopt();
+            let _lock_tag = caller.as_ref().map(|c| c.enter());
             r.done(
                 view.flush_sync_write(ino, cancel)
                     .map(|()| n)
@@ -1103,9 +1116,14 @@ impl Vfs for View {
         });
     }
 
-    fn flush<R: Responder<()>>(&self, _cx: &OpCtx<'_>, ino: Ino, fh: Fh, owner: LockOwner, r: R) {
+    fn flush<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, owner: LockOwner, r: R) {
         let _w = self.watch.enter("flush", ino);
         let ino = enter!(self, ino, r);
+        // Plan 30 §M14 phase 2: the close publishes under the locks its
+        // caller holds now — the tag is taken before the close drops the
+        // caller's locks on this file below.
+        let _lock_tag = self.lock_tag_scope(cx);
+        let _ = crate::locks::current_tag();
         // Plan 30 §M14: the fence first, while the closing owner's locks
         // are still there (dropping them would lift it): data written
         // under a lapsed grant is discarded, never published. Then the
@@ -1135,7 +1153,7 @@ impl Vfs for View {
 
     fn release<R: Responder<()>>(
         &self,
-        _cx: &OpCtx<'_>,
+        cx: &OpCtx<'_>,
         ino: Ino,
         fh: Fh,
         flags: OpenFlags,
@@ -1158,7 +1176,10 @@ impl Vfs for View {
         }
         // Plan 30 §M14: the fence first (as in `flush`), then
         // `FUSE_RELEASE_FLOCK_UNLOCK` — the last close of an open file
-        // drops its `flock` lock (whose owner is the open file).
+        // drops its `flock` lock (whose owner is the open file). Phase 2:
+        // the fencing token is taken before that, as in `flush`.
+        let _lock_tag = self.lock_tag_scope(cx);
+        let _ = crate::locks::current_tag();
         let locks = self.cluster_locks();
         let gate = self.lock_publish_gate(ino, fh);
         drop(_closed);
@@ -1236,7 +1257,7 @@ impl Vfs for View {
 
     fn fsync<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, level: Durability, r: R) {
         let _w = self.watch.enter("fsync", ino);
-        let _admitted = admit!(self, cx, r, owner_fence_checked_later);
+        admit!(self, cx, r, _admitted, owner_fence_checked_later);
         let ino = enter!(self, ino, r);
         if self.lock_owner_fenced(cx) {
             // This `EIO` also reports a discard this description has not
@@ -1270,8 +1291,10 @@ impl Vfs for View {
         };
         let admitted = _admitted.defer();
         let watch = _w;
+        let caller = crate::locks::scope_caller();
         crate::fsync_wait::pool().submit(move || {
             watch.adopt();
+            let _lock_tag = caller.as_ref().map(|c| c.enter());
             r.done(finish(&view).map_err(VfsError::from));
             view.admission.leave_deferred(admitted);
             drop(watch);
@@ -1288,7 +1311,7 @@ impl Vfs for View {
         mut r: R,
     ) {
         let _w = self.watch.enter("readdir", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let visible_ino = ino;
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
@@ -1366,7 +1389,7 @@ impl Vfs for View {
 
     fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
         let _w = self.watch.enter("statfs", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         // §6.12: an inode outside the view answers `Stale` here too.
         let _ino = enter!(self, ino, r);
         // Used space is logical bytes under the mounted view; free space
@@ -1406,7 +1429,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("fallocate", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         // Plan 31 §6.2: absent from a frontend that does not declare it.
         if !self.caps.fallocate {
             r.done(err(Code::NotSupported));
@@ -1449,7 +1472,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("lseek", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         // Plan 31 §6.2: `SEEK_DATA`/`SEEK_HOLE` are absent from a frontend
         // that does not declare them.
         if !self.caps.seek_hole {
@@ -1465,7 +1488,7 @@ impl Vfs for View {
 
     fn getxattr<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {
         let _w = self.watch.enter("getxattr", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
@@ -1523,7 +1546,7 @@ impl Vfs for View {
         r: R,
     ) {
         let _w = self.watch.enter("setxattr", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
@@ -1641,7 +1664,7 @@ impl Vfs for View {
 
     fn listxattr<R: Responder<Vec<XattrNameBuf>>>(&self, cx: &OpCtx<'_>, ino: Ino, r: R) {
         let _w = self.watch.enter("listxattr", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         if !View::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
@@ -1667,7 +1690,7 @@ impl Vfs for View {
 
     fn removexattr<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {
         let _w = self.watch.enter("removexattr", ino);
-        let _admitted = admit!(self, cx, r);
+        admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,

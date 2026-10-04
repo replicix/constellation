@@ -13,6 +13,9 @@ struct Harness {
     core: Core,
     meta: Meta,
     now: Ms,
+    /// `step` leaves `Action::PersistLockHorizon` to the test (a slow
+    /// write); otherwise it completes it at once, as the driver would.
+    manual_horizon: bool,
 }
 
 impl Harness {
@@ -54,11 +57,35 @@ impl Harness {
             },
             &meta,
         );
-        Self { core, meta, now }
+        Self {
+            core,
+            meta,
+            now,
+            manual_horizon: false,
+        }
     }
 
     fn step(&mut self, event: Event) -> Vec<Action> {
-        self.core.handle(self.now, event, &self.meta)
+        let mut out = self.core.handle(self.now, event, &self.meta);
+        if self.manual_horizon {
+            return out;
+        }
+        // The lock-grant horizon write lands at once: its answers follow
+        // in the same step (`manual_horizon` keeps it pending).
+        let mut i = 0;
+        while i < out.len() {
+            if let Action::PersistLockHorizon { until } = out[i] {
+                let durable = self.meta.note_lock_grant_horizon(until).ok();
+                let more = self.core.handle(
+                    self.now,
+                    Event::LockHorizonPersisted { until, durable },
+                    &self.meta,
+                );
+                out.extend(more);
+            }
+            i += 1;
+        }
+        out
     }
 
     fn advance(&mut self, ms: u64) {
@@ -201,6 +228,7 @@ fn a_timed_out_forward_retries_the_same_rid_then_takes_the_lease_path() {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     let sent = sends(&out);
     assert_eq!(sent.len(), 1);
@@ -250,6 +278,7 @@ fn the_lease_path_resolves_an_in_doubt_rid_from_the_log() {
         policy: Policy::Client,
         rid,
         op: op.clone(),
+        tag: Default::default(),
     });
     let timeout = timers(&out, TimerKind::ForwardTimeout)[0];
     // Meanwhile the holder executed it and its segment was tailed here.
@@ -410,6 +439,7 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
         acked_through: 0,
         deps: constellation_meta::Position::ZERO,
         applied: 0,
+        tag: Default::default(),
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -472,6 +502,7 @@ fn a_reply_base_names_the_unshipped_overlap() {
         policy: Policy::Client,
         rid: h.rid(1),
         op: h.create("a"),
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -497,6 +528,7 @@ fn a_reply_base_names_the_unshipped_overlap() {
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             },
         });
         match sends(&out)[0].1 {
@@ -702,6 +734,7 @@ fn a_renewal_due_mid_ship_goes_out_between_two_segments() {
             policy: Policy::Client,
             rid: h.rid(seq),
             op: h.create(name),
+            tag: Default::default(),
         });
         assert!(matches!(
             replies(&out)[0].1,
@@ -810,6 +843,7 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
             manifest,
             size: 7,
         },
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -920,6 +954,7 @@ fn a_handoff_is_declined_while_the_journal_cannot_drain() {
             manifest,
             size: 7,
         },
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -1106,6 +1141,7 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
         policy: Policy::Client,
         rid: h.rid(1),
         op: h.create("a"),
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -1187,6 +1223,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
         policy: Policy::Client,
         rid: r1,
         op: h.create("a"),
+        tag: Default::default(),
     });
     assert_eq!(sends(&out1).len(), 1);
     // The second op touches the same parent: gated, not sent.
@@ -1197,6 +1234,7 @@ fn overlapping_forwards_from_one_node_are_issued_in_order() {
             parent: ROOT_INO,
             name: "a".into(),
         },
+        tag: Default::default(),
     });
     assert!(sends(&out2).is_empty());
     assert!(matches!(
@@ -1236,6 +1274,7 @@ fn a_nudge_during_an_in_flight_publish_ships_the_journal_at_once() {
         policy: Policy::Client,
         rid: h.rid(1),
         op: h.create("a"),
+        tag: Default::default(),
     });
     assert!(!replies(&out).is_empty());
     // A forced publish (`SyncRequest::Publish`): the round uploads, ships
@@ -1277,6 +1316,7 @@ fn a_nudge_during_an_in_flight_publish_ships_the_journal_at_once() {
         policy: Policy::Client,
         rid: h.rid(2),
         op: h.create("b"),
+        tag: Default::default(),
     });
     assert!(!replies(&out).is_empty());
     let out = h.step(Event::Control {
@@ -1326,6 +1366,7 @@ fn a_shutdown_waits_for_an_in_flight_publish_and_publishes_after_it() {
         policy: Policy::Client,
         rid: h.rid(1),
         op: h.create("a"),
+        tag: Default::default(),
     });
     assert!(!replies(&out).is_empty());
     let out = h.step(Event::Control {
@@ -1363,6 +1404,7 @@ fn a_shutdown_waits_for_an_in_flight_publish_and_publishes_after_it() {
         policy: Policy::Client,
         rid: h.rid(2),
         op: h.create("b"),
+        tag: Default::default(),
     });
     assert!(!replies(&out).is_empty());
     let shutdown = OpId(901);
@@ -1443,6 +1485,7 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
             policy: Policy::Client,
             rid: h.rid(rid),
             op: h.create(name),
+            tag: Default::default(),
         });
         assert!(!replies(&out).is_empty());
         let out = h.step(Event::Control {
@@ -1490,6 +1533,7 @@ fn a_reply_base_is_the_last_shipped_touch_not_the_head() {
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             },
         });
         match sends(&out)[0].1 {
@@ -1519,6 +1563,7 @@ fn an_op_from_a_node_with_an_unshipped_journal_takes_the_lease_path() {
         policy: Policy::Client,
         rid: h.rid(1),
         op: h.create("in-clone"),
+        tag: Default::default(),
     });
     assert!(
         sends(&out).is_empty(),
@@ -1562,6 +1607,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
         policy: Policy::Client,
         rid,
         op: h.create("a"),
+        tag: Default::default(),
     });
     for key in &keys {
         assert!(
@@ -1624,6 +1670,7 @@ fn every_inbox_batch_of_a_rid_is_withdrawn_before_a_forward() {
         policy: Policy::Client,
         rid: rid2,
         op: h.create("b"),
+        tag: Default::default(),
     });
     let (op, req) = s3_ops(&out)[0];
     assert!(matches!(req, S3Op::InboxTombstone { .. }));
@@ -1651,6 +1698,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
         policy: Policy::Client,
         rid: a,
         op: h.create("a"),
+        tag: Default::default(),
     });
     let req = match sends(&out)[0].1 {
         PeerMsg::MutateRequest { req, .. } => *req,
@@ -1664,6 +1712,7 @@ fn releasing_several_gated_ops_survives_the_nested_release() {
             policy: Policy::Client,
             rid: h.rid(seq),
             op: h.create("a"),
+            tag: Default::default(),
         });
         assert!(sends(&out).is_empty(), "op {seq} is gated: {out:?}");
     }
@@ -1709,6 +1758,7 @@ fn forward_through(
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     let sent = sends(&out);
     let [(1, request)] = sent.as_slice() else {
@@ -1801,6 +1851,7 @@ fn a_refusal_raises_observed_until_the_segment_lands() {
         policy: Policy::Client,
         rid: holder.rid(1),
         op: holder.create("a"),
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -1909,9 +1960,11 @@ fn the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit() {
         atime_ns: None,
         mtime_ns: None,
     };
-    h.meta.queue_replay(a(1), &truncate).unwrap();
     h.meta
-        .queue_replay(a(2), &set(Some(base), b"loser-from-a"))
+        .queue_replay(a(1), &truncate, &Default::default())
+        .unwrap();
+    h.meta
+        .queue_replay(a(2), &set(Some(base), b"loser-from-a"), &Default::default())
         .unwrap();
 
     h.hold(2, None);
@@ -2086,7 +2139,10 @@ fn a_queued_replay_blocks_reads_of_its_keys() {
     let requester = Harness::new(2);
     requester.meta.session().set_budget_ms(20);
     let op = requester.create("x");
-    requester.meta.queue_replay(requester.rid(1), &op).unwrap();
+    requester
+        .meta
+        .queue_replay(requester.rid(1), &op, &Default::default())
+        .unwrap();
     assert!(matches!(
         requester
             .meta
@@ -2128,6 +2184,7 @@ fn awaiting_log_forward(name: &str) -> (Harness, Rid, Vec<LogRecord>) {
         policy: Policy::Client,
         rid,
         op: op.clone(),
+        tag: Default::default(),
     });
     let sent = sends(&out);
     let [(1, PeerMsg::MutateRequest { req, .. })] = sent.as_slice() else {
@@ -2267,7 +2324,10 @@ fn a_stranded_replay_is_not_gated_behind_an_op_awaiting_a_dead_epochs_log() {
         new_name: "u".into(),
         noreplace: false,
     };
-    requester.meta.queue_replay(rid_r, &rename).unwrap();
+    requester
+        .meta
+        .queue_replay(rid_r, &rename, &Default::default())
+        .unwrap();
     // Node 3's epoch 2 is in the log: node 1's epoch is over.
     crate::replica::Replica::apply_segment(&requester.meta, 1, 2, 0, &[], &[], &[]).unwrap();
     requester.core.ship.max_epoch = 2;
@@ -2452,6 +2512,7 @@ mod own_chunks {
             policy: Policy::Client,
             rid,
             op,
+            tag: Default::default(),
         });
         assert!(uploads_awaited(&out).is_empty(), "not with the forward");
         let sent = sends(&out);
@@ -2551,6 +2612,7 @@ mod own_chunks {
             policy: Policy::Client,
             rid,
             op,
+            tag: Default::default(),
         });
         let sent = sends(&out);
         let [(1, request)] = sent.as_slice() else {
@@ -2664,6 +2726,7 @@ mod own_chunks {
                 manifest: vec![1, 2, 3],
                 size: 3,
             },
+            tag: Default::default(),
         });
         let [(1, PeerMsg::MutateRequest { req, .. })] = sends(&out)[..] else {
             panic!("expected a forward: {out:?}")
@@ -2968,6 +3031,7 @@ mod own_chunks {
             policy: Policy::Client,
             rid,
             op,
+            tag: Default::default(),
         });
         let [(1, PeerMsg::MutateRequest { req, .. })] = sends(&out)[..] else {
             panic!("expected a forward: {out:?}")
@@ -3061,6 +3125,7 @@ mod own_chunks {
                     acked_through: 0,
                     deps: constellation_meta::Position::ZERO,
                     applied,
+                    tag: Default::default(),
                 },
             });
             let [(2, reply @ PeerMsg::MutateReply { base, .. })] = sends(&out)[..] else {
@@ -3165,6 +3230,7 @@ mod own_chunks {
             acked_through: 0,
             deps: constellation_meta::Position::ZERO,
             applied: 0,
+            tag: Default::default(),
         };
         let tick = |holder: &mut Harness, ms: u64| {
             let out = holder.step(Event::Peer {
@@ -3401,6 +3467,7 @@ mod own_chunks {
             policy: Policy::Client,
             rid: x,
             op: requester.create("x"),
+            tag: Default::default(),
         });
         let [(1, first)] = sends(&out)[..] else {
             panic!("a forward: {out:?}")
@@ -3493,7 +3560,10 @@ mod own_chunks {
                 size: 3,
             };
             let out = if replay {
-                requester.meta.queue_replay(rid, &op).unwrap();
+                requester
+                    .meta
+                    .queue_replay(rid, &op, &Default::default())
+                    .unwrap();
                 let cfg = requester.core.cfg.clone();
                 requester.core = Core::new(cfg);
                 let mut out = Vec::new();
@@ -3520,6 +3590,7 @@ mod own_chunks {
                     policy: Policy::Client,
                     rid,
                     op,
+                    tag: Default::default(),
                 })
             };
             let req = sends(&out)
@@ -3628,6 +3699,7 @@ mod own_chunks {
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             }
         }
 
@@ -3896,6 +3968,7 @@ fn holder_segment(holder: &mut Harness, name: &str, seq: Seq) -> Vec<u8> {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -3988,6 +4061,7 @@ fn submit_create(holder: &mut Harness, seq: u64, name: &str) {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -4752,6 +4826,7 @@ mod cto {
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             },
         })
     }
@@ -4881,6 +4956,7 @@ mod cto {
                 name: "f".into(),
             },
             policy: Policy::Client,
+            tag: Default::default(),
         });
         assert!(replies(&out).is_empty(), "{out:?}");
         assert!(
@@ -4950,6 +5026,7 @@ mod cto {
             rid,
             op: setattr(ino),
             policy: Policy::Client,
+            tag: Default::default(),
         });
         assert!(replies(&out).is_empty(), "{out:?}");
         let rs = recalls(&out);
@@ -5063,7 +5140,12 @@ mod cto {
         let mut out = Vec::new();
         core.start(now, &meta, &mut out);
         let quarantine = timer_of(&out, TimerKind::GrantQuarantine);
-        let mut h = Harness { core, meta, now };
+        let mut h = Harness {
+            core,
+            meta,
+            now,
+            manual_horizon: false,
+        };
         h.hold(1, None);
         let out = forward(&mut h, 3, 9, 1, setattr(ino));
         assert!(mutate_replies(&out).is_empty(), "{out:?}");
@@ -5307,6 +5389,7 @@ mod epoch_rules {
                 policy: Policy::Client,
                 rid: learning,
                 op,
+                tag: Default::default(),
             });
             let (get, req) = s3_ops(&out)[0];
             assert!(matches!(req, S3Op::LeaseGet));
@@ -5317,6 +5400,7 @@ mod epoch_rules {
                 policy: Policy::Client,
                 rid: waiting,
                 op,
+                tag: Default::default(),
             });
             let (get2, _) = s3_ops(&out)[0];
             h.step(Event::S3 {
@@ -5348,6 +5432,7 @@ mod epoch_rules {
                 policy: Policy::Client,
                 rid: late,
                 op,
+                tag: Default::default(),
             });
             assert!(refused(&out, late), "frozen={frozen}: {out:?}");
             assert!(s3_ops(&out).is_empty(), "{out:?}");
@@ -5377,6 +5462,7 @@ mod epoch_rules {
             policy: Policy::Client,
             rid,
             op,
+            tag: Default::default(),
         });
         let [(1, PeerMsg::MutateRequest { req, .. })] = sends(&out)[..] else {
             panic!("expected a forward: {out:?}")
@@ -5423,7 +5509,7 @@ mod epoch_rules {
             });
             let rid = h.rid(1);
             let op = h.create("a");
-            h.meta.queue_replay(rid, &op).unwrap();
+            h.meta.queue_replay(rid, &op, &Default::default()).unwrap();
             h.step(refusing_epoch(frozen, vec![2]));
             let ticks = h.core.cfg.replay_lease_fallback_ms / h.core.cfg.replay_drain_ms + 4;
             for _ in 0..ticks {
@@ -5560,6 +5646,7 @@ mod epoch_rules {
             policy: Policy::Client,
             rid,
             op,
+            tag: Default::default(),
         });
         assert!(
             matches!(
@@ -5892,6 +5979,7 @@ mod refusal_outcomes {
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             },
         })
     }
@@ -7119,6 +7207,7 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     let Some((_, PeerMsg::MutateRequest { req, .. })) = sends(&out).first().copied() else {
         panic!(
@@ -7877,7 +7966,10 @@ mod backup_crash {
         let (holder, mut requester) = pair();
         let rid = requester.rid(1);
         let op = requester.create("x");
-        requester.meta.queue_replay(rid, &op).unwrap();
+        requester
+            .meta
+            .queue_replay(rid, &op, &Default::default())
+            .unwrap();
         // A fresh core over the store arms the replay drain.
         let cfg = requester.core.cfg.clone();
         requester.core = Core::new(cfg);
@@ -7912,6 +8004,7 @@ mod backup_crash {
             policy: Policy::Client,
             rid,
             op: op.clone(),
+            tag: Default::default(),
         });
         assert!(replies(&out).is_empty());
         let records = constellation_meta::execute_mutate(&holder.meta, &op, Some(rid)).unwrap();
@@ -7949,6 +8042,7 @@ mod backup_crash {
             policy: Policy::Client,
             rid,
             op: op.clone(),
+            tag: Default::default(),
         });
         let deadline = timers(&out, TimerKind::ClientDeadline)[0];
         assert!(!sends(&out).is_empty(), "forwarded: {out:?}");
@@ -7981,6 +8075,7 @@ mod backup_crash {
             policy: Policy::Client,
             rid,
             op: h.create("s"),
+            tag: Default::default(),
         });
         assert!(replies(&out).is_empty(), "parked for the segment: {out:?}");
         // The segment lands; the holder learns it only after its lease
@@ -8017,6 +8112,7 @@ mod backup_crash {
                 parent: ROOT_INO,
                 name: "missing".into(),
             },
+            tag: Default::default(),
         });
         assert!(replies(&out).is_empty(), "parked for the segment: {out:?}");
         let deadline = timers(&out, TimerKind::ClientDeadline)[0];
@@ -8103,6 +8199,7 @@ mod backup_crash {
                 core: Core::new(Config::defaults(2, 1)),
                 meta,
                 now: Ms(1_000_000),
+                manual_horizon: false,
             };
             let mut out = Vec::new();
             core.start(h.now, &h.meta, &mut out);
@@ -8967,6 +9064,7 @@ mod locks {
                 core,
                 meta: h.meta,
                 now: h.now.plus(10),
+                manual_horizon: false,
             };
             h.hold(2, None);
             h
@@ -8999,6 +9097,299 @@ mod locks {
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         assert!(matches!(lock(&mut h, 8, later), LockAnswer::WouldBlock));
         assert_eq!(h.core.stats.lock_grace_refusals, 1);
+    }
+
+    /// Lock-fence-token review must-fix 1: a renewal persists the restart
+    /// horizon as a grant does. The grant's own window ended long ago, its
+    /// renewed one has not: a sequencer restarted inside its lease grants
+    /// the lock to nobody else until the renewed window is over (it used to
+    /// regrant once the *grant*'s horizon passed, while the holder still
+    /// honoured its renewal).
+    #[test]
+    fn a_restart_waits_out_the_last_renewal_not_the_grant() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, false);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let granted_horizon = h.meta.load_lock_quarantine(h.now.0).unwrap();
+        let ttl = h.core.lock_ttl_ms();
+        let mut renewed_until = 0;
+        // Renew every half TTL until the grant's own horizon is long gone.
+        for i in 0..6 {
+            h.advance(ttl as u64 / 2);
+            h.hold(1, None);
+            let out = h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::LockRenew {
+                    req: OpId(20 + i),
+                    entries: vec![LockRenewEntry {
+                        ino,
+                        grant: g2,
+                        mode: X,
+                    }],
+                },
+            });
+            let [(2, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
+                panic!("{out:?}")
+            };
+            assert!(
+                matches!(results[0].2, LockRenewResult::Ok { .. }),
+                "{results:?}"
+            );
+            renewed_until = h.now.0 + ttl + h.core.lock_margin_ms();
+        }
+        assert!(h.now.0 > granted_horizon, "the grant's own horizon passed");
+        // Restart inside the lease (the holder's table is in memory).
+        let mut core = Core::new(h.core.cfg.clone());
+        core.start(h.now, &h.meta, &mut Vec::new());
+        let mut h = Harness {
+            core,
+            meta: h.meta,
+            now: h.now.plus(10),
+            manual_horizon: false,
+        };
+        h.hold(2, None);
+        let out = request(&mut h, 3, 30, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(30), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        h.now = Ms(renewed_until - 1);
+        let out = request(&mut h, 3, 31, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(31), LockOutcome::WouldBlock)]
+            ),
+            "still inside the renewed window: {out:?}"
+        );
+        let horizon = h.meta.load_lock_quarantine(h.now.0).unwrap();
+        assert!(horizon >= renewed_until, "{horizon} < {renewed_until}");
+        h.now = Ms(horizon + 1);
+        let out = request(&mut h, 3, 32, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(32), LockOutcome::Granted { .. })]
+            ),
+            "{out:?}"
+        );
+    }
+
+    fn horizon_writes(out: &[Action]) -> Vec<i64> {
+        out.iter()
+            .filter_map(|a| match a {
+                Action::PersistLockHorizon { until } => Some(*until),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn renewed(out: &[Action], to: NodeId) -> Option<Vec<LockRenewResult>> {
+        sends(out).into_iter().find_map(|(n, m)| match m {
+            PeerMsg::LockRenewed { results, .. } if n == to => {
+                Some(results.iter().map(|r| r.2).collect())
+            }
+            _ => None,
+        })
+    }
+
+    fn renew(h: &mut Harness, from: NodeId, req: u64, ino: Ino, grant: GrantId) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::LockRenew {
+                req: OpId(req),
+                entries: vec![LockRenewEntry {
+                    ino,
+                    grant,
+                    mode: X,
+                }],
+            },
+        })
+    }
+
+    /// Lock-fence-token fix round 4 (`git-under-flock-b2b` seed 7: one
+    /// renewal blocked the core 12 s on a 7.6 s sync, and another node's
+    /// grant lapsed meanwhile): the restart horizon is written off the
+    /// core. A slow write holds only the answers that need it; the core
+    /// keeps stepping — a refusal to another node goes out at once —
+    /// and grants made while the write is in flight coalesce into the
+    /// next write, which carries the highest horizon.
+    #[test]
+    fn a_slow_horizon_write_holds_only_the_answers_waiting_for_it() {
+        let (mut h, ino) = holder_with_file();
+        let other = {
+            let op = h.create("g");
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            ino
+        };
+        h.manual_horizon = true;
+        let out = request(&mut h, 2, 7, ino, X, false);
+        assert!(
+            lock_replies(&out).is_empty(),
+            "answered before durable: {out:?}"
+        );
+        let first = horizon_writes(&out);
+        assert_eq!(first.len(), 1, "{out:?}");
+        let g2 = h
+            .meta
+            .locks()
+            .own_grant(ino, 2, h.now.0)
+            .expect("in the table");
+        assert!(first[0] >= g2.until_ms);
+        // The core keeps stepping: node 3's refusal needs no horizon.
+        h.advance(2_000);
+        let out = request(&mut h, 3, 8, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(8), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        assert!(horizon_writes(&out).is_empty(), "{out:?}");
+        // A grant to node 4 meanwhile: held, and no second write in flight.
+        let out = request(&mut h, 4, 9, other, X, false);
+        assert!(lock_replies(&out).is_empty(), "{out:?}");
+        assert!(
+            horizon_writes(&out).is_empty(),
+            "one write at a time: {out:?}"
+        );
+        let g4 = h
+            .meta
+            .locks()
+            .own_grant(other, 4, h.now.0)
+            .expect("granted");
+        // The first write lands: node 2's answer only (node 4's window
+        // runs past it), and the next write carries node 4's.
+        let durable = h.meta.note_lock_grant_horizon(first[0]).unwrap();
+        assert!(durable < g4.until_ms, "the test needs a second write");
+        let out = h.step(Event::LockHorizonPersisted {
+            until: first[0],
+            durable: Some(durable),
+        });
+        let rs = lock_replies(&out);
+        let [(2, OpId(7), o)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        assert_eq!(granted(o).0, g2.id);
+        let second = horizon_writes(&out);
+        assert_eq!(second.len(), 1, "{out:?}");
+        assert!(second[0] >= g4.until_ms);
+        let durable = h.meta.note_lock_grant_horizon(second[0]).unwrap();
+        let out = h.step(Event::LockHorizonPersisted {
+            until: second[0],
+            durable: Some(durable),
+        });
+        let rs = lock_replies(&out);
+        let [(4, OpId(9), o)] = rs.as_slice() else {
+            panic!("{out:?}")
+        };
+        assert_eq!(granted(o).0, g4.id);
+        assert!(horizon_writes(&out).is_empty(), "{out:?}");
+        // Covered already: the next renewal inside it goes out at once.
+        let out = renew(&mut h, 2, 20, ino, g2.id);
+        assert!(
+            matches!(
+                renewed(&out, 2).as_deref(),
+                Some([LockRenewResult::Ok { .. }])
+            ),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.lock_horizon_writes, 2);
+    }
+
+    /// The safety rule the asynchronous write keeps: nothing is answered
+    /// before its horizon is durable, so a restart after a renewal that
+    /// was never answered waits out at least every window a peer was
+    /// told of — and the renewal's own once its write landed.
+    #[test]
+    fn a_restart_after_an_unanswered_renewal_never_under_reports_the_horizon() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, false);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let answered = h.meta.locks().get(g2).unwrap().until_ms;
+        let ttl = h.core.lock_ttl_ms();
+        h.manual_horizon = true;
+        h.advance(ttl as u64 / 2);
+        let out = renew(&mut h, 2, 20, ino, g2);
+        assert!(
+            renewed(&out, 2).is_none(),
+            "answered before durable: {out:?}"
+        );
+        let pending = horizon_writes(&out);
+        assert_eq!(pending.len(), 1, "{out:?}");
+        // Crash before the write lands: the restart waits out the window
+        // node 2 was told of.
+        let horizon = h.meta.load_lock_quarantine(h.now.0).expect("quarantined");
+        assert!(horizon >= answered, "{horizon} < {answered}");
+        // The write lands: the renewal is answered, and a restart from
+        // here waits out the renewed window.
+        let durable = h.meta.note_lock_grant_horizon(pending[0]).unwrap();
+        let out = h.step(Event::LockHorizonPersisted {
+            until: pending[0],
+            durable: Some(durable),
+        });
+        assert!(
+            matches!(
+                renewed(&out, 2).as_deref(),
+                Some([LockRenewResult::Ok { .. }])
+            ),
+            "{out:?}"
+        );
+        let renewed_until = h.meta.locks().get(g2).unwrap().until_ms;
+        assert!(renewed_until > answered);
+        let horizon = h.meta.load_lock_quarantine(h.now.0).expect("quarantined");
+        assert!(horizon >= renewed_until, "{horizon} < {renewed_until}");
+    }
+
+    /// A horizon write that fails refuses what it held, as the
+    /// synchronous write did: the grant `Busy` (and gone from the table,
+    /// so nobody waits it out), the renewal `NotOwner { 0 }`.
+    #[test]
+    fn a_failed_horizon_write_refuses_the_answers_it_held() {
+        let (mut h, ino) = holder_with_file();
+        h.manual_horizon = true;
+        let out = request(&mut h, 2, 7, ino, X, false);
+        let until = horizon_writes(&out)[0];
+        let out = h.step(Event::LockHorizonPersisted {
+            until,
+            durable: None,
+        });
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(2, OpId(7), LockOutcome::Busy)]
+            ),
+            "{out:?}"
+        );
+        assert!(h.meta.locks().own_grant(ino, 2, h.now.0).is_none());
+        assert_eq!(h.core.stats.lock_horizon_failed, 1);
+        // Asked again: a new write, and this time it lands.
+        h.manual_horizon = false;
+        let out = request(&mut h, 2, 8, ino, X, false);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.manual_horizon = true;
+        // Past the rounding of that write: the renewal needs a new one.
+        h.advance(2_000);
+        let out = renew(&mut h, 2, 20, ino, g2);
+        let until = horizon_writes(&out)[0];
+        let out = h.step(Event::LockHorizonPersisted {
+            until,
+            durable: None,
+        });
+        assert!(
+            matches!(
+                renewed(&out, 2).as_deref(),
+                Some([LockRenewResult::NotOwner { owner: 0 }])
+            ),
+            "{out:?}"
+        );
     }
 
     /// EC2 campaign 4 B-1: a lock orders *every* write of its previous
@@ -11639,6 +12030,48 @@ mod locks {
         })
     }
 
+    // ---- plan 30 §M14 phase 2: the fencing token ----
+
+    use constellation_meta::locks::{LockTag, LockToken};
+
+    fn token(grant: GrantId, until_ms: i64) -> LockTag {
+        LockTag(vec![LockToken { grant, until_ms }])
+    }
+
+    fn setattr_mtime(ino: Ino, mtime_ns: i64) -> MutateOp {
+        MutateOp::Setattr {
+            ino,
+            mode: None,
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: Some(mtime_ns),
+        }
+    }
+
+    fn forward_tagged(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        rid: Rid,
+        op: MutateOp,
+        tag: LockTag,
+    ) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(req),
+                rid,
+                op,
+                acked_through: 0,
+                deps: Position::ZERO,
+                tag,
+                applied: 0,
+            },
+        })
+    }
+
     /// An open epoch's rounds are its probes: the sync interval at first
     /// (an epoch carrying no lease used to probe every 10 s once idle,
     /// refusing writes with `EROFS` that long after S3 returned), backed
@@ -11685,6 +12118,1124 @@ mod locks {
         // Closed: the idle backoff again.
         h.step(epoch_report(false, false, false, &[1, 2], None));
         assert_ne!(h.core.next_poll_ms(h.now), 4 * base);
+    }
+
+    fn mutate_reply(out: &[Action], to: NodeId, req: u64) -> MutateOutcome {
+        sends(out)
+            .into_iter()
+            .find_map(|(t, m)| match m {
+                PeerMsg::MutateReply {
+                    req: r, outcome, ..
+                } if t == to && *r == OpId(req) => Some(outcome.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no reply to node {to}'s request {req}: {out:?}"))
+    }
+
+    fn peer_rid(node: NodeId, seq: u64) -> Rid {
+        Rid {
+            node,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    fn mtime(h: &Harness, ino: Ino) -> i64 {
+        MetaStore::getattr(&h.meta, ino).unwrap().unwrap().mtime_ns
+    }
+
+    /// The gap phase 1 left (Kleppmann's fencing-token argument): node 2's
+    /// write passes its node-local fence while its grant is honoured, then
+    /// stalls (a SIGSTOPped daemon, a forward stuck in flight) past the
+    /// grant; the sequencer outwaits the grant and gives the lock to node
+    /// 3, which writes under it; then node 2's stalled forward arrives.
+    /// It carries its token — the grant and the window node 2 honoured it
+    /// for — and the sequencer refuses it: `LockLapsed`, nothing executed,
+    /// nothing journaled (no `Refused` row either), and a retry of the
+    /// same rid is refused the same way. Node 3's write stands.
+    #[test]
+    fn a_forward_stalled_past_its_grant_is_refused_after_the_next_holders_write() {
+        let (mut h, ino) = holder_with_file();
+        let data = h.create("data");
+        let MutateOp::Create { ino: data_ino, .. } = data else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &data, None).unwrap();
+        let t0 = h.now;
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, ttl) = granted(&lock_replies(&out)[0].2);
+        // What node 2 honours the grant for: `sent + ttl − margin`.
+        let window2 = t0.0 + ttl as i64 - 1_000;
+        // Node 2's write passed its fence at `window2 − 100`, then stalled.
+        // The sequencer records the grant until `granted + ttl + margin`:
+        // past that, node 3 gets the lock.
+        h.now = t0.plus(ttl + 1_000 + 1);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        let (g3, _) = granted(&lock_replies(&out)[0].2);
+        let window3 = h.now.0 + ttl as i64 - 1_000;
+        let out = forward_tagged(
+            &mut h,
+            3,
+            20,
+            peer_rid(3, 1),
+            setattr_mtime(data_ino, 3),
+            token(g3, window3),
+        );
+        assert!(
+            matches!(mutate_reply(&out, 3, 20), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, data_ino), 3);
+        // Node 2's stalled forward lands now.
+        let next = crate::replica::Replica::journal_next_seq(&h.meta).unwrap();
+        let rid2 = peer_rid(2, 1);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            21,
+            rid2,
+            setattr_mtime(data_ino, 2),
+            token(g2, window2),
+        );
+        assert_eq!(mutate_reply(&out, 2, 21), MutateOutcome::LockLapsed);
+        assert_eq!(mtime(&h, data_ino), 3, "node 3's write stands");
+        assert_eq!(
+            crate::replica::Replica::journal_next_seq(&h.meta).unwrap(),
+            next,
+            "nothing journaled"
+        );
+        assert!(h.meta.completed_outcome(rid2).unwrap().is_none());
+        // Its retry by rid (the reply was lost) is refused again.
+        h.advance(200);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            22,
+            rid2,
+            setattr_mtime(data_ino, 2),
+            token(g2, window2),
+        );
+        assert_eq!(mutate_reply(&out, 2, 22), MutateOutcome::LockLapsed);
+        assert_eq!(h.core.stats.lock_lapsed_refusals, 2);
+        assert_eq!(h.meta.locks().stats().token_rejections, 2);
+    }
+
+    /// The same op, landing while the grant is still honoured, executes:
+    /// the token costs a live holder nothing.
+    #[test]
+    fn a_forward_inside_its_grant_executes() {
+        let (mut h, ino) = holder_with_file();
+        let t0 = h.now;
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, ttl) = granted(&lock_replies(&out)[0].2);
+        h.advance(ttl - 1_100);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            21,
+            peer_rid(2, 1),
+            setattr_mtime(ino, 2),
+            token(g2, t0.0 + ttl as i64 - 1_000),
+        );
+        assert!(
+            matches!(mutate_reply(&out, 2, 21), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, ino), 2);
+        assert_eq!(h.meta.locks().stats().token_rejections, 0);
+    }
+
+    /// Lock-fence-token review must-fix 2: the minter judges a grant it
+    /// holds live exactly. Its holder kept renewing, so an op whose token
+    /// window has passed (it was taken before a slow flush, or a forward
+    /// was retried) still executes there; once the minter's own record
+    /// has expired (outwaited) it is refused.
+    #[test]
+    fn the_minter_accepts_a_renewed_grants_op_past_its_token_window() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, ttl) = granted(&lock_replies(&out)[0].2);
+        let stale_window = h.now.0 + 100;
+        h.advance(ttl / 2);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(20),
+                entries: vec![LockRenewEntry {
+                    ino,
+                    grant: g2,
+                    mode: X,
+                }],
+            },
+        });
+        assert!(!sends(&out).is_empty());
+        let out = forward_tagged(
+            &mut h,
+            2,
+            21,
+            peer_rid(2, 1),
+            setattr_mtime(ino, 2),
+            token(g2, stale_window),
+        );
+        assert!(
+            matches!(mutate_reply(&out, 2, 21), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, ino), 2);
+        // Never renewed again: the record runs out, the grant is dead.
+        let record = h.meta.locks().grants_snapshot()[0].until_ms;
+        h.now = Ms(record);
+        h.hold(1, None);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            22,
+            peer_rid(2, 2),
+            setattr_mtime(ino, 3),
+            token(g2, record + 1_000),
+        );
+        assert_eq!(mutate_reply(&out, 2, 22), MutateOutcome::LockLapsed);
+        assert_eq!(mtime(&h, ino), 2);
+    }
+
+    /// The minting sequencer knows releases exactly: a token naming a
+    /// grant its holder released is refused at once, inside the window.
+    #[test]
+    fn the_minter_refuses_a_released_grants_token_inside_its_window() {
+        let (mut h, ino) = holder_with_file();
+        let t0 = h.now;
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, ttl) = granted(&lock_replies(&out)[0].2);
+        h.advance(100);
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: Position::ZERO,
+            },
+        });
+        let out = forward_tagged(
+            &mut h,
+            2,
+            21,
+            peer_rid(2, 1),
+            setattr_mtime(ino, 2),
+            token(g2, t0.0 + ttl as i64 - 1_000),
+        );
+        assert_eq!(mutate_reply(&out, 2, 21), MutateOutcome::LockLapsed);
+    }
+
+    /// A sequencer that did not mint the grant (the git case: the lock
+    /// file is the root's, the objects live in a delegated subtree) judges
+    /// the token by its window alone, on its own clock.
+    #[test]
+    fn a_sequencer_that_did_not_mint_the_grant_checks_the_window() {
+        let (mut h, ino) = holder_with_file();
+        let foreign = GrantId { node: 9, seq: 4 };
+        let until = h.now.0 + 50;
+        let out = forward_tagged(
+            &mut h,
+            2,
+            21,
+            peer_rid(2, 1),
+            setattr_mtime(ino, 2),
+            token(foreign, until),
+        );
+        assert!(
+            matches!(mutate_reply(&out, 2, 21), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        h.advance(50);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            22,
+            peer_rid(2, 2),
+            setattr_mtime(ino, 3),
+            token(foreign, until),
+        );
+        assert_eq!(mutate_reply(&out, 2, 22), MutateOutcome::LockLapsed);
+        assert_eq!(mtime(&h, ino), 2);
+    }
+
+    /// An op of the holder's own client, executed here (the core's local
+    /// path), is checked the same way.
+    #[test]
+    fn the_holders_own_op_under_a_lapsed_grant_is_refused() {
+        let (mut h, ino) = holder_with_file();
+        let next = crate::replica::Replica::journal_next_seq(&h.meta).unwrap();
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            rid,
+            op: setattr_mtime(ino, 7),
+            policy: Policy::Client,
+            tag: token(GrantId { node: 1, seq: 1 }, h.now.0 - 1),
+        });
+        let rs = replies(&out);
+        assert!(
+            matches!(
+                rs.as_slice(),
+                [(r, ClientReply::Outcome(MutateOutcome::LockLapsed))] if *r == rid
+            ),
+            "{out:?}"
+        );
+        assert_eq!(
+            crate::replica::Replica::journal_next_seq(&h.meta).unwrap(),
+            next
+        );
+        assert_ne!(mtime(&h, ino), 7);
+    }
+
+    /// Layer A: a stranded op replayed by rid after a holder change carries
+    /// its token (persisted with its replay row). The forward goes out with
+    /// it; the sequencer refuses it; the replay is settled as refused (its
+    /// conflict copy keeps what it would have written aside) and is never
+    /// sent again — the requester does not loop.
+    #[test]
+    fn a_replay_by_rid_carries_its_token_and_a_lapsed_one_is_not_resent() {
+        let mut r = requester();
+        let op = r.create("x");
+        let rid = r.rid(1);
+        let dead = token(GrantId { node: 1, seq: 5 }, r.now.0 - 10);
+        r.meta.queue_replay(rid, &op, &dead).unwrap();
+        let mut out = Vec::new();
+        r.core.on_drain_tick(r.now, &r.meta, &mut out);
+        let req = match sends(&out).as_slice() {
+            [(
+                1,
+                PeerMsg::MutateRequest {
+                    req, rid: rr, tag, ..
+                },
+            )] => {
+                assert_eq!(*rr, rid);
+                assert_eq!(*tag, dead, "the replay carries its token");
+                *req
+            }
+            other => panic!("expected the replay's forward: {other:?}"),
+        };
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::MutateReply {
+                req,
+                outcome: MutateOutcome::LockLapsed,
+                base: None,
+                position: Position::ZERO,
+                gen: 0,
+                own_chunks: OwnChunks::None,
+                own_rows: None,
+            },
+        });
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+            "{out:?}"
+        );
+        let queued = r.meta.pending_replays().unwrap();
+        assert!(
+            queued.iter().all(|q| q.refused.is_some()),
+            "settled as refused: {queued:?}"
+        );
+        for _ in 0..3 {
+            r.advance(500);
+            let mut out = Vec::new();
+            r.core.on_drain_tick(r.now, &r.meta, &mut out);
+            assert!(
+                !sends(&out)
+                    .iter()
+                    .any(|(_, m)| matches!(m, PeerMsg::MutateRequest { .. })),
+                "a refused replay is never resent: {out:?}"
+            );
+        }
+    }
+
+    /// The takeover gate's local replay checks the token too.
+    #[test]
+    fn a_local_replay_under_a_lapsed_grant_is_refused() {
+        let (mut h, ino) = holder_with_file();
+        let rid = peer_rid(2, 9);
+        h.meta
+            .queue_replay(
+                rid,
+                &setattr_mtime(ino, 5),
+                &token(GrantId { node: 1, seq: 5 }, h.now.0 - 10),
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        h.core
+            .replay_queue_locally(h.now, &h.meta, &mut out)
+            .unwrap();
+        assert_ne!(mtime(&h, ino), 5, "not executed");
+        let queued = h.meta.pending_replays().unwrap();
+        assert!(
+            queued.iter().all(|q| q.refused.is_some()),
+            "refused: {queued:?}"
+        );
+    }
+
+    /// Release ordering: a recalled grant is not released while an op
+    /// tagged with it is in flight, nor while one left in doubt may still
+    /// execute somewhere (until its token's window is over) — released
+    /// earlier, it could land after the next holder's writes at a
+    /// sequencer that only checks the window.
+    #[test]
+    fn a_release_waits_for_the_ops_tagged_with_its_grant() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(3),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let g = GrantId { node: 1, seq: 3 };
+        let held = r.meta.locks().held(42).unwrap();
+        let tag = token(g, held.until_ms);
+        // The application locked, wrote, unlocked.
+        let local = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(
+            r.meta.locks().local_set(42, local, r.now.0),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.now.0));
+        // Two ops tagged with the grant: one in flight, one ends in doubt.
+        r.meta.locks().tag_begin(&tag, r.now.0);
+        r.meta.locks().tag_begin(&tag, r.now.0);
+        r.meta.locks().tag_end(&tag, true, r.now.0);
+        // Recalled with nothing under it: flushed, but not released.
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: g,
+            },
+        });
+        assert!(out
+            .iter()
+            .any(|a| matches!(a, Action::LockFlush { ino: 42, .. })));
+        let out = r.step(Event::LockFlushed {
+            ino: 42,
+            grant: g,
+            ok: true,
+        });
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::LockReleased { .. })),
+            "released with a tagged op in flight: {out:?}"
+        );
+        let mut wait = timer_of(&out, TimerKind::LockReleaseWait);
+        assert_eq!(r.meta.locks().stats().release_waits, 1);
+        // The op in flight is answered; the in-doubt one still pins the
+        // grant until its window is over.
+        r.advance(10);
+        r.meta.locks().tag_end(&tag, false, r.now.0);
+        let out = r.step(Event::Timer { id: wait });
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::LockReleased { .. })),
+            "released while an in-doubt op may still land: {out:?}"
+        );
+        wait = timer_of(&out, TimerKind::LockReleaseWait);
+        r.now = Ms(held.until_ms);
+        let out = r.step(Event::Timer { id: wait });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockReleased { .. }))
+                || r.meta.locks().held(42).is_none(),
+            "released (or lapsed) once the window is over: {out:?}"
+        );
+        assert_eq!(r.meta.locks().stats().release_waits, 1);
+    }
+
+    /// A requester holding grant `g` (seq 3) on inode 42 with nothing
+    /// under it, recalled and flushed while `pin` keeps the release
+    /// waiting: the release's actions and its wait timer.
+    fn recalled_and_waiting(
+        r: &mut Harness,
+        pin: impl FnOnce(&Harness, GrantId, i64),
+    ) -> (GrantId, Vec<Action>) {
+        let req = lock_control(r, 50, 42, true);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(3),
+            },
+        });
+        let g = GrantId { node: 1, seq: 3 };
+        let until = r.meta.locks().held(42).unwrap().until_ms;
+        let local = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        r.meta.locks().local_set(42, local, r.now.0);
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.now.0));
+        pin(r, g, until);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: g,
+            },
+        });
+        let out = r.step(Event::LockFlushed {
+            ino: 42,
+            grant: g,
+            ok: true,
+        });
+        assert!(!released(&out), "released while pinned: {out:?}");
+        (g, out)
+    }
+
+    fn released(out: &[Action]) -> bool {
+        sends(out)
+            .iter()
+            .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockReleased { .. }))
+    }
+
+    /// Review nit: the release waiting for a tagged op is woken by the
+    /// op's end (`Control::LockReleaseWake`, which the FUSE thread's
+    /// `tag_end` sends), not found by a 10 ms poll; the poll stays only
+    /// as a slow fallback.
+    #[test]
+    fn the_last_tagged_op_wakes_a_waiting_release() {
+        let mut r = requester();
+        let (g, out) = recalled_and_waiting(&mut r, |r, g, until| {
+            r.meta.locks().tag_begin(&token(g, until), r.now.0);
+        });
+        let wait = timer_of(&out, TimerKind::LockReleaseWait);
+        let at = r.core.timers.get(&wait).map(|t| t.1).unwrap();
+        assert!(at.0 >= r.now.0 + 200, "a slow fallback poll: {at:?}");
+        let until = r.meta.locks().held(42).unwrap().until_ms;
+        r.meta.locks().tag_end(&token(g, until), false, r.now.0);
+        let out = r.step(Event::Control {
+            op: OpId(90),
+            req: Control::LockReleaseWake { ino: 42 },
+        });
+        assert!(released(&out), "{out:?}");
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::CancelTimer { id } if *id == wait)),
+            "the fallback poll is cancelled: {out:?}"
+        );
+        // A wake with no release waiting does nothing.
+        let out = r.step(Event::Control {
+            op: OpId(91),
+            req: Control::LockReleaseWake { ino: 42 },
+        });
+        assert!(!released(&out));
+    }
+
+    /// Release ordering covers stranded ops too: one tagged with the
+    /// grant and queued for replay by rid (after a holder change) keeps
+    /// the release waiting until it is resolved — released earlier, its
+    /// replay could land after the next holder's writes at an executor
+    /// that only checks the window.
+    #[test]
+    fn a_queued_replay_tagged_with_the_grant_holds_its_release() {
+        let mut r = requester();
+        let rid = Rid {
+            node: 2,
+            incarnation: 1,
+            seq: 5,
+        };
+        let (_, out) = recalled_and_waiting(&mut r, |r, g, until| {
+            let op = MutateOp::Setattr {
+                ino: 42,
+                mode: Some(0o600),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+            };
+            r.meta.queue_replay(rid, &op, &token(g, until)).unwrap();
+        });
+        let wait = timer_of(&out, TimerKind::LockReleaseWait);
+        let queued = r.meta.pending_replays().unwrap();
+        r.meta.forget_replay(queued[0].queue_seq).unwrap();
+        r.advance(300);
+        let out = r.step(Event::Timer { id: wait });
+        assert!(released(&out), "resolved: released: {out:?}");
+    }
+
+    // ---- the token composed with kept tenures (650acc8) ----
+
+    fn grant_ids(h: &Harness) -> Vec<GrantId> {
+        let mut ids: Vec<GrantId> = h
+            .meta
+            .locks()
+            .grants_snapshot()
+            .iter()
+            .map(|g| g.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The close of a continuation epoch that `holder_with_grants_in_an_epoch`
+    /// opened, as the driver reports it once S3 is back, then the
+    /// re-claim (brought by a blocking lock on a fresh inode) replacing
+    /// `object`, the lease the close let go.
+    fn close_and_reclaim(h: &mut Harness, members: &[NodeId], object: &mut Lease) {
+        let carried = h.core.pr.carried;
+        h.step(epoch_report(false, false, false, members, carried));
+        reclaim(h, members, object);
+    }
+
+    fn reclaim(h: &mut Harness, members: &[NodeId], object: &mut Lease) {
+        assert!(h.core.epoch_reclaim_pending(h.now));
+        let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(1 << 30),
+            req: Control::Lock {
+                ino: fresh,
+                mode: X,
+                blocking: true,
+            },
+        });
+        epoch_pump(h, members, object, out);
+        assert_eq!(object.holder, h.core.node_id());
+        assert!(
+            h.core.pr.closed_tenure.is_empty(),
+            "settled by the re-claim"
+        );
+    }
+
+    /// Review (lock-fence-token × 650acc8): a fencing token survives a
+    /// kept tenure. The grants keep their ids across a continuation
+    /// epoch's close and the re-claim, so an op tagged before the close —
+    /// a peer's forward, the holder's own op — still passes at the minter
+    /// after the re-claim while its grant is live in the kept table, even
+    /// past the window it set out with. Where another tenure intervened
+    /// the table is dropped, and the same token is judged by its window.
+    #[test]
+    fn a_token_taken_before_an_epoch_close_passes_after_the_reclaim() {
+        let (mut h, ino, peer_ino, peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        let own = h.meta.locks().held(ino).unwrap().id;
+        let before = grant_ids(&h);
+        let peer_tag = token(peer_grant, h.now.0 + 100);
+        let own_tag = token(own, h.now.0 + 100);
+        h.advance(500);
+        close_and_reclaim(&mut h, &[1, 2], &mut object);
+        let after = grant_ids(&h);
+        assert!(
+            before.iter().all(|id| after.contains(id)),
+            "the same grant ids: {before:?} → {after:?}"
+        );
+        assert!(h.now.0 > peer_tag.until_ms(), "past the tokens' windows");
+        let out = forward_tagged(
+            &mut h,
+            2,
+            40,
+            peer_rid(2, 1),
+            setattr_mtime(peer_ino, 2),
+            peer_tag.clone(),
+        );
+        assert!(
+            matches!(mutate_reply(&out, 2, 40), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, peer_ino), 2);
+        let rid = h.rid(1);
+        let out = h.step(Event::Submit {
+            rid,
+            op: setattr_mtime(ino, 1),
+            policy: Policy::Client,
+            tag: own_tag,
+        });
+        assert!(
+            !replies(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, ClientReply::Outcome(MutateOutcome::LockLapsed))),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, ino), 1);
+        assert_eq!(h.meta.locks().stats().token_rejections, 0);
+
+        // Another tenure intervened (node 2 held the lease in between):
+        // the kept table is dropped, and the token, past its window, is
+        // refused.
+        let (mut h, _ino, peer_ino, peer_grant, object) = holder_with_grants_in_an_epoch();
+        let peer_tag = token(peer_grant, h.now.0 + 100);
+        h.advance(500);
+        let carried = h.core.pr.carried;
+        h.step(epoch_report(false, false, false, &[1, 2], carried));
+        let mut other = lease_of(2, object.epoch + 1, h.now.0 + 5_000);
+        other.released = true;
+        let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = h.step(Event::Control {
+            op: OpId(9),
+            req: Control::Lock {
+                ino: fresh,
+                mode: X,
+                blocking: true,
+            },
+        });
+        epoch_pump(&mut h, &[1, 2], &mut other, out);
+        assert_eq!(h.meta.locks().grants_len(), 0, "a tenure intervened");
+        let out = forward_tagged(
+            &mut h,
+            2,
+            41,
+            peer_rid(2, 1),
+            setattr_mtime(peer_ino, 2),
+            peer_tag,
+        );
+        assert_eq!(mutate_reply(&out, 2, 41), MutateOutcome::LockLapsed);
+        assert_ne!(mtime(&h, peer_ino), 2);
+    }
+
+    /// Review (lock-fence-token × 650acc8): the release ordering against
+    /// the one-shot `keep_grants`. The holder's own grant is recalled
+    /// (node 3 waits for it) while a write tagged with it is in flight,
+    /// so its release waits — through a continuation epoch's close that
+    /// keeps the grant table. Once the write is answered, inside the
+    /// re-claim window, the release ends the grant in the kept table (it
+    /// was dropped there, and the grant outwaited before node 3 was
+    /// served); the peer's grant stands through the re-claim; and the
+    /// close consumed its keep: a real lease loss afterwards drops the
+    /// table.
+    #[test]
+    fn a_release_waiting_through_a_kept_close_ends_its_grant_in_the_kept_table() {
+        let (mut h, ino, _peer_ino, peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        let own = h.meta.locks().held(ino).unwrap();
+        let own_record = h.meta.locks().get(own.id).unwrap().until_ms;
+        let tag = token(own.id, own.until_ms);
+        let out = request(&mut h, 3, 30, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        assert!(h.meta.locks().held(ino).unwrap().recalled);
+        h.meta.locks().tag_begin(&tag, h.now.0);
+        assert!(h.meta.locks().local_unlock(ino, 9, 0, u64::MAX, h.now.0));
+        let out = h.step(Event::Control {
+            op: OpId(6),
+            req: Control::LockIdle { ino },
+        });
+        let flush = out
+            .iter()
+            .find_map(|a| match a {
+                Action::LockFlush { ino: i, grant } if *i == ino => Some(*grant),
+                _ => None,
+            })
+            .expect("a flush before the release");
+        let out = h.step(Event::LockFlushed {
+            ino,
+            grant: flush,
+            ok: true,
+        });
+        let wait = timer_of(&out, TimerKind::LockReleaseWait);
+        assert!(h.meta.locks().held(ino).is_some(), "the release waits");
+        // S3 is back: the close keeps the table; the waiter is told to wait.
+        let carried = h.core.pr.carried;
+        let out = h.step(epoch_report(false, false, false, &[1, 2, 3], carried));
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(30), LockOutcome::Waiting { .. })]
+            ),
+            "{out:?}"
+        );
+        assert_eq!(h.meta.locks().grants_len(), 2, "kept for the re-claim");
+        // The fallback poll in the window: the write still pins it.
+        h.advance(10);
+        let out = h.step(Event::Timer { id: wait });
+        timer_of(&out, TimerKind::LockReleaseWait);
+        assert!(h.meta.locks().held(ino).is_some());
+        // The write is answered: the release ends the grant here.
+        h.meta.locks().tag_end(&tag, false, h.now.0);
+        h.step(Event::Control {
+            op: OpId(7),
+            req: Control::LockReleaseWake { ino },
+        });
+        assert!(h.meta.locks().held(ino).is_none());
+        assert!(
+            h.meta.locks().get(own.id).is_none(),
+            "ended in the kept table, not left to be outwaited"
+        );
+        assert!(h.meta.locks().check_tag(&tag, h.now.0).is_err());
+        assert_eq!(grant_ids(&h), vec![peer_grant]);
+        reclaim(&mut h, &[1, 2, 3], &mut object);
+        assert!(
+            grant_ids(&h).contains(&peer_grant),
+            "the peer's grant stands"
+        );
+        assert!(h.meta.locks().get(own.id).is_none());
+        // Node 3 is served at once, long before the grant's record ran out.
+        let out = request(&mut h, 3, 31, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(31), LockOutcome::Granted { .. })]
+            ),
+            "{out:?}"
+        );
+        assert!(h.now.0 < own_record);
+        // The keep was the close's alone: a real loss drops the table.
+        h.core.lease.force_lost();
+        let now = h.now;
+        h.core.deleg_on_lease_gone(now, &h.meta, &mut Vec::new());
+        assert_eq!(h.meta.locks().grants_len(), 0, "the keep leaked");
+    }
+
+    /// Review (lock-fence-token × 650acc8): in the re-claim window the
+    /// owner answers from its kept table — a non-blocking request a kept
+    /// grant conflicts with `WouldBlock`, any other `Waiting` (which
+    /// grants nothing) — and a forward tagged with a kept grant is
+    /// neither executed nor refused for its token there: no lease, no
+    /// executor. Re-sent after the re-claim it passes (the grant is live
+    /// in the kept table); once the grant's record has run out (nothing
+    /// renewed it, and `Waiting` granted nothing over it) its token is
+    /// refused.
+    #[test]
+    fn a_tagged_forward_in_the_reclaim_window_is_judged_after_the_reclaim() {
+        let (mut h, _ino, peer_ino, peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        let record = h.meta.locks().get(peer_grant).unwrap().until_ms;
+        let tag = token(peer_grant, h.now.0 + 100);
+        let carried = h.core.pr.carried;
+        h.step(epoch_report(false, false, false, &[1, 2, 3], carried));
+        assert!(h.core.epoch_reclaim_pending(h.now));
+        let out = request(&mut h, 3, 30, peer_ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(30), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        let other = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let out = request(&mut h, 3, 31, other, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(31), LockOutcome::Waiting { .. })]
+            ),
+            "{out:?}"
+        );
+        let rid = peer_rid(2, 1);
+        let out = forward_tagged(&mut h, 2, 40, rid, setattr_mtime(peer_ino, 2), tag.clone());
+        let early = sends(&out).into_iter().find_map(|(t, m)| match m {
+            PeerMsg::MutateReply { req, outcome, .. } if t == 2 && *req == OpId(40) => {
+                Some(outcome.clone())
+            }
+            _ => None,
+        });
+        assert!(matches!(early, Some(MutateOutcome::Held { .. })), "{out:?}");
+        assert_ne!(mtime(&h, peer_ino), 2);
+        assert_eq!(h.meta.locks().stats().token_rejections, 0);
+        // The forward itself brings the re-claim (`Held`: re-sent).
+        h.advance(500);
+        epoch_pump(&mut h, &[1, 2, 3], &mut object, out);
+        assert_eq!(object.holder, 1);
+        assert!(
+            h.core.pr.closed_tenure.is_empty(),
+            "settled by the re-claim"
+        );
+        let out = forward_tagged(&mut h, 2, 41, rid, setattr_mtime(peer_ino, 2), tag);
+        assert!(
+            matches!(mutate_reply(&out, 2, 41), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, peer_ino), 2);
+        h.now = Ms(record);
+        h.hold(object.epoch, None);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            42,
+            peer_rid(2, 2),
+            setattr_mtime(peer_ino, 3),
+            token(peer_grant, record + 1_000),
+        );
+        assert_eq!(mutate_reply(&out, 2, 42), MutateOutcome::LockLapsed);
+        assert_eq!(mtime(&h, peer_ino), 2);
+    }
+
+    /// Review (lock-fence-token × 650acc8): the restart horizon persisted
+    /// on renewals covers kept grants. A peer's grant kept through a
+    /// close and renewed after the re-claim moves the horizon to its new
+    /// record, so a restart there grants nothing over it until then —
+    /// and a token naming it, which the restarted node judges by its
+    /// window alone (its table is gone), can no longer be inside its
+    /// window once a conflicting grant is possible.
+    #[test]
+    fn a_kept_grants_renewal_after_the_reclaim_moves_the_restart_horizon() {
+        let (mut h, _ino, peer_ino, peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        h.advance(500);
+        close_and_reclaim(&mut h, &[1, 2], &mut object);
+        h.advance(2_000);
+        let sent = h.now;
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(70),
+                entries: vec![LockRenewEntry {
+                    ino: peer_ino,
+                    grant: peer_grant,
+                    mode: X,
+                }],
+            },
+        });
+        let ttl = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::LockRenewed { results, .. } if to == 2 => match results.as_slice() {
+                    [(_, id, LockRenewResult::Ok { ttl_ms, .. })] if *id == peer_grant => {
+                        Some(*ttl_ms as i64)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the kept grant renewed: {out:?}"));
+        let record = h.meta.locks().get(peer_grant).unwrap().until_ms;
+        let window = sent.0 + ttl - h.core.lock_margin_ms();
+        // The restart.
+        let cfg = h.core.cfg.clone();
+        h.core = Core::new(cfg);
+        let now = h.now;
+        h.core.start(now, &h.meta, &mut Vec::new());
+        let horizon = h
+            .meta
+            .load_lock_quarantine(h.now.0)
+            .expect("quarantined by the renewal");
+        assert!(horizon >= record, "{horizon} < {record}");
+        assert!(horizon >= window + 2 * h.core.lock_margin_ms());
+        h.hold(object.epoch + 1, None);
+        let out = request(&mut h, 3, 30, peer_ino, X, false);
+        assert!(
+            !matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(30), LockOutcome::Granted { .. })]
+            ),
+            "granted over a renewed kept grant after a restart: {out:?}"
+        );
+    }
+
+    /// Review round 2, should-fix 4 (composition with `lock-release-drop`):
+    /// the re-claim's lease CAS ends in doubt and the acquisition re-reads
+    /// the lease (`Phase::CasReread`). A forward tagged with a kept grant
+    /// arriving then is answered `Held` as in the rest of the re-claim
+    /// window: not executed, not refused for its token. Once the re-read
+    /// finds the CAS landed, the re-sent forward passes.
+    #[test]
+    fn a_tagged_forward_in_the_cas_reread_window_is_held() {
+        let (mut h, _ino, peer_ino, peer_grant, mut object) = holder_with_grants_in_an_epoch();
+        let tag = token(peer_grant, h.now.0 + 100);
+        let carried = h.core.pr.carried;
+        h.step(epoch_report(false, false, false, &[1, 2, 3], carried));
+        assert!(h.core.epoch_reclaim_pending(h.now));
+        let rid = peer_rid(2, 1);
+        // The forward brings the re-claim.
+        let mut out = forward_tagged(&mut h, 2, 40, rid, setattr_mtime(peer_ino, 2), tag.clone());
+        if let Some(id) = h.core.poll_timer {
+            out.extend(h.step(Event::Timer { id }));
+        }
+        let mut reread = None;
+        for _ in 0..400 {
+            let mut next = Vec::new();
+            for action in std::mem::take(&mut out) {
+                match action {
+                    Action::S3 { op, req } => {
+                        let result = match req {
+                            S3Op::LeaseGet if reread.is_none() => {
+                                S3Result::LeaseGet(Ok(Some((object.clone(), super::tag()))))
+                            }
+                            S3Op::LeaseGet => {
+                                reread = Some(op);
+                                continue;
+                            }
+                            S3Op::LeaseSwap { lease, .. } | S3Op::LeaseCreate { lease } => {
+                                // Lands, but the answer is a timeout.
+                                object = lease;
+                                reread = Some(OpId(0));
+                                S3Result::LeasePut(Err(CasFailure::Failed("timeout".into())))
+                            }
+                            S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                            S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                            S3Op::InboxDrain { .. } => S3Result::InboxDrain(Ok(Vec::new())),
+                            S3Op::HeartbeatRead => S3Result::Heartbeats(Ok(Vec::new())),
+                            _ => continue,
+                        };
+                        next.extend(h.step(Event::S3 { op, result }));
+                    }
+                    Action::SetTimer {
+                        id,
+                        kind: TimerKind::Poll | TimerKind::LockRetry,
+                        ..
+                    } => next.extend(h.step(Event::Timer { id })),
+                    Action::EpochClose => next.extend(h.step(epoch_report(
+                        false,
+                        false,
+                        true,
+                        &[1, 2, 3],
+                        h.core.pr.carried,
+                    ))),
+                    Action::UploadDirtyChunks { op, .. } => {
+                        next.extend(h.step(Event::UploadsDone {
+                            op,
+                            result: UploadResult::Done { held: 0 },
+                        }))
+                    }
+                    _ => {}
+                }
+            }
+            if reread.is_some_and(|op| op != OpId(0)) {
+                break;
+            }
+            h.advance(10);
+            out = next;
+        }
+        let reread = reread.filter(|op| *op != OpId(0)).expect("the CAS re-read");
+        assert!(h.core.acquiring());
+        let out = forward_tagged(&mut h, 2, 41, rid, setattr_mtime(peer_ino, 2), tag.clone());
+        let held = sends(&out).into_iter().find_map(|(t, m)| match m {
+            PeerMsg::MutateReply { req, outcome, .. } if t == 2 && *req == OpId(41) => {
+                Some(outcome.clone())
+            }
+            _ => None,
+        });
+        assert!(matches!(held, Some(MutateOutcome::Held { .. })), "{out:?}");
+        assert_ne!(mtime(&h, peer_ino), 2);
+        assert_eq!(h.meta.locks().stats().token_rejections, 0);
+        assert!(
+            h.meta.locks().get(peer_grant).is_some(),
+            "the kept grant stands"
+        );
+        // The re-read finds the CAS landed: won.
+        let out = h.step(Event::S3 {
+            op: reread,
+            result: S3Result::LeaseGet(Ok(Some((object.clone(), super::tag())))),
+        });
+        epoch_pump(&mut h, &[1, 2, 3], &mut object, out);
+        let out = forward_tagged(&mut h, 2, 42, rid, setattr_mtime(peer_ino, 2), tag);
+        assert!(
+            matches!(mutate_reply(&out, 2, 42), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, peer_ino), 2);
+    }
+
+    /// Review round 2, must-fix 2: a backup's lock mirror is asynchronous,
+    /// so a successor can install a grant its predecessor had already
+    /// ended. Node 2 held `g2` at node 1, and its op went into the S3
+    /// inbox in doubt; node 2 waited the token's window out, `g2` ended at
+    /// node 1 (released), node 3 was granted and wrote, and node 1 died
+    /// before a mirror without `g2` reached node 4. Node 4 takes over with
+    /// the stale mirror: `g2` is live in its table, restamped. The drained
+    /// inbox op past its window is refused (`LockLapsed`), not passed as
+    /// a live grant's op. The holder's renewal confirms `g2` only from
+    /// then on: the old op is still refused, a new one passes.
+    #[test]
+    fn a_stale_mirrors_grant_does_not_pass_an_op_past_its_window() {
+        let mut h = Harness::new(4);
+        h.core.cfg.inbox = true;
+        let op = h.create("f");
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        let ttl = h.core.lock_ttl_ms();
+        let g2 = GrantId { node: 1, seq: 5 };
+        let window2 = h.now.0 + ttl - 1_000;
+        h.core.lease.cached_holder = Some(1);
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockMirror {
+                ver: 1,
+                grants: vec![constellation_meta::locks::Grant {
+                    id: g2,
+                    node: 2,
+                    ino,
+                    mode: X,
+                    until_ms: window2 + 2_000,
+                    recalled: false,
+                    gen: 0,
+                    confirmed_ms: constellation_meta::locks::Grant::MINTED,
+                }],
+                floor: Position::ZERO,
+            },
+        });
+        // Node 1 dies; node 4 takes over after the window.
+        h.now = Ms(window2 + 500);
+        h.hold(2, None);
+        let now = h.now;
+        h.core.lock_install_mirror(now, &h.meta);
+        assert!(
+            h.meta.locks().get(g2).is_some(),
+            "installed from the mirror"
+        );
+        let before = mtime(&h, ino);
+        let mut batch = super::inbox_batch(2, 0, 1, &setattr_mtime(ino, 2));
+        batch.ops[0].lock_tag = token(g2, window2).to_wire();
+        let mut out = Vec::new();
+        h.core
+            .inbox_drain(h.now, vec![batch], &h.meta, &mut out)
+            .unwrap();
+        assert_eq!(mtime(&h, ino), before, "the stale op did not execute");
+        assert_eq!(h.meta.locks().stats().token_rejections, 1);
+        // The holder renews `g2` here: confirmed from now on.
+        h.advance(100);
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(30),
+                entries: vec![LockRenewEntry {
+                    ino,
+                    grant: g2,
+                    mode: X,
+                }],
+            },
+        });
+        let confirmed = h.meta.locks().get(g2).unwrap().confirmed_ms;
+        assert_eq!(confirmed, h.now.0);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            31,
+            peer_rid(2, 2),
+            setattr_mtime(ino, 3),
+            token(g2, window2),
+        );
+        assert_eq!(mutate_reply(&out, 2, 31), MutateOutcome::LockLapsed);
+        assert_eq!(mtime(&h, ino), before);
+        // An op sent under the renewed window passes even once that
+        // window is over: the grant is live here and confirmed.
+        let renewed = h.now.0 + ttl - 1_000;
+        h.now = Ms(renewed + 10);
+        let out = forward_tagged(
+            &mut h,
+            2,
+            32,
+            peer_rid(2, 3),
+            setattr_mtime(ino, 4),
+            token(g2, renewed),
+        );
+        assert!(
+            matches!(mutate_reply(&out, 2, 32), MutateOutcome::Accepted { .. }),
+            "{out:?}"
+        );
+        assert_eq!(mtime(&h, ino), 4);
     }
 }
 
@@ -11805,6 +13356,7 @@ fn inbox_batch(
             },
             op: op.to_postcard().unwrap(),
             deps: Vec::new(),
+            lock_tag: Vec::new(),
         }],
         wants_lease: false,
     }
@@ -12060,6 +13612,7 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             },
         });
         match sends(&out).first().map(|(_, m)| *m) {
@@ -12853,6 +14406,7 @@ fn a_held_epochs_release_given_up_in_doubt_owes_the_move_and_refuses_writes() {
         policy: Policy::Client,
         rid: waiting,
         op,
+        tag: Default::default(),
     });
     assert!(
         h.core.clients().any(|(r, _)| r == waiting),
@@ -12886,6 +14440,7 @@ fn a_held_epochs_release_given_up_in_doubt_owes_the_move_and_refuses_writes() {
         policy: Policy::Client,
         rid: late,
         op,
+        tag: Default::default(),
     });
     assert!(refused(&out, late), "{out:?}");
     assert!(s3_ops(&out).is_empty(), "{out:?}");
@@ -12939,6 +14494,7 @@ fn an_outage_during_a_release_that_ends_kept_serves_writes() {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     assert!(
         replies(&out).iter().any(|(r, reply)| *r == rid
@@ -13127,6 +14683,7 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
         policy: Policy::Client,
         rid,
         op: h.create("a"),
+        tag: Default::default(),
     });
     // Into the inbox (as when the forward could not be sent).
     h.core.inbox_enqueue(h.now, rid, 1, &h.meta, &mut out);
@@ -13468,6 +15025,7 @@ fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted(
             policy: Policy::Client,
             rid,
             op: h.create(name),
+            tag: Default::default(),
         }));
         // Into the inbox (as when the forward could not be sent).
         h.core.inbox_enqueue(h.now, rid, 1, &h.meta, &mut out);
@@ -13508,6 +15066,7 @@ fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted(
         policy: Policy::Client,
         rid: c,
         op: h.create("c"),
+        tag: Default::default(),
     }));
     h.core.inbox_enqueue(h.now, c, 1, &h.meta, &mut out);
     let (_, puts) = land_inbox_puts(&mut h, out);
@@ -13628,6 +15187,7 @@ fn a_node_with_its_s3_stalled_keeps_forwarding_past_the_retry_budget() {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     let out = exhaust_forward_retries(&mut h, &first);
     // Not the lease path (its lease read would wait on the dead S3 path):
@@ -13687,6 +15247,7 @@ fn a_stall_forwards_again_an_op_already_waiting_on_the_lease_path() {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     // S3 not yet known stalled: the budget ends in the lease path.
     let out = exhaust_forward_retries(&mut h, &first);
@@ -13716,6 +15277,7 @@ fn a_stalled_node_fails_an_unanswered_op_at_the_bound_unless_the_bucket_is_down(
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     exhaust_forward_retries(&mut h, &first);
     h.advance(h.core.cfg.s3_less_deadline_ms);
@@ -13766,6 +15328,7 @@ fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
         acked_through: 0,
         deps: constellation_meta::Position::ZERO,
         applied: 0,
+        tag: Default::default(),
     };
     let out = h.step(Event::Peer {
         from: 2,
@@ -13847,6 +15410,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             },
         });
         let (get, _) = s3_ops(&out)
@@ -13882,6 +15446,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
                 acked_through: 0,
                 deps: constellation_meta::Position::ZERO,
                 applied: 0,
+                tag: Default::default(),
             },
         });
         assert!(
@@ -13927,6 +15492,7 @@ fn a_released_lease_is_not_readopted_for_a_forward() {
             acked_through: 0,
             deps: constellation_meta::Position::ZERO,
             applied: 0,
+            tag: Default::default(),
         },
     });
     assert!(
@@ -14052,6 +15618,7 @@ mod portable_codes {
             policy: Policy::Client,
             rid,
             op,
+            tag: Default::default(),
         });
         let sent = sends(&out);
         let [(1, request)] = sent.as_slice() else {
@@ -14401,6 +15968,7 @@ fn a_barrier_behind_a_held_back_row_fails_after_bounded_rounds() {
             manifest,
             size: 7,
         },
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -14462,6 +16030,7 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
         policy: Policy::Client,
         rid: h.rid(1),
         op: h.create("a"),
+        tag: Default::default(),
     });
     assert!(matches!(
         replies(&out)[0].1,
@@ -14737,7 +16306,12 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
             .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::DelegRenew { gen: 7, .. })),
         "{out:?}"
     );
-    let mut h = Harness { core, meta, now };
+    let mut h = Harness {
+        core,
+        meta,
+        now,
+        manual_horizon: false,
+    };
     h.advance(2);
     h.step(renewed(req, 7, 5_000));
     assert!(
@@ -14758,6 +16332,7 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     assert!(
         !sends(&out)
@@ -14812,6 +16387,7 @@ fn delegate_parked_on_a_silent_root() -> (Harness, constellation_fs_core::Ino, R
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     assert_eq!(h.core.stats.deleg_parked_expired, 1, "{out:?}");
     assert!(renew_req(&out, 7).is_some(), "no renewal for the parked op");
@@ -14862,6 +16438,7 @@ fn a_delegate_gives_up_a_grant_its_dead_root_never_renews() {
         policy: Policy::Client,
         rid: rid2,
         op,
+        tag: Default::default(),
     });
     assert!(
         h.core.dl.mine[&7].parked.is_empty(),
@@ -14929,6 +16506,7 @@ fn a_lapsed_delegation_renewed_before_the_reclaim_executes_again() {
         policy: Policy::Client,
         rid,
         op,
+        tag: Default::default(),
     });
     assert!(
         replies(&out).iter().any(|(r, _)| *r == rid),

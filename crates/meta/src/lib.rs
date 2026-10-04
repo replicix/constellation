@@ -20,7 +20,8 @@ pub mod store;
 pub use constellation_mtree::keys::snapshot_id;
 pub use error::MetaError;
 pub use mutate::{
-    execute as execute_mutate, MutateOp, MutateOutcome, OwnChunks, OwnRows, OwnTx, OWN_ROWS_CAP,
+    execute as execute_mutate, execute_tagged, MutateOp, MutateOutcome, OwnChunks, OwnRows, OwnTx,
+    OWN_ROWS_CAP,
 };
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
 pub use readdeleg::{

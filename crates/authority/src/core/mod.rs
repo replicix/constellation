@@ -815,6 +815,12 @@ pub struct Stats {
     pub lock_waiters_dropped: u64,
     pub lock_wait_ms_total: u64,
     pub lock_renewals_served: u64,
+    /// Owner side: grant/renewal answers held for the restart horizon's
+    /// durable write (`Action::PersistLockHorizon`), the writes issued,
+    /// and the ones that failed (their answers refused).
+    pub lock_horizon_held: u64,
+    pub lock_horizon_writes: u64,
+    pub lock_horizon_failed: u64,
     pub lock_reclaimed: u64,
     pub lock_moved: u64,
     /// Grants handed to a delegation that ended without handing them
@@ -898,6 +904,11 @@ pub struct Stats {
     /// acknowledged ops whose refusal was an outcome rather than a
     /// conflict copy.
     pub refusals_journaled: u64,
+    /// Plan 30 §M14 phase 2: ops answered `LockLapsed` — refused here
+    /// (as executor) or by the executor that answered this node's
+    /// forward, because a cluster-lock grant they were issued under had
+    /// ended. Nothing was journaled.
+    pub lock_lapsed_refusals: u64,
     pub unacked_replays_refused: u64,
     // ---- M10: heartbeat promises ----
     /// Promises persisted and PUT (on an observed unrenewed expiry, on a
@@ -1104,6 +1115,12 @@ enum Timer {
     LockWaiterTick,
     LockRenewTimeout(OpId),
     LockTestTimeout(OpId),
+    /// M14 phase 2: re-check whether `(ino, grant)`'s release may go
+    /// (`on_lock_flushed`).
+    LockReleaseWait(
+        constellation_fs_core::Ino,
+        constellation_meta::locks::GrantId,
+    ),
     DelegStream,
     /// Phase 2b: the placement's evaluation tick.
     Placement,
@@ -1144,6 +1161,7 @@ impl Timer {
             Timer::LockHeldReply(_) => TimerKind::LockHeldReply,
             Timer::LockGrantExpiry(_) => TimerKind::LockGrantExpiry,
             Timer::LockRenewTick => TimerKind::LockRenewTick,
+            Timer::LockReleaseWait(..) => TimerKind::LockReleaseWait,
             Timer::LockWaiterTick => TimerKind::LockWaiterTick,
             Timer::LockRenewTimeout(_) => TimerKind::LockRenewTimeout,
             Timer::LockTestTimeout(_) => TimerKind::LockTestTimeout,
@@ -1480,9 +1498,12 @@ impl Core {
         }
         self.last_now = now;
         match event {
-            Event::Submit { rid, op, policy } => {
-                self.on_submit(now, rid, op, policy, replica, &mut out)
-            }
+            Event::Submit {
+                rid,
+                op,
+                policy,
+                tag,
+            } => self.on_submit(now, rid, op, policy, tag, replica, &mut out),
             Event::Peer { from, msg } => self.on_peer(now, from, msg, replica, &mut out),
             Event::PeerFailed { req, to, outage } => {
                 self.on_peer_failed(now, req, to, outage, replica, &mut out)
@@ -1494,6 +1515,9 @@ impl Core {
             }
             Event::LockFlushed { ino, grant, ok } => {
                 self.on_lock_flushed(now, ino, grant, ok, replica, &mut out)
+            }
+            Event::LockHorizonPersisted { until, durable } => {
+                self.on_lock_horizon_persisted(now, until, durable, replica, &mut out)
             }
             Event::PublishDone { op, ok } => {
                 if self.publishing == Some(op) {
@@ -1596,6 +1620,7 @@ impl Core {
                 acked_through,
                 deps,
                 applied,
+                tag,
             } => self.on_mutate_request(
                 now,
                 from,
@@ -1604,6 +1629,7 @@ impl Core {
                 op,
                 acked_through,
                 (deps, applied),
+                tag,
                 replica,
                 out,
             ),
@@ -1970,6 +1996,9 @@ impl Core {
             Timer::LockHeldReply(w) => self.on_lock_held_reply_timer(w, out),
             Timer::LockGrantExpiry(id) => self.on_lock_grant_expiry(now, id, replica, out),
             Timer::LockRenewTick => self.on_lock_renew_tick(now, replica, out),
+            Timer::LockReleaseWait(ino, grant) => {
+                self.on_lock_flushed(now, ino, grant, true, replica, out)
+            }
             Timer::LockWaiterTick => self.on_lock_waiter_tick(now, replica, out),
             Timer::LockRenewTimeout(req) => self.on_lock_renew_timeout(req, replica, out),
             Timer::LockTestTimeout(req) => self.on_lock_test_timeout(req, out),
@@ -2105,6 +2134,9 @@ impl Core {
                 blocking,
             } => self.on_lock_control(now, op, ino, mode, blocking, replica, out),
             Control::LockIdle { ino } => self.on_lock_idle_control(now, op, ino, replica, out),
+            Control::LockReleaseWake { ino } => {
+                self.on_lock_release_wake(now, op, ino, replica, out)
+            }
             Control::LockTest { ino, mode } => {
                 self.on_lock_test_control(now, op, ino, mode, replica, out)
             }

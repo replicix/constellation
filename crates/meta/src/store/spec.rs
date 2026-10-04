@@ -111,6 +111,7 @@
 //! it deletes that row, along with the holder's in-memory `recent` answer.
 
 use crate::error::MetaError;
+use crate::locks::LockTag;
 use crate::mutate::MutateOp;
 use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, apply_record, ApplyCx, TouchSet};
@@ -151,6 +152,9 @@ pub enum SpecKind {
         epoch: u64,
         op: MutateOp,
         gen: u64,
+        /// Plan 30 §M14 phase 2: the op's fencing token, which a replay
+        /// carries.
+        lock_tag: LockTag,
     },
     /// The `Exists` early install: retires once the applied state
     /// reaches `at`, the position the refusal was evaluated at
@@ -183,7 +187,7 @@ pub enum SpecKind {
         /// is what keeps later streamed rows right; stranded, it replays
         /// by rid as this node's op — a conflict copy on refusal — rather
         /// than as a foreign row.
-        own: Option<(Rid, MutateOp)>,
+        own: Option<(Rid, MutateOp, LockTag)>,
     },
     /// A tailed segment applied while older speculation was outstanding
     /// (or a `Local` transaction that shipped while it was).
@@ -312,6 +316,9 @@ struct QueuedReplay {
     /// stranded row's before-image. A manifest commit for the same inode
     /// queued after it is rebased onto this (see [`rebase_on_truncate`]).
     truncate_base: Option<Vec<u8>>,
+    /// Plan 30 §M14 phase 2: the op's fencing token: the replay carries
+    /// it, and is rejected wherever a grant it names has ended.
+    lock_tag: LockTag,
 }
 
 /// A stranded op waiting to be replayed by rid (plan 30 §M3a recovery
@@ -329,6 +336,8 @@ pub struct StrandedOp {
     pub source: Option<u64>,
     /// Plan 30 §M11 phase 2b round 2: see `QueuedReplay::gen`.
     pub gen: u64,
+    /// Plan 30 §M14 phase 2: see `QueuedReplay::lock_tag`.
+    pub lock_tag: LockTag,
 }
 
 /// What a stranding pass rolled back.
@@ -574,6 +583,7 @@ fn adopt_streamed_tx(
     meta: &Meta,
     rid: Rid,
     op: &MutateOp,
+    tag: &LockTag,
 ) -> Result<bool, MetaError> {
     let Some(spec_seq) = streamed_entry_completing(tx, meta, rid)? else {
         return Ok(false);
@@ -581,7 +591,7 @@ fn adopt_streamed_tx(
     if let Some(v) = tx.get(&meta.spec, seq_key(spec_seq))? {
         let mut row: SpecRow = postcard::from_bytes(&v)?;
         if let SpecKind::Streamed { own, .. } = &mut row.kind {
-            *own = Some((rid, op.clone()));
+            *own = Some((rid, op.clone(), tag.clone()));
         }
         put_row(tx, &meta.spec, spec_seq, &row)?;
     }
@@ -594,15 +604,21 @@ fn shadow_row_for(
     r: &impl Readable,
     meta: &Meta,
     rid: Rid,
-) -> Result<Option<(u64, u64, MutateOp)>, MetaError> {
+) -> Result<Option<(u64, u64, MutateOp, LockTag)>, MetaError> {
     for (seq, entry) in read_live(r, meta)? {
         if !matches!(entry, LiveEntry::Shadow { rid: r2, .. } if r2 == rid) {
             continue;
         }
         if let Some(v) = r.get(&meta.spec, seq_key(seq))? {
             let row: SpecRow = postcard::from_bytes(&v)?;
-            if let SpecKind::Shadow { epoch, op, .. } = row.kind {
-                return Ok(Some((seq, epoch, op)));
+            if let SpecKind::Shadow {
+                epoch,
+                op,
+                lock_tag,
+                ..
+            } = row.kind
+            {
+                return Ok(Some((seq, epoch, op, lock_tag)));
             }
         }
     }
@@ -711,22 +727,25 @@ fn enqueue_replay_tx(
     key: u64,
     rid: Rid,
     op: MutateOp,
+    tag: LockTag,
     before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, None, 0, before)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, tag, None, 0, before)
 }
 
 /// [`enqueue_replay_tx`] for a shadow a delegate accepted under `gen`.
+#[allow(clippy::too_many_arguments)]
 fn enqueue_replay_gen_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     key: u64,
     rid: Rid,
     op: MutateOp,
+    tag: LockTag,
     gen: u64,
     before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, None, gen, before)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, tag, None, gen, before)
 }
 
 /// Queue `op` for replay by `rid` under `key`. `before` is the stranded
@@ -741,6 +760,7 @@ fn enqueue_replay_as_tx(
     key: u64,
     rid: Rid,
     mut op: MutateOp,
+    lock_tag: LockTag,
     foreign: Option<u64>,
     gen: u64,
     before: &Before,
@@ -755,6 +775,7 @@ fn enqueue_replay_as_tx(
         source: foreign,
         gen,
         truncate_base,
+        lock_tag,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -1018,7 +1039,7 @@ fn strand_local_tx(
         None => derive_replay_op(&records),
     };
     if let Some(op) = op {
-        enqueue_replay_tx(tx, meta, key, rid, op, before)?;
+        enqueue_replay_tx(tx, meta, key, rid, op, row.lock_tag, before)?;
     }
     Ok(())
 }
@@ -1231,8 +1252,14 @@ fn redo_row_tx(
             counter_add_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, -1)?;
         }
         match row.kind {
-            SpecKind::Shadow { rid, op, gen, .. } => {
-                enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen, &row.before)?;
+            SpecKind::Shadow {
+                rid,
+                op,
+                gen,
+                lock_tag,
+                ..
+            } => {
+                enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, lock_tag, gen, &row.before)?;
                 out.shadows += 1;
             }
             SpecKind::Local { first, .. } => {
@@ -1246,8 +1273,8 @@ fn redo_row_tx(
                 // must not see the rolled-back state as final. This
                 // node's own op (adopted by `install_shadow`) replays as
                 // a shadow's would.
-                if let Some((rid, op)) = own {
-                    enqueue_replay_tx(tx, meta, row.origin, rid, op, &row.before)?;
+                if let Some((rid, op, tag)) = own {
+                    enqueue_replay_tx(tx, meta, row.origin, rid, op, tag, &row.before)?;
                     out.shadows += 1;
                 } else {
                     let rid = row.records.iter().find_map(|r| match r {
@@ -1258,7 +1285,17 @@ fn redo_row_tx(
                         let op = MutateOp::Records {
                             records: row.records.clone(),
                         };
-                        enqueue_replay_as_tx(tx, meta, row.origin, rid, op, Some(source), 0, &[])?;
+                        enqueue_replay_as_tx(
+                            tx,
+                            meta,
+                            row.origin,
+                            rid,
+                            op,
+                            LockTag::NONE,
+                            Some(source),
+                            0,
+                            &[],
+                        )?;
                     }
                     out.hints += 1;
                 }
@@ -1345,7 +1382,7 @@ struct StreamedTx<'a> {
     first: u64,
     last: u64,
     records: &'a [LogRecord],
-    adopt: Option<(u64, Rid, MutateOp)>,
+    adopt: Option<(u64, Rid, MutateOp, LockTag)>,
 }
 
 /// Whether a row stays ahead of a transaction the stream delivers now: a
@@ -1471,13 +1508,13 @@ fn insert_streamed_tx(
         redo_row_tx(tx, meta, staged, &live, &none, &mut out, true, seq, row)?;
     }
     match (adopted, t.adopt) {
-        (Some((seq, mut row)), Some((_, rid, op))) => {
+        (Some((seq, mut row)), Some((_, rid, op, tag))) => {
             row.kind = SpecKind::Streamed {
                 epoch: t.epoch,
                 first: t.first,
                 last: t.last,
                 source: t.source,
-                own: Some((rid, op)),
+                own: Some((rid, op, tag)),
             };
             live.insert(
                 seq,
@@ -1977,8 +2014,24 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
         if let LiveEntry::Shadow { .. } = entry {
             if let Some(v) = tx.get(&meta.spec, seq_key(*seq))? {
                 let row: SpecRow = postcard::from_bytes(&v)?;
-                if let SpecKind::Shadow { rid, op, gen, .. } = row.kind {
-                    enqueue_replay_gen_tx(tx, meta, row.origin, rid, op, gen, &row.before)?;
+                if let SpecKind::Shadow {
+                    rid,
+                    op,
+                    gen,
+                    lock_tag,
+                    ..
+                } = row.kind
+                {
+                    enqueue_replay_gen_tx(
+                        tx,
+                        meta,
+                        row.origin,
+                        rid,
+                        op,
+                        lock_tag,
+                        gen,
+                        &row.before,
+                    )?;
                 }
             }
             tx.remove(&meta.spec_live, seq_key(*seq));
@@ -2082,6 +2135,7 @@ pub(crate) fn refuse_queued_tx(
         source: None,
         gen: 0,
         truncate_base: None,
+        lock_tag: LockTag::NONE,
     };
     tx.insert(
         &meta.pending_replay,
@@ -2145,6 +2199,7 @@ pub(crate) fn read_pending_replays(
             foreign: row.foreign,
             source: row.source,
             gen: row.gen,
+            lock_tag: row.lock_tag,
         });
     }
     Ok(out)
@@ -2174,7 +2229,7 @@ impl Meta {
         op: &MutateOp,
         records: &[LogRecord],
     ) -> Result<bool, MetaError> {
-        self.install_shadow_from(rid, epoch, 0, op, records)
+        self.install_shadow_from(rid, epoch, 0, op, &LockTag::NONE, records)
     }
 
     /// Chunk metered-own-rows: which of `rids`' ops this replica carries
@@ -2240,12 +2295,17 @@ impl Meta {
     /// the op is answered now, not when its segment reaches S3. `false`:
     /// the stream has not carried it (or the log has: `completed`
     /// answers it then).
-    pub fn adopt_streamed(&self, rid: Rid, op: &MutateOp) -> Result<bool, MetaError> {
+    pub fn adopt_streamed(
+        &self,
+        rid: Rid,
+        op: &MutateOp,
+        tag: &LockTag,
+    ) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         if tx.get(&self.completed, rid.to_key())?.is_some() {
             return Ok(false);
         }
-        if adopt_streamed_tx(&mut tx, self, rid, op)? {
+        if adopt_streamed_tx(&mut tx, self, rid, op, tag)? {
             tx.commit()?;
             return Ok(true);
         }
@@ -2260,6 +2320,7 @@ impl Meta {
         epoch: u64,
         gen: u64,
         op: &MutateOp,
+        tag: &LockTag,
         records: &[LogRecord],
     ) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
@@ -2278,7 +2339,7 @@ impl Meta {
         // would (a conflict copy on refusal). The reply counts as
         // installed (backup seeds 1122 and 1407: "not installed" sent
         // the op down the lease path a second time).
-        if adopt_streamed_tx(&mut tx, self, rid, op)? {
+        if adopt_streamed_tx(&mut tx, self, rid, op, tag)? {
             tx.commit()?;
             return Ok(true);
         }
@@ -2290,7 +2351,7 @@ impl Meta {
             // a stranded shadow of it would be — replayed at once, the
             // takeover gate executed it ahead of the delegate's earlier
             // transactions (locks-released-delegated seed 198670).
-            enqueue_replay_gen_tx(&mut tx, self, key, rid, op.clone(), gen, &[])?;
+            enqueue_replay_gen_tx(&mut tx, self, key, rid, op.clone(), tag.clone(), gen, &[])?;
             tx.commit()?;
             tracing::info!(
                 ?rid,
@@ -2306,6 +2367,7 @@ impl Meta {
             epoch,
             op: op.clone(),
             gen,
+            lock_tag: tag.clone(),
         };
         self.install_speculative_tx(tx, kind, records)?;
         Ok(true)
@@ -2419,7 +2481,7 @@ impl Meta {
         // 1402: a shadow retired the ordinary way had the segment's
         // unlink re-applied over a later streamed create) — and a
         // takeover strands it as this node's own op.
-        let mut adopt: Option<(u64, Rid, MutateOp)> = None;
+        let mut adopt: Option<(u64, Rid, MutateOp, LockTag)> = None;
         for rec in records {
             if let LogRecord::Completed { rid } = rec {
                 // Plan 30 §M11 phase 2b: this node's own delegate
@@ -2432,8 +2494,8 @@ impl Meta {
                 if tx.get(&self.completed, rid.to_key())?.is_some() {
                     return Ok(());
                 }
-                if let Some((seq, _, op)) = shadow_row_for(&tx, self, *rid)? {
-                    adopt = Some((seq, *rid, op));
+                if let Some((seq, _, op, tag)) = shadow_row_for(&tx, self, *rid)? {
+                    adopt = Some((seq, *rid, op, tag));
                     break;
                 }
             }
@@ -2481,7 +2543,7 @@ impl Meta {
             staged.drain_into(self.usage_tracker());
             return Ok(());
         }
-        if let Some((seq, rid, op)) = adopt {
+        if let Some((seq, rid, op, tag)) = adopt {
             if let Some(v) = tx.get(&self.spec, seq_key(seq))? {
                 let mut row: SpecRow = postcard::from_bytes(&v)?;
                 row.kind = SpecKind::Streamed {
@@ -2489,7 +2551,7 @@ impl Meta {
                     first,
                     last,
                     source,
-                    own: Some((rid, op)),
+                    own: Some((rid, op, tag)),
                 };
                 put_row(&mut tx, &self.spec, seq, &row)?;
             }
@@ -3160,10 +3222,28 @@ impl Meta {
     /// Queue `op` for replay by `rid` directly, after everything already
     /// queued. For callers that learn of a stranded op outside any
     /// stranding pass.
-    pub fn queue_replay(&self, rid: Rid, op: &MutateOp) -> Result<(), MetaError> {
+    pub fn queue_replay(&self, rid: Rid, op: &MutateOp, tag: &LockTag) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let key = next_spec_seq_tx(&mut tx, &self.local)?;
-        enqueue_replay_tx(&mut tx, self, key, rid, op.clone(), &[])?;
+        enqueue_replay_tx(&mut tx, self, key, rid, op.clone(), tag.clone(), &[])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Queue `op` as a replay already refused for `refusal`, after
+    /// everything queued: the drain materializes its conflict copy and
+    /// never executes it. Plan 30 §M14 phase 2: a close whose commit the
+    /// sequencer refused for a lock grant that had ended keeps its data
+    /// this way instead of dropping it.
+    pub fn queue_refused_replay(
+        &self,
+        rid: Rid,
+        op: &MutateOp,
+        refusal: Refusal,
+    ) -> Result<(), MetaError> {
+        let mut tx = self.db.write_tx();
+        let key = next_spec_seq_tx(&mut tx, &self.local)?;
+        refuse_queued_tx(&mut tx, self, key, rid, op.clone(), refusal)?;
         tx.commit()?;
         Ok(())
     }

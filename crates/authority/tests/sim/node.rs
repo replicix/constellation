@@ -17,6 +17,7 @@ use constellation_authority::{
     Action, Carrier, CasFailure, ClientReply, Config, Control, Core, EpochClaimView, Event, NodeId,
     OpId, PeerLink, PeerMsg, Policy, Replica, S3Failure, S3Op, S3Result, Seq, Stats, UploadResult,
 };
+use constellation_meta::locks::LockTag;
 use constellation_meta::{Meta, MutateOp, MutateOutcome, PublishBasis, Rid, TouchSet};
 use constellation_store_s3::commits::{CommitChain, CommitPayload};
 use constellation_store_s3::heartbeat::HeartbeatStore;
@@ -303,6 +304,17 @@ impl NodeHandle {
     /// Submit a client op. The receiver errors if the node dies before
     /// answering (a FUSE thread's reply channel going away).
     pub fn submit(&self, rid: Rid, op: MutateOp) -> oneshot::Receiver<ClientReply> {
+        self.submit_tagged(rid, op, LockTag::NONE)
+    }
+
+    /// [`Self::submit`] with a fencing token (plan 30 §M14 phase 2): the
+    /// grants the submitting client holds.
+    pub fn submit_tagged(
+        &self,
+        rid: Rid,
+        op: MutateOp,
+        tag: LockTag,
+    ) -> oneshot::Receiver<ClientReply> {
         let (tx, rx) = oneshot::channel();
         if !self.alive() {
             return rx;
@@ -312,6 +324,7 @@ impl NodeHandle {
             rid,
             op,
             policy: Policy::Client,
+            tag,
         });
         rx
     }
@@ -758,6 +771,7 @@ impl Driver {
             rid,
             op,
             policy: Policy::Client,
+            tag,
         } = event
         else {
             return None;
@@ -774,13 +788,15 @@ impl Driver {
             FastPath::Checked => Some(self.meta.root_fast_path(op)?),
             _ => None,
         };
-        let outcome = match constellation_meta::execute_mutate(&self.meta, op, Some(*rid)) {
-            Ok(records) => MutateOutcome::Accepted { epoch, records },
-            Err(constellation_meta::MetaError::Conflict) => {
-                MutateOutcome::Conflict { manifest: None }
-            }
-            Err(e) => MutateOutcome::Errno(e.code()),
-        };
+        let outcome =
+            match constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now.0) {
+                Ok(records) => MutateOutcome::Accepted { epoch, records },
+                Err(constellation_meta::MetaError::Conflict) => {
+                    MutateOutcome::Conflict { manifest: None }
+                }
+                Err(constellation_meta::MetaError::LockLapsed) => MutateOutcome::LockLapsed,
+                Err(e) => MutateOutcome::Errno(e.code()),
+            };
         drop(admission);
         self.shared
             .fast_path_executed
@@ -891,6 +907,14 @@ impl Driver {
                             ok: true,
                         });
                     });
+                }
+                Action::PersistLockHorizon { until } => {
+                    // Written here (the simulation has no core thread to
+                    // keep free), answered as an event: the answers it
+                    // holds go out one event later, behind whatever
+                    // arrives meanwhile.
+                    let durable = self.meta.note_lock_grant_horizon(until).ok();
+                    let _ = self.tx.send(Event::LockHorizonPersisted { until, durable });
                 }
                 Action::EpochClose | Action::EpochFlushed => {
                     // `EpochManager::close` / `finish_flushing`.

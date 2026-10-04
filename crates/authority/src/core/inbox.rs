@@ -487,6 +487,7 @@ impl Core {
                     },
                     op,
                     deps: c.deps.to_postcard(),
+                    lock_tag: c.tag.to_wire(),
                 })
             })
             .collect();
@@ -1533,7 +1534,13 @@ impl Core {
                 }
             }
             let executed = match &decoded {
-                Ok(op) => replica.execute_inbox(ack, op, rid),
+                Ok(decoded_op) => replica.execute_inbox(
+                    ack,
+                    decoded_op,
+                    rid,
+                    &constellation_meta::locks::LockTag::from_wire(&op.lock_tag),
+                    now.0,
+                ),
                 Err(_) => Err(MetaError::Invalid("undecodable inbox op".into())),
             };
             self.inbox_unblock(now, &touched);
@@ -1559,7 +1566,14 @@ impl Core {
                     replica.journal_inbox_refusal(rid, Code::Stale, ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }
+                // Plan 30 §M14 phase 2: the op's lock grant ended. Unlike a
+                // P2P refusal it is journaled (`EIO`): the requester learns
+                // inbox outcomes from the log, and the position must be
+                // answered for the drain to move on. Nothing else ran.
                 Err(error) => {
+                    if matches!(error, MetaError::LockLapsed) {
+                        self.stats.lock_lapsed_refusals += 1;
+                    }
                     replica.journal_inbox_refusal(rid, error.code(), ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }

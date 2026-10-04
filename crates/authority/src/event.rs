@@ -13,6 +13,7 @@
 
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
+use constellation_meta::locks::LockTag;
 use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
 use constellation_store_s3::heartbeat::Promise;
 use constellation_store_s3::inbox::InboxBatch;
@@ -29,6 +30,11 @@ pub enum Event {
         rid: Rid,
         op: MutateOp,
         policy: Policy,
+        /// Plan 30 §M14 phase 2: the fencing token — the cluster-lock
+        /// grants the op's issuer held (empty: none). Carried on every
+        /// forward, inbox batch and replay of the op; every executor
+        /// refuses it once a named grant is no longer live.
+        tag: LockTag,
     },
     /// A peer's message was delivered.
     Peer { from: NodeId, msg: PeerMsg },
@@ -63,6 +69,10 @@ pub enum Event {
         grant: constellation_meta::locks::GrantId,
         ok: bool,
     },
+    /// Plan 30 §M14: `Action::PersistLockHorizon { until }` finished:
+    /// `durable` is the horizon now on disk (at least `until`), `None`
+    /// if the write failed.
+    LockHorizonPersisted { until: i64, durable: Option<i64> },
     /// The membership poll read the write-eligible roster (M13's inbox
     /// polls it; M9 picks backups from it).
     Roster { write_eligible: Vec<NodeId> },
@@ -226,6 +236,10 @@ pub enum Control {
     /// Plan 30 §M14: the last local lock under a recalled grant on `ino`
     /// left; the grant is released (`Done` at once).
     LockIdle { ino: Ino },
+    /// Plan 30 §M14 phase 2: the last tagged mutation in flight under
+    /// `ino`'s recalled grant was answered; a release waiting for it
+    /// goes on now (`Done` at once).
+    LockReleaseWake { ino: Ino },
     /// Plan 30 §M14: `getlk` — is a conflicting grant held elsewhere?
     LockTest {
         ino: Ino,
@@ -321,6 +335,8 @@ pub enum PeerMsg {
         /// unread and the holder skips working them out
         /// (`Core::own_chunks_for`).
         applied: Seq,
+        /// Plan 30 §M14 phase 2: the op's fencing token (`Event::Submit`).
+        tag: LockTag,
     },
     /// The holder's answer. `base` is the first form of plan 30 §M6's
     /// position on replies: the log position the requester must have

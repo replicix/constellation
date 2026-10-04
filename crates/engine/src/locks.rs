@@ -33,7 +33,9 @@
 //!   with `EIO` until they are unlocked (NFSv4's rule), and the lock's
 //!   owner — its process and the processes it started — gets `EIO` from
 //!   every write and namespace op on the mount meanwhile
-//!   ([`ClusterLocks::owner_fenced`]).
+//!   ([`ClusterLocks::owner_fenced`]). Every mutation an owner issues
+//!   carries the fencing token of its grants ([`current_tag`]), so an op
+//!   already on its way when the grant lapsed is refused where it lands.
 //! - Without P2P (`CONSTELLATION_P2P=off`, or an endpoint that could not
 //!   start) the effective mode is `local`: the inbox is not a lock path.
 //!   An explicit `--locks cluster` then fails the mount.
@@ -60,7 +62,9 @@ use constellation_authority::{
     LockAnswer, LockOutcome, LockRenewEntry, LockRenewResult, LockTestAnswer, LockTestOutcome,
 };
 use constellation_fs_core::Ino;
-use constellation_meta::locks::{FencedOwner, Grant, GrantId, LocalLock, LocalOutcome, LockMode};
+use constellation_meta::locks::{
+    Grant, GrantId, LocalLock, LocalOutcome, LockMode, LockTag, OwnerFenced,
+};
 use constellation_meta::{JournalPos, Meta, Position, ReadKey};
 use constellation_net::{LockOutcomeWire, LockRenewResultWire, LockRenewWire, LockTestOutcomeWire};
 use constellation_types::Code;
@@ -114,8 +118,25 @@ pub fn lock_cache_idle_ms(default: u64) -> u64 {
     env_ms("CONSTELLATION_LOCK_CACHE_IDLE_MS", default)
 }
 
-fn now_ms() -> i64 {
-    constellation_store_s3::lease::now_unix_ms()
+/// The clock grants are honoured by and fencing tokens are checked at
+/// (unix ms). Tests move it per thread ([`advance_test_clock`]) instead
+/// of sleeping past a grant.
+pub(crate) fn now_ms() -> i64 {
+    let now = constellation_store_s3::lease::now_unix_ms();
+    #[cfg(test)]
+    let now = now + TEST_CLOCK_OFFSET_MS.with(|c| c.get());
+    now
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCK_OFFSET_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Move this thread's [`now_ms`] forward (tests only).
+#[cfg(test)]
+pub(crate) fn advance_test_clock(ms: i64) {
+    TEST_CLOCK_OFFSET_MS.with(|c| c.set(c.get() + ms));
 }
 
 /// The process of task `pid` (FUSE names a request by its thread),
@@ -139,24 +160,37 @@ fn same_process(a: (u32, u64), b: (u32, u64)) -> bool {
     a.0 == b.0 && (a.1 == 0 || b.1 == 0 || a.1 == b.1)
 }
 
-/// Whether the process `proc` (with parent `ppid`) is one of `fenced`
-/// or descends from one: up the parent chain through `/proc`.
-fn lineage_hits(mut proc: (u32, u64), mut ppid: u32, fenced: &[(u32, u64)]) -> bool {
+/// The process of task `pid` (whose own `/proc` entry is `task`) and
+/// its ancestors, nearest first, as `(pid, start time)`: up the parent
+/// chain through `/proc`, at most [`LINEAGE_DEPTH`] levels. Without
+/// `/proc` (or the task gone) just `(pid, 0)`, which matches by pid alone.
+fn ancestry_of(
+    pid: u32,
+    task: Option<constellation_platform::process::Lineage>,
+) -> Vec<(u32, u64)> {
     let process = &constellation_platform::native().process;
+    let Some(t) = task else {
+        return vec![(pid, 0)];
+    };
+    let mut chain = Vec::new();
+    let mut proc = if t.tgid == pid {
+        (pid, t.start)
+    } else {
+        (t.tgid, process.lineage(t.tgid).map_or(0, |p| p.start))
+    };
+    let mut ppid = t.ppid;
     for _ in 0..LINEAGE_DEPTH {
-        if fenced.iter().any(|f| same_process(*f, proc)) {
-            return true;
-        }
+        chain.push(proc);
         if ppid <= 1 {
-            return false;
+            break;
         }
         let Ok(l) = process.lineage(ppid) else {
-            return false;
+            break;
         };
         proc = (ppid, l.start);
         ppid = l.ppid;
     }
-    false
+    chain
 }
 
 /// The largest offset the kernel accepts in a lock reply (`OFFSET_MAX`);
@@ -199,20 +233,24 @@ pub struct ClusterLocks {
     /// The frontends' kernel caches of a file, dropped after a grant
     /// (`crate::kernel_inval`); `None` with kernel invalidation off.
     pub inval: Option<crate::kernel_inval::InodeInvalidator>,
-    /// The owner fence's verdicts per pid, valid for one set of fenced
-    /// owners (see [`Self::owner_fenced`]).
+    /// Each task's process ancestry, for the owner fence and the fencing
+    /// token (see [`Self::ancestry`]).
     pub lineage: Mutex<LineageCache>,
 }
 
-/// Which tasks descend from a fenced owner's process, for the fenced set
-/// it was worked out for: a fence that stays (an application that keeps
-/// its lock after the lapse) costs every other task one `/proc` walk and
-/// then one `/proc` read per op (its start time, against pid reuse).
+/// A process and its ancestors, nearest first: `(pid, start time)`.
+type Ancestry = Vec<(u32, u64)>;
+
+/// The tasks' process ancestries ([`ancestry_of`]), valid for one set of
+/// lock-holding processes: a lock that stays (or a fence that does)
+/// costs every other task one `/proc` walk and then one `/proc` read per
+/// op (its start time, against pid reuse). Reset when the set changes,
+/// which also drops chains a re-parented process no longer has.
 #[derive(Default)]
 pub struct LineageCache {
-    fenced: Vec<FencedOwner>,
+    lockers: Vec<(u32, u64)>,
     /// By `(task id, task start time)`.
-    verdicts: std::collections::HashMap<(u32, u64), bool>,
+    chains: std::collections::HashMap<(u32, u64), Arc<Ancestry>>,
 }
 
 /// Past this many pids the cache starts over.
@@ -237,8 +275,13 @@ impl ClusterLocks {
     /// fenced. One or two relaxed atomic loads while no owner can be
     /// fenced.
     pub fn owner_fenced(&self, pid: Option<u32>, lock_owner: Option<u64>) -> bool {
-        let now = now_ms();
         let locks = self.meta.locks();
+        // The table's state before the clock: `local_inos` first, so the
+        // no-lock fast path reads no clock at all.
+        if locks.lockers_none() {
+            return false;
+        }
+        let now = now_ms();
         if !locks.owner_fence_armed(now) {
             return false;
         }
@@ -247,53 +290,97 @@ impl ClusterLocks {
             return false;
         }
         let hit = lock_owner.is_some_and(|o| fenced.iter().any(|f| f.owner == o))
-            || pid.is_some_and(|pid| self.descends_from_fenced(pid, fenced));
+            || pid.is_some_and(|pid| {
+                let owners: Vec<(u32, u64)> = fenced
+                    .iter()
+                    .filter(|f| f.pid > 1)
+                    .map(|f| (f.pid, f.pid_start))
+                    .collect();
+                !owners.is_empty()
+                    && self
+                        .ancestry(pid, &self.locker_procs())
+                        .iter()
+                        .any(|p| owners.iter().any(|o| same_process(*o, *p)))
+            });
         if hit {
             locks.note_owner_fenced_op();
         }
         hit
     }
 
-    /// Whether the process of task `pid`, or one of its ancestors, is the
-    /// process of a fenced owner: by thread group, so a sibling thread of
-    /// the locking thread and a process the locker started are fenced
-    /// whichever thread took the lock. Verdicts are cached per fenced set
-    /// and keyed by the task's start time too, so a recycled pid is
-    /// judged afresh (one `/proc` read per op while an owner is fenced;
-    /// the walk up the tree once per task).
-    fn descends_from_fenced(&self, pid: u32, fenced: Vec<FencedOwner>) -> bool {
+    /// The processes holding local locks, for [`Self::ancestry`]'s cache.
+    fn locker_procs(&self) -> Vec<(u32, u64)> {
+        let mut v: Vec<(u32, u64)> = self
+            .meta
+            .locks()
+            .lockers()
+            .into_iter()
+            .map(|(_, pid, start)| (pid, start))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Task `pid`'s process and its ancestors (by thread group, so a
+    /// sibling thread of the locking thread and a process the locker
+    /// started match whichever thread took the lock). Cached per task,
+    /// keyed by its start time too, so a recycled pid is judged afresh;
+    /// the `/proc` walk runs outside the cache's mutex.
+    fn ancestry(&self, pid: u32, lockers: &[(u32, u64)]) -> Arc<Ancestry> {
         let process = &constellation_platform::native().process;
         let task = process.lineage(pid).ok();
         let key = (pid, task.map_or(0, |t| t.start));
+        {
+            let mut cache = self.lineage.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.lockers != lockers || cache.chains.len() >= LINEAGE_CACHE_MAX {
+                cache.lockers = lockers.to_vec();
+                cache.chains.clear();
+            }
+            if let Some(c) = cache.chains.get(&key) {
+                return c.clone();
+            }
+        }
+        let chain = Arc::new(ancestry_of(pid, task));
         let mut cache = self.lineage.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.fenced != fenced || cache.verdicts.len() >= LINEAGE_CACHE_MAX {
-            cache.fenced = fenced;
-            cache.verdicts.clear();
+        if cache.lockers == lockers {
+            cache.chains.insert(key, chain.clone());
         }
-        if let Some(v) = cache.verdicts.get(&key) {
-            return *v;
+        chain
+    }
+
+    /// Plan 30 §M14 phase 2, the fencing token: the tag a mutation by
+    /// `pid` / `lock_owner` carries — the grants the local locks of every
+    /// owner it matches (as the owner fence matches them) are under
+    /// (`LockTables::owner_tag`). Empty when it holds no lock (one relaxed
+    /// load while no local lock exists); `Err` when one of its locks is
+    /// under no honoured grant (it is fenced: the op is refused, `EIO`).
+    pub fn caller_tag(
+        &self,
+        pid: Option<u32>,
+        lock_owner: Option<u64>,
+    ) -> Result<LockTag, OwnerFenced> {
+        let locks = self.meta.locks();
+        let lockers = locks.lockers();
+        if lockers.is_empty() {
+            return Ok(LockTag::NONE);
         }
-        let owners: Vec<(u32, u64)> = cache
-            .fenced
+        let mut procs: Vec<(u32, u64)> = lockers.iter().map(|l| (l.1, l.2)).collect();
+        procs.sort_unstable();
+        procs.dedup();
+        let chain = pid.map(|pid| self.ancestry(pid, &procs));
+        let owners: Vec<u64> = lockers
             .iter()
-            .filter(|f| f.pid > 1)
-            .map(|f| (f.pid, f.pid_start))
+            .filter(|(owner, lpid, lstart)| {
+                lock_owner == Some(*owner)
+                    || (*lpid > 1
+                        && chain
+                            .as_ref()
+                            .is_some_and(|c| c.iter().any(|p| same_process((*lpid, *lstart), *p))))
+            })
+            .map(|l| l.0)
             .collect();
-        let verdict = !owners.is_empty()
-            && match task {
-                Some(t) => {
-                    let proc = if t.tgid == pid {
-                        (pid, t.start)
-                    } else {
-                        (t.tgid, process.lineage(t.tgid).map_or(0, |p| p.start))
-                    };
-                    lineage_hits(proc, t.ppid, &owners)
-                }
-                // No `/proc` (or the task is gone): by pid alone.
-                None => owners.iter().any(|o| o.0 == pid),
-            };
-        cache.verdicts.insert(key, verdict);
-        verdict
+        locks.owner_tag(&owners, now_ms())
     }
 
     /// Whether `ino`'s dirty data must be discarded rather than
@@ -336,7 +423,9 @@ impl ClusterLocks {
             .local_test(ino, owner, write, start, end, now_ms())
         {
             LocalOutcome::Conflict(l) => Some((l.start, l.end.min(OFFSET_MAX), l.write, l.pid)),
-            LocalOutcome::Done => None,
+            // (`local_test` never answers `Predecessor`: only a lock
+            // waits for an earlier turn.)
+            LocalOutcome::Done | LocalOutcome::Predecessor => None,
             LocalOutcome::NeedGrant(mode) => {
                 constellation_vfs::watch::stage("lock test (core reply)");
                 let (reply, answer) = tokio::sync::oneshot::channel();
@@ -480,7 +569,7 @@ impl ClusterLocks {
         loop {
             match self.meta.locks().local_set(ino, lock, now_ms()) {
                 LocalOutcome::Done => return Ok(()),
-                LocalOutcome::Conflict(_) => {
+                LocalOutcome::Conflict(_) | LocalOutcome::Predecessor => {
                     if !sleep {
                         return Err(Code::Again);
                     }
@@ -590,10 +679,269 @@ impl ClusterLocks {
     }
 }
 
+// ------------------------------------------------------- the fencing token
+
+/// Plan 30 §M14 phase 2: the FUSE op this thread is serving, for the
+/// fencing token its mutations carry. Entered when the op starts (the
+/// view's `admit!`, `flush`, `release`), and only while this node holds a
+/// local lock at all; which grants the op is under is worked out at its
+/// first mutation ([`current_tag`]; `flush` and `release` ask at once,
+/// before the close drops the caller's locks), which also counts the op
+/// in flight for them — none of them is released before the op ends
+/// (`LockTables::tag_begin`/`tag_end`, the release ordering). Each
+/// mutation's token then carries the grants' windows as they are when it
+/// is sent (`LockTables::refresh_tag`).
+struct ScopeState {
+    locks: Arc<ClusterLocks>,
+    pid: Option<u32>,
+    lock_owner: Option<u64>,
+    /// Worked out (and announced in flight) at the first mutation; a
+    /// scope entered with a fixed tag has it from the start.
+    tag: Option<Result<LockTag, OwnerFenced>>,
+    /// The token last handed to a mutation (the same grants, windows as
+    /// of then).
+    sent: LockTag,
+    /// The token of the mutation that ended in doubt (the latest such):
+    /// how long it may still execute at an executor that checks the
+    /// window — what its grants' release waits for. Not `sent`, which a
+    /// later mutation of the op may have refreshed up to the grant's end
+    /// (pinned that long, a recalled grant lapsed before its release).
+    doubt: LockTag,
+    /// A mutation of this op ended in doubt: it may still execute, so
+    /// its grants wait for its tokens' windows before a release.
+    in_doubt: bool,
+}
+
+thread_local! {
+    static SCOPE: std::cell::RefCell<Option<ScopeState>> = const { std::cell::RefCell::new(None) };
+}
+
+/// See [`ScopeState`]. Ends the scope (and the op's in-flight count) when
+/// dropped; restores an enclosing scope.
+#[must_use]
+pub struct TagScope {
+    prev: Option<Option<ScopeState>>,
+}
+
+impl TagScope {
+    fn inert() -> TagScope {
+        TagScope { prev: None }
+    }
+
+    fn enter(state: ScopeState) -> TagScope {
+        let prev = SCOPE.with(|s| s.borrow_mut().replace(state));
+        TagScope { prev: Some(prev) }
+    }
+}
+
+impl Drop for TagScope {
+    fn drop(&mut self) {
+        let Some(prev) = self.prev.take() else {
+            return;
+        };
+        let ended = SCOPE.with(|s| std::mem::replace(&mut *s.borrow_mut(), prev));
+        if let Some(ScopeState {
+            locks,
+            tag: Some(Ok(tag)),
+            sent,
+            doubt,
+            in_doubt,
+            ..
+        }) = ended
+        {
+            let last = if in_doubt && !doubt.is_empty() {
+                doubt
+            } else if sent.is_empty() {
+                tag
+            } else {
+                sent
+            };
+            locks.meta.locks().tag_end(&last, in_doubt, now_ms());
+        }
+    }
+}
+
+/// Who an op deferred to another thread was issued by, to re-enter its
+/// scope there ([`ScopeCaller::enter`]).
+pub struct ScopeCaller {
+    locks: Arc<ClusterLocks>,
+    pid: Option<u32>,
+    lock_owner: Option<u64>,
+}
+
+impl ScopeCaller {
+    pub fn enter(&self) -> TagScope {
+        self.locks.tag_scope(self.pid, self.lock_owner)
+    }
+}
+
+impl ClusterLocks {
+    /// Enter the fencing-token scope of an op by `pid` / `lock_owner` on
+    /// this thread (see [`ScopeState`]). One relaxed load, and nothing
+    /// else, while no local lock exists on this node.
+    pub fn tag_scope(self: &Arc<Self>, pid: Option<u32>, lock_owner: Option<u64>) -> TagScope {
+        if self.meta.locks().lockers_none() {
+            return TagScope::inert();
+        }
+        TagScope::enter(ScopeState {
+            locks: self.clone(),
+            pid,
+            lock_owner,
+            tag: None,
+            sent: LockTag::NONE,
+            doubt: LockTag::NONE,
+            in_doubt: false,
+        })
+    }
+
+    /// A scope whose mutations carry `tag` whoever runs them: a recalled
+    /// grant's flush (`Action::LockFlush`), on the driver's thread,
+    /// publishes the locked file under the grant it is about to release.
+    pub fn fixed_tag_scope(self: &Arc<Self>, tag: LockTag) -> TagScope {
+        if tag.is_empty() {
+            return TagScope::inert();
+        }
+        self.meta.locks().tag_begin(&tag, now_ms());
+        TagScope::enter(ScopeState {
+            locks: self.clone(),
+            pid: None,
+            lock_owner: None,
+            tag: Some(Ok(tag)),
+            sent: LockTag::NONE,
+            doubt: LockTag::NONE,
+            in_doubt: false,
+        })
+    }
+}
+
+/// The caller of the op this thread serves, if it is in a scope.
+pub fn scope_caller() -> Option<ScopeCaller> {
+    SCOPE.with(|s| {
+        s.borrow().as_ref().map(|st| ScopeCaller {
+            locks: st.locks.clone(),
+            pid: st.pid,
+            lock_owner: st.lock_owner,
+        })
+    })
+}
+
+/// The fencing token for a mutation of the op this thread serves (empty
+/// outside a scope, or for a caller that holds no lock). Which grants it
+/// names is worked out once per op, at its first call, which counts the
+/// op in flight for them; their windows are taken now, at every call
+/// (the token of the mutation about to be sent: a renewal since the op
+/// began moved them on). `Err(EIO)`: the caller holds a lock under no
+/// honoured grant — it is fenced (counted as an owner-fenced op).
+pub fn current_tag() -> Result<LockTag, Code> {
+    SCOPE.with(|s| {
+        let mut s = s.borrow_mut();
+        let Some(st) = s.as_mut() else {
+            return Ok(LockTag::NONE);
+        };
+        let tag = st
+            .tag
+            .get_or_insert_with(|| {
+                let tag = st.locks.caller_tag(st.pid, st.lock_owner);
+                if let Ok(t) = &tag {
+                    st.locks.meta.locks().tag_begin(t, now_ms());
+                }
+                tag
+            })
+            .clone();
+        let tag = tag.map(|captured| {
+            let base = if st.sent.is_empty() {
+                &captured
+            } else {
+                &st.sent
+            };
+            let fresh = st.locks.meta.locks().refresh_tag(base, now_ms());
+            st.sent = fresh.clone();
+            fresh
+        });
+        tag.map_err(|OwnerFenced| {
+            // What it publishes now was written under that lock: never
+            // published (see `take_lapsed`).
+            note_lapsed();
+            st.locks.meta.locks().note_owner_fenced_op();
+            tracing::debug!(
+                target: "constellation::locks",
+                pid = ?st.pid,
+                "refused a mutation: the caller holds a lock under no honoured grant (EIO)"
+            );
+            Code::Io
+        })
+    })
+}
+
+/// A mutation of this op was refused for a lapsed grant (`LockLapsed`):
+/// whether to send it again under a fresh rid and token — every grant it
+/// named is still held and honoured here, under a window that moved on
+/// since the refused token was taken (a renewal). The executor judged a
+/// window this node has since extended (a delegate's clock check, or a
+/// replay that waited), not an ended grant: an ended grant is renewed no
+/// more, so this is `false` again soon and the op is not re-sent for
+/// ever.
+pub fn reissue_after_lapse() -> bool {
+    SCOPE.with(|s| {
+        let s = s.borrow();
+        let Some(st) = s.as_ref() else {
+            return false;
+        };
+        if st.sent.is_empty() {
+            return false;
+        }
+        let now = now_ms();
+        let locks = st.locks.meta.locks();
+        let fresh = locks.refresh_tag(&st.sent, now);
+        fresh != st.sent && locks.tag_honoured(&fresh, now)
+    })
+}
+
+/// A tagged mutation of this op ended in doubt (it may still execute
+/// somewhere): its grants are not released before its tokens' windows
+/// are over.
+pub fn note_tag_in_doubt() {
+    SCOPE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            if st
+                .tag
+                .as_ref()
+                .is_some_and(|t| t.as_ref().is_ok_and(|t| !t.is_empty()))
+            {
+                st.in_doubt = true;
+                st.doubt = st.sent.clone();
+            }
+        }
+    });
+}
+
+thread_local! {
+    static LAPSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A mutation on this thread was refused for a lapsed lock grant (the
+/// fencing token): the publication it was part of is discarded
+/// ([`take_lapsed`]).
+pub fn note_lapsed() {
+    LAPSED.with(|l| l.set(true));
+}
+
+/// Whether a mutation on this thread was refused for a lapsed lock grant
+/// since the last call (clears it).
+pub fn take_lapsed() -> bool {
+    LAPSED.with(|l| l.replace(false))
+}
+
 /// One view's flush for a recalled lock grant (`Action::LockFlush`):
 /// what `fsync` guarantees, for one inode.
 pub trait LockFlush: Send + Sync {
-    fn flush_for_lock(&self, ino: Ino) -> bool;
+    /// `grant`: the grant about to be released (phase 2: the flush's
+    /// commit carries it as its fencing token).
+    fn flush_for_lock(&self, ino: Ino, grant: GrantId) -> bool;
+    /// The view's root directory: a refused replay of an op issued under
+    /// a lock keeps its conflict copy under the deepest mounted view root
+    /// above its file (`recovery::materialize_remote`).
+    fn view_root(&self) -> Ino;
 }
 
 /// Every mounted view's flush, for the driver's `Action::LockFlush`: a
@@ -617,7 +965,7 @@ impl LockFlushers {
 
     /// Flush `ino` in every live view (blocking; run it off the runtime).
     /// No live view: nothing in memory to flush.
-    pub fn flush(&self, ino: Ino) -> bool {
+    pub fn flush(&self, ino: Ino, grant: GrantId) -> bool {
         let views: Vec<Arc<dyn LockFlush>> = self
             .views
             .lock()
@@ -625,12 +973,27 @@ impl LockFlushers {
             .iter()
             .filter_map(|(_, w)| w.upgrade())
             .collect();
-        views.iter().all(|v| v.flush_for_lock(ino))
+        views.iter().all(|v| v.flush_for_lock(ino, grant))
+    }
+
+    /// Every live view's root directory.
+    pub fn view_roots(&self) -> Vec<Ino> {
+        self.views
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, w)| w.upgrade())
+            .map(|v| v.view_root())
+            .collect()
     }
 }
 
 /// The driver's hook for `Action::LockFlush` (blocking).
-pub type LockFlushHook = Arc<dyn Fn(Ino) -> bool + Send + Sync>;
+pub type LockFlushHook = Arc<dyn Fn(Ino, GrantId) -> bool + Send + Sync>;
+
+/// The driver's view of the mounted views' roots
+/// ([`LockFlushers::view_roots`]), for `Action::ConflictCopy`.
+pub type ViewRootsHook = Arc<dyn Fn() -> Vec<Ino> + Send + Sync>;
 
 // ---------------------------------------------------------------- wire
 
@@ -914,6 +1277,7 @@ mod tests {
             until_ms: 99,
             recalled: false,
             gen: 0,
+            confirmed_ms: Grant::UNCONFIRMED,
         }];
         assert_eq!(grants_of(&grants_wire(&grants)), grants);
         assert!(grants_of(&[]).is_empty());

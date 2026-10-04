@@ -47,6 +47,14 @@
 //!   files with the lock (git creates, links and renames under one
 //!   `flock`) gets `EIO` from every write and namespace op it issues
 //!   until its local locks are gone — other processes are not touched;
+//! - and what the owner already sent is refused where it lands: every
+//!   mutation of a lock owner carries a **fencing token** ([`LockTag`]:
+//!   its grants and the end of the window this node honours each for),
+//!   and whichever sequencer executes it refuses it once that window is
+//!   over on its own clock — unless the grant is live in its own table
+//!   (the minter, or the delegate it moved to: exact) — or once it ended
+//!   the grant ([`LockTables::check_tag`]); a grant is not released while
+//!   a mutation tagged with it is in flight ([`LockTables::release_blocked`]);
 //! - dirty data written under a grant that ended *without* its release's
 //!   flush (lapsed, lost, or unlocked while fenced) is never published:
 //!   the inode is **tainted**, and every point that would publish it
@@ -70,7 +78,7 @@
 use crate::session::Position;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -113,6 +121,80 @@ pub struct GrantId {
     pub seq: u64,
 }
 
+/// Plan 30 §M14 phase 2, the **fencing token**: one grant a mutation was
+/// issued under, as its issuing node honoured it — the grant's id and
+/// the end of the window that node honoured it for (`sent + ttl −
+/// margin` of its latest request or renewal, on the issuing node's
+/// clock). See [`LockTag`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LockToken {
+    pub grant: GrantId,
+    pub until_ms: i64,
+}
+
+/// The grants a mutation was issued under (empty: none — the op of a
+/// process that holds no cluster lock, which nothing checks).
+///
+/// A node tags a mutation when the process issuing it (or one of its
+/// ancestors, as the owner fence matches them) holds local locks: one
+/// [`LockToken`] per minting sequencer, the earliest window among that
+/// minter's grants under the owner's locks. Every executor rejects the
+/// op ([`LockTables::check_tag`]) once its own clock is at a token's
+/// `until_ms`: the minter records the grant live until `granted + ttl +
+/// margin` and grants no conflicting lock before that, which is at least
+/// `2 × margin` after the holder's window ended — so an executor whose
+/// clock is within that of the holder's (the lease machinery assumes
+/// half a margin) never runs a tagged op after a conflicting grant was
+/// made. The minter (or the delegate a grant moved to) judges exactly: a
+/// grant live in its table passes whatever the window, one it ended or
+/// outwaited is rejected at once. A node takes the token when it sends
+/// the op, from its current window ([`LockTables::refresh_tag`]). No
+/// generation is carried: a `GrantId` is unique across a minter's
+/// incarnations — that relies on [`LockTables::seed_ids`] seeding each
+/// incarnation's counter above the last one's (the incarnation in the
+/// high bits) — and keeps its id across delegation moves, and neither
+/// check needs more.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LockTag(pub Vec<LockToken>);
+
+impl LockTag {
+    pub const NONE: LockTag = LockTag(Vec::new());
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The earliest window among the tokens (`i64::MAX` with none).
+    pub fn until_ms(&self) -> i64 {
+        self.0.iter().map(|t| t.until_ms).min().unwrap_or(i64::MAX)
+    }
+
+    /// The wire form (`(minter, seq, until_ms)` per token).
+    pub fn to_wire(&self) -> Vec<(u64, u64, i64)> {
+        self.0
+            .iter()
+            .map(|t| (t.grant.node, t.grant.seq, t.until_ms))
+            .collect()
+    }
+
+    pub fn from_wire(w: &[(u64, u64, i64)]) -> LockTag {
+        LockTag(
+            w.iter()
+                .map(|&(node, seq, until_ms)| LockToken {
+                    grant: GrantId { node, seq },
+                    until_ms,
+                })
+                .collect(),
+        )
+    }
+}
+
+/// [`LockTables::owner_tag`]'s refusal: one of the owner's local locks is
+/// under no honoured, covering grant — the owner is fenced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerFenced;
+
 /// A grant the sequencer made, as its table keeps it (and as it travels
 /// to a backup's mirror or with a delegation move).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +209,24 @@ pub struct Grant {
     /// The M11 generation it was granted (or installed) under; 0 for the
     /// root's table. A generation's grants leave with it.
     pub gen: u64,
+    /// Phase 2: a token naming this grant whose window ends at or before
+    /// this (this table's clock) is judged by its window even while the
+    /// grant is live here ([`LockTables::check_tag`]). [`Self::MINTED`]
+    /// for a grant this table made or its holder renewed from the start;
+    /// [`Self::UNCONFIRMED`] for a copy installed without its holder — a
+    /// backup's mirror, a root's reinstated handoff copy — which may be a
+    /// grant its last sequencer had already ended; the holder's next
+    /// renewal sets it to the renewal's time ([`LockTables::extend`]), so
+    /// only an op it sent under a window running past that passes
+    /// whatever the window. A move keeps it.
+    pub confirmed_ms: i64,
+}
+
+impl Grant {
+    /// [`Grant::confirmed_ms`] of a grant confirmed from the start.
+    pub const MINTED: i64 = i64::MIN;
+    /// [`Grant::confirmed_ms`] of a copy no holder has renewed here yet.
+    pub const UNCONFIRMED: i64 = i64::MAX;
 }
 
 /// What a delegate hands back to the root with its recall answer: the
@@ -239,6 +339,9 @@ pub struct LockStats {
     pub requests: u64,
     pub local_hits: u64,
     pub local_conflicts: u64,
+    /// Phase 2: a new local turn waited for an earlier turn's mutations
+    /// tagged with the same grant ([`LocalOutcome::Predecessor`]).
+    pub predecessor_waits: u64,
     pub granted: u64,
     pub would_block: u64,
     pub unavailable: u64,
@@ -260,6 +363,11 @@ pub struct LockStats {
     /// Recalled grants given up before their first local lock: the
     /// requester gave up, or the first-use budget ran out.
     pub first_use_abandoned: u64,
+    /// Plan 30 §M14 phase 2: mutations this node issued tagged with the
+    /// grants their owner held (the fencing token), and releases held
+    /// back until such an op had been answered.
+    pub tagged_ops: u64,
+    pub release_waits: u64,
     /// Recalls that named a newer id of the same owner than the held
     /// one (adopted; see `recall_held`).
     pub recalled_superseded: u64,
@@ -282,6 +390,10 @@ pub struct LockStats {
     pub reclaimed: u64,
     pub waiters_parked: u64,
     pub grace_refusals: u64,
+    /// Plan 30 §M14 phase 2: tagged mutations this executor rejected
+    /// because a grant they named was no longer live (`EIO`, nothing
+    /// journaled).
+    pub token_rejections: u64,
 }
 
 /// `BTreeMap`s throughout: the renewal tick and the idle sweep iterate
@@ -322,7 +434,41 @@ struct Inner {
     /// Node side: lock owners whose grant ended under their local lock,
     /// by kernel lock owner (see [`LockTables::fenced_owners`]).
     fenced_owners: BTreeMap<u64, FencedOwner>,
+    /// Sequencer side (phase 2): grants this table ended by a release or
+    /// an outwait (an expired record dropped), kept until `TTL + 2 ×
+    /// margin` past the end of their record (`ended_keep_ms`) — a token
+    /// naming one is rejected at once ([`LockTables::check_tag`]). Moves
+    /// to and from a delegate are not ends.
+    ended: BTreeMap<GrantId, i64>,
+    /// Node side (phase 2): per grant, the tagged ops in flight and how
+    /// long one left in doubt may still execute somewhere — the grant is
+    /// not released before both are over ([`LockTables::release_blocked`]).
+    inflight: BTreeMap<GrantId, Inflight>,
+    /// Sequencer side (phase 2): how long past the end of its record an
+    /// ended grant stays in `ended` ([`LockTables::set_token_memory_ms`]:
+    /// `TTL + 2 × margin`, so an outwaited grant — whose record has
+    /// already expired when it ends — is remembered too).
+    ended_keep_ms: i64,
+    /// Node side (phase 2): the grant last held on each inode, for a
+    /// fence captured after the lapsed grant left `held`
+    /// ([`FencedOwner::grant`]).
+    last_held: BTreeMap<u64, GrantId>,
+    /// Node side (phase 2): told when a grant's last tagged mutation in
+    /// flight ended, so a release that waits for it goes on at once
+    /// ([`LockTables::set_release_wake`]).
+    release_wake: Option<ReleaseWake>,
     stats: LockStats,
+}
+
+/// See [`LockTables::set_release_wake`]: called with the inode whose
+/// held grant has no tagged mutation in flight any more.
+pub type ReleaseWake = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
+
+/// See `Inner::inflight`.
+#[derive(Clone, Copy, Debug, Default)]
+struct Inflight {
+    active: u32,
+    pinned_until_ms: i64,
 }
 
 /// A lock owner fenced on this node: its grant lapsed (or was lost)
@@ -339,9 +485,18 @@ pub struct FencedOwner {
     pub pid: u32,
     pub pid_start: u64,
     pub since_ms: i64,
+    /// The grant whose end fenced it (the one its lock was under), when
+    /// known: the fencing token named it on every op the owner issued
+    /// under that lock.
+    pub grant: Option<GrantId>,
 }
 
 const RELEASED_KEPT: usize = 512;
+
+/// Past this many ended grants the oldest go (an end forgotten early only
+/// leaves the token's window check, which a release cannot beat: the
+/// releasing node waits for its tagged ops first).
+const ENDED_KEPT: usize = 4096;
 /// Past this many `(inode, owner)` pairs the oldest inodes' go (a lost
 /// entry only admits what it would have refused before).
 const NEWEST_KEPT: usize = 4096;
@@ -363,18 +518,46 @@ impl Inner {
     /// `ino`'s local locks are under no honoured grant: fence their
     /// owners everywhere (kept until each owner's locks are gone, even if
     /// a new grant arrives meanwhile — the lock was not held throughout).
+    ///
+    /// Only the owners whose own lock is uncovered: a shared lock under
+    /// an honoured shared grant is still held when another owner's
+    /// exclusive lock on the same file lost its cover (the exclusive
+    /// grant lapsed and a shared one came for another request).
     fn capture(&mut self, ino: u64, now_ms: i64) {
         let Some(v) = self.local.get(&ino) else {
             return;
         };
+        let cover = self
+            .held
+            .get(&ino)
+            .filter(|h| h.until_ms > now_ms)
+            .map(|h| h.mode);
+        // Fenced since the grant's window ended (from then on every op of
+        // the owner is refused, whenever this capture runs), or now when
+        // there is no grant to tell.
+        let since = self
+            .held
+            .get(&ino)
+            .map(|h| h.until_ms)
+            .filter(|until| *until <= now_ms)
+            .unwrap_or(now_ms);
+        let grant = self
+            .held
+            .get(&ino)
+            .map(|h| h.id)
+            .or_else(|| self.last_held.get(&ino).copied());
         for l in v {
+            if cover.is_some_and(|m| m.covers(l.mode())) {
+                continue;
+            }
             if let std::collections::btree_map::Entry::Vacant(e) = self.fenced_owners.entry(l.owner)
             {
                 e.insert(FencedOwner {
                     owner: l.owner,
                     pid: l.pid,
                     pid_start: l.pid_start,
-                    since_ms: now_ms,
+                    since_ms: since,
+                    grant,
                 });
                 self.stats.owners_fenced += 1;
             }
@@ -391,6 +574,35 @@ impl Inner {
             .collect();
         for ino in fenced {
             self.capture(ino, now_ms);
+        }
+    }
+
+    /// Expired grant records leave the table, remembered as ended (an
+    /// outwait: the next holder may be granted from now on). Whether any
+    /// was dropped.
+    fn drop_expired(&mut self, now_ms: i64) -> bool {
+        if !self.grants.values().any(|e| e.until_ms <= now_ms) {
+            return false;
+        }
+        let expired: Vec<(GrantId, i64)> = self
+            .grants
+            .values()
+            .filter(|e| e.until_ms <= now_ms)
+            .map(|e| (e.id, e.until_ms))
+            .collect();
+        for (id, until) in expired {
+            self.grants.remove(&id);
+            self.note_ended(id, until);
+        }
+        true
+    }
+
+    /// `id` ended here with its record running to `until_ms`.
+    fn note_ended(&mut self, id: GrantId, until_ms: i64) {
+        let keep = until_ms.saturating_add(self.ended_keep_ms);
+        self.ended.insert(id, keep);
+        while self.ended.len() > ENDED_KEPT {
+            self.ended.pop_first();
         }
     }
 
@@ -479,6 +691,11 @@ pub struct LockTables {
     /// How long after its install a recalled grant waiting for its first
     /// local lock is still renewed (0: [`FIRST_USE_BUDGET_MS`]).
     first_use_budget_ms: AtomicI64,
+    /// Expired grant records were dropped (an outwait noticed by a
+    /// conflicting request or a token check) since the sequencer last
+    /// asked ([`LockTables::take_expired_dropped`]): its backup's mirror
+    /// is out of date.
+    expired_dropped: AtomicBool,
 }
 
 /// The default first-use budget: the session wait (2 s), the kernel
@@ -497,6 +714,12 @@ pub enum LocalOutcome {
     /// No grant covers `mode` (none, lapsed, recalled, or shared for an
     /// exclusive request): ask the sequencer for one.
     NeedGrant(LockMode),
+    /// Phase 2: the grant covers it, but no local lock is left on the
+    /// inode and mutations an earlier turn tagged with the grant are still
+    /// in flight, or ended in doubt inside their window: they may still
+    /// land at the minter, which honours the grant, after this turn's
+    /// writes. `EAGAIN`, or wait and ask again (as for `Conflict`).
+    Predecessor,
 }
 
 impl LockTables {
@@ -614,6 +837,7 @@ impl LockTables {
                 until_ms,
                 recalled: false,
                 gen,
+                confirmed_ms: Grant::MINTED,
             },
         );
         g.stats.grants_made += 1;
@@ -657,7 +881,9 @@ impl LockTables {
     /// with `mode`. Expired grants are dropped on the way.
     pub fn conflicting(&self, ino: u64, node: u64, mode: LockMode, now_ms: i64) -> Vec<Grant> {
         let mut g = self.lock();
-        g.grants.retain(|_, e| e.until_ms > now_ms);
+        if g.drop_expired(now_ms) {
+            self.expired_dropped.store(true, Ordering::Relaxed);
+        }
         g.grants
             .values()
             .filter(|e| e.ino == ino && e.node != node && e.mode.conflicts(mode))
@@ -681,12 +907,20 @@ impl LockTables {
         self.lock().grants.get(&id).copied()
     }
 
-    /// Extend a known grant of `node`: `(mode, recalled)`, or `None` when
-    /// unknown.
-    pub fn extend(&self, id: GrantId, node: u64, until_ms: i64) -> Option<(LockMode, bool)> {
+    /// Extend a known grant of `node` at its renewal (`now_ms`):
+    /// `(mode, recalled)`, or `None` when unknown. The renewal confirms an
+    /// installed copy from `now_ms` on ([`Grant::confirmed_ms`]).
+    pub fn extend(
+        &self,
+        id: GrantId,
+        node: u64,
+        until_ms: i64,
+        now_ms: i64,
+    ) -> Option<(LockMode, bool)> {
         let mut g = self.lock();
         let e = g.grants.get_mut(&id).filter(|e| e.node == node)?;
         e.until_ms = e.until_ms.max(until_ms);
+        e.confirmed_ms = e.confirmed_ms.min(now_ms);
         Some((e.mode, e.recalled))
     }
 
@@ -702,8 +936,91 @@ impl LockTables {
         }
     }
 
+    /// The grant ended here (released, or outwaited): gone from the
+    /// table, and remembered as ended until its record would have expired
+    /// (a token naming it is rejected meanwhile, [`Self::check_tag`]).
     pub fn forget(&self, id: GrantId) -> Option<Grant> {
-        self.lock().grants.remove(&id)
+        let mut g = self.lock();
+        let gone = g.grants.remove(&id);
+        if let Some(e) = gone {
+            g.note_ended(id, e.until_ms);
+        }
+        gone
+    }
+
+    /// How long an ended grant is remembered past the end of its record:
+    /// the sequencer's `TTL + 2 × margin`. An outwaited grant ends when
+    /// its record has expired already; remembered only until then, its
+    /// id was forgotten at the first prune (lock-fence-token review).
+    pub fn set_token_memory_ms(&self, ms: i64) {
+        self.lock().ended_keep_ms = ms.max(0);
+    }
+
+    /// Plan 30 §M14 phase 2, the fencing token at the executor: `Err` with
+    /// the first token of `tag` naming a grant that is no longer live — its
+    /// holder's window has passed on this clock (`now_ms >= until_ms`), or
+    /// this table ended the grant (released or outwaited). The caller then
+    /// executes nothing (`MetaError::LockLapsed`). An empty tag costs
+    /// nothing.
+    ///
+    /// A grant live in this table (the minter, or the delegate it moved
+    /// to) is judged exactly: it passes whatever the token's window says,
+    /// as no conflicting grant can exist while it is here — a holder that
+    /// kept renewing it is not refused because its op was slower than
+    /// the window it set out with (lock-fence-token review). One whose
+    /// record has expired here is dead (an outwait), as is one this
+    /// table ended. Except: a grant installed here from a copy (a mirror,
+    /// a reinstated handoff) may be one its last sequencer had ended, so
+    /// a token whose window ends before the holder's first renewal here
+    /// confirmed it ([`Grant::confirmed_ms`]) is judged by that window
+    /// (lock-fence-token review, round 2: an inbox op drained by a new
+    /// holder that installed a stale mirror).
+    pub fn check_tag(&self, tag: &LockTag, now_ms: i64) -> Result<(), LockToken> {
+        if tag.is_empty() {
+            return Ok(());
+        }
+        let mut g = self.lock();
+        if g.ended.len() > 256 {
+            g.ended.retain(|_, keep| *keep > now_ms);
+        }
+        if g.drop_expired(now_ms) {
+            self.expired_dropped.store(true, Ordering::Relaxed);
+        }
+        let dead = tag
+            .0
+            .iter()
+            .find(|t| {
+                if g.grants
+                    .get(&t.grant)
+                    .is_some_and(|e| t.until_ms > e.confirmed_ms)
+                {
+                    return false;
+                }
+                now_ms >= t.until_ms || g.ended.contains_key(&t.grant)
+            })
+            .copied();
+        match dead {
+            Some(t) => {
+                g.stats.token_rejections += 1;
+                Err(t)
+            }
+            None => {
+                // Evidence for a harness (off by default): when each grant
+                // last let an op through here, on this node's clock — none
+                // may after another node got the lock.
+                for t in &tag.0 {
+                    // In the message, not as fields: a harness parses it
+                    // from logs that style field names.
+                    tracing::debug!(
+                        target: "constellation::token_exec",
+                        "tagged op executed minter={} seq={} at_ms={now_ms}",
+                        t.grant.node,
+                        t.grant.seq,
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Grants whose `until_ms` has passed (still in the table).
@@ -748,6 +1065,13 @@ impl LockTables {
             g.grants.remove(&t.id);
         }
         taken
+    }
+
+    /// Whether expired records were dropped since the last call (the
+    /// sequencer's mirror must be sent again).
+    pub fn take_expired_dropped(&self) -> bool {
+        self.expired_dropped.load(Ordering::Relaxed)
+            && self.expired_dropped.swap(false, Ordering::Relaxed)
     }
 
     pub fn clear_grants(&self) -> usize {
@@ -868,6 +1192,10 @@ impl LockTables {
             held.installed_ms = old.installed_ms;
         }
         let recalled = held.recalled;
+        g.last_held.insert(ino, held.id);
+        while g.last_held.len() > NEWEST_KEPT {
+            g.last_held.pop_first();
+        }
         if let Some(old) = g.held.insert(ino, held) {
             if old.id != held.id {
                 // Replaced (an upgrade, a fresh grant after a lapse): the
@@ -1215,6 +1543,204 @@ impl LockTables {
         g.fenced_owners.values().copied().collect()
     }
 
+    /// Whether no local lock exists on this node (one relaxed load: the
+    /// fences' and the fencing token's fast path).
+    pub fn lockers_none(&self) -> bool {
+        self.local_inos.load(Ordering::Relaxed) == 0
+    }
+
+    /// Every local lock's owner and the process that took it (the
+    /// callers a mutation is tagged for, matched by the FUSE side).
+    /// Empty, with one relaxed load, while no local lock exists.
+    pub fn lockers(&self) -> Vec<(u64, u32, u64)> {
+        if self.local_inos.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+        let g = self.lock();
+        let mut out: Vec<(u64, u32, u64)> = g
+            .local
+            .values()
+            .flatten()
+            .map(|l| (l.owner, l.pid, l.pid_start))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Plan 30 §M14 phase 2: the tag a mutation of the lock owners
+    /// `owners` carries — per minting sequencer, the earliest honoured
+    /// window among the grants their local locks are under (see
+    /// [`LockTag`]). `Err` when one of their locks is under no honoured,
+    /// covering grant: the owner is fenced (its op is refused, `EIO`).
+    /// Empty when they hold no local lock.
+    pub fn owner_tag(&self, owners: &[u64], now_ms: i64) -> Result<LockTag, OwnerFenced> {
+        if owners.is_empty() {
+            return Ok(LockTag::NONE);
+        }
+        let g = self.lock();
+        let mut per_minter: BTreeMap<u64, LockToken> = BTreeMap::new();
+        for (ino, v) in &g.local {
+            for l in v.iter().filter(|l| owners.contains(&l.owner)) {
+                let h = g
+                    .held
+                    .get(ino)
+                    .filter(|h| h.until_ms > now_ms && h.mode.covers(l.mode()))
+                    .ok_or(OwnerFenced)?;
+                let t = LockToken {
+                    grant: h.id,
+                    until_ms: h.until_ms,
+                };
+                let e = per_minter.entry(h.id.node).or_insert(t);
+                if t.until_ms < e.until_ms {
+                    *e = t;
+                }
+            }
+        }
+        Ok(LockTag(per_minter.into_values().collect()))
+    }
+
+    /// A mutation tagged with `tag` is in flight from this node: none of
+    /// its grants is released before [`Self::tag_end`].
+    pub fn tag_begin(&self, tag: &LockTag, now_ms: i64) {
+        if tag.is_empty() {
+            return;
+        }
+        let mut g = self.lock();
+        // An entry pinned by an op left in doubt goes once its pin is
+        // over, whether or not a release ever asked about its grant (one
+        // that lapsed instead stayed for ever).
+        g.inflight
+            .retain(|_, e| e.active > 0 || e.pinned_until_ms > now_ms);
+        g.stats.tagged_ops += 1;
+        for t in &tag.0 {
+            g.inflight.entry(t.grant).or_default().active += 1;
+        }
+    }
+
+    /// The mutation [`Self::tag_begin`] announced was answered. `in_doubt`:
+    /// it may still execute somewhere (a forward neither answered nor
+    /// refused) — until its tokens' windows are over, after which every
+    /// executor rejects it; the grants are not released before then.
+    pub fn tag_end(&self, tag: &LockTag, in_doubt: bool, now_ms: i64) {
+        if tag.is_empty() {
+            return;
+        }
+        let mut wake = Vec::new();
+        let mut g = self.lock();
+        for t in &tag.0 {
+            let Some(e) = g.inflight.get_mut(&t.grant) else {
+                continue;
+            };
+            e.active = e.active.saturating_sub(1);
+            if in_doubt {
+                e.pinned_until_ms = e.pinned_until_ms.max(t.until_ms);
+            }
+            if e.active == 0 && e.pinned_until_ms <= now_ms {
+                g.inflight.remove(&t.grant);
+                // A recalled grant's release may be waiting for this (an
+                // idle one's too: `idle_before` marks it recalled).
+                if let Some(ino) = g
+                    .held
+                    .iter()
+                    .find(|(_, h)| h.id == t.grant && h.recalled)
+                    .map(|(ino, _)| *ino)
+                {
+                    wake.push(ino);
+                }
+            }
+        }
+        let hook = g.release_wake.clone();
+        drop(g);
+        if let Some(hook) = hook {
+            for ino in wake {
+                hook(ino);
+            }
+        }
+    }
+
+    /// Install the hook [`Self::tag_end`] calls when a recalled grant's
+    /// last tagged mutation in flight ended (the release waiting for it
+    /// goes on then instead of at its next poll).
+    pub fn set_release_wake(&self, wake: ReleaseWake) {
+        self.lock().release_wake = Some(wake);
+    }
+
+    /// The grants this node holds now (`[minter, seq]` each), for
+    /// `status`.
+    pub fn held_ids(&self) -> Vec<GrantId> {
+        self.lock().held.values().map(|h| h.id).collect()
+    }
+
+    /// Whether every grant `tag` names is held here and honoured at
+    /// `now_ms`.
+    pub fn tag_honoured(&self, tag: &LockTag, now_ms: i64) -> bool {
+        let g = self.lock();
+        tag.0.iter().all(|t| {
+            g.held
+                .values()
+                .any(|h| h.id == t.grant && h.until_ms > now_ms)
+        })
+    }
+
+    /// `tag` with each token's window brought up to date: a grant this
+    /// node still holds and honours at `now_ms` is named with the end of
+    /// its current window (renewals move it), any other keeps the window
+    /// it had. Phase 2 takes an op's token when it is sent, not when the
+    /// op started: a close whose flush took long, or a retry, is not
+    /// refused for the window its op set out with.
+    pub fn refresh_tag(&self, tag: &LockTag, now_ms: i64) -> LockTag {
+        if tag.is_empty() {
+            return LockTag::NONE;
+        }
+        let g = self.lock();
+        LockTag(
+            tag.0
+                .iter()
+                .map(|t| {
+                    let until = g
+                        .held
+                        .values()
+                        .find(|h| h.id == t.grant && h.until_ms > now_ms)
+                        .map_or(t.until_ms, |h| h.until_ms.max(t.until_ms));
+                    LockToken {
+                        grant: t.grant,
+                        until_ms: until,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether `grant` must not be released yet: a mutation tagged with it
+    /// is in flight, or one left in doubt may still execute (phase 2's
+    /// release ordering — a released grant's stale op must never land
+    /// after the next holder's). `Some(t)`: not before `t` (in doubt
+    /// only; `None` with ops in flight: when they are answered).
+    pub fn release_blocked(&self, grant: GrantId, now_ms: i64) -> Option<Option<i64>> {
+        let mut g = self.lock();
+        let e = g.inflight.get(&grant).copied()?;
+        if e.active > 0 {
+            return Some(None);
+        }
+        if e.pinned_until_ms > now_ms {
+            return Some(Some(e.pinned_until_ms));
+        }
+        g.inflight.remove(&grant);
+        None
+    }
+
+    /// The owners fenced at `now_ms`, for `status`: as
+    /// [`Self::fenced_owners`] (a lapse no op has looked at yet is
+    /// captured here too), but empty — with no capture — while no local
+    /// lock exists.
+    pub fn fenced_owners_snapshot(&self, now_ms: i64) -> Vec<FencedOwner> {
+        if self.local_inos.load(Ordering::Relaxed) == 0 {
+            return self.lock().fenced_owners.values().copied().collect();
+        }
+        self.fenced_owners(now_ms)
+    }
+
     /// An op of a fenced owner was refused (counted).
     pub fn note_owner_fenced_op(&self) {
         self.lock().stats.owner_fenced_ops += 1;
@@ -1237,14 +1763,16 @@ impl LockTables {
             return None;
         }
         let mut g = self.lock();
-        if let Some(h) = g.held.get(&ino).copied().filter(|h| h.until_ms <= now_ms) {
+        let lapsed = g.held.get(&ino).copied().filter(|h| h.until_ms <= now_ms);
+        if let Some(h) = lapsed {
             g.held.remove(&ino);
             g.tombstone(h.id);
             g.taint(ino);
         }
         let fenced = g.fenced_at(ino, now_ms);
         if fenced {
-            g.capture(ino, now_ms);
+            // Fenced since the dropped grant's window ended, not since now.
+            g.capture(ino, lapsed.map_or(now_ms, |h| h.until_ms));
         }
         let tainted = g.taint.remove(&ino);
         if fenced {
@@ -1394,6 +1922,23 @@ impl LockTables {
         if !covered {
             return LocalOutcome::NeedGrant(need);
         }
+        // A new turn on this node under a grant an earlier turn's ops are
+        // still tagged with (in flight, or in doubt and not yet past their
+        // windows) waits for them: the grant is live at its minter, so the
+        // token would let them land after this turn's writes (review
+        // round 2, should-fix 1). The release waits the same way.
+        let new_turn = g.local.get(&ino).is_none_or(|v| v.is_empty());
+        if new_turn {
+            let id = g.held.get(&ino).map(|h| h.id);
+            if id.is_some_and(|id| {
+                g.inflight
+                    .get(&id)
+                    .is_some_and(|e| e.active > 0 || e.pinned_until_ms > now_ms)
+            }) {
+                g.stats.predecessor_waits += 1;
+                return LocalOutcome::Predecessor;
+            }
+        }
         if let Some(h) = g.held.get_mut(&ino) {
             h.first_use = false;
             h.idle_since_ms = None;
@@ -1513,6 +2058,24 @@ impl crate::Meta {
     pub fn locks(&self) -> &LockTables {
         &self.locks
     }
+
+    /// Plan 30 §M14 phase 2: run `f` — a journaled write that is not a
+    /// `MutateOp` execution (the holder's own manifest commit) — under the
+    /// fencing token `tag`, checked at `now_ms` as
+    /// [`crate::mutate::execute_tagged`] checks it, and recorded with the
+    /// transaction's `journal_tx` row.
+    pub fn with_lock_tag<T>(
+        &self,
+        tag: &LockTag,
+        now_ms: i64,
+        f: impl FnOnce() -> Result<T, crate::MetaError>,
+    ) -> Result<T, crate::MetaError> {
+        if self.locks.check_tag(tag, now_ms).is_err() {
+            return Err(crate::MetaError::LockLapsed);
+        }
+        let _tag = crate::store::journal::PendingLockTag::set(tag);
+        f()
+    }
 }
 
 #[cfg(test)]
@@ -1558,6 +2121,7 @@ mod tests {
             until_ms: 100,
             recalled: false,
             gen: 0,
+            confirmed_ms: Grant::UNCONFIRMED,
         };
         // Node 2 was granted again (a newer id): the old copy stays out.
         t.install(copy(2, 5, LockMode::Shared));
@@ -1816,7 +2380,8 @@ mod tests {
                 owner: 1,
                 pid: 10,
                 pid_start: 0,
-                since_ms: 100
+                since_ms: 100,
+                grant: Some(GrantId { node: 1, seq: 1 }),
             }]
         );
         assert_eq!(t.stats().owners_fenced, 1);
@@ -2203,5 +2768,380 @@ mod supersede_tests {
         };
         assert!(matches!(t.install_held(7, other), Installed::Ok { .. }));
         assert!(t.held(7).unwrap().first_use);
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    fn held(mode: LockMode, until: i64) -> HeldGrant {
+        HeldGrant {
+            id: GrantId { node: 1, seq: 1 },
+            mode,
+            until_ms: until,
+            renew_at_ms: until / 2,
+            owner: 1,
+            recalled: false,
+            position: Position::ZERO,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since_ms: None,
+            installed_ms: 0,
+        }
+    }
+
+    fn lk(owner: u64, write: bool, start: u64, end: u64) -> LocalLock {
+        LocalLock {
+            owner,
+            pid: 1,
+            pid_start: 0,
+            write,
+            start,
+            end,
+        }
+    }
+
+    // ---- plan 30 §M14 phase 2: the fencing token ----
+
+    /// The executor's check. A grant live in this table (the minter's)
+    /// passes whatever the token's window says: the holder renewed it,
+    /// so no conflicting grant exists (lock-fence-token review must-fix
+    /// 2). One this table does not have is judged by the window; one it
+    /// ended — released, or outwaited (its record expired) — is dead at
+    /// once and stays dead for `TTL + 2 × margin` past its record (review
+    /// should-fix 3: an outwaited id used to be forgotten at the first
+    /// prune). A move to a delegate is not an end.
+    #[test]
+    fn a_token_dies_with_its_grant_or_its_window_where_the_grant_is_unknown() {
+        let t = LockTables::default();
+        t.set_token_memory_ms(3_000);
+        let id = t.grant(1, 2, 7, LockMode::Exclusive, 1_000, 0);
+        let tag = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 500,
+        }]);
+        assert_eq!(t.check_tag(&LockTag::NONE, i64::MAX), Ok(()));
+        assert_eq!(t.check_tag(&tag, 499), Ok(()));
+        assert_eq!(t.check_tag(&tag, 700), Ok(()), "live here: exact");
+        // Moved away (a delegation): not ended; the window judges.
+        let moved = t.take_where(|_| true);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(t.check_tag(&tag, 100), Ok(()));
+        assert!(
+            t.check_tag(&tag, 500).is_err(),
+            "unknown here, at the window: dead"
+        );
+        t.install(moved[0]);
+        // Released: dead at once, whatever the window says.
+        assert!(t.forget(id).is_some());
+        assert!(t.check_tag(&tag, 100).is_err());
+        // Outwaited: the record expired (a conflicting request found it
+        // so); a token whose window still runs is refused all the same,
+        // through 257 other ends (the prune) and for the memory's span.
+        let out = t.grant(1, 3, 8, LockMode::Exclusive, 2_000, 0);
+        let late = LockTag(vec![LockToken {
+            grant: out,
+            until_ms: 9_000,
+        }]);
+        assert!(t.conflicting(8, 4, LockMode::Exclusive, 2_000).is_empty());
+        for k in 0..300 {
+            let g = t.grant(1, 10 + k, 100 + k, LockMode::Shared, 2_100, 0);
+            t.forget(g);
+        }
+        assert!(t.check_tag(&late, 4_000).is_err(), "outwaited: remembered");
+        assert!(t.check_tag(&late, 4_999).is_err());
+        // Past `until + memory` only the window is left.
+        assert_eq!(t.check_tag(&late, 5_001), Ok(()));
+        let s = t.stats();
+        assert_eq!(s.token_rejections, 4);
+    }
+
+    /// Review round 2, must-fix 2: a grant installed from a copy (a
+    /// backup's mirror, a root's reinstated handoff copy) may be one its
+    /// last sequencer ended, so it passes a token only inside its window
+    /// until its holder renews it here; from that renewal on, a token
+    /// whose window ends after it passes whatever the window, an older
+    /// one still only inside it.
+    #[test]
+    fn an_installed_copy_is_judged_by_the_window_until_its_holder_renews() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 9 };
+        let copy = Grant {
+            id,
+            node: 2,
+            ino: 7,
+            mode: LockMode::Exclusive,
+            until_ms: 10_000,
+            recalled: false,
+            gen: 0,
+            confirmed_ms: Grant::UNCONFIRMED,
+        };
+        assert!(t.install_if_consistent(copy));
+        let old = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 500,
+        }]);
+        assert_eq!(t.check_tag(&old, 499), Ok(()));
+        assert!(t.check_tag(&old, 500).is_err(), "unconfirmed: the window");
+        assert_eq!(
+            t.extend(id, 2, 12_000, 1_000),
+            Some((LockMode::Exclusive, false))
+        );
+        assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
+        assert!(t.check_tag(&old, 1_200).is_err(), "sent before the renewal");
+        let new = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 1_500,
+        }]);
+        assert_eq!(t.check_tag(&new, 3_000), Ok(()), "confirmed: exact");
+        // A later renewal never moves the confirmation forward.
+        t.extend(id, 2, 13_000, 2_000);
+        assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
+        // A grant made here is confirmed from the start.
+        let made = t.grant(1, 3, 8, LockMode::Exclusive, 10_000, 0);
+        assert_eq!(t.get(made).unwrap().confirmed_ms, Grant::MINTED);
+    }
+
+    /// A token is taken when its op is sent: a renewal since the op began
+    /// moves its window on (`refresh_tag`); a grant no longer honoured
+    /// here keeps the old window (the executor judges it).
+    #[test]
+    fn a_tokens_window_is_refreshed_from_the_held_grant() {
+        let t = LockTables::default();
+        t.install_held(7, held(LockMode::Exclusive, 1_000));
+        let id = GrantId { node: 1, seq: 1 };
+        let old = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 600,
+        }]);
+        let fresh = t.refresh_tag(&old, 500);
+        assert_eq!(fresh.0[0].until_ms, 1_000);
+        assert!(t.tag_honoured(&fresh, 500));
+        // Past the held window: not honoured, nothing to refresh from.
+        assert_eq!(t.refresh_tag(&old, 1_000), old);
+        assert!(!t.tag_honoured(&old, 1_000));
+        let other = LockTag(vec![LockToken {
+            grant: GrantId { node: 1, seq: 9 },
+            until_ms: 600,
+        }]);
+        assert_eq!(t.refresh_tag(&other, 500), other);
+        assert!(!t.tag_honoured(&other, 500));
+    }
+
+    /// The release ordering's bookkeeping does not leak: an entry pinned
+    /// by an op left in doubt goes once its pin is over, at the next
+    /// op's start, even if no release ever asks about its grant (review
+    /// should-fix 4). The last op of a recalled grant wakes its release.
+    #[test]
+    fn in_flight_pins_expire_and_the_last_op_wakes_the_release() {
+        let t = LockTables::default();
+        let woken = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let w = woken.clone();
+        t.set_release_wake(std::sync::Arc::new(move |ino| w.lock().unwrap().push(ino)));
+        let lapsed = GrantId { node: 1, seq: 7 };
+        let tag = |grant, until_ms| LockTag(vec![LockToken { grant, until_ms }]);
+        t.tag_begin(&tag(lapsed, 300), 0);
+        t.tag_end(&tag(lapsed, 300), true, 10);
+        assert_eq!(t.lock().inflight.len(), 1, "pinned");
+        // Another grant's op, after the pin: the stale entry goes.
+        t.install_held(
+            7,
+            HeldGrant {
+                recalled: true,
+                ..held(LockMode::Exclusive, 1_000)
+            },
+        );
+        let live = GrantId { node: 1, seq: 1 };
+        t.tag_begin(&tag(live, 900), 400);
+        assert_eq!(t.lock().inflight.len(), 1, "only the live grant's");
+        assert!(woken.lock().unwrap().is_empty());
+        t.tag_end(&tag(live, 900), false, 410);
+        assert_eq!(
+            *woken.lock().unwrap(),
+            vec![7],
+            "the recalled grant's release"
+        );
+    }
+
+    /// The node side: an owner's tag names, per minter, the earliest
+    /// honoured window among its locks' grants; an owner with a lock
+    /// under no honoured, covering grant gets none (it is fenced).
+    #[test]
+    fn an_owners_tag_is_the_earliest_window_per_minter() {
+        let t = LockTables::default();
+        let g = |node, seq, mode, until| HeldGrant {
+            id: GrantId { node, seq },
+            ..held(mode, until)
+        };
+        t.install_held(7, g(1, 1, LockMode::Exclusive, 900));
+        t.install_held(8, g(1, 2, LockMode::Exclusive, 600));
+        t.install_held(9, g(3, 1, LockMode::Shared, 800));
+        assert_eq!(
+            t.local_set(7, lk(10, true, 0, u64::MAX), 0),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(8, lk(10, true, 0, u64::MAX), 0),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(9, lk(10, false, 0, u64::MAX), 0),
+            LocalOutcome::Done
+        );
+        assert_eq!(
+            t.local_set(7, lk(11, false, 0, 0), 0),
+            LocalOutcome::Conflict(lk(10, true, 0, u64::MAX))
+        );
+        assert_eq!(t.owner_tag(&[], 0), Ok(LockTag::NONE));
+        assert_eq!(t.owner_tag(&[12], 0), Ok(LockTag(Vec::new())));
+        let tag = t.owner_tag(&[10], 100).unwrap();
+        assert_eq!(
+            tag.0,
+            vec![
+                LockToken {
+                    grant: GrantId { node: 1, seq: 2 },
+                    until_ms: 600
+                },
+                LockToken {
+                    grant: GrantId { node: 3, seq: 1 },
+                    until_ms: 800
+                },
+            ]
+        );
+        assert_eq!(tag.until_ms(), 600);
+        assert_eq!(LockTag::from_wire(&tag.to_wire()), tag);
+        // Past one grant's window: no tag (fenced).
+        assert_eq!(t.owner_tag(&[10], 600), Err(OwnerFenced));
+        let mut lockers = t.lockers();
+        lockers.sort();
+        assert_eq!(lockers, vec![(10, 1, 0)]);
+    }
+
+    /// Release ordering's bookkeeping: a grant is held back while a tagged
+    /// op is in flight, and after one ended in doubt until its window.
+    #[test]
+    fn a_grant_with_tagged_ops_in_flight_is_held_back() {
+        let t = LockTables::default();
+        let id = GrantId { node: 1, seq: 4 };
+        let tag = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 500,
+        }]);
+        assert_eq!(t.release_blocked(id, 0), None);
+        t.tag_begin(&tag, 0);
+        t.tag_begin(&tag, 0);
+        assert_eq!(t.release_blocked(id, 0), Some(None));
+        t.tag_end(&tag, false, 10);
+        assert_eq!(t.release_blocked(id, 10), Some(None));
+        t.tag_end(&tag, true, 20);
+        assert_eq!(t.release_blocked(id, 20), Some(Some(500)));
+        assert_eq!(t.release_blocked(id, 500), None);
+        assert_eq!(t.stats().tagged_ops, 2);
+    }
+
+    /// Review round 2, should-fix 1: owner 10's op under the grant ends
+    /// in doubt, 10 unlocks, and owner 11 on the same node locks under the
+    /// same held grant. The grant is live at its minter, so 10's op could
+    /// land after 11's writes: 11's lock waits (`Predecessor`) while the
+    /// op is in flight and until its window is over. An owner that joins
+    /// a turn still holding a lock there does not wait.
+    #[test]
+    fn a_new_turn_waits_for_the_previous_turns_tagged_ops() {
+        let t = LockTables::default();
+        t.install_held(7, held(LockMode::Exclusive, 10_000));
+        let id = GrantId { node: 1, seq: 1 };
+        let tag = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 500,
+        }]);
+        assert_eq!(t.local_set(7, lk(10, true, 0, 9), 0), LocalOutcome::Done);
+        t.tag_begin(&tag, 0);
+        assert_eq!(
+            t.local_set(7, lk(11, false, 20, 29), 0),
+            LocalOutcome::Done,
+            "a lock beside the turn's"
+        );
+        t.local_unlock(7, 11, 0, u64::MAX, 0);
+        t.local_unlock(7, 10, 0, u64::MAX, 10);
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), 10),
+            LocalOutcome::Predecessor,
+            "in flight"
+        );
+        t.tag_end(&tag, true, 20);
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), 499),
+            LocalOutcome::Predecessor,
+            "in doubt inside its window"
+        );
+        assert_eq!(t.local_set(7, lk(11, true, 0, 9), 500), LocalOutcome::Done);
+        assert_eq!(t.stats().predecessor_waits, 2);
+    }
+
+    /// The review nit: a shared lock under an honoured shared grant is not
+    /// fenced because another owner's exclusive lock on the same file lost
+    /// its cover. (The owner replaced the node's exclusive grant with a
+    /// fresh shared one before the exclusive one lapsed here — after a
+    /// takeover, say: the shared owner was covered throughout.)
+    #[test]
+    fn only_the_uncovered_owner_is_fenced_on_a_shared_grant() {
+        let t = LockTables::default();
+        t.install_held(7, held(LockMode::Exclusive, 200));
+        assert_eq!(t.local_set(7, lk(10, true, 0, 9), 0), LocalOutcome::Done);
+        assert_eq!(t.local_set(7, lk(11, false, 20, 29), 0), LocalOutcome::Done);
+        t.install_held(
+            7,
+            HeldGrant {
+                id: GrantId { node: 1, seq: 2 },
+                installed_ms: 150,
+                ..held(LockMode::Shared, 300)
+            },
+        );
+        let fenced: Vec<u64> = t.fenced_owners(160).iter().map(|f| f.owner).collect();
+        assert_eq!(fenced, vec![10], "the shared owner keeps its lock");
+    }
+
+    /// The token's cost on the wire (postcard, as `MutateRequest` and the
+    /// inbox carry it): one byte without a lock; one grant from a minter
+    /// with a full-width node id, a seq in the millions and a unix-ms
+    /// window, 20 bytes more (21 in all).
+    #[test]
+    fn a_token_costs_a_byte_without_a_lock_and_21_with_one() {
+        let none = postcard::to_allocvec(&LockTag::NONE.to_wire()).unwrap();
+        assert_eq!(none.len(), 1);
+        let one = LockTag(vec![LockToken {
+            grant: GrantId {
+                node: u64::MAX - 7,
+                seq: 3_000_000,
+            },
+            until_ms: 1_790_000_000_000,
+        }]);
+        let bytes = postcard::to_allocvec(&one.to_wire()).unwrap();
+        assert_eq!(bytes.len(), 1 + 10 + 4 + 6, "{bytes:?}");
+    }
+
+    /// A fence's start is the grant's lapse, whichever path notices it
+    /// (an op, the publish gate, the renewal tick, `status`): from then on
+    /// every op of the owner is refused. A harness compares it with when
+    /// another node got the lock.
+    #[test]
+    fn a_fence_starts_when_the_grant_lapsed_whoever_notices() {
+        for path in 0..3 {
+            let t = LockTables::default();
+            t.install_held(7, held(LockMode::Exclusive, 100));
+            assert_eq!(
+                t.local_set(7, lk(10, true, 0, u64::MAX), 0),
+                LocalOutcome::Done
+            );
+            match path {
+                0 => assert_eq!(t.take_discard(7, 5_000), Some(true)),
+                1 => assert!(t.fenced(7, 5_000)),
+                _ => assert_eq!(t.fenced_owners_snapshot(5_000).len(), 1),
+            }
+            let since: Vec<i64> = t.fenced_owners(5_000).iter().map(|f| f.since_ms).collect();
+            assert_eq!(since, vec![100], "path {path}");
+        }
     }
 }

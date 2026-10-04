@@ -780,6 +780,7 @@ fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
                 manifest: last,
                 size: 4,
             },
+            &Default::default(),
         )
         .unwrap();
     let queued = holder.pending_replays().unwrap();

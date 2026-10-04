@@ -10,6 +10,7 @@ use crate::event::PeerMsg;
 use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
 use crate::replica::Replica;
 use constellation_meta::delegation::Ownership;
+use constellation_meta::locks::LockTag;
 use constellation_meta::{
     LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position, RemoteBlockers, Rid,
     TouchSet,
@@ -54,6 +55,7 @@ impl Core {
         op: MutateOp,
         acked_through: u64,
         (deps, applied): (Position, Seq),
+        tag: LockTag,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -84,6 +86,7 @@ impl Core {
                 &op,
                 deps,
                 acked_through,
+                &tag,
                 replica,
                 out,
             )
@@ -251,6 +254,7 @@ impl Core {
                             rid,
                             op,
                             acked_through,
+                            tag,
                             out,
                         );
                     }
@@ -268,13 +272,14 @@ impl Core {
                         rid,
                         op,
                         acked_through,
+                        tag,
                         out,
                     );
                 }
                 return;
             }
             base = self.reply_base(&op, replica);
-            let (outcome, executed) = self.holder_execute(now, epoch, rid, &op, replica, out);
+            let (outcome, executed) = self.holder_execute(now, epoch, rid, &op, &tag, replica, out);
             fresh = executed;
             // Plan 30 §M6: the state the op was evaluated against, its
             // own rows included — everything shipped through `head_seq`,
@@ -613,12 +618,14 @@ impl Core {
     /// to install the existing entry. The second value is set when the op
     /// executed just now: the inodes its records touched (plan 30 §M8's
     /// recall set).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn holder_execute(
         &mut self,
         now: Ms,
         epoch: Epoch,
         rid: Rid,
         op: &MutateOp,
+        tag: &LockTag,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> (MutateOutcome, Option<Vec<u64>>) {
@@ -656,7 +663,7 @@ impl Core {
             rseq = rid.seq,
             "holder: executing a forwarded op"
         );
-        let outcome = match replica.execute(op, Some(rid)) {
+        let outcome = match replica.execute(op, Some(rid), tag, now.0) {
             Ok(records) => {
                 replica.remember_outcome(rid, &records);
                 if rid.node != self.cfg.node_id {
@@ -675,6 +682,20 @@ impl Core {
                 },
                 _ => MutateOutcome::Errno(Code::Again),
             },
+            // Plan 30 §M14 phase 2, the fencing token: a grant the op was
+            // issued under is no longer live here. Not journaled (nothing
+            // ran, and a retry of the rid is refused the same way: a
+            // token never comes back to life), never executed.
+            Err(MetaError::LockLapsed) => {
+                self.stats.lock_lapsed_refusals += 1;
+                tracing::info!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    ?tag,
+                    "refused a forwarded op: the lock grant it was issued under is no longer live"
+                );
+                MutateOutcome::LockLapsed
+            }
             Err(MetaError::Exists) => {
                 self.record_refusal(rid, Code::Exists, Some(op), replica);
                 match named_child(op) {

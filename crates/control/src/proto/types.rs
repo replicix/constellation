@@ -1335,6 +1335,32 @@ pub struct LockStatus {
     /// Recalled grants given up before their first local lock (the
     /// requester gave up, or the first-use budget ran out).
     pub first_use_abandoned: u64,
+    /// The lock owners fenced on this node now, with when each was fenced
+    /// (this node's clock, unix ms): what a harness compares with when
+    /// another node got the lock.
+    pub fenced_owners: Vec<FencedOwnerStatus>,
+    /// The bounded clock-skew margin the lease and lock machinery assume
+    /// (ms): a grant's holder honours it `margin` less than its owner
+    /// records it, and a fence that came `2 × margin` before another
+    /// node's grant came first.
+    pub margin_ms: u64,
+    /// The grants this node holds now, `[minter, seq]` each (a harness
+    /// matches them with the executors' log of tagged operations).
+    pub held_grants: Vec<(u64, u64)>,
+    /// Plan 30 §M14 phase 2 (the fencing token): mutations issued here
+    /// tagged with their owner's grants, and recalled grants whose
+    /// release waited for such a mutation to be answered.
+    pub tagged_ops: u64,
+    pub release_waits: u64,
+    /// A new local lock that waited for an earlier turn's mutations
+    /// tagged with the same grant (in flight, or in doubt inside their
+    /// window) before it was taken.
+    pub predecessor_waits: u64,
+    /// Owner side: grant and renewal answers that waited for the restart
+    /// horizon's durable write (run off the authority core), and those
+    /// writes.
+    pub horizon_held: u64,
+    pub horizon_writes: u64,
     /// Grants whose floor this replica had not reached on arrival (the
     /// first read under the lock waited), how long those waits took in
     /// all, and the ones that timed out after the session budget: under
@@ -1354,6 +1380,10 @@ pub struct LockStatus {
     pub reclaimed: u64,
     pub waiters_parked: u64,
     pub grace_refusals: u64,
+    /// Plan 30 §M14 phase 2: tagged mutations this node refused as their
+    /// executor because a grant they named was no longer live (`EIO` to
+    /// their issuer; nothing journaled).
+    pub token_rejections: u64,
     /// Waiters re-parked at their old queue position after a grant to
     /// them went unused, and releases that named a grant id this owner
     /// had replaced (both ended a grant that was otherwise outwaited).
@@ -1363,6 +1393,22 @@ pub struct LockStatus {
     pub requests_in_flight: u64,
     pub waiters: u64,
     pub recalls_in_flight: u64,
+}
+
+/// One lock owner fenced on this node (`LockStatus::fenced_owners`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FencedOwnerStatus {
+    /// The kernel's lock owner id.
+    pub owner: u64,
+    /// The process that took the lock (0: unknown).
+    pub pid: u32,
+    /// When it was fenced (unix ms, this node's clock).
+    pub since_ms: i64,
+    /// The grant whose end fenced it, `[minter, seq]`, when known: every
+    /// op the owner issued under that lock carried it as its fencing
+    /// token (an executor logs each one it lets through, target
+    /// `constellation::token_exec`).
+    pub grant: Option<(u64, u64)>,
 }
 
 /// EC2 campaign 8 A-1: this node's own S3 path. While it is stalled (no

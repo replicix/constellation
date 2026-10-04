@@ -41,6 +41,15 @@ impl View {
         owner_fence_applies(cx.kind) && self.lock_owner_fenced_any(cx)
     }
 
+    /// Plan 30 §M14 phase 2: enter the fencing-token scope of `cx`'s op
+    /// on this thread (`crate::locks::TagScope`): its mutations carry the
+    /// grants its caller's locks are under. Nothing under `--locks
+    /// local`; one relaxed load while this node holds no local lock.
+    pub(crate) fn lock_tag_scope(&self, cx: &OpCtx<'_>) -> Option<crate::locks::TagScope> {
+        self.cluster_locks()
+            .map(|l| l.tag_scope(cx.caller.pid, cx.lock_owner))
+    }
+
     /// [`Self::lock_owner_fenced`] whatever the op.
     pub(crate) fn lock_owner_fenced_any(&self, cx: &OpCtx<'_>) -> bool {
         let Some(l) = self.cluster_locks() else {
@@ -158,7 +167,31 @@ impl View {
 /// next holder must be able to fetch them), and the local journal synced
 /// (the log too under `--fsync-mode s3`).
 impl crate::locks::LockFlush for View {
-    fn flush_for_lock(&self, ino: Ino) -> bool {
+    fn view_root(&self) -> Ino {
+        View::view_root(self)
+    }
+
+    fn flush_for_lock(&self, ino: Ino, grant: constellation_meta::locks::GrantId) -> bool {
+        // Plan 30 §M14 phase 2: the file's commit carries the grant being
+        // released as its fencing token — a commit stalled past the
+        // grant's window is refused where it would land, never published
+        // after the next holder's writes (phase 1 checked the fence only
+        // when the flush started).
+        let _lock_tag = self.cluster_locks().map(|l| {
+            let tag = l
+                .meta
+                .locks()
+                .held(ino)
+                .filter(|h| h.id == grant)
+                .map(|h| {
+                    constellation_meta::locks::LockTag(vec![constellation_meta::locks::LockToken {
+                        grant,
+                        until_ms: h.until_ms,
+                    }])
+                })
+                .unwrap_or_default();
+            l.fixed_tag_scope(tag)
+        });
         // The release's flush publishes only what its grant still covers:
         // one that lapsed meanwhile (a partition, a stalled node) has
         // been outwaited by its owner, who may have granted the file

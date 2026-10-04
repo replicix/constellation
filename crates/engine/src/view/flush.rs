@@ -3,6 +3,7 @@
 //! commits a write session's manifest (locally, or forwarded with rebase).
 
 use super::*;
+use crate::recovery::conflict_name_for_path;
 
 /// How many times a forwarded whole-file manifest commit may rebase
 /// onto a concurrent update before giving up with `EAGAIN`. Each pass
@@ -427,6 +428,8 @@ impl View {
             return Ok(());
         }
         constellation_vfs::watch::stage("flush: compose and commit");
+        crate::locks::take_lapsed();
+        REFUSED_COMMIT.with(|r| r.borrow_mut().take());
         match self.flush_detached(ino, ws, force_through) {
             Ok(drain) => {
                 self.writes.retire(ino);
@@ -434,6 +437,55 @@ impl View {
                     self.drain_inode(ino)?;
                 }
                 Ok(())
+            }
+            Err(FlushFail {
+                errno,
+                ws: Some(ws),
+            }) if crate::locks::take_lapsed() => {
+                // Plan 30 §M14 phase 2: the sequencer refused the commit —
+                // the lock grant these writes were made under had ended
+                // (the fencing token; a grant this node still honoured
+                // was re-sent, `mutate_op_rebasable`). They are never
+                // published into the file, which the next lock holder may
+                // have written since: they become a conflict copy beside
+                // it (`.constellation-conflict/`, the replay drain's), and
+                // every open description reports `EIO` once.
+                let refused = REFUSED_COMMIT.with(|r| r.borrow_mut().take());
+                let mut ws = *ws;
+                let kept = match refused {
+                    Some(c) if c.ino == ino => self.keep_refused_commit(c),
+                    _ => false,
+                };
+                if !kept {
+                    let enrolled: Vec<u64> = ws.enrolled.iter().copied().collect();
+                    for idx in enrolled {
+                        if let Err(error) = self.unseal(&mut ws, ino, idx) {
+                            tracing::warn!(ino, idx, %error, "withdrawing a discarded chunk's upload claim failed");
+                        }
+                    }
+                }
+                ws.staging.discard();
+                self.writes.retire(ino);
+                if kept {
+                    tracing::warn!(
+                        target: "constellation::locks",
+                        ino,
+                        "writes whose commit was refused (the lock grant they were made under has ended) \
+                         are kept as a conflict copy, not published into the file (EIO)"
+                    );
+                } else {
+                    tracing::error!(
+                        target: "constellation::locks",
+                        ino,
+                        "discarded writes whose commit was refused: the lock grant they were made under \
+                         has ended, and no conflict copy could be queued (EIO)"
+                    );
+                }
+                if let Some(l) = self.cluster_locks() {
+                    l.note_discard(ino);
+                    l.invalidate(ino);
+                }
+                Err(errno)
             }
             Err(FlushFail {
                 errno,
@@ -865,15 +917,25 @@ impl View {
             manifest_bytes,
             dirty_hashes,
             |base, manifest_bytes, file_len, dirty_hashes| {
+                // Plan 30 §M14 phase 2: the holder's own commit carries the
+                // fencing token too (checked here, recorded for a replay).
+                let tag = crate::locks::current_tag().map_err(|_| MutateFail::LockLapsed)?;
                 self.meta
-                    .set_manifest_dirty(
-                        ino,
-                        Some(&base.encode()),
-                        manifest_bytes,
-                        file_len,
-                        dirty_hashes,
-                    )
-                    .map_err(mutate_fail)
+                    .with_lock_tag(&tag, crate::locks::now_ms(), || {
+                        self.meta.set_manifest_dirty(
+                            ino,
+                            Some(&base.encode()),
+                            manifest_bytes,
+                            file_len,
+                            dirty_hashes,
+                        )
+                    })
+                    .map_err(|e| {
+                        if matches!(e, MetaError::LockLapsed) {
+                            self.meta.locks().note_owner_fenced_op();
+                        }
+                        mutate_fail(e)
+                    })
             },
         )
     }
@@ -1040,6 +1102,22 @@ impl View {
             let current = match attempt_commit(&base, &manifest_bytes, file_len, &dirty_hashes) {
                 Ok(()) => return Ok(()),
                 Err(MutateFail::Errno(e)) => return Err(e),
+                Err(MutateFail::LockLapsed) => {
+                    // Plan 30 §M14 phase 2: written under a lock grant
+                    // that ended before the commit landed — `flush_inode`
+                    // keeps it as a conflict copy rather than ever
+                    // publishing it into the file.
+                    crate::locks::note_lapsed();
+                    REFUSED_COMMIT.with(|r| {
+                        *r.borrow_mut() = Some(RefusedCommit {
+                            ino,
+                            manifest: manifest_bytes.clone(),
+                            size: file_len,
+                            dirty: dirty_hashes.clone(),
+                        })
+                    });
+                    return Err(Code::Io);
+                }
                 Err(MutateFail::Conflict { manifest }) => manifest,
             };
             // `None` means whichever node executed the mutation was us,
@@ -1073,5 +1151,131 @@ impl View {
             "manifest commit kept losing its base; giving up"
         );
         Err(Code::Again)
+    }
+}
+
+/// Plan 30 §M14 phase 2: the manifest commit the sequencer refused for a
+/// lock grant that had ended, as `commit_manifest_with_rebase` last tried
+/// it (this thread's; `flush_inode` takes it).
+struct RefusedCommit {
+    ino: Ino,
+    manifest: Vec<u8>,
+    size: u64,
+    dirty: Vec<ChunkHash>,
+}
+
+thread_local! {
+    static REFUSED_COMMIT: std::cell::RefCell<Option<RefusedCommit>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl View {
+    /// Keep a refused commit's content as a conflict copy: its chunks stay
+    /// enrolled for upload (the copy's manifest names them), and the
+    /// commit is queued as a replay already refused, which the replay
+    /// drain materializes under the view's root (`recovery::materialize_remote`)
+    /// and never executes. `false`: nothing could be queued.
+    fn keep_refused_commit(&self, c: RefusedCommit) -> bool {
+        let Some(h) = &self.sync else {
+            return false;
+        };
+        for hash in &c.dirty {
+            let durable = matches!(
+                self.cache.state_of(hash),
+                Some(ChunkState::Clean) | Some(ChunkState::Pinned)
+            ) && !self.meta.upload_pending_for_hash(hash).unwrap_or(true);
+            if !durable {
+                if let Err(error) = self.meta.add_pending_upload(hash, c.ino) {
+                    tracing::warn!(ino = c.ino, %error, "enrolling a refused commit's chunk failed");
+                    return false;
+                }
+            }
+        }
+        let rid = constellation_meta::Rid {
+            node: h.node_id,
+            incarnation: h.incarnation,
+            seq: h
+                .next_rid_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        // The copy goes under the conflict directory of this view's root
+        // (the filesystem root, or a subtree mount's root: the copy stays
+        // where the writer can see it and confined to it), named after
+        // the file's path below that root, not beside the file: a lock
+        // guards files whose directories mean something to their
+        // application (beside `.git/refs/heads/master.lock` it is a ref
+        // with a bad name, and `git fsck` fails). It is the file's owner's
+        // with the owner's permission bits only (`recovery::copy_op`):
+        // the file's ancestors no longer guard it. Only the copy is made
+        // of this op (it is queued refused, never executed).
+        let (uid, gid, mode) = self
+            .meta
+            .getattr(c.ino)
+            .ok()
+            .flatten()
+            .map(|a| (a.uid, a.gid, a.mode & 0o700))
+            .unwrap_or((0, 0, 0o600));
+        let op = constellation_meta::MutateOp::Publish {
+            ino: c.ino,
+            parent: self.view_root,
+            name: conflict_name_for_path(&self.path_below_view_root(c.ino)),
+            mode,
+            uid,
+            gid,
+            mtime_ns: 0,
+            manifest: c.manifest,
+            size: c.size,
+            xattrs: Vec::new(),
+            noreplace: false,
+        };
+        let refusal = constellation_meta::Refusal {
+            reason: "the lock grant it was written under had ended (fencing token)".into(),
+            ts_unix: (constellation_fs_core::types::now_ns() / 1_000_000_000) as i64,
+        };
+        match self.meta.queue_refused_replay(rid, &op, refusal) {
+            Ok(()) => {
+                let _ = h.tx.send(SyncRequest::Nudge);
+                true
+            }
+            Err(error) => {
+                tracing::warn!(ino = c.ino, %error, "queueing a refused commit's conflict copy failed");
+                false
+            }
+        }
+    }
+}
+
+impl View {
+    /// `ino`'s path below this view's root (`ino-<ino>` if it is not
+    /// below it, or its path cannot be read).
+    fn path_below_view_root(&self, ino: Ino) -> String {
+        let fallback = || format!("ino-{ino}");
+        let Ok(path) = self.meta.path_of(ino) else {
+            return fallback();
+        };
+        if self.view_root == constellation_fs_core::types::ROOT_INO {
+            return path;
+        }
+        let Ok(root) = self.meta.path_of(self.view_root) else {
+            return fallback();
+        };
+        match path.strip_prefix(&root) {
+            Some(rest) if rest.starts_with('/') => rest.to_string(),
+            _ => fallback(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod conflict_name_tests {
+    #[test]
+    fn a_path_becomes_one_name() {
+        assert_eq!(
+            super::conflict_name_for_path("/r/.git/refs/heads/master.lock"),
+            "r%2F.git%2Frefs%2Fheads%2Fmaster.lock"
+        );
+        assert_eq!(super::conflict_name_for_path("/a%b"), "a%25b");
+        let long = format!("/{}", "x/".repeat(300));
+        assert!(super::conflict_name_for_path(&long).len() <= 200);
     }
 }

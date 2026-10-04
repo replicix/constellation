@@ -14,6 +14,7 @@ between nodes safely. It is on by default whenever P2P is on.
 - [Details](#details)
   - [Grants and local locks](#grants-and-local-locks)
   - [Leases, renewal and fencing](#leases-renewal-and-fencing)
+  - [The fencing token](#the-fencing-token)
   - [Conflicts, recalls and blocking waits](#conflicts-recalls-and-blocking-waits)
   - [Coherence from one holder to the next](#coherence-from-one-holder-to-the-next)
   - [Failover](#failover)
@@ -46,6 +47,10 @@ between nodes safely. It is on by default whenever P2P is on.
 - **Lock owner**: the kernel's owner of a local lock (`flock`: the open
   file; `fcntl`: the process's file table), and the process that took
   it.
+- **Fencing token**: what a lock owner's mutation carries to whichever
+  sequencer executes it: the grants the owner's locks are under, and
+  when the node stops honouring each. See
+  [The fencing token](#the-fencing-token).
 
 ## Modes
 
@@ -188,6 +193,141 @@ cached pages of the file are dropped with them:
 
 Publishing that data later would overwrite what the next holder wrote
 under its own grant.
+
+### The fencing token
+
+The fences above are checked on the node, when an operation starts. An
+operation admitted while the grant was still honoured can still reach
+its sequencer after the grant lapsed: a forward stalled in flight (a
+stopped daemon, a slow link), a retry of it, or its replay by rid after
+a holder change. By then another node may hold the lock and have
+written under it. So the check also happens where the write is recorded
+(Chubby's sequencers, Kleppmann's fencing tokens).
+
+- **Tag.** A mutation (any namespace operation, or a manifest commit)
+  issued by a lock owner — matched as the owner fence matches it: the
+  process of the thread that took a lock, its threads and the processes
+  it started, or the kernel's lock owner — carries a **token**: per
+  minting sequencer, the grant whose window ends first among those the
+  owner's locks are under, as `(grant id, until)`. `until` is when this
+  node stops honouring the grant (`sent + ttl − margin` of its latest
+  request or renewal), on its clock. Operations of processes that hold
+  no lock carry nothing and are not checked. Which grants an operation
+  is under is worked out at its first mutation (a close works it out
+  before it drops the closer's locks); each mutation's `until` is taken
+  when that mutation is sent, from the grant's current window, so a
+  renewal since the operation began counts (a slow close or a retry is
+  not refused for the window it set out with). A recalled grant's own
+  flush carries the grant it is about to release.
+- **Check.** Whichever sequencer executes the operation checks each
+  token. This includes the holder or delegate executing a forward, the
+  requester's own lease path, the takeover gate's local replay, the
+  inbox drain, and the FUSE fast paths on the sequencer itself.
+  - A sequencer whose table holds the grant live (the minter, or the
+    delegate a grant moved to) judges it exactly: it accepts the token
+    whatever its `until` says, since nothing conflicting can be granted
+    while the grant is there. A holder that keeps renewing is never
+    refused for a slow operation.
+  - Except a grant installed from a copy rather than made or renewed
+    here: a backup's lock mirror installed at a takeover, or a root's
+    copy of what it handed a delegate, reinstated when the delegation
+    ended. The mirror is asynchronous, so such a copy may name a grant
+    its last sequencer had already ended (and granted to someone else).
+    Until its holder renews it here, the window judges every token
+    naming it; from that renewal on, only tokens whose `until` runs past
+    the renewal pass whatever the window, so an operation sent before
+    the copy was confirmed is still judged by its window.
+  - A sequencer that ended the grant (released it, or outwaited it: its
+    record expired) refuses the token at once, inside its window. It
+    remembers the ended id for `ttl + 2 × margin` past the end of its
+    record (at most 4096 ids).
+  - Any other sequencer refuses the token once its own clock reaches
+    `until`. The minter records the grant live until `granted + ttl +
+    margin` and grants nothing conflicting before that, which is at
+    least `2 × margin` after `until`. So while clocks stay within that
+    of each other (the lease machinery assumes half a margin), no
+    conflicting grant exists while a token is still accepted anywhere.
+    That holds whether or not the executor minted the grant: git's turn
+    file is the root's while its objects may live in a delegated
+    subtree.
+- **Refusal.** Nothing is executed or journaled (only an inbox refusal
+  is journaled, as every inbox outcome is), and a retry of the rid is
+  refused the same way.
+  - If the issuing node still holds and honours every grant the token
+    named, under a window renewed since the token was taken, the
+    executor judged a stale window (a delegate's clock check, a forward
+    that waited): the node sends the operation again under a fresh rid
+    and a fresh token, at most 3 times. An ended grant is renewed no
+    more, so this stops.
+  - Otherwise the operation fails with `EIO`. A refused manifest commit
+    (a close, `fsync`, a recalled grant's flush) is never published into
+    the file, which the next holder may have written since: its content
+    becomes a **conflict copy** under the root of the mount that wrote
+    it (the filesystem root, or a subtree mount's root such as a CSI
+    volume), `.constellation-conflict/<path>@<node>-<time>-<seq>`, where
+    `<path>` is the file's path below that root with `/` written as
+    `%2F` (`%` as `%25`; only the last 200 bytes of a longer one) and
+    `<seq>` the refused operation's rid sequence (two copies of one file
+    within a second do not collide). Not beside the file: a lock guards
+    directories that mean something to their application (beside
+    `.git/refs/heads/master.lock` a copy is a ref with a bad name, and
+    `git fsck` fails). Every open description of the file reports `EIO`
+    once. A refused replay also leaves a conflict copy, never its
+    effect: for an operation issued under a lock (one that carried a
+    fencing token), under the root of the deepest mounted view above its
+    file, named the same way (beside the file only when no mounted view
+    contains it); for any other operation beside its file, as before.
+  - A conflict copy keeps its source's owner and only the owner's
+    permission bits (`mode & 0700`): away from the file, its ancestors no
+    longer keep other users out. The `.constellation-conflict` directory
+    is created `0700`, owned by the owner of the directory it is created
+    in (the volume's owner on a subtree mount; `root` at the filesystem
+    root, where only `root` can reach the copies).
+  - When this happens: an operation sent at time `t` is refused only if
+    the grant ended at its minter, or if it reaches another sequencer
+    after its token's `until` — the grant's window at `t`, `ttl −
+    margin` after the latest renewal before `t` (9.5–19 s at the default
+    20 s TTL; the delegate's clock). A refusal by window is re-sent
+    while the grant is still honoured, so only an operation slower than
+    the grant's remaining life, or one whose grant truly ended, fails.
+- **Release ordering.** A node does not release a grant (on a recall, or
+  when its idle cache expires) while an operation tagged with it is in
+  flight, or while one of its own stranded operations tagged with it
+  waits in the replay queue. If such an operation ended in doubt (no
+  answer: it may still execute somewhere), or is queued, the node waits
+  until the token's `until` has passed, after which every executor that
+  does not hold the grant refuses it (the minter refuses it once the
+  release ends the grant). So a released grant's stale operation never
+  lands after the next holder's writes. The last operation in flight
+  wakes the waiting release; a 250 ms poll is the fallback. If the wait
+  outlasts the grant's window, the grant lapses there and its owner
+  outwaits it.
+  The same holds for the next turn on the same node under the same
+  cached grant: a lock taken when no local lock is left on the file
+  waits (or `EAGAIN` without blocking; `locks.predecessor_waits`) while
+  an operation an earlier turn tagged with the grant is in flight or in
+  doubt inside its window. The grant is live at its minter, so such an
+  operation would otherwise pass there after the new turn's writes.
+- **Replays.** The token is persisted with the operation wherever a
+  replay by rid can come from: the requester's shadow, the executor's
+  journal row (a deposed holder replays its journal) and the replay
+  queue. A replay therefore carries its token after a daemon restart
+  too. It is judged like any operation: at the minter, a grant still
+  live passes; elsewhere, a replay that comes after its token's
+  `until` is refused, and the acknowledged operation becomes a conflict
+  copy. A failover longer than the window (`ttl − margin`) therefore
+  turns acknowledged operations under a lock whose files a delegate
+  sequences into conflict copies.
+- **Restart.** A sequencer persists, before it answers, the latest
+  `until` it promised in a grant *or a renewal* to another node. After
+  a restart inside its lease it grants nothing new before that has
+  passed. (It used to persist grants only, and so could regrant while a
+  holder still honoured a renewed window.) A node's grants to itself
+  die with it and leave no such wait. A renewal persists it only when it
+  extends a grant in the table (one for an unknown id does not lengthen
+  the next restart's wait), rounded up by a quarter TTL, so peers
+  holding grants cost a synced write about every quarter TTL rather
+  than every second.
 
 ### Conflicts, recalls and blocking waits
 
@@ -354,7 +494,15 @@ owner has replaced it.
   grants to other nodes extend the horizon: a grant the holder made to
   itself died with its process (its local locks and held grants live in
   memory, and a handover is refused while a cluster lock is held), so a
-  lone node that remounts grants at once.
+  lone node that remounts grants at once. Renewals extend it too (rounded
+  up by a quarter TTL). The write is durable (`fsync`) and runs off the
+  authority core: the grant or renewal answer that needs it is held
+  until it lands, later needs coalesce into the next write, and every
+  other event goes on meanwhile — a slow disk delays only the answers
+  waiting for it (`status` `locks.horizon_held`, `horizon_writes`). A
+  write that fails refuses what it held (a grant `Busy`, a renewal
+  `NotOwner`). Nothing is answered before its window is on disk, so a
+  restart never waits out less than a peer was told.
 - **An S3 blip** (a [continuation
   epoch](durability-and-failover.md#flexible-continuation-epochs)
   carrying the holder's lease): the grants stand. Inside the epoch the
@@ -373,7 +521,16 @@ owner has replaced it.
   the next epoch carries the lease again, see
   [continuation epochs](durability-and-failover.md#flexible-continuation-epochs)).
   Requests parked at the close are told to ask again. Renewals keep
-  going to the holder. After the flush, the lease stays while grants are
+  going to the holder. Fencing tokens go on too: a kept grant keeps its
+  id, so an operation tagged with it before the close passes at the
+  holder after the re-claim while the grant is live there (whatever its
+  token's `until`). An operation forwarded inside the re-claim window
+  is told to come back (`Held`), and is judged once the lease is held
+  again. A release that waited through the close for tagged operations
+  ends the grant in the kept table. A renewal of a kept grant moves the
+  restart horizon as any renewal does. Where the table is dropped, a
+  token naming one of its grants is judged by its `until`, and nothing
+  conflicting is granted before that has passed. After the flush, the lease stays while grants are
   live, as with any idle holder. Any other `Busy` from an owner (no
   fresh S3 liveness, a lease not marked as granting yet) still fails a
   non-blocking request with `ENOLCK` after the usual few attempts.
@@ -461,7 +618,15 @@ would make SQLite unusable and would fence I/O whenever S3 is slow. So:
   lock on a file, and nothing for re-locks while it keeps the grant.
 - A conflict costs a recall round trip plus the recalled node's flush.
 - Workloads that never lock pay one atomic load per I/O, and one per
-  write or namespace operation for the owner fence. While locks are
+  write or namespace operation for the owner fence and the fencing
+  token (8 ns per operation measured).
+- The fencing token: while this node holds any local lock, each
+  operation that mutates takes its caller's tag once (its `/proc` start
+  time and the lock table: about 7.5 µs measured on this host, the same
+  for a process that turns out to hold no lock). A tagged forward is 21
+  bytes longer (one grant: a full-width node id, the seq, the window);
+  an untagged one 1 byte. The executor's check is one lookup per token
+  (11 ns measured). No extra message is sent. While locks are
   held under honoured grants, the owner fence costs a second load. While
   an owner is fenced, every such operation on the node takes the lock
   table's mutex and reads its thread's `/proc` entry (its start time, so
@@ -498,15 +663,32 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   the file as unlocked.
 - **Adjacent ranges of one owner are not merged**, so `getlk` can
   report a piece of a range.
-- **The fence is checked when a flush starts, not when it lands.** A
-  flush that passes the fence while its grant is still honoured
-  publishes even if the grant lapses while the flush is in flight. The
-  two margins (`2 × margin`) cover a flush that finishes promptly. A
-  flush stalled for longer can land after another node was granted the
-  lock, because the sequencer does not check grants on a commit.
-  The owner fence has the same limit: an operation checked while the
-  grant was still honoured, then delayed past its lapse (a stalled
-  forward), is still applied.
+- **What the fences cannot see.** An operation admitted while the grant
+  was honoured, whose effect lands after the lapse, is caught by the
+  fencing token in these cases: a forward stalled in flight, a retry or
+  replay of it by rid (after a restart too), an `open(O_TRUNC)` or
+  `rename` forwarded just before the lapse, a manifest commit (close,
+  `fsync`, a recalled grant's flush) that started under the grant and
+  landed after it, and a write to another file that its owner closes
+  while still holding the lapsed lock. These remain:
+  - **Data published after the locks are gone.** A write the owner made
+    to another file under the lock is published by whoever closes or
+    `fsync`s the file later, or by a `syncfs` of the mount. If that happens after the owner unlocked,
+    the commit carries no token. That is also the case after a lapse:
+    the owner's unlock or close lifts its fence. On the locked file
+    itself, the taint still discards such data. The token cannot carry
+    these, because the data does not remember which lock it was written
+    under.
+  - **Operations of processes the owner fence cannot match:** see the
+    next items. They carry no token either.
+  - **A stranded op of another node,** replayed here as pre-S3 streamed
+    speculation, carries no token (the stream carries records, not
+    tokens). Its own requester's replay carries one, and the rid makes
+    whichever lands first the only execution.
+  - **The clock assumption.** The window check (executors that do not
+    hold the grant) holds while an executor's clock is within
+    `2 × margin` of the holder's. That is four times the lease's own
+    assumption.
 - **The owner fence knows processes, not intentions.** A process the
   lock holder started is fenced only while it is still the holder's
   descendant: one that daemonized (re-parented to `init`) is not. A
@@ -519,9 +701,15 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   owner's mmap'd writes to *other* files are published. (On the locked
   file itself the per-file fence and the discard at publication still
   apply.)
-- **Without `/proc`** (macOS, other platforms) the owner fence matches
-  a request by the pid it carries alone: requests with the pid that took
-  the lock are fenced, the processes it started are not.
+- **Without `/proc`, and where it lies.** Without `/proc` (macOS,
+  other platforms), the owner fence matches a request by the pid it
+  carries alone: requests with the pid that took the lock are fenced,
+  and the processes it started are not. The same happens with
+  `hidepid=2` (the lineage cannot be read). Under a pid namespace (an
+  app pod under the CSI node service), the kernel sends the daemon pid
+  0, which reads as no pid at all: no owner fence. The fencing token is
+  worked out by the same match, so it does not make these cases safe;
+  only the per-file fence and the taint protect them then.
 - OFD locks and mandatory locks get no special handling.
 
 ## Configuration
@@ -561,11 +749,18 @@ for both roles:
   `owners_fenced` (lock owners fenced on this node), `owner_fenced_ops`
   (their operations refused with `EIO`, on any file),
   `first_use_abandoned` (recalled grants released before their first
-  lock, see [Leases, renewal and fencing](#leases-renewal-and-fencing));
+  lock, see [Leases, renewal and fencing](#leases-renewal-and-fencing)),
+  `fenced_owners` (the owners fenced now: `owner`, `pid`, `since_ms`,
+  and `grant`, the `[minter, seq]` whose end fenced it), `margin_ms`
+  (the clock-skew margin the lock machinery assumes),
+  `tagged_ops` (mutations that carried a fencing token),
+  `release_waits` (releases held back for one) and `predecessor_waits`
+  (new local turns held back for an earlier turn's tagged mutations);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
   `grace_refusals`, `requeued_in_place`, `released_superseded`,
-  `requests_in_flight`, `waiters`, `recalls_in_flight`.
+  `requests_in_flight`, `waiters`, `recalls_in_flight`,
+  `token_rejections` (operations refused for a dead fencing token).
 
 These counters are not exported to `/metrics` or shown in the web UI.
 
@@ -575,7 +770,10 @@ These counters are not exported to `/metrics` or shown in the web UI.
 
 The node's grant lapsed: `fenced_io` rises on the locked file,
 `owner_fenced_ops` on the lock owner's operations elsewhere, and `lost`
-counts the grants. The usual cause is a stall of the node, or a
+counts the grants. An operation that was already on its way when the
+grant lapsed is refused by its sequencer instead: `token_rejections`
+rises there, and the daemon logs "the lock grant it was issued under is
+no longer live". The usual cause is a stall of the node, or a
 partition from the owning sequencer, longer than
 `CONSTELLATION_LOCK_TTL_MS` (on the holder itself, a stall of its
 authority core: renewals of its own grants run there too, so a
@@ -585,7 +783,12 @@ takeover of the root lease. An S3 blip no longer does (see
 the file or unlock, then lock again. The application must assume that
 another node may have taken the lock in between. If `close` or `fsync`
 returns `EIO`, the writes it made under the lapsed grant, and not yet
-flushed, were discarded. The file holds what the next holder wrote.
+flushed, were not published into the file, which holds what the next
+holder wrote. If the sequencer refused them (the fencing token), they
+are kept as a conflict copy under `/.constellation-conflict/` at the
+filesystem root, named after the file's path, logged as "kept as a
+conflict copy". Writes discarded on the node
+itself (the per-file taint) are not kept.
 
 ### `flock -n` or `F_SETLK` fails once, then succeeds
 
@@ -628,6 +831,8 @@ off. Use `--locks local`, or turn P2P on.
   [`crates/engine/src/view/lock_gate.rs`](../../../crates/engine/src/view/lock_gate.rs) (the fences)
 - Model: `crates/model/src/locks.rs`; harness: `flock-cross-node`,
   `sqlite-two-nodes`, `lock-holder-partitioned`, `lock-failover`,
-  `lock-latency`, `git-under-flock-b2b` and `-rounds` (the owner fence)
+  `lock-latency`, `git-under-flock-b2b` and `-rounds` (the owner fence),
+  `git-under-flock-faults` with `GIT_FLOCK_STRICT=1` (the fencing
+  token); sim `locks_lapsed_owner_is_fenced_on_other_files`
 - [Close-to-open modes](cto-modes.md), [Durability and failover](durability-and-failover.md),
   [Delegations](delegations.md)
