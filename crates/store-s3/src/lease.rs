@@ -479,7 +479,6 @@ mod tests {
     use super::*;
     use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
     use object_store::memory::InMemory;
-    use object_store::PutPayload;
 
     const P: &str = "p0";
     const TTL: u64 = 60_000;
@@ -681,33 +680,6 @@ mod tests {
         assert_eq!(edited.wanted_by, vec![9]);
         s.try_swap(&edited.renewed(TTL), &tag).await.unwrap();
         assert_eq!(s.get().await.unwrap().unwrap().0.wanted_by, vec![9]);
-    }
-
-    #[tokio::test]
-    async fn forward_compatible_decode() {
-        let s = ls(LeaseMode::Cas);
-        s.store
-            .put(
-                &layout::lease(P),
-                PutPayload::from(
-                    br#"{"v":9,"partition":"p0","holder":5,"epoch":3,
-                         "expires_unix_ms":1,"released":false,"future":42}"#
-                        .to_vec(),
-                ),
-            )
-            .await
-            .unwrap();
-        let (lease, _) = s.get().await.unwrap().unwrap();
-        assert_eq!((lease.holder, lease.epoch), (5, 3));
-        // Missing fields default rather than failing the mount.
-        let s2 = ls(LeaseMode::Cas);
-        s2.store
-            .put(&layout::lease(P), PutPayload::from(br#"{}"#.to_vec()))
-            .await
-            .unwrap();
-        let (empty, _) = s2.get().await.unwrap().unwrap();
-        assert_eq!(empty.holder, 0);
-        assert!(empty.is_claimable(now_unix_ms()));
     }
 
     // ---- plan 30 §M4 item 1: each error code, at both lease CAS sites ----

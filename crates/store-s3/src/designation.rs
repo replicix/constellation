@@ -298,7 +298,7 @@ mod tests {
     async fn a_designation_at_the_wrong_key_does_not_count() {
         use object_store::ObjectStoreExt as _;
         let s = ds();
-        let body = serde_json::json!({"path": "/x", "designee": 1, "created_unix_ms": 0});
+        let body = Designation::new("/x", 1, false);
         let payload = object_store::PutPayload::from(serde_json::to_vec(&body).unwrap());
         // At its own key it is a live claim (proves the body parses).
         s.store

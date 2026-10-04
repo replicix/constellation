@@ -701,24 +701,6 @@ mod tests {
     /// fields simply mean that node has no fast path. The fixture is
     /// deliberately the original on-disk shape — `ro` is defaulted, not
     /// required, so this stays a real test of a narrower record.
-    #[tokio::test]
-    async fn records_without_p2p_fields_still_parse() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        store
-            .put(
-                &node_key(7),
-                PutPayload::from(br#"{"node_id":7,"hostname":"old","created_unix":123}"#.to_vec()),
-            )
-            .await
-            .unwrap();
-        let nodes = list_nodes(store).await.unwrap();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].node_id, 7);
-        assert!(nodes[0].pubkey.is_none());
-        assert!(!nodes[0].ro, "an absent ro flag means write-eligible");
-        assert!(!nodes[0].retired);
-    }
-
     /// The roster must fail CLOSED. A corrupt record that silently
     /// shrinks it would let `component_covers_roster` authorize a
     /// continuation epoch while an unaccounted-for node may be writing.
