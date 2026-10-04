@@ -132,7 +132,7 @@ const EXPIRY_REASON: &str = "no tier keeps it";
 /// The owner of `snapsched`'s second hold.
 const CSI_OWNER: &str = "csi:test-uid";
 
-fn tuned(c: Client, ttl_ms: Option<i64>, grace_s: u64, expire_every_s: u64) -> Client {
+pub(super) fn tuned(c: Client, ttl_ms: Option<i64>, grace_s: u64, expire_every_s: u64) -> Client {
     let c = c
         .with_env("CONSTELLATION_SNAPSCHED_TICK_MS", &TICK_MS.to_string())
         .with_env("CONSTELLATION_SNAPSCHED_GRACE_S", &grace_s.to_string())
@@ -146,7 +146,7 @@ fn tuned(c: Client, ttl_ms: Option<i64>, grace_s: u64, expire_every_s: u64) -> C
     }
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
@@ -156,7 +156,7 @@ fn bucket_of(ms: i64) -> i64 {
     ms.div_euclid(BUCKET_MS) * BUCKET_MS
 }
 
-fn parse_policy(text: &str) -> Result<SnapPolicy> {
+pub(super) fn parse_policy(text: &str) -> Result<SnapPolicy> {
     SnapPolicy::parse(text).map_err(|e| anyhow!("parsing {text:?}: {e:?}"))
 }
 
@@ -190,11 +190,11 @@ fn auto_bucket(name: &str) -> Option<i64> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Snap {
-    name: String,
-    id: String,
-    created: i64,
-    bucket: i64,
+pub(super) struct Snap {
+    pub(super) name: String,
+    pub(super) id: String,
+    pub(super) created: i64,
+    pub(super) bucket: i64,
 }
 
 impl Snap {
@@ -209,7 +209,7 @@ impl Snap {
     }
 }
 
-fn auto_snaps(rows: &[serde_json::Value]) -> Result<Vec<Snap>> {
+pub(super) fn auto_snaps(rows: &[serde_json::Value]) -> Result<Vec<Snap>> {
     let mut out = Vec::new();
     for row in rows {
         if row["path"] != "/proj" || row["origin"] != "auto" {
@@ -251,7 +251,7 @@ fn listed(c: &Client) -> Result<Vec<Snap>> {
 
 /// The same, straight from `snapshot.list` without sizes: cheap enough to
 /// poll (no accounting work).
-fn polled(c: &Client) -> Result<Vec<Snap>> {
+pub(super) fn polled(c: &Client) -> Result<Vec<Snap>> {
     let listing = c.control_call(
         "snapshot.list",
         serde_json::json!({"path": null, "sizes": false}),
@@ -274,7 +274,7 @@ fn names(snaps: &[Snap]) -> BTreeSet<String> {
 /// with the host for a while (17 s seen here, both nodes at once) answers
 /// late, and a status read is not what any scenario asserts on. The CLI's
 /// own 10 s handshake timeout failed such a run.
-fn sched_status(c: &Client) -> Result<serde_json::Value> {
+pub(super) fn sched_status(c: &Client) -> Result<serde_json::Value> {
     c.control_call(
         "snapshot.sched.status",
         serde_json::json!({}),
@@ -283,16 +283,16 @@ fn sched_status(c: &Client) -> Result<serde_json::Value> {
     .with_context(|| format!("{}: snapshot.sched.status", c.name))
 }
 
-fn is_leader(c: &Client) -> Result<bool> {
+pub(super) fn is_leader(c: &Client) -> Result<bool> {
     Ok(sched_status(c)?["stats"]["leader"] == true)
 }
 
-fn stat(status: &serde_json::Value, key: &str) -> u64 {
+pub(super) fn stat(status: &serde_json::Value, key: &str) -> u64 {
     status["stats"][key].as_u64().unwrap_or(0)
 }
 
 /// The root lease as `c` reports it: `(holder, epoch)`.
-fn root_lease(c: &Client) -> Result<(u64, u64)> {
+pub(super) fn root_lease(c: &Client) -> Result<(u64, u64)> {
     let lease = c.control_status()?["lease"].clone();
     Ok((
         lease["holder"].as_u64().unwrap_or(0),
@@ -536,7 +536,7 @@ struct Audit {
     entries: usize,
 }
 
-fn journal_entries(endpoint: &str, prefix: &str) -> Result<Vec<SnapSchedJournalEntry>> {
+pub(super) fn journal_entries(endpoint: &str, prefix: &str) -> Result<Vec<SnapSchedJournalEntry>> {
     let mut keys: Vec<String> = raw_objects(endpoint, &format!("{prefix}/snapsched/journal/"))?
         .into_iter()
         .map(|(key, _)| key)
@@ -655,7 +655,7 @@ fn read_audit(endpoint: &str, prefix: &str) -> Result<Audit> {
 }
 
 /// `snapsched/state.json`, the grace state.
-fn read_state(endpoint: &str, prefix: &str) -> Result<SnapSchedState> {
+pub(super) fn read_state(endpoint: &str, prefix: &str) -> Result<SnapSchedState> {
     let key = format!("{prefix}/snapsched/state.json");
     let body = crate::s3auth::get(&format!("{endpoint}/{BUCKET}/{key}"))
         .call()
@@ -706,7 +706,7 @@ fn creation_list(audit: &Audit, seen: &BTreeMap<String, Snap>) -> Result<(Vec<Sn
 
 /// Retention's facts for the creation list: `origin = auto` of `ino`,
 /// held as `holds` (id → owner, `""` for a plain hold) says.
-fn facts(ino: u64, snaps: &[Snap], holds: &BTreeMap<String, String>) -> Vec<SnapFacts> {
+pub(super) fn facts(ino: u64, snaps: &[Snap], holds: &BTreeMap<String, String>) -> Vec<SnapFacts> {
     snaps
         .iter()
         .map(|s| SnapFacts {
@@ -886,7 +886,11 @@ fn check_deletions(
 /// The window, recorded in `state.json`, that a policy's first sighting
 /// (`canonical: null` prior) or a change away from `from` opened on the
 /// root: `(replaced_unix_ms, until_unix_ms)`.
-fn grace_window(state: &SnapSchedState, ino: u64, from: Option<&str>) -> Result<(i64, i64)> {
+pub(super) fn grace_window(
+    state: &SnapSchedState,
+    ino: u64,
+    from: Option<&str>,
+) -> Result<(i64, i64)> {
     let root = state
         .roots
         .get(&ino)

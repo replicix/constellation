@@ -490,5 +490,5 @@ Deleting snapshots only starts the clock; see *Space returns after GC*.
   batches.
 - [`scratch-directories.md`](scratch-directories.md) — scratch roots cannot
   carry a policy.
-- [Plan 32](../../plans/v1/wip/32-snapshot-policies-and-space.md) — the design
+- [Plan 32](../../plans/v1/done/32-snapshot-policies-and-space.md) — the design
   and its rationale.

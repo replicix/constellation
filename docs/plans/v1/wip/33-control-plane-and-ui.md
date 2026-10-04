@@ -1541,6 +1541,6 @@ more honest than a guessed one.)*
 | 13 | `crates/net/src/endpoint.rs:958-970`, `crates/net/src/peers.rs:794-817`, `Cargo.toml:86-87` | iroh multi-ALPN endpoint/router pattern already in this repo (g) — read directly, not searched |
 | 14 | `crates/api/src/lib.rs`, `types.rs`, `web.rs`, `webui/index.html`, `webui/peers.html`, `Cargo.toml` (crate) | Today's control API surface, the web adapter's security posture and its own module-doc citation of CVE-2025-49596 |
 | 15 | `crates/cli/src/main.rs:140-160` | The existing `--web-ui`/`CONSTELLATION_WEB_UI_PORT` mount flag this plan's headless mode supersedes with an explicit subcommand |
-| 16 | `docs/plans/v1/wip/32-snapshot-policies-and-space.md` (read-only) | The web-UI page spec (§7) this plan hosts in the SPA, and the additive `Request`/`SnapshotStatus` surface (§7.6) |
+| 16 | `docs/plans/v1/done/32-snapshot-policies-and-space.md` (read-only) | The web-UI page spec (§7) this plan hosts in the SPA, and the additive `Request`/`SnapshotStatus` surface (§7.6) |
 | 17 | `docs/plans/v1/wip/23-remote-support-mode.md` (read-only) | The feature this plan's remote-management milestone must stay distinct from |
 | 18 | The design brief (`core-design-brief.md`, this session's scratchpad) | Fixed plan numbering, milestone IDs U0–U8/C0–C8, crate names, and the Plan 33 decisions section this plan expands |

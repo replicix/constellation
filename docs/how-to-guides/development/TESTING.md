@@ -1259,6 +1259,75 @@ than the grace window `snapsched/state.json` records for the root.
   still held; the journal carries exactly the two policies, and no deletion
   is of a held snapshot or from a tick before the window's end.
 
+Plan 32's close-out adds two more, each in its own module:
+
+- `snapsched-budget` (`scenarios/snapbudget.rs`; plan 32 Step 8, asked for
+  by the M7 review): three nodes with their own node keys, lease TTL 10 s,
+  grace 180 s, expiry every 5 s, `CONSTELLATION_SNAPACCT_REFRESH_S=5`, ~4
+  min. `b` creates the filesystem, holds the root lease, is the only writer
+  and mounts with `CONSTELLATION_SNAPSCHED=0`, so the schedule leader is
+  never the holder; `a` binds `10s:1h 1m:1h; last=2; budget=3M` on `/proj`
+  and runs `snapshot sched run` (if `c` wins the race the roles swap, and
+  the log says so). Nine buckets each replace `/proj/data` with 1 MiB of
+  fresh seeded random bytes (one per bucket, 3 s in), so each auto snapshot
+  owns ~1 MiB; after the second auto snapshot it creates `/proj@keep`
+  (manual) and holds the first two (plain, `--by csi:test-uid`). The tiers
+  keep everything (asserted with `evaluate`), so every deletion is the
+  budget's. **The oracle**, computed while the first-sighting grace window
+  is still open (asserted: more than 5 s left) and the tree is frozen:
+  `retention::budget_order` over the listed rows gives the victim order,
+  `snapshot.reclaim` on the leader gives `reclaim(kept)` and the bytes of
+  every prefix, and the expected victims are the shortest prefix leaving at
+  most the budget (asserted ≥ 2). The log prints one line per snapshot:
+  held/candidate, its place in the order, victim (with what the prefix frees
+  and leaves) or survivor. Asserted:
+  - inside the window, polled every second: the listing does not change and
+    no node counts an expiry; the follower reports no `budget_used_bytes`;
+  - the leader is `kill -9`ed the moment its `budget_expired` (or
+    `expired`) shows, its status read in the same poll reporting
+    `budget_used_bytes` within the budget and no note;
+  - the follower leads within 2 × TTL + 10 ticks, measures the budget with
+    its own index (`budget_used_bytes` within the budget, no note) and
+    deletes nothing over four expiry periods;
+  - the survivors on `b` are exactly everything but the expected prefix:
+    the manual snapshot, both held ones (still held by their owners), the
+    newest `last` two; `snapshot.reclaim` of the kept survivors is within
+    the budget;
+  - the journal: every deletion has the reason `budget` and is one of the
+    expected victims, no name is deleted twice, all deletions sit in one
+    journal entry (one run) of the expected size; none at all is allowed
+    only when the killed leader's batch landed before its audit write (the
+    listing is then the proof, and the new leader must have deleted
+    nothing);
+  - the killed node, mounted again, lists the same survivors; the root
+    lease's (holder, epoch) is unchanged.
+- `snapsched-write-overhead` (`scenarios/snapwrite.rs`, `requires: fio`;
+  plan 32 §11 "Compliance and performance"): two nodes, every knob at the
+  product default except `CONSTELLATION_SNAPSCHED=0` on `b`. `b` creates
+  the filesystem, holds the root lease and writes a 100,000-file tree under
+  `/proj/tree` (1,000 directories × 100 small files, eight writers, under
+  `--write-mode back`, then `through` again with the upload journal
+  drained; `a` must see the last file). Then three pairs of fio runs on `b`,
+  alternating so host-load drift hits both legs: **off** (no policy) and
+  **on** (`10s:1h` on `/proj`, set through `a`, the run starting once `a`
+  leads and the policy's first snapshot has landed; `policy rm` afterwards,
+  then a settle so no tick planned before the removal creates during the
+  next off run). Each run is one fresh file under `/proj/fio`: `--rw=write
+  --bs=1M --ioengine=psync --numjobs=1 --fsync=256 --end_fsync=1`, 2 GiB
+  or 30 s (whichever first), removed afterwards. The `fsync` every 256 MiB
+  is what gives the policy work during a run: a file being written is
+  published only at `fsync`/`close`, so without it every bucket inside a
+  run would be skipped as empty (the default `skip-empty`). **Asserted** (invariants only):
+  the root lease's (holder, epoch) is `b`'s and never changes (read before,
+  after each run, and once a second during each run); at least one auto
+  snapshot is created during every on run, none during an off run.
+  **Printed:** MB/s per run (fio's `write.bw_bytes`), the median per leg
+  and the regression of the medians (`RESULT` line). The plan's ≤ 3 %
+  bound is judged on those medians and is not asserted: on a shared host
+  the spread of one leg alone is often larger than 3 %.
+  `CONSTELLATION_HARNESS_WOH_{FILES,FIO_SIZE,FIO_RUNTIME_S,RUNS}` override
+  the tree size, fio's size and runtime, and the number of pairs.
+
 Phase 6b scenarios exercise E2E passphrase mode:
 
 - `e2e-basic` creates with `--e2e`, runs a seeded workload beside a known

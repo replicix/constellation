@@ -29393,7 +29393,7 @@ warm lane's name, and blessable as such).
 
 ## Plan 32 Step 0.4 (holds) — the plan-37 prerequisite subset
 
-**This is a subset of [plan 32](wip/32-snapshot-policies-and-space.md), not
+**This is a subset of [plan 32](done/32-snapshot-policies-and-space.md), not
 the plan.** Only §0.4 (snapshot row and record extensions) plus the hold
 surface plan 37 milestone K4 consumes is built here, so that K4 (CSI
 `CreateSnapshot`/`DeleteSnapshot`/`ListSnapshots`, §16 of
@@ -29510,7 +29510,7 @@ field, no UI. `snapshot hold` takes one selector, not the `<sel>...` list
 
 ## Plan 32 M1a (policy language)
 
-**Step 1 of [plan 32](wip/32-snapshot-policies-and-space.md) only: the
+**Step 1 of [plan 32](done/32-snapshot-policies-and-space.md) only: the
 language.** The types, the hand-written parser and the canonical printer
 for `user.constellation.snapshots`, plus the shared lexer the prune parser
 now also uses. Nothing runs: no retention (`evaluate` is Step 2 / chunk
@@ -30072,7 +30072,7 @@ its CLI arm, docs and results).
 
 ## Plan 32 M1b (retention)
 
-**Step 2 of [plan 32](wip/32-snapshot-policies-and-space.md) only: retention as
+**Step 2 of [plan 32](done/32-snapshot-policies-and-space.md) only: retention as
 a pure function.** Where a bucket starts, which snapshots a policy keeps, why,
 when the next one is due, and what the schedule does next — with no I/O, no
 clock read and no environment anywhere (`now_ms` is a parameter of the two
@@ -30295,7 +30295,7 @@ succeeded.
 
 ## Plan 32 M0b (snapwalk, per-chain GC mark)
 
-Step 0.2 of [plan 32](wip/32-snapshot-policies-and-space.md): chunk GC no
+Step 0.2 of [plan 32](done/32-snapshot-policies-and-space.md): chunk GC no
 longer walks every snapshot's whole subtree every round. Snapshot roots are
 grouped into chains by directory `ino`, ordered by `(seq, created_unix_ms)`,
 and each chain costs one full walk of its oldest snapshot plus one
@@ -30364,7 +30364,7 @@ before and after.
 
 ## Plan 32 M5a (accounting index core)
 
-Step 6.2 of [plan 32](wip/32-snapshot-policies-and-space.md), the data
+Step 6.2 of [plan 32](done/32-snapshot-policies-and-space.md), the data
 structure and its algorithms only: a node-local fjall database of per-chain
 interval runs that turns `snapwalk` deltas into ZFS-style `USED` /
 `WRITTEN` / `REFER` / `LSIZE`, `reclaim(D)` and the `snapshot space`
@@ -30410,7 +30410,7 @@ Gates (this worktree, `CARGO_TARGET_DIR` unset):
 
 ## Plan 32 M0c (delete-by-id, orphan reconciliation, rename-safe listing)
 
-Steps 0.3 and 0.5 of [plan 32](wip/32-snapshot-policies-and-space.md): a
+Steps 0.3 and 0.5 of [plan 32](done/32-snapshot-policies-and-space.md): a
 snapshot delete is a point lookup by its computed id; every GC round makes
 the two copies of a snapshot (the `snaps/` object and the replicated row)
 agree again before it marks; and `.constellation/snapshot/` follows a
@@ -31056,7 +31056,7 @@ zero-copy lane and `uring_zc` remain a name with no code behind it.
 
 ## Plan 32 M3b (skip-empty)
 
-Step 3.4 of [plan 32](wip/32-snapshot-policies-and-space.md) (chunk
+Step 3.4 of [plan 32](done/32-snapshot-policies-and-space.md) (chunk
 `32-m3b`): the holder decides, after the batch's one publish, whether
 anything under a create's directory changed since its
 `skip_if_unchanged_since` root. It replaces `32-m0a`'s equal-roots
@@ -31179,7 +31179,7 @@ the publish is still running.
 
 ## Plan 32 M1 — policy language and retention
 
-**Milestone M1 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 1 +
+**Milestone M1 of [plan 32](done/32-snapshot-policies-and-space.md) (Step 1 +
 Step 2 + Step 5's `policy check`): closed.** Three chunks: `32-m1a` (the
 language), `32-m1b` (retention as a pure function) and `32-m1c` (this one:
 the read-only control methods, the CLI and the milestone gate). The policy
@@ -31428,7 +31428,7 @@ that also reads as "missing".
 
 ## Plan 32 M2a (policy binding)
 
-**Chunk `32-m2a` of [plan 32](wip/32-snapshot-policies-and-space.md) M2 (Step
+**Chunk `32-m2a` of [plan 32](done/32-snapshot-policies-and-space.md) M2 (Step
 3.1, plus the Step 5/7.3/7.6 control surface of the binding).** A snapshot
 policy can now be set, shown, listed, paused and removed, through `setfattr`
 or the control protocol. **Nothing runs yet**: no scheduler (M3), no expiry
@@ -32021,7 +32021,7 @@ lock. Both look like the cross-node visibility family that
 
 ## Plan 32 M0 — snapshots at automatic scale
 
-Step 12's milestone M0 of [plan 32](wip/32-snapshot-policies-and-space.md)
+Step 12's milestone M0 of [plan 32](done/32-snapshot-policies-and-space.md)
 ("Step 0 … table `snapshot ls`") is complete. Four chunks built it: the
 three below whose own sections carry their detail and gates, and the
 close-out `32-m0d` (this section's second table), which adds the
@@ -32172,7 +32172,7 @@ rerun (they ran on this change, above).
 
 ## Plan 32 M5b (accounting integration)
 
-Steps 6.2–6.3 of [plan 32](wip/32-snapshot-policies-and-space.md) on a
+Steps 6.2–6.3 of [plan 32](done/32-snapshot-policies-and-space.md) on a
 node: the `32-m5a` index is built from the replica's real snapshot rows,
 kept equal to them and to the live tree, verified against a brute force,
 and reported in `node.status`. Advisory throughout: GC and snapshot
@@ -32333,7 +32333,7 @@ DESIGN.md §2. Gates (`CARGO_TARGET_DIR` unset):
 
 ## Plan 32 M3a (scheduler)
 
-Steps 3.2–3.3 of [plan 32](wip/32-snapshot-policies-and-space.md) (chunk
+Steps 3.2–3.3 of [plan 32](done/32-snapshot-policies-and-space.md) (chunk
 `32-m3a`): policies now **create** snapshots. A sticky `_snapsched`
 singleton on one node creates every due root's snapshot through the
 holder-side `SnapshotBatch` (M0a), so creation never moves the root lease.
@@ -32580,7 +32580,7 @@ the service's logical-over-stored ratio), the CLI lays them out.
 
 ## Plan 32 M2 — policy binding and CLI
 
-**Milestone M2 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 3.1
+**Milestone M2 of [plan 32](done/32-snapshot-policies-and-space.md) (Step 3.1
 plus Step 5's `policy set/show/ls/rm/pause/resume` and `snapshot ls
 --orphaned`): closed.** Two chunks: `32-m2a` (the xattr gate, root
 discovery, `SnapSchedStats`, the `snapshot.policy.{list,show,set,remove,pause}`
@@ -33016,7 +33016,7 @@ answers only — no retention or accounting arithmetic in the page.
 
 ## Plan 32 M5 — space accounting
 
-Step 12's milestone M5 of [plan 32](wip/32-snapshot-policies-and-space.md)
+Step 12's milestone M5 of [plan 32](done/32-snapshot-policies-and-space.md)
 ("Step 6: snapwalk-based index, sizes in `ls`, `space`, `delete
 --dry-run`, `--verify`") is complete. Four chunks built it: the three
 below, whose own sections above carry their detail, decisions and gates,
@@ -34229,7 +34229,7 @@ conflicts, then the review's findings.
 
 ## Plan 32 M3 — scheduler and creation
 
-**Milestone M3 of [plan 32](wip/32-snapshot-policies-and-space.md) (Steps
+**Milestone M3 of [plan 32](done/32-snapshot-policies-and-space.md) (Steps
 3.2–3.4 plus Step 5's `snapshot sched status | run [--dry-run]`): closed.**
 Three chunks: `32-m3a` (the scheduler; "Plan 32 M3a (scheduler)" above keeps its
 detail and decisions), `32-m3b` (skip-empty; "Plan 32 M3b (skip-empty)" above)
@@ -35747,7 +35747,7 @@ opt-in).
 
 ## Plan 32 M4a (expiry)
 
-Step 4 of [plan 32](wip/32-snapshot-policies-and-space.md) (chunk `32-m4a`),
+Step 4 of [plan 32](done/32-snapshot-policies-and-space.md) (chunk `32-m4a`),
 plus Step 5's `policy rm --expire`, the `policy set` grace delta and `snapshot
 ls`'s `KEPT BY`/`EXPIRES`, and the carried M3c gap (an unreachable root-lease
 holder). **Policies now delete snapshots.** The only code that does so
@@ -37335,7 +37335,7 @@ this fix. It is not investigated further here.
 
 ## Plan 32 M6 — web UI
 
-Step 12's milestone M6 of [plan 32](wip/32-snapshot-policies-and-space.md)
+Step 12's milestone M6 of [plan 32](done/32-snapshot-policies-and-space.md)
 ("Step 7: the snapshots page, the policy editor, the retention simulator")
 is complete. Two chunks built it: `32-m6a` (the page, Steps 7.1, 7.2, 7.5;
 "Plan 32 M6a (snapshots page)" above keeps its decisions and API gaps) and
@@ -38174,7 +38174,7 @@ table. No interaction.
 
 ## Plan 32 M4 — expiry
 
-**Milestone M4 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 4,
+**Milestone M4 of [plan 32](done/32-snapshot-policies-and-space.md) (Step 4,
 plus Step 5's `policy rm --expire` and Step 11's two harness scenarios and a
 grace scenario): closed.** Two chunks: `32-m4a` (expiry, grace, the never-delete
 set; "Plan 32 M4a (expiry)" above keeps its detail, decisions and tests) and
@@ -40330,7 +40330,7 @@ first file at t=11361 while node 1's holder was still in I/O.
 
 ## Plan 32 M7 — space budget
 
-**Milestone M7 of [plan 32](wip/32-snapshot-policies-and-space.md) (Step 8,
+**Milestone M7 of [plan 32](done/32-snapshot-policies-and-space.md) (Step 8,
 optional; chunk `32-m7`): `budget=<size>` now deletes.** It is the only rule
 that expires snapshots the tier windows keep. Base `72438dc`.
 
@@ -41918,3 +41918,239 @@ copy's placement.
 - `crates/control/src/proto/types.rs`, `crates/control/schema/control.schema.json`
 - `crates/harness/src/scenarios/gitflock.rs`
 - docs: `cluster-locks.md`, `forwarded-mutations.md`, `DESIGN.md`, `DECISIONS.md`, `TESTING.md`
+
+## Plan 32 — close-out
+
+Step 12's milestone M8 remainder (chunk `32-m8c`) and the plan's close-out.
+Base `5fde9b7` (M7 merged). **Every milestone M0–M8 shipped, including the
+optional M7 `budget=`** ("Plan 32 M7 — space budget" above, with its review
+round). The plan moved to
+[`done/32-snapshot-policies-and-space.md`](done/32-snapshot-policies-and-space.md)
+(a status note added at its top) and every link to it was updated (PROGRESS,
+the plans README table, plans 33/37/38, `snapshot-policies.md`). No product
+code changed in this chunk.
+
+| Item | State | Where |
+|---|---|---|
+| §11 "Compliance and performance": write throughput and lease stability with `10s:1h` on a 100k-file tree, re-runnable | DONE | `snapsched-write-overhead` (`crates/harness/src/scenarios/snapwrite.rs`, `requires: fio`), TESTING.md |
+| §11: pjdfstest with the scheduler on and no policies | DONE: 8798/8798, scheduler enabled and ticking | `tests/compliance.sh` now prints the scheduler's state and fails the lane if it is disabled or never ticked |
+| M7 review: a `budget=` scenario with the schedule leader not the lease holder | DONE, 4/4 runs passed | `snapsched-budget` (`crates/harness/src/scenarios/snapbudget.rs`), TESTING.md |
+| "Gates + report" items collected | DONE | below |
+| Full CONVENTIONS gates | DONE, with the failures listed under Gates | below |
+
+### Decisions taken here
+
+- **`snapsched-write-overhead` checks only the invariants and prints the
+  throughput.** It asserts that the root lease (holder, epoch) stays the
+  same throughout, that at least one auto snapshot lands during every "on"
+  run, and that none lands during an "off" run. It prints MB/s per run, the
+  medians and their regression. A hard 3 % assertion would fail on noise
+  alone, because one leg's run-to-run spread on this shared host is 5–10 %
+  (numbers below).
+- **The fio run** (fixed): one fresh file per run on the root lease holder,
+  `--rw=write --bs=1M --ioengine=psync --numjobs=1 --size=2G --runtime=30`
+  (whichever comes first; every run here hit 2 GiB in 13.7–28 s),
+  `--fsync=256 --end_fsync=1`, file removed afterwards. Off and on runs
+  alternate, three pairs, so drift in host load hits both legs alike. The
+  `fsync` every 256 MiB is needed: a file being written is published only
+  at `fsync`/`close`, so without it skip-empty would skip every bucket
+  inside a run and the policy would do no work while fio runs.
+- **The scheduler leads on the non-holder.** `b` creates, holds the root
+  lease, writes the tree and runs fio, with `CONSTELLATION_SNAPSCHED=0`.
+  `a` leads, so every create goes through the holder-side batch forwarded
+  over P2P (the plan's shape). Everything else is the product default.
+- **`snapsched-budget` uses three nodes, not two.** The holder `b` runs
+  without a scheduler, so the leader is never the holder. A third node is
+  needed so a follower exists to take over when the leader is `kill -9`ed.
+- **Mid-run leader change.** The scenario kills the leader the moment its
+  status shows a budget deletion. In all four runs the kill landed after
+  the leader's batch: all 3 victims deleted in one run, journaled. The new
+  leader then measured the same `budget_used_bytes` with its own index and
+  deleted nothing over four expiry periods. The case "the batch landed but
+  the audit write did not" is accepted by the scenario (the listing is the
+  proof then) but was not hit. A kill *inside* one delete batch is not
+  something the harness can time from outside, since the batch is a single
+  holder-side request.
+
+### Write throughput with an active policy (§11)
+
+`target/release/harness run snapsched-write-overhead`: two nodes, docker S3
+(floci through toxiproxy, as the integration lane uses). Tree:
+`/proj/tree`, 1,000 directories × 100 small files = **100,000 files**,
+written by `b` (eight writers, `--write-mode back`, then `through` again
+with the journal drained). Host: EC2, AMD EPYC 9R45, 32 vCPU, shared with
+other agents' harness and cargo runs (load 10–40). Three complete runs of
+the scenario (MB/s = fio's `write.bw_bytes`):
+
+| Run | No policy (MB/s) | `10s:1h` (MB/s) | Median off | Median on | Regression | Root lease before → after | Auto snapshots during on runs |
+|---|---|---|---|---|---|---|---|
+| 1 (07:25) | 146.7, 136.2, 139.4 | 138.9, 141.7, 134.4 | 139.4 | 138.9 | **+0.38 %** | holder 1 epoch 1 → holder 1 epoch 1 | 3 (1 per run) |
+| 2 (full matrix, ~15:20) | 86.7, 98.8, 81.5 | 95.7, 91.2, 85.0 | 86.7 | 91.2 | **−5.19 %** (on faster) | holder 1 epoch 1 → holder 1 epoch 1 | 6 (2 per run) |
+| 3 (18:00, load 18–38) | 89.2, 88.4, 78.3 | 87.2, 84.3, 76.8 | 88.4 | 84.3 | **+4.70 %** | holder 1 epoch 1 → holder 1 epoch 1 | 6 (2 per run) |
+
+The scheduler on `a` in every run: `create_failed 0`, `skipped_empty 0`.
+The lease was also read once a second during every run and never changed.
+
+**Verdict against the ≤ 3 % bound.** The median of the three runs'
+regressions is **+0.38 %**. Across all nine adjacent off/on pairs, the
+median regression is **+2.2 %** (mean +0.7 %, standard deviation 5.8 %).
+Both aggregates are inside 3 %, but run 3 alone was over it (+4.70 %; its
+three pairs were 2.2 %, 4.6 % and 1.9 %). The pair-to-pair noise on this
+host is about twice the bound. So these numbers neither show a regression
+over 3 % nor prove there is none. A quiet host would settle it, and the
+scenario is built to be rerun for that. **The lease never moved**: (1, 1)
+before and after, in all three runs. An earlier development run of the
+scenario failed its own "≥ 1 snapshot per on run" check once, before the
+scenario's final revision (not a product change). The final version passed
+3/3.
+
+### `snapsched-budget` (M7 review request), 4 runs
+
+Leader `a` (node 2), follower `c`, root lease holder `b` (node 1). The
+policy is `10s:1h 1m:1h; last=2; budget=3M`. Ten auto snapshots of ~1 MiB
+each, one manual, two held. The oracle from the 4th run (in the full
+matrix), verbatim:
+
+```
+oracle over 10 auto snapshots (used 6291456 bytes, budget 3145728):
+  auto-20261004T151050Z    held                 order -   survives
+  auto-20261004T151100Z    held: csi:test-uid   order -   survives
+  auto-20261004T151110Z    candidate            order 4   survives
+  auto-20261004T151120Z    candidate            order 0   victim (prefix frees 1048576, leaves 5242880)
+  auto-20261004T151130Z    candidate            order 1   victim (prefix frees 2097152, leaves 4194304)
+  auto-20261004T151140Z    candidate            order 2   victim (prefix frees 3145728, leaves 3145728)
+  auto-20261004T151150Z    candidate            order 3   survives
+  auto-20261004T151200Z    candidate            order 5   survives
+  auto-20261004T151210Z    candidate            order -   survives
+  auto-20261004T151220Z    candidate            order -   survives
+expected victims (shortest prefix of budget_order): 3 of 6; the grace window closes in 93208 ms
+```
+
+| Run | Result | Kill after the window closed | Time |
+|---|---|---|---|
+| 1 | PASSED: 3 victims in one run by node 2, journaled 3; 8 survive (manual `keep`, both held, `last` 2); remaining 3,145,728 ≤ 3,145,728; new leader `c` measured 3,145,728, deleted 0; lease (1, 1) before and after | 3,621 ms | 222.7 s |
+| 2 | PASSED, the same | 2,662 ms | 220.2 s |
+| 3 | PASSED, the same | 1,728 ms | 214.5 s |
+| 4 (full matrix) | PASSED, the same | 3,607 ms | 219.8 s |
+
+The leader's status at the kill showed `budget_used_bytes 3145728` and
+`budget_note null` in every run. The follower reported no
+`budget_used_bytes` before it led.
+
+### pjdfstest with the scheduler on and no policies
+
+`SMOKE_IMAGE=m8c-smoke:local docker compose -f docker-compose.yml -f
+<override> --profile test run --rm compliance`. The image was built from
+this tree. The override is `floci: ports: !reset []`, because host port
+4566 was held by another agent's floci. The compliance service passes no
+`CONSTELLATION_SNAPSCHED`, so the daemon runs with the default (on):
+
+```
+== FUSE transport: dev_fuse (asked for auto)
+== results: 8798 passed, 0 failed
+== snapshot scheduler: enabled=true ticks=16 policy_roots=0 (CONSTELLATION_SNAPSCHED=unset)
+COMPLIANCE TEST PASSED (baseline: 0 known failures)
+```
+
+`tests/compliance.sh` now reads `snapshot sched status --json` after the
+suite and fails the lane if the scheduler is not `enabled` or has 0 ticks.
+A lane that passed with the scheduler off would not be the run §11 asks
+for.
+
+### "Gates + report" (plan 32), collected
+
+1. **`snapsched` survivor set vs `retention::evaluate`.** First recorded in
+   "Plan 32 M4 — expiry" (gate round 1, 444.6 s). Rerun in this chunk's
+   full matrix (381.1 s, PASSED; `a` led and was killed, `b` led after; the
+   same check on both mounts). The table, verbatim (`oracle (b): ` prefix
+   dropped):
+
+   ```
+   creation (journal)         created  retention::evaluate        survives
+   auto-20261004T145750Z         0.0s  keep (held)                yes
+   auto-20261004T145800Z         3.6s  keep (held: csi:test-uid)  yes
+   auto-20261004T145810Z        13.6s  expire                     no
+   …   (every row from 23.6s to 113.6s: expire / no)
+   auto-20261004T150000Z       123.6s  keep (1m)                  yes
+   …   (133.6s–174.6s: expire / no)
+   auto-20261004T150100Z       183.6s  keep (1m)                  yes
+   …   (193.6s–233.6s: expire / no)
+   auto-20261004T150200Z       243.6s  keep (1m)                  yes
+   auto-20261004T150210Z       253.6s  expire                     no
+   auto-20261004T150220Z       263.6s  expire                     no
+   auto-20261004T150230Z       273.6s  keep (10s)                 yes
+   auto-20261004T150240Z       283.6s  keep (10s·last)            yes
+   auto-20261004T150320Z       324.6s  keep (10s·1m·last)         yes
+   ```
+
+   The run ended with 9 snapshots of `/proj` on both mounts (8 auto) and
+   root lease holder 1 epoch 1 before and after. If the holds are dropped,
+   `evaluate` would expire both held snapshots; the holds keep them.
+2. **`snapacct` dry-run chunk set vs GC-journaled deletions** (M5, "Plan 32
+   M5 — space accounting"; rerun in this matrix, PASSED 40.5 s, identical):
+   dry run `/proj@p04%p08` **15 chunks** (9,730,640 bytes), GC journaled
+   **15** deletions, whole sets equal. First 5 of each:
+   `0ba6256a…19dabc`, `27b8fe0f…c90886`, `37659870…384405`,
+   `42a409e9…7aef5`, `6ef741d7…1fce8` (full hashes in the M5 section).
+3. **The lease never moves (Step 0.1).** M0: lease `{"epoch":1,"holder":1}`
+   before, after 202 writes and after the CLI phase ("Plan 32 M0").
+   M3/M4: holder 1 / epoch 1 before and after in every
+   `snapsched-create`/`snapsched` run. This chunk: holder 1 epoch 1 before
+   and after in `snapsched` (matrix), in all four `snapsched-budget` runs
+   and in all three `snapsched-write-overhead` runs (there also polled
+   every second during each fio run).
+4. **GC round time `full` vs `diff`** (M5, "GC mark: `full` vs `diff`"): 300
+   snapshots of a 100k-file tree, mark phase: `diff` **2.63 s**, `full`
+   **567.2 s**, **216×**, equal candidate sets. **Throughput regression**:
+   the table above (medians +0.38 % / −5.19 % / +4.70 %; median paired
+   regression +2.2 %; lease unchanged).
+5. **Step 4.4 inode reuse** (M0c, restated in M3): inode numbers are
+   **never reused** within a filesystem. `alloc_ino_tx` hands out blocks
+   from a monotonic per-node counter under the node prefix, and
+   `reclaim_ino_counter` only moves it forward. So matching policy roots by
+   `ino` is safe.
+6. **pjdfstest**: 8798/8798 with the scheduler on and no policies (above).
+7. **M7 `budget=`**: shipped (`5fde9b7`), plus the leader-not-holder
+   scenario above.
+
+### Known follow-ups (not plan 32 work)
+
+- **Plan 33 Screen 5** ports `crates/control/webui/snapshots.html` (the
+  vanilla reference: same API calls, "render answers only", same timeline
+  vocabulary; see "Plan 32 M6 — web UI").
+- **Plan 37 `size_bytes`**: the CSI controller
+  (`crates/csi/src/controller/snapshots.rs`) reports `refer_bytes`, the
+  creation-time figure from the snapshot row. The plan's coordination note
+  says plan 37 reads `REFER` (Step 6.1, live from the accounting index).
+  Switching to `refer` is the coordinator's call. It costs an index read
+  per listing, and the index can answer `Building`.
+- A quiet-host rerun of `snapsched-write-overhead` would firm up the 3 %
+  verdict (see above).
+- **Pre-existing, outside plan 32:** three `constellation-store-s3` unit
+  tests fail at this base and on main `2c5497e` (no store-s3 change since):
+  `lease::tests::forward_compatible_decode` (`missing field wanted_by`),
+  `nodes::tests::records_without_p2p_fields_still_parse` and
+  `designation::tests::a_designation_at_the_wrong_key_does_not_count`.
+  These tests feed older-format JSON, which `ea8049a` (serde-default
+  cleanup) deliberately stopped accepting. The tests need updating or
+  removing in that cleanup's follow-up. They were not touched here.
+- Main has since moved plan 38 to `done/` (`a056b91`). This chunk's link
+  fix inside `wip/38-fuse-read-path-transport.md` belongs in
+  `done/38-…` when merging.
+
+### Gates
+
+Host shared with other agents (load 10–40). `CARGO_TARGET_DIR` unset,
+`ulimit -n 65536`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --workspace` (in 3 groups under the 10-minute limit: everything but the 8 small crates and `constellation-model`; `-p constellation-{mtree,net,platform,store-s3,types,upload-concurrency,vfs} -p uploadbench`; `--release -p constellation-model`, as earlier gates ran the model) | **2,592 passed, 3 failed** (1,891 + 563 + 138; ignored 32 + 3 + 13). The 3 failures are the pre-existing store-s3 tests above. The first group's doc-tests were cut off by the time limit; an earlier full `--no-fail-fast` run of this tree failed only the same `-p constellation-store-s3 --lib` target |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `bash tests/integration.sh` | PASSED (shared floci) |
+| `cargo build --release --workspace` | ok (no source change since) |
+| `target/release/harness run` (full matrix; one scenario per process via a queue script, prefix `m8c`, `TMPDIR=/var/tmp/m8c`; `fuse-inval-storm` excluded, a known bug; the two known-bug reproductions not run) | **222 scenarios: 208 PASSED first time, 11 SKIPPED** (passthrough/zero-copy, need root), **3 FAILED first time, all PASSED on rerun**: `csi-credential-revocation` (no versitygw on PATH; PASSED 8.2 s with `CONSTELLATION_VERSITYGW_BIN`), `lock-grant-dead-generation` (`designation.undelegate: directory … is not delegated`, 5.4 s; then PASSED 2/2, 10.1 s each), `delegate-backup-handoff-failover` (`a did not list b as its backup again within 90s of its upgrade`; then PASSED 2/2, 37.8 s / 114.5 s). Neither flake touches snapshots. Every plan 32 scenario passed first time: `snapsched` 381.1 s, `snapsched-s3-outage` 206.7 s, `snapsched-grace` 136.5 s, `snapsched-budget` 219.8 s, `snapsched-write-overhead` 400.2 s, `snapacct` 40.5 s, `snapshot-*`, `web-ui-smoke` |
+| `docker compose --profile test run --rm compliance` (private `SMOKE_IMAGE`, floci host port reset) | `== results: 8798 passed, 0 failed`, `COMPLIANCE TEST PASSED (baseline: 0 known failures)`, scheduler `enabled=true ticks=16 policy_roots=0` |
+| `bash tests/webui-headless.sh` (`CHROME_BIN` = Chromium from `zenika/alpine-chrome` in docker) | `PASS: webui-headless` |

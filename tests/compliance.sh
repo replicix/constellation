@@ -100,6 +100,23 @@ passthrough=$("$BIN" status tests --state-dir "$STATE" 2>/dev/null \
     | tr '\n' ' ')
 say "FUSE passthrough: ${passthrough:-unknown}"
 
+# Plan 32 §11: the suite runs with the snapshot scheduler on (the default:
+# nothing here sets `CONSTELLATION_SNAPSCHED`) and no policies, so the
+# default posture is shown to be inert. The tick counter shows the task ran
+# through the suite; a disabled or never-ticking scheduler fails the lane,
+# since the run would then not be the one the plan asks for. `grep -o`,
+# not `jq`, as above; the first `"enabled"` is the report's own field.
+sched=$("$BIN" snapshot sched status --json --state-dir "$STATE" 2>/dev/null | tr -d ' \n')
+sched_enabled=$(echo "$sched" | grep -o '"enabled":[a-z]*' | head -1 | cut -d: -f2)
+sched_ticks=$(echo "$sched" | grep -o '"ticks":[0-9][0-9]*' | head -1 | cut -d: -f2)
+sched_roots=$(echo "$sched" | grep -o '"roots":[0-9][0-9]*' | head -1 | cut -d: -f2)
+say "snapshot scheduler: enabled=${sched_enabled:-unknown} ticks=${sched_ticks:-unknown} policy_roots=${sched_roots:-unknown} (CONSTELLATION_SNAPSCHED=${CONSTELLATION_SNAPSCHED:-unset})"
+if [ "$sched_enabled" != "true" ] || [ "${sched_ticks:-0}" -lt 1 ]; then
+    fs_unmount
+    echo "COMPLIANCE TEST FAILED (the snapshot scheduler is not enabled and ticking)"
+    exit 1
+fi
+
 # Diff against the baseline (which may be absent or read-only).
 BASE_SORTED="$WORK/baseline-sorted.txt"
 { grep -hv '^#' "$BASELINE" 2>/dev/null || true; } | sort > "$BASE_SORTED"

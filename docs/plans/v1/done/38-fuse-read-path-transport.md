@@ -89,7 +89,7 @@ also runs inside a container, where seccomp profiles commonly block
 `io_uring` entirely (§8, Risks) — this plan's runtime detection is what
 keeps that combination safe rather than a silent crash.
 
-**Coordinates with plan 32** (`docs/plans/v1/wip/32-snapshot-policies-and-space.md`,
+**Coordinates with plan 32** (`docs/plans/v1/done/32-snapshot-policies-and-space.md`,
 space accounting): §3(c)'s passthrough eligibility rule pins a chunk file
 open for as long as the kernel holds a backing fd on it (§3(c)'s "pin
 while open" decision). A pinned-while-open chunk cannot be evicted by

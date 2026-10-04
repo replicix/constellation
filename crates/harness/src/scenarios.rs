@@ -70,10 +70,14 @@ mod rejoin;
 mod slowseal;
 /// Plan 32 §11: the reclaim estimate against what GC deletes.
 mod snapacct;
+/// Plan 32 Step 8: `budget=` with the schedule leader off the lease holder.
+mod snapbudget;
 /// Fix snap-drain-busy: snapshots of a busy holder under S3 latency.
 mod snapbusy;
 /// Plan 32 M3 + M4: automatic snapshot creation and expiry (`snapsched*`).
 mod snapsched;
+/// Plan 32 §11: an active policy's cost to the sequencer's writes.
+mod snapwrite;
 /// stress-ng's filesystem stressors, all at once, with verification.
 mod stressfs;
 /// Plan 38 §6/§3(e): the transport a mount negotiates, and whether a
@@ -499,6 +503,28 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: snapsched::snapsched_grace,
+    },
+    Scenario {
+        name: "snapsched-budget",
+        desc: "plan 32 Step 8: `budget=3M` on /proj, three nodes, the schedule leader not the \
+               root lease holder; after the grace window one leader run deletes exactly the \
+               shortest prefix of `budget_order` that the leader's index says meets the budget \
+               (nothing `last`, held, manual or in grace), `budget_used_bytes` from the leader; \
+               the leader killed at its run: the new leader deletes nothing twice",
+        requires: &[],
+        caps: &[],
+        run: snapbudget::snapsched_budget,
+    },
+    Scenario {
+        name: "snapsched-write-overhead",
+        desc: "plan 32 §11: a 100k-file tree under /proj on two nodes; fio sequential writes on \
+               the root lease holder, alternating no policy and `10s:1h` on /proj (the \
+               scheduler on the other node), 3 runs each: the root lease (holder, epoch) never \
+               moves; MB/s per run, the medians and the regression printed (the <= 3% bound is \
+               judged on them, not asserted)",
+        requires: &["fio"],
+        caps: &[],
+        run: snapwrite::snapsched_write_overhead,
     },
     Scenario {
         name: "e2e-basic",

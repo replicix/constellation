@@ -1,5 +1,10 @@
 # Plan 32 — Automatic snapshot policies and per-snapshot space accounting
 
+> **Status: done (M0–M8, including the optional M7 `budget=`).** The evidence
+> this plan's "Gates + report" asks for, and the follow-ups left open, are in
+> `docs/plans/v1/PROGRESS.md` "Plan 32 — close-out". Where this document and
+> PROGRESS differ, PROGRESS is what the tree does.
+
 Read `docs/plans/v1/CONVENTIONS.md` first. Spec context:
 `docs/explanation/DESIGN.md` §13 (snapshots — **stale**, see "Where we
 are" below), §14 (GC), §10 (control plane). Feature docs:
