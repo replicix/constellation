@@ -501,6 +501,9 @@ pub struct Report {
     /// missing), and the authority samples taken.
     pub epochs_formed: usize,
     pub epochs_missing_node: usize,
+    /// Outages that found a member's previous epoch still open, so no
+    /// epoch formed and that one went on (`epochs::try_form`).
+    pub epochs_continued: usize,
     pub authority_samples: u64,
     /// Plan 30 §M11: marker pairs checked and violations seen.
     pub marker_checks: u64,
@@ -535,6 +538,8 @@ pub struct Cluster {
     /// Plan 30 §M10: epochs formed (members), and single-authority
     /// violations seen by the sampler.
     pub epochs: Mutex<Vec<Vec<NodeId>>>,
+    /// Outages whose epoch was a member's still-open previous one.
+    pub epochs_continued: Mutex<usize>,
     pub split_brains: Mutex<Vec<String>>,
     pub slack: u32,
     /// Plan 30 §M9: holder crashes (simulated ms) and, once known, the
@@ -2012,6 +2017,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         down: Mutex::new(BTreeMap::new()),
         claim_ms: 4 * cfg.s3_latency.1 as i64,
         epochs: Mutex::new(Vec::new()),
+        epochs_continued: Mutex::new(0),
         split_brains: Mutex::new(Vec::new()),
         slack: cfg.epoch_slack,
         locks: Arc::new(super::locks::LockGhost::new(seed)),
@@ -2433,6 +2439,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .filter(|m| m.len() < cfg.nodes as usize)
             .count();
     }
+    report.epochs_continued = *cluster.epochs_continued.lock().unwrap();
     report.authority_samples = super::epochs::SAMPLES.with(|s| s.get());
     {
         let (checks, violations) = *marker_stats.lock().unwrap();

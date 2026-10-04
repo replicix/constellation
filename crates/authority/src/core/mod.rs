@@ -800,11 +800,14 @@ pub struct Stats {
     /// a grant to them went unused (`LockState::served`); releases that
     /// named an id this owner had replaced; node: pushes accepted from a
     /// node other than the one the op last asked, and replies to a
-    /// request a push had answered, installed over the held id.
+    /// request a push had answered, installed over the held id; and
+    /// recalls of a grant this node neither held nor could still
+    /// install, answered with its release.
     pub lock_requeued_in_place: u64,
     pub lock_released_superseded: u64,
     pub lock_pushes_from_other_owner: u64,
     pub lock_late_replies_installed: u64,
+    pub lock_recalls_unheld_released: u64,
     pub lock_waiters_parked: u64,
     pub lock_waiting_replies: u64,
     /// Plan 30 §M14: remote waiters dropped after `4 × ttl` of silence

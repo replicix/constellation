@@ -2781,16 +2781,29 @@ landing but answering a timeout (a re-claim in doubt), and requires no
 lost grant, no fenced I/O and no `ENOLCK` (before the `epoch-lock-grants`
 fix the first seed already broke mutual exclusion: every close dropped
 the grant table). `locks-blips-tight` cuts in back-to-back pairs (300 to
-900 ms apart), so some cuts start between a close and the lease's
-re-claim, and requires the next epoch to carry the lease again
-(`epoch_closed_leases_reheld`); its seed 2723 is pinned
+900 ms apart), so some cuts start before the last epoch has closed
+everywhere: as the daemon does, the sim's coordinator then forms no
+epoch, and the open one goes on (`epochs_continued`; a member of an open
+epoch neither proposes nor joins another). Seeds 200 and 8398 are pinned
+(`locks_blips_tight_an_open_epoch_is_not_formed_over`: a second epoch
+formed over the open one carried no lease, and a member took the lease
+over beside the owner's hold). With three nodes no cut can begin a new
+epoch inside the hold owner's re-claim window (the others are still in
+the last epoch, waiting for that re-claim), so the re-held lease
+(`epoch_closed_leases_reheld`) is required of `locks-blips-tight-single`
+(one node), and no fenced I/O of `locks-blips-tight-long-lease` (a 10 s
+lease: with 6 s, the lease a close let go can expire inside a pair of
+cuts no re-claim reached, and its grants with it). Seed 2723 is pinned
 (`locks_blips_tight_seed_2723_release_keeps_exclusion`: a handoff that
 dropped two live exclusive grants, and a successor whose release grace
 went with its own tenure). `locks-blips-tight-in-doubt` (sweep only, plus
 the pinned `locks_blips_tight_in_doubt_seeds_acquire`) adds `locks-blips`'
 in-doubt lease PUTs to that schedule: acquisition CASes that land but
 answer a timeout, and non-holders whose cached holders point at each
-other. Replay one with
+other; its seed 1383 is pinned
+(`locks_blips_tight_in_doubt_seed_1383_an_overtaken_release_keeps_exclusion`:
+a node's next request overtook its release, and the release ended the
+grant re-affirmed for that request). Replay one with
 `AUTHORITY_SIM_SEED=<seed> AUTHORITY_SIM_CONFIG=<config> RUST_LOG=sim=debug,constellation_authority::core::locks=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
 
 Harness scenarios (the harness process is the application: it calls

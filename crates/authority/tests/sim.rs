@@ -335,6 +335,8 @@ fn replay_seed() {
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-blips") => locks_blips_config(),
         Ok("locks-blips-tight") => locks_blips_tight_config(),
+        Ok("locks-blips-tight-single") => locks_blips_tight_single_config(),
+        Ok("locks-blips-tight-long-lease") => locks_blips_tight_long_lease_config(),
         Ok("locks-blips-tight-in-doubt") => locks_blips_tight_in_doubt_config(),
         Ok("locks-pause") => locks_pause_config(),
         Ok("locks-delegated") => locks_delegated_config(),
@@ -2613,6 +2615,8 @@ fn sweep_config() {
         "locks-faults" => locks_faults_config(),
         "locks-blips" => locks_blips_config(),
         "locks-blips-tight" => locks_blips_tight_config(),
+        "locks-blips-tight-single" => locks_blips_tight_single_config(),
+        "locks-blips-tight-long-lease" => locks_blips_tight_long_lease_config(),
         "locks-blips-tight-in-doubt" => locks_blips_tight_in_doubt_config(),
         "locks-pause" => locks_pause_config(),
         "locks-delegated" => locks_delegated_config(),
@@ -4044,6 +4048,41 @@ fn locks_blips_tight_config() -> SimConfig {
     c
 }
 
+/// `locks-blips-tight` on one node (`stress-ng-fs-faults`' topology).
+/// With three, the members of the last epoch stay in it until the
+/// carried lease has moved, that is past the holder's re-claim, and a
+/// member of an open epoch joins no other (`Machine::persist_promise`):
+/// so only a lone node's next epoch can begin inside the re-claim
+/// window and carry the lease its close let go.
+fn locks_blips_tight_single_config() -> SimConfig {
+    SimConfig {
+        nodes: 1,
+        ..locks_blips_tight_config()
+    }
+}
+
+/// `locks-blips-tight` with a 10 s lease. A pair of cuts whose gap no
+/// re-claim reached (the hold owner closed in a short S3 window and was
+/// cut again) has no next epoch: the other members are still in the
+/// last one, waiting for that re-claim. The grants the close kept are
+/// renewed under the closed lease up to its expiry, and with the sim's
+/// 6 s lease, last renewed up to half a TTL before the pair, that expiry
+/// can fall inside the pair (1.5 + 0.9 + 1.5 s at most): the grants lapse,
+/// as for any lease nobody could renew. 10 s outlasts it, so the schedule
+/// tests what it is for: grants surviving the blips.
+fn locks_blips_tight_long_lease_config() -> SimConfig {
+    let c = locks_blips_tight_config();
+    let core = c.core.clone();
+    SimConfig {
+        core: std::sync::Arc::new(move |id, incarnation| {
+            let mut k = core(id, incarnation);
+            k.ttl_ms = 10_000;
+            k
+        }),
+        ..c
+    }
+}
+
 /// `locks-blips-tight` with `locks-blips`' in-doubt lease PUTs back:
 /// back-to-back cuts with acquisition and release CASes that land but
 /// answer a timeout. On main before chunk lock-release-drop it failed
@@ -4359,14 +4398,54 @@ fn locks_survive_s3_blips() {
         t.clients.unavailable, 0,
         "locks refused across blips: {t:?}"
     );
-    // Cuts between a close and the lease's re-claim: the next epoch
-    // carries the lease the close let go.
-    let mut reheld = 0;
+    // Cuts in back-to-back pairs: some begin before the last epoch has
+    // closed everywhere, and that epoch goes on.
+    let mut continued = 0;
     let mut t = M14Totals::default();
     for seed in 99_100..99_160 {
         let report = run_seed(seed, locks_blips_tight_config()).unwrap_or_else(|e| {
             panic!(
                 "locks-blips-tight seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight"
+            )
+        });
+        continued += report.epochs_continued;
+        t.add(&report);
+    }
+    eprintln!("locks-blips-tight: {continued} epochs continued, {t:#?}");
+    assert!(continued > 0, "no cut fell before an epoch's close");
+    assert_eq!(t.lost, 0, "grants lost across blips: {t:?}");
+    assert_eq!(
+        t.clients.unavailable, 0,
+        "locks refused across blips: {t:?}"
+    );
+    // No fenced I/O once the lease outlives a pair of cuts no re-claim
+    // reached (see `locks_blips_tight_long_lease_config`; with the 6 s
+    // lease it can expire inside the pair, and its grants with it).
+    let mut t = M14Totals::default();
+    for seed in 99_100..99_160 {
+        let report = run_seed(seed, locks_blips_tight_long_lease_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-blips-tight-long-lease seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight-long-lease"
+            )
+        });
+        t.add(&report);
+    }
+    eprintln!("locks-blips-tight-long-lease: {t:#?}");
+    assert_eq!(t.lost, 0, "grants lost across blips: {t:?}");
+    assert_eq!(t.clients.fenced_ios, 0, "I/O fenced across blips: {t:?}");
+    assert_eq!(
+        t.clients.unavailable, 0,
+        "locks refused across blips: {t:?}"
+    );
+    // Cuts between a close and the lease's re-claim: the next epoch
+    // carries the lease the close let go (one node: see
+    // `locks_blips_tight_single_config`).
+    let mut reheld = 0;
+    let mut t = M14Totals::default();
+    for seed in 99_100..99_160 {
+        let report = run_seed(seed, locks_blips_tight_single_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-blips-tight-single seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight-single"
             )
         });
         reheld += report
@@ -4376,7 +4455,7 @@ fn locks_survive_s3_blips() {
             .sum::<u64>();
         t.add(&report);
     }
-    eprintln!("locks-blips-tight: {reheld} closed leases held again, {t:#?}");
+    eprintln!("locks-blips-tight-single: {reheld} closed leases held again, {t:#?}");
     assert!(reheld > 0, "no cut fell inside a re-claim window");
     assert_eq!(t.lost, 0, "grants lost across blips: {t:?}");
     assert_eq!(t.clients.fenced_ios, 0, "I/O fenced across blips: {t:?}");
@@ -4391,6 +4470,14 @@ fn locks_survive_s3_blips() {
 /// handoff flushed, and the release dropped them under their holders'
 /// I/O; the successor's grace went with its own epoch-flush release, and
 /// its re-claim of that lease granted over the live exclusive grant.
+///
+/// No I/O is fenced with the 10 s lease. With the 6 s one, one I/O is:
+/// the hold owner closed its epoch at t=8701 on a probe that landed as
+/// S3 was cut again (t=8500), the other members stayed in that epoch
+/// waiting for its re-claim, so none formed, and the closed lease, last
+/// renewed before the cut, expired at t≈9.8 s inside it with the grants
+/// it kept (`locks_blips_tight_long_lease_config`). It passed with 0
+/// only while the sim formed a second epoch over the open one.
 #[test]
 fn locks_blips_tight_seed_2723_release_keeps_exclusion() {
     let report = run_seed(2723, locks_blips_tight_config()).unwrap_or_else(|e| {
@@ -4399,7 +4486,71 @@ fn locks_blips_tight_seed_2723_release_keeps_exclusion() {
     let mut t = M14Totals::default();
     t.add(&report);
     assert_eq!(t.lost, 0, "grants lost: {t:?}");
+    assert!(t.clients.fenced_ios <= 1, "I/O fenced: {t:?}");
+    let report = run_seed(2723, locks_blips_tight_long_lease_config()).unwrap_or_else(|e| {
+        panic!(
+            "locks-blips-tight-long-lease seed 2723: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight-long-lease"
+        )
+    });
+    let mut t = M14Totals::default();
+    t.add(&report);
+    assert_eq!(t.lost, 0, "grants lost: {t:?}");
     assert_eq!(t.clients.fenced_ios, 0, "I/O fenced: {t:?}");
+}
+
+/// `locks-failover` seed 5297: node 2's recall of grant 558 (the owner
+/// served a stale waiter of its with it after node 2 released 557)
+/// overtook the push of 558; nothing was held and no op waited, so node
+/// 2 released it at once. Its next op on the inode then installed the
+/// late push, and node 3 entered I/O under 559 beside it: two exclusive
+/// holders. The fast-path release tombstones the id, so the late push is
+/// refused and the op asks again.
+#[test]
+fn locks_failover_seed_5297_a_push_behind_its_released_recall_is_refused() {
+    run_seed(5297, locks_failover_config()).unwrap_or_else(|e| {
+        panic!("locks-failover seed 5297: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-failover")
+    });
+}
+
+/// `locks-blips-tight-in-doubt` seed 1383: node 3 released its grant and
+/// asked again at once; the request overtook the release at the owner,
+/// which re-affirmed the grant under a new id, then took the release of
+/// the old id for the end of the new one and granted the inode to itself
+/// beside node 3's: two exclusive holders. Exposed once the sim stopped
+/// forming an epoch over an open one (see the next test).
+#[test]
+fn locks_blips_tight_in_doubt_seed_1383_an_overtaken_release_keeps_exclusion() {
+    run_seed(1383, locks_blips_tight_in_doubt_config()).unwrap_or_else(|e| {
+        panic!(
+            "locks-blips-tight-in-doubt seed 1383: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight-in-doubt"
+        )
+    });
+}
+
+/// `locks-blips-tight` seeds 200 and 8398: the next outage came before
+/// the last continuation epoch (carrying node 1's lease, node 1 owning
+/// its hold) had closed. The sim's coordinator formed a second epoch
+/// over the open one, which the daemon never does (an open member
+/// neither proposes nor accepts another epoch's promise); its carrier
+/// resolved to `None`, since the hold's owner claims nothing, so the
+/// other members closed on S3's return as members of an epoch carrying
+/// no lease, and one of them took the expired lease over (seed 200: the
+/// dead-root check, seed 8398: a lock acquisition) beside node 1's hold.
+/// The epoch now goes on instead, and its members wait for the carried
+/// lease to move.
+#[test]
+fn locks_blips_tight_an_open_epoch_is_not_formed_over() {
+    for seed in [200, 8398] {
+        let report = run_seed(seed, locks_blips_tight_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-blips-tight seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-blips-tight"
+            )
+        });
+        assert!(
+            report.epochs_continued > 0,
+            "seed {seed}: no outage met an open epoch"
+        );
+    }
 }
 
 /// `locks-blips-tight` with in-doubt lease PUTs: an acquisition CAS that

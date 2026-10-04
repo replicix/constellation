@@ -308,6 +308,9 @@ struct Inner {
     /// landed after the second was released — sim `locks-released-writes`
     /// seed 211029, two exclusive holders). Refused like a released id.
     newest: BTreeMap<(u64, u64), u64>,
+    /// Node side: per inode, the grant this node released last, while it
+    /// has held none there since (see [`LockTables::released_last`]).
+    released_last: BTreeMap<u64, GrantId>,
     /// Node side: inodes whose dirty data may have been written under a
     /// grant that ended without the release's flush (see
     /// [`LockTables::take_discard`]).
@@ -815,6 +818,7 @@ impl LockTables {
         while g.newest.len() > NEWEST_KEPT {
             g.newest.pop_first();
         }
+        g.released_last.remove(&ino);
         if g.pending_recalls
             .remove(&ino)
             .is_some_and(|ids| ids.contains(&held.id))
@@ -891,11 +895,31 @@ impl LockTables {
                 }
                 g.held.remove(&ino);
                 g.tombstone(id);
+                g.released_last.insert(ino, id);
+                while g.released_last.len() > NEWEST_KEPT {
+                    g.released_last.pop_first();
+                }
                 self.track(&g);
                 true
             }
             _ => false,
         }
+    }
+
+    /// The grant on `ino` this node released last (its flush done, no
+    /// local lock under it), if it has held none there since: every
+    /// other way a held grant ends (a lapse, a loss) follows an install,
+    /// which clears this. `None` also when the entry was evicted (past
+    /// `NEWEST_KEPT` inodes): what it vouches for is then unknown.
+    pub fn released_last(&self, ino: u64) -> Option<GrantId> {
+        self.lock().released_last.get(&ino).copied()
+    }
+
+    /// This node answered the recall of `id`, which it does not hold, with
+    /// a release: refuse it from now on. A push of it may still be in
+    /// flight, and a push installs for any later op on the inode.
+    pub fn tombstone_unheld(&self, id: GrantId) {
+        self.lock().tombstone(id);
     }
 
     /// The sequencer recalled `id` on `ino`: `Some(busy)` when this node

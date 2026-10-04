@@ -411,6 +411,23 @@ impl Core {
                 gen: 0,
             };
         }
+        // An epoch's close let the lease go locally and kept its grants,
+        // and S3 was cut again before the re-claim landed: the lease still
+        // stands as this node's (`epoch_reclaim_expires`), so the kept
+        // grants are renewed under it, capped at its expiry as a held
+        // lease's are; new grants wait for the re-claim
+        // (`lock_op_while_resuming`). Answered `NotOwner { 0 }`, they
+        // lapsed under their holders' I/O whenever the next epoch could
+        // not form: its other members were still in the last one, waiting
+        // for this very re-claim (`locks-blips-tight` seed 99102).
+        if renewal {
+            if let Some(expires) = self.epoch_reclaim_expires(now) {
+                return Route::Me {
+                    cap_ms: expires - self.lock_margin_ms() - now.0,
+                    gen: 0,
+                };
+            }
+        }
         match self
             .lease
             .cached_holder
@@ -1369,17 +1386,29 @@ impl Core {
             self.lock_grant_done(now, grant, ino, replica, out);
             return;
         }
-        // The node released an id this owner has since replaced (a
+        // The node released an id this owner has since replaced: a
         // re-sent request re-affirmed its grant under a new id while the
-        // old one was on its way there): the node holds nothing on the
-        // inode any more, so the grant it still has here is done too.
-        // Left in the table, that grant was outwaited (`ttl + margin`)
-        // before the next waiter was served.
+        // old one was on its way there, and the node may hold nothing on
+        // the inode any more. Or it may hold the new id: its *next*
+        // request, sent after this release, overtook it, and the
+        // re-affirmation answered it, so the new id has a lock under it
+        // there (`locks-blips-tight-in-doubt` seed 1383: ended here, the
+        // owner granted itself the inode beside it). So the new id is
+        // recalled: a node that holds it releases it once its locks are
+        // gone, one that cannot come to hold it answers the recall with
+        // its release (`lock_recall_here`) — the waiter is served one
+        // round trip later, not outwaited (`ttl + margin`). This node's
+        // own release is never overtaken by its own next request: it
+        // ends the grant at once.
         if let Some(g) = replica.locks().own_grant(ino, from, now.0) {
             if g.id.node == grant.node && g.id.seq > grant.seq {
-                self.stats.lock_recalls_released += 1;
                 self.stats.lock_released_superseded += 1;
-                self.lock_grant_done(now, g.id, ino, replica, out);
+                if from == self.cfg.node_id {
+                    self.stats.lock_recalls_released += 1;
+                    self.lock_grant_done(now, g.id, ino, replica, out);
+                } else {
+                    self.lock_recall(now, g, replica, out);
+                }
             }
         }
     }
@@ -2623,6 +2652,38 @@ impl Core {
             to: from,
             msg: PeerMsg::LockRecalled { req },
         });
+        // A newer id of the grant this node released last on the inode,
+        // with nothing held or installed there since and no op here
+        // waiting on it: the id that superseded the released one at the
+        // owner (`on_lock_released`). Nothing ran under it here, so it
+        // is released now rather than outwaited — and tombstoned: a push
+        // of it may still be in flight, and a push installs for any
+        // later op on the inode (sim `locks-failover` seed 5297: the
+        // recall overtook the push, a new op took the late push, two
+        // exclusive holders); refused, that op asks again. A grant this
+        // node held and lost (lapsed) is not: what ran under it may still
+        // be in flight, and its owner waits that out. With an op waiting, the
+        // grant may be its answer, in flight: the reply installs it
+        // recalled, as below.
+        if replica.locks().held(ino).is_none()
+            && replica
+                .locks()
+                .released_last(ino)
+                .is_some_and(|r| r.node == grant.node && r.seq < grant.seq)
+            && !self.lk.ops.values().any(|o| o.ino == ino)
+        {
+            self.stats.lock_recalls_unheld_released += 1;
+            replica.locks().tombstone_unheld(grant);
+            out.push(Action::Send {
+                to: from,
+                msg: PeerMsg::LockReleased {
+                    ino,
+                    grant,
+                    position: Position::ZERO,
+                },
+            });
+            return;
+        }
         self.lock_recall_here(now, ino, grant, replica, out);
     }
 

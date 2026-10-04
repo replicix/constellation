@@ -8471,10 +8471,13 @@ mod locks {
 
     /// The owner re-affirms a grant under a new id for every answer
     /// (a re-sent request that crossed the old id's push); the node may
-    /// release the old id. That release ends the grant here too, instead
-    /// of leaving it to be outwaited.
+    /// release the old id. That release leaves the new one recalled, and
+    /// the node, holding nothing on the inode and waiting for nothing
+    /// there, answers the recall with its release (see
+    /// `a_recall_of_a_newer_id_than_the_grant_released_is_released`): the
+    /// waiter is served then, instead of after the grant is outwaited.
     #[test]
-    fn a_release_naming_a_superseded_id_ends_the_grant() {
+    fn a_release_naming_a_superseded_id_recalls_the_grant() {
         let (mut h, ino) = holder_with_file();
         let out = request(&mut h, 2, 7, ino, X, true);
         let (old, _) = granted(&lock_replies(&out)[0].2);
@@ -8494,11 +8497,274 @@ mod locks {
                 position: constellation_meta::Position::ZERO,
             },
         });
-        let [(3, OpId(9), LockOutcome::Granted { .. })] = lock_replies(&out).as_slice() else {
-            panic!("the waiter is served on the old id's release: {out:?}")
-        };
+        assert!(lock_replies(&out).is_empty(), "not yet: {out:?}");
+        // Recalled (already, for node 3's request), so node 2 answers it.
+        assert!(h.meta.locks().get(new).is_some_and(|g| g.recalled));
         assert_eq!(h.core.stats.lock_released_superseded, 1);
+        h.advance(10);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: new,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let [(3, OpId(9), LockOutcome::Granted { .. })] = lock_replies(&out).as_slice() else {
+            panic!("the waiter is served on the new id's release: {out:?}")
+        };
         assert!(h.meta.locks().get(new).is_none());
+    }
+
+    /// `locks-blips-tight-in-doubt` seed 1383: node 3 released its grant
+    /// (unrecalled at the owner: re-claimed after a takeover) and asked
+    /// again at once; the request overtook the release, and the owner
+    /// re-affirmed the grant under a new id, which node 3 installed with
+    /// a lock under it. The release of the old id ended that new grant
+    /// too, and the owner granted the inode to itself beside node 3's:
+    /// two exclusive holders. The new id is recalled instead, and nothing
+    /// is granted over it until node 3 releases it.
+    #[test]
+    fn a_release_overtaken_by_the_nodes_next_request_keeps_the_new_grant() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 3, 7, ino, X, true);
+        let (old, _) = granted(&lock_replies(&out)[0].2);
+        // Node 3's next request (sent after its release) arrives first.
+        h.advance(10);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        let (new, _) = granted(&lock_replies(&out)[0].2);
+        assert!(new.seq > old.seq);
+        // Then the release of the old id.
+        h.advance(10);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: old,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        assert!(h.meta.locks().get(new).is_some_and(|g| g.recalled));
+        assert!(
+            recalls(&out)
+                .iter()
+                .any(|(to, _, i, g)| *to == 3 && *i == ino && *g == new),
+            "{out:?}"
+        );
+        // The owner, as a lock user, waits behind node 3's live grant.
+        let lock_granted = |out: &[Action]| {
+            out.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::ControlDone {
+                        op: OpId(5),
+                        result: Ok(ControlOk::Lock(LockAnswer::Granted { .. })),
+                    }
+                )
+            })
+        };
+        h.advance(10);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: true,
+            },
+        });
+        assert!(!lock_granted(&out), "granted beside node 3's: {out:?}");
+        // Node 3 releases the new id once its lock is gone: served.
+        h.advance(10);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: new,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        assert!(lock_granted(&out), "{out:?}");
+    }
+
+    /// A recall of a newer id of the grant this node released last on
+    /// the inode, with nothing held there since and no op waiting on it
+    /// (the id that superseded the released one at its owner): nothing
+    /// ran under it and nothing can install it, so it is released at
+    /// once. Not so for an id it never had a release to vouch for (one
+    /// it held and lost is outwaited by its owner: what ran under it may
+    /// be in flight), nor with an op waiting, whose answer it may be: the
+    /// reply installs it recalled.
+    #[test]
+    fn a_recall_of_a_newer_id_than_the_grant_released_is_released() {
+        let mut r = requester();
+        let recall = |r: &mut Harness, req: u64, ino: Ino, seq: u64| {
+            let out = r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockRecall {
+                    req: OpId(req),
+                    ino,
+                    grant: GrantId { node: 1, seq },
+                },
+            });
+            sends(&out)
+                .into_iter()
+                .filter_map(|(to, m)| match m {
+                    PeerMsg::LockReleased { ino, grant, .. } => Some((to, *ino, *grant)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // Never held here: kept for a reply, as before.
+        assert!(recall(&mut r, 70, 44, 3).is_empty());
+        // Grant 2 on inode 42, used and released.
+        let req = lock_control(&mut r, 50, 42, true);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(2),
+            },
+        });
+        let lock = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        r.meta.locks().local_set(42, lock, r.now.0);
+        assert!(recall(&mut r, 71, 42, 2).is_empty(), "busy");
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.now.0));
+        r.step(Event::Control {
+            op: OpId(51),
+            req: Control::LockIdle { ino: 42 },
+        });
+        let out = r.step(Event::LockFlushed {
+            ino: 42,
+            grant: GrantId { node: 1, seq: 2 },
+            ok: true,
+        });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::LockReleased { .. })),
+            "{out:?}"
+        );
+        // The owner had re-affirmed it as 3 meanwhile: released here.
+        assert_eq!(
+            recall(&mut r, 72, 42, 3),
+            vec![(1, 42, GrantId { node: 1, seq: 3 })]
+        );
+        assert_eq!(r.core.stats.lock_recalls_unheld_released, 1);
+        // An op waits on the inode now: id 4 may be its answer.
+        let req = lock_control(&mut r, 52, 42, true);
+        assert!(recall(&mut r, 73, 42, 4).is_empty());
+        r.advance(10);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(4),
+            },
+        });
+        assert!(r.meta.locks().held(42).is_some_and(|h| h.recalled));
+    }
+
+    /// The recall of the newer id overtook its push: released at once,
+    /// it is tombstoned, so the late push — which a push installs for
+    /// any later op on the inode — is refused for the next op, which asks
+    /// again (sim `locks-failover` seed 5297: that op entered I/O under
+    /// the released id beside the next holder's).
+    #[test]
+    fn a_push_behind_its_released_recall_is_refused() {
+        let mut r = requester();
+        // Grant 2 on inode 42, used, recalled and released.
+        let req = lock_control(&mut r, 50, 42, true);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(2),
+            },
+        });
+        let lock = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        r.meta.locks().local_set(42, lock, r.now.0);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(69),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 2 },
+            },
+        });
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.now.0));
+        r.step(Event::Control {
+            op: OpId(51),
+            req: Control::LockIdle { ino: 42 },
+        });
+        r.step(Event::LockFlushed {
+            ino: 42,
+            grant: GrantId { node: 1, seq: 2 },
+            ok: true,
+        });
+        assert!(r.meta.locks().held(42).is_none());
+        // The recall of 3 comes before its push: released at once.
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(70),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 3 },
+            },
+        });
+        assert!(
+            sends(&out).iter().any(|(_, m)| matches!(
+                m,
+                PeerMsg::LockReleased {
+                    grant: GrantId { node: 1, seq: 3 },
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        assert_eq!(r.core.stats.lock_recalls_unheld_released, 1);
+        // A new op on the inode; then the push of 3 lands.
+        let sent = r.now;
+        let _req = lock_control(&mut r, 52, 42, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockGranted {
+                ino: 42,
+                sent,
+                outcome: grant_msg(3),
+            },
+        });
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(52), .. })),
+            "the released id answered the op: {out:?}"
+        );
+        assert!(r.meta.locks().held(42).is_none());
+        assert_eq!(r.core.stats.lock_released_replies, 1);
+        // It asks again.
+        let retry = timer_of(&out, TimerKind::LockRetry);
+        r.advance(1_000);
+        let out = r.step(Event::Timer { id: retry });
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockRequest { .. })),
+            "{out:?}"
+        );
     }
 
     /// A push answers the op waiting for the inode even when it comes
@@ -10737,6 +11003,79 @@ mod locks {
             .expect("a renewal answer");
         assert!(
             matches!(renewed.as_slice(), [(_, _, LockRenewResult::Ok { .. })]),
+            "{renewed:?}"
+        );
+    }
+
+    /// `locks-blips-tight` seed 99102 (three nodes): the hold owner
+    /// closed its epoch in a short S3 window and was cut again before its
+    /// re-claim. No next epoch could form (the other members were still
+    /// in this one, waiting for that very re-claim, and a member of an
+    /// open epoch joins no other), and the renewals of the grants the
+    /// close kept were answered `NotOwner { 0 }`, so they lapsed under
+    /// their holders' I/O. They are renewed under the closed lease now,
+    /// which still stands as this node's, up to its expiry.
+    #[test]
+    fn kept_grants_are_renewed_in_the_reclaim_window_up_to_the_closed_leases_expiry() {
+        let (mut h, ino, peer_ino, peer_grant, object) = holder_with_grants_in_an_epoch();
+        // The close; S3 is cut again: nothing below answers an S3 op.
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        assert!(h.core.lease.held.is_none());
+        assert!(h.core.epoch_reclaim_pending(h.now));
+        let margin = h.core.cfg.expiry_margin_ms as i64;
+        let renew = |h: &mut Harness, req: u64| {
+            let out = h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::LockRenew {
+                    req: OpId(req),
+                    entries: vec![LockRenewEntry {
+                        ino: peer_ino,
+                        grant: peer_grant,
+                        mode: X,
+                    }],
+                },
+            });
+            sends(&out)
+                .into_iter()
+                .find_map(|(to, m)| match m {
+                    PeerMsg::LockRenewed { results, .. } if to == 2 => Some(results.clone()),
+                    _ => None,
+                })
+                .expect("a renewal answer")
+        };
+        // A peer's renewal: served, capped at the closed lease's expiry.
+        h.advance(700);
+        let renewed = renew(&mut h, 70);
+        let [(_, _, LockRenewResult::Ok { ttl_ms, .. })] = renewed.as_slice() else {
+            panic!("{renewed:?}")
+        };
+        assert!(*ttl_ms as i64 <= object.expires_unix_ms - margin - h.now.0);
+        // The node's own lockers' too.
+        let held = h.meta.locks().held(ino).expect("still held");
+        h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
+        let mut out = Vec::new();
+        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        assert_eq!(h.core.stats.lock_lost, 0, "fenced: {out:?}");
+        assert!(h
+            .meta
+            .locks()
+            .held(ino)
+            .is_some_and(|g| g.until_ms > h.now.0 && g.until_ms <= object.expires_unix_ms));
+        // Past the closed lease's usable end, nothing is renewed: anyone
+        // may take it over from then on.
+        h.now = Ms(object.expires_unix_ms - margin);
+        let renewed = renew(&mut h, 71);
+        assert!(
+            matches!(
+                renewed.as_slice(),
+                [(_, _, LockRenewResult::NotOwner { owner: 0 })]
+            ),
             "{renewed:?}"
         );
     }

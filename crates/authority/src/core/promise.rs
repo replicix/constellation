@@ -729,6 +729,30 @@ impl Core {
                 .any(|(_, _, expires)| *expires - self.cfg.expiry_margin_ms as i64 > now.0)
     }
 
+    /// While the re-claim is pending, the end of the authority the close
+    /// let go: the earliest expiry among the closed tenure's objects, if
+    /// every one is this node's own. The object standing in S3 is one of
+    /// them, unchanged since the close (the re-claim is this node's CAS
+    /// to make), and nobody takes it over before it expires: a member of
+    /// the epoch acquires nothing while it is open, anyone else only
+    /// past the expiry. `None` with a hold handed over in the epoch among
+    /// them (another node's lease object).
+    pub(crate) fn epoch_reclaim_expires(&self, now: Ms) -> Option<i64> {
+        if !self.epoch_reclaim_pending(now)
+            || self
+                .pr
+                .closed_tenure
+                .iter()
+                .any(|(holder, _, _)| *holder != self.cfg.node_id)
+        {
+            return None;
+        }
+        // The minimum over every entry, although the re-claim is pending
+        // while any one is unexpired: an expired one makes the cap
+        // negative, which the renewal refuses (`lock_renew_one`: `NotOwner`).
+        self.pr.closed_tenure.iter().map(|(_, _, e)| *e).min()
+    }
+
     /// This node lets its epoch hold go for good (a handoff, the close):
     /// record the carried lease so nothing adopts that hold again here.
     /// `closed`: it closed the epoch itself (S3 is back), and owes the

@@ -40689,3 +40689,208 @@ lane, fio gate) at "Read-path lanes at a glance".
 - Z0b's and the TESTING.md gate text said the CI cost gate would gate "until
   Z1 establishes a runner baseline". It records in the `performance` job and
   gates per leg in `transport-matrix` (first run blesses); TESTING.md is fixed.
+
+## Fix: an epoch hold beside another node's usable S3 lease; a release overtaken by the node's next request ended its live grant (`two-authorities`)
+
+Sim `locks-blips-tight` seed 200 ("two authorities at once (plan 30
+§M10)": t=10762, an epoch hold on node 1, a usable S3 lease on node 3)
+failed from f3052f4 on. Seed 8398 (t=10609, the lease on node 2) failed
+before it, on d1e56cd.
+
+### Root cause: the sim formed an epoch over an open one (both seeds)
+
+The schedule repeats whole-cluster outages (S3 and P2P for 1.5 s), some
+of them in back-to-back pairs. In both seeds the outage at t=8500 came
+while the continuation epoch formed at t=6800 was still open. That epoch
+carried node 1's lease, and node 1 owned its hold. The sim's coordinator
+(`epochs::try_form`) formed a second epoch at t=8800 over the open one.
+The daemon never does this: `EpochManager::maybe_propose` returns while
+the node's epoch `is_open`, and `Machine::persist_promise` refuses a
+different open epoch. The new activation's carrier resolved to `None`,
+since the hold owner claims nothing while it holds. Nodes 2 and 3 were
+now members of an epoch carrying no lease, so they closed on S3's return
+and treated the expired lease as anyone's. In seed 200, node 3 took it
+over through f3052f4's dead-root lease check (an op waiting more than
+3 s). That is why the seed starts failing at that commit. In seed 8398,
+node 2 took it over through a lock acquisition. Node 1 still held its
+epoch hold both times.
+
+None of f3052f4's candidates is at fault. The dead-root check, the
+delegate lapse at `until + 2m`, `Core::start` re-adopting delegations
+and the backup silence watch behave correctly. The check only exposed a
+state the daemon can't reach. With the old coordinator, both seeds still
+fail on HEAD's core and pass once it continues the open epoch.
+
+### Root cause: a release overtaken by the node's next request (exposed by the above)
+
+With the faithful coordinator, `locks-blips-tight-in-doubt` seed 1383
+broke mutual exclusion on HEAD's core: at t=10204, node 1 (t17,
+Exclusive) and node 3 (t49, Exclusive) were both in I/O on the same
+inode. Sequence:
+- Node 3 held grant 789. Node 1 had re-claimed the lease as a takeover,
+  because its re-claim CAS was in doubt, and 789 was reclaimed in the
+  grace period unrecalled.
+- Node 3 released 789 at t=10189 and asked again at t=10198 for another
+  thread.
+- The request reached node 1 first (t=10202). Node 1 re-affirmed node
+  3's grant as 791, and node 3 installed 791 and took the lock.
+- The release of 789 arrived at t=10204. `on_lock_released` read "a
+  release naming an id this owner has since replaced" as "the node holds
+  nothing there", ended 791, and served node 1's own waiter.
+
+The owner can't tell this case from the one that rule was written for (a
+re-sent request crossing the old id's push; EC2 campaign 8).
+
+### Fix
+
+Fix: the sim's coordinator no longer forms an epoch over a member's open
+one: it continues that epoch, and its liveness watch follows it. On the
+lock side, the owner recalls the newer grant instead of ending it, and a
+node answers a recall with an immediate release only for an id it
+provably never had.
+
+- `tests/sim/epochs.rs`: `try_form` returns `Formation::Continues` when
+  a member's epoch is still open (`Report::epochs_continued`), and
+  `drive_epoch` follows that member's epoch for freezes and thaws.
+- `locks::on_lock_released`: a release naming an id this owner has since
+  replaced recalls the newer grant (`lock_recall`) instead of ending it.
+  The owner's own release still ends it at once, since an in-process
+  release can't be overtaken.
+- `locks::on_lock_recall`: a node releases a recalled grant at once
+  (`stats.lock_recalls_unheld_released`) when all three hold:
+  - it holds nothing on the inode;
+  - the id is newer, from the same owner, than the grant it released
+    last there (new `LockTables::released_last`, set by a clean
+    `end_release` and cleared by any install);
+  - no op of its own waits on the inode.
+
+  Nothing ran under such an id, so the waiter
+  is served one round trip after the old id's release, not outwaited. A
+  grant the node held and lapsed doesn't qualify, because what ran under
+  it may still be in flight. A first version without the `released_last`
+  condition broke exclusion in `locks-blips` seed 434 and
+  `locks-released-delegated` seed 1863 (a pushed grant that lapsed 1 ms
+  after its install, with I/O under it).
+- In the reclaim window, the grants an epoch's close kept are renewed
+  under the closed lease, capped at its expiry
+  (`Core::epoch_reclaim_expires`, `lock_route_for` for renewals). The
+  lease object in S3 is still this node's. Answered `NotOwner { 0 }`,
+  those grants lapsed under their holders' I/O whenever no next epoch
+  could form (`locks-blips-tight` seed 99102).
+
+### Consequences for existing tests (no check weakened; the fault model changed)
+
+- `locks_survive_s3_blips`:
+  - The three-node `locks-blips-tight` run required
+    `epoch_closed_leases_reheld > 0`. That came only from epochs formed
+    over open ones: with three nodes, the other members are still in the
+    last epoch, waiting for the owner's re-claim, so no new epoch can
+    begin inside the re-claim window. The requirement moved to the new
+    `locks-blips-tight-single` config (one node, 14 re-held over
+    99100..99160).
+  - The no-fenced-I/O requirement moved to the new
+    `locks-blips-tight-long-lease` config (10 s lease, 0 fenced). With
+    the 6 s lease, a closed lease last renewed before a pair of cuts that
+    no re-claim reached can expire inside the pair, and nobody can renew
+    it (3-node runs: 4 fenced I/Os in 60 seeds).
+  - The three-node run now asserts `epochs_continued > 0`, no lost
+    grant, and no refusal.
+- `locks_blips_tight_seed_2723_release_keeps_exclusion` keeps its
+  6 s-lease run (exclusion checks plus `lost == 0`) and adds a 10 s-lease
+  run that requires `fenced_ios == 0`. With 6 s there is one fenced I/O:
+  node 1 closed at t=8701 on a probe that landed as S3 was cut again at
+  t=8500, and its lease expired at about t=9.8 s, inside the cut. It
+  passed with 0 only while the sim formed a second epoch over the open
+  one.
+- `a_release_naming_a_superseded_id_ends_the_grant` became
+  `a_release_naming_a_superseded_id_recalls_the_grant`: the waiter is
+  served on the node's release of the newer id. It is no longer served
+  on the old id's release, which is the unsafe behavior.
+
+### Tests
+
+- core:
+  - `a_release_overtaken_by_the_nodes_next_request_keeps_the_new_grant`
+    (seed 1383; fails with the old rule, checked);
+  - `a_recall_of_a_newer_id_than_the_grant_released_is_released`;
+  - `kept_grants_are_renewed_in_the_reclaim_window_up_to_the_closed_leases_expiry`
+    (seed 99102).
+- sim:
+  - `locks_blips_tight_an_open_epoch_is_not_formed_over` (seeds 200 and
+    8398, each must continue an epoch);
+  - `locks_blips_tight_in_doubt_seed_1383_an_overtaken_release_keeps_exclusion`.
+- Seeds 200 and 8398 are not pinned as core tests. The defect was the
+  sim's coordinator, and the core behaves correctly given the epoch state
+  it was handed.
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority -p constellation-meta` | 240 + 4 + 120 + 227 + … passed, 0 failed |
+| every lock config (`locks`, `-partition`, `-skew`, `-failover`, `-failover-backup`, `-faults`, `-blips`, `-blips-tight`, `-blips-tight-single`, `-blips-tight-long-lease`, `-blips-tight-in-doubt`, `-pause`, `-delegated`, `-released-delegated`, `-writes`, `-delegated-writes`, `-released-writes`, `-failover-backup-writes`), `flex`, `flex-crash`: 0..3000 | 0 failing |
+| `delegated-holder-cut`, `long-delegated`, `delegated-backup`, `delegated-two-gens-root-crash`, `delegated-root-gone`, `delegated-delegate-restart`, `long-delegated-backup`, `long-backup`, `long-acks3`: 0..1000 | 0 failing |
+| `harness run delegate-root-blackhole delegate-root-loss-ttl delegate-backup-handoff-failover epoch-member-lost epoch-peer-reaching-s3-declines epoch-missing-node epoch-member-dies-with-chunk epoch-holder-retired epoch-slack-zero-unchanged` | ALL SCENARIOS PASSED |
+
+### Open
+
+- When an epoch's other members are still open, waiting for the hold
+  owner's re-claim, and S3 is cut again before it lands, no epoch can
+  form, and the closed lease and its grants lapse at expiry. This is a
+  liveness gap in the daemon (members could accept a fresh epoch from a
+  closed hold owner), not a safety one. Out of scope here.
+- (Corrected in the review round below.) `try_form`'s `Continues`
+  matches the daemon for f > 0 too: the daemon does not let the closed
+  members form among themselves while another reachable member's epoch
+  is open.
+
+### Review round
+
+Fix: the node-side fast path of `on_lock_recall` tombstones the id it
+releases (`LockTables::tombstone_unheld`), so a push of it still in flight
+is refused by `install_held` and the op that took it asks again.
+
+- Must fix 1 (exclusion): `locks-failover` seed 5297 broke mutual
+  exclusion with the round above and passed on base. Node 2 released 557;
+  the owner served a stale waiter of node 2's (left by a re-sent request
+  the push of 557 had answered) with push 558 and recalled 558 at once for
+  node 3. The recall reached node 2 first (t=8212): nothing held, 557 <
+  558, no op waiting, so node 2 released 558 and the owner granted 559 to
+  node 3. Node 2's next op on the inode (t=8221) took the late push of 558
+  (t=8223): a push installs for any later op on the inode, which the
+  round's comment ("installs only for a waiting op") got wrong. Node 3
+  entered I/O under 559 at t=8235. Pinned by
+  `a_push_behind_its_released_recall_is_refused` (core) and
+  `locks_failover_seed_5297_a_push_behind_its_released_recall_is_refused`
+  (sim); both fail without the tombstone (checked).
+- Should fix 1: the 6 s-lease run of
+  `locks_blips_tight_seed_2723_release_keeps_exclusion` now asserts
+  `fenced_ios <= 1`.
+- Should fix 2: the f > 0 "Open" bullet above was wrong. With f > 0,
+  `component_quorum` (`crates/net/src/epoch.rs`) puts every reachable
+  roster node in the proposal and the open member refuses the promise
+  (`persist_promise`), so the proposal fails: `Continues` matches the
+  daemon, it is not a conservative approximation.
+- `Core::epoch_reclaim_expires`: a comment on taking the minimum over all
+  closed-tenure entries while the pending check needs any unexpired one
+  (a negative cap is refused by `lock_renew_one`).
+
+Open (tracked follow-up, queued by the coordinator as its own chunk):
+when S3 is cut again before a closed hold owner's re-claim lands, the
+epoch's other members stay in the last epoch waiting for it, no epoch can
+form, and the closed lease and the grants it kept lapse at its expiry:
+fenced I/O and `EIO` with a 6 s lease (3-node `locks-blips-tight`: 4
+fenced I/Os in 60 seeds). The daemon fix is for members to accept a fresh
+epoch from a closed hold owner whose re-claim is pending. Liveness only,
+not safety.
+
+Gates (this round, `AUTHORITY_SIM_THREADS=8`):
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority -p constellation-meta` | 241 + 4 + 121 + 230 + … passed, 0 failed |
+| every lock config (the 20 of `sweep_config`, `locks` … `locks-failover-backup-writes`): 0..6000 | 0 failing |
+| `locks-failover` 6000..12000; `flex`, `flex-crash` 0..3000; `locks-blips-tight-in-doubt` 400000..403000 | 0 failing |
+| `harness run lock-grant-dead-generation lock-holder-partitioned lock-failover lock-holder-killed-contention lock-fence-at-close lock-latency` | ALL SCENARIOS PASSED |

@@ -223,8 +223,14 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    a request a push already answered installs the id the owner
    re-affirmed the grant under; a recall naming a newer id of the same
    owner than the one held applies to the held grant (which adopts the
-   id); and a release naming an id the owner has since replaced ends
-   the grant there too (`released_superseded`). Each of these gaps
+   id); and a release naming an id the owner has since replaced
+   recalls the newer one (`released_superseded`) — the node may hold it,
+   if its next request overtook its release — which a node that never
+   installed it (it released the older id and has nothing on the inode
+   since, nor an op waiting there) answers with its release at once,
+   refusing that id from then on (a push of it may still be in flight,
+   and would install for the node's next op on the inode).
+   Each of these gaps
    otherwise cost every waiter a `ttl + margin` outwait, and let the
    released node re-lock under its cached grant ahead of them (EC2
    campaign 8: one committer waiting 16–28 s while the other took turn
