@@ -803,8 +803,7 @@ fn fuse_mount(c: &Client) -> Result<serde_json::Value> {
 /// harness's daemons run with) takes the ladder like any plain mount, on
 /// the deeper queue (`CLUSTER_LOCKS_URING_QUEUE_DEPTH`, 32), and no rung
 /// named `cluster_locks` exists any more; an explicit depth wins; the same
-/// daemon with `--locks local` gets the ordinary depth (8); `uring` is the
-/// same ladder as `auto`. A `daemon --upgrade` of the `auto` cluster-lock
+/// daemon with `--locks local` gets the ordinary depth (8). A `daemon --upgrade` of the `auto` cluster-lock
 /// mount is refused where it got the ring (a ring session cannot be
 /// detached; the mount keeps serving) and served where it fell back, the
 /// resumed session keeping its first rung. On a host that cannot grant the
@@ -878,15 +877,7 @@ pub fn transport_cluster_locks_auto(seed: u64) -> Result<()> {
         serve_check(&c.mnt, seed + 2, "local-auto")?;
         c.unmount()?;
 
-        // 4. `uring`, cluster locks: the same ladder as `auto`.
-        c.set_env("CONSTELLATION_FUSE_TRANSPORT", "uring");
-        c.mount()?;
-        expect(&c, 32, "uring, cluster locks")?;
-        serve_check(&c.mnt, seed + 3, "cluster-uring")?;
-        no_alarms(&c)?;
-        c.unmount()?;
-
-        // 5. `daemon --upgrade` of the `auto` cluster-lock mount: refused
+        // 4. `daemon --upgrade` of the `auto` cluster-lock mount: refused
         // on the ring, at no cost to the mount; served on a fallback, the
         // resumed session (pinned now, in a new process) still naming its
         // first rung, not the pin (the Z2b review's finding).

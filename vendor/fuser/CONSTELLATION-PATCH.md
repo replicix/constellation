@@ -794,7 +794,7 @@ size (the kernel never sends more than `max_pages` pages). Neither
 
 Re-measured for the fix round (2026-10-02, kernel 7.3.0-rc4): 32 possible
 CPUs, the daemon's 12 FUSE workers (12 rings), `--locks local`,
-`CONSTELLATION_FUSE_TRANSPORT=uring`, depth 8 unless noted, one view
+`CONSTELLATION_FUSE_TRANSPORT=auto`, depth 8 unless noted, one view
 (`constellation mount --foreground` on a local backend). Columns: `VmSize`
 and `VmRSS` of the daemon idle (2 s after the mount); `VmRSS` after **one
 256 MiB workload** (256 MiB written, `drop_caches`, read back with `dd

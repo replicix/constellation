@@ -43033,3 +43033,34 @@ Exit criteria:
 - [x] Lock scenarios measured per scenario: transport, `lock_wait_downgrades`, workload `ENOLCK`
 - [x] Daemon CPU, `dev_fuse` vs ring, median of 3
 - [ ] `git-under-flock-causal` 5/5 on the ring: 4/5, one lock-recall livelock (above), not reproduced in 4 reruns
+
+## `--fuse-transport uring` removed (2026-10-05)
+
+Since 06d635b (cluster-lock mounts take the ring under `auto`) `uring` was
+only an alias of `auto`. Verified in code before removing it: `plan()` and
+`asks_for_ring()` treated `Auto` and `Uring` identically (ring unless
+`DevFuse`, depth `--fuse-uring-queue-depth` else 32 for cluster locks / 8);
+handover-capable and `PreopenedFd` mounts are pinned to `DevFuse` by
+`MountOptions::handover_capable` regardless of the policy; the mobile
+profile only changes the default (`dev-fuse`). The one difference was the
+name echoed as "asked for".
+
+| Change | Where |
+|---|---|
+| `TransportPolicy::Uring` and the `"uring"` spelling gone; `--fuse-transport uring` / `CONSTELLATION_FUSE_TRANSPORT=uring` now fail the mount like any unknown value (test added); error text `expected auto or dev-fuse` | `crates/frontend-fuse/src/session.rs`, `crates/cli/src/main.rs` |
+| Tests that looped over `[Auto, Uring]` now use `Auto` | session, stats, handover, node_runtime |
+| Harness: `transport-cluster-locks-auto` loses its `uring` leg, `passthrough-on-every-transport` runs `dev-fuse`/`auto`, zero-copy scenarios ask for `auto` | `crates/harness/src/scenarios/` |
+| `compliance-uring` (service, profile `test-uring`, Make target) renamed `compliance-ring`: it keeps what it tests (the ladder under `seccomp:unconfined`, optional zero-copy) but no longer sets the transport | `docker-compose.yml`, `Makefile`, `tests/compliance.sh`, `tests/docker/Dockerfile` |
+| `TRANSPORTS` default `dev-fuse auto`; the transport-matrix `uring` leg dropped; the 7.3 lane's cost-gate legs `auto:off`/`auto:auto` | `Makefile`, `tests/transport-matrix.sh`, `.github/workflows/nightly.yml` |
+| Docs | `docs/reference/configuration.md`, `TESTING.md`, `tests/read-cpu-gate.sh` |
+
+Left as is: the transport *name* `uring`/`uring_zc` in `node.status`, metrics
+and logs; `bench/fuse-read-path` (its own C-benchmark modes); earlier
+PROGRESS entries and plan records (history).
+
+Gates: `cargo fmt --check`, `cargo clippy --workspace --all-targets
+--features constellation-frontend-fuse/io-uring -D warnings` clean;
+`cargo test -p constellation-frontend-fuse --features io-uring` 61 + 29 + 7
+passed; `cargo test -p constellation -p constellation-harness` 0 failed;
+`tests/smoke.sh` PASSED; both YAML files parse. The Docker compliance and the
+ring harness legs were not run here.

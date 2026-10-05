@@ -123,9 +123,8 @@ use std::time::{Duration, Instant};
 /// probe refuses the mix up front. 4 — plan 37 K3a, a mount carries
 /// `foreign` (made by someone else, `view.mount{PreopenedFd}`).
 /// 5 — plan 38 Z3b, passthrough table + write-intent counts + passthrough
-/// chunk hashes. 6 — plan 38 Z2c, `fuse_transport` may be `uring`, and an
-/// absent `fuse_uring_queue_depth` means "chosen per mount" (8, or 32 for
-/// a cluster-lock mount on `uring`) where a version-5 image always sent
+/// chunk hashes. 6 — plan 38 Z2c, an absent `fuse_uring_queue_depth` means
+/// "chosen per mount" (8, or 32 for a cluster-lock mount) where a version-5 image always sent
 /// the depth it used: across the mix a version-5 image would refuse the
 /// policy and a version-6 one would pin every ring mount to 8.
 pub const HANDOVER_VERSION: u32 = 6;
@@ -237,7 +236,7 @@ pub struct NodeHandoff {
     /// resumed node then falls back to `CONSTELLATION_CACHE_VERIFY` and
     /// the default, as a fresh mount would).
     cache_verify: Option<String>,
-    /// Plan 38 Z1b: `--fuse-transport` (`auto`/`uring`/`dev-fuse`). The
+    /// Plan 38 Z1b: `--fuse-transport` (`auto`/`dev-fuse`). The
     /// *resumed* mounts are `/dev/fuse` by construction (a ring session
     /// cannot be handed over at all, §3(e)); this is for the views added
     /// to the new image afterwards, which would otherwise lose a flag the
@@ -1223,16 +1222,12 @@ mod tests {
 
     /// Plan 38 Z2c: the sessions `daemon --upgrade` resumes are
     /// `/dev/fuse` whatever the node's knob says — the shipped `auto`,
-    /// `uring`, any depth — while the views the new image mounts
+    /// any depth — while the views the new image mounts
     /// afterwards (plain ones) take the knob.
     #[test]
     fn an_upgrade_target_session_is_pinned_to_dev_fuse() {
         use constellation_frontend_fuse::{TransportConfig, TransportPolicy};
-        for policy in [
-            TransportPolicy::Auto,
-            TransportPolicy::Uring,
-            TransportPolicy::DevFuse,
-        ] {
+        for policy in [TransportPolicy::Auto, TransportPolicy::DevFuse] {
             let cfg = TransportConfig {
                 policy,
                 uring_queue_depth: Some(16),

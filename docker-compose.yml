@@ -69,10 +69,9 @@ services:
     <<: *suite
     command: ["compliance"]
 
-  # The same pjdfstest run on plan 38's ring transport
-  # (`CONSTELLATION_FUSE_TRANSPORT=uring`: the ladder for every plain mount,
-  # including this one, which has cluster locks; the same ladder as `auto`
-  # since the 2026-10-05 decision), so POSIX compliance is gated on
+  # The same pjdfstest run on plan 38's ring transport (the default
+  # `auto` ladder, which takes every plain mount, including this one with
+  # cluster locks, since the 2026-10-05 decision), so POSIX compliance is gated on
   # every transport and not only on `/dev/fuse` (plan 38 §6: "pjdfstest
   # 8798/8798 on every transport"). The image is the suite's own: Linux
   # builds of `constellation` carry the `io-uring` feature since Z2c. What
@@ -89,18 +88,17 @@ services:
   # On a host without it the leg still runs and still has to pass, on the
   # `/dev/fuse` fallback — which is the ladder's own promise.
   #
-  #   docker compose --profile test-uring run --rm compliance-uring
-  #   make compliance-uring
-  compliance-uring:
+  #   docker compose --profile test-ring run --rm compliance-ring
+  #   make compliance-ring
+  compliance-ring:
     <<: *suite
-    profiles: ["test-uring"]
+    profiles: ["test-ring"]
     security_opt:
       - apparmor:unconfined
       - label:disable
       - seccomp:unconfined
     environment:
       <<: *suite-env
-      CONSTELLATION_FUSE_TRANSPORT: uring
       # Zero-copy queues are opt-in (plan 38 Z4b); this lane asks for them,
       # so a privileged run on a 7.3 kernel negotiates `uring_zc`. The
       # threshold passes through (empty: the daemon's default).

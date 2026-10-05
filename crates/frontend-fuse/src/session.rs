@@ -106,11 +106,6 @@ pub enum TransportPolicy {
     /// a plain mount since plan 38 Z2c.
     #[default]
     Auto,
-    /// The same ladder as [`Self::Auto`]. Until the 2026-10-05 decision
-    /// it was the opt-in that put a mount with cluster locks on the ring;
-    /// it now differs from `auto` only in the name the session reports as
-    /// asked for.
-    Uring,
     /// `/dev/fuse` `read`/`writev`, on every kernel and every platform:
     /// the only policy a handover-capable session may have
     /// ([`MountOptions::handover_capable`]), and the mobile profile's
@@ -119,12 +114,11 @@ pub enum TransportPolicy {
 }
 
 impl TransportPolicy {
-    /// `auto` / `uring` / `dev-fuse`, as the knob and the CLI flag spell
+    /// `auto` / `dev-fuse`, as the knob and the CLI flag spell
     /// them.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
-            "uring" => Some(Self::Uring),
             "dev-fuse" | "dev_fuse" => Some(Self::DevFuse),
             _ => None,
         }
@@ -133,7 +127,6 @@ impl TransportPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Uring => "uring",
             Self::DevFuse => "dev-fuse",
         }
     }
@@ -356,9 +349,8 @@ impl TransportConfig {
                 .filter(|v| !v.is_empty())
         };
         let policy = match get(TRANSPORT_ENV) {
-            Some(raw) => TransportPolicy::parse(&raw).ok_or_else(|| {
-                format!("{TRANSPORT_ENV}={raw}: expected auto, uring or dev-fuse")
-            })?,
+            Some(raw) => TransportPolicy::parse(&raw)
+                .ok_or_else(|| format!("{TRANSPORT_ENV}={raw}: expected auto or dev-fuse"))?,
             None => policy.unwrap_or(default),
         };
         let depth =
@@ -1849,12 +1841,12 @@ mod tests {
         // The flag alone, over the profile's default.
         let cfg = TransportConfig::resolve_from(
             none,
-            Some(TransportPolicy::Uring),
+            Some(TransportPolicy::Auto),
             Some(4),
             TransportPolicy::DevFuse,
         )
         .unwrap();
-        assert_eq!(cfg.policy, TransportPolicy::Uring);
+        assert_eq!(cfg.policy, TransportPolicy::Auto);
         assert_eq!(cfg.uring_queue_depth, Some(4));
         // The env over the flag, either way round, and tolerant of
         // whitespace and case as the other knobs' parsers are.
@@ -1875,14 +1867,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.policy, TransportPolicy::DevFuse);
-        let cfg = TransportConfig::resolve_from(
-            var(&[(TRANSPORT_ENV, "Uring")]),
-            None,
-            None,
-            TransportPolicy::DevFuse,
-        )
-        .unwrap();
-        assert_eq!(cfg.policy, TransportPolicy::Uring);
+        let cfg =
+            TransportConfig::resolve_from(var(&[(TRANSPORT_ENV, "Dev-Fuse")]), None, None, auto)
+                .unwrap();
+        assert_eq!(cfg.policy, TransportPolicy::DevFuse);
         // An empty value is "unset", not a parse error: an exported but
         // empty variable is what a shell leaves behind.
         let cfg = TransportConfig::resolve_from(
@@ -1899,6 +1887,14 @@ mod tests {
         let err = TransportConfig::resolve_from(var(&[(TRANSPORT_ENV, "ring")]), None, None, auto)
             .expect_err("an unknown transport must be refused");
         assert!(err.contains(TRANSPORT_ENV) && err.contains("ring"), "{err}");
+        // `uring` was an alias of `auto` once; it is an unknown value now.
+        let err = TransportConfig::resolve_from(var(&[(TRANSPORT_ENV, "uring")]), None, None, auto)
+            .expect_err("the removed alias must be refused");
+        assert!(
+            err.contains(TRANSPORT_ENV) && err.contains("uring"),
+            "{err}"
+        );
+        assert_eq!(TransportPolicy::parse("uring"), None);
         for bad in [
             &[(URING_QUEUE_DEPTH_ENV, "0")],
             &[(URING_QUEUE_DEPTH_ENV, "-1")],
@@ -2040,23 +2036,22 @@ mod tests {
     /// the constructor that takes the marker, and it pins `dev-fuse`.
     #[test]
     fn a_handover_capable_session_ignores_the_knob() {
-        for policy in [TransportPolicy::Auto, TransportPolicy::Uring] {
-            let asked = TransportConfig {
-                policy,
-                uring_queue_depth: Some(4),
-                ..TransportConfig::default()
-            };
-            let pinned = MountOptions::handover_capable(
-                "pinned",
-                2,
-                KernelTuning::for_workers(2),
-                asked,
-                HandoverCapable,
-            );
-            assert_eq!(pinned.transport(), TransportPolicy::DevFuse);
-            for caps in [crate::caps(false), crate::caps(true)] {
-                assert!(!pinned.plan(&caps, true).ring, "{policy} {caps:?}");
-            }
+        let policy = TransportPolicy::Auto;
+        let asked = TransportConfig {
+            policy,
+            uring_queue_depth: Some(4),
+            ..TransportConfig::default()
+        };
+        let pinned = MountOptions::handover_capable(
+            "pinned",
+            2,
+            KernelTuning::for_workers(2),
+            asked,
+            HandoverCapable,
+        );
+        assert_eq!(pinned.transport(), TransportPolicy::DevFuse);
+        for caps in [crate::caps(false), crate::caps(true)] {
+            assert!(!pinned.plan(&caps, true).ring, "{policy} {caps:?}");
         }
         let asked = TransportConfig {
             policy: TransportPolicy::Auto,
@@ -2123,7 +2118,7 @@ mod tests {
                     .find(|(k, _)| *k == key)
                     .map(|(_, v)| v.clone())
             };
-            TransportConfig::resolve_from(get, None, None, TransportPolicy::Uring)
+            TransportConfig::resolve_from(get, None, None, TransportPolicy::Auto)
         };
         // Opt-in (plan 38 Z4b's measurements, the knob's doc).
         assert_eq!(resolve(vec![]).unwrap().uring_zero_copy, UringZeroCopy::Off);
@@ -2172,7 +2167,7 @@ mod tests {
                 },
                 None,
                 None,
-                TransportPolicy::Uring,
+                TransportPolicy::Auto,
             )
         };
         assert_eq!(
@@ -2201,8 +2196,7 @@ mod tests {
         }
     }
 
-    /// Plan 38 Z2c as decided on 2026-10-05: under `auto` (and `uring`,
-    /// the same ladder) a mount with cluster locks takes the ring with the
+    /// Plan 38 Z2c as decided on 2026-10-05: under `auto` a mount with cluster locks takes the ring with the
     /// deeper queue; an explicit depth wins over both defaults; a mount
     /// with local locks gets the ring at the ordinary depth; `dev-fuse`
     /// asks for no ring.
@@ -2225,17 +2219,16 @@ mod tests {
         let p = |ring, depth| TransportPlan { ring, depth };
         let d = DEFAULT_URING_QUEUE_DEPTH;
         let deep = CLUSTER_LOCKS_URING_QUEUE_DEPTH;
-        for policy in [TransportPolicy::Auto, TransportPolicy::Uring] {
-            let o = opts(policy, None);
-            assert_eq!(plan(&o, &local), p(true, d), "{policy}");
-            assert_eq!(plan(&o, &cluster), p(true, deep), "{policy}");
-            let explicit = opts(policy, Some(4));
-            assert_eq!(plan(&explicit, &cluster), p(true, 4), "{policy}");
-            assert_eq!(plan(&explicit, &local), p(true, 4), "{policy}");
-            // The build rung comes after the policy: no ring without the
-            // feature.
-            assert_eq!(o.plan(&cluster, false), p(false, deep), "{policy}");
-        }
+        let policy = TransportPolicy::Auto;
+        let o = opts(policy, None);
+        assert_eq!(plan(&o, &local), p(true, d), "{policy}");
+        assert_eq!(plan(&o, &cluster), p(true, deep), "{policy}");
+        let explicit = opts(policy, Some(4));
+        assert_eq!(plan(&explicit, &cluster), p(true, 4), "{policy}");
+        assert_eq!(plan(&explicit, &local), p(true, 4), "{policy}");
+        // The build rung comes after the policy: no ring without the
+        // feature.
+        assert_eq!(o.plan(&cluster, false), p(false, deep), "{policy}");
         let dev = opts(TransportPolicy::DevFuse, None);
         assert_eq!(plan(&dev, &cluster), p(false, deep));
         assert!(deep > d, "the deeper queue is deeper");

@@ -1130,20 +1130,18 @@ mod tests {
     #[test]
     fn a_preopened_view_mount_is_pinned_and_a_plain_one_takes_the_knob() {
         use constellation_frontend_fuse::{KernelTuning, TransportConfig, TransportPolicy};
-        for policy in [TransportPolicy::Auto, TransportPolicy::Uring] {
-            let cfg = TransportConfig {
-                policy,
-                uring_queue_depth: None,
-                ..Default::default()
-            };
-            let csi = mount_options_for("csi".into(), 2, KernelTuning::for_workers(2), cfg, true);
-            assert_eq!(csi.transport(), TransportPolicy::DevFuse, "{policy}");
-            assert!(csi.is_handover_capable());
-            let plain =
-                mount_options_for("plain".into(), 2, KernelTuning::for_workers(2), cfg, false);
-            assert_eq!(plain.transport(), policy);
-            assert!(!plain.is_handover_capable());
-        }
+        let policy = TransportPolicy::Auto;
+        let cfg = TransportConfig {
+            policy,
+            uring_queue_depth: None,
+            ..Default::default()
+        };
+        let csi = mount_options_for("csi".into(), 2, KernelTuning::for_workers(2), cfg, true);
+        assert_eq!(csi.transport(), TransportPolicy::DevFuse, "{policy}");
+        assert!(csi.is_handover_capable());
+        let plain = mount_options_for("plain".into(), 2, KernelTuning::for_workers(2), cfg, false);
+        assert_eq!(plain.transport(), policy);
+        assert!(!plain.is_handover_capable());
         let shipped = mount_options_for(
             "default".into(),
             2,

@@ -30,11 +30,11 @@ export CARGO_TERM_COLOR ?= always
 COMPOSE_SUITES ?=
 HARNESS_SCENARIOS ?=
 HARNESS_SEED ?= 42
-# FUSE transports the matrix lane runs (plan 38 §6): `dev-fuse`, the
-# shipped ladder (`auto`, cluster-lock mounts included since 2026-10-05)
-# and `uring` (the same ladder); the last two fall back to
-# `/dev/fuse` where the kernel cannot grant the ring and must pass either way.
-TRANSPORTS ?= dev-fuse auto uring
+# FUSE transports the matrix lane runs (plan 38 §6): `dev-fuse` and the
+# shipped ladder (`auto`, cluster-lock mounts included since 2026-10-05),
+# which falls back to `/dev/fuse` where the kernel cannot grant the ring
+# and must pass either way.
+TRANSPORTS ?= dev-fuse auto
 # Extra cargo features for the binaries the lanes build. Linux builds carry
 # the FUSE-over-io_uring transport without one (plan 38 Z2c).
 CARGO_FEATURES ?=
@@ -52,7 +52,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
 	check ci clean smoke integration webui-check csi-sanity csi-image compose compose-down harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
-	harness-transport-matrix compliance-uring \
+	harness-transport-matrix compliance-ring \
 	dist-linux dist-macos deps FORCE \
 	uploadbench-build uploadbench-sim uploadbench-live check-cross vfs-bench
 
@@ -205,9 +205,9 @@ transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## Read-path scenarios once 
 harness-transport-matrix: $(RELEASE_BIN) $(RELEASE_HARNESS) ## FULL fault-injection matrix once per FUSE transport (plan 38 §6; slow)
 	TRANSPORTS="$(TRANSPORTS)" SCENARIOS=all tests/transport-matrix.sh
 
-compliance-uring: ## pjdfstest on the ring: a container whose seccomp permits io_uring, CONSTELLATION_FUSE_TRANSPORT=uring (plan 38 §6)
-	docker compose --profile test-uring build compliance-uring
-	docker compose --profile test-uring run --rm compliance-uring
+compliance-ring: ## pjdfstest on the ring: a container whose seccomp permits io_uring, so the ladder reaches it (plan 38 §6)
+	docker compose --profile test-ring build compliance-ring
+	docker compose --profile test-ring run --rm compliance-ring
 
 uploadbench-build: ## Build the adaptive-upload-concurrency benchmark
 	$(CARGO) build -p uploadbench --release

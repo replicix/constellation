@@ -148,7 +148,7 @@ enum Command {
         /// of them does not. A mount with cluster locks (`--locks cluster`,
         /// the default with P2P) takes the ring too, where a burst of
         /// contended blocking lock waits past the queue's budget is
-        /// answered ENOLCK. "uring" is the same ladder as "auto".
+        /// answered ENOLCK.
         /// "dev-fuse" is the `/dev/fuse` `writev` path
         /// every kernel and platform has. A mount that ends up on a ring
         /// **cannot be handed over**, so `daemon --upgrade`/`node.handoff`
@@ -2371,9 +2371,7 @@ fn cmd_mount(
         None => None,
         Some(raw) => Some(
             constellation_frontend_fuse::TransportPolicy::parse(raw).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "invalid --fuse-transport {raw:?} (expected auto, uring or dev-fuse)"
-                )
+                anyhow::anyhow!("invalid --fuse-transport {raw:?} (expected auto or dev-fuse)")
             })?,
         ),
     };

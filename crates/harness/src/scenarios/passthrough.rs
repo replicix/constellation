@@ -579,7 +579,7 @@ pub fn handover(seed: u64) -> Result<()> {
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/pt-handover-{}", ts());
     // Handover-capable means `/dev/fuse` (plan 38 §3(e)), pinned as
-    // `handover`'s own scenarios pin it: on the transport matrix's `uring`
+    // `handover`'s own scenarios pin it: on the transport matrix's `auto`
     // leg this writable mount would otherwise be on the ring, which
     // `daemon --upgrade` refuses by design (`transport-detach-refused`).
     let mut c = client(&env, root.path(), "c0", &backend)?
@@ -828,7 +828,7 @@ pub fn default_by_mount_mode(seed: u64) -> Result<()> {
 /// read-only snapshot mount gets passthrough on `/dev/fuse` and on the ring
 /// alike. A frozen view takes no cluster locks (`node_runtime`'s
 /// `!frozen_view`), so under `auto` it is not held back for them: per
-/// policy — `dev-fuse` (no ring asked, no fallback); `auto` and `uring`
+/// policy — `dev-fuse` (no ring asked, no fallback); `auto`
 /// (the ring on a ring host; elsewhere `/dev/fuse` naming an earlier rung,
 /// never `cluster_locks`) — the mount reports the transport and fallback
 /// the ladder gives it (checked before any open, so the counters hold the
@@ -853,7 +853,7 @@ pub fn on_every_transport(seed: u64) -> Result<()> {
         Ok(())
     })?;
     let ring_host = crate::suites::unavailable(crate::suites::FUSE_URING).is_none();
-    for policy in ["dev-fuse", "auto", "uring"] {
+    for policy in ["dev-fuse", "auto"] {
         c.set_env("CONSTELLATION_FUSE_TRANSPORT", policy);
         c.mount_view(Some("/@pt-transport"), &[])?;
         let leg = policy;

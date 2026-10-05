@@ -30,7 +30,7 @@ fs_mount --allow-other
 
 # Which transport this run is actually gating (plan 38 §6: "pjdfstest
 # 8798/8798 on every transport"). `CONSTELLATION_FUSE_TRANSPORT` (default
-# `auto`; `uring`, the same ladder, in `compliance-uring`) is a *request*: the ladder falls back to `/dev/fuse`
+# `auto`, also in `compliance-ring`) is a *request*: the ladder falls back to `/dev/fuse`
 # whenever the kernel is too old, `fuse.enable_uring` is off, or the
 # sandbox denies `io_uring_setup(2)` — and a container's default seccomp
 # profile denies it silently. Printing what was negotiated is what keeps the ring leg

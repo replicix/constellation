@@ -177,7 +177,7 @@ jobs:
             read-cpu.jsonl
             read-cpu-ci-baseline.json
 
-  # Plan 38 §6/Z2: the FUSE transport matrix, both ring legs and the
+  # Plan 38 §6/Z2: the FUSE transport matrix, the ring leg (`auto`) and the
   # `dev-fuse` control, on a runner whose kernel grants FUSE-over-io_uring.
   # Hosted runners cannot (no 6.14+ kernel with `fuse.enable_uring=Y`), so
   # this job runs on a self-managed runner registered with the `fuse-uring`
@@ -205,16 +205,15 @@ jobs:
           test "$(cat /sys/module/fuse/parameters/enable_uring)" = Y
           test "$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)" = 0
       - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
-      # Every scenario once per leg: dev-fuse, the shipped `auto` (every plain
-      # mount on the ring, cluster-lock ones included) and `uring` (the same
-      # ladder). Each leg
+      # Every scenario once per leg: dev-fuse and the shipped `auto` (every
+      # plain mount on the ring, cluster-lock ones included). Each leg
       # prints its census of which mounts got which transport. The cost gate
       # runs per leg against its own baseline,
       # read-cpu-uring-runner-baseline-<leg>.json, which a fresh checkout
       # does not have: each leg blesses (records) its own numbers.
       - run: |
           set -o pipefail
-          TRANSPORTS="dev-fuse auto uring" SCENARIOS=all READ_CPU_GATE=1 \
+          TRANSPORTS="dev-fuse auto" SCENARIOS=all READ_CPU_GATE=1 \
             READ_CPU_BASELINE=read-cpu-uring-runner-baseline.json \
             tests/transport-matrix.sh 2>&1 | tee transport-matrix.log
       # pjdfstest per transport: /dev/fuse and the ring.
@@ -223,7 +222,7 @@ jobs:
           docker compose --profile test build compliance
           docker compose --profile test run --rm -e CONSTELLATION_FUSE_TRANSPORT=dev-fuse \
             compliance 2>&1 | tee compliance-dev-fuse.log
-          CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0 make compliance-uring 2>&1 | tee compliance-uring.log
+          CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0 make compliance-ring 2>&1 | tee compliance-ring.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -276,7 +275,7 @@ jobs:
       # each leg records its own baseline on a fresh checkout.
       - run: |
           set -o pipefail
-          for leg in dev-fuse:auto uring:off uring:auto; do
+          for leg in dev-fuse:auto auto:off auto:auto; do
             sudo env HOME=/root PATH="$PATH" CONSTELLATION_FUSE_TRANSPORT="${leg%%:*}" \
               CONSTELLATION_FUSE_URING_ZERO_COPY="${leg##*:}" \
               READ_CPU_BASELINE="read-cpu-zc-runner-baseline-${leg/:/-}.json" \
@@ -287,7 +286,7 @@ jobs:
           # zero-copy.
           lanes="cold-seq-1m $(tests/read-cpu-gate.sh --size-lanes)"
           for leg in off:512k auto:0; do
-            sudo env HOME=/root PATH="$PATH" CONSTELLATION_FUSE_TRANSPORT=uring \
+            sudo env HOME=/root PATH="$PATH" CONSTELLATION_FUSE_TRANSPORT=auto \
               CONSTELLATION_FUSE_URING_ZERO_COPY="${leg%%:*}" \
               CONSTELLATION_FUSE_ZERO_COPY_MIN_READ="${leg##*:}" \
               READ_CPU_LANES="$lanes" \
@@ -295,12 +294,12 @@ jobs:
               tests/read-cpu-gate.sh 2>&1 | tee -a read-cpu-zc-sizes.log
           done
       # pjdfstest with the daemon as root on the ring: the suite container
-      # has CAP_SYS_ADMIN, so `compliance-uring` negotiates uring_zc here
+      # has CAP_SYS_ADMIN, so `compliance-ring` negotiates uring_zc here
       # (its first line says which transport it got).
       - run: |
           set -o pipefail
-          make compliance-uring 2>&1 | tee compliance-uring-zc.log
-          grep -q "FUSE transport: uring_zc" compliance-uring-zc.log
+          make compliance-ring 2>&1 | tee compliance-ring-zc.log
+          grep -q "FUSE transport: uring_zc" compliance-ring-zc.log
       # The steps above ran as root inside the checkout (the gate writes
       # its per-leg baselines here, the harness its results): hand
       # everything back to the runner user, so a persistent runner's next
@@ -318,7 +317,7 @@ jobs:
             zero-copy-*.log
             read-cpu-zc.log
             read-cpu-zc-sizes.log
-            compliance-uring-zc.log
+            compliance-ring-zc.log
             read-cpu-zc-runner-baseline-*.json
             read-cpu-zc-runner-sizes-*.json
 

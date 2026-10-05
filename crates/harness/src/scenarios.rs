@@ -1663,8 +1663,8 @@ pub const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "passthrough-on-every-transport",
         desc: "plan 38 Z2c with Z3b/Z3c: a read-only snapshot mount (no cluster locks) under \
-               dev-fuse, auto and uring reports the transport and fallback the ladder gives it \
-               (auto and uring: the ring on a ring host, never a cluster_locks fallback) and \
+               dev-fuse and auto reports the transport and fallback the ladder gives it \
+               (auto: the ring on a ring host, never a cluster_locks fallback) and \
                serves a verified chunk's open by passthrough on each: counted, pinned, \
                byte-exact, no daemon read",
         requires: &[suites::CAP_SYS_ADMIN, suites::LINUX_6_9],

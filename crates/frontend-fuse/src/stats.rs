@@ -454,31 +454,30 @@ mod tests {
     #[test]
     fn every_rung_of_the_ladder_names_its_own_reason() {
         use FallbackReason::*;
-        use TransportPolicy::{Auto, DevFuse, Uring};
+        use TransportPolicy::{Auto, DevFuse};
         let dev = Transport::DevFuse;
         let (on, off) = (Some(init(true)), Some(init(false)));
         let c = |h: Handshake<'_>, feature: bool| classify(&h, feature);
         // Never asked, or granted: nothing to record.
         assert_eq!(c(hs(DevFuse, false, off.as_ref(), dev), true), None);
         assert_eq!(c(hs(DevFuse, true, None, dev), false), None);
-        for asked in [Auto, Uring] {
-            assert_eq!(
-                c(hs(asked, false, on.as_ref(), Transport::Uring), true),
-                None
-            );
-            assert_eq!(
-                c(hs(asked, false, on.as_ref(), dev), false),
-                Some(NoIoUringFeature)
-            );
-            assert_eq!(
-                c(hs(asked, false, off.as_ref(), dev), true),
-                Some(KernelNotOffered)
-            );
-            assert_eq!(
-                c(hs(asked, false, on.as_ref(), dev), true),
-                Some(RingSetupFailed)
-            );
-        }
+        let asked = Auto;
+        assert_eq!(
+            c(hs(asked, false, on.as_ref(), Transport::Uring), true),
+            None
+        );
+        assert_eq!(
+            c(hs(asked, false, on.as_ref(), dev), false),
+            Some(NoIoUringFeature)
+        );
+        assert_eq!(
+            c(hs(asked, false, off.as_ref(), dev), true),
+            Some(KernelNotOffered)
+        );
+        assert_eq!(
+            c(hs(asked, false, on.as_ref(), dev), true),
+            Some(RingSetupFailed)
+        );
         // The policy rung, named only where the ring was on offer.
         assert_eq!(
             c(hs(Auto, true, on.as_ref(), dev), true),

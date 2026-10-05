@@ -201,8 +201,8 @@ stressor, verdict, bogo-ops).
 
 ```sh
 target/release/harness run stress-ng-fs
-CONSTELLATION_FUSE_TRANSPORT=uring target/release/harness run stress-ng-fs
-sudo env HOME=/root PATH=$PATH CONSTELLATION_FUSE_TRANSPORT=uring \
+CONSTELLATION_FUSE_TRANSPORT=dev-fuse target/release/harness run stress-ng-fs
+sudo env HOME=/root PATH=$PATH \
     CONSTELLATION_FUSE_URING_ZERO_COPY=auto \
     target/release/harness run stress-ng-fs      # as root: uring_zc, passthrough too
 target/release/harness run stress-ng-fs-nodes stress-ng-fs-faults  # known-bug repros
@@ -2415,8 +2415,8 @@ which of them can say anything there. Each is explained in the section named.
 | Lane | Command | Proves | Needs |
 |---|---|---|---|
 | Cost gate | `make read-cpu-gate` | daemon CPU-s/GiB and peak RSS per lane and transport (a leg is the `CONSTELLATION_FUSE_TRANSPORT` the gate runs under; zero-copy and passthrough through their own variables) | fio, Linux; root for `uring_zc` and passthrough. See "Read-path cost gate" |
-| Transport matrix | `make transport-matrix` (`harness-transport-matrix` for the full matrix) | the read-path scenarios (or all of them) once per leg: `dev-fuse`, `auto`, `uring`, with a census of what each mount negotiated | any host; the ring legs are fallback legs unless the kernel grants the ring. See "FUSE transport matrix" |
-| Ring host or **KVM guest** | the guest procedure in "Running the ring legs" | the ring itself: a 6.14+ kernel booted with `fuse.enable_uring=1`, the matrix over `dev-fuse auto uring`, `make compliance-uring` (pjdfstest on the ring) | a host or guest with that kernel; CI: a self-hosted `fuse-uring` runner |
+| Transport matrix | `make transport-matrix` (`harness-transport-matrix` for the full matrix) | the read-path scenarios (or all of them) once per leg: `dev-fuse`, `auto`, with a census of what each mount negotiated | any host; the ring legs are fallback legs unless the kernel grants the ring. See "FUSE transport matrix" |
+| Ring host or **KVM guest** | the guest procedure in "Running the ring legs" | the ring itself: a 6.14+ kernel booted with `fuse.enable_uring=1`, the matrix over `dev-fuse auto`, `make compliance-ring` (pjdfstest on the ring) | a host or guest with that kernel; CI: a self-hosted `fuse-uring` runner |
 | **7.3 lane** | the four `zero-copy-*` scenarios as root | `uring_zc`: the chunk-spanning fallback, eviction while a read is in flight, `--cache-verify always` turning it off | Linux 7.3+ with buffer pools, root; SKIPs loudly elsewhere. CI: a self-hosted `fuse-uring-zc` runner. See "FUSE zero-copy reads: the 7.3 lane" |
 
 Passthrough has its own scenarios (`passthrough-*`, `CAP_SYS_ADMIN` and Linux
@@ -2503,7 +2503,6 @@ which one a mount gets is decided at runtime by the policy and the host:
 | `CONSTELLATION_FUSE_TRANSPORT` / `--fuse-transport` | what a mount gets |
 |---|---|
 | `auto` (**the default**; `dev-fuse` under `CONSTELLATION_PROFILE=mobile`) | plan 38 §2.4's ladder — FUSE-over-io_uring when the kernel is 6.14+ with `fuse.enable_uring=Y` and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once and reported in `node.status`. **A mount with cluster locks** (`--locks cluster`, the default with P2P — so almost every harness mount) **takes the ladder too** (decided 2026-10-05), on a deeper queue (32): a contended blocking lock wait past a queue's budget (`depth - 1` waiters per CPU) is answered `ENOLCK` and counted in `lock_wait_downgrades` |
-| `uring` | the same ladder as `auto` (until 2026-10-05, the opt-in that put cluster-lock mounts on the ring) |
 | `dev-fuse` | `read(2)`/`writev(2)` on `/dev/fuse`: every kernel, every platform |
 
 What a mount *negotiated* is in `node.status`'s per-mount `transport`
@@ -2523,7 +2522,7 @@ harness scenarios once per policy, so a transport-specific regression
 fails one leg instead of everything:
 
 ```bash
-tests/transport-matrix.sh                              # dev-fuse, auto, uring
+tests/transport-matrix.sh                              # dev-fuse, auto
 TRANSPORTS="dev-fuse" tests/transport-matrix.sh        # one leg
 SCENARIOS="cold-cache readahead" tests/transport-matrix.sh
 SCENARIOS=all tests/transport-matrix.sh                # the full matrix per leg
@@ -2538,9 +2537,9 @@ daemon the harness started records its mounts' `FUSE transport` lines in
 `target/transport-matrix/<leg>.census.tsv` (`scenario client transport
 reason`, via `CONSTELLATION_HARNESS_TRANSPORT_CENSUS`), and the script
 prints how many mounts got each transport and why the rest fell back. That
-is how a leg says what it actually covered: on a ring host the `auto` and
-`uring` legs put the matrix on the ring (handover-capable mounts excepted),
-on any other host they are fallback legs. **No leg ever skips.**
+is how a leg says what it actually covered: on a ring host the `auto`
+leg puts the matrix on the ring (handover-capable mounts excepted),
+on any other host it is a fallback leg. **No leg ever skips.**
 
 `CONSTELLATION_HARNESS_DAEMON_CENSUS=<file>` (any `harness run`, off by
 default) is the census's counterpart for what the census cannot see from a
@@ -2554,8 +2553,8 @@ PROGRESS "cluster-lock-ring-auto"). A frozen daemon (`SIGSTOP`) records
 nothing; the status call costs up to 2 s before such a kill.
 
 On a kernel below 6.14, with `fuse.enable_uring=N`, or under a seccomp
-profile that denies `io_uring_setup`, the `auto` and `uring` legs run as
-*fallback* legs, and still have to pass — that is the ladder's own promise,
+profile that denies `io_uring_setup`, the `auto` leg runs as a
+*fallback* leg, and still has to pass — that is the ladder's own promise,
 and the one property the lane can check on every host. On a host that
 **does** grant the ring (`fuse.enable_uring=Y`, `kernel.io_uring_disabled=0`)
 a fallback is a failure: the script exports
@@ -2581,7 +2580,7 @@ before and after a remount.
 
 ### Running the ring legs: `fuse.enable_uring=Y`
 
-The `auto` and `uring` legs only exercise the ring on a 6.14+ kernel with
+The `auto` leg only exercises the ring on a 6.14+ kernel with
 the fuse module's `enable_uring` parameter on; anywhere else they are
 fallback legs (still required to pass). To get a host that grants it:
 
@@ -2601,9 +2600,9 @@ line, with docker, fuse3 and fio installed and the worktree synced in:
 ```bash
 # in the guest, from the synced worktree (CARGO_TARGET_DIR unset)
 cargo build --release -p constellation -p constellation-harness -p constellation-chaos
-TRANSPORTS="dev-fuse auto uring" SCENARIOS=all tests/transport-matrix.sh
-make compliance-uring                                  # pjdfstest on the ring
-READ_CPU_GATE=1 TRANSPORTS="dev-fuse uring" SCENARIOS=fio-latency tests/transport-matrix.sh
+TRANSPORTS="dev-fuse auto" SCENARIOS=all tests/transport-matrix.sh
+make compliance-ring                                  # pjdfstest on the ring
+READ_CPU_GATE=1 TRANSPORTS="dev-fuse auto" SCENARIOS=fio-latency tests/transport-matrix.sh
 ```
 
 (The project's own lane uses a `vm-run $RING_BOX <command>` wrapper that
@@ -2616,7 +2615,7 @@ the default (`auto`, a fallback on a hosted runner, whose `last_fallback`
 the smoke test checks) and on `dev-fuse`, then the matrix's `dev-fuse` leg.
 `nightly.yml`'s `transport-matrix` job runs **every leg over the full
 matrix**, pjdfstest per transport (`compliance` with `dev-fuse`,
-`compliance-uring`) and the cost gate per leg, on a **self-managed runner**
+`compliance-ring`) and the cost gate per leg, on a **self-managed runner**
 labelled `fuse-uring` (`runs-on: [self-hosted, linux, fuse-uring]`): kernel
 6.14+, `fuse.enable_uring=Y`, docker, fuse3, fio, python3 (the cost gate),
 util-linux's `taskset` (`transport-lock-wait-budget`) and passwordless sudo.
@@ -2688,25 +2687,25 @@ with no exceptions:
 ```bash
 docker compose --profile test run --rm compliance          # auto (dev_fuse: the default seccomp denies the ring)
 docker compose --profile test run --rm -e CONSTELLATION_FUSE_TRANSPORT=dev-fuse compliance
-make compliance-uring                                     # uring (the ring: seccomp unconfined)
+make compliance-ring                                     # the ladder, seccomp unconfined
 ```
 
-`compliance-uring` is a separate compose service (same image: the binary
+`compliance-ring` is a separate compose service (same image: the binary
 carries the ring) because the ring needs one thing the default suite
 container does not have: `seccomp:unconfined`. Docker's default seccomp
 profile blocks `io_uring_setup(2)` outright, and a blocked setup leaves
 nothing in sysfs to see — the mount would quietly fall back and the lane
 would pass while testing nothing (plan 38 §8). The relaxation is on that
 service only; `smoke`/`compliance`/`stress` keep running under an ordinary
-container profile on purpose. It asks for `uring`, the same ladder as `auto`
+container profile on purpose. It asks for the default `auto` ladder
 since 2026-10-05 (before, `auto` kept the suite's cluster-lock mount on
 `/dev/fuse`).
 
 Each run prints the transport it actually negotiated before it starts
-(`FUSE transport: uring (asked for uring)`), read back from `node.status`:
+(`FUSE transport: uring (asked for auto)`), read back from `node.status`:
 the policy is a request, and a run that fell back would otherwise be
 mistaken for ring coverage. On a 6.14+ `enable_uring=Y` host the
-`compliance-uring` lane is 8798/8798 over the ring; on an older kernel it is
+`compliance-ring` lane is 8798/8798 over the ring; on an older kernel it is
 8798/8798 over `/dev/fuse`, and says so.
 
 ### Where the ring is tested without a kernel
@@ -2770,7 +2769,7 @@ passthrough scenarios need root:
 | `passthrough-handover` | a passthrough handle held across `daemon --upgrade`: the new image counts it and holds its pin (a prune keeps the chunk), a new open of the file shares the handed-over backing id, the close releases both |
 | `passthrough-disabled-by-verify-always` | `--cache-verify always`: `enabled = false`, reason `cache_verify_always`, no pin, every read reaches the daemon — privileged or not (it requires nothing) |
 | `passthrough-default-by-mount-mode` | without the opt-in: a writable mount reports reason `writable_mount`, holds no passthrough handle and serves a read-write open beside a reader; a read-only mount of a snapshot of the same file negotiates passthrough (no reason); with the daemon's memory tier on (the default) the verifying first read admits the chunk to memory and the next open is **not** passthrough (a chunk held in memory never is, plan 38 Z3c), and on a second snapshot mount with `CONSTELLATION_CHUNK_MEMCACHE_BYTES=0` it serves the frozen file by passthrough: the first open after the new daemon's start is ordinary (its read verifies the chunk the daemon found on disk), the next is counted and pinned (`(opens, open_pins) = (1, 1)`, `opens_total` ≥ 1), reads byte-exact with neither the `read` series nor `cache.memory_misses` moving, a read-write open beside it is `EROFS` and leaves the counts alone, and the close releases the pin |
-| `passthrough-on-every-transport` | plan 38 Z2c with Z3b/Z3c: one read-only snapshot mount per policy (`dev-fuse`, `auto`, `uring`). Before any open, the mount reports the transport and fallback the ladder gives it (`dev-fuse`: `dev_fuse`, no fallback; `auto` and `uring`: the ring on a ring host, and elsewhere a fallback naming an earlier rung, counted once). Then passthrough serves a verified chunk's open on that transport: counted and pinned `(1, 1)`, byte-exact, no read reaching the daemon, released at the close |
+| `passthrough-on-every-transport` | plan 38 Z2c with Z3b/Z3c: one read-only snapshot mount per policy (`dev-fuse`, `auto`). Before any open, the mount reports the transport and fallback the ladder gives it (`dev-fuse`: `dev_fuse`, no fallback; `auto`: the ring on a ring host, and elsewhere a fallback naming an earlier rung, counted once). Then passthrough serves a verified chunk's open on that transport: counted and pinned `(1, 1)`, byte-exact, no read reaching the daemon, released at the close |
 
 All but `passthrough-disabled-by-verify-always` `require` `CAP_SYS_ADMIN` and `linux>=6.9` — `requires`
 entries that name a host capability rather than a binary
@@ -2837,7 +2836,7 @@ All four `require` `fuse-uring-zc` (`suites::FUSE_URING_ZERO_COPY`: the ring
 requirement, `CAP_SYS_ADMIN`, Linux >= 7.3) and SKIP loudly elsewhere
 (`requires CAP_SYS_ADMIN for io_uring zero-copy (run the harness as root)`,
 `requires Linux >= 7.3 for io_uring zero-copy (this is …)`). They mount with
-`CONSTELLATION_FUSE_TRANSPORT=uring`, `CONSTELLATION_FUSE_URING_ZERO_COPY=auto`,
+`CONSTELLATION_FUSE_TRANSPORT=auto`, `CONSTELLATION_FUSE_URING_ZERO_COPY=auto`,
 `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=8192` and `--locks local`, whatever the
 harness's environment says; the memory tier does not matter (a chunk it
 holds is read zero-copy as well). A 7.3+ kernel that does not offer buffer
@@ -2855,9 +2854,9 @@ In CI this is `nightly.yml`'s `zero-copy-7-3` job, on a self-hosted runner
 labelled `fuse-uring-zc` (enabled by the repository variable
 `FUSE_URING_ZC_RUNNER`): the four scenarios, the whole matrix as root with
 zero-copy queues asked for (the default transport policy), the read-cost gate
-on `dev-fuse`, `uring` (zero-copy off) and `uring_zc`, its read-size lanes
+on `dev-fuse`, `auto` (zero-copy off: `uring`) and `uring_zc`, its read-size lanes
 (`tests/read-cpu-gate.sh --size-lanes`: `uring` against `uring_zc` with every
-read zero-copy, the threshold's measurement), and `make compliance-uring`,
+read zero-copy, the threshold's measurement), and `make compliance-ring`,
 which asks for zero-copy queues and negotiates `uring_zc` in the privileged
 suite container (its first line says so; the job checks). The job runs it with
 `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ=0`: pjdfstest's files and reads are far

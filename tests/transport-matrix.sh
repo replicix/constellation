@@ -16,12 +16,9 @@
 #             queue depth 32 (decided 2026-10-05; contended blocking lock
 #             waits past a queue's budget get ENOLCK): this leg is what the
 #             default actually ships.
-#   uring     the same ladder as `auto` since 2026-10-05 (before, the
-#             opt-in that put cluster-lock mounts on the ring); kept as a
-#             leg so the spelling stays exercised.
 #
-# **No leg skips.** A host that cannot grant the ring runs `auto` and
-# `uring` as fallback legs, which is exactly the property the ladder
+# **No leg skips.** A host that cannot grant the ring runs `auto`
+# as a fallback leg, which is exactly the property the ladder
 # promises: the same scenarios must pass when it degrades. Each leg ends
 # with a census — how many of its mounts got which transport, and why the
 # others fell back (`CONSTELLATION_HARNESS_TRANSPORT_CENSUS`, from each
@@ -32,7 +29,7 @@
 # not disabled by sysctl) a fallback is a failure, not coverage: the lane
 # exports CONSTELLATION_FUSE_EXPECT_URING=1 and always runs
 # `transport-detach-refused`, which then fails if its mount (which asks
-# for `uring` itself) negotiated `dev_fuse`. EXPECT_URING=0|1 overrides the
+# for the ring itself) negotiated `dev_fuse`. EXPECT_URING=0|1 overrides the
 # detection. The `auto` leg needs `fuse.enable_uring=Y` to be anything but
 # a second fallback leg; see docs/how-to-guides/development/TESTING.md
 # for running it in a KVM guest.
@@ -66,7 +63,7 @@ esac
 
 # Every policy a mount may be asked for (`--fuse-transport`). `uring_zc`
 # is not one: the ladder negotiates it.
-TRANSPORTS="${TRANSPORTS:-dev-fuse auto uring}"
+TRANSPORTS="${TRANSPORTS:-dev-fuse auto}"
 
 # The read-path scenarios: the cache/prefetch/coop paths a transport
 # change can break, plus the end-to-end and fault legs that read back
@@ -111,8 +108,8 @@ mkdir -p "$RESULTS_DIR"
 rc=0
 for transport in $TRANSPORTS; do
     case "$transport" in
-        dev-fuse|auto|uring) ;;
-        *) echo "FAIL: unknown transport $transport (expected dev-fuse, auto or uring)" >&2; exit 2 ;;
+        dev-fuse|auto) ;;
+        *) echo "FAIL: unknown transport $transport (expected dev-fuse or auto)" >&2; exit 2 ;;
     esac
     echo "== transport $transport: harness run ${SCENARIOS:-<full matrix>} ${HARNESS_ARGS:-}"
     census="$RESULTS_DIR/$transport.census.tsv"

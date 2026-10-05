@@ -9,7 +9,7 @@ FROM rust:1-bookworm AS build
 # the shipped build — which on Linux already carries the FUSE-over-io_uring
 # transport (plan 38 Z2c); reaching the ring at *run* time also needs a
 # seccomp profile that permits `io_uring_setup(2)` (docker-compose.yml's
-# `compliance-uring`).
+# `compliance-ring`).
 ARG CARGO_FEATURES=
 # The target cache is per checkout: cargo decides freshness by mtime, COPY
 # keeps the context's mtimes, and every checkout builds at /src, so a

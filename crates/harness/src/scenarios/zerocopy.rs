@@ -12,9 +12,8 @@
 //! rule as the passthrough scenarios: a fast path that silently never
 //! engages must be observable).
 //!
-//! The mounts ask for the ring explicitly (`CONSTELLATION_FUSE_TRANSPORT=uring`,
-//! `--locks local`: under `auto` a mount with cluster locks stays on
-//! `/dev/fuse`, plan 38 Z2c) and for zero-copy queues
+//! The mounts ask for the ladder (`CONSTELLATION_FUSE_TRANSPORT=auto`,
+//! `--locks local`) and for zero-copy queues
 //! (`CONSTELLATION_FUSE_URING_ZERO_COPY=auto`), whatever the harness's own
 //! environment says. What a zero-copy read is, from outside:
 //! `fuse.mounts[].zero_copy_reads` counts it, and the daemon's `read`
@@ -52,7 +51,7 @@ const MIN_READ: usize = 8192;
 
 fn client(env: &S3Env, root: &Path, name: &str, backend: &str) -> Result<Client> {
     Ok(Client::new(root, name, &env.endpoint, backend)?
-        .with_env("CONSTELLATION_FUSE_TRANSPORT", "uring")
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", "auto")
         .with_env("CONSTELLATION_FUSE_URING_ZERO_COPY", "auto")
         .with_env(
             "CONSTELLATION_FUSE_ZERO_COPY_MIN_READ",
