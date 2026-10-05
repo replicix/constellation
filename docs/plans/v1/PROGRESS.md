@@ -42127,12 +42127,23 @@ for.
 - **Plan 33 Screen 5** ports `crates/control/webui/snapshots.html` (the
   vanilla reference: same API calls, "render answers only", same timeline
   vocabulary; see "Plan 32 M6 — web UI").
-- **Plan 37 `size_bytes`**: the CSI controller
-  (`crates/csi/src/controller/snapshots.rs`) reports `refer_bytes`, the
-  creation-time figure from the snapshot row. The plan's coordination note
-  says plan 37 reads `REFER` (Step 6.1, live from the accounting index).
-  Switching to `refer` is the coordinator's call. It costs an index read
-  per listing, and the index can answer `Building`.
+- **Plan 37 `size_bytes`** — *resolved in 37-k7a (coordinator decision,
+  2026-10-04)*: the CSI controller
+  (`crates/csi/src/controller/snapshots.rs`) now reports the accounting
+  index's live `refer` (`SnapshotStatus.refer`, Step 6.1) whenever the
+  index answers `ok`, and falls back to the row's creation-time
+  `refer_bytes` while it is `building` or `off`. No CSI snapshot call
+  asks for sizes (`sizes: false`: the engine only peeks, so the live figure
+  shows once the index is current); none waits for the index, and
+  `CreateSnapshot` never fails on it.
+  Test: `controller::tests::size_bytes_is_the_live_refer_once_the_index_is_ok`
+  (asserts no sized list).
+- **37-k7a review round** — `CreateSnapshot`/`ListSnapshots`/`GetSnapshot`
+  list with `sizes: false` (the `sizes: true` wait of up to `answer_wait`
+  is gone); setgid test extended (member keeps `S_ISGID`, lost-race
+  `create` keeps the stored gid); `new_owner` logs an unreadable parent;
+  `tests/csi/e2e.sh` refuses `-ginkgo.skip`/`--skip`; `--device /dev/fuse`
+  dropped from the workstation container.
 - A quiet-host rerun of `snapsched-write-overhead` would firm up the 3 %
   verdict (see above).
 - **Pre-existing, outside plan 32:** three `constellation-store-s3` unit

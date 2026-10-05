@@ -79,6 +79,7 @@
 //! missing `fio`.
 
 pub mod lifecycle;
+pub mod pool_access;
 pub mod remote;
 pub mod scenarios;
 
@@ -668,18 +669,22 @@ impl Env {
             // Plan 37 K6b: the idle GC, the drain watch and the purge
             // worker on scenario timescales ([`HARNESS_PURGE`]).
             .args(["--set", &format!("engineProfile.idleTtl={IDLE_TTL_S}s")])
-            .args(["--set", "engineProfile.idleGcInterval=5"])
+            // Numbers as strings: `set_chart_image`'s `--reuse-values`
+            // round-trips the release's values through JSON, which makes
+            // an integer a float, and `quote` renders 16777216 as
+            // "1.6777216e+07" — a value the controller refuses to start on.
+            .args(["--set-string", "engineProfile.idleGcInterval=5"])
             .args([
                 "--set",
                 &format!("purge.interval={}s", HARNESS_PURGE.interval_s),
             ])
             .args(["--set", &format!("purge.grace={}s", HARNESS_PURGE.grace_s)])
             .args([
-                "--set",
+                "--set-string",
                 &format!("purge.opsPerSecond={}", HARNESS_PURGE.ops_per_s),
-                "--set",
+                "--set-string",
                 &format!("purge.bytesPerSecond={}", HARNESS_PURGE.bytes_per_s),
-                "--set",
+                "--set-string",
                 &format!("purge.maxConcurrentDeletes={}", HARNESS_PURGE.concurrency),
             ])
             .args(["--wait", "--timeout", "300s"]);
@@ -910,6 +915,8 @@ pub struct Scope<'a> {
     pub ns: String,
     /// The scope's first pool StorageClass.
     pub sc: String,
+    /// Its bucket prefix (the pool's, or its shards' parent).
+    prefix: String,
     /// Every StorageClass of the scope ([`Scope::add_class`]), the first
     /// included, with the driver's `constellation.dev/pool` label of its
     /// pool.
@@ -921,6 +928,9 @@ pub struct Scope<'a> {
     /// The scope's `VolumeSnapshotClass`, once made.
     snapshot_class: Option<String>,
     pvcs: Vec<String>,
+    /// Statically provisioned PVs ([`Scope::static_pv`]): `Retain`, so
+    /// the teardown deletes them itself.
+    static_pvs: Vec<String>,
     /// Set by [`Scope::expect_no_engine_return`]: after the teardown, wait
     /// and check no engine pod of the scope's pools comes back.
     no_engine_return: bool,
@@ -962,9 +972,11 @@ impl<'a> Scope<'a> {
         }))?;
         // From here on `Drop` removes the namespace (and the classes made
         // so far).
+        let prefix = format!("k8s-harness/{}/{scenario}", env.scope_id());
         let mut scope = Self {
             env,
             sc: ns.clone(),
+            prefix: prefix.clone(),
             ns,
             classes: Vec::new(),
             secret: secret.to_string(),
@@ -974,16 +986,18 @@ impl<'a> Scope<'a> {
                 .collect(),
             snapshot_class: None,
             pvcs: Vec::new(),
+            static_pvs: Vec::new(),
             no_engine_return: false,
             done: false,
         };
         let sc = scope.sc.clone();
-        scope.class(&sc, &format!("k8s-harness/{}/{scenario}", env.scope_id()))?;
+        scope.class(&sc, &prefix, &[])?;
         Ok(scope)
     }
 
-    /// A pool StorageClass `name` of its own pool at `prefix`.
-    fn class(&mut self, name: &str, prefix: &str) -> Result<()> {
+    /// A pool StorageClass `name` of its own pool at `prefix`, its
+    /// parameters the scope's with `overrides` on top.
+    fn class(&mut self, name: &str, prefix: &str, overrides: &[(&str, String)]) -> Result<()> {
         let env = self.env;
         let mut params = serde_json::Map::new();
         for (k, v) in [
@@ -1015,6 +1029,9 @@ impl<'a> Scope<'a> {
         for (k, v) in &self.extra {
             params.insert(k.clone(), Value::String(v.clone()));
         }
+        for (k, v) in overrides {
+            params.insert(k.to_string(), Value::String(v.clone()));
+        }
         self.classes
             .push((name.to_string(), pool_label(&env.endpoint, BUCKET, prefix)));
         env.kube.apply(&json!({
@@ -1033,8 +1050,102 @@ impl<'a> Scope<'a> {
     pub fn add_class(&mut self, suffix: &str) -> Result<String> {
         let name = format!("{}-{suffix}", self.sc);
         let prefix = format!("k8s-harness/{}/{}-{suffix}", self.env.run_id, self.ns);
-        self.class(&name, &prefix)?;
+        self.class(&name, &prefix, &[])?;
         Ok(name)
+    }
+
+    /// Another StorageClass `<sc>-<suffix>` of the scope's *own* pool (the
+    /// same bucket and prefix), its parameters the scope's with
+    /// `overrides` on top: e.g. the same pool seen with another `shards`.
+    pub fn add_class_of_pool(
+        &mut self,
+        suffix: &str,
+        overrides: &[(&str, String)],
+    ) -> Result<String> {
+        let name = format!("{}-{suffix}", self.sc);
+        let prefix = self.prefix.clone();
+        self.class(&name, &prefix, overrides)?;
+        Ok(name)
+    }
+
+    /// The scope's pool's bucket prefix (a sharded pool's shards live
+    /// under it, `shard-<k>`).
+    pub fn pool_prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// The driver's `constellation.dev/pool` label of the scope's pool
+    /// (shared by all its shards).
+    pub fn pool_label(&self) -> &str {
+        &self.classes[0].1
+    }
+
+    /// The scope's pool as a static PV's `volumeAttributes` spell it
+    /// (plan 37 settled decision 17): the class parameters without the
+    /// sidecars' secret references.
+    pub fn pool_attributes(&self) -> serde_json::Map<String, Value> {
+        let mut attrs = serde_json::Map::new();
+        for (k, v) in [
+            ("bucket", BUCKET.to_string()),
+            ("prefix", self.prefix.clone()),
+            ("endpoint", self.env.endpoint.clone()),
+            ("region", "us-east-1".into()),
+            ("layout", "pool".into()),
+            ("chunkSize", "1MiB".into()),
+        ] {
+            attrs.insert(k.into(), Value::String(v));
+        }
+        for (k, v) in &self.extra {
+            attrs.insert(k.clone(), Value::String(v.clone()));
+        }
+        attrs
+    }
+
+    /// A statically provisioned PV `name` (cluster-scoped: the caller makes
+    /// it unique) whose `volumeHandle` is `handle`, located by
+    /// `attributes`, staged with the scope's Secret; `Retain`, no
+    /// StorageClass. Deleted by the teardown.
+    pub fn static_pv(
+        &mut self,
+        name: &str,
+        handle: &str,
+        attributes: serde_json::Map<String, Value>,
+        mode: &str,
+        size: &str,
+    ) -> Result<()> {
+        self.static_pvs.push(name.to_string());
+        self.env.kube.apply(&json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": name},
+            "spec": {
+                "accessModes": [mode],
+                "capacity": {"storage": size},
+                "persistentVolumeReclaimPolicy": "Retain",
+                "storageClassName": "",
+                "csi": {
+                    "driver": "csi.constellation.dev",
+                    "volumeHandle": handle,
+                    "volumeAttributes": attributes,
+                    "nodeStageSecretRef": {"name": self.secret, "namespace": self.env.driver_ns},
+                },
+            }
+        }))
+    }
+
+    /// PVC `name` bound to PV `pv` by name (static provisioning: no class).
+    pub fn pvc_for_pv(&mut self, name: &str, pv: &str, mode: &str, size: &str) -> Result<()> {
+        self.env.kube.apply(&json!({
+            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": self.ns},
+            "spec": {
+                "accessModes": [mode],
+                "storageClassName": "",
+                "volumeName": pv,
+                "resources": {"requests": {"storage": size}},
+            }
+        }))?;
+        self.pvcs.push(name.to_string());
+        Ok(())
     }
 
     /// The scope's `VolumeSnapshotClass` (made on first use).
@@ -1291,13 +1402,28 @@ impl<'a> Scope<'a> {
         claims: &[&str],
         script: Option<&str>,
     ) -> Result<()> {
+        self.spawn_pod_with(name, node, claims, script, false)
+    }
+
+    /// [`Scope::spawn_pod`], every claim mounted read-only when
+    /// `read_only` (the pod volume's `persistentVolumeClaim.readOnly`).
+    pub fn spawn_pod_with(
+        &self,
+        name: &str,
+        node: &str,
+        claims: &[&str],
+        script: Option<&str>,
+        read_only: bool,
+    ) -> Result<()> {
         let mounts: Vec<Value> = claims
             .iter()
-            .map(|c| json!({"name": c, "mountPath": data_dir(c)}))
+            .map(|c| json!({"name": c, "mountPath": data_dir(c), "readOnly": read_only}))
             .collect();
         let vols: Vec<Value> = claims
             .iter()
-            .map(|c| json!({"name": c, "persistentVolumeClaim": {"claimName": c}}))
+            .map(|c| {
+                json!({"name": c, "persistentVolumeClaim": {"claimName": c, "readOnly": read_only}})
+            })
             .collect();
         let command = match script {
             Some(s) => json!(["sh", "-c", s]),
@@ -1596,6 +1722,18 @@ impl<'a> Scope<'a> {
         );
         if result.is_ok() && check {
             result = gone;
+        }
+        // Static PVs are `Retain`: Released once their claim went, and
+        // removed here (`DeleteVolume` is never called for one).
+        for pv in &self.static_pvs {
+            let _ = kube.run(&[
+                "delete",
+                "pv",
+                pv,
+                "--ignore-not-found",
+                "--wait=true",
+                "--timeout=120s",
+            ]);
         }
         lap("waiting for the PVs and snapshot contents to go");
         for c in &classes {

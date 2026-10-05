@@ -897,3 +897,118 @@ fn a_discard_is_reported_once_to_every_description_open_when_it_happened() {
     c.fsync(ino, fresh).unwrap();
     c.close(ino, fresh).unwrap();
 }
+
+/// POSIX set-group-ID directories (Linux `inode_init_owner`), which FUSE
+/// leaves to the filesystem: what is made in one takes its group, and a
+/// subdirectory the bit as well; outside one the caller's group stands.
+/// Kubernetes' `fsGroup` rests on it (plan 37 settled decision 11).
+#[test]
+fn a_setgid_directory_hands_its_group_to_new_entries() {
+    let mut c = client();
+    let shared = c.mkdir(ROOT_INO, "shared").unwrap().attr.ino;
+    let plain = c.mkdir(ROOT_INO, "plain").unwrap().attr.ino;
+    // The owner marks it g+s with group 2000 (root may chown to any group).
+    c.caller = Caller::new(0, 0, None);
+    Blocking::run(|r| {
+        c.view.setattr(
+            &c.cx(OpKind::Setattr),
+            shared,
+            None,
+            &SetAttr {
+                gid: Some(2000),
+                mode: Some(0o2777),
+                ..SetAttr::default()
+            },
+            r,
+        )
+    })
+    .unwrap();
+    c.caller = Caller::new(1000, 1000, None);
+
+    let (file, o) = c.create(shared, "f").unwrap();
+    c.close(file.attr.ino, o.fh).unwrap();
+    assert_eq!((file.attr.uid, file.attr.gid), (1000, 2000));
+    assert_eq!(file.attr.mode & 0o7777, 0o644);
+    let sub = c.mkdir(shared, "sub").unwrap();
+    assert_eq!((sub.attr.uid, sub.attr.gid), (1000, 2000));
+    assert_eq!(
+        sub.attr.mode & 0o7777,
+        0o2755,
+        "a subdirectory inherits S_ISGID"
+    );
+    // ... and hands the group on in turn.
+    let (deep, o) = c.create(sub.attr.ino, "deep").unwrap();
+    c.close(deep.attr.ino, o.fh).unwrap();
+    assert_eq!(deep.attr.gid, 2000);
+    let sym = Blocking::run(|r| {
+        c.view
+            .symlink(&c.cx(OpKind::Symlink), shared, Name::new("s"), b"f", r)
+    })
+    .unwrap();
+    assert_eq!(sym.attr.gid, 2000);
+    let fifo = Blocking::run(|r| {
+        c.view.mknod(
+            &c.cx(OpKind::Mknod),
+            shared,
+            Name::new("p"),
+            constellation_vfs::types::mode::S_IFIFO | 0o640,
+            constellation_types::Rdev::default(),
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!((fifo.attr.gid, fifo.attr.mode & 0o7777), (2000, 0o640));
+    // What a lookup reads back is what was stored, not just the reply.
+    assert_eq!(c.lookup(shared, "f").unwrap().attr.gid, 2000);
+
+    // A member of the directory's group creating a file with its own
+    // S_ISGID: the kernel leaves the bit for a member, and it is kept,
+    // with the group inherited.
+    let member = Caller::new(1000, 2000, None);
+    let (sgid_file, o) = Blocking::run(|r| {
+        c.view.create(
+            &OpCtx::new(OpKind::Create, &member),
+            shared,
+            Name::new("sgid"),
+            0o102755,
+            OpenFlags::READ | OpenFlags::WRITE,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    c.close(sgid_file.attr.ino, o.fh).unwrap();
+    assert_eq!(sgid_file.attr.gid, 2000);
+    assert_eq!(
+        sgid_file.attr.mode & 0o7777,
+        0o2755,
+        "a member keeps S_ISGID"
+    );
+    // Opening an existing entry through create (the lost race) keeps what
+    // is stored, whatever group the caller has.
+    let stranger = Caller::new(1000, 3000, None);
+    let (again, o) = Blocking::run(|r| {
+        c.view.create(
+            &OpCtx::new(OpKind::Create, &stranger),
+            shared,
+            Name::new("f"),
+            0o100644,
+            OpenFlags::READ | OpenFlags::WRITE,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    c.close(again.attr.ino, o.fh).unwrap();
+    assert_eq!(again.attr.gid, 2000, "an existing entry keeps its gid");
+
+    // Outside a set-group-ID directory: the caller's group, no bit.
+    let (other, o) = c.create(plain, "f").unwrap();
+    c.close(other.attr.ino, o.fh).unwrap();
+    assert_eq!(other.attr.gid, 1000);
+    let other_dir = c.mkdir(plain, "d").unwrap();
+    assert_eq!(
+        (other_dir.attr.gid, other_dir.attr.mode & 0o7777),
+        (1000, 0o755)
+    );
+}

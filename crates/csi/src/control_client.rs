@@ -279,5 +279,5 @@ pub enum Handle<'a> {
 
 mod fake;
 mod socket;
-pub use fake::{InMemoryControl, InMemoryEngines};
+pub use fake::{InMemoryControl, InMemoryEngines, SizeIndex};
 pub use socket::{SocketControlClient, DEFAULT_CALL_TIMEOUT};

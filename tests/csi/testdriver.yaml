@@ -1,0 +1,79 @@
+# The Kubernetes external storage e2e suite's view of constellation-csi
+# (plan 37 §12, K7): `e2e.test -storage.testdriver=tests/csi/testdriver.yaml`,
+# run by tests/csi/e2e.sh, which also creates the two classes named below
+# (their parameters carry the run's S3 endpoint, so they cannot be static
+# files here).
+#
+# Capabilities declare exactly what the driver does — never more to run a
+# test, never less to skip one. Each line says where the fact comes from;
+# tests/csi/e2e-skips.md lists every test the `false` lines skip.
+StorageClass:
+  # A pool StorageClass (layout pool, unsharded), allowVolumeExpansion:
+  # true, Immediate binding, provisioner and node-stage secrets.
+  FromExistingClassName: constellation-e2e
+SnapshotClass:
+  # driver csi.constellation.dev, snapshotter secret, deletionPolicy Delete.
+  FromExistingClassName: constellation-e2e
+DriverInfo:
+  Name: csi.constellation.dev
+  # Capacity is a subtree quota (metadata, settled decision 6), so any size
+  # is honest; the suite's default minimum is 5Gi, 1Gi keeps its quota
+  # tests' fills small against an in-memory S3.
+  SupportedSizeRange:
+    Min: 1Gi
+    Max: 64Gi
+  # A FUSE filesystem: there is no fsType to choose.
+  SupportedFsType: {"": {}}
+  Capabilities:
+    # Data lives in S3; a pod restart (or a restage on another node) sees
+    # it.
+    persistence: true
+    # Volumes are filesystem mounts only (CreateVolume refuses block).
+    block: false
+    # CSIDriver fsGroupPolicy: File (settled decision 11): kubelet's
+    # recursive chown/chmod through FUSE.
+    fsGroup: true
+    # No VOLUME_MOUNT_GROUP node capability.
+    volumeMountGroup: false
+    # The FUSE mount is not noexec.
+    exec: true
+    # Stage once per (PV, node), publish by bind mount (settled decision 5).
+    multipods: true
+    # MULTI_NODE_MULTI_WRITER (settled decision 14).
+    RWX: true
+    # MULTI_NODE_READER_ONLY (settled decisions 14, 17).
+    capReadOnlyMany: true
+    # SINGLE_NODE_MULTI_WRITER is advertised, so the sidecars accept RWOP.
+    readWriteOncePod: true
+    # Snapshots and clones (K4): CREATE_DELETE_SNAPSHOT, CLONE_VOLUME.
+    snapshotDataSource: true
+    pvcDataSource: true
+    # No snapshot-metadata service, no group snapshots.
+    snapshotMetadata: false
+    groupSnapshot: false
+    # EXPAND_VOLUME is controller-only; NodeExpandVolume is a no-op that
+    # is never required (settled decision 6). Expansion works mounted and
+    # unmounted (quota.set), so online/offline keep their default (true).
+    controllerExpansion: true
+    nodeExpansion: false
+    # NodeGetInfo reports max_volumes_per_node 0 (the CO decides).
+    volumeLimits: false
+    # No topology: every node reaches every bucket (settled decision 4).
+    topology: false
+    singleNodeVolume: false
+    # CSIDriver storageCapacity: false.
+    capacity: false
+    # The driver keys staging by volume handle only and never reads PV
+    # objects: two PVs naming one handle see the same NodeStage/Publish.
+    multiplePVsSameID: true
+    # CSIDriver seLinuxMount: false (settled decision 13).
+    seLinuxMount: false
+Timeouts:
+  # An engine pod is brought up on a node's first stage of a pool, and a
+  # pod's first mount of a volume waits for it.
+  PodStart: 10m
+  ClaimProvision: 10m
+  PVCreate: 10m
+  PVDelete: 10m
+  SnapshotCreate: 10m
+  SnapshotDelete: 10m

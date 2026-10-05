@@ -1,5 +1,5 @@
 use super::*;
-use crate::control_client::{InMemoryControl, InMemoryEngines};
+use crate::control_client::{InMemoryControl, InMemoryEngines, SizeIndex};
 use crate::proto::csi::v1::volume_capability::{AccessMode, BlockVolume, MountVolume};
 use constellation_control::proto::types::{
     CloneParams, FsCreateParams, SnapshotCreateParams, SnapshotHoldParams,
@@ -1039,6 +1039,80 @@ async fn delete_snapshot_releases_its_hold_and_leaves_a_human_hold_alone() {
     assert!(fs.exists(&VolumeId::parse(&restored.volume_id).unwrap().subtree()));
     f.delete_snapshot(&c.snapshot_id).await.unwrap();
     assert_eq!(fs.snapshots().len(), 1, "only the human's is left");
+}
+
+/// Coordinator decision 2026-10-04: `size_bytes` is the index's live
+/// `REFER` when it answers `ok`, the row's `refer_bytes` while it builds or
+/// is off — and neither state fails or holds up `CreateSnapshot`.
+#[tokio::test]
+async fn size_bytes_is_the_live_refer_once_the_index_is_ok() {
+    let f = fixture();
+    let v = f.create(create_req("pvc-src", GIB)).await.unwrap();
+    let fs = f.fs_of(&v.volume_id).await;
+    fs.set_used_bytes("/volumes/pvc-src", 12345);
+    let get = |id: String| {
+        let f = &f;
+        async move {
+            f.service
+                .list_snapshots(Request::new(ListSnapshotsRequest {
+                    snapshot_id: id,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .entries
+                .into_iter()
+                .map(|e| e.snapshot.unwrap().size_bytes)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Building: the create answers at once, with the creation-time figure.
+    fs.set_size_index(Some(SizeIndex::Building));
+    let s = f.snapshot("snapshot-1", &v.volume_id).await.unwrap();
+    assert_eq!(s.size_bytes, 12345, "refer_bytes while the index builds");
+    assert_eq!(get(s.snapshot_id.clone()).await, [12345]);
+    fs.set_size_index(Some(SizeIndex::Off));
+    assert_eq!(get(s.snapshot_id.clone()).await, [12345], "off");
+
+    // Ok: the live, deduplicated REFER, on every answer made from a row.
+    fs.set_size_index(Some(SizeIndex::Ok(Arc::new(|_| 4096))));
+    assert_eq!(get(s.snapshot_id.clone()).await, [4096]);
+    let again = f.snapshot("snapshot-1", &v.volume_id).await.unwrap();
+    assert_eq!(
+        again.size_bytes, 4096,
+        "the idempotent create reads the row"
+    );
+    let by_source = f
+        .service
+        .list_snapshots(Request::new(ListSnapshotsRequest {
+            source_volume_id: v.volume_id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        by_source.entries[0].snapshot.as_ref().unwrap().size_bytes,
+        4096
+    );
+    let one = f
+        .service
+        .get_snapshot(Request::new(GetSnapshotRequest {
+            snapshot_id: s.snapshot_id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(one.snapshot.unwrap().size_bytes, 4096);
+    assert!(fs.snapshot_lists() > 0);
+    assert_eq!(
+        fs.sized_snapshot_lists(),
+        0,
+        "no snapshot call asks for sizes, so none waits on the index"
+    );
 }
 
 #[tokio::test]

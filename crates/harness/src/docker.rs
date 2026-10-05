@@ -30,6 +30,12 @@ pub struct Container {
 impl Container {
     /// `docker run -d` with standard harness labels; returns once created.
     pub fn run(name: &str, image: &str, extra: &[&str]) -> Result<Self> {
+        Self::run_with_cmd(name, image, extra, &[])
+    }
+
+    /// [`Container::run`] with `cmd` after the image (its command, or the
+    /// arguments of `--entrypoint`).
+    pub fn run_with_cmd(name: &str, image: &str, extra: &[&str], cmd: &[&str]) -> Result<Self> {
         // Remove leftovers from a previous crashed run.
         let _ = docker(&["rm", "-f", name]);
         let mut args = vec![
@@ -43,6 +49,7 @@ impl Container {
         ];
         args.extend_from_slice(extra);
         args.push(image);
+        args.extend_from_slice(cmd);
         let id = docker(&args)?;
         Ok(Self {
             id,

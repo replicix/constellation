@@ -65,6 +65,17 @@ struct Cli {
     /// (default 300); on any other node exit at once. Serves nothing.
     #[arg(long, requires = "node")]
     pre_stop: bool,
+    /// Ask the Node service at `--endpoint` for one staged volume's health
+    /// (`NodeGetVolumeHealth`), print it as JSON and exit. How an operator,
+    /// or `harness k8s-scenario`, reads plan 37 §11's volume condition — a
+    /// volume removed or its record changed outside Kubernetes (settled
+    /// decision 18) — where kubelet does not surface it: `kubectl exec` it
+    /// in the node plugin's container. Serves nothing.
+    #[arg(long, value_name = "VOLUME_ID", conflicts_with_all = ["controller", "node"])]
+    volume_health: Option<String>,
+    /// With `--volume-health`: a publish path to check as well.
+    #[arg(long, value_name = "PATH", requires = "volume_health")]
+    volume_path: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -80,6 +91,7 @@ fn main() -> Result<()> {
     // engine pods with `fs.unlock`): never in a core dump.
     constellation_platform::forbid_core_dumps().context("disabling core dumps")?;
     match (cli.controller, cli.node) {
+        (false, false) if cli.volume_health.is_some() => {}
         (false, false) => bail!("one of --controller or --node is required"),
         (true, false) if cli.node_id.is_some() => {
             bail!("--node-id only applies to --node")
@@ -99,6 +111,9 @@ fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     if cli.pre_stop {
         return pre_stop(cli).await;
+    }
+    if let Some(volume_id) = &cli.volume_health {
+        return volume_health(&cli.endpoint, volume_id, cli.volume_path.as_deref()).await;
     }
     let path = socket_path(&cli.endpoint)?;
     if path.exists() {
@@ -315,6 +330,58 @@ async fn pre_stop(cli: Cli) -> Result<()> {
     gc::pre_stop(&engines, timeout)
         .await
         .map_err(anyhow::Error::msg)
+}
+
+/// `--volume-health` (see the flag): one `NodeGetVolumeHealth` call to the
+/// Node service at `endpoint`, its answer on stdout as JSON
+/// (`{"volume_id", "abnormal", "statuses": [{"status", "reason",
+/// "message"}]}`; `status` is the CSI `VolumeHealthErrorType` name).
+async fn volume_health(endpoint: &str, volume_id: &str, path: Option<&str>) -> Result<()> {
+    use constellation_csi::proto::csi::v1::node_client::NodeClient;
+    use constellation_csi::proto::csi::v1::{NodeGetVolumeHealthRequest, VolumeHealthErrorType};
+    let socket = socket_path(endpoint)?;
+    // The URI is a placeholder: the connector dials the socket.
+    let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")?
+        .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+            let socket = socket.clone();
+            async move {
+                tokio::net::UnixStream::connect(socket)
+                    .await
+                    .map(hyper_util::rt::TokioIo::new)
+            }
+        }))
+        .await
+        .with_context(|| format!("connecting to {endpoint}"))?;
+    let health = NodeClient::new(channel)
+        .node_get_volume_health(NodeGetVolumeHealthRequest {
+            volume_id: volume_id.to_string(),
+            volume_publish_path: path.unwrap_or_default().to_string(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|s| anyhow::anyhow!("NodeGetVolumeHealth: {:?}: {}", s.code(), s.message()))?
+        .into_inner()
+        .volume_health
+        .unwrap_or_default();
+    let statuses: Vec<serde_json::Value> = health
+        .health_statuses
+        .iter()
+        .map(|e| {
+            let status = VolumeHealthErrorType::try_from(e.status)
+                .map(|t| t.as_str_name().to_string())
+                .unwrap_or_else(|_| e.status.to_string());
+            serde_json::json!({"status": status, "reason": e.reason, "message": e.message})
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::json!({
+            "volume_id": volume_id,
+            "abnormal": !statuses.is_empty(),
+            "statuses": statuses,
+        })
+    );
+    Ok(())
 }
 
 /// `CONSTELLATION_CSI_METRICS_ADDR` (e.g. `0.0.0.0:9810`): the node

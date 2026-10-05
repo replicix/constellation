@@ -11,16 +11,25 @@ use constellation_control::proto::types::{
     Ack, CloneParams, DeleteParams, DirectoryEntry, DirectoryListing, FileStat, FsCreateParams,
     FsCreated, FsInfo, FsListing, FsUnlockParams, HandedOffView, HandoffParams, HandoffPhase,
     HandoffReport, HandoffState, HandoffTarget, LeaveParams, MkdirParams, MountSource, PeerListing,
-    Pong, QuotaStatus, RenameParams, SnapshotCreateParams, SnapshotCreated, SnapshotDeleteParams,
-    SnapshotHeld, SnapshotHoldParams, SnapshotListParams, SnapshotListing, SnapshotStatus,
-    ViewInfo, ViewListParams, ViewListing, ViewMountParams, ViewStatsParams, ViewStatsReport,
-    ViewUnmountParams, XattrOp, XattrParams, XattrResult,
+    Pong, QuotaStatus, RenameParams, SizeState, SnapshotCreateParams, SnapshotCreated,
+    SnapshotDeleteParams, SnapshotHeld, SnapshotHoldParams, SnapshotListParams, SnapshotListing,
+    SnapshotStatus, ViewInfo, ViewListParams, ViewListing, ViewMountParams, ViewStatsParams,
+    ViewStatsReport, ViewUnmountParams, XattrOp, XattrParams, XattrResult,
 };
 use constellation_control::proto::ControlError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// The fake's accounting index ([`InMemoryControl::set_size_index`]).
+#[derive(Clone)]
+pub enum SizeIndex {
+    /// Current: a row's live `refer` is the function's answer.
+    Ok(Arc<dyn Fn(&SnapshotStatus) -> u64 + Send + Sync>),
+    Building,
+    Off,
+}
 
 /// One directory entry: its extended attributes and its own subtree quota
 /// (plan 37 §5's `quota.set{subtree}`; the root's is the filesystem-wide
@@ -130,6 +139,10 @@ pub struct InMemoryControl {
     clone_failures: AtomicU32,
     /// Every `snapshot.list` call.
     snapshot_lists: AtomicU64,
+    sized_snapshot_lists: AtomicU64,
+    /// The accounting index `snapshot.list{sizes}` answers from
+    /// ([`InMemoryControl::set_size_index`]); `None` reports no sizes.
+    size_index: Mutex<Option<SizeIndex>>,
     /// Plan 37 §8's socket handoff, as a sender and as a standby.
     handoff: Mutex<FakeHandoff>,
     /// Every `browse.delete` that removed something.
@@ -220,6 +233,8 @@ impl InMemoryControl {
             clones: AtomicU64::new(0),
             clone_failures: AtomicU32::new(0),
             snapshot_lists: AtomicU64::new(0),
+            sized_snapshot_lists: AtomicU64::new(0),
+            size_index: Mutex::new(None),
             handoff: Mutex::default(),
             deletes: AtomicU64::new(0),
             delete_failures: AtomicU32::new(0),
@@ -769,6 +784,19 @@ impl InMemoryControl {
     /// How many `snapshot.list` calls arrived.
     pub fn snapshot_lists(&self) -> u64 {
         self.snapshot_lists.load(Ordering::SeqCst)
+    }
+
+    /// How many `snapshot.list` calls asked for sizes (`sizes: true`, which
+    /// makes the engine wait for its index).
+    pub fn sized_snapshot_lists(&self) -> u64 {
+        self.sized_snapshot_lists.load(Ordering::SeqCst)
+    }
+
+    /// Have `snapshot.list` answer with plan 32's sizes in `state` (`None`:
+    /// none, as before the index existed); with `Ok`, every row's live
+    /// `refer` is `refer(row)`.
+    pub fn set_size_index(&self, index: Option<SizeIndex>) {
+        *self.size_index.lock().unwrap() = index;
     }
 
     /// Every snapshot this filesystem holds, as `snapshot.list` reports it.
@@ -1334,14 +1362,35 @@ impl ControlClient for InMemoryControl {
         self.note("snapshot.list");
         self.gate_check()?;
         self.snapshot_lists.fetch_add(1, Ordering::SeqCst);
+        if params.sizes {
+            self.sized_snapshot_lists.fetch_add(1, Ordering::SeqCst);
+        }
         let state = self.state.lock().unwrap();
         let path = params.path.as_deref().map(normalize);
+        let index = self.size_index.lock().unwrap().clone();
         let snapshots = state
             .snapshots
             .iter()
             .map(|s| &s.status)
             .filter(|s| path.as_deref().is_none_or(|p| s.path == p))
             .cloned()
+            .map(|mut s| {
+                // The engine fills sizes only for a caller that asked, or
+                // when the index is current anyway (plan 32 §6.3).
+                match &index {
+                    Some(SizeIndex::Ok(refer)) => {
+                        s.refer = Some(refer(&s));
+                        s.size_state = Some(SizeState::Ok);
+                    }
+                    Some(SizeIndex::Building) if params.sizes => {
+                        s.size_state = Some(SizeState::Building);
+                        s.building_pct = Some(40);
+                    }
+                    Some(SizeIndex::Off) if params.sizes => s.size_state = Some(SizeState::Off),
+                    _ => {}
+                }
+                s
+            })
             .collect();
         Ok(SnapshotListing { snapshots })
     }

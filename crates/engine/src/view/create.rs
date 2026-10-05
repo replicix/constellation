@@ -25,7 +25,46 @@ pub(super) fn may_open(caller: &Caller, attr: &FileAttr, flags: OpenFlags) -> bo
     (!read || bits & 4 != 0) && (!write || bits & 2 != 0)
 }
 
+/// `S_ISGID` on a directory: its new entries take its group, and its new
+/// subdirectories the bit (POSIX `open`/`mkdir`; Linux `inode_init_owner`).
+const S_ISGID: u32 = 0o2000;
+
 impl View {
+    /// The owner `(uid, gid)` and mode of a new entry `caller` makes in
+    /// `parent` from the requested `mode`, as Linux's `inode_init_owner`
+    /// gives them: in a set-group-ID directory the entry takes the
+    /// directory's group instead of the caller's, and a new subdirectory
+    /// (`dir`) inherits the bit. Under FUSE this is the filesystem's job —
+    /// the kernel sends the caller's gid and leaves it at that (it has
+    /// already stripped `S_ISGID` from a new file's mode when the caller
+    /// may not have it, `mode_strip_sgid`). Kubernetes' `fsGroup` (plan 37
+    /// settled decision 11) rests on it: kubelet marks the volume root
+    /// `g+s` with the pod's group, so every file a pod creates is the
+    /// group's. An unreadable parent leaves the caller's group, as before.
+    pub(super) fn new_owner(
+        &self,
+        caller: &Caller,
+        parent: Ino,
+        mode: u32,
+        dir: bool,
+    ) -> (u32, u32, u32) {
+        let (uid, gid) = self.policies.identity.owner(caller);
+        let parent_attr = match self.meta.getattr(parent) {
+            Ok(Some(a)) => Some(a),
+            Ok(None) => self.meta.scratch_getattr(parent).ok().flatten(),
+            Err(e) => {
+                tracing::debug!(parent, error = %e, "new_owner: parent unreadable, keeping the caller's group");
+                None
+            }
+        };
+        match parent_attr {
+            Some(p) if p.mode & S_ISGID != 0 => {
+                (uid, p.gid, if dir { mode | S_ISGID } else { mode })
+            }
+            _ => (uid, gid, mode),
+        }
+    }
+
     /// `create(2)` as POSIX has it: create `name` in `parent`, or — when
     /// the name exists and `flags` lacks `O_EXCL` — open what is there.
     /// `Ok((attr, created))`.
@@ -66,13 +105,14 @@ impl View {
         let excl = flags.contains(OpenFlags::EXCL);
         let scratch = self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some();
+        let (uid, gid, mode) = self.new_owner(caller, parent, mode, false);
         let mut attempt = 0;
         loop {
             attempt += 1;
             let ino = self.meta.allocate_ino(parent).map_err(|e| e.code())?;
             let created = if scratch {
                 self.meta
-                    .scratch_create(parent, name, ino, mode, caller.uid, caller.gid)
+                    .scratch_create(parent, name, ino, mode, uid, gid)
                     .map_err(|e| e.code())
             } else {
                 self.mutate_op(
@@ -82,8 +122,8 @@ impl View {
                         name: name.to_string(),
                         ino,
                         mode,
-                        uid: caller.uid,
-                        gid: caller.gid,
+                        uid,
+                        gid,
                     },
                 )
                 .and_then(|()| {

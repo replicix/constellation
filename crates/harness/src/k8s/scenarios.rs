@@ -111,6 +111,27 @@ pub const K8S_SCENARIOS: &[K8sScenario] = &[
         gate: None,
     },
     K8sScenario {
+        name: "csi-static-provisioning",
+        desc: "a human seeds /datasets/set1 inside a pool with the CLI; a PersistentVolume naming <fs-uuid>/datasets/set1 (no StorageClass, Retain, ROX) binds by name, mounts read-only on both workers with the human's tree, refuses writes (EROFS), made no volume (no CreateVolume); the human's later additions reach both pods",
+        workers: 2,
+        run: super::pool_access::csi_static_provisioning,
+        gate: None,
+    },
+    K8sScenario {
+        name: "csi-human-cli-mount",
+        desc: "a human mounts a PV's subtree with `constellation mount pool:/volumes/<pv>` outside Kubernetes while a pod uses it: alternating writes converge both ways (close-to-open); the PV's 32 MiB quota refuses the human's and then the pod's writes past it and the pod's df counts the human's bytes; the human's rm -rf of another staged volume is not prevented and its node reports it abnormal (NodeGetVolumeHealth VolumeRemoved, DATA_LOSS), the other volumes healthy",
+        workers: 2,
+        run: super::pool_access::csi_human_cli_mount,
+        gate: None,
+    },
+    K8sScenario {
+        name: "csi-shard-routing",
+        desc: "16 PVs of a `shards: 4` class: each on the shard its name hashes to and its id encodes, one filesystem per shard; node-owned engine pods exactly for the (shard, node) pairs in use, before and after every PV restages on the other worker (trees intact, idle ones collected); clones stay in their sources' shards; a clone through a 2-shard class of the same pool from shard 2/3 is refused INVALID_ARGUMENT and stays Pending",
+        workers: 2,
+        run: super::pool_access::csi_shard_routing,
+        gate: None,
+    },
+    K8sScenario {
         name: "csi-pod-security",
         desc: "the privilege split of plan 37 §9, as PodSecurity admission judges it (server dry runs in a `restricted` namespace): controller and controller-owned engine pod admitted, node-owned engine pods refused for their hostPaths only, the node plugin refused as privileged",
         workers: 1,
@@ -121,10 +142,10 @@ pub const K8S_SCENARIOS: &[K8sScenario] = &[
 
 /// Cross-node visibility (log shipping + FUSE attribute TTLs) is
 /// asynchronous; this bounds how long a reader may lag.
-const CONVERGE: Duration = Duration::from_secs(120);
+pub(super) const CONVERGE: Duration = Duration::from_secs(120);
 
 /// `pod`'s view of `claim` equals `model` now.
-fn verify(s: &Scope, pod: &str, claim: &str, model: &Model) -> Result<()> {
+pub(super) fn verify(s: &Scope, pod: &str, claim: &str, model: &Model) -> Result<()> {
     let seen = s.listing(pod, &data_dir(claim))?;
     model
         .verify_observed(&seen)
@@ -136,7 +157,7 @@ fn verify(s: &Scope, pod: &str, claim: &str, model: &Model) -> Result<()> {
 /// close sees it within the visibility bound, so a reader is given time —
 /// and nothing about what it sees in the meantime is asserted (a read
 /// racing the replica's catch-up is not covered by close-to-open).
-fn converge(s: &Scope, pod: &str, claim: &str, model: &Model) -> Result<()> {
+pub(super) fn converge(s: &Scope, pod: &str, claim: &str, model: &Model) -> Result<()> {
     eventually(
         &format!("{pod}'s view of {claim} matches the model"),
         CONVERGE,
@@ -690,7 +711,7 @@ fn snapshot_source(name: &str) -> serde_json::Value {
 }
 
 /// A `dataSource` naming PVC `name` (a clone).
-fn pvc_source(name: &str) -> serde_json::Value {
+pub(super) fn pvc_source(name: &str) -> serde_json::Value {
     serde_json::json!({"kind": "PersistentVolumeClaim", "name": name})
 }
 

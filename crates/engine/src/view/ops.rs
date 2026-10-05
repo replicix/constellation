@@ -419,7 +419,7 @@ impl Vfs for View {
             Ok(ino) => ino,
             Err(e) => return r.done(err(e.code())),
         };
-        let (uid, gid) = self.policies.identity.owner(cx.caller);
+        let (uid, gid, mode) = self.new_owner(cx.caller, parent, mode & 0o7777, false);
         let op = if kind == InodeKind::File {
             constellation_meta::MutateOp::Create {
                 parent,
@@ -470,7 +470,7 @@ impl Vfs for View {
             Ok(ino) => ino,
             Err(e) => return r.done(err(e.code())),
         };
-        let (uid, gid) = self.policies.identity.owner(cx.caller);
+        let (uid, gid, mode) = self.new_owner(cx.caller, parent, mode, true);
         if self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some()
         {
@@ -515,7 +515,8 @@ impl Vfs for View {
             Ok(ino) => ino,
             Err(e) => return r.done(err(e.code())),
         };
-        let (uid, gid) = self.policies.identity.owner(cx.caller);
+        // A symlink's mode is fixed (0777): only the group is inherited.
+        let (uid, gid, _) = self.new_owner(cx.caller, parent, 0o777, false);
         let op = constellation_meta::MutateOp::Symlink {
             parent,
             name: name.into_owned(),

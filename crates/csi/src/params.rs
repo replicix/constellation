@@ -633,6 +633,14 @@ mod tests {
         assert!(seen.iter().all(|n| *n > 50), "{seen:?}");
         let one = ClassParams::parse(&params(&[("bucket", "b")])).unwrap();
         assert_eq!(one.shard_for("anything"), 0);
+        // Pinned: `harness`'s copy (`k8s::pool_access::shard_for`) is
+        // tested against the same values.
+        let four = ClassParams::parse(&params(&[("bucket", "b"), ("shards", "4")])).unwrap();
+        let got: Vec<u32> = ["pvc-0", "pvc-1", "pvc-2", "pvc-3", "pvc-7a1c"]
+            .iter()
+            .map(|n| four.shard_for(n))
+            .collect();
+        assert_eq!(got, [1, 2, 3, 0, 3]);
     }
 
     #[test]

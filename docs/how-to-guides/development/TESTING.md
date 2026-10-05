@@ -3717,7 +3717,7 @@ real store with no spawned tasks.
   subtree walk costs about 0.45 µs per entry warm; no CSI controller RPC
   pays it on a capped volume.
 
-### Kubernetes lane: `harness k8s-scenario` (plan 37 §12, K3, K4, K5, K6)
+### Kubernetes lane: `harness k8s-scenario` (plan 37 §12, K3, K4, K5, K6, K7)
 
 Scenarios that only exist behind the CSI driver run in their own harness
 mode, `harness k8s-scenario <name>... | --all` (`--list` names them; they
@@ -3818,6 +3818,9 @@ target: `Model::verify_observed`). Cross-node expectations use
 | `csi-snapshot-clone-mount` | A pod on worker 1 writes a seeded tree and a 64 MiB file into a PVC; a `VolumeSnapshot` of it is ready with the handle `<volume handle>@snapshot-<uid>` and a `restoreSize` of at least the data; the source then moves on (more ops, the big file removed). A PVC restored from the snapshot and a PVC cloned from the source bind in the source's pool filesystem, and the controller logged a metadata-only `clone.create` for each (under 10 s with the 64 MiB file in the tree; the run prints the times). A pod on worker 2 sees the restore as the tree at the snapshot (big file's SHA-256 intact) and the clone as the tree now; writes into the clone and the restore leave the source's tree as it was. |
 | `csi-engine-pod-handoff-under-load` | Plan 37 K5's headline gate (§8). A pod on worker 1 runs `upgrade-under-load`'s trio against an RWO PV of a `static-ephemeral` pool class: `constellation-pod-load` (`crates/pod-load`, a static binary in the CSI image) appends 4 KiB records through one held descriptor at 512 KiB/s with an `fsync` every 16, creates and closes 10 files a second, and re-reads a 256 KiB file 10 times a second through a held descriptor and a fresh `open`; every call is timed, every failure counted by errno (a short write or a wrong read counts as one), the final `fsync` and every `close(2)` checked. Then the chart's image tag flips (`<image>` ↔ `<image>-next`, the same image under a second tag; `helm upgrade --reuse-values`, no `--wait`), and the restarted node plugin hands the engine pod's FUSE session to a replacement. Checks: the replacement on the new image is Ready on worker 1 and the old pod is gone (within 900 s); the plugin logged the handoff as succeeded at the first attempt (no rollback, loss or partial resume for the unit); the replacement took its credentials from the handoff; the staging mount has the same mount id; the trio keeps going 10 s past the cutover; **zero errors of any kind**. A `VolumeSnapshot` is requested as soon as the replacement waits as a standby; when it was cut is reported (bracketed by the request, or the `VolumeSnapshotContent`'s creation if later, and the engine's snapshot row, the content's `status.creationTime`), not required to fall inside the handoff. After the load pod is gone and the volume unstaged, a pod on worker 2 (its own engine pod) reads every file back: the tree equals the model rebuilt from the seed and the trio's counts (sizes and SHA-256, every acknowledged byte); the PVC restored from the snapshot holds a state the trio went through (`fixed` whole, every other file a prefix of its final contents, nothing else) and at least what was acknowledged before the cut's lower bound (every record a returned `fsync` covered, every `created/` file a returned `close` ended; the trio timestamps each). Measured per run: `pause_ms` (the trio's longest call overlapping the plugin's window, counted whole: the client-visible pause, and the gated value; 0 when no call of 100 ms or more overlapped it), `handoff_ms` (the plugin's `elapsed`, `Prepare` sent to `Resumed` seen), the longest call overall and when it started relative to the window, the rollout time, the call count, and the snapshot's request and cut bracket relative to the window (`snapshot_asked_ms`, `snapshot_cut_from_ms`, `snapshot_cut_by_ms`) with its records and the records acknowledged before it. Diagnostics: the old engine pod's, the replacement's and the pool's root's logs are followed (`kubectl logs -f`; a root that appears later is followed from then, and a follow that cannot start is printed), and printed around every error (the old pod is gone by the verdict); a call caught by the handoff that outlasts its window by over 1 s prints what the replacement and the root logged meanwhile; a snapshot cut over 5 s after its request prints what the engines logged about snapshots or as warnings meanwhile. |
 | `csi-clone-cross-pool-refused` | Two pool classes (two filesystems). Within the source's pool, a PVC clone and a restore from a `VolumeSnapshot` bind in the source's filesystem and hold its tree (read on the other worker). The same clone and restore with the other pool's class get a `ProvisioningFailed` warning with `InvalidArgument` naming both filesystems, and stay `Pending` (plan 37 settled decision 8: never a silent full copy). |
+| `csi-static-provisioning` | Plan 37 K7, settled decision 17. A human (a `Workstation`: a privileged container on the `kind` network running the image's `constellation` CLI, outside Kubernetes) mounts the pool's root (`constellation mount pool:/ … --s3 s3://<bucket>/<prefix>`) and seeds `/datasets/set1` with 3 seeded blocks. A `PersistentVolume` with `volumeHandle: <fs-uuid>/datasets/set1`, the pool in `volumeAttributes`, `ReadOnlyMany`, `Retain`, no class, binds a PVC by name; read-only pods on both workers see the human's tree, and a write fails `EROFS`. No `CreateVolume` happened: the controller's log never names the PV and the pool's `/volumes` holds only the scope's one dynamic volume. 20 more operations by the human reach both pods. |
+| `csi-human-cli-mount` | Plan 37 K7, settled decision 18. A pod on worker 1 uses three PVs; the human mounts one with `constellation mount pool:/volumes/<pv> /mnt/shared`. Four rounds alternate the writer (pod, then human, each starting once its side shows the model): both converge (close-to-open). The 32 MiB PV's quota governs the human. 24 MiB fit, and 16 MiB more are refused (`ENOSPC`). Once the partial write is removed, the pod's `df` shows exactly the human's 24 MiB, and the pod's own 16 MiB write is refused too. The human's `rm -rf` of a third, staged volume's directory is not prevented. Worker 1's node plugin then reports it `DATA_LOSS`/`VolumeRemoved` (`NodeGetVolumeHealth`, read with `constellation-csi --volume-health` in the plugin's container), while the other volumes stay healthy. The human leaves the pool's cluster (`constellation leave`) at the end. |
+| `csi-shard-routing` | Plan 37 K7, §2.3 and settled decisions 7 and 8. 16 PVCs of a `shards: 4` class. Each handle's shard is FNV-1a of the PV name mod 4 (the harness's copy is pinned to the driver's by unit tests), each shard is one filesystem, and no two shards share one. Two pods, eight PVs each, one per worker. Node-owned engine pods exist for exactly the `(shard, node)` pairs in use, each serving its shard's filesystem (`fs-uuid` label, `…/shard-<k>` location). After every PV restages on the other worker, the trees are intact and the engine pods converge to the new pairs (idle ones collected). Clones from two shards bind in their sources' shards (not their own names') with the sources' trees. A clone of a shard-2/3 volume through a 2-shard class of the same pool is refused `INVALID_ARGUMENT` naming the source's filesystem, and stays `Pending`. |
 
 Gate run on the dev box (a created cluster, a prebuilt image; the tag must
 exist in the local docker, or the harness builds it with `make csi-image`):
@@ -3840,6 +3843,27 @@ make csi-image CSI_IMAGE=constellation-csi:k5b
 KIND_CLUSTER=kind-37-k5b target/release/harness k8s-scenario \
     csi-engine-pod-handoff-under-load csi-snapshot-clone-mount --repeat 20 \
     --image constellation-csi:k5b --results-json handoff.json
+```
+
+**Kubernetes external storage e2e (plan 37 K7, §12).** `tests/csi/e2e.sh`
+runs the upstream `e2e.test` (its version must match the kind node image's
+Kubernetes: `$E2E_TEST_BIN`) with
+`-ginkgo.focus='External.Storage' -storage.testdriver=tests/csi/testdriver.yaml`
+against the chart on kind, with a private floci on the `kind` network and
+the two classes the driver definition names (`constellation-e2e`: a pool
+`StorageClass` with `allowVolumeExpansion`, and a `VolumeSnapshotClass`).
+`testdriver.yaml` declares exactly the driver's capabilities, each line
+saying why. There is no skip regex. Every spec the suite skips is listed
+with the suite's reason in `tests/csi/e2e-skips.md` (v1.37.0: 89 specs, 64
+passed, 25 skipped). With the `ginkgo` CLI it runs `$E2E_PROCS` (default
+4) processes. `tests/csi/e2e-tally.py` turns the JUnit report into the
+tally (`target/csi-e2e/<name>.summary.txt`). `E2E_SETUP_ONLY=1` sets the
+cluster up and keeps it, and `E2E_REUSE=1` (with an `E2E_FOCUS` starting
+`External.Storage`) runs against it:
+
+```bash
+E2E_TEST_BIN=~/.local/bin/e2e.test GINKGO_BIN=~/.local/bin/ginkgo \
+    KIND_CLUSTER=csi-e2e tests/csi/e2e.sh
 ```
 
 **PodSecurity check (plan 37 K6 gate).** `tests/csi/podsecurity-check.sh`
@@ -3865,7 +3889,9 @@ KUBECONFIG=/tmp/kubeconfig PSC_STORAGE_CLASS=<class> PSC_IMAGE=<image> \
 
 CI: `csi-unit` (`ci.yml`) runs `cargo test -p constellation-csi`; nightly's
 `csi-sanity` runs `make csi-sanity` on a hosted runner and `kind-e2e` runs
-`tests/csi/sanity-kind.sh` and `harness k8s-scenario --all` on a
+`tests/csi/sanity-kind.sh`, `tests/csi/e2e.sh` (the e2e.test and ginkgo of
+the Kubernetes test tarball matching the pinned `KIND_NODE_IMAGE`) and
+`harness k8s-scenario --all` on a
 self-hosted runner labelled `fuse` (plan 37 "K0 results", question 5: a
 hosted runner's kind nodes are unverified). `kind-e2e` runs only when the
 repository variable `CONSTELLATION_FUSE_RUNNER` is `true`, so a nightly

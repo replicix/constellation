@@ -46,6 +46,17 @@
 //! pagination token is the last id returned (`ABORTED` for anything that is
 //! not such a token), so a snapshot deleted between pages shifts nothing.
 //!
+//! **`size_bytes`** (the content's `restoreSize`) is the accounting index's
+//! live `REFER` (plan 32 §6.1: the distinct chunks the snapshot references)
+//! whenever the engine's index answers `ok`, and the row's creation-time
+//! `refer_bytes` while it is `building` or `off` (coordinator decision,
+//! 2026-10-04). No CSI call asks for sizes (`sizes: false`): the engine only
+//! peeks at its index, so the live figure appears once the index is
+//! current, and no call waits for the index or fails on it. A
+//! fresh `CreateSnapshot`'s answer is the engine's new row, which the index
+//! has not seen: `refer_bytes`, and the live figure from the next listing
+//! on.
+//!
 //! **Known gaps.** An unfiltered `ListSnapshots` covers only filesystems with
 //! an engine pod up, so snapshots of idle pools are not listed (a CSI
 //! semantics gap; asking for one `snapshot_id` or source volume reaches it).
@@ -82,8 +93,8 @@ use crate::proto::csi::v1::volume_content_source::Type as SourceType;
 use crate::proto::csi::v1::*;
 use crate::volume_id::{validate_snapshot_name, SnapshotId, VolumeId, VOLUMES_DIR};
 use constellation_control::proto::types::{
-    CloneParams, MkdirParams, SnapshotCreateParams, SnapshotDeleteParams, SnapshotHoldParams,
-    SnapshotListParams, SnapshotStatus, XattrOp, XattrParams,
+    CloneParams, MkdirParams, SizeState, SnapshotCreateParams, SnapshotDeleteParams,
+    SnapshotHoldParams, SnapshotListParams, SnapshotStatus, XattrOp, XattrParams,
 };
 use constellation_control::proto::ErrorKind;
 use std::sync::Arc;
@@ -136,12 +147,24 @@ fn creation_time(row: &SnapshotStatus) -> prost_types::Timestamp {
     }
 }
 
+/// A snapshot's `size_bytes`: the accounting index's live `REFER` (plan 32
+/// §6.1, deduplicated, as of the index's last catch-up) when the index
+/// answers `ok`, else the row's creation-time `refer_bytes` — while the
+/// index is `building` or `off`, and on `CreateSnapshot`'s own answer,
+/// which the index has not seen yet. Reads what a peek found; never a wait.
+fn size_of(row: &SnapshotStatus) -> i64 {
+    let live = match row.size_state {
+        Some(SizeState::Ok) => row.refer,
+        _ => None,
+    };
+    live.or(row.refer_bytes)
+        .map(|b| i64::try_from(b).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
 fn snapshot_of(id: &SnapshotId, row: &SnapshotStatus) -> Snapshot {
     Snapshot {
-        size_bytes: row
-            .refer_bytes
-            .map(|b| i64::try_from(b).unwrap_or(i64::MAX))
-            .unwrap_or(0),
+        size_bytes: size_of(row),
         snapshot_id: id.to_string(),
         source_volume_id: id.volume.to_string(),
         creation_time: Some(creation_time(row)),
@@ -157,7 +180,10 @@ fn csi_id(row: &SnapshotStatus) -> Option<SnapshotId> {
     SnapshotId::parse(owner).ok()
 }
 
-/// Rows of `fs` at exactly `path` (`None`: all of them).
+/// Rows of `fs` at exactly `path` (`None`: all of them). Never asks for
+/// sizes (`sizes: false`): the engine then only peeks at its accounting
+/// index, filling `refer` when the index is current and never waiting for
+/// it ([`size_of`]).
 async fn list(fs: &dyn ControlClient, path: Option<&str>) -> Result<Vec<SnapshotStatus>, Status> {
     fs.snapshot_list(SnapshotListParams {
         path: path.map(str::to_string),
