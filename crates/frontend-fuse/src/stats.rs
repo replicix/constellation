@@ -24,14 +24,15 @@
 //! `io_uring_setup` errno, the value of `fuse.enable_uring`) goes in
 //! [`TransportFallback::detail`], which `node.status` carries and the
 //! metric does not. Each name is a rung of §2.4's ladder that can refuse:
-//! the build, the kernel's offer, the cluster-lock rule of plan 38 Z2c,
-//! the handover pin, and the ring setup.
+//! the build, the kernel's offer, the handover pin, and the ring setup.
+//! (Plan 38 Z2c's `cluster_locks` rung, `auto` keeping a mount with
+//! cluster locks on `/dev/fuse`, was removed by the 2026-10-05 decision.)
 //!
 //! # The first rung that refused
 //!
 //! A session reports the rung that would have refused it first, in the
-//! ladder's order — build, kernel, cluster locks, handover pin, setup —
-//! so a policy reason (`cluster_locks`, `handover_capable`) is named only
+//! ladder's order — build, kernel, handover pin, setup — so the policy
+//! reason (`handover_capable`) is named only
 //! where the ring would otherwise have been granted. A session resumed by
 //! `daemon --upgrade` on a kernel that never offered the ring therefore
 //! keeps reporting `kernel_not_offered` (its handoff carries the original
@@ -68,10 +69,6 @@ pub enum FallbackReason {
     /// The session can be handed to another process image, so it is
     /// pinned to `/dev/fuse` (plan 38 §3(e)) whatever the knob asked.
     HandoverCapable,
-    /// `auto` keeps a mount whose frontend forwards locks to the cluster
-    /// on `/dev/fuse` (plan 38 Z2c; [`TransportPolicy`]'s doc):
-    /// `--fuse-transport uring` is the opt-in.
-    ClusterLocks,
     /// This binary was built without the `io-uring` feature.
     NoIoUringFeature,
     /// The kernel's `FUSE_INIT` did not offer `FUSE_OVER_IO_URING`
@@ -88,7 +85,6 @@ impl FallbackReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::HandoverCapable => "handover_capable",
-            Self::ClusterLocks => "cluster_locks",
             Self::NoIoUringFeature => "no_io_uring_feature",
             Self::KernelNotOffered => "kernel_not_offered",
             Self::RingSetupFailed => "ring_setup_failed",
@@ -119,8 +115,6 @@ pub(crate) struct Handshake<'a> {
     pub asked: TransportPolicy,
     /// The session is handover-capable (pinned to `/dev/fuse`).
     pub pinned: bool,
-    /// `auto` kept it off the ring for its cluster locks.
-    pub held_back_for_locks: bool,
     /// What the handshake recorded (`None` for one that never ran).
     pub init: Option<&'a NegotiatedInit>,
     /// What the session is served over.
@@ -144,8 +138,6 @@ pub(crate) fn classify(h: &Handshake<'_>, feature: bool) -> Option<FallbackReaso
         FallbackReason::NoIoUringFeature
     } else if h.init.is_some_and(|i| !offered(i)) {
         FallbackReason::KernelNotOffered
-    } else if h.held_back_for_locks {
-        FallbackReason::ClusterLocks
     } else if h.pinned {
         FallbackReason::HandoverCapable
     } else {
@@ -159,11 +151,6 @@ fn detail(reason: FallbackReason) -> String {
         FallbackReason::HandoverCapable => {
             "the session can be handed to another process image, so it stays on /dev/fuse \
              (a ring session cannot be detached)"
-        }
-        FallbackReason::ClusterLocks => {
-            "the mount forwards locks to the cluster, and transport auto keeps such a mount on \
-             /dev/fuse (a blocked lock wait holds a ring entry; --fuse-transport uring opts in \
-             and answers contended waits past the queue's budget with ENOLCK)"
         }
         FallbackReason::NoIoUringFeature => "this build has no io-uring feature",
         FallbackReason::KernelNotOffered => {
@@ -452,14 +439,12 @@ mod tests {
     fn hs(
         asked: TransportPolicy,
         pinned: bool,
-        held_back_for_locks: bool,
         init: Option<&NegotiatedInit>,
         negotiated: Transport,
     ) -> Handshake<'_> {
         Handshake {
             asked,
             pinned,
-            held_back_for_locks,
             init,
             negotiated,
             uring_queue_depth: 8,
@@ -474,40 +459,30 @@ mod tests {
         let (on, off) = (Some(init(true)), Some(init(false)));
         let c = |h: Handshake<'_>, feature: bool| classify(&h, feature);
         // Never asked, or granted: nothing to record.
-        assert_eq!(c(hs(DevFuse, false, false, off.as_ref(), dev), true), None);
-        assert_eq!(c(hs(DevFuse, true, false, None, dev), false), None);
+        assert_eq!(c(hs(DevFuse, false, off.as_ref(), dev), true), None);
+        assert_eq!(c(hs(DevFuse, true, None, dev), false), None);
         for asked in [Auto, Uring] {
             assert_eq!(
-                c(hs(asked, false, false, on.as_ref(), Transport::Uring), true),
+                c(hs(asked, false, on.as_ref(), Transport::Uring), true),
                 None
             );
             assert_eq!(
-                c(hs(asked, false, false, on.as_ref(), dev), false),
+                c(hs(asked, false, on.as_ref(), dev), false),
                 Some(NoIoUringFeature)
             );
             assert_eq!(
-                c(hs(asked, false, false, off.as_ref(), dev), true),
+                c(hs(asked, false, off.as_ref(), dev), true),
                 Some(KernelNotOffered)
             );
             assert_eq!(
-                c(hs(asked, false, false, on.as_ref(), dev), true),
+                c(hs(asked, false, on.as_ref(), dev), true),
                 Some(RingSetupFailed)
             );
         }
-        // The policy rungs, named only where the ring was on offer.
+        // The policy rung, named only where the ring was on offer.
         assert_eq!(
-            c(hs(Auto, false, true, on.as_ref(), dev), true),
-            Some(ClusterLocks)
-        );
-        assert_eq!(
-            c(hs(Auto, true, false, on.as_ref(), dev), true),
+            c(hs(Auto, true, on.as_ref(), dev), true),
             Some(HandoverCapable)
-        );
-        // A pinned mount with cluster locks under `auto` would not have
-        // had the ring anyway: the earlier rung is the one named.
-        assert_eq!(
-            c(hs(Auto, true, true, on.as_ref(), dev), true),
-            Some(ClusterLocks)
         );
     }
 
@@ -522,15 +497,15 @@ mod tests {
         let off = init(false);
         let on = init(true);
         assert_eq!(
-            classify(&hs(Auto, true, false, Some(&off), dev), true),
+            classify(&hs(Auto, true, Some(&off), dev), true),
             Some(FallbackReason::KernelNotOffered)
         );
         assert_eq!(
-            classify(&hs(Auto, true, false, Some(&on), dev), false),
+            classify(&hs(Auto, true, Some(&on), dev), false),
             Some(FallbackReason::NoIoUringFeature)
         );
         assert_eq!(
-            classify(&hs(Auto, true, false, Some(&on), dev), true),
+            classify(&hs(Auto, true, Some(&on), dev), true),
             Some(FallbackReason::HandoverCapable)
         );
     }
@@ -545,13 +520,7 @@ mod tests {
         let mut old = init(false);
         old.kernel_flags = (InitFlags::all() - InitFlags::FUSE_OVER_IO_URING).bits();
         old.kernel_minor = 40;
-        let h = hs(
-            TransportPolicy::Auto,
-            false,
-            false,
-            Some(&old),
-            Transport::DevFuse,
-        );
+        let h = hs(TransportPolicy::Auto, false, Some(&old), Transport::DevFuse);
         assert_eq!(classify(&h, true), Some(FallbackReason::KernelNotOffered));
         let mut new = old;
         new.kernel_flags |= InitFlags::FUSE_OVER_IO_URING.bits();
@@ -614,8 +583,7 @@ mod tests {
         let offered = init(true);
         let stats = SessionStats::at_handshake(
             hs(
-                TransportPolicy::Uring,
-                false,
+                TransportPolicy::Auto,
                 false,
                 Some(&offered),
                 Transport::Uring,

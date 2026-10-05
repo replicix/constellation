@@ -2502,8 +2502,8 @@ which one a mount gets is decided at runtime by the policy and the host:
 
 | `CONSTELLATION_FUSE_TRANSPORT` / `--fuse-transport` | what a mount gets |
 |---|---|
-| `auto` (**the default**; `dev-fuse` under `CONSTELLATION_PROFILE=mobile`) | plan 38 §2.4's ladder — FUSE-over-io_uring when the kernel is 6.14+ with `fuse.enable_uring=Y` and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once and reported in `node.status`. **A mount with cluster locks** (`--locks cluster`, the default with P2P — so almost every harness mount) **stays on `/dev/fuse`**, recorded as a `cluster_locks` fallback |
-| `uring` | the same ladder for every plain mount, cluster-lock ones included, on a deeper queue (32): a contended blocking lock wait past a queue's budget (`depth - 1` waiters per CPU) is answered `ENOLCK` and counted in `lock_wait_downgrades` |
+| `auto` (**the default**; `dev-fuse` under `CONSTELLATION_PROFILE=mobile`) | plan 38 §2.4's ladder — FUSE-over-io_uring when the kernel is 6.14+ with `fuse.enable_uring=Y` and the sandbox permits `io_uring_setup(2)`; `/dev/fuse` otherwise, logged once and reported in `node.status`. **A mount with cluster locks** (`--locks cluster`, the default with P2P — so almost every harness mount) **takes the ladder too** (decided 2026-10-05), on a deeper queue (32): a contended blocking lock wait past a queue's budget (`depth - 1` waiters per CPU) is answered `ENOLCK` and counted in `lock_wait_downgrades` |
+| `uring` | the same ladder as `auto` (until 2026-10-05, the opt-in that put cluster-lock mounts on the ring) |
 | `dev-fuse` | `read(2)`/`writev(2)` on `/dev/fuse`: every kernel, every platform |
 
 What a mount *negotiated* is in `node.status`'s per-mount `transport`
@@ -2538,9 +2538,20 @@ daemon the harness started records its mounts' `FUSE transport` lines in
 `target/transport-matrix/<leg>.census.tsv` (`scenario client transport
 reason`, via `CONSTELLATION_HARNESS_TRANSPORT_CENSUS`), and the script
 prints how many mounts got each transport and why the rest fell back. That
-is how a leg says what it actually covered: the `auto` leg is mostly
-`dev_fuse (cluster_locks)` by design, the `uring` leg is the one that puts
-the matrix on the ring. **No leg ever skips.**
+is how a leg says what it actually covered: on a ring host the `auto` and
+`uring` legs put the matrix on the ring (handover-capable mounts excepted),
+on any other host they are fallback legs. **No leg ever skips.**
+
+`CONSTELLATION_HARNESS_DAEMON_CENSUS=<file>` (any `harness run`, off by
+default) is the census's counterpart for what the census cannot see from a
+log: just before a client's daemon is unmounted or killed, the harness reads
+its `node.status` and `/proc/<pid>/stat` and appends `scenario client when
+transports depths lock_wait_downgrades_total cpu_s` (`when` is `unmount`,
+`kill9` or `drop`). Summed per scenario it says whether the ring's lock-wait
+budget ever answered a workload's blocking lock non-blocking, and what the
+daemons cost in CPU (how the 2026-10-05 cluster-lock decision was measured,
+PROGRESS "cluster-lock-ring-auto"). A frozen daemon (`SIGSTOP`) records
+nothing; the status call costs up to 2 s before such a kill.
 
 On a kernel below 6.14, with `fuse.enable_uring=N`, or under a seccomp
 profile that denies `io_uring_setup`, the `auto` and `uring` legs run as
@@ -2553,8 +2564,9 @@ and that scenario fails if its mount negotiated `dev_fuse`.
 `EXPECT_URING=0|1` overrides the detection.
 
 The `transport-detach-refused` scenario is in the default list. It asks for
-`uring` itself (its daemon has cluster locks, which `auto` keeps on
-`/dev/fuse`) and is **one scenario with two expected outcomes**, keyed on
+`auto` itself (so it asks the same question on every leg; its daemon has
+cluster locks, which `auto` puts on the ring since 2026-10-05) and is **one
+scenario with two expected outcomes**, keyed on
 what it negotiated: on a ring session `daemon --upgrade` must be refused
 with an error naming the transport, losing no request and leaving the
 mount serving under the same pid and generation; on a session that fell
@@ -2617,12 +2629,12 @@ leg with its own baseline (`read-cpu-uring-runner-baseline-<leg>.json`,
 created — blessed — by the leg's first run on a fresh checkout and uploaded
 with the artifacts), never one transport's numbers with another's.
 
-### Cluster locks on the ring (plan 38 Z2c)
+### Cluster locks on the ring (plan 38 Z2c, decided 2026-10-05)
 
 | scenario | what it checks | runs on |
 |---|---|---|
-| `transport-cluster-locks-auto` | `auto` keeps a cluster-lock mount on `dev_fuse` with a `cluster_locks` fallback (one `FUSE transport (fell back)` line, `node.status`, counted once) and it serves; `--locks local` gets the ring under `auto` (depth 8); `uring` puts the cluster-lock mount on the ring at depth 32. Off a ring host, every leg is `dev_fuse` and names the earlier rung | every host |
-| `transport-lock-wait-budget` | **real kernel**: a cluster-lock mount on `uring`, `depth + 3` processes pinned to one CPU (`taskset`) blocking in `F_SETLKW` while a process on the same CPU holds the lock. `depth - 1` wait, the rest get `ENOLCK` at once, a `stat` from that CPU is served, the holder's `write` and unlock go through, every waiter that waited is granted, and `lock_wait_downgrades` (per mount and process-wide) equals the refusals. At depth 4 and at the shipped 32 | ring hosts (`fuse-uring`, `taskset`) |
+| `transport-cluster-locks-auto` | `auto` puts a cluster-lock mount on the ring at depth 32 (no fallback, no lock-wait downgrade, one `FUSE transport` line) and it serves; an explicit `CONSTELLATION_FUSE_URING_QUEUE_DEPTH=16` wins; `--locks local` gets depth 8; `uring` is the same as `auto`; `daemon --upgrade` of the `auto` mount is refused on the ring (naming the transport, the mount keeps serving) and served on a fallback (the resumed mount keeps its first rung). Off a ring host, every leg is `dev_fuse` and names a rung other than the locks | every host |
+| `transport-lock-wait-budget` | **real kernel**: a cluster-lock mount on the ring under `auto`, `depth + 3` processes pinned to one CPU (`taskset`) blocking in `F_SETLKW` while a process on the same CPU holds the lock. `depth - 1` wait, the rest get `ENOLCK` at once, a `stat` from that CPU is served, the holder's `write` and unlock go through, every waiter that waited is granted, and `lock_wait_downgrades` (per mount and process-wide) equals the refusals. At depth 4 and at the shipped 32 | ring hosts (`fuse-uring`, `taskset`) |
 
 ### Every downgrade, injected (plan 38 Z2a)
 
@@ -2655,9 +2667,10 @@ ordinary host-visible one (`crates/harness/src/sandbox.rs`).
 
 Every one of them also requires `node.status` to say why: the mount's
 `last_fallback.reason` is one of the fixed names (`no_io_uring_feature`,
-`kernel_not_offered`, `cluster_locks`, `handover_capable`,
-`ring_setup_failed`) and `fuse.transport_fallbacks` counts exactly that one
-fallback. They ask for `uring` (the harness's daemons have cluster locks).
+`kernel_not_offered`, `handover_capable`, `ring_setup_failed`; plan 38 Z2c's
+`cluster_locks` was removed on 2026-10-05) and `fuse.transport_fallbacks`
+counts exactly that one fallback. They ask for `auto`, which puts the
+harness's cluster-lock mounts on the ring.
 The kernel-below-6.14 rung cannot be provoked on a ring host; it is covered
 by `frontend-fuse`'s `stats::an_init_without_the_ring_bit_is_kernel_not_offered`,
 which feeds the classification a negotiated `FUSE_INIT` without the ring
@@ -2673,9 +2686,9 @@ POSIX compliance is gated per transport (plan 38 §6), still 8798/8798
 with no exceptions:
 
 ```bash
-docker compose --profile test run --rm compliance          # auto (dev_fuse: cluster locks)
+docker compose --profile test run --rm compliance          # auto (dev_fuse: the default seccomp denies the ring)
 docker compose --profile test run --rm -e CONSTELLATION_FUSE_TRANSPORT=dev-fuse compliance
-make compliance-uring                                     # uring
+make compliance-uring                                     # uring (the ring: seccomp unconfined)
 ```
 
 `compliance-uring` is a separate compose service (same image: the binary
@@ -2685,8 +2698,9 @@ profile blocks `io_uring_setup(2)` outright, and a blocked setup leaves
 nothing in sysfs to see — the mount would quietly fall back and the lane
 would pass while testing nothing (plan 38 §8). The relaxation is on that
 service only; `smoke`/`compliance`/`stress` keep running under an ordinary
-container profile on purpose. It asks for `uring`, because the suite's
-mount has cluster locks and `auto` would keep it on `/dev/fuse`.
+container profile on purpose. It asks for `uring`, the same ladder as `auto`
+since 2026-10-05 (before, `auto` kept the suite's cluster-lock mount on
+`/dev/fuse`).
 
 Each run prints the transport it actually negotiated before it starts
 (`FUSE transport: uring (asked for uring)`), read back from `node.status`:
@@ -2756,7 +2770,7 @@ passthrough scenarios need root:
 | `passthrough-handover` | a passthrough handle held across `daemon --upgrade`: the new image counts it and holds its pin (a prune keeps the chunk), a new open of the file shares the handed-over backing id, the close releases both |
 | `passthrough-disabled-by-verify-always` | `--cache-verify always`: `enabled = false`, reason `cache_verify_always`, no pin, every read reaches the daemon — privileged or not (it requires nothing) |
 | `passthrough-default-by-mount-mode` | without the opt-in: a writable mount reports reason `writable_mount`, holds no passthrough handle and serves a read-write open beside a reader; a read-only mount of a snapshot of the same file negotiates passthrough (no reason); with the daemon's memory tier on (the default) the verifying first read admits the chunk to memory and the next open is **not** passthrough (a chunk held in memory never is, plan 38 Z3c), and on a second snapshot mount with `CONSTELLATION_CHUNK_MEMCACHE_BYTES=0` it serves the frozen file by passthrough: the first open after the new daemon's start is ordinary (its read verifies the chunk the daemon found on disk), the next is counted and pinned (`(opens, open_pins) = (1, 1)`, `opens_total` ≥ 1), reads byte-exact with neither the `read` series nor `cache.memory_misses` moving, a read-write open beside it is `EROFS` and leaves the counts alone, and the close releases the pin |
-| `passthrough-on-every-transport` | plan 38 Z2c with Z3b/Z3c: one read-only snapshot mount per policy (`dev-fuse`, `auto`, `uring`). Before any open, the mount reports the transport and fallback the ladder gives it (`dev-fuse`: `dev_fuse`, no fallback; `auto` and `uring`: the ring on a ring host — a frozen view has no cluster locks, so `auto` does not hold it back — and elsewhere a fallback naming an earlier rung, never `cluster_locks`, counted once). Then passthrough serves a verified chunk's open on that transport: counted and pinned `(1, 1)`, byte-exact, no read reaching the daemon, released at the close |
+| `passthrough-on-every-transport` | plan 38 Z2c with Z3b/Z3c: one read-only snapshot mount per policy (`dev-fuse`, `auto`, `uring`). Before any open, the mount reports the transport and fallback the ladder gives it (`dev-fuse`: `dev_fuse`, no fallback; `auto` and `uring`: the ring on a ring host, and elsewhere a fallback naming an earlier rung, counted once). Then passthrough serves a verified chunk's open on that transport: counted and pinned `(1, 1)`, byte-exact, no read reaching the daemon, released at the close |
 
 All but `passthrough-disabled-by-verify-always` `require` `CAP_SYS_ADMIN` and `linux>=6.9` — `requires`
 entries that name a host capability rather than a binary

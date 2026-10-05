@@ -1325,6 +1325,17 @@ additions are listed below.
   path — on a daemon or a headless `serve` node, CSI engine pods included —
   is a plain mount and follows the same policy. The handoff now carries
   `uring` and a per-mount (absent) queue depth, so `HANDOVER_VERSION` is 6.
+
+  **Decided (project owner, 2026-10-05): yes — option (a) with the deeper
+  queue.** The close-out's open question (PROGRESS "Plan 38 — close-out") is
+  answered: under `auto` a cluster-lock mount takes the ladder like any plain
+  mount, at queue depth 32 unless `--fuse-uring-queue-depth` says otherwise,
+  accepting the `depth - 1` lock-wait budget and its `ENOLCK` (counted in
+  `lock_wait_downgrades`). The `cluster_locks` fallback rung is removed, with
+  no compatibility kept; `uring` is now the same ladder as `auto`.
+  Handover-capable mounts and the mobile profile stay `dev_fuse`. What the
+  lock scenarios measured under the new default is in PROGRESS,
+  "cluster-lock-ring-auto". The 2026-10-02 text above is history.
 - **Z3 — Passthrough for single-chunk read-only opens.** §3(c)'s
   eligibility rule, the `Opened`/`View::open` extension, the pin-while-open
   `DiskCache` guard, and the scan-ahead/atime move to `open()` land,

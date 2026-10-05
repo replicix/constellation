@@ -1222,9 +1222,9 @@ mod tests {
     }
 
     /// Plan 38 Z2c: the sessions `daemon --upgrade` resumes are
-    /// `/dev/fuse` whatever the node's knob says — the shipped `auto`, the
-    /// cluster-lock opt-in `uring`, any depth — while the views the new
-    /// image mounts afterwards (plain ones) take the knob.
+    /// `/dev/fuse` whatever the node's knob says — the shipped `auto`,
+    /// `uring`, any depth — while the views the new image mounts
+    /// afterwards (plain ones) take the knob.
     #[test]
     fn an_upgrade_target_session_is_pinned_to_dev_fuse() {
         use constellation_frontend_fuse::{TransportConfig, TransportPolicy};

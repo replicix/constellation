@@ -589,8 +589,7 @@ pub struct FuseFallback {
     /// What the connection got (`dev_fuse`).
     pub to: String,
     /// The rung that refused, a fixed name: `no_io_uring_feature`,
-    /// `kernel_not_offered`, `cluster_locks`, `handover_capable`,
-    /// `ring_setup_failed`.
+    /// `kernel_not_offered`, `handover_capable`, `ring_setup_failed`.
     pub reason: String,
     /// What refused, as precisely as the daemon knows.
     pub detail: String,

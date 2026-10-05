@@ -75,7 +75,7 @@ use std::time::Duration;
 /// §3(e)). A *policy*, not an outcome: what the connection ended up on is
 /// [`FuseSession::transport`], runtime-negotiated.
 ///
-/// # Cluster locks and the ring (plan 38 Z2c)
+/// # Cluster locks and the ring (plan 38 Z2c, decided 2026-10-05)
 ///
 /// Over a ring every request holds its queue entry until it is answered,
 /// and the kernel queues a CPU's requests behind that CPU's queue only. A
@@ -86,29 +86,30 @@ use std::time::Duration;
 /// past `depth - 1` waiters on one queue as a non-blocking one — granted
 /// if free, `ENOLCK` if contended (`RingCommit::reserve_lock_wait`) —
 /// which removes the deadlock and replaces it with an error that
-/// `/dev/fuse` mounts never return. The maintainer's decision
-/// (2026-10-02): [`Self::Auto`] keeps a mount whose frontend forwards
-/// locks to the cluster ([`FrontendCaps::cluster_locks`], the default
-/// with P2P) on `/dev/fuse`, recorded as a `cluster_locks` fallback;
-/// [`Self::Uring`] is the explicit opt-in that puts such a mount on the
-/// ring anyway, with a deeper queue ([`CLUSTER_LOCKS_URING_QUEUE_DEPTH`])
-/// and every downgrade counted (`lock_wait_downgrades`). To be revisited
-/// after plan 38 Z4's zero-copy numbers.
+/// `/dev/fuse` mounts never return. The project owner's decision
+/// (2026-10-05, replacing Z2c's of 2026-10-02): a mount whose frontend
+/// forwards locks to the cluster ([`FrontendCaps::cluster_locks`], the
+/// default with P2P) takes the ladder under [`Self::Auto`] like any
+/// other plain mount, with a deeper queue
+/// ([`CLUSTER_LOCKS_URING_QUEUE_DEPTH`]) and every downgrade counted
+/// (`lock_wait_downgrades`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TransportPolicy {
     /// Run plan 38 §2.4's ladder: FUSE-over-io_uring when this build
     /// carries the `io-uring` feature and the kernel and the process both
     /// grant it, `/dev/fuse` `writev` whenever anything in that chain
     /// says no. Every refusal is a logged, observable downgrade, never a
-    /// mount failure. A mount with cluster locks stays on `/dev/fuse`
-    /// (see the type's doc). The default for a plain mount since plan 38
-    /// Z2c.
+    /// mount failure. A mount with cluster locks takes the ring too,
+    /// accepting the per-queue lock-wait budget (see the type's doc): at
+    /// most `depth - 1` blocking lock requests of one CPU wait at a time,
+    /// and a further contended one is answered `ENOLCK`. The default for
+    /// a plain mount since plan 38 Z2c.
     #[default]
     Auto,
-    /// [`Self::Auto`], and a mount with cluster locks takes the ring too,
-    /// accepting the per-queue lock-wait budget: at most `depth - 1`
-    /// blocking lock requests of one CPU wait at a time, and a further
-    /// contended one is answered `ENOLCK`.
+    /// The same ladder as [`Self::Auto`]. Until the 2026-10-05 decision
+    /// it was the opt-in that put a mount with cluster locks on the ring;
+    /// it now differs from `auto` only in the name the session reports as
+    /// asked for.
     Uring,
     /// `/dev/fuse` `read`/`writev`, on every kernel and every platform:
     /// the only policy a handover-capable session may have
@@ -258,7 +259,7 @@ impl UringZeroCopy {
 pub const DEFAULT_URING_QUEUE_DEPTH: usize = 8;
 
 /// Ring entries per kernel queue for a mount with cluster locks that
-/// [`TransportPolicy::Uring`] put on the ring (plan 38 Z2c), unless
+/// gets the ring (plan 38 Z2c; under `auto` since 2026-10-05), unless
 /// `--fuse-uring-queue-depth` says otherwise. The lock-wait budget is
 /// `depth - 1` blocked lock waiters per CPU, so 32 lets 31 processes of
 /// one CPU wait for contended locks at once before the next is answered
@@ -283,8 +284,7 @@ pub struct TransportConfig {
     pub policy: TransportPolicy,
     /// `io_uring_queue_depth`, read only when a mount resolves to a ring.
     /// `None`: [`DEFAULT_URING_QUEUE_DEPTH`], or
-    /// [`CLUSTER_LOCKS_URING_QUEUE_DEPTH`] for a mount with cluster locks
-    /// that [`TransportPolicy::Uring`] put on the ring.
+    /// [`CLUSTER_LOCKS_URING_QUEUE_DEPTH`] for a mount with cluster locks.
     pub uring_queue_depth: Option<usize>,
     /// Plan 38 Z3b: which mounts ask for FUSE passthrough — by default the
     /// read-only ones ([`PassthroughPolicy`]; [`PASSTHROUGH_ENV`];
@@ -575,26 +575,17 @@ impl MountOptions {
     }
 
     /// What a mount with these options and `caps` asks fuser for (plan 38
-    /// §2.4 and Z2c's cluster-lock rule, [`TransportPolicy`]'s doc). Pure:
+    /// §2.4; the cluster-lock depth is [`TransportPolicy`]'s doc). Pure:
     /// the build rung is `feature`, so every case is testable on any host.
     fn plan(&self, caps: &FrontendCaps, feature: bool) -> TransportPlan {
-        let cluster_locks = caps.cluster_locks;
-        let wanted = match self.transport {
-            TransportPolicy::DevFuse => false,
-            TransportPolicy::Auto => !cluster_locks,
-            TransportPolicy::Uring => true,
-        };
-        let depth = self.uring_queue_depth.unwrap_or(
-            if cluster_locks && self.transport == TransportPolicy::Uring {
-                CLUSTER_LOCKS_URING_QUEUE_DEPTH
-            } else {
-                DEFAULT_URING_QUEUE_DEPTH
-            },
-        );
+        let depth = self.uring_queue_depth.unwrap_or(if caps.cluster_locks {
+            CLUSTER_LOCKS_URING_QUEUE_DEPTH
+        } else {
+            DEFAULT_URING_QUEUE_DEPTH
+        });
         TransportPlan {
-            ring: wanted && feature,
+            ring: self.transport.asks_for_ring() && feature,
             depth,
-            held_back_for_locks: self.asked == TransportPolicy::Auto && cluster_locks,
         }
     }
 
@@ -640,10 +631,7 @@ impl MountOptions {
                 config.io_uring_malformed_register = uring_fault_malformed_register();
                 config.io_uring_lock_wait_downgrades = Some(lock_waits.hook());
             }
-        } else if !cfg!(feature = "io-uring")
-            && self.transport.asks_for_ring()
-            && !plan.held_back_for_locks
-        {
+        } else if !cfg!(feature = "io-uring") && self.transport.asks_for_ring() {
             // A ladder that degrades: asking for a transport this build
             // cannot speak is a downgrade, not a mount failure (fuser's own
             // `Config::io_uring` would refuse the mount). Logged once per
@@ -666,9 +654,6 @@ struct TransportPlan {
     ring: bool,
     /// `io_uring_queue_depth`, when `ring`.
     depth: usize,
-    /// [`TransportPolicy::Auto`] kept this mount off the ring because its
-    /// frontend has cluster locks: the session's `cluster_locks` fallback.
-    held_back_for_locks: bool,
 }
 
 /// `CONSTELLATION_FUSE_URING_FAULT=malformed-register`: **fault injection,
@@ -1270,7 +1255,6 @@ impl<V: Vfs> FuseSession<V> {
                 Handshake {
                     asked: opts.asked,
                     pinned: opts.handover,
-                    held_back_for_locks: plan.held_back_for_locks,
                     init: session.negotiated_init().as_ref(),
                     negotiated: transport,
                     uring_queue_depth: plan.depth,
@@ -2217,13 +2201,13 @@ mod tests {
         }
     }
 
-    /// Plan 38 Z2c, the maintainer's decision: under `auto` a mount with
-    /// cluster locks stays on `/dev/fuse` (and says so as its fallback);
-    /// `uring` puts it on the ring with the deeper queue; an explicit
-    /// depth wins over both defaults; a mount with local locks gets the
-    /// ring under either policy at the ordinary depth.
+    /// Plan 38 Z2c as decided on 2026-10-05: under `auto` (and `uring`,
+    /// the same ladder) a mount with cluster locks takes the ring with the
+    /// deeper queue; an explicit depth wins over both defaults; a mount
+    /// with local locks gets the ring at the ordinary depth; `dev-fuse`
+    /// asks for no ring.
     #[test]
-    fn auto_keeps_cluster_lock_mounts_on_dev_fuse_and_uring_opts_in() {
+    fn cluster_lock_mounts_take_the_ring_under_auto_with_the_deeper_queue() {
         let opts = |policy, depth| {
             MountOptions::new(
                 "z2c",
@@ -2238,27 +2222,22 @@ mod tests {
         };
         let (local, cluster) = (crate::caps(false), crate::caps(true));
         let plan = |o: &MountOptions, caps| o.plan(caps, true);
-        let p = |ring, depth, held| TransportPlan {
-            ring,
-            depth,
-            held_back_for_locks: held,
-        };
+        let p = |ring, depth| TransportPlan { ring, depth };
         let d = DEFAULT_URING_QUEUE_DEPTH;
         let deep = CLUSTER_LOCKS_URING_QUEUE_DEPTH;
-        let auto = opts(TransportPolicy::Auto, None);
-        assert_eq!(plan(&auto, &local), p(true, d, false));
-        assert_eq!(plan(&auto, &cluster), p(false, d, true));
-        let uring = opts(TransportPolicy::Uring, None);
-        assert_eq!(plan(&uring, &local), p(true, d, false));
-        assert_eq!(plan(&uring, &cluster), p(true, deep, false));
-        let explicit = opts(TransportPolicy::Uring, Some(4));
-        assert_eq!(plan(&explicit, &cluster), p(true, 4, false));
+        for policy in [TransportPolicy::Auto, TransportPolicy::Uring] {
+            let o = opts(policy, None);
+            assert_eq!(plan(&o, &local), p(true, d), "{policy}");
+            assert_eq!(plan(&o, &cluster), p(true, deep), "{policy}");
+            let explicit = opts(policy, Some(4));
+            assert_eq!(plan(&explicit, &cluster), p(true, 4), "{policy}");
+            assert_eq!(plan(&explicit, &local), p(true, 4), "{policy}");
+            // The build rung comes after the policy: no ring without the
+            // feature.
+            assert_eq!(o.plan(&cluster, false), p(false, deep), "{policy}");
+        }
         let dev = opts(TransportPolicy::DevFuse, None);
-        assert_eq!(plan(&dev, &cluster), p(false, d, false));
-        // The build rung comes after the policy: no ring without the
-        // feature, and the cluster-lock rule still recorded under `auto`.
-        assert_eq!(auto.plan(&cluster, false), p(false, d, true));
-        assert_eq!(uring.plan(&cluster, false), p(false, deep, false));
+        assert_eq!(plan(&dev, &cluster), p(false, deep));
         assert!(deep > d, "the deeper queue is deeper");
     }
 

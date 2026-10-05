@@ -31,8 +31,8 @@ COMPOSE_SUITES ?=
 HARNESS_SCENARIOS ?=
 HARNESS_SEED ?= 42
 # FUSE transports the matrix lane runs (plan 38 §6): `dev-fuse`, the
-# shipped ladder (`auto`, which keeps cluster-lock mounts on `/dev/fuse`)
-# and `uring` (the ladder for every mount); the last two fall back to
+# shipped ladder (`auto`, cluster-lock mounts included since 2026-10-05)
+# and `uring` (the same ladder); the last two fall back to
 # `/dev/fuse` where the kernel cannot grant the ring and must pass either way.
 TRANSPORTS ?= dev-fuse auto uring
 # Extra cargo features for the binaries the lanes build. Linux builds carry

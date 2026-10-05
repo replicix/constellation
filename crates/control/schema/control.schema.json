@@ -2576,7 +2576,7 @@
           "type": "string"
         },
         "reason": {
-          "description": "The rung that refused, a fixed name: `no_io_uring_feature`,\n`kernel_not_offered`, `cluster_locks`, `handover_capable`,\n`ring_setup_failed`.",
+          "description": "The rung that refused, a fixed name: `no_io_uring_feature`,\n`kernel_not_offered`, `handover_capable`, `ring_setup_failed`.",
           "type": "string"
         },
         "to": {

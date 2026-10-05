@@ -71,8 +71,8 @@ services:
 
   # The same pjdfstest run on plan 38's ring transport
   # (`CONSTELLATION_FUSE_TRANSPORT=uring`: the ladder for every plain mount,
-  # including this one, which has cluster locks and which `auto` would keep
-  # on `/dev/fuse` since plan 38 Z2c), so POSIX compliance is gated on
+  # including this one, which has cluster locks; the same ladder as `auto`
+  # since the 2026-10-05 decision), so POSIX compliance is gated on
   # every transport and not only on `/dev/fuse` (plan 38 §6: "pjdfstest
   # 8798/8798 on every transport"). The image is the suite's own: Linux
   # builds of `constellation` carry the `io-uring` feature since Z2c. What

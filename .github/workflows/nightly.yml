@@ -205,8 +205,9 @@ jobs:
           test "$(cat /sys/module/fuse/parameters/enable_uring)" = Y
           test "$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo 0)" = 0
       - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
-      # Every scenario once per leg: dev-fuse, the shipped `auto` (cluster-lock
-      # mounts on /dev/fuse) and `uring` (every mount on the ring). Each leg
+      # Every scenario once per leg: dev-fuse, the shipped `auto` (every plain
+      # mount on the ring, cluster-lock ones included) and `uring` (the same
+      # ladder). Each leg
       # prints its census of which mounts got which transport. The cost gate
       # runs per leg against its own baseline,
       # read-cpu-uring-runner-baseline-<leg>.json, which a fresh checkout
@@ -258,7 +259,7 @@ jobs:
       - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
       # The four zero-copy scenarios, then the whole matrix with zero-copy
       # queues asked for (they are opt-in, plan 38 Z4b; the transport policy
-      # stays the default, so cluster-lock mounts stay on /dev/fuse), both
+      # stays the default, which puts cluster-lock mounts on the ring), both
       # as root (a root HOME of its own: the daemon must not write
       # root-owned files into the runner user's ~/.config).
       - run: |

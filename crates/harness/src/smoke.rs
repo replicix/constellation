@@ -96,7 +96,6 @@ fn transport_is_reported(status: &serde_json::Value, mnt: &Path) -> Result<()> {
             [
                 "no_io_uring_feature",
                 "kernel_not_offered",
-                "cluster_locks",
                 "handover_capable",
                 "ring_setup_failed"
             ]

@@ -55,8 +55,8 @@
 #   READ_CPU_CHUNK_MIB      filesystem chunk size (default 4, the shape
 #                           bench/fuse-read-path measured)
 #   CONSTELLATION_FUSE_TRANSPORT  the daemon's transport (`auto`, the
-#                           default, which keeps this gate's cluster-lock
-#                           mount on `/dev/fuse`; `uring`; `dev-fuse` —
+#                           default, which puts this gate's cluster-lock
+#                           mount on the ring; `uring`, the same; `dev-fuse` —
 #                           plan 38 §2.4, Z2c), passed through to it and recorded
 #                           in every result line; see tests/transport-matrix.sh,
 #                           whose READ_CPU_GATE=1 mode runs this gate per leg

@@ -40655,6 +40655,15 @@ line in `MountOptions::plan` (the `cluster_locks` rung) plus the default depth;
 the tests that pin the current rule are `transport-cluster-locks-auto` and the
 Z2c unit tests.
 
+**Decided 2026-10-05 (project owner): yes.** Under `auto` a cluster-lock mount
+takes the ring ladder like any plain mount, at queue depth 32 unless
+`--fuse-uring-queue-depth` says otherwise, accepting the lock-wait budget
+(`ENOLCK` past `depth - 1` contended waiters on one CPU's queue, counted in
+`lock_wait_downgrades`). The `cluster_locks` rung is removed (no compatibility
+kept); handover-capable mounts stay `dev_fuse`. The text above is the record of
+the open question; the change and its measurements are in the section
+"cluster-lock-ring-auto" at the end of this file.
+
 ### Documentation
 
 `docs/reference/configuration.md` has one "Read-path transports at a glance"
@@ -42882,3 +42891,145 @@ Not run: the full `harness run` matrix, `compliance`,
 `tests/integration.sh` and the other eight kind scenarios. The brief's
 gate list leaves them out, and only `crates/csi`, a chart comment and docs
 changed.
+
+## cluster-lock-ring-auto: under `auto`, cluster-lock mounts take the io_uring ring (depth 32)
+
+The project owner decided plan 38's open question on 2026-10-05 ("Plan 38 —
+close-out", "Open decision", the dated line under it): **yes**. Under `auto` a
+mount with cluster locks takes the ring ladder like any plain mount, at queue
+depth 32 unless `--fuse-uring-queue-depth` says otherwise, accepting the ring's
+lock-wait budget (a contended blocking `fcntl`/`flock` past `depth - 1` waiters
+on one CPU's queue gets `ENOLCK`, counted in `lock_wait_downgrades`). The
+`cluster_locks` fallback rung is removed with no compatibility kept.
+Handover-capable mounts and the mobile profile stay `dev_fuse`. No version
+bump: `HANDOVER_VERSION` stays 6 (the handoff carries the policy, not the
+rule, and resumed sessions are `dev_fuse` anyway).
+
+| Item | State | Where |
+|---|---|---|
+| The ladder: `auto` no longer holds a cluster-lock mount back; depth 32 for any cluster-lock mount that asks for the ring (8 otherwise), an explicit depth wins | done | `MountOptions::plan` (`crates/frontend-fuse/src/session.rs`; `TransportPlan` lost `held_back_for_locks`); `TransportPolicy` doc rewritten. `uring` is kept as a spelling and is now the same ladder as `auto` |
+| `cluster_locks` rung removed | done | `stats::FallbackReason::ClusterLocks`, `Handshake::held_back_for_locks` and the `classify` branch gone; `node.status`'s `last_fallback.reason` doc (`crates/control/src/proto/types.rs`, regenerated `control.schema.json`); harness `FALLBACK_REASONS`, `smoke.rs` |
+| Unit tests | done | `session::tests::cluster_lock_mounts_take_the_ring_under_auto_with_the_deeper_queue` (replaces `auto_keeps_cluster_lock_mounts_on_dev_fuse_and_uring_opts_in`: `auto` and `uring` × local/cluster × default/explicit depth, the build rung, `dev-fuse`); `stats::tests::every_rung_of_the_ladder_names_its_own_reason` without the rung |
+| `transport-cluster-locks-auto` rewritten for the new rule | done | `crates/harness/src/scenarios/transport.rs`: `auto` + cluster locks → ring depth 32, no fallback, no downgrade; explicit depth 16 wins; `--locks local` → 8; `uring` = `auto`; `daemon --upgrade` refused on the ring (served, first rung kept, on a fallback host) |
+| Ring scenarios ask for `auto` | done | `RING_POLICY` = `auto` (it was `uring` only because `auto` held cluster-lock mounts back); `transport-lock-wait-budget` asks for `auto` |
+| Harness: daemon census | done (new) | `CONSTELLATION_HARNESS_DAEMON_CENSUS` (`crates/harness/src/client.rs`): before each unmount/kill the client appends the daemon's transports, depths, `lock_wait_downgrades_total` (from `node.status`) and CPU seconds (`/proc`). Off by default. Documented in TESTING.md next to the transport census |
+| Docs | done | `configuration.md` (`--fuse-transport` and depth rows, the at-a-glance table and ladder, the ring note, "open decision" → decided), TESTING.md (transport table, matrix census text, scenario rows, compliance lines), README, `--fuse-transport`/`--fuse-uring-queue-depth` help, `docker-compose.yml`, `Makefile`, `nightly.yml`, `tests/{compliance,transport-matrix,read-cpu-gate}.sh` comments; plan 38's §7 Z2c paragraph gets a dated "Decided" paragraph (history kept) |
+
+Design decisions taken alone (no one to ask):
+
+- **`uring` stays a valid value** meaning the same ladder as `auto`. Removing it
+  would break `compliance-uring`, the matrix's `uring` leg, `zerocopy.rs` and
+  every operator script that set it. It is not a compatibility shim for the
+  removed rung. The matrix lane still runs `dev-fuse auto uring` (TRANSPORTS
+  default unchanged). The `uring` leg now duplicates `auto`; dropping it to
+  save nightly time is the owner's call.
+- **The depth rule follows the caps, not the policy:** 32 for every
+  cluster-lock mount that gets a ring, under `auto` and `uring` alike, 8 for
+  the rest, an explicit depth for all.
+- **The harness census is new instrumentation**, added because nothing else
+  reports `lock_wait_downgrades` or daemon CPU per scenario. It is opt-in and
+  costs one status call before each unmount/kill only when set.
+
+### Measurements: the lock scenarios under the new `auto`
+
+Host: 32 CPUs, kernel 7.3.0-rc4, `fuse.enable_uring=Y`, load 7–14 from other
+sessions; release build; `CONSTELLATION_FUSE_TRANSPORT=auto`,
+`CONSTELLATION_HARNESS_DOCKER_PREFIX=clr`/`clrd`, `TMPDIR=/var/tmp/clr`,
+seed 42. "Transport" is every mount the scenario made (transport census);
+"downgrades" is `fuse.lock_wait_downgrades_total` of every daemon life just
+before its unmount or kill (daemon census; a SIGSTOPped daemon records
+nothing). ENOLCK: grepped every scenario's output for `ENOLCK`, `No locks
+available` and `os error 37`.
+
+| Scenario | Result | Transport (mounts) | Depth | `lock_wait_downgrades` | Workload `ENOLCK` |
+|---|---|---|---|---|---|
+| `lock-failover` | PASSED 30.5 s | `uring` ×5 | 32 | 0 | none |
+| `lock-fence-at-close` | PASSED 16.4 s | `uring` ×3 | 32 | 0 | none |
+| `lock-grant-dead-generation` | PASSED 9.7 s | `uring` ×4 | 32 | 0 | none |
+| `lock-holder-killed-contention` | PASSED 15.4 s | `uring` ×5 | 32 | 0 | none |
+| `lock-holder-partitioned` | PASSED 9.5 s | `uring` ×3 | 32 | 0 | none |
+| `lock-latency` | PASSED 10.7 s | `uring` ×4 (one with `--locks local`, depth 8) | 32 / 8 | 0 | none |
+| `flock-cross-node` | PASSED 9.3 s | `uring` ×4 (two with local locks, depth 8) | 32 / 8 | 0 | none |
+| `sqlite-two-nodes` | PASSED 12.8 s | `uring` ×2 | 32 | 0 | none |
+| `git-under-flock` | PASSED 153.7 s | `uring` ×5 | 32 | 0 | none |
+| `git-under-flock-gc` | PASSED 80.1 s | `uring` ×5 | 32 | 0 | none |
+| `git-under-flock-b2b` | PASSED 313.2 s, then 3 + 3 more in the CPU A/B (below) | `uring` ×5 | 32 | 0 | none |
+| `git-under-flock-rounds` | PASSED 481.5 s | `uring` ×5 | 32 | 0 | none |
+| `git-under-flock-faults` | PASSED 228.7 s | `uring` (every life, 21 recorded) | 32 | 0 | none |
+| `git-under-flock-faults`, `GIT_FLOCK_STRICT=1` | PASSED 209.6 s: 197 turns, 0 overlapping, 0 fenced, 0 unexplained | `uring` (21 recorded) | 32 | 0 | none |
+| `git-under-flock-causal` | **4 of 5 PASSED** (268–289 s); the first run **stalled** and was killed after 35 min (below) | `uring` | 32 | 0 | none |
+| `transport-lock-wait-budget` | PASSED 7.1 s | `uring` | 4, then 32 | 4 and 4: the scenario's own refusals | by design: depth 4 → 3 waited, 4 `ENOLCK`; depth 32 → 31 waited, 4 `ENOLCK` |
+| `transport-cluster-locks-auto` (rewritten) | PASSED 3.8 s | `uring` ×5 | 32, 16, 8, 32, 32 | 0 | none |
+| `transport-detach-refused`, `-refused-registration`, `-seccomp-denied`, `-enomem-ring`, `-abort-while-armed` (now asking for `auto`) | all PASSED | `uring` where not faulted; `dev_fuse` with `ring_setup_failed` where faulted | 32 (64 in `enomem-ring`, set by the scenario) | 0 | none |
+
+**No workload got `ENOLCK` on the ring, and no lock-wait downgrade happened
+anywhere outside `transport-lock-wait-budget`.** None of these workloads
+queued more than a handful of blocked lock waiters per node, far from 31 on one
+CPU's queue.
+
+**The one anomaly: `git-under-flock-causal`, first run, stalled.** After the
+scenario's first reader restart (`reader c killed and remounted`, 65 s in),
+node `a`, which held the turn lock's root, logged "a lock grant's recall went
+unanswered; outwaited it (TTL + margin) … holder=3" every ~19.5 s and "every
+P2P dial has timed out … the endpoint may be stuck" for the next 35 minutes.
+Node 3 is the restarted reader `c`. Every committer's and the reader's
+blocking `setlk` waited in the engine at stage "lock grant (core reply)" (the
+`constellation_vfs::watch` lines). Those are engine-side lock waits, each
+holding one ring entry. `lock_wait_downgrades` was 0: no ring queue came near
+its budget, and no request was refused. `c`'s new incarnation logged gossip
+"failed to send" to `a` for the whole time. The stall is the lock root
+repeatedly granting to a holder it cannot reach over P2P, then outwaiting the
+recall. Nothing in that path is transport-specific. In the same session, the
+reruns were 1 more on `auto` alone (PASSED 268.2 s), then 3 on `auto` and 3 on
+`dev-fuse` interleaved (all 6 PASSED, 283–296 s). With 4/5 on the ring
+against 3/3 on `/dev/fuse` I cannot rule the ring in or out as a timing
+factor. The logs are kept at `/var/tmp/clr/evidence/causal-auto-hang-1` on the
+dev host (not in the repository). Follow-up, not done: a lock root whose
+recall of an unreachable holder's grant keeps being outwaited and re-granted
+to the same holder is a liveness bug worth a sim seed of its own.
+
+### Daemon CPU on a lock-heavy lane: `git-under-flock-b2b`, `dev_fuse` vs ring
+
+Three runs per transport, the `dev-fuse` and `auto` runs side by side in
+pairs (two harness processes at once, own docker prefixes, load 9–14). CPU is
+the sum over the scenario's five daemons (`a`–`d` and the verifying fresh
+node) of `utime + stime` just before each unmount (daemon census). The workload
+is time-bounded, so the turn count varies between runs (233–276 per run), and
+CPU per acknowledged turn is the comparable figure.
+
+| run | `dev_fuse` CPU-s | turns | CPU-s/turn | ring (`uring`, depth 32) CPU-s | turns | CPU-s/turn |
+|---|---|---|---|---|---|---|
+| 1 | 376.4 | 274 | 1.374 | 354.3 | 276 | 1.284 |
+| 2 | 339.0 | 233 | 1.455 | 367.0 | 275 | 1.335 |
+| 3 | 336.5 | 233 | 1.444 | 331.1 | 234 | 1.415 |
+| **median** | **339.0** | | **1.444** | **354.3** | | **1.335** |
+
+Per turn the ring costs about 7.5% less daemon CPU (median 1.335 vs 1.444
+CPU-s). The run-to-run spread within one transport is ±5%, so this is a small
+effect at the edge of the noise. It is not the 2–3x of the read lanes, and it
+should not be: this lane is metadata, lock and S3 traffic, not reads. Total
+CPU is the same within noise. Every run PASSED with 0 overlapping turns and 0
+lock-wait downgrades. Lock acquire wait p50 was 0.48–0.54 s on both
+transports.
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p constellation-frontend-fuse --features io-uring` | 61 + 29 + 7 passed, 0 failed |
+| `cargo test --workspace --exclude constellation-engine --exclude constellation-authority` | 0 failed |
+| `cargo test -p constellation-engine -p constellation-authority` | authority 262 + 4 + sim 121; engine 591 + conformance 1; 0 failed |
+| harness: the scenarios above | all PASSED except the one `git-under-flock-causal` stall described above (4/5 on `auto`) |
+| `bash tests/smoke.sh` | `SMOKE TEST PASSED` |
+| `compliance-uring` (`docker compose --profile test-uring run --rm compliance-uring`, own project name and image tag, a throwaway override dropping floci's host port 4566, which another session held) | `FUSE transport: uring_zc (asked for uring)`; `8798 passed, 0 failed` |
+
+Exit criteria:
+
+- [x] `auto` gives cluster-lock mounts the ring, depth 32 unless set; the `cluster_locks` rung is gone
+- [x] Handover-capable mounts still `dev_fuse` (`an_upgrade_target_session_is_pinned_to_dev_fuse`, `a_preopened_view_mount_is_pinned_and_a_plain_one_takes_the_knob` unchanged and passing)
+- [x] Tests, `node.status`/metrics docs, `configuration.md`, TESTING.md, plan 38 record updated
+- [x] Lock scenarios measured per scenario: transport, `lock_wait_downgrades`, workload `ENOLCK`
+- [x] Daemon CPU, `dev_fuse` vs ring, median of 3
+- [ ] `git-under-flock-causal` 5/5 on the ring: 4/5, one lock-recall livelock (above), not reproduced in 4 reruns

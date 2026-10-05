@@ -104,7 +104,7 @@ fn percentiles(mut ms: Vec<f64>) -> (f64, f64, f64) {
 /// Parsed after the last `)` so a command name containing spaces or
 /// parens (unlikely for `constellation`, defensive anyway) can't shift
 /// the field count.
-fn cpu_ticks(pid: u32) -> Option<u64> {
+pub(crate) fn cpu_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.rfind(')')?;
     let fields: Vec<&str> = stat[after_comm + 1..].split_whitespace().collect();
@@ -139,7 +139,7 @@ fn cpu_ticks_logged(pid: u32) -> Option<u64> {
     t
 }
 
-fn clk_tck() -> f64 {
+pub(crate) fn clk_tck() -> f64 {
     // SAFETY: `sysconf(_SC_CLK_TCK)` takes no pointers and never fails in
     // a way that matters here (POSIX guarantees it on Linux).
     let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };

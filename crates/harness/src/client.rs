@@ -684,6 +684,7 @@ impl Client {
 
     /// Clean unmount (flushes, exits the daemon).
     pub fn unmount(&mut self) -> Result<()> {
+        self.record_daemon_census("unmount");
         let _ = unmount(&self.mnt, UnmountMode::Normal);
         if let Some(mut child) = self.child.take() {
             let deadline = Instant::now() + client_timeout();
@@ -714,6 +715,7 @@ impl Client {
     /// Unlike [`Self::unmount`], a daemon that exits non-zero is not an
     /// error here: the caller asserts on the status.
     pub fn unmount_exit(&mut self, within: Duration) -> Result<std::process::ExitStatus> {
+        self.record_daemon_census("unmount");
         let _ = unmount(&self.mnt, UnmountMode::Normal);
         let mut child = self.child.take().context("not mounted")?;
         let deadline = Instant::now() + within;
@@ -739,6 +741,7 @@ impl Client {
 
     /// Crash: SIGKILL the daemon, then clean up the dead mountpoint.
     pub fn kill9(&mut self) -> Result<()> {
+        self.record_daemon_census("kill9");
         let mut child = self.child.take().context("not mounted")?;
         kill9(&mut child).context("SIGKILL")?;
         let released = release_killed(&mut child, &self.name, &self.mnt, KILLED_EXIT);
@@ -755,6 +758,7 @@ impl Client {
     /// thread states and `wchan`s — after aborting its FUSE connection so
     /// the mount, the zombie and the lock are cleaned up all the same.
     pub fn kill9_within(&mut self, within: Duration) -> Result<Duration> {
+        self.record_daemon_census("kill9");
         let mut child = self.child.take().context("not mounted")?;
         let pid = child.id();
         kill9(&mut child).context("SIGKILL")?;
@@ -1017,6 +1021,7 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
+        self.record_daemon_census("drop");
         if let Some(mut child) = self.child.take() {
             let _ = unmount(&self.mnt, UnmountMode::Normal);
             let _ = child.kill();
@@ -1066,7 +1071,71 @@ fn log_field(line: &str, key: &str) -> Option<String> {
     Some(value.trim_matches('"').to_string())
 }
 
+/// A file each client appends one line to just before its daemon is
+/// unmounted or killed — `scenario client when transports depths
+/// lock_wait_downgrades_total cpu_s` (`when`: `unmount`, `kill9`, `drop`;
+/// the per-mount fields comma-separated; `cpu_s` the daemon's
+/// `utime + stime` so far, `-` if unreadable) — read from the live
+/// daemon's `node.status` and `/proc`, so a run can say how many blocking
+/// lock requests the ring's lock-wait budget served as non-blocking and
+/// what the daemons cost (plan 38 Z2c; the 2026-10-05 decision's
+/// measurement). Off unless set: the status call costs a round trip (at
+/// most 2 s on a frozen daemon, which then records nothing) before the
+/// unmount or the kill.
+pub const DAEMON_CENSUS_ENV: &str = "CONSTELLATION_HARNESS_DAEMON_CENSUS";
+
 impl Client {
+    fn record_daemon_census(&self, when: &str) {
+        let Some(path) = std::env::var_os(DAEMON_CENSUS_ENV) else {
+            return;
+        };
+        let Some(pid) = self.pid() else {
+            return;
+        };
+        let Ok(status) =
+            self.control_call("node.status", serde_json::json!({}), Duration::from_secs(2))
+        else {
+            return;
+        };
+        let fuse = &status["fuse"];
+        let mounts = fuse["mounts"].as_array().cloned().unwrap_or_default();
+        let field = |key: &str| {
+            mounts
+                .iter()
+                .map(|m| match &m[key] {
+                    serde_json::Value::String(s) => s.clone(),
+                    v => v.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let scenario = SCENARIO.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cpu_s = crate::csi_meta_ladder::cpu_ticks(pid)
+            .map(|t| format!("{:.2}", t as f64 / crate::csi_meta_ladder::clk_tck()))
+            .unwrap_or_else(|| "-".into());
+        let row = format!(
+            "{}\t{}\t{when}\t{}\t{}\t{}\t{cpu_s}\n",
+            if scenario.is_empty() { "-" } else { &scenario },
+            self.name,
+            field("transport"),
+            field("uring_queue_depth"),
+            fuse["lock_wait_downgrades_total"]
+        );
+        use std::io::Write;
+        let appended = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(row.as_bytes()));
+        if let Err(e) = appended {
+            eprintln!(
+                "!!! DAEMON CENSUS: cannot append {}'s row to {} ({DAEMON_CENSUS_ENV}): {e}",
+                self.name,
+                std::path::Path::new(&path).display()
+            );
+        }
+    }
+
     fn record_transport_census(&self) {
         let Some(path) = std::env::var_os(TRANSPORT_CENSUS_ENV) else {
             return;

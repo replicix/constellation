@@ -339,10 +339,9 @@ pub fn cmd_serve(
             // with a path (control.rs) makes a plain one — CSI engine pods
             // included — and it follows the same transport policy as a
             // daemon's plain mount (plan 38 Z2c): `auto` unless the
-            // environment or the profile says otherwise, with cluster-lock
-            // mounts on /dev/fuse under `auto` anyway. `view.mount` on a
-            // pre-opened descriptor is handover-capable and pinned to
-            // /dev/fuse whatever this says.
+            // environment or the profile says otherwise, cluster-lock
+            // mounts included. `view.mount` on a pre-opened descriptor is
+            // handover-capable and pinned to /dev/fuse whatever this says.
             fuse_transport: constellation_frontend_fuse::TransportConfig::resolve(
                 None,
                 None,

@@ -1713,18 +1713,19 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "transport-cluster-locks-auto",
-        desc: "plan 38 Z2c: under auto a mount with cluster locks stays on dev_fuse with a \
-               cluster_locks fallback (logged once, in node.status, counted once) and serves; \
-               --locks local gets the ring under auto, and --fuse-transport uring puts the \
-               cluster-lock mount on the ring with the deeper queue (32); after daemon \
-               --upgrade the resumed auto mount still reports cluster_locks; every host",
+        desc: "plan 38 Z2c as decided 2026-10-05: under auto a mount with cluster locks takes \
+               the ring with the deeper queue (32; an explicit depth wins), --locks local the \
+               ordinary depth (8), uring the same as auto, no fallback and no lock-wait \
+               downgrade, and each serves; daemon --upgrade of the auto mount is refused on the \
+               ring and served on a fallback (the resumed mount keeps its first rung); off a \
+               ring host every leg falls back for a rung other than the locks; every host",
         requires: &[],
         caps: &[],
         run: transport::transport_cluster_locks_auto,
     },
     Scenario {
         name: "transport-lock-wait-budget",
-        desc: "plan 38 Z2c, real kernel: a cluster-lock mount opted into the ring, depth+3 \
+        desc: "plan 38 Z2c, real kernel: a cluster-lock mount on the ring under auto, depth+3 \
                processes pinned to one CPU blocking in F_SETLKW while a process on that CPU \
                holds the lock -- depth-1 wait, the rest get ENOLCK at once, the holder's write \
                and unlock go through, every waiter that waited is granted, and \

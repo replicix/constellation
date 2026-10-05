@@ -12,13 +12,13 @@
 #             since Z2c), the kernel is 6.14+ with `fuse.enable_uring=Y`,
 #             and the sandbox permits `io_uring_setup(2)`; falls back to
 #             `/dev/fuse` otherwise. A mount with cluster locks (the
-#             default with P2P, so most harness mounts) stays on
-#             `/dev/fuse` under `auto` (plan 38 Z2c): this leg is what
-#             the default actually ships.
-#   uring     the ladder for every plain mount, cluster-lock ones included
-#             (the opt-in; contended blocking lock waits past a queue's
-#             budget get ENOLCK). The leg that puts the whole matrix on the
-#             ring.
+#             default with P2P, so most harness mounts) takes it too, at
+#             queue depth 32 (decided 2026-10-05; contended blocking lock
+#             waits past a queue's budget get ENOLCK): this leg is what the
+#             default actually ships.
+#   uring     the same ladder as `auto` since 2026-10-05 (before, the
+#             opt-in that put cluster-lock mounts on the ring); kept as a
+#             leg so the spelling stays exercised.
 #
 # **No leg skips.** A host that cannot grant the ring runs `auto` and
 # `uring` as fallback legs, which is exactly the property the ladder

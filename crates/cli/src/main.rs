@@ -145,11 +145,11 @@ enum Command {
         /// build, the running kernel (6.14+ with `fuse.enable_uring=Y`) and
         /// the process's sandbox all grant it, and falling back to
         /// `/dev/fuse` — logged, and visible in `node.status` — whenever one
-        /// of them does not; a mount with cluster locks (`--locks cluster`,
-        /// the default with P2P) stays on `/dev/fuse` under "auto". "uring"
-        /// is "auto" that puts cluster-lock mounts on the ring too, where a
-        /// burst of contended blocking lock waits past the queue's budget
-        /// is answered ENOLCK. "dev-fuse" is the `/dev/fuse` `writev` path
+        /// of them does not. A mount with cluster locks (`--locks cluster`,
+        /// the default with P2P) takes the ring too, where a burst of
+        /// contended blocking lock waits past the queue's budget is
+        /// answered ENOLCK. "uring" is the same ladder as "auto".
+        /// "dev-fuse" is the `/dev/fuse` `writev` path
         /// every kernel and platform has. A mount that ends up on a ring
         /// **cannot be handed over**, so `daemon --upgrade`/`node.handoff`
         /// refuses to detach it; mounts somebody else handed us a
@@ -160,7 +160,7 @@ enum Command {
         #[arg(long)]
         fuse_transport: Option<String>,
         /// Ring entries per kernel queue when the transport is a ring
-        /// (default 8; 32 for a cluster-lock mount on "uring"). The ring's
+        /// (default 8; 32 for a mount with cluster locks). The ring's
         /// reserved address space is `queues x depth x payload` (plan 38
         /// §4), and at most `depth - 1` of a queue's entries wait for
         /// locks, so this is the knob for an operator who has measured

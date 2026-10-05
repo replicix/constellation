@@ -4,10 +4,10 @@
 //! `transport-detach-refused` is **one scenario with two expected
 //! outcomes, keyed on the transport the mount actually negotiated** — not
 //! two scenarios, and not a scenario that skips off a ring kernel. It
-//! always asks for the ladder — `CONSTELLATION_FUSE_TRANSPORT=uring`, the
-//! ladder for every plain mount: the harness's mounts have cluster locks
-//! (P2P is on), which plain `auto` keeps on `/dev/fuse` since plan 38 Z2c
-//! — and then reads `node.status` to learn what it got:
+//! always asks for the ladder — `CONSTELLATION_FUSE_TRANSPORT=auto`, which
+//! since the 2026-10-05 decision puts the harness's cluster-lock mounts
+//! (P2P is on) on the ring too — and then reads `node.status` to learn
+//! what it got:
 //!
 //! - **`uring`** (a 6.14+ kernel with `fuse.enable_uring=Y`, an
 //!   `io-uring`-feature build, and a sandbox that permits
@@ -47,13 +47,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// What the ring scenarios ask for: plan 38 §2.4's ladder for every plain
-/// mount, cluster-lock ones included (`uring`). The harness's daemons run
-/// with P2P and so with cluster locks, and plain `auto` keeps those on
-/// `/dev/fuse` since plan 38 Z2c (`transport-cluster-locks-auto` is that
-/// rule's scenario); these scenarios are about the ladder itself. Set on
-/// the client rather than inherited, so a scenario asks the same question
-/// on every leg of the transport matrix lane.
-pub(crate) const RING_POLICY: &str = "uring";
+/// mount, cluster-lock ones included (`auto`, the shipped default; since
+/// the 2026-10-05 decision it no longer keeps the harness's cluster-lock
+/// mounts on `/dev/fuse`). Set on the client rather than inherited, so a
+/// scenario asks the same question on every leg of the transport matrix
+/// lane.
+pub(crate) const RING_POLICY: &str = "auto";
 
 /// A client whose mount asks for the ladder ([`RING_POLICY`]).
 fn auto_client(env: &S3Env, root: &Path, prefix: &str) -> Result<Client> {
@@ -65,12 +64,10 @@ fn auto_client(env: &S3Env, root: &Path, prefix: &str) -> Result<Client> {
     Ok(c)
 }
 
-/// The fallback reasons `node.status` may name (plan 38 §2.4, Z2b; Z2c's
-/// `cluster_locks`).
+/// The fallback reasons `node.status` may name (plan 38 §2.4, Z2b).
 pub(crate) const FALLBACK_REASONS: &[&str] = &[
     "no_io_uring_feature",
     "kernel_not_offered",
-    "cluster_locks",
     "handover_capable",
     "ring_setup_failed",
 ];
@@ -801,18 +798,17 @@ fn fuse_mount(c: &Client) -> Result<serde_json::Value> {
     Ok(status["fuse"]["mounts"][0].clone())
 }
 
-/// Plan 38 Z2c, the maintainer's decision: under `auto` a mount with
+/// Plan 38 Z2c as decided on 2026-10-05: under `auto` a mount with
 /// cluster locks (`--locks cluster`, the default with P2P, which the
-/// harness's daemons run with) stays on `/dev/fuse`, recorded as a
-/// `cluster_locks` fallback — once in the log, in `node.status`'s
-/// `last_fallback`, counted once — and serves; the same daemon with
-/// `--locks local` gets the ring under `auto`; and `uring` puts the
-/// cluster-lock mount on the ring with the deeper queue
-/// (`CLUSTER_LOCKS_URING_QUEUE_DEPTH`, 32). A `daemon --upgrade` of the
-/// `auto` mount is served, and the resumed session keeps reporting the same
-/// first rung. On a host that cannot grant the ring every leg is
-/// `dev_fuse`, and the reason is the earlier rung's (the ladder names the
-/// first rung that refused).
+/// harness's daemons run with) takes the ladder like any plain mount, on
+/// the deeper queue (`CLUSTER_LOCKS_URING_QUEUE_DEPTH`, 32), and no rung
+/// named `cluster_locks` exists any more; an explicit depth wins; the same
+/// daemon with `--locks local` gets the ordinary depth (8); `uring` is the
+/// same ladder as `auto`. A `daemon --upgrade` of the `auto` cluster-lock
+/// mount is refused where it got the ring (a ring session cannot be
+/// detached; the mount keeps serving) and served where it fell back, the
+/// resumed session keeping its first rung. On a host that cannot grant the
+/// ring every leg is `dev_fuse`, for a rung other than the locks.
 pub fn transport_cluster_locks_auto(seed: u64) -> Result<()> {
     let (env, root) = setup("transport-cluster-locks-auto")?;
     let _proxy = env.s3_proxy()?;
@@ -821,114 +817,127 @@ pub fn transport_cluster_locks_auto(seed: u64) -> Result<()> {
         .with_env("CONSTELLATION_FUSE_TRANSPORT", "auto");
     c.fs_create()?;
     let ring_host = crate::suites::unavailable(crate::suites::FUSE_URING).is_none();
+    // The mounted leg's transport: the ring at `depth` with no fallback
+    // and no lock-wait downgrade yet on a ring host, a fallback for a rung
+    // other than the locks anywhere else.
+    let expect = |c: &Client, depth: u64, leg: &str| -> Result<String> {
+        let negotiated = negotiated_transport(c)?;
+        let mount = fuse_mount(c)?;
+        if ring_host {
+            ensure!(
+                is_ring(&negotiated) && mount["last_fallback"].is_null(),
+                "{leg} on a ring host negotiated {negotiated}: {mount}"
+            );
+            ensure!(
+                mount["uring_queue_depth"] == depth,
+                "{leg}: expected queue depth {depth}: {mount}"
+            );
+            ensure!(mount["lock_wait_downgrades"] == 0, "{leg}: {mount}");
+            ensure!(
+                downgrades(c).is_empty(),
+                "{leg}: no rung refused the ring: {:?}",
+                downgrades(c)
+            );
+        } else {
+            let why = fallback_reported(c, None)?;
+            ensure!(
+                why != "cluster_locks",
+                "{leg}: no rung holds a mount back for its locks"
+            );
+        }
+        eprintln!(
+            "    {leg}: {negotiated} depth {}",
+            mount["uring_queue_depth"]
+        );
+        Ok(negotiated)
+    };
     let result = (|| -> Result<()> {
-        // 1. `auto`, cluster locks: /dev/fuse, and says why, once.
+        // 1. `auto`, cluster locks: the ring, on the deeper queue.
         c.mount()?;
-        let negotiated = negotiated_transport(&c)?;
-        ensure!(
-            negotiated == "dev_fuse",
-            "auto with cluster locks negotiated {negotiated}"
-        );
-        let reason = fallback_reported(&c, ring_host.then_some("cluster_locks"))?;
-        ensure!(
-            downgrades(&c).is_empty(),
-            "auto asked for no ring for this mount, so no rung refused one: {:?}",
-            downgrades(&c)
-        );
+        expect(&c, 32, "auto, cluster locks")?;
         serve_check(&c.mnt, seed, "cluster-auto")?;
         let records = transport_records(&c);
         ensure!(
-            records.len() == 1 && records[0].contains("fell back") && records[0].contains(&reason),
-            "the fallback must be logged exactly once, naming {reason}: {records:?}"
-        );
-        eprintln!("    auto, cluster locks: dev_fuse ({reason}), logged once");
-        c.unmount()?;
-
-        // 2. `auto`, local locks: the ring where the host grants it.
-        c.mount_view(None, &["--locks", "local"])?;
-        let negotiated = negotiated_transport(&c)?;
-        let mount = fuse_mount(&c)?;
-        if ring_host {
-            ensure!(
-                is_ring(&negotiated) && mount["last_fallback"].is_null(),
-                "auto with local locks on a ring host negotiated {negotiated}: {mount}"
-            );
-            ensure!(
-                mount["uring_queue_depth"] == 8,
-                "the ordinary queue depth: {mount}"
-            );
-        } else {
-            let why = fallback_reported(&c, None)?;
-            ensure!(
-                why != "cluster_locks",
-                "local locks cannot be held back for locks"
-            );
-        }
-        serve_check(&c.mnt, seed + 1, "local-auto")?;
-        eprintln!(
-            "    auto, local locks: {negotiated} {}",
-            mount["uring_queue_depth"]
-        );
-        c.unmount()?;
-
-        // 3. `uring`, cluster locks: the opt-in, on the deeper queue.
-        c.set_env("CONSTELLATION_FUSE_TRANSPORT", "uring");
-        c.mount()?;
-        let negotiated = negotiated_transport(&c)?;
-        let mount = fuse_mount(&c)?;
-        if ring_host {
-            ensure!(
-                is_ring(&negotiated) && mount["last_fallback"].is_null(),
-                "uring with cluster locks on a ring host negotiated {negotiated}: {mount}"
-            );
-            ensure!(
-                mount["uring_queue_depth"] == 32,
-                "a cluster-lock mount on the ring gets the deeper queue: {mount}"
-            );
-            ensure!(mount["lock_wait_downgrades"] == 0, "{mount}");
-        } else {
-            let why = fallback_reported(&c, None)?;
-            ensure!(
-                why != "cluster_locks",
-                "uring never holds a mount back for locks"
-            );
-        }
-        serve_check(&c.mnt, seed + 2, "cluster-uring")?;
-        eprintln!(
-            "    uring, cluster locks: {negotiated} {}",
-            mount["uring_queue_depth"]
+            records.len() == 1,
+            "one transport record per mount: {records:?}"
         );
         no_alarms(&c)?;
         c.unmount()?;
 
-        // 4. `daemon --upgrade` of the `auto` cluster-lock mount: it is on
-        // /dev/fuse, so the handover is served, and the resumed session —
-        // pinned now, in a new process — still names the rung that kept
-        // it off the ring, not the pin (the Z2b review's finding), logged
-        // once by the new image and counted once in its counters.
+        // 2. `auto`, cluster locks, an explicit depth: it wins.
+        c.set_env("CONSTELLATION_FUSE_URING_QUEUE_DEPTH", "16");
+        c.mount()?;
+        expect(&c, 16, "auto, cluster locks, depth 16")?;
+        serve_check(&c.mnt, seed + 1, "cluster-auto-16")?;
+        c.unmount()?;
+        c.unset_env("CONSTELLATION_FUSE_URING_QUEUE_DEPTH");
+
+        // 3. `auto`, local locks: the ordinary depth.
+        c.mount_view(None, &["--locks", "local"])?;
+        expect(&c, 8, "auto, local locks")?;
+        serve_check(&c.mnt, seed + 2, "local-auto")?;
+        c.unmount()?;
+
+        // 4. `uring`, cluster locks: the same ladder as `auto`.
+        c.set_env("CONSTELLATION_FUSE_TRANSPORT", "uring");
+        c.mount()?;
+        expect(&c, 32, "uring, cluster locks")?;
+        serve_check(&c.mnt, seed + 3, "cluster-uring")?;
+        no_alarms(&c)?;
+        c.unmount()?;
+
+        // 5. `daemon --upgrade` of the `auto` cluster-lock mount: refused
+        // on the ring, at no cost to the mount; served on a fallback, the
+        // resumed session (pinned now, in a new process) still naming its
+        // first rung, not the pin (the Z2b review's finding).
         c.set_env("CONSTELLATION_FUSE_TRANSPORT", "auto");
         c.mount()?;
-        let before = fallback_reported(&c, None)?;
+        let negotiated = negotiated_transport(&c)?;
+        let before = if is_ring(&negotiated) {
+            None
+        } else {
+            Some(fallback_reported(&c, None)?)
+        };
         let generation = super::handover::generation(&c)?;
         let out = super::handover::try_upgrade(&c)?;
-        ensure!(
-            out.status.success(),
-            "daemon --upgrade of a dev_fuse mount must be served: {}{}",
+        let said = format!(
+            "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        ensure!(
-            super::handover::generation(&c)? == generation + 1,
-            "the generation did not advance"
-        );
-        let after = fallback_reported(&c, Some(&before))?;
-        let records = transport_records(&c);
-        ensure!(
-            records.len() == 2 && records[1].contains(&after),
-            "one record per daemon image, the resumed one naming {after}: {records:?}"
-        );
-        serve_check(&c.mnt, seed + 3, "resumed")?;
-        eprintln!("    auto, cluster locks, after daemon --upgrade: still {after}");
+        match before {
+            None => {
+                ensure!(
+                    !out.status.success() && said.contains(&format!("served over {negotiated}")),
+                    "daemon --upgrade must refuse a {negotiated} session, naming it: {said}"
+                );
+                ensure!(
+                    super::handover::generation(&c)? == generation,
+                    "the generation advanced although the upgrade was refused"
+                );
+                ensure!(negotiated_transport(&c)? == negotiated);
+                serve_check(&c.mnt, seed + 4, "refused")?;
+                eprintln!("    auto, cluster locks, daemon --upgrade: refused on {negotiated}");
+            }
+            Some(before) => {
+                ensure!(
+                    out.status.success(),
+                    "daemon --upgrade of a dev_fuse mount must be served: {said}"
+                );
+                ensure!(
+                    super::handover::generation(&c)? == generation + 1,
+                    "the generation did not advance"
+                );
+                let after = fallback_reported(&c, Some(&before))?;
+                let records = transport_records(&c);
+                ensure!(
+                    records.len() == 2 && records[1].contains(&after),
+                    "one record per daemon image, the resumed one naming {after}: {records:?}"
+                );
+                serve_check(&c.mnt, seed + 4, "resumed")?;
+                eprintln!("    auto, cluster locks, after daemon --upgrade: still {after}");
+            }
+        }
         c.unmount()
     })();
     let _ = c.unmount();
@@ -1213,10 +1222,10 @@ fn lock_wait_round(c: &Client, depth: u64, extra: u64, round: &str) -> Result<u6
 }
 
 /// Plan 38 Z2c item 4, on a **real kernel** (not the in-memory ring of
-/// `wire_uring.rs`): a cluster-lock mount opted into the ring
-/// (`--fuse-transport uring`), `depth + 3` processes pinned to one CPU
-/// (`taskset`) blocking in `F_SETLKW` on a lock a process on the same CPU
-/// holds. Without the budget the first `depth` waiters would take every
+/// `wire_uring.rs`): a cluster-lock mount on the ring under the shipped
+/// `auto` (since the 2026-10-05 decision), `depth + 3` processes pinned to
+/// one CPU (`taskset`) blocking in `F_SETLKW` on a lock a process on the
+/// same CPU holds. Without the budget the first `depth` waiters would take every
 /// entry of that CPU's queue and the holder's `write` — and with it the
 /// unlock — would never be served. With it: `depth - 1` wait, the rest are
 /// answered `ENOLCK` at once, a `stat` from that CPU is served, the holder
@@ -1230,7 +1239,7 @@ pub fn transport_lock_wait_budget(_seed: u64) -> Result<()> {
     let _proxy = env.s3_proxy()?;
     let backend = format!("s3://{BUCKET}/transport-lock-budget-{}", ts());
     let mut c = Client::new(root.path(), "c0", &env.endpoint, &backend)?
-        .with_env("CONSTELLATION_FUSE_TRANSPORT", "uring")
+        .with_env("CONSTELLATION_FUSE_TRANSPORT", "auto")
         .with_env("CONSTELLATION_FUSE_URING_QUEUE_DEPTH", "4");
     c.fs_create()?;
     let result = (|| -> Result<()> {
