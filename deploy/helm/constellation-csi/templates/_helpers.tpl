@@ -30,3 +30,23 @@ policies admit (as CEL over `v`, a volume, and `m`, a volume mount).
                        && m.mountPath == '/var/run/secrets/pods.eks.amazonaws.com/serviceaccount'
                        && m.?readOnly.orValue(false))
 {{- end }}
+{{- /*
+A value as text, an integral number as an integer. Numbers reach the
+templates as float64 from a values file, `--set-json` and every `helm
+upgrade --reuse-values` (the release's values round-trip through JSON), and
+`quote`/`toString` print a float64 past six digits in exponent form
+(purge.bytesPerSecond 16777216 → "1.6777216e+07"), which the plugins refuse
+to start on. Every number this chart renders is a count, a port or a
+duration in whole units, so a fractional one is refused here, at render
+time, rather than truncated.
+*/}}
+{{- define "csi.str" -}}
+{{- if or (kindIs "float64" .) (kindIs "float32" .) -}}
+{{- if ne (float64 (int64 .)) (float64 .) -}}
+{{- fail (printf "constellation-csi: expected a whole number, got %v" .) -}}
+{{- end -}}
+{{- int64 . -}}
+{{- else -}}
+{{- toString . -}}
+{{- end -}}
+{{- end }}

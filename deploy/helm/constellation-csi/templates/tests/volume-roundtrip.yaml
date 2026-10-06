@@ -1,0 +1,128 @@
+{{- /*
+`helm test` (plan 37 §14): one volume's whole life through the driver,
+independent of the e2e suite. A PVC of tests.storageClassName (default: the
+first of storageClasses) binds (CreateVolume in the pool); a writer pod
+mounts it (NodeStageVolume, NodePublishVolume), writes a 4 MiB file, a
+checksum and a directory, and reads them back; once it has exited (its
+volume unpublished, and unstaged when nothing else on that node uses it), a
+reader pod mounts the volume afresh, checks the checksum, removes
+everything and sees the volume empty. Helm then deletes the three
+(DeleteVolume: the volume goes to the pool's trash, which the purge worker
+empties). A failed test leaves them for inspection; the next `helm test`
+replaces them.
+
+Without a class to test there is nothing to check, and a pass would say
+otherwise: the test pod then fails, saying what to set.
+*/}}
+{{- $class := .Values.tests.storageClassName }}
+{{- if and (not $class) .Values.storageClasses }}
+{{- $class = (first .Values.storageClasses).name }}
+{{- end }}
+{{- $claim := printf "%s-test-volume" .Release.Name }}
+{{- define "csi.testPodSpec" -}}
+restartPolicy: Never
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile: {type: RuntimeDefault}
+{{- with .root.Values.imagePullSecrets }}
+imagePullSecrets: {{- toYaml . | nindent 2 }}
+{{- end }}
+containers:
+  - name: test
+    image: {{ include "csi.image" .root }}
+    imagePullPolicy: {{ .root.Values.image.pullPolicy }}
+    command: [sh, -c]
+    args:
+      - {{ .script | quote }}
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+      readOnlyRootFilesystem: true
+    resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {memory: 64Mi}}
+    {{- if .claim }}
+    volumeMounts:
+      - {name: data, mountPath: /data}
+    {{- end }}
+{{- if .claim }}
+volumes:
+  - name: data
+    persistentVolumeClaim: {claimName: {{ .claim }}}
+{{- end }}
+{{- end }}
+{{- if $class }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $claim }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  storageClassName: {{ $class }}
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: {{ .Values.tests.size }}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-test-write
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  {{- $write := `set -eu
+cd /data
+echo "volume: $(df -k . | tail -1)"
+head -c 4194304 /dev/urandom > payload
+sha256sum payload > payload.sha256
+mkdir -p dir/sub
+echo hello > dir/sub/note
+sync
+sha256sum -c payload.sha256
+test "$(cat dir/sub/note)" = hello
+echo "wrote and read back $(stat -c %s payload) bytes"` }}
+  {{- include "csi.testPodSpec" (dict "root" . "claim" $claim "script" $write) | nindent 2 }}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-test-read
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "2"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  {{- $read := `set -eu
+cd /data
+sha256sum -c payload.sha256
+test "$(cat dir/sub/note)" = hello
+rm -rf payload payload.sha256 dir
+test -z "$(ls -A)"
+echo "a fresh mount read the payload back, removed it and is empty"` }}
+  {{- include "csi.testPodSpec" (dict "root" . "claim" $claim "script" $read) | nindent 2 }}
+{{- else }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-test-write
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "csi.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  {{- $none := `echo "no StorageClass to test: set tests.storageClassName, or list one under storageClasses" >&2; exit 1` }}
+  {{- include "csi.testPodSpec" (dict "root" . "claim" "" "script" $none) | nindent 2 }}
+{{- end }}

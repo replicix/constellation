@@ -8,8 +8,8 @@
 # lanes, each compared against the reference lane above.
 #
 # Reserved for later plans (not added here): "macos-nfs" (34), "linux-nfs"
-# (34), "windows-winfsp" (35), "android-saf" (36), "linux-csi" (37, a subset
-# of the harness run through pods per plan 37's parity lane).
+# (34), "windows-winfsp" (35), "android-saf" (36). "linux-csi" (plan 37) is
+# below.
 
 # linux-fuse-process differs from linux-fuse only in the S3 backend
 # (versitygw + native toxiproxy instead of floci + dockerised toxiproxy), so
@@ -24,5 +24,144 @@
 # cap = "<Cap>"                  # required when scenario = "*"
 # reason = "<why this lane legitimately differs>"
 #
-# (The file is intentionally empty of entries here; a missing `expect` key
-# means "no expectations". Plans 34/35/36 append `[[expect]]` tables.)
+# Plans 34/35/36 append `[[expect]]` tables.
+
+# ---------------------------------------------------------------------------
+# linux-csi (plan 37 §12, K7): `harness k8s-scenario --parity` on a kind
+# cluster. Volumes are PVs mounted through the CSI driver into pods; the
+# lane runs the `harness run` scenarios ported to pods
+# (crates/harness/src/k8s/parity.rs `PORTED`: baseline, two-clients-disjoint,
+# two-clients-shared, git-workflow, truncate-never-resurrects,
+# xattr-roundtrip, fallocate-sparse, append-setattr-size) under their own
+# names, and reports every other scenario skipped. Each of those is listed
+# by hand in parity.rs `SKIPPED` with what it needs (a unit test fails on
+# a catalog scenario listed nowhere), in one of three ways:
+#
+# * it pulls a lever on its own local clients that a CSI-mounted volume
+#   does not have — a SIGKILL or SIGSTOP of a client, toxiproxy in front
+#   of one client's S3, a fault hook or environment knob the StorageClass
+#   does not expose, a third or fourth node of one filesystem (the kind
+#   lane has two workers). Its reason names the capability `LocalClient`
+#   and the levers. `LocalClient` is not a `constellation_vfs::Cap` (the
+#   frontend has every cap the reference has); it is the lane's own word,
+#   spelled as a whole word in exactly these reasons so the wildcard at the
+#   end binds to them and nothing else;
+# * as above, and a `k8s-scenario` covers the behaviour through the
+#   driver: named below, pointing at the coverage;
+# * it needs no such lever (mounts, file operations, status reads an
+#   engine pod answers too): "not yet ported (follow-up F6)", named below,
+#   so porting it turns its entry stale. Its reason does not name
+#   `LocalClient`: the wildcard cannot excuse it.
+#
+# CI runs the lane only on a FUSE-capable kind runner and passes
+# `--absent-lane linux-csi` without one.
+#
+# Plan 37 §12 drafted three entries. Two named scenarios that do not exist
+# in the catalog ("fusermount-flags", "local-daemon-upgrade"); the latter's
+# intent is the `upgrade-under-load` / `session-handover-idle` entries
+# below. The third was a `ClusterLocks` wildcard, justified by the cap being
+# exercised under another name; with k8s-scenario csi-cross-pod-locks it is
+# (flock and fcntl across pods on two workers), so `flock-cross-node` is
+# named below with it and the other lock scenarios are `LocalClient` skips
+# for the levers they pull (kills, P2P cuts, four nodes). The first
+# matching entry excuses a difference: the named entries come first.
+
+[[expect]]
+scenario = "upgrade-under-load"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "An engine-pod upgrade is a node.handoff of the pod's FUSE sessions to a replacement pod, not `constellation daemon --upgrade` of a local daemon; the same FuseSession::resume seam is gated, under a writing/creating/reading load with zero errors, by k8s-scenario csi-engine-pod-handoff-under-load (plan 37 K5, 20 runs)."
+
+[[expect]]
+scenario = "session-handover-idle"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "The idle handover of a local daemon; under the driver every engine-pod rollout hands its sessions over (k8s-scenario csi-engine-pod-handoff-under-load, and csi-plugin-restart-survives for the plugin itself)."
+
+[[expect]]
+scenario = "node-leave"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Under Kubernetes a node leaves the pool's roster when its engine pod is drained or collected idle, not by `constellation leave`; k8s-scenario csi-node-drain checks the roster stays clean across a drain."
+
+[[expect]]
+scenario = "quota-enforcement"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "A PV's quota is set by CreateVolume/ControllerExpandVolume, not quota.set on a local daemon; k8s-scenarios csi-many-pvs-one-pool (independent per-PV quotas) and csi-human-cli-mount (ENOSPC for a pod and a human mount on one quota) cover it."
+
+[[expect]]
+scenario = "snapshot-lifecycle"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Snapshots are VolumeSnapshots taken through the controller's engine pod (held by csi:<content uid>); k8s-scenario csi-snapshot-clone-mount covers create, restore and mount."
+
+[[expect]]
+scenario = "clone-workflow"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Clones are PVCs with a dataSource, a metadata-only clone.create in the source's pool; k8s-scenarios csi-snapshot-clone-mount and csi-clone-cross-pool-refused cover them."
+
+[[expect]]
+scenario = "snapshot-mount"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "A snapshot reaches a pod as a PVC restored from a VolumeSnapshot, not a snapshot view of a local mount; k8s-scenario csi-snapshot-clone-mount mounts restores on the other worker."
+
+[[expect]]
+scenario = "csi-credential-revocation"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Runs the driver's fs.unlock rotation against versitygw from local processes; through Kubernetes Secrets the rotation is k8s-scenario csi-secret-rotation."
+
+[[expect]]
+scenario = "flock-cross-node"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Its second phase mounts with CONSTELLATION_LOCKS=local. Cross-node flock and fcntl exclusion, contention and release through the driver are k8s-scenario csi-cross-pod-locks: pods on the two workers sharing an RWX PV, whose engine pods mount with cluster locks."
+
+# Not yet ported (follow-up F6, PROGRESS "Plan 37 close-out"): no lever the
+# driver lacks.
+
+[[expect]]
+scenario = "forwarded-mutations"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): two mounts and the lease's status; portable to two pods and the engine pods' node.status."
+
+[[expect]]
+scenario = "scratch-publish"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): two mounts, the scratch marker xattr and a publishing rename; portable to two pods with the pod tool."
+
+[[expect]]
+scenario = "e2e-basic"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): an e2e=true StorageClass, a cold remount, a scan of the bucket for plaintext and a wrong-passphrase Secret refused."
+
+[[expect]]
+scenario = "stress-ng-fs"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): needs stress-ng in the workload pod (the lane's pods run the driver image), its mid-run snapshots as VolumeSnapshots."
+
+[[expect]]
+scenario = "existence-bloom-dedup"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): two mounts in turn and the bucket's chunk count (the harness lists the bucket on kind)."
+
+[[expect]]
+scenario = "subtree-confinement"
+lanes = ["linux-csi"]
+outcome = "skipped"
+reason = "Not yet ported (F6): `..`, symlinks and hard links at a view root, which is what a pool PV is; the first F6 port to make. Its maintenance view would be a static PV of the pool root."
+
+[[expect]]
+scenario = "*"
+lanes = ["linux-csi"]
+outcome = "skipped"
+cap = "LocalClient"
+reason = "The scenario pulls levers on its own local clients that a CSI-mounted volume does not have; its skip reason lists them (parity.rs SKIPPED, by hand per scenario). A CSI volume's engine is a pod the node plugin starts and configures; the engine and frontend code under test is the reference lane's."

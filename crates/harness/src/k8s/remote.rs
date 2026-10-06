@@ -260,6 +260,20 @@ impl RemoteWorkload {
     }
 }
 
+/// The pod tool (`pod_tool.pl`): xattrs, `fcntl` locks, `SEEK_HOLE` /
+/// `SEEK_DATA`, an `O_APPEND` writer and its checker, as `perl` (the
+/// driver image has perl-base, not attr or python). [`pod_tool_script`]
+/// installs it at [`POD_TOOL`]; scripts then run `perl /tmp/pt.pl OP ...`.
+pub const POD_TOOL: &str = "/tmp/pt.pl";
+
+/// A script fragment writing the pod tool to [`POD_TOOL`].
+pub fn pod_tool_script() -> String {
+    format!(
+        "cat > {POD_TOOL} <<'POD_TOOL_EOF'\n{}POD_TOOL_EOF\n",
+        include_str!("pod_tool.pl")
+    )
+}
+
 /// A script printing the tree under `dir` one entry per line, sorted:
 /// `d<TAB>path`, `l<TAB>path<TAB>target`, `f<TAB>path<TAB>size<TAB>sha256`
 /// (paths relative, `./`-prefixed). It fails on any error reading the tree.

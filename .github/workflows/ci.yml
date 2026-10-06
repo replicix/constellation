@@ -40,6 +40,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p constellation-csi
+      # The chart without a cluster (plan 37 K7): lint, integers rendered as
+      # integers however a number arrives, the helm-test hook; then packaged.
+      - uses: azure/setup-helm@v4
+      - run: make csi-chart
 
   integration:
     name: Integration (containerized FUSE + floci S3)

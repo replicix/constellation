@@ -1,6 +1,6 @@
 # Plan 37 K0 Track B — `CreateVolume` metadata-op throughput ladder
 
-Raw results for `docs/plans/v1/wip/37-kubernetes-csi.md`'s "K0 results" →
+Raw results for `docs/plans/v1/done/37-kubernetes-csi.md`'s "K0 results" →
 "Track B" section. Driver: `crates/harness/src/csi_meta_ladder.rs`, run via
 `target/release/harness csi-meta-ladder`.
 

@@ -50,7 +50,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 -include local.mk
 
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
-	check ci clean smoke integration webui-check csi-sanity csi-image compose harness harness-docker \
+	check ci clean smoke integration webui-check csi-sanity csi-image csi-image-dist csi-chart compose harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
 	harness-transport-matrix compliance-ring \
 	dist-linux dist-macos deps FORCE \
@@ -133,12 +133,27 @@ webui-check: $(RELEASE_BIN) ## Headless-Chrome check of the web UI's snapshots p
 	CONSTELLATION_BIN=$(RELEASE_BIN) tests/webui-headless.sh
 
 CSI_IMAGE ?= constellation-csi:dev
+# Where csi-image-dist and csi-chart leave their artifacts (plan 37 §14). Nothing
+# is pushed; docs/how-to-guides/development/RELEASING.md has the publish
+# commands.
+CSI_DIST ?= $(TARGET_DIR)/dist/csi
+CSI_CHART := deploy/helm/constellation-csi
 
 csi-image: ## Build the constellation-csi image (static musl; one image for controller + node + engine pods)
 	docker build -f deploy/docker/constellation-csi.Dockerfile \
 		--build-arg CONSTELLATION_GIT_DESCRIBE="$$(git describe --tags --always --dirty 2>/dev/null)" \
 		--build-arg JOBS="$${CARGO_BUILD_JOBS:-}" \
 		-t $(CSI_IMAGE) .
+
+csi-image-dist: csi-image ## csi-image, then save the image to CSI_DIST as a gzipped tarball (docker load -i)
+	mkdir -p $(CSI_DIST)
+	docker save $(CSI_IMAGE) | gzip -1 > $(CSI_DIST)/$(subst /,_,$(subst :,_,$(CSI_IMAGE))).tar.gz
+	@echo "image $(CSI_IMAGE) -> $(CSI_DIST)/$(subst /,_,$(subst :,_,$(CSI_IMAGE))).tar.gz (docker load -i)"
+
+csi-chart: ## Lint and check the constellation-csi Helm chart (tests/csi/chart-check.sh) and package it into CSI_DIST
+	tests/csi/chart-check.sh
+	mkdir -p $(CSI_DIST)
+	helm package $(CSI_CHART) -d $(CSI_DIST)
 
 csi-sanity: $(RELEASE_CSI) ## csi-sanity's Identity + Controller + Node groups against constellation-csi on its in-memory backends (plan 37 K1-K3; needs CSI_SANITY_BIN or csi-sanity on PATH)
 	CONSTELLATION_CSI_BIN=$(abspath $(RELEASE_CSI)) tests/csi/sanity.sh

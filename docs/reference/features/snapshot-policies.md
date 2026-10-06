@@ -247,7 +247,7 @@ hold may carry an owner, `held_by`, in a namespace:
 |---|---|---|
 | (empty) | an operator's plain hold | released by a plain `snapshot release` |
 | `user:<name>` | a person or script | |
-| `csi:<id>` | the [Kubernetes CSI driver](../../plans/v1/wip/37-kubernetes-csi.md) | a `VolumeSnapshot` is a held snapshot; the driver owns the hold |
+| `csi:<id>` | the [Kubernetes CSI driver](../../plans/v1/done/37-kubernetes-csi.md) | a `VolumeSnapshot` is a held snapshot; the driver owns the hold |
 
 `policy:` is reserved and anything unprefixed is refused. Releasing (or
 re-holding) a snapshot requires the **same owner**: `snapshot release

@@ -115,7 +115,7 @@ jobs:
 
   parity:
     if: always()
-    needs: [harness, harness-lanes-linux, conformance]
+    needs: [harness, harness-lanes-linux, conformance, kind-e2e]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -125,10 +125,15 @@ jobs:
         with: { path: results, pattern: "harness-*", merge-multiple: true }
       # Every lane this workflow runs is required: a lane whose job died
       # before writing its results must fail parity, not drop out of it.
-      - run: |
+      # linux-csi (plan 37 §12) runs in kind-e2e, on the FUSE runner only;
+      # without one it is declared absent (its expectations unchecked).
+      - env:
+          CSI_LANE: ${{ vars.CONSTELLATION_FUSE_RUNNER == 'true' && '--require-lane' || '--absent-lane' }}
+        run: |
           set -o pipefail
           python3 tests/parity.py --expect tests/platform-parity.toml \
             --require-lane linux-fuse --require-lane linux-fuse-process \
+            "$CSI_LANE" linux-csi \
             results/results-*.json | tee -a "$GITHUB_STEP_SUMMARY"
 
   xfstests:
@@ -406,6 +411,19 @@ jobs:
           set -o pipefail
           KIND_CLUSTER=nightly-k8s-harness target/release/harness k8s-scenario --all \
             --image "$CSI_IMAGE" --results-json results-linux-k8s-kind.json 2>&1 | tee -a kind-e2e.log
+      # The linux-csi parity lane (plan 37 §12): `harness run`'s scenarios
+      # ported to pods, the rest reported skipped with the reason; the
+      # `parity` job compares it with linux-fuse. It runs even when the
+      # suite above failed, so the `parity` job reports the lane's own
+      # outcome rather than a missing lane.
+      - if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          KIND_CLUSTER=nightly-csi-parity target/release/harness k8s-scenario --parity \
+            --image "$CSI_IMAGE" --results-json results-linux-csi.json 2>&1 | tee linux-csi.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: harness-linux-csi, path: "*-linux-csi.*" }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -426,6 +444,8 @@ jobs:
           docker rm -f nightly-csi-e2e-floci || true
           kind delete cluster --name nightly-k8s-harness || true
           docker ps -aq --filter name='^nightly-k8s-harness-k8s-floci' | xargs -r docker rm -f || true
+          kind delete cluster --name nightly-csi-parity || true
+          docker ps -aq --filter name='^nightly-csi-parity-k8s-floci' | xargs -r docker rm -f || true
 
   # Plan 37 §13 / K5: the release gate for §8's headline guarantee — an
   # engine-pod image upgrade under an actively writing, creating and

@@ -7,7 +7,12 @@ metadata:
   name: {{ .name }}
   labels: {{- include "csi.labels" $ | nindent 4 }}
 provisioner: {{ $.Values.driverName }}
-parameters: {{- toYaml .parameters | nindent 2 }}
+{{- /* StorageClass parameters are strings: `shards: 4` in a values file is a
+number, which the API server refuses in a StorageClass. */}}
+parameters:
+  {{- range $key, $value := .parameters }}
+  {{ $key | quote }}: {{ include "csi.str" $value | quote }}
+  {{- end }}
 reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
 allowVolumeExpansion: {{ if hasKey . "allowVolumeExpansion" }}{{ .allowVolumeExpansion }}{{ else }}true{{ end }}
 volumeBindingMode: {{ .volumeBindingMode | default "Immediate" }}
@@ -26,6 +31,9 @@ metadata:
 driver: {{ $.Values.driverName }}
 deletionPolicy: {{ .deletionPolicy | default "Delete" }}
 {{- with .parameters }}
-parameters: {{- toYaml . | nindent 2 }}
+parameters:
+  {{- range $key, $value := . }}
+  {{ $key | quote }}: {{ include "csi.str" $value | quote }}
+  {{- end }}
 {{- end }}
 {{- end }}

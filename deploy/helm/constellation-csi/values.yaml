@@ -246,3 +246,13 @@ node:
 
 # Log filter (RUST_LOG).
 logLevel: info
+
+# `helm test` (templates/tests/volume-roundtrip.yaml): a PVC of this
+# StorageClass, a pod that writes and reads back 4 MiB through it, then a
+# second pod that mounts it afresh, checks it, empties it; Helm deletes all
+# three when the test passes (the volume goes to the pool's trash). Default:
+# the first class of `storageClasses`. With neither, `helm test` fails,
+# saying so — there is nothing to check.
+tests:
+  storageClassName: ""
+  size: 64Mi

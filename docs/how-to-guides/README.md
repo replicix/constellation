@@ -4,6 +4,7 @@ Goal-oriented directions for a specific task or problem.
 
 ## Operations
 
+- [Deploy as a Kubernetes CSI driver](kubernetes-csi.md) — the Helm chart, pool vs dedicated classes, sharding, static provisioning, mounting a pool by hand, upgrades, troubleshooting
 - [Enable P2P relays](operations/enable-p2p-relays.md) — public or self-hosted iroh relays for NAT / no-shared-L3 fleets
 - [Run a self-hosted iroh relay](operations/run-iroh-relay.md) — build and operate `iroh-relay` for Constellation
 - [Use a custom S3 endpoint](operations/use-custom-s3-endpoint.md) — floci / Localstack-style daemon on another host, create bucket, mount

@@ -11,7 +11,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels: {{- include "csi.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.controller.replicas }}
+  replicas: {{ include "csi.str" .Values.controller.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: constellation-csi
@@ -65,16 +65,16 @@ spec:
             - {name: CONSTELLATION_CSI_ENGINE_SERVICE_ACCOUNT, value: constellation-csi-engine}
             - {name: CONSTELLATION_CSI_ENGINE_RESOURCES, value: {{ .Values.engineProfile.resources | toJson | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_LOG_LEVEL, value: {{ .Values.engineProfile.logLevel | quote }}}
-            - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ .Values.engineProfile.readyTimeout | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ include "csi.str" .Values.engineProfile.readyTimeout | quote }}}
             # Plan 37 §"Deletion and purge" (K6b): the purge worker, in the
             # replica holding the constellation-csi-purge Lease.
             - name: POD_NAME
               valueFrom: {fieldRef: {fieldPath: metadata.name}}
-            - {name: CONSTELLATION_CSI_PURGE_INTERVAL, value: {{ .Values.purge.interval | quote }}}
-            - {name: CONSTELLATION_CSI_PURGE_GRACE, value: {{ .Values.purge.grace | quote }}}
-            - {name: CONSTELLATION_CSI_PURGE_MAX_CONCURRENT_DELETES, value: {{ .Values.purge.maxConcurrentDeletes | quote }}}
-            - {name: CONSTELLATION_CSI_PURGE_OPS_PER_SECOND, value: {{ .Values.purge.opsPerSecond | quote }}}
-            - {name: CONSTELLATION_CSI_PURGE_BYTES_PER_SECOND, value: {{ .Values.purge.bytesPerSecond | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_INTERVAL, value: {{ include "csi.str" .Values.purge.interval | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_GRACE, value: {{ include "csi.str" .Values.purge.grace | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_MAX_CONCURRENT_DELETES, value: {{ include "csi.str" .Values.purge.maxConcurrentDeletes | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_OPS_PER_SECOND, value: {{ include "csi.str" .Values.purge.opsPerSecond | quote }}}
+            - {name: CONSTELLATION_CSI_PURGE_BYTES_PER_SECOND, value: {{ include "csi.str" .Values.purge.bytesPerSecond | quote }}}
             # The purge Lease's timing: the sidecars' own.
             - {name: CONSTELLATION_CSI_LEADER_LEASE_DURATION, value: {{ .Values.controller.leaderElection.leaseDuration | quote }}}
             - {name: CONSTELLATION_CSI_LEADER_RENEW_DEADLINE, value: {{ .Values.controller.leaderElection.renewDeadline | quote }}}
@@ -90,9 +90,9 @@ spec:
           image: {{ include "csi.sidecar" (dict "root" . "sc" .Values.sidecars.livenessprobe) }}
           args:
             - --csi-address=/csi/csi.sock
-            - --health-port={{ .Values.controller.livenessPort }}
+            - --health-port={{ include "csi.str" .Values.controller.livenessPort }}
           ports:
-            - {name: healthz, containerPort: {{ .Values.controller.livenessPort }}, protocol: TCP}
+            - {name: healthz, containerPort: {{ include "csi.str" .Values.controller.livenessPort }}, protocol: TCP}
           livenessProbe:
             httpGet: {path: /healthz, port: healthz}
             initialDelaySeconds: 10

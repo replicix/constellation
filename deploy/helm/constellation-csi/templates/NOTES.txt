@@ -25,4 +25,15 @@ Verify registration:
   kubectl get csidriver {{ .Values.driverName }}
   kubectl get csinode
 
-Sharding guidance: TODO(37-k7b) — filled in from the K0b pool metadata ceiling.
+Sharding (StorageClass parameter `shards`, default 1) is for metadata
+throughput, not for a PV count: one pool filesystem sustained about
+1.2-1.4k volume-creation sequences per second in plan 37's measurement
+(K0 Track B; 1377/s with 64 in flight and no errors once K2 made quota.set
+per volume), with no PV-count limit found up to 10,000 volumes. Set
+`shards: N` (about N times that) when a class's volume churn approaches it;
+choose it when the class is created — a volume's shard is fixed by its
+name, and clones and restores stay in their source's shard.
+
+Check the install end to end (needs a StorageClass: tests.storageClassName,
+or one under storageClasses):
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}

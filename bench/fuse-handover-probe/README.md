@@ -1,6 +1,6 @@
 # fuse-handover-probe: fd passing and session handover between three processes
 
-Plan 37 milestone K0, Track A (`docs/plans/v1/wip/37-kubernetes-csi.md` §8, §15
+Plan 37 milestone K0, Track A (`docs/plans/v1/done/37-kubernetes-csi.md` §8, §15
 questions 1-5). Constellation's CSI driver (plan 37) mounts a PV in the **node
 plugin** (privileged: it calls `mount(2)` itself through
 `constellation_platform::linux::fuse_mount_fd`), hands the `/dev/fuse` descriptor to

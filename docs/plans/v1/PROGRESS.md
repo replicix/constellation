@@ -29397,7 +29397,7 @@ warm lane's name, and blessable as such).
 the plan.** Only §0.4 (snapshot row and record extensions) plus the hold
 surface plan 37 milestone K4 consumes is built here, so that K4 (CSI
 `CreateSnapshot`/`DeleteSnapshot`/`ListSnapshots`, §16 of
-[plan 37](wip/37-kubernetes-csi.md)) has no ad hoc hold-naming scheme to
+[plan 37](done/37-kubernetes-csi.md)) has no ad hoc hold-naming scheme to
 invent. A later session implements the rest of plan 32 — the policy
 language (Step 1), retention (Step 2), the scheduler (Step 3), expiry
 (Step 4), the rest of the CLI (Step 5), space accounting (Step 6) and the
@@ -29599,7 +29599,7 @@ environment or locale access exists anywhere in `parse` or `Display`.
 
 ## Plan 37 K0 Track A — fd passing and FUSE session handover
 
-Milestone K0 of [plan 37](wip/37-kubernetes-csi.md) (§15), Track A: the spike
+Milestone K0 of [plan 37](done/37-kubernetes-csi.md) (§15), Track A: the spike
 that has to answer questions 1-5 before K1-K7 are built on §8's session
 handover. Nothing in the product changed — two throwaway probes and a kind
 config. Full write-up and raw data: `bench/fuse-handover-probe/RESULTS.md`; the
@@ -29613,7 +29613,7 @@ recorded in its own section below.)
 | `stage_volume_probe`: the same first hop with the product in the path — `fuse_mount_fd` here, `view.mount{source: PreopenedFd}` to a running `constellation` daemon over its control socket, I/O through the mount, `view.list` | DONE | `crates/cli/examples/stage_volume_probe.rs` |
 | Runners (`run.sh [--deep] --in-container`, `stage-volume.sh --in-container`: root and `/dev/fuse` in a privileged container, since nobody has root on the host — `--deep` is the recorded 80-client run), README, RESULTS, raw JSON | DONE | `bench/fuse-handover-probe/` |
 | The kind cluster config as verified (control-plane without `extraMounts` as the control group, two workers with `/dev/fuse`), no node image pinned | DONE | `tests/csi/kind-config.yaml` |
-| "K0 results" written: prediction vs observation vs consequence for questions 1-5, plus the four gaps for K5/K3a | DONE | `docs/plans/v1/wip/37-kubernetes-csi.md` |
+| "K0 results" written: prediction vs observation vs consequence for questions 1-5, plus the four gaps for K5/K3a | DONE | `docs/plans/v1/done/37-kubernetes-csi.md` |
 
 **The answers.** (1) Stock `Session::from_fd` on an already-initialised
 connection reproduces §8's prediction exactly: `InvalidData`, "Received non-init
@@ -29963,7 +29963,7 @@ documents it correctly; whoever implements the rest of plan 33's file
 
 ## Plan 37 K0 Track B — pool `CreateVolume` metadata-throughput ceiling
 
-Milestone K0 of [plan 37](wip/37-kubernetes-csi.md) (§15), Track B: question
+Milestone K0 of [plan 37](done/37-kubernetes-csi.md) (§15), Track B: question
 6, run independently of Track A on the same host (2026-10-01). New harness
 driver only — no CSI code, no Kubernetes, no engine change. Full write-up,
 tables, measurement caveats and attribution: the plan's own "K0 results" →
@@ -29976,7 +29976,7 @@ tables, measurement caveats and attribution: the plan's own "K0 results" →
 | `node.ping` control-overhead ladder on the same grid and the same single-connection client shape, proving neither the socket nor the client is the bottleneck | DONE | same file, `run_ping_concurrency` |
 | End-of-run summary table (one row per concurrency level) and `ConcurrencySummary` JSON, so the published table's "seq/s" columns are computed by the tool (`sum(volumes)/sum(wall_s)`) rather than by hand | DONE | same file, `summarize`/`print_summary` |
 | Raw JSON + logs (two runs with the final driver, three with the first version) and a `README.md` with the exact re-run commands | DONE | `bench/csi-metadata/results/` |
-| "K0 results" → "Track B" section: both results (p99 knee *and* failure cliff), the cross-run host-dependence table, the four measurement caveats, the attribution traced to source, the guidance, the K2/K6 gap | DONE | `docs/plans/v1/wip/37-kubernetes-csi.md` |
+| "K0 results" → "Track B" section: both results (p99 knee *and* failure cliff), the cross-run host-dependence table, the four measurement caveats, the attribution traced to source, the guidance, the K2/K6 gap | DONE | `docs/plans/v1/done/37-kubernetes-csi.md` |
 
 **The answer: a super-linear p99 knee *and*, on top of it, a failure-rate
 cliff, both in the c=16…64 region.** The knee — what question 6 predicted —
@@ -30606,7 +30606,7 @@ assertion and the `v`-covered assertion fail too.
 
 ## Plan 37 K1 — `crates/csi` skeleton, packaging, driver registration
 
-Milestone K1 of [plan 37](wip/37-kubernetes-csi.md) (§15), chunks 37-k1a
+Milestone K1 of [plan 37](done/37-kubernetes-csi.md) (§15), chunks 37-k1a
 (crate skeleton + Identity service) and 37-k1b (image, Helm chart, kind
 registration). The driver registers on a kind cluster; no Controller/Node
 volume RPC exists yet (K2/K3).
@@ -31540,7 +31540,7 @@ check between evaluation and write
 
 ## Plan 37 K2 — Controller service: volumes and expansion
 
-Milestone K2 of [plan 37](wip/37-kubernetes-csi.md) (§15), chunks 37-k2a
+Milestone K2 of [plan 37](done/37-kubernetes-csi.md) (§15), chunks 37-k2a
 (the Controller service against the `ControlClient` seam, the `quota.set`
 barrier fix) and 37-k2b (controller-owned engine pods, the real control
 client, per-subtree quotas, the chart's provisioner/resizer, the kind gate).
@@ -33272,7 +33272,7 @@ Gates (fix round; `CARGO_TARGET_DIR` unset; harness prefix `m5dfix`):
 
 ## Plan 37 K3a — Node service: stage, publish, stats (review fix round)
 
-Chunk 37-k3a of [plan 37](wip/37-kubernetes-csi.md) (§15 K3, part 1), after
+Chunk 37-k3a of [plan 37](done/37-kubernetes-csi.md) (§15 K3, part 1), after
 its review. The full K3 entry is 37-k3b's to write; this section records
 what the fix round changed and decided.
 
@@ -34431,7 +34431,7 @@ during a 90s cut (0 -> 0)`. That is the evidence for the fix.
 
 ## Plan 37 K3 — Node service: stage, publish, mount, RWX (K3 closed)
 
-Milestone K3 of [plan 37](wip/37-kubernetes-csi.md) (§15) in two chunks.
+Milestone K3 of [plan 37](done/37-kubernetes-csi.md) (§15) in two chunks.
 37-k3a built the Node service, node-owned engine pods and their security
 (the review fix round is above). 37-k3b added the `harness k8s-scenario`
 mode, the four K3 scenarios and the CSI CI jobs, and fixed one bug in
@@ -36834,7 +36834,7 @@ Gates (2026-10-03, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536):
 
 ## Plan 37 K4 — Snapshots and clones (K4 closed)
 
-Milestone K4 of [plan 37](wip/37-kubernetes-csi.md) (§15), on plan 32's
+Milestone K4 of [plan 37](done/37-kubernetes-csi.md) (§15), on plan 32's
 held snapshots (the "Plan 32 Step 0.4 (holds)" subset). A `VolumeSnapshot`
 is a held Constellation snapshot of the volume's subtree; a PVC restored
 from one, or cloned from another PVC, is a metadata-only `clone.create`
@@ -40907,7 +40907,7 @@ Gates (this round, `AUTHORITY_SIM_THREADS=8`):
 
 ## Plan 37 K5 — FUSE session handover in production (K5 closed)
 
-Milestone K5 of [plan 37](wip/37-kubernetes-csi.md) (§8, §15). Part 1
+Milestone K5 of [plan 37](done/37-kubernetes-csi.md) (§8, §15). Part 1
 (37-k5a, merged as c28d849): the protocol against real engine pods, the
 node plugin's rollout, one kind run. Part 2 (37-k5b, this section's gate):
 the `csi-engine-pod-handoff-under-load` k8s-scenario, its 20-run gate and
@@ -42177,7 +42177,7 @@ Host shared with other agents (load 10–40). `CARGO_TARGET_DIR` unset,
 
 ## Plan 37 K6 — Credentials, security, drain, purge, GC (K6 closed)
 
-Milestone K6 of [plan 37](wip/37-kubernetes-csi.md) (§15), in two chunks:
+Milestone K6 of [plan 37](done/37-kubernetes-csi.md) (§15), in two chunks:
 37-k6a (credentials and security, merged as d1e56cd) and 37-k6b (engine-pod
 idle GC, node drain, the controller's purge worker, the K6 gate). The
 plan's §7 "Ownership and GC" / "Drain", §"Deletion and purge" and §9 carry
@@ -43798,3 +43798,207 @@ prefix `htd2`, `TMPDIR=/var/tmp/htd2`. The reviewer's repro (a labelled
 `constellation-harness-floci` with `/tmp/.constellation-harness.lock` held)
 now leaves the container alone, and a later run with the lock free sweeps it.
 Not run: `tests/compose-test.sh` (`bash -n` only), `fuse-inval-storm`.
+
+## Plan 37 K7 — Full e2e, parity lane, packaging, docs (K7 closed)
+
+Milestone K7 of [plan 37](done/37-kubernetes-csi.md) (§15), in two chunks:
+37-k7a (committed as 1aee527: the external storage e2e suite and the
+static-provisioning, human-CLI-mount and shard-routing scenarios) and 37-k7b
+(this one: the `linux-csi` parity lane, the chart finalised, packaging, the
+how-to guide, the `seLinuxMount` decision, the close-out). 37-k7b changes
+no driver code. The one bug the lane's gates surfaced was in a test script
+(`make csi-sanity`, below). The chart fix is templates only.
+
+| Item | State | Where |
+|---|---|---|
+| Kubernetes external storage e2e (`e2e.test -storage.testdriver`, v1.37.0): 89 specs, **64 passed, 0 failed, 25 skipped**, every skip the suite's own and justified; no skip regex (37-k7a) | DONE | `tests/csi/e2e.sh`, `testdriver.yaml`, `e2e-skips.md`, `e2e-tally.py` |
+| Engine fix the suite found: setgid directories pass their group (and the bit, to subdirectories) to new entries, which `fsGroup` relies on (37-k7a) | DONE | `crates/engine/src/view/create.rs` (`View::new_owner`) |
+| `csi-static-provisioning`, `csi-human-cli-mount`, `csi-shard-routing` k8s-scenarios (37-k7a) | DONE | `crates/harness/src/k8s/pool_access.rs` |
+| `size_bytes` = the accounting index's live `refer` (plan 32's REFER), no CSI call waiting on the index (37-k7a) | DONE | `crates/csi/src/controller/snapshots.rs` |
+| **`linux-csi` parity lane**: `harness k8s-scenario --parity` runs the `harness run` scenarios ported to pods (`baseline`, `two-clients-disjoint`, `two-clients-shared`, `git-workflow`, `truncate-never-resurrects`, and since the review round `xattr-roundtrip`, `fallocate-sparse`, `append-setattr-size`) under their own names and reports the other 215 skipped. Each is listed by hand in `SKIPPED` with its reason: the levers it pulls on its local clients (`LocalClient`), the covering k8s-scenario where there is one, or "not yet ported (F6)" | DONE | `crates/harness/src/k8s/parity.rs`, `pod_tool.pl`, `k8s.rs` `run`, `main.rs` |
+| `tests/platform-parity.toml`: 9 named `[[expect]]`s naming the k8s-scenario that covers each, 6 named "not yet ported (F6)" ones, and the one `LocalClient` capability wildcard (the `ClusterLocks` wildcard is gone: `csi-cross-pod-locks` covers cross-pod locking). Unit tests pin the file and `SKIPPED` to the catalog | DONE | `tests/platform-parity.toml`, `parity.rs` `parity_tests` |
+| `tests/parity.py --absent-lane LANE`: a lane the run deliberately did not produce (its expectations unchecked, "not run" in the summary, results for it a violation; never both required and absent) | DONE | `tests/parity.py`, `tests/test_parity.py` (31 tests) |
+| Nightly: `kind-e2e` runs the lane (artifact `harness-linux-csi`); `parity` needs `kind-e2e` and passes `--require-lane linux-csi` with the FUSE runner, `--absent-lane linux-csi` without | DONE | `.github/workflows/nightly.yml` |
+| **Chart bug from K7a fixed**: a number set with `--set` and carried through `helm upgrade --reuse-values` (or from a values file, or `--set-json`) arrived as a float64 and rendered as `1.6777216e+07`, which the controller refused. Every number now renders through `csi.str` (a whole number as an integer, a fractional one refused at render time); StorageClass/VolumeSnapshotClass parameters are rendered as strings (`shards: 4` in values used to be refused by the API server). The harness's `--set-string` workaround is gone | DONE | `templates/_helpers.tpl`, `controller.yaml`, `node.yaml`, `storageclass.yaml`; `crates/harness/src/k8s.rs` |
+| `tests/csi/chart-check.sh` (in `make csi-chart`, and `csi-unit` in `ci.yml`): `helm lint --strict` (defaults; every optional template on), large numbers through `--set`, `--set-json` and a values file render as exact integers with no exponent, a fraction is refused, the `helm test` hook renders with and without a class. Against the pre-fix templates it reports 25 failures | DONE | `tests/csi/chart-check.sh` |
+| **`helm test`**: `templates/tests/volume-roundtrip.yaml`: a PVC of `tests.storageClassName` (default: the first of `storageClasses`), a pod writing and reading back 4 MiB + a checksum + a directory, a second pod verifying them on a fresh mount and emptying the volume; deleted on success; without a class a pod that fails saying what to set. `tests/csi/e2e.sh` runs it in its setup | DONE | `deploy/helm/constellation-csi/templates/tests/`, `values.yaml` `tests` |
+| `NOTES.txt` with K0b's sharding sentence; `values.yaml` `tests` documented; chart `README.md`: building/publishing, `helm test`, the pool trust model and sharding, the human-CLI-mount rules (settled decision 18), SELinux | DONE | `deploy/helm/constellation-csi/` |
+| `make csi-image-dist` builds the image and saves it to `target/dist/csi/<image>.tar.gz` (`make csi-image` only builds, as the nightly jobs need); `make csi-chart` checks and packages the chart (`constellation-csi-0.1.0.tgz`). Nothing pushes; the publish commands are in RELEASING.md (with `image.repository` for a registry install) | DONE | `Makefile`, `docs/how-to-guides/development/RELEASING.md` |
+| How-to guide: install, layout selection, the three §6 classes (adjusted: Secrets in the release namespace, `Retain` for dedicated), sharding guidance (K0b's 1.2–1.4k/s, no PV-count limit to 10,000), `helm test`, snapshots/clones, static provisioning, the human-CLI-mount rules, credentials, upgrades by handover, SELinux nodes, troubleshooting (`node.status` through `constellation status pool --state-dir`, run in an engine pod on kind in the review round; the audit log; `--volume-health`; common failures) | DONE | `docs/how-to-guides/kubernetes-csi.md` (indexed in `docs/how-to-guides/README.md`) |
+| **`seLinuxMount`** (settled decision 13): stays `false`. The driver applies no mount options, and shared staging cannot honour per-pod labels for cross-namespace RWX. SELinux nodes need `virt_sandbox_use_fusefs`; the path to `true` is follow-up F7 | DONE | plan "K7 note: `seLinuxMount`", how-to §12, chart README |
+| `make csi-sanity` fixed (test script): since 37-k6a the in-memory engine pods of a `static-ephemeral` class wait for `fs.unlock` like real ones, and `tests/csi/sanity.sh` gave csi-sanity no secrets, so 6 Node specs failed `UNAVAILABLE` (no recorded run between K4 and here). It now passes the Secrets kubelet and the sidecars would (`--csi.secrets`, as `sanity-kind.sh` does) | DONE | `tests/csi/sanity.sh` |
+| TESTING.md: the `linux-csi` lane, `--absent-lane`, the chart check and `helm test`, CI | DONE | `docs/how-to-guides/development/TESTING.md` |
+
+### Scenario results (37-k7b, `kind-37-k7b`, kindest/node v1.37.0, image `constellation-csi:k7b`, reused cluster, one scenario per `harness k8s-scenario` process under the tool's 10-minute cap)
+
+| Scenario | Result |
+|---|---|
+| `csi-pod-rw`, `csi-rwx-across-nodes` | PASSED 49.2 s, 34.4 s |
+| `csi-many-pvs-one-pool` | PASSED 98.2 s: 50 PVCs in one pool filesystem, written and verified independently by 10 pods on both workers; 2 node-owned engine pods (25 views each) + 1 controller-owned for 50 PVs; per-PV quotas independent (`ENOSPC` per volume) |
+| `csi-plugin-restart-survives` | PASSED 60.0 s |
+| `csi-snapshot-clone-mount` | PASSED 99.0 s: restore + clone Bound 652 ms after creation, `clone.create` 5 ms and 4 ms |
+| `csi-clone-cross-pool-refused` | PASSED 180.4 s |
+| `csi-secret-rotation` | PASSED 42.8 s |
+| `csi-engine-pod-handoff-under-load` | PASSED 57.0 s: `pause_ms` 123, `handoff_ms` 136, 3956 calls, 0 errors |
+| `csi-node-drain` | PASSED 118.7 s |
+| `csi-trash-purge-under-load` | PASSED 450.2 s: all three trashed volumes (64 MiB, 100 000 files, small) purged 311.9 s after the delete (deadline 741 s); writers 1789 and 2153 iterations, longest 319 and 221 ms, zero errors, data intact. (A first attempt was cut at 590 s by my own `timeout`, set too short for its 426–562 s; not a product failure) |
+| `csi-static-provisioning`, `csi-human-cli-mount`, `csi-shard-routing` | PASSED 29.1 s, 36.5 s, 49.3 s |
+| `csi-pod-security` | PASSED 29.4 s |
+| `--parity` (the `linux-csi` lane) | 5 PASSED (`baseline` 28.1 s, `two-clients-disjoint` 36.6 s, `two-clients-shared` 33.6 s, `git-workflow` 34.0 s, `truncate-never-resurrects` 110.3 s), 218 reported skipped; after the review round 8 PASSED, 215 skipped (below) |
+| `tests/csi/e2e.sh` (`E2E_SETUP_ONLY=1`, then `E2E_REUSE=1 E2E_PROCS=6`) | `helm test`: PVC, writer, reader Succeeded; suite **64 passed, 0 failed, 25 skipped (of 89)**, 4 m 56 s |
+| `helm upgrade --reuse-values --set purge.bytesPerSecond=16777216 --set purge.opsPerSecond=5000000`, then another `--reuse-values` upgrade | controller env `"16777216"`, `"5000000"`; it started with `bytes_per_s: 16777216` (the K7a failure mode, fixed) |
+
+### Parity summary
+
+Final run, after the review round. `python3 tests/parity.py --expect tests/platform-parity.toml --require-lane linux-fuse --require-lane linux-csi results-*.json`: **PASS**, 0 violations.
+
+| Lane | Scenarios | passed | skipped | failed | Differs from `linux-fuse` | Excused by |
+|---|---:|---:|---:|---:|---:|---|
+| `linux-fuse` (reference) | 223 | 223 | 0 | 0 | — | — |
+| `linux-csi` | 223 | 8 | 215 | 0 | 215 | 9 named entries, each naming the k8s-scenario covering it (`upgrade-under-load`, `session-handover-idle`, `node-leave`, `quota-enforcement`, `snapshot-lifecycle`, `clone-workflow`, `snapshot-mount`, `csi-credential-revocation`, `flock-cross-node` → `csi-cross-pod-locks`); 6 named "not yet ported (F6)" entries (`forwarded-mutations`, `scratch-publish`, `e2e-basic`, `stress-ng-fs`, `existence-bloom-dedup`, `subtree-confinement`); the `LocalClient` wildcard 200, each skip's reason naming the levers it pulls |
+
+Zero unexplained differences: every skip carries its reason in the
+results file, and the summary's "Expected differences" table repeats the
+entry's. The reference lane's 223 are the full-matrix run below, with
+`delegate-backup-handoff-failover` from its rerun (seed 42) and the 11
+root-only scenarios from their root run. (The first K7b run, before the
+review: 5 passed, 218 skipped, excused by 8 named entries and the
+`ClusterLocks` (8) and `LocalClient` (202) wildcards.)
+
+### Gates (37-k7b worktree, kernel 7.3.0-rc4, `CARGO_TARGET_DIR` unset, `ulimit -n` 65536; per-worker harness prefixes `k7b-w{1,2,3}`, `TMPDIR=/var/tmp/k7b/tmp-w*`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | no diff after; clean |
+| `cargo test --workspace` (in pieces under the tool's time limits; `--no-fail-fast`) | **2699 passed, 0 failed**, 49 ignored: `constellation` 58 + 17; `constellation-authority` 268 + 4 + `sim` 123 (run in exact-name slices in parallel processes: the binary runs its tests on about one core); `constellation-engine` 596; every other member 1633 (`constellation-csi` 172 + 1, `constellation-harness` 90 with the 4 `parity_tests`). One test needed more than the time limit here: `sim` `streams_carry_the_log_and_save_tail_gets` (1200 seeded runs on on-disk stores) did not finish in 40 min (debug) or 39 min (release) with `TMPDIR` on this host's btrfs `/var/tmp`, where a profile showed it in btrfs and page-cache work, not spinning. With `TMPDIR` on tmpfs it **passed in 198 s (debug) and 26 s (release)**. Pre-existing and unrelated to K7b (no `crates/authority` change), recorded as F14 |
+| `bash tests/smoke.sh`; `bash tests/integration.sh` | SMOKE TEST PASSED; INTEGRATION TEST PASSED |
+| `target/release/harness run <one scenario>` for each of the 223 in `harness list` (a queue, three workers, `CONSTELLATION_VERSITYGW_BIN` set) | **211 PASSED, 1 FAILED, 11 SKIPPED** (root-only). `delegate-backup-handoff-failover` failed once ("a did not list b as its backup again within 90s of its upgrade", the flake plan 32's close-out records), then **3/3 PASSED** alone (seeds 42–44). The 11 `passthrough-*`/`zero-copy-*` **11/11 PASSED** as root (`sudo env -u XDG_RUNTIME_DIR HOME=/root … CONSTELLATION_HARNESS_DOCKER_PREFIX=k7b-root harness run …`; no root-owned file left). `fuse-inval-storm` passed. 37-k7b changes nothing on the `harness run` path |
+| `docker compose --profile test run --rm compliance` | **8798 passed, 0 failed**, COMPLIANCE TEST PASSED (baseline: 0 known failures). A first attempt under host load ~45 (the `sim` tests) failed `tests/lib.sh`'s 10 s mount wait and hung in cleanup; rerun at load ~20, passed |
+| `make csi-sanity` | Identity 3 passed; Identity\|Controller\|Node **65 passed, 0 failed**, 1 pending, 37 skipped (after the `sanity.sh` fix; before it 59 passed, 6 failed) |
+| `make csi-chart` (`tests/csi/chart-check.sh` + `helm package`) | all checks PASS; `target/dist/csi/constellation-csi-0.1.0.tgz` |
+| `make csi-image CSI_IMAGE=constellation-csi:k7b` | built in 2 m 38 s; `target/dist/csi/constellation-csi_k7b.tar.gz` |
+| `tests/csi/e2e.sh`, `helm test` | above |
+| `harness k8s-scenario` (each of the 14 of `--all`), `--parity` | 14/14 PASSED; lane clean (above) |
+| `python3 -m unittest discover -s tests -p 'test_parity.py'`; `python3 tests/parity.py …` | 31 OK; PASS |
+| `--parity` again with the final `target/release/harness` (after `cargo fmt`), then `tests/parity.py` | 5 PASSED (29.2, 35.4, 35.7, 34.1, 108.2 s); PASS |
+| `kind delete cluster --name kind-37-k7b` | deleted, with its floci containers; `kind get clusters` empty |
+
+### Exit criteria (plan 37 §15 K7)
+
+- [x] Kubernetes external storage e2e full suite green (64/0/25 of 89; every skip justified in `tests/csi/e2e-skips.md`).
+- [x] `linux-csi` parity lane wired into `tests/parity.py` with the §12 `[[expect]]`s (adapted to the catalog: §12's "fusermount-flags" and "local-daemon-upgrade" are not scenario names; the latter's intent is the `upgrade-under-load`/`session-handover-idle` entries; the `cluster_locks` wildcard was replaced by `csi-cross-pod-locks` in the review round), zero unexplained differences.
+- [x] Helm chart finalised with `helm test` (passes on kind, nightly in `e2e.sh`).
+- [x] Container image built and packaged with its publish recipe. Not published: no push is in this repository's remit; RELEASING.md has the commands.
+- [x] `seLinuxMount` revisited with a concrete recommendation (stays `false`; plan "K7 note").
+- [x] Static-provisioning, human-CLI-mount and shard-routing k8s-scenarios pass.
+- [x] The how-to guide publishes K0 Track B's sharding guidance and covers pool vs dedicated layout selection and static provisioning.
+- [x] The full `k8s-scenario` suite green; `PROGRESS.md`/`TESTING.md` updated.
+- [ ] Every CI job in §13 green: **not observable from here.** No GitHub
+  Actions run was made. Each job's local equivalent is green (the gates
+  table above). `kind-e2e` and `upgrade-under-load` need the self-hosted
+  FUSE runner (`CONSTELLATION_FUSE_RUNNER`).
+
+### Review round (37-k7b fix)
+
+The review's must-fix: the lane gave a made-up `LocalClient` capability to
+every scenario not ported, so its wildcard bound all 202 with one generic
+reason. That could never go stale, excused new scenarios automatically, and
+was untrue for scenarios that only mount and do file operations. Changes:
+
+| Item | State | Where |
+|---|---|---|
+| `SKIPPED`: an explicit table of the 215 skipped names, each with what it needs: `Local` (the levers it pulls on its local clients, named in the reason with `LocalClient`), `Covered` (the same, plus the covering k8s-scenario), `Unported` ("not yet ported (F6)", no `LocalClient`: only a named parity entry excuses it). Unit tests: every catalog name ported or listed once, in catalog order; `LocalClient` in exactly the lever reasons; the parity file names exactly the `Covered` and `Unported` ones; its only wildcard is `LocalClient`'s | DONE | `crates/harness/src/k8s/parity.rs` |
+| Three more ports: `xattr-roundtrip` (decided: through a pool PV's subtree view, `user.constellation.rsize`/`rcount` are those of the directory asked, in the filesystem. The PV root reports the volume's own totals, never the pool's, and a second PV of the same pool on the same engine pod does not count. Measured: `tree` and the PV root both report 1073741831 bytes, 2 files), `fallocate-sparse` (19 chunk objects for the 256 MiB file; the original's local run reported 18), `append-setattr-size` (768 MiB per leg under 44 attribute changes and 5 `fdatasync`s, every block in place on both workers and on a fresh engine pod) | DONE | `parity.rs`, `pod_tool.pl` |
+| Should-fix 1: `csi-cross-pod-locks`, a two-worker `flock` and `fcntl` scenario on an RWX PV. It covers exclusion and blocking, shared locks, an overlapping range refused and named by `F_GETLK`, a 2 × 50 locked counter reading 100 on both, and both locks released to the other worker when the holding pod is deleted. The `ClusterLocks` wildcard is gone; `flock-cross-node` is named with this scenario | DONE | `crates/harness/src/k8s/scenarios.rs`, `tests/platform-parity.toml`, plan §12 "As built (37-k7b)" |
+| Should-fix 2: the how-to's `constellation status pool --state-dir /var/lib/constellation/state` was run in a node-owned engine pod on kind: rc 0, `node.status` JSON on stdout (it reaches the socket through the state directory's `control.path`). The audit-log `tail` was run there too. The guide now says which stream carries the JSON | DONE | `docs/how-to-guides/kubernetes-csi.md` |
+| Nits: the nightly parity-lane step runs `if: ${{ !cancelled() }}`; the image tarball moved to `make csi-image-dist` (nightly builds with `csi-image` only); RELEASING.md sets `image.repository` for a registry install; `terminationGracePeriodSeconds` goes through `csi.str`, so a fractional `node.drain.preStopTimeoutSeconds` is refused like every other number (chart-check covers both, and the large-number render of `12345708`) | DONE | `nightly.yml`, `Makefile`, RELEASING.md, `node.yaml`, `tests/csi/chart-check.sh` |
+
+Gates, this round (`CARGO_TARGET_DIR` unset, `ulimit -n` 65536): `cargo fmt
+--all` (no diff); `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `cargo test -p constellation-harness -p constellation-csi`: harness
+91 + 2 (5 `parity_tests`), csi 172 + 1 + 1, 0 failed; `python3
+tests/test_parity.py` 31 OK; `tests/csi/chart-check.sh` all PASS. One kind
+cluster (`kind-37-k7b`, image `constellation-csi:k7b`: no driver or engine
+change since it was built): `csi-cross-pod-locks` 1 + 3/3 PASSED
+(`flock_handoff_ms` 1602, `release_on_delete_ms` 2954–9762); `csi-pod-rw`
+PASSED (the troubleshooting check ran beside it); `--parity` twice, 8/8
+PASSED both times (the second with the final binary: 25, 36, 36, 31, 112,
+38, 95, 118 s); `tests/parity.py` PASS, 0 violations. The cluster was
+deleted.
+
+## Plan 37 — close-out
+
+Plan 37 (Kubernetes CSI driver) is done: K0–K7 closed, the plan moved to
+`done/37-kubernetes-csi.md`. This section is §18's report.
+
+### §18 Definition of done
+
+| # | Item | State | Evidence |
+|---|---|---|---|
+| 1 | Every milestone's gate (K0–K7), including K5's 20-run zero-`ENOTCONN` bar | met | "Plan 37 K0 Track A", "K0 Track B", "K1" … "K6" (each closed with its exit criteria), "K7" above. K5: 20/20 consecutive runs at the gate and 20/20 more on the final code, 0 errors of any kind |
+| 2 | CI green (`csi-unit`, `csi-sanity`, `kind-e2e`, `upgrade-under-load`; the `linux-csi` lane with zero unexplained differences) | met locally, not observed on GitHub | Per-job tallies below. The lane: PASS, 0 violations (8 run, 215 skipped, each listed by hand with its reason) |
+| 3 | External storage e2e full suite green | met | 64 passed, 0 failed, 25 skipped of 89 (37-k7a and 37-k7b) |
+| 4 | The chart installs on a bare kind cluster and passes its `helm test` | met | A fresh `kind-37-k7b` (`tests/csi/kind-up.sh`), the chart `helm upgrade --install`ed onto it (`e2e.sh` → `kind-up.sh --install`); `helm test`: test-volume, test-write and test-read Succeeded |
+| 5 | Linux reference lane unchanged: pjdfstest 8798/8798, the full harness matrix passes | met | Gates table above. The CSI work touched the engine once, for the setgid fix (37-k7a, through the same gates) |
+| 6 | Docs: PROGRESS with the K0 matrix (both tracks); TESTING (`linux-csi`, csi-sanity, k8s-scenario); the how-to guide (layouts, sharding, static provisioning, human-CLI rules); the plan 31/32/33 needs filed as tracked follow-ups | met | K0 matrices: the plan's "K0 results" (Track A rows 1–5, Track B question 6) and PROGRESS "Plan 37 K0 Track A"/"Track B"; TESTING "Kubernetes CSI driver (plan 37)", "The `linux-csi` parity lane", "Kubernetes lane"; `docs/how-to-guides/kubernetes-csi.md`; follow-ups below |
+| 7 | Pool scenarios pass: many PVs in one pool, clone/restore within a pool and refusal across pools, trash purge under load, static provisioning, human CLI mount, shard routing | met | K7 scenario table above (and K3–K7's own runs) |
+| 8 | Report: per-job CI tallies, the K0 matrix, K5's p50/p99 and 20-run tally, pool scenario results, parity summary | met | Here and below |
+
+**Per-job tallies (local equivalents, 2026-10-06):**
+
+| Job | Where | Local run | Result |
+|---|---|---|---|
+| `csi-unit` | `ci.yml` | `cargo test -p constellation-csi` (inside `cargo test --workspace`) + `make csi-chart` | 172 + 1 passed, 0 failed; chart check all PASS |
+| `csi-sanity` | `nightly.yml` | `make csi-sanity` | 3 + 65 passed, 0 failed |
+| `kind-e2e` | `nightly.yml` (FUSE runner) | `tests/csi/e2e.sh` (with `helm test`), the `k8s-scenario`s, `--parity` | 64/0/25; the 14 of the first run 14/14, and the review round's `csi-cross-pod-locks` 3/3; 8 passed + 215 skipped, parity PASS |
+| `upgrade-under-load` | `nightly.yml` (FUSE runner) | K5's `--repeat 20` (not rerun in K7: no handoff code changed since) and 1 run here | 20/20, 0 errors, `handoff_ms` p50 338 / p99 535 ms; here `pause_ms` 123 ms, 0 errors |
+| `parity` | `nightly.yml` | `tests/parity.py` + its unit tests | PASS; 31 OK |
+| `harness`, `compliance`, `integration`, lint, unit | both | the CONVENTIONS gates | above |
+
+**K0 results matrix.** In the plan, "K0 results": Track A (questions 1–5:
+fd passing, `detach`/`resume` with writers, readers and fio throughout,
+`NodeStageVolume` through `fuse_mount_fd`, `/dev/fuse` in kind) and Track
+B (question 6: one pool's `CreateVolume` metadata ceiling, 1.2–1.4k
+sequences/s, no PV-count limit through 10,000; after K2's
+`quota.set{subtree}`, 1377/s at 64 in flight with 0 errors). PROGRESS
+"Plan 37 K0 Track A" and "Plan 37 K0 Track B" hold the item tables and
+gates.
+
+**K5 handoff numbers.** First 20-run gate, 2026-10-03: 20/20, `handoff_ms`
+p50 442 / p99 1057 ms. The final 20 on the finished code: 20/20, p50 338 /
+p99 535 ms, 0 errors. Review-round re-measure, gated on the writer-visible
+`pause_ms`: 10/10, p50 300 / p99 1161 ms (§8's bound is 2 s), 0 errors in
+148,302 calls. Detail in "Plan 37 K5".
+
+**Pool scenarios.** All green in K7 (table above): `csi-many-pvs-one-pool`,
+`csi-snapshot-clone-mount`, `csi-clone-cross-pool-refused`,
+`csi-trash-purge-under-load` (100 000-file volume purged within the
+deadline, zero writer errors), `csi-static-provisioning`,
+`csi-human-cli-mount`, `csi-shard-routing`.
+
+**Parity.** `linux-csi` against `linux-fuse`: 223 scenarios, 8 run (all
+passed), 215 skipped, each listed by hand with its reason and excused by a
+named entry (15) or the `LocalClient` capability wildcard (200). 0
+violations. The table is under "Plan 37 K7".
+
+### Tracked follow-ups
+
+§16's needs from plans 31, 32 and 33, as they stand at close, and what K0–K7
+left open. "Owner" is the plan or chunk expected to pick it up.
+
+| # | Item | Owner | State |
+|---|---|---|---|
+| F1 | Plan 31's `browse.*` family (`browse.mkdir`, `rename`, `readdir`, `delete`, `xattr`, and since then `inspect`, `stat`, `read`, `write`), which the pool design uses | plan 31 | **closed**: in `crates/control/src/methods.rs`, used by the controller and the purge worker |
+| F2 | Plan 32 holds with owner namespaces (`csi:<VolumeSnapshotContent uid>`, invisible to policy expiry and pruning) | plan 32 Step 0.4 | **closed**: used by `CreateSnapshot`/`DeleteSnapshot` (K4) |
+| F3 | Plan 32 `size_bytes` = REFER | plan 32 / 37-k7a | **closed**: the index's live `refer`, falling back to `refer_bytes` (37-k7a; nothing open in plan 32's close-out) |
+| F4 | Plan 33 U1 service principals (`kind = "service"` grants, `principal.kind = "service"` in the audit log, PV names in `on_behalf_of`) | plan 33 U1 | **closed**: the node plugin's and controller's grants (37-k6a) |
+| F5 | A k8s-scenario taking cluster locks (`flock`/`fcntl`) across pods on two workers through one RWX PV | plan 37 follow-up | **closed** in the K7b review round: `csi-cross-pod-locks` (exclusion, shared locks, `fcntl` ranges and `F_GETLK`, a 2 × 50 locked counter, release on pod deletion); the `ClusterLocks` wildcard is gone |
+| F6 | Port the `harness run` scenarios that need no local-client lever to the `linux-csi` lane. They are `Skip::Unported` in `parity.rs` and named in the parity file: `subtree-confinement` (`..`, symlinks and hard links at a view root, which is what a pool PV is: first), `forwarded-mutations`, `scratch-publish`, `existence-bloom-dedup`, `e2e-basic` (an `e2e=true` class, a bucket scan, a wrong-passphrase Secret), `stress-ng-fs` (needs stress-ng in a test image). Beyond those, a three- or four-worker kind lane would bring the 3/4-node scenarios (`mkdir-p-race`, `cto-bounded`, `marker-order`, ...) within reach | plan 37 follow-up | **open** |
+| F7 | SELinux: honour a `context=` from the capability's mount flags (and a class-wide `mountOptions`) at `NodeStageVolume`; verify on an enforcing node (not kind); then declare `seLinuxMount: true` (plan "K7 note") | plan 37 follow-up | **open** |
+| F8 | Plan 33 UI, Screen 3: CSI-provisioned views filtered by `pv`/`pvc`/`namespace`/`pool`/`shard`, the pool hierarchy (`StorageClass` → pool → shards → volumes) with capacity vs used, snapshots, trash/purge status, safe actions only (inspect, purge-now) | plan 33 | **open**: specified in plan 33 ("CSI pools", "CSI-provisioned views") |
+| F9 | Plan 33 UI, Screen 5: `csi:`-held snapshots shown as externally owned; deleting one needs admin and an explicit override | plan 33 | **open**: specified in plan 33 ("Externally-owned snapshots") |
+| F10 | §10 observability not built: the purge worker's `constellation_csi_purge_{pending,deleted,failed}_total{pool,shard}` / `_duration_seconds`, and the PVC `Event`s (engine pod replaced, quota near/at limit, handoff fallback). Today: the handoff counters on the node plugin's `/metrics`, events on engine pods, the purge worker's logs | plan 37 follow-up | **open** |
+| F11 | K5's open items: one unreproduced `EIO` pair during a rollout under a loaded control plane, before any handoff; a `VolumeSnapshot` requested within ~150 ms of a handoff's `Prepare` is cut on the CSI retry, 30 s later | plan 37 / engine | **open** (PROGRESS "Plan 37 K5") |
+| F12 | §17 risks, deferred by design: one shared FUSE mount per filesystem instead of one connection per PV (if fd/kernel cost bites at high PV-per-node counts); a per-pod admission exception instead of a `privileged` namespace; an incremental/resumable purge of huge trashed volumes; a revisit of the idle-TTL default (10 m); clones into dedicated volumes (a full copy) and dropping a dedicated volume's filesystem on `DeleteVolume` (both refused today) | plan 37 follow-up | **open** |
+| F13 | `tests/ci/install-native-s3.sh` release checksums (empty; `auto` falls back to `go install`) | CI owner | **open** (pre-existing) |
+| F14 | `constellation-authority` `sim` `streams_carry_the_log_and_save_tail_gets` takes over 40 min with `TMPDIR` on btrfs (this host's `/var/tmp`) and 26 s–3 min on tmpfs. The sim's stores do real file I/O; either keep them in memory or document a tmpfs `TMPDIR` for `cargo test` | authority owner | **open** (pre-existing; found here) |

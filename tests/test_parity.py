@@ -10,6 +10,7 @@ that stopped matching reality must fail too.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -93,23 +94,116 @@ class ParityTests(unittest.TestCase):
         self.assertIn("**PASS**", r.stdout)
         self.assertIn("| `linux-fuse-process` |", r.stdout)
 
-    def test_seeded_file_parses_and_is_empty(self):
+    def test_seeded_file_parses_and_holds_only_linux_csi_entries(self):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "platform-parity.toml")
         cfg = parity.load_config(path)
         self.assertEqual(cfg.reference, "linux-fuse")
-        self.assertEqual(cfg.expects, [])
+        # linux-fuse-process starts with no expectations; every entry is
+        # the plan 37 CSI lane's, and its wildcards are capability-bound.
+        self.assertTrue(cfg.expects)
+        for e in cfg.expects:
+            self.assertEqual(e.lanes, ("linux-csi",))
+            if e.wildcard:
+                self.assertEqual(e.cap, "LocalClient")
         docs = [all_passed("linux-fuse"), all_passed("linux-fuse-process")]
-        with Run(docs) as r:
-            self.assertEqual(r.code, 0)
-        # The real file, through the CLI.
         with tempfile.TemporaryDirectory() as d:
             paths = []
             for i, doc in enumerate(docs):
                 paths.append(os.path.join(d, f"r{i}.json"))
                 with open(paths[-1], "w") as fh:
                     json.dump(doc, fh)
+            out = io.StringIO()
+            # Without the CSI lane its entries are stale, unless the run
+            # says it did not run it.
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(parity.main(["--expect", path, *paths]), 1)
+            self.assertIn("| stale-expect | `linux-csi` |", out.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = parity.main(["--expect", path, "--absent-lane", "linux-csi", *paths])
+            self.assertEqual(code, 0, out.getvalue())
+            self.assertIn("| `linux-csi` | not run (`--absent-lane`) |", out.getvalue())
+
+    def test_real_file_against_a_csi_lane(self):
+        # The lane's shape (crates/harness/src/k8s/parity.rs): ported
+        # scenarios pass; a skip pulling a local-client lever names
+        # LocalClient and the lever; a lever-less one says "not yet ported"
+        # and is excused only by its named entry.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "platform-parity.toml")
+        local = "requires capability LocalClient: SIGKILLs a client and remounts it"
+        unported = "not yet ported to pods (follow-up F6): needs only two mounts"
+        names = ["baseline", "upgrade-under-load", "flock-cross-node", "kill9-remount", "scratch-publish"]
+        csi = results(
+            "linux-csi",
+            {
+                "baseline": "passed",
+                "upgrade-under-load": ("skipped", local + "; covered ..."),
+                "flock-cross-node": ("skipped", local + "; covered ..."),
+                "kill9-remount": ("skipped", local),
+                "scratch-publish": ("skipped", unported),
+            },
+        )
+        # Every named entry needs its scenario in the results, so give the
+        # reference all of them (the absent ones would be stale).
+        cfg = parity.load_config(path)
+        named = [e.scenario for e in cfg.expects if not e.wildcard]
+        self.assertIn("flock-cross-node", named)
+        self.assertIn("scratch-publish", named)
+        for n in named:
+            if n not in names:
+                names.append(n)
+                csi["scenarios"].append(
+                    {"name": n, "outcome": "skipped", "seconds": 0.0, "reason": local}
+                )
+        lanes = {}
+        parity.merge_results(lanes, all_passed("linux-fuse", names))
+        parity.merge_results(lanes, csi)
+        rep = parity.check(lanes, cfg, ["linux-csi"])
+        self.assertTrue(rep.ok, rep.violations)
+        why = {c.scenario: c.why for c in rep.covered}
+        self.assertIn("csi-engine-pod-handoff-under-load", why["upgrade-under-load"])
+        self.assertIn("csi-cross-pod-locks", why["flock-cross-node"])
+        self.assertIn("levers", why["kill9-remount"])
+        self.assertIn("F6", why["scratch-publish"])
+        # An unported scenario without its named entry is not excused by
+        # the wildcard: its reason does not name LocalClient.
+        cfg_wild = dataclasses.replace(
+            cfg, expects=[e for e in cfg.expects if e.scenario != "scratch-publish"]
+        )
+        rep = parity.check(lanes, cfg_wild, ["linux-csi"])
+        self.assertEqual([(v.kind, v.scenario) for v in rep.violations], [("mismatch", "scratch-publish")])
+        # A ported scenario that fails, or one skipped for another reason,
+        # is not excused.
+        csi["scenarios"][3]["reason"] = "fio not installed"
+        lanes = {}
+        parity.merge_results(lanes, all_passed("linux-fuse", names))
+        parity.merge_results(lanes, csi)
+        rep = parity.check(lanes, cfg, ["linux-csi"])
+        # (The LocalClient wildcard excused only kill9-remount: now stale.)
+        self.assertEqual([v.kind for v in rep.violations], ["mismatch", "stale-expect"])
+        self.assertEqual(rep.violations[0].scenario, "kill9-remount")
+
+    def test_absent_lane(self):
+        toml = expect(lanes=("linux-csi",), cap="LocalClient", scenario="*")
+        docs = [all_passed("linux-fuse"), all_passed("linux-fuse-process")]
+        with Run(docs, toml=toml) as r:
+            self.assertEqual(r.code, 1)
+        with Run(docs, toml=toml) as r:
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(parity.main(["--expect", path, *paths]), 0)
+                self.assertEqual(parity.main(["--absent-lane", "linux-csi"] + r.args), 0)
+        # Declared absent but present: a violation, not a silent pass.
+        lanes = {}
+        parity.merge_results(lanes, all_passed("linux-fuse"))
+        parity.merge_results(lanes, all_passed("linux-csi"))
+        rep = parity.check(lanes, parity.Config(), absent=["linux-csi"])
+        self.assertEqual([v.kind for v in rep.violations], ["absent-lane"])
+        # Required and absent at once is unusable input.
+        with Run(docs, toml=toml) as r:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = parity.main(
+                    ["--absent-lane", "linux-csi", "--require-lane", "linux-csi"] + r.args
+                )
+        self.assertEqual(code, 2)
 
     def test_deliberate_mismatch_fails_closed(self):
         lane = all_passed("linux-fuse-process")

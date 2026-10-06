@@ -1,7 +1,7 @@
 # constellation-csi
 
 The Kubernetes CSI driver for Constellation (plan 37,
-`docs/plans/v1/wip/37-kubernetes-csi.md`): a controller `Deployment`, a node
+`docs/plans/v1/done/37-kubernetes-csi.md`): a controller `Deployment`, a node
 plugin `DaemonSet`, and the engine pods both start — one per pool filesystem
 for the controller, one per (pool filesystem, node) for each node plugin.
 Everything is in the release namespace.
@@ -11,6 +11,89 @@ helm upgrade --install constellation-csi deploy/helm/constellation-csi \
     -n constellation-csi --create-namespace
 kubectl label namespace constellation-csi pod-security.kubernetes.io/enforce=privileged
 ```
+
+The how-to guide, `docs/how-to-guides/kubernetes-csi.md`, walks through a
+deployment: the classes (pool, sharded pool, dedicated), static
+provisioning, snapshots and clones, upgrades and troubleshooting.
+`values.yaml` documents every value. Numbers may come from `--set`, a
+values file or `helm upgrade --reuse-values`: each renders as an integer,
+and a fractional one is refused (`tests/csi/chart-check.sh`).
+
+## Building, checking, publishing
+
+```bash
+make csi-image CSI_IMAGE=constellation-csi:dev        # the image, in the local docker
+make csi-image-dist CSI_IMAGE=constellation-csi:dev   # and target/dist/csi/constellation-csi_dev.tar.gz
+make csi-chart                                        # lint + render checks, then target/dist/csi/constellation-csi-<version>.tgz
+```
+
+Nothing pushes. The publish commands (`docker push`, `helm push
+oci://…`) are in `docs/how-to-guides/development/RELEASING.md`.
+
+## Checking an install: `helm test`
+
+```bash
+helm test constellation-csi -n constellation-csi
+```
+
+`templates/tests/volume-roundtrip.yaml` binds a PVC of
+`tests.storageClassName` (default: the first of `storageClasses`). A pod
+writes 4 MiB, a checksum and a directory, and reads them back. A second pod
+then mounts the volume afresh, verifies it and empties it. Helm deletes all
+three when the test passes; the volume goes to the pool's trash. A failed
+test leaves them for `kubectl logs`. Without a class the test fails and
+says what to set. `tests/csi/e2e.sh` runs it on every nightly.
+
+## Pools: the trust model and sharding
+
+A `layout: pool` class is one Constellation filesystem shared by all its
+volumes (subtrees `/volumes/<pv>`): one E2E key, one metadata commit
+chain, one GC domain, one engine pod per node for all of them. A subtree
+view confines each volume's mount, but the engine pod can reach the whole
+pool, so **the `StorageClass` is the isolation boundary**. Tenants that
+must not share a failure or trust domain need their own class (their own
+prefix and credentials, or `layout: dedicated`), not just their own PVCs.
+
+`shards: N` spreads a class's volumes over N pool filesystems by a hash of
+the volume name, for **metadata throughput**. One pool filesystem
+sustained about 1.2–1.4k volume-creation sequences per second (plan 37
+K0 Track B: 1377/s, 64 in flight, no errors), and no PV-count limit was
+found up to 10,000 volumes. Start at 1, and shard a class whose volume
+churn approaches that rate. Choose N when creating the class: clones and
+restores stay in their source's shard.
+
+## Mounting a pool outside Kubernetes
+
+People may mount a pool with the ordinary CLI to inspect a volume, seed a
+dataset for static provisioning or copy a volume out:
+
+```bash
+constellation mount pool:/volumes/pvc-1a2b… /mnt/pv --s3 s3://<bucket>/<prefix>[/shard-<k>]
+```
+
+The rules (plan 37 settled decision 18):
+
+- The volume's quota governs the person's writes exactly as the pod's
+  (`ENOSPC` past it), and both see each other's closed files
+  (close-to-open).
+- Deleting a volume's contents by hand is not prevented (Constellation
+  cannot tell an admin's `rm -rf` from the application's deletes), but it
+  is detected. The node plugin reports the volume abnormal (`DATA_LOSS`,
+  `VolumeRemoved` from `NodeGetVolumeHealth`) instead of serving an empty
+  mount as healthy. Delete volumes through their PVC.
+- Leave `/volumes` and `/.trash` themselves to the driver. Seed datasets
+  elsewhere (`/datasets/…`) and bind them with a static PV.
+- `constellation leave` once done: the mount was a node of the pool's
+  cluster.
+
+## SELinux
+
+The `CSIDriver` declares `seLinuxMount: false`. Every pod that publishes a
+volume on a node shares its one staging mount, and the driver does not
+apply mount options. On SELinux-enforcing nodes let containers use FUSE
+mounts with `setsebool -P virt_sandbox_use_fusefs on` (all FUSE mounts on
+the node, not per volume). The reasoning, and the follow-up that would
+allow `true`, are in the how-to guide.
 
 ## Who is privileged (plan 37 §9)
 

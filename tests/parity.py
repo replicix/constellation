@@ -2,7 +2,7 @@
 """Platform parity checker (plan 31 C6, DESIGN in plan 31 section 8/12).
 
     python3 tests/parity.py --expect tests/platform-parity.toml \
-        [--require-lane LANE ...] results/results-*.json
+        [--require-lane LANE ...] [--absent-lane LANE ...] results/results-*.json
 
 Inputs are the `--results-json` files of `harness run` (schema 1, see
 crates/harness/src/results.rs). Files that share a `lane` are shards of one
@@ -23,7 +23,12 @@ touching this checker). For every other lane and every scenario:
     violation, and `failed` can never be expected;
   * every `--require-lane` must have results (CI names the lanes it ran, so
     a lane whose job died before writing its results file cannot drop out
-    of the comparison unnoticed).
+    of the comparison unnoticed);
+  * an `--absent-lane` is one this run deliberately did not produce (the
+    `linux-csi` lane needs a FUSE-capable kind runner that a workflow may
+    not have): its `[[expect]]` entries are not checked, the summary says
+    it was not run, and results for it are a violation. A lane cannot be
+    both required and absent.
 
 Expectations are two-way, like the xfstests baseline: an `[[expect]]` entry
 that no longer matches reality fails the check too. That covers a lane or
@@ -130,6 +135,7 @@ class Covered:
 class Report:
     lanes: Lanes
     config: Config
+    absent: tuple[str, ...] = ()
     violations: list[Violation] = field(default_factory=list)
     covered: list[Covered] = field(default_factory=list)
     # (scenario, lane, reference outcome, lane outcome) for the diff table
@@ -264,9 +270,28 @@ def parse_expect(raw: object, where: str) -> Expect:
 # Checking
 
 
-def check(lanes: Lanes, cfg: Config, required: list[str] | tuple[str, ...] = ()) -> Report:
-    rep = Report(lanes, cfg)
+def check(
+    lanes: Lanes,
+    cfg: Config,
+    required: list[str] | tuple[str, ...] = (),
+    absent: list[str] | tuple[str, ...] = (),
+) -> Report:
+    both = sorted(set(required) & set(absent))
+    if both:
+        raise ParityError(f"lane(s) {both} both required and absent")
+    rep = Report(lanes, cfg, tuple(sorted(set(absent))))
     add = rep.violations.append
+
+    for lane in rep.absent:
+        if lane in lanes:
+            add(
+                Violation(
+                    "absent-lane",
+                    lane,
+                    "*",
+                    "declared absent (--absent-lane) but has results; check it or drop the flag",
+                )
+            )
 
     for lane in sorted(set(required)):
         if lane not in lanes:
@@ -377,6 +402,8 @@ def stale_check(rep: Report, lanes: Lanes, cfg: Config, used: set[tuple[int, str
     add = rep.violations.append
     for i, e in enumerate(cfg.expects):
         for lane in e.lanes:
+            if lane in rep.absent:
+                continue
             if lane not in lanes:
                 add(Violation("stale-expect", lane, e.scenario, f"lane not in results ({e.label()})"))
             elif lane == cfg.reference_of(lane):
@@ -459,6 +486,9 @@ def render(rep: Report) -> str:
             f"| `{lane}` | {'(reference)' if ref == lane else '`' + ref + '`'} | {len(res)} "
             f"| {n['passed']} | {n['skipped']} | {n['failed']} | {diffs_by_lane.get(lane, 0)} |"
         )
+    for lane in rep.absent:
+        if lane not in rep.lanes:
+            out.append(f"| `{lane}` | not run (`--absent-lane`) | | | | | |")
     if rep.violations:
         out += ["", "### Violations", "", "| Kind | Lane | Scenario | Detail |", "|---|---|---|---|"]
         for v in rep.violations:
@@ -500,12 +530,20 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="a lane that must have results (repeatable); a missing one is a violation",
     )
+    ap.add_argument(
+        "--absent-lane",
+        metavar="LANE",
+        action="append",
+        default=[],
+        help="a lane deliberately not run (repeatable): its expectations are not checked, "
+        "and results for it are a violation",
+    )
     ap.add_argument("results", nargs="+", metavar="results.json", help="harness --results-json files")
     args = ap.parse_args(argv)
     try:
         cfg = load_config(args.expect)
         lanes = load_results(args.results)
-        rep = check(lanes, cfg, args.require_lane)
+        rep = check(lanes, cfg, args.require_lane, args.absent_lane)
     except ParityError as e:
         print(render_error(str(e)))
         print(f"parity: {e}", file=sys.stderr)

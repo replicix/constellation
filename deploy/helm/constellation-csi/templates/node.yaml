@@ -24,7 +24,7 @@ spec:
       app.kubernetes.io/component: node
   updateStrategy:
     type: RollingUpdate
-    rollingUpdate: {maxUnavailable: {{ .Values.node.maxUnavailable }}}
+    rollingUpdate: {maxUnavailable: {{ include "csi.str" .Values.node.maxUnavailable }}}
   template:
     metadata:
       labels:
@@ -45,7 +45,7 @@ spec:
       # Plan 37 §7 "Drain" (K6b): on a draining node the preStop hook waits
       # until this plugin has collected every engine pod of the node (each
       # leaves the pool's registry first); the grace period must cover it.
-      terminationGracePeriodSeconds: {{ add .Values.node.drain.preStopTimeoutSeconds 30 }}
+      terminationGracePeriodSeconds: {{ add (include "csi.str" .Values.node.drain.preStopTimeoutSeconds | int64) 30 }}
       containers:
         - name: constellation-csi
           image: {{ include "csi.image" . }}
@@ -76,23 +76,23 @@ spec:
             - {name: CONSTELLATION_CSI_ENGINE_SERVICE_ACCOUNT, value: constellation-csi-engine}
             - {name: CONSTELLATION_CSI_ENGINE_RESOURCES, value: {{ .Values.engineProfile.resources | toJson | quote }}}
             - {name: CONSTELLATION_CSI_ENGINE_LOG_LEVEL, value: {{ .Values.engineProfile.logLevel | quote }}}
-            - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ .Values.engineProfile.readyTimeout | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_READY_TIMEOUT_S, value: {{ include "csi.str" .Values.engineProfile.readyTimeout | quote }}}
             # Plan 37 §8: engine-pod rollouts by FUSE session handoff.
-            - {name: CONSTELLATION_CSI_HANDOFF_DRAIN_TIMEOUT_MS, value: {{ .Values.engineProfile.handoff.drainTimeoutMs | quote }}}
-            - {name: CONSTELLATION_CSI_HANDOFF_TOTAL_TIMEOUT_MS, value: {{ .Values.engineProfile.handoff.totalTimeoutMs | quote }}}
-            - {name: CONSTELLATION_CSI_HANDOFF_RESUME_TIMEOUT_MS, value: {{ .Values.engineProfile.handoff.resumeTimeoutMs | quote }}}
-            - {name: CONSTELLATION_CSI_HANDOFF_MAX_ATTEMPTS, value: {{ .Values.engineProfile.handoff.maxAttempts | quote }}}
-            - {name: CONSTELLATION_CSI_ROLLOUT_INTERVAL_S, value: {{ .Values.engineProfile.handoff.rolloutInterval | quote }}}
+            - {name: CONSTELLATION_CSI_HANDOFF_DRAIN_TIMEOUT_MS, value: {{ include "csi.str" .Values.engineProfile.handoff.drainTimeoutMs | quote }}}
+            - {name: CONSTELLATION_CSI_HANDOFF_TOTAL_TIMEOUT_MS, value: {{ include "csi.str" .Values.engineProfile.handoff.totalTimeoutMs | quote }}}
+            - {name: CONSTELLATION_CSI_HANDOFF_RESUME_TIMEOUT_MS, value: {{ include "csi.str" .Values.engineProfile.handoff.resumeTimeoutMs | quote }}}
+            - {name: CONSTELLATION_CSI_HANDOFF_MAX_ATTEMPTS, value: {{ include "csi.str" .Values.engineProfile.handoff.maxAttempts | quote }}}
+            - {name: CONSTELLATION_CSI_ROLLOUT_INTERVAL_S, value: {{ include "csi.str" .Values.engineProfile.handoff.rolloutInterval | quote }}}
             # Plan 37 §7 (K6b): idle GC and drain (crates/csi/src/node/gc.rs).
-            - {name: CONSTELLATION_CSI_ENGINE_IDLE_TTL, value: {{ .Values.engineProfile.idleTtl | quote }}}
-            - {name: CONSTELLATION_CSI_IDLE_GC_INTERVAL_S, value: {{ .Values.engineProfile.idleGcInterval | quote }}}
-            - {name: CONSTELLATION_CSI_PRESTOP_TIMEOUT_S, value: {{ .Values.node.drain.preStopTimeoutSeconds | quote }}}
+            - {name: CONSTELLATION_CSI_ENGINE_IDLE_TTL, value: {{ include "csi.str" .Values.engineProfile.idleTtl | quote }}}
+            - {name: CONSTELLATION_CSI_IDLE_GC_INTERVAL_S, value: {{ include "csi.str" .Values.engineProfile.idleGcInterval | quote }}}
+            - {name: CONSTELLATION_CSI_PRESTOP_TIMEOUT_S, value: {{ include "csi.str" .Values.node.drain.preStopTimeoutSeconds | quote }}}
             {{- if .Values.node.metricsPort }}
-            - {name: CONSTELLATION_CSI_METRICS_ADDR, value: {{ printf "0.0.0.0:%v" .Values.node.metricsPort | quote }}}
+            - {name: CONSTELLATION_CSI_METRICS_ADDR, value: {{ printf "0.0.0.0:%s" (include "csi.str" .Values.node.metricsPort) | quote }}}
             {{- end }}
           {{- if .Values.node.metricsPort }}
           ports:
-            - {name: metrics, containerPort: {{ .Values.node.metricsPort }}, protocol: TCP}
+            - {name: metrics, containerPort: {{ include "csi.str" .Values.node.metricsPort }}, protocol: TCP}
           {{- end }}
           securityContext:
             privileged: true
@@ -123,9 +123,9 @@ spec:
           image: {{ include "csi.sidecar" (dict "root" . "sc" .Values.sidecars.livenessprobe) }}
           args:
             - --csi-address=/csi/csi.sock
-            - --health-port={{ .Values.node.livenessPort }}
+            - --health-port={{ include "csi.str" .Values.node.livenessPort }}
           ports:
-            - {name: healthz, containerPort: {{ .Values.node.livenessPort }}, protocol: TCP}
+            - {name: healthz, containerPort: {{ include "csi.str" .Values.node.livenessPort }}, protocol: TCP}
           livenessProbe:
             httpGet: {path: /healthz, port: healthz}
             initialDelaySeconds: 10

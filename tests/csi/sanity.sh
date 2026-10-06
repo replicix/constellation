@@ -44,6 +44,7 @@ node_sock="$work/node.sock"
 log="$work/constellation-csi.log"
 node_log="$work/constellation-csi-node.log"
 params="$work/volume-parameters.yaml"
+secrets="$work/secrets.yaml"
 pid=""
 node_pid=""
 
@@ -55,6 +56,22 @@ bucket: csi-sanity
 prefix: constellation-csi/sanity
 layout: pool
 shards: "2"
+YAML
+
+# The Secrets the sidecars and kubelet would pass. The class is
+# `static-ephemeral` (the default), so the in-memory engine pods wait for
+# their credentials (`fs.unlock`) as real ones do (37-k6a), and a
+# NodeStageVolume without a secret is refused `UNAVAILABLE`.
+creds='{aws_access_key_id: test, aws_secret_access_key: test}'
+cat >"$secrets" <<YAML
+CreateVolumeSecret: $creds
+DeleteVolumeSecret: $creds
+ControllerExpandVolumeSecret: $creds
+ControllerValidateVolumeCapabilitiesSecret: $creds
+NodeStageVolumeSecret: $creds
+CreateSnapshotSecret: $creds
+DeleteSnapshotSecret: $creds
+ListSnapshotsSecret: $creds
 YAML
 
 cleanup() {
@@ -100,7 +117,7 @@ echo "== csi-sanity --ginkgo.focus=Identity (controller role)"
     || status=$?
 echo "== csi-sanity --ginkgo.focus='Identity|Controller|Node' (node + controller roles)"
 "$sanity" --csi.endpoint="unix://$node_sock" --csi.controllerendpoint="unix://$sock" \
-    --csi.testvolumeparameters="$params" \
+    --csi.testvolumeparameters="$params" --csi.secrets="$secrets" \
     --csi.mountdir="$work/mount" --csi.stagingdir="$work/staging" \
     --ginkgo.focus='Identity|Controller|Node' --ginkgo.fail-on-empty ${CSI_SANITY_ARGS:-} || status=$?
 if [ "$status" -ne 0 ]; then

@@ -7,8 +7,8 @@
 //!               [--s3-backend docker|process] [--frontend fuse]
 //!   harness smoke [BACKEND]
 //!   harness interop write|verify --bucket-dir DIR
-//!   harness k8s-scenario <name>...|--all [--kubeconfig PATH] [--chart DIR] [--image IMG]
-//!                        [--repeat N]
+//!   harness k8s-scenario <name>...|--all|--parity [--kubeconfig PATH] [--chart DIR]
+//!                        [--image IMG] [--repeat N]
 //!
 //! Requires: fusermount3, a release `constellation` binary
 //! (CONSTELLATION_BIN or target/release/constellation), and for the default
@@ -99,9 +99,17 @@ enum Command {
         #[arg(long)]
         all: bool,
         /// List the k8s scenarios (they are not in `harness list`, whose
-        /// names are all `harness run`'s).
+        /// names are all `harness run`'s), and the `--parity` lane's
+        /// ported ones.
         #[arg(long)]
         list: bool,
+        /// Run the `linux-csi` parity lane (plan 37 §12, `k8s::parity`):
+        /// the `harness run` scenarios ported to pods, under their own
+        /// names, and every other `harness run` scenario reported skipped
+        /// with the reason, so `tests/parity.py` compares the whole
+        /// catalog against `linux-fuse`. Lane default: linux-csi.
+        #[arg(long, conflicts_with_all = ["names", "all"])]
+        parity: bool,
         /// Kubeconfig of an existing kind cluster to reuse (default:
         /// $KUBECONFIG; neither: create one).
         #[arg(long)]
@@ -128,7 +136,8 @@ enum Command {
         /// Write a results file (the `harness run` format).
         #[arg(long, value_name = "PATH")]
         results_json: Option<std::path::PathBuf>,
-        /// Lane recorded in the results file (default: linux-k8s-kind).
+        /// Lane recorded in the results file (default: linux-k8s-kind;
+        /// linux-csi with --parity).
         #[arg(long)]
         lane: Option<String>,
         /// Keep a cluster this run created (its kubeconfig path is printed).
@@ -339,12 +348,20 @@ fn main() -> Result<()> {
             for s in k8s::K8S_SCENARIOS {
                 println!("{:28} {}", s.name, s.desc);
             }
+            println!(
+                "\n--parity (lane {}), ported harness scenarios:",
+                k8s::parity::LANE
+            );
+            for s in k8s::parity::PORTED {
+                println!("{:28} {}", s.name, s.desc);
+            }
             Ok(())
         }
         Command::K8sScenario {
             names,
             all,
             list: false,
+            parity,
             kubeconfig,
             context,
             chart,
@@ -359,6 +376,7 @@ fn main() -> Result<()> {
         } => k8s::run(k8s::Opts {
             names,
             all,
+            parity,
             kubeconfig,
             context,
             chart,

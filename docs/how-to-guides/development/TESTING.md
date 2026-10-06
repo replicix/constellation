@@ -732,7 +732,8 @@ a reference lane (default `linux-fuse`) and writes a Markdown summary
 
 ```sh
 python3 tests/parity.py --expect tests/platform-parity.toml \
-    [--require-lane linux-fuse --require-lane linux-fuse-process] results/results-*.json
+    [--require-lane linux-fuse --require-lane linux-fuse-process] \
+    [--require-lane linux-csi | --absent-lane linux-csi] results/results-*.json
 python3 -m unittest discover -s tests -p 'test_parity.py' -v   # the checker's own tests
 ```
 
@@ -749,11 +750,16 @@ and scenario:
   `failed` can never be expected;
 - every `--require-lane` must have results, so a lane whose job died before
   writing its results file fails the check instead of dropping out of it
-  (nightly requires every lane it runs).
+  (nightly requires every lane it runs);
+- an `--absent-lane` is one the run deliberately did not produce (nightly
+  passes `--absent-lane linux-csi` when it has no FUSE-capable kind
+  runner): its entries are not checked, the summary lists it as not run,
+  and results for it are a violation. A lane cannot be both.
 
-`tests/platform-parity.toml` holds the expectations. It is seeded empty:
-`linux-fuse-process` differs from `linux-fuse` only in the S3 backend, so any
-difference is a bug to fix or a scenario-specific entry to explain. An entry:
+`tests/platform-parity.toml` holds the expectations. `linux-fuse-process`
+has none: it differs from `linux-fuse` only in the S3 backend, so any
+difference is a bug to fix or a scenario-specific entry to explain. Every
+entry in the file is `linux-csi`'s (below). An entry:
 
 ```toml
 [[expect]]
@@ -775,7 +781,79 @@ a top-level `reference = "<lane>"` and `[lane."<name>"] reference = "<lane>"`
 give a lane its own reference. `tests/test_parity.py` runs the checker on
 synthetic results sets (all equal passes; a deliberate mismatch fails
 closed; covered skip; stale entry; wildcard without `cap`; `failed`
-expected; shard merging; missing reference lane; ...).
+expected; shard merging; missing reference lane; the real file against a
+CSI-shaped lane; `--absent-lane`; ...).
+
+### The `linux-csi` parity lane (plan 37 §12, K7)
+
+`harness k8s-scenario --parity` runs the parity lane through the CSI
+driver on kind (the k8s-scenario mode's cluster, setup and options; see
+"Kubernetes lane" below) and writes a results file with lane `linux-csi`
+holding **every** `harness run` scenario, so `tests/parity.py` compares the
+whole catalog against `linux-fuse`:
+
+- **Ported scenarios run.** `crates/harness/src/k8s/parity.rs` `PORTED`
+  re-expresses `harness run` scenarios through pods, under their own names,
+  with the original's operations, oracle and assertions, each departure
+  stated in its doc comment: `baseline` (one PV, 5 blocks of 60 seeded
+  operations), `two-clients-disjoint` (two pools, pods on both workers),
+  `two-clients-shared` (one RWX PV, both workers, convergence within
+  `CONVERGE`, no conflict on either engine pod), `git-workflow` (the
+  stage-and-rename ping-pong across workers), `truncate-never-resurrects`
+  (truncate/`O_TRUNC`/`fallocate` then writes past the gap, live on both
+  workers, then again through new engine pods after the old ones are
+  collected idle: a cold cache bootstrapped from the bucket),
+  `xattr-roundtrip` (xattrs across workers through the pod tool;
+  `user.constellation.rsize`/`rcount` of a 1 GiB sparse file at the
+  directory and at the PV's root, which reports the volume's own totals,
+  not the pool's), `fallocate-sparse` (a punched hole, `SEEK_HOLE`/`SEEK_DATA`,
+  a rewrite in the hole, the bucket's chunk count, a fresh engine pod
+  reading it back) and `append-setattr-size` (an `O_APPEND` writer under
+  attribute changes and `fdatasync`s, the kubelet's fsGroup pass, on each
+  worker; every acknowledged block on the writer, the other worker and a
+  fresh engine pod). The pod tool (`k8s/pod_tool.pl`, `perl` from the
+  driver image) supplies the system calls coreutils lack: xattrs, `fcntl`
+  locks, `SEEK_HOLE`/`SEEK_DATA`, the appender and its checker.
+- **Every other scenario is reported `skipped`**, and is listed by hand in
+  `parity.rs` `SKIPPED` with what it needs. A unit test fails on a catalog
+  scenario listed nowhere, so whoever adds a scenario decides what this
+  lane does with it. Three kinds of entry:
+  - `Skip::Local`: the scenario pulls levers on its own local clients
+    that a CSI volume does not have, and its reason names the lane's
+    capability `LocalClient` and each lever (SIGKILL/SIGSTOP of a client,
+    toxiproxy in front of one client, a fault hook or environment knob the
+    StorageClass does not expose, a third or fourth node on a two-worker
+    cluster, ...);
+  - `Skip::Covered`: as `Local`, plus the `k8s-scenario` covering the
+    behaviour through the driver;
+  - `Skip::Unported`: no such lever; "not yet ported (follow-up F6)", and
+    the reason does not name `LocalClient`.
+- `tests/platform-parity.toml` excuses those skips. The `Covered` and
+  `Unported` scenarios are named one entry each (`upgrade-under-load` →
+  `csi-engine-pod-handoff-under-load`, `flock-cross-node` →
+  `csi-cross-pod-locks`, ...; an unported entry turns stale once its
+  scenario is ported). After them comes the one `LocalClient` capability
+  wildcard. Unit tests pin it all: every catalog name is ported or listed
+  once, in catalog order; `LocalClient` is in exactly the lever reasons;
+  the file names exactly the `Covered` and `Unported` scenarios; its only
+  wildcard is `LocalClient`'s; every covering scenario exists.
+
+```bash
+target/release/harness k8s-scenario --parity --kubeconfig /tmp/kubeconfig \
+    --image constellation-csi:dev --results-json results-linux-csi.json
+target/release/harness run --results-json results-linux-fuse.json
+python3 tests/parity.py --expect tests/platform-parity.toml \
+    --require-lane linux-fuse --require-lane linux-csi results-*.json
+```
+
+`--parity` takes no scenario names and no `--repeat` (one entry per
+scenario). About 8 minutes on a reused cluster (37-k7b's final run:
+`baseline` 25 s, `two-clients-disjoint` 36 s, `two-clients-shared` 36 s,
+`git-workflow` 31 s, `truncate-never-resurrects` 112 s, `xattr-roundtrip`
+38 s, `fallocate-sparse` 95 s, `append-setattr-size` 118 s). Nightly runs
+it in `kind-e2e` (artifact `harness-linux-csi`), even when the
+`k8s-scenario --all` step before it failed, and `parity` requires the lane
+when the FUSE runner is there.
 
 ### Chaos CI (`chaos-ci`)
 
@@ -3763,6 +3841,9 @@ mount is the driver's (`NodeStageVolume` into a node-owned engine pod,
 compared against a listing taken in the pod (kind, size, SHA-256, symlink
 target: `Model::verify_observed`). Cross-node expectations use
 `eventually()`.
+`--parity` runs the `linux-csi` parity lane in the same mode instead: the
+`harness run` scenarios ported to pods (`--list` names them too) and every
+other one reported skipped ("The `linux-csi` parity lane" above).
 
 - **Cluster.** `--kubeconfig` (or `$KUBECONFIG`) naming a kind cluster is
   reused and left running; with neither, the harness creates `kind-harness`
@@ -3842,6 +3923,7 @@ target: `Model::verify_observed`). Cross-node expectations use
 |---|---|
 | `csi-pod-rw` | A pod on worker 1 runs 4 seeded blocks through an RWO PVC, the model verified after each; the PV is staged on that worker only. After the pod is gone, a pod on worker 2 (an unstage and a fresh stage) sees the same tree and writes on. |
 | `csi-rwx-across-nodes` | Two pods on two workers, one RWX PVC. Six rounds alternate the writer; each writer starts once its node shows the model (an open after the other's close) and the other node must then converge. Then both write concurrently into their own directories and both converge on the merged model. Close-to-open in its default `bounded` form: visibility is eventual (`CONVERGE` = 120 s), and nothing is asserted about what a lagging reader sees meanwhile. |
+| `csi-cross-pod-locks` | Advisory locks between pods on the two workers sharing one RWX PV (plan 37 §12's `ClusterLocks` coverage; the engine pods mount with cluster locks, P2P being on). `flock` (util-linux, `-E 75` so a refusal is told from a failure): a's `LOCK_EX` refuses b's `LOCK_NB` and blocks b's blocking request until the unlock (granted ≥ 1.4 s after asking, ~1.6 s measured: `flock_handoff_ms`); a's `LOCK_SH` lets b's `LOCK_SH` in and refuses its `LOCK_EX`. `fcntl` (the pod tool): a's write lock on [0, 100) refuses b's overlapping `F_SETLK` (`EAGAIN`/`EACCES`) and `F_GETLK` names a write lock; b is granted after the unlock. Contention: both pods run 50 increments of one counter at once, each under a whole-file write lock with an `fsync`; it reads 100 on both. Release on pod deletion: a holds a `flock` and an `fcntl` lock and its pod is deleted; b is granted both (`release_on_delete_ms`, 3–10 s from the start of the delete, the pod's termination included). |
 | `csi-many-pvs-one-pool` | 50 PVCs of one pool class, 10 pods alternating workers with 5 PVs each: one pool filesystem; each PV its own seeded tree, verified independently; exactly two node-owned engine pods (one per worker, 25 views each) and one controller-owned one; quotas per PV: a full 16 MiB PV refuses with `ENOSPC` while a 64 MiB one beside it (same pod, same engine) takes 24 MiB, and a 32 MiB PV on the other worker takes 24 MiB then refuses (2 MiB slack either way: the caps are soft, above, and a refusal may not come early either); the trees are intact afterwards and unstaging all 50 annotates both engine pods with 0 views. |
 | `csi-secret-rotation` | Plan 37 K6a, `Refreshing(callback)`: a `credentialSource: refreshing` class (the watched Secret is also its provisioner and node-stage secret). A writer pod on worker 1 and a reader on worker 2 (as in `csi-plugin-restart-survives`) run while the Secret is rotated twice. After each rotation every engine pod of the pool — both node-owned ones and the controller-owned one — reports through `fs.list` (over `kubectl exec … control-relay`) a credentials generation one higher and its S3 clients signing with it (`credentials_in_use`), within 180 s; the writer keeps going; a PVC created afterwards binds (the controller provisions with the new pair). Each node engine's audit log has an `fs.unlock` line per unlock (the start and both rotations) by the `csi-node-plugin` service principal (uid 0), with the params digest withheld, the rotations `on_behalf_of` `secret:<namespace>/<name>`, and the stage's `view.mount` by the same principal with `on_behalf_of` naming the PV; every line of the controller-owned engine's audit log is by the `csi-controller` service principal (uid 65532, the image's allowlist), with the start and both rotations among them and a CSI call naming the PV. No pod spec, engine-process environment (`/proc/1/environ`), engine or plugin log, audit log, or file under either worker's hostRoot holds a key pair of any generation (the hostRoot is searched before and after the rotations). Every engine pod and both plugins run with `RLIMIT_CORE` 0, and the unprivileged ones are not dumpable. Zero I/O errors, the tree matches the model on both workers, the staging mounts keep their mount ids and the engine pods their uids and restart counts: no remount. floci accepts any key pair, so "the old pair stops working" is shown from the engines' side (the generation in use), not by S3 refusing it; `harness run csi-credential-revocation` shows the refusal on versitygw. |
 | `csi-node-drain` | Plan 37 §7 "Drain", K6b: a `Deployment` pod preferring worker 1 mounts an RWO PVC and writes 20 files; `kubectl drain <worker 1> --ignore-daemonsets --delete-emptydir-data --force` completes (the chart's `PodDisruptionBudget` refuses the node-owned engine pod's eviction until the node plugin, seeing the node cordoned and the pod's views gone, has it `node.leave` and deletes it — the plugin's log says so, "draining"); no node-owned engine pod is left on worker 1, the pod comes up on worker 2 with the tree intact and writes on, the drained engine's registry id is gone from `peers.list` (seen from worker 2's engine: no ghost roster entry), and its node identity (`<hostRoot>/node-identity/<unit>`, and the `.left-*` copy it is moved to first) is gone from worker 1's disk. Uncordoned, worker 1 gets no engine pod back. The drain itself took 6 s on the dev box. Then a second PVC of the pool is written and deleted into the trash, and the worker running the pool's controller-owned engine pod is drained at once (a bare `emptyDir` pod: evicted with no leave, nobody asks for it again): the purge worker brings it back on another node, the trashed entry is purged through the new incarnation (its `purged trash entry` line no earlier than the new pod's creation) and is gone from `/.trash`, and the drained incarnation's registry id is retired from the roster. |
@@ -3899,6 +3981,19 @@ E2E_TEST_BIN=~/.local/bin/e2e.test GINKGO_BIN=~/.local/bin/ginkgo \
     KIND_CLUSTER=csi-e2e tests/csi/e2e.sh
 ```
 
+**The chart (plan 37 K7, §14).** `make csi-chart` runs
+`tests/csi/chart-check.sh` (no cluster: `helm lint --strict` with the
+defaults and with every optional template on; every number the chart
+renders, set large through `--set`, `--set-json` and a values file, comes
+out as an integer and never in exponent form, the regression K7a hit through
+`helm upgrade --reuse-values`; a fractional number is refused at render
+time; the `helm test` hook renders with and without a class), then packages
+the chart to `target/dist/csi/`. `make csi-image-dist` builds the
+image and saves it there as a tarball (`make csi-image` only builds it). `tests/csi/e2e.sh`'s setup runs the chart's own
+**`helm test`** on its pool class (`templates/tests/volume-roundtrip.yaml`:
+a PVC, a pod writing and reading back 4 MiB, a second pod verifying it on a
+fresh mount and emptying it), before the suite.
+
 **PodSecurity check (plan 37 K6 gate).** `tests/csi/podsecurity-check.sh`
 asserts, kube-bench style (`[PASS]`/`[FAIL] <id> <what>`, non-zero exit on
 any FAIL), that the installed driver's pods hold exactly §9's privilege
@@ -3920,11 +4015,13 @@ KUBECONFIG=/tmp/kubeconfig PSC_STORAGE_CLASS=<class> PSC_IMAGE=<image> \
     tests/csi/podsecurity-check.sh
 ```
 
-CI: `csi-unit` (`ci.yml`) runs `cargo test -p constellation-csi`; nightly's
+CI: `csi-unit` (`ci.yml`) runs `cargo test -p constellation-csi` and `make
+csi-chart`; nightly's
 `csi-sanity` runs `make csi-sanity` on a hosted runner and `kind-e2e` runs
 `tests/csi/sanity-kind.sh`, `tests/csi/e2e.sh` (the e2e.test and ginkgo of
-the Kubernetes test tarball matching the pinned `KIND_NODE_IMAGE`) and
-`harness k8s-scenario --all` on a
+the Kubernetes test tarball matching the pinned `KIND_NODE_IMAGE`; `helm
+test` in its setup), `harness k8s-scenario --all` and the `linux-csi` lane
+(`--parity`) on a
 self-hosted runner labelled `fuse` (plan 37 "K0 results", question 5: a
 hosted runner's kind nodes are unverified). `kind-e2e` runs only when the
 repository variable `CONSTELLATION_FUSE_RUNNER` is `true`, so a nightly
@@ -3979,5 +4076,7 @@ versitygw binary it fails, naming the install script.
   which downloads every `harness-*` artifact (each carries its
   `results-<lane>.json`; the `harness` job's is `results-linux-fuse.json`),
   runs the checker's unit tests, then `tests/parity.py` and appends its
-  table to the job summary. The harness steps use `set -o pipefail` so the
+  table to the job summary. It also gets `kind-e2e`'s `harness-linux-csi`
+  artifact: `linux-csi` is required when `CONSTELLATION_FUSE_RUNNER` is
+  `true` and declared `--absent-lane` otherwise. The harness steps use `set -o pipefail` so the
   run's exit status survives `tee`.

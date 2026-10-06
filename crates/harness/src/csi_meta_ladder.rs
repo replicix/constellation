@@ -1,5 +1,5 @@
 //! Plan 37 K0 Track B: the `Controller.CreateVolume` metadata-op
-//! throughput ladder (§5/§15/§2.3 of `docs/plans/v1/wip/37-kubernetes-csi.md`).
+//! throughput ladder (§5/§15/§2.3 of `docs/plans/v1/done/37-kubernetes-csi.md`).
 //!
 //! `CreateVolume` for a pool-layout volume runs `browse.mkdir` + six
 //! `browse.xattr{set}` + one `quota.set` through the control protocol

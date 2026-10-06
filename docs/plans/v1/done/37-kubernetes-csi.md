@@ -1,5 +1,13 @@
 # Plan 37 — Kubernetes CSI driver
 
+> **Status: done (K0–K7).** What shipped, milestone by milestone, with the
+> measurements, is `docs/plans/v1/PROGRESS.md` "Plan 37 K0" … "Plan 37 K7"
+> and "Plan 37 — close-out" (the §18 checklist and the tracked follow-ups).
+> Where this document and PROGRESS differ, PROGRESS is what the tree does.
+> The deployment guide is `docs/how-to-guides/kubernetes-csi.md`. Settled
+> decision 13 is resolved in "K7 note: `seLinuxMount`" (after "K0
+> results"): it stays `false`.
+
 Read `docs/plans/v1/CONVENTIONS.md` first. This plan turns Constellation
 into a native Kubernetes storage backend: a CSI driver where a
 `PersistentVolume` is a Constellation `View`, `ReadWriteMany` is a first-class
@@ -444,7 +452,8 @@ guessing a number up front.
     restart policy must do it. K5's handover removes the limitation for
     planned replacements, because the connection never dies there. A crash
     still has it.
-13. **`seLinuxMount: false` at K0–K6, revisited at K7.** SELinux
+13. **`seLinuxMount: false` at K0–K6, revisited at K7** (K7: stays
+    `false`; see "K7 note: `seLinuxMount`"). SELinux
     per-volume mount context (`-o context=`) is a FUSE mount option
     (`fuse_mount_fd`'s `opts`) applied once at `NodeStageVolume` time for
     the whole PV; since every pod publishing the same PV shares one
@@ -1986,6 +1995,32 @@ failure leaves the **old** pod as the source of truth until step 6's commit:
   are capability-scoped (the third entry above carries `cap =
   "cluster_locks"`), never a bare unscoped `scenario = "*"`.
 
+  *As built (37-k7b):* `harness k8s-scenario --parity`
+  (`crates/harness/src/k8s/parity.rs`) runs 8 `harness run` scenarios
+  ported to pods under their own names (`baseline`,
+  `two-clients-disjoint`, `two-clients-shared`, `git-workflow`,
+  `truncate-never-resurrects`, `xattr-roundtrip`, `fallocate-sparse`,
+  `append-setattr-size`) and reports the other 215 skipped. Each one is
+  listed by hand in `SKIPPED` with what it needs; a unit test fails on a
+  catalog name in neither list. 209 pull a lever on their own local clients
+  that a CSI volume does not have (SIGKILL/SIGSTOP of a client, toxiproxy in
+  front of one client, a fault hook or environment knob the StorageClass
+  does not expose, a third or fourth node of one filesystem on a two-worker
+  cluster). Their reasons name the lane's capability word `LocalClient` and
+  the levers, and one capability-scoped wildcard excuses them. 9 of those
+  are also named in the parity file with the `k8s-scenario` that covers them
+  through the driver. 6 need no such lever and are "not yet ported"
+  (follow-up F6); the parity file names each of them, so porting one makes
+  its entry stale. The draft entries above were adapted: "fusermount-flags"
+  and "local-daemon-upgrade" are not catalog names (the latter's intent is
+  the `upgrade-under-load` / `session-handover-idle` entries). The
+  `cluster_locks` wildcard's premise, that the capability is exercised under
+  another scenario name, held only once `k8s-scenario csi-cross-pod-locks`
+  existed (flock and fcntl exclusion, contention and release on pod
+  deletion between pods on two workers through one RWX PV). With it the
+  wildcard was dropped: `flock-cross-node` is named with it, and the other
+  lock scenarios are `LocalClient` skips for the levers they pull.
+
 ## 13. CI
 
 No new CI job is needed for the pool scenarios added to §"Testing" — they
@@ -3237,6 +3272,51 @@ K2").
    `FuseSession::resume`, a livelock for anything else that reads it. **K5** restores
    the blocking mode in the resume path, or `SessionControl::detach` does before
    handing the descriptor out.
+
+## K7 note: `seLinuxMount` (settled decision 13, revisited)
+
+**Recommendation: keep `seLinuxMount: false` for this release.** SELinux
+nodes run with `virt_sandbox_use_fusefs` on. A class-wide `context=` comes
+before `true`, as a tracked follow-up (PROGRESS "Plan 37 — close-out", F7).
+The reasons:
+
+1. **The driver applies no mount options.** `NodeStageVolume` mounts with
+   its own `fuse_mount_fd` options and ignores the capability's
+   `mount_flags` (`testdriver.yaml` declares no `SupportedMountOption`, and
+   the e2e suite skips its mount-option spec for that reason).
+   `seLinuxMount: true` tells kubelet the driver *will* mount with
+   `-o context=<pod label>`, so kubelet and the runtime skip relabeling.
+   Declared today, every volume would be mounted with no context while
+   kubelet believes it has one.
+2. **Shared staging and per-pod labels conflict.** Settled decision 5 stages
+   a volume once per node and bind-mounts it into every pod. A `context=`
+   is fixed per mount, so all of a node's pods on one volume would need one
+   label. Kubernetes' SELinuxMount handling enforces exactly that: a pod
+   with a different label cannot use the volume on that node while another
+   runs, unless it opts out with `seLinuxChangePolicy: Recursive`. For
+   RWX, the driver's headline mode, pods in different namespaces get
+   different MCS categories by default. `true` would turn today's working
+   cross-namespace sharing into scheduling failures.
+3. **`false` works on enforcing nodes with one policy switch.** A FUSE
+   mount without `context=` is labeled `fusefs_t` (genfscon), and a
+   runtime relabel of it is expected to fail with "not supported" and be
+   ignored, as for NFS: a genfscon filesystem keeps no
+   `security.selinux`. `container_t` reaches `fusefs_t` once the
+   container-selinux boolean `virt_sandbox_use_fusefs` is on, which is
+   node-wide, not per volume. This is the documented setup
+   (`docs/how-to-guides/kubernetes-csi.md` §12, the chart README).
+   Unverified here: the kind lane's node containers run as `spc_t` and
+   never exercise it (this host is enforcing, but kind's nodes are
+   unconfined).
+4. **What would allow `true`.** First, honour a `context=` from the
+   capability's mount flags (only that option, refusing the rest) at
+   `NodeStageVolume` and restage on a mismatch. Second, a StorageClass-wide
+   `mountOptions: [context=…]` for clusters that want one label per class
+   (the "common case" decision 13 asked about). Third, a scenario on an
+   SELinux-enforcing node (not kind). The class-wide context alone does not
+   need `seLinuxMount: true`: kubelet passes `mountOptions` either way. So
+   F7's first step is the mount-option plumbing, and declaring `true` is
+   its last.
 
 ## Sources checked out for this plan
 

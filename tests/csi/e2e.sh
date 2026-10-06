@@ -9,6 +9,8 @@
 #      `constellation-e2e`: a pool StorageClass (a prefix of its own per
 #      setup, so a reused cluster never meets an engine pod of an earlier
 #      setup's filesystem; allowVolumeExpansion) and a VolumeSnapshotClass;
+#      then the chart's `helm test` on that class (a PVC, a writer pod, a
+#      reader pod on a fresh mount);
 #   3. the upstream `e2e.test` (matching the kind node image's Kubernetes):
 #      -ginkgo.focus='External.Storage' -storage.testdriver=tests/csi/testdriver.yaml,
 #      every spec the driver definition selects — in E2E_PROCS parallel
@@ -155,6 +157,21 @@ parameters:
   csi.storage.k8s.io/snapshotter-secret-name: constellation-e2e-creds
   csi.storage.k8s.io/snapshotter-secret-namespace: "$ns"
 EOF
+
+    # The chart's own post-install check (plan 37 §14, §18 item 4) on the
+    # class just made. `--reuse-values` also renders every number the
+    # install set through the JSON round trip (tests/csi/chart-check.sh).
+    echo "== helm test (tests.storageClassName=$class)"
+    helm --kube-context "$ctx" upgrade constellation-csi "$root/deploy/helm/constellation-csi" \
+        -n "$ns" --reuse-values --set tests.storageClassName="$class" --wait --timeout 180s >/dev/null
+    # A passing test's hooks are deleted (hook-succeeded); a failing one's
+    # stay, and their logs say why.
+    if ! helm --kube-context "$ctx" test constellation-csi -n "$ns" --timeout 600s; then
+        k -n "$ns" logs constellation-csi-test-write --tail=50 2>/dev/null || true
+        k -n "$ns" logs constellation-csi-test-read --tail=50 2>/dev/null || true
+        k -n "$ns" describe pvc constellation-csi-test-volume 2>/dev/null | tail -20 || true
+        exit 1
+    fi
 }
 
 if [ "$reuse" = 1 ]; then

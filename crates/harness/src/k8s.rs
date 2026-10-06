@@ -79,6 +79,7 @@
 //! missing `fio`.
 
 pub mod lifecycle;
+pub mod parity;
 pub mod pool_access;
 pub mod remote;
 pub mod scenarios;
@@ -146,6 +147,8 @@ const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct Opts {
     pub names: Vec<String>,
     pub all: bool,
+    /// The `linux-csi` parity lane ([`parity`]).
+    pub parity: bool,
     pub kubeconfig: Option<PathBuf>,
     pub context: Option<String>,
     pub chart: Option<PathBuf>,
@@ -594,7 +597,7 @@ pub struct Env {
     round: AtomicU32,
     /// What the running scenario measured ([`Env::measure`]).
     measurements: Mutex<serde_json::Map<String, Value>>,
-    _floci: Container,
+    floci: Container,
 }
 
 impl Env {
@@ -672,22 +675,18 @@ impl Env {
             // Plan 37 K6b: the idle GC, the drain watch and the purge
             // worker on scenario timescales ([`HARNESS_PURGE`]).
             .args(["--set", &format!("engineProfile.idleTtl={IDLE_TTL_S}s")])
-            // Numbers as strings: `set_chart_image`'s `--reuse-values`
-            // round-trips the release's values through JSON, which makes
-            // an integer a float, and `quote` renders 16777216 as
-            // "1.6777216e+07" — a value the controller refuses to start on.
-            .args(["--set-string", "engineProfile.idleGcInterval=5"])
+            .args(["--set", "engineProfile.idleGcInterval=5"])
             .args([
                 "--set",
                 &format!("purge.interval={}s", HARNESS_PURGE.interval_s),
             ])
             .args(["--set", &format!("purge.grace={}s", HARNESS_PURGE.grace_s)])
             .args([
-                "--set-string",
+                "--set",
                 &format!("purge.opsPerSecond={}", HARNESS_PURGE.ops_per_s),
-                "--set-string",
+                "--set",
                 &format!("purge.bytesPerSecond={}", HARNESS_PURGE.bytes_per_s),
-                "--set-string",
+                "--set",
                 &format!("purge.maxConcurrentDeletes={}", HARNESS_PURGE.concurrency),
             ])
             .args(["--wait", "--timeout", "300s"]);
@@ -766,7 +765,7 @@ impl Env {
             next_image: OnceLock::new(),
             round: AtomicU32::new(0),
             measurements: Mutex::new(serde_json::Map::new()),
-            _floci: floci,
+            floci,
         })
     }
 
@@ -777,6 +776,41 @@ impl Env {
             0 => self.run_id.clone(),
             r => format!("{}-r{r}", self.run_id),
         }
+    }
+
+    /// The keys under `prefix/` in the harness bucket, as the S3 server
+    /// (floci) lists them.
+    pub fn bucket_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let out = docker(&[
+            "exec",
+            "-e",
+            "AWS_ACCESS_KEY_ID=test",
+            "-e",
+            "AWS_SECRET_ACCESS_KEY=test",
+            "-e",
+            "AWS_DEFAULT_REGION=us-east-1",
+            &self.floci.name,
+            "aws",
+            "--endpoint-url",
+            "http://localhost:4566",
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            BUCKET,
+            "--prefix",
+            &format!("{}/", prefix.trim_end_matches('/')),
+            "--query",
+            "Contents[].Key",
+            "--output",
+            "text",
+        ])?;
+        // `None` when nothing matches; keys are tab-separated, a line per
+        // page.
+        Ok(out
+            .split_whitespace()
+            .filter(|k| *k != "None")
+            .map(str::to_string)
+            .collect())
     }
 
     /// Record a measurement of the running scenario (reported with its
@@ -1476,6 +1510,13 @@ impl<'a> Scope<'a> {
         self.env.kube.exec(&self.ns, pod, script)
     }
 
+    /// Install the pod tool ([`remote::POD_TOOL`]) in `pod`.
+    pub fn install_pod_tool(&self, pod: &str) -> Result<()> {
+        self.exec(pod, &remote::pod_tool_script())
+            .map(|_| ())
+            .with_context(|| format!("installing the pod tool in {pod}"))
+    }
+
     pub fn delete_pods(&self, pods: &[&str]) -> Result<()> {
         let mut args = vec!["delete", "pod", "-n", &self.ns, "--wait=true"];
         args.extend_from_slice(pods);
@@ -1907,7 +1948,16 @@ fn percentile(values: &[f64], p: f64) -> f64 {
 
 /// `harness k8s-scenario`.
 pub fn run(opts: Opts) -> Result<()> {
-    let selected: Vec<&K8sScenario> = if opts.all {
+    let selected: Vec<&K8sScenario> = if opts.parity {
+        if opts.all || !opts.names.is_empty() {
+            bail!("--parity runs the whole lane: no --all, no scenario names");
+        }
+        // One entry per scenario: `tests/parity.py` refuses a name twice.
+        if opts.repeat > 1 {
+            bail!("--parity runs each scenario once: no --repeat");
+        }
+        parity::PORTED.iter().collect()
+    } else if opts.all {
         if !opts.names.is_empty() {
             bail!("--all and scenario names are exclusive");
         }
@@ -1924,8 +1974,35 @@ pub fn run(opts: Opts) -> Result<()> {
         }
         v
     };
-    let lane = opts.lane.clone().unwrap_or_else(|| DEFAULT_LANE.into());
+    let default_lane = if opts.parity {
+        parity::LANE
+    } else {
+        DEFAULT_LANE
+    };
+    let lane = opts.lane.clone().unwrap_or_else(|| default_lane.into());
     let mut report = RunResults::new(&lane, opts.seed, None);
+    // The parity lane reports every `harness run` scenario: the ones it
+    // does not run, up front, with the reason. They stay out of the run's
+    // skipped list, which names what could not run here; these never run
+    // in this lane.
+    if opts.parity {
+        let lane_skips = parity::skipped();
+        let unported = parity::SKIPPED
+            .iter()
+            .filter(|(_, skip)| matches!(skip, parity::Skip::Unported(_)))
+            .count();
+        eprintln!(
+            "=== lane {lane}: {} ported scenario(s) run, {} reported skipped ({} needing {}, \
+             {unported} not yet ported)",
+            selected.len(),
+            lane_skips.len(),
+            lane_skips.len() - unported,
+            parity::LOCAL_CLIENT
+        );
+        for (name, why) in lane_skips {
+            report.push(name, Outcome::Skipped, 0.0, Some(why));
+        }
+    }
     let finish = |report: RunResults, failures: Vec<String>, skipped: Vec<String>| -> Result<()> {
         if let Some(p) = &opts.results_json {
             report.write(p)?;

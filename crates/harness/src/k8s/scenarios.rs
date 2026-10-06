@@ -17,7 +17,7 @@ use crate::spawn::TiedSpawn;
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct K8sScenario {
     pub name: &'static str,
@@ -50,6 +50,13 @@ pub const K8S_SCENARIOS: &[K8sScenario] = &[
         desc: "two pods on two workers share one RWX PVC: alternating and concurrent writes converge to the model on both (close-to-open, bounded: eventual, nothing stronger)",
         workers: 2,
         run: csi_rwx_across_nodes,
+        gate: None,
+    },
+    K8sScenario {
+        name: "csi-cross-pod-locks",
+        desc: "advisory locks between pods on the two workers sharing an RWX PV: flock exclusive refuses LOCK_NB and blocks until the unlock, shared locks coexist and exclude an exclusive one; an fcntl write lock refuses an overlapping one (F_GETLK names it) until released; 2 x 50 locked increments of one counter at once read 100 on both; a pod deleted holding a flock and an fcntl lock releases both to the other worker",
+        workers: 2,
+        run: csi_cross_pod_locks,
         gate: None,
     },
     K8sScenario {
@@ -269,6 +276,237 @@ fn csi_rwx_across_nodes(env: &Env, seed: u64) -> Result<()> {
     eprintln!(
         "   3 concurrent rounds into a/ and b/: both pods converged on {} entries",
         model.nodes.len()
+    );
+    s.finish()
+}
+
+/// `flock` with conflicts answered as exit status 75, so a refusal is told
+/// apart from a failure: `(path, args)` → the exit status.
+fn flock_rc(s: &Scope, pod: &str, args: &str) -> Result<i32> {
+    let out = s.exec(pod, &format!("flock -E 75 {args}; echo rc=$?"))?;
+    out.trim()
+        .rsplit_once("rc=")
+        .and_then(|(_, rc)| rc.parse().ok())
+        .with_context(|| format!("flock {args} in {pod}: {out:?}"))
+}
+
+/// Wait until `file` exists in `pod`.
+fn await_file(s: &Scope, pod: &str, file: &str) -> Result<()> {
+    eventually(&format!("{file} in {pod}"), Duration::from_secs(60), || {
+        s.exec(pod, &format!("test -e {file}")).map(|_| ())
+    })
+}
+
+/// A script holding `flock MODE path` until `/tmp/release-TAG` appears,
+/// having touched `/tmp/held-TAG`.
+fn hold_flock(mode: &str, path: &str, tag: &str) -> String {
+    format!(
+        "exec flock {mode} {path} sh -c 'touch /tmp/held-{tag}; \
+         while [ ! -e /tmp/release-{tag} ]; do sleep 0.05; done'"
+    )
+}
+
+/// Advisory locks between pods on the two workers sharing an RWX PV (the
+/// pods' engine pods are two nodes of the pool, mounting with cluster
+/// locks: P2P is on). `flock`: an exclusive lock refuses the other node's
+/// `LOCK_NB` and blocks its blocking request until the unlock; shared
+/// locks coexist and exclude an exclusive one. `fcntl`: a write lock on a
+/// range refuses an overlapping one and `F_GETLK` names it; the other node
+/// is granted once it is released. Contention: both pods increment one
+/// counter under a whole-file `fcntl` lock, 50 times each, at once: it
+/// reads 100 on both. Release on pod deletion: a pod holding a `flock` and
+/// an `fcntl` lock is deleted; the other worker's pod is granted both.
+fn csi_cross_pod_locks(env: &Env, _seed: u64) -> Result<()> {
+    use super::remote::POD_TOOL;
+    let (w1, w2) = (&env.workers[0], &env.workers[1]);
+    let mut s = Scope::new(env, "csi-locks")?;
+    s.pvc("shared", "1Gi", true)?;
+    s.wait_bound(Duration::from_secs(300))?;
+    s.pod("a", w1, &["shared"])?;
+    s.pod("b", w2, &["shared"])?;
+    s.install_pod_tool("a")?;
+    s.install_pod_tool("b")?;
+    let root = data_dir("shared");
+    let (f, g, counter) = (
+        format!("{root}/f"),
+        format!("{root}/g"),
+        format!("{root}/counter"),
+    );
+    s.exec("a", &format!("set -e; : > {f}; : > {g}; : > {counter}"))?;
+    eventually("the lock files on b", CONVERGE, || {
+        s.exec(
+            "b",
+            &format!("test -e {f} && test -e {g} && test -e {counter}"),
+        )
+        .map(|_| ())
+    })?;
+    let tool = |pod: &str, args: &str| -> Result<String> {
+        Ok(s.exec(pod, &format!("perl {POD_TOOL} {args}"))?
+            .trim()
+            .to_string())
+    };
+
+    // flock, exclusive: b's LOCK_NB is refused, its blocking request waits
+    // for a's unlock.
+    s.exec("a", "rm -f /tmp/held-x /tmp/release-x")?;
+    let waited = std::thread::scope(|t| -> Result<Duration> {
+        let holder = t.spawn(|| s.exec("a", &hold_flock("-x", &f, "x")));
+        await_file(&s, "a", "/tmp/held-x")?;
+        let rc = flock_rc(&s, "b", &format!("-xn {f} true"))?;
+        ensure!(
+            rc == 75,
+            "b's LOCK_EX|LOCK_NB while a holds LOCK_EX: exit {rc}"
+        );
+        let started = Instant::now();
+        let waiter = {
+            let (s, f) = (&s, &f);
+            t.spawn(move || {
+                flock_rc(s, "b", &format!("-x {f} true")).map(|rc| (rc, started.elapsed()))
+            })
+        };
+        std::thread::sleep(Duration::from_millis(1500));
+        ensure!(
+            !waiter.is_finished(),
+            "b's blocking LOCK_EX returned while a holds"
+        );
+        s.exec("a", "touch /tmp/release-x")?;
+        holder
+            .join()
+            .map_err(|_| anyhow::anyhow!("holder panicked"))?
+            .context("a's flock holder")?;
+        let (rc, waited) = waiter
+            .join()
+            .map_err(|_| anyhow::anyhow!("waiter panicked"))??;
+        ensure!(rc == 0, "b's blocking LOCK_EX: exit {rc}");
+        Ok(waited)
+    })?;
+    ensure!(
+        waited >= Duration::from_millis(1400),
+        "b was granted too early: {waited:?}"
+    );
+    eprintln!(
+        "   flock: b's LOCK_NB refused, its blocking LOCK_EX granted {waited:?} after asking"
+    );
+    env.measure("flock_handoff_ms", waited.as_millis() as u64);
+
+    // flock, shared: both hold LOCK_SH; an exclusive request conflicts.
+    s.exec("a", "rm -f /tmp/held-s /tmp/release-s")?;
+    std::thread::scope(|t| -> Result<()> {
+        let holder = t.spawn(|| s.exec("a", &hold_flock("-s", &f, "s")));
+        await_file(&s, "a", "/tmp/held-s")?;
+        let shared = flock_rc(&s, "b", &format!("-sn {f} true"));
+        let exclusive = flock_rc(&s, "b", &format!("-xn {f} true"));
+        s.exec("a", "touch /tmp/release-s")?;
+        holder
+            .join()
+            .map_err(|_| anyhow::anyhow!("holder panicked"))?
+            .context("a's shared holder")?;
+        ensure!(
+            shared? == 0,
+            "b's LOCK_SH|LOCK_NB beside a's LOCK_SH refused"
+        );
+        ensure!(
+            exclusive? == 75,
+            "b's LOCK_EX|LOCK_NB beside a's LOCK_SH granted"
+        );
+        Ok(())
+    })?;
+
+    // fcntl: a's write lock on [0, 100) refuses b's overlapping one, which
+    // F_GETLK names; after a's unlock b is granted.
+    s.exec("a", "rm -f /tmp/held-w /tmp/release-w")?;
+    std::thread::scope(|t| -> Result<()> {
+        let holder = t.spawn(|| {
+            tool(
+                "a",
+                &format!("hold {g} w 0 100 '' /tmp/held-w /tmp/release-w"),
+            )
+        });
+        await_file(&s, "a", "/tmp/held-w")?;
+        let tried = tool("b", &format!("try {g} w 50 10"));
+        let conflict = tool("b", &format!("getlk {g} w 50 10"));
+        s.exec("a", "touch /tmp/release-w")?;
+        holder
+            .join()
+            .map_err(|_| anyhow::anyhow!("holder panicked"))?
+            .context("a's fcntl holder")?;
+        let tried = tried?;
+        // EAGAIN or EACCES, as POSIX allows.
+        ensure!(
+            tried == "ERR 11" || tried == "ERR 13",
+            "b's overlapping F_SETLK while a holds [0, 100): {tried}"
+        );
+        let conflict = conflict?;
+        ensure!(conflict == "w", "b's F_GETLK while a holds: {conflict}");
+        Ok(())
+    })?;
+    eventually(
+        "b's F_SETLK granted after a's unlock",
+        Duration::from_secs(60),
+        || {
+            let tried = tool("b", &format!("try {g} w 50 10"))?;
+            ensure!(tried == "OK", "{tried}");
+            Ok(())
+        },
+    )?;
+
+    // Contention: one counter, 50 locked increments from each worker at once.
+    let (ra, rb) = std::thread::scope(|t| {
+        let ha = t.spawn(|| tool("a", &format!("incr {counter} 50")));
+        let hb = t.spawn(|| tool("b", &format!("incr {counter} 50")));
+        (ha.join(), hb.join())
+    });
+    ra.map_err(|_| anyhow::anyhow!("a's incrementer panicked"))?
+        .context("a's increments")?;
+    rb.map_err(|_| anyhow::anyhow!("b's incrementer panicked"))?
+        .context("b's increments")?;
+    for pod in ["a", "b"] {
+        eventually(&format!("the counter reads 100 on {pod}"), CONVERGE, || {
+            let v = s.exec(pod, &format!("cat {counter}"))?;
+            ensure!(v.trim() == "100", "{pod} reads {:?}", v.trim());
+            Ok(())
+        })?;
+    }
+
+    // Release on pod deletion: a holds a flock on f and an fcntl lock on
+    // g, then goes; b is granted both.
+    s.exec(
+        "a",
+        "rm -f /tmp/held-d /tmp/release-d /tmp/held-e /tmp/release-e",
+    )?;
+    let released = std::thread::scope(|t| -> Result<Duration> {
+        // Both end with an error when the pod goes.
+        let _flock = t.spawn(|| s.exec("a", &hold_flock("-x", &f, "d")));
+        let _fcntl = t.spawn(|| {
+            tool(
+                "a",
+                &format!("hold {g} w 0 0 '' /tmp/held-e /tmp/release-e"),
+            )
+        });
+        await_file(&s, "a", "/tmp/held-d")?;
+        await_file(&s, "a", "/tmp/held-e")?;
+        ensure!(
+            flock_rc(&s, "b", &format!("-xn {f} true"))? == 75,
+            "b's LOCK_NB granted while a holds"
+        );
+        let tried = tool("b", &format!("try {g} w 0 1"))?;
+        ensure!(
+            tried.starts_with("ERR "),
+            "b's F_SETLK granted while a holds: {tried}"
+        );
+        let started = Instant::now();
+        s.delete_pods(&["a"])?;
+        let rc = flock_rc(&s, "b", &format!("-x -w 120 {f} true"))?;
+        ensure!(rc == 0, "b's LOCK_EX after a's pod went: exit {rc}");
+        let got = tool("b", &format!("lockread {g} 0 0 0"));
+        got.context("b's F_SETLKW after a's pod went")?;
+        Ok(started.elapsed())
+    })?;
+    eprintln!("   a's pod deleted holding a flock and an fcntl lock: b granted both {released:?} after the delete began");
+    env.measure("release_on_delete_ms", released.as_millis() as u64);
+    ensure!(
+        released < Duration::from_secs(120),
+        "b granted only {released:?} after a's pod was deleted"
     );
     s.finish()
 }

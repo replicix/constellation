@@ -41,7 +41,7 @@ with its patch series) or against upstream primary source (kernel.org,
 not independently re-derived in this session — milestone Z1 (§7) re-verifies
 every REPORTED claim this plan's first vendoring step depends on before
 anything is built on it, exactly as plan 37's K0 re-checks its own REPORTED
-fuser facts (`docs/plans/v1/wip/37-kubernetes-csi.md` §1, VERIFIED/REPORTED
+fuser facts (`docs/plans/v1/done/37-kubernetes-csi.md` §1, VERIFIED/REPORTED
 paragraph).
 
 ## Dependencies
@@ -77,7 +77,7 @@ paragraph).
   for every path that does not read the chunk file directly (§3(d)) — and
   extends its budget accounting (§4), not its design.
 
-**Coordinates with plan 37** (`docs/plans/v1/wip/37-kubernetes-csi.md`): the
+**Coordinates with plan 37** (`docs/plans/v1/done/37-kubernetes-csi.md`): the
 CSI engine pod's session handover (plan 37's K0/K5) and this plan's ring
 transport both touch `FuseSession`/`fuser::Session`; §3(e)'s fallback policy
 (`transport: Auto | DevFuse` on a per-mount basis) is written so a
@@ -1520,7 +1520,7 @@ updated), plus, per milestone (cumulative):
 | `vendor/fuser/{CONSTELLATION-PATCH.md,src/{reply,channel,passthrough,lib,session}.rs}` on `main` | The existing patch series' shape and precedent (§3(a)), `ReplyData`/`ChannelSender::send`/passthrough API (§1, §3(b), §2.1 row 7) | VERIFIED |
 | `docs/plans/v1/PROGRESS.md` on `main`, "## Chunk memory cache" and "## Plan 31 C7b" sections | The memcache's design/measurements (§1, §2.1 row 4), the deferral/Mountpoint-candidate findings this plan reconciles with (§2's "Reconciling with C7b") | VERIFIED |
 | `docs/plans/v1/CONVENTIONS.md` | Gates, reporting format, harness scenario checklist (§6, §7, §9) | VERIFIED (this repo, `main`) |
-| `docs/plans/v1/wip/37-kubernetes-csi.md` (lines 1–120) | Style template, VERIFIED/REPORTED convention, the K0 re-verification precedent §3(a)/§7 follow | VERIFIED (this repo, `main`) |
+| `docs/plans/v1/done/37-kubernetes-csi.md` (lines 1–120) | Style template, VERIFIED/REPORTED convention, the K0 re-verification precedent §3(a)/§7 follow | VERIFIED (this repo, `main`) |
 | `docs/plans/v1/wip/31-core-frontend-backend.md` §6.2, §6.4, §6.6, §6.9, §6.11, §11 (C4, C7), §14, §15 | The `Vfs`/`Responder`/`FrontendCaps`/threading contract this plan builds on (§3), the session-handover design and risk (§3(e)), the perf-target and DoD style (§4, §9) | VERIFIED (this repo, `main`) |
 | kernel.org, `fs/fuse/dev.c` (`torvalds/master`), the 6.14 FUSE-io_uring kernel doc, the 7.3 FUSE pull request | §2.1 rows 1–2's splice/vmsplice mechanism, §2.4's kernel version gates, §3(a)/§3(d)'s transport/zero-copy mechanism | VERIFIED (per the research notes' own primary-source citations) |
 | `bench/fuse-uring-handover/RESULTS.md`, `results/summary-tables.md`, `results/*/summary.jsonl` (this repo) | §3(e)'s handover findings and decision, §6's refusal scenario, §7 Z0a's result, §8's handover risk | VERIFIED (Z0a's own run, 2026-09-30, three kernels) |
