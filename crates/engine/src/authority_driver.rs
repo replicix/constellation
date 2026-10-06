@@ -2161,9 +2161,14 @@ impl Driver {
                 mode,
                 blocking,
                 sent,
+                incarnation,
                 reply,
             } => {
                 let req = self.control_id();
+                // A request the core never answers leaves its sender here
+                // only until the P2P task waiting on it gives up
+                // (`P2pBridge::lock_requested` bounds the wait).
+                self.lock_request_replies.retain(|_, tx| !tx.is_closed());
                 self.lock_request_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from: requester,
@@ -2173,6 +2178,7 @@ impl Driver {
                         mode,
                         blocking,
                         sent: constellation_authority::Ms(sent),
+                        incarnation,
                     },
                 }))
             }
@@ -2722,6 +2728,7 @@ impl Driver {
                 mode,
                 blocking,
                 sent,
+                incarnation,
             } => {
                 let payload = Payload::LockRequest {
                     requester: self.node_id,
@@ -2730,6 +2737,7 @@ impl Driver {
                     exclusive: crate::locks::exclusive(mode),
                     blocking,
                     sent: sent.0,
+                    incarnation,
                 };
                 self.lock_rpc(to, req, payload, |reply, req| match reply {
                     Payload::LockReply { req_id, outcome } if req_id == req.0 => {

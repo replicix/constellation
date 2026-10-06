@@ -1401,6 +1401,18 @@ pub struct LockStatus {
     /// had replaced (both ended a grant that was otherwise outwaited).
     pub requeued_in_place: u64,
     pub released_superseded: u64,
+    /// Peers this owner took for unreachable (a recall undeliverable, or
+    /// pushed grants unused twice in a row; granted only over their own
+    /// requests until one acknowledges a recall), and waiters of theirs
+    /// passed over meanwhile (silent past a short wait for their next
+    /// request).
+    pub peers_unreachable: u64,
+    pub unreachable_passed_over: u64,
+    /// Waiters dropped because their node asked again under a new
+    /// incarnation, and requests from an older incarnation than one
+    /// already seen (answered, not served).
+    pub incarnation_waiters_dropped: u64,
+    pub stale_incarnation_requests: u64,
     /// Right now: requests in flight, parked waiters, recalls in flight.
     pub requests_in_flight: u64,
     pub waiters: u64,

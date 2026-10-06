@@ -813,6 +813,17 @@ pub struct Stats {
     /// Plan 30 §M14: remote waiters dropped after `4 × ttl` of silence
     /// (killed while parked; a live one re-sends every `ttl/2`).
     pub lock_waiters_dropped: u64,
+    /// Owner: peers taken for unreachable (a recall undeliverable, or
+    /// grants pushed to them unused twice in a row; `LockState::
+    /// unreachable`), and waiters passed over meanwhile because only a
+    /// request of their own can carry their grant.
+    pub lock_peers_unreachable: u64,
+    pub lock_unreachable_passed_over: u64,
+    /// Owner: waiters a node's previous incarnation left queued, dropped
+    /// when its new incarnation asked; requests from an older
+    /// incarnation than one already seen, ignored.
+    pub lock_incarnation_waiters_dropped: u64,
+    pub lock_stale_incarnation_requests: u64,
     pub lock_wait_ms_total: u64,
     pub lock_renewals_served: u64,
     /// Owner side: grant/renewal answers held for the restart horizon's
@@ -1817,7 +1828,19 @@ impl Core {
                 mode,
                 blocking,
                 sent,
-            } => self.on_lock_request(now, from, req, ino, mode, blocking, sent, replica, out),
+                incarnation,
+            } => self.on_lock_request(
+                now,
+                from,
+                req,
+                ino,
+                mode,
+                blocking,
+                sent,
+                incarnation,
+                replica,
+                out,
+            ),
             PeerMsg::LockReply { req, outcome } => {
                 self.on_lock_reply(now, from, req, outcome, replica, out)
             }
@@ -1827,7 +1850,7 @@ impl Core {
             PeerMsg::LockRecall { req, ino, grant } => {
                 self.on_lock_recall(now, from, req, ino, grant, replica, out)
             }
-            PeerMsg::LockRecalled { req } => self.on_lock_recalled_ack(req),
+            PeerMsg::LockRecalled { req } => self.on_lock_recalled_ack(from, req),
             PeerMsg::LockReleased {
                 ino,
                 grant,

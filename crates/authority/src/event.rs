@@ -653,6 +653,9 @@ pub enum PeerMsg {
         /// push, so the grant's window never starts later than the
         /// request it answers (a stale push after a pause found this).
         sent: Ms,
+        /// The requester's incarnation: the owner drops what an earlier
+        /// one left queued (`LockState::incarnations`).
+        incarnation: u32,
     },
     LockReply {
         req: OpId,

@@ -3953,6 +3953,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "incarnation_waiters_dropped": {
+          "description": "Waiters dropped because their node asked again under a new\nincarnation, and requests from an older incarnation than one\nalready seen (answered, not served).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "local_conflicts": {
           "format": "uint64",
           "minimum": 0,
@@ -3986,6 +3992,12 @@
         },
         "owners_fenced": {
           "description": "Lock owners fenced on this node (their grant lapsed under their\nlocal lock), and the ops of theirs refused with `EIO` for it, on\nany file.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "peers_unreachable": {
+          "description": "Peers this owner took for unreachable (a recall undeliverable, or\npushed grants unused twice in a row; granted only over their own\nrequests until one acknowledges a recall), and waiters of theirs\npassed over meanwhile (silent past a short wait for their next\nrequest).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4070,6 +4082,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "stale_incarnation_requests": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "tagged_ops": {
           "description": "Plan 30 §M14 phase 2 (the fencing token): mutations issued here\ntagged with their owner's grants, and recalled grants whose\nrelease waited for such a mutation to be answered.",
           "format": "uint64",
@@ -4083,6 +4100,11 @@
           "type": "integer"
         },
         "unavailable": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unreachable_passed_over": {
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4145,6 +4167,10 @@
         "token_rejections",
         "requeued_in_place",
         "released_superseded",
+        "peers_unreachable",
+        "unreachable_passed_over",
+        "incarnation_waiters_dropped",
+        "stale_incarnation_requests",
         "requests_in_flight",
         "waiters",
         "recalls_in_flight"

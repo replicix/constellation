@@ -29,7 +29,7 @@
 //! the fix, the 21 lookups took 126 s and `session.timeouts` counted 69.
 
 use super::m11::{
-    cluster, deleg_of, delegate, dump_logs_on_failure, undelegate, unmount_all,
+    cluster, deleg_of, delegate, dump_logs_on_failure, n, undelegate, unmount_all,
     wait_for_connected_peers, wait_installed,
 };
 use super::m9::node_id;
@@ -76,6 +76,20 @@ pub fn lock_grant_dead_generation(_seed: u64) -> Result<()> {
     let (_env, _root, mut clients, _proxies) = cluster(NAME, &["a", "b", "c"], &[], 0)?;
     let result = (|| -> Result<()> {
         let c_id = node_id(&clients[2])?;
+        // b's write into d1 must go to the delegate c. A node's authority
+        // core learns its links on a 1 s tick, and it sends an op under
+        // another node's delegation to the root while it has no link to
+        // that delegate yet; the root, not linked to c yet either,
+        // recalls the delegation and executes it (the designed fallback
+        // for an unreachable delegate). Right after the mounts, c had
+        // enrolled a second before b's write: the generation ended under
+        // the scenario, whose `undelegate` then found nothing delegated.
+        let linked = {
+            let refs: Vec<&Client> = clients.iter().collect();
+            wait_for_p2p(&refs)?;
+            wait_for_connected_peers(&refs)?;
+            Instant::now()
+        };
         {
             let a = &clients[0];
             std::fs::create_dir(a.mnt.join("d1"))?;
@@ -103,6 +117,26 @@ pub fn lock_grant_dead_generation(_seed: u64) -> Result<()> {
             std::fs::write(clients[2].mnt.join(&name), name.as_bytes())?;
             names.push(name);
         }
+        for x in &clients[..2] {
+            eventually(
+                &format!("{} applies the delegation of /d1", x.name),
+                Duration::from_secs(30),
+                || {
+                    let d = deleg_of(x)?;
+                    let table = d["table"].as_array().cloned().unwrap_or_default();
+                    anyhow::ensure!(
+                        table
+                            .iter()
+                            .any(|e| e["path"] == "/d1" && n(e, "gen") == gen),
+                        "{}'s table: {table:?}",
+                        x.name
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+        // Two link ticks since every link was up: the cores route to c.
+        std::thread::sleep(Duration::from_secs(2).saturating_sub(linked.elapsed()));
         std::fs::write(clients[1].mnt.join("d1/b-0"), b"d1/b-0")?;
         names.push("d1/b-0".into());
         for x in &clients {

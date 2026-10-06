@@ -541,6 +541,9 @@ pub enum Payload {
         /// The requester's clock (unix ms) when it sent; echoed in a
         /// `LockGranted` push.
         sent: i64,
+        /// The requester's node incarnation: the owner drops what an
+        /// earlier one left queued.
+        incarnation: u32,
     },
     LockReply {
         req_id: u64,
@@ -1308,6 +1311,7 @@ mod tests {
                 exclusive: true,
                 blocking: false,
                 sent: 7,
+                incarnation: 2,
             },
             Payload::LockReply {
                 req_id: 2,

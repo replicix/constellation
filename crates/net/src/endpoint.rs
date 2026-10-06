@@ -439,14 +439,22 @@ impl Pool {
             .unwrap_or_default()
     }
 
-    fn track(&self, conn: &iroh::endpoint::Connection) {
+    /// Track `conn`; `false` if it already was.
+    fn track(&self, conn: &iroh::endpoint::Connection) -> bool {
         let mut tracked = self.tracked.lock().unwrap();
         let list = tracked.entry(conn.remote_id()).or_default();
+        let stable = conn.stable_id();
+        let mut known = false;
         list.retain(|weak| {
-            weak.upgrade()
-                .is_some_and(|conn| conn.close_reason().is_none())
+            weak.upgrade().is_some_and(|c| {
+                known |= c.stable_id() == stable;
+                c.close_reason().is_none()
+            })
         });
-        list.push(conn.weak_handle());
+        if !known {
+            list.push(conn.weak_handle());
+        }
+        !known
     }
 
     /// Plan 31 C8: close every pooled and tracked connection.
@@ -793,11 +801,13 @@ pub(crate) fn version_reason() -> Vec<u8> {
 /// grow [`Pool::tracked`] without bound — one entry per fresh random
 /// key, each pinning its dead connection's allocation through the weak
 /// handle — before ever being refused. So an inbound connection is
-/// tracked and probed only when its key is already on the allowlist;
-/// a peer that enrolled since the last registry read is admitted by the
-/// handler's refresh as before, and its restart, if any, is caught by
-/// the registry path (`Peers::refresh_registry` → `suspect_moved`: the
-/// restart publishes a new port).
+/// tracked and probed only when its key is already on the allowlist.
+/// A peer that enrolled since the last registry read is tracked later,
+/// once its key is enrolled ([`P2p::admitted`]): left untracked,
+/// its connections outlived the eviction of its dead incarnation, and
+/// kept iroh's selected path to it on the dead port
+/// (`git-under-flock-causal`: the reader mounted a second after the lock
+/// owner; after its restart the owner could not dial it for 35 minutes).
 ///
 /// Plan 31 C8: it is also where [`Admission`] is enforced — an inbound
 /// connection is refused right after its handshake while this endpoint is
@@ -870,11 +880,8 @@ impl iroh::endpoint::EndpointHooks for InboundWatch {
                         .unwrap()
                         .contains(&crate::identity::hex32(conn.remote_id().as_bytes()))
                 });
-            if known {
-                pool.track(conn);
-                if inbound {
-                    pool.suspect(conn.remote_id(), Suspicion::Restarted);
-                }
+            if known && pool.track(conn) && inbound {
+                pool.suspect(conn.remote_id(), Suspicion::Restarted);
             }
         }
         std::future::ready(iroh::endpoint::AfterHandshakeOutcome::accept())
@@ -1306,6 +1313,7 @@ pub trait PeerService: Send + Sync + 'static {
     fn holder_alive(&self, _holder: u64, _epoch: u64, _candidacy: u64, _listed: bool) {}
     /// Plan 30 §M14: a node asks this one, as the owning sequencer, for
     /// a lock grant. Default: busy (no lock service here).
+    #[allow(clippy::too_many_arguments)]
     fn lock_requested(
         &self,
         _requester: u64,
@@ -1314,6 +1322,7 @@ pub trait PeerService: Send + Sync + 'static {
         _exclusive: bool,
         _blocking: bool,
         _sent: i64,
+        _incarnation: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::LockReply {
@@ -1631,6 +1640,23 @@ impl P2p {
 
     pub fn allowed_len(&self) -> usize {
         self.allow.lock().unwrap().len()
+    }
+
+    /// An inbound connection whose key is on the allowlist now (our ALPN
+    /// handler admitted it, or gossip's saw the key enrolled). The
+    /// handshake hook passed it over if the key was not enrolled yet then
+    /// ([`InboundWatch`]): track it, and have the pooled connection
+    /// probed as for any fresh inbound one.
+    pub(crate) fn admitted(&self, conn: &iroh::endpoint::Connection) {
+        if self.pool.track(conn) {
+            self.pool.suspect(conn.remote_id(), Suspicion::Restarted);
+        }
+    }
+
+    /// Is `pubkey_hex` enrolled? Unlike [`P2p::check`], a miss neither
+    /// asks for a registry read nor arms the refresh cooldown.
+    pub(crate) fn is_allowed(&self, pubkey_hex: &str) -> bool {
+        self.allow.lock().unwrap().contains(pubkey_hex)
     }
 
     /// Is `pubkey_hex` currently permitted? `Refresh` is reported as not
@@ -2037,6 +2063,19 @@ impl P2p {
     #[cfg(test)]
     pub(crate) fn tracked_peers(&self) -> usize {
         self.pool.tracked.lock().unwrap().len()
+    }
+
+    /// How many tracked connections are open.
+    #[cfg(test)]
+    pub(crate) fn tracked_open(&self) -> usize {
+        self.pool
+            .tracked
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .filter(|weak| weak.upgrade().is_some_and(|c| c.close_reason().is_none()))
+            .count()
     }
 
     /// The pooled connection's id, to tell whether it was replaced. For

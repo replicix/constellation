@@ -803,6 +803,7 @@ impl constellation_net::PeerService for P2pBridge {
         exclusive: bool,
         blocking: bool,
         sent: i64,
+        incarnation: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -815,13 +816,21 @@ impl constellation_net::PeerService for P2pBridge {
                     mode: crate::locks::mode_of(exclusive),
                     blocking,
                     sent,
+                    incarnation,
                     reply,
                 })
                 .is_ok()
             {
-                receive
-                    .await
-                    .unwrap_or(constellation_authority::LockOutcome::Busy)
+                // Bounded: the requester gives up after one forward
+                // timeout (and asks again), so an answer later than this
+                // reaches nobody; one that never comes (the core dropped
+                // the request) must not keep this task and its stream.
+                let bound =
+                    std::time::Duration::from_millis(2 * crate::forward::forward_timeout_ms());
+                match tokio::time::timeout(bound, receive).await {
+                    Ok(Ok(outcome)) => outcome,
+                    _ => constellation_authority::LockOutcome::Busy,
+                }
             } else {
                 constellation_authority::LockOutcome::Busy
             };

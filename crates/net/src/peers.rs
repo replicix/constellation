@@ -908,7 +908,12 @@ impl Peers {
         };
         let mut router = iroh::protocol::Router::builder(inner.p2p.endpoint().clone())
             .accept(ALPN, handler)
-            .accept(iroh_gossip::ALPN, inner.p2p.gossip().clone());
+            .accept(
+                iroh_gossip::ALPN,
+                GossipHandler {
+                    inner: inner.clone(),
+                },
+            );
         for &alpn in crate::message::OLDER_ALPNS {
             router = router.accept(alpn, OlderVersion { alpn });
         }
@@ -917,6 +922,70 @@ impl Peers {
         // abort the accept loop.
         std::mem::forget(router);
         std::future::pending::<()>().await
+    }
+}
+
+/// How long a gossip connection from a key not enrolled here is watched
+/// for the key's enrolment ([`GossipHandler`]): a few of the engine's
+/// registry polls (5 s), or a miss on our ALPN, enrol a peer that just
+/// mounted well within it.
+const GOSSIP_ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+/// iroh-gossip's connections, handed to gossip at once: gossip does its
+/// own admission (a message from an unenrolled author is dropped in
+/// [`run_gossip`]). An enrolled peer's connection is also tracked, like
+/// one on our ALPN ([`handle_conn`]): a peer that mounted after this
+/// node's last registry read dials gossip before anything else, and that
+/// connection, untracked, outlived its incarnation's eviction. Such a
+/// key is not on the allowlist yet; its connection is tracked once a
+/// registry read enrols it ([`GOSSIP_ADMISSION_WAIT`]). Gossip neither
+/// waits for that read nor asks for it: a miss here would arm the
+/// allowlist's refresh cooldown, and the peer's own dial on our ALPN,
+/// right behind, would then be rejected unread (`lock-grant-dead-
+/// generation`: `b` could not reach the delegate `c`, its write went to
+/// the root, which recalled the delegation).
+struct GossipHandler {
+    inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for GossipHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GossipHandler")
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for GossipHandler {
+    async fn accept(
+        &self,
+        conn: iroh::endpoint::Connection,
+    ) -> std::result::Result<(), iroh::protocol::AcceptError> {
+        let hex = crate::identity::hex32(conn.remote_id().as_bytes());
+        if self.inner.p2p.is_allowed(&hex) {
+            self.inner.p2p.admitted(&conn);
+        } else {
+            let (inner, weak) = (self.inner.clone(), conn.weak_handle());
+            tokio::spawn(async move {
+                let deadline = Instant::now() + GOSSIP_ADMISSION_WAIT;
+                while Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let Some(conn) = weak.upgrade() else {
+                        return;
+                    };
+                    if conn.close_reason().is_some() {
+                        return;
+                    }
+                    if inner.p2p.is_allowed(&hex) {
+                        inner.p2p.admitted(&conn);
+                        return;
+                    }
+                }
+            });
+        }
+        iroh::protocol::ProtocolHandler::accept(self.inner.p2p.gossip(), conn).await
+    }
+
+    async fn shutdown(&self) {
+        iroh::protocol::ProtocolHandler::shutdown(self.inner.p2p.gossip()).await
     }
 }
 
@@ -1243,6 +1312,9 @@ async fn handle_conn<S: PeerService>(
         conn.close(1u32.into(), b"not allowed");
         return Ok(());
     }
+    // Tracked for eviction: the handshake hook passed it over if the key
+    // was not enrolled then (`P2p::admitted`).
+    inner.p2p.admitted(&conn);
     // Streams run concurrently rather than one-at-a-time. A chunk
     // request costs a disk read plus a multi-megabyte transfer, so
     // serializing behind `accept_bi` would both stall unrelated requests
@@ -1596,9 +1668,18 @@ async fn handle_stream<S: PeerService>(
             exclusive,
             blocking,
             sent,
+            incarnation,
         } => Some(
             service
-                .lock_requested(requester, req_id, ino, exclusive, blocking, sent)
+                .lock_requested(
+                    requester,
+                    req_id,
+                    ino,
+                    exclusive,
+                    blocking,
+                    sent,
+                    incarnation,
+                )
                 .await,
         ),
         Payload::LockRecall {
@@ -2464,6 +2545,68 @@ mod tests {
             0,
             "an unenrolled key's connection must not be tracked"
         );
+    }
+
+    /// A peer that enrolled after the holder's last registry read: its
+    /// connection completes its handshake unknown (not tracked), and the
+    /// handler's re-read admits it. It must be tracked then — on our ALPN
+    /// and on gossip's — or evicting its dead incarnation later leaves
+    /// that connection open, holding iroh's path to the peer on its dead
+    /// port (`git-under-flock-causal`: 35 minutes the lock owner could
+    /// not reach the restarted reader).
+    #[tokio::test]
+    async fn a_peer_admitted_after_its_handshake_is_tracked() {
+        let topic = crate::topic_for(Some(&[5u8; 32]), "fs");
+        let holder_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let holder_addr = holder_p2p.addr();
+        let holder_key = holder_p2p.pubkey_hex();
+        let holder = Peers::new(holder_p2p, 1);
+        let asker_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let asker_addr = asker_p2p.addr();
+        let asker_key = asker_p2p.pubkey_hex();
+        let asker = Peers::new(asker_p2p, 2);
+        let registry = vec![
+            (
+                1,
+                holder_key.clone(),
+                serde_json::to_value(&holder_addr).unwrap(),
+            ),
+            (2, asker_key, serde_json::to_value(&asker_addr).unwrap()),
+        ];
+        // The holder read the registry before the asker enrolled; a miss
+        // re-reads it and finds the asker.
+        holder.refresh_registry(vec![registry[0].clone()]);
+        {
+            let (peers, registry) = (holder.clone(), registry.clone());
+            holder.set_refresher(Arc::new(move || {
+                peers.refresh_registry(registry.clone());
+                Box::pin(async {})
+            }));
+        }
+        asker.refresh_registry(registry);
+        let service = Arc::new(Recorder {
+            release: true,
+            ..Default::default()
+        });
+        let serving = holder.clone();
+        let svc = service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+
+        let tracked = |peers: &Peers| peers.inner.as_ref().unwrap().p2p.tracked_open();
+        assert!(asker.request_lease("p0", None).await.is_some());
+        assert_eq!(tracked(&holder), 1, "the admitted direct connection");
+        // Gossip dials its own connection.
+        let _rx = asker.join_topic(vec![holder_addr.id]).await.unwrap();
+        let _holder_rx = holder.join_topic(Vec::new()).await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tracked(&holder) < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(tracked(&holder), 2, "and the admitted gossip connection");
     }
 
     /// A request that names a node other than the one enrolled under its

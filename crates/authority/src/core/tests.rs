@@ -8384,6 +8384,18 @@ mod locks {
         mode: LockMode,
         blocking: bool,
     ) -> Vec<Action> {
+        request_inc(h, from, 1, req, ino, mode, blocking)
+    }
+
+    fn request_inc(
+        h: &mut Harness,
+        from: NodeId,
+        incarnation: u32,
+        req: u64,
+        ino: Ino,
+        mode: LockMode,
+        blocking: bool,
+    ) -> Vec<Action> {
         h.step(Event::Peer {
             from,
             msg: PeerMsg::LockRequest {
@@ -8392,6 +8404,7 @@ mod locks {
                 mode,
                 blocking,
                 sent: h.now,
+                incarnation,
             },
         })
     }
@@ -8564,6 +8577,427 @@ mod locks {
             1,
             "node 4 recalls node 3's grant: {out:?}"
         );
+    }
+
+    /// Every grant in `out`, pushed or replied: `(to, id)`.
+    fn grants_to(out: &[Action]) -> Vec<(NodeId, GrantId)> {
+        pushes(out)
+            .into_iter()
+            .map(|(to, _, o)| (to, o))
+            .chain(lock_replies(out).into_iter().map(|(to, _, o)| (to, o)))
+            .filter_map(|(to, o)| match o {
+                LockOutcome::Granted { id, .. } => Some((to, id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Fire every `LockHeldReply` timer in `out`: the parked requests
+    /// are answered `Waiting`; returns their retry intervals by node.
+    fn answer_held(h: &mut Harness, out: &[Action]) -> Vec<(NodeId, u64)> {
+        let mut waits = Vec::new();
+        for t in timers(out, TimerKind::LockHeldReply) {
+            let out = h.step(Event::Timer { id: t });
+            for (to, _, o) in lock_replies(&out) {
+                let LockOutcome::Waiting { retry_ms } = o else {
+                    panic!("held reply not Waiting: {o:?}")
+                };
+                waits.push((to, retry_ms));
+            }
+        }
+        waits
+    }
+
+    /// `git-under-flock-causal` (35 minutes): node 3, the reader, came
+    /// back under a new incarnation that this owner could not dial, while
+    /// its own requests (and their replies) still arrived over its own
+    /// connection. Each time the turn lock freed, node 3 was first in
+    /// line with no request held, so the grant went out as a push and was
+    /// lost; the committers' recall of it was lost too, so it was
+    /// outwaited (`ttl + margin`), and node 3 — keeping its place — was
+    /// pushed the next one. Now an undeliverable recall marks node 3
+    /// unreachable: it loses its kept place, is passed over while it has
+    /// no request held, re-sends at once, and is granted over a request
+    /// of its own — never by push.
+    #[test]
+    fn an_unreachable_waiter_is_granted_over_its_own_requests_and_passed_over_meanwhile() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let out = request_inc(&mut h, 3, 2, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let normal = answer_held(&mut h, &out);
+        assert_eq!(normal.len(), 1);
+        let normal_retry = normal[0].1;
+        h.advance(10);
+        let out = request(&mut h, 4, 9, ino, X, true);
+        answer_held(&mut h, &out);
+        // Node 2 releases: node 3, first in line, is pushed its grant
+        // (this owner does not know yet that it cannot reach node 3).
+        h.advance(100);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let ps = pushes(&out);
+        let [(3, _, LockOutcome::Granted { id: g3, .. })] = ps.as_slice() else {
+            panic!("node 3 is pushed its grant: {out:?}")
+        };
+        let g3 = *g3;
+        let rc = recalls(&out);
+        let [(3, recall, _, _)] = rc.as_slice() else {
+            panic!("node 4 recalls node 3's grant: {out:?}")
+        };
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        // The push is lost, and the recall fails with no connection left.
+        h.advance(500);
+        h.step(Event::PeerFailed {
+            req: *recall,
+            to: 3,
+            outage: true,
+        });
+        assert_eq!(h.core.stats.lock_peers_unreachable, 1);
+        // Node 3 re-sends: its grant is recalled, so it parks — not at
+        // its old place (ahead of node 4) — and is told to ask again at
+        // once.
+        h.advance(1_500);
+        let out = request_inc(&mut h, 3, 2, 18, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let waits = answer_held(&mut h, &out);
+        let [(3, retry)] = waits.as_slice() else {
+            panic!("one Waiting for node 3: {waits:?}")
+        };
+        assert!(
+            *retry < normal_retry,
+            "an unreachable waiter re-sends at once ({retry} ms, normally {normal_retry} ms)"
+        );
+        assert_eq!(h.core.stats.lock_requeued_in_place, 0);
+        // Node 4 re-sends as a live waiter does (its Waiting answered).
+        h.advance(500);
+        let out = request(&mut h, 4, 19, ino, X, true);
+        answer_held(&mut h, &out);
+        // Node 3's grant is outwaited: node 4 is served, not node 3.
+        h.now = Ms(h.meta.locks().get(g3).unwrap().until_ms);
+        let out = h.step(Event::Timer { id: expiry });
+        assert_eq!(h.core.stats.lock_recalls_expired, 1);
+        let gs = grants_to(&out);
+        let [(4, g4)] = gs.as_slice() else {
+            panic!("node 4 is served, not node 3: {out:?}")
+        };
+        let g4 = *g4;
+        // Node 3 asks again (at once, as told): node 4 is recalled for it,
+        // and node 4's release grants node 3 over its held request.
+        h.advance(50);
+        let out = request_inc(&mut h, 3, 2, 28, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        assert!(
+            recalls(&out).iter().any(|(to, _, _, _)| *to == 4),
+            "node 4 recalled for node 3: {out:?}"
+        );
+        h.advance(50);
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g4,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let [(3, OpId(28), LockOutcome::Granted { .. })] = lock_replies(&out).as_slice() else {
+            panic!("node 3 is granted over its own request: {out:?}")
+        };
+        assert!(pushes(&out).is_empty(), "{out:?}");
+        assert!(h.core.stats.lock_unreachable_passed_over >= 1);
+        // A recall node 3 acknowledges: reachable again.
+        let out = request(&mut h, 2, 37, ino, X, true);
+        let rc = recalls(&out);
+        let [(3, recall, _, _)] = rc.as_slice() else {
+            panic!("node 2 recalls node 3's grant: {out:?}")
+        };
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockRecalled { req: *recall },
+        });
+        assert_eq!(h.core.lock_unreachable(), 0);
+    }
+
+    /// An unreachable waiter first in line, between two of its requests
+    /// (its last one answered `Waiting`, the next moments away) when the
+    /// lock frees: the queue waits for that request instead of serving
+    /// the waiter behind it, which took the turn every time the release
+    /// fell in that gap. Silent past the wait, it is passed over.
+    #[test]
+    fn the_queue_waits_briefly_for_an_unreachable_waiters_next_request() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        // Node 3 restarted: its new incarnation is not known reachable.
+        h.advance(10);
+        let out = request_inc(&mut h, 3, 1, 8, ino, X, true);
+        answer_held(&mut h, &out);
+        h.advance(10);
+        let out = request_inc(&mut h, 3, 2, 9, ino, X, true);
+        assert_eq!(h.core.lock_unreachable(), 1);
+        answer_held(&mut h, &out);
+        h.advance(10);
+        let out = request(&mut h, 4, 10, ino, X, true);
+        answer_held(&mut h, &out);
+        let release = |h: &mut Harness, grant| {
+            h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::LockReleased {
+                    ino,
+                    grant,
+                    position: constellation_meta::Position::ZERO,
+                },
+            })
+        };
+        // Node 2 releases while node 3 has no request held.
+        h.advance(20);
+        let out = release(&mut h, g2);
+        assert!(grants_to(&out).is_empty(), "nobody served yet: {out:?}");
+        // Node 3's next request is granted over itself.
+        h.advance(30);
+        let out = request_inc(&mut h, 3, 2, 11, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(3, OpId(11), LockOutcome::Granted { id: g3, .. })] = rs.as_slice() else {
+            panic!("node 3 is granted over its request: {out:?}")
+        };
+        let g3 = *g3;
+        assert!(pushes(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.lock_unreachable_passed_over, 0);
+        // Node 3 queues again and goes silent; node 4 holds meanwhile.
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g3,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let out = request(&mut h, 4, 12, ino, X, true);
+        let (g4, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let out = request_inc(&mut h, 3, 2, 13, ino, X, true);
+        answer_held(&mut h, &out);
+        h.advance(10);
+        let out = request(&mut h, 2, 14, ino, X, true);
+        answer_held(&mut h, &out);
+        // Node 4 releases long after node 3's last request: node 2 is
+        // served, node 3 passed over.
+        h.advance(2_000);
+        let out = h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g4,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let gs = grants_to(&out);
+        let [(2, _)] = gs.as_slice() else {
+            panic!("node 2 is served, node 3 passed over: {out:?}")
+        };
+        assert_eq!(h.core.stats.lock_unreachable_passed_over, 1);
+    }
+
+    /// The same without the transport saying so: grants pushed to a
+    /// waiter that never uses them (no renewal, no release) — twice in a
+    /// row — take it for unreachable, and the waiter behind it is served
+    /// at the next expiry instead of it.
+    #[test]
+    fn a_waiter_leaving_two_pushed_grants_unused_loses_its_place() {
+        let (mut h, ino) = holder_with_file();
+        // Short grants: two outwaited ones fit in the harness's lease.
+        h.core.cfg.lock_ttl_ms = 2_000;
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        answer_held(&mut h, &out);
+        h.advance(10);
+        let out = request(&mut h, 4, 9, ino, X, true);
+        answer_held(&mut h, &out);
+        h.advance(100);
+        let mut out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let mut req = 18;
+        for round in 0..2 {
+            let ps = pushes(&out);
+            let [(3, _, LockOutcome::Granted { id, .. })] = ps.as_slice() else {
+                panic!("round {round}: node 3 (first in line) is pushed: {out:?}")
+            };
+            let g3 = *id;
+            let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+            // Lost; node 3 re-sends (its recall times out on a live
+            // connection: no outage evidence), and re-parks in place; both
+            // waiters keep re-sending until the expiry.
+            let until = h.meta.locks().get(g3).unwrap().until_ms;
+            for at in [h.now.0 + 500, until - 500] {
+                h.now = Ms(at);
+                let resend = request(&mut h, 3, req, ino, X, true);
+                answer_held(&mut h, &resend);
+                let resend = request(&mut h, 4, req + 1, ino, X, true);
+                answer_held(&mut h, &resend);
+                req += 10;
+            }
+            h.now = Ms(until);
+            out = h.step(Event::Timer { id: expiry });
+        }
+        assert_eq!(
+            h.core.stats.lock_requeued_in_place, 2,
+            "kept its place after each unused grant"
+        );
+        assert_eq!(h.core.stats.lock_peers_unreachable, 1);
+        // Node 3 asked 500 ms ago: the queue waits briefly for its next
+        // request rather than push it a third grant. It stays silent;
+        // node 4's next request is served, node 3 passed over.
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        // 800 ms after its request: past the wait, inside `ttl - margin`.
+        h.advance(300);
+        let out = request(&mut h, 4, req + 1, ino, X, true);
+        let gs = grants_to(&out);
+        let [(4, _)] = gs.as_slice() else {
+            panic!("node 4 is served after node 3's second unused grant: {out:?}")
+        };
+        assert_eq!(h.core.stats.lock_unreachable_passed_over, 1);
+    }
+
+    /// A node that restarts while parked: its new incarnation's request
+    /// drops what the previous one left queued (a waiter of another mode
+    /// would otherwise hold the queue until its silence ran out, and its
+    /// kept place would carry over), and a request still in flight from
+    /// the previous incarnation is answered `Waiting` and not served.
+    #[test]
+    fn a_new_incarnation_drops_the_previous_ones_waiters() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let out = request_inc(&mut h, 3, 1, 8, ino, X, true);
+        answer_held(&mut h, &out);
+        h.advance(10);
+        let out = request(&mut h, 4, 9, ino, S, true);
+        answer_held(&mut h, &out);
+        assert_eq!(h.core.lock_waiters(), 2);
+        // Node 3 restarts and asks for a shared lock.
+        h.advance(100);
+        let out = request_inc(&mut h, 3, 2, 1, ino, S, true);
+        answer_held(&mut h, &out);
+        assert_eq!(h.core.stats.lock_incarnation_waiters_dropped, 1);
+        assert_eq!(h.core.lock_waiters(), 2, "node 4's, and node 3's new one");
+        // A late request of the old incarnation: answered, not served.
+        let out = request_inc(&mut h, 3, 1, 10, ino, X, true);
+        let [(3, OpId(10), LockOutcome::Waiting { .. })] = lock_replies(&out).as_slice() else {
+            panic!("the stale request is answered Waiting: {out:?}")
+        };
+        assert!(pushes(&out).is_empty(), "{out:?}");
+        assert!(
+            timers(&out, TimerKind::LockHeldReply).is_empty(),
+            "not held: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_stale_incarnation_requests, 1);
+        assert_eq!(h.core.lock_waiters(), 2);
+        // The restarted node is not known reachable from here yet: it is
+        // told to ask again at once, and granted over its own requests.
+        assert_eq!(h.core.lock_unreachable(), 1);
+        // Node 2 releases: node 4's shared waiter is granted; the old
+        // exclusive one, had it stayed, would have gone first alone.
+        // Node 3's new one, with no request held, is waited for...
+        h.advance(100);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        let ps = pushes(&out);
+        let [(4, _, LockOutcome::Granted { mode: S, .. })] = ps.as_slice() else {
+            panic!("node 4 is granted its shared lock: {out:?}")
+        };
+        // ... and granted alongside node 4 over its next request.
+        h.advance(20);
+        let out = request_inc(&mut h, 3, 2, 2, ino, S, true);
+        let [(3, OpId(2), LockOutcome::Granted { mode: S, .. })] = lock_replies(&out).as_slice()
+        else {
+            panic!("node 3 is granted over its request: {out:?}")
+        };
+        assert_eq!(h.core.lock_waiters(), 0);
+    }
+
+    /// A waiter dropped for its node's new incarnation while its request
+    /// is held here (`recall_hold_ms`) has that request answered: the
+    /// RPC's reply is awaited on the serving side (the driver's reply
+    /// table, the P2P task holding the stream), and dropped unanswered
+    /// it waited there forever.
+    #[test]
+    fn a_held_request_of_a_restarted_nodes_dropped_waiter_is_answered() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        // Node 3's request is held, not answered yet.
+        let out = request_inc(&mut h, 3, 1, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "held: {out:?}");
+        let held = timers(&out, TimerKind::LockHeldReply);
+        assert_eq!(held.len(), 1, "{out:?}");
+        // Node 3 restarts and asks again under its new incarnation.
+        h.advance(10);
+        let out = request_inc(&mut h, 3, 2, 1, ino, X, true);
+        assert_eq!(h.core.stats.lock_incarnation_waiters_dropped, 1);
+        let replies = lock_replies(&out);
+        assert!(
+            replies
+                .iter()
+                .any(|r| matches!(r, (3, OpId(8), LockOutcome::Waiting { .. }))),
+            "the dropped waiter's held request is answered: {out:?}"
+        );
+        assert!(
+            !replies.iter().any(|(_, req, _)| *req == OpId(1)),
+            "the new request is held as any other: {out:?}"
+        );
+        assert_eq!(h.core.lock_waiters(), 1, "node 3's new one");
+        // The old request's held timer no longer answers anything.
+        for t in held {
+            let out = h.step(Event::Timer { id: t });
+            assert!(
+                !lock_replies(&out).iter().any(|(_, req, _)| *req == OpId(8)),
+                "answered twice: {out:?}"
+            );
+        }
+        // The new one is granted over its held request once node 2 is
+        // done.
+        h.advance(10);
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g2,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        assert!(
+            pushes(&out).is_empty(),
+            "not pushed to a restarted node: {out:?}"
+        );
+        let [(3, OpId(1), LockOutcome::Granted { mode: X, .. })] = lock_replies(&out).as_slice()
+        else {
+            panic!("node 3 is granted over its request: {out:?}")
+        };
+        assert_eq!(h.core.lock_waiters(), 0);
     }
 
     /// The owner re-affirms a grant under a new id for every answer

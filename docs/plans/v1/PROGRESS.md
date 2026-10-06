@@ -43213,3 +43213,194 @@ the runs above.
 - `gate1`'s holder-side, daemon-idle hang: unexplained. If it recurs, the
   first look is `ring_stranded_commits`/`ring_entries_held_long` and the
   `io_uring: ring N …` log lines.
+
+## Fix: a lock owner kept pushing the turn lock to a restarted reader it could not reach (`lock-recall-unreachable`)
+
+`git-under-flock-causal` on the ring (`auto`, `06d635b`) stalled 35 minutes in
+1 of 5 runs (the anomaly in "cluster-lock-ring-auto" above).
+
+Fix: the lock owner takes a peer for unreachable when a recall to it fails
+with no connection left, or when two grants in a row served to it from the
+queue go unused (outwaited, never renewed nor released). Such a waiter loses
+its kept queue position, is told to re-send at once, is granted only over a
+request of its own (never by push), and is passed over when it has been
+silent for longer than two of its request cycles. Every `LockRequest` now
+carries the requester's incarnation: a new incarnation drops the waiters and
+kept positions its previous one left queued (a held request among them is
+answered `Waiting`), starts out unreachable, and a late request from an
+older incarnation is answered `Waiting` and not served. On the P2P side, an
+inbound connection from a peer enrolled after this node's last registry
+read is now tracked like any other once its key is enrolled, on our ALPN
+and on gossip's, so evicting the peer's dead incarnation closes it.
+
+### What the evidence showed (`/var/tmp/clr/evidence/causal-auto-hang-1`)
+
+- Node 1 (`a`) owned the turn lock. It started with `peers=0` in its
+  registry view. Reader `c` (node 3) mounted 2 s later, so `c`'s first
+  connections (gossip first) reached `a` before `c`'s key was on `a`'s
+  allowlist. `handle_conn`'s re-read admitted them, but `InboundWatch` had
+  already passed them over, so they were never put in `Pool::tracked`.
+- 00:12:33: `c` was killed and restarted (incarnation 2). `a` evicted the
+  pooled connection (`Unanswered`), but the untracked ones stayed open and
+  kept iroh's path on `c`'s dead port. From then on every dial from `a`
+  timed out ("every P2P dial has timed out for … 2043 s"). `b`, which had
+  `c` enrolled from the start, rejoined `c` in 8 s. `c`'s gossip sends to
+  `a` failed for the whole 35 minutes.
+- The link was one-way: `c`'s own lock requests reached `a` on `c`'s fresh
+  connection and were answered `Waiting`. Everything `a` sent on its own was
+  lost: the `LockGranted` push and the `LockRecall`.
+- `a` logged "a lock grant's recall went unanswered; outwaited it" for
+  holder 3 **105 times**. Each time the lock freed, node 3 was first in line
+  with no request held, so its grant went out as a push and was lost. The
+  committers' recalls of it were lost too, so it was outwaited after ttl +
+  margin. Because the grant went unused, `served` re-parked node 3 at its
+  old position (the EC2-campaign-8 fairness rule), ahead of both committers,
+  and it was pushed the next grant. The committers never got a turn: their
+  `setlk`s waited inside the engine (`vfs::watch` "still waiting … stage=lock
+  grant"), with no ring queue near its limit.
+- The answers to the task's questions: (1) the waiter was **not** a stale
+  previous-incarnation entry. It was the live incarnation 2, but the owner
+  could not push to it. (2) Yes: an outwaited, unused grant re-queued the
+  waiter at its kept position, with no limit. (3) The next waiter never got
+  its turn because of (2). (4) P2P never reconnected because the connections
+  admitted after a late enrollment were untracked and outlived the eviction.
+
+### Changes
+
+- `crates/authority/src/core/locks.rs`: `LockState::{unused_grants,
+  unproven, unreachable, incarnations}`; `lock_note_incarnation`,
+  `lock_peer_unreachable`, `lock_peer_heard`; `lock_serve_waiters` waits
+  briefly (`lock_unreachable_wait_ms` = 2 × (`recall_hold_ms` + resume
+  retry)) for an unreachable waiter's next request, then passes it over;
+  the held-reply retry for an unreachable waiter is the short resume retry;
+  `on_lock_recalled_ack` clears the mark; an outage `PeerFailed` on a recall
+  sets it; `UNUSED_GRANTS_UNREACHABLE` = 2.
+- Wire: `PeerMsg::LockRequest.incarnation`, `Payload::LockRequest.
+  incarnation`, `PeerService::lock_requested(.., incarnation)`. There is no
+  serde default and no version bump; the field is required.
+- Stats: `lock_peers_unreachable`, `lock_unreachable_passed_over`,
+  `lock_incarnation_waiters_dropped`, `lock_stale_incarnation_requests`.
+  `node.status` locks: `peers_unreachable`, `unreachable_passed_over`,
+  `incarnation_waiters_dropped`, `stale_incarnation_requests`
+  (`control.schema.json` regenerated).
+- `crates/net`: `Pool::track` returns whether the connection is new;
+  `P2p::admitted`, called by `handle_conn` once it admitted a connection;
+  `P2p::is_allowed` (an allowlist lookup that neither re-reads the
+  registry nor arms its cooldown); the new `GossipHandler` wraps
+  iroh-gossip's handler and tracks an enrolled peer's gossip connection,
+  or, for a key not enrolled yet, watches it (up to 60 s) until a registry
+  read enrols the key. Gossip gets the connection at once either way.
+- `crates/engine`: `P2pBridge::lock_requested` waits at most
+  2 × `forward_timeout_ms` for the core's answer (the requester gives up
+  after one), and the driver prunes `lock_request_replies` entries whose
+  receiver is gone, so a request the core never answers cannot leak.
+- `docs/reference/features/cluster-locks.md`: the unreachable-peer and
+  incarnation rules, and the four new counters.
+
+### Reproduction, pinned
+
+- Core (deterministic, blackholed owner→reader direction with the reader's
+  own requests still arriving):
+  `an_unreachable_waiter_is_granted_over_its_own_requests_and_passed_over_meanwhile`
+  (the causal shape: lost push, recall failing with an outage, outwait:
+  node 4 is served, not node 3; node 3 is then granted over its own
+  request), `a_waiter_leaving_two_pushed_grants_unused_loses_its_place`
+  (the same with no transport evidence: two unused grants),
+  `the_queue_waits_briefly_for_an_unreachable_waiters_next_request`,
+  `a_new_incarnation_drops_the_previous_ones_waiters`. With
+  `lock_peer_unreachable` disabled, the first three fail.
+  `a_held_request_of_a_restarted_nodes_dropped_waiter_is_answered` fails
+  without the answer to the dropped waiter's held request, and the
+  incarnation test fails without the answer to a stale request.
+- Net: `peers::tests::a_peer_admitted_after_its_handshake_is_tracked`
+  fails with `P2p::admitted` made a no-op ("the admitted direct
+  connection"). An end-to-end loopback test of the late-enrolled restart
+  passed before the net fix as well, so it was dropped in review: iroh's
+  path selection to the dead port did not reproduce on loopback. The part
+  of the P2P stall that is isolated precisely is the untracked
+  connection. The lock-side fix bounds the damage whatever the link does.
+
+### Decisions taken alone
+
+- **A new incarnation starts out unreachable.** This owner's link to a
+  restarted peer can take seconds to come back (5–23 s, "delegate-root-loss"),
+  and a lost first push costs every waiter behind it ttl + margin. Granting
+  over the peer's own requests costs it at most one request round-trip.
+- **The previous incarnation's grants are not dropped** with its waiters.
+  The process is gone, but nothing proves its I/O is over; they are released
+  or outwaited as before.
+- **N = 2 unused grants.** One can be a race: the push finds no op because
+  it was granted over its own request just before.
+- **Sim tests and sweeps ran with `TMPDIR=/dev/shm/lru`.** On `/var/tmp`
+  (btrfs) the sim's on-disk stores made seeds ~80× slower (256 `locks` seeds:
+  93 s vs 1.1 s), which put the sim suite past 30 minutes. The harness used
+  `TMPDIR=/var/tmp/lru` as required.
+
+### Gates (`CARGO_TARGET_DIR` unset; host shared, load 14–35)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --release -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority -p constellation-meta -p constellation-net` | authority 272 + 4 + sim 123, meta 241 + integration, net 120 + integration (`same_identity_restart` 4); 0 failed |
+| `sweep_config` 0..3000, every lock config it takes (`locks`, `-partition`, `-skew`, `-failover`, `-failover-backup`, `-faults`, `-blips`, `-blips-tight`, `-blips-tight-{single,long-lease,in-doubt,faults,delegated}`, `-pause`, `-delegated`, `-released-delegated`, `-writes`, `-delegated-writes`, `-released-writes`, `-failover-backup-writes`) | 0 failing in all 21. Fenced I/Os and lost grants match the base commit's sweep within ±2 per config (e.g. `locks-faults` 8/0 both, `locks-partition` 4877 vs 4875) |
+| harness `lock-*` (`auto`, prefix `lru`) | `lock-holder-partitioned`, `lock-failover`, `lock-latency`, `lock-fence-at-close`, `lock-holder-killed-contention`, `lock-grant-dead-generation`: all PASSED |
+| harness `git-under-flock*` once | `git-under-flock` 126 s, `-gc` 79 s, `-faults` 256 s, `-b2b` 290 s (a first try was cut at the very end by my own 285 s `timeout`, then passed), `-rounds` 466 s: all PASSED |
+| `git-under-flock-causal` ×10 on `auto` | **10/10 PASSED**, 242–276 s; lock acquire wait p50 0.57–0.61 s, max 3.1–11.4 s (the 11 s maxima are one grant outwaited after a reader kill, not a stall) |
+
+The evidence directory `/var/tmp/clr` was deleted after this analysis, as the
+task asked.
+
+### Review round (fix)
+
+- **`lock-grant-dead-generation` failed about half the time** (reviewer:
+  6 of 12; base 8 of 8). Reproduced 3 of 8 with the reviewed build and
+  debug logs. **What happened:** `c` mounted last, about 1 s before `b`
+  wrote `d1/b-0`. `b`'s net layer learned `c` at 55.177 (`c`'s gossip
+  dial made it re-read the registry). But the authority core sees links
+  only through the driver's peer snapshot, sent every 1 s
+  (`authority_driver.rs`, the `Event::Peers` ticker). `b`'s core had no
+  link to `c` at 56.10, so `reaches(c)` was false and the write went to
+  the root `a`. `a`'s core did not show `c` as connected either, so
+  instead of redirecting `b` to the delegate (`holder.rs`) it recalled
+  generation 1 and executed the op (56.104). The scenario's own
+  `undelegate` then found nothing delegated. **Not a routing bug:** this is
+  the documented fallback for an unreachable delegate, inside a ≤1-s
+  window after a peer enrols, and it costs a recall, not correctness.
+  **Peers now connect faster at cluster start:** the reviewed build's
+  gossip handler re-read the registry when a just-mounted peer dialed
+  gossip. The setup step went from about 7.5 s to about 3.5 s, which put
+  `b`'s write inside that window. **Fix:** a readiness wait in the
+  scenario. Every node's links must be up (`wait_for_p2p`,
+  `wait_for_connected_peers`) before `d1` is made. `a` and `b` must have
+  applied the delegation. Two link ticks (2 s) must have passed since the
+  links came up before `b` writes. The core's links are not in
+  `node.status`, so the last part is a bounded margin, not a poll. Run
+  12 times: 12/12.
+- **The gossip handler must not block on, or arm, a registry read**
+  (should-fix 1). A blocking re-read held up gossip's join on an S3
+  read. A non-blocking `check()` was no better: it arms the allowlist's
+  refresh cooldown, and the same peer's dial on our ALPN, right behind,
+  was then rejected without a re-read ("rejecting peer: not in the
+  registry allowlist", seen in a run). The handler now uses
+  `P2p::is_allowed` (no re-read, no cooldown). It tracks the connection
+  if the key is enrolled, and otherwise watches it until a registry read
+  (the 5-s poll, or a miss on our ALPN) enrols it.
+- **Every dropped or refused lock request is answered** (must-fix 2). A
+  request from an older incarnation, and a held request of a waiter
+  dropped for a new incarnation, are answered `Waiting`. The engine side
+  is bounded too (Changes, above).
+- **Per-tenure state cleared at the end of a tenure:**
+  `lock_on_lease_gone` clears `unused_grants`, `unproven` and
+  `unreachable`.
+
+#### Gates (review round; `CARGO_TARGET_DIR` unset, `ulimit -n` 65536, sims with `TMPDIR=/dev/shm/lru`, harness with `TMPDIR=/var/tmp/lru` and prefix `lru`)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority -p constellation-meta -p constellation-net -p constellation-engine` | 22 test binaries, 0 failed (authority lib 273, sim 123; engine 594; meta 241; net incl. `a_peer_admitted_after_its_handshake_is_tracked`) |
+| `sweep_config` 0..3000, all 20 lock configs | 0 failing in every one (fenced I/Os and lost grants as in the first round, e.g. `locks-partition` 4877/0, `locks-failover-backup` 890/23) |
+| harness `lock-grant-dead-generation` ×12 | 12/12 PASSED (11.1–11.4 s) |
+| harness `lock-*` (all 6) | all PASSED |
+| `git-under-flock-causal` ×3, `auto` (io_uring transport) | 3/3 PASSED (285, 287, 266 s); 0 overlapping, 0 fenced; lock acquire wait p50 0.59–0.61 s, max 3.1–3.9 s |

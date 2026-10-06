@@ -466,6 +466,7 @@ pub enum SyncRequest {
         blocking: bool,
         /// The requester's clock when it sent (echoed in a push).
         sent: i64,
+        incarnation: u32,
         reply: tokio::sync::oneshot::Sender<constellation_authority::LockOutcome>,
     },
     /// Plan 30 §M14: the owner recalls a grant this node holds; answered

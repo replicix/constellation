@@ -86,6 +86,12 @@ struct LockOp {
 /// ends the last of them wakes the release (`Control::LockReleaseWake`).
 const RELEASE_WAIT_POLL_MS: i64 = 250;
 
+/// How many grants in a row a peer may leave unused (outwaited) before
+/// the owner takes it for unreachable ([`LockState::unreachable`]). One
+/// can be a race (the push found no op: it had just been granted over
+/// its own request), two in a row are not.
+const UNUSED_GRANTS_UNREACHABLE: u32 = 2;
+
 /// How many `LockState::done_reqs` entries are kept.
 const DONE_REQS_KEPT: usize = 64;
 
@@ -171,6 +177,37 @@ pub(crate) struct LockState {
     /// meanwhile (EC2 campaign 8: a committer waiting 16–28 s while the
     /// other took turn after turn). Kept `4 × ttl`.
     served: BTreeMap<(NodeId, Ino), Ms>,
+    /// Owner side: per peer, how many grants served to it from the queue
+    /// in a row went unused and were outwaited (no renewal, release or
+    /// recall acknowledgement from it in between). At
+    /// [`UNUSED_GRANTS_UNREACHABLE`] the peer is taken for unreachable.
+    unused_grants: BTreeMap<NodeId, u32>,
+    /// Owner side: grants served to remote waiters from the queue that
+    /// their node has not used yet (renewed or released); one outwaited
+    /// while still here went unused. (`served` cannot tell: a re-send of
+    /// the node parks it again and takes that entry.)
+    unproven: std::collections::BTreeSet<GrantId>,
+    /// Owner side: peers this owner cannot reach — a recall to one failed
+    /// at the transport with no connection left, or grants pushed to it
+    /// kept going unused. The link can be one-way: such a peer's own
+    /// requests (and their replies, on its connection) still arrive while
+    /// everything this owner sends on its own — a `LockGranted` push, a
+    /// `LockRecall` — is lost (`git-under-flock-causal`: a restarted
+    /// reader this owner could not dial; it was pushed the turn lock,
+    /// recalled, outwaited and pushed it again, for 35 minutes, while
+    /// both committers waited behind it). Its waiter is granted only over
+    /// a request of its own, which it is told to re-send at once; the
+    /// queue waits for that request briefly, and passes the waiter over
+    /// once it is silent for longer. Its kept queue position (`served`)
+    /// goes.
+    /// Cleared by a recall it acknowledges (this owner reached it), or by
+    /// a new incarnation.
+    unreachable: std::collections::BTreeSet<NodeId>,
+    /// Owner side: the newest incarnation each peer's lock requests
+    /// carried. A higher one drops what the previous incarnation left
+    /// queued here; a request from a lower one (delayed in flight from a
+    /// process that is gone) is ignored.
+    incarnations: BTreeMap<NodeId, u32>,
     /// Owner side: while waiters are parked, they are re-served on a
     /// tick — a refusal for stale liveness, an unmarked lease or a grace
     /// period has no event of its own that ends it.
@@ -308,6 +345,12 @@ impl Core {
     pub(crate) fn lock_waiters(&self) -> usize {
         self.lk.waiters.len()
     }
+
+    /// Owner side: peers taken for unreachable right now (tests).
+    #[cfg(test)]
+    pub(crate) fn lock_unreachable(&self) -> usize {
+        self.lk.unreachable.len()
+    }
 }
 
 impl LockState {
@@ -315,6 +358,10 @@ impl LockState {
         vec![
             ("lk_done_reqs", self.done_reqs.len()),
             ("lk_served", self.served.len()),
+            ("lk_unused_grants", self.unused_grants.len()),
+            ("lk_unproven", self.unproven.len()),
+            ("lk_unreachable", self.unreachable.len()),
+            ("lk_incarnations", self.incarnations.len()),
             ("lk_ops", self.ops.len()),
             ("lk_waiters", self.waiters.len()),
             ("lk_recalls", self.recalls.len()),
@@ -532,12 +579,22 @@ impl Core {
         mode: LockMode,
         blocking: bool,
         sent: Ms,
+        incarnation: u32,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         self.note_foreign(now, replica, out);
-        // A re-sent request of a parked node: re-attach (and answer at
-        // once if its grant is ready).
+        if !self.lock_note_incarnation(now, from, incarnation, replica, out) {
+            // Answered all the same: the RPC waits for its reply on the
+            // serving side (its entry in the driver's reply table, the
+            // P2P task holding the stream). The process that sent it is
+            // gone; `Waiting` asks nothing of a live one.
+            let outcome = LockOutcome::Waiting {
+                retry_ms: self.lock_resume_retry_ms(),
+            };
+            self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out);
+            return;
+        }
         // A re-sent request of a parked node: re-attach (and answer at
         // once if its grant is ready). Two ops of one node on one inode
         // are two waiters (matched by mode; sim seed 93007).
@@ -577,6 +634,128 @@ impl Core {
                 self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out)
             }
             Served::Parked => {}
+        }
+    }
+
+    /// A lock request from `from`'s `incarnation`: `false` if it comes
+    /// from an older incarnation than one already seen (a request delayed
+    /// in flight from a process that is gone: not served, only answered).
+    /// A newer one drops what the previous incarnation left queued here —
+    /// its parked waiters, their kept queue positions — and serves the
+    /// waiters behind them. A dropped waiter's held request is answered
+    /// `Waiting`, as every removed waiter's is (`lock_on_lease_gone`). Its grants stay until released or
+    /// outwaited: that process is gone, but nothing here proves its I/O
+    /// is over.
+    ///
+    /// The new incarnation starts out unreachable from here
+    /// (`LockState::unreachable`) until it acknowledges a recall. Its
+    /// requests reach this owner over its own fresh connection, but this
+    /// owner's link to it takes seconds to come back after a restart, and
+    /// once never did (PROGRESS.md "lock-recall-unreachable"): the
+    /// first grant pushed to it was lost, and every waiter behind it
+    /// waited out `ttl + margin` (`git-under-flock-causal`: 20 s after 3
+    /// of 8 reader restarts, once the 35-minute livelock was gone).
+    fn lock_note_incarnation(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        incarnation: u32,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if from == self.cfg.node_id {
+            return true;
+        }
+        let seen = self.lk.incarnations.get(&from).copied();
+        match seen {
+            Some(i) if incarnation < i => {
+                self.stats.lock_stale_incarnation_requests += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    from,
+                    incarnation,
+                    seen = i,
+                    "ignored a lock request from an earlier incarnation"
+                );
+                return false;
+            }
+            Some(i) if incarnation == i => return true,
+            _ => {}
+        }
+        self.lk.incarnations.insert(from, incarnation);
+        let Some(previous) = seen else {
+            return true;
+        };
+        let mut inos = Vec::new();
+        let mut dropped = 0u64;
+        let mut i = 0;
+        while i < self.lk.waiters.len() {
+            let w = &self.lk.waiters[i];
+            if w.node == from && w.op.is_none() {
+                let w = self.lk.waiters.remove(i);
+                if let Some(t) = w.held_timer {
+                    self.cancel_timer(t, out);
+                }
+                if let Some(req) = w.req {
+                    let outcome = LockOutcome::Waiting {
+                        retry_ms: self.lock_resume_retry_ms(),
+                    };
+                    self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out);
+                }
+                if !inos.contains(&w.ino) {
+                    inos.push(w.ino);
+                }
+                dropped += 1;
+            } else {
+                i += 1;
+            }
+        }
+        self.lk.served.retain(|(n, _), _| *n != from);
+        self.lk.unused_grants.remove(&from);
+        self.lock_peer_unreachable(from, "it restarted: this owner has not reached it yet");
+        self.stats.lock_incarnation_waiters_dropped += dropped;
+        tracing::info!(
+            node = self.cfg.node_id,
+            from,
+            incarnation,
+            previous,
+            dropped,
+            "a node asked for a lock under a new incarnation; dropped what its previous one left \
+             queued"
+        );
+        for ino in inos {
+            self.lock_serve_waiters(now, ino, replica, out);
+        }
+        true
+    }
+
+    /// `node` cannot be reached from here (`LockState::unreachable`).
+    fn lock_peer_unreachable(&mut self, node: NodeId, why: &'static str) {
+        if node == self.cfg.node_id || !self.lk.unreachable.insert(node) {
+            return;
+        }
+        self.stats.lock_peers_unreachable += 1;
+        // Its kept positions go: it is passed over until a request of its
+        // own arrives, and then it queues as any new request does.
+        self.lk.served.retain(|(n, _), _| *n != node);
+        tracing::info!(
+            node = self.cfg.node_id,
+            peer = node,
+            why,
+            "a lock waiter's node is unreachable from this owner; it is granted only over its \
+             own requests until it acknowledges a recall"
+        );
+    }
+
+    /// `node` used a grant, or this owner reached it.
+    fn lock_peer_heard(&mut self, node: NodeId, reached: bool) {
+        self.lk.unused_grants.remove(&node);
+        if reached && self.lk.unreachable.remove(&node) {
+            tracing::info!(
+                node = self.cfg.node_id,
+                peer = node,
+                "a lock waiter's node is reachable from this owner again"
+            );
         }
     }
 
@@ -815,6 +994,13 @@ impl Core {
     /// (`lock_owner_resuming`) asks again.
     fn lock_resume_retry_ms(&self) -> u64 {
         (self.cfg.forward_backoff_ms / 4).max(10)
+    }
+
+    /// How long the queue waits for an unreachable waiter's next request
+    /// (`lock_serve_waiters`): two of its request cycles (the request
+    /// held `recall_hold_ms`, then re-sent after `lock_resume_retry_ms`).
+    fn lock_unreachable_wait_ms(&self) -> i64 {
+        2 * (self.cfg.recall_hold_ms + self.lock_resume_retry_ms()) as i64
     }
 
     /// Grant `mode` to `from` — re-affirming or upgrading *in place* a
@@ -1323,8 +1509,18 @@ impl Core {
             .saturating_sub(self.cfg.expiry_margin_ms)
             / 2)
         .max(50);
+        // A waiter this owner cannot push to is granted only over a
+        // request of its own: it asks again at once, so one is held here
+        // nearly all the time.
+        let short = self.lock_resume_retry_ms();
+        let unreachable = &self.lk.unreachable;
         let Some(w) = self.lk.waiters.iter_mut().find(|w| w.id == wid) else {
             return;
+        };
+        let retry_ms = if unreachable.contains(&w.node) {
+            short
+        } else {
+            retry_ms
         };
         w.held_timer = None;
         if let Some(req) = w.req.take() {
@@ -1377,6 +1573,22 @@ impl Core {
                 if now.0 >= recv.0 + ttl - margin {
                     continue;
                 }
+                // A push would be lost; its next request carries its
+                // grant. It was told to ask again at once, so the queue
+                // waits for that request, briefly: passing it over then
+                // and there let the waiter behind it take the turn
+                // whenever the lock freed between two of its requests.
+                // Silent for longer (its answers are lost too, or it is
+                // gone), it is passed over, not pushed to: everyone
+                // behind it waited out a lost push's grant otherwise,
+                // once per push.
+                if self.lk.unreachable.contains(&node) {
+                    if now.0 < recv.0 + self.lock_unreachable_wait_ms() {
+                        break;
+                    }
+                    self.stats.lock_unreachable_passed_over += 1;
+                    continue;
+                }
             }
             let base = if op.is_some() { now } else { recv };
             match self.lock_serve_again(now, base, node, ino, mode, replica, out) {
@@ -1385,9 +1597,12 @@ impl Core {
                     // A remote waiter's grant may go unused (see
                     // `LockState::served`); a local op installs its grant
                     // in this very event.
-                    if op.is_none() && matches!(outcome, LockOutcome::Granted { .. }) {
+                    if let (None, LockOutcome::Granted { id, .. }) = (op, &outcome) {
                         let since = self.lk.waiters[i].since;
                         self.lk.served.insert((node, ino), since);
+                        let locks = replica.locks();
+                        self.lk.unproven.retain(|g| locks.get(*g).is_some());
+                        self.lk.unproven.insert(*id);
                     }
                     self.lock_deliver(now, node, ino, req, op, sent, outcome, replica, out);
                 }
@@ -1523,6 +1738,7 @@ impl Core {
         // Released: the grant was used, so its holder's next request is
         // a new one (no queue position to keep; `LockState::served`).
         self.lk.served.remove(&(from, ino));
+        self.lock_peer_heard(from, false);
         if replica
             .locks()
             .get(grant)
@@ -1559,9 +1775,11 @@ impl Core {
         }
     }
 
-    pub(crate) fn on_lock_recalled_ack(&mut self, req: OpId) {
-        // The recall arrived; the release (or the expiry) follows.
+    pub(crate) fn on_lock_recalled_ack(&mut self, from: NodeId, req: OpId) {
+        // The recall arrived; the release (or the expiry) follows. The
+        // node is reachable from here.
         if let Some(id) = self.lk.recall_by_req.remove(&req) {
+            self.lock_peer_heard(from, true);
             if let Some(r) = self.lk.recalls.get_mut(&id) {
                 r.req = None;
             }
@@ -1595,6 +1813,15 @@ impl Core {
             return;
         }
         self.stats.lock_recalls_expired += 1;
+        // A grant served from the queue that its node never renewed nor
+        // released: it went unused (the push was lost, or found no op).
+        if self.lk.unproven.remove(&id) {
+            let n = self.lk.unused_grants.entry(g.node).or_insert(0);
+            *n += 1;
+            if *n >= UNUSED_GRANTS_UNREACHABLE {
+                self.lock_peer_unreachable(g.node, "grants pushed to it went unused");
+            }
+        }
         // The holder never said what it did under the grant. What it was
         // acknowledged is in some sequencer's journal: this one's, at
         // least, is covered by what this node has now.
@@ -1618,6 +1845,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         replica.locks().forget(id);
+        self.lk.unproven.remove(&id);
         self.lk.mirror_dirty = true;
         if let Some(r) = self.lk.recalls.remove(&id) {
             self.cancel_timer(r.timer, out);
@@ -1660,6 +1888,7 @@ impl Core {
     ) -> LockRenewResult {
         // Renewed: the grant is in use (`LockState::served`).
         self.lk.served.remove(&(from, ino));
+        self.lock_peer_heard(from, false);
         let (cap_ms, gen) = match self.lock_route_answering(now, ino, replica, from, true) {
             Route::Me { cap_ms, gen } => (cap_ms, gen),
             Route::Node(n) => return LockRenewResult::NotOwner { owner: n },
@@ -1699,6 +1928,7 @@ impl Core {
             // The renewal is applied to the table before its horizon is
             // durable; a failed write only makes the owner wait longer
             // (it refuses the answer, the table keeps the later expiry).
+            self.lk.unproven.remove(&target);
             if let Some((mode, recalled)) = replica.locks().extend(target, from, until, now.0) {
                 if from != self.cfg.node_id {
                     self.lock_need_horizon(until, until + ttl / 4);
@@ -1964,6 +2194,7 @@ impl Core {
                         mode,
                         blocking,
                         sent: now,
+                        incarnation: self.cfg.incarnation,
                     },
                 });
             }
@@ -2463,9 +2694,14 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> bool {
         if let Some(id) = self.lk.recall_by_req.remove(&req) {
-            // The grant's expiry answers an undelivered recall.
+            // The grant's expiry answers an undelivered recall. With no
+            // connection left to the holder, a push would not arrive
+            // either.
             if let Some(r) = self.lk.recalls.get_mut(&id) {
                 r.req = None;
+            }
+            if outage {
+                self.lock_peer_unreachable(to, "a recall could not be delivered");
             }
             return true;
         }
@@ -3538,6 +3774,9 @@ impl Core {
         self.lk.handed.clear();
         self.lk.handed_floor.clear();
         self.lk.grace.clear();
+        self.lk.unused_grants.clear();
+        self.lk.unproven.clear();
+        self.lk.unreachable.clear();
         // The floors stay (positions are the cluster's, not the
         // tenure's); a next tenure here floors everything again first.
         self.lk.tenure_floor_due = true;

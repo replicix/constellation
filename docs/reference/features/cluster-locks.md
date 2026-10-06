@@ -375,6 +375,28 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    released node re-lock under its cached grant ahead of them (EC2
    campaign 8: one committer waiting 16–28 s while the other took turn
    after turn).
+   A node the sequencer cannot reach loses that position. The P2P link
+   can fail in one direction only: the node's own requests, and the
+   answers on its connection, still arrive, but a push or a recall the
+   sequencer sends is lost. A recall that fails with no connection left
+   to the node, or two grants in a row pushed to it and never renewed nor
+   released, mark the node unreachable (`peers_unreachable`). Its waiter
+   is then granted only over a request of its own: it is told to ask
+   again at once, so one is nearly always held at the sequencer, and it
+   is passed over while none is, once it has been silent for longer
+   than two of its request cycles (`unreachable_passed_over`). The mark
+   goes when the node acknowledges
+   a recall. Before, such a node was pushed the lock, recalled, outwaited
+   and pushed it again, keeping its place each time, and the waiters
+   behind it never got a turn (`git-under-flock-causal`: 35 minutes).
+   Every request carries the requester's incarnation. A request from a
+   new incarnation drops the waiters its previous one left queued, with
+   their kept positions and the reachability learned of it
+   (`incarnation_waiters_dropped`); a request it had held at the
+   sequencer is answered `Waiting`. A request still in flight from an
+   older incarnation is answered `Waiting` and not served
+   (`stale_incarnation_requests`). The previous incarnation's grants stay
+   until they are released or outwaited.
 4. A non-blocking request (`F_SETLK`, `flock -n`) that conflicts gets
    `EAGAIN` at once. The recall still goes out, so a retry succeeds once
    the other node's application unlocks (SQLite's busy loop relies on
@@ -759,7 +781,12 @@ for both roles:
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
   `grace_refusals`, `requeued_in_place`, `released_superseded`,
-  `requests_in_flight`, `waiters`, `recalls_in_flight`,
+  `peers_unreachable` (nodes taken for unreachable, see
+  [Conflicts, recalls and blocking waits](#conflicts-recalls-and-blocking-waits)),
+  `unreachable_passed_over` (their waiters passed over meanwhile),
+  `incarnation_waiters_dropped` (waiters a restarted node's previous
+  incarnation left queued), `stale_incarnation_requests` (requests from
+  an older incarnation, answered and not served), `requests_in_flight`, `waiters`, `recalls_in_flight`,
   `token_rejections` (operations refused for a dead fencing token).
 
 These counters are not exported to `/metrics` or shown in the web UI.
