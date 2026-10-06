@@ -39,7 +39,9 @@ pub use session::{
     TransportPolicy, UringZeroCopy, CLUSTER_LOCKS_URING_QUEUE_DEPTH, DEFAULT_URING_QUEUE_DEPTH,
     TRANSPORT_ENV, URING_QUEUE_DEPTH_ENV, URING_ZERO_COPY_ENV,
 };
-pub use stats::{FallbackReason, LockWaitCounter, SessionStats, TransportFallback};
+pub use stats::{
+    FallbackReason, LockWaitCounter, RingHealthStats, SessionStats, TransportFallback,
+};
 
 /// Whether this build can serve FUSE-over-io_uring at all (the `io-uring`
 /// feature, on Linux): what `constellation daemon --fuse-transports`

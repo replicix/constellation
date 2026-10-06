@@ -128,6 +128,10 @@ pub use crate::uring::memory::InMemoryRingKernel;
 // downgrades with (`Config::io_uring_lock_wait_downgrades`).
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub use crate::uring::LockWaitDowngrades;
+// CONSTELLATION PATCH (io-uring): what a ring session reports about the requests
+// it holds (`Config::io_uring_health`).
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub use crate::uring::RingHealth;
 
 /// We generally support async reads
 #[cfg(not(target_os = "macos"))]

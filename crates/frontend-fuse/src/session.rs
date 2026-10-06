@@ -62,7 +62,7 @@ use crate::passthrough::{
     reason, PassthroughHandoff, PassthroughPolicy, PassthroughState, PassthroughWish,
     PASSTHROUGH_ENV,
 };
-use crate::stats::{Handshake, LockWaitCounter, SessionStats, ZeroCopyCounter};
+use crate::stats::{Handshake, LockWaitCounter, RingHealthStats, SessionStats, ZeroCopyCounter};
 use constellation_types::Code;
 use constellation_vfs::{Blocking, Caller, FrontendCaps, Observer, OpCtx, OpKind, Vfs};
 use fuser::{NegotiatedInit, Transport};
@@ -622,6 +622,12 @@ impl MountOptions {
             {
                 config.io_uring_malformed_register = uring_fault_malformed_register();
                 config.io_uring_lock_wait_downgrades = Some(lock_waits.hook());
+                // The ring's own count of requests it holds, against the
+                // stall threshold the op watchdog uses for the ones the
+                // view knows about (`RingHealthStats`)
+                config.io_uring_health = Some(fuser::RingHealth::new(
+                    constellation_vfs::watch::threshold_from_env(),
+                ));
             }
         } else if !cfg!(feature = "io-uring") && self.transport.asks_for_ring() {
             // A ladder that degrades: asking for a transport this build
@@ -1254,7 +1260,8 @@ impl<V: Vfs> FuseSession<V> {
                 lock_waits,
                 passthrough.clone(),
             )
-            .with_zero_copy_reads(zero_copy_reads),
+            .with_zero_copy_reads(zero_copy_reads)
+            .with_ring_health(RingHealthStats::of_session(&config, transport)),
         );
         let gate = NotifyGate::new(session.notifier(), entries.clone());
         // The backing-id ioctls go to the connection; a duplicate of the

@@ -1,6 +1,6 @@
 # Vendored fuser 0.18.0: Constellation's patch series
 
-Three named series live in `patches/`, applied in filename order:
+Four named series live in `patches/`, applied in filename order:
 
 1. `0001-constellation-session-handover.patch` — plan 31 §6.11 / C4b. This
    file's first half.
@@ -8,6 +8,8 @@ Three named series live in `patches/`, applied in filename order:
    `io-uring` cargo feature, off by default. "The io-uring transport",
    below.
 3. `0003-interrupt.patch` — plan 39 §3.3. "FUSE_INTERRUPT", at the end.
+4. `0004-ring-idle-wait.patch` — the `ring-stress-hang` fix. "The ring's idle
+   wait", after it.
 
 ## FUSE session handover (`patches/0001-constellation-session-handover.patch`)
 
@@ -930,3 +932,58 @@ Regenerated as `git diff --no-index <pristine-plus-0001-and-0002>
 vendor/fuser`; `tools/vendor-fuser.sh --check` verifies the series.
 
 The upstream issue to file for this patch, with a verified reproducer, is `../ISSUE-fuser.md`.
+
+## The ring's idle wait (`patches/0004-ring-idle-wait.patch`)
+
+The `ring-stress-hang` chunk (`docs/plans/v1/PROGRESS.md`). In two
+`stress-ng-fs-nodes` runs on the io_uring transport (overload-cascade-2's
+`gate1` and `diag1`, 2026-10-05), processes on the lease holder waited in
+`request_wait_answer` through the deadline while the daemon had nothing older
+than a second in flight: the kernel held requests the daemon never answered.
+That signature was not reproduced afterwards. In 16 ring runs (some with every
+FUSE request traced), every hang held its requests in the daemon (the
+delegates' livelock, not the ring; `/dev/fuse` hangs the same way). The ring
+never stranded a reply, and every request the kernel queued for a ring reached
+an entry. So the patch closes the path every candidate mechanism shares, makes
+it visible, and leaves the rest to the counters:
+
+- **A ring thread's wait is bounded** (`IDLE_WAIT`, 1 s; `RingIo::submit_and_wait`
+  takes the timeout). A reply made on another thread is queued in
+  `Live::pending` and announced through the wake eventfd, whose multishot poll
+  completes the ring thread's wait; if that announcement is lost -- in this
+  crate or in the kernel's deferred task-work wake-up (`DEFER_TASKRUN`) -- the
+  thread slept until some other completion on its queues woke it, which at the
+  end of a workload is never, while the caller waited in the kernel and the
+  filesystem considered the request answered. Now the next pass flushes it
+  within a second. Entering the kernel also runs whatever task work it queued
+  for the thread, so a fetch whose wake-up went missing is served by the same
+  pass. Cost: one wake-up a second per idle ring.
+- **A stranded reply is counted and logged** (`Ring::note_stranded`). After a
+  wait that ended with no completion at all, every reply queued more than
+  100 ms earlier (`RingEntry::handed_ms`; a younger one may still have its
+  eventfd write under way) had no wake-up: counted in
+  `RingHealth::stranded_commits`, logged at most once a minute per ring.
+- **Entries userspace holds too long are reported** (`Ring::report_held`, the
+  `fuser-ring-watch` thread `RingSet::watch_held` starts). Every fetch records
+  its time, opcode and unique; the watchdog (every quarter of the threshold, at
+  least once a second) logs each entry held past `RingHealth`'s threshold once
+  per fetch, with its state and a per-queue census (in the kernel / in
+  userspace / dead), and keeps `RingHealth::entries_held_long`. Blocking lock
+  requests (`RingEntry::lock_wait`), which wait for the holder by design, are
+  logged at debug and not counted. This shows what a filesystem's own count of
+  requests in flight cannot: a request still queued for an offload thread
+  (under overload, tens of seconds deep) or one answered whose commit did not
+  reach the kernel.
+- `Config::io_uring_health: Option<RingHealth>` (public, re-exported) carries
+  the threshold and the counters; `None` keeps the bounded wait and drops the
+  rest. A zero threshold runs no watchdog.
+
+Tests: `uring::ring::test::a_reply_whose_wake_up_is_lost_is_flushed_by_the_idle_wait`
+(a test hook, `RingHooks::lost_wakes`, drops one eventfd write; the reply still
+reaches the kernel, counted once, and an announced one is not counted; it
+fails with the unbounded wait) and
+`report_held_counts_long_held_entries_but_not_lock_waits`.
+
+Regenerated as `git diff --no-index --no-prefix a b` of pristine 0.18.0 with
+0001-0003 applied (`a`) against this tree (`b`); `tools/vendor-fuser.sh
+--check` verifies the series.

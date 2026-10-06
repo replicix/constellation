@@ -21,6 +21,7 @@ use std::fs;
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::thread;
 use std::thread::JoinHandle;
 
 use log::debug;
@@ -183,6 +184,91 @@ impl PartialEq for LockWaitDowngrades {
 
 impl Eq for LockWaitDowngrades {}
 
+/// CONSTELLATION PATCH (io-uring): what a ring session reports about requests it holds, shared
+/// by all of its rings and read by the filesystem (`Config::io_uring_health`).
+///
+/// - `stranded_commits`: replies another thread handed to a ring thread whose wake-up never
+///   came. The ring thread found each still queued after an idle wait timed out, and flushed it
+///   then; without that bounded wait the caller in the kernel would have waited until the next
+///   request on one of that ring's queues woke the thread. Non-zero means a lost wake-up, in
+///   this crate or the kernel: worth reporting, and no longer a hang.
+/// - `entries_held_long`: ring entries userspace has held -- fetched, not yet committed back
+///   -- for at least `held_report_after`, as of the last watchdog pass (every quarter of that,
+///   at least once a second), blocking lock requests excepted. Each is a caller the kernel
+///   holds while the filesystem may not even have seen its request (it can wait for an
+///   offload thread), so a filesystem's own count of requests in flight does not show them.
+///   Each newly long-held entry is also logged once, with a per-queue census.
+#[derive(Clone)]
+pub struct RingHealth(Arc<RingHealthInner>);
+
+struct RingHealthInner {
+    held_report_after: std::time::Duration,
+    stranded_commits: std::sync::atomic::AtomicU64,
+    entries_held_long: std::sync::atomic::AtomicU64,
+}
+
+impl RingHealth {
+    /// Reports entries held in userspace for `held_report_after` or longer; zero runs no
+    /// watchdog (`entries_held_long` stays 0) and still counts stranded commits.
+    pub fn new(held_report_after: std::time::Duration) -> Self {
+        Self(Arc::new(RingHealthInner {
+            held_report_after,
+            stranded_commits: Default::default(),
+            entries_held_long: Default::default(),
+        }))
+    }
+
+    /// Replies flushed only by a ring thread's idle wait, so far.
+    pub fn stranded_commits(&self) -> u64 {
+        self.0
+            .stranded_commits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Entries held in userspace past `held_report_after` at the last watchdog pass.
+    pub fn entries_held_long(&self) -> u64 {
+        self.0
+            .entries_held_long
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn held_report_after(&self) -> std::time::Duration {
+        self.0.held_report_after
+    }
+
+    /// Counts `n` more stranded commits; the new total.
+    pub(crate) fn note_stranded(&self, n: u64) -> u64 {
+        self.0
+            .stranded_commits
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+            + n
+    }
+
+    pub(crate) fn set_entries_held_long(&self, n: u64) {
+        self.0
+            .entries_held_long
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl fmt::Debug for RingHealth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RingHealth")
+            .field("held_report_after", &self.0.held_report_after)
+            .field("stranded_commits", &self.stranded_commits())
+            .field("entries_held_long", &self.entries_held_long())
+            .finish()
+    }
+}
+
+impl PartialEq for RingHealth {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RingHealth {}
+
 impl RingSet {
     /// CONSTELLATION PATCH (io-uring): tells `hook` about every lock-wait budget downgrade on
     /// any of this set's rings (`LockWaitDowngrades`).
@@ -190,6 +276,40 @@ impl RingSet {
         for ring in &self.rings {
             ring.set_lock_wait_downgrades(hook.clone());
         }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): every ring of this set counts into `health`
+    /// (`RingHealth`).
+    pub(crate) fn set_health(&self, health: &RingHealth) {
+        for ring in &self.rings {
+            ring.set_health(health.clone());
+        }
+    }
+
+    /// CONSTELLATION PATCH (io-uring): starts the thread that reports entries userspace holds
+    /// past `health`'s threshold (`Ring::report_held`, `RingHealth::entries_held_long`). It
+    /// holds the rings weakly and leaves once they are all gone.
+    pub(crate) fn watch_held(&self, health: RingHealth) -> io::Result<()> {
+        let rings: Vec<std::sync::Weak<Ring>> = self.rings.iter().map(Arc::downgrade).collect();
+        let after = health.held_report_after();
+        let tick = (after / 4).max(std::time::Duration::from_secs(1));
+        let after_ms = after.as_millis() as u64;
+        thread::Builder::new()
+            .name("fuser-ring-watch".into())
+            .spawn(move || loop {
+                thread::sleep(tick);
+                let mut alive = false;
+                let mut long = 0;
+                for ring in rings.iter().filter_map(std::sync::Weak::upgrade) {
+                    alive = true;
+                    long += ring.report_held(after_ms);
+                }
+                if !alive {
+                    return;
+                }
+                health.set_entries_held_long(long);
+            })
+            .map(drop)
     }
 
     /// Opens the io_urings of `min(n_threads, queues)` rings over every possible CPU's queue,

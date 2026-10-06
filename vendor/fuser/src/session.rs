@@ -1024,6 +1024,14 @@ impl<FS: Filesystem> Session<FS> {
         if let Some(hook) = &self.config.io_uring_lock_wait_downgrades {
             set.set_lock_wait_downgrades(hook);
         }
+        if let Some(health) = &self.config.io_uring_health {
+            set.set_health(health);
+            if !health.held_report_after().is_zero() {
+                if let Err(err) = set.watch_held(health.clone()) {
+                    warn!("io_uring: could not start the held-entry watchdog ({err})");
+                }
+            }
+        }
         Ok(set)
     }
 

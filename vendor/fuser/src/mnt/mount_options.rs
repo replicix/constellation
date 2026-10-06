@@ -115,6 +115,12 @@ pub struct Config {
     /// refused. `None` (the default): nobody is told.
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     pub io_uring_lock_wait_downgrades: Option<crate::LockWaitDowngrades>,
+    /// CONSTELLATION PATCH (io-uring): where the session's rings count replies their idle wait
+    /// had to flush and report entries held in userspace too long (`RingHealth`). `None` (the
+    /// default): neither is counted and no watchdog runs; the idle wait bounds every ring
+    /// either way.
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    pub io_uring_health: Option<crate::RingHealth>,
 }
 
 // CONSTELLATION PATCH (io-uring): hand-written so `io_uring_queue_depth`
@@ -137,6 +143,8 @@ impl Default for Config {
             io_uring_malformed_register: false,
             #[cfg(all(feature = "io-uring", target_os = "linux"))]
             io_uring_lock_wait_downgrades: None,
+            #[cfg(all(feature = "io-uring", target_os = "linux"))]
+            io_uring_health: None,
         }
     }
 }

@@ -154,11 +154,15 @@ A run passes when all of these hold:
   A failure whose log mentions verification, a mismatch or corruption is
   never baselined, and a stressor with no verdict (killed) fails.
 - stress-ng finishes within its timeout plus 120 s. Otherwise the stuck
-  processes are printed with their `wchan` and the daemon's
-  `fuse_requests`, the process group is killed, and the mount's FUSE
-  connection is aborted if they survive `SIGKILL`.
+  processes are printed with their `wchan`, the daemon's `fuse_requests`
+  and each mount's ring counters (`ring_stranded_commits`,
+  `ring_entries_held_long`), the process group is killed, and the mount's
+  FUSE connection is aborted if they survive `SIGKILL`.
 - The daemon logged no panic, and no `ERROR` line except in the faults
-  scenario. No non-lock FUSE request stalled past the watchdog threshold.
+  scenario. No non-lock FUSE request stalled past the watchdog threshold;
+  on a ring, no entry is held in userspace past it either (a request still
+  queued for a worker, which `fuse_requests` cannot see) and no reply was
+  flushed only by a ring thread's bounded wait.
 - No cluster lock grant lapsed and nothing was fenced for it:
   `status.locks` `lost`, `fenced_io`, `owners_fenced` and
   `owner_fenced_ops` are all 0. stress-ng tolerates some of the `EIO`s a
@@ -214,9 +218,18 @@ stress-ng --lockmix 1 --verify --timeout 20s --temp-path "$MNT" --metrics --seed
 ```
 
 Other knobs: `STRESS_NG_FS_SECS` (120), `STRESS_NG_FS_INSTANCES` (1 per
-stressor), `STRESS_NG_FS_ARGS` (extra stress-ng arguments) and
-`STRESS_NG_FS_TMP`. The last sets where the mounts and caches live; the
-default is `/var/tmp`, because a run writes several hundred MiB. File sizes
+stressor), `STRESS_NG_FS_ARGS` (extra stress-ng arguments),
+`STRESS_NG_FS_HANG_HOOK` and `STRESS_NG_FS_TMP`. The hang hook is a shell
+command run at a hang before anything is killed, with `HANG_NODE`,
+`HANG_PGID`, `HANG_DAEMON_PID` and `HANG_FUSE_CONN` in its environment: the
+moment to read the stuck tasks' `/proc/<pid>/stack` (root), the daemon's
+threads and `/sys/fs/fuse/connections/$HANG_FUSE_CONN/waiting`. Tracing the
+kernel's `fuse:fuse_request_send`/`fuse_request_sent`/`fuse_request_end`
+events during the run tells a request the kernel never handed to the daemon
+(`send` without `sent`) from one the daemon held (`sent`, no `end`); see
+PROGRESS "ring-stress-hang". `STRESS_NG_FS_TMP` sets where the mounts and
+caches live; the default is `/var/tmp`, because a run writes several
+hundred MiB. File sizes
 are capped at 128 MiB per stressor (`--hdd-bytes`, `--iomix-bytes`,
 `--fallocate-bytes`, `--sync-file-bytes`, `--copy-file-bytes`). Root runs
 must keep `HOME=/root`; afterwards check `find ~ -user root`.

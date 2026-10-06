@@ -52,7 +52,10 @@
 //!   mount's FUSE connection aborted if they are still there.
 //! - The daemons logged no panic; outside the faults scenario, no `ERROR`
 //!   line either. No FUSE request other than a blocking lock went
-//!   unanswered past the watchdog threshold (`status.fuse_requests`). No
+//!   unanswered past the watchdog threshold (`status.fuse_requests`), and
+//!   on a ring none held there either, nor a reply flushed only by a ring
+//!   thread's bounded wait (`ring_entries_held_long`,
+//!   `ring_stranded_commits` per mount). No
 //!   cluster lock grant lapsed and nothing was fenced for it
 //!   (`status.locks`: `lost`, `fenced_io`, `owners_fenced`,
 //!   `owner_fenced_ops` all 0) — stress-ng tolerates some of the `EIO`s a
@@ -76,7 +79,11 @@
 //! the ones compiled in), `STRESS_NG_FS_REPORT` (append the per-stressor
 //! table as TSV: scenario, transport, node, stressor, verdict, bogo-ops),
 //! `STRESS_NG_FS_TMP` (where the scenario's mounts and caches live,
-//! default `/var/tmp`: the 1 GiB stressors do not fit a tmpfs `/tmp`).
+//! default `/var/tmp`: the 1 GiB stressors do not fit a tmpfs `/tmp`),
+//! `STRESS_NG_FS_HANG_HOOK` (a shell command run at a hang before anything
+//! is killed, with `HANG_NODE`, `HANG_PGID`, `HANG_DAEMON_PID` and
+//! `HANG_FUSE_CONN` set: for kernel stacks and the connection's `waiting`
+//! count while the requests are still stuck).
 //!
 //! The stressors' file sizes are capped ([`SIZE_ARGS`]) so that one run
 //! writes a few hundred MiB, not several GiB, and the spool drains in
@@ -527,9 +534,18 @@ fn finish(run: &mut Run, client: &Client) -> Result<std::process::ExitStatus> {
         }
         if Instant::now() >= run.deadline {
             let stuck = group_processes(pgid);
+            hang_hook(run, client, pgid);
             let requests = client
                 .control_status()
-                .map(|s| s["fuse_requests"].to_string())
+                .map(|s| {
+                    let rings: Vec<String> = s["fuse"]["mounts"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(ring_health)
+                        .collect();
+                    format!("{}\n  rings: {}", s["fuse_requests"], rings.join("; "))
+                })
                 .unwrap_or_else(|e| format!("(status failed: {e:#})"));
             kill_group(pgid, client, &stuck)?;
             let _ = run.child.wait();
@@ -544,6 +560,27 @@ fn finish(run: &mut Run, client: &Client) -> Result<std::process::ExitStatus> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// `STRESS_NG_FS_HANG_HOOK`: a shell command run at a hang, before anything
+/// is killed, with `HANG_NODE`, `HANG_PGID` (stress-ng's process group),
+/// `HANG_DAEMON_PID` and `HANG_FUSE_CONN` (the mount's fusectl connection) in
+/// its environment — for capturing kernel stacks and ring state while the
+/// requests are still stuck.
+fn hang_hook(run: &Run, client: &Client, pgid: u32) {
+    let Ok(hook) = std::env::var("STRESS_NG_FS_HANG_HOOK") else {
+        return;
+    };
+    let opt = |v: Option<u32>| v.map(|v| v.to_string()).unwrap_or_default();
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&hook)
+        .env("HANG_NODE", &run.node)
+        .env("HANG_PGID", pgid.to_string())
+        .env("HANG_DAEMON_PID", opt(client.pid()))
+        .env("HANG_FUSE_CONN", opt(client.fuse_connection()))
+        .status();
+    eprintln!("    hang hook for {}: {status:?}", run.node);
 }
 
 fn kill_group(pgid: u32, client: &Client, listed: &[String]) -> Result<()> {
@@ -749,14 +786,38 @@ fn strip_ansi(line: &str) -> String {
 /// No FUSE request but a blocking lock went unanswered past the
 /// watchdog's threshold, ever.
 fn no_stalled_requests(c: &Client) -> Result<()> {
-    let r = &c.control_status()?["fuse_requests"];
+    let status = c.control_status()?;
+    let r = &status["fuse_requests"];
     ensure!(
         r["stalled_total"].as_u64() == Some(0),
         "{}: FUSE requests stalled past {}s: {r}",
         c.name,
         r["stall_threshold_s"]
     );
+    // What the view's own count cannot see: ring entries held before the
+    // view was handed the request (queued for a worker), and replies whose
+    // ring thread was never woken (flushed only by its bounded wait).
+    for m in status["fuse"]["mounts"].as_array().into_iter().flatten() {
+        ensure!(
+            m["ring_stranded_commits"].as_u64().unwrap_or(0) == 0
+                && m["ring_entries_held_long"].as_u64().unwrap_or(0) == 0,
+            "{}: the ring held requests the view did not see in flight: {}",
+            c.name,
+            ring_health(m)
+        );
+    }
     Ok(())
+}
+
+/// A mount's ring counters (`node.status`), for a report.
+fn ring_health(m: &serde_json::Value) -> String {
+    format!(
+        "{} transport={} stranded_commits={} entries_held_long={}",
+        m["mountpoint"].as_str().unwrap_or("?"),
+        m["transport"].as_str().unwrap_or("?"),
+        m["ring_stranded_commits"],
+        m["ring_entries_held_long"]
+    )
 }
 
 /// A few closed multi-chunk files written before the run, so that the

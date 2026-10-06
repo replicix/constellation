@@ -43075,3 +43075,141 @@ Gates: `cargo fmt --check`, `cargo clippy --workspace --all-targets
 passed; `cargo test -p constellation -p constellation-harness` 0 failed;
 `tests/smoke.sh` PASSED; both YAML files parse. The Docker compliance and the
 ring harness legs were not run here.
+
+## ring-stress-hang: `stress-ng-fs-nodes` hangs on the io_uring transport (2026-10-06)
+
+The report: in overload-cascade-2's gate (`gate1`, also `diag1`), one of five
+`stress-ng-fs-nodes` runs hung. Processes on the holder stayed in
+`request_wait_answer` while the daemon had nothing older than a second in
+flight, i.e. the kernel apparently held requests the daemon never received.
+The mounts were on the ring (cluster-lock mounts take it under `auto` since
+06d635b). Base: main `1aee527`. Host: 16 CPUs, kernel 7.3.0-rc4, idle apart
+from the runs. Harness prefix `rsh`, `TMPDIR=/var/tmp/rsh`, a
+`STRESS_NG_FS_HANG_HOOK` that captured `/proc/<pid>/stack` of every stuck
+task and daemon thread plus every fusectl connection's `waiting` at the
+deadline, and (in the `fix-*` runs) the kernel's `fuse:*` trace events.
+
+Fix: no ring defect was found. Every reproduced hang held its requests in the
+daemon (the delegates' livelock, overload-cascade-2's "What still stalls"),
+on `/dev/fuse` as often as on the ring, and the ring alone passes 6/6 with
+delegation off. As a guard against the reported signature, a ring thread's
+wait for the kernel is now bounded (1 s), so a reply whose wake-up was lost is
+flushed and counted rather than stranded. Each mount reports what its ring
+holds (`ring_stranded_commits`, `ring_entries_held_long` in `node.status` and
+`/metrics`), and `stress-ng-fs` fails on either
+(`vendor/fuser/patches/0004-ring-idle-wait.patch`).
+
+### Runs (`stress-ng-fs-nodes`, seed 42, default 120 s)
+
+| set | transport | runs | hung | other failures | passed | ring stranded replies |
+|---|---|---|---|---|---|---|
+| before 0004 | `auto` (ring, depth 32) | 7 | 4 (auto-1, 2, 4, 7) | 3: lock grants lapsed 1, requests stalled > 30 s 2 | 0 | — |
+| before 0004 | `CONSTELLATION_FUSE_TRANSPORT=dev-fuse` | 6 | 4 (devfuse-1–4) | 2: requests stalled > 30 s | 0 | — |
+| 0004, development | `auto` | 3 | 1 | 2: stalled | 0 | 0 |
+| 0004, final build | `auto` | 6 | 4 (final-2, 3, 4, 6) | 2: stalled 1, lock grants lapsed 1 | 0 | 0 |
+| 0004, final build, `CONSTELLATION_DELEGATION=0` | `auto` | 6 | **0** | 0 | **6** (177–180 s) | 0 |
+| single node `stress-ng-fs` | `auto` | 3 | 0 | 0 | 3 | — |
+
+"Hung" means stress-ng was still running past its deadline (or the harness
+was killed at the 530–570 s call limit), always on a delegate (n1 or n2),
+never on the holder.
+
+### Every hang has one signature, on both transports
+
+- The daemon held the requests: `fuse_requests` at the deadline had 9–20 in
+  flight, the oldest 39–242 s old, almost all at "mutation submitted to the
+  core (reply)", and the watchdog logged them stalled up to 514 s. The
+  `waiting` count on that connection was 76–159. None of these hangs had the
+  "daemon idle" shape.
+- The cause is in the cluster layer: the node was a placement delegate. Its
+  writes parked ("Recalling", `deleg_ack_gated`: waiting for the backup's
+  stream acknowledgement) and its renewals stopped. The root logged
+  "delegate silent: sealing its backup", and the delegate itself logged
+  "delegation lapsed unrenewed" minutes later. This is overload-cascade-2's
+  open "What still stalls" item (the delegate's stream batch and renewal
+  answered too late from the root's ordinary lane), which also fails every
+  main run there.
+- Knock-on effect, not cause: the node's `kernel-inval` thread was in `D` at
+  `fuse_reverse_inval_entry+0x5b` (the parent's `i_rwsem`) in 12 of 13 dumps,
+  behind a `mkdir`/`create`/`unlink` in that directory that was itself
+  waiting on the core. Lock grants' `invalidate_and_wait` is bounded (1 s);
+  the `setlk` rows showing "kernel invalidation after a lock grant" for
+  minutes are a stage label left over, not a wait.
+- With `CONSTELLATION_DELEGATION=0`, the same scenario on the same ring
+  build passed 6/6: no stalled request, no ring entry held past 30 s, no
+  blocked invalidation, no lapsed lock grant.
+
+### The reported signature (holder, daemon idle) was not reproduced
+
+Not seen in 16 ring runs. In the traced runs every request the kernel queued
+for a ring was fetched into an entry (`fuse_request_send` was always followed
+by the ring's `fuse_request_sent`), and the daemon answered every request it
+was handed, except those the livelock held. At fix-2's hang dump, the trace
+shows 180 requests sent to the daemon and unanswered, and 0 queued in the
+kernel and never fetched. The
+ring code was read for the candidate mechanisms:
+
+- Entries not re-committed after an error or interrupt: every error path
+  commits an errno, and `flush_pending` resubmits.
+- A request class the ring never fetches: interrupts, forgets and notify
+  replies go over `/dev/fuse` (`fuser-dev`, alive in every dump).
+- Lock-wait budget entries not returned: `report_held` counts them apart, and
+  none was held long except blocking locks.
+- The eventfd wake-up: the queue-then-write ordering against the drain and
+  `flush_pending` holds. That leaves a lost wake-up in the kernel's
+  `DEFER_TASKRUN` poll path, unproven, as the one mechanism that matches
+  `gate1` exactly: a reply committed from an offload thread and never
+  submitted, the caller waiting, and the daemon believing it answered.
+
+So no kernel reproducer was written: nothing kernel-side was observed. The
+patch removes that failure mode whatever its source and makes any recurrence
+visible:
+
+| change | where |
+|---|---|
+| A ring thread's wait is bounded (`IDLE_WAIT`, 1 s; the dead-eventfd case stays 10 ms). A reply queued in `Live::pending` whose announcement is lost is flushed by the next pass instead of waiting for the next request on that ring. Entering the kernel also runs any task work queued for the thread | `vendor/fuser/src/uring/ring.rs` (`serve`, `RingIo::submit_and_wait(timeout)`; `memory.rs` likewise) |
+| Stranded replies (queued > 100 ms before an idle wait that ended with no completion) are counted (`RingHealth::stranded_commits`) and logged at most once a minute per ring | `Ring::note_stranded` |
+| A `fuser-ring-watch` thread reports entries held in userspace past the request stall threshold (`CONSTELLATION_FUSE_REQUEST_STALL_S`, default 30 s), each once per fetch, with opcode, state and a per-queue census; blocking locks are logged at debug and not counted. This shows what `fuse_requests` cannot: a request still queued for an offload thread | `Ring::report_held`, `RingSet::watch_held`, `RingHealth` (`uring/mod.rs`), `Config::io_uring_health` |
+| Per mount in `node.status` `fuse.mounts[]`: `ring_stranded_commits`, `ring_entries_held_long`; `/metrics` `constellation_fuse_ring_stranded_commits_total`, `constellation_fuse_ring_entries_held_long` | `crates/frontend-fuse/src/{session,stats}.rs`, `crates/control/src/{proto/types.rs,web.rs}`, schema regenerated, `crates/cli/src/control.rs` |
+| `stress-ng-fs*` fails on either counter; at a hang it prints them and runs `STRESS_NG_FS_HANG_HOOK` (`HANG_NODE`, `HANG_PGID`, `HANG_DAEMON_PID`, `HANG_FUSE_CONN`) before anything is killed | `crates/harness/src/scenarios/stressfs.rs`, TESTING.md |
+| Docs | `configuration.md` (what a ring holds), TESTING.md, `CONSTELLATION-PATCH.md` "The ring's idle wait" |
+
+Tests: `uring::ring::test::a_reply_whose_wake_up_is_lost_is_flushed_by_the_idle_wait`
+runs on the real kernel ring. A test hook drops one eventfd write; the reply
+still reaches the kernel and is counted once, and an announced reply is not
+counted. With `IDLE_WAIT` unbounded it fails in 5 s. Also
+`report_held_counts_long_held_entries_but_not_lock_waits` and the metrics
+render test.
+
+Decisions taken alone:
+
+- **No ring "fix" beyond the bound.** No defect was found to fix. The bound
+  costs one wake-up a second per idle ring and turns any lost wake-up, in
+  fuser or the kernel, from a hang into a counted ≤ 1 s delay. The counters
+  say which one happened if `gate1`'s shape returns.
+- **No fallback to `/dev/fuse` on stranded replies.** With recovery in a
+  second, a fallback would only add a session switch. If the counter is ever
+  non-zero in the field, that is the time to decide.
+- **The gate "×6 on the ring with zero hangs" is met only with delegation
+  off.** With it on, main hangs on either transport (above). That fix
+  belongs to overload-cascade-2 or its follow-up, not to the transport.
+- **`ring_entries_held_long` is a gauge** (as of the watchdog's last pass),
+  so the harness's end-of-run check catches only a hold still in place. The
+  log line, once per fetch, records every past one (80–196 per failed
+  livelock run above, 0 in every delegation-off run).
+
+Gates: `cargo fmt --check`; `cargo clippy --workspace --all-targets -D
+warnings` (also `--all-features`); `cargo test -p constellation-frontend-fuse
+--features io-uring` 61 + 29 + 7; `cargo test --manifest-path
+vendor/fuser/Cargo.toml --features io-uring` 174 + 3; `cargo test -p
+constellation-control --features web` 153; `tools/vendor-fuser.sh --check`
+ok; `tests/smoke.sh` PASSED; the seven `transport-*` scenarios PASSED once;
+the runs above.
+
+### Open
+
+- The delegates' livelock (overload-cascade-2, "What still stalls"): it is
+  what hangs `stress-ng-fs-nodes` on main on both transports.
+- `gate1`'s holder-side, daemon-idle hang: unexplained. If it recurs, the
+  first look is `ring_stranded_commits`/`ring_entries_held_long` and the
+  `io_uring: ring N …` log lines.

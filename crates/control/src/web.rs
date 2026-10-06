@@ -1175,7 +1175,9 @@ fn render_vfs_ops(output: &mut String, ops: &VfsOpsStatus) {
 /// `constellation_fuse_lock_wait_downgrades_total` counters, and per mount (by
 /// `mountpoint`, as many series as there are mounts) the
 /// `constellation_fuse_passthrough_opens` and
-/// `constellation_fuse_uring_queue_depth` gauges.
+/// `constellation_fuse_uring_queue_depth` gauges, the
+/// `constellation_fuse_ring_stranded_commits_total` counter and the
+/// `constellation_fuse_ring_entries_held_long` gauge.
 fn render_fuse(output: &mut String, fuse: &FuseStatus) {
     use std::fmt::Write;
     output.push_str(
@@ -1229,6 +1231,30 @@ fn render_fuse(output: &mut String, fuse: &FuseStatus) {
             label_value(&m.mountpoint),
             label_value(&m.transport),
             m.uring_queue_depth
+        );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_ring_stranded_commits_total FUSE replies a ring thread found queued with no wake-up and flushed only by its bounded wait (a lost wake-up, recovered).\n\
+         # TYPE constellation_fuse_ring_stranded_commits_total counter\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_ring_stranded_commits_total{{mountpoint=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            m.ring_stranded_commits
+        );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_ring_entries_held_long FUSE ring entries held in userspace past the request stall threshold, blocking locks aside.\n\
+         # TYPE constellation_fuse_ring_entries_held_long gauge\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_ring_entries_held_long{{mountpoint=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            m.ring_entries_held_long
         );
     }
 }
@@ -1586,6 +1612,8 @@ mod tests {
                         refused_opens: 0,
                         opens_total: 0,
                     },
+                    ring_stranded_commits: 2,
+                    ring_entries_held_long: 1,
                     ..Default::default()
                 },
                 FuseMountStatus {
@@ -1619,6 +1647,11 @@ mod tests {
             "# TYPE constellation_fuse_uring_queue_depth gauge",
             "constellation_fuse_uring_queue_depth{mountpoint=\"/mnt/a\",transport=\"uring\"} 8",
             "constellation_fuse_uring_queue_depth{mountpoint=\"/mnt/\\\"b\\\"\",transport=\"dev_fuse\"} 0",
+            "# TYPE constellation_fuse_ring_stranded_commits_total counter",
+            "constellation_fuse_ring_stranded_commits_total{mountpoint=\"/mnt/a\"} 2",
+            "# TYPE constellation_fuse_ring_entries_held_long gauge",
+            "constellation_fuse_ring_entries_held_long{mountpoint=\"/mnt/a\"} 1",
+            "constellation_fuse_ring_entries_held_long{mountpoint=\"/mnt/\\\"b\\\"\"} 0",
         ] {
             assert!(out.lines().any(|l| l == line), "{line}\n{out}");
         }

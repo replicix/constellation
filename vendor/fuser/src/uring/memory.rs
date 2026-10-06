@@ -843,7 +843,7 @@ impl MemoryRing {
     /// Submits, then blocks until a completion is posted or the wake eventfd is readable (a
     /// commit from another thread), as `io_uring_enter(.., min_complete = 1, ..)` with the
     /// multishot poll armed would; `timed` bounds the wait to 10 ms.
-    pub(crate) fn submit_and_wait(&mut self, timed: bool) -> io::Result<usize> {
+    pub(crate) fn submit_and_wait(&mut self, timeout: std::time::Duration) -> io::Result<usize> {
         let n = self.submit()?;
         loop {
             let wake = {
@@ -861,11 +861,8 @@ impl MemoryRing {
             if let Some(fd) = wake_fd {
                 fds.push(PollFd::new(fd, PollFlags::POLLIN));
             }
-            let timeout = if timed {
-                PollTimeout::from(10u16)
-            } else {
-                PollTimeout::NONE
-            };
+            let timeout =
+                PollTimeout::try_from(timeout.as_millis()).unwrap_or(PollTimeout::MAX);
             match nix::poll::poll(&mut fds, timeout) {
                 Ok(0) => return Ok(n),
                 Ok(_) => {}

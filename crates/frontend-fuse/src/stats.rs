@@ -286,6 +286,62 @@ impl LockWaitCounter {
     }
 }
 
+/// What a ring session's rings report about the requests they hold
+/// (`fuser::RingHealth`, the vendored fuser's io-uring patch): replies a
+/// ring thread found queued with no wake-up and flushed only because its
+/// wait is bounded (`stranded_commits`: a lost wake-up, recovered, which
+/// before the bound left the caller waiting in the kernel while this
+/// daemon had nothing in flight), and ring entries held in userspace past
+/// the op watchdog's stall threshold, blocking locks aside
+/// (`entries_held_long`: requests the kernel's callers wait on that the
+/// view may not even have been handed yet). Zero on `/dev/fuse` and on a
+/// build without the ring.
+#[derive(Debug, Clone, Default)]
+pub struct RingHealthStats {
+    #[cfg(all(feature = "io-uring", target_os = "linux"))]
+    health: Option<fuser::RingHealth>,
+}
+
+impl RingHealthStats {
+    /// The counters `config` carries, when the session it built ended up
+    /// on a ring.
+    pub(crate) fn of_session(config: &fuser::Config, transport: Transport) -> Self {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        {
+            Self {
+                health: config
+                    .io_uring_health
+                    .clone()
+                    .filter(|_| !transport.is_dev_fuse()),
+            }
+        }
+        #[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+        {
+            let _ = (config, transport);
+            Self::default()
+        }
+    }
+
+    /// Replies flushed only by a ring thread's bounded wait.
+    pub fn stranded_commits(&self) -> u64 {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        if let Some(h) = &self.health {
+            return h.stranded_commits();
+        }
+        0
+    }
+
+    /// Ring entries held in userspace past the stall threshold, as of the
+    /// ring watchdog's last pass.
+    pub fn entries_held_long(&self) -> u64 {
+        #[cfg(all(feature = "io-uring", target_os = "linux"))]
+        if let Some(h) = &self.health {
+            return h.entries_held_long();
+        }
+        0
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -304,6 +360,7 @@ pub struct SessionStats {
     /// The session's passthrough state (plan 38 Z3b), read live.
     passthrough: Option<Arc<PassthroughState>>,
     lock_wait_downgrades: LockWaitCounter,
+    ring_health: RingHealthStats,
 }
 
 impl SessionStats {
@@ -367,6 +424,7 @@ impl SessionStats {
             zero_copy_reads: ZeroCopyCounter::default(),
             passthrough: None,
             lock_wait_downgrades: LockWaitCounter::default(),
+            ring_health: RingHealthStats::default(),
         }
     }
 
@@ -400,6 +458,24 @@ impl SessionStats {
     /// (module doc); always 0 on `/dev/fuse`.
     pub fn lock_wait_downgrades(&self) -> u64 {
         self.lock_wait_downgrades.get()
+    }
+
+    /// Report what `health` counts (the session's rings').
+    pub(crate) fn with_ring_health(mut self, health: RingHealthStats) -> Self {
+        self.ring_health = health;
+        self
+    }
+
+    /// Replies this session's rings flushed only by their bounded wait
+    /// ([`RingHealthStats::stranded_commits`]); 0 on `/dev/fuse`.
+    pub fn ring_stranded_commits(&self) -> u64 {
+        self.ring_health.stranded_commits()
+    }
+
+    /// Ring entries held in userspace past the stall threshold
+    /// ([`RingHealthStats::entries_held_long`]); 0 on `/dev/fuse`.
+    pub fn ring_entries_held_long(&self) -> u64 {
+        self.ring_health.entries_held_long()
     }
 
     /// Count one zero-copy read (plan 38 Z4's read path).

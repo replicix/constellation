@@ -555,6 +555,19 @@ pub struct FuseMountStatus {
     /// (see [`FuseStatus::lock_wait_downgrades_total`]); always 0 on
     /// `dev_fuse`.
     pub lock_wait_downgrades: u64,
+    /// Replies this mount's ring threads found queued with no wake-up and
+    /// flushed only because their wait for the kernel is bounded (1 s): each
+    /// one a lost wake-up that, before the bound, left its caller waiting in
+    /// the kernel while the daemon had nothing in flight. Logged (at most
+    /// once a minute per ring); always 0 on `dev_fuse`.
+    pub ring_stranded_commits: u64,
+    /// Ring entries this mount's userspace has held -- fetched from the
+    /// kernel, not yet answered back -- for longer than the FUSE request
+    /// stall threshold (`CONSTELLATION_FUSE_REQUEST_STALL_S`), blocking lock
+    /// requests aside, as of the ring watchdog's last pass. Unlike
+    /// `fuse_requests` this includes requests still queued for a worker,
+    /// which the view has not been handed yet. Always 0 on `dev_fuse`.
+    pub ring_entries_held_long: u64,
 }
 
 /// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a

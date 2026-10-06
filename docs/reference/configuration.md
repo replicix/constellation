@@ -259,6 +259,23 @@ backups, datasets read through), not for ones that re-read a working set.
 > where the locks need not be cluster-wide); what the lock scenarios measured
 > under the new default is in PROGRESS, "cluster-lock-ring-auto".
 >
+> **What a ring holds is reported by the ring itself.** A request on the
+> ring is first held in its entry, then (unless it is a read of data or
+> metadata) queued for one of the mount's worker threads before the view
+> sees it, so under overload `fuse_requests` can show nothing in flight while
+> callers wait. Each ring session therefore reports, per mount in
+> `node.status`'s `fuse.mounts[]` (and `/metrics`, labelled `mountpoint`):
+> `ring_entries_held_long` (`constellation_fuse_ring_entries_held_long`), the
+> entries held in userspace past `CONSTELLATION_FUSE_REQUEST_STALL_S`
+> (default 30 s; 0 turns this watchdog off), blocking locks aside, each also
+> logged once with its opcode, state and a per-queue census; and
+> `ring_stranded_commits` (`constellation_fuse_ring_stranded_commits_total`),
+> replies whose ring thread was never woken for them. A ring thread's wait
+> for the kernel is bounded at 1 s, so such a reply is flushed within a second
+> and logged (at most once a minute per ring) instead of leaving its caller
+> waiting until another request reaches that ring (PROGRESS,
+> "ring-stress-hang"). Both are 0 on `/dev/fuse`.
+>
 > `CONSTELLATION_FUSE_URING_FAULT=malformed-register` is **fault injection
 > for the test harness only** (`transport-refused-registration`): a mount
 > that asks for the ring registers it malformed, the kernel refuses, and the

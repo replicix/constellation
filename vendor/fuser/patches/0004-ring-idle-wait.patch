@@ -1,0 +1,662 @@
+ring-stress-hang: bound a ring thread's idle wait, count the replies it strands, and report
+ring entries userspace holds too long, for fuser 0.18.0 (vendor/fuser/CONSTELLATION-PATCH.md,
+"The ring's idle wait"). Apply with -p1 in vendor/fuser, after 0003-interrupt.patch.
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 3923ad7..8ac9674 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -128,6 +128,10 @@ pub use crate::uring::memory::InMemoryRingKernel;
+ // downgrades with (`Config::io_uring_lock_wait_downgrades`).
+ #[cfg(all(feature = "io-uring", target_os = "linux"))]
+ pub use crate::uring::LockWaitDowngrades;
++// CONSTELLATION PATCH (io-uring): what a ring session reports about the requests
++// it holds (`Config::io_uring_health`).
++#[cfg(all(feature = "io-uring", target_os = "linux"))]
++pub use crate::uring::RingHealth;
+ 
+ /// We generally support async reads
+ #[cfg(not(target_os = "macos"))]
+diff --git a/src/mnt/mount_options.rs b/src/mnt/mount_options.rs
+index c6071aa..634d149 100644
+--- a/src/mnt/mount_options.rs
++++ b/src/mnt/mount_options.rs
+@@ -115,6 +115,12 @@ pub struct Config {
+     /// refused. `None` (the default): nobody is told.
+     #[cfg(all(feature = "io-uring", target_os = "linux"))]
+     pub io_uring_lock_wait_downgrades: Option<crate::LockWaitDowngrades>,
++    /// CONSTELLATION PATCH (io-uring): where the session's rings count replies their idle wait
++    /// had to flush and report entries held in userspace too long (`RingHealth`). `None` (the
++    /// default): neither is counted and no watchdog runs; the idle wait bounds every ring
++    /// either way.
++    #[cfg(all(feature = "io-uring", target_os = "linux"))]
++    pub io_uring_health: Option<crate::RingHealth>,
+ }
+ 
+ // CONSTELLATION PATCH (io-uring): hand-written so `io_uring_queue_depth`
+@@ -137,6 +143,8 @@ impl Default for Config {
+             io_uring_malformed_register: false,
+             #[cfg(all(feature = "io-uring", target_os = "linux"))]
+             io_uring_lock_wait_downgrades: None,
++            #[cfg(all(feature = "io-uring", target_os = "linux"))]
++            io_uring_health: None,
+         }
+     }
+ }
+diff --git a/src/session.rs b/src/session.rs
+index b3c704a..1a23f21 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -1024,6 +1024,14 @@ impl<FS: Filesystem> Session<FS> {
+         if let Some(hook) = &self.config.io_uring_lock_wait_downgrades {
+             set.set_lock_wait_downgrades(hook);
+         }
++        if let Some(health) = &self.config.io_uring_health {
++            set.set_health(health);
++            if !health.held_report_after().is_zero() {
++                if let Err(err) = set.watch_held(health.clone()) {
++                    warn!("io_uring: could not start the held-entry watchdog ({err})");
++                }
++            }
++        }
+         Ok(set)
+     }
+ 
+diff --git a/src/uring/memory.rs b/src/uring/memory.rs
+index 596963e..1bb4c30 100644
+--- a/src/uring/memory.rs
++++ b/src/uring/memory.rs
+@@ -843,7 +843,7 @@ impl MemoryRing {
+     /// Submits, then blocks until a completion is posted or the wake eventfd is readable (a
+     /// commit from another thread), as `io_uring_enter(.., min_complete = 1, ..)` with the
+     /// multishot poll armed would; `timed` bounds the wait to 10 ms.
+-    pub(crate) fn submit_and_wait(&mut self, timed: bool) -> io::Result<usize> {
++    pub(crate) fn submit_and_wait(&mut self, timeout: std::time::Duration) -> io::Result<usize> {
+         let n = self.submit()?;
+         loop {
+             let wake = {
+@@ -861,11 +861,8 @@ impl MemoryRing {
+             if let Some(fd) = wake_fd {
+                 fds.push(PollFd::new(fd, PollFlags::POLLIN));
+             }
+-            let timeout = if timed {
+-                PollTimeout::from(10u16)
+-            } else {
+-                PollTimeout::NONE
+-            };
++            let timeout =
++                PollTimeout::try_from(timeout.as_millis()).unwrap_or(PollTimeout::MAX);
+             match nix::poll::poll(&mut fds, timeout) {
+                 Ok(0) => return Ok(n),
+                 Ok(_) => {}
+diff --git a/src/uring/mod.rs b/src/uring/mod.rs
+index 5a4d449..1760c35 100644
+--- a/src/uring/mod.rs
++++ b/src/uring/mod.rs
+@@ -21,6 +21,7 @@ use std::fs;
+ use std::io;
+ use std::sync::Arc;
+ use std::sync::mpsc;
++use std::thread;
+ use std::thread::JoinHandle;
+ 
+ use log::debug;
+@@ -183,6 +184,91 @@ impl PartialEq for LockWaitDowngrades {
+ 
+ impl Eq for LockWaitDowngrades {}
+ 
++/// CONSTELLATION PATCH (io-uring): what a ring session reports about requests it holds, shared
++/// by all of its rings and read by the filesystem (`Config::io_uring_health`).
++///
++/// - `stranded_commits`: replies another thread handed to a ring thread whose wake-up never
++///   came. The ring thread found each still queued after an idle wait timed out, and flushed it
++///   then; without that bounded wait the caller in the kernel would have waited until the next
++///   request on one of that ring's queues woke the thread. Non-zero means a lost wake-up, in
++///   this crate or the kernel: worth reporting, and no longer a hang.
++/// - `entries_held_long`: ring entries userspace has held -- fetched, not yet committed back
++///   -- for at least `held_report_after`, as of the last watchdog pass (every quarter of that,
++///   at least once a second), blocking lock requests excepted. Each is a caller the kernel
++///   holds while the filesystem may not even have seen its request (it can wait for an
++///   offload thread), so a filesystem's own count of requests in flight does not show them.
++///   Each newly long-held entry is also logged once, with a per-queue census.
++#[derive(Clone)]
++pub struct RingHealth(Arc<RingHealthInner>);
++
++struct RingHealthInner {
++    held_report_after: std::time::Duration,
++    stranded_commits: std::sync::atomic::AtomicU64,
++    entries_held_long: std::sync::atomic::AtomicU64,
++}
++
++impl RingHealth {
++    /// Reports entries held in userspace for `held_report_after` or longer; zero runs no
++    /// watchdog (`entries_held_long` stays 0) and still counts stranded commits.
++    pub fn new(held_report_after: std::time::Duration) -> Self {
++        Self(Arc::new(RingHealthInner {
++            held_report_after,
++            stranded_commits: Default::default(),
++            entries_held_long: Default::default(),
++        }))
++    }
++
++    /// Replies flushed only by a ring thread's idle wait, so far.
++    pub fn stranded_commits(&self) -> u64 {
++        self.0
++            .stranded_commits
++            .load(std::sync::atomic::Ordering::Relaxed)
++    }
++
++    /// Entries held in userspace past `held_report_after` at the last watchdog pass.
++    pub fn entries_held_long(&self) -> u64 {
++        self.0
++            .entries_held_long
++            .load(std::sync::atomic::Ordering::Relaxed)
++    }
++
++    pub(crate) fn held_report_after(&self) -> std::time::Duration {
++        self.0.held_report_after
++    }
++
++    /// Counts `n` more stranded commits; the new total.
++    pub(crate) fn note_stranded(&self, n: u64) -> u64 {
++        self.0
++            .stranded_commits
++            .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
++            + n
++    }
++
++    pub(crate) fn set_entries_held_long(&self, n: u64) {
++        self.0
++            .entries_held_long
++            .store(n, std::sync::atomic::Ordering::Relaxed);
++    }
++}
++
++impl fmt::Debug for RingHealth {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("RingHealth")
++            .field("held_report_after", &self.0.held_report_after)
++            .field("stranded_commits", &self.stranded_commits())
++            .field("entries_held_long", &self.entries_held_long())
++            .finish()
++    }
++}
++
++impl PartialEq for RingHealth {
++    fn eq(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.0, &other.0)
++    }
++}
++
++impl Eq for RingHealth {}
++
+ impl RingSet {
+     /// CONSTELLATION PATCH (io-uring): tells `hook` about every lock-wait budget downgrade on
+     /// any of this set's rings (`LockWaitDowngrades`).
+@@ -192,6 +278,40 @@ impl RingSet {
+         }
+     }
+ 
++    /// CONSTELLATION PATCH (io-uring): every ring of this set counts into `health`
++    /// (`RingHealth`).
++    pub(crate) fn set_health(&self, health: &RingHealth) {
++        for ring in &self.rings {
++            ring.set_health(health.clone());
++        }
++    }
++
++    /// CONSTELLATION PATCH (io-uring): starts the thread that reports entries userspace holds
++    /// past `health`'s threshold (`Ring::report_held`, `RingHealth::entries_held_long`). It
++    /// holds the rings weakly and leaves once they are all gone.
++    pub(crate) fn watch_held(&self, health: RingHealth) -> io::Result<()> {
++        let rings: Vec<std::sync::Weak<Ring>> = self.rings.iter().map(Arc::downgrade).collect();
++        let after = health.held_report_after();
++        let tick = (after / 4).max(std::time::Duration::from_secs(1));
++        let after_ms = after.as_millis() as u64;
++        thread::Builder::new()
++            .name("fuser-ring-watch".into())
++            .spawn(move || loop {
++                thread::sleep(tick);
++                let mut alive = false;
++                let mut long = 0;
++                for ring in rings.iter().filter_map(std::sync::Weak::upgrade) {
++                    alive = true;
++                    long += ring.report_held(after_ms);
++                }
++                if !alive {
++                    return;
++                }
++                health.set_entries_held_long(long);
++            })
++            .map(drop)
++    }
++
+     /// Opens the io_urings of `min(n_threads, queues)` rings over every possible CPU's queue,
+     /// reserves their buffers and spawns their parked threads. The error text names what
+     /// failed, for the session's fallback warning.
+diff --git a/src/uring/ring.rs b/src/uring/ring.rs
+index 840089a..cd1699b 100644
+--- a/src/uring/ring.rs
++++ b/src/uring/ring.rs
+@@ -28,6 +28,7 @@ use std::sync::atomic::AtomicUsize;
+ use std::sync::atomic::Ordering;
+ use std::sync::mpsc;
+ use std::thread;
++use std::time::Duration;
+ use std::thread::ThreadId;
+ 
+ use io_uring::IoUring;
+@@ -188,19 +189,22 @@ impl RingIo {
+         }
+     }
+ 
+-    /// Submits the queue and waits for one CQE; `timed` bounds the wait to 10 ms.
+-    fn submit_and_wait(&mut self, timed: bool) -> io::Result<usize> {
++    /// Submits the queue and waits for one CQE, at most `timeout`: `ETIME` (or, from the
++    /// in-memory backend, no CQE) when it passed with none.
++    ///
++    /// CONSTELLATION PATCH (io-uring): every wait is bounded now (`IDLE_WAIT`), not only the
++    /// one after the eventfd poll died.
++    fn submit_and_wait(&mut self, timeout: Duration) -> io::Result<usize> {
+         if !self.early.is_empty() {
+             return self.submit();
+         }
+         match &mut self.io {
+-            Backend::Kernel(io) if timed => {
+-                let ts = types::Timespec::new().nsec(10_000_000);
++            Backend::Kernel(io) => {
++                let ts = types::Timespec::from(timeout);
+                 let args = types::SubmitArgs::new().timespec(&ts);
+                 io.submitter().submit_with_args(1, &args)
+             }
+-            Backend::Kernel(io) => io.submit_and_wait(1),
+-            Backend::Memory(m) => m.submit_and_wait(timed),
++            Backend::Memory(m) => m.submit_and_wait(timeout),
+         }
+     }
+ 
+@@ -375,6 +379,11 @@ pub(crate) struct Ring {
+     /// instead of two, which the kernel refuses with `EINVAL` before it records anything
+     /// (`fuse_uring_get_iovec_from_sqe`). Set only through `Config::io_uring_malformed_register`.
+     malformed_register: std::sync::atomic::AtomicBool,
++    /// CONSTELLATION PATCH (io-uring): where this ring counts what `note_stranded` finds. Set
++    /// only through `Config::io_uring_health`, before any request is served.
++    health: OnceLock<super::RingHealth>,
++    /// CONSTELLATION PATCH (io-uring): when `note_stranded` last logged (`mono_ms`, 0 never).
++    stranded_logged: std::sync::atomic::AtomicU64,
+     /// CONSTELLATION PATCH (io-uring): told about every lock-wait budget downgrade
+     /// (`HeldRequest::downgrade_lock_wait`). Set only through
+     /// `Config::io_uring_lock_wait_downgrades`, before any request is served.
+@@ -578,8 +587,47 @@ pub(crate) struct RingEntry {
+     /// (`FUSE_URING_ENT_ZERO_COPY`), so its data reply reaches the caller only through a
+     /// `READ_FIXED` into them: the kernel copies nothing from the payload buffer.
+     zero_copied: AtomicBool,
++    /// CONSTELLATION PATCH (io-uring): when the current fetch arrived (`mono_ms`; 0 before the
++    /// first), its opcode and unique, for `Ring::report_held`. Written by the ring thread at
++    /// every fetch, before the entry leaves the kernel's hands for userspace's.
++    fetched_ms: std::sync::atomic::AtomicU64,
++    fetched_opcode: std::sync::atomic::AtomicU32,
++    fetched_unique: std::sync::atomic::AtomicU64,
++    /// CONSTELLATION PATCH (io-uring): the unique `Ring::report_held` last logged, so an entry
++    /// held across several watchdog passes is logged once per fetch.
++    held_reported: std::sync::atomic::AtomicU64,
++    /// CONSTELLATION PATCH (io-uring): when the entry was last queued in `Live::pending`
++    /// (`mono_ms`), so the ring thread can tell a commit no wakeup announced from one whose
++    /// wakeup is still on its way (`Ring::flush_stranded`).
++    handed_ms: std::sync::atomic::AtomicU64,
+ }
+ 
++/// CONSTELLATION PATCH (io-uring): milliseconds on a process-wide monotonic clock. It starts
++/// at a day rather than at 0, which means "never" in the entry stamps, so a stamp can always be
++/// set a while in the past (the tests do).
++fn mono_ms() -> u64 {
++    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
++    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 86_400_000
++}
++
++/// CONSTELLATION PATCH (io-uring): the longest a ring thread waits for a completion before it
++/// looks at its commit queue again on its own. Every reply handed to a ring thread from
++/// another thread is announced through the wake eventfd, so this wait never ends by timing out
++/// while the ring works as designed; it bounds what a lost announcement can cost -- a reply the
++/// kernel's caller would otherwise wait for until the next request on one of this ring's
++/// queues happened to wake the thread, which at the end of a workload is never. Entering the
++/// kernel also runs whatever task work it queued for this thread (`DEFER_TASKRUN`), so a fetch
++/// whose wake-up went missing is served by the same pass. One wake-up a second per idle ring.
++const IDLE_WAIT: Duration = Duration::from_secs(1);
++
++/// CONSTELLATION PATCH (io-uring): the wait once the eventfd poll is dead (`serve`).
++const DEAD_WAKE_WAIT: Duration = Duration::from_millis(10);
++
++/// CONSTELLATION PATCH (io-uring): a commit queued at least this long before an idle wait timed
++/// out had its announcement lost; a younger one may still have its eventfd write under way
++/// (the committer queues, then writes).
++const STRANDED_AFTER_MS: u64 = 100;
++
+ #[derive(Debug)]
+ enum EntryState {
+     /// A REGISTER (`last == 0`) or COMMIT_AND_FETCH for `last` is pending in the kernel.
+@@ -1449,6 +1497,11 @@ impl Ring {
+                     reply_at: AtomicPtr::new(unsafe { base.add(mem.gap()) }.as_ptr()),
+                     reply_cap: AtomicUsize::new(mem.payload_cap()),
+                     zero_copied: AtomicBool::new(false),
++                    fetched_ms: std::sync::atomic::AtomicU64::new(0),
++                    fetched_opcode: std::sync::atomic::AtomicU32::new(0),
++                    fetched_unique: std::sync::atomic::AtomicU64::new(0),
++                    held_reported: std::sync::atomic::AtomicU64::new(0),
++                    handed_ms: std::sync::atomic::AtomicU64::new(0),
+                 }
+             })
+             .collect();
+@@ -1474,6 +1527,8 @@ impl Ring {
+             mem: ManuallyDrop::new(mem),
+             malformed_register: std::sync::atomic::AtomicBool::new(false),
+             lock_wait_downgrades: OnceLock::new(),
++            health: OnceLock::new(),
++            stranded_logged: std::sync::atomic::AtomicU64::new(0),
+             pool_plan: Mutex::new(None),
+             pools: OnceLock::new(),
+             setup_gate: Mutex::new(None),
+@@ -1592,6 +1647,11 @@ impl Ring {
+         let _ = self.lock_wait_downgrades.set(hook);
+     }
+ 
++    /// CONSTELLATION PATCH (io-uring): see `Ring::health`.
++    pub(crate) fn set_health(&self, health: super::RingHealth) {
++        let _ = self.health.set(health);
++    }
++
+     fn commit_sqe(&self, e: &RingEntry, commit_id: u64) -> squeue::Entry128 {
+         opcode::UringCmd80::new(
+             types::Fd(self.device.as_raw_fd()),
+@@ -2060,6 +2120,117 @@ impl Ring {
+         self.hand_off_as(e, commit_id, EntryState::PendingRead { commit_id, read });
+     }
+ 
++    /// CONSTELLATION PATCH (io-uring): called at the top of the pass after an idle wait timed
++    /// out with no completion at all. A commit another thread queued in `pending` more than
++    /// `STRANDED_AFTER_MS` before that is one whose eventfd announcement never produced a
++    /// completion: without the bounded wait the kernel's caller would wait for it until some
++    /// other request on this ring's queues woke the thread. It is flushed by this very pass;
++    /// here it is counted (`RingHealth::stranded_commits`) and reported, at most once a minute
++    /// per ring.
++    fn note_stranded(&self) {
++        let now = mono_ms();
++        let (stranded, oldest) = {
++            let live = self.live.lock();
++            live.pending
++                .iter()
++                .map(|&idx| self.entries[idx as usize].handed_ms.load(Ordering::Relaxed))
++                .filter(|&at| at != 0 && now.saturating_sub(at) >= STRANDED_AFTER_MS)
++                .fold((0u64, 0u64), |(n, oldest), at| (n + 1, oldest.max(now - at)))
++        };
++        if stranded == 0 {
++            return;
++        }
++        let total = self
++            .health
++            .get()
++            .map_or(stranded, |h| h.note_stranded(stranded));
++        let last = self.stranded_logged.load(Ordering::Relaxed);
++        if last == 0 || now.saturating_sub(last) >= 60_000 {
++            self.stranded_logged.store(now, Ordering::Relaxed);
++            warn!(
++                "io_uring: ring {} found {stranded} repl{} queued with no wake-up (oldest \
++                 {oldest} ms); flushed by the idle wait ({total} so far in this session)",
++                self.index,
++                if stranded == 1 { "y" } else { "ies" }
++            );
++        }
++    }
++
++    /// CONSTELLATION PATCH (io-uring): the entries of this ring that userspace has held for at
++    /// least `after_ms`: fetched from the kernel, not yet committed back. Each one is a
++    /// caller waiting in the kernel on a request the filesystem may not even know about yet
++    /// (still queued for an offload thread), or whose reply is not yet on its way back. Every
++    /// newly long-held entry is logged once per fetch with its state, opcode and age, next to
++    /// a per-queue census; blocking lock requests (which wait for the lock holder by design)
++    /// are logged at debug level and left out of the returned count.
++    pub(crate) fn report_held(&self, after_ms: u64) -> u64 {
++        let now = mono_ms();
++        let mut long = 0;
++        let mut new = Vec::new();
++        let mut census: std::collections::BTreeMap<u16, [u32; 3]> = Default::default();
++        for e in self.entries.iter() {
++            let state = e.state.lock();
++            let held = !matches!(*state, EntryState::InKernel { .. } | EntryState::Dead);
++            // [in the kernel, held by userspace, dead]
++            let slot = match *state {
++                EntryState::InKernel { .. } => 0,
++                EntryState::Dead => 2,
++                _ => 1,
++            };
++            census.entry(e.qid).or_default()[slot] += 1;
++            let at = e.fetched_ms.load(Ordering::Relaxed);
++            if !held || at == 0 || now.saturating_sub(at) < after_ms {
++                continue;
++            }
++            let lock_wait = e.lock_wait.load(Ordering::Relaxed);
++            if !lock_wait {
++                long += 1;
++            }
++            let unique = e.fetched_unique.load(Ordering::Relaxed);
++            if e.held_reported.swap(unique, Ordering::Relaxed) != unique {
++                new.push((
++                    lock_wait,
++                    format!(
++                        "qid {} entry {} unique {unique} opcode {} {:?} for {} ms",
++                        e.qid,
++                        e.idx,
++                        e.fetched_opcode.load(Ordering::Relaxed),
++                        *state,
++                        now - at
++                    ),
++                ));
++            }
++        }
++        if new.is_empty() {
++            return long;
++        }
++        let census: Vec<String> = census
++            .iter()
++            .map(|(qid, [k, u, d])| format!("{qid}: {k}/{u}/{d}"))
++            .collect();
++        let (pending, outstanding) = {
++            let live = self.live.lock();
++            (live.pending.len(), live.outstanding)
++        };
++        for (lock_wait, entry) in new {
++            if lock_wait {
++                debug!(
++                    "io_uring: ring {} holds a blocking lock request: {entry}",
++                    self.index
++                );
++            } else {
++                warn!(
++                    "io_uring: ring {} holds a request in userspace past {after_ms} ms: {entry}; \
++                     outstanding {outstanding}, pending {pending}; per queue in kernel/userspace/\
++                     dead: {}",
++                    self.index,
++                    census.join(", ")
++                );
++            }
++        }
++        long
++    }
++
+     /// CONSTELLATION PATCH (io-uring): writes a reply (`iov[0]` the out header) the way the
+     /// current fetch takes it, and hands the entry off. A zero-copied request's payload cannot
+     /// go through the payload buffer -- the kernel copies nothing from it into the request's
+@@ -2270,6 +2441,16 @@ impl Ring {
+             *state = next;
+             live.in_kernel += 1;
+             live.pending.push(e.idx);
++            e.handed_ms.store(mono_ms(), Ordering::Relaxed);
++        }
++        #[cfg(test)]
++        if self
++            .hooks
++            .lost_wakes
++            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
++            .is_ok()
++        {
++            return;
+         }
+         if self.ring_thread.get() != Some(&thread::current().id()) {
+             if let Err(err) = self.wake.write(1) {
+@@ -2288,7 +2469,12 @@ impl Ring {
+     /// behind them.
+     fn serve(self: &Arc<Self>, io: &mut RingIo, handler: &mut dyn FetchHandler) -> io::Result<()> {
+         let (mut wake_retried, mut wake_dead) = (false, false);
++        // CONSTELLATION PATCH (io-uring): the last wait ended with no completion at all
++        let mut timed_out = false;
+         loop {
++            if std::mem::take(&mut timed_out) {
++                self.note_stranded();
++            }
+             self.flush_pending(io)?;
+             {
+                 let mut live = self.live.lock();
+@@ -2305,11 +2491,17 @@ impl Ring {
+                 .exit_checks
+                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+             // Once the eventfd poll is dead foreign commits cannot wake this thread, so the
+-            // wait is bounded and flush_pending runs on every pass
+-            match io.submit_and_wait(wake_dead) {
++            // wait is short and flush_pending runs on every pass. CONSTELLATION PATCH
++            // (io-uring): otherwise it is `IDLE_WAIT`, so that a commit whose wake-up was lost
++            // is flushed (and reported) rather than stranded
++            let wait = if wake_dead { DEAD_WAKE_WAIT } else { IDLE_WAIT };
++            match io.submit_and_wait(wait) {
+                 Ok(_) => {}
+                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+-                Err(e) if wake_dead && e.raw_os_error() == Some(libc::ETIME) => continue,
++                Err(e) if e.raw_os_error() == Some(libc::ETIME) => {
++                    timed_out = !wake_dead;
++                    continue;
++                }
+                 // The SQ was not consumed; reap what the CQ holds so it can be retried, and
+                 // give the kernel a moment since the CQ is usually empty on EAGAIN
+                 Err(e) if matches!(e.raw_os_error(), Some(libc::EBUSY | libc::EAGAIN)) => {
+@@ -2319,6 +2511,8 @@ impl Ring {
+                 Err(e) => return Err(e),
+             }
+             let cqes = io.reap();
++            // The in-memory backend reports a timed-out wait as one with no CQE
++            timed_out = cqes.is_empty() && !wake_dead;
+             for (ud, res, flags) in cqes {
+                 if ud == WAKE {
+                     let failed = if res < 0 {
+@@ -2471,6 +2665,17 @@ impl Ring {
+             }
+         };
+         let commit_id = staged.commit_id;
++        {
++            // CONSTELLATION PATCH (io-uring): what `report_held` names this fetch by
++            // SAFETY: as for `stage_request` above; the slice ends with this block.
++            let req = unsafe { slice::from_raw_parts(staged.req.as_ptr(), staged.len.min(8)) };
++            let opcode = req
++                .get(4..8)
++                .map_or(0, |b| u32::from_ne_bytes(b.try_into().unwrap()));
++            e.fetched_opcode.store(opcode, Ordering::Relaxed);
++            e.fetched_unique.store(commit_id, Ordering::Relaxed);
++            e.fetched_ms.store(mono_ms(), Ordering::Relaxed);
++        }
+         if let Some((kind, why)) = refusal {
+             // Once per kind of refusal, so a second kind still shows up in the log
+             static ONCE: [std::sync::Once; 3] = [const { std::sync::Once::new() }; 3];
+@@ -2772,6 +2977,9 @@ pub(crate) mod test {
+         pub(super) exit_checks: AtomicUsize,
+         /// `fill` replies written straight into an entry, as opposed to handed back.
+         pub(super) direct_fills: AtomicUsize,
++        /// CONSTELLATION PATCH (io-uring): this many next hand-offs queue their commit without
++        /// writing the wake eventfd -- a lost announcement.
++        pub(super) lost_wakes: AtomicUsize,
+     }
+ 
+     impl RingHooks {
+@@ -3491,6 +3699,85 @@ pub(crate) mod test {
+         assert!(io.uring().submission().is_empty());
+     }
+ 
++    /// CONSTELLATION PATCH (io-uring): a reply handed to an idle ring thread whose eventfd
++    /// announcement is lost still reaches the kernel: the ring thread's wait is bounded
++    /// (`IDLE_WAIT`), the next pass flushes it, and it is counted as stranded. Before the
++    /// bound the thread slept until something else woke it -- in a ring nobody else uses, never
++    /// (the signature of overload-cascade-2's `gate1` hang: the caller waited in the kernel,
++    /// the daemon had nothing in flight).
++    #[test]
++    fn a_reply_whose_wake_up_is_lost_is_flushed_by_the_idle_wait() {
++        let Some(io) = try_ring_io(8, 16) else { return };
++        let ring = fake_ring(3, true);
++        let health = crate::uring::RingHealth::new(Duration::from_secs(30));
++        ring.set_health(health.clone());
++        let served = Served::start(io, ring, true);
++        served.ring.hooks.lost_wakes.store(1, Ordering::SeqCst);
++        // Commit right after the ring thread started a wait, so that the reply is older than
++        // `STRANDED_AFTER_MS` when that wait times out
++        let passes = served.ring.hooks.exit_checks.load(Ordering::SeqCst);
++        let deadline = Instant::now() + Duration::from_secs(3);
++        while served.ring.hooks.exit_checks.load(Ordering::SeqCst) == passes {
++            assert!(Instant::now() < deadline, "the ring thread never waited again");
++            thread::sleep(Duration::from_millis(1));
++        }
++        let commit = fake_dispatched(&served.ring, 0, 71);
++        let header = ok_header(71);
++        thread::spawn(move || commit.commit(&[IoSlice::new(header.as_bytes())]))
++            .join()
++            .unwrap()
++            .unwrap();
++        assert_eq!(served.ring.hooks.lost_wakes.load(Ordering::SeqCst), 0);
++        let idx = served
++            .flushed
++            .recv_timeout(Duration::from_secs(5))
++            .expect("a reply whose wake-up was lost was never flushed");
++        assert_eq!(idx, 0);
++        served.wait_retired(0);
++        assert_eq!(health.stranded_commits(), 1);
++
++        // An announced reply is not counted
++        served.foreign_commit(fake_dispatched(&served.ring, 1, 72));
++        served.wait_retired(1);
++        thread::sleep(IDLE_WAIT + Duration::from_millis(200));
++        assert_eq!(health.stranded_commits(), 1);
++
++        let (outcome, _io) = served.finish();
++        outcome.unwrap();
++    }
++
++    /// CONSTELLATION PATCH (io-uring): `report_held` counts the entries userspace has held past
++    /// the threshold, blocking lock requests aside, and leaves the rest alone.
++    #[test]
++    fn report_held_counts_long_held_entries_but_not_lock_waits() {
++        let ring = fake_ring(4, true);
++        let now = mono_ms();
++        let fetched = |idx: usize, unique: u64, age_ms: u64| {
++            let e = &ring.entries[idx];
++            e.fetched_unique.store(unique, Ordering::Relaxed);
++            e.fetched_ms.store(now - age_ms, Ordering::Relaxed);
++        };
++        // Held for a minute: counted
++        let _held = fake_dispatched(&ring, 0, 81);
++        fetched(0, 81, 60_000);
++        // Held for a moment: not yet
++        let _young = fake_dispatched(&ring, 1, 82);
++        fetched(1, 82, 10);
++        // A blocking lock request held for a minute: by design, not counted
++        let _lock = fake_dispatched(&ring, 2, 83);
++        fetched(2, 83, 60_000);
++        ring.entries[2].lock_wait.store(true, Ordering::Relaxed);
++        // Back in the kernel after a long fetch: not held at all
++        *ring.entries[3].state.lock() = EntryState::InKernel { last: 84 };
++        fetched(3, 84, 60_000);
++        assert_eq!(ring.report_held(30_000), 1);
++        // Logged once per fetch, counted every pass
++        assert_eq!(ring.entries[0].held_reported.load(Ordering::Relaxed), 81);
++        assert_eq!(ring.report_held(30_000), 1);
++        assert_eq!(ring.report_held(5), 2);
++        ring.live.lock().outstanding = 0;
++    }
++
+     #[test]
+     fn cancelled_wake_poll_degrades_to_timed_waits() {
+         let Some(io) = try_ring_io(8, 16) else { return };

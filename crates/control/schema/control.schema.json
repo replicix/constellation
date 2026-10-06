@@ -2651,6 +2651,18 @@
         "passthrough": {
           "$ref": "#/$defs/FusePassthroughStatus"
         },
+        "ring_entries_held_long": {
+          "description": "Ring entries this mount's userspace has held -- fetched from the\nkernel, not yet answered back -- for longer than the FUSE request\nstall threshold (`CONSTELLATION_FUSE_REQUEST_STALL_S`), blocking lock\nrequests aside, as of the ring watchdog's last pass. Unlike\n`fuse_requests` this includes requests still queued for a worker,\nwhich the view has not been handed yet. Always 0 on `dev_fuse`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ring_stranded_commits": {
+          "description": "Replies this mount's ring threads found queued with no wake-up and\nflushed only because their wait for the kernel is bounded (1 s): each\none a lost wake-up that, before the bound, left its caller waiting in\nthe kernel while the daemon had nothing in flight. Logged (at most\nonce a minute per ring); always 0 on `dev_fuse`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "transport": {
           "description": "What the connection negotiated: `dev_fuse`, `uring` or `uring_zc`,\nfixed for the connection's life.",
           "type": "string"
@@ -2675,7 +2687,9 @@
         "uring_queue_depth",
         "passthrough",
         "zero_copy_reads",
-        "lock_wait_downgrades"
+        "lock_wait_downgrades",
+        "ring_stranded_commits",
+        "ring_entries_held_long"
       ],
       "type": "object"
     },
