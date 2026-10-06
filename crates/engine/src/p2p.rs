@@ -27,6 +27,14 @@ pub(crate) struct P2pBridge {
     /// holds the root lease.
     pub(crate) snapshot_batches: std::sync::Arc<crate::snapshot_batch::SnapshotBatcher>,
     pub(crate) nudge: tokio::sync::mpsc::UnboundedSender<sync::SyncRequest>,
+    /// The driver's urgent lane (`DriverDeps::urgent_rx`): renewals and
+    /// the holder's heartbeat, which must not queue behind the ordinary
+    /// requests on `nudge` (a lock or delegation renewal answered seconds
+    /// late is a lapse; a heartbeat, a seal).
+    pub(crate) urgent: tokio::sync::mpsc::UnboundedSender<sync::SyncRequest>,
+    /// Shared with the driver off the core's step: when each holder was
+    /// last heard from, and whether the driver is progressing.
+    pub(crate) off_core: std::sync::Arc<crate::authority_driver::OffCore>,
     pub(crate) epochs: std::sync::Arc<epoch::EpochManager>,
     /// The bucket, for an epoch proposal's member-side S3 probe.
     pub(crate) store: std::sync::Arc<dyn object_store::ObjectStore>,
@@ -514,6 +522,7 @@ impl constellation_net::PeerService for P2pBridge {
         req_id: u64,
         gen: u64,
         txs: Vec<u8>,
+        leaving: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -526,6 +535,11 @@ impl constellation_net::PeerService for P2pBridge {
             let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs) else {
                 return refuse;
             };
+            let Ok(leaving) =
+                postcard::from_bytes::<Vec<constellation_meta::locks::Grant>>(&leaving)
+            else {
+                return refuse;
+            };
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
                 .nudge
@@ -533,6 +547,7 @@ impl constellation_net::PeerService for P2pBridge {
                     from,
                     gen,
                     txs,
+                    leaving,
                     reply,
                 })
                 .is_err()
@@ -563,7 +578,7 @@ impl constellation_net::PeerService for P2pBridge {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
             let (ttl_ms, locks, lock_grace_ms, lock_floor) = if self
-                .nudge
+                .urgent
                 .send(sync::SyncRequest::PeerDelegRenew {
                     from,
                     gen,
@@ -725,6 +740,12 @@ impl constellation_net::PeerService for P2pBridge {
                 return refuse;
             };
             tracing::trace!(target: "constellation::fwd", from, "append queued");
+            // Heard from now, whenever the core gets to it (`OffCore`).
+            self.off_core.note_holder_heard(
+                holder,
+                epoch,
+                constellation_store_s3::lease::now_unix_ms(),
+            );
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
                 .nudge
@@ -782,17 +803,25 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn holder_alive(&self, holder: u64, epoch: u64, candidacy: u64, listed: bool) {
+    fn holder_alive(&self, holder: u64, epoch: u64, candidacy: u64, listed: bool) -> bool {
+        let now = constellation_store_s3::lease::now_unix_ms();
         if crate::fault::p2p_denied(holder) {
-            return;
+            return false;
         }
-        let _ = self.nudge.send(sync::SyncRequest::PeerHolderAlive {
+        if listed {
+            self.off_core.note_holder_heard(holder, epoch, now);
+        }
+        let _ = self.urgent.send(sync::SyncRequest::PeerHolderAlive {
             holder,
             epoch,
             candidacy,
             listed,
-            at_unix_ms: constellation_store_s3::lease::now_unix_ms(),
+            at_unix_ms: now,
         });
+        // The holder gives a backup that says so longer to acknowledge
+        // (`Event::BackupAlive`): true only while this node's driver is
+        // progressing, so a hung core does not earn it.
+        self.off_core.core_responsive(now)
     }
 
     fn lock_requested(
@@ -879,7 +908,7 @@ impl constellation_net::PeerService for P2pBridge {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
             let sent = self
-                .nudge
+                .urgent
                 .send(sync::SyncRequest::PeerLockRenew {
                     from,
                     entries: crate::locks::renew_entries_of(entries),

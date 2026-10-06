@@ -345,6 +345,15 @@ fn replay_seed() {
         Ok("locks-delegated") => locks_delegated_config(),
         Ok("locks-released-delegated") => locks_released_delegated_config(),
         Ok("locks-delegated-writes") => with_lock_writes(locks_delegated_config(), "d2"),
+        Ok("locks-unlinked-delegated") => locks_unlinked_delegated_config(),
+        Ok("locks-unlinked-delegated-hcrash") => locks_unlinked_hcrash_config(false),
+        Ok("locks-unlinked-delegated-hcrash-backup") => locks_unlinked_hcrash_config(true),
+        Ok("locks-unlinked-delegated-dcrash") => locks_unlinked_dcrash_config(true),
+        Ok("locks-unlinked-delegated-dcrash-nb") => locks_unlinked_dcrash_config(false),
+        Ok("locks-unlinked-delegated-random") => locks_unlinked_random_config(false),
+        Ok("locks-unlinked-delegated-dbackup-random") => locks_unlinked_random_config(true),
+        Ok("locks-unlinked-delegated-blips") => locks_unlinked_blips_config(),
+        Ok("locks-unlinked-delegated-partition") => locks_unlinked_partition_config(),
         Ok("locks-released-writes") => with_lock_writes(locks_released_delegated_config(), "d2"),
         Ok("locks-failover-backup-writes") => with_lock_writes(locks_failover_backup_config(), ""),
         Ok("locks-writes") => with_lock_writes(locks_config(), ""),
@@ -2655,6 +2664,15 @@ fn sweep_config() {
         "locks-blips-tight-delegated" => locks_blips_tight_delegated_config(),
         "locks-pause" => locks_pause_config(),
         "locks-delegated" => locks_delegated_config(),
+        "locks-unlinked-delegated" => locks_unlinked_delegated_config(),
+        "locks-unlinked-delegated-hcrash" => locks_unlinked_hcrash_config(false),
+        "locks-unlinked-delegated-hcrash-backup" => locks_unlinked_hcrash_config(true),
+        "locks-unlinked-delegated-dcrash" => locks_unlinked_dcrash_config(true),
+        "locks-unlinked-delegated-dcrash-nb" => locks_unlinked_dcrash_config(false),
+        "locks-unlinked-delegated-random" => locks_unlinked_random_config(false),
+        "locks-unlinked-delegated-dbackup-random" => locks_unlinked_random_config(true),
+        "locks-unlinked-delegated-blips" => locks_unlinked_blips_config(),
+        "locks-unlinked-delegated-partition" => locks_unlinked_partition_config(),
         "locks-released-delegated" => locks_released_delegated_config(),
         "locks-writes" => with_lock_writes(locks_config(), ""),
         "locks-delegated-writes" => with_lock_writes(locks_delegated_config(), "d2"),
@@ -4303,6 +4321,7 @@ struct M14Totals {
     renewals_served: u64,
     reclaimed: u64,
     moved: u64,
+    leaving_installed: u64,
     reinstated: u64,
     graces_inherited: u64,
     lost: u64,
@@ -4356,6 +4375,7 @@ impl M14Totals {
             self.renewals_served += s.lock_renewals_served;
             self.reclaimed += s.lock_reclaimed;
             self.moved += s.lock_moved;
+            self.leaving_installed += s.lock_leaving_installed;
             self.reinstated += s.lock_reinstated;
             self.graces_inherited += s.lock_graces_inherited;
             self.lost += s.lock_lost;
@@ -4817,6 +4837,164 @@ fn locks_survive_paused_nodes() {
         t.clients.fenced_ios > 0,
         "no paused holder was fenced: {t:?}"
     );
+}
+
+/// overload-cascade-2: lock files in a delegated subtree (`d1`, node 2)
+/// unlinked while other clients hold them open and locked, as
+/// `stress-ng`'s lock stressors do; every client keeps locking the
+/// unlinked inode, whose owner is the root by location from the unlink
+/// on. The delegate's grants on it go to the root with the batch that
+/// carries the unlink; the mutual-exclusion ghost and the turn checks
+/// (writes in `d2`) catch a root that grants over one it never got.
+fn locks_unlinked_delegated_config() -> SimConfig {
+    SimConfig {
+        lock_unlink_ratio: 0.2,
+        ..with_lock_writes(locks_delegated_config(), "d2")
+    }
+}
+
+/// overload-cascade-2 review round 2 (sweep only, seed 41 pinned):
+/// `locks-unlinked-delegated` with the root holder crashing at 1.5 s
+/// (back at 6.5 s with its journal), with or without the M9 backups.
+/// With them, node 2 (the delegate of `d1`) is often the root's backup:
+/// it takes the root over and ends its own generation, whose grants on
+/// unlinked inodes are now the root's.
+fn locks_unlinked_hcrash_config(backup: bool) -> SimConfig {
+    let base = locks_unlinked_delegated_config();
+    SimConfig {
+        core: if backup {
+            std::sync::Arc::new(sim::run::backup_core_config)
+        } else {
+            base.core.clone()
+        },
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CrashHolder {
+                restart_ms: Some(5_000),
+                keep_journal: true,
+            },
+        }],
+        ..base
+    }
+}
+
+/// The delegate of `d1` (node 2) dies at 1.5 s and is back at 10.5 s with
+/// its journal, with or without delegate backups: its streamed unlinks
+/// reach the root from its stream, its backup's drain or its journal.
+fn locks_unlinked_dcrash_config(backup: bool) -> SimConfig {
+    let base = locks_unlinked_delegated_config();
+    SimConfig {
+        core: if backup {
+            std::sync::Arc::new(sim::run::deleg_backup_core_config)
+        } else {
+            base.core.clone()
+        },
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CrashNode {
+                node: 2,
+                restart_ms: Some(9_000),
+                keep_journal: true,
+            },
+        }],
+        ..base
+    }
+}
+
+/// The CI's two random faults, with or without delegate backups.
+fn locks_unlinked_random_config(backup: bool) -> SimConfig {
+    let base = locks_unlinked_delegated_config();
+    SimConfig {
+        core: if backup {
+            std::sync::Arc::new(sim::run::deleg_backup_core_config)
+        } else {
+            base.core.clone()
+        },
+        random_faults: 2,
+        ..base
+    }
+}
+
+/// `locks-blips`' S3 outages and in-doubt lease PUTs.
+fn locks_unlinked_blips_config() -> SimConfig {
+    let c = locks_blips_config();
+    SimConfig {
+        ops_per_client: c.ops_per_client,
+        lock_ios: c.lock_ios,
+        lock_io_ms: c.lock_io_ms,
+        faults: c.faults,
+        ..locks_unlinked_delegated_config()
+    }
+}
+
+/// `locks-partition`'s cut lockers (plus its random fault).
+fn locks_unlinked_partition_config() -> SimConfig {
+    let c = locks_partition_config();
+    SimConfig {
+        random_faults: c.random_faults,
+        lock_ios: c.lock_ios,
+        lock_io_ms: c.lock_io_ms,
+        faults: c.faults,
+        ..locks_unlinked_delegated_config()
+    }
+}
+
+/// overload-cascade-2 review, must-fix 1: see
+/// [`locks_unlinked_delegated_config`]. Non-vacuous: the root installs
+/// grants that left a subtree with its unlink.
+#[test]
+fn locks_on_files_unlinked_in_a_delegated_subtree() {
+    let t = run_m14(
+        "locks-unlinked-delegated",
+        locks_unlinked_delegated_config(),
+        99_500..99_580,
+    );
+    assert!(t.grants > 300, "{t:?}");
+    assert!(
+        t.leaving_installed > 0,
+        "no grant ever left a subtree with its unlink: {t:?}"
+    );
+    assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
+    assert_eq!(t.clients.late_unacked_turns, 0, "{t:?}");
+}
+
+/// `locks-unlinked-delegated-hcrash-backup` seed 41 (this chunk's
+/// round-2 review): node 2, `d1`'s delegate and the root's backup,
+/// granted node 3 an exclusive lock on `lk0` and unlinked it; the root
+/// died before it applied that batch. Node 2 took the root over, ended
+/// its own inherited generation and dropped the grant (no grace covered
+/// the unlinked inode), then granted itself `lk0` under node 3's I/O.
+/// Now the grant stays in its table (`Core::drop_delegate_state`), and a
+/// subtree grace covers unlinked inodes (`Core::lock_in_grace`).
+#[test]
+fn regression_locks_unlinked_delegated_hcrash_backup_seed_41() {
+    run_seed(41, locks_unlinked_hcrash_config(true)).unwrap_or_else(|e| {
+        panic!(
+            "locks-unlinked-delegated-hcrash-backup seed 41: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-hcrash-backup"
+        )
+    });
+}
+
+/// `locks-unlinked-delegated` seeds 292 and 6475 (this chunk's first
+/// cut of the move): a recall and re-delegation left the grant in the
+/// root's handoff for the new generation, whose delegate executed the
+/// unlink before its first renewal — nothing to carry, and the root
+/// granted the unlinked inode over its own pending copy (now
+/// `Core::lock_take_back_left`); and a recall answer handed back the
+/// delegate's stale shared copy of a grant the root had upgraded to
+/// exclusive since the unlink, over the root's record (now the leaving
+/// path in `Core::lock_install_returned`).
+#[test]
+fn regression_locks_unlinked_delegated_seeds_292_6475() {
+    for seed in [292, 6_475] {
+        run_seed(seed, locks_unlinked_delegated_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-unlinked-delegated seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-unlinked-delegated"
+            )
+        });
+    }
 }
 
 /// Plan 30 §M14: lock files in a delegated subtree: the delegate owns the

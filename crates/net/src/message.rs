@@ -370,13 +370,16 @@ pub enum Payload {
     },
     /// Plan 30 §M11: a delegate streams its transactions of generation
     /// `gen` to the root (`txs`: postcard of
-    /// `Vec<constellation_meta::DelegateTx>`). Answered by
+    /// `Vec<constellation_meta::DelegateTx>`; `leaving`: postcard of
+    /// `Vec<constellation_meta::locks::Grant>`, the delegate's grants on
+    /// inodes the batch takes out of its subtree). Answered by
     /// [`Payload::DelegateStreamAck`].
     DelegateStream {
         from: u64,
         req_id: u64,
         gen: u64,
         txs: Vec<u8>,
+        leaving: Vec<u8>,
     },
     DelegateStreamAck {
         req_id: u64,
@@ -674,12 +677,22 @@ pub enum Payload {
     /// `listed: false` goes to a backup the holder dropped (its
     /// `candidacy`, as in [`Payload::BackupAppend`]): it stops watching
     /// instead of sealing a holder that dropped it. Answered with
-    /// [`Payload::Ok`].
+    /// [`Payload::HolderAliveAck`].
     HolderAlive {
         holder: u64,
         epoch: u64,
         candidacy: u64,
         listed: bool,
+    },
+    // ---- overload-cascade-2 ----
+    /// The answer to [`Payload::HolderAlive`]: whether the backup's own
+    /// authority driver is progressing (it is waiting for work, or its
+    /// current wake-up started within a bound). The holder gives a
+    /// backup that says so longer to acknowledge its appends; a backup
+    /// whose process answers while its core is stuck says no, and is
+    /// held to the ordinary acknowledgement timeout.
+    HolderAliveAck {
+        core_responsive: bool,
     },
 }
 

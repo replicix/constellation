@@ -907,6 +907,13 @@ impl LockTables {
         self.lock().grants.get(&id).copied()
     }
 
+    /// Whether this table ended `id` (released, or outwaited) and still
+    /// remembers so ([`Self::forget`]). A grant that moved out with a
+    /// delegation ([`Self::take_where`]) did not end here.
+    pub fn was_ended(&self, id: GrantId) -> bool {
+        self.lock().ended.contains_key(&id)
+    }
+
     /// Extend a known grant of `node` at its renewal (`now_ms`):
     /// `(mode, recalled)`, or `None` when unknown. The renewal confirms an
     /// installed copy from `now_ms` on ([`Grant::confirmed_ms`]).

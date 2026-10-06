@@ -127,6 +127,9 @@ struct GhostInner {
     seed: u64,
     files: Vec<String>,
     inos: Vec<u64>,
+    /// `SimConfig::lock_unlink_ratio`: the clients lock the inodes set at
+    /// setup, not what the names resolve to (they may be unlinked).
+    by_ino: bool,
     in_io: BTreeMap<u64, Vec<InIo>>,
     violations: Vec<String>,
     counters: LockCounters,
@@ -184,6 +187,16 @@ impl LockGhost {
             g.files = files.iter().map(|(n, _)| n.clone()).collect();
             g.inos = files.iter().map(|(_, i)| *i).collect();
         });
+    }
+
+    pub fn set_by_ino(&self, by_ino: bool) {
+        self.with(|g| g.by_ino = by_ino);
+    }
+
+    /// The inode lock file `i` had at setup, if the clients lock that
+    /// whatever its name resolves to now ([`Self::set_by_ino`]).
+    fn setup_ino(&self, i: usize) -> Option<u64> {
+        self.with(|g| (g.by_ino && !g.inos.is_empty()).then(|| g.inos[i % g.inos.len()]))
     }
 
     pub fn file(&self, i: usize) -> Option<String> {
@@ -600,8 +613,12 @@ pub async fn client_lock(
     ghost.count(|c| c.steps += 1);
     // The name on this node's replica (created at setup; a restarted
     // node has it in its journal).
-    let mut ino = None;
+    // Or the inode it had at setup, kept open (`set_by_ino`).
+    let mut ino = ghost.setup_ino(step.file);
     for _ in 0..200 {
+        if ino.is_some() {
+            break;
+        }
         let Some(h) = same(&cluster, node, inc) else {
             ghost.count(|c| c.abandoned += 1);
             return;

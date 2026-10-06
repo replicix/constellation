@@ -260,6 +260,14 @@ pub struct DriverDeps {
     /// applied segment so a foreign unlink of a locally open file is
     /// claimed within a round trip. `None` in tools and tests.
     pub holds: Option<Arc<crate::holds::Holds>>,
+    /// What the peer service shares with this driver off the core's
+    /// step ([`OffCore`]).
+    pub off_core: Arc<OffCore>,
+    /// The peer requests that must not queue behind the others
+    /// (`SyncRequest`s the peer service sends on [`OffCore`]'s lane:
+    /// renewals and the holder's heartbeat), served before the ordinary
+    /// requests. Taken by [`Driver::new`].
+    pub urgent_rx: Option<mpsc::UnboundedReceiver<SyncRequest>>,
 }
 
 /// Plan 30 §M7: frames queued for one log-stream subscriber, at most
@@ -277,6 +285,12 @@ pub fn log_stream_queue() -> usize {
 /// (`CONSTELLATION_LOG_STREAM_BUFFER_BYTES`, default 32 MiB). This is what
 /// keeps a slow WAN subscriber from slowing the holder: the holder never
 /// waits on a subscriber, it only ever enqueues or drops.
+/// The subscriber's frame backlog budget ([`Driver::log_permits`]): the
+/// holder's per-subscriber budget, as a semaphore's permit count.
+fn log_backlog_bytes() -> usize {
+    log_stream_buffer_bytes().min(u32::MAX as usize)
+}
+
 fn log_stream_buffer_bytes() -> usize {
     std::env::var("CONSTELLATION_LOG_STREAM_BUFFER_BYTES")
         .ok()
@@ -432,6 +446,10 @@ enum Internal {
         kind: TimerKind,
         deferred: bool,
     },
+    /// A log-stream frame (or its end), holding its bytes of the
+    /// subscriber's backlog budget ([`Driver::log_permits`]) until the core
+    /// has handled it.
+    Frame(Event, tokio::sync::OwnedSemaphorePermit),
 }
 
 /// Read the core's tunables from the environment (the `CONSTELLATION_*`
@@ -565,6 +583,11 @@ pub fn load_config(
     // whose renewal came a second late had its generation sealed and
     // drained by the root (`stress-ng-fs-nodes`). The price is the
     // reclaim of a dead delegate's subtree, after `ttl + margin`.
+    // With renewals that no longer starve (overload-cascade-2), 5 s still
+    // lapsed under `stress-ng-fs-nodes` (a delegate's own 0.5-0.8 s steps
+    // behind compactions against ~2.3 s grants) and 10 s passed 2 of 2 at
+    // load 35-65: a candidate for the default, kept at the lock TTL until
+    // it is measured under heavier load.
     c.delegation_ttl_ms = env_ms(
         "CONSTELLATION_DELEGATION_TTL_MS",
         c.lock_ttl_ms.max(c.delegation_ttl_ms),
@@ -688,6 +711,26 @@ pub struct Driver {
     inbox: InboxStore,
     int_tx: mpsc::UnboundedSender<Internal>,
     int_rx: mpsc::UnboundedReceiver<Internal>,
+    /// The bytes of the holder's log-stream frames this node's
+    /// subscriptions may have queued for the core at once: the holder's
+    /// budget for one subscriber's queue ([`log_stream_buffer_bytes`]).
+    /// A core behind by that much stops its subscription reading; the
+    /// holder's queue for it then fills and the holder drops it to S3
+    /// tailing — as it would a subscriber that far behind anyway. Below
+    /// it the frames are in arrival order with the replies and timers on
+    /// the internal channel, as they always were.
+    ///
+    /// overload-cascade-2 tried two smaller bounds, each worse than
+    /// none. A lane of 64 frames of its own, served after the internal
+    /// channel, starved while that channel was never empty: the stream
+    /// watchdog (a timer on it) found the stream silent with frames
+    /// waiting and dropped it. 64 frames on the internal channel were
+    /// seconds of lag at most: under a load spike both non-holders were
+    /// dropped at once ("queue full"), tailed S3 in seconds-long
+    /// `SegmentRun` steps, and each, the other's delegate backup, could
+    /// not acknowledge appends whose deps its replica no longer reached —
+    /// both delegates' writes waited 107 s (`stress-ng-fs-nodes`).
+    log_permits: Arc<tokio::sync::Semaphore>,
     sync_tx: mpsc::UnboundedSender<SyncRequest>,
     sync_rx: mpsc::UnboundedReceiver<SyncRequest>,
     replies: HashMap<Rid, oneshot::Sender<ClientReply>>,
@@ -733,7 +776,11 @@ pub struct Driver {
     /// refresh), and the driver loop's progress stamp: see
     /// [`holder_alive_task`].
     alive: Arc<Mutex<Option<AliveTargets>>>,
-    busy_since: Arc<std::sync::atomic::AtomicI64>,
+    /// The urgent lane ([`DriverDeps::urgent_rx`]); `None` once closed.
+    urgent_rx: Option<mpsc::UnboundedReceiver<SyncRequest>>,
+    /// The holders' liveness handed to the core so far
+    /// ([`fresh_heard`]).
+    heard_handed: HashMap<NodeId, (u64, i64)>,
     /// The thread the driver loop runs on now (its tokio worker), for the
     /// stuck-driver backtrace.
     loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
@@ -877,14 +924,16 @@ fn alive_tick(t: Option<&AliveTargets>, now: i64, busy_since: i64, stall: i64) -
 /// (`stress-ng-fs-nodes`). This task beats every backup heartbeat
 /// interval while the node holds an unexpired lease and the driver loop
 /// has progressed within [`holder_stall_ms`]; a backup counts a beat as
-/// it counts an append (`Event::HolderAlive`). A backup that answers is
-/// alive, whatever its own core is doing: the core hears so
-/// (`Event::BackupAlive`) and gives it longer to acknowledge. It runs for
-/// as long as [`Driver::run`] does ([`AliveTask`]).
+/// it counts an append (`Event::HolderAlive`), from its arrival
+/// ([`OffCore`]). A backup that answers that its own driver is
+/// progressing ([`OffCore::core_responsive`]) is alive: the core hears so
+/// (`Event::BackupAlive`) and gives it longer to acknowledge; one whose
+/// driver is stuck answers so, and gets the ordinary acknowledgement
+/// timeout. It runs for as long as [`Driver::run`] does ([`AliveTask`]).
 async fn holder_alive_task(
     peers: constellation_net::Peers,
     alive: Arc<Mutex<Option<AliveTargets>>>,
-    busy_since: Arc<std::sync::atomic::AtomicI64>,
+    off_core: Arc<OffCore>,
     every: Duration,
     node_id: NodeId,
     core: mpsc::UnboundedSender<Internal>,
@@ -893,35 +942,42 @@ async fn holder_alive_task(
     let stall = holder_stall_ms();
     let backtraces = constellation_vfs::watch::backtraces_from_env();
     let mut stalled = false;
-    // Beats still waiting for their answer: one per peer at a time.
-    let pending: Arc<Mutex<std::collections::HashSet<NodeId>>> = Arc::default();
+    let cap = beats_outstanding_max(every);
+    // Beats still waiting for their answer, per peer.
+    let pending: Arc<Mutex<HashMap<NodeId, usize>>> = Arc::default();
     loop {
         tokio::time::sleep(every).await;
         let targets = alive.lock().unwrap().clone();
-        let tick = alive_tick(
-            targets.as_ref(),
-            now_unix_ms(),
-            busy_since.load(Ordering::Relaxed),
-            stall,
-        );
+        let busy = off_core.busy_since();
+        let now = now_unix_ms();
+        let tick = alive_tick(targets.as_ref(), now, busy, stall);
         // Whether or not this node holds a lease: a driver stuck this
         // long is reported (with the thread's backtrace under
         // `CONSTELLATION_FUSE_STALL_BACKTRACE=1`).
-        let busy = busy_since.load(Ordering::Relaxed);
-        let stuck_ms = now_unix_ms() - busy;
+        let stuck_ms = now - busy;
         let hung = busy != 0 && stuck_ms > stall;
         if hung != stalled {
             stalled = hung;
             if hung {
                 let thread = *loop_thread.lock().unwrap();
-                tracing::warn!(
-                    node = node_id,
-                    stuck_ms,
-                    tid = thread.tid,
-                    holding = targets.is_some(),
-                    "the authority driver has made no progress (a holder sends no more liveness \
-                     heartbeats: its backups will seal this tenure)"
-                );
+                if targets.is_some() {
+                    tracing::warn!(
+                        node = node_id,
+                        stuck_ms,
+                        tid = thread.tid,
+                        holding = true,
+                        "the authority driver has made no progress (this holder sends no more \
+                         liveness heartbeats: its backups will seal this tenure)"
+                    );
+                } else {
+                    tracing::warn!(
+                        node = node_id,
+                        stuck_ms,
+                        tid = thread.tid,
+                        holding = false,
+                        "the authority driver has made no progress"
+                    );
+                }
                 if backtraces
                     && constellation_platform::native()
                         .process
@@ -938,7 +994,7 @@ async fn holder_alive_task(
             continue;
         };
         for (to, candidacy, listed) in beats {
-            if crate::fault::p2p_denied(to) || !pending.lock().unwrap().insert(to) {
+            if crate::fault::p2p_denied(to) || !beat_slot(&mut pending.lock().unwrap(), to, cap) {
                 continue;
             }
             let payload = Payload::HolderAlive {
@@ -955,15 +1011,25 @@ async fn holder_alive_task(
             // takes its time): a request that times out marks the peer's
             // link down in the directory, and timing beats out at the
             // interval had the holder removing a live backup for "link
-            // down". The next beat to the peer waits for this one.
+            // down". So a beat waits `BEAT_TIMEOUT` for its answer, and
+            // the next ones go out meanwhile, every interval, up to
+            // `beats_outstanding_max` (one beat in flight per peer, as
+            // before, silenced the heartbeat for as long as one answer
+            // took: up to 5 s against the backup's 1.5 s watch).
             tokio::spawn(async move {
                 let answered = tokio::time::timeout(
                     BEAT_TIMEOUT,
                     peers.request_to_node_timeout(to, &payload, BEAT_TIMEOUT),
                 )
                 .await;
-                pending.lock().unwrap().remove(&to);
-                if listed && matches!(answered, Ok(Ok(_))) {
+                beat_done(&mut pending.lock().unwrap(), to);
+                let responsive = matches!(
+                    answered,
+                    Ok(Ok(Payload::HolderAliveAck {
+                        core_responsive: true
+                    }))
+                );
+                if listed && responsive {
                     let _ = core.send(Internal::Event(Event::BackupAlive { from: to, at }));
                 }
             });
@@ -973,6 +1039,36 @@ async fn holder_alive_task(
 
 /// How long one beat of [`holder_alive_task`] waits for its answer.
 const BEAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most beats of [`holder_alive_task`] in flight to one peer: a new
+/// one every interval for as long as one waits for its answer
+/// ([`BEAT_TIMEOUT`]), so a slow answer never delays the next beat, and
+/// no more (a peer that answers nothing costs a bounded number of
+/// requests).
+fn beats_outstanding_max(every: Duration) -> usize {
+    let every = every.as_millis().max(1);
+    (BEAT_TIMEOUT.as_millis().div_ceil(every) as usize).clamp(1, 64)
+}
+
+/// Take a beat slot for `to` if fewer than `cap` are in flight.
+fn beat_slot(pending: &mut HashMap<NodeId, usize>, to: NodeId, cap: usize) -> bool {
+    let n = pending.entry(to).or_default();
+    if *n >= cap {
+        return false;
+    }
+    *n += 1;
+    true
+}
+
+/// A beat to `to` was answered (or timed out).
+fn beat_done(pending: &mut HashMap<NodeId, usize>, to: NodeId) {
+    if let Some(n) = pending.get_mut(&to) {
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            pending.remove(&to);
+        }
+    }
+}
 
 /// [`holder_alive_task`] for the life of [`Driver::run`]: dropped when
 /// `run` returns or its task dies, it stops the beats and forgets the
@@ -991,23 +1087,121 @@ impl Drop for AliveTask {
     }
 }
 
-/// Timers that measure a peer's silence (a reply, an append, a renewal
-/// that did not come): handled after the requests that reached this node
-/// before they fired ([`Driver::run`]), so this node's own stall is not
-/// taken for the peer's. That includes the expiries an owner keeps for a
-/// grant it handed out (a lock grant, a delegation, a read delegation):
-/// they outwait the holder's renewal, and handling a renewal that is
-/// already queued first only makes the owner wait longer before it acts
-/// on the expiry — the holder honours its grant from its own send time,
-/// so a later expiry is never unsafe (before, the owner dropped the grant
-/// and answered the queued renewal `Lost`). Every other timer (a renewal
-/// to send, a tick, a deadline this node keeps for itself) is handled in
-/// turn, never behind the backlog.
+/// What this node's peer service (`crate::p2p::P2pBridge`) and its
+/// authority driver share outside the core's step, where a slow step
+/// cannot delay it:
+///
+/// - **When each holder was last heard from**, as a backup: the arrival
+///   of its latest heartbeat (`HolderAlive`) or append, by holder and
+///   epoch. The core's seal watch measures the holder's silence; fed
+///   only by the events it handled, it measured this node's own backlog
+///   too — a backup whose steps took seconds sealed a live holder that
+///   was sending to it the whole time (`silent_ms=21872`). The driver
+///   hands the latest arrivals to the core right before the watch is
+///   evaluated ([`Driver::hand_heard`]).
+/// - **The driver loop's progress stamp** (unix ms of its last wake-up or
+///   step, 0 while it waits for work): the holder stops its heartbeat
+///   when its own loop is stuck ([`holder_alive_task`]), and a backup
+///   answers a heartbeat with whether its loop is
+///   ([`OffCore::core_responsive`]).
+#[derive(Debug)]
+pub struct OffCore {
+    busy_since: std::sync::atomic::AtomicI64,
+    /// holder → (its latest epoch heard, the latest arrival at it).
+    heard: Mutex<HashMap<NodeId, (u64, i64)>>,
+    responsive_ms: i64,
+}
+
+impl OffCore {
+    /// `responsive_ms`: the longest the driver loop may be inside one
+    /// wake-up and still count as responsive ([`Self::core_responsive`]).
+    pub fn new(responsive_ms: u64) -> Self {
+        Self {
+            busy_since: std::sync::atomic::AtomicI64::new(0),
+            heard: Mutex::new(HashMap::new()),
+            responsive_ms: responsive_ms.max(1) as i64,
+        }
+    }
+
+    /// The default for a node with `config`: half the holder's bound for
+    /// a slow backup (`backup_slow_max_ms`, 10 s: 5 s). A backup whose
+    /// steps take seconds (an overloaded host) is responsive and kept
+    /// that long; one whose loop is stuck in one wake-up longer answers
+    /// that it is not, and is removed at the ordinary acknowledgement
+    /// timeout instead of being waited for.
+    pub fn for_config(config: &Config) -> Self {
+        Self::new(config.backup_slow_max_ms / 2)
+    }
+
+    pub(crate) fn set_busy(&self, at_unix_ms: i64) {
+        self.busy_since.store(at_unix_ms, Ordering::Relaxed);
+    }
+
+    pub(crate) fn busy_since(&self) -> i64 {
+        self.busy_since.load(Ordering::Relaxed)
+    }
+
+    /// Whether the driver loop is waiting for work or has progressed
+    /// within `responsive_ms`.
+    pub(crate) fn core_responsive(&self, now_unix_ms: i64) -> bool {
+        let busy = self.busy_since();
+        busy == 0 || now_unix_ms - busy <= self.responsive_ms
+    }
+
+    /// The holder `holder` was heard from at `epoch` (a heartbeat or an
+    /// append arrived) at `at_unix_ms`. An older epoch's is ignored.
+    pub(crate) fn note_holder_heard(&self, holder: NodeId, epoch: u64, at_unix_ms: i64) {
+        let mut heard = self.heard.lock().unwrap();
+        let e = heard.entry(holder).or_insert((epoch, at_unix_ms));
+        if epoch > e.0 {
+            *e = (epoch, at_unix_ms);
+        } else if epoch == e.0 {
+            e.1 = e.1.max(at_unix_ms);
+        }
+    }
+
+    fn heard(&self) -> HashMap<NodeId, (u64, i64)> {
+        self.heard.lock().unwrap().clone()
+    }
+}
+
+/// The holders heard from since what was handed to the core
+/// (`handed`, updated): `(holder, epoch, arrival)`.
+fn fresh_heard(
+    heard: HashMap<NodeId, (u64, i64)>,
+    handed: &mut HashMap<NodeId, (u64, i64)>,
+) -> Vec<(NodeId, u64, i64)> {
+    let mut fresh: Vec<(NodeId, u64, i64)> = heard
+        .into_iter()
+        .filter(|(holder, now)| handed.get(holder).is_none_or(|was| now > was))
+        .map(|(holder, (epoch, at))| (holder, epoch, at))
+        .collect();
+    fresh.sort_unstable();
+    for &(holder, epoch, at) in &fresh {
+        handed.insert(holder, (epoch, at));
+    }
+    fresh
+}
+
+/// An owner's expiry of a grant it handed out (a lock grant, a
+/// delegation): it outwaits the holder's renewal, which reaches the
+/// driver on the urgent lane ([`DriverDeps::urgent_rx`]); what was
+/// queued there when it fired is handled first ([`Driver::run`]).
+fn waits_for_renewals(kind: TimerKind) -> bool {
+    matches!(kind, TimerKind::LockGrantExpiry | TimerKind::DelegExpiry)
+}
+
+/// A timer that measures a peer's silence: it is handled after the
+/// requests and peer messages that reached this node before it fired
+/// (the internal channel is served first, so after a long step a due
+/// timer overtook them), for at most [`SILENCE_DRAIN_BUDGET`]. Not the
+/// backup's seal watch: it decides on the holder's arrival stamps
+/// ([`Driver::hand_heard`]), which no backlog delays, and a drain only
+/// made it later.
 fn measures_silence(kind: TimerKind) -> bool {
     matches!(
         kind,
-        TimerKind::BackupWatch
-            | TimerKind::ForwardTimeout
+        TimerKind::ForwardTimeout
             | TimerKind::JobRequestTimeout
             | TimerKind::ReadIndexTimeout
             | TimerKind::LockRequestTimeout
@@ -1061,10 +1255,11 @@ impl Driver {
     /// Build the driver; `run` drives it. `sync_tx` is what the rest of
     /// the daemon sends `SyncRequest`s on.
     pub fn new(
-        deps: DriverDeps,
+        mut deps: DriverDeps,
         sync_tx: mpsc::UnboundedSender<SyncRequest>,
         sync_rx: mpsc::UnboundedReceiver<SyncRequest>,
     ) -> Self {
+        let urgent_rx = deps.urgent_rx.take();
         let node_id = deps.config.node_id;
         let core = Core::new(deps.config.clone());
         let leases = LeaseStore::new(deps.store_inner.clone(), PARTITION, deps.lease_mode);
@@ -1081,6 +1276,7 @@ impl Driver {
             inbox,
             int_tx,
             int_rx,
+            log_permits: Arc::new(tokio::sync::Semaphore::new(log_backlog_bytes())),
             sync_tx,
             sync_rx,
             replies: HashMap::new(),
@@ -1108,7 +1304,8 @@ impl Driver {
             bulk_pass: BulkPass::default(),
             round_upload_wait: round_upload_wait(),
             alive: Arc::default(),
-            busy_since: Arc::default(),
+            urgent_rx,
+            heard_handed: HashMap::new(),
             loop_thread: Arc::new(Mutex::new(
                 constellation_platform::process::ThreadRef::unknown(),
             )),
@@ -1203,7 +1400,7 @@ impl Driver {
             task: tokio::spawn(holder_alive_task(
                 self.deps.peers.clone(),
                 self.alive.clone(),
-                self.busy_since.clone(),
+                self.deps.off_core.clone(),
                 Duration::from_millis(self.core.config().backup_heartbeat_ms.max(1)),
                 self.node_id,
                 self.int_tx.clone(),
@@ -1218,19 +1415,32 @@ impl Driver {
         }
         loop {
             // Waiting for work is not being stuck (`holder_alive_task`).
-            self.busy_since.store(0, Ordering::Relaxed);
+            self.deps.off_core.set_busy(0);
+            let urgent_open = self.urgent_rx.is_some();
             let wake = tokio::select! {
                 biased;
                 msg = self.int_rx.recv() => match msg {
                     Some(m) => Wake::Internal(m),
                     None => break,
                 },
+                req = async {
+                    match self.urgent_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => None,
+                    }
+                }, if urgent_open => match req {
+                    Some(req) => Wake::Request(req),
+                    None => {
+                        self.urgent_rx = None;
+                        continue;
+                    }
+                },
                 req = self.sync_rx.recv() => match req {
                     Some(req) => Wake::Request(req),
                     None => break,
                 },
             };
-            self.busy_since.store(now_unix_ms(), Ordering::Relaxed);
+            self.deps.off_core.set_busy(now_unix_ms());
             *self.loop_thread.lock().unwrap() =
                 constellation_platform::native().process.current_thread();
             let internal = match wake {
@@ -1240,17 +1450,40 @@ impl Driver {
                     None => continue,
                 },
             };
-            // A silence timer is handled after what reached this node
-            // before it fired: the requests and peer messages queued
-            // meanwhile (the internal channel is served first, so after a
-            // long step a due timer overtook them). It measures the peer's
-            // silence, not this node's own stall: a backup's seal watch
-            // fired with the holder's heartbeats sitting in the queue.
-            // Bounded: past `SILENCE_DRAIN_BUDGET` the timer goes back
-            // behind whatever else is due (once), so the proactive timers
-            // and S3 completions on the internal channel never wait out
-            // the backlog.
-            if let Internal::Timer { id, kind, deferred } = internal {
+            if let Internal::Timer { id, kind, deferred } = &internal {
+                let (id, kind, deferred) = (*id, *kind, *deferred);
+                // A backup's seal watch decides on when the holder was last
+                // heard from — its beats' and appends' arrival here, not
+                // when this node's core got to them: a backup whose steps
+                // took seconds sealed a live holder `silent_ms=21872` in
+                // with its appends queued (`stress-ng-fs-nodes`).
+                if kind == TimerKind::BackupWatch {
+                    self.hand_heard();
+                }
+                // An owner's expiry of a grant it handed out goes after
+                // the renewals that reached this node before it fired (the
+                // urgent lane: a handful, cheap): handled first, they only
+                // make the owner wait longer, and the holder honours its
+                // grant from its own send, so a later expiry is never
+                // unsafe (before, the owner dropped the grant and answered
+                // the queued renewal `Lost`).
+                if waits_for_renewals(kind) {
+                    while let Some(req) = self.urgent_rx.as_mut().and_then(|rx| rx.try_recv().ok())
+                    {
+                        if let Some(earlier) = self.on_request(req) {
+                            self.step(earlier);
+                        }
+                        if self.core.stopped() {
+                            return;
+                        }
+                    }
+                }
+                // Other silence timers go after the ordinary requests
+                // queued when they fired, as before (bounded: past
+                // `SILENCE_DRAIN_BUDGET` the timer goes back behind
+                // whatever else is due, once, so the proactive timers and
+                // S3 completions on the internal channel never wait out
+                // the backlog).
                 if measures_silence(kind) {
                     let pending = self.sync_rx.len();
                     let drained = drain_queued(pending, SILENCE_DRAIN_BUDGET, || {
@@ -1281,11 +1514,33 @@ impl Driver {
         }
     }
 
+    /// Hand the core the holders heard from since the last hand-off
+    /// ([`OffCore`]), as heartbeats at their arrival: the seal watch then
+    /// measures the holder's silence, not this node's backlog.
+    fn hand_heard(&mut self) {
+        let heard = self.deps.off_core.heard();
+        for (from, epoch, at) in fresh_heard(heard, &mut self.heard_handed) {
+            self.step(Internal::Event(Event::HolderAlive {
+                from,
+                epoch,
+                candidacy: 0,
+                listed: true,
+                at: Ms(at),
+            }));
+        }
+    }
+
     /// One core step: the event, the mirror refresh, the actions.
     fn step(&mut self, internal: Internal) {
         let waited_us = self.step_end.elapsed().as_micros() as u64;
+        // A frame's permit goes once the step is done.
+        let mut _frame = None;
         let event = match internal {
             Internal::Event(event) => event,
+            Internal::Frame(event, permit) => {
+                _frame = Some(permit);
+                event
+            }
             Internal::Control { req, reply } => {
                 let op = self.control_id();
                 self.controls.insert(op, reply);
@@ -1297,8 +1552,8 @@ impl Driver {
             .last_sync_ms
             .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
         let kind = event_kind(&event);
-        // Progress (a drain runs several steps in one wake-up).
-        self.busy_since.store(now_unix_ms(), Ordering::Relaxed);
+        // Progress (a wake-up may run several steps).
+        self.deps.off_core.set_busy(now_unix_ms());
         let started = std::time::Instant::now();
         let int_pending = self.int_rx.len();
         let sync_pending = self.sync_rx.len();
@@ -1769,13 +2024,19 @@ impl Driver {
                 from,
                 gen,
                 txs,
+                leaving,
                 reply,
             } => {
                 let req = self.control_id();
                 self.deleg_stream_replies.insert(req, reply);
                 Some(Internal::Event(Event::Peer {
                     from,
-                    msg: PeerMsg::DelegateStream { req, gen, txs },
+                    msg: PeerMsg::DelegateStream {
+                        req,
+                        gen,
+                        txs,
+                        leaving,
+                    },
                 }))
             }
             SyncRequest::PeerDelegRenew {
@@ -2942,12 +3203,18 @@ impl Driver {
                     }
                 });
             }
-            PeerMsg::DelegateStream { req, gen, txs } => {
+            PeerMsg::DelegateStream {
+                req,
+                gen,
+                txs,
+                leaving,
+            } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
                 let from = self.node_id;
                 let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
                 let bytes = postcard::to_allocvec(&txs).unwrap_or_default();
+                let leaving = postcard::to_allocvec(&leaving).unwrap_or_default();
                 if crate::fault::p2p_denied(to) {
                     let _ = tx.send(Internal::Event(Event::PeerFailed {
                         req,
@@ -2962,6 +3229,7 @@ impl Driver {
                         req_id: req.0,
                         gen,
                         txs: bytes,
+                        leaving,
                     };
                     let reply = tokio::time::timeout(
                         timeout,
@@ -3830,6 +4098,7 @@ impl Driver {
     fn spawn_subscription(&mut self, to: NodeId, req: OpId, from: u64) {
         self.subscriptions.retain(|_, h| !h.is_finished());
         let tx = self.int_tx.clone();
+        let permits = self.log_permits.clone();
         let peers = self.deps.peers.clone();
         let handle = tokio::spawn(async move {
             let mut rx = match peers.subscribe_log(to, req.0, from).await {
@@ -3847,7 +4116,17 @@ impl Driver {
                 }
             };
             let mut ended = false;
+            let budget = log_backlog_bytes() as u32;
             while let Some(event) = rx.recv().await {
+                // Its bytes of the backlog budget (at least one permit, at
+                // most the whole budget).
+                let cost = match &event {
+                    LogEvent::Frame {
+                        segment: Some((_, bytes)),
+                        ..
+                    } => (bytes.len().min(budget as usize) as u32).max(1),
+                    _ => 1,
+                };
                 let msg = match event {
                     LogEvent::Frame {
                         n,
@@ -3878,8 +4157,14 @@ impl Driver {
                         PeerMsg::LogStreamEnd { req, refused }
                     }
                 };
+                // Bounded ([`Driver::log_permits`]): a core that far behind
+                // the stream stops this read, the holder's queue for this
+                // node fills, and the holder drops it to S3 tailing.
+                let Ok(permit) = permits.clone().acquire_many_owned(cost).await else {
+                    return;
+                };
                 if tx
-                    .send(Internal::Event(Event::Peer { from: to, msg }))
+                    .send(Internal::Frame(Event::Peer { from: to, msg }, permit))
                     .is_err()
                 {
                     return;
@@ -5328,28 +5613,101 @@ mod tests {
         assert!(alive.lock().unwrap().is_none(), "targets kept");
     }
 
+    /// A backup's seal watch is handed the holder's latest arrival, not
+    /// what its core got to: the peer service notes each heartbeat and
+    /// append as it arrives, and the driver hands the core what is newer
+    /// than it handed before (once per arrival; a newer epoch replaces an
+    /// older one, an older epoch's late arrival is ignored).
+    #[test]
+    fn the_seal_watch_is_handed_the_holders_latest_arrival() {
+        use super::{fresh_heard, OffCore};
+        let off = OffCore::new(5_000);
+        let mut handed = std::collections::HashMap::new();
+        assert!(fresh_heard(off.heard(), &mut handed).is_empty());
+        off.note_holder_heard(1, 4, 1_000);
+        off.note_holder_heard(1, 4, 1_300);
+        off.note_holder_heard(1, 4, 1_200);
+        off.note_holder_heard(2, 7, 900);
+        assert_eq!(
+            fresh_heard(off.heard(), &mut handed),
+            vec![(1, 4, 1_300), (2, 7, 900)]
+        );
+        assert!(
+            fresh_heard(off.heard(), &mut handed).is_empty(),
+            "handed twice"
+        );
+        off.note_holder_heard(1, 4, 1_600);
+        off.note_holder_heard(1, 3, 9_000);
+        assert_eq!(fresh_heard(off.heard(), &mut handed), vec![(1, 4, 1_600)]);
+        off.note_holder_heard(1, 5, 1_500);
+        assert_eq!(fresh_heard(off.heard(), &mut handed), vec![(1, 5, 1_500)]);
+    }
+
+    /// A backup answers the holder's heartbeat with whether its own
+    /// driver is progressing: waiting for work, or inside a wake-up
+    /// shorter than the bound — not a hung one.
+    #[test]
+    fn a_backup_answers_its_heartbeat_with_its_own_drivers_progress() {
+        use super::OffCore;
+        let off = OffCore::new(5_000);
+        assert!(off.core_responsive(100_000), "idle");
+        off.set_busy(100_000);
+        assert!(off.core_responsive(104_000), "a slow step");
+        assert!(off.core_responsive(105_000));
+        assert!(!off.core_responsive(105_001), "stuck");
+        off.set_busy(0);
+        assert!(off.core_responsive(200_000), "idle again");
+    }
+
+    /// The heartbeat goes out every interval however long earlier beats
+    /// wait for their answers, up to as many as fit in one beat's
+    /// timeout per peer; an answer frees a slot.
+    #[test]
+    fn beats_go_out_every_interval_up_to_a_cap_per_peer() {
+        use super::{beat_done, beat_slot, beats_outstanding_max};
+        use std::time::Duration;
+        assert_eq!(beats_outstanding_max(Duration::from_millis(300)), 17);
+        assert_eq!(beats_outstanding_max(Duration::from_secs(60)), 1);
+        assert_eq!(beats_outstanding_max(Duration::ZERO), 64);
+        let mut pending = std::collections::HashMap::new();
+        for _ in 0..3 {
+            assert!(beat_slot(&mut pending, 2, 3));
+        }
+        assert!(!beat_slot(&mut pending, 2, 3), "past the cap");
+        assert!(beat_slot(&mut pending, 3, 3), "another peer");
+        beat_done(&mut pending, 2);
+        assert!(beat_slot(&mut pending, 2, 3));
+        for _ in 0..3 {
+            beat_done(&mut pending, 2);
+        }
+        assert!(!pending.contains_key(&2));
+    }
+
     /// Only timers that measure a peer's silence (owners' grant expiries
     /// included) wait for the backlog that reached the node before they
-    /// fired; renewals, ticks and this node's own deadlines never do. The drain handles what was queued in
-    /// order, stops at the budget (the timer then goes back behind what
-    /// else is due) and at a stopped core.
+    /// fired; renewals, ticks and this node's own deadlines never do, nor
+    /// the backup's seal watch, which decides on the holder's arrival
+    /// stamps. The drain handles what was queued in order, stops at the
+    /// budget (the timer then goes back behind what else is due) and at a
+    /// stopped core.
     #[test]
     fn only_silence_timers_wait_for_the_backlog_and_only_so_long() {
         use super::{drain_queued, measures_silence, Drained};
         use constellation_authority::TimerKind;
         use std::time::Duration;
         for kind in [
-            TimerKind::BackupWatch,
             TimerKind::ForwardTimeout,
             TimerKind::JobRequestTimeout,
             TimerKind::LockRequestTimeout,
             TimerKind::LockRenewTimeout,
             TimerKind::LockGrantExpiry,
             TimerKind::DelegExpiry,
+            TimerKind::StreamWatchdog,
         ] {
             assert!(measures_silence(kind), "{kind:?}");
         }
         for kind in [
+            TimerKind::BackupWatch,
             TimerKind::LockRenewTick,
             TimerKind::DelegRenew,
             TimerKind::BackupTick,
@@ -5389,6 +5747,28 @@ mod tests {
             drain_queued(5, Duration::from_secs(5), || Some(false)),
             Drained::Stopped
         );
+    }
+
+    /// Only an owner's expiries of grants it handed out wait for the
+    /// renewals queued on the urgent lane; every other timer is handled
+    /// in turn.
+    #[test]
+    fn only_grant_expiries_wait_for_queued_renewals() {
+        use super::waits_for_renewals;
+        use constellation_authority::TimerKind;
+        for kind in [TimerKind::LockGrantExpiry, TimerKind::DelegExpiry] {
+            assert!(waits_for_renewals(kind), "{kind:?}");
+        }
+        for kind in [
+            TimerKind::BackupWatch,
+            TimerKind::LockRenewTick,
+            TimerKind::LockRenewTimeout,
+            TimerKind::DelegRenew,
+            TimerKind::ForwardTimeout,
+            TimerKind::BackupTick,
+        ] {
+            assert!(!waits_for_renewals(kind), "{kind:?}");
+        }
     }
 
     /// Two standalone drivers in one process whose cores reach a rebuild

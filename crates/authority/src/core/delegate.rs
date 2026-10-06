@@ -216,7 +216,49 @@ pub(crate) struct DelegateState {
     /// `deleg_request_timeout_ms`, not waited for forever.
     pub inflight_at: Ms,
     pub backup_inflight_at: Ms,
+    /// The root tenure this generation streams to, as this node counts
+    /// them: bumped at every re-stream to a new root. A late stream
+    /// acknowledgement counts only from the tenure its batch went to
+    /// ([`LateReq::round`]).
+    pub stream_round: u64,
+    /// The last batch sent carried this generation's grants on these
+    /// inodes out of the subtree (`Core::deleg_leaving_grants`); its last
+    /// index. Dropped from this table once the root acknowledged it.
+    pub leaving: Option<(u64, Vec<Ino>)>,
 }
+
+/// A request [`Core::deleg_expire_inflight`] gave up waiting for. The
+/// timeout re-sends what may have been lost (a partition drops a message
+/// with no transport failure); it says nothing about the answer to the
+/// first send, which a loaded peer gives late, not never. Thrown away,
+/// as it was, an answer later than the timeout never counted: under
+/// `stress-ng-fs-nodes` the root took over 500 ms to answer a delegate's
+/// batch, every answer arrived after its batch had been re-sent, and the
+/// stream re-sent the same batch every half second for minutes with the
+/// root holding every row — every op parked on it waited, and a delegate
+/// whose renewal answers all came late lapsed. A late answer is used
+/// for what it can only add: a stream acknowledgement from the root
+/// still streamed to, a backup's acknowledgement from the backup still
+/// appended to, a granted renewal (honoured from its own send).
+#[derive(Debug, Clone, Copy)]
+struct LateReq {
+    gen: u64,
+    kind: ReqKind,
+    /// The root or backup it went to.
+    to: Option<NodeId>,
+    /// A stream batch: the root tenure it went to
+    /// ([`DelegateState::stream_round`]). A root that changed and came
+    /// back (R → R2 → R) is the same node, not the same stream: the
+    /// re-stream to R2 restarted from what the log carries, and R's late
+    /// answer for its first tenure would claim rows R2's tenure never got
+    /// (long-delegated-backup seed 75504's class).
+    round: u64,
+    /// This node's clock at the send.
+    sent: Ms,
+}
+
+/// How long a late answer is still used ([`LateReq`]).
+const LATE_ANSWER_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReqKind {
@@ -235,6 +277,7 @@ impl DelegationState {
             ("dl_gens", self.gens.len()),
             ("dl_mine", self.mine.len()),
             ("dl_by_req", self.by_req.len()),
+            ("dl_late", self.late.len()),
             ("dl_pending_exec", self.pending_exec.len()),
             (
                 "dl_parked",
@@ -257,6 +300,10 @@ pub(crate) struct DelegationState {
     pub backing: BTreeMap<u64, (NodeId, u64)>,
     pub sealed: BTreeSet<u64>,
     by_req: BTreeMap<OpId, (u64, ReqKind)>,
+    /// Stream batches, backup appends and renewals that
+    /// `deleg_expire_inflight` stopped waiting for: their answer may
+    /// still come, and is used when it does (`LateReq`).
+    late: BTreeMap<OpId, LateReq>,
     /// Local ops whose execution waits for a recall or for `deps` (their
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
@@ -444,6 +491,8 @@ impl Core {
                     renew_backup: None,
                     inflight_at: Ms(0),
                     backup_inflight_at: Ms(0),
+                    stream_round: 0,
+                    leaving: None,
                 },
             );
             if d.designated {
@@ -574,8 +623,29 @@ impl Core {
         // did, or without one) are dropped — their holders keep
         // honouring them: the root reinstated its copies of what it
         // handed, and an outwaited generation's own grants were capped
-        // by its tenure.
-        let dropped = self.lock_take_generation(gen, replica);
+        // by its tenure. Unless this node is the root: then those on
+        // inodes that are the root's now (the subtree's, or unlinked
+        // under their lock) are this table's own, as a delegate's batch
+        // carries them ([`Core::lock_install_leaving`]). Dropped, nobody
+        // had them, and no grace covers an unlinked inode (sim
+        // `locks-unlinked-delegated-hcrash-backup` seed 41: the root's
+        // backup and `d1`'s delegate took the root over, ended its own
+        // inherited generation, and granted itself an unlinked inode
+        // node 3 still held exclusively).
+        let mut dropped = self.lock_take_generation(gen, replica);
+        if self.lease.held.is_some() && !self.lease.lost {
+            let (kept, rest): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|g| {
+                g.until_ms > now.0
+                    && matches!(
+                        replica.resolve_ownership(&Self::read_keys(g.ino, None)),
+                        constellation_meta::delegation::Ownership::Root
+                    )
+            });
+            dropped = rest;
+            if !kept.is_empty() {
+                self.lock_install_leaving(now, gen, kept, replica);
+            }
+        }
         if !dropped.is_empty() {
             tracing::info!(
                 node = self.me(),
@@ -1049,6 +1119,15 @@ impl Core {
                 );
             }
         }
+        if !chosen.is_empty() {
+            // A late answer from an earlier stint of the same peer as this
+            // generation's backup counts nothing for this one, which
+            // starts from 0 (as a late stream acknowledgement across a
+            // root change, `deleg_after_event`).
+            self.dl
+                .late
+                .retain(|_, l| !(l.kind == ReqKind::BackupAppend && chosen.contains(&l.gen)));
+        }
         for gen in chosen {
             // The root learns the backup from a renewal (it seals it when
             // this delegate falls silent): send one now.
@@ -1103,6 +1182,28 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if !self.dl.by_req.contains_key(&req) {
+            // A late answer (`LateReq`): what the backup holds, if it is
+            // still the backup appended to.
+            if sealed
+                || self
+                    .deleg_take_late(req, ReqKind::BackupAppend, gen, Some(from))
+                    .is_none()
+            {
+                return;
+            }
+            let Some(d) = self.dl.mine.get_mut(&gen) else {
+                return;
+            };
+            if d.backup != Some(from) || acked <= d.backup_acked {
+                return;
+            }
+            d.backup_acked = acked;
+            d.backup_sent_through = d.backup_sent_through.max(acked);
+            self.complete_ready(now, replica, out);
+            self.deleg_backup_stream(now, replica, out);
+            return;
+        }
         let Some((g, ReqKind::BackupAppend)) = self.dl.by_req.remove(&req) else {
             return;
         };
@@ -1398,16 +1499,20 @@ impl Core {
         // behind (4, 18); every op parked on the new root for 120 s).
         let root = self.root_node();
         let mut stale_reqs = Vec::new();
+        let mut restreamed = Vec::new();
         for d in self.dl.mine.values_mut() {
             if d.last_root != root {
                 if d.last_root.is_some() && root.is_some() {
                     d.streamed_through = replica.log_stream_idx(d.gen);
-                    // The old root's answer to the batch in flight must
-                    // not count for the new one (see
-                    // `on_delegate_stream_ack`).
+                    // The old root's answer to the batch in flight, or to
+                    // one given up on (`LateReq`), must not count for the
+                    // new one (see `on_delegate_stream_ack`) — nor for the
+                    // old root if it comes back (`LateReq::round`).
                     if let Some((req, _)) = d.inflight.take() {
                         stale_reqs.push(req);
                     }
+                    d.stream_round += 1;
+                    restreamed.push(d.gen);
                     d.refused = false;
                     d.stream_after = None;
                     d.stream_backoff_ms = 0;
@@ -1424,6 +1529,11 @@ impl Core {
         }
         for req in stale_reqs {
             self.dl.by_req.remove(&req);
+        }
+        if !restreamed.is_empty() {
+            self.dl
+                .late
+                .retain(|_, l| !(l.kind == ReqKind::Stream && restreamed.contains(&l.gen)));
         }
         // Parked delegate ops.
         let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
@@ -1510,30 +1620,38 @@ impl Core {
             .max(1)
     }
 
-    /// Drop the in-flight requests whose answers are overdue; the
-    /// generations whose renewal was dropped (re-sent by the caller).
+    /// Stop waiting for the in-flight requests whose answers are
+    /// overdue (their answers are still used when they come:
+    /// [`LateReq`]); the generations whose renewal was dropped (re-sent
+    /// by the caller). A stream batch is re-sent after a backoff, as
+    /// after a transport failure: the root is slow, and the same batch
+    /// every timeout only adds to what it is slow with.
     fn deleg_expire_inflight(&mut self, now: Ms) -> Vec<u64> {
         let timeout = self.deleg_request_timeout_ms() as i64;
-        let mut drop_reqs = Vec::new();
+        let tick = self.cfg.delegation_stream_tick_ms.max(1);
+        let root = self.root_node();
+        let mut late = Vec::new();
         let mut renew_again = Vec::new();
         for d in self.dl.mine.values_mut() {
             if let Some((req, _)) = d.inflight {
                 if now.since(d.inflight_at) >= timeout {
-                    drop_reqs.push(req);
+                    late.push((req, d.last_root.or(root), d.stream_round, d.inflight_at));
                     d.inflight = None;
+                    d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
+                    d.stream_after = Some(now.plus(d.stream_backoff_ms));
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, _)) = d.backup_inflight {
                 if now.since(d.backup_inflight_at) >= timeout {
-                    drop_reqs.push(req);
+                    late.push((req, d.backup, 0, d.backup_inflight_at));
                     d.backup_inflight = None;
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, sent)) = d.renew {
                 if now.since(sent) >= timeout {
-                    drop_reqs.push(req);
+                    late.push((req, root, 0, sent));
                     d.renew = None;
                     if d.renew_timer.is_none() && !d.stopped {
                         renew_again.push(d.gen);
@@ -1541,10 +1659,40 @@ impl Core {
                 }
             }
         }
-        for req in drop_reqs {
-            self.dl.by_req.remove(&req);
+        self.dl
+            .late
+            .retain(|_, l| now.since(l.sent) < LATE_ANSWER_MS);
+        for (req, to, round, sent) in late {
+            if let Some((gen, kind)) = self.dl.by_req.remove(&req) {
+                self.dl.late.insert(
+                    req,
+                    LateReq {
+                        gen,
+                        kind,
+                        to,
+                        round,
+                        sent,
+                    },
+                );
+            }
         }
         renew_again
+    }
+
+    /// The late answer to `req` ([`LateReq`]), if it is one, of `kind`
+    /// for `gen` from `from`.
+    fn deleg_take_late(
+        &mut self,
+        req: OpId,
+        kind: ReqKind,
+        gen: u64,
+        from: Option<NodeId>,
+    ) -> Option<LateReq> {
+        let l = *self.dl.late.get(&req)?;
+        if l.kind != kind || l.gen != gen || (from.is_some() && l.to != from) {
+            return None;
+        }
+        self.dl.late.remove(&req)
     }
 
     /// Send the next batch of every generation without one in flight.
@@ -1601,23 +1749,32 @@ impl Core {
                 continue;
             }
             let last = txs.last().map(|t| t.idx).unwrap_or(from);
+            let leaving = self.deleg_leaving_grants(now, gen, replica);
             let req = self.op_id();
             self.dl.by_req.insert(req, (gen, ReqKind::Stream));
             self.stats.deleg_streamed_txs += txs.len() as u64;
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.inflight = Some((req, last));
             d.inflight_at = now;
+            d.leaving =
+                (!leaving.is_empty()).then(|| (last, leaving.iter().map(|g| g.ino).collect()));
             tracing::debug!(
                 node = self.me(),
                 gen,
                 from,
                 last,
                 root,
+                leaving = leaving.len(),
                 "delegate stream batch"
             );
             out.push(Action::Send {
                 to: root,
-                msg: PeerMsg::DelegateStream { req, gen, txs },
+                msg: PeerMsg::DelegateStream {
+                    req,
+                    gen,
+                    txs,
+                    leaving,
+                },
             });
         }
         // A lost ack (the transport reports it), a batch that could not
@@ -1645,6 +1802,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if !self.dl.by_req.contains_key(&req) {
+            self.deleg_late_stream_ack(now, req, gen, through, refused, replica, out);
+            return;
+        }
         let Some((g, ReqKind::Stream)) = self.dl.by_req.remove(&req) else {
             return;
         };
@@ -1680,7 +1841,61 @@ impl Core {
         d.streamed_through = d.streamed_through.max(through);
         d.stream_after = None;
         d.stream_backoff_ms = 0;
+        self.deleg_drop_left(gen, replica);
         self.deleg_stream(now, replica, out);
+    }
+
+    /// The answer to a batch [`Core::deleg_expire_inflight`] stopped
+    /// waiting for ([`LateReq`]): the rows through `through` are the
+    /// root's if it is still the root this generation streams to (a new
+    /// root re-streams from what the log carries, and must not be
+    /// credited with what an old one answered). A refusal is left to the
+    /// batch in flight, or the next.
+    #[allow(clippy::too_many_arguments)]
+    fn deleg_late_stream_ack(
+        &mut self,
+        now: Ms,
+        req: OpId,
+        gen: u64,
+        through: u64,
+        refused: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let root = self.root_node();
+        let Some(late) = self.deleg_take_late(req, ReqKind::Stream, gen, None) else {
+            return;
+        };
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        if refused
+            || late.to.is_none()
+            || late.to != root
+            || d.last_root != late.to
+            || late.round != d.stream_round
+        {
+            return;
+        }
+        if through <= d.streamed_through {
+            return;
+        }
+        tracing::debug!(
+            node = self.cfg.node_id,
+            gen,
+            through,
+            was = d.streamed_through,
+            late_ms = now.since(late.sent),
+            "a late stream acknowledgement counted"
+        );
+        d.streamed_through = through;
+        if d.inflight.is_none() {
+            d.stream_after = None;
+            d.stream_backoff_ms = 0;
+        }
+        self.deleg_drop_left(gen, replica);
+        self.deleg_stream(now, replica, out);
+        self.complete_ready(now, replica, out);
     }
 
     /// A stream, renewal or recall request failed at the transport: let
@@ -2046,6 +2261,10 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        if !self.dl.by_req.contains_key(&req) {
+            self.deleg_late_renewed(now, req, gen, ttl_ms, replica, out);
+            return;
+        }
         let Some((g, ReqKind::Renew)) = self.dl.by_req.remove(&req) else {
             return;
         };
@@ -2110,6 +2329,57 @@ impl Core {
             // only once it knows it — tell it now, not at the next timer.
             self.deleg_renew_now(now, gen, out);
         }
+        self.deleg_after_event(now, replica, out);
+    }
+
+    /// The answer to a renewal [`Core::deleg_expire_inflight`] stopped
+    /// waiting for ([`LateReq`]): granted, the grant is honoured from that
+    /// renewal's send, as an answer in time would have been (the root
+    /// counts from its receipt, which is later). A refusal is left to the
+    /// renewal in flight, or the next: the log ends a generation.
+    fn deleg_late_renewed(
+        &mut self,
+        now: Ms,
+        req: OpId,
+        gen: u64,
+        ttl_ms: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let root = self.root_node();
+        let Some(late) = self.deleg_take_late(req, ReqKind::Renew, gen, None) else {
+            return;
+        };
+        if ttl_ms == 0 || late.to.is_none() || late.to != root {
+            return;
+        }
+        let margin = self.cfg.expiry_margin_ms;
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        if d.stopped {
+            return;
+        }
+        let until = late.sent.plus(ttl_ms.saturating_sub(margin));
+        if until <= d.until {
+            return;
+        }
+        tracing::debug!(
+            node = self.cfg.node_id,
+            gen,
+            late_ms = now.since(late.sent),
+            "a late delegation renewal counted"
+        );
+        d.until = until;
+        if d.lapsed && now < d.until {
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen,
+                "a lapsed delegation was renewed"
+            );
+            d.lapsed = false;
+        }
+        self.arm_deleg_lapse(now, gen, out);
         self.deleg_after_event(now, replica, out);
     }
 
@@ -2747,6 +3017,7 @@ impl Core {
         req: OpId,
         gen: u64,
         txs: Vec<constellation_meta::DelegateTx>,
+        leaving: Vec<constellation_meta::locks::Grant>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2774,6 +3045,7 @@ impl Core {
         }
         let mut cursor = g.cursor;
         let mut appended = 0u64;
+        let batch_last = txs.last().map(|t| t.idx).unwrap_or(0);
         for tx in txs {
             if tx.idx <= cursor {
                 continue;
@@ -2824,6 +3096,14 @@ impl Core {
         }
         if let Some(g) = self.dl.gens.get_mut(&gen) {
             g.cursor = cursor;
+        }
+        // Grants on inodes the batch takes out of the subtree: this
+        // table's from the step its rows are applied in.
+        if !leaving.is_empty() && cursor >= batch_last {
+            self.lock_install_leaving(now, gen, leaving, replica);
+        }
+        if appended > 0 {
+            self.lock_take_back_left(now, gen, replica);
         }
         if appended > 0 {
             self.stats.deleg_appended_txs += appended;

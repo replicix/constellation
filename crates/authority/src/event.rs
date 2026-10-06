@@ -549,6 +549,11 @@ pub enum PeerMsg {
         req: OpId,
         gen: u64,
         txs: Vec<DelegateTx>,
+        /// The delegate's live lock grants of `gen` on inodes no longer
+        /// in its subtree (unlinked under their lock): the root installs
+        /// them once it has applied the batch, which takes them out of
+        /// the subtree in its replica too (`Core::deleg_leaving_grants`).
+        leaving: Vec<constellation_meta::locks::Grant>,
     },
     /// Plan 30 §M11: the root appended the stream through `through`
     /// (the delegate re-sends from there), or `refused` the generation

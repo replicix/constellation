@@ -218,31 +218,52 @@ stops, and when the driver loop has made no progress for
 `CONSTELLATION_HOLDER_STALL_MS` (15 s; a core step, or anything else the
 driver does between waits for work): that long is a hung authority, and
 its backups then seal it a takeover window later. A dead process or a
-cut link stops it at once, so a crash still fails over in about 1.5 s. A
-backup counts a heartbeat like an append, from the moment it **arrived**
-(the P2P bridge stamps it), not from when its own core got to it. And a
-driver hands its core a timer that measures a peer's silence (the seal
-watch, request and renewal timeouts) only after the peer messages that
-were queued before it fired — for at most 500 ms of them, after which the
-timer goes back once behind whatever else is due — so an observer's own
-slow step is never read as the peer's silence (a seal watch used to fire
-with the holder's heartbeats waiting in the queue). Every other timer (a
-renewal to send, the backup tick) is handled in turn, never behind the
-backlog.
+cut link stops it at once, so a crash still fails over in about 1.5 s.
+A backup counts a heartbeat like an append, from the moment it
+**arrived**, not from when its own core got to it: the P2P bridge
+records the latest arrival of each holder's heartbeats and appends (per
+holder and epoch, off the core's step), and the driver hands those
+arrivals to the core immediately before it evaluates the seal watch. A
+backup whose own steps take seconds therefore never reads its backlog as
+the holder's silence (one sealed a live holder at `silent_ms=21872`
+while the holder was sending to it). Heartbeats and lock and delegation
+renewals also reach the driver on a lane of their own, served before the
+ordinary peer requests; an owner's expiry of a grant it handed out (a
+lock grant, a delegation) is handled after the renewals queued there
+when it fired. The other timers that measure a peer's silence (request
+and renewal timeouts, grant expiries, the log-stream watchdog) are still
+handled after the ordinary peer requests that were queued before they
+fired, for at most 500 ms of them, after which the timer goes back once
+behind whatever else is due. A non-holder's log-stream frames stay on
+the driver's internal channel in arrival order with replies and timers;
+the frames it has not applied yet are bounded by the holder's
+per-subscriber budget (32 MiB), past which its subscription stops
+reading and the holder drops it to S3 tailing, as it would anyway. The heartbeat goes out every interval whatever earlier
+beats are still waiting for their answers (each waits up to 5 s; at most
+as many in flight per peer as fit in that wait), so one slow answer
+never silences it past the 1.5 s takeover window.
 
-The heartbeat also tells the holder its backups are alive: a backup that
-answers it is a live process with a working link, whatever its own core
-is doing. Such a backup that is slow to acknowledge (a loaded node whose
-core takes seconds over a step) is kept for up to
-`CONSTELLATION_BACKUP_SLOW_MAX_MS` (10 s) without acknowledgement
-progress, and an append waits that long for its answer. Before, an
-append's answer was abandoned after `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS`
-(1 s) and the backup dropped for making no progress: under
-`stress-ng-fs-nodes` the holder dropped and re-added candidates every
-second or two and had no backup most of the time, so every
-acknowledgement waited for S3. A backup that does not answer the
-heartbeat (dead, cut off), or that answers appends short (alive but
-stuck), still goes after the ack timeout.
+The heartbeat also tells the holder whether its backups are alive: a
+backup answers it with whether its own authority driver is progressing
+(waiting for work, or in a wake-up that started within half of
+`CONSTELLATION_BACKUP_SLOW_MAX_MS`). Such a backup that is slow to
+acknowledge (a loaded node whose core takes seconds over a step) is kept
+for up to `CONSTELLATION_BACKUP_SLOW_MAX_MS` (10 s) without
+acknowledgement progress, and an append waits that long for its answer.
+Before, an append's answer was abandoned after
+`CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (1 s) and the backup dropped for
+making no progress: under `stress-ng-fs-nodes` the holder dropped and
+re-added candidates every second or two and had no backup most of the
+time, so every acknowledgement waited for S3. A backup that does not
+answer the heartbeat (dead, cut off), that answers that its driver is
+stuck, or that answers appends short (alive but stuck), still goes after
+the ack timeout. A candidate that times out is not brought up again for
+a while — the reconfiguration rate limit doubled per consecutive timeout
+(6 s, 12 s, ... at most a minute) — so another peer goes first and the
+holder does not re-stream the journal from zero to the same loaded node
+every few seconds; a candidate that makes it into the set starts over,
+and so does one that has not timed out for a minute past its last
+backoff.
 
 A backup the holder dropped (a candidate that timed out, a committed
 backup reconfigured out) used to keep watching and seal the live holder

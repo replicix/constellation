@@ -6274,6 +6274,106 @@ mod pipelined_appends {
         assert!(h.core.stats.backup_ack_timeouts >= 1);
     }
 
+    /// overload-cascade-2: a candidate that timed out is not brought up
+    /// again at once — it would start from zero and likely time out the
+    /// same way (`stress-ng-fs-nodes`: the same loaded node re-selected
+    /// every ~13 s for minutes). Another peer goes first; the same node
+    /// comes back only after a backoff that doubles per timeout in a row.
+    #[test]
+    fn a_candidate_that_timed_out_is_backed_off_and_another_peer_goes_first() {
+        use crate::core::backup::candidate_backoff_ms;
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        // A lease that outlasts the two minutes (no renewal in between).
+        h.core.lease.held.as_mut().unwrap().0.expires_unix_ms = h.now.plus(3_600_000).0;
+        h.step(Event::Roster {
+            write_eligible: vec![1, 2, 3],
+        });
+        let link = |node, since| crate::event::PeerLink {
+            node,
+            connected: true,
+            last_seen: None,
+            rtt_ms: Some(1),
+            since: Some(Ms(since)),
+        };
+        // Node 2's link is the older one: it is preferred.
+        h.step(Event::Peers {
+            links: vec![link(2, 0), link(3, 1)],
+        });
+        journal(&h, "a", 1);
+        journaled(&mut h, 900);
+        let reconfig_min = h.core.cfg.backup_reconfig_min_ms;
+        // Every candidate times out (no acknowledgement, no heartbeat
+        // answer); the bring-ups over two minutes, with their times.
+        let start = h.now;
+        let mut brought_up: Vec<(i64, NodeId)> = Vec::new();
+        let mut current = None;
+        while h.now.since(start) < 120_000 {
+            h.advance(50);
+            if let Some(id) = h.core.ack.tick_timer {
+                h.step(Event::Timer { id });
+            }
+            if h.now.since(start) % 1_000 == 0 {
+                // The driver's directory refresh, every second.
+                h.step(Event::Peers {
+                    links: vec![link(2, 0), link(3, 1)],
+                });
+            }
+            if h.core.ack.candidate != current {
+                current = h.core.ack.candidate;
+                if let Some(n) = current {
+                    brought_up.push((h.now.since(start), n));
+                }
+            }
+        }
+        assert!(brought_up.len() >= 4, "{brought_up:?}");
+        assert_eq!(brought_up[0].1, 2, "{brought_up:?}");
+        assert_eq!(
+            brought_up[1].1, 3,
+            "the other peer goes next: {brought_up:?}"
+        );
+        // The same node again only after its backoff: 2×, 4×, 8×, ... the
+        // rate limit (a timeout takes about a second on top).
+        for n in [2, 3] {
+            let times: Vec<i64> = brought_up
+                .iter()
+                .filter(|(_, m)| *m == n)
+                .map(|(t, _)| *t)
+                .collect();
+            assert!(times.len() >= 2, "node {n}: {brought_up:?}");
+            for (strike, w) in times.windows(2).enumerate() {
+                let backoff = candidate_backoff_ms(reconfig_min, strike as u32 + 1) as i64;
+                assert!(
+                    w[1] - w[0] >= backoff,
+                    "node {n} re-selected {} ms after its bring-up, backoff {backoff}: {brought_up:?}",
+                    w[1] - w[0]
+                );
+            }
+        }
+        // Without the backoff, a node came back every rate-limit period.
+        assert!(
+            brought_up.len() < (120_000 / (reconfig_min as usize + 1_000)),
+            "{brought_up:?}"
+        );
+        assert_eq!(candidate_backoff_ms(3_000, 1), 6_000);
+        assert_eq!(candidate_backoff_ms(3_000, 2), 12_000);
+        assert_eq!(candidate_backoff_ms(3_000, 30), 60_000);
+        // Strikes decay: one more while the last backoff is recent, from 1
+        // again after a quiet minute past it.
+        use crate::core::backup::candidate_strikes_after;
+        assert_eq!(candidate_strikes_after(None, Ms(1_000)), 1);
+        assert_eq!(candidate_strikes_after(Some((3, Ms(10_000))), Ms(5_000)), 4);
+        assert_eq!(
+            candidate_strikes_after(Some((3, Ms(10_000))), Ms(69_999)),
+            4
+        );
+        assert_eq!(
+            candidate_strikes_after(Some((3, Ms(10_000))), Ms(70_000)),
+            1
+        );
+        assert_eq!(candidate_strikes_after(Some((1, Ms(0))), Ms(3_600_000)), 1);
+    }
+
     /// overload-cascade: a backup that answers the holder's heartbeat
     /// (`Event::BackupAlive`) is alive, and a loaded one acknowledges
     /// seconds late: it is not dropped at `backup_ack_timeout_ms`, only
@@ -8363,6 +8463,531 @@ mod locks {
             .collect();
         assert_eq!(granted.len(), 1, "{out:?}");
         assert!(granted[0] >= 2_000, "a {}-ms grant", granted[0]);
+    }
+
+    /// `d/turn.lock` (`f`) in a replica whose table delegates `d` to
+    /// node 3 as generation 7; returns `(dir, f)`.
+    fn delegated_file(meta: &Meta) -> (Ino, Ino) {
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        let f = meta.allocate_ino(dir).unwrap();
+        crate::replica::Replica::apply_segment(
+            meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Create {
+                    parent: dir,
+                    name: "turn.lock".into(),
+                    ino: f,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 2,
+                },
+                LogRecord::Delegate {
+                    dir,
+                    node: 3,
+                    gen: 7,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        (dir, f)
+    }
+
+    /// overload-cascade-2 (`stress-ng-fs-nodes`): a file locked through
+    /// a delegate is unlinked under its lock (`stress-ng`'s lock
+    /// stressors do). No subtree contains it any more, so by location its
+    /// owner is the root, and the holder renews there. The root never had
+    /// the grant (the delegate minted it, or it moved there with the
+    /// delegation): answered `Lost`, the holder's writes were discarded
+    /// (`EIO`) while the delegate still honoured it; adopted at that
+    /// renewal instead (this chunk's first round), another node routed to
+    /// the root by location could be granted the inode first, release it,
+    /// and then the first holder's grant was adopted — two exclusive
+    /// holders, silently (the review's release-then-renew case). Now the
+    /// delegate's grants on inodes that left its subtree go to the root
+    /// with the batch that carries the unlink, and the root has them from
+    /// the step that applies it; an unknown grant is never adopted.
+    #[test]
+    fn a_grant_on_a_file_unlinked_under_its_lock_moves_to_the_root_with_the_unlink() {
+        let delegates_grant = GrantId { node: 3, seq: 1 };
+        let moved_grant = GrantId { node: 1, seq: 77 };
+        let renew_id = |h: &mut Harness, ino: Ino, grant: GrantId| {
+            let out = h.step(Event::Peer {
+                from: 2,
+                msg: PeerMsg::LockRenew {
+                    req: OpId(40),
+                    entries: vec![LockRenewEntry {
+                        ino,
+                        grant,
+                        mode: X,
+                    }],
+                },
+            });
+            let [(2, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
+                panic!("expected an answer: {out:?}")
+            };
+            results.clone()
+        };
+        let renew = |h: &mut Harness, ino: Ino| renew_id(h, ino, delegates_grant);
+        let root = || {
+            let mut h = Harness::new(1);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.hold(1, None);
+            let (dir, f) = delegated_file(&h.meta);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            assert!(h.core.dl.gens.contains_key(&7), "gen 7 not learned");
+            // The tenure's lock floor: it waits for the delegate's stream
+            // head (its renewal) before the root grants anything.
+            request(&mut h, 5, 99, ROOT_INO, X, false);
+            h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegRenew {
+                    req: OpId(98),
+                    gen: 7,
+                    backup: None,
+                    stream_head: 0,
+                },
+            });
+            (h, dir, f)
+        };
+        let grant_of = |h: &Harness, id: GrantId, f: Ino| constellation_meta::locks::Grant {
+            id,
+            node: 2,
+            ino: f,
+            mode: X,
+            until_ms: h.now.0 + 5_000,
+            recalled: false,
+            gen: 7,
+            confirmed_ms: constellation_meta::locks::Grant::MINTED,
+        };
+        // The delegate's batch with the unlink row (index 1), carrying
+        // `leaving`.
+        let stream = |h: &mut Harness, dir: Ino, req: u64, leaving| {
+            let out = h.step(Event::Peer {
+                from: 3,
+                msg: PeerMsg::DelegateStream {
+                    req: OpId(req),
+                    gen: 7,
+                    txs: vec![constellation_meta::DelegateTx {
+                        idx: 1,
+                        rid: None,
+                        records: vec![LogRecord::Unlink {
+                            parent: dir,
+                            name: "turn.lock".into(),
+                            time_ns: 1,
+                        }],
+                        deps: Default::default(),
+                    }],
+                    leaving,
+                },
+            });
+            assert!(
+                sends(&out).iter().any(|(to, m)| *to == 3
+                    && matches!(
+                        m,
+                        PeerMsg::DelegateStreamAck {
+                            through: 1,
+                            refused: false,
+                            ..
+                        }
+                    )),
+                "not appended: {out:?}"
+            );
+        };
+        let granted_to_4 = |out: &[Action]| {
+            lock_replies(out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. }))
+        };
+        // Still in the subtree: the delegate's, not the root's.
+        let (mut h, dir, f) = root();
+        assert!(
+            matches!(
+                renew(&mut h, f).as_slice(),
+                [(_, _, LockRenewResult::NotOwner { owner: 3 })]
+            ),
+            "renewed by the root inside a delegated subtree"
+        );
+        // Unlinked: the grant came with the row, another node's request
+        // waits for it, and its holder renews it here.
+        let g = grant_of(&h, delegates_grant, f);
+        stream(&mut h, dir, 50, vec![g]);
+        let out = request(&mut h, 4, 9, f, X, false);
+        assert!(!granted_to_4(&out), "granted over the moved grant: {out:?}");
+        assert!(
+            matches!(
+                renew(&mut h, f).as_slice(),
+                [(_, _, LockRenewResult::Ok { id, .. })] if *id == delegates_grant
+            ),
+            "the moved grant not renewed"
+        );
+        // Released here, then the same batch again (its acknowledgement
+        // lost): the grant this root ended is not put back.
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockReleased {
+                ino: f,
+                grant: delegates_grant,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        assert!(h.meta.locks().get(delegates_grant).is_none());
+        let g = grant_of(&h, delegates_grant, f);
+        stream(&mut h, dir, 51, vec![g]);
+        assert!(
+            h.meta.locks().get(delegates_grant).is_none(),
+            "a released grant reinstalled by a re-sent batch"
+        );
+        // A grant the root minted before the subtree was delegated (it
+        // moved to the delegate) comes back the same way.
+        let (mut h, dir, f) = root();
+        let g = grant_of(&h, moved_grant, f);
+        stream(&mut h, dir, 50, vec![g]);
+        assert!(
+            matches!(
+                renew_id(&mut h, f, moved_grant).as_slice(),
+                [(_, _, LockRenewResult::Ok { id, .. })] if *id == moved_grant
+            ),
+            "a grant that moved with the delegation not taken back"
+        );
+        // The review's case: a grant the root never got (here: the batch
+        // carried none). Another node is granted the unlinked inode by
+        // location, and releases it; the first holder's renewal is not
+        // adopted — it is `Lost`, and its writes are fenced.
+        let (mut h, dir, f) = root();
+        stream(&mut h, dir, 50, Vec::new());
+        let out = request(&mut h, 4, 9, f, X, false);
+        let replies = lock_replies(&out);
+        let [(4, _, LockOutcome::Granted { id: g4, .. })] = replies.as_slice() else {
+            panic!("not granted by location: {out:?}")
+        };
+        let g4 = *g4;
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockReleased {
+                ino: f,
+                grant: g4,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        assert!(
+            matches!(renew(&mut h, f).as_slice(), [(_, _, LockRenewResult::Lost)]),
+            "an unknown grant adopted after another node held the lock"
+        );
+        // One next to a conflicting grant of this table stays out.
+        let (mut h, dir, f) = root();
+        h.meta.locks().install(constellation_meta::locks::Grant {
+            id: GrantId { node: 1, seq: 5 },
+            node: 4,
+            gen: 0,
+            ..grant_of(&h, moved_grant, f)
+        });
+        let g = grant_of(&h, delegates_grant, f);
+        stream(&mut h, dir, 50, vec![g]);
+        assert!(
+            h.meta.locks().get(delegates_grant).is_none(),
+            "installed next to a conflicting grant"
+        );
+        assert!(
+            matches!(renew(&mut h, f).as_slice(), [(_, _, LockRenewResult::Lost)]),
+            "renewed next to a conflicting grant"
+        );
+    }
+
+    /// overload-cascade-2: the delegate's half of the move above. Its
+    /// grant on a file unlinked under the lock leaves with the batch that
+    /// carries the unlink, and leaves its table once the root
+    /// acknowledged that batch (a recall must not hand it back over the
+    /// root's own record).
+    #[test]
+    fn a_delegate_sends_its_grants_on_unlinked_files_with_the_unlink() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let req = renew_req(&out, 7).expect("no renewal on install");
+        h.step(super::renewed(req, 7, 5_000));
+        let f = h.meta.allocate_ino(dir).unwrap();
+        let create = MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: f,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = h.rid(1);
+        let created = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: create,
+            tag: Default::default(),
+        });
+        // Node 2 locks it here.
+        let out = request(&mut h, 2, 9, f, X, false);
+        let replies = lock_replies(&out);
+        let [(2, _, LockOutcome::Granted { id, .. })] = replies.as_slice() else {
+            panic!("not granted by the delegate: {out:?}")
+        };
+        let id = *id;
+        let batch = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegateStream {
+                    req,
+                    gen: 7,
+                    txs,
+                    leaving,
+                } if to == 1 => Some((
+                    *req,
+                    txs.last().map(|t| t.idx).unwrap_or(0),
+                    leaving.clone(),
+                )),
+                _ => None,
+            })
+        };
+        // The create's batch, acknowledged: the unlink goes out in a
+        // batch of its own.
+        if let Some((req, last, leaving)) = batch(&created) {
+            assert!(leaving.is_empty(), "{leaving:?}");
+            h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::DelegateStreamAck {
+                    req,
+                    gen: 7,
+                    through: last,
+                    refused: false,
+                },
+            });
+        }
+        let rid = h.rid(2);
+        let out = h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Unlink {
+                parent: dir,
+                name: "f".into(),
+            },
+            tag: Default::default(),
+        });
+        let (sreq, last, leaving) = batch(&out).expect("the unlink not streamed");
+        assert_eq!(
+            leaving.iter().map(|g| (g.id, g.ino)).collect::<Vec<_>>(),
+            vec![(id, f)],
+            "the grant did not go with the unlink"
+        );
+        assert!(
+            h.meta.locks().get(id).is_some(),
+            "dropped before the root had it"
+        );
+        h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegateStreamAck {
+                req: sreq,
+                gen: 7,
+                through: last,
+                refused: false,
+            },
+        });
+        assert!(
+            h.meta.locks().get(id).is_none(),
+            "still in the delegate's table once the root had it"
+        );
+    }
+
+    /// overload-cascade-2 review round 2 (sim
+    /// `locks-unlinked-delegated-hcrash-backup` seed 41): the delegate
+    /// grants a file, it is unlinked under the lock, and the batch that
+    /// carries the unlink and the grant never reaches a live root. The
+    /// delegate takes the root over and ends its own inherited
+    /// generation: the grants on inodes that are the root's now are its
+    /// own table's, not dropped — dropped, the holder's renewal was
+    /// answered `Lost` at best, and the root granted the inode over it.
+    #[test]
+    fn a_delegate_that_takes_the_root_over_keeps_its_grants_on_unlinked_files() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let dir = delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let req = renew_req(&out, 7).expect("no renewal on install");
+        h.step(super::renewed(req, 7, 5_000));
+        let f = h.meta.allocate_ino(dir).unwrap();
+        let rid = h.rid(1);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Create {
+                parent: dir,
+                name: "f".into(),
+                ino: f,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+            tag: Default::default(),
+        });
+        // Node 2 locks it here, and it is unlinked under the lock; no
+        // batch is acknowledged (the root is gone).
+        let out = request(&mut h, 2, 9, f, X, false);
+        let replies = lock_replies(&out);
+        let [(2, _, LockOutcome::Granted { id, .. })] = replies.as_slice() else {
+            panic!("not granted by the delegate: {out:?}")
+        };
+        let id = *id;
+        let rid = h.rid(2);
+        h.step(Event::Submit {
+            policy: Policy::Client,
+            rid,
+            op: MutateOp::Unlink {
+                parent: dir,
+                name: "f".into(),
+            },
+            tag: Default::default(),
+        });
+        assert!(h.meta.locks().get(id).is_some_and(|g| g.gen == 7));
+        // This node takes the root over and ends its own generation.
+        h.core.lease.cached_holder = None;
+        h.hold(2, None);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        assert!(
+            !h.core.dl.mine.contains_key(&7),
+            "the root's own generation not ended: {out:?}"
+        );
+        let g = h.meta.locks().get(id).expect("the grant dropped");
+        assert_eq!((g.node, g.ino, g.gen), (2, f, 0));
+        // Another node's request waits, the holder renews it here.
+        let out = request(&mut h, 4, 10, f, X, false);
+        assert!(
+            !lock_replies(&out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. })),
+            "granted over the kept grant: {out:?}"
+        );
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(40),
+                entries: vec![LockRenewEntry {
+                    ino: f,
+                    grant: id,
+                    mode: X,
+                }],
+            },
+        });
+        assert!(
+            matches!(
+                renewed(&out, 2).as_deref(),
+                Some([LockRenewResult::Ok { id: g, .. }]) if *g == id
+            ),
+            "the kept grant not renewed: {out:?}"
+        );
+    }
+
+    /// overload-cascade-2 review round 2: a generation that ends without
+    /// handing its grants back (outwaited, sealed, drained from its
+    /// backup) may have granted an inode its rows then unlinked, and the
+    /// grants on it never reached this root. The subtree's grace covers
+    /// such an inode, which is under no directory any more; a linked
+    /// inode elsewhere is not held up.
+    #[test]
+    fn an_outwaited_generations_grace_covers_the_inodes_it_unlinked() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, f) = delegated_file(&h.meta);
+        let other = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: "other.lock".into(),
+                ino: other,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        // The tenure's floor: it waits for the delegate's renewal.
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(98),
+                gen: 7,
+                backup: None,
+                stream_head: 0,
+            },
+        });
+        // The delegate's unlink row is applied (from its backup, say),
+        // without the grants it made on the file.
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(50),
+                gen: 7,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: None,
+                    records: vec![LogRecord::Unlink {
+                        parent: dir,
+                        name: "turn.lock".into(),
+                        time_ns: 1,
+                    }],
+                    deps: Default::default(),
+                }],
+                leaving: Vec::new(),
+            },
+        });
+        h.core.lock_on_generation_outwaited(h.now, 7, dir);
+        let granted = |out: &[Action]| {
+            lock_replies(out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. }))
+        };
+        let out = request(&mut h, 4, 9, f, X, false);
+        assert!(
+            !granted(&out),
+            "an unlinked inode granted inside the grace: {out:?}"
+        );
+        let out = request(&mut h, 4, 10, other, X, false);
+        assert!(granted(&out), "a linked inode elsewhere held up: {out:?}");
+        h.advance(h.core.lock_ttl_ms() as u64 + 2 * h.core.lock_margin_ms() as u64);
+        let out = request(&mut h, 4, 11, f, X, false);
+        assert!(granted(&out), "not granted once the grace passed: {out:?}");
     }
 
     fn holder_with_file() -> (Harness, Ino) {
@@ -10912,6 +11537,105 @@ mod locks {
         });
         let tick = timer_of(&out, TimerKind::LockRenewTick);
         assert!(r.core.timer_at(tick).unwrap().0 <= r.now.0 + 1_000);
+    }
+
+    /// overload-cascade-2: an owner whose requests queue behind seconds
+    /// of other work answers a renewal after the requester stopped
+    /// waiting (`forward_timeout_ms`). The late grant still counts —
+    /// honoured from its own send, as an answer in time would be — where
+    /// it used to be thrown away (every answer late: the grant lapsed
+    /// under the holder's writes although the owner renewed it each
+    /// time). A late `Lost`, and an answer from another node, do not.
+    #[test]
+    fn a_renewal_answered_after_its_timeout_still_counts() {
+        let mut r = requester();
+        let sent = r.now;
+        let req = lock_control(&mut r, 50, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        let tick = timer_of(&out, TimerKind::LockRenewTick);
+        r.now = sent.plus(2_600);
+        let renew_sent = r.now;
+        let out = r.step(Event::Timer { id: tick });
+        let [(1, PeerMsg::LockRenew { req, .. })] = sends(&out).as_slice() else {
+            panic!("expected a renewal: {out:?}")
+        };
+        let req = *req;
+        let timeout = timer_of(&out, TimerKind::LockRenewTimeout);
+        r.advance(r.core.cfg.forward_timeout_ms);
+        r.step(Event::Timer { id: timeout });
+        let ok = |ttl_ms| {
+            vec![(
+                42,
+                GrantId { node: 1, seq: 1 },
+                LockRenewResult::Ok {
+                    ttl_ms,
+                    recalled: false,
+                    id: GrantId { node: 1, seq: 1 },
+                    mode: X,
+                },
+            )]
+        };
+        let before = r.meta.locks().held(42).unwrap().until_ms;
+        assert_eq!(before, sent.0 + 5_000 - 1_000);
+        // Another node answering that request id: not the owner asked.
+        r.advance(1_000);
+        r.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockRenewed {
+                req,
+                results: ok(5_000),
+            },
+        });
+        assert_eq!(r.meta.locks().held(42).unwrap().until_ms, before);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req,
+                results: ok(5_000),
+            },
+        });
+        assert_eq!(
+            r.meta.locks().held(42).unwrap().until_ms,
+            renew_sent.0 + 5_000 - 1_000,
+            "the late grant did not count"
+        );
+        // A late `Lost` never drops the grant (the renewal sent since
+        // may have been granted by a new owner).
+        let mut r = requester();
+        let sent = r.now;
+        let req = lock_control(&mut r, 50, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        let tick = timer_of(&out, TimerKind::LockRenewTick);
+        r.now = sent.plus(2_600);
+        let out = r.step(Event::Timer { id: tick });
+        let [(1, PeerMsg::LockRenew { req, .. })] = sends(&out).as_slice() else {
+            panic!("expected a renewal: {out:?}")
+        };
+        let req = *req;
+        let timeout = timer_of(&out, TimerKind::LockRenewTimeout);
+        r.advance(r.core.cfg.forward_timeout_ms);
+        r.step(Event::Timer { id: timeout });
+        r.advance(500);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req,
+                results: vec![(42, GrantId { node: 1, seq: 1 }, LockRenewResult::Lost)],
+            },
+        });
+        assert!(r.meta.locks().held(42).is_some(), "a late Lost dropped it");
     }
 
     /// The grant is installed honoured until sent + ttl − margin; the
@@ -17105,6 +17829,194 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
         "not answered: {out:?}"
     );
     assert_eq!(h.core.dl.mine[&7].executed, 1);
+}
+
+/// overload-cascade-2 (`stress-ng-fs-nodes`): a root whose requests
+/// queue behind other work answers a delegate's batch and renewal after
+/// the delegate stopped waiting (`deleg_request_timeout_ms`, 500 ms).
+/// Thrown away, as before, every answer arrived late: the delegate
+/// re-sent the same batch every half second for minutes with the root
+/// holding every row (all the ops parked on it waited), and its
+/// renewals never counted. The late stream acknowledgement and the late
+/// grant count now; the batch is re-sent after a backoff, not at once.
+#[test]
+fn a_delegates_late_answers_still_count() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    let ttl = 5_000;
+    let margin = h.core.cfg.expiry_margin_ms;
+    let out = h.step(renewed(req, 7, ttl));
+    let renew_timer = timers(&out, TimerKind::DelegRenew);
+    assert_eq!(renew_timer.len(), 1, "{out:?}");
+    let batch = |out: &[Action]| {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegateStream {
+                req, gen: 7, txs, ..
+            } if to == 1 => Some((*req, txs.last().map(|t| t.idx).unwrap_or(0))),
+            _ => None,
+        })
+    };
+    let rid = h.rid(1);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "f".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    let (sreq, last) = batch(&out).expect("no batch streamed");
+    assert!(last > 0);
+    let poke = |h: &mut Harness| {
+        h.step(Event::Activity {
+            last_write: Ms(0),
+            acked_seqs: Vec::new(),
+        })
+    };
+    // Unanswered past the timeout: given up on, re-sent only after a
+    // backoff.
+    h.advance(h.core.deleg_request_timeout_ms());
+    let out = poke(&mut h);
+    assert!(batch(&out).is_none(), "re-sent at once: {out:?}");
+    assert_eq!(h.core.dl.mine[&7].streamed_through, 0);
+    // The answer comes, late: the root has the rows.
+    h.advance(300);
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamAck {
+            req: sreq,
+            gen: 7,
+            through: last,
+            refused: false,
+        },
+    });
+    assert_eq!(
+        h.core.dl.mine[&7].streamed_through, last,
+        "the late acknowledgement did not count"
+    );
+    // A renewal answered late counts from its own send.
+    let renew_sent = h.now;
+    let out = h.step(Event::Timer { id: renew_timer[0] });
+    let req = renew_req(&out, 7).expect("no renewal");
+    h.advance(h.core.deleg_request_timeout_ms());
+    let out = poke(&mut h);
+    let again = renew_req(&out, 7).expect("not re-sent");
+    assert_ne!(again, req);
+    h.advance(700);
+    h.step(renewed(req, 7, ttl));
+    assert_eq!(
+        h.core.dl.mine[&7].until,
+        renew_sent.plus(ttl - margin),
+        "the late grant did not count"
+    );
+    // A late refusal leaves the generation to the renewal in flight.
+    h.advance(h.core.deleg_request_timeout_ms());
+    poke(&mut h);
+    h.step(renewed(again, 7, 0));
+    assert!(!h.core.dl.mine[&7].stopped, "stopped on a late refusal");
+}
+
+/// overload-cascade-2 review: a late stream acknowledgement counts only
+/// from the root tenure its batch went to. The root changed (R → R2) and
+/// came back (→ R) within the late window: each change re-streamed from
+/// what the log carries, so R's late answer for its first tenure ("I
+/// have through N") says nothing about R's second tenure — credited, the
+/// stream would stop short of rows the log never got (long-delegated-
+/// backup seed 75504's class).
+#[test]
+fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    h.step(renewed(req, 7, 5_000));
+    let batch_to = |out: &[Action], root: NodeId| {
+        sends(out).into_iter().find_map(|(to, m)| match m {
+            PeerMsg::DelegateStream {
+                req, gen: 7, txs, ..
+            } if to == root => Some((*req, txs.last().map(|t| t.idx).unwrap_or(0))),
+            _ => None,
+        })
+    };
+    let rid = h.rid(1);
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op: MutateOp::Create {
+            parent: dir,
+            name: "f".into(),
+            ino: h.meta.allocate_ino(dir).unwrap(),
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        },
+        tag: Default::default(),
+    });
+    let (sreq, last) = batch_to(&out, 1).expect("no batch streamed");
+    assert!(last > 0);
+    let poke = |h: &mut Harness| {
+        h.step(Event::Activity {
+            last_write: Ms(0),
+            acked_seqs: Vec::new(),
+        })
+    };
+    // Given up on (late), then the root changes and comes back.
+    h.advance(h.core.deleg_request_timeout_ms());
+    poke(&mut h);
+    h.core.lease.cached_holder = Some(2);
+    let out = poke(&mut h);
+    assert!(
+        batch_to(&out, 2).is_some(),
+        "not re-streamed to R2: {out:?}"
+    );
+    h.advance(100);
+    h.core.lease.cached_holder = Some(1);
+    let out = poke(&mut h);
+    let (again, _) = batch_to(&out, 1).expect("not re-streamed to R");
+    assert_ne!(again, sreq);
+    assert_eq!(h.core.stats.deleg_restreams, 2);
+    // R's late answer from its first tenure.
+    h.advance(100);
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamAck {
+            req: sreq,
+            gen: 7,
+            through: last,
+            refused: false,
+        },
+    });
+    assert_eq!(
+        h.core.dl.mine[&7].streamed_through, 0,
+        "credited an acknowledgement from the root's earlier tenure"
+    );
+    // The answer to the batch of this tenure counts.
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegateStreamAck {
+            req: again,
+            gen: 7,
+            through: last,
+            refused: false,
+        },
+    });
+    assert_eq!(h.core.dl.mine[&7].streamed_through, last);
 }
 
 /// A delegate of `/d` (generation 7, root node 1) whose renewal was

@@ -1163,6 +1163,7 @@ pub trait PeerService: Send + Sync + 'static {
         req_id: u64,
         gen: u64,
         _txs: Vec<u8>,
+        _leaving: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::DelegateStreamAck {
@@ -1309,8 +1310,12 @@ pub trait PeerService: Send + Sync + 'static {
     /// Default ignores it.
     fn backup_hold(&self, _holder: u64, _epoch: u64, _for_ms: u64) {}
     /// The lease holder's off-core liveness heartbeat
-    /// ([`Payload::HolderAlive`]). Default ignores it.
-    fn holder_alive(&self, _holder: u64, _epoch: u64, _candidacy: u64, _listed: bool) {}
+    /// ([`Payload::HolderAlive`]); the answer is whether this node's
+    /// authority core is responsive ([`Payload::HolderAliveAck`]).
+    /// Default ignores it and answers no.
+    fn holder_alive(&self, _holder: u64, _epoch: u64, _candidacy: u64, _listed: bool) -> bool {
+        false
+    }
     /// Plan 30 §M14: a node asks this one, as the owning sequencer, for
     /// a lock grant. Default: busy (no lock service here).
     #[allow(clippy::too_many_arguments)]
@@ -1727,7 +1732,15 @@ impl P2p {
         let conn = self.connection(&peer).await?;
         let mut in_flight = InFlight::new(&self.pool, expect);
         let result = async {
+            let opening = std::time::Instant::now();
             let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
+            if opening.elapsed() >= Duration::from_secs(1) {
+                tracing::debug!(
+                    peer = %expect.fmt_short(),
+                    waited_ms = opening.elapsed().as_millis() as u64,
+                    "opening a stream to the peer waited (its stream limit)"
+                );
+            }
             let msg = Signed::new(&self.key, payload)?;
             crate::message::write_frame(&mut send, &msg).await?;
             send.finish().ok();

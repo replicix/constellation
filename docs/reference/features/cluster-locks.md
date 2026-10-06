@@ -131,6 +131,50 @@ the root's; at the 5 s it used to default to, a lock in a delegated
 subtree was honoured for under 3 s and renewed every second or so, and
 it lapsed under load: `stress-ng-fs-nodes`).
 
+A renewal is never lost to a slow owner. Renewals (lock and delegation)
+and the holder's heartbeat reach the owner's authority driver on a lane
+of their own, ahead of the ordinary peer requests, and a peer request
+whose sender gave up (its request timed out) stops occupying one of the
+connection's stream slots, so a backlog of them never shuts a peer's
+renewals out. A renewal that is not answered within its timeout is sent
+again at the next tick, but its answer still counts when it comes (for
+up to a minute): a granted renewal is honoured from that renewal's own
+send, as an answer in time would have been. Before, every answer later
+than the timeout (500 ms) was thrown away, and an owner whose answers
+all came late let the grant lapse under the holder's writes although it
+had renewed it each time. A late `Lost` or `NotOwner` is ignored (the
+renewal sent since decides).
+
+A file locked through a delegate and then unlinked while locked
+(`stress-ng`'s lock stressors do) is in no delegated subtree any more,
+so from the unlink on its owner is the root, by location: its holder
+renews there, and another node asking for it is routed there too. The
+delegate's grants on such an inode go to the root with the stream batch
+that carries the unlink, and the root installs them in the step that
+applies it; until it has applied that row, the root itself still routes
+the inode to the delegate. Grants the root had moved to the delegation itself (waiting
+for the delegate's first renewal, or handed and not handed back) come
+back to its table at the same point, and a recall answer never puts the
+delegate's older copy of such a grant over the root's record. Before,
+the root did not have the grant at all: it answered the holder's
+renewal `Lost` (its writes discarded with `EIO`) and, in the window
+before that, could grant the inode to another node while the holder
+still honoured its grant. A grant the root never got is never adopted
+at a renewal: another node may have held the lock in between.
+
+The batch may never reach a live root: the root dies first, or the
+delegate does and its rows reach the root from its backup, or from the
+log, without the grants. Two rules cover that. A delegate that is the
+root when its own generation ends (it took the root over, and ends the
+generation it inherited) keeps the grants on inodes that are the
+root's now in its table instead of dropping them. And a generation
+that ends without handing its grants back (outwaited, sealed, drained
+from its backup) leaves a grace on its subtree, as before, that now also
+covers every unlinked inode: such an inode is under no directory, and
+which subtree it left is not recorded. During that grace the root makes
+no new grant on an unlinked inode, and a holder whose grant it never
+got reclaims it with its next renewal, as under any grace.
+
 A grant lapses when its holding node, or that node's path to the
 sequencer, stalls for longer than the TTL: a partition, a stopped or
 swapped-out daemon, an overloaded host. The sequencer then outwaits the

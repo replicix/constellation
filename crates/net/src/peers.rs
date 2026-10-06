@@ -1322,15 +1322,33 @@ async fn handle_conn<S: PeerService>(
     // unreachable — it could never see more than one serve in flight.
     // The semaphore keeps the resulting concurrency bounded per peer.
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS));
+    let mut full_warned: Option<std::time::Instant> = None;
     loop {
         let (send, recv) = match conn.accept_bi().await {
             Ok(pair) => pair,
             // Normal close.
             Err(_) => return Ok(()),
         };
+        let waiting = std::time::Instant::now();
         let Ok(permit) = slots.clone().acquire_owned().await else {
             return Ok(());
         };
+        // Every permit held: nothing more from this peer is served until
+        // one frees, its renewals and heartbeats included. Said once in a
+        // while, not per stream.
+        let waited = waiting.elapsed();
+        if waited >= Duration::from_secs(1)
+            && full_warned.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+        {
+            full_warned = Some(std::time::Instant::now());
+            tracing::warn!(
+                peer = %hex,
+                waited_ms = waited.as_millis() as u64,
+                limit = MAX_CONCURRENT_STREAMS,
+                "a peer's requests waited for a free stream slot: its earlier ones are all \
+                 still being handled"
+            );
+        }
         let inner = inner.clone();
         let service = service.clone();
         let hex = hex.clone();
@@ -1459,411 +1477,439 @@ async fn handle_stream<S: PeerService>(
         Payload::StreamAhead { .. } => "ahead",
         _ => "other",
     };
-    let reply = match payload {
-        Payload::SegmentPublished { part, seq, epoch } => {
-            service.segment_published(&part, seq, epoch);
-            None
-        }
-        Payload::LogSubscribe {
-            requester,
-            req_id,
-            from,
-            ..
-        } => {
-            serve_log_stream(inner, service, hex, requester, req_id, from, &mut send).await?;
-            let _ = send.finish();
-            return Ok(());
-        }
-        Payload::CondemnedPublished { .. } => None,
-        Payload::LeaseRequest {
-            part,
-            requester,
-            epoch_applied,
-        } => Some(
-            service
-                .lease_requested(part, requester, epoch_applied)
-                .await,
-        ),
-        Payload::MutateRequest {
-            part,
-            requester,
-            req_id,
-            epoch_seen,
-            op,
-            rid,
-            acked_through,
-            deps,
-            pending,
-            applied,
-            lock_tag,
-        } => {
-            // The request carries `rid`/`acked_through`, which mutate
-            // per-requester exactly-once dedup state: only the node that
-            // actually sent it may name itself as `requester`, never a
-            // peer on another node's behalf.
-            if sender_node_id(inner, hex) == Some(requester) {
-                Some(
-                    service
-                        .mutate_requested(
-                            part,
-                            requester,
-                            req_id,
-                            epoch_seen,
-                            op,
-                            rid,
-                            acked_through,
-                            deps,
-                            pending,
-                            applied,
-                            lock_tag,
-                        )
-                        .await,
-                )
-            } else {
-                tracing::warn!(peer = %hex, requester, "dropping a mutate request not sent by its requester");
+    // A handler whose requester gave up (its request timed out, or it
+    // went away: the peer stops the stream) ends here, and frees its
+    // stream permit. Handlers that wait for this node's core (a backup
+    // append parked on its deps, a forwarded op waiting to be durable) held
+    // their permits past their requesters' timeouts, every retry took one
+    // more, and once the connection's [`MAX_CONCURRENT_STREAMS`] were held
+    // nothing more from that peer was accepted — its renewals, heartbeats
+    // and stream batches included (`stress-ng-fs-nodes`: inbound streams
+    // waited 44 s and 99 s for a permit between two delegates that back
+    // each other, and both stalled).
+    let stopped = send.stopped();
+    let handled = async {
+        Ok::<_, anyhow::Error>(Some(match payload {
+            Payload::SegmentPublished { part, seq, epoch } => {
+                service.segment_published(&part, seq, epoch);
                 None
             }
-        }
-        Payload::SnapshotBatchRequest {
-            requester,
-            req_id,
-            rid,
-            items,
-        } => Some(
-            service
-                .snapshot_batch_requested(requester, req_id, rid, items)
-                .await,
-        ),
-        Payload::ChunksDurable { from, hashes } => {
-            // Only the node that forwarded the chunks as pending speaks
-            // for them, never a peer on its behalf.
-            if sender_node_id(inner, hex) == Some(from) {
-                service.chunks_durable(from, hashes).await;
-            } else {
-                tracing::warn!(peer = %hex, from, "dropping a chunks-durable report not sent by its node");
+            Payload::LogSubscribe {
+                requester,
+                req_id,
+                from,
+                ..
+            } => {
+                serve_log_stream(inner, service, hex, requester, req_id, from, &mut send).await?;
+                let _ = send.finish();
+                return Ok(None);
             }
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::DelegateStream {
-            from,
-            req_id,
-            gen,
-            txs,
-        } => Some(
-            service
-                .delegate_stream_requested(from, req_id, gen, txs)
-                .await,
-        ),
-        Payload::DelegRenew {
-            from,
-            req_id,
-            gen,
-            backup,
-            stream_head,
-        } => Some(
-            service
-                .deleg_renew_requested(from, req_id, gen, backup, stream_head)
-                .await,
-        ),
-        Payload::DelegRecall {
-            root,
-            req_id,
-            dir,
-            gen,
-        } => Some(service.deleg_recall_requested(root, req_id, dir, gen).await),
-        Payload::LeaseOffer { part, epoch } => {
-            service.lease_offered(part, epoch);
-            None
-        }
-        Payload::ReadIndex {
-            requester,
-            req_id,
-            ino,
-            dir,
-            name,
-        } => Some(
-            service
-                .read_index_requested(requester, req_id, ino, dir, name)
-                .await,
-        ),
-        Payload::ReadRecall {
-            holder,
-            req_id,
-            ino,
-            grant,
-        } => Some(
-            service
-                .read_recall_requested(holder, req_id, ino, grant)
-                .await,
-        ),
-        Payload::PeerRtts { node_id, rtts } => {
-            service.peer_rtts(node_id, rtts);
-            None
-        }
-        Payload::BackupAppend {
-            holder,
-            req_id,
-            epoch,
-            config_version,
-            candidacy,
-            from,
-            txs,
-            through,
-        } => Some(
-            service
-                .backup_append_requested(
-                    holder,
-                    req_id,
-                    epoch,
-                    (config_version, candidacy),
-                    from,
-                    txs,
-                    through,
-                )
-                .await,
-        ),
-        Payload::StreamAhead {
-            from,
-            epoch,
-            base,
-            txs,
-        } => {
-            service.stream_ahead(from, epoch, base, txs);
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::BackupHold {
-            holder,
-            epoch,
-            for_ms,
-        } => {
-            service.backup_hold(holder, epoch, for_ms);
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::HolderAlive {
-            holder,
-            epoch,
-            candidacy,
-            listed,
-        } => {
-            service.holder_alive(holder, epoch, candidacy, listed);
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::DelegBackupAppend {
-            from,
-            req_id,
-            gen,
-            txs,
-        } => Some(
-            service
-                .deleg_backup_append_requested(from, req_id, gen, txs)
-                .await,
-        ),
-        Payload::DelegSeal { root, req_id, gen } => {
-            Some(service.deleg_seal_requested(root, req_id, gen).await)
-        }
-        Payload::LockRequest {
-            requester,
-            req_id,
-            ino,
-            exclusive,
-            blocking,
-            sent,
-            incarnation,
-        } => Some(
-            service
-                .lock_requested(
-                    requester,
-                    req_id,
-                    ino,
-                    exclusive,
-                    blocking,
-                    sent,
-                    incarnation,
-                )
-                .await,
-        ),
-        Payload::LockRecall {
-            owner,
-            req_id,
-            ino,
-            grant,
-        } => Some(
-            service
-                .lock_recall_requested(owner, req_id, ino, grant)
-                .await,
-        ),
-        Payload::LockRenew {
-            from,
-            req_id,
-            entries,
-        } => Some(service.lock_renew_requested(from, req_id, entries).await),
-        Payload::LockTest {
-            requester,
-            req_id,
-            ino,
-            exclusive,
-        } => Some(
-            service
-                .lock_test_requested(requester, req_id, ino, exclusive)
-                .await,
-        ),
-        // One way: acknowledged with `Ok` so the sender's request
-        // completes; nothing waits on what the service does with it.
-        Payload::LockGranted {
-            from,
-            ino,
-            sent,
-            outcome,
-        } => {
-            service.lock_granted(from, ino, sent, outcome);
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::LockReleased {
-            from,
-            ino,
-            grant,
-            position,
-        } => {
-            service.lock_released(from, ino, grant, &position);
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::LockMirror {
-            from,
-            ver,
-            grants,
-            floor,
-        } => {
-            service.lock_mirror(from, ver, grants, floor);
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::PingS3 { .. } => Some(Payload::Pong {
-            node_id: service.node_id(),
-            s3_ok: service.s3_probe().await,
-        }),
-        Payload::Ping { .. } => Some(Payload::Pong {
-            node_id: service.node_id(),
-            s3_ok: false,
-        }),
-        Payload::EpochPropose {
-            epoch_id,
-            members,
-            base,
-            proposer,
-            epoch_slack,
-        } => Some(
-            service
-                .epoch_proposed(epoch_id, members, base, proposer, epoch_slack)
-                .await,
-        ),
-        Payload::EpochAbort { epoch_id, proposer } => {
-            // Only the proposer itself may abort its proposal: a forged
-            // abort would drop a member's promise while the proposer
-            // still counts the member's ack.
-            if sender_node_id(inner, hex) == Some(proposer) {
-                service.epoch_aborted(epoch_id, proposer);
-            } else {
-                tracing::warn!(peer = %hex, proposer, "dropping an epoch abort not sent by its proposer");
+            Payload::CondemnedPublished { .. } => None,
+            Payload::LeaseRequest {
+                part,
+                requester,
+                epoch_applied,
+            } => Some(
+                service
+                    .lease_requested(part, requester, epoch_applied)
+                    .await,
+            ),
+            Payload::MutateRequest {
+                part,
+                requester,
+                req_id,
+                epoch_seen,
+                op,
+                rid,
+                acked_through,
+                deps,
+                pending,
+                applied,
+                lock_tag,
+            } => {
+                // The request carries `rid`/`acked_through`, which mutate
+                // per-requester exactly-once dedup state: only the node that
+                // actually sent it may name itself as `requester`, never a
+                // peer on another node's behalf.
+                if sender_node_id(inner, hex) == Some(requester) {
+                    Some(
+                        service
+                            .mutate_requested(
+                                part,
+                                requester,
+                                req_id,
+                                epoch_seen,
+                                op,
+                                rid,
+                                acked_through,
+                                deps,
+                                pending,
+                                applied,
+                                lock_tag,
+                            )
+                            .await,
+                    )
+                } else {
+                    tracing::warn!(peer = %hex, requester, "dropping a mutate request not sent by its requester");
+                    None
+                }
             }
-            Some(Payload::Ok { req_id: 0 })
-        }
-        Payload::EpochActivate {
-            epoch_id,
-            members,
-            base,
-            carrier,
-            stale_below,
-        } => {
-            service.epoch_activated(crate::EpochActivation {
-                epoch_id: epoch_id.clone(),
+            Payload::SnapshotBatchRequest {
+                requester,
+                req_id,
+                rid,
+                items,
+            } => Some(
+                service
+                    .snapshot_batch_requested(requester, req_id, rid, items)
+                    .await,
+            ),
+            Payload::ChunksDurable { from, hashes } => {
+                // Only the node that forwarded the chunks as pending speaks
+                // for them, never a peer on its behalf.
+                if sender_node_id(inner, hex) == Some(from) {
+                    service.chunks_durable(from, hashes).await;
+                } else {
+                    tracing::warn!(peer = %hex, from, "dropping a chunks-durable report not sent by its node");
+                }
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::DelegateStream {
+                from,
+                req_id,
+                gen,
+                txs,
+                leaving,
+            } => Some(
+                service
+                    .delegate_stream_requested(from, req_id, gen, txs, leaving)
+                    .await,
+            ),
+            Payload::DelegRenew {
+                from,
+                req_id,
+                gen,
+                backup,
+                stream_head,
+            } => Some(
+                service
+                    .deleg_renew_requested(from, req_id, gen, backup, stream_head)
+                    .await,
+            ),
+            Payload::DelegRecall {
+                root,
+                req_id,
+                dir,
+                gen,
+            } => Some(service.deleg_recall_requested(root, req_id, dir, gen).await),
+            Payload::LeaseOffer { part, epoch } => {
+                service.lease_offered(part, epoch);
+                None
+            }
+            Payload::ReadIndex {
+                requester,
+                req_id,
+                ino,
+                dir,
+                name,
+            } => Some(
+                service
+                    .read_index_requested(requester, req_id, ino, dir, name)
+                    .await,
+            ),
+            Payload::ReadRecall {
+                holder,
+                req_id,
+                ino,
+                grant,
+            } => Some(
+                service
+                    .read_recall_requested(holder, req_id, ino, grant)
+                    .await,
+            ),
+            Payload::PeerRtts { node_id, rtts } => {
+                service.peer_rtts(node_id, rtts);
+                None
+            }
+            Payload::BackupAppend {
+                holder,
+                req_id,
+                epoch,
+                config_version,
+                candidacy,
+                from,
+                txs,
+                through,
+            } => Some(
+                service
+                    .backup_append_requested(
+                        holder,
+                        req_id,
+                        epoch,
+                        (config_version, candidacy),
+                        from,
+                        txs,
+                        through,
+                    )
+                    .await,
+            ),
+            Payload::StreamAhead {
+                from,
+                epoch,
+                base,
+                txs,
+            } => {
+                service.stream_ahead(from, epoch, base, txs);
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::BackupHold {
+                holder,
+                epoch,
+                for_ms,
+            } => {
+                service.backup_hold(holder, epoch, for_ms);
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::HolderAlive {
+                holder,
+                epoch,
+                candidacy,
+                listed,
+            } => {
+                let core_responsive = service.holder_alive(holder, epoch, candidacy, listed);
+                Some(Payload::HolderAliveAck { core_responsive })
+            }
+            Payload::DelegBackupAppend {
+                from,
+                req_id,
+                gen,
+                txs,
+            } => Some(
+                service
+                    .deleg_backup_append_requested(from, req_id, gen, txs)
+                    .await,
+            ),
+            Payload::DelegSeal { root, req_id, gen } => {
+                Some(service.deleg_seal_requested(root, req_id, gen).await)
+            }
+            Payload::LockRequest {
+                requester,
+                req_id,
+                ino,
+                exclusive,
+                blocking,
+                sent,
+                incarnation,
+            } => Some(
+                service
+                    .lock_requested(
+                        requester,
+                        req_id,
+                        ino,
+                        exclusive,
+                        blocking,
+                        sent,
+                        incarnation,
+                    )
+                    .await,
+            ),
+            Payload::LockRecall {
+                owner,
+                req_id,
+                ino,
+                grant,
+            } => Some(
+                service
+                    .lock_recall_requested(owner, req_id, ino, grant)
+                    .await,
+            ),
+            Payload::LockRenew {
+                from,
+                req_id,
+                entries,
+            } => Some(service.lock_renew_requested(from, req_id, entries).await),
+            Payload::LockTest {
+                requester,
+                req_id,
+                ino,
+                exclusive,
+            } => Some(
+                service
+                    .lock_test_requested(requester, req_id, ino, exclusive)
+                    .await,
+            ),
+            // One way: acknowledged with `Ok` so the sender's request
+            // completes; nothing waits on what the service does with it.
+            Payload::LockGranted {
+                from,
+                ino,
+                sent,
+                outcome,
+            } => {
+                service.lock_granted(from, ino, sent, outcome);
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::LockReleased {
+                from,
+                ino,
+                grant,
+                position,
+            } => {
+                service.lock_released(from, ino, grant, &position);
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::LockMirror {
+                from,
+                ver,
+                grants,
+                floor,
+            } => {
+                service.lock_mirror(from, ver, grants, floor);
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::PingS3 { .. } => Some(Payload::Pong {
+                node_id: service.node_id(),
+                s3_ok: service.s3_probe().await,
+            }),
+            Payload::Ping { .. } => Some(Payload::Pong {
+                node_id: service.node_id(),
+                s3_ok: false,
+            }),
+            Payload::EpochPropose {
+                epoch_id,
+                members,
+                base,
+                proposer,
+                epoch_slack,
+            } => Some(
+                service
+                    .epoch_proposed(epoch_id, members, base, proposer, epoch_slack)
+                    .await,
+            ),
+            Payload::EpochAbort { epoch_id, proposer } => {
+                // Only the proposer itself may abort its proposal: a forged
+                // abort would drop a member's promise while the proposer
+                // still counts the member's ack.
+                if sender_node_id(inner, hex) == Some(proposer) {
+                    service.epoch_aborted(epoch_id, proposer);
+                } else {
+                    tracing::warn!(peer = %hex, proposer, "dropping an epoch abort not sent by its proposer");
+                }
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::EpochActivate {
+                epoch_id,
                 members,
                 base,
                 carrier,
                 stale_below,
-            });
-            Some(Payload::EpochAck {
-                epoch_id,
-                member: service.node_id(),
-                accepted: true,
-                claim: None,
-                known: 0,
-            })
-        }
-        Payload::PromiseRequest {
-            requester,
-            req_id,
-            expires_unix_ms,
-        } => Some(
-            service
-                .promise_requested(requester, req_id, expires_unix_ms)
-                .await,
-        ),
-        Payload::ReconcileRequest { queries } => Some(service.reconcile_requested(queries).await),
-        Payload::ChunkHandoff {
-            requester,
-            req_id,
-            hashes,
-        } => {
-            // Fetch from the peer that actually asked, never from a node
-            // it names on someone else's behalf.
-            if sender_node_id(inner, hex) == Some(requester) {
-                Some(
-                    service
-                        .chunk_handoff_requested(requester, req_id, hashes)
-                        .await,
-                )
-            } else {
-                tracing::warn!(peer = %hex, requester, "dropping a chunk handoff not sent by its requester");
-                Some(Payload::ChunkHandoffReply {
-                    req_id,
-                    uploaded: false,
+            } => {
+                service.epoch_activated(crate::EpochActivation {
+                    epoch_id: epoch_id.clone(),
+                    members,
+                    base,
+                    carrier,
+                    stale_below,
+                });
+                Some(Payload::EpochAck {
+                    epoch_id,
+                    member: service.node_id(),
+                    accepted: true,
+                    claim: None,
+                    known: 0,
                 })
             }
-        }
-        Payload::ChunkRequest { hash } => {
-            let served = service.serve_chunk(hash, hex.to_string()).await;
-            let status = match &served {
-                Ok(_) => crate::message::ChunkStatus::Found,
-                Err(why) => crate::message::ChunkStatus::Declined(*why),
-            };
-            let reply = Payload::ChunkResponse { hash, status };
-            let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
-            write_frame(&mut send, &signed).await?;
-            if let Ok(bytes) = served {
-                use tokio::io::AsyncWriteExt;
-                send.write_u64(bytes.len() as u64).await?;
-                send.write_all(&bytes).await?;
+            Payload::PromiseRequest {
+                requester,
+                req_id,
+                expires_unix_ms,
+            } => Some(
+                service
+                    .promise_requested(requester, req_id, expires_unix_ms)
+                    .await,
+            ),
+            Payload::ReconcileRequest { queries } => {
+                Some(service.reconcile_requested(queries).await)
             }
-            let _ = send.finish();
+            Payload::ChunkHandoff {
+                requester,
+                req_id,
+                hashes,
+            } => {
+                // Fetch from the peer that actually asked, never from a node
+                // it names on someone else's behalf.
+                if sender_node_id(inner, hex) == Some(requester) {
+                    Some(
+                        service
+                            .chunk_handoff_requested(requester, req_id, hashes)
+                            .await,
+                    )
+                } else {
+                    tracing::warn!(peer = %hex, requester, "dropping a chunk handoff not sent by its requester");
+                    Some(Payload::ChunkHandoffReply {
+                        req_id,
+                        uploaded: false,
+                    })
+                }
+            }
+            Payload::ChunkRequest { hash } => {
+                let served = service.serve_chunk(hash, hex.to_string()).await;
+                let status = match &served {
+                    Ok(_) => crate::message::ChunkStatus::Found,
+                    Err(why) => crate::message::ChunkStatus::Declined(*why),
+                };
+                let reply = Payload::ChunkResponse { hash, status };
+                let signed = Signed::new(inner.p2p.secret_key(), &reply)?;
+                write_frame(&mut send, &signed).await?;
+                if let Ok(bytes) = served {
+                    use tokio::io::AsyncWriteExt;
+                    send.write_u64(bytes.len() as u64).await?;
+                    send.write_all(&bytes).await?;
+                }
+                let _ = send.finish();
+                return Ok(None);
+            }
+            Payload::Pong { .. }
+            | Payload::LeaseHandoff { .. }
+            | Payload::EpochAck { .. }
+            | Payload::CacheDigest { .. }
+            | Payload::CacheDigestDelta { .. }
+            | Payload::CacheSummary { .. }
+            | Payload::CacheSetDelta { .. }
+            | Payload::ReconcileReply { .. }
+            | Payload::ChunkResponse { .. }
+            | Payload::LogFrame { .. }
+            | Payload::LogEnd { .. }
+            | Payload::MutateReply { .. }
+            | Payload::ReadIndexReply { .. }
+            | Payload::ReadRecalled { .. }
+            | Payload::DelegateStreamAck { .. }
+            | Payload::DelegRenewed { .. }
+            | Payload::DelegRecalled { .. }
+            | Payload::DelegBackupAck { .. }
+            | Payload::DelegSealed { .. }
+            | Payload::BackupAck { .. }
+            | Payload::PromiseReply { .. }
+            | Payload::LockReply { .. }
+            | Payload::LockRecalled { .. }
+            | Payload::LockRenewed { .. }
+            | Payload::LockTestReply { .. }
+            | Payload::ChunkHandoffReply { .. }
+            | Payload::SnapshotBatchReply { .. }
+            | Payload::Ok { .. }
+            | Payload::HolderAliveAck { .. } => None,
+        }))
+    };
+    let reply = tokio::select! {
+        biased;
+        handled = handled => match handled? {
+            Some(reply) => reply,
+            None => return Ok(()),
+        },
+        _ = stopped => {
+            tracing::debug!(peer = %hex, kind, "the requester gave up; stream handler ended");
             return Ok(());
         }
-        Payload::Pong { .. }
-        | Payload::LeaseHandoff { .. }
-        | Payload::EpochAck { .. }
-        | Payload::CacheDigest { .. }
-        | Payload::CacheDigestDelta { .. }
-        | Payload::CacheSummary { .. }
-        | Payload::CacheSetDelta { .. }
-        | Payload::ReconcileReply { .. }
-        | Payload::ChunkResponse { .. }
-        | Payload::LogFrame { .. }
-        | Payload::LogEnd { .. }
-        | Payload::MutateReply { .. }
-        | Payload::ReadIndexReply { .. }
-        | Payload::ReadRecalled { .. }
-        | Payload::DelegateStreamAck { .. }
-        | Payload::DelegRenewed { .. }
-        | Payload::DelegRecalled { .. }
-        | Payload::DelegBackupAck { .. }
-        | Payload::DelegSealed { .. }
-        | Payload::BackupAck { .. }
-        | Payload::PromiseReply { .. }
-        | Payload::LockReply { .. }
-        | Payload::LockRecalled { .. }
-        | Payload::LockRenewed { .. }
-        | Payload::LockTestReply { .. }
-        | Payload::ChunkHandoffReply { .. }
-        | Payload::SnapshotBatchReply { .. }
-        | Payload::Ok { .. } => None,
     };
     let served_us = t0.elapsed().as_micros() as u64;
     if let Some(reply) = reply {
@@ -2715,10 +2761,19 @@ mod tests {
             >,
         > {
             Box::pin(async move {
+                // Released on drop, as `coop`'s serve slot is: a serve
+                // whose requester gave up is dropped mid-sleep.
+                struct Slot<'a>(&'a AtomicU32);
+                impl Drop for Slot<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, AtomicOrder::SeqCst);
+                    }
+                }
                 let n = self.in_flight.fetch_add(1, AtomicOrder::SeqCst) + 1;
+                let slot = Slot(&self.in_flight);
                 self.peak.fetch_max(n, AtomicOrder::SeqCst);
                 tokio::time::sleep(self.delay).await;
-                self.in_flight.fetch_sub(1, AtomicOrder::SeqCst);
+                drop(slot);
                 self.data
                     .clone()
                     .ok_or(crate::message::ChunkDecline::Absent)
@@ -2975,6 +3030,71 @@ mod tests {
             service.peak.load(AtomicOrder::SeqCst),
             2,
             "streams on one connection were handled one at a time"
+        );
+    }
+
+    /// overload-cascade-2: a handler whose requester gave up (dropped its
+    /// side of the stream after a timeout) ends and frees its stream
+    /// permit. Before, handlers waiting on the node's core held their
+    /// permits past their requesters' timeouts, and once a connection's
+    /// `MAX_CONCURRENT_STREAMS` were held nothing more from that peer was
+    /// accepted — its renewals and heartbeats included.
+    #[tokio::test]
+    async fn a_handler_whose_requester_gave_up_frees_its_stream_permit() {
+        let topic = crate::topic_for(Some(&[11u8; 32]), "fs");
+        let holder_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let client_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let holder_addr = holder_p2p.addr();
+        let holder = Peers::new(holder_p2p, 1);
+        holder.refresh_registry(vec![
+            (
+                1,
+                holder.pubkey_hex().unwrap(),
+                serde_json::to_value(&holder_addr).unwrap(),
+            ),
+            (
+                2,
+                client_p2p.pubkey_hex(),
+                serde_json::to_value(client_p2p.addr()).unwrap(),
+            ),
+        ]);
+        // Every chunk request waits (as a handler parked on the core would).
+        let service = ChunkServer::new(Some(vec![5u8; 16]), Duration::from_secs(3_600));
+        let serving = holder.clone();
+        let svc = service.clone();
+        tokio::spawn(async move { serving.serve(svc).await });
+        let conn = client_p2p
+            .endpoint()
+            .connect(holder_addr, ALPN)
+            .await
+            .unwrap();
+        let chunk = Signed::new(
+            client_p2p.secret_key(),
+            &Payload::ChunkRequest { hash: a_hash() },
+        )
+        .unwrap();
+        for _ in 0..MAX_CONCURRENT_STREAMS + 4 {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            write_frame(&mut send, &chunk).await.unwrap();
+            send.finish().ok();
+            // The requester times out: it drops its side.
+            drop(recv);
+        }
+        let ping = Signed::new(client_p2p.secret_key(), &Payload::Ping { node_id: 2 }).unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            write_frame(&mut send, &ping).await?;
+            send.finish().ok();
+            read_frame(&mut recv).await?.verify()
+        })
+        .await;
+        assert!(
+            matches!(answered, Ok(Ok((_, Payload::Pong { .. })))),
+            "a request after abandoned ones was not served: {answered:?}"
         );
     }
 

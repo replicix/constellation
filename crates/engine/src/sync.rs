@@ -264,6 +264,7 @@ pub enum SyncRequest {
         from: u64,
         gen: u64,
         txs: Vec<constellation_meta::DelegateTx>,
+        leaving: Vec<constellation_meta::locks::Grant>,
         reply: tokio::sync::oneshot::Sender<(u64, bool)>,
     },
     /// Plan 30 §M11: a delegate's renewal; answered with the ttl (0:

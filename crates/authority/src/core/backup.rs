@@ -124,6 +124,35 @@ const HOUSEKEEPING_MS: i64 = 50;
 /// watch, whatever it asks.
 pub const BACKUP_HOLD_MAX_MS: u64 = 30_000;
 
+/// How long a candidate that timed out `strikes` times in a row is not
+/// brought up again: the reconfiguration rate limit doubled per strike
+/// (6 s, 12 s, 24 s, ... at the 3 s default), at most a minute. A
+/// candidate that makes it into the set starts over.
+pub(crate) fn candidate_backoff_ms(reconfig_min_ms: u64, strikes: u32) -> u64 {
+    reconfig_min_ms
+        .max(1)
+        .saturating_mul(1u64 << strikes.min(16))
+        .min(CANDIDATE_BACKOFF_MAX_MS)
+}
+
+/// The longest [`candidate_backoff_ms`].
+const CANDIDATE_BACKOFF_MAX_MS: u64 = 60_000;
+
+/// A candidate's strike count after it timed out at `now`, its previous
+/// strikes and the end of their backoff being `prev`: one more — unless
+/// it has had a quiet [`CANDIDATE_BACKOFF_MAX_MS`] since that backoff
+/// ended (not timed out again in that time), when it starts over at 1. A
+/// node that timed out once an hour ago is not still on its second
+/// strike.
+pub(crate) fn candidate_strikes_after(prev: Option<(u32, Ms)>, now: Ms) -> u32 {
+    match prev {
+        Some((strikes, until)) if now.since(until) < CANDIDATE_BACKOFF_MAX_MS as i64 => {
+            strikes.saturating_add(1)
+        }
+        _ => 1,
+    }
+}
+
 /// One backup (committed, or a candidate being brought up) as the holder
 /// tracks it.
 #[derive(Debug, Clone)]
@@ -233,6 +262,10 @@ pub(crate) struct AckState {
     /// When each node was last dropped or removed (not re-added within
     /// `backup_reconfig_min_ms`).
     last_dropped: BTreeMap<NodeId, Ms>,
+    /// Candidates that timed out lately: how many times in a row, and
+    /// until when they are not brought up again ([`candidate_backoff_ms`];
+    /// the count decays, [`candidate_strikes_after`]).
+    candidate_strikes: BTreeMap<NodeId, (u32, Ms)>,
     /// The highest journal seq any acknowledgement of this tenure may
     /// have rested on (the durable seq's high-water mark). A backup is
     /// removed from the lease only once everything up to here is in the
@@ -806,6 +839,10 @@ impl Core {
         for (n, p) in self.ack.peers.iter_mut() {
             p.committed = committed.contains(n);
         }
+        // A candidate that made it in starts over.
+        self.ack
+            .candidate_strikes
+            .retain(|n, _| !committed.contains(n));
         let candidate = self.ack.candidate;
         self.ack
             .peers
@@ -869,11 +906,21 @@ impl Core {
         {
             return;
         }
+        // A candidate that timed out lately is backed off: brought up
+        // again, it starts from zero and likely times out the same way
+        // (`stress-ng-fs-nodes`: the same loaded node re-selected every
+        // ~13 s for minutes, each time re-streaming the journal). Another
+        // peer goes first meanwhile.
         let Some(n) = candidates.into_iter().find(|n| {
             self.ack
                 .last_dropped
                 .get(n)
                 .is_none_or(|at| now.since(*at) >= self.cfg.backup_reconfig_min_ms as i64)
+                && self
+                    .ack
+                    .candidate_strikes
+                    .get(n)
+                    .is_none_or(|(_, until)| now >= *until)
         }) else {
             return;
         };
@@ -1066,6 +1113,18 @@ impl Core {
                 self.ack.candidate = None;
                 self.ack.peers.remove(&n);
                 self.ack.last_dropped.insert(n, now);
+                let strikes =
+                    candidate_strikes_after(self.ack.candidate_strikes.get(&n).copied(), now);
+                let until = now.plus(candidate_backoff_ms(
+                    self.cfg.backup_reconfig_min_ms,
+                    strikes,
+                ));
+                // Entries that have decayed act as absent ones: gone
+                // (a node that left the cluster keeps none).
+                self.ack
+                    .candidate_strikes
+                    .retain(|_, (_, u)| now.since(*u) < CANDIDATE_BACKOFF_MAX_MS as i64);
+                self.ack.candidate_strikes.insert(n, (strikes, until));
                 continue;
             }
             self.drop_backup(now, n, "no acknowledgement progress");

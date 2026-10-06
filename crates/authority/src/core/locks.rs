@@ -135,7 +135,28 @@ struct RenewInFlight {
     entries: Vec<(Ino, GrantId)>,
     sent: Ms,
     timer: TimerId,
+    /// The owner it went to.
+    to: NodeId,
 }
+
+/// A renewal whose answer `on_lock_renew_timeout` stopped waiting for:
+/// the owner it went to and this node's clock at the send. The timeout
+/// lets the next tick renew again (a lost request is re-sent at once);
+/// it says nothing about the answer to this one, which an owner whose
+/// requests queue behind seconds of other work gives late. Thrown away,
+/// as they were, every renewal answered later than the timeout (500 ms)
+/// was wasted: under `stress-ng-fs-nodes` an owner's answers all came
+/// late, no renewal ever counted, and the grant lapsed under the
+/// holder's writes (`EIO`) although the owner had renewed it each time.
+/// A late grant is honoured from its own send, as one in time would be.
+#[derive(Debug, Clone, Copy)]
+struct LateRenew {
+    to: NodeId,
+    sent: Ms,
+}
+
+/// How long a late renewal answer is still used ([`LateRenew`]).
+const LATE_RENEW_MS: i64 = 60_000;
 
 #[derive(Debug, Default)]
 pub(crate) struct LockState {
@@ -146,6 +167,7 @@ pub(crate) struct LockState {
     tests: BTreeMap<OpId, OpId>,
     test_by_req: BTreeMap<OpId, OpId>,
     renews: BTreeMap<OpId, RenewInFlight>,
+    late_renews: BTreeMap<OpId, LateRenew>,
     renew_timer: Option<TimerId>,
     /// When `renew_timer` fires.
     renew_at: Option<Ms>,
@@ -366,6 +388,7 @@ impl LockState {
             ("lk_waiters", self.waiters.len()),
             ("lk_recalls", self.recalls.len()),
             ("lk_renews", self.renews.len()),
+            ("lk_late_renews", self.late_renews.len()),
             ("lk_horizon_held", self.horizon_held.len()),
         ]
     }
@@ -541,15 +564,23 @@ impl Core {
         lease.expires_unix_ms - self.lock_margin_ms() - now.0
     }
 
-    /// The inode is under a subtree grace (an outwaited delegate).
+    /// The inode is under a subtree grace (an outwaited delegate), or is
+    /// unlinked while one lasts: a generation that ends without handing
+    /// its grants back (outwaited, sealed, drained from its backup) may
+    /// have granted an inode its rows then took out of the subtree, and
+    /// such an inode is under no directory any more. Which subtree it
+    /// left is not recorded, so any grace covers every unlinked inode
+    /// (reclaims admitted, as under any grace).
     fn lock_in_grace(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> bool {
+        use constellation_fs_core::types::ROOT_INO;
         self.lk.grace.retain(|(_, until)| *until > now);
         if self.lk.grace.is_empty() {
             return false;
         }
         let dirs: Vec<Ino> = self.lk.grace.iter().map(|(d, _)| *d).collect();
         dirs.iter()
-            .any(|d| *d == constellation_fs_core::types::ROOT_INO || replica.is_under(ino, *d))
+            .any(|d| *d == ROOT_INO || replica.is_under(ino, *d))
+            || (ino != ROOT_INO && !replica.is_under(ino, ROOT_INO))
     }
 
     /// Whether new grants are refused now (reclaims still accepted).
@@ -2864,6 +2895,7 @@ impl Core {
                     entries: entries.iter().map(|(i, h)| (*i, h.id)).collect(),
                     sent: now,
                     timer,
+                    to,
                 },
             );
             tracing::debug!(
@@ -2960,6 +2992,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let Some(r) = self.lk.renews.remove(&req) else {
+            self.lock_late_renewed(now, from, req, results, replica, out);
             return;
         };
         self.cancel_timer(r.timer, out);
@@ -3044,7 +3077,55 @@ impl Core {
             for (ino, id) in r.entries {
                 replica.locks().renewal_failed(ino, id);
             }
+            let sent = r.sent;
+            self.lk
+                .late_renews
+                .retain(|_, l| sent.since(l.sent) < LATE_RENEW_MS);
+            self.lk
+                .late_renews
+                .insert(req, LateRenew { to: r.to, sent });
             self.lock_relearn_owner(out);
+        }
+    }
+
+    /// The answer to a renewal [`LateRenew`] stopped waiting for: only
+    /// its granted renewals count — honoured from that renewal's send
+    /// (`LockTable::renewed` never shortens a grant). A `Lost` or
+    /// `NotOwner` late is left to the renewal sent since: an owner that
+    /// gave the inode away after answering this one would have the grant
+    /// dropped that its successor renewed meanwhile.
+    fn lock_late_renewed(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        req: OpId,
+        results: Vec<(Ino, GrantId, LockRenewResult)>,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        // Only from the owner it went to (another node's answer to the
+        // same id leaves it for that one).
+        let late = match self.lk.late_renews.entry(req) {
+            std::collections::btree_map::Entry::Occupied(e) if e.get().to == from => e.remove(),
+            _ => return,
+        };
+        self.note_p2p_result(now, from, true);
+        let granted: Vec<_> = results
+            .into_iter()
+            .filter(|(_, _, r)| matches!(r, LockRenewResult::Ok { .. }))
+            .collect();
+        tracing::debug!(
+            node = self.cfg.node_id,
+            from,
+            late_ms = now.since(late.sent),
+            granted = granted.len(),
+            "late lock renewals answered"
+        );
+        for (ino, id, result) in granted {
+            self.lock_apply_renew_result(now, ino, id, late.sent, result, replica, out);
+        }
+        if replica.locks().held_count() > 0 {
+            self.lock_arm_renew_tick(now, replica, out);
         }
     }
 
@@ -3379,6 +3460,188 @@ impl Core {
         }
     }
 
+    /// Delegate: the live grants of generation `gen` on inodes that are
+    /// no longer in any delegated subtree here — unlinked under their
+    /// lock (`stress-ng`'s lock stressors unlink their files while they
+    /// hold them). By location such an inode is the root's now, and its
+    /// holder renews there; the root, which never had the grant, answered
+    /// `Lost` (overload-cascade-2: the holder's writes discarded, `EIO`)
+    /// — or, adopting it at that renewal instead, could have granted the
+    /// inode to another node first (routed to the root by location too)
+    /// and then adopted the first holder's grant once that one released:
+    /// two exclusive holders. So the grants go to the root with the batch
+    /// that carries the unlink ([`Core::lock_install_leaving`]): the root
+    /// keeps routing the inode here until it applies that row, and has
+    /// the grants from the same step on. This node no longer serves the
+    /// inode (it routes it to the root), so nothing changes them
+    /// meanwhile but a lapse.
+    pub(crate) fn deleg_leaving_grants(
+        &self,
+        now: Ms,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> Vec<Grant> {
+        if replica.locks().grants_len() == 0 {
+            return Vec::new();
+        }
+        replica
+            .locks()
+            .grants_snapshot()
+            .into_iter()
+            .filter(|g| {
+                g.gen == gen
+                    && g.until_ms > now.0
+                    && matches!(
+                        replica.resolve_ownership(&Self::read_keys(g.ino, None)),
+                        constellation_meta::delegation::Ownership::Root
+                    )
+            })
+            .collect()
+    }
+
+    /// Delegate: the root acknowledged the batch that carried grants out
+    /// of the subtree ([`Core::deleg_leaving_grants`]): they are the
+    /// root's, and leave this table (a recall must not hand them back
+    /// over the root's own record, which may have ended them since).
+    pub(crate) fn deleg_drop_left(&mut self, gen: u64, replica: &dyn Replica) {
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        let through = d.streamed_through;
+        let Some((_, inos)) = d.leaving.take_if(|(last, _)| *last <= through) else {
+            return;
+        };
+        let gone = replica.locks().take_where(|ino| inos.contains(&ino));
+        if !gone.is_empty() {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                gen,
+                n = gone.len(),
+                "lock grants on inodes that left the subtree are the root's now"
+            );
+        }
+    }
+
+    /// Root: a delegate's batch of `gen`, applied through its last row,
+    /// carried `leaving` ([`Core::deleg_leaving_grants`]) — installed
+    /// restamped, as a move is, where the inode is this table's now (or
+    /// still the sending generation's: a later row the delegate has not
+    /// streamed yet takes it out, and the delegate no longer serves it).
+    /// A grant this table has already (its own copy, put back by
+    /// [`Core::lock_take_back_left`]) is extended to the restamped end:
+    /// the delegate renewed it past what this root recorded. A grant this
+    /// table ended (the batch re-sent after its holder released it here)
+    /// or one next to a conflicting grant stays out.
+    pub(crate) fn lock_install_leaving(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        leaving: Vec<Grant>,
+        replica: &dyn Replica,
+    ) {
+        let until = self.restamp(now);
+        let mut n = 0;
+        for g in leaving {
+            let here = match replica.resolve_ownership(&Self::read_keys(g.ino, None)) {
+                constellation_meta::delegation::Ownership::Root => true,
+                constellation_meta::delegation::Ownership::Delegated(d) => d.gen == gen,
+                _ => false,
+            };
+            if !here || replica.locks().was_ended(g.id) {
+                continue;
+            }
+            if let Some(e) = replica.locks().get(g.id) {
+                if e.node == g.node && e.ino == g.ino && e.until_ms < until {
+                    replica.locks().install(Grant {
+                        until_ms: until,
+                        ..e
+                    });
+                }
+                continue;
+            }
+            let g = Grant {
+                until_ms: until,
+                gen: 0,
+                ..g
+            };
+            if replica.locks().install_if_consistent(g) {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.stats.lock_moved += n;
+            self.stats.lock_leaving_installed += n;
+            self.lk.mirror_dirty = true;
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen,
+                n,
+                "installed a delegate's lock grants on inodes that left its subtree"
+            );
+        }
+    }
+
+    /// Root: rows of generation `gen` were applied here; grants this root
+    /// moved to the generation itself — waiting for its first renewal
+    /// ([`LockState::handoff`]) or handed and not handed back
+    /// ([`LockState::handed`]) — on an inode those rows took out of the
+    /// subtree (unlinked under the lock) come back to this table as it
+    /// recorded them, unconfirmed (the delegate may have ended one). The
+    /// delegate cannot carry them ([`Core::deleg_leaving_grants`]) if they
+    /// never reached it (sim `locks-unlinked-delegated` seed 292: a
+    /// recall and re-delegation put the grant in the new generation's
+    /// handoff, the delegate executed the unlink before its first
+    /// renewal, and the root granted the unlinked inode over it); one it
+    /// did install and renew comes with its batch and extends this copy
+    /// ([`Core::lock_install_leaving`]). Nor are they handed to the
+    /// delegate after this: it no longer serves the inode.
+    pub(crate) fn lock_take_back_left(&mut self, now: Ms, gen: u64, replica: &dyn Replica) {
+        let left = |g: &Grant| {
+            matches!(
+                replica.resolve_ownership(&Self::read_keys(g.ino, None)),
+                constellation_meta::delegation::Ownership::Root
+            )
+        };
+        let mut back = Vec::new();
+        for moved in [self.lk.handoff.get_mut(&gen), self.lk.handed.get_mut(&gen)]
+            .into_iter()
+            .flatten()
+        {
+            moved.retain(|g| {
+                if left(g) {
+                    back.push(*g);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        let mut n = 0;
+        for g in back {
+            let g = Grant {
+                gen: 0,
+                confirmed_ms: Grant::UNCONFIRMED,
+                ..g
+            };
+            if g.until_ms > now.0
+                && !replica.locks().was_ended(g.id)
+                && replica.locks().install_if_consistent(g)
+            {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.stats.lock_reinstated += n;
+            self.lk.mirror_dirty = true;
+            tracing::info!(
+                node = self.cfg.node_id,
+                gen,
+                n,
+                "grants moved to a delegation came back with their inodes, which left its subtree"
+            );
+        }
+    }
+
     /// Root: the lock floor a granting renewal of `gen` carries.
     pub(crate) fn lock_floor_for_generation(&self, gen: u64) -> Position {
         self.lk.handed_floor.get(&gen).copied().unwrap_or_default()
@@ -3479,6 +3742,22 @@ impl Core {
         }
         if let Some(handed) = self.lk.handed.get_mut(&gen) {
             handed.retain(|h| !grants.iter().any(|g| g.node == h.node && g.ino == h.ino));
+        }
+        // A grant on an inode that left the subtree is this table's since
+        // the row that took it out (it came with that row, or was this
+        // root's own copy, `lock_take_back_left`): the delegate's copy may
+        // be older than what this root made of it since (sim
+        // `locks-unlinked-delegated` seed 6475: the root upgraded it to
+        // exclusive, the recall answer put the delegate's shared copy
+        // back over it, and the root granted another node shared).
+        let (left, grants): (Vec<Grant>, Vec<Grant>) = grants.into_iter().partition(|g| {
+            matches!(
+                replica.resolve_ownership(&Self::read_keys(g.ino, None)),
+                constellation_meta::delegation::Ownership::Root
+            )
+        });
+        if !left.is_empty() {
+            self.lock_install_leaving(now, gen, left, replica);
         }
         if !grants.is_empty() {
             self.lock_install_moved(now, 0, grants, replica);

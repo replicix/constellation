@@ -1117,6 +1117,10 @@ impl Engine {
             hold_sources.clone(),
             crate::holds::HoldConfig::from_env(core_config.ttl_ms),
         );
+        // The driver's urgent lane and what it shares with the peer
+        // service off the core's step (`authority_driver::OffCore`).
+        let (urgent_tx, urgent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let off_core = Arc::new(crate::authority_driver::OffCore::for_config(&core_config));
         // The core's IO driver: the sync task (plan 30 M5).
         {
             let driver = crate::authority_driver::Driver::new(
@@ -1155,6 +1159,8 @@ impl Engine {
                     },
                     fault_reply_delay_ms: fault_forward_delay_ms,
                     holds: Some(holds.clone()),
+                    off_core: off_core.clone(),
+                    urgent_rx: Some(urgent_rx),
                 },
                 sync_tx.clone(),
                 sync_rx,
@@ -1201,6 +1207,8 @@ impl Engine {
             snapshot_batches: snapshot_batches.clone(),
             node_id,
             nudge: sync_tx.clone(),
+            urgent: urgent_tx,
+            off_core: off_core.clone(),
             epochs: epochs.clone(),
             store: store.inner().clone(),
             coop: coop.clone(),

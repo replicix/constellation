@@ -43404,3 +43404,371 @@ task asked.
 | harness `lock-grant-dead-generation` ×12 | 12/12 PASSED (11.1–11.4 s) |
 | harness `lock-*` (all 6) | all PASSED |
 | `git-under-flock-causal` ×3, `auto` (io_uring transport) | 3/3 PASSED (285, 287, 266 s); 0 overlapping, 0 fenced; lock acquire wait p50 0.59–0.61 s, max 3.1–3.9 s |
+
+## Fix: a slow backup sealed a live holder; lock grants lapsed under multi-node load (`overload-cascade-2`)
+
+Follow-up of `overload-cascade` (its "Coordinator note at merge" lists
+what was open). Base: main `8734437`, which has 5f289b4 (dentry-limited
+reverse invalidations) and 06d635b (cluster-lock mounts take the
+io_uring ring under `auto`). Host: 32 CPUs, kernel 7.3.0-rc4, load 6–65
+during the runs (much lower than the 100–350 of the first chunk). Runs
+use `/var/tmp/oc2/run.sh` (harness prefix `oc2`, `CHAOS_KEEP_TMP=1`, a
+`status` sample of every node each 15 s) and `/var/tmp/oc2/summ.sh`
+(counts from the daemon logs; it counts the real stuck-driver message,
+`the authority driver has made no progress`, item 8). Artifacts are
+under `/var/tmp/harness-stress-ng-fs-nodes-*`.
+
+### 1. Re-measured on main (`8734437`, built in a separate worktree)
+
+| run | load | result | live-holder seals | lost grants | lapse discards (EIO) n0/n1/n2 | stalled FUSE requests n0/n1/n2 | bring-ups / candidate timeouts (holder) |
+|---|---|---|---|---|---|---|---|
+| main1 | 14→9 | hung (harness killed at 560 s) | 0 | 0 | 0/0/0 | 0/216/216 | 11 / 10 |
+| main2 | 8→13 | FAILED (n1 did not finish) | 0 | 0 | 0/5/0 | 0/155/168 | 4 / 3 |
+| main3 | 12→9 | hung (harness killed at 560 s) | 0 | 0 | 0/0/2 | 0/216/216 | 7 / 6 |
+
+Attribution:
+
+- **Stalled requests (all of them): the delegates' livelock, not the
+  invalidations.** Every stalled request on n1 and n2 waits at "mutation
+  submitted to the core (reply)" for the whole run (558 s). The status
+  samples show it: each delegate's `delegation.streamed_txs` climbs (20k →
+  120k) while `executed`, `backup_acks` and `acks_parked` do not move for
+  minutes. A delegate's stream batch or backup append whose answer came
+  later than the request timeout (500 ms) was dropped and the same batch
+  re-sent, so under load no answer ever counted. Meanwhile handlers that
+  wait on the core kept their stream permits past their requesters'
+  timeouts, until the connection's `MAX_CONCURRENT_STREAMS` were all held
+  and nothing more from that peer (renewals and heartbeats included) was
+  accepted. None is a reverse-invalidation stall, and none is lsm-tree.
+- **Lapse discards (7):** all consequences of the stall. On main2's n1
+  the delegation lapsed unrenewed ("delegation lapsed unrenewed past the
+  root's earliest reclaim") and the harness aborted the stuck connection.
+  On main3's n2 two setattrs under a lock waited 65 s in the stall, past
+  the grant's window.
+- **Seals:** none on main at this load.
+- **Candidate churn:** the holder re-selected the same timed-out
+  candidate (3–10 timeouts per run).
+
+### Fix
+
+| item | change | where |
+|---|---|---|
+| 2 | The P2P bridge records the latest arrival of each holder's `HolderAlive` and `BackupAppend` (per holder and epoch) in `OffCore`, off the core's step; the driver hands the arrivals not yet handed to the core as `Event::HolderAlive { at: arrival }` immediately before a `BackupWatch` timer is evaluated. `SILENCE_DRAIN_BUDGET`, `drain_queued` and `measures_silence` are gone (restored for every other silence timer in round 2, below): an owner's grant expiries (`LockGrantExpiry`, `DelegExpiry`) still go after the renewals queued when they fired, now on the urgent lane (below), which is small and cheap to drain | `engine::authority_driver::{OffCore, fresh_heard, Driver::hand_heard, waits_for_renewals}`, `engine::p2p::{backup_append_requested, holder_alive}` |
+| 3 | `HolderAlive` is answered with `HolderAliveAck { core_responsive }` (appended last to `Payload`; no ALPN bump): true only while the backup's driver waits for work or is in a wake-up younger than `backup_slow_max_ms / 2` (5 s), the `busy_since` stamp the holder already uses. The holder sends `BackupAlive` (the 10 s slow bound) only on `true` | `net::message::Payload::HolderAliveAck`, `net::PeerService::holder_alive -> bool`, `OffCore::core_responsive`, `holder_alive_task` |
+| 4 | A beat goes out every interval; up to `ceil(BEAT_TIMEOUT / interval)` (17 at 300 ms) wait for their answers per peer, each up to 5 s (a timeout still marks no link down) | `beats_outstanding_max`, `beat_slot`, `beat_done` |
+| 5 | A candidate that times out is backed off: not brought up again for the reconfiguration rate limit doubled per consecutive timeout (6 s, 12 s, … at most 60 s), so another peer goes first; it starts over once committed | `core::backup::{candidate_backoff_ms, AckState::candidate_strikes}`, `backup_select`, `backup_timeouts` |
+| 6 | Renewals do not starve. (a) Renewals (lock, delegation) and the holder's heartbeat reach the driver on an urgent lane served before the ordinary requests. (b) A peer stream handler whose requester gave up (its side stopped) ends and frees its stream permit; a peer whose permits are all held is logged (`a peer's requests waited for a free stream slot`). (c) Late answers count: a lock renewal, a delegation renewal, a delegate's stream batch and backup append whose answer comes after the request timeout is remembered for 60 s (`LateRenew`, `LateReq`). A late grant is honoured from its own send; a late stream or backup acknowledgement is credited only if it came from the root or backup still streamed to; a late refusal or `Lost` is ignored. A timed-out stream batch is re-sent after a backoff (4 ticks doubling to 2 s), not every timeout. (d) (replaced in round 2, below: it broke exclusion) A grant on a file unlinked under its lock (in no delegated subtree any more, so the renewal goes to the root) is adopted by the root if nothing conflicts and the root did not end it itself (`LockTable::was_ended`); before, the root answered `Lost` and the holder's writes were discarded. (e) (replaced in round 2, below: it starved) A non-holder's log-stream frames have a bounded lane (64) of their own instead of the unbounded internal channel that every reply and timer queued behind | (a) `DriverDeps::urgent_rx`, `P2pBridge::urgent`; (b) `net::peers::handle_stream`, `handle_conn`; (c) `core::locks::{LateRenew, lock_late_renewed}`, `core::delegate::{LateReq, deleg_late_stream_ack, deleg_late_renewed, deleg_expire_inflight}`; (d) `core::locks::lock_adopts_unplaced`, `lock_renew_one`, `meta::locks::LockTable::was_ended`; (e) `LOG_LANE`, `spawn_subscription` |
+| 8 | The stuck-driver warning says "its backups will seal this tenure" only with `holding=true`; on a non-holder it is just `the authority driver has made no progress` | `holder_alive_task` |
+
+Decisions:
+
+- **Unlinked-under-lock grants (6d)** (superseded in round 2: the
+  adoption below broke mutual exclusion). An earlier draft of this chunk
+  renewed such a grant at the delegate that had it. That fixed the lapses
+  but left the root unaware of the grant: another node with the unlinked
+  file open would be routed to the root by location and granted over it,
+  for as long as the delegate kept renewing. Adoption by the root closes
+  that. The window before the holder's first renewal at the root remains,
+  as before (the root may grant over it there; the holder then gets
+  `Lost`, as it did).
+- **The delegation TTL default stays at the lock TTL (20 s).** With the
+  renewal fixes, `CONSTELLATION_DELEGATION_TTL_MS=5000` still failed
+  `stress-ng-fs-nodes`: 7 + 5 lapse discards and 63 fenced writes. A
+  delegate's own core spent 0.5–0.8 s per log-apply step behind lsm-tree
+  compactions, against its lock grants capped at ~2.3 s. At 10 000 it
+  passed 2 of 2 with no lapse (load 35–65). 10 s is the candidate (a dead
+  delegate's subtree reclaimed after ~11 s instead of ~21 s), but two runs
+  at moderate load are not enough to move a default the first chunk saw
+  lapse at load 100–350. Recorded at `load_config`.
+- **One mock fixed, no assertion changed.** `ChunkServer`'s in-flight
+  counter in `net::peers` tests now releases on drop, as `coop`'s
+  `ServeSlot` does, because a serve whose requester gave up is now
+  dropped. `chunk_timeout_bounds_the_wait_and_server_work_releases` keeps
+  its assertion.
+
+### Tests
+
+- `authority_driver::tests::{the_seal_watch_is_handed_the_holders_latest_arrival,
+  a_backup_answers_its_heartbeat_with_its_own_drivers_progress,
+  beats_go_out_every_interval_up_to_a_cap_per_peer,
+  only_grant_expiries_wait_for_queued_renewals}` (the last replaces
+  `only_silence_timers_wait_for_the_backlog_and_only_so_long`, whose
+  drain is gone).
+- `core::tests::pipelined_appends::a_candidate_that_timed_out_is_backed_off_and_another_peer_goes_first`.
+- `core::tests::locks::{a_renewal_answered_after_its_timeout_still_counts,
+  a_grant_on_a_file_unlinked_under_its_lock_is_adopted_by_the_root}`.
+  The second covers a delegate-minted grant, a root-minted grant that
+  moved with the delegation, a grant the root ended (stays `Lost`) and a
+  conflicting root grant (stays `Lost`). It fails with the adoption
+  disabled.
+- `core::tests::a_delegates_late_answers_still_count`.
+- `net::peers::tests::a_handler_whose_requester_gave_up_frees_its_stream_permit`.
+
+### 7. `backup-takeover-holds-missing-chunks`
+
+20 of 20 PASSED (12.8–13.2 s each, `CHAOS_KEEP_TMP=1`, load 8–12). The
+102.6 s failure was not reproduced, and its artifacts are gone. Neither
+shown on main nor fixed; open. It needs the load it failed under, which
+this chunk may not generate.
+
+### Development runs (this tree, before the final code)
+
+| run | result | what it showed |
+|---|---|---|
+| r1 | FAILED: `locks.lost = 3` | adoption of delegate-minted grants on unlinked files worked (`reclaimed a lock grant from=2/3`); 3 + 3 `Lost` remained |
+| r2dbg (`core::locks=debug`) | FAILED: `locks.lost = 3` | the remaining ones were root-minted grants that had moved to the delegate with the delegation; the root did not adopt its own ids → `was_ended` rule |
+| r3dbg (`core::locks=debug`) | FAILED: `n1 logged 1 ERROR line` | 0 seals, 0 lost, 0 discards, 0 stalled; the ERROR is iroh's own `could not close last open path` at connection setup (also in a run of an older tree, `harness-stress-ng-fs-nodes-vO49d6`) |
+
+### Gates (final code; `CARGO_TARGET_DIR` unset, `ulimit -n 65536`)
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- Workspace tests, split: net 120 + 4, engine 597 (+9 ignored) + 1, the
+  other crates 1456; authority (release, with sim,
+  `AUTHORITY_SIM_THREADS=8`) 272 + 4 + 123 (+13 ignored); model (release)
+  138 (+13 ignored). 0 failed. One unrelated flake on the first pass:
+  `platform::linux::tests::another_process_is_seen_to_have_its_file_open`
+  (it races the child's exec); it passed 3 of 3 alone and in the rerun.
+- Harness, all 29 of `backup-*`, `lock-*`, `delegate*` and
+  `git-under-flock*`, at their default durations: all PASSED.
+  `backup-takeover-holds-missing-chunks`, `backup-takeover-drops-held-chunks`,
+  `backup-failover`, `backup-departs`, `backup-failover-with-delegation`,
+  `backup-partition`, `delegated-subtrees`, `delegate-crash`,
+  `delegate-crash-default-ttl`, `delegate-partition`,
+  `delegated-op-latency`, `delegate-crash-backup`, `delegate-root-loss`,
+  `delegate-root-blackhole`, `delegate-root-loss-ttl`,
+  `delegate-handoff-renewal`, `delegate-backup-handoff-failover`,
+  `lock-grant-dead-generation`, `lock-holder-partitioned`, `lock-failover`,
+  `lock-holder-killed-contention`, `lock-fence-at-close`, `lock-latency`,
+  `git-under-flock` (118 s), `git-under-flock-gc`, `git-under-flock-causal`
+  (280 s), `git-under-flock-faults` (176 s), `git-under-flock-b2b` (285 s),
+  `git-under-flock-rounds` (427 s, 3 rounds).
+- `stress-ng-fs-nodes` ×5: **4 PASSED, 1 FAILED** at the load of these
+  runs. **The gate is not reached under heavier load:** the review's two
+  runs (host load to ~98) both FAILED (n1's mutations waited up to 216 s,
+  one lapse discard, a conflict copy from a lapsed grant), and so did
+  every run of round 2 (below), on this tree and on main alike.
+
+| run | load | result | live-holder seals | lost grants | lapse discards | stalled FUSE requests n0/n1/n2 | bring-ups / candidate timeouts | max step |
+|---|---|---|---|---|---|---|---|---|
+| gate1 | 6→20 | FAILED: stress-ng[n0] did not finish | 0 | 0 | 0 | 0/0/0 | 2 / 0 | 1.0 s |
+| gate2 | 11→47 | PASSED (188 s) | 0 | 0 | 0 | 0/0/0 | 4 / 1 | 1.75 s |
+| gate3 | 44→47 | PASSED (183 s) | 0 | 0 | 0 | 0/0/0 | 1 / 0 | 0.8 s |
+| gate4 | 44→31 | PASSED (214 s) | 0 | 0 | 0 | 0/0/0 | 2 / 0 | 1.1 s |
+| gate5 | 29→46 | PASSED (183 s) | 0 | 0 | 0 | 0/0/0 | 1 / 0 | 0.9 s |
+
+  Also with the final code: `CONSTELLATION_DELEGATION_TTL_MS=10000` ×2
+  PASSED (0 / 0 / 0 / 0), and `=5000` ×1 FAILED (0 seals, 0 lost, 12
+  lapse discards, 63 fenced writes).
+
+**gate1's failure (not in this chunk's area; open).** Eight
+`stress-ng-filerace` processes on the holder n0 stayed in
+`request_wait_answer`, `fuse_cache_write_iter` and
+`folio_wait_bit_common`. The daemon at the same time had nothing to
+answer: `fuse_requests` `in_flight` 0–3, `oldest_s` 0, nothing stalled,
+in every sample through the deadline. The kernel held requests the
+daemon never received. These mounts run on the io_uring ring (`FUSE
+transport ... transport="uring"`, queue depth 32 for cluster-lock mounts
+since 06d635b). The likely cause is a ring queue that stopped delivering
+(entries used up or never re-committed on one CPU's queue). Not
+compared with `CONSTELLATION_FUSE_TRANSPORT=dev_fuse` here (at one
+failure in five, a comparison needs more runs than this chunk had); the
+same signature (a holder-side process in `request_wait_answer` with the
+daemon idle) is in one development run of this chunk on the same base
+(`diag1`). For the FUSE transport's owner.
+
+### Open
+
+- gate1's ring hang (above).
+- `backup-takeover-holds-missing-chunks`' single 102.6 s failure
+  (above).
+- The lsm-tree version-lock freeze (`slow commit`, `Starting major
+  compaction`): out of scope. It is what still makes a delegate's steps
+  0.5–0.8 s, and it is why the 5 s delegation TTL still lapses.
+- iroh logs `could not close last open path` at ERROR on some connection
+  setups. The stress-ng scenarios fail on any ERROR line.
+
+### Round 2: review fixes
+
+Review verdict: fix (2 must-fix, 3 should-fix). Base unchanged
+(`8734437`). Host for this round: the daemons log `cpus=16`; every
+`stress-ng-fs-nodes` run here took the host's load from ~2 to 83–160
+(most of it the scenario's own processes blocked in D state), so the
+runs below are at the review's load or above, not the first round's.
+
+| finding | what was done | where |
+|---|---|---|
+| Must 1: the root adopted an unknown grant after another node had held the lock in between | Adoption at renewal is gone (`lock_adopts_unplaced` removed). The delegate's live grants of a generation on inodes that no longer resolve to any subtree there (unlinked under their lock) ride its stream batch (`DelegateStream::leaving`, wire `Payload::DelegateStream::leaving`); the root installs them restamped in the step that applies the batch through its last row (until then it routes the inode to the delegate, so it never grants over them); the delegate drops them once the root acknowledged that batch. Two more holes the new sim config found: grants the root had moved to the generation itself (in `handoff`, waiting for the first renewal, or `handed`) on an inode that left come back to the root's table when the root applies the rows (seed 292: recall, re-delegation, unlink before the first renewal, root granted over its own pending copy); and a recall answer's copy of such a grant no longer overwrites the root's newer record (seed 6475: the root had upgraded it to exclusive, the handback put the delegate's shared copy back, the root granted another node shared). A re-sent batch never reinstalls a grant the root ended (`LockTables::was_ended`). Main had the same hole without the adoption: by location the root granted the unlinked inode while the delegate's holder still honoured its grant (the new sim config fails on main's behaviour, seed 99502) | `core::locks::{deleg_leaving_grants, deleg_drop_left, lock_install_leaving, lock_take_back_left, lock_install_returned}`, `core::delegate::{deleg_stream, on_delegate_stream}`, `DelegateState::leaving` |
+| Must 2: a late stream ack from an earlier tenure of the same root (R → R2 → R) could be credited | A re-stream to a new root drops the generation's `ReqKind::Stream` entries from `dl.late` (with the in-flight batch), and every `LateReq` carries the stream round it was sent in (`DelegateState::stream_round`, bumped at every re-stream); a late ack counts only in its own round. The lease epoch is not used for the tag: a delegate learns its root from redirects that carry no epoch, so the round is the delegate's own count of root changes. The same drop applies to `BackupAppend` entries when a generation chooses a backup anew | `core::delegate::{deleg_after_event, deleg_late_stream_ack, deleg_backup_select}` |
+| Should 1: attribute the r1 stall pattern; fix it if `LOG_LANE` causes it | Partly caused by it (runs below). (a) The lane of 64 frames served after the internal channel starved while that channel was never empty; the stream watchdog (a timer on it) then found the stream silent with frames waiting, dropped it, and the node tailed S3 in 2.4–3.8 s `SegmentRun` steps (tree1: n2's `log_stream.timeouts` 0 → 2, then 13 such steps; the holder logged `gone` every ~10 s). (b) 64 frames on the internal channel (tree2) were seconds of lag: under a load spike the holder dropped both non-holders at once (`queue full`), both tailed S3, and each, the other's delegate backup, stalled the other's acknowledgements for 107 s. Now the frames are on the internal channel in arrival order with replies and timers, as on main, bounded in bytes by the holder's own per-subscriber budget (32 MiB): a subscriber stops reading only when the holder would drop it anyway. After that, no run (tree3 on) dropped a subscriber or ran a slow `SegmentRun` | `engine::authority_driver::{Internal::Frame, Driver::log_permits, log_backlog_bytes, spawn_subscription}` |
+| Should 2: the silence drain was removed for every timer | Restored as on main for every silence timer except `BackupWatch` (which decides on arrival stamps): `ForwardTimeout`, `JobRequestTimeout`, `ReadIndexTimeout`, `LockRequestTimeout`, `LockRenewTimeout`, `LockTestTimeout`, `LockGrantExpiry`, `DelegExpiry`, `GrantExpiry`, `StreamWatchdog` go after the ordinary requests queued when they fired, for at most 500 ms, then once behind what else is due. The two grant expiries also drain the urgent lane first | `measures_silence`, `SILENCE_DRAIN_BUDGET`, `drain_queued`, `Driver::run` |
+| Should 3: candidate strikes never decay | A candidate's strikes start over at 1 once it has gone a minute (the longest backoff) past its last backoff without timing out | `core::backup::candidate_strikes_after` |
+| Nits | `lock_late_renewed` takes the entry with one lookup (an answer from another node still leaves it for the owner asked, as the test requires); the `HolderAliveAck` section comment no longer says "appended" | |
+
+Tests: `core::tests::locks::{a_grant_on_a_file_unlinked_under_its_lock_moves_to_the_root_with_the_unlink`
+(rewritten for the move: the grant comes with the batch, another node's
+request then waits, the holder renews it, a re-sent batch after the
+release does not reinstall it, a root-minted grant comes back the same
+way, **the review's release-then-renew case is `Lost`**, a conflicting
+root grant keeps it out; fails with the install disabled),
+`a_delegate_sends_its_grants_on_unlinked_files_with_the_unlink}`;
+`core::tests::a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited`
+(R → R2 → R; fails without the drop and the round);
+`pipelined_appends::a_candidate_that_timed_out_is_backed_off_and_another_peer_goes_first`
+(decay cases added); `authority_driver::tests::only_silence_timers_wait_for_the_backlog_and_only_so_long`
+(restored, `BackupWatch` now on the other side). Sim: config
+`locks-unlinked-delegated` (lock files in `d1`, delegated to node 2,
+unlinked by a client after a lock step with probability 0.2; every lock
+client keeps locking the inode it had, as a process with the file open;
+turns written in `d2`), test `locks_on_files_unlinked_in_a_delegated_subtree`
+(non-vacuous: 137 grants moved with their unlinks in 80 seeds) and
+`regression_locks_unlinked_delegated_seeds_292_6475`.
+
+Gates (final code; `CARGO_TARGET_DIR` unset, `ulimit -n 65536`):
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test --release -p constellation-authority -p constellation-net
+  -p constellation-engine`: authority 274 + 4 + sim 125 (+11 ignored),
+  engine 598 (+9 ignored) + 1, net 120 + 1 + 2 + 1 + 3 + 1. 0 failed.
+- Lock sim sweep (`sweep_config`, seeds 0..3000) over all 21 lock
+  configs, `locks` through `locks-failover-backup-writes` and the new
+  `locks-unlinked-delegated`: 0 failing in every config; the new one
+  also 0 of 20 000.
+- Harness, all 23 `backup-*`, `lock-*`, `delegate*` scenarios once: all
+  PASSED.
+- `stress-ng-fs-nodes`, every count from the daemon logs (stalled = FUSE
+  requests that crossed the 30 s threshold, `first=true`, all nodes;
+  every mount on the io_uring transport):
+
+| run | tree | max load | result | live-holder seals | lost grants | lapse discards n0/n1/n2 | stalled | subscriber drops (full/gone) | slow `SegmentRun` | delegate sealed silent |
+|---|---|---|---|---|---|---|---|---|---|---|
+| main1 | main | 91 | FAILED: locks lost | 0 | 14 (n1 8, n2 6) | 0/7/3 | 0 | 0/0 | 0 | 1 |
+| main2 | main | 99 | hung (killed at 540 s) | 0 | 9 (n2) | 0/0/2 | 10 | 0/0 | 0 | 1 |
+| main3 | main | 154 | hung | 0 | 0 | 0/2/1 | 16 | 0/0 | 0 | 2 |
+| tree1 | lane 64, served after the internal channel | 97 | FAILED: n2 did not finish | 0 | 0 | 0/0/0 | 0 | 0/4 | 13 (n2, to 3.8 s) | 0 |
+| tree2 | 64 frames on the internal channel | 136 | hung | 0 | 0 | 0/5/5 | 31 | 2/44 | 101 | 1 |
+| gate1 | final | 160 | hung | 0 | 0 | 0/3/0 | 17 | 0/0 | 0 | 2 |
+| gate2 | final | 95 | hung | 0 | 0 | 0/4/0 | 8 | 0/0 | 0 | 1 |
+| gate3 | final | 98 | FAILED: n1 did not finish | 0 | 0 | 0/3/0 | 9 | 0/0 | 0 | 1 |
+| gate4 | final | 83 | FAILED: n2 did not finish | 0 | 0 | 0/5/0 | 24 | 0/0 | 0 | 1 |
+| gate5 | final | 104 | hung | 0 | 0 | 0/1/0 | 9 | 0/0 | 0 | 1 |
+
+  (tree3 and tree4dbg, the final logic before formatting, failed the
+  same way as gate1–5: no drops, no `SegmentRun`, one delegate sealed
+  silent each.) **The gate is not met: 0 of 5**, and main fails every
+  run here too. Zero live-holder seals and zero lost grants in every
+  run of this tree; main lost 23 grants in three runs.
+
+**What still stalls (main and this tree alike).** The stall that
+remains has one signature in every failing run on both trees. A
+delegate's stream batch to the root has a 2 s transport timeout
+(`forward_timeout_ms × 4`), and its renewal 1 s. The root answers both
+from its ordinary request lane, which under this load is served seconds
+late. The answer arrives after the transport gave up, so the late-answer
+path (which counts answers up to a minute late) never sees it. The
+delegate re-sends a batch the root already holds every ~2.5 s
+(tree4dbg, with `core::delegate=debug`: n1 re-sent rows 1967..2096 from
+22:39:11 on, and the root sealed the generation at 22:39:29 with
+`cursor=2096`). Its acknowledgements stay parked behind
+`streamed_through`, and the root, which hears no renewal in time,
+seals the generation's backup ("delegate silent"). The delegate's
+mutations wait at `mutation submitted to the core (reply)` for
+100–220 s, until its replica applies the generation's end. Lengthening
+those transport timeouts to the late window would hold the
+connection's stream slots (32) for the whole window under exactly this
+load, which is what the first round had to fix. So it is not done here;
+it needs a design (answers as one-way messages, or the delegate stream
+on its own lane at the root). Open, for the delegation owner.
+
+**Decisions.** The delegation TTL stays at 20 s (unchanged from round 1).
+The sim's new lock config is not added to `long_locks`' sequence, only
+to `sweep_config`, with a fixed-seed test.
+
+### Open (round 2)
+
+- The delegate-stream answer timeout described above (main too): the
+  gate cannot be met on this host until it is fixed.
+- A delegate that dies after it streamed an unlink but before the root
+  applied it is sealed through its backup. The rows come from the
+  backup, without `leaving`, and the subtree grace does not cover an
+  unlinked inode. ~~Such grants are bounded by the dead delegate's
+  delegation window, which the seal outwaits~~ — wrong, see round 3: the
+  review broke mutual exclusion through the related root-takeover path
+  (`locks-unlinked-delegated-hcrash-backup` seed 41). Closed in round 3.
+- `backup-takeover-holds-missing-chunks`' single 102.6 s failure: not
+  seen again (passed here).
+- The lsm-tree version-lock freeze (out of scope, as before).
+
+### Round 3: review fixes (2026-10-06)
+
+| Finding | Fix | Where |
+|---|---|---|
+| Must 1: a delegate that becomes the root drops its live grants on unlinked inodes, and the subtree grace does not cover them (sim `-hcrash-backup` seed 41: mutual exclusion) | Two independent rules, each enough on its own for every seed below (each checked with the other disabled). (a) A node that holds the lease when one of its own delegate generations ends keeps that generation's live grants on inodes that now resolve to `Ownership::Root` and passes them to `lock_install_leaving` (restamped, `gen` 0, never over an ended id or a conflicting grant) instead of dropping them; grants on inodes still in a subtree are dropped as before. (b) `lock_in_grace` also counts an inode that is under no directory (unlinked: `is_under(ino, ROOT_INO)` is false) as covered while any subtree grace lasts. The grace is pushed when a generation is outwaited, when it is sealed or drained from its backup, and when a successor ends an inherited one. Which subtree an unlinked inode left is not recorded, so this is a superset of "the inodes the applied rows took out of the subtree". It also covers rows applied from a backup's drain or a predecessor's log, which a per-batch record would miss. The cost is that, during any grace, a new grant on any unlinked inode waits; reclaims are admitted, so the holder whose grant the root never got reclaims it with its next renewal | `Core::drop_delegate_state`, `Core::lock_in_grace` |
+| Coordinator 2: fault variants | Sweep configs (and `replay_seed` names) `locks-unlinked-delegated-{hcrash,hcrash-backup,dcrash,dcrash-nb,random,dbackup-random,blips,partition}`: the root holder crashes at 1.5 s (back at 6.5 s) with or without M9 backups; `d1`'s delegate (node 2) crashes at 1.5 s (back at 10.5 s) with or without delegate backups; two random faults, with or without delegate backups; `locks-blips`' S3 outages and in-doubt lease PUTs; `locks-partition`'s cut lockers and random fault. Seed 41 of `-hcrash-backup` is pinned | `tests/sim.rs` |
+| Should 1: stale reads under a lock (an outwaited holder's writes in another delegate's unstreamed rows) | Not fixed: open, measured below. It is the documented gap in `cluster-locks.md` ("A grant that was outwaited instead of released still carries only the owner's own position"). Without unlinks the same fault mix fails at the same rate on main and here (57/3000 each on `-partition`'s faults), so it is not this chunk's. In seed 276 as the review read it, the locker is node 3, the delegate of `d2` (the data directory). It is partitioned from the root inside its critical section, and its write is acknowledged in its own generation's stream, which the root does not have yet. The root outwaits its grant and grants node 1, whose read cannot see the write. The other seeds were not traced one by one. A fix has to bound such a write's acknowledgement by what the next grant's floor can name: hold lock-protected writes in a delegated subtree until the root has the row (a latency cost on every such write), or let the owner learn the writer's delegate stream head before it grants past an outwait. Neither is contained | — |
+| Should 2: `-dbackup-random` seed 2982 does not reach quiescence | Not the doubling `stream_after` backoff: it still fails with the old immediate re-send restored. Not the leaving machinery either: every batch of the generation carries `leaving=0`, and the hole is made elsewhere. The cause: node 2, `d1`'s delegate (gen 5) and root 1's backup, executes rows 3..5 of gen 5 while root 1 is dead, takes the root over (4627 ms, a fast takeover with a backup tail), and `strand_for_takeover` strands its own unappended gen-5 rows so that they follow the tail. They are replayed as root rows of epoch 2 and reach the log in segment 62. Node 2 crashes at 4777 ms, inside its takeover gate and before it inherits and ends gen 5 itself. Node 1 takes over at 10905 ms and inherits gen 5 with cursor 2. Node 2 comes back as gen 5's delegate, and its stream now starts at index 6: `delegate_txs_from(5, 3)` returns 6.., so the root's cursor never moves and the delegate re-sends the same batch for the rest of the run. Seed 2477 is the same (two holder crashes, the second the delegate-turned-root just after its strand; gen 3, gap 11→12). This is a pre-existing path (`jobs.rs`, `meta/src/store/spec.rs`, untouched here); main never reaches it in these two seeds, which fail there with mutual exclusion (2477) or take another trajectory (2982). Open | — |
+| Nit: `candidate_strikes` pruned only on commit | Entries whose backoff ended more than `CANDIDATE_BACKOFF_MAX_MS` ago act exactly as absent ones (`candidate_strikes_after` restarts at 1, the eligibility check passes), so they are dropped at each new strike | `core::backup` |
+| Nit: test name | `a_grant_on_a_file_unlinked_under_its_lock_is_adopted_by_the_root` → `…_moves_to_the_root_with_the_unlink` | `core::tests::locks` |
+| Nit: PROGRESS "Open (round 2)" bullet 2 | Struck through and pointed here (seed 41) | this file |
+| Docs | `cluster-locks.md`: removed "So the root never grants over a grant it has not seen"; new paragraph on the batch that never reaches a live root and on the two rules | `docs/reference/features/cluster-locks.md` |
+
+Tests: `core::tests::locks::a_delegate_that_takes_the_root_over_keeps_its_grants_on_unlinked_files`
+(fails without (a): "the grant dropped"),
+`core::tests::locks::an_outwaited_generations_grace_covers_the_inodes_it_unlinked`
+(fails without (b): granted inside the grace; a linked inode elsewhere
+is still granted, and the unlinked one once the grace passed); sim
+`regression_locks_unlinked_delegated_hcrash_backup_seed_41`.
+
+Gates (final code; `CARGO_TARGET_DIR` unset, `ulimit -n 65536`):
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `TMPDIR=/dev/shm cargo test --release -p constellation-authority -p
+  constellation-net -p constellation-engine`: authority 276 (+2 ignored)
+  + 4 + sim 126 (+11 ignored), engine 598 (+9 ignored) + 1, net 120 + 1
+  + 2 + 1 + 3 + 1. 0 failed.
+- Lock sim sweep (`sweep_config`, seeds 0..3000) over all 21 lock
+  configs: 0 failing in every one (fenced/lost identical to main where
+  compared: `locks-failover-backup-writes` 1150 I/Os fenced, 22 grants
+  lost on both).
+- Harness `lock-*`, `delegate*` (17 scenarios) once: all PASSED.
+- `stress-ng-fs-nodes`: not run (coordinator).
+
+The new variants, seeds 0..3000. "main" is base `8734437` with only
+this chunk's sim harness ported onto it (a scratch worktree):
+
+| variant | round 2 | this round | of which mutual exclusion | main |
+|---|---|---|---|---|
+| `locks-unlinked-delegated` | 0 | 0 | 0 | – |
+| `-hcrash` | – | 0 | 0 | – |
+| `-hcrash-backup` | 5 (41, 349, 760, 923, 2711) | **0** | 0 | – |
+| `-dcrash` | – | 0 | 0 | – |
+| `-dcrash-nb` | – | 0 | 0 | – |
+| `-random` | 3 (935 mutual exclusion, 2716, 2877) | 3 (935, 2716, 2877: stale reads) | 0 | 637 (633 mutual exclusion, 4 stale reads) |
+| `-dbackup-random` | 8 | 7 (276, 297, 1293, 1690, 2036: stale reads; 2477, 2982: quiescence) | 0 | 692 (689 mutual exclusion, 3 stale reads) |
+| `-blips` | – | 0 | 0 | – |
+| `-partition` | – | 56 (all stale reads) | 0 | 369 (339 mutual exclusion, 30 stale reads) |
+| `-partition`, no unlinks (control) | – | 57 stale reads | 0 | 57 stale reads |
+
+(The round-2 column is this config set run on the round-2 code; it
+reproduces the review's failing seeds exactly. Seed 935 now fails a
+later check, a stale read, instead of mutual exclusion.) Main's
+mutual-exclusion failures end most of its runs early, so its stale-read
+counts with unlinks are a floor.
+
+### Open (round 3)
+
+- Stale reads under a lock after an outwait, when the outwaited holder's
+  writes are in a delegate's stream nobody else has (should-fix 1 above):
+  `-random` 3/3000 (935, 2716, 2877), `-dbackup-random` 5/3000 (276,
+  297, 1293, 1690, 2036), `-partition` 56/3000; 57/3000 without unlinks
+  on main and here alike. `sweep_config` on those three variants fails
+  until this is fixed.
+- The stranded-own-rows hole in a delegate's stream after it takes the
+  root over and crashes inside its takeover gate (should-fix 2 above):
+  `-dbackup-random` 2477 and 2982 never reach quiescence (the generation
+  never drains and its ops wait).
+- From round 2, unchanged: the delegate-stream answer timeout (the
+  `stress-ng-fs-nodes` gate), `backup-takeover-holds-missing-chunks`'
+  single failure, the lsm-tree version-lock freeze.

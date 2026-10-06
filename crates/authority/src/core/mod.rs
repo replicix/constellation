@@ -834,6 +834,10 @@ pub struct Stats {
     pub lock_horizon_failed: u64,
     pub lock_reclaimed: u64,
     pub lock_moved: u64,
+    /// Root: a delegate's grants on inodes that left its subtree
+    /// (unlinked under their lock), installed with the batch that carried
+    /// them (`Core::lock_install_leaving`).
+    pub lock_leaving_installed: u64,
     /// Grants handed to a delegation that ended without handing them
     /// back, reinstated in the root's table.
     pub lock_reinstated: u64,
@@ -1749,9 +1753,12 @@ impl Core {
                 until,
                 epoch_slack,
             } => self.on_promise_reply(now, from, req, until, epoch_slack, replica, out),
-            PeerMsg::DelegateStream { req, gen, txs } => {
-                self.on_delegate_stream(now, from, req, gen, txs, replica, out)
-            }
+            PeerMsg::DelegateStream {
+                req,
+                gen,
+                txs,
+                leaving,
+            } => self.on_delegate_stream(now, from, req, gen, txs, leaving, replica, out),
             PeerMsg::DelegateStreamAck {
                 req,
                 gen,

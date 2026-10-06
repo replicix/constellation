@@ -221,6 +221,14 @@ pub struct SimConfig {
     /// seen before any other node can be granted.
     pub lock_io_ms: (u64, u64),
     pub lock_dir: Option<String>,
+    /// overload-cascade-2: after a lock step, a client unlinks that lock
+    /// file with this probability (`stress-ng`'s lock stressors unlink
+    /// their files while other processes hold them open and locked).
+    /// Every lock client keeps locking the inode the file had
+    /// ([`super::locks::LockGhost::inos`]), as a process with the file
+    /// open would; with `lock_dir` delegated, the grants on it move from
+    /// the delegate to the root with the unlink.
+    pub lock_unlink_ratio: f64,
     /// Plan 30 §M14's non-vacuity knob: clients perform I/O even when
     /// `fenced` says the grant lapsed (the checker must catch it).
     pub lock_ignore_fence: bool,
@@ -451,6 +459,7 @@ impl Default for SimConfig {
             lock_ios: (2, 6),
             lock_io_ms: (5, 60),
             lock_dir: None,
+            lock_unlink_ratio: 0.0,
             lock_ignore_fence: false,
             lock_writes: false,
             lock_data_dir: None,
@@ -1316,14 +1325,18 @@ fn with_locks(rng: &mut StdRng, steps: Vec<Step>, cfg: &SimConfig) -> Vec<Step> 
             } else {
                 constellation_meta::locks::LockMode::Exclusive
             };
+            let file = rng.random_range(0..cfg.lock_files);
             out.push(Step::Lock(super::locks::LockStep {
-                file: rng.random_range(0..cfg.lock_files),
+                file,
                 mode,
                 blocking: !rng.random_bool(cfg.lock_nonblocking_ratio.clamp(0.0, 1.0)),
                 ios: rng.random_range(cfg.lock_ios.0..=cfg.lock_ios.1),
                 io_ms: rng.random_range(cfg.lock_io_ms.0..=cfg.lock_io_ms.1),
                 write: cfg.lock_writes && mode == constellation_meta::locks::LockMode::Exclusive,
             }));
+            if cfg.lock_unlink_ratio > 0.0 && rng.random_bool(cfg.lock_unlink_ratio.min(1.0)) {
+                out.push(Step::Op(NsOp::Unlink(lock_file_name(cfg, file))));
+            }
         }
     }
     out
@@ -3071,6 +3084,14 @@ async fn setup_dirs(cluster: &Arc<Cluster>, cfg: &SimConfig, failures: &Arc<Mute
         .push("setup: delegations were not installed on the delegates".into());
 }
 
+/// Plan 30 §M14: lock file `i`'s name.
+fn lock_file_name(cfg: &SimConfig, i: usize) -> String {
+    match &cfg.lock_dir {
+        Some(d) => format!("{d}/lk{i}"),
+        None => format!("lk{i}"),
+    }
+}
+
 /// Plan 30 §M14: create the lock files through node 1 (recorded in the
 /// history like any client op), then wait until every node has them.
 async fn setup_lock_files(
@@ -3082,10 +3103,7 @@ async fn setup_lock_files(
 ) {
     let handle = cluster.get(1);
     let mut names: Vec<String> = (0..cfg.lock_files)
-        .map(|i| match &cfg.lock_dir {
-            Some(d) => format!("{d}/lk{i}"),
-            None => format!("lk{i}"),
-        })
+        .map(|i| lock_file_name(cfg, i))
         .collect();
     let data_dir = cfg.lock_data_dir.as_ref().filter(|_| cfg.lock_writes);
     if let Some(d) = data_dir {
@@ -3146,6 +3164,7 @@ async fn setup_lock_files(
             let data: Vec<u64> = files.split_off(n).into_iter().map(|(_, i)| i).collect();
             cluster.locks.set_files(files);
             cluster.locks.set_data(data);
+            cluster.locks.set_by_ino(cfg.lock_unlink_ratio > 0.0);
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
