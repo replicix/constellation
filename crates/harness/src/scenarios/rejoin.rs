@@ -23,6 +23,7 @@ use super::m8::{dist, write_timed};
 use super::m9::{ack_of, all_visible, cluster, node_id, unmount_all, wait_for_backup, write_files};
 use super::{ensure_no_conflicts, eventually, lease_of, wait_for_p2p};
 use crate::client::Client;
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
@@ -257,7 +258,7 @@ fn spawn_mute_daemon(
         .arg(state_dir)
         .stdout(std::process::Stdio::from(logf.try_clone()?))
         .stderr(std::process::Stdio::from(logf))
-        .spawn()
+        .spawn_tied()
         .context("spawning the mute daemon")?;
     let pid = state_dir.join("daemon.pid");
     eventually(

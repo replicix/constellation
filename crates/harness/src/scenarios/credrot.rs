@@ -31,6 +31,7 @@
 
 use crate::client::{constellation_bin, control_runtime};
 use crate::s3env::{Versitygw, BUCKET};
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, ensure, Context, Result};
 use constellation_control::methods::{BrowseMkdir, BrowseRead, BrowseWrite, FsList, FsUnlock};
 use constellation_control::proto::types::{
@@ -105,7 +106,7 @@ impl Engine {
             .stdin(Stdio::null())
             .stdout(out.try_clone()?)
             .stderr(out)
-            .spawn()
+            .spawn_tied()
             .context("starting constellation serve")?;
         let mut engine = Engine {
             child,

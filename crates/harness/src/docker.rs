@@ -38,6 +38,11 @@ impl Container {
     pub fn run_with_cmd(name: &str, image: &str, extra: &[&str], cmd: &[&str]) -> Result<Self> {
         // Remove leftovers from a previous crashed run.
         let _ = docker(&["rm", "-f", name]);
+        let prefix_label = format!(
+            "{}={}",
+            crate::sweep::PREFIX_LABEL,
+            crate::s3env::docker_prefix()
+        );
         let mut args = vec![
             "run",
             "-d",
@@ -46,6 +51,8 @@ impl Container {
             name,
             "--label",
             "constellation-harness=1",
+            "--label",
+            &prefix_label,
         ];
         args.extend_from_slice(extra);
         args.push(image);

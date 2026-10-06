@@ -226,10 +226,12 @@ pub fn fuse_inval_storm(_seed: u64) -> Result<()> {
             exits.push(exit);
             // Did the daemon exit on its own, or did its reaper have to
             // abort a wedged connection? Both are within the bound; the
-            // count tells how often the residual window was hit.
+            // count tells how often the residual window was hit. Only the
+            // wedged lines count: every kill also leaves a "daemon N is
+            // gone" line for the mounts it left, now or a round later.
             let reaper_log = clients[holder].state_dir().join("reaper.log");
             let reaped = std::fs::read_to_string(&reaper_log).unwrap_or_default();
-            if !reaped.trim().is_empty() {
+            if reaped.contains("is dead but wedged") {
                 reaped_rounds += 1;
                 eprintln!(
                     "    {NAME}: round {round}: the reaper had to release {}:\n{}",

@@ -694,8 +694,22 @@ fn commit(node: &Arc<NodeRuntime>, started: Instant) -> Result<HandoffReport, Co
             Some(p) if p.transferred => {
                 // Under the lock the deadline's abort takes too: one of the
                 // two wins, and `Status` tells which. The marker first: from
-                // here on the receiver's copies may be the only ones.
+                // here on the receiver's copies may be the only ones. Our
+                // mount records go just before it: once it is written the
+                // receiver owns the sessions, and our reaper (were we
+                // killed now) must not abort their connections.
+                let records: Vec<_> = p
+                    .detached
+                    .iter()
+                    .filter_map(|(t, _)| {
+                        let id = t.id.as_u64();
+                        crate::daemon_lock::take_mount(&state_dir, id).map(|r| (id, r))
+                    })
+                    .collect();
                 write_marker(&state_dir, p.epoch).map_err(|e| {
+                    for (id, r) in &records {
+                        crate::daemon_lock::restore_mount(&state_dir, *id, r);
+                    }
                     ControlError::failed(format!(
                         "writing the commit marker (nothing was committed): {e}"
                     ))
@@ -714,7 +728,6 @@ fn commit(node: &Arc<NodeRuntime>, started: Instant) -> Result<HandoffReport, Co
     let views = handed_off(&prepared.detached);
     for (t, _) in &prepared.detached {
         engine.close_view_for_handover(&t.view);
-        crate::daemon_lock::forget_mount(&state_dir, t.id.as_u64());
         node.mounts.lock().unwrap().remove(&t.id);
     }
     node.close_headless_view();

@@ -3,8 +3,8 @@
 # Used locally for host-side runs; CI uses the fully containerized
 # tests/compose-test.sh instead.
 #
-#   tests/integration.sh           # start floci, run, leave it running
-#   tests/integration.sh --down    # ...and tear floci down afterwards
+#   tests/integration.sh           # start floci, run, tear it down at exit
+#   tests/integration.sh --keep    # ...and leave floci running afterwards
 #
 # Requires: docker compose, fusermount3, a built `constellation` binary
 # (CONSTELLATION_BIN or $CARGO_TARGET_DIR/debug/constellation).
@@ -12,8 +12,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-TEARDOWN=false
-[ "${1:-}" = "--down" ] && TEARDOWN=true
+# The compose project is torn down in the EXIT trap however the script ends
+# (failure, SIGTERM, a `timeout`), but only if this run started floci: one
+# already up (a shared checkout's) is someone else's. `--keep` leaves it up.
+TEARDOWN=true
+[ "${1:-}" = "--keep" ] && TEARDOWN=false
+if [ -n "$(docker compose ps -q floci 2>/dev/null)" ]; then
+    echo "== floci is already up: reusing it, and leaving it up"
+    TEARDOWN=false
+fi
 
 cleanup() {
     if $TEARDOWN; then
@@ -21,6 +28,8 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT HUP
 
 echo "== starting floci (S3 emulator)"
 docker compose up -d --wait floci

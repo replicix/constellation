@@ -16,6 +16,7 @@
 //! node's `status` naming the FUSE transport the mount negotiated.
 
 use crate::client::is_mountpoint;
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, ensure, Context, Result};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -176,7 +177,7 @@ impl Mount {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
-            .spawn()
+            .spawn_tied()
             .with_context(|| format!("spawning {}", self.bin.display()))?;
         self.child = Some(child);
         for _ in 0..100 {

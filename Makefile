@@ -50,7 +50,7 @@ UPLOADBENCH_INITIAL_CONCURRENCY ?= 4
 -include local.mk
 
 .PHONY: help build build-release build-debug build-chaos test test-unit fmt fmt-check clippy lint \
-	check ci clean smoke integration webui-check csi-sanity csi-image compose compose-down harness harness-docker \
+	check ci clean smoke integration webui-check csi-sanity csi-image compose harness harness-docker \
 	harness-list bench perf-regression xfstests perf-gate read-cpu-gate transport-matrix \
 	harness-transport-matrix compliance-ring \
 	dist-linux dist-macos deps FORCE \
@@ -148,13 +148,6 @@ compose: ## Containerized FUSE suites (floci S3; needs docker)
 		tests/compose-test.sh $(COMPOSE_SUITES); \
 	else \
 		tests/compose-test.sh; \
-	fi
-
-compose-down: ## Containerized suites, then tear down compose stack
-	@if [ -n "$(COMPOSE_SUITES)" ]; then \
-		tests/compose-test.sh --down $(COMPOSE_SUITES); \
-	else \
-		tests/compose-test.sh --down; \
 	fi
 
 harness-list: $(RELEASE_HARNESS) ## List fault-injection scenarios

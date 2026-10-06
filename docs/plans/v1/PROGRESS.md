@@ -43772,3 +43772,29 @@ counts with unlinks are a floor.
 - From round 2, unchanged: the delegate-stream answer timeout (the
   `stress-ng-fs-nodes` gate), `backup-takeover-holds-missing-chunks`'
   single failure, the lsm-tree version-lock freeze.
+
+## harness-teardown: a killed harness no longer leaves daemons, mounts, containers (2026-10-06)
+
+Found on the shared runner (2026-10-05): `constellation mount` daemons alive
+1-3 days after their harness was killed by `timeout`, 9 dead FUSE mounts under
+`/tmp/harness-*`, 5 floci/toxiproxy containers up to 3 days old.
+
+| Change | Where |
+|---|---|
+| Every harness-spawned child (mounts, gc, lock-wait holder and waiters, versitygw/toxiproxy, serve, stress-ng, smoke mounts, git cat-file, kubectl, `make csi-image`) starts with `PR_SET_PDEATHSIG` = SIGTERM, forked from one process-long spawner thread (the signal fires on the forking *thread's* exit, and scenarios fork from short-lived workers). Not `fusermount3`: setuid clears the signal, and it is killed at its bound | `crates/harness/src/spawn.rs` (`TiedSpawn::spawn_tied`) |
+| Zombie reaper: whenever its daemon is gone (out of the process table, or an exited leader nobody has reaped yet) it takes `daemon.lock` itself (non-blocking; skips if anyone holds it: the records are then theirs), aborts the daemon's recorded, never-forgotten mounts and lazily unmounts each one whose top mount is still the aborted FUSE connection, logged to `reaper.log`. After a wedged-zombie abort it does the same once it gets the lock. The handoff sender drops its mount records before writing the commit marker (restored if the write fails) | `crates/cli/src/daemon_lock.rs` (`reap_left_mounts`), `handoff_socket.rs` |
+| Startup sweep, once per process: FUSE mounts under `<temp root>/harness-*` answering `ENOTCONN` whose scenario root no live run has claimed (`sweep::claim`: a shared `flock` on `.harness-owner`, taken by `setup_in` and `Client::new`); containers of this prefix, and of the default prefix if its lock is free. Prefix locks moved to `/tmp/.<prefix>.lock`, independent of `TMPDIR`, so a private-`TMPDIR` run sees a default run's lock. Containers carry a `constellation-harness-prefix` label so `constellation-harness-p30-*` is never taken for `constellation-harness`'s | `crates/harness/src/sweep.rs`, `docker.rs`, `s3env.rs` |
+| `tests/integration.sh`, `tests/compose-test.sh` tear the compose project down in an EXIT trap (TERM/INT/HUP exit through it), but only if floci was not already up before the run; `--keep` opts out. `--down` and `make compose-down` removed | `tests/`, `Makefile` |
+| `fuse-inval-storm` counts a round as reaped only on an `is dead but wedged` line (every kill now also logs a "gone" line) | `scenarios/inval_storm.rs` |
+| Tests: `harness/tests/teardown.rs` (SIGKILL `harness run baseline` mid-scenario: no process and no mount mentions its TMPDIR), `cli/tests/reaper.rs` (kill -9: mount and reaper gone; an unreaped zombie daemon's mount goes too, fails on the old `is_alive` check; a `daemon.lock` someone else holds keeps records and mount), `s3env` (a lock is seen from a child with another `TMPDIR`, no lock file lands there), sweep unit tests (prefix matching, candidates, claimed roots) | `#[ignore]` ones run with `--ignored` |
+
+Gates (review round): `cargo fmt --all`, `cargo clippy --workspace
+--all-targets -D warnings` clean; `cargo test -p constellation-harness -p
+constellation` 0 failed; `--ignored` reaper (3) and teardown (1) pass;
+`tests/smoke.sh` PASSED; `tests/integration.sh` PASSED (torn down) and PASSED
+with floci already up (left up); harness `kill9-remount`,
+`session-handover-idle`, `p2p-handover`, all seven `transport-*` PASSED with
+prefix `htd2`, `TMPDIR=/var/tmp/htd2`. The reviewer's repro (a labelled
+`constellation-harness-floci` with `/tmp/.constellation-harness.lock` held)
+now leaves the container alone, and a later run with the lock free sweeps it.
+Not run: `tests/compose-test.sh` (`bash -n` only), `fuse-inval-storm`.

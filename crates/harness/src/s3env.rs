@@ -23,6 +23,7 @@
 
 use crate::docker::{Container, Network};
 use crate::reqlog::CountingProxy;
+use crate::spawn::TiedSpawn;
 use crate::toxiproxy::{Proxy, Toxiproxy};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -50,6 +51,11 @@ pub(crate) fn docker_prefix() -> String {
         .unwrap_or_else(|_| "constellation-harness".to_string())
 }
 
+/// Whether a live run holds `prefix`'s lock right now.
+pub(crate) fn prefix_in_use(prefix: &str) -> bool {
+    PrefixLock::acquire(prefix).is_err()
+}
+
 /// Host-wide guard for one docker prefix, so two harness processes
 /// cannot quietly destroy each other's environment.
 ///
@@ -61,15 +67,23 @@ pub(crate) fn docker_prefix() -> String {
 /// conflict, or a missing network. Rather than leave that to whoever
 /// remembers, take an advisory lock on the prefix and refuse up front.
 /// The lock file is never removed; only the `flock` matters, and it is
-/// released with the fd (including on a crash or a kill).
+/// released with the fd (including on a crash or a kill). It lives at a
+/// fixed host-wide path ([`prefix_lock_path`]), not under `TMPDIR`: runs
+/// with different `TMPDIR`s must still see each other's locks (the
+/// startup sweep asks whether the default prefix is in use).
 struct PrefixLock {
     _file: std::fs::File,
+}
+
+/// `/tmp/.<prefix>.lock`, whatever `TMPDIR` says.
+pub(crate) fn prefix_lock_path(prefix: &str) -> PathBuf {
+    Path::new("/tmp").join(format!(".{prefix}.lock"))
 }
 
 impl PrefixLock {
     fn acquire(prefix: &str) -> Result<PrefixLock> {
         use std::os::fd::AsRawFd;
-        let path = std::env::temp_dir().join(format!(".{prefix}.lock"));
+        let path = prefix_lock_path(prefix);
         // A file another user left (a `sudo` run of the same prefix) may
         // not be opened with `O_CREAT` in a sticky world-writable /tmp
         // (`fs.protected_regular`, on by default on Fedora) nor for
@@ -254,6 +268,8 @@ impl S3Env {
     fn start_docker() -> Result<S3Env> {
         let prefix = docker_prefix();
         let lock = PrefixLock::acquire(&prefix)?;
+        crate::sweep::mounts();
+        crate::sweep::containers(&prefix);
         let floci_name = format!("{prefix}-floci");
         let toxi_name = format!("{prefix}-toxiproxy");
         // Leftovers from a crashed run would hold the network open.
@@ -311,6 +327,7 @@ impl S3Env {
     }
 
     fn start_process() -> Result<S3Env> {
+        crate::sweep::mounts();
         let versitygw = find_bin("CONSTELLATION_VERSITYGW_BIN", "versitygw")?;
         let toxiproxy_bin = find_bin("CONSTELLATION_TOXIPROXY_BIN", "toxiproxy-server")?;
         let dir = tempfile::Builder::new()
@@ -435,7 +452,7 @@ impl ChildGuard {
             .stdin(Stdio::null())
             .stdout(out.try_clone()?)
             .stderr(out)
-            .spawn()
+            .spawn_tied()
             .with_context(|| format!("starting {name}"))?;
         Ok(ChildGuard {
             name,
@@ -649,4 +666,41 @@ fn find_bin(var: &str, name: &str) -> Result<PathBuf> {
         "{name} not found (set {var}, or put it on PATH): the `process` S3 backend needs \
          native versitygw and toxiproxy-server; {INSTALL_HINT}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A run with a private `TMPDIR` must still see a lock taken by a run
+    /// with another: the startup sweep relies on it. The probe is this
+    /// very test, re-run in a child with its own `TMPDIR`.
+    #[test]
+    fn a_prefix_lock_is_seen_whatever_tmpdir_says() {
+        const PROBE: &str = "HARNESS_TEST_PREFIX_PROBE";
+        if let Ok(prefix) = std::env::var(PROBE) {
+            assert!(prefix_in_use(&prefix), "{prefix} looks free");
+            return;
+        }
+        let prefix = format!("constellation-harness-locktest-{}", std::process::id());
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = PrefixLock::acquire(&prefix).unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "s3env::tests::a_prefix_lock_is_seen_whatever_tmpdir_says",
+                "--exact",
+                "--quiet",
+            ])
+            .env(PROBE, &prefix)
+            .env("TMPDIR", tmp.path())
+            .status()
+            .unwrap();
+        drop(lock);
+        let left: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        let free = !prefix_in_use(&prefix);
+        let _ = std::fs::remove_file(prefix_lock_path(&prefix));
+        assert!(st.success(), "the probe under another TMPDIR: {st}");
+        assert!(left.is_empty(), "lock files under TMPDIR: {left:?}");
+        assert!(free, "{prefix} still looks held after the drop");
+    }
 }

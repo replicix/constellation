@@ -31,7 +31,7 @@
 //! takeover is of a process the kernel has already killed.
 
 use anyhow::{bail, Context, Result};
-use constellation_platform::{native, ProcessFacts};
+use constellation_platform::{native, ProcessFacts, UnmountMode};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -339,6 +339,20 @@ pub fn forget_mount(state_dir: &Path, id: u64) {
     let _ = std::fs::remove_file(state_dir.join(MOUNTS_DIR).join(id.to_string()));
 }
 
+/// [`forget_mount`], keeping the record for [`restore_mount`] should the
+/// step it was dropped for fail.
+pub fn take_mount(state_dir: &Path, id: u64) -> Option<String> {
+    let path = state_dir.join(MOUNTS_DIR).join(id.to_string());
+    let record = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    Some(record)
+}
+
+/// Put back a record [`take_mount`] dropped.
+pub fn restore_mount(state_dir: &Path, id: u64, record: &str) {
+    let _ = std::fs::write(state_dir.join(MOUNTS_DIR).join(id.to_string()), record);
+}
+
 /// A mount a previous daemon of this state dir left behind, and what
 /// became of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -498,7 +512,12 @@ pub fn reaper_main(parent: u32, state_dir: &Path) -> Result<()> {
             // other processes keep changing, so one read can skip our
             // line on a busy host.
             released_polls += 1;
-            if released_polls >= REAPER_RELEASED_POLLS || !native().process.is_alive(parent) {
+            if parent_gone(parent) {
+                // Gone however it died: what it left mounted goes too.
+                reap_left_mounts(state_dir, parent);
+                return Ok(());
+            }
+            if released_polls >= REAPER_RELEASED_POLLS {
                 return Ok(());
             }
             continue;
@@ -507,7 +526,8 @@ pub fn reaper_main(parent: u32, state_dir: &Path) -> Result<()> {
         let holder = classify_pid(parent);
         let Holder::Wedged { why, .. } = holder else {
             wedged_since = None;
-            if matches!(holder, Holder::Unknown { .. }) && !native().process.is_alive(parent) {
+            if matches!(holder, Holder::Unknown { .. }) && parent_gone(parent) {
+                reap_left_mounts(state_dir, parent);
                 return Ok(());
             }
             continue;
@@ -543,22 +563,116 @@ pub fn reaper_main(parent: u32, state_dir: &Path) -> Result<()> {
             ));
         }
         append_reaper_log(state_dir, &log);
-        // Give the zombie a moment to go, for the log's sake only.
+        // Give the zombie a moment to go and release the lock. Its
+        // aborted mounts are then dropped too, under `daemon.lock` (so no
+        // new daemon of this state dir mounts meanwhile), and only where
+        // the aborted connection is still the one mounted there.
         let t = Instant::now();
-        while t.elapsed() < Duration::from_secs(10) && native().process.is_alive(parent) {
+        let mut guard = None;
+        while t.elapsed() < Duration::from_secs(10) {
+            if parent_gone(parent) {
+                guard = try_take_lock(state_dir);
+                if guard.is_some() {
+                    break;
+                }
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let gone = !native().process.is_alive(parent);
+        let gone = parent_gone(parent);
+        let unmounted = if guard.is_some() {
+            stale.iter().filter_map(lazy_unmount_connection).count()
+        } else {
+            0
+        };
+        drop(guard);
         append_reaper_log(
             state_dir,
             &format!(
-                "{now} daemon {parent} {} {:?} after the abort\n",
+                "{now} daemon {parent} {} {:?} after the abort; {unmounted} aborted mount(s) \
+                 lazily unmounted\n",
                 if gone { "exited" } else { "is still there" },
                 t.elapsed()
             ),
         );
         return Ok(());
     }
+}
+
+/// Whether `pid` is gone for good: no longer in the process table, or
+/// an exited (zombie or dead) leader its parent has not reaped yet. Only
+/// asked once `daemon.lock` looks released, or when the holder cannot be
+/// classified: a zombie leader whose threads still run keeps the lock (the
+/// file table is shared), and `try_take_lock` is the final word anyway.
+fn parent_gone(pid: u32) -> bool {
+    match native().process.facts(pid) {
+        Ok(facts) => facts.zombie || facts.dead,
+        Err(_) => !native().process.is_alive(pid),
+    }
+}
+
+/// `daemon.lock`, taken without waiting, for the reaper's own work on a
+/// state dir its daemon has left: while the reaper holds it no daemon of
+/// this state dir can start (a `mount` meanwhile sees a live holder that
+/// is not a daemon and retries within its attach timeout), so the records
+/// it reaps are the dead daemon's. `None` when anyone holds it (a new
+/// daemon: the records are its own), or when there is no lock file (never
+/// created here: it would only appear between a takeover's rename and the
+/// new daemon's lock).
+fn try_take_lock(state_dir: &Path) -> Option<constellation_platform::LockGuard> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(state_dir.join(LOCK_NAME))
+        .ok()?;
+    native().file_lock.try_lock(file).ok().flatten()
+}
+
+/// Lazily unmount `s`'s mountpoint if the mount on top there is still the
+/// FUSE connection that was aborted (a dead FUSE mount answers `ENOTCONN`
+/// for good until someone drops it); whatever was mounted there since is
+/// left alone. `None` when nothing was aborted or it is no longer there.
+fn lazy_unmount_connection(s: &StaleMount) -> Option<Result<(), String>> {
+    let connection = s.connection?;
+    let table = &native().mounts;
+    // Mountinfo lists a stacked mount after the one it covers.
+    let top = table
+        .list()
+        .ok()?
+        .into_iter()
+        .rfind(|m| m.mountpoint == s.mountpoint)?;
+    (top.fuse_connection() == Some(connection)).then(|| {
+        table
+            .unmount(&s.mountpoint, UnmountMode::Lazy)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The daemon `parent` is gone: abort and lazily unmount every mount it
+/// recorded and never forgot (`forget_mount` is its clean-exit path, so a
+/// record still there means the daemon died with the mount up: `kill -9`,
+/// its harness dying, anything). Done holding `daemon.lock`
+/// (`try_take_lock`), and skipped when that cannot be had: another daemon
+/// holds it and the records are its own. Logged to `reaper.log`.
+fn reap_left_mounts(state_dir: &Path, parent: u32) {
+    let Some(_guard) = try_take_lock(state_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut log = String::new();
+    for s in abort_stale_mounts(state_dir) {
+        let unmounted = lazy_unmount_connection(&s);
+        log.push_str(&format!(
+            "{now} daemon {parent} is gone; {s}; lazy unmount: {}\n",
+            match unmounted {
+                None => "nothing to unmount".to_string(),
+                Some(Ok(())) => "done".to_string(),
+                Some(Err(e)) => format!("failed ({e})"),
+            }
+        ));
+    }
+    append_reaper_log(state_dir, &log);
 }
 
 fn append_reaper_log(state_dir: &Path, text: &str) {

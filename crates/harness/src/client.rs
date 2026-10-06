@@ -2,6 +2,7 @@
 //! the real `constellation` binary. Supports clean unmount, hard kill
 //! (SIGKILL, simulating a crash), and remount.
 
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, Context, Result};
 use constellation_platform::mounts::UnmountMode;
 use std::path::{Path, PathBuf};
@@ -130,6 +131,7 @@ impl Client {
         let state = work.join("state");
         std::fs::create_dir_all(&mnt)?;
         std::fs::create_dir_all(&state)?;
+        crate::sweep::claim(root);
         Ok(Self {
             name: name.to_string(),
             backend: backend.to_string(),
@@ -442,7 +444,7 @@ impl Client {
         let child = cmd
             .stdout(Stdio::from(logf.try_clone()?))
             .stderr(Stdio::from(logf))
-            .spawn()
+            .spawn_tied()
             .context("spawning mount")?;
         self.child = Some(child);
         let deadline = Instant::now() + within;
@@ -626,7 +628,7 @@ impl Client {
             .cmd(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?)
+            .spawn_tied()?)
     }
 
     pub fn gc_run(&self) -> Result<std::process::Output> {
@@ -1367,7 +1369,9 @@ fn unmount(mnt: &Path, mode: UnmountMode) -> std::io::Result<()> {
 /// wedged mount can itself hang). The helper is a child process, killed at
 /// the bound: a detach left running (or a thread falling through to the
 /// mount service's other fallbacks) could complete later and detach the
-/// *next* mount at the same path.
+/// *next* mount at the same path. Not [`TiedSpawn::spawn_tied`]:
+/// `fusermount3` is setuid, which clears the death signal, and it is
+/// killed at the bound anyway.
 fn detach_bounded(mnt: &Path, bound: Duration) {
     let Ok(mut fm) = Command::new("fusermount3")
         .args(["-u", "-z"])

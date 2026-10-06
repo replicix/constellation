@@ -345,6 +345,26 @@ is the Jepsen-style lane. The harness orchestrates everything itself:
 - **Client lifecycle**: mount, clean unmount, `kill -9` (crash), remount,
   chunk-cache wipe — all first-class scenario operations.
 
+- **Teardown**: every process the harness starts (daemons, gc, S3 gateway,
+  proxies, `stress-ng`, kubectl) is forked by one long-lived spawner thread
+  with `PR_SET_PDEATHSIG` = SIGTERM (`crates/harness/src/spawn.rs`), so a
+  harness killed by `timeout` or `kill -9` takes its daemons with it; a
+  daemon's zombie reaper (no death signal of its own) lazily unmounts what
+  the daemon left once the daemon is gone (exited, or an unreaped zombie),
+  holding `daemon.lock` itself while it does. On start the harness sweeps
+  (`sweep.rs`): dead FUSE mounts (`ENOTCONN`) under `<TMPDIR>/harness-*` and
+  `/tmp/harness-*` that no live run has claimed (a run holds a `flock` on
+  `.harness-owner` in each scenario root), and containers of its own
+  `CONSTELLATION_HARNESS_DOCKER_PREFIX` (and of the default prefix when no
+  live run holds its lock). Prefix locks are `/tmp/.<prefix>.lock` whatever
+  `TMPDIR` says. Another prefix's containers and a live run's mounts are
+  never touched. Tests:
+  `cargo test -p constellation-harness --test teardown -- --ignored` (SIGKILLs
+  a harness mid-scenario) and `cargo test -p constellation --test reaper --
+  --ignored`. `tests/integration.sh` and `tests/compose-test.sh` tear their
+  compose project down in an EXIT trap if they started its floci (one
+  already up is left alone; `--keep` opts out).
+
 Scenarios (see `harness list`): `baseline`, `latency`, `slow-network`,
 `s3-outage`, `s3-flap`, `kill9-remount` (the phase-1 crash-recovery exit
 criterion), `cold-cache`, `two-clients-disjoint`,

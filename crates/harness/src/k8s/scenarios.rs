@@ -13,6 +13,7 @@ use crate::docker::docker;
 use crate::model::Observed;
 use crate::model::{Model, Node};
 use crate::scenarios::eventually;
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1722,7 +1723,7 @@ impl LogTap {
             .stdin(std::process::Stdio::null())
             .stdout(out)
             .stderr(std::process::Stdio::null());
-        let child = cmd.spawn().context("spawning kubectl logs -f")?;
+        let child = cmd.spawn_tied().context("spawning kubectl logs -f")?;
         Ok(LogTap {
             pod: pod.to_string(),
             child,

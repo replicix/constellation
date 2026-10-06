@@ -21,6 +21,8 @@ pub mod sandbox;
 pub mod scenarios;
 pub mod smoke;
 pub mod snapchurn;
+pub mod spawn;
 pub mod suites;
+pub mod sweep;
 pub mod toxiproxy;
 pub mod workload;

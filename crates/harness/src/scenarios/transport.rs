@@ -41,6 +41,7 @@ use super::handover::{generation, start_load, try_upgrade, verify_load, Watcher}
 use super::{setup, ts};
 use crate::client::Client;
 use crate::s3env::{S3Env, BUCKET};
+use crate::spawn::TiedSpawn;
 use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -1078,7 +1079,7 @@ fn lock_wait_round(c: &Client, depth: u64, extra: u64, round: &str) -> Result<u6
     let mut holder = pinned(&["holder", path])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .spawn()?;
+        .spawn_tied()?;
     let mut said = BufReader::new(holder.stdout.take().context("holder stdout")?);
     let mut line = String::new();
     said.read_line(&mut line)?;
@@ -1089,7 +1090,7 @@ fn lock_wait_round(c: &Client, depth: u64, extra: u64, round: &str) -> Result<u6
         .map(|i| {
             pinned(&["waiter", path, &i.to_string()])
                 .stdout(Stdio::piped())
-                .spawn()
+                .spawn_tied()
         })
         .collect::<std::io::Result<_>>()?;
     // `depth - 1` of them wait on the queue's entries; every other one is

@@ -88,6 +88,7 @@ use crate::interrupt;
 use crate::model::Observed;
 use crate::results::{Outcome, RunResults};
 use crate::s3env::FLOCI_IMAGE;
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -207,7 +208,9 @@ fn run_cmd(mut cmd: Command, stdin: Option<&[u8]>, timeout: Duration) -> Result<
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    let mut child = cmd.spawn().with_context(|| format!("spawning {what}"))?;
+    let mut child = cmd
+        .spawn_tied()
+        .with_context(|| format!("spawning {what}"))?;
     let feeder = stdin.map(|data| {
         let mut pipe = child.stdin.take().expect("piped stdin");
         let data = data.to_vec();
@@ -613,7 +616,7 @@ impl Env {
                 .arg(root)
                 .arg("csi-image")
                 .arg(format!("CSI_IMAGE={image}"))
-                .spawn()
+                .spawn_tied()
                 .context("running make csi-image")?;
             let st = loop {
                 if let Some(st) = make.try_wait()? {

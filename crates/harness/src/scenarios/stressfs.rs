@@ -93,6 +93,7 @@ use super::snapacct::verify_clean;
 use super::{eventually, setup_in, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::s3env::{S3Env, BUCKET};
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::process::CommandExt;
@@ -471,7 +472,7 @@ fn start(plan: &Plan, node: &str, dir: &Path, work: &Path, seed: u64) -> Result<
         plan.secs,
         dir.display()
     );
-    let child = cmd.spawn().context("spawning stress-ng")?;
+    let child = cmd.spawn_tied().context("spawning stress-ng")?;
     let started = Instant::now();
     Ok(Run {
         node: node.to_string(),

@@ -34,6 +34,7 @@
 use super::{eventually, setup, ts};
 use crate::client::Client;
 use crate::s3env::BUCKET;
+use crate::spawn::TiedSpawn;
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -290,7 +291,7 @@ pub(super) fn fsync_interrupt(seed: u64) -> Result<()> {
         .arg(&script)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .spawn_tied()
         .context("python3")?;
     let outcome = (|| -> Result<()> {
         std::thread::sleep(Duration::from_secs(4));

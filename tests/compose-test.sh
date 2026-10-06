@@ -4,14 +4,22 @@
 #
 #   tests/compose-test.sh                  # all suites
 #   tests/compose-test.sh smoke stress     # selected suites
-#   tests/compose-test.sh --down [suites]  # ...tear down afterwards
+#   tests/compose-test.sh --keep [suites]  # leave the compose project up afterwards
+#
+# The compose project is torn down in an EXIT trap however the script ends
+# (failure, SIGTERM, a `timeout`), but only if this run started its floci:
+# one already up (a shared checkout's) is someone else's.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TEARDOWN=false
-if [ "${1:-}" = "--down" ]; then
-    TEARDOWN=true
+TEARDOWN=true
+if [ "${1:-}" = "--keep" ]; then
+    TEARDOWN=false
     shift
+fi
+if [ -n "$(docker compose --profile test ps -q floci 2>/dev/null)" ]; then
+    echo "== floci is already up: reusing it, and leaving the project up"
+    TEARDOWN=false
 fi
 SUITES=("${@:-}")
 [ -z "${SUITES[0]:-}" ] && SUITES=(smoke compliance stress)
@@ -22,6 +30,8 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT HUP
 
 # CI pre-builds the image (with a shared layer cache) and sets SMOKE_IMAGE;
 # locally we build here.

@@ -98,6 +98,7 @@ use super::{eventually, journal_drained, lease_of, setup, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::reqlog::CountingProxy;
 use crate::s3env::{S3Env, BUCKET};
+use crate::spawn::TiedSpawn;
 use anyhow::{bail, Context, Result};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -887,7 +888,7 @@ fn git_within(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_tied()
         .with_context(|| format!("running git {args:?}"))?;
     let mut out = child.stdout.take().unwrap();
     let mut err = child.stderr.take().unwrap();
@@ -994,7 +995,7 @@ fn missing_from_packs(
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()?;
+                .spawn_tied()?;
             // Fed from a thread of its own: git answers while it reads,
             // and a list longer than the pipe would otherwise block both
             // ends. Stdin closes when the writer drops it.

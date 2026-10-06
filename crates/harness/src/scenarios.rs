@@ -1814,6 +1814,7 @@ fn setup_in(name: &str, dir: &std::path::Path) -> Result<(S3Env, tempfile::TempD
     let mut root = tempfile::Builder::new()
         .prefix(&format!("harness-{name}-"))
         .tempdir_in(dir)?;
+    crate::sweep::claim(root.path());
     // CHAOS_KEEP_TMP=1 keeps mount logs + state dirs around after the
     // scenario returns, for offline inspection of failures.
     if std::env::var_os("CHAOS_KEEP_TMP").is_some_and(|v| v != "0") {
