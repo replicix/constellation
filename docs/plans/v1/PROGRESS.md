@@ -45442,3 +45442,107 @@ write under `c`'s fresh delegation to the root `a`. Neither core showed
 | harness `delegate*` once | `delegated-subtrees`, `delegate-crash`, `-crash-default-ttl`, `-partition`, `p2p-off-no-delegation`, `delegated-op-latency`, `delegate-crash-backup`, `-root-loss`, `-root-blackhole`, `-root-loss-ttl`, `-handoff-renewal`, `-backup-handoff-failover`: all PASSED |
 
 No `sll` containers or mounts were left.
+
+## Fix: a live holder's grant lapsed under an S3 cut while the root renewing it was reachable over P2P (`delegate-fenced-io`, 2026-10-07)
+
+Fix: a delegate whose generation a recall took back names the root that recalled it for the subtree's lock requests and renewals (`NotOwner { root }`, also for a generation it never installed), and a node that hears so from the delegate its table names asks that root until its table drops the generation (`DelegationState::handed_back`, `LockState::deleg_moved`). A failed lease read for the owner falls back to the active epoch's carrier (`Core::lock_owner_without_s3`). A `NotHolder`/`Busy` reply no longer makes its sender the cached lease holder (`Core::on_mutate_reply`). A grant arriving with less than `margin / 4` of its window left is asked for again, like one that lapsed on arrival.
+
+Base: main `67ed5c2`. Open item of `epoch-liveness-gap`'s review round: `locks-blips-tight-delegated` 0..4000 fenced 482 lock I/Os in about 470 seeds (`locks-blips-tight`: 0). Every one was safe (no failing seed, no grant lost) and an availability failure.
+
+### Classification (replays, `RUST_LOG=sim=debug,constellation_authority=info,…::locks=debug,…::delegate=debug`)
+
+None of the brief's candidate mechanisms was the cause: the delegate's own window, the delegation TTL against the lock TTL, and renewals queued behind a recall all checked out. Four mechanisms, in order of size:
+
+1. **The recalled delegate answered `NotOwner { 0 }` (seeds 1, 15, 36, 41, 67 and nearly all others of main's 482).** Every sampled seed follows the same sequence:
+   - The cut opens and a continuation epoch forms (≈ t+700 ms).
+   - `deleg_on_epoch` stops the delegates, and the root's `recall_all` recalls every generation.
+   - The delegates hand their grants back (`DelegRecalled`), and the root installs them and ends each generation in its own journal within ~15 ms (`end_generation`).
+   - The `Recall` record reaches the other replicas only once S3 is back and the epoch has closed (seed 1: t=1439 at the root, t=2912 at nodes 2 and 3).
+   - Meanwhile every holder's table still names the delegate, the delegate itself included (for its own grants). The renewals and requests go there and are answered `NotOwner { 0 }` (`lock_route_for`: generation stopped, `Route::Unknown`).
+   - The holder then reads the lease, which fails in the cut. Its grant lapses at `sent + ttl − margin` under its I/O, although the root had the grant and was reachable over P2P.
+2. **The same for a generation the delegate never installed (seed 293).** The table named it while an epoch was active, so `delegation_sync` installed nothing. The recall carried no `mine` entry, and a first version of the fix keyed on `DelegateState` missed it.
+3. **No owner known and the lease read failing (seed 157).** The holder's table no longer delegated the inode: generation 1 had ended there and generation 3 was not applied yet. Its cached holder was the delegate, which a `NotOwner { 0 }` then cleared. Only the lease read could name the root, and that read failed for the rest of the cut.
+4. **Two former delegates caching each other as the lease holder (seed 3117).** A recalled delegate answered a parked op `NotHolder` with `gen: 0`. `on_mutate_reply` caches the sender of any `gen == 0` reply as the lease holder, so each former delegate sent the other its lock renewals until the grant lapsed. Found with temporary debug lines at every `cached_holder` setter (removed).
+
+Seeds 157, 293 and 3117 fenced only once mechanism 1 was fixed (the timings moved), but main's code has each path.
+
+5. **(Found by the gate sweeps.) A pushed grant arriving all but lapsed.** `locks-delegated-writes` (no S3 cuts) went from 1 fenced I/O (seed 1704) to 7 with fix 1 alone; turning the delegate redirect off brought it back to 1. All 7, and main's 1704, are the same class:
+   - A waiter's re-send arrives at a delegate whose grants the delegation caps (ttl 1000–1250 ms against 1500).
+   - The waiter is served from the queue 280–700 ms later.
+   - The push's window counts from that request's send, so the grant installs with 5–20 ms left.
+   - The client enters its I/O, and the renewal sent at once comes back after the lapse.
+
+   The owner side is unchanged on purpose: its record counts from the latest arrival (`Waiter::recv`) so that a dead waiter costs at most `ttl + margin`.
+
+### What changed (all in `crates/authority/src/core`)
+
+| change | where |
+|---|---|
+| A recall records `(root, at, row seen)` per generation, whether or not the generation is in `mine`. It is dropped once the generation's table row was seen here and is gone, or after 60 s for a row never seen. `lock_route_for` sends a stopped or never-installed generation of this node to that root (`Route::Node(root)`), not `Route::Unknown`. The delegate's own grants on the subtree therefore renew at the root too | `delegate.rs` `DelegationState::handed_back`, `on_deleg_recall`, `delegation_sync`, `deleg_handed_back_to`; `locks.rs` `lock_route_for` |
+| A `NotOwner { owner }` from the delegate this node's table names (renewal answer or lock reply), with `owner` neither 0, the sender, nor this node, redirects that generation to `owner`. A `NotOwner` from the redirect's target drops the redirect. Redirects are pruned at every renewal tick for generations no longer in the table | `locks.rs` `LockState::deleg_moved`, `lock_note_not_owner`, `lock_apply_renew_result` (now takes `from`), `lock_op_outcome`, `on_lock_renew_tick` |
+| A lease read that failed (`LeaseGet(Err)`), for a renewal or a request, names the active epoch's carrier, else the holder of the last lease object seen while it has not expired here | `locks.rs` `lock_owner_without_s3`, `on_lock_renew_holder`, `on_lock_holder_learned` |
+| `gen == 0` replies cache their sender as the lease holder only when they are not `NotHolder` or `Busy` | `client.rs` `on_mutate_reply` |
+| Lapsed on arrival: `sent + ttl − margin <= now + margin / 4` | `locks.rs` `lock_op_outcome` |
+
+### Why it keeps every safety rule
+
+- **Nothing is granted or extended by the redirect or the fallback themselves.** They only choose which node is *asked*. That node answers from its own table with its own windows, as for any request: `lock_route_answering`, `lock_renew_one`, the cap, the grace, `Lost` for an unknown grant. Fencing tokens, barriers, floors and exclusion are decided where they were.
+- **The root routes the subtree to itself only after `end_generation`.** By then the recall answer's grants are installed (or reinstated from `handed`, with a grace when outwaited). A holder that reaches the root early is answered `NotOwner { delegate }`, which drops the redirect. It is never answered `Lost` early.
+- **A wrong guess costs a round trip, not a grant.** A stale redirect or fallback node answers `NotOwner`, and the answer clears it.
+- **The arrival check only refuses more.** The node asks again, which the existing lapsed-on-arrival path does already, and the owner re-affirms the grant from the fresh request (`lock_try_grant` mints per answer).
+- No oracle was changed and no check or test was weakened.
+
+### Tests
+
+- Core (each fails with its change reverted; all five were reverted together and checked):
+  - `a_recalled_delegate_sends_its_subtrees_locks_to_the_root`: installed and never-installed generation; renewal and request; dropped with the `Recall` row.
+  - `a_holder_renews_where_its_recalled_delegate_points`: delegate → root → `NotOwner { 3 }` → delegate again.
+  - `a_failed_owner_read_renews_with_the_epochs_carrier`.
+  - `a_not_holder_reply_does_not_make_its_sender_the_holder`: `NotHolder` and `Busy`.
+  - `a_grant_arriving_all_but_lapsed_is_asked_for_again`: 3.7 s installs, 3.8 s re-asks.
+- Sim: `delegate_fenced_io_seeds_keep_their_grants`. It pins `locks-blips-tight-delegated` 1, 15, 36, 41, 67, 157, 293, 3117 and `locks-delegated-writes` 463, 510, 1203, 1704, with 0 fenced and 0 lost each.
+
+### Results (`sweep_config`, `TMPDIR=/dev/shm`, 15 threads; base = main `67ed5c2` built in a separate worktree)
+
+| config | seeds | fenced, main | fenced, this chunk |
+|---|---|---|---|
+| `locks-blips-tight-delegated` | 0..4000 | 482 | **0** (2532 epochs replaced) |
+| `locks-blips-tight` | 0..4000 | 0 | 0 |
+| `locks-unlinked-delegated-blips` | 0..3000 | 315 | 0 |
+| `locks-blips`, `-tight-in-doubt` | 0..3000 | 1, 1 | 0, 0 |
+| `locks-delegated`, `-delegated-writes`, `locks-unlinked-delegated` | 0..3000 | 1, 1, 0 | 1, 0, 0 |
+
+Target met: fenced I/O in `locks-blips-tight-delegated` equals `locks-blips-tight` (0 = 0) over 0..4000. The remaining configs fence by design (partitions, crashes, pauses, random faults). Their totals stay within a few I/Os of main's, and their per-seed sets reshuffle in both directions as timings move: `-partition` 4878→4875, `-failover` 862→860, `-failover-backup` 890 (lost 23) both, `-faults` 8 both, `-blips-tight-faults` 1374→1375, `-pause` 759→760, `-hcrash` 746→736, `-hcrash-backup` 564→568 (lost 4→5), `-dcrash` 27→31, `-dcrash-nb` 21→22, `-random` 490→478, `-dbackup-random` 368→361 (lost 3→4), `-unlinked-delegated-partition` 5332→5350, `-delegated-partition` 5522→5537, `-released-delegated` 2→3, `-released-writes` 32→31, `-failover-backup-writes` 1149→1148 (lost 22 both). Spot checks of the new seeds:
+- `-dcrash` 696: the grant's delegate crashed, so it lapses until the root outwaits it (by design).
+- `-released-delegated` 687: the config's own case. A grant of the released tenure's owner is unreachable from the moment the lease was released and lapses at its window.
+
+Remaining fenced seeds by mechanism:
+- `locks-delegated` 1432 (1 I/O; main fences seed 1528 there). It has no S3 cut and no fault (`faults: []`).
+  - The root answers its delegate's renewals with a ttl capped by its own lease's expiry, falling from 2021 to 1556 ms between t=6.6 s and 7.1 s.
+  - The delegate caps its lock renewals at what is left of the delegation: 1274, 930, 723, 613, 551, 528, 515, 501 ms.
+  - A renewal answered with a ttl of about the margin (500 ms) leaves the holder a window of about 0, and the grant lapsed under its I/O at t=7180.
+  - This is the lease-cap path, not this chunk's. Why the root's lease got that close to its expiry was not determined.
+- The by-design classes above.
+
+### Gates (`CARGO_TARGET_DIR` unset)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `TMPDIR=/dev/shm cargo test --release -p constellation-authority -p constellation-meta` | authority 310 (+2 ignored) + 4 + sim 133 (+11 ignored); meta 244 (+2) and its integration tests: 0 failed |
+| `cargo test --release -p constellation-engine --lib` (not a gate) | 607 passed |
+| All 30 lock configs, `sweep_config` 0..3000 | 0 failing |
+| `delegated-holder-cut`, `long-delegated`, `delegated-backup`, `delegated-two-gens-root-crash`, `delegated-root-gone`, `delegated-delegate-restart`, `long-delegated-backup`, `long-delegated-late-answers`, 0..3000 | 0 failing, 0 fenced |
+| Harness, prefix `dfi`, `TMPDIR=/var/tmp/dfi/htmp`: the 6 `lock-*` and the 11 `delegate*`/`delegated-*` scenarios, once | ALL SCENARIOS PASSED |
+
+### Decisions taken alone
+
+- **The redirect, not a faster `Recall` record.** Shipping the record to replicas during an epoch would change what the epoch's members apply before S3 has it, which is the epoch design's business. The root already serves the grants. Only the route to it was missing, and the delegate knows it.
+- **`margin / 4` for "all but lapsed"** (125 ms in the sim, 250 ms at the default margin). It sits well above the 5–20 ms these grants had left and well below a normal window, and costs one round trip when it triggers.
+- **The fallback includes the last lease seen, not only the carrier.** A cut before an epoch forms has the same shape. The guess is only asked, and a `NotOwner` clears it.
+- `lock_owner_without_s3` is `pub(crate)` for its test.
+
+### Open
+
+- `flex*`, `long-*` other than the delegated ones, and `stress-ng-fs-nodes` were not run (not in the gates; the change is lock and delegation routing).
+- `locks-delegated` 1432: lock renewals under a delegation shrink with the root lease's remaining life down to the margin, so the holder's window reaches about 0 (see above). A renewal that cannot leave a useful window could renew the delegation (and the root its lease) first, as a new grant on less than `2 × margin` already does (`lock_min_grant_ms`); not done here.

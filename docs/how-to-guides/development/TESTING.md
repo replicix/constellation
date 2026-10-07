@@ -3049,7 +3049,12 @@ configs for this: `locks-blips-tight-faults` (random faults on top),
 replaced epochs have delegates among their members) and `flex-tight`
 (`flex`'s two-member outages in back-to-back pairs); their seeds are
 pinned in `epoch_liveness_gap_fault_seeds`. `sweep_config` prints the
-fenced I/Os per seed (`SWEEP-FENCED`). Seed 2723 is pinned
+fenced I/Os per seed (`SWEEP-FENCED`). `locks-blips-tight-delegated`
+fences no I/O in 0..4000 (482 before chunk delegate-fenced-io: holders
+renewing at a delegate that a continuation epoch's recall had stopped,
+before the `Recall` record reached their tables); its seeds and the
+`locks-delegated-writes` seeds whose pushed grant arrived all but lapsed
+are pinned in `delegate_fenced_io_seeds_keep_their_grants`. Seed 2723 is pinned
 (`locks_blips_tight_seed_2723_release_keeps_exclusion`: a handoff that
 dropped two live exclusive grants, and a successor whose release grace
 went with its own tenure). `locks-blips-tight-in-doubt` (sweep only, plus

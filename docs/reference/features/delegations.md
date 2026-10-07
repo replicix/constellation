@@ -261,6 +261,13 @@ The root then executes the op itself. There is no two-phase commit.
 After a cross-subtree op the root delegates the same subtrees again,
 under new generations.
 
+The `Recall` record reaches the other tables later than it ends the
+generation at the root, under an S3 cut only after the cut. Until then
+the recalled delegate answers lock requests and renewals for the subtree
+`NotOwner` naming the root that recalled it, and a node that hears it
+asks that root for the subtree's locks (see [Cluster
+locks](cluster-locks.md#delegations)).
+
 ### Automatic placement
 
 Placement is on by default (`CONSTELLATION_DELEGATION_PLACEMENT`). The

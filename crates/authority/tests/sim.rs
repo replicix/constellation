@@ -4251,6 +4251,64 @@ fn locks_blips_tight_delegated_config() -> SimConfig {
     }
 }
 
+/// Chunk delegate-fenced-io: `locks-blips-tight-delegated` fenced 482
+/// lock I/Os in 0..4000 on main (`locks-blips-tight`: 0), every one a live
+/// holder whose grant lapsed during an S3 cut while the root renewing it
+/// was reachable over P2P:
+///
+/// - 1, 15, 36, 41, 67: a continuation epoch's recall-all took the
+///   delegates' grants back to the root, which ended the generations in
+///   its own journal; the `Recall` record reached the other tables only
+///   after the cut, so the holders (the delegate itself among them) sent
+///   their renewals to the recalled delegate, answered `NotOwner { 0 }`,
+///   and the lease read that followed failed in the cut. The delegate now
+///   names the root its recall went back to (`Core::deleg_handed_back_to`),
+///   and the holder renews there (`LockState::deleg_moved`).
+///
+/// Fenced once that was fixed (main's code has each path; these seeds
+/// reach it only with the redirect's timings):
+/// - 293: the same, for a generation the delegate never installed (the
+///   epoch was active when its table named it).
+/// - 157: the holder's table no longer named a delegate and nothing named
+///   the root; the failed lease read now falls back to the active
+///   epoch's carrier (`Core::lock_owner_without_s3`).
+/// - 3117: a recalled delegate's `NotHolder` reply made it the other
+///   former delegate's cached lease holder, and the two sent each other
+///   their renewals (`Core::on_mutate_reply` no longer caches a refusal's
+///   sender).
+/// - `locks-delegated-writes` 463, 510, 1203, and 1704, fenced on main
+///   the same way: a pushed grant whose window counted from a request
+///   sent 300–700 ms before arrived with 5–20 ms left under a delegate's
+///   capped ttl; it is now asked for again.
+#[test]
+fn delegate_fenced_io_seeds_keep_their_grants() {
+    let cases: [(&str, &[u64]); 2] = [
+        (
+            "locks-blips-tight-delegated",
+            &[1, 15, 36, 41, 67, 157, 293, 3117],
+        ),
+        ("locks-delegated-writes", &[463, 510, 1203, 1704]),
+    ];
+    for (name, seeds) in cases {
+        for &seed in seeds {
+            let config = match name {
+                "locks-blips-tight-delegated" => locks_blips_tight_delegated_config(),
+                _ => with_lock_writes(locks_delegated_config(), "d2"),
+            };
+            let report = run_seed(seed, config).unwrap_or_else(|e| {
+                panic!("{name} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={name}")
+            });
+            let mut t = M14Totals::default();
+            t.add(&report);
+            assert_eq!(t.lost, 0, "{name} seed {seed}: grants lost: {t:?}");
+            assert_eq!(
+                t.clients.fenced_ios, 0,
+                "{name} seed {seed}: I/O fenced: {t:?}"
+            );
+        }
+    }
+}
+
 /// `locks-blips-tight` with `locks-blips`' in-doubt lease PUTs back:
 /// back-to-back cuts with acquisition and release CASes that land but
 /// answer a timeout. On main before chunk lock-release-drop it failed

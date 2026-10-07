@@ -955,9 +955,20 @@ impl Core {
         // Plan 30 §M11: whatever the reply installs here, this client's
         // next write orders after the answering sequencer's position.
         replica.note_frontier(&position);
-        if gen == 0 {
+        if gen == 0
+            && !matches!(
+                outcome,
+                MutateOutcome::NotHolder { .. } | MutateOutcome::Busy
+            )
+        {
             // Plan 30 §M11: a delegate's reply says nothing about the
-            // lease; only the root's names the holder.
+            // lease; only the root's names the holder. Nor does a
+            // refusal to execute: a recalled delegate answers its parked
+            // ops `NotHolder` with no generation, and cached as the
+            // holder, it took this node's lock renewals for the rest of
+            // an S3 cut (`locks-blips-tight-delegated` seed 3117: two
+            // former delegates each sent the other their renewals until
+            // the grant lapsed under its I/O; chunk delegate-fenced-io).
             self.lease.cached_holder = Some(from);
         }
         let applied = replica.applied_seq().unwrap_or(0);

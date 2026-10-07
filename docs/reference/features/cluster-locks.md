@@ -152,6 +152,21 @@ batches go further: they and the root's answers are one-way messages,
 so no answer can be lost to a timeout at all (see
 [Delegations](delegations.md#the-append-path-and-dependencies)).
 
+A renewal (or request) that finds no owner it can reach reads the root
+lease to learn the holder. Under an S3 cut that read fails. The node
+then asks the active continuation epoch's carrier, or failing that, the
+holder of the last lease object it saw, if that object has not expired
+on its clock. It only asks that node: the node answers from its own
+table, and a `NotOwner` answer clears the guess again. Before, a holder
+that knew no owner found none for the whole cut, and its grant lapsed
+under its I/O although the root that would renew it was reachable over
+P2P (`locks-blips-tight-delegated`). Only a reply of the root's that
+executed (or refused) the op names the lease holder: a `NotHolder` or
+`Busy` reply names nobody. A recalled delegate answers the ops parked on
+it `NotHolder` with no generation. Before, that made it the asking
+node's cached lease holder, and two former delegates sent each other
+their lock renewals until the grants lapsed.
+
 A file locked through a delegate and then unlinked while locked
 (`stress-ng`'s lock stressors do) is in no delegated subtree any more,
 so from the unlink on its owner is the root, by location: its holder
@@ -413,7 +428,14 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    node (`LockGranted`) when it becomes free. A parked request is granted
    live from its latest arrival, not from when it is served. A waiter
    silent for longer than `ttl − margin` is passed over: a grant would
-   already have lapsed when it arrived. After `4 × ttl` of silence the
+   already have lapsed when it arrived. A grant that arrives with less
+   than a quarter of the margin of its window left (the window counts
+   from the request's send) is treated as lapsed on arrival: the node
+   asks again, and the owner re-affirms the grant from the fresh
+   request. Installed, it lapsed under the I/O it let in before a
+   renewal could come back: a waiter served from a delegate's queue
+   near the end of its re-send interval, under a ttl capped by the
+   delegation, got 5 to 20 ms of it (`locks-delegated-writes`). After `4 × ttl` of silence the
    waiter is dropped. So a node that dies while queued costs the waiters
    behind it at most one `ttl + margin` from its last message, and
    nothing if the lock frees later than that.
@@ -753,6 +775,21 @@ delegation's first renewal therefore carries what is left of any grace
 that covers its subtree. A delegate that starts serving inside a grace
 makes no new grants on the subtree until the grace has passed, plus the
 margin, and accepts reclaims meanwhile.
+
+A recall's answer takes the subtree's grants back to the root, which
+ends the generation in its own journal at once. The other nodes' tables
+drop the generation only when the `Recall` record reaches them, and
+under an S3 cut (a continuation epoch recalls every delegation) that is
+after the cut. Meanwhile their tables still name the delegate. The
+recalled delegate therefore answers lock requests and renewals for the
+subtree `NotOwner` naming the root that recalled it, also for a
+generation it never installed. A node that hears that from the delegate
+its table names sends the subtree's requests and renewals to that root
+until its table drops the generation, or until the root itself answers
+`NotOwner`. Before, the delegate answered `NotOwner { 0 }`, the holders
+found no owner for the whole cut, and their grants lapsed under their
+I/O while the root had them and would have renewed them
+(`locks-blips-tight-delegated`: 482 fenced I/Os in 4000 seeds, now 0).
 
 Name-hash range delegations need nothing extra: a file's lock owner is
 resolved from its primary link, like every other ownership lookup.

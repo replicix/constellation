@@ -290,6 +290,10 @@ impl DelegationState {
     }
 }
 
+/// How long a recall answered for a generation this node's table has
+/// not named yet is remembered ([`DelegationState::handed_back`]).
+const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
+
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
     /// The root's generations (this node holds the lease).
@@ -314,6 +318,18 @@ pub(crate) struct DelegationState {
     root_synced: bool,
     /// Plan 30 §M10: an active continuation epoch — no delegation.
     pub(crate) epoch_active: bool,
+    /// Generations this node's table still delegates to it whose recall
+    /// it answered, with the root that recalled them: the subtree's lock
+    /// grants went back there (`on_deleg_recall`), so lock requests and
+    /// renewals for it are sent there (`NotOwner { root }`) rather than
+    /// refused with `NotOwner { 0 }` until the `Recall` record reaches
+    /// this table — under an S3 cut, only after it. Also for a
+    /// generation never installed here (an epoch was active when the
+    /// table named it). `(root, recalled at, row seen)`: dropped once the
+    /// generation's table row was seen here and is gone, or — a row
+    /// never seen (the recall overtook the record naming this node) —
+    /// after [`HANDED_BACK_UNSEEN_MS`].
+    pub handed_back: BTreeMap<u64, (NodeId, Ms, bool)>,
 }
 
 /// Plan 30 §M11's view for `status`.
@@ -449,6 +465,13 @@ impl Core {
         for gen in ended {
             self.drop_delegate_state(now, gen, replica, out);
         }
+        self.dl.handed_back.retain(|gen, (_, at, seen)| {
+            if live_mine.contains(gen) {
+                *seen = true;
+                return true;
+            }
+            !*seen && now.since(*at) < HANDED_BACK_UNSEEN_MS
+        });
         for d in table.iter().filter(|d| d.node == me) {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
                 continue;
@@ -2335,6 +2358,16 @@ impl Core {
             .map(|d| d.until)
     }
 
+    /// The root a recall handed generation `gen`'s lock grants back to,
+    /// while this node is still its delegate in the table.
+    pub(crate) fn deleg_handed_back_to(&self, gen: u64) -> Option<NodeId> {
+        self.dl
+            .handed_back
+            .get(&gen)
+            .map(|(root, _, _)| *root)
+            .filter(|n| *n != 0 && *n != self.cfg.node_id)
+    }
+
     /// A grant never outlives the root lease's usable end (the cap).
     fn grant_cap_ms(&self, now: Ms) -> u64 {
         let Some((lease, _)) = &self.lease.held else {
@@ -2530,6 +2563,11 @@ impl Core {
         // Plan 30 §M14: the subtree's lock grants go back with the answer;
         // its waiters are told to ask the root.
         let locks = self.lock_hand_back(gen, replica);
+        let seen = replica
+            .delegation_table()
+            .iter()
+            .any(|d| d.gen == gen && d.node == self.me());
+        self.dl.handed_back.insert(gen, (from, now, seen));
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.stopped = true;
             self.stats.deleg_recalls_received += 1;

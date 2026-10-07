@@ -176,6 +176,20 @@ pub(crate) struct LockState {
     deleg_renew_wanted: std::collections::BTreeSet<u64>,
     /// A lease read to relearn the owner for renewals is in flight.
     relearning: bool,
+    /// Node side, per generation this node's table still delegates: the
+    /// node its delegate named the owner (`NotOwner { root }`) once a
+    /// recall had taken the subtree's grants back to that root
+    /// (`DelegationState::handed_back`). Requests and renewals for the
+    /// subtree go there until the `Recall` record reaches this table —
+    /// which under an S3 cut is only after it (the root ends the
+    /// generation in its journal at once, a continuation epoch's
+    /// recall-all). Sent to the stale delegate meanwhile, they were
+    /// answered `NotOwner { 0 }` for the whole cut, and the grants the
+    /// root renews lapsed under their holders' I/O
+    /// (`locks-blips-tight-delegated`, chunk delegate-fenced-io). Dropped
+    /// when the named node answers `NotOwner` itself, or once the table
+    /// no longer has the generation.
+    deleg_moved: BTreeMap<u64, NodeId>,
     /// Flush attempts per inode with a release in flight.
     flushing: BTreeMap<Ino, u32>,
     /// Phase 2: inodes whose release waits for tagged mutations
@@ -538,10 +552,20 @@ impl Core {
                             cap_ms: until.0 - self.lock_margin_ms() - now.0,
                             gen: d.gen,
                         },
-                        // Not installed or renewed yet: a request here
-                        // would be answered `NotOwner{me}`; wait a tick.
-                        _ => Route::Unknown,
+                        // Recalled: the subtree's grants went back to the
+                        // root that recalled it, which serves them from
+                        // its own table (its journal ended the generation
+                        // before this table hears of it).
+                        _ => match self.deleg_handed_back_to(d.gen) {
+                            Some(root) => Route::Node(root),
+                            // Not installed or renewed yet: a request here
+                            // would be answered `NotOwner{me}`; wait a tick.
+                            None => Route::Unknown,
+                        },
                     };
+                }
+                if let Some(&to) = self.lk.deleg_moved.get(&d.gen) {
+                    return Route::Node(to);
                 }
                 return Route::Node(d.node);
             }
@@ -576,6 +600,42 @@ impl Core {
         {
             Some(h) => Route::Node(h),
             None => Route::Unknown,
+        }
+    }
+
+    /// `from` answered a request or renewal for `ino` with `NotOwner {
+    /// owner }`. From the delegate this node's table names for it, an
+    /// owner elsewhere is the root its recall handed the subtree back to:
+    /// the subtree goes there (`LockState::deleg_moved`). From the node
+    /// that redirect named, the redirect is stale (that node's table
+    /// still delegates the subtree, or it is not the root any more): the
+    /// subtree goes to its delegate again, which names the owner anew.
+    fn lock_note_not_owner(
+        &mut self,
+        from: NodeId,
+        ino: Ino,
+        owner: NodeId,
+        replica: &dyn Replica,
+    ) {
+        if !self.cfg.delegation || replica.delegation_table().is_empty() {
+            return;
+        }
+        let keys = Self::read_keys(ino, None);
+        let constellation_meta::delegation::Ownership::Delegated(d) =
+            replica.resolve_ownership(&keys)
+        else {
+            return;
+        };
+        let me = self.cfg.node_id;
+        if d.node == me {
+            return;
+        }
+        if from == d.node {
+            if owner != 0 && owner != from && owner != me {
+                self.lk.deleg_moved.insert(d.gen, owner);
+            }
+        } else if self.lk.deleg_moved.get(&d.gen) == Some(&from) {
+            self.lk.deleg_moved.remove(&d.gen);
         }
     }
 
@@ -2746,6 +2806,13 @@ impl Core {
         if self.lock_op_while_resuming(now, op, replica, out) {
             return;
         }
+        if matches!(&result, crate::event::S3Result::LeaseGet(Err(_))) {
+            if let Some(owner) = self.lock_owner_without_s3(now) {
+                self.lease.cached_holder = Some(owner);
+                self.lock_route_op(now, op, replica, out);
+                return;
+            }
+        }
         // Nobody usable holds it: a lock needs a sequencer as a write
         // does — acquire (the sim found blocked lockers with nobody
         // taking the lease). Non-blocking: unavailable after the retries.
@@ -2995,9 +3062,18 @@ impl Core {
                 position,
             } => {
                 let ttl = ttl_ms as i64;
-                if o.sent_at.0 + ttl - margin <= now.0 {
+                if o.sent_at.0 + ttl - margin <= now.0 + margin / 4 {
                     // Lapsed on arrival (a request held longer than the
-                    // window): ask again rather than install a fence.
+                    // window), or all but: ask again rather than install
+                    // a fence. A grant whose window ends before a renewal
+                    // could come back lapses under the I/O it lets in
+                    // (the window counts from the request's send, and a
+                    // waiter served from the queue near the end of its
+                    // re-send interval under a delegate's capped ttl got
+                    // 5–20 ms of it: `locks-delegated-writes`, chunk
+                    // delegate-fenced-io). The owner answers the request
+                    // again at once (it re-affirms the grant this node
+                    // holds there), from its fresh send.
                     self.lock_retry(now, op, out);
                     return;
                 }
@@ -3075,6 +3151,8 @@ impl Core {
                 });
             }
             LockOutcome::NotOwner { owner } => {
+                let ino = o.ino;
+                self.lock_note_not_owner(from, ino, owner, replica);
                 if owner != 0 && owner != from && owner != self.cfg.node_id {
                     let names_delegate = replica.delegation_table().iter().any(|e| e.node == owner);
                     if !names_delegate {
@@ -3200,6 +3278,12 @@ impl Core {
         self.lk.renew_timer = None;
         self.lk.renew_at = None;
         let mut relearn = false;
+        if !self.lk.deleg_moved.is_empty() {
+            let table = replica.delegation_table();
+            self.lk
+                .deleg_moved
+                .retain(|gen, _| table.iter().any(|e| e.gen == *gen));
+        }
         // A cache nobody locked for a while is given back (its renewals
         // would otherwise go on forever).
         let idle = replica
@@ -3248,7 +3332,7 @@ impl Core {
                 Route::Me { .. } => {
                     let me = self.cfg.node_id;
                     let r = self.lock_renew_one(now, me, ino, h.id, h.mode, replica);
-                    self.lock_apply_renew_result(now, ino, h.id, now, r, replica, out);
+                    self.lock_apply_renew_result(now, me, ino, h.id, now, r, replica, out);
                     for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
                         self.deleg_renew_now(now, gen, out);
                     }
@@ -3340,6 +3424,32 @@ impl Core {
         }
     }
 
+    /// The owner to ask when the lease could not be read (S3 cut): the
+    /// active continuation epoch's carrier, or the holder of the last
+    /// lease object seen while that object has not expired here. Only a
+    /// node to *ask*: it answers from its own table, and `NotOwner`
+    /// clears it again (`cached_holder`). With no owner known, a cut
+    /// lasting longer than a grant's window lapsed it under its holder's
+    /// I/O although the root renewing it was reachable over P2P (a
+    /// holder whose stale delegate answered `NotOwner { 0 }` and whose
+    /// table no longer named a delegate: `locks-blips-tight-delegated`
+    /// seed 157, chunk delegate-fenced-io).
+    pub(crate) fn lock_owner_without_s3(&self, now: Ms) -> Option<NodeId> {
+        let me = self.cfg.node_id;
+        let carrier = self
+            .pr
+            .carried
+            .filter(|_| self.epoch.active)
+            .map(|c| c.node);
+        let seen = self
+            .lease
+            .last_seen
+            .as_ref()
+            .filter(|l| !l.is_claimable(now.0))
+            .map(|l| l.holder);
+        carrier.or(seen).filter(|n| *n != 0 && *n != me)
+    }
+
     fn lock_relearn_owner(&mut self, out: &mut Vec<Action>) {
         if self.lk.relearning {
             return;
@@ -3365,6 +3475,10 @@ impl Core {
             self.lease.note_object(now, lease);
             if lease.holder != 0 && !lease.is_claimable(now.0) && lease.holder != self.cfg.node_id {
                 self.lease.cached_holder = Some(lease.holder);
+            }
+        } else if matches!(&result, crate::event::S3Result::LeaseGet(Err(_))) {
+            if let Some(owner) = self.lock_owner_without_s3(now) {
+                self.lease.cached_holder = Some(owner);
             }
         }
         // Renew at once with what was learned.
@@ -3399,7 +3513,7 @@ impl Core {
             "lock renewals answered"
         );
         for (ino, id, result) in results {
-            self.lock_apply_renew_result(now, ino, id, sent, result, replica, out);
+            self.lock_apply_renew_result(now, from, ino, id, sent, result, replica, out);
         }
         // The answer may carry a shorter window than the tick allows for.
         if replica.locks().held_count() > 0 {
@@ -3411,6 +3525,7 @@ impl Core {
     fn lock_apply_renew_result(
         &mut self,
         now: Ms,
+        from: NodeId,
         ino: Ino,
         id: GrantId,
         sent: Ms,
@@ -3455,6 +3570,7 @@ impl Core {
                 if owner != 0 && owner != self.cfg.node_id && !names_delegate {
                     self.lease.cached_holder = Some(owner);
                 }
+                self.lock_note_not_owner(from, ino, owner, replica);
                 replica.locks().renewal_failed(ino, id);
             }
         }
@@ -3516,7 +3632,7 @@ impl Core {
             "late lock renewals answered"
         );
         for (ino, id, result) in granted {
-            self.lock_apply_renew_result(now, ino, id, late.sent, result, replica, out);
+            self.lock_apply_renew_result(now, from, ino, id, late.sent, result, replica, out);
         }
         if replica.locks().held_count() > 0 {
             self.lock_arm_renew_tick(now, replica, out);
