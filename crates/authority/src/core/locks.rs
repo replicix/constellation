@@ -4210,7 +4210,8 @@ impl Core {
     }
 
     /// Root: a delegate's drained answer handed `grants` back — installed
-    /// restamped; the root's copies of them are done.
+    /// restamped; the root's copies of them are done. An answer that
+    /// comes after the generation ended here brings no grants back.
     pub(crate) fn lock_install_returned(
         &mut self,
         now: Ms,
@@ -4223,9 +4224,38 @@ impl Core {
             floor,
             barrier,
         } = back;
-        if let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) {
-            self.lock_note_dir_floor(dir, &floor);
-            self.lock_dir_barrier(dir, barrier);
+        let live = match self.dl.gens.get(&gen) {
+            Some(g) => {
+                let (dir, ended) = (g.dir, g.ended);
+                self.lock_note_dir_floor(dir, &floor);
+                self.lock_dir_barrier(dir, barrier);
+                !ended
+            }
+            None => false,
+        };
+        if !live {
+            // Whatever ended the generation accounted for its grants: an
+            // outwait or a seal waited out the delegation's window, which
+            // caps every grant it made or renewed (and left a grace on
+            // the subtree); a drained answer already handed them back; a
+            // lost lease took this tenure's table with it. A late answer
+            // (the delegate paused past its window, then answered the
+            // recall it found queued) carries copies nobody honours any
+            // more. Restamped, they would come back to life beside the
+            // subtree's next generation and keep its grants out at an
+            // unlink (sim `locks-unlinked-delegated-partition` seed 7455:
+            // the root then upgraded the revived copy for its old holder
+            // beside the delegate's live exclusive grant).
+            if !grants.is_empty() {
+                self.stats.lock_returned_after_end += grants.len() as u64;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    gen,
+                    n = grants.len(),
+                    "a recall answer after its generation ended; its grants dropped"
+                );
+            }
+            return;
         }
         if let Some(handed) = self.lk.handed.get_mut(&gen) {
             handed.retain(|h| !grants.iter().any(|g| g.node == h.node && g.ino == h.ino));

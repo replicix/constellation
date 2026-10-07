@@ -44595,3 +44595,128 @@ leave an unlocked file. Gates: fmt, clippy `-D warnings` clean;
 
 
 - iroh-error-line: `could not close last open path` (iroh `remote_state.rs`, `apply_selected_path`) is benign: iroh's path map lists a path noq already abandoned, noq refuses to close the last open path, nothing leaks. The CLI's log setup drops exactly that event (a tracing layer matching the `iroh::socket::remote_map::remote_state` target and the exact message; the module's other events are kept; `RUST_LOG` naming `remote_state` re-enables it); the harness's "no ERROR" rule is untouched. Upstream note in `vendor/ISSUE-iroh.md`.
+
+## Fix: a recall answer that came after its generation ended put lapsed grants back in the root's table (`unlinked-exclusion-7455`, 2026-10-07)
+
+Base: main `fd4fcf6d`. `locks-unlinked-delegated-partition` seed 7455
+failed "mutual exclusion violated" (ino `0x10000000800`, `lk0`, nodes 2
+and 1 both exclusive at t=9702) on `96f45659` and `c465b07f`. It passes
+on main `304c30c2`/`fd4fcf6d`, but only by another trajectory: the
+outwait barriers of `stale-read-outwaited` move its timings. The
+mechanism is still in main's code (below).
+
+Fix: `Core::lock_install_returned` installs a recall answer's grants
+only for a generation the root still has live. If the generation has
+ended there (outwaited, sealed, drained), or the root no longer knows it
+(the lease was lost since), the grants are dropped and counted
+(`Stats::lock_returned_after_end`). The answer's floor and barrier still
+count while the generation is known.
+
+**Cause** (replayed on `c465b07f` with
+`RUST_LOG=sim=debug,constellation_authority=debug`):
+
+1. Node 2, `d1`'s delegate (gen 1), is paused from t=3091 to 7784, past
+   its delegation's window (`until` 5090). Its grants lapse at their
+   holders: node 1's `(2, …781)` on `lk0` ("lapsed during a write" at
+   4088).
+2. t=6094: root 1 recalls gen 1. t=6096: the recall is outwaited, and
+   `end_generation` ends gen 1. At 6109 `d1` is re-delegated to node 2 as
+   gen 5.
+3. t=8375: node 2 resumes, finds the queued recall and answers
+   `DelegRecalled { gen: 1, locks: [(2, …780), (2, …781)] }`, the copies
+   still in its table.
+4. t=8382: the root installs them restamped with `lock_install_moved(..,
+   0, ..)`: `until` = now + 2000 (10382). A dead holder's record is live
+   again in the root's table, on inodes gen 5 serves.
+   `on_deleg_recalled` ignored the answer (its request was gone), but the
+   grants had already been installed by the dispatch in `Core::handle`.
+5. t=9229: node 1 releases gen 5's grant, and node 2 (the delegate)
+   grants itself `lk0` exclusive (`…785`). t=9419: node 1's unlink of
+   `lk0` executes at gen 5, and batch 4 carries `…785` as `leaving`.
+   t=9440: the root's `lock_install_leaving` → `install_if_consistent`
+   refuses it: the revived `…781` (node 1, exclusive, unexpired) is in
+   the way. The delegate, acknowledged, drops its copy.
+6. t=9702: node 1 asks the root for `lk0` exclusive. The root finds node
+   1's own revived record and grants (`upgraded=true`). Node 2 is still
+   inside its section (since 9229): two exclusive holders.
+
+The rule broken: a grant record in the root's table must be one its
+holder may still honour. An outwait or seal waited out the delegation's
+window, which caps every grant the generation made or renewed, and left
+a grace on the subtree. A drained answer handed the grants back already.
+So an answer after the end has nothing live to return. Restamping its
+copies gives a dead holder a fresh window.
+
+**Decisions.**
+
+- *Gate on the generation, not on the request id.* A live generation
+  whose answer names an older recall request (a re-sent recall) still
+  installs. The delegate took the grants out of its table for that
+  answer, so a later answer would carry none.
+- *Unknown generation dropped too.* A root that lost its lease since the
+  recall dropped its delegation state and its tenure's grant table.
+  Holders reclaim at the next tenure as after any takeover, so nothing
+  of an old answer belongs in a table there. This was already an early
+  return in the first cut; it is only counted now.
+- *Not "drop only lapsed copies".* The delegate's `until_ms` is its own
+  clock's restamp. Whether a copy is live is decided by the generation's
+  end, which the root itself measured.
+
+| Item | State | Where |
+|---|---|---|
+| A recall answer after its generation ended (or for an unknown one) installs no grants | done | `core::locks::lock_install_returned`, `Stats::lock_returned_after_end` |
+| Core test (fails without the fix: the lapsed grant is revived in the root's table) | done | `core::tests::locks::a_recall_answer_after_its_generation_ended_brings_no_grants_back` |
+| Sim regression: 7455, plus 1144, 1682, 1945, which take the late-answer path on this tree; asserts the counter is non-zero | done | `regression_locks_unlinked_delegated_partition_late_recall_answer` |
+| `sweep_config` prints `SWEEP-LATE-HANDBACK` per seed that reaches the path | done | `tests/sim.rs` |
+| Docs | done | `docs/reference/features/cluster-locks.md` (recall answers after the end), `TESTING.md` (`SWEEP-LATE-HANDBACK`, the pinned seeds) |
+
+Verification on `c465b07f` (scratch copy): seed 7455 fails without the
+fix and passes with it.
+
+Sweeps (`sweep_config`, seeds 0..9000, `TMPDIR=/dev/shm/ux7`, 14
+threads, 16 CPUs). "Late" = seeds with `SWEEP-LATE-HANDBACK`:
+
+| config | this tree: failing | of which "mutual exclusion" | late | main `fd4fcf6d`: failing |
+|---|---|---|---|---|
+| `locks-unlinked-delegated-partition` | 0 | 0 | 16 | 0 |
+| `locks-unlinked-delegated-random` | 0 | 0 | 42 | 0 |
+| `locks-unlinked-delegated-dbackup-random` | 0 | 0 | 41 | 0 |
+| `locks-delegated-partition` | 0 | 0 | 17 | 0 |
+| `locks-unlinked-delegated`, `-hcrash`, `-hcrash-backup`, `-dcrash`, `-dcrash-nb`, `-blips` | 0 | 0 | 0 | 0 |
+| `locks-delegated`, `locks-released-delegated` | 0 | 0 | 0 | 0 |
+| `locks`, `-partition`, `-skew`, `-failover`, `-failover-backup`, `-faults`, `-pause`, `-blips`, `-blips-tight`, `-blips-tight-single`, `-blips-tight-long-lease`, `-blips-tight-in-doubt`, `-blips-tight-faults`, `-blips-tight-delegated`, `-writes`, `-delegated-writes`, `-released-writes`, `-failover-backup-writes` | 0 | 0 | 0 | not run |
+
+The 18 configs in the last row were swept with this fix's first build,
+which differed only in not counting the unknown-generation case (that
+was an early return in both builds). None of them reached the path, so
+the fix does not change their runs. Main has no failures in any variant
+swept: the stale reads the brief mentions (`stale-read-outwaited`) were
+fixed in `304c30c2`, and 7455 itself no longer fails there. Without the
+fix, this tree's counter shows the path in 94 seeds of the three
+random-fault unlinked variants, with no failure in 0..9000. Reviving a
+lapsed record breaks exclusion only when an unlink or an upgrade meets
+it inside its fresh 2 s window, as in 7455.
+
+Gates (`CARGO_TARGET_DIR` unset, `ulimit -n 65536`):
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test --release -p constellation-authority -p
+  constellation-meta` (`TMPDIR=/dev/shm/ux7`): authority lib 296 (+2
+  ignored), 4, sim 130 (+11 ignored); meta 244 (+2 ignored) and every
+  integration binary. 0 failed.
+- Harness, prefix `ux7`, `TMPDIR=/var/tmp/ux7/tmp`, load 79–106, once
+  each, all PASSED: `lock-grant-dead-generation` 28.5 s,
+  `lock-holder-partitioned` 28.2 s, `lock-failover` 64.6 s,
+  `lock-holder-killed-contention` 22.6 s, `lock-fence-at-close` 22.3 s,
+  `lock-latency` 79.7 s, `delegated-subtrees` 57.3 s, `delegate-crash`
+  17.6 s, `delegate-crash-default-ttl` 32.4 s, `delegate-partition`
+  22.4 s, `delegated-op-latency` 25.7 s, `delegate-crash-backup` 15.7 s,
+  `delegate-root-loss` 29.2 s, `delegate-root-blackhole` 29.2 s,
+  `delegate-root-loss-ttl` 40.5 s, `delegate-handoff-renewal` 20.0 s,
+  `delegate-backup-handoff-failover` 33.2 s.
+
+### Open
+
+- None from this chunk. `unlinked-exclusion-5681`'s open item (seed 7455)
+  is closed here.

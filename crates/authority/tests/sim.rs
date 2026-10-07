@@ -2737,6 +2737,18 @@ fn sweep_config() {
                     chunks[4].fetch_add(report.held_back, ord);
                     chunks[5].fetch_add(report.awaited_uploaded, ord);
                     let lost: u64 = report.stats.values().map(|s| s.lock_lost).sum();
+                    // Seeds that exercise `Core::lock_install_returned`'s
+                    // late-answer rule (unlinked-exclusion-7455).
+                    let late: u64 = report
+                        .stats
+                        .values()
+                        .map(|s| s.lock_returned_after_end)
+                        .sum();
+                    if late > 0 {
+                        eprintln!(
+                            "SWEEP-LATE-HANDBACK {label} seed {seed}: {late} grants of an ended generation dropped"
+                        );
+                    }
                     superseded.fetch_add(report.epochs_superseded as u64, ord);
                     fenced[0].fetch_add(report.locks.fenced_ios, ord);
                     fenced[1].fetch_add(lost, ord);
@@ -5038,6 +5050,36 @@ fn regression_locks_unlinked_delegated_dbackup_random_seed_5681() {
              AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
         )
     });
+}
+
+/// unlinked-exclusion-7455: the root outwaited and ended `d1`'s
+/// generation while its delegate (node 2) was paused; awake, the delegate
+/// answered the recall it found queued with grants that had lapsed during
+/// the pause, and the root installed them restamped. One, node 1's on
+/// `lk0`, later kept the next generation's leaving grant (node 2's,
+/// exclusive) out at the unlink, and the root upgraded node 1's revived
+/// copy: both exclusive. Now a recall answer after its generation ended
+/// brings no grants back (`Core::lock_install_returned`). 7455 fails on
+/// `c465b07` and passes on later main by another trajectory (the outwait
+/// barriers move its timings); 1144, 1682 and 1945 take the late-answer
+/// path here, and the test asserts that some seed does.
+#[test]
+fn regression_locks_unlinked_delegated_partition_late_recall_answer() {
+    let mut late = 0;
+    for seed in [7_455, 1_144, 1_682, 1_945] {
+        let report = run_seed(seed, locks_unlinked_partition_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-unlinked-delegated-partition seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-partition"
+            )
+        });
+        late += report
+            .stats
+            .values()
+            .map(|s| s.lock_returned_after_end)
+            .sum::<u64>();
+    }
+    assert!(late > 0, "vacuous: no recall answer came after its end");
 }
 
 /// stale-read-outwaited: a locker cut off from the lock's owner is

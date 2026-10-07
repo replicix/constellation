@@ -3062,7 +3062,13 @@ directory and no unlinks, so every lock's owner is a delegate and an
 outwaited locker's turn sits in its own delegated stream; its seeds and
 those of the `locks-unlinked-delegated` variants that read a stale turn
 after an outwait are pinned in `regression_stale_read_after_an_outwait`
-(stale-read-outwaited). Replay one with
+(stale-read-outwaited). `sweep_config` also prints the seeds in which a
+recall answer came after its generation had ended at the root and its
+grants were dropped (`SWEEP-LATE-HANDBACK`); `locks-unlinked-delegated-partition`
+seed 7455 (two exclusive holders after such an answer revived a lapsed
+grant) and seeds that take that path are pinned in
+`regression_locks_unlinked_delegated_partition_late_recall_answer`
+(unlinked-exclusion-7455). Replay one with
 `AUTHORITY_SIM_SEED=<seed> AUTHORITY_SIM_CONFIG=<config> RUST_LOG=sim=debug,constellation_authority::core::locks=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
 
 Harness scenarios (the harness process is the application: it calls

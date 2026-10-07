@@ -9181,6 +9181,92 @@ mod locks {
         assert_eq!(handed[0].until_ms, live.until_ms, "restamped: {handed:?}");
     }
 
+    /// Sim `locks-unlinked-delegated-partition` seed 7455: the root
+    /// recalled a generation whose delegate was paused, outwaited it and
+    /// ended it. The delegate woke past its window, found the recall
+    /// queued and answered it with the grants it still had, lapsed long
+    /// before. The root installed them restamped with a fresh window:
+    /// a dead holder's record came back to life on an inode the root now
+    /// serves (there, kept a later generation's leaving grant out at an
+    /// unlink, and the root upgraded the revived copy for its old holder
+    /// beside the delegate's live exclusive grant). A recall answer that
+    /// comes after its generation ended brings no grants back.
+    #[test]
+    fn a_recall_answer_after_its_generation_ended_brings_no_grants_back() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let out = h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        let recall = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
+        // The delegate stays silent: the recall is outwaited and the
+        // generation ends.
+        h.core.dl.gens.get_mut(&7).unwrap().until = h.now;
+        let mut out = Vec::new();
+        h.core.on_deleg_expiry(h.now, 7, &h.meta, &mut out);
+        assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
+        // Past the outwait's grace on the subtree.
+        h.advance(h.core.lock_ttl_ms() as u64 + 2 * h.core.lock_margin_ms() as u64);
+        // The late answer: node 4's grant, lapsed at the delegate.
+        let lapsed = constellation_meta::locks::Grant {
+            id: GrantId { node: 3, seq: 5 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until_ms: h.now.0 - 1_000,
+            recalled: false,
+            gen: 7,
+            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+        };
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRecalled {
+                req: recall,
+                gen: 7,
+                through: 0,
+                locks: constellation_meta::locks::LockHandback {
+                    grants: vec![lapsed],
+                    floor: Position::ZERO,
+                    barrier: 0,
+                },
+            },
+        });
+        assert!(
+            h.meta.locks().grants_snapshot().is_empty(),
+            "a lapsed grant revived: {:?}",
+            h.meta.locks().grants_snapshot()
+        );
+        assert_eq!(h.core.stats.lock_returned_after_end, 1);
+        // Another node is granted at once, and node 4 is not granted
+        // over it on the strength of its old record.
+        let out = request(&mut h, 5, 10, f, X, false);
+        assert!(
+            lock_replies(&out)
+                .iter()
+                .any(|(to, _, o)| *to == 5 && matches!(o, LockOutcome::Granted { .. })),
+            "held up by the revived record: {out:?}"
+        );
+        let out = request(&mut h, 4, 11, f, X, false);
+        assert!(
+            !lock_replies(&out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. })),
+            "two exclusive holders: {out:?}"
+        );
+    }
+
     fn holder_with_file() -> (Harness, Ino) {
         let mut h = Harness::new(1);
         h.hold(1, None);

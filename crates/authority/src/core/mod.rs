@@ -841,6 +841,10 @@ pub struct Stats {
     /// Grants handed to a delegation that ended without handing them
     /// back, reinstated in the root's table.
     pub lock_reinstated: u64,
+    /// Root: grants in a recall answer that came after the generation had
+    /// ended here (outwaited, sealed) or with no generation known here (the
+    /// lease lost since), dropped (`Core::lock_install_returned`).
+    pub lock_returned_after_end: u64,
     /// Delegate: generations that started inside the root's lock grace
     /// (carried with their first granting renewal).
     pub lock_graces_inherited: u64,
