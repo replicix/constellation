@@ -44569,3 +44569,19 @@ child briefly inherits the lock fd between fork and exec. Not fixed here.
 
 - `s3env::tests::a_prefix_lock_is_seen_whatever_tmpdir_says` is flaky
   under load (see above).
+
+### Harness prefix lock: flake fixed (2026-10-07)
+
+`s3env::tests::a_prefix_lock_is_seen_whatever_tmpdir_says` failed ~1 run
+in 3 with "… still looks held after the drop". Cause confirmed via
+`/proc/locks`: the fd was already close-on-exec (std opens that way), but
+a child another test thread forks (the `pre_exec` spawns fork rather than
+`posix_spawn`) shares the lock's open file description until its `exec`,
+and `flock` belongs to the description, not the fd, so closing ours did
+not release it. Fix (`crates/harness/src/s3env.rs`): `PrefixLock::drop`
+unlocks explicitly (`LOCK_UN` releases for every holder of the
+description). It now also removes `/tmp/.<prefix>.lock` (unlink while
+locked; `acquire` re-checks that the path still names the locked inode and
+retries otherwise, so no run locks an unlinked file). Crashed runs still
+leave an unlocked file. Gates: fmt, clippy `-D warnings` clean;
+`cargo test -p constellation-harness` ×20, 0 failures.

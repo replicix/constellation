@@ -66,13 +66,20 @@ pub(crate) fn prefix_in_use(prefix: &str) -> bool {
 /// unrelated with a connection error, a "name is already in use"
 /// conflict, or a missing network. Rather than leave that to whoever
 /// remembers, take an advisory lock on the prefix and refuse up front.
-/// The lock file is never removed; only the `flock` matters, and it is
-/// released with the fd (including on a crash or a kill). It lives at a
+/// Only the `flock` matters, and it is released with the fd (including
+/// on a crash or a kill). A clean drop unlocks it explicitly first: a
+/// child another thread forks while the fd is open holds the same open
+/// file description until its `exec`, which would keep the lock alive
+/// past the drop. The drop also removes the file (only while holding
+/// the lock; [`PrefixLock::acquire`] re-checks that the path still names
+/// the locked inode, so a racing run never locks an unlinked file). A
+/// crashed run leaves its file behind, unlocked and harmless. It lives at a
 /// fixed host-wide path ([`prefix_lock_path`]), not under `TMPDIR`: runs
 /// with different `TMPDIR`s must still see each other's locks (the
 /// startup sweep asks whether the default prefix is in use).
 struct PrefixLock {
     _file: std::fs::File,
+    path: PathBuf,
 }
 
 /// `/tmp/.<prefix>.lock`, whatever `TMPDIR` says.
@@ -80,8 +87,35 @@ pub(crate) fn prefix_lock_path(prefix: &str) -> PathBuf {
     Path::new("/tmp").join(format!(".{prefix}.lock"))
 }
 
+impl Drop for PrefixLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Unlink while still locked, then unlock for every holder of the
+        // open file description (see the type docs).
+        let _ = std::fs::remove_file(&self.path);
+        // SAFETY: a plain `flock(2)` on a file descriptor we own.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl PrefixLock {
     fn acquire(prefix: &str) -> Result<PrefixLock> {
+        loop {
+            let (file, path) = Self::open_locked(prefix)?;
+            // A holder that just dropped unlinked the file we opened
+            // before it unlocked: lock the path's current file instead.
+            use std::os::unix::fs::MetadataExt;
+            let same = match (file.metadata(), std::fs::metadata(&path)) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                _ => false,
+            };
+            if same {
+                return Ok(PrefixLock { _file: file, path });
+            }
+        }
+    }
+
+    fn open_locked(prefix: &str) -> Result<(std::fs::File, PathBuf)> {
         use std::os::fd::AsRawFd;
         let path = prefix_lock_path(prefix);
         // A file another user left (a `sudo` run of the same prefix) may
@@ -116,7 +150,7 @@ impl PrefixLock {
                 anyhow::Error::new(err).context(format!("locking the harness prefix {prefix}"))
             );
         }
-        Ok(PrefixLock { _file: file })
+        Ok((file, path))
     }
 }
 
