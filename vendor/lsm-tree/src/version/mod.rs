@@ -12,6 +12,7 @@ mod super_version;
 pub use blob_file_list::BlobFileList;
 pub use persist::persist_version;
 pub use run::Run;
+// CONSTELLATION PATCH: `StaleVersions` is re-exported for fjall-side callers.
 pub use super_version::{StaleVersions, SuperVersion, SuperVersions};
 
 use crate::blob_tree::{FragmentationEntry, FragmentationMap};

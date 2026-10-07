@@ -211,11 +211,21 @@ impl SuperVersions {
         #[expect(clippy::expect_used, reason = "lock is expected to not be poisoned")]
         let mut history = history.write().expect("lock is poisoned");
         let mut next = history.latest_version();
-        assert_eq!(
-            next.version.id(),
-            base.version.id(),
-            "a version change was not serialized by the compaction state lock",
-        );
+        // Not an `assert_eq!`: a panic here would poison the history lock.
+        if next.version.id() != base.version.id() {
+            debug_assert!(
+                false,
+                "a version change was not serialized by the compaction state lock"
+            );
+            log::error!(
+                "version change not serialized by the compaction state lock: base #{}, latest #{}",
+                base.version.id(),
+                next.version.id(),
+            );
+            return Err(crate::Error::Io(std::io::Error::other(
+                "a version change was not serialized by the compaction state lock",
+            )));
+        }
         next.version = version;
         next.seqno = seqno;
         memtables(&mut next);
@@ -284,15 +294,25 @@ impl SuperVersions {
 pub struct StaleVersions(Vec<(PathBuf, SuperVersion)>);
 
 impl StaleVersions {
-    /// Drops the versions, then removes their files.
+    /// Drops the versions, then removes their files. A failure does not
+    /// stop the loop: every file is tried, the first error is returned.
     pub fn remove(self) -> crate::Result<()> {
+        let mut first_err = None;
         for (path, version) in self.0 {
             drop(version);
-            if path.try_exists()? {
-                crate::file::retry_transient_io(|| std::fs::remove_file(&path))?;
+            let result = path.try_exists().and_then(|exists| {
+                if exists {
+                    crate::file::retry_transient_io(|| std::fs::remove_file(&path))
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = result {
+                log::warn!("Failed to remove stale version file {path:?}: {e}");
+                first_err.get_or_insert(e);
             }
         }
-        Ok(())
+        first_err.map_or(Ok(()), |e| Err(e.into()))
     }
 }
 
@@ -389,6 +409,29 @@ mod version_lock_tests {
 mod tests {
     use super::*;
     use test_log::test;
+
+    #[test]
+    fn stale_versions_remove_tries_every_file_after_an_error() -> crate::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // `remove_file` fails on a directory
+        let bad = dir.path().join("v1");
+        std::fs::create_dir(&bad)?;
+        let good = dir.path().join("v2");
+        std::fs::write(&good, b"x")?;
+
+        let sv = || SuperVersion {
+            active_memtable: Arc::new(Memtable::new(0)),
+            sealed_memtables: Arc::default(),
+            version: Version::new(0, crate::TreeType::Standard),
+            seqno: 0,
+        };
+        let stale = StaleVersions(vec![(bad.clone(), sv()), (good.clone(), sv())]);
+
+        assert!(stale.remove().is_err());
+        assert!(bad.exists());
+        assert!(!good.exists());
+        Ok(())
+    }
 
     #[test]
     fn super_version_gc_above_watermark() -> crate::Result<()> {

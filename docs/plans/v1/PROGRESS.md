@@ -44965,3 +44965,5 @@ compacts while it writes.
   the write lock (it allocates its seqno there on purpose; rare).
 - Not re-run here: the 5 s delegation-TTL experiment that
   `overload-cascade-2` deferred until this stall was fixed.
+
+- `lsm-followup` (2026-10-07): vendored lsm-tree — `StaleVersions::remove` now tries every stale version file and returns the first error (unit test with an injected failure); the version-change check under the history write lock is a `debug_assert!` plus an `Err` instead of an `assert_eq!` that would poison the lock; the `StaleVersions` re-export carries the `CONSTELLATION PATCH` marker and is listed in `vendor/lsm-tree/CONSTELLATION-PATCH.md`. Gates: lsm-tree tests (240+23), fjall lib (72), constellation-meta pass; vendored lsm-tree clippy `-D warnings` already fails on upstream code (34 lib errors; the `StaleVersions` re-export is flagged as an unused import, as before this change).

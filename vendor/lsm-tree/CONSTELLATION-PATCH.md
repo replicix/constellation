@@ -21,7 +21,10 @@ edits in place, each marked `CONSTELLATION PATCH`.
    history held, then installed under a short write lock.
    `SuperVersions::maintenance` is split into `take_garbage` (bookkeeping,
    under the lock) and `StaleVersions::remove` (dropping the old versions
-   and removing their files, after it).
+   and removing their files, after it; it tries every file and returns the
+   first error). `StaleVersions` is re-exported from `src/version/mod.rs`
+   (marked). A lost serialization of version changes is an `Err`, not an
+   `assert_eq!` that would poison the history lock.
 2. **`src/compaction/worker.rs`, `src/compaction/flavour.rs`**: a
    compaction finishes its output files (`CompactionFlavour::finish_files`)
    before it takes any lock, and builds the next version from the latest one
