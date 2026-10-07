@@ -22,9 +22,28 @@
 //! | does not | names nobody, an expired or released lease, or this node | acquires the lease (an unheld lease is free) and executes here |
 //!
 //! A live holder is never preempted while there is a peer path to it,
-//! and a forward that fails (holder unreachable, timeout, the holder no
-//! longer holds) is the caller's error — never a reason to fall back to
-//! acquiring. The scheduler simply tries again on its next tick. With
+//! and a forward that fails (holder unreachable, timeout) is the
+//! caller's error — never a reason to fall back to acquiring. The
+//! scheduler simply tries again on its next tick. Two answers are not
+//! failures, because the lease is only moving, and the batch follows it
+//! under its rid within one forward timeout counted from its first
+//! forward (every re-route and re-send shares it): a holder that
+//! answers it no longer holds is asked again of whoever the lease
+//! object names next, every 200 ms, and a holder that comes up under a
+//! new endpoint (an engine pod's successor on its state dir, plan 37 K5,
+//! serves the same node id with a fresh key) gets the batch there as
+//! soon as the registry names it, instead of the old endpoint's silence
+//! costing the whole timeout. The price of the second: a request that
+//! fails outright waits up to 5 s for a new endpoint before the caller
+//! hears `HolderUnreachable`, so a holder that is simply down is
+//! reported that much later.
+//!
+//! | the holder is | a batch forwarded to it |
+//! |---|---|
+//! | handing its state dir to a successor (`Engine::stop_for_local_handoff`) | is answered `NotHolder` unless it already started (that one runs to completion, and the successor ships its rows); the requester re-routes it to the successor |
+//! | draining for a clean unmount | is served as before the drain: the holder holds until it releases, and a batch it takes runs to completion |
+//!
+//! With
 //! P2P off (an S3-only cluster) there is no forward to make: a non-holder
 //! writes nothing without the lease in that mode, so a snapshot asks for
 //! it exactly as it did before batches.
@@ -111,6 +130,21 @@ const RECENT_BATCHES: usize = 1024;
 /// mutations (a takeover gate right after an acquisition, a handoff
 /// pause) before it gives up on the batch.
 const ADMIT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a requester waits before routing a batch again after its
+/// holder answered that it no longer holds the root lease (the lease is
+/// moving; see [`SnapshotBatcher::run`]).
+const NOT_HOLDER_PAUSE: Duration = Duration::from_millis(200);
+
+/// How long a forward whose request failed outright waits for the
+/// holder to come up under a new endpoint before it reports the failure
+/// ([`EngineBatchHost::forward`]): a holder handing its state dir to a
+/// successor exits under the request, and the successor registers its
+/// own endpoint within a second or so.
+const MOVED_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a pending forward looks for its holder's endpoint changing.
+const MOVED_POLL: Duration = Duration::from_millis(100);
 
 /// How many sync rounds a snapshot's drain may take on a busy holder
 /// (see [`SnapshotBatcher::drain`]).
@@ -389,7 +423,8 @@ impl Admission<'_> {
 /// What a batch needs from the node it runs on. The daemon's is
 /// [`EngineBatchHost`]; the multi-node tests wire standalone drivers.
 pub trait BatchHost: Send + Sync {
-    /// This node holds a usable root lease.
+    /// This node holds a usable root lease (and may start a batch under
+    /// it: [`SnapshotBatcher::execute`] checks this first).
     fn holds(&self) -> bool;
     /// Admit one row write (`None`: the lease view is closed to new
     /// mutations — not held, releasing, gated, paused).
@@ -410,13 +445,15 @@ pub trait BatchHost: Send + Sync {
     /// What `SyncRequest::Barrier` drains for directory `ino`.
     fn drain(&self, ino: Ino) -> BoxFuture<'_, Result<()>>;
     /// Send the batch to `to`, the believed holder, and return its
-    /// answer. An error is a transport failure: the holder may or may
-    /// not have executed it.
+    /// answer by `deadline` (what is left of the batch's
+    /// [`forward_timeout`]). An error is a transport failure: the holder
+    /// may or may not have executed it.
     fn forward(
         &self,
         to: u64,
         rid: Rid,
         items: Vec<SnapshotItem>,
+        deadline: tokio::time::Instant,
     ) -> BoxFuture<'_, Result<SnapshotBatchOutcome>>;
     /// Best effort, after a forwarded batch: bring this replica up to
     /// the holder's log, so a `snapshot ls` here right after shows it.
@@ -549,68 +586,84 @@ impl SnapshotBatcher {
                 SnapshotBatchOutcome::Failed(error) => bail!(error),
             }
         }
-        let holder = self
-            .host
-            .live_holder()
-            .await
-            .context("reading the root lease to find its holder")?;
-        match holder {
-            Some(holder) if holder != self.node_id && self.host.peer_path() => {
-                // What the requester's own `Barrier` used to upload
-                // before it took the lease: chunks written here, whose
-                // forwarded rows the holder's drain must ship.
-                if items
+        // One forward timeout for the whole route, re-routes included,
+        // from the first forward on (the requester's own drain before it
+        // is not the holder's time).
+        let mut budget = None;
+        loop {
+            let holder = self
+                .host
+                .live_holder()
+                .await
+                .context("reading the root lease to find its holder")?;
+            let holder = match holder {
+                Some(holder) if holder != self.node_id && self.host.peer_path() => holder,
+                _ => break,
+            };
+            // What the requester's own `Barrier` used to upload before it
+            // took the lease: chunks written here, whose forwarded rows
+            // the holder's drain must ship.
+            if budget.is_none()
+                && items
                     .iter()
                     .any(|item| matches!(item, SnapshotItem::Create { .. }))
-                {
-                    self.host
-                        .drain_own()
-                        .await
-                        .context("uploading this node's pending writes before the snapshot")?;
-                }
-                tracing::debug!(rid = ?rid, holder, items = items.len(), "snapshot batch: forwarding to the holder");
-                let outcome = self
-                    .host
-                    .forward(holder, rid, items)
+            {
+                self.host
+                    .drain_own()
                     .await
-                    .with_context(|| HolderUnreachable { holder })?;
-                match outcome {
-                    SnapshotBatchOutcome::Done(results) => {
-                        self.host.catch_up().await;
-                        Ok(BatchReport {
-                            results,
-                            route: Route::Forwarded(holder),
-                        })
-                    }
-                    SnapshotBatchOutcome::NotHolder => bail!(
-                        "node {holder} no longer holds the root write lease; retry the snapshot operation"
-                    ),
-                    SnapshotBatchOutcome::Failed(error) => {
-                        bail!("node {holder}, the root-lease holder: {error}")
-                    }
-                }
+                    .context("uploading this node's pending writes before the snapshot")?;
             }
-            // Nobody holds it (or the object still names this node,
-            // whose view is closed): an unheld lease is free to take. Or
-            // a live holder, but P2P is off here: no forward exists, so
-            // ask for the lease through the cooperative handover, as
-            // every write in that mode does (and as snapshots did before
-            // batches).
-            _ => {
-                if !self.host.acquire().await? {
-                    bail!("subtree write lease is held by another node");
-                }
-                match self.execute(rid, &items).await {
-                    SnapshotBatchOutcome::Done(results) => Ok(BatchReport {
+            let budget =
+                *budget.get_or_insert_with(|| tokio::time::Instant::now() + forward_timeout());
+            tracing::debug!(rid = ?rid, holder, items = items.len(), "snapshot batch: forwarding to the holder");
+            let outcome = self
+                .host
+                .forward(holder, rid, items.clone(), budget)
+                .await
+                .with_context(|| HolderUnreachable { holder })?;
+            match outcome {
+                SnapshotBatchOutcome::Done(results) => {
+                    self.host.catch_up().await;
+                    return Ok(BatchReport {
                         results,
-                        route: Route::Acquired,
-                    }),
-                    SnapshotBatchOutcome::NotHolder => {
-                        bail!("lost the root write lease right after taking it; retry")
-                    }
-                    SnapshotBatchOutcome::Failed(error) => bail!(error),
+                        route: Route::Forwarded(holder),
+                    });
+                }
+                // The lease is moving: a holder handing off to a
+                // successor, or one that has not taken it up yet. The
+                // lease object names the next one soon; the batch goes
+                // there under the same rid.
+                SnapshotBatchOutcome::NotHolder
+                    if tokio::time::Instant::now() + NOT_HOLDER_PAUSE < budget =>
+                {
+                    tracing::info!(rid = ?rid, holder, "snapshot batch: the holder no longer holds the root lease; routing it again");
+                    tokio::time::sleep(NOT_HOLDER_PAUSE).await;
+                }
+                SnapshotBatchOutcome::NotHolder => bail!(
+                    "node {holder} no longer holds the root write lease; retry the snapshot operation"
+                ),
+                SnapshotBatchOutcome::Failed(error) => {
+                    bail!("node {holder}, the root-lease holder: {error}")
                 }
             }
+        }
+        // Nobody holds it (or the object still names this node, whose
+        // view is closed): an unheld lease is free to take. Or a live
+        // holder, but P2P is off here: no forward exists, so ask for the
+        // lease through the cooperative handover, as every write in that
+        // mode does (and as snapshots did before batches).
+        if !self.host.acquire().await? {
+            bail!("subtree write lease is held by another node");
+        }
+        match self.execute(rid, &items).await {
+            SnapshotBatchOutcome::Done(results) => Ok(BatchReport {
+                results,
+                route: Route::Acquired,
+            }),
+            SnapshotBatchOutcome::NotHolder => {
+                bail!("lost the root write lease right after taking it; retry")
+            }
+            SnapshotBatchOutcome::Failed(error) => bail!(error),
         }
     }
 
@@ -1010,6 +1063,14 @@ impl SnapshotBatcher {
 pub(crate) struct EngineBatchHost {
     pub(crate) node_id: u64,
     pub(crate) lease: Arc<crate::lease::LeaseView>,
+    /// The node is handing its state dir to a successor
+    /// ([`crate::Engine::stop_for_local_handoff`]): it starts no batch
+    /// any more, so it answers forwards `NotHolder` and the requester
+    /// routes them to whoever holds next (the successor). A batch it
+    /// already started runs to completion: its rows are in the state
+    /// dir the successor ships. Not set for a clean unmount, whose
+    /// draining holder keeps serving batches until it releases.
+    pub(crate) handing_off: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) sync_tx: tokio::sync::mpsc::UnboundedSender<crate::sync::SyncRequest>,
     pub(crate) store: Arc<dyn object_store::ObjectStore>,
     pub(crate) lease_mode: constellation_store_s3::LeaseMode,
@@ -1017,7 +1078,36 @@ pub(crate) struct EngineBatchHost {
     pub(crate) next_req: std::sync::atomic::AtomicU64,
 }
 
+/// A peer key as the logs print endpoints: its first 10 hex digits.
+fn short_key(pubkey_hex: &str) -> &str {
+    pubkey_hex.get(..10).unwrap_or(pubkey_hex)
+}
+
 impl EngineBatchHost {
+    /// Node `to`'s peer record as the registry names it now.
+    fn peer_of(&self, to: u64) -> Option<constellation_net::peers::Peer> {
+        self.peers.snapshot().into_iter().find(|p| p.node_id == to)
+    }
+
+    /// Node `to`'s record once it names another endpoint than
+    /// `pubkey_hex`, or `None` at `until`.
+    async fn moved(
+        &self,
+        to: u64,
+        pubkey_hex: &str,
+        until: tokio::time::Instant,
+    ) -> Option<constellation_net::peers::Peer> {
+        loop {
+            if let Some(peer) = self.peer_of(to).filter(|p| p.pubkey_hex != pubkey_hex) {
+                return Some(peer);
+            }
+            if tokio::time::Instant::now() >= until {
+                return None;
+            }
+            tokio::time::sleep(MOVED_POLL).await;
+        }
+    }
+
     async fn ask<T>(
         &self,
         what: &str,
@@ -1033,7 +1123,7 @@ impl EngineBatchHost {
 
 impl BatchHost for EngineBatchHost {
     fn holds(&self) -> bool {
-        self.lease.usable()
+        !self.handing_off.load(std::sync::atomic::Ordering::SeqCst) && self.lease.usable()
     }
 
     fn admit(&self) -> Option<Admission<'_>> {
@@ -1097,35 +1187,68 @@ impl BatchHost for EngineBatchHost {
         })
     }
 
+    /// One request per endpoint the holder answers at. A holder handing
+    /// its state dir to a successor (plan 37 K5: an engine pod replaced
+    /// on its node) exits under a request it took, without answering,
+    /// and the successor serves the same node id under a new endpoint.
+    /// Waiting for the old endpoint to answer would cost the whole
+    /// timeout (and a CSI `CreateSnapshot` its deadline): the batch goes
+    /// to the new endpoint as soon as the registry names it, under the
+    /// same rid (should the old process have run it after all, the
+    /// `snaps/` name CAS answers the second create `AlreadyExists`).
     fn forward(
         &self,
         to: u64,
         rid: Rid,
         items: Vec<SnapshotItem>,
+        deadline: tokio::time::Instant,
     ) -> BoxFuture<'_, Result<SnapshotBatchOutcome>> {
         Box::pin(async move {
             if crate::fault::p2p_denied(to) {
                 bail!("the link to node {to} is cut (fault injection)");
             }
-            let req_id = self
-                .next_req
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let payload = constellation_net::Payload::SnapshotBatchRequest {
-                requester: self.node_id,
-                req_id,
-                rid: rid_to_wire(rid),
-                items,
-            };
-            match self
-                .peers
-                .request_to_node_timeout(to, &payload, forward_timeout())
-                .await?
-            {
-                constellation_net::Payload::SnapshotBatchReply {
-                    req_id: answered,
-                    outcome,
-                } if answered == req_id => Ok(outcome),
-                other => bail!("node {to} answered a snapshot batch with {other:?}"),
+            let mut peer = self
+                .peer_of(to)
+                .with_context(|| format!("no address for node {to}"))?;
+            loop {
+                let req_id = self
+                    .next_req
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let payload = constellation_net::Payload::SnapshotBatchRequest {
+                    requester: self.node_id,
+                    req_id,
+                    rid: rid_to_wire(rid),
+                    items: items.clone(),
+                };
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let sent = tokio::select! {
+                    reply = self.peers.request_raw_timeout(peer.addr.clone(), &payload, left) => Ok(reply),
+                    moved = self.moved(to, &peer.pubkey_hex, deadline) => Err(moved),
+                };
+                let moved = match sent {
+                    Ok(Ok(constellation_net::Payload::SnapshotBatchReply {
+                        req_id: answered,
+                        outcome,
+                    })) if answered == req_id => return Ok(outcome),
+                    Ok(Ok(other)) => bail!("node {to} answered a snapshot batch with {other:?}"),
+                    Ok(Err(error)) => {
+                        let grace = deadline.min(tokio::time::Instant::now() + MOVED_GRACE);
+                        match self.moved(to, &peer.pubkey_hex, grace).await {
+                            Some(moved) => moved,
+                            None => return Err(error),
+                        }
+                    }
+                    Err(Some(moved)) => moved,
+                    Err(None) => bail!("request timed out"),
+                };
+                tracing::info!(
+                    to,
+                    rid = ?rid,
+                    from = %short_key(&peer.pubkey_hex),
+                    endpoint = %short_key(&moved.pubkey_hex),
+                    "snapshot batch: the holder came up under a new endpoint (a handoff or a restart); sending the batch there"
+                );
+                peer = moved;
             }
         })
     }
@@ -1181,6 +1304,9 @@ pub(crate) mod tests {
         pub(crate) unreachable: Mutex<HashSet<u64>>,
         /// Forwards whose reply is lost after the holder executed them.
         lose_replies: AtomicU64,
+        /// Forwards answered `NotHolder` (a holder handing off to a
+        /// successor) before the holder is asked.
+        not_holder_answers: AtomicU64,
         pub(crate) forwards: AtomicU64,
         pub(crate) acquires: AtomicU64,
         /// P2P is on (`BatchHost::peer_path`).
@@ -1189,6 +1315,13 @@ pub(crate) mod tests {
         drain_own_fails: AtomicBool,
         /// How many more admissions succeed (negative: unlimited).
         admits_left: std::sync::atomic::AtomicI64,
+        /// The node is handing off to a successor: as
+        /// [`EngineBatchHost`]'s flag, it no longer holds, while a batch
+        /// already admitted still is.
+        handing_off: AtomicBool,
+        /// Start handing off once this many more admissions succeeded
+        /// (negative: never).
+        hand_off_after_admits: std::sync::atomic::AtomicI64,
         /// `drain_own` / `forward` / `acquire`, in call order.
         calls: Mutex<Vec<&'static str>>,
     }
@@ -1204,7 +1337,7 @@ pub(crate) mod tests {
     impl BatchHost for TestHost {
         fn holds(&self) -> bool {
             self.refresh();
-            self.view.usable()
+            !self.handing_off.load(Ordering::SeqCst) && self.view.usable()
         }
 
         fn admit(&self) -> Option<Admission<'_>> {
@@ -1218,7 +1351,17 @@ pub(crate) mod tests {
             {
                 return None;
             }
-            self.view.admit().map(|guard| Admission(Some(guard)))
+            let admitted = self.view.admit().map(|guard| Admission(Some(guard)));
+            if admitted.is_some()
+                && self.hand_off_after_admits.fetch_update(
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                    |n| (n > 0).then(|| n - 1),
+                ) == Ok(1)
+            {
+                self.handing_off.store(true, Ordering::SeqCst);
+            }
+            admitted
         }
 
         fn peer_path(&self) -> bool {
@@ -1273,12 +1416,20 @@ pub(crate) mod tests {
             to: u64,
             rid: Rid,
             items: Vec<SnapshotItem>,
+            _deadline: tokio::time::Instant,
         ) -> BoxFuture<'_, Result<SnapshotBatchOutcome>> {
             Box::pin(async move {
                 self.forwards.fetch_add(1, Ordering::Relaxed);
                 self.calls.lock().unwrap().push("forward");
                 if self.unreachable.lock().unwrap().contains(&to) {
                     bail!("node {to} is unreachable");
+                }
+                if self
+                    .not_holder_answers
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return Ok(SnapshotBatchOutcome::NotHolder);
                 }
                 let holder = self
                     .net
@@ -1401,11 +1552,14 @@ pub(crate) mod tests {
             net: net.clone(),
             unreachable: Mutex::new(HashSet::new()),
             lose_replies: AtomicU64::new(0),
+            not_holder_answers: AtomicU64::new(0),
             forwards: AtomicU64::new(0),
             acquires: AtomicU64::new(0),
             p2p: AtomicBool::new(true),
             drain_own_fails: AtomicBool::new(false),
             admits_left: std::sync::atomic::AtomicI64::new(-1),
+            handing_off: AtomicBool::new(false),
+            hand_off_after_admits: std::sync::atomic::AtomicI64::new(-1),
             calls: Mutex::new(Vec::new()),
         });
         let batcher = Arc::new(SnapshotBatcher::new(
@@ -1942,6 +2096,274 @@ pub(crate) mod tests {
         assert_eq!(a.host.acquires.load(Ordering::Relaxed), 0);
         assert_eq!(snaps_objects(&store).await, 0);
         assert!(b.rows().is_empty() && a.rows().is_empty());
+    }
+
+    /// A holder that answers it no longer holds (one handing off to a
+    /// successor) is not the caller's error: the batch is routed again,
+    /// under its rid, to whoever the lease object names, and runs once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_holder_that_no_longer_holds_is_asked_again() {
+        let (store, a, b, _, _) = holder_b().await;
+        a.host.not_holder_answers.store(2, Ordering::Relaxed);
+        let report = a
+            .batcher
+            .run(a.batcher.next_rid(), vec![create("/data", "moved", 1)])
+            .await
+            .unwrap();
+        assert_eq!(report.route, Route::Forwarded(2));
+        created(&report.results[0]);
+        assert_eq!(a.host.forwards.load(Ordering::Relaxed), 3);
+        assert_eq!(a.host.acquires.load(Ordering::Relaxed), 0);
+        let calls = a.host.calls.lock().unwrap().clone();
+        assert_eq!(calls, ["drain_own", "forward", "forward", "forward"]);
+        assert_eq!(snaps_objects(&store).await, 1);
+        assert_eq!(b.rows().len(), 1);
+    }
+
+    /// The K5 handoff race (`handoff-snapshot-late`): the holder takes a
+    /// forwarded batch and exits without answering; its successor serves
+    /// the same node id under a new endpoint. The forward goes there as
+    /// soon as the registry names it, instead of waiting out the 30 s
+    /// forward timeout on the silent endpoint (which a CSI
+    /// `CreateSnapshot` did, missing its deadline).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forward_follows_its_holder_to_a_new_endpoint() {
+        use constellation_net::{P2p, Payload, PeerService, Peers};
+
+        /// Node 2's old process: takes the batch, never answers.
+        struct Silent(tokio::sync::mpsc::UnboundedSender<()>);
+        /// Node 2's successor: executes it.
+        struct Successor;
+        impl PeerService for Silent {
+            fn segment_published(&self, _: &str, _: u64, _: u64) {}
+            fn lease_requested(
+                &self,
+                _: String,
+                _: u64,
+                _: Option<u64>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>
+            {
+                Box::pin(std::future::pending())
+            }
+            fn node_id(&self) -> u64 {
+                2
+            }
+            fn snapshot_batch_requested(
+                &self,
+                _: u64,
+                _: u64,
+                _: (u64, u32, u64),
+                _: Vec<SnapshotItem>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>
+            {
+                let _ = self.0.send(());
+                Box::pin(std::future::pending())
+            }
+        }
+        impl PeerService for Successor {
+            fn segment_published(&self, _: &str, _: u64, _: u64) {}
+            fn lease_requested(
+                &self,
+                _: String,
+                _: u64,
+                _: Option<u64>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>
+            {
+                Box::pin(std::future::pending())
+            }
+            fn node_id(&self) -> u64 {
+                2
+            }
+            fn snapshot_batch_requested(
+                &self,
+                _: u64,
+                req_id: u64,
+                _: (u64, u32, u64),
+                _: Vec<SnapshotItem>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>
+            {
+                Box::pin(async move {
+                    Payload::SnapshotBatchReply {
+                        req_id,
+                        outcome: SnapshotBatchOutcome::Done(vec![ItemResult::Skipped]),
+                    }
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let topic = constellation_net::topic_for(Some(&[41u8; 32]), "snapshot-forward-moves");
+        let key = |name: &str| {
+            constellation_net::load_or_create(&dir.path().join(name))
+                .unwrap()
+                .0
+        };
+        let pa = P2p::spawn(key("a.key"), topic).await.unwrap();
+        let p_old = P2p::spawn(key("old.key"), topic).await.unwrap();
+        let p_new = P2p::spawn(key("new.key"), topic).await.unwrap();
+        let record =
+            |id: u64, p: &P2p| (id, p.pubkey_hex(), serde_json::to_value(p.addr()).unwrap());
+        let before = vec![record(1, &pa), record(2, &p_old)];
+        let after = vec![record(1, &pa), record(2, &p_new)];
+        let peers_a = Peers::new(pa, 1);
+        let peers_old = Peers::new(p_old, 2);
+        let peers_new = Peers::new(p_new, 2);
+        peers_a.refresh_registry(before.clone());
+        peers_old.refresh_registry(before);
+        peers_new.refresh_registry(after.clone());
+        let (asked, mut asked_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let peers = peers_old.clone();
+            tokio::spawn(async move { peers.serve(Arc::new(Silent(asked))).await });
+            let peers = peers_new.clone();
+            tokio::spawn(async move { peers.serve(Arc::new(Successor)).await });
+        }
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = Arc::new(EngineBatchHost {
+            node_id: 1,
+            lease: Arc::new(LeaseView::default()),
+            handing_off: Arc::new(AtomicBool::new(false)),
+            sync_tx,
+            store: Arc::new(InMemory::new()),
+            lease_mode: LeaseMode::Cas,
+            peers: peers_a.clone(),
+            next_req: AtomicU64::new(1),
+        });
+        let started = std::time::Instant::now();
+        let forward = {
+            let host = host.clone();
+            tokio::spawn(async move {
+                let rid = Rid {
+                    node: 1,
+                    incarnation: 1,
+                    seq: 1,
+                };
+                let deadline = tokio::time::Instant::now() + forward_timeout();
+                host.forward(2, rid, vec![create("/data", "x", 1)], deadline)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(20), asked_rx.recv())
+            .await
+            .expect("the old endpoint was asked")
+            .unwrap();
+        // The successor registers its endpoint.
+        peers_a.refresh_registry(after);
+        let outcome = tokio::time::timeout(Duration::from_secs(20), forward)
+            .await
+            .expect("the forward followed the holder well within its 30 s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            SnapshotBatchOutcome::Done(vec![ItemResult::Skipped])
+        );
+        assert!(
+            started.elapsed() < forward_timeout(),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A node handing its state dir to a successor starts no batch (it
+    /// no longer holds, so `execute` answers a forward `NotHolder`), but
+    /// still admits the row writes of one it already started.
+    #[test]
+    fn a_node_handing_off_does_not_hold() {
+        use constellation_authority::core::LeaseState;
+        use constellation_authority::{Config, Ms};
+        let cfg = Config::defaults(2, 1);
+        let now = Ms(crate::prune::now_unix_ms() as i64);
+        let mut state = LeaseState::default();
+        state.adopt_epoch_hold(now, 3);
+        let lease = Arc::new(LeaseView::default());
+        lease.mirror(&state, now, &cfg, false);
+        let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = EngineBatchHost {
+            node_id: 2,
+            lease,
+            handing_off: Arc::new(AtomicBool::new(false)),
+            sync_tx,
+            store: Arc::new(InMemory::new()),
+            lease_mode: LeaseMode::Cas,
+            peers: constellation_net::Peers::disabled(),
+            next_req: AtomicU64::new(1),
+        };
+        assert!(host.holds() && host.admit().is_some());
+        host.handing_off.store(true, Ordering::SeqCst);
+        assert!(!host.holds());
+        assert!(host.admit().is_some());
+    }
+
+    /// A forwarded batch reaching a holder that is handing off is
+    /// answered `NotHolder` without running; the requester routes it
+    /// again under its rid, and once the successor serves (the same node
+    /// id, holding again) it runs there, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_batch_forwarded_to_a_holder_handing_off_follows_it() {
+        let (store, a, b, _, _) = holder_b().await;
+        b.host.handing_off.store(true, Ordering::SeqCst);
+        let rid = a.batcher.next_rid();
+        let items = vec![create("/data", "handoff", 1)];
+        assert_eq!(
+            b.batcher.execute(rid, &items).await,
+            SnapshotBatchOutcome::NotHolder
+        );
+        assert_eq!(snaps_objects(&store).await, 0);
+        let run = {
+            let batcher = a.batcher.clone();
+            let items = items.clone();
+            tokio::spawn(async move { batcher.run(rid, items).await })
+        };
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!run.is_finished());
+        let refused = a.host.forwards.load(Ordering::Relaxed);
+        assert!(refused >= 2, "{refused} forwards while handing off");
+        // The successor serves.
+        b.host.handing_off.store(false, Ordering::SeqCst);
+        let report = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("the batch follows the lease within its budget")
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.route, Route::Forwarded(2));
+        created(&report.results[0]);
+        assert_eq!(a.host.acquires.load(Ordering::Relaxed), 0);
+        assert_eq!(snaps_objects(&store).await, 1);
+        assert_eq!(b.rows().len(), 1);
+    }
+
+    /// The handoff lands while a batch is between its `snaps/` object's
+    /// PUT and its row: the batch was admitted, so it runs to completion
+    /// (an orphan object with no row would answer every retry
+    /// `AlreadyExists` with nothing for CSI's `find` to find). Only the
+    /// next batch is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handoff_mid_batch_leaves_no_orphan() {
+        let (store, _a, b, _, _) = holder_b().await;
+        // Admissions: the batch's `wait_admissible`, then the create's
+        // before its PUT; the handoff starts right after that one.
+        b.host.hand_off_after_admits.store(2, Ordering::SeqCst);
+        let report = b
+            .batcher
+            .run(b.batcher.next_rid(), vec![create("/data", "mid", 2)])
+            .await
+            .unwrap();
+        assert!(
+            b.host.handing_off.load(Ordering::SeqCst),
+            "the handoff landed"
+        );
+        assert_eq!(report.route, Route::Local);
+        let row = created(&report.results[0]);
+        assert_eq!(snaps_objects(&store).await, 1);
+        assert_eq!(b.rows(), vec![row]);
+        assert_eq!(
+            b.batcher
+                .execute(b.batcher.next_rid(), &[create("/data", "next", 2)])
+                .await,
+            SnapshotBatchOutcome::NotHolder
+        );
+        assert_eq!(snaps_objects(&store).await, 1);
     }
 
     /// `skip_if_unchanged_since` naming the root the batch's publish

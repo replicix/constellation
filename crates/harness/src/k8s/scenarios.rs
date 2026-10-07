@@ -1822,6 +1822,13 @@ const LOAD_CTL: &str = "/tmp/load";
 /// (`tests/csi/k5-handoff.sh`'s `K5_ROLLOUT_S`).
 const ROLLOUT: Duration = Duration::from_secs(900);
 
+/// How long after the handoff's end (or its request, if later) the
+/// `VolumeSnapshot` asked for across it may be cut. Before the fix
+/// (`handoff-snapshot-late`) a request racing the handoff's first ~150 ms
+/// was cut on the snapshotter's retry, ~31 s later, and a controller
+/// rollout beside the handoff cost the snapshotter's leader lease (15 s).
+const SNAPSHOT_LATE: Duration = Duration::from_secs(5);
+
 /// How long the trio goes on after the cutover: past the replacement's
 /// first `fsync`s, which wait out the delegation the old engine held
 /// (plan 37 K5 notes, "a restarted delegate's first writes").
@@ -2491,7 +2498,8 @@ fn csi_engine_pod_handoff_under_load(env: &Env, seed: u64) -> Result<()> {
         "the snapshot's row ({cut_by}) predates its request ({cut_from})"
     );
     // A `snapshot.create` that raced the handoff once waited out its 30 s
-    // deadline and was cut on the sidecar's retry: what the engines said.
+    // deadline and was cut on the sidecar's retry (`handoff-snapshot-late`):
+    // what the engines said.
     if cut_by > asked + 5_000 {
         eprintln!(
             "   the snapshot was cut {} ms after it was asked for; what the engines logged \
@@ -2510,11 +2518,32 @@ fn csi_engine_pod_handoff_under_load(env: &Env, seed: u64) -> Result<()> {
             }
         }
     }
+    // How the batch reached the root-lease holder when the lease or its
+    // endpoint moved under it (the engines log only those at `info`).
+    for tap in &taps {
+        for line in tap.matching(asked.saturating_sub(1_000), cut_by + 1_000, 10, |l| {
+            l.contains("snapshot batch:")
+        }) {
+            eprintln!("   {}: {line}", tap.pod);
+        }
+    }
     let (acked_records, acked_files) = summary.acked_before(cut_from);
     let rel = |t: u64| t as i64 - window.0 as i64;
     env.measure("snapshot_asked_ms", rel(asked));
     env.measure("snapshot_cut_from_ms", rel(cut_from));
     env.measure("snapshot_cut_by_ms", rel(cut_by));
+    env.measure("snapshot_after_handoff_ms", cut_by as i64 - window.1 as i64);
+    // Asked for during the handoff, the snapshot is cut once the
+    // replacement serves: within SNAPSHOT_LATE of the handoff's end (or of
+    // the request, if that came later), not on a retry after a deadline.
+    let due = asked.max(window.1) + SNAPSHOT_LATE.as_millis() as u64;
+    ensure!(
+        cut_by <= due,
+        "the snapshot asked for {} ms into the handoff was cut {} ms after the later of \
+         the handoff's end and its request, more than {SNAPSHOT_LATE:?}",
+        rel(asked),
+        cut_by as i64 - asked.max(window.1) as i64
+    );
     s.pvc_from("restored", "8Gi", None, snapshot_source("across"))?;
     s.wait_bound_claims(&["restored"], Duration::from_secs(300))?;
     s.pod("verify", w2, &[CLAIM, "restored"])?;

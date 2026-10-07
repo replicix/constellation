@@ -27,6 +27,10 @@ sidecars:
   provisioner: {enabled: true, image: csi-provisioner, tag: v6.3.0}
   resizer: {enabled: true, image: csi-resizer, tag: v2.2.1}
   snapshotter: {enabled: true, image: csi-snapshotter, tag: v8.6.0}
+  # The three controller sidecars run with
+  # --feature-gates=ReleaseLeaderElectionOnExit=true
+  # (templates/controller.yaml): a tag older than one that knows the gate
+  # (it is in the pinned ones) exits on the unknown gate and crash-loops.
   # How long a sidecar waits for one Controller RPC. The first CreateVolume
   # of a pool starts that pool's engine pod and waits for it to become
   # ready, which takes longer than the sidecars' 10s default.
@@ -200,10 +204,13 @@ controller:
   # older than 1.30.
   podAccessPolicy: true
   # The sidecars' leader election, and the controller's own purge Lease.
+  # A stopping sidecar releases its Lease (templates/controller.yaml), so
+  # after a rollout the new leader is the first standby to retry: within
+  # 2.2 x retryPeriod (client-go's jitter). kube-controller-manager's 2s.
   leaderElection:
     leaseDuration: 15s
     renewDeadline: 10s
-    retryPeriod: 5s
+    retryPeriod: 2s
   resources:
     csi: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 256Mi}}
     sidecar: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 128Mi}}

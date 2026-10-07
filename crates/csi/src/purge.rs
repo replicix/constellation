@@ -800,12 +800,12 @@ pub struct LeaderTiming {
 }
 
 impl Default for LeaderTiming {
-    /// The chart's defaults: 15 s, 10 s, 5 s.
+    /// The chart's defaults: 15 s, 10 s, 2 s.
     fn default() -> Self {
         LeaderTiming {
             lease: Duration::from_secs(15),
             renew_deadline: Duration::from_secs(10),
-            retry: Duration::from_secs(5),
+            retry: Duration::from_secs(2),
         }
     }
 }

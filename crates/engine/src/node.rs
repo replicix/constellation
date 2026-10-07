@@ -333,6 +333,9 @@ pub struct Engine {
     pins: Arc<pin::PinManager>,
     reintegration: Arc<reintegrate::ReintegrationState>,
     stop: Arc<AtomicBool>,
+    /// [`Self::stop_for_local_handoff`] started: the snapshot batcher
+    /// starts no more batches (`EngineBatchHost::handing_off`).
+    handing_off: Arc<AtomicBool>,
     rt: tokio::runtime::Handle,
     started: Instant,
     /// Plan 30 §M7: drops the frontends' cached view of what another
@@ -1187,6 +1190,7 @@ impl Engine {
                 .context("adopting the root directory owner")?;
         }
         phase(&on_phase, "starting the node's background tasks");
+        let handing_off = Arc::new(AtomicBool::new(false));
         let snapshot_batches = Arc::new(crate::snapshot_batch::SnapshotBatcher::new(
             node_id,
             meta.clone(),
@@ -1194,6 +1198,7 @@ impl Engine {
             Arc::new(crate::snapshot_batch::EngineBatchHost {
                 node_id,
                 lease: lease_view.clone(),
+                handing_off: handing_off.clone(),
                 sync_tx: sync_tx.clone(),
                 store: store.inner().clone(),
                 lease_mode,
@@ -1680,6 +1685,7 @@ impl Engine {
             pins,
             reintegration,
             stop,
+            handing_off,
             rt,
             started: Instant::now(),
             views: Mutex::new(HashMap::new()),
@@ -2090,6 +2096,7 @@ impl Engine {
         let held = self.hold_backups_for_handoff();
         self.shutdown_started.store(true, Ordering::SeqCst);
         self.stop.store(true, Ordering::Relaxed);
+        self.handing_off.store(true, Ordering::SeqCst);
         let backlog = constellation_meta::MetaStore::journal_len(&*self.meta).unwrap_or(0);
         let pending = self.meta.pending_upload_count().unwrap_or(0);
         tracing::info!(

@@ -110,6 +110,11 @@ spec:
           args:
             - --csi-address=/csi/csi.sock
             - --leader-election
+            # A replica stopped by a rollout hands its leadership back at
+            # once: otherwise the new replicas wait out the lease (15 s)
+            # and every snapshot, provision or resize asked for meanwhile
+            # waits with them.
+            - --feature-gates=ReleaseLeaderElectionOnExit=true
             - --leader-election-namespace={{ $.Release.Namespace }}
             - --leader-election-lease-duration={{ $.Values.controller.leaderElection.leaseDuration }}
             - --leader-election-renew-deadline={{ $.Values.controller.leaderElection.renewDeadline }}

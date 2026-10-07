@@ -44720,3 +44720,125 @@ Gates (`CARGO_TARGET_DIR` unset, `ulimit -n 65536`):
 
 - None from this chunk. `unlinked-exclusion-5681`'s open item (seed 7455)
   is closed here.
+
+## Fix: a `VolumeSnapshot` asked for at an engine-pod handoff was cut only on the snapshotter's retry (`handoff-snapshot-late`, 2026-10-07)
+
+K5b recorded it: in 8 of 20 `csi-engine-pod-handoff-under-load` runs a
+snapshot asked for between ~100 ms before and ~140 ms after the handoff's
+start missed the CSI controller's 30 s limit (`DeadlineExceeded …
+snapshot.create did not finish within 30s`, no row made) and was cut by
+the csi-snapshotter's retry ~31 s later (5 s once). Data was always
+consistent; the engines logged nothing at `info`.
+
+Fix: (1) a forwarded snapshot batch follows its holder: `EngineBatchHost::forward` re-sends it (same rid) to the holder's new endpoint as soon as the registry names one, instead of waiting out the 30 s forward timeout on a holder that exited under it, and `SnapshotBatcher::run` routes a batch again when its holder answers `NotHolder`, every re-route and re-send sharing one forward timeout from the first forward; an engine handing its state dir to a successor answers every new batch `NotHolder` instead of starting it (a batch it already started runs to completion; a clean unmount's draining holder serves batches as before); (2) the chart's controller sidecars release their leader Lease when stopped (`--feature-gates=ReleaseLeaderElectionOnExit=true`) and retry every 2 s, so a controller rollout beside the handoff no longer leaves snapshots without a snapshotter leader for a whole lease (15-21 s); (3) the scenario fails a snapshot cut more than 5 s after the handoff's end (or its request, if later) and prints the engines' routing lines.
+
+### Two causes
+
+- **The forward to a holder that is handing off (the reported 31 s).**
+  The controller-owned engine pod is not always the root-lease holder: the
+  lease follows the writer, so at the handoff it is often the node engine
+  pod being replaced (node 2 in every quick run here). The controller's
+  `snapshot.create` then forwards the batch over P2P to node 2, resolving
+  its endpoint once (`Peers::request_to_node_timeout`) with
+  `CONSTELLATION_SNAPSHOT_FORWARD_TIMEOUT_MS` = 30 s, the same as the CSI
+  controller's own limit. The old engine exits ~150-300 ms after `Prepare`
+  without answering a batch it took (or before it arrives), and its
+  successor serves node 2 under a **fresh P2P key** (the engine pod's
+  `/tmp` key). A forward sent in that window waited on the silent old
+  endpoint for the whole 30 s: the CSI call hit its deadline, no row was
+  made, and the snapshotter's retry, by then routed to the replacement, cut
+  it at once. That is the K5b shape (requests 0.1 s before to 0.14 s after
+  `Prepare`, cut 31 s later; the 5 s case a transport error surfacing
+  earlier). Not reproduced live in this round: on this host (load 30-110)
+  the controller's relay reached the engine 0.4-0.6 s after the request,
+  after the controller already knew the new endpoint, in all 6 rounds run
+  on the old engine with the chart fixed (4 quick, 2 with the upgrade
+  delayed 90 s to get K5b's root-plus-delegate topology). It is pinned
+  instead by `a_forward_follows_its_holder_to_a_new_endpoint` (real iroh
+  endpoints: the old endpoint takes the batch and never answers, the
+  registry then names a new one for node 2): it fails at its 20 s limit
+  without the fix and passes in well under a second with it.
+- **The snapshotter's leader lease across a controller rollout (found
+  here, 4 of 6 rounds before the fix).** The scenario's `helm upgrade`
+  rolls the controller Deployment as well as the node DaemonSet. The
+  stopping csi-snapshotter did not release its Lease, so the new replicas
+  waited out the 15 s lease plus client-go's jittered retry (5-11 s):
+  leadership moved 21 s after the old leader's SIGTERM, and the snapshot,
+  asked for meanwhile, was cut 12-18 s late (the controller engine then
+  forwarded and cut it in 0.3-1.1 s). With the release on exit and the
+  2 s retry, leadership moved in 0.6-1.0 s.
+
+| Item | State | Where |
+|---|---|---|
+| `EngineBatchHost::forward`: one request per endpoint; a pending forward watches the holder's peer record (every 100 ms) and re-sends to the new endpoint; a request that fails outright waits up to 5 s for one before reporting the failure (so a holder that is simply down is reported up to 5 s later); its deadline is what is left of the batch's forward timeout, passed in by `run` (`BatchHost::forward`'s `deadline`); an `info` line per re-send | DONE | `crates/engine/src/snapshot_batch.rs` |
+| `SnapshotBatcher::run`: a `NotHolder` answer is routed again (re-read the lease object, 200 ms apart) within the forward budget, under the same rid; `drain_own` once; nobody holding still falls through to the acquire path; an `info` line per re-route | DONE | `crates/engine/src/snapshot_batch.rs` |
+| `EngineBatchHost::handing_off` (`Engine::handing_off`, set only by `stop_for_local_handoff`): an engine handing off no longer `holds()`, so `execute` answers a new batch `NotHolder`; `admit()` ignores it, so a batch already started writes its `snaps/` object and its row both (gating `admit()` too left an orphan object with no row when the handoff landed between them, review round 1) and the successor ships the row (`Buffer` commits reach the OS); the shutdown drain does not set it, so the draining holder keeps serving batches | DONE | `crates/engine/src/snapshot_batch.rs`, `crates/engine/src/node.rs` |
+| Tests: `a_holder_that_no_longer_holds_is_asked_again`, `a_forward_follows_its_holder_to_a_new_endpoint`, `a_node_handing_off_does_not_hold`, `a_batch_forwarded_to_a_holder_handing_off_follows_it`, `a_handoff_mid_batch_leaves_no_orphan` (fails with the old `admit()` gate: "LEASE_LOST after writing snaps/ object") | DONE | `crates/engine/src/snapshot_batch.rs` |
+| Chart: controller sidecars `--feature-gates=ReleaseLeaderElectionOnExit=true` (provisioner v6.3.0, resizer v2.2.1, snapshotter v8.6.0 all have it); `controller.leaderElection.retryPeriod` 5s → 2s (kube-controller-manager's default; also the purge Lease's, and `LeaderTiming::default`'s); a note beside `sidecars.*.tag` that an older tag without the gate crash-loops | DONE | `deploy/helm/constellation-csi/templates/controller.yaml`, `values.yaml` |
+| Scenario: `SNAPSHOT_LATE` (5 s) gate, measurement `snapshot_after_handoff_ms`, the engines' `snapshot batch:` lines printed; TESTING.md row | DONE | `crates/harness/src/k8s/scenarios.rs`, `docs/how-to-guides/development/TESTING.md` |
+
+### Before (kind `hsl`, image `hsl-0` = main 7b724d4, debug-level snapshot logs)
+
+| Round | `handoff_ms` | Rollout s | Snapshot asked / cut by, ms (from the handoff's start) | Late because |
+|---|---|---|---|---|
+| 1 | 237 | 8.8 | -23 / 610 | — |
+| 2 | 229 | 11.3 | 580 / 17691 | snapshotter leader: new leader 21 s after the old one's SIGTERM; forward + cut 0.3 s |
+| 3 | 327 | 17.0 | 301 / 14042 | same |
+| 4 | 202 | 20.8 | 215 / 12051 | same |
+| 5 | 214 | 18.1 | -5 / 18119 | same |
+| 6 | 211 | 7.1 | 258 / 788 | — |
+
+### The gate (2026-10-07, kind `hsl`, kindest/node v1.37.0, image `hsl-1` = this tree, the chart as shipped, `CONSTELLATION_HARNESS_DOCKER_PREFIX=hsl-k8s`, host load 26-110)
+
+`harness k8s-scenario csi-engine-pod-handoff-under-load --repeat 2`, then
+`--repeat 4` twice, on one kept cluster (`--kubeconfig`): **10/10
+consecutive rounds passed, 0 errors in 42,550 calls; every snapshot cut
+within 2.9 s of the handoff's end** (and every one a state the trio went
+through holding everything acknowledged before it). `pause_ms` p50 144 /
+p99 417 ms.
+
+| Round | `handoff_ms` | `pause_ms` | Rollout s | Calls | Snapshot asked / cut by, ms | Cut after the handoff's end, ms | Records (acked before) |
+|---|---|---|---|---|---|---|---|
+| 1 | 189 | 153 | 6.1 | 4125 | -41 / 250 | 61 | 880 (864) |
+| 2 | 184 | 144 | 8.6 | 4072 | 420 / 709 | 525 | 864 (832) |
+| 3 | 201 | 180 | 6.5 | 4318 | -94 / 357 | 156 | 1136 (1104) |
+| 4 | 191 | 168 | 9.3 | 4254 | 353 / 798 | 607 | 960 (928) |
+| 5 | 175 | 124 | 7.8 | 4023 | 33 / 251 | 76 | 784 (768) |
+| 6 | 195 | 212 | 7.1 | 3806 | 74 / 486 | 291 | 640 (608) |
+| 7 | 119 | 133 | 5.8 | 4068 | -66 / 352 | 233 | 816 (784) |
+| 8 | 138 | 130 | 6.7 | 3744 | -97 / 950 | 812 | 736 (624) |
+| 9 | 203 | 417 | 30.8 | 6411 | 212 / 1113 | 910 | 1904 (1856) |
+| 10 | 128 | 107 | 6.4 | 3729 | -42 / 3030 | 2902 | 944 (592) |
+
+No round printed a `snapshot batch:` re-route line: on this host the
+forward never landed in the window (see the first cause). An earlier
+`hsl-1` batch with debug logs (3 rounds, requests at -116, +9, +230 ms)
+cut 333-786 ms after the handoff's end. With the chart fixed but the old
+engine (`hsl-0`, 4 quick rounds + 2 with the upgrade delayed 90 s) every
+cut was 0.2-1.7 s after the end.
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings` | clean; clean |
+| `cargo test -p constellation-csi -p constellation-harness -p constellation-engine` | 876 passed, 0 failed |
+| `bash tests/smoke.sh` | SMOKE TEST PASSED |
+| `harness k8s-scenario csi-engine-pod-handoff-under-load` ×10 (above) | 10/10 PASSED, every cut ≤ 2.9 s after the handoff's end |
+| `harness k8s-scenario csi-snapshot-clone-mount` | PASSED (restore + clone Bound 2.4 s, `clone.create` 26 and 6 ms) |
+| kind `hsl` | deleted; `fs.inotify.max_user_instances` left at 512 |
+
+### Notes
+
+- **The k8s mode's floci is swept by other runs on the default prefix.**
+  `harness k8s-scenario` labels its floci with the docker prefix
+  (`constellation-harness-prefix`) but never takes that prefix's lock, so
+  a `harness run` started meanwhile on the same (default) prefix sweeps it
+  as a leftover (`docker rm -f`). Seen twice here: S3 went `Connect`-refused
+  mid-run (a handoff then rolled back at its `credentials` step three
+  times; a PVC never bound). Run the k8s mode with a private
+  `CONSTELLATION_HARNESS_DOCKER_PREFIX`. Not fixed here (harness, not this
+  bug); the fix is for the k8s mode to hold the prefix lock or label its
+  floci with a prefix of its own.
+- `--repeat N` on a kept cluster took ~65 s a round here (2 rounds 2m16s,
+  4 rounds 4-5 min), so 4 rounds fit one 10-minute tool call.
