@@ -44592,3 +44592,6 @@ leave an unlocked file. Gates: fmt, clippy `-D warnings` clean;
   test now uses a ns clock. Did not reproduce locally in 90 isolated runs (timing-dependent);
   cause established from the guard. Gates: fmt, clippy `-D warnings` clean; test ×50, 0 failures;
   `cargo test -p constellation-engine --lib` 599 passed.
+
+
+- iroh-error-line: `could not close last open path` (iroh `remote_state.rs`, `apply_selected_path`) is benign: iroh's path map lists a path noq already abandoned, noq refuses to close the last open path, nothing leaks. The CLI's log setup drops exactly that event (a tracing layer matching the `iroh::socket::remote_map::remote_state` target and the exact message; the module's other events are kept; `RUST_LOG` naming `remote_state` re-enables it); the harness's "no ERROR" rule is untouched. Upstream note in `vendor/ISSUE-iroh.md`.

@@ -1223,6 +1223,41 @@ fn remember_endpoint(name: &str, endpoint: &str) {
     }
 }
 
+/// Drops iroh's `could not close last open path` event and nothing else.
+///
+/// iroh logs it at ERROR when its own path bookkeeping lists a second IP path
+/// that noq has already abandoned: noq refuses the close and the connection
+/// keeps its remaining path, so it is benign (vendor/ISSUE-iroh.md). The
+/// event has no target of its own, so it is matched by module and message;
+/// every other event of that module (`Opening path failed`, ...) is kept.
+struct IrohNoise;
+
+const IROH_NOISE_TARGET: &str = "iroh::socket::remote_map::remote_state";
+const IROH_NOISE_MESSAGE: &str = "could not close last open path";
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for IrohNoise {
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        if event.metadata().target() != IROH_NOISE_TARGET {
+            return true;
+        }
+        struct Message(bool);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}") == IROH_NOISE_MESSAGE;
+                }
+            }
+        }
+        let mut m = Message(false);
+        event.record(&mut m);
+        !m.0
+    }
+}
+
 fn main() -> Result<()> {
     let log_buffer = log_buffer::LogBuffer::default();
     let log_writer = log_buffer.clone();
@@ -1235,10 +1270,22 @@ fn main() -> Result<()> {
     if !rust_log.contains("aws_config") {
         filter = filter.add_directive("aws_config=warn".parse().expect("static directive"));
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(move || log_writer.writer())
-        .init();
+    // The one iroh line that is benign noise at ERROR (see `IrohNoise`),
+    // unless RUST_LOG names its module.
+    let iroh_noise = (!rust_log.contains("remote_state")).then_some(IrohNoise);
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+        tracing_subscriber::registry()
+            .with(iroh_noise)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || log_writer.writer())
+                    .with_filter(filter),
+            )
+            .init();
+    }
     let cli = Cli::parse();
     let threads = parallelism::thread_plan();
     tracing::info!(
@@ -4059,6 +4106,64 @@ fn parse_quota_arg(input: &str) -> Result<Option<u64>> {
         Ok(None)
     } else {
         Ok(Some(n))
+    }
+}
+
+#[cfg(test)]
+mod iroh_noise_tests {
+    use super::{IrohNoise, IROH_NOISE_TARGET};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct Collect(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Collect {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V(String);
+            impl tracing::field::Visit for V {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "message" {
+                        self.0 = format!("{v:?}");
+                    }
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", event.metadata().level(), v.0));
+        }
+    }
+
+    #[test]
+    fn drops_only_the_close_last_path_line() {
+        assert_eq!(IROH_NOISE_TARGET, "iroh::socket::remote_map::remote_state");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::registry()
+            .with(IrohNoise)
+            .with(Collect(seen.clone()));
+        tracing::subscriber::with_default(sub, || {
+            tracing::error!(target: "iroh::socket::remote_map::remote_state", "could not close last open path");
+            tracing::error!(target: "iroh::socket::remote_map::remote_state", "Opening path failed");
+            tracing::warn!(target: "iroh::socket::remote_map::remote_state", "multipath not negotiated");
+            tracing::error!(target: "iroh::socket::remote_map::remote_state", "could not close last open path: other");
+            tracing::error!(target: "other::module", "could not close last open path");
+            tracing::error!("unrelated");
+        });
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "ERROR Opening path failed",
+                "WARN multipath not negotiated",
+                "ERROR could not close last open path: other",
+                "ERROR could not close last open path",
+                "ERROR unrelated",
+            ]
+        );
     }
 }
 
