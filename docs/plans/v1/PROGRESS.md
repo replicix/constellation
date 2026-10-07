@@ -44518,3 +44518,54 @@ Gates of the review round (final code; `CARGO_TARGET_DIR` unset,
   PASSED — `lock-grant-dead-generation`, `lock-holder-partitioned`
   30.1 s, `lock-failover` 56.7 s, `lock-holder-killed-contention`
   45.5 s, `lock-fence-at-close` 41.5 s, `lock-latency` 44.1 s.
+
+## Fix: `takeover-marker-strands-promptly` met a backed takeover and failed "1 record(s)" (`takeover-marker-flake`, 2026-10-07)
+
+Base: main `fd4fcf6d`. Release build, prefix `tmf`,
+`TMPDIR=/var/tmp/tmf`, `CHAOS_KEEP_TMP=1`, load 31–43.
+
+**Before: 0/10** (24.7–28.9 s each). Every run failed the same way: "the
+first segment of the new epoch (seq 3|4) must be B's (node 2) empty
+epoch-2 marker; it is node 2, epoch 2, 1 record(s)". (Earlier
+reports: ~2 in 5 on `247fc59`/`d1e56cd`, at lower load.)
+
+**Cause: the scenario's precondition, not the product.** All ten kept
+B logs show the same sequence. A logs "bringing up a backup … candidate=2"
+and "backup set reconfigured … backups=[2]" before the kill. About 1.5 s
+after `kill9`, B logs "holder silent (or its lease expired) and this node
+still listed: sealed its epoch to take over". That comes before and apart
+from its refused `rmdir`. Then B logs "shipped the takeover's epoch marker"
+and "re-shipping the predecessor's backup tail under the new epoch". This
+is the plan 30 §M9 backed handover: its marker carries
+`LogRecord::TailFollows { prev_epoch }` by design (`jobs::marker_records`),
+which is the 1 record, and B's re-shipped tail segments could strand C's
+shadow too. The scenario tests the §M3b *unbacked* takeover, where B
+takes the expired lease through its own refused op and ships nothing but
+an empty marker. It was written before backups were on by default, so
+it met the unbacked takeover only when A's backup tick had not run
+before the kill. At load 40 the tick always ran first. The same race
+was fixed in `p2p-same-identity-restart` by pinning backups off.
+
+**Fix (harness only):** `takeover_marker_strands_promptly` passes
+`CONSTELLATION_BACKUPS=0` to all three nodes, beside the existing
+`CONSTELLATION_SYNC_IDLE_MAX_MS=1000`. Every bound and check is unchanged:
+5 s strand bound, the marker is B's at B's epoch with zero records,
+`epoch_markers >= 1`, replay exactly once, fresh D agrees. The backed
+handover keeps its own scenarios (`holder-publishes-log-prefix-backup`
+and others). The scenario doc comment and `TESTING.md` explain the pin.
+
+**After: 10/10** (29.5–38.2 s; C stranded its shadow 253–1006 ms after
+B's refused takeover op, marker at seq 4 or 5).
+
+Gates: `cargo fmt --all -- --check` clean; `cargo clippy -p
+constellation-harness --all-targets -- -D warnings` clean; `cargo test -p
+constellation-harness` 95/95 in 5 of 10 runs (load ~30). In the other 5,
+`s3env::tests::a_prefix_lock_is_seen_whatever_tmpdir_says` failed
+"… still looks held after the drop". That code is untouched by this
+chunk. The likely cause is that a concurrent test thread's spawned
+child briefly inherits the lock fd between fork and exec. Not fixed here.
+
+### Open
+
+- `s3env::tests::a_prefix_lock_is_seen_whatever_tmpdir_says` is flaky
+  under load (see above).

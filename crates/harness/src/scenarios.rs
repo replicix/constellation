@@ -10623,7 +10623,8 @@ type PhantomRig = (
 
 /// As [`phantom_setup`], with `extra` environment on all three nodes
 /// (plan 30 M3b: `takeover-marker-strands-promptly` shortens the idle
-/// poll ceiling so its promptness bound does not ride on the P2P push).
+/// poll ceiling so its promptness bound does not ride on the P2P push,
+/// and turns backups off so B's takeover is the unbacked one).
 fn phantom_setup_with(scenario: &str, extra: &[(&str, &str)]) -> Result<PhantomRig> {
     let (env, root) = setup(scenario)?;
     let _proxy = env.s3_proxy()?;
@@ -10920,6 +10921,17 @@ fn read_commit(endpoint: &str, key: &str) -> Result<serde_json::Value> {
 /// must be that marker (B's node, zero records), and the stranded create
 /// is then replayed by rid through B exactly once: B, C and a fresh node
 /// D all see `phantom` as one inode.
+///
+/// Every node runs with `CONSTELLATION_BACKUPS=0`. A backed holder hands
+/// over a different way (plan 30 §M9): its backup seals A's epoch about
+/// 1.5 s after A falls silent and takes over by itself, before B's `rmdir`
+/// and whatever B does, and it re-ships A's tail. Its marker then carries a
+/// `TailFollows` record by design (`jobs::marker_records`), and the
+/// re-shipped tail segments can strand C's shadow as well. A
+/// takes B as its backup once its backup tick has run. Under load that
+/// usually happens before the kill, so the scenario failed "1 record(s)"
+/// in 10 of 10 runs at load 40. The backed handover has its own scenarios
+/// (`holder-publishes-log-prefix-backup` and others).
 fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
     use std::time::Instant;
     /// How long after B's takeover C may take to strand its shadow. The
@@ -10929,7 +10941,10 @@ fn takeover_marker_strands_promptly(_seed: u64) -> Result<()> {
     const PROMPT: Duration = Duration::from_secs(5);
     let (env, root, mut a, mut b, mut c, sw) = phantom_setup_with(
         "takeover-marker-strands-promptly",
-        &[("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000")],
+        &[
+            ("CONSTELLATION_SYNC_IDLE_MAX_MS", "1000"),
+            ("CONSTELLATION_BACKUPS", "0"),
+        ],
     )?;
     let prefix = b
         .backend

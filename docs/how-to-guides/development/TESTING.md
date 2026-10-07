@@ -1832,7 +1832,13 @@ was rewritten for the same milestone):
   once: B, C and a fresh D (after C's clean unmount publishes) see
   `phantom` as one inode, with no replay conflict. All three nodes run
   with `CONSTELLATION_SYNC_IDLE_MAX_MS=1000`, so the 5 s bound does not
-  depend on the P2P push alone.
+  depend on the P2P push alone, and with `CONSTELLATION_BACKUPS=0`. With
+  backups on, A takes B as its backup once its backup tick has run. B
+  then seals A's epoch on its own about 1.5 s after the kill, before its
+  `rmdir`. Its marker carries a `TailFollows` record (plan 30 §M9), and
+  it re-ships A's tail. Before the pin, the scenario failed "1 record(s)"
+  whenever the tick beat the kill: about 2 runs in 5, and 10 of 10 runs
+  at load 40.
 - **`holder-publishes-log-prefix`** (holder publish). Holder A runs a
   paced `mkdir` burst (~200/s, metadata only: no close nudges, no chunk
   uploads) with `CONSTELLATION_SYNC_INTERVAL_MS=50` under 25 ms of
