@@ -44606,7 +44606,8 @@ outwait barriers of `stale-read-outwaited` move its timings. The
 mechanism is still in main's code (below).
 
 Fix: `Core::lock_install_returned` installs a recall answer's grants
-only for a generation the root still has live. If the generation has
+only for a generation the root still has inside its window (not past
+`until`, not sealing). If the generation is outwaited, sealing or has
 ended there (outwaited, sealed, drained), or the root no longer knows it
 (the lease was lost since), the grants are dropped and counted
 (`Stats::lock_returned_after_end`). The answer's floor and barrier still
@@ -45329,3 +45330,7 @@ Gates (this round, `CARGO_TARGET_DIR` unset):
   back through an RPC future on `int_tx`. This is the same class for
   cluster locks, but no lock lapse was seen in any run (r1–r3,
   s1–s5).
+
+### Follow-up: the late-answer rule covers the whole outwaited window (`late-handback-followup`, 2026-10-07)
+
+`Core::lock_install_returned` treated "live" as `!g.ended`, so an answer arriving while the root was sealing (`RecallPhase::Sealing`; the seal pushes `until` on, after the outwait grace) or during repeated `!root_usable` expiry retries (`now >= until`, not yet ended) still installed restamped grants (a phantom holder until expiry). It now drops them when `ended || now >= g.until || recall == Sealing`; the floor and barrier still count. Core test `a_recall_answer_while_the_generation_is_sealing_brings_no_grants_back` (fails without the change). `cluster-locks.md` and the wording above corrected ("outwaited window", not "ended"). Gates: fmt, clippy `-D warnings`, `cargo test --release -p constellation-authority` (297 + 4 + 130), sweeps 0..3000 of `locks-unlinked-delegated` (+ `-partition`, `-random`, `-dbackup-random`, `-hcrash`, `-hcrash-backup`, `-dcrash`, `-dcrash-nb`, `-blips`) and `locks-delegated-partition`: 0 failing.

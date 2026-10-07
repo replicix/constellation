@@ -178,18 +178,20 @@ which subtree it left is not recorded. During that grace the root makes
 no new grant on an unlinked inode, and a holder whose grant it never
 got reclaims it with its next renewal, as under any grace.
 
-A recall answer that comes after its generation ended at the root brings
-no grants back. A delegate paused past its delegation's window (or cut
-off for it) answers the recall it finds queued when it resumes, with
-the grants still in its table; by then the root has outwaited and ended
-the generation, and every one of those grants has lapsed at its holder
-(the delegation's window caps them). Installed with a fresh window, as
-a timely answer's grants are, such a copy would make the root treat a
-dead holder as live: it kept the next generation's grant out when the
-file was unlinked, then granted the copy's old holder an upgrade beside
-the delegate's live exclusive grant (`locks-unlinked-delegated-partition`
-seed 7455). Its floor and barrier still count while the root knows the
-generation.
+A recall answer that comes once its generation's window is outwaited at
+the root brings no grants back: the generation has ended, is sealing its
+backup, or is past its `until` (an expiry still retrying). A delegate
+paused past its delegation's window (or cut off for it) answers the
+recall it finds queued when it resumes, with the grants still in its
+table; by then the root has outwaited the window (and, unless it is
+sealing or retrying, ended the generation), and every one of those
+grants has lapsed at its holder (the delegation's window caps them).
+Installed with a fresh window, as a timely answer's grants are, such a
+copy would make the root treat a dead holder as live: it kept the next
+generation's grant out when the file was unlinked, then granted the
+copy's old holder an upgrade beside the delegate's live exclusive grant
+(`locks-unlinked-delegated-partition` seed 7455). Its floor and barrier
+still count while the root knows the generation.
 
 A grant lapses when its holding node, or that node's path to the
 sequencer, stalls for longer than the TTL: a partition, a stopped or

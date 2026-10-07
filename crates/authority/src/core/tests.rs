@@ -9274,6 +9274,64 @@ mod locks {
         );
     }
 
+    /// The same late answer while the root is sealing the silent
+    /// delegate's backup: the generation has not ended, and the seal
+    /// pushed its `until` on, but the window was outwaited already (the
+    /// grace stands). The answer's grants are not installed.
+    #[test]
+    fn a_recall_answer_while_the_generation_is_sealing_brings_no_grants_back() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let out = h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        let recall = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
+        let g = h.core.dl.gens.get_mut(&7).unwrap();
+        g.recall = crate::core::delegate::RecallPhase::Sealing;
+        g.until = h.now.plus(5_000);
+        let live = constellation_meta::locks::Grant {
+            id: GrantId { node: 3, seq: 5 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until_ms: h.now.0 + 1_000,
+            recalled: false,
+            gen: 7,
+            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+        };
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRecalled {
+                req: recall,
+                gen: 7,
+                through: 0,
+                locks: constellation_meta::locks::LockHandback {
+                    grants: vec![live],
+                    floor: Position::ZERO,
+                    barrier: 0,
+                },
+            },
+        });
+        assert!(
+            h.meta.locks().grants_snapshot().is_empty(),
+            "a grant installed while sealing: {:?}",
+            h.meta.locks().grants_snapshot()
+        );
+        assert_eq!(h.core.stats.lock_returned_after_end, 1);
+    }
+
     fn holder_with_file() -> (Harness, Ino) {
         let mut h = Harness::new(1);
         h.hold(1, None);

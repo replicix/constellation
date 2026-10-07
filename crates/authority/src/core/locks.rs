@@ -4211,7 +4211,8 @@ impl Core {
 
     /// Root: a delegate's drained answer handed `grants` back — installed
     /// restamped; the root's copies of them are done. An answer that
-    /// comes after the generation ended here brings no grants back.
+    /// comes once the generation's window is outwaited (past `until`,
+    /// sealing, or ended) here brings no grants back.
     pub(crate) fn lock_install_returned(
         &mut self,
         now: Ms,
@@ -4226,15 +4227,21 @@ impl Core {
         } = back;
         let live = match self.dl.gens.get(&gen) {
             Some(g) => {
-                let (dir, ended) = (g.dir, g.ended);
+                // Past its window the delegation's grants have lapsed at
+                // their holders and the outwait's grace stands (or is
+                // about to: an expiry retry, `!root_usable`); a seal
+                // pushed `until` on but began after the outwait.
+                let outwaited =
+                    g.ended || now >= g.until || g.recall == super::delegate::RecallPhase::Sealing;
+                let dir = g.dir;
                 self.lock_note_dir_floor(dir, &floor);
                 self.lock_dir_barrier(dir, barrier);
-                !ended
+                !outwaited
             }
             None => false,
         };
         if !live {
-            // Whatever ended the generation accounted for its grants: an
+            // Whatever outwaited or ended the generation accounted for its grants: an
             // outwait or a seal waited out the delegation's window, which
             // caps every grant it made or renewed (and left a grace on
             // the subtree); a drained answer already handed them back; a
