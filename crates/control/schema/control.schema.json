@@ -4870,6 +4870,10 @@
           ],
           "description": "Cooperative-cache source stats for this peer, when available."
         },
+        "core_connected": {
+          "description": "Whether the authority core sees this peer connected: the link it\nroutes forwards and redirects on. It follows `connected` within\none step of the driver (`startup-link-lag`).",
+          "type": "boolean"
+        },
         "created_unix": {
           "format": "int64",
           "type": [
@@ -4967,7 +4971,8 @@
         "designations",
         "s3",
         "path",
-        "paths"
+        "paths",
+        "core_connected"
       ],
       "type": "object"
     },

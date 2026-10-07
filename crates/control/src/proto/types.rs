@@ -1200,6 +1200,10 @@ pub struct PeerStatus {
     pub path: String,
     /// Plan 30 §M4: every open QUIC path to this peer right now.
     pub paths: PeerPathsStatus,
+    /// Whether the authority core sees this peer connected: the link it
+    /// routes forwards and redirects on. It follows `connected` within
+    /// one step of the driver (`startup-link-lag`).
+    pub core_connected: bool,
 }
 
 /// Plan 30 §M4: the open network paths of the pooled connection to one

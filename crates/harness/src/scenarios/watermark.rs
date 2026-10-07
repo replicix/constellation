@@ -30,7 +30,7 @@
 
 use super::m11::{
     cluster, deleg_of, delegate, dump_logs_on_failure, n, undelegate, unmount_all,
-    wait_for_connected_peers, wait_installed,
+    wait_for_connected_peers, wait_for_core_links, wait_installed,
 };
 use super::m9::node_id;
 use super::{eventually, wait_for_p2p};
@@ -77,19 +77,16 @@ pub fn lock_grant_dead_generation(_seed: u64) -> Result<()> {
     let result = (|| -> Result<()> {
         let c_id = node_id(&clients[2])?;
         // b's write into d1 must go to the delegate c. A node's authority
-        // core learns its links on a 1 s tick, and it sends an op under
-        // another node's delegation to the root while it has no link to
-        // that delegate yet; the root, not linked to c yet either,
-        // recalls the delegation and executes it (the designed fallback
-        // for an unreachable delegate). Right after the mounts, c had
-        // enrolled a second before b's write: the generation ended under
-        // the scenario, whose `undelegate` then found nothing delegated.
-        let linked = {
-            let refs: Vec<&Client> = clients.iter().collect();
-            wait_for_p2p(&refs)?;
-            wait_for_connected_peers(&refs)?;
-            Instant::now()
-        };
+        // core sends an op under another node's delegation to the root
+        // while it has no link to that delegate; the root, not linked to
+        // c either, recalls the delegation and executes it (the designed
+        // fallback for an unreachable delegate), and the scenario's
+        // `undelegate` then finds nothing delegated. The cores' links
+        // follow the P2P layer's within a driver step
+        // (`startup-link-lag`); b's write waits until they show.
+        let refs: Vec<&Client> = clients.iter().collect();
+        wait_for_p2p(&refs)?;
+        wait_for_connected_peers(&refs)?;
         {
             let a = &clients[0];
             std::fs::create_dir(a.mnt.join("d1"))?;
@@ -135,8 +132,7 @@ pub fn lock_grant_dead_generation(_seed: u64) -> Result<()> {
                 },
             )?;
         }
-        // Two link ticks since every link was up: the cores route to c.
-        std::thread::sleep(Duration::from_secs(2).saturating_sub(linked.elapsed()));
+        wait_for_core_links(&refs)?;
         std::fs::write(clients[1].mnt.join("d1/b-0"), b"d1/b-0")?;
         names.push("d1/b-0".into());
         for x in &clients {

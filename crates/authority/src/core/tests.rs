@@ -15688,6 +15688,102 @@ fn undelegate_refuses_a_designation() {
     );
 }
 
+/// `startup-link-lag`: the root delegates `d1` to node 3, and node 2's
+/// write into it reaches the root (node 2 had no link to 3 yet). The
+/// root redirects it to the delegate only if its own links show 3
+/// connected; with the peer enrolled but its link not reported yet (the
+/// driver used to report links on a 1 s tick only), the root recalls the
+/// fresh generation and executes the write itself.
+#[test]
+fn a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate() {
+    fn delegate_then_forward(c_connected: bool) -> Vec<Action> {
+        let (mut h, dir) = root_with_dir();
+        let out = h.step(Event::Control {
+            op: OpId(900),
+            req: Control::Delegate {
+                dir,
+                node: 3,
+                range: (0, 0),
+            },
+        });
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::ControlDone {
+                    op: OpId(900),
+                    result: Ok(_)
+                }
+            )),
+            "not delegated: {out:?}"
+        );
+        if c_connected {
+            h.step(Event::Peers {
+                links: (2..=4)
+                    .map(|node| crate::event::PeerLink {
+                        node,
+                        connected: true,
+                        last_seen: Some(h.now),
+                        rtt_ms: Some(1),
+                        since: Some(h.now),
+                    })
+                    .collect(),
+            });
+        }
+        h.advance(10);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::MutateRequest {
+                req: OpId(7),
+                rid: Rid {
+                    node: 2,
+                    incarnation: 1,
+                    seq: 1,
+                },
+                op: MutateOp::Create {
+                    parent: dir,
+                    name: "b-0".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+                acked_through: 0,
+                deps: constellation_meta::Position::ZERO,
+                applied: 0,
+                tag: Default::default(),
+            },
+        })
+    }
+    let recalled = |out: &[Action]| {
+        sends(out)
+            .iter()
+            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::DelegRecall { .. }))
+    };
+    let redirected = |out: &[Action]| {
+        sends(out).iter().any(|(to, m)| {
+            *to == 2
+                && matches!(
+                    m,
+                    PeerMsg::MutateReply {
+                        outcome: MutateOutcome::NotHolder { holder: 3 },
+                        ..
+                    }
+                )
+        })
+    };
+    let out = delegate_then_forward(false);
+    assert!(
+        recalled(&out) && !redirected(&out),
+        "the root, its link to 3 not reported yet, recalls: {out:?}"
+    );
+    let out = delegate_then_forward(true);
+    assert!(
+        redirected(&out) && !recalled(&out),
+        "the root, its link to 3 up, redirects to the delegate: {out:?}"
+    );
+}
+
 /// `fs set epoch-slack` raising `f` from 0 on a mounted node whose
 /// promise TTL exceeds lease TTL / 4 (never validated at mount, since
 /// `f` was 0 then): the core clamps the TTL instead of promising for

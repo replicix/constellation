@@ -340,6 +340,31 @@ pub(super) fn wait_for_connected_peers(clients: &[&Client]) -> Result<()> {
     Ok(())
 }
 
+/// Every node's authority core sees every other node connected
+/// (`core_connected`): the links it routes forwards and redirects on.
+pub(super) fn wait_for_core_links(clients: &[&Client]) -> Result<()> {
+    let need = clients.len().saturating_sub(1);
+    for c in clients {
+        eventually(
+            &format!("{}'s core links reach {need} peer(s)", c.name),
+            Duration::from_secs(30),
+            || {
+                let s = c.control_status()?;
+                let n = super::node_peers(&s["p2p"])
+                    .filter(|p| p["core_connected"] == true)
+                    .count();
+                anyhow::ensure!(
+                    n >= need,
+                    "{}'s core links reach {n} peers, want {need}",
+                    c.name
+                );
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Every `names` file reads as its own name on `c`.
 fn all_visible(c: &Client, names: &[String], deadline: Duration) -> Result<()> {
     eventually(&format!("{} sees every file", c.name), deadline, || {

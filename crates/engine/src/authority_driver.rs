@@ -166,6 +166,8 @@ pub struct CoreStatus {
     pub lock_recalls_in_flight: usize,
     /// EC2 campaign 8 A-1.
     pub own_s3: constellation_authority::core::OwnS3,
+    /// The peers whose link the core sees connected (`startup-link-lag`).
+    pub connected_links: Vec<u64>,
     /// Plan 31 C8: forward-only and suspended, as the core applies them.
     pub authority: constellation_authority::core::AuthorityMode,
 }
@@ -1458,62 +1460,13 @@ impl Driver {
         }
         // The peer directory and the roster, on a ticker like the
         // daemon's registry poll; with them, this node's own S3 path
-        // (EC2 campaign 8 A-1, `Event::OwnS3`).
+        // (EC2 campaign 8 A-1, `Event::OwnS3`). The links also go out as
+        // soon as the directory changes (`startup-link-lag`).
         {
             let tx = self.event_tx();
             let peers = self.deps.peers.clone();
-            let mut own_s3 = OwnS3Watch::new(self.deps.upload.clone(), peers.clone());
-            tokio::spawn(async move {
-                // Plan 30 §M9: when each peer's link came up, for the
-                // backup selection's stability requirement.
-                let mut since: HashMap<u64, Ms> = HashMap::new();
-                loop {
-                    let now = Ms(now_unix_ms());
-                    let links: Vec<PeerLink> = peers
-                        .snapshot()
-                        .into_iter()
-                        .map(|p| {
-                            // Fault injection: a denied peer is a link that
-                            // is down (the cut is a real one to the core:
-                            // the inbox path, no redirects to it).
-                            let connected = p.connected && !crate::fault::p2p_denied(p.node_id);
-                            let since = if connected {
-                                Some(*since.entry(p.node_id).or_insert(now))
-                            } else {
-                                since.remove(&p.node_id);
-                                None
-                            };
-                            PeerLink {
-                                node: p.node_id,
-                                connected,
-                                last_seen: if connected {
-                                    p.last_seen.map(|at| {
-                                        Ms(now_unix_ms() - at.elapsed().as_millis() as i64)
-                                    })
-                                } else {
-                                    None
-                                },
-                                rtt_ms: p.rtt_ms,
-                                since,
-                            }
-                        })
-                        .collect();
-                    let (stalled, peers_reach_s3) = own_s3.tick();
-                    if tx
-                        .send(Internal::Event(Event::OwnS3 {
-                            stalled,
-                            peers_reach_s3,
-                        }))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if tx.send(Internal::Event(Event::Peers { links })).is_err() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(1_000)).await;
-                }
-            });
+            let own_s3 = OwnS3Watch::new(self.deps.upload.clone(), peers.clone());
+            tokio::spawn(peer_links_task(peers, own_s3, tx));
         }
         let _alive_task = self.core.config().p2p.then(|| AliveTask {
             task: tokio::spawn(holder_alive_task(
@@ -1855,6 +1808,7 @@ impl Driver {
         status.lock_waiters = lv.waiters;
         status.lock_recalls_in_flight = lv.recalls_in_flight;
         status.own_s3 = self.core.own_s3();
+        status.connected_links = self.core.connected_links();
         status.authority = self.core.authority_mode();
         drop(status);
         self.deps
@@ -4870,6 +4824,98 @@ const OWN_S3_ASK_EVERY: Duration = Duration::from_secs(5);
 /// How long an answer to that question may take.
 const OWN_S3_ASK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How often the driver sends the core its peer links when nothing
+/// changes.
+const PEER_LINKS_TICK: Duration = Duration::from_millis(1_000);
+
+/// [`PeerLink`]s from the peer directory. `since`: when each peer's link
+/// came up, for the backup selection's stability requirement (plan 30
+/// §M9).
+fn peer_links(peers: &constellation_net::Peers, since: &mut HashMap<u64, Ms>) -> Vec<PeerLink> {
+    let now = Ms(now_unix_ms());
+    peers
+        .snapshot()
+        .into_iter()
+        .map(|p| {
+            // Fault injection: a denied peer is a link that is down (the
+            // cut is a real one to the core: the inbox path, no redirects
+            // to it).
+            let connected = p.connected && !crate::fault::p2p_denied(p.node_id);
+            let up_since = if connected {
+                Some(*since.entry(p.node_id).or_insert(now))
+            } else {
+                since.remove(&p.node_id);
+                None
+            };
+            PeerLink {
+                node: p.node_id,
+                connected,
+                last_seen: if connected {
+                    p.last_seen
+                        .map(|at| Ms(now_unix_ms() - at.elapsed().as_millis() as i64))
+                } else {
+                    None
+                },
+                rtt_ms: p.rtt_ms,
+                since: up_since,
+            }
+        })
+        .collect()
+}
+
+/// Sends the core `Event::Peers` and `Event::OwnS3` every
+/// [`PEER_LINKS_TICK`], and `Event::Peers` again as soon as a peer enrols
+/// or leaves or its link goes up or down (`startup-link-lag`: with the
+/// tick alone, a peer that had just enrolled was not in the core's links
+/// for up to a second, so a write into its fresh delegation went to the
+/// root, which recalled the delegation).
+async fn peer_links_task(
+    peers: constellation_net::Peers,
+    mut own_s3: OwnS3Watch,
+    tx: mpsc::UnboundedSender<Internal>,
+) {
+    let mut since: HashMap<u64, Ms> = HashMap::new();
+    let mut changed = peers.links_changed();
+    let mut tick = tokio::time::Instant::now();
+    loop {
+        let ticked = tokio::time::Instant::now() >= tick;
+        if ticked {
+            let (stalled, peers_reach_s3) = own_s3.tick();
+            if tx
+                .send(Internal::Event(Event::OwnS3 {
+                    stalled,
+                    peers_reach_s3,
+                }))
+                .is_err()
+            {
+                return;
+            }
+            tick = tokio::time::Instant::now() + PEER_LINKS_TICK;
+        }
+        // Read before the snapshot: a change after it wakes us again.
+        if let Some(rx) = changed.as_mut() {
+            rx.borrow_and_update();
+        }
+        let links = peer_links(&peers, &mut since);
+        if tx.send(Internal::Event(Event::Peers { links })).is_err() {
+            return;
+        }
+        match changed.as_mut() {
+            Some(rx) => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(tick) => {}
+                    r = rx.changed() => {
+                        if r.is_err() {
+                            changed = None;
+                        }
+                    }
+                }
+            }
+            None => tokio::time::sleep_until(tick).await,
+        }
+    }
+}
+
 /// EC2 campaign 8 A-1: this node's own S3 path for the core, once a
 /// second. Stalled when no S3 request (and no chunk PUT) of this node
 /// has completed for [`s3_stall_ms`]; while stalled, the live peers are
@@ -6187,6 +6233,101 @@ mod tests {
         assert_eq!(parse_u64_zero_ok(Some(" 35 "), 20), 35);
         assert_eq!(parse_u64_zero_ok(None, 20), 20);
         assert_eq!(parse_u64_zero_ok(Some("off"), 20), 20);
+    }
+
+    /// `startup-link-lag`: a peer that enrols shows up connected in the
+    /// core's links within a round trip, not on the next 1 s link tick
+    /// (before, the root's core did not see a delegate that had just
+    /// enrolled and recalled its fresh delegation instead of redirecting
+    /// a write to it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_that_enrols_reaches_the_cores_links_at_once() {
+        use super::{peer_links_task, Internal, OwnS3Watch};
+        use constellation_authority::Event;
+        use constellation_net::{Payload, Peers};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct Quiet;
+        impl constellation_net::PeerService for Quiet {
+            fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
+            fn lease_requested(
+                &self,
+                _part: String,
+                _requester: u64,
+                _epoch_applied: Option<u64>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>>
+            {
+                Box::pin(async move { Payload::Ping { node_id: 2 } })
+            }
+            fn node_id(&self) -> u64 {
+                2
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let topic = constellation_net::topic_for(Some(&[40u8; 32]), "startup-link-lag");
+        let (key_a, _) = constellation_net::load_or_create(&dir.path().join("a.key")).unwrap();
+        let (key_b, _) = constellation_net::load_or_create(&dir.path().join("b.key")).unwrap();
+        let pa = constellation_net::P2p::spawn(key_a, topic).await.unwrap();
+        let pb = constellation_net::P2p::spawn(key_b, topic).await.unwrap();
+        let registry = vec![
+            (
+                1u64,
+                pa.pubkey_hex(),
+                serde_json::to_value(pa.addr()).unwrap(),
+            ),
+            (
+                2u64,
+                pb.pubkey_hex(),
+                serde_json::to_value(pb.addr()).unwrap(),
+            ),
+        ];
+        let peers_a = Peers::new(pa, 1);
+        let peers_b = Peers::new(pb, 2);
+        peers_a.refresh_registry(vec![registry[0].clone()]);
+        peers_b.refresh_registry(registry.clone());
+        {
+            let peers_b = peers_b.clone();
+            tokio::spawn(async move { peers_b.serve(Arc::new(Quiet)).await });
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let upload = Arc::new(crate::upload::UploadRuntime::for_test(false));
+        let own_s3 = OwnS3Watch::new(upload, peers_a.clone());
+        tokio::spawn(peer_links_task(peers_a.clone(), own_s3, tx));
+        let up = |links: &[constellation_authority::event::PeerLink]| {
+            links.iter().any(|l| l.node == 2 && l.connected)
+        };
+        // The first links go out at once; node 2 is not enrolled yet.
+        loop {
+            match rx.recv().await {
+                Some(Internal::Event(Event::Peers { links })) => {
+                    assert!(!up(&links));
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("the task stopped"),
+            }
+        }
+        // Mid-tick, node 2 enrols.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let enrolled = Instant::now();
+        peers_a.refresh_registry(registry);
+        let took = loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(Internal::Event(Event::Peers { links }))) if up(&links) => {
+                    break enrolled.elapsed();
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the task stopped"),
+                Err(_) => panic!("node 2 never reached the core's links connected"),
+            }
+        };
+        eprintln!("enrolment to a connected link in the core's events: {took:?}");
+        assert!(
+            took < Duration::from_millis(500),
+            "the core saw the enrolled peer's link only after {took:?}"
+        );
     }
 
     /// Plan 39b: an `fsync`'s drain that succeeds through a peer handoff

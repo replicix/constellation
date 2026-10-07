@@ -45336,3 +45336,109 @@ Gates (this round, `CARGO_TARGET_DIR` unset):
 `Core::lock_install_returned` treated "live" as `!g.ended`, so an answer arriving while the root was sealing (`RecallPhase::Sealing`; the seal pushes `until` on, after the outwait grace) or during repeated `!root_usable` expiry retries (`now >= until`, not yet ended) still installed restamped grants (a phantom holder until expiry). It now drops them when `ended || now >= g.until || recall == Sealing`; the floor and barrier still count. Core test `a_recall_answer_while_the_generation_is_sealing_brings_no_grants_back` (fails without the change). `cluster-locks.md` and the wording above corrected ("outwaited window", not "ended"). Gates: fmt, clippy `-D warnings`, `cargo test --release -p constellation-authority` (297 + 4 + 130), sweeps 0..3000 of `locks-unlinked-delegated` (+ `-partition`, `-random`, `-dbackup-random`, `-hcrash`, `-hcrash-backup`, `-dcrash`, `-dcrash-nb`, `-blips`) and `locks-delegated-partition`: 0 failing.
 
 - **lock-renew-prompt (2026-10-07, base `d7d2eb8`; closes the open item above).** A lock holder's `LockRenewTick` is now a prompt-lane timer (`prompt_timer`). The answer to its `LockRenew` comes back on the urgent lane as the new `SyncRequest::LockRenewAnswered` (`Driver::lock_renew_rpc`, `lock_renew_answer`; the driver holds `DriverDeps::urgent_tx`). This covers both the owner's `LockRenewed` and the `PeerFailed` when no answer came. Nothing depended on the old order: the holder honours a grant from its renewal's send and `LockTable::renewed` only lengthens it (`max`). An earlier tick only renews sooner and drops lapsed grants on time; a tick fired while the owner relearn is in flight is still floored (`lock_relearn_floor`). `LockRenewTimeout` stays a silence timer on the internal channel, so an answer queued when it fires is taken first, and a late answer still counts (`LateRenew`). The owner side is unchanged: `LockGrantExpiry` stays on the internal channel and drains the urgent lane first; peer `LockRenew` was already urgent. The sim does not model lanes. Tests: `only_a_holders_grant_timers_are_prompt` (was `only_a_delegates_…`) and `lock_renewal_answers_take_the_urgent_lane`. Docs: `durability-and-failover.md` (lane order), `cluster-locks.md`. Gates: fmt, clippy `-D warnings` (authority, engine); `cargo test --release -p constellation-authority -p constellation-engine` (`TMPDIR=/dev/shm`) 0 failed (authority 303 + 4 + sim 132, engine 606 + 1). Sim `sweep_config` 0..2000 over all 30 lock configs: 0 failing. Harness, prefix `lrp`, `TMPDIR=/var/tmp/lrp`, load 4–30: the 6 `lock-*` scenarios PASSED, and `git-under-flock-faults` with `GIT_FLOCK_STRICT=1` PASSED in 257 s (149 turns, 0 overlapping, 0 fenced, 0 stale, 0 unexplained, `fenced_io` 0 on both nodes). The `stress-ng-fs-nodes` class this targets was not re-run.
+
+## Fix: a peer that just enrolled was invisible to the authority core for up to a second (`startup-link-lag`)
+
+Follow-up of `lock-recall-unreachable`'s review round. There, `b` sent a
+write under `c`'s fresh delegation to the root `a`. Neither core showed
+`c` connected yet, so `a` recalled generation 1, and
+`lock-grant-dead-generation` needed a fixed 2 s readiness margin.
+
+### Cause
+
+- The driver sent the core its links (`Event::Peers`) only on a 1 s
+  ticker (`authority_driver.rs`). A peer enrolled mid-tick was missing
+  from the core's links for the rest of the tick. `reaches()` is false
+  for an unknown peer, so the requester sent the op to the root.
+- At the root, the redirect to a delegate (`holder.rs`) needs the core
+  to show the delegate `connected`. The net layer set that flag only on
+  a gossip neighbor-up for an already enrolled key, on an RPC this node
+  made, or on the 5 s registry-tick probe. A peer enrolled by the
+  on-demand registry re-read (its own dial was what triggered the
+  re-read) often stayed `connected: false` until the next 5 s probe. So
+  the root recalled the generation instead of redirecting the write.
+
+### Changes
+
+- `crates/net/src/peers.rs`:
+  - `Peers::links_changed()` returns a `tokio::sync::watch` receiver.
+    It is bumped when a peer enters or leaves the directory, or when a
+    peer's `connected` flag flips (`note_rtt`, `mark_neighbor`, the evict
+    hook).
+  - `refresh_registry` pings every newly enrolled peer at once (spawned).
+    The answer flips `connected`.
+- `crates/engine/src/authority_driver.rs`: the ticker is now
+  `peer_links_task` (links built by `peer_links`). It still sends
+  `OwnS3` and `Peers` every second. It also sends `Peers` as soon as the
+  watch fires (a burst of changes collapses into one wake).
+- `node.status`: `p2p.peers[].core_connected` shows whether the core
+  sees the link connected (`Core::connected_links`,
+  `CoreStatus::connected_links`). `control.schema.json` was
+  regenerated.
+- Harness: `m11::wait_for_core_links` polls `core_connected`.
+  `lock-grant-dead-generation` now waits on it before `b`'s write. The
+  fixed 2 s margin is gone.
+- `docs/reference/features/delegations.md` (Ownership): routing uses
+  the core's links, how they are kept current, and `core_connected`.
+
+### Reproduction and measurement
+
+- Core: `a_write_into_a_fresh_delegation_is_recalled_until_the_root_sees_the_delegate`.
+  The root delegates `d1` to node 3 and node 2's forward into `d1`
+  arrives. If the root's links do not show 3 connected, it sends
+  `DelegRecall` to 3. If they do, it answers `NotHolder { holder: 3 }`.
+  This pins the consequence. The fix is in what reaches the core and
+  when.
+- Net: `a_newly_enrolled_peer_is_probed_and_announced_at_once`. A peer
+  enrolled by the on-demand re-read shows connected, and the watch
+  fires at least twice. With the enrolment ping removed, the test fails:
+  the peer is still `connected: false` after 3 s.
+- Driver: `a_peer_that_enrols_reaches_the_cores_links_at_once` uses two
+  real endpoints. Node 2 enrols 100 ms into a tick, and the test times
+  how long until an `Event::Peers` shows it connected. **Before**
+  (watch disabled, tick only): 899–901 ms in 3 runs, which is the rest
+  of the tick. Up to 1 s in general, and without the enrolment ping not
+  until a gossip neighbor-up or the 5 s probe. **After**: about 2 ms.
+  The test asserts < 500 ms.
+- Harness: `lock-grant-dead-generation` with the poll and the margin
+  both removed (`b` writes as soon as the net layer shows every peer
+  connected and `a`/`b` applied the delegation): 12/12 passed. The
+  review round had seen the same shape fail 3 of 8 on its base, and the
+  reviewer 6 of 12. I did not re-run the base here.
+
+### Decisions taken alone
+
+- **Notify, not a shorter tick.** A watch costs nothing when nothing
+  changes. A 100 ms tick would still leave a window.
+- **Push the snapshot to the core rather than routing to a peer whose
+  connection is "being established".** The net layer has no reliable
+  "being established" state for a peer it has not dialed yet. The ping
+  on enrolment turns that case into a real `connected` within one round
+  trip, so the existing rules (`reaches`, the root's `connected` check,
+  the recall fallback) are unchanged.
+- **The ping goes only to newly enrolled peers.** A restarted peer keeps
+  its node id and is handled as before (`suspect_moved`, `InboundWatch`).
+  The 5 s tick already probes everyone (`probe_all`).
+- **The scenario polls `core_connected` even though the fix alone passed
+  12/12 without it.** A poll is exact. The watch still leaves a
+  microsecond-scale gap between the net layer's flag and the core's
+  step, so a scenario that relies on the fix alone could still flake.
+  `wait_for_connected_peers` itself does not check `core_connected`:
+  fault-injected P2P denial makes a link connected at the net layer and
+  down to the core, and scenarios that combine the two would hang.
+- `core_connected` was added at the end of `PeerStatus`, as a required
+  field (no serde default, no version bump).
+
+### Gates (`CARGO_TARGET_DIR` unset, `ulimit -n` 65536)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets --release -- -D warnings` | clean |
+| `cargo test --release -p constellation-authority -p constellation-net -p constellation-engine` (`TMPDIR=/dev/shm/sll`) | authority 297 + 4 + sim 130, engine 605 + conformance 1, net 122 + integration (`addr_churn`, `cluster_restart`, `same_identity_restart` 3, `udp_rebind_wakeups`): 0 failed |
+| `cargo test --release -p constellation-control` | 140 passed (schema current) |
+| harness `lock-grant-dead-generation` ×12 (prefix `sll`, `TMPDIR=/var/tmp/sll`) | **12/12 PASSED**, 5–7 s each (11.1–11.4 s with the margin) |
+| harness `p2p-*` once | `p2p-invalidation`, `-handover`, `-partition-tolerance`, `-same-identity-restart`, `-cluster-restart`, `-partition-one-node`: all PASSED |
+| harness `delegate*` once | `delegated-subtrees`, `delegate-crash`, `-crash-default-ttl`, `-partition`, `p2p-off-no-delegation`, `delegated-op-latency`, `delegate-crash-backup`, `-root-loss`, `-root-blackhole`, `-root-loss-ttl`, `-handoff-renewal`, `-backup-handoff-failover`: all PASSED |
+
+No `sll` containers or mounts were left.

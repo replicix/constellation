@@ -1436,6 +1436,15 @@ impl Core {
         &self.ship
     }
 
+    /// The peers whose link this core sees connected, for `status`.
+    pub fn connected_links(&self) -> Vec<NodeId> {
+        self.links
+            .values()
+            .filter(|l| l.connected)
+            .map(|l| l.node)
+            .collect()
+    }
+
     /// EC2 campaign 8 A-1: this node's own S3 path, for `status`.
     pub fn own_s3(&self) -> OwnS3 {
         self.own_s3

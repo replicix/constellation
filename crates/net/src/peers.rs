@@ -129,6 +129,15 @@ struct Inner {
     refresher: Mutex<Option<Refresher>>,
     /// One-shot latch for the shared-node-key misconfiguration warning.
     warned_shared_key: std::sync::atomic::AtomicBool,
+    /// Bumped whenever a peer enters or leaves the directory or its
+    /// `connected` flag flips (see [`Peers::links_changed`]).
+    links: tokio::sync::watch::Sender<u64>,
+}
+
+impl Inner {
+    fn links_changed(&self) {
+        self.links.send_modify(|v| *v = v.wrapping_add(1));
+    }
 }
 
 impl Peers {
@@ -146,6 +155,7 @@ impl Peers {
             ids: Mutex::new(HashMap::new()),
             refresher: Mutex::new(None),
             warned_shared_key: std::sync::atomic::AtomicBool::new(false),
+            links: tokio::sync::watch::Sender::new(0),
         });
         // A dead pooled connection was just evicted (the peer crashed,
         // or restarted under the same key) and every connection to it
@@ -162,13 +172,16 @@ impl Peers {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
-            let node = {
+            let (node, flipped) = {
                 let mut map = inner.peers.lock().unwrap();
-                map.values_mut().find(|p| p.addr.id == endpoint).map(|p| {
-                    p.connected = false;
-                    p.node_id
-                })
+                map.values_mut()
+                    .find(|p| p.addr.id == endpoint)
+                    .map(|p| (Some(p.node_id), std::mem::replace(&mut p.connected, false)))
+                    .unwrap_or((None, false))
             };
+            if flipped {
+                inner.links_changed();
+            }
             if let (Some(node), Ok(rt)) = (node, tokio::runtime::Handle::try_current()) {
                 let peers = Peers { inner: Some(inner) };
                 let rejoin = peers.clone();
@@ -319,7 +332,46 @@ impl Peers {
         }
         inner.p2p.set_allowed(allowed);
         *inner.ids.lock().unwrap() = ids;
-        *inner.peers.lock().unwrap() = peers;
+        let enrolled: Vec<u64> = {
+            let mut map = inner.peers.lock().unwrap();
+            let enrolled = peers
+                .keys()
+                .filter(|id| !map.contains_key(id))
+                .copied()
+                .collect();
+            let left = map.keys().any(|id| !peers.contains_key(id));
+            *map = peers;
+            if left {
+                inner.links_changed();
+            }
+            enrolled
+        };
+        if enrolled.is_empty() {
+            return;
+        }
+        // A peer just enrolled. Its first connection may already be up
+        // (it dialed us, which is what had the registry re-read), but
+        // nothing would mark it connected before a gossip neighbor-up or
+        // the next registry-tick probe, up to 5 s away: the authority
+        // core would route around it meanwhile (`startup-link-lag`). Probe
+        // it now; the answer flips `connected` and wakes the watchers.
+        inner.links_changed();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            for node in enrolled {
+                let peers = self.clone();
+                rt.spawn(async move {
+                    let _ = peers.ping_node(node).await;
+                });
+            }
+        }
+    }
+
+    /// A receiver that is marked changed whenever a peer enrols or leaves
+    /// the directory or its `connected` flag flips, so a consumer of
+    /// [`Self::snapshot`] (the authority driver's link view) need not
+    /// wait for its next poll. `None` when P2P is off.
+    pub fn links_changed(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.inner.as_ref()?.links.subscribe())
     }
 
     /// Install the callback used to re-read the registry when an unknown
@@ -610,7 +662,9 @@ impl Peers {
             return;
         };
         if let Some(p) = inner.peers.lock().unwrap().get_mut(&node_id) {
-            p.connected = ok;
+            if std::mem::replace(&mut p.connected, ok) != ok {
+                inner.links_changed();
+            }
             if ok {
                 if !took.is_zero() {
                     p.rtt_ms = Some(took.as_millis() as u64);
@@ -642,7 +696,9 @@ impl Peers {
         };
         let mut map = inner.peers.lock().unwrap();
         if let Some(p) = map.values_mut().find(|p| p.addr.id == endpoint) {
-            p.connected = up;
+            if std::mem::replace(&mut p.connected, up) != up {
+                inner.links_changed();
+            }
             if up {
                 p.last_seen = Some(Instant::now());
             }
@@ -2709,6 +2765,64 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(tracked(&holder), 2, "and the admitted gossip connection");
+    }
+
+    /// `startup-link-lag`: a peer that enrols (here: its dial had the
+    /// holder re-read the registry) is probed at once, so it shows
+    /// connected within a round trip, and the links watch fires for its
+    /// enrolment and for its link coming up. Before, nothing marked it
+    /// connected until a gossip neighbor-up or the next registry-tick
+    /// probe, and the authority driver saw it on its next 1 s tick.
+    #[tokio::test]
+    async fn a_newly_enrolled_peer_is_probed_and_announced_at_once() {
+        let topic = crate::topic_for(Some(&[6u8; 32]), "fs");
+        let holder_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let holder_addr = holder_p2p.addr();
+        let holder_key = holder_p2p.pubkey_hex();
+        let holder = Peers::new(holder_p2p, 1);
+        let asker_p2p = P2p::spawn(iroh::SecretKey::generate(), topic)
+            .await
+            .unwrap();
+        let asker_addr = asker_p2p.addr();
+        let asker_key = asker_p2p.pubkey_hex();
+        let asker = Peers::new(asker_p2p, 2);
+        let registry = vec![
+            (1, holder_key, serde_json::to_value(&holder_addr).unwrap()),
+            (2, asker_key, serde_json::to_value(&asker_addr).unwrap()),
+        ];
+        holder.refresh_registry(vec![registry[0].clone()]);
+        {
+            let (peers, registry) = (holder.clone(), registry.clone());
+            holder.set_refresher(Arc::new(move || {
+                peers.refresh_registry(registry.clone());
+                Box::pin(async {})
+            }));
+        }
+        asker.refresh_registry(registry);
+        for peers in [&holder, &asker] {
+            let (serving, svc) = (peers.clone(), Arc::new(Recorder::default()));
+            tokio::spawn(async move { serving.serve(svc).await });
+        }
+        let mut links = holder.links_changed().unwrap();
+        let before = *links.borrow_and_update();
+        let _ = asker.request_lease("p0", None).await;
+        let started = std::time::Instant::now();
+        let connected = |p: &Peers| p.snapshot().iter().any(|p| p.node_id == 2 && p.connected);
+        while !connected(&holder) {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "the enrolled peer was not probed: {:?}",
+                holder.snapshot()
+            );
+            tokio::time::timeout(Duration::from_millis(100), links.changed())
+                .await
+                .ok();
+        }
+        // Once for the enrolment, once for the link coming up.
+        let bumps = links.borrow().wrapping_sub(before);
+        assert!(bumps >= 2, "the links watch fired {bumps} times");
     }
 
     /// A request that names a node other than the one enrolled under its

@@ -215,6 +215,7 @@ impl EngineControl {
                 s3: false,
                 path,
                 paths: paths::status(self.peers.path_summary(p.node_id)),
+                core_connected: core.connected_links.contains(&p.node_id),
             }
         }));
         let p2p = api::P2pStatus {

@@ -84,6 +84,18 @@ A forward goes to the owner. A node with a stale table that sends an op
 to the wrong node gets `NotHolder` with the right owner, and follows up
 to two redirects (a delegate names the root, the root names a delegate).
 
+Routing uses the links the authority core sees. A node with no link to
+the delegate sends the op to the root. The root redirects to the
+delegate only while its own link to it is up; otherwise it recalls the
+generation (see [Cross-subtree operations and recall](#cross-subtree-operations-and-recall)).
+The driver sends the core its links every second, and again as soon as
+a peer enrols or leaves or a link goes up or down. A newly enrolled peer
+is probed at once, so its link shows within a round trip. Before, a
+peer could be invisible to the core for up to a second after it
+enrolled, and a write into a delegation made to it in that second was
+recalled (`startup-link-lag`). `p2p.peers[].core_connected` in
+`constellation status` shows the core's view of each link.
+
 ### How a delegate executes
 
 A delegate validates each op against its own replica. That replica is
