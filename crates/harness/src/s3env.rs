@@ -56,6 +56,21 @@ pub(crate) fn prefix_in_use(prefix: &str) -> bool {
     PrefixLock::acquire(prefix).is_err()
 }
 
+/// The docker prefix's lock, held by a run that creates prefixed
+/// containers without an [`S3Env`] (`harness k8s-scenario`): released when
+/// dropped, or when the process dies.
+pub struct PrefixHold(#[allow(dead_code)] PrefixLock);
+
+/// Take the lock of [`docker_prefix`], or fail saying who has it: without
+/// it, any `harness run` of the default prefix sweeps this run's
+/// containers as leftovers.
+pub fn hold_prefix() -> Result<PrefixHold> {
+    let prefix = docker_prefix();
+    PrefixLock::acquire(&prefix)
+        .map(PrefixHold)
+        .with_context(|| format!("holding the docker prefix lock of {prefix:?}"))
+}
+
 /// Host-wide guard for one docker prefix, so two harness processes
 /// cannot quietly destroy each other's environment.
 ///

@@ -85,20 +85,32 @@ pub fn containers(own: &str) {
             return;
         };
         let rows = parse_rows(&text);
-        let mut prefixes = vec![own.to_string()];
-        if own != DEFAULT_PREFIX && !crate::s3env::prefix_in_use(DEFAULT_PREFIX) {
-            prefixes.push(DEFAULT_PREFIX.to_string());
-        }
-        for p in prefixes {
-            for r in owned_by(&rows, &p) {
-                eprintln!(
-                    "=== sweep: removing leftover container {} ({})",
-                    r.name, r.id
-                );
-                let _ = crate::docker::docker(&["rm", "-f", &r.id]);
-            }
+        for r in targets(&rows, own, DEFAULT_PREFIX, crate::s3env::prefix_in_use) {
+            eprintln!(
+                "=== sweep: removing leftover container {} ({})",
+                r.name, r.id
+            );
+            let _ = crate::docker::docker(&["rm", "-f", &r.id]);
         }
     });
+}
+
+/// The rows a run of prefix `own` removes: its own, and `default`'s
+/// unless `in_use` says a live run holds that prefix's lock.
+pub fn targets<'a>(
+    rows: &'a [Row],
+    own: &str,
+    default: &str,
+    in_use: impl Fn(&str) -> bool,
+) -> Vec<&'a Row> {
+    let mut prefixes = vec![own];
+    if own != default && !in_use(default) {
+        prefixes.push(default);
+    }
+    prefixes
+        .into_iter()
+        .flat_map(|p| owned_by(rows, p))
+        .collect()
 }
 
 fn temp_roots() -> Vec<PathBuf> {
@@ -213,6 +225,54 @@ pub fn mounts() {
 
 #[cfg(test)]
 mod tests {
+    /// A live `k8s-scenario` run holds its prefix lock (another process):
+    /// a sweep of another prefix, with that one as the default, leaves
+    /// its containers; once the holder is gone it takes them.
+    #[test]
+    fn a_held_k8s_lock_keeps_the_default_sweep_off_its_container() {
+        use std::io::{BufRead, Write};
+        const HOLD: &str = "HARNESS_TEST_SWEEP_HOLD";
+        const NAME: &str =
+            "sweep::tests::a_held_k8s_lock_keeps_the_default_sweep_off_its_container";
+        if std::env::var(HOLD).is_ok() {
+            let _lock = crate::s3env::hold_prefix().unwrap();
+            println!("held");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            return;
+        }
+        let default = format!("constellation-harness-sweeptest-{}", std::process::id());
+        let rows = vec![Row {
+            id: "1".into(),
+            name: "kind-k8s-floci-1-2".into(),
+            prefix: default.clone(),
+        }];
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--nocapture", "--quiet"])
+            .env(HOLD, "1")
+            .env("CONSTELLATION_HARNESS_DOCKER_PREFIX", &default)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut l = String::new();
+            assert!(out.read_line(&mut l).unwrap() > 0, "the holder died");
+            if l.trim() == "held" {
+                break;
+            }
+        }
+        let own = "constellation-harness-sweeptest-other";
+        let while_held = targets(&rows, own, &default, crate::s3env::prefix_in_use).len();
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let after = targets(&rows, own, &default, crate::s3env::prefix_in_use).len();
+        assert_eq!(while_held, 0, "swept a container of a held prefix");
+        assert_eq!(after, 1, "a free prefix's container is left");
+    }
+
     use super::*;
 
     fn row(name: &str, prefix: &str) -> Row {

@@ -44842,3 +44842,7 @@ cut was 0.2-1.7 s after the end.
   floci with a prefix of its own.
 - `--repeat N` on a kept cluster took ~65 s a round here (2 rounds 2m16s,
   4 rounds 4-5 min), so 4 rounds fit one 10-minute tool call.
+
+## Fix: `harness k8s-scenario` holds its docker prefix lock (`k8s-prefix-lock`, 2026-10-07)
+
+`k8s-scenario` labelled its floci with the docker prefix but never took the prefix lock, so a `harness run` on the default prefix swept it as a leftover mid-run (it killed two handoff runs). `k8s::run` (so `--all`, `--parity`, `--repeat`, `--keep`/`--kubeconfig` batches) now takes the lock (`s3env::hold_prefix`) before it creates anything and holds it until it returns; a second run or a `harness run` on the same prefix is refused up front (use `CONSTELLATION_HARNESS_DOCKER_PREFIX`). `--keep` keeps only the cluster: floci is removed at the end and the lock released; a killed run drops the lock with the process. `sweep::targets` factored out of `containers`; test `sweep::tests::a_held_k8s_lock_keeps_the_default_sweep_off_its_container` (holder in a second process). Docs in the `k8s.rs` module header.

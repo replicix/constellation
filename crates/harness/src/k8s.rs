@@ -30,6 +30,17 @@
 //! work, at one cluster. The run's own S3 container and namespaces carry
 //! the run id, so those do not collide.
 //!
+//! The run holds the docker prefix lock (`/tmp/.<prefix>.lock`, the
+//! prefix `$CONSTELLATION_HARNESS_DOCKER_PREFIX`, default
+//! `constellation-harness`) from before it creates anything until it
+//! returns, as `harness run` does: its floci carries the prefix label, so
+//! a `harness run` on the same prefix would otherwise sweep it as a
+//! leftover mid-run. The flip side: two runs (or a run and a `harness
+//! run`) on one prefix are refused; give each its own prefix. `--keep`
+//! keeps only the cluster: the floci container is removed when the run
+//! ends and the lock is released then (a killed run drops the lock with
+//! the process and leaves its floci for the next sweep of the prefix).
+//!
 //! SIGINT or SIGTERM stops the run in order ([`crate::interrupt`]): the
 //! running scenario fails at its next command, and the run removes what
 //! it created — its namespaces, StorageClasses and engine pods on a
@@ -2042,6 +2053,9 @@ pub fn run(opts: Opts) -> Result<()> {
         return finish(report, Vec::new(), skipped);
     }
 
+    // Its floci carries the docker prefix label, so without the prefix
+    // lock any `harness run` of the default prefix sweeps it mid-run.
+    let _prefix_lock = crate::s3env::hold_prefix()?;
     interrupt::install().context("installing the SIGINT/SIGTERM handler")?;
     let setup = repo_root()
         .and_then(|root| {
