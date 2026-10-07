@@ -2342,7 +2342,15 @@ pub(crate) mod tests {
     async fn an_atime_only_change_is_skipped() {
         let mut fx = Skip::new().await;
         let before = fx.node.meta.getattr(fx.f).unwrap().unwrap().atime_ns;
-        let now = crate::prune::now_unix_ms() as i64 * 1_000_000 + 1;
+        // Nanosecond clock: the bump's observation time must postdate the
+        // file's ctime, which has ns precision; a millisecond-truncated
+        // "now" can land before a ctime stamped in the same millisecond
+        // and the ctime guard then (correctly) refuses the bump.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+            + 1;
         let bump = [(fx.f, now, now)];
         let (applied, _) = fx.node.meta.apply_atime(&bump).unwrap();
         fx.node.meta.queue_atime(&bump).unwrap();

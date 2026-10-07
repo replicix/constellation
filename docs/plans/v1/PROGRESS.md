@@ -44585,3 +44585,10 @@ locked; `acquire` re-checks that the path still names the locked inode and
 retries otherwise, so no run locks an unlinked file). Crashed runs still
 leave an unlocked file. Gates: fmt, clippy `-D warnings` clean;
 `cargo test -p constellation-harness` ×20, 0 failures.
+- 2026-10-07 atime-flake: `snapshot_batch::tests::an_atime_only_change_is_skipped` built its bump's
+  observation time from a millisecond clock (`now_unix_ms()*1e6+1`); `apply_atime` guards on
+  `ctime_ns < time_ns`, and the file's ctime has ns precision, so a ctime stamped in the same
+  millisecond refused the bump (`applied == 1` / `after > before` failed). Product is right; the
+  test now uses a ns clock. Did not reproduce locally in 90 isolated runs (timing-dependent);
+  cause established from the guard. Gates: fmt, clippy `-D warnings` clean; test ×50, 0 failures;
+  `cargo test -p constellation-engine --lib` 599 passed.
