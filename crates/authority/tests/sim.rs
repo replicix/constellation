@@ -327,6 +327,7 @@ fn replay_seed() {
         Ok("shared-dir-faults") => shared_dir_faults_config(),
         Ok("long-delegated") => long_delegated_config(),
         Ok("long-delegated-backup") => long_delegated_backup_config(),
+        Ok("long-delegated-late-answers") => long_delegated_late_answers_config(),
         // Plan 30 §M14.
         Ok("locks") => locks_config(),
         Ok("locks-partition") => locks_partition_config(),
@@ -2642,6 +2643,7 @@ fn sweep_config() {
         "delegated-root-gone" => delegated_root_gone_config(),
         "delegated-delegate-restart" => delegated_delegate_restart_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
+        "long-delegated-late-answers" => long_delegated_late_answers_config(),
         "placement-hot" => placement_hot_config(),
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
@@ -3179,6 +3181,18 @@ fn long_delegated_backup_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::deleg_backup_core_config),
         ..long_delegated_config()
+    }
+}
+
+/// delegate-stream-acks (`stress-ng-fs-nodes`): `long-delegated-backup`
+/// with a root that answers every delegate batch and renewal 0.4–2.5 s
+/// late — past the delegate's request timeout (400 ms here; the
+/// production transport gave up after 2 s and 1 s), so most answers come
+/// after the batch was given up on and re-sent, and in any order.
+fn long_delegated_late_answers_config() -> SimConfig {
+    SimConfig {
+        deleg_answer_delay: (400, 2_500),
+        ..long_delegated_backup_config()
     }
 }
 
@@ -3957,6 +3971,29 @@ fn long_delegated() {
         start..start + seeds,
     );
     assert!(t.executed > 0);
+}
+
+/// delegate-stream-acks: `long-delegated-late-answers` passes, and is
+/// not vacuous: batches were given up on and re-sent, answers to them
+/// counted anyway, and every row reached the log (the run's own
+/// quiescence and history checks).
+#[test]
+fn delegate_answers_later_than_the_request_timeout_still_count() {
+    let (mut timeouts, mut unmatched, mut appended) = (0, 0, 0);
+    for seed in 0..12 {
+        let report = run_seed(seed, long_delegated_late_answers_config())
+            .unwrap_or_else(|e| panic!("long-delegated-late-answers seed {seed}: {e}"));
+        for s in report.stats.values() {
+            timeouts += s.deleg_stream_timeouts;
+            unmatched += s.deleg_stream_acks_unmatched;
+            appended += s.deleg_appended_txs;
+        }
+    }
+    eprintln!(
+        "late answers: {timeouts} batches given up on, {unmatched} answers to them counted, \
+         {appended} rows appended"
+    );
+    assert!(timeouts > 0 && unmatched > 0 && appended > 0);
 }
 
 // ===================================================================
@@ -5021,6 +5058,29 @@ fn regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982() {
             panic!(
                 "locks-unlinked-delegated-dbackup-random seed {seed}: {e}\n  replay with \
                  AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
+            )
+        });
+    }
+}
+
+/// delegate-stream-acks: `long-delegated-late-answers` seeds 45, 1381
+/// and 3498. 45: a takeover whose lease became usable only after the acquisition
+/// (its PUT slow) never learned the delegation table's generations, so
+/// the root executed ops under a live delegation as its own and refused
+/// the delegate's stream for good (`Core::deleg_root_sync_due`). 1381: a
+/// backup took the lease over 120 ms before its own forwarded create's
+/// deadline; the create was at log seq 15 but the new holder's journal
+/// was not durable yet, and the client heard `EIO` for a write that had
+/// landed (`Core::settled_outcome`). 3498 (main too): the marker
+/// watcher read a stream-ahead row stranded by a takeover, waiting for
+/// its re-ship, as missing, where a read of it waits (`marker_watcher`).
+#[test]
+fn regression_long_delegated_late_answers_seeds_45_1381_3498() {
+    for seed in [45, 1381, 3498] {
+        run_seed(seed, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+            panic!(
+                "long-delegated-late-answers seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
             )
         });
     }

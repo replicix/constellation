@@ -8467,7 +8467,7 @@ mod locks {
 
     /// `d/turn.lock` (`f`) in a replica whose table delegates `d` to
     /// node 3 as generation 7; returns `(dir, f)`.
-    fn delegated_file(meta: &Meta) -> (Ino, Ino) {
+    pub(super) fn delegated_file(meta: &Meta) -> (Ino, Ino) {
         let dir = meta.allocate_ino(ROOT_INO).unwrap();
         let f = meta.allocate_ino(dir).unwrap();
         crate::replica::Replica::apply_segment(
@@ -8653,6 +8653,7 @@ mod locks {
                 msg: PeerMsg::DelegRenew {
                     req: OpId(98),
                     gen: 7,
+                    round: 1,
                     backup: None,
                     stream_head: 0,
                     stream_head_at: 0,
@@ -8678,6 +8679,7 @@ mod locks {
                 msg: PeerMsg::DelegateStream {
                     req: OpId(req),
                     gen: 7,
+                    round: 1,
                     txs: vec![constellation_meta::DelegateTx {
                         idx: 1,
                         rid: None,
@@ -8820,7 +8822,7 @@ mod locks {
         let mut out = Vec::new();
         h.core.delegation_sync(h.now, &h.meta, &mut out);
         let req = renew_req(&out, 7).expect("no renewal on install");
-        h.step(super::renewed(req, 7, 5_000));
+        h.step(super::renewed(&h, req, 7, 5_000));
         let f = h.meta.allocate_ino(dir).unwrap();
         let create = MutateOp::Create {
             parent: dir,
@@ -8849,11 +8851,12 @@ mod locks {
                 PeerMsg::DelegateStream {
                     req,
                     gen: 7,
+                    round,
                     txs,
                     leaving,
                     ..
                 } if to == 1 => Some((
-                    *req,
+                    (*req, *round),
                     txs.last().map(|t| t.idx).unwrap_or(0),
                     leaving.clone(),
                 )),
@@ -8862,13 +8865,14 @@ mod locks {
         };
         // The create's batch, acknowledged: the unlink goes out in a
         // batch of its own.
-        if let Some((req, last, leaving)) = batch(&created) {
+        if let Some(((req, round), last, leaving)) = batch(&created) {
             assert!(leaving.is_empty(), "{leaving:?}");
             h.step(Event::Peer {
                 from: 1,
                 msg: PeerMsg::DelegateStreamAck {
                     req,
                     gen: 7,
+                    round,
                     through: last,
                     refused: false,
                 },
@@ -8884,7 +8888,7 @@ mod locks {
             },
             tag: Default::default(),
         });
-        let (sreq, last, leaving) = batch(&out).expect("the unlink not streamed");
+        let ((sreq, round), last, leaving) = batch(&out).expect("the unlink not streamed");
         assert_eq!(
             leaving.iter().map(|g| (g.id, g.ino)).collect::<Vec<_>>(),
             vec![(id, f)],
@@ -8899,6 +8903,7 @@ mod locks {
             msg: PeerMsg::DelegateStreamAck {
                 req: sreq,
                 gen: 7,
+                round,
                 through: last,
                 refused: false,
             },
@@ -8927,7 +8932,7 @@ mod locks {
         let mut out = Vec::new();
         h.core.delegation_sync(h.now, &h.meta, &mut out);
         let req = renew_req(&out, 7).expect("no renewal on install");
-        h.step(super::renewed(req, 7, 5_000));
+        h.step(super::renewed(&h, req, 7, 5_000));
         let f = h.meta.allocate_ino(dir).unwrap();
         let rid = h.rid(1);
         h.step(Event::Submit {
@@ -9042,6 +9047,7 @@ mod locks {
             msg: PeerMsg::DelegRenew {
                 req: OpId(98),
                 gen: 7,
+                round: 1,
                 backup: None,
                 stream_head: 0,
                 stream_head_at: 0,
@@ -9054,6 +9060,7 @@ mod locks {
             msg: PeerMsg::DelegateStream {
                 req: OpId(50),
                 gen: 7,
+                round: 1,
                 txs: vec![constellation_meta::DelegateTx {
                     idx: 1,
                     rid: None,
@@ -11150,6 +11157,7 @@ mod locks {
             msg: PeerMsg::DelegRenew {
                 req: OpId(req),
                 gen: 7,
+                round: 0,
                 backup: None,
                 stream_head: head,
                 stream_head_at: at,
@@ -11600,11 +11608,13 @@ mod locks {
         );
         let renewal = |out: &[Action]| {
             sends(out).into_iter().find_map(|(to, m)| match m {
-                PeerMsg::DelegRenew { req, gen: 7, .. } if to == 1 => Some(*req),
+                PeerMsg::DelegRenew {
+                    req, gen: 7, round, ..
+                } if to == 1 => Some((*req, *round)),
                 _ => None,
             })
         };
-        let Some(req) = renewal(&out) else {
+        let Some((req, round)) = renewal(&out) else {
             panic!("no cut asked for: {out:?}")
         };
         let answer = |req: OpId, cut_at: i64, cut: Position| Event::Peer {
@@ -11612,6 +11622,7 @@ mod locks {
             msg: PeerMsg::DelegRenewed {
                 req,
                 gen: 7,
+                round,
                 ttl_ms: 20_000,
                 locks: Vec::new(),
                 lock_grace_ms: 0,
@@ -11632,7 +11643,7 @@ mod locks {
         h.advance(10);
         let out = request(&mut h, 4, 9, f, X, true);
         assert!(grant_to(&out, 4).is_none(), "{out:?}");
-        let Some(req) = renewal(&out) else {
+        let Some((req, _)) = renewal(&out) else {
             panic!("no fresher cut asked for: {out:?}")
         };
         h.advance(10);
@@ -11692,6 +11703,7 @@ mod locks {
             msg: PeerMsg::DelegateStream {
                 req: OpId(50),
                 gen: 7,
+                round: 0,
                 txs: vec![constellation_meta::DelegateTx {
                     idx: 1,
                     rid: None,
@@ -18602,12 +18614,19 @@ fn renew_req(out: &[Action], gen: u64) -> Option<OpId> {
     })
 }
 
-fn renewed(req: OpId, gen: u64, ttl_ms: u64) -> Event {
+/// This delegate's stream round of `gen` (every answer echoes it).
+fn round_of(h: &Harness, gen: u64) -> u64 {
+    h.core.dl.mine.get(&gen).map_or(0, |d| d.stream_round)
+}
+
+/// The root's (node 1's) answer to `h`'s renewal `req`.
+fn renewed(h: &Harness, req: OpId, gen: u64, ttl_ms: u64) -> Event {
     Event::Peer {
         from: 1,
         msg: PeerMsg::DelegRenewed {
             req,
             gen,
+            round: round_of(h, gen),
             ttl_ms,
             locks: Vec::new(),
             lock_grace_ms: 0,
@@ -18655,7 +18674,7 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
         manual_horizon: false,
     };
     h.advance(2);
-    h.step(renewed(req, 7, 5_000));
+    h.step(renewed(&h, req, 7, 5_000));
     assert!(
         h.core.dl.mine[&7].until > h.now,
         "the renewal was not honoured"
@@ -18709,7 +18728,7 @@ fn a_delegates_late_answers_still_count() {
     let req = renew_req(&out, 7).expect("no renewal on install");
     let ttl = 5_000;
     let margin = h.core.cfg.expiry_margin_ms;
-    let out = h.step(renewed(req, 7, ttl));
+    let out = h.step(renewed(&h, req, 7, ttl));
     let renew_timer = timers(&out, TimerKind::DelegRenew);
     assert_eq!(renew_timer.len(), 1, "{out:?}");
     let batch = |out: &[Action]| {
@@ -18756,6 +18775,7 @@ fn a_delegates_late_answers_still_count() {
         msg: PeerMsg::DelegateStreamAck {
             req: sreq,
             gen: 7,
+            round: round_of(&h, 7),
             through: last,
             refused: false,
         },
@@ -18773,7 +18793,7 @@ fn a_delegates_late_answers_still_count() {
     let again = renew_req(&out, 7).expect("not re-sent");
     assert_ne!(again, req);
     h.advance(700);
-    h.step(renewed(req, 7, ttl));
+    h.step(renewed(&h, req, 7, ttl));
     assert_eq!(
         h.core.dl.mine[&7].until,
         renew_sent.plus(ttl - margin),
@@ -18782,7 +18802,7 @@ fn a_delegates_late_answers_still_count() {
     // A late refusal leaves the generation to the renewal in flight.
     h.advance(h.core.deleg_request_timeout_ms());
     poke(&mut h);
-    h.step(renewed(again, 7, 0));
+    h.step(renewed(&h, again, 7, 0));
     assert!(!h.core.dl.mine[&7].stopped, "stopped on a late refusal");
 }
 
@@ -18803,12 +18823,16 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
     let mut out = Vec::new();
     h.core.delegation_sync(h.now, &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
-    h.step(renewed(req, 7, 5_000));
+    h.step(renewed(&h, req, 7, 5_000));
     let batch_to = |out: &[Action], root: NodeId| {
         sends(out).into_iter().find_map(|(to, m)| match m {
             PeerMsg::DelegateStream {
-                req, gen: 7, txs, ..
-            } if to == root => Some((*req, txs.last().map(|t| t.idx).unwrap_or(0))),
+                req,
+                gen: 7,
+                round,
+                txs,
+                ..
+            } if to == root => Some(((*req, *round), txs.last().map(|t| t.idx).unwrap_or(0))),
             _ => None,
         })
     };
@@ -18826,7 +18850,7 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
         },
         tag: Default::default(),
     });
-    let (sreq, last) = batch_to(&out, 1).expect("no batch streamed");
+    let ((sreq, sround), last) = batch_to(&out, 1).expect("no batch streamed");
     assert!(last > 0);
     let poke = |h: &mut Harness| {
         h.step(Event::Activity {
@@ -18846,8 +18870,9 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
     h.advance(100);
     h.core.lease.cached_holder = Some(1);
     let out = poke(&mut h);
-    let (again, _) = batch_to(&out, 1).expect("not re-streamed to R");
+    let ((again, round), _) = batch_to(&out, 1).expect("not re-streamed to R");
     assert_ne!(again, sreq);
+    assert_ne!(round, sround);
     assert_eq!(h.core.stats.deleg_restreams, 2);
     // R's late answer from its first tenure.
     h.advance(100);
@@ -18856,6 +18881,7 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
         msg: PeerMsg::DelegateStreamAck {
             req: sreq,
             gen: 7,
+            round: sround,
             through: last,
             refused: false,
         },
@@ -18870,11 +18896,455 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
         msg: PeerMsg::DelegateStreamAck {
             req: again,
             gen: 7,
+            round,
             through: last,
             refused: false,
         },
     });
     assert_eq!(h.core.dl.mine[&7].streamed_through, last);
+}
+
+/// delegate-stream-acks: a delegate of `/d` (generation 7, root node 1)
+/// whose first renewal was granted. `stream_one` executes a create under
+/// it and returns the batch that went out (`(req, round, last)`).
+fn streaming_delegate() -> (Harness, constellation_fs_core::Ino) {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    h.step(renewed(&h, req, 7, 5_000));
+    (h, dir)
+}
+
+/// The batch of generation 7 in `out` to `root`: `(req, round, first,
+/// last)`.
+fn stream_batch(out: &[Action], root: NodeId) -> Option<(OpId, u64, u64, u64)> {
+    sends(out).into_iter().find_map(|(to, m)| match m {
+        PeerMsg::DelegateStream {
+            req,
+            gen: 7,
+            round,
+            txs,
+            ..
+        } if to == root => Some((
+            *req,
+            *round,
+            txs.first().map(|t| t.idx).unwrap_or(0),
+            txs.last().map(|t| t.idx).unwrap_or(0),
+        )),
+        _ => None,
+    })
+}
+
+fn create_in(h: &mut Harness, dir: constellation_fs_core::Ino, seq: u64) -> Vec<Action> {
+    let rid = h.rid(seq);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: format!("f{seq}"),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    })
+}
+
+fn poke(h: &mut Harness) -> Vec<Action> {
+    h.step(Event::Activity {
+        last_write: Ms(0),
+        acked_seqs: Vec::new(),
+    })
+}
+
+fn stream_ack(from: NodeId, req: OpId, round: u64, through: u64) -> Event {
+    Event::Peer {
+        from,
+        msg: PeerMsg::DelegateStreamAck {
+            req,
+            gen: 7,
+            round,
+            through,
+            refused: false,
+        },
+    }
+}
+
+/// Give the batch in flight up and wait out the backoff until the stream
+/// re-sends (from the acknowledged cursor); the re-sent batch.
+fn resend(h: &mut Harness) -> (OpId, u64, u64, u64) {
+    h.advance(h.core.deleg_request_timeout_ms());
+    poke(h);
+    for _ in 0..20 {
+        h.advance(250);
+        if let Some(b) = stream_batch(&poke(h), 1) {
+            return b;
+        }
+    }
+    panic!("never re-sent");
+}
+
+/// delegate-stream-acks (`stress-ng-fs-nodes`): the root answers a batch
+/// after the delegate gave up on it and re-sent it. The batch and its
+/// answer are one-way messages now, so the answer is not lost to a
+/// request timeout; it is cumulative, so it counts although it names the
+/// batch given up on (and covers the re-send in flight), and the answer
+/// to the re-send (the same cursor) and a duplicate of either change
+/// nothing.
+#[test]
+fn a_stream_ack_after_the_resend_counts_and_duplicates_change_nothing() {
+    let (mut h, dir) = streaming_delegate();
+    let (first, round, _, last) = stream_batch(&create_in(&mut h, dir, 1), 1).expect("no batch");
+    let (again, again_round, from, again_last) = resend(&mut h);
+    assert_ne!(again, first);
+    assert_eq!((again_round, from, again_last), (round, 1, last));
+    assert_eq!(h.core.dl.mine[&7].streamed_through, 0);
+    // The answer to the batch given up on.
+    h.step(stream_ack(1, first, round, last));
+    let d = &h.core.dl.mine[&7];
+    assert_eq!(
+        d.streamed_through, last,
+        "the late acknowledgement did not count"
+    );
+    assert_eq!(h.core.stats.deleg_stream_acks_unmatched, 1);
+    // It covers the re-send in flight: the stream is free for the next
+    // row at once.
+    assert!(
+        d.inflight.is_none(),
+        "still waiting for the re-send's answer"
+    );
+    // Its duplicate, the re-send's answer, and that one's duplicate.
+    for (req, n) in [(first, 1), (again, 1), (again, 2)] {
+        let out = h.step(stream_ack(1, req, round, last));
+        assert!(
+            stream_batch(&out, 1).is_none(),
+            "re-sent on answer {n}: {out:?}"
+        );
+        assert_eq!(h.core.dl.mine[&7].streamed_through, last);
+    }
+    assert!(h.core.dl.mine[&7].inflight.is_none());
+    assert_eq!(h.core.stats.deleg_stream_acks_unmatched, 1);
+    // Nothing more is sent for rows the root has.
+    h.advance(5_000);
+    assert!(stream_batch(&poke(&mut h), 1).is_none());
+}
+
+/// delegate-stream-acks: the root's answers overtake each other (two
+/// connections' streams, or a queued batch and its re-send handled in
+/// either order): an earlier, shorter cursor arriving last never moves
+/// the delegate's acknowledged cursor back, and the next batch goes out
+/// from the furthest one.
+#[test]
+fn reordered_stream_acks_never_move_the_cursor_back() {
+    let (mut h, dir) = streaming_delegate();
+    let (first, round, _, one) = stream_batch(&create_in(&mut h, dir, 1), 1).expect("no batch");
+    // A second row while the first batch is in flight: the re-send
+    // carries both.
+    create_in(&mut h, dir, 2);
+    let (again, _, from, two) = resend(&mut h);
+    assert_eq!((from, two), (one, one + 1));
+    // The re-send's answer first, then the first batch's.
+    h.step(stream_ack(1, again, round, two));
+    assert_eq!(h.core.dl.mine[&7].streamed_through, two);
+    h.step(stream_ack(1, first, round, one));
+    assert_eq!(
+        h.core.dl.mine[&7].streamed_through, two,
+        "a reordered answer moved the cursor back"
+    );
+    // The next row streams from the furthest cursor.
+    let (_, _, from, _) = stream_batch(&create_in(&mut h, dir, 3), 1).expect("no batch");
+    assert_eq!(from, two + 1);
+}
+
+/// delegate-stream-acks: an answer counts only from the root this
+/// generation streams to, in the round it streams in. The root changes
+/// mid-stream (R → R2): R's answer, and R2's answer carrying R's round
+/// (an answer to a batch that reached R2 before the delegate learned it
+/// was the root), are dropped; R2's answer in its own round counts. A
+/// renewal granted by the old root (with its lock handoff) is dropped
+/// too.
+#[test]
+fn a_root_change_mid_stream_drops_the_old_rounds_answers() {
+    let (mut h, dir) = streaming_delegate();
+    let (first, round, _, last) = stream_batch(&create_in(&mut h, dir, 1), 1).expect("no batch");
+    let until = h.core.dl.mine[&7].until;
+    let renew_sent = h.now;
+    let out = h.step(Event::Timer {
+        id: h.core.dl.mine[&7].renew_timer.expect("no renewal timer"),
+    });
+    let renewal = renew_req(&out, 7).expect("no renewal");
+    // R2 is the root now: re-streamed from what the log carries.
+    h.advance(100);
+    h.core.lease.cached_holder = Some(2);
+    let (second, round2, from, _) = stream_batch(&poke(&mut h), 2).expect("not re-streamed");
+    assert_eq!(from, 1);
+    assert_ne!(round2, round);
+    for (root, req, r) in [(1, first, round), (2, first, round), (1, second, round2)] {
+        h.step(stream_ack(root, req, r, last));
+        assert_eq!(
+            h.core.dl.mine[&7].streamed_through, 0,
+            "credited node {root}'s answer in round {r}"
+        );
+    }
+    assert_eq!(h.core.stats.deleg_stream_acks_stale, 3);
+    // R's grant of the renewal sent before the change, with a lock
+    // handoff: neither counts.
+    let f = h.meta.allocate_ino(dir).unwrap();
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegRenewed {
+            req: renewal,
+            gen: 7,
+            round,
+            ttl_ms: 5_000,
+            locks: vec![constellation_meta::locks::Grant {
+                id: constellation_meta::locks::GrantId { node: 1, seq: 9 },
+                node: 4,
+                ino: f,
+                mode: constellation_meta::locks::LockMode::Exclusive,
+                until_ms: h.now.0 + 5_000,
+                recalled: false,
+                gen: 0,
+                confirmed_ms: constellation_meta::locks::Grant::MINTED,
+            }],
+            lock_grace_ms: 0,
+            lock_floor: Default::default(),
+            lock_cut_at: 0,
+            lock_cut: Default::default(),
+            lock_barrier: 0,
+        },
+    });
+    assert_eq!(
+        h.core.dl.mine[&7].until, until,
+        "the old root's grant counted"
+    );
+    assert!(
+        h.meta
+            .locks()
+            .get(constellation_meta::locks::GrantId { node: 1, seq: 9 })
+            .is_none(),
+        "the old root's lock handoff installed"
+    );
+    assert!(h.now > renew_sent);
+    // R2's answer in its round counts.
+    h.step(stream_ack(2, second, round2, last));
+    assert_eq!(h.core.dl.mine[&7].streamed_through, last);
+}
+
+/// delegate-stream-acks: the root drops out of view and comes back (the
+/// same node). The gap may hide another tenure, so the round changes and
+/// the batch in flight, answered in the old round, is stale: the stream
+/// sends again at once in the new round rather than after the batch's
+/// timeout and a backoff; the old round's answer counts for nothing.
+#[test]
+fn a_root_lost_from_view_restarts_the_batch_in_flight_at_once() {
+    let (mut h, dir) = streaming_delegate();
+    let (first, round, _, last) = stream_batch(&create_in(&mut h, dir, 1), 1).expect("no batch");
+    h.core.lease.cached_holder = None;
+    h.core.lease.last_seen = None;
+    assert!(stream_batch(&poke(&mut h), 1).is_none());
+    assert!(h.core.dl.mine[&7].inflight.is_none());
+    h.advance(10);
+    h.core.lease.cached_holder = Some(1);
+    let (again, round2, from, through) = stream_batch(&poke(&mut h), 1).expect("not re-sent");
+    assert_ne!(round2, round);
+    assert_eq!((from, through), (1, last));
+    h.step(stream_ack(1, first, round, last));
+    assert_eq!(
+        h.core.dl.mine[&7].streamed_through, 0,
+        "the old round counted"
+    );
+    h.step(stream_ack(1, again, round2, last));
+    assert_eq!(h.core.dl.mine[&7].streamed_through, last);
+}
+
+/// delegate-stream-acks: a late renewal answer for a generation this
+/// node no longer has (ended under the old root) counts for nothing:
+/// its lock cut, from the old root, never replaces the current root's
+/// newer one (the cut is replaced whenever it comes from another root).
+#[test]
+fn a_late_answer_for_an_ended_generation_leaves_the_cut() {
+    let (mut h, _dir) = streaming_delegate();
+    // R2 is the root now and its renewal carried its cut.
+    h.core.lease.cached_holder = Some(2);
+    poke(&mut h);
+    h.core.lk.cut = Some((2, 100, Default::default()));
+    // R's late answer for generation 6, which ended here.
+    assert!(!h.core.dl.mine.contains_key(&6));
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegRenewed {
+            req: OpId(9_999),
+            gen: 6,
+            round: 1,
+            ttl_ms: 5_000,
+            locks: Vec::new(),
+            lock_grace_ms: 0,
+            lock_floor: Default::default(),
+            lock_cut_at: 500,
+            lock_cut: Default::default(),
+            lock_barrier: 0,
+        },
+    });
+    let (root, at, _) = h.core.lk.cut.expect("the cut is gone");
+    assert_eq!((root, at), (2, 100), "the old root's cut replaced R2's");
+    assert_eq!(h.core.stats.deleg_renewed_stale, 1);
+}
+
+/// delegate-stream-acks: request ids start over at a restart, so an
+/// answer to this node's previous incarnation could name a request of
+/// this one. The round carries the incarnation: the old grant does not
+/// count for the new renewal with the same id.
+#[test]
+fn an_answer_to_a_previous_incarnation_does_not_count() {
+    let install = |incarnation: u32| {
+        let mut h = Harness::new(3);
+        h.core.cfg.incarnation = incarnation;
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        delegated_to_me(&h.meta, 3);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let req = renew_req(&out, 7).expect("no renewal on install");
+        (h, req)
+    };
+    let (old, old_req) = install(1);
+    let (mut h, req) = install(2);
+    assert_eq!(req, old_req, "the ids are reused (the case under test)");
+    let old_round = round_of(&old, 7);
+    assert_ne!(old_round, round_of(&h, 7));
+    h.step(Event::Peer {
+        from: 1,
+        msg: PeerMsg::DelegRenewed {
+            req,
+            gen: 7,
+            round: old_round,
+            ttl_ms: 5_000,
+            locks: Vec::new(),
+            lock_grace_ms: 0,
+            lock_floor: Default::default(),
+            lock_cut_at: 0,
+            lock_cut: Default::default(),
+            lock_barrier: 0,
+        },
+    });
+    assert_eq!(h.core.dl.mine[&7].until, Ms(0), "renewed by an old answer");
+    h.step(renewed(&h, req, 7, 5_000));
+    assert!(h.core.dl.mine[&7].until > h.now);
+}
+
+/// delegate-stream-acks (`stress-ng-fs-nodes`): the root sealed a live
+/// delegate whose renewals it handled late, at the very cursor the
+/// delegate was re-streaming from. A batch is a sign of life like a
+/// renewal: while batches come (re-sends of rows the root has included)
+/// the generation is neither sealed through its backup nor reclaimed;
+/// once they and the renewals stop, it is sealed when the grant's window
+/// has passed, as before.
+#[test]
+fn a_root_seals_a_delegate_only_on_real_silence() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.cfg.delegation_ttl_ms = 1_000;
+    h.hold(1, None);
+    let (dir, _) = locks::delegated_file(&h.meta);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    assert!(h.core.dl.gens.contains_key(&7));
+    h.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::DelegRenew {
+            req: OpId(1),
+            gen: 7,
+            round: 1,
+            backup: Some(4),
+            stream_head: 0,
+            stream_head_at: 0,
+        },
+    });
+    let sub = h.meta.allocate_ino(dir).unwrap();
+    let batch = |req: u64| Event::Peer {
+        from: 3,
+        msg: PeerMsg::DelegateStream {
+            req: OpId(req),
+            gen: 7,
+            round: 1,
+            txs: vec![constellation_meta::DelegateTx {
+                idx: 1,
+                rid: None,
+                records: vec![LogRecord::Mkdir {
+                    parent: dir,
+                    name: "sub".into(),
+                    ino: sub,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 5,
+                }],
+                deps: Default::default(),
+            }],
+            leaving: Vec::new(),
+            leaving_barriers: Vec::new(),
+        },
+    };
+    // Fire every delegation expiry that is due; whether one sealed.
+    let fire = |h: &mut Harness| -> bool {
+        let due: Vec<TimerId> = h
+            .core
+            .timers
+            .iter()
+            .filter(|(_, (t, at))| matches!(t, Timer::DelegExpiry(7)) && *at <= h.now)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut sealed = false;
+        for id in due {
+            let out = h.step(Event::Timer { id });
+            sealed |= sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 4 && matches!(m, PeerMsg::DelegSeal { gen: 7, .. }));
+        }
+        sealed
+    };
+    // No renewal for three windows, the same batch every 500 ms (its
+    // first copy appended, the rest re-sends).
+    for i in 0..12u64 {
+        h.advance(500);
+        let out = h.step(batch(10 + i));
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 3
+                && matches!(
+                    m,
+                    PeerMsg::DelegateStreamAck {
+                        through: 1,
+                        refused: false,
+                        round: 1,
+                        ..
+                    }
+                )),
+            "not acknowledged: {out:?}"
+        );
+        assert!(!fire(&mut h), "sealed a delegate streaming to it");
+        assert!(!h.core.dl.gens[&7].ended);
+    }
+    assert!(h.core.stats.deleg_live_by_stream > 0);
+    // Silence: sealed once the window passed. (The root's lease renewed,
+    // as its holder would.)
+    h.hold(1, None);
+    let mut sealed = false;
+    for _ in 0..10 {
+        h.advance(500);
+        sealed |= fire(&mut h);
+    }
+    assert!(sealed, "a silent delegate never sealed");
 }
 
 /// A delegate of `/d` (generation 7, root node 1) whose renewal was
@@ -18892,7 +19362,7 @@ fn delegate_parked_on_a_silent_root() -> (Harness, constellation_fs_core::Ino, R
     let req = renew_req(&out, 7).expect("no renewal on install");
     let ttl = 5_000;
     let margin = h.core.cfg.expiry_margin_ms;
-    let out = h.step(renewed(req, 7, ttl));
+    let out = h.step(renewed(&h, req, 7, ttl));
     let until = h.core.dl.mine[&7].until;
     assert_eq!(until, h.now.plus(ttl - margin));
     let lapse = timers(&out, TimerKind::DelegLapse);
@@ -19020,7 +19490,7 @@ fn a_lapsed_delegation_renewed_before_the_reclaim_executes_again() {
     let out = out_of_renew_timer(&mut h);
     let req = renew_req(&out, 7).unwrap();
     h.advance(2);
-    h.step(renewed(req, 7, 5_000));
+    h.step(renewed(&h, req, 7, 5_000));
     let d = &h.core.dl.mine[&7];
     assert!(!d.lapsed && !d.stopped && d.until > h.now, "{d:?}");
     let rid = h.rid(3);
@@ -19048,7 +19518,7 @@ fn a_lapsed_delegation_renewed_before_the_reclaim_executes_again() {
     h.step(Event::Timer { id: lapse });
     let out = out_of_renew_timer(&mut h);
     let req = renew_req(&out, 7).unwrap();
-    h.step(renewed(req, 7, 0));
+    h.step(renewed(&h, req, 7, 0));
     let d = &h.core.dl.mine[&7];
     assert!(d.stopped, "{d:?}");
     assert!(d.renew_timer.is_none());

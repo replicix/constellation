@@ -36,6 +36,8 @@ pub struct Bus {
     /// Plan 30 M0's `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS`: extra
     /// delay on a holder's `MutateReply`s, per sender.
     reply_delay: Mutex<HashMap<NodeId, u64>>,
+    /// `SimConfig::deleg_answer_delay`.
+    deleg_answer_delay: Mutex<(u64, u64)>,
     pub sent: Mutex<u64>,
     pub dropped: Mutex<u64>,
     /// M7: per (from, to) lane, when its last frame is delivered.
@@ -71,6 +73,7 @@ impl Bus {
             dead: Mutex::new(HashSet::new()),
             senders: Mutex::new(BTreeMap::new()),
             reply_delay: Mutex::new(HashMap::new()),
+            deleg_answer_delay: Mutex::new((0, 0)),
             sent: Mutex::new(0),
             dropped: Mutex::new(0),
             lanes: Mutex::new(HashMap::new()),
@@ -127,6 +130,10 @@ impl Bus {
             p.remove(&(a, b));
             p.remove(&(b, a));
         }
+    }
+
+    pub fn set_deleg_answer_delay(&self, range: (u64, u64)) {
+        *self.deleg_answer_delay.lock().unwrap() = range;
     }
 
     pub fn set_reply_delay(&self, node: NodeId, delay_ms: Option<u64>) {
@@ -189,6 +196,16 @@ impl Bus {
         if matches!(msg, PeerMsg::MutateReply { .. }) {
             if let Some(extra) = self.reply_delay.lock().unwrap().get(&from) {
                 delay += Duration::from_millis(*extra);
+            }
+        }
+        if matches!(
+            msg,
+            PeerMsg::DelegateStreamAck { .. } | PeerMsg::DelegRenewed { .. }
+        ) {
+            let (lo, hi) = *self.deleg_answer_delay.lock().unwrap();
+            if hi > 0 {
+                let extra = self.rng.lock().unwrap().random_range(lo..=hi);
+                delay += Duration::from_millis(extra);
             }
         }
         let deliverable = self.deliverable(from, to);

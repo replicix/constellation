@@ -44967,3 +44967,365 @@ compacts while it writes.
   `overload-cascade-2` deferred until this stall was fixed.
 
 - `lsm-followup` (2026-10-07): vendored lsm-tree — `StaleVersions::remove` now tries every stale version file and returns the first error (unit test with an injected failure); the version-change check under the history write lock is a `debug_assert!` plus an `Err` instead of an `assert_eq!` that would poison the lock; the `StaleVersions` re-export carries the `CONSTELLATION PATCH` marker and is listed in `vendor/lsm-tree/CONSTELLATION-PATCH.md`. Gates: lsm-tree tests (240+23), fjall lib (72), constellation-meta pass; vendored lsm-tree clippy `-D warnings` already fails on upstream code (34 lib errors; the `StaleVersions` re-export is flagged as an unused import, as before this change).
+
+## Fix: a delegate's stream batches and renewals no longer lose the root's late answer, and a tailed segment no longer rewinds a delegate's whole stream (`delegate-stream-acks`)
+
+Fix: stream batches, renewals and the root's answers are one-way
+messages (cumulative `through` per generation, tagged with the
+delegate's stream round), and a segment a delegate tails goes under its
+unappended stream transactions only where it overlaps them. Before, it
+rewound all of them for every segment, the delegate's core fell minutes
+behind the holder's log, and that, more than the transport timeouts, is
+what made its answers late. A delegate's driver serves the urgent lane
+(renewals, their answers, heartbeats) and its renewal and lapse timers
+before its internal channel, so a backlog of log-stream frames there no
+longer lapses its grant (review round).
+
+Base: main `4c5d184` (overload-cascade-2 merged). Host: 16 CPUs, kernel
+7.3.0-rc4, shared with other chunks (load 15–75 before a run, 100–125
+during one). Harness prefix `dsa`, `TMPDIR=/var/tmp/dsa`.
+
+### What changed
+
+| item | change | where |
+|---|---|---|
+| Wire | `DelegateStream`, `DelegRenew` and the root's `DelegateStreamAck`, `DelegRenewed` are one-way messages. The receiving bridge queues them for its core and answers `Ok` at once, so no stream slot waits on a core and no answer is lost to a request timeout. All four carry `round`; both answers carry the root's `from`. Changed in place, no version bump | `net::message::Payload`, `net::peers::handle_stream`, `net::PeerService::{delegate_stream, delegate_stream_acked, deleg_renew, deleg_renewed}`, `engine::p2p`, `engine::sync::SyncRequest`, `Driver::one_way_reported` (a send that did not reach the root is `PeerFailed`) |
+| Stream round | `DelegateState::stream_round` = this node's incarnation in the high bits, plus a fresh op id at the install and at every re-stream to a new root. An answer counts only from the root the generation streams to, in its round. This covers R → R2 → R, answers to a previous incarnation (whose request ids the new one reuses) and an old root's renewal and lock handoff | `Core::deleg_new_round`, `on_delegate_stream_ack`, `on_deleg_renewed` |
+| Cumulative acknowledgement | An ack counts whenever it comes in its round: for a batch given up on and re-sent, overtaken by another answer, or duplicated. It never moves the cursor back, and one that covers the batch in flight frees it. A refusal counts only for the batch in flight. The `LateReq` path for stream batches is gone (renewals and backup appends keep it) | `on_delegate_stream_ack`, `deleg_expire_inflight` |
+| Liveness | A batch from the generation's delegate counts as a sign of life, like a renewal: the root's `until` moves (never during a recall), so it neither outwaits nor seals a delegate that is streaming to it. The delegate still honours its grant from its renewals only | `Core::deleg_live_by_stream`, `GenState::renewed_until`, stat `deleg_live_by_stream` |
+| Rewind cost (the stall's main cause) | `Meta::apply_segment_rows` puts a segment under the delegate's `Local` rows (gen ≠ 0) only from the oldest one whose touches it overlaps. With none it applies on top, captured as a `Foreign` row, which is B-2's rule for other speculation applied to delegate rows. A delegate's keys are its subtree's: the log changes them only through its own rows (skipped, or rolled back with their row) or after a `Recall`, which strands them. A holder's own rows (gen 0) keep the unconditional rewind | `meta::store::spec::apply_segment_rows` |
+| Driver lanes (review round) | `Driver::run` serves the urgent lane first, then a new prompt lane carrying a delegate's `DelegRenew` and `DelegLapse` timers, then the internal channel, then the ordinary requests. Before, the internal channel came first and a delegate's renewal timer and the root's renewal answer waited behind its frame backlog | `Driver::run`, `prompt_timer`, `Driver::{prompt_tx, prompt_rx}` |
+| Found by the new sim config | (a) seed 45: a takeover whose lease became usable only after acquisition never learned the delegation table; the table is synced again whenever this node is a usable root and the last sync did not find it one. (b) seed 1381: a holder's settled row that is already in an applied segment is answered as a non-holder's would be, not held for its journal | `Core::deleg_root_sync_due`, `Core::settled_outcome` |
+| Diagnostics | Debug lines with the request id for every batch, ack, renewal and renewal answer. `core step profile` (debug, every 5 s): steps per event kind, time and max, plus each lane's deepest queue. It is what found the rewind cost | `core::delegate`, `engine::authority_driver::StepProfile` |
+| Docs | One-way answers and rounds, liveness by stream, and the delegate-row rewind rule | `delegations.md`, `cluster-locks.md`, `forwarded-mutations.md` |
+
+### Diagnosis
+
+The earlier attempt's runs of the one-way design (with a "piggyback":
+the root's latest answer returned on the delegate's next send) still
+failed: delegate seals 1–2, lapse discards 5–10, stalled requests 8–27,
+or `fenced_io` 13–19. With request ids in every log line, the answers
+reached the delegate's P2P bridge within milliseconds, then waited in its
+own queues. The step profile showed why: on the delegate, each
+`LogStream` step took 100–400 ms against 1 ms before load. It held
+110–240 unappended stream transactions, and every tailed segment rolled
+all of them back and redid them (`rewind_tx` from the oldest `Local`
+row). At ~150 segments a second its internal queue reached 25 000 frames
+and its sync lane 26 000 entries (diag5: hung, killed at 600 s).
+Renewal timers, acks and renewal answers all queued behind the frames,
+so grants lapsed and the root sealed. With the conflict-only rewind, the
+same queues stay under ~300 (diag6, PASSED).
+
+Decisions:
+
+- **The piggyback is removed.** The answers were never stuck in
+  transport, so the answer cache in `OffCore` and the reply-carried
+  answer were complexity outside the brief's design.
+- **The rewind rule changes only for delegate rows.** For a holder's
+  rows, a late segment of the previous tenure can touch any key, and the
+  existing tests pin the rewind there. `TouchSet` misses some
+  non-commutative pairs (an `Rmdir` record carries no ino). A delegate
+  never meets them: a segment touching its subtree's keys comes from its
+  own rows or after a recall.
+- **Oracle change: the marker watcher waits as a read does**
+  (`long-delegated-late-answers` seed 3498). `marker_watcher`
+  (`tests/sim/run.rs`) no longer reports a missing data name while the
+  node's `replay_touches` is set for it: this weakens an existing oracle
+  (CONVENTIONS rule 4), on purpose. A takeover's marker segment stranded
+  a stream-ahead row on a non-holder. The paused successor re-shipped it
+  4.5 s later, and meanwhile the data row was queued for replay
+  (`Meta::replay_touches`). Every real reader waits there:
+  `meta::session_wait` waits on `replay_touches || durability_pending`
+  (`crates/meta/src/session.rs`), so no read returns the gap. The row is
+  not lost either: it is in the replay queue and lands when replayed, and
+  the watcher still reports it if it is missing once the queue no longer
+  holds it. Correction: the first round said main fails seed 3498
+  identically. That was not established. The config does not exist on
+  main, the review could not reproduce the claim, and this round did not
+  re-check it. 3498 is a seed that the oracle change makes pass, not a
+  failure shared with main.
+- **Control: main plus only the meta change PASSED `stress-ng-fs-nodes`
+  2 of 2** (max load 118.7 and 110.9, all counts 0). At this load the
+  rewind cost was the stall. The one-way design is kept because it is
+  the brief's decision and it closes the answer-loss mechanism on its
+  own. The new sim config failed seeds 45 and 1381 on the code before
+  this chunk (fixed by `deleg_root_sync_due` and `settled_outcome`), and
+  3498 before the oracle change above. It fails 0 here.
+
+### Tests
+
+- Core: `a_stream_ack_after_the_resend_counts_and_duplicates_change_nothing`
+  (a late ack after the resend timer, and duplicates),
+  `reordered_stream_acks_never_move_the_cursor_back`,
+  `a_root_change_mid_stream_drops_the_old_rounds_answers`,
+  `an_answer_to_a_previous_incarnation_does_not_count`,
+  `a_root_seals_a_delegate_only_on_real_silence`.
+- Meta: `holder_capture::a_segment_goes_under_a_delegates_stream_only_where_it_conflicts`
+  (no rewind elsewhere, a rewind on the subtree's directory, the replica
+  equals log order, and a `Recall` still strands from under both
+  segments; it fails with the old rule).
+- Sim: config `long-delegated-late-answers` (`long-delegated-backup` with
+  every `DelegateStreamAck` and `DelegRenewed` delayed 0.4–2.5 s, past
+  the 400 ms request timeout), test
+  `delegate_answers_later_than_the_request_timeout_still_count` (it is
+  not vacuous: timeouts, unmatched acks and appended rows are all > 0),
+  `regression_long_delegated_late_answers_seeds_45_1381_3498`.
+
+### Merge round: onto main `116ed70` (2026-10-07)
+
+Main gained `stale-read-outwaited`, `strand-takeover-quiescence`,
+`unlinked-exclusion-5681`, `lock-recall-unreachable`,
+`harness-teardown` and `takeover-marker-flake` since this chunk's base.
+Both designs are kept:
+
+- **Renewal cut fields on the one-way messages.** `DelegRenew` carries
+  `stream_head` and `stream_head_at` beside `round`: the head is filled
+  when the renewal leaves this node (`Core::lock_fill_renew_heads`) and
+  `stream_head_at` is the delegate's clock at that send, so the root
+  still takes a cut only from a renewal *sent* at or after the barrier.
+  The root's one-way `DelegRenewed` carries `lock_cut_at`, `lock_cut`
+  and `lock_barrier` beside `round`; `DelegateStream` carries
+  `leaving_barriers`, installed only once the batch's rows are applied
+  (as on main). Every layer carries them: `net::Payload`,
+  `PeerService::{delegate_stream, deleg_renew, deleg_renewed}`,
+  `engine::p2p`, `SyncRequest::{PeerDelegateStream, PeerDelegRenew,
+  PeerDelegRenewed}`, the driver's one-way sends. `sync::DelegRenewReply`
+  (the reply channel of the old request) is gone.
+- **Rounds and incarnations.** The stream round already holds
+  `cfg.incarnation` in its high bits, the same incarnation main's lock
+  requests carry; nothing else needed to change.
+- **The takeover-strand mark.** Unchanged: a marked generation executes
+  nothing more and a recall answers at the log's index; its re-sends are
+  refused (`g.ended`) and a refusal only backs the stream off.
+- **The seed-1918 handback filter is reverted.** Kept on the merged
+  tree, it made `locks-unlinked-delegated-random` seed 971 a stale read
+  (main passes it): node 3's grant had expired unreleased in delegate
+  node 2's table, the filter dropped it from the recall's handback, so
+  the root never outwaited it, set no barrier, and its next grant
+  carried gen 3 at 1 while node 3's acknowledged write was at 3. On main
+  the expired grant goes back, the root outwaits it, and the barrier
+  makes the next grant wait for the cut. Main passes 1918 without the
+  filter (`unlinked-exclusion-5681`: an expired record never keeps a
+  grant out), so `Core::lock_hand_back` is main's again and its core and
+  sim tests are removed.
+
+Gates on the merged tree:
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean.
+- `TMPDIR=/dev/shm/dsa cargo test --release -p constellation-authority
+  -p constellation-net -p constellation-engine` (also `-p
+  constellation-meta` once): authority 300 (+2 ignored) + 4 + sim 131
+  (+11 ignored), engine 599 (+9 ignored) + 1, net 121 + 1 + 2 + 1 + 3 +
+  1, meta 244 and its integration tests. 0 failed.
+- Sim `sweep_config` 0..3000, 0 failing in every config: all 30 lock
+  configs (`locks` through `locks-failover-backup-writes`, every
+  `locks-unlinked-delegated*` variant), `long-delegated-late-answers`,
+  `delegated-holder-cut`, `long-delegated`, `delegated-backup`,
+  `delegated-two-gens-root-crash`, `delegated-root-gone`,
+  `delegated-delegate-restart`, `long-delegated-backup`. The stale reads
+  and unsettled seeds listed below for the previous base are all gone
+  (main's fixes).
+- Harness, all 23 `backup-*`, `lock-*`, `delegate*` scenarios once: all
+  PASSED.
+- `stress-ng-fs-nodes` ×3 (`CHAOS_KEEP_TMP=1`, counts from the three
+  `mount.log`s; stalled = `a FUSE request is stalled` with
+  `first=true`):
+
+| run | max load | result | live-holder seals | delegate seals | lost grants | lapse discards | stalled requests | ERROR lines | `fenced_io` |
+|---|---|---|---|---|---|---|---|---|---|
+| m1 | 160.1 | PASSED (164 s) | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| m2 | 148.5 | PASSED (167 s) | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| m3 | 160.9 | PASSED (181 s) | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+### Gates (previous base `4c5d184`)
+
+- `cargo fmt --all -- --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean.
+- `TMPDIR=/dev/shm cargo test --release -p constellation-authority -p
+  constellation-net -p constellation-engine -p constellation-meta`:
+  authority 287 (+2 ignored) + sim 129 (+11 ignored), engine 599 (+9
+  ignored), meta 241 (+2) and its integration tests, net 121. 0 failed.
+- Sim `long-delegated-late-answers` 0..5000: 0 failing (3 before:
+  45, 1381, 3498; 3498 only with the old oracle, see above).
+- Sim 0..3000: `delegated-holder-cut`, `long-delegated`,
+  `delegated-backup`, `delegated-two-gens-root-crash`,
+  `delegated-root-gone`, `delegated-delegate-restart`,
+  `long-delegated-backup` and every `locks*` config: 0 failing,
+  except the variants with the known open classes, where no failure is
+  mutual exclusion. `-random`: 4 (935, 2716, 2877 as on main; 971 is new
+  here, the same class: the root restarted and granted while node 3's
+  acknowledged write was still in its generation's unappended rows).
+  `-dbackup-random`: 7 (276, 297, 1293, 1690, 2036 stale reads; 2477,
+  2982 no quiescence: round 3's set). `-partition`: 63 stale reads
+  (main 60; 44 seeds in common).
+- Harness, all 23 `backup-*`, `lock-*`, `delegate*` scenarios once: all
+  PASSED.
+- `stress-ng-fs-nodes` ×5 (counts from the daemon logs, all nodes):
+
+| run | max load | result | live-holder seals | delegate seals | lost grants | lapse discards | stalled requests |
+|---|---|---|---|---|---|---|---|
+| gate1 | 107.0 | PASSED (160 s) | 0 | 0 | 0 | 0 | 0 |
+| gate2 | 103.6 | PASSED (203 s) | 0 | 0 | 0 | 0 | 0 |
+| gate3 | 102.4 | PASSED (184 s) | 0 | 0 | 0 | 0 | 0 |
+| gate4 | 124.0 | PASSED (155 s) | 0 | 0 | 0 | 0 | 0 |
+| gate5 | 105.2 | PASSED (174 s) | 0 | 0 | 0 | 0 | 0 |
+
+  Also 0 `fenced_io`, 0 conflict copies, 0 ERROR lines and 0 ring
+  requests held past 30 s in every run. The gate is met: 5 of 5.
+
+### Review round (2026-10-07)
+
+Fix: a delegate's renewal path no longer waits behind its own internal
+lane. The driver serves the urgent lane first, and a delegate's renewal
+and lapse timers go on a prompt lane served before the internal channel.
+
+**The gate was not met on the merged tree.** The record above said
+`stress-ng-fs-nodes` was clean and nothing was open. The review's own
+×3 on this host had 1 failure:
+
+| run | load before→after | result | delegate seals | holder seals | lost grants | lapse discards | stalled requests | ERROR | `fenced_io` | delegation lapses |
+|---|---|---|---|---|---|---|---|---|---|---|
+| r1 | 91→72 | PASSED 173 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| r2 | 48→62 | **FAILED** 197 s | 0 | 0 | 0 | 0 | 3 (one op, 47 s) | 0 | 0 | 1 |
+| r3 | 2→27 | PASSED 235 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+The residual class, from r2's kept logs, is the delegate's own
+internal-lane backlog. It starved the renewal timer and the urgent-lane
+answers; no answer was lost. On delegate n2 a `flush` waited 46.9 s:
+its `SetManifest` parked because the delegation lapsed.
+
+- The grant ran until 17:54:24.9. The lapse timer due at 17:54:26.9 ran
+  17 s late.
+- The root's backup reconfiguration answer, sent at 17:54:26.0, reached
+  n2's core 21 s later.
+- The renewal counted at 17:54:48.2, and every parked op finished then.
+
+The root never sealed or reclaimed the generation, and nothing looped on
+re-sends. The mechanism was in the driver. `Driver::run` served
+`int_rx` first in a `biased` select. `Action::SetTimer` delivers through
+`int_tx`, and `DelegRenewed` arrives on the urgent lane, which came
+after it. A 17–20 s backlog of `LogStream`/`StreamAhead` frames (n2:
+`max_int_pending` 1640, at 3–8 ms each, with fjall compactions and
+journal rotations under it) therefore delayed both the `DelegRenew`
+timer (every ttl/4 = 5 s with grants out) and the root's one-way
+answers.
+
+Changes:
+
+- **Lane order (should-fix 1).** The select's order is now: urgent
+  lane, prompt lane (a delegate's `DelegRenew` and `DelegLapse` timers,
+  `prompt_timer`), internal channel, ordinary requests. No invariant
+  depended on the internal channel coming first:
+  - Peer messages are not ordered against each other in transit.
+  - A renewal answer or a heartbeat taken before an S3 result or a
+    frame is the same as one that arrived a moment earlier.
+  - A cut a `DelegRenewed` carries only settles barriers once the
+    replica reaches it (`lock_settle_barriers`), so it needs no frame
+    applied first.
+  - A renewal is built fresh at its send (`deleg_renew_now`,
+    `lock_fill_renew_heads`), so an earlier send reports a smaller head
+    and never claims more.
+  - The lapse still runs after the renewal answers already queued: the
+    urgent lane is served first.
+  - The root's grant expiry (`DelegExpiry`, `LockGrantExpiry`) stays on
+    the internal channel and still drains the urgent lane first
+    (`waits_for_renewals`).
+  - The urgent lane cannot starve the rest. It carries a handful of
+    cheap messages per peer per heartbeat or renewal period.
+
+  Test: `only_a_delegates_grant_timers_are_prompt`.
+- **Unknown-generation renewal answers (should-fix 3).**
+  `on_deleg_renewed` returns `false` for a generation not in `dl.mine`.
+  Before, it returned `true`, so `lock_take_cut` ran and replaced the
+  current root's newer cut with an old root's late one: a cut from
+  another root replaces whatever its time. Test:
+  `a_late_answer_for_an_ended_generation_leaves_the_cut` (fails with
+  the old arm).
+- **Stats (nit).** Stale renewal answers count in a new
+  `deleg_renewed_stale`, not in `deleg_stream_acks_stale`.
+- **Round bits (nit).** `deleg_new_round` names its 40 op bits and 24
+  incarnation bits. It `debug_assert`s both and masks the op id. Two
+  incarnations share the high bits only 2^24 restarts apart.
+- **Round on every root change (nit, kept, with its cost removed).** A
+  new round is still minted on Some→None→Some as well as on Some→Some.
+  It is not safe to drop:
+  - One-way answers count by root and round alone.
+  - `root_node` leaves this node out, so a gap in the root can hide a
+    tenure: this node's own, or another root's that this node never saw.
+  - Main bumped only on Some→Some, but its answers were matched to live
+    request ids.
+  - The cost was that the batch in flight waited out its timeout and a
+    backoff. Now every round change drops the batch in flight (its
+    answer is stale by construction) and clears the backoff, so the
+    stream sends again at once in the new round.
+  Test: `a_root_lost_from_view_restarts_the_batch_in_flight_at_once`.
+- Not changed: a root cursor behind `streamed_through` (a gap) still
+  re-sends at once with no backoff. This is the previous behaviour and
+  only happens after a root change.
+
+Gates (this round, `CARGO_TARGET_DIR` unset):
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean.
+- `TMPDIR=/dev/shm/dsa2 cargo test --release -p constellation-authority
+  -p constellation-meta -p constellation-net -p constellation-engine`:
+  0 failed (authority 302 + 4, sim 131 (+11 ignored), engine 600, meta
+  244 and its integration tests, net 121 and the rest).
+- Sim `sweep_config` 0..3000, 8 threads, `TMPDIR=/dev/shm`: 0 failing in
+  all 30 lock configs and in `delegated-holder-cut`, `long-delegated`,
+  `delegated-backup`, `delegated-two-gens-root-crash`,
+  `delegated-root-gone`, `delegated-delegate-restart`,
+  `long-delegated-backup` and `long-delegated-late-answers`.
+- The sweep's "grants lost" stat is non-zero in a few configs. The
+  oracle passes them, but no baseline for this stat was recorded
+  before, so these numbers are the baseline:
+
+  | config | grants lost |
+  |---|---|
+  | `locks-failover-backup` | 23 |
+  | `locks-failover-backup-writes` | 22 |
+  | `locks-unlinked-delegated-hcrash-backup` | 4 |
+  | `locks-unlinked-delegated-dbackup-random` | 4 |
+  | `locks-unlinked-delegated-random` | 1 |
+
+  Every other config is 0. All of these are crash and failover configs,
+  where a lost grant is fenced, not a double grant.
+- Harness, prefix `dsa2`, `TMPDIR=/var/tmp/dsa2`: all 11 `delegate*` and
+  all 6 `backup-*` scenarios PASSED once.
+- `stress-ng-fs-nodes` ×5 (`CHAOS_KEEP_TMP=1`, counts over the three
+  `mount.log`s; stalled = `stalled` lines with `first=true`; delegate
+  seals = "delegate silent: sealing its backup", "reclaiming an
+  unrenewed delegation" or "the backup sealed this delegation"; holder
+  seals = a backup's "holder silent … sealed"; lost grants = "lock grant
+  lost"; delegation lapses = "delegation lapsed unrenewed"; lapse
+  discards = "lock grant lapsed", and the scenario's own lock-lapse
+  check):
+
+| run | load before → after (max) | result | delegate seals | holder seals | lost grants | lapse discards | stalled requests | ERROR | `fenced_io` | delegation lapses |
+|---|---|---|---|---|---|---|---|---|---|---|
+| s1 | 3.0 → 61.6 (95.8) | PASSED 164 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| s2 | 37.3 → 65.4 (103.7) | PASSED 163 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| s3 | 60.2 → 57.1 (98.9) | PASSED 172 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| s4 | 52.5 → 60.6 (102.5) | PASSED 172 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| s5 | 56.3 → 55.7 (105.7) | PASSED 184 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+  5 of 5. r2's failure was about 1 in 3, so 5 clean runs make it
+  unlikely, but do not prove, that the class is gone. Its shape (a lapse
+  behind a frame backlog) has no path left in the driver.
+
+### Open
+
+- None of the sweep failures of the previous base remain on the merged
+  tree.
+- The delegate's `LogStream` steps still cost 3–8 ms on average under
+  this load, with single steps up to 0.5 s behind lsm-tree's writer lock
+  (the version-lock freeze, out of scope). With the lanes reordered,
+  this no longer reaches a delegate's grant. It still delays the
+  delegate's other work, such as stream ticks and frames: 15–26
+  `slow core step` warnings per run here.
+- A lock holder's own renewal tick (`LockRenewTick`) and the answer to
+  its renewal still queue behind the internal channel. The answer comes
+  back through an RPC future on `int_tx`. This is the same class for
+  cluster locks, but no lock lapse was seen in any run (r1–r3,
+  s1–s5).

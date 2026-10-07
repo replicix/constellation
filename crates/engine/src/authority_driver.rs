@@ -25,7 +25,7 @@
 //! flush or fails the release, never stranded behind it.
 
 use crate::lease::LeaseView;
-use crate::sync::{AcquireProgress, DelegRenewReply, HandoffResult, SyncRequest};
+use crate::sync::{AcquireProgress, HandoffResult, SyncRequest};
 use anyhow::{Context, Result};
 use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
@@ -50,7 +50,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// A core step (handle + refresh + dispatch) longer than this is logged:
@@ -69,6 +69,55 @@ pub type MutateReplyParts = (
     u64,
     (OwnChunks, Option<constellation_meta::OwnRows>),
 );
+
+/// How often [`StepProfile`] is logged.
+const STEP_PROFILE_EVERY: Duration = Duration::from_secs(5);
+
+/// The core's steps since the last report: per event kind, how many and
+/// how long; and the deepest each lane got. Logged at debug (`core step
+/// profile`): a node whose core falls behind shows here what it was busy
+/// with, and which lane waited.
+#[derive(Debug, Default)]
+struct StepProfile {
+    since: Option<Instant>,
+    kinds: HashMap<&'static str, (u64, u64, u64)>,
+    max_pending: (usize, usize, usize),
+}
+
+impl StepProfile {
+    fn note(&mut self, kind: &'static str, us: u64, int: usize, sync: usize, urgent: usize) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let k = self.kinds.entry(kind).or_default();
+        k.0 += 1;
+        k.1 += us;
+        k.2 = k.2.max(us);
+        let m = &mut self.max_pending;
+        *m = (m.0.max(int), m.1.max(sync), m.2.max(urgent));
+        if since.elapsed() < STEP_PROFILE_EVERY {
+            return;
+        }
+        let mut kinds: Vec<_> = self.kinds.drain().collect();
+        kinds.sort_by_key(|(_, (_, total, _))| std::cmp::Reverse(*total));
+        let busy_ms: u64 = kinds.iter().map(|(_, (_, total, _))| total).sum::<u64>() / 1000;
+        let top: Vec<String> = kinds
+            .iter()
+            .take(8)
+            .map(|(kind, (n, total, max))| {
+                format!("{kind}:{n}/{}ms/max{}ms", total / 1000, max / 1000)
+            })
+            .collect();
+        tracing::debug!(
+            window_ms = since.elapsed().as_millis() as u64,
+            busy_ms,
+            max_int_pending = m.0,
+            max_sync_pending = m.1,
+            max_urgent_pending = m.2,
+            top = ?top,
+            "core step profile"
+        );
+        *self = Self::default();
+    }
+}
 
 /// Plan 30 §M14: an owner's answer to a `LockRenew`.
 pub type LockRenewResults = Vec<(constellation_fs_core::Ino, GrantId, LockRenewResult)>;
@@ -261,8 +310,9 @@ pub struct DriverDeps {
     pub off_core: Arc<OffCore>,
     /// The peer requests that must not queue behind the others
     /// (`SyncRequest`s the peer service sends on [`OffCore`]'s lane:
-    /// renewals and the holder's heartbeat), served before the ordinary
-    /// requests. Taken by [`Driver::new`].
+    /// renewals and the holder's heartbeat), served before everything
+    /// else, the internal channel included ([`Driver::run`]). Taken by
+    /// [`Driver::new`].
     pub urgent_rx: Option<mpsc::UnboundedReceiver<SyncRequest>>,
 }
 
@@ -707,6 +757,10 @@ pub struct Driver {
     inbox: InboxStore,
     int_tx: mpsc::UnboundedSender<Internal>,
     int_rx: mpsc::UnboundedReceiver<Internal>,
+    /// The timers that keep a delegate's grant ([`prompt_timer`]),
+    /// served before the internal channel.
+    prompt_tx: mpsc::UnboundedSender<Internal>,
+    prompt_rx: mpsc::UnboundedReceiver<Internal>,
     /// The bytes of the holder's log-stream frames this node's
     /// subscriptions may have queued for the core at once: the holder's
     /// budget for one subscriber's queue ([`log_stream_buffer_bytes`]).
@@ -736,10 +790,9 @@ pub struct Driver {
     /// driver minted for the core.
     read_index_replies: HashMap<OpId, oneshot::Sender<ReadIndexOutcome>>,
     recall_replies: HashMap<OpId, oneshot::Sender<()>>,
-    /// Plan 30 §M11: peers' delegate-stream batches, renewals and
-    /// recalls this node is answering.
-    deleg_stream_replies: HashMap<OpId, oneshot::Sender<(u64, bool)>>,
-    deleg_renew_replies: HashMap<OpId, oneshot::Sender<DelegRenewReply>>,
+    /// Plan 30 §M11: peers' delegation recalls this node is answering
+    /// (stream batches and renewals are one way, answered by the core's
+    /// own messages).
     deleg_recall_replies:
         HashMap<OpId, oneshot::Sender<(u64, constellation_meta::locks::LockHandback)>>,
     /// Plan 30 §M14: peers' lock requests, recalls, renewals and tests
@@ -782,6 +835,9 @@ pub struct Driver {
     loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
     alive_book: AliveBook,
     step_end: std::time::Instant,
+    /// Where the core's time goes, per event kind, logged at debug every
+    /// [`STEP_PROFILE_EVERY`] ([`StepProfile`]).
+    profile: StepProfile,
     /// The core's job and the replica's next log sequence, and since
     /// when both have stayed the same (the stuck-job report,
     /// [`STUCK_JOB`]).
@@ -1187,10 +1243,20 @@ fn waits_for_renewals(kind: TimerKind) -> bool {
     matches!(kind, TimerKind::LockGrantExpiry | TimerKind::DelegExpiry)
 }
 
+/// A delegate's timers that keep its grant: the renewal and the lapse.
+/// Delivered on a lane served before the internal channel
+/// ([`Driver::run`]): a backlog of frames there must not hold back the
+/// renewal (the root outwaits a silent delegate) nor the lapse (the grant
+/// is not honoured past it). The lapse still goes after the renewal
+/// answers queued on the urgent lane, which is served first.
+fn prompt_timer(kind: TimerKind) -> bool {
+    matches!(kind, TimerKind::DelegRenew | TimerKind::DelegLapse)
+}
+
 /// A timer that measures a peer's silence: it is handled after the
 /// requests and peer messages that reached this node before it fired
-/// (the internal channel is served first, so after a long step a due
-/// timer overtook them), for at most [`SILENCE_DRAIN_BUDGET`]. Not the
+/// (the internal channel is served before them, so after a long step a
+/// due timer overtook them), for at most [`SILENCE_DRAIN_BUDGET`]. Not the
 /// backup's seal watch: it decides on the holder's arrival stamps
 /// ([`Driver::hand_heard`]), which no backlog delays, and a drain only
 /// made it later.
@@ -1264,6 +1330,7 @@ impl Driver {
             None => InboxStore::new(deps.store_inner.clone()),
         };
         let (int_tx, int_rx) = mpsc::unbounded_channel();
+        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
         Self {
             core,
             deps,
@@ -1272,6 +1339,8 @@ impl Driver {
             inbox,
             int_tx,
             int_rx,
+            prompt_tx,
+            prompt_rx,
             log_permits: Arc::new(tokio::sync::Semaphore::new(log_backlog_bytes())),
             sync_tx,
             sync_rx,
@@ -1280,8 +1349,6 @@ impl Driver {
             handoff_replies: HashMap::new(),
             read_index_replies: HashMap::new(),
             recall_replies: HashMap::new(),
-            deleg_stream_replies: HashMap::new(),
-            deleg_renew_replies: HashMap::new(),
             deleg_recall_replies: HashMap::new(),
             lock_request_replies: HashMap::new(),
             lock_recall_replies: HashMap::new(),
@@ -1307,6 +1374,7 @@ impl Driver {
             )),
             alive_book: AliveBook::default(),
             step_end: std::time::Instant::now(),
+            profile: StepProfile::default(),
             job_since: None,
         }
     }
@@ -1413,12 +1481,18 @@ impl Driver {
             // Waiting for work is not being stuck (`holder_alive_task`).
             self.deps.off_core.set_busy(0);
             let urgent_open = self.urgent_rx.is_some();
+            // The urgent lane first, then a delegate's renewal timers,
+            // then the internal channel: a delegate's grant must not wait
+            // behind its own backlog. With the internal channel first, a
+            // delegate whose log-stream frames queued 17 s deep sent its
+            // renewal and took the root's answer that late, and lapsed
+            // (`stress-ng-fs-nodes`: a flush parked 47 s). Nothing the
+            // lanes carry is ordered against the internal channel: peer
+            // messages are not ordered against each other in transit, and
+            // a renewal answer or a heartbeat taken before an S3 result or
+            // a frame is the same as one that arrived a moment earlier.
             let wake = tokio::select! {
                 biased;
-                msg = self.int_rx.recv() => match msg {
-                    Some(m) => Wake::Internal(m),
-                    None => break,
-                },
                 req = async {
                     match self.urgent_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -1430,6 +1504,14 @@ impl Driver {
                         self.urgent_rx = None;
                         continue;
                     }
+                },
+                msg = self.prompt_rx.recv() => match msg {
+                    Some(m) => Wake::Internal(m),
+                    None => break,
+                },
+                msg = self.int_rx.recv() => match msg {
+                    Some(m) => Wake::Internal(m),
+                    None => break,
                 },
                 req = self.sync_rx.recv() => match req {
                     Some(req) => Wake::Request(req),
@@ -1605,6 +1687,13 @@ impl Driver {
             "core step"
         );
         let step_us = handled_us + refreshed_us + dispatched_us;
+        self.profile.note(
+            kind,
+            step_us,
+            int_pending,
+            sync_pending,
+            self.urgent_rx.as_ref().map_or(0, |rx| rx.len()),
+        );
         if step_us >= SLOW_STEP_US {
             // Everything the core does (backup heartbeats included)
             // waits for this step: a long one silences the node.
@@ -2016,48 +2105,89 @@ impl Driver {
                     },
                 }))
             }
+            // One way: `req` is the sender's id, echoed in the answer.
             SyncRequest::PeerDelegateStream {
                 from,
+                req_id,
                 gen,
+                round,
                 txs,
                 leaving,
                 leaving_barriers,
-                reply,
-            } => {
-                let req = self.control_id();
-                self.deleg_stream_replies.insert(req, reply);
-                Some(Internal::Event(Event::Peer {
-                    from,
-                    msg: PeerMsg::DelegateStream {
-                        req,
-                        gen,
-                        txs,
-                        leaving,
-                        leaving_barriers,
-                    },
-                }))
-            }
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::DelegateStream {
+                    req: OpId(req_id),
+                    gen,
+                    round,
+                    txs,
+                    leaving,
+                    leaving_barriers,
+                },
+            })),
+            SyncRequest::PeerDelegateStreamAck {
+                from,
+                req_id,
+                gen,
+                round,
+                through,
+                refused,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::DelegateStreamAck {
+                    req: OpId(req_id),
+                    gen,
+                    round,
+                    through,
+                    refused,
+                },
+            })),
             SyncRequest::PeerDelegRenew {
                 from,
+                req_id,
                 gen,
+                round,
                 backup,
                 stream_head,
                 stream_head_at,
-                reply,
-            } => {
-                let req = self.control_id();
-                self.deleg_renew_replies.insert(req, reply);
-                Some(Internal::Event(Event::Peer {
-                    from,
-                    msg: PeerMsg::DelegRenew {
-                        req,
-                        gen,
-                        backup: (backup != 0).then_some(backup),
-                        stream_head,
-                        stream_head_at,
-                    },
-                }))
-            }
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::DelegRenew {
+                    req: OpId(req_id),
+                    gen,
+                    round,
+                    backup: (backup != 0).then_some(backup),
+                    stream_head,
+                    stream_head_at,
+                },
+            })),
+            SyncRequest::PeerDelegRenewed {
+                from,
+                req_id,
+                gen,
+                round,
+                ttl_ms,
+                locks,
+                lock_grace_ms,
+                lock_floor,
+                lock_cut_at,
+                lock_cut,
+                lock_barrier,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::DelegRenewed {
+                    req: OpId(req_id),
+                    gen,
+                    round,
+                    ttl_ms,
+                    locks,
+                    lock_grace_ms,
+                    lock_floor,
+                    lock_cut_at,
+                    lock_cut: Box::new(lock_cut),
+                    lock_barrier,
+                },
+            })),
             SyncRequest::PeerDelegRecall {
                 root,
                 dir,
@@ -2576,7 +2706,11 @@ impl Driver {
                 Action::Send { to, msg } => self.send(to, msg),
                 Action::S3 { op, req } => self.spawn_s3(op, req),
                 Action::SetTimer { id, at, kind } => {
-                    let tx = self.int_tx.clone();
+                    let tx = if prompt_timer(kind) {
+                        self.prompt_tx.clone()
+                    } else {
+                        self.int_tx.clone()
+                    };
                     let delay = Duration::from_millis((at.0 - now_unix_ms()).max(0) as u64);
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
@@ -2933,16 +3067,25 @@ impl Driver {
             }
             PeerMsg::DelegateStreamAck {
                 req,
+                gen,
+                round,
                 through,
                 refused,
-                ..
             } => {
-                if let Some(tx) = self.deleg_stream_replies.remove(&req) {
-                    let _ = tx.send((through, refused));
-                }
+                let payload = Payload::DelegateStreamAck {
+                    from: self.node_id,
+                    req_id: req.0,
+                    gen,
+                    round,
+                    through,
+                    refused,
+                };
+                self.one_way(to, payload);
             }
             PeerMsg::DelegRenewed {
                 req,
+                gen,
+                round,
                 ttl_ms,
                 locks,
                 lock_grace_ms,
@@ -2950,19 +3093,21 @@ impl Driver {
                 lock_cut_at,
                 lock_cut,
                 lock_barrier,
-                ..
             } => {
-                if let Some(tx) = self.deleg_renew_replies.remove(&req) {
-                    let _ = tx.send(DelegRenewReply {
-                        ttl_ms,
-                        locks,
-                        lock_grace_ms,
-                        lock_floor,
-                        lock_cut_at,
-                        lock_cut: *lock_cut,
-                        lock_barrier,
-                    });
-                }
+                let payload = Payload::DelegRenewed {
+                    from: self.node_id,
+                    req_id: req.0,
+                    gen,
+                    round,
+                    ttl_ms,
+                    locks: crate::locks::grants_wire(&locks),
+                    lock_grace_ms,
+                    lock_floor: crate::locks::floor_wire(&lock_floor),
+                    lock_cut_at,
+                    lock_cut: crate::locks::floor_wire(&lock_cut),
+                    lock_barrier,
+                };
+                self.one_way(to, payload);
             }
             PeerMsg::DelegRecalled {
                 req,
@@ -3214,134 +3359,47 @@ impl Driver {
                     }
                 });
             }
+            // One way: the root answers with its own `DelegateStreamAck` /
+            // `DelegRenewed`, whenever its core gets to it; this request
+            // only waits for the message to be queued there, and a send
+            // that did not get there is `PeerFailed` (the core backs off).
             PeerMsg::DelegateStream {
                 req,
                 gen,
+                round,
                 txs,
                 leaving,
                 leaving_barriers,
             } => {
-                let tx = self.int_tx.clone();
-                let peers = self.deps.peers.clone();
-                let from = self.node_id;
-                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
-                let bytes = postcard::to_allocvec(&txs).unwrap_or_default();
-                let leaving = postcard::to_allocvec(&leaving).unwrap_or_default();
-                let leaving_barriers = postcard::to_allocvec(&leaving_barriers).unwrap_or_default();
-                if crate::fault::p2p_denied(to) {
-                    let _ = tx.send(Internal::Event(Event::PeerFailed {
-                        req,
-                        to,
-                        outage: true,
-                    }));
-                    return;
-                }
-                tokio::spawn(async move {
-                    let payload = Payload::DelegateStream {
-                        from,
-                        req_id: req.0,
-                        gen,
-                        txs: bytes,
-                        leaving,
-                        leaving_barriers,
-                    };
-                    let reply = tokio::time::timeout(
-                        timeout,
-                        peers.request_to_node_timeout(to, &payload, timeout),
-                    )
-                    .await;
-                    match reply {
-                        Ok(Ok(Payload::DelegateStreamAck {
-                            req_id,
-                            gen,
-                            through,
-                            refused,
-                        })) if req_id == req.0 => {
-                            let _ = tx.send(Internal::Event(Event::Peer {
-                                from: to,
-                                msg: PeerMsg::DelegateStreamAck {
-                                    req,
-                                    gen,
-                                    through,
-                                    refused,
-                                },
-                            }));
-                        }
-                        _ => {
-                            let outage =
-                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
-                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
-                        }
-                    }
-                });
+                let payload = Payload::DelegateStream {
+                    from: self.node_id,
+                    req_id: req.0,
+                    gen,
+                    round,
+                    txs: postcard::to_allocvec(&txs).unwrap_or_default(),
+                    leaving: postcard::to_allocvec(&leaving).unwrap_or_default(),
+                    leaving_barriers: postcard::to_allocvec(&leaving_barriers).unwrap_or_default(),
+                };
+                self.one_way_reported(to, req, payload);
             }
             PeerMsg::DelegRenew {
                 req,
                 gen,
+                round,
                 backup,
                 stream_head,
                 stream_head_at,
             } => {
-                let tx = self.int_tx.clone();
-                let peers = self.deps.peers.clone();
-                let from = self.node_id;
-                let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 2);
-                if crate::fault::p2p_denied(to) {
-                    let _ = tx.send(Internal::Event(Event::PeerFailed {
-                        req,
-                        to,
-                        outage: true,
-                    }));
-                    return;
-                }
-                tokio::spawn(async move {
-                    let payload = Payload::DelegRenew {
-                        from,
-                        req_id: req.0,
-                        gen,
-                        backup: backup.unwrap_or(0),
-                        stream_head,
-                        stream_head_at,
-                    };
-                    let reply = tokio::time::timeout(
-                        timeout,
-                        peers.request_to_node_timeout(to, &payload, timeout),
-                    )
-                    .await;
-                    match reply {
-                        Ok(Ok(Payload::DelegRenewed {
-                            req_id,
-                            gen,
-                            ttl_ms,
-                            locks,
-                            lock_grace_ms,
-                            lock_floor,
-                            lock_cut_at,
-                            lock_cut,
-                            lock_barrier,
-                        })) if req_id == req.0 => {
-                            let _ = tx.send(Internal::Event(Event::Peer {
-                                from: to,
-                                msg: PeerMsg::DelegRenewed {
-                                    req,
-                                    gen,
-                                    ttl_ms,
-                                    locks: crate::locks::grants_of(&locks),
-                                    lock_grace_ms,
-                                    lock_floor: crate::locks::floor_of(&lock_floor),
-                                    lock_cut_at,
-                                    lock_cut: Box::new(crate::locks::floor_of(&lock_cut)),
-                                    lock_barrier,
-                                },
-                            }));
-                        }
-                        _ => {
-                            let outage =
-                                crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
-                            let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
-                        }
-                    }
-                });
+                let payload = Payload::DelegRenew {
+                    from: self.node_id,
+                    req_id: req.0,
+                    gen,
+                    round,
+                    backup: backup.unwrap_or(0),
+                    stream_head,
+                    stream_head_at,
+                };
+                self.one_way_reported(to, req, payload);
             }
             PeerMsg::DelegRecall { req, dir, gen } => {
                 let tx = self.int_tx.clone();
@@ -4041,6 +4099,35 @@ impl Driver {
                     let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                     let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
                 }
+            }
+        });
+    }
+
+    /// [`Driver::one_way`] for a message the core tracks as `req`: one
+    /// that did not reach `to` (refused by the fault switch, a dial or
+    /// connection failure, not queued there in time) comes back as
+    /// `PeerFailed`.
+    fn one_way_reported(&self, to: NodeId, req: OpId, payload: Payload) {
+        let tx = self.int_tx.clone();
+        if crate::fault::p2p_denied(to) {
+            let _ = tx.send(Internal::Event(Event::PeerFailed {
+                req,
+                to,
+                outage: true,
+            }));
+            return;
+        }
+        let peers = self.deps.peers.clone();
+        let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
+        tokio::spawn(async move {
+            let reply = tokio::time::timeout(
+                timeout,
+                peers.request_to_node_timeout(to, &payload, timeout),
+            )
+            .await;
+            if !matches!(reply, Ok(Ok(Payload::Ok { .. }))) {
+                let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
             }
         });
     }
@@ -5792,6 +5879,30 @@ mod tests {
             TimerKind::BackupTick,
         ] {
             assert!(!waits_for_renewals(kind), "{kind:?}");
+        }
+    }
+
+    /// Only a delegate's renewal and lapse skip the internal channel's
+    /// backlog; the other timers, the stream tick and the root's expiry
+    /// of the grant included, keep their place in it.
+    #[test]
+    fn only_a_delegates_grant_timers_are_prompt() {
+        use super::prompt_timer;
+        use constellation_authority::TimerKind;
+        for kind in [TimerKind::DelegRenew, TimerKind::DelegLapse] {
+            assert!(prompt_timer(kind), "{kind:?}");
+        }
+        for kind in [
+            TimerKind::DelegExpiry,
+            TimerKind::DelegStream,
+            TimerKind::LockGrantExpiry,
+            TimerKind::LockRenewTick,
+            TimerKind::BackupWatch,
+            TimerKind::BackupTick,
+            TimerKind::ForwardTimeout,
+            TimerKind::Poll,
+        ] {
+            assert!(!prompt_timer(kind), "{kind:?}");
         }
     }
 

@@ -373,28 +373,41 @@ pub enum Payload {
     /// `Vec<constellation_meta::DelegateTx>`; `leaving`: postcard of
     /// `Vec<constellation_meta::locks::Grant>`, the delegate's grants on
     /// inodes the batch takes out of its subtree; `leaving_barriers`:
-    /// postcard of `Vec<(u64, i64)>`, its outwait barriers on them).
-    /// Answered by [`Payload::DelegateStreamAck`].
+    /// postcard of `Vec<(u64, i64)>`, its outwait barriers on them). One
+    /// way (answered `Ok` once queued): the root acknowledges with its own
+    /// [`Payload::DelegateStreamAck`], echoing `req_id` and `round`, so
+    /// no stream slot waits on the root's core and no answer is lost to a
+    /// request timeout.
     DelegateStream {
         from: u64,
         req_id: u64,
         gen: u64,
+        /// The delegate's stream round (its incarnation and root tenure,
+        /// `DelegateState::stream_round`), echoed by the acknowledgement.
+        round: u64,
         txs: Vec<u8>,
         leaving: Vec<u8>,
         leaving_barriers: Vec<u8>,
     },
+    /// Plan 30 §M11, one way: the root holds `gen`'s stream through
+    /// `through` (cumulative), or `refused` the batch `req_id`.
     DelegateStreamAck {
+        from: u64,
         req_id: u64,
         gen: u64,
+        round: u64,
         through: u64,
         refused: bool,
     },
-    /// Plan 30 §M11: a delegate renews its grant on `gen`; `ttl_ms` 0
-    /// refuses.
+    /// Plan 30 §M11, one way: a delegate renews its grant on `gen`; the
+    /// root answers with its own [`Payload::DelegRenewed`] (`ttl_ms` 0
+    /// refuses).
     DelegRenew {
         from: u64,
         req_id: u64,
         gen: u64,
+        /// As [`Payload::DelegateStream::round`].
+        round: u64,
         /// Phase 2b: the delegate's backup peer (0: none).
         backup: u64,
         /// Plan 30 §M14: the delegate's executed stream head for `gen`,
@@ -402,9 +415,12 @@ pub enum Payload {
         stream_head: u64,
         stream_head_at: i64,
     },
+    /// Plan 30 §M11, one way: the root's answer to the renewal `req_id`.
     DelegRenewed {
+        from: u64,
         req_id: u64,
         gen: u64,
+        round: u64,
         ttl_ms: u64,
         /// Plan 30 §M14: postcard of the root's lock grants under the
         /// subtree (`Vec<constellation_meta::locks::Grant>`), handed over
@@ -1371,8 +1387,10 @@ mod tests {
                 },
             },
             Payload::DelegRenewed {
+                from: 6,
                 req_id: 1,
                 gen: 2,
+                round: 7,
                 ttl_ms: 3,
                 locks: vec![1, 2, 3],
                 lock_grace_ms: 4,

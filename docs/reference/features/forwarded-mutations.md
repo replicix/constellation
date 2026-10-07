@@ -314,7 +314,17 @@ always a prefix of the durable log plus speculation it can take back:
   while it has any (a deposed holder's late, unfenced write) is applied
   *before* them: they are rolled back, the segment applied, and they are
   redone on top through the replay path — exactly what every other
-  replica computes once they ship after it.
+  replica computes once they ship after it. A delegate's unappended
+  stream transactions also go after every segment it tails, but a segment
+  is put under them only from the oldest one whose keys it overlaps (the
+  rule below). Their keys are the delegated subtree's, which the log
+  changes only through the delegate's own rows or after a `Recall` (which
+  strands them), so in practice no segment overlaps them and each applies
+  on top. Rewinding them all for every segment cost the delegate its
+  whole unappended stream per segment (`stress-ng-fs-nodes`: 110–240
+  transactions, 100–400 ms a segment against ~150 segments a second), and
+  its core fell minutes behind the holder's log, with its renewals and
+  stream acknowledgements queued behind it.
 - **A tailed segment goes under the speculation it overlaps.** The
   segment is earlier in the log than every shadow, hint or streamed
   transaction still outstanding here, so when its records touch any of

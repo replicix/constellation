@@ -767,6 +767,21 @@ pub struct Stats {
     /// Phase 2b: stream batches, backup appends re-sent after a lost
     /// answer.
     pub deleg_stream_timeouts: u64,
+    /// Delegate: stream acknowledgements that counted though they did not
+    /// answer the batch in flight (it had been given up on and re-sent,
+    /// or a later one was in flight), and ones dropped as another root's
+    /// or round's.
+    pub deleg_stream_acks_unmatched: u64,
+    pub deleg_stream_acks_stale: u64,
+    /// Delegate: renewal answers dropped as another root's or round's, or
+    /// for a generation no longer this node's.
+    pub deleg_renewed_stale: u64,
+    /// Root: stream batches that kept a generation's grant from being
+    /// outwaited (a live delegate streaming, its renewals behind).
+    pub deleg_live_by_stream: u64,
+    /// Root: table syncs run because the lease became usable after the
+    /// last sync (`Core::deleg_root_sync_due`).
+    pub deleg_root_resyncs: u64,
     pub deleg_backup_appends: u64,
     pub deleg_backup_acks: u64,
     pub deleg_acks_parked: u64,
@@ -1533,6 +1548,7 @@ impl Core {
             return out;
         }
         self.last_now = now;
+        self.deleg_root_sync_due(now, replica, &mut out);
         match event {
             Event::Submit {
                 rid,
@@ -1618,6 +1634,7 @@ impl Core {
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
         }
+        self.deleg_root_sync_due(now, replica, &mut out);
         self.resolve_moot_waits(now, replica, &mut out);
         self.reroute_ended_epoch_waits(now, replica, &mut out);
         self.inbox_after_event(now, &mut out);
@@ -1769,6 +1786,7 @@ impl Core {
             PeerMsg::DelegateStream {
                 req,
                 gen,
+                round,
                 txs,
                 leaving,
                 leaving_barriers,
@@ -1777,6 +1795,7 @@ impl Core {
                 from,
                 req,
                 gen,
+                round,
                 txs,
                 leaving,
                 leaving_barriers,
@@ -1786,22 +1805,26 @@ impl Core {
             PeerMsg::DelegateStreamAck {
                 req,
                 gen,
+                round,
                 through,
                 refused,
-            } => self.on_delegate_stream_ack(now, req, gen, through, refused, replica, out),
+            } => self
+                .on_delegate_stream_ack(now, from, req, gen, round, through, refused, replica, out),
             PeerMsg::DelegRenew {
                 req,
                 gen,
+                round,
                 backup,
                 stream_head,
                 stream_head_at,
             } => {
                 self.lock_note_delegate_head(now, from, gen, stream_head, stream_head_at);
-                self.on_deleg_renew(now, from, req, gen, backup, replica, out)
+                self.on_deleg_renew(now, from, req, gen, round, backup, replica, out)
             }
             PeerMsg::DelegRenewed {
                 req,
                 gen,
+                round,
                 ttl_ms,
                 locks,
                 lock_grace_ms,
@@ -1813,9 +1836,13 @@ impl Core {
                 // The renewal installs the generation's window first; the
                 // handoff is tagged with the generation itself. A grace
                 // the root carried binds a delegate that starts serving
-                // with this renewal.
+                // with this renewal. An answer from another root or round,
+                // or for a generation no longer this node's, carries
+                // nothing (its cut would replace the current root's).
                 let serving = self.deleg_mine_until(gen).is_some();
-                self.on_deleg_renewed(now, req, gen, ttl_ms, replica, out);
+                if !self.on_deleg_renewed(now, from, req, gen, round, ttl_ms, replica, out) {
+                    return;
+                }
                 if ttl_ms > 0 && !serving {
                     self.lock_take_grace(now, gen, lock_grace_ms);
                 }

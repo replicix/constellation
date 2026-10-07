@@ -543,11 +543,16 @@ pub enum PeerMsg {
     /// Plan 30 §M11: a delegate streams its executed transactions of
     /// generation `gen` to the root, in stream order from index
     /// `from_idx` (`txs[0].idx`), one batch in flight per generation.
-    /// Each carries the requester's `deps`. Answered by
-    /// [`PeerMsg::DelegateStreamAck`].
+    /// Each carries the requester's `deps`. One way: the root answers
+    /// with its own [`PeerMsg::DelegateStreamAck`] (the driver reports
+    /// `PeerFailed` only for a send that did not reach the root).
     DelegateStream {
         req: OpId,
         gen: u64,
+        /// The delegate's stream round (`DelegateState::stream_round`):
+        /// echoed by every answer, which counts only in the round it
+        /// answers.
+        round: u64,
         txs: Vec<DelegateTx>,
         /// The delegate's live lock grants of `gen` on inodes no longer
         /// in its subtree (unlinked under their lock): the root installs
@@ -561,21 +566,24 @@ pub enum PeerMsg {
         leaving_barriers: Vec<(Ino, i64)>,
     },
     /// Plan 30 §M11: the root appended the stream through `through`
-    /// (the delegate re-sends from there), or `refused` the generation
-    /// (unknown, ended, or not this node's): the delegate stops streaming
-    /// it and waits for the log.
+    /// (cumulative: the delegate re-sends from there, whichever batch
+    /// `req` names), or `refused` the batch `req` (the generation is
+    /// unknown, ended, or not this node's): the delegate backs off.
     DelegateStreamAck {
         req: OpId,
         gen: u64,
+        round: u64,
         through: u64,
         refused: bool,
     },
     /// Plan 30 §M11: a delegate renews its grant on `gen`; the root
     /// answers with the ttl (0: refused — the generation is ending or is
-    /// not this delegate's). The delegate measures from its send.
+    /// not this delegate's). The delegate measures from its send. One
+    /// way, as `DelegateStream`.
     DelegRenew {
         req: OpId,
         gen: u64,
+        round: u64,
         /// Phase 2b: the delegate's backup peer, if it appends to one.
         backup: Option<NodeId>,
         /// Plan 30 §M14: the highest stream index the delegate executed
@@ -593,6 +601,7 @@ pub enum PeerMsg {
     DelegRenewed {
         req: OpId,
         gen: u64,
+        round: u64,
         ttl_ms: u64,
         /// Plan 30 §M14: the root's lock grants under the subtree, handed
         /// over with the first renewal (restamped by the delegate).

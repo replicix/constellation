@@ -516,102 +516,120 @@ impl constellation_net::PeerService for P2pBridge {
         })
     }
 
-    fn delegate_stream_requested(
+    fn delegate_stream(
         &self,
         from: u64,
         req_id: u64,
         gen: u64,
+        round: u64,
         txs: Vec<u8>,
         leaving: Vec<u8>,
         leaving_barriers: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let refuse = constellation_net::Payload::DelegateStreamAck {
-                req_id,
+    ) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let (Ok(txs), Ok(leaving), Ok(leaving_barriers)) = (
+            postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs),
+            postcard::from_bytes::<Vec<constellation_meta::locks::Grant>>(&leaving),
+            postcard::from_bytes::<Vec<(u64, i64)>>(&leaving_barriers),
+        ) else {
+            tracing::warn!(
+                from,
                 gen,
-                through: 0,
-                refused: true,
-            };
-            let Ok(txs) = postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs) else {
-                return refuse;
-            };
-            let Ok(leaving) =
-                postcard::from_bytes::<Vec<constellation_meta::locks::Grant>>(&leaving)
-            else {
-                return refuse;
-            };
-            let Ok(leaving_barriers) = postcard::from_bytes::<Vec<(u64, i64)>>(&leaving_barriers)
-            else {
-                return refuse;
-            };
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            if self
-                .nudge
-                .send(sync::SyncRequest::PeerDelegateStream {
-                    from,
-                    gen,
-                    txs,
-                    leaving,
-                    leaving_barriers,
-                    reply,
-                })
-                .is_err()
-            {
-                return refuse;
-            }
-            match receive.await {
-                Ok((through, refused)) => constellation_net::Payload::DelegateStreamAck {
-                    req_id,
-                    gen,
-                    through,
-                    refused,
-                },
-                Err(_) => refuse,
-            }
-        })
+                "dropping a delegate stream batch that does not decode"
+            );
+            return;
+        };
+        let _ = self.nudge.send(sync::SyncRequest::PeerDelegateStream {
+            from,
+            req_id,
+            gen,
+            round,
+            txs,
+            leaving,
+            leaving_barriers,
+        });
     }
 
-    fn deleg_renew_requested(
+    fn delegate_stream_acked(
         &self,
         from: u64,
         req_id: u64,
         gen: u64,
+        round: u64,
+        through: u64,
+        refused: bool,
+    ) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(sync::SyncRequest::PeerDelegateStreamAck {
+            from,
+            req_id,
+            gen,
+            round,
+            through,
+            refused,
+        });
+    }
+
+    fn deleg_renew(
+        &self,
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        round: u64,
         backup: u64,
         stream_head: u64,
         stream_head_at: i64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
-    {
-        Box::pin(async move {
-            let (reply, receive) = tokio::sync::oneshot::channel();
-            let r: sync::DelegRenewReply = if self
-                .urgent
-                .send(sync::SyncRequest::PeerDelegRenew {
-                    from,
-                    gen,
-                    backup,
-                    stream_head,
-                    stream_head_at,
-                    reply,
-                })
-                .is_ok()
-            {
-                receive.await.unwrap_or_default()
-            } else {
-                Default::default()
-            };
-            constellation_net::Payload::DelegRenewed {
-                req_id,
-                gen,
-                ttl_ms: r.ttl_ms,
-                locks: crate::locks::grants_wire(&r.locks),
-                lock_grace_ms: r.lock_grace_ms,
-                lock_floor: crate::locks::floor_wire(&r.lock_floor),
-                lock_cut_at: r.lock_cut_at,
-                lock_cut: crate::locks::floor_wire(&r.lock_cut),
-                lock_barrier: r.lock_barrier,
-            }
-        })
+    ) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.urgent.send(sync::SyncRequest::PeerDelegRenew {
+            from,
+            req_id,
+            gen,
+            round,
+            backup,
+            stream_head,
+            stream_head_at,
+        });
+    }
+
+    fn deleg_renewed(
+        &self,
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        round: u64,
+        ttl_ms: u64,
+        locks: Vec<u8>,
+        lock_grace_ms: u64,
+        lock_floor: Vec<u8>,
+        lock_cut_at: i64,
+        lock_cut: Vec<u8>,
+        lock_barrier: i64,
+    ) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        // On the urgent lane, as the renewal was at the root: a grant
+        // handled late here lapses all the same.
+        let _ = self.urgent.send(sync::SyncRequest::PeerDelegRenewed {
+            from,
+            req_id,
+            gen,
+            round,
+            ttl_ms,
+            locks: crate::locks::grants_of(&locks),
+            lock_grace_ms,
+            lock_floor: crate::locks::floor_of(&lock_floor),
+            lock_cut_at,
+            lock_cut: crate::locks::floor_of(&lock_cut),
+            lock_barrier,
+        });
     }
 
     fn deleg_recall_requested(

@@ -1155,25 +1155,33 @@ pub trait PeerService: Send + Sync + 'static {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {})
     }
-    /// Plan 30 §M11: a delegate's stream batch for the root. Default:
-    /// refused.
-    fn delegate_stream_requested(
+    /// Plan 30 §M11, one way: a delegate's stream batch for the root
+    /// ([`Payload::DelegateStream`]; acknowledged by the root's own
+    /// [`Payload::DelegateStreamAck`]). Default: ignored.
+    #[allow(clippy::too_many_arguments)]
+    fn delegate_stream(
         &self,
         _from: u64,
-        req_id: u64,
-        gen: u64,
+        _req_id: u64,
+        _gen: u64,
+        _round: u64,
         _txs: Vec<u8>,
         _leaving: Vec<u8>,
         _leaving_barriers: Vec<u8>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
-        Box::pin(async move {
-            Payload::DelegateStreamAck {
-                req_id,
-                gen,
-                through: 0,
-                refused: true,
-            }
-        })
+    ) {
+    }
+    /// Plan 30 §M11, one way: the root's acknowledgement of a delegate's
+    /// stream. Default: ignored.
+    #[allow(clippy::too_many_arguments)]
+    fn delegate_stream_acked(
+        &self,
+        _from: u64,
+        _req_id: u64,
+        _gen: u64,
+        _round: u64,
+        _through: u64,
+        _refused: bool,
+    ) {
     }
     /// Plan 30 §M11 phase 2b: a delegate's append to this backup.
     /// Default: sealed (nothing held).
@@ -1210,29 +1218,37 @@ pub trait PeerService: Send + Sync + 'static {
             }
         })
     }
-    /// Plan 30 §M11: a delegate's renewal. Default: refused (ttl 0).
-    fn deleg_renew_requested(
+    /// Plan 30 §M11, one way: a delegate's renewal (answered by the
+    /// root's own [`Payload::DelegRenewed`]). Default: ignored.
+    #[allow(clippy::too_many_arguments)]
+    fn deleg_renew(
         &self,
         _from: u64,
-        req_id: u64,
-        gen: u64,
+        _req_id: u64,
+        _gen: u64,
+        _round: u64,
         _backup: u64,
         _stream_head: u64,
         _stream_head_at: i64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
-        Box::pin(async move {
-            Payload::DelegRenewed {
-                req_id,
-                gen,
-                ttl_ms: 0,
-                locks: Vec::new(),
-                lock_grace_ms: 0,
-                lock_floor: Vec::new(),
-                lock_cut_at: 0,
-                lock_cut: Vec::new(),
-                lock_barrier: 0,
-            }
-        })
+    ) {
+    }
+    /// Plan 30 §M11, one way: the root's answer to a renewal. Default:
+    /// ignored.
+    #[allow(clippy::too_many_arguments)]
+    fn deleg_renewed(
+        &self,
+        _from: u64,
+        _req_id: u64,
+        _gen: u64,
+        _round: u64,
+        _ttl_ms: u64,
+        _locks: Vec<u8>,
+        _lock_grace_ms: u64,
+        _lock_floor: Vec<u8>,
+        _lock_cut_at: i64,
+        _lock_cut: Vec<u8>,
+        _lock_barrier: i64,
+    ) {
     }
     /// Plan 30 §M11: the root's recall. Default: nothing executed.
     fn deleg_recall_requested(

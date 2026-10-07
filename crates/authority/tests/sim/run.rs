@@ -243,6 +243,12 @@ pub struct SimConfig {
     /// floor (the releaser's frontier) orders it before the next holder
     /// (git's refs under its `flock` turn file). `None`: the lock file.
     pub lock_data_dir: Option<String>,
+    /// delegate-stream-acks: extra delay, drawn per message in this range
+    /// (ms), on every `DelegateStreamAck` and `DelegRenewed` — a root
+    /// whose core answers a delegate's batches and renewals late, past
+    /// the delegate's request timeout (`stress-ng-fs-nodes`). `(0, 0)`:
+    /// none.
+    pub deleg_answer_delay: (u64, u64),
 }
 
 /// See `SimConfig::fast_path`.
@@ -463,6 +469,7 @@ impl Default for SimConfig {
             lock_ignore_fence: false,
             lock_writes: false,
             lock_data_dir: None,
+            deleg_answer_delay: (0, 0),
         }
     }
 }
@@ -2009,6 +2016,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let bucket = Bucket::new(seed, cfg.s3_latency);
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
     bus.set_stream_faults(cfg.stream_faults.clone());
+    bus.set_deleg_answer_delay(cfg.deleg_answer_delay);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
     let env = NodeEnv {
@@ -3251,9 +3259,22 @@ async fn marker_watcher(
             let (dp, dl) = split_name(&handle.meta, &data);
             let marker_seen = handle.meta.child_ino(mp, &ml).ok().flatten().is_some();
             let data_seen = handle.meta.child_ino(dp, &dl).ok().flatten().is_some();
+            // A read of the data waits while a stranded op queued for
+            // replay touches it, as a FUSE read does (`session_wait`): a
+            // stream-ahead transaction of a deposed holder is rolled back
+            // here until its successor re-ships it from the backup tail,
+            // and a reader never observes that gap (long-delegated-late-
+            // answers seed 3498: the delegate executed the marker on the
+            // streamed data; the takeover's marker segment stranded the
+            // data, and the successor, paused, re-shipped it 4.5 s later;
+            // main fails the seed the same way).
+            let data_waits = !data_seen
+                && handle
+                    .meta
+                    .replay_touches(&[constellation_meta::ReadKey::Dentry(dp, dl.clone())]);
             let mut s = stats.lock().unwrap();
             s.0 += 1;
-            if marker_seen && !data_seen {
+            if marker_seen && !data_seen && !data_waits {
                 s.1 += 1;
                 failures.lock().unwrap().push(format!(
                     "node {node} saw marker {marker} without its data {data}"

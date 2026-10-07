@@ -143,7 +143,10 @@ send, as an answer in time would have been. Before, every answer later
 than the timeout (500 ms) was thrown away, and an owner whose answers
 all came late let the grant lapse under the holder's writes although it
 had renewed it each time. A late `Lost` or `NotOwner` is ignored (the
-renewal sent since decides).
+renewal sent since decides). A delegation's renewals and its stream
+batches go further: they and the root's answers are one-way messages,
+so no answer can be lost to a timeout at all (see
+[Delegations](delegations.md#the-append-path-and-dependencies)).
 
 A file locked through a delegate and then unlinked while locked
 (`stress-ng`'s lock stressors do) is in no delegated subtree any more,

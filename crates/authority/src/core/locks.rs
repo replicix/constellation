@@ -363,7 +363,7 @@ pub(crate) struct LockState {
     /// [`Core::lock_cut_here`]). A cut from another root replaces it
     /// whatever its time: the clocks differ, and a new root's behind the
     /// old one's would settle nothing until it passed the old value.
-    cut: Option<(NodeId, i64, Position)>,
+    pub(crate) cut: Option<(NodeId, i64, Position)>,
     /// The next `lock_on_lease_gone` is a continuation epoch's close
     /// that this node's next acquisition may continue: the grant table
     /// stays, for that acquisition to keep or drop

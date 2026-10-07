@@ -386,6 +386,114 @@ fn a_segment_tailed_under_local_speculation_is_inserted_before_it() {
     assert_eq!(mode_of(&root_now), 0o711);
 }
 
+/// delegate-stream-acks (`stress-ng-fs-nodes`): a delegate's unappended
+/// stream transactions go *after* every segment it tails, but a segment
+/// is rewound under them only from the oldest one it conflicts with — one
+/// that touches none of them commutes with them and applies on top. The
+/// replica equals the log order either way, and a `Recall` still strands
+/// the delegate's rows from under the segments applied on top of them.
+#[test]
+fn a_segment_goes_under_a_delegates_stream_only_where_it_conflicts() {
+    let meta = Meta::open_in_memory().unwrap();
+    let log_order = Meta::open_in_memory().unwrap();
+    let (d, a, b, x) = ((2 << 40) | 1, (2 << 40) | 2, (2 << 40) | 3, (4 << 40) | 1);
+    let mkdir = vec![LogRecord::Mkdir {
+        parent: ROOT_INO,
+        name: "d".into(),
+        ino: d,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        time_ns: 1,
+    }];
+    let applied = meta
+        .apply_segment(1, 1, &mkdir, &TouchSet::default())
+        .unwrap();
+    assert!(!applied.inserted_before_local);
+    log_order.apply_records(&mkdir).unwrap();
+    // The delegate of `d` (generation 7) executes two creates in it.
+    let gen = 7;
+    let mut delegate_records = Vec::new();
+    for (seq, name, ino) in [(1, "a", a), (2, "b", b)] {
+        let op = MutateOp::Create {
+            parent: d,
+            name: name.into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let (records, _) = meta
+            .delegate_execute(
+                &op,
+                Some(rid(seq)),
+                gen,
+                Default::default(),
+                &Default::default(),
+                0,
+            )
+            .unwrap();
+        delegate_records.extend(records);
+    }
+    assert_eq!(meta.speculation_counts().unwrap().local, 2);
+
+    // Elsewhere in the tree: on top, no rewind.
+    let elsewhere = vec![LogRecord::Create {
+        parent: ROOT_INO,
+        name: "x".into(),
+        ino: x,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    }];
+    let applied = meta
+        .apply_segment(2, 1, &elsewhere, &TouchSet::default())
+        .unwrap();
+    assert!(
+        !applied.inserted_before_local,
+        "no conflict: applied on top"
+    );
+    assert!(!applied.stranded.any());
+    // On the subtree's directory itself: under the delegate's rows.
+    let on_d = vec![LogRecord::Setattr {
+        ino: d,
+        mode: Some(0o700),
+        uid: None,
+        gid: None,
+        size: None,
+        atime_ns: None,
+        mtime_ns: None,
+        time_ns: 6,
+    }];
+    let applied = meta
+        .apply_segment(3, 1, &on_d, &TouchSet::default())
+        .unwrap();
+    assert!(applied.inserted_before_local, "a conflict rewinds");
+    assert_eq!(meta.speculation_counts().unwrap().local, 2);
+    log_order.apply_records(&elsewhere).unwrap();
+    log_order.apply_records(&on_d).unwrap();
+    let segments_only = log_order.dump_replicated().unwrap();
+    log_order.apply_records(&delegate_records).unwrap();
+    assert_eq!(
+        meta.dump_replicated().unwrap(),
+        log_order.dump_replicated().unwrap(),
+        "the delegate's rows after both segments, as the log will have them"
+    );
+
+    // The log recalls the generation without its rows: they are stranded
+    // and rolled back from under both segments.
+    let recall = vec![LogRecord::Recall { dir: d, gen }];
+    let applied = meta
+        .apply_segment(4, 1, &recall, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.stranded.locals, 2);
+    assert_eq!(meta.speculation_counts().unwrap().local, 0);
+    assert_eq!(meta.dump_replicated().unwrap(), segments_only);
+    assert!(meta.lookup(ROOT_INO, "x").unwrap().is_some());
+    assert!(meta.lookup(d, "a").unwrap().is_none());
+}
+
 /// The publish rule: a holder with unshipped work publishes the log
 /// prefix at `applied_seq` — exactly the state it last shipped.
 #[test]

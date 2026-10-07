@@ -125,6 +125,9 @@ pub(crate) struct GenState {
     pub cursor: u64,
     /// The root outwaits the delegate once its clock reaches this.
     pub until: Ms,
+    /// What the renewals alone gave `until` (the rest is the delegate's
+    /// stream, `Core::deleg_live_by_stream`).
+    pub renewed_until: Ms,
     pub recall: RecallPhase,
     /// The phase a seal of the backup replaced: what an unanswered seal
     /// goes back to.
@@ -212,14 +215,21 @@ pub(crate) struct DelegateState {
     /// newly chosen backup before the next timer).
     pub renew_backup: Option<NodeId>,
     /// When the in-flight stream batch / backup append was sent: one
-    /// lost in a partition (no transport failure) is re-sent after
-    /// `deleg_request_timeout_ms`, not waited for forever.
+    /// lost in a partition (no transport failure), or answered late, is
+    /// re-sent after `deleg_request_timeout_ms` (and a backoff), not
+    /// waited for forever.
     pub inflight_at: Ms,
     pub backup_inflight_at: Ms,
-    /// The root tenure this generation streams to, as this node counts
-    /// them: bumped at every re-stream to a new root. A late stream
-    /// acknowledgement counts only from the tenure its batch went to
-    /// ([`LateReq::round`]).
+    /// The stream round: this node's incarnation and a fresh id at the
+    /// install and at every re-stream to a new root
+    /// ([`Core::deleg_new_round`]). Every batch and renewal carries it and
+    /// the root echoes it; an answer counts only in the round it
+    /// answers. A root that changed and came back (R → R2 → R) is the
+    /// same node, not the same stream: the re-stream to R2 restarted from
+    /// what the log carries, and R's answer from its first tenure would
+    /// claim rows R2's tenure never got (long-delegated-backup seed
+    /// 75504's class); and an answer to this node's previous incarnation
+    /// names request ids this one reuses.
     pub stream_round: u64,
     /// The last batch sent carried this generation's grants on these
     /// inodes out of the subtree (`Core::deleg_leaving_grants`); its last
@@ -227,32 +237,23 @@ pub(crate) struct DelegateState {
     pub leaving: Option<(u64, Vec<Ino>)>,
 }
 
-/// A request [`Core::deleg_expire_inflight`] gave up waiting for. The
-/// timeout re-sends what may have been lost (a partition drops a message
-/// with no transport failure); it says nothing about the answer to the
-/// first send, which a loaded peer gives late, not never. Thrown away,
-/// as it was, an answer later than the timeout never counted: under
-/// `stress-ng-fs-nodes` the root took over 500 ms to answer a delegate's
-/// batch, every answer arrived after its batch had been re-sent, and the
-/// stream re-sent the same batch every half second for minutes with the
-/// root holding every row — every op parked on it waited, and a delegate
-/// whose renewal answers all came late lapsed. A late answer is used
-/// for what it can only add: a stream acknowledgement from the root
-/// still streamed to, a backup's acknowledgement from the backup still
-/// appended to, a granted renewal (honoured from its own send).
+/// A renewal or backup append [`Core::deleg_expire_inflight`] gave up
+/// waiting for. The timeout re-sends what may have been lost (a partition
+/// drops a message with no transport failure); it says nothing about the
+/// answer to the first send, which a loaded peer gives late, not never.
+/// Thrown away, an answer later than the timeout never counted (under
+/// `stress-ng-fs-nodes` a delegate whose renewal answers all came late
+/// lapsed). A late answer is used for what it can only add: a backup's
+/// acknowledgement from the backup still appended to, a granted renewal
+/// (honoured from its own send). Stream batches need no such record:
+/// the root's acknowledgement is cumulative, and counts whenever it
+/// comes in the round it answers ([`Core::on_delegate_stream_ack`]).
 #[derive(Debug, Clone, Copy)]
 struct LateReq {
     gen: u64,
     kind: ReqKind,
     /// The root or backup it went to.
     to: Option<NodeId>,
-    /// A stream batch: the root tenure it went to
-    /// ([`DelegateState::stream_round`]). A root that changed and came
-    /// back (R → R2 → R) is the same node, not the same stream: the
-    /// re-stream to R2 restarted from what the log carries, and R's late
-    /// answer for its first tenure would claim rows R2's tenure never got
-    /// (long-delegated-backup seed 75504's class).
-    round: u64,
     /// This node's clock at the send.
     sent: Ms,
 }
@@ -300,14 +301,17 @@ pub(crate) struct DelegationState {
     pub backing: BTreeMap<u64, (NodeId, u64)>,
     pub sealed: BTreeSet<u64>,
     by_req: BTreeMap<OpId, (u64, ReqKind)>,
-    /// Stream batches, backup appends and renewals that
-    /// `deleg_expire_inflight` stopped waiting for: their answer may
-    /// still come, and is used when it does (`LateReq`).
+    /// Backup appends and renewals that `deleg_expire_inflight` stopped
+    /// waiting for: their answer may still come, and is used when it does
+    /// (`LateReq`).
     late: BTreeMap<OpId, LateReq>,
     /// Local ops whose execution waits for a recall or for `deps` (their
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
     stream_timer: Option<TimerId>,
+    /// The last table sync found this node a usable root (and so learned
+    /// the generations the table names): see [`Core::deleg_root_sync_due`].
+    root_synced: bool,
     /// Plan 30 §M10: an active continuation epoch — no delegation.
     pub(crate) epoch_active: bool,
 }
@@ -449,6 +453,7 @@ impl Core {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
                 continue;
             }
+            let stream_round = self.deleg_new_round();
             tracing::info!(node = me, dir = d.dir, gen = d.gen, "delegation installed");
             self.stats.deleg_installed += 1;
             // A delegate's reply base is the last applied segment that
@@ -494,7 +499,7 @@ impl Core {
                     renew_backup: None,
                     inflight_at: Ms(0),
                     backup_inflight_at: Ms(0),
-                    stream_round: 0,
+                    stream_round,
                     leaving: None,
                 },
             );
@@ -507,7 +512,8 @@ impl Core {
             self.arm_deleg_lapse(now, d.gen, out);
         }
         // The root side.
-        if self.root_usable(now) {
+        self.dl.root_synced = self.root_usable(now);
+        if self.dl.root_synced {
             let live: BTreeSet<u64> = table.iter().map(|d| d.gen).collect();
             for d in table.iter() {
                 if self.dl.gens.contains_key(&d.gen) {
@@ -551,6 +557,7 @@ impl Core {
                         seal_attempts: 0,
                         cursor,
                         until: now.plus(self.reclaim_horizon_ms()),
+                        renewed_until: now.plus(self.reclaim_horizon_ms()),
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
                         ended: false,
@@ -1470,6 +1477,28 @@ impl Core {
         }
     }
 
+    /// The root learns the generations its table names when the table
+    /// changes and when it acquires the lease — usable then. A lease that
+    /// becomes usable only later (acquired inside its expiry margin, its
+    /// first renewal making it usable) learned nothing: the root executed
+    /// ops under a live delegation as if it were its own, and refused the
+    /// delegate's stream for good, its acknowledged writes never appended
+    /// (sim `long-delegated-late-answers` seed 45: a takeover whose lease
+    /// PUT was slow). So the table is synced again whenever this node is
+    /// a usable root and the last sync did not find it one — before the
+    /// event, after it, and before the root executes anything itself.
+    pub(crate) fn deleg_root_sync_due(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.cfg.delegation && !self.dl.root_synced && self.root_usable(now) {
+            self.stats.deleg_root_resyncs += 1;
+            self.delegation_sync(now, replica, out);
+        }
+    }
+
     /// Retry every parked op whose wait is over, then stream and renew.
     pub(crate) fn deleg_after_event(
         &mut self,
@@ -1502,20 +1531,35 @@ impl Core {
         // behind (4, 18); every op parked on the new root for 120 s).
         let root = self.root_node();
         let mut stale_reqs = Vec::new();
-        let mut restreamed = Vec::new();
+        let rounds: BTreeMap<u64, u64> = self
+            .dl
+            .mine
+            .values()
+            .filter(|d| d.last_root != root)
+            .map(|d| d.gen)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|g| (g, self.deleg_new_round()))
+            .collect();
         for d in self.dl.mine.values_mut() {
-            if d.last_root != root {
+            if let Some(round) = rounds.get(&d.gen) {
+                // The old root's answers — to the batch in flight, to one
+                // given up on, to a renewal — must not count for the new
+                // one, nor for the old root if it comes back
+                // (`DelegateState::stream_round`). Every change counts, a
+                // root lost from view and found again too: the gap may
+                // hide another tenure (this node's own: `root_node`
+                // leaves it out), and an answer counts by root and round
+                // alone. The batch in flight is answered in the old round,
+                // so stale: the next one goes now, not after its timeout.
+                d.stream_round = *round;
+                if let Some((req, _)) = d.inflight.take() {
+                    stale_reqs.push(req);
+                    d.stream_after = None;
+                    d.stream_backoff_ms = 0;
+                }
                 if d.last_root.is_some() && root.is_some() {
                     d.streamed_through = replica.log_stream_idx(d.gen);
-                    // The old root's answer to the batch in flight, or to
-                    // one given up on (`LateReq`), must not count for the
-                    // new one (see `on_delegate_stream_ack`) — nor for the
-                    // old root if it comes back (`LateReq::round`).
-                    if let Some((req, _)) = d.inflight.take() {
-                        stale_reqs.push(req);
-                    }
-                    d.stream_round += 1;
-                    restreamed.push(d.gen);
                     d.refused = false;
                     d.stream_after = None;
                     d.stream_backoff_ms = 0;
@@ -1532,11 +1576,6 @@ impl Core {
         }
         for req in stale_reqs {
             self.dl.by_req.remove(&req);
-        }
-        if !restreamed.is_empty() {
-            self.dl
-                .late
-                .retain(|_, l| !(l.kind == ReqKind::Stream && restreamed.contains(&l.gen)));
         }
         // Parked delegate ops.
         let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
@@ -1614,6 +1653,22 @@ impl Core {
         self.deleg_stream(now, replica, out);
     }
 
+    /// A fresh stream round ([`DelegateState::stream_round`]): unique
+    /// within this incarnation (an op id, below 2^40) and across
+    /// incarnations (the incarnation in the high 24 bits: two
+    /// incarnations share them only 2^24 restarts apart).
+    fn deleg_new_round(&mut self) -> u64 {
+        const OP_BITS: u32 = 40;
+        let op = self.op_id().0;
+        debug_assert!(op < 1 << OP_BITS, "op id {op} overflows a round");
+        debug_assert!(
+            u64::from(self.cfg.incarnation) < 1 << (64 - OP_BITS),
+            "incarnation {} overflows a round",
+            self.cfg.incarnation
+        );
+        (u64::from(self.cfg.incarnation) << OP_BITS) | (op & ((1 << OP_BITS) - 1))
+    }
+
     /// How long a stream batch, backup append or renewal waits for its
     /// answer before it is sent again (a partition drops it silently).
     pub(crate) fn deleg_request_timeout_ms(&self) -> u64 {
@@ -1624,21 +1679,23 @@ impl Core {
     }
 
     /// Stop waiting for the in-flight requests whose answers are
-    /// overdue (their answers are still used when they come:
-    /// [`LateReq`]); the generations whose renewal was dropped (re-sent
-    /// by the caller). A stream batch is re-sent after a backoff, as
-    /// after a transport failure: the root is slow, and the same batch
-    /// every timeout only adds to what it is slow with.
+    /// overdue (a renewal's or backup append's answer is still used when
+    /// it comes: [`LateReq`]; a stream acknowledgement always is, in its
+    /// round); the generations whose renewal was dropped (re-sent by the
+    /// caller). A stream batch is re-sent from the acknowledged cursor
+    /// after a backoff, as after a transport failure: the root is slow,
+    /// and the same batch every timeout only adds to what it is slow with.
     fn deleg_expire_inflight(&mut self, now: Ms) -> Vec<u64> {
         let timeout = self.deleg_request_timeout_ms() as i64;
         let tick = self.cfg.delegation_stream_tick_ms.max(1);
         let root = self.root_node();
         let mut late = Vec::new();
+        let mut given_up = Vec::new();
         let mut renew_again = Vec::new();
         for d in self.dl.mine.values_mut() {
             if let Some((req, _)) = d.inflight {
                 if now.since(d.inflight_at) >= timeout {
-                    late.push((req, d.last_root.or(root), d.stream_round, d.inflight_at));
+                    given_up.push(req);
                     d.inflight = None;
                     d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
                     d.stream_after = Some(now.plus(d.stream_backoff_ms));
@@ -1647,14 +1704,14 @@ impl Core {
             }
             if let Some((req, _)) = d.backup_inflight {
                 if now.since(d.backup_inflight_at) >= timeout {
-                    late.push((req, d.backup, 0, d.backup_inflight_at));
+                    late.push((req, d.backup, d.backup_inflight_at));
                     d.backup_inflight = None;
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, sent)) = d.renew {
                 if now.since(sent) >= timeout {
-                    late.push((req, root, 0, sent));
+                    late.push((req, root, sent));
                     d.renew = None;
                     if d.renew_timer.is_none() && !d.stopped {
                         renew_again.push(d.gen);
@@ -1665,7 +1722,10 @@ impl Core {
         self.dl
             .late
             .retain(|_, l| now.since(l.sent) < LATE_ANSWER_MS);
-        for (req, to, round, sent) in late {
+        for req in given_up {
+            self.dl.by_req.remove(&req);
+        }
+        for (req, to, sent) in late {
             if let Some((gen, kind)) = self.dl.by_req.remove(&req) {
                 self.dl.late.insert(
                     req,
@@ -1673,7 +1733,6 @@ impl Core {
                         gen,
                         kind,
                         to,
-                        round,
                         sent,
                     },
                 );
@@ -1758,6 +1817,7 @@ impl Core {
             self.dl.by_req.insert(req, (gen, ReqKind::Stream));
             self.stats.deleg_streamed_txs += txs.len() as u64;
             let d = self.dl.mine.get_mut(&gen).expect("present");
+            let round = d.stream_round;
             d.inflight = Some((req, last));
             d.inflight_at = now;
             d.leaving = (!leaving.is_empty() || !leaving_barriers.is_empty()).then(|| {
@@ -1768,6 +1828,7 @@ impl Core {
             tracing::debug!(
                 node = self.me(),
                 gen,
+                ?req,
                 from,
                 last,
                 root,
@@ -1779,6 +1840,7 @@ impl Core {
                 msg: PeerMsg::DelegateStream {
                     req,
                     gen,
+                    round,
                     txs,
                     leaving,
                     leaving_barriers,
@@ -1799,42 +1861,70 @@ impl Core {
         }
     }
 
+    /// The root's acknowledgement of this node's stream of `gen`,
+    /// cumulative: the root holds the stream through `through`, whichever
+    /// batch `req` names. It counts whenever it comes — an answer to a
+    /// batch given up on and re-sent, one overtaken by a later answer, a
+    /// duplicate — provided it is from the root this generation streams
+    /// to, in the round it streams in: a new root re-streams from what the
+    /// log carries, and must not be credited with what an old one (or an
+    /// earlier tenure of the same node, or an answer to this node's
+    /// previous incarnation) holds (long-delegated-backup seed 75504: the
+    /// old root's ack through 7 arrived after the re-stream to its
+    /// successor, whose cursor was 6; the delegate's last row never
+    /// reached the log). Only the rows the root applied are ever credited:
+    /// `through` is its cursor after the batch. A refusal counts only
+    /// for the batch in flight (the next one is refused, or not, anew).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_delegate_stream_ack(
         &mut self,
         now: Ms,
+        from: NodeId,
         req: OpId,
         gen: u64,
+        round: u64,
         through: u64,
         refused: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        if !self.dl.by_req.contains_key(&req) {
-            self.deleg_late_stream_ack(now, req, gen, through, refused, replica, out);
-            return;
-        }
-        let Some((g, ReqKind::Stream)) = self.dl.by_req.remove(&req) else {
-            return;
-        };
-        if g != gen {
-            return;
-        }
+        let root = self.root_node();
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
         };
-        // Only the answer to the batch in flight counts: a late answer
-        // from a root this generation no longer streams to (it was paused,
-        // then deposed) would claim the new root holds rows it never got,
-        // and the stream would stop short of them for good (long-
-        // delegated-backup seed 75504: the old root's ack through 7
-        // arrived after the re-stream to its successor, whose cursor was
-        // 6; the delegate's last row never reached the log).
-        if d.inflight.map(|(r, _)| r) != Some(req) {
+        let stale = root != Some(from) || d.last_root != Some(from) || round != d.stream_round;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            from,
+            gen,
+            ?req,
+            through,
+            refused,
+            was = d.streamed_through,
+            inflight = ?d.inflight,
+            stale,
+            "delegate stream acknowledgement"
+        );
+        if stale {
+            self.stats.deleg_stream_acks_stale += 1;
             return;
         }
-        d.inflight = None;
+        let answers_inflight = d.inflight.is_some_and(|(r, _)| r == req);
+        // An acknowledgement through the in-flight batch's last row (one
+        // for a given-up batch overtaken by its re-send) answers that
+        // batch too: the next one goes out now, not after the re-send's
+        // own answer.
+        let covers_inflight = !refused && d.inflight.is_some_and(|(_, last)| last <= through);
+        if answers_inflight || covers_inflight {
+            if let Some((r, _)) = d.inflight.take() {
+                self.dl.by_req.remove(&r);
+            }
+        }
+        let d = self.dl.mine.get_mut(&gen).expect("present");
         if refused {
+            if !answers_inflight {
+                return;
+            }
             // The generation is ending, or the root has not learned it
             // (a successor before its table, a holder inside its takeover
             // gate): the log ends a generation, a refusal does not — back
@@ -1846,64 +1936,29 @@ impl Core {
             self.arm_stream_tick(now, out);
             return;
         }
+        let progressed = through > d.streamed_through;
+        if !progressed && !answers_inflight {
+            return;
+        }
+        if progressed && !answers_inflight {
+            tracing::debug!(
+                node = self.cfg.node_id,
+                gen,
+                through,
+                was = d.streamed_through,
+                "a stream acknowledgement for an earlier batch counted"
+            );
+        }
         d.streamed_through = d.streamed_through.max(through);
-        d.stream_after = None;
-        d.stream_backoff_ms = 0;
-        self.deleg_drop_left(gen, replica);
-        self.deleg_stream(now, replica, out);
-    }
-
-    /// The answer to a batch [`Core::deleg_expire_inflight`] stopped
-    /// waiting for ([`LateReq`]): the rows through `through` are the
-    /// root's if it is still the root this generation streams to (a new
-    /// root re-streams from what the log carries, and must not be
-    /// credited with what an old one answered). A refusal is left to the
-    /// batch in flight, or the next.
-    #[allow(clippy::too_many_arguments)]
-    fn deleg_late_stream_ack(
-        &mut self,
-        now: Ms,
-        req: OpId,
-        gen: u64,
-        through: u64,
-        refused: bool,
-        replica: &dyn Replica,
-        out: &mut Vec<Action>,
-    ) {
-        let root = self.root_node();
-        let Some(late) = self.deleg_take_late(req, ReqKind::Stream, gen, None) else {
-            return;
-        };
-        let Some(d) = self.dl.mine.get_mut(&gen) else {
-            return;
-        };
-        if refused
-            || late.to.is_none()
-            || late.to != root
-            || d.last_root != late.to
-            || late.round != d.stream_round
-        {
-            return;
-        }
-        if through <= d.streamed_through {
-            return;
-        }
-        tracing::debug!(
-            node = self.cfg.node_id,
-            gen,
-            through,
-            was = d.streamed_through,
-            late_ms = now.since(late.sent),
-            "a late stream acknowledgement counted"
-        );
-        d.streamed_through = through;
         if d.inflight.is_none() {
             d.stream_after = None;
             d.stream_backoff_ms = 0;
         }
+        if progressed && !answers_inflight {
+            self.stats.deleg_stream_acks_unmatched += 1;
+        }
         self.deleg_drop_left(gen, replica);
         self.deleg_stream(now, replica, out);
-        self.complete_ready(now, replica, out);
     }
 
     /// A stream, renewal or recall request failed at the transport: let
@@ -2037,13 +2092,23 @@ impl Core {
             self.cancel_timer(t, out);
         }
         self.dl.by_req.insert(req, (gen, ReqKind::Renew));
-        let backup = self.dl.mine.get(&gen).and_then(|d| d.backup);
-        self.dl.mine.get_mut(&gen).expect("present").renew_backup = backup;
+        let d = self.dl.mine.get_mut(&gen).expect("present");
+        let backup = d.backup;
+        d.renew_backup = backup;
+        let round = d.stream_round;
+        tracing::debug!(
+            node = self.cfg.node_id,
+            gen,
+            ?req,
+            root,
+            "delegation renewal sent"
+        );
         out.push(Action::Send {
             to: root,
             msg: PeerMsg::DelegRenew {
                 req,
                 gen,
+                round,
                 backup,
                 stream_head: 0,
                 stream_head_at: now.0,
@@ -2067,6 +2132,7 @@ impl Core {
         from: NodeId,
         req: OpId,
         gen: u64,
+        round: u64,
         backup: Option<NodeId>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2083,12 +2149,21 @@ impl Core {
                         if until > g.until {
                             g.until = until;
                         }
+                        g.renewed_until = g.renewed_until.max(until);
                     }
                     if g.backup != backup {
                         g.backup = backup;
                     }
                 }
             }
+            tracing::debug!(
+                node = self.me(),
+                from,
+                gen,
+                ?req,
+                ttl_ms,
+                "delegation renewal"
+            );
             if ttl_ms > 0 {
                 self.stats.deleg_renewals += 1;
                 self.lease.touch(now);
@@ -2128,6 +2203,7 @@ impl Core {
             msg: PeerMsg::DelegRenewed {
                 req,
                 gen,
+                round,
                 ttl_ms,
                 locks,
                 lock_grace_ms,
@@ -2271,37 +2347,67 @@ impl Core {
         (end - now.0).max(0) as u64
     }
 
+    /// The root's answer to a renewal. `false`: it is not from the root
+    /// this generation renews with, in its round
+    /// ([`DelegateState::stream_round`]), or the generation is not this
+    /// node's — another root's grant, one answering this node's previous
+    /// incarnation (whose request ids this one reuses), or a late one for
+    /// an ended generation says nothing about this grant, and neither
+    /// does the lock handoff it carries.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_renewed(
         &mut self,
         now: Ms,
+        from: NodeId,
         req: OpId,
         gen: u64,
+        round: u64,
         ttl_ms: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
-    ) {
+    ) -> bool {
+        let root = self.root_node();
+        tracing::debug!(
+            node = self.cfg.node_id,
+            from,
+            gen,
+            ?req,
+            ttl_ms,
+            in_flight = self.dl.by_req.contains_key(&req),
+            "delegation renewal answer"
+        );
+        match self.dl.mine.get(&gen) {
+            Some(d) if root == Some(from) && d.stream_round == round => {}
+            // Not this node's any more (ended, or never installed here):
+            // nothing to renew, and its lock handoff — the cut above all,
+            // which would replace a newer root's — says nothing either.
+            _ => {
+                self.stats.deleg_renewed_stale += 1;
+                return false;
+            }
+        }
         if !self.dl.by_req.contains_key(&req) {
             self.deleg_late_renewed(now, req, gen, ttl_ms, replica, out);
-            return;
+            return true;
         }
         let Some((g, ReqKind::Renew)) = self.dl.by_req.remove(&req) else {
-            return;
+            return true;
         };
         if g != gen {
-            return;
+            return true;
         }
         let Some(d) = self.dl.mine.get_mut(&gen) else {
-            return;
+            return true;
         };
         let Some((_, sent)) = d.renew.take() else {
-            return;
+            return true;
         };
         if let Some(t) = d.renew_timer.take() {
             // (A lapsed generation's retry.)
             self.cancel_timer(t, out);
         }
         let Some(d) = self.dl.mine.get_mut(&gen) else {
-            return;
+            return true;
         };
         if ttl_ms == 0 {
             // Refused: the generation is ending; stop executing (the log
@@ -2313,7 +2419,7 @@ impl Core {
             for p in parked {
                 self.answer_not_owner(now, p, root, replica, out);
             }
-            return;
+            return true;
         }
         // Measured from the send (M8's discipline): honoured until
         // `sent + ttl − margin` on this clock.
@@ -2349,6 +2455,7 @@ impl Core {
             self.deleg_renew_now(now, gen, out);
         }
         self.deleg_after_event(now, replica, out);
+        true
     }
 
     /// The answer to a renewal [`Core::deleg_expire_inflight`] stopped
@@ -3033,7 +3140,41 @@ impl Core {
         self.deleg_wait_done(now, wait_id(gen), replica, out);
     }
 
-    /// The root appends a delegate's batch.
+    /// A batch from a generation's delegate is as good a sign of life as
+    /// its renewal: the root does not outwait (nor seal through its
+    /// backup) a delegate that is streaming to it. Under load the root
+    /// handles renewals and batches late, not never; a delegate whose
+    /// renewals queue behind (or whose answers came too late to count, as
+    /// before the answers were one way) is still here, and sealing it at
+    /// the cursor it is streaming from left its writes waiting for minutes
+    /// (`stress-ng-fs-nodes`). Only the root's own wait moves: the
+    /// delegate honours its grant from its renewals alone, so a later
+    /// `until` here is never less safe. Not during a recall (no renewal is
+    /// granted then either: the recall's outwait stands).
+    fn deleg_live_by_stream(&mut self, now: Ms, gen: u64) {
+        let ttl = self.cfg.delegation_ttl_ms.min(self.grant_cap_ms(now));
+        if ttl == 0 || self.dl.epoch_active {
+            return;
+        }
+        let extra = self.reclaim_horizon_ms() - self.cfg.delegation_ttl_ms;
+        let Some(g) = self.dl.gens.get_mut(&gen) else {
+            return;
+        };
+        if g.ended || g.recall != RecallPhase::None {
+            return;
+        }
+        // (The expiry timer re-arms itself when it fires before `until`.)
+        if now >= g.renewed_until {
+            // The renewals alone would have let it be outwaited.
+            self.stats.deleg_live_by_stream += 1;
+        }
+        g.until = g.until.max(now.plus(ttl + extra));
+    }
+
+    /// The root appends a delegate's batch, and acknowledges the stream
+    /// through its cursor (cumulative: a batch it already holds, re-sent
+    /// because the delegate gave up on an answer that was only late, is
+    /// answered with the same cursor).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_delegate_stream(
         &mut self,
@@ -3041,6 +3182,7 @@ impl Core {
         from: NodeId,
         req: OpId,
         gen: u64,
+        round: u64,
         txs: Vec<constellation_meta::DelegateTx>,
         leaving: Vec<constellation_meta::locks::Grant>,
         leaving_barriers: Vec<(Ino, i64)>,
@@ -3054,6 +3196,7 @@ impl Core {
                 msg: PeerMsg::DelegateStreamAck {
                     req,
                     gen,
+                    round,
                     through,
                     refused: true,
                 },
@@ -3069,6 +3212,18 @@ impl Core {
             refuse(out, g.cursor);
             return;
         }
+        self.deleg_live_by_stream(now, gen);
+        let g = self.dl.gens.get(&gen).expect("present");
+        tracing::debug!(
+            node = self.me(),
+            from,
+            gen,
+            ?req,
+            first = txs.first().map(|t| t.idx).unwrap_or(0),
+            last = txs.last().map(|t| t.idx).unwrap_or(0),
+            cursor = g.cursor,
+            "delegate stream batch received"
+        );
         let mut cursor = g.cursor;
         let mut appended = 0u64;
         let batch_last = txs.last().map(|t| t.idx).unwrap_or(0);
@@ -3149,6 +3304,7 @@ impl Core {
             msg: PeerMsg::DelegateStreamAck {
                 req,
                 gen,
+                round,
                 through: cursor,
                 refused: false,
             },
@@ -3306,6 +3462,7 @@ impl Core {
                 seal_attempts: 0,
                 cursor: 0,
                 until: now.plus(self.reclaim_horizon_ms()),
+                renewed_until: now.plus(self.reclaim_horizon_ms()),
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,
                 ended: false,

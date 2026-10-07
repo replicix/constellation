@@ -1410,7 +1410,9 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | SnapshotBatchRequest { requester, .. } => *requester,
         ChunksDurable { from, .. }
         | DelegateStream { from, .. }
+        | DelegateStreamAck { from, .. }
         | DelegRenew { from, .. }
+        | DelegRenewed { from, .. }
         | DelegBackupAppend { from, .. }
         | StreamAhead { from, .. }
         | LockGranted { from, .. }
@@ -1574,30 +1576,84 @@ async fn handle_stream<S: PeerService>(
                 }
                 Some(Payload::Ok { req_id: 0 })
             }
+            // One way, like `LockGranted` below: queued for the core and
+            // answered `Ok` at once; the core answers with its own
+            // one-way message. Waiting here for the core held a stream
+            // permit per batch and renewal for as long as the root's core
+            // was behind, and an answer later than the requester's
+            // timeout was lost (`stress-ng-fs-nodes`: a delegate re-sent
+            // a batch the root already had for minutes).
             Payload::DelegateStream {
                 from,
                 req_id,
                 gen,
+                round,
                 txs,
                 leaving,
                 leaving_barriers,
-            } => Some(
-                service
-                    .delegate_stream_requested(from, req_id, gen, txs, leaving, leaving_barriers)
-                    .await,
-            ),
+            } => {
+                service.delegate_stream(from, req_id, gen, round, txs, leaving, leaving_barriers);
+                Some(Payload::Ok { req_id })
+            }
+            Payload::DelegateStreamAck {
+                from,
+                req_id,
+                gen,
+                round,
+                through,
+                refused,
+            } => {
+                service.delegate_stream_acked(from, req_id, gen, round, through, refused);
+                Some(Payload::Ok { req_id })
+            }
             Payload::DelegRenew {
                 from,
                 req_id,
                 gen,
+                round,
                 backup,
                 stream_head,
                 stream_head_at,
-            } => Some(
-                service
-                    .deleg_renew_requested(from, req_id, gen, backup, stream_head, stream_head_at)
-                    .await,
-            ),
+            } => {
+                service.deleg_renew(
+                    from,
+                    req_id,
+                    gen,
+                    round,
+                    backup,
+                    stream_head,
+                    stream_head_at,
+                );
+                Some(Payload::Ok { req_id })
+            }
+            Payload::DelegRenewed {
+                from,
+                req_id,
+                gen,
+                round,
+                ttl_ms,
+                locks,
+                lock_grace_ms,
+                lock_floor,
+                lock_cut_at,
+                lock_cut,
+                lock_barrier,
+            } => {
+                service.deleg_renewed(
+                    from,
+                    req_id,
+                    gen,
+                    round,
+                    ttl_ms,
+                    locks,
+                    lock_grace_ms,
+                    lock_floor,
+                    lock_cut_at,
+                    lock_cut,
+                    lock_barrier,
+                );
+                Some(Payload::Ok { req_id })
+            }
             Payload::DelegRecall {
                 root,
                 req_id,
@@ -1885,8 +1941,6 @@ async fn handle_stream<S: PeerService>(
             | Payload::MutateReply { .. }
             | Payload::ReadIndexReply { .. }
             | Payload::ReadRecalled { .. }
-            | Payload::DelegateStreamAck { .. }
-            | Payload::DelegRenewed { .. }
             | Payload::DelegRecalled { .. }
             | Payload::DelegBackupAck { .. }
             | Payload::DelegSealed { .. }

@@ -1788,6 +1788,7 @@ impl Core {
         // op's keys fall under first, and wait for its `deps`; `finish`
         // skips this rid until the parked continuation executes it.
         if self.cfg.delegation {
+            self.deleg_root_sync_due(now, replica, out);
             let keys = super::holder::keys_of_op_in(&op, replica);
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -2525,7 +2526,13 @@ impl Core {
     /// carries is not the log's (long_backup seed 56774: the deposed
     /// holder's own `Refused` row, never acknowledged, answered `ENOENT`
     /// at the deadline; the op then ran by rid under the next holder and
-    /// succeeded).
+    /// succeeded). A holder's row that is not in its journal is in an
+    /// applied segment — the log (a holder applies its own segments once
+    /// they landed): answered as a non-holder's is, whatever its journal
+    /// still waits for (long-delegated-late-answers seed 1381: a backup
+    /// took over 120 ms before its own forwarded create's deadline; the
+    /// create was at log seq 15, the new holder's first segments were not
+    /// durable yet, and the client heard `EIO`).
     pub(crate) fn settled_outcome(&self, rid: Rid, replica: &dyn Replica) -> Option<MutateOutcome> {
         let holds = self.lease.held.is_some() || self.lease.epoch_held();
         if !holds {
@@ -2539,6 +2546,9 @@ impl Core {
         }
         let epoch = self.lease.epoch().unwrap_or(self.ship.max_epoch);
         let outcome = completed_as_outcome(replica, rid, epoch)?;
+        if !journal_carries_outcome(replica, rid) {
+            return Some(outcome);
+        }
         let position = Position {
             seq: self.ship.head_seq,
             pending: replica.journal_position(epoch),

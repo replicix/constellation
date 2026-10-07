@@ -2826,11 +2826,65 @@ impl Meta {
         // apply from the segment, in log order (epoch seed 64010: redone
         // after the segment instead, a delegate's `Create` came back
         // after the rename the segment carried and the name diverged).
-        let first_local = live
-            .iter()
-            .filter(|(_, entry)| matches!(entry, LiveEntry::Local { .. }))
-            .map(|(seq, _)| *seq)
-            .min();
+        //
+        // A delegate's own stream transactions (`Local` rows of a
+        // generation) are the exception: the segment goes under the
+        // oldest one it conflicts with, not under the oldest one. Their
+        // keys are the subtree's, which the log changes only through
+        // this delegate's own rows (skipped below, or rolled back with
+        // their row) or after a `Recall` (which strands them); a segment
+        // that touches none of them commutes with them, so it applies on
+        // top, captured as a `Foreign` row — the state every replica
+        // reaches when they ship after it (B-2's rule below, for the
+        // delegate's rows). Rewinding them all for every segment made
+        // each tailed segment cost the delegate's whole unappended stream
+        // (`stress-ng-fs-nodes`: 110–240 transactions, 100–400 ms per
+        // segment against ~150 segments a second; its core fell minutes
+        // behind the holder's log, and its stream acknowledgements and
+        // renewal answers with it). A holder's own unshipped rows keep
+        // the rewind (gen 0: they may conflict with a late segment of
+        // the previous tenure anywhere).
+        let first_local = {
+            let mut skipped: HashSet<u64> = confirmed
+                .iter()
+                .flat_map(|(_, first, last)| *first..=*last)
+                .collect();
+            skipped.extend(own_rows.keys());
+            let mut jseqs = rows.iter();
+            let touch = TouchSet::from_records(records.iter().filter(|rec| {
+                if matches!(rec, LogRecord::Atime { .. }) {
+                    return true;
+                }
+                let jseq = jseqs.next().copied();
+                !jseq.is_some_and(|j| skipped.contains(&j))
+            }));
+            let holder_first = live
+                .iter()
+                .filter(|(_, entry)| matches!(entry, LiveEntry::Local { gen: 0, .. }))
+                .map(|(seq, _)| *seq)
+                .min();
+            let mut delegate_rows: Vec<u64> = live
+                .iter()
+                .filter(|(seq, entry)| {
+                    matches!(entry, LiveEntry::Local { gen, .. } if *gen != 0)
+                        && holder_first.is_none_or(|h| **seq < h)
+                })
+                .map(|(seq, _)| *seq)
+                .collect();
+            delegate_rows.sort_unstable();
+            let mut first = holder_first;
+            for spec_seq in delegate_rows {
+                let Some(v) = tx.get(&self.spec, seq_key(spec_seq))? else {
+                    continue;
+                };
+                let row: SpecRow = postcard::from_bytes(&v)?;
+                if row_touches(&tx, self, &row)?.overlaps(&touch) {
+                    first = Some(spec_seq);
+                    break;
+                }
+            }
+            first
+        };
         // EC2 campaign 4 B-2: the same for outstanding speculation of any
         // other kind that this segment's records overlap (or that it
         // retires): the segment is earlier in the log than it, so its

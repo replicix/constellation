@@ -104,23 +104,6 @@ impl From<SyncFailure> for String {
     }
 }
 
-/// Plan 30 §M11: the root's answer to a delegate's renewal
-/// (`SyncRequest::PeerDelegRenew`): the ttl (0: refused) and (§M14) the
-/// root's lock grants under the subtree, handed over with the first
-/// renewal, the remaining lock grace on it (ms), the subtree's floor, the
-/// root's cut and the latest outwait barrier under the subtree (see
-/// `PeerMsg::DelegRenewed`).
-#[derive(Debug, Default)]
-pub struct DelegRenewReply {
-    pub ttl_ms: u64,
-    pub locks: Vec<constellation_meta::locks::Grant>,
-    pub lock_grace_ms: u64,
-    pub lock_floor: constellation_meta::Position,
-    pub lock_cut_at: i64,
-    pub lock_cut: constellation_meta::Position,
-    pub lock_barrier: i64,
-}
-
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
@@ -275,28 +258,58 @@ pub enum SyncRequest {
         inos: Vec<Ino>,
         reply: tokio::sync::oneshot::Sender<()>,
     },
-    /// Plan 30 §M11: a delegate's stream batch (this node is the root);
-    /// answered `(through, refused)`.
+    /// Plan 30 §M11, one way: a delegate's stream batch (this node is
+    /// the root). The core answers with its own `DelegateStreamAck`.
     PeerDelegateStream {
         from: u64,
+        req_id: u64,
         gen: u64,
+        round: u64,
         txs: Vec<constellation_meta::DelegateTx>,
         leaving: Vec<constellation_meta::locks::Grant>,
         leaving_barriers: Vec<(Ino, i64)>,
-        reply: tokio::sync::oneshot::Sender<(u64, bool)>,
     },
-    /// Plan 30 §M11: a delegate's renewal; answered with the ttl (0:
-    /// refused).
+    /// Plan 30 §M11, one way: the root's acknowledgement of this
+    /// delegate's stream.
+    PeerDelegateStreamAck {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        round: u64,
+        through: u64,
+        refused: bool,
+    },
+    /// Plan 30 §M11, one way: a delegate's renewal. The core answers
+    /// with its own `DelegRenewed`.
     PeerDelegRenew {
         from: u64,
+        req_id: u64,
         gen: u64,
+        round: u64,
         /// Phase 2b: the delegate's backup peer (0: none).
         backup: u64,
         /// Plan 30 §M14: the delegate's executed stream head, and when
         /// it sent the renewal (its clock).
         stream_head: u64,
         stream_head_at: i64,
-        reply: tokio::sync::oneshot::Sender<DelegRenewReply>,
+    },
+    /// Plan 30 §M11, one way: the root's answer to this delegate's
+    /// renewal: the ttl (0: refused) and (§M14) the root's lock grants
+    /// under the subtree, the remaining lock grace on it (ms), its lock
+    /// floor, its cut and the latest outwait barrier under the subtree
+    /// (see `PeerMsg::DelegRenewed`).
+    PeerDelegRenewed {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        round: u64,
+        ttl_ms: u64,
+        locks: Vec<constellation_meta::locks::Grant>,
+        lock_grace_ms: u64,
+        lock_floor: constellation_meta::Position,
+        lock_cut_at: i64,
+        lock_cut: constellation_meta::Position,
+        lock_barrier: i64,
     },
     /// Plan 30 §M11: the root recalls a generation this node holds;
     /// answered with the highest stream index executed here (and, §M14,

@@ -114,6 +114,39 @@ re-validate the operations. It journals them with the delegate's origin,
 so the segment carries it and every replica, the delegate included,
 learns the generation's applied index.
 
+Stream batches (`DelegateStream`) and renewals (`DelegRenew`) are one-way
+messages, and so are the root's answers (`DelegateStreamAck`,
+`DelegRenewed`): the receiving node acknowledges a message once it is
+queued for its authority core, so no request slot waits for the root's
+core and no answer is lost to a request timeout. The stream
+acknowledgement is cumulative (`through`: the root holds the
+generation's stream through that index, whichever batch it answers), so
+an answer to a batch the delegate already gave up on and re-sent still
+counts, answers that overtake each other never move the delegate's
+cursor back, and duplicates change nothing. One batch is in flight per
+generation; one not answered within the request timeout is sent again
+from the acknowledged cursor after a backoff (4 ticks, doubling to
+2 s), and the root, which skips the rows it holds, answers it with the
+same cursor. Every batch and renewal carries the delegate's stream
+round: its incarnation and a fresh id at the install and at every change
+of root. An answer counts only from the root the generation streams to,
+in the round it answers, so an old root's answer (or one from an
+earlier tenure of the same node, or one to the delegate's previous
+incarnation, whose request ids the new one reuses) never credits the
+new root with rows it does not have. The root counts a batch from the
+generation's delegate as a sign of life, as it counts a renewal: while
+the delegate streams, re-sends included, the root neither outwaits the
+grant nor seals the delegate's backup. Before, a root that answered
+later than the 2 s batch timeout (1 s for a renewal) had every answer
+thrown away; the delegate re-sent a batch the root already held every
+2.5 s, and the root sealed the generation as silent at the very cursor
+the delegate was streaming from (`stress-ng-fs-nodes`: the delegate's
+writes waited 100–220 s). Most of that lateness was the delegate's own
+core falling behind the holder's log: every tailed segment rewound its
+whole unappended stream. A segment now goes under a delegate's
+transactions only where it overlaps them (see
+[Forwarded mutations](forwarded-mutations.md#speculation-and-stranded-op-recovery)).
+
 A forward carries `deps`: for each delegate stream, the highest
 acknowledged position the requester has observed. The root appends a
 transaction only once everything in its `deps` is in its replica, and a
@@ -162,7 +195,9 @@ delegated directory do not wait for its ship either. Status:
   under 3 s and lapsed on any slow step). The delegate
   renews it at half its TTL (`DelegRenew`); the root answers with a new
   grant capped by the root's own lease (`expires − margin`), so a grant
-  never outlives the lease it came from.
+  never outlives the lease it came from. A renewal not answered within
+  the request timeout is sent again; a grant that comes later still
+  counts, from its own renewal's send, for up to a minute.
 - The delegate honours a grant until `sent + ttl − margin` on its own
   clock; the root considers it live until `granted + ttl + margin` on
   its clock (the same discipline as read delegations and lock grants).
