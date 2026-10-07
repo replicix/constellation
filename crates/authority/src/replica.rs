@@ -976,7 +976,10 @@ impl Replica for Meta {
     fn delegate_stranded(&self, gen: u64) -> bool {
         // An unreadable mark is taken as set: the cost is a generation
         // ended early, not a stream that never drains.
-        Meta::delegate_stranded(self, gen).unwrap_or(true)
+        Meta::delegate_stranded(self, gen).unwrap_or_else(|e| {
+            tracing::warn!(gen, error = %e, "delegate-stranded mark unreadable; taking it as set");
+            true
+        })
     }
 
     fn void_stream(&self, gen: u64, cut: u64) {

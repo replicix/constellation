@@ -342,10 +342,7 @@ designations create no delegation.
   executes in it again. It ends the generation itself once its gate
   opens; if it crashes or loses the lease first, it comes back as a
   stopped delegate that answers a recall at the log's index of the
-  stream, and the next root ends it there (before, it re-adopted the
-  generation, streamed rows past the hole, and the root's cursor never
-  moved: sim `locks-unlinked-delegated-dbackup-random` seeds 2477,
-  2982). A generation the successor inherits is learned when its takeover gate
+  stream, and the next root ends it there. A generation the successor inherits is learned when its takeover gate
   opens, whichever round that is in.
 - While any generation is live, the root does not release its lease when
   idle and declines a cooperative handoff.

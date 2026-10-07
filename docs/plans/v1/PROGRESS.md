@@ -44073,6 +44073,16 @@ the same (gen 3, 11 → 12).
 | Sim regression (fails without the fix: seed 2477 "did not reach quiescence within 90000ms") | done | `regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982` |
 | Docs | done | `docs/reference/features/delegations.md` ("Root fails over") |
 
+Review follow-up (2026-10-07): core tests
+`a_restarted_delegate_re_adopts_a_stranded_generation_stopped` and
+`the_takeover_gate_stops_a_generation_whose_rows_it_stranded` (each fails with
+its code path disabled: re-adoption `stopped`, recall `through`, gate loop);
+`Replica::delegate_stranded` logs a store read error (`warn`, still `true`).
+Bug history moved here from the reference doc: before the mark, a restarted
+delegate re-adopted the generation, streamed rows past the hole and the root's
+cursor never moved (sim seeds 2477, 2982). Not done: `strand_tx` reporting the
+stranded generations (the optional nit).
+
 Gates (`CARGO_TARGET_DIR` unset, `ulimit -n 65536`, sims with
 `TMPDIR=/dev/shm/stq`, harness with `TMPDIR=/var/tmp/stq/tmp`, prefix
 `stq`; 16 CPUs):

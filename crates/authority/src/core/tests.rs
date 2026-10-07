@@ -8509,6 +8509,97 @@ mod locks {
         (dir, f)
     }
 
+    /// Executes two rows of generation 7 as node 3, the delegate.
+    fn two_delegate_rows(h: &Harness, dir: Ino) {
+        for n in 1..=2 {
+            let op = MutateOp::Create {
+                parent: dir,
+                name: format!("r{n}"),
+                ino: h.meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            let rid = Rid {
+                node: 3,
+                incarnation: 1,
+                seq: n,
+            };
+            let tag = constellation_meta::locks::LockTag::NONE;
+            let (_, idx) = h
+                .meta
+                .delegate_execute(&op, Some(rid), 7, Default::default(), &tag, 0)
+                .unwrap();
+            assert_eq!(idx, n);
+        }
+    }
+
+    /// strand-takeover-quiescence: a takeover's strand of a delegate's own
+    /// rows marks the generation; a restarted core re-adopts it stopped
+    /// and answers a recall at the log's index of the stream, not its
+    /// counter.
+    #[test]
+    fn a_restarted_delegate_re_adopts_a_stranded_generation_stopped() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        assert!(!h.core.dl.mine[&7].stopped);
+        two_delegate_rows(&h, dir);
+        h.meta.strand_for_takeover(2, &[7]).unwrap();
+        assert_eq!(h.meta.delegate_idx(7).unwrap(), 2, "the counter stays");
+        // The restart.
+        h.core = Core::new(h.core.cfg.clone());
+        h.core.lease.cached_holder = Some(1);
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        assert!(h.core.dl.mine[&7].stopped, "re-adopted live");
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(5),
+                dir,
+                gen: 7,
+            },
+        });
+        let want = h.meta.log_stream_idx(7).unwrap();
+        assert!(
+            sends(&out).iter().any(|(to, m)| *to == 1
+                && matches!(m, PeerMsg::DelegRecalled { gen: 7, through, .. } if *through == want)),
+            "no recall answer at the log's index {want}: {out:?}"
+        );
+    }
+
+    /// strand-takeover-quiescence: the takeover gate's strand of the
+    /// delegate's own rows stops the generation at once.
+    #[test]
+    fn the_takeover_gate_stops_a_generation_whose_rows_it_stranded() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let (dir, _) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        two_delegate_rows(&h, dir);
+        h.hold(
+            2,
+            Some(PendingGate {
+                epoch: 2,
+                takeover: true,
+                marker_shipped: true,
+                drained: false,
+                fast_prev: None,
+                backup_tail_epoch: Some(1),
+                shippable: true,
+            }),
+        );
+        assert!(!h.core.dl.mine[&7].stopped);
+        h.core.complete_gate(h.now, &h.meta, &mut out);
+        assert!(h.meta.delegate_stranded(7).unwrap());
+        assert!(h.core.dl.mine[&7].stopped, "the gate left it running");
+    }
+
     /// overload-cascade-2 (`stress-ng-fs-nodes`): a file locked through
     /// a delegate is unlinked under its lock (`stress-ng`'s lock
     /// stressors do). No subtree contains it any more, so by location its

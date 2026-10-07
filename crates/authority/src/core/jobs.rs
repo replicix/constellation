@@ -292,7 +292,7 @@ impl Job {
 }
 
 /// The state of a pending takeover gate after one step of it.
-enum GateStep {
+pub(super) enum GateStep {
     Done,
     NeedMarker,
     NeedDrain,
@@ -1176,7 +1176,12 @@ impl Core {
     /// `shipper::complete_gate`: after the marker (or with none needed),
     /// strand what the new epoch supersedes, replay the queue locally,
     /// drain the older epochs' inbox, open the view.
-    fn complete_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) -> GateStep {
+    pub(super) fn complete_gate(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> GateStep {
         let Some(gate) = self.lease.gate else {
             return GateStep::Done;
         };
