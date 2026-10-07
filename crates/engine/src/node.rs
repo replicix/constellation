@@ -1164,6 +1164,7 @@ impl Engine {
                     holds: Some(holds.clone()),
                     off_core: off_core.clone(),
                     urgent_rx: Some(urgent_rx),
+                    urgent_tx: Some(urgent_tx.clone()),
                 },
                 sync_tx.clone(),
                 sync_rx,

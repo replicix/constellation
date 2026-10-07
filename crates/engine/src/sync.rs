@@ -515,6 +515,23 @@ pub enum SyncRequest {
             )>,
         >,
     },
+    /// The owner's answer to this node's own lock renewal `req_id` sent
+    /// to `to` (`None`: none came; `outage` as in `Event::PeerFailed`).
+    /// The driver's renewal RPC puts it on the urgent lane, as the
+    /// renewal was at the owner: a grant renewed late here lapses all
+    /// the same.
+    LockRenewAnswered {
+        to: u64,
+        req_id: u64,
+        results: Option<
+            Vec<(
+                Ino,
+                constellation_meta::locks::GrantId,
+                constellation_authority::LockRenewResult,
+            )>,
+        >,
+        outage: bool,
+    },
     /// Plan 30 §M14: a peer's `getlk`, to answer as the owner.
     PeerLockTest {
         requester: u64,

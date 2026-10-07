@@ -314,6 +314,10 @@ pub struct DriverDeps {
     /// else, the internal channel included ([`Driver::run`]). Taken by
     /// [`Driver::new`].
     pub urgent_rx: Option<mpsc::UnboundedReceiver<SyncRequest>>,
+    /// The urgent lane's sender, for the answers to this node's own lock
+    /// renewals ([`SyncRequest::LockRenewAnswered`]); `None` without a
+    /// peer service (they go on the internal channel then).
+    pub urgent_tx: Option<mpsc::UnboundedSender<SyncRequest>>,
 }
 
 /// Plan 30 §M7: frames queued for one log-stream subscriber, at most
@@ -757,7 +761,7 @@ pub struct Driver {
     inbox: InboxStore,
     int_tx: mpsc::UnboundedSender<Internal>,
     int_rx: mpsc::UnboundedReceiver<Internal>,
-    /// The timers that keep a delegate's grant ([`prompt_timer`]),
+    /// The timers that keep a grant this node holds ([`prompt_timer`]),
     /// served before the internal channel.
     prompt_tx: mpsc::UnboundedSender<Internal>,
     prompt_rx: mpsc::UnboundedReceiver<Internal>,
@@ -825,7 +829,8 @@ pub struct Driver {
     /// refresh), and the driver loop's progress stamp: see
     /// [`holder_alive_task`].
     alive: Arc<Mutex<Option<AliveTargets>>>,
-    /// The urgent lane ([`DriverDeps::urgent_rx`]); `None` once closed.
+    /// The urgent lane ([`DriverDeps::urgent_rx`]); `None` once closed
+    /// (never while the driver holds [`DriverDeps::urgent_tx`]).
     urgent_rx: Option<mpsc::UnboundedReceiver<SyncRequest>>,
     /// The holders' liveness handed to the core so far
     /// ([`fresh_heard`]).
@@ -1243,14 +1248,64 @@ fn waits_for_renewals(kind: TimerKind) -> bool {
     matches!(kind, TimerKind::LockGrantExpiry | TimerKind::DelegExpiry)
 }
 
-/// A delegate's timers that keep its grant: the renewal and the lapse.
-/// Delivered on a lane served before the internal channel
-/// ([`Driver::run`]): a backlog of frames there must not hold back the
-/// renewal (the root outwaits a silent delegate) nor the lapse (the grant
-/// is not honoured past it). The lapse still goes after the renewal
-/// answers queued on the urgent lane, which is served first.
+/// The timers that keep a grant this node holds: a delegate's renewal
+/// and lapse, and a lock holder's renewal tick. Delivered on a lane
+/// served before the internal channel ([`Driver::run`]): a backlog of
+/// frames there must not hold back a renewal (the owner outwaits a silent
+/// holder) nor the lapse (the grant is not honoured past it). The lapse
+/// still goes after the renewal answers queued on the urgent lane, which
+/// is served first. A lock holder honours a grant from its renewal's
+/// send and drops a lapsed one at the tick, so a tick taken earlier only
+/// renews sooner; the renewal's timeout stays a silence timer.
 fn prompt_timer(kind: TimerKind) -> bool {
-    matches!(kind, TimerKind::DelegRenew | TimerKind::DelegLapse)
+    matches!(
+        kind,
+        TimerKind::DelegRenew | TimerKind::DelegLapse | TimerKind::LockRenewTick
+    )
+}
+
+/// The core's event for the answer to a lock renewal: the owner's
+/// `LockRenewed`, or `PeerFailed` when none came.
+fn lock_renew_event(
+    to: NodeId,
+    req: OpId,
+    results: Option<LockRenewResults>,
+    outage: bool,
+) -> Event {
+    match results {
+        Some(results) => Event::Peer {
+            from: to,
+            msg: PeerMsg::LockRenewed { req, results },
+        },
+        None => Event::PeerFailed { req, to, outage },
+    }
+}
+
+/// Hand the driver the answer to this node's lock renewal `req`
+/// ([`Driver::lock_renew_rpc`]): on the urgent lane when there is one
+/// (a closed one is a driver that is gone: it holds the receiver until
+/// it stops), else on the internal channel.
+fn lock_renew_answer(
+    urgent: Option<&mpsc::UnboundedSender<SyncRequest>>,
+    int_tx: &mpsc::UnboundedSender<Internal>,
+    to: NodeId,
+    req: OpId,
+    results: Option<LockRenewResults>,
+    outage: bool,
+) {
+    match urgent {
+        Some(urgent) => {
+            let _ = urgent.send(SyncRequest::LockRenewAnswered {
+                to,
+                req_id: req.0,
+                results,
+                outage,
+            });
+        }
+        None => {
+            let _ = int_tx.send(Internal::Event(lock_renew_event(to, req, results, outage)));
+        }
+    }
 }
 
 /// A timer that measures a peer's silence: it is handled after the
@@ -1481,9 +1536,11 @@ impl Driver {
             // Waiting for work is not being stuck (`holder_alive_task`).
             self.deps.off_core.set_busy(0);
             let urgent_open = self.urgent_rx.is_some();
-            // The urgent lane first, then a delegate's renewal timers,
-            // then the internal channel: a delegate's grant must not wait
-            // behind its own backlog. With the internal channel first, a
+            // The urgent lane first (with the answers to this node's own
+            // lock renewals), then the timers that keep a grant held here
+            // (a delegate's renewal and lapse, the lock renewal tick),
+            // then the internal channel: a grant must not wait behind its
+            // holder's own backlog. With the internal channel first, a
             // delegate whose log-stream frames queued 17 s deep sent its
             // renewal and took the root's answer that late, and lapsed
             // (`stress-ng-fs-nodes`: a flush parked 47 s). Nothing the
@@ -2598,6 +2655,17 @@ impl Driver {
                     msg: PeerMsg::LockRenew { req, entries },
                 }))
             }
+            SyncRequest::LockRenewAnswered {
+                to,
+                req_id,
+                results,
+                outage,
+            } => Some(Internal::Event(lock_renew_event(
+                to,
+                OpId(req_id),
+                results,
+                outage,
+            ))),
             SyncRequest::PeerLockTest {
                 requester,
                 ino,
@@ -3186,15 +3254,7 @@ impl Driver {
                     req_id: req.0,
                     entries: crate::locks::renew_entries_wire(&entries),
                 };
-                self.lock_rpc(to, req, payload, |reply, req| match reply {
-                    Payload::LockRenewed { req_id, results } if req_id == req.0 => {
-                        Some(PeerMsg::LockRenewed {
-                            req,
-                            results: crate::locks::renew_results_of(results),
-                        })
-                    }
-                    _ => None,
-                });
+                self.lock_renew_rpc(to, req, payload);
             }
             PeerMsg::LockTest { req, ino, mode } => {
                 let payload = Payload::LockTest {
@@ -4098,6 +4158,45 @@ impl Driver {
                 None => {
                     let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
                     let _ = tx.send(Internal::Event(Event::PeerFailed { req, to, outage }));
+                }
+            }
+        });
+    }
+
+    /// [`Driver::lock_rpc`] for this node's own lock renewal: the answer,
+    /// or its failure, comes back on the urgent lane
+    /// ([`SyncRequest::LockRenewAnswered`]), as the renewal was at the
+    /// owner. On the internal channel it waited behind a backlog of
+    /// frames there, and the grant lapsed under the application's lock
+    /// all the same. The renewal's timeout stays on the internal channel:
+    /// an answer queued when it fires is taken first.
+    fn lock_renew_rpc(&self, to: NodeId, req: OpId, payload: Payload) {
+        let urgent = self.deps.urgent_tx.clone();
+        let int_tx = self.int_tx.clone();
+        let answer = move |results: Option<LockRenewResults>, outage: bool| {
+            lock_renew_answer(urgent.as_ref(), &int_tx, to, req, results, outage)
+        };
+        if crate::fault::p2p_denied(to) {
+            // Fault injection: the link to this peer is cut — a
+            // connection failure, at once.
+            answer(None, true);
+            return;
+        }
+        let peers = self.deps.peers.clone();
+        let timeout = Duration::from_millis(self.core.config().forward_timeout_ms);
+        tokio::spawn(async move {
+            let reply = tokio::time::timeout(
+                timeout,
+                peers.request_to_node_timeout(to, &payload, timeout),
+            )
+            .await;
+            match reply.ok().and_then(|r| r.ok()) {
+                Some(Payload::LockRenewed { req_id, results }) if req_id == req.0 => {
+                    answer(Some(crate::locks::renew_results_of(results)), false);
+                }
+                _ => {
+                    let outage = crate::fault::p2p_denied(to) || !peers.connection_alive(to).await;
+                    answer(None, outage);
                 }
             }
         });
@@ -5882,21 +5981,28 @@ mod tests {
         }
     }
 
-    /// Only a delegate's renewal and lapse skip the internal channel's
-    /// backlog; the other timers, the stream tick and the root's expiry
-    /// of the grant included, keep their place in it.
+    /// Only the timers that keep a grant this node holds skip the
+    /// internal channel's backlog: a delegate's renewal and lapse, a lock
+    /// holder's renewal tick. The other timers, the stream tick, the
+    /// renewal timeouts and the owner's expiry of a grant included, keep
+    /// their place in it.
     #[test]
-    fn only_a_delegates_grant_timers_are_prompt() {
+    fn only_a_holders_grant_timers_are_prompt() {
         use super::prompt_timer;
         use constellation_authority::TimerKind;
-        for kind in [TimerKind::DelegRenew, TimerKind::DelegLapse] {
+        for kind in [
+            TimerKind::DelegRenew,
+            TimerKind::DelegLapse,
+            TimerKind::LockRenewTick,
+        ] {
             assert!(prompt_timer(kind), "{kind:?}");
         }
         for kind in [
             TimerKind::DelegExpiry,
             TimerKind::DelegStream,
             TimerKind::LockGrantExpiry,
-            TimerKind::LockRenewTick,
+            TimerKind::LockRenewTimeout,
+            TimerKind::LockRequestTimeout,
             TimerKind::BackupWatch,
             TimerKind::BackupTick,
             TimerKind::ForwardTimeout,
@@ -5904,6 +6010,68 @@ mod tests {
         ] {
             assert!(!prompt_timer(kind), "{kind:?}");
         }
+    }
+
+    /// The answer to this node's lock renewal, or its failure, goes on
+    /// the urgent lane, not behind the internal channel; it reaches the
+    /// core as the owner's `LockRenewed` or as `PeerFailed`. Without a
+    /// peer service it goes on the internal channel.
+    #[test]
+    fn lock_renewal_answers_take_the_urgent_lane() {
+        use super::{lock_renew_answer, Internal, SyncRequest};
+        use constellation_authority::{Event, LockRenewResult, OpId, PeerMsg};
+        use constellation_meta::locks::GrantId;
+        let (urgent_tx, mut urgent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (int_tx, mut int_rx) = tokio::sync::mpsc::unbounded_channel();
+        let results = vec![(7, GrantId::default(), LockRenewResult::Lost)];
+        lock_renew_answer(
+            Some(&urgent_tx),
+            &int_tx,
+            3,
+            OpId(11),
+            Some(results.clone()),
+            false,
+        );
+        lock_renew_answer(Some(&urgent_tx), &int_tx, 3, OpId(12), None, true);
+        assert!(int_rx.try_recv().is_err());
+        let mut events = Vec::new();
+        while let Ok(req) = urgent_rx.try_recv() {
+            let SyncRequest::LockRenewAnswered {
+                to,
+                req_id,
+                results,
+                outage,
+            } = req
+            else {
+                panic!("not a renewal answer");
+            };
+            events.push(super::lock_renew_event(to, OpId(req_id), results, outage));
+        }
+        let [Event::Peer {
+            from: 3,
+            msg:
+                PeerMsg::LockRenewed {
+                    req: OpId(11),
+                    results: got,
+                },
+        }, Event::PeerFailed {
+            req: OpId(12),
+            to: 3,
+            outage: true,
+        }] = events.as_slice()
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(got, &results);
+        lock_renew_answer(None, &int_tx, 4, OpId(13), None, false);
+        assert!(matches!(
+            int_rx.try_recv(),
+            Ok(Internal::Event(Event::PeerFailed {
+                req: OpId(13),
+                to: 4,
+                outage: false,
+            }))
+        ));
     }
 
     /// Two standalone drivers in one process whose cores reach a rebuild

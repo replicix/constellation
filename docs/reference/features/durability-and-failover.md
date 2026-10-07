@@ -227,11 +227,14 @@ arrivals to the core immediately before it evaluates the seal watch. A
 backup whose own steps take seconds therefore never reads its backlog as
 the holder's silence (one sealed a live holder at `silent_ms=21872`
 while the holder was sending to it). Heartbeats and lock and delegation
-renewals (and the answers to a delegate's renewals) also reach the
-driver on a lane of their own, served before everything else, the
-driver's internal channel included; a delegate's own renewal and lapse
-timers come next, ahead of the internal channel, so a backlog of
-log-stream frames never lapses its grant. An owner's expiry of a grant it handed out (a
+renewals (and the answers to a delegate's and a lock holder's own
+renewals) also reach the driver on a lane of their own, served before
+everything else, the driver's internal channel included. The timers
+that keep a grant this node holds come next, ahead of the internal
+channel: a delegate's renewal and lapse, and a lock holder's renewal
+tick. A backlog of log-stream frames therefore never lapses a
+delegation or a lock grant. A renewal's timeout stays on the internal
+channel, so an answer queued when it fires is taken first. An owner's expiry of a grant it handed out (a
 lock grant, a delegation) is handled after the renewals queued there
 when it fired. The other timers that measure a peer's silence (request
 and renewal timeouts, grant expiries, the log-stream watchdog) are still

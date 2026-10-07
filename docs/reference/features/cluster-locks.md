@@ -136,7 +136,11 @@ and the holder's heartbeat reach the owner's authority driver on a lane
 of their own, ahead of the ordinary peer requests, and a peer request
 whose sender gave up (its request timed out) stops occupying one of the
 connection's stream slots, so a backlog of them never shuts a peer's
-renewals out. A renewal that is not answered within its timeout is sent
+renewals out. At the holder, the renewal tick and the owner's answer
+come ahead of the driver's internal channel too, so a backlog of
+log-stream frames there neither delays a renewal nor holds back its
+answer until the grant has lapsed (see
+[Durability and failover](durability-and-failover.md)). A renewal that is not answered within its timeout is sent
 again at the next tick, but its answer still counts when it comes (for
 up to a minute): a granted renewal is honoured from that renewal's own
 send, as an answer in time would have been. Before, every answer later
