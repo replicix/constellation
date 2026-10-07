@@ -43765,10 +43765,11 @@ counts with unlinks are a floor.
   297, 1293, 1690, 2036), `-partition` 56/3000; 57/3000 without unlinks
   on main and here alike. `sweep_config` on those three variants fails
   until this is fixed.
-- The stranded-own-rows hole in a delegate's stream after it takes the
+- ~~The stranded-own-rows hole in a delegate's stream after it takes the
   root over and crashes inside its takeover gate (should-fix 2 above):
   `-dbackup-random` 2477 and 2982 never reach quiescence (the generation
-  never drains and its ops wait).
+  never drains and its ops wait).~~ Closed by `strand-takeover-quiescence`
+  below.
 - From round 2, unchanged: the delegate-stream answer timeout (the
   `stress-ng-fs-nodes` gate), `backup-takeover-holds-missing-chunks`'
   single failure, the lsm-tree version-lock freeze.
@@ -44002,3 +44003,113 @@ left open. "Owner" is the plan or chunk expected to pick it up.
 | F12 | §17 risks, deferred by design: one shared FUSE mount per filesystem instead of one connection per PV (if fd/kernel cost bites at high PV-per-node counts); a per-pod admission exception instead of a `privileged` namespace; an incremental/resumable purge of huge trashed volumes; a revisit of the idle-TTL default (10 m); clones into dedicated volumes (a full copy) and dropping a dedicated volume's filesystem on `DeleteVolume` (both refused today) | plan 37 follow-up | **open** |
 | F13 | `tests/ci/install-native-s3.sh` release checksums (empty; `auto` falls back to `go install`) | CI owner | **open** (pre-existing) |
 | F14 | `constellation-authority` `sim` `streams_carry_the_log_and_save_tail_gets` takes over 40 min with `TMPDIR` on btrfs (this host's `/var/tmp`) and 26 s–3 min on tmpfs. The sim's stores do real file I/O; either keep them in memory or document a tmpfs `TMPDIR` for `cargo test` | authority owner | **open** (pre-existing; found here) |
+
+## Fix: a delegate that takes the root over and crashes re-sends a stream batch forever (`strand-takeover-quiescence`, 2026-10-07)
+
+Follow-up of `overload-cascade-2` round 3, should-fix 2. Base: main
+`e71b4129`.
+
+Fix: `Meta::strand_for_takeover` marks, in its own transaction, every
+generation of this node's whose rows it stranded (`local` kv
+`deleg_stranded:{gen}`, `Meta::delegate_stranded`). A marked generation is
+never executed in again: the takeover gate stops it at once, a restart
+re-adopts it stopped, and it answers a recall with the log's index of the
+stream (`log_stream_idx`) instead of its counter. The node ends it itself
+when its gate opens (as before); if it crashes or loses the lease first,
+the next root recalls it on the first op in the subtree (or reclaims it
+unrenewed) and ends it at its cursor.
+
+**Cause** (as round 3 traced it, confirmed here on seed 2982): node 2,
+`d1`'s delegate (gen 5) and root 1's backup, executed gen-5 rows 3..5 while
+root 1 was dead, took the root over and stranded them so they follow the
+backup tail; they were replayed as root rows of epoch 2. The delegate's
+next stream index is a persisted counter (`deleg_idx:{gen}`), which the
+strand left at 5. Node 2 crashed inside its takeover gate (the
+read-delegation quarantine) before ending gen 5. Node 1 took over and
+inherited gen 5 at cursor 2; node 2 restarted, re-adopted gen 5, executed
+its next op as index 6 and streamed `from=3 last=6` for the rest of the
+run: the root waits for 3, which no journal holds any more. Seed 2477 is
+the same (gen 3, 11 → 12).
+
+**Decisions.**
+
+- *End the generation, do not renumber.* Pulling the counter back to the
+  log's index would reuse indices 3..5 for different rows, while requesters
+  already hold acknowledgements naming `(5, 3..5)` (their next `deps`,
+  their session waits): such a wait would be met by someone else's row.
+  Ending the generation at the log's cut keeps the existing rule for an
+  ended stream: those acknowledgements are tentative, `deps_lost` holds
+  dependants until the requester's replays by rid settle, and the rows
+  themselves reach the log once, as root rows (replayed by rid from the
+  queue `strand_local_tx` persisted, deduplicated by rid if the replay or
+  a sealed delegate backup's drain lands it twice).
+- *A mark, not a journaled `Recall` at the strand.* A `Recall` journaled
+  in the gate is durable only once shipped; a crash before that (the case
+  here) loses it with the rest of the deposed tenure, and the restarted
+  delegate would re-adopt the generation exactly as before. The mark is
+  local and atomic with the strand, so it survives every crash point after
+  the strand commits, and the generation's end stays the root's job, by
+  the existing paths (`end_generation` on the gate's own root, or recall
+  and reclaim on a successor).
+- *Every generation that lost a row is marked*, even one whose stranded
+  rows were all re-journaled by the predecessor's tail (no hole then). The
+  node ends such a generation anyway when its gate opens; marking it only
+  changes the crash/lease-loss path, where it costs an early end, not a
+  stall. Telling the two apart needs the tail applied first, in a second
+  transaction, which reopens the crash window this closes.
+- A recall's `through` for a marked generation is the log's index as this
+  replica holds it: at most the root's cursor (a lag only makes it lower),
+  so the root ends the generation as soon as it has its own rows.
+- The mark is never cleared: generation numbers are not reused, and the
+  per-generation counters (`deleg_idx`, `deleg_log_idx`) are not cleared
+  either.
+
+| Item | State | Where |
+|---|---|---|
+| Strand marks the generations it holed, atomically | done | `meta::store::spec` (`strand_for_takeover`), `meta::store::local` (`delegate_stranded`, `mark_deleg_stranded_tx`) |
+| `Replica::delegate_stranded` | done | `authority::replica` |
+| Gate stops a marked generation; re-adoption starts it stopped; recall answers at the log's index | done | `core::jobs::complete_gate`, `core::delegate` (`delegation_sync`, `on_deleg_recall`) |
+| Unit test | done | `meta::store::local::tests::a_takeover_strand_marks_the_generations_it_holed` |
+| Sim regression (fails without the fix: seed 2477 "did not reach quiescence within 90000ms") | done | `regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982` |
+| Docs | done | `docs/reference/features/delegations.md` ("Root fails over") |
+
+Gates (`CARGO_TARGET_DIR` unset, `ulimit -n 65536`, sims with
+`TMPDIR=/dev/shm/stq`, harness with `TMPDIR=/var/tmp/stq/tmp`, prefix
+`stq`; 16 CPUs):
+
+- `cargo fmt --all` no diff; `cargo clippy --workspace --all-targets --
+  -D warnings` clean.
+- `cargo test --release -p constellation-authority -p constellation-meta`:
+  authority 281 (+2 ignored) + 4 + sim 127 (+11 ignored); meta 242 (+2
+  ignored) and every integration test binary. 0 failed.
+- `sweep_config`, seeds 0..3000, every config below: 0 failing, except the
+  open stale reads under a lock (should-fix 1 of `overload-cascade-2`
+  round 3, not this chunk's):
+
+  | configs | failing |
+  |---|---|
+  | `locks`, `-partition`, `-skew`, `-failover`, `-failover-backup`, `-faults`, `-blips`, `-blips-tight`, `-blips-tight-single`, `-blips-tight-long-lease`, `-blips-tight-in-doubt`, `-blips-tight-faults`, `-blips-tight-delegated`, `-pause`, `-delegated`, `-released-delegated`, `-writes`, `-delegated-writes`, `-released-writes`, `-failover-backup-writes` | 0 |
+  | `delegated-holder-cut`, `long-delegated`, `delegated-backup`, `delegated-two-gens-root-crash`, `delegated-root-gone`, `delegated-delegate-restart`, `long-delegated-backup` | 0 |
+  | `long-backup`, `long-acks3`, `backup-hot`, `flex-crash` | 0 |
+  | `locks-unlinked-delegated`, `-hcrash`, `-hcrash-backup`, `-dcrash`, `-dcrash-nb`, `-blips` | 0 |
+  | `locks-unlinked-delegated-random` | 3 (935, 2716, 2877: stale reads) — base: the same 3 |
+  | `locks-unlinked-delegated-dbackup-random` | 5 (276, 297, 1293, 1690, 2036: stale reads) — base: those 5 plus 2477, 2982 (quiescence) |
+  | `locks-unlinked-delegated-partition` | 60 (all stale reads) — base: the same 60 seeds |
+
+  "Base" is `e71b4129` unchanged, swept in a scratch worktree. Its
+  `-partition` count is 60 against round 3's 56: drift on main since
+  round 3, identical seed set with and without this fix.
+- Harness `lock-*`, `delegate*` (17 scenarios) once: all PASSED
+  (`lock-grant-dead-generation`, `delegated-subtrees`, `delegate-crash`,
+  `delegate-crash-default-ttl`, `delegate-partition`,
+  `delegated-op-latency`, `lock-holder-partitioned`, `lock-failover`,
+  `lock-holder-killed-contention`, `lock-fence-at-close`, `lock-latency`,
+  `delegate-crash-backup`, `delegate-root-loss`, `delegate-root-blackhole`,
+  `delegate-root-loss-ttl`, `delegate-handoff-renewal`,
+  `delegate-backup-handoff-failover`).
+
+### Open
+
+- The stale reads under a lock after an outwait (`overload-cascade-2`
+  round 3, should-fix 1), unchanged: `sweep_config` on `-random`,
+  `-dbackup-random` and `-partition` keeps failing until that is fixed.

@@ -466,7 +466,10 @@ impl Core {
                     dir: d.dir,
                     gen: d.gen,
                     until: Ms(0),
-                    stopped: false,
+                    // A takeover's strand left a hole in this stream
+                    // (`Meta::strand_for_takeover`): it ends at what the
+                    // log holds of it; nothing more executes here.
+                    stopped: replica.delegate_stranded(d.gen),
                     stream_after: None,
                     stream_backoff_ms: 0,
                     refused: false,
@@ -2394,7 +2397,13 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let through = replica.delegate_idx(gen);
+        // A stream a takeover's strand holed has nothing past what the
+        // log holds of it: its counter's later indices were root rows'.
+        let through = if replica.delegate_stranded(gen) {
+            replica.log_stream_idx(gen)
+        } else {
+            replica.delegate_idx(gen)
+        };
         // Plan 30 §M14: the subtree's lock grants go back with the answer;
         // its waiters are told to ask the root.
         let locks = self.lock_hand_back(gen, replica);

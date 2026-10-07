@@ -1212,6 +1212,17 @@ impl Core {
                             (stranded.shadows + stranded.hints) as u64;
                         self.stats.local_rolled_back += stranded.locals as u64;
                     }
+                    // A generation that lost rows here never executes
+                    // again: ended by this node once its gate opens, or
+                    // by the next root should this one crash or lose the
+                    // lease first.
+                    for gen in own_gens {
+                        if replica.delegate_stranded(gen) {
+                            if let Some(d) = self.dl.mine.get_mut(&gen) {
+                                d.stopped = true;
+                            }
+                        }
+                    }
                 }
                 Err(e) => return GateStep::Failed(e.to_string()),
             }

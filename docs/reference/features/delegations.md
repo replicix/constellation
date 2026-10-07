@@ -330,8 +330,16 @@ designations create no delegation.
   re-journals the predecessor's appends of delegate streams under their
   delegation origin, in the predecessor's order; if it was itself a
   delegate, its own unappended transactions are rolled back and
-  replayed by rid after that tail, never shipped ahead of it. A
-  generation the successor inherits is learned when its takeover gate
+  replayed by rid after that tail, never shipped ahead of it. Such a
+  generation is marked in the same local transaction: its stream now
+  has a hole (the replayed rows are root rows), so the node never
+  executes in it again. It ends the generation itself once its gate
+  opens; if it crashes or loses the lease first, it comes back as a
+  stopped delegate that answers a recall at the log's index of the
+  stream, and the next root ends it there (before, it re-adopted the
+  generation, streamed rows past the hole, and the root's cursor never
+  moved: sim `locks-unlinked-delegated-dbackup-random` seeds 2477,
+  2982). A generation the successor inherits is learned when its takeover gate
   opens, whichever round that is in.
 - While any generation is live, the root does not release its lease when
   idle and declines a cooperative handoff.

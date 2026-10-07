@@ -3102,15 +3102,39 @@ impl Meta {
     /// the same name out of `d1`). Stranded here, the tail re-journals
     /// the appended ones in their place (completing their rids) and the
     /// queued replay re-executes the rest by rid after it, in order.
+    ///
+    /// Such a generation's stream has a hole from here on: the rows the
+    /// predecessor never appended are root rows now, but this node's
+    /// persisted stream counter still counts them, so its next row of
+    /// the generation would follow the hole and no root's cursor ever
+    /// reaches it. The generation is marked stranded in the same
+    /// transaction ([`Meta::delegate_stranded`]): this node never
+    /// executes in it again, and it ends at what the log holds of it —
+    /// ended by this node once its gate opens, or by whichever root
+    /// inherits it if this node crashes or loses the lease first
+    /// (`locks-unlinked-delegated-dbackup-random` seeds 2477 and 2982:
+    /// the delegate-turned-root crashed inside its takeover gate,
+    /// restarted as the generation's delegate and streamed index 6 to a
+    /// root waiting for 3, forever).
     pub fn strand_for_takeover(&self, epoch: u64, own_gens: &[u64]) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
+        let own = |entry: &LiveEntry| match entry {
+            LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen) => Some(*gen),
+            _ => None,
+        };
+        let holed: HashSet<u64> = read_live(&tx, self)?
+            .iter()
+            .filter_map(|(_, entry)| own(entry))
+            .collect();
         let stranded = strand_tx(&mut tx, self, &staged, |entry| {
-            entry.stranded_by(epoch)
-                || matches!(entry, LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen))
+            entry.stranded_by(epoch) || own(entry).is_some()
         })?;
         if !stranded.any() {
             return Ok(stranded);
+        }
+        for gen in holed {
+            local::mark_deleg_stranded_tx(&mut tx, &self.local, gen);
         }
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;

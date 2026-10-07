@@ -432,6 +432,14 @@ impl Meta {
             .unwrap_or(0))
     }
 
+    /// Whether a takeover's strand took rows of this node's stream `gen`
+    /// out of it (`Meta::strand_for_takeover`): the stream has a hole the
+    /// generation cannot continue past.
+    pub fn delegate_stranded(&self, gen: u64) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        Ok(kv_get_tx(&r, &self.local, &deleg_stranded_key(gen))?.is_some())
+    }
+
     /// Phase 2b: the highest index of `gen` in the log as this replica
     /// holds it (see [`deleg_log_idx_key`]).
     pub fn log_stream_idx(&self, gen: u64) -> Result<u64, MetaError> {
@@ -1427,6 +1435,41 @@ mod root_substitution_tests {
             "the log-prefix root carries the shipped owner"
         );
     }
+
+    /// A takeover's strand of this node's own delegate rows leaves its
+    /// stream counter past them; the generation is marked in the same
+    /// transaction, and only a generation that lost rows is.
+    #[test]
+    fn a_takeover_strand_marks_the_generations_it_holed() {
+        let meta = Meta::open_in_memory().unwrap();
+        let tag = crate::locks::LockTag::NONE;
+        for n in 1..=3 {
+            let op = MutateOp::Create {
+                parent: ROOT_INO,
+                name: format!("f{n}"),
+                ino: (3 << 40) | n,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            let rid = Rid {
+                node: 3,
+                incarnation: 1,
+                seq: n,
+            };
+            let (_, idx) = meta
+                .delegate_execute(&op, Some(rid), 5, Default::default(), &tag, 0)
+                .unwrap();
+            assert_eq!(idx, n);
+        }
+        let stranded = meta.strand_for_takeover(2, &[5, 9]).unwrap();
+        assert_eq!(stranded.locals, 3, "{stranded:?}");
+        assert!(meta.delegate_stranded(5).unwrap());
+        assert!(!meta.delegate_stranded(9).unwrap(), "no row of 9 was here");
+        assert_eq!(meta.delegate_idx(5).unwrap(), 3, "the counter stays");
+        assert_eq!(meta.log_stream_idx(5).unwrap(), 0);
+        assert!(meta.delegate_txs_from(5, 1, usize::MAX).unwrap().is_empty());
+    }
 }
 
 /// `local` kv: the next stream index a delegate assigns under a
@@ -1441,6 +1484,22 @@ fn deleg_idx_key(gen: u64) -> String {
 /// a delegate's re-stream start).
 pub(crate) fn deleg_log_idx_key(gen: u64) -> String {
     format!("deleg_log_idx:{gen}")
+}
+
+/// `local` kv: generation `gen`'s stream lost rows to a takeover's
+/// strand (`Meta::strand_for_takeover`); this node, its delegate, never
+/// executes in it again.
+fn deleg_stranded_key(gen: u64) -> String {
+    format!("deleg_stranded:{gen}")
+}
+
+/// Mark generation `gen` stranded (see [`deleg_stranded_key`]).
+pub(crate) fn mark_deleg_stranded_tx(
+    tx: &mut SingleWriterWriteTx,
+    local: &SingleWriterTxKeyspace,
+    gen: u64,
+) {
+    kv_set_tx(tx, local, &deleg_stranded_key(gen), "1");
 }
 
 /// Raise the persisted log index of `gen` to `idx`.

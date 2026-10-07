@@ -4976,6 +4976,29 @@ fn regression_locks_unlinked_delegated_hcrash_backup_seed_41() {
     });
 }
 
+/// `locks-unlinked-delegated-dbackup-random` seeds 2477 and 2982
+/// (overload-cascade-2 round 3, should-fix 2): node 2, a delegate and
+/// the root's backup, took the root over while it held rows of its
+/// generation the dead root never appended; the takeover's strand made
+/// them root rows, and node 2 crashed inside its gate, before it ended
+/// the generation itself. Restarted as the generation's delegate, its
+/// persisted stream counter still counted the stranded rows: its next
+/// row followed the hole, the new root's cursor waited below it, and the
+/// same batch was re-sent for the rest of the run. Now the strand marks
+/// the generation (`Meta::delegate_stranded`): it executes nothing more
+/// and answers a recall at the log's index of it, so the root ends it.
+#[test]
+fn regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982() {
+    for seed in [2_477, 2_982] {
+        run_seed(seed, locks_unlinked_random_config(true)).unwrap_or_else(|e| {
+            panic!(
+                "locks-unlinked-delegated-dbackup-random seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
+            )
+        });
+    }
+}
+
 /// `locks-unlinked-delegated` seeds 292 and 6475 (this chunk's first
 /// cut of the move): a recall and re-delegation left the grant in the
 /// root's handoff for the new generation, whose delegate executed the

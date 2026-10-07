@@ -277,6 +277,10 @@ pub trait Replica {
     /// The highest stream index this node assigned as the delegate of
     /// `gen`.
     fn delegate_idx(&self, gen: u64) -> u64;
+    /// A takeover's strand took rows of this delegate's stream `gen` out
+    /// of it (`Meta::delegate_stranded`): the generation is never
+    /// executed in here again.
+    fn delegate_stranded(&self, gen: u64) -> bool;
     /// Generation `gen` ended at `cut` (the void rule).
     fn void_stream(&self, gen: u64, cut: u64);
     /// Phase 2b (`ack=s3`): transaction `(gen, idx)` of this delegate's
@@ -967,6 +971,12 @@ impl Replica for Meta {
 
     fn delegate_idx(&self, gen: u64) -> u64 {
         Meta::delegate_idx(self, gen).unwrap_or(0)
+    }
+
+    fn delegate_stranded(&self, gen: u64) -> bool {
+        // An unreadable mark is taken as set: the cost is a generation
+        // ended early, not a stream that never drains.
+        Meta::delegate_stranded(self, gen).unwrap_or(true)
     }
 
     fn void_stream(&self, gen: u64, cut: u64) {
