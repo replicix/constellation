@@ -44846,3 +44846,122 @@ cut was 0.2-1.7 s after the end.
 ## Fix: `harness k8s-scenario` holds its docker prefix lock (`k8s-prefix-lock`, 2026-10-07)
 
 `k8s-scenario` labelled its floci with the docker prefix but never took the prefix lock, so a `harness run` on the default prefix swept it as a leftover mid-run (it killed two handoff runs). `k8s::run` (so `--all`, `--parity`, `--repeat`, `--keep`/`--kubeconfig` batches) now takes the lock (`s3env::hold_prefix`) before it creates anything and holds it until it returns; a second run or a `harness run` on the same prefix is refused up front (use `CONSTELLATION_HARNESS_DOCKER_PREFIX`). `--keep` keeps only the cluster: floci is removed at the end and the lock released; a killed run drops the lock with the process. `sweep::targets` factored out of `containers`; test `sweep::tests::a_held_k8s_lock_keeps_the_default_sweep_off_its_container` (holder in a second process). Docs in the `k8s.rs` module header.
+
+## Fix: commits froze for seconds behind lsm-tree's version lock during a major compaction (`lsm-version-lock`, 2026-10-07)
+
+Left open by `overload-cascade-2`: under `stress-ng-fs-nodes` the meta store
+logged `slow commit: 15433 ms for 16 items (memtables=14707ms)` right after
+`Starting major compaction` (`Meta::vacuum_churn`), the authority core waited
+on the writer lock behind such a transaction, and a delegate's log-apply steps
+took 0.5–0.8 s behind compactions.
+
+Fix: lsm-tree (fjall's storage engine) is vendored (`vendor/lsm-tree`, 3.1.10,
+like `vendor/fjall`) and does no disk I/O under a tree's version lock any
+more. A flush, a compaction, a move, a drop or a `clear` computes the next
+version, persists it (fsyncs, `current` rewrite) holding only the compaction
+state mutex, and then swaps it in under a write lock held for a few pointer
+moves. A compaction finishes and reopens its output tables before taking any
+lock. Version GC drops stale versions, and with them a compaction's input
+files, after the lock is released, in lsm-tree and at fjall's rotation call
+site (fjall change 6). Crash ordering and the on-disk format are unchanged
+(`vendor/lsm-tree/CONSTELLATION-PATCH.md`, "Crash safety").
+
+### What the commit waited on
+
+A commit's `memtables` phase is `Tree::append_entry`, which takes the tree's
+version history `RwLock` for reading. fjall holds the journal mutex across
+those inserts, so one tree's wait is every commit's wait. These sections held
+the lock for writing across I/O (measured by timing every holder in a scratch
+build): every flush (`register_tables`: `persist_version`, about 11 ms per
+flush on an idle NVMe), every compaction commit (`consume_writer`, which
+finishes the last output table and runs `Table::recover` on every output,
+plus `persist_version`: 113 ms for a 160-table major compaction), moves and
+drops, and fjall's version GC on every memtable rotation (the last stale
+version's drop unlinks a compaction's input files). Write-stall thresholds and
+the memtable rotation itself were not involved. No configuration change
+removes the stall: every flush and every compaction persists a version.
+
+### Before / after
+
+`crates/meta/tests/compaction_stall.rs`: a writer commits a 3-row transaction
+every millisecond while a major compaction of a 4M-row keyspace runs, in a
+release build. The ext4 disk below is a `dm-delay` device (an fsync takes
+about 80 ms), torn down afterwards.
+
+| | idle NVMe, 5 runs | ext4 on dm-delay, 3 runs |
+|---|---|---|
+| worst commit, upstream lsm-tree | 133–138 ms (`memtables`) | 668–712 ms (`memtables`) |
+| worst commit, patched | 40–61 µs | 337–351 ms (`journal_lock`: fjall's journal rotation by a flush, see below) |
+| commit p50 / p99 | 4–6 µs / 15–22 µs both ways | 3–6 µs / 5–6 ms both ways (the disk) |
+| load of 4M rows | 6.0–6.1 s → 4.4–5.0 s | 9.3–14.8 s → 4.1–4.9 s |
+
+The standalone lsm-tree reproducer (`vendor/ISSUE-lsm-tree.md`) gives a worst
+insert of 46–49 ms on the NVMe and 333–345 ms on dm-delay before the fix, and
+5 µs–455 µs after it. The existing benchmarks, before → after (same host, one
+run each): `recursive_size_perf` 100k creates 2.08 → 2.07 s and 1M creates
+34.8 → 35.1 s; `vfs_bench` view getattr/lookup/read 1074/1915/1706 ns →
+1048/1900/1752 ns. Both are the same within noise, as expected: neither
+compacts while it writes.
+
+| Change | Where |
+|---|---|
+| lsm-tree 3.1.10 vendored: `[patch.crates-io]`, workspace `exclude`, `path` on fjall's dependency, `.gitignore` for its in-place test build | `Cargo.toml`, `vendor/lsm-tree/`, `vendor/fjall/Cargo.toml`, `.gitignore` |
+| `SuperVersions::upgrade_version_unlocked` (persist outside the lock; install rebased on the latest super version; serialized by the compaction state mutex, which `clear` now takes too); `take_garbage` / `StaleVersions` | `vendor/lsm-tree/src/version/super_version.rs` |
+| Compaction: `finish_files` before any lock, `CompactionOutput::next_version`, no read lock held through the choice and preparation; moves, drops, flushes and `clear` on the new path | `vendor/lsm-tree/src/compaction/{worker,flavour}.rs`, `src/tree/mod.rs`, `src/blob_tree/mod.rs` |
+| fjall's rotation GC: `take_garbage` under the guard, `remove` after it (fjall change 6) | `vendor/fjall/src/keyspace/mod.rs` |
+| Regression test: version persists slowed by 400 ms (test-only `SLOW_PERSIST`), inserts during a flush and a major compaction must stay under 200 ms; upstream fails it (410 ms) | `vendor/lsm-tree/src/version/{persist,super_version}.rs` |
+| Focused measurement (in `cargo test -p constellation-meta`, coarse 1 s bound; knobs `LSM_STALL_KEYS`, `LSM_STALL_PRESSURE`, `LSM_STALL_MAX_MS`) | `crates/meta/tests/compaction_stall.rs` |
+| Upstream issue with a minimal reproducer; fjall's issue file points to it | `vendor/ISSUE-lsm-tree.md`, `vendor/ISSUE-fjall.md` |
+| Lane for the vendored lsm-tree's tests | `docs/how-to-guides/development/TESTING.md` |
+
+### Gates (2026-10-07, 16 cores, load average 30–115 from other agents)
+
+- `cargo fmt --all` no diff; `cargo clippy --workspace --all-targets -- -D
+  warnings` clean.
+- Vendored crates: `vendor/lsm-tree` `cargo test --all-features` 239 + 23
+  doctests passed. Upstream lsm-tree's own `tests/` (repository at `9812163`)
+  with the patched `src/`: 441 passed, 0 failed (440 with the pristine
+  `src/`). `vendor/fjall` `--lib`: 72 passed. fjall's own `tests/`
+  (repository at `3adaa50`, vendored `src/`) against the patched lsm-tree:
+  122 passed, 0 failed.
+- `cargo test -p constellation-meta`: 241 unit tests and every integration
+  file (crash, reopen and recovery tests included, `fjall_drop_deadlock`,
+  `compaction_stall`), 0 failed.
+- Workspace, split per crate (`ulimit -n 65536`): engine 600, authority 281 +
+  4 + `sim` 126 (release, `TMPDIR=/dev/shm/lvl`: on btrfs `/var/tmp` it is
+  fsync-bound, F14 above), model 138 (release), and every other member (types
+  26, platform 40, vfs 58, fs-core 71, mtree 71, store-s3 229, net 129,
+  control 140, upload-concurrency 11, frontend-fuse 90, constellation 75,
+  harness 99, chaos 37, pod-load 4, csi 174, uploadbench 4): 0 failed.
+- `tests/smoke.sh`: SMOKE TEST PASSED.
+- Harness (prefix `lvl`, `TMPDIR=/var/tmp/lvl`), once each, all PASSED: every
+  `backup-*` (6), `lock-*` (6) and `delegate*` (11) scenario, 23 in all. No
+  `lvl` containers or mounts were left.
+- Not a gate here, run for evidence: `stress-ng-fs-nodes`, 6 runs. The one
+  that started at load ~14 PASSED. The 5 started or run at load 50–138
+  FAILED on the known overload symptoms: lapsed lock grants (`fenced_io`
+  12), FUSE requests over 30 s (twice), a stress-ng that did not finish
+  (twice). One failing run's daemon logs were kept (`CHAOS_KEEP_TMP=1`).
+  Across 50 `Starting major compaction` lines on its three nodes, it logged 5
+  slow commits (≥ 500 ms), 530–675 ms each, all of it `journal_lock` and
+  `memtables` ≤ 4 ms. Before the fix the same scenario logged
+  `memtables=14707ms`. Its slowest core steps (0.65–0.70 s) were store-lock
+  waits behind those commits. Its stalled requests (38–48 s) waited at
+  "mutation submitted to the core (reply)", the delegated path
+  `overload-cascade-2` left open.
+
+### What remains
+
+- **fjall's journal rotation.** A flush rotates the journal under the
+  journal writer's mutex: the old journal's `sync_all`, the new file's
+  creation, `set_len` and `sync_all`, and the directory's fsync. Every commit
+  waits for those three fsyncs once per flush (337–351 ms with an 80 ms
+  fsync; 530–675 ms under `stress-ng-fs-nodes` at load 50–138, the only
+  slow commits left there). Not changed here: syncing the sealed journal outside the lock
+  would let a later sync of the new journal make writes durable while
+  earlier ones in the old journal are not, which breaks the journal's
+  prefix ordering. Recorded in `vendor/ISSUE-fjall.md`.
+- Ingestion (bootstrap's `start_ingestion`) still persists its version under
+  the write lock (it allocates its seqno there on purpose; rare).
+- Not re-run here: the 5 s delegation-TTL experiment that
+  `overload-cascade-2` deferred until this stall was fixed.

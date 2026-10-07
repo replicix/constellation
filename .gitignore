@@ -11,6 +11,9 @@
 # fjall's unit tests, run in place (vendor/fjall/CONSTELLATION-PATCH.md)
 /vendor/fjall/Cargo.lock
 /vendor/fjall/target
+# lsm-tree's unit tests, run in place (vendor/lsm-tree/CONSTELLATION-PATCH.md)
+/vendor/lsm-tree/Cargo.lock
+/vendor/lsm-tree/target
 /.scratch
 mount.sh
 umount.sh

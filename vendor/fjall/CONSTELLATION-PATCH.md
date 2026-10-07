@@ -1,4 +1,4 @@
-# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report
+# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock
 
 This directory is fjall **3.1.10** exactly as published on crates.io
 (checksum `cd201c93…c33f`, upstream commit
@@ -10,7 +10,7 @@ and both texts stay here unchanged.
 
 ## What is changed
 
-There are five changes, each marked `CONSTELLATION PATCH`:
+There are six changes, each marked `CONSTELLATION PATCH`:
 
 1. **`src/db.rs`, `impl Drop for DatabaseInner`**: this is the fix. The
    worker shutdown loop never blocks now.
@@ -29,6 +29,11 @@ There are five changes, each marked `CONSTELLATION PATCH`:
 5. **`src/batch/mod.rs`, `src/batch/slow_commit.rs` (new)**: a commit that
    takes 500 ms or more logs where the time went. See
    [Change 5](#change-5-a-slow-commit-says-where-its-time-went).
+6. **`src/keyspace/mod.rs`, `Cargo.toml`**: a memtable rotation's version
+   GC drops old versions and removes their files after the version lock is
+   released, and fjall builds against the vendored lsm-tree
+   (`../lsm-tree`). See
+   [Change 6](#change-6-version-gc-outside-the-version-lock).
 
 The directory is also listed in the workspace `exclude` list. That way it is
 built as a plain dependency, and `cargo clippy --workspace`, `cargo fmt --all`
@@ -203,8 +208,29 @@ its LSM tree's version-history lock (`RwLock::read`). A flush
 persists the new version (`persist_version`: the version file's and the
 directory's fsyncs, then `rewrite_atomic` of `current`, more fsyncs), so
 under I/O pressure every insert into that keyspace waits for the disk,
-with the database's single-writer lock held. That is lsm-tree 3.1.10's
-design, not this patch's; see `../ISSUE-fjall.md`.
+with the database's single-writer lock held. That was lsm-tree 3.1.10's
+design; the vendored lsm-tree no longer does any disk I/O under that lock
+(`../lsm-tree/CONSTELLATION-PATCH.md`, `lsm-version-lock`).
+
+## Change 6: version GC outside the version lock
+
+`Keyspace::inner_rotate_memtable` garbage-collects every keyspace's old
+versions after a rotation. Upstream calls `SuperVersions::maintenance` on
+the guard of the tree's version history **write** lock
+(`get_version_history_lock()`), and `maintenance` removes the old version
+files and drops the old super versions there. Dropping the last one that
+references a compaction's inputs runs their `Drop`, which unlinks the
+files: after a major compaction, every input table's file was unlinked with
+the lock held that every insert into the tree waits for. Now the guard only
+takes the stale versions out (`take_garbage`, the vendored lsm-tree's) and
+is released before `StaleVersions::remove` drops them and removes their
+files. Errors are logged as before.
+
+`Cargo.toml`'s `lsm-tree` dependency gains `path = "../lsm-tree"`, so that a
+standalone build of this crate (`cargo test --manifest-path
+vendor/fjall/Cargo.toml`) uses the vendored lsm-tree, which has
+`take_garbage`. The workspace's `[patch.crates-io]` entry resolves any other
+`lsm-tree` dependent to the same copy.
 
 ## Tests
 
@@ -228,8 +254,8 @@ window, so the logger widens the window the way a preempted worker would.
 
 Once upstream fixes this (see `../ISSUE-fjall.md`, the issue to file):
 
-1. Remove the `[patch.crates-io]` table and the `"vendor/fjall"` entry in
-   `exclude` from the workspace `Cargo.toml`.
+1. Remove the `fjall` entry of `[patch.crates-io]` and the `"vendor/fjall"`
+   entry in `exclude` from the workspace `Cargo.toml`.
 2. Delete `vendor/fjall/`.
 3. Bump `fjall` in `crates/meta`, `crates/cli` and `crates/harness` to the
    fixed release, then run `cargo update -p fjall`.
@@ -243,4 +269,5 @@ self-contained and only touches `impl Drop for DatabaseInner`.
 Changes 3, 4 and 5 have no upstream counterpart: dropping the vendored copy
 means re-applying them to the new version (or giving up the writer
 priority and the unlocked sync, which brings back the stalls described
-above).
+above). Change 6 goes with the vendored lsm-tree
+(`../lsm-tree/CONSTELLATION-PATCH.md`, "Dropping the patch").

@@ -9,6 +9,7 @@ nightly and on manual dispatch (`.github/workflows/nightly.yml`).
 |---|---|---|---|---|
 | Unit tests | `cargo test --workspace` | in-memory / tempdir | Rust | seconds |
 | Vendored fjall | `cargo test --manifest-path vendor/fjall/Cargo.toml --lib` | tempdir | Rust | seconds |
+| Vendored lsm-tree | `cargo test --manifest-path vendor/lsm-tree/Cargo.toml --all-features` | tempdir | Rust | seconds |
 | Host smoke | `tests/smoke.sh` (= `harness smoke`) | local directory (`object_store` LocalFileSystem) | Rust, fuse3 | ~2 s |
 | Host integration | `tests/integration.sh` | floci S3 (container) | + docker | ~10 s |
 | Containerized | `tests/compose-test.sh` | floci S3 (container) | docker only | ~5 min cold |
@@ -21,7 +22,12 @@ The vendored fjall is outside the workspace (`vendor/fjall/CONSTELLATION-PATCH.m
 so its own unit tests — among them the writer lock's (`writer_lock`) and
 the journal's — run only through its manifest; run them after touching
 anything under `vendor/fjall`. Its `Cargo.lock` and `target/` are
-ignored.
+ignored. The same holds for the vendored lsm-tree, fjall's storage engine
+(`vendor/lsm-tree/CONSTELLATION-PATCH.md`): run its suite after touching
+anything under `vendor/lsm-tree`, or `vendor/fjall` (whose build uses it).
+Its `inserts_never_wait_for_a_version_being_persisted` test is the
+regression test for the version-lock freeze. Its `Cargo.lock` and `target/`
+are ignored as well.
 
 The fault-injection lane includes **`chaos-ci`**: same-path conflict races
 across three local mounts of one filesystem (create/mkdir/unlink/rename

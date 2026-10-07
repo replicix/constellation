@@ -771,10 +771,16 @@ impl Keyspace {
                 .expect("lock is poisoned")
                 .values()
             {
-                if let Err(e) = keyspace.tree.get_version_history_lock().maintenance(
+                // CONSTELLATION PATCH: only the bookkeeping under the
+                // version lock; dropping the stale versions (the last one
+                // holding a compaction's inputs deletes their files) and
+                // removing their files happen after it is released, since
+                // every insert into the tree waits for that lock.
+                let stale = keyspace.tree.get_version_history_lock().take_garbage(
                     keyspace.path(),
                     self.supervisor.snapshot_tracker.get_seqno_safe_to_gc(),
-                ) {
+                );
+                if let Err(e) = stale.remove() {
                     log::warn!(
                         "Version history GC failed for keyspace {:?}: {e:?}",
                         keyspace.name,

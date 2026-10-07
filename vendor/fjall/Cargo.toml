@@ -80,6 +80,9 @@ version = "0.4.27"
 
 [dependencies.lsm-tree]
 version = "~3.1.10"
+# CONSTELLATION PATCH: the vendored lsm-tree (../lsm-tree/CONSTELLATION-PATCH.md);
+# change 6 calls its `SuperVersions::take_garbage`.
+path = "../lsm-tree"
 features = []
 default-features = false
 

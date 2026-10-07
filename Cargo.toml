@@ -55,6 +55,7 @@ exclude = [
     "bench/enginebench",
     "vendor/fjall",
     "vendor/fuser",
+    "vendor/lsm-tree",
     "vendor/netwatch",
 ]
 
@@ -134,6 +135,9 @@ netwatch = "0.19.3"
 # linted or tested as a member).
 [patch.crates-io]
 fjall = { path = "vendor/fjall" }
+# fjall's storage engine, vendored so a compaction or flush never holds the
+# tree's version lock across disk I/O (vendor/lsm-tree/CONSTELLATION-PATCH.md).
+lsm-tree = { path = "vendor/lsm-tree" }
 # Plan 31 C4b: FUSE session handover (vendor/fuser/CONSTELLATION-PATCH.md).
 fuser = { path = "vendor/fuser" }
 # Fix p2p-restart-auth: netwatch 0.19.3's UDP socket wakes only the last
