@@ -523,6 +523,7 @@ impl constellation_net::PeerService for P2pBridge {
         gen: u64,
         txs: Vec<u8>,
         leaving: Vec<u8>,
+        leaving_barriers: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -540,6 +541,10 @@ impl constellation_net::PeerService for P2pBridge {
             else {
                 return refuse;
             };
+            let Ok(leaving_barriers) = postcard::from_bytes::<Vec<(u64, i64)>>(&leaving_barriers)
+            else {
+                return refuse;
+            };
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
                 .nudge
@@ -548,6 +553,7 @@ impl constellation_net::PeerService for P2pBridge {
                     gen,
                     txs,
                     leaving,
+                    leaving_barriers,
                     reply,
                 })
                 .is_err()
@@ -573,17 +579,19 @@ impl constellation_net::PeerService for P2pBridge {
         gen: u64,
         backup: u64,
         stream_head: u64,
+        stream_head_at: i64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
             let (reply, receive) = tokio::sync::oneshot::channel();
-            let (ttl_ms, locks, lock_grace_ms, lock_floor) = if self
+            let r: sync::DelegRenewReply = if self
                 .urgent
                 .send(sync::SyncRequest::PeerDelegRenew {
                     from,
                     gen,
                     backup,
                     stream_head,
+                    stream_head_at,
                     reply,
                 })
                 .is_ok()
@@ -595,10 +603,13 @@ impl constellation_net::PeerService for P2pBridge {
             constellation_net::Payload::DelegRenewed {
                 req_id,
                 gen,
-                ttl_ms,
-                locks: crate::locks::grants_wire(&locks),
-                lock_grace_ms,
-                lock_floor: crate::locks::floor_wire(&lock_floor),
+                ttl_ms: r.ttl_ms,
+                locks: crate::locks::grants_wire(&r.locks),
+                lock_grace_ms: r.lock_grace_ms,
+                lock_floor: crate::locks::floor_wire(&r.lock_floor),
+                lock_cut_at: r.lock_cut_at,
+                lock_cut: crate::locks::floor_wire(&r.lock_cut),
+                lock_barrier: r.lock_barrier,
             }
         })
     }
@@ -633,6 +644,7 @@ impl constellation_net::PeerService for P2pBridge {
                 through,
                 locks: crate::locks::grants_wire(&locks.grants),
                 lock_floor: crate::locks::floor_wire(&locks.floor),
+                lock_barrier: locks.barrier,
             }
         })
     }

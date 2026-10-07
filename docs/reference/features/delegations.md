@@ -185,6 +185,12 @@ delegated directory do not wait for its ship either. Status:
 - An acknowledgement from a stream that ended before the root appended
   it is tentative: the row is stranded and the requester replays the op
   by rid.
+- Every renewal carries the stream index the delegate has executed and
+  when it sent the renewal, on its clock. The root keeps the latest of
+  each generation: a lock owner that waited a holder out learns from
+  them how far every stream went, and a granting answer carries the
+  root's resulting cut to the delegate (see [Cluster
+  locks](cluster-locks.md#coherence-from-one-holder-to-the-next)).
 
 ### Cross-subtree operations and recall
 

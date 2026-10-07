@@ -25,7 +25,7 @@
 //! flush or fails the release, never stranded behind it.
 
 use crate::lease::LeaseView;
-use crate::sync::{AcquireProgress, HandoffResult, SyncRequest};
+use crate::sync::{AcquireProgress, DelegRenewReply, HandoffResult, SyncRequest};
 use anyhow::{Context, Result};
 use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
@@ -36,7 +36,7 @@ use constellation_authority::{
     S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult,
 };
 use constellation_fs_core::cache::DiskCache;
-use constellation_meta::locks::{Grant, GrantId};
+use constellation_meta::locks::GrantId;
 use constellation_meta::{JournalPos, Meta, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
 use constellation_net::{LogEvent, Payload};
 use constellation_store_s3::inbox::InboxStore;
@@ -72,10 +72,6 @@ pub type MutateReplyParts = (
 
 /// Plan 30 §M14: an owner's answer to a `LockRenew`.
 pub type LockRenewResults = Vec<(constellation_fs_core::Ino, GrantId, LockRenewResult)>;
-
-/// A delegation renewal's answer: the ttl, the lock grants handed over,
-/// the remaining lock grace (ms) and the subtree's lock floor.
-type DelegRenewReply = (u64, Vec<Grant>, u64, constellation_meta::Position);
 
 /// The core's observable state, refreshed after every event, for
 /// `status` and the background tickers (placement, atime, prune).
@@ -2025,6 +2021,7 @@ impl Driver {
                 gen,
                 txs,
                 leaving,
+                leaving_barriers,
                 reply,
             } => {
                 let req = self.control_id();
@@ -2036,6 +2033,7 @@ impl Driver {
                         gen,
                         txs,
                         leaving,
+                        leaving_barriers,
                     },
                 }))
             }
@@ -2044,6 +2042,7 @@ impl Driver {
                 gen,
                 backup,
                 stream_head,
+                stream_head_at,
                 reply,
             } => {
                 let req = self.control_id();
@@ -2055,6 +2054,7 @@ impl Driver {
                         gen,
                         backup: (backup != 0).then_some(backup),
                         stream_head,
+                        stream_head_at,
                     },
                 }))
             }
@@ -2947,10 +2947,21 @@ impl Driver {
                 locks,
                 lock_grace_ms,
                 lock_floor,
+                lock_cut_at,
+                lock_cut,
+                lock_barrier,
                 ..
             } => {
                 if let Some(tx) = self.deleg_renew_replies.remove(&req) {
-                    let _ = tx.send((ttl_ms, locks, lock_grace_ms, lock_floor));
+                    let _ = tx.send(DelegRenewReply {
+                        ttl_ms,
+                        locks,
+                        lock_grace_ms,
+                        lock_floor,
+                        lock_cut_at,
+                        lock_cut: *lock_cut,
+                        lock_barrier,
+                    });
                 }
             }
             PeerMsg::DelegRecalled {
@@ -3208,6 +3219,7 @@ impl Driver {
                 gen,
                 txs,
                 leaving,
+                leaving_barriers,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -3215,6 +3227,7 @@ impl Driver {
                 let timeout = Duration::from_millis(self.core.config().forward_timeout_ms * 4);
                 let bytes = postcard::to_allocvec(&txs).unwrap_or_default();
                 let leaving = postcard::to_allocvec(&leaving).unwrap_or_default();
+                let leaving_barriers = postcard::to_allocvec(&leaving_barriers).unwrap_or_default();
                 if crate::fault::p2p_denied(to) {
                     let _ = tx.send(Internal::Event(Event::PeerFailed {
                         req,
@@ -3230,6 +3243,7 @@ impl Driver {
                         gen,
                         txs: bytes,
                         leaving,
+                        leaving_barriers,
                     };
                     let reply = tokio::time::timeout(
                         timeout,
@@ -3266,6 +3280,7 @@ impl Driver {
                 gen,
                 backup,
                 stream_head,
+                stream_head_at,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -3286,6 +3301,7 @@ impl Driver {
                         gen,
                         backup: backup.unwrap_or(0),
                         stream_head,
+                        stream_head_at,
                     };
                     let reply = tokio::time::timeout(
                         timeout,
@@ -3300,6 +3316,9 @@ impl Driver {
                             locks,
                             lock_grace_ms,
                             lock_floor,
+                            lock_cut_at,
+                            lock_cut,
+                            lock_barrier,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
@@ -3310,6 +3329,9 @@ impl Driver {
                                     locks: crate::locks::grants_of(&locks),
                                     lock_grace_ms,
                                     lock_floor: crate::locks::floor_of(&lock_floor),
+                                    lock_cut_at,
+                                    lock_cut: Box::new(crate::locks::floor_of(&lock_cut)),
+                                    lock_barrier,
                                 },
                             }));
                         }
@@ -3352,6 +3374,7 @@ impl Driver {
                             through,
                             locks,
                             lock_floor,
+                            lock_barrier,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
@@ -3362,6 +3385,7 @@ impl Driver {
                                     locks: constellation_meta::locks::LockHandback {
                                         grants: crate::locks::grants_of(&locks),
                                         floor: crate::locks::floor_of(&lock_floor),
+                                        barrier: lock_barrier,
                                     },
                                 },
                             }));

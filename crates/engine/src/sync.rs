@@ -104,6 +104,23 @@ impl From<SyncFailure> for String {
     }
 }
 
+/// Plan 30 §M11: the root's answer to a delegate's renewal
+/// (`SyncRequest::PeerDelegRenew`): the ttl (0: refused) and (§M14) the
+/// root's lock grants under the subtree, handed over with the first
+/// renewal, the remaining lock grace on it (ms), the subtree's floor, the
+/// root's cut and the latest outwait barrier under the subtree (see
+/// `PeerMsg::DelegRenewed`).
+#[derive(Debug, Default)]
+pub struct DelegRenewReply {
+    pub ttl_ms: u64,
+    pub locks: Vec<constellation_meta::locks::Grant>,
+    pub lock_grace_ms: u64,
+    pub lock_floor: constellation_meta::Position,
+    pub lock_cut_at: i64,
+    pub lock_cut: constellation_meta::Position,
+    pub lock_barrier: i64,
+}
+
 /// A request to the daemon's sync task — the authority core's driver
 /// (`crate::authority_driver`), which turns each into a core event.
 pub enum SyncRequest {
@@ -265,6 +282,7 @@ pub enum SyncRequest {
         gen: u64,
         txs: Vec<constellation_meta::DelegateTx>,
         leaving: Vec<constellation_meta::locks::Grant>,
+        leaving_barriers: Vec<(Ino, i64)>,
         reply: tokio::sync::oneshot::Sender<(u64, bool)>,
     },
     /// Plan 30 §M11: a delegate's renewal; answered with the ttl (0:
@@ -274,17 +292,11 @@ pub enum SyncRequest {
         gen: u64,
         /// Phase 2b: the delegate's backup peer (0: none).
         backup: u64,
-        /// Plan 30 §M14: the delegate's executed stream head.
+        /// Plan 30 §M14: the delegate's executed stream head, and when
+        /// it sent the renewal (its clock).
         stream_head: u64,
-        /// Answered with the ttl and (§M14) the root's lock grants under
-        /// the subtree, handed over with the first renewal, and the
-        /// remaining lock grace on it (ms).
-        reply: tokio::sync::oneshot::Sender<(
-            u64,
-            Vec<constellation_meta::locks::Grant>,
-            u64,
-            constellation_meta::Position,
-        )>,
+        stream_head_at: i64,
+        reply: tokio::sync::oneshot::Sender<DelegRenewReply>,
     },
     /// Plan 30 §M11: the root recalls a generation this node holds;
     /// answered with the highest stream index executed here (and, §M14,

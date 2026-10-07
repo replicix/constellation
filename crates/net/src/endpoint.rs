@@ -1164,6 +1164,7 @@ pub trait PeerService: Send + Sync + 'static {
         gen: u64,
         _txs: Vec<u8>,
         _leaving: Vec<u8>,
+        _leaving_barriers: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::DelegateStreamAck {
@@ -1217,6 +1218,7 @@ pub trait PeerService: Send + Sync + 'static {
         gen: u64,
         _backup: u64,
         _stream_head: u64,
+        _stream_head_at: i64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::DelegRenewed {
@@ -1226,6 +1228,9 @@ pub trait PeerService: Send + Sync + 'static {
                 locks: Vec::new(),
                 lock_grace_ms: 0,
                 lock_floor: Vec::new(),
+                lock_cut_at: 0,
+                lock_cut: Vec::new(),
+                lock_barrier: 0,
             }
         })
     }
@@ -1244,6 +1249,7 @@ pub trait PeerService: Send + Sync + 'static {
                 through: 0,
                 locks: Vec::new(),
                 lock_floor: Vec::new(),
+                lock_barrier: 0,
             }
         })
     }

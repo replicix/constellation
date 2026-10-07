@@ -237,6 +237,10 @@ impl Grant {
 pub struct LockHandback {
     pub grants: Vec<Grant>,
     pub floor: Position,
+    /// The latest outwait barrier under the subtree that no cut has
+    /// settled yet (the delegate's clock; 0: none): the root's grants
+    /// there wait for a cut as of it, as the delegate's would have.
+    pub barrier: i64,
 }
 
 /// Join two lock floors (positions: watermarks, so the join is what both
@@ -440,6 +444,11 @@ struct Inner {
     /// naming one is rejected at once ([`LockTables::check_tag`]). Moves
     /// to and from a delegate are not ends.
     ended: BTreeMap<GrantId, i64>,
+    /// Sequencer side: the expired records [`Inner::drop_expired`]
+    /// dropped (outwaited: their holders never released them) since the
+    /// sequencer last took them ([`LockTables::take_outwaited`]), at most
+    /// [`ENDED_KEPT`] (the oldest go first).
+    outwaited: Vec<Grant>,
     /// Node side (phase 2): per grant, the tagged ops in flight and how
     /// long one left in doubt may still execute somewhere — the grant is
     /// not released before both are over ([`LockTables::release_blocked`]).
@@ -584,15 +593,20 @@ impl Inner {
         if !self.grants.values().any(|e| e.until_ms <= now_ms) {
             return false;
         }
-        let expired: Vec<(GrantId, i64)> = self
+        let expired: Vec<Grant> = self
             .grants
             .values()
             .filter(|e| e.until_ms <= now_ms)
-            .map(|e| (e.id, e.until_ms))
+            .copied()
             .collect();
-        for (id, until) in expired {
-            self.grants.remove(&id);
-            self.note_ended(id, until);
+        for e in expired {
+            self.grants.remove(&e.id);
+            self.note_ended(e.id, e.until_ms);
+            self.outwaited.push(e);
+        }
+        if self.outwaited.len() > ENDED_KEPT {
+            let over = self.outwaited.len() - ENDED_KEPT;
+            self.outwaited.drain(..over);
         }
         true
     }
@@ -1083,6 +1097,16 @@ impl LockTables {
             g.grants.remove(&t.id);
         }
         taken
+    }
+
+    /// The records expired and dropped since the last call, wherever the
+    /// drop happened (a conflicting request, a token check): grants their
+    /// holders never released here. What such a holder was acknowledged
+    /// under the grant is in no release position, so the sequencer must
+    /// learn it another way before it grants the inode again
+    /// (`core::locks`, the outwait barrier).
+    pub fn take_outwaited(&self) -> Vec<Grant> {
+        std::mem::take(&mut self.lock().outwaited)
     }
 
     /// Whether expired records were dropped since the last call (the
@@ -2204,6 +2228,37 @@ mod tests {
                 .map(|g| g.id.seq)
                 .collect::<Vec<_>>(),
             vec![3]
+        );
+    }
+
+    /// The sequencer learns of every outwait, wherever the expired
+    /// record was dropped (here a token check and a conflicting request),
+    /// once; a released grant is no outwait.
+    #[test]
+    fn expired_records_dropped_anywhere_are_reported_as_outwaited_once() {
+        let t = LockTables::default();
+        let a = t.grant(1, 2, 7, LockMode::Exclusive, 100, 0);
+        let b = t.grant(1, 3, 8, LockMode::Exclusive, 300, 0);
+        let c = t.grant(1, 4, 9, LockMode::Exclusive, 100, 0);
+        t.forget(c);
+        assert!(t.take_outwaited().is_empty(), "nothing dropped yet");
+        assert!(t
+            .check_tag(
+                &LockTag(vec![LockToken {
+                    grant: b,
+                    until_ms: 300
+                }]),
+                150
+            )
+            .is_ok());
+        let first = t.take_outwaited();
+        assert_eq!(first.iter().map(|g| g.id).collect::<Vec<_>>(), vec![a]);
+        assert_eq!(first[0].until_ms, 100);
+        assert!(t.take_outwaited().is_empty(), "reported once");
+        assert!(t.conflicting(8, 5, LockMode::Exclusive, 300).is_empty());
+        assert_eq!(
+            t.take_outwaited().iter().map(|g| g.id).collect::<Vec<_>>(),
+            vec![b]
         );
     }
 

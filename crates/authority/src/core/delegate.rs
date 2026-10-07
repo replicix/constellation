@@ -1753,14 +1753,18 @@ impl Core {
             }
             let last = txs.last().map(|t| t.idx).unwrap_or(from);
             let leaving = self.deleg_leaving_grants(now, gen, replica);
+            let leaving_barriers = self.deleg_leaving_barriers(now, gen, &leaving, replica);
             let req = self.op_id();
             self.dl.by_req.insert(req, (gen, ReqKind::Stream));
             self.stats.deleg_streamed_txs += txs.len() as u64;
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.inflight = Some((req, last));
             d.inflight_at = now;
-            d.leaving =
-                (!leaving.is_empty()).then(|| (last, leaving.iter().map(|g| g.ino).collect()));
+            d.leaving = (!leaving.is_empty() || !leaving_barriers.is_empty()).then(|| {
+                let mut inos: Vec<Ino> = leaving.iter().map(|g| g.ino).collect();
+                inos.extend(leaving_barriers.iter().map(|(ino, _)| *ino));
+                (last, inos)
+            });
             tracing::debug!(
                 node = self.me(),
                 gen,
@@ -1777,6 +1781,7 @@ impl Core {
                     gen,
                     txs,
                     leaving,
+                    leaving_barriers,
                 },
             });
         }
@@ -2041,6 +2046,7 @@ impl Core {
                 gen,
                 backup,
                 stream_head: 0,
+                stream_head_at: now.0,
             },
         });
     }
@@ -2105,6 +2111,13 @@ impl Core {
         } else {
             (Vec::new(), 0)
         };
+        // The cut first: a barrier it settles raises the floor.
+        let (lock_cut_at, lock_cut, lock_barrier) = if ttl_ms > 0 {
+            let (at, cut, barrier) = self.lock_cut_for_generation(now, gen, replica);
+            (at, Box::new(cut), barrier)
+        } else {
+            (0, Box::default(), 0)
+        };
         let lock_floor = if ttl_ms > 0 {
             self.lock_floor_for_generation(gen)
         } else {
@@ -2119,6 +2132,9 @@ impl Core {
                 locks,
                 lock_grace_ms,
                 lock_floor,
+                lock_cut_at,
+                lock_cut,
+                lock_barrier,
             },
         });
     }
@@ -3027,6 +3043,7 @@ impl Core {
         gen: u64,
         txs: Vec<constellation_meta::DelegateTx>,
         leaving: Vec<constellation_meta::locks::Grant>,
+        leaving_barriers: Vec<(Ino, i64)>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -3110,6 +3127,9 @@ impl Core {
         // table's from the step its rows are applied in.
         if !leaving.is_empty() && cursor >= batch_last {
             self.lock_install_leaving(now, gen, leaving, replica);
+        }
+        if !leaving_barriers.is_empty() && cursor >= batch_last {
+            self.lock_install_leaving_barriers(leaving_barriers, replica);
         }
         if appended > 0 {
             self.lock_take_back_left(now, gen, replica);

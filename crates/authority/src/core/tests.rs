@@ -8564,6 +8564,7 @@ mod locks {
                     gen: 7,
                     backup: None,
                     stream_head: 0,
+                    stream_head_at: 0,
                 },
             });
             (h, dir, f)
@@ -8597,6 +8598,7 @@ mod locks {
                         deps: Default::default(),
                     }],
                     leaving,
+                    leaving_barriers: Vec::new(),
                 },
             });
             assert!(
@@ -8758,6 +8760,7 @@ mod locks {
                     gen: 7,
                     txs,
                     leaving,
+                    ..
                 } if to == 1 => Some((
                     *req,
                     txs.last().map(|t| t.idx).unwrap_or(0),
@@ -8950,6 +8953,7 @@ mod locks {
                 gen: 7,
                 backup: None,
                 stream_head: 0,
+                stream_head_at: 0,
             },
         });
         // The delegate's unlink row is applied (from its backup, say),
@@ -8970,9 +8974,12 @@ mod locks {
                     deps: Default::default(),
                 }],
                 leaving: Vec::new(),
+                leaving_barriers: Vec::new(),
             },
         });
         h.core.lock_on_generation_outwaited(h.now, dir);
+        // (`end_generation` marks it ended in the same step.)
+        h.core.dl.gens.get_mut(&7).unwrap().ended = true;
         let granted = |out: &[Action]| {
             lock_replies(out)
                 .iter()
@@ -10956,6 +10963,584 @@ mod locks {
             panic!("expected node 4's grant: {out:?}")
         };
         assert!(position.pending >= Some(journal), "{position:?}");
+    }
+
+    /// A delegate's renewal of generation 7 reporting `head`, sent at `at`
+    /// on its clock.
+    fn renew_gen7(h: &mut Harness, req: u64, head: u64, at: i64) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenew {
+                req: OpId(req),
+                gen: 7,
+                backup: None,
+                stream_head: head,
+                stream_head_at: at,
+            },
+        })
+    }
+
+    /// Any grant to `node` among the replies and pushes in `out`.
+    fn grant_to(out: &[Action], node: NodeId) -> Option<Position> {
+        lock_replies(out)
+            .into_iter()
+            .map(|(to, _, o)| (to, o))
+            .chain(pushes(out).into_iter().map(|(to, _, o)| (to, o)))
+            .find_map(|(to, o)| match o {
+                LockOutcome::Granted { position, .. } if to == node => Some(position),
+                _ => None,
+            })
+    }
+
+    /// stale-read-outwaited (sim `locks-unlinked-delegated-dbackup-random`
+    /// seed 276): a holder partitioned from the root is outwaited; what it
+    /// was acknowledged under its grant sits in a delegate's stream the
+    /// root has not appended, so the next grant on the inode carried only
+    /// the root's own position and its holder read the older state. Now
+    /// the outwait leaves a barrier: the next grant waits for a cut as of
+    /// the grant record's end — every live generation's head from a
+    /// renewal its delegate sent at or after it — and carries it.
+    #[test]
+    fn an_outwaited_holders_successor_waits_for_every_live_streams_head() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        // The tenure's floor waits for the inherited delegate's renewal.
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        let now = h.now.0;
+        renew_gen7(&mut h, 90, 2, now);
+        let t0 = h.now;
+        let out = request(&mut h, 2, 7, ino, X, true);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let out = request(&mut h, 4, 8, ino, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        let end = t0.plus(6_000);
+        assert_eq!(h.core.timer_at(expiry), Some(end));
+        // Node 2 never answers: outwaited, but not granted on.
+        h.now = end;
+        let out = h.step(Event::Timer { id: expiry });
+        assert_eq!(h.core.stats.lock_recalls_expired, 1);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted past an outwait: {out:?}"
+        );
+        assert!(h.core.stats.lock_barrier_waits > 0);
+        // A renewal sent before the record's end (it arrived late) says
+        // nothing about what was executed after it.
+        h.advance(100);
+        renew_gen7(&mut h, 91, 4, end.0 - 1);
+        let out = request(&mut h, 4, 9, ino, X, true);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted on a stale head: {out:?}"
+        );
+        // One sent at it settles the barrier: the grant carries its head.
+        h.advance(100);
+        renew_gen7(&mut h, 92, 5, end.0);
+        let out = request(&mut h, 4, 10, ino, X, true);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted once every live stream was heard from: {out:?}")
+        };
+        assert!(
+            position.streams.get(7) >= Some(5),
+            "the grant does not cover the delegate's head: {position:?}"
+        );
+        assert_eq!(
+            h.core
+                .lk
+                .container_sizes()
+                .iter()
+                .find(|(n, _)| *n == "lk_barriers")
+                .map(|(_, s)| *s),
+            Some(0)
+        );
+        // Settled once: the next grant does not wait.
+        let waits = h.core.stats.lock_barrier_waits;
+        let (g4, _) = granted(&LockOutcome::Granted {
+            id: h.meta.locks().own_grant(ino, 4, h.now.0).unwrap().id,
+            mode: X,
+            ttl_ms: 0,
+            position,
+        });
+        h.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g4,
+                position: Position::ZERO,
+            },
+        });
+        let out = request(&mut h, 6, 11, ino, X, true);
+        assert!(grant_to(&out, 6).is_some(), "{out:?}");
+        assert_eq!(h.core.stats.lock_barrier_waits, waits);
+    }
+
+    /// A root with generation 7 (node 3's) heard from before node 2's
+    /// grant on a root file was outwaited, and node 4's request parked
+    /// behind the barrier: `(h, ino)`.
+    fn outwaited_beside_gen7() -> (Harness, Ino) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        let now = h.now.0;
+        renew_gen7(&mut h, 90, 2, now);
+        request(&mut h, 2, 7, ino, X, true);
+        let out = request(&mut h, 4, 8, ino, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        h.now = h.core.timer_at(expiry).unwrap();
+        let out = h.step(Event::Timer { id: expiry });
+        assert!(grant_to(&out, 4).is_none(), "{out:?}");
+        (h, ino)
+    }
+
+    /// A live holder whose grant record lapsed at the owner (its renewal
+    /// came late) re-asks: the barrier its own record left does not hold
+    /// it — what it was acknowledged under the grant is in its own
+    /// position — and the new grant ends the barrier. Another node still
+    /// waits on it.
+    #[test]
+    fn a_lapsed_holder_does_not_wait_on_its_own_outwait_barrier() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        let now = h.now.0;
+        renew_gen7(&mut h, 90, 2, now);
+        let out = request(&mut h, 2, 7, ino, X, false);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let end = h.meta.locks().own_grant(ino, 2, h.now.0).unwrap().until_ms;
+        h.now = Ms(end + 10);
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted past an outwait: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_barrier_waits, 1);
+        let out = request(&mut h, 2, 9, ino, X, false);
+        assert!(
+            grant_to(&out, 2).is_some(),
+            "the lapsed holder waited on its own record: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_barrier_waits, 1);
+        assert_eq!(
+            h.core
+                .lk
+                .container_sizes()
+                .iter()
+                .find(|(n, _)| *n == "lk_barriers")
+                .map(|(_, s)| *s),
+            Some(0),
+            "the new grant did not end the barrier"
+        );
+    }
+
+    /// An outwaited holder whose stream ended: the generation counts no
+    /// more (what the root appended of it is in the root's own position,
+    /// the rest was never appended and its acknowledgements are rolled
+    /// back), so the barrier settles without its renewal.
+    #[test]
+    fn an_ended_generation_does_not_hold_an_outwait_barrier() {
+        let (mut h, ino) = outwaited_beside_gen7();
+        h.core.dl.gens.get_mut(&7).unwrap().ended = true;
+        let out = request(&mut h, 4, 9, ino, X, true);
+        assert!(
+            grant_to(&out, 4).is_some(),
+            "an ended stream held the barrier: {out:?}"
+        );
+    }
+
+    /// The lapsed holder granted *shared* again does not end its barrier:
+    /// another node's shared grant beside it does not wait for its
+    /// release, so it still waits for the cut (sim
+    /// `locks-unlinked-delegated-partition` seed 390).
+    #[test]
+    fn a_lapsed_holders_shared_grant_keeps_its_barrier_for_others() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        let now = h.now.0;
+        renew_gen7(&mut h, 90, 2, now);
+        let out = request(&mut h, 2, 7, ino, X, false);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let end = h.meta.locks().own_grant(ino, 2, h.now.0).unwrap().until_ms;
+        h.now = Ms(end + 10);
+        let out = request(&mut h, 2, 8, ino, S, false);
+        assert!(
+            grant_to(&out, 2).is_some(),
+            "the lapsed holder waited on its own record: {out:?}"
+        );
+        let out = request(&mut h, 4, 9, ino, S, false);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "a shared grant beside the lapsed holder skipped its barrier: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_barrier_waits, 1);
+        h.advance(100);
+        renew_gen7(&mut h, 91, 3, end);
+        let out = request(&mut h, 4, 10, ino, S, false);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted on a cut as of the record's end: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(3), "{position:?}");
+    }
+
+    /// An offline designation's designee writes while isolated and is
+    /// never reclaimed: silent for a delegation TTL (here its renewal came
+    /// a whole lock TTL before the outwait), its head joins the cut, but
+    /// its silence does not hold every grant after an outwait.
+    #[test]
+    fn an_offline_designation_does_not_hold_an_outwait_barrier() {
+        let (mut h, ino) = outwaited_beside_gen7();
+        h.core.dl.gens.get_mut(&7).unwrap().kind = super::super::delegate::DelegKind::Designated;
+        let out = request(&mut h, 4, 9, ino, X, true);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("a silent designation held the barrier: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(2), "{position:?}");
+    }
+
+    /// An online designation — renewed within a delegation TTL — counts
+    /// as any generation: its head from a renewal sent before the
+    /// outwaited record's end does not settle the barrier; one sent at it
+    /// does.
+    #[test]
+    fn an_online_designation_holds_an_outwait_barrier() {
+        let (mut h, ino) = outwaited_beside_gen7();
+        h.core.dl.gens.get_mut(&7).unwrap().kind = super::super::delegate::DelegKind::Designated;
+        let end = h.now.0;
+        renew_gen7(&mut h, 91, 3, end - 1);
+        let out = request(&mut h, 4, 9, ino, X, true);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "an online designation's older head settled the barrier: {out:?}"
+        );
+        h.advance(100);
+        renew_gen7(&mut h, 92, 4, end);
+        let out = request(&mut h, 4, 10, ino, X, true);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted on a cut as of the record's end: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(4), "{position:?}");
+    }
+
+    /// A restart inside the lease forgets its grant table: every grant of
+    /// the previous incarnation ends unreleased, as an outwait does, and
+    /// its holders may write into delegates' streams until the persisted
+    /// horizon. So the first grant after the quarantine waits for a cut as
+    /// of the horizon too.
+    #[test]
+    fn a_restart_inside_the_lease_leaves_a_barrier_at_its_horizon() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        h.meta.note_lock_grant_horizon(h.now.0 + 3_000).unwrap();
+        let until = h.meta.load_lock_quarantine(h.now.0).expect("quarantined");
+        let now = h.now;
+        h.core.locks_start(now, &h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        // Past the quarantine, the tenure's floor is taken (the delegate's
+        // renewal, sent before the horizon, arrives now).
+        h.now = Ms(until + 10);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        renew_gen7(&mut h, 90, 2, until - 1);
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted past a restart's grants: {out:?}"
+        );
+        assert_eq!(
+            h.core.stats.lock_tenure_waits, 1,
+            "held by the tenure's floor, not the barrier: {out:?}"
+        );
+        renew_gen7(&mut h, 91, 3, until);
+        let out = request(&mut h, 4, 9, ino, X, false);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted on a cut as of the horizon: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(3), "{position:?}");
+    }
+
+    /// A takeover of a released lease (a successor with no mirror of the
+    /// predecessor's grants): those grants end unreleased, as an outwait
+    /// does, and their holders may write into delegates' streams until
+    /// the quarantine's end. The tenure's floor takes the inherited
+    /// delegate's first renewal, which may be older than those writes, so
+    /// the first grant past the quarantine waits for a cut as of its end.
+    #[test]
+    fn a_released_takeover_leaves_a_barrier_at_its_quarantines_end() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let now = h.now;
+        h.core.lock_on_released_takeover(now, &h.meta);
+        let until = h.meta.locks().quarantine_until();
+        assert!(until > now.0);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.now = Ms(until + 10);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        renew_gen7(&mut h, 90, 2, until - 1);
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted past the predecessor's grants: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_tenure_waits, 1, "{out:?}");
+        renew_gen7(&mut h, 91, 3, until);
+        let out = request(&mut h, 4, 9, ino, X, false);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted on a cut as of the quarantine's end: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(3), "{position:?}");
+    }
+
+    /// The same for a node that re-claims its own released lease (no
+    /// takeover): its dropped tenure's live grants are waited out, and the
+    /// first grant after them waits for a cut as of their end.
+    #[test]
+    fn a_dropped_tenures_grants_leave_a_barrier_at_their_end() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        let now = h.now.0;
+        renew_gen7(&mut h, 90, 2, now);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let end = h.meta.locks().own_grant(ino, 2, h.now.0).unwrap().until_ms;
+        h.core.lease.released();
+        let now = h.now;
+        h.core.lock_on_lease_gone(now, &h.meta, &mut Vec::new());
+        assert_eq!(h.meta.locks().quarantine_until(), end);
+        h.advance(100);
+        h.hold(2, None);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.now = Ms(end + 10);
+        request(&mut h, 5, 98, ROOT_INO, X, false);
+        renew_gen7(&mut h, 91, 3, end - 1);
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted past the dropped tenure's grant: {out:?}"
+        );
+        renew_gen7(&mut h, 92, 4, end);
+        let out = request(&mut h, 4, 9, ino, X, false);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted on a cut as of the grants' end: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(4), "{position:?}");
+    }
+
+    /// The delegate side: a delegate that outwaits a holder has no other
+    /// generations' heads; it waits for a cut its root sends with a
+    /// granting renewal answer (asking for one with a renewal at once),
+    /// as of the grant record's end or later.
+    #[test]
+    fn a_delegates_outwait_barrier_waits_for_the_roots_cut() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (_, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let d = h.core.dl.mine.get_mut(&7).expect("installed");
+        d.until = h.now.plus(60_000);
+        d.renew = None;
+        let out = request(&mut h, 2, 7, f, X, true);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let out = request(&mut h, 4, 8, f, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        let end = h.core.timer_at(expiry).unwrap();
+        h.now = end;
+        let out = h.step(Event::Timer { id: expiry });
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted past an outwait: {out:?}"
+        );
+        let renewal = |out: &[Action]| {
+            sends(out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::DelegRenew { req, gen: 7, .. } if to == 1 => Some(*req),
+                _ => None,
+            })
+        };
+        let Some(req) = renewal(&out) else {
+            panic!("no cut asked for: {out:?}")
+        };
+        let answer = |req: OpId, cut_at: i64, cut: Position| Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRenewed {
+                req,
+                gen: 7,
+                ttl_ms: 20_000,
+                locks: Vec::new(),
+                lock_grace_ms: 0,
+                lock_floor: Position::ZERO,
+                lock_cut_at: cut_at,
+                lock_cut: Box::new(cut),
+                lock_barrier: 0,
+            },
+        };
+        let mut cut = Position::ZERO;
+        assert!(cut.streams.raise(5, 9));
+        h.advance(10);
+        let out = h.step(answer(req, end.0 - 1, cut));
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted on an older cut: {out:?}"
+        );
+        h.advance(10);
+        let out = request(&mut h, 4, 9, f, X, true);
+        assert!(grant_to(&out, 4).is_none(), "{out:?}");
+        let Some(req) = renewal(&out) else {
+            panic!("no fresher cut asked for: {out:?}")
+        };
+        h.advance(10);
+        let out = h.step(answer(req, end.0, cut));
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted on the root's cut: {out:?}")
+        };
+        assert!(position.streams.get(5) >= Some(9), "{position:?}");
+    }
+
+    /// stale-read-outwaited (sim `locks-unlinked-delegated-partition` seed
+    /// 4067): a delegate outwaits a holder, then the file is unlinked; the
+    /// root owns it from that row on and granted it with only its own
+    /// position. The delegate's barrier on it (here still an expired,
+    /// unreleased record nobody dropped) goes with the batch that carries
+    /// the unlink, and the root keeps it.
+    #[test]
+    fn an_outwait_barrier_moves_to_the_root_with_the_unlink() {
+        // Delegate side.
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (dir, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let d = h.core.dl.mine.get_mut(&7).expect("installed");
+        d.until = h.now.plus(60_000);
+        d.renew = None;
+        let out = request(&mut h, 2, 7, f, X, true);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let end = h.meta.locks().own_grant(f, 2, h.now.0).unwrap().until_ms;
+        h.now = Ms(end + 10);
+        let unlink = LogRecord::Unlink {
+            parent: dir,
+            name: "turn.lock".into(),
+            time_ns: 3,
+        };
+        crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[unlink]).unwrap();
+        let now = h.now;
+        let carried = h.core.deleg_leaving_barriers(now, 7, &[], &h.meta);
+        assert_eq!(carried, vec![(f, end)]);
+        // Root side.
+        let mut r = Harness::new(1);
+        r.core.cfg.delegation = true;
+        r.core.cfg.p2p = true;
+        r.hold(1, None);
+        let (dir, f) = delegated_file(&r.meta);
+        let mut out = Vec::new();
+        r.core.delegation_sync(r.now, &r.meta, &mut out);
+        request(&mut r, 5, 99, ROOT_INO, X, false);
+        let now = r.now.0;
+        renew_gen7(&mut r, 90, 0, now);
+        let at = r.now.0 + 50;
+        r.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegateStream {
+                req: OpId(50),
+                gen: 7,
+                txs: vec![constellation_meta::DelegateTx {
+                    idx: 1,
+                    rid: None,
+                    records: vec![LogRecord::Unlink {
+                        parent: dir,
+                        name: "turn.lock".into(),
+                        time_ns: 1,
+                    }],
+                    deps: Default::default(),
+                }],
+                leaving: Vec::new(),
+                leaving_barriers: vec![(f, at)],
+            },
+        });
+        let out = request(&mut r, 4, 9, f, X, false);
+        assert!(
+            grant_to(&out, 4).is_none(),
+            "granted over the delegate's outwait: {out:?}"
+        );
+        r.advance(100);
+        renew_gen7(&mut r, 91, 1, at);
+        let out = request(&mut r, 4, 10, f, X, false);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted once the cut came: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(1), "{position:?}");
     }
 
     /// Two peers: the second conflicting request recalls the first grant
@@ -17850,6 +18435,9 @@ fn renewed(req: OpId, gen: u64, ttl_ms: u64) -> Event {
             locks: Vec::new(),
             lock_grace_ms: 0,
             lock_floor: Default::default(),
+            lock_cut_at: 0,
+            lock_cut: Box::default(),
+            lock_barrier: 0,
         },
     }
 }

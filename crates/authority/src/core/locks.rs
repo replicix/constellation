@@ -322,6 +322,48 @@ pub(crate) struct LockState {
     /// to be reclaimed, and by then the requester's link was down —
     /// 451 s).
     tenure_minted: std::collections::BTreeSet<u64>,
+    /// Owner side, per inode: the end of the latest grant record on it
+    /// that expired here unreleased (outwaited, on this clock). Its
+    /// holder's release position is lost: what it was acknowledged under
+    /// the grant may sit in a delegate's stream (or the root's journal)
+    /// that this owner's own position does not name — a partitioned
+    /// holder that is itself the delegate of the files it wrote (sim
+    /// `locks-unlinked-delegated-dbackup-random` seed 276). No grant on
+    /// the inode until a *cut* as of that time is noted as its floor
+    /// ([`Core::lock_barrier_ready`]). The holder's fencing token is
+    /// refused everywhere from its window's end, which is `2 × margin −
+    /// (transit + the holder's skew)` before the record's — positive by
+    /// the margin rule (`margin ≥ skew + transit`) — so a cut taken at or
+    /// after the record's end covers every row executed under the grant.
+    ///
+    /// With it, the holder whose record it was while it is only one node's
+    /// (`None`: several, or unknown — carried from a delegate). That node
+    /// itself does not wait on it: what it was acknowledged under the
+    /// grant is in its own position (a live holder whose renewal came late
+    /// re-asks). Its *exclusive* grant ends the barrier: nobody is granted
+    /// past it before its release, which carries that position, or its
+    /// outwait, which sets a later barrier. A shared one does not: another
+    /// node's shared grant does not wait for its release (sim
+    /// `locks-unlinked-delegated-partition` seed 390 read the older turn
+    /// beside it).
+    barriers: BTreeMap<Ino, (i64, Option<NodeId>)>,
+    /// The same for every inode under a directory (`ROOT_INO`: all): an
+    /// outwaited delegation's subtree (its holders' releases went with
+    /// it), a barrier carried with a subtree move, the overflow of
+    /// [`LockState::barriers`].
+    dir_barriers: Vec<(Ino, i64)>,
+    /// Root: per live generation, the latest stream head its delegate's
+    /// renewals reported and when the delegate sent it, on its clock
+    /// (`DelegRenew::stream_head_at`): what a cut takes for the stream;
+    /// and when the latest renewal arrived here (whether a designee is
+    /// online, [`Core::lock_cut_here`]).
+    heads: BTreeMap<u64, (i64, u64, Ms)>,
+    /// Delegate: the latest cut a granting renewal answer carried, as
+    /// `(root, as of, position)` (that root's clock; see
+    /// [`Core::lock_cut_here`]). A cut from another root replaces it
+    /// whatever its time: the clocks differ, and a new root's behind the
+    /// old one's would settle nothing until it passed the old value.
+    cut: Option<(NodeId, i64, Position)>,
     /// The next `lock_on_lease_gone` is a continuation epoch's close
     /// that this node's next acquisition may continue: the grant table
     /// stays, for that acquisition to keep or drop
@@ -387,6 +429,9 @@ impl LockState {
             ("lk_renews", self.renews.len()),
             ("lk_late_renews", self.late_renews.len()),
             ("lk_horizon_held", self.horizon_held.len()),
+            ("lk_barriers", self.barriers.len()),
+            ("lk_dir_barriers", self.dir_barriers.len()),
+            ("lk_heads", self.heads.len()),
         ]
     }
 }
@@ -1067,13 +1112,21 @@ impl Core {
             return Err(Vec::new());
         }
         let mode = own.map_or(mode, |g| g.mode.max(mode));
-        let conflicting = if own.is_some_and(|g| g.mode == mode) {
+        let reaffirm = own.is_some_and(|g| g.mode == mode);
+        let conflicting = if reaffirm {
             Vec::new()
         } else {
             replica.locks().conflicting(ino, from, mode, now.0)
         };
+        self.lock_take_outwaited(replica);
         if !conflicting.is_empty() {
             return Err(conflicting);
+        }
+        // A holder of this inode was outwaited: what it did under its
+        // grant must be under this one's floor first (parked, or
+        // `WouldBlock`). A re-affirmation gives the node nothing new.
+        if !reaffirm && !self.lock_barrier_ready(now, from, ino, gen, replica, out) {
+            return Err(Vec::new());
         }
         let ttl = self.lock_ttl_ms().min(cap_ms);
         if ttl < self.lock_min_grant_ms() {
@@ -1123,6 +1176,17 @@ impl Core {
                     .grant(self.cfg.node_id, from, ino, mode, until, gen)
             }
         };
+        // A barrier its own outwaited record left ends with this grant
+        // when it is exclusive (see `LockState::barriers`).
+        if mode == LockMode::Exclusive
+            && self
+                .lk
+                .barriers
+                .get(&ino)
+                .is_some_and(|(_, holder)| *holder == Some(from))
+        {
+            self.lk.barriers.remove(&ino);
+        }
         self.stats.lock_grants += 1;
         self.lk.mirror_dirty = true;
         let position = self.lock_grant_position(from, ino, replica);
@@ -1321,8 +1385,16 @@ impl Core {
         true
     }
 
-    /// Root: a delegate renewed `gen` with its stream `head`.
-    pub(crate) fn lock_note_delegate_head(&mut self, from: NodeId, gen: u64, head: u64) {
+    /// Root: a delegate renewed `gen` with its stream `head`, executed
+    /// by `at` on its clock; the renewal arrived `now`.
+    pub(crate) fn lock_note_delegate_head(
+        &mut self,
+        now: Ms,
+        from: NodeId,
+        gen: u64,
+        head: u64,
+        at: i64,
+    ) {
         if !self.dl.gens.get(&gen).is_some_and(|g| g.node == from) {
             return;
         }
@@ -1331,6 +1403,327 @@ impl Core {
                 self.lk.tenure_heads.push((gen, head));
             }
         }
+        let e = self.lk.heads.entry(gen).or_insert((at, head, now));
+        e.2 = e.2.max(now);
+        if at >= e.0 {
+            *e = (at, e.1.max(head), e.2);
+        }
+    }
+
+    /// Owner side: the grant records that expired here unreleased since
+    /// the last look become barriers on their inodes (see
+    /// [`LockState::barriers`]). This node's own grants are left out:
+    /// what its clients were acknowledged is in its release floor, which
+    /// every grant here joins anyway.
+    fn lock_take_outwaited(&mut self, replica: &dyn Replica) {
+        for g in replica.locks().take_outwaited() {
+            if g.node != self.cfg.node_id {
+                self.lock_barrier(g.ino, g.until_ms, Some(g.node));
+            }
+        }
+    }
+
+    /// No grant on `ino` before a cut as of `at` is its floor; `holder`:
+    /// whose record it was, if known.
+    fn lock_barrier(&mut self, ino: Ino, at: i64, holder: Option<NodeId>) {
+        let e = self.lk.barriers.entry(ino).or_insert((i64::MIN, holder));
+        if e.1 != holder {
+            e.1 = None;
+        }
+        if e.0 >= at {
+            return;
+        }
+        e.0 = at;
+        self.stats.lock_outwait_barriers += 1;
+        if self.lk.barriers.len() > FLOORS_CAP {
+            let all = self
+                .lk
+                .barriers
+                .values()
+                .map(|(a, _)| *a)
+                .max()
+                .unwrap_or(at);
+            self.lk.barriers.clear();
+            self.lock_dir_barrier(constellation_fs_core::types::ROOT_INO, all);
+        }
+    }
+
+    /// No grant under `dir` before a cut as of `at` is its floor.
+    fn lock_dir_barrier(&mut self, dir: Ino, at: i64) {
+        if at <= 0 {
+            return;
+        }
+        match self.lk.dir_barriers.iter_mut().find(|(d, _)| *d == dir) {
+            Some((_, a)) => *a = (*a).max(at),
+            None => self.lk.dir_barriers.push((dir, at)),
+        }
+        if self.lk.dir_barriers.len() > DIR_FLOORS_CAP {
+            let all = self
+                .lk
+                .dir_barriers
+                .drain(..)
+                .map(|(_, a)| a)
+                .max()
+                .unwrap_or(at);
+            self.lk
+                .dir_barriers
+                .push((constellation_fs_core::types::ROOT_INO, all));
+        }
+    }
+
+    /// The latest barrier that applies to `ino` for a grant to `to`
+    /// (`None`: none). An inode under no directory (unlinked) is under
+    /// every directory barrier, as under every subtree grace
+    /// (`lock_in_grace`): which subtree it left is not recorded. One left
+    /// by `to`'s own record only does not apply (see
+    /// [`LockState::barriers`]).
+    fn lock_barrier_for(&self, ino: Ino, to: NodeId, replica: &dyn Replica) -> Option<i64> {
+        use constellation_fs_core::types::ROOT_INO;
+        let mut at = self
+            .lk
+            .barriers
+            .get(&ino)
+            .filter(|(_, holder)| *holder != Some(to))
+            .map(|(a, _)| *a);
+        if self.lk.dir_barriers.is_empty() {
+            return at;
+        }
+        let orphan = !replica.is_under(ino, ROOT_INO);
+        for (dir, a) in &self.lk.dir_barriers {
+            if *dir == ROOT_INO || orphan || replica.is_under(ino, *dir) {
+                at = Some(at.map_or(*a, |b| b.max(*a)));
+            }
+        }
+        at
+    }
+
+    /// The latest barrier on or under `dir` (0: none) — what a subtree
+    /// move carries.
+    fn lock_barrier_under(&self, dir: Ino, replica: &dyn Replica) -> i64 {
+        let mut at = 0;
+        for (ino, (a, _)) in &self.lk.barriers {
+            if replica.is_under(*ino, dir) {
+                at = at.max(*a);
+            }
+        }
+        for (d, a) in &self.lk.dir_barriers {
+            if *d == constellation_fs_core::types::ROOT_INO
+                || replica.is_under(dir, *d)
+                || replica.is_under(*d, dir)
+            {
+                at = at.max(*a);
+            }
+        }
+        at
+    }
+
+    /// Root: a cut of everything acknowledged anywhere, as `(as of,
+    /// position)`: this node's release floor now (its log, its journal,
+    /// its own generations), joined with the head every other live
+    /// generation's delegate last renewed with. It is as of the earliest
+    /// of those renewals' sends (and of now): a row executed before that,
+    /// anywhere, is under the position. A live generation never heard
+    /// from makes it as of nothing (`i64::MIN`). An ended generation
+    /// counts no more: what this root appended of it is in its own
+    /// position, and the rest was never appended — tentative, its
+    /// acknowledgements rolled back (replayed by rid, where an outwaited
+    /// holder's fencing token refuses them). A designation counts as any
+    /// generation while it is online — renewed (or, never heard from,
+    /// granted here) within one delegation TTL. An offline one adds the
+    /// head it last renewed with but no longer holds the cut back: its
+    /// designee writes while isolated and is never reclaimed (DESIGN.md
+    /// §5.2), so waiting for it would stop every grant after an outwait
+    /// for as long as it is away. What it executed after its last renewal
+    /// is then not under the cut (`cluster-locks.md`, "After an outwait").
+    /// A cut names at most `STREAMS_CAP` streams, as every floor does
+    /// (`floor_join` keeps the newest): `Stats::lock_cut_truncated`.
+    pub(crate) fn lock_cut_here(&mut self, now: Ms, replica: &dyn Replica) -> (i64, Position) {
+        let me = self.cfg.node_id;
+        let online_ms = self.cfg.delegation_ttl_ms as i64;
+        let gens = &self.dl.gens;
+        self.lk
+            .heads
+            .retain(|gen, _| gens.get(gen).is_some_and(|g| !g.ended));
+        let mut at = now.0;
+        let mut pos = self.lock_release_floor(replica);
+        for (gen, g) in &self.dl.gens {
+            if g.ended || g.node == me {
+                continue;
+            }
+            let designated = g.kind == super::delegate::DelegKind::Designated;
+            match self.lk.heads.get(gen) {
+                Some((sent, head, heard)) => {
+                    if !designated || now.0 - heard.0 < online_ms {
+                        at = at.min(*sent);
+                    }
+                    let mut p = Position::ZERO;
+                    if *head > 0 && p.streams.raise(*gen, *head) {
+                        pos = constellation_meta::locks::floor_join(&pos, &p);
+                    }
+                }
+                None if designated && now.0 - g.granted.0 >= online_ms => {}
+                None => at = i64::MIN,
+            }
+        }
+        let truncated = self.dl.gens.iter().any(|(gen, g)| {
+            !g.ended
+                && g.node != me
+                && self.lk.heads.get(gen).is_some_and(|(_, head, _)| {
+                    *head > 0 && pos.streams.get(*gen).is_none_or(|i| i < *head)
+                })
+        });
+        if truncated {
+            self.stats.lock_cut_truncated += 1;
+        }
+        (at, pos)
+    }
+
+    /// Every barrier a cut as of `at` settles becomes a floor: `pos` on
+    /// its inode or directory — and, at a root, on the floor it re-sends
+    /// with every granting renewal of a generation whose subtree has the
+    /// inode or overlaps the directory (as a release that reaches the
+    /// root after the move raises it). `true` if any did.
+    fn lock_settle_barriers(&mut self, at: i64, pos: &Position, replica: &dyn Replica) -> bool {
+        let inos: Vec<Ino> = self
+            .lk
+            .barriers
+            .iter()
+            .filter(|(_, (b, _))| *b <= at)
+            .map(|(ino, _)| *ino)
+            .collect();
+        let dirs: Vec<Ino> = self
+            .lk
+            .dir_barriers
+            .iter()
+            .filter(|(_, b)| *b <= at)
+            .map(|(d, _)| *d)
+            .collect();
+        for ino in &inos {
+            self.lk.barriers.remove(ino);
+            self.lock_note_floor(*ino, pos);
+        }
+        self.lk.dir_barriers.retain(|(_, b)| *b > at);
+        for dir in &dirs {
+            self.lock_note_dir_floor(*dir, pos);
+        }
+        if (!inos.is_empty() || !dirs.is_empty()) && !self.lk.handed_floor.is_empty() {
+            let gens: Vec<u64> = self
+                .lk
+                .handed_floor
+                .keys()
+                .copied()
+                .filter(|gen| {
+                    self.dl.gens.get(gen).is_some_and(|g| {
+                        inos.iter().any(|ino| replica.is_under(*ino, g.dir))
+                            || dirs.iter().any(|d| {
+                                *d == constellation_fs_core::types::ROOT_INO
+                                    || replica.is_under(g.dir, *d)
+                                    || replica.is_under(*d, g.dir)
+                            })
+                    })
+                })
+                .collect();
+            for gen in gens {
+                if let Some(f) = self.lk.handed_floor.get_mut(&gen) {
+                    *f = constellation_meta::locks::floor_join(f, pos);
+                }
+            }
+        }
+        !inos.is_empty() || !dirs.is_empty()
+    }
+
+    /// Whether `ino` may be granted as far as outwait barriers go: none
+    /// applies, or a cut as of the latest one is noted as its floor now.
+    /// The root takes its own cut; a delegate the latest one its root
+    /// sent, joined with its own release floor, and asks for a fresher
+    /// one (a renewal) when it is too old.
+    fn lock_barrier_ready(
+        &mut self,
+        now: Ms,
+        to: NodeId,
+        ino: Ino,
+        gen: u64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) -> bool {
+        if self.lock_barrier_for(ino, to, replica).is_none() {
+            return true;
+        }
+        if self.lease.held.is_some() {
+            let (at, pos) = self.lock_cut_here(now, replica);
+            self.lock_settle_barriers(at, &pos, replica);
+        } else if let Some((_, at, cut)) = self.lk.cut {
+            let pos =
+                constellation_meta::locks::floor_join(&cut, &self.lock_release_floor(replica));
+            self.lock_settle_barriers(at, &pos, replica);
+        }
+        if self.lock_barrier_for(ino, to, replica).is_none() {
+            return true;
+        }
+        self.stats.lock_barrier_waits += 1;
+        if gen != 0 && self.lease.held.is_none() {
+            self.deleg_renew_now(now, gen, out);
+        }
+        false
+    }
+
+    /// Delegate: a granting renewal answer from `root` carried its cut,
+    /// as `(as of, position)`, and the latest barrier left under the
+    /// subtree.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lock_take_cut(
+        &mut self,
+        now: Ms,
+        root: NodeId,
+        gen: u64,
+        (cut_at, cut): (i64, Position),
+        barrier: i64,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if barrier > 0 {
+            if let Some(dir) = self.dl.mine.get(&gen).map(|d| d.dir) {
+                self.lock_dir_barrier(dir, barrier);
+            }
+        }
+        if self
+            .lk
+            .cut
+            .is_none_or(|(from, at, _)| from != root || cut_at > at)
+        {
+            self.lk.cut = Some((root, cut_at, cut));
+        }
+        let Some((_, at, cut)) = self.lk.cut else {
+            return;
+        };
+        if self.lk.barriers.is_empty() && self.lk.dir_barriers.is_empty() {
+            return;
+        }
+        let pos = constellation_meta::locks::floor_join(&cut, &self.lock_release_floor(replica));
+        if self.lock_settle_barriers(at, &pos, replica) {
+            self.lock_reserve_all(now, replica, out);
+        }
+    }
+
+    /// Root: what a granting renewal of `gen` carries for the barriers —
+    /// the cut as of now and the latest barrier under the subtree (the
+    /// delegate settles it with the cut when it covers it). This root's
+    /// own barriers that the cut covers settle here too.
+    pub(crate) fn lock_cut_for_generation(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        replica: &dyn Replica,
+    ) -> (i64, Position, i64) {
+        let (at, pos) = self.lock_cut_here(now, replica);
+        let barrier = match self.dl.gens.get(&gen).map(|g| g.dir) {
+            Some(dir) => self.lock_barrier_under(dir, replica),
+            None => 0,
+        };
+        if !self.lk.barriers.is_empty() || !self.lk.dir_barriers.is_empty() {
+            self.lock_settle_barriers(at, &pos, replica);
+        }
+        (at, pos, barrier)
     }
 
     /// Delegate: every renewal sent in this event carries this node's
@@ -1855,6 +2248,10 @@ impl Core {
         // least, is covered by what this node has now.
         let floor = self.lock_release_floor(replica);
         self.lock_note_floor(g.ino, &floor);
+        // But not what it was acknowledged elsewhere: a barrier.
+        if g.node != self.cfg.node_id {
+            self.lock_barrier(g.ino, g.until_ms, Some(g.node));
+        }
         tracing::info!(
             node = self.cfg.node_id,
             holder = g.node,
@@ -3496,6 +3893,84 @@ impl Core {
             .collect()
     }
 
+    /// Delegate: the outwait barriers that go to the root with a batch of
+    /// `gen`, on the inodes no longer in its subtree (unlinked): those on
+    /// the inode itself — an expired, unreleased record still in the
+    /// table counts, as nothing may have dropped it yet — joined with the
+    /// barriers on the subtree, which no longer cover an inode outside
+    /// it. Without them the root granted an unlinked inode whose last
+    /// holder this delegate had outwaited with only its own position
+    /// (sim `locks-unlinked-delegated-partition` seed 4067).
+    pub(crate) fn deleg_leaving_barriers(
+        &mut self,
+        now: Ms,
+        gen: u64,
+        leaving: &[Grant],
+        replica: &dyn Replica,
+    ) -> Vec<(Ino, i64)> {
+        self.lock_take_outwaited(replica);
+        let me = self.cfg.node_id;
+        for g in replica.locks().expired(now.0) {
+            if g.gen == gen && g.node != me {
+                self.lock_barrier(g.ino, g.until_ms, Some(g.node));
+            }
+        }
+        let root_owned = |ino: Ino| {
+            matches!(
+                replica.resolve_ownership(&Self::read_keys(ino, None)),
+                constellation_meta::delegation::Ownership::Root
+            )
+        };
+        let mut inos: Vec<Ino> = self
+            .lk
+            .barriers
+            .keys()
+            .copied()
+            .filter(|ino| root_owned(*ino))
+            .collect();
+        inos.extend(leaving.iter().map(|g| g.ino));
+        inos.sort_unstable();
+        inos.dedup();
+        if inos.is_empty() {
+            return Vec::new();
+        }
+        let subtree = match self.dl.mine.get(&gen).map(|d| d.dir) {
+            Some(dir) => self.lock_barrier_under(dir, replica),
+            None => 0,
+        };
+        inos.into_iter()
+            .filter_map(|ino| {
+                let at = self
+                    .lk
+                    .barriers
+                    .get(&ino)
+                    .map_or(0, |(a, _)| *a)
+                    .max(subtree);
+                (at > 0).then_some((ino, at))
+            })
+            .collect()
+    }
+
+    /// Root: a batch of `gen`, applied through its last row, carried
+    /// `barriers` on inodes it took out of the subtree
+    /// ([`Core::deleg_leaving_barriers`]; whose records they were is not
+    /// said): kept where the inode is this
+    /// table's now.
+    pub(crate) fn lock_install_leaving_barriers(
+        &mut self,
+        barriers: Vec<(Ino, i64)>,
+        replica: &dyn Replica,
+    ) {
+        for (ino, at) in barriers {
+            if matches!(
+                replica.resolve_ownership(&Self::read_keys(ino, None)),
+                constellation_meta::delegation::Ownership::Root
+            ) {
+                self.lock_barrier(ino, at, None);
+            }
+        }
+    }
+
     /// Delegate: the root acknowledged the batch that carried grants out
     /// of the subtree ([`Core::deleg_leaving_grants`]): they are the
     /// root's, and leave this table (a recall must not hand them back
@@ -3508,6 +3983,9 @@ impl Core {
         let Some((_, inos)) = d.leaving.take_if(|(last, _)| *last <= through) else {
             return;
         };
+        for ino in &inos {
+            self.lk.barriers.remove(ino);
+        }
         let gone = replica.locks().take_where(|ino| inos.contains(&ino));
         if !gone.is_empty() {
             tracing::debug!(
@@ -3664,11 +4142,18 @@ impl Core {
     ) -> constellation_meta::locks::LockHandback {
         let dir = self.dl.mine.get(&gen).map(|d| d.dir);
         let grants = self.lock_take_generation(gen, replica);
-        let floor = match dir {
-            Some(dir) => self.lock_subtree_floor(dir, |ino| replica.is_under(ino, dir), replica),
-            None => Position::ZERO,
+        let (floor, barrier) = match dir {
+            Some(dir) => (
+                self.lock_subtree_floor(dir, |ino| replica.is_under(ino, dir), replica),
+                self.lock_barrier_under(dir, replica),
+            ),
+            None => (Position::ZERO, 0),
         };
-        constellation_meta::locks::LockHandback { grants, floor }
+        constellation_meta::locks::LockHandback {
+            grants,
+            floor,
+            barrier,
+        }
     }
 
     /// Root: what to hand a delegate with a granting renewal — what is
@@ -3733,9 +4218,14 @@ impl Core {
         back: constellation_meta::locks::LockHandback,
         replica: &dyn Replica,
     ) {
-        let constellation_meta::locks::LockHandback { grants, floor } = back;
+        let constellation_meta::locks::LockHandback {
+            grants,
+            floor,
+            barrier,
+        } = back;
         if let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) {
             self.lock_note_dir_floor(dir, &floor);
+            self.lock_dir_barrier(dir, barrier);
         }
         if let Some(handed) = self.lk.handed.get_mut(&gen) {
             handed.retain(|h| !grants.iter().any(|g| g.node == h.node && g.ino == h.ino));
@@ -3882,6 +4372,9 @@ impl Core {
         // seen is at most what this root has once it appended the
         // delegate's stream — noted at the next event.
         self.lk.pending_dir_floors.push(dir);
+        // Nor did they say what they were acknowledged in other
+        // generations' streams: a barrier on the subtree.
+        self.lock_dir_barrier(dir, now.0);
         self.stats.lock_grace_periods += 1;
         // What was not handed over yet stays the generation's until it
         // ends: [`Core::lock_on_generation_ended`] returns it to this
@@ -3960,8 +4453,15 @@ impl Core {
     /// flush), and its re-claim of the lease it had released — no
     /// takeover — granted over the predecessor's live exclusive grant
     /// (`locks-blips-tight` seed 2723).
+    /// The predecessor's grants end unreleased, as an outwait does, and
+    /// their holders may write into delegates' streams until then: a
+    /// barrier on everything as of the quarantine's end (the tenure's
+    /// floor takes the inherited delegates' *first* renewals, which may
+    /// be older than those writes).
     pub(crate) fn lock_on_released_takeover(&mut self, now: Ms, replica: &dyn Replica) {
-        replica.locks().set_quarantine(self.restamp(now));
+        let until = self.restamp(now);
+        replica.locks().set_quarantine(until);
+        self.lock_dir_barrier(constellation_fs_core::types::ROOT_INO, until);
         self.stats.lock_grace_periods += 1;
     }
 
@@ -3987,6 +4487,8 @@ impl Core {
         let until = grants.max(grace);
         if until > now.0 {
             replica.locks().set_quarantine(until);
+            // Those grants end unreleased (see `lock_on_released_takeover`).
+            self.lock_dir_barrier(constellation_fs_core::types::ROOT_INO, until);
             self.stats.lock_grace_periods += 1;
         }
     }
@@ -4012,6 +4514,10 @@ impl Core {
                  no new lock grant until they have expired (parked requests are \
                  served by the waiter tick then)"
             );
+            // They all end unreleased, as an outwait does, and their
+            // holders may write into delegates' streams until then: a
+            // barrier on everything as of that end.
+            self.lock_dir_barrier(constellation_fs_core::types::ROOT_INO, until);
         }
     }
 
@@ -4064,6 +4570,7 @@ impl Core {
         self.lk.tenure_floor_due = true;
         self.lk.tenure_waiting = None;
         self.lk.tenure_heads.clear();
+        self.lk.heads.clear();
         self.lk.tenure_minted.clear();
         // A tenure the close keeps is this node's again in a moment
         // (`lock_owner_resuming`): its waiters ask here again. `NotOwner`
@@ -4117,6 +4624,7 @@ impl Core {
         if replica.locks().take_expired_dropped() {
             self.lk.mirror_dirty = true;
         }
+        self.lock_take_outwaited(replica);
         if self.lk.mirror_dirty {
             self.lk.mirror_dirty = false;
             let backups = self.lease.backups();

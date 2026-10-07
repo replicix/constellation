@@ -850,6 +850,15 @@ pub struct Stats {
     /// Root: grants held back while a new tenure waited for its
     /// inherited delegates' stream heads.
     pub lock_tenure_waits: u64,
+    /// Owner side: outwait barriers set (a grant record expired
+    /// unreleased; see `LockState::barriers`).
+    pub lock_outwait_barriers: u64,
+    /// Owner side: grants held back until a cut settled an outwait
+    /// barrier on their inode.
+    pub lock_barrier_waits: u64,
+    /// Root: cuts that named more live streams than a floor holds
+    /// (`STREAMS_CAP`): the oldest were left out (`Core::lock_cut_here`).
+    pub lock_cut_truncated: u64,
     /// Delegate: requests held back because too little of the
     /// delegation was left to grant a lock worth holding (the
     /// delegation's renewal is asked for at once).
@@ -1758,7 +1767,18 @@ impl Core {
                 gen,
                 txs,
                 leaving,
-            } => self.on_delegate_stream(now, from, req, gen, txs, leaving, replica, out),
+                leaving_barriers,
+            } => self.on_delegate_stream(
+                now,
+                from,
+                req,
+                gen,
+                txs,
+                leaving,
+                leaving_barriers,
+                replica,
+                out,
+            ),
             PeerMsg::DelegateStreamAck {
                 req,
                 gen,
@@ -1770,8 +1790,9 @@ impl Core {
                 gen,
                 backup,
                 stream_head,
+                stream_head_at,
             } => {
-                self.lock_note_delegate_head(from, gen, stream_head);
+                self.lock_note_delegate_head(now, from, gen, stream_head, stream_head_at);
                 self.on_deleg_renew(now, from, req, gen, backup, replica, out)
             }
             PeerMsg::DelegRenewed {
@@ -1781,6 +1802,9 @@ impl Core {
                 locks,
                 lock_grace_ms,
                 lock_floor,
+                lock_cut_at,
+                lock_cut,
+                lock_barrier,
             } => {
                 // The renewal installs the generation's window first; the
                 // handoff is tagged with the generation itself. A grace
@@ -1793,6 +1817,15 @@ impl Core {
                 }
                 if ttl_ms > 0 {
                     self.lock_take_floor(gen, &lock_floor);
+                    self.lock_take_cut(
+                        now,
+                        from,
+                        gen,
+                        (lock_cut_at, *lock_cut),
+                        lock_barrier,
+                        replica,
+                        out,
+                    );
                 }
                 if ttl_ms > 0 && !locks.is_empty() {
                     self.lock_install_moved(now, gen, locks, replica);

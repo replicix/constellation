@@ -3047,7 +3047,16 @@ answer a timeout, and non-holders whose cached holders point at each
 other; its seed 1383 is pinned
 (`locks_blips_tight_in_doubt_seed_1383_an_overtaken_release_keeps_exclusion`:
 a node's next request overtook its release, and the release ended the
-grant re-affirmed for that request). Replay one with
+grant re-affirmed for that request). The configurations with lock
+writes also check that a holder reads the turn the previous exclusive
+holder wrote under the lock (a stale read fails the seed unless that
+write's acknowledgement was rolled back). `locks-delegated-partition`
+(sweep only) cuts lockers off with the lock files in a delegated
+directory and no unlinks, so every lock's owner is a delegate and an
+outwaited locker's turn sits in its own delegated stream; its seeds and
+those of the `locks-unlinked-delegated` variants that read a stale turn
+after an outwait are pinned in `regression_stale_read_after_an_outwait`
+(stale-read-outwaited). Replay one with
 `AUTHORITY_SIM_SEED=<seed> AUTHORITY_SIM_CONFIG=<config> RUST_LOG=sim=debug,constellation_authority::core::locks=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
 
 Harness scenarios (the harness process is the application: it calls

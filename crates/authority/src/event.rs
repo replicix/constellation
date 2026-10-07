@@ -554,6 +554,11 @@ pub enum PeerMsg {
         /// them once it has applied the batch, which takes them out of
         /// the subtree in its replica too (`Core::deleg_leaving_grants`).
         leaving: Vec<constellation_meta::locks::Grant>,
+        /// Plan 30 §M14: the delegate's outwait barriers on inodes no
+        /// longer in its subtree, `(inode, as of)` on its clock: the root
+        /// keeps them once it has applied the batch
+        /// (`Core::deleg_leaving_barriers`).
+        leaving_barriers: Vec<(Ino, i64)>,
     },
     /// Plan 30 §M11: the root appended the stream through `through`
     /// (the delegate re-sends from there), or `refused` the generation
@@ -580,6 +585,10 @@ pub enum PeerMsg {
         /// the previous tenure recorded may name a stream index the new
         /// root has not been re-streamed yet.
         stream_head: u64,
+        /// When the delegate sent this, on its clock: `stream_head` is
+        /// at least everything it executed before then. The root's lock
+        /// cut is as of the earliest of these (`Core::lock_cut_here`).
+        stream_head_at: i64,
     },
     DelegRenewed {
         req: OpId,
@@ -600,6 +609,16 @@ pub enum PeerMsg {
         /// joins it into every grant under the subtree, so the move does
         /// not lose "the next holder reads what the previous one wrote".
         lock_floor: constellation_meta::Position,
+        /// Plan 30 §M14: the root's cut of everything acknowledged
+        /// anywhere, as of `lock_cut_at` on the root's clock (0: none) —
+        /// what settles the delegate's outwait barriers
+        /// (`Core::lock_take_cut`).
+        lock_cut_at: i64,
+        lock_cut: Box<constellation_meta::Position>,
+        /// Plan 30 §M14: the latest outwait barrier the root has left
+        /// under the subtree (0: none): the delegate's grants there wait
+        /// for a cut as of it too.
+        lock_barrier: i64,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops executing under it and answers with the highest

@@ -354,6 +354,7 @@ fn replay_seed() {
         Ok("locks-unlinked-delegated-dbackup-random") => locks_unlinked_random_config(true),
         Ok("locks-unlinked-delegated-blips") => locks_unlinked_blips_config(),
         Ok("locks-unlinked-delegated-partition") => locks_unlinked_partition_config(),
+        Ok("locks-delegated-partition") => locks_delegated_partition_config(),
         Ok("locks-released-writes") => with_lock_writes(locks_released_delegated_config(), "d2"),
         Ok("locks-failover-backup-writes") => with_lock_writes(locks_failover_backup_config(), ""),
         Ok("locks-writes") => with_lock_writes(locks_config(), ""),
@@ -2673,6 +2674,7 @@ fn sweep_config() {
         "locks-unlinked-delegated-dbackup-random" => locks_unlinked_random_config(true),
         "locks-unlinked-delegated-blips" => locks_unlinked_blips_config(),
         "locks-unlinked-delegated-partition" => locks_unlinked_partition_config(),
+        "locks-delegated-partition" => locks_delegated_partition_config(),
         "locks-released-delegated" => locks_released_delegated_config(),
         "locks-writes" => with_lock_writes(locks_config(), ""),
         "locks-delegated-writes" => with_lock_writes(locks_delegated_config(), "d2"),
@@ -4939,6 +4941,19 @@ fn locks_unlinked_partition_config() -> SimConfig {
     }
 }
 
+/// `locks-unlinked-delegated-partition` without the unlinks: the lock
+/// files stay in `d1` (node 2's), so every grant's owner is a delegate,
+/// and the turns go to `d2` (node 3's). A locker cut from both is
+/// outwaited by node 2 while its acknowledged turn is in its own `d2`
+/// stream, which the root has not appended (stale-read-outwaited: 57 of
+/// 3000 seeds read an older turn before the fix).
+fn locks_delegated_partition_config() -> SimConfig {
+    SimConfig {
+        lock_unlink_ratio: 0.0,
+        ..locks_unlinked_partition_config()
+    }
+}
+
 /// overload-cascade-2 review, must-fix 1: see
 /// [`locks_unlinked_delegated_config`]. Non-vacuous: the root installs
 /// grants that left a subtree with its unlink.
@@ -5023,6 +5038,94 @@ fn regression_locks_unlinked_delegated_dbackup_random_seed_5681() {
              AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
         )
     });
+}
+
+/// stale-read-outwaited: a locker cut off from the lock's owner is
+/// outwaited while what it was acknowledged under the lock is in a
+/// delegate's stream the root has not appended (here its own `d2`
+/// stream), and the next holder read the older turn: the grant carried
+/// only the owner's position. Now the outwait is a barrier the next grant
+/// waits on until a cut of every live stream as of the grant record's end
+/// is its floor (`Core::lock_barrier_ready`). 276 and 297: the root owns
+/// the unlinked lock file; 935 and 2716 the same without delegate
+/// backups; 68 and 81: a delegate owns it and takes the cut from its
+/// root's renewal answers; 597: a delegate outwaits, the root's cut waits
+/// for the cut-off delegate's generation to end; 4067: the delegate
+/// outwaits, then the file is unlinked and the barrier goes to the root
+/// with the unlink (`Core::deleg_leaving_barriers`). Each fails without
+/// the barrier. 390 (review round): the outwaited holder itself was
+/// granted shared again, which must not end its barrier — another node's
+/// shared grant beside it read the older turn.
+#[test]
+fn regression_stale_read_after_an_outwait() {
+    type Config = fn() -> SimConfig;
+    let seeds: [(&str, Config, u64); 9] = [
+        (
+            "locks-unlinked-delegated-dbackup-random",
+            || locks_unlinked_random_config(true),
+            276,
+        ),
+        (
+            "locks-unlinked-delegated-dbackup-random",
+            || locks_unlinked_random_config(true),
+            297,
+        ),
+        (
+            "locks-unlinked-delegated-random",
+            || locks_unlinked_random_config(false),
+            935,
+        ),
+        (
+            "locks-unlinked-delegated-random",
+            || locks_unlinked_random_config(false),
+            2_716,
+        ),
+        (
+            "locks-delegated-partition",
+            locks_delegated_partition_config,
+            68,
+        ),
+        (
+            "locks-delegated-partition",
+            locks_delegated_partition_config,
+            81,
+        ),
+        (
+            "locks-unlinked-delegated-partition",
+            locks_unlinked_partition_config,
+            597,
+        ),
+        (
+            "locks-unlinked-delegated-partition",
+            locks_unlinked_partition_config,
+            4_067,
+        ),
+        (
+            "locks-unlinked-delegated-partition",
+            locks_unlinked_partition_config,
+            390,
+        ),
+    ];
+    let (mut barriers, mut waits) = (0, 0);
+    for (config, cfg, seed) in seeds {
+        let report = run_seed(seed, cfg()).unwrap_or_else(|e| {
+            panic!("{config} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={config}")
+        });
+        barriers += report
+            .stats
+            .values()
+            .map(|s| s.lock_outwait_barriers)
+            .sum::<u64>();
+        waits += report
+            .stats
+            .values()
+            .map(|s| s.lock_barrier_waits)
+            .sum::<u64>();
+    }
+    assert!(
+        barriers > 0 && waits > 0,
+        "vacuous: {barriers} barriers, {waits} waits"
+    );
 }
 
 /// `locks-unlinked-delegated` seeds 292 and 6475 (this chunk's first

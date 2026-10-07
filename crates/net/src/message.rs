@@ -372,14 +372,16 @@ pub enum Payload {
     /// `gen` to the root (`txs`: postcard of
     /// `Vec<constellation_meta::DelegateTx>`; `leaving`: postcard of
     /// `Vec<constellation_meta::locks::Grant>`, the delegate's grants on
-    /// inodes the batch takes out of its subtree). Answered by
-    /// [`Payload::DelegateStreamAck`].
+    /// inodes the batch takes out of its subtree; `leaving_barriers`:
+    /// postcard of `Vec<(u64, i64)>`, its outwait barriers on them).
+    /// Answered by [`Payload::DelegateStreamAck`].
     DelegateStream {
         from: u64,
         req_id: u64,
         gen: u64,
         txs: Vec<u8>,
         leaving: Vec<u8>,
+        leaving_barriers: Vec<u8>,
     },
     DelegateStreamAck {
         req_id: u64,
@@ -395,8 +397,10 @@ pub enum Payload {
         gen: u64,
         /// Phase 2b: the delegate's backup peer (0: none).
         backup: u64,
-        /// Plan 30 §M14: the delegate's executed stream head for `gen`.
+        /// Plan 30 §M14: the delegate's executed stream head for `gen`,
+        /// and when it sent this (its clock, unix ms).
         stream_head: u64,
+        stream_head_at: i64,
     },
     DelegRenewed {
         req_id: u64,
@@ -412,6 +416,13 @@ pub enum Payload {
         /// Plan 30 §M14: postcard of the subtree's lock floor (a
         /// `constellation_meta::Position`; empty: none).
         lock_floor: Vec<u8>,
+        /// Plan 30 §M14: the root's lock cut, as of `lock_cut_at` (unix
+        /// ms; 0: none), postcard of a `constellation_meta::Position`, and
+        /// the latest outwait barrier left under the subtree (0: none) —
+        /// see `PeerMsg::DelegRenewed`.
+        lock_cut_at: i64,
+        lock_cut: Vec<u8>,
+        lock_barrier: i64,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops and answers the highest stream index it executed.
@@ -428,8 +439,10 @@ pub enum Payload {
         /// Plan 30 §M14: postcard of the delegate's lock grants under the
         /// subtree, handed back to the root.
         locks: Vec<u8>,
-        /// Plan 30 §M14: postcard of the subtree's lock floor.
+        /// Plan 30 §M14: postcard of the subtree's lock floor, and the
+        /// latest outwait barrier under it (0: none).
         lock_floor: Vec<u8>,
+        lock_barrier: i64,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
     /// `Vec<DelegateTx>`), and the backup's contiguous hold (or `sealed`).
@@ -1364,6 +1377,9 @@ mod tests {
                 locks: vec![1, 2, 3],
                 lock_grace_ms: 4,
                 lock_floor: vec![5],
+                lock_cut_at: 6,
+                lock_cut: vec![7],
+                lock_barrier: 8,
             },
         ] {
             let signed = Signed::new(&k, &payload).unwrap();

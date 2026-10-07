@@ -1580,9 +1580,10 @@ async fn handle_stream<S: PeerService>(
                 gen,
                 txs,
                 leaving,
+                leaving_barriers,
             } => Some(
                 service
-                    .delegate_stream_requested(from, req_id, gen, txs, leaving)
+                    .delegate_stream_requested(from, req_id, gen, txs, leaving, leaving_barriers)
                     .await,
             ),
             Payload::DelegRenew {
@@ -1591,9 +1592,10 @@ async fn handle_stream<S: PeerService>(
                 gen,
                 backup,
                 stream_head,
+                stream_head_at,
             } => Some(
                 service
-                    .deleg_renew_requested(from, req_id, gen, backup, stream_head)
+                    .deleg_renew_requested(from, req_id, gen, backup, stream_head, stream_head_at)
                     .await,
             ),
             Payload::DelegRecall {

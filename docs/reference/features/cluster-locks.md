@@ -464,7 +464,81 @@ the lock, not only the locked file:
   delegates, and — when the releaser is the root holder — its whole
   unshipped journal). The owner keeps the join per file and every later
   grant of the file carries it. A grant that was outwaited instead of
-  released carries the owner's own position.
+  released has no such position: the next grant of the file waits for a
+  cut instead (below).
+
+**After an outwait.** A holder that stops answering (a partition, a
+stopped daemon) never says what it was acknowledged under its grant,
+and that may be in a stream the owner's position does not name: a
+delegate's rows the root has not appended yet, the holder's own when it
+is the delegate of the files it wrote. Granting on with the owner's own
+position let the next holder read the older state (sim
+`locks-unlinked-delegated-dbackup-random` seed 276; 54 in 3000 seeds of
+`locks-delegated-partition`). So a grant record that ends unreleased —
+outwaited after a recall, or found expired by the next request — leaves
+a **barrier** on its file at the record's end, and the file's next grant
+waits (parked, or `EWOULDBLOCK`) until a **cut** as of that time is its
+floor:
+
+- The fencing token bounds what is left to learn. The holder's operations
+  are refused everywhere from its window's end, which is `2 × margin`
+  minus the transit and the holder's clock skew before the record's end —
+  positive by the margin rule (margin ≥ skew + transit) — so whatever was
+  executed under the grant was executed before the record ended.
+- A cut is the root's own position (its log, its unshipped journal, its
+  own generations) joined with every live generation's stream index as
+  its delegate's latest renewal reported it. Each `DelegRenew` carries
+  the index the delegate has executed and when it sent the renewal, on
+  its clock, and a cut is as of the earliest of those sends. A
+  generation that has ended counts no more: what the root appended of it
+  is in the root's position, and the rest was never appended, so those
+  acknowledgements are tentative (replayed by rid, where the outwaited
+  holder's token refuses them).
+- A designation counts like any generation while it is online (renewed
+  within one delegation TTL). An offline one adds the index it last
+  renewed with but no longer holds a cut back: its designee writes while
+  isolated and is never reclaimed, so a lock holder's writes in a
+  designated subtree, made after its designee's last renewal and while
+  the designee is cut off, are ordered for the next holder only as far
+  as that renewal went.
+- The holder whose record left the barrier does not wait on it: what it
+  was acknowledged under the grant is in its own position (a live holder
+  whose renewal came late asks again), and its new *exclusive* grant ends
+  the barrier (nobody is granted past it before its release or its
+  outwait). A shared one does not: another node's shared grant beside it
+  still waits for the cut. A barrier carried from a delegate (with an unlink) does not
+  say whose record it was, so it holds everyone.
+- The root takes its own cut when it grants. A delegate owner takes the
+  one its root sends with every granting renewal answer, joined with its
+  own executed stream, and renews at once while a grant waits for a
+  fresher one.
+- A holder cut off from everyone is often the delegate of the files it
+  wrote. Its stream cannot be heard from either, so the cut waits until
+  the root has ended that generation (outwaited, sealed or drained from
+  its backup), as every grant under it would.
+- A barrier settles once, into an ordinary floor; later grants do not
+  wait. It costs nothing while nothing is outwaited. After an outwait,
+  the next grant waits for every live delegate's next renewal (at most a
+  quarter of the delegation TTL with grants out, half without), on top
+  of the `ttl + margin` the outwait already took.
+- Barriers move with the lock table like floors: a granting renewal
+  carries the latest barrier under the subtree and a recall answer
+  carries the delegate's back; an outwaited delegation leaves one on its
+  subtree (its holders' releases went with it); a file unlinked under a
+  delegate takes the delegate's barrier to the root with the stream batch
+  that carries the unlink (sim `locks-unlinked-delegated-partition` seed
+  4067); an unlinked file is under every directory barrier, as under
+  every subtree grace. A restart inside the lease forgets its grant
+  table, so every grant of the previous incarnation ends unreleased: it
+  leaves a barrier on everything as of the persisted horizon, which its
+  holders may write until (a new tenure's floor, below, is a cut taken
+  when the tenure begins, before those holders stop). The same holds
+  for a takeover of a released lease (a barrier as of the end of its
+  quarantine) and for a node that drops its tenure's grant table and may
+  claim the lease again (as of the end of the grants it dropped).
+- The holder itself is not asked: its frontier would be the exact
+  floor, but a holder that cannot be reached cannot send it, and one
+  that can be reached is not outwaited.
 
 `status.locks` says whether that ever failed: `grants_waited` and
 `grant_wait_ms_total` count the grants whose floor the replica had not
@@ -502,7 +576,8 @@ when the owner changes:
 - **A delegation recalled.** The delegate's answer carries the
   subtree's floor back. A delegate that is outwaited instead leaves
   the root's own position, taken once the root has appended the
-  delegate's stream, as the subtree's floor.
+  delegate's stream, as the subtree's floor, and a barrier on the
+  subtree (above).
 - **A takeover.** The holder mirrors the join of every floor it knows
   to its backups, and a fast successor puts it on the whole namespace.
   Any new tenure (a takeover, a restart, the lease back after losing
@@ -523,9 +598,9 @@ costs nothing. A node's session watermark holds at most 8 delegation
 streams, and streams the node has already applied are dropped first.
 The wait on the grant itself always covers the grant's whole floor. A
 later read of another file could lose a stream only when more than 8
-unapplied streams are owed at once; the newest are kept then. A grant
-that was outwaited instead of released still carries only the owner's
-own position.
+unapplied streams are owed at once; the newest are kept then. A cut
+names every live generation, so it is cut down the same way when more
+than 8 are live.
 
 Two node-side rules keep a holder's I/O inside its grant. An exclusive
 local lock is fenced unless the honoured grant is exclusive too. This

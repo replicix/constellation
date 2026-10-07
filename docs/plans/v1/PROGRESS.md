@@ -44241,3 +44241,270 @@ Gates (`CARGO_TARGET_DIR` unset, `ulimit -n 65536`, sims with
   partitioned at t=1556, node 2 paused at t=3091, locker 3 partitioned again
   at t=8531). It fails the same way on main 96f4565, so it predates this
   chunk (found by its review's 6000..9000 sweep); tracked as its own chunk.
+
+## Fix: a lock granted after an outwaited holder read state older than that holder's acknowledged writes (`stale-read-outwaited`, 2026-10-07)
+
+Follow-up of `overload-cascade-2` round 3, should-fix 1 (the documented
+gap in `cluster-locks.md`: "a grant that was outwaited instead of
+released carries only the owner's own position"). Base: main `c465b07f`
+(this chunk started on `96f45659` and moved onto `c465b07f`, the merged
+`unlinked-exclusion-5681`, part-way).
+
+Fix: a grant record that ends unreleased (outwaited after a recall, or
+found expired by the next request) leaves a **barrier** on its inode at
+the record's end, and the inode's next grant waits until a **cut** as of
+that time is its floor. A cut is the root's own release floor joined with
+every live generation's stream head from a renewal its delegate *sent*
+at or after that time (`DelegRenew` now carries `stream_head_at`, the
+delegate's clock at the send). The root takes its own cut; a delegate
+owner takes the one its root sends with every granting `DelegRenewed`
+(`lock_cut_at`, `lock_cut`) and renews at once while a grant waits.
+Barriers move with the lock table: a granting renewal carries the latest
+one under the subtree (`lock_barrier`), a recall answer carries the
+delegate's back (`LockHandback::barrier`), an outwaited generation
+leaves one on its subtree, a file unlinked under a delegate takes the
+delegate's barrier to the root with the stream batch that carries the
+unlink (`DelegateStream::leaving_barriers`), and a restart inside the
+lease leaves one on everything as of its persisted lock horizon.
+
+**Cause** (replayed with `RUST_LOG=sim=debug,constellation_authority::core::locks=debug`):
+
+- `locks-unlinked-delegated-dbackup-random` seed 276: node 3, the
+  delegate of `d2` (the turn files), is partitioned from root 1 at
+  t=1022 for 4.3 s. It takes `lk0` (unlinked, so the root's) under its
+  cached grant and writes turn 4 at t=1732 in its own `d2` stream, which
+  the root cannot receive. It unlocks at 1752 but keeps the grant
+  cached; node 1's request recalls it, the recall is lost, the root
+  outwaits it and grants node 1 at 3859 with the root's position, which
+  names nothing of `d2`'s stream past what was appended: node 1 reads
+  turn 3.
+- `locks-unlinked-delegated-partition` seed 597 and the no-unlink
+  control `locks-delegated-partition` seeds 68, 81: the same with the
+  lock file still in `d1`, so the owner is node 2 (`d1`'s delegate),
+  which has no view of node 3's stream at all.
+- `locks-unlinked-delegated-partition` seed 4067 (found after the first
+  cut of the fix): node 2 outwaits node 3's grant on `lk0`, then node 1
+  unlinks `lk0`, and from that row on the root owns it with no barrier:
+  the delegate's barrier (here only an expired, unreleased record nobody
+  had dropped yet) did not travel with the unlink.
+- `-partition` seed 3700 failed "mutual exclusion" on the first cut, on
+  `96f45659`: the shape of `unlinked-exclusion-5681` (an expired record
+  kept a leaving grant out); gone on `c465b07f`.
+
+**Decisions.**
+
+- *(b), not (a).* Holding back the acknowledgement of a lock-protected
+  write until the lock's owner has the row adds a stream round trip (and
+  for a delegate owner, the root's ship to the log) to every such write:
+  git's objects in a delegated subtree under a root turn file is the
+  common case, uncontended. The barrier costs nothing until something is
+  outwaited (one map lookup per grant; the cut only when a barrier
+  applies), and outwaits are already the slow path (`ttl + margin`).
+- *Learn the streams, not the holder.* An outwaited holder's own frontier
+  would be the exact floor, but a holder that can be reached is not
+  outwaited. What it was acknowledged sits in some sequencer's stream or
+  journal; the fencing token bounds it in time: every executor refuses
+  the holder's token from its window's end (`sent + ttl − margin`, its
+  clock), which is at least `2 × margin` before the record's end at the
+  owner. So a cut as of the record's end covers every row executed under
+  the grant, and the comparison is between clocks the lock design
+  already bounds (the token argument needs the same skew bound). Rows
+  executed after it are refused anyway.
+- *Timestamps on renewals, not a new message.* The root already gets a
+  renewal from every live delegate at least every half delegation TTL,
+  carrying its executed head (for the tenure floor). The send time is
+  what makes "a head reported after the outwait" decidable: a renewal
+  that arrives late, sent before, does not count (pinned in
+  `an_outwaited_holders_successor_waits_for_every_live_streams_head`). A
+  dedicated head query would answer faster (one round trip instead of
+  up to half a delegation TTL) but needs a new message pair end to end;
+  the outwait has already cost `ttl + margin`, so the renewal cadence
+  was kept.
+- *Liveness.* A delegate that cannot be heard from (the partitioned
+  holder is the `d2` delegate itself in every traced seed) holds the cut
+  until the root ends its generation: outwaited by the delegation's TTL,
+  sealed, or drained from its backup. An ended generation counts no
+  more: what the root appended of it is in the root's own position, the
+  rest was never appended and its acknowledgements are tentative
+  (replayed by rid, where the outwaited holder's token refuses them: a
+  conflict copy, as before). So the wait is bounded by the reclaim the
+  root does anyway. An offline designation never ends that way (its
+  designee writes while isolated, DESIGN.md §5.2), so once silent for a
+  delegation TTL it contributes the head it last renewed with and no
+  longer holds a cut back
+  (`an_offline_designation_does_not_hold_an_outwait_barrier`); online,
+  it counts as any generation (review round, below).
+- *Durability rules unchanged.* No acknowledgement waits longer and no
+  row moves; only the next grant's floor (and when it is answered)
+  changes. A barrier settles once into an ordinary floor (a watermark).
+- *Restart.* A restart inside the lease forgets its grant table, which
+  is the same hole (its previous grants may be honoured, and written
+  under into delegates' streams, until the persisted horizon, after the
+  new tenure's floor was taken). It leaves a barrier on everything as of
+  the horizon; on a node with no live delegations the cut is immediate.
+  Not seen in the sweeps; pinned by
+  `a_restart_inside_the_lease_leaves_a_barrier_at_its_horizon`.
+- *Unlinked inodes* are under every directory barrier, as under every
+  subtree grace (`lock_in_grace`): which subtree one left is not
+  recorded. `an_outwaited_generations_grace_covers_the_inodes_it_unlinked`
+  now marks its generation ended after calling
+  `lock_on_generation_outwaited` directly, as `end_generation` does in
+  the same step (the test bypassed it; its assertions are unchanged).
+- *Wire changes in place* (no version bump, no defaults): `DelegRenew`
+  `stream_head_at`; `DelegRenewed` `lock_cut_at`, `lock_cut` (boxed:
+  `PeerMsg` crossed clippy's variant-size limit), `lock_barrier`;
+  `DelegRecalled` `lock_barrier`; `DelegateStream` `leaving_barriers`;
+  `LockHandback::barrier`. The engine's renewal answer became a struct
+  (`sync::DelegRenewReply`) instead of a 7-tuple.
+
+| Item | State | Where |
+|---|---|---|
+| Expired records dropped anywhere are reported to the sequencer once | done | `meta::locks::LockTables::take_outwaited` (`Inner::outwaited`) |
+| Barriers, cuts, settling into floors (and into the floor re-sent to a delegated subtree) | done | `core::locks` (`LockState::{barriers, dir_barriers, heads, cut}`, `lock_barrier_ready`, `lock_cut_here`, `lock_settle_barriers`, `lock_take_cut`, `lock_cut_for_generation`) |
+| Renewals stamped; heads kept per generation | done | `core::delegate::deleg_renew_now`, `Core::lock_note_delegate_head` |
+| Barriers with moves, outwaited generations, unlinks, restarts | done | `lock_hand_back`, `lock_install_returned`, `lock_on_generation_outwaited`, `deleg_leaving_barriers`, `lock_install_leaving_barriers`, `deleg_drop_left`, `locks_start` |
+| Wire | done | `authority::event`, `net::message`, `net::{peers, endpoint}`, `engine::{p2p, sync, authority_driver}` |
+| Stats | done | `Stats::{lock_outwait_barriers, lock_barrier_waits}`; `container_sizes` `lk_barriers`, `lk_dir_barriers`, `lk_heads` |
+| Core tests (each fails with `lock_barrier_ready` always true, the restart one without its barrier) | done | `core::tests::locks::{an_outwaited_holders_successor_waits_for_every_live_streams_head, an_ended_generation_does_not_hold_an_outwait_barrier, an_offline_designation_does_not_hold_an_outwait_barrier, a_restart_inside_the_lease_leaves_a_barrier_at_its_horizon, a_delegates_outwait_barrier_waits_for_the_roots_cut, an_outwait_barrier_moves_to_the_root_with_the_unlink}` |
+| Meta test | done | `meta::locks::tests::expired_records_dropped_anywhere_are_reported_as_outwaited_once` |
+| Sim: no-unlink control config, sweep and replay | done | `locks-delegated-partition` (`locks_delegated_partition_config`) |
+| Sim regression (8 seeds, each fails without the barrier; asserts barriers and waits happened) | done | `regression_stale_read_after_an_outwait`: dbackup-random 276, 297; random 935, 2716; delegated-partition 68, 81; unlinked-partition 597, 4067 |
+| Docs | done | `cluster-locks.md` ("After an outwait", the move rules, the 8-stream note), `delegations.md` (renewal stamps), `TESTING.md` |
+
+Sweeps (`sweep_config`, `TMPDIR=/dev/shm/sro`, 12 threads; "no fix" is
+this tree with `lock_barrier_ready` always true, which reproduces the
+base counts exactly):
+
+| config | seeds | no fix | this tree |
+|---|---|---|---|
+| `locks-unlinked-delegated-partition` | 0..3000 / 0..6000 | 60 stale reads | 0 |
+| `locks-unlinked-delegated-dbackup-random` | 0..3000 / 0..6000 | 5 (276, 297, 1293, 1690, 2036) | 0 |
+| `locks-unlinked-delegated-random` | 0..3000 / 0..6000 | 3 (935, 2716, 2877) | 0 |
+| `locks-delegated-partition` (new, no unlinks) | 0..3000 / 0..6000 | 54 stale reads | 0 |
+| `locks-unlinked-delegated`, `-hcrash`, `-hcrash-backup`, `-dcrash`, `-dcrash-nb`, `-blips` | 0..6000 | – | 0 |
+| `locks`, `-partition`, `-skew`, `-failover`, `-failover-backup`, `-faults`, `-pause`, `-blips`, `-blips-tight`, `-blips-tight-single`, `-blips-tight-long-lease`, `-blips-tight-in-doubt`, `-blips-tight-faults`, `-blips-tight-delegated`, `-delegated`, `-released-delegated`, `-writes`, `-delegated-writes`, `-released-writes`, `-failover-backup-writes` | 0..6000 | – | 0 |
+| `flex`, `flex-crash` | 0..3000 | – | 0 |
+| `delegated-holder-cut`, `long-delegated`, `delegated-backup`, `delegated-two-gens-root-crash`, `delegated-root-gone`, `delegated-delegate-restart`, `long-delegated-backup` | 0..2000 | – | 0 |
+
+Gates (final code; `CARGO_TARGET_DIR` unset, `ulimit -n 65536`; 16
+CPUs, load 25–75):
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test --release -p constellation-authority` (sim with
+  `TMPDIR=/dev/shm/sro`, `AUTHORITY_SIM_THREADS=8`): 288 (+2 ignored) + 4
+  + sim 129 (+11 ignored); `-p constellation-meta -p
+  constellation-engine`: 923 passed (+16 ignored; meta lib 244, engine
+  lib 599), 0 failed. Also `-p constellation-net` (wire changed): 129
+  passed.
+- Harness, once each at default durations, prefix `sro`,
+  `TMPDIR=/var/tmp/sro/tmp`, all PASSED: `lock-grant-dead-generation`
+  11.4 s, `lock-holder-partitioned` 9.3 s, `lock-failover` 30.5 s,
+  `lock-holder-killed-contention` 15.4 s, `lock-fence-at-close` 16.3 s,
+  `lock-latency` 10.6 s, `delegated-subtrees` 17.7 s, `delegate-crash`
+  15.2 s, `delegate-crash-default-ttl` 30.0 s, `delegate-partition`
+  25.0 s, `delegated-op-latency` 28.1 s, `delegate-crash-backup` 16.9 s,
+  `delegate-root-loss` 28.8 s, `delegate-root-blackhole` 28.6 s,
+  `delegate-root-loss-ttl` 40.5 s, `delegate-handoff-renewal` 19.4 s,
+  `delegate-backup-handoff-failover` 32.8 s, `git-under-flock` 117.6 s,
+  `git-under-flock-gc` 78.5 s, `git-under-flock-faults` 216.2 s,
+  `git-under-flock-causal` 279.5 s, `git-under-flock-b2b` 286.7 s,
+  `git-under-flock-rounds` 267.2 s with `GIT_FLOCK_ROUNDS=2` (3 rounds
+  does not fit the 600 s tool call here).
+
+### Review round (should-fixes 1–3, nits)
+
+- *Released takeover, dropped tenure* (should-fix 1). The restart's hole
+  was open for a takeover of a released lease and for a node that drops
+  its tenure's grant table and re-claims the lease: the predecessor's
+  grants end unreleased, their holders may write into delegates' streams
+  until the quarantine ends, and the new tenure's floor takes the
+  inherited delegates' *first* renewals. Both now leave a barrier on
+  everything as of the quarantine's end, next to `set_quarantine`
+  (`lock_on_released_takeover`, `lock_quarantine_dropped_tenure`).
+  Tests: `a_released_takeover_leaves_a_barrier_at_its_quarantines_end`,
+  `a_dropped_tenures_grants_leave_a_barrier_at_their_end` (both fail
+  without the barrier). No new sim config: the existing `-failover*`,
+  `-released-*` configs sweep it (below).
+- *A lapsed holder's own barrier* (should-fix 2). A barrier remembers
+  whose record left it while that is one node (`LockState::barriers`
+  `(at, Option<NodeId>)`; `None` once two nodes' records join, and for
+  barriers carried with an unlink). That node does not wait on it — its
+  own position covers what it did under the grant — and its new
+  *exclusive* grant removes the barrier (nobody is granted past it before
+  its release, which carries that position, or its outwait, which sets a
+  later barrier). The first cut removed it on any grant:
+  `locks-unlinked-delegated-partition` seed 390 then failed — node 3,
+  outwaited after an acknowledged write, was granted shared again, and
+  node 1's shared grant beside it, no longer behind the barrier, read the
+  older turn. Tests:
+  `a_lapsed_holder_does_not_wait_on_its_own_outwait_barrier` (fails
+  without it; another node still waits),
+  `a_lapsed_holders_shared_grant_keeps_its_barrier_for_others` (fails
+  when a shared grant removes it); seed 390 pinned in
+  `regression_stale_read_after_an_outwait`.
+- *Online designations* (should-fix 3). A designation's renewal lowers
+  the cut's time while its last renewal arrived within one delegation
+  TTL (or, never heard from, it was granted here within one); after that
+  silence it is dropped as before. `LockState::heads` keeps the arrival
+  time. Test: `an_online_designation_holds_an_outwait_barrier` (fails
+  without it).
+- Nits: a delegate's kept cut is replaced by one from another root
+  whatever its time (`LockState::cut` keeps the root); the root's heads
+  are cleared when the lease goes; the token-window wording now says
+  `2 × margin − (transit + holder skew)`, positive by the margin rule;
+  `Stats::lock_cut_truncated` counts cuts that left a live stream out at
+  `STREAMS_CAP`.
+
+Gates of this round: see the end of this section.
+
+### Open
+
+- An offline designation (silent for a delegation TTL) does not hold a
+  cut back: a lock holder that is a designee, writes in its designated
+  subtree and is then cut off and outwaited can still hand the next
+  holder state older than its acknowledged writes (the seed-276 shape;
+  not sim-covered: no lock config designates). Waiting for it would
+  stop every grant after an outwait while the designee is away
+  (DESIGN.md §5.2).
+- A holder's *release* recorded at a delegate is not carried when the
+  file is then unlinked out of the subtree: the root's next grant on it
+  has the root's floors, not the delegate's per-file floor. The same
+  class of stale read, not seen in any sweep (a release's position is
+  usually reached by the root's own position by the time an unlink and
+  another request follow); carrying it would need the per-file floors
+  checked against ownership on every stream batch. Recorded, not fixed.
+- A cut names at most 8 streams (`STREAMS_CAP`), as every floor does;
+  with more than 8 live delegations the oldest are cut off.
+- The cut waits for every live delegate's next renewal: up to half the
+  delegation TTL (10 s at the defaults) on top of the outwait. A head
+  query would bound it by a round trip.
+- A barrier carried to the root with an unlink does not say whose
+  record it was, so the outwaited holder itself waits on it there too
+  (latency only; the late-renewal path rarely meets an unlink).
+
+Gates of the review round (final code; `CARGO_TARGET_DIR` unset,
+`ulimit -n 65536`, `TMPDIR=/dev/shm/sro`):
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test --release -p constellation-authority -p constellation-meta
+  -p constellation-net`: 878 passed, 0 failed (authority lib 293, sim
+  129, meta_repro 4).
+- `sweep_config` 0..3000, 12 threads, every one `0 failing`: all 30 lock
+  configs the sweep takes (`locks`, `-partition`, `-skew`, `-failover`,
+  `-failover-backup`, `-faults`, `-pause`, `-blips`, `-blips-tight{,
+  -single,-long-lease,-in-doubt,-faults,-delegated}`, `-delegated`,
+  `-released-delegated`, `-writes`, `-delegated-writes`,
+  `-released-writes`, `-failover-backup-writes`,
+  `locks-unlinked-delegated{,-hcrash,-hcrash-backup,-dcrash,-dcrash-nb,
+  -random,-dbackup-random,-blips,-partition}`, `locks-delegated-partition`),
+  `flex`, `flex-crash`; and 3000..6000 for `locks-unlinked-delegated-
+  {partition,dbackup-random,random,hcrash-backup}`,
+  `locks-delegated-partition`, `locks-failover-backup`,
+  `locks-released-delegated`, `locks-blips-tight-delegated`: 0 failing.
+  (Seed 390 above is from the first sweep of this round.)
+- Harness, prefix `sro`, `TMPDIR=/var/tmp/sro/tmp`, load 40–55: all
+  PASSED — `lock-grant-dead-generation`, `lock-holder-partitioned`
+  30.1 s, `lock-failover` 56.7 s, `lock-holder-killed-contention`
+  45.5 s, `lock-fence-at-close` 41.5 s, `lock-latency` 44.1 s.
