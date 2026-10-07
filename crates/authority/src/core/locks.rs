@@ -234,9 +234,6 @@ pub(crate) struct LockState {
     /// tick — a refusal for stale liveness, an unmarked lease or a grace
     /// period has no event of its own that ends it.
     waiter_tick: Option<TimerId>,
-    /// Grants handed back by an outwaited generation's handoff, or
-    /// otherwise returning to this table at the next event.
-    pending_returns: Vec<Grant>,
     recalls: BTreeMap<GrantId, Recalling>,
     recall_by_req: BTreeMap<OpId, GrantId>,
     /// Subtree grace after an outwaited delegate: `(dir, until)`.
@@ -3564,7 +3561,7 @@ impl Core {
                 gen: 0,
                 ..g
             };
-            if replica.locks().install_if_consistent(g) {
+            if replica.locks().install_if_consistent(g, now.0) {
                 n += 1;
             }
         }
@@ -3625,7 +3622,7 @@ impl Core {
             };
             if g.until_ms > now.0
                 && !replica.locks().was_ended(g.id)
-                && replica.locks().install_if_consistent(g)
+                && replica.locks().install_if_consistent(g, now.0)
             {
                 n += 1;
             }
@@ -3711,7 +3708,7 @@ impl Core {
                 confirmed_ms: Grant::UNCONFIRMED,
                 ..g
             };
-            if g.until_ms > now.0 && replica.locks().install_if_consistent(g) {
+            if g.until_ms > now.0 && replica.locks().install_if_consistent(g, now.0) {
                 n += 1;
             }
         }
@@ -3811,7 +3808,7 @@ impl Core {
                 if !self.lk.moved_seen.entry(gen).or_default().insert(g.id) {
                     continue;
                 }
-                if !replica.locks().install_if_consistent(g) {
+                if !replica.locks().install_if_consistent(g, now.0) {
                     continue;
                 }
             }
@@ -3878,7 +3875,7 @@ impl Core {
     /// grants moved to it may still be honoured with the windows this
     /// root gave them — a grace on the subtree until they lapse or
     /// reclaim.
-    pub(crate) fn lock_on_generation_outwaited(&mut self, now: Ms, gen: u64, dir: Ino) {
+    pub(crate) fn lock_on_generation_outwaited(&mut self, now: Ms, dir: Ino) {
         let until = Ms(self.restamp(now));
         self.lk.grace.push((dir, until));
         // Its holders' releases are lost with it: what they could have
@@ -3886,11 +3883,17 @@ impl Core {
         // delegate's stream — noted at the next event.
         self.lk.pending_dir_floors.push(dir);
         self.stats.lock_grace_periods += 1;
-        // Anything not yet handed over returns to this table at the next
-        // event (it never left this node).
-        if let Some(back) = self.lk.handoff.remove(&gen) {
-            self.lk.pending_returns.extend(back);
-        }
+        // What was not handed over yet stays the generation's until it
+        // ends: [`Core::lock_on_generation_ended`] returns it to this
+        // table as recorded, live ones only, before a re-delegation of
+        // the subtree takes the table's grants along. Returned here at
+        // the next event instead, it came back restamped — lapsed grants
+        // revived — after the same step had re-delegated the subtree, so
+        // it sat in this table on inodes the new generation serves; such
+        // a record of a holder kept that holder's grant out when it came
+        // back with an unlink (`lock_install_leaving`), and this root
+        // granted the inode over it (sim `locks-unlinked-delegated-
+        // dbackup-random` seed 5681).
     }
 
     /// Root: what is left of a grace here (a subtree grace overlapping
@@ -4101,10 +4104,6 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let returns = std::mem::take(&mut self.lk.pending_returns);
-        if !returns.is_empty() {
-            self.lock_install_moved(now, 0, returns, replica);
-        }
         self.lock_fill_renew_heads(replica, out);
         let dirs = std::mem::take(&mut self.lk.pending_dir_floors);
         if !dirs.is_empty() {

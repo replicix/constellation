@@ -4999,6 +4999,32 @@ fn regression_locks_unlinked_delegated_dbackup_random_seeds_2477_2982() {
     }
 }
 
+/// `locks-unlinked-delegated-dbackup-random` seed 5681 (mutual
+/// exclusion): `d1`'s generation was outwaited while grants the root had
+/// moved to it were still undelivered (the root and the delegate were
+/// partitioned), and the step that ended it re-delegated the subtree.
+/// The undelivered grants came back to the root's table only after that,
+/// restamped: lapsed ones revived, on inodes the new generation served.
+/// Later the new delegate granted one of those inodes to the same holder,
+/// which a client then unlinked; the grant came to the root with the
+/// unlink, and the root's stale record of that holder (expired by then,
+/// but never dropped) kept it out. The delegate dropped its copy once the
+/// root acknowledged the batch, and the root granted the inode to another
+/// node inside the holder's section. Now the generation's end returns
+/// undelivered grants as recorded, live ones only, before the
+/// re-delegation takes them along (`Core::lock_on_generation_outwaited`),
+/// and an expired record never keeps a grant out
+/// (`LockTables::install_if_consistent`); either alone passes this seed.
+#[test]
+fn regression_locks_unlinked_delegated_dbackup_random_seed_5681() {
+    run_seed(5_681, locks_unlinked_random_config(true)).unwrap_or_else(|e| {
+        panic!(
+            "locks-unlinked-delegated-dbackup-random seed 5681: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-unlinked-delegated-dbackup-random"
+        )
+    });
+}
+
 /// `locks-unlinked-delegated` seeds 292 and 6475 (this chunk's first
 /// cut of the move): a recall and re-delegation left the grant in the
 /// root's handoff for the new generation, whose delegate executed the

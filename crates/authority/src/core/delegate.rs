@@ -2810,7 +2810,7 @@ impl Core {
             _ => None,
         };
         if let Some(dir) = outwaited_dir {
-            self.lock_on_generation_outwaited(now, gen, dir);
+            self.lock_on_generation_outwaited(now, dir);
         }
         // Phase 2b: a silent delegate with a backup — ask the backup to
         // seal and hand over what it holds first (once; the answer, or
@@ -2974,7 +2974,7 @@ impl Core {
         // generation also leaves a grace on the subtree (sim seed 96046).
         self.lock_on_generation_ended(now, gen, replica);
         if !drained {
-            self.lock_on_generation_outwaited(now, gen, dir);
+            self.lock_on_generation_outwaited(now, dir);
         }
         tracing::info!(
             node = self.me(),

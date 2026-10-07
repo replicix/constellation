@@ -44113,3 +44113,131 @@ Gates (`CARGO_TARGET_DIR` unset, `ulimit -n 65536`, sims with
 - The stale reads under a lock after an outwait (`overload-cascade-2`
   round 3, should-fix 1), unchanged: `sweep_config` on `-random`,
   `-dbackup-random` and `-partition` keeps failing until that is fixed.
+
+## Fix: an outwaited generation's undelivered grants came back revived, beside its successor; an expired record kept a grant out (`unlinked-exclusion-5681`, 2026-10-07)
+
+Base: main `96f45659`. `locks-unlinked-delegated-dbackup-random` seed
+5681 failed "mutual exclusion violated" (node 1 and node 2 exclusive on
+`lk0` at t=10480), on main too: the only exclusion failure of that
+variant in 0..6000.
+
+Fix: an outwaited generation keeps the grants the root moved to it and
+never delivered until it ends; `Core::lock_on_generation_ended` returns
+them then, as recorded (live ones only, the root's own window), before a
+re-delegation of the subtree in the same step takes the table's grants
+along. The deferred return (`LockState::pending_returns`, installed
+restamped at the end of the step) is gone. And
+`LockTables::install_if_consistent` drops expired records before it
+compares: an expired record is no grant, as `conflicting` already
+treats it.
+
+**Cause** (replayed with `RUST_LOG=sim=debug,constellation_authority=debug`):
+
+1. t=1391: `d1`'s gen 3 (delegate node 2) is recalled; its handback,
+   grants `(2, …779)` (node 1 on `lk0`) and `(2, …780)` (node 3 on `lk1`),
+   goes into the root's table and, at the re-delegation as gen 5, into
+   gen 5's handoff. Root 1 and node 2 are partitioned (t=797 for 4.7 s):
+   gen 5 is never renewed, the handoff never delivered, and both grants
+   lapse at their holders.
+2. t=6899, one step at root 1: gen 5's expiry outwaits it.
+   `lock_on_generation_outwaited` moved its handoff to `pending_returns`;
+   `end_generation` ended it (`lock_on_generation_ended` found the handoff
+   empty); the parked cross-subtree op re-delegated `d1` as gen 7
+   (`lock_on_delegated` found nothing to take); then `locks_after_event`
+   installed the returns with `lock_install_moved(.., 0, ..)`: restamped
+   to t+2000 (8899), lapsed grants revived, in the root's table on inodes
+   gen 7 serves, never handed to it.
+3. The records expired at 8899 but stayed in the table (expiry is lazy:
+   only `conflicting` and token checks drop them).
+4. t=10268: gen 7 grants node 1 `lk0` (`(2, …790)`); t=10332 node 3's
+   unlink of `lk0` executes there; batch 6 carries the grant as
+   `leaving`. t=10352: the root applies it and `lock_install_leaving`
+   calls `install_if_consistent`, which refuses it: the expired record
+   `(2, …779)` is of the same node on the same inode. Nothing is logged.
+   t=10361: the delegate, acknowledged, drops its copy
+   (`deleg_drop_left`). Node 1 is inside its section (since 10274).
+5. t=10476: node 2 asks the root for `lk0`; `conflicting` drops the
+   expired records, finds nothing, and grants: two exclusive holders.
+   (`lk1`'s grant to node 1 at t=10197 was refused the same way; node 1's
+   renewal found it `Lost` at 10472.)
+
+The rule broken: grants that come back to the root's table must be ones
+someone may still honour, and must be where the inode's owner is; and a
+record nobody honours must not outrank the delegate's live grant at the
+unlink hand-over.
+
+**Decisions.**
+
+- *Both halves.* Either alone passes the seed (each checked with the
+  other reverted). The handoff fix removes the stale records at their
+  source: revived and misplaced, they would also have kept the grant out
+  while still unexpired (an unlink within 2 s of the re-delegation), and
+  had a returned grant been live, gen 7 would never have known it. The
+  `install_if_consistent` half closes any other way an expired record is
+  left in a table: lapsed records are kept lazily by design, and every
+  caller of it (`lock_install_leaving`, `lock_take_back_left`,
+  `lock_on_generation_ended`, a delegate's `lock_install_moved`) means
+  "conflicts with a grant someone may honour".
+- *Not restamped.* Nobody renewed an undelivered handoff grant (the
+  delegate never had it, and the root's table did not): the root's own
+  window is the longest any holder measures, as `lock_on_generation_ended`
+  already assumed for the same grants.
+- *Every end goes through `end_generation`* (expiry, seal answer, drained
+  recall, inherited self-delegation), which always runs
+  `lock_on_generation_ended` before any re-delegation; the one path that
+  does not (`mark_ended` for a generation a predecessor's record ended)
+  is a successor's, which has no handoff. So nothing is left behind by
+  not returning at the outwait; during a seal the inodes still resolve to
+  the generation and the root does not serve them.
+- `lock_on_generation_outwaited` lost its unused `gen` argument.
+
+| Item | State | Where |
+|---|---|---|
+| Undelivered handoff returns at the generation's end, not restamped at the next event; `pending_returns` removed | done | `core::locks` (`lock_on_generation_outwaited`, `locks_after_event`, `LockState`) |
+| An expired record never keeps a copy out | done | `meta::locks::LockTables::install_if_consistent` (takes `now_ms`) |
+| Core test (fails without the fix: both records left in the root's table, the lapsed one revived) | done | `core::tests::locks::an_outwaited_generations_undelivered_grants_go_with_the_next_delegation` |
+| Meta test | done | `meta::locks::tests::an_expired_record_does_not_keep_a_copy_out` |
+| Sim regression | done | `regression_locks_unlinked_delegated_dbackup_random_seed_5681` |
+| Docs | done | `docs/reference/features/cluster-locks.md` (the handoff paragraph) |
+
+Gates (`CARGO_TARGET_DIR` unset, `ulimit -n 65536`, sims with
+`TMPDIR=/dev/shm/ux5`, harness with `TMPDIR=/var/tmp/ux5/tmp`, prefix
+`ux5`; 16 CPUs):
+
+- `cargo fmt --all` no diff; `cargo clippy --workspace --all-targets --
+  -D warnings` clean.
+- `cargo test --release -p constellation-authority -p constellation-meta`:
+  authority 282 (+2 ignored) + 4 + sim 128 (+11 ignored); meta 243 (+2
+  ignored) and every integration test binary. 0 failed.
+- `sweep_config`, seeds 0..6000, this tree and base (`96f45659` in a
+  scratch worktree): "mutual exclusion" failures **0** in every config
+  here (base: 1, seed 5681). Every other failure is a stale read under a
+  lock (`overload-cascade-2` round 3, should-fix 1, open), the same seed
+  set here and on base:
+
+  | configs | here | base |
+  |---|---|---|
+  | `locks`, `-blips`, `-blips-tight`, `-blips-tight-delegated`, `-blips-tight-faults`, `-blips-tight-in-doubt`, `-blips-tight-long-lease`, `-blips-tight-single`, `-delegated`, `-delegated-writes`, `-failover`, `-failover-backup`, `-failover-backup-writes`, `-faults`, `-partition`, `-pause`, `-released-delegated`, `-released-writes`, `-skew`, `-writes` | 0 | 0 |
+  | `locks-unlinked-delegated`, `-blips`, `-dcrash`, `-dcrash-nb`, `-hcrash`, `-hcrash-backup` | 0 | 0 |
+  | `locks-unlinked-delegated-random` | 4 stale reads (935, 2716, 2877, 4711) | the same 4 |
+  | `locks-unlinked-delegated-dbackup-random` | 11 stale reads (276, 297, 1293, 1690, 2036, 3590, 3821, 4656, 4996, 5869, 5904) | the same 11 + 5681 (mutual exclusion) |
+  | `locks-unlinked-delegated-partition` | 110 stale reads | the same 110 seeds |
+- Harness `lock-*`, `delegate*` (17 scenarios) once: all PASSED
+  (`lock-grant-dead-generation`, `lock-holder-partitioned`,
+  `lock-failover`, `lock-holder-killed-contention`, `lock-fence-at-close`,
+  `lock-latency`, `delegated-subtrees`, `delegate-crash`,
+  `delegate-partition`, `delegated-op-latency`,
+  `delegate-crash-default-ttl`, `delegate-crash-backup`,
+  `delegate-root-loss`, `delegate-root-blackhole`,
+  `delegate-root-loss-ttl`, `delegate-handoff-renewal`,
+  `delegate-backup-handoff-failover`).
+
+### Open
+
+- The stale reads under a lock after an outwait (`overload-cascade-2`
+  round 3, should-fix 1), unchanged.
+- `locks-unlinked-delegated-partition` seed 7455 breaks mutual exclusion
+  (t=9702, ino 0x10000000800, nodes 2 and 1 both exclusive; faults: locker 3
+  partitioned at t=1556, node 2 paused at t=3091, locker 3 partitioned again
+  at t=8531). It fails the same way on main 96f4565, so it predates this
+  chunk (found by its review's 6000..9000 sweep); tracked as its own chunk.

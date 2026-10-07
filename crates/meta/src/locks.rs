@@ -865,8 +865,19 @@ impl LockTables {
     /// would put two conflicting grants in one table, and a request of
     /// the copy's node would then be re-affirmed without a recall (sim
     /// `locks-delegated` seed 196004). `false`: not installed.
-    pub fn install_if_consistent(&self, grant: Grant) -> bool {
+    ///
+    /// A record that expired by `now_ms` is no grant: it is dropped
+    /// first, as [`Self::conflicting`] drops it before granting over it.
+    /// Kept, it refused the copy while the owner already granted past it
+    /// (sim `locks-unlinked-delegated-dbackup-random` seed 5681: the
+    /// root's stale record of the same holder on an unlinked inode kept
+    /// the grant that came with the unlink out, and the root granted the
+    /// inode to another node while the holder was inside its section).
+    pub fn install_if_consistent(&self, grant: Grant, now_ms: i64) -> bool {
         let mut g = self.lock();
+        if g.drop_expired(now_ms) {
+            self.expired_dropped.store(true, Ordering::Relaxed);
+        }
         if g.grants
             .values()
             .any(|e| e.ino == grant.ino && (e.node == grant.node || e.mode.conflicts(grant.mode)))
@@ -2148,14 +2159,52 @@ mod tests {
         };
         // Node 2 was granted again (a newer id): the old copy stays out.
         t.install(copy(2, 5, LockMode::Shared));
-        assert!(!t.install_if_consistent(copy(2, 1, LockMode::Exclusive)));
+        assert!(!t.install_if_consistent(copy(2, 1, LockMode::Exclusive), 0));
         // Node 3's exclusive copy conflicts with node 2's grant (made
         // after the copy's grant left): out.
-        assert!(!t.install_if_consistent(copy(3, 2, LockMode::Exclusive)));
+        assert!(!t.install_if_consistent(copy(3, 2, LockMode::Exclusive), 0));
         // A compatible copy goes in, once.
-        assert!(t.install_if_consistent(copy(3, 3, LockMode::Shared)));
-        assert!(!t.install_if_consistent(copy(3, 3, LockMode::Shared)));
+        assert!(t.install_if_consistent(copy(3, 3, LockMode::Shared), 0));
+        assert!(!t.install_if_consistent(copy(3, 3, LockMode::Shared), 0));
         assert_eq!(t.grants_len(), 2);
+    }
+
+    /// An expired record is no grant: a copy of the same node, or a
+    /// conflicting one, goes in over it (sim `locks-unlinked-delegated-
+    /// dbackup-random` seed 5681: the root's stale record of the holder
+    /// kept the grant that came with an unlink out of its table).
+    #[test]
+    fn an_expired_record_does_not_keep_a_copy_out() {
+        let t = LockTables::default();
+        let copy = |node: u64, seq: u64, mode: LockMode, until_ms: i64| Grant {
+            id: GrantId { node: 9, seq },
+            node,
+            ino: 7,
+            mode,
+            until_ms,
+            recalled: false,
+            gen: 0,
+            confirmed_ms: Grant::UNCONFIRMED,
+        };
+        t.install(copy(2, 1, LockMode::Exclusive, 100));
+        t.install(copy(3, 2, LockMode::Shared, 100));
+        // Still live at 50: both keep the copy out.
+        assert!(!t.install_if_consistent(copy(2, 3, LockMode::Exclusive, 500), 50));
+        assert_eq!(t.grants_len(), 2);
+        // Expired at 100: the copy is the inode's only grant, and the
+        // dropped records are remembered as ended.
+        assert!(t.install_if_consistent(copy(2, 3, LockMode::Exclusive, 500), 100));
+        assert_eq!(t.grants_len(), 1);
+        assert!(t.was_ended(GrantId { node: 9, seq: 1 }));
+        assert!(t.was_ended(GrantId { node: 9, seq: 2 }));
+        assert!(t.take_expired_dropped(), "the backup's mirror is stale");
+        assert_eq!(
+            t.conflicting(7, 4, LockMode::Shared, 200)
+                .iter()
+                .map(|g| g.id.seq)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 
     #[test]
@@ -2924,7 +2973,7 @@ mod token_tests {
             gen: 0,
             confirmed_ms: Grant::UNCONFIRMED,
         };
-        assert!(t.install_if_consistent(copy));
+        assert!(t.install_if_consistent(copy, 0));
         let old = LockTag(vec![LockToken {
             grant: id,
             until_ms: 500,

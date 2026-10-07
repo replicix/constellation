@@ -639,9 +639,13 @@ what it handed. Every renewal it grants re-sends the copies that are
 still live, and the delegate installs each grant once. It starts
 serving locks only from a renewal that carried them. When a delegation
 ends without handing a grant back, the root puts its copy back in its
-own table. The next delegation of the subtree then takes that grant
-along. A copy is skipped when the table already holds a newer grant for
-the same node on that file, or a conflicting grant. A delegate that was
+own table when the delegation ends (an outwaited one too), only copies
+still live and with the window the root gave them. The next delegation
+of the subtree then takes that grant along, even one made in the same
+step. A copy
+is skipped when the table already holds a newer grant for the same
+node on that file, or a conflicting grant. An expired record in the
+table is no grant and never keeps a copy out. A delegate that was
 outwaited (it stopped answering) also leaves a grace period on its
 subtree.
 

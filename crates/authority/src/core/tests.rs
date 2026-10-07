@@ -8972,7 +8972,7 @@ mod locks {
                 leaving: Vec::new(),
             },
         });
-        h.core.lock_on_generation_outwaited(h.now, 7, dir);
+        h.core.lock_on_generation_outwaited(h.now, dir);
         let granted = |out: &[Action]| {
             lock_replies(out)
                 .iter()
@@ -8988,6 +8988,99 @@ mod locks {
         h.advance(h.core.lock_ttl_ms() as u64 + 2 * h.core.lock_margin_ms() as u64);
         let out = request(&mut h, 4, 11, f, X, false);
         assert!(granted(&out), "not granted once the grace passed: {out:?}");
+    }
+
+    /// Sim `locks-unlinked-delegated-dbackup-random` seed 5681: a
+    /// generation is outwaited with grants this root moved to it still
+    /// undelivered (its delegate never renewed), and the same step ends it
+    /// and re-delegates the subtree (a parked cross-subtree op). The
+    /// undelivered grants used to come back to this table only at the end
+    /// of that step, restamped: a lapsed one revived, and both left in
+    /// the table on inodes the new generation serves, never handed to it.
+    /// Such a record of a holder later kept that holder's grant out when
+    /// it came back with an unlink, and the root granted the inode over
+    /// it. Now the generation's end returns them as recorded, live ones
+    /// only, and the re-delegation takes them along.
+    #[test]
+    fn an_outwaited_generations_undelivered_grants_go_with_the_next_delegation() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (dir, f) = delegated_file(&h.meta);
+        let lapsing = h.meta.allocate_ino(dir).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Create {
+                parent: dir,
+                name: "lapsing.lock".into(),
+                ino: lapsing,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 3,
+            }],
+        )
+        .unwrap();
+        let grant =
+            |seq: u64, node: NodeId, ino: Ino, until_ms: i64| constellation_meta::locks::Grant {
+                id: GrantId { node: 1, seq },
+                node,
+                ino,
+                mode: X,
+                until_ms,
+                recalled: false,
+                gen: 0,
+                confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            };
+        let live = grant(1, 4, f, h.now.0 + 5_000);
+        h.meta.locks().install(live);
+        h.meta.locks().install(grant(2, 5, lapsing, h.now.0 + 100));
+        // Delegated to gen 7: both wait for its first renewal, which
+        // never comes.
+        h.core.lock_on_delegated(7, &h.meta);
+        assert_eq!(h.meta.locks().grants_len(), 0);
+        h.advance(200);
+        let now = h.now;
+        // One step: outwaited, ended, re-delegated as gen 8.
+        h.core.lock_on_generation_outwaited(now, dir);
+        h.core.lock_on_generation_ended(now, 7, &h.meta);
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            3,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Recall { dir, gen: 7 },
+                LogRecord::Delegate {
+                    dir,
+                    node: 3,
+                    gen: 8,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        h.core.lock_on_delegated(8, &h.meta);
+        let mut out = Vec::new();
+        h.core.locks_after_event(now, &h.meta, &mut out);
+        assert!(
+            h.meta.locks().grants_snapshot().is_empty(),
+            "left in the root's table under gen 8: {:?}",
+            h.meta.locks().grants_snapshot()
+        );
+        let handed = h.core.lock_take_handoff(now, 8);
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        assert_eq!(handed[0].id, live.id);
+        assert_eq!(handed[0].until_ms, live.until_ms, "restamped: {handed:?}");
     }
 
     fn holder_with_file() -> (Harness, Ino) {
@@ -10837,7 +10930,7 @@ mod locks {
         let journal = h.meta.journal_position(1).expect("unshipped");
         let now = h.now;
         h.core
-            .lock_on_generation_outwaited(now, 9, constellation_fs_core::types::ROOT_INO);
+            .lock_on_generation_outwaited(now, constellation_fs_core::types::ROOT_INO);
         // (The subtree grace is not what this test is about.)
         h.core.lk.grace.clear();
         // The next event notes the floor.
