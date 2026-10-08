@@ -124,8 +124,11 @@ so it keeps that authority topped up: while it has grants out it renews
 the delegation at a quarter of its TTL, a lock renewal that finds less
 than `2 × margin` of it left renews it at once, and it grants nothing
 new on less than `2 × margin` (the request waits for the delegation's
-renewal). A grant under a delegation is therefore never longer than
-what is left of the delegation (`CONSTELLATION_DELEGATION_TTL_MS`, by
+renewal). The root caps the delegation in turn by what is left of its
+lease, less the margin, and renews its lease as soon as half its TTL
+is gone (its sync poll is armed for that moment), so a delegated grant
+is not squeezed by a lease left close to its expiry. A grant under a
+delegation is therefore never longer than what is left of the delegation (`CONSTELLATION_DELEGATION_TTL_MS`, by
 default the lock TTL, so a delegate's grants get about the same window as
 the root's; at the 5 s it used to default to, a lock in a delegated
 subtree was honoured for under 3 s and renewed every second or so, and

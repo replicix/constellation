@@ -2687,7 +2687,14 @@ impl Core {
     /// every `idle_max_ms` (10 s), still refusing writes that long after
     /// S3 returned (`stress-ng-fs-faults`: a create after the run failed
     /// `EROFS`); never backed off, a frozen epoch whose dead member
-    /// waits for an admin probed twice a second for hours.
+    /// waits for an admin probed twice a second for hours. A held
+    /// lease's poll also fires when its renewal falls due
+    /// (`renew_due_in_ms`): with only the quarter-TTL cap the renewal
+    /// went out as late as a quarter TTL before the expiry, and the root
+    /// capped every delegation, and through it every delegated lock
+    /// grant, by that short remainder (`locks-delegated` seed 1432: a
+    /// grant renewed for 501 ms with a 500 ms margin lapsed under its
+    /// holder's I/O).
     pub(crate) fn next_poll_ms(&self, now: Ms) -> u64 {
         let base = self.cfg.sync_interval_ms.max(1);
         let mut next = base
@@ -2710,6 +2717,9 @@ impl Core {
             if !self.inbox.pending.is_empty() {
                 next = next.min(self.cfg.inbox_tail_ms.max(1));
             }
+        }
+        if let Some(due) = self.renew_due_in_ms(now) {
+            next = next.min(due.max(1));
         }
         next
     }

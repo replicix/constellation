@@ -1684,6 +1684,18 @@ impl Core {
             }
     }
 
+    /// How long until [`Self::renew_due`] turns true by the clock alone
+    /// (`None`: it never will, or it is due already). The poll is armed
+    /// for that moment (`next_poll_ms`).
+    pub(crate) fn renew_due_in_ms(&self, now: Ms) -> Option<u64> {
+        if self.lease.lost || self.lease.epoch_held() || self.ship.renew_now {
+            return None;
+        }
+        let (lease, _) = self.lease.held.as_ref()?;
+        let left = lease.expires_in_ms(now.0) - (self.cfg.ttl_ms / 2) as i64;
+        (left > 0).then_some(left as u64)
+    }
+
     fn issue_renew(&mut self, now: Ms, mid_ship: bool, out: &mut Vec<Action>) {
         let (mine, tag) = self.lease.held.clone().expect("held");
         let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);

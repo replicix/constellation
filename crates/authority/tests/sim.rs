@@ -4309,6 +4309,28 @@ fn delegate_fenced_io_seeds_keep_their_grants() {
     }
 }
 
+/// `locks-delegated` (no faults) fenced a delegated lock holder's I/O in
+/// seeds 1432 and 1528: the root's poll ran up to a quarter TTL after its
+/// lease renewal fell due, the root capped the delegation's renewals by
+/// that short remainder, and the delegate capped its lock renewals by the
+/// delegation's (down to 501 ms against a 500 ms margin). The poll now
+/// fires when the renewal is due (`Core::renew_due_in_ms`).
+#[test]
+fn lease_cap_fenced_seeds_keep_their_grants() {
+    for seed in [1432, 1528] {
+        let report = run_seed(seed, locks_delegated_config()).unwrap_or_else(|e| {
+            panic!("locks-delegated seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=locks-delegated")
+        });
+        let mut t = M14Totals::default();
+        t.add(&report);
+        assert_eq!(t.lost, 0, "locks-delegated seed {seed}: grants lost: {t:?}");
+        assert_eq!(
+            t.clients.fenced_ios, 0,
+            "locks-delegated seed {seed}: I/O fenced: {t:?}"
+        );
+    }
+}
+
 /// `locks-blips-tight` with `locks-blips`' in-doubt lease PUTs back:
 /// back-to-back cuts with acquisition and release CASes that land but
 /// answer a timeout. On main before chunk lock-release-drop it failed

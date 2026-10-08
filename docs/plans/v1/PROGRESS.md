@@ -45739,3 +45739,99 @@ unchanged; recovery does one more `sync_all` per sealed journal at open).
   floci's host port 4566 dropped by an override): 8798 passed, 0 failed.
 - Not run: `stress-ng-fs-nodes` (not a gate here; the journal-lock slow
   commits it showed are the ones measured above).
+
+## Fix: a delegated lock grant shrank to about the margin while the root's lease renewal waited for the next poll (`lease-cap-fenced`, 2026-10-08)
+
+Fix: a lease holder's sync poll is now also armed for the moment its renewal falls due (`Core::renew_due_in_ms`, used by `next_poll_ms`). Before, only the quarter-TTL cap bounded the poll, so the renewal went out anywhere between half and a quarter of the TTL before the expiry.
+
+Base: main `2a89303`. Open item of `delegate-fenced-io`: `locks-delegated` (no cut, no faults) fenced 1–2 lock I/Os per few thousand seeds.
+
+### Cause (seed 1432, `RUST_LOG=sim=debug,constellation_authority=debug`)
+
+The root's lease renewal was neither starved nor read stale. It went out late, as the poll schedule allowed:
+
+- Node 1 (root) last renewed its lease at about t=3.16 s (expiry ≈ 9.16 s). The next renewal is due once half the TTL is left (`renew_due`, 3 s in the sim), so from t≈6.16 s.
+- The root shipped nothing between t=5.06 and 7.4 s, so only the idle poll started its rounds, backed off to `min(idle_max, ttl/4)` = 1.5 s. The renewal went out in the round at ≈7.4 s with ≈1.75 s of the lease left, which is within the old schedule's bound (a quarter TTL).
+- Each layer under the lease subtracts a margin (500 ms) from what is left:
+  - The root answers delegation renewals with `lease end − margin − now` (`grant_cap_ms`: 2021 → 1499 ms between t=6.65 and 7.16 s).
+  - The delegate honours its delegation until `sent + ttl − margin`.
+  - The delegate caps lock renewals at `until − margin − now` (1274 … 551, 528, 515, 501 ms).
+  - The holder honours its grant until `sent + ttl − margin`.
+- So a holder's window is about `lease left − 4 × margin`, which reaches 0 when the lease has 2 s left. The 501 ms renewal at t=7166 left node 1's grant with about 0 ms, and the grant lapsed under the I/O that began at t=7142 (fenced at t=7180).
+
+The cap arithmetic is correct: every layer must keep its own margin. Production (TTL 60 s, margin 1 s, poll cap 15 s) never gets near this, but the sim's 6 s TTL with a 500 ms margin does. With the poll armed for the due time, the root renews with about half the TTL left. In seed 1432 its delegation answers now stay ≥ 2905 ms and the lock renewals ≥ 907 ms.
+
+### What changed
+
+| change | where |
+|---|---|
+| `renew_due_in_ms`: the time until `renew_due` turns true by the clock (`None` when the lease is lost, under an epoch hold, with `renew_now` set, or when the renewal is due already) | `crates/authority/src/core/jobs.rs` |
+| `next_poll_ms` takes the minimum with it (at least 1 ms) | `crates/authority/src/core/mod.rs` |
+| Docs: the holder's poll cadence; the root's cap on a delegation and its prompt renewal | `docs/reference/configuration.md`, `docs/reference/features/cluster-locks.md` |
+
+### Why it keeps every safety rule
+
+- Only *when* the lease is renewed moves, and only earlier.
+- No cap, margin or grant changed, and neither did the renewal rule (`renew_due`, never under an epoch hold). A grant still never outlives the lease, delegation or grant that backs it.
+- A renewal that is already due but did not happen (a failed CAS) keeps the old quarter-TTL poll, so there is no 1 ms poll loop.
+
+### Tests
+
+- Core `a_held_leases_poll_fires_when_its_renewal_is_due`: 300 ms before the renewal is due, the poll fires in 300 ms. When it is due already or far off, the quarter-TTL cap applies. Without the change the poll is 2.5 s.
+- Sim `lease_cap_fenced_seeds_keep_their_grants`: `locks-delegated` 1432 and 1528, 0 fenced and 0 lost each. 1528 does not fence on this base either (`delegate-fenced-io` named it as fenced on main before that chunk); it is pinned as asked.
+
+### Results (`sweep_config`, `TMPDIR=/dev/shm`, 15 threads; base = `2a89303` in a separate worktree)
+
+| config | seeds | fenced, base | fenced, this chunk |
+|---|---|---|---|
+| `locks-delegated` | 0..6000 | 2 (1432, 5095; 5095 is the same class, with lock renewals of 504 ms) | **0** |
+| `locks-delegated-writes` | 0..6000 | 0 | **0** |
+| `locks-released-delegated` | 0..6000 | 5 (687, 1822, 2919, 3379, 4778) | 5, the same seeds |
+
+The `locks-released-delegated` remainder is that config's by-design case, and this fix does not change it (all five spot-checked). In each seed node 1 releases its lease gracefully with grants out (t≈1.94–2.06 s). Each fenced I/O ends 0.5–1.1 s later on a grant of that released tenure. Nobody can renew such a grant, so it lapses at its window (`delegate-fenced-io` found the same for 687).
+
+All 30 lock configs, 0..2000, base → this chunk: 0 failing in both.
+
+| config | fenced, base → this chunk | lost, base → this chunk |
+|---|---|---|
+| `locks`, `-skew`, `-blips`, `-blips-tight`, `-blips-tight-single`, `-blips-tight-long-lease`, `-blips-tight-in-doubt`, `-blips-tight-delegated`, `-unlinked-delegated`, `-unlinked-delegated-blips`, `-writes`, `-delegated-writes` | 0 → 0 | 0 → 0 |
+| `-delegated` | 1 → 0 | 0 → 0 |
+| `-partition` | 3306 → 3303 | 0 → 0 |
+| `-failover` | 573 → 573 | 0 → 0 |
+| `-failover-backup` | 586 → 586 | 18 → 20 |
+| `-faults` | 6 → 6 | 0 → 0 |
+| `-blips-tight-faults` | 931 → 930 | 0 → 0 |
+| `-pause` | 509 → 509 | 0 → 0 |
+| `-unlinked-delegated-hcrash` | 493 → 493 | 0 → 0 |
+| `-unlinked-delegated-hcrash-backup` | 364 → 364 | 5 → 5 |
+| `-unlinked-delegated-dcrash` | 23 → 22 | 0 → 0 |
+| `-unlinked-delegated-dcrash-nb` | 16 → 16 | 0 → 0 |
+| `-unlinked-delegated-random` | 334 → 324 | 0 → 0 |
+| `-unlinked-delegated-dbackup-random` | 236 → 232 | 4 → 5 |
+| `-unlinked-delegated-partition` | 3554 → 3540 | 0 → 0 |
+| `-delegated-partition` | 3678 → 3645 | 0 → 0 |
+| `-released-delegated` | 2 → 2 | 0 → 0 |
+| `-released-writes` | 21 → 21 | 0 → 0 |
+| `-failover-backup-writes` | 771 → 771 | 14 → 12 |
+
+The lost grants are the known class of the crash and backup-failover configs (a lost grant is fenced, never granted twice). Their total moves from 41 to 42 as the timings reshuffle.
+
+### Gates (`CARGO_TARGET_DIR` unset)
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `TMPDIR=/dev/shm cargo test --release -p constellation-authority` | 311 (+2 ignored) + 4 + sim 134 (+11 ignored): 0 failed |
+| All 30 lock configs, `sweep_config` 0..2000 | 0 failing (table above) |
+| Harness, prefix `lcf`, `TMPDIR=/var/tmp/lcf/htmp`, `--seed 1`: the 6 `lock-*` scenarios, once | ALL SCENARIOS PASSED |
+
+### Decisions taken alone
+
+- **Renew on time, not on demand.** `delegate-fenced-io` suggested renewing the lease when a delegation renewal would leave too little. Arming the poll for the due time removes the cause in every case at no extra S3 cost: the renewal would have happened anyway, only later. An on-demand renewal would add a CAS path and a threshold that only treats the symptom.
+- **No change to the margins.** Each of the four margins guards a different clock and hop, and dropping one would loosen a safety rule.
+- **A renewal already due but not done** (a failed CAS) keeps the quarter-TTL poll, as before, rather than polling at once.
+
+### Open
+
+- `locks-released-delegated` keeps its 5 by-design fenced seeds in 0..6000.
+- `flex*`, `long-*` and `stress-ng-fs-nodes` were not run (not in the gates). The change moves every lease holder's poll timing, so every config sees it; the 30 lock configs and the authority suite covered it here.

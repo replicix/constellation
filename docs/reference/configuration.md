@@ -708,7 +708,11 @@ A node that currently **holds** a partition lease never backs off past a
 quarter of `CONSTELLATION_LEASE_TTL_MS`, whatever the ceiling says: the
 sync round is also what renews the lease and what notices another node's
 handoff request, so backing off past the renewal cadence would let a
-holder sleep through its own renewal.
+holder sleep through its own renewal. Its poll also fires at the moment
+the renewal falls due (half the TTL left), so the renewal goes out then
+rather than up to a quarter TTL later: what is left of the lease caps
+the root's delegations and lock grants, and through a delegation every
+delegated lock grant.
 
 #### Publish cadence
 

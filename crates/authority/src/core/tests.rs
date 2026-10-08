@@ -14764,6 +14764,30 @@ mod locks {
         assert_ne!(h.core.next_poll_ms(h.now), 4 * base);
     }
 
+    /// A held lease's poll fires when its renewal falls due (half its
+    /// TTL left), not up to a quarter TTL later: the root caps every
+    /// delegation, and every delegated lock grant through it, by what is
+    /// left of its lease, and a renewal sent with a quarter TTL left
+    /// shrank a delegated grant's renewals to about the margin
+    /// (`locks-delegated` seed 1432).
+    #[test]
+    fn a_held_leases_poll_fires_when_its_renewal_is_due() {
+        let mut h = Harness::new(1);
+        h.core.idle_rounds = 10;
+        let half = (h.core.cfg.ttl_ms / 2) as i64;
+        let lease = lease_of(1, 1, h.now.0 + half + 300);
+        h.core.lease.adopt(h.now, lease, tag(), None);
+        assert_eq!(h.core.next_poll_ms(h.now), 300);
+        // Due already (a renewal that failed): the quarter-TTL cap.
+        let lease = lease_of(1, 1, h.now.0 + half - 10);
+        h.core.lease.adopt(h.now, lease, tag(), None);
+        assert_eq!(h.core.next_poll_ms(h.now), h.core.cfg.ttl_ms / 4);
+        // Far from due: the quarter-TTL cap as before.
+        let lease = lease_of(1, 1, h.now.0 + 2 * half);
+        h.core.lease.adopt(h.now, lease, tag(), None);
+        assert_eq!(h.core.next_poll_ms(h.now), h.core.cfg.ttl_ms / 4);
+    }
+
     fn mutate_reply(out: &[Action], to: NodeId, req: u64) -> MutateOutcome {
         sends(out)
             .into_iter()
