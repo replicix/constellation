@@ -27,6 +27,18 @@
 //! `inserts_never_wait_for_a_version_being_persisted`, which slows every
 //! version persist by 400 ms. Numbers on a slow disk: run this with
 //! `--release`, `LSM_STALL_KEYS=4000000` and `TMPDIR` on that disk.
+//!
+//! The second test measures commits across fjall's journal rotations
+//! (`fjall-journal-rotation`): a flush rotates the journal once it is
+//! larger than 64 MB, and upstream fjall held the journal lock, which every
+//! commit takes, across three fsyncs to do it. Knobs: `JNL_STALL_ROTATIONS`
+//! (default 2), `JNL_STALL_MBPS` (the loader's pace, default 100 MiB/s: an
+//! unpaced loader outruns the flushes once rotations stop throttling it,
+//! and the commits then wait in fjall's write stall instead),
+//! `LSM_STALL_PRESSURE`, `LSM_STALL_MAX_MS` as above. The
+//! deterministic regression test is the vendored fjall's
+//! `commits_never_wait_for_a_rotation_sync` (journal syncs slowed by
+//! 300 ms).
 
 use fjall::{KeyspaceCreateOptions, SingleWriterTxDatabase};
 use std::io::Write;
@@ -58,6 +70,23 @@ impl XorShift {
             chunk.copy_from_slice(&x[..chunk.len()]);
         }
     }
+}
+
+/// Prints fjall's warnings (a slow commit names the phase it waited in).
+struct WarnLogger;
+
+impl log::Log for WarnLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
 }
 
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
@@ -182,5 +211,113 @@ fn a_major_compaction_never_freezes_commits() {
     assert!(
         max < Duration::from_millis(max_ms),
         "a commit took {max:?} during a major compaction (limit {max_ms} ms)"
+    );
+}
+
+/// The highest journal id in `dir`: how many times the journal rotated.
+fn last_journal_id(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.ok()?.file_name();
+            name.to_str()?.strip_suffix(".jnl")?.parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn journal_rotations_never_freeze_commits() {
+    let rotations: u64 = env_or("JNL_STALL_ROTATIONS", 2);
+    let mbps: u64 = env_or("JNL_STALL_MBPS", 100);
+    if log::set_logger(&WarnLogger).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+    let pressure = env_or("LSM_STALL_PRESSURE", 1u8) != 0;
+    let max_ms: u64 = env_or("LSM_STALL_MAX_MS", 1_000);
+
+    let dir = tempfile::Builder::new()
+        .prefix("jnl-stall-")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join("db");
+    let db = SingleWriterTxDatabase::builder(&path)
+        .worker_threads(4)
+        .open()
+        .unwrap();
+    let big = db
+        .keyspace("big", || {
+            KeyspaceCreateOptions::default().max_memtable_size(8 << 20)
+        })
+        .unwrap();
+    let small = db
+        .keyspace("small", KeyspaceCreateOptions::default)
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let pressure = pressure.then(|| disk_pressure(dir.path().to_path_buf(), stop.clone()));
+    let writer = {
+        let (db, small, stop) = (db.clone(), small.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut latencies = Vec::new();
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                let mut tx = db.write_tx();
+                tx.insert(&small, i.to_be_bytes(), b"row".to_vec());
+                tx.remove(&small, i.saturating_sub(100).to_be_bytes());
+                tx.commit().unwrap();
+                latencies.push(started.elapsed());
+                i += 1;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            latencies
+        })
+    };
+
+    // Load the journal through `rotations` rotations, 1 MiB per commit, at
+    // `mbps`.
+    let mut rng = XorShift(0x5DEE_CE66_D1CE_4E5B);
+    let mut value = vec![0u8; 16 << 10];
+    let load = Instant::now();
+    let mut key = 0u64;
+    while last_journal_id(&path) < rotations && load.elapsed() < Duration::from_secs(300) {
+        let mut tx = db.write_tx();
+        for _ in 0..64 {
+            rng.fill(&mut value);
+            tx.insert(&big, key.to_be_bytes(), value.clone());
+            key += 1;
+        }
+        tx.commit().unwrap();
+        let due = Duration::from_secs_f64((key / 64) as f64 / mbps as f64);
+        if let Some(ahead) = due.checked_sub(load.elapsed()) {
+            std::thread::sleep(ahead);
+        }
+    }
+    let load = load.elapsed();
+    // The last rotation's syncs may still run.
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, Ordering::Relaxed);
+    let mut latencies = writer.join().unwrap();
+    if let Some(p) = pressure {
+        p.join().unwrap();
+    }
+
+    latencies.sort();
+    let max = *latencies.last().unwrap();
+    eprintln!(
+        "{} rotations ({} MiB loaded in {load:?}); {} commits meanwhile: \
+         p50 {:?} p99 {:?} p99.9 {:?} max {max:?}",
+        last_journal_id(&path),
+        key * 16 / 1024,
+        latencies.len(),
+        percentile(&latencies, 0.5),
+        percentile(&latencies, 0.99),
+        percentile(&latencies, 0.999),
+    );
+    assert!(last_journal_id(&path) >= rotations, "the journal rotated");
+    assert!(
+        max < Duration::from_millis(max_ms),
+        "a commit took {max:?} across journal rotations (limit {max_ms} ms)"
     );
 }

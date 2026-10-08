@@ -187,43 +187,9 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
                 return Ok(false);
             };
 
-            {
-                log::trace!("acquiring journal lock to maybe rotate journal");
-                let mut journal_writer = ctx.supervisor.journal.get_writer()?;
-
-                if journal_writer.pos()? > 64_000_000 {
-                    #[expect(clippy::expect_used)]
-                    let mut journal_manager = ctx
-                        .supervisor
-                        .journal_manager
-                        .write()
-                        .expect("lock is poisoned");
-
-                    let seqno_map = {
-                        #[expect(clippy::expect_used)]
-                        let keyspaces = ctx.supervisor.keyspaces.write().expect("lock is poisoned");
-
-                        ctx.supervisor.build_seqno_map(&keyspaces)
-                    };
-
-                    journal_manager.rotate_journal(&mut journal_writer, seqno_map)?;
-
-                    if journal_manager.disk_space_used()
-                        >= ctx.supervisor.db_config.max_journaling_size_in_bytes
-                    {
-                        let stragglers =
-                            journal_manager.get_keyspaces_to_flush_for_oldest_journal_eviction();
-
-                        for keyspace in stragglers {
-                            log::info!(
-                                "Rotating {:?} to try to reduce journal size",
-                                keyspace.name,
-                            );
-                            keyspace.request_rotation();
-                        }
-                    }
-                }
-            }
+            // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): no
+            // fsync under the journal lock.
+            crate::journal::rotation::rotate_if_full(&ctx.supervisor)?;
 
             run_flush(
                 &task,

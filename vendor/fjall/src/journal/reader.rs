@@ -36,6 +36,8 @@ impl JournalReader {
         log::debug!("truncating journal to {pos}");
         self.reader.get_mut().set_len(pos)?;
         self.reader.get_mut().sync_all()?;
+        // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7).
+        super::rotation::after_sync(&self.path);
         Ok(())
     }
 

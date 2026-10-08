@@ -6,6 +6,7 @@ use crate::{
     file::{KEYSPACES_FOLDER, LSM_CURRENT_VERSION_MARKER},
     journal::{
         batch_reader::JournalBatchReader, manager::EvictionWatermark, reader::JournalReader,
+        rotation::RotationChain,
     },
     keyspace::{
         apply_to_base_config, options::CreateOptions as KeyspaceCreateOptions, InternalKeyspaceId,
@@ -116,11 +117,16 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
     Ok(())
 }
 
+/// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): checks the
+/// journal rotation markers (`journal/rotation.rs`) and returns the check's
+/// state, which the active journal's replay continues.
 #[expect(clippy::too_many_lines)]
 pub fn recover_sealed_memtables(
     db: &Database,
     sealed_journal_paths: &[PathBuf],
-) -> crate::Result<()> {
+) -> crate::Result<RotationChain> {
+    let mut chain = RotationChain::default();
+
     #[expect(clippy::expect_used)]
     let mut journal_manager_lock = db
         .supervisor
@@ -134,17 +140,43 @@ pub fn recover_sealed_memtables(
     for journal_path in sealed_journal_paths {
         log::debug!("Recovering sealed journal: {}", journal_path.display());
 
-        let journal_size = journal_path.metadata()?.len();
+        // CONSTELLATION PATCH (change 7): a journal after a lost tail is
+        // emptied; the journal manager deletes it like a flushed one.
+        if chain.is_broken() {
+            RotationChain::discard(journal_path)?;
+        }
 
         log::debug!("Reading sealed journal at {}", journal_path.display());
 
         let raw_reader = JournalReader::new(journal_path)?;
-        let reader = JournalBatchReader::new(raw_reader);
+        let mut reader = JournalBatchReader::new(raw_reader);
 
         let mut watermarks: HashMap<_, EvictionWatermark> = HashMap::default();
 
-        for batch in reader {
-            let batch = batch?;
+        let mut first = true;
+        let mut torn = false;
+        for batch in reader.by_ref() {
+            // CONSTELLATION PATCH (change 7): a sealed journal may have
+            // lost pages of its tail in a power loss while its seal was
+            // pending; a batch that does not read back whole ends it.
+            let batch = match batch {
+                Err(crate::Error::JournalRecovery(
+                    crate::JournalRecoveryError::ChecksumMismatch
+                    | crate::JournalRecoveryError::InsufficientLength
+                    | crate::JournalRecoveryError::TooManyItems,
+                )) => {
+                    torn = true;
+                    break;
+                }
+                batch => batch?,
+            };
+
+            // CONSTELLATION PATCH (change 7).
+            if std::mem::take(&mut first) && !chain.admits_first(&batch) {
+                RotationChain::discard(journal_path)?;
+                break;
+            }
+            chain.note(batch.seqno);
 
             for item in batch.items {
                 let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)? else {
@@ -256,6 +288,15 @@ pub fn recover_sealed_memtables(
 
         log::debug!("Recovered {recovered_count} sealed memtables");
 
+        // CONSTELLATION PATCH (change 7).
+        if torn {
+            reader.truncate_to_last_batch()?;
+            chain.torn();
+        }
+
+        chain.end_journal();
+        let journal_size = journal_path.metadata()?.len();
+
         // IMPORTANT: Add sealed journal to journal manager
         journal_manager_lock.enqueue(crate::journal::manager::Item {
             watermarks: watermarks.into_values().collect(),
@@ -266,5 +307,5 @@ pub fn recover_sealed_memtables(
         log::debug!("Requeued sealed journal at {}", journal_path.display());
     }
 
-    Ok(())
+    Ok(chain)
 }

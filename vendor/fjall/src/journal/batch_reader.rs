@@ -57,8 +57,17 @@ impl JournalBatchReader {
         let file = OpenOptions::new().write(true).open(&self.reader.path)?;
         file.set_len(last_valid_pos)?;
         file.sync_all()?;
+        // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7).
+        super::rotation::after_sync(&self.reader.path);
 
         Ok(())
+    }
+
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): truncates
+    /// the journal after its last whole batch, once a batch failed to read
+    /// back (recovery ends a sealed journal there).
+    pub(crate) fn truncate_to_last_batch(&self) -> crate::Result<()> {
+        self.truncate_to(self.last_valid_pos)
     }
 
     fn on_close(&self) -> crate::Result<()> {

@@ -45552,3 +45552,190 @@ Remaining fenced seeds by mechanism:
 
 - `flex*`, `long-*` other than the delegated ones, and `stress-ng-fs-nodes` were not run (not in the gates; the change is lock and delegation routing).
 - `locks-delegated` 1432: lock renewals under a delegation shrink with the root lease's remaining life down to the margin, so the holder's window reaches about 0 (see above). A renewal that cannot leave a useful window could renew the delegation (and the root its lease) first, as a new grant on less than `2 × margin` already does (`lock_min_grant_ms`); not done here.
+
+## Fix: every commit waited for three fsyncs at each fjall journal rotation (`fjall-journal-rotation`, 2026-10-07)
+
+Left open by `lsm-version-lock`: a flush rotates fjall's journal once it is
+over 64 MB, and upstream fjall did it with the journal writer's mutex held
+across three fsyncs (the old journal's `sync_all`, the new file's after its
+pre-allocation, the folder's). Every commit takes that mutex, so every
+commit waited for them: 337–351 ms worst commit with an 80 ms fsync, and
+the 530–675 ms `journal_lock` slow commits under `stress-ng-fs-nodes`.
+Syncing the old journal after releasing the lock naively breaks the
+journal's ordering: the kernel may write back the new journal's pages
+before the old journal's tail, and a power loss then replays later writes
+without earlier ones.
+
+Fix: vendored fjall change 7 (`vendor/fjall/CONSTELLATION-PATCH.md`). The
+next journal file is created, pre-allocated and synced, and the folder
+synced, before the lock is taken; under the lock the writer only swaps
+files and writes a rotation marker into the new one (an empty batch whose
+seqno is the old journal's last batch seqno, a batch fjall's format already
+has); the old journal is synced after the lock is released. A
+`SyncAll`/`SyncData` persist after the swap also waits for that sync (a
+chained seal per pending sealed journal), so a write acknowledged as
+durable implies every earlier one is. Buffer-mode commits (all of
+Constellation's: `Meta::sync` is the durable path) never wait for an
+fsync and still reach the OS at once, so a process crash loses nothing.
+Recovery checks the markers oldest journal first: a journal whose marker
+names a seqno its predecessor does not end with was written while that
+predecessor's tail was not durable, and it and every later journal are
+emptied; nothing in them was acknowledged as durable. So a crash at any
+point recovers a prefix with every acknowledged-durable write (the proof
+against fjall's reader and recovery code is in `CONSTELLATION-PATCH.md`,
+"Why a crash at any point recovers a prefix"). No on-disk format change:
+upstream fjall reads a marker as a batch with no items.
+
+### Before / after
+
+`crates/meta/tests/compaction_stall.rs`'s new
+`journal_rotations_never_freeze_commits`, release build: a writer commits a
+2-row transaction every millisecond while a loader commits 1 MiB
+transactions at a fixed pace until the journal rotated 6 (NVMe) or 4
+(dm-delay) times, with the existing disk-pressure thread. Before = this
+worktree's `HEAD` fjall, same test binary source.
+
+| | NVMe (btrfs `/var/tmp`), 100 MiB/s, 5 runs | ext4 on dm-delay (fsync ≈ 85 ms), 30 MiB/s, 3 runs |
+|---|---|---|
+| worst commit, before | 172–211 ms | 460–625 ms (see below) |
+| worst commit, after | 0.95–1.47 ms | 20.4–21.2 ms |
+| p99.9, before → after | 49–177 ms → 0.60–0.72 ms | 21.4–99.6 ms → 19.9–20.8 ms |
+| p99 (both) | 0.52–0.65 ms | 19.4–19.7 ms (the disk) |
+
+On dm-delay the before-runs' commits of 500 ms or more (the slow-commit
+log's threshold) were reported as `backpressure` at 30 MiB/s (fjall's write
+stall; upstream's rotation also held every other flush worker on the
+journal lock for its fsyncs), and as `journal_lock=498–581ms` at 100 MiB/s.
+No after-run reported a `journal_lock` wait.
+
+The vendored fjall's deterministic test (every journal sync slowed by
+300 ms, 3 rotations): worst commit 900 ms before, 3.5 ms after. The
+`a_major_compaction_never_freezes_commits` scenario on dm-delay
+(`LSM_STALL_KEYS=4000000`, 3 runs each) gave 20.0–23.5 ms both ways: no
+rotation fell inside its compaction window in these runs (the journal
+rotates during the load), so it no longer shows this stall either way.
+
+Unpaced (`JNL_STALL_MBPS=100000`) or at 100 MiB/s on dm-delay, both builds
+still show 0.5–2.6 s commits, all `backpressure` (fjall's write stall: the
+loader's commit sleeps in `local_backpressure` holding the single-writer
+lock while flushes catch up): a different stall, not changed here. The first
+patched version held the rotation lock through the old journal's sync; with
+the loader unpaced the active journal then grew to 1 GB+ before the next
+rotation (7 GB over 6 rotations once), hence the chained seals.
+
+| Change | Where |
+|---|---|
+| Rotation in three steps, `Seal`/`SealedJournal`, `RotationChain`, test hooks (threshold, slow sync, rotation points; `cfg(test)` only) | `vendor/fjall/src/journal/rotation.rs` (new) |
+| `Writer::{next_path, swap_to, pending_seal, write_marker}`, `last_seqno`, persists wait for pending seals; upstream's `rotate` kept as a one-call wrapper for its unit tests | `vendor/fjall/src/journal/writer.rs`, `journal/mod.rs`, `journal/manager.rs` |
+| Flush worker calls `rotate_if_full` | `vendor/fjall/src/worker_pool.rs` |
+| Recovery: syncs every sealed journal before reading it; marker check (sealed journals, then the active one); a damaged batch in a sealed journal ends the replay | `vendor/fjall/src/recovery.rs`, `src/db.rs`, `src/journal/{rotation,batch_reader,reader}.rs` |
+| Tests: slow-sync latency, crash images at `Prepared`/`Swapped`/`Sealed` (process crash, power loss with the old journal's tail cut at 4 points), restart then power loss, damaged sealed journal, durable persist waits, chained rotation; a failed batch is not `last_seqno` | `vendor/fjall/src/journal/rotation_test.rs` (new), `journal/writer.rs` |
+| Measurement across real rotations (knobs `JNL_STALL_ROTATIONS`, `JNL_STALL_MBPS`); a warn-level logger shows fjall's slow-commit phases | `crates/meta/tests/compaction_stall.rs` |
+| Docs | `vendor/fjall/CONSTELLATION-PATCH.md` (change 7, change 4's note), `vendor/ISSUE-fjall.md` (new issue), `docs/how-to-guides/development/TESTING.md` |
+
+### Decisions
+
+- **Marker + recovery check, not holding new writes in memory.** Keeping
+  the new journal's writes in process memory until the old journal is
+  synced would also keep the order, but Buffer-mode commits would no
+  longer survive a process crash, which Constellation relies on (a backup
+  acknowledges unsynced writes, `crates/authority/src/core/backup.rs`).
+- **Seals are chained and the rotation lock is released before the
+  sync**, so a rotation never waits for the previous journal's sync and
+  the journal stays near 64 MB under load.
+- **A flush waits for pending seals** before it runs (in the worker, never
+  in a commit), as upstream's flush did behind the journal lock. fjall
+  never syncs the journal before a flush, so a flushed table can already
+  hold a write whose predecessors in another keyspace sit in an unsynced
+  journal tail; that is upstream's behaviour and unchanged.
+- **A first journal with a marker is not checked**: its predecessor was
+  deleted by journal maintenance, which deletes oldest first and only
+  fully flushed journals.
+- Discarded journals are emptied (`set_len(0)`, synced), not deleted, so
+  which file is active does not change; an emptied sealed journal has no
+  watermarks and maintenance deletes it.
+
+### Review round (2026-10-08)
+
+- **Restart with a seal pending, then power loss** (must-fix): a process
+  that died before a sealed journal's sync (or before the swap, with
+  unsynced `Buffer` commits in the journal being sealed and the next file
+  already created) left that tail in the page cache. The next process read
+  it whole and found the chain intact, but its durable persists synced
+  only the active journal, so a power loss after them could still cut the
+  tail: the marker check then emptied the journals holding the new
+  process's acknowledged-durable writes, or (before the swap: no marker
+  in the next journal) replayed them after a cut tail. Fix: `Database::
+  recover` `sync_all`s every sealed journal, oldest first, before reading
+  any (`rotation::sync_sealed_journals`), then the active one as before.
+  No folder sync is added: every journal file is created and its folder
+  synced before anything is written to it, and recovery's own new active
+  journal is created by `Journal::create_new`, which syncs its folder.
+  Tests `a_restart_after_a_crash_before_{the_swap,the_sealed_sync}_syncs_
+  the_sealed_journal` record each journal's contents at every sync
+  (`test_hooks::set_sync_hook`), restart the crash image, persist a write
+  durably, and reset every journal to its last synced contents: all 181
+  keys must come back, and the sealed journal must be synced during
+  `Database::open`. Without the fix: 100 keys (`Swapped`) and `0..100`
+  then key 180 (`Prepared`, not a prefix).
+- **`last_seqno` set only after a batch's `End`** (all write paths and the
+  marker): a batch that failed part-way no longer becomes the next
+  marker's seqno. Test `a_failed_batch_is_not_the_last_seqno` (the file
+  turned read-only mid-batch).
+- **A damaged batch in a sealed journal** (`ChecksumMismatch`,
+  `InsufficientLength`, `TooManyItems`) truncates that journal after its
+  last whole batch and empties every later one, instead of failing
+  `Database::open`; the later journals are emptied even without a marker,
+  so the replay stays a prefix. Remaining risk, documented: bit rot in a
+  synced sealed journal now loses the later journals instead of refusing
+  to open; the active journal keeps upstream's error. Test
+  `a_damaged_batch_in_a_sealed_journal_ends_the_prefix`.
+- Nits: upstream's one-call `Writer::rotate` is `#[cfg(test)]` (only its
+  unit tests use it); the proof says why a lost middle page cannot leave
+  the old journal ending with the marker's batch (an unwritten page of
+  the pre-allocated file reads as zeros, which do not decode); a comment
+  on `RotationChain::discard` dropping the pre-allocation (the active
+  writer appends).
+- The lint debt this change had added to the vendored crate is gone:
+  `cargo clippy --manifest-path vendor/fjall/Cargo.toml --all-targets --
+  -D warnings` now reports exactly the same messages as on `HEAD`
+  (upstream's and change 5's, per file and kind), none in the files of
+  this change.
+
+Gates of the review round (2026-10-08): `cargo fmt --all -- --check` and
+the vendored crate's `cargo fmt -- --check` clean; `cargo clippy
+--workspace --all-targets -- -D warnings` clean; `cargo test
+--manifest-path vendor/fjall/Cargo.toml --lib` 82 passed, 1 ignored (the
+rotation and `last_seqno` tests 5 more times: all passed); fjall's
+upstream suite (clone at `3adaa50`, vendored `src/` and lsm-tree,
+`--tests --features __internal_whitebox`) 50 integration + 82 lib passed,
+0 failed; `cargo test -p constellation-meta` 326 passed, 0 failed;
+`tests/smoke.sh` SMOKE TEST PASSED. Not re-run: the workspace split and
+pjdfstest (only `vendor/fjall` and docs changed since the first round's
+runs), and the release before/after measurements (the rotation path is
+unchanged; recovery does one more `sync_all` per sealed journal at open).
+
+### Gates (2026-10-07, 16 cores, load 1–100 from other agents)
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean. The vendored crate's files touched
+  here are clippy-clean; `cargo clippy --manifest-path
+  vendor/fjall/Cargo.toml --all-targets` still fails on code not touched
+  here (`src/batch/slow_commit.rs:62` indexing, change 5; upstream's
+  `src/meta_keyspace.rs`).
+- `cargo test --manifest-path vendor/fjall/Cargo.toml --lib`: 78 passed,
+  1 ignored (upstream's). fjall's upstream suite (repository at `3adaa50`,
+  `--tests --features __internal_whitebox`, vendored `src/`, vendored
+  lsm-tree): 128 passed, 0 failed (50 integration + 78 lib).
+- `cargo test -p constellation-meta` (`TMPDIR=/var/tmp`): 326 passed, 0
+  failed (crash, reopen and recovery tests, `fjall_drop_deadlock`, both
+  `compaction_stall` tests included).
+- Workspace, split: control, platform, csi, constellation, harness, types,
+  vfs, mtree, upload-concurrency, pod-load, uploadbench 717; engine,
+  store-s3, net, fs-core, frontend-fuse, chaos 1165; authority (release,
+  `TMPDIR=/dev/shm`) 305 + 4 + sim 132; model (release) 138: 0 failed.
+- `tests/smoke.sh`: SMOKE TEST PASSED.
+- pjdfstest compliance (compose project `fjr`, private `SMOKE_IMAGE`,
+  floci's host port 4566 dropped by an override): 8798 passed, 0 failed.
+- Not run: `stress-ng-fs-nodes` (not a gate here; the journal-lock slow
+  commits it showed are the ones measured above).

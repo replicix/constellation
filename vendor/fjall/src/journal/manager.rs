@@ -2,7 +2,7 @@
 // This source code is licensed under both the Apache 2.0 and MIT License
 // (found in the LICENSE-* files in the repository)
 
-use super::writer::Writer;
+use super::{rotation::SealedJournal, writer::Writer};
 use crate::Keyspace;
 use lsm_tree::{AbstractTree, SeqNo};
 use std::{path::PathBuf, sync::MutexGuard};
@@ -166,21 +166,25 @@ impl JournalManager {
         }
     }
 
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): switches
+    /// the writer to `next` without syncing; the caller syncs the returned
+    /// sealed journal after releasing the journal lock.
     pub(crate) fn rotate_journal(
         &mut self,
         journal_writer: &mut MutexGuard<Writer>,
+        next: Writer,
         watermarks: Vec<EvictionWatermark>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<SealedJournal> {
         let journal_size = journal_writer.len()?;
 
-        let (sealed_path, _) = journal_writer.rotate()?;
+        let sealed = journal_writer.swap_to(next)?;
 
         self.enqueue(Item {
-            path: sealed_path,
+            path: sealed.path.clone(),
             watermarks,
             size_in_bytes: journal_size,
         });
 
-        Ok(())
+        Ok(sealed)
     }
 }

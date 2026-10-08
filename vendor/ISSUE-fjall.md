@@ -565,4 +565,58 @@ Durability is unchanged: the buffer is flushed under the lock, and the duplicate
 
 - On btrfs the benefit is smaller: btrfs takes the inode lock in `fsync`, so a commit whose journal append reaches `write(2)` (the buffer's flush) still waits for an fsync of the same file in progress. The reproducer above therefore runs on ext4.
 - Related, in lsm-tree 3.1.10 (fjall's storage): every memtable insert first takes its tree's version-history lock (`Tree::append_entry`, `version_history.read()`), and a flush (`register_tables`) or a compaction holds that lock for writing while `persist_version` writes and fsyncs the new version file, fsyncs the directory and rewrites `current` (more fsyncs). Under I/O pressure a commit of a few rows then waits seconds for the disk with the single-writer lock held; Constellation measured up to 11.2 s inside one commit's memtable inserts (its vendored fjall logs a commit's phases when it takes ≥ 500 ms). Persisting the version before taking the write lock, and only swapping it in under the lock, would keep fsyncs off every writer's path: filed separately with a reproducer, `ISSUE-lsm-tree.md`. Its fix needs one change here too: `Keyspace::inner_rotate_memtable` calls `SuperVersions::maintenance` on the version write guard (`keyspace.tree.get_version_history_lock().maintenance(…)`), which drops the old versions under it. The last one referencing a compaction's input tables unlinks their files from `Drop`, so after a major compaction every insert into that keyspace waits for those unlinks. Taking the stale versions out under the guard and dropping them after it is released fixes that.
-- Also on a commit's path: a flush rotates the journal (`JournalManager::rotate_journal` in the flush worker) under the journal writer's mutex. That is the old journal's `sync_all`, the new file's creation, `set_len` and `sync_all`, and the directory's fsync, so every commit waits for three fsyncs per flush. With an 80 ms fsync that was 337–351 ms per flush, the largest commit wait left once the version-lock stalls were fixed.
+- Also on a commit's path: a flush rotates the journal (`JournalManager::rotate_journal` in the flush worker) under the journal writer's mutex. That is the old journal's `sync_all`, the new file's creation, `set_len` and `sync_all`, and the directory's fsync, so every commit waits for three fsyncs per rotation (each 64 MB of journal). With an 80 ms fsync that was 337–351 ms, the largest commit wait left once the version-lock stalls were fixed: filed below.
+
+# Journal rotation holds the journal writer's lock across three fsyncs: every commit stalls once per 64 MB of journal
+
+## Version
+
+- fjall 3.1.10 (`src/worker_pool.rs`, `src/journal/{manager,writer}.rs`; unchanged in 3.1.11)
+- Linux 7.3.0-0.rc4.260925g165768bb7026.42.fc46.x86_64, rustc 1.99.0; ext4 on a `dm-delay` device (an `fsync` takes about 85 ms) and btrfs on NVMe
+
+## Problem
+
+Before each flush, a worker checks the active journal's size with the journal writer's mutex held, and if it is over 64 MB it rotates the journal (`JournalManager::rotate_journal` → `Writer::rotate`) with that mutex still held. The rotation `sync_all`s the old journal, creates the next file, `set_len`s it to 64 MiB and `sync_all`s it, and fsyncs the folder. Every commit appends to the journal under the same mutex, so every writer of the database waits for those three fsyncs, once per 64 MB of journal, whether or not it asked for durability.
+
+The obvious fix (sync the old journal after releasing the lock) breaks the journal's ordering. Writes keep going into the new journal and reach the OS, and the kernel may write their pages back before the old journal's tail. A power loss then leaves the new journal's writes but not some earlier ones in the old journal, and recovery replays both: not a prefix of the commits.
+
+## Reproducer
+
+A thread commits a 2-row transaction every millisecond while another loads 1 MiB transactions at 30 MiB/s (100 MiB/s on the NVMe) until the journal has rotated 4 (6) times; the commit latencies of the first thread are reported. This is `journal_rotations_never_freeze_commits` in Constellation's `crates/meta/tests/compaction_stall.rs`, against `SingleWriterTxDatabase` with 4 workers; a thread writing and `sync_data`ing 4 MiB at a time keeps the disk busy as a real host's would.
+
+## Expected vs actual
+
+- Expected: the small commits (no persist) take microseconds whatever the rotation's fsyncs take.
+- Actual, 3.1.10 (`slow commit` lines are Constellation's per-phase report, see its fjall patch 5):
+
+```
+dm-delay, 30 MiB/s, 4 rotations, 3 runs: max 460 ms, 500 ms, 625 ms
+dm-delay, 100 MiB/s: slow commit: 581 ms for 2 items (journal_lock=581ms ...)
+NVMe, 6 rotations, 5 runs: p99.9 49-177 ms, max 172-211 ms
+```
+
+With the fix below:
+
+```
+dm-delay, 4 rotations, 3 runs: max 20.4 ms, 20.6 ms, 21.2 ms (p99 19 ms in both builds: the disk)
+NVMe, 6 rotations, 5 runs: p99.9 0.60-0.72 ms, max 0.95-1.47 ms
+```
+
+A unit test with every journal sync slowed by 300 ms (three rotations): worst commit 900 ms before (3 × 300 ms), 3.5 ms after.
+
+## Suggested fix
+
+Do every fsync of a rotation off the lock, and keep the ordering with a marker that recovery checks:
+
+1. Create, pre-allocate and sync the next journal file, and fsync the folder, before taking the lock (a rotation lock keeps two workers from preparing the same file).
+2. Under the journal lock (and the journal manager's and keyspaces' locks, as now): write out the old journal's buffer (to the OS), switch the writer to the new file and write a **rotation marker** as its first batch: an empty batch (`Start { item_count: 0, seqno: L }`, `End(checksum of nothing)`) whose seqno `L` is that of the last batch written to the old journal. No fsync. The format does not change: 3.1.10's recovery reads the marker as a batch with no items.
+3. Release the lock and `sync_all` the old journal. A `PersistMode::SyncAll`/`SyncData` persist that comes after the swap waits for that sync too (and for any earlier pending one), so a write acknowledged as durable implies every earlier write is durable. Buffer-mode commits never wait: they reach the OS at once, as before, so a process crash loses nothing.
+4. In recovery, for each journal after the first, oldest first: if its first batch is a marker and the previous journal's last batch does not have the marker's seqno, the previous journal lost its tail in a crash before step 3 finished. Empty that journal and every later one (they hold nothing acknowledged as durable: that would have waited for the old journal's sync, which would have made its last batch, `L`, durable). What is replayed is then a prefix of the commits.
+
+5. In recovery, before reading any journal, `sync_all` every sealed one (as the active one already is). A process that crashed before step 3 (or before the swap, with `Buffer` commits in the old journal and the new file already created) leaves the old journal's tail in the page cache: the next process reads it whole, and nothing in it waits for that tail's sync. Without this, a durable persist after the restart followed by a power loss loses those writes (the marker check empties the journals after the cut tail) or, before the swap, replays them after a cut tail with no marker to detect it.
+6. Also in recovery: a sealed journal with a batch that does not read back whole (`ChecksumMismatch`, `InsufficientLength`, `TooManyItems`; a lost page in the middle of a batch whose `End` survived) ends the replay after its last whole batch, and every later journal is emptied, instead of failing `Database::open`. A rotation marker names the last batch whose `End` was written (set after `End`, not at `Start`), so a batch that failed part-way never becomes the marker's seqno.
+
+Why the check is exact: seqnos are allocated under the journal lock and strictly increase in journal order, so the old journal ends with batch `L` if and only if it is complete (the reader stops at the first invalid entry, and every batch before `L` precedes it; an unwritten page inside the pre-allocated file reads back as zeros, which do not decode). A rotation from a journal this writer never wrote to has no marker: that journal was synced when it was created or recovered.
+
+Two more details: a flush worker waits for a pending old-journal sync before it flushes (as it did, behind the journal lock), and the next rotation does not wait for it (each pending sync is chained to the one before), so the active journal stays near 64 MB under load. Constellation's patch (`vendor/fjall/CONSTELLATION-PATCH.md`, change 7) has the code and the tests: slow-sync latency, crash images at each step with the old journal's unsynced tail cut at several points, a restart followed by a power loss (every journal reset to its contents at its last sync), a damaged batch in a sealed journal, a durable persist that must wait, and a rotation while the previous sync is held.
+

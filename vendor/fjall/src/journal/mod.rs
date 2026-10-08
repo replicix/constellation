@@ -8,8 +8,12 @@ pub mod error;
 pub mod manager;
 pub mod reader;
 mod recovery;
+// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7).
+pub mod rotation;
 pub mod writer;
 
+#[cfg(test)]
+mod rotation_test;
 #[cfg(test)]
 mod test;
 
@@ -27,6 +31,9 @@ use writer::Writer;
 
 pub struct Journal {
     writer: Mutex<Writer>,
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): held by a
+    /// rotation from the next file's creation to the swap.
+    rotation: Mutex<()>,
 }
 
 impl std::fmt::Debug for Journal {
@@ -71,6 +78,7 @@ impl Journal {
     fn from_file<P: AsRef<Path>>(path: P) -> crate::Result<Self> {
         Ok(Self {
             writer: Mutex::new(Writer::from_file(path)?),
+            rotation: Mutex::default(),
         })
     }
 
@@ -97,6 +105,7 @@ impl Journal {
 
         Ok(Self {
             writer: Mutex::new(writer),
+            rotation: Mutex::default(),
         })
     }
 
@@ -107,6 +116,21 @@ impl Journal {
     /// Returns an error if the journal writer is poisoned.
     pub(crate) fn get_writer(&self) -> crate::Result<MutexGuard<'_, Writer>> {
         self.writer.lock().map_err(|_| crate::Error::Poisoned)
+    }
+
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): the
+    /// rotation lock (it guards no data: a poisoned one is taken).
+    pub(crate) fn lock_rotation(&self) -> MutexGuard<'_, ()> {
+        self.rotation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): waits for
+    /// the syncs of the journals sealed so far.
+    pub(crate) fn wait_for_sealed(&self) -> crate::Result<()> {
+        let seal = self.get_writer()?.pending_seal();
+        seal.map_or(Ok(()), |seal| seal.wait().map_err(Into::into))
     }
 
     pub fn path(&self) -> crate::Result<PathBuf> {
@@ -128,7 +152,7 @@ impl Journal {
     /// the disk took (seconds on a busy one).
     pub fn persist(&self, mode: PersistMode) -> crate::Result<()> {
         let file = self.get_writer()?.flush_for_sync(mode)?;
-        let Some((file, path)) = file else {
+        let Some((file, path, seal)) = file else {
             return Ok(());
         };
         match mode {
@@ -141,9 +165,12 @@ impl Journal {
                     path.display(),
                 );
             }),
-            PersistMode::Buffer => Ok(()),
-        }
-        .map_err(Into::into)
+            PersistMode::Buffer => return Ok(()),
+        }?;
+        rotation::after_sync(&path);
+        // CONSTELLATION PATCH (change 7): writes before a rotation are in
+        // the sealed journal, whose sync runs outside the lock.
+        seal.map_or(Ok(()), |seal| seal.wait().map_err(Into::into))
     }
 
     pub fn recover<P: AsRef<Path>>(

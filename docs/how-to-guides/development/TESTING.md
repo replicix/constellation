@@ -19,9 +19,11 @@ nightly and on manual dispatch (`.github/workflows/nightly.yml`).
 | Read-path cost | `make read-cpu-gate` | local directory | Linux, Rust, fuse3, fio | ~5 min |
 
 The vendored fjall is outside the workspace (`vendor/fjall/CONSTELLATION-PATCH.md`),
-so its own unit tests — among them the writer lock's (`writer_lock`) and
-the journal's — run only through its manifest; run them after touching
-anything under `vendor/fjall`. Its `Cargo.lock` and `target/` are
+so its own unit tests — among them the writer lock's (`writer_lock`), the
+journal's, and the journal rotation's (`journal::rotation_test`: commits
+under slow rotation fsyncs, crash images around a rotation) — run only
+through its manifest; run them after touching anything under
+`vendor/fjall`. Its `Cargo.lock` and `target/` are
 ignored. The same holds for the vendored lsm-tree, fjall's storage engine
 (`vendor/lsm-tree/CONSTELLATION-PATCH.md`): run its suite after touching
 anything under `vendor/lsm-tree`, or `vendor/fjall` (whose build uses it).

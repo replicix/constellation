@@ -7,7 +7,7 @@ use crate::{
     db_config::Config,
     file::{fsync_directory, KEYSPACES_FOLDER, LOCK_FILE, VERSION_MARKER},
     flush::manager::FlushManager,
-    journal::{manager::JournalManager, writer::PersistMode, Journal},
+    journal::{manager::JournalManager, rotation::RotationChain, writer::PersistMode, Journal},
     keyspace::{name::is_valid_keyspace_name, KeyspaceKey},
     locked_file::LockedFileGuard,
     meta_keyspace::MetaKeyspace,
@@ -609,6 +609,12 @@ impl Database {
         )?;
         log::debug!("journal recovery result: {journal_recovery:#?}");
 
+        // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): a
+        // crashed process may have left a sealed journal unsynced.
+        crate::journal::rotation::sync_sealed_journals(
+            journal_recovery.sealed.iter().map(|(_, path)| path),
+        )?;
+
         let active_journal = Arc::new(journal_recovery.active);
         active_journal.get_writer()?.persist(PersistMode::SyncAll)?;
 
@@ -686,7 +692,7 @@ impl Database {
         recover_keyspaces(&db, &meta_keyspace)?;
 
         // Recover sealed memtables by walking through old journals
-        recover_sealed_memtables(
+        let mut chain = recover_sealed_memtables(
             &db,
             &sealed_journals
                 .into_iter()
@@ -712,10 +718,25 @@ impl Database {
             if !journal_recovery.was_active_created {
                 log::trace!("Recovering active memtables from active journal");
 
+                // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 7): the
+                // rotation markers' check goes on into the active journal.
+                let active_path = db.supervisor.journal.path()?;
+                if chain.is_broken() {
+                    RotationChain::discard(&active_path)?;
+                }
+
                 let reader = db.supervisor.journal.get_reader()?;
 
+                let mut first = true;
                 for batch in reader {
                     let batch = batch?;
+
+                    // CONSTELLATION PATCH (change 7).
+                    if std::mem::take(&mut first) && !chain.admits_first(&batch) {
+                        RotationChain::discard(&active_path)?;
+                        break;
+                    }
+                    chain.note(batch.seqno);
 
                     for item in batch.items {
                         let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)?
