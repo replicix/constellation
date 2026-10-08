@@ -42145,7 +42145,13 @@ for.
   `tests/csi/e2e.sh` refuses `-ginkgo.skip`/`--skip`; `--device /dev/fuse`
   dropped from the workstation container.
 - A quiet-host rerun of `snapsched-write-overhead` would firm up the 3 %
-  verdict (see above).
+  verdict (see above). **Done 2026-10-08 on main `2008881`** (16-CPU
+  runner idle, load 9.6 → 1.5 at the start of each run), 3 scenario runs:
+  median regression −7.72 %, −0.20 %, +2.54 % (no policy vs `10s:1h`,
+  medians of three 2 GiB fio runs each: 84.4/90.9, 92.4/92.6, 94.2/91.8
+  MB/s); root lease `holder 1 epoch 1` before and after every run; 5–6
+  auto snapshots during each policy run. Within the plan's 3 % bound;
+  the remaining spread is run-to-run disk variance (±7 % between pairs).
 - **Pre-existing, outside plan 32:** three `constellation-store-s3` unit
   tests fail at this base and on main `2c5497e` (no store-s3 change since):
   `lease::tests::forward_compatible_decode` (`missing field wanted_by`),
