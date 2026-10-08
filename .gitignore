@@ -15,6 +15,10 @@
 /vendor/lsm-tree/Cargo.lock
 /vendor/lsm-tree/target
 /.scratch
+# ci.yml's `integration` job drops the shared build's binaries here so the
+# test-runner image can COPY them in without recompiling (see
+# tests/docker/Dockerfile's CI_PREBUILT arg).
+/ci-bin
 mount.sh
 umount.sh
 TODO.md

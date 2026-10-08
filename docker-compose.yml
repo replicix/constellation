@@ -40,6 +40,9 @@ services:
       target: suite
       args:
         TARGET_CACHE_ID: constellation-target-${COMPOSE_PROJECT_NAME}
+        # Set by ci.yml's `integration` job (ci-bin/ then holds the
+        # binaries the shared `build` job compiled); empty locally.
+        CI_PREBUILT: ${CI_PREBUILT:-}
     profiles: ["test"]
     depends_on:
       floci:

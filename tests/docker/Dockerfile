@@ -18,14 +18,25 @@ ARG CARGO_FEATURES=
 # `docker-compose.yml` passes its project name (by default the checkout's
 # directory); other builds share the default id.
 ARG TARGET_CACHE_ID=constellation-target
+# CI (ci.yml's `integration` job) sets this to reuse the release binaries
+# the shared `build` job already compiled on the host, instead of compiling
+# them again inside the image: it copies them to ci-bin/ in the build
+# context before `docker build`/`docker compose build` runs (docker-compose.yml
+# passes the arg through). Empty (the default) keeps the local/dev path —
+# compile here — unchanged.
+ARG CI_PREBUILT=
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=${TARGET_CACHE_ID},target=/src/target \
-    cargo build --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
-        -p constellation -p constellation-harness \
-    && cp target/release/constellation /constellation \
-    && cp target/release/harness /harness
+    if [ -n "$CI_PREBUILT" ]; then \
+        cp ci-bin/constellation /constellation && cp ci-bin/harness /harness; \
+    else \
+        cargo build --release ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
+            -p constellation -p constellation-harness \
+        && cp target/release/constellation /constellation \
+        && cp target/release/harness /harness; \
+    fi
 
 FROM debian:bookworm-slim AS pjdfstest
 # Pinned upstream commit for reproducible test semantics.

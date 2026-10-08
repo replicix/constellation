@@ -45941,3 +45941,127 @@ own (old) stress-ng and a scoped native-S3 install; `snapsched-write-overhead`
 reproduced once under `taskset -c 0-3` (no crash; confirmed as host-load
 sensitive, not fixed in product code) and confirmed `SKIPPED` under
 `--exclude` alongside a real scenario.
+
+## Fix: `ci.yml` compiled the workspace once per job — up to six separate
+compiles of the same source per push (`ci-shared-build`, 2026-10-08)
+
+### Cause
+
+`lint`, `test` (unit), `csi-unit`, `harness` (fault injection) and
+`transport-dev-fuse` each ran their own `cargo build`/`cargo test` from a
+clean (or cache-restored) `target/`; `integration` additionally compiled a
+fourth time inside its Docker image. None shared a binary or a dependency
+cache keyed the same way, so a push paid for the same `cargo build --release
+-p constellation -p constellation-harness -p constellation-chaos` three
+times over (`harness`, `transport-dev-fuse`, `integration`'s Dockerfile)
+plus two debug-profile workspace compiles (`lint`'s clippy pass, `test`'s
+`cargo test --workspace`, itself the reported 1 h 24 min lane).
+
+### What changed
+
+1. **New `build` job**: compiles the release binaries every other job
+   needs (`constellation`, `harness`, `chaos`) once, tars them (preserves
+   the executable bit that `actions/upload-artifact`'s zip drops), and
+   uploads the tarball. `integration`, `harness` and `transport-dev-fuse`
+   now `needs: build` and extract it
+   (`.github/actions/download-ci-bin`, a composite action) instead of
+   compiling — no Rust toolchain in those three jobs; their `cargo
+   run`/`cargo build` steps became direct binary calls
+   (`target/release/harness run …`, not `cargo run --release -q -p
+   constellation-harness -- run …`). `transport-dev-fuse` calls
+   `tests/transport-matrix.sh` directly rather than through `make
+   transport-matrix`: that target's `$(RELEASE_BIN)` prerequisite has a
+   phony `FORCE` dependency (so plain `make` always re-triggers the
+   `cargo build` recipe, by design for interactive/local use) — in this
+   job there is no longer a toolchain to do that rebuild with.
+
+   `build` runs inside `rust:1-bookworm` rather than bare `ubuntu-latest`:
+   confirmed locally that a binary built directly on this host (glibc
+   2.39) refuses to start inside `debian:bookworm-slim`
+   (`tests/docker/Dockerfile`'s runtime stage, which `integration` uses) —
+   `GLIBC_2.39' not found`. A build inside `rust:1-bookworm` (glibc 2.36,
+   the same base the Dockerfile already compiled in) runs on both
+   `bookworm-slim` and directly on `ubuntu-latest` (and even a plain
+   `ubuntu:latest`, glibc 2.43): glibc is backward- but not
+   forward-compatible. `tests/docker/Dockerfile`'s `build` stage grew a
+   `CI_PREBUILT` arg (plumbed through `docker-compose.yml`): set, it `cp`s
+   `ci-bin/{constellation,harness}` (the `integration` job populates
+   `ci-bin/` from the downloaded artifact — `.dockerignore` excludes
+   `target/`) instead of running `cargo build`; unset (the default) it
+   compiles exactly as before, so local `docker compose build` is
+   unaffected.
+
+2. **Unit tests**: `unit-test-archive` builds every workspace test binary
+   once (`cargo nextest archive --workspace`, installed via
+   `taiki-e/install-action`) and uploads the archive; `unit-test`'s
+   6-job matrix each downloads it and runs one slice (`cargo nextest run
+   --archive-file … --partition count:i/6`) — no toolchain, no rust-cache,
+   no recompile, just `cargo` (ambient on `ubuntu-latest`) dispatching to
+   the nextest binary. Audited the workspace for nextest's process-per-test
+   model first: no fixed ports, no `#[ctor]`/global test-order state, no
+   `serial_test`; root-only tests (`crates/cli/tests/serve.rs`) already
+   self-skip on a non-zero `geteuid()` rather than relying on
+   `--test-threads=1`. Several tests do mutate process-global env vars
+   (`CONSTELLATION_P2P`, `CONSTELLATION_REGISTRY`,
+   `CONSTELLATION_CSI_POOL_CREATE_CONCURRENCY`, …) — already a latent
+   flakiness risk under `cargo test`'s shared-process thread-per-test
+   model; nextest's one-process-per-test model happens to make these
+   safe outright rather than needing a fix. Nothing needed `cargo test`
+   kept outside nextest. `N = 6`, not fewer: `count:i/N` splits by test
+   count, not measured duration, and a cluster of
+   `constellation-authority::sim` / `constellation-model` property tests
+   (randomized, many iterations) run 1–7 minutes each; one 4-way slice
+   locally stacked 22 of them back to back for 430s on a 32-core box, so a
+   4-core hosted runner would do worse — left a comment on the matrix for
+   retuning `N` from observed Actions wall time rather than a hunch.
+   Doctests (nextest does not run them) moved to their own `doctest` job
+   (`cargo test --doc --workspace`). `csi-unit` is untouched (still its
+   own job, plan 37 §13), now sharing the same dependency cache.
+
+3. **Shared dependency caches**: `lint`, `unit-test-archive`, `doctest`
+   and `csi-unit` (all `dev` profile) share one `Swatinem/rust-cache` via
+   `shared-key: dev`; `build` (release) and `cross-check` (its own darwin +
+   windows-gnu target triples) each keep their own key. All three
+   `save-if` only on `main`.
+
+4. Nightly (`nightly.yml`) is untouched: restructuring its 18-job chain
+   (several needing self-hosted FUSE/kind runners this sandbox cannot
+   reach) onto one shared build is not a small change and could not be
+   validated here; left as a follow-up.
+
+### Gates
+
+`python3 -c "import yaml; yaml.safe_load(...)"` and
+`rhysd/actionlint` (docker) clean on `ci.yml` (nightly.yml's only findings
+are pre-existing: unknown self-hosted runner labels, one shellcheck style
+nit). Built `constellation`/`harness`/`chaos` (release) both directly
+(3 m 05 s, 32 cores) and inside `rust:1-bookworm` (4 m 32 s) and confirmed
+by `md5sum` the Dockerfile's `CI_PREBUILT=1` path copies the exact
+artifact rather than recompiling (`#12 CACHED` on a second build). Ran
+`tests/smoke.sh` against the shared release binaries (host and, with
+`SMOKE_IMAGE` pointed at a `CI_PREBUILT=1` image, fully containerized);
+`harness run cold-cache` and `TRANSPORTS=dev-fuse SCENARIOS=cold-cache
+tests/transport-matrix.sh` both PASSED directly against
+`target/release/{constellation,harness}`, no `cargo` involved. Built a
+`cargo nextest archive --workspace` inside `rust:1-bookworm` (74 binaries,
+2.5 GB archive, 3 m 32 s compile + 44 s to archive) and ran partition 1/4
+from it in a fresh container with no toolchain beyond `cargo`+`nextest`:
+729/729 passed with `/dev/fuse` + `fuse3` available (one FUSE-mount test
+failed without them — a gap in that throwaway container, not in the
+workspace or nextest, confirmed by rerunning just that test with the
+device attached).
+
+### Open
+
+- The nextest archive is 2.5 GB (`test` profile ships full debug info);
+  not reduced here, but worth revisiting (e.g. `CARGO_PROFILE_TEST_DEBUG`)
+  if the 6-way download overhead shows up in the Actions timing.
+- `N = 6` for `unit-test` and the `build`/`unit-test-archive` container
+  choice are the two judgment calls most likely to need a follow-up once
+  real Actions timing exists; this sandbox has no hosted-runner-shaped
+  box to measure against (everything above ran on a 32-core host, not a
+  4-core hosted runner).
+- Branch protection's required status checks (if configured) likely name
+  the old `test` job; renaming it away (now `unit-test-archive` +
+  `unit-test (partition i/6)` + `doctest`) needs a matching update there,
+  outside this repo.

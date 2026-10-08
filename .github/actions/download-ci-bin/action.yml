@@ -1,0 +1,25 @@
+name: Download the shared release binaries
+description: >
+  Download the release-bin artifact produced by ci.yml's `build` job and
+  extract it to target/release, so test jobs run the same binaries without
+  a Rust toolchain or their own compile. actions/upload-artifact zips its
+  payload, which drops the executable bit; the build job tars the binaries
+  itself so this step's tar -xzf gets it back.
+inputs:
+  name:
+    description: Artifact name to download
+    required: false
+    default: release-bin
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        path: .
+    - shell: bash
+      run: |
+        mkdir -p target/release
+        tar -xzf release-bin.tar.gz -C target/release
+        chmod +x target/release/constellation target/release/harness target/release/chaos
+        rm -f release-bin.tar.gz

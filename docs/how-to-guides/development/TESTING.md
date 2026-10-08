@@ -4095,10 +4095,55 @@ versitygw binary it fails, naming the install script.
 
 ## CI notes
 
+- `ci.yml`'s `build` job compiles `constellation`, `harness` and `chaos`
+  (release) once and tars them (`actions/upload-artifact` zips its
+  payload, which drops the executable bit); `integration`, `harness` and
+  `transport-dev-fuse` each `needs: build` and extract the tarball
+  (`.github/actions/download-ci-bin`) instead of compiling their own copy
+  — no Rust toolchain in those three jobs. `build` runs inside the
+  `rust:1-bookworm` container (not bare `ubuntu-latest`): `integration`
+  runs the binary inside a `debian:bookworm-slim` image
+  (`tests/docker/Dockerfile`'s `runtime-base`), and a binary linked
+  against `ubuntu-latest`'s (newer) glibc refuses to start there
+  (`GLIBC_2.39' not found`, confirmed locally); bookworm's glibc is older,
+  so the same binary runs fine everywhere else too (glibc is
+  backward-compatible, not forward-compatible). `tests/docker/Dockerfile`'s
+  `build` stage takes a `CI_PREBUILT` arg: set, it copies `ci-bin/{constellation,harness}`
+  (placed there by the `integration` job, from the shared build) instead of
+  running `cargo build` itself; unset (the default, including local
+  `docker compose build`), it compiles as before.
+- Unit tests build once (`cargo nextest archive --workspace`,
+  `unit-test-archive`) and run as 6 parallel slices of that archive
+  (`unit-test`'s matrix, `cargo nextest run --archive-file … --partition
+  count:i/6`), each downloading the archive — no recompile. `count:i/N`
+  splits by test count, not measured duration: a handful of
+  `constellation-authority::sim` / `constellation-model` property tests
+  (randomized, many iterations) run 1–7 minutes each and land unevenly
+  across slices (confirmed locally: one slice of 4 ran 22 such tests back
+  to back for 430s on a 32-core box); retune `N` (the matrix list and the
+  `/N` divisor together) from observed per-partition wall time in the
+  Actions UI rather than guessing, and consider carving the slowest sim/
+  property tests into a slice of their own if `count` partitioning stays
+  imbalanced. nextest runs each test in its own process, which incidentally
+  fixes a latent class of flakiness `cargo test --workspace` had: several
+  tests mutate process-global env vars (`CONSTELLATION_P2P`,
+  `CONSTELLATION_REGISTRY`, …) that `cargo test`'s thread-per-test model
+  shares across whatever else is running in that binary. nextest does not
+  run doctests; `doctest` (`cargo test --doc --workspace`) covers them in
+  its own job, sharing lint/unit-test-archive's dependency cache (same
+  `dev` profile). `csi-unit` keeps running `constellation-csi`'s tests on
+  their own too (plan 37 §13) — intentional duplication with the archive's
+  `--workspace` run, not an oversight.
+- `lint`, `unit-test-archive`, `doctest` and `csi-unit` share one
+  dependency cache (`Swatinem/rust-cache`'s `shared-key: dev`, all `dev`
+  profile); `build` has its own (`shared-key: release`); `cross-check` has
+  its own too (different target triples, darwin + windows-gnu, entirely
+  separate `target/` subtrees). All three save only on `main`
+  (`save-if`) to avoid thrashing one shared entry from every PR branch.
 - The `integration` job builds the runner image via buildx with
-  `type=gha` layer caching. Source changes invalidate the cargo build
-  layer (cache mounts don't persist across GHA runs); a cold build is
-  ~40 s on top of image pulls.
+  `type=gha` layer caching. With `CI_PREBUILT=1` the compile layer is
+  just a `cp`, so a cold build is dominated by the image pulls and the
+  (non-Rust) pjdfstest build, not by cargo.
 - `SMOKE_IMAGE` tells `tests/compose-test.sh` to use the pre-built image
   instead of building via compose.
 - Lint gates are `cargo fmt --all --check` and
