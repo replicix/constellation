@@ -107,7 +107,7 @@ def main():
     args = ap.parse_args()
 
     args.logs_dir.mkdir(parents=True, exist_ok=True)
-    suite = {"config": vars(args).copy(), "profiles": {}}
+    suite = {"schema": 1, "config": vars(args).copy(), "profiles": {}}
     suite["config"]["harness_bin"] = str(args.harness_bin)
     suite["config"]["constellation_bin"] = str(args.constellation_bin)
     suite["config"]["out"] = str(args.out)

@@ -28,39 +28,11 @@ CI defaults to `--max-file-bytes 2097152` (~2 MiB) so the full tree shape fits
 
 Flat `--files` / `--fanout` / `--file-size` generation remains available when corpus mode is off.
 
-## Baseline storage strategy
+## Comparison with main
 
-Performance baselines are committed directly to each branch:
+Every push to `main` runs the suite and keeps `head.json` in the `perf-results` artifact (90 days). A pull request runs the suite once, downloads the newest of those, and renders the comparison with `report.py`: a geometric-mean overview per network profile, then every metric against main. Changes under ±15% are shown in small print (hosted runners are that noisy); a main measured with a different corpus (seed, file limit, size cap) is not compared. The report is in the job summary and in one comment per pull request, updated in place. Nothing is committed to the branch.
 
-### `.perf-baselines/result.json` in branch
-- Each branch maintains its own baseline
-- File path: `.perf-baselines/result.json`
-- Updated automatically after successful benchmark runs
-- Committed with `[skip ci]` to avoid triggering loops
-
-### How it works
-1. PR opens against base branch (e.g., `main`)
-2. Workflow fetches baseline from base branch (`.perf-baselines/result.json`)
-3. If not found: runs benchmark for base commit to generate baseline
-4. Runs benchmark for PR head
-5. Compares head vs base and generates report
-6. Commits head's baseline to PR branch
-7. When PR merges, updated baseline flows to base branch
-
-### Benefits
-- ✅ Indefinite retention (follows git history)
-- ✅ Intuitive: baseline lives with the code it measures
-- ✅ Works with any ref (branches, tags, SHAs)
-- ✅ Self-contained: no separate branch management
-- ✅ Fast: existing baselines skip expensive rebuilds
-- ✅ Automatic: baselines update on every PR merge
-
-### Artifacts (ephemeral)
-
-Short-lived workflow artifacts for recent runs only:
-
-- **Comparison reports** (14 days): `perf-report-{run_id}` - Markdown diff tables
-- **Logs** (14 days): `perf-logs-{run_id}` - Raw constellation/harness logs for debugging
+Artifacts per run (14 days): `perf-{run_id}` with `head.json`, `report.md` and the raw constellation/harness logs.
 
 ## Local run
 
@@ -68,8 +40,8 @@ Short-lived workflow artifacts for recent runs only:
 make perf-regression
 ```
 
-## Compare two suites
+## Compare two suites (Markdown to stdout)
 
 ```bash
-python3 tests/perf_regression/compare.py --base base.json --head head.json --out report.md
+python3 tests/perf_regression/report.py head.json --base base.json
 ```

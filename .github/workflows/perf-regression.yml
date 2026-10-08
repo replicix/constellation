@@ -1,13 +1,18 @@
 name: Performance Regression
 
+# The corpus-replay benchmark (tests/perf_regression/) on a hosted runner.
+# Pull requests are compared with the latest run on main: the results of
+# every push to main are kept in the `perf-results` artifact, so a pull
+# request runs the suite once (no base build). The report goes to the job
+# summary and to one comment on the pull request, updated in place.
 on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "**.md"]
   pull_request:
+    paths-ignore: ["docs/**", "**.md"]
   workflow_dispatch:
     inputs:
-      base_ref:
-        description: "Base ref for comparison (branch, tag, or SHA)"
-        required: false
-        default: "main"
       repetitions:
         description: "Repetitions per profile (median reported)"
         required: false
@@ -33,18 +38,23 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: perf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   perf-regression:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      actions: read
       pull-requests: write
     env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       CACHE_RUST_BUILD: ${{ github.event.inputs.cache_rust_build == 'true' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Free runner disk space
         if: env.CACHE_RUST_BUILD != 'true'
@@ -86,39 +96,36 @@ jobs:
         if: env.CACHE_RUST_BUILD != 'true'
         id: cfg
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "base_ref=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "base_ref=${{ github.event.inputs.base_ref || 'main' }}" >> "$GITHUB_OUTPUT"
-          fi
           echo "repetitions=${{ github.event.inputs.repetitions || '1' }}" >> "$GITHUB_OUTPUT"
           echo "seed=${{ github.event.inputs.seed || '42' }}" >> "$GITHUB_OUTPUT"
-          # Replaying all 120k files three times for HEAD and again for BASE
-          # takes many hours on a hosted runner and exhausted process/memory
-          # resources before rsync could even start. 20k preserves the real
-          # corpus shape and is large enough for stable rates while keeping
-          # the routine regression job bounded. A manual dispatch can still
-          # request the full 120367-entry corpus explicitly.
+          # Replaying all 120k files three times takes many hours on a hosted
+          # runner and exhausted process/memory resources before rsync could
+          # even start. 20k preserves the real corpus shape and is large
+          # enough for stable rates while keeping the routine job bounded. A
+          # manual dispatch can still request the full 120367-entry corpus.
           echo "corpus_limit=${{ github.event.inputs.corpus_limit || '20000' }}" >> "$GITHUB_OUTPUT"
-          # PRs always cap; workflow_dispatch can clear the input to use exact sizes.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "max_file_bytes=${{ github.event.inputs.max_file_bytes || '2097152' }}" >> "$GITHUB_OUTPUT"
-          else
+          # Pushes and PRs always cap; workflow_dispatch can clear the input to use exact sizes.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "max_file_bytes=${{ github.event.inputs.max_file_bytes }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "max_file_bytes=${{ github.event.inputs.max_file_bytes || '2097152' }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch baseline from base ref
-        if: env.CACHE_RUST_BUILD != 'true'
+      # The newest main run that kept results, to compare with.
+      - name: Results of main
+        if: env.CACHE_RUST_BUILD != 'true' && github.event_name != 'push'
+        id: base
         run: |
           mkdir -p perf-artifacts
-          base_ref="${{ steps.cfg.outputs.base_ref }}"
-          if git show "${base_ref}:.perf-baselines/result.json" > perf-artifacts/base.json 2>/dev/null; then
-            echo "Found existing baseline in ${base_ref}"
-            echo "baseline_exists=true" >> "$GITHUB_ENV"
-          else
-            echo "No baseline found in ${base_ref}, will generate"
-            echo "baseline_exists=false" >> "$GITHUB_ENV"
-          fi
+          for row in $(gh run list --workflow perf-regression.yml --branch main --event push --limit 20 \
+              --json databaseId,headSha --jq '.[] | "\(.databaseId):\(.headSha)"'); do
+            if gh run download "${row%%:*}" --name perf-results --dir perf-artifacts/main 2>/dev/null; then
+              cp perf-artifacts/main/head.json perf-artifacts/base.json
+              echo "sha=${row#*:}" >>"$GITHUB_OUTPUT"
+              echo "run=${row%%:*}" >>"$GITHUB_OUTPUT"
+              break
+            fi
+          done
 
       # Plan 31 C7: in-process VFS dispatch overhead (< 1 us/op) and per-op
       # allocation ceilings (tests/perf-baseline.json "vfs_bench"). No
@@ -129,49 +136,23 @@ jobs:
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" \
             PERF_GATE_VFS_BENCH_ONLY=1 tests/perf-gate.sh
 
-      - name: Build HEAD binaries
+      - name: Build binaries
         if: env.CACHE_RUST_BUILD != 'true'
         run: |
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" cargo build --release -p constellation -p constellation-harness
           mkdir -p "$RUNNER_TEMP/bin"
-          cp "$RUNNER_TEMP/target-head/release/constellation" "$RUNNER_TEMP/bin/constellation-head"
+          cp "$RUNNER_TEMP/target-head/release/constellation" "$RUNNER_TEMP/bin/constellation"
           cp "$RUNNER_TEMP/target-head/release/harness" "$RUNNER_TEMP/bin/harness"
-          # Keep target-head warm for BASE when we still need to generate a baseline;
-          # otherwise free it now so the suite has disk.
-          if [ "${baseline_exists}" = "true" ]; then
-            rm -rf "$RUNNER_TEMP/target-head"
-          fi
+          # Free the disk for the suite.
+          rm -rf "$RUNNER_TEMP/target-head"
           df -h
 
-      - name: Prepare BASE worktree
-        if: env.CACHE_RUST_BUILD != 'true' && env.baseline_exists == 'false'
-        run: |
-          git fetch --no-tags --depth 1 origin "${{ steps.cfg.outputs.base_ref }}"
-          git worktree add "$RUNNER_TEMP/base" FETCH_HEAD
-
-      - name: Build BASE binaries
-        if: env.CACHE_RUST_BUILD != 'true' && env.baseline_exists == 'false'
-        run: |
-          head_sha="$(git rev-parse HEAD)"
-          base_sha="$(git -C "$RUNNER_TEMP/base" rev-parse HEAD)"
-          if [ "$head_sha" = "$base_sha" ]; then
-            echo "BASE == HEAD ($head_sha); reusing constellation-head"
-            cp "$RUNNER_TEMP/bin/constellation-head" "$RUNNER_TEMP/bin/constellation-base"
-          else
-            cd "$RUNNER_TEMP/base"
-            # Same target dir as HEAD so dependency artifacts stay warm.
-            CARGO_TARGET_DIR="$RUNNER_TEMP/target-head" cargo build --release -p constellation
-            cp "$RUNNER_TEMP/target-head/release/constellation" "$RUNNER_TEMP/bin/constellation-base"
-          fi
-          rm -rf "$RUNNER_TEMP/target-head" "$RUNNER_TEMP/base"
-          df -h
-
-      - name: Run HEAD performance suite
+      - name: Run the performance suite
         if: env.CACHE_RUST_BUILD != 'true'
         env:
           TMPDIR: /mnt/tmp
         run: |
-          mkdir -p "$TMPDIR" perf-artifacts/head-logs
+          mkdir -p "$TMPDIR" perf-artifacts/logs
           EXTRA=()
           if [ -n "${{ steps.cfg.outputs.corpus_limit }}" ]; then
             EXTRA+=(--corpus-limit "${{ steps.cfg.outputs.corpus_limit }}")
@@ -181,100 +162,67 @@ jobs:
           fi
           python3 tests/perf_regression/run_suite.py \
             --harness-bin "$RUNNER_TEMP/bin/harness" \
-            --constellation-bin "$RUNNER_TEMP/bin/constellation-head" \
+            --constellation-bin "$RUNNER_TEMP/bin/constellation" \
             --out perf-artifacts/head.json \
-            --logs-dir perf-artifacts/head-logs \
+            --logs-dir perf-artifacts/logs \
             --repetitions "${{ steps.cfg.outputs.repetitions }}" \
             --seed "${{ steps.cfg.outputs.seed }}" \
             --corpus-shape \
             "${EXTRA[@]}"
           df -h
 
-      - name: Run BASE performance suite
-        if: env.CACHE_RUST_BUILD != 'true' && env.baseline_exists == 'false'
-        env:
-          TMPDIR: /mnt/tmp
-        run: |
-          mkdir -p "$TMPDIR" perf-artifacts/base-logs
-          EXTRA=()
-          if [ -n "${{ steps.cfg.outputs.corpus_limit }}" ]; then
-            EXTRA+=(--corpus-limit "${{ steps.cfg.outputs.corpus_limit }}")
-          fi
-          if [ -n "${{ steps.cfg.outputs.max_file_bytes }}" ]; then
-            EXTRA+=(--max-file-bytes "${{ steps.cfg.outputs.max_file_bytes }}")
-          fi
-          python3 tests/perf_regression/run_suite.py \
-            --harness-bin "$RUNNER_TEMP/bin/harness" \
-            --constellation-bin "$RUNNER_TEMP/bin/constellation-base" \
-            --out perf-artifacts/base.json \
-            --logs-dir perf-artifacts/base-logs \
-            --repetitions "${{ steps.cfg.outputs.repetitions }}" \
-            --seed "${{ steps.cfg.outputs.seed }}" \
-            --corpus-shape \
-            "${EXTRA[@]}"
-          df -h
-
-      - name: Commit baseline to current branch
-        if: env.CACHE_RUST_BUILD != 'true' && success() && github.event_name == 'pull_request'
-        run: |
-          mkdir -p .perf-baselines
-          cp perf-artifacts/head.json .perf-baselines/result.json
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .perf-baselines/result.json
-
-          if git diff --staged --quiet; then
-            echo "No changes to baseline"
-          else
-            git commit -m "Update performance baseline [skip ci]"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
-
-      - name: Render markdown comparison
+      - name: Report
         if: env.CACHE_RUST_BUILD != 'true'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          BASE_RUN: ${{ steps.base.outputs.run }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          python3 tests/perf_regression/compare.py \
-            --base perf-artifacts/base.json \
-            --head perf-artifacts/head.json \
-            --out perf-artifacts/report.md
-          cat perf-artifacts/report.md >> "$GITHUB_STEP_SUMMARY"
+          server=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          meta="commit [\`${SHA::7}\`]($server/commit/$SHA) · [run]($server/actions/runs/$GITHUB_RUN_ID) · GitHub ubuntu-latest runner"
+          if [[ -n $BASE_SHA ]]; then
+            meta+=" · compared with main at [\`${BASE_SHA::7}\`]($server/actions/runs/$BASE_RUN)"
+          fi
+          base=()
+          if [[ ${{ github.event_name }} != push ]]; then
+            base=(--base perf-artifacts/base.json)
+          fi
+          python3 tests/perf_regression/report.py perf-artifacts/head.json "${base[@]}" --meta "$meta" >perf-artifacts/report.md
+          cat perf-artifacts/report.md >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Post sticky PR comment
-        if: env.CACHE_RUST_BUILD != 'true' && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+      # One comment per pull request, updated in place. Pull requests from
+      # forks get a read-only token: the job summary has the same report.
+      - name: Comment on the pull request
+        if: env.CACHE_RUST_BUILD != 'true' && always() && github.event_name == 'pull_request' && hashFiles('perf-artifacts/report.md') != ''
+        continue-on-error: true
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api "repos/$GH_REPO/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- perf-regression-report -->"))) | .id' | tail -n 1)
+          if [[ -n $id ]]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$id" -F body=@perf-artifacts/report.md >/dev/null
+          else
+            gh api --method POST "repos/$GH_REPO/issues/$PR/comments" -F body=@perf-artifacts/report.md >/dev/null
+          fi
+
+      # Results of main, for the pull requests to compare with.
+      - name: Keep the results of main
+        if: env.CACHE_RUST_BUILD != 'true' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
         with:
-          script: |
-            const fs = require('fs');
-            const marker = '<!-- perf-regression-report -->';
-            const body = marker + '\n' + fs.readFileSync('perf-artifacts/report.md', 'utf8');
-            const { owner, repo } = context.repo;
-            const issue_number = context.issue.number;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number, per_page: 100,
-            });
-            const existing = comments.find(c => c.user.type === 'Bot' && c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
-            }
+          name: perf-results
+          path: perf-artifacts/head.json
+          retention-days: 90
 
-      - name: Upload comparison report (14-day retention)
+      - name: Upload report and logs (14-day retention)
         if: env.CACHE_RUST_BUILD != 'true' && always()
         uses: actions/upload-artifact@v4
         with:
-          name: perf-report-${{ github.run_id }}
-          retention-days: 14
-          path: perf-artifacts/report.md
-
-      - name: Upload logs (14-day retention)
-        if: env.CACHE_RUST_BUILD != 'true' && always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-logs-${{ github.run_id }}
+          name: perf-${{ github.run_id }}
           retention-days: 14
           if-no-files-found: ignore
           path: |
-            perf-artifacts/base-logs/
-            perf-artifacts/head-logs/
+            perf-artifacts/head.json
+            perf-artifacts/report.md
+            perf-artifacts/logs/
