@@ -67,13 +67,24 @@ fn constellation_bin() -> PathBuf {
         })
 }
 
+/// nextest remaps binary paths when a test runs from an extracted archive
+/// (`--archive-file`/`--extract-to`): it exposes the remapped path as
+/// `NEXTEST_BIN_EXE_harness` and also rewrites `CARGO_BIN_EXE_harness` in
+/// the environment, so read those at runtime instead of trusting the path
+/// `env!` baked in at compile time.
+fn harness_bin() -> String {
+    std::env::var("NEXTEST_BIN_EXE_harness")
+        .or_else(|_| std::env::var("CARGO_BIN_EXE_harness"))
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_harness").to_string())
+}
+
 #[test]
 #[ignore = "needs docker, FUSE and a built constellation"]
 fn a_sigkilled_harness_leaves_no_daemon_and_no_mount() {
     let tmp = tempfile::tempdir().unwrap();
     let tmp_s = tmp.path().to_str().unwrap().to_string();
     let prefix = format!("htdkill-{}", std::process::id());
-    let mut harness = Command::new(env!("CARGO_BIN_EXE_harness"))
+    let mut harness = Command::new(harness_bin())
         .args(["run", "baseline"])
         .env("TMPDIR", &tmp_s)
         .env("CONSTELLATION_BIN", constellation_bin())

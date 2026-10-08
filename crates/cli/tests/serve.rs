@@ -19,10 +19,22 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_constellation");
+/// nextest remaps binary paths when a test runs from an extracted archive
+/// (`--archive-file`/`--extract-to`): it exposes the remapped path as
+/// `NEXTEST_BIN_EXE_constellation` and also rewrites `CARGO_BIN_EXE_constellation`
+/// in the environment, so read those at runtime instead of trusting the
+/// path `env!` baked in at compile time.
+fn bin() -> &'static str {
+    static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        std::env::var("NEXTEST_BIN_EXE_constellation")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_constellation"))
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_constellation").to_string())
+    })
+}
 
 fn ping(socket: &Path) -> bool {
-    Command::new(BIN)
+    Command::new(bin())
         .args(["control-relay", "--ping", "--socket"])
         .arg(socket)
         .stdout(Stdio::null())
@@ -46,7 +58,7 @@ fn serve_answers_the_control_protocol_through_a_relay() {
     let dir = tempfile::tempdir().unwrap();
     let s3 = dir.path().join("s3");
     let socket = dir.path().join("sockets/pool/control.sock");
-    let child = Command::new(BIN)
+    let child = Command::new(bin())
         .arg("serve")
         .arg("--s3")
         .arg(&s3)
@@ -74,7 +86,7 @@ fn serve_answers_the_control_protocol_through_a_relay() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut relay = tokio::process::Command::new(BIN)
+        let mut relay = tokio::process::Command::new(bin())
             .args(["control-relay", "--socket"])
             .arg(&socket)
             .stdin(Stdio::piped())
@@ -195,7 +207,7 @@ fn serve_await_unlock_takes_its_credentials_from_the_control_socket() {
     let url = s3.display().to_string();
     let socket = dir.path().join("sockets/pool/control.sock");
     let state = dir.path().join("state");
-    let child = Command::new(BIN)
+    let child = Command::new(bin())
         .arg("serve")
         .arg("--s3")
         .arg(&s3)
@@ -352,7 +364,7 @@ fn awaiting_serve_env(
     extra: &[&str],
     envs: &[(&str, &Path)],
 ) -> Daemon {
-    let child = Command::new(BIN)
+    let child = Command::new(bin())
         .arg("serve")
         .arg("--s3")
         .arg(s3)
@@ -567,7 +579,7 @@ fn serve_with_a_preopened_view_in(
         .map(|p| ("CONSTELLATION_CONTROL_POLICY", p))
         .into_iter()
         .collect();
-    let child = Command::new(BIN)
+    let child = Command::new(bin())
         .arg("serve")
         .arg("--s3")
         .arg(dir.path().join("s3"))
@@ -812,7 +824,7 @@ fn standby_with_env(
 ) -> (Daemon, std::path::PathBuf, std::path::PathBuf) {
     let socket = dir.join(format!("sockets/unit/control-{name}.sock"));
     let handoff = dir.join(format!("sockets/unit/handoff-{name}.sock"));
-    let child = Command::new(BIN)
+    let child = Command::new(bin())
         .arg("serve")
         .arg("--s3")
         .arg(dir.join("s3"))

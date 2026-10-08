@@ -16,7 +16,19 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_constellation");
+/// nextest remaps binary paths when a test runs from an extracted archive
+/// (`--archive-file`/`--extract-to`): it exposes the remapped path as
+/// `NEXTEST_BIN_EXE_constellation` and also rewrites `CARGO_BIN_EXE_constellation`
+/// in the environment, so read those at runtime instead of trusting the
+/// path `env!` baked in at compile time.
+fn bin() -> &'static str {
+    static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        std::env::var("NEXTEST_BIN_EXE_constellation")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_constellation"))
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_constellation").to_string())
+    })
+}
 
 fn wait_until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
     let t = Instant::now();
@@ -64,12 +76,12 @@ fn start_daemon(dir: &Path) -> (std::process::Child, std::path::PathBuf, std::pa
     );
     std::fs::create_dir_all(&mnt).unwrap();
     std::fs::create_dir_all(&state).unwrap();
-    let st = Command::new(BIN)
+    let st = Command::new(bin())
         .args(["fs", "create", "reaper-test", "--s3", &s3])
         .status()
         .unwrap();
     assert!(st.success(), "fs create: {st}");
-    let daemon = Command::new(BIN)
+    let daemon = Command::new(bin())
         .args(["mount", "/"])
         .arg(&mnt)
         .args(["--s3", &s3, "--state-dir"])

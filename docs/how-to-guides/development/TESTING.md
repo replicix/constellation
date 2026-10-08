@@ -180,10 +180,16 @@ A run passes when all of these hold:
   other node's file.
 - The spool drains (`journal_backlog` and `pending_uploads` reach 0).
 - With snapshots on, `snapshot space --verify` reports no mismatch.
-- No kernel message since the start names stress-ng or a hung task. The
-  log is read with `dmesg`, or `journalctl -k` when `dmesg` is
-  restricted. If neither is readable the check is skipped, and the run
-  says so.
+- No kernel message since the start reports a hung task (`blocked for
+  more than`/`hung_task`, whichever process it names — this is
+  process-name-agnostic, so a stall in our FUSE path is still caught). A
+  bare mention of stress-ng or FUSE is printed but does not fail the run:
+  the kernel logs routine notices against stress-ng's own threads
+  regardless of the filesystem under them (e.g. the LOCK_MAND deprecation
+  notice its `flock` stressor trips on every run), and a FUSE message may
+  belong to another agent's mount on the same host. The log is read with
+  `dmesg`, or `journalctl -k` when `dmesg` is restricted. If neither is
+  readable the check is skipped, and the run says so.
 
 Each run prints a table of stressor, verdict, bogo-ops and note.
 `STRESS_NG_FS_REPORT=<file>` appends it as TSV (scenario, transport, node,

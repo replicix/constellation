@@ -112,7 +112,7 @@ jobs:
           name: nextest-archive
           path: target
       - run: |
-          cargo nextest run --archive-file target/nextest-archive.tar.zst \
+          cargo nextest run --no-fail-fast --archive-file target/nextest-archive.tar.zst \
             --partition count:${{ matrix.partition }}/6
 
   # nextest does not run doctests; kept in its own job since it is a real
@@ -185,8 +185,22 @@ jobs:
         run: docker compose logs floci || true
 
   harness:
-    name: Fault injection (toxiproxy + model oracle)
+    name: Fault injection (toxiproxy + model oracle, shard ${{ matrix.shard }}/5)
     needs: build
+    # 5-way shard of the scenario list (`harness run --shard i/5`, round-robin
+    # by selection order): unsharded, this lane's ~200 scenarios summed to
+    # ~105 min on a hosted runner (the pipeline's critical path). Round-robin
+    # spreads out the handful of scenario clusters that run long
+    # back-to-back (snapsched's four, git-under-flock's six, …) across
+    # different shards rather than piling them into one; replaying that
+    # run's per-scenario timings through `idx % 5` puts the heaviest shard
+    # at ~23 min, comfortable headroom under the ~30 min target for runner
+    # variance. Bump both this list and the /5 below together to retune
+    # from observed Actions wall time, not from a hunch.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -221,8 +235,10 @@ jobs:
       # starve the lease holder's heartbeat past the backup's 1.5 s silence
       # bound, a legitimate takeover under real contention, not a bug); it
       # runs in the nightly lane instead (docs/plans/v1/PROGRESS.md).
-      - name: Run all fault-injection scenarios
-        run: target/release/harness run --exclude snapsched-write-overhead
+      - name: Run this shard's fault-injection scenarios
+        run: |
+          target/release/harness run --exclude snapsched-write-overhead \
+            --shard ${{ matrix.shard }}/5
 
   # Plan 38 §6/Z2c: the transport matrix's `dev-fuse` leg on every push,
   # plus the smoke test on the shipped default (`auto`) and on `dev-fuse`.

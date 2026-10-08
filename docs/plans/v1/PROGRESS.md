@@ -46065,3 +46065,112 @@ device attached).
   the old `test` job; renaming it away (now `unit-test-archive` +
   `unit-test (partition i/6)` + `doctest`) needs a matching update there,
   outside this repo.
+
+## Fix: the three failures `ci-shared-build` left behind — nextest's remapped binary paths, a false-positive kernel-message check, and the fault lane's 106 min critical path (`ci-round3`, 2026-10-08)
+
+### Cause
+
+Run 37786675883 (logs in `/tmp/ci-logs/r2/`) showed three separate
+problems, all downstream of or adjacent to the shared-build change:
+
+1. All 6 `unit-test` partitions failed. `crates/cli/tests/serve.rs` and
+   `crates/cli/tests/reaper.rs` spawn `constellation` via `const BIN: &str
+   = env!("CARGO_BIN_EXE_constellation")`; `crates/harness/tests/teardown.rs`
+   does the same for `harness`. `env!` bakes in the path Cargo used at
+   *compile* time (on `unit-test-archive`'s runner); nextest's archive
+   extracts the binaries to a fresh path on each `unit-test` partition's
+   own runner, so the baked-in path (ENOENT at serve.rs:63/221/374) no
+   longer exists. Each partition also stopped at its first failure
+   (`cargo nextest run` fails fast by default), so a partition's log
+   showed only one failure even when more tests would have hit the same
+   bug.
+2. The `harness` (fault injection) lane's `stress-ng-fs` scenario failed:
+   every stressor passed (38 passed, 3 skipped, 1 baselined, 0 failed —
+   `filename` is a known, baselined mismatch between stress-ng's
+   non-UTF-8 probe and the vfs's `NamePolicy::linux`), but
+   `kernel_messages` still failed the run over one `dmesg` line:
+   `stress-ng-flock(66544): Attempt to set a LOCK_MAND lock via flock(2).
+   This support has been removed and the request ignored.` That is the
+   kernel's own `LOCK_MAND`-removal notice, logged because stress-ng's
+   `flock` stressor (which passed) exercises the now-ignored flag on
+   every run — unrelated to our FUSE path, our daemon, or a hang. The
+   check's `l.contains("stress-ng")` branch flagged it anyway: it fails
+   on *any* kernel line naming the process, not just a hang or crash.
+3. The `harness` lane ran all ~200 scenarios serially and took 106 min
+   on the hosted runner (confirmed against the log: scenario durations
+   alone summed to 6314 s) — the pipeline's critical path, well past
+   every other job.
+
+### What changed
+
+1. **Binary paths read at runtime.** `serve.rs` and `reaper.rs` each grew
+   a `bin() -> &'static str` (`OnceLock`-cached) that tries
+   `NEXTEST_BIN_EXE_constellation`, then `CARGO_BIN_EXE_constellation`
+   (nextest overwrites this one too, so either env var has the
+   extracted-archive path at runtime; the compile-time `env!` literal is
+   only the last-resort fallback for a plain, non-nextest invocation
+   where neither is set) — same idea for `teardown.rs`'s
+   `harness_bin()`/`CARGO_BIN_EXE_harness`. Grepped the workspace for
+   `CARGO_BIN_EXE` and `target/debug|release` first: every other hit
+   (`crates/harness/src/{client,k8s,main,scenarios,smoke}.rs`,
+   `scenarios/{confinement,handover}.rs`) already reads
+   `CARGO_TARGET_DIR` via `std::env::var_os` at runtime, not a
+   compile-time macro, so needed no change. `ci.yml`'s `unit-test` step
+   also gained `--no-fail-fast`, so a partition now reports every failing
+   test instead of stopping at the first.
+2. **`kernel_messages` (`crates/harness/src/scenarios/stressfs.rs`)
+   narrowed to the hung-task detector's own messages**
+   (`blocked for more than`/`hung_task` — process-name-agnostic, so a
+   real stall in our FUSE path is still caught whichever thread it
+   names, stress-ng's or our daemon's). A bare mention of `stress-ng` or
+   `fuse` is now printed (visible, not hidden) but no longer fails the
+   run on its own. Updated the scenario's module doc comment and
+   `docs/how-to-guides/development/TESTING.md`'s stress-ng-fs rule to
+   match.
+3. **`harness` sharded 5 ways** (`strategy.matrix.shard: [1..5]`,
+   `harness run --shard ${{ matrix.shard }}/5`, each shard still
+   installing/caching its own native S3 test servers and downloading the
+   shared build). `Shard::partition` (`crates/harness/src/results.rs`)
+   is a round-robin by selection order (`idx % n`), not duration-aware;
+   replaying the failed run's 223 scenario entries (including the
+   near-zero-duration skips) through `idx % 5` puts the heaviest shard
+   at ~23 min — comfortable under the ~30 min target, since round-robin
+   already spreads the handful of scenarios that run long back-to-back
+   (snapsched's four, git-under-flock's six, …) across different shards
+   rather than piling them into one.
+
+### Gates
+
+`cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D
+warnings` both clean. `python3 -c "import yaml; yaml.safe_load(...)"` and
+`rhysd/actionlint` (docker) clean on `ci.yml` (same pre-existing
+`nightly.yml` findings as the prior entry: unknown self-hosted runner
+labels, one shellcheck style nit — untouched by this change). Built a
+`cargo nextest archive -p constellation -p constellation-harness` inside
+`rust:1-bookworm` (a throwaway container, `cargo-nextest` installed only
+inside it, nothing added to the host), extracted it to a different path
+(`--extract-to`) in the same container, and ran the previously-failing
+tests from there: `cargo nextest run --no-fail-fast --archive-file …
+--extract-to /extract -E 'test(serve) + test(reaper)'` — 13/13 passed,
+including the three that had failed on the hosted runner
+(`serve_answers_the_control_protocol_through_a_relay`,
+`serve_await_unlock_takes_its_credentials_from_the_control_socket`,
+`serve_refuses_a_wrong_passphrase_at_the_gate`). `cargo test -p
+constellation-harness --lib` (`stressfs::` and `results::` modules)
+passed, including the existing `Shard` partition tests.
+
+### Open
+
+- The fault lane's native-S3-servers cache (`actions/cache`, keyed only
+  by the install script's hash) now has 5 parallel jobs racing to
+  populate it on a cache miss; `actions/cache` tolerates concurrent
+  saves to the same key (last write wins, no job failure), and every
+  shard after the first push sees a hit, so left as is.
+- The 5-way split is round-robin by registration order, not a real
+  duration-aware bin-packer; if `scenarios.rs` gains a new slow scenario
+  next to others, the heaviest shard could drift above the ~23 min
+  estimate well before 30 min, same follow-up note as `N = 6` for
+  `unit-test`: retune from observed Actions wall time.
+- Not re-run end to end on a hosted runner (no access from this
+  sandbox); the archive-extraction and `kernel_messages`/`Shard` unit
+  tests above are the closest local proxy.
