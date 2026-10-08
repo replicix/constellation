@@ -106,6 +106,17 @@ const EXCLUDE: &str = include_str!("../../../../tests/stress-ng-exclude.txt");
 /// Reproducible failures that are known semantic gaps, with a reason each.
 const BASELINE: &str = include_str!("../../../../tests/stress-ng-baseline.txt");
 
+/// Stressors the exclude/baseline lists reference that some installed
+/// stress-ng does not compile in yet (e.g. `statmount`, over the Linux 6.8
+/// `statmount`(2)/`listmount`(2) syscalls: an older build's package predates
+/// them). Absent from `--class filesystem?` only for that reason, not
+/// because the name is a mistake — the stale check below tolerates exactly
+/// these, and nothing else, so a real typo still fails it. Add a name here
+/// only after checking it against the stress-ng source (not merely because
+/// a CI run reported it missing): the point is telling a version gap apart
+/// from a mistake, not widening what the check accepts.
+const VERSION_GATED: &[&str] = &["rofs", "statmount"];
+
 /// How long past its own `--timeout` stress-ng may take to stop its
 /// stressors and report. Generous: a stressor ends its current op first,
 /// and `copy-file`/`hdd` close (flush) large files.
@@ -227,22 +238,49 @@ fn effective_exclude(listed: &BTreeMap<String, String>, root: bool) -> BTreeMap<
         .collect()
 }
 
+/// Names in `listed` (exclude list) or `baseline` that `class` (this
+/// stress-ng's `--class filesystem?`) does not have: split into genuinely
+/// stale entries (a mistake, must fail) and ones [`VERSION_GATED`] excuses
+/// (this stress-ng predates them, not a mistake).
+fn missing_from_class<'a>(
+    listed: &'a BTreeMap<String, String>,
+    baseline: &'a BTreeMap<String, String>,
+    class: &BTreeSet<String>,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let names = listed
+        .keys()
+        .map(|s| s.strip_suffix("@root").unwrap_or(s))
+        .chain(baseline.keys().map(String::as_str))
+        .filter(|s| !class.contains(*s));
+    let mut stale = Vec::new();
+    let mut gated = Vec::new();
+    for s in names {
+        if VERSION_GATED.contains(&s) {
+            gated.push(s);
+        } else {
+            stale.push(s);
+        }
+    }
+    (stale, gated)
+}
+
 fn plan() -> Result<Plan> {
     let listed = list("STRESS_NG_FS_EXCLUDE", EXCLUDE)?;
     // SAFETY: geteuid(2) cannot fail.
     let root = unsafe { libc::geteuid() } == 0;
     let baseline = list("STRESS_NG_FS_BASELINE", BASELINE)?;
     let class = filesystem_class()?;
-    let stale: Vec<&str> = listed
-        .keys()
-        .map(|s| s.strip_suffix("@root").unwrap_or(s))
-        .chain(baseline.keys().map(String::as_str))
-        .filter(|s| !class.contains(*s))
-        .collect();
+    let (stale, gated) = missing_from_class(&listed, &baseline, &class);
     ensure!(
         stale.is_empty(),
         "listed stressors this stress-ng does not have (stale list entries): {stale:?}"
     );
+    if !gated.is_empty() {
+        eprintln!(
+            "    stress-ng-fs: this stress-ng does not have {gated:?} yet (version-gated, not a \
+             stale entry)"
+        );
+    }
     let both: Vec<&String> = listed
         .keys()
         .filter(|s| baseline.contains_key(s.strip_suffix("@root").unwrap_or(s)))
@@ -1342,6 +1380,24 @@ mod tests {
         assert_eq!(c.len(), 3);
         assert!(c.contains("dentry"));
         assert!(parse_class("nothing here").is_err());
+    }
+
+    #[test]
+    fn version_gated_names_missing_from_an_older_stress_ng_are_not_stale() {
+        let listed =
+            parse_list("rofs # REASON: x\nstatmount # REASON: y\ntypoed # REASON: z\n").unwrap();
+        let baseline = parse_list("alsotypo # REASON: w\n").unwrap();
+        // An older stress-ng: no rofs, statmount, or (of course) the typos.
+        let class: BTreeSet<String> = ["dentry", "xattr"].map(String::from).into();
+        let (stale, gated) = missing_from_class(&listed, &baseline, &class);
+        assert_eq!(stale, vec!["typoed", "alsotypo"]);
+        assert!(gated.contains(&"rofs") && gated.contains(&"statmount"));
+        // A current stress-ng that does have them: no longer gated, and a
+        // real mistake still fails just as it would on the older one.
+        let class: BTreeSet<String> = ["dentry", "rofs", "statmount"].map(String::from).into();
+        let (stale, gated) = missing_from_class(&listed, &baseline, &class);
+        assert_eq!(stale, vec!["typoed", "alsotypo"]);
+        assert!(gated.is_empty());
     }
 
     const LOG: &str = "\

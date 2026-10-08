@@ -4,7 +4,7 @@
 //!
 //!   harness list
 //!   harness run [scenario ...] [--seed N] [--shard i/n] [--results-json PATH [--lane NAME]]
-//!               [--s3-backend docker|process] [--frontend fuse]
+//!               [--s3-backend docker|process] [--frontend fuse] [--exclude NAME]
 //!   harness smoke [BACKEND]
 //!   harness interop write|verify --bucket-dir DIR
 //!   harness k8s-scenario <name>...|--all|--parity [--kubeconfig PATH] [--chart DIR]
@@ -86,6 +86,13 @@ enum Command {
         /// checker's wildcard for it) without a second frontend.
         #[arg(long = "without-cap", value_name = "CAP")]
         without_caps: Vec<caps::Cap>,
+        /// Skip a scenario by name (repeatable), reported SKIPPED with the
+        /// reason "excluded for this run (--exclude)" — for a scenario this
+        /// host is unsuited to (not a missing capability or tool), e.g. a
+        /// throughput measurement a shared, small runner's own load would
+        /// fail outright rather than just make noisy.
+        #[arg(long = "exclude", value_name = "NAME")]
+        exclude: Vec<String>,
     },
     /// Plan 37 §12: scenarios driven through a kind cluster running the
     /// CSI driver (`kubectl`/`helm`; see the `k8s` module docs). Reuses
@@ -332,6 +339,7 @@ fn main() -> Result<()> {
             s3_backend,
             frontend,
             without_caps,
+            exclude,
         } => run(RunOpts {
             names,
             seed,
@@ -343,6 +351,7 @@ fn main() -> Result<()> {
             s3_backend,
             frontend,
             without_caps,
+            exclude,
         }),
         Command::K8sScenario { list: true, .. } => {
             for s in k8s::K8S_SCENARIOS {
@@ -533,6 +542,7 @@ struct RunOpts {
     s3_backend: Option<S3Backend>,
     frontend: String,
     without_caps: Vec<caps::Cap>,
+    exclude: Vec<String>,
 }
 
 fn run(opts: RunOpts) -> Result<()> {
@@ -547,7 +557,17 @@ fn run(opts: RunOpts) -> Result<()> {
         s3_backend,
         frontend,
         without_caps,
+        exclude,
     } = opts;
+    for n in &exclude {
+        if !SCENARIOS
+            .iter()
+            .chain(scenarios::KNOWN_BUG_REPROS.iter())
+            .any(|s| s.name == n)
+        {
+            bail!("unknown scenario {n:?} in --exclude (try `harness list`)");
+        }
+    }
     results::check_frontend(&frontend)?;
     // Before any scenario: a census that cannot be written fails the run
     // now, not as an empty file noticed after an hour of scenarios.
@@ -596,6 +616,13 @@ fn run(opts: RunOpts) -> Result<()> {
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
     for s in selected {
+        if exclude.iter().any(|e| e == s.name) {
+            let reason = "excluded for this run (--exclude)";
+            eprintln!("=== {} SKIPPED ({reason})", s.name);
+            report.push(s.name, Outcome::Skipped, 0.0, Some(reason.to_string()));
+            skipped.push(s.name);
+            continue;
+        }
         // A capability the frontend lacks is a skip that names it (the
         // parity checker lets those differ across lanes; a missing tool
         // it does not).

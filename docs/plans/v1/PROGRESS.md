@@ -45860,3 +45860,84 @@ CI's `cross-check` job (`tools/check-cross.sh`) was red. Of the five FAILs in th
 ### Open
 
 - `constellation-harness` on macOS (21 errors: io_uring/seccomp/CPU-affinity/`fallocate`/`prctl`/xattr/`F_SETLK`) stays known-failure debt; plan 31's own notes already defer it to a future move of the harness's host calls behind `constellation-platform` ("C6"), out of scope here.
+
+## Fix: the "FUSE transport matrix" and "Fault injection" CI jobs on a hosted runner (`ci-fault-lane`, 2026-10-08)
+
+Four independent failures on `ubuntu-latest` (4 vCPU, kernel 6.17 azure, no
+io_uring FUSE, not root), none seen on a dev box with more cores or a
+docker-shelled S3.
+
+1. **`transport-dev-fuse`**: `tests/smoke.sh` failed with "constellation
+   binary not found at target/debug/constellation" — the job builds
+   `--release` only, and the step ran `tests/smoke.sh` without
+   `CONSTELLATION_BIN`, so the harness's `smoke` (`crates/harness/src/smoke.rs`
+   `bin()`) fell back to its `debug` default. Fixed by passing
+   `CONSTELLATION_BIN=target/release/constellation` alongside
+   `CONSTELLATION_HARNESS_BIN` on both smoke invocations
+   (`.github/workflows/ci.yml`). The following `make transport-matrix` step
+   needed nothing: the Makefile already exports `CONSTELLATION_BIN` to the
+   release path by default.
+
+2. **`csi-credential-revocation`** (plan 37 K6a): always needs its own
+   native, SigV4-checking versitygw (floci accepts any key pair, so only a
+   real signature check can show a revoked key refused) — not gated by
+   `--s3-backend`, so installing it only for a `process`-backend lane (as
+   `nightly.yml`'s `harness-lanes-linux` already does) does not reach it.
+   Installed in `ci.yml`'s `harness` job instead, via the existing
+   `tests/ci/install-native-s3.sh` (pinned versions, `go install` fallback;
+   GitHub-hosted runners carry a Go toolchain), cached by
+   `hashFiles('tests/ci/install-native-s3.sh')` under `~/.local/bin` (where
+   `s3env::find_bin` already looks, so no `PATH` step is needed). Verified
+   locally with a scoped `DEST_DIR`/`GOPATH`/`GOCACHE` under `/tmp` (not the
+   real `~/.local/bin`): `go install` resolved and built both binaries, and
+   `csi-credential-revocation` then passed pointed at them.
+
+3. **`stress-ng-fs`**: "listed stressors this stress-ng does not have
+   (stale list entries): rofs, statmount" — `tests/stress-ng-exclude.txt`
+   lists two real but recent stress-ng stressors (statmount, over the Linux
+   6.8 `statmount`(2)/`listmount`(2) syscalls) that an older packaged
+   stress-ng (confirmed here too: Ubuntu noble's `stress-ng` 0.17.06-1build1
+   has neither name anywhere in the binary) does not compile in, which
+   `plan()`'s stale check could not tell apart from an actual typo. Fixed
+   with a small, explicitly curated `VERSION_GATED` list
+   (`crates/harness/src/scenarios/stressfs.rs`): a name missing from
+   `--class filesystem?` is tolerated (reported, not failed) only if it is
+   in `VERSION_GATED`; anything else missing still fails the stale check
+   exactly as before. New unit test
+   `version_gated_names_missing_from_an_older_stress_ng_are_not_stale`; ran
+   `stress-ng-fs` end to end on this box's own (equally old) stress-ng: the
+   gated note prints, and the scenario passes.
+
+4. **`snapsched-write-overhead`**: "the root lease moved during fio run
+   run2-on: (1, 1) -> (2, 1)". Reproduced under `taskset -c 0-3`
+   (`CHAOS_KEEP_TMP=1`, private docker prefix): seed 42 did not lose the
+   lease outright, but `run2-on`'s throughput collapsed to 16.4 MB/s against
+   62–68 MB/s for every other run — the same contention, short of the
+   trigger by luck alone. Not a product bug and not 17ee59c (which only
+   makes a renewal fire *earlier*, so it reduces this risk, not raises it):
+   the scenario's own comment on `pin_lease` already documents this class of
+   failure for the tree-write phase ("a loaded host... the backup sealed its
+   epoch and took over" at the 1.5 s `backup_takeover_ms` silence bound, M9's
+   deliberate fast-takeover for availability) but only guards against it
+   there, not during the fio runs the scenario measures. A 100k-file tree
+   write + sequential fio + an active snapshot policy is enough to starve
+   the lease holder's heartbeat past 1.5 s on 4 vCPUs; weakening the takeover
+   bound to accommodate one throughput measurement is the wrong trade.
+   Moved out of the per-PR lane: added `harness run --exclude NAME`
+   (repeatable; reported `SKIPPED (excluded for this run (--exclude))`,
+   validated against the catalog like a scenario name) and excluded
+   `snapsched-write-overhead` in `ci.yml`'s `harness` job only; nightly's
+   unfiltered `harness run` keeps running it.
+
+### Gates
+
+`cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --
+-D warnings` clean; `cargo test -p constellation-harness --lib` 97 passed,
+0 failed; `python3 -c "import yaml; yaml.safe_load(...)"` on both
+`ci.yml` and `nightly.yml`; `tests/smoke.sh` with
+`CONSTELLATION_BIN=target/release/constellation` PASSED;
+`csi-credential-revocation` and `stress-ng-fs` PASSED against this box's
+own (old) stress-ng and a scoped native-S3 install; `snapsched-write-overhead`
+reproduced once under `taskset -c 0-3` (no crash; confirmed as host-load
+sensitive, not fixed in product code) and confirmed `SKIPPED` under
+`--exclude` alongside a real scenario.
