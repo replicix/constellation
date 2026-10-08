@@ -45835,3 +45835,28 @@ The lost grants are the known class of the crash and backup-failover configs (a 
 
 - `locks-released-delegated` keeps its 5 by-design fenced seeds in 0..6000.
 - `flex*`, `long-*` and `stress-ng-fs-nodes` were not run (not in the gates). The change moves every lease holder's poll timing, so every config sees it; the 30 lock configs and the authority suite covered it here.
+
+## Fix: `make check-cross` failed — a new Windows regression plus two fixable cross-target gaps (`ci-cross-check`, 2026-10-08)
+
+CI's `cross-check` job (`tools/check-cross.sh`) was red. Of the five FAILs in the job log, only one was a real, unlisted regression; the other four were pre-existing debt already named in `tools/check-cross-known-failures.txt` (so they alone did not fail the gate), but two of those were worth fixing for real while in there.
+
+- **The actual regression: `constellation-pod-load` on `x86_64-pc-windows-gnu`** (`cannot find unix in os`, `src/lib.rs`'s `std::os::unix::fs::FileExt`). Not a new bug in pod-load — it was never a Windows-portable crate: its own `Cargo.toml` description says it is a Kubernetes-pod-only binary for the harness's k8s scenarios (plan 37 K5b), and like `constellation-csi` it is not a `default-members` entry. `tools/check-cross.sh`'s `lib_crates()` excluded `csi` for exactly that reason but had never excluded `pod-load`. Fixed by adding it to the exclusion list (with `constellation-chaos`, below), not by chasing Windows-only POSIX code in a binary that will never run there.
+- **`constellation-chaos` on the same target** (`std::os::unix::fs::{MetadataExt, PermissionsExt}` in `converge.rs`/`op.rs`) was already a known failure, but on inspection it is the same shape of problem: chaos is a multi-node consistency *checker* whose job is literally testing POSIX permissions/symlinks, not a product library crate. Moved it from known-failures into the same exclusion list as pod-load, csi, cli, harness and frontend-fuse — paying down the debt instead of re-documenting it.
+- **`constellation-engine` on Windows** (`staging.rs`'s `std::os::unix::fs::FileExt::{write_at,read_exact_at}`, and `view/zero_copy.rs`'s `MetadataExt::nlink`) was also known debt, but engine is a real product crate meant to build on Windows (plan 35's WinFsp frontend), so this one got an actual portable implementation rather than an exclusion: `file_write_at`/`file_read_exact_at` dispatch to `std::os::windows::fs::FileExt::{seek_write,seek_read}` under `cfg(windows)` (with a hand-rolled exact-read loop mirroring std's own unix impl, since Windows has no `read_exact_at` equivalent); the zero-copy handle's "still linked" check (unix-only `nlink`) falls back to `false` on non-unix, which only forces a reopen — safe, since zero-copy is Linux-io_uring-only to begin with. Removed from known-failures: it now genuinely passes.
+- **`constellation-harness` on macOS** (`sandbox.rs`'s `libc::MSG_CMSG_CLOEXEC`, used by the `fusermount3` relay's `recvmsg`) got the same portable-fallback treatment already used next door in `crates/control/src/transport/unix.rs`: the flag is Linux/Android-only, so non-Linux unix targets pass `0` and apply `FD_CLOEXEC` via `fcntl` after the call. The crate still fails on macOS for unrelated, pre-existing reasons (io_uring/seccomp/CPU-affinity/`fallocate`/`prctl`/xattr-arity/`F_SETLK` typing — 21 errors, all Linux-sandboxing internals plan 31's known-failures entry already defers to a future "C6" move behind the platform crate); updated that entry's count/description rather than leaving it stale.
+- **`constellation` (cli) on macOS** (`main.rs`'s `xattr_set`/`xattr_get`/`xattr_remove`) was a real, fixable arity mismatch: macOS's `setxattr`/`getxattr`/`removexattr` take two (resp. one) more arguments than Linux's (a resource-fork `position` and an `options` flag). Added `cfg(target_os = "macos")` call variants with `position = 0`, `options = 0` (follow symlinks, matching the existing Linux behavior, which also follows symlinks). Removed from known-failures: cli now passes on macOS.
+
+### Gates
+
+| Gate | Result |
+|---|---|
+| `tools/check-cross.sh` (`CARGO_TARGET_DIR=/tmp/constellation-lb/target-ci`) | OK — only the one remaining, documented `constellation-harness`/macOS known failure |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo test -p constellation-engine --lib` (staging + zero_copy) | 13 + 13 passed |
+| `cargo test -p constellation-harness --lib` | 96 passed |
+| `cargo test -p constellation` | 59 + 17 passed, 3 ignored (need FUSE) |
+
+### Open
+
+- `constellation-harness` on macOS (21 errors: io_uring/seccomp/CPU-affinity/`fallocate`/`prctl`/xattr/`F_SETLK`) stays known-failure debt; plan 31's own notes already defer it to a future move of the harness's host calls behind `constellation-platform` ("C6"), out of scope here.

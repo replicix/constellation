@@ -49,19 +49,26 @@ zig_target() {
     esac
 }
 
-# Library crates: workspace members minus cli, harness, frontend-fuse, csi
-# and bench/*. constellation-frontend-fuse is the Linux (FreeBSD-ready) FUSE
-# frontend, a platform frontend like cli's binary: FUSE does not exist on
-# Windows (plan 35's frontend is WinFsp), so it is not a Windows library
-# crate. It is still type-checked for macOS by the darwin workspace row.
-# constellation-csi (plan 37) is a Kubernetes-only driver binary, not a
-# default workspace member (so the darwin row's plain `cargo check`, which
-# only reaches default-members, already skips it) and excluded here too.
+# Library crates: workspace members minus cli, harness, frontend-fuse, csi,
+# chaos, pod-load and bench/*. constellation-frontend-fuse is the Linux
+# (FreeBSD-ready) FUSE frontend, a platform frontend like cli's binary: FUSE
+# does not exist on Windows (plan 35's frontend is WinFsp), so it is not a
+# Windows library crate. It is still type-checked for macOS by the darwin
+# workspace row. constellation-csi (plan 37) is a Kubernetes-only driver
+# binary, not a default workspace member (so the darwin row's plain
+# `cargo check`, which only reaches default-members, already skips it) and
+# excluded here too. constellation-chaos (the multi-node consistency
+# checker) and constellation-pod-load (plan 37 K5b's `upgrade-under-load`
+# pod binary, also not a default workspace member) exercise POSIX-only
+# semantics (permissions, symlinks, `pread`/`pwrite`) as their actual job,
+# not incidentally: they are harness-adjacent test tooling, not product
+# library crates, so they are excluded here the same way constellation-cli
+# and constellation-harness are.
 lib_crates() {
     sed -n '/^members *= *\[/,/^\]/p' Cargo.toml | grep -o '"[^"]*"' | tr -d '"' |
         while read -r dir; do
             case "$dir" in
-            crates/cli | crates/harness | crates/frontend-fuse | crates/csi | bench/*) continue ;;
+            crates/cli | crates/harness | crates/frontend-fuse | crates/csi | crates/chaos | crates/pod-load | bench/*) continue ;;
             esac
             sed -n 's/^name *= *"\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1
         done

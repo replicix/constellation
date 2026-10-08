@@ -4,22 +4,11 @@
 # that fixes it. Two-way: a listed entry that now passes makes
 # tools/check-cross.sh fail with "STALE" (like the xfstests baseline).
 
-# macOS: cli's Linux-only `setxattr`/`getxattr`/`removexattr` arities in
-# main.rs's `xattr` subcommand (4 errors after plan 31 C4a; 33 after C2, 29
-# after C3 — the other 25 were the FUSE adapter's, which C4a rebuilt as
-# constellation-frontend-fuse and which now compiles for macOS).
-aarch64-apple-darwin constellation
-# macOS: the harness's own Linux-only calls (`libc::fallocate`, the
-# `setxattr`/`getxattr` arities in scenarios.rs; 8 errors). Reached since
+# macOS: the harness's own Linux-only calls (seccomp/`io_uring_setup`
+# denial, CPU-affinity scheduling, `libc::fallocate`/`prctl`, the
+# `setxattr`/`getxattr` arities and `F_SETLK`/`F_WRLCK` typing in
+# scenarios.rs; 21 errors as of plan 38's sandboxing work). Reached since
 # plan 31 C2 made constellation-chaos compile for macOS (its
 # `posix_fadvise` went behind constellation-platform); C6 moves the
 # harness's host calls behind the platform crate.
 aarch64-apple-darwin constellation-harness
-
-# Windows: the engine's `staging.rs` writes staging files with
-# `std::os::unix::fs::FileExt` (`read_at`/`write_at`). Engine code itself has
-# no `libc`/`fuser` since C3; its control protocol (constellation-control,
-# which replaced constellation-api in plan 31 C5) is clean for Windows.
-x86_64-pc-windows-gnu constellation-engine
-# Windows: `std::os::unix` (permissions, symlinks) in the checker.
-x86_64-pc-windows-gnu constellation-chaos

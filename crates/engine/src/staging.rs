@@ -29,10 +29,59 @@
 
 use constellation_fs_core::Ino;
 use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// `pwrite`, portable: unix's `write_at` directly; Windows has the same
+/// contract under a different name (`seek_write`, `std::os::windows::fs`).
+fn file_write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+    }
+}
+
+/// `pread` into a full buffer, portable: unix's `read_exact_at` directly;
+/// Windows has no equivalent, so loop `seek_read` the way the standard
+/// library's own unix impl does, including its EOF/`Interrupted` handling.
+fn file_read_exact_at(
+    file: &File,
+    #[cfg_attr(unix, allow(unused_mut))] mut buf: &mut [u8],
+    #[cfg_attr(unix, allow(unused_mut))] mut offset: u64,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        while !buf.is_empty() {
+            match std::os::windows::fs::FileExt::seek_read(file, buf, offset) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !buf.is_empty() {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StagingError {
@@ -311,14 +360,14 @@ impl Staging {
             self.reserved += growth;
             self.file_len = end;
         }
-        self.file.write_at(buf, offset)?;
+        file_write_at(&self.file, buf, offset)?;
         Ok(())
     }
 
     /// `pread`. Callers only read ranges within `file_len`; holes there
     /// come back zeroed by the filesystem.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StagingError> {
-        self.file.read_exact_at(buf, offset)?;
+        file_read_exact_at(&self.file, buf, offset)?;
         Ok(())
     }
 

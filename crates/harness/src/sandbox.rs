@@ -320,8 +320,12 @@ fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Option<
     hdr.msg_iovlen = 1;
     hdr.msg_control = control.as_mut_ptr().cast();
     hdr.msg_controllen = space as _;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let flags = 0;
     // SAFETY: every pointer in `hdr` is valid for the call.
-    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut hdr, libc::MSG_CMSG_CLOEXEC) };
+    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut hdr, flags) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -335,6 +339,8 @@ fn recv_with_fd(sock: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Option<
             && (*cmsg).cmsg_type == libc::SCM_RIGHTS
         {
             let raw = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
             fd = Some(OwnedFd::from_raw_fd(raw));
         }
     }

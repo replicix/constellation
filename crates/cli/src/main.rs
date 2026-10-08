@@ -3650,6 +3650,21 @@ fn xattr_set(path: &std::path::Path, name: &str, value: &[u8]) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let cname = std::ffi::CString::new(name)?;
+    // macOS's `setxattr` has two extra arguments over Linux's: a
+    // resource-fork `position` (0: the data fork, the only one here) and
+    // `options` (0: follow symlinks, matching the Linux call below).
+    #[cfg(target_os = "macos")]
+    let rc = unsafe {
+        libc::setxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+            0,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
     let rc = unsafe {
         libc::setxattr(
             cpath.as_ptr(),
@@ -3670,6 +3685,20 @@ fn xattr_get(path: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {
     use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let cname = std::ffi::CString::new(name)?;
+    // See `xattr_set`: macOS's `getxattr` takes the same extra `position`/
+    // `options` pair.
+    #[cfg(target_os = "macos")]
+    let size = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
     let size = unsafe { libc::getxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
     if size < 0 {
         let err = std::io::Error::last_os_error();
@@ -3679,6 +3708,18 @@ fn xattr_get(path: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>> {
         };
     }
     let mut buf = vec![0u8; size as usize];
+    #[cfg(target_os = "macos")]
+    let got = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            0,
+            0,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
     let got = unsafe {
         libc::getxattr(
             cpath.as_ptr(),
@@ -3699,6 +3740,11 @@ fn xattr_remove(path: &std::path::Path, name: &str) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     let cname = std::ffi::CString::new(name)?;
+    // macOS's `removexattr` takes an extra `options` argument (0: follow
+    // symlinks, matching the Linux call below).
+    #[cfg(target_os = "macos")]
+    let rc = unsafe { libc::removexattr(cpath.as_ptr(), cname.as_ptr(), 0) };
+    #[cfg(not(target_os = "macos"))]
     let rc = unsafe { libc::removexattr(cpath.as_ptr(), cname.as_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error().into());

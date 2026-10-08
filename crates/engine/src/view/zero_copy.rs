@@ -82,7 +82,6 @@
 
 use super::*;
 use constellation_vfs::{Fh, ZeroCopySource};
-use std::os::unix::fs::MetadataExt;
 
 /// How many chunk files a marked handle keeps open and pinned (module
 /// doc): enough that random reads over a few chunks do not reopen one per
@@ -274,8 +273,18 @@ impl View {
             // the one held here unlinked. Served only while it is still
             // the cache's file — same length, still linked.
             let cached = sources.remove(at);
-            let current = cached.len == resident.len
-                && cached.source.file().metadata().is_ok_and(|m| m.nlink() > 0);
+            // `nlink` is a unix-only notion (zero-copy is Linux-FUSE-only
+            // to begin with, module doc); elsewhere, never trust a cached
+            // handle and fall through to reopen it below.
+            #[cfg(unix)]
+            let still_linked = cached
+                .source
+                .file()
+                .metadata()
+                .is_ok_and(|m| std::os::unix::fs::MetadataExt::nlink(&m) > 0);
+            #[cfg(not(unix))]
+            let still_linked = false;
+            let current = cached.len == resident.len && still_linked;
             if current {
                 let source = Arc::clone(&cached.source);
                 sources.push(cached);
