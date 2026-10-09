@@ -1098,7 +1098,7 @@ operator has cleared.
 |---|---:|---|---|
 | `CONSTELLATION_REGISTRY` | `$XDG_CONFIG_HOME/constellation/registry.toml` | path | local named-filesystem registry file (see [named filesystems](features/named-filesystems.md)) |
 | `CONSTELLATION_NO_DAEMONIZE` | unset | presence (any value, even empty) | force `--foreground` behavior for every `mount` (CI/harness convenience) |
-| `CONSTELLATION_SHUTDOWN_STALL_S` | `120` | seconds, positive | an unmount's drain that makes no progress (the journal and pending uploads stop shrinking) for this long gives up and exits non-zero, leaving everything on disk for the next mount |
+| `CONSTELLATION_SHUTDOWN_STALL_S` | `120` | seconds, positive | an unmount's drain that makes no progress (the journal and pending uploads stop shrinking, and the final metadata publish reads, writes and locates no tree nodes) for this long gives up and exits non-zero, leaving everything on disk for the next mount |
 
 ### Control UI
 

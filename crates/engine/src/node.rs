@@ -276,6 +276,9 @@ pub struct Engine {
     meta: Arc<Meta>,
     store: Arc<ChunkStore>,
     cache: Arc<DiskCache>,
+    /// The published tree's node cache: its progress counter is how the
+    /// shutdown drain tells a slow final publish from a stuck one.
+    tree_nodes: Arc<constellation_store_s3::NodeCache>,
     compression: CompressionSetting,
     snapshots: Arc<snapshot::SnapshotManager>,
     /// Plan 32 Step 0.1: every snapshot row write, routed to the
@@ -1075,7 +1078,6 @@ impl Engine {
                     .with_sealing(tree_sealing.clone()),
                 tree_access.config,
                 node_id,
-                rt.clone(),
             );
             publisher
                 .restore()
@@ -1646,6 +1648,7 @@ impl Engine {
             meta,
             store,
             cache,
+            tree_nodes: tree_access.nodes.clone(),
             compression,
             snapshots,
             snapshot_batches,
@@ -2246,13 +2249,21 @@ impl Engine {
         // drain that stops shrinking the journal and the pending uploads
         // (S3 unreachable: every PUT spends its retry budget and fails,
         // round after round) must not keep the process alive forever.
+        // The final publish that follows an emptied journal is progress
+        // too, measured as tree nodes read, written or located: it moves
+        // neither count, and on a cold node cache at high S3 latency it
+        // can outlast the stall limit while working normally (the
+        // latency250 benchmark's delete phase: a 113k-key publish, given
+        // up after 120 s, exited without its metadata commit).
         let stall = shutdown_stall_limit();
         let meta = self.meta.clone();
+        let nodes = self.tree_nodes.clone();
         let watchdog = async move {
             let progress = || {
                 (
                     meta.pending_upload_count().unwrap_or(u64::MAX),
                     constellation_meta::MetaStore::journal_len(&*meta).unwrap_or(u64::MAX),
+                    nodes.progress(),
                 )
             };
             let mut best = progress();
@@ -2260,11 +2271,11 @@ impl Engine {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 let now = progress();
-                if now.0 < best.0 || now.1 < best.1 {
-                    best = (now.0.min(best.0), now.1.min(best.1));
+                if now.0 < best.0 || now.1 < best.1 || now.2 > best.2 {
+                    best = (now.0.min(best.0), now.1.min(best.1), now.2.max(best.2));
                     since = Instant::now();
                 } else if since.elapsed() >= stall {
-                    return now;
+                    return (now.0, now.1);
                 }
             }
         };
@@ -2278,6 +2289,11 @@ impl Engine {
                 )),
             }
         });
+        // Done with the tree either way: a publish the watchdog gave up on
+        // may still be building in a blocking thread, which nothing stops
+        // when the runtime shuts down — closed, its next node read fails
+        // instead of polling a timer of a runtime that is gone.
+        self.tree_nodes.close();
         flush.context("final log flush")?;
         // No view is left to hold an orphan open: withdraw the claim now
         // rather than let its TTL run out (unless a handover carries the

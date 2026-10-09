@@ -41,6 +41,11 @@ pub enum MtreeError {
     #[error("invalid configuration: {0}")]
     Config(&'static str),
 
+    /// The node store was closed (its process is shutting down) and
+    /// does no more I/O; a tree operation still running is abandoned.
+    #[error("the node store is closed")]
+    Closed,
+
     /// Whatever the [`crate::NodeStore`] implementation failed with.
     /// This crate does no I/O of its own, so it has nothing more
     /// specific to say.

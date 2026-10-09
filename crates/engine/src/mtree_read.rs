@@ -711,7 +711,6 @@ mod tests {
             CommitChain::new(Arc::clone(&store)),
             record::config(),
             1,
-            tokio::runtime::Handle::current(),
         );
         let commit = publisher.publish(1).await.unwrap().unwrap();
         (store, meta, commit, inos)
@@ -933,7 +932,6 @@ mod tests {
                 publish_reader.chain,
                 publish_reader.config,
                 1,
-                tokio::runtime::Handle::current(),
             );
             publisher.publish(1).await.unwrap().unwrap();
 
@@ -999,7 +997,6 @@ mod tests {
             CommitChain::new(Arc::clone(&store)),
             record::config(),
             2,
-            tokio::runtime::Handle::current(),
         );
         publisher.restore().unwrap();
         let delta = publisher.publish(1).await.unwrap().unwrap();

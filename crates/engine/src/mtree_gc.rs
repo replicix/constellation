@@ -769,7 +769,6 @@ mod tests {
             CommitChain::new(store.clone()),
             record::config(),
             1,
-            tokio::runtime::Handle::current(),
         )
     }
 

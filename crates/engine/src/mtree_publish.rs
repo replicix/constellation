@@ -200,7 +200,6 @@ pub struct TreePublisher {
     /// commit can have been created *and* pruned, so an empty probe at
     /// seq 1 is proof enough that the chain is still empty.
     empty_chain_seen: Option<std::time::Instant>,
-    handle: tokio::runtime::Handle,
     /// Plan 30 §M4 item 3: the newest commit [`Self::follow_head`] has
     /// seen, so a follower's head probe starts from there.
     followed: u64,
@@ -256,7 +255,6 @@ impl TreePublisher {
         chain: CommitChain,
         config: constellation_mtree::Config,
         node_id: u64,
-        handle: tokio::runtime::Handle,
     ) -> TreePublisher {
         TreePublisher {
             meta,
@@ -272,7 +270,6 @@ impl TreePublisher {
             // hold its nodes can resolve them.
             hydrated: false,
             empty_chain_seen: None,
-            handle,
             followed: 0,
         }
     }
@@ -627,8 +624,10 @@ impl TreePublisher {
                     Some(root) => root,
                     None => tree.empty().map_err(StoreError::from)?,
                 };
+                let edits = plan.edits();
+                prefetch(&tree, base_for_apply, &edits);
                 let root = tree
-                    .apply(&base_for_apply, &plan.edits())
+                    .apply(&base_for_apply, &edits)
                     .map_err(StoreError::from)?;
                 Ok(Planned::Ready(plan, root, vector, dirty))
             })
@@ -734,7 +733,6 @@ impl TreePublisher {
         let declined: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
         let noted = Arc::clone(&declined);
         let cache = Arc::clone(&self.cache);
-        let handle = self.handle.clone();
         let mine = vector;
         let commit = self
             .chain
@@ -744,7 +742,7 @@ impl TreePublisher {
                 payload,
                 move |payload: CommitPayload, winner: &Commit| {
                     let from = spliced.get();
-                    match Self::splice(&tree, &cache, &handle, &plan, mine, from, winner, payload) {
+                    match Self::splice(&tree, &cache, &plan, mine, from, winner, payload) {
                         Ok((next, root)) => {
                             spliced.set(Some(root));
                             Ok(next)
@@ -805,7 +803,6 @@ impl TreePublisher {
     fn splice(
         tree: &Tree<Arc<NodeCache>>,
         cache: &Arc<NodeCache>,
-        handle: &tokio::runtime::Handle,
         plan: &Plan,
         mine: Vector,
         from: Option<NodeHash>,
@@ -833,7 +830,7 @@ impl TreePublisher {
         // replica has never read. Without their indices every descent
         // into its tree is a missing node.
         let packs = winner.pack_hashes()?;
-        blocking(handle, || cache.load_pack_indices(&packs))?;
+        blocking(cache, || cache.load_pack_indices(&packs))?;
 
         let changed = match from {
             Some(from) => tree.diff(&from, &winner_root)?,
@@ -853,8 +850,10 @@ impl TreePublisher {
                 changed.len()
             )));
         }
-        let root = tree.apply(&winner_root, &plan.edits())?;
-        let packs = blocking(handle, || cache.seal_packs())?;
+        let edits = plan.edits();
+        prefetch(tree, winner_root, &edits);
+        let root = tree.apply(&winner_root, &edits)?;
+        let packs = blocking(cache, || cache.seal_packs())?;
         Ok((
             CommitPayload {
                 roots: std::collections::BTreeMap::from([(SHARD0.to_string(), root)]),
@@ -929,22 +928,28 @@ impl TreePublisher {
     }
 }
 
+/// Warm the cache with every node `apply(root, edits)` reads, fetched
+/// concurrently ([`NodeCache::prefetch_paths`]): `apply` itself reads
+/// them one round trip at a time.
+fn prefetch(tree: &Tree<Arc<NodeCache>>, root: NodeHash, edits: &[constellation_mtree::Edit]) {
+    let keys: Vec<&[u8]> = edits.iter().map(|(key, _)| key.as_slice()).collect();
+    tree.store().prefetch_paths_blocking(root, &keys);
+}
+
 /// Run one async step from inside the synchronous rebase callback.
 ///
 /// The callback is handed to `CommitChain::publish` as a plain closure
 /// — resolving a lost CAS needs the §P6 codec, which `store-s3` cannot
 /// see, so the hook has to be synchronous — but loading a pack index
-/// and sealing packs are I/O. `block_in_place` is the same bridge
-/// `NodeCache` already uses for exactly this reason.
-fn blocking<F, T>(handle: &tokio::runtime::Handle, f: impl FnOnce() -> F) -> Result<T, StoreError>
+/// and sealing packs are I/O. Through the cache's own bridge, so a
+/// closed cache refuses it ([`NodeCache::block_on`]).
+fn blocking<F, T>(cache: &NodeCache, f: impl FnOnce() -> F) -> Result<T, StoreError>
 where
     F: std::future::Future<Output = Result<T, StoreError>>,
 {
-    let fut = f();
-    match tokio::runtime::Handle::try_current() {
-        Ok(_) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => handle.block_on(fut),
-    }
+    cache
+        .block_on(f())
+        .unwrap_or(Err(constellation_mtree::MtreeError::Closed.into()))
 }
 
 fn encode_vector(applied: Vector) -> String {
@@ -1162,7 +1167,6 @@ mod tests {
                 CommitChain::new(store),
                 record::config(),
                 node_id,
-                tokio::runtime::Handle::current(),
             )
         }
 

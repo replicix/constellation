@@ -229,7 +229,6 @@ mod tests {
             CommitChain::new(backend.clone()),
             record::config(),
             id,
-            tokio::runtime::Handle::current(),
         );
         publisher.restore().unwrap();
         let driver =
@@ -698,7 +697,6 @@ mod root_owner_tests {
             CommitChain::new(backend.clone()),
             record::config(),
             id,
-            tokio::runtime::Handle::current(),
         );
         publisher.restore().unwrap();
         let driver =

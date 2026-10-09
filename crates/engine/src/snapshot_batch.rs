@@ -1488,7 +1488,6 @@ pub(crate) mod tests {
             CommitChain::new(backend.clone()),
             record::config(),
             id,
-            tokio::runtime::Handle::current(),
         );
         publisher.restore().unwrap();
         let driver: Driver = Arc::new(tokio::sync::Mutex::new(Standalone::with_publisher(

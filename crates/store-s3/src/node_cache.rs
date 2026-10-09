@@ -120,6 +120,8 @@ struct Counters {
     hits_peer: AtomicU64,
     pack_reads: AtomicU64,
     leaf_packs_touched: Mutex<HashSet<PackHash>>,
+    /// Never reset: see [`NodeCache::progress`].
+    progress: AtomicU64,
 }
 
 /// Read counters, for tests and for the metrics a node exports.
@@ -181,6 +183,9 @@ pub struct NodeCache {
     /// — what a publisher re-checks just before its commit CAS.
     deduped: Mutex<HashSet<PackHash>>,
     counters: Counters,
+    /// [`NodeCache::close`]: no more I/O through [`NodeCache::block_on`].
+    closed: std::sync::atomic::AtomicBool,
+    closing: tokio::sync::Notify,
 }
 
 impl NodeCache {
@@ -222,6 +227,8 @@ impl NodeCache {
             condemned: RwLock::new(HashSet::new()),
             deduped: Mutex::new(HashSet::new()),
             counters: Counters::default(),
+            closed: Default::default(),
+            closing: tokio::sync::Notify::new(),
         }
     }
 
@@ -256,6 +263,14 @@ impl NodeCache {
         }
     }
 
+    /// Monotonic: bumped by every node read, written or located (a pack
+    /// index attached, which sealing a pack does too). What a caller
+    /// waiting on a long tree operation — the final publish of an
+    /// unmount — watches to tell a slow one from one that is stuck.
+    pub fn progress(&self) -> u64 {
+        self.counters.progress.load(Ordering::Relaxed)
+    }
+
     pub fn reset_stats(&self) {
         self.counters.hits_memory.store(0, Ordering::Relaxed);
         self.counters.hits_disk.store(0, Ordering::Relaxed);
@@ -278,6 +293,7 @@ impl NodeCache {
 
     /// Teach the cache where a pack's nodes live.
     pub fn attach_index(&self, pack: PackHash, index: &PackIndex) {
+        self.counters.progress.fetch_add(1, Ordering::Relaxed);
         self.attached.write().expect("attached packs").insert(pack);
         let mut locations = self.locations.write().expect("locations");
         for entry in &index.entries {
@@ -310,7 +326,7 @@ impl NodeCache {
             let store = self.packs.clone();
             async move { (hash, store.get_index(&hash).await) }
         }))
-        .buffer_unordered(8);
+        .buffer_unordered(READ_CONCURRENCY);
         while let Some((hash, index)) = fetched.next().await {
             self.attach_index(hash, &index?);
         }
@@ -360,7 +376,9 @@ impl NodeCache {
         if self.refresh_generation.load(Ordering::Acquire) != seen {
             return true;
         }
-        let refreshed = self.block_on(self.refresh_catalog()).is_ok();
+        let refreshed = self
+            .block_on(self.refresh_catalog())
+            .is_some_and(|refreshed| refreshed.is_ok());
         self.refresh_generation.fetch_add(1, Ordering::Release);
         refreshed
     }
@@ -472,14 +490,45 @@ impl NodeCache {
 
     // ------------------------------------------------------------ read
 
-    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+    /// Run `fut` on the cache's runtime from synchronous code (the
+    /// [`NodeStore`] side, a `spawn_blocking` tree build, a publish's
+    /// rebase callback). `None` once the cache is [closed](Self::close),
+    /// without polling `fut` again.
+    ///
+    /// A synchronous caller is not a task, so a runtime shutdown does not
+    /// stop it: a tree build the shutdown drain gave up on went on
+    /// fetching nodes, and its next poll of an S3 request's timer, after
+    /// the runtime's time driver had shut down, panicked ("A Tokio 1.x
+    /// context was found, but it is being shutdown").
+    pub fn block_on<F: std::future::Future>(&self, fut: F) -> Option<F::Output> {
+        let guarded = async {
+            let closing = self.closing.notified();
+            tokio::pin!(closing);
+            closing.as_mut().enable();
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = closing => None,
+                out = fut => Some(out),
+            }
+        };
         // Called from a runtime worker (a FUSE request bridged through
         // `SyncHandle`, or a `spawn_blocking` build) as often as from a
         // plain thread, and `Handle::block_on` panics in the first case.
         match tokio::runtime::Handle::try_current() {
-            Ok(_) => tokio::task::block_in_place(|| self.handle.block_on(fut)),
-            Err(_) => self.handle.block_on(fut),
+            Ok(_) => tokio::task::block_in_place(|| self.handle.block_on(guarded)),
+            Err(_) => self.handle.block_on(guarded),
         }
+    }
+
+    /// Stop all I/O through [`Self::block_on`], waking any caller blocked
+    /// in it. For a process about to shut its runtime down: call it
+    /// before the runtime goes. Not reversible.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.closing.notify_waiters();
     }
 
     /// Hash-check, structurally validate, and cache bytes that arrived
@@ -493,6 +542,7 @@ impl NodeCache {
         let node = NodeRef::parse(&bytes)?;
         let level = node.level();
         let bytes: Arc<[u8]> = bytes.into();
+        self.counters.progress.fetch_add(1, Ordering::Relaxed);
         let _ = self
             .cache
             .insert(&chunk_hash(hash), &bytes, ChunkState::Clean);
@@ -504,6 +554,56 @@ impl NodeCache {
         }
         Ok(bytes)
     }
+}
+
+/// GETs a pack-index load or a [`NodeCache::prefetch_paths`] keeps in
+/// flight. Each is small, so at S3 latency the count is the rate: a
+/// restarted node's catalog load (one index per pack, ~600 in the
+/// perf-regression corpus) took ~40 s at 8 and 250 ms of latency, and
+/// held the publisher — every cadence publish of a short mount behind
+/// it — that long.
+const READ_CONCURRENCY: usize = 32;
+
+/// The children of the interior node `bytes` that the keys in `range`
+/// descend into, each with its own sub-range, plus the right neighbour
+/// of every run of them (with an empty range). A node with an empty
+/// range is a neighbour: only its leftmost descent is read.
+fn prefetch_children(
+    bytes: &[u8],
+    keys: &[&[u8]],
+    range: std::ops::Range<usize>,
+    out: &mut Vec<(NodeHash, std::ops::Range<usize>)>,
+) -> Result<(), MtreeError> {
+    let node = NodeRef::new(bytes)?;
+    if node.is_leaf() || node.count() == 0 {
+        return Ok(());
+    }
+    if range.is_empty() {
+        out.push((node.child(0)?.0, range));
+        return Ok(());
+    }
+    let mut i = range.start;
+    let mut last = None;
+    while i < range.end {
+        let idx = node.descend(keys[i])?;
+        let bound = (idx + 1 < node.count())
+            .then(|| node.key(idx + 1))
+            .transpose()?;
+        let mut j = i + 1;
+        while j < range.end && bound.is_none_or(|b| keys[j] < b) {
+            j += 1;
+        }
+        if let Some(l) = last.filter(|l| l + 1 < idx) {
+            out.push((node.child(l + 1)?.0, i..i));
+        }
+        out.push((node.child(idx)?.0, i..j));
+        last = Some(idx);
+        i = j;
+    }
+    if let Some(l) = last.filter(|l| l + 1 < node.count()) {
+        out.push((node.child(l + 1)?.0, range.end..range.end));
+    }
+    Ok(())
 }
 
 /// A node hash and a chunk hash are the same 32 bytes of blake3 over
@@ -539,8 +639,10 @@ impl NodeStore for NodeCache {
         // S3. The location lookup releases its lock before the GET, so
         // concurrent misses stay concurrent (§14.9).
         let seen = self.refresh_generation.load(Ordering::Acquire);
-        if let Ok(bytes) = self.fetch_located(hash) {
-            return Ok(bytes);
+        match self.fetch_located(hash) {
+            Ok(bytes) => return Ok(bytes),
+            Err(MtreeError::Closed) => return Err(MtreeError::Closed),
+            Err(_) => {}
         }
         // Either no index this cache holds names the node, or the pack
         // it named is gone (compacted). Both are what a catalog refresh
@@ -559,6 +661,11 @@ impl NodeStore for NodeCache {
 impl NodeCache {
     /// The S3 rung of the ladder, from whatever location is known now.
     fn fetch_located(&self, hash: &NodeHash) -> Result<Arc<[u8]>, MtreeError> {
+        self.block_on(self.fetch_located_async(hash))
+            .unwrap_or(Err(MtreeError::Closed))
+    }
+
+    async fn fetch_located_async(&self, hash: &NodeHash) -> Result<Arc<[u8]>, MtreeError> {
         let Some(location) = self.location_of(hash) else {
             return Err(MtreeError::MissingNode(*hash));
         };
@@ -571,17 +678,71 @@ impl NodeCache {
                 .insert(location.pack);
         }
         let bytes = self
-            .block_on(self.packs.get_node_bytes(
+            .packs
+            .get_node_bytes(
                 &location.pack,
                 hash,
                 location.offset,
                 location.compressed_len,
-            ))
+            )
+            .await
             .map_err(|_| MtreeError::MissingNode(*hash))?;
         self.accept(hash, bytes)
     }
 
+    /// A node from memory, the disk cache or S3 (no peer: its fetch
+    /// blocks), without the miss path's catalog refresh. Not counted as
+    /// a hit: the read this warms up counts it.
+    async fn get_async(&self, hash: &NodeHash) -> Result<Arc<[u8]>, MtreeError> {
+        if let Some(bytes) = self.memory.read().expect("memory tier").nodes.get(hash) {
+            return Ok(bytes.clone());
+        }
+        if let Ok(Some(bytes)) = self.cache.get(&chunk_hash(hash)) {
+            return self.accept(hash, bytes);
+        }
+        self.fetch_located_async(hash).await
+    }
+
+    /// Fetch every node a [`constellation_mtree::Tree::apply`] of edits
+    /// at `keys` (ascending) onto `root` descends through, level by
+    /// level, [`READ_CONCURRENCY`] GETs at a time, into the cache.
+    ///
+    /// `apply` reads one node at a time, so on a cold cache each node is
+    /// a round trip: a 113k-key publish (an unmount after `rm -rf` of a
+    /// 38k-entry tree) read 1101 nodes in 555 s at 250 ms of S3 latency.
+    /// Prefetched, that is one round trip per tree level and per
+    /// [`READ_CONCURRENCY`] nodes. Also fetched: each touched run's
+    /// right neighbour (and its leftmost descent), which a rewrite reads
+    /// when it does not re-synchronise at the run's end. Best effort: a
+    /// node that cannot be fetched here is left to `apply`'s own miss
+    /// path.
+    pub async fn prefetch_paths(&self, root: NodeHash, keys: &[&[u8]]) {
+        use futures::StreamExt;
+        let mut frontier = vec![(root, 0..keys.len())];
+        while !frontier.is_empty() {
+            let fetched: Vec<_> = futures::stream::iter(
+                frontier
+                    .drain(..)
+                    .map(|(hash, range)| async move { (self.get_async(&hash).await, range) }),
+            )
+            .buffer_unordered(READ_CONCURRENCY)
+            .collect()
+            .await;
+            for (bytes, range) in fetched {
+                let Ok(bytes) = bytes else { continue };
+                let _ = prefetch_children(&bytes, keys, range, &mut frontier);
+            }
+        }
+    }
+
+    /// [`Self::prefetch_paths`] from synchronous code (a `spawn_blocking`
+    /// tree build).
+    pub fn prefetch_paths_blocking(&self, root: NodeHash, keys: &[&[u8]]) {
+        self.block_on(self.prefetch_paths(root, keys));
+    }
+
     fn put_node(&self, hash: NodeHash, level: u8, bytes: Vec<u8>) -> Result<(), MtreeError> {
+        self.counters.progress.fetch_add(1, Ordering::Relaxed);
         if let Some(location) = self.location_of(&hash) {
             // Already durable; nodes are immutable — unless a GC round
             // is about to delete the pack that holds it.
@@ -627,7 +788,7 @@ impl NodeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use constellation_mtree::{Config, Tree};
+    use constellation_mtree::{Config, Edit, Tree};
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
     use std::sync::{Condvar, MutexGuard};
@@ -711,6 +872,103 @@ mod tests {
             assert_eq!(cold.get(&root, key).unwrap().as_ref(), Some(value));
         }
         assert!(reader.cache.stats().pack_reads > 0);
+    }
+
+    /// `close` wakes a caller blocked in `block_on` and refuses every
+    /// later one, and a read of a node that is not local fails `Closed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_wakes_a_blocked_caller_and_refuses_the_next() {
+        let f = fixture(Arc::new(InMemory::new()), 1 << 20);
+        let cache = f.cache.clone();
+        let blocked = std::thread::spawn(move || cache.block_on(std::future::pending::<()>()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        f.cache.close();
+        assert_eq!(blocked.join().unwrap(), None);
+        assert_eq!(f.cache.block_on(async { 1 }), None);
+        let cache = f.cache.clone();
+        let read = tokio::task::spawn_blocking(move || cache.get(&NodeHash([7u8; 32])))
+            .await
+            .unwrap();
+        assert!(matches!(read, Err(MtreeError::Closed)), "{read:?}");
+    }
+
+    /// The shutdown panic: a synchronous caller blocked on S3 I/O (here a
+    /// timer) when its runtime shuts down. Closed first, it returns
+    /// instead of polling a timer whose driver is gone, which panics
+    /// ("A Tokio 1.x context was found, but it is being shutdown").
+    #[test]
+    fn a_closed_cache_outlives_its_runtime_without_panicking() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let f = rt.block_on(async { fixture(Arc::new(InMemory::new()), 1 << 20) });
+        let cache = f.cache.clone();
+        let blocked = std::thread::spawn(move || {
+            cache.block_on(async { tokio::time::sleep(Duration::from_secs(3600)).await })
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        f.cache.close();
+        rt.shutdown_timeout(Duration::from_secs(1));
+        assert_eq!(blocked.join().expect("no panic"), None);
+    }
+
+    /// After [`NodeCache::prefetch_paths`], `apply` on a cold cache reads
+    /// nothing from S3 itself: dense deletes over the whole tree (an
+    /// `rm -rf`), sparse ones (a right neighbour per run), and inserts
+    /// past both ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prefetched_apply_reads_nothing_from_s3() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = fixture(store.clone(), 256 << 10);
+        let pairs = dentries(64, 500);
+        let tree = Arc::new(Tree::new(writer.cache.clone()));
+        let root = tree.build(pairs.clone()).unwrap();
+        let packs = writer.cache.seal_packs().await.unwrap();
+
+        let dense: Vec<Edit> = pairs
+            .iter()
+            .step_by(3)
+            .map(|(key, _)| (key.clone(), None))
+            .collect();
+        let sparse: Vec<Edit> = pairs
+            .iter()
+            .step_by(997)
+            .map(|(key, _)| (key.clone(), None))
+            .collect();
+        let mut ends: Vec<Edit> = vec![(vec![0x01], Some(b"first".to_vec()))];
+        ends.push((pairs[1234].0.clone(), Some(b"changed".to_vec())));
+        ends.push((vec![0x03], Some(b"last".to_vec())));
+
+        for edits in [dense, sparse, ends] {
+            let reader = fixture(store.clone(), 256 << 10);
+            reader.cache.load_pack_indices(&packs).await.unwrap();
+            let keys: Vec<&[u8]> = edits.iter().map(|(key, _)| key.as_slice()).collect();
+            reader.cache.prefetch_paths(root, &keys).await;
+            assert!(reader.cache.stats().pack_reads > 0);
+            reader.cache.reset_stats();
+            let cold = Tree::new(reader.cache.clone());
+            let applied = {
+                let edits = edits.clone();
+                tokio::task::spawn_blocking(move || cold.apply(&root, &edits).unwrap())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(
+                reader.cache.stats().pack_reads,
+                0,
+                "apply missed nodes the prefetch should have read ({} edits)",
+                edits.len()
+            );
+            let expected = {
+                let tree = tree.clone();
+                tokio::task::spawn_blocking(move || tree.apply(&root, &edits).unwrap())
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(applied, expected);
+        }
     }
 
     /// §14.2's measured property, and the reason [`build_packs`] sorts

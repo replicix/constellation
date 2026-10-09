@@ -57,8 +57,8 @@ pub(crate) fn control_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// How long `mount_view` polls for the mountpoint to appear, and `unmount`/
-/// `leave` poll for the daemon to exit, before giving up. Both loops return
+/// How long `mount_view` polls for the mountpoint to appear before giving
+/// up (and the floor of [`exit_timeout`]). The loop returns
 /// as soon as the condition is met, so a generous ceiling costs nothing for
 /// the common case of small, fast fault-injection scenarios — it only
 /// raises the bound for genuinely slow or hung cases. Full-corpus
@@ -77,6 +77,25 @@ fn client_timeout() -> Duration {
             .filter(|v: &u64| *v > 0)
             .unwrap_or(120),
     )
+}
+
+/// How long `unmount`/`leave` wait for the daemon to exit. Longer than
+/// the daemon's own bound on a drain that stops progressing
+/// (`CONSTELLATION_SHUTDOWN_STALL_S`, 120 s): a drain that keeps
+/// progressing is not bounded at all, and a wait as long as that bound
+/// killed the daemon of the latency250 benchmark mid-publish, before the
+/// daemon itself could finish or give up. Override with
+/// `CONSTELLATION_HARNESS_EXIT_TIMEOUT_S`; never shorter than
+/// [`client_timeout`].
+fn exit_timeout() -> Duration {
+    let exit = Duration::from_secs(
+        std::env::var("CONSTELLATION_HARNESS_EXIT_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &u64| *v > 0)
+            .unwrap_or(600),
+    );
+    exit.max(client_timeout())
 }
 
 pub struct Client {
@@ -689,7 +708,7 @@ impl Client {
         self.record_daemon_census("unmount");
         let _ = unmount(&self.mnt, UnmountMode::Normal);
         if let Some(mut child) = self.child.take() {
-            let deadline = Instant::now() + client_timeout();
+            let deadline = Instant::now() + exit_timeout();
             while Instant::now() < deadline {
                 if child.try_wait()?.is_some() {
                     return Ok(());
@@ -701,7 +720,7 @@ impl Client {
             bail!(
                 "{} daemon did not exit after unmount within {:?}{}: {}",
                 self.name,
-                client_timeout(),
+                exit_timeout(),
                 released
                     .err()
                     .map(|e| format!(" (and {e:#})"))
@@ -1002,7 +1021,7 @@ impl Client {
         // Self-leave triggers fusermount; wait for the daemon to exit.
         if node_id.is_none() {
             if let Some(mut child) = self.child.take() {
-                let deadline = Instant::now() + client_timeout();
+                let deadline = Instant::now() + exit_timeout();
                 while Instant::now() < deadline {
                     if child.try_wait()?.is_some() {
                         return Ok(());
@@ -1013,7 +1032,7 @@ impl Client {
                 bail!(
                     "{} daemon did not exit after leave within {:?}",
                     self.name,
-                    client_timeout()
+                    exit_timeout()
                 );
             }
         }

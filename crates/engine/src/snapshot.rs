@@ -1202,7 +1202,6 @@ pub fn test_manager(
             CommitChain::new(backend),
             record::config(),
             1,
-            handle.clone(),
         ),
     ));
     let hook: PublishHook = Arc::new(move |through| {
