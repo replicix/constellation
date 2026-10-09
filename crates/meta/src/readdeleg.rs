@@ -733,7 +733,8 @@ mod tests {
             .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
             .unwrap();
         assert!(!meta.unshipped_touches_read(f.ino, false, None));
-        meta.set_manifest_dirty(f.ino, None, b"M", 1, &[]).unwrap();
+        meta.set_manifest_dirty(f.ino, None, b"M", 1, None, &[])
+            .unwrap();
         assert!(meta.unshipped_touches_read(f.ino, false, None));
     }
 

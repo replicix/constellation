@@ -191,7 +191,7 @@ impl Inval {
         Some(match self {
             Inval::Entry { parent, name } => Invalidation::Entry {
                 parent: in_view(*parent, view_root)?,
-                name: NameBuf::from(name.as_str()),
+                name: NameBuf::new(constellation_vfs::name::wire_bytes(name).into_owned()),
             },
             Inval::Inode { ino, data: false } => Invalidation::Attr {
                 ino: in_view(*ino, view_root)?,
@@ -878,6 +878,7 @@ mod tests {
                 manifest: Vec::new(),
                 size: 8,
                 time_ns: 2,
+                mtime_ns: 2,
             },
         ]);
         assert_eq!(

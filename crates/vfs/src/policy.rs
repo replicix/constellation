@@ -27,15 +27,14 @@ pub const RCOUNT_XATTR: &str = "user.constellation.rcount";
 /// Directory entry names: frontend bytes → the engine's stored name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamePolicy {
-    /// Longest name, in bytes of the stored (UTF-8) form.
+    /// Longest name, in bytes as the frontend delivered it.
     pub max_len: usize,
     pub case: CasePolicy,
 }
 
 impl NamePolicy {
-    /// Linux: bytes read as UTF-8 with invalid sequences replaced (as
-    /// `OsStr::to_string_lossy` has always stored them), at most
-    /// [`NAME_MAX`] bytes after that, case-sensitive.
+    /// Linux: any bytes, at most [`NAME_MAX`] of them, stored in
+    /// [`crate::name::stored_form`], case-sensitive.
     pub const fn linux() -> Self {
         Self {
             max_len: NAME_MAX,
@@ -45,11 +44,10 @@ impl NamePolicy {
 
     /// The stored form of `name`, or `NameTooLong`.
     pub fn check<'a>(&self, name: &'a Name) -> Result<Cow<'a, str>, Code> {
-        let stored = String::from_utf8_lossy(name.as_bytes());
-        if stored.len() > self.max_len {
+        if name.len() > self.max_len {
             return Err(Code::NameTooLong);
         }
-        Ok(stored)
+        Ok(crate::name::stored_form(name.as_bytes()))
     }
 }
 
@@ -59,19 +57,22 @@ pub struct XattrPolicy {
     /// The read-only attributes the view computes (never stored):
     /// setting or removing one is `Perm`.
     pub virtual_names: &'static [&'static str],
-    /// Whether `listxattr` names the virtual attributes. Linux: yes
-    /// (`getfattr -d` has always shown them); macOS: no (`copyfile(3)`
-    /// and Finder enumerate every listed name, plan 34).
+    /// Whether `listxattr` names the virtual attributes. Neither Linux nor
+    /// macOS: tools that copy attributes enumerate every listed name
+    /// (`cp -a`, `rsync -X`, `tar --xattrs`, `copyfile(3)`), so a listed
+    /// virtual attribute was copied as a real one onto other file
+    /// systems and refused (`EPERM`) when written back here. They are
+    /// read by name (`getfattr -n user.constellation.rsize`).
     pub list_virtual: bool,
 }
 
 impl XattrPolicy {
-    /// Linux: `user.*` for everyone, `trusted.*` for uid 0, the virtual
-    /// `user.constellation.{rsize,rcount}` listed.
+    /// Linux: `user.*` and `security.*` for everyone, `trusted.*` for
+    /// uid 0, the virtual `user.constellation.{rsize,rcount}` unlisted.
     pub const fn linux() -> Self {
         Self {
             virtual_names: &[RSIZE_XATTR, RCOUNT_XATTR],
-            list_virtual: true,
+            list_virtual: false,
         }
     }
 
@@ -79,14 +80,22 @@ impl XattrPolicy {
     /// longer than 255 bytes, `Invalid` when not UTF-8, `Perm` for
     /// `trusted.*` unless uid 0 (FUSE carries no capability bits: uid 0
     /// stands for the kernel-authenticated privileged caller),
-    /// `NotSupported` for any other namespace.
+    /// `NotSupported` for any other namespace (`system.*`: no ACLs).
+    ///
+    /// `security.*` is stored like `user.*`: who may set which one (file
+    /// capabilities need `CAP_SETFCAP`, the rest `CAP_SYS_ADMIN` or the
+    /// LSM's say) is the kernel's check, made before the request reaches
+    /// the file system. Refused, an absent `security.capability` — which
+    /// the kernel asks for on every write, to drop privileges — read
+    /// `EOPNOTSUPP` where other file systems answer `ENODATA`, and
+    /// `setcap` failed.
     pub fn check_name(&self, name: &XattrName, caller: &Caller) -> Result<String, Code> {
         let bytes = name.as_bytes();
         if bytes.is_empty() || bytes.len() > 255 {
             return Err(Code::Range);
         }
         let name = std::str::from_utf8(bytes).map_err(|_| Code::Invalid)?;
-        if name.starts_with("user.") {
+        if name.starts_with("user.") || name.starts_with("security.") {
             return Ok(name.to_string());
         }
         if name.starts_with("trusted.") {
@@ -182,8 +191,10 @@ mod tests {
     }
 
     #[test]
-    fn linux_lists_the_virtual_xattrs_sorted_and_deduplicated() {
-        let p = XattrPolicy::linux();
+    fn a_frontend_that_lists_the_virtual_xattrs_lists_them_sorted_and_deduplicated() {
+        let mut caps = FrontendCaps::linux_fuse(false);
+        caps.virtual_xattrs_listed = true;
+        let p = PolicyStack::for_caps(&caps).xattrs;
         assert_eq!(
             names(&p.listing(vec!["user.z".into(), "user.a".into(), "user.a".into()])),
             [
@@ -200,10 +211,8 @@ mod tests {
     }
 
     #[test]
-    fn a_frontend_that_does_not_list_them_never_sees_them_listed() {
-        let mut caps = FrontendCaps::linux_fuse(false);
-        caps.virtual_xattrs_listed = false;
-        let p = PolicyStack::for_caps(&caps).xattrs;
+    fn linux_never_lists_them() {
+        let p = PolicyStack::for_caps(&FrontendCaps::linux_fuse(false)).xattrs;
         assert_eq!(
             names(&p.listing(vec!["user.b".into(), RSIZE_XATTR.into(), "user.a".into()])),
             ["user.a", "user.b"]
@@ -226,7 +235,8 @@ mod tests {
         assert_eq!(check(b"user.x", &user), Ok("user.x".into()));
         assert_eq!(check(b"trusted.x", &root), Ok("trusted.x".into()));
         assert_eq!(check(b"trusted.x", &user), Err(Code::Perm));
-        assert_eq!(check(b"security.x", &root), Err(Code::NotSupported));
+        assert_eq!(check(b"security.x", &user), Ok("security.x".into()));
+        assert_eq!(check(b"system.x", &root), Err(Code::NotSupported));
         assert_eq!(
             check(b"system.posix_acl_access", &root),
             Err(Code::NotSupported)
@@ -237,17 +247,19 @@ mod tests {
     }
 
     #[test]
-    fn linux_names_are_lossy_utf8_within_name_max() {
+    fn linux_names_are_any_bytes_within_name_max() {
         let p = NamePolicy::linux();
         assert_eq!(p.check(Name::new(b"a")).unwrap(), "a");
         assert_eq!(p.check(Name::new(&[b'x'; 255])).unwrap().len(), 255);
         assert_eq!(p.check(Name::new(&[b'x'; 256])), Err(Code::NameTooLong));
-        // An invalid byte becomes U+FFFD (three bytes): the limit applies
-        // to the stored form.
-        assert_eq!(p.check(Name::new(b"a\xffb")).unwrap(), "a\u{fffd}b");
-        let mut long = vec![b'x'; 253];
-        long.push(0xff);
-        assert_eq!(p.check(Name::new(&long)), Err(Code::NameTooLong));
+        // Not UTF-8: distinct names stay distinct, and the limit is on
+        // the delivered bytes.
+        let a = p.check(Name::new(b"a\xffb")).unwrap();
+        let b = p.check(Name::new(b"a\xfeb")).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(&*crate::name::wire_bytes(&a), b"a\xffb");
+        assert!(p.check(Name::new(&[0xff; 255])).is_ok());
+        assert_eq!(p.check(Name::new(&[0xff; 256])), Err(Code::NameTooLong));
     }
 
     #[test]

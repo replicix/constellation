@@ -771,3 +771,150 @@ fn a_refused_commits_copy_stays_in_the_view_and_keeps_its_owner() {
         other => panic!("{other:?}"),
     }
 }
+
+/// An open file description's (`F_OFD_SETLK`) lock ends with the
+/// description: FUSE sends no unlock for it on close, only `RELEASE` of
+/// its handle (with no lock owner), which must drop it — and only it.
+#[test]
+fn releasing_a_handle_drops_the_locks_taken_through_it() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (e, a) = f.create(&caller, ROOT_INO, "ofd").unwrap();
+    let ino = e.attr.ino;
+    let b = f.open_write(&caller, ino).unwrap();
+    f.meta.locks().install_held(
+        ino,
+        HeldGrant {
+            id: GrantId { node: 9, seq: 1 },
+            mode: LockMode::Exclusive,
+            until_ms: i64::MAX,
+            renew_at_ms: i64::MAX,
+            owner: 9,
+            recalled: false,
+            position: constellation_meta::Position::ZERO,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since_ms: None,
+            installed_ms: now_unix_ms(),
+        },
+    );
+    // Two descriptions, each its own owner (the kernel names an OFD
+    // lock's owner after its `struct file`), on disjoint ranges.
+    for (fh, owner, start) in [(a.fh, 0xa, 0), (b.fh, 0xb, 100)] {
+        Blocking::run(|r| {
+            f.fs.lock_acquire(
+                &OpCtx::new(OpKind::LockAcquire, &caller),
+                ino,
+                fh,
+                LockSpec {
+                    owner: LockOwner(owner),
+                    range: LockRange {
+                        start,
+                        end: start + 9,
+                    },
+                    kind: LockKind::Write,
+                    pid: 0,
+                },
+                false,
+                r,
+            )
+        })
+        .unwrap();
+    }
+    assert_eq!(f.meta.locks().local_locks(ino).len(), 2);
+    Blocking::run(|r| {
+        f.fs.release(
+            &OpCtx::new(OpKind::Release, &caller),
+            ino,
+            a.fh,
+            OpenFlags::WRITE,
+            None,
+            r,
+        )
+    })
+    .unwrap();
+    let left = f.meta.locks().local_locks(ino);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(
+        left[0].owner, 0xb,
+        "only the released description's lock went"
+    );
+}
+
+/// The kernel names an OFD owner after its `struct file`, which a new
+/// open may reuse while the old description's `RELEASE` is still on its
+/// way: that late release leaves the new description's lock alone.
+#[test]
+fn a_late_release_spares_a_reused_owners_new_lock() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (e, old) = f.create(&caller, ROOT_INO, "reuse").unwrap();
+    let ino = e.attr.ino;
+    let new = f.open_write(&caller, ino).unwrap();
+    f.meta.locks().install_held(
+        ino,
+        HeldGrant {
+            id: GrantId { node: 9, seq: 1 },
+            mode: LockMode::Exclusive,
+            until_ms: i64::MAX,
+            renew_at_ms: i64::MAX,
+            owner: 9,
+            recalled: false,
+            position: constellation_meta::Position::ZERO,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since_ms: None,
+            installed_ms: now_unix_ms(),
+        },
+    );
+    let lock = |fh: Fh| {
+        Blocking::run(|r| {
+            f.fs.lock_acquire(
+                &OpCtx::new(OpKind::LockAcquire, &caller),
+                ino,
+                fh,
+                LockSpec {
+                    owner: LockOwner(0x5a),
+                    range: LockRange { start: 0, end: 9 },
+                    kind: LockKind::Write,
+                    pid: 0,
+                },
+                false,
+                r,
+            )
+        })
+        .unwrap()
+    };
+    lock(old.fh);
+    lock(new.fh);
+    Blocking::run(|r| {
+        f.fs.release(
+            &OpCtx::new(OpKind::Release, &caller),
+            ino,
+            old.fh,
+            OpenFlags::WRITE,
+            None,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        f.meta.locks().local_locks(ino).len(),
+        1,
+        "the new description keeps its lock"
+    );
+    Blocking::run(|r| {
+        f.fs.release(
+            &OpCtx::new(OpKind::Release, &caller),
+            ino,
+            new.fh,
+            OpenFlags::WRITE,
+            None,
+            r,
+        )
+    })
+    .unwrap();
+    assert!(f.meta.locks().local_locks(ino).is_empty());
+}

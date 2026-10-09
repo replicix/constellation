@@ -830,7 +830,7 @@ mod pending_claim_tests {
         let file = meta
             .create(constellation_fs_core::types::ROOT_INO, "f", 0o644, 0, 0)
             .unwrap();
-        meta.set_manifest_dirty(file.ino, None, b"M", 1, &[h])
+        meta.set_manifest_dirty(file.ino, None, b"M", 1, None, &[h])
             .unwrap();
         meta.add_pending_upload(&h, file.ino).unwrap();
         assert_eq!(meta.pending_upload_claims(&h, file.ino).unwrap(), 2);

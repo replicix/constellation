@@ -25,7 +25,19 @@ pub(super) struct WriteState {
     /// starts such a chunk from zeros, not from the base.
     pub(super) zeroed: crate::staging::DirtyRuns,
     pub(super) seal_buffer: Vec<u8>,
-    pub(super) high_water: u64,
+    /// The sequential runs this session's writes are in, `[start, end)`,
+    /// least recently extended first (at most `MAX_RUNS`): a write that
+    /// starts inside one extends it, any other starts a new one. The
+    /// chunks a run moves past are sealed for eager upload
+    /// ([`super::View::note_write`]).
+    pub(super) runs: Vec<(u64, u64)>,
+    /// The file's mtime as this session leaves it: now, at each data
+    /// change ([`WriteState::changed`]); the time an `utimes`/`futimens`
+    /// set since ([`WriteState::times_set`]). `None`: no change yet. The
+    /// flush commits it, and `getattr` shows it meanwhile.
+    pub(super) mtime_ns: Option<i64>,
+    /// When the session last changed the file (its ctime meanwhile).
+    pub(super) ctime_ns: i64,
     /// Absolute half-open byte ranges this open handle's `write()`
     /// calls actually delivered — as opposed to the padding bytes
     /// `do_write` seeds from the committed manifest so a partial
@@ -111,7 +123,51 @@ pub(super) fn covers(written: &[(u64, u64)], start: u64, end: u64) -> bool {
 /// read it under the shard lock exactly as they read a session's size.
 pub(super) struct WriteShards {
     pub(super) maps: [Mutex<HashMap<Ino, WriteState>>; WRITE_SHARDS],
-    pub(super) detached: [Mutex<HashMap<Ino, u64>>; WRITE_SHARDS],
+    pub(super) detached: [Mutex<HashMap<Ino, Pending>>; WRITE_SHARDS],
+}
+
+/// What `getattr` overlays from a write session on the committed row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Pending {
+    pub(super) len: u64,
+    pub(super) mtime_ns: Option<i64>,
+    pub(super) ctime_ns: i64,
+}
+
+impl Pending {
+    /// `attr` as the session leaves it.
+    pub(super) fn overlay(&self, attr: &mut FileAttr) {
+        attr.size = self.len;
+        if let Some(mtime) = self.mtime_ns {
+            attr.mtime_ns = mtime;
+        }
+        attr.ctime_ns = attr.ctime_ns.max(self.ctime_ns);
+    }
+}
+
+impl WriteState {
+    pub(super) fn pending(&self) -> Pending {
+        Pending {
+            len: self.file_len,
+            mtime_ns: self.mtime_ns,
+            ctime_ns: self.ctime_ns,
+        }
+    }
+
+    /// A data change (write, truncate, fallocate): mtime and ctime now.
+    pub(super) fn changed(&mut self) {
+        let now = constellation_fs_core::types::now_ns();
+        self.mtime_ns = Some(now);
+        self.ctime_ns = now;
+    }
+
+    /// An explicit mtime (`utimes`/`futimens`) while the session is open:
+    /// the flush must commit it, not the last write's time (`cp -p` sets
+    /// the source's times before its `close`).
+    pub(super) fn times_set(&mut self, mtime_ns: i64) {
+        self.mtime_ns = Some(mtime_ns);
+        self.ctime_ns = self.ctime_ns.max(constellation_fs_core::types::now_ns());
+    }
 }
 
 impl WriteShards {
@@ -149,7 +205,13 @@ impl WriteShards {
     /// The pending size of `ino`'s session: in the map, or detached. Call
     /// with the inode's shard lock held (`shard`).
     pub(super) fn pending_len(&self, shard: &HashMap<Ino, WriteState>, ino: Ino) -> Option<u64> {
-        shard.get(&ino).map(|ws| ws.file_len).or_else(|| {
+        self.pending(shard, ino).map(|p| p.len)
+    }
+
+    /// What `ino`'s session overlays on the committed row (size, times):
+    /// in the map, or detached. Call with the inode's shard lock held.
+    pub(super) fn pending(&self, shard: &HashMap<Ino, WriteState>, ino: Ino) -> Option<Pending> {
+        shard.get(&ino).map(WriteState::pending).or_else(|| {
             self.detached[ino as usize % WRITE_SHARDS]
                 .lock()
                 .unwrap()
@@ -168,7 +230,7 @@ impl WriteShards {
         self.detached[ino as usize % WRITE_SHARDS]
             .lock()
             .unwrap()
-            .insert(ino, ws.file_len);
+            .insert(ino, ws.pending());
         Some(ws)
     }
 

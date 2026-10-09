@@ -842,6 +842,7 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
             base_manifest: None,
             manifest,
             size: 7,
+            mtime_ns: None,
         },
         tag: Default::default(),
     });
@@ -953,6 +954,7 @@ fn a_handoff_is_declined_while_the_journal_cannot_drain() {
             base_manifest: None,
             manifest,
             size: 7,
+            mtime_ns: None,
         },
         tag: Default::default(),
     });
@@ -1939,6 +1941,7 @@ fn the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit() {
         base_manifest: base,
         manifest: manifest(bytes),
         size: bytes.len() as u64,
+        mtime_ns: None,
     };
     let base = manifest(b"baseline");
     constellation_meta::execute_mutate(&h.meta, &set(None, b"baseline"), None).unwrap();
@@ -2019,7 +2022,7 @@ fn a_deposed_holders_adopted_manifest_commit_is_not_replayed() {
         .0
         .encode();
     h.meta
-        .set_manifest_dirty(file.ino, None, &manifest, 12, &[])
+        .set_manifest_dirty(file.ino, None, &manifest, 12, None, &[])
         .unwrap();
     let adopted: Vec<LogRecord> = MetaStore::take_journal(&h.meta, usize::MAX)
         .unwrap()
@@ -2486,6 +2489,7 @@ mod own_chunks {
             base_manifest: None,
             manifest,
             size: 14,
+            mtime_ns: None,
         };
         let records = vec![LogRecord::WriteManifest {
             ino,
@@ -2496,6 +2500,7 @@ mod own_chunks {
             },
             size: 14,
             time_ns: 0,
+            mtime_ns: 0,
         }];
         (op, records, created)
     }
@@ -2725,6 +2730,7 @@ mod own_chunks {
                 base_manifest: None,
                 manifest: vec![1, 2, 3],
                 size: 3,
+                mtime_ns: None,
             },
             tag: Default::default(),
         });
@@ -2983,7 +2989,7 @@ mod own_chunks {
                         .encode();
                 holder
                     .meta
-                    .set_manifest_dirty(g, None, &manifest, 9, &[own])
+                    .set_manifest_dirty(g, None, &manifest, 9, None, &[own])
                     .unwrap();
             }
             let (close, _, _) = back_close(&mut holder, true);
@@ -3121,6 +3127,7 @@ mod own_chunks {
                         base_manifest: None,
                         manifest,
                         size: 14,
+                        mtime_ns: None,
                     },
                     acked_through: 0,
                     deps: constellation_meta::Position::ZERO,
@@ -3331,6 +3338,7 @@ mod own_chunks {
             .0
             .encode(),
             size: 14,
+            mtime_ns: None,
         }
     }
 
@@ -3558,6 +3566,7 @@ mod own_chunks {
                 base_manifest: None,
                 manifest: vec![1, 2, 3],
                 size: 3,
+                mtime_ns: None,
             };
             let out = if replay {
                 requester
@@ -4345,6 +4354,7 @@ fn stream_ahead_gives_a_pending_manifest_only_to_its_forwarder() {
             base_manifest: None,
             manifest,
             size: 19,
+            mtime_ns: None,
         },
         None,
     )
@@ -18767,6 +18777,7 @@ fn a_barrier_behind_a_held_back_row_fails_after_bounded_rounds() {
             base_manifest: None,
             manifest,
             size: 7,
+            mtime_ns: None,
         },
         tag: Default::default(),
     });

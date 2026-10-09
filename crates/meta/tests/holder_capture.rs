@@ -149,11 +149,13 @@ fn every_journaled_api_is_captured_and_rolls_back_byte_for_byte() {
         m.set_manifest(f1, &[4, 5], 2).unwrap()
     });
     assert_captured(&meta, "set_manifest_dirty", |m| {
-        m.set_manifest_dirty(f1, None, &[6, 7], 2, &[]).unwrap()
+        m.set_manifest_dirty(f1, None, &[6, 7], 2, None, &[])
+            .unwrap()
     });
     assert_captured(&meta, "set_manifest_with_base", |m| {
         let base = m.manifest(f1).unwrap().unwrap();
-        m.set_manifest_with_base(f1, Some(&base), &[8], 1).unwrap()
+        m.set_manifest_with_base(f1, Some(&base), &[8], 1, None)
+            .unwrap()
     });
     assert_captured(&meta, "set_xattr (spilled set)", |m| {
         m.set_xattr(f1, "user.new", b"x", SetXattrMode::Set)
@@ -689,7 +691,7 @@ fn a_stranded_manifest_commit_replays_as_an_optimistic_set_manifest() {
     meta.set_manifest(f, b"base", 4).unwrap();
     ship_all(&meta, 1);
     meta.set_holder_epoch(1);
-    meta.set_manifest_dirty(f, Some(b"base"), b"mine", 4, &[])
+    meta.set_manifest_dirty(f, Some(b"base"), b"mine", 4, None, &[])
         .unwrap();
     meta.strand_below_epoch(2).unwrap();
     let queued = meta.pending_replays().unwrap();
@@ -700,6 +702,7 @@ fn a_stranded_manifest_commit_replays_as_an_optimistic_set_manifest() {
             base_manifest: Some(b"base".to_vec()),
             manifest: b"mine".to_vec(),
             size: 4,
+            mtime_ns: None,
         }
     );
     assert_eq!(meta.manifest(f).unwrap().as_deref(), Some(&b"base"[..]));
@@ -787,6 +790,7 @@ fn a_stranded_truncate_then_write_replays_on_the_uncut_base() {
             base_manifest: Some(baseline.clone()),
             manifest: theirs.clone(),
             size: 13,
+            mtime_ns: None,
         },
         Some(rid(9)),
     )
@@ -808,7 +812,7 @@ fn a_stranded_truncate_then_write_replays_on_the_uncut_base() {
     assert_ne!(clipped, baseline, "the truncate clips the manifest");
     let mine = one_chunk_manifest(b"stranded-from-a", 15);
     holder
-        .set_manifest_dirty(f, Some(&clipped), &mine, 15, &[])
+        .set_manifest_dirty(f, Some(&clipped), &mine, 15, None, &[])
         .unwrap();
     holder.set_holder_epoch(0);
     holder.strand_below_epoch(2).unwrap();
@@ -869,7 +873,7 @@ fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
     execute_mutate(&holder, &truncate(20), Some(rid(1))).unwrap();
     let grown = one_chunk_manifest(b"grown", 20);
     holder
-        .set_manifest_dirty(f, Some(&baseline), &grown, 20, &[])
+        .set_manifest_dirty(f, Some(&baseline), &grown, 20, None, &[])
         .unwrap();
     // A truncate whose following commit composed on some other base.
     execute_mutate(&holder, &truncate(0), Some(rid(2))).unwrap();
@@ -887,6 +891,7 @@ fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
                 base_manifest: Some(elsewhere.clone()),
                 manifest: last,
                 size: 4,
+                mtime_ns: None,
             },
             &Default::default(),
         )

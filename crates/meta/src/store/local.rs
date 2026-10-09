@@ -1322,7 +1322,7 @@ mod tests {
         tx.commit().unwrap();
         let lost = constellation_fs_core::ChunkHash::of(b"gone");
         let ino = (3 << 40) | 1;
-        meta.set_manifest_dirty(ino, None, b"not a manifest", 4, &[lost])
+        meta.set_manifest_dirty(ino, None, b"not a manifest", 4, None, &[lost])
             .unwrap();
         create(&meta, 31);
         meta.note_unrecoverable_chunks(&[(lost, ino)], true)

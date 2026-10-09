@@ -257,9 +257,16 @@ impl Vfs for View {
                 };
                 r.done(Ok(self.attr_out(&attr)))
             }
-            Ok(None) => r.done(err(Code::NotFound)),
+            Ok(None) => match self.dead_attr(ino) {
+                Some(attr) => r.done(Ok(self.attr_out(&attr))),
+                None => r.done(err(Code::NotFound)),
+            },
             Err(code) => r.done(err(code)),
         }
+    }
+
+    fn forget(&self, ino: Ino) {
+        self.forget_dead(self.real_ino(ino));
     }
 
     fn setattr<R: Responder<Attr>>(
@@ -343,19 +350,30 @@ impl Vfs for View {
                 .map_err(|error| error.code())
                 .and_then(|attr| attr.ok_or(Code::NotFound))
                 .map(|mut attr| {
-                    let writes = self.writes.lock(ino);
-                    if let Some(len) = self.writes.pending_len(&writes, ino) {
-                        attr.size = len;
+                    let mut writes = self.writes.lock(ino);
+                    if let (Some(mtime), Some(ws)) = (mtime_ns, writes.get_mut(&ino)) {
+                        ws.times_set(mtime);
+                    }
+                    if let Some(pending) = self.writes.pending(&writes, ino) {
+                        pending.overlay(&mut attr);
                     }
                     attr
                 }),
             Err(error) => Err(error),
             // A `chmod`/`chown`/`utimes` of a file still being written
             // reports the session's size, not the committed row's
-            // (`current_attr`: the kernel takes this reply's size).
-            Ok(()) => self
-                .current_attr(ino)
-                .and_then(|attr| attr.ok_or(Code::NotFound)),
+            // (`current_attr`: the kernel takes this reply's size). An
+            // mtime set goes into the session too: its flush commits the
+            // session's mtime, which must now be this one.
+            Ok(()) => {
+                if let Some(mtime) = mtime_ns {
+                    if let Some(ws) = self.writes.lock(ino).get_mut(&ino) {
+                        ws.times_set(mtime);
+                    }
+                }
+                self.current_attr(ino)
+                    .and_then(|attr| attr.ok_or(Code::NotFound))
+            }
         };
         match result {
             Ok(attr) => r.done(Ok(self.attr_out(&attr))),
@@ -376,7 +394,7 @@ impl Vfs for View {
                 ..
             } = node
             {
-                r.done(Ok(target.into_bytes()));
+                r.done(Ok(constellation_vfs::name::wire_bytes(&target).into_owned()));
             } else {
                 r.done(err(Code::Invalid));
             }
@@ -384,7 +402,9 @@ impl Vfs for View {
         }
         self.session_wait(&[ReadKey::Ino(ino)]);
         match self.meta.readlink(ino) {
-            Ok(Some(target)) => r.done(Ok(target.into_bytes())),
+            Ok(Some(target)) => {
+                r.done(Ok(constellation_vfs::name::wire_bytes(&target).into_owned()))
+            }
             Ok(None) => r.done(err(Code::Invalid)),
             Err(e) => r.done(err(e.code())),
         }
@@ -510,7 +530,7 @@ impl Vfs for View {
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
-        let target = String::from_utf8_lossy(target);
+        let target = constellation_vfs::name::stored_form(target);
         let ino = match self.meta.allocate_ino(parent) {
             Ok(ino) => ino,
             Err(e) => return r.done(err(e.code())),
@@ -634,6 +654,7 @@ impl Vfs for View {
         let parent = enter!(self, parent, r);
         let _inflight = self.inflight.enter(&[parent]);
         let name = checked_name!(self, name, r);
+        let target = self.meta.lookup(parent, &name);
         let result = if (self.meta.is_scratch_dir(parent).unwrap_or(false)
             || self.meta.scratch_getattr(parent).ok().flatten().is_some())
             && self
@@ -662,7 +683,12 @@ impl Vfs for View {
             )
         };
         match result {
-            Ok(()) => r.done(Ok(())),
+            Ok(()) => {
+                if let Ok(Some(attr)) = target {
+                    self.remember_if_gone(attr);
+                }
+                r.done(Ok(()))
+            }
             Err(e) => r.done(err(self.beneath_non_dir(e, &[parent]))),
         }
     }
@@ -832,6 +858,12 @@ impl Vfs for View {
                 return;
             }
         }
+        // The target the rename replaces, if any.
+        let replaced = if exchange {
+            None
+        } else {
+            self.meta.lookup(newparent, &newname).ok().flatten()
+        };
         let op = if exchange {
             constellation_meta::MutateOp::Exchange {
                 parent,
@@ -849,7 +881,19 @@ impl Vfs for View {
             }
         };
         match self.mutate_op(parent, op) {
-            Ok(()) => r.done(Ok(())),
+            Ok(()) => {
+                // Like `unlink`'s: the target's last name went with no
+                // open handle in any view of this node, so reap it now
+                // (it was left in `orphans` for good).
+                if let Some(attr) = replaced {
+                    if attr.kind == InodeKind::Dir {
+                        self.remember_if_gone(attr);
+                    } else {
+                        self.reap_after_unlink(attr.ino);
+                    }
+                }
+                r.done(Ok(()))
+            }
             Err(e) => r.done(err(self.beneath_non_dir(e, &[parent, newparent]))),
         }
     }
@@ -889,7 +933,7 @@ impl Vfs for View {
                 // The handle first: `release_frozen` trims the pins to the
                 // handles the table still lists, so a pin must never exist
                 // without its handle there (plan 38 Z3c).
-                let fh = self.open_handle(ino);
+                let fh = self.open_handle(ino, false);
                 let backing = self.frozen_passthrough_backing(ino, flags, &node);
                 // Plan 38 §3(d), as for a live file below; nothing writes
                 // a frozen one.
@@ -925,7 +969,8 @@ impl Vfs for View {
                 // chunk file itself, and the pin that keeps it where the
                 // handle expects it is dropped in `release`.
                 let backing = self.passthrough_backing(ino, flags, &attr);
-                let fh = self.open_handle(ino);
+                let fh =
+                    self.open_handle(ino, flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC));
                 // Plan 38 §3(d): a read-only open the frontend can serve
                 // zero-copy reads for is marked so; which of its reads are
                 // zero-copy is decided per read (`zero_copy`'s module doc).
@@ -973,7 +1018,10 @@ impl Vfs for View {
                 self.note_writer_open(attr.ino, flags);
                 r.done(Ok((
                     self.entry_out(&attr),
-                    Opened::new(self.open_handle(attr.ino)),
+                    Opened::new(self.open_handle(
+                        attr.ino,
+                        flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC),
+                    )),
                 )))
             }
             Err(e) => r.done(err(e)),
@@ -1134,8 +1182,11 @@ impl Vfs for View {
         let locks = self.cluster_locks().filter(|_| !View::is_synthetic(ino));
         let gate = self.lock_publish_gate(ino, fh);
         let idle = locks.map(|l| l.drop_owner(ino, owner.0));
+        let publishes = self.handles.writes(fh);
         let result = gate.and_then(|owed| {
-            self.flush_inode(ino, false)?;
+            if publishes {
+                self.flush_inode(ino, false)?;
+            }
             if owed {
                 return Err(Code::Io);
             }
@@ -1163,6 +1214,7 @@ impl Vfs for View {
     ) {
         // The description ends with this call however it answers (an
         // `enter!` refusal included): nothing addresses it any more.
+        let publishes = self.handles.writes(fh);
         let _closed = self.handles.closing(fh);
         self.drop_zero_copy(fh);
         let _w = self.watch.enter("release", ino);
@@ -1184,12 +1236,25 @@ impl Vfs for View {
         let locks = self.cluster_locks();
         let gate = self.lock_publish_gate(ino, fh);
         drop(_closed);
-        let idle = match (locks, owner) {
+        let mut idle = match (locks, owner) {
             (Some(l), Some(owner)) => l.drop_owner(ino, owner.0),
             _ => false,
         };
+        // The open file description's own (OFD) locks end with it.
+        for (locked, by) in self.take_lock_handle(fh) {
+            if let Some(l) = locks {
+                let none_left = l.drop_owner(locked, by);
+                if locked == ino {
+                    idle |= none_left;
+                } else if none_left {
+                    l.idle(locked);
+                }
+            }
+        }
         let flush_result = gate.and_then(|owed| {
-            self.flush_inode(ino, flags.contains(OpenFlags::SYNC))?;
+            if publishes {
+                self.flush_inode(ino, flags.contains(OpenFlags::SYNC))?;
+            }
             if owed {
                 return Err(Code::Io);
             }
@@ -1242,6 +1307,7 @@ impl Vfs for View {
             }
             if let Ok(Some(attr)) = self.meta.getattr(ino) {
                 if attr.nlink == 0 {
+                    self.remember_dead(attr);
                     let _ = self.meta.reap_orphan(ino);
                 }
             }
@@ -1331,7 +1397,12 @@ impl Vfs for View {
                         let Some((child_ino, kind, name)) = entries.get((idx - 2) as usize) else {
                             break;
                         };
-                        r.add(*child_ino, next, kind_out(*kind), name.as_bytes())
+                        r.add(
+                            *child_ino,
+                            next,
+                            kind_out(*kind),
+                            &constellation_vfs::name::wire_bytes(name),
+                        )
                     }
                 };
                 if full {
@@ -1380,7 +1451,7 @@ impl Vfs for View {
                 child.ino,
                 *next,
                 kind_out(child.kind),
-                child.name.as_bytes(),
+                &constellation_vfs::name::wire_bytes(&child.name),
             ) {
                 break;
             }
@@ -1780,7 +1851,7 @@ impl Vfs for View {
         &self,
         cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh: Fh,
         lock: LockSpec,
         sleep: bool,
         r: R,
@@ -1804,6 +1875,7 @@ impl Vfs for View {
         // Data written under an earlier grant that ended without its
         // flush does not ride along under the new one.
         self.lock_discard_tainted(ino);
+        self.note_lock_handle(fh, ino, lock.owner.0);
         let local = constellation_meta::locks::LocalLock {
             owner: lock.owner.0,
             pid: lock.pid,

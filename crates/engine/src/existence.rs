@@ -186,6 +186,7 @@ mod tests {
                 manifest: manifest_of(hash),
                 size: 4096,
                 time_ns: 2,
+                mtime_ns: 2,
             },
         ])
         .unwrap();

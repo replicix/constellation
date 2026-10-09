@@ -2003,6 +2003,22 @@ impl LockTables {
         }
         let was_empty = g.local.get(&ino).is_none_or(|v| v.is_empty());
         let v = g.local.entry(ino).or_default();
+        // POSIX merges an owner's locks of one type that overlap or touch
+        // into one: `F_GETLK` then reports the whole lock, not the piece
+        // set last (xcheckfs saw ext4 answer 4+24 where this said 4+8).
+        // The ranges merged are only that owner's same-type locks (an
+        // owner's locks never overlap), so cutting the union is exact.
+        let mut lock = lock;
+        for l in v.iter() {
+            if l.owner == lock.owner
+                && l.write == lock.write
+                && l.start <= lock.end.saturating_add(1)
+                && lock.start <= l.end.saturating_add(1)
+            {
+                lock.start = lock.start.min(l.start);
+                lock.end = lock.end.max(l.end);
+            }
+        }
         Self::cut(v, lock.owner, lock.start, lock.end);
         v.push(lock);
         if was_empty {
@@ -2353,6 +2369,43 @@ mod tests {
         assert_eq!(
             t.local_set(7, lk(1, true, 0, 10), 100),
             LocalOutcome::NeedGrant(LockMode::Exclusive)
+        );
+    }
+
+    #[test]
+    fn an_owners_touching_locks_of_one_type_merge() {
+        let t = LockTables::default();
+        t.install_held(7, held(LockMode::Exclusive, 100));
+        assert_eq!(t.local_set(7, lk(1, false, 4, 11), 0), LocalOutcome::Done);
+        assert_eq!(t.local_set(7, lk(1, false, 15, 18), 0), LocalOutcome::Done);
+        // Overlapping one, touching the other: one lock 4..=27.
+        assert_eq!(t.local_set(7, lk(1, false, 12, 27), 0), LocalOutcome::Done);
+        assert_eq!(t.local_locks(7), [lk(1, false, 4, 27)]);
+        // Another type, or another owner, does not merge.
+        assert_eq!(t.local_set(7, lk(1, true, 28, 30), 0), LocalOutcome::Done);
+        assert_eq!(t.local_set(7, lk(2, false, 31, 40), 0), LocalOutcome::Done);
+        let mut v = t.local_locks(7);
+        v.sort_by_key(|l| l.start);
+        assert_eq!(
+            v,
+            [
+                lk(1, false, 4, 27),
+                lk(1, true, 28, 30),
+                lk(2, false, 31, 40)
+            ]
+        );
+        // A read lock over the owner's write lock replaces that part,
+        // and merges with the read lock it now touches.
+        assert_eq!(t.local_set(7, lk(1, false, 28, 29), 0), LocalOutcome::Done);
+        let mut v = t.local_locks(7);
+        v.sort_by_key(|l| l.start);
+        assert_eq!(
+            v,
+            [
+                lk(1, false, 4, 29),
+                lk(1, true, 30, 30),
+                lk(2, false, 31, 40)
+            ]
         );
     }
 

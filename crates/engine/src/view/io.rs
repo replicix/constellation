@@ -290,11 +290,10 @@ impl View {
             // as zeros. Nothing here copies a shared chunk.
             let (chunk, valid): (Bytes, usize) = match &ws {
                 Some(w) if w.sealed.contains_key(&slice.index) => {
-                    let chunk = self
-                        .cache
-                        .get_shared(w.sealed.get(&slice.index).unwrap())
-                        .map_err(|_| Code::Io)?
-                        .ok_or(Code::Io)?;
+                    // Fetched, not only looked up: an uploaded sealed copy
+                    // is clean and may have been evicted.
+                    let chunk =
+                        self.fetch_chunk_for_inode(Some(ino), w.sealed.get(&slice.index).unwrap())?;
                     let valid = chunk.len();
                     (chunk, valid)
                 }
@@ -416,28 +415,30 @@ impl View {
             let full_len = layout.chunk_len(new_file_len, slice.index);
             let is_whole_chunk = slice.offset == 0 && slice.len == full_len;
             let chunk_start = slice.index * self.chunk_size as u64;
-            let sealed = self.unseal(ws, ino, slice.index)?;
             // A chunk this session punched (or zeroed) whole has no base
             // content any more: seeded from zeros, never the base's
             // bytes (a sealed copy is this session's own, and valid).
             let punched = ws.zeroed.contains(slice.index);
-            ws.holes.clear(slice.index);
-            ws.staging
-                .prepare_chunk(slice.index, self.chunk_size)
-                .map_err(|e| staging_code(&e))?;
             // A partial (not-whole-chunk) write into a chunk this open
             // handle has not touched yet must first seed the untouched
             // bytes from the committed content — otherwise they would
             // read back as a spurious hole (zero) instead of their real
             // pre-write value.
-            if !is_whole_chunk && !ws.staging.is_dirty(slice.index) {
-                let seed = match sealed {
+            //
+            // Everything that can fail comes before anything that changes
+            // the session: the seed is read and staging reserved first,
+            // then the chunk unsealed. In the other order a failure left
+            // the chunk neither sealed nor staged, and reads fell through
+            // to the base — writes already acknowledged in that chunk read
+            // back as the base's bytes (zeros, for a sparse file). And a
+            // sealed copy is fetched, not only looked up in the cache:
+            // once uploaded it is a clean, evictable entry, and a full
+            // cache had evicted it (EIO on the write, the database lane).
+            let seed = if !is_whole_chunk && !ws.staging.is_dirty(slice.index) {
+                Some(match ws.sealed.get(&slice.index).copied() {
                     Some(hash) => {
-                        let mut data = self
-                            .cache
-                            .get(&hash)
-                            .map_err(|_| Code::Io)?
-                            .ok_or(Code::Io)?;
+                        let mut data =
+                            Vec::from(&self.fetch_chunk_for_inode(Some(ino), &hash)?[..]);
                         data.resize(full_len as usize, 0);
                         data
                     }
@@ -448,7 +449,16 @@ impl View {
                         ws.clip_base(&mut seed, chunk_start, manifest.file_len);
                         seed
                     }
-                };
+                })
+            } else {
+                None
+            };
+            ws.staging
+                .prepare_chunk(slice.index, self.chunk_size)
+                .map_err(|e| staging_code(&e))?;
+            self.unseal(ws, ino, slice.index)?;
+            ws.holes.clear(slice.index);
+            if let Some(seed) = seed {
                 ws.staging
                     .write_at(chunk_start, &seed)
                     .map_err(|e| staging_code(&e))?;
@@ -463,10 +473,8 @@ impl View {
             consumed += slice.len as usize;
         }
         ws.file_len = new_file_len;
-        if offset <= ws.high_water && write_end > ws.high_water {
-            ws.high_water = write_end;
-        }
-        self.seal_crossed_chunks(ino, ws)?;
+        ws.changed();
+        self.note_write(ino, ws, offset, write_end)?;
         Ok(data.len() as u32)
     }
 
@@ -488,6 +496,7 @@ impl View {
         let cs = u64::from(self.chunk_size);
         let ws = self.write_state(writes, ino, manifest)?;
         self.quota_check(ino, new_size)?;
+        ws.changed();
         if new_size < ws.file_len {
             // Everything at or past `new_size` is dead, whatever holds it
             // — the base (`floor`: zeroed wherever base content is read
@@ -509,15 +518,15 @@ impl View {
                 if idx * cs >= new_size {
                     self.unseal(ws, ino, idx)?;
                 } else if (idx + 1) * cs > new_size {
-                    let hash = self.unseal(ws, ino, idx)?.expect("sealed");
-                    let data = self
-                        .cache
-                        .get(&hash)
-                        .map_err(|_| Code::Io)?
-                        .ok_or(Code::Io)?;
+                    // Fetched (the sealed copy may have been evicted once
+                    // uploaded) and staging reserved before the chunk
+                    // leaves the sealed set, as in `do_write`.
+                    let hash = *ws.sealed.get(&idx).expect("sealed");
+                    let data = self.fetch_chunk_for_inode(Some(ino), &hash)?;
                     ws.staging
                         .prepare_chunk(idx, self.chunk_size)
                         .map_err(|e| staging_code(&e))?;
+                    self.unseal(ws, ino, idx)?;
                     ws.staging
                         .write_at(idx * cs, &data)
                         .map_err(|e| staging_code(&e))?;
@@ -535,7 +544,10 @@ impl View {
                 *end = (*end).min(new_size);
                 *start < *end
             });
-            ws.high_water = ws.high_water.min(new_size);
+            ws.runs.retain_mut(|(start, end)| {
+                *end = (*end).min(new_size);
+                *start < new_size
+            });
         }
         ws.staging
             .set_len_sparse(new_size)
@@ -595,6 +607,7 @@ impl View {
         {
             let mut writes = self.writes.lock(ino);
             let ws = self.write_state(&mut writes, ino, &manifest)?;
+            ws.changed();
             if new_size > ws.file_len {
                 ws.staging
                     .set_len_sparse(new_size)

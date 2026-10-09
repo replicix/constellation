@@ -498,12 +498,14 @@ fn write_manifest(ino: u64, byte: u8, len: u64, t: i64) -> (LogRecord, MutateOp)
             manifest: manifest.clone(),
             size: len,
             time_ns: t,
+            mtime_ns: t,
         },
         MutateOp::SetManifest {
             ino,
             base_manifest: None,
             manifest,
             size: len,
+            mtime_ns: None,
         },
     )
 }
@@ -1487,6 +1489,7 @@ fn a_streamed_manifest_held_back_by_its_chunk_stays_speculation_until_it_ships()
             manifest: vec![0xAB; 24],
             size: 4096,
             time_ns: t0 + 2,
+            mtime_ns: t0 + 2,
         },
         completed(r_manifest),
     ];
@@ -1578,6 +1581,7 @@ fn a_streamed_transaction_the_tenure_ships_past_is_rolled_back() {
             manifest: vec![0xAB; 24],
             size: 4096,
             time_ns: t0 + 2,
+            mtime_ns: t0 + 2,
         },
         completed(rid(3)),
     ];

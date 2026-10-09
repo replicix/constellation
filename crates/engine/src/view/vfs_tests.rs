@@ -260,6 +260,41 @@ fn mkdir_and_readdir_resume_from_a_cookie() {
     assert_eq!(code(c.mkdir(ROOT_INO, "d")), Code::Exists);
 }
 
+/// A removed inode the kernel still references without a handle (an
+/// `O_PATH` descriptor, a working directory) stats as `nlink == 0` until
+/// the kernel's `FORGET`.
+#[test]
+fn a_removed_inode_stats_with_no_links_until_it_is_forgotten() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    c.write(e.attr.ino, o.fh, 0, b"abc").unwrap();
+    c.close(e.attr.ino, o.fh).unwrap();
+    let f = e.attr.ino;
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    let (v, o) = c.create(ROOT_INO, "victim").unwrap();
+    c.close(v.attr.ino, o.fh).unwrap();
+    let (src, o) = c.create(ROOT_INO, "src").unwrap();
+    c.close(src.attr.ino, o.fh).unwrap();
+
+    c.unlink(ROOT_INO, "f").unwrap();
+    c.rmdir(ROOT_INO, "d").unwrap();
+    c.rename(ROOT_INO, "src", ROOT_INO, "victim").unwrap();
+    let gone = c.getattr(f).unwrap();
+    assert_eq!((gone.nlink, gone.size), (0, 3));
+    assert_eq!(c.getattr(d).unwrap().nlink, 0);
+    assert_eq!(c.getattr(v.attr.ino).unwrap().nlink, 0);
+    assert_eq!(
+        c.getattr(src.attr.ino).unwrap().nlink,
+        1,
+        "the renamed file lives"
+    );
+
+    for ino in [f, d, v.attr.ino] {
+        c.view.forget(ino);
+        assert_eq!(code(c.getattr(ino)), Code::NotFound);
+    }
+}
+
 #[test]
 fn rename_unlink_and_rmdir() {
     let c = client();
@@ -281,7 +316,7 @@ fn rename_unlink_and_rmdir() {
 }
 
 #[test]
-fn xattrs_round_trip_and_the_virtual_ones_are_listed_but_read_only() {
+fn xattrs_round_trip_and_the_virtual_ones_are_read_only_and_unlisted() {
     let c = client();
     let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
     let (e, o) = c.create(d, "f").unwrap();
@@ -291,14 +326,7 @@ fn xattrs_round_trip_and_the_virtual_ones_are_listed_but_read_only() {
     c.setxattr(f, "user.color", b"blue", SetXattrFlags::empty())
         .unwrap();
     assert_eq!(c.getxattr(f, "user.color").unwrap(), b"blue");
-    assert_eq!(
-        c.listxattr(f).unwrap(),
-        [
-            "user.color",
-            "user.constellation.rcount",
-            "user.constellation.rsize"
-        ]
-    );
+    assert_eq!(c.listxattr(f).unwrap(), ["user.color"]);
     // The virtual ones: computed, never stored or settable.
     assert_eq!(c.getxattr(d, "user.constellation.rsize").unwrap(), b"5");
     assert_eq!(c.getxattr(d, "user.constellation.rcount").unwrap(), b"1");
@@ -311,8 +339,13 @@ fn xattrs_round_trip_and_the_virtual_ones_are_listed_but_read_only() {
         Code::Perm
     );
     // Namespaces and flags.
+    assert_eq!(code(c.getxattr(f, "security.capability")), Code::NoData);
+    c.setxattr(f, "security.x", b"1", SetXattrFlags::empty())
+        .unwrap();
+    assert_eq!(c.getxattr(f, "security.x").unwrap(), b"1");
+    c.removexattr(f, "security.x").unwrap();
     assert_eq!(
-        code(c.setxattr(f, "security.x", b"1", SetXattrFlags::empty())),
+        code(c.setxattr(f, "system.x", b"1", SetXattrFlags::empty())),
         Code::NotSupported
     );
     assert_eq!(
@@ -334,10 +367,7 @@ fn xattrs_round_trip_and_the_virtual_ones_are_listed_but_read_only() {
     );
     c.removexattr(f, "user.color").unwrap();
     assert_eq!(code(c.getxattr(f, "user.color")), Code::NoData);
-    assert_eq!(
-        c.listxattr(f).unwrap(),
-        ["user.constellation.rcount", "user.constellation.rsize"]
-    );
+    assert!(c.listxattr(f).unwrap().is_empty());
 }
 
 #[test]
@@ -442,6 +472,95 @@ fn setattr_truncates_and_sets_times() {
     assert_eq!(attr.mode & 0o7777, 0o600);
     assert_eq!(c.read(ino, o.fh, 0, 64).unwrap(), b"abc");
     c.close(ino, o.fh).unwrap();
+}
+
+/// Only a writer's close publishes (close-to-open): a read-only
+/// description's close leaves another descriptor's pending writes alone
+/// (it used to publish them, a chunk upload and commit per reader close).
+#[test]
+fn a_read_only_close_does_not_publish_anothers_writes() {
+    let c = client();
+    let (e, w) = c.create(ROOT_INO, "f").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, w.fh, 0, b"12345").unwrap();
+    let r = Blocking::run(|r| {
+        c.view.open(
+            &c.cx(OpKind::Open),
+            ino,
+            OpenFlags::empty(),
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        c.read(ino, r.fh, 0, 64).unwrap(),
+        b"12345",
+        "the reader sees the pending writes"
+    );
+    c.close(ino, r.fh).unwrap();
+    assert_eq!(
+        c._meta.getattr(ino).unwrap().unwrap().size,
+        0,
+        "not published by the reader"
+    );
+    assert_eq!(c.getattr(ino).unwrap().size, 5);
+    c.close(ino, w.fh).unwrap();
+    assert_eq!(
+        c._meta.getattr(ino).unwrap().unwrap().size,
+        5,
+        "published by the writer"
+    );
+}
+
+/// mtime follows the writes of an open file, not its flush: each write
+/// moves it (visible before the close), the close keeps the last write's
+/// time rather than stamping its own, and a time set through the open
+/// descriptor before the close (`cp -p`) is the one the file keeps.
+#[test]
+fn mtime_is_the_last_writes_or_the_one_set_not_the_flushs() {
+    let c = client();
+    let pause = || std::thread::sleep(std::time::Duration::from_millis(20));
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"one").unwrap();
+    let first = c.getattr(ino).unwrap().mtime_ns;
+    pause();
+    c.write(ino, o.fh, 3, b"two").unwrap();
+    let second = c.getattr(ino).unwrap().mtime_ns;
+    assert!(second > first, "a write moves mtime before the close");
+    pause();
+    c.close(ino, o.fh).unwrap();
+    let closed = c.getattr(ino).unwrap();
+    assert_eq!(
+        closed.mtime_ns, second,
+        "the close keeps the last write's time"
+    );
+    assert!(closed.ctime_ns >= second);
+
+    let (e, o) = c.create(ROOT_INO, "p").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"copied").unwrap();
+    Blocking::run(|r| {
+        c.view.setattr(
+            &c.cx(OpKind::Setattr),
+            ino,
+            Some(o.fh),
+            &SetAttr {
+                mtime: Some(TimeSet::At(-1_000_000_000)),
+                ..SetAttr::default()
+            },
+            r,
+        )
+    })
+    .unwrap();
+    pause();
+    c.close(ino, o.fh).unwrap();
+    assert_eq!(
+        c.getattr(ino).unwrap().mtime_ns,
+        -1_000_000_000,
+        "the time set survives the close"
+    );
 }
 
 /// The kind lane's busy-writer loss: the kernel stores every attribute

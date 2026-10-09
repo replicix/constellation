@@ -80,23 +80,34 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
     #[test]
-    fn a_name_is_stored_lossily_within_name_max_and_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..400)) {
+    fn a_name_round_trips_within_name_max_and_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..400)) {
         let policy = NamePolicy::linux();
-        let lossy = String::from_utf8_lossy(&bytes).into_owned();
         match policy.check(Name::new(&bytes)) {
             Ok(stored) => {
-                prop_assert!(stored.len() <= NAME_MAX);
-                prop_assert_eq!(&*stored, lossy.as_str());
-                // Valid UTF-8 is stored untouched.
-                if std::str::from_utf8(&bytes).is_ok() {
-                    prop_assert_eq!(stored.as_bytes(), &bytes[..]);
+                prop_assert!(bytes.len() <= NAME_MAX);
+                prop_assert_eq!(&*constellation_vfs::name::wire_bytes(&stored), &bytes[..]);
+                // Valid UTF-8 outside the escape range is stored untouched.
+                if let Ok(s) = std::str::from_utf8(&bytes) {
+                    if !s.chars().any(|c| u32::from(c) >= 0x10_FF80) {
+                        prop_assert_eq!(stored.as_bytes(), &bytes[..]);
+                    }
                 }
             }
             Err(code) => {
                 prop_assert_eq!(code, Code::NameTooLong);
-                prop_assert!(lossy.len() > NAME_MAX);
+                prop_assert!(bytes.len() > NAME_MAX);
             }
         }
+    }
+
+    #[test]
+    fn distinct_names_have_distinct_stored_forms(
+        a in proptest::collection::vec(prop_oneof![any::<u8>(), Just(0xf4u8), Just(0x8fu8), Just(0xbfu8)], 0..12),
+        b in proptest::collection::vec(prop_oneof![any::<u8>(), Just(0xf4u8), Just(0x8fu8), Just(0xbfu8)], 0..12),
+    ) {
+        let sa = constellation_vfs::name::stored_form(&a);
+        let sb = constellation_vfs::name::stored_form(&b);
+        prop_assert_eq!(a == b, sa == sb);
     }
 
     #[test]
@@ -181,8 +192,8 @@ proptest! {
         let caller = Caller::with_groups(uid, gid, &[]);
         prop_assert_eq!(stack.identity.owner(&caller), (uid, gid));
         prop_assert_eq!(IdentityMap::Posix.owner(&caller), (uid, gid));
-        // Xattr names: unchanged in, and the listing is the stored set plus
-        // the two virtual names, in order.
+        // Xattr names: unchanged in, and the listing is the stored set, in
+        // order (the virtual names are read by name, never listed).
         let stored: Vec<String> = names.iter().cloned().collect();
         let listed: Vec<String> = stack
             .xattrs
@@ -191,9 +202,8 @@ proptest! {
             .map(|n| String::from_utf8(n.into_bytes()).unwrap())
             .collect();
         let mut want = stored;
-        want.push(RSIZE.to_string());
-        want.push(RCOUNT.to_string());
         want.sort();
+        want.dedup();
         prop_assert_eq!(listed, want);
     }
 
@@ -208,7 +218,7 @@ proptest! {
         // Undoing the two differences gives the reference stack back.
         let mut undone = stack;
         undone.names.case = CasePolicy::Sensitive;
-        undone.xattrs.list_virtual = true;
+        undone.xattrs.list_virtual = false;
         prop_assert_eq!(undone, PolicyStack::linux());
     }
 

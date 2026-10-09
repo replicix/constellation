@@ -5,6 +5,12 @@
 use super::*;
 use crate::recovery::conflict_name_for_path;
 
+/// Sequential runs a write session follows at once ([`View::note_write`]).
+const MAX_RUNS: usize = 8;
+/// Whole dirty chunks a write seals under staging pressure, at most
+/// ([`View::note_write`]).
+const PRESSURE_SEALS: usize = 8;
+
 /// How many times a forwarded whole-file manifest commit may rebase
 /// onto a concurrent update before giving up with `EAGAIN`. Each pass
 /// costs one round trip to the holder and loses only to a writer that
@@ -248,7 +254,9 @@ impl View {
                 holes: crate::staging::DirtyRuns::default(),
                 zeroed: crate::staging::DirtyRuns::default(),
                 seal_buffer: Vec::new(),
-                high_water: size.min(manifest.file_len),
+                runs: Vec::new(),
+                mtime_ns: None,
+                ctime_ns: 0,
                 written: Vec::new(),
                 floor: (size < manifest.file_len).then_some(size),
             });
@@ -288,15 +296,74 @@ impl View {
         }
     }
 
-    /// Seal dirty full chunks below the contiguous write high-water
-    /// mark. Byte-prefix continuity is used instead of borrowing the
-    /// read prefetcher's signal: it directly proves a sequential
-    /// writer has crossed the boundary. A later write into a sealed
-    /// chunk re-admits and re-dirties that chunk.
-    pub(super) fn seal_crossed_chunks(&self, ino: Ino, ws: &mut WriteState) -> Result<(), Code> {
-        let complete = ws.high_water / u64::from(self.chunk_size);
+    /// Note that `[offset, end)` was written, and seal the dirty chunks
+    /// that made a sequential run move past (eager upload: a file larger
+    /// than the cache streams through it). Byte continuity of a run is
+    /// used instead of borrowing the read prefetcher's signal: it
+    /// directly proves a sequential writer has crossed the boundary. Up
+    /// to [`MAX_RUNS`] runs are followed at once (a multi-stream
+    /// download writes at several fronts), and only what this write made
+    /// a run cross is sealed: a rewrite inside a run (a header patched on
+    /// every append) seals nothing. A later write into a sealed chunk
+    /// re-admits and re-dirties that chunk.
+    ///
+    /// A random writer's chunks stay dirty until the flush, or until the
+    /// node's staging is half full: then each write also seals up to
+    /// [`PRESSURE_SEALS`] of its session's whole dirty chunks — well
+    /// before `throttle_delay` slows writes (three quarters) or refuses
+    /// them (full), and few at a time, as this runs under the write
+    /// shard's lock.
+    ///
+    /// (A session on an existing file used to count the whole file as
+    /// crossed, so each small overwrite re-sealed its whole chunk — read
+    /// back, hashed, cached and uploaded: 4 KiB random writes into a
+    /// 64 MiB file ran at 19-88 IOPS and left 11 GB of superseded chunks
+    /// in the cache.)
+    pub(super) fn note_write(
+        &self,
+        ino: Ino,
+        ws: &mut WriteState,
+        offset: u64,
+        end: u64,
+    ) -> Result<(), Code> {
+        let chunk = u64::from(self.chunk_size);
+        let (start, old_end) = match ws
+            .runs
+            .iter()
+            .position(|(s, e)| (*s..=*e).contains(&offset))
+        {
+            Some(i) => ws.runs.remove(i),
+            None => {
+                if ws.runs.len() == MAX_RUNS {
+                    ws.runs.remove(0);
+                }
+                (offset, offset)
+            }
+        };
+        let new_end = old_end.max(end);
+        ws.runs.push((start, new_end));
+        self.seal_chunks(ino, ws, old_end / chunk..new_end / chunk)?;
+        if self.staging_budget.used().saturating_mul(2) >= self.staging_budget.budget() {
+            let whole = ws.file_len / chunk;
+            let victims: Vec<u64> = ws
+                .staging
+                .dirty_indices()
+                .filter(|idx| *idx < whole)
+                .take(PRESSURE_SEALS)
+                .collect();
+            self.seal_chunks(ino, ws, victims)?;
+        }
+        Ok(())
+    }
+
+    fn seal_chunks(
+        &self,
+        ino: Ino,
+        ws: &mut WriteState,
+        chunks: impl IntoIterator<Item = u64>,
+    ) -> Result<(), Code> {
         let mut sealed_any = false;
-        for idx in 0..complete {
+        for idx in chunks {
             if !ws.staging.is_dirty(idx) || ws.sealed.contains_key(&idx) {
                 continue;
             }
@@ -342,26 +409,23 @@ impl View {
     }
 
     /// Drop sealed chunk `idx` from the write session (it is being
-    /// overwritten or punched) and withdraw the one pending-upload claim
-    /// its seal enrolled, if it enrolled one. Other claims on the same
-    /// content — another index with identical bytes, an earlier manifest
-    /// of this inode not yet uploaded — are untouched, so that content
-    /// still uploads (`Meta::cancel_pending_upload`).
+    /// overwritten or punched). Its pending-upload claim stays: the copy
+    /// uploads like any other, becomes Clean — durable, and evictable —
+    /// and is garbage GC collects. Withdrawing the claim instead left a
+    /// Dirty cache entry nothing would ever upload or evict: every chunk
+    /// sealed and then written again leaked its cache space for good (a
+    /// database's cache filled with them, and writes failed). Marking it
+    /// Clean is no way out either: Clean means "in S3" to every check
+    /// that skips an upload, so identical content written later went
+    /// unuploaded, and its cache copy could be evicted — lost.
     pub(super) fn unseal(
         &self,
         ws: &mut WriteState,
-        ino: Ino,
+        _ino: Ino,
         idx: u64,
     ) -> Result<Option<ChunkHash>, Code> {
-        let hash = ws.sealed.remove(&idx);
-        if let Some(hash) = &hash {
-            if ws.enrolled.remove(&idx) {
-                self.meta
-                    .cancel_pending_upload(hash, ino)
-                    .map_err(|error| error.code())?;
-            }
-        }
-        Ok(hash)
+        ws.enrolled.remove(&idx);
+        Ok(ws.sealed.remove(&idx))
     }
 
     /// Insert content as Dirty unless the local durable-set rung proves
@@ -597,7 +661,7 @@ impl View {
                     .map_err(|e| dropped(e.code()))?;
             }
             self.meta
-                .scratch_set_manifest(ino, &manifest_bytes, ws.file_len)
+                .scratch_set_manifest(ino, &manifest_bytes, ws.file_len, ws.mtime_ns)
                 .map_err(|e| dropped(e.code()))?;
             ws.staging.discard();
             return Ok(force_through);
@@ -813,6 +877,7 @@ impl View {
                     base_manifest: None,
                     manifest: Vec::new(),
                     size: 0,
+                    mtime_ns: None,
                 })
         });
         if admitted.is_some() && owned.is_none() {
@@ -927,6 +992,7 @@ impl View {
                             Some(&base.encode()),
                             manifest_bytes,
                             file_len,
+                            ws.mtime_ns,
                             dirty_hashes,
                         )
                     })
@@ -963,6 +1029,7 @@ impl View {
                     base_manifest: None,
                     manifest: Vec::new(),
                     size: 0,
+                    mtime_ns: None,
                 })
                 .is_some()
     }
@@ -1060,6 +1127,7 @@ impl View {
                         base_manifest: Some(base.encode()),
                         manifest: manifest_bytes.to_vec(),
                         size: file_len,
+                        mtime_ns: ws.mtime_ns,
                     },
                 );
                 if defer_upload {

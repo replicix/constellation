@@ -24,6 +24,10 @@ fn env() -> Env {
 }
 
 fn env_with(chunk: u32) -> Env {
+    env_with_budget(chunk, 1 << 30)
+}
+
+fn env_with_budget(chunk: u32, staging_budget: u64) -> Env {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let dir = TempDir::new().unwrap();
     // With the memory tier on: every truncate/clip shape below then also
@@ -53,7 +57,7 @@ fn env_with(chunk: u32) -> Env {
             sync: None,
             coop: None,
             staging_dir: dir.path().join("staging"),
-            staging_budget: StagingBudget::new(1 << 30),
+            staging_budget: StagingBudget::new(staging_budget),
             snapshots,
             atime: Arc::new(crate::atime::AtimeAccumulator::new(
                 crate::atime::AtimeMode::Off,
@@ -107,6 +111,21 @@ fn read_all(e: &Env, ino: Ino) -> Vec<u8> {
         .into_owned()
 }
 
+/// The whole file, read a chunk at a time.
+fn read_whole(e: &Env, ino: Ino) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let part =
+            e.fs.do_read(ino, out.len() as u64, u64::from(CHUNK))
+                .unwrap();
+        let part = part.contiguous().unwrap().into_owned();
+        if part.is_empty() {
+            return out;
+        }
+        out.extend(part);
+    }
+}
+
 /// The FUSE `setattr(size)` path: the session's truncate plus the
 /// committed size.
 fn setattr_size(e: &Env, ino: Ino, size: u64) {
@@ -124,9 +143,32 @@ fn file_with(e: &Env, name: &str, bytes: &[u8]) -> Ino {
 }
 
 fn check(e: &Env, ino: Ino, want: &[u8], what: &str) {
-    assert_eq!(read_all(e, ino), want, "{what}: before the flush");
+    same(
+        &read_whole(e, ino),
+        want,
+        &format!("{what}: before the flush"),
+    );
     e.fs.flush_inode(ino, false).unwrap();
-    assert_eq!(read_all(e, ino), want, "{what}: after the flush");
+    same(
+        &read_whole(e, ino),
+        want,
+        &format!("{what}: after the flush"),
+    );
+}
+
+/// `got == want`, reported as the first differing offset (the buffers
+/// are megabytes).
+fn same(got: &[u8], want: &[u8], what: &str) {
+    if got != want {
+        let at = got.iter().zip(want).position(|(g, w)| g != w);
+        panic!(
+            "{what}: {} bytes read, {} expected, first difference at {at:?}: {:?} vs {:?}",
+            got.len(),
+            want.len(),
+            at.map(|i| &got[i..(i + 16).min(got.len())]),
+            at.map(|i| &want[i..(i + 16).min(want.len())]),
+        );
+    }
 }
 
 #[test]
@@ -417,12 +459,13 @@ fn rewriting_one_of_two_identical_sealed_chunks_keeps_the_other_enrolled() {
         "both sealed positions enrolled a claim"
     );
 
-    // Rewrite position 0 with different bytes: its claim goes, the
-    // claim of position 2 stays.
+    // Rewrite position 0 with different bytes: both claims stay (a
+    // superseded copy uploads and becomes evictable, see `View::unseal`),
+    // and the one position 2 needs is among them.
     e.fs.do_write(file.ino, 0, &chunk(b'C')).unwrap();
     assert_eq!(
         e.meta.pending_upload_claims(&same_hash, file.ino).unwrap(),
-        1
+        2
     );
 
     e.fs.flush_inode(file.ino, false).unwrap();
@@ -498,4 +541,234 @@ fn another_inodes_rewrite_or_delete_leaves_the_shared_chunk_enrolled() {
     e.upload_round();
     e.assert_manifest_in_s3(a.ino);
     e.assert_manifest_in_s3(b.ino);
+}
+
+// ---- when a write session seals (eager upload) ----
+//
+// A sequential run seals the chunks it moves past; a random writer's
+// chunks wait for the flush unless staging fills; a chunk written again
+// after its seal is not sealed again by a run.
+
+/// Chunk versions in the cache: one per seal (and per flushed chunk).
+fn cached(e: &Env) -> usize {
+    e.cache.entries().len()
+}
+
+fn claims(e: &Env, ino: Ino) -> usize {
+    e.meta
+        .pending_uploads()
+        .unwrap()
+        .iter()
+        .filter(|(_, i)| *i == ino)
+        .count()
+}
+
+/// A committed, uploaded file of `chunks` chunks, chunk `i` filled with
+/// `b'a' + i`.
+fn uploaded_file(e: &Env, name: &str, chunks: u8) -> (Ino, Vec<u8>) {
+    let bytes: Vec<u8> = (0..chunks).flat_map(|i| chunk(b'a' + i)).collect();
+    // A chunk per write, as FUSE delivers them (one write larger than
+    // the staging budget cannot be staged).
+    let ino = e.meta.create(ROOT_INO, name, 0o644, 0, 0).unwrap().ino;
+    for (i, part) in bytes.chunks(CHUNK as usize).enumerate() {
+        e.fs.do_write(ino, (i * CHUNK as usize) as u64, part)
+            .unwrap();
+    }
+    e.fs.flush_inode(ino, false).unwrap();
+    e.upload_round();
+    assert_eq!(claims(e, ino), 0);
+    (ino, bytes)
+}
+
+#[test]
+fn random_overwrites_of_an_existing_file_seal_nothing_until_the_flush() {
+    let e = env();
+    let (ino, mut want) = uploaded_file(&e, "random", 4);
+    let before = cached(&e);
+    for (i, idx) in [2u64, 0, 3, 1, 2, 0].into_iter().enumerate() {
+        let off = idx * u64::from(CHUNK) + 4096 * (i as u64 + 1);
+        let data = vec![b'0' + i as u8; 4096];
+        e.fs.do_write(ino, off, &data).unwrap();
+        want[off as usize..off as usize + 4096].copy_from_slice(&data);
+    }
+    assert_eq!(claims(&e, ino), 0, "no chunk sealed before the flush");
+    assert_eq!(
+        cached(&e),
+        before,
+        "no chunk version cached before the flush"
+    );
+    check(&e, ino, &want, "random overwrites");
+    assert_eq!(
+        claims(&e, ino),
+        4,
+        "the flush enrolls each touched chunk once"
+    );
+    e.assert_manifest_backed(ino);
+}
+
+#[test]
+fn a_sequential_overwrite_seals_behind_the_writer() {
+    let e = env();
+    let (ino, _) = uploaded_file(&e, "seq", 4);
+    let want: Vec<u8> = (0..4).flat_map(|i| chunk(b'k' + i)).collect();
+    for piece in want.chunks(64 << 10).enumerate() {
+        e.fs.do_write(ino, (piece.0 * (64 << 10)) as u64, piece.1)
+            .unwrap();
+        let crossed = (piece.0 + 1) * (64 << 10) / CHUNK as usize;
+        assert_eq!(
+            claims(&e, ino),
+            crossed,
+            "sealed as the run crosses each chunk"
+        );
+    }
+    check(&e, ino, &want, "sequential overwrite");
+}
+
+#[test]
+fn an_append_at_an_unaligned_length_seals_the_straddling_chunk_once_crossed() {
+    let e = env();
+    let half = CHUNK as usize / 2;
+    let mut want = chunk(b'a');
+    want.extend(vec![b'b'; half]);
+    let ino = file_with(&e, "append", &want);
+    e.upload_round();
+    let quarter = vec![b'c'; half / 2];
+    e.fs.do_write(ino, want.len() as u64, &quarter).unwrap();
+    want.extend(&quarter);
+    assert_eq!(claims(&e, ino), 0, "chunk 1 is not crossed yet");
+    e.fs.do_write(ino, want.len() as u64, &vec![b'd'; half])
+        .unwrap();
+    want.extend(vec![b'd'; half]);
+    assert_eq!(claims(&e, ino), 1, "the run crossed chunk 1");
+    check(&e, ino, &want, "append");
+}
+
+#[test]
+fn a_header_patched_on_every_append_is_sealed_once() {
+    let e = env();
+    let file = e.meta.create(ROOT_INO, "header", 0o644, 0, 0).unwrap();
+    let mut want = Vec::new();
+    let record = vec![b'r'; 64 << 10];
+    for i in 0..48u32 {
+        e.fs.do_write(file.ino, want.len() as u64, &record).unwrap();
+        want.extend(&record);
+        let count = (i + 1).to_le_bytes();
+        e.fs.do_write(file.ino, 0, &count).unwrap();
+        want[..4].copy_from_slice(&count);
+    }
+    // 3 MiB: chunks 0, 1 and 2 crossed, each sealed once: a patch inside
+    // the run crosses nothing.
+    assert!(cached(&e) <= 3, "{} chunk versions cached", cached(&e));
+    check(&e, file.ino, &want, "header");
+}
+
+#[test]
+fn two_interleaved_sequential_fronts_both_seal() {
+    let e = env();
+    let file = e.meta.create(ROOT_INO, "fronts", 0o644, 0, 0).unwrap();
+    let mut want = vec![0u8; 4 * CHUNK as usize];
+    let piece = 64 << 10;
+    for i in 0..(2 * CHUNK as usize / piece) {
+        for (front, fill) in [(0usize, b'A'), (2 * CHUNK as usize, b'a')] {
+            let off = front + i * piece;
+            // A different byte per chunk: identical chunks share a claim.
+            let data = vec![fill + (off / CHUNK as usize) as u8; piece];
+            e.fs.do_write(file.ino, off as u64, &data).unwrap();
+            want[off..off + piece].copy_from_slice(&data);
+        }
+    }
+    assert_eq!(
+        claims(&e, file.ino),
+        4,
+        "each front sealed the two chunks it crossed"
+    );
+    check(&e, file.ino, &want, "two fronts");
+}
+
+#[test]
+fn staging_pressure_seals_a_random_writers_chunks_instead_of_refusing() {
+    // Two chunks of budget: half of it is reached by one dirty chunk.
+    let e = env_with_budget(CHUNK, 2 * u64::from(CHUNK));
+    let (a, mut want_a) = uploaded_file(&e, "pa", 6);
+    let (b, mut want_b) = uploaded_file(&e, "pb", 6);
+    for round in 0..3u64 {
+        for idx in [4u64, 1, 5, 0, 3, 2] {
+            for (ino, want) in [(a, &mut want_a), (b, &mut want_b)] {
+                let off = idx * u64::from(CHUNK) + 8192 * (round + 1);
+                let data = vec![b'0' + idx as u8; 4096];
+                e.fs.do_write(ino, off, &data)
+                    .expect("no ENOSPC under pressure");
+                want[off as usize..off as usize + 4096].copy_from_slice(&data);
+            }
+        }
+    }
+    check(&e, a, &want_a, "pressure a");
+    check(&e, b, &want_b, "pressure b");
+    e.assert_manifest_backed(a);
+    e.assert_manifest_backed(b);
+}
+
+#[test]
+fn truncate_below_a_run_on_an_existing_file_then_extend_reads_zeros() {
+    let e = env();
+    let (ino, bytes) = uploaded_file(&e, "trunc", 3);
+    // A run starting at the end of the existing file, then cut below it.
+    e.fs.do_write(ino, bytes.len() as u64, &chunk(b'z'))
+        .unwrap();
+    let cut = u64::from(CHUNK) + 100;
+    setattr_size(&e, ino, cut);
+    let mut want = bytes[..cut as usize].to_vec();
+    let tail = vec![b'y'; 1000];
+    e.fs.do_write(ino, cut + 5000, &tail).unwrap();
+    want.resize(cut as usize + 5000, 0);
+    want.extend(&tail);
+    check(&e, ino, &want, "truncate below a run");
+}
+
+/// A chunk sealed and then written again (its pending-upload claim
+/// withdrawn) must not stay Dirty in the cache once nothing will upload
+/// it: Dirty entries are never evicted, so each one leaked cache space
+/// for good (the database lane's `dirty_bytes` stuck at the 10 GiB cache
+/// budget with no pending upload).
+#[test]
+fn a_superseded_sealed_chunk_does_not_stay_dirty() {
+    let e = env();
+    let file = e.meta.create(ROOT_INO, "superseded", 0o644, 0, 0).unwrap();
+    e.fs.do_write(file.ino, 0, &chunk(b'A')).unwrap();
+    e.fs.do_write(file.ino, u64::from(CHUNK), b"x").unwrap(); // seals chunk 0
+    e.fs.do_write(file.ino, 10, b"rewritten").unwrap(); // re-dirties it
+    e.fs.flush_inode(file.ino, false).unwrap();
+    e.upload_round();
+    assert!(e.meta.pending_uploads().unwrap().is_empty());
+    assert_eq!(
+        e.cache.dirty_bytes(),
+        0,
+        "a Dirty entry nothing will upload"
+    );
+}
+
+/// A sealed chunk, once uploaded, is a clean cache entry a full cache may
+/// evict: a write into it and a read of it fetch it back (they failed
+/// with EIO), and the failed write no longer lost the chunk's earlier
+/// writes (it unsealed the chunk before reading the copy, so reads then
+/// fell through to the base: zeros).
+#[test]
+fn an_evicted_sealed_copy_is_fetched_back() {
+    let e = env();
+    let file = e.meta.create(ROOT_INO, "evicted", 0o644, 0, 0).unwrap();
+    let mut want = chunk(b'A');
+    e.fs.do_write(file.ino, 0, &want).unwrap();
+    e.fs.do_write(file.ino, u64::from(CHUNK), b"x").unwrap(); // seals chunk 0
+    want.push(b'x');
+    e.upload_round();
+    let sealed = ChunkHash::of(&chunk(b'A'));
+    e.cache.remove(&sealed).unwrap();
+    assert_eq!(
+        &read_whole(&e, file.ino)[..CHUNK as usize],
+        &want[..CHUNK as usize],
+        "read of the evicted copy"
+    );
+    e.fs.do_write(file.ino, 100, b"patched").unwrap();
+    want[100..107].copy_from_slice(b"patched");
+    check(&e, file.ino, &want, "patched after eviction");
 }

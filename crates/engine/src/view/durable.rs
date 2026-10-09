@@ -37,15 +37,36 @@ pub struct Handle {
     pub ino: Ino,
     /// The newest discard error event on `ino` this description has seen.
     pub seen: u64,
+    /// Opened for writing: its `close` publishes the file's pending writes
+    /// (close-to-open). A read-only description's does not: it would
+    /// publish another descriptor's writes mid-stream — a 4 MiB chunk
+    /// hashed, uploaded and committed per reader's close, 40-80 ms each
+    /// (xcheckfs's read-back after every write made writes 40-175 times
+    /// slower). Missing from a handover export: writable, as before.
+    #[serde(default = "writable")]
+    pub write: bool,
+}
+
+fn writable() -> bool {
+    true
 }
 
 impl Handles {
     /// A new description of `ino`, having seen everything up to `seen`.
-    pub(super) fn open(&self, ino: Ino, seen: u64) -> Fh {
+    pub(super) fn open(&self, ino: Ino, seen: u64, write: bool) -> Fh {
         // Never 0: a frontend passes `Fh(0)` for "no handle".
         let fh = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        self.open.lock().unwrap().insert(fh, Handle { ino, seen });
+        self.open
+            .lock()
+            .unwrap()
+            .insert(fh, Handle { ino, seen, write });
         Fh(fh)
+    }
+
+    /// Whether `fh` was opened for writing (`true` for a handle this view
+    /// does not know: its close publishes, as every close used to).
+    pub(super) fn writes(&self, fh: Fh) -> bool {
+        self.open.lock().unwrap().get(&fh.0).is_none_or(|h| h.write)
     }
 
     pub(super) fn ino(&self, fh: Fh) -> Option<Ino> {
@@ -122,8 +143,9 @@ impl Drop for Closing<'_> {
 
 impl View {
     /// A new open file description of `ino` (see the module doc).
-    pub(super) fn open_handle(&self, ino: Ino) -> Fh {
-        self.handles.open(ino, self.meta.locks().error_seq(ino))
+    pub(super) fn open_handle(&self, ino: Ino, write: bool) -> Fh {
+        self.handles
+            .open(ino, self.meta.locks().error_seq(ino), write)
     }
 
     /// This view's last description of `ino` closed: forget the inode's
@@ -160,7 +182,7 @@ impl View {
             return Fh(*fh);
         }
         drop(open);
-        self.handles.open(ino, 0)
+        self.handles.open(ino, 0, true)
     }
 
     /// The node's `fsync` policy and waits.
@@ -264,8 +286,8 @@ mod tests {
     #[test]
     fn handles_are_unique_and_address_their_inode() {
         let h = Handles::default();
-        let a = h.open(7, 0);
-        let b = h.open(7, 0);
+        let a = h.open(7, 0, true);
+        let b = h.open(7, 0, true);
         assert_ne!(a, b);
         assert_ne!(a, Fh(0));
         assert_eq!(h.ino(a), Some(7));
@@ -279,10 +301,10 @@ mod tests {
     #[test]
     fn an_error_event_is_reported_once_per_description_open_at_the_time() {
         let h = Handles::default();
-        let a = h.open(7, 0);
-        let b = h.open(7, 0);
+        let a = h.open(7, 0, true);
+        let b = h.open(7, 0, true);
         let event = 3;
-        let c = h.open(7, event);
+        let c = h.open(7, event, true);
         assert!(h.take_error(a, 7, event));
         assert!(!h.take_error(a, 7, event), "reported once");
         assert!(h.take_error(b, 7, event));

@@ -37,11 +37,12 @@ pub fn reply_code(code: Code) -> Errno {
 
 /// The kernel's attribute struct for `attr`.
 pub(crate) fn fuse_attr(a: &Attr) -> fuser::FileAttr {
+    // Before 1970 too: a time `utimes` set there is stored as is.
     let ts = |ns: i64| {
         if ns >= 0 {
             UNIX_EPOCH + Duration::from_nanos(ns as u64)
         } else {
-            UNIX_EPOCH
+            UNIX_EPOCH - Duration::from_nanos(ns.unsigned_abs())
         }
     };
     fuser::FileAttr {
@@ -607,7 +608,11 @@ mod tests {
         assert_eq!((f.size, f.blocks, f.blksize), (1000, 2, 131072));
         assert_eq!(f.kind, FileType::CharDevice);
         assert_eq!(f.perm, 0o644);
-        assert_eq!(f.atime, UNIX_EPOCH, "before the epoch reads as the epoch");
+        assert_eq!(
+            f.atime,
+            UNIX_EPOCH - Duration::from_nanos(5),
+            "before the epoch"
+        );
         assert_eq!(f.mtime, UNIX_EPOCH + Duration::from_millis(1500));
         assert_eq!(f.crtime, f.ctime);
         assert_eq!(f.rdev, (4 << 8) | 5);

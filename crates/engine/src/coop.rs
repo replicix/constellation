@@ -977,25 +977,21 @@ impl Coop {
                 total_ms,
             } => {
                 debug_assert_eq!(&hash, requested);
-                self.cache
-                    .commit_spill(requested, spill, ChunkState::Clean)
+                // The reader gets the bytes from the spill itself, whether
+                // or not the cache keeps them (full of writes waiting to
+                // upload, or evicting this entry at once to make room):
+                // dropped, or read back from a cache that no longer had
+                // them, the read failed with EIO.
+                let data = self
+                    .cache
+                    .commit_spill_read(requested, spill, ChunkState::Clean, read_back)
                     .ok()?;
-                // Nothing to admit to the memory tier here: the bytes
-                // went straight from the decoder into the spill file and
-                // are not in hand, and reading them back only to admit
-                // them would cost exactly the I/O plan 38 §2.3 avoids.
-                // The entry `commit_spill` left is `verified`, so the
-                // read below (and the demand read after a prefetch)
-                // skips the second hash, and `fetch_chunk_for_inode`
-                // admits what it is handed.
-                let data = if read_back {
-                    self.cache.get(requested).ok().flatten()
-                } else {
-                    None
-                };
-                if read_back && data.is_none() {
-                    return None;
-                }
+                // Nothing to admit to the memory tier here: a prefetch's
+                // bytes went straight from the decoder into the spill file
+                // and are not in hand (reading them back only to admit
+                // them would cost the I/O plan 38 §2.3 avoids); a demand
+                // read's are, and `fetch_chunk_for_inode` admits what it
+                // is handed.
                 let mut selector = self.selector.lock().unwrap();
                 selector.record_transport(src, None, PathKind::Unknown);
                 selector.record_ok(src, ttfb_ms, bytes, total_ms);

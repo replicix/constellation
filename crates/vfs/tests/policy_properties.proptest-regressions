@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 35c6a240a1114405d34d6eaf47c0d839e89d26ab4391a82de8a4142dcfa868b0 # shrinks to uid = 0, gid = 0, names = {}
+cc b7c4e041f078f7e2b416df5123d4fc9f9e95f2ddc03a1a58ddcd42bdfda40c15 # shrinks to caps = FrontendCaps { push_inval: None, per_close_flush: false, cluster_locks: false, xattrs: None, virtual_xattrs_listed: false, hard_links: false, fallocate: false, seek_hole: false, special_files: false, case: Sensitive, max_io: 0, deferrable: OpKindSet(1073741823), open_unlinked: Keep, abortable: false, passthrough: false, zero_copy: false, zero_copy_min_read: 0 }

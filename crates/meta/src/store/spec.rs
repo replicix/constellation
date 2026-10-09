@@ -950,6 +950,7 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
             base_manifest: base_manifest.clone(),
             manifest: manifest.clone(),
             size: *size,
+            mtime_ns: None,
         }),
         _ => Some(MutateOp::Records {
             records: effective.into_iter().cloned().collect(),

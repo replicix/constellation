@@ -585,8 +585,11 @@ fn apply_one(
             manifest,
             size,
             time_ns,
+            mtime_ns,
             ..
-        } => apply_write_manifest(tx, meta, dirty, *ino, manifest, *size, *time_ns, staged),
+        } => apply_write_manifest(
+            tx, meta, dirty, *ino, manifest, *size, *time_ns, *mtime_ns, staged,
+        ),
         LogRecord::SetXattr {
             ino,
             name,
@@ -1102,6 +1105,7 @@ fn apply_rename(
     }
     misc::touch_times_tx(tx, &meta.ns, dirty, parent, t)?;
     misc::touch_times_tx(tx, &meta.ns, dirty, new_parent, t)?;
+    misc::bump_file_nlink_tx(tx, &meta.ns, dirty, ino, 0, t)?;
     Ok(Applied::Done)
 }
 
@@ -1256,6 +1260,7 @@ fn apply_write_manifest(
     manifest: &[u8],
     size: u64,
     t: i64,
+    mtime_ns: i64,
     staged: &crate::store::UsageTracker,
 ) -> Result<Applied, MetaError> {
     let Some(rec) = ns::get_inode_record(tx, &meta.ns, ino)? else {
@@ -1269,7 +1274,7 @@ fn apply_write_manifest(
         .transpose()?;
     let mut attrs = rec.attrs;
     attrs.size = size;
-    attrs.mtime_ns = t;
+    attrs.mtime_ns = mtime_ns;
     attrs.ctime_ns = t;
     let xattrs = rec.xattrs.clone();
     ns::put_inode(

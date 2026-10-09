@@ -94,6 +94,9 @@ pub enum MutateOp {
         base_manifest: Option<Vec<u8>>,
         manifest: Vec<u8>,
         size: u64,
+        /// The file's mtime: the writer's last change, or a time set by
+        /// `utimes` since. `None`: the commit's time.
+        mtime_ns: Option<i64>,
     },
     SetXattr {
         ino: Ino,
@@ -567,8 +570,15 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
             base_manifest,
             manifest,
             size,
+            mtime_ns,
         } => {
-            meta.set_manifest_with_base(*ino, base_manifest.as_deref(), manifest, *size)?;
+            meta.set_manifest_with_base(
+                *ino,
+                base_manifest.as_deref(),
+                manifest,
+                *size,
+                *mtime_ns,
+            )?;
         }
         MutateOp::SetXattr {
             ino,
@@ -734,6 +744,29 @@ mod tests {
             MutateOp::from_postcard(&op.to_postcard().unwrap()).unwrap(),
             op
         );
+    }
+
+    /// A rename changes the moved inode's ctime (Linux file systems do;
+    /// it is a status change), on the holder and on a replica replaying
+    /// the record, and the dentry copy of the attributes follows.
+    #[test]
+    fn rename_touches_the_moved_inodes_ctime() {
+        let m = Meta::open_in_memory().unwrap();
+        let a = m.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        execute(&m, &rename_op(ROOT_INO, "a", ROOT_INO, "b", false), None).unwrap();
+        let r = replica_of(&m);
+        for meta in [&m, &r] {
+            let attr = meta.getattr(a.ino).unwrap().unwrap();
+            assert!(
+                attr.ctime_ns > a.ctime_ns,
+                "{} vs {}",
+                attr.ctime_ns,
+                a.ctime_ns
+            );
+            let listed = meta.lookup(ROOT_INO, "b").unwrap().unwrap();
+            assert_eq!(listed.ctime_ns, attr.ctime_ns);
+        }
     }
 
     #[test]

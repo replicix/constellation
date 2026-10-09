@@ -987,6 +987,43 @@ impl DiskCache {
         mut spill: SpillFile,
         state: ChunkState,
     ) -> Result<(), CoreError> {
+        self.commit_spill_in(hash, &mut spill, state)
+    }
+
+    /// [`Self::commit_spill`] for a fetch: with `read`, the spill's bytes
+    /// are read first and returned, and a cache with no room for them
+    /// ([`CoreError::CacheFull`]: what is left is Dirty or pinned) is no
+    /// error. A fetch must serve what it fetched whether or not it can
+    /// keep it, and must not count on reading it back from the cache:
+    /// under pressure the entry it just committed is the one the next
+    /// insert evicts. Either way every read of an uncached chunk failed
+    /// with `EIO` while the cache was full of writes waiting to upload.
+    pub fn commit_spill_read(
+        &self,
+        hash: &ChunkHash,
+        mut spill: SpillFile,
+        state: ChunkState,
+        read: bool,
+    ) -> Result<Option<Vec<u8>>, CoreError> {
+        let bytes = if read {
+            let file = spill.file.as_mut().unwrap();
+            file.flush()?;
+            Some(fs::read(&spill.path)?)
+        } else {
+            None
+        };
+        match self.commit_spill_in(hash, &mut spill, state) {
+            Ok(()) | Err(CoreError::CacheFull { .. }) => Ok(bytes),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit_spill_in(
+        &self,
+        hash: &ChunkHash,
+        spill: &mut SpillFile,
+        state: ChunkState,
+    ) -> Result<(), CoreError> {
         let file = spill.file.as_mut().unwrap();
         file.flush()?;
         file.sync_data()?;
@@ -1615,6 +1652,36 @@ mod tests {
         let batch = c.take_digest_events();
         assert_eq!(batch.events, vec![DigestChange::Remove(clean_h)]);
         assert!(c.take_digest_events().events.is_empty());
+    }
+
+    /// A fetched chunk is handed to the reader whether or not the cache
+    /// has room for it (here the rest is Dirty).
+    #[test]
+    fn a_spill_the_cache_cannot_take_is_read_back_not_dropped() {
+        let dir = TempDir::new().unwrap();
+        let c = DiskCache::open(dir.path(), 100).unwrap();
+        let (h1, d1) = chunk(1, 60);
+        c.insert(&h1, &d1, ChunkState::Dirty).unwrap();
+        let (h2, d2) = chunk(2, 60);
+        let mut spill = c.begin_spill().unwrap();
+        spill.write_all(&d2).unwrap();
+        assert_eq!(
+            c.commit_spill_read(&h2, spill, ChunkState::Clean, true)
+                .unwrap(),
+            Some(d2.clone())
+        );
+        assert!(!c.contains(&h2), "not cached");
+        assert!(c.contains(&h1), "the dirty entry stays");
+        // With room, it is cached and nothing is handed back.
+        c.set_state(&h1, ChunkState::Clean);
+        let mut spill = c.begin_spill().unwrap();
+        spill.write_all(&d2).unwrap();
+        assert_eq!(
+            c.commit_spill_read(&h2, spill, ChunkState::Clean, false)
+                .unwrap(),
+            None
+        );
+        assert!(c.contains(&h2));
     }
 
     #[test]

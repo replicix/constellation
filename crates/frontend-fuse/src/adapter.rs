@@ -856,15 +856,20 @@ pub(crate) fn seek_whence(raw: i32) -> Option<SeekWhence> {
     }
 }
 
-/// A `setattr` time.
+/// A `setattr` time, in the engine's signed nanoseconds since the epoch:
+/// before 1970 negative, outside 1677-2262 clamped to that range (as
+/// Linux clamps a time to what its file system can store). It was 0
+/// before 1970, and wrapped past 2262 (`as_nanos() as i64`): `utime`
+/// to 2^40 s stored 0, and later stats read garbage.
 fn time_set(t: TimeOrNow) -> TimeSet {
     match t {
         TimeOrNow::Now => TimeSet::Now,
-        TimeOrNow::SpecificTime(st) => TimeSet::At(
-            st.duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0),
-        ),
+        TimeOrNow::SpecificTime(st) => TimeSet::At(match st.duration_since(UNIX_EPOCH) {
+            Ok(after) => i64::try_from(after.as_nanos()).unwrap_or(i64::MAX),
+            Err(before) => i64::try_from(before.duration().as_nanos())
+                .map(|ns| -ns)
+                .unwrap_or(i64::MIN),
+        }),
     }
 }
 
@@ -1359,6 +1364,12 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         reply: ReplyEmpty,
     ) {
         self.sync_barrier(req, ino, Fh(fh.0), reply);
+    }
+
+    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
+        // The kernel sends it only when it evicts the inode, with every
+        // lookup it still held: the inode is no longer referenced.
+        self.vfs.forget(ino.0);
     }
 
     /// CONSTELLATION PATCH (interrupt) in vendored fuser: see [`Interrupts`].
@@ -1937,7 +1948,35 @@ mod tests {
             TimeSet::At(1_234_567_891)
         );
         let before = UNIX_EPOCH - std::time::Duration::from_secs(1);
-        assert_eq!(time_set(TimeOrNow::SpecificTime(before)), TimeSet::At(0));
+        assert_eq!(
+            time_set(TimeOrNow::SpecificTime(before)),
+            TimeSet::At(-1_000_000_000)
+        );
+        let far = UNIX_EPOCH + std::time::Duration::from_secs(1 << 40);
+        assert_eq!(
+            time_set(TimeOrNow::SpecificTime(far)),
+            TimeSet::At(i64::MAX)
+        );
+        let past = UNIX_EPOCH - std::time::Duration::from_secs(1 << 40);
+        assert_eq!(
+            time_set(TimeOrNow::SpecificTime(past)),
+            TimeSet::At(i64::MIN)
+        );
+        // And back, in a reply.
+        for t in [
+            before,
+            UNIX_EPOCH + std::time::Duration::from_nanos(1_234_567_891),
+        ] {
+            let TimeSet::At(ns) = time_set(TimeOrNow::SpecificTime(t)) else {
+                unreachable!()
+            };
+            let reply_ts = if ns >= 0 {
+                UNIX_EPOCH + std::time::Duration::from_nanos(ns as u64)
+            } else {
+                UNIX_EPOCH - std::time::Duration::from_nanos(ns.unsigned_abs())
+            };
+            assert_eq!(reply_ts, t);
+        }
     }
 
     #[test]

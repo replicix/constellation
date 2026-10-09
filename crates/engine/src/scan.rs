@@ -156,7 +156,7 @@ impl ScanAhead {
         };
         let order = needs_order.then(|| self.build_order(scan_dir));
 
-        let (candidates, window) = {
+        let (candidates, window, start) = {
             let mut scans = self.scans.lock().unwrap();
             let Some(scan) = scans.get_mut(&scan_dir) else {
                 return Vec::new();
@@ -182,11 +182,11 @@ impl ScanAhead {
             scan.pos = Some(current);
             scan.last_ino = ino;
             scan.last_hit = now;
-            scan.resume = scan.resume.max(current + 1);
+            scan.resume = scan.resume.max(current + 1).min(scan.order.len());
             if scan.hits < TRIGGER_HITS {
                 return Vec::new();
             }
-            (scan.order[scan.resume..].to_vec(), scan.window)
+            (scan.order[scan.resume..].to_vec(), scan.window, scan.resume)
         };
         self.file_to_dir.lock().unwrap().insert(ino, scan_dir);
 
@@ -232,9 +232,18 @@ impl ScanAhead {
             });
             self.file_to_dir.lock().unwrap().insert(candidate, scan_dir);
         }
+        // Past what this call consumed, from where it started: another
+        // reader of the directory may have consumed the same candidates
+        // meanwhile (or the scan been rebuilt), and adding to its `resume`
+        // instead ran it past the end of `order` — the next read's slice
+        // panicked, poisoning the lock every FUSE worker then panicked on
+        // (EC2 xcheckfs dev lane: the mount went away twice).
         if consumed > 0 {
             if let Some(scan) = self.scans.lock().unwrap().get_mut(&scan_dir) {
-                scan.resume = scan.resume.saturating_add(consumed);
+                scan.resume = scan
+                    .resume
+                    .max(start.saturating_add(consumed))
+                    .min(scan.order.len());
             }
         }
         files
@@ -290,6 +299,61 @@ mod tests {
         let files = scan.note_read(inos[2]);
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|file| file.hashes.len() == 2));
+    }
+
+    /// Concurrent readers of one directory consume overlapping candidates:
+    /// the scan's resume point stays within its order (it used to run past
+    /// it, and the next read's slice panicked and poisoned the lock).
+    #[test]
+    fn concurrent_readers_of_one_directory_never_overrun_the_scan() {
+        let (meta, inos) = fixture(40, 1);
+        let scan = Arc::new(ScanAhead::with_enabled(meta, 1 << 30, true));
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (scan, inos) = (scan.clone(), inos.clone());
+                std::thread::spawn(move || {
+                    for round in 0..200 {
+                        let from = (t * 5 + round) % inos.len();
+                        for ino in &inos[from..] {
+                            scan.note_read(*ino);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("no reader panicked");
+        }
+        // Then one reader in order: a forward run is what slices the scan.
+        for _ in 0..3 {
+            for ino in &inos {
+                scan.note_read(*ino);
+            }
+        }
+        for scan in scan.scans.lock().unwrap().values() {
+            assert!(scan.resume <= scan.order.len());
+        }
+    }
+
+    /// However `resume` got past the end of `order` (two readers adding
+    /// their consumption to it, a scan rebuilt shorter), the next forward
+    /// read does not slice past it.
+    #[test]
+    fn a_resume_past_the_order_does_not_panic() {
+        let (meta, inos) = fixture(10, 1);
+        let scan = ScanAhead::with_enabled(meta, 1 << 30, true);
+        scan.note_read(inos[0]);
+        scan.note_read(inos[1]);
+        scan.note_read(inos[2]);
+        for s in scan.scans.lock().unwrap().values_mut() {
+            s.resume = s.order.len() + 25;
+        }
+        scan.note_read(inos[3]);
+        scan.note_read(inos[4]);
+        assert!(
+            scan.note_read(inos[5]).is_empty(),
+            "nothing left to read ahead"
+        );
     }
 
     #[test]

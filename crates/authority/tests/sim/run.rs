@@ -1313,6 +1313,7 @@ fn write_op(cluster: &Cluster, node: NodeId, rid: Rid, name: &str) -> Option<Mut
         base_manifest: None,
         manifest: ChunkWorld::manifest(hash),
         size: CHUNK_SIZE as u64,
+        mtime_ns: None,
     })
 }
 

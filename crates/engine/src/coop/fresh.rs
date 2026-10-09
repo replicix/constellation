@@ -128,6 +128,7 @@ mod tests {
             manifest: manifest(hashes),
             size: 4096,
             time_ns: 1,
+            mtime_ns: 1,
         }
     }
 
@@ -187,6 +188,7 @@ mod tests {
             manifest: m.encode(),
             size: 1,
             time_ns: 1,
+            mtime_ns: 1,
         };
         assert_eq!(written_chunks(&[rec, done(2, 1)]), vec![(2, list)]);
     }

@@ -440,6 +440,7 @@ impl Meta {
         expected_base: Option<&[u8]>,
         manifest: &[u8],
         size: u64,
+        mtime: Option<i64>,
     ) -> Result<i64, MetaError> {
         let Some(rec) = ns::get_inode_record(tx, ns_ks, ino)? else {
             return Err(MetaError::NoEnt(ino));
@@ -461,7 +462,7 @@ impl Meta {
         let old_size = rec.attrs.size as i64;
         let mut attrs = rec.attrs;
         attrs.size = size;
-        attrs.mtime_ns = t;
+        attrs.mtime_ns = mtime.unwrap_or(t);
         attrs.ctime_ns = t;
         let xattrs: Vec<(Vec<u8>, Vec<u8>)> = rec.xattrs.clone();
         ns::put_inode(
@@ -497,6 +498,7 @@ impl Meta {
                 manifest: manifest.to_vec(),
                 size,
                 time_ns: t,
+                mtime_ns: attrs.mtime_ns,
             },
         )?;
         Ok(size as i64 - old_size)
@@ -508,6 +510,7 @@ impl Meta {
         base_manifest: Option<&[u8]>,
         manifest: &[u8],
         size: u64,
+        mtime_ns: Option<i64>,
         dirty_hashes: &[constellation_fs_core::ChunkHash],
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
@@ -538,6 +541,7 @@ impl Meta {
             base_manifest,
             manifest,
             size,
+            mtime_ns,
         )?;
         for hash in dirty_hashes {
             crate::store::misc::add_pending_claim_tx(&mut tx, self, hash, ino)?;
@@ -555,12 +559,17 @@ impl Meta {
         Ok(())
     }
 
+    /// Commit `manifest` as `ino`'s content, if its current manifest is
+    /// still `base_manifest` (or already `manifest`). `mtime_ns`: the
+    /// file's mtime (the writer's last change, or a time set since);
+    /// `None` stamps the commit's time.
     pub fn set_manifest_with_base(
         &self,
         ino: Ino,
         base_manifest: Option<&[u8]>,
         manifest: &[u8],
         size: u64,
+        mtime_ns: Option<i64>,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
@@ -579,6 +588,7 @@ impl Meta {
             base_manifest,
             manifest,
             size,
+            mtime_ns,
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
         self.finish_local(&mut tx, local)?;
@@ -750,7 +760,8 @@ impl Meta {
                 base_manifest: None,
                 manifest: manifest.to_vec(),
                 size,
-                time_ns: mtime_ns,
+                time_ns: ctime_ns,
+                mtime_ns,
             },
         )?;
         for (name, value) in xattrs {
@@ -916,6 +927,11 @@ fn rename_in_tx(
     }
     misc::touch_times_tx(tx, ns_ks, dirty, parent, t)?;
     misc::touch_times_tx(tx, ns_ks, dirty, new_parent, t)?;
+    // The moved inode's ctime too, as Linux file systems do (and as
+    // `exchange_in_tx` does for both): a zero `nlink` delta is a
+    // ctime-only touch that rewrites every dentry copy, the new one
+    // included.
+    misc::bump_file_nlink_tx(tx, ns_ks, dirty, ino, 0, t)?;
     Ok(Some((ino, t, delta.0, delta.1)))
 }
 
@@ -1825,6 +1841,7 @@ impl MetaStore for Meta {
             None,
             manifest,
             size,
+            None,
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
         self.finish_local(&mut tx, local)?;

@@ -3120,7 +3120,7 @@ async fn attach_views(
                 .with_context(|| format!("attaching {}", view.mountpoint.display()))?;
         match resp {
             Ok(_) => {}
-            Err(e) if e.message.contains("shutting down") => {
+            Err(e) if e.message.contains(node_runtime::SHUTTING_DOWN) => {
                 return Ok(AttachOutcome::DaemonShuttingDown);
             }
             Err(e) if e.message.contains(node_runtime::UPGRADING) => {

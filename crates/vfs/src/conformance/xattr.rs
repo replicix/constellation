@@ -125,11 +125,15 @@ pub(super) fn namespaces_and_name_limits(env: &Env<'_>) -> TestResult {
     let user = fx.client();
     let root = fx.root_client();
     let f = must("put f", user.put(user.root(), "f", b"x")).attr.ino;
+    // `security.*` is stored; who may set it is the kernel's check. An
+    // absent one is `NoData`, as on any file system that has the
+    // namespace (the kernel asks for `security.capability` on writes).
     refused(
-        "security.*",
-        user.setxattr(f, "security.x", b"1", NONE),
-        Code::NotSupported,
+        "absent security.capability",
+        user.getxattr(f, "security.capability"),
+        Code::NoData,
     );
+    must("security.*", user.setxattr(f, "security.x", b"1", NONE));
     refused(
         "system.*",
         root.setxattr(f, "system.posix_acl_access", b"1", NONE),

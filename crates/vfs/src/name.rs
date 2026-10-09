@@ -9,9 +9,91 @@
 //! unsized view (`&Name`, like `&Path`: free to build from a request
 //! buffer) and an owned buffer (`NameBuf`, for results and events).
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::ops::Deref;
+
+/// The first of the 128 code points that stand for the bytes 0x80..=0xFF
+/// of a name that is not UTF-8 (U+10FF80..=U+10FFFF, the end of the
+/// supplementary private use area B).
+const ESCAPED: u32 = 0x10_FF80;
+
+fn is_escape(c: char) -> bool {
+    u32::from(c) >= ESCAPED
+}
+
+fn push_escaped(out: &mut String, byte: u8) {
+    let c = char::from_u32(ESCAPED - 0x80 + u32::from(byte)).expect("U+10FF80..=U+10FFFF");
+    out.push(c);
+}
+
+fn push_valid(out: &mut String, valid: &str) {
+    for c in valid.chars() {
+        if is_escape(c) {
+            for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                push_escaped(out, byte);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// The stored (UTF-8) form of a name or a symlink target the frontend
+/// delivered as `bytes`, from which [`wire_bytes`] gives them back
+/// exactly. UTF-8 is stored as is; each byte of an invalid sequence is
+/// stored as a code point of U+10FF80..=U+10FFFF, and so is each byte of
+/// any of those code points the input itself holds, so that no two
+/// byte strings share a stored form. (It was a lossy conversion: every
+/// invalid sequence became U+FFFD, so `a\xffb` and `a\xfeb` were one
+/// file, and a name was measured against `NAME_MAX` after each invalid
+/// byte had grown to three.)
+pub fn stored_form(bytes: &[u8]) -> Cow<'_, str> {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        if !s.chars().any(is_escape) {
+            return Cow::Borrowed(s);
+        }
+    }
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                push_valid(&mut out, valid);
+                return Cow::Owned(out);
+            }
+            Err(e) => {
+                let (valid, after) = rest.split_at(e.valid_up_to());
+                push_valid(
+                    &mut out,
+                    std::str::from_utf8(valid).expect("valid up to here"),
+                );
+                let bad = e.error_len().unwrap_or(after.len());
+                for &byte in &after[..bad] {
+                    push_escaped(&mut out, byte);
+                }
+                rest = &after[bad..];
+            }
+        }
+    }
+}
+
+/// The bytes a stored name or symlink target stands for: the inverse of
+/// [`stored_form`].
+pub fn wire_bytes(stored: &str) -> Cow<'_, [u8]> {
+    if !stored.chars().any(is_escape) {
+        return Cow::Borrowed(stored.as_bytes());
+    }
+    let mut out = Vec::with_capacity(stored.len());
+    for c in stored.chars() {
+        if is_escape(c) {
+            out.push((u32::from(c) - ESCAPED + 0x80) as u8);
+        } else {
+            out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+        }
+    }
+    Cow::Owned(out)
+}
 
 macro_rules! byte_name {
     ($(#[$doc:meta])* $name:ident, $(#[$bufdoc:meta])* $buf:ident) => {

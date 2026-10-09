@@ -119,7 +119,7 @@ impl FrontendCaps {
             per_close_flush: true,
             cluster_locks,
             xattrs: XattrSupport::Native,
-            virtual_xattrs_listed: true,
+            virtual_xattrs_listed: false,
             hard_links: true,
             fallocate: true,
             seek_hole: true,
@@ -278,7 +278,6 @@ mod tests {
             Cap::PerCloseFlush,
             Cap::ClusterLocks,
             Cap::Xattrs,
-            Cap::VirtualXattrsListed,
             Cap::HardLinks,
             Cap::Fallocate,
             Cap::SeekHole,
@@ -289,6 +288,7 @@ mod tests {
             assert!(all.contains(&cap), "{cap}");
         }
         assert!(!all.contains(&Cap::CaseInsensitive));
+        assert!(!all.contains(&Cap::VirtualXattrsListed));
         assert!(!FrontendCaps::linux_fuse(false).has(Cap::ClusterLocks));
         let mut bare = fuse.clone();
         bare.push_inval = PushInval::Attr;
@@ -314,8 +314,8 @@ mod tests {
             assert!(caps.per_close_flush);
             assert_eq!(caps.xattrs, XattrSupport::Native);
             assert!(
-                caps.virtual_xattrs_listed,
-                "Linux lists user.constellation.{{rsize,rcount}}"
+                !caps.virtual_xattrs_listed,
+                "user.constellation.{{rsize,rcount}} are read by name, never listed"
             );
             assert!(caps.hard_links && caps.fallocate && caps.seek_hole && caps.special_files);
             assert_eq!(caps.case, CasePolicy::Sensitive);

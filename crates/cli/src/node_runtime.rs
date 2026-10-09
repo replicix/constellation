@@ -83,6 +83,70 @@ fn clear_stale_mount(host: &HostServices, mountpoint: &std::path::Path) {
 /// attaching `mount` matches it to retry).
 pub const UPGRADING: &str = "the daemon is being upgraded in place; retry shortly";
 
+/// What `add_mount` answers once the node is going away (the attaching
+/// `mount` matches it to wait for the exit and become the next daemon).
+pub const SHUTTING_DOWN: &str = "daemon is shutting down; retry once it has exited";
+
+/// Views being added, against the last view leaving: a node with no view
+/// left shuts down, unless a view is being added — then the add that ends
+/// last decides, by whether a view is mounted by then.
+#[derive(Default)]
+struct Gate {
+    /// Views admitted but not yet mounted (or failed).
+    adding: usize,
+    /// The last view left while views were being added.
+    orphaned: bool,
+    /// The node shuts down: no view is admitted any more.
+    closing: bool,
+}
+
+impl Gate {
+    /// The last view left: whether the node closes now (`true`) or the
+    /// adds in flight decide.
+    fn leave(&mut self) -> bool {
+        if self.adding > 0 {
+            self.orphaned = true;
+            return false;
+        }
+        self.closing = true;
+        true
+    }
+
+    /// An add ended, with views `mounted` (its own, if it succeeded) or
+    /// none: whether the node closes now, the last view having left meanwhile.
+    fn added(&mut self, mounted: bool) -> bool {
+        self.adding -= 1;
+        if mounted {
+            self.orphaned = false;
+        }
+        if self.adding == 0 && self.orphaned {
+            self.closing = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// A view admitted by [`NodeRuntime::admit_view`], until it is mounted or
+/// failed.
+struct AddSlot<'a> {
+    node: &'a Arc<NodeRuntime>,
+}
+
+impl Drop for AddSlot<'_> {
+    fn drop(&mut self) {
+        let close = {
+            let mut gate = self.node.gate.lock().unwrap();
+            let mounted = !self.node.mounts.lock().unwrap().is_empty();
+            gate.added(mounted)
+        };
+        if close {
+            tracing::info!("the last view left while this one failed to mount; exiting");
+            let _ = self.node.shutdown();
+        }
+    }
+}
+
 /// Everything needed to start the daemon's node, independent of any
 /// particular mounted view.
 pub struct NodeConfig {
@@ -246,6 +310,9 @@ pub struct NodeRuntime {
     /// `remove_mount`'s attempt to join it.
     threads: Mutex<HashMap<MountId, std::thread::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
+    /// Orders views being added against the last one leaving ([`Gate`]).
+    /// Locked before `mounts` when both are.
+    gate: Mutex<Gate>,
     /// Plan 31 C4b: the handover state (`crate::handover`).
     pub(crate) handover: crate::handover::HandoverState,
     /// The node's own settings, as the next image restarts it.
@@ -390,6 +457,7 @@ impl NodeRuntime {
             mounts: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
             shutdown_started: AtomicBool::new(false),
+            gate: Mutex::new(Gate::default()),
             handover: crate::handover::HandoverState::new(generation),
             handoff_config,
             fuse_transport,
@@ -557,8 +625,12 @@ impl NodeRuntime {
         // process exits and orphans the new kernel mount, leaving a dead
         // mountpoint (`Transport endpoint is not connected`). Rejecting
         // here lets the client fall through to `BecomeDaemon` cleanly.
+        // The gate closes the gap between the last view leaving and its
+        // thread starting that shutdown: a view admitted here keeps the
+        // node up, one refused finds a successor daemon.
+        let _slot = self.admit_view()?;
         if self.shutdown_started.load(Ordering::SeqCst) || self.engine.is_shutting_down() {
-            bail!("daemon is shutting down; retry once it has exited");
+            bail!("{SHUTTING_DOWN}");
         }
         let ViewConfig {
             inner_path,
@@ -662,6 +734,16 @@ impl NodeRuntime {
         ))
     }
 
+    /// Admits a view to be added, or refuses it once the node is closing.
+    fn admit_view(self: &Arc<Self>) -> Result<AddSlot<'_>> {
+        let mut gate = self.gate.lock().unwrap();
+        if gate.closing {
+            bail!("{SHUTTING_DOWN}");
+        }
+        gate.adding += 1;
+        Ok(AddSlot { node: self })
+    }
+
     /// Record a mounted session and run it on its own OS thread (see the
     /// module doc for the thread's teardown).
     pub(crate) fn serve_session(
@@ -748,13 +830,16 @@ impl NodeRuntime {
             node.engine.close_view(&fs);
             drop(fs);
             // This view is gone: drop its bookkeeping entry, and if it
-            // was the last one, run the one node-wide clean shutdown.
-            let now_empty = {
+            // was the last one, run the one node-wide clean shutdown —
+            // decided under the gate, so no view is admitted meanwhile.
+            let (now_empty, closing) = {
+                let mut gate = node.gate.lock().unwrap();
                 let mut mounts = node.mounts.lock().unwrap();
                 mounts.remove(&id);
-                mounts.is_empty()
+                let now_empty = mounts.is_empty();
+                (now_empty, now_empty && !node.persistent && gate.leave())
             };
-            if now_empty && !node.persistent {
+            if closing {
                 // `shutdown` logs its own failure (and records it for the
                 // process's exit status).
                 let _ = node.shutdown();
@@ -969,6 +1054,7 @@ impl NodeRuntime {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+        self.gate.lock().unwrap().closing = true;
         if let Some(view) = self.headless_view.lock().unwrap().take() {
             self.engine.close_view(&view);
         }
@@ -1121,6 +1207,36 @@ mod tests {
             rt.clone(),
         )
         .expect("NodeRuntime::start")
+    }
+
+    /// A `mount` attaching while the last view leaves (`umount; mount` back
+    /// to back) must not land on a node that then shuts down under it: the
+    /// view either keeps the node up, or is refused and finds a successor.
+    #[test]
+    fn a_view_added_while_the_last_one_leaves_is_kept_or_refused() {
+        // Admitted first, mounted: the node stays.
+        let mut g = Gate::default();
+        g.adding += 1;
+        assert!(!g.leave(), "an add in flight decides");
+        assert!(!g.added(true), "it mounted: the node serves it");
+        assert!(!g.closing);
+        // Admitted first, failed: the node goes, nothing else will end it.
+        let mut g = Gate::default();
+        g.adding += 1;
+        assert!(!g.leave());
+        assert!(g.added(false), "the failed add closes the empty node");
+        assert!(g.closing);
+        // Left first: the node is closing and admits nothing.
+        let mut g = Gate::default();
+        assert!(g.leave());
+        assert!(g.closing, "admit_view refuses from here");
+        // Two adds: the one that ends last decides.
+        let mut g = Gate::default();
+        g.adding += 2;
+        assert!(!g.leave());
+        assert!(!g.added(false), "another add is still in flight");
+        assert!(!g.added(true));
+        assert!(!g.closing);
     }
 
     /// Plan 38 Z2c: a `view.mount{PreopenedFd}` session (plan 37's CSI

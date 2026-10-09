@@ -1322,7 +1322,7 @@ pub(crate) mod pending_upload_tests {
         let hash = ChunkHash::of(&data);
         f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, None, &[hash])
             .unwrap();
 
         // Simulate the crash: reopening the cache rebuilds accounting
@@ -1367,7 +1367,7 @@ pub(crate) mod pending_upload_tests {
         let hash = ChunkHash::of(&data);
         f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, None, &[hash])
             .unwrap();
 
         f.failing.set_fail_puts(true);
@@ -1434,7 +1434,7 @@ pub(crate) mod pending_upload_tests {
         let hash = ChunkHash::of(&data);
         f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, None, &[hash])
             .unwrap();
         // Default mode: this process wrote the chunk, so its entry is
         // `verified` and a plain read would hand the bytes over unchecked.
@@ -1499,6 +1499,7 @@ pub(crate) mod pending_upload_tests {
                 None,
                 b"M",
                 healthy_data.len() as u64,
+                None,
                 &[healthy_hash],
             )
             .unwrap();
@@ -1518,7 +1519,7 @@ pub(crate) mod pending_upload_tests {
             .unwrap();
         let broken_hash = ChunkHash::of(b"bytes that are gone");
         f.meta
-            .set_manifest_dirty(broken_file.ino, None, b"M2", 4, &[broken_hash])
+            .set_manifest_dirty(broken_file.ino, None, b"M2", 4, None, &[broken_hash])
             .unwrap();
         assert!(
             f.cache.get(&broken_hash).unwrap().is_none(),
@@ -1682,6 +1683,7 @@ pub(crate) mod pending_upload_tests {
                         manifest: manifest.encode(),
                         size: 8192,
                         time_ns: 1,
+                        mtime_ns: 1,
                     },
                     constellation_meta::LogRecord::Completed { rid },
                 ],
@@ -1814,6 +1816,7 @@ pub(crate) mod pending_upload_tests {
                         manifest: manifest.encode(),
                         size: 9,
                         time_ns: 1,
+                        mtime_ns: 1,
                     },
                     constellation_meta::LogRecord::Completed { rid },
                 ],
@@ -1885,6 +1888,7 @@ pub(crate) mod pending_upload_tests {
                     manifest: manifest.encode(),
                     size: 25,
                     time_ns: 1,
+                    mtime_ns: 1,
                 }],
                 None,
             )
@@ -1942,7 +1946,7 @@ pub(crate) mod pending_upload_tests {
             let hash = ChunkHash::of(&data);
             f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
             f.meta
-                .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+                .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, None, &[hash])
                 .unwrap();
         }
         let upload = UploadRuntime::for_test_fixed(true, 3);
@@ -1971,7 +1975,7 @@ pub(crate) mod pending_upload_tests {
         let hash = ChunkHash::of(data);
         f.cache.insert(&hash, data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, None, &[hash])
             .unwrap();
         hash
     }
@@ -2125,7 +2129,7 @@ pub(crate) mod pending_upload_tests {
             .unwrap();
         f.cache.insert(&hash, data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(file.ino, None, b"M", data.len() as u64, None, &[hash])
             .unwrap();
         f.failing.puts.store(0, Ordering::SeqCst);
         f.failing.heads.store(0, Ordering::SeqCst);
@@ -2298,6 +2302,7 @@ pub(crate) mod pending_upload_tests {
             base_manifest: None,
             manifest: manifest(&[durable, pending]),
             size: 8192,
+            mtime_ns: None,
         };
         assert_eq!(
             forwarded_pending_chunks(&f.meta, &f.cache, &op),
@@ -2378,7 +2383,7 @@ pub(crate) mod pending_upload_tests {
         // Writer 1 caches and commits.
         f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
         f.meta
-            .set_manifest_dirty(w1.ino, None, b"M1", data.len() as u64, &[hash])
+            .set_manifest_dirty(w1.ino, None, b"M1", data.len() as u64, None, &[hash])
             .unwrap();
         // Writer 2's cache_for_upload: a merge into the dirty entry.
         f.cache.insert(&hash, &data, ChunkState::Dirty).unwrap();
@@ -2398,7 +2403,7 @@ pub(crate) mod pending_upload_tests {
         f.cache.prune_to(0).unwrap();
         assert!(!f.cache.contains(&hash));
         f.meta
-            .set_manifest_dirty(w2.ino, None, b"M2", data.len() as u64, &[hash])
+            .set_manifest_dirty(w2.ino, None, b"M2", data.len() as u64, None, &[hash])
             .unwrap();
 
         let report = rt()
@@ -2454,7 +2459,7 @@ pub(crate) mod pending_upload_tests {
             .create(constellation_fs_core::types::ROOT_INO, "late", 0o644, 0, 0)
             .unwrap();
         f.meta
-            .set_manifest_dirty(late.ino, None, b"M", data.len() as u64, &[hash])
+            .set_manifest_dirty(late.ino, None, b"M", data.len() as u64, None, &[hash])
             .unwrap();
         let report = rt()
             .block_on(upload_dirty_chunks_report(

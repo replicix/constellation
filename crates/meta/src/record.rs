@@ -114,7 +114,11 @@ pub enum LogRecord {
         /// Encoded `fs_core::Manifest` bytes.
         manifest: Vec<u8>,
         size: u64,
+        /// The commit's time: the file's ctime, and the record's stamp.
         time_ns: i64,
+        /// The file's mtime (the writer's, or a time set before the
+        /// commit), applied as is.
+        mtime_ns: i64,
     },
     SetXattr {
         ino: Ino,
@@ -359,6 +363,7 @@ mod tests {
             manifest: manifest.clone(),
             size: 99,
             time_ns: 1,
+            mtime_ns: 1,
         };
         let bytes = r.to_postcard().unwrap();
         // Binary payload must appear verbatim, not as a JSON number list.

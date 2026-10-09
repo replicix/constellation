@@ -150,6 +150,7 @@ fn usage_counters_survive_replay_of_a_foreign_batch() {
             manifest: b"abcdefghij".to_vec(),
             size: 10,
             time_ns: 2,
+            mtime_ns: 2,
         },
     ];
     meta.apply_records(&records).unwrap();

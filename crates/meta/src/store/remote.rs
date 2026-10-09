@@ -791,6 +791,7 @@ mod tests {
                 manifest: manifest_of(hashes),
                 size: 4096,
                 time_ns: 0,
+                mtime_ns: 0,
             }],
             origin: (0, 0),
         };
@@ -837,6 +838,7 @@ mod tests {
                 manifest: manifest_of(hashes),
                 size: 4096,
                 time_ns: 0,
+                mtime_ns: 0,
             }]
         };
         let rid = crate::rid::Rid {

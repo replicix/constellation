@@ -345,6 +345,12 @@ pub struct View {
     inode_ops: InodeOps,
     /// Open handle counts per inode, for orphan reaping on last close.
     opens: Mutex<HashMap<Ino, u32>>,
+    /// Inodes this view removed (`nlink` 0, no open handle) that the
+    /// kernel may still reference: see [`View::remember_dead`].
+    dead: Mutex<DeadInodes>,
+    /// The lock owners each open handle locked for: see
+    /// [`View::note_lock_handle`].
+    lock_handles: Mutex<HashMap<u64, HashSet<(Ino, u64)>>>,
     /// Every open file description this view handed out (plan 39 §3.7):
     /// its inode (§6.12: a handle addresses only that one) and the discard
     /// error event it has seen ([`durable`]'s module doc).
@@ -494,6 +500,8 @@ impl View {
             writes: WriteShards::new(),
             inode_ops: InodeOps::new(),
             opens: Mutex::new(HashMap::new()),
+            dead: Mutex::new(DeadInodes::default()),
+            lock_handles: Mutex::new(HashMap::new()),
             handles: durable::Handles::default(),
             passthrough: Mutex::new(HashMap::new()),
             writers: Mutex::new(HashMap::new()),
@@ -595,6 +603,79 @@ impl View {
     /// invisible here, and its open handle lost the inode). Otherwise
     /// the orphan stays for the handles, and the hold writer is nudged so
     /// the claim reaches the bucket at once. Returns whether it reaped.
+    /// Keep the final attributes of an inode this view removed, for the
+    /// kernel references it outlives. A file or directory is gone from
+    /// the replica once its last name and handle are, but the kernel may
+    /// still hold it without a handle — an `O_PATH` descriptor, a removed
+    /// directory that is some process's working directory — and `fstat`
+    /// of that must answer `nlink == 0`, not `ENOENT` (which it did: every
+    /// `unlink` through xcheckfs, which stats its `O_PATH` handle after
+    /// the operation, was a mismatch). Dropped at the kernel's `FORGET`
+    /// ([`Vfs::forget`]), or the oldest past [`DEAD_INODES_MAX`]. Inode
+    /// numbers are never reused, so an entry never answers for another
+    /// file.
+    pub(crate) fn remember_dead(&self, mut attr: FileAttr) {
+        attr.nlink = 0;
+        attr.ctime_ns = constellation_fs_core::types::now_ns();
+        self.dead.lock().unwrap().insert(attr);
+    }
+
+    pub(crate) fn dead_attr(&self, ino: Ino) -> Option<FileAttr> {
+        self.dead.lock().unwrap().map.get(&ino).cloned()
+    }
+
+    pub(crate) fn forget_dead(&self, ino: Ino) {
+        self.dead.lock().unwrap().map.remove(&ino);
+    }
+
+    /// Remember `ino` as dead unless the replica still has it (another
+    /// name, an orphan an open handle keeps).
+    pub(crate) fn remember_if_gone(&self, attr: FileAttr) {
+        if matches!(self.meta.getattr(attr.ino), Ok(None)) {
+            self.remember_dead(attr);
+        }
+    }
+
+    /// `owner` locked `ino` through handle `fh`. An open file
+    /// description's (OFD) locks end with the description, and FUSE
+    /// sends no unlock for them on close — only `RELEASE` of the handle,
+    /// whose lock owner it fills in for `flock` alone — so the view keeps
+    /// which owners locked through which handle, and the release drops
+    /// theirs ([`View::take_lock_handle`]). They leaked before: an
+    /// `F_OFD_SETLK` lock outlived its descriptor and its process for
+    /// good, and the next process to lock the file got `EAGAIN`. A
+    /// process's own POSIX locks lose nothing by it: closing any of its
+    /// descriptors drops them all already (`flush`).
+    ///
+    /// An owner is bound to the handle it locked through last. The kernel
+    /// names an OFD owner after its `struct file`, which a new open can
+    /// reuse while the old one's `RELEASE` is still queued (the kernel
+    /// sends it asynchronously): that release must not drop the new
+    /// description's locks.
+    pub(crate) fn note_lock_handle(&self, fh: constellation_vfs::Fh, ino: Ino, owner: u64) {
+        let mut handles = self.lock_handles.lock().unwrap();
+        if handles
+            .get(&fh.0)
+            .is_some_and(|set| set.contains(&(ino, owner)))
+        {
+            return;
+        }
+        for set in handles.values_mut() {
+            set.remove(&(ino, owner));
+        }
+        handles.retain(|_, set| !set.is_empty());
+        handles.entry(fh.0).or_default().insert((ino, owner));
+    }
+
+    /// The owners that locked through `fh`, which is being released.
+    pub(crate) fn take_lock_handle(&self, fh: constellation_vfs::Fh) -> HashSet<(Ino, u64)> {
+        self.lock_handles
+            .lock()
+            .unwrap()
+            .remove(&fh.0)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn reap_after_unlink(&self, ino: Ino) -> bool {
         let open_here = self.opens.lock().unwrap().get(&ino).copied().unwrap_or(0) > 0;
         let open_elsewhere = self
@@ -606,6 +687,11 @@ impl View {
                 h.nudge();
             }
             return false;
+        }
+        if let Ok(Some(attr)) = self.meta.getattr(ino) {
+            if attr.nlink == 0 {
+                self.remember_dead(attr);
+            }
         }
         let _ = self.meta.reap_orphan(ino);
         true
@@ -793,8 +879,8 @@ impl View {
             None => self.meta.scratch_getattr(ino).map_err(|e| e.code())?,
         };
         Ok(current.map(|mut attr| {
-            if let Some(len) = self.writes.pending_len(&writes, ino) {
-                attr.size = len;
+            if let Some(pending) = self.writes.pending(&writes, ino) {
+                pending.overlay(&mut attr);
             }
             attr
         }))
@@ -906,4 +992,31 @@ pub(crate) fn slow_fuse_op() -> Duration {
             ms => Duration::from_millis(ms),
         }
     })
+}
+
+/// Removed inodes the kernel may still reference ([`View::remember_dead`]).
+const DEAD_INODES_MAX: usize = 1 << 16;
+
+#[derive(Default)]
+struct DeadInodes {
+    map: HashMap<Ino, FileAttr>,
+    order: std::collections::VecDeque<Ino>,
+}
+
+impl DeadInodes {
+    fn insert(&mut self, attr: FileAttr) {
+        if self.map.insert(attr.ino, attr.clone()).is_none() {
+            self.order.push_back(attr.ino);
+        }
+        while self.order.len() > DEAD_INODES_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        // Entries `FORGET` removed leave their number in `order`:
+        // compact once those are most of it.
+        if self.order.len() > 2 * self.map.len() + 64 {
+            self.order.retain(|ino| self.map.contains_key(ino));
+        }
+    }
 }
