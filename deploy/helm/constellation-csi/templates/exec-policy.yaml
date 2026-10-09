@@ -94,7 +94,7 @@ spec:
         !variables.creating || (
           has(object.metadata.labels)
           && object.metadata.labels[?'app.kubernetes.io/component'].orValue('') == 'engine'
-          && object.metadata.labels[?'constellation.dev/owner'].orValue('') == 'controller')
+          && object.metadata.labels[?'constellation.replicix.com/owner'].orValue('') == 'controller')
       message: an engine pod carries the engine/controller labels
     - expression: >-
         !variables.creating || (
@@ -238,7 +238,7 @@ directories owned by uid 65532 itself), uid 65532 under PodSecurity
 service-account token (and the token-less `constellation-csi-engine`
 ServiceAccount), no environment from anywhere but literal values (the
 credentials come by `fs.unlock`), and the volumes of one unit
-(`constellation.dev/unit`) only: <hostRoot>/{node-identity,sockets,policy}/
+(`constellation.replicix.com/unit`) only: <hostRoot>/{node-identity,sockets,policy}/
 <unit> (type Directory: never created by kubelet) and a scratch emptyDir,
 each at its own path, the policy one read-only (and the EKS webhooks'
 projected token, as above).
@@ -281,7 +281,7 @@ spec:
           : (oldObject == null ? '' : oldObject.spec.?nodeName.orValue(''))
     - name: unit
       expression: >-
-        object.metadata.?labels[?'constellation.dev/unit'].orValue('')
+        object.metadata.?labels[?'constellation.replicix.com/unit'].orValue('')
     - name: execOk
       # A probe's exec command, if any, is `constellation control-relay …`.
       expression: >-
@@ -310,13 +310,13 @@ spec:
         !variables.creating || (
           has(object.metadata.labels)
           && object.metadata.labels[?'app.kubernetes.io/component'].orValue('') == 'engine'
-          && object.metadata.labels[?'constellation.dev/owner'].orValue('') == 'node'
+          && object.metadata.labels[?'constellation.replicix.com/owner'].orValue('') == 'node'
           && variables.unit.matches('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
           && !variables.unit.endsWith('-controller')
           && variables.target.startsWith('constellation-engine-' + variables.unit + '-'))
       message: >-
         an engine pod carries the engine/node labels and is named after its
-        unit (constellation.dev/unit)
+        unit (constellation.replicix.com/unit)
     - expression: >-
         !variables.creating || (
           !object.spec.?hostNetwork.orValue(false)

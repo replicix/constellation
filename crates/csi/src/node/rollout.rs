@@ -8,7 +8,7 @@
 //! **The trigger.** The desired spec is the plugin's own engine-pod
 //! settings (the chart's `image`/`engineProfile` values, through the
 //! DaemonSet's environment); every engine pod carries the fingerprint of
-//! the settings it was created from (`constellation.dev/engine-config`).
+//! the settings it was created from (`constellation.replicix.com/engine-config`).
 //! A chart upgrade that changes them rolls the node plugin itself, whose
 //! next generation finds every engine pod drifted: [`NodeService::rollout_once`]
 //! runs at its start and every `CONSTELLATION_CSI_ROLLOUT_INTERVAL_S`

@@ -966,7 +966,7 @@ pub struct Scope<'a> {
     /// Its bucket prefix (the pool's, or its shards' parent).
     prefix: String,
     /// Every StorageClass of the scope ([`Scope::add_class`]), the first
-    /// included, with the driver's `constellation.dev/pool` label of its
+    /// included, with the driver's `constellation.replicix.com/pool` label of its
     /// pool.
     classes: Vec<(String, String)>,
     /// The Secret every class of the scope reads (provisioner and
@@ -1085,7 +1085,7 @@ impl<'a> Scope<'a> {
         env.kube.apply(&json!({
             "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
             "metadata": {"name": name},
-            "provisioner": "csi.constellation.dev",
+            "provisioner": "constellation.csi.replicix.com",
             "parameters": params,
             "reclaimPolicy": "Delete",
             "volumeBindingMode": "Immediate",
@@ -1122,7 +1122,7 @@ impl<'a> Scope<'a> {
         &self.prefix
     }
 
-    /// The driver's `constellation.dev/pool` label of the scope's pool
+    /// The driver's `constellation.replicix.com/pool` label of the scope's pool
     /// (shared by all its shards).
     pub fn pool_label(&self) -> &str {
         &self.classes[0].1
@@ -1171,7 +1171,7 @@ impl<'a> Scope<'a> {
                 "persistentVolumeReclaimPolicy": "Retain",
                 "storageClassName": "",
                 "csi": {
-                    "driver": "csi.constellation.dev",
+                    "driver": "constellation.csi.replicix.com",
                     "volumeHandle": handle,
                     "volumeAttributes": attributes,
                     "nodeStageSecretRef": {"name": self.secret, "namespace": self.env.driver_ns},
@@ -1206,7 +1206,7 @@ impl<'a> Scope<'a> {
         self.env.kube.apply(&json!({
             "apiVersion": "snapshot.storage.k8s.io/v1", "kind": "VolumeSnapshotClass",
             "metadata": {"name": name},
-            "driver": "csi.constellation.dev",
+            "driver": "constellation.csi.replicix.com",
             "deletionPolicy": "Delete",
         }))?;
         Ok(name)
@@ -1550,7 +1550,7 @@ impl<'a> Scope<'a> {
             &self.env.driver_ns,
             "-l",
             &format!(
-                "app.kubernetes.io/component=engine,constellation.dev/owner={owner},constellation.dev/fs-uuid={fs_uuid}"
+                "app.kubernetes.io/component=engine,constellation.replicix.com/owner={owner},constellation.replicix.com/fs-uuid={fs_uuid}"
             ),
         ])?;
         Ok(list["items"]
@@ -1808,7 +1808,7 @@ impl<'a> Scope<'a> {
             eprintln!("   forgetting the scope's pool records: {e:#}");
         }
         for (_, pool) in &self.classes {
-            let sel = format!("constellation.dev/pool={pool}");
+            let sel = format!("constellation.replicix.com/pool={pool}");
             let _ = kube.run(&[
                 "delete",
                 "pods",
@@ -1829,7 +1829,7 @@ impl<'a> Scope<'a> {
                 let deadline = Instant::now() + NO_ENGINE_RETURN;
                 while Instant::now() < deadline {
                     for (_, pool) in &self.classes {
-                        let sel = format!("constellation.dev/pool={pool}");
+                        let sel = format!("constellation.replicix.com/pool={pool}");
                         let pods = kube.get(&["pods", "-n", ns, "-l", &sel])?;
                         let names: Vec<&str> = pods["items"]
                             .as_array()
@@ -1878,7 +1878,7 @@ pub struct EnginePod {
     pub node: String,
     pub uid: String,
     pub restarts: u64,
-    /// `constellation.dev/last-view-count`: the views it served when the
+    /// `constellation.replicix.com/last-view-count`: the views it served when the
     /// node plugin last staged or unstaged through it.
     pub views: Option<u64>,
     /// Its engine container's image.
@@ -1899,7 +1899,7 @@ impl EnginePod {
                 .flatten()
                 .map(|c| c["restartCount"].as_u64().unwrap_or(0))
                 .sum(),
-            views: p["metadata"]["annotations"]["constellation.dev/last-view-count"]
+            views: p["metadata"]["annotations"]["constellation.replicix.com/last-view-count"]
                 .as_str()
                 .and_then(|v| v.parse().ok()),
             image: p["spec"]["containers"][0]["image"]
@@ -1915,7 +1915,7 @@ impl EnginePod {
     }
 }
 
-/// The driver's `constellation.dev/pool` label of the pool at `endpoint`,
+/// The driver's `constellation.replicix.com/pool` label of the pool at `endpoint`,
 /// `bucket`, `prefix` (a copy of `constellation_csi::engine_pods::
 /// pool_label`, which pins it as a versioned name; the test below pins
 /// this copy to a value that function gives).

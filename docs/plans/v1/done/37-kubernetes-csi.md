@@ -303,9 +303,15 @@ guessing a number up front.
    `constellation-engine` directly. It speaks gRPC (via `tonic`) to
    Kubernetes and the control protocol (via `constellation-control`'s client
    library, `UnixSocket` transport, `Transport::send_fd`) to engine pods.
-2. **Driver name: `csi.constellation.dev`.** Used as `spec.driverName` in
+2. **Driver name: `constellation.csi.replicix.com`.** Used as `spec.driverName` in
    `CSIDriver`, the `provisioner`/`driver` fields of `StorageClass`/
-   `VolumeSnapshotClass`, and `GetPluginInfo`'s `name`.
+   `VolumeSnapshotClass`, and `GetPluginInfo`'s `name`. Labels and
+   annotations use the prefix `constellation.replicix.com/`. (Renamed on
+   2026-10-10, before any release, from `csi.constellation.dev` and
+   `constellation.dev/`: the CSI spec asks for a domain-name-form plugin name
+   that includes the vendor's name to avoid collisions, and
+   `constellation.dev` is not a domain we control. The name is stored in every
+   `StorageClass` and PV, so it must not change once volumes exist.)
 3. **Controller is a `Deployment` (replicas: 2, leader-election via the
    standard `external-provisioner`/`external-resizer`/`external-snapshotter`
    lease mechanism), Node is a `DaemonSet`.** Standard CSI topology; no
@@ -318,7 +324,7 @@ guessing a number up front.
    advertises the `STAGE_UNSTAGE_VOLUME` node capability. `NodeStageVolume`
    is where the real FUSE work happens — `fuse_mount_fd` plus `view.mount`
    against a node-local *global staging path*
-   `/var/lib/kubelet/plugins/csi.constellation.dev/staging/<pv-name>/globalmount`
+   `/var/lib/kubelet/plugins/constellation.csi.replicix.com/staging/<pv-name>/globalmount`
    (naming convention shared with `csi-driver-nfs`'s
    `globalmount` staging layout — Sources table, `csi-driver-nfs` row).
    `<pv-name>` here is `req.volume_id`'s CSI-visible name (`pvc-<uid>`), not
@@ -756,7 +762,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: constellation-rwx
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   # S3 bucket the pool lives in. Required.
   bucket: "constellation-csi-pool"
@@ -806,7 +812,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: constellation-ci-scratch
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "constellation-csi-pool"
   prefix: "constellation-csi/constellation-ci-scratch"
@@ -828,7 +834,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: constellation-tenant-a-isolated
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "constellation-csi-tenant-a"
   prefix: "constellation-csi/isolated"
@@ -864,7 +870,7 @@ apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:
   name: constellation-snapshots
-driver: csi.constellation.dev
+driver: constellation.csi.replicix.com
 deletionPolicy: Delete
 parameters:
   csi.storage.k8s.io/snapshotter-secret-name: "constellation-s3-creds"
@@ -894,7 +900,7 @@ spec:
   accessModes: ["ReadOnlyMany"]
   persistentVolumeReclaimPolicy: Retain
   csi:
-    driver: csi.constellation.dev
+    driver: constellation.csi.replicix.com
     volumeHandle: "4f9c1e2a-.../datasets/imagenet"
     readOnly: true
     nodeStageSecretRef:
@@ -936,8 +942,8 @@ by the node plugin's `DaemonSet` with a `hostPath` volume of type
 **Creation.** `NodeStageVolume` for the first PV of a pool (or dedicated
 `StorageClass`) on a node: the node plugin checks for a `Ready`
 `constellation-engine-<unit>-<node>` pod via the Kubernetes API (list by
-label `constellation.dev/pool=<pool>` or `constellation.dev/sc=<sc>`, plus
-`constellation.dev/node=<node>`); if absent, it creates one — a bare `Pod`
+label `constellation.replicix.com/pool=<pool>` or `constellation.replicix.com/sc=<sc>`, plus
+`constellation.replicix.com/node=<node>`); if absent, it creates one — a bare `Pod`
 object (not a `Deployment`/`StatefulSet`: its identity is entirely
 determined by (pool|sc, node) and it is never rescheduled, only replaced in
 place by the node plugin itself, which already has to orchestrate
@@ -1014,7 +1020,7 @@ controller, for its own controller-owned pod) polls Kubernetes
 `ownerReference` to the node plugin's own `DaemonSet` Pod (so it cannot
 outlive the node plugin generation that created it — a stale engine pod
 from a deleted node plugin gets garbage-collected by Kubernetes itself)
-plus a `constellation.dev/last-view-count` annotation the node plugin
+plus a `constellation.replicix.com/last-view-count` annotation the node plugin
 updates on every `view.mount`/`view.unmount`. A background reconcile loop
 in the node plugin (polling every 30s) deletes any engine pod whose
 `view.list` returns zero views and whose `last-view-count` has been zero
@@ -1054,10 +1060,10 @@ every deliberate delete of one leaves the registry first, and the registry
 sweep (§"Deletion and purge") retires the records rescheduled incarnations
 left behind (37-k6a review). With two controller replicas the one retiring
 a pod may not be the one using it, so (37-k6b review) every RPC first
-*holds* the pod — a `constellation.dev/held-by-<replica>` annotation of
+*holds* the pod — a `constellation.replicix.com/held-by-<replica>` annotation of
 unix-ms expiry, written by compare-and-swap on the pod's
 `resourceVersion` and renewed while in use — and a reap, roll or a
-delete's own stop first *marks* it (`constellation.dev/retiring`, by
+delete's own stop first *marks* it (`constellation.replicix.com/retiring`, by
 compare-and-swap too, only when no other replica's hold is live); a hold
 that finds a fresh mark waits for the pod to go and starts it again. The
 two swaps on one object serialize, so no RPC of any replica whose hold
@@ -1065,7 +1071,7 @@ stays live is cut off; a renewal is a compare-and-swap too and refuses a
 pod another replica marked once the hold had lapsed, so those RPCs fail
 and their retries get a fresh pod (37-k6b follow-up). A pod whose engine
 left the registry but whose fenced delete was refused is annotated
-`constellation.dev/left`, and the next hold or bring-up of any replica
+`constellation.replicix.com/left`, and the next hold or bring-up of any replica
 replaces it: a left engine never serves a pool with volumes
 (`crates/csi/src/engine_pods/controller_pods.rs`).
 
@@ -1346,7 +1352,7 @@ duplicate of that fd changes:
    to the `run()` event loop. K0 is where this patch is written and proven,
    not assumed — see its gate.
 6. **Cutover.** Once every `View`'s `resume()` returns `Ok`, the new engine
-   pod's `constellation.dev/last-view-count` annotation goes non-zero, the
+   pod's `constellation.replicix.com/last-view-count` annotation goes non-zero, the
    node plugin marks the old pod for deletion (a final `node.handoff{phase:
    Commit}` lets the old pod exit cleanly rather than being SIGKILLed, for
    log/metrics hygiene only — nothing correctness-relevant happens in this
@@ -2624,7 +2630,7 @@ What §8 became against real engine pods, where it had to differ:
   (so `Status` and `Abort` answer while a slow reader holds the stream;
   an `Abort` landing mid-write fails the transfer, and no commit can
   follow). 3 attempts per pod and desired spec, then the §8 fallback: the
-  old pod keeps serving (an event, `constellation.dev/handoff-fallback`,
+  old pod keeps serving (an event, `constellation.replicix.com/handoff-fallback`,
   `constellation_csi_handoff_fallback_total`; logged once) until it ends
   and the republish restages its volumes on the new spec.
 - **For K5b: the gated pause is client-visible.** From the drain's start
@@ -2638,7 +2644,7 @@ What §8 became against real engine pods, where it had to differ:
   and `tests/csi/k5-handoff.sh`'s busy writer report it as the longest
   call.
 - **Rollout trigger.** Each node pod carries the fingerprint of the engine
-  settings it was made from (`constellation.dev/engine-config`: image, pull
+  settings it was made from (`constellation.replicix.com/engine-config`: image, pull
   policy, resources, log level); a node plugin whose own settings (chart
   values, through its DaemonSet) differ rolls its drifted pods one at a
   time, at start and every 30 s. Replacements alternate between two socket

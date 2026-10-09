@@ -24,7 +24,7 @@ use tonic::{Request, Response, Status};
 
 /// `spec.driverName`, `GetPluginInfo.name`, and every `*.storage.k8s.io`
 /// `driver`/`provisioner` field (plan 37 settled decision 2).
-pub const DRIVER_NAME: &str = "csi.constellation.dev";
+pub const DRIVER_NAME: &str = "constellation.csi.replicix.com";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {

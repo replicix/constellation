@@ -3,7 +3,7 @@
 Give Kubernetes workloads `PersistentVolume`s backed by Constellation on S3:
 install the `constellation-csi` Helm chart, pick a layout per
 `StorageClass`, and provision volumes from it. The driver is
-`csi.constellation.dev`: a controller `Deployment` (provisioning,
+`constellation.csi.replicix.com`: a controller `Deployment` (provisioning,
 expansion, snapshots, trash purge) and a node plugin `DaemonSet` (the
 FUSE mounts). Both start **engine pods**, one `constellation serve`
 process per pool filesystem per node, which serve every volume of that
@@ -55,7 +55,7 @@ helm upgrade --install constellation-csi target/dist/csi/constellation-csi-0.1.0
     -n constellation-csi \
     --set image.repository=registry.example.com/constellation-csi --set image.tag=0.1.0 \
     -f my-values.yaml
-kubectl get csidriver csi.constellation.dev
+kubectl get csidriver constellation.csi.replicix.com
 ```
 
 `values.yaml` documents every setting: sidecar versions, the engine pods'
@@ -109,7 +109,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: constellation-rwx
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "constellation-csi-pool"          # required
   # Default "constellation-csi" for every class: two classes in one bucket
@@ -144,7 +144,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: constellation-ci-scratch
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "constellation-csi-pool"
   prefix: "constellation-csi/constellation-ci-scratch"
@@ -166,7 +166,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: constellation-tenant-a-isolated
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "constellation-csi-tenant-a"
   prefix: "constellation-csi/isolated"
@@ -185,7 +185,7 @@ apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:
   name: constellation-snapshots
-driver: csi.constellation.dev
+driver: constellation.csi.replicix.com
 deletionPolicy: Delete
 parameters:
   csi.storage.k8s.io/snapshotter-secret-name: "constellation-s3-creds"
@@ -266,7 +266,7 @@ spec:
   persistentVolumeReclaimPolicy: Retain      # the driver never deletes it
   storageClassName: ""
   csi:
-    driver: csi.constellation.dev
+    driver: constellation.csi.replicix.com
     volumeHandle: "4f9c1e2a-…/datasets/imagenet"
     readOnly: true
     volumeAttributes:
@@ -357,7 +357,7 @@ every engine pod uses it, then revoke the old pair. The chart README's
   a writing, creating and reading load with zero errors. The
   `engineProfile.handoff.*` values bound each step. A pod whose handover
   fails `maxAttempts` times keeps serving (event and annotation
-  `constellation.dev/handoff-fallback`), and its volumes move at the next
+  `constellation.replicix.com/handoff-fallback`), and its volumes move at the next
   republish.
 - **Plugin pods** (controller, node DaemonSet): mounts survive a node
   plugin restart. Engine pods hold the FUSE connections, not the plugin.

@@ -9,7 +9,7 @@ Usage: tests/csi/e2e-tally.py REPORT.xml...
 import sys
 import xml.etree.ElementTree as ET
 
-DRIVER = "External Storage [Driver: csi.constellation.dev] "
+DRIVER = "External Storage [Driver: constellation.csi.replicix.com] "
 
 
 def first_line(text):

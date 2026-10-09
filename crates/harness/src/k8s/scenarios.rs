@@ -1759,7 +1759,7 @@ fn csi_pod_security(env: &Env, _seed: u64) -> Result<()> {
             let labels = &pod["metadata"]["labels"];
             let role = match (
                 labels["app.kubernetes.io/component"].as_str(),
-                labels["constellation.dev/owner"].as_str(),
+                labels["constellation.replicix.com/owner"].as_str(),
             ) {
                 (Some("controller"), _) => "controller",
                 (Some("node"), _) => "node plugin",
@@ -2053,7 +2053,7 @@ fn controller_engines(env: &Env) -> Vec<String> {
             "-n",
             &env.driver_ns,
             "-l",
-            "app.kubernetes.io/component=engine,constellation.dev/owner=controller",
+            "app.kubernetes.io/component=engine,constellation.replicix.com/owner=controller",
             "--field-selector=status.phase=Running",
             "-o",
             "name",

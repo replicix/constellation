@@ -77,7 +77,7 @@ read -r ctl_pod ctl_uid worker < <(k -n "$ns" get pods -l app.kubernetes.io/comp
     | grep -v ' control-plane$' | head -1)
 [ -n "${worker:-}" ] || { echo "no controller replica on a worker"; exit 1; }
 node_ctr="$worker"
-plugin=/var/lib/kubelet/plugins/csi.constellation.dev
+plugin=/var/lib/kubelet/plugins/constellation.csi.replicix.com
 # The emptyDir's own path is longer than a unix socket address may be
 # (108 bytes): reach it through a short symlink to its directory.
 ctl_dir="/var/lib/kubelet/pods/$ctl_uid/volumes/kubernetes.io~empty-dir/socket-dir"
@@ -123,7 +123,7 @@ docker exec "$node_ctr" /usr/local/bin/csi-sanity \
     --ginkgo.focus="$focus" --ginkgo.fail-on-empty --ginkgo.no-color --ginkgo.v
 
 echo "== the engine pod csi-sanity staged through"
-sel=app.kubernetes.io/component=engine,constellation.dev/owner=node
+sel=app.kubernetes.io/component=engine,constellation.replicix.com/owner=node
 k -n "$ns" get pods -l "$sel" -o wide
 pods=$(k -n "$ns" get pods -l "$sel" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
 [ "$(grep -c . <<<"$pods")" = 1 ] || { echo "expected one node-owned engine pod, got: ${pods:-none}"; exit 1; }
@@ -132,7 +132,7 @@ jq -e --arg n "$worker" '.spec.nodeName == $n
        and .spec.containers[0].securityContext.privileged != true
        and .spec.securityContext.runAsNonRoot == true
        and .metadata.ownerReferences[0].kind == "DaemonSet"
-       and .metadata.annotations["constellation.dev/last-view-count"] == "0"' \
+       and .metadata.annotations["constellation.replicix.com/last-view-count"] == "0"' \
     <<<"$spec" >/dev/null || { echo "the node engine pod is not pinned/unprivileged/owned/idle: $spec"; exit 1; }
 if docker exec "$node_ctr" grep -q 'fuse.constellation' /proc/self/mountinfo; then
     echo "a staging mount outlived csi-sanity's cleanup:"

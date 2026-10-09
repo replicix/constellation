@@ -12,10 +12,10 @@ StorageClass:
   # true, Immediate binding, provisioner and node-stage secrets.
   FromExistingClassName: constellation-e2e
 SnapshotClass:
-  # driver csi.constellation.dev, snapshotter secret, deletionPolicy Delete.
+  # driver constellation.csi.replicix.com, snapshotter secret, deletionPolicy Delete.
   FromExistingClassName: constellation-e2e
 DriverInfo:
-  Name: csi.constellation.dev
+  Name: constellation.csi.replicix.com
   # Capacity is a subtree quota (metadata, settled decision 6), so any size
   # is honest; the suite's default minimum is 5Gi, 1Gi keeps its quota
   # tests' fills small against an in-memory S3.

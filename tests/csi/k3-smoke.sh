@@ -86,7 +86,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: k3-pool
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "$bucket"
   prefix: "constellation-csi/k3-pool"
@@ -177,7 +177,7 @@ pod b1 "$w1" 'true' k3-b
 in_pod b1 'echo b > /data/k3-b/own && cat /data/k3-b/own' | grep -qx b \
     || { echo "b1 cannot use pvc b"; exit 1; }
 in_pod b1 'test ! -e /data/k3-b/greeting' || { echo "pvc b sees pvc a's files"; exit 1; }
-sel=app.kubernetes.io/component=engine,constellation.dev/owner=node
+sel=app.kubernetes.io/component=engine,constellation.replicix.com/owner=node
 k -n "$ns" get pods -l "$sel" -o wide
 engines=$(k -n "$ns" get pods -l "$sel" -o json)
 jq -e --arg w1 "$w1" --arg w2 "$w2" '
@@ -188,7 +188,7 @@ jq -e --arg w1 "$w1" --arg w2 "$w2" '
                      and .metadata.ownerReferences[0].kind == "DaemonSet")' \
     <<<"$engines" >/dev/null || { echo "not one pinned, unprivileged engine pod per (pool, node)"; exit 1; }
 views() {
-    k -n "$ns" get pods -l "$sel,constellation.dev/node=$1" \
+    k -n "$ns" get pods -l "$sel,constellation.replicix.com/node=$1" \
         -o jsonpath='{.items[0].metadata.annotations.constellation\.dev/last-view-count}'
 }
 [ "$(views "$w1")" = 2 ] || { echo "the $w1 engine pod serves $(views "$w1") views, not 2"; exit 1; }
@@ -224,8 +224,8 @@ denied() { # denied WHAT CMD...: the call must fail with an admission denial
         || { echo "$what failed, but not by the policy: $out"; exit 1; }
     echo "   denied: $what"
 }
-e1=$(k -n "$ns" get pods -l "$sel,constellation.dev/node=$w1" -o jsonpath='{.items[0].metadata.name}')
-e2=$(k -n "$ns" get pods -l "$sel,constellation.dev/node=$w2" -o jsonpath='{.items[0].metadata.name}')
+e1=$(k -n "$ns" get pods -l "$sel,constellation.replicix.com/node=$w1" -o jsonpath='{.items[0].metadata.name}')
+e2=$(k -n "$ns" get pods -l "$sel,constellation.replicix.com/node=$w2" -o jsonpath='{.items[0].metadata.name}')
 # Positive controls first, so a policy that refuses everything fails here.
 as_w2 -n "$ns" delete pod "$e2" --dry-run=server >/dev/null \
     || { echo "the $w2 plugin's token may not delete its own engine pod"; exit 1; }
@@ -315,7 +315,7 @@ docker exec "$w1" rm -f "$victim"
 echo "   victim untouched; the grant was rewritten in place, root-owned"
 
 echo "== settled decision 12: the $w1 engine pod dies; republish restages"
-e1=$(k -n "$ns" get pods -l "$sel,constellation.dev/node=$w1" -o jsonpath='{.items[0].metadata.name}')
+e1=$(k -n "$ns" get pods -l "$sel,constellation.replicix.com/node=$w1" -o jsonpath='{.items[0].metadata.name}')
 uid=$(k -n "$ns" get pod "$e1" -o jsonpath='{.metadata.uid}')
 k -n "$ns" delete pod "$e1" --grace-period=0 --force >/dev/null 2>&1
 # kubelet republishes every staged volume of a requiresRepublish driver on

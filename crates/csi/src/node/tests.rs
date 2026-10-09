@@ -168,7 +168,7 @@ fn context() -> HashMap<String, String> {
         // What external-provisioner adds to every volume it provisions.
         (
             "storage.kubernetes.io/csiProvisionerIdentity",
-            "1790930000000-1234-csi.constellation.dev",
+            "1790930000000-1234-constellation.csi.replicix.com",
         ),
     ]
     .into_iter()

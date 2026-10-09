@@ -10,7 +10,7 @@ name="${KIND_CLUSTER:-constellation-csi}"
 sanity="${CSI_SANITY_BIN:-csi-sanity}"
 sanity="$(readlink -f "$(command -v "$sanity")")"
 node="$(docker ps --format '{{.Names}}' | grep -x "$name-worker")"
-sock="${CSI_PLUGIN_SOCK:-/var/lib/kubelet/plugins/csi.constellation.dev/csi.sock}"
+sock="${CSI_PLUGIN_SOCK:-/var/lib/kubelet/plugins/constellation.csi.replicix.com/csi.sock}"
 # /tmp is a tmpfs in the kind node, which `docker cp` cannot write to.
 docker cp "$sanity" "$node:/usr/local/bin/csi-sanity"
 docker exec "$node" /usr/local/bin/csi-sanity --csi.endpoint="unix://$sock" \

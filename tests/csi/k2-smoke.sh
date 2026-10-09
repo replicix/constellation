@@ -101,7 +101,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: k2-pool
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "$bucket"
   prefix: "constellation-csi/k2-pool"
@@ -146,7 +146,7 @@ uuid_b=$(cut -d/ -f4 <<<"$hb")
 [ "$uuid_a" = "$uuid_b" ] || { echo "PVCs landed on different filesystems: $uuid_a vs $uuid_b"; exit 1; }
 
 echo "== exactly one controller-owned engine pod"
-sel=app.kubernetes.io/component=engine,constellation.dev/owner=controller
+sel=app.kubernetes.io/component=engine,constellation.replicix.com/owner=controller
 pods=$(k -n "$ns" get pods -l "$sel" -o name)
 # `grep -c .`, not `wc -l`: an empty list is 0 lines, not 1.
 [ "$(grep -c . <<<"$pods")" = 1 ] || { echo "expected one engine pod, got: ${pods:-none}"; exit 1; }
@@ -211,7 +211,7 @@ grep -q 'constellation-csi-controller-pods' <<<"$out" \
     || { echo "exec refused, but not by the policy: $out"; exit 1; }
 echo "   exec into $node_pod: denied by the policy"
 if out=$(k "${as_ctl[@]}" -n "$ns" run constellation-engine-evil-controller --restart=Never \
-    --image="$CSI_IMAGE" -l app.kubernetes.io/component=engine,constellation.dev/owner=controller \
+    --image="$CSI_IMAGE" -l app.kubernetes.io/component=engine,constellation.replicix.com/owner=controller \
     --overrides='{"spec":{"hostPID":true,"containers":[{"name":"x","image":"'"$CSI_IMAGE"'","securityContext":{"privileged":true}}]}}' \
     2>&1); then
     echo "the controller SA could create a privileged pod"; exit 1

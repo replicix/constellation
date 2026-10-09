@@ -11,7 +11,7 @@
 //! the middle of using it; an in-process lock cannot see the other. So:
 //!
 //! - Every RPC that reaches a pod first **holds** it: its replica writes
-//!   `constellation.dev/held-by-<10 hex of the replica's name>` = the unix
+//!   `constellation.replicix.com/held-by-<10 hex of the replica's name>` = the unix
 //!   ms until which it holds the pod ([`HOLD_FOR`] ahead) with a
 //!   compare-and-swap on the pod's `resourceVersion`, on the first use
 //!   after none in that replica, and renews it while any RPC of the
@@ -20,7 +20,7 @@
 //!   pod another replica has marked meanwhile (this replica's hold had
 //!   lapsed, say the API server was out of reach): the retire goes on,
 //!   the RPCs using the pod fail, and their retries hold a fresh one.
-//! - A retire first **marks** the pod: `constellation.dev/retiring` =
+//! - A retire first **marks** the pod: `constellation.replicix.com/retiring` =
 //!   `<its replica's key> <unix ms>`, by a compare-and-swap too, and only
 //!   when no other replica's hold is live (and no RPC of its own uses
 //!   the pod). Only then does it look again (a reap: is the pool still
@@ -58,9 +58,9 @@ use std::collections::{BTreeSet, HashSet};
 
 /// A controller replica's hold on a controller-owned pod (module docs):
 /// `<prefix><10 hex>` = unix ms.
-pub const ANNOTATION_HELD_PREFIX: &str = "constellation.dev/held-by-";
+pub const ANNOTATION_HELD_PREFIX: &str = "constellation.replicix.com/held-by-";
 /// A retire in progress (module docs): `<holder key> <unix ms>`.
-pub const ANNOTATION_RETIRING: &str = "constellation.dev/retiring";
+pub const ANNOTATION_RETIRING: &str = "constellation.replicix.com/retiring";
 /// How far ahead a hold is written.
 pub const HOLD_FOR: Duration = Duration::from_secs(120);
 /// A hold with less than this left is renewed (while used).
@@ -69,7 +69,7 @@ const HOLD_RENEW_BELOW: Duration = Duration::from_secs(60);
 pub const HOLD_SKEW: Duration = Duration::from_secs(30);
 /// A pod whose engine left the registry but which was not deleted
 /// (module docs): `<holder key> <unix ms>`.
-pub const ANNOTATION_LEFT: &str = "constellation.dev/left";
+pub const ANNOTATION_LEFT: &str = "constellation.replicix.com/left";
 /// A retiring mark older than this is stale: its replica died mid-retire.
 pub const RETIRING_TTL: Duration = Duration::from_secs(120);
 /// A recorded pool no PV names is given up on after failing to come up in
@@ -1568,7 +1568,7 @@ mod tests {
             (other.as_str(), (now + 1).to_string()),
             // Expired, but within the skew allowance: still live.
             (third.as_str(), (now - skew + 1).to_string()),
-            ("constellation.dev/engine-config", "x".into()),
+            ("constellation.replicix.com/engine-config", "x".into()),
         ]);
         let mut live = live_holds(&pod, &me, now);
         live.sort();

@@ -125,7 +125,7 @@ fn engine_pods_on(env: &Env, node: &str) -> Result<Vec<String>> {
         "-n",
         &env.driver_ns,
         "-l",
-        "app.kubernetes.io/component=engine,constellation.dev/owner=node",
+        "app.kubernetes.io/component=engine,constellation.replicix.com/owner=node",
     ])?;
     Ok(list["items"]
         .as_array()
@@ -211,7 +211,7 @@ pub fn csi_node_drain(env: &Env, seed: u64) -> Result<()> {
             .clone();
         let id = node_id_of(env, &engine)?;
         let unit = env.kube.get(&["pod", "-n", &env.driver_ns, &engine])?["metadata"]["labels"]
-            ["constellation.dev/unit"]
+            ["constellation.replicix.com/unit"]
             .as_str()
             .unwrap_or_default()
             .to_string();
@@ -346,7 +346,7 @@ fn controller_pod(s: &Scope, fs: &str) -> Result<(String, String, String, String
         &s.env.driver_ns,
         "-l",
         &format!(
-            "app.kubernetes.io/component=engine,constellation.dev/owner=controller,constellation.dev/fs-uuid={fs}"
+            "app.kubernetes.io/component=engine,constellation.replicix.com/owner=controller,constellation.replicix.com/fs-uuid={fs}"
         ),
     ])?;
     let pod = pods["items"]

@@ -2,7 +2,7 @@
 
 # The CSI driver name; StorageClass.provisioner and VolumeSnapshotClass.driver
 # must carry exactly this (plan 37 settled decision 2).
-driverName: csi.constellation.dev
+driverName: constellation.csi.replicix.com
 
 image:
   # One image carries constellation-csi (--controller / --node) and the
@@ -77,7 +77,7 @@ engineProfile:
     # sessions, so it is waited for, never deleted on a timeout).
     resumeTimeoutMs: 300000
     # Attempts per pod and spec before the rollout leaves the old pod
-    # serving (an event and the constellation.dev/handoff-fallback
+    # serving (an event and the constellation.replicix.com/handoff-fallback
     # annotation say so; its volumes move at the next republish).
     maxAttempts: 3
     # Seconds between rollout passes (and at the plugin's start); 0: off.

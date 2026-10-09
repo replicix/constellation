@@ -363,7 +363,10 @@ async fn create_volume_once(control: &ControlClient, idx: u64) -> (SeqLatencies,
         ),
         ("user.namespace", "default".to_string()),
         ("user.capacity", VOLUME_CAPACITY_BYTES.to_string()),
-        ("user.source", "csi.constellation.dev/pool".to_string()),
+        (
+            "user.source",
+            "constellation.csi.replicix.com/pool".to_string(),
+        ),
         ("user.created", ts().to_string()),
     ];
     for (attr_name, value) in xattrs {

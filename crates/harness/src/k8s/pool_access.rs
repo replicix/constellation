@@ -490,9 +490,9 @@ fn parse_pool_handle(handle: &str) -> Result<(u32, String, String)> {
 /// A node-owned engine pod of a pool shard.
 struct ShardEngine {
     pod: String,
-    /// Its `constellation.dev/fs-uuid` label.
+    /// Its `constellation.replicix.com/fs-uuid` label.
     uuid: String,
-    /// Its `constellation.dev/s3` annotation: the filesystem's location.
+    /// Its `constellation.replicix.com/s3` annotation: the filesystem's location.
     s3: String,
 }
 
@@ -505,7 +505,7 @@ fn node_engines(s: &Scope) -> Result<BTreeMap<(u32, String), ShardEngine>> {
         &s.env.driver_ns,
         "-l",
         &format!(
-            "app.kubernetes.io/component=engine,constellation.dev/owner=node,constellation.dev/pool={}",
+            "app.kubernetes.io/component=engine,constellation.replicix.com/owner=node,constellation.replicix.com/pool={}",
             s.pool_label()
         ),
     ])?;
@@ -516,7 +516,7 @@ fn node_engines(s: &Scope) -> Result<BTreeMap<(u32, String), ShardEngine>> {
         }
         let m = &p["metadata"];
         let name = m["name"].as_str().unwrap_or_default().to_string();
-        let shard: u32 = m["labels"]["constellation.dev/shard"]
+        let shard: u32 = m["labels"]["constellation.replicix.com/shard"]
             .as_str()
             .and_then(|v| v.parse().ok())
             .with_context(|| format!("{name} has no shard label"))?;
@@ -524,11 +524,11 @@ fn node_engines(s: &Scope) -> Result<BTreeMap<(u32, String), ShardEngine>> {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let uuid = m["labels"]["constellation.dev/fs-uuid"]
+        let uuid = m["labels"]["constellation.replicix.com/fs-uuid"]
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let s3 = m["annotations"]["constellation.dev/s3"]
+        let s3 = m["annotations"]["constellation.replicix.com/s3"]
             .as_str()
             .unwrap_or_default()
             .to_string();

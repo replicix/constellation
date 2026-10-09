@@ -46174,3 +46174,36 @@ passed, including the existing `Shard` partition tests.
 - Not re-run end to end on a hosted runner (no access from this
   sandbox); the archive-extraction and `kernel_messages`/`Shard` unit
   tests above are the closest local proxy.
+
+## Rename: CSI driver `csi.constellation.dev` → `constellation.csi.replicix.com`, label prefix `constellation.dev/` → `constellation.replicix.com/` (2026-10-10)
+
+### Cause
+
+The CSI spec (`GetPluginInfo`) requires a domain-name-form plugin name that
+"SHOULD include the plugin's host company name … to minimize the possibility
+of collisions". `constellation.dev` is registered to a third party (since
+2025-07-22, a parked page), so neither the driver name nor the Kubernetes
+label/annotation prefix were under a domain we control. The driver name is
+written into every `StorageClass` and PersistentVolume and cannot change once
+volumes exist; no release had shipped yet, so the rename is free now.
+
+### What changed
+
+`DRIVER_NAME` (`crates/csi/src/identity.rs`) and every label/annotation
+constant in `crates/csi/src/engine_pods.rs` and
+`engine_pods/controller_pods.rs`; the Helm chart (`values.yaml` `driverName`,
+chart description; templates derive the kubelet plugin directory, the
+`CSIDriver` name and the admission-policy label checks from them); the
+harness (`k8s.rs`, `pool_access.rs`, `csi_meta_ladder.rs`); the CSI test
+scripts, `testdriver.yaml`, `e2e-tally.py`, `e2e-skips.md`; the
+Kubernetes how-to and plan 37 (with the rationale). Earlier entries in this
+log keep the old name as historical record.
+
+### Gates
+
+`cargo fmt --all -- --check` clean (one harness line re-wrapped);
+`cargo clippy -p constellation-csi -p constellation-harness --all-targets -- -D warnings`
+clean; `cargo test -p constellation-csi` 172 + integration passed (under
+`umask 022`: two `engine_pods` tests refuse a group-writable temp dir under
+umask 002, by design, independent of this change); `helm template` renders
+only the new names. Not run: the kind/k3s CSI e2e lanes (need a cluster).

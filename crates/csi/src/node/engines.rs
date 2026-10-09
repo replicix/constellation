@@ -39,7 +39,7 @@ pub trait NodeEngines: Send + Sync {
     /// The engine pod serving `pool` on this node, created first when there
     /// is none (§7 "Creation"), once it is ready. `fs_uuid` is the
     /// filesystem the volume being staged names (the pod's
-    /// `constellation.dev/fs-uuid` label; the caller still checks that the
+    /// `constellation.replicix.com/fs-uuid` label; the caller still checks that the
     /// pod serves it). `unlock`: the credentials to send a pod that waits
     /// for them (`crate::credentials`) — sent once per incarnation, and
     /// again when they differ from what it got (a rotation). Without them
@@ -206,10 +206,10 @@ pub struct UnitPod {
     pub pod: String,
     /// Running and ready (a pod that is not cannot be asked anything).
     pub ready: bool,
-    /// `constellation.dev/last-view-count`; `None`: never counted (a stage
+    /// `constellation.replicix.com/last-view-count`; `None`: never counted (a stage
     /// that failed after bringing it up).
     pub views: Option<u64>,
-    /// `constellation.dev/idle-since` (unix seconds), set with a count of 0.
+    /// `constellation.replicix.com/idle-since` (unix seconds), set with a count of 0.
     pub idle_since: Option<u64>,
     /// When the pod was created (unix seconds).
     pub created: Option<u64>,

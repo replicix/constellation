@@ -71,7 +71,7 @@ s3c="$KIND_CLUSTER-floci"
 bucket=k5-handoff
 w1="$KIND_CLUSTER-worker"
 k() { kubectl --context "$ctx" "$@"; }
-sel=app.kubernetes.io/component=engine,constellation.dev/owner=node
+sel=app.kubernetes.io/component=engine,constellation.replicix.com/owner=node
 
 cleanup() {
     status=$?
@@ -115,7 +115,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: k5-pool
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "$bucket"
   prefix: "constellation-csi/k5-pool"
@@ -235,7 +235,7 @@ for _ in $(seq 60); do [ "$(count)" -gt 50 ] && break; sleep 1; done
 [ "$(count)" -gt 50 ] || { echo "the writer is not writing ($(count) lines)"; exit 1; }
 echo "   writing: $(count) lines so far"
 
-old=$(k -n "$ns" get pods -l "$sel,constellation.dev/node=$w1" -o jsonpath='{.items[0].metadata.name}')
+old=$(k -n "$ns" get pods -l "$sel,constellation.replicix.com/node=$w1" -o jsonpath='{.items[0].metadata.name}')
 old_image=$(k -n "$ns" get pod "$old" -o jsonpath='{.spec.containers[0].image}')
 fuse_mount() { # the staging FUSE mount on the worker: "<mount id> <mountpoint>"
     docker exec "$w1" awk '$9 ~ /^fuse/ && $5 ~ /globalmount$/ {print $1, $5}' /proc/self/mountinfo
@@ -267,7 +267,7 @@ echo "   chart upgraded; waiting for the rollout on $w1"
 new=""
 rollout_s=${K5_ROLLOUT_S:-900}
 for _ in $(seq $((rollout_s / 2))); do
-    new=$(k -n "$ns" get pods -l "$sel,constellation.dev/node=$w1" -o json | jq -r --arg img "$next" '
+    new=$(k -n "$ns" get pods -l "$sel,constellation.replicix.com/node=$w1" -o json | jq -r --arg img "$next" '
         [.items[] | select(.spec.containers[0].image == $img
             and (.status.conditions // [] | any(.type == "Ready" and .status == "True")))
         ] | .[0].metadata.name // empty')
@@ -380,7 +380,7 @@ fi
 
 echo "== the backup across the handoff"
 since=$(( $(date +%s) - upgraded_at + 30 ))s
-backup=$(k -n "$ns" get pods -l app.kubernetes.io/component=engine,constellation.dev/owner=controller \
+backup=$(k -n "$ns" get pods -l app.kubernetes.io/component=engine,constellation.replicix.com/owner=controller \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 nocolor() { sed 's/\x1b\[[0-9;]*m//g'; }
 if [ -n "$backup" ]; then

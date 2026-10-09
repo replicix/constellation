@@ -129,7 +129,7 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
   name: $class
-provisioner: csi.constellation.dev
+provisioner: constellation.csi.replicix.com
 parameters:
   bucket: "$bucket"
   prefix: "csi-e2e/$run_id"
@@ -151,7 +151,7 @@ apiVersion: snapshot.storage.k8s.io/v1
 kind: VolumeSnapshotClass
 metadata:
   name: $class
-driver: csi.constellation.dev
+driver: constellation.csi.replicix.com
 deletionPolicy: Delete
 parameters:
   csi.storage.k8s.io/snapshotter-secret-name: constellation-e2e-creds

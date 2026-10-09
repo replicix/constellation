@@ -35,7 +35,7 @@
 #   CSI_NAMESPACE              the driver's namespace (default constellation-csi)
 #   CSI_HOST_ROOT              the chart's hostRoot (default /var/lib/constellation-csi)
 #   CSI_KUBELET_DIR            the chart's kubeletDir (default /var/lib/kubelet)
-#   CSI_DRIVER_NAME            the chart's driverName (default csi.constellation.dev)
+#   CSI_DRIVER_NAME            the chart's driverName (default constellation.csi.replicix.com)
 #   PSC_STORAGE_CLASS          a pool StorageClass to stage a volume of first
 #   PSC_IMAGE                  the workload pod's image (default constellation-csi:dev)
 set -euo pipefail
@@ -45,7 +45,7 @@ host_root="${CSI_HOST_ROOT:-/var/lib/constellation-csi}"
 host_root="${host_root%/}"
 kubelet_dir="${CSI_KUBELET_DIR:-/var/lib/kubelet}"
 kubelet_dir="${kubelet_dir%/}"
-driver="${CSI_DRIVER_NAME:-csi.constellation.dev}"
+driver="${CSI_DRIVER_NAME:-constellation.csi.replicix.com}"
 k() {
     if [ -n "${KUBE_CONTEXT:-}" ]; then
         kubectl --context "$KUBE_CONTEXT" "$@"
@@ -158,7 +158,7 @@ engine_common() { # name
 }
 
 n=0
-for name in $(jq -r '.items[] | select(.metadata.labels["app.kubernetes.io/component"] == "engine" and .metadata.labels["constellation.dev/owner"] == "controller") | .metadata.name' <<<"$pods"); do
+for name in $(jq -r '.items[] | select(.metadata.labels["app.kubernetes.io/component"] == "engine" and .metadata.labels["constellation.replicix.com/owner"] == "controller") | .metadata.name' <<<"$pods"); do
     n=$((n + 1))
     doc=$(jq --arg n "$name" '.items[] | select(.metadata.name == $n)' <<<"$pods")
     engine_common "$name"
@@ -168,12 +168,12 @@ done
 [ "$n" -gt 0 ] || { echo "[FAIL] 3.0 no controller-owned engine pod to check"; fail=$((fail + 1)); }
 
 n=0
-for name in $(jq -r '.items[] | select(.metadata.labels["app.kubernetes.io/component"] == "engine" and .metadata.labels["constellation.dev/owner"] == "node") | .metadata.name' <<<"$pods"); do
+for name in $(jq -r '.items[] | select(.metadata.labels["app.kubernetes.io/component"] == "engine" and .metadata.labels["constellation.replicix.com/owner"] == "node") | .metadata.name' <<<"$pods"); do
     n=$((n + 1))
     doc=$(jq --arg n "$name" --arg root "$host_root" '.items[] | select(.metadata.name == $n) | . + {root: $root}' <<<"$pods")
     engine_common "$name"
     check "3.6" "$name (node-owned): hostPaths exactly <hostRoot>/{node-identity,sockets,policy}/<its unit>, type Directory" \
-        '.metadata.labels["constellation.dev/unit"] as $u | .root as $r | ([.spec.volumes[] | select(.hostPath) | .hostPath.path] | sort) == (["\($r)/node-identity/\($u)", "\($r)/sockets/\($u)", "\($r)/policy/\($u)"] | sort) and ([.spec.volumes[] | select(.hostPath) | .hostPath.type == "Directory"] | all)'
+        '.metadata.labels["constellation.replicix.com/unit"] as $u | .root as $r | ([.spec.volumes[] | select(.hostPath) | .hostPath.path] | sort) == (["\($r)/node-identity/\($u)", "\($r)/sockets/\($u)", "\($r)/policy/\($u)"] | sort) and ([.spec.volumes[] | select(.hostPath) | .hostPath.type == "Directory"] | all)'
     check "3.7" "$name (node-owned): the policy hostPath (its grant) is mounted read-only" \
         '[.spec.containers[0].volumeMounts[] | select(.name == "policy") | .readOnly == true] == [true]'
 done

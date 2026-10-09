@@ -14,11 +14,11 @@
 //! shard of the pool, which `-shard-<k>` then tells apart — so every
 //! controller replica, before and after a restart, names the same pod for
 //! the same filesystem, and two classes sharing a bucket but not a prefix
-//! never share a pod. `constellation.dev/pool` carries `<pool>` (one value
-//! per pool, §7) and `constellation.dev/shard` the shard. Its labels say what it is (`app.kubernetes.io/component:
-//! engine`, `constellation.dev/pool`, `constellation.dev/shard`,
-//! `constellation.dev/owner: controller`) and, once the controller has
-//! asked it, which filesystem it serves (`constellation.dev/fs-uuid`), which
+//! never share a pod. `constellation.replicix.com/pool` carries `<pool>` (one value
+//! per pool, §7) and `constellation.replicix.com/shard` the shard. Its labels say what it is (`app.kubernetes.io/component:
+//! engine`, `constellation.replicix.com/pool`, `constellation.replicix.com/shard`,
+//! `constellation.replicix.com/owner: controller`) and, once the controller has
+//! asked it, which filesystem it serves (`constellation.replicix.com/fs-uuid`), which
 //! is how `DeleteVolume`/`ControllerExpandVolume` — knowing only the uuid in
 //! `volume_id` — find it again. Its `ownerReference` is the controller
 //! `Deployment` (when the chart names it), so uninstalling the driver
@@ -170,32 +170,32 @@ const POD_STATE_DIR: &str = "/var/lib/constellation/state";
 const ENGINE_UID: i64 = 65532;
 
 pub const LABEL_COMPONENT: &str = "app.kubernetes.io/component";
-pub const LABEL_POOL: &str = "constellation.dev/pool";
-pub const LABEL_SHARD: &str = "constellation.dev/shard";
-pub const LABEL_OWNER: &str = "constellation.dev/owner";
-pub const LABEL_FS_UUID: &str = "constellation.dev/fs-uuid";
-pub const LABEL_NODE: &str = "constellation.dev/node";
+pub const LABEL_POOL: &str = "constellation.replicix.com/pool";
+pub const LABEL_SHARD: &str = "constellation.replicix.com/shard";
+pub const LABEL_OWNER: &str = "constellation.replicix.com/owner";
+pub const LABEL_FS_UUID: &str = "constellation.replicix.com/fs-uuid";
+pub const LABEL_NODE: &str = "constellation.replicix.com/node";
 /// A node-owned pod's `<unit>`: what its name, hostPaths and credentials
 /// `Secret` are derived from, which the node half of the chart's
 /// pod-access policy holds them to.
-pub const LABEL_UNIT: &str = "constellation.dev/unit";
+pub const LABEL_UNIT: &str = "constellation.replicix.com/unit";
 /// §7: how many views a node-owned engine pod serves, as its node plugin
 /// last counted them (the idle GC, 37-k6b, reads it), and since when it
 /// has served none.
-pub const ANNOTATION_VIEWS: &str = "constellation.dev/last-view-count";
-pub const ANNOTATION_IDLE_SINCE: &str = "constellation.dev/idle-since";
+pub const ANNOTATION_VIEWS: &str = "constellation.replicix.com/last-view-count";
+pub const ANNOTATION_IDLE_SINCE: &str = "constellation.replicix.com/idle-since";
 /// Plan 37 §8: a node-owned pod's place in its unit's chain of
 /// replacements (`0` for the first). Its name and its sockets follow from
 /// it ([`node_pod_name_gen`], [`control_socket_file`]).
-pub const LABEL_GENERATION: &str = "constellation.dev/generation";
+pub const LABEL_GENERATION: &str = "constellation.replicix.com/generation";
 /// The fingerprint of the engine settings a node-owned pod was created
 /// from ([`engine_config_fingerprint`]): a pod whose fingerprint is not
 /// the plugin's own drifted, and is rolled (`crate::node::rollout`).
-pub const ANNOTATION_ENGINE_CONFIG: &str = "constellation.dev/engine-config";
+pub const ANNOTATION_ENGINE_CONFIG: &str = "constellation.replicix.com/engine-config";
 /// Why a rollout gave up on this pod (§8 "Failure handling").
-pub const ANNOTATION_HANDOFF_FALLBACK: &str = "constellation.dev/handoff-fallback";
-const ANNOTATION_S3: &str = "constellation.dev/s3";
-const ANNOTATION_ENDPOINT: &str = "constellation.dev/endpoint";
+pub const ANNOTATION_HANDOFF_FALLBACK: &str = "constellation.replicix.com/handoff-fallback";
+const ANNOTATION_S3: &str = "constellation.replicix.com/s3";
+const ANNOTATION_ENDPOINT: &str = "constellation.replicix.com/endpoint";
 
 /// How engine pods are made. Read from the controller's environment
 /// ([`Self::from_env`]); the chart sets every variable.
@@ -928,7 +928,7 @@ pub fn drifted_from(pod: &Pod, cfg: &EnginePodConfig) -> bool {
 
 /// The node-owned engine pod of `pool` on `node` (plan 37 §7), owned by
 /// the node plugin's `DaemonSet` (`owner`). `fs_uuid`: the filesystem the
-/// volume that brings it up names, for the `constellation.dev/fs-uuid`
+/// volume that brings it up names, for the `constellation.replicix.com/fs-uuid`
 /// label. Pure, so the spec is unit-tested.
 pub fn node_engine_pod(
     pool: &PoolRef,
@@ -2377,8 +2377,8 @@ async fn wait_existing_ready(
 ///
 /// One pod per (pool filesystem [shard], node), `constellation-engine-<unit>-<node>`,
 /// built like the controller's ([`node_engine_pod`]) but **pinned** to this
-/// node, never `--create`-ing a filesystem, labelled `constellation.dev/owner:
-/// node` and `constellation.dev/node`, and owned by the node plugin's
+/// node, never `--create`-ing a filesystem, labelled `constellation.replicix.com/owner:
+/// node` and `constellation.replicix.com/node`, and owned by the node plugin's
 /// `DaemonSet` — not by the plugin *pod*: the plan's §7 asks for the pod, so
 /// that an engine pod cannot outlive the plugin generation that made it,
 /// but every rolling update of the plugin would then delete every engine
@@ -3454,7 +3454,7 @@ mod tests {
             assert_ne!(pool_label(&other), label);
         }
         // Shards of one class: one pool label (§7's
-        // `constellation.dev/pool`), one pod per shard.
+        // `constellation.replicix.com/pool`), one pod per shard.
         let s0 = pool(&[("bucket", "b"), ("shards", "4")], 0);
         let s3 = pool(&[("bucket", "b"), ("shards", "4")], 3);
         assert_eq!(pool_label(&s0), pool_label(&s3));
