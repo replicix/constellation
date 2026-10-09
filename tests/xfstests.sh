@@ -22,9 +22,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-constellation fs create --s3 "$test_backend"
-constellation fs create --s3 "$scratch_backend"
-constellation mount --s3 "$test_backend" "$test_mnt" --state-dir "$work/test-state" \
+constellation fs create xfstests-test --s3 "$test_backend"
+constellation fs create xfstests-scratch --s3 "$scratch_backend"
+constellation mount / "$test_mnt" --s3 "$test_backend" --state-dir "$work/test-state" \
     --allow-other --fs-name constellation-test >"$work/test-state/mount.log" 2>&1 &
 test_pid=$!
 for _ in $(seq 1 100); do
@@ -32,7 +32,7 @@ for _ in $(seq 1 100); do
     sleep 0.1
 done
 mountpoint -q "$test_mnt" || { echo "initial test mount did not appear"; exit 1; }
-constellation mount --s3 "$scratch_backend" "$scratch_mnt" --state-dir "$work/scratch-state" \
+constellation mount / "$scratch_mnt" --s3 "$scratch_backend" --state-dir "$work/scratch-state" \
     --allow-other --fs-name constellation-scratch >"$work/scratch-state/mount.log" 2>&1 &
 scratch_pid=$!
 for _ in $(seq 1 100); do

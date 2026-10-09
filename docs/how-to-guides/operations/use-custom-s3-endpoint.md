@@ -66,13 +66,18 @@ Pick an empty prefix inside the bucket (first create):
 BUCKET=s3://my-bucket/constellation-demo
 mkdir -p /mnt/constellation
 
-constellation doctor --s3 "$BUCKET"      # checks If-None-Match / If-Match
-constellation fs create --s3 "$BUCKET"   # once per prefix
-constellation mount --s3 "$BUCKET" /mnt/constellation
+constellation doctor demo --s3 "$BUCKET"      # checks If-None-Match / If-Match
+constellation fs create demo --s3 "$BUCKET"   # registers "demo", once per prefix
+constellation mount demo /mnt/constellation   # backgrounds itself by default
 ```
 
+`demo` is a local name you choose in `fs create`; it need not match the
+bucket prefix, but every later command (`mount`, `status`, `umount`) must use
+the same name. Mounting a name that was never registered fails with
+`filesystem "<name>" has no --s3 on record`.
+
 `doctor` must report working conditional puts; multi-node leases need
-them. Unmount with `fusermount3 -u /mnt/constellation`.
+them. Unmount with `constellation umount demo` (or `fusermount3 -u /mnt/constellation`).
 
 ## Example: floci on another host
 
@@ -94,9 +99,9 @@ export AWS_ENDPOINT=http://192.0.2.10:4566
 export AWS_ALLOW_HTTP=true
 
 aws --endpoint-url "$AWS_ENDPOINT" s3 mb s3://constellation-ci
-constellation doctor --s3 s3://constellation-ci/demo
-constellation fs create --s3 s3://constellation-ci/demo
-constellation mount --s3 s3://constellation-ci/demo /mnt/constellation
+constellation doctor demo --s3 s3://constellation-ci/demo
+constellation fs create demo --s3 s3://constellation-ci/demo
+constellation mount demo /mnt/constellation
 ```
 
 The repo's `docker compose` floci service pre-creates `constellation-ci`

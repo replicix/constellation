@@ -1442,7 +1442,7 @@ and FUSE passthrough.
 
 ## 13. Snapshots and Clones
 
-ZFS-style, on any path: `constellation snapshot create <path>@<name>`
+ZFS-style, on any path: `constellation snapshot create myfs:<path>@<name>`
 freezes the subtree under that name until the snapshot is deleted. Any
 number of named snapshots per path; identity is `path@name`.
 
@@ -1481,7 +1481,7 @@ Snapshots are **always immutable**. Writability is real and cheap, but it is
 deliberately a separate object — a **clone**, exactly as in ZFS:
 
 ```
-constellation clone /projects@friday /projects-fix
+constellation clone myfs:/projects@friday /projects-fix
 ```
 
 instantly creates a normal writable subtree initialized from the snapshot

@@ -4,4 +4,4 @@ Learning-oriented experiences to get you up to speed on Constellation.
 
 Included here are:
 
-_(none yet — the root README quick-start is the interim entry point)_
+- [Quickstart](quickstart.md) — create, mount, operate (settings, stats, snapshots, web UI) and unmount a filesystem

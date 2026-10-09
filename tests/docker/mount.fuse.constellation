@@ -29,7 +29,7 @@ done
 mkdir -p "$state" "$mountpoint"
 
 if [ "${CONSTELLATION_DIRECT_MOUNT:-0}" = 1 ]; then
-    /usr/local/bin/constellation mount --s3 "$backend" "$mountpoint" \
+    /usr/local/bin/constellation mount / "$mountpoint" --s3 "$backend" \
         --state-dir "$state" --allow-other --fs-name "$source_dev" \
         >"$state/mount.log" 2>&1 &
     pid=$!
