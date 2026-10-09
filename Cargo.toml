@@ -140,7 +140,7 @@ lsm-tree = { path = "vendor/lsm-tree" }
 # fuser 0.18.0 with session handover, the io_uring transport, its idle
 # wait and FUSE_INTERRUPT, one branch each (github.com/replicix/fuser,
 # REPLICIX.md); `replicix` is all of them.
-fuser = { git = "https://github.com/replicix/fuser", rev = "8b1c141b1352f377e42c8981e1183316591129fe" }
+fuser = { git = "https://github.com/replicix/fuser", rev = "b6af219f908f0fc21d44e7058c39b04934a7d9fa" }
 # Fix p2p-restart-auth: netwatch 0.19.3's UDP socket wakes only the last
 # of the tasks parked on it, which stalls iroh's endpoint for a minute
 # after a rebind (vendor/netwatch/CONSTELLATION-PATCH.md).
