@@ -1274,7 +1274,7 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         // buffer either way (plan 38 §3(b)). The borrow ends when this call
         // returns, before the entry can be re-armed: fuser keeps the entry
         // fetched until the dispatch that received `data` is over
-        // (`HeldRequest` in `vendor/fuser/src/uring/ring.rs`), and a view
+        // (`HeldRequest` in replicix/fuser's `src/uring/ring.rs`), and a view
         // that keeps the bytes past the call copies them into
         // `WriteData::Shared` itself.
         let flags = open_flags(flags.0);

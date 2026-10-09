@@ -2841,8 +2841,8 @@ mistaken for ring coverage. On a 6.14+ `enable_uring=Y` host the
 
 ### Where the ring is tested without a kernel
 
-`vendor/fuser`'s own suite carries the transport's unit coverage
-(`cargo test --manifest-path vendor/fuser/Cargo.toml --features io-uring`):
+[replicix/fuser](https://github.com/replicix/fuser)'s own suite carries the transport's unit coverage
+(`cargo test --lib --features io-uring` in its checkout):
 the entry state machine (including a fetch *held* by an offload thread:
 replies stashed until its dispatch ends, a write's bytes borrowed from the
 entry's payload buffer), the staging layout against the ABI, the reply
@@ -3444,7 +3444,7 @@ too, run it as root:
 
 `constellation daemon --upgrade` replaces a running daemon's image while
 its views stay mounted (the sequence is `crates/cli/src/handover.rs`'s
-module doc; the vendored fuser patch is `vendor/fuser/CONSTELLATION-PATCH.md`).
+module doc; the fuser changes are in [replicix/fuser](https://github.com/replicix/fuser) (`REPLICIX.md`)).
 
 - `session-handover-idle`: one upgrade with nothing in flight. A watcher
   `stat`s and lists the mountpoint every 5 ms across it (any error or a

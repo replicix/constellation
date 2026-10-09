@@ -9,8 +9,8 @@ commit's). It is used through `[patch.crates-io]` in the workspace
 the files a build needs are kept (`src/`, `Cargo.toml`, `README.md`) plus the
 license files (`LICENSE-MIT`, `LICENSE-APACHE`). lsm-tree is dual-licensed
 MIT OR Apache-2.0, and both texts stay here unchanged. The directory is in
-the workspace `exclude` list, like `vendor/fjall`. Unlike `vendor/fuser`,
-there is no re-vendoring script (fjall has none either): the changes are
+the workspace `exclude` list, like `vendor/fjall`. As for fjall,
+there is no re-vendoring script: the changes are
 edits in place, each marked `CONSTELLATION PATCH`.
 
 ## What is changed

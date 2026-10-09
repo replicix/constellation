@@ -2112,6 +2112,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 [[package]]
 name = "fuser"
 version = "0.18.0"
+source = "git+https://github.com/replicix/fuser?rev=8b1c141b1352f377e42c8981e1183316591129fe#8b1c141b1352f377e42c8981e1183316591129fe"
 dependencies = [
  "bitflags 2.13.1",
  "io-uring",
