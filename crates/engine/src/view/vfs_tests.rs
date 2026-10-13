@@ -897,6 +897,55 @@ fn mtime_is_the_last_writes_or_the_one_set_not_the_flushs() {
     );
 }
 
+/// The reverse order: a write that reaches the file after a time set is
+/// a data change after it, and moves mtime past it — also within one
+/// session, and also when the set came by path (no handle).
+///
+/// xcheckfs finding 11 is this case seen from user space: a store into a
+/// shared writable `mmap`; `utimensat(OLD)`; `munmap` left the file at the
+/// `munmap`'s time, where ext4 keeps `OLD`. Without the writeback cache
+/// the kernel neither stamps the store at its page fault (`S_NOCMTIME`)
+/// nor writes the page back before a time-setting `setattr`, so the
+/// store's bytes arrive as this second write, at the `munmap` (or an
+/// `msync`, `fsync`, the close, the kernel's flusher). A store made after
+/// the set arrives exactly the same way; leaving the set's time for it
+/// would leave a changed file with a time from before the change
+/// (`make`, rsync's size-and-mtime check). Every FUSE file system that
+/// stamps its writes does the same (DESIGN §3 "File times").
+#[test]
+fn a_write_after_a_time_set_moves_mtime_past_it_in_the_same_session() {
+    const OLD: i64 = 2_000_000 * 1_000_000_000;
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "mapped").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, &[0u8; 4096]).unwrap();
+    let set = Blocking::run(|r| {
+        c.view.setattr(
+            &c.cx(OpKind::Setattr),
+            ino,
+            None,
+            &SetAttr {
+                mtime: Some(TimeSet::At(OLD)),
+                ..SetAttr::default()
+            },
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(set.mtime_ns, OLD);
+    assert_eq!(c.getattr(ino).unwrap().mtime_ns, OLD, "the set is live");
+    // The page's writeback.
+    c.write(ino, o.fh, 0, b"abcd").unwrap();
+    let written = c.getattr(ino).unwrap().mtime_ns;
+    assert!(written > OLD, "the write left mtime at the set: {written}");
+    c.close(ino, o.fh).unwrap();
+    assert_eq!(
+        c.getattr(ino).unwrap().mtime_ns,
+        written,
+        "the close publishes the write's time, not the set's"
+    );
+}
+
 /// `setattr` with an mtime, on another thread, while `ino`'s inode
 /// operation lock is held by this one: returns once the setattr has
 /// answered, or waits for that lock.

@@ -1268,6 +1268,12 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let caller = caller(req);
         let op = self.obs().begin(OpKind::Write, ino.0);
         let _in = op.enter();
+        // `_write_flags`: a `FUSE_WRITE_CACHE` write is a page's writeback,
+        // here (no writeback cache) a shared `mmap` store's, maybe from
+        // before a `utimensat` that reached us first. It stamps mtime like
+        // any write: nothing tells a store made before the set from one
+        // made after it (DESIGN §3 "File times", xcheckfs finding 11).
+        //
         // Borrowed from wherever fuser received the request: the worker's
         // `/dev/fuse` buffer, or, over io_uring, the ring entry's own payload
         // buffer the kernel copied the bytes into — no copy into a worker

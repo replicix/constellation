@@ -279,6 +279,21 @@ order is close-to-open's: a session on another node commits its
 writer's mtime at that node's close, over a set made after the write
 but before that close.
 
+A store into a shared writable `mmap` is a write only once the kernel
+writes its page back: at `msync`, `fsync`, the `munmap`, the close, or
+the kernel's flusher. Without the writeback cache (§12, not built) the
+kernel neither stamps the store at its page fault (FUSE inodes are
+`S_NOCMTIME` then) nor writes dirty pages back before a time-setting
+`setattr`, so `store; utimensat(OLD); munmap` ends with the writeback's
+time, where ext4 keeps `OLD` (stamped at the fault, before the set).
+The write cannot tell that store from one made after the set
+(`utimensat(OLD); store; munmap`, which must move mtime), so every
+write stamps the session, also one the kernel flags `FUSE_WRITE_CACHE`:
+POSIX lets a mapped store mark the times any time after it, and a
+changed file left with a time from before the change would mislead
+`make` and rsync's size-and-mtime check. Any FUSE file system that
+stamps its writes behaves the same; an `msync` before the set keeps it.
+
 A close is no change of its own, however late its commit runs (`back`,
 a busy sequencer): the commit leaves the file the ctime of its last
 change, not its own time. The manifest commit carries the session's
