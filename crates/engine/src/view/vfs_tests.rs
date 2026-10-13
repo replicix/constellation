@@ -790,6 +790,103 @@ fn mtime_is_the_last_writes_or_the_one_set_not_the_flushs() {
     );
 }
 
+/// `setattr` with an mtime, on another thread, while `ino`'s inode
+/// operation lock is held by this one: returns once the setattr has
+/// answered, or waits for that lock.
+fn set_mtime_meanwhile<'s>(
+    s: &'s std::thread::Scope<'s, '_>,
+    c: &'s Client,
+    ino: Ino,
+    mtime: i64,
+) -> std::thread::ScopedJoinHandle<'s, VfsResult<Attr>> {
+    let setattr = s.spawn(move || {
+        Blocking::run(|r| {
+            c.view.setattr(
+                &c.cx(OpKind::Setattr),
+                ino,
+                None,
+                &SetAttr {
+                    mtime: Some(TimeSet::At(mtime)),
+                    ..SetAttr::default()
+                },
+                r,
+            )
+        })
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !setattr.is_finished()
+        && !c
+            .view
+            .watch
+            .ops()
+            .iter()
+            .any(|op| op.op == "setattr" && op.stage == "inode operation lock")
+    {
+        assert!(std::time::Instant::now() < deadline, "setattr stuck");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    setattr
+}
+
+/// xcheckfs: a `utime` racing the close of a write that had returned
+/// before it was lost (293 of 300 rounds on a mount; never on ext4). The
+/// close's flush takes the session out of its shard under the inode's
+/// operation lock, and commits the session's mtime — the write's. A
+/// `setattr` in that window found no session to fold its time into, set
+/// the row, and the commit then put the write's time back. It is ordered
+/// against the flush now: folded before it, or set after its commit.
+#[test]
+fn a_time_set_while_a_flush_holds_the_session_is_the_one_the_file_keeps() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "raced").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"written").unwrap();
+    let written = c.getattr(ino).unwrap().mtime_ns;
+    let set = -1_000_000_000;
+    std::thread::scope(|s| {
+        // A flush between its detach and its commit (a read holds the
+        // same while it reads).
+        let op = c.view.inode_ops.lock(ino);
+        let ws = c.view.writes.detach(ino).expect("the write's session");
+        let setattr = set_mtime_meanwhile(s, &c, ino, set);
+        c.view.writes.reattach(ino, ws);
+        // The commit (re-entering the lock this thread holds).
+        c.view.flush_inode(ino, false).unwrap();
+        drop(op);
+        setattr.join().unwrap().unwrap();
+    });
+    assert_ne!(written, set);
+    assert_eq!(
+        c.getattr(ino).unwrap().mtime_ns,
+        set,
+        "the time set after the write returned survives its commit"
+    );
+    c.close(ino, o.fh).unwrap();
+    assert_eq!(c.getattr(ino).unwrap().mtime_ns, set);
+}
+
+/// The lock above is taken only for a file with a write session on this
+/// node: a `touch` of a file that is only being read never waits for the
+/// read (a chunk fetch, maybe from S3).
+#[test]
+fn a_time_set_of_a_file_without_a_session_does_not_wait_for_its_reads() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "read").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"written").unwrap();
+    c.close(ino, o.fh).unwrap();
+    let set = -2_000_000_000;
+    std::thread::scope(|s| {
+        // A read in flight.
+        let op = c.view.inode_ops.lock(ino);
+        let setattr = set_mtime_meanwhile(s, &c, ino, set);
+        assert!(setattr.is_finished(), "the set waited for the read");
+        drop(op);
+        setattr.join().unwrap().unwrap();
+    });
+    assert_eq!(c.getattr(ino).unwrap().mtime_ns, set);
+}
+
 /// The kind lane's busy-writer loss: the kernel stores every attribute
 /// reply's size in `i_size` and positions an `O_APPEND` write there. A
 /// `chmod` (or a `link`) of a file whose write session holds more than

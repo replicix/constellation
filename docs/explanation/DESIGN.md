@@ -267,6 +267,18 @@ inside the file, a `KEEP_SIZE` one, a punch past the end). Such an
 open it starts one, as a same-size `ftruncate` does, and the close
 commits a manifest that names no new chunk.
 
+An mtime set is ordered against the session's flush by the inode's
+operation lock, which the flush holds from taking the session until
+its commit returns: the set lands in the session before (the commit
+publishes it) or on the row after, never between — there the commit
+published the write's time over a `utime` made after the write had
+returned. The log orders the two records alike, so every replica
+replays the same mtime. A set with no session open on its node takes
+no lock (a file only being read never makes it wait). Across nodes the
+order is close-to-open's: a session on another node commits its
+writer's mtime at that node's close, over a set made after the write
+but before that close.
+
 A close is no change of its own, however late its commit runs (`back`,
 a busy sequencer): the commit leaves the file the ctime of its last
 change, not its own time. The manifest commit carries the session's

@@ -201,6 +201,10 @@ impl WriteState {
     /// session's: the `setattr` that set it stamped the row's, which
     /// `getattr` and the commit both take, so a later stamp here would be
     /// one the commit drops — ctime moving back at the close.
+    ///
+    /// Folded under the inode's [`InodeOps`] lock, with the session in
+    /// its shard: a set that found it taken out by a flush already past
+    /// its detach lost to that flush's commit of the write's time.
     pub(super) fn times_set(&mut self, mtime_ns: i64) {
         self.mtime_ns = Some(mtime_ns);
     }
@@ -270,6 +274,14 @@ impl WriteShards {
         Some(ws)
     }
 
+    /// Whether `ino` has a write session, attached or detached (a session
+    /// is retired only once its commit has returned, or it is dropped
+    /// unpublished).
+    pub(super) fn has_session(&self, ino: Ino) -> bool {
+        let shard = self.lock(ino);
+        self.pending(&shard, ino).is_some()
+    }
+
     /// Every inode with a write session, attached or detached
     /// (`View::sync_view`'s flush list).
     pub(super) fn pending_inos(&self) -> Vec<Ino> {
@@ -323,12 +335,13 @@ pub(super) struct FlushFail {
 }
 
 /// Per-inode ordering of the operations that read or change a write
-/// session (`read`, `write`, `truncate`, `fallocate`, `lseek`, and the
-/// flush that publishes it), held across their slow parts — the chunk
-/// fetch, the forward, the drain — so the per-inode order a single
-/// shard lock used to give survives [`WriteShards`] releasing it. Only
-/// operations on the same inode wait. Re-entrant on one thread
-/// (`fallocate` truncates and writes through the public paths).
+/// session (`read`, `write`, `truncate`, `fallocate`, `lseek`, an mtime
+/// set while one is open, and the flush that publishes it), held across
+/// their slow parts — the chunk fetch, the forward, the drain — so the
+/// per-inode order a single shard lock used to give survives
+/// [`WriteShards`] releasing it. Only operations on the same inode
+/// wait. Re-entrant on one thread (`fallocate` truncates and writes
+/// through the public paths).
 pub(super) struct InodeOps {
     shards: [InodeOpShard; 64],
 }

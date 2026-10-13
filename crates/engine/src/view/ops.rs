@@ -288,7 +288,36 @@ impl Vfs for View {
         admit!(self, cx, r, _admitted);
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
+        // An mtime set (`utimes`, `futimens`, `touch`) of a file with a
+        // write session on this node changes the session, so it is one
+        // of the operations [`InodeOps`] orders: it holds the inode's
+        // operation lock across the row's change and the fold into the
+        // session below. A flush holds that lock from taking the session
+        // out of its shard until its commit (which publishes the
+        // session's mtime) has returned, and a read holds it while the
+        // session is out. A set in that window found no session to fold
+        // into, and the commit then published the write's time over it:
+        // a `utime` lost to the close of a write that had returned before
+        // it. Now the set is ordered before the flush (folded: the commit
+        // carries it) or after it, and the log orders the two records
+        // alike, so every replica replays the same mtime.
+        //
+        // No session here, no lock: a session opened after this check is
+        // a write's that overlaps the set (either order is right), and a
+        // write that returned before it left one — attached, detached, or
+        // retired only once its commit returned. So a `touch` of a file
+        // that is only being read never waits for a chunk fetch, nor for
+        // the upload drain that follows a local commit of a close. With a
+        // session it waits as a write to the file would: on a non-owner in
+        // write-through that is the close's upload, which precedes the
+        // forwarded commit. A truncate opens a session itself (`self.truncate` re-enters
+        // the lock). Mode, owner and atime need no lock: a manifest commit
+        // carries none of them, and it leaves the file the later of its
+        // ctime and the row's (`WriteState::changed`).
+        let _op = (set.mtime.is_some() && (set.size.is_some() || self.writes.has_session(ino)))
+            .then(|| self.inode_ops.lock(ino));
         let atime_ns = set.atime.map(time_ns);
+        // `TimeSet::Now` read once ordered: the set's time, not a wait's.
         let mtime_ns = set.mtime.map(time_ns);
         // An explicit atime set must drop any queued read-bump for this
         // inode, so a pending coalesced bump cannot clobber a fresh
@@ -371,7 +400,9 @@ impl Vfs for View {
             // reports the session's size, not the committed row's
             // (`current_attr`: the kernel takes this reply's size). An
             // mtime set goes into the session too: its flush commits the
-            // session's mtime, which must now be this one.
+            // session's mtime, which must now be this one. The session is
+            // in its shard here whenever one exists: `_op` keeps every
+            // flush and read that takes it out off this inode.
             Ok(()) => {
                 if let Some(mtime) = mtime_ns {
                     if let Some(ws) = self.writes.lock(ino).get_mut(&ino) {
