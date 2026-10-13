@@ -111,6 +111,7 @@ impl Vfs for View {
     }
 
     fn frontend_negotiated(&self, caps: &FrontendCaps) {
+        self.set_single_worker(caps.single_worker);
         self.set_passthrough_on(caps.passthrough);
         self.set_zero_copy_on(caps.zero_copy, caps.zero_copy_min_read);
     }
@@ -1204,8 +1205,9 @@ impl Vfs for View {
         // are still there (dropping them would lift it): data written
         // under a lapsed grant is discarded, never published. Then the
         // close drops the process's POSIX locks on the file (any
-        // descriptor's close, as POSIX says); the kernel also sends an
-        // explicit unlock, which then finds nothing.
+        // descriptor's close, as POSIX says). The kernel sends no unlock
+        // of its own: it keeps no lock for a file whose locks it forwards
+        // (`lock_handles`' module doc), so this is the only one.
         let locks = self.cluster_locks().filter(|_| !View::is_synthetic(ino));
         let gate = self.lock_publish_gate(ino, fh);
         let idle = locks.map(|l| l.drop_owner(ino, owner.0));
@@ -1224,6 +1226,20 @@ impl Vfs for View {
         if let (Some(l), Some(true)) = (locks, idle) {
             l.idle(ino);
         }
+        // This may be the description's last close: its OFD and `flock`
+        // locks go with the `RELEASE` the kernel sends after this answer
+        // without waiting for it, and a request that conflicts with them
+        // waits for that (`lock_handles`' module doc). Marked once the
+        // close's work is done, just before the kernel moves on.
+        if locks.is_some_and(|l| !l.meta.locks().lockers_none()) {
+            self.note_handle_closed(fh);
+        }
+        // The close's fencing-token scope ends before its answer, not
+        // after: the closer's next lock request, which the answer lets the
+        // kernel send, would otherwise find this op still in flight under
+        // the grant and be refused as a new turn behind it
+        // (`LocalOutcome::Predecessor`). Nothing is published past here.
+        drop(_lock_tag);
         match result {
             Ok(()) => r.done(Ok(())),
             Err(e) => r.done(self.ino_err(ino, e)),
@@ -1263,14 +1279,12 @@ impl Vfs for View {
         let locks = self.cluster_locks();
         let gate = self.lock_publish_gate(ino, fh);
         drop(_closed);
-        let mut idle = match (locks, owner) {
-            (Some(l), Some(owner)) => l.drop_owner(ino, owner.0),
-            _ => false,
-        };
-        // The open file description's own (OFD) locks end with it.
-        for (locked, by) in self.take_lock_handle(fh) {
-            if let Some(l) = locks {
-                let none_left = l.drop_owner(locked, by);
+        // The open file description's own (OFD) locks end with it too. A
+        // request waiting for them (`past_closing_locks`) asks again.
+        let mut idle = false;
+        if let Some(l) = locks {
+            let flock = owner.map(|owner| (ino, owner.0));
+            for (locked, none_left) in self.release_lock_handle(fh, flock, l) {
                 if locked == ino {
                     idle |= none_left;
                 } else if none_left {
@@ -1836,7 +1850,7 @@ impl Vfs for View {
         &self,
         _cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh: Fh,
         lock: LockSpec,
         r: R,
     ) {
@@ -1852,13 +1866,22 @@ impl Vfs for View {
             r.done(Ok(LockStatus::Unlocked));
             return;
         }
-        let status = match locks.test(
+        let write = lock.kind == LockKind::Write;
+        let (owner, start, end) = (lock.owner.0, lock.range.start, lock.range.end);
+        // A test through `fh` shows its description open.
+        self.note_handle_open(fh);
+        // A lock of a description whose last close was just answered is
+        // not reported while its `RELEASE` is on its way (`lock_handles`).
+        let found = self.past_closing_locks(
+            locks,
             ino,
-            lock.owner.0,
-            lock.range.start,
-            lock.range.end,
-            lock.kind == LockKind::Write,
-        ) {
+            owner,
+            (start, end),
+            write,
+            |_| locks.test(ino, owner, start, end, write),
+            Option::is_some,
+        );
+        let status = match found {
             Some((start, end, write, pid)) => LockStatus::Locked {
                 range: LockRange { start, end },
                 kind: if write {
@@ -1923,6 +1946,23 @@ impl Vfs for View {
             start: lock.range.start,
             end: lock.range.end,
         };
+        if !sleep {
+            // Answered here, as before. A refusal by locks of descriptions
+            // whose last close was just answered waits for their
+            // `RELEASE`, which the kernel sends without waiting for it
+            // (`lock_handles`' module doc), and asks again.
+            let result = self.past_closing_locks(
+                locks,
+                ino,
+                local.owner,
+                (local.start, local.end),
+                local.write,
+                |deadline| locks.try_lock_by(ino, local, deadline, cx.cancel),
+                |r| *r == Err(Code::Again),
+            );
+            r.done(result.map_err(VfsError::from));
+            return;
+        }
         if !self.caps.deferrable.contains(OpKind::LockAcquire) {
             r.done(
                 locks
@@ -1953,7 +1993,7 @@ impl Vfs for View {
         &self,
         _cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh: Fh,
         owner: LockOwner,
         range: LockRange,
         r: R,
@@ -1964,6 +2004,8 @@ impl Vfs for View {
             r.done(err(Code::NotImplemented));
             return;
         };
+        // An unlock through `fh` shows its description open.
+        self.note_handle_open(fh);
         locks.unlock(ino, owner.0, range.start, range.end);
         r.done(Ok(()));
     }

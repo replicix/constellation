@@ -344,7 +344,10 @@ pub struct LockStats {
     pub local_hits: u64,
     pub local_conflicts: u64,
     /// Phase 2: a new local turn waited for an earlier turn's mutations
-    /// tagged with the same grant ([`LocalOutcome::Predecessor`]).
+    /// tagged with the same grant ([`LocalOutcome::Predecessor`]): once
+    /// per lock request (the engine's `ClusterLocks`), however often it
+    /// looked again, whether it then took the lock or, non-blocking, was
+    /// refused.
     pub predecessor_waits: u64,
     pub granted: u64,
     pub would_block: u64,
@@ -1993,7 +1996,8 @@ impl LockTables {
                     .get(&id)
                     .is_some_and(|e| e.active > 0 || e.pinned_until_ms > now_ms)
             }) {
-                g.stats.predecessor_waits += 1;
+                // Counted once per request by the caller, which may ask
+                // again many times (`LockStats::predecessor_waits`).
                 return LocalOutcome::Predecessor;
             }
         }
@@ -2061,10 +2065,16 @@ impl LockTables {
     /// Drop every lock of `owner` on `ino` (a close). Returns whether
     /// `ino` has no local lock left.
     pub fn local_release_owner(&self, ino: u64, owner: u64, now_ms: i64) -> bool {
+        self.local_release_owner_dropped(ino, owner, now_ms).0
+    }
+
+    /// [`Self::local_release_owner`], also saying whether it dropped any
+    /// lock: `(no local lock left, dropped)`.
+    pub fn local_release_owner_dropped(&self, ino: u64, owner: u64, now_ms: i64) -> (bool, bool) {
         let mut g = self.lock();
         let fenced = g.fenced_at(ino, now_ms);
         let Some(v) = g.local.get_mut(&ino) else {
-            return true;
+            return (true, false);
         };
         let before = v.len();
         v.retain(|l| l.owner != owner);
@@ -2082,7 +2092,7 @@ impl LockTables {
         }
         g.lift_if_unlocked(owner);
         self.track(&g);
-        idle
+        (idle, dropped)
     }
 
     /// Grants idle (no local lock under them) since before `before_ms`,
@@ -3280,7 +3290,6 @@ mod token_tests {
             "in doubt inside its window"
         );
         assert_eq!(t.local_set(7, lk(11, true, 0, 9), 500), LocalOutcome::Done);
-        assert_eq!(t.stats().predecessor_waits, 2);
     }
 
     /// The review nit: a shared lock under an honoured shared grant is not

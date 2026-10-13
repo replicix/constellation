@@ -1248,3 +1248,188 @@ fn lock_latency_lone() -> Result<()> {
     }
     Ok(())
 }
+
+// ------------------------------------------------------------------ lock-release-at-close
+
+/// One leg of [`lock_release_at_close`]: the locking mode, the transport
+/// asked for (`None`: the lane's), and the FUSE worker count (`None`: the
+/// host's).
+struct ReleaseLeg {
+    locks: &'static str,
+    transport: Option<&'static str>,
+    threads: Option<&'static str>,
+}
+
+/// The last `close(2)` of an open file description releases its OFD and
+/// `flock` locks before it returns, as on a local file system: another
+/// description's non-blocking lock right after the close is granted, and
+/// `F_OFD_GETLK` reports nothing. The kernel sends the `RELEASE` that
+/// drops them in the background after the close's `FLUSH` was answered,
+/// so a lock request served first saw them (`EAGAIN` in 40–80 % of tries,
+/// xcheckfs on Linux 7.3); the view now waits for that `RELEASE` (the
+/// engine's `view::lock_handles`). A `dup`'s close is not the last: the
+/// lock stays.
+///
+/// A lone node, under `--locks cluster` over `/dev/fuse` with the host's
+/// workers, over the transport ladder (`auto`: the ring where the kernel
+/// offers it; the leg prints which it got), over `/dev/fuse` with a
+/// single worker (no wait there: the kernel's queue order serves the
+/// `RELEASE` first), and under `--locks local` (the kernel's own locks,
+/// for the record). A single worker over the ring is not exercised: its
+/// queue order holds only while the closing CPU's queue has a free
+/// entry, which a test cannot arrange reliably.
+///
+/// The view waits for a `RELEASE` for `CONSTELLATION_LOCK_CLOSE_WAIT_MS`
+/// (100 ms) at most, and a kernel can hold one back longer (a full
+/// background queue, a loaded host: the documented limit). So a cluster
+/// leg allows [`RELEASE_TOLERANCE`] of its rounds to see the closed lock:
+/// 1 %, against 87 % (309 refusals and 124 reports in 500 rounds) before
+/// the wait — a regression still fails by far, a CI host's stall does
+/// not. Every round that saw it is printed with its delay.
+pub fn lock_release_at_close(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-release-at-close";
+    const ROUNDS: usize = 500;
+    /// See the function doc.
+    const RELEASE_TOLERANCE: usize = ROUNDS / 100;
+    let legs = [
+        ReleaseLeg {
+            locks: "cluster",
+            transport: Some("dev-fuse"),
+            threads: None,
+        },
+        ReleaseLeg {
+            locks: "cluster",
+            transport: Some("auto"),
+            threads: None,
+        },
+        ReleaseLeg {
+            locks: "cluster",
+            transport: Some("dev-fuse"),
+            threads: Some("1"),
+        },
+        ReleaseLeg {
+            locks: "local",
+            transport: None,
+            threads: None,
+        },
+    ];
+    let (env, root) = setup(NAME)?;
+    for (n, leg) in legs.iter().enumerate() {
+        let mode = leg.locks;
+        let backend = format!("s3://{BUCKET}/{NAME}-{n}-{mode}-{}", ts());
+        let mut c = Client::new(
+            root.path(),
+            &format!("lone-{n}-{mode}"),
+            &env.direct_endpoint,
+            &backend,
+        )?
+        .with_env("CONSTELLATION_LOCKS", mode);
+        if let Some(transport) = leg.transport {
+            c = c.with_env("CONSTELLATION_FUSE_TRANSPORT", transport);
+        }
+        if let Some(threads) = leg.threads {
+            c = c.with_env("CONSTELLATION_FUSE_THREADS", threads);
+        }
+        c.fs_create()?;
+        c.mount()?;
+        let r = (|| -> Result<()> {
+            let got = c.control_status()?["mounts"][0]["transport"].clone();
+            let label = format!(
+                "--locks {mode}, transport {got} (asked {}), {} FUSE workers",
+                leg.transport.unwrap_or("the lane's"),
+                leg.threads.unwrap_or("the host's")
+            );
+            let p = c.mnt.join("f");
+            std::fs::write(&p, b"x")?;
+            let (mut refused, mut reported) = (0, 0);
+            let mut took = Vec::new();
+            for i in 0..ROUNDS {
+                let flock_kind = i % 2 == 1;
+                let a = open_rw(&p)?;
+                let b = open_rw(&p)?;
+                if flock_kind {
+                    flock(&a, libc::LOCK_EX | libc::LOCK_NB)
+                        .map_err(|e| anyhow::anyhow!("A's flock: {e}"))?;
+                } else {
+                    fcntl_lock(&a, libc::F_OFD_SETLK, libc::F_WRLCK as i16, 0, 10)
+                        .map_err(|e| anyhow::anyhow!("A's F_OFD_SETLK: {e}"))?;
+                }
+                drop(a);
+                let t = Instant::now();
+                if !flock_kind && i % 4 == 0 {
+                    // The test first: it must not report the closed lock.
+                    let mut l: libc::flock = unsafe { std::mem::zeroed() };
+                    l.l_type = libc::F_WRLCK as i16;
+                    l.l_whence = libc::SEEK_SET as i16;
+                    l.l_len = 10;
+                    if unsafe { libc::fcntl(b.as_raw_fd(), libc::F_OFD_GETLK, &mut l) } != 0 {
+                        bail!("F_OFD_GETLK: {}", std::io::Error::last_os_error());
+                    }
+                    if l.l_type != libc::F_UNLCK as i16 {
+                        reported += 1;
+                        eprintln!(
+                            "    {NAME}: {label}: round {i}: F_OFD_GETLK reported the closed \
+                             lock after {:?}",
+                            t.elapsed()
+                        );
+                    }
+                }
+                let r = if flock_kind {
+                    flock(&b, libc::LOCK_EX | libc::LOCK_NB)
+                } else {
+                    fcntl_lock(&b, libc::F_OFD_SETLK, libc::F_WRLCK as i16, 0, 10)
+                };
+                took.push(t.elapsed());
+                if let Err(e) = r {
+                    refused += 1;
+                    eprintln!(
+                        "    {NAME}: {label}: round {i} ({}): {e:?} after {:?}",
+                        if flock_kind { "flock" } else { "OFD" },
+                        t.elapsed()
+                    );
+                }
+            }
+            eprintln!(
+                "    {NAME}: {label}: {ROUNDS} closes, then another description's lock: \
+                 {refused} refused, {reported} F_OFD_GETLK reported the closed lock; took {}",
+                dist(took)
+            );
+            print_locks(NAME, &c);
+            // The kernel's own locks go synchronously: none, ever.
+            let tolerance = if mode == "local" {
+                0
+            } else {
+                RELEASE_TOLERANCE
+            };
+            anyhow::ensure!(
+                refused + reported <= tolerance,
+                "{label}: a lock of a closed description was still seen after close() \
+                 returned ({refused} refusals, {reported} reports in {ROUNDS} rounds; \
+                 {tolerance} allowed)"
+            );
+            // A dup's close is not the last: the lock stays.
+            let a = open_rw(&p)?;
+            let b = open_rw(&p)?;
+            fcntl_lock(&a, libc::F_OFD_SETLK, libc::F_WRLCK as i16, 0, 10)
+                .map_err(|e| anyhow::anyhow!("A's F_OFD_SETLK: {e}"))?;
+            flock(&a, libc::LOCK_EX | libc::LOCK_NB)
+                .map_err(|e| anyhow::anyhow!("A's flock: {e}"))?;
+            drop(a.try_clone()?);
+            let r = fcntl_lock(&b, libc::F_OFD_SETLK, libc::F_WRLCK as i16, 0, 10);
+            anyhow::ensure!(
+                r == Err(Code::Again),
+                "{label}: OFD lock after a dup's close: {r:?}"
+            );
+            let r = flock(&b, libc::LOCK_EX | libc::LOCK_NB);
+            anyhow::ensure!(
+                r == Err(Code::Again),
+                "{label}: flock after a dup's close: {r:?}"
+            );
+            drop(a);
+            Ok(())
+        })();
+        let _ = c.unmount();
+        r?;
+    }
+    Ok(())
+}

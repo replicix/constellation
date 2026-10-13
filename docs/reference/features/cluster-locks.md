@@ -13,6 +13,7 @@ between nodes safely. It is on by default whenever P2P is on.
 - [Modes](#modes)
 - [Details](#details)
   - [Grants and local locks](#grants-and-local-locks)
+  - [Close and release](#close-and-release)
   - [Leases, renewal and fencing](#leases-renewal-and-fencing)
   - [The fencing token](#the-fencing-token)
   - [Conflicts, recalls and blocking waits](#conflicts-recalls-and-blocking-waits)
@@ -87,6 +88,60 @@ one on a file goes to the sequencer. A cached grant with no local lock
 under it is released after `CONSTELLATION_LOCK_CACHE_IDLE_MS` (30 s),
 and its renewals stop. Upgrading a shared grant to an exclusive one is
 a new grant.
+
+### Close and release
+
+With the lock capabilities the kernel keeps no lock of its own for the
+file, so it sends no unlock when a descriptor is closed. The daemon
+learns of a close from two requests:
+
+- `FLUSH`, on every `close(2)`, which the close waits for. It names the
+  closing process's POSIX lock owner, and the node drops that owner's
+  locks on the file there: POSIX says any close does.
+- `RELEASE`, once the last descriptor of an open file description is
+  gone. The node drops the description's OFD and `flock` locks there:
+  the owners that locked through it, which it keeps per description,
+  since the kernel names the `flock` owner only, and no OFD owner unless
+  the description also used `flock` (the same owner id). A
+  `FLUSH` cannot drop them: a `dup`'s close, a forked child's or an
+  `exec`'s `O_CLOEXEC` close sends one too, and the description and its
+  locks outlive those.
+
+The kernel sends `RELEASE` in the background, after `close(2)` has
+returned (`fuse_file_release`), and another FUSE worker can serve the
+process's next request first. So a description whose last close was
+just answered may still hold its locks for a moment, typically 0.1–5 ms.
+A non-blocking lock (`F_SETLK`, `F_OFD_SETLK`, `flock` with `LOCK_NB`)
+or a lock test that conflicts only with such locks waits for their
+`RELEASE`, then asks again: as on a local file system, it does not see
+the locks of a description closed before it was made. The wait lasts at
+most `CONSTELLATION_LOCK_CLOSE_WAIT_MS` (100 ms) from the close, and
+never more than that from the request itself, however many closes of
+the description's other descriptors follow (a shell that holds
+`flock -n 9` and runs a command per loop closes a copy of descriptor 9
+with each command's exit). Past that, or when a lock request, unlock or
+test through the description shows it open, the request is refused at
+once. A close that was not the last (a `dup`'s) is followed by no
+`RELEASE`, so a request in its shadow is refused late, never wrongly.
+Nothing is released before its `RELEASE`.
+
+A mount served by a single FUSE worker (`CONSTELLATION_FUSE_THREADS=1`,
+or a view mounted with `fuse_threads` 1) does not wait: its requests
+are served in the order the kernel queued them (strictly so over
+`/dev/fuse` and on a one-CPU host; over the ring as long as the closing
+CPU's queue has a free entry), so the `RELEASE` that
+`close(2)` queued is served before the process's next request, and a
+wait would only hold the one worker that has to serve it.
+
+The `RELEASE` then publishes what was written under the locks, under
+the grant's [fencing token](#the-fencing-token), and a new turn on the
+node waits for the earlier turn's operations still in flight under the
+grant. A non-blocking request with nothing else in its way waits for
+them too, instead of answering `EAGAIN` at once, within the same bound
+of `CONSTELLATION_LOCK_CLOSE_WAIT_MS` from its arrival (both waits
+together never exceed it; this one also on a single worker, since those
+operations finish without one). A blocking request always waited for
+them.
 
 ### Leases, renewal and fencing
 
@@ -388,7 +443,8 @@ written under it. So the check also happens where the write is recorded
   outwaits it.
   The same holds for the next turn on the same node under the same
   cached grant: a lock taken when no local lock is left on the file
-  waits (or `EAGAIN` without blocking; `locks.predecessor_waits`) while
+  waits (a non-blocking request for a short while, then `EAGAIN`, see
+  [Close and release](#close-and-release); `locks.predecessor_waits`) while
   an operation an earlier turn tagged with the grant is in flight or in
   doubt inside its window. The grant is live at its minter, so such an
   operation would otherwise pass there after the new turn's writes.
@@ -917,7 +973,17 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   0, which reads as no pid at all: no owner fence. The fencing token is
   worked out by the same match, so it does not make these cases safe;
   only the per-file fence and the taint protect them then.
-- OFD locks and mandatory locks get no special handling.
+- OFD locks and mandatory locks get no special handling, except that
+  an OFD lock ends with its open file description
+  ([Close and release](#close-and-release)).
+- A description's OFD and `flock` locks go with the kernel's
+  `RELEASE`, which comes after `close(2)` returned. A request behind
+  them waits for it for up to `CONSTELLATION_LOCK_CLOSE_WAIT_MS` from
+  the close, and never longer than that from the request itself; a
+  `RELEASE` the kernel holds back longer (asynchronous I/O of the
+  description still in flight, a full background queue) is not waited
+  for, and the request is refused as before. A single-worker mount
+  takes no such wait.
 
 ## Configuration
 
@@ -927,6 +993,7 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 | `CONSTELLATION_LOCKS` | unset | default for `--locks`; the flag wins |
 | `CONSTELLATION_LOCK_TTL_MS` | `20000` | a grant's lifetime, renewed half-way through the window it is honoured for |
 | `CONSTELLATION_LOCK_CACHE_IDLE_MS` | `30000` | how long a grant with no local lock under it is kept |
+| `CONSTELLATION_LOCK_CLOSE_WAIT_MS` | `100` | how long a non-blocking request may wait for a just-closed description's locks to go, counted from the close, and for an earlier turn's operations still in flight — never longer than this from the request itself ([Close and release](#close-and-release)); `0`: no wait; a single-worker mount never waits for the closed description's locks |
 
 The margin is the lease's; see [Configuration](../configuration.md#cluster-locks).
 
@@ -962,7 +1029,8 @@ for both roles:
   (the clock-skew margin the lock machinery assumes),
   `tagged_ops` (mutations that carried a fencing token),
   `release_waits` (releases held back for one) and `predecessor_waits`
-  (new local turns held back for an earlier turn's tagged mutations);
+  (lock requests of new local turns held back for an earlier turn's
+  tagged mutations, once per request);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
   `grace_refusals`, `requeued_in_place`, `released_superseded`,

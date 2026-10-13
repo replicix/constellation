@@ -218,7 +218,9 @@ pub trait Vfs: Send + Sync + 'static {
     fn flush<R: Responder<()>>(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, owner: LockOwner, r: R);
 
     /// The last close of a handle (`owner`: its `flock` owner). Ends the
-    /// lifetime of whatever [`Opened::backing`] the open handed out.
+    /// lifetime of whatever [`Opened::backing`] the open handed out, and
+    /// the locks taken through the handle by its own (OFD, `flock`)
+    /// owners. FUSE sends it after `close(2)` returned, unwaited for.
     #[allow(clippy::too_many_arguments)]
     fn release<R: Responder<()>>(
         &self,
@@ -303,9 +305,11 @@ pub trait Vfs: Send + Sync + 'static {
         r: R,
     );
 
-    /// `F_SETLK` (`sleep: false`: `Again` on a conflict) or
-    /// `F_SETLKW`/`flock` (`sleep: true`: waits, on a thread of its own —
-    /// the one op that defers today).
+    /// `F_SETLK` (`sleep: false`: `Again` on a conflict, after waiting
+    /// briefly for locks of a handle whose last close was just flushed
+    /// and whose `release` is still on its way) or `F_SETLKW`/`flock`
+    /// (`sleep: true`: waits, on a thread of its own — the one op that
+    /// defers today).
     #[allow(clippy::too_many_arguments)]
     fn lock_acquire<R: Responder<()>>(
         &self,

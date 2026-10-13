@@ -116,6 +116,20 @@ pub struct FrontendCaps {
     /// adapter's own caps (`constellation_frontend_fuse::caps`), whose
     /// sessions do send it, turn it on.
     pub reports_forget: bool,
+    /// One worker serves the view's requests (Linux FUSE: a mount of one
+    /// `/dev/fuse` reader, or of one ring and its offload thread), served
+    /// in queue order — strictly so over `/dev/fuse` and on a one-CPU
+    /// host; over the ring as long as the closing CPU's queue has a free
+    /// entry (a `RELEASE` waits in a queue whose entries are all taken,
+    /// while a request from a task that moved to another CPU is posted
+    /// first). A request then does not overtake one queued before it:
+    /// the engine waits for no `release` that `close(2)` queued before
+    /// returning, since it is served first, and a wait would only hold
+    /// the one worker that serves it (plan 30
+    /// §M14, the engine's `view::lock_handles`). Linux FUSE declares
+    /// `false` and the session says otherwise before it serves anything
+    /// (`Vfs::frontend_negotiated`). No [`Cap`]: no scenario gates on it.
+    pub single_worker: bool,
 }
 
 impl FrontendCaps {
@@ -155,6 +169,8 @@ impl FrontendCaps {
             zero_copy_min_read: 0,
             // The adapter's own caps turn it on (see the field).
             reports_forget: false,
+            // Set by the session from its worker count.
+            single_worker: false,
         }
     }
 }

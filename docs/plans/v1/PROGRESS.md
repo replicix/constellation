@@ -46379,3 +46379,116 @@ closed, as it waits for cluster locks.
   (without the check: no blocker after `sync_view`).
 - `session::tests::a_detach_refuses_while_the_view_has_state_that_cannot_cross`
   (a real FUSE mount; skipped where none can be made).
+
+## Fix: a closed description's OFD and `flock` locks were still seen after `close(2)` returned (plan 30 §M14, 2026-10-13)
+
+### Cause
+
+xcheckfs (single node, Linux 7.3, `--locks cluster`): after process A
+closed the descriptor holding an `F_OFD_SETLK` or `flock` lock, another
+description's non-blocking lock got `EAGAIN` in 40–80 % of tries (ext4:
+never), the lock going 0.1–5 ms after `close` returned.
+
+With `FUSE_POSIX_LOCKS`/`FUSE_FLOCK_LOCKS` the kernel keeps no lock of
+its own (`fuse_file_lock`/`fuse_file_flock` forward everything), so
+`locks_remove_posix`/`locks_remove_file` find no lock context at close and
+send no unlock. The daemon gets `FLUSH` (every `close`, waited for, the
+closer's POSIX owner: dropped there since `df14686`) and, once the last
+descriptor is gone, `RELEASE` (the `flock` owner with
+`FUSE_RELEASE_FLOCK_UNLOCK`, and no OFD owner unless the description
+also used `flock`, the same owner id: both dropped there, the OFD ones
+through the view's per-handle table since `8a6f96c`). But
+`fuse_file_release` sends `RELEASE` in the background
+(`fuse_file_put(ff, false)` → `fuse_simple_background`): it is queued
+before `close` returns but not waited for, and another worker (another
+ring) serves the next request first. A second, narrower cause: the
+fencing token (`f57db3c`) makes a new turn wait for an earlier turn's ops
+in flight under the grant (`LocalOutcome::Predecessor`), and a
+non-blocking request answered that with `EAGAIN` — the release's own
+publication, and any op whose tag scope ends just after its answer (the
+close's `FLUSH`, an `open`), so a lock right after them was refused.
+
+`FLUSH` cannot drop OFD/`flock` locks: a `dup`'s close, a forked child's,
+an `exec`'s `O_CLOEXEC` close send one too, and the daemon cannot tell
+the last close from the others.
+
+### What changed
+
+- `view::lock_handles`: the per-handle owner table (`8a6f96c`'s, with its
+  rule that an owner is bound to the handle it locked through last) also
+  records when a descriptor of the handle was last closed (`FLUSH`); a
+  lock request, unlock or test through the handle clears it. `RELEASE`
+  drops the `flock` owner and the bound owners under the table's mutex
+  and, when it dropped any lock, wakes waiters.
+- A non-blocking lock or a lock test whose only local conflicts are locks
+  of descriptions closed within `CONSTELLATION_LOCK_CLOSE_WAIT_MS` (100 ms,
+  `0` turns it off) waits for their `RELEASE`, then asks again; a refusal
+  whose blocker a release dropped meanwhile is asked once more. A
+  non-blocking request refused only by an earlier turn's ops in flight
+  (`Predecessor`) polls for them (`ClusterLocks::try_lock_by`). Both
+  waits share one deadline per request, `CONSTELLATION_LOCK_CLOSE_WAIT_MS`
+  from its start: closes of the description's other descriptors renew
+  its window (a shell loop holding `flock -n 9` closes a copy with every
+  command's exit), and without the cap such a request waited as long as
+  they went on (review). Nothing is released earlier than before; a
+  `dup`'s close keeps the lock (a request in its shadow is refused after
+  the window, late but never wrong).
+- A mount with a single FUSE worker waits for no closing description
+  (`FrontendCaps::single_worker`, set by the FUSE session from its
+  `n_threads`; fuser keeps `FLUSH`, `RELEASE` and lock requests on one
+  thread there over either transport): its kernel queue order serves the
+  `RELEASE` first, and the wait would hold the one worker it needs. The
+  `Predecessor` wait stays (those ops finish without a worker).
+- `locks.predecessor_waits` counts once per request (the poll had made
+  it count every look).
+- `flush` ends its fencing-token scope before answering.
+- Tests: `owner_fence_tests` (last close; `dup`'s close; earlier turn in
+  flight — the first and last fail on `61d08a5`; closes that keep coming
+  — hangs without the per-request cap; an unlock or test ends the
+  window; a single worker does not wait), `lock_handles` unit tests (the
+  repeated-close bound hangs without the cap), harness scenario
+  `lock-release-at-close` (500 rounds each: `--locks cluster` over
+  `/dev/fuse`, over the transport ladder, over `/dev/fuse` with one
+  worker; `--locks local`).
+- Docs: cluster-locks.md "Close and release", Limits, Configuration;
+  configuration.md; DESIGN.md §Cluster locks; ADR-25 amendment.
+
+### Gates
+
+On the shared EC2-like host (16 vCPU, Linux 7.3, load 30–60), single node,
+`file://` backend, `--locks cluster`: `repro_lock_release.py` 2000+2000
+rounds before OFD 450/2000 and `flock` 504/2000 granted, after 2000/2000
+and 2000/2000 (three runs); first-attempt failures of the `flock` lag loop
+2297/3000 before, 0/5000 after (three runs); `lockfuzz3.py` 1/10 replays
+inconsistent before, 0/9 after (three runs of three). `--locks local` (kernel locks) 2000/2000
+before and after. Review's shell loop (`exec 9>>f; flock -n 9; while
+:; do /bin/true; done`, then `flock -n f true` five times): first
+revision probe 1 waited 6240 ms (until the loop ended) and then got the
+lock; after the cap `EAGAIN` after 101–104 ms each (three runs); on
+`61d08a5` and on a single worker `EAGAIN` after 1 ms. Single worker
+(`CONSTELLATION_FUSE_THREADS=1`): 2000/2000 and 2000/2000 granted, 0 of
+5000 first-attempt failures, no wait (on `61d08a5` too: 0 of 2000).
+Harness `lock-release-at-close` (all four legs 0 of 500 twice; the ring
+leg ran over `uring`; fails on `61d08a5`), `flock-cross-node`,
+`lock-latency`, `lock-fence-at-close` pass. `cargo test` engine (632),
+frontend-fuse, vfs, meta, harness: pass except
+`the_engine_view_conforms` and `the_caps_of_linux_fuse_are_derived_from_its_declaration`,
+which fail the same way on `61d08a5`. `cargo fmt --check`, workspace
+clippy `-D warnings` clean.
+
+### Open
+
+- Fixed after review: one request's total wait was unbounded while
+  closes of the description kept coming (each `FLUSH` renewed the
+  window); now capped per request.
+- A single-worker mount takes no close wait (above): it cannot help
+  there, as the waiting worker is the only one that could serve the
+  `RELEASE`. A `RELEASE` the kernel queues behind the next request (a
+  full background queue) is refused there as before.
+- The bound: a `RELEASE` the kernel holds back longer than the window
+  (asynchronous I/O of the description still in flight, a full background
+  queue, a loaded host) is not waited for. A kernel that sent `RELEASE`
+  synchronously for a file with `flock`/OFD locks (or an unlock from
+  `fuse_flush` on the last close) would make the wait unnecessary.
+- Across nodes nothing changed: a non-blocking request from another node
+  is refused while the holder's grant is recalled, as before.

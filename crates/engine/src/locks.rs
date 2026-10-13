@@ -44,6 +44,9 @@
 //!   renewed in the background while held.
 //! - `CONSTELLATION_LOCK_CACHE_IDLE_MS` (default 30000): how long an
 //!   unused cached grant is kept before it is released.
+//! - `CONSTELLATION_LOCK_CLOSE_WAIT_MS` (default 100): how long a
+//!   non-blocking request waits for what a just-closed description left
+//!   behind ([`close_wait`]).
 //!
 //! A blocked lock wait ends with `EINTR` when the frontend cancels it (the
 //! FUSE adapter does on any signal, as POSIX has `F_SETLKW` do): checked
@@ -116,6 +119,28 @@ pub fn lock_ttl_ms(default: u64) -> u64 {
 /// `CONSTELLATION_LOCK_CACHE_IDLE_MS` (default 30000).
 pub fn lock_cache_idle_ms(default: u64) -> u64 {
     env_ms("CONSTELLATION_LOCK_CACHE_IDLE_MS", default)
+}
+
+/// `CONSTELLATION_LOCK_CLOSE_WAIT_MS` (default 100; `0`: no wait): how
+/// long a non-blocking request (or a test) refused by what a just-closed
+/// open file description leaves behind may wait for it to go — the
+/// description's own locks, which the kernel's `RELEASE` drops after
+/// `close(2)` returned, at most this long from the close (the view's
+/// `lock_handles`), and the release's publication still in flight under
+/// the grant (`LocalOutcome::Predecessor`) — and never more than this
+/// long from the request itself, however many closes follow. Far above
+/// the lag measured on a loaded host (p99 2–4 ms), and short enough that
+/// a request behind a lock whose description stays open (a `dup`'s
+/// close) is not held up for long.
+pub fn close_wait() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let ms = std::env::var("CONSTELLATION_LOCK_CLOSE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(100);
+        Duration::from_millis(ms)
+    })
 }
 
 /// The clock grants are honoured by and fencing tokens are checked at
@@ -201,6 +226,10 @@ const OFFSET_MAX: u64 = i64::MAX as u64;
 /// conflicts wake nobody: the other owner's unlock is a plain table
 /// update).
 const LOCAL_POLL: Duration = Duration::from_millis(15);
+
+/// How often a non-blocking request behind an earlier turn's ops in
+/// flight re-checks (see [`close_wait`]).
+const PREDECESSOR_POLL: Duration = Duration::from_micros(200);
 
 /// How long a granted lock waits for the kernel to drop its cache of the
 /// file before it is used anyway (the invalidation thread can be held up
@@ -465,6 +494,14 @@ impl ClusterLocks {
         self.meta.locks().local_release_owner(ino, owner, now_ms())
     }
 
+    /// [`Self::drop_owner`], also saying whether it dropped any lock:
+    /// `(no local lock left, dropped)`.
+    pub fn drop_owner_dropped(&self, ino: Ino, owner: u64) -> (bool, bool) {
+        self.meta
+            .locks()
+            .local_release_owner_dropped(ino, owner, now_ms())
+    }
+
     /// No local lock is left on `ino`: if its grant was recalled, the
     /// core releases it now (flushing the file first). Nobody waits.
     pub fn idle(&self, ino: Ino) {
@@ -496,7 +533,7 @@ impl ClusterLocks {
         F: FnOnce(Result<(), Code>) + Send + 'static,
     {
         if !sleep {
-            done(self.set(ino, lock, false, None));
+            done(self.set(ino, lock, false, None, None));
             return;
         }
         let this = self.clone();
@@ -510,7 +547,7 @@ impl ClusterLocks {
                 if let Some(op) = op {
                     op.adopt();
                 }
-                done(this.set(ino, lock, true, cancel.as_ref()))
+                done(this.set(ino, lock, true, cancel.as_ref(), None))
             });
         if let Err(error) = spawned {
             // The reply went with the closure; dropping it answers EIO.
@@ -528,21 +565,40 @@ impl ClusterLocks {
         sleep: bool,
         cancel: Option<&CancelToken>,
     ) -> Result<(), Code> {
-        self.set(ino, lock, sleep, cancel)
+        self.set(ino, lock, sleep, cancel, None)
     }
 
+    /// A non-blocking [`Self::lock_here`] that waits for an earlier turn's
+    /// ops in flight (`LocalOutcome::Predecessor`) until `deadline` at
+    /// most: the request's own bound, shared with the view's wait for
+    /// closing descriptions (`View::past_closing_locks`), so the two
+    /// together never hold it longer than [`close_wait`].
+    pub fn try_lock_by(
+        &self,
+        ino: Ino,
+        lock: LocalLock,
+        deadline: std::time::Instant,
+        cancel: Option<&CancelToken>,
+    ) -> Result<(), Code> {
+        self.set(ino, lock, false, cancel, Some(deadline))
+    }
+
+    /// `deadline`: how long a non-blocking request waits for an earlier
+    /// turn's ops ([`Self::try_lock_by`]); [`close_wait`] from its first
+    /// `Predecessor` when `None`.
     fn set(
         &self,
         ino: Ino,
         mut lock: LocalLock,
         sleep: bool,
         cancel: Option<&CancelToken>,
+        deadline: Option<std::time::Instant>,
     ) -> Result<(), Code> {
         // FUSE names the locking *thread*; the owner fence (and `getlk`)
         // need its process, named across pid reuse.
         (lock.pid, lock.pid_start) = process_of(lock.pid);
         let mut asked = false;
-        let r = self.set_inner(ino, lock, sleep, cancel, &mut asked);
+        let r = self.set_inner(ino, lock, sleep, cancel, deadline, &mut asked);
         if r.is_err() && asked {
             // A grant may have come for this request (or its answer was
             // lost after the core installed it) that it will now never
@@ -562,15 +618,45 @@ impl ClusterLocks {
         lock: LocalLock,
         sleep: bool,
         cancel: Option<&CancelToken>,
+        mut deadline: Option<std::time::Instant>,
         asked: &mut bool,
     ) -> Result<(), Code> {
         let cancelled = || cancel.is_some_and(CancelToken::is_cancelled);
         let mut rounds = 0u32;
+        let mut predecessor_counted = false;
         loop {
-            match self.meta.locks().local_set(ino, lock, now_ms()) {
+            let outcome = self.meta.locks().local_set(ino, lock, now_ms());
+            if outcome == LocalOutcome::Predecessor && !predecessor_counted {
+                // Once per request, however often it looks again.
+                predecessor_counted = true;
+                self.meta.locks().with_stats(|s| s.predecessor_waits += 1);
+            }
+            match outcome {
                 LocalOutcome::Done => return Ok(()),
-                LocalOutcome::Conflict(_) | LocalOutcome::Predecessor => {
+                LocalOutcome::Predecessor
+                    if !sleep
+                        && *deadline
+                            .get_or_insert_with(|| std::time::Instant::now() + close_wait())
+                            > std::time::Instant::now() =>
+                {
+                    // Nothing is in the way but an earlier turn's ops still
+                    // in flight under the grant: the publication of a
+                    // release the kernel sent after `close(2)` returned,
+                    // or an op whose answer is already out (its tag ends
+                    // after it). A local file system would grant now:
+                    // wait for them a little rather than refuse.
+                    std::thread::sleep(PREDECESSOR_POLL);
+                }
+                outcome @ (LocalOutcome::Conflict(_) | LocalOutcome::Predecessor) => {
                     if !sleep {
+                        if matches!(outcome, LocalOutcome::Predecessor) {
+                            tracing::debug!(
+                                target: "constellation::locks",
+                                ino,
+                                "a non-blocking lock request is refused: an earlier turn's ops \
+                                 are still in flight after the close wait"
+                            );
+                        }
                         return Err(Code::Again);
                     }
                     if cancelled() {

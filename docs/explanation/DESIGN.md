@@ -947,6 +947,16 @@ of another node's `close()` out of band, with no lock between them
   file's dirty data to the log before it releases. Blocking requests park
   first-in first-out at the sequencer; non-blocking ones get `EAGAIN` and
   the recall still goes out.
+- **Close.** The kernel drops nothing itself at close: the close's
+  `FLUSH` drops the closing process's POSIX locks, and the description's
+  `RELEASE` its OFD and `flock` locks. `RELEASE` comes after `close(2)`
+  returned, so a non-blocking request (or a test) that only a just-closed
+  description's locks, or the earlier turn's operations still in flight,
+  stand in the way of waits for them, for at most
+  `CONSTELLATION_LOCK_CLOSE_WAIT_MS` (100 ms) from the close and from
+  the request, instead of seeing a lock that a local file system would
+  already have dropped (a single-worker mount, served in queue order,
+  needs no wait).
 - **Coherence from one holder to the next.** A grant carries a position
   the new holder waits for, and it drops its kernel cache of the file.
   The position covers every file, not only the locked one: a release

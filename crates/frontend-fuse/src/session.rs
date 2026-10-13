@@ -594,6 +594,17 @@ impl MountOptions {
         MountSource::Path(mountpoint.to_path_buf(), opts)
     }
 
+    /// `caps` with what this mount's worker count settles:
+    /// [`FrontendCaps::single_worker`] when one thread serves its requests
+    /// — one `/dev/fuse` reader, or, over the ring, one ring thread and one
+    /// offload thread, between which fuser never splits `FLUSH`,
+    /// `RELEASE` and the lock requests (`dispatch_on_ring`): the kernel's
+    /// queue order is then the order they are served in.
+    fn with_workers(&self, mut caps: FrontendCaps) -> FrontendCaps {
+        caps.single_worker = self.n_threads <= 1;
+        caps
+    }
+
     /// The fuser configuration a mount with `plan` (from [`Self::plan`])
     /// starts with; `lock_waits` counts the ring's lock-wait downgrades.
     fn config(&self, plan: TransportPlan, lock_waits: &LockWaitCounter) -> fuser::Config {
@@ -974,6 +985,7 @@ pub fn mount_source<V: Vfs>(
     opts: &MountOptions,
     caps: FrontendCaps,
 ) -> std::io::Result<FuseSession<V>> {
+    let caps = opts.with_workers(caps);
     let plan = opts.plan(&caps, cfg!(feature = "io-uring"));
     let lock_waits = LockWaitCounter::default();
     let config = opts.config(plan, &lock_waits);
@@ -1348,7 +1360,7 @@ impl<V: Vfs> FuseSession<V> {
         );
         config.io_uring = false;
         share_fd_without_a_device(&mut config);
-        let mut caps = caps;
+        let mut caps = opts.with_workers(caps);
         let fs = FuseFs::new(view.clone(), caps.clone(), opts.tuning)
             .with_passthrough(opts.passthrough_wish());
         let deferred = fs.deferred().clone();

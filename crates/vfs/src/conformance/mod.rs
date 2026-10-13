@@ -845,6 +845,7 @@ mod tests {
             zero_copy: false,
             zero_copy_min_read: 0,
             reports_forget: false,
+            single_worker: false,
         }
     }
 

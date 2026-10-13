@@ -1367,6 +1367,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m14::lock_fence_at_close,
     },
     Scenario {
+        name: "lock-release-at-close",
+        desc: "the last close(2) of an open file description releases its OFD and flock locks before it returns: another description's non-blocking lock right after is granted and F_OFD_GETLK reports nothing, 500 rounds on a lone node under --locks cluster (over /dev/fuse, over the transport ladder, and with a single FUSE worker over /dev/fuse — the ring's single-worker case is not exercised; at most 1 % of rounds, for a RELEASE a loaded host holds back past the 100 ms wait) and --locks local (none) (was: EAGAIN in 40-80 % of rounds, the kernel's RELEASE served after the next request); a dup's close keeps the lock",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_release_at_close,
+    },
+    Scenario {
         name: "lock-latency",
         desc: "plan 30 M14 measurements: first lock on a file from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff; and a lone node under --locks cluster against --locks local",
         requires: &[],

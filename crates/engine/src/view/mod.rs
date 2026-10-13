@@ -107,6 +107,7 @@ mod frozen_manifests;
 mod handoff;
 mod io;
 mod lock_gate;
+mod lock_handles;
 pub mod ops;
 mod passthrough;
 mod shards;
@@ -355,8 +356,12 @@ pub struct View {
     /// orphans it or the platform's eviction `forget`s it.
     unlinked_refs: Mutex<HashMap<Ino, Option<Instant>>>,
     /// The lock owners each open handle locked for: see
-    /// [`View::note_lock_handle`].
-    lock_handles: Mutex<HashMap<u64, HashSet<(Ino, u64)>>>,
+    /// [`View::note_lock_handle`] and [`lock_handles`].
+    lock_handles: lock_handles::LockHandles,
+    /// The frontend serves this view with a single worker
+    /// ([`FrontendCaps::single_worker`]): no wait for closing
+    /// descriptions ([`View::closing_window`]).
+    single_worker: std::sync::atomic::AtomicBool,
     /// Every open file description this view handed out (plan 39 §3.7):
     /// its inode (§6.12: a handle addresses only that one) and the discard
     /// error event it has seen ([`durable`]'s module doc).
@@ -508,7 +513,8 @@ impl View {
             opens: Mutex::new(HashMap::new()),
             dead: Mutex::new(DeadInodes::default()),
             unlinked_refs: Mutex::new(HashMap::new()),
-            lock_handles: Mutex::new(HashMap::new()),
+            lock_handles: Default::default(),
+            single_worker: Default::default(),
             handles: durable::Handles::default(),
             passthrough: Mutex::new(HashMap::new()),
             writers: Mutex::new(HashMap::new()),
@@ -644,7 +650,7 @@ impl View {
     /// sends no unlock for them on close — only `RELEASE` of the handle,
     /// whose lock owner it fills in for `flock` alone — so the view keeps
     /// which owners locked through which handle, and the release drops
-    /// theirs ([`View::take_lock_handle`]). They leaked before: an
+    /// theirs ([`View::release_lock_handle`]). They leaked before: an
     /// `F_OFD_SETLK` lock outlived its descriptor and its process for
     /// good, and the next process to lock the file got `EAGAIN`. A
     /// process's own POSIX locks lose nothing by it: closing any of its
@@ -654,29 +660,117 @@ impl View {
     /// names an OFD owner after its `struct file`, which a new open can
     /// reuse while the old one's `RELEASE` is still queued (the kernel
     /// sends it asynchronously): that release must not drop the new
-    /// description's locks.
+    /// description's locks. A lock request through `fh` also proves its
+    /// description open ([`View::note_handle_closed`]), as an unlock or a
+    /// test through it does ([`View::note_handle_open`]).
     pub(crate) fn note_lock_handle(&self, fh: constellation_vfs::Fh, ino: Ino, owner: u64) {
-        let mut handles = self.lock_handles.lock().unwrap();
-        if handles
-            .get(&fh.0)
-            .is_some_and(|set| set.contains(&(ino, owner)))
-        {
-            return;
-        }
-        for set in handles.values_mut() {
-            set.remove(&(ino, owner));
-        }
-        handles.retain(|_, set| !set.is_empty());
-        handles.entry(fh.0).or_default().insert((ino, owner));
+        self.lock_handles.note(fh.0, ino, owner);
     }
 
-    /// The owners that locked through `fh`, which is being released.
-    pub(crate) fn take_lock_handle(&self, fh: constellation_vfs::Fh) -> HashSet<(Ino, u64)> {
-        self.lock_handles
-            .lock()
-            .unwrap()
-            .remove(&fh.0)
-            .unwrap_or_default()
+    /// `fh` is being released: drop the locks of `flock` (the owner
+    /// `FUSE_RELEASE_FLOCK_UNLOCK` names) and of the owners that locked
+    /// through it, as `(inode, whether no local lock is left on it)`.
+    pub(crate) fn release_lock_handle(
+        &self,
+        fh: constellation_vfs::Fh,
+        flock: Option<(Ino, u64)>,
+        locks: &crate::locks::ClusterLocks,
+    ) -> Vec<(Ino, bool)> {
+        // Whether each drop dropped anything: a waiter asks again only then.
+        self.lock_handles.release(fh.0, flock, |ino, owner| {
+            locks.drop_owner_dropped(ino, owner)
+        })
+    }
+
+    /// An unlock or a lock test came through `fh`: its description is
+    /// open, whatever closes of its descriptors were flushed.
+    pub(crate) fn note_handle_open(&self, fh: constellation_vfs::Fh) {
+        self.lock_handles.opened(fh.0);
+    }
+
+    /// Whether the frontend serves this view with a single worker
+    /// (`Vfs::frontend_negotiated`).
+    pub(crate) fn set_single_worker(&self, single: bool) {
+        self.single_worker
+            .store(single, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How long after a close a request waits for the closed
+    /// description's `RELEASE`: [`crate::locks::close_wait`], or nothing
+    /// on a single worker, where the kernel's first-in-first-out queue
+    /// serves that `RELEASE` before the next request and a wait would
+    /// only hold the worker it needs (the `lock_handles` module doc).
+    fn closing_window(&self) -> std::time::Duration {
+        if self
+            .single_worker
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            std::time::Duration::ZERO
+        } else {
+            crate::locks::close_wait()
+        }
+    }
+
+    /// A descriptor of `fh` was closed (`flush`): if its description holds
+    /// locks, its `RELEASE` may follow, and a conflicting non-blocking
+    /// request waits for it a little ([`View::past_closing_locks`]).
+    pub(crate) fn note_handle_closed(&self, fh: constellation_vfs::Fh) {
+        self.lock_handles.closed(fh.0);
+    }
+
+    /// A non-blocking request of `owner` for `[start, end]` on `ino`
+    /// (`attempt`, given the request's deadline; `refused`: whether it
+    /// was): while every local lock in its way belongs to a description
+    /// whose last close is answered and whose `RELEASE` the kernel has
+    /// not delivered yet, wait for those and ask again (the `lock_handles`
+    /// module doc). Asked once more when a release dropped what was in
+    /// its way between the refusal and the look. Never waits past
+    /// [`crate::locks::close_wait`] from its start, however many closes
+    /// renew the windows meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn past_closing_locks<T>(
+        &self,
+        locks: &crate::locks::ClusterLocks,
+        ino: Ino,
+        owner: u64,
+        (start, end): (u64, u64),
+        write: bool,
+        mut attempt: impl FnMut(std::time::Instant) -> T,
+        refused: impl Fn(&T) -> bool,
+    ) -> T {
+        let deadline = std::time::Instant::now() + crate::locks::close_wait();
+        let window = self.closing_window();
+        let conflicts = || {
+            let mut owners: Vec<u64> = locks
+                .meta
+                .locks()
+                .local_locks(ino)
+                .into_iter()
+                .filter(|l| {
+                    l.owner != owner && l.start <= end && start <= l.end && (write || l.write)
+                })
+                .map(|l| l.owner)
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            owners
+        };
+        let mut cleared = false;
+        loop {
+            let since = self.lock_handles.releases();
+            let result = attempt(deadline);
+            if !refused(&result) || std::time::Instant::now() >= deadline {
+                return result;
+            }
+            match self
+                .lock_handles
+                .await_closing(ino, window, deadline, since, conflicts)
+            {
+                lock_handles::CloseWait::Waited => cleared = false,
+                lock_handles::CloseWait::Cleared if !cleared => cleared = true,
+                _ => return result,
+            }
+        }
     }
 
     /// The name is gone (a local `unlink` just succeeded): reap the

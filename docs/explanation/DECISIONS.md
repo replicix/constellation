@@ -862,6 +862,30 @@ takeover (unnecessary: grants are capped by the lease they came from).
 [`crates/cli/src/locks.rs`](../../crates/cli/src/locks.rs);
 model `crates/model/src/locks.rs`. Amends ADR-4.
 
+**Amended (close and release)**: the kernel drops nothing at close for
+the locks it forwards: `FLUSH` (every `close(2)`, waited for) drops the
+closing process's POSIX locks, and `RELEASE` (the description's last
+close) its OFD and `flock` locks. `RELEASE` is sent after `close(2)`
+returned, in the background, so a request served before it saw a closed
+description's lock (`EAGAIN` where local file systems grant). A
+non-blocking request or a test whose only conflicts are such locks now
+waits for their `RELEASE`, for at most
+`CONSTELLATION_LOCK_CLOSE_WAIT_MS` (100 ms) from the `FLUSH`, and never
+more than that from the request itself (closes of the description's
+other descriptors keep coming in a shell loop that holds the lock), and
+a non-blocking request refused only because an earlier turn's
+operations are still in flight under the grant (the release's
+publication, or an op whose tag ends just after its answer) waits for
+them as a blocking one does, within the same bound. A mount served by
+a single worker takes no wait for a closed description: the kernel's
+queue order serves the `RELEASE` first, and the wait would hold the
+worker it needs. Rejected:
+dropping OFD and `flock` locks at `FLUSH` (a `dup`'s close would drop
+them while the description stays open); waiting for every `RELEASE` in
+flight (a `dup`'s close is followed by none, and the daemon cannot tell
+the last close from the others). See
+[Close and release](../reference/features/cluster-locks.md#close-and-release).
+
 ## ADR-26: Exact chunk-location reconciliation replaces bloom digests
 
 **Context**: peers learned each other's cached chunks from bloom-filter

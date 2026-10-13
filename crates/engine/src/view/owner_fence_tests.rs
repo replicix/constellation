@@ -9,8 +9,8 @@ use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::locks::{GrantId, HeldGrant, LockMode};
 use constellation_store_s3::lease::now_unix_ms;
 use constellation_vfs::{
-    Blocking, Fh, LockKind, LockOwner, LockRange, LockSpec, Name, OpCtx, OpKind, OpenOwner, Opened,
-    RenameFlags, Vfs, VfsResult, WriteData,
+    Blocking, Fh, LockKind, LockOwner, LockRange, LockSpec, LockStatus, Name, OpCtx, OpKind,
+    OpenOwner, Opened, RenameFlags, Vfs, VfsResult, WriteData,
 };
 
 fn code<T: std::fmt::Debug>(r: VfsResult<T>) -> Code {
@@ -917,4 +917,352 @@ fn a_late_release_spares_a_reused_owners_new_lock() {
     })
     .unwrap();
     assert!(f.meta.locks().local_locks(ino).is_empty());
+}
+
+/// Two descriptions of one file, an exclusive grant held, and each a lock
+/// owner of its own (an OFD or `flock` owner: the kernel names it after
+/// the description).
+fn two_descriptions(f: &Fenced, caller: &Caller, name: &str) -> (Ino, Fh, Fh) {
+    let (e, a) = f.create(caller, ROOT_INO, name).unwrap();
+    let ino = e.attr.ino;
+    let b = f.open_write(caller, ino).unwrap();
+    f.meta.locks().install_held(
+        ino,
+        HeldGrant {
+            id: GrantId { node: 9, seq: 1 },
+            mode: LockMode::Exclusive,
+            until_ms: i64::MAX,
+            renew_at_ms: i64::MAX,
+            owner: 9,
+            recalled: false,
+            position: constellation_meta::Position::ZERO,
+            renewing: None,
+            releasing: false,
+            first_use: false,
+            idle_since_ms: None,
+            installed_ms: now_unix_ms(),
+        },
+    );
+    (ino, a.fh, b.fh)
+}
+
+/// A non-blocking write lock of `owner` on `[0, 9]` through `fh`.
+fn try_lock(f: &Fenced, caller: &Caller, ino: Ino, fh: Fh, owner: u64) -> VfsResult<()> {
+    Blocking::run(|r| {
+        f.fs.lock_acquire(
+            &OpCtx::new(OpKind::LockAcquire, caller),
+            ino,
+            fh,
+            LockSpec {
+                owner: LockOwner(owner),
+                range: LockRange { start: 0, end: 9 },
+                kind: LockKind::Write,
+                pid: 0,
+            },
+            false,
+            r,
+        )
+    })
+}
+
+fn test_lock(f: &Fenced, caller: &Caller, ino: Ino, fh: Fh, owner: u64) -> LockStatus {
+    Blocking::run(|r| {
+        f.fs.lock_test(
+            &OpCtx::new(OpKind::LockTest, caller),
+            ino,
+            fh,
+            LockSpec {
+                owner: LockOwner(owner),
+                range: LockRange { start: 0, end: 9 },
+                kind: LockKind::Write,
+                pid: 0,
+            },
+            r,
+        )
+    })
+    .unwrap()
+}
+
+/// `close(2)`'s `FLUSH` of `fh` by the process whose POSIX owner is
+/// `0xf00` (not the lock's owner: an OFD or `flock` lock survives it).
+fn close(f: &Fenced, caller: &Caller, ino: Ino, fh: Fh) {
+    Blocking::run(|r| {
+        f.fs.flush(
+            &OpCtx::new(OpKind::Flush, caller),
+            ino,
+            fh,
+            LockOwner(0xf00),
+            r,
+        )
+    })
+    .unwrap();
+}
+
+fn release(f: &Fenced, caller: &Caller, ino: Ino, fh: Fh) {
+    Blocking::run(|r| {
+        f.fs.release(
+            &OpCtx::new(OpKind::Release, caller),
+            ino,
+            fh,
+            OpenFlags::WRITE,
+            None,
+            r,
+        )
+    })
+    .unwrap();
+}
+
+/// The last `close(2)` of a description holding an OFD (or `flock`) lock
+/// returns once its `FLUSH` is answered; the kernel sends the `RELEASE`
+/// that drops the lock after that, in the background, and another worker
+/// may serve the next request first. A non-blocking lock or a test of
+/// another description that the process issues after the close returned
+/// must not see the lock (xcheckfs: `EAGAIN` in 40–80 % of tries on a
+/// mount, never on a local file system).
+#[test]
+fn a_lock_request_after_the_last_close_does_not_see_the_closed_descriptions_lock() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "closed");
+    let (owner_a, owner_b) = (0xa, 0xb);
+    for test in [false, true] {
+        try_lock(&f, &caller, ino, a, owner_a).unwrap();
+        close(&f, &caller, ino, a);
+        std::thread::scope(|s| {
+            // The `RELEASE`, on another worker, a moment later.
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                release(&f, &caller, ino, a);
+            });
+            if test {
+                assert_eq!(
+                    test_lock(&f, &caller, ino, b, owner_b),
+                    LockStatus::Unlocked,
+                    "F_GETLK after the last close"
+                );
+            } else {
+                assert_eq!(
+                    try_lock(&f, &caller, ino, b, owner_b),
+                    Ok(()),
+                    "F_SETLK after the last close"
+                );
+            }
+        });
+        Blocking::run(|r| {
+            f.fs.lock_release(
+                &OpCtx::new(OpKind::LockRelease, &caller),
+                ino,
+                b,
+                LockOwner(owner_b),
+                LockRange { start: 0, end: 9 },
+                r,
+            )
+        })
+        .unwrap();
+        assert!(f.meta.locks().local_locks(ino).is_empty());
+    }
+}
+
+/// A close that is not the description's last (a `dup`'s, a forked
+/// child's, an `exec`'s `O_CLOEXEC` one) is answered by no `RELEASE`: the
+/// description's lock stays, a conflicting request is still refused —
+/// after the close's window at the latest — and once that window is over
+/// it is refused at once again.
+#[test]
+fn a_dups_close_keeps_the_descriptions_lock() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "dup");
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    close(&f, &caller, ino, a);
+    let window = crate::locks::close_wait();
+    let started = Instant::now();
+    assert_eq!(code(try_lock(&f, &caller, ino, b, 0xb)), Code::Again);
+    assert!(
+        started.elapsed() < window + Duration::from_secs(2),
+        "the wait is bounded by the close's window: {:?}",
+        started.elapsed()
+    );
+    let started = Instant::now();
+    assert_eq!(code(try_lock(&f, &caller, ino, b, 0xb)), Code::Again);
+    assert!(
+        matches!(
+            test_lock(&f, &caller, ino, b, 0xb),
+            LockStatus::Locked { .. }
+        ),
+        "F_GETLK still reports the open description's lock"
+    );
+    assert!(
+        started.elapsed() < window,
+        "past the window, refused without a wait: {:?}",
+        started.elapsed()
+    );
+    // A lock request through the description proves it open: no wait.
+    close(&f, &caller, ino, a);
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    let started = Instant::now();
+    assert_eq!(code(try_lock(&f, &caller, ino, b, 0xb)), Code::Again);
+    assert!(started.elapsed() < window, "{:?}", started.elapsed());
+    assert_eq!(f.meta.locks().local_locks(ino).len(), 1);
+    release(&f, &caller, ino, a);
+    assert!(f.meta.locks().local_locks(ino).is_empty());
+}
+
+/// The release publishes what was written under the locks after it
+/// dropped them, under the grant's fencing token, and a new turn waits
+/// for an earlier turn's ops in flight (`Predecessor`) — as it does for
+/// any op whose tag ends just after its answer went out. A non-blocking
+/// request with nothing else in its way waits for them (a local file
+/// system would grant it) instead of answering `EAGAIN`.
+#[test]
+fn a_non_blocking_lock_waits_for_the_earlier_turns_ops_in_flight() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let caller = Caller::new(0, 0, Some(me));
+    let (ino, a, b) = two_descriptions(&f, &caller, "turns");
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let (tagged, in_flight) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        // The earlier turn's op, tagged with the grant while 0xa held its
+        // lock, still in flight after the lock is gone.
+        s.spawn(|| {
+            let _scope = locks.tag_scope(Some(me), Some(0xa));
+            crate::locks::current_tag().unwrap();
+            tagged.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        });
+        in_flight.recv().unwrap();
+        release(&f, &caller, ino, a);
+        assert!(f.meta.locks().local_locks(ino).is_empty());
+        let before = f.meta.locks().stats().predecessor_waits;
+        assert_eq!(
+            try_lock(&f, &caller, ino, b, 0xb),
+            Ok(()),
+            "granted once the earlier turn's op ended"
+        );
+        assert_eq!(
+            f.meta.locks().stats().predecessor_waits,
+            before + 1,
+            "counted once per request, not per look"
+        );
+    });
+    release(&f, &caller, ino, b);
+}
+
+/// The review's must-fix: a description whose descriptors keep being
+/// closed (`exec 9>lock; flock -n 9 || exit; while :; do cmd; done` —
+/// each child's exit flushes descriptor 9) renews its close window with
+/// every `FLUSH`. A conflicting non-blocking request (or test) is still
+/// refused within its own bound, not held for as long as the closes go
+/// on.
+#[test]
+fn closes_that_keep_coming_do_not_hold_a_request_past_its_bound() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "renewed");
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    close(&f, &caller, ino, a);
+    let window = crate::locks::close_wait();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(window / 4);
+                close(&f, &caller, ino, a);
+            }
+        });
+        let started = Instant::now();
+        let refused = code(try_lock(&f, &caller, ino, b, 0xb));
+        let took_lock = started.elapsed();
+        let started = Instant::now();
+        let tested = test_lock(&f, &caller, ino, b, 0xb);
+        let took_test = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(refused, Code::Again);
+        assert!(matches!(tested, LockStatus::Locked { .. }));
+        for took in [took_lock, took_test] {
+            assert!(
+                took < window + Duration::from_millis(500),
+                "bounded by the request's own deadline: {took:?}"
+            );
+        }
+    });
+    release(&f, &caller, ino, a);
+}
+
+/// An unlock or a test through the description shows it open: a
+/// conflicting request is refused without waiting out the close window.
+#[test]
+fn an_unlock_or_a_test_through_the_description_ends_its_close_window() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "shown-open");
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    let window = crate::locks::close_wait();
+    for through in ["unlock", "test"] {
+        close(&f, &caller, ino, a);
+        if through == "unlock" {
+            // Of a range the lock does not cover: the lock stays.
+            Blocking::run(|r| {
+                f.fs.lock_release(
+                    &OpCtx::new(OpKind::LockRelease, &caller),
+                    ino,
+                    a,
+                    LockOwner(0xa),
+                    LockRange {
+                        start: 100,
+                        end: 109,
+                    },
+                    r,
+                )
+            })
+            .unwrap();
+        } else {
+            assert_eq!(test_lock(&f, &caller, ino, a, 0xa), LockStatus::Unlocked);
+        }
+        let started = Instant::now();
+        assert_eq!(code(try_lock(&f, &caller, ino, b, 0xb)), Code::Again);
+        assert!(
+            started.elapsed() < window,
+            "{through}: {:?}",
+            started.elapsed()
+        );
+    }
+    release(&f, &caller, ino, a);
+}
+
+/// A view served by a single worker (`FrontendCaps::single_worker`)
+/// waits for no closing description: its `RELEASE` is queued before the
+/// next request and served first, and a wait would hold the one worker
+/// that serves it. A just-closed description's lock is refused at once.
+#[test]
+fn a_single_worker_does_not_wait_for_a_closing_description() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "one-worker");
+    f.fs.frontend_negotiated(&FrontendCaps {
+        single_worker: true,
+        ..f.fs.caps.clone()
+    });
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    close(&f, &caller, ino, a);
+    let window = crate::locks::close_wait();
+    let started = Instant::now();
+    assert_eq!(code(try_lock(&f, &caller, ino, b, 0xb)), Code::Again);
+    assert!(
+        matches!(
+            test_lock(&f, &caller, ino, b, 0xb),
+            LockStatus::Locked { .. }
+        ),
+        "the description is not released yet"
+    );
+    assert!(
+        started.elapsed() < window / 2,
+        "no wait: {:?}",
+        started.elapsed()
+    );
+    release(&f, &caller, ino, a);
+    try_lock(&f, &caller, ino, b, 0xb).unwrap();
+    release(&f, &caller, ino, b);
 }

@@ -520,6 +520,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ("lock-holder-killed-contention", Skip::Local(&[KILL, NODES4])),
     ("lock-fence-at-close", Skip::Local(&[P2P_CUT, NODES3])),
     (
+        "lock-release-at-close",
+        Skip::Local(&["compares against mounts with CONSTELLATION_LOCKS=local"]),
+    ),
+    (
         "lock-latency",
         Skip::Local(&["compares against mounts with CONSTELLATION_LOCKS=local"]),
     ),
