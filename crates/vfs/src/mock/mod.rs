@@ -427,6 +427,8 @@ struct Inner {
     held: Mutex<Vec<Box<dyn Any + Send>>>,
     /// Deferred completions started and not yet finished.
     deferred: AtomicUsize,
+    /// What [`Vfs::handover_blockers`] answers ([`MockVfs::set_handover_blockers`]).
+    handover_blockers: Mutex<Vec<String>>,
 }
 
 /// A recording, scriptable [`Vfs`]; see the module doc.
@@ -493,8 +495,14 @@ impl MockVfs {
                 view,
                 held: Mutex::new(Vec::new()),
                 deferred: AtomicUsize::new(0),
+                handover_blockers: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Make [`Vfs::handover_blockers`] answer `blockers`.
+    pub fn set_handover_blockers(&self, blockers: Vec<String>) {
+        *self.inner.handover_blockers.lock().unwrap() = blockers;
     }
 
     /// A mock with no filesystem: every op that is not scripted answers
@@ -720,6 +728,10 @@ fn nb(name: &Name) -> NameBuf {
 }
 
 impl Vfs for MockVfs {
+    fn handover_blockers(&self) -> Vec<String> {
+        self.inner.handover_blockers.lock().unwrap().clone()
+    }
+
     fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let call = self.record(
             cx,

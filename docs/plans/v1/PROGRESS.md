@@ -46334,3 +46334,48 @@ expects `getattr` of a removed inode to be `ENOENT` without a `FORGET`,
 which 8a6f96c's `DeadInodes` answers; and the harness's
 `caps::the_caps_of_linux_fuse_are_derived_from_its_declaration` fails on
 `VirtualXattrsListed` since 8a6f96c.
+
+## Fix: an in-place upgrade dropped an unlinked file's unpublished writes (`handover-orphan-writes`, 2026-10-13)
+
+Found in review of `opath-unlinked`. A handover publishes every write
+session before the old image goes (`Vfs::sync_view`, plan 31 §6.11), and
+sessions do not cross. But a file written after its last name went —
+unlinked while open, or (since `opath-unlinked`) reopened through a
+descriptor the kernel still holds — has nothing to publish its writes
+under: `flush_inode` keeps them in the view's session for the file's own
+descriptors (ed9b40b), so `sync_view` succeeded, the old image exited
+with them, and the next one served the file without them. The handover
+module still described the pre-ed9b40b state (`fsync`/`close` failing
+with `ENOENT`, which refused the upgrade); since ed9b40b nothing did.
+
+### What changed
+
+- `View::handover_blockers` names every orphan with a pending session,
+  next to the cluster locks it already named (and no longer skips
+  everything when the view has no cluster locks). The upgrade's preflight
+  refuses on it as on a held lock: retry once no descriptor refers to the
+  file.
+- `Vfs::handover_blockers` (new, empty by default; `View` answers its own)
+  is asked again by the FUSE session's detach once the session has
+  stopped and published, the point after which nothing can change it:
+  non-empty refuses the detach with `EBUSY` and the session serves on in
+  place, like a lock wait that began after the preflight. This also
+  re-checks a cluster lock granted between the preflight and the stop,
+  which went through before. `MockVfs::set_handover_blockers` scripts it.
+- `constellation daemon --help` says so: a long-lived unlinked temporary
+  file with unpublished writes defers an in-place upgrade until no
+  descriptor refers to it.
+
+Making such writes cross instead (the session's staged bytes and sealed
+chunks, which live in the node's staging directory and cache) would keep
+the upgrade available for long-lived unlinked temporary files, at the
+cost of a new kind of state in the handoff; refusing keeps the handoff as
+it is and loses nothing. An upgrade now waits for those files to be
+closed, as it waits for cluster locks.
+
+### Tests
+
+- `view::handoff::tests::an_unlinked_file_with_unpublished_writes_refuses_a_handover`
+  (without the check: no blocker after `sync_view`).
+- `session::tests::a_detach_refuses_while_the_view_has_state_that_cannot_cross`
+  (a real FUSE mount; skipped where none can be made).

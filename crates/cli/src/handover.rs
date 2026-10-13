@@ -24,9 +24,11 @@
 //!    handover is not already running; the new binary runs and speaks this
 //!    handover's version (`daemon --handover-abi`); an E2E filesystem's
 //!    passphrase is in the environment (the new image unlocks the keyring
-//!    again, with no terminal); no view holds a cluster lock and no
-//!    blocking lock wait is in flight (neither survives a restart of the
-//!    node: `View::handover_blockers`, `SessionControl::deferred_replies`).
+//!    again, with no terminal); no view holds a cluster lock or an unlinked
+//!    file's unpublished writes, and no blocking lock wait is in flight
+//!    (none survives a restart of the node: `View::handover_blockers`,
+//!    `SessionControl::deferred_replies`; the session asks the view again
+//!    once it stopped, `Vfs::handover_blockers`).
 //! 2. **Detach every session** (`SessionControl::detach`, whose module doc
 //!    has the steps): the notification gate closes while the session still
 //!    serves; the fuser workers stop before their next read (requests the
@@ -82,10 +84,15 @@
 //!   survives the node's restart. Retry once they are released. (Under
 //!   `--locks local` the kernel holds every lock: nothing to refuse.)
 //! - **A pending write that cannot be published** refuses it (the
-//!   `sync_view` of step 2 fails; the session resumes in place). Today
-//!   that includes a file written, unlinked and still open: its `fsync`
-//!   and `close` fail with `ENOENT` as well — an engine bug that predates
-//!   the handover.
+//!   `sync_view` of step 2 fails; the session resumes in place). A file
+//!   written after its last name went — unlinked while open, or reopened
+//!   through a descriptor the kernel still holds — has no name to publish
+//!   under: `sync_view` keeps its writes in the view's session for its
+//!   descriptors (ed9b40b), and sessions do not cross, so it refuses the
+//!   upgrade too (`View::handover_blockers`, at the preflight and again by
+//!   the stopped session) until no descriptor refers to it. Before, the
+//!   upgrade went ahead and the next image served the file without those
+//!   writes (since 43268fc).
 //! - **Invalidations** the engine produces during the gap are dropped
 //!   (the gate); entries and attributes are TTL-bounded, and every open
 //!   file's pages are invalidated on resume.

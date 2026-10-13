@@ -17,6 +17,8 @@
 //! the node's open-orphan holds read. Write sessions do not cross: a
 //! detach publishes every one first (`Vfs::sync_view`), and a write on a
 //! handed-over descriptor opens a fresh one from the published manifest.
+//! An unlinked file's cannot be published, so a handover waits for it
+//! (`View::handover_blockers`).
 //!
 //! What does cross, then:
 //!
@@ -220,12 +222,29 @@ impl View {
     /// silently — so a handover waits until none is held. (Under
     /// `--locks local` the kernel keeps every lock, and they cross by
     /// themselves.)
+    ///
+    /// Likewise an unlinked file with writes not published: they have no
+    /// name to be published under, so `sync_view` leaves them in this
+    /// view's session (`flush_inode`: the orphan's descriptors read them
+    /// there, ed9b40b), and sessions do not cross — the next process
+    /// would serve the file without them. A handover waits until the
+    /// file is closed and, if the kernel still references it, forgotten
+    /// (`View::reap_after_unlink`). Asked by the preflight and again by
+    /// the session once it stopped (`Vfs::handover_blockers`).
     pub fn handover_blockers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for ino in self.writes.pending_inos() {
+            if self.orphaned(ino) {
+                out.push(format!(
+                    "inode {ino} is unlinked with writes that cannot be published \
+                     (retry once no descriptor refers to it)"
+                ));
+            }
+        }
         if self.cluster_locks().is_none() {
-            return Vec::new();
+            return out;
         }
         let inos: Vec<Ino> = self.opens.lock().unwrap().keys().copied().collect();
-        let mut out = Vec::new();
         for ino in inos {
             let held = self.meta.locks().local_locks(ino).len();
             if held > 0 {
@@ -277,9 +296,8 @@ mod tests {
             )
         })
         .unwrap();
-        // Published (a dirty unlinked-open file cannot be published today:
-        // `fsync`/`close` answer `ENOENT` — a pre-existing engine bug a
-        // handover refuses on, see `cli/src/handover.rs`).
+        // Published before the unlink (writes made after it could not
+        // be, and would refuse the handover: `View::handover_blockers`).
         Blocking::run(|r| {
             old.flush(
                 &cx(&caller, OpKind::Flush),
@@ -405,5 +423,61 @@ mod tests {
             postcard::from_bytes::<HandleTableSnapshot>(&bytes).unwrap(),
             empty
         );
+    }
+
+    /// An unlinked file's writes have no name to be published under, so
+    /// they stay in the view's session after `sync_view`, and sessions do
+    /// not cross a handover: the view refuses one (before, the next image
+    /// served the file without them). Closed, the file and its writes are
+    /// gone, and nothing refuses it.
+    #[test]
+    fn an_unlinked_file_with_unpublished_writes_refuses_a_handover() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let (view, _d) = super::super::quota_tests::test_fs(meta);
+        let caller = Caller::new(1000, 1000, None);
+        let (entry, opened) = Blocking::run(|r| {
+            view.create(
+                &cx(&caller, OpKind::Create),
+                ROOT_INO,
+                Name::new("tmp"),
+                0o100644,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap();
+        let ino = entry.attr.ino;
+        Blocking::run(|r| view.unlink(&cx(&caller, OpKind::Unlink), ROOT_INO, Name::new("tmp"), r))
+            .unwrap();
+        Blocking::run(|r| {
+            view.write(
+                &cx(&caller, OpKind::Write),
+                ino,
+                opened.fh,
+                0,
+                WriteData::Borrowed(b"scratch"),
+                OpenFlags::WRITE,
+                r,
+            )
+        })
+        .unwrap();
+        // The detach's barrier succeeds — and keeps the writes here.
+        Blocking::run(|r| view.sync_view(&cx(&caller, OpKind::SyncView), r)).unwrap();
+        let blockers = Vfs::handover_blockers(&view);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains(&ino.to_string()), "{blockers:?}");
+        Blocking::run(|r| {
+            view.release(
+                &cx(&caller, OpKind::Release),
+                ino,
+                opened.fh,
+                OpenFlags::READ | OpenFlags::WRITE,
+                None,
+                r,
+            )
+        })
+        .unwrap();
+        assert!(Vfs::handover_blockers(&view).is_empty());
     }
 }

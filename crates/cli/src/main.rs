@@ -228,7 +228,11 @@ enum Command {
     /// shuts its node down cleanly, and `exec`s the new binary, which
     /// resumes the same connections under the same pid — no unmount, no
     /// `ENOTCONN` for a process with a file open on the mount. Refused
-    /// (nothing changes) while a cluster lock is held or waited for.
+    /// (nothing changes) while a cluster lock is held or waited for, and
+    /// while an unlinked file has writes that cannot be published (a
+    /// long-lived unlinked temporary file defers the upgrade until no
+    /// descriptor refers to it any more: closed, and forgotten by the
+    /// kernel).
     Daemon {
         /// A registered name, or (with `--state-dir`) anything.
         target: Option<String>,

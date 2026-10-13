@@ -106,6 +106,10 @@ fn err<T>(code: Code) -> Result<T, VfsError> {
 const XATTR_VALUE_MAX: usize = 64 * 1024;
 
 impl Vfs for View {
+    fn handover_blockers(&self) -> Vec<String> {
+        View::handover_blockers(self)
+    }
+
     fn frontend_negotiated(&self, caps: &FrontendCaps) {
         self.set_passthrough_on(caps.passthrough);
         self.set_zero_copy_on(caps.zero_copy, caps.zero_copy_min_read);

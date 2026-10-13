@@ -1522,7 +1522,17 @@ impl<V: Vfs> FuseSession<V> {
                     ),
                 ))
             } else {
-                sync_view(&*vfs)
+                sync_view(&*vfs).and_then(|()| {
+                    // Checked here, with nothing served any more: what the
+                    // view cannot carry out of this process (the
+                    // preflight's check could be overtaken meanwhile).
+                    let blockers = vfs.handover_blockers();
+                    if blockers.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(refused(Code::Busy, blockers.join("; ")))
+                    }
+                })
             };
             // Plan 37 K0 (gap 4): an armed session's channel is
             // non-blocking, and the flag lives on the open file
@@ -2652,6 +2662,26 @@ mod tests {
         // Still serving.
         std::fs::write(m.dir.path().join("still"), b"up").unwrap();
         end(m.control, m.thread);
+    }
+
+    /// What the view cannot carry out of this process (here: scripted)
+    /// refuses the detach once the session has stopped and published, and
+    /// the session serves on in place; once it is gone, the detach goes.
+    #[test]
+    fn a_detach_refuses_while_the_view_has_state_that_cannot_cross() {
+        let vfs = MockVfs::reference(caps());
+        let Some(m) = mount_mock(&vfs) else { return };
+        vfs.set_handover_blockers(vec!["inode 7 is unlinked with unpublished writes".into()]);
+        let refused = m.control.detach(|| ()).expect_err("the view refuses it");
+        assert_eq!(refused.code, Code::Busy);
+        assert!(refused.to_string().contains("inode 7"), "{refused}");
+        // Still serving.
+        std::fs::write(m.dir.path().join("still"), b"up").unwrap();
+        vfs.set_handover_blockers(Vec::new());
+        m.control
+            .detach(|| ())
+            .expect("nothing refuses it any more");
+        assert_eq!(m.thread.join().unwrap().unwrap(), SessionExit::Detached);
     }
 
     #[test]

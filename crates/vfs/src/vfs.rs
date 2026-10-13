@@ -69,6 +69,17 @@ pub trait Vfs: Send + Sync + 'static {
         let _ = ino;
     }
 
+    /// Why this view's state cannot leave this process right now (empty:
+    /// it can) — what a session handover (plan 31 §6.11) or a hand-off of
+    /// the session to another process would silently lose: a lock that
+    /// lives in this process, writes that have nowhere to be published.
+    /// A frontend asks it once its session has stopped and the view's
+    /// writes are published (`sync_view`), and refuses the detach,
+    /// serving on in place, while it is not empty. Nothing by default.
+    fn handover_blockers(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// A regular file on the filesystem this view's backing files
     /// ([`crate::Opened::backing`]) live on, for a frontend to check once,
     /// before it serves, that its kernel will really accept one (Linux
