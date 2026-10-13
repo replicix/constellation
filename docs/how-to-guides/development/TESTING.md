@@ -96,7 +96,9 @@ is set again `policy rm --expire --yes` deletes it with the policy) and
 snapshot space accounting (plan 32 M5c: a 2 MiB file only one of three
 snapshots keeps; `snapshot space --verify` = 0 mismatches, `snapshot ls`'s
 `USED`/`WRITTEN` and footer, `-p -s used`, `snapshot delete --dry-run`'s
-`would reclaim ≈ 2.0M in 2 chunks`), unlink-while-open orphan semantics, unmount/remount persistence, and
+`would reclaim ≈ 2.0M in 2 chunks`), unlink-while-open orphan semantics (and an
+unlinked file reopened read-only and read-write through its `O_PATH`
+descriptor), unmount/remount persistence, and
 cold-cache reads after wiping the local chunk cache.
 
 The backend URL decides where it runs:

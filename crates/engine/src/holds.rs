@@ -43,6 +43,20 @@
 //! set is what makes that safe: an inode can only be opened while it has
 //! a name, so a handle on an orphan present at the first read is either
 //! counted at the second read or already released.
+//!
+//! # Orphans the platform still references
+//!
+//! A view also reports an orphan it unlinked while its platform may
+//! still reference it without a handle (an `O_PATH` descriptor that can
+//! reopen it, `View::reap_after_unlink`), until the platform lets go.
+//! The reaper leaves those like open ones. The hold claims one only once
+//! the reference is older than [`Holds::claim_after`]: the unlinking
+//! lookup's own reference, which the platform lets go of as the unlink
+//! returns, is the common case and must not cost a hold write per
+//! `unlink`. A longer one is claimed within that grace: the view asks
+//! the loop to wake for it ([`Holds::wake_in`]), whatever the refresh
+//! period — well inside the lease TTL a GC round waits between marking
+//! and deleting, so it is covered as an open orphan is.
 
 use anyhow::{Context, Result};
 use constellation_fs_core::manifest::{decode_chunk_list, ChunkInfo, Manifest};
@@ -51,15 +65,21 @@ use constellation_meta::{Meta, MetaStore};
 use constellation_store_s3::{layout, ChunkStore};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What a mounted view reports: the inodes with at least one open
-/// handle.
+/// handle, and the orphans its platform still references.
 pub trait OpenHandles: Send + Sync {
     fn open_inos(&self) -> Vec<Ino>;
+
+    /// Of [`Self::open_inos`], those only the platform references (no
+    /// handle), and since when (`None`: since before this process).
+    fn referenced(&self) -> Vec<(Ino, Option<Instant>)> {
+        Vec::new()
+    }
 }
 
 /// Every mounted view's open-handle table, weakly (a view goes away with
@@ -82,19 +102,66 @@ impl HoldSources {
 
     /// Whether any live view has `ino` open.
     pub fn is_open(&self, ino: Ino) -> bool {
-        self.open_inos().contains(&ino)
+        self.live()
+            .iter()
+            .any(|view| view.open_inos().contains(&ino))
+    }
+
+    /// Whether any live view has a handle open on `ino` (not only its
+    /// platform's reference, [`OpenHandles::referenced`]).
+    pub fn has_handle(&self, ino: Ino) -> bool {
+        self.live().iter().any(|view| {
+            view.open_inos().contains(&ino)
+                && !view
+                    .referenced()
+                    .iter()
+                    .any(|(referenced, _)| *referenced == ino)
+        })
     }
 
     /// The union of every live view's open inodes.
     pub fn open_inos(&self) -> HashSet<Ino> {
-        let views: Vec<Arc<dyn OpenHandles>> = self
-            .views
+        self.live().iter().flat_map(|v| v.open_inos()).collect()
+    }
+
+    /// The inodes no view has open and every view that reports them has
+    /// referenced for less than `grace` — not to be claimed yet — and how
+    /// long until the first of them is due.
+    pub fn unclaimed(&self, grace: Duration) -> (HashSet<Ino>, Option<Duration>) {
+        let mut young = HashMap::new();
+        let mut claimed = HashSet::new();
+        for view in self.live() {
+            let referenced = view.referenced();
+            let by_reference: HashSet<Ino> = referenced.iter().map(|(ino, _)| *ino).collect();
+            claimed.extend(
+                view.open_inos()
+                    .into_iter()
+                    .filter(|ino| !by_reference.contains(ino)),
+            );
+            for (ino, since) in referenced {
+                match since.map(|at| grace.saturating_sub(at.elapsed())) {
+                    Some(left) if !left.is_zero() => {
+                        let due = young.entry(ino).or_insert(left);
+                        *due = left.min(*due);
+                    }
+                    _ => {
+                        claimed.insert(ino);
+                    }
+                }
+            }
+        }
+        young.retain(|ino, _| !claimed.contains(ino));
+        let due = young.values().min().copied();
+        (young.into_keys().collect(), due)
+    }
+
+    fn live(&self) -> Vec<Arc<dyn OpenHandles>> {
+        self.views
             .lock()
             .unwrap()
             .iter()
             .filter_map(|(_, w)| w.upgrade())
-            .collect();
-        views.iter().flat_map(|v| v.open_inos()).collect()
+            .collect()
     }
 }
 
@@ -156,6 +223,14 @@ pub struct Holds {
     /// The last body written, to skip rewrites of an unchanged set until
     /// its refresh is due.
     last: Mutex<Option<(HoldBody, std::time::Instant)>>,
+    /// When the loop must run a pass before its regular refresh: a
+    /// referenced orphan comes due for its claim ([`Self::wake_in`], and
+    /// a pass that left one unclaimed).
+    wake_at: Mutex<Option<Instant>>,
+    /// Pokes the loop to re-read `wake_at` without running a pass.
+    rewake: tokio::sync::Notify,
+    /// Passes run, failed ones included ([`Self::passes`]).
+    passes: std::sync::atomic::AtomicU64,
 }
 
 impl Holds {
@@ -177,7 +252,44 @@ impl Holds {
             nudge: tokio::sync::Notify::new(),
             published: AtomicBool::new(true),
             last: Mutex::new(None),
+            wake_at: Mutex::new(None),
+            rewake: tokio::sync::Notify::new(),
+            passes: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Run a pass no later than `after` from now — not now: the claim of
+    /// an orphan a view's platform references without a handle comes
+    /// due after [`Self::claim_after`] (a view, right after the unlink),
+    /// and must not wait for the regular refresh. Costs a timer, not a
+    /// pass.
+    pub fn wake_in(&self, after: Duration) {
+        let at = Instant::now() + after;
+        {
+            let mut wake_at = self.wake_at.lock().unwrap();
+            // Already due by then (an `rm -rf`: one wake per unlink): the
+            // loop has nothing to re-arm.
+            if wake_at.is_some_and(|current| current <= at) {
+                return;
+            }
+            *wake_at = Some(at);
+        }
+        self.rewake.notify_one();
+    }
+
+    /// How many passes ran since this writer started (each lists the
+    /// replica's orphans): what a caller that should not have caused one
+    /// can check.
+    pub fn passes(&self) -> u64 {
+        self.passes.load(Ordering::Relaxed)
+    }
+
+    /// How long a view's platform must have referenced an orphan without
+    /// a handle before the hold claims it (the module doc): a quarter of
+    /// the refresh period, at most a second — a GC round waits a whole
+    /// lease TTL, twice the default refresh, before it deletes.
+    pub fn claim_after(&self) -> Duration {
+        (self.config.refresh / 4).min(Duration::from_secs(1))
     }
 
     /// Run a pass soon (the sync task, after applied segments; a view,
@@ -216,9 +328,17 @@ impl Holds {
             if let Err(error) = self.refresh_once().await {
                 tracing::warn!(error = %format!("{error:#}"), "open-orphan hold refresh failed");
             }
-            tokio::select! {
-                _ = tokio::time::sleep(self.config.refresh) => {}
-                _ = self.nudge.notified() => {}
+            let refresh_at = Instant::now() + self.config.refresh;
+            loop {
+                let at = match *self.wake_at.lock().unwrap() {
+                    Some(wake_at) => refresh_at.min(wake_at),
+                    None => refresh_at,
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep_until(at.into()) => break,
+                    _ = self.nudge.notified() => break,
+                    _ = self.rewake.notified() => {}
+                }
             }
         }
     }
@@ -264,7 +384,24 @@ impl Holds {
     /// One pass: compute the held set, then write, re-stamp or delete
     /// the hold object as the set and the cadence require.
     pub async fn refresh_once(&self) -> Result<()> {
-        let inodes = self.held_orphans()?;
+        self.passes.fetch_add(1, Ordering::Relaxed);
+        // This pass is the wake that was due: dropped before anything here
+        // can fail, so a failing pass (an unreadable replica) is retried at
+        // the refresh, not at once and forever. A wake still ahead stays.
+        {
+            let now = Instant::now();
+            let mut wake_at = self.wake_at.lock().unwrap();
+            *wake_at = wake_at.filter(|at| *at > now);
+        }
+        let mut inodes = self.held_orphans()?;
+        let (unclaimed, due) = self.sources.unclaimed(self.claim_after());
+        inodes.retain(|ino| !unclaimed.contains(ino));
+        if let Some(due) = due {
+            // This pass's own: when the first reference it left comes due.
+            let at = Instant::now() + due;
+            let mut wake_at = self.wake_at.lock().unwrap();
+            *wake_at = Some(wake_at.map_or(at, |current| current.min(at)));
+        }
         let key = layout::hold(self.node_id);
         if inodes.is_empty() {
             if self.published.swap(false, Ordering::Relaxed) {
@@ -358,6 +495,19 @@ mod tests {
 
     impl OpenHandles for Opens {
         fn open_inos(&self) -> Vec<Ino> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// A view whose platform references orphans without a handle.
+    struct Referenced(Mutex<Vec<(Ino, Option<Instant>)>>);
+
+    impl OpenHandles for Referenced {
+        fn open_inos(&self) -> Vec<Ino> {
+            self.referenced().into_iter().map(|(ino, _)| ino).collect()
+        }
+
+        fn referenced(&self) -> Vec<(Ino, Option<Instant>)> {
             self.0.lock().unwrap().clone()
         }
     }
@@ -473,5 +623,140 @@ mod tests {
         assert!(store.head(&layout::hold(7)).await.is_err());
         assert!(meta.orphans().unwrap().is_empty());
         assert!(meta.getattr(open.ino).unwrap().is_none());
+    }
+
+    /// An orphan a view's platform references without a handle (an
+    /// `O_PATH` descriptor) is never reaped while referenced, and claimed
+    /// only once the reference is older than `claim_after` — the unlink's
+    /// own lookup, let go of at once, costs no hold write — with the pass
+    /// waking for it. One a handle has open is claimed at once, and one
+    /// referenced since before this process too.
+    #[tokio::test]
+    async fn a_referenced_orphan_is_kept_and_claimed_after_a_grace() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let chunks = Arc::new(ChunkStore::new(store.clone()));
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.set_node_prefix(7).unwrap();
+        let hash = ChunkHash::of(b"referenced");
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        meta.set_manifest(f.ino, &inline_manifest(hash), 4).unwrap();
+        meta.unlink(ROOT_INO, "f").unwrap();
+        let view = Arc::new(Referenced(Mutex::new(vec![(f.ino, Some(Instant::now()))])));
+        let sources = Arc::new(HoldSources::default());
+        sources.register(1, Arc::downgrade(&view) as Weak<dyn OpenHandles>);
+        let holds = Holds::new(
+            store.clone(),
+            chunks,
+            meta.clone(),
+            7,
+            sources.clone(),
+            HoldConfig {
+                refresh: Duration::from_secs(60),
+                ttl: Duration::from_secs(180),
+            },
+        );
+        assert_eq!(holds.claim_after(), Duration::from_secs(1));
+
+        holds.refresh_once().await.unwrap();
+        assert_eq!(meta.orphans().unwrap(), vec![f.ino], "kept, not reaped");
+        assert!(sources.is_open(f.ino) && !sources.has_handle(f.ino));
+        assert!(
+            store.head(&layout::hold(7)).await.is_err(),
+            "not claimed yet"
+        );
+        let wake_at = holds
+            .wake_at
+            .lock()
+            .unwrap()
+            .expect("the pass wakes for it");
+        assert!(wake_at <= Instant::now() + Duration::from_secs(1));
+
+        // Another view holding it open claims it at once.
+        let other = Arc::new(Opens(Mutex::new(vec![f.ino])));
+        sources.register(2, Arc::downgrade(&other) as Weak<dyn OpenHandles>);
+        assert!(sources.has_handle(f.ino));
+        holds.refresh_once().await.unwrap();
+        assert!(store.head(&layout::hold(7)).await.is_ok());
+        drop(other);
+        holds.refresh_once().await.unwrap();
+        assert!(store.head(&layout::hold(7)).await.is_err());
+
+        // Past the grace (or referenced since before this process).
+        for since in [Instant::now().checked_sub(Duration::from_secs(2)), None] {
+            view.0.lock().unwrap()[0].1 = since;
+            holds.refresh_once().await.unwrap();
+            let body: HoldBody = serde_json::from_slice(
+                &store
+                    .get(&layout::hold(7))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                (body.inodes, body.chunks),
+                (vec![f.ino], vec![hash.to_hex()])
+            );
+            assert!(holds
+                .wake_at
+                .lock()
+                .unwrap()
+                .is_none_or(|at| at <= Instant::now() + Duration::from_secs(1)));
+        }
+
+        // The platform lets go: reaped and withdrawn.
+        view.0.lock().unwrap().clear();
+        holds.refresh_once().await.unwrap();
+        assert!(meta.orphans().unwrap().is_empty());
+        assert!(store.head(&layout::hold(7)).await.is_err());
+    }
+
+    /// A pass that fails (here: the bucket refuses the hold) is not
+    /// rerun at once and forever: the wake that brought it is dropped
+    /// before anything in it can fail, and the next try is the refresh
+    /// (or a later wake). The pass reads the replica before it writes,
+    /// and a replica that cannot be read (no fault hook in `Meta`) took
+    /// the same path before the wake was dropped first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_pass_is_not_rerun_back_to_back() {
+        let store = crate::upload::pending_upload_tests::FailingStore::new();
+        store.set_fail_puts(true);
+        let dyn_store: Arc<dyn ObjectStore> = store.clone();
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.set_node_prefix(7).unwrap();
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        meta.unlink(ROOT_INO, "f").unwrap();
+        // Referenced since before this process: claimed (written) at once.
+        let view = Arc::new(Referenced(Mutex::new(vec![(f.ino, None)])));
+        let sources = Arc::new(HoldSources::default());
+        sources.register(1, Arc::downgrade(&view) as Weak<dyn OpenHandles>);
+        let holds = Holds::new(
+            dyn_store.clone(),
+            Arc::new(ChunkStore::new(dyn_store)),
+            meta,
+            7,
+            sources,
+            HoldConfig {
+                refresh: Duration::from_secs(60),
+                ttl: Duration::from_secs(180),
+            },
+        );
+        // A wake that is due, as one a view asked for and that came due.
+        *holds.wake_at.lock().unwrap() = Instant::now().checked_sub(Duration::from_millis(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(holds.clone().run(stop.clone()));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(store.puts(), 1, "one failed pass, then the refresh");
+        assert_eq!(*holds.wake_at.lock().unwrap(), None);
+        // A view's wake still runs a pass when it is due, once.
+        holds.wake_in(Duration::from_millis(100));
+        holds.wake_in(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(store.puts(), 2);
+        stop.store(true, Ordering::Relaxed);
+        holds.nudge();
+        task.await.unwrap();
     }
 }

@@ -1111,6 +1111,8 @@ impl NodeRuntime {
         let caps = constellation_vfs::FrontendCaps {
             push_inval: constellation_vfs::PushInval::None,
             cluster_locks: false,
+            // Unmounted: no kernel references, and no `FORGET`s.
+            reports_forget: false,
             ..constellation_frontend_fuse::caps(false)
         };
         let view = self

@@ -40,7 +40,9 @@ pub enum CasePolicy {
 /// What the frontend's platform does with a file unlinked while open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenUnlinked {
-    /// The inode stays usable through open handles (POSIX, FUSE).
+    /// The inode stays usable through open handles (POSIX, FUSE) — and
+    /// through the platform's own references when the frontend reports
+    /// letting go of them ([`FrontendCaps::reports_forget`]).
     Keep,
     /// The client renames it aside (`.nfs*`).
     SillyRename,
@@ -102,6 +104,18 @@ pub struct FrontendCaps {
     /// 38 Z4b's measurements; Linux FUSE:
     /// `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ`). `0`: every read.
     pub zero_copy_min_read: u32,
+    /// The frontend calls [`crate::Vfs::forget`] whenever its platform
+    /// lets go of an inode it was handed (Linux FUSE: `FORGET`). With
+    /// [`OpenUnlinked::Keep`], the view then keeps a file it unlinked —
+    /// data included — for as long as the platform references it, where
+    /// an `O_PATH` descriptor can reopen it as on a local filesystem.
+    /// A declaration, never a default: a host driving a view without a
+    /// platform (the control service's browse view, a test, a bench)
+    /// sends no `forget`, and an inode kept for one would never be
+    /// reaped. [`FrontendCaps::linux_fuse`] declares `false`; the FUSE
+    /// adapter's own caps (`constellation_frontend_fuse::caps`), whose
+    /// sessions do send it, turn it on.
+    pub reports_forget: bool,
 }
 
 impl FrontendCaps {
@@ -139,6 +153,8 @@ impl FrontendCaps {
             // Off until the session's transport is settled (plan 38 Z4).
             zero_copy: false,
             zero_copy_min_read: 0,
+            // The adapter's own caps turn it on (see the field).
+            reports_forget: false,
         }
     }
 }

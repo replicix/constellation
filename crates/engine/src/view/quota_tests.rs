@@ -134,6 +134,244 @@ fn unlink_does_not_reap_an_inode_another_view_has_open() {
     assert!(meta.getattr(f.ino).unwrap().is_none());
 }
 
+/// The last name of a file the kernel references is reported to the hold
+/// writer from before the unlink until the kernel's `FORGET`: a reaper
+/// pass between the unlink and `reap_after_unlink` leaves the orphan, and
+/// so does one after an unlink this replica applies only later (a
+/// forwarded one). One of several names is not reported.
+#[test]
+fn an_unlinked_last_name_is_reported_from_before_the_unlink() {
+    use crate::holds::{HoldConfig, HoldSources, Holds, OpenHandles};
+    use constellation_vfs::Vfs;
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let g = meta.create(ROOT_INO, "g", 0o644, 0, 0).unwrap();
+    let linked = meta.link(g.ino, ROOT_INO, "g2").unwrap();
+    let (mut fs, _tmpdir) = test_fs(meta.clone());
+    fs.caps.reports_forget = true;
+    let sources = Arc::new(HoldSources::default());
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    fs.holds = Some(Holds::new(
+        store.clone(),
+        Arc::new(ChunkStore::new(store)),
+        meta.clone(),
+        1,
+        sources.clone(),
+        HoldConfig {
+            refresh: std::time::Duration::from_secs(1),
+            ttl: std::time::Duration::from_secs(3),
+        },
+    ));
+    let fs = Arc::new(fs);
+    sources.register(1, Arc::downgrade(&fs) as std::sync::Weak<dyn OpenHandles>);
+
+    fs.unlinking(&f);
+    fs.unlinking(&linked);
+    assert!(!sources.is_open(g.ino), "one of two names: not reported");
+    // Not applied here yet: still named, kept reported.
+    assert!(!fs.reap_after_unlink(f.ino));
+    meta.unlink(ROOT_INO, "f").unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(fs.holds.as_ref().unwrap().refresh_once())
+        .unwrap();
+    assert_eq!(meta.orphans().unwrap(), vec![f.ino], "the reaper leaves it");
+    fs.forget(f.ino);
+    assert!(
+        meta.getattr(f.ino).unwrap().is_none(),
+        "reaped at the forget"
+    );
+}
+
+/// Two views of one node over a shared hold writer, both reporting
+/// `forget`s (two FUSE mounts).
+struct TwoViews {
+    a: Arc<View>,
+    b: Arc<View>,
+    holds: Arc<crate::holds::Holds>,
+    store: Arc<dyn object_store::ObjectStore>,
+    _dirs: Vec<TempDir>,
+}
+
+fn two_forgetting_views(meta: &Arc<Meta>, refresh: std::time::Duration) -> TwoViews {
+    use crate::holds::{HoldConfig, HoldSources, Holds, OpenHandles};
+    let sources = Arc::new(HoldSources::default());
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let holds = Holds::new(
+        store.clone(),
+        Arc::new(ChunkStore::new(store.clone())),
+        meta.clone(),
+        1,
+        sources.clone(),
+        HoldConfig {
+            refresh,
+            ttl: refresh * 3,
+        },
+    );
+    let mut dirs = Vec::new();
+    let mut views = Vec::new();
+    for id in [1, 2] {
+        let (mut fs, dir) = test_fs(meta.clone());
+        fs.caps.reports_forget = true;
+        fs.holds = Some(holds.clone());
+        let fs = Arc::new(fs);
+        sources.register(id, Arc::downgrade(&fs) as std::sync::Weak<dyn OpenHandles>);
+        views.push(fs);
+        dirs.push(dir);
+    }
+    let b = views.pop().unwrap();
+    let a = views.pop().unwrap();
+    TwoViews {
+        a,
+        b,
+        holds,
+        store,
+        _dirs: dirs,
+    }
+}
+
+/// View A unlinked a file its kernel still references; view B's last
+/// close of it must not reap it under A (before, `release` asked only
+/// its own view): A reopens it, and A's `FORGET` reaps it.
+#[test]
+fn another_views_last_close_leaves_a_referenced_orphan() {
+    use constellation_vfs::{Blocking, Name, OpCtx, OpKind, OpenOwner, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let views = two_forgetting_views(&meta, std::time::Duration::from_secs(60));
+    let (a, b) = (&views.a, &views.b);
+    let caller = constellation_vfs::Caller::new(0, 0, None);
+    let open = |view: &View| {
+        let cx = OpCtx::new(OpKind::Open, &caller);
+        Blocking::run(|r| view.open(&cx, f.ino, OpenFlags::READ, OpenOwner::NONE, r))
+    };
+    let close = |view: &View, fh| {
+        let cx = OpCtx::new(OpKind::Release, &caller);
+        Blocking::run(|r| view.release(&cx, f.ino, fh, OpenFlags::READ, None, r)).unwrap()
+    };
+    let in_b = open(b).unwrap();
+    let cx = OpCtx::new(OpKind::Unlink, &caller);
+    Blocking::run(|r| a.unlink(&cx, ROOT_INO, Name::new("f"), r)).unwrap();
+    close(b, in_b.fh);
+    assert_eq!(meta.orphans().unwrap(), vec![f.ino], "kept for A");
+    let in_a = open(a).expect("A's reference reopens it");
+    close(a, in_a.fh);
+    a.forget(f.ino);
+    assert!(
+        meta.getattr(f.ino).unwrap().is_none(),
+        "reaped at A's forget"
+    );
+}
+
+/// A reference without a handle is claimed in the hold within
+/// `claim_after` of its unlink on a node where nothing else runs a pass
+/// (no applied segments to nudge it), not at the next regular refresh:
+/// the view asks the hold writer to wake for it.
+#[test]
+fn a_referenced_orphan_is_claimed_without_waiting_for_the_refresh() {
+    use constellation_vfs::{Blocking, Name, OpCtx, OpKind, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let views = two_forgetting_views(&meta, std::time::Duration::from_secs(30));
+    let (a, holds, store) = (&views.a, &views.holds, &views.store);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    rt.spawn(holds.clone().run(stop.clone()));
+    let claimed = || {
+        rt.block_on(object_store::ObjectStoreExt::head(
+            &**store,
+            &constellation_store_s3::layout::hold(1),
+        ))
+        .is_ok()
+    };
+    // The loop's first pass is behind it.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let caller = constellation_vfs::Caller::new(0, 0, None);
+    let cx = OpCtx::new(OpKind::Unlink, &caller);
+    Blocking::run(|r| a.unlink(&cx, ROOT_INO, Name::new("f"), r)).unwrap();
+    let unlinked = std::time::Instant::now();
+    assert!(!claimed(), "not claimed at once");
+    while !claimed() && unlinked.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        claimed(),
+        "not claimed within {:?} (claim_after {:?})",
+        unlinked.elapsed(),
+        holds.claim_after()
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The kernel's `FORGET` of a file it referenced only for the unlink —
+/// within the claim grace, so never claimed — costs no hold pass (an
+/// `rm -rf` would run them back to back); one of a reference that
+/// outlived the grace withdraws its claim at once, not at the refresh.
+#[test]
+fn a_forget_runs_a_hold_pass_only_for_a_claimed_reference() {
+    use constellation_vfs::{Blocking, Name, OpCtx, OpKind, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let g = meta.create(ROOT_INO, "g", 0o644, 0, 0).unwrap();
+    let views = two_forgetting_views(&meta, std::time::Duration::from_secs(30));
+    let (a, holds, store) = (&views.a, &views.holds, &views.store);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    rt.spawn(holds.clone().run(stop.clone()));
+    let claimed = || {
+        rt.block_on(object_store::ObjectStoreExt::head(
+            &**store,
+            &constellation_store_s3::layout::hold(1),
+        ))
+        .is_ok()
+    };
+    let caller = constellation_vfs::Caller::new(0, 0, None);
+    let unlink = |name: &str| {
+        let cx = OpCtx::new(OpKind::Unlink, &caller);
+        Blocking::run(|r| a.unlink(&cx, ROOT_INO, Name::new(name), r)).unwrap()
+    };
+    let settle = || std::thread::sleep(std::time::Duration::from_millis(300));
+    settle();
+    let passes = holds.passes();
+    assert!(passes >= 1, "the loop's first pass");
+
+    // Let go of within the grace: reaped, and no pass.
+    unlink("f");
+    a.forget(f.ino);
+    assert!(meta.getattr(f.ino).unwrap().is_none(), "reaped");
+    settle();
+    assert_eq!(holds.passes(), passes, "no pass for an unclaimed reference");
+
+    // Held past the grace: claimed; let go of: withdrawn at once.
+    unlink("g");
+    let unlinked = std::time::Instant::now();
+    while !claimed() && unlinked.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(claimed(), "claimed after the grace");
+    a.forget(g.ino);
+    let forgot = std::time::Instant::now();
+    while claimed() && forgot.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !claimed(),
+        "withdrawn at the forget, not at the 30 s refresh"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[test]
 fn quota_check_unlimited_always_ok() {
     let meta = Arc::new(Meta::open_in_memory().unwrap());

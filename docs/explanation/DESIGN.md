@@ -375,8 +375,38 @@ know client opens; Constellation avoids the problem with explicit claims.)
   later.) Scratch shortcut: an orphan with a single local
   holder that was never opened elsewhere never flushes at all — the
   open-unlink-tmpfile pattern runs entirely in the local cache.
+- **Kernel references count as holds**: the kernel may keep an unlinked
+  inode without any open handle (an `O_PATH` descriptor, which
+  `open("/proc/self/fd/N")` reopens, as on any local filesystem). Under a
+  frontend that declares it reports the kernel letting go
+  (`FrontendCaps::reports_forget`: the FUSE adapter; never a host that
+  drives a view without a kernel, whose kept inodes would never be
+  reaped), the view that unlinked a file keeps the orphan, its data and
+  its unpublished writes until the kernel's `FORGET`, not only until the
+  last close, and reports it to the hold task as open. The hold claims it
+  only once the reference outlives a short grace (≤ 1 s, well inside the
+  lease TTL a GC round waits; the view asks the hold task to wake for it,
+  whatever its refresh period), so the unlink's own lookup, let go of as
+  the unlink returns, never costs a hold write. A session handover carries these references; a
+  restart ends them with the kernel's (the mount goes).
+- **Removed elsewhere = stale handle**: an inode removed by another node,
+  or by another view of this one, is not kept for this view's kernel
+  references (the view keeps no lookup table). Every op on such an inode
+  itself — `getattr`, `setattr`, `open`, `readlink`, `link`'s source,
+  `readdir`, the xattr ops, and the handle ops `read`, `write`, `flush`,
+  `fsync`, `fallocate`, `seek` — answers `ESTALE`, as NFS does (an
+  `O_PATH` descriptor's `/proc/self/fd/N`; an open handle keeps its
+  inode, so it never meets this); a path walk that meets it is retried by
+  the kernel with fresh lookups, so a missing *name* still answers
+  `ENOENT`, as does every op addressed by a parent and a name. An inode
+  this view removed itself is not stale: it answers as on a local
+  filesystem until the kernel's `FORGET`.
+  Until this node applies the remote unlink, and for the kernel's
+  attribute TTL after, the reference still shows the old attributes
+  (`nlink` 1): the bounded close-to-open window (§6).
 - **Fast path preserved**: unlinking a file nobody has open (the vast
-  majority) takes the ordinary route — no holds, immediate deref.
+  majority) takes the ordinary route — no holds; the deref waits only for
+  the kernel's `FORGET`.
 - **Edge**: a node offline with an orphan open can only read its cached
   chunks anyway; if its unrenewable hold expired and GC collected the rest,
   uncached reads after reconnect return EIO. Optional mitigation:

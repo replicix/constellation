@@ -843,6 +843,7 @@ mod tests {
             passthrough: false,
             zero_copy: false,
             zero_copy_min_read: 0,
+            reports_forget: false,
         }
     }
 

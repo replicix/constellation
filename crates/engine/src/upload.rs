@@ -1180,6 +1180,11 @@ pub(crate) mod pending_upload_tests {
             self.fail_puts.store(fail, Ordering::SeqCst);
         }
 
+        /// How many `put`s were tried, failed ones included.
+        pub(crate) fn puts(&self) -> usize {
+            self.puts.load(Ordering::SeqCst)
+        }
+
         fn set_delay_puts(&self, delay: bool) {
             self.delay_puts.store(delay, Ordering::SeqCst);
         }

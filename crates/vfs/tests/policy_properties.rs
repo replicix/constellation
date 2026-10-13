@@ -71,6 +71,7 @@ fn any_caps() -> impl Strategy<Value = FrontendCaps> {
                     passthrough,
                     zero_copy,
                     zero_copy_min_read,
+                    reports_forget: false,
                 }
             },
         )

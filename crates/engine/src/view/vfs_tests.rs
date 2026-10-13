@@ -23,6 +23,12 @@ fn client() -> Client {
     client_with(|_| {})
 }
 
+/// A client for a frontend that reports the kernel's `FORGET`s, as the
+/// FUSE adapter's caps declare (`FrontendCaps::reports_forget`).
+fn fuse_client() -> Client {
+    client_with(|view| view.caps.reports_forget = true)
+}
+
 fn client_with(tune: impl FnOnce(&mut View)) -> Client {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let (mut view, dir) = super::quota_tests::test_fs(meta.clone());
@@ -135,6 +141,20 @@ impl Client {
                 RenameFlags::empty(),
                 r,
             )
+        })
+    }
+
+    fn open(&self, ino: Ino, flags: OpenFlags) -> VfsResult<Opened> {
+        Blocking::run(|r| {
+            self.view
+                .open(&self.cx(OpKind::Open), ino, flags, OpenOwner::NONE, r)
+        })
+    }
+
+    fn setattr(&self, ino: Ino, set: &SetAttr) -> VfsResult<Attr> {
+        Blocking::run(|r| {
+            self.view
+                .setattr(&self.cx(OpKind::Setattr), ino, None, set, r)
         })
     }
 
@@ -291,8 +311,215 @@ fn a_removed_inode_stats_with_no_links_until_it_is_forgotten() {
 
     for ino in [f, d, v.attr.ino] {
         c.view.forget(ino);
-        assert_eq!(code(c.getattr(ino)), Code::NotFound);
+        // Nothing answers for it any more: a stale reference.
+        assert_eq!(code(c.getattr(ino)), Code::Stale);
     }
+}
+
+/// An unlinked file the kernel still references without a handle (an
+/// `O_PATH` descriptor) reopens through it (`open("/proc/self/fd/N")`)
+/// and reads, writes, truncates and chmods like any file — before and
+/// after its handles close — until the kernel's `FORGET`, which reaps it.
+#[test]
+fn an_unlinked_file_reopens_until_it_is_forgotten() {
+    let c = fuse_client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let f = e.attr.ino;
+    c.write(f, o.fh, 0, &b"hello".repeat(100)).unwrap();
+    c.close(f, o.fh).unwrap();
+    // Unlinked while open, and then closed.
+    let (e, o) = c.create(ROOT_INO, "g").unwrap();
+    let g = e.attr.ino;
+    c.write(g, o.fh, 0, b"open at unlink").unwrap();
+
+    c.unlink(ROOT_INO, "f").unwrap();
+    c.unlink(ROOT_INO, "g").unwrap();
+    c.close(g, o.fh).unwrap();
+
+    let ro = c.open(f, OpenFlags::READ).unwrap();
+    assert_eq!(c.read(f, ro.fh, 0, 10_000).unwrap(), b"hello".repeat(100));
+    let rw = c.open(f, OpenFlags::READ | OpenFlags::WRITE).unwrap();
+    c.write(f, rw.fh, 0, b"HELLO").unwrap();
+    assert_eq!(c.read(f, ro.fh, 0, 5).unwrap(), b"HELLO");
+    let attr = c
+        .setattr(
+            f,
+            &SetAttr {
+                size: Some(7),
+                mode: Some(0o600),
+                ..SetAttr::default()
+            },
+        )
+        .unwrap();
+    assert_eq!((attr.size, attr.mode & 0o7777, attr.nlink), (7, 0o600, 0));
+    c.close(f, rw.fh).unwrap();
+    c.close(f, ro.fh).unwrap();
+    // No handle left: the kernel's reference alone keeps it, writes
+    // included.
+    let again = c.open(f, OpenFlags::READ).unwrap();
+    assert_eq!(c.read(f, again.fh, 0, 64).unwrap(), b"HELLOhe");
+    c.close(f, again.fh).unwrap();
+    let attr = c.getattr(f).unwrap();
+    assert_eq!((attr.nlink, attr.size), (0, 7));
+    let reopened = c.open(g, OpenFlags::READ).unwrap();
+    assert_eq!(c.read(g, reopened.fh, 0, 64).unwrap(), b"open at unlink");
+    c.close(g, reopened.fh).unwrap();
+
+    for ino in [f, g] {
+        c.view.forget(ino);
+        assert_eq!(code(c.getattr(ino)), Code::Stale);
+        assert_eq!(code(c.open(ino, OpenFlags::READ)), Code::Stale);
+    }
+    assert!(
+        c._meta.orphans().unwrap().is_empty(),
+        "reaped at the forget"
+    );
+    assert!(c.view.export_handles().unlinked_refs.is_empty());
+}
+
+/// The kernel may send an unlinked file's `FORGET` before the `RELEASE`
+/// of its last handle (the two travel apart): the forget leaves the
+/// orphan to the handle, whose close then reaps it.
+#[test]
+fn a_forget_before_the_last_close_leaves_the_reap_to_the_close() {
+    let c = fuse_client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let f = e.attr.ino;
+    c.write(f, o.fh, 0, b"still open").unwrap();
+    c.unlink(ROOT_INO, "f").unwrap();
+    c.view.forget(f);
+    assert_eq!(c.read(f, o.fh, 0, 64).unwrap(), b"still open");
+    assert_eq!(c._meta.orphans().unwrap(), vec![f]);
+    c.close(f, o.fh).unwrap();
+    assert!(c._meta.orphans().unwrap().is_empty(), "reaped at the close");
+    assert!(c.view.writes.pending_inos().is_empty());
+    assert!(c.view.export_handles().unlinked_refs.is_empty());
+}
+
+/// A frontend that does not report `forget`s (the control service's
+/// browse view, a test or bench host) keeps nothing for references it
+/// cannot have: an unlink or a rename over a file reaps it at once, as
+/// before, and leaves no orphan record or reference behind.
+#[test]
+fn a_view_without_forgets_keeps_no_unlinked_file() {
+    let c = client();
+    assert!(!c.view.caps.reports_forget);
+    for name in ["a", "b", "c"] {
+        let (e, o) = c.create(ROOT_INO, name).unwrap();
+        c.write(e.attr.ino, o.fh, 0, name.as_bytes()).unwrap();
+        c.close(e.attr.ino, o.fh).unwrap();
+    }
+    c.unlink(ROOT_INO, "a").unwrap();
+    c.rename(ROOT_INO, "b", ROOT_INO, "c").unwrap();
+    assert!(c.view.export_handles().unlinked_refs.is_empty());
+    assert!(c._meta.orphans().unwrap().is_empty());
+}
+
+/// An inode this view handed out that was removed elsewhere — another
+/// node's unlink its reaper applied, or another view's — answers
+/// `ESTALE` to every op on the inode itself (a stale handle, as NFS
+/// answers), where a lookup of its old name answers `ENOENT`.
+#[test]
+fn an_inode_removed_elsewhere_is_a_stale_handle() {
+    let c = client();
+    let mut inos = Vec::new();
+    for name in ["f", "g"] {
+        let (e, o) = c.create(ROOT_INO, name).unwrap();
+        c.close(e.attr.ino, o.fh).unwrap();
+        inos.push(e.attr.ino);
+    }
+    // Another node's unlink, then this node's reaper.
+    c._meta.unlink(ROOT_INO, "f").unwrap();
+    c._meta.reap_orphan(inos[0]).unwrap();
+    // Another view of this node.
+    let (other, _dir) = super::quota_tests::test_fs(c._meta.clone());
+    let cx = OpCtx::new(OpKind::Unlink, &c.caller);
+    Blocking::run(|r| other.unlink(&cx, ROOT_INO, Name::new("g"), r)).unwrap();
+
+    for (ino, name) in inos.into_iter().zip(["f", "g"]) {
+        assert_eq!(code(c.lookup(ROOT_INO, name)), Code::NotFound);
+        assert_eq!(code(c.getattr(ino)), Code::Stale);
+        assert_eq!(code(c.open(ino, OpenFlags::READ)), Code::Stale);
+        let chmod = SetAttr {
+            mode: Some(0o600),
+            ..SetAttr::default()
+        };
+        assert_eq!(code(c.setattr(ino, &chmod)), Code::Stale);
+        let truncate = SetAttr {
+            size: Some(0),
+            ..SetAttr::default()
+        };
+        assert_eq!(code(c.setattr(ino, &truncate)), Code::Stale);
+        assert_eq!(code(c.getxattr(ino, "user.a")), Code::Stale);
+        assert_eq!(code(c.listxattr(ino)), Code::Stale);
+        assert_eq!(
+            code(c.setxattr(ino, "user.a", b"1", SetXattrFlags::empty())),
+            Code::Stale
+        );
+        assert_eq!(code(c.removexattr(ino, "user.a")), Code::Stale);
+        let link = Blocking::run(|r| {
+            c.view
+                .link(&c.cx(OpKind::Link), ino, ROOT_INO, Name::new("again"), r)
+        });
+        assert_eq!(code(link), Code::Stale);
+    }
+
+    // A directory and a symlink removed by another node.
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    let l = Blocking::run(|r| {
+        c.view
+            .symlink(&c.cx(OpKind::Symlink), ROOT_INO, Name::new("l"), b"t", r)
+    })
+    .unwrap()
+    .attr
+    .ino;
+    c._meta.rmdir(ROOT_INO, "d").unwrap();
+    c._meta.unlink(ROOT_INO, "l").unwrap();
+    c._meta.reap_orphan(l).unwrap();
+    assert_eq!(code(c.readdir(d, 0, 10)), Code::Stale);
+    assert_eq!(code(c.getattr(d)), Code::Stale);
+    assert_eq!(
+        code(Blocking::run(|r| c.view.readlink(
+            &c.cx(OpKind::Readlink),
+            l,
+            r
+        ))),
+        Code::Stale
+    );
+    // One this view removed itself is not stale: it answers as on a
+    // local filesystem until the kernel's `FORGET`.
+    let mine = c.mkdir(ROOT_INO, "mine").unwrap().attr.ino;
+    c.rmdir(ROOT_INO, "mine").unwrap();
+    assert_eq!(c.getattr(mine).unwrap().nlink, 0);
+    assert_eq!(code(c.readdir(mine, 0, 10)), Code::NotFound);
+    // Nor is a synthetic inode, which the replica never has.
+    let synthetic = SYNTHETIC_INO_BIT + 5;
+    assert!(View::is_synthetic(synthetic));
+    assert_eq!(c.view.gone(synthetic, Code::NotFound), Code::NotFound);
+}
+
+/// The kernel's reference to an unlinked file crosses a handover: the
+/// next process's view keeps it openable until the `FORGET` it receives.
+#[test]
+fn an_unlinked_file_the_kernel_references_crosses_a_handover() {
+    let c = fuse_client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let f = e.attr.ino;
+    c.close(f, o.fh).unwrap();
+    c.unlink(ROOT_INO, "f").unwrap();
+    let snapshot = c.view.export_handles();
+    assert_eq!(snapshot.unlinked_refs, vec![f]);
+
+    let (mut next, _dir) = super::quota_tests::test_fs(c._meta.clone());
+    next.caps.reports_forget = true;
+    next.import_handles(&snapshot);
+    let cx = OpCtx::new(OpKind::Open, &c.caller);
+    let opened = Blocking::run(|r| next.open(&cx, f, OpenFlags::READ, OpenOwner::NONE, r)).unwrap();
+    let cx = OpCtx::new(OpKind::Release, &c.caller);
+    Blocking::run(|r| next.release(&cx, f, opened.fh, OpenFlags::READ, None, r)).unwrap();
+    assert_eq!(c._meta.orphans().unwrap(), vec![f], "still referenced");
+    next.forget(f);
+    assert!(c._meta.orphans().unwrap().is_empty());
 }
 
 #[test]

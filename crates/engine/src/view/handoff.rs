@@ -6,7 +6,11 @@
 //! knows lives only in the view. Inode numbers are the replica's (`Meta`,
 //! on disk): the kernel's cached dentries and its lookup counts name
 //! numbers the next process resolves the same way, and the view keeps no
-//! lookup table (`forget` is a no-op). File handles are the view's own
+//! lookup table (`FORGET`s queued during the gap reach the next image,
+//! which acts on the few inodes `forget` matters for: `unlinked_refs`
+//! below; the removed inodes' last attributes it answers `getattr` with
+//! until then do not cross, so the next image answers `ESTALE` for
+//! those). File handles are the view's own
 //! numbering (one per open, plan 39 §3.7), so they cross as a table: each
 //! handle's inode and the discard error event it has seen, plus the
 //! view's count of handles per inode, which the last-close orphan reap and
@@ -32,6 +36,12 @@
 //! - **`reached`**: a confined view's cache of inodes known inside it,
 //!   so an inode it handed out and that was since renamed out of the
 //!   subtree stays addressable by handle exactly as before.
+//! - **`unlinked_refs`**: the orphans this view unlinked that the kernel
+//!   may still reference without a handle (`View::reap_after_unlink`):
+//!   without them the next process's hold writer would reap what an
+//!   `O_PATH` descriptor can still reopen. They are claimed at once
+//!   there: the old process's hold may already name them, and the next
+//!   one's first pass replaces that hold.
 //! - **`writers`**: the write-intent handles among `opens`, which refuse
 //!   passthrough on their inode (plan 38 Z3b).
 //! - **`passthrough`**: the chunk each passthrough handle sits on (plan 38
@@ -70,6 +80,8 @@ pub struct HandleTableSnapshot {
     /// `(inode, chunk hashes)`: the chunk each passthrough handle on the
     /// inode reads from, oldest first.
     pub passthrough: Vec<(Ino, Vec<[u8; 32]>)>,
+    /// The orphans the kernel may still reference without a handle.
+    pub unlinked_refs: Vec<Ino>,
 }
 
 /// A synthetic node, opaquely (its type is the engine's own).
@@ -117,6 +129,9 @@ impl View {
             .map(|(ino, n)| (*ino, *n))
             .collect();
         opens.sort_unstable();
+        let mut unlinked_refs: Vec<Ino> =
+            self.unlinked_refs.lock().unwrap().keys().copied().collect();
+        unlinked_refs.sort_unstable();
         let mut reached = self.reach.all();
         reached.sort_unstable();
         reached.dedup();
@@ -153,6 +168,7 @@ impl View {
             synthetic_next: next,
             writers,
             passthrough: self.export_passthrough(),
+            unlinked_refs,
         }
     }
 
@@ -179,6 +195,13 @@ impl View {
             }
         }
         self.import_passthrough(&snapshot.passthrough);
+        // Referenced since before this process, maybe claimed by its hold
+        // already: claimed at once, so the first pass here never
+        // withdraws a claim the old one published.
+        self.unlinked_refs
+            .lock()
+            .unwrap()
+            .extend(snapshot.unlinked_refs.iter().map(|ino| (*ino, None)));
         for ino in &snapshot.reached {
             self.reach.mark(*ino);
         }
@@ -287,6 +310,8 @@ mod tests {
         let snapshot = old.export_handles();
         assert_eq!(snapshot.opens, vec![(ino, 1)]);
         assert!(snapshot.open_inos().eq([ino]));
+        // A view without `forget`s (this test's) keeps no references.
+        assert!(snapshot.unlinked_refs.is_empty());
 
         // It crosses processes: both wire forms round-trip.
         let handoff = ViewHandoff {

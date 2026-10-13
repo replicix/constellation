@@ -11,7 +11,8 @@
 //!
 //! The steps: create a fs (a second create must be refused), mount, POSIX
 //! namespace ops, a 3.5 MiB multi-chunk file, partial in-place edit,
-//! truncate, append, unlink-while-open, rm/rmdir, unmount, remount and
+//! truncate, append, unlink-while-open, an unlinked file reopened through
+//! its `O_PATH` descriptor, rm/rmdir, unmount, remount and
 //! verify persistence, remount with a cold chunk cache, `status`, and the
 //! node's `status` naming the FUSE transport the mount negotiated.
 
@@ -20,7 +21,8 @@ use crate::spawn::TiedSpawn;
 use anyhow::{bail, ensure, Context, Result};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -834,6 +836,39 @@ fn smoke(m: &mut Mount, work: &Path) -> Result<()> {
         "FAIL: unlinked-but-open file read back {text:?}"
     );
     drop(held);
+
+    say("unlinked file reopened through its O_PATH descriptor");
+    let path = mnt.join("opath.txt");
+    let content = "hello".repeat(100);
+    fs::write(&path, &content)?;
+    let opath = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(&path)?;
+    fs::remove_file(&path)?;
+    let proc_fd = PathBuf::from(format!("/proc/self/fd/{}", opath.as_raw_fd()));
+    let mut ro = fs::File::open(&proc_fd).context("FAIL: O_RDONLY open of an unlinked file")?;
+    let mut rw = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&proc_fd)
+        .context("FAIL: O_RDWR open of an unlinked file")?;
+    let mut text = String::new();
+    rw.read_to_string(&mut text)?;
+    ensure!(text == content, "FAIL: unlinked file read back {text:?}");
+    rw.write_all_at(b"HELLO", 0)?;
+    drop(rw);
+    text.clear();
+    ro.read_to_string(&mut text)?;
+    ensure!(
+        text.starts_with("HELLOhello") && text.len() == content.len(),
+        "FAIL: unlinked file reopened read back {text:?}"
+    );
+    ensure!(
+        opath.metadata()?.nlink() == 0,
+        "FAIL: unlinked file has links"
+    );
+    drop((ro, opath));
 
     say("rm/rmdir");
     fs::remove_file(mnt.join("dir/link"))?;

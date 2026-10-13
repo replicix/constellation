@@ -50,7 +50,12 @@ pub use stats::{
 pub const URING_BUILT: bool = cfg!(all(feature = "io-uring", target_os = "linux"));
 
 /// The capabilities this frontend declares: [`FrontendCaps::linux_fuse`]
-/// (`cluster_locks`: the mount forwards POSIX/`flock` locks to the view).
+/// (`cluster_locks`: the mount forwards POSIX/`flock` locks to the view),
+/// and [`FrontendCaps::reports_forget`]: every session sends the kernel's
+/// `FORGET`s on to the view (`Filesystem::forget` in the adapter).
 pub fn caps(cluster_locks: bool) -> FrontendCaps {
-    FrontendCaps::linux_fuse(cluster_locks)
+    FrontendCaps {
+        reports_forget: true,
+        ..FrontendCaps::linux_fuse(cluster_locks)
+    }
 }

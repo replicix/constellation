@@ -46207,3 +46207,130 @@ clean; `cargo test -p constellation-csi` 172 + integration passed (under
 `umask 022`: two `engine_pods` tests refuse a group-writable temp dir under
 umask 002, by design, independent of this change); `helm template` renders
 only the new names. Not run: the kind/k3s CSI e2e lanes (need a cluster).
+
+## Fix: an unlinked file the kernel still references could not be reopened (`opath-unlinked`, 2026-10-13)
+
+Found by xcheckfs and confirmed on a mount: `fd = open(p, O_PATH);
+unlink(p); open("/proc/self/fd/<fd>", O_RDONLY | O_RDWR)` answered
+`ENOENT`, where every local filesystem reopens the inode (`fstat` on the
+`O_PATH` descriptor already answered `nlink == 0`).
+
+### Cause
+
+`View::reap_after_unlink` (`crates/engine/src/view/mod.rs`) reaped the
+orphan as soon as no *handle* anywhere on the node had it open — the rule
+of 84a59be / acc977a, where "held" meant "open handle" (DESIGN §3). The
+kernel's own reference, a lookup with no handle, did not count: 8a6f96c
+kept only the inode's last attributes for it (`DeadInodes`, so `fstat`
+works until `FORGET`), not the inode, so `open` found nothing
+(`ops.rs` `open`: `meta.getattr` → `None` → `NotFound`). The last-close
+reap in `release` (ed9b40b, b5e11ae) had the same blind spot for a file
+unlinked while open and then closed while the `O_PATH` descriptor lived.
+
+### What changed
+
+The kernel's reference now counts as a hold for the orphans a view
+unlinked itself, under a frontend that keeps unlinked inodes
+(`OpenUnlinked::Keep`) *and declares* that it reports the kernel letting
+go (`FrontendCaps::reports_forget`, new): only the FUSE adapter's caps
+(`constellation_frontend_fuse::caps`) set it. `FrontendCaps::linux_fuse`
+leaves it off, so the hosts that drive a view without a kernel — the
+control service's browse view, the headless view, tests, benches — keep
+reaping at unlink; a kept inode there would never see a `forget`.
+
+- `View::unlinked_refs`: entered just before the last name goes
+  (`View::unlinking`, so the hold reaper — orphans read before opens —
+  never sees the orphan unreported, and a forwarded unlink the replica
+  applies later is covered), settled by `reap_after_unlink`, and removed
+  by `forget` (`View::forget_unlinked`), which drops this view's write
+  session and reaps the orphan unless a handle here still has it or
+  another view has it open or references it. `release` leaves such an
+  orphan, and its session, to that `forget`: a reopen reads what the last
+  handle wrote. `release` also no longer reaps an orphan another view has
+  open or references (it asked only its own view; 84a59be had fixed the
+  same for `unlink`).
+- The view reports these inodes to the hold writer as open
+  (`OpenHandles::open_inos`), so everything 84a59be/acc977a built on that
+  set applies unchanged: the reaper leaves them, a namespace rebuild
+  carries them (`Holds::open_orphans`), another view's unlink does not reap
+  them, and their chunks are claimed in `holds/<node>.json`.
+- No hold write on the hot path: the unlinking lookup's reference is let
+  go of within a millisecond (measured), so a reference without a handle
+  is claimed only once older than `Holds::claim_after` (a quarter of the
+  refresh, at most 1 s). The view asks the writer to wake for it
+  (`Holds::wake_in`: a timer, not a pass; skipped when a wake that early
+  is already set), so the claim never waits for the regular refresh,
+  whatever `CONSTELLATION_HOLD_REFRESH_MS` says (left as configured:
+  `log-retention-gap-open-orphan` sets it above the lease TTL on purpose).
+  A pass drops the wake it answers before anything in it can fail, so a
+  failing pass is retried at the refresh, not in a loop. A `forget` that
+  reaps a reference that may have been claimed (older than the grace, or
+  handed over) nudges the writer, so the claim is withdrawn at once; the
+  common one, the unlinking lookup's own, costs no pass. A handle is
+  claimed at once as before; `reap_after_unlink` nudges the writer only
+  for a handle (`HoldSources::has_handle`), not for its own reference.
+- `HandleTableSnapshot::unlinked_refs`: a handover carries them, claimed
+  at once in the next image so its first pass never withdraws a claim the
+  old one published. (No compatibility with older images, as for the rest
+  of the handoff since `ea8049a`.)
+- A confined view admits an inode it unlinked while referenced
+  (`enter_ino`), as it admits one open through it.
+- Removed elsewhere is a stale handle: every op on an inode itself
+  (`getattr`, `setattr`, `open`, `readlink`, `link`'s source, `readdir`,
+  the xattr ops, and the handle ops) that the replica no longer has at
+  all, and that this view did not remove itself, answers `ESTALE`
+  instead of `ENOENT` (`View::gone`, `View::ino_err`). The view's own
+  synthetic inodes, never in the replica, keep `NotFound`. The kernel only
+  names inodes the view handed out, so one the replica lacks was removed
+  after it was looked up here — by another node or another view, which
+  keep nothing for this view's references. The kernel retries a path walk
+  that met `ESTALE` with fresh lookups, so a missing name still answers
+  `ENOENT`. Until the remote unlink is applied here (and for the kernel's
+  attribute TTL after), such a reference still stats with the old
+  attributes: the bounded close-to-open window, unchanged.
+
+Unchanged on purpose: directories (`rmdir`) and frontends that do not
+report `forget`s still use `DeadInodes`. A daemon crash ends the kernel's
+references with the mount; the orphan records go at the next bootstrap or
+reaper pass and the hold expires by its TTL.
+
+### Tests
+
+Each fails without its part of the fix (checked by reverting that part):
+
+- `view::vfs_tests::an_unlinked_file_reopens_until_it_is_forgotten`
+  (previous main: `open` → `NotFound`): reopen read-only and read-write, a
+  second handle sees the first one's writes, `ftruncate` + `fchmod`,
+  reopen after every handle closed, `FORGET` reaps; also for a file
+  unlinked while open.
+- `view::vfs_tests::a_view_without_forgets_keeps_no_unlinked_file`
+  (without the `reports_forget` gate: references accumulate).
+- `view::quota_tests::a_referenced_orphan_is_claimed_without_waiting_for_the_refresh`
+  (without `wake_in`: not claimed within 5 s at a 30 s refresh).
+- `view::quota_tests::another_views_last_close_leaves_a_referenced_orphan`
+  (without the other-views check in `release`: reaped under view A).
+- `view::vfs_tests::an_inode_removed_elsewhere_is_a_stale_handle`
+  (previous main: `NotFound`; every inode-addressed op, and `NotFound`
+  for a directory this view removed itself).
+- `view::quota_tests::a_forget_runs_a_hold_pass_only_for_a_claimed_reference`
+  (with an unconditional nudge: a pass per `forget`; with none: the claim
+  stays until the 30 s refresh).
+- Also: `holds::tests::a_failing_pass_is_not_rerun_back_to_back` (a
+  regression guard: `Meta` has no fault hook, so it fails the pass at
+  the bucket, after the point where an unreadable replica fails it),
+  `a_forget_before_the_last_close_leaves_the_reap_to_the_close`,
+  `an_unlinked_file_the_kernel_references_crosses_a_handover`,
+  `an_unlinked_last_name_is_reported_from_before_the_unlink`,
+  `holds::tests::a_referenced_orphan_is_kept_and_claimed_after_a_grace`;
+  `a_removed_inode_stats_with_no_links_until_it_is_forgotten` now expects
+  `Stale` after the `FORGET`.
+- `harness smoke`: an unlinked file reopened `O_RDONLY` and `O_RDWR`
+  through its `O_PATH` descriptor on a real mount.
+
+Pre-existing, not changed here: the engine conformance run
+(`crates/engine/tests/conformance.rs`) fails `mkdir_rmdir_and_their_refusals`
+and `hard_links_count_names` on the previous main already — the kit
+expects `getattr` of a removed inode to be `ENOENT` without a `FORGET`,
+which 8a6f96c's `DeadInodes` answers; and the harness's
+`caps::the_caps_of_linux_fuse_are_derived_from_its_declaration` fails on
+`VirtualXattrsListed` since 8a6f96c.

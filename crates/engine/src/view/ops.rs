@@ -230,7 +230,7 @@ impl Vfs for View {
         let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                r.done(err(Code::Stale));
+                r.done(self.ino_err(ino, Code::Stale));
             } else {
                 let attr = self.visible_attr(self.synthetic_attr(ino, &node));
                 r.done(Ok(self.attr_out(&attr)));
@@ -259,14 +259,16 @@ impl Vfs for View {
             }
             Ok(None) => match self.dead_attr(ino) {
                 Some(attr) => r.done(Ok(self.attr_out(&attr))),
-                None => r.done(err(Code::NotFound)),
+                None => r.done(self.ino_err(ino, Code::NotFound)),
             },
-            Err(code) => r.done(err(code)),
+            Err(code) => r.done(self.ino_err(ino, code)),
         }
     }
 
     fn forget(&self, ino: Ino) {
-        self.forget_dead(self.real_ino(ino));
+        let ino = self.real_ino(ino);
+        self.forget_dead(ino);
+        self.forget_unlinked(ino);
     }
 
     fn setattr<R: Responder<Attr>>(
@@ -307,24 +309,24 @@ impl Vfs for View {
             };
             match kind {
                 Some(InodeKind::Dir) => {
-                    r.done(err(Code::IsDir));
+                    r.done(self.ino_err(ino, Code::IsDir));
                     return;
                 }
                 Some(InodeKind::File) | None => {}
                 Some(_) => {
-                    r.done(err(Code::Invalid));
+                    r.done(self.ino_err(ino, Code::Invalid));
                     return;
                 }
             }
             // Plan 30 §M14: a truncation is a write (fenced under a
             // lapsed lock grant).
             if self.lock_fenced(ino) {
-                r.done(err(Code::Io));
+                r.done(self.ino_err(ino, Code::Io));
                 return;
             }
             self.lock_discard_tainted(ino);
             if let Err(error) = self.truncate(ino, new_size) {
-                r.done(err(error));
+                r.done(self.ino_err(ino, error));
                 return;
             }
         }
@@ -377,7 +379,7 @@ impl Vfs for View {
         };
         match result {
             Ok(attr) => r.done(Ok(self.attr_out(&attr))),
-            Err(error) => r.done(err(error)),
+            Err(error) => r.done(self.ino_err(ino, error)),
         }
     }
 
@@ -387,7 +389,7 @@ impl Vfs for View {
         let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                r.done(err(Code::Stale));
+                r.done(self.ino_err(ino, Code::Stale));
             } else if let SyntheticNode::Frozen {
                 kind: InodeKind::Symlink,
                 target: Some(target),
@@ -396,7 +398,7 @@ impl Vfs for View {
             {
                 r.done(Ok(constellation_vfs::name::wire_bytes(&target).into_owned()));
             } else {
-                r.done(err(Code::Invalid));
+                r.done(self.ino_err(ino, Code::Invalid));
             }
             return;
         }
@@ -405,8 +407,12 @@ impl Vfs for View {
             Ok(Some(target)) => {
                 r.done(Ok(constellation_vfs::name::wire_bytes(&target).into_owned()))
             }
-            Ok(None) => r.done(err(Code::Invalid)),
-            Err(e) => r.done(err(e.code())),
+            // Not a symlink — or no inode at all any more (`View::gone`).
+            Ok(None) => r.done(err(match self.gone(ino, Code::NotFound) {
+                Code::Stale => Code::Stale,
+                _ => Code::Invalid,
+            })),
+            Err(e) => r.done(self.ino_err(ino, e.code())),
         }
     }
 
@@ -573,7 +579,7 @@ impl Vfs for View {
         // inode's link domains (the view module doc's "Link domains").
         if self.confine_links && !View::is_synthetic(ino) && !View::is_synthetic(new_parent) {
             if let Err(code) = self.link_within_domain(ino, new_parent) {
-                r.done(err(code));
+                r.done(self.ino_err(ino, code));
                 return;
             }
         }
@@ -586,10 +592,10 @@ impl Vfs for View {
             // The linked inode may have a session open (`current_attr`).
             Ok(()) => match self.current_attr(ino) {
                 Ok(Some(attr)) => r.done(Ok(self.entry_out(&attr))),
-                Ok(None) => r.done(err(Code::NotFound)),
-                Err(code) => r.done(err(code)),
+                Ok(None) => r.done(self.ino_err(ino, Code::NotFound)),
+                Err(code) => r.done(self.ino_err(ino, code)),
             },
-            Err(e) => r.done(err(e)),
+            Err(e) => r.done(self.ino_err(ino, e)),
         }
     }
 
@@ -628,6 +634,9 @@ impl Vfs for View {
                 Err(e) => Err(e.code()),
             }
         } else {
+            if let Ok(Some(attr)) = &target {
+                self.unlinking(attr);
+            }
             self.mutate_op(
                 parent,
                 constellation_meta::MutateOp::Unlink {
@@ -638,13 +647,19 @@ impl Vfs for View {
         };
         match result {
             Ok(()) => {
-                // No open handle in any view of this node: reap now.
+                // No open handle in any view of this node, nor a
+                // reference of the kernel's: reap now.
                 if let Ok(Some(attr)) = target {
                     self.reap_after_unlink(attr.ino);
                 }
                 r.done(Ok(()))
             }
-            Err(e) => r.done(err(self.beneath_non_dir(e, &[parent]))),
+            Err(e) => {
+                if let Ok(Some(attr)) = target {
+                    self.unlink_failed(attr.ino);
+                }
+                r.done(err(self.beneath_non_dir(e, &[parent])))
+            }
         }
     }
 
@@ -864,6 +879,9 @@ impl Vfs for View {
         } else {
             self.meta.lookup(newparent, &newname).ok().flatten()
         };
+        if let Some(attr) = &replaced {
+            self.unlinking(attr);
+        }
         let op = if exchange {
             constellation_meta::MutateOp::Exchange {
                 parent,
@@ -894,7 +912,12 @@ impl Vfs for View {
                 }
                 r.done(Ok(()))
             }
-            Err(e) => r.done(err(self.beneath_non_dir(e, &[parent, newparent]))),
+            Err(e) => {
+                if let Some(attr) = replaced.filter(|a| a.kind != InodeKind::Dir) {
+                    self.unlink_failed(attr.ino);
+                }
+                r.done(err(self.beneath_non_dir(e, &[parent, newparent])))
+            }
         }
     }
 
@@ -912,17 +935,17 @@ impl Vfs for View {
         // is not fenced: the fence must not stop a fenced owner from
         // reaching its own close).
         if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC) && self.lock_owner_fenced_any(cx) {
-            r.done(err(Code::Io));
+            r.done(self.ino_err(ino, Code::Io));
             return;
         }
         let ino = enter!(self, ino, r);
         if let Some(node) = self.synthetic_node(ino) {
             if !self.synthetic_active(&node) {
-                r.done(err(Code::Stale));
+                r.done(self.ino_err(ino, Code::Stale));
             } else if flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC) {
                 // A snapshot mirror is frozen: `EROFS`, as a read-only
                 // mount answers an open for writing.
-                r.done(err(Code::ReadOnly));
+                r.done(self.ino_err(ino, Code::ReadOnly));
             } else if matches!(
                 node,
                 SyntheticNode::Frozen {
@@ -947,7 +970,7 @@ impl Vfs for View {
                     zero_copy,
                 }));
             } else {
-                r.done(err(Code::IsDir));
+                r.done(self.ino_err(ino, Code::IsDir));
             }
             return;
         }
@@ -986,8 +1009,8 @@ impl Vfs for View {
                     zero_copy,
                 }))
             }
-            Ok(None) => r.done(err(Code::NotFound)),
-            Err(e) => r.done(err(e.code())),
+            Ok(None) => r.done(self.ino_err(ino, Code::NotFound)),
+            Err(e) => r.done(self.ino_err(ino, e.code())),
         }
     }
 
@@ -1044,7 +1067,7 @@ impl Vfs for View {
         // view hands out one per open and knows its inode); anything else
         // was never given out.
         if self.handle_ino(fh) != Some(ino) {
-            r.done(err(Code::BadFd));
+            r.done(self.ino_err(ino, Code::BadFd));
             return;
         }
         let _inflight = self.inflight.enter(&[ino]);
@@ -1053,19 +1076,19 @@ impl Vfs for View {
         if View::is_synthetic(ino) {
             match self.read_frozen(ino, zc.as_deref(), off, len as u64) {
                 Ok(data) => r.done(Ok(data)),
-                Err(error) => r.done(err(error)),
+                Err(error) => r.done(self.ino_err(ino, error)),
             }
             return;
         }
         if self.lock_fenced(ino) {
-            r.done(err(Code::Io));
+            r.done(self.ino_err(ino, Code::Io));
             return;
         }
         // A cold read defers to the completion pool (`io`'s module doc).
         let Some(view) = self.read_deferral() else {
             match self.do_read_zc(ino, zc.as_deref(), off, len as u64) {
                 Ok(data) => r.done(Ok(data)),
-                Err(e) => r.done(err(e)),
+                Err(e) => r.done(self.ino_err(ino, e)),
             }
             return;
         };
@@ -1074,7 +1097,7 @@ impl Vfs for View {
         {
             match result {
                 Ok(data) => r.done(Ok(data)),
-                Err(e) => r.done(err(e)),
+                Err(e) => r.done(self.ino_err(ino, e)),
             }
             return;
         }
@@ -1088,7 +1111,7 @@ impl Vfs for View {
             let result = view.do_read_zc(ino, zc.as_deref(), off, len as u64);
             match result {
                 Ok(data) => r.done(Ok(data)),
-                Err(e) => r.done(err(e)),
+                Err(e) => r.done(view.ino_err(ino, e)),
             }
             drop(inflight);
             view.admission.leave_deferred(admitted);
@@ -1111,7 +1134,7 @@ impl Vfs for View {
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         if View::is_synthetic(ino) {
-            r.done(err(Code::ReadOnly));
+            r.done(self.ino_err(ino, Code::ReadOnly));
             return;
         }
         // `ViewQos::max_staging_bytes`: wait for this view's own flushes.
@@ -1119,18 +1142,18 @@ impl Vfs for View {
             .admission
             .admit_staging(cx, data.as_slice().len() as u64)
         {
-            r.done(err(code));
+            r.done(self.ino_err(ino, code));
             return;
         }
         if self.lock_fenced(ino) {
-            r.done(err(Code::Io));
+            r.done(self.ino_err(ino, Code::Io));
             return;
         }
         self.lock_discard_tainted(ino);
         let n = match self.do_write(ino, off, data.as_slice()) {
             Ok(n) if flags.contains(OpenFlags::SYNC) => n,
             Ok(n) => return r.done(Ok(n)),
-            Err(e) => return r.done(err(e)),
+            Err(e) => return r.done(self.ino_err(ino, e)),
         };
         // `O_SYNC`/`O_DSYNC` (plan 39 §3.3): the publication waits like
         // an `fsync`, and so, like one, on the `fsync` pool — a database
@@ -1199,7 +1222,7 @@ impl Vfs for View {
         }
         match result {
             Ok(()) => r.done(Ok(())),
-            Err(e) => r.done(err(e)),
+            Err(e) => r.done(self.ino_err(ino, e)),
         }
     }
 
@@ -1295,9 +1318,17 @@ impl Vfs for View {
         // sequencer's to judge: its session goes only once the flush
         // above answered `ESTALE` (no such file there), never with a
         // success; after any other failure it stays, as a present
-        // file's does.
-        let orphan = last && self.orphaned(ino);
-        if orphan || (last && self.unlinked(ino) && flush_result == Err(Code::Stale)) {
+        // file's does. An orphan this view's platform still references
+        // is left to its `forget`, session included: a reopen through
+        // that reference, in this view, reads what this handle wrote
+        // (`View::reap_after_unlink`; sessions are per view). One another
+        // view still has open or references keeps its record for that
+        // view — as `unlink`'s reap already asked every view (84a59be) —
+        // and this view's session, which nothing in this view reaches any
+        // more, goes.
+        let reap = last && !self.unlinked_referenced(ino);
+        let orphan = reap && self.orphaned(ino);
+        if orphan || (reap && self.unlinked(ino) && flush_result == Err(Code::Stale)) {
             if self.drop_writes(ino) && !orphan {
                 tracing::warn!(
                     ino,
@@ -1305,8 +1336,12 @@ impl Vfs for View {
                      the close answered ESTALE"
                 );
             }
+            let elsewhere = self
+                .holds
+                .as_ref()
+                .is_some_and(|h| h.sources().is_open(ino));
             if let Ok(Some(attr)) = self.meta.getattr(ino) {
-                if attr.nlink == 0 {
+                if attr.nlink == 0 && !elsewhere {
                     self.remember_dead(attr);
                     let _ = self.meta.reap_orphan(ino);
                 }
@@ -1331,7 +1366,7 @@ impl Vfs for View {
             // reported yet (plan 39 §3.7: once, not again after the fence
             // lifts).
             self.lock_errors_reported(ino, fh);
-            r.done(err(Code::Io));
+            r.done(self.ino_err(ino, Code::Io));
             return;
         }
         // Plan 30 §M14: nothing written under a lapsed grant is made
@@ -1340,7 +1375,7 @@ impl Vfs for View {
         let owed = match self.lock_publish_gate(ino, fh) {
             Ok(owed) => owed,
             Err(e) => {
-                r.done(err(e));
+                r.done(self.ino_err(ino, e));
                 return;
             }
         };
@@ -1385,7 +1420,7 @@ impl Vfs for View {
         if View::is_synthetic(ino) {
             let entries = match self.synthetic_entries(ino) {
                 Ok(entries) => entries,
-                Err(error) => return r.done(err(error)),
+                Err(error) => return r.done(self.ino_err(ino, error)),
             };
             let mut idx = cookie;
             loop {
@@ -1426,7 +1461,7 @@ impl Vfs for View {
             self.meta.readdir(ino)
         } {
             Ok(e) => e,
-            Err(e) => return r.done(err(e.code())),
+            Err(e) => return r.done(self.ino_err(ino, e.code())),
         };
         // Cookies: "." answers 1, ".." 2, and each child its name's
         // `dir_cookie` — so a listing resumes after the *name* it stopped
@@ -1504,13 +1539,13 @@ impl Vfs for View {
         admit!(self, cx, r, _admitted);
         // Plan 31 §6.2: absent from a frontend that does not declare it.
         if !self.caps.fallocate {
-            r.done(err(Code::NotSupported));
+            r.done(self.ino_err(ino, Code::NotSupported));
             return;
         }
         let ino = enter!(self, ino, r);
         let _inflight = self.inflight.enter(&[ino]);
         if View::is_synthetic(ino) {
-            r.done(err(Code::ReadOnly));
+            r.done(self.ino_err(ino, Code::ReadOnly));
             return;
         }
         // No lease: like a write or a truncation, an allocation changes
@@ -1520,17 +1555,17 @@ impl Vfs for View {
         // non-holder's `fallocate` wait out a busy holder for 2xTTL and
         // fail with EIO (stress-ng-fs-nodes: `iomix`, `fsize`, `sync-file`).
         if self.lock_fenced(ino) {
-            r.done(err(Code::Io));
+            r.done(self.ino_err(ino, Code::Io));
             return;
         }
         self.lock_discard_tainted(ino);
         if len == 0 {
-            r.done(err(Code::Invalid));
+            r.done(self.ino_err(ino, Code::Invalid));
             return;
         }
         match self.do_fallocate(ino, off, len, mode) {
             Ok(()) => r.done(Ok(())),
-            Err(error) => r.done(err(error)),
+            Err(error) => r.done(self.ino_err(ino, error)),
         }
     }
 
@@ -1548,13 +1583,13 @@ impl Vfs for View {
         // Plan 31 §6.2: `SEEK_DATA`/`SEEK_HOLE` are absent from a frontend
         // that does not declare them.
         if !self.caps.seek_hole {
-            r.done(err(Code::NotSupported));
+            r.done(self.ino_err(ino, Code::NotSupported));
             return;
         }
         let ino = enter!(self, ino, r);
         match self.seek_sparse(ino, off, whence) {
             Ok(position) => r.done(Ok(position as u64)),
-            Err(error) => r.done(err(error)),
+            Err(error) => r.done(self.ino_err(ino, error)),
         }
     }
 
@@ -1564,7 +1599,7 @@ impl Vfs for View {
         let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
-            Err(error) => return r.done(err(error)),
+            Err(error) => return r.done(self.ino_err(ino, error)),
         };
         if !View::is_synthetic(ino) {
             self.session_wait(&[ReadKey::Ino(ino)]);
@@ -1584,7 +1619,7 @@ impl Vfs for View {
                         rcount.to_string().into_bytes()
                     }
                 }
-                Err(error) => return r.done(err(error)),
+                Err(error) => return r.done(self.ino_err(ino, error)),
             }
         } else {
             let result = if View::is_synthetic(ino) {
@@ -1601,8 +1636,8 @@ impl Vfs for View {
             };
             match result {
                 Ok(Some(value)) => value,
-                Ok(None) => return r.done(err(Code::NoData)),
-                Err(error) => return r.done(err(error)),
+                Ok(None) => return r.done(self.ino_err(ino, Code::NoData)),
+                Err(error) => return r.done(self.ino_err(ino, error)),
             }
         };
         r.done(Ok(value));
@@ -1622,25 +1657,25 @@ impl Vfs for View {
         let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
-            Err(error) => return r.done(err(error)),
+            Err(error) => return r.done(self.ino_err(ino, error)),
         };
         if self.policies.xattrs.is_virtual(&name) {
-            r.done(err(Code::Perm));
+            r.done(self.ino_err(ino, Code::Perm));
             return;
         }
         if View::is_synthetic(ino) {
-            r.done(err(Code::ReadOnly));
+            r.done(self.ino_err(ino, Code::ReadOnly));
             return;
         }
         if value.len() > XATTR_VALUE_MAX {
-            r.done(err(Code::TooBig));
+            r.done(self.ino_err(ino, Code::TooBig));
             return;
         }
         let mode = match flags.mode() {
             Ok(SetXattrMode::Set) => constellation_meta::SetXattrMode::Set,
             Ok(SetXattrMode::Create) => constellation_meta::SetXattrMode::Create,
             Ok(SetXattrMode::Replace) => constellation_meta::SetXattrMode::Replace,
-            Err(error) => return r.done(err(error)),
+            Err(error) => return r.done(self.ino_err(ino, error)),
         };
         let wire_mode = match mode {
             constellation_meta::SetXattrMode::Create => 1,
@@ -1655,9 +1690,9 @@ impl Vfs for View {
             // Only directories may carry a policy.
             match self.meta.getattr(ino) {
                 Ok(Some(attr)) if attr.kind == InodeKind::Dir => {}
-                Ok(Some(_)) => return r.done(err(Code::Invalid)),
-                Ok(None) => return r.done(err(Code::NotFound)),
-                Err(e) => return r.done(err(e.code())),
+                Ok(Some(_)) => return r.done(self.ino_err(ino, Code::Invalid)),
+                Ok(None) => return r.done(self.ino_err(ino, Code::NotFound)),
+                Err(e) => return r.done(self.ino_err(ino, e.code())),
             }
             let expr = String::from_utf8_lossy(value);
             match constellation_meta::prune::Policy::parse(&expr) {
@@ -1672,12 +1707,12 @@ impl Vfs for View {
                             0,
                             "policy needs atime; mount with --atime relatime",
                         );
-                        return r.done(err(Code::Invalid));
+                        return r.done(self.ino_err(ino, Code::Invalid));
                     }
                 }
                 Err(e) => {
                     self.prune_stats.record_parse_error(&expr, e.offset, &e.msg);
-                    return r.done(err(Code::Invalid));
+                    return r.done(self.ino_err(ino, Code::Invalid));
                 }
             }
         }
@@ -1691,7 +1726,7 @@ impl Vfs for View {
                     let expr = String::from_utf8_lossy(value);
                     self.snapsched_stats.record_parse_error(&expr, *offset, msg);
                 }
-                return r.done(err(refusal.code));
+                return r.done(self.ino_err(ino, refusal.code));
             }
         }
         // ... and the converse: no directory at or above a policy root may
@@ -1704,7 +1739,7 @@ impl Vfs for View {
                     self.snapsched_stats
                         .record_parse_error(&marking, *offset, msg);
                 }
-                return r.done(err(refusal.code));
+                return r.done(self.ino_err(ino, refusal.code));
             }
         }
         // Scratch files are node-private (scratch-directories.md) and
@@ -1714,7 +1749,7 @@ impl Vfs for View {
         if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
             return match self.meta.scratch_set_xattr(ino, &name, value, mode) {
                 Ok(()) => r.done(Ok(())),
-                Err(error) => r.done(err(error.code())),
+                Err(error) => r.done(self.ino_err(ino, error.code())),
             };
         }
         match self.mutate_op(
@@ -1730,7 +1765,7 @@ impl Vfs for View {
                 self.nudge_sync();
                 r.done(Ok(()))
             }
-            Err(error) => r.done(err(error)),
+            Err(error) => r.done(self.ino_err(ino, error)),
         }
     }
 
@@ -1756,7 +1791,7 @@ impl Vfs for View {
                 names.retain(|n| !is_internal_xattr(n));
                 r.done(Ok(self.policies.xattrs.listing(names)))
             }
-            Err(error) => r.done(err(error)),
+            Err(error) => r.done(self.ino_err(ino, error)),
         }
     }
 
@@ -1766,20 +1801,20 @@ impl Vfs for View {
         let ino = enter!(self, ino, r);
         let name = match self.policies.xattrs.check_name(name, cx.caller) {
             Ok(name) => name,
-            Err(error) => return r.done(err(error)),
+            Err(error) => return r.done(self.ino_err(ino, error)),
         };
         if self.policies.xattrs.is_virtual(&name) {
-            r.done(err(Code::Perm));
+            r.done(self.ino_err(ino, Code::Perm));
             return;
         }
         if View::is_synthetic(ino) {
-            r.done(err(Code::ReadOnly));
+            r.done(self.ino_err(ino, Code::ReadOnly));
             return;
         }
         if self.meta.scratch_getattr(ino).ok().flatten().is_some() {
             return match self.meta.scratch_remove_xattr(ino, &name) {
                 Ok(()) => r.done(Ok(())),
-                Err(error) => r.done(err(error.code())),
+                Err(error) => r.done(self.ino_err(ino, error.code())),
             };
         }
         match self.mutate_op(ino, constellation_meta::MutateOp::RemoveXattr { ino, name }) {
@@ -1787,7 +1822,7 @@ impl Vfs for View {
                 self.nudge_sync();
                 r.done(Ok(()))
             }
-            Err(error) => r.done(err(error)),
+            Err(error) => r.done(self.ino_err(ino, error)),
         }
     }
 
@@ -1956,6 +1991,12 @@ pub(super) fn dir_cookie(name: &[u8]) -> u64 {
 }
 
 impl View {
+    /// The error of an op on inode `ino` itself: `NotFound` answered
+    /// `Stale` once the inode is gone from the replica ([`View::gone`]).
+    fn ino_err<T>(&self, ino: Ino, code: Code) -> Result<T, VfsError> {
+        Err(self.gone(ino, code).into())
+    }
+
     /// The cluster locks the `lock_*` ops serve: none unless this view's
     /// frontend declared `cluster_locks` (plan 31 §6.2: "only called if
     /// caps.cluster_locks") — a frontend that keeps locks node-local is

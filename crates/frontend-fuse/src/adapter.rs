@@ -1367,8 +1367,14 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
-        // The kernel sends it only when it evicts the inode, with every
-        // lookup it still held: the inode is no longer referenced.
+        // Taken as "the inode is no longer referenced" (the view keeps no
+        // lookup counts, plan 31 §6.11). The kernel sends it when it
+        // evicts the inode, with every lookup it still held — and, the
+        // one partial forget, for the single lookup a dentry
+        // revalidation's `LOOKUP` added when it returned another inode
+        // than the dentry's (`fuse_dentry_revalidate`): an inode a name
+        // just led to, so never an unlinked one, the only kind whose
+        // `forget` frees anything (`View::forget_unlinked`).
         self.vfs.forget(ino.0);
     }
 

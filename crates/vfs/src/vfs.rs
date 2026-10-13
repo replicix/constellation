@@ -62,7 +62,9 @@ pub trait Vfs: Send + Sync + 'static {
     /// `FORGET`, sent when the kernel evicts the inode). What a view
     /// kept to answer for an inode it removed while still referenced (an
     /// `O_PATH` descriptor, a removed directory that is a process's
-    /// working directory) can go. Ignored by default.
+    /// working directory) can go — an unlinked file's data included, for a
+    /// frontend that declares [`crate::FrontendCaps::reports_forget`]
+    /// (one that does not never calls this). Ignored by default.
     fn forget(&self, ino: Ino) {
         let _ = ino;
     }

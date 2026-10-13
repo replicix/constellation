@@ -173,7 +173,7 @@ use constellation_store_s3::{ChunkStore, CompressionSetting, DecodePriority};
 use constellation_types::Code;
 use constellation_vfs::{
     Attr, Caller, Durability, Entry, FallocateMode, FileKind, FrontendCaps, OpWatch, OpenFlags,
-    PassthroughChunk, PolicyStack, ReadData, SeekWhence,
+    OpenUnlinked, PassthroughChunk, PolicyStack, ReadData, SeekWhence,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek};
@@ -348,6 +348,12 @@ pub struct View {
     /// Inodes this view removed (`nlink` 0, no open handle) that the
     /// kernel may still reference: see [`View::remember_dead`].
     dead: Mutex<DeadInodes>,
+    /// Orphans this view unlinked that its platform may still reference,
+    /// kept until its `forget`, and since when: see
+    /// [`View::reap_after_unlink`]. A last name whose unlink this replica
+    /// has not applied yet sits here too, still named, until the replica
+    /// orphans it or the platform's eviction `forget`s it.
+    unlinked_refs: Mutex<HashMap<Ino, Option<Instant>>>,
     /// The lock owners each open handle locked for: see
     /// [`View::note_lock_handle`].
     lock_handles: Mutex<HashMap<u64, HashSet<(Ino, u64)>>>,
@@ -501,6 +507,7 @@ impl View {
             inode_ops: InodeOps::new(),
             opens: Mutex::new(HashMap::new()),
             dead: Mutex::new(DeadInodes::default()),
+            unlinked_refs: Mutex::new(HashMap::new()),
             lock_handles: Mutex::new(HashMap::new()),
             handles: durable::Handles::default(),
             passthrough: Mutex::new(HashMap::new()),
@@ -596,13 +603,6 @@ impl View {
             .unwrap_or_else(|| self.staging_budget.clone())
     }
 
-    /// The name is gone (a local `unlink` just succeeded): reap the
-    /// orphan now if no handle anywhere on this node keeps it — this
-    /// view's own table *and* every other view's, through the hold
-    /// writer's registry (a second view of the same node used to be
-    /// invisible here, and its open handle lost the inode). Otherwise
-    /// the orphan stays for the handles, and the hold writer is nudged so
-    /// the claim reaches the bucket at once. Returns whether it reaped.
     /// Keep the final attributes of an inode this view removed, for the
     /// kernel references it outlives. A file or directory is gone from
     /// the replica once its last name and handle are, but the kernel may
@@ -610,10 +610,13 @@ impl View {
     /// directory that is some process's working directory — and `fstat`
     /// of that must answer `nlink == 0`, not `ENOENT` (which it did: every
     /// `unlink` through xcheckfs, which stats its `O_PATH` handle after
-    /// the operation, was a mismatch). Dropped at the kernel's `FORGET`
-    /// ([`Vfs::forget`]), or the oldest past [`DEAD_INODES_MAX`]. Inode
-    /// numbers are never reused, so an entry never answers for another
-    /// file.
+    /// the operation, was a mismatch). A file such a reference can also
+    /// reopen stays in the replica instead, under a frontend that keeps
+    /// unlinked inodes ([`View::reap_after_unlink`]); this covers
+    /// directories, and files under any other. Dropped at the kernel's
+    /// `FORGET` ([`Vfs::forget`]), or the oldest past [`DEAD_INODES_MAX`].
+    /// Inode numbers are never reused, so an entry never answers for
+    /// another file.
     pub(crate) fn remember_dead(&self, mut attr: FileAttr) {
         attr.nlink = 0;
         attr.ctime_ns = constellation_fs_core::types::now_ns();
@@ -676,15 +679,59 @@ impl View {
             .unwrap_or_default()
     }
 
+    /// The name is gone (a local `unlink` just succeeded): reap the
+    /// orphan now if no handle anywhere on this node keeps it — this
+    /// view's own table *and* every other view's, through the hold
+    /// writer's registry (a second view of the same node used to be
+    /// invisible here, and its open handle lost the inode). Otherwise
+    /// the orphan stays for the handles, and the hold writer is nudged so
+    /// the claim reaches the bucket at once. Returns whether it reaped.
+    ///
+    /// The kernel's own references count too. Answering `fstat` of one
+    /// (the dead attributes above, kept when this reaped) was not enough:
+    /// a platform that keeps unlinked inodes usable holds what it
+    /// unlinked until it lets go — an `O_PATH` descriptor, or an open
+    /// handle closed later, reopens it (`open("/proc/self/fd/N")`), as on
+    /// any local filesystem. Under a frontend that reports that
+    /// ([`View::keeps_referenced`]), the orphan, its data and its write
+    /// session stay until its `forget` ([`View::forget_unlinked`]), not
+    /// only until the last close. The view reports it as open meanwhile
+    /// (`holds::OpenHandles`): the reaper leaves it, a rebuild carries it,
+    /// and a hold claims its chunks once the reference outlives a short
+    /// grace (`holds::Holds::claim_after`; the hold writer is told to
+    /// wake for it) — the common case, the unlink's own lookup let go of
+    /// as the unlink returns, costs no hold write.
     pub(crate) fn reap_after_unlink(&self, ino: Ino) -> bool {
+        // An orphan, or a last name whose unlink this replica has yet to
+        // apply ([`View::unlinking`]): it becomes one there.
+        let referenced = self.keeps_referenced()
+            && (self.orphaned(ino)
+                || (self.unlinked_referenced(ino)
+                    && matches!(self.meta.getattr(ino), Ok(Some(_)))));
+        {
+            let mut refs = self.unlinked_refs.lock().unwrap();
+            if referenced {
+                refs.insert(ino, Some(Instant::now()));
+            } else {
+                refs.remove(&ino);
+            }
+        }
+        // A handle, not a reference (this view's own included): the claim
+        // it needs is published at once.
         let open_here = self.opens.lock().unwrap().get(&ino).copied().unwrap_or(0) > 0;
         let open_elsewhere = self
             .holds
             .as_ref()
-            .is_some_and(|h| h.sources().is_open(ino));
+            .is_some_and(|h| h.sources().has_handle(ino));
         if open_here || open_elsewhere {
             if let Some(h) = &self.holds {
                 h.nudge();
+            }
+            return false;
+        }
+        if referenced {
+            if let Some(h) = &self.holds {
+                h.wake_in(h.claim_after());
             }
             return false;
         }
@@ -695,6 +742,112 @@ impl View {
         }
         let _ = self.meta.reap_orphan(ino);
         true
+    }
+
+    /// Whether this view keeps the files it unlinks for its platform's
+    /// references until their `forget`: only under a frontend that keeps
+    /// unlinked inodes *and* declares that it reports letting go
+    /// ([`FrontendCaps::reports_forget`]) — kept for a host that sends
+    /// no `forget`, one would never be reaped.
+    pub(crate) fn keeps_referenced(&self) -> bool {
+        self.caps.open_unlinked == OpenUnlinked::Keep && self.caps.reports_forget
+    }
+
+    /// The last name of `attr`'s inode is about to go: report it as
+    /// referenced before it does, so the hold writer's reaper — which
+    /// reads the orphans before what the views report — never finds the
+    /// orphan unreported between the unlink and
+    /// [`View::reap_after_unlink`], which settles it (as
+    /// [`View::unlink_failed`] does if the name stays).
+    pub(crate) fn unlinking(&self, attr: &FileAttr) {
+        if self.keeps_referenced() && attr.kind != InodeKind::Dir && attr.nlink <= 1 {
+            self.unlinked_refs
+                .lock()
+                .unwrap()
+                .entry(attr.ino)
+                .or_insert(Some(Instant::now()));
+        }
+    }
+
+    /// The unlink [`View::unlinking`] announced failed: drop the report
+    /// unless `ino` is an orphan after all (a concurrent unlink won).
+    pub(crate) fn unlink_failed(&self, ino: Ino) {
+        if !self.orphaned(ino) {
+            self.unlinked_refs.lock().unwrap().remove(&ino);
+        }
+    }
+
+    /// `NotFound` for an op on inode `ino` itself (not a name), answered
+    /// `Stale` once the replica has no such inode at all and this view
+    /// did not remove it. The platform only names inodes this view handed
+    /// out, so one the replica lacks was removed after it was looked up
+    /// here — by another node, or another view of this one, whose unlink
+    /// this view's [`View::reap_after_unlink`] could not keep it for —
+    /// and a stale handle is what that is (NFS's `ESTALE`). Every op
+    /// addressed to an inode answers so: `getattr`, `setattr`, `open`,
+    /// `readlink`, `link` (its source), `read`, `write`, `flush`,
+    /// `fsync`, `fallocate`, `seek`, `readdir` and the xattr ops. A
+    /// kernel retries a path walk that met `ESTALE` with the names
+    /// re-looked-up, so `stat` or `open` of a missing *name* still
+    /// answers `ENOENT`, from `lookup`, and so do the ops addressed by a
+    /// parent and a name; what answers `ESTALE` is a reference that
+    /// outlived the inode (`/proc/self/fd/N` of an `O_PATH` descriptor).
+    /// An inode this view removed itself answers from
+    /// [`View::remember_dead`] (a removed directory's `readdir` stays
+    /// `ENOENT`, as on a local filesystem, while its entry lives: until
+    /// the kernel's `FORGET`, or past [`DEAD_INODES_MAX`] newer ones) or
+    /// from the replica until the kernel's `FORGET`. The view's own
+    /// synthetic inodes (`.constellation`, snapshot mirrors) are never in
+    /// the replica: their `NotFound` stays. Free unless `code` is
+    /// `NotFound`.
+    pub(crate) fn gone(&self, ino: Ino, code: Code) -> Code {
+        if code != Code::NotFound || View::is_synthetic(ino) {
+            return code;
+        }
+        let missing = matches!(self.meta.getattr(ino), Ok(None))
+            && matches!(self.meta.scratch_getattr(ino), Ok(None))
+            && self.dead_attr(ino).is_none();
+        if missing {
+            Code::Stale
+        } else {
+            code
+        }
+    }
+
+    /// Whether `ino` is an orphan this view's platform may still
+    /// reference ([`View::reap_after_unlink`]).
+    pub(crate) fn unlinked_referenced(&self, ino: Ino) -> bool {
+        self.unlinked_refs.lock().unwrap().contains_key(&ino)
+    }
+
+    /// The platform let go of `ino` ([`Vfs::forget`]): an orphan its
+    /// reference kept is reaped, with its write session — unless a handle
+    /// here still has it (its last close reaps it), and keeping the
+    /// record for another view that has it open or references it (that
+    /// view's close or `forget`, or the hold writer's reaper, reaps it).
+    pub(crate) fn forget_unlinked(&self, ino: Ino) {
+        let Some(since) = self.unlinked_refs.lock().unwrap().remove(&ino) else {
+            return;
+        };
+        if self.opens.lock().unwrap().contains_key(&ino) || !self.orphaned(ino) {
+            return;
+        }
+        // Nothing in this view reaches it any more.
+        self.drop_writes(ino);
+        let Some(holds) = &self.holds else {
+            let _ = self.meta.reap_orphan(ino);
+            return;
+        };
+        if !holds.sources().is_open(ino) {
+            let _ = self.meta.reap_orphan(ino);
+            // A reference that outlived the grace (or crossed a handover)
+            // may be claimed: withdrawn now rather than at the next
+            // refresh. The common one, the unlinking lookup's own, never
+            // was, and costs no pass.
+            if since.is_none_or(|since| since.elapsed() >= holds.claim_after()) {
+                holds.nudge();
+            }
+        }
     }
 
     /// Logical used space for the *mounted view*: `(bytes, file_count)`.
@@ -974,7 +1127,17 @@ impl View {
 /// The open-orphan hold writer's view of this filesystem (`crate::holds`).
 impl crate::holds::OpenHandles for View {
     fn open_inos(&self) -> Vec<Ino> {
-        self.opens.lock().unwrap().keys().copied().collect()
+        let mut inos: Vec<Ino> = self.opens.lock().unwrap().keys().copied().collect();
+        inos.extend(self.unlinked_refs.lock().unwrap().keys());
+        inos
+    }
+
+    fn referenced(&self) -> Vec<(Ino, Option<Instant>)> {
+        let refs = self.unlinked_refs.lock().unwrap().clone();
+        let opens = self.opens.lock().unwrap();
+        refs.into_iter()
+            .filter(|(ino, _)| !opens.contains_key(ino))
+            .collect()
     }
 }
 

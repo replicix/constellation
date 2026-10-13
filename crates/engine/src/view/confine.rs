@@ -104,9 +104,10 @@ impl View {
         if self.reach.contains(ino) {
             return Ok(ino);
         }
-        // Open through this view (an unlinked-open orphan has no name to
-        // walk from, but was reachable when it was opened here).
-        if self.opens.lock().unwrap().contains_key(&ino) {
+        // Open through this view, or unlinked through it while its
+        // platform still references it (an orphan has no name to walk
+        // from, but was reachable when it was opened or unlinked here).
+        if self.opens.lock().unwrap().contains_key(&ino) || self.unlinked_referenced(ino) {
             return Ok(ino);
         }
         match self.dominated(ino, true) {
