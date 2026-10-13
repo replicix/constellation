@@ -79,7 +79,14 @@ Locks work on two levels:
   by `(node, inode)` and never sees byte ranges or lock owners.
 - **Local locks** are the kernel's lock requests from this node's
   processes, keyed by the kernel's lock owner, with POSIX byte ranges.
-  They are resolved on the node, under the grant it holds.
+  They are resolved on the node, under the grant it holds, and kept as
+  Linux keeps them (`posix_lock_inode`): an owner's touching or
+  overlapping ranges of one type merged into one, a range of the other
+  type inside one splitting it, each owner's locks in start order, and
+  the owners in the order of their first lock on the file. A `getlk`
+  answered on the node names the lock Linux would name, the first in
+  that order that is in the way: a whole merged range, never a piece
+  of one.
 
 A node keeps a grant after its last application unlocks. An
 uncontended re-lock by the same node therefore costs no message: SQLite
@@ -123,6 +130,22 @@ with each command's exit). Past that, or when a lock request, unlock or
 test through the description shows it open, the request is refused at
 once. A close that was not the last (a `dup`'s) is followed by no
 `RELEASE`, so a request in its shadow is refused late, never wrongly.
+A lock test that another lock is in the way of too does not wait, and
+names that other lock, as Linux, which dropped the closed
+description's locks at the close, does.
+
+The kernel names an OFD or `flock` lock owner after the open file
+description, and a description opened right after another's last
+close can take its place in memory, and so its owner id, before that
+one's `RELEASE` arrives. A lock request of that owner through the new
+description waits for the old `RELEASE` first (within the same bounds),
+so the closed description's locks go with it instead of passing to the
+new description. A POSIX owner locking through another description
+after a different process closed one it shares is followed by no
+`RELEASE`: it waits out the close window at most, and keeps its locks. A late `RELEASE` names its description's `flock` owner; when a new
+description at that address holds the id by then (it unlocked before
+the close, so its successor did not wait), the new description's locks
+are left alone.
 Nothing is released before its `RELEASE`.
 
 A mount served by a single FUSE worker (`CONSTELLATION_FUSE_THREADS=1`,
@@ -948,8 +971,6 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   non-blocking lock may fail once against such a grant before the recall
   frees it. If the owning sequencer cannot be reached, `getlk` reports
   the file as unlocked.
-- **Adjacent ranges of one owner are not merged**, so `getlk` can
-  report a piece of a range.
 - **What the fences cannot see.** An operation admitted while the grant
   was honoured, whose effect lands after the lapse, is caught by the
   fencing token in these cases: a forward stalled in flight, a retry or

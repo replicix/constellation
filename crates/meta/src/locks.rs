@@ -1921,6 +1921,25 @@ impl LockTables {
         end: u64,
         now_ms: i64,
     ) -> LocalOutcome {
+        self.local_test_going_last(ino, owner, write, start, end, now_ms, |_| false)
+    }
+
+    /// [`Self::local_test`] that names a lock of an owner `going` names
+    /// (one of a description on its way out, whose locks Linux has
+    /// dropped already: the engine's `lock_handles`) only when no other
+    /// lock is in the way. It is still in the way here: the caller waits
+    /// for it to go.
+    #[allow(clippy::too_many_arguments)]
+    pub fn local_test_going_last(
+        &self,
+        ino: u64,
+        owner: u64,
+        write: bool,
+        start: u64,
+        end: u64,
+        now_ms: i64,
+        going: impl Fn(u64) -> bool,
+    ) -> LocalOutcome {
         let need = if write {
             LockMode::Exclusive
         } else {
@@ -1928,9 +1947,13 @@ impl LockTables {
         };
         let g = self.lock();
         if let Some(v) = g.local.get(&ino) {
+            let conflicts =
+                |l: &&LocalLock| l.owner != owner && l.overlaps(start, end) && (write || l.write);
             if let Some(c) = v
                 .iter()
-                .find(|l| l.owner != owner && l.overlaps(start, end) && (write || l.write))
+                .filter(conflicts)
+                .find(|l| !going(l.owner))
+                .or_else(|| v.iter().find(conflicts))
             {
                 return LocalOutcome::Conflict(*c);
             }
@@ -2011,7 +2034,9 @@ impl LockTables {
         // into one: `F_GETLK` then reports the whole lock, not the piece
         // set last (xcheckfs saw ext4 answer 4+24 where this said 4+8).
         // The ranges merged are only that owner's same-type locks (an
-        // owner's locks never overlap), so cutting the union is exact.
+        // owner's locks never overlap, and none of one type touch: one
+        // pass finds every lock the union touches), so cutting the union
+        // is exact. The result goes where Linux keeps it (`place`).
         let mut lock = lock;
         for l in v.iter() {
             if l.owner == lock.owner
@@ -2023,8 +2048,9 @@ impl LockTables {
                 lock.end = lock.end.max(l.end);
             }
         }
+        let block = v.iter().position(|l| l.owner == lock.owner);
         Self::cut(v, lock.owner, lock.start, lock.end);
-        v.push(lock);
+        v.insert(Self::place(v, &lock, block), lock);
         if was_empty {
             self.local_inos.fetch_add(1, Ordering::Relaxed);
         }
@@ -2113,7 +2139,35 @@ impl LockTables {
         self.lock().local.get(&ino).is_none_or(|v| v.is_empty())
     }
 
-    /// POSIX range subtraction for one owner.
+    /// Where `lock` goes in a file's list, as Linux keeps it
+    /// (`posix_lock_inode`): each owner's locks together, sorted by
+    /// start, the owners in the order their first lock came. `F_GETLK`
+    /// then names the first lock in the way that the kernel would
+    /// ([`Self::local_test`]). `v` holds no lock of `lock`'s owner that
+    /// overlaps it ([`Self::cut`]); `block`: where the owner's locks
+    /// began before that cut. A lock that replaced all of them (merged
+    /// with them, or over them) keeps their place, as the kernel extends
+    /// or replaces the lock in its list; an owner that had none comes
+    /// last.
+    fn place(v: &[LocalLock], lock: &LocalLock, block: Option<usize>) -> usize {
+        let Some(first) = v.iter().position(|l| l.owner == lock.owner) else {
+            // The cut removed only that owner's locks, all at and after
+            // `block`: the others before it are where they were.
+            return block.map_or(v.len(), |b| b.min(v.len()));
+        };
+        let block = v[first..]
+            .iter()
+            .position(|l| l.owner != lock.owner)
+            .map_or(v.len(), |n| first + n);
+        v[first..block]
+            .iter()
+            .position(|l| l.start > lock.start)
+            .map_or(block, |n| first + n)
+    }
+
+    /// POSIX range subtraction for one owner: remove `owner`'s locks
+    /// within `[start, end]`, keeping what is left of each in its place
+    /// (a lock cut in two leaves both pieces there, in order).
     fn cut(v: &mut Vec<LocalLock>, owner: u64, start: u64, end: u64) {
         let mut out = Vec::with_capacity(v.len() + 1);
         for l in v.drain(..) {
@@ -2192,6 +2246,148 @@ mod tests {
             start,
             end,
         }
+    }
+
+    /// A table with a whole-file exclusive grant held on inode 7.
+    fn granted() -> LockTables {
+        let t = LockTables::default();
+        t.install_held(7, held(LockMode::Exclusive, i64::MAX));
+        t
+    }
+
+    /// `(owner, write, start, end)` of each local lock on inode 7, in
+    /// the table's order.
+    fn table(t: &LockTables) -> Vec<(u64, bool, u64, u64)> {
+        t.local_locks(7)
+            .iter()
+            .map(|l| (l.owner, l.write, l.start, l.end))
+            .collect()
+    }
+
+    /// Finding 12 (xcheckfs, ext4 against a mount): `F_GETLK` names the
+    /// lock Linux names, the first conflicting one in its list, which
+    /// keeps each owner's locks together, in the order the owners first
+    /// locked the file, and sorted by start (`posix_lock_inode`). The
+    /// table appended each new lock instead: owner 10's `W[58,75]` then
+    /// `W[29,38]`, tested by owner 11 over the whole file, answered
+    /// 58+18 where ext4 answers 29+10.
+    #[test]
+    fn a_test_names_the_first_conflicting_lock_in_the_kernels_order() {
+        let t = granted();
+        let test = |owner, start, end| match t.local_test(7, owner, true, start, end, 0) {
+            LocalOutcome::Conflict(l) => Some((l.owner, l.start, l.end)),
+            _ => None,
+        };
+        assert_eq!(t.local_set(7, lk(10, true, 58, 75), 0), LocalOutcome::Done);
+        assert_eq!(t.local_set(7, lk(10, true, 29, 38), 0), LocalOutcome::Done);
+        assert_eq!(test(11, 1, u64::MAX), Some((10, 29, 38)));
+        // Owners in the order they first locked the file, whatever their
+        // ranges: owner 12's lower range comes after owner 10's.
+        assert_eq!(t.local_set(7, lk(12, true, 0, 9), 0), LocalOutcome::Done);
+        assert_eq!(test(11, 0, u64::MAX), Some((10, 29, 38)));
+        assert_eq!(
+            table(&t),
+            [(10, true, 29, 38), (10, true, 58, 75), (12, true, 0, 9)]
+        );
+        // A lock that replaces all of an owner's locks keeps their place
+        // (lockdiff on the mount: B `W[26,43]`, A `W[58,69]`, B
+        // `W[42,51]`, C tests `W[46,68]`: ext4 names B's 26+26).
+        let u = granted();
+        assert_eq!(u.local_set(7, lk(20, true, 26, 43), 0), LocalOutcome::Done);
+        assert_eq!(u.local_set(7, lk(21, true, 58, 69), 0), LocalOutcome::Done);
+        assert_eq!(u.local_set(7, lk(20, true, 42, 51), 0), LocalOutcome::Done);
+        match u.local_test(7, 22, true, 46, 68, 0) {
+            LocalOutcome::Conflict(l) => assert_eq!((l.owner, l.start, l.end), (20, 26, 51)),
+            other => panic!("{other:?}"),
+        }
+        // So does one of the other type over all of them.
+        assert_eq!(u.local_set(7, lk(20, false, 20, 55), 0), LocalOutcome::Done);
+        assert_eq!(table(&u), [(20, false, 20, 55), (21, true, 58, 69)]);
+        // An owner that unlocked everything and locks again comes last.
+        t.local_unlock(7, 10, 0, u64::MAX, 0);
+        assert_eq!(t.local_set(7, lk(10, true, 20, 29), 0), LocalOutcome::Done);
+        assert_eq!(test(11, 0, u64::MAX), Some((12, 0, 9)));
+        assert_eq!(table(&t), [(12, true, 0, 9), (10, true, 20, 29)]);
+    }
+
+    /// An owner's locks as Linux keeps them: touching or overlapping
+    /// ranges of one type merged into one (`F_GETLK` reports the whole
+    /// run, never a piece of it), a lock of the other type inside one
+    /// splitting it, an unlock cutting it, each in start order.
+    #[test]
+    fn an_owners_locks_are_merged_split_and_ordered_as_the_kernel_keeps_them() {
+        let t = granted();
+        let set = |write, start, end| {
+            assert_eq!(
+                t.local_set(7, lk(10, write, start, end), 0),
+                LocalOutcome::Done
+            )
+        };
+        set(true, 0, 19);
+        // A read lock inside its own write lock splits it.
+        set(false, 5, 9);
+        assert_eq!(
+            table(&t),
+            [(10, true, 0, 4), (10, false, 5, 9), (10, true, 10, 19)]
+        );
+        // Converted back: one write lock again.
+        set(true, 5, 9);
+        assert_eq!(table(&t), [(10, true, 0, 19)]);
+        // A partial unlock cuts it; filling the hole merges it again.
+        t.local_unlock(7, 10, 8, 11, 0);
+        assert_eq!(table(&t), [(10, true, 0, 7), (10, true, 12, 19)]);
+        set(true, 8, 11);
+        assert_eq!(table(&t), [(10, true, 0, 19)]);
+        // Touching ranges merge, both sides at once.
+        set(true, 30, 34);
+        set(true, 40, 44);
+        set(true, 35, 39);
+        assert_eq!(table(&t), [(10, true, 0, 19), (10, true, 30, 44)]);
+        // A range to the end merges what it touches before it.
+        set(true, 45, u64::MAX);
+        assert_eq!(table(&t), [(10, true, 0, 19), (10, true, 30, u64::MAX)]);
+        // A read lock over the end of one write run and into a gap:
+        // merged with nothing of the other type.
+        set(false, 15, 25);
+        assert_eq!(
+            table(&t),
+            [
+                (10, true, 0, 14),
+                (10, false, 15, 25),
+                (10, true, 30, u64::MAX)
+            ]
+        );
+        // A test by another owner names the whole run in its way.
+        match t.local_test(7, 11, false, 40, 41, 0) {
+            LocalOutcome::Conflict(l) => assert_eq!((l.start, l.end), (30, u64::MAX)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A test names the locks of owners its caller says are going (those
+    /// of a description whose `RELEASE` is on its way, gone on Linux)
+    /// last: the first other lock in the way, theirs only when no other
+    /// lock is (they are still held here, and the caller waits for them).
+    #[test]
+    fn a_test_names_the_locks_of_owners_on_their_way_out_last() {
+        let t = granted();
+        assert_eq!(t.local_set(7, lk(10, true, 48, 48), 0), LocalOutcome::Done);
+        assert_eq!(
+            t.local_set(7, lk(12, false, 53, u64::MAX), 0),
+            LocalOutcome::Done
+        );
+        let test =
+            |going: u64| match t.local_test_going_last(7, 11, true, 43, 66, 0, |o| o == going) {
+                LocalOutcome::Conflict(l) => Some((l.owner, l.start, l.end)),
+                _ => None,
+            };
+        assert_eq!(test(0), Some((10, 48, 48)));
+        assert_eq!(test(10), Some((12, 53, u64::MAX)));
+        assert_eq!(test(12), Some((10, 48, 48)));
+        t.local_release_owner(7, 12, 0);
+        assert_eq!(test(10), Some((10, 48, 48)));
+        t.local_release_owner(7, 10, 0);
+        assert_eq!(test(10), None);
     }
 
     #[test]

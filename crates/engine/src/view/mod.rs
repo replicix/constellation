@@ -663,8 +663,27 @@ impl View {
     /// description's locks. A lock request through `fh` also proves its
     /// description open ([`View::note_handle_closed`]), as an unlock or a
     /// test through it does ([`View::note_handle_open`]).
-    pub(crate) fn note_lock_handle(&self, fh: constellation_vfs::Fh, ino: Ino, owner: u64) {
-        self.lock_handles.note(fh.0, ino, owner);
+    ///
+    /// Waits first, until `deadline` at most, for the `RELEASE` of a
+    /// just-closed description whose locks `owner` still holds
+    /// ([`lock_handles::LockHandles::note`]).
+    pub(crate) fn note_lock_handle(
+        &self,
+        fh: constellation_vfs::Fh,
+        ino: Ino,
+        owner: u64,
+        locks: &crate::locks::ClusterLocks,
+        deadline: std::time::Instant,
+    ) {
+        self.lock_handles
+            .note(fh.0, ino, owner, self.closing_window(), deadline, || {
+                locks
+                    .meta
+                    .locks()
+                    .local_locks(ino)
+                    .iter()
+                    .any(|l| l.owner == owner)
+            });
     }
 
     /// `fh` is being released: drop the locks of `flock` (the owner
@@ -693,6 +712,12 @@ impl View {
     pub(crate) fn set_single_worker(&self, single: bool) {
         self.single_worker
             .store(single, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The owners of locks on `ino` whose description's `RELEASE` is on
+    /// its way ([`lock_handles::LockHandles::closing_owners`]).
+    pub(crate) fn closing_lock_owners(&self, ino: Ino) -> std::collections::HashSet<u64> {
+        self.lock_handles.closing_owners(ino, self.closing_window())
     }
 
     /// How long after a close a request waits for the closed
@@ -725,8 +750,8 @@ impl View {
     /// not delivered yet, wait for those and ask again (the `lock_handles`
     /// module doc). Asked once more when a release dropped what was in
     /// its way between the refusal and the look. Never waits past
-    /// [`crate::locks::close_wait`] from its start, however many closes
-    /// renew the windows meanwhile.
+    /// `deadline` ([`crate::locks::close_wait`] from the request's
+    /// start), however many closes renew the windows meanwhile.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn past_closing_locks<T>(
         &self,
@@ -735,10 +760,10 @@ impl View {
         owner: u64,
         (start, end): (u64, u64),
         write: bool,
+        deadline: std::time::Instant,
         mut attempt: impl FnMut(std::time::Instant) -> T,
         refused: impl Fn(&T) -> bool,
     ) -> T {
-        let deadline = std::time::Instant::now() + crate::locks::close_wait();
         let window = self.closing_window();
         let conflicts = || {
             let mut owners: Vec<u64> = locks

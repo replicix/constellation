@@ -438,6 +438,10 @@ impl ClusterLocks {
     /// pid))`; `None` when there is none. `write: false` asks about any
     /// lock (a read test, or `F_UNLCK`). Another node's grant answers as a
     /// whole-file lock with pid 0.
+    ///
+    /// `going`: owners whose locks go with a description on its way out
+    /// (the view's `lock_handles`), named only when no other lock is in
+    /// the way, as Linux, which dropped them already, names that one.
     pub fn test(
         &self,
         ino: Ino,
@@ -445,12 +449,17 @@ impl ClusterLocks {
         start: u64,
         end: u64,
         write: bool,
+        going: impl Fn(u64) -> bool,
     ) -> Option<(u64, u64, bool, u32)> {
-        match self
-            .meta
-            .locks()
-            .local_test(ino, owner, write, start, end, now_ms())
-        {
+        match self.meta.locks().local_test_going_last(
+            ino,
+            owner,
+            write,
+            start,
+            end,
+            now_ms(),
+            going,
+        ) {
             LocalOutcome::Conflict(l) => Some((l.start, l.end.min(OFFSET_MAX), l.write, l.pid)),
             // (`local_test` never answers `Predecessor`: only a lock
             // waits for an earlier turn.)

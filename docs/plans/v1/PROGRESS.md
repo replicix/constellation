@@ -46492,3 +46492,124 @@ clippy `-D warnings` clean.
   `fuse_flush` on the last close) would make the wait unnecessary.
 - Across nodes nothing changed: a non-blocking request from another node
   is refused while the holder's grant is recalled, as before.
+
+## Fix: `F_GETLK` named a lock Linux does not (finding 12, 2026-10-13)
+
+### Cause
+
+xcheckfs `engine_locks::random_lock_traffic_single_thread` (ext4 against
+a `--locks cluster` mount, OFD locks, three owners) failed every run:
+`getlk ... primary=type 0 53+0 secondary=type 1 48+1`. The finding read
+it as a piece of an unmerged run, but an owner's touching same-type
+ranges have been merged since `8a6f96c`. A trace of the view's lock
+table at that op (seed 77, op 3161) showed two other causes:
+
+- **A lock of a description on its way out.** Owner 0 held `W[48,48]`
+  and closed its descriptor; its `RELEASE` arrived 4 µs after owner 1's
+  `F_OFD_GETLK W[43,66]`. Owner 2's live `R[53,EOF]` was in the way too,
+  so the close wait (`2598b1e`) rightly did not wait, but the test named
+  the first conflict in the table, owner 0's lock. Linux dropped that at
+  the close and names owner 2's.
+- **A closed description's locks passed to a new one.** The kernel
+  names an OFD (or `flock`) owner after its `struct file`; owner 2's
+  descriptor, reopened after a close, can get the freed address, and so
+  the same owner id, before the old `RELEASE` arrives. Its first lock
+  moved the owner to the new handle (`8a6f96c`'s binding), so the old
+  `RELEASE` found nothing of the owner's to drop, and the closed
+  description's ranges stayed under the new one, merged with its own
+  (seed 77, op 214: `R[4,17]` named, no owner holding that run), until
+  the new description was released: a lock held by nobody on Linux,
+  refusing other owners' requests.
+- **Which lock is named.** Linux keeps a file's POSIX/OFD locks in one
+  list (`posix_lock_inode`): each owner's locks together and sorted by
+  start, the owners in the order of their first lock (a lock merged with
+  or replacing an owner's locks keeps their place; an owner that had
+  none goes last), and `posix_test_lock` names the first conflict in it.
+  The table appended each new lock: owner B `W[58,75]` then `W[29,38]`,
+  owner C testing `W[1,EOF]` got 58+18 where ext4 answers 29+10
+  (`lockdiff.py`'s minimal case). POSIX allows either; xcheckfs allows
+  either, but a differential run diverged at op 25 of 6000.
+
+### What changed
+
+- `meta::locks::LockTables::local_set` inserts a lock where Linux keeps
+  it (`place`): within the owner's block in start order, the block where
+  it was before the request's cut, or last for an owner with none.
+  `cut` keeps what is left of each lock in its place. Merging (touching
+  or overlapping same-type ranges of one owner) and splitting are
+  unchanged and now tested.
+- `local_test_going_last`: a test names a lock of an owner its caller
+  says is going only when no other lock is in the way. The view passes
+  the owners bound to a description whose last close was answered
+  within the close window (`LockHandles::closing_owners`, a snapshot
+  taken before the lock table's mutex, keeping the handles-then-table
+  lock order); with only those in the way the test still waits for the
+  `RELEASE` as before.
+- `LockHandles::note`: a lock request of an owner that still holds
+  locks on the file and is bound to another handle whose close was
+  answered within the close window waits for that handle's `RELEASE`
+  (or the window's end, never past the request's deadline, which
+  `lock_acquire` now takes once for every wait) before moving the
+  owner. The reused-id case: the `RELEASE` comes and drops the closed
+  description's locks. A POSIX owner locking through a second
+  description after another process closed a shared one: no `RELEASE`
+  follows, the request goes on after the window with every lock kept,
+  as before (nothing is ever dropped early).
+- `LockHandles::release` drops the owner the kernel names in a
+  `RELEASE` (`FUSE_RELEASE_FLOCK_UNLOCK`) only when no other handle
+  binds it (review): bound to a handle still open, that `struct
+  file`-named owner is a new description at the old one's address.
+  `flock(fd1, LOCK_EX); flock(fd1, LOCK_UN); close(fd1); fd2 = open();
+  flock(fd2, LOCK_EX)` takes no wait (nothing held at the close), and
+  `fd1`'s late `RELEASE` dropped `fd2`'s live lock, which another
+  process could then take.
+- Cluster level: unchanged. The sequencer's grants are whole-inode and
+  carry no ranges or owners; a test answered from another node's grant
+  still reports a whole-file lock (cluster-locks.md, Limits).
+- Docs: cluster-locks.md (how local locks are kept and which one `getlk`
+  names; the stale "not merged" limit removed; the close section).
+
+### Gates
+
+New tests, failing on `41e46ef`: meta
+`a_test_names_the_first_conflicting_lock_in_the_kernels_order` (58+18
+for 29+10), `an_owners_locks_are_merged_split_and_ordered_as_the_kernel_keeps_them`
+(order only: merging and splitting were right); engine
+`a_test_names_a_live_lock_before_one_whose_release_is_on_its_way`
+(named the closing `W[48,48]`), `a_reused_owner_id_does_not_adopt_the_closed_descriptions_locks`
+(`R[4,20]` left after the old `RELEASE`, for `R[13,20]`). Also new:
+`a_test_names_the_locks_of_owners_on_their_way_out_last`,
+`a_posix_owner_keeps_its_locks_when_another_process_closes_a_shared_description`,
+`a_request_holding_nothing_does_not_wait_for_the_old_release`. After
+review, failing without the `release` guard:
+`a_late_flock_release_spares_a_reused_owners_new_lock`,
+`an_unlocked_closed_descriptions_late_release_spares_the_new_flock`
+(both: the new description's lock dropped),
+`a_late_release_leaves_a_reused_flock_owner_alone`.
+
+On the box (Linux 7.3, `file://`, `--locks cluster`): xcheckfs
+`engine_locks` (ext4 primary) failed 3 of 3 before with the reported
+mismatch, passes 3 of 3 after (21 tests). Seed 77 replayed as xcheckfs
+drives a backend (`fragcheck`): a named lock that is no whole run of any
+owner in 1 of 15 runs before the reuse fix, 0 of 20 after. `lockdiff.py`
+against ext4: diverged at op 25 of 6000 before, no divergence after
+(every `F_OFD_GETLK` names the lock ext4 names). Finding 05's
+reproducers: 2000/2000 and 2000/2000, 0 of 5000 first-attempt failures.
+`cargo test --workspace`: 2868 passed, 2 failed
+(`the_engine_view_conforms`, `the_caps_of_linux_fuse_are_derived_from_its_declaration`,
+failing the same way on main). `cargo fmt --check`, workspace clippy
+`-D warnings` clean.
+
+### Open
+
+- A merged lock carries the pid of the piece set last, where Linux
+  keeps the lowest-start touching lock's; it differs only for an owner
+  shared across processes (an OFD inherited by a child), and the owner
+  fence uses it.
+- The `flock` case of the reused owner id (a late `RELEASE` naming it
+  dropped the new description's live lock) is fixed (above).
+- A test answered from another node's grant still names the whole file
+  (pid 0): the sequencer's grants carry no ranges.
+- The reused-id wait is bounded like the close wait: a `RELEASE` held
+  back past it lets the closed description's locks pass to the new one
+  as before.

@@ -1266,3 +1266,237 @@ fn a_single_worker_does_not_wait_for_a_closing_description() {
     try_lock(&f, &caller, ino, b, 0xb).unwrap();
     release(&f, &caller, ino, b);
 }
+
+/// A lock of `owner` through `fh`, `write` or not, on `[start, end]`.
+fn lock_range(
+    f: &Fenced,
+    caller: &Caller,
+    ino: Ino,
+    fh: Fh,
+    owner: u64,
+    write: bool,
+    (start, end): (u64, u64),
+) -> VfsResult<()> {
+    Blocking::run(|r| {
+        f.fs.lock_acquire(
+            &OpCtx::new(OpKind::LockAcquire, caller),
+            ino,
+            fh,
+            LockSpec {
+                owner: LockOwner(owner),
+                range: LockRange { start, end },
+                kind: if write {
+                    LockKind::Write
+                } else {
+                    LockKind::Read
+                },
+                pid: 0,
+            },
+            false,
+            r,
+        )
+    })
+}
+
+/// Finding 12 (xcheckfs, seed 77, op 3161): a description holding
+/// `W[48,48]` is closed, and before its `RELEASE` arrives another owner
+/// tests `W[43,66]`, which another description's live `R[53,EOF]` is in
+/// the way of too. The test does not wait (a live lock is in the way),
+/// and it named the closing description's lock, the first in the table,
+/// where Linux, which dropped that one at the close, names the live one.
+#[test]
+fn a_test_names_a_live_lock_before_one_whose_release_is_on_its_way() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "going");
+    let c = f.open_write(&caller, ino).unwrap().fh;
+    lock_range(&f, &caller, ino, a, 0xa, true, (48, 48)).unwrap();
+    lock_range(&f, &caller, ino, c, 0xc, false, (53, u64::MAX >> 1)).unwrap();
+    close(&f, &caller, ino, a);
+    let started = Instant::now();
+    let found = Blocking::run(|r| {
+        f.fs.lock_test(
+            &OpCtx::new(OpKind::LockTest, &caller),
+            ino,
+            b,
+            LockSpec {
+                owner: LockOwner(0xb),
+                range: LockRange { start: 43, end: 66 },
+                kind: LockKind::Write,
+                pid: 0,
+            },
+            r,
+        )
+    })
+    .unwrap();
+    assert!(
+        matches!(
+            found,
+            LockStatus::Locked {
+                range: LockRange { start: 53, .. },
+                kind: LockKind::Read,
+                ..
+            }
+        ),
+        "{found:?}"
+    );
+    assert!(
+        started.elapsed() < crate::locks::close_wait(),
+        "a live lock is in the way: no wait"
+    );
+    release(&f, &caller, ino, a);
+    release(&f, &caller, ino, c);
+}
+
+/// Finding 12, the other cause: the kernel names an OFD owner after its
+/// `struct file`, and a description opened right after another's last
+/// close can get its address, and so its owner id, before that one's
+/// `RELEASE` arrives. Its first lock moved the owner to the new handle,
+/// with the closed description's locks still under it (merged with the
+/// new one's): the old `RELEASE` then found nothing of the owner's to
+/// drop, and they stayed, held by nobody on Linux, until the new
+/// description was released. The request now waits for that `RELEASE`.
+#[test]
+fn a_reused_owner_id_does_not_adopt_the_closed_descriptions_locks() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "reused");
+    lock_range(&f, &caller, ino, a, 0xa, false, (4, 17)).unwrap();
+    close(&f, &caller, ino, a);
+    // The new description, at the old one's address: the same owner id.
+    let c = f.open_write(&caller, ino).unwrap().fh;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            release(&f, &caller, ino, a);
+        });
+        lock_range(&f, &caller, ino, c, 0xa, false, (13, 20)).unwrap();
+    });
+    let held: Vec<_> = f
+        .meta
+        .locks()
+        .local_locks(ino)
+        .iter()
+        .map(|l| (l.owner, l.start, l.end))
+        .collect();
+    assert_eq!(held, [(0xa, 13, 20)], "only the new description's lock");
+    lock_range(&f, &caller, ino, b, 0xb, true, (4, 12)).expect("nothing held there any more");
+    release(&f, &caller, ino, b);
+    release(&f, &caller, ino, c);
+}
+
+/// A POSIX owner locks through several descriptions of a file, and
+/// another process's close of one of them (a child's copy) is followed by
+/// no `RELEASE`: its next lock through another description waits out
+/// the close window at most, then goes on with every lock kept.
+#[test]
+fn a_posix_owner_keeps_its_locks_when_another_process_closes_a_shared_description() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, a, b) = two_descriptions(&f, &caller, "shared");
+    lock_range(&f, &caller, ino, a, 0xa, true, (0, 9)).unwrap();
+    close(&f, &caller, ino, a);
+    let started = Instant::now();
+    lock_range(&f, &caller, ino, b, 0xa, true, (30, 39)).unwrap();
+    assert!(
+        started.elapsed() < crate::locks::close_wait() + Duration::from_millis(500),
+        "bounded: {:?}",
+        started.elapsed()
+    );
+    let held: Vec<_> = f
+        .meta
+        .locks()
+        .local_locks(ino)
+        .iter()
+        .map(|l| (l.owner, l.start, l.end))
+        .collect();
+    assert_eq!(held, [(0xa, 0, 9), (0xa, 30, 39)]);
+    release(&f, &caller, ino, a);
+    release(&f, &caller, ino, b);
+}
+
+/// The `RELEASE` of `fh` naming its `flock` owner
+/// (`FUSE_RELEASE_FLOCK_UNLOCK`).
+fn release_flock(f: &Fenced, caller: &Caller, ino: Ino, fh: Fh, owner: u64) {
+    Blocking::run(|r| {
+        f.fs.release(
+            &OpCtx::new(OpKind::Release, caller),
+            ino,
+            fh,
+            OpenFlags::WRITE,
+            Some(LockOwner(owner)),
+            r,
+        )
+    })
+    .unwrap();
+}
+
+/// [`a_late_release_spares_a_reused_owners_new_lock`] for `flock`: the
+/// late `RELEASE` names the owner itself (`FUSE_RELEASE_FLOCK_UNLOCK`),
+/// and it dropped the new description's lock under that id.
+#[test]
+fn a_late_flock_release_spares_a_reused_owners_new_lock() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, old, new) = two_descriptions(&f, &caller, "reuse-flock");
+    lock_range(&f, &caller, ino, old, 0x5a, true, (0, u64::MAX >> 1)).unwrap();
+    lock_range(&f, &caller, ino, new, 0x5a, true, (0, u64::MAX >> 1)).unwrap();
+    release_flock(&f, &caller, ino, old, 0x5a);
+    assert_eq!(
+        f.meta.locks().local_locks(ino).len(),
+        1,
+        "the new description keeps its lock"
+    );
+    release_flock(&f, &caller, ino, new, 0x5a);
+    assert!(f.meta.locks().local_locks(ino).is_empty());
+}
+
+/// `flock(fd1, LOCK_EX); flock(fd1, LOCK_UN); close(fd1); fd2 =
+/// open(same file); flock(fd2, LOCK_EX)` with `fd2`'s description at
+/// `fd1`'s address: the owner holds nothing at the close, so the new
+/// lock does not wait, and `fd1`'s late `RELEASE`, naming the same
+/// owner, dropped the live lock, which another process could then take.
+#[test]
+fn an_unlocked_closed_descriptions_late_release_spares_the_new_flock() {
+    let f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (ino, fd1, other) = two_descriptions(&f, &caller, "unlocked-reuse");
+    let whole = (0, u64::MAX >> 1);
+    lock_range(&f, &caller, ino, fd1, 0x5a, true, whole).unwrap();
+    Blocking::run(|r| {
+        f.fs.lock_release(
+            &OpCtx::new(OpKind::LockRelease, &caller),
+            ino,
+            fd1,
+            LockOwner(0x5a),
+            LockRange {
+                start: whole.0,
+                end: whole.1,
+            },
+            r,
+        )
+    })
+    .unwrap();
+    close(&f, &caller, ino, fd1);
+    let fd2 = f.open_write(&caller, ino).unwrap().fh;
+    let started = Instant::now();
+    lock_range(&f, &caller, ino, fd2, 0x5a, true, whole).unwrap();
+    assert!(
+        started.elapsed() < crate::locks::close_wait() / 2,
+        "nothing held at the close: no wait ({:?})",
+        started.elapsed()
+    );
+    release_flock(&f, &caller, ino, fd1, 0x5a);
+    assert_eq!(
+        f.meta.locks().local_locks(ino).len(),
+        1,
+        "fd2 keeps its lock"
+    );
+    assert_eq!(
+        code(lock_range(&f, &caller, ino, other, 0x77, true, whole)),
+        Code::Again,
+        "and nobody else gets it"
+    );
+    release_flock(&f, &caller, ino, fd2, 0x5a);
+    release(&f, &caller, ino, other);
+}

@@ -1871,14 +1871,21 @@ impl Vfs for View {
         // A test through `fh` shows its description open.
         self.note_handle_open(fh);
         // A lock of a description whose last close was just answered is
-        // not reported while its `RELEASE` is on its way (`lock_handles`).
+        // not reported while its `RELEASE` is on its way (`lock_handles`):
+        // another lock in the way is named first, as Linux, which dropped
+        // that one already, names it, and with none the test waits for
+        // the `RELEASE`.
         let found = self.past_closing_locks(
             locks,
             ino,
             owner,
             (start, end),
             write,
-            |_| locks.test(ino, owner, start, end, write),
+            std::time::Instant::now() + crate::locks::close_wait(),
+            |_| {
+                let going = self.closing_lock_owners(ino);
+                locks.test(ino, owner, start, end, write, |o| going.contains(&o))
+            },
             Option::is_some,
         );
         let status = match found {
@@ -1937,7 +1944,9 @@ impl Vfs for View {
         // Data written under an earlier grant that ended without its
         // flush does not ride along under the new one.
         self.lock_discard_tainted(ino);
-        self.note_lock_handle(fh, ino, lock.owner.0);
+        // The request's bound, for every wait it takes on the way.
+        let deadline = std::time::Instant::now() + crate::locks::close_wait();
+        self.note_lock_handle(fh, ino, lock.owner.0, locks, deadline);
         let local = constellation_meta::locks::LocalLock {
             owner: lock.owner.0,
             pid: lock.pid,
@@ -1957,6 +1966,7 @@ impl Vfs for View {
                 local.owner,
                 (local.start, local.end),
                 local.write,
+                deadline,
                 |deadline| locks.try_lock_by(ino, local, deadline, cx.cancel),
                 |r| *r == Err(Code::Again),
             );

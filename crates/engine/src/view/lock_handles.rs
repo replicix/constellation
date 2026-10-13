@@ -131,8 +131,47 @@ impl LockHandles {
     /// `RELEASE` is still queued, and that release must not drop the new
     /// description's locks. The request also proves the description open
     /// ([`Self::opened`]).
-    pub(crate) fn note(&self, fh: u64, ino: Ino, owner: u64) {
+    ///
+    /// Before it moves the owner, a request waits for the `RELEASE` of
+    /// the handle the owner is bound to when that handle's close was
+    /// answered within `window` and the owner still `holds` locks on
+    /// `ino` (finding 12): with the same owner id through another
+    /// handle, that description is gone and the new one is at its
+    /// address, so those locks are the closed description's. Bound to
+    /// the new handle, they would outlive the old `RELEASE` (which would
+    /// find nothing of the owner's to drop) as the new description's,
+    /// merged with its own. A POSIX owner can lock through several
+    /// descriptions of one file, and one of them can be closed by
+    /// another process (a child's copy) with no `RELEASE` to follow: its
+    /// request goes on once the window is over, its locks kept, as
+    /// before. Never past `deadline`, the request's own bound.
+    pub(crate) fn note(
+        &self,
+        fh: u64,
+        ino: Ino,
+        owner: u64,
+        window: Duration,
+        deadline: Instant,
+        holds: impl Fn() -> bool,
+    ) {
         let mut handles = self.by_fh.lock().unwrap();
+        loop {
+            let now = Instant::now();
+            let until = handles
+                .iter()
+                .find(|(k, h)| **k != fh && h.owners.contains(&(ino, owner)))
+                .and_then(|(_, h)| h.closed)
+                .map(|closed| (closed + window).min(deadline))
+                .filter(|until| *until > now);
+            match until {
+                // Read under this table's mutex, which is taken before the
+                // lock table's.
+                Some(until) if holds() => {
+                    handles = self.changed.wait_timeout(handles, until - now).unwrap().0;
+                }
+                _ => break,
+            }
+        }
         if let Some(h) = handles.get_mut(&fh) {
             if h.open() {
                 self.changed.notify_all();
@@ -168,7 +207,8 @@ impl LockHandles {
     }
 
     /// `fh` is released: `drop_owner` drops `flock` (the owner the kernel
-    /// names in `RELEASE`, if any) and each owner that locked through `fh`
+    /// names in `RELEASE`, if any, unless another handle binds it) and
+    /// each owner that locked through `fh`
     /// (under this table's mutex, so a waiter never sees the handle gone
     /// with its locks still there), returning what the caller wants back
     /// and whether it dropped any lock. When one did, every waiter asks
@@ -181,6 +221,14 @@ impl LockHandles {
     ) -> Vec<(Ino, T)> {
         let mut handles = self.by_fh.lock().unwrap();
         let owners = handles.remove(&fh).map(|h| h.owners).unwrap_or_default();
+        // The owner the kernel names is the description's own (its
+        // `struct file`): bound to another handle still open, it is a new
+        // description at the old one's address, which locked before this
+        // late `RELEASE` arrived (`flock` after the old one unlocked, so
+        // no wait held it back: [`Self::note`]). Its locks are not this
+        // description's.
+        let flock = flock
+            .filter(|(ino, owner)| !handles.values().any(|h| h.owners.contains(&(*ino, *owner))));
         let mut any = false;
         let dropped: Vec<(Ino, T)> = flock
             .into_iter()
@@ -197,6 +245,28 @@ impl LockHandles {
             self.changed.notify_all();
         }
         dropped
+    }
+
+    /// The owners of locks on `ino` bound to a description closed within
+    /// `window`, its `RELEASE` on its way: Linux dropped their locks
+    /// already, so a test names one of them only when nothing else is in
+    /// the way (`View::lock_test`). A snapshot, taken before the lock
+    /// table's mutex: this table's mutex is taken before that one, never
+    /// inside it.
+    pub(crate) fn closing_owners(&self, ino: Ino, window: Duration) -> HashSet<u64> {
+        if window.is_zero() {
+            return HashSet::new();
+        }
+        let now = Instant::now();
+        self.by_fh
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|h| h.closed.is_some_and(|t| now < t + window))
+            .flat_map(|h| h.owners.iter())
+            .filter(|(i, _)| *i == ino)
+            .map(|(_, owner)| *owner)
+            .collect()
     }
 
     /// How many releases dropped locks so far: read before a request, it
@@ -290,7 +360,7 @@ mod tests {
     fn a_waiter_wakes_when_the_closing_description_is_released() {
         let t = Arc::new(LockHandles::default());
         let held = Arc::new(Mutex::new(vec![0xa_u64]));
-        t.note(1, 7, 0xa);
+        t.note(1, 7, 0xa, Duration::ZERO, later(), || false);
         t.closed(1);
         let releaser = std::thread::spawn({
             let (t, held) = (t.clone(), held.clone());
@@ -319,7 +389,7 @@ mod tests {
     fn an_open_description_or_a_spent_window_is_not_waited_for() {
         let t = LockHandles::default();
         let window = Duration::from_secs(10);
-        t.note(1, 7, 0xa);
+        t.note(1, 7, 0xa, Duration::ZERO, later(), || false);
         // Nothing local in the way: refused elsewhere, the refusal stands;
         // unless a release dropped locks since the request: ask again.
         assert_eq!(
@@ -327,7 +397,7 @@ mod tests {
             CloseWait::Refused
         );
         let since = t.releases();
-        t.note(9, 7, 0xc);
+        t.note(9, 7, 0xc, Duration::ZERO, later(), || false);
         t.release(9, None, |_, _| ((), true));
         assert_eq!(
             t.await_closing(7, window, later(), since, Vec::new),
@@ -346,7 +416,7 @@ mod tests {
         );
         // Closed, then locked through again: open after all.
         t.closed(1);
-        t.note(1, 7, 0xa);
+        t.note(1, 7, 0xa, Duration::ZERO, later(), || false);
         assert_eq!(
             t.await_closing(7, window, later(), t.releases(), || vec![0xa]),
             CloseWait::Refused
@@ -359,7 +429,7 @@ mod tests {
             CloseWait::Refused
         );
         // One conflict closing, another open: refused at once.
-        t.note(2, 7, 0xb);
+        t.note(2, 7, 0xb, Duration::ZERO, later(), || false);
         t.closed(1);
         assert_eq!(
             t.await_closing(7, window, later(), t.releases(), || vec![0xa, 0xb]),
@@ -385,6 +455,53 @@ mod tests {
         );
     }
 
+    /// A late `RELEASE` names its description's `flock` owner, which a
+    /// new description at the same address, bound to its own handle, may
+    /// hold now: that owner's locks are left alone. Unbound, it is
+    /// dropped as before.
+    #[test]
+    fn a_late_release_leaves_a_reused_flock_owner_alone() {
+        let t = LockHandles::default();
+        t.note(2, 7, 0xa, Duration::ZERO, later(), || false);
+        let mut dropped = Vec::new();
+        t.release(1, Some((7, 0xa)), |ino, owner| {
+            dropped.push((ino, owner));
+            ((), true)
+        });
+        assert!(dropped.is_empty(), "{dropped:?}");
+        t.release(3, Some((7, 0xb)), |ino, owner| {
+            dropped.push((ino, owner));
+            ((), true)
+        });
+        assert_eq!(dropped, [(7, 0xb)]);
+    }
+
+    /// No wait for a closing handle's `RELEASE` when the owner holds no
+    /// lock on the file any more (it unlocked before the close): nothing
+    /// of the closed description's could pass to the new one.
+    #[test]
+    fn a_request_holding_nothing_does_not_wait_for_the_old_release() {
+        let t = LockHandles::default();
+        t.note(1, 7, 0xa, Duration::ZERO, later(), || false);
+        t.closed(1);
+        let started = Instant::now();
+        t.note(2, 7, 0xa, Duration::from_secs(10), later(), || false);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Holding locks, it waits (here, out the deadline).
+        t.note(3, 7, 0xb, Duration::ZERO, later(), || false);
+        t.closed(3);
+        let started = Instant::now();
+        t.note(
+            4,
+            7,
+            0xb,
+            Duration::from_secs(10),
+            Instant::now() + Duration::from_millis(50),
+            || true,
+        );
+        assert!(started.elapsed() >= Duration::from_millis(40));
+    }
+
     /// The reviewer's case: a description whose descriptors keep being
     /// closed (`exec 9>lock; flock -n 9 || exit; while :; do cmd; done` —
     /// every child's exit flushes descriptor 9) renews its window with
@@ -393,7 +510,7 @@ mod tests {
     #[test]
     fn repeated_closes_do_not_hold_a_request_past_its_deadline() {
         let t = Arc::new(LockHandles::default());
-        t.note(1, 7, 0xa);
+        t.note(1, 7, 0xa, Duration::ZERO, later(), || false);
         t.closed(1);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let closer = std::thread::spawn({
