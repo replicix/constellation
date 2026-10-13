@@ -297,6 +297,17 @@ small body. Only a dedup hit, an upload that finds its chunk already in S3
 and relies on it, needs GC's condemned pointer, and reads it after the
 hit (§14).
 
+**Concurrent drains.** A sync round's upload pass, a close's drain and
+an `fsync`'s overlap, and files of identical content share chunks. A
+drain leaves a chunk another drain is uploading to it and waits for that
+upload, which settles the waiting drain's pending rows for the chunk too
+(content addressing: one upload serves every claim). Only a chunk the
+other drain did not get into S3 (it failed, found the bytes missing,
+or its pass was held on a metered network or ended before uploading it)
+is the waiting drain's to upload again; so a write-through close or an
+`fsync` never succeeds before its chunks are in S3, and never fails
+because another drain uploaded them.
+
 **One node losing S3.** If a node's own S3 path makes no progress for
 `CONSTELLATION_CHUNK_HANDOFF_AFTER_MS` (6 s), its drains hand the chunks
 to a peer that reaches S3 (the lease holder first): the peer fetches them
