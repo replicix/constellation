@@ -205,22 +205,21 @@ impl Meta {
         attrs.size = size;
         attrs.mtime_ns = mtime_ns.unwrap_or(t);
         attrs.ctime_ns = crate::store::writes::commit_ctime(rec.attrs.ctime_ns, ctime_ns, t);
-        let xattrs = rec.xattrs.clone();
         let target = rec
             .symlink_target
             .as_ref()
             .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
             .transpose()?;
-        ns::put_inode(
+        ns::put_inode_keeping_xattrs(
             &mut tx,
             &self.scratch,
             ns::Dirty::Untracked,
             &self.blobs,
             ino,
+            &rec,
             attrs,
             Some(manifest.to_vec()),
             target,
-            &xattrs,
         )?;
         for (parent, name) in ns::links_of(&tx, &self.scratch, ino)? {
             tx.insert(

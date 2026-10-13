@@ -418,6 +418,16 @@ fn planned_rows(
     ino: u64,
     model: &std::collections::BTreeMap<String, Vec<u8>>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    planned_rows_with(meta, ino, None, model)
+}
+
+/// [`planned_rows`] for a file whose record also holds `manifest`.
+fn planned_rows_with(
+    meta: &Meta,
+    ino: u64,
+    manifest: Option<Vec<u8>>,
+    model: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let attr = meta.getattr(ino).unwrap().unwrap();
     let attrs = Attrs {
         kind: Kind::from_u8(attr.kind.as_u8()).unwrap(),
@@ -434,7 +444,7 @@ fn planned_rows(
         .iter()
         .map(|(n, v)| (n.as_bytes().to_vec(), v.clone()))
         .collect();
-    let planned = record::plan_inode(attrs, None, None, &xattrs, hash_blob);
+    let planned = record::plan_inode(attrs, manifest, None, &xattrs, hash_blob);
     let mut rows = vec![(keys::inode(ino), planned.record.encode())];
     if planned.xattrs == record::XattrPlacement::Spilled {
         for (name, value) in &xattrs {
@@ -551,4 +561,163 @@ fn a_spilled_xattr_set_changed_one_name_at_a_time_stores_the_whole_set_rule() {
         );
     }
     assert!(local.list_xattrs(f.ino).unwrap().is_empty());
+}
+
+// ------------------------------- a data change keeps the file's xattrs
+
+/// An xattr set as names, value lengths and value hashes, sorted (short
+/// enough for an assertion message).
+fn digest(set: &[(String, Vec<u8>)]) -> Vec<(String, usize, String)> {
+    let mut out: Vec<_> = set
+        .iter()
+        .map(|(name, value)| {
+            let hash = blake3::hash(value).to_hex();
+            (name.clone(), value.len(), hash[..16].to_string())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A file's xattr set as `list_xattrs`/`get_xattr` report it.
+fn xattr_set(meta: &Meta, ino: u64) -> Vec<(String, usize, String)> {
+    let set: Vec<_> = meta
+        .list_xattrs(ino)
+        .unwrap()
+        .into_iter()
+        .map(|name| {
+            let value = meta.get_xattr(ino, &name).unwrap().unwrap();
+            (name, value)
+        })
+        .collect();
+    digest(&set)
+}
+
+/// A manifest commit (a write's close or `fsync`) and a truncate change a
+/// file's content, never its xattrs: executed here, replayed from the
+/// log, and in a scratch directory, the set is kept whether it is inline
+/// in the record or spilled to `0x03` keys. (xcheckfs, sighting 2: two
+/// 139-byte values are over `XATTR_INLINE`, so they spill — and the next
+/// close of a write, or a truncate, rewrote the record from its inline
+/// xattrs, which a spilled set leaves empty, and removed the `0x03` keys:
+/// every xattr of the file was gone.)
+#[test]
+fn a_manifest_commit_or_truncate_keeps_the_xattr_set_inline_or_spilled() {
+    use constellation_meta::LogRecord;
+    let mut manifest = constellation_fs_core::Manifest::empty(4 << 20);
+    manifest.file_len = 8;
+    let manifest = manifest.encode();
+    let sets: [(&str, Vec<_>); 2] = [
+        ("inline", vec![("user.k".into(), b"v".to_vec())]),
+        (
+            "spilled",
+            vec![
+                ("user.k1".into(), vec![1u8; 139]),
+                ("user.k2".into(), vec![2u8; 139]),
+                ("user.big".into(), vec![3u8; 4096]),
+            ],
+        ),
+    ];
+    for (label, set) in sets {
+        let want = digest(&set);
+
+        let local = Meta::open_in_memory().unwrap();
+        let f = local.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        for (name, value) in &set {
+            local
+                .set_xattr(f.ino, name, value, SetXattrMode::Set)
+                .unwrap();
+        }
+        assert_eq!(xattr_set(&local, f.ino), want, "{label}: set");
+        local.set_manifest(f.ino, &manifest, 8).unwrap();
+        assert_eq!(xattr_set(&local, f.ino), want, "{label}: manifest commit");
+        // byte for byte the whole-set rule: every replica's tree agrees
+        let model: std::collections::BTreeMap<String, Vec<u8>> = set.iter().cloned().collect();
+        assert_eq!(
+            stored_rows(&local, f.ino),
+            planned_rows_with(&local, f.ino, Some(manifest.clone()), &model),
+            "{label}: manifest commit rows"
+        );
+        local
+            .setattr(f.ino, None, None, None, Some(4), None, None)
+            .unwrap();
+        assert_eq!(xattr_set(&local, f.ino), want, "{label}: truncate");
+
+        let ino = (1u64 << 40) | 7;
+        let replayed = Meta::open_in_memory().unwrap();
+        let mut records = vec![LogRecord::Create {
+            parent: ROOT_INO,
+            name: "f".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 1,
+        }];
+        for (name, value) in &set {
+            records.push(LogRecord::SetXattr {
+                ino,
+                name: name.clone(),
+                value: value.clone(),
+                time_ns: 2,
+            });
+        }
+        replayed.apply_records(&records).unwrap();
+        replayed
+            .apply_records(&[LogRecord::WriteManifest {
+                ino,
+                base_manifest: None,
+                manifest: manifest.clone(),
+                size: 8,
+                time_ns: 3,
+                mtime_ns: 3,
+            }])
+            .unwrap();
+        assert_eq!(
+            xattr_set(&replayed, ino),
+            want,
+            "{label}: replayed manifest commit"
+        );
+        assert_eq!(
+            stored_rows(&replayed, ino),
+            planned_rows_with(&replayed, ino, Some(manifest.clone()), &model),
+            "{label}: replayed manifest commit rows"
+        );
+        replayed
+            .apply_records(&[LogRecord::Setattr {
+                ino,
+                mode: None,
+                uid: None,
+                gid: None,
+                size: Some(4),
+                atime_ns: None,
+                mtime_ns: None,
+                time_ns: 4,
+            }])
+            .unwrap();
+        assert_eq!(
+            xattr_set(&replayed, ino),
+            want,
+            "{label}: replayed truncate"
+        );
+
+        let scratch = Meta::open_in_memory().unwrap();
+        let s = (1u64 << 40) | 8;
+        scratch
+            .scratch_create(ROOT_INO, "s", s, 0o644, 0, 0)
+            .unwrap();
+        for (name, value) in &set {
+            scratch
+                .scratch_set_xattr(s, name, value, SetXattrMode::Set)
+                .unwrap();
+        }
+        scratch
+            .scratch_set_manifest(s, &manifest, 8, None, None)
+            .unwrap();
+        assert_eq!(
+            digest(&scratch.scratch_xattrs(s).unwrap()),
+            want,
+            "{label}: scratch manifest commit"
+        );
+    }
 }

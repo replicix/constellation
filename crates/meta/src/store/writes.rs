@@ -500,20 +500,21 @@ impl Meta {
         attrs.size = size;
         attrs.mtime_ns = mtime.unwrap_or(t);
         attrs.ctime_ns = commit_ctime(rec.attrs.ctime_ns, session_ctime, t);
-        let xattrs: Vec<(Vec<u8>, Vec<u8>)> = rec.xattrs.clone();
-        ns::put_inode(
+        let target = rec
+            .symlink_target
+            .as_ref()
+            .map(|p| ns::resolve_payload(tx, blobs, p))
+            .transpose()?;
+        ns::put_inode_keeping_xattrs(
             tx,
             ns_ks,
             dirty,
             blobs,
             ino,
+            &rec,
             attrs,
             Some(manifest.to_vec()),
-            rec.symlink_target
-                .as_ref()
-                .map(|p| ns::resolve_payload(tx, blobs, p))
-                .transpose()?,
-            &xattrs,
+            target,
         )?;
         misc::track_manifest_transition_tx(
             tx,

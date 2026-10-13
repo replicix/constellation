@@ -285,6 +285,51 @@ pub(crate) fn put_inode(
     Ok(planned.xattrs)
 }
 
+/// Rewrite `ino`'s `0x01` record for a change of its attrs, manifest or
+/// symlink target that leaves its xattr set as `rec` stores it (a
+/// manifest commit, a truncate's clip). An inline set rides in the
+/// record, as [`put_inode`] writes it. A spilled set's `0x03` keys stay
+/// as they are: `rec.xattrs` is empty for one, and handing that to
+/// [`put_inode`] wrote the set as empty and removed the keys — every
+/// xattr of a file whose set exceeds [`record::XATTR_INLINE`] was lost
+/// at its next write's close or truncate. The record is what
+/// [`record::plan_inode`] builds for the spilled set (as in
+/// [`put_spilled_xattr`]): no inline section and the flag set, and the
+/// flag takes no bytes, so the manifest and target spill as they would.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn put_inode_keeping_xattrs(
+    tx: &mut SingleWriterWriteTx,
+    ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
+    blobs: &SingleWriterTxKeyspace,
+    ino: Ino,
+    rec: &InodeRecord,
+    attrs: Attrs,
+    manifest: Option<Vec<u8>>,
+    symlink_target: Option<Vec<u8>>,
+) -> Result<(), MetaError> {
+    if !rec.xattrs_spilled {
+        put_inode(
+            tx,
+            ns,
+            dirty,
+            blobs,
+            ino,
+            attrs,
+            manifest,
+            symlink_target,
+            &rec.xattrs,
+        )?;
+        return Ok(());
+    }
+    let mut planned = record::plan_inode(attrs, manifest, symlink_target, &[], Meta::hash_blob);
+    planned.record.xattrs_spilled = true;
+    for blob in planned.blobs {
+        Meta::put_blob(tx, blobs, blob);
+    }
+    put_inode_record(tx, ns, dirty, ino, &planned.record)
+}
+
 /// One xattr of a spilled set set (`Some`) or removed (`None`), when the
 /// set stays spilled: only that name's `0x03` key and the `0x01` record
 /// (whose `attrs` carry the new ctime) are written. Returns `false`, having

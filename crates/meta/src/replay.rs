@@ -1232,16 +1232,16 @@ pub(crate) fn clip_manifest_to_size_tx(
         .as_ref()
         .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
         .transpose()?;
-    ns::put_inode(
+    ns::put_inode_keeping_xattrs(
         tx,
         &meta.ns,
         dirty,
         &meta.blobs,
         ino,
+        &rec,
         rec.attrs,
         Some(clipped.clone()),
         symlink,
-        &rec.xattrs,
     )?;
     misc::track_manifest_transition_tx(
         tx,
@@ -1279,20 +1279,21 @@ fn apply_write_manifest(
     attrs.size = size;
     attrs.mtime_ns = mtime_ns;
     attrs.ctime_ns = t;
-    let xattrs = rec.xattrs.clone();
-    ns::put_inode(
+    let target = rec
+        .symlink_target
+        .as_ref()
+        .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
+        .transpose()?;
+    ns::put_inode_keeping_xattrs(
         tx,
         &meta.ns,
         dirty,
         &meta.blobs,
         ino,
+        &rec,
         attrs,
         Some(manifest.to_vec()),
-        rec.symlink_target
-            .as_ref()
-            .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
-            .transpose()?,
-        &xattrs,
+        target,
     )?;
     for (parent, name) in ns::links_of(tx, &meta.ns, ino)? {
         ns::ns_insert(
