@@ -416,6 +416,32 @@ fn an_unlinked_file_keeps_and_changes_its_xattrs() {
     assert_eq!(code(c.listxattr(f)), Code::Stale);
 }
 
+/// A file unlinked elsewhere (another node's unlink, applied here) that
+/// this view still had open: its reference answers `ESTALE` once the
+/// last handle's close reaped it — not `nlink` 0 to `fstat` and `ENOENT`
+/// to a reopen, as when the close took it for this view's own removal.
+#[test]
+fn a_file_unlinked_elsewhere_is_stale_after_its_last_close_here() {
+    let c = fuse_client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let f = e.attr.ino;
+    c.close(f, o.fh).unwrap();
+    let held = c.open(f, OpenFlags::READ).unwrap();
+    c._meta
+        .apply_records(&[constellation_meta::LogRecord::Unlink {
+            parent: ROOT_INO,
+            name: "f".into(),
+            time_ns: 9,
+        }])
+        .unwrap();
+    // Still open here: still the file (nlink 0).
+    assert_eq!(c.getattr(f).unwrap().nlink, 0);
+    c.close(f, held.fh).unwrap();
+    assert!(c._meta.orphans().unwrap().is_empty(), "reaped at the close");
+    assert_eq!(code(c.getattr(f)), Code::Stale);
+    assert_eq!(code(c.open(f, OpenFlags::READ)), Code::Stale);
+}
+
 /// A removed directory the kernel still references (a process's working
 /// directory, an `O_PATH` descriptor) keeps its attributes and xattrs,
 /// and `chmod`, `utimes` and the xattr ops through the reference change

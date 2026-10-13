@@ -1400,7 +1400,16 @@ impl Vfs for View {
                 .is_some_and(|h| h.sources().is_open(ino));
             if let Ok(Some(attr)) = self.meta.getattr(ino) {
                 if attr.nlink == 0 && !elsewhere {
-                    self.remember_dead(attr);
+                    // Under a frontend that reports `forget`s, this view's
+                    // own unlinks wait for theirs (above), so one reaped
+                    // here was unlinked elsewhere — another node or view —
+                    // and a reference that outlives it is stale
+                    // (`View::gone`): remembered as this view's own
+                    // removal, its `fstat` answered `nlink` 0 while its
+                    // reopen answered `ENOENT`.
+                    if !self.keeps_referenced() {
+                        self.remember_dead(attr);
+                    }
                     let _ = self.meta.reap_orphan(ino);
                 }
             }

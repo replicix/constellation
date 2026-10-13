@@ -46700,3 +46700,35 @@ every replica — what an `unlink` already costs.
 meta `a_removed_directory_is_an_orphan_until_it_is_reaped` (rmdir,
 replayed, renamed over) fail on the previous main; new
 `holds::tests::an_orphan_without_data_is_kept_but_never_claimed`.
+
+## Fix: a reference to a file removed elsewhere is stale every time (`opath-unlinked` remainder 3, 2026-10-13)
+
+On the box's two-node runs, a reference on node B to a file node A unlinked
+answered `ESTALE` in 1 run of 7 and `ENOENT` in the rest: B's first reopen
+succeeded (B's replica still held the orphan), then `fstat` answered
+`nlink` 0 and every reopen `ENOENT`, where the documented answer is
+`ESTALE`.
+
+### Cause
+
+The last close of that reopened handle reaped the foreign orphan and
+`release` filed it with `remember_dead` as the view's own removal; a
+`DeadInodes` entry makes `View::gone` leave `NotFound` alone.
+
+### What changed
+
+Under a frontend that reports `forget`s, a view's own unlinks wait for
+their `forget` (`View::reap_after_unlink`), so an orphan `release` reaps
+was unlinked elsewhere: it is no longer remembered, and the reference
+answers `ESTALE` from then on. The first reopen on B can still succeed
+while B's replica holds the orphan record: the inode exists there, and the
+reopen reads its data under a hold, as a handle open at the unlink would.
+Keeping a foreign orphan for B's kernel references would need to know
+which inodes B's kernel holds — a lookup table, which plan 31 §6.11
+avoids.
+
+### Tests
+
+`view::vfs_tests::a_file_unlinked_elsewhere_is_stale_after_its_last_close_here`
+fails on the previous main. Two nodes on S3 (box): `cross` ×4 never
+answers `ENOENT`.
