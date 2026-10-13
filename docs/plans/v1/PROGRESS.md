@@ -46732,3 +46732,17 @@ avoids.
 `view::vfs_tests::a_file_unlinked_elsewhere_is_stale_after_its_last_close_here`
 fails on the previous main. Two nodes on S3 (box): `cross` ×4 never
 answers `ENOENT`.
+
+## Fix: a file a `Publish` replaced was left to the reaper (2026-10-13)
+
+Renaming a scratch file over a shared one (`Publish`, plan 31 scratch
+directories) orphans the replaced file in the replica, but the view's
+publish branch returned before the `unlinking`/`reap_after_unlink` its
+rename branch does, so the view never kept it for the kernel's reference:
+the hold writer's reaper dropped it, and the reference answered `ESTALE`
+instead of the file (`nlink` 0), as a rename over it keeps.
+
+The publish branch now registers the replaced file before the mutation
+and settles it after, as the rename branch does.
+`view::quota_tests::a_file_a_publish_replaces_is_kept_for_the_kernels_reference`
+fails without it.

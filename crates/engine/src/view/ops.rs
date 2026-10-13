@@ -882,6 +882,17 @@ impl Vfs for View {
                     return;
                 }
             };
+            // The file the publish replaces, as a rename's below: its last
+            // name goes, and it is an orphan kept for the kernel's
+            // reference to it, else reaped now.
+            let replaced = if noreplace {
+                None
+            } else {
+                self.meta.lookup(newparent, &newname).ok().flatten()
+            };
+            if let Some(attr) = &replaced {
+                self.unlinking(attr);
+            }
             let op = constellation_meta::MutateOp::Publish {
                 ino: attr.ino,
                 parent: newparent,
@@ -896,11 +907,21 @@ impl Vfs for View {
                 noreplace,
             };
             return match self.mutate_op(newparent, op) {
-                Ok(()) => match self.meta.scratch_unlink(parent, &name) {
-                    Ok(()) => r.done(Ok(())),
-                    Err(error) => r.done(err(error.code())),
-                },
-                Err(error) => r.done(err(error)),
+                Ok(()) => {
+                    if let Some(attr) = replaced {
+                        self.reap_after_unlink(attr.ino);
+                    }
+                    match self.meta.scratch_unlink(parent, &name) {
+                        Ok(()) => r.done(Ok(())),
+                        Err(error) => r.done(err(error.code())),
+                    }
+                }
+                Err(error) => {
+                    if let Some(attr) = replaced {
+                        self.unlink_failed(attr.ino);
+                    }
+                    r.done(err(error))
+                }
             };
         }
         // §6.12 `confine_links`: moving one of several names of a file

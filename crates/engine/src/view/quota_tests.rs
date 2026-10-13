@@ -392,6 +392,99 @@ fn a_forget_runs_a_hold_pass_only_for_a_claimed_reference() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Publishing a scratch file over a shared one (a rename out of a
+/// scratch directory) replaces it as a rename does: the replaced file's
+/// last name goes, and it is an orphan kept for the kernel's reference to
+/// it — before, the view never learned of it, and the hold writer's
+/// reaper dropped it under that reference (`ESTALE` instead of the file).
+#[test]
+fn a_file_a_publish_replaces_is_kept_for_the_kernels_reference() {
+    use constellation_vfs::{
+        Blocking, Caller, LockOwner, Name, OpCtx, OpKind, OpenOwner, RenameFlags, SetXattrFlags,
+        Vfs, WriteData, XattrName,
+    };
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    meta.set_node_prefix(1).unwrap();
+    let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    meta.set_manifest(f.ino, &with_data(), 4).unwrap();
+    let s = meta.mkdir(ROOT_INO, "s", 0o755, 0, 0).unwrap();
+    let views = two_forgetting_views(&meta, std::time::Duration::from_secs(60));
+    let (a, holds) = (&views.a, &views.holds);
+    let caller = Caller::new(0, 0, None);
+    let cx = |kind| OpCtx::new(kind, &caller);
+    Blocking::run(|r| {
+        a.setxattr(
+            &cx(OpKind::Setxattr),
+            s.ino,
+            XattrName::new(constellation_meta::SCRATCH_XATTR),
+            b"1",
+            SetXattrFlags::empty(),
+            r,
+        )
+    })
+    .unwrap();
+    let (entry, opened) = Blocking::run(|r| {
+        a.create(
+            &cx(OpKind::Create),
+            s.ino,
+            Name::new("new"),
+            0o100644,
+            OpenFlags::READ | OpenFlags::WRITE,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    let new = entry.attr.ino;
+    Blocking::run(|r| {
+        a.write(
+            &cx(OpKind::Write),
+            new,
+            opened.fh,
+            0,
+            WriteData::Borrowed(b"published"),
+            OpenFlags::WRITE,
+            r,
+        )
+    })
+    .unwrap();
+    Blocking::run(|r| a.flush(&cx(OpKind::Flush), new, opened.fh, LockOwner(1), r)).unwrap();
+    Blocking::run(|r| {
+        a.release(
+            &cx(OpKind::Release),
+            new,
+            opened.fh,
+            OpenFlags::WRITE,
+            None,
+            r,
+        )
+    })
+    .unwrap();
+    Blocking::run(|r| {
+        a.rename(
+            &cx(OpKind::Rename),
+            s.ino,
+            Name::new("new"),
+            ROOT_INO,
+            Name::new("f"),
+            RenameFlags::empty(),
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(meta.lookup(ROOT_INO, "f").unwrap().unwrap().ino, new);
+
+    // A reaper pass: the replaced file stays for the kernel's reference.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(holds.refresh_once()).unwrap();
+    assert_eq!(meta.getattr(f.ino).unwrap().unwrap().nlink, 0);
+    a.forget(f.ino);
+    assert!(
+        meta.getattr(f.ino).unwrap().is_none(),
+        "reaped at the forget"
+    );
+}
+
 #[test]
 fn quota_check_unlimited_always_ok() {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
