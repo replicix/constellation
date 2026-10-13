@@ -739,6 +739,11 @@ impl EngineControl {
             s3: backend::s3_request_counts(),
             vfs_ops: super::ops::vfs_ops_status(),
             fuse,
+            clock: api::ClockStatus {
+                hlc_last_ns: constellation_meta::hlc::last_ns(),
+                skew_tolerance_s: constellation_meta::hlc::skew_tolerance_ns() / 1_000_000_000,
+                rejected_stamps: constellation_meta::hlc::rejected_stamps(),
+            },
         }
     }
 

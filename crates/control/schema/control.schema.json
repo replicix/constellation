@@ -643,6 +643,33 @@
       ],
       "type": "object"
     },
+    "ClockStatus": {
+      "description": "The hybrid logical clock every inode time comes from (plan 30 §M12,\n`constellation_meta::hlc`).",
+      "properties": {
+        "hlc_last_ns": {
+          "description": "The last stamp this node issued or observed (ns since the epoch);\nabove the wall clock by at most the tolerance below.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "rejected_stamps": {
+          "description": "Stamps further ahead than that, not followed: a replayed record's\n(a sequencer's or delegate's clock) or a forwarded close's (any\nclient's). Not zero: some node's clock is that far ahead (the\ndaemon log's one warning names the stamp); fix its clock.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skew_tolerance_s": {
+          "description": "How far ahead of this node's wall clock another node's stamp may\nbe and still be followed (`CONSTELLATION_HLC_SKEW_TOLERANCE_S`).",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hlc_last_ns",
+        "skew_tolerance_s",
+        "rejected_stamps"
+      ],
+      "type": "object"
+    },
     "CloneParams": {
       "description": "`clone.create`.",
       "properties": {
@@ -8029,6 +8056,10 @@
         "cache": {
           "$ref": "#/$defs/CacheStatus"
         },
+        "clock": {
+          "$ref": "#/$defs/ClockStatus",
+          "description": "Plan 30 §M12: the hybrid logical clock inode times come from, and\nthe stamps of other nodes' clocks it refused to follow."
+        },
         "coop": {
           "$ref": "#/$defs/CoopStatus",
           "description": "Cooperative cache (phase 5, DESIGN.md §7)."
@@ -8271,7 +8302,8 @@
         "lifecycle",
         "s3",
         "vfs_ops",
-        "fuse"
+        "fuse",
+        "clock"
       ],
       "type": "object"
     },

@@ -668,7 +668,9 @@ lease and one log
   its ops in a 30 s window, above a rate floor), recalling when the share
   stays below 50% for a minute, with a cool-down before it moves again.
 - **Hot shared directories**: parent `mtime`/`ctime` are hybrid logical
-  clock stamps merged by `max` and `nlink` changes are deltas, so creates
+  clock stamps (a peer's stamp more than `CONSTELLATION_HLC_SKEW_TOLERANCE_S`
+  ahead is applied but not followed by the clock) merged by `max` and
+  `nlink` changes are deltas, so creates
   in one directory commute and hold their parent only *shared*. A
   directory can be split into up to 16 name-hash ranges (GIGA+), each
   delegated separately, but only to a node that dominates that range:

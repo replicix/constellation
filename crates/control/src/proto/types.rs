@@ -504,6 +504,26 @@ pub struct StatusReport {
     /// Plan 38 §5: the FUSE read-path transport, per mount and
     /// process-wide.
     pub fuse: FuseStatus,
+    /// Plan 30 §M12: the hybrid logical clock inode times come from, and
+    /// the stamps of other nodes' clocks it refused to follow.
+    pub clock: ClockStatus,
+}
+
+/// The hybrid logical clock every inode time comes from (plan 30 §M12,
+/// `constellation_meta::hlc`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ClockStatus {
+    /// The last stamp this node issued or observed (ns since the epoch);
+    /// above the wall clock by at most the tolerance below.
+    pub hlc_last_ns: i64,
+    /// How far ahead of this node's wall clock another node's stamp may
+    /// be and still be followed (`CONSTELLATION_HLC_SKEW_TOLERANCE_S`).
+    pub skew_tolerance_s: i64,
+    /// Stamps further ahead than that, not followed: a replayed record's
+    /// (a sequencer's or delegate's clock) or a forwarded close's (any
+    /// client's). Not zero: some node's clock is that far ahead (the
+    /// daemon log's one warning names the stamp); fix its clock.
+    pub rejected_stamps: u64,
 }
 
 /// Plan 38 §5's `fuse` section: what each FUSE mount's connection is

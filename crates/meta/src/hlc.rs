@@ -4,8 +4,10 @@
 //! attributes it sets) comes from [`now_ns`]: the wall clock when it is
 //! ahead of everything this node has seen, one nanosecond past the last
 //! stamp otherwise. Every stamp this node *applies* from the log (a
-//! peer's record) advances the clock through [`observe`]. Two
-//! consequences, both needed by M12's commutative parent attributes:
+//! peer's record) advances the clock through [`observe`] — unless it is
+//! more than [`skew_tolerance_ns`] ahead of this node's wall clock
+//! ([`observe_within_tolerance`]; see below). Two consequences, both
+//! needed by M12's commutative parent attributes:
 //!
 //! - **Per node, stamps strictly increase** — a parent's mtime/ctime
 //!   merged by `max` never goes backwards on the node that wrote it, so
@@ -20,7 +22,27 @@
 //! wall clock (a node that applied a peer 5 s ahead stamps 5 s ahead
 //! until its own clock catches up) — the same bound HLCs have always
 //! had, and one that only moves inode timestamps: the lease, grant and
-//! promise clocks (M8/M10's drift margins) stay on the wall clock.
+//! promise clocks (M8/M10's drift margins) stay on the wall clock. The
+//! clock never comes down, so a peer's stamp further ahead than the
+//! tolerance — a sequencer or delegate with a bad clock (2040, or
+//! `i64::MAX`, which would pin it so it stops increasing) — is not
+//! observed: its record is applied as is, but the clock that would have
+//! stamped every later time on this node past it, and on every node
+//! replaying this one's records, stays on this node's own. Like the HLC
+//! paper's drift bound, a clock that bad is refused, not followed — and
+//! the times it stamped pay for it, not the whole cluster's:
+//!
+//! - **A parent's times** (merged by `max`) stay at the bad stamp until
+//!   the clocks reach it: they never go back.
+//! - **A file's own ctime and mtime** are set as is, so they step back
+//!   once, for every observer: a delegate with a 2040 clock `chmod`s a
+//!   file (ctime 2040 everywhere), the root's next `chmod` stamps it
+//!   2026. One step back on the files that clock touched, against every
+//!   time in the cluster stamped past 2040 for good.
+//! - **Atime bumps on such a file** are fenced
+//!   (`store::atime::apply_atime_one`: a bump observed before the
+//!   file's ctime is dropped) until the wall clock passes the stamp or
+//!   another change restamps the file.
 //!
 //! One record's stamp may be an earlier one: a manifest commit's
 //! (`WriteManifest`) is the file's ctime, its last change — the write

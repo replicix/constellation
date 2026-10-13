@@ -380,9 +380,12 @@ fn apply_one(
     staged: &crate::store::UsageTracker,
 ) -> Result<Applied, MetaError> {
     // Plan 30 §M12: a stamp applied here is one this node's clock stays
-    // above from now on (the HLC's receive rule).
+    // above from now on (the HLC's receive rule) — within the skew
+    // tolerance of its wall clock. The record is applied as is (every
+    // replica must agree on it); a sequencer's or delegate's bad clock
+    // just does not become every node's, for good.
     if let Some(t) = rec.stamp_ns() {
-        crate::hlc::observe(t);
+        crate::hlc::observe_within_tolerance(t);
     }
     // EC2 campaign 4 B-2: an inode is created once — inos are never
     // reused — so a durable create whose ino already exists here is this
@@ -1524,9 +1527,51 @@ fn apply_clone(
 #[cfg(test)]
 mod tests {
     use super::size_delta;
+    use crate::record::LogRecord;
     use crate::store::Meta;
     use crate::MetaStore;
     use constellation_fs_core::types::ROOT_INO;
+
+    /// A record stamped far ahead of this node's clock — a delegate or a
+    /// former lease holder with a bad clock — is applied as is (it is in
+    /// the log, every replica must agree), but moves this node's clock no
+    /// further than the skew tolerance: the stamps it issues next are its
+    /// own clock's, not a day ahead, for good.
+    // Relies on no other test in this binary observing a far-ahead stamp
+    // (the clock is process-wide).
+    #[test]
+    fn a_record_stamped_far_ahead_is_applied_but_moves_no_clock() {
+        let writer = Meta::open_in_memory().unwrap();
+        let f = writer.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let replica = Meta::open_in_memory().unwrap();
+        let records: Vec<LogRecord> = writer
+            .peek_journal_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        replica.apply_records(&records).unwrap();
+        let day_ahead = crate::hlc::now_ns() + 86_400_000_000_000;
+        replica
+            .apply_records(&[LogRecord::Setattr {
+                ino: f.ino,
+                mode: Some(0o600),
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns: None,
+                time_ns: day_ahead,
+            }])
+            .unwrap();
+        let applied = replica.getattr(f.ino).unwrap().unwrap();
+        assert_eq!(
+            (applied.mode & 0o7777, applied.ctime_ns),
+            (0o600, day_ahead)
+        );
+        assert!(crate::hlc::last_ns() < day_ahead, "the clock was dragged");
+        assert!(crate::hlc::now_ns() < day_ahead);
+    }
 
     /// POSIX `link(2)`/`unlink(2)`: a new or removed name changes the
     /// file's *ctime* only (its status: `nlink`), never its mtime — the
