@@ -83,11 +83,14 @@ mod tests {
             Cap::PushInvalFull,
             Cap::KeepOpenUnlinked,
             Cap::PerCloseFlush,
-            Cap::VirtualXattrsListed,
         ] {
             assert!(caps.contains(&cap), "{cap}");
         }
         assert!(!caps.contains(&Cap::CaseInsensitive));
+        // `user.constellation.{rsize,rcount}` are read by name, never
+        // listed: `cp -a`, `rsync -X` and `tar --xattrs` copied listed
+        // ones as real attributes (`XattrPolicy::list_virtual`).
+        assert!(!caps.contains(&Cap::VirtualXattrsListed));
         // Derived, not a second table: change the declaration, the caps
         // follow.
         let mut other = fuse.clone();
@@ -95,11 +98,13 @@ mod tests {
         other.cluster_locks = false;
         other.xattrs = XattrSupport::None;
         other.push_inval = PushInval::Attr;
+        other.virtual_xattrs_listed = true;
         let caps = caps_of(&other);
         assert!(!caps.contains(&Cap::FuseAbort));
         assert!(!caps.contains(&Cap::ClusterLocks));
         assert!(!caps.contains(&Cap::Xattrs));
         assert!(caps.contains(&Cap::PushInval) && !caps.contains(&Cap::PushInvalFull));
+        assert!(caps.contains(&Cap::VirtualXattrsListed));
         assert!(frontend_caps("nfs").is_err());
     }
 

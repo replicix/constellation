@@ -32,6 +32,12 @@
 //!   name) and deterministic in what it *does*; threads make the
 //!   interleaving nondeterministic, so what concurrent tests *check* are
 //!   invariants and a model's answer, never an order.
+//! - The [`Client`] is the platform, and it references every inode it
+//!   was handed until its [`Client::forget`] ([`Vfs::forget`], Linux
+//!   FUSE's `FORGET`), as a kernel does: a removed inode it still
+//!   references answers `getattr` with `nlink == 0` (a working directory,
+//!   an `O_PATH` descriptor), and after the forget nothing answers for it
+//!   (`ENOENT` or `ESTALE`).
 //! - Groups: `namespace`, `io`, `xattr`, `readdir`, `concurrency`,
 //!   `deferral`, `cancellation`, `invalidation`, `confinement` (§6.12).
 //!

@@ -60,10 +60,32 @@ pub(super) fn mkdir_rmdir_and_their_refusals(env: &Env<'_>) -> TestResult {
     must("rmdir d", c.rmdir(root, "d"));
     refused("lookup d", c.lookup(root, "d"), Code::NotFound);
     refused("rmdir d again", c.rmdir(root, "d"), Code::NotFound);
+    // The inode is gone, but this client still references it (mkdir
+    // handed it out; the platform has not let go): a working directory or
+    // an open descriptor of a removed directory stats as one with no
+    // links, and neither lists nor takes a new entry (Linux: `ENOENT`),
+    // until the platform's `forget` — after which nothing answers for it.
+    let gone = must("getattr of the removed directory", c.getattr(d));
+    assert_eq!(
+        (gone.ino, gone.kind, gone.nlink),
+        (d, FileKind::Dir, 0),
+        "a removed directory stats with no links while referenced"
+    );
     refused(
-        "getattr of the removed directory",
-        c.getattr(d),
+        "readdir of the removed directory",
+        c.names(d),
         Code::NotFound,
+    );
+    refused(
+        "mkdir in the removed directory",
+        c.mkdir(d, "inside"),
+        Code::NotFound,
+    );
+    c.forget(d);
+    refused_any(
+        "getattr of the removed directory after its forget",
+        c.getattr(d),
+        &[Code::NotFound, Code::Stale],
     );
     // Not empty, not a directory.
     let d = must("mkdir d", c.mkdir(root, "d")).attr.ino;
@@ -442,10 +464,20 @@ pub(super) fn hard_links_count_names(env: &Env<'_>) -> TestResult {
     assert_eq!(must("getattr", c.getattr(f.attr.ino)).nlink, 2);
     must("unlink l2", c.unlink(root, "l2"));
     must("unlink d/l", c.unlink(d, "l"));
-    refused(
-        "getattr of the last unlinked name",
+    // Its last name went with no handle open; the client still
+    // references it (an `O_PATH` descriptor's `fstat`): no links, its
+    // size, until the platform's `forget`.
+    let gone = must("getattr of the last unlinked name", c.getattr(f.attr.ino));
+    assert_eq!(
+        (gone.ino, gone.kind, gone.size, gone.nlink),
+        (f.attr.ino, FileKind::File, 6, 0),
+        "an unlinked file stats with no links while referenced"
+    );
+    c.forget(f.attr.ino);
+    refused_any(
+        "getattr of the last unlinked name after its forget",
         c.getattr(f.attr.ino),
-        Code::NotFound,
+        &[Code::NotFound, Code::Stale],
     );
     Ok(())
 }

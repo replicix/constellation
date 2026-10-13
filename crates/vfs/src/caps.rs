@@ -135,11 +135,11 @@ pub struct FrontendCaps {
 impl FrontendCaps {
     /// Linux FUSE (`constellation-frontend-fuse`), derived from what the
     /// adapter demonstrably supports: kernel invalidation of names,
-    /// attributes and pages; native xattrs with the virtual ones listed
-    /// (as `getfattr -d` has always shown them); hard links, `fallocate`,
-    /// `SEEK_DATA`/`SEEK_HOLE`, special files; case-sensitive names; any
-    /// op answerable from another thread; unlinked-open inodes kept;
-    /// abortable. `cluster_locks`: the mount forwards locks (`--locks
+    /// attributes and pages; native xattrs, the virtual ones read by name
+    /// and never listed (`XattrPolicy::list_virtual` says why); hard
+    /// links, `fallocate`, `SEEK_DATA`/`SEEK_HOLE`, special files;
+    /// case-sensitive names; any op answerable from another thread;
+    /// unlinked-open inodes kept; abortable. `cluster_locks`: the mount forwards locks (`--locks
     /// cluster` on a writable view).
     pub fn linux_fuse(cluster_locks: bool) -> Self {
         Self {

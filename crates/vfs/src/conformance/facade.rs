@@ -202,6 +202,8 @@ pub trait DynVfs: Send + Sync {
         done: Done<()>,
     );
     fn sync_view(&self, cx: &OpCtx<'_>, done: Done<()>);
+    /// [`Vfs::forget`]: no answer.
+    fn forget(&self, ino: Ino);
 }
 
 impl<V: Vfs> DynVfs for V {
@@ -470,5 +472,9 @@ impl<V: Vfs> DynVfs for V {
 
     fn sync_view(&self, cx: &OpCtx<'_>, done: Done<()>) {
         Vfs::sync_view(self, cx, Probe::new(done));
+    }
+
+    fn forget(&self, ino: Ino) {
+        Vfs::forget(self, ino);
     }
 }

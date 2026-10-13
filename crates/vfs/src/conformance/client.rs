@@ -179,6 +179,16 @@ impl Client {
         self.getattr_fh(ino, None)
     }
 
+    /// The platform lets go of `ino` ([`crate::Vfs::forget`], Linux FUSE's
+    /// `FORGET`). Until then, every inode an op handed this client (an
+    /// [`Entry`], or the inode it was asked about) is one the platform
+    /// still references, as a kernel holds what it looked up: a removed
+    /// one answers `getattr` with `nlink == 0`, as a local filesystem
+    /// answers `fstat` of a deleted file or directory.
+    pub fn forget(&self, ino: Ino) {
+        self.vfs.forget(ino);
+    }
+
     pub fn getattr_fh(&self, ino: Ino, fh: Option<Fh>) -> VfsResult<Attr> {
         self.start(OpKind::Getattr, "getattr", |v, cx, d| {
             v.getattr(cx, ino, fh, d)

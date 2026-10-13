@@ -175,18 +175,34 @@ impl ConformanceTarget for EngineTarget {
     }
 }
 
-#[test]
-fn the_engine_view_conforms() {
+fn conforms_as(caps: FrontendCaps) {
     let report = run(
         &EngineTarget,
         &RunOptions {
             filter: std::env::var("CONFORMANCE_FILTER").ok(),
-            // Every view `Engine::open_view` builds has a `SyncHandle`,
-            // whose `ClusterLocks` is live under `--locks cluster`.
-            caps: FrontendCaps::linux_fuse(true),
+            caps,
             ..RunOptions::default()
         },
     );
     println!("{}", report.render());
     report.assert_ok();
+}
+
+#[test]
+fn the_engine_view_conforms() {
+    // Every view `Engine::open_view` builds has a `SyncHandle`, whose
+    // `ClusterLocks` is live under `--locks cluster`.
+    conforms_as(FrontendCaps::linux_fuse(true));
+}
+
+/// As the FUSE adapter declares itself (`constellation_frontend_fuse::caps`):
+/// it reports the kernel's `FORGET`s, so the view keeps the files it
+/// unlinks, data and all, for the kit's references until the kit's
+/// `forget` (DESIGN.md §3, "Kernel references count as holds").
+#[test]
+fn the_engine_view_conforms_as_a_fuse_mount() {
+    conforms_as(FrontendCaps {
+        reports_forget: true,
+        ..FrontendCaps::linux_fuse(true)
+    });
 }

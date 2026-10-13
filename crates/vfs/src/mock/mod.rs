@@ -732,6 +732,14 @@ impl Vfs for MockVfs {
         self.inner.handover_blockers.lock().unwrap().clone()
     }
 
+    /// Not recorded (it has no responder to script); the reference
+    /// filesystem drops what it kept for `ino` ([`RefView::forget`]).
+    fn forget(&self, ino: Ino) {
+        if let Some(view) = &self.inner.view {
+            view.forget(ino);
+        }
+    }
+
     fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx<'_>, parent: Ino, name: &Name, r: R) {
         let call = self.record(
             cx,

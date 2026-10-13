@@ -23,7 +23,10 @@
 //! - **Content.** Sparse files: bytes plus the list of ranges that hold
 //!   data, so `SEEK_DATA`/`SEEK_HOLE`, `fallocate` (plain, `KEEP_SIZE`,
 //!   `PUNCH_HOLE`, `ZERO_RANGE`) and truncate-then-grow-reads-zeros mean
-//!   what POSIX says. An unlinked file lives until its last handle closes.
+//!   what POSIX says. An unlinked file lives until its last handle closes;
+//!   after that, and after a directory's `rmdir`, the view that removed
+//!   it still answers its `getattr` with `nlink` 0, for the references
+//!   its platform may hold, until the platform's `forget`.
 //! - **Capabilities.** Every op the [`FrontendCaps`] withhold (hard links,
 //!   xattrs, special files, `fallocate`, `SEEK_HOLE`, cluster locks) is
 //!   refused the way the contract says: `NotSupported`, or `NotImplemented`
@@ -497,6 +500,7 @@ impl RefFs {
             confine_links,
             id,
             sink: Mutex::new(None),
+            dead: Mutex::new(HashMap::new()),
         })
     }
 
@@ -606,6 +610,10 @@ pub struct RefView {
     confine_links: bool,
     id: u64,
     sink: Mutex<Option<Arc<Sink>>>,
+    /// The final attributes (`nlink` 0) of the inodes this view removed,
+    /// which its platform may still reference: `getattr` answers them
+    /// until [`RefView::forget`] (see [`RefView::bury`]).
+    dead: Mutex<HashMap<Ino, Attr>>,
 }
 
 /// The outcome of a lock attempt.
@@ -893,10 +901,33 @@ impl RefView {
     }
 
     pub fn getattr(&self, ino: Ino, _fh: Option<Fh>) -> VfsResult<Attr> {
-        self.read_only(|st| match self.enter(st, ino)? {
-            Target::Real(real) => Ok(self.attr_of(st, real)),
-            Target::Syn(syn) => Ok(self.syn_attr(st, &syn, ino)),
+        self.read_only(|st| match self.enter(st, ino) {
+            Ok(Target::Real(real)) => Ok(self.attr_of(st, real)),
+            Ok(Target::Syn(syn)) => Ok(self.syn_attr(st, &syn, ino)),
+            Err(code @ (Code::NotFound | Code::Stale)) => {
+                let dead = self.dead.lock().unwrap().get(&ino).cloned();
+                dead.ok_or_else(|| code.into())
+            }
+            Err(code) => Err(code.into()),
         })
+    }
+
+    /// The platform let go of `ino` ([`crate::Vfs::forget`]): what this
+    /// view kept to answer for it, had it removed it, goes.
+    pub fn forget(&self, ino: Ino) {
+        self.dead.lock().unwrap().remove(&ino);
+    }
+
+    /// This view is about to remove `real` for good (its last name and
+    /// handle are gone): keep its final attributes, `nlink` 0, for the
+    /// platform's references (a working directory, an `O_PATH`
+    /// descriptor), whose `fstat` answers so on a local filesystem, until
+    /// the platform's `forget`. Per view, as only this view's platform
+    /// was handed the inode by this view; inode numbers are never reused.
+    fn bury(&self, st: &State, real: Ino) {
+        let mut attr = self.attr_of(st, real);
+        attr.nlink = 0;
+        self.dead.lock().unwrap().insert(real, attr);
     }
 
     pub fn setattr(&self, ino: Ino, _fh: Option<Fh>, set: &SetAttr) -> VfsResult<Attr> {
@@ -1128,7 +1159,7 @@ impl RefView {
     }
 
     /// Drop one name of `ino`; reap it when nothing names or holds it.
-    fn drop_name(st: &mut State, ino: Ino, parent: Ino, now: i64) {
+    fn drop_name(&self, st: &mut State, ino: Ino, parent: Ino, now: i64) {
         let open = st.opens.get(&ino).copied().unwrap_or(0) > 0;
         let node = st.nodes.get_mut(&ino).expect("linked node exists");
         node.nlink = node.nlink.saturating_sub(1);
@@ -1137,6 +1168,7 @@ impl RefView {
             node.parents.remove(at);
         }
         if node.nlink == 0 && !open {
+            self.bury(st, ino);
             st.nodes.remove(&ino);
             st.locks.remove(&ino);
         }
@@ -1156,7 +1188,7 @@ impl RefView {
             }
             let now = st.tick();
             Self::detach(st, dir, &stored, now);
-            Self::drop_name(st, child, dir, now);
+            self.drop_name(st, child, dir, now);
             changes.push(Invalidation::Entry {
                 parent: dir,
                 name: NameBuf::new(stored),
@@ -1187,6 +1219,7 @@ impl RefView {
             }
             let now = st.tick();
             Self::detach(st, dir, &stored, now);
+            self.bury(st, child);
             st.nodes.remove(&child);
             changes.push(Invalidation::Entry {
                 parent: dir,
@@ -1304,9 +1337,10 @@ impl RefView {
                     }
                     Self::detach(st, ddir, &new, now);
                     if dst_dir {
+                        self.bury(st, dst);
                         st.nodes.remove(&dst);
                     } else {
-                        Self::drop_name(st, dst, ddir, now);
+                        self.drop_name(st, dst, ddir, now);
                     }
                 }
                 Self::detach(st, sdir, &old, now);
@@ -1512,6 +1546,7 @@ impl RefView {
                 if *open == 0 {
                     st.opens.remove(&h.ino);
                     if st.nodes.get(&h.ino).is_some_and(|n| n.nlink == 0) {
+                        self.bury(st, h.ino);
                         st.nodes.remove(&h.ino);
                         st.locks.remove(&h.ino);
                     }
