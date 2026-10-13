@@ -773,7 +773,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "fallocate-sparse",
-        desc: "large sparse extend, hole punch, SEEK_HOLE/DATA, rewrite, and fresh-node verification",
+        desc: "large sparse extend, hole punch, SEEK_HOLE/DATA, rewrite, an allocation that changes nothing still moving mtime, and fresh-node verification",
         requires: &[],
         caps: &[Cap::Fallocate, Cap::SeekHole],
         run: fallocate_sparse,
@@ -8004,10 +8004,46 @@ fn fallocate_sparse(seed: u64) -> Result<()> {
         peak_rss / 1024 / 1024
     );
     anyhow::ensure!(std::fs::metadata(&path)?.len() == file_len);
+
+    // Every successful `fallocate` stamps mtime, also one that changes
+    // no byte and no size (xcheckfs: these kept the time `futimens` had
+    // set); the fresh node below sees the time the close published.
+    let stamped = a.mnt.join("stamped.bin");
+    std::fs::write(&stamped, vec![1u8; 65536])?;
+    let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    for (what, mode, offset, len) in [
+        ("an allocation inside the file", 0, 0, 4096),
+        ("KEEP_SIZE inside", libc::FALLOC_FL_KEEP_SIZE, 0, 4096),
+        (
+            "KEEP_SIZE past the end",
+            libc::FALLOC_FL_KEEP_SIZE,
+            65536,
+            65536,
+        ),
+    ] {
+        let file = std::fs::OpenOptions::new().write(true).open(&stamped)?;
+        file.set_modified(old)?;
+        // SAFETY: a plain `fallocate(2)` on an fd we own.
+        let rc = unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, len) };
+        anyhow::ensure!(rc == 0, "{what}: {}", std::io::Error::last_os_error());
+        let mtime = file.metadata()?.modified()?;
+        anyhow::ensure!(
+            mtime > old + Duration::from_secs(60),
+            "{what} left mtime at {mtime:?}"
+        );
+    }
+    let stamped_mtime = std::fs::metadata(&stamped)?.modified()?;
     a.unmount()?;
 
     let mut b = Client::new(root.path(), "b", &env.endpoint, &backend)?.with_cache_size(cache_size);
     b.mount()?;
+    let seen = std::fs::metadata(b.mnt.join("stamped.bin"))?;
+    anyhow::ensure!(
+        (seen.len(), seen.modified()?) == (65536, stamped_mtime),
+        "fresh node: stamped.bin is {} bytes, mtime {:?}, not {stamped_mtime:?}",
+        seen.len(),
+        seen.modified()?
+    );
     let second = std::fs::File::open(b.mnt.join("sparse.bin"))?;
     let mut marker = [0u8; 4];
     second.read_exact_at(&mut marker, 0)?;

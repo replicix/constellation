@@ -375,6 +375,103 @@ pub(super) fn fallocate_modes(env: &Env<'_>) -> TestResult {
     Ok(())
 }
 
+/// Every successful `fallocate` is a modification (ext4, xfs, btrfs and
+/// tmpfs stamp mtime and ctime for each): also the ones that change no
+/// byte and no size — an allocation inside the file, any `KEEP_SIZE`
+/// allocation, a zeroing or a punch past the end. The time is the
+/// file's live, and the one its close publishes.
+pub(super) fn fallocate_stamps_mtime_and_ctime(env: &Env<'_>) -> TestResult {
+    const OLD: i64 = 1_000_000_000_000_000;
+    let fx = env.fresh();
+    let c = fx.client();
+    let ino = must("put", c.put(c.root(), "f", &[1u8; 65536])).attr.ino;
+    for (what, off, len, mode) in [
+        (
+            "an allocation inside the file",
+            0,
+            4096,
+            FallocateMode::empty(),
+        ),
+        (
+            "an allocation that extends it",
+            65536,
+            4096,
+            FallocateMode::empty(),
+        ),
+        (
+            "KEEP_SIZE inside the file",
+            0,
+            4096,
+            FallocateMode::KEEP_SIZE,
+        ),
+        (
+            "KEEP_SIZE past the end",
+            131072,
+            65536,
+            FallocateMode::KEEP_SIZE,
+        ),
+        (
+            "a punch inside the file",
+            0,
+            4096,
+            FallocateMode::PUNCH_HOLE | FallocateMode::KEEP_SIZE,
+        ),
+        (
+            "a punch past the end",
+            262144,
+            4096,
+            FallocateMode::PUNCH_HOLE | FallocateMode::KEEP_SIZE,
+        ),
+        (
+            "a zeroing inside the file",
+            4096,
+            4096,
+            FallocateMode::ZERO_RANGE,
+        ),
+        (
+            "a KEEP_SIZE zeroing past the end",
+            262144,
+            4096,
+            FallocateMode::ZERO_RANGE | FallocateMode::KEEP_SIZE,
+        ),
+    ] {
+        let set = must(
+            "setattr",
+            c.setattr(
+                ino,
+                None,
+                &SetAttr {
+                    mtime: Some(TimeSet::At(OLD)),
+                    ..SetAttr::default()
+                },
+            ),
+        );
+        assert_eq!(set.mtime_ns, OLD);
+        let o = must("open", c.open_rw(ino));
+        must(what, c.fallocate(ino, o.fh, off, len, mode));
+        let live = must("getattr", c.getattr(ino));
+        assert!(
+            live.mtime_ns > OLD,
+            "{what} left mtime at {}",
+            live.mtime_ns
+        );
+        assert!(
+            live.ctime_ns > set.ctime_ns && live.ctime_ns >= live.mtime_ns,
+            "{what}: ctime {} (was {}, mtime {})",
+            live.ctime_ns,
+            set.ctime_ns,
+            live.mtime_ns
+        );
+        must("close", c.close(ino, o.fh));
+        assert_eq!(
+            must("getattr after close", c.getattr(ino)).mtime_ns,
+            live.mtime_ns,
+            "{what}: the close publishes the allocation's mtime"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn fallocate_absent_is_not_supported(env: &Env<'_>) -> TestResult {
     let mut caps = env.caps().clone();
     caps.fallocate = false;

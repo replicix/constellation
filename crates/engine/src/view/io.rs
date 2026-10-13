@@ -590,16 +590,29 @@ impl View {
         if new_size > old_size {
             self.quota_check(ino, new_size)?;
         }
+        // Every successful `fallocate` is a data change (ext4, xfs and
+        // tmpfs stamp each), also one that changes no byte and no size —
+        // an allocation inside the file, a `KEEP_SIZE` one, a punch or a
+        // zeroing past the end: its session carries mtime and ctime to
+        // the file's next manifest commit, as a write's does. The other
+        // paths stamp through `truncate` and the zeroing below.
+        let stamp = || {
+            let mut writes = self.writes.lock(ino);
+            self.write_state(&mut writes, ino, &manifest)
+                .map(WriteState::changed)
+        };
         if !punch && !zero {
             if new_size != old_size {
                 self.truncate(ino, new_size)?;
+            } else {
+                stamp()?;
             }
             return Ok(());
         }
 
         let effective_end = end.min(new_size);
         if offset >= effective_end {
-            return Ok(());
+            return stamp();
         }
         let chunk_size = u64::from(self.chunk_size);
         let full_start = offset.div_ceil(chunk_size);

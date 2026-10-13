@@ -642,6 +642,7 @@ tests! {
         large_multi_chunk_file [],
         fsync_levels [],
         fallocate_modes [Fallocate],
+        fallocate_stamps_mtime_and_ctime [Fallocate],
         fallocate_absent_is_not_supported [],
         seek_data_and_hole [SeekHole],
         seek_absent_is_not_supported [],
@@ -919,6 +920,7 @@ mod tests {
             ("namespace::special_files", "SpecialFiles"),
             ("xattr::set_get_list_remove", "Xattrs"),
             ("io::fallocate_modes", "Fallocate"),
+            ("io::fallocate_stamps_mtime_and_ctime", "Fallocate"),
             ("io::seek_data_and_hole", "SeekHole"),
             (
                 "invalidation::remote_create_invalidates_the_name",

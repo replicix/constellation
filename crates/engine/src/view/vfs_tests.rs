@@ -942,6 +942,64 @@ fn seek_fallocate_statfs_and_fsync() {
     assert!(st.blocks >= st.bfree);
 }
 
+/// xcheckfs: an allocation that changes neither a byte nor the size (one
+/// inside the file, a `KEEP_SIZE` one) left mtime where `utimes` had put
+/// it. Like every other `fallocate` it stamps the write session, and the
+/// close commits that mtime into the inode's row — what replicates.
+#[test]
+fn an_allocation_that_changes_nothing_still_moves_mtime() {
+    const OLD: i64 = 1_000_000_000_000_000;
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, &[1u8; 65536]).unwrap();
+    c.close(ino, o.fh).unwrap();
+    for (off, len, mode) in [
+        (0, 4096, FallocateMode::empty()),
+        (0, 4096, FallocateMode::KEEP_SIZE),
+        (65536, 65536, FallocateMode::KEEP_SIZE),
+    ] {
+        Blocking::run(|r| {
+            c.view.setattr(
+                &c.cx(OpKind::Setattr),
+                ino,
+                None,
+                &SetAttr {
+                    mtime: Some(TimeSet::At(OLD)),
+                    ..SetAttr::default()
+                },
+                r,
+            )
+        })
+        .unwrap();
+        let o = Blocking::run(|r| {
+            c.view.open(
+                &c.cx(OpKind::Open),
+                ino,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap();
+        Blocking::run(|r| {
+            c.view
+                .fallocate(&c.cx(OpKind::Fallocate), ino, o.fh, off, len, mode, r)
+        })
+        .unwrap();
+        let live = c.getattr(ino).unwrap();
+        assert!(live.mtime_ns > OLD, "{mode:?} {off}+{len}: mtime not moved");
+        c.close(ino, o.fh).unwrap();
+        let row = c._meta.getattr(ino).unwrap().unwrap();
+        assert_eq!(
+            (row.mtime_ns, row.size),
+            (live.mtime_ns, 65536),
+            "{mode:?} {off}+{len}: the committed row"
+        );
+        assert!(row.ctime_ns >= row.mtime_ns);
+    }
+}
+
 #[test]
 fn sync_view_publishes_every_pending_write() {
     let c = client();

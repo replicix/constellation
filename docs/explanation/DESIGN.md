@@ -255,6 +255,18 @@ and would become a conflict copy, `--cto strict` would no longer see
 every completed close, and the node's own reads would need a new kind of
 speculation.
 
+**File times.** A write session carries the file's mtime and ctime:
+every data change stamps both, a `utimes`/`futimens` through the open
+file replaces the mtime, `getattr` overlays the session on the committed
+row meanwhile, and the manifest commit publishes the session's mtime, so
+every replica replays the writer's time, not the commit's. A data change
+is a `write`, a `truncate` and every successful `fallocate`, as on ext4,
+xfs and tmpfs — also one that changes no byte and no size (an allocation
+inside the file, a `KEEP_SIZE` one, a punch past the end). Such an
+`fallocate` stays metadata-only and lease-free (§12): if no session is
+open it starts one, as a same-size `ftruncate` does, and the close
+commits a manifest that names no new chunk.
+
 **Dedup and the condemned check.** A chunk upload is a create-if-absent,
 or a `HEAD` first when a positive hint (the existence cache, a peer's
 chunk set) says the chunk is probably there already. A chunk below
