@@ -616,10 +616,11 @@ impl View {
     /// directory that is some process's working directory — and `fstat`
     /// of that must answer `nlink == 0`, not `ENOENT` (which it did: every
     /// `unlink` through xcheckfs, which stats its `O_PATH` handle after
-    /// the operation, was a mismatch). A file such a reference can also
-    /// reopen stays in the replica instead, under a frontend that keeps
-    /// unlinked inodes ([`View::reap_after_unlink`]); this covers
-    /// directories, and files under any other. Dropped at the kernel's
+    /// the operation, was a mismatch). Under a frontend that reports its
+    /// platform letting go, a removed file or directory stays in the
+    /// replica instead, as an orphan ([`View::reap_after_unlink`]), and
+    /// the reference reopens it, changes its attributes and xattrs; this
+    /// covers frontends that do not. Dropped at the kernel's
     /// `FORGET` ([`Vfs::forget`]), or the oldest past [`DEAD_INODES_MAX`].
     /// Inode numbers are never reused, so an entry never answers for
     /// another file.
@@ -635,14 +636,6 @@ impl View {
 
     pub(crate) fn forget_dead(&self, ino: Ino) {
         self.dead.lock().unwrap().map.remove(&ino);
-    }
-
-    /// Remember `ino` as dead unless the replica still has it (another
-    /// name, an orphan an open handle keeps).
-    pub(crate) fn remember_if_gone(&self, attr: FileAttr) {
-        if matches!(self.meta.getattr(attr.ino), Ok(None)) {
-            self.remember_dead(attr);
-        }
     }
 
     /// `owner` locked `ino` through handle `fh`. An open file
@@ -879,7 +872,8 @@ impl View {
     /// [`View::reap_after_unlink`], which settles it (as
     /// [`View::unlink_failed`] does if the name stays).
     pub(crate) fn unlinking(&self, attr: &FileAttr) {
-        if self.keeps_referenced() && attr.kind != InodeKind::Dir && attr.nlink <= 1 {
+        // A directory has one name (its `nlink` counts its `..`s).
+        if self.keeps_referenced() && (attr.kind == InodeKind::Dir || attr.nlink <= 1) {
             self.unlinked_refs
                 .lock()
                 .unwrap()
@@ -911,11 +905,12 @@ impl View {
     /// answers `ENOENT`, from `lookup`, and so do the ops addressed by a
     /// parent and a name; what answers `ESTALE` is a reference that
     /// outlived the inode (`/proc/self/fd/N` of an `O_PATH` descriptor).
-    /// An inode this view removed itself answers from
-    /// [`View::remember_dead`] (a removed directory's `readdir` stays
-    /// `ENOENT`, as on a local filesystem, while its entry lives: until
-    /// the kernel's `FORGET`, or past [`DEAD_INODES_MAX`] newer ones) or
-    /// from the replica until the kernel's `FORGET`. The view's own
+    /// An inode this view removed itself answers from the replica (an
+    /// orphan, [`View::reap_after_unlink`]) until the kernel's `FORGET`,
+    /// or, under a frontend that sends none, from [`View::remember_dead`]
+    /// while its entry lives (past [`DEAD_INODES_MAX`] newer ones it is
+    /// stale too); a removed directory's `readdir` stays `ENOENT`, as on
+    /// a local filesystem. The view's own
     /// synthetic inodes (`.constellation`, snapshot mirrors) are never in
     /// the replica: their `NotFound` stays. Free unless `code` is
     /// `NotFound`.

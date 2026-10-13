@@ -183,6 +183,21 @@ fn an_unlinked_last_name_is_reported_from_before_the_unlink() {
     );
 }
 
+/// A one-chunk manifest: data a hold protects.
+fn with_data() -> Vec<u8> {
+    use constellation_fs_core::manifest::{ChunkInfo, Manifest};
+    Manifest {
+        layout: constellation_fs_core::ChunkLayout::new(4096),
+        file_len: 4,
+        chunks: ChunkInfo::Inline(
+            [(0u64, constellation_fs_core::ChunkHash::of(b"data"))]
+                .into_iter()
+                .collect(),
+        ),
+    }
+    .encode()
+}
+
 /// Two views of one node over a shared hold writer, both reporting
 /// `forget`s (two FUSE mounts).
 struct TwoViews {
@@ -273,7 +288,9 @@ fn a_referenced_orphan_is_claimed_without_waiting_for_the_refresh() {
     use constellation_vfs::{Blocking, Name, OpCtx, OpKind, Vfs};
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     meta.set_node_prefix(1).unwrap();
-    meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    // Data for a hold to protect (an orphan without any is never claimed).
+    meta.set_manifest(f.ino, &with_data(), 4).unwrap();
     let views = two_forgetting_views(&meta, std::time::Duration::from_secs(30));
     let (a, holds, store) = (&views.a, &views.holds, &views.store);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -320,6 +337,9 @@ fn a_forget_runs_a_hold_pass_only_for_a_claimed_reference() {
     meta.set_node_prefix(1).unwrap();
     let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
     let g = meta.create(ROOT_INO, "g", 0o644, 0, 0).unwrap();
+    for ino in [f.ino, g.ino] {
+        meta.set_manifest(ino, &with_data(), 4).unwrap();
+    }
     let views = two_forgetting_views(&meta, std::time::Duration::from_secs(30));
     let (a, holds, store) = (&views.a, &views.holds, &views.store);
     let rt = tokio::runtime::Builder::new_multi_thread()

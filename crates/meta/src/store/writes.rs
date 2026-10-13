@@ -837,7 +837,6 @@ fn rename_in_tx(
     tx: &mut SingleWriterWriteTx,
     ns_ks: &SingleWriterTxKeyspace,
     dirty: ns::Dirty,
-    atime_ks: &SingleWriterTxKeyspace,
     orphans_ks: &SingleWriterTxKeyspace,
     xattr_by_name_ks: &SingleWriterTxKeyspace,
     chunk_ref: &SingleWriterTxKeyspace,
@@ -889,15 +888,22 @@ fn rename_in_tx(
             if ns::has_children(tx, ns_ks, existing.ino)? {
                 return Err(MetaError::NotEmpty);
             }
+            // An orphan, as `rmdir`'s (`ns::orphan_dir`).
+            let mut orphan_rec = existing_rec.clone();
+            orphan_rec.attrs.nlink = 0;
+            orphan_rec.attrs.ctime_ns = t;
+            ns::orphan_inode(
+                tx,
+                ns_ks,
+                dirty,
+                blobs,
+                xattr_by_name_ks,
+                orphans_ks,
+                existing.ino,
+                &existing_rec,
+                orphan_rec,
+            )?;
             ns::ns_remove(tx, ns_ks, dirty, keys::inode(existing.ino))?;
-            ns::clear_spilled_xattrs(tx, ns_ks, dirty, existing.ino)?;
-            let names: Vec<Vec<u8>> =
-                ns::all_xattrs(tx, ns_ks, blobs, &existing_rec, existing.ino)?
-                    .into_iter()
-                    .map(|(n, _)| n.into_bytes())
-                    .collect();
-            misc::xattr_by_name_del_all_tx(tx, xattr_by_name_ks, existing.ino, names);
-            atime::remove_atime_tx(tx, atime_ks, existing.ino);
             misc::bump_nlink_tx(tx, ns_ks, dirty, new_parent, -1, t)?;
         } else if existing_rec.attrs.nlink <= 1 {
             let manifest_bytes = existing_rec
@@ -1139,7 +1145,6 @@ impl Meta {
             &mut tx,
             &self.ns,
             dirty,
-            &self.atime,
             &self.orphans,
             &self.xattr_by_name,
             &self.chunk_ref,
@@ -1818,14 +1823,7 @@ impl MetaStore for Meta {
         }
         let t = now_ns();
         ns::remove_dentry(&mut tx, &self.ns, dirty, parent, name, ino)?;
-        ns::ns_remove(&mut tx, &self.ns, dirty, keys::inode(ino))?;
-        let names: Vec<Vec<u8>> = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?
-            .into_iter()
-            .map(|(n, _)| n.into_bytes())
-            .collect();
-        ns::clear_spilled_xattrs(&mut tx, &self.ns, dirty, ino)?;
-        misc::xattr_by_name_del_all_tx(&mut tx, &self.xattr_by_name, ino, names);
-        atime::remove_atime_tx(&mut tx, &self.atime, ino);
+        ns::orphan_dir(&mut tx, self, dirty, ino, &rec, t)?;
         misc::bump_nlink_tx(&mut tx, &self.ns, dirty, parent, -1, t)?;
         journal::append_tx(
             &mut tx,

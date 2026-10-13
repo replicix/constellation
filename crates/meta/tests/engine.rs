@@ -161,6 +161,52 @@ fn an_orphan_keeps_its_xattrs_until_it_is_reaped() {
     }
 }
 
+/// A removed directory becomes an orphan as an unlinked file does —
+/// `rmdir` here, one replayed from the log, and an empty directory a
+/// rename replaced — with its attributes and xattrs, out of `ns` and the
+/// by-name index; reaped, nothing of it is left.
+#[test]
+fn a_removed_directory_is_an_orphan_until_it_is_reaped() {
+    for how in ["rmdir", "replayed", "renamed over"] {
+        let meta = Meta::open_in_memory().unwrap();
+        let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        meta.set_xattr(d.ino, "user.a", b"1", SetXattrMode::Set)
+            .unwrap();
+        match how {
+            "rmdir" => meta.rmdir(ROOT_INO, "d").unwrap(),
+            "replayed" => meta
+                .apply_records(&[constellation_meta::LogRecord::Rmdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    time_ns: 9,
+                }])
+                .unwrap(),
+            _ => {
+                meta.mkdir(ROOT_INO, "e", 0o755, 0, 0).unwrap();
+                meta.rename(ROOT_INO, "e", ROOT_INO, "d").unwrap();
+            }
+        }
+        assert!(meta
+            .lookup(ROOT_INO, "d")
+            .unwrap()
+            .is_none_or(|a| a.ino != d.ino));
+        assert_eq!(meta.orphans().unwrap(), vec![d.ino], "{how}");
+        let attr = meta.getattr(d.ino).unwrap().unwrap();
+        assert_eq!(attr.nlink, 0, "{how}");
+        assert_eq!(meta.list_xattrs(d.ino).unwrap(), ["user.a"]);
+        assert!(!meta.any_xattr_named("user.a").unwrap(), "{how}");
+        let subdirs = u32::from(how == "renamed over");
+        assert_eq!(
+            meta.getattr(ROOT_INO).unwrap().unwrap().nlink,
+            2 + subdirs,
+            "{how}"
+        );
+        meta.reap_orphan(d.ino).unwrap();
+        assert!(meta.orphans().unwrap().is_empty());
+        assert!(meta.getattr(d.ino).unwrap().is_none());
+    }
+}
+
 #[test]
 fn unlinking_one_of_several_hardlinks_does_not_orphan_the_inode() {
     let meta = Meta::open_in_memory().unwrap();

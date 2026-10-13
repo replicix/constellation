@@ -46662,3 +46662,41 @@ were never journaled.
 unlink, inline and spilled sets, the index), `an_orphans_xattrs_persist_across_reopen`,
 `speculation::a_stranded_unlink_leaves_no_orphan_xattrs`, and the xattrs
 in `rebuild_orphans`.
+
+## Fix: a removed directory is an orphan (`opath-unlinked` remainder 2, 2026-10-13)
+
+`chmod`, `utimes` and the xattr ops through a reference to a removed
+directory (a working directory, an `O_PATH` descriptor) answered `ENOENT`;
+ext4 keeps the directory's attributes and xattrs and changes them. It is
+what failed the rmdir faults of xcheckfs's
+`every_transient_fault_is_repaired_on_the_canonical_workload`: the repair
+of the `(deleted)` directory compares its xattr names ("xattr names still
+differ").
+
+### Cause
+
+`rmdir` — local, replayed, and a rename over an empty directory — dropped
+the directory outright; only the view's `DeadInodes` (8a6f96c) kept its
+attributes, read-only.
+
+### What changed
+
+- `ns::orphan_dir`: a removed directory becomes an orphan on every replica
+  (`rmdir`, its replay, a rename over an empty directory), xattrs and all
+  (`ns::orphan_inode`), kept for the kernel's reference by the view that
+  removed it (`View::unlinking` registers directories now) and reaped as a
+  file's orphan otherwise. `View::remember_if_gone` is gone: `rmdir` and a
+  rename over a directory go through `reap_after_unlink`, which falls back
+  to `DeadInodes` for a frontend that sends no `forget`s.
+- The hold writer claims only orphans with data (`Holds::with_data`): a
+  removed directory a shell sits in never costs a hold write.
+
+Every `rmdir` now writes an orphan record the reaper removes soon after, on
+every replica — what an `unlink` already costs.
+
+### Tests
+
+`view::vfs_tests::a_removed_directory_is_kept_until_it_is_forgotten` and
+meta `a_removed_directory_is_an_orphan_until_it_is_reaped` (rmdir,
+replayed, renamed over) fail on the previous main; new
+`holds::tests::an_orphan_without_data_is_kept_but_never_claimed`.

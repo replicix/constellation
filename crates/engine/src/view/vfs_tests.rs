@@ -416,6 +416,46 @@ fn an_unlinked_file_keeps_and_changes_its_xattrs() {
     assert_eq!(code(c.listxattr(f)), Code::Stale);
 }
 
+/// A removed directory the kernel still references (a process's working
+/// directory, an `O_PATH` descriptor) keeps its attributes and xattrs,
+/// and `chmod`, `utimes` and the xattr ops through the reference change
+/// them, as on a local filesystem (all answered `ENOENT` before), until
+/// the kernel's `FORGET` reaps it. Listing it answers `ENOENT`.
+#[test]
+fn a_removed_directory_is_kept_until_it_is_forgotten() {
+    let c = fuse_client();
+    let d = c.mkdir(ROOT_INO, "d").unwrap().attr.ino;
+    c.setxattr(d, "user.a", b"1", SetXattrFlags::empty())
+        .unwrap();
+    c.rmdir(ROOT_INO, "d").unwrap();
+    assert_eq!(code(c.lookup(ROOT_INO, "d")), Code::NotFound);
+
+    let attr = c.getattr(d).unwrap();
+    assert_eq!((attr.kind, attr.nlink), (FileKind::Dir, 0));
+    assert_eq!(c.listxattr(d).unwrap(), ["user.a"]);
+    c.setxattr(d, "user.b", b"2", SetXattrFlags::empty())
+        .unwrap();
+    c.removexattr(d, "user.a").unwrap();
+    assert_eq!(c.listxattr(d).unwrap(), ["user.b"]);
+    let attr = c
+        .setattr(
+            d,
+            &SetAttr {
+                mode: Some(0o700),
+                mtime: Some(TimeSet::At(2_000_000_000)),
+                ..SetAttr::default()
+            },
+        )
+        .unwrap();
+    assert_eq!((attr.mode & 0o7777, attr.mtime_ns), (0o700, 2_000_000_000));
+    assert_eq!(code(c.readdir(d, 0, 10)), Code::NotFound);
+    assert_eq!(code(c.mkdir(d, "inside")), Code::NotFound);
+
+    c.view.forget(d);
+    assert_eq!(code(c.getattr(d)), Code::Stale);
+    assert!(c._meta.orphans().unwrap().is_empty());
+}
+
 /// The kernel may send an unlinked file's `FORGET` before the `RELEASE`
 /// of its last handle (the two travel apart): the forget leaves the
 /// orphan to the handle, whose close then reaps it.
@@ -514,7 +554,9 @@ fn an_inode_removed_elsewhere_is_a_stale_handle() {
     .ino;
     c._meta.rmdir(ROOT_INO, "d").unwrap();
     c._meta.unlink(ROOT_INO, "l").unwrap();
-    c._meta.reap_orphan(l).unwrap();
+    for ino in [d, l] {
+        c._meta.reap_orphan(ino).unwrap();
+    }
     assert_eq!(code(c.readdir(d, 0, 10)), Code::Stale);
     assert_eq!(code(c.getattr(d)), Code::Stale);
     assert_eq!(

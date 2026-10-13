@@ -366,19 +366,25 @@ impl Holds {
         Ok(held)
     }
 
-    /// Every chunk hash the held orphans' manifests name (the spill chunk
-    /// of a spilled list included, as `gc::live_roots` counts them).
-    async fn held_chunks(&self, inodes: &[Ino]) -> Result<BTreeSet<String>> {
-        let mut out = BTreeSet::new();
+    /// The held orphans with data, and every chunk hash their manifests
+    /// name (the spill chunk of a spilled list included, as
+    /// `gc::live_roots` counts them). An orphan with no manifest — a
+    /// removed directory a working directory keeps, a file never written —
+    /// has nothing for GC to keep: it is left out, so it never costs a
+    /// hold write.
+    async fn with_data(&self, inodes: &[Ino]) -> Result<(Vec<Ino>, BTreeSet<String>)> {
+        let mut chunks = BTreeSet::new();
+        let mut held = Vec::with_capacity(inodes.len());
         for &ino in inodes {
             let Some(bytes) = self.meta.manifest(ino)? else {
                 continue;
             };
+            held.push(ino);
             for hash in manifest_chunk_hashes(&self.chunks, &bytes).await? {
-                out.insert(hash.to_hex());
+                chunks.insert(hash.to_hex());
             }
         }
-        Ok(out)
+        Ok((held, chunks))
     }
 
     /// One pass: compute the held set, then write, re-stamp or delete
@@ -402,6 +408,8 @@ impl Holds {
             let mut wake_at = self.wake_at.lock().unwrap();
             *wake_at = Some(wake_at.map_or(at, |current| current.min(at)));
         }
+        let (inodes, chunks) = self.with_data(&inodes).await?;
+        let chunks: Vec<String> = chunks.into_iter().collect();
         let key = layout::hold(self.node_id);
         if inodes.is_empty() {
             if self.published.swap(false, Ordering::Relaxed) {
@@ -417,7 +425,6 @@ impl Holds {
             }
             return Ok(());
         }
-        let chunks: Vec<String> = self.held_chunks(&inodes).await?.into_iter().collect();
         let now = constellation_store_s3::lease::now_unix_ms();
         let body = HoldBody {
             v: HOLD_VERSION,
@@ -727,6 +734,8 @@ mod tests {
         let meta = Arc::new(Meta::open_in_memory().unwrap());
         meta.set_node_prefix(7).unwrap();
         let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        meta.set_manifest(f.ino, &inline_manifest(ChunkHash::of(b"f")), 4)
+            .unwrap();
         meta.unlink(ROOT_INO, "f").unwrap();
         // Referenced since before this process: claimed (written) at once.
         let view = Arc::new(Referenced(Mutex::new(vec![(f.ino, None)])));
@@ -758,5 +767,68 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         holds.nudge();
         task.await.unwrap();
+    }
+
+    /// A referenced orphan with no data — a removed directory that is a
+    /// working directory, a file never written — has nothing for GC to
+    /// keep: it is neither reaped nor claimed, and alone it costs no hold
+    /// write; one with data beside it is claimed alone.
+    #[tokio::test]
+    async fn an_orphan_without_data_is_kept_but_never_claimed() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        meta.set_node_prefix(7).unwrap();
+        let d = meta.mkdir(ROOT_INO, "d", 0o755, 0, 0).unwrap();
+        meta.rmdir(ROOT_INO, "d").unwrap();
+        let empty = meta.create(ROOT_INO, "empty", 0o644, 0, 0).unwrap();
+        meta.unlink(ROOT_INO, "empty").unwrap();
+        let view = Arc::new(Referenced(Mutex::new(vec![
+            (d.ino, None),
+            (empty.ino, None),
+        ])));
+        let sources = Arc::new(HoldSources::default());
+        sources.register(1, Arc::downgrade(&view) as Weak<dyn OpenHandles>);
+        let holds = Holds::new(
+            store.clone(),
+            Arc::new(ChunkStore::new(store.clone())),
+            meta.clone(),
+            7,
+            sources,
+            HoldConfig {
+                refresh: Duration::from_secs(60),
+                ttl: Duration::from_secs(180),
+            },
+        );
+        holds.refresh_once().await.unwrap();
+        let mut orphans = meta.orphans().unwrap();
+        orphans.sort();
+        assert_eq!(orphans, {
+            let mut v = vec![d.ino, empty.ino];
+            v.sort();
+            v
+        });
+        assert!(store.head(&layout::hold(7)).await.is_err(), "no hold write");
+
+        // A file with data beside them is claimed alone.
+        let hash = ChunkHash::of(b"data");
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        meta.set_manifest(f.ino, &inline_manifest(hash), 4).unwrap();
+        meta.unlink(ROOT_INO, "f").unwrap();
+        view.0.lock().unwrap().push((f.ino, None));
+        holds.refresh_once().await.unwrap();
+        let body: HoldBody = serde_json::from_slice(
+            &store
+                .get(&layout::hold(7))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (body.inodes, body.chunks),
+            (vec![f.ino], vec![hash.to_hex()])
+        );
     }
 }

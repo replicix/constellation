@@ -926,18 +926,11 @@ fn evict_dentry(
             return Ok(Applied::Skipped("name held by non-empty directory"));
         }
         ns::remove_dentry(tx, &meta.ns, dirty, parent, name, ino)?;
-        ns::ns_remove(tx, &meta.ns, dirty, keys::inode(ino))?;
+        ns::orphan_dir(tx, meta, dirty, ino, &rec, t)?;
         // The parent lost a subdirectory (`..`): the same delta the
         // writer applied (`writes::rename_in_tx`); plan 30 §M12 makes
         // every parent delta additive, so replay must carry it too.
         misc::bump_nlink_tx(tx, &meta.ns, dirty, parent, -1, t)?;
-        ns::clear_spilled_xattrs(tx, &meta.ns, dirty, ino)?;
-        let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
-            .into_iter()
-            .map(|(n, _)| n.into_bytes())
-            .collect();
-        misc::xattr_by_name_del_all_tx(tx, &meta.xattr_by_name, ino, names);
-        atime::remove_atime_tx(tx, &meta.atime, ino);
     } else {
         ns::remove_dentry(tx, &meta.ns, dirty, parent, name, ino)?;
         if rec.attrs.nlink <= 1 {
@@ -1043,9 +1036,7 @@ fn apply_rmdir(
         return Ok(Applied::Skipped("directory not empty locally"));
     }
     ns::remove_dentry(tx, &meta.ns, dirty, parent, name, d.ino)?;
-    ns::ns_remove(tx, &meta.ns, dirty, keys::inode(d.ino))?;
-    ns::clear_spilled_xattrs(tx, &meta.ns, dirty, d.ino)?;
-    atime::remove_atime_tx(tx, &meta.atime, d.ino);
+    ns::orphan_dir(tx, meta, dirty, d.ino, &rec, t)?;
     misc::bump_nlink_tx(tx, &meta.ns, dirty, parent, -1, t)?;
     Ok(Applied::Done)
 }

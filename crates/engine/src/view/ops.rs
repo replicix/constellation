@@ -726,6 +726,9 @@ impl Vfs for View {
                 Err(e) => Err(e.code()),
             }
         } else {
+            if let Ok(Some(attr)) = &target {
+                self.unlinking(attr);
+            }
             self.mutate_op(
                 parent,
                 constellation_meta::MutateOp::Rmdir {
@@ -736,12 +739,20 @@ impl Vfs for View {
         };
         match result {
             Ok(()) => {
+                // A removed directory is an orphan as an unlinked file
+                // is (`ns::orphan_dir`): kept for the kernel's
+                // reference to it, else reaped now.
                 if let Ok(Some(attr)) = target {
-                    self.remember_if_gone(attr);
+                    self.reap_after_unlink(attr.ino);
                 }
                 r.done(Ok(()))
             }
-            Err(e) => r.done(err(self.beneath_non_dir(e, &[parent]))),
+            Err(e) => {
+                if let Ok(Some(attr)) = target {
+                    self.unlink_failed(attr.ino);
+                }
+                r.done(err(self.beneath_non_dir(e, &[parent])))
+            }
         }
     }
 
@@ -940,17 +951,14 @@ impl Vfs for View {
                 // Like `unlink`'s: the target's last name went with no
                 // open handle in any view of this node, so reap it now
                 // (it was left in `orphans` for good).
+                // A replaced directory too (`rmdir`'s).
                 if let Some(attr) = replaced {
-                    if attr.kind == InodeKind::Dir {
-                        self.remember_if_gone(attr);
-                    } else {
-                        self.reap_after_unlink(attr.ino);
-                    }
+                    self.reap_after_unlink(attr.ino);
                 }
                 r.done(Ok(()))
             }
             Err(e) => {
-                if let Some(attr) = replaced.filter(|a| a.kind != InodeKind::Dir) {
+                if let Some(attr) = replaced {
                     self.unlink_failed(attr.ino);
                 }
                 r.done(err(self.beneath_non_dir(e, &[parent, newparent])))

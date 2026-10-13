@@ -213,6 +213,38 @@ pub(crate) fn orphan_inode(
     Ok(())
 }
 
+/// A removed (empty) directory leaves the namespace into `orphans`, as an
+/// unlinked file does (DESIGN §3): every replica keeps it, attributes and
+/// xattrs, for a view whose kernel still references it — a process's
+/// working directory, an `O_PATH` descriptor — and reaps it as a file's
+/// orphan ([`Meta::reap_orphan`]) once nothing does. Before, it was dropped
+/// at once, and `chmod`, `utimes` and the xattr ops through such a
+/// reference answered `ENOENT` where a local filesystem changes it.
+pub(crate) fn orphan_dir(
+    tx: &mut SingleWriterWriteTx,
+    meta: &Meta,
+    dirty: Dirty,
+    ino: Ino,
+    rec: &InodeRecord,
+    t: i64,
+) -> Result<(), MetaError> {
+    let mut orphan_rec = rec.clone();
+    orphan_rec.attrs.nlink = 0;
+    orphan_rec.attrs.ctime_ns = t;
+    orphan_inode(
+        tx,
+        &meta.ns,
+        dirty,
+        &meta.blobs,
+        &meta.xattr_by_name,
+        &meta.orphans,
+        ino,
+        rec,
+        orphan_rec,
+    )?;
+    ns_remove(tx, &meta.ns, dirty, keys::inode(ino))
+}
+
 pub(crate) fn child_ino(
     r: &impl Readable,
     ns: &SingleWriterTxKeyspace,
