@@ -759,7 +759,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "xattr-roundtrip",
-        desc: "file and directory xattrs replicate; removal and logical recursive size are correct",
+        desc: "file and directory xattrs replicate; removal and logical recursive size are correct; a close keeps the ctime/mtime of the last change (write, fchmod, setxattr, a future futimens), from the holder and from a forwarding node, seen on both nodes",
         requires: &[],
         caps: &[Cap::Xattrs],
         run: xattr_roundtrip,
@@ -7870,6 +7870,47 @@ fn xattr_roundtrip(_seed: u64) -> Result<()> {
             Err(error) => Err(error.into()),
         },
     )?;
+
+    // A close publishes the times of the file's last change, not a time
+    // of its own (xcheckfs: after `write; fchmod; close` ctime moved to
+    // the commit's time), nor one a `futimens` set (an hour ahead, as
+    // `tar x` from a skewed host does): what the writer saw before its
+    // close is what it sees after, and what the other node sees. From a,
+    // and from b, whose close goes to a's sequencer as a forwarded commit.
+    for (name, writer, other) in [("a", &a.mnt, &b.mnt), ("b", &b.mnt, &a.mnt)] {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let times = |m: &std::fs::Metadata| (m.ctime(), m.ctime_nsec(), m.mtime(), m.mtime_nsec());
+        let stamped = writer.join(format!("tree/stamped-{name}"));
+        let mut file = std::fs::File::create(&stamped)?;
+        file.write_all(b"data")?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        set_xattr(&stamped, "user.k", b"v")?;
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))?;
+        let open = times(&file.metadata()?);
+        drop(file);
+        // Past the attribute TTL: the kernel asks the daemon again.
+        std::thread::sleep(Duration::from_millis(1500));
+        let closed = times(&std::fs::metadata(&stamped)?);
+        anyhow::ensure!(
+            closed == open,
+            "{name}: the close moved (ctime, mtime) from {open:?} to {closed:?}"
+        );
+        eventually(
+            "the times on the other node",
+            Duration::from_secs(20),
+            || {
+                let seen = times(&std::fs::metadata(
+                    other.join(format!("tree/stamped-{name}")),
+                )?);
+                anyhow::ensure!(
+                    seen == open,
+                    "{name}: (ctime, mtime) {seen:?} on the other node, not {open:?}"
+                );
+                Ok(())
+            },
+        )?;
+    }
     a.unmount()?;
     b.unmount()?;
     eprintln!("    xattr-roundtrip: rsize={rsize} rcount={rcount} sparse_holes=logical");

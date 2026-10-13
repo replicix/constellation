@@ -17,6 +17,33 @@ fn mask_mode(mode: u32) -> u32 {
     mode & 0o7777
 }
 
+/// The ctime a manifest commit at `t` leaves a file whose row says
+/// `row_ctime`, `session_ctime` being the writer's last data change: the
+/// file's last change, not the commit's time — a close (and its commit,
+/// maybe seconds later under `--write-mode back`) is no change of its own
+/// (ext4: `write; fchmod; close` keeps the `fchmod`'s ctime). Any change
+/// since the last write (`fchmod`, `fchown`, `fsetxattr`, a `futimens`,
+/// another node's) stamped the row itself, so the later of the two is the
+/// last change. Never the mtime: a `futimens` may have set that anywhere,
+/// an hour ahead included (`tar x`, `cp -p`, `touch -d`).
+///
+/// Capped at `t` because the result is also the record's stamp, and a
+/// stamp above the sequencer's clock would let its next change of the
+/// file (stamped from that clock, which never observes the records it
+/// appends itself; [`crate::hlc::observe`] runs on replay) carry a lower
+/// ctime — ctime going back for every observer. The caller observes
+/// `session_ctime` first (`Meta::set_manifest_tx`), so a writer's clock
+/// ahead of the sequencer's by less than the skew tolerance moves the
+/// sequencer's up instead of being cut down by the cap. One further ahead
+/// is not observed ([`crate::hlc::observe_within_tolerance`]: a bad
+/// client clock must not drag every clock for good), and the cap cuts
+/// that commit's ctime to `t` — only that writer sees its ctime drop, by
+/// its own skew. Without a writer's change (a scan, fsck, recovery) the
+/// commit's time, as before.
+pub(crate) fn commit_ctime(row_ctime: i64, session_ctime: Option<i64>, t: i64) -> i64 {
+    session_ctime.map_or(t, |session| row_ctime.max(session.min(t)))
+}
+
 /// The shared body of `mkdir`/`create`/`symlink`/`mknod` (and their
 /// `_at` twins): existence checks, the `0x01`/`0x02`/`0x04` writes, the
 /// `atime` seed, and the parent-directory touch (nlink+1 for a new
@@ -441,6 +468,7 @@ impl Meta {
         manifest: &[u8],
         size: u64,
         mtime: Option<i64>,
+        session_ctime: Option<i64>,
     ) -> Result<i64, MetaError> {
         let Some(rec) = ns::get_inode_record(tx, ns_ks, ino)? else {
             return Err(MetaError::NoEnt(ino));
@@ -458,12 +486,20 @@ impl Meta {
         let journal_base = expected_base
             .map(<[u8]>::to_vec)
             .or_else(|| current.clone());
+        // A writer's clock ahead of ours (a forwarded close): the
+        // commit's stamp and every later one of ours stay above its
+        // change, as they do above a peer's record we apply (plan 30
+        // §M12) — within the skew tolerance only: the stamp is any
+        // client's, and a bad clock's would drag every clock for good.
+        if let Some(session) = session_ctime {
+            crate::hlc::observe_within_tolerance(session);
+        }
         let t = now_ns();
         let old_size = rec.attrs.size as i64;
         let mut attrs = rec.attrs;
         attrs.size = size;
         attrs.mtime_ns = mtime.unwrap_or(t);
-        attrs.ctime_ns = t;
+        attrs.ctime_ns = commit_ctime(rec.attrs.ctime_ns, session_ctime, t);
         let xattrs: Vec<(Vec<u8>, Vec<u8>)> = rec.xattrs.clone();
         ns::put_inode(
             tx,
@@ -497,13 +533,14 @@ impl Meta {
                 base_manifest: journal_base,
                 manifest: manifest.to_vec(),
                 size,
-                time_ns: t,
+                time_ns: attrs.ctime_ns,
                 mtime_ns: attrs.mtime_ns,
             },
         )?;
         Ok(size as i64 - old_size)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_manifest_dirty(
         &self,
         ino: Ino,
@@ -511,6 +548,7 @@ impl Meta {
         manifest: &[u8],
         size: u64,
         mtime_ns: Option<i64>,
+        ctime_ns: Option<i64>,
         dirty_hashes: &[constellation_fs_core::ChunkHash],
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
@@ -542,6 +580,7 @@ impl Meta {
             manifest,
             size,
             mtime_ns,
+            ctime_ns,
         )?;
         for hash in dirty_hashes {
             crate::store::misc::add_pending_claim_tx(&mut tx, self, hash, ino)?;
@@ -562,6 +601,7 @@ impl Meta {
     /// Commit `manifest` as `ino`'s content, if its current manifest is
     /// still `base_manifest` (or already `manifest`). `mtime_ns`: the
     /// file's mtime (the writer's last change, or a time set since);
+    /// `ctime_ns`: the writer's last data change ([`commit_ctime`]).
     /// `None` stamps the commit's time.
     pub fn set_manifest_with_base(
         &self,
@@ -570,6 +610,7 @@ impl Meta {
         manifest: &[u8],
         size: u64,
         mtime_ns: Option<i64>,
+        ctime_ns: Option<i64>,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let local = self.begin_local(&tx)?;
@@ -589,6 +630,7 @@ impl Meta {
             manifest,
             size,
             mtime_ns,
+            ctime_ns,
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;
         self.finish_local(&mut tx, local)?;
@@ -1841,6 +1883,7 @@ impl MetaStore for Meta {
             None,
             manifest,
             size,
+            None,
             None,
         )?;
         crate::store::adjust_usage_tx(&mut tx, &self.local, delta, 0)?;

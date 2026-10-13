@@ -637,6 +637,7 @@ tests! {
         sparse_files_read_zeros [],
         truncate_shrinks_and_growth_reads_zeros [],
         setattr_mode_owner_and_times [],
+        close_keeps_ctime_and_mtime [],
         two_handles_see_each_others_writes [],
         data_survives_close_and_reopen [],
         large_multi_chunk_file [],

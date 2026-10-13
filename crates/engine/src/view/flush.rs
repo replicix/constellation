@@ -472,6 +472,14 @@ impl View {
         let Some(ws) = self.writes.detach(ino) else {
             return Ok(());
         };
+        // Nothing to publish: no manifest commit, which would stamp both
+        // times with its own (whatever the write that failed staged is
+        // gone with it, as its error said).
+        if ws.changed_nothing() {
+            ws.staging.discard();
+            self.writes.retire(ino);
+            return Ok(());
+        }
         // Written, then unlinked while still open (here or on another
         // node): there is no name to publish the content under, and the
         // sequencer would refuse the manifest (`NotFound`). POSIX has the
@@ -661,7 +669,13 @@ impl View {
                     .map_err(|e| dropped(e.code()))?;
             }
             self.meta
-                .scratch_set_manifest(ino, &manifest_bytes, ws.file_len, ws.mtime_ns)
+                .scratch_set_manifest(
+                    ino,
+                    &manifest_bytes,
+                    ws.file_len,
+                    ws.mtime_ns,
+                    ws.commit_ctime(),
+                )
                 .map_err(|e| dropped(e.code()))?;
             ws.staging.discard();
             return Ok(force_through);
@@ -878,6 +892,7 @@ impl View {
                     manifest: Vec::new(),
                     size: 0,
                     mtime_ns: None,
+                    ctime_ns: None,
                 })
         });
         if admitted.is_some() && owned.is_none() {
@@ -993,6 +1008,7 @@ impl View {
                             manifest_bytes,
                             file_len,
                             ws.mtime_ns,
+                            ws.commit_ctime(),
                             dirty_hashes,
                         )
                     })
@@ -1030,6 +1046,7 @@ impl View {
                     manifest: Vec::new(),
                     size: 0,
                     mtime_ns: None,
+                    ctime_ns: None,
                 })
                 .is_some()
     }
@@ -1128,6 +1145,7 @@ impl View {
                         manifest: manifest_bytes.to_vec(),
                         size: file_len,
                         mtime_ns: ws.mtime_ns,
+                        ctime_ns: ws.commit_ctime(),
                     },
                 );
                 if defer_upload {

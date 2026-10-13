@@ -94,8 +94,16 @@ fn setup(epoch: u64) -> Setup {
     meta.set_holder_epoch(epoch);
     let lost = ChunkHash::of(b"bytes that are gone");
     let broken = meta.create(ROOT_INO, "broken", 0o644, 0, 0).unwrap().ino;
-    meta.set_manifest_dirty(broken, None, &manifest_naming(lost, 19), 19, None, &[lost])
-        .unwrap();
+    meta.set_manifest_dirty(
+        broken,
+        None,
+        &manifest_naming(lost, 19),
+        19,
+        None,
+        None,
+        &[lost],
+    )
+    .unwrap();
     meta.setattr(broken, Some(0o600), None, None, None, None, None)
         .unwrap();
     let other = meta.create(ROOT_INO, "other", 0o644, 0, 0).unwrap().ino;
@@ -313,7 +321,7 @@ fn drop_held_remote_drops_a_transaction_deferred_on_a_departed_nodes_chunk() {
     let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
     // The forward arrives: its chunk is enrolled before the op executes.
     meta.enroll_remote_chunks(file, &[away], 7).unwrap();
-    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19, None)
+    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19, None, None)
         .unwrap();
     meta.setattr(file, Some(0o600), None, None, None, None, None)
         .unwrap();
@@ -392,7 +400,7 @@ fn a_refusal_that_observed_a_deferred_transactions_keys_is_deferred_with_it() {
     let away = ChunkHash::of(b"pending on another node");
     let file = meta.create(ROOT_INO, "file", 0o644, 0, 0).unwrap().ino;
     meta.enroll_remote_chunks(file, &[away], 7).unwrap();
-    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19, None)
+    meta.set_manifest_with_base(file, None, &manifest_naming(away, 19), 19, None, None)
         .unwrap();
     let rid = |seq: u64| constellation_meta::Rid {
         node: 3,
@@ -504,6 +512,7 @@ fn a_manifest_whose_chunk_is_uploading_is_deferred_and_others_ship() {
         &manifest_naming(pending, 33),
         33,
         None,
+        None,
         &[pending],
     )
     .unwrap();
@@ -570,6 +579,7 @@ fn a_dependent_of_a_deferred_manifest_waits_with_it() {
         None,
         &manifest_naming(pending, 15),
         15,
+        None,
         None,
         &[pending],
     )
@@ -646,6 +656,7 @@ fn an_op_depending_on_a_deferred_close_waits_for_the_forwarders_chunks() {
             manifest: manifest_naming(away, 19),
             size: 19,
             mtime_ns: None,
+            ctime_ns: None,
         },
     );
     let chmod = ex(2, setattr(file));

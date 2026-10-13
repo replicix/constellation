@@ -97,6 +97,12 @@ pub enum MutateOp {
         /// The file's mtime: the writer's last change, or a time set by
         /// `utimes` since. `None`: the commit's time.
         mtime_ns: Option<i64>,
+        /// The writer's last data change (`WriteState::changed`, an HLC
+        /// stamp; never a time a user set, unlike `mtime_ns`): with the
+        /// row's ctime, what the commit leaves as the file's ctime
+        /// (`store::writes::commit_ctime`). `None`: the commit's time (a
+        /// scan, fsck, recovery: no writer's change to carry).
+        ctime_ns: Option<i64>,
     },
     SetXattr {
         ino: Ino,
@@ -571,6 +577,7 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
             manifest,
             size,
             mtime_ns,
+            ctime_ns,
         } => {
             meta.set_manifest_with_base(
                 *ino,
@@ -578,6 +585,7 @@ fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError
                 manifest,
                 *size,
                 *mtime_ns,
+                *ctime_ns,
             )?;
         }
         MutateOp::SetXattr {
@@ -767,6 +775,151 @@ mod tests {
             let listed = meta.lookup(ROOT_INO, "b").unwrap().unwrap();
             assert_eq!(listed.ctime_ns, attr.ctime_ns);
         }
+    }
+
+    /// A manifest commit's ctime is the file's last change, not the
+    /// commit's time (xcheckfs: `write; fchmod; close` moved ctime to the
+    /// close): the write session's last data change, which the op carries,
+    /// or any change since, already on the row — never the mtime, which a
+    /// `futimens` may have set anywhere (`tar x`, `cp -p`, `touch -d`). A
+    /// replica replays the same times.
+    #[test]
+    fn a_manifest_commit_keeps_the_ctime_of_the_files_last_change() {
+        let m = Meta::open_in_memory().unwrap();
+        let commit = |ino: Ino, mtime_ns: Option<i64>, ctime_ns: Option<i64>| {
+            execute(
+                &m,
+                &MutateOp::SetManifest {
+                    ino,
+                    base_manifest: None,
+                    manifest: b"MANIFEST".to_vec(),
+                    size: 4,
+                    mtime_ns,
+                    ctime_ns,
+                },
+                None,
+            )
+            .unwrap();
+            m.getattr(ino).unwrap().unwrap()
+        };
+        let create = |name: &str| m.create(ROOT_INO, name, 0o644, 0, 0).unwrap();
+        let setattr = |ino: Ino, mode: Option<u32>, mtime_ns: Option<i64>| {
+            let op = MutateOp::Setattr {
+                ino,
+                mode,
+                uid: None,
+                gid: None,
+                size: None,
+                atime_ns: None,
+                mtime_ns,
+            };
+            execute(&m, &op, None).unwrap();
+            m.getattr(ino).unwrap().unwrap().ctime_ns
+        };
+
+        // A write, then an fchmod, then the close: the fchmod's ctime.
+        let a = create("a");
+        let wrote = crate::hlc::now_ns();
+        let chmodded = setattr(a.ino, Some(0o755), None);
+        assert!(chmodded > wrote);
+        let a = commit(a.ino, Some(wrote), Some(wrote));
+        assert_eq!((a.ctime_ns, a.mtime_ns), (chmodded, wrote));
+
+        // A write alone: the write's time, for both.
+        let b = create("b");
+        let wrote = crate::hlc::now_ns();
+        let b = commit(b.ino, Some(wrote), Some(wrote));
+        assert_eq!((b.ctime_ns, b.mtime_ns), (wrote, wrote));
+
+        // A write, then a `futimens` an hour ahead, then the close: the
+        // `futimens`'s ctime; the mtime set is no change time.
+        let c = create("c");
+        let wrote = crate::hlc::now_ns();
+        let future = wrote + 3_600_000_000_000;
+        let set = setattr(c.ino, None, Some(future));
+        let c = commit(c.ino, Some(future), Some(wrote));
+        assert_eq!((c.ctime_ns, c.mtime_ns), (set, future));
+
+        // No change of the writer's (a scan, fsck, recovery): the
+        // commit's time, for both.
+        let d = create("d");
+        let d0 = d.ctime_ns;
+        let d = commit(d.ino, None, None);
+        assert!(d.ctime_ns > d0);
+        assert_eq!(d.mtime_ns, d.ctime_ns);
+
+        let r = replica_of(&m);
+        for attr in [a, b, c, d] {
+            let replayed = r.getattr(attr.ino).unwrap().unwrap();
+            assert_eq!(
+                (replayed.ctime_ns, replayed.mtime_ns),
+                (attr.ctime_ns, attr.mtime_ns)
+            );
+        }
+    }
+
+    /// Clock skew: a close forwarded from a node whose clock is ahead of
+    /// the sequencer's keeps the ctime that node showed before its close
+    /// (a ctime never goes back), and the sequencer's next change of the
+    /// file stamps above it. 20 ms: the clock is process-wide.
+    #[test]
+    fn a_forwarded_close_from_a_node_ahead_keeps_its_ctime() {
+        let m = Meta::open_in_memory().unwrap();
+        let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let ahead = crate::hlc::now_ns() + 20_000_000;
+        let op = MutateOp::SetManifest {
+            ino: f.ino,
+            base_manifest: None,
+            manifest: b"MANIFEST".to_vec(),
+            size: 4,
+            mtime_ns: Some(ahead),
+            ctime_ns: Some(ahead),
+        };
+        execute(&m, &op, None).unwrap();
+        let closed = m.getattr(f.ino).unwrap().unwrap();
+        assert_eq!((closed.ctime_ns, closed.mtime_ns), (ahead, ahead));
+        let chmod = MutateOp::Setattr {
+            ino: f.ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime_ns: None,
+            mtime_ns: None,
+        };
+        execute(&m, &chmod, None).unwrap();
+        assert!(m.getattr(f.ino).unwrap().unwrap().ctime_ns > ahead);
+    }
+
+    /// A forwarding client whose clock is far ahead (a bad RTC) moves no
+    /// clock: its stamp is past the skew tolerance, so the sequencer does
+    /// not observe it, and the cap cuts the file's ctime to the commit's
+    /// time — nothing a day ahead reaches the record, or any replica's
+    /// clock from it. The mtime it carries applies as is (any `futimens`
+    /// may set one a day ahead).
+    // Relies on no other test in this binary observing a far-ahead stamp
+    // (the clock is process-wide).
+    #[test]
+    fn a_forwarded_close_from_a_clock_far_ahead_moves_no_clock() {
+        let m = Meta::open_in_memory().unwrap();
+        let f = m.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let day_ahead = crate::hlc::now_ns() + 86_400_000_000_000;
+        let op = MutateOp::SetManifest {
+            ino: f.ino,
+            base_manifest: None,
+            manifest: b"MANIFEST".to_vec(),
+            size: 4,
+            mtime_ns: Some(day_ahead),
+            ctime_ns: Some(day_ahead),
+        };
+        execute(&m, &op, None).unwrap();
+        assert!(crate::hlc::last_ns() < day_ahead, "the clock was dragged");
+        let closed = m.getattr(f.ino).unwrap().unwrap();
+        assert!(closed.ctime_ns > f.ctime_ns && closed.ctime_ns < day_ahead);
+        assert_eq!(closed.mtime_ns, day_ahead);
+        let records = m.peek_journal_after(0).unwrap();
+        let stamps: Vec<i64> = records.iter().filter_map(|(_, r)| r.stamp_ns()).collect();
+        assert!(stamps.iter().all(|t| *t < day_ahead), "{stamps:?}");
     }
 
     #[test]

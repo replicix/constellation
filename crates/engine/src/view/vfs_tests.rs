@@ -1000,6 +1000,117 @@ fn an_allocation_that_changes_nothing_still_moves_mtime() {
     }
 }
 
+/// A write or truncate the quota refuses changes nothing, and neither
+/// does the close after it: it used to leave a write session that had
+/// changed nothing, whose close committed a base-identical manifest
+/// stamped with the commit's time for both mtime and ctime.
+#[test]
+fn a_refused_write_or_truncate_leaves_the_times_to_the_close() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"data").unwrap();
+    c.close(ino, o.fh).unwrap();
+    c._meta.set_quota(Some(100)).unwrap();
+    View::invalidate_quota_cache(&c.view.quota_cache);
+    let before = c._meta.getattr(ino).unwrap().unwrap();
+    let times = |a: &constellation_fs_core::FileAttr| (a.ctime_ns, a.mtime_ns, a.size);
+    let manifests = || {
+        c._meta
+            .peek_journal_after(0)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, r)| matches!(r, constellation_meta::LogRecord::WriteManifest { ino: i, .. } if *i == ino))
+            .count()
+    };
+    let committed = manifests();
+    let open = || {
+        Blocking::run(|r| {
+            c.view.open(
+                &c.cx(OpKind::Open),
+                ino,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .unwrap()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let o = open();
+    assert_eq!(code(c.write(ino, o.fh, 0, &[1u8; 4096])), Code::NoSpace);
+    c.close(ino, o.fh).unwrap();
+    assert_eq!(
+        times(&c._meta.getattr(ino).unwrap().unwrap()),
+        times(&before),
+        "after a refused write"
+    );
+    let o = open();
+    let refused = Blocking::run(|r| {
+        c.view.setattr(
+            &c.cx(OpKind::Setattr),
+            ino,
+            Some(o.fh),
+            &SetAttr {
+                size: Some(4096),
+                ..SetAttr::default()
+            },
+            r,
+        )
+    });
+    assert_eq!(code(refused), Code::NoSpace);
+    c.close(ino, o.fh).unwrap();
+    assert_eq!(
+        times(&c._meta.getattr(ino).unwrap().unwrap()),
+        times(&before),
+        "after a refused truncate"
+    );
+    assert_eq!(manifests(), committed, "a close published a manifest");
+}
+
+/// The other side of [`a_refused_write_or_truncate_leaves_the_times_to_the_close`]:
+/// a session whose first write was refused and whose next one succeeded
+/// changed data, and its close publishes it.
+#[test]
+fn a_write_after_a_refused_one_is_published() {
+    let c = client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let ino = e.attr.ino;
+    c.write(ino, o.fh, 0, b"data").unwrap();
+    c.close(ino, o.fh).unwrap();
+    c._meta.set_quota(Some(100)).unwrap();
+    View::invalidate_quota_cache(&c.view.quota_cache);
+    let before = c._meta.getattr(ino).unwrap().unwrap();
+    let o = Blocking::run(|r| {
+        c.view.open(
+            &c.cx(OpKind::Open),
+            ino,
+            OpenFlags::READ | OpenFlags::WRITE,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(code(c.write(ino, o.fh, 0, &[1u8; 4096])), Code::NoSpace);
+    c.write(ino, o.fh, 0, b"0123456789").unwrap();
+    c.close(ino, o.fh).unwrap();
+    let after = c._meta.getattr(ino).unwrap().unwrap();
+    assert_eq!(after.size, 10);
+    assert!(after.mtime_ns > before.mtime_ns && after.ctime_ns > before.ctime_ns);
+    let o = Blocking::run(|r| {
+        c.view.open(
+            &c.cx(OpKind::Open),
+            ino,
+            OpenFlags::READ,
+            OpenOwner::NONE,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(c.read(ino, o.fh, 0, 64).unwrap(), b"0123456789");
+    c.close(ino, o.fh).unwrap();
+}
+
 #[test]
 fn sync_view_publishes_every_pending_write() {
     let c = client();

@@ -506,6 +506,7 @@ fn write_manifest(ino: u64, byte: u8, len: u64, t: i64) -> (LogRecord, MutateOp)
             manifest,
             size: len,
             mtime_ns: None,
+            ctime_ns: None,
         },
     )
 }

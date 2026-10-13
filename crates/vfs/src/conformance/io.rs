@@ -7,7 +7,10 @@
 //! the contract has nothing to check.
 
 use super::{must, refused, Env, Rng, TestResult};
-use crate::types::{Durability, FallocateMode, OpenFlags, SeekWhence, SetAttr, TimeSet};
+use crate::caps::XattrSupport;
+use crate::types::{
+    Durability, FallocateMode, OpenFlags, SeekWhence, SetAttr, SetXattrFlags, TimeSet,
+};
 use constellation_types::Code;
 
 pub(super) fn write_read_roundtrip(env: &Env<'_>) -> TestResult {
@@ -196,6 +199,120 @@ pub(super) fn setattr_mode_owner_and_times(env: &Env<'_>) -> TestResult {
     must("write", c.write(ino, o.fh, 0, b"x"));
     must("close", c.close(ino, o.fh));
     assert!(must("getattr", c.getattr(ino)).mtime_ns >= before);
+    Ok(())
+}
+
+/// A close changes neither ctime nor mtime: they are the last change's,
+/// a write or any attribute change made before the close (xcheckfs: after
+/// `write; fchmod; close` ctime moved to the time the close's commit ran,
+/// ext4 leaves it at the `fchmod`). Every step is a change, so ctime
+/// rises with each; an mtime a `futimens` set — even one in the future
+/// (`tar x`, `cp -p`, `touch -d`) — is no change time. An attribute
+/// change alone opens no write session, so it has nothing to show here.
+pub(super) fn close_keeps_ctime_and_mtime(env: &Env<'_>) -> TestResult {
+    const OLD: i64 = 1_000_000_000_000_000;
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Step {
+        Write,
+        Chmod,
+        Chown,
+        UtimensOld,
+        UtimensFuture,
+        UtimensNow,
+        Setxattr,
+        Removexattr,
+    }
+    use Step::*;
+    let fx = env.fresh();
+    let c = fx.client();
+    let mut failures = Vec::new();
+    for (i, steps) in [
+        &[Write][..],
+        &[Write, Chmod],
+        &[Write, Chown],
+        &[Write, UtimensOld],
+        &[Write, UtimensFuture],
+        &[Write, UtimensNow],
+        &[Write, UtimensOld, Write],
+        &[Write, Setxattr],
+        &[Setxattr, Write],
+        &[Setxattr, Write, Removexattr],
+        &[Chmod, Write],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let xattr_step = steps.contains(&Setxattr) || steps.contains(&Removexattr);
+        if xattr_step && fx.caps.xattrs != XattrSupport::Native {
+            continue;
+        }
+        let (e, o) = must("create", c.create_excl(c.root(), &format!("f{i}")));
+        let ino = e.attr.ino;
+        let setattr = |set: SetAttr| must("setattr", c.setattr(ino, Some(o.fh), &set));
+        let times = |at: Option<TimeSet>| {
+            setattr(SetAttr {
+                atime: at,
+                mtime: at,
+                ..SetAttr::default()
+            })
+        };
+        let mut ctime = e.attr.ctime_ns;
+        for step in steps {
+            match step {
+                Write => {
+                    must("write", c.write(ino, o.fh, 0, b"data"));
+                }
+                Chmod => {
+                    setattr(SetAttr {
+                        mode: Some(0o755),
+                        ..SetAttr::default()
+                    });
+                }
+                Chown => {
+                    setattr(SetAttr {
+                        uid: Some(c.uid()),
+                        gid: Some(c.gid()),
+                        ..SetAttr::default()
+                    });
+                }
+                UtimensOld => {
+                    times(Some(TimeSet::At(OLD)));
+                }
+                UtimensFuture => {
+                    // An hour past the engine's clock and the reference's.
+                    let now = must("getattr", c.getattr(ino)).ctime_ns;
+                    times(Some(TimeSet::At(now + 3_600_000_000_000)));
+                }
+                UtimensNow => {
+                    times(Some(TimeSet::Now));
+                }
+                Setxattr => must(
+                    "setxattr",
+                    c.setxattr(ino, "user.k", b"v", SetXattrFlags::empty()),
+                ),
+                Removexattr => must("removexattr", c.removexattr(ino, "user.k")),
+            }
+            let now = must("getattr", c.getattr(ino)).ctime_ns;
+            if now <= ctime {
+                failures.push(format!(
+                    "{steps:?}: {step:?} left ctime at {now} (was {ctime})"
+                ));
+            }
+            ctime = now;
+        }
+        let open = must("getattr", c.getattr(ino));
+        must("close", c.close(ino, o.fh));
+        let closed = must("getattr after close", c.getattr(ino));
+        let seen = |a: &crate::types::Attr| (a.ctime_ns, a.mtime_ns, a.size);
+        if seen(&closed) != seen(&open) {
+            failures.push(format!(
+                "{steps:?}: the close changed (ctime, mtime, size) from {:?} to {:?}",
+                seen(&open),
+                seen(&closed)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 

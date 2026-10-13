@@ -231,14 +231,14 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
 
     step!(meta, "set_manifest_dirty", {
         let ino = meta.child_ino(ROOT_INO, "published").unwrap().unwrap();
-        meta.set_manifest_dirty(ino, None, &[1, 2], 2, None, &[])
+        meta.set_manifest_dirty(ino, None, &[1, 2], 2, None, None, &[])
             .unwrap();
     });
 
     step!(meta, "set_manifest_with_base", {
         let ino = meta.child_ino(ROOT_INO, "published").unwrap().unwrap();
         let base = meta.manifest(ino).unwrap().unwrap();
-        meta.set_manifest_with_base(ino, Some(&base), &[3, 4], 2, None)
+        meta.set_manifest_with_base(ino, Some(&base), &[3, 4], 2, None, None)
             .unwrap();
     });
 

@@ -267,6 +267,27 @@ inside the file, a `KEEP_SIZE` one, a punch past the end). Such an
 open it starts one, as a same-size `ftruncate` does, and the close
 commits a manifest that names no new chunk.
 
+A close is no change of its own, however late its commit runs (`back`,
+a busy sequencer): the commit leaves the file the ctime of its last
+change, not its own time. The manifest commit carries the session's
+last data change, stamped from the hybrid logical clock every inode
+time comes from (§4), and the file keeps the later of that and the
+row's ctime — any change since (`fchmod`, `fchown`, `fsetxattr`, a
+`futimens`, another node's) stamped the row itself. Never the mtime: a
+`futimens` may have set that anywhere, an hour ahead included (`tar x`,
+`cp -p`). The ctime is the record's stamp, so every replica replays it,
+and it never runs ahead of the sequencer's clock, whose next change of
+the file must stamp above it: the sequencer observes a forwarding
+writer's stamp before it commits, so a writer ahead of it moves its
+clock up rather than its ctime being cut back — within a skew
+tolerance of the sequencer's wall clock
+(`CONSTELLATION_HLC_SKEW_TOLERANCE_S`, 300 s). The stamp is any
+client's and a clock never comes down, so a client with a bad clock
+must not drag every clock in the cluster: past the tolerance its stamp
+is not observed (a warning, once) and that commit's ctime is the
+sequencer's time. `write; fchmod; close` therefore keeps the
+`fchmod`'s ctime, as ext4 does.
+
 **Dedup and the condemned check.** A chunk upload is a create-if-absent,
 or a `HEAD` first when a positive hint (the existence cache, a peer's
 chunk set) says the chunk is probably there already. A chunk below

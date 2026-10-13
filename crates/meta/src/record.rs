@@ -114,7 +114,10 @@ pub enum LogRecord {
         /// Encoded `fs_core::Manifest` bytes.
         manifest: Vec<u8>,
         size: u64,
-        /// The commit's time: the file's ctime, and the record's stamp.
+        /// The file's ctime as the commit leaves it, and the record's
+        /// stamp: the file's last change — the writer's last data change
+        /// or any change since — never above the sequencer's clock
+        /// (`store::writes::commit_ctime`).
         time_ns: i64,
         /// The file's mtime (the writer's, or a time set before the
         /// commit), applied as is.

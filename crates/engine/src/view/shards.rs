@@ -36,7 +36,8 @@ pub(super) struct WriteState {
     /// set since ([`WriteState::times_set`]). `None`: no change yet. The
     /// flush commits it, and `getattr` shows it meanwhile.
     pub(super) mtime_ns: Option<i64>,
-    /// When the session last changed the file (its ctime meanwhile).
+    /// When the session last changed the file's data: its ctime
+    /// meanwhile, unless the row's (an attribute change since) is later.
     pub(super) ctime_ns: i64,
     /// Absolute half-open byte ranges this open handle's `write()`
     /// calls actually delivered — as opposed to the padding bytes
@@ -154,19 +155,54 @@ impl WriteState {
         }
     }
 
-    /// A data change (write, truncate, fallocate): mtime and ctime now.
+    /// A data change (write, truncate, fallocate): mtime and ctime now,
+    /// on the HLC every other inode time comes from (plan 30 §M12): above
+    /// every stamp this node has issued or applied. The commit carries
+    /// the ctime ([`Self::commit_ctime`]) and leaves the file the later of
+    /// it and the row's (`constellation_meta::store::writes::commit_ctime`).
+    ///
+    /// Above the row's ctime of an attribute change made before it once
+    /// that change's record is applied here. Not yet, on a node whose
+    /// `fchmod` went to a sequencer whose clock is ahead: then the write
+    /// can be stamped below it, and the commit leaves the `fchmod`'s
+    /// ctime with the write's (earlier) mtime — the write's ctime late by
+    /// at most that skew, never a ctime going back. (The sequencer
+    /// observing this stamp at the commit covers the opposite skew, a
+    /// writer ahead of it; nothing this node has can cover this one.)
     pub(super) fn changed(&mut self) {
-        let now = constellation_fs_core::types::now_ns();
+        let now = constellation_meta::hlc::now_ns();
         self.mtime_ns = Some(now);
         self.ctime_ns = now;
     }
 
+    /// What the commit carries as the writer's last data change: the
+    /// session's ctime. A session that changed no data is never committed
+    /// ([`Self::changed_nothing`]); `None` (the commit's time) only for
+    /// one that sealed a chunk all the same — a write that failed after
+    /// staging pressure sealed part of it.
+    pub(super) fn commit_ctime(&self) -> Option<i64> {
+        (self.ctime_ns > 0).then_some(self.ctime_ns)
+    }
+
+    /// Whether the session changed no data and holds nothing to publish:
+    /// every data change stamps it ([`Self::changed`]), so only a refused
+    /// first write or truncate (quota, staging space) leaves one, maybe
+    /// with an mtime a `futimens` set since (already on the row: its
+    /// `setattr` committed it). Its close publishes nothing — a close is
+    /// no change (DESIGN §3 "File times"); committing it restamped both
+    /// times with the commit's.
+    pub(super) fn changed_nothing(&self) -> bool {
+        self.ctime_ns == 0 && self.sealed.is_empty() && self.enrolled.is_empty()
+    }
+
     /// An explicit mtime (`utimes`/`futimens`) while the session is open:
     /// the flush must commit it, not the last write's time (`cp -p` sets
-    /// the source's times before its `close`).
+    /// the source's times before its `close`). Not a ctime of the
+    /// session's: the `setattr` that set it stamped the row's, which
+    /// `getattr` and the commit both take, so a later stamp here would be
+    /// one the commit drops — ctime moving back at the close.
     pub(super) fn times_set(&mut self, mtime_ns: i64) {
         self.mtime_ns = Some(mtime_ns);
-        self.ctime_ns = self.ctime_ns.max(constellation_fs_core::types::now_ns());
     }
 }
 

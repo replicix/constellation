@@ -359,6 +359,7 @@ pub(crate) async fn materialize_remote(
             manifest: manifest.clone(),
             size: *size,
             mtime_ns: None,
+            ctime_ns: None,
         };
         if !step(set).await {
             return Ok(false);

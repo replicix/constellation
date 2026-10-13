@@ -459,6 +459,7 @@ quarter of the lease TTL and logs an error.
 | `CONSTELLATION_LEASE_PLACEMENT` | `on` | boolean | holder-driven placement of the root lease (see [Lease placement](features/lease-placement.md)) |
 | `CONSTELLATION_LEASE_DWELL_MS` | `5000` | milliseconds; `0` means the default | a lease handed over cannot be handed back before this (it stops two competing writers ping-ponging it) |
 | `CONSTELLATION_LEASE_WANTED_GRACE_MS` | `5000` | milliseconds; `0` means the default | a requester registered in `wanted_by` is answered within this, busy holder or not |
+| `CONSTELLATION_HLC_SKEW_TOLERANCE_S` | `300` | seconds, read once at start | how far ahead of the sequencer's wall clock a forwarded close's change time may be and still advance its hybrid logical clock; past it the stamp is not observed (a warning, once) and the file's ctime is the commit's time instead (see `crates/meta/src/hlc.rs`) |
 
 The lease's expiry margin (a lease is usable only while at least this
 much of it is left, and every grant backed by it is capped by it) is

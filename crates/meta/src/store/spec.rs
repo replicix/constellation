@@ -939,18 +939,23 @@ fn derive_replay_op(records: &[LogRecord]) -> Option<MutateOp> {
         .collect();
     match effective.as_slice() {
         [] => None,
+        // The record's times go with it: the writer's mtime, and its
+        // ctime (the file's last change as the speculative commit left
+        // it), so a re-commit does not restamp the file with its own time.
         [LogRecord::WriteManifest {
             ino,
             base_manifest,
             manifest,
             size,
-            ..
+            time_ns,
+            mtime_ns,
         }] => Some(MutateOp::SetManifest {
             ino: *ino,
             base_manifest: base_manifest.clone(),
             manifest: manifest.clone(),
             size: *size,
-            mtime_ns: None,
+            mtime_ns: Some(*mtime_ns),
+            ctime_ns: Some(*time_ns),
         }),
         _ => Some(MutateOp::Records {
             records: effective.into_iter().cloned().collect(),

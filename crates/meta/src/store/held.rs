@@ -1149,6 +1149,7 @@ impl Meta {
                 manifest: sanitize_manifest(&manifest, &missing).unwrap_or_default(),
                 size,
                 mtime_ns: None,
+                ctime_ns: None,
             };
             spec::refuse_queued_tx(&mut tx, self, *origin, rid, op, refusal(&missing))?;
             refused_rids.push(rid);
@@ -1184,6 +1185,7 @@ impl Meta {
                 manifest: sanitize_manifest(manifest, &missing).unwrap_or_default(),
                 size,
                 mtime_ns: None,
+                ctime_ns: None,
             };
             spec::refuse_queued_tx(
                 &mut tx,
@@ -1432,7 +1434,15 @@ mod tests {
                             // A file renamed over is gone: nothing to close.
                             Some(None) => {
                                 if meta
-                                    .set_manifest_dirty(ino, None, &manifest, 7, None, &[hash])
+                                    .set_manifest_dirty(
+                                        ino,
+                                        None,
+                                        &manifest,
+                                        7,
+                                        None,
+                                        None,
+                                        &[hash],
+                                    )
                                     .is_ok()
                                 {
                                     rows.push((hash, ino));
@@ -1447,11 +1457,13 @@ mod tests {
                                     manifest,
                                     size: 7,
                                     mtime_ns: None,
+                                    ctime_ns: None,
                                 };
                                 run(&meta, rid(*n), op);
                             }
                             None => {
-                                let _ = meta.set_manifest_with_base(ino, None, &manifest, 7, None);
+                                let _ = meta
+                                    .set_manifest_with_base(ino, None, &manifest, 7, None, None);
                             }
                         }
                     }

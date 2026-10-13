@@ -194,6 +194,7 @@ impl Meta {
         manifest: &[u8],
         size: u64,
         mtime_ns: Option<i64>,
+        ctime_ns: Option<i64>,
     ) -> Result<(), MetaError> {
         let mut tx = self.db.write_tx();
         let Some(rec) = ns::get_inode_record(&tx, &self.scratch, ino)? else {
@@ -203,7 +204,7 @@ impl Meta {
         let t = now_ns();
         attrs.size = size;
         attrs.mtime_ns = mtime_ns.unwrap_or(t);
-        attrs.ctime_ns = t;
+        attrs.ctime_ns = crate::store::writes::commit_ctime(rec.attrs.ctime_ns, ctime_ns, t);
         let xattrs = rec.xattrs.clone();
         let target = rec
             .symlink_target
