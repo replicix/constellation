@@ -594,8 +594,10 @@ impl View {
         // tmpfs stamp each), also one that changes no byte and no size —
         // an allocation inside the file, a `KEEP_SIZE` one, a punch or a
         // zeroing past the end: its session carries mtime and ctime to
-        // the file's next manifest commit, as a write's does. The other
-        // paths stamp through `truncate` and the zeroing below.
+        // the file's next manifest commit, as a write's does. Stamped
+        // once it succeeded, never before: a failed one changes no time
+        // (its session, if it changed nothing else, is dropped at the
+        // close). The growth path stamps through `truncate`.
         let stamp = || {
             let mut writes = self.writes.lock(ino);
             self.write_state(&mut writes, ino, &manifest)
@@ -620,7 +622,6 @@ impl View {
         {
             let mut writes = self.writes.lock(ino);
             let ws = self.write_state(&mut writes, ino, &manifest)?;
-            ws.changed();
             if new_size > ws.file_len {
                 ws.staging
                     .set_len_sparse(new_size)
@@ -648,7 +649,7 @@ impl View {
         // selected bytes. At most two chunk-sized buffers are materialized.
         if full_start >= full_end {
             self.do_write(ino, offset, &vec![0; (effective_end - offset) as usize])?;
-            return Ok(());
+            return stamp();
         }
         let first_boundary_end = effective_end.min(full_start * chunk_size);
         if offset < first_boundary_end {
@@ -666,7 +667,7 @@ impl View {
                 &vec![0; (effective_end - last_boundary_start) as usize],
             )?;
         }
-        Ok(())
+        stamp()
     }
 
     pub(super) fn seek_sparse(

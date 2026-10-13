@@ -772,3 +772,28 @@ fn an_evicted_sealed_copy_is_fetched_back() {
     want[100..107].copy_from_slice(b"patched");
     check(&e, file.ino, &want, "patched after eviction");
 }
+
+/// A `fallocate` that fails changes neither time: it stamps the write
+/// session only once it succeeded. (A zeroing inside the file whose
+/// boundary bytes the staging budget cannot take used to stamp first,
+/// and the close then committed the failed call's time for both.)
+#[test]
+fn a_failed_fallocate_stamps_nothing() {
+    let e = env_with_budget(CHUNK, 1);
+    let ino = e.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap().ino;
+    e.meta
+        .setattr(ino, None, None, None, Some(4096), None, None)
+        .unwrap();
+    let before = e.meta.getattr(ino).unwrap().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(e
+        .fs
+        .do_fallocate(ino, 10, 20, FallocateMode::ZERO_RANGE)
+        .is_err());
+    e.fs.flush_inode(ino, false).unwrap();
+    let after = e.meta.getattr(ino).unwrap().unwrap();
+    assert_eq!(
+        (after.ctime_ns, after.mtime_ns, after.size),
+        (before.ctime_ns, before.mtime_ns, before.size)
+    );
+}
