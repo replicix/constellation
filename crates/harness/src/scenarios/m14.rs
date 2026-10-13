@@ -1088,6 +1088,328 @@ fn keep_logs(scenario: &str, clients: &[Client]) {
     eprintln!("    {scenario}: node logs kept under {}", dir.display());
 }
 
+// ------------------------------------------------------------------ lock-lapse-lone-node
+
+/// One op of a [`lock_lapse_lone_node`] worker: the name it made (or
+/// renamed to) and what the kernel answered.
+type LoneOutcome = (String, std::result::Result<(), Code>);
+
+/// A worker issuing `op(i)` for i = 1, 2, … until `stop`.
+fn lone_worker(
+    stop: Arc<AtomicBool>,
+    mut op: impl FnMut(u64) -> (String, std::io::Result<()>) + Send + 'static,
+) -> std::thread::JoinHandle<Vec<LoneOutcome>> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while !stop.load(Ordering::Relaxed) {
+            i += 1;
+            let (what, r) = op(i);
+            out.push((what, r.map_err(|e| Code::from_io_error(&e))));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        out
+    })
+}
+
+/// The xcheckfs differential run of 2026-10-13 (cell c2, a lone node,
+/// `--write-mode back`): the host stalled the daemon for 18 s (an fjall
+/// journal write held the metadata store's writer lock, and the authority
+/// core waited on it), longer than what was left of a lock grant's window,
+/// so the grant lapsed on the node that sequences it — the core that
+/// renews it was the one stalled. The lock owner was xcheckfs itself (one
+/// process issuing every stressor's requests), so the owner fence refused
+/// every create, link, symlink, rename and write it sent from then on
+/// (`EIO`), and a rename whose source an earlier refused rename never made
+/// answered `ENOENT`.
+///
+/// That is the fence working as documented (cluster-locks.md, "Leases,
+/// renewal and fencing"); what this pins is what the application sees on
+/// a lone node: one process holds an `fcntl` lock, writes under it and
+/// `fsync`s (published under an honoured grant), while its threads
+/// create, link, symlink and rename; it writes the file again right
+/// before the daemon is frozen past the grant's window and thawed. Every
+/// op answers `OK` or `EIO`, and the tree holds exactly what answered
+/// `OK` — an op in flight across the stall either applied and answered
+/// `OK` or applied nothing; none is half-applied or reported wrongly. The
+/// write after the lapse and the close under the fence answer `EIO`, the
+/// file holds exactly what was `fsync`ed (the dirty write under the
+/// lapsed grant is discarded, never published), the fence lifts with the
+/// lock; after a remount the tree, the locked file and every write a
+/// later `fsync` acknowledged are there, and fsck finds nothing.
+pub fn lock_lapse_lone_node(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-lapse-lone-node";
+    const LOCK_TTL_MS: u64 = 3_000;
+    let (env, root) = setup(NAME)?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let mut c = Client::new(root.path(), "lone", &env.direct_endpoint, &backend)?
+        .with_write_mode("back")
+        .with_env("CONSTELLATION_LOCKS", "cluster")
+        .with_env("CONSTELLATION_LOCK_TTL_MS", &LOCK_TTL_MS.to_string())
+        .with_env(
+            "RUST_LOG",
+            "info,constellation_authority::core::locks=debug,constellation::locks=debug",
+        );
+    c.fs_create()?;
+    c.mount()?;
+    // Frozen well past the grant's window (ttl − margin from its last
+    // renewal), well inside the lease's TTL.
+    let result = lock_lapse_lone_run(NAME, &c, Duration::from_millis(3 * LOCK_TTL_MS)).and_then(
+        |expected| {
+            // Read back from the bucket and the store, not this mount's
+            // page cache.
+            c.unmount()?;
+            c.mount()?;
+            lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
+            let fsck = c.fsck(false)?;
+            let report = String::from_utf8_lossy(&fsck.stdout).to_string();
+            anyhow::ensure!(
+                fsck.status.success(),
+                "fsck: {report}{}",
+                String::from_utf8_lossy(&fsck.stderr)
+            );
+            let report: serde_json::Value =
+                serde_json::from_str(&report).context("fsck's report")?;
+            let mut shown = report.to_string();
+            shown.truncate(400);
+            eprintln!("    {NAME}: fsck clean: {shown}");
+            Ok(())
+        },
+    );
+    if result.is_err() {
+        keep_logs(NAME, std::slice::from_ref(&c));
+    }
+    let _ = c.unmount();
+    result
+}
+
+/// What the tree must hold once the fence lifted: each directory's
+/// entries, and the plain file's words a successful `fsync` covers.
+struct LoneExpected {
+    dirs: std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>>,
+    synced: Vec<u64>,
+}
+
+/// The locked file's content: what was `fsync`ed under the honoured grant.
+const LONE_SYNCED: &[u8] = b"UNDER-LOCK";
+
+fn lock_lapse_lone_check(name: &str, c: &Client, e: &LoneExpected, when: &str) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let m = &c.mnt;
+    for (dir, want) in &e.dirs {
+        let mut have = std::collections::BTreeSet::new();
+        for d in std::fs::read_dir(m.join(dir))? {
+            have.insert(d?.file_name().to_string_lossy().into_owned());
+        }
+        anyhow::ensure!(
+            &have == want,
+            "{when}: {dir}/ holds {:?} that answered EIO and lacks {:?} that answered OK",
+            have.difference(want).collect::<Vec<_>>(),
+            want.difference(&have).collect::<Vec<_>>()
+        );
+    }
+    let locked = std::fs::read(m.join("locked"))?;
+    anyhow::ensure!(
+        locked == LONE_SYNCED,
+        "{when}: the locked file reads {:?}, expected what was fsynced under the grant ({:?}): \
+         the write under the lapsed grant must be discarded",
+        String::from_utf8_lossy(&locked),
+        String::from_utf8_lossy(LONE_SYNCED)
+    );
+    let plain = File::open(m.join("plain"))?;
+    for i in &e.synced {
+        let mut b = [0u8; 8];
+        plain.read_exact_at(&mut b, i * 8)?;
+        anyhow::ensure!(
+            u64::from_le_bytes(b) == *i,
+            "{when}: write {i} answered OK and a later fsync too, but the file holds {b:?} there"
+        );
+    }
+    eprintln!(
+        "    {name}: {when}: the tree holds exactly what answered OK, the locked file what was fsynced, the plain file {} acknowledged writes",
+        e.synced.len()
+    );
+    Ok(())
+}
+
+fn lock_lapse_lone_run(name: &str, c: &Client, frozen: Duration) -> Result<LoneExpected> {
+    use std::os::unix::fs::FileExt;
+    let m = c.mnt.clone();
+    for d in ["ren", "lnk", "sym", "cre"] {
+        std::fs::create_dir(m.join(d))?;
+    }
+    std::fs::write(m.join("ren/r0"), b"r")?;
+    std::fs::write(m.join("target"), b"t")?;
+    std::fs::write(m.join("locked"), b"initial")?;
+    let plain = Arc::new(open_rw(&m.join("plain"))?);
+    let mut lf = open_rw(&m.join("locked"))?;
+    fcntl_lock(&lf, libc::F_SETLKW, libc::F_WRLCK as i16, 0, 0)
+        .map_err(|e| anyhow::anyhow!("the lock: {e}"))?;
+    write_at(&mut lf, 0, LONE_SYNCED).context("the write under the lock")?;
+    lf.sync_all().context("the fsync under the lock")?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ren = {
+        let dir = m.join("ren");
+        let mut cur = 0u64;
+        lone_worker(stop.clone(), move |i| {
+            let r = std::fs::rename(dir.join(format!("r{cur}")), dir.join(format!("r{i}")));
+            if r.is_ok() {
+                cur = i;
+            }
+            (format!("r{i}"), r)
+        })
+    };
+    let lnk = {
+        let (dir, target) = (m.join("lnk"), m.join("target"));
+        lone_worker(stop.clone(), move |i| {
+            let n = format!("k{i}");
+            (n.clone(), std::fs::hard_link(&target, dir.join(n)))
+        })
+    };
+    let sym = {
+        let dir = m.join("sym");
+        lone_worker(stop.clone(), move |i| {
+            let n = format!("s{i}");
+            (
+                n.clone(),
+                std::os::unix::fs::symlink("../target", dir.join(n)),
+            )
+        })
+    };
+    let cre = {
+        let dir = m.join("cre");
+        lone_worker(stop.clone(), move |i| {
+            let n = format!("c{i}");
+            let r = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(&n))
+                .map(drop);
+            (n, r)
+        })
+    };
+    let wr = {
+        let plain = plain.clone();
+        lone_worker(stop.clone(), move |i| {
+            (format!("{i}"), plain.write_all_at(&i.to_le_bytes(), i * 8))
+        })
+    };
+
+    std::thread::sleep(Duration::from_secs(1));
+    {
+        // Thawed whatever happens below: a frozen daemon would hang the
+        // workers and the unmount.
+        struct Thaw<'a>(&'a Client);
+        impl Drop for Thaw<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.resume();
+            }
+        }
+        // Dirty when the grant lapses: discarded at the close, never
+        // published (it reads longer than what was fsynced).
+        write_at(&mut lf, 0, b"DIRTY-AT-LAPSE").context("the write right before the freeze")?;
+        c.pause()?;
+        let _thaw = Thaw(c);
+        std::thread::sleep(frozen);
+    }
+    // The workers run into the fence (the grant lapsed while frozen).
+    std::thread::sleep(Duration::from_secs(2));
+    let after = write_at(&mut lf, 0, b"AFTER-LAPSE");
+    stop.store(true, Ordering::Relaxed);
+    let mut outcomes = std::collections::BTreeMap::new();
+    for (what, h) in [
+        ("rename", ren),
+        ("link", lnk),
+        ("symlink", sym),
+        ("create", cre),
+        ("write", wr),
+    ] {
+        let v = h
+            .join()
+            .map_err(|_| anyhow::anyhow!("the {what} worker panicked"))?;
+        outcomes.insert(what, v);
+    }
+    let fence = locks_of(c)?;
+    anyhow::ensure!(
+        after.as_ref().err().and_then(Code::from_os_error) == Some(Code::Io),
+        "the write under the lapsed grant answered {after:?}, expected EIO; locks: {fence}"
+    );
+    // The close drops the POSIX lock; the fence is checked before.
+    let fd = std::os::unix::io::IntoRawFd::into_raw_fd(lf);
+    let rc = unsafe { libc::close(fd) };
+    let close = Code::from_os_error(&std::io::Error::last_os_error());
+    anyhow::ensure!(
+        rc == -1 && close == Some(Code::Io),
+        "the close under the fence returned {rc} ({close:?}), expected EIO; locks: {fence}"
+    );
+    let summary: Vec<String> = outcomes
+        .iter()
+        .map(|(what, v)| {
+            let ok = v.iter().filter(|(_, r)| r.is_ok()).count();
+            let eio = v.iter().filter(|(_, r)| *r == Err(Code::Io)).count();
+            format!("{what} {ok} OK / {eio} EIO / {} other", v.len() - ok - eio)
+        })
+        .collect();
+    eprintln!("    {name}: {}; locks {fence}", summary.join(", "));
+    let fenced_ops = fence["owner_fenced_ops"].as_u64().unwrap_or(0);
+    anyhow::ensure!(
+        fenced_ops > 0,
+        "the daemon was frozen {frozen:?} past a {}-ms lock window and fenced nothing: {fence}",
+        fence["margin_ms"]
+    );
+    for (what, v) in &outcomes {
+        if let Some((n, r)) = v.iter().find(|(_, r)| !matches!(r, Ok(()) | Err(Code::Io))) {
+            bail!("{what} {n} answered {r:?}: only OK or EIO are right (the op was valid)");
+        }
+    }
+    // The fence lifted with the lock: this process mutates again.
+    std::fs::write(m.join("after-fence"), b"x").context("a create once the lock is gone")?;
+    // The tree holds exactly what answered OK.
+    let mut dirs = std::collections::BTreeMap::new();
+    for (what, dir) in [("link", "lnk"), ("symlink", "sym"), ("create", "cre")] {
+        let ok: std::collections::BTreeSet<String> = outcomes[what]
+            .iter()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(n, _)| n.clone())
+            .collect();
+        dirs.insert(dir, ok);
+    }
+    let renamed = outcomes["rename"]
+        .iter()
+        .rev()
+        .find(|(_, r)| r.is_ok())
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| "r0".into());
+    dirs.insert("ren", std::iter::once(renamed).collect());
+    // What a successful fsync covers must be there: every write that
+    // answered OK (none lost silently).
+    let synced = plain.sync_all();
+    eprintln!("    {name}: fsync of the plain file after the fence lifted: {synced:?}");
+    let expected = LoneExpected {
+        dirs,
+        synced: if synced.is_ok() {
+            outcomes["write"]
+                .iter()
+                .filter(|(_, r)| r.is_ok())
+                .map(|(n, _)| n.parse())
+                .collect::<std::result::Result<_, _>>()?
+        } else {
+            Vec::new()
+        },
+    };
+    drop(plain);
+    lock_lapse_lone_check(name, c, &expected, "on the mount")?;
+    let after = locks_of(c)?;
+    anyhow::ensure!(
+        after["fenced_owners"]
+            .as_array()
+            .is_some_and(|v| v.is_empty()),
+        "a lock owner is still fenced: {after}"
+    );
+    Ok(expected)
+}
+
 // ------------------------------------------------------------------ lock-latency
 
 /// The measurements: on a LAN, the first lock on a file from a

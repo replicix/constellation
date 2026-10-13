@@ -524,6 +524,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         Skip::Local(&["compares against mounts with CONSTELLATION_LOCKS=local"]),
     ),
     (
+        "lock-lapse-lone-node",
+        Skip::Local(&[STOP, "shortens the grant TTL (CONSTELLATION_LOCK_TTL_MS)"]),
+    ),
+    (
         "lock-latency",
         Skip::Local(&["compares against mounts with CONSTELLATION_LOCKS=local"]),
     ),

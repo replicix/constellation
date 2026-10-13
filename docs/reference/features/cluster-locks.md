@@ -271,10 +271,28 @@ copy's old holder an upgrade beside the delegate's live exclusive grant
 still count while the root knows the generation.
 
 A grant lapses when its holding node, or that node's path to the
-sequencer, stalls for longer than the TTL: a partition, a stopped or
-swapped-out daemon, an overloaded host. The sequencer then outwaits the
-grant and may give the lock to another node while the application on
-the first node still holds its `flock`. That node is **fenced**:
+sequencer, stalls past what is left of the grant's window: a partition,
+a stopped or swapped-out daemon, an overloaded host. Renewed half-way
+through, a grant has between `(ttl − margin) / 2` and `ttl − margin` of
+its window left at any moment (9.5–19 s at the defaults): a stall
+under 9.5 s never lapses it, a longer one shorter than the TTL can.
+The node that sequences the lock itself (a lone node, or the lease
+holder's own locks) is no exception: its renewal is a step of the same
+authority core, and a stalled core renews nothing. The xcheckfs run of
+2026-10-13 stalled a lone node's core for 18 s (a metadata-store write
+waiting on a journal write the overloaded host held up) and its grants
+lapsed. Its window is not stretched to the lease's for its own grants,
+because the node cannot tell from inside a stall that nobody acted on
+the expiry: a backup's seal or an `ack=s3` takeover deposes a holder
+well inside its lease TTL, and the successor's grace assumes every
+grant lapsed at its holder within a lock window. (The close-and-release
+waits above are bounded separately, by
+`CONSTELLATION_LOCK_CLOSE_WAIT_MS`; they do not stretch a window
+either.) The sequencer then outwaits the grant (its own too: the
+record lives until `ttl + margin` from its send, while the lapsed grant
+itself is dropped at the node's first renewal tick after the stall) and
+may give the lock to another node while the application on the first
+node still holds its `flock`. That node is **fenced**:
 
 - **On the locked file**, `read`, `write`, `flush`, `fsync`, `fallocate`
   and truncating `setattr` fail with `EIO`, for every process on the
@@ -301,7 +319,13 @@ the first node still holds its `flock`. That node is **fenced**:
   `flock` the lock's owner is the open file while a write's is the
   process's file table, so it never matches a `flock`. Lookups, `getattr`, `readdir`, `close`
   and the lock calls are not fenced, so the application can still see
-  the tree and unlock. Other processes on the node are not fenced.
+  the tree and unlock. Other processes on the node are not fenced. A
+  process that issues requests on behalf of others (a FUSE passthrough,
+  a file server, a differential tester such as xcheckfs) is one owner:
+  one lapsed grant of any lock it took fences every request it sends
+  until the lapsed lock's owner holds no lock any more — every `fcntl`
+  lock of the process (they share one owner), or that `flock`ed open
+  file's.
 - The owner fence lifts when that owner's local locks are gone (unlock
   or close), and only then: a new grant on the file does not lift it,
   because the lock was not held throughout.

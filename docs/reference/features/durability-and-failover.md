@@ -793,7 +793,17 @@ Operational rules:
   P2P path to the holder answers within. It is not applied while
   the live peers answer (`PingS3`, asked every 5 s during the stall)
   that none of them reaches S3 either: a bucket outage is the
-  continuation epoch's.
+  continuation epoch's. A lone node has no peer to ask
+  (`peers_reach_s3` stays `null`): the deadline applies to it (with
+  forwarding on, the default, and no continuation epoch open), and
+  nothing is forwarded (there is no holder but itself); a bucket outage
+  ends that when the node's epoch of one forms. The test is that no
+  request completed, not that one is outstanding, so a daemon that
+  stalled itself (frozen, or its authority core waiting 18 s on a
+  metadata-store write, as in the xcheckfs run of 2026-10-13) issued
+  none and reads as stalled for a moment when it runs again. On a
+  holder whose lease is still valid nothing waits on the deadline (its
+  ops execute locally); that run's `own_s3.deadlines` stayed 0.
 - A node restarted after a crash with nothing of its own to ship does
   not reacquire the lease its previous incarnation held. If no backup
   seals that lease, it stays in force until it expires, and a peer's

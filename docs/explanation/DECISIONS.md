@@ -805,6 +805,10 @@ strict mode (cross-node byte-range locks) had never been built.
   locks are gone: an application guarding other files with the lock
   (git) must not write on without it. The TTL is long (20 s) so that
   lapses are rare; a crashed holder costs its waiters `ttl + margin`.
+  Renewed half-way through its window, a grant is sure to survive a
+  stall of its holder (or of the core that sequences it, on the same
+  node) only up to `(ttl − margin) / 2` (9.5 s), and one up to
+  `ttl − margin` (19 s) only right after a renewal, never a whole TTL.
 - Each mutation of a lock owner carries a fencing token (Chubby's
   sequencer, Kleppmann's argument): its grants and the end of the window
   its node honours them for. A sequencer that holds the grant (its

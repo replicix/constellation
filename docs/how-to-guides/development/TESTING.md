@@ -3104,9 +3104,11 @@ Harness scenarios (the harness process is the application: it calls
 | `lock-latency` | measurements: first lock from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff, and a lone node under `cluster` against `local` |
 | `lock-holder-killed-contention` | four nodes increment one `flock`ed counter (read, add, write, `fsync`); the holder is `kill -9`'d with the lock held. The survivors stall only until its grant is outwaited (ttl + margin, never less than its remaining life), hand the lock on with no further outwait (the owner's `recalls_expired` is 1), and the count is exact. Then a node killed while parked first in line costs the next waiter nothing (granted within milliseconds of the unlock, not ttl + margin later) |
 | `lock-fence-at-close` | B writes under a lock and is cut from the owner past its grant; C takes the lock and writes. B's close returns `EIO` (`fcntl` closed while still locked; `flock` unlocked first, then closed), and the file holds C's data on every node |
+| `lock-lapse-lone-node` | a lone node (`--write-mode back`, ttl 3 s) is frozen (`SIGSTOP`) past a lock grant's window while the lock's owner process has `fsync`ed one write under the lock and left a second one dirty, and creates, links, symlinks and renames from other threads: every op answers OK or `EIO` and the tree holds exactly what answered OK (an op in flight across the stall is applied and answered OK, or not applied), the write and the close after the lapse answer `EIO`, the file holds exactly the `fsync`ed write (the dirty one is discarded, never published), and the fence lifts with the lock. After a remount the tree, the file and every write a later `fsync` acknowledged are there, and fsck is clean. The node that sequences its own grants lapses them too: the core that renews them is the one stalled (the xcheckfs run of 2026-10-13) |
 
-On failure `lock-failover`, `lock-holder-killed-contention` and
-`lock-fence-at-close` keep the node logs under `/tmp/harness-m14-logs`.
+On failure `lock-failover`, `lock-holder-killed-contention`,
+`lock-fence-at-close` and `lock-lapse-lone-node` keep the node logs
+under `/tmp/harness-m14-logs`.
 
 `chaos-ci` and `chaos-soak-4` diagnose a convergence failure before they
 tear down. For the path the coordinator could not get agreement on, they

@@ -1374,6 +1374,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m14::lock_release_at_close,
     },
     Scenario {
+        name: "lock-lapse-lone-node",
+        desc: "plan 30 M14: a lone node (write-back) frozen past a lock grant's window while the lock's owner process has fsynced one write under it and left a second dirty, and creates, links, symlinks and renames from other threads: every op answers OK or EIO and the tree holds exactly what answered OK, the write and the close after the lapse answer EIO, the file holds exactly the fsynced write (the dirty one is discarded), the fence lifts with the lock; after a remount the tree, the file and every fsync-acknowledged write are there; fsck is clean",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_lapse_lone_node,
+    },
+    Scenario {
         name: "lock-latency",
         desc: "plan 30 M14 measurements: first lock on a file from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff; and a lone node under --locks cluster against --locks local",
         requires: &[],
