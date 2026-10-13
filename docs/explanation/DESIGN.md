@@ -443,8 +443,17 @@ know client opens; Constellation avoids the problem with explicit claims.)
   only once the reference outlives a short grace (≤ 1 s, well inside the
   lease TTL a GC round waits; the view asks the hold task to wake for it,
   whatever its refresh period), so the unlink's own lookup, let go of as
-  the unlink returns, never costs a hold write. A session handover carries these references; a
-  restart ends them with the kernel's (the mount goes).
+  the unlink returns, never costs a hold write. A session handover carries
+  these references; a restart ends them with the kernel's (the mount
+  goes).
+- **An orphan is the whole inode**: it keeps its xattrs (in `orphans`,
+  one key per name beside its record, since the record's inline set is
+  small and the spilled form lives in the replicated `ns`) and its
+  attributes, and `setattr` and the xattr ops through a descriptor or a
+  kernel reference change them there, journaling nothing — the inode has
+  no name, so no other replica can reach it. An unlink that speculation
+  later rolls back restores the inode as it was before (§4): what was
+  changed on it as an orphan meanwhile, never journaled, is not kept.
 - **Removed elsewhere = stale handle**: an inode removed by another node,
   or by another view of this one, is not kept for this view's kernel
   references (the view keeps no lookup table). Every op on such an inode

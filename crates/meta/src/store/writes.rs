@@ -691,13 +691,6 @@ impl Meta {
             let t = now_ns();
             ns::remove_dentry(&mut tx, &self.ns, dirty, parent, name, old.ino)?;
             if old_rec.attrs.nlink <= 1 {
-                ns::clear_spilled_xattrs(&mut tx, &self.ns, dirty, old.ino)?;
-                let names: Vec<Vec<u8>> =
-                    ns::all_xattrs(&tx, &self.ns, &self.blobs, &old_rec, old.ino)?
-                        .into_iter()
-                        .map(|(n, _)| n.into_bytes())
-                        .collect();
-                misc::xattr_by_name_del_all_tx(&mut tx, &self.xattr_by_name, old.ino, names);
                 misc::track_manifest_transition_tx(
                     &mut tx,
                     &self.chunk_ref,
@@ -709,12 +702,17 @@ impl Meta {
                 let mut orphan_rec = old_rec.clone();
                 orphan_rec.attrs.nlink = 0;
                 orphan_rec.attrs.ctime_ns = t;
-                orphan_rec.xattrs.clear();
-                tx.insert(
+                ns::orphan_inode(
+                    &mut tx,
+                    &self.ns,
+                    dirty,
+                    &self.blobs,
+                    &self.xattr_by_name,
                     &self.orphans,
-                    old.ino.to_be_bytes().to_vec(),
-                    orphan_rec.encode(),
-                );
+                    old.ino,
+                    &old_rec,
+                    orphan_rec,
+                )?;
                 ns::ns_remove(&mut tx, &self.ns, dirty, keys::inode(old.ino))?;
                 if old_rec.attrs.kind == Kind::File {
                     delta_bytes -= old_rec.attrs.size as i64;
@@ -902,13 +900,6 @@ fn rename_in_tx(
             atime::remove_atime_tx(tx, atime_ks, existing.ino);
             misc::bump_nlink_tx(tx, ns_ks, dirty, new_parent, -1, t)?;
         } else if existing_rec.attrs.nlink <= 1 {
-            ns::clear_spilled_xattrs(tx, ns_ks, dirty, existing.ino)?;
-            let names: Vec<Vec<u8>> =
-                ns::all_xattrs(tx, ns_ks, blobs, &existing_rec, existing.ino)?
-                    .into_iter()
-                    .map(|(n, _)| n.into_bytes())
-                    .collect();
-            misc::xattr_by_name_del_all_tx(tx, xattr_by_name_ks, existing.ino, names);
             let manifest_bytes = existing_rec
                 .manifest
                 .as_ref()
@@ -925,12 +916,17 @@ fn rename_in_tx(
             let mut orphan_rec = existing_rec.clone();
             orphan_rec.attrs.nlink = 0;
             orphan_rec.attrs.ctime_ns = t;
-            orphan_rec.xattrs.clear();
-            tx.insert(
+            ns::orphan_inode(
+                tx,
+                ns_ks,
+                dirty,
+                blobs,
+                xattr_by_name_ks,
                 orphans_ks,
-                existing.ino.to_be_bytes().to_vec(),
-                orphan_rec.encode(),
-            );
+                existing.ino,
+                &existing_rec,
+                orphan_rec,
+            )?;
             ns::ns_remove(tx, ns_ks, dirty, keys::inode(existing.ino))?;
             if existing_rec.attrs.kind == Kind::File {
                 delta.0 -= existing_rec.attrs.size as i64;
@@ -1237,6 +1233,65 @@ impl Meta {
         Ok(Some(ns::attrs_to_fileattr(ino, &rec.attrs, at)))
     }
 
+    /// `setxattr` on an unlinked inode a descriptor or the kernel still
+    /// references (its record lives in `orphans`, DESIGN.md §3): applied
+    /// to its orphan xattrs ([`ns::orphan_xattr_key`]) only, journaling
+    /// nothing, as [`Self::orphan_setattr`] — the inode has no name, so
+    /// no other replica can reach it. `Ok(false)` when `ino` is not an
+    /// orphan here; the mode's refusals as for a named inode.
+    pub fn orphan_set_xattr(
+        &self,
+        ino: Ino,
+        name: &str,
+        value: &[u8],
+        mode: SetXattrMode,
+    ) -> Result<bool, MetaError> {
+        self.orphan_xattr_change(ino, name, |existing| match mode {
+            SetXattrMode::Create if existing => Err(MetaError::Exists),
+            SetXattrMode::Replace if !existing => Err(MetaError::NoData),
+            _ => Ok(Some(value.to_vec())),
+        })
+    }
+
+    /// `removexattr` on an orphan, as [`Self::orphan_set_xattr`].
+    pub fn orphan_remove_xattr(&self, ino: Ino, name: &str) -> Result<bool, MetaError> {
+        self.orphan_xattr_change(ino, name, |existing| {
+            if existing {
+                Ok(None)
+            } else {
+                Err(MetaError::NoData)
+            }
+        })
+    }
+
+    /// One orphan xattr written (`Some`) or removed (`None`) as `change`
+    /// decides from whether it exists, with the orphan's ctime.
+    fn orphan_xattr_change(
+        &self,
+        ino: Ino,
+        name: &str,
+        change: impl FnOnce(bool) -> Result<Option<Vec<u8>>, MetaError>,
+    ) -> Result<bool, MetaError> {
+        let mut tx = self.db.write_tx();
+        if ns::get_inode_record(&tx, &self.ns, ino)?.is_some() {
+            return Ok(false);
+        }
+        let Some(v) = tx.get(&self.orphans, ino.to_be_bytes())? else {
+            return Ok(false);
+        };
+        let key = ns::orphan_xattr_key(ino, name.as_bytes());
+        let existing = tx.get(&self.orphans, key.clone())?.is_some();
+        match change(existing)? {
+            Some(value) => tx.insert(&self.orphans, key, value),
+            None => tx.remove(&self.orphans, key),
+        }
+        let mut rec = InodeRecord::decode(&v)?;
+        rec.attrs.ctime_ns = now_ns();
+        tx.insert(&self.orphans, ino.to_be_bytes().to_vec(), rec.encode());
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// `renameat2(RENAME_EXCHANGE)`: atomically swap the inodes
     /// `parent/name` and `new_parent/new_name` name (see
     /// [`exchange_in_tx`]), journaling one [`LogRecord::Exchange`].
@@ -1332,8 +1387,13 @@ impl MetaStore for Meta {
 
     fn get_xattr(&self, ino: Ino, name: &str) -> Result<Option<Vec<u8>>, MetaError> {
         let r = self.db.read_tx();
-        let Some(rec) = ns::get_inode_any(&r, &self.ns, &self.orphans, ino)? else {
-            return Err(MetaError::NoEnt(ino));
+        let Some(rec) = ns::get_inode_record(&r, &self.ns, ino)? else {
+            if r.get(&self.orphans, ino.to_be_bytes())?.is_none() {
+                return Err(MetaError::NoEnt(ino));
+            }
+            return Ok(r
+                .get(&self.orphans, ns::orphan_xattr_key(ino, name.as_bytes()))?
+                .map(|v| v.to_vec()));
         };
         if !rec.xattrs.is_empty() {
             return Ok(rec
@@ -1354,8 +1414,14 @@ impl MetaStore for Meta {
 
     fn list_xattrs(&self, ino: Ino) -> Result<Vec<String>, MetaError> {
         let r = self.db.read_tx();
-        let Some(rec) = ns::get_inode_any(&r, &self.ns, &self.orphans, ino)? else {
-            return Err(MetaError::NoEnt(ino));
+        let Some(rec) = ns::get_inode_record(&r, &self.ns, ino)? else {
+            if r.get(&self.orphans, ino.to_be_bytes())?.is_none() {
+                return Err(MetaError::NoEnt(ino));
+            }
+            return Ok(ns::orphan_xattrs(&r, &self.orphans, ino)?
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect());
         };
         Ok(ns::all_xattrs(&r, &self.ns, &self.blobs, &rec, ino)?
             .into_iter()
@@ -1684,12 +1750,6 @@ impl MetaStore for Meta {
                 .as_ref()
                 .map(|p| ns::resolve_payload(&tx, &self.blobs, p))
                 .transpose()?;
-            let names: Vec<Vec<u8>> = ns::all_xattrs(&tx, &self.ns, &self.blobs, &rec, ino)?
-                .into_iter()
-                .map(|(n, _)| n.into_bytes())
-                .collect();
-            ns::clear_spilled_xattrs(&mut tx, &self.ns, dirty, ino)?;
-            misc::xattr_by_name_del_all_tx(&mut tx, &self.xattr_by_name, ino, names);
             misc::track_manifest_transition_tx(
                 &mut tx,
                 &self.chunk_ref,
@@ -1701,12 +1761,17 @@ impl MetaStore for Meta {
             let mut orphan_rec = rec.clone();
             orphan_rec.attrs.nlink = 0;
             orphan_rec.attrs.ctime_ns = t;
-            orphan_rec.xattrs.clear();
-            tx.insert(
+            ns::orphan_inode(
+                &mut tx,
+                &self.ns,
+                dirty,
+                &self.blobs,
+                &self.xattr_by_name,
                 &self.orphans,
-                ino.to_be_bytes().to_vec(),
-                orphan_rec.encode(),
-            );
+                ino,
+                &rec,
+                orphan_rec,
+            )?;
             ns::ns_remove(&mut tx, &self.ns, dirty, keys::inode(ino))?;
             if rec.attrs.kind == Kind::File {
                 usage_delta = (-(rec.attrs.size as i64), -1);
@@ -2065,6 +2130,7 @@ impl MetaStore for Meta {
                 None,
             )?;
             tx.remove(&self.orphans, ino.to_be_bytes());
+            ns::clear_orphan_xattrs(&mut tx, &self.orphans, ino)?;
             atime::remove_atime_tx(&mut tx, &self.atime, ino);
         }
         tx.commit()?;

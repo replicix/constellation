@@ -334,6 +334,10 @@ impl Meta {
             }
             if let Some(v) = tx.get(&self.orphans, ino.to_be_bytes())? {
                 kept.push((ino.to_be_bytes().to_vec(), v.to_vec()));
+                // Its xattrs with it (`ns::orphan_xattr_key`).
+                for (name, value) in ns::orphan_xattrs(&tx, &self.orphans, ino)? {
+                    kept.push((ns::orphan_xattr_key(ino, name.as_bytes()), value));
+                }
             }
         }
         // The namespace is replaced wholesale, so every key that was live

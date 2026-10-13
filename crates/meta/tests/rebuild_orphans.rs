@@ -5,7 +5,7 @@
 //! still names is not an orphan there and the namespace record wins.
 
 use constellation_fs_core::types::ROOT_INO;
-use constellation_meta::{Meta, MetaStore};
+use constellation_meta::{Meta, MetaStore, SetXattrMode};
 use std::collections::HashSet;
 
 #[test]
@@ -17,6 +17,11 @@ fn a_rebuild_keeps_the_orphans_that_are_held_open_and_drops_the_rest() {
     let relinked = meta.create(ROOT_INO, "relinked", 0o644, 0, 0).unwrap();
     let open = meta.create(ROOT_INO, "open", 0o644, 0, 0).unwrap();
     meta.set_manifest(open.ino, &[0xab; 64], 4096).unwrap();
+    // Inline and over the inline budget (spilled while it had a name).
+    meta.set_xattr(open.ino, "user.small", b"s", SetXattrMode::Set)
+        .unwrap();
+    meta.set_xattr(open.ino, "user.big", &[7; 2000], SetXattrMode::Set)
+        .unwrap();
     let closed = meta.create(ROOT_INO, "closed", 0o644, 0, 0).unwrap();
     meta.set_manifest(closed.ino, &[0xcd; 64], 4096).unwrap();
     for name in ["open", "closed", "relinked"] {
@@ -43,9 +48,17 @@ fn a_rebuild_keeps_the_orphans_that_are_held_open_and_drops_the_rest() {
     let keep: HashSet<_> = [open.ino, relinked.ino].into_iter().collect();
     meta.replace_ns_from_rebuilt(&side, &keep).unwrap();
 
-    // The open orphan survives with its manifest; the closed one is gone.
+    // The open orphan survives with its manifest and its xattrs; the
+    // closed one is gone.
     assert_eq!(meta.orphans().unwrap(), vec![open.ino]);
     assert_eq!(meta.manifest(open.ino).unwrap(), Some(vec![0xab; 64]));
+    let mut names = meta.list_xattrs(open.ino).unwrap();
+    names.sort();
+    assert_eq!(names, ["user.big", "user.small"]);
+    assert_eq!(
+        meta.get_xattr(open.ino, "user.big").unwrap(),
+        Some(vec![7; 2000])
+    );
     let attr = meta.getattr(open.ino).unwrap().unwrap();
     assert_eq!(attr.nlink, 0);
     assert!(meta.getattr(closed.ino).unwrap().is_none());

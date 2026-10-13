@@ -131,6 +131,88 @@ pub(crate) fn get_inode_any(
     }
 }
 
+/// An orphan's xattrs (DESIGN §3: an unlinked inode a descriptor or the
+/// kernel still references keeps them, as on a local filesystem). They
+/// live in the node-local `orphans` keyspace beside the inode's record,
+/// one key per name — `ino` (8 bytes, the record's own key) followed by
+/// the name, so never 8 bytes long and never taken for a record
+/// ([`Meta::orphans`] lists 8-byte keys only) — because the record's
+/// inline xattr section holds [`record::XATTR_INLINE`] bytes and the
+/// spilled form lives in `ns`, the replicated namespace an orphan has
+/// left.
+pub(crate) fn orphan_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
+    let mut key = ino.to_be_bytes().to_vec();
+    key.extend_from_slice(name);
+    key
+}
+
+/// `ino`'s orphan xattrs, by name.
+pub(crate) fn orphan_xattrs(
+    r: &impl Readable,
+    orphans: &SingleWriterTxKeyspace,
+    ino: Ino,
+) -> Result<Vec<(String, Vec<u8>)>, MetaError> {
+    let mut out = Vec::new();
+    for guard in r.prefix(orphans, ino.to_be_bytes()) {
+        let (k, v) = guard.into_inner()?;
+        if k.len() > 8 {
+            out.push((String::from_utf8_lossy(&k[8..]).into_owned(), v.to_vec()));
+        }
+    }
+    Ok(out)
+}
+
+/// Drop every orphan xattr of `ino` (its record is reaped, or it is
+/// linked again).
+pub(crate) fn clear_orphan_xattrs(
+    tx: &mut SingleWriterWriteTx,
+    orphans: &SingleWriterTxKeyspace,
+    ino: Ino,
+) -> Result<(), MetaError> {
+    let keys: Vec<Vec<u8>> = tx
+        .prefix(orphans, ino.to_be_bytes())
+        .map(|g| g.into_inner().map(|(k, _)| k.to_vec()))
+        .collect::<Result<_, _>>()?;
+    for key in keys.into_iter().filter(|k| k.len() > 8) {
+        tx.remove(orphans, key);
+    }
+    Ok(())
+}
+
+/// Move inode `ino` (record `rec`, its last name just gone) into
+/// `orphans` as `orphan_rec`, its xattrs with it: they leave `ns` (the
+/// spilled `0x03` keys) and the by-name index, and are kept as orphan
+/// xattrs. Returns nothing; the caller removes the `ns` record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn orphan_inode(
+    tx: &mut SingleWriterWriteTx,
+    ns: &SingleWriterTxKeyspace,
+    dirty: Dirty,
+    blobs: &SingleWriterTxKeyspace,
+    xattr_by_name: &SingleWriterTxKeyspace,
+    orphans: &SingleWriterTxKeyspace,
+    ino: Ino,
+    rec: &InodeRecord,
+    mut orphan_rec: InodeRecord,
+) -> Result<(), MetaError> {
+    // Read before the spilled keys go: the set is inline or spilled.
+    let xattrs = all_xattrs(tx, ns, blobs, rec, ino)?;
+    clear_spilled_xattrs(tx, ns, dirty, ino)?;
+    crate::store::misc::xattr_by_name_del_all_tx(
+        tx,
+        xattr_by_name,
+        ino,
+        xattrs.iter().map(|(n, _)| n.clone().into_bytes()),
+    );
+    orphan_rec.xattrs.clear();
+    orphan_rec.xattrs_spilled = false;
+    tx.insert(orphans, ino.to_be_bytes().to_vec(), orphan_rec.encode());
+    for (name, value) in xattrs {
+        tx.insert(orphans, orphan_xattr_key(ino, name.as_bytes()), value);
+    }
+    Ok(())
+}
+
 pub(crate) fn child_ino(
     r: &impl Readable,
     ns: &SingleWriterTxKeyspace,

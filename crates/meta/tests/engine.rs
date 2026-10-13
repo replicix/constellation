@@ -83,14 +83,82 @@ fn unlinking_the_last_link_of_an_open_file_moves_it_to_orphans_and_reap_removes_
         meta.manifest(f.ino).unwrap().as_deref(),
         Some(&b"MANIFEST"[..])
     );
-    // Unlink already cleared xattrs (mirrors the old engine).
-    assert!(meta.list_xattrs(f.ino).unwrap().is_empty());
+    // Its xattrs go with it (a local filesystem's unlinked file keeps
+    // them for its descriptors).
+    assert_eq!(meta.list_xattrs(f.ino).unwrap(), ["user.a"]);
     assert_eq!(meta.orphans().unwrap(), vec![f.ino]);
 
     meta.reap_orphan(f.ino).unwrap();
 
     assert!(meta.getattr(f.ino).unwrap().is_none());
     assert!(meta.orphans().unwrap().is_empty());
+}
+
+/// An orphan keeps its whole xattr set, inline or spilled, whether the
+/// unlink was this replica's or replayed from another node's log; it
+/// leaves `ns` and the by-name index (its spilled names included, which
+/// the index used to keep), and `orphan_set_xattr`/`orphan_remove_xattr`
+/// change it there, journaling nothing. Reaped, nothing of it is left.
+#[test]
+fn an_orphan_keeps_its_xattrs_until_it_is_reaped() {
+    for foreign in [false, true] {
+        let meta = Meta::open_in_memory().unwrap();
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        let big = vec![7u8; 2000];
+        meta.set_xattr(f.ino, "user.small", b"v", SetXattrMode::Set)
+            .unwrap();
+        meta.set_xattr(f.ino, "user.big", &big, SetXattrMode::Set)
+            .unwrap();
+        assert!(meta.any_xattr_named("user.big").unwrap());
+        if foreign {
+            meta.apply_records(&[constellation_meta::LogRecord::Unlink {
+                parent: ROOT_INO,
+                name: "f".into(),
+                time_ns: 9,
+            }])
+            .unwrap();
+        } else {
+            meta.unlink(ROOT_INO, "f").unwrap();
+        }
+        assert_eq!(meta.orphans().unwrap(), vec![f.ino], "foreign: {foreign}");
+        let mut names = meta.list_xattrs(f.ino).unwrap();
+        names.sort();
+        assert_eq!(names, ["user.big", "user.small"]);
+        assert_eq!(
+            meta.get_xattr(f.ino, "user.big").unwrap(),
+            Some(big.clone())
+        );
+        assert!(!meta.any_xattr_named("user.big").unwrap(), "left the index");
+        assert!(!meta.any_xattr_named("user.small").unwrap());
+
+        let journal = meta.journal_len().unwrap();
+        assert!(meta
+            .orphan_set_xattr(f.ino, "user.new", b"n", SetXattrMode::Create)
+            .unwrap());
+        assert!(matches!(
+            meta.orphan_set_xattr(f.ino, "user.new", b"n", SetXattrMode::Create),
+            Err(constellation_meta::MetaError::Exists)
+        ));
+        assert!(meta.orphan_remove_xattr(f.ino, "user.small").unwrap());
+        assert!(matches!(
+            meta.orphan_remove_xattr(f.ino, "user.small"),
+            Err(constellation_meta::MetaError::NoData)
+        ));
+        assert_eq!(meta.journal_len().unwrap(), journal, "nothing journaled");
+        let mut names = meta.list_xattrs(f.ino).unwrap();
+        names.sort();
+        assert_eq!(names, ["user.big", "user.new"]);
+        assert_eq!(meta.orphans().unwrap(), vec![f.ino], "names are no orphans");
+
+        meta.reap_orphan(f.ino).unwrap();
+        assert!(meta.orphans().unwrap().is_empty());
+        assert!(meta.list_xattrs(f.ino).is_err());
+        // A named inode is not changed this way.
+        let g = meta.create(ROOT_INO, "g", 0o644, 0, 0).unwrap();
+        assert!(!meta
+            .orphan_set_xattr(g.ino, "user.x", b"1", SetXattrMode::Set)
+            .unwrap());
+    }
 }
 
 #[test]
@@ -129,6 +197,33 @@ fn usage_counters_persist_across_reopen() {
         (8, 1),
         "usage must be read back from the persisted counters, not re-derived by a full scan"
     );
+}
+
+/// An orphan's xattrs are on disk with its record: a reopened replica
+/// still has them (a daemon restart keeps the orphan until the reaper or
+/// the bootstrap drops it).
+#[test]
+fn an_orphans_xattrs_persist_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meta.fjall");
+    let f = {
+        let meta = Meta::open(&path).unwrap();
+        let f = meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        meta.set_xattr(f.ino, "user.big", &[1; 2000], SetXattrMode::Set)
+            .unwrap();
+        meta.unlink(ROOT_INO, "f").unwrap();
+        assert!(meta
+            .orphan_set_xattr(f.ino, "user.new", b"n", SetXattrMode::Set)
+            .unwrap());
+        f
+    };
+    let reopened = Meta::open(&path).unwrap();
+    assert_eq!(reopened.orphans().unwrap(), vec![f.ino]);
+    let mut names = reopened.list_xattrs(f.ino).unwrap();
+    names.sort();
+    assert_eq!(names, ["user.big", "user.new"]);
+    reopened.reap_orphan(f.ino).unwrap();
+    assert!(reopened.list_xattrs(f.ino).is_err());
 }
 
 #[test]

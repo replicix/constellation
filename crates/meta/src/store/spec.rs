@@ -1113,8 +1113,10 @@ fn restore_key_tx(
                         value,
                     );
                 }
-                // Linked again: whatever orphaned it is being undone.
+                // Linked again: whatever orphaned it is being undone (its
+                // xattrs are the restored record's again).
                 tx.remove(&meta.orphans, ino.to_be_bytes().to_vec());
+                ns::clear_orphan_xattrs(tx, &meta.orphans, ino)?;
             }
         }
         Ok(keys::Key::Xattr { ino, name }) => {

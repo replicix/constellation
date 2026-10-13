@@ -946,12 +946,6 @@ fn evict_dentry(
                 .as_ref()
                 .map(|p| ns::resolve_payload(tx, &meta.blobs, p))
                 .transpose()?;
-            ns::clear_spilled_xattrs(tx, &meta.ns, dirty, ino)?;
-            let names: Vec<Vec<u8>> = ns::all_xattrs(tx, &meta.ns, &meta.blobs, &rec, ino)?
-                .into_iter()
-                .map(|(n, _)| n.into_bytes())
-                .collect();
-            misc::xattr_by_name_del_all_tx(tx, &meta.xattr_by_name, ino, names);
             misc::track_manifest_transition_tx(
                 tx,
                 &meta.chunk_ref,
@@ -963,12 +957,17 @@ fn evict_dentry(
             let mut orphan_rec = rec.clone();
             orphan_rec.attrs.nlink = 0;
             orphan_rec.attrs.ctime_ns = t;
-            orphan_rec.xattrs.clear();
-            tx.insert(
+            ns::orphan_inode(
+                tx,
+                &meta.ns,
+                dirty,
+                &meta.blobs,
+                &meta.xattr_by_name,
                 &meta.orphans,
-                ino.to_be_bytes().to_vec(),
-                orphan_rec.encode(),
-            );
+                ino,
+                &rec,
+                orphan_rec,
+            )?;
             ns::ns_remove(tx, &meta.ns, dirty, keys::inode(ino))?;
         } else {
             misc::bump_file_nlink_tx(tx, &meta.ns, dirty, ino, -1, t)?;

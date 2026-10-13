@@ -424,6 +424,55 @@ fn a_stranded_unlink_restores_the_file() {
     );
 }
 
+/// The orphan a stranded unlink made, xattrs included, goes when the
+/// rollback names the inode again: its xattrs are the restored record's
+/// (what was changed on the orphan meanwhile was never journaled), and
+/// no orphan xattr key is left behind for a later unlink to inherit.
+#[test]
+fn a_stranded_unlink_leaves_no_orphan_xattrs() {
+    let meta = Meta::open_in_memory().unwrap();
+    apply(
+        &meta,
+        1,
+        1,
+        &[
+            create("f", ino(1), 10),
+            LogRecord::SetXattr {
+                ino: ino(1),
+                name: "user.a".into(),
+                value: b"1".to_vec(),
+                time_ns: 11,
+            },
+        ],
+    );
+    let op = MutateOp::Unlink {
+        parent: ROOT_INO,
+        name: "f".into(),
+    };
+    meta.install_shadow(rid(1), 1, &op, &[unlink("f", 20), completed(rid(1))])
+        .unwrap();
+    assert_eq!(
+        meta.list_xattrs(ino(1)).unwrap(),
+        ["user.a"],
+        "the orphan's"
+    );
+    assert!(meta
+        .orphan_set_xattr(
+            ino(1),
+            "user.o",
+            b"2",
+            constellation_meta::SetXattrMode::Set
+        )
+        .unwrap());
+    meta.strand_below_epoch(2).unwrap();
+    assert_eq!(meta.list_xattrs(ino(1)).unwrap(), ["user.a"], "restored");
+    // Unlinked for good now: the orphan's xattrs are the file's, with
+    // nothing of the stranded orphan's.
+    apply(&meta, 2, 2, &[unlink("f", 30)]);
+    assert_eq!(meta.orphans().unwrap(), vec![ino(1)]);
+    assert_eq!(meta.list_xattrs(ino(1)).unwrap(), ["user.a"]);
+}
+
 // ------------------------------------------------------ property test
 
 /// SplitMix64: a dependency-free, seedable generator.

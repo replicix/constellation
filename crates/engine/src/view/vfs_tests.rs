@@ -377,6 +377,45 @@ fn an_unlinked_file_reopens_until_it_is_forgotten() {
     assert!(c.view.export_handles().unlinked_refs.is_empty());
 }
 
+/// An unlinked file the kernel still references keeps its xattrs, and
+/// `setxattr`/`removexattr` through the reference (`/proc/self/fd/N`)
+/// change them, as on a local filesystem (both answered `ENOENT`, and the
+/// xattrs read back empty, before).
+#[test]
+fn an_unlinked_file_keeps_and_changes_its_xattrs() {
+    let c = fuse_client();
+    let (e, o) = c.create(ROOT_INO, "f").unwrap();
+    let f = e.attr.ino;
+    c.close(f, o.fh).unwrap();
+    let big = vec![b'x'; 2000];
+    c.setxattr(f, "user.small", b"1", SetXattrFlags::empty())
+        .unwrap();
+    c.setxattr(f, "user.big", &big, SetXattrFlags::empty())
+        .unwrap();
+    c.unlink(ROOT_INO, "f").unwrap();
+
+    let mut names = c.listxattr(f).unwrap();
+    names.sort();
+    assert_eq!(names, ["user.big", "user.small"]);
+    assert_eq!(c.getxattr(f, "user.big").unwrap(), big);
+    c.setxattr(f, "user.new", b"n", SetXattrFlags::empty())
+        .unwrap();
+    assert_eq!(
+        code(c.setxattr(f, "user.new", b"n", SetXattrFlags::CREATE)),
+        Code::Exists
+    );
+    c.removexattr(f, "user.small").unwrap();
+    assert_eq!(code(c.removexattr(f, "user.small")), Code::NoData);
+    assert_eq!(code(c.getxattr(f, "user.small")), Code::NoData);
+    let mut names = c.listxattr(f).unwrap();
+    names.sort();
+    assert_eq!(names, ["user.big", "user.new"]);
+    assert_eq!(c.getxattr(f, "user.new").unwrap(), b"n");
+
+    c.view.forget(f);
+    assert_eq!(code(c.listxattr(f)), Code::Stale);
+}
+
 /// The kernel may send an unlinked file's `FORGET` before the `RELEASE`
 /// of its last handle (the two travel apart): the forget leaves the
 /// orphan to the handle, whose close then reaps it.

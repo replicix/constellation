@@ -1802,18 +1802,26 @@ impl Vfs for View {
                 Err(error) => r.done(self.ino_err(ino, error.code())),
             };
         }
-        match self.mutate_op(
+        let op = constellation_meta::MutateOp::SetXattr {
             ino,
-            constellation_meta::MutateOp::SetXattr {
-                ino,
-                name,
-                value: value.to_vec(),
-                mode: wire_mode,
-            },
-        ) {
+            name: name.clone(),
+            value: value.to_vec(),
+            mode: wire_mode,
+        };
+        match self.mutate_op(ino, op) {
             Ok(()) => {
                 self.nudge_sync();
                 r.done(Ok(()))
+            }
+            // An unlinked file a descriptor or the kernel still references
+            // (`setxattr` of `/proc/self/fd/N`): nothing to publish, the
+            // orphan's own xattrs change, as `setattr`'s do.
+            Err(Code::NotFound) if self.unlinked(ino) => {
+                match self.meta.orphan_set_xattr(ino, &name, value, mode) {
+                    Ok(true) => r.done(Ok(())),
+                    Ok(false) => r.done(self.ino_err(ino, Code::NotFound)),
+                    Err(error) => r.done(self.ino_err(ino, error.code())),
+                }
             }
             Err(error) => r.done(self.ino_err(ino, error)),
         }
@@ -1867,10 +1875,22 @@ impl Vfs for View {
                 Err(error) => r.done(self.ino_err(ino, error.code())),
             };
         }
-        match self.mutate_op(ino, constellation_meta::MutateOp::RemoveXattr { ino, name }) {
+        let op = constellation_meta::MutateOp::RemoveXattr {
+            ino,
+            name: name.clone(),
+        };
+        match self.mutate_op(ino, op) {
             Ok(()) => {
                 self.nudge_sync();
                 r.done(Ok(()))
+            }
+            // As `setxattr`'s: an unlinked, still referenced file's own.
+            Err(Code::NotFound) if self.unlinked(ino) => {
+                match self.meta.orphan_remove_xattr(ino, &name) {
+                    Ok(true) => r.done(Ok(())),
+                    Ok(false) => r.done(self.ino_err(ino, Code::NotFound)),
+                    Err(error) => r.done(self.ino_err(ino, error.code())),
+                }
             }
             Err(error) => r.done(self.ino_err(ino, error)),
         }

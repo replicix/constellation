@@ -46613,3 +46613,52 @@ failing the same way on main). `cargo fmt --check`, workspace clippy
 - The reused-id wait is bounded like the close wait: a `RELEASE` held
   back past it lets the closed description's locks pass to the new one
   as before.
+
+## Fix: an orphan keeps its xattrs (`opath-unlinked` remainder 1, 2026-10-13)
+
+The remainder of xcheckfs finding 02 on the box after `opath-unlinked`:
+`setxattr`/`removexattr` through an `O_PATH` reference to an unlinked file
+answered `ENOENT`, and its xattrs read back empty; ext4 keeps them and
+changes them (xcheckfs `stress_*`: `getxattr`/`listxattr` on `(deleted)`
+files).
+
+### Cause
+
+Every orphaning path (`writes.rs` unlink, a rename over a file and a
+`Publish` over one, `replay::evict_dentry`) dropped the inode's xattrs —
+`orphan_rec.xattrs.clear()` and `clear_spilled_xattrs`, "mirroring the old
+engine" (plan 29 M1, db34280: the SQLite engine kept xattrs in a table the
+inode row's deletion cascaded to). Three of the four also read the names
+to drop from the by-name index only after clearing a spilled set, so its
+names stayed in `xattr_by_name`. And `setxattr`/`removexattr` had no
+orphan path; `setattr` has had `orphan_setattr` since ed9b40b.
+
+### What changed
+
+- `ns::orphan_inode`: every orphaning path moves the whole xattr set,
+  inline or spilled (read before the spilled keys go), into `orphans`, one
+  key per name (`ino ‖ name`, never 8 bytes long, so `Meta::orphans`,
+  which lists 8-byte keys, is unchanged), and drops all of its names from
+  the by-name index.
+- `get_xattr`/`list_xattrs` of an orphan read them;
+  `Meta::orphan_set_xattr`/`orphan_remove_xattr` change them as
+  `orphan_setattr` changes its attributes (journaling nothing — the inode
+  has no name, so no other replica can reach it — with the ctime bumped);
+  `reap_orphan`, a rebuild's carry-over and a speculation rollback that
+  names the inode again handle them with the record.
+- The view's `setxattr`/`removexattr` fall back to them when the sequencer
+  answers `NotFound` for an unlinked inode, as `setattr` does.
+
+What was changed on an orphan is lost if speculation rolls its unlink back:
+the restored inode is the one before the unlink, and the orphan's changes
+were never journaled.
+
+### Tests
+
+`view::vfs_tests::an_unlinked_file_keeps_and_changes_its_xattrs` and meta
+`unlinking_the_last_link_of_an_open_file_moves_it_to_orphans_and_reap_removes_it`
+(now: the orphan keeps `user.a`) fail on the previous main; new meta
+`an_orphan_keeps_its_xattrs_until_it_is_reaped` (local and replayed
+unlink, inline and spilled sets, the index), `an_orphans_xattrs_persist_across_reopen`,
+`speculation::a_stranded_unlink_leaves_no_orphan_xattrs`, and the xattrs
+in `rebuild_orphans`.
