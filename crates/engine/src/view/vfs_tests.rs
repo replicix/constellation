@@ -900,6 +900,34 @@ fn lookup_and_create_of_an_existing_file_report_the_pending_size() {
     c.close(ino, o.fh).unwrap();
 }
 
+/// In a scratch directory `rmdir` removes an empty directory and `unlink`
+/// a file, as anywhere else: the two were swapped (`rmdir` of a scratch
+/// directory answered `EISDIR`, so `rm -r` of one failed on a mount, and
+/// `unlink` removed an empty one).
+#[test]
+fn rmdir_and_unlink_in_a_scratch_directory() {
+    let c = client();
+    let scratch = c.mkdir(ROOT_INO, "tmp").unwrap().attr.ino;
+    c.setxattr(
+        scratch,
+        constellation_meta::SCRATCH_XATTR,
+        b"1",
+        SetXattrFlags::default(),
+    )
+    .unwrap();
+    let sub = c.mkdir(scratch, "sub").unwrap().attr.ino;
+    let (e, o) = c.create(sub, "f").unwrap();
+    c.close(e.attr.ino, o.fh).unwrap();
+    assert_eq!(code(c.unlink(scratch, "sub")), Code::IsDir);
+    assert_eq!(code(c.rmdir(sub, "f")), Code::NotDir);
+    assert_eq!(code(c.rmdir(scratch, "sub")), Code::NotEmpty);
+    c.unlink(sub, "f").unwrap();
+    assert_eq!(code(c.lookup(sub, "f")), Code::NotFound);
+    c.rmdir(scratch, "sub").unwrap();
+    assert_eq!(code(c.lookup(scratch, "sub")), Code::NotFound);
+    assert_eq!(code(c.rmdir(scratch, "sub")), Code::NotFound);
+}
+
 #[test]
 fn seek_fallocate_statfs_and_fsync() {
     let c = client();

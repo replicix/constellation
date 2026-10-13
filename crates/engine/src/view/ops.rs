@@ -620,17 +620,12 @@ impl Vfs for View {
                 .flatten()
                 .is_some()
         {
+            // unlink(2) of a directory is `EISDIR`; `rmdir` removes one
+            // (the two branches were swapped from the scratch area's
+            // start, f11c20e: `unlink` removed an empty scratch directory
+            // and `rmdir` of one answered `EISDIR`).
             match self.meta.scratch_lookup(parent, &name) {
-                Ok(Some(attr))
-                    if attr.kind == InodeKind::Dir
-                        && !self
-                            .meta
-                            .scratch_readdir(attr.ino)
-                            .unwrap_or_default()
-                            .is_empty() =>
-                {
-                    Err(Code::NotEmpty)
-                }
+                Ok(Some(attr)) if attr.kind == InodeKind::Dir => Err(Code::IsDir),
                 Ok(Some(_)) => self
                     .meta
                     .scratch_unlink(parent, &name)
@@ -684,12 +679,18 @@ impl Vfs for View {
                 .flatten()
                 .is_some()
         {
+            // rmdir(2): `ENOTDIR` for anything but a directory,
+            // `ENOTEMPTY` for one with entries (see `unlink`).
             match self.meta.scratch_lookup(parent, &name) {
-                Ok(Some(attr)) if attr.kind == InodeKind::Dir => Err(Code::IsDir),
-                Ok(Some(_)) => self
-                    .meta
-                    .scratch_unlink(parent, &name)
-                    .map_err(|e| e.code()),
+                Ok(Some(attr)) if attr.kind != InodeKind::Dir => Err(Code::NotDir),
+                Ok(Some(attr)) => match self.meta.scratch_readdir(attr.ino) {
+                    Ok(entries) if !entries.is_empty() => Err(Code::NotEmpty),
+                    Ok(_) => self
+                        .meta
+                        .scratch_unlink(parent, &name)
+                        .map_err(|e| e.code()),
+                    Err(e) => Err(e.code()),
+                },
                 Ok(None) => Err(Code::NotFound),
                 Err(e) => Err(e.code()),
             }
