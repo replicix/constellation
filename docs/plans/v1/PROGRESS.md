@@ -46933,3 +46933,180 @@ own commit, which is ordered already.
 `a_dot_lookup_waits_for_the_directorys_inode` fail on main (the lookup
 answers the old mode while the replica has not applied the observed
 `Setattr`) and pass with the change.
+
+## Fix: a partial `FORGET` reaped an orphan the kernel still referenced (plan 40 R2, 2026-10-14)
+
+The FUSE adapter forwarded every `FORGET` to `Vfs::forget` ("the view
+keeps no lookup counts", plan 31 §6.11), and the view reaps there an
+orphan it kept for the kernel's reference (`View::forget_unlinked`,
+9447477; directories since 5804289). A `FORGET` that gives back only some
+of the kernel's lookups of an inode it still holds therefore let go of an
+unlinked file (or a removed directory) that an `O_PATH` descriptor, an open
+file or a working directory still referenced: `fstat` answered `ESTALE`
+(`View::gone`: the replica no longer has the inode), and a reopen
+through `/proc/self/fd/N` failed, where a local filesystem answers
+`nlink 0`. This is plan 40's milestone R2 (§4.4), landed as a standalone
+integrity fix before READDIRPLUS is served.
+
+### Why
+
+The kernel keeps a lookup count per inode and forgets single lookups of
+inodes it still holds (Linux mainline `4056b3c9d3c9`, `fs/fuse/`):
+
+- `fuse_dentry_revalidate` (`dir.c`): a revalidation `LOOKUP` that answers
+  another node id than the dentry's queues `FORGET(nodeid, 1)` for that
+  answer and drops the dentry;
+- `fuse_lookup_name`, `create_new_entry`, `fuse_create_open` (`dir.c`):
+  an entry reply whose inode cannot be allocated queues `FORGET(nodeid, 1)`;
+- `fuse_force_forget` (`readdir.c`, `READDIRPLUS` only, not served yet): a
+  plus entry the kernel fails to link, `nlookup = 1`.
+
+The adapter's comment argued that the revalidation forget names an inode
+a name just led to, so never an unlinked one. That holds when the reply is
+written, not when the `FORGET` is read: the kernel queues it after the
+answer, its reader (`fuse_dev_do_read`) lets normal requests pass queued
+forgets, and another worker may serve a fresh `LOOKUP` and the `UNLINK` of
+that inode's last name — `reap_after_unlink` puts it in `unlinked_refs` —
+before the `FORGET` is applied. Sequence: node A's kernel holds Y under
+`m` (and an `O_PATH` descriptor of it) and X under `n`; past the entry TTL
+and the notification slack (`dentries`), node B runs `mv m n`; on A,
+`stat n` revalidates `n`, whose `LOOKUP` answers Y ≠ X → `FORGET(Y, 1)`,
+then looks `n` up again; `rm n` removes Y's last name; the late `FORGET`
+reaps Y.
+
+### What changed
+
+| Item | State | Where |
+|---|---|---|
+| `KernelRefs`: per-node-id lookup counts, 64 cache-line-padded shards (`HashMap<u64, u64>` with a splitmix hasher), outcome counters kept under the shard locks; `took`, `forgot -> Last \| Partial \| Underflow \| Unknown`, `export`/`import`, `len`; a `FORGET` of more than was counted drops the entry but is not final (`Underflow`: lookups were missed, the kernel may hold more; warn); a shard shrinks once the kernel shed most of it | done | `crates/frontend-fuse/src/refs.rs` |
+| Counted before the reply is written, on success only: `EntryReply` (lookup, mknod, mkdir, symlink, link) and `CreateReply` (both passthrough and plain), through the reply's `EntryGuard` (`hands_out`), so no shared reference is added per request; the table lives beside the names in `KernelEntries` | done | `reply.rs`, `dentries.rs` |
+| `forget`: only `Last` reaches `Vfs::forget`, and an `Unknown` root (its reference comes from the mount; a no-op for the view). In doubt the inode is kept: `Partial`, `Underflow`, and an `Unknown` other than the root (a reply path that misses its count — a future one such as `READDIRPLUS`'s would otherwise bring the bug back; warn). A kept inode is a bounded leak, never a reap under a live reference. The comment names every partial forget | done | `adapter.rs` `Filesystem::forget` |
+| `FUSE_BATCH_FORGET` (opcode 42): fuser's default `batch_forget`, which calls `forget` per node with its count — the same rule. It cannot be overridden: its `ForgetOne` argument is not exported by fuser 0.18.0 (nor by upstream master), so no implementor can name it; overriding it needs a fork branch exporting the type | default kept, wire-tested | `adapter.rs` (comment) |
+| Handover: `FuseHandoff::refs` (exported by the detach once every worker stopped, imported by `FuseSession::resume` before it serves; a detach abandoned in place keeps the filesystem and its table), `MountHandoff::refs` (the `daemon --upgrade` memfd and the CSI handoff socket's record) | done | `session.rs`, `crates/cli/src/handover.rs`, `handoff_socket.rs` |
+| An unreadable handoff rolls back: the new image hands the very text back to the previous executable, marked as the rollback (`roll_back_unread`), instead of exiting | done | `crates/cli/src/handover.rs` |
+| `HANDOVER_VERSION`'s doc: the no-bump rule replaces "bump it on any change" | done | `crates/cli/src/handover.rs` |
+| `node.status` per FUSE mount: `kernel_refs`, `forgets_final`, `forgets_partial`, `forgets_unknown`, `forgets_underflow`; `/metrics`: `constellation_fuse_kernel_refs{mountpoint}`, `constellation_fuse_forgets_total{mountpoint,outcome="final"\|"partial"\|"unknown"\|"underflow"}`; schema re-blessed | done | `stats.rs`, `crates/control/src/proto/types.rs`, `web.rs`, `control.schema.json`, `crates/cli/src/control.rs` |
+| Docs: `Vfs::forget` and `FrontendCaps::reports_forget` (the last `FORGET`), the view handoff's module doc (the frontend keeps the lookup table, it crosses in `FuseHandoff::refs`), ADR-31 | done | `crates/vfs/src/vfs.rs`, `caps.rs`, `crates/engine/src/view/handoff.rs`, `docs/explanation/DECISIONS.md` |
+| `MockVfs::forgets` (the forgets it was told, in order) and `MockVfs::delay_forget` (one inode's forget waits on the worker that applies it) | done | `crates/vfs/src/mock/mod.rs` |
+
+### The first `daemon --upgrade` across this change
+
+The handoff changed shape in place (`MountHandoff::refs`, no version bump,
+no `serde(default)`), so the old image's `--handover-abi` preflight passes,
+the old image detaches its views and `exec`s the new one, and the new one
+cannot parse the handoff ("missing field `refs`"). Measured on a Linux 7.3
+host, two nodes on S3, node A upgraded from `main` (`866a13a`'s code) to
+this change with a file open on the mount: **without** the rollback the
+new image exited, the view ended (`ENOTCONN` on the open descriptor, the
+mount gone) and `daemon --upgrade` timed out after 60 s — not a clean
+refusal; every in-place handoff change since the no-bump rule (9447477's
+`unlinked_refs` among them) had behaved so. **With** it, the new image logs
+"this image cannot read the handoff the previous one wrote; rolling back to
+it", the old image resumes the view (`rollback=true`), the open descriptor
+keeps reading and the mount stays. `daemon --upgrade` (this change's
+client) tells a rollback apart by version — the daemon still serves the
+version it ran before where the target's is another — and says so: with
+`--binary` it fails (exit 1, "the upgrade was rolled back: … unmount and
+mount again to move to the new build"), since the requested upgrade did
+not happen; without it the target is the daemon's own path on disk, whose
+version only the daemon knows, so the client compares with its own and
+only warns (exit 0). Measured with a probe image whose handoff has one
+more required field: `daemon --upgrade --binary <probe>` from this build
+rolled back, kept the view and an open descriptor, and exited 1 with that
+message. Across this change itself the client decides: `main`'s client
+drives the rollback above and prints "upgraded: … version <old
+version>"; this change's client cannot decode `main`'s `node.status` (the
+new required `kernel_refs` fields) and refuses before anything is detached
+("no daemon answers for this state dir … missing field `kernel_refs`"),
+the view untouched. Upgrading across this change therefore takes a remount (`umount`, then
+`mount` with the new binary); from this change on, an unreadable handoff
+always rolls back. The two fields the rollback reads from the raw JSON
+(`rollback_exe_fd`, `is_rollback`) are the part of the handoff no change
+may move. Refusing before anything is detached would need the *old* image
+to recognise the new shape, which `main`'s preflight cannot.
+
+### Unchanged on purpose
+
+- The view keeps no lookup table: what it needs is "the kernel references
+  this inode no more", which only the frontend can count. So there is no
+  engine-level partial-forget test (`View::forget` means the last one by
+  contract); the adapter is tested against the reference filesystem, which
+  keeps what its kernel unlinked until `forget` exactly as the view does
+  (34fe917), and the engine on a real two-node mount (below).
+- No harness scenario: plan 40 §7's `readdirplus-orphan-forget` (phase 1 is
+  the two-node reproduction below) lands with plan 40's system tests.
+- No over-count reaping: a reply the kernel never processes (a connection
+  abort, or a kernel path that drops a reply without forgetting it, such
+  as `create_new_entry`'s type mismatch) keeps its inode until the session
+  ends.
+
+### Tests
+
+- `refs::tests` (unit): a forget is final only for the last lookup;
+  inodes counted apart (one shard); the root is `Unknown`; an underflow
+  drops the entry and is never final; counts round-trip a handover (JSON) and add to what
+  is there; 8 threads taking and forgetting the same inodes balance to
+  empty; a shard shrinks.
+- `tests/wire.rs`: `only_the_last_forget_of_an_inode_reaches_the_view`
+  (`LOOKUP` twice, `FORGET(ino, 1)` not forwarded, the second one is; an
+  unknown node id is kept, the root's forwarded; a `FORGET` of more than
+  was counted is kept; an error reply counts nothing),
+  `a_batch_forget_gives_back_each_nodes_lookups` (opcode 42 with six nodes
+  after `MKNOD`, `MKDIR`, `SYMLINK`, `LINK`, `CREATE` and `LOOKUP`),
+  `a_late_partial_forget_leaves_the_orphan_the_kernel_still_references`
+  (the sequence above against the reference filesystem, "another node"
+  being a second view of it: `GETATTR` of Y answers `nlink` 0 after the late
+  partial forget and `ENOENT`/`ESTALE` after the final one). All three fail
+  with the previous forward-every-forget rule (the partial forget forwarded;
+  `GETATTR` `ENOENT`).
+- `session::tests` (real kernel, root): `a_revalidations_forget_applied_
+  after_the_unlink_keeps_the_orphan` — the race itself on a kernel mount of
+  the reference filesystem, the worker applying Y's `FORGET` held 500 ms
+  (`MockVfs::delay_forget`) while the other worker serves the fresh `LOOKUP`
+  and the `UNLINK`; `statx(AT_STATX_FORCE_SYNC)` of the `O_PATH`
+  descriptor answers `nlink` 0 and `forgets_partial` rose. With the previous
+  rule: 8 of 8 runs `ENOENT`; with this change 6 of 6 pass.
+  `the_kernels_lookup_counts_cross_a_handover`: the detached session's
+  `FuseHandoff::refs` holds the file's lookups and the resumed session
+  starts from them, serving the descriptor the kernel still holds.
+- `crates/cli` `handover::tests`: `a_mounts_lookup_counts_cross_the_exec`,
+  `a_handoff_this_image_cannot_read_rolls_back_to_its_writer` (a handoff
+  without `refs` is refused by the parse, and the rollback hands the same
+  text back marked `is_rollback`; a rollback is never rolled back again).
+- `web::tests::fuse_transport_metrics_render_per_mount_and_process_wide`
+  extended to the new series.
+- Two nodes of one filesystem on S3 (Linux 7.3 host, debug builds): each
+  round creates Y and X on A, opens an `O_PATH` descriptor of Y, waits past
+  TTL and slack, renames on B, waits until A's replica applied it (asked
+  through A's daemon, not A's kernel), `stat n` and `rm n` on A, then `fstat`
+  and reopens the descriptor. `main`: 2 of 20 rounds `ESTALE` (the race is
+  timing-dependent there). This change: 33 of 33 rounds `nlink` 0 and the
+  data read back through the reopened descriptor, and A's `forgets_partial`
+  rose by exactly 1 in every round.
+- A real `daemon --upgrade` of node A to the same build with 50 `O_PATH`
+  descriptors open: `kernel_refs` 51 before and after (`forgets_unknown`
+  0), and after the files were removed every descriptor `fstat`ed to
+  `nlink` 0.
+
+### Cost
+
+One shard lock and a hash-map update per entry reply and per `FORGET`
+(measured before the `Underflow` outcome was split out, which changes no
+path's cost):
+42 ns per lookup-and-forget pair on one thread, 135 ns per pair per thread
+with 8 threads hammering a 1-million-inode table in a tight loop (59 M
+pairs/s in all; release build, a loaded 16-CPU host) — against the
+microseconds a `LOOKUP` round trip costs. About 32 bytes per inode the
+kernel holds (its own inode and dentry cost well over 1 KiB). A first cut
+with the outcome counters as shared atomics and unpadded shards ran at 368
+ns per pair per thread with 8 threads; an extra shared reference per
+request (an `Arc` clone) would have cost as much again, hence the table
+beside the names in `KernelEntries`.
+
+### Proposed DESIGN text (CONVENTIONS rule 5: not edited here)
+
+DESIGN §3, "Kernel references count as holds": "…keeps the orphan, its
+data and its unpublished writes until the kernel's `FORGET`…" → "…until
+the kernel lets go of its last lookup of the inode (the FUSE adapter
+counts them: the kernel also forgets single lookups of inodes it still
+holds, ADR-31)…". DESIGN's "(the view keeps no lookup table)" stays true.

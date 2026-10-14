@@ -638,6 +638,7 @@ fn transfer(
                     init: h.fuse.init,
                     foreign: h.fuse.foreign,
                     passthrough: h.fuse.passthrough.clone(),
+                    refs: h.fuse.refs.clone(),
                     view: view.clone(),
                 },
             };

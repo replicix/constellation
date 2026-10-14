@@ -121,8 +121,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The handoff's format: an old and a new binary must agree on it
-/// (`daemon --handover-abi`). Bump it on any change to what crosses:
-/// 2 — plan 32 M0c, the `.constellation` synthetic nodes carry the
+/// (`daemon --handover-abi`). Since the maintainer's rule (2026-10-03) it
+/// is not bumped: what crosses changes in place, with no version bump and
+/// no compatibility shim (no `serde(default)`). So the preflight passes
+/// across such a change, and the new image cannot read what the old one
+/// sent; it hands the handoff back to the old image, which resumes the
+/// views as a rollback (`roll_back_unread`): that upgrade does not happen,
+/// and the views survive it (before plan 40 R2's `MountHandoff::refs`, the
+/// first change checked this way, the new image exited and every view
+/// ended). Upgrading across the change then takes a remount. The bumps
+/// before the rule: 2 — plan 32 M0c, the `.constellation` synthetic nodes carry the
 /// directory's inode instead of its path. 3 — plan 39 §3.7, a view's
 /// file handles are its own per-open numbers (`handles`), and the node's
 /// discard error events cross (`errors`): a version-2 image could neither
@@ -371,6 +379,8 @@ pub struct MountHandoff {
     /// Plan 38 Z3b: the session's passthrough table, its backing ids
     /// still registered (`FuseHandoff::passthrough`).
     pub(crate) passthrough: constellation_frontend_fuse::PassthroughHandoff,
+    /// Plan 40 R2: the kernel's lookup counts (`FuseHandoff::refs`).
+    pub(crate) refs: constellation_frontend_fuse::RefsHandoff,
     pub(crate) view: ViewHandoff,
 }
 
@@ -433,11 +443,17 @@ fn set_cloexec(fd: RawFd, on: bool) -> std::io::Result<()> {
 }
 
 /// A memfd (inherited across `exec`) holding `handoff`.
+#[cfg(test)]
 fn write_handoff(handoff: &DaemonHandoff) -> std::io::Result<RawFd> {
+    write_memfd(&serde_json::to_vec(handoff).map_err(std::io::Error::other)?)
+}
+
+/// A memfd (inherited across `exec`) holding `body`.
+fn write_memfd(body: &[u8]) -> std::io::Result<RawFd> {
     let fd = memfd()?;
     // SAFETY: a descriptor we just created and own.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    file.write_all(&serde_json::to_vec(handoff).map_err(std::io::Error::other)?)?;
+    file.write_all(body)?;
     file.flush()?;
     Ok(file.into_raw_fd())
 }
@@ -463,14 +479,24 @@ fn memfd() -> std::io::Result<RawFd> {
     ))
 }
 
+#[cfg(test)]
 fn read_handoff(fd: RawFd) -> Result<DaemonHandoff> {
+    parse_handoff(&read_handoff_text(fd)?)
+}
+
+/// The handoff's text, from the memfd the previous image passed (closed).
+fn read_handoff_text(fd: RawFd) -> Result<String> {
     // SAFETY: the descriptor the previous image passed us, ours now.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     file.rewind().context("the handoff memfd")?;
     let mut text = String::new();
     file.read_to_string(&mut text)
         .context("reading the handoff")?;
-    let handoff: DaemonHandoff = serde_json::from_str(&text).context("parsing the handoff")?;
+    Ok(text)
+}
+
+fn parse_handoff(text: &str) -> Result<DaemonHandoff> {
+    let handoff: DaemonHandoff = serde_json::from_str(text).context("parsing the handoff")?;
     if handoff.version != HANDOVER_VERSION {
         bail!(
             "handoff version {} (this binary speaks {HANDOVER_VERSION})",
@@ -488,7 +514,16 @@ fn exec_with(binary: &Path, handoff: &DaemonHandoff) -> std::io::Error {
             return e;
         }
     }
-    let memfd = match write_handoff(handoff) {
+    match serde_json::to_vec(handoff) {
+        Ok(body) => exec_body(binary, &body),
+        Err(e) => std::io::Error::other(e),
+    }
+}
+
+/// `exec` `binary` with `body` as its handoff, every descriptor it names
+/// already inheritable; returns only on failure.
+fn exec_body(binary: &Path, body: &[u8]) -> std::io::Error {
+    let memfd = match write_memfd(body) {
         Ok(fd) => fd,
         Err(e) => return e,
     };
@@ -516,6 +551,63 @@ fn roll_back(mut handoff: DaemonHandoff, why: &str) -> ! {
         None => tracing::error!(why, "handover failed and cannot roll back; exiting"),
     }
     std::process::exit(1)
+}
+
+/// A handoff this image cannot read goes back to the image that wrote it.
+///
+/// The handoff's shape changes in place, with no version bump
+/// ([`HANDOVER_VERSION`]), so an upgrade across such a change passes the
+/// `--handover-abi` preflight and reaches an image that cannot parse what
+/// the previous one sent (plan 40 R2's `MountHandoff::refs` was the first
+/// change to be checked this way: the new image exited, its descriptors
+/// closed, and every view on the node ended with `ENOTCONN` for the
+/// processes using it). Nothing has been touched yet here: every
+/// descriptor the handoff names is still inheritable, so the previous
+/// executable (`rollback_exe_fd`) resumes the views from the very same
+/// text — its own format — marked as the rollback (`is_rollback`). Those
+/// two fields are read from the raw JSON, and so are the part of the
+/// handoff no change may move. Never returns.
+fn roll_back_unread(text: &str, why: &str) -> ! {
+    match unread_rollback(text) {
+        Ok((fd, body)) => {
+            tracing::error!(
+                why,
+                "this image cannot read the handoff the previous one wrote; rolling back to it"
+            );
+            let err = exec_body(&PathBuf::from(format!("/proc/self/fd/{fd}")), &body);
+            tracing::error!(error = %err, "the rollback exec failed; exiting (the mounts end)");
+        }
+        Err(cannot) => {
+            tracing::error!(
+                why,
+                cannot,
+                "cannot read the handoff and cannot roll back; exiting"
+            )
+        }
+    }
+    std::process::exit(1)
+}
+
+/// [`roll_back_unread`]'s target: the previous executable's descriptor
+/// and the handoff to give it, the same text marked as the rollback.
+fn unread_rollback(text: &str) -> Result<(RawFd, Vec<u8>), String> {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("the handoff is not JSON: {e}"))?;
+    if raw
+        .get("is_rollback")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+    {
+        return Err("it is a rollback already".into());
+    }
+    let fd = raw
+        .get("rollback_exe_fd")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|fd| RawFd::try_from(fd).ok())
+        .ok_or("it names no previous executable")?;
+    raw["is_rollback"] = serde_json::Value::Bool(true);
+    let body = serde_json::to_vec(&raw).map_err(|e| e.to_string())?;
+    Ok((fd, body))
 }
 
 /// Run `binary --handover-abi` (bounded) and check it speaks this
@@ -886,6 +978,7 @@ fn hand_over(node: Arc<NodeRuntime>, binary: PathBuf, detached: Vec<Detached>) {
             fuse_fd: handoff.fuse.fuse_fd.into_raw_fd(),
             init: handoff.fuse.init,
             passthrough: handoff.fuse.passthrough,
+            refs: handoff.fuse.refs,
             view,
         });
     }
@@ -924,7 +1017,12 @@ pub fn resume_main(
     threads: crate::parallelism::ThreadPlan,
     log_buffer: crate::log_buffer::LogBuffer,
 ) -> Result<()> {
-    let handoff = read_handoff(handoff_fd)?;
+    let text = read_handoff_text(handoff_fd)?;
+    let handoff = match parse_handoff(&text) {
+        Ok(handoff) => handoff,
+        Err(e) => roll_back_unread(&text, &format!("{e:#}")),
+    };
+    drop(text);
     for fd in handoff.fds() {
         let _ = set_cloexec(fd, true);
     }
@@ -1103,6 +1201,7 @@ pub(crate) fn resume_mount(node: &Arc<NodeRuntime>, m: MountHandoff) -> Result<M
             mountpoint: Some(m.mountpoint.clone()),
             foreign: m.foreign,
             passthrough: m.passthrough.clone(),
+            refs: m.refs,
         },
         view.clone(),
         &options,
@@ -1272,6 +1371,83 @@ mod tests {
         let fd = write_handoff(&sent).unwrap();
         assert!(read_handoff(fd).is_err());
         assert_ne!(HANDOVER_VERSION, 2);
+    }
+
+    fn mount(refs: constellation_frontend_fuse::RefsHandoff) -> MountHandoff {
+        MountHandoff {
+            old_id: 4,
+            subtree: "/".into(),
+            mountpoint: "/mnt/x".into(),
+            fs_name: "x".into(),
+            allow_other: false,
+            read_only: false,
+            fuse_threads: 2,
+            fuse_fd: 11,
+            init: NegotiatedInit {
+                kernel_major: 7,
+                kernel_minor: 41,
+                proto_major: 7,
+                proto_minor: 40,
+                kernel_flags: 0,
+                flags: 0,
+                max_readahead: 131072,
+                max_write: 1 << 20,
+                max_background: 96,
+                congestion_threshold: 72,
+                time_gran_ns: 1,
+                max_pages: 256,
+                max_stack_depth: 0,
+                transport: constellation_frontend_fuse::Transport::DevFuse,
+            },
+            foreign: false,
+            passthrough: Default::default(),
+            refs,
+            view: ViewHandoff {
+                spec: Default::default(),
+                handles: Default::default(),
+            },
+        }
+    }
+
+    /// Plan 40 R2: the kernel's lookup counts cross the `exec` with their
+    /// mount.
+    #[test]
+    fn a_mounts_lookup_counts_cross_the_exec() {
+        let mut sent = handoff();
+        sent.mounts.push(mount(vec![(1 << 40, 3), (9, 1)]));
+        let got = read_handoff(write_handoff(&sent).unwrap()).unwrap();
+        assert_eq!(got.mounts[0].refs, vec![(1 << 40, 3), (9, 1)]);
+        assert_eq!(got.fds(), vec![7, 9, 11]);
+    }
+
+    /// The handoff changes shape in place (no version bump): an image
+    /// written before plan 40 R2 sends no lookup counts, this one cannot
+    /// read it, and it goes back to the image that wrote it — the same
+    /// text, marked as the rollback — instead of ending the mounts.
+    #[test]
+    fn a_handoff_this_image_cannot_read_rolls_back_to_its_writer() {
+        let mut sent = handoff();
+        sent.mounts.push(mount(vec![(9, 1)]));
+        let mut old: serde_json::Value = serde_json::to_value(&sent).unwrap();
+        old["mounts"][0].as_object_mut().unwrap().remove("refs");
+        let text = old.to_string();
+        let fd = write_memfd(text.as_bytes()).unwrap();
+        let err = read_handoff(fd).unwrap_err();
+        assert!(format!("{err:#}").contains("refs"), "{err:#}");
+        let (exe, body) = unread_rollback(&text).unwrap();
+        assert_eq!(exe, 9, "the previous executable");
+        let back: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(back["is_rollback"], true);
+        old["is_rollback"] = true.into();
+        assert_eq!(back, old, "otherwise the very text the writer sent");
+        // A rollback is never rolled back again, nor a handoff naming no
+        // previous executable.
+        assert!(unread_rollback(&back.to_string()).is_err());
+        let mut nameless = old.clone();
+        nameless["is_rollback"] = false.into();
+        nameless["rollback_exe_fd"] = serde_json::Value::Null;
+        assert!(unread_rollback(&nameless.to_string()).is_err());
+        assert!(unread_rollback("not json").is_err());
     }
 
     #[test]

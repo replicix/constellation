@@ -147,6 +147,11 @@ fn fuse_mount_status(stats: &constellation_frontend_fuse::SessionStats) -> api::
         lock_wait_downgrades: stats.lock_wait_downgrades(),
         ring_stranded_commits: stats.ring_stranded_commits(),
         ring_entries_held_long: stats.ring_entries_held_long(),
+        kernel_refs: stats.kernel_refs(),
+        forgets_final: stats.forgets_final(),
+        forgets_partial: stats.forgets_partial(),
+        forgets_unknown: stats.forgets_unknown(),
+        forgets_underflow: stats.forgets_underflow(),
         last_fallback: stats.last_fallback().map(|f| api::FuseFallback {
             from: f.from.name().to_string(),
             to: f.to.name().to_string(),

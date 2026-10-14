@@ -4069,6 +4069,18 @@ fn print_quota(q: api::QuotaStatus) -> Result<()> {
 /// `constellation daemon --upgrade`: ask the daemon to hand its views
 /// over (`handover`), then wait until the new image answers `status`
 /// with a higher generation.
+///
+/// A new image that cannot read the handoff the running one wrote (its
+/// shape changes in place, `handover::HANDOVER_VERSION`) hands it back,
+/// and the previous binary resumes the views as a rollback, at a higher
+/// generation too. That is told apart by version: still the version that
+/// ran before, where the target's is another. With `--binary` the target's
+/// version is the binary's own (`--handover-abi`), and a rollback fails the
+/// command (non-zero: the requested upgrade did not happen; the views are
+/// intact and a remount moves them to the new build). Without it the
+/// daemon re-executes the path it was started from, whose version only the
+/// daemon knows; this binary's version stands in for it, and a mismatch is
+/// only warned about.
 async fn cmd_daemon_upgrade(
     state_dir: &Path,
     binary: Option<PathBuf>,
@@ -4085,7 +4097,9 @@ async fn cmd_daemon_upgrade(
     match control::try_call::<cm::NodeHandoff>(
         state_dir,
         api::HandoffParams {
-            target: api::HandoffTarget::Exec { binary },
+            target: api::HandoffTarget::Exec {
+                binary: binary.clone(),
+            },
             ..Default::default()
         },
         Some(within),
@@ -4095,6 +4109,17 @@ async fn cmd_daemon_upgrade(
         Ok(report) => println!("{}", report.detail),
         Err(e) => bail!("upgrade refused: {}", e.message),
     }
+    // The daemon's preflight has just run `--handover-abi` on it: it answers.
+    let target = match &binary {
+        Some(binary) => {
+            let binary = binary.clone();
+            tokio::task::spawn_blocking(move || binary_version(&binary))
+                .await
+                .ok()
+                .flatten()
+        }
+        None => None,
+    };
     let started = std::time::Instant::now();
     loop {
         if started.elapsed() > within {
@@ -4104,6 +4129,29 @@ async fn cmd_daemon_upgrade(
         // connection waits in the listener's backlog.
         if let Ok(now) = status(std::time::Duration::from_secs(5)).await {
             if now.handover.generation > before.handover.generation && !now.handover.upgrading {
+                let expected = target
+                    .clone()
+                    .unwrap_or_else(|| env!("CONSTELLATION_VERSION").to_string());
+                if now.version == before.version && expected != before.version {
+                    let what = format!(
+                        "the daemon still serves version {} (pid {} generation {}, {} view(s) \
+                         intact): the new image ({expected}) could not take the views over and \
+                         rolled back to the previous binary (its log says why: a handoff it \
+                         cannot read, the first upgrade across a handoff change). Unmount and \
+                         mount again to move to the new build",
+                        now.version,
+                        now.handover.pid,
+                        now.handover.generation,
+                        now.mounts.len()
+                    );
+                    if target.is_some() {
+                        bail!("the upgrade was rolled back: {what}");
+                    }
+                    eprintln!(
+                        "warning: {what} (or the daemon's binary on disk is still the old one)"
+                    );
+                    return Ok(());
+                }
                 println!(
                     "upgraded: pid {} generation {} version {} serving {} view(s)",
                     now.handover.pid,
@@ -4121,6 +4169,18 @@ async fn cmd_daemon_upgrade(
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+/// The version `binary daemon --handover-abi` reports, if it answers.
+fn binary_version(binary: &Path) -> Option<String> {
+    let out = std::process::Command::new(binary)
+        .args(["daemon", "--handover-abi"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let abi: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    abi.get("version")?.as_str().map(str::to_string)
 }
 
 /// `<data dir>/<uuid>` (`constellation_engine::default_state_dir`, for

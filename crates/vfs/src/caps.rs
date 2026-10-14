@@ -105,7 +105,8 @@ pub struct FrontendCaps {
     /// `CONSTELLATION_FUSE_ZERO_COPY_MIN_READ`). `0`: every read.
     pub zero_copy_min_read: u32,
     /// The frontend calls [`crate::Vfs::forget`] whenever its platform
-    /// lets go of an inode it was handed (Linux FUSE: `FORGET`). With
+    /// lets go of an inode it was handed (Linux FUSE: the last `FORGET` of
+    /// the lookups the kernel holds, counted by the adapter). With
     /// [`OpenUnlinked::Keep`], the view then keeps a file it unlinked —
     /// data included — for as long as the platform references it, where
     /// an `O_PATH` descriptor can reopen it as on a local filesystem.

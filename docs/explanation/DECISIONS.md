@@ -1129,3 +1129,49 @@ called for it).
 [RESULTS.md](../../bench/remote/RESULTS.md#plan-30-real-s3-results);
 plan 30 [§7](../plans/v1/done/30-write-path-resilience-and-scale-out.md#7-close-out).
 Amends ADR-20.
+
+## ADR-31: The FUSE adapter keeps the kernel's lookup counts
+
+**Decision**: the Linux FUSE adapter counts, per node id, the lookups its
+replies hand the kernel (every successful `LOOKUP`, `CREATE`, `MKNOD`,
+`MKDIR`, `SYMLINK`, `LINK` reply, counted before the reply is written) and
+subtracts each `FORGET`'s count; it tells the view the kernel let go of an
+inode (`Vfs::forget`) only when the count reaches zero. In doubt it keeps
+the inode: a `FORGET` of more than was counted, or of a node id never
+counted (except the root, whose reference comes from the mount), means a
+reply's count was missed, and is logged rather than forwarded — a bounded
+leak instead of a reap under a live reference. The counts cross a session
+handover with the connection. The
+view itself still keeps no lookup table: what it needs is "the platform
+references this inode no more", and only the frontend can know.
+
+**Why**: the view reaps an orphan it kept for the kernel's reference at
+its `forget` (an unlinked file reopened through an `O_PATH` descriptor,
+DESIGN §3 "Kernel references count as holds"), so a `FORGET` that gives
+back only some of the kernel's lookups must not reach it. The kernel sends
+such partial forgets for inodes it still holds: a dentry revalidation
+whose `LOOKUP` names another inode than the dentry's forgets that answer's
+one lookup, as does an entry the kernel fails to instantiate, and
+`READDIRPLUS` force-forgets an entry it fails to link. The adapter used to
+forward every `FORGET`, reasoning that the revalidation one names an inode
+a name just led to, never an unlinked one; the `FORGET` is read later than
+it is sent, though, and another worker can apply the `LOOKUP` and the
+`UNLINK` of that inode's last name first. On two nodes of one filesystem
+on S3 that answered `ESTALE` for 2 of 20 descriptors (plan 40 R2).
+
+**Rejected**: no counts (plan 31 §6.11's choice: inode numbers needed no
+table across a handover; the partial forgets do). Counts in the view
+(every frontend would pay for one platform's protocol, and the view would
+need the frontend's reply ordering to count right). Counting only while
+`READDIRPLUS` is negotiated (the revalidation race exists without it).
+
+**Consequences**: one shard lock and a hash-map update per entry reply and
+per `FORGET`, about 32 bytes per inode the kernel holds; a reply the kernel
+never processes keeps its inode until the session ends (a bounded leak,
+never a premature reap). The handoff changed shape in place (the
+maintainer's rule: no version bump): the first `daemon --upgrade` across it
+rolls back to the old image, and the views take a remount to move.
+
+**See**: `crates/frontend-fuse/src/refs.rs`; PROGRESS, "Fix: a partial
+`FORGET` reaped an orphan the kernel still referenced";
+[plan 40 §4.4](../plans/v1/wip/40-readdirplus.md). Amends plan 31 §6.11.

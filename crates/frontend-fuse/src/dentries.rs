@@ -70,6 +70,7 @@
 //! the resume, longer than any entry TTL a view grants (1 s, or less for
 //! a lone strict node).
 
+use crate::refs::KernelRefs;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -140,6 +141,10 @@ pub struct KernelEntries {
     unfiltered_until: Mutex<Option<Instant>>,
     /// The longest TTL a reply has carried, in nanoseconds.
     longest_ttl_ns: AtomicU64,
+    /// The inodes the kernel holds, beside the names: the lookup counts
+    /// (plan 40 R2). Kept here so that a reply's [`EntryGuard`] reaches
+    /// them without another shared reference per request.
+    refs: Arc<KernelRefs>,
 }
 
 impl Default for KernelEntries {
@@ -149,6 +154,7 @@ impl Default for KernelEntries {
             hasher: RandomState::new(),
             unfiltered_until: Mutex::new(None),
             longest_ttl_ns: AtomicU64::new(0),
+            refs: KernelRefs::new(),
         }
     }
 }
@@ -156,6 +162,11 @@ impl Default for KernelEntries {
 impl KernelEntries {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// The kernel's lookup counts on this connection ([`KernelRefs`]).
+    pub(crate) fn refs(&self) -> &Arc<KernelRefs> {
+        &self.refs
     }
 
     /// This connection was served by another process (or another session)
@@ -288,6 +299,13 @@ pub(crate) struct EntryGuard {
 }
 
 impl EntryGuard {
+    /// The reply is about to hand the kernel node id `ino`: one more
+    /// lookup of it ([`KernelRefs::took`]). Called before the reply is
+    /// written, and only for a success.
+    pub(crate) fn hands_out(&self, ino: u64) {
+        self.entries.refs.took(ino);
+    }
+
     /// The reply handed the kernel this name with `ttl`.
     pub(crate) fn replied(mut self, ttl: Duration) {
         self.done = true;

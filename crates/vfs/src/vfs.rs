@@ -58,13 +58,16 @@ pub trait Vfs: Send + Sync + 'static {
         let _ = caps;
     }
 
-    /// The frontend's platform no longer references `ino` (Linux FUSE:
-    /// `FORGET`, sent when the kernel evicts the inode). What a view
-    /// kept to answer for an inode it removed while still referenced (an
-    /// `O_PATH` descriptor, a removed directory that is a process's
-    /// working directory) can go — an unlinked file's data included, for a
-    /// frontend that declares [`crate::FrontendCaps::reports_forget`]
-    /// (one that does not never calls this). Ignored by default.
+    /// The frontend's platform no longer references `ino` **at all**
+    /// (Linux FUSE: the `FORGET` that gives back the last of the kernel's
+    /// lookups of it — the kernel also forgets single lookups of inodes it
+    /// still holds, and the adapter counts them, so those never come
+    /// here; plan 40 R2). What a view kept to answer for an inode it
+    /// removed while still referenced (an `O_PATH` descriptor, a removed
+    /// directory that is a process's working directory) can go — an
+    /// unlinked file's data included, for a frontend that declares
+    /// [`crate::FrontendCaps::reports_forget`] (one that does not never
+    /// calls this). Ignored by default.
     fn forget(&self, ino: Ino) {
         let _ = ino;
     }

@@ -802,8 +802,10 @@ fn serve_main(args: &Args) -> Result<(), Fail> {
                     init: carried,
                     mountpoint: msg["mountpoint"].as_str().map(PathBuf::from),
                     foreign: false,
-                    // The probe serves a mock with no backing files.
+                    // The probe serves a mock with no backing files, and its
+                    // detach hands no lookup counts on.
                     passthrough: Default::default(),
+                    refs: Vec::new(),
                 };
                 match FuseSession::resume(handoff, vfs, &opts, caps(false), None) {
                     Ok(session) => {

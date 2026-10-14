@@ -80,6 +80,7 @@ mod op {
     pub const SETLKW: u32 = 33;
     pub const CREATE: u32 = 35;
     pub const DESTROY: u32 = 38;
+    pub const BATCH_FORGET: u32 = 42;
     pub const FALLOCATE: u32 = 43;
     pub const RENAME2: u32 = 45;
     pub const LSEEK: u32 = 46;
@@ -1693,6 +1694,246 @@ fn forget_needs_no_reply_and_unknown_opcodes_are_refused_not_fatal() {
     assert_eq!(r.errno(), libc::ENOSYS);
     k.call(op::GETATTR, 1, &Body::new().u32(0).u32(0).u64(0))
         .ok();
+    k.finish();
+}
+
+// ------------------------------------------- the kernel's lookup counts
+
+/// `FUSE_FORGET` of `n` lookups of `ino` (no reply).
+fn forget(k: &mut Kernel, ino: u64, n: u64) {
+    k.send(op::FORGET, ino, &Body::new().u64(n).0);
+}
+
+/// `FUSE_BATCH_FORGET` (`fuse_batch_forget_in`, then one `fuse_forget_one`
+/// per node; no reply).
+fn batch_forget(k: &mut Kernel, nodes: &[(u64, u64)]) {
+    let mut body = Body::new().u32(nodes.len() as u32).u32(0);
+    for &(ino, n) in nodes {
+        body = body.u64(ino).u64(n);
+    }
+    k.send(op::BATCH_FORGET, 0, &body.0);
+}
+
+/// A request answered after every forget sent before it: one worker
+/// serves the socket in order.
+fn barrier(k: &mut Kernel) {
+    k.call(op::GETATTR, ROOT_INO, &Body::new().u32(0).u32(0).u64(0))
+        .ok();
+}
+
+/// A session over `mock` whose lookup counts the test can read.
+fn counting(mock: &MockVfs) -> (Kernel, Arc<constellation_frontend_fuse::KernelRefs>) {
+    let fs = FuseFs::new(
+        Arc::new(mock.clone()),
+        constellation_frontend_fuse::caps(false),
+        KernelTuning::for_workers(1),
+    );
+    let refs = fs.kernel_refs().clone();
+    (Kernel::start_fs(fs, KERNEL_INIT_FLAGS, 0), refs)
+}
+
+/// Plan 40 R2: a `FORGET` reaches the view only when it gives back the
+/// kernel's last lookup of the inode (or is the root's). On the previous
+/// main the first partial `FORGET` already did.
+#[test]
+fn only_the_last_forget_of_an_inode_reaches_the_view() {
+    let mock = MockVfs::new();
+    mock.always_getattr(Script::ok(attr(ROOT_INO, FileKind::Dir)));
+    mock.always_lookup(Script::ok(entry(42, FileKind::File)));
+    let (mut k, refs) = counting(&mock);
+    k.call(op::LOOKUP, ROOT_INO, &Body::new().cstr("a")).ok();
+    k.call(op::LOOKUP, ROOT_INO, &Body::new().cstr("b")).ok();
+    assert_eq!(refs.count(42), 2, "each entry reply is a lookup");
+    forget(&mut k, 42, 1);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), Vec::<Ino>::new(), "a partial forget");
+    assert_eq!(refs.count(42), 1);
+    forget(&mut k, 42, 1);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), vec![42], "the last lookup given back");
+    assert!(refs.is_empty());
+    // A node id never counted is a lost count: kept from the view (a
+    // bounded leak), unless it is the root, whose reference comes from the
+    // mount.
+    forget(&mut k, 77, 3);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), vec![42], "an unknown inode is kept");
+    forget(&mut k, ROOT_INO, 1);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), vec![42, ROOT_INO]);
+    assert_eq!(refs.forgets_unknown(), 2);
+    // More given back than was counted: lookups were missed, the kernel
+    // may hold more, the view is not told.
+    k.call(op::LOOKUP, ROOT_INO, &Body::new().cstr("a")).ok();
+    forget(&mut k, 42, 2);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), vec![42, ROOT_INO]);
+    assert_eq!(refs.forgets_underflow(), 1);
+    assert!(refs.is_empty());
+    // An error reply hands the kernel no node id, and counts nothing.
+    mock.always_lookup(Script::fail(Code::NotFound));
+    let r = k.call(op::LOOKUP, ROOT_INO, &Body::new().cstr("c"));
+    assert_eq!(r.errno(), libc::ENOENT);
+    assert!(refs.is_empty());
+    k.finish();
+}
+
+/// `FUSE_BATCH_FORGET` (opcode 42: what the kernel sends with more than
+/// one forget queued) follows the same rule node by node, and every reply
+/// that hands out a node id counts: `MKNOD`, `MKDIR`, `SYMLINK`, `LINK`,
+/// `CREATE`, `LOOKUP`.
+#[test]
+fn a_batch_forget_gives_back_each_nodes_lookups() {
+    let mock = MockVfs::new();
+    mock.always_getattr(Script::ok(attr(ROOT_INO, FileKind::Dir)));
+    mock.always_mknod(Script::ok(entry(20, FileKind::Fifo)));
+    mock.always_mkdir(Script::ok(entry(21, FileKind::Dir)));
+    mock.always_symlink(Script::ok(entry(22, FileKind::Symlink)));
+    mock.always_link(Script::ok(entry(23, FileKind::File)));
+    mock.always_create(Script::ok((entry(50, FileKind::File), Opened::new(Fh(78)))));
+    mock.always_lookup(Script::ok(entry(20, FileKind::Fifo)));
+    let (mut k, refs) = counting(&mock);
+    k.call(
+        op::MKNOD,
+        ROOT_INO,
+        &Body::new()
+            .u32(modebits::S_IFIFO | 0o644)
+            .u32(0)
+            .u32(0)
+            .u32(0)
+            .cstr("p"),
+    )
+    .ok();
+    k.call(
+        op::MKDIR,
+        ROOT_INO,
+        &Body::new().u32(0o755).u32(0).cstr("d"),
+    )
+    .ok();
+    k.call(op::SYMLINK, ROOT_INO, &Body::new().cstr("l").cstr("t"))
+        .ok();
+    k.call(op::LINK, ROOT_INO, &Body::new().u64(23).cstr("h"))
+        .ok();
+    k.call(
+        op::CREATE,
+        ROOT_INO,
+        &Body::new()
+            .i32(RW | libc::O_CREAT)
+            .u32(0o100_644)
+            .u32(0)
+            .u32(0)
+            .cstr("f"),
+    )
+    .ok();
+    k.call(op::LOOKUP, ROOT_INO, &Body::new().cstr("p")).ok();
+    for (ino, n) in [(20, 2), (21, 1), (22, 1), (23, 1), (50, 1)] {
+        assert_eq!(refs.count(ino), n, "inode {ino}");
+    }
+    batch_forget(
+        &mut k,
+        &[(20, 1), (21, 1), (22, 1), (23, 1), (50, 1), (99, 2)],
+    );
+    barrier(&mut k);
+    // 99 was never counted: kept from the view.
+    assert_eq!(mock.forgets(), vec![21, 22, 23, 50]);
+    assert_eq!(refs.count(20), 1, "the fifo is still looked up once");
+    assert_eq!(
+        (
+            refs.forgets_final(),
+            refs.forgets_partial(),
+            refs.forgets_unknown()
+        ),
+        (4, 1, 1)
+    );
+    batch_forget(&mut k, &[(20, 1)]);
+    barrier(&mut k);
+    assert_eq!(mock.forgets(), vec![21, 22, 23, 50, 20]);
+    assert!(refs.is_empty());
+    k.finish();
+}
+
+/// The race plan 40 §4.4 closes, as the kernel produces it, against the
+/// reference filesystem (which, like the engine's view, keeps an inode its
+/// kernel unlinked for the kernel's references until `forget`).
+///
+/// The kernel holds inode Y under the name `m` (and an `O_PATH`
+/// descriptor of it) and X under `n`; another node renames `m` over `n`.
+/// The kernel revalidates `n`: its `LOOKUP` answers Y, not the dentry's
+/// X, so the kernel queues `FORGET(Y, 1)` for that answer
+/// (`fuse_dentry_revalidate`) and looks `n` up afresh. Then `rm n`
+/// removes Y's last name. The queued `FORGET` is read only now (another
+/// worker: the kernel dequeues forgets beside other requests). Y is
+/// still the kernel's, through `m`'s dentry and the descriptor: its
+/// `fstat` must answer `nlink` 0, as on a local filesystem. On the
+/// previous main the late `FORGET` reached the view, which let the orphan
+/// go: `ESTALE`/`ENOENT`.
+#[test]
+fn a_late_partial_forget_leaves_the_orphan_the_kernel_still_references() {
+    use constellation_vfs::{Blocking, Caller, Name, OpCtx};
+    let mock = MockVfs::reference(constellation_frontend_fuse::caps(false));
+    let (mut k, refs) = counting(&mock);
+    let node = |k: &mut Kernel, name: &str| {
+        k.call(
+            op::MKNOD,
+            ROOT_INO,
+            &Body::new()
+                .u32(modebits::S_IFREG | 0o644)
+                .u32(0)
+                .u32(0)
+                .u32(0)
+                .cstr(name),
+        )
+        .u64_at(0)
+    };
+    let x = node(&mut k, "n");
+    let y = node(&mut k, "m");
+    // Another node (a second view of the same filesystem) renames m over n.
+    let elsewhere = mock.view_of("/", false).unwrap();
+    let caller = Caller::new(0, 0, None);
+    Blocking::run(|r| {
+        elsewhere.rename(
+            &OpCtx::new(OpKind::Rename, &caller),
+            ROOT_INO,
+            Name::new("m"),
+            ROOT_INO,
+            Name::new("n"),
+            RenameFlags::empty(),
+            r,
+        )
+    })
+    .unwrap();
+    // The revalidation of n, and the fresh lookup that follows it.
+    let lookup_n = |k: &mut Kernel| {
+        k.call(op::LOOKUP, ROOT_INO, &Body::new().cstr("n"))
+            .u64_at(0)
+    };
+    assert_eq!(lookup_n(&mut k), y, "n now names Y, not X ({x})");
+    assert_eq!(lookup_n(&mut k), y);
+    // rm n: the last name of Y.
+    k.call(op::UNLINK, ROOT_INO, &Body::new().cstr("n")).ok();
+    // The revalidation's FORGET, read after the unlink.
+    forget(&mut k, y, 1);
+    let r = k.call(op::GETATTR, y, &Body::new().u32(0).u32(0).u64(0));
+    assert_eq!(
+        r.error,
+        0,
+        "fstat of the descriptor answered errno {}: the orphan was reaped on a partial forget",
+        r.errno()
+    );
+    let a = wire_attr(&r.body[16..]);
+    assert_eq!((a.ino, a.nlink), (y, 0));
+    assert_eq!(refs.count(y), 2);
+    assert_eq!(refs.forgets_partial(), 1);
+    // The kernel evicts Y (the descriptor closed, m's dentry dropped): its
+    // last FORGET gives back both lookups, and the orphan goes.
+    forget(&mut k, y, 2);
+    let r = k.call(op::GETATTR, y, &Body::new().u32(0).u32(0).u64(0));
+    assert!(
+        [libc::ENOENT, libc::ESTALE].contains(&r.errno()),
+        "after the last forget: errno {}",
+        r.errno()
+    );
+    assert_eq!(refs.count(y), 0);
     k.finish();
 }
 

@@ -55,6 +55,7 @@
 //! (`fuser::uring_unavailable`) supplies the detail.
 
 use crate::passthrough::{PassthroughState, PassthroughStatus};
+use crate::refs::KernelRefs;
 use crate::session::TransportPolicy;
 use fuser::{InitFlags, NegotiatedInit, Transport};
 use std::collections::BTreeMap;
@@ -361,6 +362,8 @@ pub struct SessionStats {
     passthrough: Option<Arc<PassthroughState>>,
     lock_wait_downgrades: LockWaitCounter,
     ring_health: RingHealthStats,
+    /// Plan 40 R2: the kernel's lookup counts, read live.
+    refs: Option<Arc<KernelRefs>>,
 }
 
 impl SessionStats {
@@ -425,6 +428,7 @@ impl SessionStats {
             passthrough: None,
             lock_wait_downgrades: LockWaitCounter::default(),
             ring_health: RingHealthStats::default(),
+            refs: None,
         }
     }
 
@@ -446,6 +450,41 @@ impl SessionStats {
     /// Zero-copy reads this session served.
     pub fn zero_copy_reads(&self) -> u64 {
         self.zero_copy_reads.get()
+    }
+
+    /// Report the lookup counts `refs` keeps (the session's filesystem's).
+    pub(crate) fn with_kernel_refs(mut self, refs: Arc<KernelRefs>) -> Self {
+        self.refs = Some(refs);
+        self
+    }
+
+    /// Node ids the kernel holds at least one lookup of (plan 40 R2).
+    pub fn kernel_refs(&self) -> u64 {
+        self.refs.as_ref().map_or(0, |r| r.len() as u64)
+    }
+
+    /// `FORGET`s that let go of an inode's last lookup, told to the view.
+    pub fn forgets_final(&self) -> u64 {
+        self.refs.as_ref().map_or(0, |r| r.forgets_final())
+    }
+
+    /// `FORGET`s of some of an inode's lookups, the kernel still holding
+    /// it (a revalidation that found another inode, plan 40 §4.4): not
+    /// told to the view.
+    pub fn forgets_partial(&self) -> u64 {
+        self.refs.as_ref().map_or(0, |r| r.forgets_partial())
+    }
+
+    /// `FORGET`s of node ids never counted: the root's (told to the view,
+    /// a no-op there) and any other (a count lost: kept from the view).
+    pub fn forgets_unknown(&self) -> u64 {
+        self.refs.as_ref().map_or(0, |r| r.forgets_unknown())
+    }
+
+    /// `FORGET`s of more lookups than were counted (some reply's count was
+    /// missed): kept from the view.
+    pub fn forgets_underflow(&self) -> u64 {
+        self.refs.as_ref().map_or(0, |r| r.forgets_underflow())
     }
 
     /// Report the reads `counter` counts (the session's filesystem's).

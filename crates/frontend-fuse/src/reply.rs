@@ -78,7 +78,8 @@ pub(crate) fn file_type(kind: FileKind) -> FileType {
     }
 }
 
-/// An entry reply, and the name it hands the kernel (`dentries`).
+/// An entry reply, and the name it hands the kernel (`dentries`; the
+/// node id it hands it is counted there too, `refs`).
 pub(crate) struct EntryReply {
     pub reply: ReplyEntry,
     pub name: EntryGuard,
@@ -88,6 +89,9 @@ impl Responder<Entry> for EntryReply {
     fn done(self, r: VfsResult<Entry>) {
         match r {
             Ok(e) => {
+                // Before the bytes go: the kernel may forget this lookup as
+                // soon as it has the reply, on another worker.
+                self.name.hands_out(e.attr.ino);
                 self.reply
                     .entry(&e.attr.ttl, &fuse_attr(&e.attr), Generation(e.generation));
                 self.name.replied(e.attr.ttl);
@@ -322,7 +326,8 @@ pub(crate) struct CreateReply {
     pub reply: ReplyCreate,
     /// `ino` is learnt from the reply; `pre` is always `Unregistered`.
     pub cx: OpenCtx,
-    /// The name it hands the kernel (`dentries`).
+    /// The name it hands the kernel (`dentries`), and where the node id
+    /// it hands it is counted (`refs`).
     pub name: EntryGuard,
 }
 
@@ -354,12 +359,15 @@ impl Responder<(Entry, Opened)> for CreateReply {
                 let generation = Generation(e.generation);
                 match fopen(answer) {
                     Some((flags, None)) => {
+                        // Counted before the bytes go, as an entry reply's.
+                        name.hands_out(e.attr.ino);
                         reply.created(&e.attr.ttl, &attr, generation, fh, flags);
                         name.replied(e.attr.ttl);
                     }
                     Some((flags, Some(id))) => {
                         // SAFETY: as in `OpenReply`.
                         let backing = unsafe { reply.wrap_backing(id) };
+                        name.hands_out(e.attr.ino);
                         reply.created_passthrough(
                             &e.attr.ttl,
                             &attr,

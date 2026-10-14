@@ -1176,8 +1176,12 @@ fn render_vfs_ops(output: &mut String, ops: &VfsOpsStatus) {
 /// `mountpoint`, as many series as there are mounts) the
 /// `constellation_fuse_passthrough_opens` and
 /// `constellation_fuse_uring_queue_depth` gauges, the
-/// `constellation_fuse_ring_stranded_commits_total` counter and the
-/// `constellation_fuse_ring_entries_held_long` gauge.
+/// `constellation_fuse_ring_stranded_commits_total` counter, the
+/// `constellation_fuse_ring_entries_held_long` gauge, and (plan 40 R2) the
+/// `constellation_fuse_kernel_refs` gauge and the
+/// `constellation_fuse_forgets_total{outcome="final"|"partial"|"unknown"|
+/// "underflow"}`
+/// counter.
 fn render_fuse(output: &mut String, fuse: &FuseStatus) {
     use std::fmt::Write;
     output.push_str(
@@ -1256,6 +1260,36 @@ fn render_fuse(output: &mut String, fuse: &FuseStatus) {
             label_value(&m.mountpoint),
             m.ring_entries_held_long
         );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_kernel_refs Inodes a FUSE mount's kernel holds at least one lookup of.\n\
+         # TYPE constellation_fuse_kernel_refs gauge\n",
+    );
+    for m in &fuse.mounts {
+        let _ = writeln!(
+            output,
+            "constellation_fuse_kernel_refs{{mountpoint=\"{}\"}} {}",
+            label_value(&m.mountpoint),
+            m.kernel_refs
+        );
+    }
+    output.push_str(
+        "# HELP constellation_fuse_forgets_total FUSE FORGETs by outcome: the inode's last lookup (final), some of its lookups while still referenced (partial), an inode never counted (unknown) or more lookups than were counted (underflow); only final ones, and the root's, reach the view.\n\
+         # TYPE constellation_fuse_forgets_total counter\n",
+    );
+    for m in &fuse.mounts {
+        for (outcome, n) in [
+            ("final", m.forgets_final),
+            ("partial", m.forgets_partial),
+            ("unknown", m.forgets_unknown),
+            ("underflow", m.forgets_underflow),
+        ] {
+            let _ = writeln!(
+                output,
+                "constellation_fuse_forgets_total{{mountpoint=\"{}\",outcome=\"{outcome}\"}} {n}",
+                label_value(&m.mountpoint),
+            );
+        }
     }
 }
 
@@ -1614,6 +1648,11 @@ mod tests {
                     },
                     ring_stranded_commits: 2,
                     ring_entries_held_long: 1,
+                    kernel_refs: 12,
+                    forgets_final: 7,
+                    forgets_partial: 2,
+                    forgets_unknown: 1,
+                    forgets_underflow: 4,
                     ..Default::default()
                 },
                 FuseMountStatus {
@@ -1652,6 +1691,14 @@ mod tests {
             "# TYPE constellation_fuse_ring_entries_held_long gauge",
             "constellation_fuse_ring_entries_held_long{mountpoint=\"/mnt/a\"} 1",
             "constellation_fuse_ring_entries_held_long{mountpoint=\"/mnt/\\\"b\\\"\"} 0",
+            "# TYPE constellation_fuse_kernel_refs gauge",
+            "constellation_fuse_kernel_refs{mountpoint=\"/mnt/a\"} 12",
+            "# TYPE constellation_fuse_forgets_total counter",
+            "constellation_fuse_forgets_total{mountpoint=\"/mnt/a\",outcome=\"final\"} 7",
+            "constellation_fuse_forgets_total{mountpoint=\"/mnt/a\",outcome=\"partial\"} 2",
+            "constellation_fuse_forgets_total{mountpoint=\"/mnt/a\",outcome=\"unknown\"} 1",
+            "constellation_fuse_forgets_total{mountpoint=\"/mnt/a\",outcome=\"underflow\"} 4",
+            "constellation_fuse_forgets_total{mountpoint=\"/mnt/\\\"b\\\"\",outcome=\"partial\"} 0",
         ] {
             assert!(out.lines().any(|l| l == line), "{line}\n{out}");
         }

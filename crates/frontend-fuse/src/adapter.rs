@@ -62,6 +62,7 @@
 
 use crate::dentries::{KernelEntries, RenameGuard};
 use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, PreOpen};
+use crate::refs::{Forgot, KernelRefs};
 use crate::reply::{
     AttrReply, BytesReply, CopyReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply,
     LseekReply, OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply,
@@ -72,7 +73,7 @@ use constellation_types::{Code, Rdev};
 use constellation_vfs::{
     Caller, CancelToken, CopyFlags, Durability, FallocateMode, Fh, FrontendCaps, LockKind,
     LockOwner, LockRange, LockSpec, Name, Observer, OpKind, OpenFlags, OpenOwner, RenameFlags,
-    Responder, SeekWhence, SetAttr, SetXattrFlags, TimeSet, Vfs, WriteData, XattrName,
+    Responder, SeekWhence, SetAttr, SetXattrFlags, TimeSet, Vfs, WriteData, XattrName, ROOT_INO,
 };
 use fuser::{
     BsdFileFlags, FileHandle, Filesystem, INodeNo, InitFlags, KernelConfig, ReplyAttr, ReplyData,
@@ -134,7 +135,10 @@ pub struct FuseFs<V: Vfs> {
     passthrough: Arc<PassthroughState>,
     /// The names the kernel can hold a valid dentry for: every reply that
     /// hands it one is recorded, so the notification sink writes entry
-    /// invalidations only where they can drop something (`dentries`).
+    /// invalidations only where they can drop something (`dentries`); and
+    /// (plan 40 R2) the kernel's lookup count of every node id those
+    /// replies handed it, so that only an inode's last `FORGET` reaches the
+    /// view (`refs`, [`Filesystem::forget`] below).
     entries: Arc<KernelEntries>,
     /// Plan 38 Z4b: this session's zero-copy reads, counted by the read
     /// replies, reported by the session's stats.
@@ -156,6 +160,12 @@ impl<V: Vfs> FuseFs<V> {
             entries: KernelEntries::new(),
             zero_copy_reads: ZeroCopyCounter::default(),
         }
+    }
+
+    /// The kernel's lookup counts on this connection (a session handover
+    /// carries them, its stats report them).
+    pub fn kernel_refs(&self) -> &Arc<KernelRefs> {
+        self.entries.refs()
     }
 
     /// The names this connection's kernel can hold a valid dentry for, as
@@ -1372,17 +1382,51 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         self.sync_barrier(req, ino, Fh(fh.0), reply);
     }
 
-    fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
-        // Taken as "the inode is no longer referenced" (the view keeps no
-        // lookup counts, plan 31 §6.11). The kernel sends it when it
-        // evicts the inode, with every lookup it still held — and, the
-        // one partial forget, for the single lookup a dentry
-        // revalidation's `LOOKUP` added when it returned another inode
-        // than the dentry's (`fuse_dentry_revalidate`): an inode a name
-        // just led to, so never an unlinked one, the only kind whose
-        // `forget` frees anything (`View::forget_unlinked`).
-        self.vfs.forget(ino.0);
+    /// The kernel gives back `nlookup` of the lookups its entry replies
+    /// handed it ([`KernelRefs`]); the view hears of the last one only.
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        // `Vfs::forget` means the kernel references the inode no more —
+        // the view reaps there an orphan it kept for that reference
+        // (`View::forget_unlinked`) — and a `FORGET` does not always mean
+        // that. The kernel sends the whole count when it evicts the inode,
+        // but forgets single lookups of inodes it still holds through
+        // another dentry, an open file or an `O_PATH` descriptor: the
+        // answer of a dentry revalidation's `LOOKUP` that named another
+        // inode than the dentry's (`fuse_dentry_revalidate`), an entry
+        // the kernel could not instantiate, and (once served) a
+        // `READDIRPLUS` entry it failed to link (`fuse_force_forget`).
+        // Until plan 40 R2 every `FORGET` was forwarded, on the argument
+        // that the revalidation one names an inode a name just led to,
+        // never an unlinked one; true when the reply is written, not when
+        // the `FORGET` is read — another worker can apply a `LOOKUP` and
+        // the `UNLINK` of that inode's last name first, and the `FORGET`
+        // then reaped an orphan the kernel still held (`ESTALE`). So the
+        // adapter counts (`refs`' module doc), and only the last lookup
+        // given back reaches the view. In doubt the inode is kept (a
+        // bounded leak, never a reap under a live reference): a partial
+        // forget, more given back than was counted, and a node id never
+        // counted — except the root, whose reference comes from the mount
+        // and whose forget means nothing to the view.
+        match self.entries.refs().forgot(ino.0, nlookup) {
+            Forgot::Last => self.vfs.forget(ino.0),
+            Forgot::Unknown if ino.0 == ROOT_INO => self.vfs.forget(ino.0),
+            Forgot::Unknown => tracing::warn!(
+                ino = ino.0,
+                nlookup,
+                "FORGET of an inode no reply was counted for (a reply path that does not \
+                 count); the inode is kept"
+            ),
+            Forgot::Partial | Forgot::Underflow => {}
+        }
     }
+
+    // `FUSE_BATCH_FORGET` (opcode 42, what the kernel sends when more
+    // than one forget is queued) is fuser's default `batch_forget`, which
+    // calls `forget` above for each node with its count: the same rule,
+    // node by node. The method cannot be overridden from here: its
+    // `ForgetOne` argument is not exported by fuser 0.18 (nor by upstream
+    // master), so no implementor can name it. `tests/wire.rs` drives
+    // opcode 42 end to end.
 
     /// CONSTELLATION PATCH (interrupt) in vendored fuser: see [`Interrupts`].
     fn interrupt(&self, _req: &Request, unique: fuser::RequestId) {

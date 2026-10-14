@@ -2649,8 +2649,38 @@
     "FuseMountStatus": {
       "description": "One mount of [`FuseStatus`].",
       "properties": {
+        "forgets_final": {
+          "description": "`FORGET`s that gave back an inode's last lookup: the view was told\nthe kernel let go of it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "forgets_partial": {
+          "description": "`FORGET`s of some of an inode's lookups while the kernel still\nheld it (a dentry revalidation that found another inode under the\nname): kept from the view, which would otherwise reap an unlinked\nfile the kernel still references.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "forgets_underflow": {
+          "description": "`FORGET`s of more lookups than the session counted (a reply's count\nwas lost): the inode is kept from the view (logged).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "forgets_unknown": {
+          "description": "`FORGET`s of inodes the session never counted. The root's are told\nto the view (where they do nothing); any other means a reply's\ncount was lost, and the inode is kept from the view (logged).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "id": {
           "description": "The mount's id ([`MountInfo::id`]).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kernel_refs": {
+          "description": "Inodes the kernel holds at least one lookup of, as the session\ncounts them (plan 40 R2: `constellation_fuse_kernel_refs`).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -2716,7 +2746,12 @@
         "zero_copy_reads",
         "lock_wait_downgrades",
         "ring_stranded_commits",
-        "ring_entries_held_long"
+        "ring_entries_held_long",
+        "kernel_refs",
+        "forgets_final",
+        "forgets_partial",
+        "forgets_unknown",
+        "forgets_underflow"
       ],
       "type": "object"
     },

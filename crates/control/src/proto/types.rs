@@ -588,6 +588,24 @@ pub struct FuseMountStatus {
     /// `fuse_requests` this includes requests still queued for a worker,
     /// which the view has not been handed yet. Always 0 on `dev_fuse`.
     pub ring_entries_held_long: u64,
+    /// Inodes the kernel holds at least one lookup of, as the session
+    /// counts them (plan 40 R2: `constellation_fuse_kernel_refs`).
+    pub kernel_refs: u64,
+    /// `FORGET`s that gave back an inode's last lookup: the view was told
+    /// the kernel let go of it.
+    pub forgets_final: u64,
+    /// `FORGET`s of some of an inode's lookups while the kernel still
+    /// held it (a dentry revalidation that found another inode under the
+    /// name): kept from the view, which would otherwise reap an unlinked
+    /// file the kernel still references.
+    pub forgets_partial: u64,
+    /// `FORGET`s of inodes the session never counted. The root's are told
+    /// to the view (where they do nothing); any other means a reply's
+    /// count was lost, and the inode is kept from the view (logged).
+    pub forgets_unknown: u64,
+    /// `FORGET`s of more lookups than the session counted (a reply's count
+    /// was lost): the inode is kept from the view (logged).
+    pub forgets_underflow: u64,
 }
 
 /// Passthrough opens on one mount (plan 38 §3(c)): the kernel reading a

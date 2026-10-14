@@ -5,12 +5,15 @@
 //! What has to cross is small, because almost nothing a mounted view
 //! knows lives only in the view. Inode numbers are the replica's (`Meta`,
 //! on disk): the kernel's cached dentries and its lookup counts name
-//! numbers the next process resolves the same way, and the view keeps no
-//! lookup table (`FORGET`s queued during the gap reach the next image,
-//! which acts on the few inodes `forget` matters for: `unlinked_refs`
-//! below; the removed inodes' last attributes it answers `getattr` with
-//! until then do not cross, so the next image answers `ESTALE` for
-//! those). File handles are the view's own
+//! numbers the next process resolves the same way. The view keeps no
+//! lookup table: the frontend does (the FUSE adapter's `KernelRefs`,
+//! plan 40 R2, which calls `Vfs::forget` only at an inode's last
+//! `FORGET`), and it crosses with the session
+//! (`constellation_frontend_fuse::FuseHandoff::refs`). The `FORGET`s
+//! queued during the gap reach the next image, which acts on the few
+//! inodes `forget` matters for: `unlinked_refs` below; the removed
+//! inodes' last attributes it answers `getattr` with until then do not
+//! cross, so the next image answers `ESTALE` for those. File handles are the view's own
 //! numbering (one per open, plan 39 §3.7), so they cross as a table: each
 //! handle's inode and the discard error event it has seen, plus the
 //! view's count of handles per inode, which the last-close orphan reap and

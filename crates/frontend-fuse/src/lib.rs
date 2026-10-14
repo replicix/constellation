@@ -9,7 +9,8 @@
 //! decoding, the attribute and errno encodings ([`reply_code`]), the
 //! `FUSE_INIT` negotiation, the kernel's cache notifications
 //! ([`FuseNotifySink`]), the dispatcher sizing ([`threads`]), FUSE
-//! passthrough ([`passthrough`], plan 38 Z3b), the mount itself
+//! passthrough ([`passthrough`], plan 38 Z3b), the kernel's lookup counts
+//! ([`refs`], plan 40 R2), the mount itself
 //! ([`mount`]) and what a session reports about its transport
 //! ([`stats`]). It is the only crate that depends on
 //! `fuser`.
@@ -18,6 +19,7 @@ mod adapter;
 mod dentries;
 mod notify;
 pub mod passthrough;
+pub mod refs;
 mod reply;
 mod session;
 pub mod stats;
@@ -32,6 +34,7 @@ pub use passthrough::{
     has_cap_sys_admin, InodeHandoff, PassthroughHandoff, PassthroughPolicy, PassthroughState,
     PassthroughStatus, PassthroughWish, PASSTHROUGH_ENV,
 };
+pub use refs::{KernelRefs, RefsHandoff};
 pub use reply::reply_code;
 pub use session::{
     mount, mount_source, DetachError, FuseHandoff, FuseSession, FuseUnmounter, HandoverCapable,
@@ -51,8 +54,9 @@ pub const URING_BUILT: bool = cfg!(all(feature = "io-uring", target_os = "linux"
 
 /// The capabilities this frontend declares: [`FrontendCaps::linux_fuse`]
 /// (`cluster_locks`: the mount forwards POSIX/`flock` locks to the view),
-/// and [`FrontendCaps::reports_forget`]: every session sends the kernel's
-/// `FORGET`s on to the view (`Filesystem::forget` in the adapter).
+/// and [`FrontendCaps::reports_forget`]: every session tells the view when
+/// the kernel lets go of an inode — its last `FORGET`, the adapter counting
+/// the kernel's lookups ([`refs`]).
 pub fn caps(cluster_locks: bool) -> FrontendCaps {
     FrontendCaps {
         reports_forget: true,

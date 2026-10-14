@@ -52,8 +52,11 @@
 //!    without unmounting or destroying anything.
 //!
 //! Queued requests, `FORGET`s included, are served by whoever resumes the
-//! descriptor; the kernel's lookup counts need nothing from us (inode
-//! numbers are the replica's, the view keeps no lookup table).
+//! descriptor. Inode numbers are the replica's, so the kernel's node ids
+//! mean the same to the next server; the lookup counts the adapter keeps
+//! for them (`refs`, plan 40 R2) cross in [`FuseHandoff::refs`], taken
+//! once every worker has stopped and imported before the next server
+//! reads, so a `FORGET` queued during the gap subtracts from them.
 
 use crate::adapter::{Deferred, FuseFs, KernelTuning};
 use crate::dentries::KernelEntries;
@@ -62,6 +65,7 @@ use crate::passthrough::{
     reason, PassthroughHandoff, PassthroughPolicy, PassthroughState, PassthroughWish,
     PASSTHROUGH_ENV,
 };
+use crate::refs::RefsHandoff;
 use crate::stats::{Handshake, LockWaitCounter, RingHealthStats, SessionStats, ZeroCopyCounter};
 use constellation_types::Code;
 use constellation_vfs::{Blocking, Caller, FrontendCaps, Observer, OpCtx, OpKind, Vfs};
@@ -706,6 +710,10 @@ pub struct FuseHandoff {
     /// the backing ids — still registered — of those in passthrough mode
     /// ([`PassthroughHandoff`]).
     pub passthrough: PassthroughHandoff,
+    /// Plan 40 R2: the kernel's lookup count of every node id the
+    /// connection's servers handed it ([`KernelRefs`]): without them the
+    /// next server would take a partial `FORGET` for a final one.
+    pub refs: RefsHandoff,
 }
 
 /// Whether a connection's `FUSE_INIT` turned passthrough on.
@@ -840,9 +848,10 @@ struct Shared {
     /// connection instead of handing it out or resuming it.
     ending: std::sync::atomic::AtomicBool,
     gate: Arc<NotifyGate>,
-    /// What this connection's kernel can hold (the gate writes against
-    /// it; a detach abandoned in place keeps it, the filesystem being the
-    /// same).
+    /// What this connection's kernel can hold — names (the gate writes
+    /// against them) and lookup counts (plan 40 R2, crossing a handover in
+    /// [`FuseHandoff::refs`]); a detach abandoned in place keeps it, the
+    /// filesystem being the same.
     entries: Arc<KernelEntries>,
     deferred: Arc<Deferred>,
     /// Plan 38 Z3b: the session's passthrough state (its table crosses a
@@ -1272,6 +1281,7 @@ impl<V: Vfs> FuseSession<V> {
                 lock_waits,
                 passthrough.clone(),
             )
+            .with_kernel_refs(entries.refs().clone())
             .with_zero_copy_reads(zero_copy_reads)
             .with_ring_health(RingHealthStats::of_session(&config, transport)),
         );
@@ -1366,8 +1376,10 @@ impl<V: Vfs> FuseSession<V> {
         let deferred = fs.deferred().clone();
         let observer = fs.observer_slot();
         let entries = fs.kernel_entries().clone();
-        // The kernel holds dentries the previous server handed out.
+        // The kernel holds dentries the previous server handed out, and
+        // the lookups its replies counted (before anything is read).
         entries.resumed();
+        fs.kernel_refs().import(&handoff.refs);
         let passthrough = fs.passthrough().clone();
         let zero_copy_reads = fs.zero_copy_reads().clone();
         // Plan 38 Z3b: no `FUSE_INIT` here, so what the first server
@@ -1814,6 +1826,8 @@ impl SessionControl {
                 // Taken once every worker stopped: nothing changes it now,
                 // and its backing ids stay registered for the next server.
                 passthrough: self.shared.passthrough.export(),
+                // Likewise: no reply or `FORGET` is served any more.
+                refs: self.shared.entries.refs().export(),
             },
             view: export(),
         })
@@ -2620,6 +2634,156 @@ mod tests {
         assert!(waited >= Duration::from_millis(400), "{waited:?}");
         assert_eq!(m.thread.join().unwrap().unwrap(), SessionExit::Detached);
         let (control, thread) = resume(&vfs, handoff.fuse);
+        end(control, thread);
+    }
+
+    /// An `O_PATH` descriptor of `path` (it holds the inode in the
+    /// kernel without a FUSE handle).
+    fn o_path(path: &Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid path; the descriptor is ours.
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// `fstat` of `fd` answered by the server (`AT_STATX_FORCE_SYNC`
+    /// sends `GETATTR` whatever the kernel's attribute cache holds):
+    /// `(ino, nlink)`.
+    fn fstat_sync(fd: &std::os::fd::OwnedFd) -> std::io::Result<(u64, u32)> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a live descriptor, an empty path with `AT_EMPTY_PATH`
+        // and an out-struct the call fills.
+        let mut sx: libc::statx = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::statx(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_STATX_FORCE_SYNC,
+                libc::STATX_BASIC_STATS,
+                &mut sx,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((sx.stx_ino, sx.stx_nlink))
+    }
+
+    /// Rename `from` over `to` in the root, as another node would: through
+    /// another view of the same filesystem, so this kernel is not told.
+    fn rename_elsewhere(vfs: &MockVfs, from: &str, to: &str) {
+        use constellation_vfs::{Name, RenameFlags};
+        let elsewhere = vfs.view_of("/", false).unwrap();
+        let caller = Caller::new(0, 0, None);
+        Blocking::run(|r| {
+            elsewhere.rename(
+                &OpCtx::new(OpKind::Rename, &caller),
+                constellation_vfs::ROOT_INO,
+                Name::new(from),
+                constellation_vfs::ROOT_INO,
+                Name::new(to),
+                RenameFlags::empty(),
+                r,
+            )
+        })
+        .expect("rename elsewhere");
+    }
+
+    /// Plan 40 R2, the race on a real kernel. The kernel holds inode Y
+    /// under `m` and through an `O_PATH` descriptor, and X under `n`;
+    /// another node renames `m` over `n`. Once `n`'s dentry has expired, a
+    /// `stat n` revalidates it: the `LOOKUP` answers Y, not X, so the
+    /// kernel queues `FORGET(Y, 1)` for that answer and looks `n` up
+    /// again. The worker that reads the `FORGET` is slow to apply it (the
+    /// view's `forget` of Y waits), and meanwhile the other worker serves the
+    /// fresh `LOOKUP` and the `UNLINK` of `n` — Y's last name. The kernel
+    /// still references Y; its descriptor must `fstat` to `nlink` 0. On the
+    /// previous main the late `FORGET` reached the view, which let the
+    /// orphan go: `ENOENT`/`ESTALE`. The delay only bites there: with the
+    /// lookup counts, Y's partial `FORGET` never reaches the view, so
+    /// nothing waits.
+    #[test]
+    fn a_revalidations_forget_applied_after_the_unlink_keeps_the_orphan() {
+        let vfs = MockVfs::reference(caps());
+        if !kernel_available() {
+            return;
+        }
+        let dir = MountDir::new();
+        let session = match mount(Arc::new(vfs.clone()), dir.path(), &options(), caps()) {
+            Ok(session) => session,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: mount(2) refused here ({e})");
+                return;
+            }
+            Err(e) => panic!("mount: {e}"),
+        };
+        let stats = session.stats();
+        let (control, thread) = serve(session);
+        let (n, m) = (dir.path().join("n"), dir.path().join("m"));
+        std::fs::write(&n, b"x").unwrap();
+        std::fs::write(&m, b"yy").unwrap();
+        let x = std::fs::metadata(&n).unwrap().ino();
+        let y = std::fs::metadata(&m).unwrap().ino();
+        let fd = o_path(&m);
+        rename_elsewhere(&vfs, "m", "n");
+        vfs.delay_forget(Some((y, Duration::from_millis(500))));
+        // Past the reference filesystem's entry TTL (1 s).
+        std::thread::sleep(Duration::from_millis(1300));
+        let partial = stats.forgets_partial();
+        assert_eq!(
+            std::fs::metadata(&n).unwrap().ino(),
+            y,
+            "n names Y, not X ({x})"
+        );
+        std::fs::remove_file(&n).unwrap();
+        // Whatever forget is still waiting has acted by now.
+        std::thread::sleep(Duration::from_millis(1200));
+        vfs.delay_forget(None);
+        assert_eq!(
+            fstat_sync(&fd).expect("fstat of the descriptor after the late forget"),
+            (y, 0)
+        );
+        assert!(
+            stats.forgets_partial() > partial,
+            "the revalidation's forget was partial"
+        );
+        drop(fd);
+        end(control, thread);
+    }
+
+    /// Plan 40 R2: the kernel's lookup counts leave with a detached
+    /// session (taken once its workers stopped) and the resumed session
+    /// starts from them.
+    #[test]
+    fn the_kernels_lookup_counts_cross_a_handover() {
+        let vfs = MockVfs::reference(caps());
+        let Some(m) = mount_mock(&vfs) else { return };
+        let f = m.dir.path().join("f");
+        std::fs::write(&f, b"x").unwrap();
+        let ino = std::fs::metadata(&f).unwrap().ino();
+        let fd = o_path(&f);
+        let handoff = m.control.detach(|| ()).expect("detach");
+        assert_eq!(m.thread.join().unwrap().unwrap(), SessionExit::Detached);
+        let refs = handoff.fuse.refs.clone();
+        assert!(
+            refs.iter().any(|&(i, n)| i == ino && n >= 1),
+            "f's lookups are in the handoff: {refs:?}"
+        );
+        let session = FuseSession::resume(
+            handoff.fuse,
+            Arc::new(vfs.clone()),
+            &options(),
+            caps(),
+            None,
+        )
+        .expect("resume");
+        assert_eq!(session.stats().kernel_refs(), refs.len() as u64);
+        let (control, thread) = serve(session);
+        // The resumed session serves the inode the kernel still holds.
+        assert_eq!(fstat_sync(&fd).unwrap(), (ino, 1));
+        drop(fd);
         end(control, thread);
     }
 

@@ -440,6 +440,11 @@ struct Inner {
     deferred: AtomicUsize,
     /// What [`Vfs::handover_blockers`] answers ([`MockVfs::set_handover_blockers`]).
     handover_blockers: Mutex<Vec<String>>,
+    /// Every [`Vfs::forget`], in order ([`MockVfs::forgets`]).
+    forgets: Mutex<Vec<Ino>>,
+    /// Which inode's [`Vfs::forget`] waits before it acts, and how long
+    /// ([`MockVfs::delay_forget`]).
+    forget_delay: Mutex<Option<(Ino, Duration)>>,
 }
 
 /// A recording, scriptable [`Vfs`]; see the module doc.
@@ -507,8 +512,24 @@ impl MockVfs {
                 held: Mutex::new(Vec::new()),
                 deferred: AtomicUsize::new(0),
                 handover_blockers: Mutex::new(Vec::new()),
+                forgets: Mutex::new(Vec::new()),
+                forget_delay: Mutex::new(None),
             }),
         }
+    }
+
+    /// The inodes [`Vfs::forget`] was called for, in order (a forget has
+    /// no responder, so it is not among [`Self::calls`]).
+    pub fn forgets(&self) -> Vec<Ino> {
+        self.inner.forgets.lock().unwrap().clone()
+    }
+
+    /// Make each later [`Vfs::forget`] of `ino` wait `delay` on its
+    /// caller's thread before it acts (`None`: none waits): a `FORGET` a
+    /// worker read but is slow to apply, while other workers serve the
+    /// requests that came after it.
+    pub fn delay_forget(&self, delay: Option<(Ino, Duration)>) {
+        *self.inner.forget_delay.lock().unwrap() = delay;
     }
 
     /// Make [`Vfs::handover_blockers`] answer `blockers`.
@@ -743,9 +764,15 @@ impl Vfs for MockVfs {
         self.inner.handover_blockers.lock().unwrap().clone()
     }
 
-    /// Not recorded (it has no responder to script); the reference
-    /// filesystem drops what it kept for `ino` ([`RefView::forget`]).
+    /// Recorded apart ([`MockVfs::forgets`]: it has no responder to
+    /// script); the reference filesystem drops what it kept for `ino`
+    /// ([`RefView::forget`]).
     fn forget(&self, ino: Ino) {
+        let delay = *self.inner.forget_delay.lock().unwrap();
+        if let Some((_, delay)) = delay.filter(|(of, _)| *of == ino) {
+            std::thread::sleep(delay);
+        }
+        self.inner.forgets.lock().unwrap().push(ino);
         if let Some(view) = &self.inner.view {
             view.forget(ino);
         }
