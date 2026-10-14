@@ -71,6 +71,7 @@ pub mod snapshot_batch;
 pub mod snapwalk;
 mod sources;
 pub mod staging;
+mod store_io;
 pub mod sync;
 pub mod target;
 pub mod upload;

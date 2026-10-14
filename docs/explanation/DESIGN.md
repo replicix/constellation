@@ -512,7 +512,13 @@ Every node keeps a **full metadata replica** in [fjall](https://github.com/fjall
 [29-fjall-metadata-engine.md](../plans/v1/done/29-fjall-metadata-engine.md);
 it replaced SQLite, the choice ADR-9 records). One writer transaction at a
 time keeps "namespace change + journal row" atomic; readers take lock-free
-snapshots. The keyspaces that matter here:
+snapshots. Writes are synchronous, and a commit's journal write can wait
+seconds on a slow disk. The FUSE threads, the `fsync` waiters and the
+authority core's step write on threads of their own and wait there; an
+ordinary async task writes through `store_io::store_call`, which moves
+its runtime worker's other tasks elsewhere while it waits, so a stalled
+commit does not take the runtime with it (finding 14). The keyspaces that
+matter here:
 
 - `ns`: the replicated namespace, in plan 28's key encoding (inodes,
   dentries, spilled xattrs, reverse links, and subsystem rows such as the

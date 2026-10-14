@@ -824,7 +824,7 @@ async fn expand_adopted_spills(cache: &DiskCache, meta: &Meta, store: &ChunkStor
             chunks = chunks.len(),
             "enrolled an adopted manifest's chunk list for its durability check"
         );
-        meta.expand_adopted_spill(ino, &blob, &chunks)?;
+        crate::store_io::store_call(|| meta.expand_adopted_spill(ino, &blob, &chunks)).await?;
     }
     Ok(())
 }
@@ -1059,9 +1059,14 @@ async fn upload_dirty_chunks_pass(
                 if mode == constellation_store_s3::ChunkPutMode::Probe {
                     upload.probe.lock().unwrap().record(existed);
                 }
-                for ino in inos {
-                    meta.ack_upload(&hash, ino)?;
-                }
+                // Off the runtime's worker (finding 14): an upload pass
+                // acks every chunk it put, and a store write can wait
+                // seconds on a slow disk.
+                crate::store_io::store_call(|| {
+                    inos.into_iter()
+                        .try_for_each(|ino| meta.ack_upload(&hash, ino))
+                })
+                .await?;
                 upload.note_up(&hash);
                 upload.forget_remote_poll(&hash);
                 if !meta.upload_pending_for_hash(&hash)? {
@@ -1107,7 +1112,10 @@ async fn upload_dirty_chunks_pass(
     // A full pass sees every pending row, so its list replaces the
     // recorded set (a chunk that turned up again stops poisoning); a
     // limited pass only adds to it.
-    meta.note_unrecoverable_chunks(&missing_rows, only_ino.is_none())?;
+    crate::store_io::store_call(|| {
+        meta.note_unrecoverable_chunks(&missing_rows, only_ino.is_none())
+    })
+    .await?;
     if let Some(error) = first_error {
         return Err(error);
     }
@@ -1141,9 +1149,11 @@ async fn upload_dirty_chunks_pass(
                 ),
             };
         if landed {
-            for ino in inos {
-                meta.ack_upload(&hash, ino)?;
-            }
+            crate::store_io::store_call(|| {
+                inos.into_iter()
+                    .try_for_each(|ino| meta.ack_upload(&hash, ino))
+            })
+            .await?;
             if !meta.upload_pending_for_hash(&hash)? {
                 cache.set_state(&hash, constellation_fs_core::cache::ChunkState::Clean);
             }

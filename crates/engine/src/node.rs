@@ -901,7 +901,13 @@ impl Engine {
                     timer.tick().await;
                     background.wait_active().await;
                     let now_ms = constellation_store_s3::lease::now_unix_ms();
-                    match meta.prune_completed(now_ms, retention_s as i64 * 1000) {
+                    // Off the runtime's worker (finding 14): one prune can
+                    // be tens of thousands of rows behind a slow disk.
+                    let pruned = crate::store_io::store_call(|| {
+                        meta.prune_completed(now_ms, retention_s as i64 * 1000)
+                    })
+                    .await;
+                    match pruned {
                         Ok(0) => {}
                         Ok(pruned) => tracing::debug!(pruned, "pruned expired completed rids"),
                         Err(error) => tracing::warn!(%error, "completed-table prune failed"),

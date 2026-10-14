@@ -439,7 +439,7 @@ impl TreePublisher {
         let Some(observed) = observed else {
             return Ok(0);
         };
-        self.meta.clear_dirty_upto(&observed)?;
+        crate::store_io::store_call(|| self.meta.clear_dirty_upto(&observed)).await?;
         tracing::debug!(
             head,
             applied = commit.applied,
@@ -660,8 +660,12 @@ impl TreePublisher {
             if let Some(state) = self.state.as_mut() {
                 state.applied = vector;
             }
-            self.remember()?;
-            self.meta.clear_dirty_upto(&observed_dirty)?;
+            crate::store_io::store_call(|| -> Result<()> {
+                self.remember()?;
+                self.meta.clear_dirty_upto(&observed_dirty)?;
+                Ok(())
+            })
+            .await?;
             return Ok(Outcome::Unchanged);
         }
 
@@ -767,8 +771,12 @@ impl TreePublisher {
                     seq: commit.seq,
                     applied: vector,
                 });
-                self.remember()?;
-                self.meta.clear_dirty_upto(&observed_dirty)?;
+                crate::store_io::store_call(|| -> Result<()> {
+                    self.remember()?;
+                    self.meta.clear_dirty_upto(&observed_dirty)?;
+                    Ok(())
+                })
+                .await?;
                 Ok(Outcome::Committed(Box::new(commit)))
             }
             // A refused splice is not a failure of this publish so much

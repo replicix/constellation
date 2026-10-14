@@ -5318,11 +5318,14 @@ impl ChunkHandoff {
             }
             // Every chunk is in S3 now: this node's claims on them are
             // satisfied, whichever inode made them.
-            for hash in &hashes {
-                for i in self.meta.pending_inos_for_hash(hash).unwrap_or_default() {
-                    let _ = self.meta.ack_upload(hash, i);
+            crate::store_io::store_call(|| {
+                for hash in &hashes {
+                    for i in self.meta.pending_inos_for_hash(hash).unwrap_or_default() {
+                        let _ = self.meta.ack_upload(hash, i);
+                    }
                 }
-            }
+            })
+            .await;
             for hash in &hashes {
                 self.upload.existence.insert(hash);
                 self.upload.note_up(hash);

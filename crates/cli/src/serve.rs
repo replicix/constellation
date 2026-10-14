@@ -150,6 +150,9 @@ pub fn cmd_serve(
         .unwrap_or("through")
         .parse()
         .map_err(anyhow::Error::msg)?;
+    // No `tokio::task::LocalSet` on this runtime: the engine's store writes
+    // from async tasks use `block_in_place` (`store_io`), which panics
+    // under one.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads.tokio)
         .max_blocking_threads(threads.blocking)
