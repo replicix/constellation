@@ -396,7 +396,11 @@ These are older, per-mount knobs that combine with the policies above:
   every chunk of the file still queued on this node — whoever wrote it,
   through whichever descriptor, including writers that already closed it
   under `--write-mode back` — forces the node's metadata store to disk and
-  nudges the shipper. The file's data is then in the bucket; its latest
+  nudges the shipper. Concurrent `fsync`s share the store's journal sync:
+  each waits for one whose flush of the journal came after the call (at
+  most the one in flight and the next), so the journal sees one sync for
+  many callers and commits do not queue behind each of them (finding 14).
+  The file's data is then in the bucket; its latest
   manifest is as durable as the ack policy makes this node's journal.
   `--fsync-mode s3`: `fsync()` also waits until the journal up to the call
   (the file's records) is in the bucket. It is the per-call form of

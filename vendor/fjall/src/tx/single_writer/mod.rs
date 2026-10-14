@@ -108,6 +108,17 @@ impl TxDatabase {
         self.inner.persist(mode)
     }
 
+    /// [`Database::persist_with`](crate::Database::persist_with).
+    ///
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 8).
+    ///
+    /// # Errors
+    ///
+    /// Returns error, if an IO error occurred.
+    pub fn persist_with(&self, mode: PersistMode, at_lock: impl FnOnce()) -> crate::Result<()> {
+        self.inner.persist_with(mode, at_lock)
+    }
+
     /// Creates or opens a keyspace.
     ///
     /// If the keyspace does not yet exist, it will be created configured with `create_options`.

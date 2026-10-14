@@ -151,7 +151,22 @@ impl Journal {
     /// thread's sync stalled every writer of the database for as long as
     /// the disk took (seconds on a busy one).
     pub fn persist(&self, mode: PersistMode) -> crate::Result<()> {
-        let file = self.get_writer()?.flush_for_sync(mode)?;
+        self.persist_with(mode, || {})
+    }
+
+    /// [`Self::persist`], calling `at_lock` with the journal writer's lock
+    /// held, right before the buffer is flushed: every batch whose commit
+    /// returned before `at_lock` runs is covered by this persist.
+    ///
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 8): a caller
+    /// that shares one persist among several (Constellation's `Meta::sync`)
+    /// admits a request to it up to that point, not only up to the call.
+    pub fn persist_with(&self, mode: PersistMode, at_lock: impl FnOnce()) -> crate::Result<()> {
+        let file = {
+            let mut writer = self.get_writer()?;
+            at_lock();
+            writer.flush_for_sync(mode)?
+        };
         let Some((file, path, seal)) = file else {
             return Ok(());
         };

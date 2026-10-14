@@ -1,4 +1,4 @@
-# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock
+# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock, a persist that says when it flushes
 
 This directory is fjall **3.1.10** exactly as published on crates.io
 (checksum `cd201c93…c33f`, upstream commit
@@ -10,7 +10,7 @@ and both texts stay here unchanged.
 
 ## What is changed
 
-There are seven changes, each marked `CONSTELLATION PATCH`:
+There are eight changes, each marked `CONSTELLATION PATCH`:
 
 1. **`src/db.rs`, `impl Drop for DatabaseInner`**: this is the fix. The
    worker shutdown loop never blocks now.
@@ -41,6 +41,10 @@ There are seven changes, each marked `CONSTELLATION PATCH`:
    syncs every journal and checks the rotation markers that keep its
    crash ordering. See
    [Change 7](#change-7-journal-rotation-without-fsyncs-under-the-journal-lock).
+8. **`src/journal/mod.rs`, `src/db.rs`, `src/tx/single_writer/mod.rs`**:
+   `persist_with(mode, at_lock)`, a persist that calls `at_lock` with the
+   journal writer's lock held right before it flushes. See
+   [Change 8](#change-8-a-persist-that-says-when-it-flushes).
 
 The directory is also listed in the workspace `exclude` list. That way it is
 built as a plain dependency, and `cargo clippy --workspace`, `cargo fmt --all`
@@ -439,6 +443,24 @@ discards call too):
 `journal_rotations_never_freeze_commits` measures commits across real
 64 MB rotations (numbers in `fjall-journal-rotation`, PROGRESS).
 
+## Change 8: a persist that says when it flushes
+
+Constellation's `Meta::sync` (every `fsync(2)` on a mount, and every
+write whose safety rests on being remembered) shares one journal sync
+among the calls that arrive together (`crates/meta/src/store/sync_group.rs`,
+finding 14: on btrfs an `fsync` holds the journal's inode lock, and every
+commit's journal write waited behind every queued one). A call may join a
+sync in flight only if that sync's flush will cover the call's commits.
+`Database::persist_with(mode, at_lock)` (and `Journal::persist_with`,
+`SingleWriterTxDatabase::persist_with`) is `persist` with `at_lock`
+called while the journal writer's lock is held, right before the buffer
+is flushed (change 4's `flush_for_sync`). A commit writes its batch and
+releases that lock before it returns, so every batch whose commit
+returned before `at_lock` runs is in the flush, and in the sync that
+follows. `at_lock` is not called when the database is poisoned or the
+lock cannot be taken (the persist fails). `persist` is `persist_with`
+with nothing to call; nothing else changes.
+
 ## Tests
 
 `crates/meta/tests/fjall_drop_deadlock.rs` opens a database with 4 workers,
@@ -473,7 +495,7 @@ If the fix is still needed when moving to a newer fjall before upstream has
 it, vendor that version instead and re-apply the `db.rs` hunk. The hunk is
 self-contained and only touches `impl Drop for DatabaseInner`.
 
-Changes 3, 4, 5 and 7 have no upstream counterpart (7 is filed in
+Changes 3, 4, 5, 7 and 8 have no upstream counterpart (7 is filed in
 `../ISSUE-fjall.md`): dropping the vendored copy
 means re-applying them to the new version (or giving up the writer
 priority and the unlocked sync, which brings back the stalls described

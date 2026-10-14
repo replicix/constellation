@@ -378,16 +378,33 @@ impl Database {
     ///
     /// Returns error, if an IO error occurred.
     pub fn persist(&self, mode: PersistMode) -> crate::Result<()> {
+        self.persist_with(mode, || {})
+    }
+
+    /// [`Self::persist`], calling `at_lock` with the journal writer's lock
+    /// held, right before the journal's buffer is flushed: every write
+    /// batch whose commit returned before `at_lock` runs is covered (not
+    /// called when the database is poisoned or the lock cannot be taken).
+    ///
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 8).
+    ///
+    /// # Errors
+    ///
+    /// Returns error, if an IO error occurred.
+    pub fn persist_with(&self, mode: PersistMode, at_lock: impl FnOnce()) -> crate::Result<()> {
         if self.is_poisoned.is_poisoned() {
             return Err(crate::Error::Poisoned);
         }
 
-        self.supervisor.journal.persist(mode).inspect_err(|e| {
-            log::error!(
-                "flush failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
-            );
-            self.is_poisoned.poison();
-        })?;
+        self.supervisor
+            .journal
+            .persist_with(mode, at_lock)
+            .inspect_err(|e| {
+                log::error!(
+                    "flush failed, which is a FATAL, and possibly hardware-related, failure: {e:?}",
+                );
+                self.is_poisoned.poison();
+            })?;
 
         Ok(())
     }

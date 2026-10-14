@@ -112,6 +112,7 @@ pub mod remote;
 mod scratch;
 pub(crate) mod snapshot;
 pub mod spec;
+mod sync_group;
 pub(crate) mod writes;
 
 pub use bootstrap::BootstrapIndexBuilder;
@@ -656,6 +657,8 @@ pub struct Meta {
     /// safety-relevant write — a promise, an epoch join or ack, a seal, a
     /// grant horizon — requests one before it is acted on).
     syncs: AtomicU64,
+    /// Concurrent [`Meta::sync`] calls share journal syncs (finding 14).
+    sync_group: sync_group::SyncGroup,
     #[allow(dead_code)]
     path: Option<PathBuf>,
 }
@@ -727,9 +730,16 @@ impl Meta {
     /// (`note_grant_horizon`) — each syncs before the caller acts on it.
     /// What a *durability* contract covers (a journal, a backup tail) is
     /// described in `docs/reference/features/durability-and-failover.md`.
+    ///
+    /// Concurrent calls share journal syncs: a call is served by a sync
+    /// whose flush of the journal comes after it (`store::sync_group`,
+    /// finding 14).
     pub fn sync(&self) -> Result<(), MetaError> {
         let started = std::time::Instant::now();
-        self.db.persist(fjall::PersistMode::SyncAll)?;
+        self.sync_group.run(
+            |close| self.db.persist_with(fjall::PersistMode::SyncAll, close),
+            || fjall::Error::Poisoned,
+        )?;
         gate::note_sync(started.elapsed());
         self.syncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -847,6 +857,7 @@ impl Meta {
             vacuum_baselines: Default::default(),
             usage: UsageTracker::new(0, 0),
             syncs: AtomicU64::new(0),
+            sync_group: Default::default(),
             path,
         };
         meta.check_format()?;
