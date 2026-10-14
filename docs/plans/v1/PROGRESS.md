@@ -27684,7 +27684,7 @@ Nothing in the product code changes. Base commit: `99472fa`.
 | Known-failures file, seeded with the census below (two-way, like the xfstests baseline) | done | `tools/check-cross-known-failures.txt` |
 | CI job `cross-check` (`mlugg/setup-zig@v2`, both rustup targets, `make check-cross`) | done | `.github/workflows/ci.yml` |
 | Docs: `--shard`, `--results-json`, `--lane`, `make check-cross` and the known-failures file | done | `docs/how-to-guides/development/TESTING.md` |
-| Perf baselines: harness `bench`, meta-bench, fio-latency p50/p99, pjdfstest, and `--results-json` of the full matrix | pending — measured in the final gate run of the plan-31 series against base commit `99472fa` (the full suites run once, at the end) | — |
+| Perf baselines: harness `bench`, meta-bench, fio-latency p50/p99, pjdfstest, and `--results-json` of the full matrix | pending — measured in the final gate run of the plan-31 series against base commit `99472fa` (the full suites run once, at the end). **Superseded**: never recorded; see "Plan 31 closing", Decisions | — |
 
 ### Cross-check census (base `99472fa`)
 
@@ -27724,7 +27724,8 @@ census confirms exactly those. Notes:
 - [x] `docs/how-to-guides/development/TESTING.md` updated
 - [ ] Baseline numbers (harness `bench`, meta-bench, fio-latency,
   pjdfstest, full-matrix `--results-json`) — pending, measured in the
-  final gate run against `99472fa`
+  final gate run against `99472fa` (**superseded**: never recorded; see
+  "Plan 31 closing", Decisions)
 
 ## Plan 31 C1 — `constellation-types`: portable `Code` errno and `Rdev`
 
@@ -28637,6 +28638,66 @@ failed only while other suites ran alongside.
 - [ ] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798) — run by the coordinator at the end
 
+## Plan 31 C6 — test architecture: conformance kit, `MockVfs`, harness lanes, parity checker
+
+Milestone C6 of [plan 31](wip/31-core-frontend-backend.md) (§8, §11, §12), built in two parts: **C6a** (`ceca163`: the parity checker, the process S3 backend, `harness smoke` and `harness interop`, the nightly lane jobs) and **C6b** (`b265b6f`: the conformance kit, `MockVfs`, the FUSE wire tests, the property tests, the harness `Cap`s and the platform-neutral `Client`). Both commits were reviewed and corrected before they landed (the fixes are listed in their messages). This section was written when plan 31 was closed, from those commits and the tree; counts are the tree's, with the C6b count where it differs. What was still open, and the results of the closing gate run, are in "Plan 31 closing" below.
+
+| Item | State | Where |
+|---|---|---|
+| The conformance kit, a kernel-free suite generic over a `ConformanceTarget` (a factory of fresh `Fixture`s): 9 groups, **92 tests** (80 at C6b) — `namespace` 19, `io` 24, `xattr` 7, `readdir` 6, `concurrency` 8, `deferral` 8, `cancellation` 4, `invalidation` 5, `confinement` 11 (the plan's §6.12 group). Every test is seeded (`RunOptions::seed` mixed with the test's name), declares the `Cap`s it needs, and reports passed, failed (with the message) or skipped; a skip names its capability as a whole word (`requires capability ClusterLocks`), the spelling `tests/parity.py` matches. The kit's `Client` plays the platform: it references every inode it was handed until its `forget`. `Report::to_json` writes the harness results shape | DONE | `crates/vfs/src/conformance/{mod,client,facade,report,reference}.rs`, one module per group |
+| The oracle is the kit's own (`oracle.rs`), a small path-based model of the namespace and content that the sequential and concurrent model tests replay a seeded workload against, comparing every op's outcome and the final tree. Plan 31 §8 said `crates/model`; that crate is a Stateright model of the authority protocol (one flat directory of two names, create and unlink only) and cannot judge a `Vfs`. The plan text now says so | DONE | `crates/vfs/src/conformance/oracle.rs` (576 lines at C6b) |
+| `MockVfs` (feature `mock`): records every call (typed arguments, caller, arrival thread, deadline, whether already cancelled) and every completion; scripts replies per op (a fixed result, a closure of the call, "return now and complete from another thread after N ms", "drop the responder", "hold it, never complete"); in reference mode it is backed by `RefFs`, a small correct in-memory POSIX filesystem (subtree views, link domains, locks, snapshots, events), and is the kit's reference target | DONE | `crates/vfs/src/mock/{mod,reffs}.rs`, `crates/vfs/src/conformance/reference.rs` |
+| The reference target runs in-crate for three capability sets (`FrontendCaps::linux_fuse(true)`, `linux_fuse(false)`, and a bare set that can do very little, where the skips name their capability and the refusals owed to a frontend without one still run); the nightly `conformance` job runs it | DONE | `cargo test -p constellation-vfs --features conformance`; `crates/vfs/src/conformance/mod.rs` (`mod tests`) |
+| The engine's `View` as a target: one `Engine::start` on a local file backend per test, views through `Engine::open_view`, hooks `evict` (cold reads), `snapshot`, `subtree_view`; the instantiation is described in `ENGINE_TARGET.md`. It landed in the C4 follow-ups: the kit's first run found 16 failures (56 / 16 / 9), every one an engine bug, fixed engine-side with no assertion loosened (72 / 0 / 9; see "Engine conformance results" above). It runs for two capability sets, both `linux_fuse(true)`-shaped: as declared, and with `reports_forget` as the FUSE adapter declares itself. **9 tests skip**: see the gaps below | DONE, with the skips | `crates/engine/tests/conformance.rs`, `crates/vfs/src/conformance/ENGINE_TARGET.md` |
+| FUSE wire tests: the real adapter driven by a fake kernel over a socketpair against `MockVfs` — `FUSE_INIT`, the decoding and encoding of every op, the errno of every `Code`, inline, deferred and dropped completion. 20 tests at C6b, 33 now (later plans added theirs: forgets, handover, interrupts, copy) | DONE | `crates/frontend-fuse/tests/wire.rs` |
+| Property tests (proptest): the `Code` tables (a round trip through every encoding, an unknown wire number is `Io`, a native errno maps to its code or `Io`, Linux ↔ Darwin through the `Code`, serde carries exactly the wire number) and `Rdev` (the glibc packing is a bijection, the FUSE encoding keeps the kernel's range, serde) — 8 properties; the vfs policies (names, xattr names and listings, `PolicyStack::for_caps`, `Caller` groups, `OpKindSet`, flag algebra, `ReadData` concatenation) — 12 properties (11 at C6b) | DONE | `crates/types/tests/properties.rs`, `crates/vfs/tests/policy_properties.rs` |
+| Harness `Cap` derived from `FrontendCaps` (`caps_of`; never a second table): `Scenario.caps`, a skip that names the capability (`requires capability <Cap>`), `--frontend` (`fuse` is the only value), `--without-cap <Cap>` to run as a frontend lacking one. 18 scenarios list capabilities (21 entries: `ClusterLocks` 10, `FuseAbort` 3, `Xattrs` 2, `KeepOpenUnlinked` 2, `Fallocate`, `HardLinks`, `PushInvalFull`, `SeekHole` 1 each); 4 unit tests, including "the reference lane never skips a scenario for a capability" | DONE | `crates/harness/src/{caps,scenarios,main,results}.rs` |
+| Platform-neutral harness `Client`: the mount table, unmount, FUSE abort, `kill`, `SIGSTOP`/`SIGCONT` go through `constellation-platform` (`Process::suspend`, `resume`, `kill` were added, with the macOS and stub implementations); three behaviours the first draft lost were restored in review (`is_mountpoint`'s `stat` semantics, the killed bounded detach, the FUSE-entry mountinfo lookup). The rest of the harness (scenarios, sandbox, spawner) still calls `libc` directly | DONE for `Client`; see the macOS gap | `crates/harness/src/client.rs`, `crates/platform/src/{process,linux,macos,unix,unsupported}.rs` |
+| `harness smoke` (a step-for-step port of `tests/smoke.sh`, which is now a wrapper that finds the harness binary and forwards its arguments) and `harness interop write\|verify --bucket-dir` (a seeded tree, a pure function of the seed, written to a fresh filesystem and verified from a fresh state dir; the bucket travels as a plain directory; `file` and `process` backends) | DONE | `crates/harness/src/{smoke,interop}.rs`, `tests/smoke.sh` |
+| The process S3 backend, `--s3-backend docker\|process`: a native versitygw (v1.8.0) and `toxiproxy-server` (v2.12.0) behind the same `S3Env` API, installed by `tests/ci/install-native-s3.sh`; SigV4 signing of the harness's own raw S3 calls under the process backend only, checked against AWS's documentation vectors (6 unit tests); lane names `<os>-<frontend>` and `-process` recorded in the results JSON. Three `#[ignore]`d tests start each backend and compare them through `S3Env` (run by hand: `cargo test -p constellation-harness --test s3_process_backend -- --ignored`; no CI job runs them) | DONE | `crates/harness/src/{s3env,s3auth,results}.rs`, `crates/harness/tests/s3_process_backend.rs`, `tests/ci/install-native-s3.sh` |
+| The parity checker: a reference lane (`linux-fuse`; any lane may have its own), failing closed on a mismatch, a stale expectation (two-way), a lane or scenario missing from one side, and a `failed` outcome in any lane; `--require-lane`; wildcard `[[expect]]` only for capability skips, never for a missing tool. `tests/test_parity.py`: 29 unit tests at C6a, 31 now, including the deliberate-mismatch cases that prove it fails closed. `tests/platform-parity.toml`: seeded with no expectations (`linux-fuse-process` must equal `linux-fuse`); plan 37 added `--absent-lane` and the 16 `linux-csi` entries | DONE | `tests/parity.py` (559 lines), `tests/test_parity.py`, `tests/platform-parity.toml` |
+| CI: nightly `harness` writes `results-linux-fuse.json`; `harness-lanes-linux` runs `linux-fuse-process` (`harness run --s3-backend process --frontend fuse --results-json …`); `conformance` runs the kit and the engine target; `parity` needs `[harness, harness-lanes-linux, conformance, kind-e2e]`, runs the checker's unit tests, then `parity.py` over every `harness-*` artifact requiring `linux-fuse` and `linux-fuse-process` (`linux-csi` required with the FUSE runner, declared absent without). `ci.yml`'s `cross-check` (C0) is unchanged by C6. `docs/how-to-guides/development/TESTING.md` documents the lanes, `--frontend`, `--s3-backend` and the parity file | DONE (defined; the runs are in the table below) | `.github/workflows/nightly.yml`, `.github/workflows/ci.yml`, `docs/how-to-guides/development/TESTING.md` |
+
+### What has run
+
+"Recorded" means a PROGRESS section (this plan's or a later plan's) records the run; nothing else is claimed.
+
+| Lane / check | Recorded run |
+|---|---|
+| `linux-fuse` (docker floci S3; the reference lane) | Recorded in "Plan 37 K7": all 223 scenarios one at a time with a queue — 211 passed, 1 failed once (`delegate-backup-handoff-failover`, a known flake) and then passed 3 of 3 alone, 11 root-only scenarios passed as root. Later fixes record the scenarios they touched. The full matrix at the closing commit: "Plan 31 closing" |
+| `linux-fuse-process` (native versitygw + toxiproxy) | **No run recorded.** No section records `harness run --s3-backend process`, nor a run of the ignored `s3_process_backend` tests; the lane is defined in nightly and has no recorded result. First recorded run: the closing gate run |
+| `linux-csi` | Recorded in "Plan 37 K7": the parity lane, 8 passed and 215 skipped, `parity.py` PASS |
+| Conformance kit against the reference target | Recorded as green when it changed (`-vfs --features conformance` in "Plan 31 C4 follow-ups"); the count of 92 and the three capability sets are not separately recorded |
+| Conformance kit against the engine | Recorded: 72 passed / 0 failed / 9 skipped (81 tests then) in "Plan 31 C4 follow-ups"; `--test conformance` passed in "Chunk memory cache". The 92-test run: the closing gate run |
+| Wire tests | Recorded at 20 ("Plan 31 C4 follow-ups", "C7a", "Chunk memory cache"); 33 now |
+| Property tests | Not recorded in PROGRESS (they run in `cargo test --workspace`) |
+| `tests/parity.py` and its unit tests | Recorded in "Plan 37 K7": 31 tests OK; `parity.py` PASS over `linux-fuse` and `linux-csi`. With `linux-fuse-process`: the closing gate run |
+| `harness smoke` / `tests/smoke.sh` | Recorded: SMOKE TEST PASSED in "Plan 37 K7" |
+| `harness interop` | No run recorded; no CI job runs it (it exists for plan 34's macOS lane) |
+
+### Known gaps at the close of C6
+
+| Gap | State | Notes |
+|---|---|---|
+| The engine target's 9 skips: **4 `cancellation`** (it declares `cancellable_waits: false`) and **5 `invalidation`** (no `second_view`/`events` hook: a second view of one engine gets no invalidations for the first's mutations, and a second engine cannot share a file backend) | in progress | The cancellation flag and a two-engine fixture over an S3-shaped store are being built; see "Plan 31 closing". The engine's lock waits check the token now (`ClusterLocks::set`, `crates/engine/src/locks.rs`) but the target still declares them uncancellable |
+| The oracle is the kit's own, not `crates/model` | corrected | Plan 31 §8 said `crates/model`; the plan text is amended |
+| The engine target runs one family of capability sets | open | Two sets, both `linux_fuse(true)`-shaped; nothing runs the engine as a frontend without hard links, xattrs, push invalidation or locks, so `PolicyStack::for_caps` and the refusals owed to such a frontend are exercised against `MockVfs` only |
+| The harness does not compile for macOS | in progress | Only `Client` goes through `constellation-platform`; `tools/check-cross-known-failures.txt` still lists `aarch64-apple-darwin constellation-harness` (21 errors at the last count). The nightly `macos` job runs `cargo test --workspace`, which builds the harness: it is expected to fail until the platform move lands |
+| `linux-fuse-process` has no recorded run, and its backend test is not in CI | open | See "What has run" |
+| The kit's results JSON is not fed to the parity checker | open | `CONSTELLATION_CONFORMANCE_RESULTS` makes the reference-target run write `conformance-<lane>.json`; the nightly `parity` job compares only the `harness-*` artifacts |
+
+### Plan 31 C6 exit criteria
+
+- [x] The conformance kit, including the `confinement` group, runs in CI (nightly `conformance`) against the reference filesystem and against the engine
+- [x] `MockVfs` has adapter unit-test coverage (the FUSE wire tests)
+- [x] Property tests for the `Code`/`Rdev` tables and the policies
+- [x] `tests/parity.py` unit-tested against synthetic mismatches (it fails closed); `tests/platform-parity.toml` in use (the `linux-csi` lane's entries; `linux-fuse-process` has none by design)
+- [x] Harness `--frontend`, `--s3-backend process`, derived `Cap`, `harness smoke`, `harness interop`
+- [ ] The engine conformance target runs the `cancellation` and `invalidation` groups instead of skipping them — in progress ("Plan 31 closing")
+- [ ] The harness's host calls behind `constellation-platform`, so that it compiles for macOS — in progress ("Plan 31 closing")
+- [ ] `linux-fuse-process` green: no run is recorded — the closing gate run
+- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest 8798/8798) — the closing gate run
+
 ## Plan 31 C7a — op metrics, tracing, `node.ops`, `vfs-bench`
 
 First half of milestone C7 of [plan 31](wip/31-core-frontend-backend.md)
@@ -29130,6 +29191,103 @@ The RSS-bounded ones also pass, with the memory tier clamped to the small
 file), `writeback-bigfile` (138 MiB, 32 MiB cache), `fallocate-sparse` (93 MiB).
 Not run here: the full workspace suite, the harness matrix and pjdfstest,
 which are the gate run's.
+
+## Plan 31 closing
+
+Close-out of [plan 31](wip/31-core-frontend-backend.md). Milestones C0 to C8 are in the sections above ("Plan 31 C0" through "Plan 31 C8", with C6 written at the close). This section records, in one place: the work still in progress when the plan text was reconciled with the tree, the decisions taken, the statements in the sections above that later work superseded, the contradictions with `docs/explanation/DESIGN.md` (CONVENTIONS rule 5: the spec is not edited by plans), and the closing gate run. The in-progress items are being done by separate changes; **their results are recorded in the "Result" column when each lands, and nothing here claims one done before that.** The plan text itself (`wip/31-core-frontend-backend.md`) was amended in the same change as this section: stale names and signatures corrected in place, design history followed by "As built" or "Superseded" notes.
+
+### Remaining items
+
+| Item | State | Where | Result |
+|---|---|---|---|
+| **C6, cancellation in the conformance kit.** The engine target declares `cancellable_waits: false`, so its 4 `cancellation` tests skip, although `ClusterLocks::set` checks the `OpCtx` token between the polls of a wait and before each request to the sequencer. A cancellation flag for the target, and the group running against the engine | in progress | `crates/vfs/src/conformance/{mod,cancellation}.rs`, `crates/engine/tests/conformance.rs`, `crates/vfs/src/conformance/ENGINE_TARGET.md` | *(to be recorded)* |
+| **C6, a two-engine fixture for the `invalidation` group.** The 5 tests skip because a second view of one engine gets no invalidations for the first's mutations and two engines cannot share a file backend; the fixture is two engines over one S3-shaped store (the pattern at the bottom of `crates/engine/src/shipper.rs`) whose first engine's `open_view` is given the recording events | in progress | `crates/engine/tests/conformance.rs`, `crates/vfs/src/conformance/ENGINE_TARGET.md` | *(to be recorded)* |
+| **§6.4, the threading assertion, and §6.10, `ControlVfs` metrics.** `OpCtx::new` debug-asserts that the caller is not a tokio runtime worker (plan 31 §6.4 says it does; it does not yet); the `ControlVfs` browse ops (`browse.stat/read/write/mkdir/rename/delete/xattr`) go through the `Observer` so they are counted and traced like a mount's ops (C7a left them out) | in progress | `crates/vfs/src/ctx.rs`, `crates/engine/src/control/browse.rs` | *(to be recorded)* |
+| **`Manager`, unified.** The CLI's `fs` subcommands and the control service's `fs_list/create/export/import/passwd/doctor/unlock` are separate implementations; one shared implementation both call (plan 31 §4's `Manager`, which was never built as a type) | in progress | `crates/cli/src/main.rs`, `crates/engine/src/control/fs.rs`, `crates/engine/src/registry.rs` | *(to be recorded)* |
+| **The harness compiles for macOS.** Its host calls (seccomp and `io_uring_setup` denial, CPU-affinity scheduling, `libc::fallocate`/`prctl`, xattr arities, `F_SETLK` typing, the spawner, the sandbox) move behind `constellation-platform`; the `aarch64-apple-darwin constellation-harness` entry of `tools/check-cross-known-failures.txt` is then deleted in the same change, and the nightly `macos` job (`cargo test --workspace`) can build the harness | in progress | `crates/harness/src/*`, `crates/platform/src/*`, `tools/check-cross-known-failures.txt` | *(to be recorded)* |
+| **The closing gate run** (table below): the full harness matrix, pjdfstest 8798/8798, `vfs-bench`, both Linux lanes `linux-fuse` and `linux-fuse-process`, `tests/parity.py` | in progress | see "Closing gate run" | *(to be recorded)* |
+
+### Decisions
+
+| Decision | State | Where |
+|---|---|---|
+| **The C0 perf baseline is superseded** by `tests/perf-baseline.json` and `tests/perf-gate.sh` (and the `perf-regression` workflow and the nightly `performance` job). The baselines C0 was to record (harness `bench`, meta-bench, `fio-latency` p50/p99, pjdfstest, the full-matrix `--results-json`) were never recorded against the pre-refactor commit; "within 3% of C0" in plan 31's C3, C4 and C7 gates therefore has nothing to compare with, and is replaced by the gates described next | decided | `tests/perf-baseline.json`, `tests/perf-gate.sh`, `.github/workflows/perf-regression.yml`, `.github/workflows/nightly.yml` (`performance`) |
+
+What the superseding gates hold, exactly:
+
+- **`vfs-bench`** (`crates/engine/benches/vfs_bench.rs`, release; the first stage of `tests/perf-gate.sh`, which `make perf-gate`, the nightly `performance` job and, alone, the `perf-regression` workflow run). It exits non-zero when any inline op's dispatch overhead — the `Observer` path (op id, span, metrics) minus a bare `OpCtx::new` plus responder, the median of alternating rounds — reaches 1000 ns (plan 31 §6.9's own limit), or when the observed path allocates more per op than the bare one (not at all with no backend; by more than half an allocation per op over one otherwise). The script then holds each backend's own allocations per op to the ceilings in `tests/perf-baseline.json` `vfs_bench.max_allocs_per_op`, plus `alloc_slack` 0.5: `observer/getattr` 0, `view/getattr` 4, `view/lookup` 11, `view/read` 18. So §6.9's "no per-op heap allocation" holds for the dispatch path and not for the `View`'s own work, which is held at those ceilings (the 4 KiB read was 60 when `vfs-bench` was added, 21 after C7b).
+- **The harness `bench` rates** (the second stage; nightly only): 500 files of 4 KiB, fanout 25, the median of 3 runs of `harness bench --json`; eight metrics — `import_files_per_sec`, `durable_import_files_per_sec`, `writeback_import_files_per_sec`, `writeback_durable_files_per_sec`, `metadata_walk_files_per_sec`, `cold_read_files_per_sec`, `sequential_cold_read_mib_per_sec`, `warm_random_read_iops` — must each stay at or above `baseline × (1 − tolerance)` with `tolerance` **0.2**. That is a 20% floor, not 3%, and a floor, not a band. The committed numbers are host-specific; "Plan 31 C7b" records that they do not fit the development host and that the nightly job is the judge.
+- **`perf-regression.yml`**: the corpus-replay suite (`tests/perf_regression/`) on a hosted runner in three network profiles (`full`, `latency250`, `bw50mbps`); a pull request is compared with the latest run on `main` (kept in the `perf-results` artifact) and the report goes to the job summary and one comment on the pull request. It is a comparison, not a threshold (changes under ±15% are printed in small type); the workflow's only threshold is the `vfs-bench` stage.
+- **`tests/read-cpu-gate.sh`** (plan 38 §6): the daemon's CPU-seconds per GiB and peak RSS on a real mount against `tests/read-cpu-baseline.json`, host-specific; the nightly lane records against a baseline of its own and does not gate.
+- **pjdfstest** stays 8798/8798 against an empty known-failure baseline (`tests/pjdfstest-baseline.txt`); the full harness matrix is pass or fail per scenario.
+- **Not held to a number:** `fio-latency` p50/p99 and meta-bench have no committed baseline (`fio-latency` is a pass/fail scenario), so a latency regression the scenario's own assertions do not catch is not caught by a gate.
+
+### Statements in the sections above that later work superseded
+
+The sections above are a log and stay as written; this is where the later facts are.
+
+| Section | It says | Now |
+|---|---|---|
+| C0 table (Perf baselines row) and C0 exit criteria (last item); C3 and C4 criteria "perf within 3% of C0" | pending, measured in the final gate run | Superseded: see Decisions |
+| C0 census, C2 and C3 cross-check tables | `x86_64-pc-windows-gnu`: `constellation-api`, `-authority`, `-chaos`, `-engine` FAIL (known); `aarch64-apple-darwin`: `constellation-chaos` FAIL | `constellation-api` was deleted (C5); `-authority` has been clean since C1 (its `ESTALE` sites carry `Code`); `-chaos` compiles for darwin since C2, and with `constellation-pod-load` (POSIX test tooling) it is excluded from the Windows library list in `tools/check-cross.sh`; `-engine`'s staging I/O and zero-copy check were made portable. The last three are commit `eae81c1`. The one known failure left is `constellation-harness` on darwin (`tools/check-cross-known-failures.txt`, whose header says so) |
+| C2 table ("Left in place: … the harness's `fusermount3`/`SIGSTOP`/`fallocate` (C6)") | C6 moves them | C6b moved the harness `Client`'s; the rest is a closing item above |
+| C4a table (`trait Vfs`, "30 ops") | 30 ops | 31: `copy_file_range` (commit `2acd591`) |
+| C4 follow-ups and C6b: the engine target "72 passed / 0 failed / 9 skipped" | 81 tests | The kit has 92 tests; the engine target's skips are the closing items above |
+| C5 tables | `node.handoff` `Socket` → `Unsupported` (plan 37's second-process handover); `node.lifecycle` → `Unsupported` until C8; the table has 57 methods | `Socket` is implemented (plan 37 K5, `crates/cli/src/handoff_socket.rs`); `node.lifecycle` is implemented (C8); `METHODS` has 72 methods |
+| C7a ("§6.9's no per-op heap allocation … `View` `read` 60 allocations … a C7 follow-up") | 60 | 18 now, held as a ceiling (above) |
+| C4b ("Queued, in-flight, `FORGET`, locks") | "Lookup counts need nothing: inode numbers are the replica's and the view keeps no lookup table"; a blocking `F_SETLKW` is refused rather than drained because "fuser 0.18 cannot interrupt it" | The kernel's lookup counts do cross the handover: the FUSE adapter counts them (`KernelRefs`) so that `Vfs::forget` is the last forget, and carries them in `FuseHandoff::refs` and `MountHandoff::refs` (commit `91591c6`, ADR-31); an unreadable handoff rolls back to the previous executable. A lock wait is interruptible now (plan 39; the fuser fork delivers `FUSE_INTERRUPT`), but the upgrade still refuses while one is in flight |
+| C4b table and exit criteria | `vendor/fuser`, its `CONSTELLATION-PATCH.md` and `tools/vendor-fuser.sh` | Gone since commit `18ab365`: fuser comes from a git fork pinned by `rev` in `Cargo.toml`'s `[patch.crates-io]`, one branch per patch (handover, io_uring transport, ring idle wait, interrupt) |
+| Plan 31 §6.3 and §14, `ENGINE_TARGET.md`, the conformance kit's doc comments | fuser has no `FUSE_INTERRUPT`; a Linux FUSE `CancelToken` is never set (the kit's comments: set for the `fsync` family only) | The fork delivers `FUSE_INTERRUPT` and the adapter wires it (plan 39 §3.3) for `fsync`/`fsyncdir`, `O_SYNC`/`O_DSYNC` writes and `copy_file_range` (killable: a dying caller) and for blocking lock waits (interruptible: any signal, `EINTR`). The plan text is corrected; the kit's comments and `ENGINE_TARGET.md` are the cancellation item's to correct |
+| Plan 31 text (§§3, 4, 4.1, 6.2, 6.3, 6.5, 6.6, 6.9, 6.11, 8, 9.7, 9.9, 11, 12, 14, 15) | The design as written on 2026-09-28 | Corrected in place or annotated "As built" / "Superseded" in the same change as this section |
+
+### Contradictions with `docs/explanation/DESIGN.md` (CONVENTIONS rule 5)
+
+`DESIGN.md` is not edited by plans; where it disagrees with the tree, the disagreement is recorded here.
+
+| DESIGN.md | It says | The tree |
+|---|---|---|
+| §12, "Designed but not built" (the opening list) | "… and FUSE passthrough" | Built by plan 38 (Z3a engine side, Z3b FUSE side, Z3c snapshot views): a read-only open of a single-chunk file whose chunk is verified on disk is answered with `FOPEN_PASSTHROUGH`, so the kernel reads the chunk file itself. It needs a kernel offering `FUSE_PASSTHROUGH` (6.9+) and `CAP_SYS_ADMIN`; it is on by default for read-only mounts (snapshot views) and for a writable mount only with `CONSTELLATION_FUSE_PASSTHROUGH=1` |
+| §12, same list | "stable readdir cursors (`readdir` resumes by position today)" | Not by position since commit `ed9b40b`: a child's cookie is a hash of its name (`dir_cookie`, `crates/engine/src/view/ops.rs`: unkeyed FNV-1a), children are listed in cookie order and a listing resumes after the name it stopped at, so an unlink or create between pages no longer repeats or skips entries. Plan 40 (READDIRPLUS and name-order listing, not yet built) replaces those cookies again. The bullet "Stable readdir cursors: key-ordered cursors" under "Enabled by the local replica" is therefore ahead of the tree (hash order today, name order after plan 40) |
+| §12, same list | "`copy_file_range` … (not yet the metadata-only one)" | Consistent with the tree. Commit `2acd591` already amended this sentence: `copy_file_range` is a copy by the daemon (`Vfs::copy_file_range`, `view::copy`, a run of writes through the destination's session); `copy_manifest` and the metadata-only copy stay deferred. No contradiction remains |
+| §12, same list | "negative dentry caching", "`READDIRPLUS`", "the writeback cache with `FOPEN_KEEP_CACHE`" as not built | Still true (plan 40 is the READDIRPLUS plan) |
+| §10, the control-plane paragraph | One control API (unix socket by default, optionally TCP) serves the CLI, the embedded web UI (axum + rust-embed, loopback only; remote through opt-in auth or the iroh tunnel) and scripts | The pre-C5 protocol's description. Since C5 the control plane is `constellation-control` (plan 31 §9): framed JSON or postcard over a per-user runtime-dir unix socket recorded in the state dir's `control.path`, roles and an owner-only default by peer credentials, an audit log, streams, fd passing; the web UI speaks it over the loopback HTTP adapter (`POST /api`); the protocol has no TCP transport (the transports are the unix socket, in-process, a stream transport for tests and a named-pipe stub), and remote access and token auth are plan 33's. Recorded first in "Plan 31 C5", "Spec note" |
+
+### Stale text noticed outside the files this close-out may change
+
+Recorded, not edited here (code comments and files other changes own):
+
+| Where | Stale | Should say |
+|---|---|---|
+| `crates/vfs/src/conformance/mod.rs` (module doc), `cancellation.rs` (module doc, the `GAP` text), `ENGINE_TARGET.md` | "Linux FUSE sets the token for the `fsync` family only" / "not for lock waits" | Blocking lock waits are cancelled by any interrupt too (the adapter's module doc; `crates/vfs/src/ctx.rs` `CancelToken` already says so) |
+| `crates/frontend-fuse/src/session.rs` (module doc, detach step 2), `crates/cli/src/handover.rs` (module doc, "Refusals and limits") | "fuser 0.18 cannot interrupt the wait" | The lock wait is interruptible; the upgrade still refuses while one is in flight, because its reply must be written on the descriptor it was read from by a process that still serves it |
+| `docs/plans/v1/CONVENTIONS.md` (code style) | "Rust 2024 edition" | The workspace's `[workspace.package]` edition is `2021` |
+
+### Closing gate run
+
+The gates of CONVENTIONS plus plan 31's. Every earlier plan 31 section left "Full gates" for this run. Not yet run.
+
+| Gate | Command | State | Result |
+|---|---|---|---|
+| Format, lint | `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | not yet run | *(to be recorded)* |
+| Unit and integration tests | `cargo test --workspace` | not yet run | *(to be recorded)* |
+| Conformance | `cargo test -p constellation-vfs --features conformance`; `cargo test -p constellation-engine --test conformance` | not yet run | *(to be recorded: tests, passed, failed, skipped)* |
+| Smoke, integration | `bash tests/smoke.sh`; `bash tests/integration.sh` | not yet run | *(to be recorded)* |
+| Full harness matrix, lane `linux-fuse` | `target/release/harness run --results-json results-linux-fuse.json` | not yet run | *(to be recorded: scenarios passed, failed, skipped)* |
+| Full harness matrix, lane `linux-fuse-process` | `target/release/harness run --s3-backend process --frontend fuse --results-json results-linux-fuse-process.json` | not yet run | *(to be recorded; this lane has no earlier recorded run)* |
+| Lane parity | `python3 -m unittest discover -s tests -p 'test_parity.py'`; `python3 tests/parity.py --expect tests/platform-parity.toml --require-lane linux-fuse --require-lane linux-fuse-process …` | not yet run | *(to be recorded)* |
+| pjdfstest | `docker compose --profile test run --rm compliance` | not yet run | *(to be recorded: 8798/8798 expected, empty baseline)* |
+| Performance | `make perf-gate` (`vfs-bench`, then the harness `bench` rates); `make vfs-bench` for the numbers | not yet run | *(to be recorded: `vfs-bench` table next to C7a's and C7b's)* |
+| Cross-check | `make check-cross` | not yet run | *(to be recorded: the known failure should be gone with the macOS item)* |
+
+### Plan 31 exit criteria
+
+- [x] Milestones C0 to C8 each have a section with exit criteria (C6 written at the close)
+- [x] The plan text matches the tree: stale names and signatures corrected, design history annotated "As built" or "Superseded"
+- [x] The contradictions with `DESIGN.md` are recorded here, and the spec was not edited
+- [x] The C0 baseline decision is recorded (Decisions)
+- [ ] The five in-progress items above landed, with their results recorded
+- [ ] The closing gate run recorded, with the earlier sections' "Full gates" items ticked
+- [ ] `docs/plans/v1/wip/31-core-frontend-backend.md` moved to `docs/plans/v1/done/` after the two items above
 
 ## Plan 38 Z0a — FUSE-over-io_uring session handover spike
 

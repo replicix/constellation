@@ -91,7 +91,7 @@ Every plan ends with ALL of these green, run in this order:
 
 ## Code style
 
-- Rust 2024 edition, stable toolchain. `fuser` 0.18 with
+- Rust 2021 edition (the workspace's `edition`), stable toolchain. `fuser` 0.18 with
   `default-features = false`; Linux mounts use host-sized concurrent
   event loops. tokio multithread runtime.
 - `Vfs` ops (FUSE callbacks) run on synchronous frontend worker threads:

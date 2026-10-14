@@ -11535,8 +11535,8 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
 // ping-pong replacement, measured), a requester crash mid-batch, and a
 // holder takeover with a pending batch. Every M13 status field is read
 // through `serde_json::Value` indexing (`status["inbox"]`, see
-// `constellation_api::InboxStatus`), so a renamed field reads as zero and
-// the non-vacuity checks fail loudly.
+// `constellation_control::proto::types::InboxStatus`), so a renamed field
+// reads as zero and the non-vacuity checks fail loudly.
 // ---------------------------------------------------------------------------
 
 /// Plan 30 M13's `status["inbox"]` block, `Null` (every field zero)

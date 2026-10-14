@@ -1,5 +1,15 @@
 # Plan 31 — Core-isation: `constellation-engine`, the `constellation-vfs` frontend contract, `constellation-platform`, the control protocol, and the test architecture that makes it all verifiable
 
+> **Editorial note (plan 31 closing).** This is the design as written on
+> 2026-09-28; the milestones C0-C8 have been built. Where the tree differs
+> from a passage, the passage is either corrected in place (names,
+> signatures) or followed by an **As built:** / **Superseded:** note
+> (design history). The status of every milestone, the numbers, and what is
+> still open are in `docs/plans/v1/PROGRESS.md` ("Plan 31 C0" through
+> "Plan 31 C8", the "Plan 31 C6" section, and "Plan 31 closing"). Line
+> counts, module counts and file:line citations below describe the tree at
+> commit `a945b05` and are historical; they are not kept current.
+
 Read `docs/plans/v1/CONVENTIONS.md` first. Spec context: `docs/explanation/DESIGN.md`
 §10 (Control Plane), and plan 30's write-path sections (`cto=strict`, layered
 durability, strict locks — the semantics this plan must carry through a
@@ -46,6 +56,11 @@ reading the cited file at the cited line. "REPORTED" means the plan-34/35
 research this plan inherited, not independently re-checked here.
 
 ## 1. Why
+
+*(Historical: the counts in this section are the tree's at `a945b05`, before
+the split. At the plan's close `crates/cli/src` is 15,232 lines in 13 files, and
+the harness catalog is 223 scenarios in the plan 37 gate run. Not kept
+current.)*
 
 `crates/cli` is 47,325 lines (VERIFIED: `find crates/cli/src -name '*.rs' |
 xargs wc -l` totals exactly 47325). It is a monolith in the specific sense
@@ -186,7 +201,7 @@ format either.
  constellation-platform (host services, cfg per OS; injected, never
    reached around): dirs, daemon/process, file locks, fs primitives,
    secrets, lifecycle/power/network, mount table
- constellation-types (Code errno enum, Ino, FileAttr, ids, caps) — no deps
+ constellation-types (Code errno enum, Rdev) — no deps beyond serde
 ```
 
 Everything below `constellation-vfs` is the "backend" (one implementation,
@@ -198,9 +213,9 @@ entire job is scoped to.
 
 | Crate | Replaces / is new | Contents |
 |---|---|---|
-| `constellation-types` (`crates/types`) | new | `Code` errno enum (§7), `Ino`, `FileAttr`, `SetAttr`, `FileKind`, `Durability`, `LockRange`, capability structs, ids. No deps beyond serde. |
+| `constellation-types` (`crates/types`) | new | `Code` errno enum and `Rdev`, the portable device number (§7). No deps beyond serde. **As built:** `Ino`, `Attr` (the plan's `FileAttr`), `SetAttr`, `FileKind`, `Durability`, `LockRange` (and `LockSpec`, `LockOwner`, `Fh`, `OpenOwner`), and the capability struct `FrontendCaps` live in `constellation-vfs` (`crates/vfs/src/types.rs`, `caps.rs`), the only layer that needs them. |
 | `constellation-platform` (`crates/platform`) | new | Modules `linux`, `macos`, `windows`, `android`, `ios`, `freebsd`. Only `linux` and `macos` fully implemented here (macOS per plan 34's needs); the rest are compile-only stubs returning `io::ErrorKind::Unsupported`. Trait bundle `HostServices { dirs, process, daemon, file_lock, fs: FsPrimitives, secrets: SecretStore, lifecycle: LifecycleSource, mounts: MountTable }`. `platform::linux::fuse_mount_fd(target: &Path, opts: &MountOpts) -> io::Result<OwnedFd>` is a privileged mount helper that performs the FUSE `mount(2)` itself and returns the resulting `/dev/fuse` fd instead of handing the mount off to `fusermount3` — the one fusermount3-free path shared by the plain daemon (C4's in-place upgrade, §6.11) and plan 37's CSI node plugin, which needs the fd to hand to a separate engine process over `SCM_RIGHTS`. |
-| `constellation-engine` (`crates/engine`) | absorbs 35 of `crates/cli`'s 40 engine modules outright, and the untangled remainder of the other 5 (§5) | Everything in §5's engine-module list, plus `ConstellationFs` renamed `View` (mount-scoped). `Engine::start(EngineConfig, HostServices, EngineProfile) -> Engine`; `Engine::open_view(ViewSpec, FrontendCaps, Arc<dyn FrontendEvents>) -> View`; `Engine::control() -> ControlService`. `Manager` (registry, fs create/import/export/passwd, doctor) usable in-process by the CLI and served by the daemon. |
+| `constellation-engine` (`crates/engine`) | absorbs 35 of `crates/cli`'s 40 engine modules outright, and the untangled remainder of the other 5 (§5) | Everything in §5's engine-module list, plus `ConstellationFs` renamed `View` (mount-scoped). `Engine::start(EngineConfig, HostServices, EngineProfile) -> Result<Engine>`; `Engine::open_view(ViewSpec, FrontendCaps, Arc<dyn FrontendEvents>) -> Result<Arc<View>>`. **As built:** there is no `Engine::control() -> ControlService`. The control service is `EngineControl` (`crates/engine/src/control/`: `EngineControl::new(engine, host, ...)`), which binds the protocol's method table to an engine, plus the `ControlHost` trait for what only a host can do (mounts, handoff, detach-all, lifecycle); the daemon builds it in `crates/cli/src/node_runtime.rs` and routes it in `crates/cli/src/control.rs` (`daemon_router`, `DaemonHost`). There is no `Manager` type either: `fs create/import/export/passwd/doctor` over the registry (`crates/engine/src/registry.rs`) are implemented by the control service's `fs.*` methods (`crates/engine/src/control/fs.rs`) and, separately, by the CLI's own `fs` subcommands (`crates/cli/src/main.rs`); **being unified into one shared implementation (plan 31 closing; PROGRESS "Plan 31 closing" records the result).** |
 | `constellation-vfs` (`crates/vfs`) | new | `trait Vfs`, `OpCtx`, `Caller`, `Responder<T>`, `Blocking<T>`, `CancelToken`, `DirSink`, `FrontendEvents`, `Invalidation`, `FrontendCaps`; policies `NamePolicy`, `XattrPolicy`, `IdentityMap`, `PolicyStack`; `OpWatch` (generalised `fuse_watch`); `vfs::conformance`; `vfs::mock::MockVfs`. |
 | `constellation-control` (`crates/control`) | replaces `crates/api` (deleted outright, no shim — §2) | Protocol, framing, `Transport` trait; transports `UnixSocket` (peer-cred authz), `InProcess`, plus `NamedPipe` (stub here, implemented in 35) and `Remote` (defined in 33); the client library; the `web` adapter (moves unchanged; 33 hardens it). |
 | `constellation-frontend-fuse` (`crates/frontend-fuse`) | extracted from `crates/cli` | Linux (FreeBSD-ready: fuser has a pure-Rust FreeBSD mount). |
@@ -220,7 +235,7 @@ one process, and plan 37's CSI engine pods, which are one process per
 architecturally prevented from sharing a pod across filesystems later.
 
 ```rust
-// constellation-engine
+// constellation-engine (crates/engine/src/host.rs) -- as built
 pub struct EngineHost {
     // one tokio::runtime::Runtime shared by every hosted Engine — not one
     // runtime per Engine, since that would multiply thread-pool overhead
@@ -228,31 +243,45 @@ pub struct EngineHost {
     // barriers (§6.3) are already per-View, not per-runtime.
     runtime: tokio::runtime::Handle,
     budget: Arc<ResourceBudget>, // memory/cache/staging, partitioned per engine
-    engines: DashMap<FsId, Engine>,
+    engines: RwLock<BTreeMap<FsId, Arc<Engine>>>,
+    adding: Mutex<()>,           // serialises add_engine, so two starting at once see each other's share
 }
 impl EngineHost {
     pub fn start(runtime: tokio::runtime::Handle, budget: ResourceBudget) -> EngineHost;
-    pub fn add_engine(&self, id: FsId, cfg: EngineConfig, host: HostServices, profile: EngineProfile) -> &Engine;
-    pub fn remove_engine(&self, id: FsId) -> Option<Engine>; // used by node.leave (view first, then engine)
-    pub fn engine(&self, id: FsId) -> Option<&Engine>;
+    pub fn add_engine(&self, id: FsId, cfg: EngineConfig, host: HostServices, profile: EngineProfile) -> Result<Arc<Engine>>;
+    pub fn remove_engine(&self, id: &FsId) -> Option<Arc<Engine>>; // used by node.leave (view first, then engine)
+    pub fn engine(&self, id: &FsId) -> Option<Arc<Engine>>;
+    pub fn engines(&self) -> Vec<(FsId, Arc<Engine>)>;
+    pub fn allotment_for(&self, profile: &EngineProfile) -> ResourceBudget; // what the next engine would get
 }
-pub struct ResourceBudget { pub memory_bytes: usize, pub cache_bytes: usize, pub staging_bytes: usize }
+pub struct FsId(pub String); // the registry name, or the state dir for an unregistered filesystem
+pub struct ResourceBudget { pub memory_bytes: u64, pub cache_bytes: u64, pub staging_bytes: u64 }
 ```
 
 `ResourceBudget` is a host-wide ceiling that `EngineHost::add_engine`
 partitions across its `Engine`s (equal share by default; an explicit
-per-engine override is a `Server`-profile knob, §10.1) — this is what keeps
+per-engine override is a `Server`-profile knob, §10.1; **as built, the
+split is fixed when an engine starts**: the n-th engine added gets
+`budget / n`, adding one does not shrink the engines already running and
+removing one does not grow the rest — rebalancing a live cache is not
+built) — this is what keeps
 one noisy filesystem's cache growth from starving another's in a shared
 process, the same problem plan 37's per-view QoS (§10.1) solves one layer
 down for views that share one `Engine`. `crates/cli`'s daemon host becomes a
 thin wrapper: it constructs one `EngineHost` and, per plan 21's existing
 registry-driven bring-up, calls `add_engine` once per registered filesystem
-instead of constructing one bare `Engine` directly. This is additive over
+instead of constructing one bare `Engine` directly (**as built:** the
+daemon does exactly that, with one engine, in `NodeRuntime::start`; no
+daemon hosts more than one filesystem yet). This is additive over
 plan 21, not a rework of it: a single-filesystem daemon is `EngineHost` with
 one entry, and plan 21's "one name resolves to one `Engine`'s views"
 semantics is unchanged.
 
 ## 5. C3's module move list: what goes to `constellation-engine`, what stays, and what's tangled
+
+*(Historical: this is the move list as planned, against `crates/cli/src` at
+`a945b05`; the line and module counts are not kept current. C3 carried it out:
+PROGRESS "Plan 31 C3".)*
 
 `crates/cli/src` has exactly 50 `.rs` names at the top level plus
 `coop/{exact,fresh}.rs` (VERIFIED `ls crates/cli/src/`; VERIFIED `ls
@@ -437,13 +466,21 @@ research, cross-checked) gives the concrete shape `Vfs` has to match:
 ### 6.2 The `Vfs` trait, `OpCtx`, `Responder<T>`
 
 ```rust
-// constellation-vfs — the frontend contract. No frontend, and no
-// constellation-engine internal, is FUSE-shaped past this file.
+// constellation-vfs — the frontend contract (crates/vfs/src/{vfs,ctx,responder,types}.rs),
+// AS BUILT. No frontend, and no constellation-engine internal, is FUSE-shaped
+// past this crate.
+//
+// Every op takes `cx: &OpCtx<'_>` first and its responder `r: R` last (both
+// elided in the trait below). Inodes are the view's numbering (ROOT_INO = 1);
+// file ops take the inode AND the handle `open` gave (`ino`, `fh: Fh`), as
+// FUSE delivers them — the view addresses by inode, the handle is carried for
+// the handle table a session handover exports (§6.11).
 
 pub struct OpCtx<'a> {
     pub op: OpId,
     pub kind: OpKind,
     pub caller: &'a Caller,
+    pub lock_owner: Option<u64>,        // the kernel's fcntl-lock owner of the request, where it says (plan 30 §M14)
     pub deadline: Option<Instant>,
     pub cancel: Option<&'a CancelToken>,
     pub span: &'a tracing::Span,
@@ -451,69 +488,88 @@ pub struct OpCtx<'a> {
 
 pub struct Caller {
     pub uid: u32,
-    pub gids: smallvec::SmallVec<[u32; 16]>,
+    pub gid: u32,
     pub pid: Option<u32>,
-    pub principal: Principal, // Posix{uid,gid} today; Sid (35), AppSignature (36), later
+    pub principal: Principal,           // Posix{uid,gid} today; Sid (35), AppSignature (36), later
+    // The supplementary groups are NOT an eager `gids: SmallVec<[u32; 16]>`: for FUSE
+    // that would read /proc/<pid>/status on every request. `Caller::supplementary()` /
+    // `in_group()` ask the host (constellation-platform's Process::supplementary_groups)
+    // once, on first use; a frontend that is handed the full list up front (NFS
+    // AUTH_SYS, a Windows token) uses `Caller::with_groups` and nothing is read.
 }
 
 /// Every op completes exactly once through its Responder. A fast path
 /// completes it inline, on the calling thread, monomorphised per
 /// frontend (no heap allocation, no dyn dispatch on the hot path). A
-/// slow path — a lock grant, a lease handoff round trip, a cold S3/peer
-/// fetch past the inline budget, an admission wait — moves the
-/// Responder to the engine's completion pool and returns the calling
+/// slow path — a lock grant, a cold chunk fetch, an fsync's durability
+/// wait — moves the Responder to another thread and returns the calling
 /// thread immediately. This generalises SyncHandle's
 /// oneshot-channel-plus-blocking_recv pattern (fusefs.rs:773-822) from
 /// "every caller blocks" to "the fast path never blocks, and only the
-/// ops that already have to wait defer."
+/// ops that already have to wait defer." A dropped, uncompleted Responder
+/// answers `Code::Io`, never leaves the op pending.
 pub trait Responder<T>: Send + 'static {
-    fn done(self, r: Result<T, VfsError>);
+    fn done(self, result: VfsResult<T>);   // VfsResult<T> = Result<T, VfsError>; a VfsError wraps a Code
 }
 
-/// A Responder that parks the calling thread. Exists for simple
-/// synchronous callers (tests, MockVfs scripts, a frontend not yet
-/// converted to true deferral) — it is not how a real kernel frontend
-/// answers a deferred op.
-pub struct Blocking<T>(std::sync::mpsc::SyncSender<Result<T, VfsError>>);
+/// A Responder that parks the calling thread: `Blocking::pair()` returns the
+/// responder and its `BlockingWait<T>` (`wait`, `wait_timeout`). Also
+/// `FnResponder` (calls a function) and `CollectDir`. For simple synchronous
+/// callers (tests, MockVfs scripts, ControlVfs) — not how a real kernel
+/// frontend answers a deferred op.
+pub struct Blocking<T>(std::sync::mpsc::SyncSender<VfsResult<T>>);
 
 pub trait Vfs: Send + Sync + 'static {
-    fn lookup<R: Responder<Entry>>(&self, cx: &OpCtx, parent: Ino, name: &Name, r: R);
-    fn getattr<R: Responder<Attr>>(&self, cx: &OpCtx, ino: Ino, fh: Option<Fh>, r: R);
-    fn setattr<R: Responder<Attr>>(&self, cx: &OpCtx, ino: Ino, fh: Option<Fh>, set: &SetAttr, r: R);
-    fn mknod<R: Responder<Entry>>(&self, cx: &OpCtx, parent: Ino, name: &Name, mode: u32, rdev: u32, r: R);
-    fn mkdir<R: Responder<Entry>>(&self, cx: &OpCtx, parent: Ino, name: &Name, mode: u32, r: R);
-    fn symlink<R: Responder<Entry>>(&self, cx: &OpCtx, parent: Ino, name: &Name, target: &[u8], r: R);
-    fn link<R: Responder<Entry>>(&self, cx: &OpCtx, ino: Ino, new_parent: Ino, new_name: &Name, r: R);
-    fn unlink<R: Responder<()>>(&self, cx: &OpCtx, parent: Ino, name: &Name, r: R);
-    fn rmdir<R: Responder<()>>(&self, cx: &OpCtx, parent: Ino, name: &Name, r: R);
-    fn rename<R: Responder<()>>(&self, cx: &OpCtx, parent: Ino, name: &Name, new_parent: Ino, new_name: &Name, flags: RenameFlags, r: R);
-    fn readlink<R: Responder<Vec<u8>>>(&self, cx: &OpCtx, ino: Ino, r: R);
-    fn statfs<R: Responder<StatFs>>(&self, cx: &OpCtx, ino: Ino, r: R);
-    fn open<R: Responder<Opened>>(&self, cx: &OpCtx, ino: Ino, flags: OpenFlags, owner: OpenOwner, r: R);
-    fn create<R: Responder<(Entry, Opened)>>(&self, cx: &OpCtx, parent: Ino, name: &Name, mode: u32, flags: OpenFlags, owner: OpenOwner, r: R);
-    /// ReadData = SmallVec<[Bytes; 4]> scatter, zero-copy from cache/mmap.
-    fn read<R: Responder<ReadData>>(&self, cx: &OpCtx, fh: Fh, off: u64, len: u32, r: R);
+    // Provided methods (defaults), not ops:
+    fn identity(&self) -> ViewIdentity;                       // the view's id and allowlisted metric label (§6.10)
+    fn frontend_negotiated(&self, caps: &FrontendCaps);       // what FUSE_INIT really settled (passthrough, zero-copy, single_worker)
+    fn forget(&self, ino: Ino);                               // the platform references `ino` no more AT ALL — the LAST forget (§6.11)
+    fn handover_blockers(&self) -> Vec<String>;               // why the view's state cannot leave this process (§6.11)
+    fn passthrough_probe(&self) -> Option<io::Result<File>>;  // plan 38
+
+    // The 31 ops:
+    fn lookup  <R: Responder<Entry>>(parent: Ino, name: &Name);
+    fn getattr <R: Responder<Attr>>(ino: Ino, fh: Option<Fh>);
+    fn setattr <R: Responder<Attr>>(ino: Ino, fh: Option<Fh>, set: &SetAttr);
+    fn readlink<R: Responder<Vec<u8>>>(ino: Ino);
+    fn mknod   <R: Responder<Entry>>(parent: Ino, name: &Name, mode: u32, rdev: Rdev);
+    fn mkdir   <R: Responder<Entry>>(parent: Ino, name: &Name, mode: u32);
+    fn symlink <R: Responder<Entry>>(parent: Ino, name: &Name, target: &[u8]);
+    fn link    <R: Responder<Entry>>(ino: Ino, new_parent: Ino, new_name: &Name);
+    fn unlink  <R: Responder<()>>(parent: Ino, name: &Name);
+    fn rmdir   <R: Responder<()>>(parent: Ino, name: &Name);
+    fn rename  <R: Responder<()>>(parent: Ino, name: &Name, new_parent: Ino, new_name: &Name, flags: RenameFlags);
+    fn open    <R: Responder<Opened>>(ino: Ino, flags: OpenFlags, owner: OpenOwner);
+    fn create  <R: Responder<(Entry, Opened)>>(parent: Ino, name: &Name, mode: u32, flags: OpenFlags, owner: OpenOwner);
+    /// ReadData: a SmallVec<[Bytes; 4]> scatter, zero-copy from the cache — or, on a
+    /// handle opened zero_copy, a file range the frontend's kernel reads itself (plan 38).
+    fn read    <R: Responder<ReadData>>(ino: Ino, fh: Fh, off: u64, len: u32);
     /// data: borrowed slice for the inline path, Bytes when the write must outlive the call.
-    fn write<R: Responder<u32>>(&self, cx: &OpCtx, fh: Fh, off: u64, data: WriteData<'_>, r: R);
-    /// The close-time flush fence (plan 30 cto=strict), per close(2).
-    fn flush<R: Responder<()>>(&self, cx: &OpCtx, fh: Fh, owner: OpenOwner, r: R);
-    /// Last close of this handle.
-    fn release<R: Responder<()>>(&self, cx: &OpCtx, fh: Fh, r: R);
-    /// The layered durability barrier: Local | Peer | Durable(S3).
-    fn fsync<R: Responder<()>>(&self, cx: &OpCtx, fh: Fh, level: Durability, r: R);
-    fn readdir(&self, cx: &OpCtx, dh: Fh, cookie: u64, plus: bool, sink: &mut dyn DirSink) -> Result<(), VfsError>;
-    fn fallocate<R: Responder<()>>(&self, cx: &OpCtx, fh: Fh, off: u64, len: u64, mode: FallocateMode, r: R);
-    fn seek<R: Responder<u64>>(&self, cx: &OpCtx, fh: Fh, off: u64, whence: SeekWhence, r: R); // SEEK_DATA/SEEK_HOLE
-    fn getxattr<R: Responder<Vec<u8>>>(&self, cx: &OpCtx, ino: Ino, name: &XattrName, r: R);
-    fn setxattr<R: Responder<()>>(&self, cx: &OpCtx, ino: Ino, name: &XattrName, value: &[u8], mode: SetXattrMode, r: R);
-    fn listxattr<R: Responder<Vec<XattrName>>>(&self, cx: &OpCtx, ino: Ino, r: R);
-    fn removexattr<R: Responder<()>>(&self, cx: &OpCtx, ino: Ino, name: &XattrName, r: R);
-    /// Only called if caps.cluster_locks; getlk/setlk(blocking)/unlock.
-    fn lock_test<R: Responder<LockStatus>>(&self, cx: &OpCtx, ino: Ino, owner: LockOwner, range: LockRange, r: R);
-    fn lock_acquire<R: Responder<()>>(&self, cx: &OpCtx, ino: Ino, owner: LockOwner, range: LockRange, sleep: bool, r: R);
-    fn lock_release<R: Responder<()>>(&self, cx: &OpCtx, ino: Ino, owner: LockOwner, range: LockRange, r: R);
-    /// Whole-view barrier: unmount, suspend, snapshot.
-    fn sync_view<R: Responder<()>>(&self, cx: &OpCtx, r: R);
+    fn write   <R: Responder<u32>>(ino: Ino, fh: Fh, off: u64, data: WriteData<'_>, flags: OpenFlags);
+    /// The close-time flush fence (plan 30 cto=strict), per close(2); drops `owner`'s locks.
+    fn flush   <R: Responder<()>>(ino: Ino, fh: Fh, owner: LockOwner);
+    /// Last close of this handle (`owner`: its flock owner).
+    fn release <R: Responder<()>>(ino: Ino, fh: Fh, flags: OpenFlags, owner: Option<LockOwner>);
+    /// The layered durability barrier (`Durability`).
+    fn fsync   <R: Responder<()>>(ino: Ino, fh: Fh, level: Durability);
+    /// The responder IS the DirSink: entries go into `r` (`add(ino, next_cookie, kind, name)`)
+    /// until it is full, then `r.done(..)` answers.
+    fn readdir <R: DirSink + Responder<()>>(ino: Ino, fh: Fh, cookie: u64, plus: bool);
+    fn statfs  <R: Responder<StatFs>>(ino: Ino);
+    fn fallocate<R: Responder<()>>(ino: Ino, fh: Fh, off: u64, len: u64, mode: FallocateMode);
+    fn seek    <R: Responder<u64>>(ino: Ino, fh: Fh, off: u64, whence: SeekWhence); // SEEK_DATA/SEEK_HOLE
+    /// Default: Code::NotImplemented (the frontend then copies by read and write).
+    fn copy_file_range<R: Responder<u64>>(ino_in: Ino, fh_in: Fh, off_in: u64, ino_out: Ino, fh_out: Fh, off_out: u64, len: u64, flags: CopyFlags);
+    fn getxattr<R: Responder<Vec<u8>>>(ino: Ino, name: &XattrName);
+    fn setxattr<R: Responder<()>>(ino: Ino, name: &XattrName, value: &[u8], flags: SetXattrFlags);
+    fn listxattr<R: Responder<Vec<XattrNameBuf>>>(ino: Ino);
+    fn removexattr<R: Responder<()>>(ino: Ino, name: &XattrName);
+    /// Only called if caps.cluster_locks. `LockSpec` = owner + range + kind.
+    fn lock_test   <R: Responder<LockStatus>>(ino: Ino, fh: Fh, lock: LockSpec);
+    fn lock_acquire<R: Responder<()>>(ino: Ino, fh: Fh, lock: LockSpec, sleep: bool);
+    fn lock_release<R: Responder<()>>(ino: Ino, fh: Fh, owner: LockOwner, range: LockRange);
+    /// Whole-view barrier: unmount, suspend, snapshot, a session handover.
+    fn sync_view<R: Responder<()>>();
 }
 ```
 
@@ -527,6 +583,13 @@ Notes tying this back to today's code:
   logic beneath the trait, not as frontend policy — a WinFsp or NFS
   frontend must see the same pending-write-aware size a FUSE frontend
   does, so this cannot become per-frontend code.
+- (As built: the trait has 31 ops and five provided methods; it grew
+  `copy_file_range` after C4 (commit `2acd591`) and the provided methods
+  `identity`, `frontend_negotiated`, `forget`, `handover_blockers` and
+  `passthrough_probe` as later work needed them: `identity` in C7a,
+  `frontend_negotiated` and `passthrough_probe` in plan 38 Z3b, `forget` for
+  the kernel's references to unlinked files (ADR-31 moved the counting into
+  the FUSE adapter), and `handover_blockers` for the session handover.)
 - `fallocate`/`seek` return `Code::NotSupported` (via the `Responder`) on
   frontends whose `FrontendCaps` don't declare them (NFSv4.1 has no
   ALLOCATE/DEALLOCATE, WinFsp's fallocate story is a plan-35 question) —
@@ -556,7 +619,12 @@ Notes tying this back to today's code:
    Initially only today's lock offload defers (`locks.rs`'s `lock-wait`
    thread, generalised — see below); conversion of the other
    `blocking_recv` sites (§6.1) is incremental, behind the same trait, no
-   frontend changes required per conversion.
+   frontend changes required per conversion. **As built:** blocking lock
+   waits, cold reads (C7b: completed from the engine's completion pool) and
+   `fsync` (plan 39: the engine's `fsync` pool) defer; lease waits were
+   measured and deliberately not converted (PROGRESS "Plan 31 C7b").
+   `FrontendCaps::deferrable` is an `OpKindSet`, as designed; the Linux
+   FUSE caps declare every op deferrable.
 2. **Ordering barrier.** Per-inode op ordering (`InodeOps`, §6.1) is an
    engine invariant, unconditionally enforced beneath `Vfs`. Frontends may
    issue concurrently; the engine guarantees the POSIX-visible order for
@@ -568,23 +636,46 @@ Notes tying this back to today's code:
    `Peer` = replicated to a peer, `Durable` = S3 CAS committed — matching
    `SyncHandle.fsync_s3` today); `sync_view` is a whole-view barrier used
    by unmount, suspend and snapshot.
-4. **Cancellation barrier.** A `CancelToken` is set by FUSE INTERRUPT (not
-   available in fuser 0.18 — see the gap below), WinFsp cancel, NFS
-   disconnect, or a control-client `Cancel` frame (§10). The engine checks
+4. **Cancellation barrier.** A `CancelToken` is set by FUSE INTERRUPT (on
+   Linux FUSE for some op classes — see "As built" below), WinFsp cancel,
+   NFS disconnect, or a control-client `Cancel` frame (§9.3). The engine checks
    it at every wait point and completes with `Code::Intr`. Cancellation
    never leaves partial metadata: writes are either applied or not — this
    is not new work, it is a restatement of what plan 30's `mutate_op_rebasable`
    already guarantees for the rebase path.
 
-   **Known gap, carried forward explicitly rather than silently dropped:**
-   fuser 0.18 delivers no `FUSE_INTERRUPT` (VERIFIED, doc comment
+   **Known gap when this plan was written, since closed for Linux FUSE:**
+   fuser 0.18 delivered no `FUSE_INTERRUPT` (VERIFIED then, doc comment
    `crates/cli/src/locks.rs:35` and `:238`: "fuser 0.18 has no
-   `FUSE_INTERRUPT`: such a wait cannot be cancelled from the application").
-   A Linux FUSE-frontend `CancelToken` is therefore **never set by the
-   kernel** today; it exists in the trait for NFS/WinFsp/control-client
-   cancellation and for tests. This is not a regression C4 introduces — it
-   documents an existing Linux FUSE limitation in the frontend-neutral
-   layer instead of leaving it implicit in `locks.rs`'s comments.
+   `FUSE_INTERRUPT`: such a wait cannot be cancelled from the application"),
+   so a Linux FUSE `CancelToken` could never be set by the kernel and
+   existed for NFS/WinFsp/control-client cancellation and for tests.
+
+   **As built:** the fuser fork the tree builds against (a `[patch]` entry
+   in `Cargo.toml`, §6.11) carries an `interrupt` branch that delivers
+   `FUSE_INTERRUPT`, and the FUSE adapter wires it (plan 39 §3.3; module
+   doc of `crates/frontend-fuse/src/adapter.rs`, `Interrupts`). A request
+   registers its `CancelToken` under one of two policies: (1) **killable,
+   not interruptible** — `fsync`/`fsyncdir`, `O_SYNC`/`O_DSYNC` writes and
+   `copy_file_range`: an interrupt alone cancels nothing (the kernel sends
+   one for any signal, a handled `SIGINT` included); the token is set once
+   the calling thread has a fatal signal pending (checked at once, then
+   every 100 ms), the engine's wait ends and the data stays pending;
+   (2) **interruptible** — a blocking lock (`F_SETLKW`, `F_OFD_SETLKW`,
+   `flock` without `LOCK_NB`): any interrupt sets the token and the wait
+   answers `EINTR` holding nothing, as POSIX has it
+   (`ClusterLocks::set` in `crates/engine/src/locks.rs` checks the token
+   between the polls of a wait on a conflicting lock of its own node and
+   before each request to the sequencer; a request the owner has parked
+   because another node holds a conflicting grant is not withdrawn). Every
+   other op ignores interrupts. Over FUSE-over-io_uring the interrupt can be
+   lost, so the adapter also checks the calling task's `/proc` state for
+   those requests. So the token **is** set by Linux FUSE, for these op
+   classes, and the conformance kit's `cancellation` group tests a target
+   that declares its waits cancellable (`Declared::cancellable_waits`); the
+   engine target's declaration and the group's four tests are tracked in
+   PROGRESS "Plan 31 C6" and "Plan 31 closing".
+
 5. **Backpressure barrier.** Admission control per view: in-flight ops,
    staging bytes, forward queue depth. Ops over the limit defer, never
    spin; past the deadline they complete with `Code::Again` or
@@ -622,8 +713,9 @@ to whatever completion type each frontend's adapter wraps.
 ### 6.4 Threading contract
 
 - Ops may be called from any thread that is **not** a tokio runtime worker
-  (debug-asserted in `OpCtx::new`), matching CONVENTIONS.md's existing rule
-  ("never block the tokio runtime with sync waits").
+  (debug-asserted in `OpCtx::new` — an item of plan 31 closing; PROGRESS
+  "Plan 31 closing" records whether it landed), matching CONVENTIONS.md's
+  existing rule ("never block the tokio runtime with sync waits").
 - Frontends own their dispatch threads: FUSE workers (today, one dedicated
   OS thread per mount running `session.run()` — VERIFIED
   `crates/cli/src/node_runtime.rs:1658-1682` — itself dispatching to
@@ -700,7 +792,14 @@ VERIFIED `kernel_inval.rs:88-90`). Implementations:
 
 - **FUSE**: `impl FrontendEvents for FuseNotifySink` wraps `fuser::Notifier`
   exactly as `impl NotifySink for fuser::Notifier` does today (VERIFIED
-  `kernel_inval.rs:141-149`) — a 1:1 rename, not a redesign.
+  `kernel_inval.rs:141-149`) — a 1:1 rename, not a redesign. **As built:**
+  the delivery machinery (the one notifier thread, the `InFlight` registry,
+  the TTL drop) is `crates/engine/src/kernel_inval.rs`; the FUSE sink is
+  `FuseNotifySink` (`crates/frontend-fuse/src/notify.rs`, with a gate that
+  drops notifications while a session is handed over). `Invalidation` is
+  `#[non_exhaustive]`, carries `NameBuf` names, and only `Entry`, `Attr` and
+  `Data` are produced today (`Deleted`, `Fenced` and `ViewClosing` are
+  defined, not produced).
 - **NFS** (34): change attributes plus delegation recall.
 - **WinFsp** (35): `FspFileSystemNotify`.
 - **SAF** (36): `ContentResolver.notifyChange`.
@@ -738,6 +837,22 @@ pub struct FrontendCaps {
                                           // engine offers none to a frontend that would drop it
 }
 ```
+
+**As built** (`crates/vfs/src/caps.rs`): `FrontendCaps` gained four fields
+after this sketch. `zero_copy` and `zero_copy_min_read` (plan 38 §3(d)/Z4:
+the frontend can answer a read with a file range its kernel reads itself;
+declared `false` and turned on once the session settled on zero-copy io_uring
+queues, through `Vfs::frontend_negotiated`); `reports_forget` (the frontend
+calls `Vfs::forget` when its platform lets go of an inode, so the view keeps
+a file it unlinked, data included, while the platform references it —
+`FrontendCaps::linux_fuse` declares `false` and the FUSE adapter's own caps,
+`constellation_frontend_fuse::caps`, `true`; ADR-31); and `single_worker`
+(one worker serves the view's requests in queue order; set by the session).
+`passthrough` is no longer "false everywhere": the FUSE session turns it on at
+`FUSE_INIT` when the kernel offered `FUSE_PASSTHROUGH` and the process may
+register backing files (plan 38 Z3b). The constructor is
+`FrontendCaps::linux_fuse(cluster_locks: bool)`; the harness's `Cap` is
+derived by `FrontendCaps::caps()`.
 
 Linux FUSE's instance is derived from what `fusefs_ops.rs` demonstrably
 supports today: `push_inval: Full` (kernel_inval.rs), `cluster_locks: true`
@@ -793,20 +908,74 @@ stall (`CONSTELLATION_FUSE_STALL_BACKTRACE=1`, via `platform::process`)
 carries over unchanged in mechanism, moved to `constellation-platform`
 since it's a host service (thread-signal delivery), not FUSE-specific.
 
-### 6.9 Performance targets (C0 baselines them; C4/C7 gate them)
+### 6.9 Performance targets (C4/C7 gate them; the C0 baseline was superseded)
 
 - VFS dispatch overhead ≤ 1 µs/op beyond the work itself (criterion
   `vfs-bench`, in-process, no kernel).
-- No per-op heap allocation for inline replies.
+- No per-op heap allocation for inline replies. **As built:** this holds for
+  the dispatch path — the `Observer` (op id, `vfs.op` span, metrics) adds
+  zero allocations — but not for the engine's `View` itself, which
+  allocates per op: `getattr` 4, `lookup` 11, `read` of a cached 4 KiB file
+  18 (60 when `vfs-bench` was added, 21 after C7b). They are held as
+  ceilings, not eliminated: `tests/perf-baseline.json` `vfs_bench.max_allocs_per_op`
+  (`observer/getattr` 0, `view/getattr` 4, `view/lookup` 11, `view/read` 18,
+  plus `alloc_slack` 0.5), enforced by `tests/perf-gate.sh`.
 - Zero-copy reads (`Bytes` from cache/mmap).
-- Harness `bench` and `fio-latency` p50/p99 within 3% of C0.
+- Harness `bench` and `fio-latency` p50/p99 within 3% of C0. **Superseded:**
+  see below.
 - pjdfstest stays 8798/8798.
+
+**Superseded: the C0 baseline.** C0 was to record harness `bench`,
+meta-bench, `fio-latency` p50/p99, pjdfstest and the full-matrix
+`--results-json` against the pre-refactor commit, so that C3, C4 and C7
+could gate "within 3% of C0". That measurement run was never made (PROGRESS
+"Plan 31 C0": pending, closed as superseded in "Plan 31 closing"), and a
+comparison with a tree that no longer builds the same way is not available
+retroactively. Every "within 3% of C0" / "within noise of the C0 baseline"
+sentence in this plan (§11 C0 and C3, §14, §15) is superseded by what the
+tree gates today:
+
+- `tests/perf-gate.sh` (`make perf-gate`; the nightly `performance` job; the
+  `perf-regression.yml` workflow runs its first stage alone). Stage 1,
+  `vfs-bench` (`crates/engine/benches/vfs_bench.rs`, release build): fails
+  when any inline op's dispatch overhead (the `Observer` path minus a bare
+  `OpCtx::new` plus responder, the median of alternating rounds) reaches
+  1000 ns, or when the observed path allocates more per op than the bare one
+  (none at all with no backend; more than half an allocation over one
+  otherwise), or when a backend's own allocations per op exceed the
+  ceilings above. Stage 2, the harness `bench` (500 files of 4 KiB, fanout
+  25, the median of 3 runs): eight rates — import, durable import,
+  write-back import, write-back durable import, metadata walk, cold read,
+  sequential cold read, warm random read IOPS — must each stay above its
+  committed floor, `baseline × (1 − 0.20)`: a **20%** rate floor
+  (`tolerance` in `tests/perf-baseline.json`), not 3%. The floors are
+  host-specific numbers from the CI runner; PROGRESS "Plan 31 C7b" records
+  that they do not fit the development host.
+- `.github/workflows/perf-regression.yml`: the corpus-replay suite
+  (`tests/perf_regression/`) on a hosted runner in three network profiles; a
+  pull request is compared with the latest run on `main` and the report goes
+  to the job summary and one PR comment. It is a comparison (changes under
+  ±15% are printed in small type), not a threshold; the workflow's only
+  threshold is the `vfs-bench` stage above.
+- `tests/read-cpu-gate.sh` (plan 38 §6): the daemon's CPU-seconds per GiB and
+  peak RSS on a real mount against `tests/read-cpu-baseline.json`
+  (host-specific); the nightly lane records against a baseline of its own and
+  does not gate.
+- pjdfstest: `docker compose --profile test run --rm compliance`, 8798/8798
+  against an empty known-failure baseline (`tests/pjdfstest-baseline.txt`).
+- Not held to a number: `fio-latency` p50/p99 and meta-bench have no
+  committed baseline (`fio-latency` is a pass/fail harness scenario).
 
 ### 6.10 Observability
 
 - Every op gets an `OpId` and a tracing span, frontend → engine → S3/P2P.
 - Metrics: `constellation_vfs_ops_total{frontend,op,outcome}` and
-  `constellation_vfs_op_seconds{frontend,op}` histograms.
+  `constellation_vfs_op_seconds{frontend,op}` histograms. **As built:** the
+  series also carry `view` (only the allowlisted label, `pv`, §9.10) and
+  `transport`; they are recorded by `constellation_vfs::Observer` when the
+  op's responder completes. The `ControlVfs` browse ops are not instrumented
+  yet (plan 31 closing item; PROGRESS "Plan 31 closing" records whether it
+  landed).
 - `OpWatch`'s stalled-op registry is exposed by control `node.ops` and
   `stats.subscribe` (§10); `/metrics` keeps working.
 
@@ -831,31 +1000,72 @@ kernel ever seeing an unmount**.
                                      // or handed over from a prior process)
   }
   ```
-- **`FuseSession::detach()`/`resume()`** — the handover pair:
+- **`SessionControl::detach()` / `FuseSession::resume()`** — the handover
+  pair. **As built** (`crates/frontend-fuse/src/session.rs`; the names and
+  shapes differ from this plan's first sketch, a `SessionHandoff` holding
+  `fuse_fd`/`handles`/`view`/`init` and a consuming `FuseSession::detach`):
   ```rust
-  pub struct SessionHandoff {
+  pub struct FuseHandoff {                  // the connection
       pub fuse_fd: OwnedFd,
-      pub handles: HandleTableSnapshot, // open file handles, their flags/owners
-      pub view: ViewSpec,
-      pub init: NegotiatedInit,         // the FUSE_INIT params the kernel already agreed to
+      pub init: NegotiatedInit,             // the FUSE_INIT params the kernel already agreed to
+      pub mountpoint: Option<PathBuf>,
+      pub foreign: bool,                    // somebody else made the mount (PreopenedFd)
+      pub passthrough: PassthroughHandoff,  // plan 38 Z3b
+      pub refs: RefsHandoff,                // the kernel's lookup counts (below)
   }
-  impl FuseSession {
-      /// Stops reading /dev/fuse, drains in-flight ops (sync_view-equivalent,
-      /// §6.3), and returns everything the next process needs. The kernel
-      /// queues requests for this fd for the whole gap — it never sees an
-      /// unmount, so there is no ENOTCONN window for a caller mid-syscall.
-      pub fn detach(self) -> SessionHandoff;
-      /// Resumes serving fuse_fd with the given negotiated init params and
-      /// handle table, WITHOUT re-running the FUSE_INIT handshake.
-      pub fn resume(handoff: SessionHandoff, fs: impl Vfs) -> io::Result<FuseSession>;
+  pub struct SessionHandoff<S> {            // everything the next server needs
+      pub fuse: FuseHandoff,
+      pub view: S,                          // the host's exported view state; the daemon's S is
+  }                                         // engine::ViewHandoff { spec, handles: HandleTableSnapshot }
+  impl SessionControl {                     // the running session's handle: FuseSession::control()
+      /// Stops reading /dev/fuse, drains the deferred reads and fsyncs,
+      /// publishes pending writes (sync_view, §6.3), then runs `export` on
+      /// the quiescent view and returns everything the next process needs.
+      /// The kernel queues requests for this fd for the whole gap — it
+      /// never sees an unmount, so there is no ENOTCONN window. On any
+      /// refusal the session keeps serving and nothing was exported.
+      pub fn detach<S>(&self, export: impl FnOnce() -> S) -> Result<SessionHandoff<S>, DetachError>;
+      /// The same with the wait for the reads and fsyncs bounded by `drain`.
+      pub fn detach_within<S>(&self, drain: Option<Duration>, export: impl FnOnce() -> S)
+          -> Result<SessionHandoff<S>, DetachError>;
+  }
+  impl<V: Vfs> FuseSession<V> {
+      /// Serves the connection WITHOUT re-running the FUSE_INIT handshake.
+      pub fn resume(handoff: FuseHandoff, view: Arc<V>, opts: &MountOptions,
+                    caps: FrontendCaps, sink: Option<&FuseNotifySink>) -> io::Result<FuseSession<V>>;
   }
   ```
-  `View::export_handles() -> HandleTableSnapshot` and `Engine::open_view_resumed(spec:
-  ViewSpec, handles: HandleTableSnapshot, caps, events) -> View` are the
+  `detach` is a method of `SessionControl`, not of `FuseSession`, because a
+  session runs on a thread of its own (`FuseSession::run(self)`) and the
+  handle outlives that move.
+  `View::export_handles() -> HandleTableSnapshot`, `Engine::export_view(&View)
+  -> Result<ViewHandoff>` and `Engine::open_view_resumed(spec: ViewSpec,
+  handles: HandleTableSnapshot, caps, events) -> Result<Arc<View>>` are the
   engine-side counterparts: inode numbers are already stable meta inodes
-  (nothing to reconcile there), so the only state that does not already live
-  in `Meta`/`fjall` and needs to cross the handover explicitly is the
-  open-file-handle table (`fh` → inode/flags/owner).
+  (nothing to reconcile there), so the state that does not already live in
+  `Meta`/`fjall` and needs to cross the handover explicitly was, as first
+  designed, the open-file-handle table (`fh` → inode/flags/owner).
+  **As built, that was not the whole list: the kernel's lookup counts
+  cross too** (commit `91591c6`, ADR-31 in `docs/explanation/DECISIONS.md`).
+  The view still keeps no lookup table, but the FUSE adapter does
+  (`KernelRefs`, `crates/frontend-fuse/src/refs.rs`): every successful entry
+  reply (`LOOKUP`, `MKNOD`, `MKDIR`, `SYMLINK`, `LINK`, `CREATE`) counts its
+  node id before the reply is written, each `FORGET` subtracts, and
+  `Vfs::forget` is called only for the last one, when the count reaches
+  zero. The kernel also sends partial forgets for inodes it still holds (a
+  dentry revalidation that answers another node id, an entry it fails to
+  instantiate), and a view that reaps an unlinked file at `forget` must not
+  see those. In doubt the inode is kept, a bounded leak rather than a reap
+  under a live reference. The counts cross the handover as
+  `FuseHandoff::refs`, and in the daemon's own wrapper as
+  `MountHandoff::refs` (`crates/cli/src/handover.rs`: the `daemon --upgrade`
+  memfd and plan 37's handoff socket), taken once the workers stopped and
+  imported before the next server reads, because a `FORGET` queued during
+  the gap subtracts from them. The handoff changed shape in place (the
+  maintainer's rule: no version bump, no compatibility shim), so an
+  unreadable handoff is not fatal: the new image hands it back to the
+  previous executable, which resumes the views as a rollback, and
+  `daemon --upgrade` reports that the upgrade did not happen.
 - **Risk, verified against the vendored source, not assumed:**
   `fuser` 0.18's `Session::new` and `Session::from_fd` (VERIFIED
   `fuser-0.18.0/src/session.rs:169-215`) both end by calling
@@ -873,18 +1083,19 @@ kernel ever seeing an unmount**.
   "skip INIT, I already have `NegotiatedInit`" entry point (VERIFIED: `Session`'s
   only two constructors are `new` and `from_fd`, both above; no `cfg`, flag,
   or third constructor bypasses `handshake()`).
-  **Conclusion: this needs a small vendored `fuser` patch**, in the
+  **Conclusion: this needs a small `fuser` patch**, carried at first in the
   `vendor/fjall` style already established in this workspace (VERIFIED
   `vendor/fjall/CONSTELLATION-PATCH.md`: a `[patch.crates-io]` path
   dependency, excluded from the workspace `exclude` list, with the exact
-  upstream version, checksum and a hunk-level changelog). The shape of the
-  fix is narrow: a `Session::from_fd_resumed(fs, fd, acl, config,
-  proto_version: Version)` constructor that sets `self.proto_version =
-  Some(proto_version)` directly (the field `handshake()` would otherwise
-  populate) and calls `run()` without ever calling `handshake()`. C4 scopes
-  and lands this patch (`vendor/fuser/`); plan 37's K0 proves it end-to-end
-  against a real kernel mount (session handover under a live writer, zero
-  `ENOTCONN`).
+  upstream version, checksum and a hunk-level changelog) and since moved to
+  a git fork (see "As built" in the next bullet). The shape of the fix is
+  narrow: a `Session::from_fd_resumed(fs, fd, acl, config, init:
+  NegotiatedInit)` constructor (as built it takes the whole `NegotiatedInit`
+  the first server's handshake agreed, not just the protocol `Version`) that
+  installs it directly (what `handshake()` would otherwise populate) and
+  serves without ever calling `handshake()`. C4 scoped and landed this patch;
+  plan 37's K0 proved it end-to-end against a real kernel mount (session
+  handover under a live writer, zero `ENOTCONN`).
 - **Vendoring and maintenance model: adopt Mountpoint's, not a one-off
   patch file.** AWS carries its own fuser fork the same way, but as a
   fully maintained copy rather than a single small patch: a separate crate
@@ -901,6 +1112,17 @@ kernel ever seeing an unmount**.
   on a conflict rather than silently dropping a hunk; `vendor/fuser/CONSTELLATION-PATCH.md`
   lists each patch by name, the upstream version it applies to, and why it
   exists, exactly like `vendor/fjall`'s changelog does today.
+  **As built (commit `18ab365`):** `vendor/fuser/`, its
+  `CONSTELLATION-PATCH.md` and `tools/vendor-fuser.sh` no longer exist. The
+  patches — session handover (`from_fd_resumed`), the io_uring transport
+  (plan 38), the ring's idle wait and `FUSE_INTERRUPT` (plan 39) — are one
+  branch each in a git fork of fuser 0.18, whose `replicix` branch merges
+  them; the fork documents each patch and the issues offered upstream in
+  files of its own. `Cargo.toml`'s `[patch.crates-io]` section pins the fork
+  by `rev` (with a comment naming the branches), so updating fuser or a
+  patch is a change of that `rev`, not a script run in this repository.
+  (`vendor/fjall`, `vendor/lsm-tree` and `vendor/netwatch` remain vendored,
+  each with its `CONSTELLATION-PATCH.md`.)
 - **Checked against Mountpoint's fork, and found to need independent
   design — this was verified, not assumed.** Mountpoint's own fuser fork
   moved `INIT` handling out of a dedicated blocking pre-loop and into the
@@ -928,14 +1150,27 @@ kernel ever seeing an unmount**.
   `from_fd_resumed` being a parallel code path that skips dispatch
   altogether. C4 decides between the two shapes when it lands the patch;
   either way the harness scenario in this section is what proves it works,
-  not the shape of the constructor.
+  not the shape of the constructor. **As built:** C4 chose the dedicated
+  `from_fd_resumed` constructor, not the folded dispatch loop (fuser 0.18's
+  loop already answers a stray `INIT` with `EIO` and reads no per-connection
+  init state, so an `initialized` flag would have guarded nothing; PROGRESS
+  "Plan 31 C4b", "fuser patch choice").
 - **Plain-Linux benefit, not just a CSI one.** The same primitive gives
   `constellation daemon --upgrade`: replace the running daemon binary with
   a new version while a mount stays live, by detaching the session, execing
   (or launching) the new binary with the inherited fd, and resuming — no
   `umount`/`mount` cycle, no window where the mountpoint returns
   `ENOTCONN` to a process with an open fd on it. This is exercisable and
-  gated on plain Linux, independent of plan 37 ever landing.
+  gated on plain Linux, independent of plan 37 ever landing. **As built:**
+  the shipped `constellation daemon --upgrade` is an in-place `exec` of the
+  new binary with the connections as inherited descriptors, not a second
+  process: the pid, `daemon.lock` (an `flock` on an open file the new image
+  inherits), `daemon.pid` and the control socket's listener all carry over,
+  and the handoff travels in a memfd (`crates/cli/src/handover.rs`; the
+  control method is `node.handoff{target: Exec}`). Handing sessions to
+  *another process* is plan 37's `node.handoff{target: Socket}`
+  (`crates/cli/src/handoff_socket.rs`, in prepare/commit/abort phases a node
+  plugin drives).
 - **Harness/test implications (a C4 gate item, not deferred to plan 37):**
   a new harness scenario category exercises session handover on Linux:
   detach/resume with no in-flight ops (baseline correctness), and an
@@ -943,7 +1178,8 @@ kernel ever seeing an unmount**.
   `constellation daemon --upgrade` mid-write, and asserts zero `ENOTCONN`/
   `EIO` observed by the writer and that every write either lands or is
   cleanly retried — this is the concrete, automatable proof that the
-  `vendor/fuser` patch actually closes the gap, not just that it compiles.
+  session-handover patch actually closes the gap, not just that it compiles
+  (the scenarios are `session-handover-idle` and `upgrade-under-load`).
 
 ### 6.12 Subtree confinement: a `View` guarantee
 
@@ -1079,13 +1315,50 @@ Linux-errno/makedev encodings are not migrated.
 
 ## 8. Validation and testing architecture
 
-- **`vfs::conformance`**: a kernel-free suite driving `Vfs` with the
-  `model` oracle (VERIFIED `crates/model`, 12,335 lines — the existing
-  oracle the harness already checks against) and seeded workloads (the
-  harness's `Workload` idea). Covers concurrency (multi-thread,
-  multi-handle), cancellation, deferral, and invalidation-event assertions.
-  Runs against `Engine`+`View` with every frontend's `PolicyStack`+
-  `FrontendCaps` combination, on every OS in CI (on-device for Android).
+- **`vfs::conformance`**: a kernel-free suite driving `Vfs` with an oracle
+  and seeded workloads (the harness's `Workload` idea). Covers concurrency
+  (multi-thread, multi-handle), cancellation, deferral, and
+  invalidation-event assertions. Designed to run against `Engine`+`View`
+  with every frontend's `PolicyStack`+`FrontendCaps` combination, on every OS
+  in CI (on-device for Android).
+  **As built** (C6b, commit `b265b6f`; `crates/vfs/src/conformance/`, feature
+  `conformance` of `constellation-vfs`):
+  - **The oracle is the kit's own, not `crates/model`.** This section's
+    first draft named `crates/model`; that crate is a Stateright model of the
+    authority protocol (one flat directory of two names, create and unlink
+    only): it checks a replication algorithm and cannot judge a `Vfs`. The
+    kit's `oracle.rs` is a small path-based model of the namespace and
+    content that the sequential and concurrent model tests replay a seeded
+    workload against, comparing every op's outcome and the final tree.
+  - **Nine groups** — `namespace`, `io`, `xattr`, `readdir`, `concurrency`,
+    `deferral`, `cancellation`, `invalidation`, `confinement` — with 80 tests
+    at C6b and 92 now (the 12 added: six `copy_file_range` tests, two cold-read
+    deferral tests from C7b, the close and `fallocate` time-stamping tests,
+    `rename_exchange_across_directories` and
+    `snapshot_mirrors_copy_out_and_never_in`). Each test is seeded,
+    declares the capabilities it needs, and reports passed, failed or
+    skipped with a reason that names the capability as a whole word
+    (`requires capability ClusterLocks`), the spelling `tests/parity.py`
+    matches. A target can also skip a test for what only the fixture can say
+    (no snapshot hook, no second view, waits that ignore a `CancelToken`).
+  - **Targets.** The reference target (`MockVfs` over its in-memory `RefFs`)
+    runs in-crate for three capability sets: `FrontendCaps::linux_fuse(true)`,
+    `linux_fuse(false)` and a bare set that can do very little. The engine's
+    `View` runs from `crates/engine/tests/conformance.rs` (the instantiation
+    is described in `ENGINE_TARGET.md` next to the kit) for two sets, both
+    Linux-FUSE-shaped with cluster locks (`linux_fuse(true)`, and the same
+    with `reports_forget`); no capability-poor set is run against the engine.
+    As of the start of the plan 31 closing the engine target skipped 9
+    tests: the 4 `cancellation` tests (it declared `cancellable_waits:
+    false`) and the 5 `invalidation` tests (it offered no second-view
+    fixture). Whether that changed is in PROGRESS "Plan 31 C6" and "Plan 31
+    closing".
+  - **Where it runs.** The nightly `conformance` job (Linux) runs
+    `cargo test -p constellation-vfs --features conformance` and
+    `cargo test -p constellation-engine --test conformance`; the kit writes
+    `conformance-<lane>.json` in the harness results shape when
+    `CONSTELLATION_CONFORMANCE_RESULTS` is set, but no CI job feeds it to
+    the parity checker.
 - **`MockVfs`** for frontend-adapter unit tests: records calls, scripts
   replies — this is what lets a `constellation-frontend-fuse` or
   `-winfsp` adapter's translation logic (not the engine underneath) get
@@ -1122,6 +1395,26 @@ Linux-errno/makedev encodings are not migrated.
     s3 sync`, per plan 34's interop-lane design — reused here rather than
     redesigned, since it already proves cross-OS journal/errno portability
     end to end).
+  - **As built** (C6a/C6b, commits `ceca163`, `b265b6f`): `--frontend`
+    accepts `fuse` only. `Scenario.caps` lists `Cap`s derived from
+    `FrontendCaps` (`crates/harness/src/caps.rs`); `harness run` skips a
+    scenario the frontend lacks a capability for with `requires capability
+    <Cap>`, and `--without-cap <Cap>` runs as a frontend lacking one, to
+    exercise that path. `--s3-backend process` runs a native `versitygw` and
+    `toxiproxy-server` (pinned versions in `tests/ci/install-native-s3.sh`),
+    and signs the harness's own raw S3 calls with SigV4 under that backend
+    only (`crates/harness/src/s3auth.rs`, checked against AWS's published
+    vectors); the lane name is `<os>-<frontend>` plus `-process`, recorded
+    in the results JSON. `Client` reaches the mount table, `kill` and
+    `SIGSTOP`/`SIGCONT` through `constellation-platform` (`Process::suspend`,
+    `resume`, `kill` were added); the rest of the harness (scenarios, the
+    sandbox, the spawner) still calls `libc` directly, so the harness does
+    not yet compile for macOS — the `constellation-harness` entry of
+    `tools/check-cross-known-failures.txt`; moving those calls behind
+    `constellation-platform` is a plan 31 closing item. `harness interop
+    write|verify` moves the bucket as a plain directory (`--bucket-dir`, with
+    a `file` or a `process` backend) rather than through `aws s3 sync`; no
+    CI job runs it yet.
 - **Parity**: `tests/platform-parity.toml` + `tests/parity.py`, lanes
   named `<os>-<frontend>` (reference: `linux-fuse`). Only
   `skipped`-with-reason may differ from the reference; entries are
@@ -1129,20 +1422,29 @@ Linux-errno/makedev encodings are not migrated.
   check too, exactly like the existing xfstests baseline convention).
   `tests/parity.py` supports any number of lanes from day one, each
   against its own declared reference, so plan 34/35/36 each add a lane
-  without touching the checker.
+  without touching the checker. **As built:** also `--require-lane` (a lane
+  that must have results) and `--absent-lane` (a lane deliberately not run);
+  31 unit tests in `tests/test_parity.py`, including deliberate-mismatch
+  cases that prove it fails closed; and `tests/platform-parity.toml` now
+  carries the `linux-csi` lane's `[[expect]]` entries (plan 37 §12, 16
+  entries), besides the empty `linux-fuse-process` expectations.
 - **`make check-cross`**: type-checks the whole workspace for
   `aarch64-apple-darwin` and the library crates (everything except
   `crates/cli`, which stays Unix-heavy until a WinFsp frontend exists) for
   `x86_64-pc-windows-gnu`, via zig-cc wrappers. No `tools/` directory or
-  Makefile target for this exists yet (VERIFIED: `tools/` absent,
-  `Makefile` has no `check-cross`/`check-darwin` target today) — C0
-  creates both, adapting plan 34's already-drafted recipe (`CC_aarch64_apple_darwin`
+  Makefile target for this exists yet (VERIFIED then: `tools/` absent,
+  `Makefile` has no `check-cross`/`check-darwin` target — C0 created both,
+  `tools/check-cross.sh` and the `check-cross` target), adapting plan 34's already-drafted recipe (`CC_aarch64_apple_darwin`
   → `zig cc -target aarch64-macos` under `tools/zcc`, `AR=zig ar`; same
   wrapper exposes `-target x86_64-windows-gnu`).
 
 ## 9. The control protocol
 
 ### 9.1 Today's protocol, precisely
+
+*(History: this is the pre-C5 protocol. `crates/api` was deleted in C5; the
+protocol in the tree is `constellation-control`, §9.3 onward. The citations
+below are to the deleted crate.)*
 
 Line-delimited JSON, one `Request` per line, one `Response` per line
 (VERIFIED module doc `crates/api/src/lib.rs:1-7`), over a unix socket at
@@ -1237,6 +1539,10 @@ mapping.
 `types.rs:96-103`, "dispatch treats it identically") — the control protocol
 collapses it to one method; the old alias is simply dropped (the old
 protocol itself is deleted, not shimmed — §2).
+
+*(As built: the control method table has 57 methods at C5 and 72 now — plans
+32, 33 and 37 added snapshot-policy, security and CSI methods; `METHODS` in
+`crates/control/src/methods.rs` is the list.)*
 
 **New methods**, none of which exist in `Request` today: `fs.*`
 (registry list/create/import/export/passwd/doctor — `Manager`'s API,
@@ -1342,14 +1648,24 @@ files are current.
 
 `ControlService` is implemented by the engine plus `Manager` — the same
 object the CLI calls in-process and the daemon serves over
-`constellation-control`. `ControlVfs` implements `Vfs` (§6) by wrapping
-`Engine`/`View` with the authenticated control-protocol principal as
-`Caller` — this is the brief's "browse/transfer is just another frontend"
-made concrete: the UI's file browser, upload/download and rename/delete
-(DESIGN.md §10's "file browser (rename/move/delete/up/download, inspect,
-history)") drive the exact same `Vfs` trait a kernel mount does, gaining
-every response-barrier guarantee (§6.3) for free instead of needing its
-own ad hoc correctness story.
+`constellation-control`. `ControlVfs` is a frontend of the engine like any
+other (§3): it drives a `View` through the `Vfs` trait (§6) as the
+authenticated control-protocol principal, the `Caller` — this is the brief's
+"browse/transfer is just another frontend" made concrete: the UI's file
+browser, upload/download and rename/delete (DESIGN.md §10's "file browser
+(rename/move/delete/up/download, inspect, history)") drive the exact same
+`Vfs` trait a kernel mount does, gaining every response-barrier guarantee
+(§6.3) for free instead of needing its own ad hoc correctness story.
+
+**As built:** the service is `EngineControl`, with `ControlHost` for what only
+a host can do (§4); the CLI's own in-process path to the `fs.*` operations
+and the control service's are separate implementations today, being unified
+(plan 31 closing). `ControlVfs` (`crates/engine/src/control/browse.rs`) does
+not itself implement `Vfs`: it is a path-addressed client of one `View`
+(`stat`, `read`, `write`, `mkdir`, `rename`, `delete`, `xattr`), turning a
+path into inode lookups and a call into `open`/`read`/`release` sequences
+completed through `Blocking` responders, on a view the service opens for
+itself.
 
 The existing web adapter keeps working, still loopback-only; plan 33 adds
 token auth on top of it.
@@ -1389,12 +1705,34 @@ file descriptor across the control connection, needed for `view.mount`'s
 `PreopenedFd` source (§6.11, §9.2 row 34):
 
 ```rust
-pub trait Transport: Send + Sync {
-    // ...existing framing methods...
-    fn send_fd(&self, fd: BorrowedFd<'_>) -> io::Result<()>;
-    fn recv_fd(&self) -> io::Result<OwnedFd>;
+// crates/control/src/transport/mod.rs -- as built
+pub struct Frame {
+    pub kind: FrameKind,
+    pub payload: Bytes,
+    pub fd: Option<OwnedFd>,       // bit 7 of the kind byte (FLAG_FD): one descriptor rides with this frame
+}
+impl Frame {
+    pub fn take_fd(&mut self) -> Option<OwnedFd>;   // the "recv_fd"; handlers get it as CallCtx::take_fd
+}
+pub trait Transport: Send + Sync + 'static {
+    fn send_frame(&self, frame: Frame) -> BoxFuture<'_, Result<(), TransportError>>;
+    fn recv_frame(&self) -> BoxFuture<'_, Result<Option<Frame>, TransportError>>;
+    fn supports_fd_passing(&self) -> bool;
+    fn peer(&self) -> Principal;
+    fn name(&self) -> &'static str;
+    /// Provided: attaches a duplicate of `fd` (the caller keeps its own) to a new frame.
+    fn send_fd<'a>(&'a self, kind: FrameKind, payload: Bytes, fd: BorrowedFd<'a>)
+        -> BoxFuture<'a, Result<(), TransportError>>;
 }
 ```
+
+The fd is part of the frame, not a separate call as first sketched
+(`send_fd(fd)` / `recv_fd() -> OwnedFd`): two calls cannot tell the receiver
+*which request* a descriptor belongs to when calls interleave. On the unix
+socket the receiver pairs the *n*-th flagged frame with the *n*-th descriptor
+`recvmsg` delivered. A request that *needs* an fd on a transport that cannot
+carry one is refused with `Code::NotSupported` by the router before any
+handler runs (`Transport::supports_fd_passing`).
 
 - **`UnixSocket`**: `SCM_RIGHTS` ancillary data alongside the frame —
   the standard unix-domain-socket fd-passing mechanism, and the transport
@@ -1493,7 +1831,11 @@ an accepted cost.
 ### C0 — Baselines and guardrails
 
 - Record perf baselines: harness `bench`, meta-bench, fio-latency p50/p99,
-  pjdfstest, harness `--results-json` for the full matrix.
+  pjdfstest, harness `--results-json` for the full matrix. **Superseded:**
+  this bullet was never carried out against the pre-refactor commit; what
+  gates performance instead is `tests/perf-gate.sh` with
+  `tests/perf-baseline.json` (plus `perf-regression.yml` and the nightly
+  `performance` job) — see §6.9 for exactly what each gates.
 - Add `--results-json` and `--shard` to the harness (§8) — first, so every
   later milestone's runs are machine-comparable from the start.
 - Add `make check-cross` (§8) and the `tools/zcc` zig-cc wrapper; currently
@@ -1560,7 +1902,8 @@ an accepted cost.
   defines `constellation-engine`'s first public API surface: every type
   the 35+5 modules exposed only as crate-private before now needs a
   deliberate `pub`/re-export decision, not a blanket `pub mod`.
-- **Gate**: full CONVENTIONS gates, perf within noise of the C0 baseline.
+- **Gate**: full CONVENTIONS gates, perf within noise of the C0 baseline
+  (**superseded**: §6.9).
 
 ### C4 — `constellation-vfs` contract, and FUSE rebuilt on it
 
@@ -1577,8 +1920,9 @@ an accepted cost.
   fuser's callback shape into `Vfs` calls and translating `Responder`
   completions back into fuser replies.
 - FUSE session handover (§6.11): `MountSource::{Path, PreopenedFd}`,
-  `FuseSession::detach`/`resume`, `View::export_handles`,
-  `Engine::open_view_resumed`, and the `vendor/fuser` patch that adds
+  `SessionControl::detach`/`FuseSession::resume`, `View::export_handles`,
+  `Engine::open_view_resumed`, and the fuser patch (first vendored as
+  `vendor/fuser`, since a pinned git fork, §6.11) that adds
   `Session::from_fd_resumed` (skips the `FUSE_INIT` handshake using an
   already-negotiated `NegotiatedInit`). Also lands `constellation daemon
   --upgrade` on plain Linux, exercising the primitive without plan 37.
@@ -1586,7 +1930,7 @@ an accepted cost.
   root, `.constellation` synthetic-path confinement, and `ViewSpec::confine_links`
   (`link()` across the boundary → `EXDEV`).
 - **Gate**: pjdfstest 8798/8798, harness full matrix, the §6.9 perf
-  targets, all on Linux, unchanged from C3's baseline, plus the new session
+  targets (as superseded there), all on Linux, plus the new session
   handover harness scenarios (§6.11): detach/resume with no in-flight ops,
   and an upgrade-under-load scenario asserting zero `ENOTCONN`/`EIO` for a
   sustained writer across `constellation daemon --upgrade`; plus the new
@@ -1614,8 +1958,9 @@ an accepted cost.
   lost when `crates/api` is deleted, and C5's gate includes plan 32's CLI
   tests if they exist. This is also the rule plan 32's own "Coordination"
   section and plan 37 both point back to.
-- `ControlService` implemented by the engine plus `Manager`; `ControlVfs`
-  browse (§9.7).
+- The control service bound to the engine (`EngineControl` and `ControlHost`;
+  the plan's `ControlService`/`Manager` pair was not built as such, §4, §9.7);
+  `ControlVfs` browse (§9.7).
 - Schema generation (`schemars`, TS types).
 - The existing web adapter keeps working, still loopback-only, now
   speaking the control protocol; 33 adds auth.
@@ -1637,6 +1982,12 @@ an accepted cost.
   `confinement` conformance group; the parity checker itself unit-tested
   against a synthetic results set with a deliberate mismatch, to prove it
   actually fails closed.
+- **As built:** C6a (`ceca163`: parity checker, process S3 backend, `harness
+  smoke`/`interop`, nightly lane jobs) and C6b (`b265b6f`: conformance kit,
+  `MockVfs`, wire tests, property tests, harness `Cap`). What was built, the
+  numbers, the known gaps (the engine target's 9 skips, the harness not yet
+  compiling for macOS) and which lanes have a recorded run are in PROGRESS
+  "Plan 31 C6" and "Plan 31 closing".
 
 ### C7 — Observability and performance hardening
 
@@ -1734,8 +2085,12 @@ an accepted cost.
 
 New job, added in C0, following the existing pattern (`dtolnay/rust-toolchain@stable`
 plus the pinned `rust-toolchain.toml`, `Swatinem/rust-cache@v2` — matching
-today's `ci.yml`, VERIFIED read in full: jobs `lint`, `test`, `integration`,
-`harness`).
+today's `ci.yml`, VERIFIED read in full then: jobs `lint`, `test`,
+`integration`, `harness`). **As built:** `ci.yml`'s jobs are now `lint`,
+`build`, `unit-test-archive`, `unit-test`, `doctest`, `csi-unit`,
+`integration`, `harness`, `transport-dev-fuse` and `cross-check`; the YAML
+blocks below are the C0/C6 sketches, and the notes after each say how the
+workflow differs.
 
 ```yaml
   cross-check:
@@ -1750,9 +2105,18 @@ today's `ci.yml`, VERIFIED read in full: jobs `lint`, `test`, `integration`,
       - run: make check-cross
 ```
 
-`nightly.yml` (VERIFIED job list today: `lint`, `unit`, `integration`,
+**As built** (`ci.yml` `cross-check`): the same, plus `rustup target add
+aarch64-apple-darwin x86_64-pc-windows-gnu` (`rust-toolchain.toml` pins the
+channel, so the pinned toolchain, not only `stable`, needs the targets) and a
+cache keyed `cross-check`. `tools/check-cross.sh` leaves
+`constellation-chaos` and `constellation-pod-load` (POSIX test tooling) out
+of the Windows library list, as it does `cli`, `harness`, `frontend-fuse` and
+`csi`; the one known failure left at the plan's close was `constellation-harness`
+on `aarch64-apple-darwin`.
+
+`nightly.yml` (VERIFIED job list then: `lint`, `unit`, `integration`,
 `compliance`, `harness`, `xfstests`, `performance`, `linux-package`,
-`macos`, `summary`) gains, across C6:
+`macos`, `summary`) gains, across C6 (the sketch; **as built** below):
 
 ```yaml
   harness-lanes-linux:
@@ -1796,6 +2160,25 @@ today's `ci.yml`, VERIFIED read in full: jobs `lint`, `test`, `integration`,
       - run: python3 tests/parity.py --expect tests/platform-parity.toml results/results-*.json | tee -a "$GITHUB_STEP_SUMMARY"
 ```
 
+**As built** (`nightly.yml`): `harness` is the `linux-fuse` reference lane
+(`harness run --results-json results-linux-fuse.json`, uploaded as
+`harness-linux-fuse`); `harness-lanes-linux` runs `linux-fuse-process` as
+sketched. `conformance` runs two commands, `cargo test -p constellation-vfs
+--features conformance` and `cargo test -p constellation-engine --test
+conformance -- --nocapture`, and uploads `conformance.log`. `parity` needs
+`[harness, harness-lanes-linux, conformance, kind-e2e]`; it first runs the
+checker's own unit tests (`python3 -m unittest discover -s tests -p
+'test_parity.py'`: a deliberate mismatch must fail closed), downloads every
+`harness-*` artifact, and requires the lanes `linux-fuse` and
+`linux-fuse-process`. `linux-csi` (plan 37 §12), produced by `kind-e2e` on a
+self-hosted FUSE-capable runner only, is `--require-lane` when the repository
+variable `CONSTELLATION_FUSE_RUNNER` is `true` and `--absent-lane`
+otherwise — so on a repository without that runner the parity job never
+compares it. The job list is now `lint`, `unit`, `integration`, `compliance`,
+`harness`, `harness-lanes-linux`, `conformance`, `parity`, `xfstests`,
+`performance`, `transport-matrix`, `zero-copy-7-3`, `linux-package`,
+`csi-sanity`, `kind-e2e`, `upgrade-under-load`, `macos`, `summary`.
+
 ### `tests/platform-parity.toml`, seeded for C6 (grows as 34/35/36 add lanes)
 
 ```toml
@@ -1832,6 +2215,13 @@ today's `ci.yml`, VERIFIED read in full: jobs `lint`, `test`, `integration`,
 Both blocks above were validated to parse: the YAML parses cleanly when
 wrapped under a top-level `jobs:` key (PyYAML), and the TOML parses with
 `tomllib`.
+
+**As built:** `tests/platform-parity.toml` is the C6a seed plus the
+`linux-csi` lane (plan 37 §12): 16 `[[expect]]` tables (9 named scenarios the
+lane covers through `k8s-scenario`s, 6 named "not yet ported (F6)" ones, and
+one `LocalClient` capability wildcard); `linux-fuse-process` still has none.
+The reserved lanes are `macos-nfs`, `linux-nfs`, `windows-winfsp` and
+`android-saf`.
 
 ## 13. Future ports (not planned in detail here)
 
@@ -1877,7 +2267,8 @@ store frontend, independent of which POSIX guarantees sit on top.
 - **C3/C4 are large mechanical refactors of the highest-stakes code in the
   tree** (the write path plan 30 spent 16 milestones hardening). Mitigation:
   both are declared behaviour-neutral with a hard gate (pjdfstest
-  8798/8798, full harness matrix, perf within 3%) — any delta is treated
+  8798/8798, full harness matrix, perf within 3% — the perf clause
+  superseded, §6.9) — any delta is treated
   as a bug in the milestone, not an acceptable refactor cost, and the
   5-module tangled list (§5) is scoped precisely enough in advance that
   there's no "discover the real shape mid-move" surprise.
@@ -1892,12 +2283,19 @@ store frontend, independent of which POSIX guarantees sit on top.
   lines 240-262) and can land as a temporary thin-adapter shim in C3,
   converted to a real `Responder` in C4 without a second migration of the
   arbitration logic underneath.
-- **fuser 0.18's missing `FUSE_INTERRUPT` means the Linux FUSE frontend's
-  `CancelToken` is inert in practice** (§6.3). Mitigation: documented
-  explicitly rather than silently absorbed into "cancellation works" — the
-  conformance kit's cancellation tests run against `MockVfs`/other
-  frontends where the kernel does deliver cancellation, and the Linux FUSE
-  adapter's gap is a named, tracked limitation, not a hidden one.
+- **fuser 0.18's missing `FUSE_INTERRUPT` meant the Linux FUSE frontend's
+  `CancelToken` was inert in practice** (§6.3). Mitigation as designed:
+  documented explicitly rather than silently absorbed into "cancellation
+  works" — the conformance kit's cancellation tests run against
+  `MockVfs`/other frontends where the kernel does deliver cancellation, and
+  the Linux FUSE adapter's gap is a named, tracked limitation, not a hidden
+  one. **Closed for Linux FUSE:** plan 39 and the fuser fork wired
+  `FUSE_INTERRUPT` (§6.3, "As built"): the token is set for a blocking lock
+  wait (any signal; the wait answers `EINTR`) and, for a dying caller, for
+  the `fsync` family, `O_SYNC`/`O_DSYNC` writes and `copy_file_range`. The
+  kit's `cancellation` group tests it where a target declares its waits
+  cancellable; the engine target does not declare that yet (PROGRESS "Plan 31
+  C6", "Plan 31 closing").
 - **The control protocol's authz is new attack surface** (peer-cred checks,
   roles, an audit log — none of which exist today). Mitigation: plan 33
   owns hardening it further (remote transport, token auth for the headless
@@ -1921,7 +2319,10 @@ store frontend, independent of which POSIX guarantees sit on top.
   `from_fd_resumed` is original work, not a port; the maintenance cost is
   therefore also higher than "one small patch" — it needs the same
   ongoing-rebase discipline Mountpoint applies to its full fork
-  (`tools/vendor-fuser.sh`, §6.11), not a fire-and-forget diff.
+  (`tools/vendor-fuser.sh`, §6.11), not a fire-and-forget diff. **As
+  built:** the patches live on branches of a git fork pinned by `rev` in
+  `Cargo.toml`; `vendor/fuser` and `tools/vendor-fuser.sh` are gone
+  (commit `18ab365`, §6.11).
 - **Two research passes independently confirmed the 37-request census and
   the module tangle list; a third pass (this document) re-verified the
   highest-leverage facts directly** (SyncHandle, InodeOps, the fuser
@@ -1939,7 +2340,9 @@ milestone's DoD includes every earlier one still green):
 
 1. **C0**: `make check-cross` exists and runs (failures recorded, not yet
    required to pass); `--results-json`/`--shard` land in the harness;
-   baseline numbers are committed to `docs/plans/v1/PROGRESS.md`.
+   baseline numbers are committed to `docs/plans/v1/PROGRESS.md`
+   (**superseded**: §6.9 — the baseline run was not made; PROGRESS "Plan 31
+   closing" records the decision).
 2. **C1**: `Code` round-trip tests pass for every table entry; the golden
    cross-OS errno decode test passes; zero `libc::E*` outside the
    conversion module in the 22-file census.
@@ -1948,11 +2351,11 @@ milestone's DoD includes every earlier one still green):
    for the Windows library check.
 4. **C3**: `constellation-engine` exists as its own crate; `crates/cli`
    shrinks by the 40-module move; pjdfstest 8798/8798; harness full matrix
-   green; perf within 3% of the C0 baseline.
+   green; perf within 3% of the C0 baseline (**superseded**: §6.9).
 5. **C4**: `constellation-vfs` exists; `crates/frontend-fuse` exists and is
    what `crates/cli` mounts through; pjdfstest 8798/8798; harness full
    matrix green; `vfs-bench` numbers recorded and within target; FUSE
-   session handover (§6.11) works end-to-end (`vendor/fuser`'s
+   session handover (§6.11) works end-to-end (the fuser fork's
    `from_fd_resumed`, `constellation daemon --upgrade`), and the
    upgrade-under-load harness scenario passes with zero `ENOTCONN`/`EIO`.
 6. **C5**: `constellation-control` replaces `crates/api`, which is deleted
@@ -1963,7 +2366,8 @@ milestone's DoD includes every earlier one still green):
 7. **C6**: the conformance kit runs in CI against `linux-fuse`; `MockVfs`
    has adapter unit-test coverage; `linux-fuse-process` lane green;
    `tests/parity.py` unit-tested against a synthetic mismatch (proves it
-   fails closed).
+   fails closed). Status and the open items: PROGRESS "Plan 31 C6" and
+   "Plan 31 closing".
 8. **C7**: `vfs-bench` is part of the gated perf suite; `OpWatch` reachable
    over `node.ops`; metrics named per §6.10 are emitted and scraped by a
    test.
@@ -1978,7 +2382,7 @@ milestone's DoD includes every earlier one still green):
     recorded in `PROGRESS.md`, not silently fixed in the spec.
 11. **Report**: each milestone's report includes the harness summary line,
     the pjdfstest tally, and (from C4 on) the `vfs-bench` numbers next to
-    the C0 baseline.
+    the previous milestone's (the C0 baseline was superseded, §6.9).
 
 ## Sources checked out for this plan
 
@@ -1986,7 +2390,7 @@ milestone's DoD includes every earlier one still green):
 |---|---|
 | this tree, commit `a945b05` | every VERIFIED citation in §5-§10: `crates/cli/src/{fusefs,fusefs_ops,kernel_inval,fuse_watch,node_runtime,locks}.rs`, `crates/api/src/{lib,types,web}.rs`, `crates/meta/src/{mutate,record}.rs`, `crates/harness/src/{s3env,client,scenarios,main}.rs`, `Cargo.toml`, `crates/cli/Cargo.toml`, `.github/workflows/{ci,nightly}.yml`, `Makefile`, `docs/explanation/DESIGN.md` §10 |
 | the `fuser` 0.18.0 crate source in the cargo registry (`~/.cargo/registry/src/<index>/fuser-0.18.0/`) | `src/reply.rs` (the `Reply: Send + 'static` bound, per-type `ok`/`error`/`entry` signatures, `ReplyRaw`/`ReplySender`/`ChannelSender`/`DevFuse` Send chain), `src/session.rs:257-267` (`n_threads` Linux-only gating), `src/session.rs:169-215` (`Session::new`/`from_fd`, both ending in `self.handshake()`), `src/session.rs:283-360` (`handshake()`'s loop, its hard requirement that the first parsed operation be `Init`, and its `InvalidData` error on anything else — the basis for §6.11's session-handover risk) |
-| `vendor/fjall/CONSTELLATION-PATCH.md` | the precedent this plan's `vendor/fuser` patch (§6.11) follows: a `[patch.crates-io]` path dependency, excluded from the workspace, with an exact upstream version/checksum and a hunk-level changelog |
+| `vendor/fjall/CONSTELLATION-PATCH.md` | the precedent this plan's `vendor/fuser` patch (§6.11; since moved to a pinned git fork) follows: a `[patch.crates-io]` path dependency, excluded from the workspace, with an exact upstream version/checksum and a hunk-level changelog |
 | `docs/plans/v1/done/21-fs-registry-and-daemon.md` | the existing shared-daemon model (§Goal: "one daemon per (bucket, prefix)... share the replica, chunk cache, leases") that §4.1's `EngineHost` generalises from one engine with N views to N engines with their own views, without changing plan 21's per-filesystem semantics |
 | `docs/plans/v1/wip/34-macos-port.md` | style template (section order, options-table format, CI YAML shape, parity TOML format), and REPORTED facts this plan carries forward without re-verifying: the Windows/Darwin cross-compile error census, the zig-cc `tools/zcc` recipe, the versitygw/toxiproxy process-backend evaluation |
 | `<scratchpad>/core-design-brief.md`, `<scratchpad>/csi-brief.md` | the fixed plan numbering, crate names, trait sketches and milestone IDs this plan expands, plus the fixed CSI-seam names (§4.1, §6.11, §9.8-9.10) — every name in this document is taken verbatim from them |
