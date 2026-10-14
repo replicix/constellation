@@ -128,6 +128,8 @@ pub use passthrough::PassthroughStatus;
 pub use spec::{metric_view_label, ViewQos, ViewSpec, METRIC_LABELS};
 
 #[cfg(test)]
+mod chunk_image_tests;
+#[cfg(test)]
 mod confine_tests;
 #[cfg(test)]
 mod durable_ack_tests;

@@ -301,7 +301,10 @@ impl DirtyRuns {
 /// One open, dirty inode's staged bytes: a sparse file mirroring the
 /// real file's layout (byte offsets match 1:1), so unwritten holes
 /// read back as zero for free via ordinary filesystem sparse-file
-/// semantics — no special-casing needed here.
+/// semantics — no special-casing needed here. Only the ranges the
+/// session's writes delivered are ever read back
+/// (`view::WriteState::written`): a dirty chunk's other bytes come from
+/// the committed manifest, not from here.
 pub struct Staging {
     file: File,
     path: PathBuf,
@@ -404,7 +407,6 @@ impl Staging {
         Ok(())
     }
 
-    #[allow(dead_code)] // part of the public shape (plan 07); exercised by tests
     pub fn file_len(&self) -> u64 {
         self.file_len
     }

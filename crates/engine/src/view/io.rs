@@ -174,7 +174,8 @@ impl View {
             None => self.inode_ops.lock(ino),
         };
         let ws = self.writes.detach(ino);
-        let result = self.do_read_detached(ino, ws.as_ref(), zc, offset, size);
+        let mut ws = ws;
+        let result = self.do_read_detached(ino, ws.as_mut(), zc, offset, size);
         if let Some(ws) = ws {
             self.writes.reattach(ino, ws);
         }
@@ -228,7 +229,7 @@ impl View {
     pub(super) fn do_read_detached(
         &self,
         ino: Ino,
-        ws: Option<&WriteState>,
+        mut ws: Option<&mut WriteState>,
         zc: Option<&super::zero_copy::ZeroCopyHandle>,
         offset: u64,
         size: u64,
@@ -264,7 +265,7 @@ impl View {
         // write session to overlay, goes to the frontend's kernel as the
         // chunk file itself; anything else (a read spanning chunks above
         // all) is answered below, as always (`zero_copy`'s module doc).
-        if let (Some(zc), None) = (zc, ws) {
+        if let (Some(zc), None) = (zc, ws.as_ref()) {
             let mut slices = layout.slices(offset, len);
             if let (Some(slice), None) = (slices.next(), slices.next()) {
                 if let Some(data) = self.zero_copy_read(
@@ -288,7 +289,7 @@ impl View {
             // The chunk's bytes and how many of them are valid: past
             // `valid` (a short chunk, a hole, a truncation point) it reads
             // as zeros. Nothing here copies a shared chunk.
-            let (chunk, valid): (Bytes, usize) = match &ws {
+            let (chunk, valid): (Bytes, usize) = match &mut ws {
                 Some(w) if w.sealed.contains_key(&slice.index) => {
                     // Fetched, not only looked up: an uploaded sealed copy
                     // is clean and may have been evicted.
@@ -298,12 +299,21 @@ impl View {
                     (chunk, valid)
                 }
                 Some(w) if w.staging.is_dirty(slice.index) => {
-                    // Staged bytes: just the range asked for.
-                    let mut buf = vec![0u8; end - start];
-                    w.staging
-                        .read_at(chunk_start + start as u64, &mut buf)
-                        .map_err(|e| staging_code(&e))?;
-                    out.push(Bytes::from(buf));
+                    // What the session wrote over the base: the chunk
+                    // its flush would publish now (`chunk_image`).
+                    let base = ImageBase {
+                        chunks: &hashes,
+                        file_len: manifest.file_len,
+                    };
+                    self.read_dirty(
+                        ino,
+                        w,
+                        &base,
+                        slice.index,
+                        chunk_start + start as u64,
+                        chunk_start + end as u64,
+                        &mut out,
+                    )?;
                     continue;
                 }
                 // Punched whole by this session: zeros.
@@ -344,6 +354,138 @@ impl View {
             Some(h) => self.fetch_chunk_for_inode(Some(ino), h),
             None => Ok(Bytes::new()),
         }
+    }
+
+    /// `[start, end)` (absolute, inside dirty chunk `idx`) as session `ws`
+    /// leaves it: [`View::chunk_image`]'s rule, piecewise and without
+    /// copying the base — the written ranges read from staging, the gaps
+    /// between them shared slices of `base`'s chunk (fetched only if
+    /// there is a gap), zeros where the base has nothing valid.
+    ///
+    /// A base chunk it fetches is also staged (`stage_base`): a small
+    /// cache — or one full of chunks waiting to upload — keeps no clean
+    /// chunk long, and every later read of the chunk's gaps would fetch
+    /// the whole chunk again.
+    #[allow(clippy::too_many_arguments)]
+    fn read_dirty(
+        &self,
+        ino: Ino,
+        ws: &mut WriteState,
+        base: &ImageBase<'_>,
+        idx: u64,
+        start: u64,
+        end: u64,
+        out: &mut ReadData,
+    ) -> Result<(), Code> {
+        let chunk_start = idx * u64::from(self.chunk_size);
+        let floor = ws.base_floor(base.file_len);
+        /// Where the gaps' bytes come from.
+        enum Base {
+            /// Nothing valid: zeros.
+            Zeros,
+            /// Staging, valid below `.0` (from the chunk's start).
+            Staged(usize),
+            /// The fetched chunk, valid below `.1`.
+            Fetched(Bytes, usize),
+        }
+        let source = match base.chunks.get(&idx) {
+            Some(hash)
+                if !ws.zeroed.contains(idx)
+                    && chunk_start < floor
+                    && !ws.written.covers(start, end) =>
+            {
+                match ws.staged_base_valid(idx, hash, chunk_start, floor, end) {
+                    Some(valid) => Base::Staged(valid as usize),
+                    None => {
+                        let chunk = self.fetch_chunk_for_inode(Some(ino), hash)?;
+                        self.stage_base(ws, idx, hash, &chunk);
+                        let valid = valid_below(floor, chunk_start, &chunk);
+                        Base::Fetched(chunk, valid)
+                    }
+                }
+            }
+            _ => Base::Zeros,
+        };
+        let ws = &*ws;
+        let gap = |from: u64, to: u64, out: &mut ReadData| -> Result<(), Code> {
+            if from >= to {
+                return Ok(());
+            }
+            let (rel_from, rel_to) = ((from - chunk_start) as usize, (to - chunk_start) as usize);
+            let have = match &source {
+                Base::Zeros => 0,
+                Base::Staged(valid) => {
+                    let have = (*valid).min(rel_to).saturating_sub(rel_from);
+                    if have > 0 {
+                        let mut buf = vec![0u8; have];
+                        ws.staging
+                            .read_at(from, &mut buf)
+                            .map_err(|e| staging_code(&e))?;
+                        out.push(Bytes::from(buf));
+                    }
+                    have
+                }
+                Base::Fetched(chunk, valid) => {
+                    let have = (*valid).min(rel_to).saturating_sub(rel_from);
+                    if have > 0 {
+                        out.push(chunk.slice(rel_from..rel_from + have));
+                    }
+                    have
+                }
+            };
+            push_zeros(out, rel_to - rel_from - have);
+            Ok(())
+        };
+        let mut at = start;
+        for (from, to) in ws.written.overlapping(start, end) {
+            gap(at, from, out)?;
+            let mut buf = vec![0u8; (to - from) as usize];
+            ws.staging
+                .read_at(from, &mut buf)
+                .map_err(|e| staging_code(&e))?;
+            out.push(Bytes::from(buf));
+            at = to;
+        }
+        gap(at, end, out)
+    }
+
+    /// Stage base chunk `hash` (fetched as `chunk`) of dirty chunk `idx`:
+    /// its bytes at every offset of the staged extent that the session's
+    /// writes leave to the base ([`WriteState::staged_base`]). Never past
+    /// the staging file's length (no budget is reserved here: a dirty
+    /// chunk's staging is). A failed staging write leaves the chunk
+    /// unstaged; the read that fetched it is served all the same.
+    pub(super) fn stage_base(&self, ws: &mut WriteState, idx: u64, hash: &ChunkHash, chunk: &[u8]) {
+        let chunk_start = idx * u64::from(self.chunk_size);
+        ws.staged_base.remove(&idx);
+        let until = chunk_start
+            + (chunk.len() as u64).min(ws.staging.file_len().saturating_sub(chunk_start));
+        let mut gaps = Vec::new();
+        let mut at = chunk_start;
+        for (from, to) in ws.written.overlapping(chunk_start, until) {
+            if at < from {
+                gaps.push((at, from));
+            }
+            at = to;
+        }
+        if at < until {
+            gaps.push((at, until));
+        }
+        for (from, to) in gaps {
+            let bytes = &chunk[(from - chunk_start) as usize..(to - chunk_start) as usize];
+            if let Err(error) = ws.staging.write_at(from, bytes) {
+                tracing::debug!(idx, %error, "staging a dirty chunk's base failed; it is fetched again when needed");
+                return;
+            }
+        }
+        ws.staged_base.insert(
+            idx,
+            StagedBase {
+                hash: *hash,
+                len: chunk.len() as u64,
+                until,
+            },
+        );
     }
 
     pub(super) fn do_write(&self, ino: Ino, offset: u64, data: &[u8]) -> Result<u32, Code> {
@@ -415,41 +557,45 @@ impl View {
             let full_len = layout.chunk_len(new_file_len, slice.index);
             let is_whole_chunk = slice.offset == 0 && slice.len == full_len;
             let chunk_start = slice.index * self.chunk_size as u64;
-            // A chunk this session punched (or zeroed) whole has no base
-            // content any more: seeded from zeros, never the base's
-            // bytes (a sealed copy is this session's own, and valid).
-            let punched = ws.zeroed.contains(slice.index);
-            // A partial (not-whole-chunk) write into a chunk this open
-            // handle has not touched yet must first seed the untouched
-            // bytes from the committed content — otherwise they would
-            // read back as a spurious hole (zero) instead of their real
-            // pre-write value.
+            // A partial write stages only its own bytes: the rest of the
+            // chunk is the base's, which every reader of the chunk —
+            // a read, a seal, the flush — takes from the base itself
+            // (`chunk_image`; `WriteState::written`). Until finding 09
+            // the first partial write into a chunk seeded staging with
+            // the whole committed chunk, only for reads, since the flush
+            // replays just the written ranges over its own base anyway.
+            //
+            // Two kinds of chunk still get their staged bytes back first,
+            // because ranges `written` recorded in them are no longer in
+            // staging: a sealed chunk (its seal released them; the
+            // sealed copy holds them, and is fetched, not only looked up
+            // in the cache: once uploaded it is a clean, evictable
+            // entry, and a full cache had evicted it — EIO on the write,
+            // the database lane), and a chunk this session punched or
+            // zeroed whole (those ranges read as zeros now; the punch of
+            // their staged bytes is best-effort).
             //
             // Everything that can fail comes before anything that changes
-            // the session: the seed is read and staging reserved first,
+            // the session: the copy is read and staging reserved first,
             // then the chunk unsealed. In the other order a failure left
             // the chunk neither sealed nor staged, and reads fell through
             // to the base — writes already acknowledged in that chunk read
-            // back as the base's bytes (zeros, for a sparse file). And a
-            // sealed copy is fetched, not only looked up in the cache:
-            // once uploaded it is a clean, evictable entry, and a full
-            // cache had evicted it (EIO on the write, the database lane).
+            // back as the base's bytes (zeros, for a sparse file).
+            let punched = ws.zeroed.contains(slice.index);
+            // A sealed copy staged again brings its base along.
+            let mut restaged = None;
             let seed = if !is_whole_chunk && !ws.staging.is_dirty(slice.index) {
-                Some(match ws.sealed.get(&slice.index).copied() {
+                match ws.sealed.get(&slice.index).copied() {
                     Some(hash) => {
                         let mut data =
                             Vec::from(&self.fetch_chunk_for_inode(Some(ino), &hash)?[..]);
                         data.resize(full_len as usize, 0);
-                        data
+                        restaged = ws.sealed_base.get(&slice.index).copied();
+                        Some(data)
                     }
-                    None if punched => vec![0u8; full_len as usize],
-                    None => {
-                        let mut seed =
-                            self.committed_chunk_padded(&hashes, slice.index, full_len)?;
-                        ws.clip_base(&mut seed, chunk_start, manifest.file_len);
-                        seed
-                    }
-                })
+                    None if punched => Some(vec![0u8; full_len as usize]),
+                    None => None,
+                }
             } else {
                 None
             };
@@ -459,22 +605,42 @@ impl View {
             self.unseal(ws, ino, slice.index)?;
             ws.holes.clear(slice.index);
             if let Some(seed) = seed {
+                ws.staged_base.remove(&slice.index);
                 ws.staging
                     .write_at(chunk_start, &seed)
                     .map_err(|e| staging_code(&e))?;
             }
             let write_start = chunk_start + u64::from(slice.offset);
             let write_end = write_start + u64::from(slice.len);
-            ws.staging
+            if let Err(error) = ws
+                .staging
                 .write_at(write_start, &data[consumed..consumed + slice.len as usize])
-                .map_err(|e| staging_code(&e))?;
+            {
+                // Some of it may have landed, over bytes the chunk's
+                // staged base held: no longer to be trusted.
+                ws.staged_base.remove(&slice.index);
+                return Err(staging_code(&error));
+            }
             ws.staging.mark_dirty(slice.index);
-            ws.written.push((write_start, write_end));
+            ws.written.insert(write_start, write_end);
+            if let Some(base) = restaged {
+                ws.staged_base.insert(
+                    slice.index,
+                    StagedBase {
+                        until: base.until.min(chunk_start + u64::from(full_len)),
+                        ..base
+                    },
+                );
+            }
             consumed += slice.len as usize;
         }
         ws.file_len = new_file_len;
         ws.changed();
-        self.note_write(ino, ws, offset, write_end)?;
+        let base = ImageBase {
+            chunks: &hashes,
+            file_len: manifest.file_len,
+        };
+        self.note_write(ino, ws, offset, write_end, &base)?;
         Ok(data.len() as u32)
     }
 
@@ -523,27 +689,41 @@ impl View {
                     // leaves the sealed set, as in `do_write`.
                     let hash = *ws.sealed.get(&idx).expect("sealed");
                     let data = self.fetch_chunk_for_inode(Some(ino), &hash)?;
+                    let restaged = ws.sealed_base.get(&idx).copied();
                     ws.staging
                         .prepare_chunk(idx, self.chunk_size)
                         .map_err(|e| staging_code(&e))?;
                     self.unseal(ws, ino, idx)?;
+                    ws.staged_base.remove(&idx);
                     ws.staging
                         .write_at(idx * cs, &data)
                         .map_err(|e| staging_code(&e))?;
-                    // (Its written ranges are already recorded; the rest
-                    // of it was seeded from the base, which the
-                    // composition re-reads, clipped.)
+                    // Its written ranges are recorded, and staging must
+                    // hold their bytes again (the seal released them);
+                    // the rest of the copy is the base the seal composed
+                    // it over (`sealed_base`), clipped below.
                     ws.staging.mark_dirty(idx);
+                    if let Some(base) = restaged {
+                        ws.staged_base.insert(
+                            idx,
+                            StagedBase {
+                                until: base.until.min(idx * cs + data.len() as u64),
+                                ..base
+                            },
+                        );
+                    }
                 }
             }
             // Drop dirty runs past the new end; `Staging::set_len`
             // (ftruncate) cuts the boundary chunk's staged bytes.
             ws.staging.retain_dirty_below(keep);
             ws.staging.punch_chunks(keep, old_chunks, self.chunk_size);
-            ws.written.retain_mut(|(start, end)| {
-                *end = (*end).min(new_size);
-                *start < *end
+            // `set_len_sparse` below cuts what staging held past the point.
+            ws.staged_base.retain(|idx, staged| {
+                staged.until = staged.until.min(new_size);
+                *idx < keep
             });
+            ws.written.clip(new_size);
             ws.runs.retain_mut(|(start, end)| {
                 *end = (*end).min(new_size);
                 *start < new_size
@@ -642,6 +822,8 @@ impl View {
                 }
                 ws.staging
                     .punch_chunks(full_start, full_end, self.chunk_size);
+                ws.staged_base
+                    .retain(|index, _| *index < full_start || *index >= full_end);
             }
         }
 

@@ -18,6 +18,205 @@ const PRESSURE_SEALS: usize = 8;
 /// storm across a realistic writer set without spinning forever.
 pub(super) const MANIFEST_COMMIT_ATTEMPTS: u32 = 8;
 
+/// `CONSTELLATION_COMPOSE_CONCURRENCY`: how many chunks one flush composes
+/// at once, its own thread included (default `min(CPUs, 8)`, like
+/// `CONSTELLATION_ENCODE_CONCURRENCY`; `1` composes one at a time).
+fn compose_concurrency() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CONSTELLATION_COMPOSE_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(8)
+            })
+            .max(1)
+    })
+}
+
+/// `CONSTELLATION_COMPOSE_MEMORY` (bytes, default 64 MiB): what the
+/// compose workers beyond each flush's own thread may hold at once,
+/// node-wide. A worker holds up to two chunks (the image it builds and,
+/// transiently, the base chunk read from disk), so it is charged twice
+/// the chunk size: at 4 MiB chunks the default admits eight, at 64 MiB
+/// none (such a flush composes one chunk at a time, as before).
+fn compose_memory() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CONSTELLATION_COMPOSE_MEMORY")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(64 << 20)
+    })
+}
+
+/// The bytes compose workers hold node-wide ([`compose_memory`]).
+static COMPOSE_MEMORY_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Memory reserved in `used` (out of `limit`) for up to `want` extra
+/// compose workers of `per` bytes each, as many as fit: the count
+/// granted, released on drop.
+pub(super) struct ComposeWorkers<'a> {
+    used: &'a std::sync::atomic::AtomicU64,
+    pub(super) granted: usize,
+    per: u64,
+}
+
+impl<'a> ComposeWorkers<'a> {
+    pub(super) fn reserve(
+        used: &'a std::sync::atomic::AtomicU64,
+        limit: u64,
+        want: usize,
+        per: u64,
+    ) -> Self {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let mut granted = 0;
+        while granted < want
+            && used
+                .fetch_update(AcqRel, Acquire, |now| {
+                    now.checked_add(per).filter(|next| *next <= limit)
+                })
+                .is_ok()
+        {
+            granted += 1;
+        }
+        Self { used, granted, per }
+    }
+}
+
+impl Drop for ComposeWorkers<'_> {
+    fn drop(&mut self) {
+        self.used.fetch_sub(
+            self.per * self.granted as u64,
+            std::sync::atomic::Ordering::AcqRel,
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the compose concurrency of flushes on this thread, in
+    /// place of [`compose_concurrency`]'s.
+    pub(super) static COMPOSE_CONCURRENCY: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Tests: how long each chunk's compose is held, so the workers of a
+    /// flush on this thread are seen to overlap.
+    pub(super) static COMPOSE_HOLD: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+    /// Tests: the most chunks the last compose on this thread had in
+    /// progress at once.
+    pub(super) static COMPOSE_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `compose` on every chunk index in `jobs` — on the calling thread
+/// and on as many scoped workers as [`compose_concurrency`] and
+/// [`compose_memory`] admit — and return the outcomes in `jobs`' order.
+/// The first failure (in `jobs`' order, among the chunks attempted) is
+/// the result; after one, no worker starts another chunk. A panic in a
+/// worker is resumed on the calling thread.
+fn compose_each<T: Send>(
+    jobs: &[u64],
+    chunk_size: u32,
+    compose: impl Fn(u64) -> Result<T, Code> + Sync,
+) -> Result<Vec<T>, Code> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    #[cfg(not(test))]
+    let concurrency = compose_concurrency();
+    #[cfg(test)]
+    let concurrency = COMPOSE_CONCURRENCY
+        .with(|c| c.get())
+        .unwrap_or_else(compose_concurrency);
+    #[cfg(test)]
+    let hold = COMPOSE_HOLD.with(|h| h.get());
+    let want = concurrency.min(jobs.len()).saturating_sub(1);
+    let workers = ComposeWorkers::reserve(
+        &COMPOSE_MEMORY_USED,
+        compose_memory(),
+        want,
+        2 * u64::from(chunk_size),
+    );
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let (running, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    /// A panicking compose stops the others from starting another chunk,
+    /// as a failing one does (the panic is resumed after the joins).
+    struct FailOnPanic<'a>(&'a AtomicBool);
+    impl Drop for FailOnPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.store(true, Relaxed);
+            }
+        }
+    }
+    let work = || {
+        let _fail_on_panic = FailOnPanic(&failed);
+        let mut done = Vec::new();
+        while !failed.load(Relaxed) {
+            let i = next.fetch_add(1, Relaxed);
+            let Some(idx) = jobs.get(i) else {
+                break;
+            };
+            peak.fetch_max(running.fetch_add(1, Relaxed) + 1, Relaxed);
+            #[cfg(test)]
+            std::thread::sleep(hold);
+            let outcome = compose(*idx);
+            running.fetch_sub(1, Relaxed);
+            if outcome.is_err() {
+                failed.store(true, Relaxed);
+            }
+            done.push((i, outcome));
+        }
+        done
+    };
+    if workers.granted == 0 {
+        let done = work();
+        #[cfg(test)]
+        COMPOSE_PEAK.with(|p| p.set(peak.load(Relaxed)));
+        return done.into_iter().map(|(_, outcome)| outcome).collect();
+    }
+    let mut done = std::thread::scope(|scope| {
+        // Each worker works for the flush's op: the stall watchdog names
+        // the stage a worker waits in (a chunk fetch from S3, say), not
+        // only the flush's own.
+        let spawned: Vec<_> = (0..workers.granted)
+            .filter_map(|_| {
+                let op = constellation_vfs::watch::current();
+                std::thread::Builder::new()
+                    .name("compose".into())
+                    .spawn_scoped(scope, move || {
+                        if let Some(op) = op {
+                            op.adopt();
+                        }
+                        work()
+                    })
+                    .ok()
+            })
+            .collect();
+        let mut done = work();
+        for worker in spawned {
+            match worker.join() {
+                Ok(theirs) => done.extend(theirs),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        done
+    });
+    drop(workers);
+    #[cfg(test)]
+    COMPOSE_PEAK.with(|p| p.set(peak.load(Relaxed)));
+    done.sort_unstable_by_key(|(i, _)| *i);
+    let mut out = Vec::with_capacity(jobs.len());
+    for (_, outcome) in done {
+        out.push(outcome?);
+    }
+    // Every job ran unless one failed, and then the loop above returned.
+    debug_assert_eq!(out.len(), jobs.len());
+    Ok(out)
+}
+
 impl View {
     pub(super) fn load_manifest(&self, ino: Ino) -> Result<Manifest, Code> {
         match self.meta.manifest(ino) {
@@ -192,22 +391,81 @@ impl View {
         Ok(data)
     }
 
-    /// Full content of committed chunk `idx`, zero-padded to `len`
-    /// (cache/store fetch, or zero-fill for a hole/beyond-EOF chunk that
-    /// was never written). Used to seed a staging chunk's untouched
-    /// bytes before a partial (non-whole-chunk) write lands on top.
-    pub(super) fn committed_chunk_padded(
+    /// Chunk `idx` (`len` bytes) as write session `ws` leaves it, into
+    /// `data`: the bytes its writes delivered (`ws.written`, read from
+    /// staging) laid over `base`'s content for the chunk — zeros where
+    /// `base` has no chunk, past its length or the session's truncation
+    /// floor (`WriteState::clip_base`), and in a chunk the session
+    /// punched or zeroed whole (`zeroed`). The base's chunk is fetched
+    /// only when the writes leave part of the chunk to it (plan 30 §M9 ×
+    /// §M4: the base's chunk may be one only a departed holder had — an
+    /// adopted, held manifest — and an overwrite must not depend on it).
+    ///
+    /// The one definition of a dirty chunk's content: the flush composes
+    /// it over the base it commits on (rebasing re-composes it over the
+    /// manifest that is current, 124cc95), a seal over the manifest
+    /// current at the write that seals it (a sealed chunk's content is
+    /// then fixed: the flush names its hash as is, and a rebase does not
+    /// merge another writer's bytes into it — as before, when the seal
+    /// froze the copy made at the first write), and a read of a dirty chunk
+    /// over the manifest current at the read (`View::read_dirty`, the
+    /// same rule piecewise). So a session reads back what its flush would
+    /// publish were it to commit then; the staging file holds only the
+    /// written bytes (finding 09; [`WriteState::written`]).
+    pub(super) fn chunk_image(
         &self,
-        hashes: &SparseChunks,
+        ws: &WriteState,
         idx: u64,
-        len: u32,
-    ) -> Result<Vec<u8>, Code> {
-        let mut data = match hashes.get(&idx) {
-            Some(h) => Vec::from(self.fetch_chunk(h)?),
-            None => Vec::new(),
+        len: usize,
+        base: &ImageBase<'_>,
+        data: &mut Vec<u8>,
+    ) -> Result<Option<StagedBase>, Code> {
+        let start = idx * u64::from(self.chunk_size);
+        let end = start + len as u64;
+        data.clear();
+        data.reserve(len);
+        let floor = ws.base_floor(base.file_len);
+        // The base chunk the image holds, and how much of it: what a
+        // seal records for the chunk's later re-staging (`sealed_base`).
+        let used = match base.chunks.get(&idx) {
+            Some(hash)
+                if start < floor && !ws.zeroed.contains(idx) && !ws.written.covers(start, end) =>
+            {
+                let base_len =
+                    if let Some(valid) = ws.staged_base_valid(idx, hash, start, floor, end) {
+                        // Already in staging (`WriteState::staged_base`).
+                        let valid = (valid as usize).min(len);
+                        data.resize(len, 0);
+                        ws.staging
+                            .read_at(start, &mut data[..valid])
+                            .map_err(|e| staging_code(&e))?;
+                        ws.staged_base[&idx].len
+                    } else {
+                        let fetched = self.fetch_chunk(hash)?;
+                        data.extend_from_slice(&fetched);
+                        data.resize(len, 0);
+                        ws.clip_base(data, start, base.file_len);
+                        fetched.len() as u64
+                    };
+                let valid = base_len.min(floor - start).min(len as u64);
+                Some(StagedBase {
+                    hash: *hash,
+                    len: base_len,
+                    until: start + valid,
+                })
+            }
+            _ => {
+                data.resize(len, 0);
+                None
+            }
         };
-        data.resize(len as usize, 0);
-        Ok(data)
+        for (from, to) in ws.written.overlapping(start, end) {
+            let rel = (from - start) as usize;
+            ws.staging
+                .read_at(from, &mut data[rel..rel + (to - from) as usize])
+                .map_err(|e| staging_code(&e))?;
+        }
+        Ok(used)
     }
 
     /// Get-or-create the pending write state for `ino`, allocating a
@@ -257,7 +515,9 @@ impl View {
                 runs: Vec::new(),
                 mtime_ns: None,
                 ctime_ns: 0,
-                written: Vec::new(),
+                written: Written::default(),
+                staged_base: HashMap::new(),
+                sealed_base: HashMap::new(),
                 floor: (size < manifest.file_len).then_some(size),
             });
         }
@@ -325,6 +585,7 @@ impl View {
         ws: &mut WriteState,
         offset: u64,
         end: u64,
+        base: &ImageBase<'_>,
     ) -> Result<(), Code> {
         let chunk = u64::from(self.chunk_size);
         let (start, old_end) = match ws
@@ -342,7 +603,7 @@ impl View {
         };
         let new_end = old_end.max(end);
         ws.runs.push((start, new_end));
-        self.seal_chunks(ino, ws, old_end / chunk..new_end / chunk)?;
+        self.seal_chunks(ino, ws, old_end / chunk..new_end / chunk, base)?;
         if self.staging_budget.used().saturating_mul(2) >= self.staging_budget.budget() {
             let whole = ws.file_len / chunk;
             let victims: Vec<u64> = ws
@@ -351,16 +612,21 @@ impl View {
                 .filter(|idx| *idx < whole)
                 .take(PRESSURE_SEALS)
                 .collect();
-            self.seal_chunks(ino, ws, victims)?;
+            self.seal_chunks(ino, ws, victims, base)?;
         }
         Ok(())
     }
 
+    /// Seal `chunks` (whole ones) that are dirty: their content
+    /// ([`Self::chunk_image`] over `base`, the manifest current at the
+    /// write) goes into the cache as a pending upload, and their staged
+    /// bytes are released.
     fn seal_chunks(
         &self,
         ino: Ino,
         ws: &mut WriteState,
         chunks: impl IntoIterator<Item = u64>,
+        base: &ImageBase<'_>,
     ) -> Result<(), Code> {
         let mut sealed_any = false;
         for idx in chunks {
@@ -368,13 +634,18 @@ impl View {
                 continue;
             }
             let mut data = std::mem::take(&mut ws.seal_buffer);
-            data.resize(self.chunk_size as usize, 0);
-            ws.staging
-                .read_at(idx * u64::from(self.chunk_size), &mut data)
-                .map_err(|error| staging_code(&error))?;
+            let used = match self.chunk_image(ws, idx, self.chunk_size as usize, base, &mut data) {
+                Ok(used) => used,
+                Err(code) => {
+                    data.clear();
+                    ws.seal_buffer = data;
+                    return Err(code);
+                }
+            };
             let hash = self.store.hash(&data);
             if data.iter().all(|byte| *byte == 0) {
                 ws.staging.release_chunk(idx, self.chunk_size);
+                ws.staged_base.remove(&idx);
                 ws.holes.mark(idx);
                 ws.zeroed.mark(idx);
                 data.clear();
@@ -397,6 +668,10 @@ impl View {
                 ws.enrolled.insert(idx);
             }
             ws.staging.release_chunk(idx, self.chunk_size);
+            ws.staged_base.remove(&idx);
+            if let Some(used) = used {
+                ws.sealed_base.insert(idx, used);
+            }
             ws.sealed.insert(idx, hash);
             data.clear();
             ws.seal_buffer = data;
@@ -425,6 +700,7 @@ impl View {
         idx: u64,
     ) -> Result<Option<ChunkHash>, Code> {
         ws.enrolled.remove(&idx);
+        ws.sealed_base.remove(&idx);
         Ok(ws.sealed.remove(&idx))
     }
 
@@ -728,9 +1004,11 @@ impl View {
             .collect();
         // Every chunk this flush seals into the cache as Dirty: the
         // durable pending-upload set this manifest commit journals
-        // (plan 07 step 1). Sealing one chunk at a time (read its
-        // staged range, hash, insert, drop the buffer) keeps peak RSS
-        // O(chunk_size), never O(file_len) — 07's whole point.
+        // (plan 07 step 1). Each chunk is sealed with only its own
+        // image in memory (read its written ranges, hash, insert, drop
+        // the buffer), so peak RSS stays O(chunk_size) per compose
+        // worker — never O(file_len), 07's whole point — and the workers
+        // are bounded node-wide ([`compose_each`]).
         let mut dirty_hashes: Vec<ChunkHash> = Vec::new();
         for (&idx, hash) in &ws.sealed {
             if idx >= n_chunks {
@@ -745,60 +1023,61 @@ impl View {
             }
             new_hashes.insert(idx, *hash);
         }
-        let dirty_indices: Vec<_> = ws.staging.dirty_indices().collect();
-        for idx in dirty_indices {
-            if idx >= n_chunks {
-                continue;
-            }
-            let expect_len = layout.chunk_len(file_len, idx) as usize;
-            let chunk_start = idx * self.chunk_size as u64;
-            let chunk_end = chunk_start + expect_len as u64;
-            // Start from `base`'s committed content for this chunk —
-            // not whatever `do_write` seeded the untouched neighborhood
-            // with at write time, which is only as fresh as the
-            // manifest at that moment — and replay just the byte
-            // ranges this flush's own `write()` calls actually
-            // delivered on top. Otherwise a chunk two nodes disjointly
-            // patch converges on whichever writer commits last, since
-            // that writer's seed silently reproduces the *other*
-            // writer's bytes as zero: the earlier content it copied in
-            // predates the sibling's patch landing.
-            // A chunk this flush's writes cover completely needs nothing
-            // of the base: not fetched (plan 30 §M9 × §M4: the base's
-            // chunk may be one only a departed holder had — an adopted,
-            // held manifest — and an overwrite must not depend on it).
-            let covered = covers(&ws.written, chunk_start, chunk_end);
-            let mut data = match old_hashes.get(&idx) {
-                Some(hash) if !covered && !ws.zeroed.contains(idx) => {
-                    let mut fetched = Vec::from(self.fetch_chunk(hash)?);
-                    fetched.resize(expect_len, 0);
-                    ws.clip_base(&mut fetched, chunk_start, base.file_len);
-                    fetched
-                }
-                _ => vec![0u8; expect_len],
-            };
-            for &(start, end) in &ws.written {
-                let start = start.max(chunk_start);
-                let end = end.min(chunk_end);
-                if end <= start {
-                    continue;
-                }
-                let len = (end - start) as usize;
-                let mut buf = vec![0u8; len];
-                ws.staging
-                    .read_at(start, &mut buf)
-                    .map_err(|e| staging_code(&e))?;
-                let rel = (start - chunk_start) as usize;
-                data[rel..rel + len].copy_from_slice(&buf);
-            }
+        // A dirty chunk starts from `base`'s committed content — not
+        // what was current when the session first wrote it — with just
+        // the byte ranges this flush's own `write()` calls delivered
+        // replayed on top (`chunk_image`). Otherwise a chunk two nodes
+        // disjointly patch converges on whichever writer commits last,
+        // each writer's copy of the base silently reproducing the
+        // *other* writer's bytes as they were before its patch landed
+        // (124cc95).
+        //
+        // The chunks are independent — content-addressed, each its own
+        // cache file — so they are composed in parallel (finding 09):
+        // with frequent `fsync`s a random writer dirties most of a
+        // file's chunks per flush, and one at a time the flush waited
+        // for each chunk's hash and its cache insert's `fdatasync` in
+        // turn. Each insert is still durable before this returns, so
+        // the order the commit relies on — every chunk in the cache
+        // (durable) before the manifest that names it is journaled and
+        // its pending rows inserted (plan 07) — is unchanged, and so is
+        // the result: the outcomes are applied in chunk order, the
+        // manifest and the pending list are the sequential compose's,
+        // byte for byte. A failure fails the compose as before (the
+        // workers start no further chunk); chunks other workers had
+        // already cached stay Dirty entries no row names, as those
+        // before a failing chunk always did.
+        let jobs: Vec<u64> = ws
+            .staging
+            .dirty_indices()
+            .filter(|idx| *idx < n_chunks)
+            .collect();
+        let image_base = ImageBase {
+            chunks: &old_hashes,
+            file_len: base.file_len,
+        };
+        let outcomes = compose_each(&jobs, self.chunk_size, |idx| {
+            let mut data = Vec::new();
+            let len = layout.chunk_len(file_len, idx) as usize;
+            self.chunk_image(ws, idx, len, &image_base, &mut data)?;
             if data.iter().all(|byte| *byte == 0) {
-                new_hashes.remove(&idx);
-            } else {
-                let hash = self.store.hash(&data);
-                if self.cache_for_upload(&hash, &data)? {
-                    dirty_hashes.push(hash);
+                return Ok(None);
+            }
+            let hash = self.store.hash(&data);
+            let dirty = self.cache_for_upload(&hash, &data)?;
+            Ok(Some((hash, dirty)))
+        })?;
+        for (idx, outcome) in jobs.into_iter().zip(outcomes) {
+            match outcome {
+                None => {
+                    new_hashes.remove(&idx);
                 }
-                new_hashes.insert(idx, hash);
+                Some((hash, dirty)) => {
+                    if dirty {
+                        dirty_hashes.push(hash);
+                    }
+                    new_hashes.insert(idx, hash);
+                }
             }
         }
         // An untouched old chunk needs re-cutting when its length changed

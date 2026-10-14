@@ -202,13 +202,48 @@ objects where `chunks/` holds millions.
 
 ### Write path (partial writes)
 
-`write()` materializes only the touched chunk(s) (cold: one 4 MiB GET),
-applies the edit in the cache and marks the chunk dirty; repeated writes
-coalesce. On `close()`/`fsync()` the node re-hashes, compresses (and
-encrypts) the new chunk(s) and uploads them in parallel, then commits the
-new manifest as one small metadata operation at the file's sequencer (§4).
-Other nodes re-fetch only changed chunks: a 1-byte edit of a 1 GB file
-syncs ~4 MiB.
+`write()` stages only the bytes it writes (a sparse staging file per
+file being written, plan 07) and marks their chunk dirty; repeated
+writes coalesce. On `close()`/`fsync()` the node composes each dirty
+chunk (cold: one 4 MiB GET of the committed chunk), re-hashes it, keeps
+it durably in the chunk cache, compresses (and encrypts) and uploads the
+new chunks in parallel, then commits the new manifest as one small
+metadata operation at the file's sequencer (§4). Other nodes re-fetch
+only changed chunks: a 1-byte edit of a 1 GB file syncs ~4 MiB.
+
+**A dirty chunk's content** is the bytes the session's writes delivered
+(their byte ranges are recorded) laid over the committed chunk, zeroed
+past a truncation or where the session punched the chunk whole. One
+rule serves every reader of it: the flush composes it over the manifest
+it commits on (a commit that finds the manifest moved rebases, and
+composes it again over the current one, so two nodes patching one chunk
+disjointly converge on both patches), a seal (eager upload, below) over
+the manifest current at the write, a read of the open file over the
+manifest current at the read. So the writer reads back what its flush
+would publish then, including another node's bytes in the same chunk
+once its replica has them. (A chunk sealed for eager upload is fixed
+at its seal: the flush names it as is, and a rebase does not merge
+another writer's bytes into it.) The staging file holds the written
+bytes, not a copy of the committed chunk: that copy, which a chunk's
+first partial write used to make, staged ~40 MiB per `fsync` for the
+128 KiB an 8 KiB random writer `fsync`ing every 16 writes wrote
+(finding 09). Only a sealed chunk written again is staged whole again,
+from its sealed copy, since its seal released its staged bytes. A read
+that has to fetch a dirty chunk's base stages the base's bytes in the
+chunk's unwritten gaps, and while the chunk's base is still that chunk
+(content addressed: the same bytes) later reads, a seal and the flush
+take it from staging: with a cache too small to keep clean chunks (or
+full of chunks waiting to upload) a dirty chunk's base is fetched once
+per session, not once per read.
+
+The flush composes the dirty chunks of a file in parallel
+(`CONSTELLATION_COMPOSE_CONCURRENCY`, with the workers' memory capped
+node-wide by `CONSTELLATION_COMPOSE_MEMORY`): each chunk's hash and its
+durable cache insert (`fdatasync`, then rename) overlap the others',
+and every insert completes before the
+manifest commit journals the chunks as pending uploads — the order a
+`--write-mode back` close relies on (its upload queue is those cache
+files and rows), and the same manifest bytes as one chunk at a time.
 
 One invariant holds in every mode: **the log never names a chunk S3
 lacks.** A reader anywhere can therefore fetch every chunk a shipped

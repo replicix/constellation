@@ -5,9 +5,11 @@ use super::*;
 
 /// In-flight write state for one inode: bytes live on disk in `staging`
 /// (bounded RAM regardless of file size, plan 07), not in a `Vec` per
-/// chunk. `dirty` tracks which chunk indices actually have staged
-/// content; the rest of the file (up to `file_len`) is served from the
-/// committed manifest in `base`.
+/// chunk. The staging file's dirty set tracks which chunk indices have
+/// staged content, and `written` which of their bytes; everything else
+/// (up to `file_len`) is the committed manifest's — `base` for the
+/// flush (or whatever it rebases onto), the manifest current at the
+/// read for a read ([`View::chunk_image`]).
 pub(super) struct WriteState {
     pub(super) staging: Staging,
     pub(super) file_len: u64,
@@ -39,17 +41,51 @@ pub(super) struct WriteState {
     /// When the session last changed the file's data: its ctime
     /// meanwhile, unless the row's (an attribute change since) is later.
     pub(super) ctime_ns: i64,
-    /// Absolute half-open byte ranges this open handle's `write()`
-    /// calls actually delivered — as opposed to the padding bytes
-    /// `do_write` seeds from the committed manifest so a partial
-    /// write's untouched neighborhood reads back correctly within the
-    /// handle. Kept separate because that seed is only as fresh as the
-    /// manifest at the moment of the call: replaying just these ranges
-    /// over whatever base a flush ultimately composes or rebases onto
-    /// is what lets a chunk shared by several disjoint concurrent
-    /// writers converge instead of each writer's seed silently
-    /// clobbering the others' bytes with its own stale copy.
-    pub(super) written: Vec<(u64, u64)>,
+    /// The bytes this session's `write()` calls actually delivered
+    /// (absolute, merged half-open ranges), as opposed to the rest of a
+    /// dirty chunk, which is the base's. Two things depend on that split:
+    ///
+    /// - The flush replays just these ranges over whatever base it
+    ///   composes or rebases onto (124cc95), so a chunk several nodes
+    ///   patch disjointly converges on the union of their writes instead
+    ///   of each writer's copy of the base clobbering the others' bytes.
+    /// - Only these ranges of a dirty chunk are read from staging, by
+    ///   reads, seals and the flush alike ([`View::chunk_image`]); the
+    ///   rest comes from the base, so a chunk's first partial write
+    ///   stages only its own bytes. (Until finding 09 it also copied the
+    ///   whole committed chunk into staging — a seed only reads used,
+    ///   since the flush already ignored it: a 4 MiB read and write per
+    ///   chunk per session, ~40 MiB staged per `fsync` for the 128 KiB
+    ///   an 8 KiB random writer `fsync`ing every 16 writes wrote.)
+    ///
+    /// So staging must hold the latest written byte at every offset in
+    /// these ranges of a dirty chunk. A chunk whose staged bytes were
+    /// released while ranges here survive — sealed (`release_chunk`
+    /// punches them), punched whole by `fallocate` (`zeroed`) — gets them
+    /// back before it is staged again: the sealed copy, or zeros
+    /// (`do_write`, the truncate straddle).
+    pub(super) written: Written,
+    /// Dirty chunks whose staging also holds the bytes of a base chunk
+    /// (`hash`, `len` bytes long) at every offset below `until` that
+    /// `written` leaves to the base: put there by the read that had to
+    /// fetch that chunk ([`View::stage_base`]). While the chunk's base is
+    /// still that chunk — content addressed, so the bytes are the same —
+    /// reads, seals and the flush take it from staging instead of
+    /// fetching it again, which with a cache too small to keep it means
+    /// from S3 (a GET of a whole chunk per small read of a dirty chunk).
+    /// An entry goes whenever staging stops holding those bytes: the
+    /// chunk is sealed, punched, re-staged from a copy, cut by a
+    /// truncate, or a write into it fails.
+    pub(super) staged_base: HashMap<u64, StagedBase>,
+    /// Sealed chunks whose sealed copy holds a base chunk's bytes (below
+    /// `until`) at every offset `written` leaves to the base: the base
+    /// the seal composed it over. Staged again from that copy (a write
+    /// into the chunk, a truncate cutting it), the chunk has that base
+    /// staged (`staged_base`) and needs no fetch of it — under staging
+    /// pressure a random writer's chunks are sealed and staged again
+    /// over and over, and with a small cache each round fetched the
+    /// base anew.
+    pub(super) sealed_base: HashMap<u64, StagedBase>,
     /// The base's content is valid only below this offset: the lowest
     /// length the file was truncated to — by this session, or by a
     /// committed `setattr(size)` the base manifest predates (its
@@ -91,23 +127,129 @@ pub(super) fn clip_at(floor: Option<u64>, data: &mut [u8], start: u64) {
 
 pub(super) const WRITE_SHARDS: usize = 256;
 
-/// Whether the half-open byte ranges `written` cover `[start, end)`
-/// entirely.
-pub(super) fn covers(written: &[(u64, u64)], start: u64, end: u64) -> bool {
-    let mut ranges: Vec<(u64, u64)> = written
-        .iter()
-        .map(|&(s, e)| (s.max(start), e.min(end)))
-        .filter(|(s, e)| s < e)
-        .collect();
-    ranges.sort_unstable();
-    let mut reached = start;
-    for (s, e) in ranges {
-        if s > reached {
-            return false;
+/// A set of absolute byte offsets kept as sorted, disjoint, non-adjacent
+/// half-open ranges (`start -> end`): what a write session's writes
+/// delivered ([`WriteState::written`]). Merged on insert, so its size is
+/// the number of disjoint regions written, never the number of writes,
+/// and a lookup is a `BTreeMap` range query — every read of a dirty
+/// chunk asks it, and the flush once per dirty chunk.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct Written {
+    ranges: std::collections::BTreeMap<u64, u64>,
+}
+
+impl Written {
+    /// Add `[start, end)`, merging it with every range it overlaps or
+    /// touches.
+    pub(super) fn insert(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
         }
-        reached = reached.max(e);
+        let (mut start, mut end) = (start, end);
+        if let Some((&s, &e)) = self.ranges.range(..=start).next_back() {
+            if e >= start {
+                start = s;
+                end = end.max(e);
+            }
+        }
+        // Disjoint and non-adjacent: a range starting past `end` cannot
+        // reach back into one merged here, so one pass suffices.
+        let merged: Vec<u64> = self.ranges.range(start..=end).map(|(s, _)| *s).collect();
+        for s in merged {
+            let e = self.ranges.remove(&s).expect("listed");
+            end = end.max(e);
+        }
+        self.ranges.insert(start, end);
     }
-    reached >= end
+
+    /// Drop every offset at or past `at` (a truncate).
+    pub(super) fn clip(&mut self, at: u64) {
+        self.ranges.split_off(&at);
+        if let Some((_, e)) = self.ranges.iter_mut().next_back() {
+            *e = (*e).min(at);
+        }
+    }
+
+    /// The parts of the set inside `[start, end)`, in order.
+    pub(super) fn overlapping(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let before = self
+            .ranges
+            .range(..start)
+            .next_back()
+            .filter(|(_, e)| **e > start)
+            .map(|(s, e)| (*s, *e));
+        let inside = self
+            .ranges
+            .range(start..end.max(start))
+            .map(|(s, e)| (*s, *e));
+        before
+            .into_iter()
+            .chain(inside)
+            .map(move |(s, e)| (s.max(start), e.min(end)))
+            .filter(|(s, e)| s < e)
+    }
+
+    /// Whether the set holds every offset of `[start, end)`.
+    pub(super) fn covers(&self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return true;
+        }
+        // Merged: only one range can cover it.
+        self.ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, e)| *e >= end)
+    }
+
+    #[cfg(test)]
+    pub(super) fn ranges(&self) -> Vec<(u64, u64)> {
+        self.ranges.iter().map(|(s, e)| (*s, *e)).collect()
+    }
+}
+
+/// See [`WriteState::staged_base`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StagedBase {
+    pub(super) hash: ChunkHash,
+    pub(super) len: u64,
+    pub(super) until: u64,
+}
+
+impl WriteState {
+    /// How many bytes from `chunk_start` of base chunk `hash` (for chunk
+    /// `idx`) are valid below `floor` and staged, if staging holds every
+    /// valid one below `need_end` (the end of what the caller reads).
+    /// The staged extent stops at the session's length when it was
+    /// staged; a base another node extended since is valid further, past
+    /// what a read of the session can ask for (it ends at the session's
+    /// length) — requiring all of it re-fetched and re-staged the chunk
+    /// on every read. The flush, which may compose the chunk at the
+    /// extended length, fetches it.
+    pub(super) fn staged_base_valid(
+        &self,
+        idx: u64,
+        hash: &ChunkHash,
+        chunk_start: u64,
+        floor: u64,
+        need_end: u64,
+    ) -> Option<u64> {
+        let staged = self.staged_base.get(&idx).filter(|s| s.hash == *hash)?;
+        let valid = staged.len.min(floor.saturating_sub(chunk_start));
+        let held = staged.until.saturating_sub(chunk_start);
+        (valid <= held || need_end <= staged.until).then_some(valid.min(held))
+    }
+}
+
+/// The committed content a write session's chunk images lay its writes
+/// over ([`View::chunk_image`]): a manifest's chunk list and its
+/// `file_len` (its content is valid only below it).
+pub(super) struct ImageBase<'a> {
+    pub(super) chunks: &'a SparseChunks,
+    pub(super) file_len: u64,
 }
 
 /// The open write sessions, sharded so unrelated files do not contend on
@@ -435,14 +577,75 @@ impl Drop for InodeOpGuard<'_> {
 mod tests {
     use super::*;
 
+    fn written(ranges: &[(u64, u64)]) -> Written {
+        let mut w = Written::default();
+        for &(s, e) in ranges {
+            w.insert(s, e);
+        }
+        w
+    }
+
     #[test]
     fn covers_needs_the_whole_range() {
-        assert!(covers(&[(0, 13)], 0, 13));
-        assert!(covers(&[(5, 13), (0, 6)], 0, 13));
-        assert!(covers(&[(0, 100)], 10, 20));
-        assert!(!covers(&[(0, 5), (6, 13)], 0, 13));
-        assert!(!covers(&[(0, 12)], 0, 13));
-        assert!(!covers(&[], 0, 1));
+        assert!(written(&[(0, 13)]).covers(0, 13));
+        assert!(written(&[(5, 13), (0, 6)]).covers(0, 13));
+        assert!(written(&[(0, 100)]).covers(10, 20));
+        assert!(!written(&[(0, 5), (6, 13)]).covers(0, 13));
+        assert!(!written(&[(0, 12)]).covers(0, 13));
+        assert!(!written(&[]).covers(0, 1));
+        // Touching ranges merge.
+        assert!(written(&[(0, 5), (5, 13)]).covers(0, 13));
+        assert_eq!(written(&[(5, 13), (0, 5)]).ranges(), vec![(0, 13)]);
+    }
+
+    /// `Written` against a bitmap of written offsets: random inserts,
+    /// clips, range queries and coverage checks.
+    #[test]
+    fn written_matches_a_bitmap() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for _ in 0..2000 {
+            let mut w = Written::default();
+            let mut bits = [false; 96];
+            for _ in 0..12 {
+                let a = next(96);
+                let b = (a + next(20)).min(96);
+                if next(5) == 0 {
+                    w.clip(a);
+                    bits[a as usize..].fill(false);
+                } else {
+                    w.insert(a, b);
+                    bits[a as usize..b as usize].fill(true);
+                }
+                let ranges = w.ranges();
+                for pair in ranges.windows(2) {
+                    assert!(pair[0].1 < pair[1].0, "disjoint, non-adjacent: {ranges:?}");
+                }
+                let (qa, qb) = {
+                    let a = next(96);
+                    (a, (a + next(40)).min(96))
+                };
+                let mut got = [false; 96];
+                for (s, e) in w.overlapping(qa, qb) {
+                    assert!(qa <= s && s < e && e <= qb);
+                    got[s as usize..e as usize].fill(true);
+                }
+                for i in 0..96 {
+                    let want = bits[i] && (qa as usize..qb as usize).contains(&i);
+                    assert_eq!(got[i], want, "offset {i} of [{qa}, {qb}) in {ranges:?}");
+                }
+                assert_eq!(
+                    w.covers(qa, qb),
+                    bits[qa as usize..qb as usize].iter().all(|b| *b),
+                    "[{qa}, {qb}) in {ranges:?}"
+                );
+            }
+        }
     }
 
     #[test]
