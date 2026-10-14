@@ -343,8 +343,9 @@ pub struct LockStats {
     pub requests: u64,
     pub local_hits: u64,
     pub local_conflicts: u64,
-    /// Phase 2: a new local turn waited for an earlier turn's mutations
-    /// tagged with the same grant ([`LocalOutcome::Predecessor`]): once
+    /// Phase 2: a new local turn waited for an earlier turn's close
+    /// publication or mutation in doubt under the same grant
+    /// ([`LocalOutcome::Predecessor`]): once
     /// per lock request (the engine's `ClusterLocks`), however often it
     /// looked again, whether it then took the lock or, non-blocking, was
     /// refused.
@@ -479,8 +480,24 @@ pub type ReleaseWake = std::sync::Arc<dyn Fn(u64) + Send + Sync>;
 /// See `Inner::inflight`.
 #[derive(Clone, Copy, Debug, Default)]
 struct Inflight {
+    /// Tagged mutations in flight: the release waits for every one.
     active: u32,
+    /// The publications of the grant's own file by a close (`FLUSH`,
+    /// `RELEASE`) or by the release's flush ([`LockTables::publish_begin`]):
+    /// what the earlier turn wrote, which its application already counts
+    /// as done. A new turn on the node waits for these (and for pins)
+    /// only (`LocalOutcome::Predecessor`); the release waits for them too.
+    /// Not always among `active`: a close is tagged per minter with the
+    /// grant whose window ends first, which may be another file's.
+    publishing: u32,
     pinned_until_ms: i64,
+}
+
+impl Inflight {
+    /// Nothing left to wait for at `now_ms`: the entry can go.
+    fn over(&self, now_ms: i64) -> bool {
+        self.active == 0 && self.publishing == 0 && self.pinned_until_ms <= now_ms
+    }
 }
 
 /// A lock owner fenced on this node: its grant lapsed (or was lost)
@@ -732,10 +749,15 @@ pub enum LocalOutcome {
     /// exclusive request): ask the sequencer for one.
     NeedGrant(LockMode),
     /// Phase 2: the grant covers it, but no local lock is left on the
-    /// inode and mutations an earlier turn tagged with the grant are still
-    /// in flight, or ended in doubt inside their window: they may still
+    /// inode and what an earlier turn already counts as done may still
     /// land at the minter, which honours the grant, after this turn's
-    /// writes. `EAGAIN`, or wait and ask again (as for `Conflict`).
+    /// writes: a close's publication of the file still in flight
+    /// ([`LockTables::publish_begin`]), or a mutation tagged with the grant
+    /// that ended in doubt inside its window. Mutations still waiting for
+    /// their answer do not count: the application has not seen them done,
+    /// so they are concurrent with the unlock, and on a local file system
+    /// too they may take effect after the next holder's. Wait and ask
+    /// again (as for `Conflict`), or `EAGAIN`.
     Predecessor,
 }
 
@@ -1671,8 +1693,7 @@ impl LockTables {
         // An entry pinned by an op left in doubt goes once its pin is
         // over, whether or not a release ever asked about its grant (one
         // that lapsed instead stayed for ever).
-        g.inflight
-            .retain(|_, e| e.active > 0 || e.pinned_until_ms > now_ms);
+        g.inflight.retain(|_, e| !e.over(now_ms));
         g.stats.tagged_ops += 1;
         for t in &tag.0 {
             g.inflight.entry(t.grant).or_default().active += 1;
@@ -1697,7 +1718,7 @@ impl LockTables {
             if in_doubt {
                 e.pinned_until_ms = e.pinned_until_ms.max(t.until_ms);
             }
-            if e.active == 0 && e.pinned_until_ms <= now_ms {
+            if e.over(now_ms) {
                 g.inflight.remove(&t.grant);
                 // A recalled grant's release may be waiting for this (an
                 // idle one's too: `idle_before` marks it recalled).
@@ -1717,6 +1738,57 @@ impl LockTables {
             for ino in wake {
                 hook(ino);
             }
+        }
+    }
+
+    /// A mutation tagged with `tag` ended in doubt (it may still execute
+    /// somewhere): its grants are pinned until its tokens' windows are
+    /// over now, before its answer goes out, not only at its
+    /// [`Self::tag_end`] — a new turn the answer lets the application
+    /// start must already find the pin (`LocalOutcome::Predecessor`).
+    pub fn pin_in_doubt(&self, tag: &LockTag) {
+        if tag.is_empty() {
+            return;
+        }
+        let mut g = self.lock();
+        for t in &tag.0 {
+            let e = g.inflight.entry(t.grant).or_default();
+            e.pinned_until_ms = e.pinned_until_ms.max(t.until_ms);
+        }
+    }
+
+    /// A close (`FLUSH`, `RELEASE`) or the release's flush starts
+    /// publishing the file `grant` is held on, under that grant: what was
+    /// written under the locks the close just dropped, which a new turn
+    /// on the node waits for (`LocalOutcome::Predecessor`), until
+    /// [`Self::publish_end`]. The release waits for it too
+    /// ([`Self::release_blocked`]).
+    pub fn publish_begin(&self, grant: GrantId) {
+        self.lock().inflight.entry(grant).or_default().publishing += 1;
+    }
+
+    /// The publication [`Self::publish_begin`] announced is over. Like
+    /// [`Self::tag_end`], wakes a recalled grant's release that waited
+    /// for it, when nothing else holds the grant back.
+    pub fn publish_end(&self, grant: GrantId, now_ms: i64) {
+        let mut g = self.lock();
+        let Some(e) = g.inflight.get_mut(&grant) else {
+            return;
+        };
+        e.publishing = e.publishing.saturating_sub(1);
+        if !e.over(now_ms) {
+            return;
+        }
+        g.inflight.remove(&grant);
+        let wake = g
+            .held
+            .iter()
+            .find(|(_, h)| h.id == grant && h.recalled)
+            .map(|(ino, _)| *ino);
+        let hook = g.release_wake.clone();
+        drop(g);
+        if let (Some(hook), Some(ino)) = (hook, wake) {
+            hook(ino);
         }
     }
 
@@ -1781,7 +1853,9 @@ impl LockTables {
     pub fn release_blocked(&self, grant: GrantId, now_ms: i64) -> Option<Option<i64>> {
         let mut g = self.lock();
         let e = g.inflight.get(&grant).copied()?;
-        if e.active > 0 {
+        // A close publishing the file may be tagged with another file's
+        // grant (`Inflight::publishing`): counted here on its own.
+        if e.active > 0 || e.publishing > 0 {
             return Some(None);
         }
         if e.pinned_until_ms > now_ms {
@@ -2006,18 +2080,24 @@ impl LockTables {
         if !covered {
             return LocalOutcome::NeedGrant(need);
         }
-        // A new turn on this node under a grant an earlier turn's ops are
-        // still tagged with (in flight, or in doubt and not yet past their
-        // windows) waits for them: the grant is live at its minter, so the
-        // token would let them land after this turn's writes (review
-        // round 2, should-fix 1). The release waits the same way.
+        // A new turn on this node under a grant that what an earlier turn
+        // counts as done is still on its way under — a close's publication
+        // of the file, or a tagged op left in doubt and not yet past its
+        // window — waits for it: the grant is live at its minter, so the
+        // token would let it land after this turn's writes (review round
+        // 2, should-fix 1). A tagged op still waiting for its answer is
+        // not waited for: its caller has not seen it done, so it is
+        // concurrent with the unlock (another thread of the process, or
+        // xcheckfs mirroring every application through one process), and
+        // a non-blocking request refused behind it answered `EAGAIN` with
+        // no lock in the way. The release waits for every tagged op.
         let new_turn = g.local.get(&ino).is_none_or(|v| v.is_empty());
         if new_turn {
             let id = g.held.get(&ino).map(|h| h.id);
             if id.is_some_and(|id| {
                 g.inflight
                     .get(&id)
-                    .is_some_and(|e| e.active > 0 || e.pinned_until_ms > now_ms)
+                    .is_some_and(|e| e.publishing > 0 || e.pinned_until_ms > now_ms)
             }) {
                 // Counted once per request by the caller, which may ask
                 // again many times (`LockStats::predecessor_waits`).
@@ -3453,9 +3533,11 @@ mod token_tests {
     /// Review round 2, should-fix 1: owner 10's op under the grant ends
     /// in doubt, 10 unlocks, and owner 11 on the same node locks under the
     /// same held grant. The grant is live at its minter, so 10's op could
-    /// land after 11's writes: 11's lock waits (`Predecessor`) while the
-    /// op is in flight and until its window is over. An owner that joins
-    /// a turn still holding a lock there does not wait.
+    /// land after 11's writes: 11's lock waits (`Predecessor`) until the
+    /// op's window is over — from the moment it was found in doubt, before
+    /// its answer went out. So does a lock behind a close's publication of
+    /// the file (what the turn wrote, published after its locks went). An
+    /// owner that joins a turn still holding a lock there does not wait.
     #[test]
     fn a_new_turn_waits_for_the_previous_turns_tagged_ops() {
         let t = LockTables::default();
@@ -3467,6 +3549,7 @@ mod token_tests {
         }]);
         assert_eq!(t.local_set(7, lk(10, true, 0, 9), 0), LocalOutcome::Done);
         t.tag_begin(&tag, 0);
+        t.publish_begin(id);
         assert_eq!(
             t.local_set(7, lk(11, false, 20, 29), 0),
             LocalOutcome::Done,
@@ -3477,7 +3560,14 @@ mod token_tests {
         assert_eq!(
             t.local_set(7, lk(11, true, 0, 9), 10),
             LocalOutcome::Predecessor,
-            "in flight"
+            "a close's publication in flight"
+        );
+        t.publish_end(id, 12);
+        t.pin_in_doubt(&tag);
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), 15),
+            LocalOutcome::Predecessor,
+            "in doubt, before the op's answer and scope end"
         );
         t.tag_end(&tag, true, 20);
         assert_eq!(
@@ -3486,6 +3576,35 @@ mod token_tests {
             "in doubt inside its window"
         );
         assert_eq!(t.local_set(7, lk(11, true, 0, 9), 500), LocalOutcome::Done);
+        assert_eq!(t.release_blocked(id, 500), None, "nothing left behind");
+    }
+
+    /// A tagged op still waiting for its answer when its owner's turn ends
+    /// (another thread of the process: every op the process issues carries
+    /// its grants) is concurrent with the unlock: the next turn does not
+    /// wait for it — a non-blocking lock refused behind it answered
+    /// `EAGAIN` with no lock in the way (xcheckfs: `setlk` OK on ext4,
+    /// conflict here, under load) — but the release still does.
+    #[test]
+    fn a_new_turn_does_not_wait_for_an_unanswered_op() {
+        let t = LockTables::default();
+        t.install_held(7, held(LockMode::Exclusive, 10_000));
+        let id = GrantId { node: 1, seq: 1 };
+        let tag = LockTag(vec![LockToken {
+            grant: id,
+            until_ms: 500,
+        }]);
+        assert_eq!(t.local_set(7, lk(10, true, 0, 9), 0), LocalOutcome::Done);
+        t.tag_begin(&tag, 0);
+        t.local_unlock(7, 10, 0, u64::MAX, 10);
+        assert_eq!(t.release_blocked(id, 10), Some(None), "the release waits");
+        assert_eq!(
+            t.local_set(7, lk(11, true, 0, 9), 10),
+            LocalOutcome::Done,
+            "the next turn does not"
+        );
+        t.tag_end(&tag, false, 20);
+        assert_eq!(t.release_blocked(id, 20), None);
     }
 
     /// The review nit: a shared lock under an honoured shared grant is not

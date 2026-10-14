@@ -126,9 +126,11 @@ pub fn lock_cache_idle_ms(default: u64) -> u64 {
 /// open file description leaves behind may wait for it to go — the
 /// description's own locks, which the kernel's `RELEASE` drops after
 /// `close(2)` returned, at most this long from the close (the view's
-/// `lock_handles`), and the release's publication still in flight under
-/// the grant (`LocalOutcome::Predecessor`) — and never more than this
-/// long from the request itself, however many closes follow. Far above
+/// `lock_handles`), and a close's publication of the file still in flight
+/// under the grant or an op of the earlier turn left in doubt
+/// (`LocalOutcome::Predecessor`; a pin can outlast the wait, which then
+/// answers `EAGAIN`) — and never more than this long from the request
+/// itself, however many closes follow. Far above
 /// the lag measured on a loaded host (p99 2–4 ms), and short enough that
 /// a request behind a lock whose description stays open (a `dup`'s
 /// close) is not held up for long.
@@ -227,8 +229,8 @@ const OFFSET_MAX: u64 = i64::MAX as u64;
 /// update).
 const LOCAL_POLL: Duration = Duration::from_millis(15);
 
-/// How often a non-blocking request behind an earlier turn's ops in
-/// flight re-checks (see [`close_wait`]).
+/// How often a non-blocking request behind an earlier turn's close
+/// publication or op in doubt re-checks (see [`close_wait`]).
 const PREDECESSOR_POLL: Duration = Duration::from_micros(200);
 
 /// How long a granted lock waits for the kernel to drop its cache of the
@@ -578,7 +580,8 @@ impl ClusterLocks {
     }
 
     /// A non-blocking [`Self::lock_here`] that waits for an earlier turn's
-    /// ops in flight (`LocalOutcome::Predecessor`) until `deadline` at
+    /// close publication or op in doubt (`LocalOutcome::Predecessor`) until
+    /// `deadline` at
     /// most: the request's own bound, shared with the view's wait for
     /// closing descriptions (`View::past_closing_locks`), so the two
     /// together never hold it longer than [`close_wait`].
@@ -593,7 +596,8 @@ impl ClusterLocks {
     }
 
     /// `deadline`: how long a non-blocking request waits for an earlier
-    /// turn's ops ([`Self::try_lock_by`]); [`close_wait`] from its first
+    /// turn's close publication or op in doubt ([`Self::try_lock_by`]);
+    /// [`close_wait`] from its first
     /// `Predecessor` when `None`.
     fn set(
         &self,
@@ -648,12 +652,13 @@ impl ClusterLocks {
                             .get_or_insert_with(|| std::time::Instant::now() + close_wait())
                             > std::time::Instant::now() =>
                 {
-                    // Nothing is in the way but an earlier turn's ops still
-                    // in flight under the grant: the publication of a
-                    // release the kernel sent after `close(2)` returned,
-                    // or an op whose answer is already out (its tag ends
-                    // after it). A local file system would grant now:
-                    // wait for them a little rather than refuse.
+                    // Nothing is in the way but what an earlier turn counts
+                    // as done still on its way under the grant: a close's
+                    // publication of the file (a `RELEASE` the kernel sent
+                    // after `close(2)` returned, a `FLUSH` that dropped the
+                    // closer's locks first), or an op left in doubt. A
+                    // local file system would grant now: wait for it a
+                    // little rather than refuse.
                     std::thread::sleep(PREDECESSOR_POLL);
                 }
                 outcome @ (LocalOutcome::Conflict(_) | LocalOutcome::Predecessor) => {
@@ -662,8 +667,8 @@ impl ClusterLocks {
                             tracing::debug!(
                                 target: "constellation::locks",
                                 ino,
-                                "a non-blocking lock request is refused: an earlier turn's ops \
-                                 are still in flight after the close wait"
+                                "a non-blocking lock request is refused: an earlier turn's close \
+                                 is still publishing, or its op in doubt, after the close wait"
                             );
                         }
                         return Err(Code::Again);
@@ -805,6 +810,12 @@ struct ScopeState {
     /// A mutation of this op ended in doubt: it may still execute, so
     /// its grants wait for its tokens' windows before a release.
     in_doubt: bool,
+    /// The file whose turn this scope's op ends: a close (`FLUSH`,
+    /// `RELEASE`) that drops its caller's locks there and publishes it
+    /// ([`begin_close`]), or the flush before a grant's release
+    /// ([`ClusterLocks::fixed_tag_scope`]). A mutation of it that ends in
+    /// doubt pins that file's grant ([`note_tag_in_doubt`]).
+    closes: Option<Ino>,
 }
 
 thread_local! {
@@ -886,13 +897,15 @@ impl ClusterLocks {
             sent: LockTag::NONE,
             doubt: LockTag::NONE,
             in_doubt: false,
+            closes: None,
         })
     }
 
     /// A scope whose mutations carry `tag` whoever runs them: a recalled
     /// grant's flush (`Action::LockFlush`), on the driver's thread,
-    /// publishes the locked file under the grant it is about to release.
-    pub fn fixed_tag_scope(self: &Arc<Self>, tag: LockTag) -> TagScope {
+    /// publishes the locked file `ino` under the grant it is about to
+    /// release.
+    pub fn fixed_tag_scope(self: &Arc<Self>, tag: LockTag, ino: Ino) -> TagScope {
         if tag.is_empty() {
             return TagScope::inert();
         }
@@ -905,6 +918,7 @@ impl ClusterLocks {
             sent: LockTag::NONE,
             doubt: LockTag::NONE,
             in_doubt: false,
+            closes: Some(ino),
         })
     }
 }
@@ -994,7 +1008,10 @@ pub fn reissue_after_lapse() -> bool {
 
 /// A tagged mutation of this op ended in doubt (it may still execute
 /// somewhere): its grants are not released before its tokens' windows
-/// are over.
+/// are over, and no new local turn starts under them before then either
+/// (`LocalOutcome::Predecessor`) — pinned now, before the op answers.
+/// A close that ends its caller's turn on a file pins that file's grant
+/// too ([`begin_close`]).
 pub fn note_tag_in_doubt() {
     SCOPE.with(|s| {
         if let Some(st) = s.borrow_mut().as_mut() {
@@ -1005,9 +1022,96 @@ pub fn note_tag_in_doubt() {
             {
                 st.in_doubt = true;
                 st.doubt = st.sent.clone();
+                // Pinned now, before the op answers: the answer lets its
+                // caller unlock, and the next turn must find the pin
+                // (`LocalOutcome::Predecessor`), not wait for the scope's
+                // end (`TagScope::drop` pins it again, harmlessly).
+                let table = st.locks.meta.locks();
+                table.pin_in_doubt(&st.doubt);
+                // A close ending its caller's turn on a file
+                // ([`begin_close`]) pins that file's grant too, whatever
+                // its token names (one grant per minter, the one whose
+                // window ends first: maybe another file's), until the
+                // grant's window as held now.
+                if let Some(h) = st.closes.and_then(|ino| table.held(ino)) {
+                    table.pin_in_doubt(&LockTag(vec![constellation_meta::locks::LockToken {
+                        grant: h.id,
+                        until_ms: h.until_ms,
+                    }]));
+                }
             }
         }
     });
+}
+
+/// `current_tag` for a close (`FLUSH`, `RELEASE`) of `ino`, called before
+/// the close drops its caller's locks: the scope's grants are worked out
+/// (and the op counted in flight under them) now. `ends_turn`: the close
+/// drops locks of its caller on `ino` and publishes the file — what that
+/// turn wrote, which its application counts as done once its `close(2)`
+/// returned (or, for a `RELEASE`, before the kernel even sent it), and
+/// which must land before what the next turn writes. Then a new local
+/// turn on the file waits (`LockTables::publish_begin`,
+/// `LocalOutcome::Predecessor`) from now — before the drop, so no turn
+/// starts between the drop and the commit — until the returned guard is
+/// dropped, after the publication; and the file's grant is pinned if one
+/// of the close's mutations ends in doubt ([`note_tag_in_doubt`]). Other
+/// closes (no lock of the caller on the file: an unrelated commit), and
+/// other publications (an `fsync`, an `O_SYNC` write, answered when done,
+/// so concurrent with any unlock until then), hold no new turn. A fenced
+/// caller's `Err` is not lost: `current_tag` noted the lapse, and the
+/// close's publish gate discards what it wrote.
+pub fn begin_close(ino: Ino, ends_turn: bool) -> Publishing {
+    let _ = current_tag();
+    if !ends_turn {
+        return Publishing { held: None };
+    }
+    let held = SCOPE.with(|s| {
+        let mut s = s.borrow_mut();
+        let st = s.as_mut()?;
+        // A fenced caller's writes are discarded, never published.
+        if matches!(st.tag, Some(Err(_))) {
+            return None;
+        }
+        // Counted under the grant held on the file now, whatever the tag
+        // names: it names, per minting sequencer, only the grant whose
+        // window ends first, which may be another file's (a process
+        // holding locks on A and B closes A under B's token) — or none,
+        // when the closer's process is not told apart from its lock's
+        // (`ends_turn` is the caller's own reading of the lock table).
+        st.closes = Some(ino);
+        let grant = st.locks.meta.locks().held(ino).map(|h| h.id)?;
+        st.locks.meta.locks().publish_begin(grant);
+        Some((st.locks.clone(), grant))
+    });
+    Publishing { held }
+}
+
+/// A publication a new local turn on its file waits for, under `grant`
+/// (see [`begin_close`]); [`ClusterLocks::publishing`] for a grant
+/// release's flush. Ends when dropped.
+#[must_use]
+pub struct Publishing {
+    held: Option<(Arc<ClusterLocks>, GrantId)>,
+}
+
+impl Drop for Publishing {
+    fn drop(&mut self) {
+        if let Some((locks, grant)) = self.held.take() {
+            locks.meta.locks().publish_end(grant, now_ms());
+        }
+    }
+}
+
+impl ClusterLocks {
+    /// The flush before `grant`'s release publishes its file under it
+    /// (`LockFlush`): counted as [`begin_close`] counts a close's.
+    pub fn publishing(self: &Arc<Self>, grant: GrantId) -> Publishing {
+        self.meta.locks().publish_begin(grant);
+        Publishing {
+            held: Some((self.clone(), grant)),
+        }
+    }
 }
 
 thread_local! {

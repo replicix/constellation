@@ -1032,7 +1032,8 @@ of another node's `close()` out of band, with no lock between them
   `FLUSH` drops the closing process's POSIX locks, and the description's
   `RELEASE` its OFD and `flock` locks. `RELEASE` comes after `close(2)`
   returned, so a non-blocking request (or a test) that only a just-closed
-  description's locks, or the earlier turn's operations still in flight,
+  description's locks, or the earlier turn's close still publishing the
+  file (or its operation left in doubt),
   stand in the way of waits for them, for at most
   `CONSTELLATION_LOCK_CLOSE_WAIT_MS` (100 ms) from the close and from
   the request, instead of seeing a lock that a local file system would

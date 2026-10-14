@@ -1259,9 +1259,23 @@ impl Vfs for View {
         let ino = enter!(self, ino, r);
         // Plan 30 §M14 phase 2: the close publishes under the locks its
         // caller holds now — the tag is taken before the close drops the
-        // caller's locks on this file below.
+        // caller's locks on this file below. A close that ends its
+        // caller's turn on the file (it drops the caller's locks there)
+        // and publishes counts as that turn's publication from before the
+        // drop until the publication is over: a new turn on the file waits
+        // for it (`crate::locks::begin_close`).
         let _lock_tag = self.lock_tag_scope(cx);
-        let _ = crate::locks::current_tag();
+        let locks = self.cluster_locks().filter(|_| !View::is_synthetic(ino));
+        let publishes = self.handles.writes(fh);
+        let ends_turn = publishes
+            && locks.is_some_and(|l| {
+                l.meta
+                    .locks()
+                    .local_locks(ino)
+                    .iter()
+                    .any(|held| held.owner == owner.0)
+            });
+        let publishing = crate::locks::begin_close(ino, ends_turn);
         // Plan 30 §M14: the fence first, while the closing owner's locks
         // are still there (dropping them would lift it): data written
         // under a lapsed grant is discarded, never published. Then the
@@ -1269,10 +1283,8 @@ impl Vfs for View {
         // descriptor's close, as POSIX says). The kernel sends no unlock
         // of its own: it keeps no lock for a file whose locks it forwards
         // (`lock_handles`' module doc), so this is the only one.
-        let locks = self.cluster_locks().filter(|_| !View::is_synthetic(ino));
         let gate = self.lock_publish_gate(ino, fh);
         let idle = locks.map(|l| l.drop_owner(ino, owner.0));
-        let publishes = self.handles.writes(fh);
         let result = gate.and_then(|owed| {
             if publishes {
                 self.flush_inode(ino, false)?;
@@ -1295,11 +1307,11 @@ impl Vfs for View {
         if locks.is_some_and(|l| !l.meta.locks().lockers_none()) {
             self.note_handle_closed(fh);
         }
-        // The close's fencing-token scope ends before its answer, not
-        // after: the closer's next lock request, which the answer lets the
-        // kernel send, would otherwise find this op still in flight under
-        // the grant and be refused as a new turn behind it
-        // (`LocalOutcome::Predecessor`). Nothing is published past here.
+        // The close's publication and fencing-token scope end before its
+        // answer, not after: nothing is published past here, and neither
+        // the closer's next lock request (a new turn) nor the release of
+        // a recalled grant is held behind this op once it is answered.
+        drop(publishing);
         drop(_lock_tag);
         match result {
             Ok(()) => r.done(Ok(())),
@@ -1336,8 +1348,22 @@ impl Vfs for View {
         // drops its `flock` lock (whose owner is the open file). Phase 2:
         // the fencing token is taken before that, as in `flush`.
         let _lock_tag = self.lock_tag_scope(cx);
-        let _ = crate::locks::current_tag();
         let locks = self.cluster_locks();
+        // The description's own owners (and the `flock` owner the kernel
+        // names) lose their locks on the file below: when they held any
+        // and the close publishes, it is their turn's publication, which a
+        // new turn waits for from before the drop (as in `flush`).
+        let ends_turn = publishes
+            && locks.is_some_and(|l| {
+                let mut owners = self.lock_handles.owners_on(fh.0, ino);
+                owners.extend(owner.map(|o| o.0));
+                l.meta
+                    .locks()
+                    .local_locks(ino)
+                    .iter()
+                    .any(|held| owners.contains(&held.owner))
+            });
+        let publishing = crate::locks::begin_close(ino, ends_turn);
         let gate = self.lock_publish_gate(ino, fh);
         drop(_closed);
         // The open file description's own (OFD) locks end with it too. A
@@ -1362,6 +1388,7 @@ impl Vfs for View {
             }
             Ok(())
         });
+        drop(publishing);
         if let (Some(l), true) = (locks, idle) {
             l.idle(ino);
         }

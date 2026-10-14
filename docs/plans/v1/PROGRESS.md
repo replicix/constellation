@@ -46746,3 +46746,100 @@ The publish branch now registers the replaced file before the mutation
 and settles it after, as the rename branch does.
 `view::quota_tests::a_file_a_publish_replaces_is_kept_for_the_kernels_reference`
 fails without it.
+
+## Fix: a new lock turn does not wait for another thread's unanswered op (xcheckfs `setlk` conflict under load, 2026-10-14)
+
+The 88f246f verification soaks (6 cells, 8 of 8 soaks, also with
+`CONSTELLATION_LOCK_TTL_MS=150000`) had 1–4 xcheckfs mismatches each
+from stress-ng's `fcntl` stressor: `setlk` OK on ext4, conflict on
+constellation, sometimes a `getlk` after it (ext4 names the lock the
+secondary never took). The lane's 20 s fcntl stage and every isolated
+run were clean.
+
+### Cause
+
+Plan 30 §M14 phase 2 (`f57db3c`) tags every mutation a process issues
+while it holds a lock with the lock's grant (the fencing token is per
+process, through `/proc` lineage), and `local_set` answered
+`Predecessor` to a new turn (no local lock left on the inode) while
+*any* op tagged with the held grant was in flight. `2598b1e` let a
+non-blocking request wait for that up to
+`CONSTELLATION_LOCK_CLOSE_WAIT_MS` (100 ms), then answer `EAGAIN` —
+with no lock in the way. xcheckfs mirrors every application through
+one process, so while the stressor held a lock every fio, untar, git
+and cp op it replayed carried the stressor's grant; under the soak's
+load (metadata writer-lock stalls of 0.2–0.6 s back to back at both
+mismatch times) one of them outlasted the close wait plus xcheckfs's
+own settle retries (~1 s). Natively: one process, a thread taking and
+dropping an `F_SETLK` on a file nobody else locks beside a thread
+writing and fsyncing another file got `EAGAIN` 40 times in 5368 tries
+(30 s, `--write-mode through --fsync-mode s3`, debug log: "an earlier
+turn's ops are still in flight after the close wait" each time); ext4
+none.
+
+An op still waiting for its answer is concurrent with the unlock: its
+caller has not seen it done, and on a local file system too it may take
+effect after the next holder's writes. What the new turn must wait for
+(review round 2, should-fix 1: it could land at the minter, which
+honours the grant, after the new turn's writes) is what the earlier
+turn counts as done: a close's publication of the file (`FLUSH` drops
+the closer's POSIX locks and then publishes; `RELEASE` publishes after
+`close(2)` returned) and an op that ended in doubt.
+
+### What changed
+
+- `LockTables`' per-grant in-flight record counts, besides every
+  tagged op (the release waits for all of them, unchanged), the
+  publications of the grant's own file by a close or by the release's
+  flush (`publish_begin`/`publish_end`), and `local_set` answers
+  `Predecessor` only for those and for pins of ops in doubt.
+- An op found in doubt pins its grant at once (`pin_in_doubt`, from
+  `note_tag_in_doubt`), before its answer can let its caller unlock —
+  not only when its scope ends.
+- The engine: `flush` and `release` call `locks::begin_close(ino,
+  ends_turn)` before they drop any lock, `ends_turn` being whether the
+  close publishes (a writable description) and drops locks of its caller
+  on the file (`FLUSH`: its POSIX owner's; `RELEASE`: the owners bound to
+  the description and the `flock` owner). Only then does it count, from
+  before the drop — no new turn starts between the drop and the commit,
+  which may first wait for the file's operation lock behind an `fsync` —
+  until the publication is over (the returned `Publishing` guard,
+  dropped before the answer), under the grant held on that file now,
+  not necessarily the one the close's token names (one grant per minter,
+  the one whose window ends first). A close by a process whose locks are
+  on other files holds no new turn here. The lock release's flush counts
+  the same way (`ClusterLocks::publishing`, `fixed_tag_scope(tag, ino)`).
+  `release_blocked` waits for these publications too, and their end
+  wakes a waiting release.
+- A close that ends its caller's turn and has a mutation end in doubt
+  also pins the closed file's grant (to the grant's window as held),
+  whatever its token names.
+- Why the narrowing is safe (review): one file's publications on a node
+  are serialized by its operation lock, so the new turn's commit is not
+  sent before an earlier one was answered, and a stale replay is refused
+  by its manifest base; release ordering across nodes is unchanged.
+- Residual, documented: an op of the same process that ended in doubt
+  still pins the grant for up to its window (`ttl − margin`), and a
+  non-blocking request answers `EAGAIN` meanwhile — through xcheckfs,
+  any mirrored application's op after an S3 or sequencer blip.
+- Docs: cluster-locks.md (Close and release, release ordering, the
+  stats), configuration.md, DESIGN.md, ADR-25 amendment.
+
+### Tests
+
+- `meta::locks::token_tests::a_new_turn_does_not_wait_for_an_unanswered_op` and
+  `view::owner_fence_tests::a_non_blocking_lock_does_not_wait_for_another_threads_unanswered_op`
+  fail on main (`Predecessor`; `EAGAIN` after the close wait).
+- `a_new_turn_waits_for_the_previous_turns_tagged_ops` (a close's
+  publication; in doubt before the scope's end and inside the window),
+  `a_non_blocking_lock_waits_for_the_earlier_turns_close_publication`,
+  `a_new_turn_waits_for_an_op_in_doubt_before_its_scope_ends`, and
+  `a_new_turn_waits_for_a_closes_publication_through_the_view` (a
+  `FLUSH` and a `RELEASE` through the view with the forwarded commit's
+  answer held back: the lock waits, then is granted; a close by a
+  process whose lock is on another file holds nothing — it fails if
+  either op's wiring is dropped).
+- Follow-up, not changed here: the release of a file's grant does not
+  wait for an op on that file in flight whose token names another
+  file's grant (the per-minter collapse; `release_blocked` on the file's
+  grant sees nothing of it).

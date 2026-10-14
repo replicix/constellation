@@ -4030,7 +4030,7 @@
           "type": "integer"
         },
         "predecessor_waits": {
-          "description": "A new local lock that waited for an earlier turn's mutations\ntagged with the same grant (in flight, or in doubt inside their\nwindow) before it was taken.",
+          "description": "A new local lock that waited for what an earlier turn under the\nsame grant counts as done (a close still publishing the file, or a\nmutation in doubt inside its window) before it was taken.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

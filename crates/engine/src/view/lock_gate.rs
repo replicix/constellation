@@ -190,8 +190,16 @@ impl crate::locks::LockFlush for View {
                     }])
                 })
                 .unwrap_or_default();
-            l.fixed_tag_scope(tag)
+            l.fixed_tag_scope(tag, ino)
         });
+        // What the flush publishes was written under the grant: a new
+        // local turn waits for it (`crate::locks::begin_close`). (One under
+        // a recalled grant asks for a new grant anyway; counted all the
+        // same, as the release waits for it.)
+        let _publishing = self
+            .cluster_locks()
+            .filter(|l| l.meta.locks().held(ino).is_some_and(|h| h.id == grant))
+            .map(|l| l.publishing(grant));
         // The release's flush publishes only what its grant still covers:
         // one that lapsed meanwhile (a partition, a stalled node) has
         // been outwaited by its owner, who may have granted the file

@@ -890,6 +890,28 @@ flight (a `dup`'s close is followed by none, and the daemon cannot tell
 the last close from the others). See
 [Close and release](../reference/features/cluster-locks.md#close-and-release).
 
+**Amended (concurrent operations)**: a new turn on a node waits only
+for what the earlier turn counts as done and may still land at the
+minter after the new turn's writes — a close's (`FLUSH`, `RELEASE`)
+publication of the file under the grant, and an operation tagged with
+the grant that ended in doubt, pinned from the moment it is found in
+doubt, before its answer. It no longer waits for every tagged operation
+in flight: the fencing token is per process, so another thread's
+operation (or, through xcheckfs, any mirrored application's) carried
+the grant, and under load a non-blocking lock nobody held waited for it
+past `CONSTELLATION_LOCK_CLOSE_WAIT_MS` and answered `EAGAIN`. An
+operation still waiting for its answer is concurrent with the unlock;
+the release still waits for it. What makes the narrowing safe beyond
+that: the node commits one file's publications one at a time (its
+operation lock), so a new turn's commit of the file is never sent
+before an earlier one was answered, and a stale commit replayed later
+is refused by its manifest base. Residual: an operation of the same
+process that ended in doubt, on any file, still pins the grant for up
+to its window, and a non-blocking request answers `EAGAIN` meanwhile.
+Rejected: an unbounded wait for every
+tagged operation (correct answers, but `F_SETLK` would stall behind an
+unrelated `fsync`, for as long as an S3 outage lasts).
+
 ## ADR-26: Exact chunk-location reconciliation replaces bloom digests
 
 **Context**: peers learned each other's cached chunks from bloom-filter

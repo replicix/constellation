@@ -1392,9 +1392,9 @@ pub struct LockStatus {
     /// release waited for such a mutation to be answered.
     pub tagged_ops: u64,
     pub release_waits: u64,
-    /// A new local lock that waited for an earlier turn's mutations
-    /// tagged with the same grant (in flight, or in doubt inside their
-    /// window) before it was taken.
+    /// A new local lock that waited for what an earlier turn under the
+    /// same grant counts as done (a close still publishing the file, or a
+    /// mutation in doubt inside its window) before it was taken.
     pub predecessor_waits: u64,
     /// Owner side: grant and renewal answers that waited for the restart
     /// horizon's durable write (run off the authority core), and those

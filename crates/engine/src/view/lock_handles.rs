@@ -72,11 +72,13 @@
 //!
 //! The `RELEASE` also publishes what was written under the locks, tagged
 //! with the grant (f57db3c, the fencing token), after it dropped them; a
-//! new turn on the node waits for an earlier turn's ops in flight under
-//! the grant (`LocalOutcome::Predecessor`). A non-blocking request waits
-//! for those too, until the same deadline (`ClusterLocks::try_lock_by`);
-//! they finish without a FUSE worker, so this wait is kept on a single
-//! worker.
+//! new turn on the node waits for that publication (and for an op of the
+//! earlier turn left in doubt), not for tagged ops still waiting for
+//! their answer, which are concurrent with the unlock
+//! (`LocalOutcome::Predecessor`, `crate::locks::begin_close`). A
+//! non-blocking request waits for it too, until the same deadline
+//! (`ClusterLocks::try_lock_by`); it finishes without a FUSE worker, so
+//! this wait is kept on a single worker.
 
 use constellation_fs_core::Ino;
 use std::collections::{HashMap, HashSet};
@@ -185,6 +187,23 @@ impl LockHandles {
         }
         handles.retain(|k, h| *k == fh || !h.owners.is_empty());
         handles.entry(fh).or_default().owners.insert((ino, owner));
+    }
+
+    /// The owners bound to `fh` that locked `ino` through it: what its
+    /// `RELEASE` drops there ([`Self::release`]).
+    pub(crate) fn owners_on(&self, fh: u64, ino: Ino) -> Vec<u64> {
+        self.by_fh
+            .lock()
+            .unwrap()
+            .get(&fh)
+            .map(|h| {
+                h.owners
+                    .iter()
+                    .filter(|(i, _)| *i == ino)
+                    .map(|(_, o)| *o)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// A lock op other than a lock request (an unlock, a test) came

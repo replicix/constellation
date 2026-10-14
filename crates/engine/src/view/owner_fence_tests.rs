@@ -1108,14 +1108,29 @@ fn a_dups_close_keeps_the_descriptions_lock() {
     assert!(f.meta.locks().local_locks(ino).is_empty());
 }
 
-/// The release publishes what was written under the locks after it
-/// dropped them, under the grant's fencing token, and a new turn waits
-/// for an earlier turn's ops in flight (`Predecessor`) — as it does for
-/// any op whose tag ends just after its answer went out. A non-blocking
-/// request with nothing else in its way waits for them (a local file
-/// system would grant it) instead of answering `EAGAIN`.
+/// `F_UNLCK` of `owner`'s `[0, 9]` through `fh`.
+fn unlock_range(f: &Fenced, caller: &Caller, ino: Ino, fh: Fh, owner: u64) {
+    Blocking::run(|r| {
+        f.fs.lock_release(
+            &OpCtx::new(OpKind::LockRelease, caller),
+            ino,
+            fh,
+            LockOwner(owner),
+            LockRange { start: 0, end: 9 },
+            r,
+        )
+    })
+    .unwrap();
+}
+
+/// A close publishes what was written under the locks after it dropped
+/// them (a `FLUSH` drops its caller's POSIX locks first; a `RELEASE` comes
+/// after `close(2)` returned), under the grant's fencing token, and a new
+/// turn waits for that publication (`Predecessor`). A non-blocking request
+/// with nothing else in its way waits for it (a local file system would
+/// grant it) instead of answering `EAGAIN`.
 #[test]
-fn a_non_blocking_lock_waits_for_the_earlier_turns_ops_in_flight() {
+fn a_non_blocking_lock_waits_for_the_earlier_turns_close_publication() {
     let f = fenced_fs();
     let me = std::process::id();
     let caller = Caller::new(0, 0, Some(me));
@@ -1124,11 +1139,11 @@ fn a_non_blocking_lock_waits_for_the_earlier_turns_ops_in_flight() {
     let locks = f.fs.cluster_locks().unwrap().clone();
     let (tagged, in_flight) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
-        // The earlier turn's op, tagged with the grant while 0xa held its
-        // lock, still in flight after the lock is gone.
+        // The earlier turn's close, tagged with the grant while 0xa held
+        // its lock, still publishing the file after the lock is gone.
         s.spawn(|| {
             let _scope = locks.tag_scope(Some(me), Some(0xa));
-            crate::locks::current_tag().unwrap();
+            let _publishing = crate::locks::begin_close(ino, true);
             tagged.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(20));
         });
@@ -1139,7 +1154,7 @@ fn a_non_blocking_lock_waits_for_the_earlier_turns_ops_in_flight() {
         assert_eq!(
             try_lock(&f, &caller, ino, b, 0xb),
             Ok(()),
-            "granted once the earlier turn's op ended"
+            "granted once the earlier turn's publication ended"
         );
         assert_eq!(
             f.meta.locks().stats().predecessor_waits,
@@ -1147,6 +1162,202 @@ fn a_non_blocking_lock_waits_for_the_earlier_turns_ops_in_flight() {
             "counted once per request, not per look"
         );
     });
+    release(&f, &caller, ino, b);
+}
+
+/// Through the view: a `FLUSH` that drops its caller's POSIX lock and a
+/// `RELEASE` that drops the description's OFD lock publish what was
+/// written under it afterwards (a non-holder forwards the commit; the
+/// core's answer is held back here). A non-blocking lock of another
+/// description waits for that publication (`Predecessor`), from before
+/// the drop, and is granted once the commit is answered. A close by a
+/// process whose locks are on another file only (a commit unrelated to
+/// any turn on this one) holds no new turn here.
+#[test]
+fn a_new_turn_waits_for_a_closes_publication_through_the_view() {
+    for (last_close, ends_turn) in [(false, true), (true, true), (false, false)] {
+        let mut f = fenced_fs();
+        let me = std::process::id();
+        let caller = Caller::new(0, 0, Some(me));
+        let (ino, a, b) = two_descriptions(&f, &caller, "published");
+        if ends_turn {
+            try_lock(&f, &caller, ino, a, 0xa).unwrap();
+        } else {
+            // 0xa holds a lock on another file, none on this one, whose
+            // grant stays cached here from an earlier turn.
+            let (other, c, _) = two_descriptions(&f, &caller, "elsewhere");
+            f.meta.locks().install_held(
+                other,
+                HeldGrant {
+                    id: GrantId { node: 9, seq: 2 },
+                    ..f.meta.locks().held(ino).unwrap()
+                },
+            );
+            try_lock(&f, &caller, other, c, 0xa).unwrap();
+        }
+        f.write(&OpCtx::new(OpKind::Write, &caller), ino, a)
+            .unwrap();
+        // Not the holder from here on: the close's commit goes to the
+        // core, which answers it when this test says so.
+        f.fs.sync.as_mut().unwrap().lease = Arc::new(crate::lease::LeaseView::default());
+        let mut core = std::mem::replace(&mut f._core, tokio::sync::mpsc::unbounded_channel().1);
+        let accepted = || {
+            constellation_authority::ClientReply::Outcome(
+                constellation_meta::MutateOutcome::Accepted {
+                    epoch: 1,
+                    records: Vec::new(),
+                },
+            )
+        };
+        let before = f.meta.locks().stats().predecessor_waits;
+        std::thread::scope(|s| {
+            let close = s.spawn(|| {
+                if last_close {
+                    release(&f, &caller, ino, a);
+                } else {
+                    Blocking::run(|r| {
+                        f.fs.flush(
+                            &OpCtx::new(OpKind::Flush, &caller),
+                            ino,
+                            a,
+                            LockOwner(0xa),
+                            r,
+                        )
+                    })
+                    .unwrap();
+                }
+            });
+            let started = Instant::now();
+            let mut lock = None;
+            let mut held = None;
+            loop {
+                match core.try_recv() {
+                    Ok(SyncRequest::DrainInode { reply, .. }) => reply.send(Ok(())).unwrap(),
+                    Ok(SyncRequest::Submit { reply, .. }) if held.is_none() && lock.is_none() => {
+                        // The commit is on its way, the lock already gone.
+                        assert!(f.meta.locks().local_locks(ino).is_empty());
+                        held = Some(reply);
+                        lock = Some(s.spawn(|| try_lock(&f, &caller, ino, b, 0xb)));
+                    }
+                    Ok(SyncRequest::Submit { reply, .. }) => reply.send(accepted()).unwrap(),
+                    Ok(_) => {}
+                    Err(_) if close.is_finished() && held.is_none() => break,
+                    Err(_) => {
+                        assert!(
+                            started.elapsed() < Duration::from_secs(20),
+                            "the close is stuck"
+                        );
+                        let waiting = f.meta.locks().stats().predecessor_waits == before + 1;
+                        let answered = lock.as_ref().is_some_and(|l| l.is_finished());
+                        if held.is_some() && (waiting || answered) {
+                            // The lock request waits for the publication
+                            // (or was answered without): answer the commit.
+                            assert_eq!(answered, !ends_turn, "waits only behind its turn's close");
+                            held.take().unwrap().send(accepted()).unwrap();
+                        }
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+            }
+            let lock = lock.expect("the close forwarded its commit");
+            assert_eq!(
+                lock.join().unwrap(),
+                Ok(()),
+                "granted (last close: {last_close}, ends a turn: {ends_turn})"
+            );
+        });
+        assert_eq!(
+            f.meta.locks().stats().predecessor_waits,
+            before + u64::from(ends_turn)
+        );
+        unlock_range(&f, &caller, ino, b, 0xb);
+    }
+}
+
+/// Every op a process issues while it holds a lock carries the lock's
+/// grant (the fencing token is per process), so another thread's op —
+/// a slow `fsync` of another file, or, through xcheckfs, which mirrors
+/// every application through one process, any application's — can still
+/// be in flight under the grant when the turn ends. It is concurrent with
+/// the unlock (its caller has no answer yet), and the next turn does not
+/// wait for it: a non-blocking lock nobody else holds is granted at once.
+/// It used to wait for the op up to the close wait, then answer `EAGAIN`
+/// with no lock in the way (xcheckfs: `setlk` OK on ext4, conflict here,
+/// under load; one process, 40 of 5400 `F_SETLK`s beside a thread
+/// writing and fsyncing another file).
+#[test]
+fn a_non_blocking_lock_does_not_wait_for_another_threads_unanswered_op() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let caller = Caller::new(0, 0, Some(me));
+    let (ino, a, b) = two_descriptions(&f, &caller, "concurrent");
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let (tagged, in_flight) = std::sync::mpsc::channel();
+    let (answered, done) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        // The other thread's op, tagged with the grant while 0xa held its
+        // lock, unanswered until the lock request below is.
+        s.spawn(move || {
+            let _scope = locks.tag_scope(Some(me), Some(0xa));
+            crate::locks::current_tag().unwrap();
+            tagged.send(()).unwrap();
+            let _ = done.recv_timeout(Duration::from_secs(10));
+        });
+        in_flight.recv().unwrap();
+        unlock_range(&f, &caller, ino, a, 0xa);
+        assert!(f.meta.locks().local_locks(ino).is_empty());
+        let started = Instant::now();
+        let r = try_lock(&f, &caller, ino, b, 0xb);
+        let took = started.elapsed();
+        answered.send(()).unwrap();
+        assert_eq!(r, Ok(()), "F_SETLK with no lock in the way");
+        assert!(
+            took < crate::locks::close_wait(),
+            "granted without waiting for the unanswered op: {took:?}"
+        );
+    });
+    unlock_range(&f, &caller, ino, b, 0xb);
+    release(&f, &caller, ino, a);
+    release(&f, &caller, ino, b);
+}
+
+/// An op that ended in doubt may still execute at the minter, which
+/// honours the grant, after the next turn's writes: its grant is pinned
+/// from the moment it was found in doubt, before its answer lets its
+/// caller unlock — not only once its scope ends — and a new turn waits
+/// for the pin (a non-blocking one answers `EAGAIN` after the close wait).
+#[test]
+fn a_new_turn_waits_for_an_op_in_doubt_before_its_scope_ends() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let caller = Caller::new(0, 0, Some(me));
+    let (ino, a, b) = two_descriptions(&f, &caller, "doubt");
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    let locks = f.fs.cluster_locks().unwrap().clone();
+    let (tagged, in_doubt) = std::sync::mpsc::channel();
+    let (answered, done) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            let _scope = locks.tag_scope(Some(me), Some(0xa));
+            crate::locks::current_tag().unwrap();
+            crate::locks::note_tag_in_doubt();
+            tagged.send(()).unwrap();
+            let _ = done.recv_timeout(Duration::from_secs(10));
+        });
+        in_doubt.recv().unwrap();
+        unlock_range(&f, &caller, ino, a, 0xa);
+        let started = Instant::now();
+        let r = try_lock(&f, &caller, ino, b, 0xb);
+        let took = started.elapsed();
+        answered.send(()).unwrap();
+        assert_eq!(code(r), Code::Again, "the op in doubt may still land");
+        assert!(
+            took >= crate::locks::close_wait(),
+            "refused after waiting for the pin, not at once: {took:?}"
+        );
+    });
+    release(&f, &caller, ino, a);
     release(&f, &caller, ino, b);
 }
 

@@ -157,14 +157,35 @@ CPU's queue has a free entry), so the `RELEASE` that
 wait would only hold the one worker that has to serve it.
 
 The `RELEASE` then publishes what was written under the locks, under
-the grant's [fencing token](#the-fencing-token), and a new turn on the
-node waits for the earlier turn's operations still in flight under the
-grant. A non-blocking request with nothing else in its way waits for
-them too, instead of answering `EAGAIN` at once, within the same bound
-of `CONSTELLATION_LOCK_CLOSE_WAIT_MS` from its arrival (both waits
-together never exceed it; this one also on a single worker, since those
+the grant's [fencing token](#the-fencing-token) (so does a `FLUSH`,
+which drops the closer's POSIX locks before it publishes), and a new
+turn on the node waits for that publication — counted from before the
+close drops the locks until the commit is answered, for a close that
+drops locks of its own caller on the file and publishes it — and for an
+operation of the earlier turn that ended in doubt. A non-blocking request with
+nothing else in its way waits for them too, instead of answering
+`EAGAIN` at once, within the same bound of
+`CONSTELLATION_LOCK_CLOSE_WAIT_MS` from its arrival (both waits together
+never exceed it; this one also on a single worker, since those
 operations finish without one). A blocking request always waited for
-them.
+them. A new turn does not wait for the other operations still in flight
+under the grant: every operation of a process that holds a lock carries
+the lock's grant, but one still waiting for its answer (another
+thread's `fsync` of another file, say) is concurrent with the unlock,
+as on a local file system, where it may take effect after the next
+holder's writes too. A non-blocking lock nobody holds is granted at
+once beside it (it used to wait for it and then answer `EAGAIN` with no
+lock in the way). This narrowing is safe because the node commits one
+file's publications one at a time (the file's operation lock), so the
+new turn's commit of the file is not sent before an earlier one was
+answered, and a stale commit replayed later is refused by its manifest
+base; the wait keeps the landing order at the minter for what the
+application already counts as done. An operation of the same process
+that ended in doubt, on any file, still pins the grant until its
+window ends (up to `ttl − margin`): in that time a non-blocking request
+on a file nobody locks answers `EAGAIN`, after a sequencer or S3 blip
+(through xcheckfs, which runs every application as one process, that
+is any mirrored application's operation).
 
 ### Leases, renewal and fencing
 
@@ -489,12 +510,17 @@ written under it. So the check also happens where the write is recorded
   outlasts the grant's window, the grant lapses there and its owner
   outwaits it.
   The same holds for the next turn on the same node under the same
-  cached grant: a lock taken when no local lock is left on the file
-  waits (a non-blocking request for a short while, then `EAGAIN`, see
-  [Close and release](#close-and-release); `locks.predecessor_waits`) while
-  an operation an earlier turn tagged with the grant is in flight or in
-  doubt inside its window. The grant is live at its minter, so such an
-  operation would otherwise pass there after the new turn's writes.
+  cached grant, for what the earlier turn already counts as done: a
+  lock taken when no local lock is left on the file waits (a
+  non-blocking request for a short while, then `EAGAIN`, see
+  [Close and release](#close-and-release); `locks.predecessor_waits`)
+  while a close's publication of the file is in flight under the grant,
+  or an operation tagged with it ended in doubt inside its window
+  (pinned as soon as it is found in doubt, before its answer goes out).
+  The grant is live at its minter, so such an operation would otherwise
+  pass there after the new turn's writes. An operation still waiting
+  for its answer is concurrent with the unlock, and only the release
+  waits for it.
 - **Replays.** The token is persisted with the operation wherever a
   replay by rid can come from: the requester's shadow, the executor's
   journal row (a deposed holder replays its journal) and the replay
@@ -1075,7 +1101,7 @@ for both roles:
   `tagged_ops` (mutations that carried a fencing token),
   `release_waits` (releases held back for one) and `predecessor_waits`
   (lock requests of new local turns held back for an earlier turn's
-  tagged mutations, once per request);
+  close publication or mutation in doubt, once per request);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
   `grace_refusals`, `requeued_in_place`, `released_superseded`,
@@ -1120,7 +1146,12 @@ itself (the per-file taint) are not kept.
 Another node still cached a grant on the file. The first attempt sends
 the recall and returns `EAGAIN`; the next attempt gets the grant. A
 steady `would_block` count on a file nobody else locks means two nodes
-alternate on it.
+alternate on it. On one node, with `predecessor_waits` rising, an
+operation of the locking process ended in doubt (S3 or the sequencer
+unreachable) and pins the file's grant until its window ends, or a
+close of the file was still publishing past
+`CONSTELLATION_LOCK_CLOSE_WAIT_MS` (see
+[Close and release](#close-and-release)).
 
 ### A lock waits forever
 
