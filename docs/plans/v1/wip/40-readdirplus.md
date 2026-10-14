@@ -14,8 +14,10 @@ hashes and sorts the whole directory (§2), which is quadratic in a full
 listing and would turn plus pages (about four times fewer names per page) into
 a regression for large directories. After this plan a page is a name-ordered
 range scan of the dentries, resumed from a deterministic, keyed cookie through
-a small handle-free hint cache (§4.9): O(page) for plain and plus pages alike,
-no per-stream memory, no write-path cost.
+a small hint cache keyed by directory and cookie — never by file handle —
+whose entries for a directory are pinned while it is open (§4.9): O(page) for
+plain and plus pages alike, O(1) memory per open stream plus a bounded pin per
+open directory, no write-path cost.
 
 Every `READDIRPLUS` entry that carries a node id is a **kernel reference
 exactly like a lookup** (§3, §4.4). Getting that wrong either reaps an inode
@@ -291,7 +293,7 @@ fn add_entry(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8],
   failure makes that entry name-only), so a frontend can account the added
   entries when the page succeeds and none when it fails (§4.7). The cookie
   rules (deterministic in the name, resolvable from any earlier reply,
-  `Stale` when a cold cookie's name is gone) are stated there too (§4.9).
+  `NotFound` when a cold cookie's name is gone) are stated there too (§4.9).
 - `Vfs::forget`'s doc (`vfs.rs:61-70`) is unchanged in meaning: the
   platform no longer references the inode **at all** — a frontend whose
   platform sends partial forgets counts them itself (§4.4).
@@ -301,8 +303,11 @@ fn add_entry(&mut self, ino: Ino, next: u64, kind: FileKind, name: &[u8],
 - `OpKind::Readdirplus => "readdirplus"` (`crates/vfs/src/ctx.rs:44-75`), so
   the op metrics and `OpWatch` separate the two; the engine's watch name is
   `"readdirplus"` under `plus`.
-- No `Vfs::opendir`/`releasedir`: the listing design needs no handle state
-  (§4.9).
+- `Vfs::opendir(cx, ino, r: Responder<Fh>)` and `Vfs::releasedir(cx, ino,
+  fh, r: Responder<()>)`, with defaults `Fh(0)` / `Ok(())` (other frontends
+  unchanged). A view uses them only to know which directories are open, so
+  that their listing hints are never evicted (§4.9); `releasedir` must
+  never block. Cookies stay independent of the handle.
 
 ### 4.3 The `fuser` fork
 
@@ -313,8 +318,9 @@ dispatch (`request.rs:487-499`), the ACL allowlist (`request.rs:104`) and
 both transports are in place. On io_uring, `READDIR`/`READDIRPLUS` run on
 the offload threads under the default `RingDispatch::Reads`
 (`session.rs:1242-1266`; deliberately, `replicix/PATCHES.md:338-340`), while
-`RELEASEDIR` runs on the ring thread itself (`session.rs:1258`) — this plan
-adds nothing to `releasedir`. Two API limits matter:
+`RELEASEDIR` runs on the ring thread itself (`session.rs:1258`) — so the
+view's `releasedir` (§4.9) is a counter decrement and an unpin, nothing that
+waits. Two API limits matter:
 
 1. `ReplyDirectoryPlus::add` takes the node id from `attr.ino` and the dirent
    type from `attr.mode` (`ll/reply.rs:478-479`, `:532-544`): there is no way
@@ -382,8 +388,10 @@ the intended ones; use whatever the fix landed with):
   place, no bump, no compatibility shim). Consequence: the first `daemon
   --upgrade` across the fix cannot parse the other image's handoff and must
   refuse cleanly before anything is detached, so that upgrade is a remount,
-  not a handover. The fix verifies the refusal is clean and records it in
-  PROGRESS; R2 below re-checks it.
+  not a handover — **accepted by the maintainer (no backwards
+  compatibility; the project is WIP)**. The fix verifies the refusal is
+  clean and records it in PROGRESS; R2 below re-checks it. The same holds
+  for R3b's handoff change (§4.9).
 - `handoff.rs`'s module doc (`:7-13`) and the adapter's `forget` comment are
   corrected: the *frontend* keeps the lookup table, both partial forgets are
   named.
@@ -519,7 +527,7 @@ linked.
   whole-listing cost per page is unchanged here (a follow-up if snapshot
   mirrors of huge directories matter).
 
-### 4.9 Listing pages: name order, keyed cookies, a handle-free hint cache
+### 4.9 Listing pages: name order, keyed cookies, hints pinned while a directory is open
 
 **Why it must change.** A plain record is a 24-byte `fuse_dirent` plus the
 padded name (~48 B for a 20-byte name); a plus record adds the 128-byte
@@ -544,16 +552,20 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   (siphash13(k, name) >> 2) + 3` — the same `[3, 2^62 + 2]` range as today
   (clear of 0 = rewind, 1 = after `.`, 2 = after `..`, below `i64::MAX`),
   identical for plain and plus pages, in every stream, across restart and
-  handover, and on every node. The key `k` is derived per filesystem from
-  the secret material it already stores durably — under E2E from the master
-  key (as the gossip seed is), otherwise from `FsMeta::gossip_secret`
-  (`crates/store-s3/src/store.rs:88-104`) — with a domain-separation label,
-  so `meta.json` does not change. A filesystem so old it has no
-  `gossip_secret` derives from its UUID, which is not secret: logged once
-  at warn (the maintainer may prefer a new `meta.json` field, §8). Why
-  keyed: with today's unkeyed FNV-1a a user can create names with equal
-  cookies and make another user's listing skip or repeat entries (ext4
-  seeds its hash per filesystem for the same reason).
+  handover, and on every node. The key `k` is **derived** per filesystem
+  from the secret material it already stores durably (decided by the
+  maintainer, §9): under E2E from the master key (as the gossip seed is),
+  otherwise from `FsMeta::gossip_secret`
+  (`crates/store-s3/src/store.rs:88-104`), each with its own derivation
+  label (`readdir-cookie-v1`), so `meta.json` does not change. It is never
+  rotated: neither the master key nor `gossip_secret` changes for a
+  filesystem's life (`fs passwd` only re-wraps the master, plan 24). There
+  is no fallback: a non-E2E filesystem without a `gossip_secret` (created
+  before that field existed) refuses to mount with an error saying it must
+  be recreated (no backwards compatibility). Why keyed: with today's
+  unkeyed FNV-1a a user can create names with equal cookies and make
+  another user's listing skip or repeat entries (ext4 seeds its hash per
+  filesystem for the same reason).
 - **Hint cache** (`crates/engine/src/view/listing.rs`, new), keyed by
   `(directory, cookie)` — **never by file handle**. Each served page
   records `{anchor: the name before the page's first entry (None: the
@@ -561,7 +573,8 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   last 4 pages per directory are kept, LRU across directories, under a hard
   byte cap (`CONSTELLATION_READDIR_HINT_BYTES`, default 16 MiB per node,
   shared by the node's views; ~16 B per remembered cookie plus one name per
-  page). A request cookie `c` found at index `i` of a remembered page
+  page) — and, while the directory is open, every page of the pin window,
+  outside that cap (pins, below). A request cookie `c` found at index `i` of a remembered page
   resumes by scanning from that page's anchor and skipping every entry whose
   cookie is in `cookies[0..=i]` (the ones the kernel consumed); everything
   else is emitted. That is exact even if the entry with cookie `c`, or the
@@ -569,20 +582,106 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   name to exist), covers K5's "resume from any cookie of the previous
   reply", interrupted reads, `seekdir` back within the last pages and a
   different handle (`nfsd`, K12), and costs O(page).
-- **Cold cookie** (not in the cache: a far `seekdir`, `nfsd` re-export, a
-  restart or handover mid-listing, eviction): one O(n) scan of the
+- **Cold cookie** (not in the cache: a far `seekdir` on a stream whose
+  pins overflowed, `nfsd` re-export, a restart mid-listing, eviction of a
+  directory nobody has open): one O(n) scan of the
   directory's keys in name order — hashing names, no sort, no listing kept
   — until a name hashes to `c`; resume after it and prime the cache. A
   collision (two names with cookie `c`) resumes after the **first** in name
   order: entries between them may be listed twice, never skipped (at 62
   bits the expected number of colliding pairs is ~n²/2⁶³ ≈ 1×10⁻⁵ at 10M
   entries; counted).
-- **Cold cookie whose name is gone** (no hint, and no name hashes to it —
-  the entry was removed and the hint lost): the page answers
-  `Code::Stale` (`ESTALE`) rather than guessing — the only inexact case,
-  documented in `Vfs::readdir` and `configuration.md`. It needs a listing
-  paused across a restart, handover or eviction *and* removal of exactly
-  that entry.
+- **Hints are pinned while the directory is open.** Without this, the
+  inexact case below is reachable in practice: gnulib `fts` (`rm -rf`,
+  `find -delete`, `du`) reads up to `FTS_MAX_READDIR_ENTRIES` = 100,000
+  entries, deletes them — the one the next cookie names included — and
+  continues on the same open stream; if other listings evicted that
+  cookie from the shared cache meanwhile, `rm -rf` would fail where ext4
+  and today's constellation succeed. So:
+  - `Vfs::opendir(cx, ino, r: Responder<Fh>)` and `Vfs::releasedir(cx,
+    ino, fh, r: Responder<()>)` (defaults: `Fh(0)` / `Ok(())`; §4.2), served
+    by the adapter (`opendir` still answers no open flags) and implemented
+    by the view **only to track open directory streams**: `opendir`
+    allocates a stream id (a per-view counter in its own number space,
+    `DIR_FH_BIT = 1 << 62`, disjoint from plan 39's per-open file handles)
+    and registers `Stream { dir, start, last_page }`; a page served with
+    that `fh` at cookie 0 (a `rewinddir`) sets `start` to the directory's
+    next page sequence; every page served for a directory — through any
+    `fh`, or none — gets the next sequence number, and the stream it was
+    served to records it as `last_page`.
+  - **What is pinned, precisely**: while a directory has at least one open
+    stream, every page (anchor and cookies) served for that directory with
+    a sequence number at or after the smallest `start` among its open
+    streams — the opendir or last rewind of the oldest still-open stream —
+    is never evicted. That is a superset of every cookie `telldir` on any
+    open stream could have returned (a `telldir` value is the `d_off` of an
+    entry the stream received since its open or last rewind; POSIX leaves
+    a `seekdir` across a `rewinddir` unspecified), and of every cookie the
+    kernel can resume a stream from (K5). Lookups stay by
+    `(directory, cookie)`: **cookies remain stream-independent**, so `nfsd`
+    re-export and a future `FOPEN_CACHE_DIR` keep working; the stream id
+    only decides what may not be evicted.
+  - **Caps and overflow**: pinned bytes are bounded per directory
+    (`CONSTELLATION_READDIR_PIN_BYTES_PER_DIR`, default 128 MiB, ~16M
+    cookies) and per node (`CONSTELLATION_READDIR_PIN_BYTES`, default
+    512 MiB). Past a cap, the oldest pinned pages of the directory (per
+    node: of the directory with the most pinned bytes) are unpinned — they
+    become ordinary LRU hints — **except each open stream's `last_page`**,
+    which stays pinned whatever the caps; counted
+    (`readdir_pin_overflows`), warned once per directory. So sequential
+    continuation (the `fts` case) is exact at any size; only a `seekdir`
+    back into an overflowed region can still meet the unresolvable case.
+  - **`releasedir` never blocks**: it removes the stream under the
+    directory's short-lived lock and recomputes the directory's smallest
+    `start` (O(open streams of that directory)); pages behind the new
+    window become evictable lazily, at eviction time. No I/O, no wait —
+    `RELEASEDIR` runs inline on the io_uring ring thread (fork
+    `session.rs:1258`). The listing cache's locks are never held across a
+    replica read (a scan reads first, then records under the lock).
+  - **`fsyncdir`**: its `fh` is now a stream id. The adapter's doc
+    (`adapter.rs:1355-1362`, "always 0") is rewritten; `View::fsync` of a
+    directory (the barrier, plan 39 §3.6) must accept a directory stream
+    id — it has no write session and no discard error events, so the
+    per-handle checks (`lock_errors_reported`, `lock_publish_gate`) are
+    skipped for a directory's stream id rather than failing it.
+  - **Handover**: the open streams, each directory's page sequence and
+    window, the pinned pages, and the stream-id counter cross with the
+    view's handle table (`HandleTableSnapshot`,
+    `crates/engine/src/view/handoff.rs`), which travels in-process beside
+    `FuseHandoff` and cross-process in `MountHandoff.view`
+    (`crates/cli/src/handover.rs:374`) — like R2's lookup counts. Unpinned
+    hints do not cross. Pinned pages are encoded compactly (little-endian
+    cookie runs, not one JSON number per cookie), bounded by the pin caps;
+    R8 measures the handover with a pinned 1M-entry directory. A listing in
+    progress across `daemon --upgrade` therefore stays exact even if its
+    resume entry was deleted.
+- **Cold cookie whose name is gone** (no hint, pinned or not, and no name
+  hashes to it — the entry was removed): the page answers
+  `Code::NotFound` (`ENOENT`) rather than guessing, documented in
+  `Vfs::readdir` and `configuration.md`. After the pins this is reachable
+  only by (1) a listing paused across a daemon **crash or restart** (no
+  handover: nothing crossed) whose resume entry was also deleted, (2) an
+  `nfsd` re-export cookie (`nfsd` opens per request, K12, so no stream
+  outlives a request and its hints are never pinned) whose entry was
+  deleted and whose hint was evicted, and (3) a `seekdir` back into a
+  directory's overflowed pin region (above) to a deleted entry.
+- **Which errno.** An NFS bad-cookie error cannot be produced through a
+  FUSE server: `nfserrno` (mainline `fs/nfsd/vfs.c:66-119`) maps no errno
+  to `nfserr_bad_cookie`; NFSv4 answers it only for cookies 1 and 2 or a
+  zero cookie with a verifier (`fs/nfsd/nfs4proc.c:1095-1097`), NFSv3 never;
+  the kernel-internal `EBADCOOKIE` (523, `include/linux/errno.h:26`) cannot
+  come from a server, since `fuse_dev_do_write` rejects any error ≤ −512
+  (`fs/fuse/dev.c:1932`). Of what can: **`ENOENT`** is POSIX's own
+  `readdir` error for "the current position of the directory stream is
+  invalid", and `nfsd` maps it to `NFS3ERR_NOENT`/`NFS4ERR_NOENT`, which
+  describes a missing entry rather than an invalid directory; `ESTALE` →
+  `nfserr_stale` tells an NFS client the directory's handle is invalid (it
+  then discards state for a directory that exists); `EIO` → `nfserr_io`
+  reads as a storage failure; `EINVAL` → `nfserr_inval` blames the
+  caller's argument. Chosen: `ENOENT`, answered directly (not through
+  `ino_err`, which is for a vanished inode). How the Linux NFS client
+  reacts to `NOENT` on `READDIR` (`fs/nfs/dir.c`) is not verified; R3b
+  records it.
 - **In-page collisions.** A page never holds two entries with equal
   cookies: when the next entry's cookie already occurs in the page, the
   page ends before it (it starts the next page, anchored by name), so a
@@ -602,15 +701,22 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   (cookie `(h mod (2³¹ − 4)) + 3`). At 31 bits collisions are common at
   scale (~0.5 % of entries at 10M), but they only affect the cold path
   (duplicates, never skips) since in-page cookies are unique.
-- **Memory and writes.** O(1) per stream, the shared hint cap, nothing per
-  open directory; no write-path cost at all. Nothing crosses a handover;
-  `opendir`/`releasedir` stay fuser's defaults (fh 0), so `fsyncdir`'s
-  "always 0" doc (`adapter.rs:1355-1362`) stays true and nothing new runs
-  on the io_uring ring thread for `RELEASEDIR`.
-- **The cookie function changes once.** A listing paused across the first
-  handover from an FNV-cookie image presents an old cookie: cold, no match,
-  `ESTALE` once (no compatibility shim, maintainer rule). Recorded in
-  PROGRESS.
+- **Memory and writes.** O(1) per open stream (~48 B), the shared hint cap,
+  and for a directory with open streams its pinned pages: ~8 B per cookie
+  handed out since the oldest stream's start plus ~70 B per page (a fully
+  listed 1M-entry directory ≈ 9 MB, 10M ≈ 85 MB, bounded by the caps). No
+  write-path cost at all.
+- **One-time upgrade effects (accepted by the maintainer: no backwards
+  compatibility; the project is WIP).** The cookie function changes from
+  unkeyed FNV-1a to the keyed hash, and R3b adds the pinned listing state
+  to the handoff. Because the handoff format changes without a version
+  bump, the first `daemon --upgrade` across R3b refuses cleanly and is a
+  remount, exactly as across R2 (§4.4) — so no listing crosses from an
+  FNV-cookie image by handover. Were the cookie change ever deployed
+  without the handoff change, a listing paused across that upgrade would
+  present an old cookie: cold, no match, one error (the maintainer
+  accepted this as "one `ESTALE`"; with the errno decision above it is
+  `ENOENT`). Recorded in PROGRESS.
 
 **Rejected and deferred.**
 
@@ -643,8 +749,9 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
   name-only (logged once).
 - What crosses: the lookup table (§4.4); `KernelEntries` keeps its
   `resumed()` unfiltered window (`dentries.rs:68-71`), which covers
-  plus-installed dentries too; the hint cache does not cross (a cold cookie
-  after a handover takes the scan, §4.9).
+  plus-installed dentries too; the open directory streams and their pinned
+  listing hints cross with the view's handle table (§4.9), so a listing in
+  progress stays exact; unpinned hints do not cross.
 
 ### 4.11 Observability
 
@@ -655,12 +762,15 @@ already keyed `(parent, name)` (`crates/mtree/src/keys.rs`), so:
 - Per view in `node.status`: `unlinked_refs` (the orphans kept for kernel
   references — there is no orphan count in status today), and the listing
   counters `readdir_hint_hits`, `readdir_cold_scans`,
-  `readdir_cold_scan_entries`, `readdir_stale_cookies`,
-  `readdir_cookie_collisions`, `readdir_hint_bytes`.
+  `readdir_cold_scan_entries`, `readdir_lost_cookies` (the `ENOENT`
+  case), `readdir_cookie_collisions`, `readdir_hint_bytes`,
+  `readdir_open_streams`, `readdir_pinned_dirs`, `readdir_pinned_bytes`,
+  `readdir_pin_overflows`.
 - `/metrics`: `constellation_fuse_readdirplus_entries_total{kind="attr"|
   "name_only"}`, `constellation_readdir_cold_scans_total`,
-  `constellation_readdir_stale_cookies_total`,
-  `constellation_readdir_hint_bytes` (gauge), plus R2's
+  `constellation_readdir_lost_cookies_total`,
+  `constellation_readdir_hint_bytes` and `constellation_readdir_pinned_bytes`
+  (gauges), `constellation_readdir_pin_overflows_total`, plus R2's
   `constellation_fuse_kernel_refs` and
   `constellation_fuse_forgets_total{outcome}`; the op metrics gain
   `op="readdirplus"`. Status schema re-blessed
@@ -744,20 +854,22 @@ Each milestone ends green on `cargo fmt`/`clippy -D warnings`/`cargo test
   answering `nlink 0`, and the final forget reaps it; the deterministic
   revalidation reproducer of §7 `readdirplus-orphan-forget`'s first phase.
   Re-check that the first `daemon --upgrade` across it refuses cleanly
-  (a remount) and that PROGRESS records it. Anything missing is completed
-  here before R5.
-- **R3 — Listing pages and cookies (plain `READDIR` too).** §4.9: the keyed
-  cookie and its key derivation, `Meta::readdir_after` (and the scratch
-  twin), the page loop in `View::readdir`, the hint cache with its byte
-  cap, the cold scan, `Stale` for a vanished cold cookie, the in-page
-  collision rule, the 31-bit knob, counters. Tests: meta — `readdir_after`
+  (a remount — accepted by the maintainer: no backwards compatibility, the
+  project is WIP) and that PROGRESS records it. Anything missing is
+  completed here before R5.
+- **R3a — Listing pages and cookies (plain `READDIR` too).** §4.9: the
+  keyed cookie and its key derivation, `Meta::readdir_after` (and the
+  scratch twin), the page loop in `View::readdir`, the hint cache with its
+  byte cap, the cold scan, `NotFound` (`ENOENT`, answered directly) for a
+  vanished cold cookie, the in-page collision rule, the 31-bit knob,
+  counters. Tests: meta — `readdir_after`
   pages equal a full scan, resume after a removed name; engine — a full
   listing of 100k names reads each dentry O(1) times (a scan counter; on
   `main` the count is quadratic: **fail-before**); resume from every cookie
   of the last reply (K5) and from a cookie three pages back (hint hits);
   resume from a cookie through a second, fresh view of the node (no shared
   handle; cold scan, then hits); a cold cookie whose name was removed is
-  `Stale`, never a silent skip; two names forced to one cookie (a test-only
+  `NotFound`, never a silent skip; two names forced to one cookie (a test-only
   key/collision hook) are never skipped by a cold resume; plain and plus
   pages from one cookie sequence list the same entries; the cookie of a
   name is identical on two nodes of one filesystem and differs between two
@@ -765,6 +877,45 @@ Each milestone ends green on `cargo fmt`/`clippy -D warnings`/`cargo test
   `cookies_resume_where_they_left_off`, `removal_between_pages_never_
   repeats_or_loses` and `concurrency::creates_in_one_directory_are_all_
   visible` stay green on both targets.
+- **R3b — Open directories pin their hints.** §4.9: `Vfs::opendir`/
+  `releasedir` (defaults, adapter, view), stream ids in their own number
+  space, page sequences and the pin window, the per-directory and per-node
+  pin caps with the overflow rule (each open stream's last page exempt),
+  the `fsyncdir` stream-id handling and its rewritten doc, the listing
+  state in `HandleTableSnapshot` (in-process and in `MountHandoff.view`,
+  compact encoding), the reworded `Vfs::readdir` doc on the remaining
+  inexact cases, the `nfsd` client-side check of `NOENT` on `READDIR`
+  recorded in PROGRESS. The first `daemon --upgrade` across R3b is a
+  remount (handoff format change, no bump; accepted, §4.9). Tests (engine,
+  `crates/engine/src/view/vfs_tests.rs` and a new `listing_tests.rs`):
+  - `fts`-style deletion under hint pressure: an open stream reads 100k
+    names in rounds of 10k, unlinks each round (the next cookie's name
+    included) and continues, while another view lists 50 directories of
+    20k names with a 1 MiB hint cap: every name is listed exactly once and
+    deleted, no error (**fail-before** against R3a alone: `ENOENT` once an
+    evicted cookie's name is gone);
+  - `telldir`/`seekdir` after mass deletion with the stream open: save the
+    cookie of every 1,000th entry, delete 90 % of the names including the
+    saved ones, `seekdir` to each saved cookie in random order: each
+    resumes exactly after its name;
+  - a `rewinddir` moves the window: cookies from before it may be evicted,
+    after it not;
+  - handover mid-listing: export/import the handle table between two views
+    with the next resume entry deleted in between: the resume is exact
+    (no cold scan, `readdir_cold_scans` unchanged);
+  - pin caps: 10k open streams over 1k directories with small caps —
+    pinned bytes never exceed either cap, overflow unpins the oldest pages
+    except each stream's last page, and every stream's sequential
+    continuation stays exact;
+  - `releasedir` never blocks: it returns within 10 ms while another
+    thread runs a cold scan of a 1M-name directory and while the hint
+    cache is at its cap; and a wire test on the ring path
+    (`crates/frontend-fuse/tests/wire_uring.rs`): `RELEASEDIR` is answered
+    inline on the ring thread and reaches `MockVfs::releasedir`;
+  - wire (`wire.rs`): `OPENDIR` hands the view's stream id to the kernel
+    and `READDIR`/`READDIRPLUS`/`FSYNCDIR`/`RELEASEDIR` carry it back;
+    `fsyncdir_with_a_dir_stream_fh_is_the_barrier` (fails against a
+    `View::fsync` that applies the file-handle checks to a directory).
 - **R4 — Contract, reference fs and kit.** `DirSink::add_entry`,
   `DirEntry::entry`, `CollectDir`/`ProbeDir`, `OpKind::Readdirplus`, the
   doc text of §4.2. `RefView::readdir` takes `plus` and hands
@@ -786,8 +937,12 @@ Each milestone ends green on `cargo fmt`/`clippy -D warnings`/`cargo test
   - `plus_of_a_subtree_view_stays_confined` (`confinement.rs` style);
   - `a_cookie_resumes_from_a_fresh_client`: a second client continues a
     listing from any cookie the first was handed (both targets resolve it;
-    the engine answers `Stale` only for a name removed in between, which
-    the case accepts in place of a resume — a skip is a failure).
+    the engine answers `NotFound` only for a name removed in between while
+    no stream had the directory open, which the case accepts in place of a
+    resume — a skip is a failure); and
+  - `an_open_directory_resumes_after_its_deleted_names`: with a stream
+    open (`opendir`), delete the name the next cookie points at, then
+    resume: exact on both targets (no error allowed).
   The kit runs against `RefTarget` and the engine target
   (`ENGINE_TARGET.md`); both must pass.
 - **R5 — Engine plus.** `View::readdir` (`ops.rs:1518`): §4.5 for real,
@@ -828,21 +983,25 @@ Each milestone ends green on `cargo fmt`/`clippy -D warnings`/`cargo test
 - **R7 — Observability and docs.** §4.11 (including the per-view
   `unlinked_refs` count); `docs/reference/configuration.md`
   (`CONSTELLATION_FUSE_READDIRPLUS`, `CONSTELLATION_READDIR_HINT_BYTES`,
-  `CONSTELLATION_READDIR_COOKIE_BITS`, the `ESTALE` case);
+  `CONSTELLATION_READDIR_PIN_BYTES`, `CONSTELLATION_READDIR_PIN_BYTES_PER_DIR`,
+  `CONSTELLATION_READDIR_COOKIE_BITS`, the `ENOENT` case and when it can
+  still occur);
   `docs/how-to-guides/development/TESTING.md` (scenarios); the proposed
   DESIGN §12 text for the coordinator (CONVENTIONS rule 5: not edited
   here): move `READDIRPLUS` to "Built", replace "resumes by position
   today" and the "stable readdir cursors" bullet with the keyed-cookie,
-  name-order design and its one inexact case.
+  name-order design, the pinning of open directories and the remaining
+  inexact cases.
 - **R8 — System tests and the after-benchmark.** §7's harness scenarios and
   xcheckfs runs, §8's after-numbers in `bench/readdirplus/RESULTS.md`
   against R0, the acceptance check. If plus acceptance fails on any host
   file system or kernel, the default becomes `off` and the report says
-  why; if listing acceptance fails, the report says so and R3 is not
-  shipped as is (never ship a regression, never loosen the bar).
+  why; if listing acceptance fails, the report says so and R3a/R3b are
+  not shipped as is (never ship a regression, never loosen the bar).
 
-Order: R0, R1, R2 (verify), R3, R4, R5, R6, R7, R8. R3 lands before any plus
-entry is served (plus pages need O(page) listings); R2 before R6.
+Order: R0, R1, R2 (verify), R3a, R3b, R4, R5, R6, R7, R8. R3a and R3b land
+before any plus entry is served (plus pages need O(page) listings, and
+`fts`-style deletion must stay exact); R2 before R6.
 
 ## 7. System-level tests
 
@@ -881,19 +1040,37 @@ each 3× green, seeded):
   `O_PATH` references: `kernel_refs` after the resume equals before minus
   the forgets read meanwhile, no `ESTALE`, orphans reaped after their
   forgets (the `session-handover-idle`/`upgrade-under-load` pattern); a
-  listing paused mid-directory across the upgrade completes (cold scan),
-  with no entry skipped or repeated.
+  program pauses a listing mid-directory with the stream open, the name its
+  next cookie points at is deleted, `daemon --upgrade` runs, and the
+  listing completes exactly — no entry skipped or repeated, no error, no
+  cold scan (`readdir_cold_scans` unchanged: the pinned hints crossed).
+  (The first upgrade across R2/R3b is a remount by design; this scenario
+  runs between two images of this plan.)
 - `readdir-huge-delete` — a 1M-entry directory (`--write-mode back`), `rm
   -rf` of it (gnulib `fts` reads up to 100,000 entries per round and
-  deletes between rounds on the same stream), and in parallel `find -ls`
-  of it from a second process: no entry is left behind, `rmdir` succeeds,
-  no `ESTALE` (the hint cache keeps the deleters' cookies resolvable), and
-  `readdir_cold_scans` stays 0.
-- `readdir-cookie-cold` — a 200k-entry directory listed by a program that
-  `telldir`s every 1,000th entry, then (after a `daemon --upgrade`, so the
-  hints are gone) `seekdir`s to each saved position in random order: each
-  resume continues correctly (cold scan), and one whose name was removed
-  meanwhile answers `ESTALE`.
+  deletes between rounds on the same stream) **under hint-cache pressure**:
+  the node runs with `CONSTELLATION_READDIR_HINT_BYTES=1MiB`, and a second
+  process lists 20 directories of 200k entries in a loop the whole time, so
+  unpinned hints are evicted continuously; in parallel `find -ls` of the
+  doomed directory from a third process. `rm -rf` succeeds, `rmdir`
+  succeeds, no entry is left behind, `readdir_lost_cookies` stays 0,
+  `readdir_pinned_dirs` > 0 while it runs and 0 after, and
+  `readdir_cold_scans` stays 0 for the deleters.
+- `readdir-seekdir-after-delete` — a 200k-entry directory opened by a
+  program that `telldir`s every 1,000th entry, deletes 90 % of the names
+  (the saved ones included) with the stream still open, then `seekdir`s to
+  each saved position in random order: every resume continues exactly
+  after its name, no error. Second phase: the same with a daemon
+  **restart** (`kill -9` and remount, no handover) between the deletion
+  and the `seekdir`s, on a fresh `opendir` — POSIX makes those cookies
+  meaningless on the new stream, and the run documents the remaining
+  inexact case: positions whose names survive resume (cold scan), the
+  deleted ones answer `ENOENT`, none is skipped silently.
+- `readdir-many-open-dirs` — 5,000 processes each hold a different
+  directory open mid-listing (1,000–20,000 entries each) with the pin caps
+  lowered: daemon RSS stays within the caps plus the hint cap,
+  `readdir_pin_overflows` counts, and every process's sequential
+  continuation completes exactly.
 - `fuse-inval-storm` runs a second time with the lister doing `ls -l`
   (plus) instead of `getdents` only: no stall, no wedge (`kill -9` lands as
   before), and `KernelEntries` writes notifications for plus-listed names.
@@ -911,8 +1088,8 @@ after each `getdents` make the kernel ask for plus under `auto`):
 - `xcheckfs verify` of a 200k-file tree and a mounted session running, for
   one hour each: `git clone` + `git status`/`git checkout` loops on a large
   repository, `rsync -a` of a source tree into the mount and back,
-  `find -ls`, `ls -lR`, `du -s`, `tar c | tar x` of the tree, `rm -rf` of a
-  100k-entry directory, and a directory-heavy stress (`stress-ng --dir
+  `find -ls`, `ls -lR`, `du -s`, `tar c | tar x` of the tree, `rm -rf` and
+  `find -delete` of 100k-entry directories, and a directory-heavy stress (`stress-ng --dir
   --dirmany --getdent --link --rename`) — once with
   `CONSTELLATION_FUSE_READDIRPLUS=off` and once with `auto`. **Zero
   findings attributable to this plan**; any finding present in both runs
@@ -948,7 +1125,12 @@ S3 bucket of the usual harness setup, release build:
 - **Measured**: wall time (median of 7, IQR), FUSE requests by op (the op
   metrics from `/metrics` before/after), daemon CPU (user+sys from
   `/proc/<pid>/stat`), daemon peak RSS, `kernel_refs`, `readdir_hint_bytes`,
-  cold-scan time at 1M and 10M.
+  cold-scan time at 1M and 10M; **pinning**: `readdir_pinned_bytes` and RSS
+  per pinned directory while `rm -rf` and `ls` hold a 1M- and a 10M-entry
+  directory open (expected ~8–9 B per listed name), RSS with 1,000 and
+  10,000 directories open mid-listing, `releasedir` latency (p99) under a
+  concurrent cold scan, and `daemon --upgrade` time with a pinned 1M-entry
+  directory (handoff size and the detach-to-serve gap).
 - **Modes compared**: R0 baseline; R8 with `off`, `auto`, `always`.
 
 Acceptance (R8, per host file system and kernel):
@@ -969,8 +1151,15 @@ Acceptance (R8, per host file system and kernel):
    --dry-run`, kernel-cold, faster than R0 at 1k, 10k and 100k entries
    (target ≥ 2× at 10k; any slower case blocks the default `auto`).
 5. **Resources**: daemon peak RSS while listing the 1M and 10M directories
-   within R0 + the hint cap + `kernel_refs` × 32 B (no per-stream growth);
-   CPU per listed name for `ls -l` at most R0's.
+   within R0 + the hint cap + `kernel_refs` × 32 B + the directory's pinned
+   bytes (≤ 10 B per listed name, never above the pin caps); with 10,000
+   open directories within R0 + the caps; CPU per listed name for `ls -l`
+   at most R0's.
+7. **Pins**: `rm -rf` of the 1M-entry directory under the
+   `readdir-huge-delete` pressure succeeds with zero `readdir_lost_cookies`;
+   `releasedir` p99 under 1 ms; the handover with a pinned 1M-entry
+   directory adds at most 1 s to the detach-to-serve gap (reported for
+   10M).
 6. **Page cost**: per-page service time at 1M entries within 2× of that at
    1k (O(page)); a cold resume at 10M is reported (one scan) and must not
    exceed the time of one R0 page at 10M.
@@ -981,16 +1170,31 @@ Decide before the executor starts:
 
 - **Plain-page semantics under the new listing** (§4.9): listings become
   name-ordered (today: cookie order), entries created ahead of a running
-  listing appear and behind it do not, a renamed name may appear twice, and
-  a cold cookie whose name is gone is `ESTALE` (the only inexact case; with
-  `nfsd` re-export the error maps to a stale-handle error, not
-  `BAD_COOKIE`, since a FUSE server cannot produce the latter). Accept?
-- **The first upgrade across R2 is a remount** (no version bump, the
-  handoff format changed); confirm, and that a listing paused across the
-  first upgrade across R3 gets one `ESTALE` (old FNV cookie).
-- **Cookie key source** (§4.9): derived from existing per-filesystem secret
-  material (no `meta.json` change), UUID fallback for filesystems without a
-  gossip secret — or a new `meta.json` field written at create time?
+  listing appear and behind it do not, a renamed name may appear twice.
+  While a directory is open its cookies stay resolvable (pinned), so
+  `fts`-style deletion, `telldir`/`seekdir` and a handover mid-listing are
+  exact. **The remaining inexact case** answers `ENOENT` (POSIX's "current
+  position invalid"; an NFS bad-cookie error cannot come from a FUSE
+  server, §4.9): a listing paused across a daemon crash or restart (no
+  handover) whose resume entry was also deleted; an `nfsd` re-export
+  cookie whose entry was deleted and whose unpinned hint was evicted; a
+  `seekdir` back into a directory's overflowed pin region to a deleted
+  entry. Accept?
+- **Resolved — the first upgrade across R2 is a remount, and so is the
+  first across R3b; a listing paused across the first upgrade after the
+  keyed cookies land gets one error (accepted as "one `ESTALE`"; `ENOENT`
+  under the errno decision above).** Accepted by the maintainer: no
+  backwards compatibility; the project is WIP. (Since R3b's handoff change
+  makes that upgrade a remount, the paused-listing error can only occur if
+  the cookie change were ever deployed without it.)
+- **Pin caps** (§4.9): defaults 128 MiB per directory and 512 MiB per node,
+  each open stream's last page always pinned. Acceptable, or different
+  bounds?
+- **Resolved — cookie key source** (§4.9): derived, never rotated — under
+  E2E from the master key, otherwise from `gossip_secret`, each with its
+  own label (`readdir-cookie-v1`); no UUID fallback: a filesystem without a
+  `gossip_secret` must be recreated. Accepted by the maintainer (no
+  backwards compatibility).
 - **`lookup`'s session wait drift**: the M6 table (`PROGRESS.md:11216`)
   says `lookup` waits `Dentry` then `Ino(child)`; the code
   (`ops.rs:200-205`) waits `Dentry` only. Plus entries wait as `getattr`
@@ -1006,7 +1210,13 @@ Open, decided by measurement or later:
 - **31-bit cookies** default off; legacy 32-bit userspace must opt in.
 - **Cold-scan cost**: if `readdir_cold_scans` is material in production
   (busy `nfsd` re-export of huge directories, frequent restarts), build
-  option (b) lazily for large directories (§4.9).
+  option (b) lazily for large directories (§4.9); it would also close the
+  remaining inexact case for restarts and `nfsd`.
+- **Linux NFS client and `NOENT` on `READDIR`**: not verified how the
+  client reacts (R3b checks `fs/nfs/dir.c` and records it); if it is worse
+  than `EIO`, the errno choice is revisited.
+- **Handoff size**: a pinned 10M-entry directory adds ~80 MB to the
+  handoff; bounded by the pin caps, measured in R8.
 - **`FOPEN_CACHE_DIR`** follow-up (§4.9, K10).
 - **Kernel attribute race**: plus installs attributes through the same
   `fuse_change_attributes` path as `LOOKUP`/`GETATTR` (K9), so it is
@@ -1024,10 +1234,16 @@ Open, decided by measurement or later:
       `BATCH_FORGET`, both handoff records, the clean first-upgrade refusal
       recorded (R2).
 - [ ] Name-ordered O(page) listings, keyed stream-independent cookies, the
-      handle-free hint cache under its byte cap, the cold scan, `ESTALE`
-      for a vanished cold cookie, the collision rules, the 31-bit knob,
-      with the fail-before scan-count test (R3).
-- [ ] `DirSink::add_entry`, reference-fs oracle, the seven conformance cases
+      hint cache keyed by `(directory, cookie)` under its byte cap, the
+      cold scan, `ENOENT` for a vanished cold cookie, the collision rules,
+      the 31-bit knob, with the fail-before scan-count test (R3a).
+- [ ] Open directories pin their hints (`opendir`/`releasedir`, precise
+      pin window, per-directory and per-node caps with each stream's last
+      page exempt, non-blocking `releasedir` including on the ring thread,
+      `fsyncdir` with stream ids, pinned state across a handover); the
+      `fts`-under-pressure, `seekdir`-after-deletion, handover and pin-cap
+      tests green, the first one failing against R3a alone (R3b).
+- [ ] `DirSink::add_entry`, reference-fs oracle, the eight conformance cases
       green on the reference and the engine targets (R4).
 - [ ] Plus entries equal `lookup`'s attributes after `getattr`'s wait
       (pending overlay, batch session waits, strict name-only, synthetic,
@@ -1039,8 +1255,8 @@ Open, decided by measurement or later:
       and TESTING docs, proposed DESIGN text recorded (R7).
 - [ ] Harness scenarios 3× green; xcheckfs runs with zero findings from this
       plan; §8 acceptance met on every host file system and kernel
-      measured, or the default left `off` / R3 held back with the numbers
-      reported (R8).
+      measured, or the default left `off` / R3a–R3b held back with the
+      numbers reported (R8).
 - [ ] Every CONVENTIONS gate green; pjdfstest 8798/8798.
 
 ## 11. PROGRESS.md
@@ -1054,7 +1270,8 @@ with dates, kernel and host file systems), with these rows:
 | Baseline benchmark (R0) | | `bench/readdirplus/` |
 | fuser fork `readdirplus` branch (R1) | | fork `REPLICIX.md`, `Cargo.toml` rev |
 | Kernel lookup counts (R2, landed separately: verified) | | the integrity fix's section; `crates/frontend-fuse/`, `crates/cli/src/handover.rs` |
-| Listing pages and cookies (R3) | | `crates/engine/src/view/listing.rs`, `ops.rs` `readdir`, `Meta::readdir_after` |
+| Listing pages and cookies (R3a) | | `crates/engine/src/view/listing.rs`, `ops.rs` `readdir`, `Meta::readdir_after` |
+| Open directories pin their hints (R3b) | | `Vfs::opendir`/`releasedir`, `adapter.rs`, `view/listing.rs`, `view/handoff.rs` |
 | Plus contract (R4) | | `crates/vfs/src/responder.rs`, `vfs.rs`, `ctx.rs`, `mock/reffs.rs`, `conformance/readdir.rs` |
 | Engine plus entries (R5) | | `crates/engine/src/view/ops.rs` `readdir` |
 | Adapter readdirplus + negotiation (R6) | | `adapter.rs`, `reply.rs` `DirPlusReply`, `dentries.rs` |
@@ -1064,8 +1281,12 @@ with dates, kernel and host file systems), with these rows:
 Also record under the section: DESIGN §12's "`readdir` resumes by position
 today" is stale since `ed9b40b`, and its "stable readdir cursors are free /
 the cursor is a key" holds only for variable-length cursors, not FUSE's
-64-bit offsets; the proposed DESIGN §12 text (R7); the one-time `ESTALE` for
-a listing paused across the first upgrade across R3.
+64-bit offsets; the proposed DESIGN §12 text (R7); the one-time upgrade
+effects accepted by the maintainer (the first `daemon --upgrade` across R2
+and across R3b is a remount; a listing paused across the cookie change gets
+one error); the remaining inexact listing cases and the errno chosen for
+them, with the Linux NFS client's observed reaction to `NOENT` on
+`READDIR`.
 
 ## Sources
 
