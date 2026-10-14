@@ -341,6 +341,8 @@ impl EngineControl {
                 &name,
                 FsOverrides {
                     s3: Some(e.s3.clone()),
+                    // Host-local: this host's default, or what it had.
+                    state_dir: None,
                     cache_size: opt(&e.cache_size),
                     cache_dir: opt(&e.cache_dir),
                     fsync_mode: opt(&e.fsync_mode),

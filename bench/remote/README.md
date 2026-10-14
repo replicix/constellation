@@ -57,12 +57,12 @@ hosts from `SPEC.md`). Env var `SEQ_MB` overrides the per-thread size
    multi-node join path is `mount --s3 <url> NAME MOUNTPOINT` on every
    node other than the creator (`common.fs_create_first` +
    `common.mount(..., prefix=...)`).
-2. **`--state-dir` forces the ad-hoc/unregistered mount path**, bypassing
-   the registry entirely (see `cmd_mount` in `crates/cli/src/main.rs`:
-   `if state_dir.is_none() { ...Target::Named... }`). Never pass
-   `--state-dir` for a registered-name mount used across nodes; use the
-   bare `NAME` for `mount`/`umount`/`status`/`log tail` instead and let
-   it use the CLI's own default (`~/.local/share/constellation/<name>`).
+2. **The scripts do not pass `--state-dir` for named mounts.** With a
+   name, `--state-dir DIR` makes DIR the name's state dir in the registry
+   (new or empty, and refused while the name's current one is in use);
+   the scripts use the bare `NAME` for `mount`/`umount`/`status`/`log
+   tail` and the CLI's own default (`~/.local/share/constellation/<name>`),
+   the same on every node.
 3. **A prefix is permanently bound to one filesystem.** Re-running the
    matrix needs a brand new prefix (and typically a new local registry
    `NAME` too, since a name that's already registered under an old

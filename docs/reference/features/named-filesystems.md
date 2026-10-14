@@ -85,6 +85,17 @@ is refused if it would repoint a name whose state dir is already
 populated — identity is pinned to the name; run `export` first to really
 repoint it.
 
+A name's state dir is `$XDG_DATA_HOME/constellation/NAME`
+(`~/.local/share/constellation/NAME`) unless `mount` is given
+`--state-dir DIR`: DIR then becomes the name's state dir, stored like
+every other override, so `status NAME`, `umount NAME` and `export NAME`
+find it there (`export` deletes it). DIR must be new or an empty
+directory (`export` deletes it with everything in it, so `--state-dir .`
+in your home directory is refused), and not another name's. The same
+identity rule as for `--s3` refuses a `--state-dir` that would move a
+name whose state dir is in use: populated, or held by a daemon still
+starting up there.
+
 ## One daemon per name
 
 One process serves every mounted view of a name — they share the
@@ -159,8 +170,8 @@ make a later `mount NAME` reopen a replica that already recorded
 
 ## Ad-hoc, unregistered mounts
 
-Passing a literal path/selector as the target (not a registered name)
-together with an explicit `--s3`/`--state-dir` never touches the
+Passing a literal path/selector as the target (`/`, `/sub`, not a
+name) together with an explicit `--s3`/`--state-dir` never touches the
 registry — this is the escape hatch for a one-off or scripted mount that
 should not become a named, durable entry:
 

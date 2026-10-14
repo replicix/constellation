@@ -206,10 +206,10 @@ def fs_create_first(nodes, prefix: str, name: str, e2e: bool = False,
 
 
 def state_dir_for(name: str) -> str:
-    """The CLI's own default registered-name state dir (we never pass
-    --state-dir for named mounts: doing so forces the *ad-hoc, unregistered*
-    mount path -- see mount() docstring -- which would defeat cross-node
-    name registration)."""
+    """The CLI's own default registered-name state dir (we do not pass
+    --state-dir for named mounts: it would make that dir the name's state
+    dir in the registry, refused once the name's current one is in use;
+    the default keeps every node's layout the same)."""
     return f"/home/{SSH_USER}/.local/share/constellation/{name}"
 
 
@@ -221,9 +221,8 @@ def mount(node: str, name: str, prefix: Optional[str] = None, cache_size: Option
           write_mode: Optional[str] = None, fsync_mode: Optional[str] = None,
           e2e_passphrase: Optional[str] = None, extra_args: str = "",
           timeout: float = 60) -> RunResult:
-    """Mount `name` on `node`, using the CLI's registered-name path (NOT
-    --state-dir, which forces an ad-hoc/unregistered mount instead of the
-    Named/registry path -- see cmd_mount in crates/cli/src/main.rs). Pass
+    """Mount `name` on `node`, using the CLI's registered-name path with its
+    default state dir (no --state-dir: see state_dir_for). Pass
     `prefix` (the S3 prefix, same value used in fs_create_first) on EVERY
     node's first mount for this name -- this is how a node other than the
     fs-create node registers the name locally (`mount --s3 <url> NAME

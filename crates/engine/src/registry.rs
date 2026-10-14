@@ -77,6 +77,9 @@ impl FsEntry {
 #[derive(Debug, Clone, Default)]
 pub struct FsOverrides {
     pub s3: Option<String>,
+    /// `mount NAME --state-dir DIR`, checked by
+    /// [`Registry::explicit_state_dir`] first.
+    pub state_dir: Option<PathBuf>,
     pub cache_size: Option<String>,
     pub cache_dir: Option<String>,
     pub fsync_mode: Option<String>,
@@ -218,6 +221,9 @@ impl Registry {
         if let Some(s3) = overrides.s3 {
             entry.s3 = s3;
         }
+        if let Some(dir) = overrides.state_dir {
+            entry.state_dir = dir;
+        }
         if entry.state_dir.as_os_str().is_empty() {
             entry.state_dir = default_named_state_dir(name)?;
         }
@@ -256,12 +262,101 @@ impl Registry {
         Ok(entry)
     }
 
+    /// The state dir `mount NAME --state-dir DIR` makes `name`'s: `explicit`,
+    /// made absolute (the registry outlives the working directory). An
+    /// explicit argument overwrites the stored value (plan 21), and an
+    /// explicit `--state-dir` wins over the registered one in every other
+    /// command (`target::state_dir`): a `mount` that kept the registered
+    /// one would serve the name from a dir its caller never named, and
+    /// `status NAME --state-dir DIR` would then look for a daemon where
+    /// none runs.
+    ///
+    /// Identity is pinned to the name, as for `--s3`: a name owns one
+    /// state dir, which owns its filesystem's replica and its `node_id`.
+    /// So, unless `DIR` is the stored dir itself (however spelled):
+    ///
+    /// - refused while the stored dir is in use: populated (`meta.db`), or
+    ///   its `daemon.lock` held — a daemon still bootstrapping has no
+    ///   `meta.db` yet, and a second one in `DIR` would be a second
+    ///   `node_id` for the name. Its replica and `node_id` would be
+    ///   abandoned without leaving the cluster: `export NAME` retires them;
+    /// - `DIR` must not exist yet or be an empty directory: `export NAME`
+    ///   deletes the name's state dir with everything in it (`--state-dir .`
+    ///   in `$HOME` must not make `$HOME` that), and a populated `DIR` is
+    ///   some other replica, not this name's;
+    /// - `DIR` must not be another name's state dir.
+    pub fn explicit_state_dir(&self, name: &str, explicit: &Path) -> Result<PathBuf> {
+        let dir = std::path::absolute(explicit)
+            .with_context(|| format!("resolving --state-dir {}", explicit.display()))?;
+        if let Some(current) = self.entry(name) {
+            let stored = &current.state_dir;
+            if !stored.as_os_str().is_empty() && same_dir(stored, &dir) {
+                // (spelled as stored: a symlink or `..` to it moves nothing)
+                return Ok(stored.clone());
+            }
+            if !stored.as_os_str().is_empty()
+                && (stored.join("meta.db").exists() || daemon_lock_held(stored))
+            {
+                bail!(
+                    "{name}'s state dir is {}, which is in use; `--state-dir {}` would move it. \
+                     Run `constellation export {name}` first if you really want to move it.",
+                    stored.display(),
+                    dir.display()
+                );
+            }
+        }
+        let new_or_empty = match std::fs::read_dir(&dir) {
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            Ok(mut entries) => entries.next().is_none(),
+        };
+        if !new_or_empty {
+            bail!(
+                "--state-dir {} exists and is not an empty directory: give {name} a new or empty \
+                 one (`constellation export {name}` deletes its state dir with everything in it)",
+                dir.display()
+            );
+        }
+        if let Some((other, _)) = self
+            .entries
+            .iter()
+            .find(|(other, e)| *other != name && same_dir(&e.state_dir, &dir))
+        {
+            bail!("{} is already the state dir of {other}", dir.display());
+        }
+        Ok(dir)
+    }
+
     /// Remove a whole filesystem's row (`export`, Step 6). A no-op,
     /// successful call if the name was already absent.
     pub fn remove(&mut self, name: &str) -> Result<()> {
         self.entries.remove(name);
         self.write()
     }
+}
+
+/// Whether a process holds `dir`'s `daemon.lock` (the CLI's per-state-dir
+/// daemon lock): probed as `export` does, by trying to take it.
+fn daemon_lock_held(dir: &Path) -> bool {
+    let lock = dir.join("daemon.lock");
+    match std::fs::OpenOptions::new().write(true).open(&lock) {
+        // Anything but getting the lock (released again as the guard
+        // drops) counts as held.
+        Ok(f) => !matches!(
+            constellation_platform::native().file_lock.try_lock(f),
+            Ok(Some(_))
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Whether `a` and `b` name one directory, however spelled (resolved where
+/// they exist).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
 }
 
 /// `$XDG_DATA_HOME/constellation/<name>`, falling back to
@@ -309,6 +404,123 @@ mod tests {
         assert_eq!(entry.s3, "s3://bucket/prefix");
         assert_eq!(entry.write_mode, "through");
         assert_eq!(entry.cache_size, "2G");
+    }
+
+    #[test]
+    fn an_explicit_state_dir_is_the_names_unless_it_moves_a_populated_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_locked_at(registry_path(dir.path())).unwrap();
+        let s3 = || Some("s3://bucket/prefix".to_string());
+        // Registered (`fs create`), never mounted: the default is stored.
+        let created = reg
+            .merge_and_save(
+                "myfs",
+                FsOverrides {
+                    s3: s3(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!created.state_dir.as_os_str().is_empty());
+
+        // `mount myfs --state-dir DIR`: DIR, made absolute, replaces it.
+        let mine = dir.path().join("mine");
+        let state_dir = Some(reg.explicit_state_dir("myfs", &mine).unwrap());
+        let entry = reg
+            .merge_and_save(
+                "myfs",
+                FsOverrides {
+                    state_dir,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(entry.state_dir, mine);
+        let relative = reg.explicit_state_dir("other", Path::new("rel")).unwrap();
+        assert!(
+            relative.is_absolute() && relative.ends_with("rel"),
+            "{relative:?}"
+        );
+        // The same dir again (every mount of a script passes it) is fine.
+        assert_eq!(reg.explicit_state_dir("myfs", &mine).unwrap(), mine);
+
+        // Populated: identity is pinned to the name, as for `--s3`.
+        std::fs::create_dir_all(mine.join("meta.db")).unwrap();
+        // (another spelling of the same dir moves nothing)
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&mine, &alias).unwrap();
+            assert_eq!(reg.explicit_state_dir("myfs", &alias).unwrap(), mine);
+        }
+        let err = reg
+            .explicit_state_dir("myfs", &dir.path().join("elsewhere"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("which is in use"), "{err}");
+        assert_eq!(reg.entry("myfs").unwrap().state_dir, mine);
+    }
+
+    #[test]
+    fn an_explicit_state_dir_is_new_or_empty_and_nobody_elses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Registry::load_locked_at(registry_path(dir.path())).unwrap();
+        let register = |reg: &mut Registry, name: &str, state_dir: &Path| {
+            let state_dir = Some(reg.explicit_state_dir(name, state_dir).unwrap());
+            reg.merge_and_save(
+                name,
+                FsOverrides {
+                    s3: Some("s3://bucket/prefix".into()),
+                    state_dir,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+        let refused = |reg: &Registry, name: &str, state_dir: &Path| {
+            reg.explicit_state_dir(name, state_dir)
+                .unwrap_err()
+                .to_string()
+        };
+
+        // `cd ~; mount myfs ... --state-dir .`: `export myfs` would delete
+        // $HOME. A populated dir is not this name's (another replica), and
+        // a file is no dir at all.
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        for not_empty in [dir.path().to_path_buf(), dir.path().join("file")] {
+            let err = refused(&reg, "myfs", &not_empty);
+            assert!(err.contains("is not an empty directory"), "{err}");
+        }
+        let replica = dir.path().join("replica");
+        std::fs::create_dir_all(replica.join("meta.db")).unwrap();
+        let err = refused(&reg, "myfs", &replica);
+        assert!(err.contains("is not an empty directory"), "{err}");
+        assert!(reg.entry("myfs").is_none());
+
+        // New or empty: taken.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        register(&mut reg, "myfs", &empty);
+        assert_eq!(reg.entry("myfs").unwrap().state_dir, empty);
+
+        // Another name's state dir is never shared, empty or not.
+        let err = refused(&reg, "second", &empty);
+        assert!(err.contains("is already the state dir of myfs"), "{err}");
+
+        // A daemon still bootstrapping holds daemon.lock in the stored dir
+        // before it has a meta.db: the dir is in use, a second daemon
+        // elsewhere would be a second node_id for the name.
+        let lock =
+            constellation_platform::lock::open_lock_file(&empty.join("daemon.lock")).unwrap();
+        let held = constellation_platform::native()
+            .file_lock
+            .try_lock(lock)
+            .unwrap()
+            .expect("lock taken");
+        let err = refused(&reg, "myfs", &dir.path().join("other"));
+        assert!(err.contains("which is in use"), "{err}");
+        drop(held);
+        register(&mut reg, "myfs", &dir.path().join("other"));
     }
 
     #[test]

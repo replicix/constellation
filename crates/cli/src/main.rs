@@ -55,9 +55,10 @@ enum Command {
     },
     /// Mount a filesystem by name — see below for `TARGET`/`MOUNTPOINT`.
     Mount {
-        /// A registered name ("myfs"), a name with a subtree/snapshot
-        /// selector ("myfs:/data"), or (with `--s3`/`--state-dir`) a
-        /// literal path/selector for an ad-hoc, unregistered mount.
+        /// A name ("myfs"; registered by its first mount when new), a
+        /// name with a subtree/snapshot selector ("myfs:/data"), or a
+        /// literal path/selector ("/", "/data") for an ad-hoc, unregistered
+        /// mount, which needs `--s3` and `--state-dir`.
         target: String,
         /// Where to mount. Omit to reuse the target's stored mountpoint,
         /// or (for a bare name with no subtree) to mount every view
@@ -68,8 +69,10 @@ enum Command {
         /// (identity is pinned to the name); fills in an empty one.
         #[arg(long)]
         s3: Option<String>,
-        /// Local state directory (metadata DB + chunk cache). Explicit
-        /// escape hatch for an ad-hoc, unregistered mount.
+        /// Local state directory (metadata DB + chunk cache). Required
+        /// for an ad-hoc, unregistered mount; for a name, it becomes the
+        /// name's state dir: new or empty, and refused while the name's
+        /// current one is in use.
         #[arg(long)]
         state_dir: Option<PathBuf>,
         /// Run in the foreground instead of backgrounding.
@@ -2462,19 +2465,17 @@ fn cmd_mount(
     // `mount` is the one command allowed to *create* a name: a target
     // that is syntactically name-shaped but not yet registered (first
     // `mount myfs --s3 ...` for that name) must not fall into the
-    // ad-hoc/`--state-dir`-required path just because `resolve` only
-    // returns `Named` for names that already exist. An explicit
-    // `--state-dir` still takes the ad-hoc escape hatch, matching
-    // `target::state_dir`'s own precedence (explicit wins).
-    if state_dir.is_none() {
-        if let target::Target::Raw(raw) = &resolved {
-            if let Some((name, path)) = target::split_name(raw) {
-                resolved = target::Target::Named {
-                    name,
-                    path,
-                    entry: registry::FsEntry::default(),
-                };
-            }
+    // ad-hoc path just because `resolve` only returns `Named` for names
+    // that already exist. With `--state-dir` too: that is the name's
+    // state dir (below), not a reason to read `myfs` as a subtree path.
+    // The ad-hoc escape hatch is a literal path/selector (`/`, `/sub`).
+    if let target::Target::Raw(raw) = &resolved {
+        if let Some((name, path)) = target::split_name(raw) {
+            resolved = target::Target::Named {
+                name,
+                path,
+                entry: registry::FsEntry::default(),
+            };
         }
     }
 
@@ -2510,6 +2511,17 @@ fn cmd_mount(
                     );
                 }
             }
+            // An explicit `--state-dir` is the name's state dir from now
+            // on, as every other explicit argument overwrites the stored
+            // value — or refused (a dir in use, not empty, another
+            // name's: `Registry::explicit_state_dir`), as an `--s3` that
+            // would repoint a populated state dir is. (It was ignored: the name was served
+            // from its registered dir, `~/.local/share/constellation/NAME`
+            // after `fs create`, while the caller looked in DIR.)
+            let state_dir_override = state_dir
+                .as_deref()
+                .map(|dir| reg.explicit_state_dir(name, dir))
+                .transpose()?;
             let mount_override = (mountpoint.is_some() || path.is_some()).then(|| {
                 let subtree = path.clone().unwrap_or_default();
                 let stored = current.mount(&subtree);
@@ -2549,6 +2561,7 @@ fn cmd_mount(
                 name,
                 registry::FsOverrides {
                     s3: s3.clone(),
+                    state_dir: state_dir_override,
                     cache_size: cache_size.map(|b| format!("{b}")),
                     cache_dir: None,
                     fsync_mode: fsync_mode.clone(),
