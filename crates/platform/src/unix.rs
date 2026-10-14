@@ -1,11 +1,12 @@
 //! What Linux and macOS do identically: XDG-style dirs, `flock(2)`,
-//! `fork`-based daemonizing, `gethostname`, the effective ids, and the
-//! backtrace signal handler.
+//! `fork`-based daemonizing, `gethostname`, the effective ids, the
+//! backtrace signal handler, and the extended-attribute calls.
 
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -269,6 +270,176 @@ pub(crate) fn enable_backtraces(label: &'static str, tid: fn() -> u64) -> io::Re
     }
 }
 
+// ------------------------------------------------------------ xattrs
+//
+// The same four calls on both hosts; macOS's take a `position` (resource
+// forks; 0 for everything else) and an `options` word that Linux's do not.
+// The `sys_*` shims are that one difference.
+
+fn cpath(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+}
+
+fn cname(name: &str) -> io::Result<CString> {
+    CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains a NUL byte"))
+}
+
+/// # Safety
+/// `path` and `name` are NUL-terminated; `value` is valid for `size` bytes.
+#[cfg(target_os = "linux")]
+unsafe fn sys_setxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *const libc::c_void,
+    size: usize,
+) -> libc::c_int {
+    unsafe { libc::setxattr(path, name, value, size, 0) }
+}
+
+/// # Safety
+/// As the Linux one.
+#[cfg(target_os = "macos")]
+unsafe fn sys_setxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *const libc::c_void,
+    size: usize,
+) -> libc::c_int {
+    unsafe { libc::setxattr(path, name, value, size, 0, 0) }
+}
+
+/// # Safety
+/// `path` and `name` are NUL-terminated; `value` is null with `size` 0, or
+/// valid for writes of `size` bytes.
+#[cfg(target_os = "linux")]
+unsafe fn sys_getxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *mut libc::c_void,
+    size: usize,
+) -> libc::ssize_t {
+    unsafe { libc::getxattr(path, name, value, size) }
+}
+
+/// # Safety
+/// As the Linux one.
+#[cfg(target_os = "macos")]
+unsafe fn sys_getxattr(
+    path: *const libc::c_char,
+    name: *const libc::c_char,
+    value: *mut libc::c_void,
+    size: usize,
+) -> libc::ssize_t {
+    unsafe { libc::getxattr(path, name, value, size, 0, 0) }
+}
+
+/// # Safety
+/// `path` is NUL-terminated; `list` is null with `size` 0, or valid for
+/// writes of `size` bytes.
+#[cfg(target_os = "linux")]
+unsafe fn sys_listxattr(
+    path: *const libc::c_char,
+    list: *mut libc::c_char,
+    size: usize,
+) -> libc::ssize_t {
+    unsafe { libc::listxattr(path, list, size) }
+}
+
+/// # Safety
+/// As the Linux one.
+#[cfg(target_os = "macos")]
+unsafe fn sys_listxattr(
+    path: *const libc::c_char,
+    list: *mut libc::c_char,
+    size: usize,
+) -> libc::ssize_t {
+    unsafe { libc::listxattr(path, list, size, 0) }
+}
+
+/// # Safety
+/// `path` and `name` are NUL-terminated.
+#[cfg(target_os = "linux")]
+unsafe fn sys_removexattr(path: *const libc::c_char, name: *const libc::c_char) -> libc::c_int {
+    unsafe { libc::removexattr(path, name) }
+}
+
+/// # Safety
+/// As the Linux one.
+#[cfg(target_os = "macos")]
+unsafe fn sys_removexattr(path: *const libc::c_char, name: *const libc::c_char) -> libc::c_int {
+    unsafe { libc::removexattr(path, name, 0) }
+}
+
+pub(crate) fn set_xattr(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    let (path, name) = (cpath(path)?, cname(name)?);
+    // SAFETY: valid NUL-terminated strings and a live buffer.
+    let rc = unsafe {
+        sys_setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Read a variable-length xattr result: ask for its size, then for the
+/// bytes, asking again if it grew in between (`ERANGE`).
+fn read_sized(
+    mut call: impl FnMut(*mut libc::c_void, usize) -> libc::ssize_t,
+) -> io::Result<Vec<u8>> {
+    loop {
+        let size = call(std::ptr::null_mut(), 0);
+        if size < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; size as usize];
+        let read = call(buf.as_mut_ptr().cast(), buf.len());
+        if read < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ERANGE) {
+                continue;
+            }
+            return Err(e);
+        }
+        buf.truncate(read as usize);
+        return Ok(buf);
+    }
+}
+
+pub(crate) fn get_xattr(path: &Path, name: &str) -> io::Result<Vec<u8>> {
+    let (path, name) = (cpath(path)?, cname(name)?);
+    // SAFETY: valid NUL-terminated strings; `read_sized` passes a null
+    // buffer with size 0, or a live one of the size it gives.
+    read_sized(|buf, len| unsafe { sys_getxattr(path.as_ptr(), name.as_ptr(), buf, len) })
+}
+
+pub(crate) fn list_xattr(path: &Path) -> io::Result<Vec<String>> {
+    let path = cpath(path)?;
+    // SAFETY: as in `get_xattr`.
+    let names = read_sized(|buf, len| unsafe { sys_listxattr(path.as_ptr(), buf.cast(), len) })?;
+    Ok(names
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
+pub(crate) fn remove_xattr(path: &Path, name: &str) -> io::Result<()> {
+    let (path, name) = (cpath(path)?, cname(name)?);
+    // SAFETY: valid NUL-terminated strings.
+    if unsafe { sys_removexattr(path.as_ptr(), name.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +527,63 @@ mod tests {
             .try_lock(crate::lock::open_lock_file(&path).unwrap())
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn xattrs_round_trip_and_report_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        match set_xattr(&path, "user.constellation.test", b"blue") {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {
+                eprintln!("SKIPPED (not run): this filesystem has no extended attributes ({e})");
+                return;
+            }
+            Err(e) => panic!("set_xattr: {e}"),
+        }
+        assert_eq!(
+            get_xattr(&path, "user.constellation.test").unwrap(),
+            b"blue"
+        );
+        // A value longer than any first guess at a buffer, an empty one,
+        // and a replacement.
+        let big = vec![7u8; 20_000];
+        set_xattr(&path, "user.constellation.big", &big).unwrap();
+        set_xattr(&path, "user.constellation.empty", b"").unwrap();
+        set_xattr(&path, "user.constellation.test", b"red").unwrap();
+        assert_eq!(get_xattr(&path, "user.constellation.big").unwrap(), big);
+        assert_eq!(get_xattr(&path, "user.constellation.empty").unwrap(), b"");
+        assert_eq!(get_xattr(&path, "user.constellation.test").unwrap(), b"red");
+        let mut names = list_xattr(&path).unwrap();
+        names.retain(|n| n.starts_with("user.constellation."));
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "user.constellation.big",
+                "user.constellation.empty",
+                "user.constellation.test"
+            ]
+        );
+        remove_xattr(&path, "user.constellation.test").unwrap();
+        // The documented contract the harness's NoData checks rely on:
+        // ENODATA on Linux, ENOATTR on macOS, both `Code::NoData`.
+        for e in [
+            get_xattr(&path, "user.constellation.test").unwrap_err(),
+            remove_xattr(&path, "user.constellation.test").unwrap_err(),
+        ] {
+            assert_eq!(
+                constellation_types::Code::from_io_error(&e),
+                constellation_types::Code::NoData,
+                "{e}"
+            );
+        }
+        // Names and paths with a NUL are refused before the syscall.
+        assert_eq!(
+            set_xattr(&path, "user.a\0b", b"v").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

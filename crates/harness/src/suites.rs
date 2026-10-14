@@ -25,6 +25,18 @@ pub fn unavailable(requirement: &str) -> Option<String> {
     fuse_uring_unavailable()
 }
 
+/// FUSE-over-io_uring is a Linux kernel feature; a host that is not Linux
+/// skips the ring scenarios saying so. (The Linux probe below calls
+/// `io_uring_setup(2)`, which only Linux has.)
+#[cfg(not(target_os = "linux"))]
+fn fuse_uring_unavailable() -> Option<String> {
+    Some(format!(
+        "FUSE-over-io_uring unavailable: Linux only (this is {})",
+        std::env::consts::OS
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn fuse_uring_unavailable() -> Option<String> {
     let read = |p: &str| std::fs::read_to_string(p).map(|v| v.trim().to_string());
     match read("/sys/module/fuse/parameters/enable_uring") {
@@ -118,6 +130,10 @@ pub fn missing(req: &str) -> Option<String> {
                 fuse_uring_unavailable()
             }
         }
+        CAP_SYS_ADMIN if !cfg!(target_os = "linux") => Some(format!(
+            "requires Linux's CAP_SYS_ADMIN (this is {})",
+            std::env::consts::OS
+        )),
         CAP_SYS_ADMIN => (!has_cap_sys_admin())
             .then(|| "requires CAP_SYS_ADMIN (run the harness as root)".to_string()),
         LINUX_6_9 => {
@@ -141,7 +157,12 @@ pub fn has_cap_sys_admin() -> bool {
         .is_some_and(|caps| caps & (1 << 21) != 0)
 }
 
+/// `uname -r`. Off Linux there is no such release to compare (the
+/// kernel-version requirements are Linux's), so the OS is named instead.
 fn kernel_release() -> String {
+    if !cfg!(target_os = "linux") {
+        return std::env::consts::OS.to_string();
+    }
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "an unknown kernel".to_string())

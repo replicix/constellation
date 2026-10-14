@@ -29,7 +29,8 @@
 //! matter: a chunk it holds is read zero-copy as well.
 
 use super::passthrough::{
-    bytes, cache_entries, cached, daemon_reads, memcache, prune_all, with_clients, Aligned,
+    bytes, cache_entries, cached, daemon_reads, memcache, open_direct, prune_all, with_clients,
+    Aligned,
 };
 use super::{eventually, setup, ts};
 use crate::client::Client;
@@ -37,7 +38,7 @@ use crate::s3env::{S3Env, BUCKET};
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -125,13 +126,6 @@ fn write_file(c: &Client, path: &Path, data: &[u8]) -> Result<Vec<(String, u64)>
         },
     )?;
     Ok(out)
-}
-
-fn open_direct(path: &Path) -> Result<std::fs::File> {
-    Ok(std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)?)
 }
 
 /// One `O_DIRECT` `pread` of `len` (a page multiple) at `offset`: one FUSE

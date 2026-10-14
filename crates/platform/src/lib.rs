@@ -5,10 +5,11 @@
 //! differs between hosts is a short, enumerable list of capabilities —
 //! where state and config live, whether a pid is alive and what state it
 //! is in, how to detach into the background, advisory file locks, hole
-//! punching and fsync strength, where secrets are kept, power/network
-//! lifecycle, and the mount table — and this crate is that list. Each is a
-//! trait; [`HostServices`] bundles one implementation of each, and
-//! [`HostServices::native`] builds the set for the OS this binary targets.
+//! punching, fsync strength and extended attributes, where secrets are
+//! kept, power/network lifecycle, and the mount table — and this crate is
+//! that list. Each is a trait; [`HostServices`] bundles one implementation
+//! of each, and [`HostServices::native`] builds the set for the OS this
+//! binary targets.
 //!
 //! ## Why a bundle of `Arc<dyn Trait>`
 //!

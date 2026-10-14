@@ -34,7 +34,7 @@ use crate::s3env::{S3Env, BUCKET};
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -487,6 +487,30 @@ impl Drop for Aligned {
     }
 }
 
+/// Open `path` for reading with `O_DIRECT`, bypassing the page cache.
+/// Linux's open flag: macOS has none (`F_NOCACHE` is an `fcntl` with other
+/// semantics), and the scenarios using this are Linux kernel features
+/// (FUSE passthrough, FUSE-over-io_uring) that `requires` keeps from
+/// running elsewhere, so another host only type-checks it.
+pub(super) fn open_direct(path: &Path) -> Result<std::fs::File> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        Ok(std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        bail!(
+            "O_DIRECT is Linux's open flag (this is {})",
+            std::env::consts::OS
+        )
+    }
+}
+
 pub fn odirect(seed: u64) -> Result<()> {
     // The cache must sit on a block device for "read from disk" to mean
     // anything (a tmpfs `O_DIRECT` read is a memory copy): the work dir
@@ -545,10 +569,7 @@ pub fn odirect(seed: u64) -> Result<()> {
         // `O_DIRECT` on a passthrough handle goes to the backing file's
         // device even though every page is cached (plan 38 §2.1 row 7's
         // behaviour change, asserted rather than discovered).
-        let direct = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&path)?;
+        let direct = open_direct(&path)?;
         expect_counts(c, (2, 2), "the O_DIRECT handle is passthrough too")?;
         let mut buf = Aligned::new(len);
         let before = thread_read_bytes()?;

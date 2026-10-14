@@ -3,7 +3,8 @@
 //! A harness killed by an agent's `timeout` (or `kill -9`) used to leave
 //! its `constellation mount` daemons, S3 gateways and proxies running for
 //! days. [`TiedSpawn::spawn_tied`] starts a child with `PR_SET_PDEATHSIG`
-//! = SIGTERM: when the harness process goes, the kernel TERMs the child,
+//! = SIGTERM (Linux; other hosts have no such signal and do not tie their
+//! children): when the harness process goes, the kernel TERMs the child,
 //! and a daemon then runs its own orderly shutdown (its zombie reaper,
 //! which has no death signal, lazily unmounts whatever the daemon left).
 //!
@@ -34,23 +35,18 @@ fn spawner() -> &'static Mutex<Sender<Job>> {
     })
 }
 
-/// Make `cmd`'s child receive SIGTERM when its forking thread dies.
-fn tie(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) run in
-    // the forked child before exec.
-    unsafe {
-        let parent = libc::getpid();
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // The parent may have died between fork and prctl.
-            if libc::getppid() != parent {
-                libc::_exit(1);
-            }
-            Ok(())
-        });
+/// Make `cmd`'s child receive SIGTERM when its forking thread dies, where
+/// the host can (Linux's `PR_SET_PDEATHSIG`, behind
+/// [`constellation_platform::Process::die_with_parent`]). Elsewhere the
+/// child is simply not tied, and a harness killed hard leaves it running
+/// ([`crate::sweep`] removes mounts and containers, not processes).
+fn tie(cmd: &mut Command) -> std::io::Result<()> {
+    match constellation_platform::native()
+        .process
+        .die_with_parent(cmd)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+        other => other,
     }
 }
 
@@ -63,7 +59,7 @@ pub trait TiedSpawn {
 
 impl TiedSpawn for Command {
     fn spawn_tied(&mut self) -> std::io::Result<Child> {
-        tie(self);
+        tie(self)?;
         let mut owned = std::mem::replace(self, Command::new(""));
         let (tx, rx) = channel();
         let job: Job = Box::new(move || {

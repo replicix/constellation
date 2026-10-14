@@ -35,9 +35,9 @@ pub const BROKER_ENV: &str = "CONSTELLATION_HARNESS_FUSERMOUNT_BROKER";
 /// The name the relay is exec'd under (and fuser's own default helper).
 pub const RELAY_NAME: &str = "fusermount3";
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const AUDIT_ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 
 /// Installs, in the calling (single-threaded, about to `exec`) process, a

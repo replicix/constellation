@@ -196,6 +196,34 @@ mod tests {
         ] {
             assert_eq!(kind(r), io::ErrorKind::Unsupported);
         }
+        assert_eq!(
+            host.process.allowed_cpus().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            kind(
+                host.process
+                    .die_with_parent(&mut std::process::Command::new("true"))
+            ),
+            io::ErrorKind::Unsupported
+        );
+        let x = Path::new("/x");
+        assert_eq!(
+            kind(host.fs.set_xattr(x, "user.a", b"v")),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            kind(host.fs.get_xattr(x, "user.a").map(drop)),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            kind(host.fs.list_xattr(x).map(drop)),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            kind(host.fs.remove_xattr(x, "user.a")),
+            io::ErrorKind::Unsupported
+        );
         assert!(!host.process.is_alive(1));
         // Lifecycle events still flow: the manual source is portable.
         assert_eq!(host.lifecycle.subscribe().try_recv(), None);

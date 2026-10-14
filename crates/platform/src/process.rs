@@ -2,8 +2,9 @@
 //! a pid is alive and what state it is in (the `daemon.lock` takeover's
 //! evidence), a process's supplementary groups (the permission check of a
 //! create that found its name existing), this process's thread count and
-//! memory budget (startup diagnostics, thread sizing), and asking a thread
-//! for its backtrace (the stalled-request watchdog,
+//! memory budget (startup diagnostics, thread sizing), the CPUs it may run
+//! on, tying a child's life to its parent's, and asking a thread for its
+//! backtrace (the stalled-request watchdog,
 //! `CONSTELLATION_FUSE_STALL_BACKTRACE`, plan 31 §6.8).
 //!
 //! What a *decision* made from these facts should be (take a state dir
@@ -11,6 +12,7 @@
 //! module only reports.
 
 use std::io;
+use std::process::Command;
 
 /// One thread, as [`Process::current_thread`] saw it: an id for people
 /// (logs, `status`) and whatever this host needs to signal that thread.
@@ -108,6 +110,15 @@ pub trait Process: Send + Sync {
     /// container/cgroup limit when there is one.
     fn memory_budget(&self) -> Option<u64>;
 
+    /// The CPUs this process may run on, ascending: its scheduling
+    /// affinity mask (Linux `sched_getaffinity`), which a `taskset` or a
+    /// cgroup `cpuset` narrows. Hosts that have no such mask (macOS does
+    /// not let a process choose its CPUs) answer
+    /// [`io::ErrorKind::Unsupported`].
+    fn allowed_cpus(&self) -> io::Result<Vec<usize>> {
+        Err(crate::unsupported("CPU affinity"))
+    }
+
     /// The calling thread.
     fn current_thread(&self) -> ThreadRef;
 
@@ -123,6 +134,18 @@ pub trait Process: Send + Sync {
     /// in the handler allocates, which is fine for a thread parked in a
     /// futex wait, not for one inside the allocator.
     fn request_backtrace(&self, thread: ThreadRef) -> io::Result<()>;
+
+    /// Arrange for the child `cmd` spawns to be sent `SIGTERM` when its
+    /// parent dies (Linux `PR_SET_PDEATHSIG`), so a test harness killed
+    /// by a `timeout` does not leave its daemons running. The kernel
+    /// delivers it when the *thread* that forked the child exits, not the
+    /// process, so the caller spawns from a thread that lives as long as
+    /// the process. Hosts with no death signal answer
+    /// [`io::ErrorKind::Unsupported`]: the child simply is not tied, which
+    /// is a leak to clean up afterwards, not a failure to spawn.
+    fn die_with_parent(&self, _cmd: &mut Command) -> io::Result<()> {
+        Err(crate::unsupported("a parent-death signal"))
+    }
 
     /// Freeze process `pid` (Unix `SIGSTOP`): it stays alive, with its
     /// mounts and memory, but runs nothing until [`Process::resume`]. The

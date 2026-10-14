@@ -13,6 +13,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use constellation_types::Rdev;
@@ -325,6 +326,20 @@ impl Process for LinuxProcess {
         Some(cgroup.map_or(host, |limit| limit.min(host)))
     }
 
+    fn allowed_cpus(&self) -> io::Result<Vec<usize>> {
+        // SAFETY: a zeroed set is valid; the kernel fills it.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: our own affinity, into a set of the right size.
+        let rc = unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((0..libc::CPU_SETSIZE as usize)
+            // SAFETY: `cpu` is below CPU_SETSIZE.
+            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+            .collect())
+    }
+
     fn current_thread(&self) -> ThreadRef {
         let tid = gettid();
         ThreadRef { tid, handle: tid }
@@ -348,6 +363,26 @@ impl Process for LinuxProcess {
         };
         if rc != 0 {
             return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn die_with_parent(&self, cmd: &mut Command) -> io::Result<()> {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) run
+        // in the forked child before exec.
+        unsafe {
+            let parent = libc::getpid();
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // The parent may have died between fork and prctl.
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
         }
         Ok(())
     }
@@ -399,6 +434,22 @@ impl FsPrimitives for LinuxFs {
 
     fn full_fsync(&self, file: &File) -> io::Result<()> {
         file.sync_all()
+    }
+
+    fn set_xattr(&self, path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+        crate::unix::set_xattr(path, name, value)
+    }
+
+    fn get_xattr(&self, path: &Path, name: &str) -> io::Result<Vec<u8>> {
+        crate::unix::get_xattr(path, name)
+    }
+
+    fn list_xattr(&self, path: &Path) -> io::Result<Vec<String>> {
+        crate::unix::list_xattr(path)
+    }
+
+    fn remove_xattr(&self, path: &Path, name: &str) -> io::Result<()> {
+        crate::unix::remove_xattr(path, name)
     }
 
     fn drop_cache(&self, file: &File, offset: u64, len: u64) -> io::Result<()> {
@@ -987,6 +1038,44 @@ garbage line without the separator
         assert_eq!(file.metadata().unwrap().len(), 65536);
         LinuxFs.full_fsync(&file).unwrap();
         LinuxFs.drop_cache(&file, 0, 0).unwrap();
+    }
+
+    #[test]
+    fn allowed_cpus_are_a_nonempty_ascending_list() {
+        let cpus = LinuxProcess.allowed_cpus().unwrap();
+        assert!(!cpus.is_empty());
+        assert!(cpus.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// A child tied to its parent gets `SIGTERM` when the thread that
+    /// forked it exits (not when the process does, which is why the
+    /// harness forks from one long-lived thread).
+    #[test]
+    fn a_tied_child_is_terminated_with_its_forking_thread() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::thread::spawn(|| {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            LinuxProcess.die_with_parent(&mut cmd).unwrap();
+            cmd.spawn().unwrap()
+        })
+        .join()
+        .unwrap();
+        // Bounded, so a regression fails in seconds instead of waiting
+        // out the child.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child outlived the thread that forked it");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
     #[test]

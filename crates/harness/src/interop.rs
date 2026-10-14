@@ -370,10 +370,6 @@ mod sys {
         CString::new(p.as_os_str().as_bytes()).map_err(|_| io::ErrorKind::InvalidInput.into())
     }
 
-    fn cname(n: &str) -> io::Result<CString> {
-        CString::new(n).map_err(|_| io::ErrorKind::InvalidInput.into())
-    }
-
     fn check(rc: libc::c_int) -> io::Result<()> {
         if rc == 0 {
             Ok(())
@@ -430,91 +426,24 @@ mod sys {
         unsafe { libc::geteuid() == 0 }
     }
 
-    #[cfg(target_os = "linux")]
+    // Extended attributes: the host services' calls (Linux's and macOS's
+    // differ in arity).
     pub fn setxattr(p: &Path, name: &str, value: &[u8]) -> io::Result<()> {
-        let (c, n) = (cpath(p)?, cname(name)?);
-        // SAFETY: valid C strings; value pointer/length from a slice.
-        check(unsafe {
-            libc::setxattr(
-                c.as_ptr(),
-                n.as_ptr(),
-                value.as_ptr().cast(),
-                value.len(),
-                0,
-            )
-        })
-    }
-    #[cfg(target_os = "macos")]
-    pub fn setxattr(p: &Path, name: &str, value: &[u8]) -> io::Result<()> {
-        let (c, n) = (cpath(p)?, cname(name)?);
-        // SAFETY: as above; position 0, no options.
-        check(unsafe {
-            libc::setxattr(
-                c.as_ptr(),
-                n.as_ptr(),
-                value.as_ptr().cast(),
-                value.len(),
-                0,
-                0,
-            )
-        })
+        constellation_platform::native()
+            .fs
+            .set_xattr(p, name, value)
     }
 
-    #[cfg(target_os = "linux")]
     pub fn removexattr(p: &Path, name: &str) -> io::Result<()> {
-        let (c, n) = (cpath(p)?, cname(name)?);
-        // SAFETY: valid C strings.
-        check(unsafe { libc::removexattr(c.as_ptr(), n.as_ptr()) })
-    }
-    #[cfg(target_os = "macos")]
-    pub fn removexattr(p: &Path, name: &str) -> io::Result<()> {
-        let (c, n) = (cpath(p)?, cname(name)?);
-        // SAFETY: valid C strings.
-        check(unsafe { libc::removexattr(c.as_ptr(), n.as_ptr(), 0) })
+        constellation_platform::native().fs.remove_xattr(p, name)
     }
 
     pub fn getxattr(p: &Path, name: &str) -> io::Result<Vec<u8>> {
-        let (c, n) = (cpath(p)?, cname(name)?);
-        let mut buf = vec![0u8; 70_000];
-        // SAFETY: buffer pointer/length from a Vec we own.
-        #[cfg(target_os = "linux")]
-        let rc =
-            unsafe { libc::getxattr(c.as_ptr(), n.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-        #[cfg(target_os = "macos")]
-        let rc = unsafe {
-            libc::getxattr(
-                c.as_ptr(),
-                n.as_ptr(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                0,
-                0,
-            )
-        };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        buf.truncate(rc as usize);
-        Ok(buf)
+        constellation_platform::native().fs.get_xattr(p, name)
     }
 
     pub fn listxattr(p: &Path) -> io::Result<Vec<String>> {
-        let c = cpath(p)?;
-        let mut buf = vec![0u8; 70_000];
-        // SAFETY: buffer pointer/length from a Vec we own.
-        #[cfg(target_os = "linux")]
-        let rc = unsafe { libc::listxattr(c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-        #[cfg(target_os = "macos")]
-        let rc = unsafe { libc::listxattr(c.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        buf.truncate(rc as usize);
-        Ok(buf
-            .split(|b| *b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect())
+        constellation_platform::native().fs.list_xattr(p)
     }
 }
 

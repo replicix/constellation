@@ -3,19 +3,13 @@
 # commit 99472fa), which listed constellation-api, -authority and -chaos on
 # x86_64-pc-windows-gnu and -chaos on aarch64-apple-darwin. Since then the
 # api crate was deleted (C5), authority's ESTALE sites became `Code::Stale`
-# (C1), and commit eae81c1 emptied the rest but the entry below: the engine's
+# (C1), and commit eae81c1 emptied the rest but the harness's macOS entry
+# (fixed since, see the note below): the engine's
 # staging I/O is portable, the cli's xattr calls have macOS variants, and
 # constellation-chaos and constellation-pod-load (POSIX test tooling) left the
 # Windows library list in tools/check-cross.sh. Delete a line in the same
 # change that fixes it. Two-way: a listed entry that now passes makes
 # tools/check-cross.sh fail with "STALE" (like the xfstests baseline).
 
-# macOS: the harness's own Linux-only calls (seccomp/`io_uring_setup`
-# denial, CPU-affinity scheduling, `libc::fallocate`/`prctl`, the
-# `setxattr`/`getxattr` arities and `F_SETLK`/`F_WRLCK` typing in
-# scenarios.rs; 21 errors as of plan 38's sandboxing work). Reached since
-# plan 31 C2 made constellation-chaos compile for macOS (its
-# `posix_fadvise` went behind constellation-platform). Moving the harness's
-# host calls behind the platform crate is a plan 31 closing item (PROGRESS,
-# "Plan 31 closing").
-aarch64-apple-darwin constellation-harness
+# (No entries: plan 31 closing moved the harness's host calls behind
+# constellation-platform, the last one.)

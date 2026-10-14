@@ -5971,7 +5971,6 @@ fn epoch_peer_reaching_s3_declines(_seed: u64) -> Result<()> {
 /// Expected everywhere: the cut bytes read as zeros.
 fn truncate_never_resurrects(_seed: u64) -> Result<()> {
     use std::io::{Seek, SeekFrom, Write};
-    use std::os::fd::AsRawFd;
     const NAME: &str = "truncate-never-resurrects";
     let (env, root) = setup(NAME)?;
     let _route = env.s3_proxy()?;
@@ -6051,9 +6050,10 @@ fn truncate_never_resurrects(_seed: u64) -> Result<()> {
     {
         let f = rw(a.mnt.join("t/falloc"))?;
         f.set_len(2)?;
-        // SAFETY: a plain `fallocate(2)` on an fd we own.
-        let r = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, 8) };
-        anyhow::ensure!(r == 0, "fallocate: {}", std::io::Error::last_os_error());
+        constellation_platform::native()
+            .fs
+            .preallocate(&f, 0, 8, false)
+            .context("fallocate")?;
     }
     expect.push(("t/falloc".into(), gap(b"ab", 8, b"")));
 
@@ -7917,63 +7917,18 @@ fn xattr_roundtrip(_seed: u64) -> Result<()> {
     Ok(())
 }
 
-fn c_path(path: &std::path::Path) -> Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(std::ffi::CString::new(path.as_os_str().as_bytes())?)
-}
-
 fn set_xattr(path: &std::path::Path, name: &str, value: &[u8]) -> std::io::Result<()> {
-    let path = c_path(path).map_err(std::io::Error::other)?;
-    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
-    let result = unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    constellation_platform::native()
+        .fs
+        .set_xattr(path, name, value)
 }
 
 fn get_xattr(path: &std::path::Path, name: &str) -> std::io::Result<Vec<u8>> {
-    let path = c_path(path).map_err(std::io::Error::other)?;
-    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
-    let size = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
-    if size < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut value = vec![0u8; size as usize];
-    let read = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            value.len(),
-        )
-    };
-    if read < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        value.truncate(read as usize);
-        Ok(value)
-    }
+    constellation_platform::native().fs.get_xattr(path, name)
 }
 
 fn remove_xattr(path: &std::path::Path, name: &str) -> std::io::Result<()> {
-    let path = c_path(path).map_err(std::io::Error::other)?;
-    let name = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
-    let result = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    constellation_platform::native().fs.remove_xattr(path, name)
 }
 
 fn fallocate_sparse(seed: u64) -> Result<()> {
@@ -8010,20 +7965,12 @@ fn fallocate_sparse(seed: u64) -> Result<()> {
     file.sync_all()?;
 
     let punch_offset = 9 * chunk;
-    let rc = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            punch_offset as libc::off_t,
-            chunk as libc::off_t,
-        )
-    };
-    anyhow::ensure!(
-        rc == 0,
-        "hole punch failed: {}\ndaemon log:\n{}",
-        std::io::Error::last_os_error(),
-        a.tail_log_n(30)
-    );
+    if let Err(e) = constellation_platform::native()
+        .fs
+        .punch_hole(&file, punch_offset, chunk)
+    {
+        anyhow::bail!("hole punch failed: {e}\ndaemon log:\n{}", a.tail_log_n(30));
+    }
     file.sync_all()?;
     let mut punched = vec![1u8; chunk as usize];
     file.read_exact_at(&mut punched, punch_offset)?;
@@ -8062,25 +8009,25 @@ fn fallocate_sparse(seed: u64) -> Result<()> {
 
     // Every successful `fallocate` stamps mtime, also one that changes
     // no byte and no size (xcheckfs: these kept the time `futimens` had
-    // set); the fresh node below sees the time the close published.
+    // set); the fresh node below sees the time the close published. The
+    // expectations for an allocation inside the file are Linux
+    // `fallocate(2)` semantics: `MacFs::preallocate` issues no syscall for
+    // a range inside the current size, so a failure there on a macOS
+    // frontend is not by itself a frontend bug.
     let stamped = a.mnt.join("stamped.bin");
     std::fs::write(&stamped, vec![1u8; 65536])?;
     let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    for (what, mode, offset, len) in [
-        ("an allocation inside the file", 0, 0, 4096),
-        ("KEEP_SIZE inside", libc::FALLOC_FL_KEEP_SIZE, 0, 4096),
-        (
-            "KEEP_SIZE past the end",
-            libc::FALLOC_FL_KEEP_SIZE,
-            65536,
-            65536,
-        ),
+    for (what, keep_size, offset, len) in [
+        ("an allocation inside the file", false, 0, 4096),
+        ("KEEP_SIZE inside", true, 0, 4096),
+        ("KEEP_SIZE past the end", true, 65536, 65536),
     ] {
         let file = std::fs::OpenOptions::new().write(true).open(&stamped)?;
         file.set_modified(old)?;
-        // SAFETY: a plain `fallocate(2)` on an fd we own.
-        let rc = unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, len) };
-        anyhow::ensure!(rc == 0, "{what}: {}", std::io::Error::last_os_error());
+        constellation_platform::native()
+            .fs
+            .preallocate(&file, offset, len, keep_size)
+            .context(what)?;
         let mtime = file.metadata()?.modified()?;
         anyhow::ensure!(
             mtime > old + Duration::from_secs(60),

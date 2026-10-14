@@ -9,7 +9,9 @@ use super::{one_client, setup, ts};
 use crate::client::is_mountpoint;
 use anyhow::{bail, ensure, Context, Result};
 use constellation_types::Code;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -18,69 +20,30 @@ use std::time::{Duration, Instant};
 
 const DOMAIN_XATTR: &str = "trusted.constellation.link_domain";
 
+#[cfg(target_os = "linux")]
 fn cstr(p: &Path) -> CString {
     CString::new(p.as_os_str().as_bytes()).unwrap()
 }
 
-#[cfg(target_os = "linux")]
 fn set_xattr(path: &Path, name: &str, value: &[u8]) -> Result<()> {
-    let name = CString::new(name).unwrap();
-    // SAFETY: valid NUL-terminated strings and a live buffer.
-    let rc = unsafe {
-        libc::setxattr(
-            cstr(path).as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    if rc != 0 {
+    constellation_platform::native()
+        .fs
+        .set_xattr(path, name, value)
         // Kept as the source so a caller can tell the errno.
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("setxattr {name:?} on {}", path.display()));
-    }
-    Ok(())
+        .with_context(|| format!("setxattr {name:?} on {}", path.display()))
 }
 
-#[cfg(target_os = "linux")]
 fn get_xattr(path: &Path, name: &str) -> Result<Vec<u8>> {
-    let name = CString::new(name).unwrap();
-    let mut buf = vec![0u8; 256];
-    // SAFETY: as above; the kernel writes at most `buf.len()` bytes.
-    let n = unsafe {
-        libc::getxattr(
-            cstr(path).as_ptr(),
-            name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    if n < 0 {
-        bail!(
-            "getxattr {name:?} on {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
-    buf.truncate(n as usize);
-    Ok(buf)
-}
-
-// The Linux-only calls (xattr arities, `AT_EMPTY_PATH`): the scenario
-// runs on Linux; other hosts only type-check it (`make check-cross`).
-#[cfg(not(target_os = "linux"))]
-fn set_xattr(_: &Path, _: &str, _: &[u8]) -> Result<()> {
-    bail!("Linux only")
-}
-
-#[cfg(not(target_os = "linux"))]
-fn get_xattr(_: &Path, _: &str) -> Result<Vec<u8>> {
-    bail!("Linux only")
+    constellation_platform::native()
+        .fs
+        .get_xattr(path, name)
+        .map_err(|e| anyhow::anyhow!("getxattr {name:?} on {}: {e}", path.display()))
 }
 
 /// `linkat(fd, "", AT_FDCWD, to, AT_EMPTY_PATH)`: link the open file
 /// itself, whatever its names now are. Returns the result and `errno`.
+/// Linux-only (`AT_EMPTY_PATH`): the scenario runs on Linux, other hosts
+/// only type-check it (`make check-cross`).
 #[cfg(target_os = "linux")]
 fn link_fd(file: &std::fs::File, to: &Path) -> (i32, std::io::Error) {
     use std::os::fd::AsRawFd;

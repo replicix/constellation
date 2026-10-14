@@ -1,10 +1,12 @@
 //! The filesystem capabilities that differ between hosts (plan 31 §2
 //! point 2): hole punching, preallocation, fsync strength and page-cache
-//! advice. Everything else the engine does to local files is plain
-//! `std::fs`.
+//! advice, and extended attributes (the same calls on Linux and macOS, with
+//! different arities). Everything else the engine does to local files is
+//! plain `std::fs`.
 
 use std::fs::File;
 use std::io;
+use std::path::Path;
 
 pub trait FsPrimitives: Send + Sync {
     /// Deallocate `len` bytes at `offset` without changing the file's
@@ -31,4 +33,32 @@ pub trait FsPrimitives: Send + Sync {
     /// filesystem (Linux `POSIX_FADV_DONTNEED`). Advisory: an error only
     /// means the pages may stay.
     fn drop_cache(&self, file: &File, offset: u64, len: u64) -> io::Result<()>;
+
+    /// Set extended attribute `name` (e.g. `user.color`) of `path`, or of
+    /// what it points to when it is a symlink, creating it or replacing
+    /// its value. For code that drives a mounted filesystem through the
+    /// kernel (the harness's scenarios); the engine keeps its own
+    /// attributes in the metadata store. Hosts without extended
+    /// attributes answer [`io::ErrorKind::Unsupported`].
+    fn set_xattr(&self, _path: &Path, _name: &str, _value: &[u8]) -> io::Result<()> {
+        Err(crate::unsupported("extended attributes"))
+    }
+
+    /// The value of extended attribute `name` of `path` (symlinks
+    /// followed). A missing attribute is the OS's error (Linux `ENODATA`,
+    /// macOS `ENOATTR`).
+    fn get_xattr(&self, _path: &Path, _name: &str) -> io::Result<Vec<u8>> {
+        Err(crate::unsupported("extended attributes"))
+    }
+
+    /// The names of `path`'s extended attributes (symlinks followed), in
+    /// the order the host lists them.
+    fn list_xattr(&self, _path: &Path) -> io::Result<Vec<String>> {
+        Err(crate::unsupported("extended attributes"))
+    }
+
+    /// Remove extended attribute `name` of `path` (symlinks followed).
+    fn remove_xattr(&self, _path: &Path, _name: &str) -> io::Result<()> {
+        Err(crate::unsupported("extended attributes"))
+    }
 }

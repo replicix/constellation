@@ -236,6 +236,22 @@ impl FsPrimitives for MacFs {
     fn drop_cache(&self, _file: &File, _offset: u64, _len: u64) -> io::Result<()> {
         Err(unsupported("dropping cached pages (no posix_fadvise)"))
     }
+
+    fn set_xattr(&self, path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+        crate::unix::set_xattr(path, name, value)
+    }
+
+    fn get_xattr(&self, path: &Path, name: &str) -> io::Result<Vec<u8>> {
+        crate::unix::get_xattr(path, name)
+    }
+
+    fn list_xattr(&self, path: &Path) -> io::Result<Vec<String>> {
+        crate::unix::list_xattr(path)
+    }
+
+    fn remove_xattr(&self, path: &Path, name: &str) -> io::Result<()> {
+        crate::unix::remove_xattr(path, name)
+    }
 }
 
 // --------------------------------------------------------------- mounts

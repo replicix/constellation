@@ -959,11 +959,13 @@ pub fn lock_probe(role: &str, file: &Path, index: u64) -> i32 {
             return 1;
         }
     };
-    let lock = |cmd: libc::c_int, typ: libc::c_int| -> std::io::Result<()> {
+    // `F_WRLCK`/`F_UNLCK` are `c_int` constants on Linux and `c_short` on
+    // macOS; `l_type` is `c_short` on both, so they are taken as it.
+    let lock = |cmd: libc::c_int, typ: libc::c_short| -> std::io::Result<()> {
         // SAFETY: a zeroed `flock` is a valid argument; every field the
         // kernel reads is set below.
         let mut l: libc::flock = unsafe { std::mem::zeroed() };
-        l.l_type = typ as libc::c_short;
+        l.l_type = typ;
         l.l_whence = libc::SEEK_SET as libc::c_short;
         // SAFETY: an fcntl lock call on a descriptor this process owns.
         if unsafe { libc::fcntl(f.as_raw_fd(), cmd, &l) } == 0 {
@@ -974,7 +976,7 @@ pub fn lock_probe(role: &str, file: &Path, index: u64) -> i32 {
     };
     match role {
         "holder" => {
-            if let Err(e) = lock(libc::F_SETLK, libc::F_WRLCK) {
+            if let Err(e) = lock(libc::F_SETLK, libc::F_WRLCK as _) {
                 say(&format!("lock: {e}"));
                 return 1;
             }
@@ -988,19 +990,19 @@ pub fn lock_probe(role: &str, file: &Path, index: u64) -> i32 {
                 say(&format!("write: {e}"));
                 return 1;
             }
-            if let Err(e) = lock(libc::F_SETLK, libc::F_UNLCK) {
+            if let Err(e) = lock(libc::F_SETLK, libc::F_UNLCK as _) {
                 say(&format!("unlock: {e}"));
                 return 1;
             }
             say("unlocked");
             0
         }
-        "waiter" => match lock(libc::F_SETLKW, libc::F_WRLCK) {
+        "waiter" => match lock(libc::F_SETLKW, libc::F_WRLCK as _) {
             Ok(()) => {
                 let record = format!("waiter {index:04}\n");
                 let at = 4096 * (1 + index);
                 let r = f.write_all_at(record.as_bytes(), at);
-                let _ = lock(libc::F_SETLK, libc::F_UNLCK);
+                let _ = lock(libc::F_SETLK, libc::F_UNLCK as _);
                 match r {
                     Ok(()) => {
                         say("granted");
@@ -1031,19 +1033,12 @@ pub fn lock_probe(role: &str, file: &Path, index: u64) -> i32 {
 /// The CPU every process of [`transport_lock_wait_budget`] is pinned to:
 /// the last one this process may run on (an arbitrary but fixed queue).
 fn budget_cpu() -> Result<usize> {
-    // SAFETY: a zeroed set is valid; the kernel fills it.
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    // SAFETY: our own affinity, into a set of the right size.
-    let rc = unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&set), &mut set) };
-    ensure!(
-        rc == 0,
-        "sched_getaffinity: {}",
-        std::io::Error::last_os_error()
-    );
-    (0..libc::CPU_SETSIZE as usize)
-        .rev()
-        // SAFETY: `cpu` is below CPU_SETSIZE.
-        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+    constellation_platform::native()
+        .process
+        .allowed_cpus()
+        .map_err(|e| anyhow::anyhow!("sched_getaffinity: {e}"))?
+        .last()
+        .copied()
         .context("no CPU in our affinity mask")
 }
 

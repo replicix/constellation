@@ -29204,7 +29204,7 @@ Close-out of [plan 31](wip/31-core-frontend-backend.md). Milestones C0 to C8 are
 | **C6, a two-engine fixture for the `invalidation` group.** The 5 tests skip because a second view of one engine gets no invalidations for the first's mutations and two engines cannot share a file backend; the fixture is two engines over one S3-shaped store (the pattern at the bottom of `crates/engine/src/shipper.rs`) whose first engine's `open_view` is given the recording events | in progress | `crates/engine/tests/conformance.rs`, `crates/vfs/src/conformance/ENGINE_TARGET.md` | *(to be recorded)* |
 | **§6.4, the threading assertion, and §6.10, `ControlVfs` metrics.** `OpCtx::new` debug-asserts that the caller is not a tokio runtime worker (plan 31 §6.4 says it does; it does not yet); the `ControlVfs` browse ops (`browse.stat/read/write/mkdir/rename/delete/xattr`) go through the `Observer` so they are counted and traced like a mount's ops (C7a left them out) | in progress | `crates/vfs/src/ctx.rs`, `crates/engine/src/control/browse.rs` | *(to be recorded)* |
 | **`Manager`, unified.** The CLI's `fs` subcommands and the control service's `fs_list/create/export/import/passwd/doctor/unlock` are separate implementations; one shared implementation both call (plan 31 §4's `Manager`, which was never built as a type) | in progress | `crates/cli/src/main.rs`, `crates/engine/src/control/fs.rs`, `crates/engine/src/registry.rs` | *(to be recorded)* |
-| **The harness compiles for macOS.** Its host calls (seccomp and `io_uring_setup` denial, CPU-affinity scheduling, `libc::fallocate`/`prctl`, xattr arities, `F_SETLK` typing, the spawner, the sandbox) move behind `constellation-platform`; the `aarch64-apple-darwin constellation-harness` entry of `tools/check-cross-known-failures.txt` is then deleted in the same change, and the nightly `macos` job (`cargo test --workspace`) can build the harness | in progress | `crates/harness/src/*`, `crates/platform/src/*`, `tools/check-cross-known-failures.txt` | *(to be recorded)* |
+| **The harness compiles for macOS.** Its host calls (seccomp and `io_uring_setup` denial, CPU-affinity scheduling, `libc::fallocate`/`prctl`, xattr arities, `F_SETLK` typing, the spawner, the sandbox) move behind `constellation-platform`; the `aarch64-apple-darwin constellation-harness` entry of `tools/check-cross-known-failures.txt` is then deleted in the same change, and the nightly `macos` job (`cargo test --workspace`) can build the harness | done | `crates/harness/src/*`, `crates/platform/src/*`, `tools/check-cross-known-failures.txt` | `make check-cross`: `aarch64-apple-darwin` workspace ok, all `x86_64-pc-windows-gnu` library crates ok, the known-failures file holds no entries. Harness calls became `FsPrimitives::{preallocate, punch_hole, set/get/list/remove_xattr}`, `Process::{allowed_cpus, die_with_parent}`, or `cfg(target_os = "linux")` with a SKIP reason; the sandbox was already gated. Details and the Linux scenario results: "Plan 31 closing: the harness behind constellation-platform" at the end of this file |
 | **The closing gate run** (table below): the full harness matrix, pjdfstest 8798/8798, `vfs-bench`, both Linux lanes `linux-fuse` and `linux-fuse-process`, `tests/parity.py` | in progress | see "Closing gate run" | *(to be recorded)* |
 
 ### Decisions
@@ -29230,7 +29230,8 @@ The sections above are a log and stay as written; this is where the later facts 
 |---|---|---|
 | C0 table (Perf baselines row) and C0 exit criteria (last item); C3 and C4 criteria "perf within 3% of C0" | pending, measured in the final gate run | Superseded: see Decisions |
 | C0 census, C2 and C3 cross-check tables | `x86_64-pc-windows-gnu`: `constellation-api`, `-authority`, `-chaos`, `-engine` FAIL (known); `aarch64-apple-darwin`: `constellation-chaos` FAIL | `constellation-api` was deleted (C5); `-authority` has been clean since C1 (its `ESTALE` sites carry `Code`); `-chaos` compiles for darwin since C2, and with `constellation-pod-load` (POSIX test tooling) it is excluded from the Windows library list in `tools/check-cross.sh`; `-engine`'s staging I/O and zero-copy check were made portable. The last three are commit `eae81c1`. The one known failure left is `constellation-harness` on darwin (`tools/check-cross-known-failures.txt`, whose header says so) |
-| C2 table ("Left in place: … the harness's `fusermount3`/`SIGSTOP`/`fallocate` (C6)") | C6 moves them | C6b moved the harness `Client`'s; the rest is a closing item above |
+| C2 table ("Left in place: … the harness's `fusermount3`/`SIGSTOP`/`fallocate` (C6)") | C6 moves them | C6b moved the harness `Client`'s; the rest moved in the closing item "The harness compiles for macOS" (done) |
+| C6 gap table and exit criteria ("The harness does not compile for macOS", "The harness's host calls behind `constellation-platform`") | in progress; `aarch64-apple-darwin constellation-harness` is a known failure, 21 errors | Done: the entry is gone; the nightly `macos` job's `cargo test --workspace` can build the harness (the errors were 25 on `main` at `d940fa2`) |
 | C4a table (`trait Vfs`, "30 ops") | 30 ops | 31: `copy_file_range` (commit `2acd591`) |
 | C4 follow-ups and C6b: the engine target "72 passed / 0 failed / 9 skipped" | 81 tests | The kit has 92 tests; the engine target's skips are the closing items above |
 | C5 tables | `node.handoff` `Socket` → `Unsupported` (plan 37's second-process handover); `node.lifecycle` → `Unsupported` until C8; the table has 57 methods | `Socket` is implemented (plan 37 K5, `crates/cli/src/handoff_socket.rs`); `node.lifecycle` is implemented (C8); `METHODS` has 72 methods |
@@ -47392,3 +47393,90 @@ durable cache under the operation lock (what makes `back` durable on
 the node), so same-file I/O under concurrent closes pays the host's
 `fdatasync` latency; a `through` close still waits its own upload.
 Both are the modes' promises, not lock costs.
+
+## Plan 31 closing: the harness behind constellation-platform (2026-10-14)
+
+C6's one unfinished promise: "the platform-neutral `Client`/scenario calls
+that used to hardcode `/proc`, `fusermount3`" included the harness's own
+direct `libc` calls, and `constellation-harness` was the last entry of
+`tools/check-cross-known-failures.txt` (`aarch64-apple-darwin`). Plans 34
+(M3) and 35 (W5) assume the harness builds on their OS; it now does for
+macOS, with no logic change on Linux.
+
+### The errors, and where each call went
+
+`make check-cross` on `main` (`d940fa2`): `constellation-harness` 25 errors
+in the lib (the old comment's 21 predated the ring scenarios). Each,
+grouped by what it was:
+
+| Call (site) | Now |
+|---|---|
+| `libc::fallocate` ×5, `FALLOC_FL_PUNCH_HOLE`/`KEEP_SIZE` (`scenarios.rs`: `truncate-never-resurrects`, `fallocate-sparse`) | `FsPrimitives::preallocate` / `punch_hole`, which the engine already used (Linux: the same `fallocate(2)` modes; macOS: `F_PREALLOCATE` / `F_PUNCHHOLE`) |
+| `setxattr`/`getxattr`/`removexattr` arities (`scenarios.rs`; the same calls in `interop.rs` with its own macOS copies and in `scenarios/confinement.rs` with `Linux only` stubs) | New `FsPrimitives::{set,get,list,remove}_xattr` (one implementation in `platform::unix`, the arity difference in four `sys_*` shims). The three copies in the harness are now one-line delegations; `confinement`'s stubs are gone |
+| `F_SETLK`/`F_WRLCK`/`F_UNLCK` typing (`transport.rs` `lock_probe`: `c_int` on Linux, `c_short` on macOS) | taken as `c_short` (`l_type`'s own type) with `as _` at the call; the same `fcntl` byte-range locks on both |
+| `sched_getaffinity`, `cpu_set_t`, `CPU_ISSET` (`transport.rs` `budget_cpu`) | New `Process::allowed_cpus` (Linux: the same `sched_getaffinity` loop; default `Unsupported`). The scenario keeps its `taskset` requirement, so it still SKIPs where there is no `taskset` |
+| `prctl(PR_SET_PDEATHSIG)` (`spawn.rs`) | New `Process::die_with_parent(&mut Command)` (Linux: the same `pre_exec` hook, moved verbatim; default `Unsupported`, which `spawn_tied` treats as "child not tied") |
+| `SYS_io_uring_setup` probe (`suites.rs`) | Stays in the harness: `fuse_uring_unavailable` has a `cfg(linux)` body and a non-Linux twin answering `FUSE-over-io_uring unavailable: Linux only (this is macos)` |
+| `libc::O_DIRECT` (`passthrough.rs`, `zerocopy.rs`) | One shared `open_direct` (Linux: `custom_flags(O_DIRECT)` as before; elsewhere an error, never a silent buffered open); zerocopy's private copy is gone |
+| `libc::O_PATH` + `/proc/self/fd` (`smoke.rs`) | The "unlinked file reopened through its `O_PATH` descriptor" step is a function, `cfg(linux)`; elsewhere `harness smoke` prints `== ...: skipped (Linux only, this is macos)` and goes on |
+
+The seccomp filter and the `fusermount3` relay of `sandbox.rs` were already
+`cfg(linux)` with `Unsupported` twins; only the `AUDIT_ARCH` constants (an
+unused-constant warning on macOS) gained `target_os = "linux"`.
+
+### Linux-only scenarios on macOS
+
+No scenario was removed or weakened; none can fail to compile. A scenario
+that needs a Linux kernel feature already declares it in `requires`, and
+`harness run` reports it `SKIPPED (<reason>)` before running anything:
+`transport-*` and `passthrough-*`/`zero-copy-*` (`FUSE_URING`,
+`LINUX_6_9`, `CAP_SYS_ADMIN`; the reasons now name the OS —
+`FUSE-over-io_uring unavailable: Linux only (this is macos)`,
+`requires Linux >= 6.9 (this is macos)`, `requires Linux's CAP_SYS_ADMIN
+(this is macos)` — instead of "an unknown kernel" or "run the harness as
+root"). The xattr/fallocate/lock scenarios are not Linux-only code any more:
+they skip by `Cap` (`Xattrs`, `Fallocate`, `SeekHole`, `ClusterLocks`) on a
+frontend whose declaration lacks it, as before. `subtree-confinement`
+keeps its Linux-only `AT_EMPTY_PATH` helper behind `cfg` with its stub.
+
+### Checks
+
+- `tools/check-cross.sh` (zig 0.16.0 through `tools/zcc`): `aarch64-apple-darwin
+  workspace` ok (was `constellation-harness` FAIL), all 12
+  `x86_64-pc-windows-gnu` library crates ok, exit 0 with the known-failures
+  file now holding no entries. `cargo check --target aarch64-apple-darwin
+  -p constellation-platform -p constellation-harness --tests` clean too,
+  and no harness/platform warnings on macOS.
+- New tests: `unix::tests::xattrs_round_trip_and_report_a_missing_one`
+  (set/get/replace/list/remove, a 20000-byte value past a first-guess
+  buffer, an empty value, a NUL in the name refused),
+  `linux::tests::allowed_cpus_are_a_nonempty_ascending_list`,
+  `linux::tests::a_tied_child_is_terminated_with_its_forking_thread`
+  (SIGTERM when the forking thread exits), and the stub test now covers the
+  four xattr calls, `allowed_cpus` and `die_with_parent`.
+
+### Linux results (debug build, rebased on `627b643`)
+
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean.
+- `cargo test -p constellation-harness -p constellation-platform`: harness
+  97 lib + 3 integration, platform 43, all pass; `cargo test --workspace
+  --no-fail-fast`: 2967 passed, 0 failed, 53 ignored.
+- Scenarios using the moved calls, on a Linux 7.3 host with a real
+  FUSE-over-io_uring mount (docker floci): `xattr-roundtrip`,
+  `fallocate-sparse`, `truncate-never-resurrects`, `subtree-confinement`,
+  `transport-seccomp-denied` (the `deny_io_uring_setup` filter, the tied
+  spawner) and `transport-lock-wait-budget` (`allowed_cpus` through
+  `taskset`, `lock_probe`'s typed `fcntl` locks) all PASSED, as did
+  `harness smoke` (including the `O_PATH` step). Not run here:
+  `passthrough-odirect` and the `zero-copy-*` scenarios need `CAP_SYS_ADMIN`
+  (the host user is unprivileged), so they SKIP; their only changed line is
+  `open_direct`, the same `OpenOptions` call as before.
+
+### Plan 31 closing exit criteria
+
+- [x] `constellation-harness` type-checks for `aarch64-apple-darwin`; the
+  `tools/check-cross-known-failures.txt` entry is gone
+- [x] every host-specific harness call is behind `constellation-platform`
+  or a `cfg(target_os)` that skips with a reason; no scenario removed
+- [x] no behaviour change on Linux (see "Linux results" above)
