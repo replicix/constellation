@@ -814,7 +814,7 @@ Operational rules:
   answers that had arrived unread) is one late tick however long it
   lasted (`status.own_s3.late_ticks`); a daemon whose ticks are all late
   still reports a real stall, later. A stall already seen lasts until S3
-  answers. `status.s3.outstanding` and `oldest_outstanding_ms` show the
+  answers or a chunk PUT lands. `status.s3.outstanding` and `oldest_outstanding_ms` show the
   requests waiting. On a holder whose lease is still valid nothing waits
   on the deadline (its ops execute
   locally); that run's `own_s3.deadlines` stayed 0.

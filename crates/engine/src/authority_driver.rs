@@ -4946,7 +4946,7 @@ pub fn own_s3_late_ticks() -> u64 {
 /// one tick however long it lasted, so the watch waits a window's worth of
 /// ticks after it before it says S3 is stalled. A runtime whose ticks are
 /// all late still gets there, a tick at a time. A stall already seen
-/// lasts until S3 answers.
+/// lasts until S3 answers or a chunk PUT lands.
 struct OwnS3Watch {
     upload: Arc<crate::upload::UploadRuntime>,
     peers: constellation_net::Peers,

@@ -38,6 +38,9 @@ struct Rounds {
     /// consecutive rounds: after a failed sync the database is poisoned
     /// (`Database::persist`) and every later round fails too.
     failed: Vec<std::ops::RangeInclusive<u64>>,
+    /// Calls that have chosen the round they need (tests wait on it).
+    #[cfg(test)]
+    entered: u64,
 }
 
 #[derive(Default)]
@@ -77,6 +80,10 @@ impl SyncGroup {
         } else {
             r.started + 1
         };
+        #[cfg(test)]
+        {
+            r.entered += 1;
+        }
         loop {
             if r.finished >= need {
                 return if r.failed.iter().any(|f| f.contains(&need)) {
@@ -138,6 +145,18 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// Wait until `n` calls have chosen the round they need.
+    fn wait_entered(group: &SyncGroup, n: u64) {
+        let started = Instant::now();
+        while group.lock().entered < n {
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "calls never entered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     /// Sixteen callers at once share syncs, and each is served by a round
     /// whose flush (its `close`) came after the call.
@@ -219,15 +238,14 @@ mod tests {
                 )
             })
         };
-        // Before the flush: joins the first round. (It has 50 ms to get
-        // there; arriving later it would run a round of its own.)
+        // Before the flush: joins the first round.
         let joined = call(group.clone(), ran.clone());
-        std::thread::sleep(Duration::from_millis(50));
+        wait_entered(&group, 2);
         flush_tx.send(()).unwrap();
         flushed_rx.recv().unwrap();
         // After the flush: the next round.
         let next = call(group.clone(), ran.clone());
-        std::thread::sleep(Duration::from_millis(50));
+        wait_entered(&group, 3);
         release_tx.send(()).unwrap();
         first.join().unwrap().unwrap();
         joined.join().unwrap().unwrap();
@@ -261,16 +279,16 @@ mod tests {
             })
         };
         entered_rx.recv().unwrap();
-        // Two calls after the first round flushed (both within the 50 ms
-        // it is held): one runs the next round, which fails before its
-        // flush, the other joins it.
+        // Two calls after the first round flushed, while it is held: one
+        // runs the next round, which fails before its flush, the other
+        // joins it.
         let waiters: Vec<_> = (0..2)
             .map(|_| {
                 let group = group.clone();
                 std::thread::spawn(move || group.run(|_| Err("io"), || "poisoned"))
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(50));
+        wait_entered(&group, 3);
         release_tx.send(()).unwrap();
         assert_eq!(first.join().unwrap(), Ok(()));
         let mut results: Vec<_> = waiters.into_iter().map(|w| w.join().unwrap()).collect();
@@ -300,9 +318,8 @@ mod tests {
             })
         };
         entered_rx.recv().unwrap();
-        // Two calls during the first round (both within the 50 ms it is
-        // held): one runs the next round, which panics before its flush,
-        // the other joins it.
+        // Two calls while the first round is held: one runs the next
+        // round, which panics before its flush, the other joins it.
         let calls: Vec<_> = (0..2)
             .map(|_| {
                 let group = group.clone();
@@ -314,7 +331,7 @@ mod tests {
                 })
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(50));
+        wait_entered(&group, 3);
         release_tx.send(()).unwrap();
         assert_eq!(first.join().unwrap(), Ok(()));
         let outcomes: Vec<_> = calls.into_iter().map(|c| c.join()).collect();
