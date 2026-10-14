@@ -401,7 +401,10 @@ research, cross-checked) gives the concrete shape `Vfs` has to match:
   implemented** (confirmed absent by grep across the whole `cli` crate):
   `opendir`, `releasedir`, `fsyncdir`, `access`, `bmap`, `ioctl`,
   `copy_file_range` — these rely on fuser's ENOSYS-ish defaults, so `Vfs`
-  can omit them too. The backend-side `ConstellationFs` methods these call
+  can omit them too. (Amended 2026-10: `copy_file_range` is now a `Vfs`
+  op, `NotImplemented` by default, which the engine's view implements —
+  Linux's `ENOSYS` fallback, a splice copy through the page cache,
+  persisted stale pages; DESIGN §12 and `view::copy`.) The backend-side `ConstellationFs` methods these call
   into use domain names, not a blanket `do_*` convention; four do use
   `do_*` (`do_read`, `do_read_detached`, `do_write`, `do_fallocate` — all
   in the `fusefs_ops.rs`-included block, `:1488,1504,1604,1793`), plus

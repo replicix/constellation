@@ -1808,3 +1808,358 @@ fn a_setgid_directory_hands_its_group_to_new_entries() {
         (1000, 0o755)
     );
 }
+
+impl Client {
+    #[allow(clippy::too_many_arguments)]
+    fn copy(
+        &self,
+        src: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        dst: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+    ) -> VfsResult<u64> {
+        self.copy_cx(
+            &self.cx(OpKind::CopyFileRange),
+            src,
+            fh_in,
+            off_in,
+            dst,
+            fh_out,
+            off_out,
+            len,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_cx(
+        &self,
+        cx: &OpCtx<'_>,
+        src: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        dst: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+    ) -> VfsResult<u64> {
+        Blocking::run(|r| {
+            self.view.copy_file_range(
+                cx,
+                src,
+                fh_in,
+                off_in,
+                dst,
+                fh_out,
+                off_out,
+                len,
+                constellation_vfs::CopyFlags::empty(),
+                r,
+            )
+        })
+    }
+}
+
+/// `copy_file_range` copies what a read of the view answers — here a
+/// write of another description, pending (not yet published) — and never
+/// anything the frontend cached. Before, the view did not implement the
+/// op (`NotImplemented`, FUSE `ENOSYS`) and Linux copied with a splice
+/// that read the source through its page cache, which can hold a stale
+/// page for a write already acknowledged (the `view::copy` module doc):
+/// the copy persisted those bytes. The copy publishes nothing of the
+/// source, and the destination's bytes wait in its own session for its
+/// close, exactly as a write's would.
+#[test]
+fn copy_file_range_copies_what_the_view_reads_including_pending_writes() {
+    let c = client();
+    let src = c.put(ROOT_INO, "src", &[b'A'; 8192]);
+    let w = c.open(src, OpenFlags::READ | OpenFlags::WRITE).unwrap();
+    c.write(src, w.fh, 4096, b"BBBB").unwrap();
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let dst = e.attr.ino;
+    assert_eq!(c.copy(src, r.fh, 4094, dst, d.fh, 0, 8).unwrap(), 8);
+    assert_eq!(c.read(dst, d.fh, 0, 64).unwrap(), b"AABBBBAA");
+    assert_eq!(c.getattr(dst).unwrap().size, 8);
+    assert_eq!(
+        c._meta.getattr(dst).unwrap().unwrap().size,
+        0,
+        "pending in the destination's session, as a write's bytes are"
+    );
+    assert!(
+        c.view.writes.lock(src).contains_key(&src),
+        "the source's session is its writer's, unpublished"
+    );
+    c.close(dst, d.fh).unwrap();
+    assert_eq!(c._meta.getattr(dst).unwrap().unwrap().size, 8);
+    c.close(src, r.fh).unwrap();
+    c.close(src, w.fh).unwrap();
+    let o = c.open(dst, OpenFlags::READ).unwrap();
+    assert_eq!(c.read(dst, o.fh, 0, 64).unwrap(), b"AABBBBAA");
+}
+
+/// Into an `O_SYNC` description the copy publishes before it answers, as
+/// each write through it does (the handle remembers the flag: a FUSE copy
+/// carries no open flags); through any other it does not.
+#[test]
+fn a_copy_into_an_o_sync_description_is_published_before_it_answers() {
+    let c = client();
+    let src = c.put(ROOT_INO, "src", b"durable bytes");
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let dst = c.put(ROOT_INO, "dst", b"");
+    let s = c.open(dst, OpenFlags::WRITE | OpenFlags::SYNC).unwrap();
+    assert_eq!(c.copy(src, r.fh, 0, dst, s.fh, 0, 64).unwrap(), 13);
+    assert_eq!(
+        c._meta.getattr(dst).unwrap().unwrap().size,
+        13,
+        "published before the answer"
+    );
+    let plain = c.open(dst, OpenFlags::WRITE).unwrap();
+    assert_eq!(c.copy(src, r.fh, 0, dst, plain.fh, 13, 64).unwrap(), 13);
+    assert_eq!(c._meta.getattr(dst).unwrap().unwrap().size, 13);
+    assert_eq!(c.getattr(dst).unwrap().size, 26);
+    c.close(dst, plain.fh).unwrap();
+    c.close(dst, s.fh).unwrap();
+    assert_eq!(c._meta.getattr(dst).unwrap().unwrap().size, 26);
+}
+
+/// A caller that is gone before the copy starts (its token cancelled: the
+/// FUSE adapter's killable policy) gets `EINTR` and nothing is written.
+#[test]
+fn a_cancelled_copy_writes_nothing() {
+    let c = client();
+    let src = c.put(ROOT_INO, "src", b"0123456789");
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let token = constellation_vfs::CancelToken::new();
+    token.cancel();
+    let cx = c.cx(OpKind::CopyFileRange).with_cancel(&token);
+    assert_eq!(
+        code(c.copy_cx(&cx, src, r.fh, 0, e.attr.ino, d.fh, 0, 10)),
+        Code::Intr
+    );
+    assert_eq!(c.getattr(e.attr.ino).unwrap().size, 0);
+}
+
+/// A copy longer than the chunk size runs in steps that end on the
+/// destination's chunk boundaries (memory stays one chunk), seals the
+/// chunks it fills as a sequential writer's are sealed, and a copy that
+/// lands whole chunks at aligned offsets yields the source's own chunks:
+/// content addressing shares them at rest.
+#[test]
+fn an_aligned_copy_yields_the_sources_chunks() {
+    let c = client();
+    let cs = c.view.chunk_size as usize;
+    let data: Vec<u8> = (0..3 * cs + 100).map(|i| (i * 7 % 251) as u8).collect();
+    let src = c.put(ROOT_INO, "src", &data);
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let dst = e.attr.ino;
+    let mut done = 0u64;
+    while done < data.len() as u64 {
+        let n = c
+            .copy(src, r.fh, done, dst, d.fh, done, data.len() as u64 - done)
+            .unwrap();
+        assert!(n > 0);
+        done += n;
+    }
+    c.close(dst, d.fh).unwrap();
+    let chunks = |ino| {
+        let manifest = c.view.load_manifest(ino).unwrap();
+        c.view.chunk_list(&manifest).unwrap()
+    };
+    assert_eq!(chunks(dst), chunks(src), "the same chunks, shared");
+    let o = c.open(dst, OpenFlags::READ).unwrap();
+    let mut got = Vec::new();
+    while got.len() < data.len() {
+        let part = c.read(dst, o.fh, got.len() as u64, 1 << 20).unwrap();
+        assert!(!part.is_empty());
+        got.extend_from_slice(&part);
+    }
+    assert!(got == data);
+}
+
+/// An unlinked file still open is a file like any other to a copy, as
+/// source and as destination (POSIX: the inode lives while open).
+#[test]
+fn a_copy_reads_and_writes_unlinked_open_files() {
+    let c = client();
+    let src = c.put(ROOT_INO, "src", b"still here");
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let dst = e.attr.ino;
+    c.unlink(ROOT_INO, "src").unwrap();
+    c.unlink(ROOT_INO, "dst").unwrap();
+    assert_eq!(c.copy(src, r.fh, 0, dst, d.fh, 0, 64).unwrap(), 10);
+    assert_eq!(c.read(dst, d.fh, 0, 64).unwrap(), b"still here");
+    c.close(src, r.fh).unwrap();
+    c.close(dst, d.fh).unwrap();
+}
+
+/// Runs `hook` between the steps of the copies this thread makes until
+/// dropped (`copy::AFTER_STEP`).
+pub(super) struct BetweenSteps;
+
+impl BetweenSteps {
+    pub(super) fn set(hook: impl FnMut(u64) + 'static) -> Self {
+        super::copy::AFTER_STEP.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        BetweenSteps
+    }
+}
+
+impl Drop for BetweenSteps {
+    fn drop(&mut self) {
+        super::copy::AFTER_STEP.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// A copy never answers a code that would make Linux copy the request
+/// itself through its page cache: `ENOSYS` would also stop it asking for
+/// the mount's lifetime (`fc->no_copy_file_range`).
+#[test]
+fn a_copy_never_answers_a_code_that_makes_the_kernel_copy_itself() {
+    use super::copy::never_a_fallback;
+    for code in [Code::NotImplemented, Code::NotSupported, Code::CrossDevice] {
+        assert_eq!(never_a_fallback(code), Code::Io, "{code:?}");
+    }
+    for code in [
+        Code::Io,
+        Code::NoSpace,
+        Code::BadFd,
+        Code::Invalid,
+        Code::Intr,
+    ] {
+        assert_eq!(never_a_fallback(code), code);
+    }
+}
+
+/// The size, then every byte, of `ino`.
+fn contents(c: &Client, ino: Ino) -> Vec<u8> {
+    let o = c.open(ino, OpenFlags::READ).unwrap();
+    let mut all = Vec::new();
+    loop {
+        let part = c.read(ino, o.fh, all.len() as u64, 1 << 20).unwrap();
+        if part.is_empty() {
+            break;
+        }
+        all.extend_from_slice(&part);
+    }
+    c.close(ino, o.fh).unwrap();
+    assert_eq!(all.len() as u64, c.getattr(ino).unwrap().size);
+    all
+}
+
+/// A copy whose second step cannot read its source (the chunk is in no
+/// cache and not in the store) answers the first step's bytes — exactly
+/// what the destination then holds — and the next call, from there,
+/// reports the error.
+#[test]
+fn a_copy_that_cannot_read_its_source_midway_is_short_by_exactly_the_rest() {
+    let c = client();
+    let cs = c.view.chunk_size as usize;
+    let data: Vec<u8> = (0..cs + 10).map(|i| (i % 253) as u8 + 1).collect();
+    let src = c.put(ROOT_INO, "src", &data);
+    let manifest = c.view.load_manifest(src).unwrap();
+    let hashes = c.view.chunk_list(&manifest).unwrap();
+    // Chunk 1 is lost: never uploaded (no store sync here), now evicted.
+    c.view.cache.remove(&hashes[&1]).unwrap();
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let dst = e.attr.ino;
+    // Two steps: the destination's chunk 0 ends 10 bytes in, where the
+    // source's chunk 1 begins.
+    let at = cs as u64 - 10;
+    assert_eq!(c.copy(src, r.fh, at, dst, d.fh, at, 20).unwrap(), 10);
+    let mut expect = vec![0u8; at as usize];
+    expect.extend_from_slice(&data[at as usize..cs]);
+    assert!(
+        contents(&c, dst) == expect,
+        "the short count is what is there"
+    );
+    let next = c.copy(src, r.fh, cs as u64, dst, d.fh, cs as u64, 10);
+    assert!(
+        next.as_ref()
+            .is_err_and(|e| e.code() != Code::NotImplemented),
+        "{next:?}"
+    );
+    assert_eq!(c.getattr(dst).unwrap().size, cs as u64);
+    c.close(dst, d.fh).unwrap();
+}
+
+/// A copy refused space midway (`ENOSPC`, here the quota) is short by
+/// exactly what it could not write, and the next call reports `ENOSPC`.
+#[test]
+fn a_copy_refused_space_midway_is_short_by_exactly_the_rest() {
+    let c = client();
+    let cs = c.view.chunk_size as u64;
+    let src = c.put(ROOT_INO, "src", b"0123456789abcdefghij");
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let dst = e.attr.ino;
+    // Room for the destination's growth to the first step's end only.
+    let (used, _) = c._meta.usage();
+    c._meta.set_quota(Some(used + cs + 5)).unwrap();
+    View::invalidate_quota_cache(&c.view.quota_cache);
+    assert_eq!(c.copy(src, r.fh, 0, dst, d.fh, cs - 10, 20).unwrap(), 10);
+    assert_eq!(c.getattr(dst).unwrap().size, cs);
+    assert_eq!(
+        code(c.copy(src, r.fh, 10, dst, d.fh, cs, 10)),
+        Code::NoSpace
+    );
+    let all = contents(&c, dst);
+    assert_eq!(&all[(cs - 10) as usize..], b"0123456789");
+    assert!(all[..(cs - 10) as usize].iter().all(|b| *b == 0));
+    c.close(dst, d.fh).unwrap();
+}
+
+/// A caller that dies while its copy runs ends it at the next step: the
+/// answer counts the steps done, which the destination holds.
+#[test]
+fn a_copy_cancelled_between_steps_answers_the_steps_done() {
+    let c = client();
+    let cs = c.view.chunk_size as u64;
+    let data: Vec<u8> = (0..cs + 20).map(|i| (i % 251) as u8 + 1).collect();
+    let src = c.put(ROOT_INO, "src", &data);
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let dst = e.attr.ino;
+    let token = constellation_vfs::CancelToken::new();
+    let cancel = token.clone();
+    let _hook = BetweenSteps::set(move |_| cancel.cancel());
+    let cx = c.cx(OpKind::CopyFileRange).with_cancel(&token);
+    // Three steps (10, a chunk, 10): cancelled after the first.
+    assert_eq!(
+        c.copy_cx(&cx, src, r.fh, 0, dst, d.fh, cs - 10, cs + 20)
+            .unwrap(),
+        10
+    );
+    assert_eq!(c.getattr(dst).unwrap().size, cs);
+    assert_eq!(&contents(&c, dst)[(cs - 10) as usize..], &data[..10]);
+    c.close(dst, d.fh).unwrap();
+}
+
+/// One call copies at most `COPY_CHUNKS` chunks (`copy`'s module doc: the
+/// kernel holds the destination's `i_rwsem` across it, unkillably); the
+/// caller loops for the rest.
+#[test]
+fn one_copy_call_is_capped_at_a_few_chunks() {
+    use super::copy::{COPY_CALL_MAX, COPY_CHUNKS};
+    let c = client();
+    let cs = c.view.chunk_size as u64;
+    let cap = (COPY_CHUNKS * cs).min(COPY_CALL_MAX).max(cs);
+    let data: Vec<u8> = (0..cap + cs / 2).map(|i| (i % 249) as u8).collect();
+    let src = c.put(ROOT_INO, "src", &data);
+    let r = c.open(src, OpenFlags::READ).unwrap();
+    let (e, d) = c.create(ROOT_INO, "dst").unwrap();
+    let dst = e.attr.ino;
+    let total = data.len() as u64;
+    assert_eq!(c.copy(src, r.fh, 0, dst, d.fh, 0, total).unwrap(), cap);
+    assert_eq!(
+        c.copy(src, r.fh, cap, dst, d.fh, cap, total - cap).unwrap(),
+        total - cap
+    );
+    c.close(dst, d.fh).unwrap();
+    assert!(contents(&c, dst) == data);
+}

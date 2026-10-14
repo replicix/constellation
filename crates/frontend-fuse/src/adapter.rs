@@ -63,16 +63,16 @@
 use crate::dentries::{KernelEntries, RenameGuard};
 use crate::passthrough::{reason, BackingOps, PassthroughState, PassthroughWish, PreOpen};
 use crate::reply::{
-    AttrReply, BytesReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply, LseekReply,
-    OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply, XattrListReply,
-    XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
+    AttrReply, BytesReply, CopyReply, CreateReply, DirReply, EmptyReply, EntryReply, LockReply,
+    LseekReply, OpenCtx, OpenReply, ReadReply, RenameReply, StatfsReply, Undo, WriteReply,
+    XattrListReply, XattrReply, F_RDLCK, F_UNLCK, F_WRLCK,
 };
 use crate::stats::ZeroCopyCounter;
 use constellation_types::{Code, Rdev};
 use constellation_vfs::{
-    Caller, CancelToken, Durability, FallocateMode, Fh, FrontendCaps, LockKind, LockOwner,
-    LockRange, LockSpec, Name, Observer, OpKind, OpenFlags, OpenOwner, RenameFlags, Responder,
-    SeekWhence, SetAttr, SetXattrFlags, TimeSet, Vfs, WriteData, XattrName,
+    Caller, CancelToken, CopyFlags, Durability, FallocateMode, Fh, FrontendCaps, LockKind,
+    LockOwner, LockRange, LockSpec, Name, Observer, OpKind, OpenFlags, OpenOwner, RenameFlags,
+    Responder, SeekWhence, SetAttr, SetXattrFlags, TimeSet, Vfs, WriteData, XattrName,
 };
 use fuser::{
     BsdFileFlags, FileHandle, Filesystem, INodeNo, InitFlags, KernelConfig, ReplyAttr, ReplyData,
@@ -1566,6 +1566,66 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
             offset as u64,
             whence,
             op.responder(LseekReply(reply)),
+        );
+    }
+
+    /// `FUSE_COPY_FILE_RANGE` (the engine's `view::copy` module doc says
+    /// why it is answered at all: the kernel's fallback for `ENOSYS`, a
+    /// splice copy, reads the source through its page cache). The kernel
+    /// sends it only within one connection, for regular files it checked
+    /// (`generic_copy_file_checks`: access modes, `O_APPEND`, overlap,
+    /// the source's end as it caches it), with no flags, and never of 0
+    /// bytes; it tries `FUSE_COPY_FILE_RANGE_64` first, which fuser does
+    /// not decode (`ENOSYS`), and then sends this op for good, its length
+    /// capped below 4 GiB. Fewer bytes copied than asked is a short copy
+    /// it returns as such; any error but `EOPNOTSUPP`/`EXDEV` (which
+    /// would send it to the splice copy, and are never answered here)
+    /// is the caller's.
+    ///
+    /// Killable like an `O_SYNC` write (the module doc): a copy can run
+    /// for seconds and wait for S3, and a caller that dies meanwhile must
+    /// not wait for all of it; its interrupt ends the copy at the next
+    /// chunk, short.
+    fn copy_file_range(
+        &self,
+        req: &Request,
+        ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        flags: fuser::CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        let caller = caller(req);
+        let op = self.obs().begin(OpKind::CopyFileRange, ino_out.0);
+        let _in = op.enter();
+        let flags = if flags.bits() == 0 {
+            CopyFlags::empty()
+        } else {
+            CopyFlags::UNSUPPORTED
+        };
+        let unique = req.unique().0;
+        let token = self.interrupts.register(unique, req.pid(), self.lossy());
+        // It may be answered from the engine's completion or `fsync`
+        // pool: a bounded deferral, for a detach to drain.
+        let reply = op.responder(
+            self.deferred
+                .track_bounded(self.interrupts.guard(unique, CopyReply(reply))),
+        );
+        self.vfs.copy_file_range(
+            &op.ctx(&caller).with_cancel(&token),
+            ino_in.0,
+            Fh(fh_in.0),
+            offset_in,
+            ino_out.0,
+            Fh(fh_out.0),
+            offset_out,
+            len,
+            flags,
+            reply,
         );
     }
 

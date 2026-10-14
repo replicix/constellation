@@ -12,9 +12,9 @@ use crate::error::VfsResult;
 use crate::name::XattrNameBuf;
 use crate::responder::DirEntry;
 use crate::types::{
-    Attr, Durability, Entry, FallocateMode, Fh, Ino, LockKind, LockOwner, LockRange, LockSpec,
-    LockStatus, OpenFlags, Opened, ReadData, RenameFlags, SeekWhence, SetAttr, SetXattrFlags,
-    StatFs,
+    Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, Ino, LockKind, LockOwner, LockRange,
+    LockSpec, LockStatus, OpenFlags, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
+    SetXattrFlags, StatFs,
 };
 use constellation_types::{Code, Rdev};
 use std::sync::mpsc;
@@ -453,6 +453,52 @@ impl Client {
     ) -> VfsResult<()> {
         self.start(OpKind::Fallocate, "fallocate", |v, cx, d| {
             v.fallocate(cx, ino, fh, off, len, mode, d)
+        })
+        .wait()
+    }
+
+    /// `copy_file_range(2)` of `len` bytes, `ino_in` at `off_in` to
+    /// `ino_out` at `off_out`, with no flags.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_range(
+        &self,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+    ) -> VfsResult<u64> {
+        self.copy_range_flags(
+            ino_in,
+            fh_in,
+            off_in,
+            ino_out,
+            fh_out,
+            off_out,
+            len,
+            CopyFlags::empty(),
+        )
+    }
+
+    /// [`Self::copy_range`] with `flags`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_range_flags(
+        &self,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
+    ) -> VfsResult<u64> {
+        self.start(OpKind::CopyFileRange, "copy_file_range", |v, cx, d| {
+            v.copy_file_range(
+                cx, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags, d,
+            )
         })
         .wait()
     }

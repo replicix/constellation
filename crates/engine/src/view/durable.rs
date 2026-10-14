@@ -45,6 +45,14 @@ pub struct Handle {
     /// slower). Missing from a handover export: writable, as before.
     #[serde(default = "writable")]
     pub write: bool,
+    /// Opened `O_SYNC`/`O_DSYNC` (which `fcntl` cannot change): what a
+    /// `copy_file_range` into it publishes before answering, as each of
+    /// its writes does. A write carries the open's flags itself; a FUSE
+    /// copy names only the handle. New in the handover's handle table,
+    /// which is postcard (positional): a handover from a daemon built
+    /// before it fails to decode — accepted, no compatibility is kept for
+    /// handover formats.
+    pub sync: bool,
 }
 
 fn writable() -> bool {
@@ -53,13 +61,18 @@ fn writable() -> bool {
 
 impl Handles {
     /// A new description of `ino`, having seen everything up to `seen`.
-    pub(super) fn open(&self, ino: Ino, seen: u64, write: bool) -> Fh {
+    pub(super) fn open(&self, ino: Ino, seen: u64, write: bool, sync: bool) -> Fh {
         // Never 0: a frontend passes `Fh(0)` for "no handle".
         let fh = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        self.open
-            .lock()
-            .unwrap()
-            .insert(fh, Handle { ino, seen, write });
+        self.open.lock().unwrap().insert(
+            fh,
+            Handle {
+                ino,
+                seen,
+                write,
+                sync,
+            },
+        );
         Fh(fh)
     }
 
@@ -67,6 +80,16 @@ impl Handles {
     /// does not know: its close publishes, as every close used to).
     pub(super) fn writes(&self, fh: Fh) -> bool {
         self.open.lock().unwrap().get(&fh.0).is_none_or(|h| h.write)
+    }
+
+    /// `fh`, if this view gave it out: its inode, whether it was opened
+    /// for writing, and whether `O_SYNC` (`copy_file_range`'s checks).
+    pub(super) fn mode(&self, fh: Fh) -> Option<(Ino, bool, bool)> {
+        self.open
+            .lock()
+            .unwrap()
+            .get(&fh.0)
+            .map(|h| (h.ino, h.write, h.sync))
     }
 
     pub(super) fn ino(&self, fh: Fh) -> Option<Ino> {
@@ -142,10 +165,16 @@ impl Drop for Closing<'_> {
 }
 
 impl View {
-    /// A new open file description of `ino` (see the module doc).
-    pub(super) fn open_handle(&self, ino: Ino, write: bool) -> Fh {
-        self.handles
-            .open(ino, self.meta.locks().error_seq(ino), write)
+    /// A new open file description of `ino`, opened with `flags` (see
+    /// the module doc).
+    pub(super) fn open_handle(&self, ino: Ino, flags: constellation_vfs::OpenFlags) -> Fh {
+        use constellation_vfs::OpenFlags;
+        self.handles.open(
+            ino,
+            self.meta.locks().error_seq(ino),
+            flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC),
+            flags.contains(OpenFlags::SYNC),
+        )
     }
 
     /// This view's last description of `ino` closed: forget the inode's
@@ -182,7 +211,7 @@ impl View {
             return Fh(*fh);
         }
         drop(open);
-        self.handles.open(ino, 0, true)
+        self.handles.open(ino, 0, true, false)
     }
 
     /// The node's `fsync` policy and waits.
@@ -200,6 +229,20 @@ impl View {
     /// all.
     pub(super) fn fsync_deferral(&self, kind: constellation_vfs::OpKind) -> Option<Arc<View>> {
         if self.sync.is_none() || !self.caps.deferrable.contains(kind) {
+            return None;
+        }
+        self.this.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// This view's `Arc`, when a `copy_file_range` may run on the
+    /// completion pool: the frontend answers it from another thread and
+    /// the view was opened by an engine (`copy`'s module doc).
+    pub(super) fn copy_deferral(&self) -> Option<Arc<View>> {
+        if !self
+            .caps
+            .deferrable
+            .contains(constellation_vfs::OpKind::CopyFileRange)
+        {
             return None;
         }
         self.this.get().and_then(std::sync::Weak::upgrade)
@@ -286,8 +329,8 @@ mod tests {
     #[test]
     fn handles_are_unique_and_address_their_inode() {
         let h = Handles::default();
-        let a = h.open(7, 0, true);
-        let b = h.open(7, 0, true);
+        let a = h.open(7, 0, true, false);
+        let b = h.open(7, 0, true, false);
         assert_ne!(a, b);
         assert_ne!(a, Fh(0));
         assert_eq!(h.ino(a), Some(7));
@@ -301,10 +344,10 @@ mod tests {
     #[test]
     fn an_error_event_is_reported_once_per_description_open_at_the_time() {
         let h = Handles::default();
-        let a = h.open(7, 0, true);
-        let b = h.open(7, 0, true);
+        let a = h.open(7, 0, true, false);
+        let b = h.open(7, 0, true, false);
         let event = 3;
-        let c = h.open(7, event, true);
+        let c = h.open(7, event, true, false);
         assert!(h.take_error(a, 7, event));
         assert!(!h.take_error(a, 7, event), "reported once");
         assert!(h.take_error(b, 7, event));

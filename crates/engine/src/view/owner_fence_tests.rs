@@ -76,6 +76,24 @@ impl Fenced {
         })
     }
 
+    /// `copy_file_range` of `ino`'s first 6 bytes to its offset 64.
+    fn copy(&self, caller: &Caller, ino: Ino, fh: Fh) -> VfsResult<u64> {
+        Blocking::run(|r| {
+            self.fs.copy_file_range(
+                &OpCtx::new(OpKind::CopyFileRange, caller),
+                ino,
+                fh,
+                0,
+                ino,
+                fh,
+                64,
+                6,
+                constellation_vfs::CopyFlags::empty(),
+                r,
+            )
+        })
+    }
+
     fn rename(&self, caller: &Caller, from: &str, to: &str) -> VfsResult<()> {
         Blocking::run(|r| {
             self.fs.rename(
@@ -246,6 +264,11 @@ fn a_lapsed_owner_is_fenced_on_every_file_and_others_are_not() {
     assert_eq!(code(f.unlink(&committer, "tmp_obj")), Code::Io);
     assert_eq!(code(f.open_write(&committer, obj.attr.ino)), Code::Io);
     assert_eq!(
+        code(f.copy(&committer, obj.attr.ino, oo.fh)),
+        Code::Io,
+        "a copy is a write"
+    );
+    assert_eq!(
         code(f.create(&committer_thread, ROOT_INO, "x")),
         Code::Io,
         "a thread of the owner's process"
@@ -272,6 +295,7 @@ fn a_lapsed_owner_is_fenced_on_every_file_and_others_are_not() {
     // Another process on the same node is not fenced.
     f.write(&OpCtx::new(OpKind::Write, &other), obj.attr.ino, oo.fh)
         .unwrap();
+    assert_eq!(f.copy(&other, obj.attr.ino, oo.fh).unwrap(), 6);
     f.create(&other, ROOT_INO, "theirs").unwrap();
     f.rename(&other, "theirs", "theirs2").unwrap();
     f.write(&OpCtx::new(OpKind::Write, &unknown), obj.attr.ino, oo.fh)
@@ -1710,4 +1734,103 @@ fn an_unlocked_closed_descriptions_late_release_spares_the_new_flock() {
     );
     release_flock(&f, &caller, ino, fd2, 0x5a);
     release(&f, &caller, ino, other);
+}
+
+/// A copy is a run of writes, fenced step by step (`view::copy`): a lock
+/// on its destination whose grant lapses between two steps ends it short
+/// (the node's lock fence, for any caller), and so does the caller's own
+/// grant lapsing on another file (the owner fence) — the bytes answered
+/// are the ones written before.
+#[test]
+fn a_grant_lapsing_between_a_copys_steps_ends_it_short() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let committer = Caller::new(0, 0, Some(me));
+    let other = Caller::new(0, 0, Some(std::os::unix::process::parent_id()));
+    let root = Caller::root();
+    let cs = u64::from(f.fs.chunk_size);
+    let (src, so) = f.create(&root, ROOT_INO, "src").unwrap();
+    Blocking::run(|r| {
+        f.fs.write(
+            &OpCtx::new(OpKind::Write, &root),
+            src.attr.ino,
+            so.fh,
+            0,
+            WriteData::Borrowed(b"0123456789abcdefghij"),
+            OpenFlags::WRITE,
+            r,
+        )
+    })
+    .unwrap();
+    let copy = |caller: &Caller, dst: Ino, fh: Fh| {
+        Blocking::run(|r| {
+            f.fs.copy_file_range(
+                &OpCtx::new(OpKind::CopyFileRange, caller),
+                src.attr.ino,
+                so.fh,
+                0,
+                dst,
+                fh,
+                cs - 10,
+                20,
+                constellation_vfs::CopyFlags::empty(),
+                r,
+            )
+        })
+    };
+    let size = |ino| f.fs.current_attr(ino).unwrap().unwrap().size;
+
+    // The destination's own lock lapses: the lock fence.
+    let (locked, lo) = f.create(&root, ROOT_INO, "locked").unwrap();
+    f.lock(locked.attr.ino, me, now_unix_ms() + 60_000);
+    let id = f.meta.locks().held(locked.attr.ino).unwrap().id;
+    let (meta, ino) = (f.meta.clone(), locked.attr.ino);
+    let hook = super::vfs_tests::BetweenSteps::set(move |_| {
+        assert!(meta.locks().lost(ino, id));
+    });
+    assert_eq!(copy(&other, locked.attr.ino, lo.fh).unwrap(), 10);
+    drop(hook);
+    assert_eq!(size(locked.attr.ino), cs);
+
+    // The caller's grant on another file lapses: the owner fence.
+    let f = fenced_fs();
+    let (src2, so2) = f.create(&root, ROOT_INO, "src").unwrap();
+    Blocking::run(|r| {
+        f.fs.write(
+            &OpCtx::new(OpKind::Write, &root),
+            src2.attr.ino,
+            so2.fh,
+            0,
+            WriteData::Borrowed(b"0123456789abcdefghij"),
+            OpenFlags::WRITE,
+            r,
+        )
+    })
+    .unwrap();
+    let (turn, _) = f.create(&root, ROOT_INO, "turn.lock").unwrap();
+    let (obj, oo) = f.create(&root, ROOT_INO, "obj").unwrap();
+    f.lock(turn.attr.ino, me, now_unix_ms() + 60_000);
+    let id = f.meta.locks().held(turn.attr.ino).unwrap().id;
+    let (meta, ino) = (f.meta.clone(), turn.attr.ino);
+    let hook = super::vfs_tests::BetweenSteps::set(move |_| {
+        assert!(meta.locks().lost(ino, id));
+    });
+    let n = Blocking::run(|r| {
+        f.fs.copy_file_range(
+            &OpCtx::new(OpKind::CopyFileRange, &committer),
+            src2.attr.ino,
+            so2.fh,
+            0,
+            obj.attr.ino,
+            oo.fh,
+            cs - 10,
+            20,
+            constellation_vfs::CopyFlags::empty(),
+            r,
+        )
+    })
+    .unwrap();
+    drop(hook);
+    assert_eq!(n, 10);
+    assert_eq!(f.fs.current_attr(obj.attr.ino).unwrap().unwrap().size, cs);
 }

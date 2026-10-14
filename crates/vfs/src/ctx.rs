@@ -64,6 +64,7 @@ op_kinds! {
     Statfs => "statfs",
     Fallocate => "fallocate",
     Seek => "lseek",
+    CopyFileRange => "copy_file_range",
     Getxattr => "getxattr",
     Setxattr => "setxattr",
     Listxattr => "listxattr",

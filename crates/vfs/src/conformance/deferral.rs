@@ -9,7 +9,9 @@ use super::{fail, must, refused, Env, TestResult, HANG};
 use crate::ctx::{Caller, OpCtx, OpKind};
 use crate::error::VfsResult;
 use crate::responder::{Blocking, FnResponder, Responder};
-use crate::types::{FallocateMode, Fh, LockKind, LockOwner, LockRange, OpenFlags, SeekWhence};
+use crate::types::{
+    CopyFlags, FallocateMode, Fh, LockKind, LockOwner, LockRange, OpenFlags, SeekWhence,
+};
 use crate::{Durability, OpKindSet, SetAttr, SetXattrFlags};
 use constellation_types::Code;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -257,6 +259,21 @@ pub(super) fn every_op_completes_exactly_once(env: &Env<'_>) -> TestResult {
             )),
         );
     }
+    must(
+        "copy_file_range",
+        op!(OpKind::CopyFileRange, |cx, d| vfs.copy_file_range(
+            &cx,
+            ino,
+            o.fh,
+            0,
+            ino,
+            o.fh,
+            1 << 20,
+            4,
+            CopyFlags::empty(),
+            d
+        )),
+    );
     must(
         "rename",
         op!(OpKind::Rename, |cx, d| vfs.rename(

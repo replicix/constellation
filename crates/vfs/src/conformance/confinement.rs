@@ -398,6 +398,47 @@ pub(super) fn snapshot_mirrors_are_read_only(env: &Env<'_>) -> TestResult {
     Ok(())
 }
 
+/// `copy_file_range` out of a snapshot mirror copies the frozen bytes
+/// (restoring a file from a snapshot); into one it is refused, as a write
+/// is, and changes nothing.
+pub(super) fn snapshot_mirrors_copy_out_and_never_in(env: &Env<'_>) -> TestResult {
+    let fx = env.fresh();
+    let l = layout(&fx);
+    fx.snapshot("/", "s")?;
+    let c = fx.client();
+    // History moves on after the snapshot.
+    let o = must("open f", c.open_rw(l.f));
+    must("rewrite f", c.write(l.f, o.fh, 0, b"CHANGED!"));
+    must("close f", c.close(l.f, o.fh));
+    let (snap_dir, _) = snapshots_of(&c, c.root());
+    let mirror = must("lookup s", c.lookup(snap_dir, "s"));
+    let vol = must("lookup mirror/vol", c.lookup(mirror.attr.ino, "vol"));
+    let inside = must("lookup mirror/vol/inside", c.lookup(vol.attr.ino, "inside"));
+    let mf = must("lookup mirror/.../f", c.lookup(inside.attr.ino, "f"));
+    let mo = must("open the mirrored f", c.open(mf.attr.ino, OpenFlags::READ));
+    let (e, d) = must("create restored", c.create(l.inside, "restored"));
+    let restored = e.attr.ino;
+    assert_eq!(
+        must(
+            "copy out of the mirror",
+            c.copy_range(mf.attr.ino, mo.fh, 0, restored, d.fh, 0, 1 << 20)
+        ),
+        8
+    );
+    assert_eq!(must("read", c.read(restored, d.fh, 0, 64)), b"inside-f");
+    refused(
+        "copy into the mirror",
+        c.copy_range(restored, d.fh, 0, mf.attr.ino, mo.fh, 0, 8),
+        Code::ReadOnly,
+    );
+    must("close restored", c.close(restored, d.fh));
+    must("release the mirrored f", c.release(mf.attr.ino, mo.fh));
+    assert_eq!(must("slurp mirror", c.slurp(mf.attr.ino)), b"inside-f");
+    assert_eq!(must("slurp f", c.slurp(l.f)), b"CHANGED!");
+    assert_eq!(must("slurp restored", c.slurp(restored)), b"inside-f");
+    Ok(())
+}
+
 pub(super) fn links_are_free_without_confine_links(env: &Env<'_>) -> TestResult {
     let fx = env.fresh();
     let l = layout(&fx);

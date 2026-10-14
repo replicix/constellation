@@ -199,6 +199,17 @@ impl Admission {
     /// Before a write of `bytes`: wait while the view's staged bytes
     /// would exceed its limit.
     pub(crate) fn admit_staging(&self, cx: &OpCtx<'_>, bytes: u64) -> Result<(), Code> {
+        self.admit_staging_until(bytes, cx.deadline)
+    }
+
+    /// [`Self::admit_staging`] for one step of an op that writes in many
+    /// (`copy_file_range`, on whichever thread it runs): `deadline` is
+    /// the op's own, else the default wait from now.
+    pub(crate) fn admit_staging_until(
+        &self,
+        bytes: u64,
+        deadline: Option<Instant>,
+    ) -> Result<(), Code> {
         let Some(staging) = &self.staging else {
             return Ok(());
         };
@@ -206,7 +217,8 @@ impl Admission {
             return Ok(());
         }
         constellation_vfs::watch::stage("view admission (staging limit)");
-        if staging.wait_below(bytes, Self::deadline(cx)) {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + default_wait());
+        if staging.wait_below(bytes, deadline) {
             Ok(())
         } else {
             Err(Code::Again)

@@ -33,10 +33,10 @@ use constellation_types::{Code, Rdev};
 use constellation_vfs::mock::{Args, MockVfs, Script};
 use constellation_vfs::types::mode as modebits;
 use constellation_vfs::{
-    Attr, DirEntry, Durability, Entry, FallocateMode, Fh, FileKind, FrontendCaps, FrontendEvents,
-    Ino, Invalidation, LockKind, LockOwner, LockRange, LockSpec, LockStatus, OpKind, OpenFlags,
-    OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetXattrFlags, StatFs, TimeSet, Vfs,
-    XattrNameBuf, ROOT_INO,
+    Attr, CopyFlags, DirEntry, Durability, Entry, FallocateMode, Fh, FileKind, FrontendCaps,
+    FrontendEvents, Ino, Invalidation, LockKind, LockOwner, LockRange, LockSpec, LockStatus,
+    OpKind, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetXattrFlags, StatFs,
+    TimeSet, Vfs, XattrNameBuf, ROOT_INO,
 };
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixDatagram;
@@ -83,6 +83,8 @@ mod op {
     pub const FALLOCATE: u32 = 43;
     pub const RENAME2: u32 = 45;
     pub const LSEEK: u32 = 46;
+    pub const COPY_FILE_RANGE: u32 = 47;
+    pub const COPY_FILE_RANGE_64: u32 = 53;
 }
 
 /// Request bodies, built field by field in the kernel's little-endian
@@ -957,6 +959,90 @@ fn read_write_flush_release_and_fsync_translate() {
             "fsync(2) and fdatasync(2) both ask for what the view is configured for"
         );
     }
+    k.finish();
+}
+
+/// `fuse_copy_file_range_in`: `fh_in, off_in, nodeid_out, fh_out, off_out,
+/// len, flags` (the source's inode is the header's).
+fn copy_body(
+    fh_in: u64,
+    off_in: u64,
+    out: u64,
+    fh_out: u64,
+    off_out: u64,
+    len: u64,
+    flags: u64,
+) -> Body {
+    Body::new()
+        .u64(fh_in)
+        .u64(off_in)
+        .u64(out)
+        .u64(fh_out)
+        .u64(off_out)
+        .u64(len)
+        .u64(flags)
+}
+
+/// `FUSE_COPY_FILE_RANGE` reaches the view as `copy_file_range` (before,
+/// fuser's default answered `ENOSYS`, and the kernel copied with a splice
+/// that reads the source through its page cache from then on — the
+/// engine's `view::copy` module doc). Its answer is a write's.
+#[test]
+fn copy_file_range_reaches_the_view_and_answers_the_bytes_copied() {
+    let (mut k, mock) = plain();
+    mock.on_copy_file_range(Script::ok(4096));
+    let r = k.call(
+        op::COPY_FILE_RANGE,
+        9,
+        &copy_body(3, 100, 12, 4, 200, 5000, 0),
+    );
+    assert_eq!(r.ok().len(), 8, "fuse_write_out");
+    assert_eq!(r.u32_at(0), 4096);
+    assert_eq!(
+        mock.last_call().unwrap().args,
+        Args::CopyFileRange {
+            ino_in: 9,
+            fh_in: Fh(3),
+            off_in: 100,
+            ino_out: 12,
+            fh_out: Fh(4),
+            off_out: 200,
+            len: 5000,
+            flags: CopyFlags::empty(),
+        }
+    );
+    // A flag (Linux defines none) reaches the view to refuse.
+    mock.on_copy_file_range(Script::Reply(Err(Code::Invalid.into())));
+    let r = k.call(op::COPY_FILE_RANGE, 9, &copy_body(3, 0, 12, 4, 0, 1, 1));
+    assert_eq!(r.errno(), libc::EINVAL);
+    let Args::CopyFileRange { flags, .. } = mock.last_call().unwrap().args else {
+        panic!()
+    };
+    assert_eq!(flags, CopyFlags::UNSUPPORTED);
+    // Never the two codes that would make the kernel splice-copy instead.
+    for (code, errno) in [
+        (Code::NotSupported, libc::EIO),
+        (Code::CrossDevice, libc::EIO),
+        (Code::NoSpace, libc::ENOSPC),
+        (Code::BadFd, libc::EBADF),
+        (Code::NotImplemented, libc::ENOSYS),
+    ] {
+        mock.on_copy_file_range(Script::Reply(Err(code.into())));
+        let r = k.call(op::COPY_FILE_RANGE, 9, &copy_body(3, 0, 12, 4, 0, 1, 0));
+        assert_eq!(r.errno(), errno, "{code:?}");
+    }
+    // A count that would not fit the reply is a short one, never wrapped.
+    mock.on_copy_file_range(Script::ok(u64::MAX));
+    let r = k.call(
+        op::COPY_FILE_RANGE,
+        9,
+        &copy_body(3, 0, 12, 4, 0, u64::MAX, 0),
+    );
+    assert_eq!(r.u32_at(0), !0xfff_u32, "4 GiB less a page");
+    // The 64-bit flavour is not decoded: ENOSYS, after which the kernel
+    // sends the op above for good.
+    let r = k.call(op::COPY_FILE_RANGE_64, 9, &copy_body(3, 0, 12, 4, 0, 1, 0));
+    assert_eq!(r.errno(), libc::ENOSYS);
     k.finish();
 }
 

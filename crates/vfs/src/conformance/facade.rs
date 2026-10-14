@@ -15,8 +15,8 @@ use crate::name::NameBuf;
 use crate::name::{Name, XattrName, XattrNameBuf};
 use crate::responder::{DirEntry, DirSink, Responder};
 use crate::types::{
-    Attr, Durability, Entry, FallocateMode, Fh, FileKind, Ino, LockOwner, LockRange, LockSpec,
-    LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
+    Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, FileKind, Ino, LockOwner, LockRange,
+    LockSpec, LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
     SetXattrFlags, StatFs, WriteData,
 };
 use crate::vfs::Vfs;
@@ -170,6 +170,20 @@ pub trait DynVfs: Send + Sync {
         done: Done<()>,
     );
     fn seek(&self, cx: &OpCtx<'_>, ino: Ino, fh: Fh, off: u64, whence: SeekWhence, done: Done<u64>);
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        cx: &OpCtx<'_>,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
+        done: Done<u64>,
+    );
     fn getxattr(&self, cx: &OpCtx<'_>, ino: Ino, name: &[u8], done: Done<Vec<u8>>);
     fn setxattr(
         &self,
@@ -408,6 +422,34 @@ impl<V: Vfs> DynVfs for V {
         done: Done<u64>,
     ) {
         Vfs::seek(self, cx, ino, fh, off, whence, Probe::new(done));
+    }
+
+    fn copy_file_range(
+        &self,
+        cx: &OpCtx<'_>,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
+        done: Done<u64>,
+    ) {
+        Vfs::copy_file_range(
+            self,
+            cx,
+            ino_in,
+            fh_in,
+            off_in,
+            ino_out,
+            fh_out,
+            off_out,
+            len,
+            flags,
+            Probe::new(done),
+        );
     }
 
     fn getxattr(&self, cx: &OpCtx<'_>, ino: Ino, name: &[u8], done: Done<Vec<u8>>) {

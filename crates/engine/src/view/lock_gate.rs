@@ -26,6 +26,7 @@ fn owner_fence_applies(kind: OpKind) -> bool {
             | OpKind::Write
             | OpKind::Fsync
             | OpKind::Fallocate
+            | OpKind::CopyFileRange
             | OpKind::Setxattr
             | OpKind::Removexattr
     )

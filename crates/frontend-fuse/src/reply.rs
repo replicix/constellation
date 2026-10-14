@@ -395,6 +395,37 @@ impl Responder<u32> for WriteReply {
     }
 }
 
+/// `FUSE_COPY_FILE_RANGE`'s answer: the bytes copied, as a write's
+/// (`fuse_write_out`). The view copies at most `COPY_MAX` per call, which
+/// fits; a count that would not is a short copy of what fits, never a
+/// wrapped one (the kernel answers `EIO` to a count above what it asked).
+///
+/// `EOPNOTSUPP` and `EXDEV` are never sent: either makes the kernel copy
+/// this request itself with a splice that reads the source through its
+/// page cache (`fuse_copy_file_range`), the path this op exists to close
+/// (the engine's `view::copy`). Neither is a code a copy refuses with; if
+/// one ever surfaced from beneath, it is answered `EIO`. `ENOSYS` (a view
+/// that does not copy) is sent as such: the kernel then stops asking.
+pub(crate) struct CopyReply(pub ReplyWrite);
+
+impl Responder<u64> for CopyReply {
+    fn done(self, r: VfsResult<u64>) {
+        match r {
+            Ok(n) => self.0.written(u32::try_from(n).unwrap_or(!0xfff_u32)),
+            Err(e) => {
+                let code = match e.code() {
+                    code @ (Code::NotSupported | Code::CrossDevice) => {
+                        tracing::warn!(%code, "copy_file_range failed with a code that would make the kernel splice-copy; answering EIO");
+                        Code::Io
+                    }
+                    code => code,
+                };
+                self.0.error(reply_code(code))
+            }
+        }
+    }
+}
+
 pub(crate) struct StatfsReply(pub ReplyStatfs);
 
 impl Responder<StatFs> for StatfsReply {

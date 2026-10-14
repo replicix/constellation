@@ -41,9 +41,9 @@ use crate::events::FrontendEvents;
 use crate::name::{Name, NameBuf, XattrName, XattrNameBuf};
 use crate::responder::{DirEntry, DirSink, Responder};
 use crate::types::{
-    Attr, Durability, Entry, FallocateMode, Fh, Ino, LockOwner, LockRange, LockSpec, LockStatus,
-    OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr, SetXattrFlags,
-    StatFs, WriteData,
+    Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, Ino, LockOwner, LockRange, LockSpec,
+    LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
+    SetXattrFlags, StatFs, WriteData,
 };
 use crate::vfs::Vfs;
 use constellation_types::{Code, Rdev};
@@ -171,6 +171,16 @@ pub enum Args {
         fh: Fh,
         off: u64,
         whence: SeekWhence,
+    },
+    CopyFileRange {
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
     },
     Getxattr {
         ino: Ino,
@@ -407,6 +417,7 @@ scripts! {
     statfs: StatFs => on_statfs, always_statfs;
     fallocate: () => on_fallocate, always_fallocate;
     seek: u64 => on_seek, always_seek;
+    copy_file_range: u64 => on_copy_file_range, always_copy_file_range;
     getxattr: Vec<u8> => on_getxattr, always_getxattr;
     setxattr: () => on_setxattr, always_setxattr;
     listxattr: Vec<XattrNameBuf> => on_listxattr, always_listxattr;
@@ -1189,6 +1200,40 @@ impl Vfs for MockVfs {
             },
         );
         self.run(call, |s| &s.seek, r, |v| v.seek(ino, fh, off, whence));
+    }
+
+    fn copy_file_range<R: Responder<u64>>(
+        &self,
+        cx: &OpCtx<'_>,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
+        r: R,
+    ) {
+        let call = self.record(
+            cx,
+            Args::CopyFileRange {
+                ino_in,
+                fh_in,
+                off_in,
+                ino_out,
+                fh_out,
+                off_out,
+                len,
+                flags,
+            },
+        );
+        self.run(
+            call,
+            |s| &s.copy_file_range,
+            r,
+            |v| v.copy_file_range(ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags),
+        );
     }
 
     fn getxattr<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {

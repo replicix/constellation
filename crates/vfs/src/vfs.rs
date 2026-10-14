@@ -5,9 +5,9 @@ use crate::name::{Name, XattrName, XattrNameBuf};
 use crate::observe::ViewIdentity;
 use crate::responder::{DirSink, Responder};
 use crate::types::{
-    Attr, Durability, Entry, FallocateMode, Fh, Ino, LockOwner, LockRange, LockSpec, LockStatus,
-    OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr, SetXattrFlags,
-    StatFs, WriteData,
+    Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, Ino, LockOwner, LockRange, LockSpec,
+    LockStatus, OpenFlags, OpenOwner, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
+    SetXattrFlags, StatFs, WriteData,
 };
 use constellation_types::Rdev;
 
@@ -274,6 +274,56 @@ pub trait Vfs: Send + Sync + 'static {
         whence: SeekWhence,
         r: R,
     );
+
+    /// `copy_file_range(2)`: copy up to `len` bytes of `ino_in` from
+    /// `off_in` to `ino_out` at `off_out`, as the view's own read of the
+    /// source and write of the destination would — answering the bytes
+    /// copied. Fewer than `len` is a short copy the caller loops on: the
+    /// source's end (0 at or past it, the destination untouched), at most
+    /// [`crate::COPY_MAX`] per call (a view may copy less per call), or an
+    /// error after some bytes were already copied — then exactly the bytes
+    /// the destination holds, and the next call reports the error.
+    ///
+    /// The bytes are the view's, never a frontend's cache of them: the
+    /// source's pending writes included, as a read of it would answer
+    /// (DESIGN §12). Everything a write of the same bytes is held to
+    /// holds — the destination's lock fence, owner fence and fencing
+    /// token, quota, its times stamped, its size grown, `SYNC` on the
+    /// destination's open publishing before the answer — and what a read
+    /// is to the source (its atime policy, a snapshot mirror readable).
+    ///
+    /// Refused: `flags` not empty (`Invalid`, as the syscall refuses
+    /// them); `fh_in`/`fh_out` not handles of `ino_in`/`ino_out`, or
+    /// `fh_out` not opened for writing (`BadFd`); overlapping ranges of
+    /// one file (`Invalid`); a directory (`IsDir`) or another
+    /// non-regular file (`Invalid`); a destination a view cannot write (a
+    /// snapshot mirror, `ReadOnly`). What a kernel checks above the
+    /// trait — the source's read access, `O_APPEND` on the destination
+    /// (`fcntl` can change it after the open), `RLIMIT_FSIZE`, the files
+    /// being on one filesystem — is the frontend's.
+    ///
+    /// `NotImplemented` by default: the frontend then copies by reading
+    /// and writing (Linux FUSE: `ENOSYS`, after which the kernel's
+    /// splice fallback reads the source through its page cache).
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range<R: Responder<u64>>(
+        &self,
+        cx: &OpCtx<'_>,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
+        r: R,
+    ) {
+        let _ = (
+            cx, ino_in, fh_in, off_in, ino_out, fh_out, off_out, len, flags,
+        );
+        r.done(Err(constellation_types::Code::NotImplemented.into()));
+    }
 
     /// An xattr's whole value (a frontend's size probe is its own).
     fn getxattr<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R);

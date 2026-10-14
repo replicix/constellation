@@ -15,9 +15,10 @@ use super::*;
 use constellation_vfs::policy::{RCOUNT_XATTR, RSIZE_XATTR};
 use constellation_vfs::types::mode::{S_IFBLK, S_IFCHR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK};
 use constellation_vfs::{
-    DirSink, Fh, LockKind, LockOwner, LockRange, LockSpec, LockStatus, Name, OpCtx, OpKind,
-    OpenOwner, Opened, ReadData, RenameFlags, Responder, SetAttr, SetXattrFlags, SetXattrMode,
-    StatFs, TimeSet, Vfs, VfsError, ViewIdentity, WatchKey, WriteData, XattrName, XattrNameBuf,
+    CopyFlags, DirSink, Fh, LockKind, LockOwner, LockRange, LockSpec, LockStatus, Name, OpCtx,
+    OpKind, OpenOwner, Opened, ReadData, RenameFlags, Responder, SetAttr, SetXattrFlags,
+    SetXattrMode, StatFs, TimeSet, Vfs, VfsError, ViewIdentity, WatchKey, WriteData, XattrName,
+    XattrNameBuf,
 };
 
 /// The stored form of a name, or answer `NameTooLong` and return.
@@ -1022,7 +1023,7 @@ impl Vfs for View {
                 // The handle first: `release_frozen` trims the pins to the
                 // handles the table still lists, so a pin must never exist
                 // without its handle there (plan 38 Z3c).
-                let fh = self.open_handle(ino, false);
+                let fh = self.open_handle(ino, OpenFlags::READ);
                 let backing = self.frozen_passthrough_backing(ino, flags, &node);
                 // Plan 38 §3(d), as for a live file below; nothing writes
                 // a frozen one.
@@ -1058,8 +1059,7 @@ impl Vfs for View {
                 // chunk file itself, and the pin that keeps it where the
                 // handle expects it is dropped in `release`.
                 let backing = self.passthrough_backing(ino, flags, &attr);
-                let fh =
-                    self.open_handle(ino, flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC));
+                let fh = self.open_handle(ino, flags);
                 // Plan 38 §3(d): a read-only open the frontend can serve
                 // zero-copy reads for is marked so; which of its reads are
                 // zero-copy is decided per read (`zero_copy`'s module doc).
@@ -1107,10 +1107,7 @@ impl Vfs for View {
                 self.note_writer_open(attr.ino, flags);
                 r.done(Ok((
                     self.entry_out(&attr),
-                    Opened::new(self.open_handle(
-                        attr.ino,
-                        flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC),
-                    )),
+                    Opened::new(self.open_handle(attr.ino, flags)),
                 )))
             }
             Err(e) => r.done(err(e)),
@@ -1706,6 +1703,119 @@ impl Vfs for View {
             Ok(position) => r.done(Ok(position as u64)),
             Err(error) => r.done(self.ino_err(ino, error)),
         }
+    }
+
+    fn copy_file_range<R: Responder<u64>>(
+        &self,
+        cx: &OpCtx<'_>,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
+        r: R,
+    ) {
+        // A write of the destination (`copy`'s module doc): the owner
+        // fence and the fencing token are the op's, as a write's.
+        let _w = self.watch.enter("copy_file_range", ino_out);
+        admit!(self, cx, r, _admitted);
+        let src = enter!(self, ino_in, r);
+        let dst = enter!(self, ino_out, r);
+        // The syscall refuses every flag before a filesystem sees one.
+        if !flags.is_empty() {
+            r.done(self.ino_err(dst, Code::Invalid));
+            return;
+        }
+        // §6.12: a handle addresses only the inode it was opened on; the
+        // destination's must be open for writing (the kernel's own check,
+        // `FMODE_WRITE`, repeated for a frontend that does not make it).
+        if self.handle_ino(fh_in) != Some(src) {
+            r.done(self.ino_err(src, Code::BadFd));
+            return;
+        }
+        if View::is_synthetic(dst) {
+            r.done(self.ino_err(dst, Code::ReadOnly));
+            return;
+        }
+        let sync = match self.handles.mode(fh_out) {
+            Some((ino, true, sync)) if ino == dst => sync,
+            _ => {
+                r.done(self.ino_err(dst, Code::BadFd));
+                return;
+            }
+        };
+        let _inflight = self.inflight.enter(&[src, dst]);
+        if self.lock_fenced(src) || self.lock_fenced(dst) {
+            r.done(self.ino_err(dst, Code::Io));
+            return;
+        }
+        // Plan 39 §3.3: into an `O_SYNC`/`O_DSYNC` description, the copy
+        // publishes before it answers, as each write through it does, and
+        // waits on the `fsync` pool as they do; any other copy, which may
+        // run for seconds and wait for chunks, on the completion pool, so
+        // that no frontend thread (a ring's above all) is held by it.
+        let cancel = cx.cancel.cloned();
+        let deadline = cx.deadline;
+        let caller = super::copy::CopyCaller {
+            pid: cx.caller.pid,
+            lock_owner: cx.lock_owner,
+        };
+        // Never `ENOSYS`/`EOPNOTSUPP`/`EXDEV` from here, whatever failed
+        // beneath: Linux would copy the request itself, through its page
+        // cache (`copy`'s module doc). An error names the file it is
+        // about: a source gone from the replica is `Stale`, as for a read.
+        let run = move |view: &View| -> Result<u64, VfsError> {
+            let fail = |ino, code| view.ino_err(ino, super::copy::never_a_fallback(code));
+            let n = match view.copy_range(
+                src,
+                off_in,
+                dst,
+                off_out,
+                len,
+                caller,
+                cancel.as_ref(),
+                deadline,
+            ) {
+                Ok(n) => n,
+                Err((ino, code)) => return fail(ino, code),
+            };
+            if sync && n > 0 {
+                if let Err(code) = view.flush_sync_write(dst, cancel.clone()) {
+                    return fail(dst, code);
+                }
+            }
+            Ok(n)
+        };
+        let deferral = if sync {
+            self.fsync_deferral(OpKind::CopyFileRange)
+        } else {
+            self.copy_deferral()
+        };
+        let Some(view) = deferral else {
+            r.done(run(self));
+            return;
+        };
+        let admitted = _admitted.defer();
+        let (watch, inflight) = (_w, _inflight);
+        // Plan 30 §M14 phase 2: the copy's writes carry the caller's
+        // fencing token on the pool thread too.
+        let caller = crate::locks::scope_caller();
+        let pool = if sync {
+            crate::fsync_wait::pool()
+        } else {
+            crate::completion::CompletionPool::global()
+        };
+        pool.submit(move || {
+            watch.adopt();
+            let _lock_tag = caller.as_ref().map(|c| c.enter());
+            r.done(run(&view));
+            drop(inflight);
+            view.admission.leave_deferred(admitted);
+            drop(watch);
+        });
     }
 
     fn getxattr<R: Responder<Vec<u8>>>(&self, cx: &OpCtx<'_>, ino: Ino, name: &XattrName, r: R) {

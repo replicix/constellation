@@ -653,6 +653,12 @@ tests! {
         fallocate_absent_is_not_supported [],
         seek_data_and_hole [SeekHole],
         seek_absent_is_not_supported [],
+        copy_file_range_copies_and_extends [],
+        copy_file_range_reads_pending_writes_and_holes [],
+        copy_file_range_within_one_file [],
+        copy_file_range_refusals [],
+        copy_file_range_stamps_the_destination [],
+        copy_file_range_large_multi_chunk [],
         statfs_is_sane [];
     Xattr / xattr:
         set_get_list_remove [Xattrs],
@@ -706,6 +712,7 @@ tests! {
         an_open_file_stays_addressable_when_unlinked [KeepOpenUnlinked],
         constellation_snapshots_stay_inside_the_subtree [],
         snapshot_mirrors_are_read_only [],
+        snapshot_mirrors_copy_out_and_never_in [],
         links_are_free_without_confine_links [HardLinks],
         confine_links_refuses_links_across_domains [HardLinks, Xattrs],
         confine_links_refuses_renames_of_linked_files_across_domains [HardLinks, Xattrs];

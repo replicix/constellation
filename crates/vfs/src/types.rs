@@ -284,6 +284,24 @@ bit_set!(
 );
 
 bit_set!(
+    /// `copy_file_range`'s flags, decoded. Linux defines none: the
+    /// syscall refuses any bit (`EINVAL`) before a filesystem sees the
+    /// call, so a frontend maps a bit it was sent anyway here, and the op
+    /// refuses it (`Invalid`), as the syscall does.
+    CopyFlags {
+        /// A flag bit the contract does not name: refused (`Invalid`).
+        UNSUPPORTED = 1 << 31,
+    }
+);
+
+/// The most one `copy_file_range` copies: Linux's `MAX_RW_COUNT`
+/// (`INT_MAX & PAGE_MASK`), what a local filesystem copies per call (its
+/// copy is the kernel's splice, capped there), and below what a FUSE
+/// reply can carry (`fuse_write_out.size` is 32 bits). A longer request
+/// answers a short count, which callers loop on.
+pub const COPY_MAX: u64 = 0x7fff_f000;
+
+bit_set!(
     /// `setxattr`'s flags, decoded (see [`SetXattrFlags::mode`]).
     SetXattrFlags {
         CREATE = 1,

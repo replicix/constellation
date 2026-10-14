@@ -61,9 +61,9 @@ use crate::name::{Name, NameBuf, XattrName, XattrNameBuf};
 use crate::policy::{PolicyStack, RSIZE_XATTR};
 use crate::responder::{DirSink, Responder};
 use crate::types::{
-    mode as modebits, Attr, Entry, FallocateMode, Fh, FileKind, Ino, LockKind, LockOwner,
-    LockRange, LockSpec, LockStatus, OpenFlags, Opened, ReadData, RenameFlags, SeekWhence, SetAttr,
-    SetXattrFlags, SetXattrMode, StatFs, TimeSet, ROOT_INO,
+    mode as modebits, Attr, CopyFlags, Entry, FallocateMode, Fh, FileKind, Ino, LockKind,
+    LockOwner, LockRange, LockSpec, LockStatus, OpenFlags, Opened, ReadData, RenameFlags,
+    SeekWhence, SetAttr, SetXattrFlags, SetXattrMode, StatFs, TimeSet, COPY_MAX, ROOT_INO,
 };
 use constellation_types::{Code, Rdev};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -241,6 +241,8 @@ struct Handle {
     /// The view that opened it (a confined view keeps addressing an
     /// inode it holds open even after its last name is gone).
     view: u64,
+    /// Opened for writing (`copy_file_range` writes only through one).
+    write: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1374,10 +1376,18 @@ impl RefView {
 
     // ------------------------------------------------------------- file io
 
-    fn alloc_handle(&self, st: &mut State, ino: Ino) -> Fh {
+    fn alloc_handle(&self, st: &mut State, ino: Ino, flags: OpenFlags) -> Fh {
         let fh = st.next_fh;
         st.next_fh += 1;
-        st.handles.insert(fh, Handle { ino, view: self.id });
+        let write = flags.intersects(OpenFlags::WRITE | OpenFlags::TRUNC);
+        st.handles.insert(
+            fh,
+            Handle {
+                ino,
+                view: self.id,
+                write,
+            },
+        );
         if ino < SYN_BASE {
             *st.opens.entry(ino).or_insert(0) += 1;
         }
@@ -1405,7 +1415,7 @@ impl RefView {
                 }
                 // A frozen file is read through a handle of its own: the
                 // synthetic inode has no live node to count opens on.
-                Ok(Opened::new(self.alloc_handle(st, ino)))
+                Ok(Opened::new(self.alloc_handle(st, ino, flags)))
             }
             Target::Real(real) => {
                 if st.node(real)?.is_dir() {
@@ -1414,7 +1424,7 @@ impl RefView {
                 if flags.contains(OpenFlags::TRUNC) && flags.contains(OpenFlags::WRITE) {
                     self.truncate_open(st, changes, real);
                 }
-                Ok(Opened::new(self.alloc_handle(st, real)))
+                Ok(Opened::new(self.alloc_handle(st, real, flags)))
             }
         })
     }
@@ -1469,7 +1479,7 @@ impl RefView {
                     self.add_node(st, changes, parent, name, node, caller)?
                 }
             };
-            let fh = self.alloc_handle(st, ino);
+            let fh = self.alloc_handle(st, ino, flags);
             Ok((self.entry_of(st, ino), Opened::new(fh)))
         })
     }
@@ -1517,6 +1527,93 @@ impl RefView {
                 range: Some((off, data.len() as u64)),
             });
             Ok(data.len() as u32)
+        })
+    }
+
+    /// `copy_file_range` ([`crate::Vfs::copy_file_range`]): the source's
+    /// bytes read and written to the destination in one step under the
+    /// lock, as a `read` and a `write` of them would be — holes read as
+    /// zeros and are written as data, as a local filesystem's splice copy
+    /// writes them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_file_range(
+        &self,
+        ino_in: Ino,
+        fh_in: Fh,
+        off_in: u64,
+        ino_out: Ino,
+        fh_out: Fh,
+        off_out: u64,
+        len: u64,
+        flags: CopyFlags,
+    ) -> VfsResult<u64> {
+        self.with(|st, changes| {
+            if !flags.is_empty() {
+                return Err(Code::Invalid.into());
+            }
+            let want = len.min(COPY_MAX) as u32;
+            // The source: a live file, or a snapshot mirror's frozen one.
+            let (src_real, bytes) = match self.enter(st, ino_in)? {
+                Target::Syn(Syn::Mirror { snap, frozen, .. }) => {
+                    match st.handles.get(&fh_in.0) {
+                        Some(h) if h.ino == ino_in => {}
+                        _ => return Err(Code::BadFd.into()),
+                    }
+                    let n = &st.snapshots[snap].frozen[&frozen];
+                    match n.kind {
+                        FileKind::File => {}
+                        FileKind::Dir => return Err(Code::IsDir.into()),
+                        _ => return Err(Code::Invalid.into()),
+                    }
+                    (None, n.read_at(off_in, want))
+                }
+                Target::Syn(_) => return Err(Code::IsDir.into()),
+                Target::Real(real) => {
+                    Self::handle_ino(st, fh_in, real)?;
+                    let n = st.node(real)?;
+                    match n.kind {
+                        FileKind::File => {}
+                        FileKind::Dir => return Err(Code::IsDir.into()),
+                        _ => return Err(Code::Invalid.into()),
+                    }
+                    (Some(real), n.read_at(off_in, want))
+                }
+            };
+            let dst = self.enter_real(st, ino_out)?;
+            match st.handles.get(&fh_out.0) {
+                Some(h) if h.ino == dst && h.write => {}
+                _ => return Err(Code::BadFd.into()),
+            }
+            match st.node(dst)?.kind {
+                FileKind::File => {}
+                FileKind::Dir => return Err(Code::IsDir.into()),
+                _ => return Err(Code::Invalid.into()),
+            }
+            let count = bytes.len() as u64;
+            // The VFS's own check, on the count clamped to the source's
+            // end: ranges of one file may not overlap.
+            if src_real == Some(dst) && off_out < off_in + count && off_in < off_out + count {
+                return Err(Code::Invalid.into());
+            }
+            if count == 0 {
+                return Ok(0);
+            }
+            if off_out
+                .checked_add(count)
+                .is_none_or(|e| e > i64::MAX as u64)
+            {
+                return Err(Code::FileTooBig.into());
+            }
+            let now = st.tick();
+            let n = st.node_mut(dst)?;
+            n.write_at(off_out, &bytes);
+            n.mtime = now;
+            n.ctime = now;
+            changes.push(Invalidation::Data {
+                ino: dst,
+                range: Some((off_out, count)),
+            });
+            Ok(count)
         })
     }
 

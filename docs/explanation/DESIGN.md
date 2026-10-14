@@ -1514,10 +1514,11 @@ an indexed, transactional replica answers directly.
 
 Not every item below is built yet. Built: push invalidation, the
 recursive aggregates (`user.constellation.rsize`), `SEEK_HOLE`/`SEEK_DATA`,
-metadata-only `fallocate`/`truncate`, and time travel as snapshots (§13).
-Designed but not built: `constellation find`, `constellation changes`, the
-`unlink_subtree` and `copy_manifest` records (and so `copy_file_range`),
-stable readdir cursors (`readdir` resumes by position today), negative
+metadata-only `fallocate`/`truncate`, `copy_file_range` as a copy by the
+daemon (not yet the metadata-only one below), and time travel as
+snapshots (§13). Designed but not built: `constellation find`,
+`constellation changes`, the `unlink_subtree` and `copy_manifest` records
+(and so a metadata-only `copy_file_range`), stable readdir cursors (`readdir` resumes by position today), negative
 dentry caching (a lookup miss is answered `ENOENT`, which the kernel does
 not cache), `READDIRPLUS`, the writeback cache with `FOPEN_KEEP_CACHE`,
 and FUSE passthrough.
@@ -1561,7 +1562,34 @@ and FUSE passthrough.
   (compilers probing include paths, `PATH` lookups) stay in the kernel.
 - **`copy_file_range` / reflink as pure metadata**: content addressing makes
   every copy a manifest copy (`copy_manifest`) with chunks shared
-  automatically — instant, zero-I/O copies of any size.
+  automatically — instant, zero-I/O copies of any size. Not built.
+  **What is built is a copy by the daemon** (`FUSE_COPY_FILE_RANGE`,
+  `view::copy`): the view reads the source as a `read` would (its write
+  session on this node included) and writes the bytes through the
+  destination's write session as a `write` would, a chunk-aligned step
+  at a time — the lock and owner fences, the fencing token, quota,
+  sealing and eager upload, the times, `O_SYNC`, and the commit at close,
+  forwarded to the sequencer from any node, are a write's. It exists for
+  integrity first: unanswered (`ENOSYS`, as until 2026-10), Linux copies
+  with a splice that reads the source **through its page cache**, which,
+  without the writeback cache and `FOPEN_KEEP_CACHE`, can hold a stale
+  page for a write already acknowledged (a buffered write unlocks its
+  page before its `WRITE` reaches the daemon, a concurrent `open(2)`
+  drops the file's pages, a read refetches the page in between); the
+  splice wrote those bytes into the destination, where they were
+  persisted (xcheckfs, write-back). The daemon never answers
+  `EOPNOTSUPP`/`EXDEV`, which would send the kernel back to that splice.
+  At rest the copy shares chunks anyway wherever it lands whole chunks
+  at aligned offsets: they hash to the source's (keyed alike under E2E),
+  are found durable when sealed, and are neither cached nor uploaded
+  again; zero chunks seal as holes. `copy_manifest` was deferred, not
+  dropped: putting the source's hashes into the destination's session
+  instead would leave chunks referenced by no manifest and claimed by no
+  pending upload until the commit — GC protection, the dedup-vs-condemn
+  handshake (§14), upload claims, and the dead bytes a committed chunk
+  keeps past a truncation would all need rules of their own, and the
+  record must replay on every replica. Until then the byte copy is a
+  write in every respect.
 - **`SEEK_HOLE`/`SEEK_DATA`**: the chunk list knows exactly where holes are,
   so `cp --sparse`, rsync, and tar skip them instead of reading zeros.
 - **`fallocate`/`truncate` as metadata-only ops**: extend or punch without

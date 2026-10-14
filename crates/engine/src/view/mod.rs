@@ -99,6 +99,7 @@
 
 mod admission;
 mod confine;
+mod copy;
 mod create;
 mod durable;
 pub use durable::Handle as OpenHandle;
