@@ -898,6 +898,24 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 - One backup survives one failure. Two failures inside one backup's
   window fall back to Layer A replay.
 - With P2P off: no backups, no fast takeover, no pre-S3 streaming.
+- `syncfs(2)`, `sync -f` and `sync(2)` make nothing durable on a
+  constellation mount; only `close()` and `fsync()` do (as described
+  above, per `--write-mode` and `--fsync-mode`). Linux sends
+  `FUSE_SYNCFS` only where `fc->sync_fs` is set (mainline
+  `fs/fuse/inode.c`, `fuse_sync_fs`): on `fuseblk` connections since 6.18
+  (`d3906d8f3cee`, "fuse: enable FUSE_SYNCFS for all fuseblk servers")
+  and on virtiofs since 5.14 (`2d82ab251ef0`, "virtiofs: propagate
+  sync() to file server"), never on a plain `fuse` mount, so that an
+  unprivileged server cannot stall the host's `sync`. Constellation
+  mounts plain `fuse`: the calls write the kernel's dirty pages to the
+  daemon (which stages them like any write) and return 0 without asking
+  it anything. Under `--write-mode back` that leaves data written but not
+  closed or `fsync`ed where it was — an open file's writes only in this
+  node's staging (lost if the daemon dies before the close), a closed
+  file's queued chunks only on this node's disk (lost with the node until
+  the upload drains). An application or script that relies on `sync` to
+  make such data durable must `fsync` the files (or close them under
+  `--write-mode through`) instead.
 - A node that enrolls during an open epoch is not accounted for.
 - An epoch's hold owner that dies leaves the other members frozen until
   it returns or is retired.

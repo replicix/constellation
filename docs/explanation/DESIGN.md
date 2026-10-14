@@ -230,6 +230,14 @@ acknowledgement of the manifest means is set per filesystem:
 - `--fsync-mode local` (default): `fsync()` forces the node's metadata
   store to disk. `--fsync-mode s3`: `fsync()` also waits until the inode's
   chunks and records are in the bucket.
+- `close()` and `fsync()` are the only durability points. `syncfs(2)`,
+  `sync -f` and `sync(2)` never reach the daemon: Linux sends
+  `FUSE_SYNCFS` only to connections with `fc->sync_fs` set — `fuseblk`
+  and virtiofs — so that an unprivileged server cannot stall the host's
+  `sync`, and a constellation mount is plain `fuse`. On it they write the
+  kernel's dirty pages to the daemon, which stages them like any write,
+  and return 0 with nothing more durable than before
+  ([Known limits](../reference/features/durability-and-failover.md#known-limits)).
 - The acknowledgement policy (`fs create --ack-policy local|s3`, fixed
   for the filesystem) decides whether an acknowledged mutation lives on
   the sequencer, on a backup, or in S3 (§4, §9).

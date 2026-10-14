@@ -46843,3 +46843,56 @@ the closer's POSIX locks and then publishes; `RELEASE` publishes after
   wait for an op on that file in flight whose token names another
   file's grant (the per-minter collapse; `release_blocked` on the file's
   grant sees nothing of it).
+
+## Docs: `syncfs(2)` and `sync(2)` make nothing durable on a constellation mount (2026-10-14)
+
+Under `--write-mode back`, data written but not closed or `fsync`ed (an
+open file's staged writes, a closed file's queued chunks) is not made
+durable by `syncfs(2)`, `sync -f` or `sync(2)`, and the docs did not say
+so; cluster-locks.md even listed "a `syncfs` of the mount" among the
+points that publish another file's writes.
+
+### Why
+
+Linux sends `FUSE_SYNCFS` only where `fc->sync_fs` is set (mainline
+v7.3-rc7, `fs/fuse/inode.c`, `fuse_sync_fs`): `fuse_fill_super_common`
+sets it for `fuseblk` (`d3906d8f3cee`, 6.18), `virtio_fs_fill_super` for
+virtiofs (`2d82ab251ef0`, 5.14, whose message says it stays off for
+plain `fuse` because an untrusted server could stall `sync(2)`).
+Constellation mounts plain `fuse`/`fuse.constellation`, so the calls
+write the page cache back (`FUSE_WRITE`s the daemon stages) and return 0
+without asking it. Where the request is sent, `ENOSYS` clears
+`fc->sync_fs` for the connection, any other error is `syncfs(2)`'s, and
+`sync(2)` ignores it.
+
+### Change
+
+Docs only: DESIGN.md §3 (`close()` and `fsync()` are the only durability
+points), durability-and-failover.md (Known limits: what the calls do
+and leave undone under `--write-mode back`), cluster-locks.md (the
+`syncfs` publication point removed from "Data published after the locks
+are gone"; the fencing-token entry above (phase 2 of lock fencing) still
+lists it, as it was believed then).
+
+### Not landed: a `syncfs` implementation
+
+One was built and tested, and deliberately not landed, as code no
+mounted constellation would ever run: fuser branches `syncfs` (upstream
+master's `2c3b9b5`, `Filesystem::syncfs`, on `v0.18.0`) and
+`replicix-syncfs` (merged into `replicix`, `FUSE_SYNCFS` kept off the
+ring under `RingDispatch::AllButWaits`), kept local only, not pushed;
+and `Vfs::syncfs` / `View::syncfs` — an `fsync` of every file in one
+plan 39 retry loop: the view's write sessions published write-through
+behind the close-time lock fence, every file with a chunk of this
+node's own queued drained as plan 39b's `fsync` drains it, the
+`--fsync-mode` barrier, no fencing-token scope. On the devbox (Linux
+7.3-rc4, real S3, E2E, `--write-mode back`) a test-only `fuseblk` mount
+on a loop device showed it working end to end — an open and a closed
+file survived `syncfs`/`sync(2)`, `kill -9` and node loss, and the open
+file was lost without it — and on the plain `fuse` mount no `syncfs` op
+ever reached the daemon. It becomes worth landing if constellation
+mounts `fuseblk` (root only, a loop device per mount, fuseblk's
+synchronous `DESTROY`) or the kernel sends `FUSE_SYNCFS` to plain `fuse`
+servers mounted with init-namespace `CAP_SYS_ADMIN`; a `constellation
+sync TARGET` control command over the same view op would serve scripts
+but not applications calling `syncfs(2)`.

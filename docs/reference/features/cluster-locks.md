@@ -1007,7 +1007,7 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   while still holding the lapsed lock. These remain:
   - **Data published after the locks are gone.** A write the owner made
     to another file under the lock is published by whoever closes or
-    `fsync`s the file later, or by a `syncfs` of the mount. If that happens after the owner unlocked,
+    `fsync`s the file later. If that happens after the owner unlocked,
     the commit carries no token. That is also the case after a lapse:
     the owner's unlock or close lifts its fence. On the locked file
     itself, the taint still discards such data. The token cannot carry
