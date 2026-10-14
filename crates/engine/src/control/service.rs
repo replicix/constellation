@@ -575,7 +575,7 @@ impl EngineControl {
                     dirty_bytes: self
                         .cache
                         .dirty_bytes()
-                        .saturating_add(self.staging_budget.used()),
+                        .saturating_add(self.staging_budget.active()),
                     pending_uploads: self.meta.pending_upload_count().unwrap_or(0),
                     upload_concurrency: self.upload.gate.target() as u32,
                     remote_probe_enabled: probe.enabled(),

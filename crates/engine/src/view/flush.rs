@@ -491,18 +491,16 @@ impl View {
                 .map(|a| a.size)
                 .unwrap_or(manifest.file_len);
             let gen = self.staging_gen.next();
-            let staging = Staging::create(
+            let mut staging = Staging::create(
                 &self.staging_dir,
                 ino,
                 gen,
+                self.chunk_size,
                 self.session_staging_budget(),
                 self.host.fs.clone(),
             )
             .map_err(|e| staging_code(&e))?;
-            let mut staging = staging;
-            if size != manifest.file_len {
-                staging.set_len_sparse(size).map_err(|e| staging_code(&e))?;
-            }
+            staging.set_len_sparse(size).map_err(|e| staging_code(&e))?;
             e.insert(WriteState {
                 staging,
                 file_len: size,
@@ -604,7 +602,7 @@ impl View {
         let new_end = old_end.max(end);
         ws.runs.push((start, new_end));
         self.seal_chunks(ino, ws, old_end / chunk..new_end / chunk, base)?;
-        if self.staging_budget.used().saturating_mul(2) >= self.staging_budget.budget() {
+        if self.staging_budget.active().saturating_mul(2) >= self.staging_budget.budget() {
             let whole = ws.file_len / chunk;
             let victims: Vec<u64> = ws
                 .staging
@@ -644,7 +642,7 @@ impl View {
             };
             let hash = self.store.hash(&data);
             if data.iter().all(|byte| *byte == 0) {
-                ws.staging.release_chunk(idx, self.chunk_size);
+                ws.staging.release_chunk(idx);
                 ws.staged_base.remove(&idx);
                 ws.holes.mark(idx);
                 ws.zeroed.mark(idx);
@@ -667,7 +665,7 @@ impl View {
                     .map_err(|error| error.code())?;
                 ws.enrolled.insert(idx);
             }
-            ws.staging.release_chunk(idx, self.chunk_size);
+            ws.staging.release_chunk(idx);
             ws.staged_base.remove(&idx);
             if let Some(used) = used {
                 ws.sealed_base.insert(idx, used);

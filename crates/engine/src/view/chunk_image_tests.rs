@@ -39,6 +39,26 @@ fn shared() -> Shared {
 /// one view's commit moves the manifest under another's session, as a
 /// commit replayed from another node does). Staging under `staging`.
 fn view(s: &Shared, staging: &str, chunk: u32, staging_budget: u64) -> View {
+    view_on(
+        s,
+        staging,
+        chunk,
+        staging_budget,
+        constellation_platform::HostServices::native().fs,
+    )
+}
+
+/// [`view`], its staging on the host file primitives `fs`.
+fn view_on(
+    s: &Shared,
+    staging: &str,
+    chunk: u32,
+    staging_budget: u64,
+    fs: Arc<dyn constellation_platform::FsPrimitives>,
+) -> View {
+    // Every slot staging hands out on this thread reads as junk until
+    // written: a read of anything staging was not given since shows.
+    crate::staging::poison_slots(true);
     let snapshots = Arc::new(crate::snapshot::SnapshotManager::new(
         s.meta.clone(),
         s.store.clone(),
@@ -70,7 +90,10 @@ fn view(s: &Shared, staging: &str, chunk: u32, staging_budget: u64) -> View {
             holds: None,
             watch: OpWatch::manual("test-watch", Duration::from_secs(30)),
             caps: FrontendCaps::linux_fuse(false),
-            host: constellation_platform::HostServices::native(),
+            host: constellation_platform::HostServices {
+                fs,
+                ..constellation_platform::HostServices::native()
+            },
         },
         chunk,
         CompressionSetting::RAW,
@@ -147,6 +170,8 @@ fn staged_bytes(dir: &std::path::Path) -> u64 {
 fn a_partial_write_stages_only_its_own_bytes() {
     let s = shared();
     let fs = view(&s, "staging", MIB, 1 << 30);
+    // Measures what staging allocates: no junk filling its slots.
+    crate::staging::poison_slots(false);
     let f = s.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
     let mut model = pattern(4 * MIB as usize, 0);
     fs.do_write(f.ino, 0, &model).unwrap();
@@ -779,6 +804,90 @@ fn compose_workers_fit_their_memory_budget() {
         2 * 64 * u64::from(MIB),
     );
     assert_eq!(big.granted, 0);
+}
+
+/// The host's file primitives, counting hole punches.
+#[derive(Default)]
+struct CountingFs {
+    punches: std::sync::atomic::AtomicU64,
+}
+
+impl constellation_platform::FsPrimitives for CountingFs {
+    fn punch_hole(&self, file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+        self.punches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        constellation_platform::HostServices::native()
+            .fs
+            .punch_hole(file, offset, len)
+    }
+    fn preallocate(
+        &self,
+        file: &std::fs::File,
+        offset: u64,
+        len: u64,
+        keep_size: bool,
+    ) -> std::io::Result<()> {
+        constellation_platform::HostServices::native()
+            .fs
+            .preallocate(file, offset, len, keep_size)
+    }
+    fn full_fsync(&self, file: &std::fs::File) -> std::io::Result<()> {
+        constellation_platform::HostServices::native()
+            .fs
+            .full_fsync(file)
+    }
+    fn drop_cache(&self, file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+        constellation_platform::HostServices::native()
+            .fs
+            .drop_cache(file, offset, len)
+    }
+}
+
+/// A sequential write seals each chunk it moves past (eager upload), and
+/// that seal released the chunk's staged bytes by punching them out of
+/// the staging file — which first writes them back to the disk and
+/// waits: ~170 ms per 4 MiB chunk on btrfs with `compress=zstd`, a 23
+/// MiB/s ceiling on sequential writes and `copy_file_range`, and 3–8 ms
+/// on uncompressed btrfs and xfs. The sealed chunk's staging slot goes
+/// to the next chunk instead: nothing is punched, the staging file and
+/// the staging budget hold two chunks however long the write, and the
+/// file reads back and publishes as written.
+#[test]
+fn a_sequential_write_punches_nothing_and_stages_two_chunks() {
+    const CHUNK: u32 = 64 * 1024;
+    let s = shared();
+    let counting = Arc::new(CountingFs::default());
+    let fs = view_on(&s, "staging", CHUNK, 1 << 30, counting.clone());
+    let f = s.meta.create(ROOT_INO, "seq", 0o644, 0, 0).unwrap();
+    // 40 chunks in 24 KiB writes: most writes straddle a chunk boundary.
+    let model = pattern(40 * CHUNK as usize, 7);
+    let staging = s.dir.path().join("staging");
+    let mut peak_staged = 0;
+    let mut peak_budget = 0;
+    for piece in model.chunks(24 * 1024).enumerate() {
+        let (i, data) = piece;
+        fs.do_write(f.ino, (i * 24 * 1024) as u64, data).unwrap();
+        peak_staged = peak_staged.max(staged_bytes(&staging));
+        peak_budget = peak_budget.max(fs.staging_budget.used());
+    }
+    assert_eq!(
+        counting.punches.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "hole punches on a sequential writer's path"
+    );
+    assert!(
+        peak_staged <= 2 * u64::from(CHUNK),
+        "{peak_staged} bytes staged on disk at the peak"
+    );
+    assert!(
+        peak_budget <= 2 * u64::from(CHUNK),
+        "{peak_budget} bytes of staging budget at the peak"
+    );
+    assert_eq!(read_all(&fs, f.ino), model, "the session's reads");
+    fs.flush_inode(f.ino, false).unwrap();
+    assert_eq!(fs.staging_budget.used(), 0);
+    assert_eq!(staged_bytes(&staging), 0);
+    assert_eq!(read_all(&fs, f.ino), model, "after the flush");
 }
 
 /// A staging write that fails for real (`EIO` from the staging file, not

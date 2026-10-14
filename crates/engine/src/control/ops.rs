@@ -737,4 +737,36 @@ pub(super) mod tests {
         assert_eq!(mount.opens, 0);
         assert_eq!(mount.unavailable_reason.as_deref(), Some("frontend"));
     }
+
+    /// The writeback status's `dirty_bytes` counts what write sessions
+    /// stage (`StagingBudget::active`), not the released slots they keep
+    /// for reuse, which are free space; `cache.staging_bytes` (disk use)
+    /// counts those too.
+    #[test]
+    fn writeback_dirty_bytes_leave_kept_staging_slots_out() {
+        let f = fixture(&[&[]]);
+        let budget = f.svc.staging_budget.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let mut staging = crate::staging::Staging::create(
+            dir.path(),
+            5,
+            0,
+            4096,
+            budget.clone(),
+            HostServices::native().fs,
+        )
+        .unwrap();
+        staging.write_at(0, &[1u8; 8192]).unwrap();
+        staging.mark_dirty(0);
+        staging.release_chunk(0);
+        assert_eq!((budget.used(), budget.active()), (8192, 4096));
+        let status = f.svc.status();
+        assert_eq!(status.cache.staging_bytes, 8192);
+        assert_eq!(
+            status.writeback.dirty_bytes,
+            f.svc.cache.dirty_bytes() + 4096,
+            "a kept slot is not dirty"
+        );
+        staging.discard();
+    }
 }

@@ -518,7 +518,7 @@ impl View {
             }
         }
         match crate::writeback::throttle_delay(
-            self.staging_budget.used(),
+            self.staging_budget.active(),
             self.staging_budget.budget(),
         ) {
             Ok(delay) if !delay.is_zero() => {
@@ -572,8 +572,8 @@ impl View {
             // in the cache: once uploaded it is a clean, evictable
             // entry, and a full cache had evicted it — EIO on the write,
             // the database lane), and a chunk this session punched or
-            // zeroed whole (those ranges read as zeros now; the punch of
-            // their staged bytes is best-effort).
+            // zeroed whole (those ranges read as zeros now; their staging
+            // slot was given up, and may hold another chunk's bytes).
             //
             // Everything that can fail comes before anything that changes
             // the session: the copy is read, staging reserved, and the
@@ -605,7 +605,7 @@ impl View {
                 None
             };
             ws.staging
-                .prepare_chunk(slice.index, self.chunk_size)
+                .prepare_chunk(slice.index)
                 .map_err(|e| staging_code(&e))?;
             if let Some(seed) = seed {
                 ws.staged_base.remove(&slice.index);
@@ -687,7 +687,7 @@ impl View {
             let data = self.fetch_chunk_for_inode(Some(ino), &hash)?;
             let restaged = ws.sealed_base.get(&idx).copied();
             ws.staging
-                .prepare_chunk(idx, self.chunk_size)
+                .prepare_chunk(idx)
                 .map_err(|e| staging_code(&e))?;
             ws.staged_base.remove(&idx);
             ws.staging
@@ -709,8 +709,8 @@ impl View {
                 );
             }
         }
-        // The staging file's length (ftruncate), the last thing that can
-        // fail: a cut there loses only bytes the rest makes dead anyway.
+        // The session's length in staging (only recorded: staging's file
+        // is its slots', and this cannot fail).
         ws.staging
             .set_len_sparse(new_size)
             .map_err(|e| staging_code(&e))?;
@@ -733,10 +733,12 @@ impl View {
             for idx in past {
                 self.unseal(ws, ino, idx)?;
             }
-            // Drop dirty runs past the new end (the ftruncate above cut
-            // the boundary chunk's staged bytes).
+            // Drop dirty runs past the new end, and the slots of the
+            // chunks there. The boundary chunk's slot keeps what it held
+            // past the point, unread: neither `written` (clipped below)
+            // nor its staged base (`until`) reaches past it now.
             ws.staging.retain_dirty_below(keep);
-            ws.staging.punch_chunks(keep, old_chunks, self.chunk_size);
+            ws.staging.release_chunks(keep, old_chunks);
             ws.staged_base.retain(|idx, staged| {
                 staged.until = staged.until.min(new_size);
                 *idx < keep
@@ -836,8 +838,7 @@ impl View {
                 for index in sealed {
                     self.unseal(ws, ino, index)?;
                 }
-                ws.staging
-                    .punch_chunks(full_start, full_end, self.chunk_size);
+                ws.staging.release_chunks(full_start, full_end);
                 ws.staged_base
                     .retain(|index, _| *index < full_start || *index >= full_end);
             }

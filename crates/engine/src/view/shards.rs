@@ -59,11 +59,13 @@ pub(super) struct WriteState {
     ///   an 8 KiB random writer `fsync`ing every 16 writes wrote.)
     ///
     /// So staging must hold the latest written byte at every offset in
-    /// these ranges of a dirty chunk. A chunk whose staged bytes were
-    /// released while ranges here survive — sealed (`release_chunk`
-    /// punches them), punched whole by `fallocate` (`zeroed`) — gets them
-    /// back before it is staged again: the sealed copy, or zeros
-    /// (`do_write`, the truncate straddle).
+    /// these ranges of a dirty chunk, and nothing else of a dirty chunk
+    /// is read from it but its staged base (`staged_base`). A chunk
+    /// whose staged bytes were released while ranges here survive —
+    /// sealed (`release_chunk`: its staging slot goes to another chunk,
+    /// whose bytes it then holds), punched whole by `fallocate`
+    /// (`zeroed`) — gets them back before it is staged again: the sealed
+    /// copy, or zeros (`do_write`, the truncate straddle).
     pub(super) written: Written,
     /// Dirty chunks whose staging also holds the bytes of a base chunk
     /// (`hash`, `len` bytes long) at every offset below `until` that

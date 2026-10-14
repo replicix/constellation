@@ -213,7 +213,7 @@ impl Admission {
         let Some(staging) = &self.staging else {
             return Ok(());
         };
-        if staging.used().saturating_add(bytes) <= staging.budget() {
+        if staging.active().saturating_add(bytes) <= staging.budget() {
             return Ok(());
         }
         constellation_vfs::watch::stage("view admission (staging limit)");

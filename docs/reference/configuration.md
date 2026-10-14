@@ -840,7 +840,7 @@ protocol, message bounds and counters.
 
 | Variable | Default | Unit / values | Subsystem |
 |---|---:|---|---|
-| `CONSTELLATION_STAGING_BUDGET` | `--cache-size / 4` | bytes | in-flight unflushed write staging cap; exhaustion returns `ENOSPC` |
+| `CONSTELLATION_STAGING_BUDGET` | `--cache-size / 4` | bytes | in-flight unflushed write staging cap; exhaustion returns `ENOSPC`. It counts each chunk a write session has staged bytes in (its length), and the at most two released chunk slots a session keeps in its staging file for the next chunks it writes, so the staging files' disk use stays under it; the kept slots are free space to writers (left out of the throttling and of a view's `max_staging_bytes`), given back (punched) whenever a reservation would not fit beside them |
 | `CONSTELLATION_UPLOAD_CONCURRENCY` | unset (adaptive) | requests, positive | pin write-back upload pool size instead of adapting it |
 | `CONSTELLATION_UPLOAD_MAX_CONCURRENCY` | `128` | requests, `1..128` | adaptive upload concurrency ceiling |
 | `CONSTELLATION_UPLOAD_PROGRESS_INTERVAL_S` | `10` | seconds, positive | INFO progress summary period for pending uploads |

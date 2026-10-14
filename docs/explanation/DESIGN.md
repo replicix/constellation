@@ -236,6 +236,41 @@ take it from staging: with a cache too small to keep clean chunks (or
 full of chunks waiting to upload) a dirty chunk's base is fetched once
 per session, not once per read.
 
+**Staging slots.** A staged chunk's bytes live in a chunk-sized slot of
+the staging file, not at their offset in the real file; a chunk its
+seal released hands its slot to the next chunk the session writes. A
+dirty chunk is read back from staging only where the session put bytes
+into it since (its written ranges, a staged base), so a reused slot's
+earlier bytes are never seen, and nothing is punched or zeroed to reuse
+it. A session keeps released slots while it holds fewer than two (a
+sequential writer needs exactly two: the chunk it writes, and the one it
+just sealed or is sealing) and punches the rest. The staging budget
+counts the kept ones too, so it still bounds the staging files' disk
+use, but as free space: throttling, staging pressure and a view's
+staging limit leave them out, and a reservation that would not fit
+beside them punches the oldest of them (whichever session keeps them),
+as many as it takes, so no write waits or fails for them. A new slot
+extends the staging file over it before it is written, so no write
+lands past the file's end, where a file system may preallocate blocks
+the budget does not count (xfs did, ~4 MiB). The staging file used to
+mirror the real file and punch out (`FALLOC_FL_PUNCH_HOLE`) every chunk
+a seal released, and a punch first writes back the range's dirty pages
+and waits for them: the bytes a sequential writer had just staged, about to be
+discarded, went to the disk synchronously in its `write()` — ~170 ms per
+4 MiB chunk on btrfs with `compress=zstd` (a 23 MiB/s ceiling on
+sequential writes and `copy_file_range`), 3–8 ms on uncompressed btrfs
+and xfs, ~0.1 ms on ext4 and tmpfs — and under a small staging budget,
+where every write seals a chunk, in every write. The change had to be
+neutral or better on every file system a state dir may live on, in
+speed and in space, without detecting one; measured on btrfs with and
+without compression, ext4, xfs and tmpfs, it is: sequential writes and
+`copy_file_range` 1.0–18× as fast (btrfs+zstd 21 → 411 MiB/s), an
+8 KiB random reader and writer under a 32 MiB cache up to 3.7× (btrfs+
+zstd; 1.6× main's), the finding-09 random-write-and-`fsync` job
+unchanged, and the staging budget's and the staging files' peak use
+unchanged (the files are as long as their slots, ~52 MiB for that job
+instead of a 2 GiB sparse mirror).
+
 The flush composes the dirty chunks of a file in parallel
 (`CONSTELLATION_COMPOSE_CONCURRENCY`, with the workers' memory capped
 node-wide by `CONSTELLATION_COMPOSE_MEMORY`): each chunk's hash and its
