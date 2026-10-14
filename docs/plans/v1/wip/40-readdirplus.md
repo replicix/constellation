@@ -96,11 +96,12 @@ cannot encode a position among arbitrary names: the cursor is not free (§4.9).
   directories (`.constellation`, snapshot mirrors) list `synthetic_entries`
   with positional cookies over an immutable listing; scratch directories
   `scratch_readdir`.
-- **What a lookup answers** (`ops.rs:131-230`): `strict_read(.., Dentry)`
-  only (`ops.rs:200-205`; the M6 table's "then `Ino(child)`" is not in the
-  code — a drift recorded for the maintainer, §8), `meta.lookup(parent,
-  name)` (the `0x02` dentry copy plus an `atime` point read,
-  `crates/meta/src/store/writes.rs:1345-1351`), then `current_attr(ino)`
+- **What a lookup answers** (`ops.rs` `fn lookup`): `strict_read(.., Dentry)`,
+  `meta.lookup(parent, name)` (the `0x02` dentry copy plus an `atime`
+  point read, `crates/meta/src/store/writes.rs:1345-1351`),
+  `session_wait(Ino(child))` (the M6 table's "then `Ino(child)`": missing
+  from the code until the separate fix, commit to follow; `.`/`..` wait on
+  their target's `Ino` likewise), then `current_attr(ino)`
   (`crates/engine/src/view/mod.rs:1142`): the inode row read **under the
   write shard**, with the write session's pending size/mtime/ctime overlaid —
   the reason is documented there (the kernel stores a reply's size in
@@ -403,7 +404,8 @@ This plan adds one counting site: each plus entry handed with a node id
 
 For each name of the page the engine produces what `lookup(dir, name)`
 would answer at that moment, after the session wait `getattr` of the child
-does, or a name-only entry. The page loop (names come from the listing,
+does (a `lookup` waits identically: `Ino(child)` after the dentry), or a
+name-only entry. The page loop (names come from the listing,
 §4.9):
 
 1. **Zero TTL** (`self.ttl().is_zero()`, `--cto strict` on a node that is
@@ -455,8 +457,8 @@ linked.
 - The listing keeps its `strict_read(dir, true, None, &[Dir(dir)])` at
   cookie 0 (strict: a `ReadIndex` or a delegation; bounded: M6's wait);
   §4.5 step 2 adds the per-child `Ino` keys per batch, so a plus entry is
-  never older than a `getattr` of the child at that moment — stronger than
-  `lookup` as coded (`Dentry` only, §2), as the M6 table intended.
+  never older than a `getattr` of the child at that moment — the same wait
+  a `lookup` makes (`Dentry`, then `Ino(child)`, §2), as the M6 table says.
 - `ReadKey::Dir` is "never covered by speculation" (`session.rs:268-270`):
   plus inherits that; the per-child `Ino` keys may be covered by a shadow
   exactly as `getattr`'s are.
@@ -1195,10 +1197,11 @@ Decide before the executor starts:
   own label (`readdir-cookie-v1`); no UUID fallback: a filesystem without a
   `gossip_secret` must be recreated. Accepted by the maintainer (no
   backwards compatibility).
-- **`lookup`'s session wait drift**: the M6 table (`PROGRESS.md:11216`)
-  says `lookup` waits `Dentry` then `Ino(child)`; the code
-  (`ops.rs:200-205`) waits `Dentry` only. Plus entries wait as `getattr`
-  (§4.5); should `lookup` be brought in line (separate fix)?
+- **Resolved — `lookup`'s session wait drift**: the M6 table
+  (`PROGRESS.md:11216`) says `lookup` waits `Dentry` then `Ino(child)`; the
+  code waited `Dentry` only. Fixed separately: `lookup` now waits
+  `Ino(child)` as `getattr` does (commit to follow); plus entries wait the
+  same (§4.5).
 
 Open, decided by measurement or later:
 

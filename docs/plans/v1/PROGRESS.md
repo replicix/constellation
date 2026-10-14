@@ -46896,3 +46896,40 @@ synchronous `DESTROY`) or the kernel sends `FUSE_SYNCFS` to plain `fuse`
 servers mounted with init-namespace `CAP_SYS_ADMIN`; a `constellation
 sync TARGET` control command over the same view op would serve scripts
 but not applications calling `syncfs(2)`.
+
+## Fix: a lookup waits for the child's inode as `getattr` does (plan 30 §M6 drift, 2026-10-14)
+
+Plan 30 §M6's key table (above) says a `lookup(parent, name)` waits
+`Dentry(parent, name)`, "then `Ino(child)` for the attrs"; `getattr` waits
+`Ino(ino)`. The code did only the first half: `View::lookup` waited on the
+dentry, read it, and answered the child's attributes through `current_attr`
+with no wait on the child's inode. The two keys differ wherever speculation
+covers one and not the other (a rename's or an exchange's shadow covers the
+entries and their parents, never the inode a name leads to; an `Exists` hint
+carries the child's ino and covers both): with this node's `observed` position
+unreached and the dentry covered, a `stat` by path (a lookup that missed the
+kernel's caches) answered the inode's row from before a commit the node had
+already acknowledged — an `fstat` of the same file waited. `.` and `..`
+returned their target's attributes with no wait at all. Found while
+designing plan 40 (`wip/40-readdirplus.md` §9 recorded the drift).
+
+### What changed
+
+`View::lookup` calls `session_wait(&[ReadKey::Ino(child)])` once the dentry
+has been read and before `current_attr` (which reads under the write shard:
+never block holding one), as `getattr` does; the `.`/`..` branch waits on its
+target's `Ino` the same way. The dentry is not looked up again after the wait
+(a rename during it is concurrent with the lookup, and the reply names the
+inode the name led to); `current_attr` re-reads the inode row. Synthetic and
+scratch lookups are unchanged: scratch areas are node-local and synthetic
+inodes are not replicated. The mutations that return a child's attributes
+(`mknod`, `mkdir`, `create`, `symlink`, `link`, `setattr`) answer from their
+own commit, which is ordered already.
+
+### Tests
+
+`view::lookup_wait_tests`: `a_lookup_waits_for_the_childs_inode_not_only_its_dentry`,
+`a_dotdot_lookup_waits_for_the_parents_inode` and
+`a_dot_lookup_waits_for_the_directorys_inode` fail on main (the lookup
+answers the old mode while the replica has not applied the observed
+`Setattr`) and pass with the change.

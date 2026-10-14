@@ -146,10 +146,16 @@ impl Vfs for View {
                     .map_err(|e| e.code())
             };
             let attr = match target {
-                Ok(Some(ino)) => self.meta.getattr(ino).and_then(|attr| match attr {
-                    Some(attr) => Ok(Some(attr)),
-                    None => self.meta.scratch_getattr(ino),
-                }),
+                Ok(Some(ino)) => {
+                    // The attributes of the directory itself or of its
+                    // parent are waited for as `getattr` waits for its
+                    // own (plan 30 §M6: a lookup returns attributes).
+                    self.session_wait(&[ReadKey::Ino(ino)]);
+                    self.meta.getattr(ino).and_then(|attr| match attr {
+                        Some(attr) => Ok(Some(attr)),
+                        None => self.meta.scratch_getattr(ino),
+                    })
+                }
                 Ok(None) => Ok(None),
                 Err(code) => {
                     r.done(err(code));
@@ -213,6 +219,18 @@ impl Vfs for View {
         constellation_vfs::watch::stage("meta read");
         match self.meta.lookup(parent, &name) {
             Ok(Some(attr)) => {
+                // Plan 30 §M6: a lookup returns the child's attributes,
+                // so it waits for the child's `Ino` as `getattr` does for
+                // its own — the dentry's wait above says nothing of the
+                // inode it leads to (a rename's or an exchange's shadow
+                // covers the entries, not the inode). The child is only known after the
+                // dentry is read, and the wait comes before `current_attr`
+                // takes the write shard: never block while holding one.
+                // The entry is not looked up again afterwards: a rename
+                // during the wait is concurrent with this lookup, and the
+                // reply names the inode the name led to; `current_attr`
+                // reads the inode's row anew.
+                self.session_wait(&[ReadKey::Ino(attr.ino)]);
                 // A name looked up while its inode has pending writes
                 // must report the pending size, or the entry reply caches
                 // a stale one (`current_attr`). The ino is only known

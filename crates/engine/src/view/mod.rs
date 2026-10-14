@@ -134,6 +134,8 @@ mod durable_ack_tests;
 #[cfg(test)]
 mod fsync_drain_tests;
 #[cfg(test)]
+mod lookup_wait_tests;
+#[cfg(test)]
 mod memcache_tests;
 #[cfg(test)]
 mod owner_fence_tests;
