@@ -576,10 +576,15 @@ impl View {
             // their staged bytes is best-effort).
             //
             // Everything that can fail comes before anything that changes
-            // the session: the copy is read and staging reserved first,
-            // then the chunk unsealed. In the other order a failure left
-            // the chunk neither sealed nor staged, and reads fell through
-            // to the base — writes already acknowledged in that chunk read
+            // the session: the copy is read, staging reserved, and the
+            // copy and the write staged, and only then is the chunk
+            // unsealed (and taken out of `holes`) and marked dirty. A
+            // sealed chunk's staged bytes are read by no one, so staging
+            // them first is harmless if the write fails; in the other
+            // order a failure — the budget's, or a real one of the
+            // staging file's (ENOSPC, EIO) after the unseal — left the
+            // chunk neither sealed nor staged, and reads fell through to
+            // the base: writes already acknowledged in that chunk read
             // back as the base's bytes (zeros, for a sparse file).
             let punched = ws.zeroed.contains(slice.index);
             // A sealed copy staged again brings its base along.
@@ -602,8 +607,6 @@ impl View {
             ws.staging
                 .prepare_chunk(slice.index, self.chunk_size)
                 .map_err(|e| staging_code(&e))?;
-            self.unseal(ws, ino, slice.index)?;
-            ws.holes.clear(slice.index);
             if let Some(seed) = seed {
                 ws.staged_base.remove(&slice.index);
                 ws.staging
@@ -621,6 +624,8 @@ impl View {
                 ws.staged_base.remove(&slice.index);
                 return Err(staging_code(&error));
             }
+            self.unseal(ws, ino, slice.index)?;
+            ws.holes.clear(slice.index);
             ws.staging.mark_dirty(slice.index);
             ws.written.insert(write_start, write_end);
             if let Some(base) = restaged {
@@ -662,8 +667,54 @@ impl View {
         let cs = u64::from(self.chunk_size);
         let ws = self.write_state(writes, ino, manifest)?;
         self.quota_check(ino, new_size)?;
-        ws.changed();
-        if new_size < ws.file_len {
+        // Everything that can fail comes first, and leaves the session as
+        // it was, or as good as: a failed truncate changes no byte. (The
+        // truncation floor was lowered, and the time stamped, before the
+        // sealed chunk the point falls in was staged again; that failing,
+        // the base's bytes past the point read — and were flushed — as
+        // zeros, from a file the truncate had not shortened.)
+        let shrinks = new_size < ws.file_len;
+        // The sealed chunk the point falls inside goes back to staging,
+        // to be cut below: fetched (the sealed copy may have been evicted
+        // once uploaded), staging reserved and the copy staged before the
+        // chunk leaves the sealed set, as in `do_write`. Failing, it is
+        // still sealed; staged, it is a dirty chunk with the same bytes.
+        let straddle = (shrinks && !new_size.is_multiple_of(cs))
+            .then_some(new_size / cs)
+            .filter(|idx| ws.sealed.contains_key(idx));
+        if let Some(idx) = straddle {
+            let hash = *ws.sealed.get(&idx).expect("sealed");
+            let data = self.fetch_chunk_for_inode(Some(ino), &hash)?;
+            let restaged = ws.sealed_base.get(&idx).copied();
+            ws.staging
+                .prepare_chunk(idx, self.chunk_size)
+                .map_err(|e| staging_code(&e))?;
+            ws.staged_base.remove(&idx);
+            ws.staging
+                .write_at(idx * cs, &data)
+                .map_err(|e| staging_code(&e))?;
+            self.unseal(ws, ino, idx)?;
+            // Its written ranges are recorded, and staging must hold
+            // their bytes again (the seal released them); the rest of the
+            // copy is the base the seal composed it over (`sealed_base`),
+            // clipped below.
+            ws.staging.mark_dirty(idx);
+            if let Some(base) = restaged {
+                ws.staged_base.insert(
+                    idx,
+                    StagedBase {
+                        until: base.until.min(idx * cs + data.len() as u64),
+                        ..base
+                    },
+                );
+            }
+        }
+        // The staging file's length (ftruncate), the last thing that can
+        // fail: a cut there loses only bytes the rest makes dead anyway.
+        ws.staging
+            .set_len_sparse(new_size)
+            .map_err(|e| staging_code(&e))?;
+        if shrinks {
             // Everything at or past `new_size` is dead, whatever holds it
             // — the base (`floor`: zeroed wherever base content is read
             // for this session), this session's sealed chunks, its
@@ -672,53 +723,20 @@ impl View {
             ws.floor = Some(ws.floor.map_or(new_size, |f| f.min(new_size)));
             let keep = layout.chunk_count(new_size);
             let old_chunks = layout.chunk_count(ws.file_len);
-            // Sealed chunks: wholly past the point, dropped; the one the
-            // point falls inside goes back to staging, to be cut below.
-            let sealed: Vec<u64> = ws
+            // Sealed chunks wholly past the point: dropped.
+            let past: Vec<u64> = ws
                 .sealed
                 .keys()
                 .copied()
-                .filter(|i| *i * cs < ws.file_len)
+                .filter(|i| *i * cs < ws.file_len && *i * cs >= new_size)
                 .collect();
-            for idx in sealed {
-                if idx * cs >= new_size {
-                    self.unseal(ws, ino, idx)?;
-                } else if (idx + 1) * cs > new_size {
-                    // Fetched (the sealed copy may have been evicted once
-                    // uploaded) and staging reserved before the chunk
-                    // leaves the sealed set, as in `do_write`.
-                    let hash = *ws.sealed.get(&idx).expect("sealed");
-                    let data = self.fetch_chunk_for_inode(Some(ino), &hash)?;
-                    let restaged = ws.sealed_base.get(&idx).copied();
-                    ws.staging
-                        .prepare_chunk(idx, self.chunk_size)
-                        .map_err(|e| staging_code(&e))?;
-                    self.unseal(ws, ino, idx)?;
-                    ws.staged_base.remove(&idx);
-                    ws.staging
-                        .write_at(idx * cs, &data)
-                        .map_err(|e| staging_code(&e))?;
-                    // Its written ranges are recorded, and staging must
-                    // hold their bytes again (the seal released them);
-                    // the rest of the copy is the base the seal composed
-                    // it over (`sealed_base`), clipped below.
-                    ws.staging.mark_dirty(idx);
-                    if let Some(base) = restaged {
-                        ws.staged_base.insert(
-                            idx,
-                            StagedBase {
-                                until: base.until.min(idx * cs + data.len() as u64),
-                                ..base
-                            },
-                        );
-                    }
-                }
+            for idx in past {
+                self.unseal(ws, ino, idx)?;
             }
-            // Drop dirty runs past the new end; `Staging::set_len`
-            // (ftruncate) cuts the boundary chunk's staged bytes.
+            // Drop dirty runs past the new end (the ftruncate above cut
+            // the boundary chunk's staged bytes).
             ws.staging.retain_dirty_below(keep);
             ws.staging.punch_chunks(keep, old_chunks, self.chunk_size);
-            // `set_len_sparse` below cuts what staging held past the point.
             ws.staged_base.retain(|idx, staged| {
                 staged.until = staged.until.min(new_size);
                 *idx < keep
@@ -729,9 +747,7 @@ impl View {
                 *start < new_size
             });
         }
-        ws.staging
-            .set_len_sparse(new_size)
-            .map_err(|e| staging_code(&e))?;
+        ws.changed();
         ws.file_len = new_size;
         Ok(())
     }

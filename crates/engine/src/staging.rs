@@ -298,6 +298,15 @@ impl DirtyRuns {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: `(skip, fail)` — let `skip` more [`Staging::write_at`]s on
+    /// this thread through, then fail the next `fail` with `EIO`, as the
+    /// staging file's own write would (not the budget's refusal).
+    pub(crate) static FAIL_WRITES: std::cell::Cell<(u32, u32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// One open, dirty inode's staged bytes: a sparse file mirroring the
 /// real file's layout (byte offsets match 1:1), so unwritten holes
 /// read back as zero for free via ordinary filesystem sparse-file
@@ -362,6 +371,20 @@ impl Staging {
             self.budget.reserve(growth)?;
             self.reserved += growth;
             self.file_len = end;
+        }
+        #[cfg(test)]
+        if FAIL_WRITES.with(|f| match f.get() {
+            (0, 0) => false,
+            (0, fail) => {
+                f.set((0, fail - 1));
+                true
+            }
+            (skip, fail) => {
+                f.set((skip - 1, fail));
+                false
+            }
+        }) {
+            return Err(io::Error::from_raw_os_error(5).into());
         }
         file_write_at(&self.file, buf, offset)?;
         Ok(())

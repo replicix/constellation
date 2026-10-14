@@ -469,6 +469,40 @@ fn a_base_extended_elsewhere_stays_staged_for_reads() {
     );
 }
 
+/// A truncate that fails (here: staging the sealed chunk its point falls
+/// in) changes no byte: the base past the point still reads, and
+/// flushes, as it was. The truncation floor used to be lowered before
+/// the failing step, and the base's bytes past it read as zeros from a
+/// file the truncate had not shortened.
+#[test]
+fn a_failed_truncate_changes_no_byte() {
+    const CHUNK: u32 = 16;
+    let s = shared();
+    let fs = view(&s, "staging", CHUNK, 1 << 30);
+    let f = s.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    let mut model = pattern(32, 4);
+    fs.do_write(f.ino, 0, &model).unwrap();
+    fs.flush_inode(f.ino, false).unwrap();
+    // Chunk 0 rewritten whole: sealed by the run crossing it.
+    let sealed = pattern(CHUNK as usize, 8);
+    fs.do_write(f.ino, 0, &sealed).unwrap();
+    overwrite(&mut model, 0, &sealed);
+    assert!(fs
+        .writes
+        .lock(f.ino)
+        .get(&f.ino)
+        .unwrap()
+        .sealed
+        .contains_key(&0));
+    crate::staging::FAIL_WRITES.with(|w| w.set((0, 1)));
+    let failed = fs.truncate(f.ino, 10);
+    crate::staging::FAIL_WRITES.with(|w| w.set((0, 0)));
+    assert_eq!(failed, Err(Code::Io));
+    assert_eq!(read_all(&fs, f.ino), model, "the session");
+    fs.flush_inode(f.ino, false).unwrap();
+    assert_eq!(read_all(&fs, f.ino), model, "after the flush");
+}
+
 /// Random sessions of view A over a base another view B keeps committing
 /// into between A's steps (writes, truncates down and up): A writes inside
 /// chunks (never to a chunk's end, so nothing is sealed — asserted — and
@@ -745,4 +779,76 @@ fn compose_workers_fit_their_memory_budget() {
         2 * 64 * u64::from(MIB),
     );
     assert_eq!(big.granted, 0);
+}
+
+/// A staging write that fails for real (`EIO` from the staging file, not
+/// the budget) while a sealed chunk is staged again — its copy, the write
+/// itself, a whole-chunk write, a truncate's copy of the chunk the cut
+/// falls in — leaves the chunk sealed: the write fails, and the bytes
+/// written before it read back, before and after the flush. The chunk
+/// used to be unsealed first, and then read as the base (here: zeros).
+#[test]
+fn a_failed_restage_of_a_sealed_chunk_keeps_its_bytes() {
+    const CHUNK: u32 = 16;
+    let fail = |skip: u32| crate::staging::FAIL_WRITES.with(|f| f.set((skip, 1)));
+    let clear = || crate::staging::FAIL_WRITES.with(|f| f.set((0, 0)));
+    for case in ["copy", "write", "whole chunk", "truncate"] {
+        let s = shared();
+        let fs = view(&s, "staging", CHUNK, 1 << 30);
+        let f = s.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        // A whole chunk, sealed by the run that crosses it.
+        let sealed = pattern(CHUNK as usize, 9);
+        fs.do_write(f.ino, 0, &sealed).unwrap();
+        assert!(
+            fs.writes
+                .lock(f.ino)
+                .get(&f.ino)
+                .unwrap()
+                .sealed
+                .contains_key(&0),
+            "{case}: chunk 0 sealed"
+        );
+        let failed = match case {
+            "copy" => {
+                fail(0);
+                fs.do_write(f.ino, 5, b"XY")
+            }
+            "write" => {
+                fail(1);
+                fs.do_write(f.ino, 5, b"XY")
+            }
+            "whole chunk" => {
+                fail(0);
+                fs.do_write(f.ino, 0, &[b'Z'; CHUNK as usize])
+            }
+            _ => {
+                fail(0);
+                fs.truncate(f.ino, 10).map(|()| 0u32)
+            }
+        };
+        clear();
+        assert_eq!(failed, Err(Code::Io), "{case}: the write fails");
+        let keep = if case == "truncate" {
+            10
+        } else {
+            CHUNK as usize
+        };
+        assert_eq!(
+            read_all(&fs, f.ino)[..keep],
+            sealed[..keep],
+            "{case}: the session"
+        );
+        fs.flush_inode(f.ino, false).unwrap();
+        assert_eq!(
+            read_all(&fs, f.ino)[..keep],
+            sealed[..keep],
+            "{case}: after the flush"
+        );
+        // And the chunk takes a write again.
+        let mut want = read_all(&fs, f.ino);
+        want[5..7].copy_from_slice(b"XY");
+        fs.do_write(f.ino, 5, b"XY").unwrap();
+        fs.flush_inode(f.ino, false).unwrap();
+        assert_eq!(read_all(&fs, f.ino), want, "{case}: a later write");
+    }
 }
