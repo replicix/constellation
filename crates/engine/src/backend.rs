@@ -334,9 +334,245 @@ pub fn last_s3_completion_ms() -> i64 {
     LAST_COMPLETED_MS.load(Ordering::Relaxed)
 }
 
+/// Finding 14: the requests S3 has been asked and has not answered yet,
+/// by when each was issued (unix ms; keyed by a request number). The
+/// stall test ([`s3_stall_in_ms`]) needs a request that waited: a daemon
+/// that asked S3 nothing (its authority core blocked 18 s on a
+/// metadata-store write, nothing else due) heard nothing either, and was
+/// taken for one whose S3 path had stalled the moment it ran again. One
+/// process-wide map behind a mutex, an insert and a remove per request:
+/// noise next to the request itself.
+static OUTSTANDING: std::sync::Mutex<std::collections::BTreeMap<u64, i64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
+
+fn outstanding_requests() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, i64>> {
+    OUTSTANDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One request in [`OUTSTANDING`], from when it is issued until it is
+/// settled (answered, or failed: [`Outstanding::settle`]) or given up. A
+/// request its caller gave up before S3 answered (a timeout around it,
+/// such as the epoch member probe's) went unanswered: dropping it
+/// unsettled records that, as a failure would.
+struct Outstanding {
+    id: u64,
+    settled: bool,
+}
+
+impl Outstanding {
+    fn issued_at(at_ms: i64) -> Self {
+        let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        outstanding_requests().insert(id, at_ms);
+        Self { id, settled: false }
+    }
+
+    fn issued() -> Self {
+        Self::issued_at(constellation_store_s3::lease::now_unix_ms())
+    }
+
+    /// Record the request's outcome ([`note`]) and take it off the map.
+    fn settle<T>(mut self, r: &object_store::Result<T>) {
+        note(r);
+        self.settled = true;
+    }
+
+    /// Taken off the map with no outcome of its own (a listing that
+    /// ended or yielded its first item has its items noted one by one).
+    fn settled(mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for Outstanding {
+    fn drop(&mut self) {
+        outstanding_requests().remove(&self.id);
+        if !self.settled {
+            LAST_UNANSWERED_MS.store(
+                constellation_store_s3::lease::now_unix_ms(),
+                Ordering::Relaxed,
+            );
+            *LAST_UNANSWERED_ERROR.lock().unwrap() =
+                Some("given up by its caller before S3 answered".to_string());
+        }
+    }
+}
+
+/// A listing, outstanding until its first item, its end (an empty
+/// listing is an answer too), or its drop; its items are noted one by
+/// one as before.
+fn listing<T: Send + 'static>(
+    inner: futures::stream::BoxStream<'static, object_store::Result<T>>,
+) -> futures::stream::BoxStream<'static, object_store::Result<T>> {
+    use futures::StreamExt;
+    let req = Outstanding::issued();
+    futures::stream::unfold((inner, Some(req)), |(mut inner, mut req)| async move {
+        match inner.next().await {
+            Some(item) => {
+                note(&item);
+                if let Some(req) = req.take() {
+                    req.settled();
+                }
+                Some((item, (inner, req)))
+            }
+            None => {
+                if let Some(req) = req.take() {
+                    completed();
+                    req.settled();
+                }
+                None
+            }
+        }
+    })
+    .boxed()
+}
+
+/// EC2 finding 1, campaign 8 A-1: whether this node's S3 path has left
+/// it waiting for `for_ms` at `now_ms` (`Some(0)`), how long until it
+/// will have if nothing answers meanwhile (`Some(ms)`), or that nothing
+/// was asked of it (`None`: no request waits, none failed unanswered
+/// since the last answer — however long it was silent, finding 14).
+///
+/// S3 answered nothing for `for_ms` — since its last answer, or
+/// `progress_ms` when the caller has later evidence of its own (a chunk
+/// PUT that succeeded) — and it was asked meanwhile: a request has been
+/// outstanding that long, or one failed unanswered (or was given up)
+/// since the last answer (a request waiting out its retries' backoff
+/// after a timeout has none outstanding).
+///
+/// What this cannot tell from S3: a daemon that itself stalled for a
+/// while (its runtime held up, the answers that had arrived unread) has
+/// its requests look outstanding all that time, and a retry series that
+/// ran out during the stall fails unanswered right after it. The own-S3
+/// watch counts ticks for the first (`OwnS3Watch`); the second can still
+/// read as a stall until the next answer.
+pub fn s3_stall_in_ms(now_ms: i64, for_ms: i64, progress_ms: i64) -> Option<i64> {
+    S3Waits::now()
+        .with_progress(progress_ms)
+        .stall_in(now_ms, for_ms)
+}
+
+/// What [`s3_stall_in_ms`] judges by, read at one moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct S3Waits {
+    /// When S3 last answered (or the caller's later evidence of progress).
+    pub answered_ms: i64,
+    /// When the oldest request still waiting was issued.
+    pub oldest_outstanding_ms: Option<i64>,
+    /// When a request last failed unanswered or was given up.
+    pub last_unanswered_ms: i64,
+}
+
+impl S3Waits {
+    pub fn now() -> Self {
+        Self {
+            answered_ms: LAST_COMPLETED_MS.load(Ordering::Relaxed),
+            oldest_outstanding_ms: outstanding_requests().values().min().copied(),
+            last_unanswered_ms: LAST_UNANSWERED_MS.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn with_progress(mut self, progress_ms: i64) -> Self {
+        self.answered_ms = self.answered_ms.max(progress_ms);
+        self
+    }
+
+    /// [`s3_stall_in_ms`].
+    pub fn stall_in(&self, now_ms: i64, for_ms: i64) -> Option<i64> {
+        stall_in(
+            now_ms,
+            for_ms,
+            self.answered_ms,
+            self.oldest_outstanding_ms,
+            self.last_unanswered_ms,
+        )
+    }
+
+    /// S3 left this node waiting all through `since_ms ..= now`: nothing
+    /// answered since, and a request was already waiting then or one
+    /// failed unanswered after the last answer.
+    pub fn waited_since(&self, since_ms: i64) -> bool {
+        self.answered_ms < since_ms
+            && (self
+                .oldest_outstanding_ms
+                .is_some_and(|issued| issued <= since_ms)
+                || self.last_unanswered_ms > self.answered_ms)
+    }
+}
+
+/// [`s3_stall_in_ms`]'s rule.
+fn stall_in(
+    now_ms: i64,
+    for_ms: i64,
+    answered_ms: i64,
+    oldest_outstanding_ms: Option<i64>,
+    last_unanswered_ms: i64,
+) -> Option<i64> {
+    let silent = answered_ms + for_ms - now_ms;
+    let failed = (last_unanswered_ms > answered_ms).then_some(silent);
+    let waiting = oldest_outstanding_ms.map(|issued| silent.max(issued + for_ms - now_ms));
+    let due = match (failed, waiting) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    Some(due.max(0))
+}
+
+/// The oldest request still waiting on S3: when it was issued (unix ms),
+/// and how many are waiting (`status.s3`).
+pub fn s3_outstanding() -> (Option<i64>, usize) {
+    let requests = outstanding_requests();
+    (requests.values().min().copied(), requests.len())
+}
+
+/// Tests that set the S3 path's answers serialize on this: they are
+/// process-wide.
+#[cfg(test)]
+pub(crate) fn s3_path_for_test(answered_ms: i64) -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    s3_reset_for_test(answered_ms);
+    guard
+}
+
+/// Start the S3 path's record over (tests, under [`s3_path_for_test`]).
+#[cfg(test)]
+pub(crate) fn s3_reset_for_test(answered_ms: i64) {
+    LAST_COMPLETED_MS.store(answered_ms, Ordering::Relaxed);
+    LAST_UNANSWERED_MS.store(0, Ordering::Relaxed);
+    outstanding_requests().clear();
+}
+
+/// A request issued at `at_ms` and outstanding until the guard drops,
+/// answered then (tests).
+#[cfg(test)]
+pub(crate) fn s3_request_for_test(at_ms: i64) -> impl Drop {
+    struct Answered(Option<Outstanding>);
+    impl Drop for Answered {
+        fn drop(&mut self) {
+            if let Some(req) = self.0.take() {
+                completed();
+                req.settled();
+            }
+        }
+    }
+    Answered(Some(Outstanding::issued_at(at_ms)))
+}
+
+/// A request that went unanswered at `at_ms` (tests).
+#[cfg(test)]
+pub(crate) fn s3_unanswered_for_test(at_ms: i64) {
+    LAST_UNANSWERED_MS.store(at_ms, Ordering::Relaxed);
+}
+
 /// The counts so far (`status.s3`).
 pub fn s3_request_counts() -> constellation_control::proto::types::S3RequestStatus {
     let c = counts();
+    let (oldest, outstanding) = s3_outstanding();
     constellation_control::proto::types::S3RequestStatus {
         get: c.get.load(Ordering::Relaxed),
         head: c.head.load(Ordering::Relaxed),
@@ -349,6 +585,9 @@ pub fn s3_request_counts() -> constellation_control::proto::types::S3RequestStat
         last_answered_unix_ms: LAST_COMPLETED_MS.load(Ordering::Relaxed),
         last_unanswered_unix_ms: LAST_UNANSWERED_MS.load(Ordering::Relaxed),
         last_unanswered_error: LAST_UNANSWERED_ERROR.lock().unwrap().clone(),
+        outstanding: outstanding as u64,
+        oldest_outstanding_ms: oldest
+            .map(|issued| (constellation_store_s3::lease::now_unix_ms() - issued).max(0) as u64),
     }
 }
 
@@ -373,8 +612,9 @@ impl ObjectStore for CountingStore {
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
         count("PUT", Some(location));
+        let req = Outstanding::issued();
         let r = self.inner.put_opts(location, payload, opts).await;
-        note(&r);
+        req.settle(&r);
         r
     }
     async fn put_multipart_opts(
@@ -383,8 +623,9 @@ impl ObjectStore for CountingStore {
         opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         count("PUT", Some(location));
+        let req = Outstanding::issued();
         let r = self.inner.put_multipart_opts(location, opts).await;
-        note(&r);
+        req.settle(&r);
         r
     }
     async fn get_opts(
@@ -393,8 +634,9 @@ impl ObjectStore for CountingStore {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         count(if options.head { "HEAD" } else { "GET" }, Some(location));
+        let req = Outstanding::issued();
         let r = self.inner.get_opts(location, options).await;
-        note(&r);
+        req.settle(&r);
         r
     }
     fn delete_stream(
@@ -419,29 +661,25 @@ impl ObjectStore for CountingStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        use futures::StreamExt;
         count("LIST", prefix);
-        self.inner.list(prefix).inspect(note).boxed()
+        listing(self.inner.list(prefix))
     }
     fn list_with_offset(
         &self,
         prefix: Option<&object_store::path::Path>,
         offset: &object_store::path::Path,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        use futures::StreamExt;
         count("LIST", prefix);
-        self.inner
-            .list_with_offset(prefix, offset)
-            .inspect(note)
-            .boxed()
+        listing(self.inner.list_with_offset(prefix, offset))
     }
     async fn list_with_delimiter(
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> object_store::Result<object_store::ListResult> {
         count("LIST", prefix);
+        let req = Outstanding::issued();
         let r = self.inner.list_with_delimiter(prefix).await;
-        note(&r);
+        req.settle(&r);
         r
     }
     async fn copy_opts(
@@ -451,8 +689,9 @@ impl ObjectStore for CountingStore {
         options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
         count("COPY", Some(to));
+        let req = Outstanding::issued();
         let r = self.inner.copy_opts(from, to, options).await;
-        note(&r);
+        req.settle(&r);
         r
     }
 }
@@ -465,7 +704,7 @@ mod tests {
     /// not.
     #[test]
     fn a_request_error_counts_as_an_answer() {
-        LAST_COMPLETED_MS.store(0, Ordering::Relaxed);
+        let _path = s3_path_for_test(0);
         note::<()>(&Err(object_store::Error::Generic {
             store: "S3",
             source: "error sending request".into(),
@@ -476,6 +715,91 @@ mod tests {
             source: "404".into(),
         }));
         assert!(last_s3_completion_ms() > 0);
+    }
+
+    /// Finding 14: S3 is stalled only while it leaves a request waiting.
+    /// A daemon that asked nothing for a minute (its authority core held
+    /// up by its metadata store) is not; a request outstanding past the
+    /// window is, and so is one that failed unanswered since the last
+    /// answer (the next attempt has not gone out yet); an answer, or the
+    /// caller's own evidence of progress, restarts the window. Not yet
+    /// stalled, the rule says when it will be if nothing answers.
+    #[test]
+    fn s3_is_stalled_only_while_a_request_waits_unanswered() {
+        let w = 6_000;
+        let now = 1_000_000;
+        let long_ago = now - 60_000;
+        // Nothing asked: silence is no stall, and none is due.
+        assert_eq!(stall_in(now, w, long_ago, None, 0), None);
+        // A request that has waited the whole window.
+        assert_eq!(stall_in(now, w, long_ago, Some(now - w), 0), Some(0));
+        // One that went out 100 ms ago: due when it has waited 6 s.
+        assert_eq!(stall_in(now, w, long_ago, Some(now - 100), 0), Some(5_900));
+        // A request that failed unanswered after the last answer.
+        assert_eq!(stall_in(now, w, long_ago, None, now - 2_000), Some(0));
+        // ... but not one that failed before it.
+        assert_eq!(stall_in(now, w, long_ago, None, long_ago - 1), None);
+        // Something answered 100 ms ago: a slow request on a working path
+        // is no stall, not before the window has passed since the answer.
+        assert_eq!(
+            stall_in(now, w, now - 100, Some(now - 30_000), now - 50),
+            Some(5_900)
+        );
+    }
+
+    /// The same through the process-wide record the requests keep; a
+    /// request given up unanswered (its guard dropped unsettled) counts
+    /// as one that failed.
+    #[test]
+    fn the_outstanding_requests_decide_the_stall() {
+        let now = constellation_store_s3::lease::now_unix_ms();
+        let _path = s3_path_for_test(now - 60_000);
+        assert_eq!(s3_stall_in_ms(now, 6_000, 0), None, "nothing asked");
+        {
+            let _waiting = s3_request_for_test(now - 7_000);
+            let _fresh = s3_request_for_test(now - 100);
+            assert_eq!(s3_outstanding(), (Some(now - 7_000), 2));
+            assert_eq!(s3_stall_in_ms(now, 6_000, 0), Some(0), "waited 7 s");
+            // The caller's own evidence of progress restarts the window.
+            assert_eq!(s3_stall_in_ms(now, 6_000, now - 1_000), Some(5_000));
+        }
+        // Answered: the window counts from the answer.
+        assert_eq!(s3_outstanding(), (None, 0));
+        assert_eq!(s3_stall_in_ms(now, 6_000, 0), None, "answered");
+        s3_reset_for_test(now - 60_000);
+        drop(Outstanding::issued_at(now - 300));
+        assert_eq!(s3_stall_in_ms(now + 1, 6_000, 0), Some(0), "given up");
+        s3_reset_for_test(now - 60_000);
+        s3_unanswered_for_test(now - 1_000);
+        assert_eq!(s3_stall_in_ms(now, 6_000, 0), Some(0), "failed unanswered");
+    }
+
+    /// A listing is outstanding until its first item or its end, an empty
+    /// one being an answer too.
+    #[test]
+    fn a_listing_is_answered_by_its_first_item_or_its_end() {
+        use futures::StreamExt;
+        let now = constellation_store_s3::lease::now_unix_ms();
+        let _path = s3_path_for_test(now - 60_000);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let empty = futures::stream::empty::<object_store::Result<()>>().boxed();
+            let mut l = listing(empty);
+            assert_eq!(s3_outstanding().1, 1);
+            assert!(l.next().await.is_none());
+            assert_eq!(s3_outstanding().1, 0);
+            assert!(last_s3_completion_ms() >= now);
+            drop(l);
+            s3_reset_for_test(now - 60_000);
+            let two = futures::stream::iter([Ok(()), Ok(())]).boxed();
+            let mut l = listing(two);
+            assert!(l.next().await.is_some());
+            assert_eq!(s3_outstanding().1, 0, "answered by the first item");
+            drop(l);
+            assert_eq!(s3_stall_in_ms(now, 6_000, 0), None, "not given up");
+        });
     }
 
     /// Plan 37 K6a: an `fs.unlock` rotation reaches the next signed

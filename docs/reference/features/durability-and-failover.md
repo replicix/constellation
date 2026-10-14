@@ -775,11 +775,13 @@ Operational rules:
   reaches it, the node does not propose (its outage is its own, not the
   bucket's: `status.epoch.own_s3_outage`) and asks again 1 s later,
   until its own S3 works again. Its closes meanwhile hand their chunks
-  to a peer that reaches S3 (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`).
+  to a peer that reaches S3 (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`,
+  6 s after the drain's first request went unanswered).
   The probe is fresh each time, so a cluster-wide outage is not
   mistaken for a local one.
 - A node whose own S3 path stalls (no S3 request of it completes for
-  `CONSTELLATION_S3_STALL_MS`, 6 s; `status.own_s3.stalled`) keeps its
+  `CONSTELLATION_S3_STALL_MS`, 6 s, while one of them waits that long or
+  failed unanswered; `status.own_s3.stalled`) keeps its
   metadata ops on P2P (EC2 campaign 8 A-1). A forward that times out or
   hears `Busy` is retried to the holder, backing off to at most 1 s,
   instead of ending in the lease path, whose every step (the lease
@@ -797,13 +799,21 @@ Operational rules:
   (`peers_reach_s3` stays `null`): the deadline applies to it (with
   forwarding on, the default, and no continuation epoch open), and
   nothing is forwarded (there is no holder but itself); a bucket outage
-  ends that when the node's epoch of one forms. The test is that no
-  request completed, not that one is outstanding, so a daemon that
+  ends that when the node's epoch of one forms. The test needs a
+  request left waiting: silence alone is not a stall. A daemon that
   stalled itself (frozen, or its authority core waiting 18 s on a
-  metadata-store write, as in the xcheckfs run of 2026-10-13) issued
-  none and reads as stalled for a moment when it runs again. On a
-  holder whose lease is still valid nothing waits on the deadline (its
-  ops execute locally); that run's `own_s3.deadlines` stayed 0.
+  metadata-store write, as in the xcheckfs run of 2026-10-13) asked
+  nothing and used to read as stalled for a moment when it ran again.
+  The watch also counts its once-a-second ticks: S3 must have left a
+  request waiting through as many consecutive ticks as the window has
+  seconds, and a stall of the daemon itself (its runtime held up, the
+  answers that had arrived unread) is one late tick however long it
+  lasted (`status.own_s3.late_ticks`); a daemon whose ticks are all late
+  still reports a real stall, later. A stall already seen lasts until S3
+  answers. `status.s3.outstanding` and `oldest_outstanding_ms` show the
+  requests waiting. On a holder whose lease is still valid nothing waits
+  on the deadline (its ops execute
+  locally); that run's `own_s3.deadlines` stayed 0.
 - A node restarted after a crash with nothing of its own to ship does
   not reacquire the lease its previous incarnation held. If no backup
   seals that lease, it stays in force until it expires, and a peer's

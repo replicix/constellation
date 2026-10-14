@@ -373,13 +373,22 @@ impl UploadRuntime {
 
     /// EC2 finding 1: whether this node's S3 path has made no progress for
     /// `for_ms`: no chunk PUT and no S3 request of any kind has succeeded
-    /// (`backend::last_s3_completion_ms`) in that long.
+    /// (`backend::last_s3_completion_ms`) in that long, while a request
+    /// waited on it (`backend::s3_stall_in_ms`, finding 14).
     pub(crate) fn uploads_stalled(&self, for_ms: i64) -> bool {
-        let last = self
-            .last_put_ms
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .max(backend::last_s3_completion_ms());
-        constellation_store_s3::lease::now_unix_ms() - last >= for_ms
+        self.uploads_stall_in(constellation_store_s3::lease::now_unix_ms(), for_ms) == Some(0)
+    }
+
+    /// [`Self::uploads_stalled`] at `now_ms`: `Some(0)` stalled, `Some(ms)`
+    /// stalled in that long if nothing answers, `None` nothing asked.
+    pub(crate) fn uploads_stall_in(&self, now_ms: i64, for_ms: i64) -> Option<i64> {
+        self.s3_waits().stall_in(now_ms, for_ms)
+    }
+
+    /// The S3 path's waits, a successful chunk PUT counting as an answer.
+    pub(crate) fn s3_waits(&self) -> backend::S3Waits {
+        backend::S3Waits::now()
+            .with_progress(self.last_put_ms.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// `hashes` went out in a manifest forwarded to `to` while still

@@ -97,8 +97,9 @@ fn ls_la(dir: &std::path::Path) -> std::io::Result<usize> {
 pub fn s3_cut_one_node(_seed: u64) -> Result<()> {
     const NAME: &str = "s3-cut-one-node";
     /// How long each FUSE op on the cut node may take while the cut lasts.
-    /// (The fix: ~6 s to find the node's S3 path stalled, then one
-    /// peer upload; the bug: the whole outage.)
+    /// (The fix: ~6 s after its first unanswered request to find the
+    /// node's S3 path stalled, then one peer upload; the bug: the whole
+    /// outage.)
     const OP_BUDGET: Duration = Duration::from_secs(20);
     /// An unrelated metadata read on the cut node.
     const READ_BUDGET: Duration = Duration::from_secs(5);
@@ -1074,8 +1075,9 @@ pub fn s3_cut_create_holder_restart(_seed: u64) -> Result<()> {
     const NAME: &str = "s3-cut-create-holder-restart";
     /// A `create()` on the cut node (A-1's bound; the campaign: 120 s).
     const CREATE_BUDGET: Duration = Duration::from_secs(10);
-    /// The write + close after it (the chunk handoff to a peer: ~6 s to
-    /// find the S3 path stalled, then the peer's upload).
+    /// The write + close after it (the chunk handoff to a peer: ~6 s
+    /// after the close's first unanswered upload to find the S3 path
+    /// stalled, then the peer's upload).
     const CLOSE_BUDGET: Duration = Duration::from_secs(20);
     /// Phase 2's freeze: longer than B's forward retries (~1.5 s).
     const FREEZE: Duration = Duration::from_secs(5);

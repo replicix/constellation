@@ -4804,7 +4804,8 @@ impl Uploader {
 }
 
 /// EC2 campaign 8 A-1: how long this node's S3 path may complete nothing
-/// before the core is told it is stalled (`Event::OwnS3`;
+/// while a request of this node waits on it (or failed unanswered) before
+/// the core is told it is stalled (`Event::OwnS3`, `OwnS3Watch`;
 /// `CONSTELLATION_S3_STALL_MS`, default 6000 — longer than the 5 s
 /// registry poll, so a working path always shows a completion inside it;
 /// 0 disables).
@@ -4916,16 +4917,47 @@ async fn peer_links_task(
     }
 }
 
+/// A watch tick this long after the previous one (they are a second
+/// apart) came late: the daemon itself did not run (its runtime's workers
+/// all held up, by the metadata store's writer lock in finding 14), and
+/// neither did the reading of answers that had arrived meanwhile. Counted
+/// in `status.own_s3.late_ticks`.
+const OWN_S3_LATE_TICK: Duration = Duration::from_secs(3);
+
+/// Late watch ticks since the daemon started ([`OWN_S3_LATE_TICK`]).
+static OWN_S3_LATE_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// `status.own_s3.late_ticks`.
+pub fn own_s3_late_ticks() -> u64 {
+    OWN_S3_LATE_TICKS.load(Ordering::Relaxed)
+}
+
 /// EC2 campaign 8 A-1: this node's own S3 path for the core, once a
 /// second. Stalled when no S3 request (and no chunk PUT) of this node
-/// has completed for [`s3_stall_ms`]; while stalled, the live peers are
-/// asked every [`OWN_S3_ASK_EVERY`] whether they reach S3, in the
-/// background (the tick never waits on them).
+/// has completed for [`s3_stall_ms`] while one waited on S3 that long
+/// (`UploadRuntime::uploads_stall_in`), and the watch saw it waiting
+/// through as many consecutive ticks as the window has seconds; while
+/// stalled, the live peers are asked every [`OWN_S3_ASK_EVERY`] whether
+/// they reach S3, in the background (the tick never waits on them).
+///
+/// Counting ticks, not only time, keeps a stall of the daemon itself from
+/// reading as S3's (finding 14): requests whose answers arrived while the
+/// runtime was held up look outstanding all that time, but the stall is
+/// one tick however long it lasted, so the watch waits a window's worth of
+/// ticks after it before it says S3 is stalled. A runtime whose ticks are
+/// all late still gets there, a tick at a time. A stall already seen
+/// lasts until S3 answers.
 struct OwnS3Watch {
     upload: Arc<crate::upload::UploadRuntime>,
     peers: constellation_net::Peers,
     asked: Option<std::time::Instant>,
     answer: Arc<std::sync::Mutex<Option<bool>>>,
+    /// The previous tick: when (for lateness) and at which unix ms.
+    last_tick: Option<(std::time::Instant, i64)>,
+    /// Consecutive ticks through which S3 left this node waiting
+    /// (`S3Waits::waited_since` the previous tick).
+    waited_ticks: u64,
+    stalled: bool,
 }
 
 impl OwnS3Watch {
@@ -4935,12 +4967,38 @@ impl OwnS3Watch {
             peers,
             asked: None,
             answer: Arc::new(std::sync::Mutex::new(None)),
+            last_tick: None,
+            waited_ticks: 0,
+            stalled: false,
         }
     }
 
     fn tick(&mut self) -> (bool, Option<bool>) {
+        self.tick_at(std::time::Instant::now(), now_unix_ms())
+    }
+
+    fn tick_at(&mut self, now: std::time::Instant, now_ms: i64) -> (bool, Option<bool>) {
         let ms = s3_stall_ms();
-        let stalled = ms > 0 && self.upload.uploads_stalled(ms as i64);
+        let waits = self.upload.s3_waits();
+        match self.last_tick {
+            Some((at, at_ms)) => {
+                if now.saturating_duration_since(at) >= OWN_S3_LATE_TICK {
+                    OWN_S3_LATE_TICKS.fetch_add(1, Ordering::Relaxed);
+                }
+                if waits.waited_since(at_ms) {
+                    self.waited_ticks += 1;
+                } else {
+                    self.waited_ticks = 0;
+                }
+            }
+            None => self.waited_ticks = 0,
+        }
+        self.last_tick = Some((now, now_ms));
+        let ticks = ms.div_ceil(PEER_LINKS_TICK.as_millis() as u64);
+        let stalled = ms > 0
+            && waits.stall_in(now_ms, ms as i64) == Some(0)
+            && (self.stalled || self.waited_ticks >= ticks);
+        self.stalled = stalled;
         if !stalled {
             self.asked = None;
             *self.answer.lock().unwrap() = None;
@@ -4979,10 +5037,13 @@ impl OwnS3Watch {
 /// EC2 finding 1: how long a drain (a write-through close, a forwarded
 /// manifest's pre-publication upload, an `fsync`) waits on this node's
 /// S3 path making no progress — no upload and no other S3 request
-/// completing — before it hands its chunks to a peer
+/// completing, while one of its requests waits that long (or failed
+/// unanswered; finding 14) — before it hands its chunks to a peer
 /// (`CONSTELLATION_CHUNK_HANDOFF_AFTER_MS`, default 6000, longer than
 /// the 5 s registry poll so a working link always shows a completion
-/// inside it; 0 disables).
+/// inside it; 0 disables). The drain's first check comes `after` in and
+/// rechecks when its first request will have waited that long
+/// (`handoff_recheck`).
 fn chunk_handoff_after_ms() -> u64 {
     static AFTER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *AFTER.get_or_init(|| {
@@ -5090,20 +5151,45 @@ async fn drain_with_handoff(
                 }
                 return result;
             }
-            Err(_) if !tried && stats.uploads_stalled(after_ms as i64) => {
-                tried = true;
-                tracing::info!(
-                    ino,
-                    waited_ms = wait.as_millis() as u64,
-                    "no upload has completed on this node for a while: handing the drain's chunks to a peer"
-                );
-                if let Some(hashes) = handoff.hand_off(ino).await {
-                    return handed_off(hashes).await;
+            Err(_) if !tried => match handoff_recheck(&stats, after) {
+                None => {
+                    tried = true;
+                    tracing::info!(
+                        ino,
+                        waited_ms = wait.as_millis() as u64,
+                        "no upload has completed on this node for a while: handing the drain's chunks to a peer"
+                    );
+                    if let Some(hashes) = handoff.hand_off(ino).await {
+                        return handed_off(hashes).await;
+                    }
+                    wait = after;
                 }
-            }
-            Err(_) => {}
+                Some(recheck) => wait = recheck,
+            },
+            Err(_) => wait = after,
         }
-        wait = after;
+    }
+}
+
+/// A drain's handoff check: `None` when this node's S3 path is stalled
+/// (hand the chunks off now), else how long to wait before looking again.
+/// The drain's own first request goes out a little after the drain
+/// starts, so at the drain's first check (`after` in) it has not waited
+/// `after` yet: look again when it will have, not a whole `after` later
+/// (which doubled the handoff time under a fresh black hole). Nothing
+/// asked of S3: the full `after`.
+fn handoff_recheck(
+    stats: &crate::upload::UploadRuntime,
+    after: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let after_ms = after.as_millis() as i64;
+    match stats.uploads_stall_in(now_unix_ms(), after_ms) {
+        Some(0) => None,
+        Some(ms) => Some(
+            std::time::Duration::from_millis(ms as u64)
+                .clamp(std::time::Duration::from_millis(50), after),
+        ),
+        None => Some(after),
     }
 }
 
@@ -5772,6 +5858,105 @@ impl Standalone {
 #[cfg(test)]
 mod tests {
     use super::parse_u64_zero_ok;
+
+    /// Finding 14: a lone node's authority core waited 18 s for the
+    /// metadata store's writer lock (a FUSE commit's journal write held up
+    /// by the overloaded host), asked S3 nothing meanwhile, and the own-S3
+    /// watch reported "this node's S3 path is stalled" the moment it ran
+    /// again. Silence with nothing asked is no S3 stall; a request left
+    /// waiting through a window's worth of ticks is. A stall of the daemon
+    /// itself is one (late) tick however long it lasted; a runtime whose
+    /// ticks are all late still reports a real stall, later.
+    #[test]
+    fn the_own_s3_watch_needs_a_request_left_waiting() {
+        use super::{own_s3_late_ticks, OwnS3Watch};
+        use std::time::{Duration, Instant};
+        let t0_ms = constellation_store_s3::lease::now_unix_ms();
+        let t0 = Instant::now();
+        let at = |s: f64| (t0 + Duration::from_secs_f64(s), t0_ms + (s * 1000.0) as i64);
+        let upload = std::sync::Arc::new(crate::upload::UploadRuntime::for_test(false));
+        let watch = || OwnS3Watch::new(upload.clone(), constellation_net::Peers::disabled());
+        let w = super::s3_stall_ms() as f64 / 1000.0;
+        let tick = |watch: &mut OwnS3Watch, s: f64| {
+            let (now, now_ms) = at(s);
+            watch.tick_at(now, now_ms).0
+        };
+
+        // S3 last answered 20 s ago and nothing is asked: never stalled.
+        let _path = crate::backend::s3_path_for_test(t0_ms - 20_000);
+        let mut wt = watch();
+        for s in 0..=10 {
+            assert!(!tick(&mut wt, s as f64), "nothing asked, {s} s");
+        }
+
+        // A request goes out at t0 and S3 never answers it: stalled once
+        // it has waited the window through that many ticks, not before.
+        crate::backend::s3_reset_for_test(t0_ms - 20_000);
+        let mut wt = watch();
+        let req = crate::backend::s3_request_for_test(t0_ms);
+        for s in 0..w as u64 {
+            assert!(!tick(&mut wt, s as f64), "{s} s");
+        }
+        assert!(tick(&mut wt, w), "unanswered for {w} s");
+        // Seen once, it lasts through a late tick, until S3 answers.
+        assert!(tick(&mut wt, w + 30.0));
+        drop(req);
+        assert!(!tick(&mut wt, w + 31.0), "answered");
+
+        // The daemon stalls 18 s right after a request went out; its
+        // answer is read only once the daemon runs again. The stall is
+        // one late tick: not S3's unless still unanswered a window later.
+        crate::backend::s3_reset_for_test(t0_ms - 20_000);
+        let late_before = own_s3_late_ticks();
+        let mut wt = watch();
+        assert!(!tick(&mut wt, 0.0));
+        let req = crate::backend::s3_request_for_test(t0_ms + 500);
+        assert!(!tick(&mut wt, 18.0), "the daemon's own stall");
+        assert!(own_s3_late_ticks() > late_before);
+        for s in 1..w as u64 {
+            assert!(!tick(&mut wt, 18.0 + s as f64), "{s} s after the stall");
+        }
+        assert!(tick(&mut wt, 18.0 + w), "unanswered {w} s after it");
+        drop(req);
+
+        // Every tick late (3.5 s apart), a request unanswered from t0:
+        // still reported, after a window's worth of ticks.
+        crate::backend::s3_reset_for_test(t0_ms - 20_000);
+        let mut wt = watch();
+        let _req = crate::backend::s3_request_for_test(t0_ms);
+        let n = w as u64;
+        for k in 0..n {
+            assert!(!tick(&mut wt, k as f64 * 3.5), "late tick {k}");
+        }
+        assert!(tick(&mut wt, n as f64 * 3.5), "after {n} late ticks");
+    }
+
+    /// Under a fresh black hole the drain's first upload goes out a
+    /// little after the drain started; the drain's first check (`after`
+    /// in) finds it waiting 100 ms short of the window and looks again
+    /// 100 ms later, not a whole `after` later (handoff at ~6 s, not ~12 s).
+    #[test]
+    fn a_drain_rechecks_when_its_first_upload_has_waited_the_window() {
+        use std::time::Duration;
+        let after = Duration::from_millis(6_000);
+        let now = constellation_store_s3::lease::now_unix_ms();
+        let _path = crate::backend::s3_path_for_test(now - 60_000);
+        let upload = crate::upload::UploadRuntime::for_test(false);
+        // Nothing asked: the full `after`.
+        assert_eq!(super::handoff_recheck(&upload, after), Some(after));
+        // The drain started 6 s ago, its first PUT 100 ms after that.
+        let put = crate::backend::s3_request_for_test(now - 5_900);
+        let recheck = super::handoff_recheck(&upload, after).expect("not stalled yet");
+        assert!(
+            recheck <= Duration::from_millis(150) && recheck >= Duration::from_millis(50),
+            "{recheck:?}"
+        );
+        drop(put);
+        // A PUT unanswered for the whole window: hand off now.
+        crate::backend::s3_reset_for_test(now - 60_000);
+        let _put = crate::backend::s3_request_for_test(now - 6_100);
+        assert_eq!(super::handoff_recheck(&upload, after), None);
+    }
 
     /// The holder's dismissal bookkeeping: a backup it drops (a
     /// candidate that timed out, a committed one reconfigured out) is

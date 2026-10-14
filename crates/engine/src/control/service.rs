@@ -656,6 +656,7 @@ impl EngineControl {
                 forwards: stats.s3_less_forwards,
                 deadlines: stats.s3_less_deadlines,
                 readopted_for_forward: stats.readopt_for_forward,
+                late_ticks: crate::authority_driver::own_s3_late_ticks(),
             },
             inbox: crate::inbox::status(
                 crate::inbox::inbox_enabled(),

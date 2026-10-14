@@ -693,9 +693,13 @@ pub struct S3RequestStatus {
     /// or an error of the request itself (not found, a failed
     /// precondition), which proves the path works as well.
     pub last_answered_unix_ms: i64,
-    /// When a request last went unanswered (unix ms; 0: never), and why.
+    /// When a request last went unanswered (unix ms; 0: never), and why
+    /// (a request its caller gave up before an answer counts).
     pub last_unanswered_unix_ms: i64,
     pub last_unanswered_error: Option<String>,
+    /// Requests waiting on S3 now, and how long the oldest has waited.
+    pub outstanding: u64,
+    pub oldest_outstanding_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -1461,7 +1465,7 @@ pub struct FencedOwnerStatus {
 
 /// EC2 campaign 8 A-1: this node's own S3 path. While it is stalled (no
 /// S3 request of this node completed for `CONSTELLATION_S3_STALL_MS`,
-/// default 6 s) client ops keep forwarding over P2P rather than waiting
+/// default 6 s, while one of them waited that long) client ops keep forwarding over P2P rather than waiting
 /// on a lease acquisition that needs S3, and one not answered within
 /// `CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (default 20 s) fails with `EIO`
 /// (in doubt) — unless the peers report that none of them reaches S3
@@ -1484,6 +1488,9 @@ pub struct OwnS3Status {
     /// Forwards this node answered `Held` while re-adopting the lease a
     /// previous incarnation of it left behind.
     pub readopted_for_forward: u64,
+    /// Ticks of the own-S3 watch that came 3 s or more late: the daemon
+    /// itself was held up (finding 14), which is not counted as S3's.
+    pub late_ticks: u64,
 }
 
 /// Plan 30 §M7: the direct log stream.

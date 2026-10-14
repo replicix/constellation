@@ -4717,7 +4717,7 @@
       "type": "object"
     },
     "OwnS3Status": {
-      "description": "EC2 campaign 8 A-1: this node's own S3 path. While it is stalled (no\nS3 request of this node completed for `CONSTELLATION_S3_STALL_MS`,\ndefault 6 s) client ops keep forwarding over P2P rather than waiting\non a lease acquisition that needs S3, and one not answered within\n`CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (default 20 s) fails with `EIO`\n(in doubt) — unless the peers report that none of them reaches S3\neither (a bucket outage, served by the continuation epoch).",
+      "description": "EC2 campaign 8 A-1: this node's own S3 path. While it is stalled (no\nS3 request of this node completed for `CONSTELLATION_S3_STALL_MS`,\ndefault 6 s, while one of them waited that long) client ops keep forwarding over P2P rather than waiting\non a lease acquisition that needs S3, and one not answered within\n`CONSTELLATION_S3_LESS_OP_DEADLINE_MS` (default 20 s) fails with `EIO`\n(in doubt) — unless the peers report that none of them reaches S3\neither (a bucket outage, served by the continuation epoch).",
       "properties": {
         "deadlines": {
           "description": "Ops that failed at the bound.",
@@ -4727,6 +4727,12 @@
         },
         "forwards": {
           "description": "Ops on the lease path forwarded again.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "late_ticks": {
+          "description": "Ticks of the own-S3 watch that came 3 s or more late: the daemon\nitself was held up (finding 14), which is not counted as S3's.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4768,7 +4774,8 @@
         "retries",
         "forwards",
         "deadlines",
-        "readopted_for_forward"
+        "readopted_for_forward",
+        "late_ticks"
       ],
       "type": "object"
     },
@@ -5718,11 +5725,25 @@
           ]
         },
         "last_unanswered_unix_ms": {
-          "description": "When a request last went unanswered (unix ms; 0: never), and why.",
+          "description": "When a request last went unanswered (unix ms; 0: never), and why\n(a request its caller gave up before an answer counts).",
           "format": "int64",
           "type": "integer"
         },
         "list": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "oldest_outstanding_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outstanding": {
+          "description": "Requests waiting on S3 now, and how long the oldest has waited.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -5749,7 +5770,8 @@
         "by_area",
         "unanswered",
         "last_answered_unix_ms",
-        "last_unanswered_unix_ms"
+        "last_unanswered_unix_ms",
+        "outstanding"
       ],
       "type": "object"
     },
