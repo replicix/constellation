@@ -1189,9 +1189,10 @@ Decide before the executor starts:
   backwards compatibility; the project is WIP. (Since R3b's handoff change
   makes that upgrade a remount, the paused-listing error can only occur if
   the cookie change were ever deployed without it.)
-- **Pin caps** (§4.9): defaults 128 MiB per directory and 512 MiB per node,
-  each open stream's last page always pinned. Acceptable, or different
-  bounds?
+- **Resolved — pin caps** (§4.9): defaults 128 MiB per directory and
+  512 MiB per node, each open stream's last page always pinned. Accepted
+  by the maintainer; both are settings and can be tuned after R8's
+  measurements.
 - **Resolved — cookie key source** (§4.9): derived, never rotated — under
   E2E from the master key, otherwise from `gossip_secret`, each with its
   own label (`readdir-cookie-v1`); no UUID fallback: a filesystem without a
@@ -1199,9 +1200,11 @@ Decide before the executor starts:
   backwards compatibility).
 - **Resolved — `lookup`'s session wait drift**: the M6 table
   (`PROGRESS.md:11216`) says `lookup` waits `Dentry` then `Ino(child)`; the
-  code waited `Dentry` only. Fixed separately: `lookup` now waits
-  `Ino(child)` as `getattr` does (commit to follow); plus entries wait the
-  same (§4.5).
+  code waited `Dentry` only. Fixed separately (5e15078): `lookup` now
+  waits `Ino(child)` as `getattr` does; plus entries wait the same (§4.5).
+  Skipping the second wait when the dentry's wait was already satisfied
+  was considered and declined by the maintainer (about a microsecond per
+  positive lookup that misses the kernel cache; not worth the code).
 
 Open, decided by measurement or later:
 
