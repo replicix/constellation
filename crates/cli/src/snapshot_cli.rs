@@ -1009,7 +1009,7 @@ mod tests {
         held_csi.refer_bytes = Some(4_402_341_478);
         let mut held_user = row("/projects", "keep", 2, 1_790_603_700_000);
         held_user.held = true;
-        held_user.held_by = Some("user:attila".into());
+        held_user.held_by = Some("user:alicia".into());
         let mut held_plain = row("/projects", "plain", 4, 1_790_603_800_000);
         held_plain.held = true;
         let mut auto = row("/projects", "auto-1", 1, 1_790_600_000_000);

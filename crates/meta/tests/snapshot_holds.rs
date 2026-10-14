@@ -111,7 +111,7 @@ fn a_journal_with_the_old_create_variant_still_replays() {
         LogRecord::SnapHold {
             id: "new".into(),
             held: true,
-            by: Some("user:attila".into()),
+            by: Some("user:alicia".into()),
         },
         // …and one for a snapshot that does not exist here at all: a
         // no-op, never an error (the delete won the log order).
@@ -136,7 +136,7 @@ fn a_journal_with_the_old_create_variant_still_replays() {
     assert_eq!(new.creator, 3);
     assert_eq!(new.refer_bytes, Some(4096));
     assert!(new.held);
-    assert_eq!(new.owner(), Some("user:attila"));
+    assert_eq!(new.owner(), Some("user:alicia"));
 }
 
 /// A row claiming an owner but no hold cannot exist: it is stored — and
@@ -147,7 +147,7 @@ fn an_owner_without_a_hold_is_normalized_away() {
     let writer = Meta::open_in_memory().unwrap();
     let follower = Meta::open_in_memory().unwrap();
     let mut row = SnapshotRow::new("id0", "/", "s", "h", 1);
-    row.held_by = Some("user:attila".into());
+    row.held_by = Some("user:alicia".into());
     writer.record_snapshot(&row).unwrap();
     let stored = snapshot_rows(&writer).remove(0);
     assert!(!stored.held);
@@ -213,8 +213,8 @@ fn the_owner_rule_is_part_of_the_hold_transaction() {
     // Taking it over, and releasing it as somebody else, are both refused,
     // and the refusal names the recorded owner.
     for (held, by) in [
-        (true, Some("user:attila")),
-        (false, Some("user:attila")),
+        (true, Some("user:alicia")),
+        (false, Some("user:alicia")),
         (false, None),
     ] {
         let error = meta
@@ -236,10 +236,10 @@ fn the_owner_rule_is_part_of_the_hold_transaction() {
         .unwrap();
     assert_eq!(row.owner(), Some("csi:x"));
     let row = meta
-        .set_snapshot_hold("id0", true, Some("user:attila"), true)
+        .set_snapshot_hold("id0", true, Some("user:alicia"), true)
         .unwrap()
         .unwrap();
-    assert_eq!(row.owner(), Some("user:attila"));
+    assert_eq!(row.owner(), Some("user:alicia"));
     let row = meta
         .set_snapshot_hold("id0", false, None, true)
         .unwrap()

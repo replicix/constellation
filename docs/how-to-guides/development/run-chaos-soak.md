@@ -29,7 +29,7 @@ Use the node's reachable IP in the coordinator's `--workers` list
 
 ```bash
 chaos run \
-  --workers 10.108.0.70:7400,10.108.0.11:7400 \
+  --workers <worker-a>:7400,<worker-b>:7400 \
   --profile soak \
   --duration 4h \
   --seed 42 \

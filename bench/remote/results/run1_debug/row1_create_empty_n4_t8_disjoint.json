@@ -6,33 +6,33 @@
   "errors_sample": [
     {
       "op": "create",
-      "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0",
+      "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0",
       "errno": 17,
-      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0'"
+      "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0'"
     },
     {
       "op": "create",
-      "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1",
+      "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1",
       "errno": 17,
-      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1'"
+      "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1'"
     },
     {
       "op": "create",
-      "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2",
+      "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2",
       "errno": 17,
-      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2'"
+      "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2'"
     },
     {
       "op": "create",
-      "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3",
+      "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3",
       "errno": 17,
-      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3'"
+      "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3'"
     },
     {
       "op": "create",
-      "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4",
+      "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4",
       "errno": 17,
-      "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4'"
+      "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4'"
     }
   ],
   "per_node": {
@@ -89,303 +89,303 @@
       "errors": [
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-1'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-2'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-3'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-4'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-5",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-5",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-5'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-5'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-1",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-1",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-1'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-1'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-1",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-1",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-1'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-1'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-2",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-2",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-2'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-2'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-1",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-1",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-1'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-1'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-1",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-1",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-1'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-1'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-6",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-6",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-6'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-6'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-2",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-2",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-2'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-2'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-7",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-7",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-7'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-7'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-2",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-2",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-2'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-2'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-3",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-3",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-3'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-3'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-3",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-3",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-3'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-3'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-4",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-4",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-4'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-4'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-3",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-3",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-3'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-3'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-4",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-4",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-4'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-4'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-4",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-4",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-4'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-4'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-5",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-5",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-5'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-5'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-5",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-5",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-5'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-5'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-2",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-2",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-2'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t1/nd-1-2'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-5",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-5",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-5'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-5'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-6",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-6",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-6'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-6'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-8",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-8",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-8'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-8'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-9",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-9",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-9'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-9'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-1",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-1",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-1'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-1'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-1",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-1",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-1'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-1'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-6",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-6",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-6'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-6'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-7",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-7",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-7'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-7'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-6",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-6",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-6'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-6'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-10",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-10",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-10'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-10'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-7",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-7",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-7'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t4/nd-4-7'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-2",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-2",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-2'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-2'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t7/nd-7-0",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t7/nd-7-0",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t7/nd-7-0'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t7/nd-7-0'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-2",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-2",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-2'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t5/nd-5-2'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-7",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-7",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-7'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-7'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-8",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-8",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-8'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t2/nd-2-8'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-8",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-8",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-8'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-8'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-11",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-11",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-11'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t0/nd-0-11'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-9",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-9",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-9'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t3/nd-3-9'"
         },
         {
           "op": "create",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-3",
+          "path": "$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-3",
           "errno": 17,
-          "msg": "[Errno 17] File exists: '/home/ubuntu/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-3'"
+          "msg": "[Errno 17] File exists: '$HOME/cbench/mnt/bench-plain/create-disjoint-n4/t6/nd-6-3'"
         }
       ],
       "mode": "create_empty",

@@ -6,7 +6,7 @@
   "errors_sample": [
     {
       "op": "small_write",
-      "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-back/sw-na-7-0",
+      "path": "$HOME/cbench/mnt/bench-plain/sw-shared-n1-back/sw-na-7-0",
       "errno": 28,
       "msg": "[Errno 28] No space left on device"
     }
@@ -20,7 +20,7 @@
       "errors": [
         {
           "op": "small_write",
-          "path": "/home/ubuntu/cbench/mnt/bench-plain/sw-shared-n1-back/sw-na-7-0",
+          "path": "$HOME/cbench/mnt/bench-plain/sw-shared-n1-back/sw-na-7-0",
           "errno": 28,
           "msg": "[Errno 28] No space left on device"
         }

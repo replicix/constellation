@@ -171,7 +171,7 @@ fn every_mutating_api_dirties_the_keys_it_changes() {
         meta.set_snapshot_hold(
             &constellation_meta::snapshot_id("/", "s"),
             true,
-            Some("user:attila"),
+            Some("user:alicia"),
             false,
         )
         .unwrap()

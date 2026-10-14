@@ -3660,12 +3660,12 @@ mod tests {
         );
         // `held_by` alone is still a hold, and so is nothing at all not.
         let owner_only: SnapshotCreateParams = serde_json::from_value(serde_json::json!({
-            "selector": "/vol@pvc-1", "held_by": "user:attila"
+            "selector": "/vol@pvc-1", "held_by": "user:alicia"
         }))
         .unwrap();
         assert_eq!(
             owner_only.hold_request().unwrap(),
-            (true, Some("user:attila"))
+            (true, Some("user:alicia"))
         );
         let plain: SnapshotCreateParams =
             serde_json::from_value(serde_json::json!({"selector": "/vol@pvc-1"})).unwrap();

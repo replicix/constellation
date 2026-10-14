@@ -20,3 +20,7 @@ mount.sh
 umount.sh
 TODO.md
 local.mk
+# bench/remote: fleet hosts, ssh user and bucket (see bench/remote/README.md)
+/bench/remote/workers.local.toml
+__pycache__/
+*.pyc

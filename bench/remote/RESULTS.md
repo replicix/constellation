@@ -4,7 +4,7 @@ Run: `constellation-verify-20260922T154127Z-bench`, binary rev `a850019`
 (`constellation --version` reports `01abaad-dirty` — matches the shipped
 binary on all 4 hosts, consistent with `bin/REV`; not rebuilt).
 Fleet: 4x EC2 (Ubuntu 24.04, 8 vCPU/20GiB, ~0.5ms RTT), plain FS
-`bench-plain` at `s3://attila-test-.../constellation-verify-20260922T154127Z-bench`.
+`bench-plain` at `s3://<bucket>/constellation-verify-20260922T154127Z-bench`.
 Raw JSON: `bench/remote/results/run1/*.json`. Driver: `phase_a.py` (see
 `README.md` for how to re-run).
 

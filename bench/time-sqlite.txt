@@ -1,4 +1,4 @@
-	Command being timed: "/tmp/cursor-sandbox-cache/c3d4495fdbf607bd38da2d34c2e89db0/cargo-target/release/dbbench sqlite /home/bra/cvs/constellation/bench/data-sqlite"
+	Command being timed: "target/release/dbbench sqlite bench/data-sqlite"
 	User time (seconds): 29.20
 	System time (seconds): 206.62
 	Percent of CPU this job got: 63%

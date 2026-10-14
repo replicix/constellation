@@ -17,7 +17,55 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-SSH_USER = "ubuntu"
+
+def _load_local_config() -> dict:
+    """Optional untracked `workers.local.toml` next to this file (listed in
+    .gitignore); environment variables take precedence over it. See
+    README.md ("Configuring the fleet")."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workers.local.toml")
+    if not os.path.exists(path):
+        return {}
+    import tomllib  # python >= 3.11, only needed when the file exists
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+_LOCAL = _load_local_config()
+
+
+def _setting(env_name: str, key: str, default: Optional[str] = None) -> Optional[str]:
+    """Scalar setting: environment first, then workers.local.toml."""
+    v = os.environ.get(env_name)
+    if v:
+        return v
+    v = _LOCAL.get(key)
+    return str(v) if v else default
+
+
+def _require(env_name: str, key: str) -> str:
+    v = _setting(env_name, key)
+    if not v:
+        sys.exit(
+            f"missing benchmark configuration: set ${env_name} or `{key}` in "
+            "bench/remote/workers.local.toml (see bench/remote/README.md)"
+        )
+    return v
+
+
+def _parse_workers(spec: str) -> dict:
+    hosts = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, sep, host = item.partition("=")
+        if not sep or not name.strip() or not host.strip():
+            sys.exit(f"bad worker entry {item!r}: expected NAME=HOST")
+        hosts[name.strip()] = host.strip()
+    return hosts
+
+
+SSH_USER = _require("CONSTELLATION_BENCH_SSH_USER", "ssh_user")
 SSH_OPTS = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=10",
@@ -26,24 +74,35 @@ SSH_OPTS = [
     "-o", "StrictHostKeyChecking=accept-new",
 ]
 
-# Fixed fleet. Keys are short node names used throughout results/logs.
-HOSTS = {
-    "a": "10.108.0.70",     # us-west-2a
-    "b": "10.108.11.148",   # us-west-2b
-    "c": "10.108.18.174",   # us-west-2c
-    "d": "10.108.6.98",     # us-west-2a
-}
+# Fixed fleet, one entry per node. Keys are short node names used
+# throughout results/logs; the addresses come from the environment
+# (CONSTELLATION_BENCH_WORKERS="a=HOST,b=HOST,...") or from the untracked
+# workers.local.toml -- never from this file. Nodes may sit in different
+# availability zones.
+_workers_env = os.environ.get("CONSTELLATION_BENCH_WORKERS")
+if _workers_env:
+    HOSTS = _parse_workers(_workers_env)
+else:
+    HOSTS = {str(k): str(v) for k, v in _LOCAL.get("workers", {}).items()}
+if not HOSTS:
+    sys.exit(
+        "no benchmark workers configured: set $CONSTELLATION_BENCH_WORKERS "
+        "or a [workers] table in bench/remote/workers.local.toml "
+        "(see bench/remote/README.md)"
+    )
 NODE_NAMES = list(HOSTS.keys())
 
-BUCKET = "attila-test-211125321544-us-west-2-an"
-AWS_REGION = "us-west-2"
+# S3 bucket the benchmark filesystems live in, and its region.
+BUCKET = _require("CONSTELLATION_BENCH_BUCKET", "bucket")
+AWS_REGION = _setting("CONSTELLATION_BENCH_REGION", "region", "us-west-2")
 
 REMOTE_BIN = "/usr/local/bin/constellation"
-# Root fs *is* the 100GB NVMe (no separate /mnt volume on these hosts), and
-# ubuntu has no sudo-free write access under /mnt -- keep everything under
-# the home dir instead.
-REMOTE_STATE_ROOT = "/home/ubuntu/cbench"
-REMOTE_MOUNT_ROOT = "/home/ubuntu/cbench/mnt"
+# Root fs *is* the NVMe (no separate /mnt volume on these hosts), and the
+# ssh user has no sudo-free write access under /mnt -- keep everything
+# under the home dir instead.
+REMOTE_HOME = f"/home/{SSH_USER}"
+REMOTE_STATE_ROOT = f"{REMOTE_HOME}/cbench"
+REMOTE_MOUNT_ROOT = f"{REMOTE_STATE_ROOT}/mnt"
 
 
 @dataclass
@@ -62,7 +121,7 @@ class RunResult:
 def _ip(node: str) -> str:
     if node in HOSTS:
         return HOSTS[node]
-    return node  # allow passing a raw IP
+    return node  # allow passing a raw host name or address
 
 
 def ssh_run(node: str, remote_cmd: str, timeout: float = 30, env: Optional[dict] = None) -> RunResult:
@@ -210,7 +269,7 @@ def state_dir_for(name: str) -> str:
     --state-dir for named mounts: it would make that dir the name's state
     dir in the registry, refused once the name's current one is in use;
     the default keeps every node's layout the same)."""
-    return f"/home/{SSH_USER}/.local/share/constellation/{name}"
+    return f"{REMOTE_HOME}/.local/share/constellation/{name}"
 
 
 def mount_point_for(name: str) -> str:
@@ -379,14 +438,14 @@ def collect_status(node: str, name: str, out_dir: str) -> str:
 # worker (bench_worker.py) fan-out
 # ---------------------------------------------------------------------------
 
-REMOTE_WORKER_PATH = "/home/ubuntu/cbench/bench_worker.py"
+REMOTE_WORKER_PATH = f"{REMOTE_STATE_ROOT}/bench_worker.py"
 
 
 def deploy_worker(nodes, local_worker_path: str, timeout: float = 60) -> dict:
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as ex:
         def do(n):
-            ssh_run(n, "mkdir -p /home/ubuntu/cbench", timeout=15)
+            ssh_run(n, f"mkdir -p {REMOTE_STATE_ROOT}", timeout=15)
             return scp_to(n, local_worker_path, REMOTE_WORKER_PATH, timeout=timeout)
         futs = {ex.submit(do, n): n for n in nodes}
         for fut in concurrent.futures.as_completed(futs):

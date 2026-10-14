@@ -655,7 +655,7 @@ mod tests {
     fn mountinfo_lines_yield_the_device_type_source_and_unescaped_mountpoint() {
         let text = "\
 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
-1207 30 0:48 / /home/ubuntu/cbench/mnt6/c6daws rw,nosuid,nodev,relatime - fuse c6daws rw,user_id=1000,group_id=1000,default_permissions
+1207 30 0:48 / /mnt/cbench/mnt6/c6daws rw,nosuid,nodev,relatime - fuse c6daws rw,user_id=1000,group_id=1000,default_permissions
 1208 30 0:49 / /tmp/with\\040space rw - fuse my\\011fs rw
 garbage line without the separator
 ";
@@ -670,7 +670,7 @@ garbage line without the separator
                     device: Some(Rdev::new(98, 0)),
                 },
                 MountEntry {
-                    mountpoint: PathBuf::from("/home/ubuntu/cbench/mnt6/c6daws"),
+                    mountpoint: PathBuf::from("/mnt/cbench/mnt6/c6daws"),
                     fstype: "fuse".into(),
                     source: "c6daws".into(),
                     device: Some(Rdev::new(0, 48)),

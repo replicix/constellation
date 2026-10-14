@@ -329,7 +329,7 @@ of change, not a full request trace, which `LogTail`/`node.logs.tail`
 already covers):
 
 ```json
-{"ts":"2026-09-28T21:00:00.123Z","seq":4821,"principal":{"kind":"unix_user","uid":1000,"name":"bra"},"role":"admin","transport":"unix_socket","method":"fs.registry.create","params_digest":"blake3:9f2a7c…","outcome":"ok","latency_ms":42}
+{"ts":"2026-09-28T21:00:00.123Z","seq":4821,"principal":{"kind":"unix_user","uid":1000,"name":"alice"},"role":"admin","transport":"unix_socket","method":"fs.registry.create","params_digest":"blake3:9f2a7c…","outcome":"ok","latency_ms":42}
 ```
 
 - `params_digest` is a BLAKE3 hash of the canonical (sorted-key) JSON

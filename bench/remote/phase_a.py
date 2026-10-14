@@ -60,7 +60,7 @@ def run_row(nodes, name, mode, extra_args_per_node=None, extra_args="", out_suff
     """Run bench_worker `mode` on every node in `nodes` concurrently with a
     wall-clock barrier, fetch+aggregate results."""
     start_at = time.time() + BARRIER_DELAY
-    out_paths = {n: f"/home/ubuntu/cbench/out-{mode}{out_suffix}-{n}.json" for n in nodes}
+    out_paths = {n: f"{c.REMOTE_STATE_ROOT}/out-{mode}{out_suffix}-{n}.json" for n in nodes}
     results = {}
     import concurrent.futures
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as ex:
@@ -209,7 +209,7 @@ def row6_visibility(nodes, name=PLAIN_NAME, count=210):
     writer = nodes[0]
     pollers = nodes[1:]
     d = c.mount_point_for(name) + "/vis"
-    wout = f"/home/ubuntu/cbench/out-vis-writer.json"
+    wout = f"{c.REMOTE_STATE_ROOT}/out-vis-writer.json"
     wr_extra = f"--dir {d} --count {count} --interval 0.05"
     # Writer runs to completion first (events file is on ITS local disk,
     # not the shared mount -- pollers on other hosts can't read it directly,
@@ -223,7 +223,7 @@ def row6_visibility(nodes, name=PLAIN_NAME, count=210):
     with open(local_events, "w") as f:
         json.dump(wev, f)
     for n in pollers:
-        pr = c.scp_to(n, local_events, "/home/ubuntu/cbench/vis_events_in.json", timeout=30)
+        pr = c.scp_to(n, local_events, f"{c.REMOTE_STATE_ROOT}/vis_events_in.json", timeout=30)
         if not pr.ok():
             log(f"  scp events to {n} failed: {pr.stderr}")
 
@@ -233,9 +233,9 @@ def row6_visibility(nodes, name=PLAIN_NAME, count=210):
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(pollers)) as ex:
         futs = {}
         for n in pollers:
-            pout = f"/home/ubuntu/cbench/out-vis-poll-{n}.json"
+            pout = f"{c.REMOTE_STATE_ROOT}/out-vis-poll-{n}.json"
             pout_paths[n] = pout
-            pextra = f"--dir {d} --events-file /home/ubuntu/cbench/vis_events_in.json --poll-timeout 30"
+            pextra = f"--dir {d} --events-file {c.REMOTE_STATE_ROOT}/vis_events_in.json --poll-timeout 30"
             futs[ex.submit(c.run_worker, n, "visibility_poll", name, start_at2, pout, pextra, 120)] = n
         for fut in concurrent.futures.as_completed(futs):
             n = futs[fut]
@@ -332,7 +332,7 @@ def row7_untar(nodes):
     label = f"row7_untar_n{len(nodes)}"
     log(f"=== {label} ===")
     tarball_url = os.environ.get("TARBALL_URL", "https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.gz")
-    tarball_local = "/home/ubuntu/cbench/src.tar.gz"
+    tarball_local = f"{c.REMOTE_STATE_ROOT}/src.tar.gz"
     dl = c.ssh_fanout(nodes, f"[ -f {tarball_local} ] || curl -fsSL {tarball_url} -o {tarball_local}", timeout=120)
     for n, r in dl.items():
         log(f"  download {n}: rc={r.returncode} err={r.stderr[-200:]!r}")

@@ -674,7 +674,7 @@ constellation snapshot sched status | run [--dry-run]
 
 **`snapshot hold --by <owner>`** sets `held_by` (Step 0.4); omitting
 `--by` leaves it empty, matching today's behavior exactly. `--by` takes
-a bare namespace-prefixed string (`user:attila`, `csi:<uid>`) and is
+a bare namespace-prefixed string (`user:alicia`, `csi:<uid>`) and is
 otherwise unvalidated — this plan does not enforce who may use which
 prefix (that is a plan-33 authorization question: a `kind = "service"`
 principal, plan 33's own mechanism for the CSI driver, is what actually

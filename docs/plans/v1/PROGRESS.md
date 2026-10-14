@@ -5410,7 +5410,7 @@ bugs found and fixed, and the bloom-vs-exact numbers.
 
 ### Plan 30 M15 — tester gate run
 
-Worktree `/home/bra/cvs/constellation-m15`, branch `plan30-m15`, on top
+Worktree `constellation-m15`, branch `plan30-m15`, on top
 of main `5e18214`. All gates below are green after two local fixes (one
 in product code, one in the new harness scenario); neither needed a
 design change.
@@ -6121,7 +6121,7 @@ compiled or run (the coder brief forbade it).
 
 ## Plan 30 M4 — tester gate run
 
-Worktree `/home/bra/cvs/constellation-p30`, branch `plan30-m4`, on top of
+Worktree `constellation-p30`, branch `plan30-m4`, on top of
 main `5e18214`. All gates below were run in the order CONVENTIONS.md
 gives; every harness command used `CONSTELLATION_HARNESS_DOCKER_PREFIX=
 constellation-harness-p30` and `CONSTELLATION_BIN=<worktree>/target/
@@ -6587,7 +6587,7 @@ Decisions:
 
 ## Plan 30 M4 — tester gate run, round 2
 
-Same worktree (`/home/bra/cvs/constellation-p30`, branch `plan30-m4`),
+Same worktree (`constellation-p30`, branch `plan30-m4`),
 rebased by the coordinator onto main `b325f4d` (M3b + M15). No coder-round
 findings from round 1 needed a re-fix this round — round 2's diff already
 addressed all three items round 1 flagged (the write4k regression, the
@@ -6670,7 +6670,7 @@ untouched).
 ### Perf A/B — the decisive check
 
 Built a baseline binary from main `b325f4d` (M3b + M15, no M4 diff) in a
-separate detached worktree (`git -C /home/bra/cvs/constellation worktree
+separate detached worktree (`git -C constellation worktree
 add --detach <scratchpad>/m4-baseline main`), its own `CARGO_TARGET_DIR`.
 Removed the worktree and its target dir after measuring.
 
@@ -7307,7 +7307,7 @@ pre-existing "must pass" scenarios that now fail without
 flagged). Both need a coordinator/coder decision; see "Needs a design
 decision" at the end.**
 
-Worked in `/home/bra/cvs/constellation-m13`, branch `plan30-m13`, on top
+Worked in `constellation-m13`, branch `plan30-m13`, on top
 of `5e18214`. `stash@{0}` (m13-p1) left untouched. Nothing committed.
 
 ### Gate 1 — `cargo build --workspace --all-targets`: PASS after 4 fixes
@@ -7433,7 +7433,7 @@ Clean release build, ~1m12s.
 ### Gate 6 — harness
 
 Docker prefix `constellation-harness-m13`,
-`CONSTELLATION_BIN=/home/bra/cvs/constellation-m13/target/release/constellation`,
+`CONSTELLATION_BIN=constellation-m13/target/release/constellation`,
 every run under `timeout`. No stray processes from other worktrees were
 touched; `pkill`/`pgrep -f` with my own command-line pattern was never
 used.
@@ -10058,12 +10058,12 @@ final batch):
 
 ## Plan 30 M5 — tester gate run
 
-Worktree `/home/bra/cvs/constellation-m5`, branch `plan30-m5`, uncommitted
+Worktree `constellation-m5`, branch `plan30-m5`, uncommitted
 on main 296749d. All commands via
 `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m5` /
 `CONSTELLATION_BIN=.../constellation-m5/target/release/constellation`,
 foreground with explicit timeouts. Main-binary A/Bs used the paired
-296749d build at `/home/bra/cvs/constellation-m13/target/release/{constellation,harness}`
+296749d build at `constellation-m13/target/release/{constellation,harness}`
 under `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m13base`.
 No mechanical fixes were needed anywhere in the gates below — the tree
 built, formatted and linted clean as handed off.
@@ -10102,7 +10102,7 @@ matches the coder's session). No failing seed to report.
 - `tests/integration.sh` (real S3 API): the worktree's own
   `docker compose up -d --wait floci` could not bind — port 4566 was
   already held by `constellation-floci-1`, a container belonging to
-  compose project `constellation` (`/home/bra/cvs/constellation`, a
+  compose project `constellation` (the main checkout, a
   different, apparently-active session). Per the "never touch another
   worktree's processes" rule this container was left alone; the smoke
   test was instead run directly against it (`s3://constellation-ci/run-m5-<ts>`,
@@ -10361,8 +10361,8 @@ merge.
 
 ## Plan 30 M5 — round 3 (coder, 2026-09-24): the tester's three regressions
 
-Worktree `/home/bra/cvs/constellation-m5`, uncommitted on main 296749d;
-A/Bs against the main build at `/home/bra/cvs/constellation-m13`. All
+Worktree `constellation-m5`, uncommitted on main 296749d;
+A/Bs against the main build at `constellation-m13`. All
 three regressions traced to root causes with kept debug logs
 (`CHAOS_KEEP_TMP=1 RUST_LOG=info,constellation=debug,constellation_authority=debug`,
 plus a new `constellation::authority_driver=trace` line per core step:
@@ -10660,7 +10660,7 @@ from M2, noted here rather than changed.
 
 Re-test after round 3 (main 72ddb91, the vendored fjall shutdown-deadlock
 fix) and, mid-session, round 4 (the inbox-batch-withdraw fix). Same
-worktree/rules as round 1; A/Bs against `/home/bra/cvs/constellation-m13/target/release/{constellation,harness}`
+worktree/rules as round 1; A/Bs against `constellation-m13/target/release/{constellation,harness}`
 (pre-M5, now older than main but still the agreed behaviour baseline).
 No mechanical fixes needed. **Results below are from the round-4 build**
 except where marked "round-3 build" (superseded, kept for the record
@@ -10706,7 +10706,7 @@ range did not have** (round 1 was 3000/3000 clean here):
    12`, then `seq: 16`) while the seed itself failed every time — worth
    the coder knowing the witness the checker reports isn't stable even
    though the verdict is. Full history dumps in
-   `/tmp/claude-1000/.../scratchpad/r2_seed12666_full.log` and inline
+   `<scratchpad>/r2_seed12666_full.log` and inline
    in `r2_long_random_resume1.log`. Replay:
    `AUTHORITY_SIM_SEED=12666 AUTHORITY_SIM_CONFIG=long cargo test -p
    constellation-authority --release --test sim replay_seed --
@@ -11657,10 +11657,10 @@ through `KeySet::from_op`.
 
 ## Plan 30 M6 — tester gate run
 
-Worktree `/home/bra/cvs/constellation-m6`, branch `plan30-m6`, uncommitted
+Worktree `constellation-m6`, branch `plan30-m6`, uncommitted
 on main 617499b (the rebase-onto-M5 state above). Every harness command
 used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m6` /
-`CONSTELLATION_BIN=/home/bra/cvs/constellation-m6/target/release/constellation`,
+`CONSTELLATION_BIN=constellation-m6/target/release/constellation`,
 foreground with explicit timeouts. Baseline A/Bs used a fresh detached
 worktree at main `617499b` (`git worktree add --detach
 <scratchpad>/m6-baseline-617499b 617499b`), its own release build, under
@@ -11827,7 +11827,7 @@ changes.
   4 read-heavy `harness bench` metrics; the host's shared load (7–26
   throughout) made several individual data points noisy, documented per
   row rather than smoothed over.
-- No commits made; `git status` on `/home/bra/cvs/constellation-m6` is
+- No commits made; `git status` on `constellation-m6` is
   unchanged from what the coder handed off (same modified/untracked file
   list as the "rebase onto M5" section above).
 
@@ -12445,7 +12445,7 @@ Verified: the sim suite, 24 tests green; `long_random` seeds
 
 ## Plan 30 M7 — tester gate run (2026-09-24)
 
-Worktree `/home/bra/cvs/constellation-m7`, branch `plan30-m7`, uncommitted
+Worktree `constellation-m7`, branch `plan30-m7`, uncommitted
 on top of main 92c4078 (post M5+M6 rebase). Baseline: a detached worktree
 at main 92c4078 built once (`target/release/{constellation,harness}`),
 used for every A/B below, removed with `git worktree remove --force` at
@@ -12483,7 +12483,7 @@ the end. Harness prefix `constellation-harness-m7`. Every gate below
 
 ### Gate 4 — harness
 
-Binaries: `CONSTELLATION_BIN=/home/bra/cvs/constellation-m7/target/release/constellation`,
+Binaries: `CONSTELLATION_BIN=constellation-m7/target/release/constellation`,
 `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m7`. Every
 scenario below **PASSED on the first attempt** — no reruns or main-build
 A/B were needed since nothing failed.
@@ -13071,7 +13071,7 @@ above.
 
 ## Plan 30 M8 — tester gate run (2026-09-24)
 
-Worktree `/home/bra/cvs/constellation-m8`, branch `plan30-m8`, uncommitted
+Worktree `constellation-m8`, branch `plan30-m8`, uncommitted
 on top of main 0f9583d (M5+M6+M7+the P2P-restart fix). Baseline: a
 detached worktree at main 0f9583d, built once
 (`target/release/{constellation,harness}`), used for every A/B below,
@@ -13137,7 +13137,7 @@ start of this run.
 
 ### Gate 4 — harness
 
-Binaries: `CONSTELLATION_BIN=/home/bra/cvs/constellation-m8/target/release/constellation`,
+Binaries: `CONSTELLATION_BIN=constellation-m8/target/release/constellation`,
 `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m8`.
 
 **M8's own scenarios**, all **PASSED**:
@@ -13801,7 +13801,7 @@ Changed: `crates/store-s3/src/{lease,store,lib}.rs`;
    `base`, a ReadIndex position and M9's own holder-read wait could miss
    that those keys had unshipped work. It does now.
 
-**The two safety rules from the M10 model** (`/home/bra/cvs/constellation-m10`,
+**The two safety rules from the M10 model** (`constellation-m10`,
 `crates/model/src/flex.rs`; PROGRESS.md "Plan 30 M10 — phase 1",
 "Plan 30 §M9's seal-based fast takeover against epochs", and the
 coordinator decisions). Both live where continuation epochs are decided
@@ -14018,7 +14018,7 @@ all eight PASSED, one run each, alongside the test chain:
 
 ## Plan 30 M9 — tester gate run (phase-4 boundary)
 
-Tester (Sonnet), 2026-09-24, worktree `/home/bra/cvs/constellation-m9`
+Tester (Sonnet), 2026-09-24, worktree `constellation-m9`
 (branch `plan30-m9`, base main `e0437df` + M9's uncommitted work as
 handed off). Baseline: a detached worktree of main `e0437df` built
 fresh in the scratchpad (release `constellation` + `harness`), removed
@@ -14709,7 +14709,7 @@ store-level helpers (the heartbeat object, `meta.json`'s
 `epoch_slack`, validation), and this design for phase 2. It changes no
 file in `crates/authority/**`,
 `crates/cli/src/{authority_driver,node_runtime,main,lease}.rs` or
-`crates/meta/src/store/**`. M9 is read from `/home/bra/cvs/constellation-m9`
+`crates/meta/src/store/**`. M9 is read from `constellation-m9`
 and is not merged.
 
 | Item | State | Where |
@@ -15638,10 +15638,10 @@ Section "Plan 30 M10 — phase 2", "What the tester must run", plus
 
 ## Plan 30 M10 — tester gate run
 
-Tester (Sonnet), 2026-09-24, worktree `/home/bra/cvs/constellation-m10`
+Tester (Sonnet), 2026-09-24, worktree `constellation-m10`
 (branch `plan30-m10`, uncommitted M10 work on main `0e1017b`).
 `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m10`,
-`CONSTELLATION_BIN=/home/bra/cvs/constellation-m10/target/release/constellation`.
+`CONSTELLATION_BIN=constellation-m10/target/release/constellation`.
 Host shared with other concurrent sessions throughout (uptime load average
 ranged ~5 to ~17). No mechanical fixes were needed anywhere — every gate
 passed on the first attempt.
@@ -15717,7 +15717,7 @@ counts:**
 | `node-leave` | ×3 | 43.4 s, 43.3 s, 44.6 s — all 3 PASSED |
 
 **`node-leave` on main, for comparison** (rebuilt main `0e1017b`
-release binaries in the pre-existing `/home/bra/cvs/constellation`
+release binaries in the pre-existing `constellation`
 worktree, since it needed rebuilding anyway for the perf A/B below):
 **FAILED in 56.7 s**, `B writes b/after-leave in the post-leave epoch:
 File exists (os error 17)` — the exact error the coder's "rebase onto
@@ -15767,7 +15767,7 @@ interleaved A/B against main was run instead of trusting either
 history or an un-interleaved run:
 
 - Rebuilt main `0e1017b`'s release `constellation`/`harness` binaries
-  in the pre-existing `/home/bra/cvs/constellation` worktree (stale
+  in the pre-existing `constellation` worktree (stale
   since 2026-09-22, predating this main tip) rather than a new
   worktree, since one already existed and just needed a rebuild — no
   extra worktree was created or needed deleting.
@@ -15815,7 +15815,7 @@ needed a mechanical correction.
 ### Cleanup
 
 - The main-build rebuild happened in the pre-existing
-  `/home/bra/cvs/constellation` worktree (not a new one), so nothing
+  `constellation` worktree (not a new one), so nothing
   was created there to remove.
 - `docker ps -a` showed no leftover harness containers under either
   `constellation-harness-m10` or `constellation-harness-m10ab` after
@@ -16233,9 +16233,9 @@ Phase 1 of the largest milestone: the Stateright model of delegated
 sub-sequencers over one log, the design phase 2 implements, and the pure
 helpers the core can adopt. Nothing in `crates/authority/**`,
 `crates/cli/**` or `crates/meta/src/store/**` is touched (M9 and M10 are
-rebasing through them); M9 was read from `/home/bra/cvs/constellation-m9`
+rebasing through them); M9 was read from `constellation-m9`
 (`core/backup.rs`, its PROGRESS sections) and M10 from
-`/home/bra/cvs/constellation-m10` (`model/src/flex.rs`, its phase-1 and
+`constellation-m10` (`model/src/flex.rs`, its phase-1 and
 coordinator-decision sections). Nothing is committed.
 
 | Item | State | Where |
@@ -17249,7 +17249,7 @@ under the same harness prefix.
 
 ## Plan 30 M11 — phase 2a tester gate run
 
-Ran the full tiered gate list against `/home/bra/cvs/constellation-m11`
+Ran the full tiered gate list against `constellation-m11`
 (branch `plan30-m11`, rebased onto main `b292e5c`, uncommitted). No code
 changes were needed — every gate passed mechanically. No commits made.
 
@@ -17293,7 +17293,7 @@ changes were needed — every gate passed mechanically. No commits made.
 ### Gate 4 — harness
 
 All runs used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11`
-and `CONSTELLATION_BIN=/home/bra/cvs/constellation-m11/target/release/constellation`,
+and `CONSTELLATION_BIN=constellation-m11/target/release/constellation`,
 each wrapped in `timeout`, foreground. No `/tmp/harness-*` directories were
 left behind after any batch (the harness cleans up its own on success).
 
@@ -17330,7 +17330,7 @@ left behind after any batch (the harness cleans up its own on success).
     much faster than the 48.6 s failing run, consistent with the race
     window closing before the kill in the passing runs).
   - A/B: built main `b292e5c` in a scratch detached worktree
-    (`/tmp/claude-1000/.../scratchpad/main-b292e5c`, removed after) and
+    (`<scratchpad>/main-b292e5c`, removed after) and
     ran the identical scenario there **5× — 5/5 PASSED** (9.6 s, 9.0 s,
     9.0 s, 9.1 s, 12.8 s).
   - A second batch of 5 more on the M11 build: **5/5 PASSED** (9.0, 12.8,
@@ -17373,7 +17373,7 @@ worktrees were verified untouched throughout.
 ### Gate 6 — perf, interleaved against main
 
 Built main `b292e5c` in a scratch detached worktree
-(`/tmp/claude-1000/.../scratchpad/main-b292e5c`, `cargo build --release
+(`<scratchpad>/main-b292e5c`, `cargo build --release
 -p constellation -p constellation-harness`, removed after use) and ran
 `harness meta-bench` (filtered per label via `CONSTELLATION_METABENCH_ONLY`)
 interleaved M11-then-main, 3 pairs per config, each under its own
@@ -17430,7 +17430,7 @@ None — every gate passed without needing a code change.
 
 ## Plan 30 M11 — phase 2b (coder, 2026-09-25)
 
-Worktree `/home/bra/cvs/constellation-m11b`, branch `plan30-m11b`: main
+Worktree `constellation-m11b`, branch `plan30-m11b`: main
 `b292e5c` + WIP `8655ee0` (the 2a tree, untouched) + this phase,
 uncommitted. Scope: automatic placement, designations as delegations,
 root failover with live delegates, delegate backups (`ack=s3`, M8 strict
@@ -17710,7 +17710,7 @@ recall are the existing clean configs
 
 ## Plan 30 M11 — phase 2b tester gate run
 
-Ran the full tiered gate list against `/home/bra/cvs/constellation-m11b`
+Ran the full tiered gate list against `constellation-m11b`
 (branch `plan30-m11b`, main `578ff9c` = phase 2a committed, + this
 phase's uncommitted work). No mechanical fixes were needed. No commits
 made. **Two non-mechanical, high-confidence findings below** (a
@@ -17784,10 +17784,10 @@ a deeper look.
 ### Gate 4 — harness
 
 All runs used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m11`
-and `CONSTELLATION_BIN=/home/bra/cvs/constellation-m11b/target/release/constellation`,
+and `CONSTELLATION_BIN=constellation-m11b/target/release/constellation`,
 foreground, `timeout`-wrapped. A few `/tmp/harness-*` directories seen
 during this run belonged to a **concurrent, independent session**
-building `/home/bra/cvs/constellation-m12` (`plan30-m12`) — verified via
+building `constellation-m12` (`plan30-m12`) — verified via
 `/proc/<pid>/exe` before assuming anything, per the safety rule — and
 were left untouched; nothing of mine was left behind.
 
@@ -18017,9 +18017,9 @@ failing) run on 2b for whoever is investigating it.
 
 ## Plan 30 M11 — phase 2b round 2 (coder, 2026-09-25)
 
-The tester's two findings on the 2b tree (`/home/bra/cvs/constellation-m11b`,
+The tester's two findings on the 2b tree (`constellation-m11b`,
 main `578ff9c` + the 2b changes, uncommitted), root-caused and fixed;
-the same diff is applied to the M12 tree (`/home/bra/cvs/constellation-m12`)
+the same diff is applied to the M12 tree (`constellation-m12`)
 on top of the M12 work.
 
 ### 1. `cross-subtree-rename` / `auto-placement`: `EIO` after a re-delegation
@@ -19496,7 +19496,7 @@ and 36 s wall on a 32-core host under load average 58.
 
 ## Plan 30 M12 — hot directories (coder, 2026-09-25)
 
-Worktree `/home/bra/cvs/constellation-m12`, branch `plan30-m12`: main
+Worktree `constellation-m12`, branch `plan30-m12`: main
 `578ff9c` + WIP `8744d8d` (the 2b tree, untouched) + this milestone,
 uncommitted. Closes phase 5 (scale-out core).
 
@@ -19722,7 +19722,7 @@ quiescence), `mtime_monotone`, `no_double_create`, `acked_create_stands`.
 
 ### Phase 2b round 2, ported (2026-09-25)
 
-The 2b round-2 fixes (`/home/bra/cvs/constellation-m11b`'s "Plan 30 M11
+The 2b round-2 fixes (`constellation-m11b`'s "Plan 30 M11
 — phase 2b round 2") are applied on top of the M12 work: the held-forward
 retry executing as the delegate (`deleg_retry_executed`, core test
 `a_held_forward_executes_locally_once_the_delegation_installs`), the
@@ -19739,7 +19739,7 @@ clippy `-D warnings` and fmt: green; the M11 + M12 harness batch rerun
 ## Plan 30 M12 — tester gate run (phase-5 boundary)
 
 Ran the full phase-5 gate list against the uncommitted M12 tree
-(`/home/bra/cvs/constellation-m12`, `plan30-m12` on main `d214b1c`). Baseline
+(`constellation-m12`, `plan30-m12` on main `d214b1c`). Baseline
 for every A/B was main `d214b1c` built in a scratch detached worktree
 (`git worktree add --detach <scratchpad>/main-d214b1c d214b1c`), removed after
 use. Harness runs used `CONSTELLATION_HARNESS_DOCKER_PREFIX=constellation-harness-m12`
@@ -20405,7 +20405,7 @@ backup agent; nothing changed in this tree for them.
 ## Plan 30 M12 — tester gate run, round 2 (phase-5 boundary)
 
 Re-ran the full phase-5 gate list against the round-2 M12 tree
-(`/home/bra/cvs/constellation-m12`, `plan30-m12`, now on main `2522402`,
+(`constellation-m12`, `plan30-m12`, now on main `2522402`,
 uncommitted). Baseline for every A/B was main `2522402` built in a scratch
 detached worktree (`git worktree add --detach <scratchpad>/main-2522402
 2522402`), removed after use. Same harness prefix
@@ -21423,7 +21423,7 @@ another session's compose project (the lane's mapping is fixed).
 
 ## Plan 30 M14 — tester gate run
 
-Tree `/home/bra/cvs/constellation-m14`, `plan30-m14` = main `87cfe36`
+Tree `constellation-m14`, `plan30-m14` = main `87cfe36`
 (M12, round 2 included) + the M14 diff, uncommitted (unchanged
 throughout — nothing committed). Own harness prefix
 `constellation-harness-m14tester` (`-base` for the main A/B), own
@@ -21674,7 +21674,7 @@ failure on the M14 tree.
 
 ### 1. Lock recovery after the holder is killed
 
-**What the EC2 logs say** (`/home/bra/cvs/constellation-m14/ec2-logs/locks1/`;
+**What the EC2 logs say** (`constellation-m14/ec2-logs/locks1/`;
 the orchestrator `scenario_locks.py` and its `locks1.log` are in that
 session's scratchpad). Node a (node 2) had been the sequencer since the
 first, broken kill attempt (takeover at 12:32:32). For the corrected run:
@@ -23224,26 +23224,26 @@ never an OVH behaviour. The scripted mounts did not talk to OVH at all.
 
 The campaign drivers (`c4common.py`, and the repo's
 `bench/remote/common.py`) ran each remote command as
-`AWS_CONFIG_FILE=… AWS_PROFILE=bra-private AWS_SHARED_CREDENTIALS_FILE=/dev/null mkdir -p MNT && constellation mount --s3 s3://bra-private/PREFIX NAME MNT`.
+`AWS_CONFIG_FILE=… AWS_PROFILE=<profile> AWS_SHARED_CREDENTIALS_FILE=/dev/null mkdir -p MNT && constellation mount --s3 s3://<bucket>/PREFIX NAME MNT`.
 A `VAR=value` prefix binds only the first command of the line (`mkdir`),
 so `mount` ran with no OVH profile: the SDK chain fell through to the EC2
 instance role (IMDSv2), region us-west-2 and no configured endpoint, so
 object_store sent the requests to `https://s3.us-west-2.amazonaws.com`,
-where no bucket `bra-private` exists:
+where no bucket `<bucket>` exists:
 
-1. `GET bra-private/PREFIX/meta.json` → 404 (the pre-fork E2E check,
+1. `GET <bucket>/PREFIX/meta.json` → 404 (the pre-fork E2E check,
    `prompt_e2e_passphrase_if_needed`, background mounts only);
-2. `HEAD bra-private/PREFIX/meta.json` → 404 (edd3d5d's check agreed);
+2. `HEAD <bucket>/PREFIX/meta.json` → 404 (edd3d5d's check agreed);
 3. `Error: no filesystem found at this prefix (missing meta.json)` — the
    exact text captured in campaign 4's `testA_createrace_ovh.log`, with
    no `aws_config` "loaded base credentials" line (the profile was never
    read). `fs create` worked because its line had no `&&`, and every
    "manual mount that worked within seconds" had the environment
-   exported; hence the "flapping". Reproduced on 10.108.0.70 with the
+   exported; hence the "flapping". Reproduced on <worker-a> with the
    edd3d5d binary: the harness-shaped line fails the same way and
    `RUST_LOG=reqwest=debug` shows `starting new connection
    s3.us-west-2.amazonaws.com`; `aws s3api head-bucket --bucket
-   bra-private` without the profile answers 404.
+   <bucket>` without the profile answers 404.
 
 ### The backend's behaviour (probed directly)
 
@@ -23282,7 +23282,7 @@ changes make this failure explain itself:
   `NodeRuntime::start`, `status --s3`) turns "missing meta.json" into:
 
   ```
-  Error: no filesystem found at s3://bra-private/s3fs/lag-…: meta.json is missing
+  Error: no filesystem found at s3://<bucket>/s3fs/lag-…: meta.json is missing
     looked at: endpoint https://s3.us-west-2.amazonaws.com (AWS default: no endpoint configured), region us-west-2, credentials from IMDSv2, AWS_PROFILE unset
     found: the bucket does not exist at this endpoint: the command is talking to a different store than the one the filesystem was created on
     this name was created or last mounted against endpoint https://s3.eu-south-mil.io.cloud.ovh.net, but this command resolved https://s3.us-west-2.amazonaws.com: run it with the same AWS_PROFILE / AWS_CONFIG_FILE / AWS_ENDPOINT_URL environment the filesystem was created with
@@ -23922,7 +23922,7 @@ prefix `constellation-harness-gitdiv`):
   node's FUSE mutations then stalled for ~220 s (the harness's next
   fault waited that long on an unlink; seeds 31 and 36) until a later
   fault moved the cluster on. Logs of the permanent hang:
-  `/tmp/claude-1000/-home-bra-cvs-constellation/84196101-2583-4642-a2f2-afbc29380f8e/scratchpad/gitdiv/epochhang/`.
+  `<scratchpad>/gitdiv/epochhang/`.
 - Under faults, a lock whose previous grant was outwaited (its holder
   stuck) carries only the owner's position; one turn in 302 then read a
   stale ref for more than 5 s (no commit was lost in the end).
@@ -27406,7 +27406,7 @@ client deadline at 120 s.
   all three peers `direct` (RTT 1 ms, relay paths 0) during the cut.
 - The AWS side was a real cut too. `s3.us-west-2.amazonaws.com`
   resolves to public addresses (52.92.x, 16.15.x) from the hosts. The
-  rule is `! -d 10.108.0.0/16`, so AWS S3 is dropped as well. Checked
+  rule is `! -d <vpc-cidr>`, so AWS S3 is dropped as well. Checked
   with curl from inside a cgroup-scoped rule: both OVH and AWS S3 time
   out, and outside the scope OVH answers. The failure is not specific
   to OVH. It needs a holder that has just restarted with its lease
@@ -27532,7 +27532,7 @@ the forwards now continuing, the window only delays the first answer.
   `long_delegated` at 300 seeds. `constellation` (cli) 291,
   `constellation-net` 94, api 13. All pass; clippy is clean.
 - EC2, four hosts, this campaign's cut: `iptables -A OUTPUT -p tcp
-  --dport 443 ! -d 10.108.0.0/16 -j DROP`, scoped to the test
+  --dport 443 ! -d <vpc-cidr> -j DROP`, scoped to the test
   cluster's cgroup. `CONSTELLATION_BACKUPS=0`. Prefixes
   `s3fs/a1fix-<ts>-{aws,ovh}/`.
 
@@ -27649,7 +27649,7 @@ table refuses a cached grant once it is recalled. What did not:
   microseconds earlier and was served next), git-under-flock (54 turns,
   0 and 0), git-under-flock-faults, git-under-flock-causal (58 turns,
   0 double turns).
-- The `/home/bra/cvs/constellation-cb847f8` scratch worktree is removed.
+- The `constellation-cb847f8` scratch worktree is removed.
 - Rebased onto `62268ff` (the A-1 forward fix; only PROGRESS.md
   conflicted). On the rebased tree: fmt and clippy clean; authority lib
   146, sim 107, meta_repro 3, meta 105, api 5, cli bin 291, harness 14

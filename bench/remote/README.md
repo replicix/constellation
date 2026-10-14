@@ -26,6 +26,36 @@ each node concurrently.
   via `mount --s3`, write/read both directions, P2P/forwarding evidence
   via `status`).
 
+## Configuring the fleet
+
+No host addresses, user names or bucket names are kept in the repository.
+`common.py` reads them from the environment, or from an untracked
+`bench/remote/workers.local.toml` (listed in `.gitignore`; Python 3.11+
+for the TOML form). Environment variables win over the file.
+
+| Environment variable                | `workers.local.toml` key | Meaning |
+|-------------------------------------|--------------------------|---------|
+| `CONSTELLATION_BENCH_WORKERS`       | `[workers]` table        | `NAME=HOST` pairs (comma-separated in the env var): the nodes, e.g. `a=<host-a>,b=<host-b>,c=<host-c>,d=<host-d>` |
+| `CONSTELLATION_BENCH_SSH_USER`      | `ssh_user`               | ssh login on every node; its home directory (`/home/<user>`) holds the `cbench` work dir |
+| `CONSTELLATION_BENCH_BUCKET`        | `bucket`                 | S3 bucket the benchmark filesystems are created in |
+| `CONSTELLATION_BENCH_REGION`        | `region`                 | AWS region (default `us-west-2`) |
+
+```toml
+# bench/remote/workers.local.toml  (never commit)
+ssh_user = "<ssh-user>"
+bucket   = "<bucket>"
+region   = "us-west-2"
+
+[workers]
+a = "<host-a>"
+b = "<host-b>"
+c = "<host-c>"
+d = "<host-d>"
+```
+
+The scripts exit with a message naming the missing setting when one is
+not provided.
+
 ## Running
 
 ```bash
@@ -41,8 +71,8 @@ python3 phase_a.py "$PREFIX" results/<timestamp> 1 2 5 6 7
 # row selectors: 1 2 3 4 5 6 7 e2e (default: all of 1-7)
 ```
 
-Node names `a b c d` map to the fixed fleet IPs in `common.HOSTS` (the 4
-hosts from `SPEC.md`). Env var `SEQ_MB` overrides the per-thread size
+Node names (`a b c d` in the original run) map to the fleet hosts
+configured as described under "Configuring the fleet" below. Env var `SEQ_MB` overrides the per-thread size
 (MiB) for row 5's sequential write/read (default 512; spec asks for
 2048 = 2 GiB, scaled down here to fit the time budget -- see
 `bench/remote/RESULTS.md` for the note on this deviation).

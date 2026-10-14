@@ -1,4 +1,4 @@
-	Command being timed: "/tmp/cursor-sandbox-cache/c3d4495fdbf607bd38da2d34c2e89db0/cargo-target/release/dbbench lmdb /home/bra/cvs/constellation/bench/data-lmdb"
+	Command being timed: "target/release/dbbench lmdb bench/data-lmdb"
 	User time (seconds): 16.78
 	System time (seconds): 101.71
 	Percent of CPU this job got: 29%

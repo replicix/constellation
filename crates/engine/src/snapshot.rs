@@ -1420,13 +1420,13 @@ mod tests {
 
     #[test]
     fn hold_owners_need_a_known_namespace() {
-        validate_owner("user:attila").unwrap();
+        validate_owner("user:alicia").unwrap();
         validate_owner("csi:0f3a-content-uid").unwrap();
         // Reserved for plan 32's own scheduler, so nobody squats it.
         assert!(validate_owner("policy:7").is_err());
         // A typo must not become a namespace of its own.
-        assert!(validate_owner("attila").is_err());
-        assert!(validate_owner("users:attila").is_err());
+        assert!(validate_owner("alicia").is_err());
+        assert!(validate_owner("users:alicia").is_err());
         assert!(validate_owner("user:").is_err());
     }
 
@@ -1489,7 +1489,7 @@ mod tests {
         assert!(manager.list(Some("/vol")).unwrap().len() == 1);
 
         // Nor can another owner release or steal the hold.
-        for by in [None, Some("user:attila")] {
+        for by in [None, Some("user:alicia")] {
             let refused = manager
                 .hold("/vol@pvc-1", false, by, false)
                 .await
@@ -1556,7 +1556,7 @@ mod tests {
 
         // A hold with an owner cannot be taken over…
         manager
-            .hold("/vol@owned", true, Some("user:attila"), false)
+            .hold("/vol@owned", true, Some("user:alicia"), false)
             .await
             .unwrap();
         assert!(manager
@@ -1574,7 +1574,7 @@ mod tests {
         assert!(!row.held);
         // A forced delete does not even ask about the hold.
         manager
-            .hold("/vol@owned", true, Some("user:attila"), false)
+            .hold("/vol@owned", true, Some("user:alicia"), false)
             .await
             .unwrap();
         manager.delete("/vol", "owned", true).await.unwrap();
@@ -1587,7 +1587,7 @@ mod tests {
         // A namespace-less or reserved owner is refused before anything is
         // written.
         assert!(manager
-            .hold("/vol@plain", true, Some("attila"), false)
+            .hold("/vol@plain", true, Some("alicia"), false)
             .await
             .is_err());
         assert!(manager

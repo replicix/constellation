@@ -852,7 +852,7 @@ mod tests {
 
     fn aws_default() -> BackendInfo {
         BackendInfo {
-            url: "s3://bra-private/s3fs/x".into(),
+            url: "s3://test-bucket/s3fs/x".into(),
             s3: Some(constellation_store_s3::S3Resolution {
                 endpoint: "https://s3.us-west-2.amazonaws.com".into(),
                 endpoint_configured: false,
@@ -875,7 +875,7 @@ mod tests {
             &MissingFs::NoBucket,
             Some("https://s3.eu-south-mil.io.cloud.ovh.net"),
         );
-        assert!(msg.contains("s3://bra-private/s3fs/x"), "{msg}");
+        assert!(msg.contains("s3://test-bucket/s3fs/x"), "{msg}");
         assert!(
             msg.contains("https://s3.us-west-2.amazonaws.com (AWS default"),
             "{msg}"

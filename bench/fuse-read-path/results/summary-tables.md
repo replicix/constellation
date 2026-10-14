@@ -1,4 +1,4 @@
-# Consolidated medians (3 reps) — ip-10-108-1-209.us-west-2.compute.internal kernel 7.3.0-0.rc4.260925g165768bb7026.42.fc46.x86_64 libfuse bf4fdf9df8 fio fio-3.43 store_fs btrfs nproc 16 mem 30.7 GiB chunk 4194304
+# Consolidated medians (3 reps) — test-host kernel 7.3.0-0.rc4.260925g165768bb7026.42.fc46.x86_64 libfuse bf4fdf9df8 fio fio-3.43 store_fs btrfs nproc 16 mem 30.7 GiB chunk 4194304
 
 Columns: bw MiB/s | kIOPS | daemon CPU s per GiB served | daemon utime/stime s | daemon maxrss MiB | fallbacks | backing-file page-cache residency after run % | fio p99 latency us
 
