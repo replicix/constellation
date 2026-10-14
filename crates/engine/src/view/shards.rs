@@ -481,11 +481,12 @@ pub(super) struct FlushFail {
 /// Per-inode ordering of the operations that read or change a write
 /// session (`read`, `write`, `truncate`, `fallocate`, `lseek`, an mtime
 /// set while one is open, and the flush that publishes it), held across
-/// their slow parts — the chunk fetch, the forward, the drain — so the
-/// per-inode order a single shard lock used to give survives
-/// [`WriteShards`] releasing it. Only operations on the same inode
-/// wait. Re-entrant on one thread (`fallocate` truncates and writes
-/// through the public paths).
+/// their slow parts — the chunk fetch, the forward — so the per-inode
+/// order a single shard lock used to give survives [`WriteShards`]
+/// releasing it. A flush holds it until its commit is answered, not
+/// across the write-through drain after that (`View::publish_inode`).
+/// Only operations on the same inode wait. Re-entrant on one thread
+/// (`fallocate` truncates and writes through the public paths).
 pub(super) struct InodeOps {
     shards: [InodeOpShard; 64],
 }

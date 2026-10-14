@@ -423,8 +423,11 @@ returns". Later drains hand off at once while there is still no progress
 (for 30 s). With no such peer (a single node, P2P off, every peer cut
 too), a write-through close or `fsync` still needs S3: it fails with
 `EIO` once the node's own upload has used its retry budget (about
-3 × 30 s). A flush holds only a per-inode lock while it drains, so
-`stat` and `ls` of other files never wait behind it.
+3 × 30 s). A flush holds no lock while it drains: its per-inode
+operation lock ends with its commit, so `stat` and `ls` of other files,
+and the next read and write of the file itself, never wait behind the
+upload, nor does the next close's commit (its own drain waits for every
+chunk of the file still going up).
 
 ### Streaming writes: files larger than the cache
 

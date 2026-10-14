@@ -1277,7 +1277,7 @@ impl Vfs for View {
         // caller's locks on this file below. A close that ends its
         // caller's turn on the file (it drops the caller's locks there)
         // and publishes counts as that turn's publication from before the
-        // drop until the publication is over: a new turn on the file waits
+        // drop until its commit is answered: a new turn on the file waits
         // for it (`crate::locks::begin_close`).
         let _lock_tag = self.lock_tag_scope(cx);
         let locks = self.cluster_locks().filter(|_| !View::is_synthetic(ino));
@@ -1300,9 +1300,21 @@ impl Vfs for View {
         // (`lock_handles`' module doc), so this is the only one.
         let gate = self.lock_publish_gate(ino, fh);
         let idle = locks.map(|l| l.drop_owner(ino, owner.0));
-        let result = gate.and_then(|owed| {
-            if publishes {
-                self.flush_inode(ino, false)?;
+        let published = gate.and_then(|owed| {
+            let drain = publishes && self.publish_inode(ino, false)?;
+            Ok((owed, drain))
+        });
+        // The turn's publication is over once its commit is answered: the
+        // write-through drain after it only waits for what is published to
+        // reach S3 (`View::publish_inode`), and a new turn on the file does
+        // not wait for that. A recalled grant's release does not need this
+        // guard for it either: its own flush (`LockFlush`, before the
+        // release is even considered) drains the file's pending chunks,
+        // sharing this drain's in-flight uploads, and syncs the journal.
+        drop(publishing);
+        let result = published.and_then(|(owed, drain)| {
+            if drain {
+                self.drain_inode(ino)?;
             }
             if owed {
                 return Err(Code::Io);
@@ -1322,11 +1334,10 @@ impl Vfs for View {
         if locks.is_some_and(|l| !l.meta.locks().lockers_none()) {
             self.note_handle_closed(fh);
         }
-        // The close's publication and fencing-token scope end before its
-        // answer, not after: nothing is published past here, and neither
-        // the closer's next lock request (a new turn) nor the release of
-        // a recalled grant is held behind this op once it is answered.
-        drop(publishing);
+        // The close's fencing-token scope ends before its answer, not
+        // after (its publication ended above): nothing is published past
+        // here, and the release of a recalled grant is not held behind
+        // this op once it is answered.
         drop(_lock_tag);
         match result {
             Ok(()) => r.done(Ok(())),
@@ -1394,16 +1405,22 @@ impl Vfs for View {
                 }
             }
         }
-        let flush_result = gate.and_then(|owed| {
-            if publishes {
-                self.flush_inode(ino, flags.contains(OpenFlags::SYNC))?;
+        let published = gate.and_then(|owed| {
+            let drain = publishes && self.publish_inode(ino, flags.contains(OpenFlags::SYNC))?;
+            Ok((owed, drain))
+        });
+        // As in `flush`: the turn's publication ends with its commit, not
+        // with the drain after it.
+        drop(publishing);
+        let flush_result = published.and_then(|(owed, drain)| {
+            if drain {
+                self.drain_inode(ino)?;
             }
             if owed {
                 return Err(Code::Io);
             }
             Ok(())
         });
-        drop(publishing);
         if let (Some(l), true) = (locks, idle) {
             l.idle(ino);
         }

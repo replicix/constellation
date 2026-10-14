@@ -736,15 +736,42 @@ impl View {
     /// before publishing this manifest, so a transient reset on a
     /// healed S3 connection does not become application-visible EIO in
     /// local-fsync mode.
+    ///
+    /// [`Self::publish_inode`], then the write-through drain it leaves.
     pub(super) fn flush_inode(&self, ino: Ino, force_through: bool) -> Result<(), Code> {
+        if self.publish_inode(ino, force_through)? {
+            self.drain_inode(ino)?;
+        }
+        Ok(())
+    }
+
+    /// The publication half of [`Self::flush_inode`]: the inode's pending
+    /// writes composed and their manifest committed at the sequencer.
+    /// `Ok(true)`: the close acts as `through` and the caller still owes
+    /// the inode's drain ([`Self::drain_inode`]: its chunks into S3)
+    /// before it answers.
+    ///
+    /// The inode's operation lock is held from taking the session until
+    /// the commit is answered, and no longer: that is what orders the
+    /// file's publications (one commit at a time, each over the one
+    /// before) and an mtime set against them. The drain only waits for
+    /// what is already published to reach S3 — a `back` close leaves that
+    /// to the background passes, and nothing waits for it — and every
+    /// path that needs it (`fsync`, a lock release's flush, the next
+    /// `through` close) drains the inode's pending chunks itself. Held
+    /// across the drain, the lock made every read, write and close of the
+    /// file wait one S3 round trip per close (xcheckfs
+    /// `lock_traffic_concurrent_with_io`: four threads opening, writing
+    /// and closing one file ran one close's upload at a time).
+    pub(super) fn publish_inode(&self, ino: Ino, force_through: bool) -> Result<bool, Code> {
         // The inode's operation lock, not its shard lock, is what keeps
         // per-inode request order across the publication: the session is
         // detached from its shard (its size stays visible to `getattr`
-        // and `lookup`) so the compose, the commit — a forward — and the
-        // drain run with no shard held (EC2 finding 1).
+        // and `lookup`) so the compose and the commit — a forward — run
+        // with no shard held (EC2 finding 1).
         let _op = self.inode_ops.lock(ino);
         let Some(ws) = self.writes.detach(ino) else {
-            return Ok(());
+            return Ok(false);
         };
         // Nothing to publish: no manifest commit, which would stamp both
         // times with its own (whatever the write that failed staged is
@@ -752,7 +779,7 @@ impl View {
         if ws.changed_nothing() {
             ws.staging.discard();
             self.writes.retire(ino);
-            return Ok(());
+            return Ok(false);
         }
         // Written, then unlinked while still open (here or on another
         // node): there is no name to publish the content under, and the
@@ -771,7 +798,7 @@ impl View {
         // `concurrent-create-no-excl`).
         if self.orphaned(ino) {
             self.writes.reattach(ino, ws);
-            return Ok(());
+            return Ok(false);
         }
         constellation_vfs::watch::stage("flush: compose and commit");
         crate::locks::take_lapsed();
@@ -779,10 +806,7 @@ impl View {
         match self.flush_detached(ino, ws, force_through) {
             Ok(drain) => {
                 self.writes.retire(ino);
-                if drain {
-                    self.drain_inode(ino)?;
-                }
-                Ok(())
+                Ok(drain)
             }
             Err(FlushFail {
                 errno,
@@ -847,7 +871,7 @@ impl View {
                     // holds leaves the orphan record.
                     self.session_wait(&[ReadKey::Ino(ino)]);
                     if self.orphaned(ino) {
-                        return Ok(());
+                        return Ok(false);
                     }
                     // An inode this replica never held, or held only
                     // through speculation that was rolled back (a

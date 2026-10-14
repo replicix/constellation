@@ -47268,3 +47268,127 @@ data and its unpublished writes until the kernel's `FORGET`…" → "…until
 the kernel lets go of its last lookup of the inode (the FUSE adapter
 counts them: the kernel also forgets single lookups of inodes it still
 holds, ADR-31)…". DESIGN's "(the view keeps no lookup table)" stays true.
+
+## Fix: a close's upload holds neither its file nor the next lock turn (xcheckfs `lock_traffic_concurrent_with_io` timeout, 2026-10-14)
+
+xcheckfs `engine_locks::lock_traffic_concurrent_with_io` (four threads,
+each taking OFD range locks through its own descriptor, mixed with
+`open`/`pwrite`/`pread`/`close` of the same file) ran past its 60 s
+timeout against write-through and `--fsync-mode s3` cells on a loaded
+host (ext4: 0.03 s), and took 5–20 s on a fresh write-back mount.
+
+### Where the time went
+
+Not the locks. The same op mix with the lock calls left out
+(`NOLOCK`, the same random stream) took as long; with locks on the
+file, the cluster-lock work per op was within noise of none: `pwrite`
++0–8 µs, a read-only `open`+`close` +10 µs (3000-op loops, one
+thread), `setlk` 17–21 µs and `getlk` 4–5 µs in the daemon,
+`predecessor_waits` 0, no grant round trip after the first (a lone
+node caches its grant). A write never takes a fencing token (only a
+mutation does: the close's commit, once per op), and nothing written
+under a lock is forced through or published per write.
+
+The time was the file's publications. Every `close` of a written
+descriptor publishes (a manifest commit), and the inode's operation
+lock, which orders a file's `read`, `write`, `truncate` and flush, was
+held by the flush across the whole publication *including the
+write-through drain* — on the sequencer the commit is local and the
+close then waits for the chunk's S3 PUT. So under `--write-mode
+through` (and under `--fsync-mode s3`, which forces it) every read,
+write and close of the file queued one S3 round trip per close: 834
+closes ran one upload at a time (~30 ms each idle, seconds under load),
+and the kernel's per-inode write lock stacked the four threads' writes
+behind that (`pwrite` 56–240 ms average). Under `--write-mode back` the
+close's cost is the chunk's `fdatasync` into the durable cache (2–3 ms
+on an idle btrfs, ~0 on tmpfs) and the journal write; the multi-second
+spikes there were the host's write-back stalls (fjall: `slow commit:
+2421 ms … persist=2421ms`), with or without locks.
+
+A second, lock-specific over-wait: a close that ends its caller's turn
+counts as that turn's publication (`locks::begin_close`), and a new
+turn on the node waits for it (`Predecessor`) — "until the commit is
+answered" (4348658, ADR-25), but the guard was dropped only after
+`flush_inode` returned, i.e. after the drain. A non-blocking lock of
+the next turn behind a `through` close therefore waited for the upload
+up to `CONSTELLATION_LOCK_CLOSE_WAIT_MS` (100 ms) and then answered
+`EAGAIN` with no lock in the way.
+
+### Change
+
+`View::publish_inode` is `flush_inode` without the drain: it takes the
+operation lock, composes and commits, and returns whether a drain is
+owed; the lock ends with it. `flush_inode` is `publish_inode` then
+`drain_inode`. `flush` and `release` call the two halves themselves and
+drop the turn's `Publishing` guard between them. What stays ordered:
+the file's commits (one at a time, each over the last — the turn rule's
+safety argument), an mtime set against them (DESIGN: "until its commit
+returns"), a non-sequencer's `through` upload, which precedes its
+forwarded commit and so stays under the lock, and a gated holder's
+durability wait. The drain only waits for what is already published to
+reach S3, as a `back` close's background upload does; every path that
+needs the chunks up drains the inode's pending rows itself (`fsync`,
+`O_SYNC`, a lock release's `flush_for_lock`, the next `through` close),
+and concurrent drains share in-flight claims (`upload::InFlightClaim`).
+A recalled grant's release runs its own flush (`LockFlush`) before it
+consults `release_blocked`, and that flush drains the file (sharing the
+close's uploads in flight) and syncs the journal before the grant
+moves; it never relied on the close's guard for the chunks. The close still returns only once its chunks are in S3.
+
+### Tests
+
+- `owner_fence_tests::a_new_turn_does_not_wait_for_a_closes_upload`
+  (new; fails before: `EAGAIN` after the close wait, and the write
+  blocks): a turn-ending `FLUSH` under `through` on the holder, its
+  drain held back; the next turn's `F_SETLK` is granted with no
+  predecessor wait and a write of the file completes meanwhile.
+- `durable_ack_tests::a_close_stuck_in_its_drain_holds_no_write_shard`
+  (contract changed, fails before): besides the shard, a write and a
+  read of the same file complete during the drain, the commit is
+  already visible, and the next close publishes `hello!` over it. It
+  used to assert the write waited.
+- Unchanged and passing: `a_new_turn_waits_for_a_closes_publication_
+  through_the_view` (a forwarded commit still holds the turn),
+  `a_new_turn_waits_for_an_op_in_doubt_before_its_scope_ends`, the
+  rest of `owner_fence_tests`, `lock_handles`, meta `locks`.
+
+### Measurements
+
+16-CPU shared host, S3 backend, E2E, one node; `lockio` = the test's op
+mix natively (800 ops × 4 threads), seconds per run; xcheckfs = the
+test itself against an ext4 primary. Base fbcb3ce → this change.
+
+| state dir | mode | load | lockio | xcheckfs |
+|---|---|---|---|---|
+| btrfs | through, fsync s3 | 3–4 | 26–43 → 7.0–9.6 | 20.7–21.0 → 6.8–6.9 |
+| ext4 | through, fsync s3 | 4–18 | 29–35 → 8.4–10.8 | 60.1/60.4 (timeout) → 10.3–11.3 |
+| tmpfs | through, fsync s3 | 15–50 | 23.6–25.2 → 6.6–9.0 | 18.7–19.8 → 5.9–6.2 |
+| xfs (loop) | through, fsync s3 | ~50 | 76–82 → 35–38 | 60.2/61.0 → 22.5–28.2 |
+| btrfs | back, fsync local | 3 | 2.8–3.2 → 2.8–3.0 | 2.3–4.3 → 2.0–2.2 |
+| ext4 | back, fsync local | 15–19 | 10.4–12.2 → 7.6–10.4 | 9.2–9.5 → 5.8–6.3 |
+| tmpfs | back, fsync local | ~50 | 0.2 → 0.2 | 0.17–0.18 → 0.14–0.18 |
+
+`pwrite` averages under `through`: 43–240 ms → 0.1–5.7 ms on btrfs,
+ext4 and tmpfs (xfs under load 50: 127–239 → 48–89). `close` stays one
+S3 round trip (~30 ms idle), as `through` promises. `back` takes no
+drain and runs the same code; its numbers move with the host's load:
+base and change mounted side by side and alternated four times each
+(load 23–107) gave btrfs 7.0–10.2 s against 7.6–27 s, xfs 18.6–98.5 s
+against 22.6–103.5 s, ext4 17.4–55.5 s against 19.2–86.3 s, the spread
+inside each binary far larger than between them.
+
+Also run: xcheckfs `engine_locks` (21 tests, ext4 primary, `through` +
+`fsync s3` mount) 21/21 on both, 38 s → 15 s; harness
+`lock-release-at-close`, `flock-cross-node`, `sqlite-two-nodes`,
+`lock-fence-at-close`, `lock-lapse-lone-node`,
+`lock-holder-partitioned`, `lock-failover`, `lock-latency`,
+`git-under-flock-b2b`, `git-under-flock-rounds`, `s3-cut-one-node`,
+`writeback-fsync`, `unmount-drain` all pass; workspace tests pass.
+
+### What remains
+
+Per close, a write-back mount still `fdatasync`s the chunk into the
+durable cache under the operation lock (what makes `back` durable on
+the node), so same-file I/O under concurrent closes pays the host's
+`fdatasync` latency; a `through` close still waits its own upload.
+Both are the modes' promises, not lock costs.

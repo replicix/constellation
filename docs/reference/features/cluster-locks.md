@@ -161,7 +161,9 @@ the grant's [fencing token](#the-fencing-token) (so does a `FLUSH`,
 which drops the closer's POSIX locks before it publishes), and a new
 turn on the node waits for that publication — counted from before the
 close drops the locks until the commit is answered, for a close that
-drops locks of its own caller on the file and publishes it — and for an
+drops locks of its own caller on the file and publishes it; not the
+upload of the file's chunks that a `through` close waits for after its
+commit, which only the closing caller waits for — and for an
 operation of the earlier turn that ended in doubt. A non-blocking request with
 nothing else in its way waits for them too, instead of answering
 `EAGAIN` at once, within the same bound of

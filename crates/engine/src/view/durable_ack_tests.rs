@@ -193,10 +193,14 @@ fn a_nonowner_back_close_forwards_before_its_upload() {
 }
 
 /// EC2 finding 1: a close waiting on its drain (S3 unreachable) holds
-/// the inode's operation lock, never its write shard — `getattr` and
-/// `lookup` of every inode sharing the shard (the round-1 `ls -la`)
-/// answer at once, and the file's own size is its new one — while a
-/// write to the same file still waits for the close to finish.
+/// no write shard — `getattr` and `lookup` of every inode sharing the
+/// shard (the round-1 `ls -la`) answer at once, and the file's own size
+/// is its new one. Nor the inode's operation lock: its commit was
+/// answered before the drain began, so a write and a read of the same
+/// file go on meanwhile (the write in a new session over the published
+/// manifest), and the next close publishes over it. Until the lock
+/// ended with the commit, every op on the file waited one upload per
+/// close (xcheckfs `lock_traffic_concurrent_with_io`).
 #[test]
 fn a_close_stuck_in_its_drain_holds_no_write_shard() {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
@@ -240,16 +244,56 @@ fn a_close_stuck_in_its_drain_holds_no_write_shard() {
             .unwrap_or_else(|| meta.getattr(file.ino).unwrap().unwrap().size);
         drop(shard);
         assert_eq!(size, 5);
-        let write = scope.spawn(|| fs.do_write(file.ino, 5, b"!"));
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(
-            !write.is_finished(),
-            "a write overtook the same file's close"
+        assert_eq!(
+            meta.getattr(file.ino).unwrap().unwrap().size,
+            5,
+            "the close's commit was answered before its drain"
         );
+        // Each waited for at most a while, and the drain answered
+        // whatever happened: a write still waiting would never end.
+        fn done_soon<T>(h: &std::thread::ScopedJoinHandle<'_, T>) -> bool {
+            let started = std::time::Instant::now();
+            while !h.is_finished() && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            h.is_finished()
+        }
+        let write = scope.spawn(|| fs.do_write(file.ino, 5, b"!"));
+        let wrote = done_soon(&write);
+        let read = wrote.then(|| scope.spawn(|| fs.do_read(file.ino, 0, 16)));
+        let read_back = read.as_ref().is_some_and(|r| done_soon(r));
         reply.send(Ok(())).unwrap();
         close.join().unwrap().unwrap();
         write.join().unwrap().unwrap();
+        assert!(wrote, "a write waited for the same file's drain");
+        assert!(read_back, "a read waited for the same file's drain");
+        let data = read.unwrap().join().unwrap().unwrap();
+        assert_eq!(&*data.contiguous().unwrap(), b"hello!");
     });
+    // The next close publishes the write over the first close's manifest.
+    std::thread::scope(|scope| {
+        let close = scope.spawn(|| fs.flush_inode(file.ino, false));
+        let started = std::time::Instant::now();
+        loop {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => {
+                    reply.send(Ok(())).unwrap();
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(started.elapsed() < Duration::from_secs(5));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        close.join().unwrap().unwrap();
+    });
+    assert_eq!(meta.getattr(file.ino).unwrap().unwrap().size, 6);
+    assert_eq!(
+        &*fs.do_read(file.ino, 0, 16).unwrap().contiguous().unwrap(),
+        b"hello!"
+    );
 }
 
 #[test]

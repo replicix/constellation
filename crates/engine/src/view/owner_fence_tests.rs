@@ -1298,6 +1298,90 @@ fn a_new_turn_waits_for_a_closes_publication_through_the_view() {
     }
 }
 
+/// Whether `h` finished within a few seconds.
+fn done_soon<T>(h: &std::thread::ScopedJoinHandle<'_, T>) -> bool {
+    let started = Instant::now();
+    while !h.is_finished() && started.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    h.is_finished()
+}
+
+/// A close that ends its caller's turn under `--write-mode through`, on
+/// the holder: its commit is local and answered at once, then the close
+/// waits for the file's chunks to reach S3 (held back here). The turn's
+/// publication is that commit (`crate::locks::begin_close`): while the
+/// upload still waits, a non-blocking lock of the next turn is granted
+/// with no predecessor wait, and a write of the file goes on (the file's
+/// operation lock ended with the commit too). Both used to wait for the
+/// upload — the lock up to the close wait, then `EAGAIN` with no lock in
+/// the way; every op on the file for the whole upload.
+#[test]
+fn a_new_turn_does_not_wait_for_a_closes_upload() {
+    let mut f = fenced_fs();
+    f.fs.sync
+        .as_ref()
+        .unwrap()
+        .write_mode
+        .set(crate::writeback::WriteMode::Through);
+    let me = std::process::id();
+    let caller = Caller::new(0, 0, Some(me));
+    let (ino, a, b) = two_descriptions(&f, &caller, "uploading");
+    try_lock(&f, &caller, ino, a, 0xa).unwrap();
+    f.write(&OpCtx::new(OpKind::Write, &caller), ino, a)
+        .unwrap();
+    let mut core = std::mem::replace(&mut f._core, tokio::sync::mpsc::unbounded_channel().1);
+    let before = f.meta.locks().stats().predecessor_waits;
+    std::thread::scope(|s| {
+        let close = s.spawn(|| {
+            Blocking::run(|r| {
+                f.fs.flush(
+                    &OpCtx::new(OpKind::Flush, &caller),
+                    ino,
+                    a,
+                    LockOwner(0xa),
+                    r,
+                )
+            })
+        });
+        let started = Instant::now();
+        let drained = loop {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { ino: i, reply, .. }) if i == ino => break reply,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "the close never asked for its drain"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        assert!(
+            f.meta.locks().local_locks(ino).is_empty(),
+            "the close dropped its caller's lock"
+        );
+        let lock = s.spawn(|| try_lock(&f, &caller, ino, b, 0xb));
+        let locked = done_soon(&lock);
+        let write = s.spawn(|| f.write(&OpCtx::new(OpKind::Write, &caller), ino, b));
+        let wrote = done_soon(&write);
+        // Answered whatever happened: a write still waiting never ends.
+        drained.send(Ok(())).unwrap();
+        close.join().unwrap().unwrap();
+        assert!(locked, "the next turn's lock waited for the upload");
+        assert_eq!(lock.join().unwrap(), Ok(()), "granted during the upload");
+        assert!(wrote, "a write waited for the same file's upload");
+        write.join().unwrap().unwrap();
+    });
+    assert_eq!(
+        f.meta.locks().stats().predecessor_waits,
+        before,
+        "the next turn did not wait for the closed turn's upload"
+    );
+    unlock_range(&f, &caller, ino, b, 0xb);
+}
+
 /// Every op a process issues while it holds a lock carries the lock's
 /// grant (the fencing token is per process), so another thread's op —
 /// a slow `fsync` of another file, or, through xcheckfs, which mirrors

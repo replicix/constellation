@@ -912,6 +912,27 @@ Rejected: an unbounded wait for every
 tagged operation (correct answers, but `F_SETLK` would stall behind an
 unrelated `fsync`, for as long as an S3 outage lasts).
 
+**Amended (a publication ends with its commit)**: a close's publication,
+which a new turn on the node waits for, ends when its manifest commit is
+answered, as the turn rule above says; under `--write-mode through` on
+the sequencer the close then waits for the file's chunks to reach S3,
+and that wait no longer counts. Nor does it hold the file's operation
+lock: the lock orders the file's publications (one commit at a time)
+and an mtime set against them, and that order is settled at the commit.
+The upload is what the closing caller waits for, as `through` promises;
+whoever needs the chunks in S3 next (an `fsync`, a lock release's flush,
+the next `through` close) drains the file's pending chunks itself.
+Before, both lasted through the upload: a non-blocking lock of the next
+turn behind a close waited up to `CONSTELLATION_LOCK_CLOSE_WAIT_MS` and
+answered `EAGAIN` with no lock in the way when an upload took longer,
+and every read, write and close of the file queued one upload per close
+(xcheckfs `lock_traffic_concurrent_with_io`, four threads opening,
+writing and closing one file, timed out at 60 s on a loaded host). The
+release ordering is unchanged: a recalled grant's release runs its own
+flush first, which drains the file's pending chunks (sharing the
+close's uploads in flight) and syncs the journal before the grant
+moves.
+
 ## ADR-26: Exact chunk-location reconciliation replaces bloom digests
 
 **Context**: peers learned each other's cached chunks from bloom-filter
