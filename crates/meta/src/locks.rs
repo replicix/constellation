@@ -313,8 +313,9 @@ pub struct LocalLock {
     pub owner: u64,
     /// The process that took it (its thread group id; 0: unknown).
     pub pid: u32,
-    /// When that process started (0: unknown): the pid names it only
-    /// with this, across pid reuse.
+    /// What tells that process from a later one given its pid (0:
+    /// unknown; the platform's `Lineage::start`, opaque): the pid names it
+    /// only with this, across pid reuse.
     pub pid_start: u64,
     pub write: bool,
     pub start: u64,
@@ -509,8 +510,8 @@ pub struct FencedOwner {
     /// The kernel's lock owner (`flock`: the open file; `fcntl`: the
     /// process's file table).
     pub owner: u64,
-    /// The process that took the lock (0: unknown) and its start time
-    /// (0: unknown).
+    /// The process that took the lock (0: unknown) and its identity
+    /// across pid reuse (0: unknown; see [`LocalLock::pid_start`]).
     pub pid: u32,
     pub pid_start: u64,
     pub since_ms: i64,

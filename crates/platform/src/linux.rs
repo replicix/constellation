@@ -235,6 +235,87 @@ pub fn parse_start_time(stat: &str) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// pidfs's `statfs` magic (`PID_FS_MAGIC`, Linux >= 6.9).
+const PID_FS_MAGIC: i64 = 0x5049_4446;
+
+/// Whether processes are named by their pidfs identity
+/// ([`pidfs_identity`]): `Err` says why not. Probed once, on our own pid,
+/// and kept for the daemon's life, so the two schemes are never mixed: on
+/// a pidfs host a pid that `pidfd_open(2)` refuses later (gone, out of
+/// descriptors, not visible from our pid namespace) is unknown — `lineage`
+/// answers `Err`, and callers name it by pid alone — never by its start
+/// time. Only on 64-bit hosts, where the number is never reused.
+fn pidfs() -> Result<(), &'static str> {
+    static PIDFS: std::sync::OnceLock<Result<(), &'static str>> = std::sync::OnceLock::new();
+    *PIDFS.get_or_init(|| {
+        if !cfg!(target_pointer_width = "64") {
+            return Err("pidfs inode numbers are reused on 32-bit hosts");
+        }
+        let Ok(fd) = pidfd_open(std::process::id()) else {
+            return Err("pidfd_open(2) failed (kernel < 5.3, or refused by a seccomp filter)");
+        };
+        // SAFETY: a zeroed statfs is valid; the kernel fills it.
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is an open descriptor and `st` is ours.
+        if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut st) } != 0 {
+            return Err("fstatfs(2) of a pidfd failed");
+        }
+        #[allow(clippy::unnecessary_cast)] // `f_type`'s width differs per arch
+        let magic = st.f_type as i64;
+        if magic != PID_FS_MAGIC {
+            return Err("pidfds are not on pidfs (kernel < 6.9, or CONFIG_FS_PID=n)");
+        }
+        Ok(())
+    })
+}
+
+fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    // SAFETY: pidfd_open(2) takes a pid and flags and returns a new
+    // descriptor or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor was just returned to us and nothing else owns it.
+    Ok(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd as libc::c_int) })
+}
+
+/// Process `tgid`'s identity across pid reuse on pidfs: the inode number
+/// of its pidfd, its `struct pid`'s number (`pidfd_open(2)`, Linux >= 6.9).
+/// On 64-bit hosts it is one per process for the boot, never 0 and never
+/// given to another (a 64-bit counter; 32-bit hosts reuse it, so
+/// [`pidfs`] is false there). The same from every thread, and kept across
+/// an `execve(2)` from a thread that is not the leader (the leader's
+/// `struct pid` goes to the exec'ing thread), where the start time changes.
+///
+/// Not the start time from `/proc/<pid>/stat`, because a FUSE request can
+/// come from inside its caller's `execve(2)`, and reading `stat` there can
+/// wait for that very exec. Since 6650527444da ("proc: protect
+/// ptrace_may_access() with exec_update_lock (part 1)", Linux 7.2-rc1,
+/// `Cc: stable`) `/proc/<pid>/stat` and `wchan` take the task's
+/// `exec_update_lock`, and until e780259b54e6 ("exec: do_close_on_exec()
+/// before taking exec_update_lock", 7.3-rc3, `Cc: stable`) `execve`
+/// closes the caller's `O_CLOEXEC` descriptors while it holds that lock
+/// for writing: a `FLUSH` for each one on a FUSE mount, waited for without
+/// interruption. A daemon reading `stat` to answer that `FLUSH` waited for
+/// the exec that waited for the daemon, until the connection was aborted
+/// (plan 31's closing gate, on a kernel with the first commit and not the
+/// second: every `git` that a process holding an `flock` on the mount
+/// forked). A `READ` of a binary stored on the mount can come from the
+/// same window (the exec loading it), and a read is fenced, so it names
+/// its caller too. `/proc/<pid>/status` and a pidfd wait for nothing the
+/// task holds.
+fn pidfs_identity(tgid: u32) -> io::Result<u64> {
+    let fd = pidfd_open(tgid)?;
+    // SAFETY: a zeroed stat is valid; the kernel fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is an open descriptor and `st` is ours.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st.st_ino)
+}
+
 /// `Groups:` of a `/proc/<pid>/status`.
 pub fn parse_groups(status: &str) -> Vec<u32> {
     status_field(status, "Groups")
@@ -280,11 +361,27 @@ impl Process for LinuxProcess {
         Ok(parse_groups(&status))
     }
 
+    fn lineage_waits_for_exec(&self) -> Option<String> {
+        pidfs().err().map(|why| {
+            format!(
+                "processes are named by their start time from /proc/<pid>/stat: {why}; on a \
+                 kernel with 6650527444da and without e780259b54e6 a close a process sends from \
+                 inside its execve(2) can hang while this node holds a cluster lock"
+            )
+        })
+    }
+
     fn lineage(&self, pid: u32) -> io::Result<crate::Lineage> {
+        // `status` names no lock the task can hold; see `pidfs_identity`
+        // for why the start time is not read where pidfs exists.
         let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
         let (tgid, ppid) = parse_lineage(&status).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "no Tgid/PPid in the status")
         })?;
+        if pidfs().is_ok() {
+            let start = pidfs_identity(tgid)?;
+            return Ok(crate::Lineage { tgid, ppid, start });
+        }
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let start = parse_start_time(&stat).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "no starttime in the stat")
@@ -911,6 +1008,10 @@ garbage line without the separator
             .unwrap();
         assert_eq!((of_thread.tgid, of_thread.ppid), (me, mine.ppid));
         assert!(of_thread.start >= mine.start);
+        if pidfs().is_ok() {
+            assert_eq!(of_thread.start, mine.start, "one identity per process");
+        }
+        assert_eq!(p.lineage_waits_for_exec().is_none(), pidfs().is_ok());
         let t = p.current_thread();
         let other = std::thread::spawn(|| LinuxProcess.current_thread())
             .join()
@@ -920,6 +1021,36 @@ garbage line without the separator
             Path::new(&format!("/proc/self/task/{}", t.tid)).exists(),
             "{t:?}"
         );
+    }
+
+    /// Where pidfs exists a lineage's identity is the process's pidfd
+    /// inode, so naming a process reads nothing an `execve(2)` holds
+    /// (`pidfs_identity`); every process has its own, whichever way it
+    /// is read.
+    #[test]
+    fn a_lineage_names_each_process_apart() {
+        let p = LinuxProcess;
+        let me = p.lineage(std::process::id()).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let theirs = p.lineage(child.id()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(theirs.tgid, child.id());
+        assert_eq!(theirs.ppid, std::process::id());
+        assert!(theirs.start > 0);
+        assert_ne!(theirs.start, me.start, "two processes, two identities");
+        if pidfs().is_ok() {
+            let fd = pidfd_open(std::process::id()).unwrap();
+            // SAFETY: a zeroed stat is valid; the kernel fills it.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: an open descriptor and our own buffer.
+            assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) }, 0);
+            assert_eq!(me.start, st.st_ino);
+        }
+        assert!(p.lineage(u32::MAX).is_err());
     }
 
     /// A thread asked for its backtrace gets the signal and survives it.

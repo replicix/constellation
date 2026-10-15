@@ -170,8 +170,10 @@ pub(crate) fn advance_test_clock(ms: i64) {
 }
 
 /// The process of task `pid` (FUSE names a request by its thread),
-/// named across pid reuse: `(thread group id, start time)` — `(pid, 0)`
-/// where `/proc` cannot tell (gone, or no `/proc`).
+/// named across pid reuse: `(thread group id, its identity)`, the
+/// platform's `Lineage::start` (never a read that waits for an `execve(2)`
+/// the caller is in, where the host has pidfs: a `FLUSH` can come from
+/// there) — `(pid, 0)` where `/proc` cannot tell (gone, or no `/proc`).
 pub fn process_of(pid: u32) -> (u32, u64) {
     if pid == 0 {
         return (0, 0);

@@ -1053,6 +1053,18 @@ impl Engine {
             locks = if locks_cluster { "cluster" } else { "local" },
             "file locks"
         );
+        // A close (`FLUSH`) sent from inside its caller's `execve(2)` names
+        // the caller's process while this node holds any cluster lock
+        // (`crate::locks::process_of`); without pidfs that reads
+        // `/proc/<pid>/stat`, which some kernels make wait for the exec.
+        if locks_cluster {
+            if let Some(why) = constellation_platform::native()
+                .process
+                .lineage_waits_for_exec()
+            {
+                tracing::warn!(target: "constellation::locks", "{why}");
+            }
+        }
         let lock_flushers = Arc::new(crate::locks::LockFlushers::default());
         // Plan 30 §M10: flexible-quorum continuation epochs.
         core_config.epoch_slack = fsmeta.epoch_slack();

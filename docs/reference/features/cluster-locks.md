@@ -378,12 +378,31 @@ node still holds its `flock`. That node is **fenced**:
   `symlink`, `link`, `unlink`, `rmdir`, `rename`, `setxattr` and
   `removexattr`. The owner is recognised by its **process**: a lock
   records the process (thread group) of the thread that took it, named
-  by its pid and start time, and a request is fenced when it comes from
+  by its pid and an identity no later process with that pid has (its
+  pidfd's inode number on a 64-bit host whose kernel has pidfs, Linux 6.9
+  and later; its start time elsewhere), and a request is fenced when it
+  comes from
   any thread of that process or of a process it started — whichever
   thread took the lock (`flock turn.lock git commit …` fences the git
   under the `flock` command; a program that locks from a worker thread
-  and runs git as a child is fenced as a whole). The start time keeps a
-  recycled pid from being taken for the fenced process. A request that
+  and runs git as a child is fenced as a whole). The identity keeps a
+  recycled pid from being taken for the fenced process. It is not the
+  start time where pidfs exists because a request can come from inside
+  its caller's `execve(2)`, and reading `/proc/<pid>/stat` there can wait
+  for that exec: `stat` (and `wchan`) take the task's `exec_update_lock`
+  since Linux commit 6650527444da ("proc: protect ptrace_may_access() with
+  exec_update_lock (part 1)", 7.2-rc1, `Cc: stable`), and until
+  e780259b54e6 ("exec: do_close_on_exec() before taking
+  exec_update_lock", 7.3-rc3, `Cc: stable`) the exec closes the caller's
+  `O_CLOEXEC` descriptors while it holds that lock — a `FLUSH` for each
+  one on the mount, which waits for the daemon's answer while the
+  daemon's read waits for the exec: the close never ends, and only
+  aborting the FUSE connection does. A `READ` of a binary stored on the
+  mount can come from the same window. A kernel with the first commit and
+  without the second, and without pidfs (before 6.9, or
+  `CONFIG_FS_PID=n`, or `pidfd_open(2)` refused by a seccomp filter),
+  still has the hang; the daemon warns at start when it names processes
+  by their start time. A request that
   carries the kernel's lock owner and names the fenced owner is fenced
   too, but that only helps `fcntl` locks with direct I/O: the kernel
   sends a lock owner only with direct-I/O reads and writes, and for
@@ -987,19 +1006,20 @@ would make SQLite unusable and would fence I/O whenever S3 is slow. So:
   write or namespace operation for the owner fence and the fencing
   token (8 ns per operation measured).
 - The fencing token: while this node holds any local lock, each
-  operation that mutates takes its caller's tag once (its `/proc` start
-  time and the lock table: about 7.5 µs measured on this host, the same
+  operation that mutates takes its caller's tag once (its `/proc` status,
+  its process's identity and the lock table: about 7.5 µs measured on this host with
+  the start-time read, which the pidfd read is slightly cheaper than; the same
   for a process that turns out to hold no lock). A tagged forward is 21
   bytes longer (one grant: a full-width node id, the seq, the window);
   an untagged one 1 byte. The executor's check is one lookup per token
   (11 ns measured). No extra message is sent. While locks are
   held under honoured grants, the owner fence costs a second load. While
   an owner is fenced, every such operation on the node takes the lock
-  table's mutex and reads its thread's `/proc` entry (its start time, so
+  table's mutex and reads its thread's `/proc` entry and identity (so
   a recycled pid is judged afresh); a thread not yet seen reads `/proc`
   up its parent chain once (the verdict is cached per thread until the
   fenced set changes). Taking a lock reads the locking thread's `/proc`
-  entries once (its process and their start times).
+  entries once (its process and their identities).
 
 WAN numbers are measured separately (`lock-latency`, `bench/remote`).
 

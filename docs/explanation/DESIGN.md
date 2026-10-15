@@ -1137,7 +1137,9 @@ of another node's `close()` out of band, with no lock between them
   until they are unlocked or a new grant arrives (NFSv4's rule), and its
   writes under the lapsed grant are never published. The lock's *owner*
   is fenced on every file: the process of the thread that took the lock
-  (by thread group, named by pid and start time), all its threads and
+  (by thread group, named by pid and an identity no later process with
+  that pid has: its pidfd's inode number where pidfs exists, else its
+  start time), all its threads and
   the processes it started get `EIO` from every write and namespace
   operation until the owner's locks are gone, because an application that guards other files with the
   lock, as git does, must not write on once another node may hold it.

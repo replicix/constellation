@@ -74,8 +74,15 @@ pub struct Lineage {
     pub tgid: u32,
     /// The parent of its process.
     pub ppid: u32,
-    /// When the task started (clock ticks since boot; 0: unknown). With
-    /// the id it names the task across pid reuse.
+    /// What tells it from a task that later gets its id (0: unknown):
+    /// with the id it names the task across pid reuse. Opaque, only ever
+    /// compared for equality, and never compared across daemons. On a
+    /// 64-bit Linux host with pidfs (>= 6.9) its process's pidfd inode
+    /// number, one per process for the boot and never reused, read without
+    /// waiting for an `execve(2)` the process is in; else when the task
+    /// started (clock ticks since boot). Which one is decided once per
+    /// process: a pid the pidfs scheme cannot name has no lineage (`Err`),
+    /// never a start time.
     pub start: u64,
 }
 
@@ -98,6 +105,14 @@ pub trait Process: Send + Sync {
     /// process; the parent is the process's parent): to tell whether a
     /// request comes from a given process or one it started.
     fn lineage(&self, pid: u32) -> io::Result<Lineage>;
+
+    /// `Some(why)` when [`Self::lineage`] can wait for an `execve(2)` the
+    /// task is in, which a request sent from inside it then waits for (a
+    /// Linux host without pidfs: the start time is read from
+    /// `/proc/<pid>/stat`). `None`: it never waits, or there is no lineage.
+    fn lineage_waits_for_exec(&self) -> Option<String> {
+        None
+    }
 
     /// This process's effective `(uid, gid)`: the owner a file this
     /// process creates on its own behalf gets.
