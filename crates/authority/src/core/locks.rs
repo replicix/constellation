@@ -50,6 +50,7 @@
 //!   flush of the file's dirty data (`Action::LockFlush` →
 //!   `Event::LockFlushed`) before `LockReleased`.
 
+use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk, LockAnswer, LockTestAnswer, S3Op};
 use crate::event::{LockOutcome, LockRenewEntry, LockRenewResult, LockTestOutcome, PeerMsg};
@@ -399,9 +400,29 @@ pub(crate) struct LockState {
     /// What the answer being built needs durable (`lock_need_horizon`),
     /// taken by `lock_answer`.
     horizon_need: i64,
-    /// Answers waiting for the horizon: `(needed, to, message)`, in the
-    /// order they were made.
-    horizon_held: Vec<(i64, NodeId, PeerMsg)>,
+    /// Answers waiting for the horizon or (plan 41 L0) for the tenure's
+    /// liveness, in the order they were made.
+    horizon_held: Vec<HeldAnswer>,
+    /// Plan 41 L0: the answer being built extends a window while the
+    /// tenure's S3 liveness is stale or the tenure is not marked
+    /// (`Core::renew_hold`); taken by `lock_answer`, or by the renewal
+    /// tick for this node's own grants.
+    fresh_need: Option<FreshHold>,
+    /// Plan 41 L0: this node's own renewals at itself (`Route::Me`)
+    /// decided while stale: `(hold, ino, grant, result)`, applied as
+    /// renewed from the decision once the tenure is proven, or failed.
+    own_held: Vec<(FreshHold, Ino, GrantId, LockRenewResult)>,
+}
+
+/// An owner's answer to a peer held back: until the restart horizon is
+/// durable through `need`, and (plan 41 L0) until `fresh`'s tenure is
+/// proven live.
+#[derive(Debug)]
+pub(crate) struct HeldAnswer {
+    need: i64,
+    fresh: Option<FreshHold>,
+    to: NodeId,
+    msg: PeerMsg,
 }
 
 /// How many subtree floors an owner keeps before folding them into one
@@ -443,6 +464,7 @@ impl LockState {
             ("lk_renews", self.renews.len()),
             ("lk_late_renews", self.late_renews.len()),
             ("lk_horizon_held", self.horizon_held.len()),
+            ("lk_own_held", self.own_held.len()),
             ("lk_barriers", self.barriers.len()),
             ("lk_dir_barriers", self.dir_barriers.len()),
             ("lk_heads", self.heads.len()),
@@ -907,15 +929,47 @@ impl Core {
     /// overtake a held grant, and so reach the holder before the grant
     /// it recalls — covered on the holder's side by `note_pending_recall`
     /// and `tombstone_unheld`.
+    ///
+    /// Plan 41 L0: an answer that extended a window while the tenure's
+    /// liveness was stale (`fresh_need`) waits, the same way, for the
+    /// lease read that proves the tenure (`renew_after_event`), and is
+    /// refused (`NotOwner { 0 }`) if it shows a deposition. Holding
+    /// rather than refusing at once: a refusal makes the holder re-read
+    /// the lease and send again, a round trip to S3 either way.
     fn lock_answer(&mut self, to: NodeId, msg: PeerMsg, out: &mut Vec<Action>) {
         let need = std::mem::take(&mut self.lk.horizon_need);
-        let behind = self.lk.horizon_held.iter().any(|(_, n, _)| *n == to);
-        if need <= self.lk.horizon_durable && !behind {
+        let fresh = self.lk.fresh_need.take();
+        let behind = self.lk.horizon_held.iter().any(|h| h.to == to);
+        if need <= self.lk.horizon_durable && fresh.is_none() && !behind {
             out.push(Action::Send { to, msg });
             return;
         }
-        self.stats.lock_horizon_held += 1;
-        self.lk.horizon_held.push((need, to, msg));
+        if fresh.is_none() || need > self.lk.horizon_durable {
+            self.stats.lock_horizon_held += 1;
+        }
+        if let Some(f) = fresh {
+            self.stats.renew_held += 1;
+            self.renew_kick(&[f], out);
+            // A holder whose renewal waits re-sends it at every tick (its
+            // 500 ms timeout): the answer to a re-send supersedes a held
+            // one to the same peer that renews nothing more, so it is not
+            // queued twice (one per renewal round, not per re-send).
+            if let PeerMsg::LockRenewed { results, .. } = &msg {
+                let renews: Vec<GrantId> = results.iter().map(|(_, g, _)| *g).collect();
+                self.lk.horizon_held.retain(|h| {
+                    !(h.to == to
+                        && h.fresh.is_some()
+                        && matches!(&h.msg, PeerMsg::LockRenewed { results, .. }
+                            if results.iter().all(|(_, g, _)| renews.contains(g))))
+                });
+            }
+        }
+        self.lk.horizon_held.push(HeldAnswer {
+            need,
+            fresh,
+            to,
+            msg,
+        });
         self.lock_horizon_write(out);
     }
 
@@ -958,22 +1012,57 @@ impl Core {
                 true
             }
         };
+        self.lock_flush_held(now, failed, replica, out);
+    }
+
+    /// Send the held answers that may go now, in order per peer.
+    /// `horizon_failed`: the horizon write failed, and what it should
+    /// have covered is refused (as a failed synchronous write refused
+    /// it) — a grant answered `Busy` (and dropped here), a renewal
+    /// `NotOwner { 0 }` (the holder retries). Plan 41 L0: an answer held
+    /// for liveness goes once its tenure is proven, and is refused the
+    /// same way once that tenure is gone (`Core::renew_verdict`).
+    fn lock_flush_held(
+        &mut self,
+        now: Ms,
+        horizon_failed: bool,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let durable = self.lk.horizon_durable;
         let held = std::mem::take(&mut self.lk.horizon_held);
-        let mut keep: Vec<(i64, NodeId, PeerMsg)> = Vec::new();
+        let mut keep: Vec<HeldAnswer> = Vec::new();
         let mut dropped = Vec::new();
-        for (need, to, mut msg) in held {
-            if failed {
-                // Everything held goes now, in order: what the write
-                // should have covered refused.
-                if need > durable && !Self::lock_refuse_answer(&mut msg, &mut dropped) {
+        for mut h in held {
+            if let Some(f) = h.fresh {
+                match self.renew_verdict(now, f) {
+                    FreshVerdict::Ready => h.fresh = None,
+                    FreshVerdict::Wait => {}
+                    FreshVerdict::Refuse => {
+                        self.stats.renew_refused += 1;
+                        if !Self::lock_refuse_answer(&mut h.msg, &mut dropped) {
+                            continue;
+                        }
+                        // Refused, it extends nothing: no horizon to wait for.
+                        h.fresh = None;
+                        h.need = i64::MIN;
+                    }
+                }
+            }
+            if horizon_failed && h.need > durable {
+                if !Self::lock_refuse_answer(&mut h.msg, &mut dropped) {
                     continue;
                 }
-                out.push(Action::Send { to, msg });
-            } else if need <= durable && !keep.iter().any(|(_, n, _)| *n == to) {
-                out.push(Action::Send { to, msg });
+                h.need = i64::MIN;
+                h.fresh = None;
+            }
+            if h.need <= durable && h.fresh.is_none() && !keep.iter().any(|k| k.to == h.to) {
+                out.push(Action::Send {
+                    to: h.to,
+                    msg: h.msg,
+                });
             } else {
-                keep.push((need, to, msg));
+                keep.push(h);
             }
         }
         self.lk.horizon_held = keep;
@@ -983,6 +1072,69 @@ impl Core {
             }
         }
         self.lock_horizon_write(out);
+    }
+
+    /// Plan 41 L0, after every event: the renewal answers held for the
+    /// tenure's liveness (a peer's, this node's own, a delegate's) go
+    /// once it is proven, or are refused once it is gone; those still
+    /// waiting keep a lease read in flight (`Core::renew_kick`).
+    ///
+    /// The hold has no timer of its own: it is settled by the events that
+    /// can settle it — the lease read's result (or any other S3 result,
+    /// the marking CAS's included), a deposition — and its lock-TTL bound
+    /// is checked at the next event. A fast tenure never goes long without
+    /// one: its backup bookkeeping runs every 50 ms (`HOUSEKEEPING_MS`,
+    /// the backup tick) and an `ack=s3` holder's stream heartbeat is a
+    /// timer too.
+    pub(crate) fn renew_after_event(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.lk.horizon_held.iter().any(|h| h.fresh.is_some()) {
+            self.lock_flush_held(now, false, replica, out);
+        }
+        if !self.lk.own_held.is_empty() {
+            let me = self.cfg.node_id;
+            let held = std::mem::take(&mut self.lk.own_held);
+            let before = held.len();
+            let mut keep = Vec::new();
+            for (f, ino, id, r) in held {
+                match self.renew_verdict(now, f) {
+                    FreshVerdict::Ready => {
+                        // Honoured from the decision, as a peer's from its
+                        // renewal's send.
+                        self.lock_apply_renew_result(now, me, ino, id, f.at, r, replica, out);
+                    }
+                    FreshVerdict::Wait => keep.push((f, ino, id, r)),
+                    FreshVerdict::Refuse => {
+                        self.stats.renew_refused += 1;
+                        replica.locks().renewal_failed(ino, id);
+                    }
+                }
+            }
+            let settled = keep.len() < before;
+            self.lk.own_held = keep;
+            // A failed one is due again; an applied one has its next point.
+            if settled && replica.locks().held_count() > 0 {
+                self.lock_arm_renew_tick(now, replica, out);
+            }
+        }
+        if !self.ack.renew_held_deleg.is_empty() {
+            self.deleg_flush_held(now, out);
+        }
+        let waiting: Vec<FreshHold> = self
+            .lk
+            .horizon_held
+            .iter()
+            .filter_map(|h| h.fresh)
+            .chain(self.lk.own_held.iter().map(|(f, ..)| *f))
+            .chain(self.ack.renew_held_deleg.iter().map(|(f, ..)| *f))
+            .collect();
+        if !waiting.is_empty() {
+            self.renew_kick(&waiting, out);
+        }
     }
 
     /// A held answer whose horizon could not be persisted: its grants
@@ -2383,6 +2535,22 @@ impl Core {
         if ttl <= 0 {
             return LockRenewResult::NotOwner { owner: 0 };
         }
+        // Plan 41 L0: the root extends a window only as far as a fresh
+        // owner may promise one. A tenure that can be taken over before
+        // its lease expires (a backup's seal, `ack=s3`) answers with fresh
+        // S3 liveness and a marked lease, as it grants (`lock_serve`):
+        // its successor's grace (`note_marker_landed`) covers what it
+        // answered within `backup_takeover_ms` of its last proof, and
+        // nothing later. Checking the lease's usability alone, a root
+        // sealed by its backups kept renewing — its own grants at the
+        // tick and its peers' — up to `lock_ttl` past that grace while
+        // its lease ran (the model's
+        // `fast_takeover_renewals_without_the_probe_violate`). Stale, the
+        // extension is decided now and its answer held behind a lease
+        // read (`lock_answer`, `renew_after_event`), refused if the read
+        // shows a deposition. A delegate's authority is its delegation,
+        // which the root renewed under the same rule (`on_deleg_renew`).
+        let hold = if gen == 0 { self.renew_hold(now) } else { None };
         if gen != 0 && ttl < self.lock_min_grant_ms() {
             // A delegate short of authority: renew the delegation now
             // (the caller does), so the next renewal gives more.
@@ -2418,6 +2586,9 @@ impl Core {
                 if from != self.cfg.node_id {
                     self.lock_need_horizon(until, until + ttl / 4);
                 }
+                if hold.is_some() {
+                    self.lk.fresh_need = hold;
+                }
                 self.stats.lock_renewals_served += 1;
                 return LockRenewResult::Ok {
                     ttl_ms: ttl as u64,
@@ -2433,6 +2604,9 @@ impl Core {
         if grace && conflicting.is_empty() {
             if from != self.cfg.node_id {
                 self.lock_need_horizon(until, until);
+            }
+            if hold.is_some() {
+                self.lk.fresh_need = hold;
             }
             // Its holder's renewal: confirmed from now on.
             replica.locks().install(Grant {
@@ -3332,7 +3506,17 @@ impl Core {
                 Route::Me { .. } => {
                     let me = self.cfg.node_id;
                     let r = self.lock_renew_one(now, me, ino, h.id, h.mode, replica);
-                    self.lock_apply_renew_result(now, me, ino, h.id, now, r, replica, out);
+                    if let Some(f) = self.lk.fresh_need.take() {
+                        // Plan 41 L0: the tenure's liveness is stale; the
+                        // grant stays `renewing` (not due again) until the
+                        // lease read proves the tenure (applied as renewed
+                        // now) or shows it gone (failed, and due again).
+                        self.stats.renew_held += 1;
+                        self.lk.own_held.push((f, ino, h.id, r));
+                        self.renew_kick(&[f], out);
+                    } else {
+                        self.lock_apply_renew_result(now, me, ino, h.id, now, r, replica, out);
+                    }
                     for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
                         self.deleg_renew_now(now, gen, out);
                     }
@@ -3569,6 +3753,17 @@ impl Core {
                 let names_delegate = replica.delegation_table().iter().any(|e| e.node == owner);
                 if owner != 0 && owner != self.cfg.node_id && !names_delegate {
                     self.lease.cached_holder = Some(owner);
+                } else if owner == 0
+                    && from != self.cfg.node_id
+                    && self.lease.cached_holder == Some(from)
+                {
+                    // The owner this node cached names no other one (a
+                    // root that found itself deposed, plan 41 L0): the next
+                    // renewal reads the lease, as a request's retry does,
+                    // rather than ask it again at once — the grant is due
+                    // again, and the tick re-armed for it fired every
+                    // millisecond at the old root.
+                    self.lease.cached_holder = None;
                 }
                 self.lock_note_not_owner(from, ino, owner, replica);
                 replica.locks().renewal_failed(ino, id);

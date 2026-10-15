@@ -933,6 +933,34 @@ flush first, which drains the file's pending chunks (sharing the
 close's uploads in flight) and syncs the journal before the grant
 moves.
 
+**Amended (renewals on a fast tenure, plan 41 L0)**: a root whose tenure
+can be taken over before its lease expires (a listed backup, or
+`ack=s3`) extends a window it promised (a lock grant's renewal, its own
+grants' included; a reclaim; a delegation's renewal) only as a new grant
+is made: within `backup_takeover_ms` of the send of an S3 request that
+proved the tenure, on a lease marked as granting. The successor's grace
+covers no more. Renewals had checked only that the lease was usable, so
+a root its backups had sealed, still reachable from lock holders, kept
+renewing (its own grants and its peers') until it noticed the
+deposition, up to `lock_ttl` past the successor's grace, and its
+delegates kept granting in a subtree the successor reclaimed (the
+model's `fast_takeover_renewals_without_the_probe_violate`). A renewal
+decided on stale liveness is applied to the owner's table and its answer
+held behind one lease read, sent once the read shows the tenure still
+holds (a proof sent after the decision covers it) and refused
+(`NotOwner { 0 }`; a delegation's answer dropped) if it shows a
+successor. A root that cannot reach S3 therefore renews nothing: cut
+longer than about `(ttl − margin) / 2`, its tenure's grants lapse even
+while its backups acknowledge (before, they lasted until the lease
+ran out). After a fast takeover, the successor outwaits an inherited
+delegation `backup_takeover_ms` longer than the reclaim horizon, as its
+lock quarantine adds that window. A lone node, and any `Local` tenure
+without backups, is unchanged: no read, no wait. Rejected: answering `NotOwner { 0 }` at
+once (each holder would re-read the lease from S3 and send again, the
+same round trip, for every holder); a shorter TTL instead of the read
+(a window still decided without a proof). See
+[Leases, renewal and fencing](../reference/features/cluster-locks.md#leases-renewal-and-fencing).
+
 ## ADR-26: Exact chunk-location reconciliation replaces bloom digests
 
 **Context**: peers learned each other's cached chunks from bloom-filter

@@ -11,7 +11,7 @@
 //! `cargo test -p constellation-model --release --test locks -- --nocapture`
 
 use constellation_model::locks::{LockModel, Mode, Op, NONE};
-use stateright::{Checker, Model};
+use stateright::{Checker, HasDiscoveries, Model};
 use std::time::{Duration, Instant};
 
 // `drift-margin-3` is the largest clean run: 43.7M states (13.9M unique)
@@ -23,12 +23,16 @@ const CAP: (usize, Duration) = (60_000_000, Duration::from_secs(150));
 /// runs go depth-first, which reaches the deep counterexamples (a
 /// renewal chain past a grace period) within the budget.
 fn run(label: &str, model: &LockModel) -> impl Checker<LockModel> {
+    run_within(label, model, CAP)
+}
+
+fn run_within(label: &str, model: &LockModel, cap: (usize, Duration)) -> impl Checker<LockModel> {
     let started = Instant::now();
     let checker = model
         .clone()
         .checker()
-        .target_state_count(CAP.0)
-        .timeout(CAP.1)
+        .target_state_count(cap.0)
+        .timeout(cap.1)
         .spawn_bfs()
         .join();
     report(label, &checker, started);
@@ -71,10 +75,43 @@ fn assert_violates(label: &str, model: &LockModel) {
     println!("  final: {:?}", d.last_state().violation);
 }
 
+/// As `assert_violates`, but the search stops at the first failure: for
+/// a state space whose counterexample a depth-first search may otherwise
+/// reach only near the shared budget.
+fn assert_violates_soon(label: &str, model: &LockModel) {
+    let started = Instant::now();
+    let checker = model
+        .clone()
+        .checker()
+        .finish_when(HasDiscoveries::AnyFailures)
+        .target_state_count(CAP.0)
+        .timeout(CAP.1)
+        .spawn_dfs()
+        .join();
+    report(label, &checker, started);
+    let d = checker
+        .discovery("mutual_exclusion")
+        .unwrap_or_else(|| panic!("{label}: expected a mutual-exclusion counterexample"));
+    println!("{label}: counterexample (t = {}):", d.last_state().t);
+    for (s, a) in d.clone().into_actions().into_iter().enumerate() {
+        println!("  {s:2}: {a:?}");
+    }
+    println!("  final: {:?}", d.last_state().violation);
+}
+
 fn assert_clean(label: &str, model: &LockModel, sometimes: &[&'static str]) {
-    let checker = run(label, model);
+    assert_clean_within(label, model, sometimes, CAP);
+}
+
+fn assert_clean_within(
+    label: &str,
+    model: &LockModel,
+    sometimes: &[&'static str],
+    cap: (usize, Duration),
+) {
+    let checker = run_within(label, model, cap);
     assert!(
-        checker.is_done() && checker.state_count() < CAP.0,
+        checker.is_done() && checker.state_count() < cap.0,
         "{label}: expected exhaustive exploration within budget"
     );
     if let Some(d) = checker.discovery("table_consistent") {
@@ -276,6 +313,118 @@ fn fast_takeover_with_the_probe_is_clean_for_the_old_root() {
         ..LockModel::design(vec![vec![Lock(X), Io], vec![Lock(X), Io], vec![]])
     };
     assert_clean("fast-probe", &m, &["all_ops_done", "fast_takeover"]);
+}
+
+/// Plan 41 L0: the deposed root's renewals. Node 2 (the backup) takes
+/// the lease over before it expires; root 0 has not probed since, still
+/// believes it holds (its lease is long) and renews its **own** grant —
+/// the `Route::Me` path of `on_lock_renew_tick` — until the successor's
+/// grace has passed and the successor granted itself.
+fn fast_takeover_renewals(renew_probe_freshness: bool, max_tick: u8, max_renews: u8) -> LockModel {
+    LockModel {
+        backup: 2,
+        replicate: false,
+        grace: true,
+        renew_probe_freshness,
+        lease_ttl: 30,
+        lock_ttl: 3,
+        max_drops: 0,
+        max_tick,
+        max_renews,
+        ..LockModel::design(vec![vec![Lock(X), Io], vec![], vec![Lock(X)]])
+    }
+}
+
+/// Renewal freshness off (the code before plan 41 L0: `lock_renew_one`
+/// checked the lease's usability only, while new grants checked
+/// `strict_answer_allowed`): violated. The checker's path: node 2 takes
+/// over at t = 0 (grace to t = 6), root 0 renews its own grant at
+/// t = 1..5, node 2 grants itself at t = 6, root 0 does `Io` under its
+/// grant. Violated at the review's size (8 ticks, 6 renewals) too; this
+/// is the size the fix is checked clean at below. The search stops at
+/// the first failure (the whole space is 54.9M states).
+#[test]
+fn fast_takeover_renewals_without_the_probe_violate() {
+    assert_violates_soon("fast-renew-no-probe", &fast_takeover_renewals(false, 7, 5));
+}
+
+/// The fix: a renewal at a fast root also needs a probe within
+/// `takeover_window`, and the next probe deposes it. Exhaustive at 7
+/// ticks and 5 renewals (30.1M states, 9.8M unique), a size at which the
+/// old rule is violated.
+#[test]
+fn fast_takeover_renewals_with_the_probe_are_clean() {
+    // The shared state budget, a longer clock: 132 s in a debug build
+    // on a loaded host.
+    assert_clean_within(
+        "fast-renew-probe",
+        &fast_takeover_renewals(true, 7, 5),
+        &["fast_takeover"],
+        (CAP.0, Duration::from_secs(600)),
+    );
+}
+
+/// The same at the review's size, 8 ticks and 6 renewals: 77.0M states
+/// (23.9M unique), over the shared budget (release: about 2 minutes;
+/// run nightly).
+#[test]
+#[ignore]
+fn fast_takeover_renewals_with_the_probe_are_clean_at_the_violations_size() {
+    assert_clean_within(
+        "fast-renew-probe-8-6",
+        &fast_takeover_renewals(true, 8, 6),
+        &["fast_takeover"],
+        RENEW_CAP,
+    );
+}
+
+/// The budget of the renewal-freshness runs over the shared one.
+const RENEW_CAP: (usize, Duration) = (150_000_000, Duration::from_secs(900));
+
+/// The remote holder's variant: node 1 holds a grant from root 0 and
+/// renews where it was last answered (`cached_owner`, the code's
+/// `lease.cached_holder`), not at the register's holder: the deposed
+/// root renews its peer's grant past the successor's grace.
+fn fast_takeover_remote_renewals(
+    renew_probe_freshness: bool,
+    max_tick: u8,
+    max_renews: u8,
+) -> LockModel {
+    LockModel {
+        backup: 2,
+        replicate: false,
+        grace: true,
+        renew_probe_freshness,
+        cached_owner: true,
+        lease_ttl: 30,
+        lock_ttl: 3,
+        max_drops: 0,
+        max_tick,
+        max_renews,
+        ..LockModel::design(vec![vec![], vec![Lock(X), Io], vec![Lock(X)]])
+    }
+}
+
+#[test]
+fn fast_takeover_remote_renewals_without_the_probe_violate() {
+    assert_violates_soon(
+        "fast-remote-renew-no-probe",
+        &fast_takeover_remote_renewals(false, 7, 5),
+    );
+}
+
+/// Clean at the size the old rule is violated at: 115.2M states (34.1M
+/// unique), over the shared budget (release: about 3 minutes; run
+/// nightly).
+#[test]
+#[ignore]
+fn fast_takeover_remote_renewals_with_the_probe_are_clean() {
+    assert_clean_within(
+        "fast-remote-renew-probe",
+        &fast_takeover_remote_renewals(true, 7, 5),
+        &["fast_takeover"],
+        RENEW_CAP,
+    );
 }
 
 /// A TTL takeover with grants that outlive the old lease.

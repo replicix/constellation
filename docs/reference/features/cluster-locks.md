@@ -220,6 +220,31 @@ renewed and is released, and so is one whose requester gave up (its
 answer lost, a non-blocking request that lost a race). Otherwise the
 node would renew it for ever while the owner's waiters waited.
 
+An owner extends a window only as far as it may grant one. The lease
+holder of a tenure that can be taken over before its lease expires (a
+listed backup, or `ack=s3`; see
+[Durability and failover](durability-and-failover.md)) renews a grant
+(its own grants at its renewal tick included), accepts a reclaim, and
+renews a delegation only with fresh S3 liveness (an S3 request sent
+within `backup_takeover_ms` succeeded without showing another holder)
+and with its lease marked as granting, exactly as it grants. On stale
+liveness it decides the renewal, reads the lease once, and answers when
+the read shows it still holds; if the read shows a successor, it
+answers `NotOwner { 0 }` (the holder renews or reclaims at the
+successor) and steps down (a delegation's answer is dropped, and the
+delegate asks again). An idle fast-tenure root therefore answers a
+renewal one S3 round trip later; the holder counts the answer from its
+own send, late or not. A root that cannot reach S3 answers no renewal
+at all: if the read fails, every answer it held is refused, so a
+fast-tenure root cut from S3 for longer than about `(ttl − margin) / 2`
+(9.5 s at the defaults) lets every lock grant it sequences lapse, its
+own included, and their holders are fenced, even while its backups
+still acknowledge its writes. Before, such a root kept renewing until
+its lease ran out — and so did one its backups had sealed, still
+reached by lock holders and not yet aware of it, up to the lock TTL
+past its successor's grace. A lone node, or any lease holder without
+backups under the default `ack=local`, is not affected.
+
 A delegate's grants are capped by what is left of its own delegation,
 so it keeps that authority topped up: while it has grants out it renews
 the delegation at a quarter of its TTL, a lock renewal that finds less
@@ -797,7 +822,10 @@ owner has replaced it.
 - **Fast takeover** (a sealed backup, or `ack=s3`; see [Durability and
   failover](durability-and-failover.md)): the new holder waits out a
   grace period before it grants anything new, and accepts renewals of
-  grants it does not know as *reclaims*. The grace is `min(old expiry,
+  grants it does not know as *reclaims*. The grace covers what the old
+  holder answered within the takeover window of its last proof of S3
+  liveness, which is all it may answer, grants and renewals alike (see
+  [Leases, renewal and fencing](#leases-renewal-and-fencing)). The grace is `min(old expiry,
   marker + takeover window + max(read delegation TTL, lock TTL) + 2 ×
   margin)`. It holds back new lock grants only: the acknowledgement
   floor that protects read delegations is computed with the read

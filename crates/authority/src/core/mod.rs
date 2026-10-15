@@ -72,7 +72,7 @@ use constellation_store_s3::inbox::InboxKey;
 use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
-pub use backup::AckView;
+pub use backup::{liveness_fresh, AckView};
 pub use client::ClientPhase;
 pub use delegate::{DelegKind, DelegView, RecallPhase};
 
@@ -847,6 +847,13 @@ pub struct Stats {
     pub lock_horizon_held: u64,
     pub lock_horizon_writes: u64,
     pub lock_horizon_failed: u64,
+    /// Plan 41 L0: renewal answers (lock grants, own and peers', and
+    /// delegations) held because the tenure's S3 liveness was stale or
+    /// it was not marked as granting; the lease reads issued for them;
+    /// the held answers refused (the tenure was gone, or not proven).
+    pub renew_held: u64,
+    pub renew_probes: u64,
+    pub renew_refused: u64,
     pub lock_reclaimed: u64,
     pub lock_moved: u64,
     /// Root: a delegate's grants on inodes that left its subtree
@@ -1111,6 +1118,9 @@ pub(crate) enum S3For {
     /// A non-holder whose ops wait for a root's append reading whether
     /// that root's lease has run out (`Core::dead_root_check`).
     DeadRoot,
+    /// Plan 41 L0: a fast tenure's lease read that renewal answers held
+    /// for stale liveness wait for (`Core::renew_kick`).
+    RenewProbe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1655,6 +1665,7 @@ impl Core {
             self.withdraw_lost_deps_inbox_ops(now, replica, &mut out);
         }
         self.locks_after_event(now, replica, &mut out);
+        self.renew_after_event(now, replica, &mut out);
         self.note_client_states(now);
         out
     }
@@ -2033,6 +2044,7 @@ impl Core {
                 }
             }
             S3For::DeadRoot => self.on_dead_root_get(now, result, replica, out),
+            S3For::RenewProbe => self.on_renew_probe(now, result, replica, out),
         }
     }
 

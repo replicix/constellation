@@ -45,7 +45,11 @@
 //!   grant until `now + takeover_window + lock_ttl + 2·seq_margin`
 //!   (capped at the old expiry), while reclaims are accepted. The old
 //!   root keeps answering until it probes the register, and answers only
-//!   within `takeover_window` of a probe (M8's probe freshness).
+//!   within `takeover_window` of a probe (M8's probe freshness) — new
+//!   grants and renewals alike, its own grants' renewals included
+//!   (`renew_probe_freshness`: the code renewed without the probe until
+//!   plan 41 L0, and the checker finds the deposed root renewing its own
+//!   grant past the successor's grace).
 //! - **Delegation moves.** `Delegate` hands the table to the delegate
 //!   (restamped: every entry is live until `now + lock_ttl + seq_margin`
 //!   in the receiver's clock, as if renewed at the move — conservative);
@@ -115,7 +119,9 @@
 //! | recall + park | `on_lock_request` → `recall_needed`-style `LockRecall` + `park_reply(ParkedWhat::LockGrant)` |
 //! | `Deliver(Recall)` / `Released` | `Core::on_lock_recall` → `Action::LockFlush` → `Event::LockFlushed` → `PeerMsg::LockReleased` |
 //! | `Expire` | `Timer::LockGrantExpiry` |
-//! | `Renew`/`RenewAck`/`Lost` | `Timer::LockRenew` → `PeerMsg::LockRenew` → `LockRenewed { ok }` |
+//! | `Renew`/`RenewAck`/`Lost` | `Timer::LockRenew` → `PeerMsg::LockRenew` → `LockRenewed { ok }`; a node's own grant at the root: `on_lock_renew_tick` → `lock_renew_one(me)` |
+//! | `Renew` at a fast root (`owner_until_for(.., true)`) | `Core::renew_fresh` in `lock_renew_one` (answers held behind a lease read until fresh: `lock_answer`, `lock_fresh_release`) and in `on_deleg_renew` |
+//! | `cached_owner` routing | `lock_route_for`'s `lease.cached_holder`; `NotOwner` → `lock_apply_renew_result` |
 //! | `Io` fenced | `View::lock_fence(ino)` → `EIO` |
 //! | `Takeover` grace | `note_marker_landed`'s floor, extended to lock grants; reclaims in `on_lock_renew` |
 //! | `Delegate`/`Recall` state | `DelegRenewed { locks }` (every granting renewal: `lock_take_handoff`) and `DelegRecalled { locks }` (`lock_install_returned`) |
@@ -174,6 +180,18 @@ pub struct LockModel {
     pub grace: bool,
     /// A `fast` holder answers only within `takeover_window` of a probe.
     pub probe_freshness: bool,
+    /// Plan 41 L0: `probe_freshness` holds for *renewals* too (a node's
+    /// `Renew`, its own included, answered by a fast root). `false` is
+    /// the code before the fix: `lock_renew_one` checked only that the
+    /// lease was usable, so a deposed root that had not probed renewed
+    /// grants (its own and its peers') past its successor's grace, while
+    /// new grants kept the probe (`lock_serve`'s `strict_answer_allowed`).
+    pub renew_probe_freshness: bool,
+    /// A node renews at the owner that last answered it (`Ok` to a lock
+    /// request or a renewal), as the code routes by `lease.cached_holder`;
+    /// a `NotOwner` answer clears it and the node renews at the register's
+    /// holder. `false`: renewals go where `owner_for` says (the register).
+    pub cached_owner: bool,
     /// The root mirrors its table to the backup (asynchronously).
     pub replicate: bool,
     /// A delegation move carries the table.
@@ -251,6 +269,8 @@ impl LockModel {
             cap_by_lease: true,
             grace: true,
             probe_freshness: true,
+            renew_probe_freshness: true,
+            cached_owner: false,
             replicate: true,
             move_state: true,
             handoff_in_flight: true,
@@ -355,6 +375,9 @@ pub struct Node {
     /// The application's lock under the cache.
     pub held: Option<Mode>,
     pub renews: u8,
+    /// The owner that last answered this node `Ok` (`cached_owner`;
+    /// always `NONE` without it).
+    pub cached: u8,
     /// Recalls of grants this node does not hold (yet): a recall can
     /// overtake the reply carrying the grant it recalls. The reply then
     /// installs the grant already recalled — the application gets its
@@ -396,9 +419,11 @@ pub enum Msg {
         mode: Mode,
         sent: i16,
     },
-    /// `ok`: `(id, ttl)`; `None`: not the owner (retry).
+    /// `ok`: `(id, ttl)`; `None`: not the owner (retry). `from`: the
+    /// answering owner under `cached_owner`, else `NONE`.
     LockReply {
         to: u8,
+        from: u8,
         sent: i16,
         ok: Option<(u8, Mode, i16)>,
     },
@@ -421,6 +446,8 @@ pub enum Msg {
     },
     RenewAck {
         to: u8,
+        /// As `LockReply::from`.
+        from: u8,
         id: u8,
         sent: i16,
         outcome: RenewOutcome,
@@ -524,6 +551,13 @@ impl State {
     /// The usable end of node `i`'s authority over `X`'s table, in its
     /// clock, if it believes it is the owner now.
     fn owner_until(&self, cfg: &LockModel, i: usize) -> Option<i16> {
+        self.owner_until_for(cfg, i, false)
+    }
+
+    /// As `owner_until`, for a renewal (`renewal`) or a new grant: the
+    /// probe clause applies to renewals only under
+    /// `renew_probe_freshness` (plan 41 L0).
+    fn owner_until_for(&self, cfg: &LockModel, i: usize, renewal: bool) -> Option<i16> {
         match self.owner {
             Owner::Root => {
                 if !self.believes_root(cfg, i) {
@@ -531,6 +565,7 @@ impl State {
                 }
                 if cfg.backup != NONE
                     && cfg.probe_freshness
+                    && (!renewal || cfg.renew_probe_freshness)
                     && self.local(i) - self.nodes[i].last_probe >= cfg.takeover_window
                 {
                     return None;
@@ -561,6 +596,19 @@ impl State {
     fn owner_for(&self, cfg: &LockModel, i: usize) -> u8 {
         if self.owner == Owner::Root && self.believes_root(cfg, i) {
             return i as u8;
+        }
+        self.current_owner()
+    }
+
+    /// Where node `i` renews: as `owner_for`, except that under
+    /// `cached_owner` a node that is not the root renews at the owner
+    /// that last answered it, while it has one.
+    fn renew_target(&self, cfg: &LockModel, i: usize) -> u8 {
+        if self.owner == Owner::Root && self.believes_root(cfg, i) {
+            return i as u8;
+        }
+        if cfg.cached_owner && self.nodes[i].cached != NONE {
+            return self.nodes[i].cached;
         }
         self.current_owner()
     }
@@ -677,6 +725,7 @@ impl State {
             let id = self.grant(cfg, h, node, mode, ttl, base);
             self.send(Msg::LockReply {
                 to: node,
+                from: if cfg.cached_owner { h as u8 } else { NONE },
                 sent,
                 ok: Some((id, mode, ttl)),
             });
@@ -845,6 +894,7 @@ impl Model for LockModel {
                 cache: None,
                 held: None,
                 renews: 0,
+                cached: NONE,
                 pending_recalls: Vec::new(),
                 table: Vec::new(),
                 parks: Vec::new(),
@@ -986,6 +1036,14 @@ impl Model for LockModel {
                 let o = s.owner_for(self, i);
                 o != NONE && s.owner_until(self, o as usize).is_some()
             };
+            // A renewal goes to `renew_target`; under `cached_owner` it is
+            // sent whether or not that node still owns (a stale owner
+            // answers `NotOwner`, which clears the cache).
+            let renew_ready = {
+                let o = s.renew_target(self, i);
+                o != NONE
+                    && (self.cached_owner || s.owner_until_for(self, o as usize, true).is_some())
+            };
             if node.floor.is_some_and(|f| now >= f) {
                 actions.push(Action::FloorPassed(iu));
             }
@@ -999,7 +1057,7 @@ impl Model for LockModel {
                     matches!(m, Msg::Renew { from, .. } if *from == iu)
                         || matches!(m, Msg::RenewAck { to, .. } if *to == iu)
                 });
-                if !in_flight && owner_ready {
+                if !in_flight && renew_ready {
                     actions.push(Action::Renew(iu));
                 }
             }
@@ -1167,7 +1225,7 @@ impl Model for LockModel {
             Action::Renew(i) => {
                 let i = i as usize;
                 let c = s.nodes[i].cache?;
-                let to = s.owner_for(self, i);
+                let to = s.renew_target(self, i);
                 s.nodes[i].renews += 1;
                 let sent = s.local(i);
                 s.send(Msg::Renew {
@@ -1410,6 +1468,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             if s.owner_until(cfg, h).is_none() {
                 s.send(Msg::LockReply {
                     to: from,
+                    from: NONE,
                     sent,
                     ok: None,
                 });
@@ -1427,7 +1486,12 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 });
             }
         }
-        Msg::LockReply { to, sent, ok } => {
+        Msg::LockReply {
+            to,
+            from: owner,
+            sent,
+            ok,
+        } => {
             let i = to as usize;
             let NodeOp::Locking { mode, sent: mine } = s.nodes[i].op else {
                 return;
@@ -1450,6 +1514,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 recalled,
             });
             s.nodes[i].held = Some(mode);
+            s.nodes[i].cached = owner;
             s.finish_op(i);
         }
         Msg::Recall { to, from, id } => {
@@ -1496,9 +1561,11 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             sent,
         } => {
             let h = to as usize;
-            let Some(until) = s.owner_until(cfg, h) else {
+            let answering = if cfg.cached_owner { to } else { NONE };
+            let Some(until) = s.owner_until_for(cfg, h, true) else {
                 s.send(Msg::RenewAck {
                     to: from,
+                    from: answering,
                     id,
                     sent,
                     outcome: RenewOutcome::NotOwner,
@@ -1550,6 +1617,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             }
             s.send(Msg::RenewAck {
                 to: from,
+                from: answering,
                 id,
                 sent,
                 outcome,
@@ -1557,6 +1625,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
         }
         Msg::RenewAck {
             to,
+            from: owner,
             id,
             sent,
             outcome,
@@ -1570,6 +1639,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             }
             match outcome {
                 RenewOutcome::Ok(ttl, recalled) => {
+                    s.nodes[i].cached = owner;
                     s.nodes[i].cache = Some(Cache {
                         until: c.until.max(sent + ttl - cfg.node_margin),
                         renew_at: c.renew_at.max(sent + ttl / 2),
@@ -1586,7 +1656,9 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                         s.saw |= SAW_FENCED;
                     }
                 }
-                RenewOutcome::NotOwner => {}
+                RenewOutcome::NotOwner => {
+                    s.nodes[i].cached = NONE;
+                }
             }
         }
         Msg::Mirror { to, ver, table } => {

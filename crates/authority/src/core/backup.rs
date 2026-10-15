@@ -138,6 +138,38 @@ pub(crate) fn candidate_backoff_ms(reconfig_min_ms: u64, strikes: u32) -> u64 {
 /// The longest [`candidate_backoff_ms`].
 const CANDIDATE_BACKOFF_MAX_MS: u64 = 60_000;
 
+/// The liveness rule of a tenure that may be taken over before its lease
+/// expires (the module doc): fresh at `at_ms` only within `window_ms`
+/// (`backup_takeover_ms`) of the send of the latest S3 request that
+/// proved the tenure (`last_s3_fresh_ms`); always fresh otherwise. One
+/// definition for the core ([`Core::renew_fresh`]: strict answers, new
+/// lock grants, renewals) and the FUSE side (`LeaseView::reads_locally`).
+pub fn liveness_fresh(
+    fast_tenure: bool,
+    at_ms: i64,
+    last_s3_fresh_ms: i64,
+    window_ms: i64,
+) -> bool {
+    !fast_tenure || at_ms - last_s3_fresh_ms < window_ms
+}
+
+/// Plan 41 L0: an owner's answer that extends a window (a lock grant's
+/// renewal, a reclaim, a delegation's renewal) decided at `at` in lease
+/// epoch `epoch` while the tenure's liveness was stale or the tenure was
+/// not marked as granting: held until [`Core::renew_verdict`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FreshHold {
+    pub at: Ms,
+    pub epoch: Epoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshVerdict {
+    Ready,
+    Wait,
+    Refuse,
+}
+
 /// A candidate's strike count after it timed out at `now`, its previous
 /// strikes and the end of their backoff being `prev`: one more — unless
 /// it has had a quiet [`CANDIDATE_BACKOFF_MAX_MS`] since that backoff
@@ -230,6 +262,15 @@ pub(crate) struct AckState {
     pub s3_rtt_ms: u64,
     /// The `MarkGranting` CAS in flight.
     marking: Option<OpId>,
+    /// Plan 41 L0: the lease read that renewal answers held for stale
+    /// liveness wait for (`Core::renew_probe`), and when it was sent.
+    renew_probe: Option<(OpId, Ms)>,
+    /// A held renewal answer decided at or before this is refused (the
+    /// lease read sent then failed: nothing proves the tenure since).
+    renew_refuse_through: Ms,
+    /// Delegation renewal answers held for liveness (`on_deleg_renew`),
+    /// in the order they were made.
+    pub(crate) renew_held_deleg: Vec<(FreshHold, NodeId, PeerMsg)>,
     /// What the replica's durability gate was last told.
     reported: Option<(bool, u64, bool)>,
     /// The tenure's marker time, for the successor's floor (see the
@@ -575,18 +616,140 @@ impl Core {
 
     /// Whether this holder may answer a strict read now (see the module
     /// doc): under `Local` always (the lease cap is the argument); else
-    /// only with fresh S3 liveness. `false` starts a probe.
+    /// only with fresh S3 liveness ([`Core::renew_fresh`]). `false`
+    /// starts a probe.
     pub(crate) fn strict_answer_allowed(&mut self, now: Ms, out: &mut Vec<Action>) -> bool {
-        if self.lease.ack_policy() == AckPolicy::Local && self.lease.backups().is_empty() {
-            return true;
-        }
-        if now.since(self.ack.last_s3_fresh) < self.cfg.backup_takeover_ms as i64 {
+        if self.renew_fresh(now) {
             return true;
         }
         self.stats.stale_liveness_refusals += 1;
         self.ship.probe_now = true;
         self.nudge(now, out);
         false
+    }
+
+    /// The liveness rule of the module doc, side-effect free: a tenure
+    /// that cannot be taken over before its lease expires (`Local`, no
+    /// backup, or a continuation epoch's hold) is always fresh; any other
+    /// only within `backup_takeover_ms` of the send of an S3 request that
+    /// succeeded without revealing a deposition (`last_s3_fresh`). What a
+    /// strict read, a new lock grant and (plan 41 L0) a renewal of a lock
+    /// grant or a delegation by the root all need. `now` may be the time
+    /// an answer was *decided*: a liveness proof sent after it covers it
+    /// too (the successor's marker came after the request that proved
+    /// the tenure, so after the decision).
+    pub(crate) fn renew_fresh(&self, now: Ms) -> bool {
+        liveness_fresh(
+            self.fast_tenure(),
+            now.0,
+            self.ack.last_s3_fresh.0,
+            self.cfg.backup_takeover_ms as i64,
+        )
+    }
+
+    /// The lease says this tenure grants (`Lease::granted_delegations`),
+    /// or nobody can take it over before it expires: its successor waits
+    /// out the grants and renewals it answered (`note_marker_landed`'s
+    /// floor applies only to a marked tenure).
+    pub(crate) fn tenure_marked(&self) -> bool {
+        !self.fast_tenure()
+            || self
+                .lease
+                .held
+                .as_ref()
+                .is_some_and(|(l, _)| l.granted_delegations)
+    }
+
+    /// Plan 41 L0: an owner extending a window it promised (a lock grant
+    /// or a delegation, as the root) may answer now: fresh liveness and
+    /// a marked tenure, as a new grant needs (`lock_serve`). `Some`: the
+    /// answer is held ([`Core::renew_verdict`]) under this tag.
+    pub(crate) fn renew_hold(&self, now: Ms) -> Option<FreshHold> {
+        if self.renew_fresh(now) && self.tenure_marked() {
+            return None;
+        }
+        Some(FreshHold {
+            at: now,
+            epoch: self.lease.epoch().unwrap_or(0),
+        })
+    }
+
+    /// What becomes of an answer held under `h`: `Ready` once the tenure
+    /// it was decided in is proven live since (or cannot be taken over
+    /// any more) and is marked; `Refuse` once that tenure is gone, the
+    /// lease read that should have proven it failed, or it waited a lock
+    /// TTL (no holder still counts on it); `Wait` otherwise.
+    pub(crate) fn renew_verdict(&self, now: Ms, h: FreshHold) -> FreshVerdict {
+        if self.lease.lost || self.lease.epoch() != Some(h.epoch) {
+            return FreshVerdict::Refuse;
+        }
+        if self.renew_fresh(h.at) && self.tenure_marked() {
+            return FreshVerdict::Ready;
+        }
+        if h.at <= self.ack.renew_refuse_through || now.since(h.at) >= self.cfg.lock_ttl_ms as i64 {
+            return FreshVerdict::Refuse;
+        }
+        FreshVerdict::Wait
+    }
+
+    /// Answers wait under `holds`: read the lease (one read at a time)
+    /// for those whose liveness is stale, and mark the tenure if it is
+    /// not. Nothing for a tenure that cannot be taken over early.
+    pub(crate) fn renew_kick(&mut self, holds: &[FreshHold], out: &mut Vec<Action>) {
+        if !self.fast_tenure() || self.lease.lost {
+            return;
+        }
+        if self.ack.renew_probe.is_none() && holds.iter().any(|h| !self.renew_fresh(h.at)) {
+            let sent = self.last_now;
+            let op = self.issue_s3(S3Op::LeaseGet, S3For::RenewProbe, out);
+            self.ack.renew_probe = Some((op, sent));
+            self.stats.renew_probes += 1;
+        }
+        if !self.tenure_marked() {
+            self.ensure_granting_marked(out);
+        }
+    }
+
+    /// The lease read [`Core::renew_kick`] asked for: another holder (or
+    /// none) is a deposition, found here rather than at the next lease
+    /// CAS; a failed read refuses what it should have proven. Its
+    /// liveness, if any, was noted already (`note_s3_liveness`); the held
+    /// answers go (or are refused) after the event (`renew_after_event`).
+    pub(crate) fn on_renew_probe(
+        &mut self,
+        now: Ms,
+        result: S3Result,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        let Some((_, sent)) = self.ack.renew_probe.take() else {
+            return;
+        };
+        let mine = self
+            .lease
+            .held
+            .as_ref()
+            .filter(|_| !self.lease.lost && !self.lease.epoch_held())
+            .map(|(l, _)| l.epoch);
+        match result {
+            S3Result::LeaseGet(Ok(Some((cur, _)))) => {
+                // (An epoch below this tenure's is a read older than the
+                // acquisition that made it: it proves nothing either way.)
+                if let Some(mine) = mine.filter(|m| cur.epoch >= *m) {
+                    if cur.holder != self.cfg.node_id || cur.epoch != mine {
+                        self.deposed(now, cur.holder, cur.epoch, mine, replica, out);
+                    }
+                }
+            }
+            S3Result::LeaseGet(Ok(None)) => {
+                if let Some(mine) = mine {
+                    self.deposed(now, 0, 0, mine, replica, out);
+                }
+            }
+            _ => {
+                self.ack.renew_refuse_through = self.ack.renew_refuse_through.max(sent);
+            }
+        }
     }
 
     /// Plan 30 §M9: a tenure that serves strict reads says so in the
@@ -672,6 +835,9 @@ impl Core {
     /// acknowledgements wait out the predecessor's strict-read horizon —
     /// unless that tenure never served one.
     pub(crate) fn note_fast_takeover(&mut self, prev: &Lease) {
+        // Plan 41 L0: a predecessor's generations are outwaited the
+        // takeover window longer (`DelegationState::inherit_slack_ms`).
+        self.dl.inherit_slack_ms = self.cfg.backup_takeover_ms;
         self.ack.pending_floor = prev
             .granted_delegations
             .then_some((prev.expires_unix_ms, Ms(0)));

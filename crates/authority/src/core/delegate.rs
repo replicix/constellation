@@ -53,6 +53,7 @@
 //! a delegate that learns of an epoch stops executing. Delegation resumes
 //! by an operator's `delegate` after the epoch closed.
 
+use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk};
 use crate::event::PeerMsg;
@@ -296,6 +297,13 @@ const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
 
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
+    /// Plan 41 L0: this tenure took an unexpired lease over (a seal, or
+    /// `ack=s3`; `note_fast_takeover`), so a predecessor's last delegation
+    /// renewal may have been decided up to `backup_takeover_ms` after its
+    /// last proof of liveness, which came before this tenure's takeover
+    /// CAS: a generation inherited from it is outwaited that much longer
+    /// (`delegation_sync`). 0 after any other acquisition.
+    pub(crate) inherit_slack_ms: u64,
     /// The root's generations (this node holds the lease).
     pub gens: BTreeMap<u64, GenState>,
     /// The generations this node is the delegate of.
@@ -548,6 +556,15 @@ impl Core {
                 // unexpired lease (M9) has not, so the conservative
                 // horizon is waited before a reclaim — a renewal from the
                 // delegate ends the wait sooner.
+                // After such a fast takeover the horizon counts from the
+                // predecessor's last renewal, which it decided within
+                // `backup_takeover_ms` of a proof of liveness older than
+                // this tenure (plan 41 L0, `on_deleg_renew`), so that
+                // window is added (`inherit_slack_ms`), as the lock
+                // quarantine of `note_marker_landed` adds it. Without it
+                // the bound needed `backup_takeover_ms + 2D ≤ 2M`, which
+                // the defaults meet only for D ≤ 250 ms and a 3 s lease's
+                // margin (750 ms) not at all.
                 // The log's index of the stream, never a shadow's (a
                 // forwarded op's reply raised `stream_applied` past what
                 // the predecessor appended; the delegate re-streams the
@@ -579,8 +596,9 @@ impl Core {
                         below_since: None,
                         seal_attempts: 0,
                         cursor,
-                        until: now.plus(self.reclaim_horizon_ms()),
-                        renewed_until: now.plus(self.reclaim_horizon_ms()),
+                        until: now.plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
+                        renewed_until: now
+                            .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
                         ended: false,
@@ -2161,7 +2179,21 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let mut ttl_ms = 0u64;
+        let mut hold = None;
         if self.root_usable(now) && !self.dl.epoch_active {
+            // Plan 41 L0: as a lock renewal (`lock_renew_one`), the
+            // root extends a delegation only as far as a fresh owner may:
+            // under a tenure that can be taken over before its lease
+            // expires, with fresh S3 liveness and a marked lease, or the
+            // answer waits for the lease read that proves the tenure. The
+            // successor waits a delegation renewal out only if it was
+            // made within `backup_takeover_ms` of the old root's last
+            // proof (the `deleg` term of `note_marker_landed`'s floor,
+            // the reclaim horizon of an inherited generation); with only
+            // `root_usable` (no liveness), a root sealed by its backups
+            // renewed for as long as its lease ran, and its delegate kept
+            // granting locks in the subtree the successor reclaimed.
+            hold = self.renew_hold(now);
             let cap = self.grant_cap_ms(now);
             let extra = self.reclaim_horizon_ms() - self.cfg.delegation_ttl_ms;
             if let Some(g) = self.dl.gens.get_mut(&gen) {
@@ -2221,21 +2253,73 @@ impl Core {
         } else {
             Default::default()
         };
-        out.push(Action::Send {
-            to: from,
-            msg: PeerMsg::DelegRenewed {
-                req,
-                gen,
-                round,
-                ttl_ms,
-                locks,
-                lock_grace_ms,
-                lock_floor,
-                lock_cut_at,
-                lock_cut,
-                lock_barrier,
-            },
-        });
+        let msg = PeerMsg::DelegRenewed {
+            req,
+            gen,
+            round,
+            ttl_ms,
+            locks,
+            lock_grace_ms,
+            lock_floor,
+            lock_cut_at,
+            lock_cut,
+            lock_barrier,
+        };
+        self.deleg_answer_renewal(now, from, hold.filter(|_| ttl_ms > 0), msg, out);
+    }
+
+    /// Plan 41 L0: send a delegation renewal's answer, or hold it
+    /// (`hold`) until the tenure is proven live. Answers to one delegate
+    /// keep their order: one made behind a held one waits with it.
+    fn deleg_answer_renewal(
+        &mut self,
+        now: Ms,
+        to: NodeId,
+        hold: Option<FreshHold>,
+        msg: PeerMsg,
+        out: &mut Vec<Action>,
+    ) {
+        self.deleg_flush_held(now, out);
+        let behind = self
+            .ack
+            .renew_held_deleg
+            .iter()
+            .rev()
+            .find(|(_, n, _)| *n == to)
+            .map(|(f, ..)| *f);
+        match (hold, behind) {
+            (None, None) => out.push(Action::Send { to, msg }),
+            (Some(f), _) => {
+                self.stats.renew_held += 1;
+                self.ack.renew_held_deleg.push((f, to, msg));
+                self.renew_kick(&[f], out);
+            }
+            (None, Some(f)) => self.ack.renew_held_deleg.push((f, to, msg)),
+        }
+    }
+
+    /// The held delegation renewal answers that may go now, in order per
+    /// delegate ([`Core::renew_verdict`]). One whose tenure is gone is
+    /// dropped, not refused: a refusal (`ttl_ms: 0`) ends the generation
+    /// at its delegate, while a delegate whose renewal goes unanswered
+    /// asks again when it times out — at whichever root is then the
+    /// holder.
+    pub(crate) fn deleg_flush_held(&mut self, now: Ms, out: &mut Vec<Action>) {
+        let held = std::mem::take(&mut self.ack.renew_held_deleg);
+        let mut keep: Vec<(FreshHold, NodeId, PeerMsg)> = Vec::new();
+        for (f, to, msg) in held {
+            let verdict = if keep.iter().any(|(_, n, _)| *n == to) {
+                FreshVerdict::Wait
+            } else {
+                self.renew_verdict(now, f)
+            };
+            match verdict {
+                FreshVerdict::Ready => out.push(Action::Send { to, msg }),
+                FreshVerdict::Wait => keep.push((f, to, msg)),
+                FreshVerdict::Refuse => self.stats.renew_refused += 1,
+            }
+        }
+        self.ack.renew_held_deleg = keep;
     }
 
     /// When this node stops counting on its grant of a generation it

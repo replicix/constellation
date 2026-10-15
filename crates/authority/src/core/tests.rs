@@ -15924,6 +15924,427 @@ mod locks {
         );
         assert_eq!(mtime(&h, ino), 4);
     }
+
+    // ---------------------------------------------- plan 41 L0: freshness
+
+    /// Plan 41 L0 (review S2): a holder whose cached owner answers its
+    /// renewal `NotOwner { 0 }` (a root that found itself deposed) reads
+    /// the lease before it renews again, as a request's retry does — the
+    /// grant is due again at once, and the tick re-armed for it sent the
+    /// renewal back to the old root every millisecond.
+    #[test]
+    fn a_renewal_refused_by_the_cached_owner_reads_the_lease_next() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: grant_msg(1),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        let renew = loop {
+            r.now = r.core.timer_at(tick).expect("armed");
+            let out = r.step(Event::Timer { id: tick });
+            if let Some(req) = sends(&out).into_iter().find_map(|(to, m)| match m {
+                PeerMsg::LockRenew { req, .. } if to == 1 => Some(*req),
+                _ => None,
+            }) {
+                break req;
+            }
+            tick = timer_of(&out, TimerKind::LockRenewTick);
+        };
+        r.advance(5);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req: renew,
+                results: vec![(
+                    42,
+                    GrantId { node: 1, seq: 1 },
+                    LockRenewResult::NotOwner { owner: 0 },
+                )],
+            },
+        });
+        assert_eq!(r.core.lease.cached_holder, None, "{out:?}");
+        let tick = timer_of(&out, TimerKind::LockRenewTick);
+        r.now = r.core.timer_at(tick).expect("armed");
+        let out = r.step(Event::Timer { id: tick });
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockRenew { .. })),
+            "renewed at the old root again: {out:?}"
+        );
+        assert!(
+            s3_ops(&out)
+                .iter()
+                .any(|(_, r)| matches!(r, S3Op::LeaseGet)),
+            "no lease read: {out:?}"
+        );
+    }
+
+    /// Plan 41 L0 (review M1): after a fast takeover the successor
+    /// outwaits a generation it inherits past the predecessor's last
+    /// delegation renewal. That renewal was decided under
+    /// `backup_takeover_ms` after the predecessor's last proof of
+    /// liveness, which came before this takeover; the delegate honours it
+    /// until its send plus the TTL less the margin. Counted from the
+    /// inheritance alone, the outwait ended that much too early unless
+    /// `backup_takeover_ms + 2D ≤ 2M` (the sim's own configuration
+    /// breaks it, as does a 3 s lease's margin).
+    #[test]
+    fn a_fast_successor_outwaits_an_inherited_generation_past_the_last_renewal() {
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        let mut prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
+        prev.expires_unix_ms = h.now.0 + 60_000;
+        h.core.note_fast_takeover(&prev);
+        h.hold(2, None);
+        delegated_file(&h.meta);
+        let mut out = Vec::new();
+        let inherited = h.now;
+        h.core.delegation_sync(inherited, &h.meta, &mut out);
+        let expiry = timer_of(&out, TimerKind::DelegExpiry);
+        let w = h.core.cfg.backup_takeover_ms as i64;
+        let ttl = h.core.cfg.delegation_ttl_ms as i64;
+        let margin = h.core.cfg.expiry_margin_ms as i64;
+        // The latest renewal the predecessor may have decided, and the end
+        // of the window the delegate honours for it (its send no later).
+        let last = inherited.0 + w - 1;
+        let honoured = last + ttl - margin;
+        let at = h.core.timer_at(expiry).expect("armed").0;
+        assert!(
+            at >= honoured + 2 * margin,
+            "outwaited at {at}, the delegate may honour until {honoured}"
+        );
+        // A takeover that was not fast adds nothing.
+        let mut h = Harness::new(2);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(2, None);
+        delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let expiry = timer_of(&out, TimerKind::DelegExpiry);
+        assert_eq!(
+            h.core.timer_at(expiry),
+            Some(h.now.plus(h.core.reclaim_horizon_ms()))
+        );
+    }
+
+    /// Plan 41 L0: node 1 holds under `Backup` with node 4 listed — a
+    /// tenure its backup can seal before the lease expires — marked as
+    /// granting, its S3 liveness fresh as of now.
+    fn hold_fast(h: &mut Harness) {
+        h.hold(1, None);
+        let (mut lease, tag) = h.core.lease.held.clone().expect("held");
+        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.backups = vec![4];
+        h.core.lease.adopt(h.now, lease, tag, None);
+        h.core.ack.last_s3_fresh = h.now;
+        assert!(h.core.fast_tenure());
+    }
+
+    fn fast_holder_with_file() -> (Harness, Ino) {
+        let mut h = Harness::new(1);
+        hold_fast(&mut h);
+        let op = h.create("f");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        (h, ino)
+    }
+
+    /// The one lease read in `out` (the probe).
+    fn lease_probe(out: &[Action]) -> OpId {
+        let reads: Vec<OpId> = s3_ops(out)
+            .into_iter()
+            .filter(|(_, r)| matches!(r, S3Op::LeaseGet))
+            .map(|(op, _)| op)
+            .collect();
+        let [op] = reads.as_slice() else {
+            panic!("expected one lease read: {out:?}")
+        };
+        *op
+    }
+
+    /// This node locks `ino` itself, then its renewal ticks fire until
+    /// the grant is due (the tick runs at the TTL/4 cadence): the last
+    /// tick's actions, the decision time, and the window before it.
+    fn own_grant_due(h: &mut Harness, ino: Ino) -> (Vec<Action>, Ms, i64) {
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: false,
+            },
+        });
+        assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
+        let held = h.meta.locks().held(ino).expect("installed");
+        let mut tick = timer_of(&out, TimerKind::LockRenewTick);
+        loop {
+            let at = h.core.timer_at(tick).expect("armed");
+            h.now = at;
+            let out = h.step(Event::Timer { id: tick });
+            if at.0 >= held.renew_at_ms {
+                return (out, at, held.until_ms);
+            }
+            tick = timer_of(&out, TimerKind::LockRenewTick);
+        }
+    }
+
+    /// The probe's answer: this node's own lease (`None`), or another node's
+    /// at the next epoch (a seal-based takeover).
+    fn answer_probe(h: &mut Harness, op: OpId, taken_by: Option<NodeId>) -> Vec<Action> {
+        let (mut lease, tag) = h.core.lease.held.clone().expect("held");
+        if let Some(n) = taken_by {
+            lease.holder = n;
+            lease.epoch += 1;
+        }
+        h.step(Event::S3 {
+            op,
+            result: S3Result::LeaseGet(Ok(Some((lease, tag)))),
+        })
+    }
+
+    fn renewed_of(out: &[Action], to: NodeId) -> Option<Vec<(Ino, GrantId, LockRenewResult)>> {
+        sends(out).into_iter().find_map(|(t, m)| match m {
+            PeerMsg::LockRenewed { results, .. } if t == to => Some(results.clone()),
+            _ => None,
+        })
+    }
+
+    /// Node 2's renewal of `grant` on `ino`.
+    fn peer_renew(h: &mut Harness, req: u64, ino: Ino, grant: GrantId) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(req),
+                entries: vec![LockRenewEntry {
+                    ino,
+                    grant,
+                    mode: X,
+                }],
+            },
+        })
+    }
+
+    /// A root whose tenure can be taken over before its lease expires
+    /// (here a listed backup) answers a peer's renewal only with fresh S3
+    /// liveness, as it grants: stale, the answer waits for a lease read,
+    /// and goes once the read shows this node still holds. Before, it
+    /// was answered `Ok` in the same step: a root its backup had sealed
+    /// renewed past the successor's grace (the model's
+    /// `fast_takeover_renewals_without_the_probe_violate`).
+    #[test]
+    fn a_stale_fast_root_answers_a_peers_renewal_after_a_lease_read() {
+        let (mut h, ino) = fast_holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(2_000);
+        assert!(!h.core.renew_fresh(h.now));
+        let out = peer_renew(&mut h, 20, ino, g2);
+        assert!(
+            renewed_of(&out, 2).is_none(),
+            "answered on stale liveness: {out:?}"
+        );
+        let probe = lease_probe(&out);
+        assert_eq!(h.core.stats.renew_held, 1);
+        // The holder's re-send meanwhile (its renewal timed out) waits
+        // too, with no second read, and replaces the held answer it
+        // supersedes: one answer per renewal round (review S3).
+        let out = peer_renew(&mut h, 21, ino, g2);
+        assert!(renewed_of(&out, 2).is_none(), "{out:?}");
+        assert!(s3_ops(&out).is_empty(), "one read at a time: {out:?}");
+        h.advance(40);
+        let out = answer_probe(&mut h, probe, None);
+        let answers: Vec<_> = sends(&out)
+            .into_iter()
+            .filter_map(|(t, m)| match m {
+                PeerMsg::LockRenewed { req, results } if t == 2 => Some((*req, results.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers.len(), 1, "{out:?}");
+        assert_eq!(answers[0].0, OpId(21), "the re-send's");
+        for (_, results) in &answers {
+            assert!(
+                matches!(results[0].2, LockRenewResult::Ok { ttl_ms: 5_000, .. }),
+                "{results:?}"
+            );
+        }
+        assert_eq!(h.core.stats.renew_probes, 1);
+        assert!(!h.core.lease.lost);
+    }
+
+    /// The same read shows that node 4 (the backup) took the lease over: the held
+    /// renewal is refused (`NotOwner { 0 }`: the holder re-reads the
+    /// lease and renews — or reclaims — at the successor) and this node
+    /// deposes itself.
+    #[test]
+    fn a_stale_fast_root_refuses_a_held_renewal_when_the_read_shows_a_successor() {
+        let (mut h, ino) = fast_holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(2_000);
+        let out = peer_renew(&mut h, 20, ino, g2);
+        assert!(renewed_of(&out, 2).is_none(), "{out:?}");
+        let probe = lease_probe(&out);
+        let out = answer_probe(&mut h, probe, Some(4));
+        assert_eq!(
+            renewed_of(&out, 2).as_deref(),
+            Some(&[(ino, g2, LockRenewResult::NotOwner { owner: 0 })][..]),
+            "{out:?}"
+        );
+        assert!(h.core.lease.lost, "deposed by the read");
+        assert_eq!(h.core.stats.renew_refused, 1);
+    }
+
+    /// Fresh liveness (or a tenure nobody can take over early) changes
+    /// nothing: answered in the same step, no read.
+    #[test]
+    fn a_fresh_or_local_root_answers_a_renewal_at_once() {
+        let (mut h, ino) = fast_holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(1_000);
+        let out = peer_renew(&mut h, 20, ino, g2);
+        assert!(renewed_of(&out, 2).is_some(), "{out:?}");
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        // A lone `Local` root, liveness never proven: as before.
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(2_000);
+        assert!(h.core.renew_fresh(h.now));
+        let out = peer_renew(&mut h, 20, ino, g2);
+        assert!(renewed_of(&out, 2).is_some(), "{out:?}");
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.renew_probes, 0);
+        assert_eq!(h.core.stats.renew_held, 0);
+    }
+
+    /// A reclaim is an extension too: a fresh successor of a fast
+    /// takeover whose own lease is not marked as granting yet accepts it
+    /// only once the mark landed — otherwise its own successor (another
+    /// fast takeover) would find no floor to wait behind
+    /// (`note_fast_takeover` keys the floor on the mark) while the
+    /// reclaimed grant was honoured.
+    #[test]
+    fn a_reclaim_at_an_unmarked_fast_tenure_waits_for_the_mark() {
+        let (mut h, ino) = fast_holder_with_file();
+        let (mut lease, held_tag) = h.core.lease.held.clone().unwrap();
+        lease.granted_delegations = false;
+        h.core.lease.adopt(h.now, lease, held_tag, None);
+        h.meta.read_delegations().set_quarantine(h.now.0 + 3_000);
+        let ghost = GrantId { node: 9, seq: 1 };
+        let out = peer_renew(&mut h, 20, ino, ghost);
+        assert!(renewed_of(&out, 2).is_none(), "{out:?}");
+        let mark = s3_ops(&out)
+            .into_iter()
+            .find_map(|(op, r)| {
+                matches!(r, S3Op::LeaseSwap { lease, .. } if lease.granted_delegations)
+                    .then_some(op)
+            })
+            .unwrap_or_else(|| panic!("expected the marking CAS: {out:?}"));
+        h.advance(20);
+        let out = h.step(Event::S3 {
+            op: mark,
+            result: S3Result::LeasePut(Ok(tag())),
+        });
+        let results = renewed_of(&out, 2).unwrap_or_else(|| panic!("{out:?}"));
+        assert!(
+            matches!(results[0].2, LockRenewResult::Ok { .. }),
+            "{results:?}"
+        );
+        assert_eq!(h.core.stats.lock_reclaimed, 1);
+    }
+
+    /// This node's own grant, at its own renewal tick (`Route::Me`, the
+    /// path the model's counterexample takes: the deposed root renews its
+    /// own grant): stale, the window is not extended until the lease read
+    /// proves the tenure; then it counts from the tick.
+    #[test]
+    fn a_stale_fast_root_renews_its_own_grant_after_a_lease_read() {
+        let (mut h, ino) = fast_holder_with_file();
+        let (out, at, first) = own_grant_due(&mut h, ino);
+        assert_eq!(
+            h.meta.locks().held(ino).unwrap().until_ms,
+            first,
+            "renewed on stale liveness: {out:?}"
+        );
+        let probe = lease_probe(&out);
+        h.advance(30);
+        answer_probe(&mut h, probe, None);
+        assert_eq!(
+            h.meta.locks().held(ino).unwrap().until_ms,
+            at.0 + 5_000 - 1_000,
+            "renewed from the tick"
+        );
+    }
+
+    #[test]
+    fn a_stale_fast_root_does_not_renew_its_own_grant_when_deposed() {
+        let (mut h, ino) = fast_holder_with_file();
+        let (out, _, first) = own_grant_due(&mut h, ino);
+        let probe = lease_probe(&out);
+        answer_probe(&mut h, probe, Some(4));
+        assert!(h.core.lease.lost);
+        let held = h.meta.locks().held(ino);
+        assert!(
+            held.is_none_or(|g| g.until_ms == first),
+            "extended by a deposed root: {held:?}"
+        );
+    }
+
+    /// The root's delegation renewals follow the same rule: stale, the
+    /// granting answer waits for the lease read; deposed, it is dropped
+    /// (a refusal would end the generation at its delegate; unanswered,
+    /// the delegate asks again).
+    #[test]
+    fn a_stale_fast_root_answers_a_delegation_renewal_after_a_lease_read() {
+        for taken_by in [None, Some(4)] {
+            let mut h = Harness::new(1);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            hold_fast(&mut h);
+            delegated_file(&h.meta);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            h.advance(2_000);
+            let now = h.now.0;
+            let out = renew_gen7(&mut h, 90, 0, now);
+            let answered = |out: &[Action]| {
+                sends(out).into_iter().find_map(|(t, m)| match m {
+                    PeerMsg::DelegRenewed { req, ttl_ms, .. } if t == 3 => Some((*req, *ttl_ms)),
+                    _ => None,
+                })
+            };
+            assert_eq!(answered(&out), None, "answered on stale liveness: {out:?}");
+            let probe = lease_probe(&out);
+            h.advance(30);
+            let out = answer_probe(&mut h, probe, taken_by);
+            match taken_by {
+                None => {
+                    let Some((OpId(90), ttl)) = answered(&out) else {
+                        panic!("expected the held answer: {out:?}")
+                    };
+                    assert!(ttl > 0);
+                }
+                Some(_) => {
+                    assert_eq!(answered(&out), None, "{out:?}");
+                    assert!(h.core.lease.lost);
+                }
+            }
+        }
+    }
 }
 
 // ---- M16 fixes ----

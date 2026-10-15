@@ -47525,3 +47525,267 @@ Limits of the fixture, stated rather than hidden:
 ### Gates
 
 `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean. Tests on a loaded 16-CPU host (`-j 4`): `cargo test -p constellation-vfs --features conformance` 55 + 12 passed (the reference target unchanged); the engine conformance target as above; `cargo test --workspace --no-fail-fast` `cargo test --workspace --no-fail-fast` on `81086fe` plus this change: 2974 passed, 0 failed, 53 ignored; the engine conformance target takes 48 s for its two runs (was 71 s)
+
+## Fix: a fast-tenure root renewed lock grants and delegations without fresh S3 liveness (plan 41 L0)
+
+Found while planning plan 41 (§3.4) and confirmed by its review with a
+model counterexample. A root whose tenure can be taken over before its
+lease expires (a listed backup, or `ack=s3`) answers strict reads and
+new lock grants only within `backup_takeover_ms` of the send of an S3
+request that proved the tenure (`strict_answer_allowed`, plan 30 §M9),
+because that is all its successor's grace covers: `note_marker_landed`
+quarantines lock grants until `min(prev_expires, marker +
+backup_takeover_ms + max(read_ttl, lock_ttl) + deleg + 2M)`. Renewals
+never checked it. `lock_renew_one` routed with `lock_route_for(..,
+renewal = true)`, whose gen-0 branch asks only `lease.usable()` (held,
+not lost, past the margin), and both the renewal tick's own renewals
+(`Route::Me`) and a peer's `LockRenew` took that path; `on_deleg_renew`
+extended a generation on `root_usable` (`ship_epoch` and not fenced), no
+liveness either. A root its backups sealed — cut from them, its S3
+contact stale, still reached by a lock holder — renewed its own and its
+peers' grants by up to `lock_ttl` (capped at `lease.expires − margin`,
+up to ~58 s on a fresh 60 s lease) while the successor's grace ended
+about 23.5 s after the marker at the defaults: two holders of one lock.
+Its delegates kept renewing too, and granted in a subtree the successor
+reclaimed. ADR-12: the old root's eventual discovery (its next lease
+CAS, a ship) is no argument.
+
+### History
+
+- `0e1017b` (plan 30 §M9): `strict_answer_allowed` and the successor's
+  floor; the module doc's argument (`core/backup.rs`, "The delegation
+  horizon across a fast failover").
+- `df14686` (plan 30 §M14): `lock_renew_one`, `lock_route_for` with its
+  `renewal` flag, and the lock model. The model's `owner_until`
+  refuses a fast root outside `takeover_window` of its last probe for
+  `Msg::Renew` delivery and for `owner_ready` alike, so every clean
+  fast-takeover run assumed a rule the code did not have; the tests that
+  show the probe is load-bearing (`fast_takeover_without_the_probe_
+  violates`) turned renewals off (`max_renews: 0`). `lock_serve` (and
+  later `lock_serve_again`) checked `strict_answer_allowed` and
+  `ensure_granting_marked` for new grants only.
+- `a52671f`, `21bc6a7`, `2008881`: `lock_route_for`'s renewal branch
+  (a pending gate and a resuming epoch serve renewals); none touched
+  liveness. `578ff9c`/`d214b1c`/`379a00d`/`d7d2eb8`: `on_deleg_renew`;
+  likewise.
+
+### Fail-before evidence
+
+- **Model** (`crates/model/src/locks.rs`, new knob
+  `renew_probe_freshness`: `false` drops `owner_until`'s probe clause for
+  renewals only — `owner_ready`'s gate of a node's `Renew` and
+  `Msg::Renew` delivery — while new grants keep it). Scripts `[[Lock(X),
+  Io], [], [Lock(X)]]`, `backup: 2, replicate: false, grace: true,
+  lease_ttl: 30, lock_ttl: 3, max_drops: 0, max_tick: 8, max_renews: 6`,
+  knob off: `mutual_exclusion` violated. The review's counterexample:
+  node 2 takes the lease over at t = 0 (grace to t = 6); the deposed
+  root 0 renews **its own** grant at t = 1..5 (`Renew(0)` × 5, answered
+  by itself — the `Route::Me` path of finding 08); node 2 grants itself
+  at t = 6; root 0 does `Io` under grant 1: violation `(0, 1, 2)`. The
+  test (`fast_takeover_renewals_without_the_probe_violate`) checks 7
+  ticks and 5 renewals, stopping at the first failure (3.7M states, 13 s
+  in a debug build; the whole space is 54.9M), and finds the same path:
+  `Takeover(2)` at t = 0, `Renew(0)` at t = 1..5, the late `Probe(0)`
+  that deposes root 0 only after its renewals, `SendLock(2)` at t = 6,
+  `Start(0)` (`Io`): `(0, 1, 2)`.
+- **Model, the remote holder** (new knob `cached_owner`: a node renews
+  where it was last answered `Ok`, as the code routes by
+  `lease.cached_holder`; a `NotOwner` clears it). Scripts `[[], [Lock(X),
+  Io], [Lock(X)]]`, the same config at 7 ticks and 5 renewals, knob off:
+  violated (`fast_takeover_remote_renewals_without_the_probe_violate`,
+  4.3M states to the first failure): node 1 locks at root 0, node 2
+  takes over at t = 0, node 1 renews at root 0 at t = 1..5 (`Renew(1)`
+  × 5), node 2 grants itself at t = 6, node 1 `Io` under grant 1:
+  `(1, 1, 2)`. Without `cached_owner`
+  the model routes a non-root's renewals by the register (the
+  successor) and finds nothing, which is why the review saw only the
+  own-grant case.
+- **Core unit tests** (`crates/authority/src/core/tests.rs`, `locks`
+  module; a holder under `Backup` with node 4 listed, marked as
+  granting, `ack.last_s3_fresh` 2 s old against `backup_takeover_ms`
+  1.5 s). On `d940fa2` (the tests alone, with the new counters' lines
+  removed) six fail, each because the renewal was answered or applied in
+  the same step: `a_stale_fast_root_answers_a_peers_renewal_after_a_
+  lease_read` and `..._refuses_a_held_renewal_when_the_read_shows_a_
+  successor` (`LockRenewed { Ok }` at once), `a_stale_fast_root_renews_
+  its_own_grant_after_a_lease_read` and `..._does_not_renew_its_own_
+  grant_when_deposed` (the held grant's window extended at the tick, no
+  lease read), `a_stale_fast_root_answers_a_delegation_renewal_after_a_
+  lease_read` (`DelegRenewed { ttl_ms: 5000 }` at once),
+  `a_reclaim_at_an_unmarked_fast_tenure_waits_for_the_mark` (the reclaim
+  answered `Ok` on an unmarked lease); `a_fresh_or_local_root_answers_a_
+  renewal_at_once` passes on both.
+- **Sim** (`locks-failover-backup-renew`: while locks are held the
+  holder loses S3 and is cut from its backup, twice; P2P to the other
+  nodes stays; the backup seals and takes over). 1,000 seeds on
+  `d940fa2` (203000..204000): one ghost violation, seed 203580, which is
+  **not** this hole: node 3 renewed its exclusive grant 782 at the
+  successor during its grace, the successor's table held node 3's older
+  shared grant 779 of the same minter from the last lock mirror the old
+  root got through, `lock_renew_one` renewed that one instead
+  (`own_grant`: "this node's newer grant here") and answered `Ok { id:
+  779, mode: Shared }`, and `LockTables::renewed` kept the holder's
+  exclusive mode (`h.mode.max(mode)`); the successor then granted itself
+  a shared grant beside it. The same on the patched tree (seeds 203170,
+  203580): a separate pre-existing bug, reported with this fix (its own
+  patch), not changed here. The sim never caught this hole on its own:
+  the old root's stale renewals happened (seed 203580 on `d940fa2`,
+  t = 2544) but no conflicting grant landed in their window; the model
+  and the unit tests are the fail-before.
+
+### What changed
+
+| Item | Where |
+|---|---|
+| One liveness rule, side-effect free: `liveness_fresh(fast_tenure, at, last_s3_fresh, window)`, used by `Core::renew_fresh` (and through it `strict_answer_allowed`, unchanged in effect) and by the FUSE side's `LeaseView::reads_locally` | `core/backup.rs`, `crates/engine/src/lease.rs` |
+| `Core::renew_hold(now)`: an extension may be answered now with fresh liveness and a marked tenure (`tenure_marked`: the successor's floor applies only to a tenure whose lease says it grants), as a new grant needs; otherwise a `FreshHold { at, epoch }` | `core/backup.rs` |
+| `lock_renew_one` (gen-0 `Route::Me`: a peer's renewal, the node's own at the tick, a reclaim) decides and applies the extension to the owner's table as before, and marks the answer held when stale (`fresh_need`) | `core/locks.rs` |
+| Peers: `horizon_held` generalised to `HeldAnswer { need, fresh, to, msg }`: an answer goes once the restart horizon covers it **and** its tenure is proven; per-peer order kept; `lock_flush_held` (shared with the horizon write's completion); refused like a failed horizon write (`NotOwner { 0 }`) when the tenure is gone | `core/locks.rs` |
+| Own renewals at the tick: held (`own_held`; the grant stays `renewing`), applied as renewed from the tick once proven, `renewal_failed` (due again, tick re-armed) when refused | `core/locks.rs` |
+| `on_deleg_renew`: the same rule; a granting answer held (`AckState::renew_held_deleg`, in order per delegate) and **dropped**, not refused, if the tenure is gone (a `ttl_ms: 0` refusal stops the generation at its delegate; unanswered, the delegate asks again) | `core/delegate.rs` |
+| The proof: one lease `GET` at a time (`S3For::RenewProbe`, `renew_kick`), issued only while something waits on a fast tenure; its liveness is `note_s3_liveness`'s; another holder (or none) deposes this node at once; a failed read refuses what was decided before its send. An answer decided at `t` is released by any proof sent after `t − backup_takeover_ms` — a read sent after the decision proves the lease was still this node's when the decision was made, so the successor's marker, and its grace, came later; and an unmarked tenure marks itself (`ensure_granting_marked`). A held answer older than a lock TTL is refused | `core/backup.rs`, `core/locks.rs` `renew_after_event` |
+| Counters `renew_held`, `renew_probes`, `renew_refused` (core `Stats`; the sim's `M14Totals`) | `core/mod.rs`, `tests/sim.rs` |
+| After a fast takeover, an inherited generation is outwaited `backup_takeover_ms` longer (`inherit_slack_ms`; review M1, below) | `core/delegate.rs` `delegation_sync`, `core/backup.rs` `note_fast_takeover`, `core/jobs.rs` |
+| A holder refused `NotOwner { 0 }` by its cached owner reads the lease next; a held renewal answer superseded by the answer to the holder's re-send is dropped (review S2, S3) | `core/locks.rs` `lock_apply_renew_result`, `lock_answer` |
+| Nightly: the model's ignored runs in release | `.github/workflows/nightly.yml` |
+| Model: `renew_probe_freshness` (design `true`), `cached_owner` (design `false`; `LockReply`/`RenewAck` carry the answering owner only under it, so no other run's state space changes); the module doc's action → code table | `crates/model/src/locks.rs` |
+| Docs: cluster-locks.md (the renewal paragraph; the fast-takeover bullet), ADR-25 amendment | `docs/` |
+
+### Why it is sufficient
+
+Every gen-0 extension goes through `lock_renew_one` (peers' renewals and
+reclaims, the node's own renewals at the tick) or `on_deleg_renew`; new
+grants already went through `lock_serve`/`lock_serve_again`. Each now
+answers only when a liveness proof was *sent* within
+`backup_takeover_ms` before the decision (or any time after it) on a
+marked tenure of the same epoch — the module doc's argument, so every
+window it promises ends within the successor's grace, which `note_
+marker_landed` sizes from the marker, which follows that proof. A grant
+the old root decided while stale but never answered extends nothing at
+its holder: the holder honours only what it was told, from its own
+send. **Delegations**: with the rule, the old root's last delegation
+renewal is decided at `t < f + W` (`W` = `backup_takeover_ms`, `f` the
+proof's send, before the successor's takeover CAS), and the delegate
+honours it until at most `t + deleg_ttl − M` on its clock (its send is
+no later than `t`). The successor's lock quarantine (`marker + W +
+max(ttl) + deleg + 2M`) covers that window. The generation itself the
+successor inherited at `i ≥` its takeover CAS with `until = i +
+deleg_ttl + M` — enough only if `W + 2D ≤ 2M` (clocks within `D`),
+which nothing enforced and which fails at the defaults beyond
+`D = 250 ms` (DESIGN assumes ±500 ms), for a 3 s lease (`M` = 750 ms)
+even at `D = 0`, and in the sim's backup configuration (`W` = 1 s,
+`M` = 500 ms); the review found it (M1). After a fast takeover the
+successor now inherits with `until = i + deleg_ttl + M + W`
+(`DelegationState::inherit_slack_ms`, set by `note_fast_takeover`, 0
+after any other acquisition), as `note_marker_landed` adds `W`; the
+bound is then `t + deleg_ttl − M < i + W + deleg_ttl − M`, inside the
+outwait by `2M > 2D`, the lease's own rule, whatever `W` is — no new
+configuration constraint (and so no load-time check: there is no drift
+budget to check it against). Without the rule a stale root renewed the
+delegation indefinitely. **The mark**: a fresh successor's lease is not
+marked (`Lease::granted_delegations` is not carried by a takeover), and
+a reclaim or a mirrored grant's renewal at such a tenure used to extend
+a window its own fast successor would not wait out (no floor without
+the mark); renewals now mark the tenure first, as grants do. The
+existing tenure-marking CAS coexists with the renewal CAS as it did for
+strict reads.
+
+### Unchanged on purpose
+
+- A lone node, any `Local` tenure without backups, and a continuation
+  epoch's hold (`fast_tenure()` false): `renew_hold` is always `None`,
+  no lease read, no hold, no extra S3 traffic. `a_fresh_or_local_root_
+  answers_a_renewal_at_once` pins it.
+- Delegated routes (`gen ≠ 0`): a delegate's authority is its
+  delegation, renewed by the root under the rule.
+- The S3 cost on a fast tenure: at most one lease `GET` in flight, only
+  while an answer waits, i.e. about one per renewal round at an idle
+  fast-tenure root (any other S3 success within `backup_takeover_ms`
+  makes it unnecessary). Timing: such a renewal is answered one S3 round
+  trip later; a holder's 500 ms timeout is covered by the late-answer
+  rule (`LateRenew`), a delegate's by its own (`deleg_late_renewed`).
+- A tenure that renews (or reclaims) now marks its lease as one that
+  grants, so its own fast successor waits its floor out — including the
+  read-delegation floor that the same flag drives (one flag for both, as
+  for a tenure that grants a lock today).
+- The model's `DelegRenewal` is enabled only at a register-usable root
+  (a ghost check), so the model does not show the delegation half; it
+  is argued above and pinned by the unit tests.
+
+### Behaviour changes (review S1–S4)
+
+- **A fast tenure cut from S3 lets its lock grants lapse.** A failed
+  lease read refuses every answer held from before its send, so a
+  fast-tenure root that cannot reach S3 renews nothing: after about
+  `(ttl − margin) / 2` (9.5 s at the defaults) the grants it sequences
+  lapse, its own included, and their holders are fenced — even while
+  its backups still acknowledge its writes. Before, a `Backup` tenure
+  kept renewing through an S3 outage until its lease ran out (which is
+  exactly what a sealed root did too). Documented in cluster-locks.md
+  and ADR-25. Follow-up (not done): a liveness proof from the backups'
+  acknowledgements — a backup that acknowledges an append of epoch `e`
+  had not sealed it, so fresh acknowledgements of every listed backup
+  may prove what a lease read proves for a `Backup` tenure (not for
+  `ack=s3`); it needs its own argument and model run.
+- **A holder answered `NotOwner { 0 }` by its cached owner reads the
+  lease** before renewing again (`lock_apply_renew_result` clears
+  `cached_holder`, as a request's retry does): it no longer re-sends to
+  the old root at the 1 ms re-arm cadence after a deposition.
+- **One held answer per renewal round**: a holder re-sends a waiting
+  renewal at every tick; the answer to a re-send replaces a held one to
+  the same peer that renews no more grants.
+- **No timer of its own**: a hold is settled by events (the read's
+  result, any S3 result, the marking CAS, a deposition); a fast tenure
+  has its 50 ms backup bookkeeping or `ack=s3` stream heartbeat timers
+  meanwhile. Commented at `renew_after_event`.
+
+### Tests
+
+- Model (`crates/model/tests/locks.rs`): the two violation tests at
+  7/5, each stopping at its first failure (`assert_violates_soon`,
+  `HasDiscoveries::AnyFailures`; 13–15 s in a debug build) — the old
+  rule is also violated at 8/6, at a full-space DFS's 60.0M budget;
+  `fast_takeover_renewals_with_the_probe_are_clean` (7/5, 30.1M states,
+  9.8M unique, exhaustive; 132 s in a debug build, so a 600 s clock);
+  `#[ignore]`d for their size and run by the nightly workflow's unit job
+  (`--release -- --ignored`): `..._with_the_probe_are_clean_at_the_
+  violations_size` (8/6, 77.0M states, 23.9M unique, 99 s release) and
+  `fast_takeover_remote_renewals_with_the_probe_are_clean` (7/5, 115.2M
+  states, 34.1M unique, 153 s). The design was also clean at 7/3 (25.0M,
+  where the old rule finds nothing either).
+- Core unit tests: the seven above (six fail on `d940fa2`), and from
+  the review: `a_fast_successor_outwaits_an_inherited_generation_past_
+  the_last_renewal` (M1) and `a_renewal_refused_by_the_cached_owner_
+  reads_the_lease_next` (S2), both failing on the first version of this
+  fix; `a_stale_fast_root_answers_a_peers_renewal_after_a_lease_read`
+  now also pins S3 (the re-send's answer replaces the held one).
+- Sim: `locks-failover-backup-renew` in both config tables and
+  `long_locks` (seeds 203000+); `locks_survive_a_backup_seal_under_
+  renewals` (seeds 94500..94560: 1,789 grants, 120 backup takeovers,
+  1,281 renewal answers held, 1,272 lease reads, 1,194 refused, zero
+  violations). The 1,000-seed sweep fails seeds 203170 and 203580 on
+  the bug above, not this one.
+
+### Gates
+
+2026-10-14/15, a Linux 7.3 test host (btrfs): `cargo fmt --all` clean;
+`cargo clippy --workspace --all-targets -D warnings` clean (on the
+rebased tree too); `cargo test --workspace --no-fail-fast`: 2,975
+passed, 0 failed, 55 ignored (on `d940fa2`; after the rebase over
+`9a49b68`'s engine changes the engine and authority unit suites again:
+717 and 318 passed). The model runs above in release. Sim, release: the
+32 `locks_*` tests pass; `locks-failover-backup` 1,000 seeds clean. With
+the stale-record fix stacked on top (its own section below): the
+1,000-seed `locks-failover-backup-renew` sweep clean, and the harness
+lock scenarios `flock-cross-node`, `lock-holder-partitioned`,
+`lock-failover`, `lock-holder-killed-contention`,
+`lock-lapse-lone-node`, `lock-fence-at-close`, `lock-release-at-close`
+all PASSED.
+
+After the review (M1, S1–S6), on `81086fe`: fmt and clippy clean;
+`cargo test --workspace --no-fail-fast` 2,981 passed, 0 failed, 55
+ignored; the sim's 32 `locks_*` tests and 300-seed sweeps of
+`locks-failover-backup` and `long-delegated-backup` clean; the model's
+violation tests 13–15 s and the 7/5 clean run 132 s in a debug build.
+Rebased over `9a8549c` (no overlap but PROGRESS): clippy on the
+workspace and the authority unit suite again, on this workstation.

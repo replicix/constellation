@@ -30,6 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace 2>&1 | tee unit.log
+      # Model runs too large for the per-push suite (plan 41 L0: renewal
+      # freshness clean at the sizes the old rule is violated at).
+      - run: cargo test -p constellation-model --release --test locks -- --ignored 2>&1 | tee -a unit.log
       - run: cargo install cargo-audit --locked && cargo audit 2>&1 | tee audit.log
       - uses: actions/upload-artifact@v4
         if: always()

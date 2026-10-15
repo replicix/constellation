@@ -178,11 +178,13 @@ impl LeaseView {
         {
             return false;
         }
-        if !self.fast_tenure.load(Ordering::Relaxed) {
-            return true;
-        }
-        now_unix_ms() - self.last_s3_fresh_ms.load(Ordering::Relaxed)
-            < self.fresh_window_ms.load(Ordering::Relaxed)
+        // The core's rule (`Core::renew_fresh`), one definition.
+        constellation_authority::core::liveness_fresh(
+            self.fast_tenure.load(Ordering::Relaxed),
+            now_unix_ms(),
+            self.last_s3_fresh_ms.load(Ordering::Relaxed),
+            self.fresh_window_ms.load(Ordering::Relaxed),
+        )
     }
 
     /// Plan 30 §M9: the driver mirrors the core's liveness bookkeeping.

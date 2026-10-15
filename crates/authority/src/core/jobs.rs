@@ -2844,6 +2844,7 @@ impl Core {
                 takeover && !p.released && !p.is_expired(now.0) && p.holder != self.cfg.node_id
             })
             .map(|p| (p.expires_unix_ms, p.granted_delegations));
+        self.dl.inherit_slack_ms = 0;
         if let Some(p) = prev.as_ref().filter(|_| fast_prev.is_some()) {
             self.note_fast_takeover(p);
         }

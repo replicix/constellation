@@ -334,6 +334,7 @@ fn replay_seed() {
         Ok("locks-skew") => locks_skew_config(),
         Ok("locks-failover") => locks_failover_config(),
         Ok("locks-failover-backup") => locks_failover_backup_config(),
+        Ok("locks-failover-backup-renew") => locks_failover_backup_renew_config(),
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-blips") => locks_blips_config(),
         Ok("locks-blips-tight") => locks_blips_tight_config(),
@@ -2657,6 +2658,7 @@ fn sweep_config() {
         "locks-skew" => locks_skew_config(),
         "locks-failover" => locks_failover_config(),
         "locks-failover-backup" => locks_failover_backup_config(),
+        "locks-failover-backup-renew" => locks_failover_backup_renew_config(),
         "locks-faults" => locks_faults_config(),
         "locks-blips" => locks_blips_config(),
         "locks-blips-tight" => locks_blips_tight_config(),
@@ -4088,6 +4090,37 @@ fn locks_failover_backup_config() -> SimConfig {
     }
 }
 
+/// Plan 41 L0: while locks are held and renewed, the holder loses S3
+/// and is cut from its backup (P2P to the other nodes stays): the backup
+/// seals and takes the lease over before it expires, and the old root,
+/// still reached by the lock holders and unable to learn of it, must
+/// answer no renewal (its own grants' at the tick, or its peers') past
+/// what its successor's grace covers. No crash: the deposed root stays
+/// up. (A partition from the backup alone is mostly resolved by the
+/// holder removing the backup from the lease: no takeover.)
+fn locks_failover_backup_renew_config() -> SimConfig {
+    let cut = |at_ms| {
+        [
+            ScheduledFault {
+                at_ms,
+                kind: FaultKind::CutS3Holder { for_ms: 6_000 },
+            },
+            ScheduledFault {
+                at_ms,
+                kind: FaultKind::PartitionBackup { for_ms: 6_000 },
+            },
+        ]
+    };
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::backup_core_config),
+        ops_per_client: 8,
+        lock_ios: (4, 12),
+        lock_io_ms: (20, 150),
+        faults: cut(1_200).into_iter().chain(cut(9_000)).collect(),
+        ..locks_config()
+    }
+}
+
 /// Nodes stop (their events queue, their clients keep running) while
 /// their clients wait for or hold locks: renewals stall, grants lapse
 /// under critical sections, and replies and pushes are handled late —
@@ -4465,6 +4498,11 @@ struct M14Totals {
     unavailable: u64,
     wait_ms_total: u64,
     max_simulated_ms: u64,
+    /// Plan 41 L0: renewal answers held for a fast tenure's liveness,
+    /// the lease reads they waited for, the ones refused.
+    renew_held: u64,
+    renew_probes: u64,
+    renew_refused: u64,
 }
 
 impl M14Totals {
@@ -4518,6 +4556,9 @@ impl M14Totals {
             self.backup_takeovers += s.backup_takeovers;
             self.unavailable += s.lock_unavailable;
             self.wait_ms_total += s.lock_wait_ms_total;
+            self.renew_held += s.renew_held;
+            self.renew_probes += s.renew_probes;
+            self.renew_refused += s.renew_refused;
         }
         self.max_simulated_ms = self.max_simulated_ms.max(r.simulated_ms);
     }
@@ -4627,6 +4668,24 @@ fn locks_survive_backup_failover() {
         t.backup_takeovers > 20,
         "the backup rarely took over (with the mirror): {t:?}"
     );
+}
+
+/// Plan 41 L0: a root its backup sealed while lock holders still reach
+/// it renews nothing past its successor's grace (the ghost's mutual
+/// exclusion), and the backup does take over.
+#[test]
+fn locks_survive_a_backup_seal_under_renewals() {
+    let t = run_m14(
+        "locks-failover-backup-renew",
+        locks_failover_backup_renew_config(),
+        94_500..94_560,
+    );
+    assert!(t.grants > 300, "{t:?}");
+    assert!(
+        t.backup_takeovers > 10,
+        "the backup rarely took over: {t:?}"
+    );
+    assert!(t.renew_held > 0, "no renewal waited for liveness: {t:?}");
 }
 
 /// `stress-ng-fs-faults` (bug B): a node that keeps its lease through an
@@ -5588,6 +5647,11 @@ fn long_locks() {
         "locks-failover-backup",
         locks_failover_backup_config(),
         194_000..194_000 + n,
+    );
+    run_m14(
+        "locks-failover-backup-renew",
+        locks_failover_backup_renew_config(),
+        203_000..203_000 + n,
     );
     run_m14("locks-faults", locks_faults_config(), 195_000..195_000 + n);
     run_m14("locks-pause", locks_pause_config(), 197_000..197_000 + n);
