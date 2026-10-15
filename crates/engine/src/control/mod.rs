@@ -34,7 +34,9 @@
 //! - `browse.stat/read/write/mkdir/rename/delete/xattr` through
 //!   [`ControlVfs`], a `Vfs` client of a view this service opens for itself
 //!   (the whole filesystem), as the calling principal.
-//! - `fs.*`: the registry ([`fs`]).
+//! - `fs.*`: the filesystem [`Manager`](crate::manager::Manager) — the
+//!   registry and `create`/`import`/`export`/`passwd`/`doctor` — the CLI
+//!   calls in-process ([`fs`]).
 //! - `view.stats` (a view's `statfs` and recursive size/count), `view.list`
 //!   label filters, `peers.list`, `node.ops` (the watchdog's registry).
 //! - `stats.subscribe` (periodic samples of `/metrics`'s gauges) and
@@ -214,6 +216,9 @@ pub struct EngineControl {
     /// The whole-filesystem view `browse.*` goes through, opened on first
     /// use and kept for the engine's life.
     browse: Mutex<Option<Arc<View>>>,
+    /// The filesystem manager behind `fs.*` (the registry and the
+    /// filesystems it names), on this engine's host services.
+    pub(crate) manager: crate::manager::Manager,
     /// `fs.unlock`'s credentials, by the name (or uuid) they were given for.
     pub(crate) unlocked: Mutex<HashMap<String, Arc<constellation_platform::CredentialSource>>>,
     /// `fs.unlock` arrival order: each call takes a ticket (`.0`) when it
@@ -270,6 +275,7 @@ impl EngineControl {
             last_sync_ms: e.last_sync_ms().clone(),
             state_dir: e.state_dir().to_path_buf(),
             compression: e.compression(),
+            manager: crate::manager::Manager::new(e.host().clone()).with_meta_wait(fs::META_WAIT),
             engine,
             host,
             version: version.into(),

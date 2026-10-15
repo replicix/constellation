@@ -88,8 +88,9 @@ use constellation_control::methods::{FsUnlock, NodePing};
 use constellation_control::proto::types::{Ack, FsUnlockParams, Pong};
 use constellation_control::proto::ControlError;
 use constellation_control::transport::{Listener, Transport, UnixSocketListener};
-use constellation_platform::{CredentialSource, EphemeralSecretStore, SecretStore};
-use constellation_store_s3::{ChunkStore, CompressionSetting, FsMeta, StoreError};
+use constellation_engine::manager::{credentials, CreateHooks, CreateRequest, Existing};
+use constellation_platform::{CredentialSource, EphemeralSecretStore};
+use constellation_store_s3::ChunkStore;
 use futures::future::BoxFuture;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -121,7 +122,7 @@ pub struct ServeArgs {
 /// The name an unlocked E2E passphrase is held under (the engine's
 /// `fs.unlock` uses the same, so a rotation replaces it in place; a
 /// socket handoff's `Credentials` step reads it, `crate::handoff_socket`).
-pub(crate) const E2E_PASSPHRASE: &str = "e2e_passphrase";
+pub(crate) use constellation_engine::manager::credentials::E2E_PASSPHRASE;
 
 /// How long the gate's own connections outlive the engine's start, so the
 /// answer to the `fs.unlock` that started it is flushed before they close.
@@ -163,7 +164,10 @@ pub fn cmd_serve(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     startup::phase("taking daemon.lock");
-    let standby_on = match (crate::take_state_dir_lock(&state_dir)?, &handoff_socket) {
+    let standby_on = match (
+        crate::take_state_dir_lock(&state_dir, None)?,
+        &handoff_socket,
+    ) {
         (crate::LockOutcome::BecomeDaemon, _) => {
             crate::handoff_socket::clear_stale_marker(&state_dir);
             crate::handoff_socket::clear_stale_standby_marker(&state_dir);
@@ -298,7 +302,8 @@ pub fn cmd_serve(
     } else {
         if create {
             startup::phase("creating the filesystem if missing");
-            rt.block_on(create_if_missing(&s3, &creation, None, None))?;
+            rt.block_on(create_if_missing(&s3, &creation, None, None))
+                .map_err(crate::refusal)?;
         }
         (
             CredentialSource::AwsDefaultChain,
@@ -664,52 +669,55 @@ struct Creation {
     e2e: bool,
 }
 
-/// `fs create`'s backend half (module docs): a no-op when `meta.json`
-/// exists, a create otherwise. A concurrent creator winning the race is
-/// success too — both then serve the one filesystem. `credentials` and
-/// `passphrase`: what `fs.unlock` gave the gate (`None`: the environment).
+/// `fs create`'s backend half (module docs), through the filesystem
+/// manager with no name: a no-op when `meta.json` exists
+/// ([`Existing::Accept`]), a create otherwise. A concurrent creator winning
+/// the race is success too — both then serve the one filesystem.
+/// `credentials` and `passphrase`: what `fs.unlock` gave the gate (`None`:
+/// the environment).
 async fn create_if_missing(
     s3: &str,
     c: &Creation,
     credentials: Option<&Arc<CredentialSource>>,
     passphrase: Option<Zeroizing<String>>,
-) -> Result<()> {
-    constellation_fs_core::validate_chunk_size(c.chunk_size)?;
-    let setting: CompressionSetting = c.compression.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (backend, _) = crate::backend::open_backend_described_with(s3, credentials)
-        .await
-        .context("opening backend")?;
-    let store = ChunkStore::new(backend);
-    match store.load_fs_waiting(Duration::from_secs(2)).await {
-        Ok(meta) => {
-            tracing::info!(fs = %meta.uuid, s3, "filesystem exists; serving it");
-            return Ok(());
+) -> Result<(), ControlError> {
+    struct Hooks {
+        passphrase: Option<Zeroizing<String>>,
+        unlocked: bool,
+    }
+    impl CreateHooks for Hooks {
+        fn preflight(&mut self, checks: &[constellation_store_s3::PreflightCheck]) {
+            crate::print_preflight(checks);
         }
-        Err(StoreError::NotFound) => {}
-        Err(e) => return Err(e).context("reading meta.json"),
-    }
-    crate::preflight_backend(&store, s3).await?;
-    let mut meta = FsMeta::new(c.chunk_size, &setting.to_string());
-    meta.e2e = c.e2e;
-    if c.e2e {
-        meta.gossip_secret = None;
-        let secret = match passphrase {
-            Some(p) => p,
-            None if credentials.is_some() => {
-                bail!("an e2e filesystem needs the passphrase in fs.unlock (e2e_passphrase)")
+        fn passphrase(&mut self) -> Result<Zeroizing<String>, ControlError> {
+            match self.passphrase.take() {
+                Some(p) => Ok(p),
+                None if self.unlocked => Err(ControlError::invalid(
+                    "an e2e filesystem needs the passphrase in fs.unlock (e2e_passphrase)",
+                )),
+                None => crate::passphrase("CONSTELLATION_PASSPHRASE", "")
+                    .context("an e2e filesystem needs CONSTELLATION_PASSPHRASE")
+                    .map_err(|e| ControlError::invalid(format!("{e:#}"))),
             }
-            None => crate::passphrase("CONSTELLATION_PASSPHRASE", "")
-                .context("an e2e filesystem needs CONSTELLATION_PASSPHRASE")?,
-        };
-        meta.keyring = Some(
-            constellation_store_s3::create_keyring_block(&secret)
-                .context("creating E2E keyring")?,
-        );
+        }
     }
-    match store.create_fs(&meta).await {
-        Ok(()) => tracing::info!(fs = %meta.uuid, s3, "created the filesystem"),
-        Err(StoreError::AlreadyExists) => tracing::info!(s3, "another creator won; serving theirs"),
-        Err(e) => return Err(e).context("creating filesystem"),
+    let req = CreateRequest {
+        chunk_size: Some(c.chunk_size),
+        compression: Some(c.compression.clone()),
+        e2e: c.e2e,
+        credentials: credentials.cloned(),
+        ..CreateRequest::new(s3, Existing::Accept)
+    };
+    let mut hooks = Hooks {
+        passphrase,
+        unlocked: credentials.is_some(),
+    };
+    let created = crate::manager().create(req, &mut hooks).await?;
+    let fs = created.meta.uuid;
+    match (created.created, created.raced) {
+        (true, _) => tracing::info!(%fs, s3, "created the filesystem"),
+        (false, true) => tracing::info!(s3, "another creator won; serving theirs"),
+        (false, false) => tracing::info!(%fs, s3, "filesystem exists; serving it"),
     }
     Ok(())
 }
@@ -725,43 +733,15 @@ struct Unlock {
 
 /// `fs.unlock`'s credentials as a source and a store (module docs): a
 /// key pair makes a `Static` source over the store; a passphrase alone
-/// leaves the AWS chain.
+/// leaves the AWS chain. Read as the running daemon's `fs.unlock` reads
+/// them (`manager::credentials`).
 fn unlock_source(
     p: &FsUnlockParams,
 ) -> Result<(CredentialSource, EphemeralSecretStore), ControlError> {
-    let c = &p.credentials;
-    let has_keys = c.access_key_id.is_some() || c.secret_access_key.is_some();
-    if has_keys && (c.access_key_id.is_none() || c.secret_access_key.is_none()) {
-        return Err(ControlError::invalid(
-            "access_key_id and secret_access_key go together",
-        ));
-    }
-    if !has_keys && c.e2e_passphrase.is_none() {
-        return Err(ControlError::invalid("no credentials to unlock"));
-    }
+    let has_keys = credentials::validate(&p.credentials)?;
     let store = EphemeralSecretStore::new();
-    let mut entries: Vec<(&str, Option<&[u8]>)> = Vec::new();
-    if let (Some(id), Some(secret)) = (&c.access_key_id, &c.secret_access_key) {
-        entries.push((
-            CredentialSource::ACCESS_KEY_ID,
-            Some(id.expose().as_bytes()),
-        ));
-        entries.push((
-            CredentialSource::SECRET_ACCESS_KEY,
-            Some(secret.expose().as_bytes()),
-        ));
-        if let Some(token) = &c.session_token {
-            entries.push((
-                CredentialSource::SESSION_TOKEN,
-                Some(token.expose().as_bytes()),
-            ));
-        }
-    }
-    if let Some(passphrase) = &c.e2e_passphrase {
-        entries.push((E2E_PASSPHRASE, Some(passphrase.expose().as_bytes())));
-    }
     store
-        .replace(&entries)
+        .replace(&credentials::entries(&p.credentials))
         .map_err(|e| ControlError::failed(e.to_string()))?;
     let source = if has_keys {
         CredentialSource::Static(store.clone())
@@ -774,17 +754,9 @@ fn unlock_source(
 /// The engine's passphrase source over the unlocked store.
 fn passphrase_from(store: EphemeralSecretStore) -> constellation_engine::PassphraseSource {
     constellation_engine::PassphraseSource::Ask(Box::new(move || {
-        let secret = store
-            .get(E2E_PASSPHRASE)?
-            .context("an e2e filesystem needs the passphrase in fs.unlock (e2e_passphrase)")?;
-        let text = secret
-            .expose_str()
-            .context("the e2e passphrase is not UTF-8")?
-            .to_string();
-        if text.is_empty() {
-            bail!("the e2e passphrase must not be empty");
-        }
-        Ok(Zeroizing::new(text))
+        credentials::passphrase(&store)
+            .map_err(crate::refusal)?
+            .context("an e2e filesystem needs the passphrase in fs.unlock (e2e_passphrase)")
     }))
 }
 
@@ -803,15 +775,18 @@ async fn check_unlocked(
         CredentialSource::Static(store) => CredentialSource::Static(store.clone()),
         _ => CredentialSource::AwsDefaultChain,
     });
-    let passphrase = secrets
-        .get(E2E_PASSPHRASE)
-        .ok()
-        .flatten()
-        .and_then(|s| s.expose_str().map(|t| Zeroizing::new(t.to_string())));
+    let passphrase = credentials::passphrase(secrets)?;
+    if creation.create {
+        // Classified as everything else the gate checks (`gate_refusal`):
+        // what the manager already found transient stays so.
+        create_if_missing(s3, creation, Some(&source), passphrase.clone())
+            .await
+            .map_err(|e| match e.kind {
+                constellation_control::proto::ErrorKind::Unavailable => e,
+                _ => gate_refusal(&anyhow::anyhow!(e.message)),
+            })?;
+    }
     let checked = async {
-        if creation.create {
-            create_if_missing(s3, creation, Some(&source), passphrase.clone()).await?;
-        }
         let (backend, _) = crate::backend::open_backend_described_with(s3, Some(&source))
             .await
             .context("opening backend")?;

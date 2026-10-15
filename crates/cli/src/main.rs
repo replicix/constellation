@@ -15,9 +15,10 @@ mod startup;
 
 // Plan 31 C3: the engine modules live in `constellation-engine`; importing
 // them here keeps every `crate::<module>::…` path in this crate as it was.
+use constellation_engine::manager::{self, Manager};
 use constellation_engine::{
-    atime, authority_driver, backend, cto, designation, doctor, e2e_pin, fsck, gc, lease, leave,
-    locks, log_buffer, registry, shipper, target, writeback,
+    atime, backend, cto, doctor, e2e_pin, fsck, gc, lease, locks, log_buffer, registry, shipper,
+    target, writeback,
 };
 
 use anyhow::{bail, Context, Result};
@@ -992,8 +993,12 @@ enum DebugCommand {
 
 #[derive(Subcommand)]
 enum FsCommand {
-    /// Register (and create at the backend, if `--s3` is new) a named
-    /// filesystem. No views/mounts yet — `mount NAME` adds those.
+    /// Create a filesystem at `--s3` and register it as NAME (no views yet:
+    /// `mount NAME` adds those). Refused when a filesystem already exists
+    /// there (`mount NAME MOUNTPOINT --s3 URL` registers an existing one).
+    /// NAME is one path component with no `:`; a NAME registered at another
+    /// URL is repointed only while its state dir is not in use (no replica,
+    /// no daemon) — `export NAME` first otherwise.
     Create {
         name: String,
         #[arg(long)]
@@ -1062,10 +1067,28 @@ enum FsSetting {
 /// against it, then resolve the effective state dir (explicit wins,
 /// else the registry, else an error naming what's missing).
 fn resolve_target(target: &str, state_dir: Option<PathBuf>) -> Result<(target::Target, PathBuf)> {
-    let reg = registry::Registry::load()?;
-    let t = target::resolve(target, &reg);
+    let t = resolve(target)?;
     let dir = target::state_dir(state_dir, &t)?;
     Ok((t, dir))
+}
+
+/// The filesystem manager (plan 31 §4) every `fs` command, `doctor`,
+/// `export`, `mount`'s registration and every `NAME[:path]` go through:
+/// this host's registry and E2E pins, `meta.json` reads waiting as long as
+/// the store's default.
+fn manager() -> &'static Manager {
+    static MANAGER: std::sync::OnceLock<Manager> = std::sync::OnceLock::new();
+    MANAGER.get_or_init(Manager::native)
+}
+
+/// A manager refusal as the CLI reports it: its message.
+fn refusal(e: constellation_control::proto::ControlError) -> anyhow::Error {
+    anyhow::anyhow!(e.message)
+}
+
+/// `raw` (`myfs`, `myfs:/data`, `/data`) against the registry.
+fn resolve(raw: &str) -> Result<target::Target> {
+    manager().resolve(raw).map_err(refusal)
 }
 
 fn passphrase(env: &str, prompt: &str) -> Result<Zeroizing<String>> {
@@ -1148,38 +1171,38 @@ fn daemon_socket_is_live(state_dir: &Path) -> bool {
 /// survives the fork) or the filesystem is not E2E. Reads `meta.json`
 /// through a throwaway runtime that is fully dropped before the caller
 /// forks, so no runtime threads leak into the daemon child.
-/// Run the backend preflight for `fs create`, print the per-operation
-/// report, and bail with a concise message if any required operation is
-/// unsupported (e.g. Backblaze B2 rejecting the conditional-write headers).
-async fn preflight_backend(store: &ChunkStore, s3: &str) -> Result<()> {
-    let checks = store.preflight().await;
-    let mut failed = Vec::new();
-    for c in &checks {
+/// Print the backend preflight's per-operation report (`fs create`,
+/// `serve --create`); the manager refuses a backend whose required
+/// operations failed (e.g. Backblaze B2 rejecting the conditional-write
+/// headers) with the list.
+fn print_preflight(checks: &[constellation_store_s3::PreflightCheck]) {
+    for c in checks {
         let status = match &c.outcome {
             Ok(()) => "ok".to_string(),
-            Err(reason) => {
-                if c.required {
-                    failed.push((c.name, reason.clone()));
-                    format!("FAILED: {reason}")
-                } else {
-                    format!("unavailable: {reason}")
-                }
-            }
+            Err(reason) if c.required => format!("FAILED: {reason}"),
+            Err(reason) => format!("unavailable: {reason}"),
         };
         eprintln!("  {:.<40} {}", format!("{} ", c.name), status);
     }
-    if !failed.is_empty() {
-        let details = failed
-            .iter()
-            .map(|(name, reason)| format!("  - {name}: {reason}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        bail!(
-            "backend at {s3} is not usable as a constellation filesystem; \
-             the following required operations failed:\n{details}"
-        );
+}
+
+/// `fs create`'s side of a create: the preflight report on stderr, and the
+/// new E2E filesystem's passphrase (`CONSTELLATION_PASSPHRASE`, else a
+/// prompt), asked only once the backend passed and before anything is
+/// written, so an abort at the prompt leaves no orphan `meta.json`.
+struct CliCreate;
+
+impl manager::CreateHooks for CliCreate {
+    fn preflight(&mut self, checks: &[constellation_store_s3::PreflightCheck]) {
+        print_preflight(checks);
     }
-    Ok(())
+
+    fn passphrase(
+        &mut self,
+    ) -> std::result::Result<Zeroizing<String>, constellation_control::proto::ControlError> {
+        passphrase("CONSTELLATION_PASSPHRASE", "New filesystem passphrase: ")
+            .map_err(|e| constellation_control::proto::ControlError::failed(format!("{e:#}")))
+    }
 }
 
 /// What [`check_fs_before_mount`] learned from `meta.json`.
@@ -1225,18 +1248,7 @@ fn check_fs_before_mount(
 /// Remember the endpoint a name's `meta.json` was read from (best effort:
 /// diagnostics only, see `FsEntry::endpoint`).
 fn remember_endpoint(name: &str, endpoint: &str) {
-    let saved = registry::Registry::load_locked().and_then(|mut reg| {
-        reg.merge_and_save(
-            name,
-            registry::FsOverrides {
-                endpoint: Some(endpoint.to_string()),
-                ..Default::default()
-            },
-        )
-    });
-    if let Err(e) = saved {
-        tracing::debug!(name, error = %e, "recording the name's S3 endpoint failed");
-    }
+    manager().remember_endpoint(name, endpoint);
 }
 
 /// Drops iroh's `could not close last open path` event and nothing else.
@@ -1458,66 +1470,24 @@ fn main() -> Result<()> {
                     epoch_slack,
                 },
         } => {
-            constellation_fs_core::validate_chunk_size(chunk_size)?;
-            let ack_policy = crate::authority_driver::ack_policy_flag(ack_policy.as_deref())?;
-            let setting: CompressionSetting =
-                compression.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (backend, backend_info) = rt
-                .block_on(backend::open_backend_described(&s3))
-                .context("opening backend")?;
-            let store = ChunkStore::new(backend.clone());
-            // Verify the backend supports every operation a filesystem
-            // needs before writing (or prompting for) anything, so an
-            // unusable backend fails fast with a clean report instead of
-            // a raw protocol error mid-create.
-            rt.block_on(preflight_backend(&store, &s3))?;
-            let mut meta = FsMeta::new(chunk_size, &setting.to_string());
-            meta.e2e = e2e;
-            // E2E filesystems seed the gossip topic from the passphrase-
-            // protected keyring, not plaintext `meta.json`; leaving it here
-            // would let a bucket reader join the topic. Non-E2E keeps it in
-            // `meta.json` (S3 is the trust boundary there anyway).
-            if e2e {
-                meta.gossip_secret = None;
-            }
-            meta.max_logical_bytes = max_size.filter(|&n| n > 0);
-            meta.ack_policy = ack_policy;
-            meta.epoch_slack = (epoch_slack > 0).then_some(epoch_slack);
-            if epoch_slack > 0 {
-                let ttl = crate::lease::lease_ttl_ms();
-                constellation_store_s3::PromiseConfig::from_env(ttl)
-                    .validate(ttl)
-                    .map_err(|why| anyhow::anyhow!("--epoch-slack {epoch_slack}: {why}"))?;
-            }
-            // Collect the passphrase before writing anything: an abort at
-            // the prompt (Ctrl-C, empty input) must leave no orphan
-            // `meta.json` behind. The keyring block is built into `meta`,
-            // so the whole E2E filesystem — identity and keys — is created
-            // by a single conditional PUT with no orphan window.
-            if e2e {
-                let secret = passphrase("CONSTELLATION_PASSPHRASE", "New filesystem passphrase: ")?;
-                meta.keyring = Some(
-                    constellation_store_s3::create_keyring_block(&secret)
-                        .context("creating E2E keyring")?,
-                );
-            }
-            rt.block_on(store.create_fs(&meta))
-                .context("creating filesystem")?;
-            registry::Registry::load_locked()?
-                .merge_and_save(
-                    &name,
-                    registry::FsOverrides {
-                        s3: Some(s3.clone()),
-                        endpoint: backend_info.endpoint().map(str::to_string),
-                        ..Default::default()
-                    },
-                )
-                .context("registering the new filesystem")?;
-            e2e_pin::record(&e2e_pin::PinTarget::named(&name, &s3), &meta, None);
+            let req = manager::CreateRequest {
+                name: Some(name.clone()),
+                chunk_size: Some(chunk_size),
+                compression: Some(compression),
+                e2e,
+                max_size,
+                ack_policy,
+                epoch_slack,
+                ..manager::CreateRequest::new(s3.clone(), manager::Existing::Refuse)
+            };
+            let created = rt
+                .block_on(manager().create(req, &mut CliCreate))
+                .map_err(refusal)?;
+            let meta = &created.meta;
             println!("created filesystem {} at {s3}", meta.uuid);
             println!("  name:        {name}");
             println!("  chunk_size:  {chunk_size}");
-            println!("  compression: {setting}");
+            println!("  compression: {}", created.compression);
             println!("  e2e:         {e2e}");
             if let Some(cap) = meta.max_logical_bytes {
                 println!("  max_size:    {cap}");
@@ -1536,8 +1506,7 @@ fn main() -> Result<()> {
                     setting: FsSetting::EpochSlack { target, slack, s3 },
                 },
         } => {
-            let reg = registry::Registry::load()?;
-            let t = target::resolve(&target, &reg);
+            let t = resolve(&target)?;
             let s3 = target::s3_url(s3, &t)?;
             let backend = rt
                 .block_on(backend::open_backend(&s3))
@@ -1586,36 +1555,33 @@ fn main() -> Result<()> {
         Command::Fs {
             command: FsCommand::Passwd { target, s3 },
         } => {
-            let reg = registry::Registry::load()?;
-            let t = target::resolve(&target, &reg);
+            let t = resolve(&target)?;
             let s3 = target::s3_url(s3, &t)?;
-            let backend = rt
-                .block_on(backend::open_backend(&s3))
-                .context("opening backend")?;
-            let store = ChunkStore::new(backend.clone());
-            let meta = rt.block_on(store.load_fs())?;
-            let pin = e2e_pin::PinTarget::for_target(&t, &s3);
-            e2e_pin::check(&pin, &meta)?;
-            if !meta.e2e {
-                bail!("filesystem is not in E2E mode");
-            }
-            let old = passphrase("CONSTELLATION_PASSPHRASE", "Current passphrase: ")?;
-            let new = passphrase(
-                "CONSTELLATION_NEW_PASSPHRASE",
-                "New filesystem passphrase: ",
-            )?;
-            rt.block_on(store.change_passphrase(&old, &new))
-                .context("changing E2E passphrase")?;
-            // The rewrap kept the master, so the pin's fingerprint stands;
-            // record it anyway once the new passphrase has opened the block
-            // (a `fs create` pin has none yet).
-            let rewrapped = rt.block_on(store.load_fs())?;
-            match rewrapped.unlock(&new) {
-                Ok(keys) => e2e_pin::record(&pin, &rewrapped, Some(&keys)),
-                Err(e) => eprintln!(
-                    "warning: meta.json read back after the change does not open with the new \
-                     passphrase ({e}); the local E2E pin was not updated"
-                ),
+            let req = manager::PasswdRequest {
+                pin: e2e_pin::PinTarget::for_target(&t, &s3),
+                url: s3,
+                credentials: None,
+            };
+            // Asked only once the filesystem is known to be E2E.
+            let mut secrets = || {
+                let ask = |env, prompt| {
+                    passphrase(env, prompt).map_err(|e| {
+                        constellation_control::proto::ControlError::failed(format!("{e:#}"))
+                    })
+                };
+                Ok((
+                    ask("CONSTELLATION_PASSPHRASE", "Current passphrase: ")?,
+                    ask(
+                        "CONSTELLATION_NEW_PASSPHRASE",
+                        "New filesystem passphrase: ",
+                    )?,
+                ))
+            };
+            let outcome = rt
+                .block_on(manager().passwd(req, &mut secrets))
+                .map_err(refusal)?;
+            if let Some(warning) = outcome.warning {
+                eprintln!("warning: {warning}");
             }
             println!(
                 "passphrase changed; data-encryption keys were not rotated \
@@ -1650,15 +1616,11 @@ fn main() -> Result<()> {
             ))
         }
         Command::Doctor { target, s3 } => {
-            let reg = registry::Registry::load()?;
-            let t = target::resolve(&target, &reg);
+            let t = resolve(&target)?;
             let s3 = target::s3_url(s3, &t)?;
-            let (backend, info) = rt
-                .block_on(backend::open_backend_described(&s3))
-                .context("opening backend")?;
-            println!("backend ........................... {info}");
-            let store = ChunkStore::new(backend);
-            let caps = rt.block_on(store.probe_conditional_writes())?;
+            let report = rt.block_on(manager().doctor(&s3, None)).map_err(refusal)?;
+            println!("backend ........................... {}", report.backend);
+            let caps = report.capabilities.map_err(anyhow::Error::msg)?;
             let yn = |b: bool| if b { "ok" } else { "MISSING" };
             println!(
                 "create-if-absent (If-None-Match) ... {}",
@@ -1677,22 +1639,24 @@ fn main() -> Result<()> {
             }
             // Plan 30 §M4 items 1 and 4: what each CAS edge answers, and
             // bucket versioning.
-            let report = rt.block_on(constellation_store_s3::probe_cas_semantics(store.inner()))?;
-            doctor::print_cas_report(&report)?;
+            let cas = report
+                .cas
+                .context("the CAS probes did not run")?
+                .map_err(anyhow::Error::msg)?;
+            doctor::print_cas_report(&cas)?;
             print!("filesystem at prefix .............. ");
-            // `HEAD` first: a `GET` of a `meta.json` that does not exist
-            // yet is the answer a store caching negative reads would keep
-            // serving to the `mount` after `fs create`.
-            match rt.block_on(store.fs_exists()) {
-                Ok(false) => println!(
-                    "none — {} (run `constellation fs create`)",
-                    rt.block_on(store.locate_missing_fs())
-                ),
-                Ok(true) => match rt.block_on(store.load_fs()) {
-                    Ok(meta) => println!("ok ({}, format v{})", meta.uuid, meta.format_version),
-                    Err(e) => bail!(e),
-                },
-                Err(e) => bail!(e),
+            match report
+                .filesystem
+                .context("the filesystem check did not run")?
+            {
+                manager::FsState::Missing(found) => {
+                    println!("none — {found} (run `constellation fs create`)")
+                }
+                manager::FsState::Present {
+                    uuid,
+                    format_version,
+                } => println!("ok ({uuid}, format v{format_version})"),
+                manager::FsState::Unreadable(e) => bail!(e),
             }
             Ok(())
         }
@@ -2192,8 +2156,7 @@ fn main() -> Result<()> {
                     state_dir,
                 } => (target, s3, state_dir, true),
             };
-            let reg = registry::Registry::load()?;
-            let t = target::resolve(&target, &reg);
+            let t = resolve(&target)?;
             let s3 = target::s3_url(s3, &t)?;
             let dir = target::state_dir_opt(state_dir, &t);
             let pin = e2e_pin::PinTarget::for_target(&t, &s3);
@@ -2208,8 +2171,7 @@ fn main() -> Result<()> {
             repair,
             force_release,
         } => {
-            let reg = registry::Registry::load()?;
-            let t = target::resolve(&target, &reg);
+            let t = resolve(&target)?;
             let s3 = target::s3_url(s3, &t)?;
             let dir = target::state_dir_opt(state_dir, &t);
             let pin = e2e_pin::PinTarget::for_target(&t, &s3);
@@ -2473,7 +2435,9 @@ fn cmd_mount(
     // instead of dying as "daemon exited before reporting status").
     ensure_allow_other_supported(allow_other)?;
 
-    let mut reg = registry::Registry::load_locked()?;
+    // Held from the resolution of the target to its registration: the
+    // manager's identity rules are checked against what is written.
+    let mut reg = manager().registry_locked().map_err(refusal)?;
     let mut resolved = target::resolve(&target, &reg);
     // `mount` is the one command allowed to *create* a name: a target
     // that is syntactically name-shaped but not yet registered (first
@@ -2509,32 +2473,6 @@ fn cmd_mount(
             path,
             entry: current,
         } => {
-            // Identity is pinned to the name: refuse an --s3 that
-            // contradicts an already-populated state dir.
-            if let Some(new_s3) = &s3 {
-                if !current.s3.is_empty()
-                    && current.s3 != *new_s3
-                    && current.state_dir.join("meta.db").exists()
-                {
-                    bail!(
-                        "{name} already points at {:?}; `--s3 {new_s3:?}` would repoint an \
-                         existing state dir. Run `constellation export {name}` first if you \
-                         really want to re-point it.",
-                        current.s3
-                    );
-                }
-            }
-            // An explicit `--state-dir` is the name's state dir from now
-            // on, as every other explicit argument overwrites the stored
-            // value — or refused (a dir in use, not empty, another
-            // name's: `Registry::explicit_state_dir`), as an `--s3` that
-            // would repoint a populated state dir is. (It was ignored: the name was served
-            // from its registered dir, `~/.local/share/constellation/NAME`
-            // after `fs create`, while the caller looked in DIR.)
-            let state_dir_override = state_dir
-                .as_deref()
-                .map(|dir| reg.explicit_state_dir(name, dir))
-                .transpose()?;
             let mount_override = (mountpoint.is_some() || path.is_some()).then(|| {
                 let subtree = path.clone().unwrap_or_default();
                 let stored = current.mount(&subtree);
@@ -2570,25 +2508,30 @@ fn cmd_mount(
                     );
                 }
             }
-            let entry = reg.merge_and_save(
-                name,
-                registry::FsOverrides {
-                    s3: s3.clone(),
-                    state_dir: state_dir_override,
-                    cache_size: cache_size.map(|b| format!("{b}")),
-                    cache_dir: None,
-                    fsync_mode: fsync_mode.clone(),
-                    write_mode: write_mode.clone(),
-                    read_only_member: read_only_member.then_some(true),
-                    web_ui,
-                    // A repointed name forgets the old URL's endpoint.
-                    endpoint: s3
-                        .as_ref()
-                        .filter(|new| **new != current.s3)
-                        .map(|_| String::new()),
-                    mount: mount_override,
-                },
-            )?;
+            // Identity is pinned to the name: the manager refuses an `--s3`
+            // that would repoint a state dir in use, and a `--state-dir`
+            // that would move one, is not new or empty, or is another
+            // name's (`Registry::explicit_state_dir`). An explicit
+            // `--state-dir` is the name's state dir from now on, as every
+            // other explicit argument overwrites the stored value.
+            let entry = manager()
+                .save_mount(
+                    &mut reg,
+                    name,
+                    s3.as_deref(),
+                    state_dir.as_deref(),
+                    registry::FsOverrides {
+                        cache_size: cache_size.map(|b| format!("{b}")),
+                        cache_dir: None,
+                        fsync_mode: fsync_mode.clone(),
+                        write_mode: write_mode.clone(),
+                        read_only_member: read_only_member.then_some(true),
+                        web_ui,
+                        mount: mount_override,
+                        ..Default::default()
+                    },
+                )
+                .map_err(refusal)?;
             registered_endpoint = (!entry.endpoint.is_empty()).then(|| entry.endpoint.clone());
             let views = if path.is_none() && mountpoint.is_none() {
                 // Bare `mount NAME`: every registered view.
@@ -2651,6 +2594,14 @@ fn cmd_mount(
             )
         }
     };
+    // The name's state dir becomes "in use" (`Registry::check_repoint`,
+    // `explicit_state_dir`) before the registry's lock is let go: a
+    // concurrent `fs create NAME --s3 OTHER` or `fs.create{name}` must not
+    // see it free between here and the daemon taking `daemon.lock` (after
+    // the meta.json check, the passphrase prompt and the fork), repoint the
+    // row, and have this daemon fill a replica of the old URL under it.
+    // `daemon.lock` is a `flock`: the forked daemon inherits the very lock.
+    let held = HeldStateDir::take(&state_dir)?;
     drop(reg); // release the registry's own advisory lock before forking
 
     // A view may enable allow_other from the registry rather than this
@@ -2733,6 +2684,7 @@ fn cmd_mount(
             views,
             mount_passphrase,
             pin_target,
+            held.into_guard(),
             None,
         ),
         daemonize::Outcome::Daemon(verdict) => {
@@ -2755,6 +2707,7 @@ fn cmd_mount(
                 views,
                 mount_passphrase,
                 pin_target,
+                held.into_guard(),
                 Some(verdict),
             );
             // `cmd_mount_body` already reported success/failure through
@@ -2779,17 +2732,17 @@ enum LockOutcome {
     Attach,
 }
 
-fn take_state_dir_lock(state_dir: &Path) -> Result<LockOutcome> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("creating {}", state_dir.display()))?;
-    let lock_file =
-        constellation_platform::lock::open_lock_file(&state_dir.join(daemon_lock::LOCK_NAME))
-            .context("opening daemon.lock")?;
-    match constellation_platform::native()
-        .file_lock
-        .try_lock(lock_file)
-        .context("locking daemon.lock")?
-    {
+/// `held`: `daemon.lock` already taken by this process (`mount`'s
+/// [`HeldStateDir`]), used instead of taking it again.
+fn take_state_dir_lock(
+    state_dir: &Path,
+    held: Option<constellation_platform::LockGuard>,
+) -> Result<LockOutcome> {
+    let guard = match held {
+        Some(guard) => Some(guard),
+        None => try_lock_state_dir(state_dir)?,
+    };
+    match guard {
         Some(guard) => {
             // We hold it now. Leak the guard so the lock survives for the
             // rest of this process's life (released automatically on
@@ -2803,6 +2756,61 @@ fn take_state_dir_lock(state_dir: &Path) -> Result<LockOutcome> {
             Ok(LockOutcome::BecomeDaemon)
         }
         None => Ok(LockOutcome::Attach),
+    }
+}
+
+/// `daemon.lock` of `state_dir` (created with the dir if need be), if no
+/// other process holds it.
+fn try_lock_state_dir(state_dir: &Path) -> Result<Option<constellation_platform::LockGuard>> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("creating {}", state_dir.display()))?;
+    let lock_file =
+        constellation_platform::lock::open_lock_file(&state_dir.join(daemon_lock::LOCK_NAME))
+            .context("opening daemon.lock")?;
+    constellation_platform::native()
+        .file_lock
+        .try_lock(lock_file)
+        .context("locking daemon.lock")
+}
+
+/// `mount`'s hold on its state dir from its registration on: `daemon.lock`,
+/// taken before the registry's lock is released (see `cmd_mount`), so the
+/// name is in use from the row's write until the daemon serves it. `None`
+/// inside when another process holds it — a daemon of this state dir,
+/// which makes it in use already; the attach path then deals with it. A
+/// mount that fails before it hands the lock on removes the lock file, and
+/// the state dir when it made it (an empty dir it created, left behind,
+/// would no longer be "new or empty" for `--state-dir`).
+struct HeldStateDir {
+    guard: Option<constellation_platform::LockGuard>,
+    created: Option<PathBuf>,
+}
+
+impl HeldStateDir {
+    fn take(state_dir: &Path) -> Result<HeldStateDir> {
+        let created = (!state_dir.exists()).then(|| state_dir.to_path_buf());
+        let guard = try_lock_state_dir(state_dir)?;
+        Ok(HeldStateDir { guard, created })
+    }
+
+    /// Hand the lock on to the daemon (`take_state_dir_lock`).
+    fn into_guard(mut self) -> Option<constellation_platform::LockGuard> {
+        self.created = None;
+        self.guard.take()
+    }
+}
+
+impl Drop for HeldStateDir {
+    fn drop(&mut self) {
+        if self.guard.is_none() {
+            return;
+        }
+        if let Some(dir) = &self.created {
+            // Unlinked while still locked, then closed (the guard drops
+            // after this): a waiter re-opens by path and gets a new file.
+            let _ = std::fs::remove_file(dir.join(daemon_lock::LOCK_NAME));
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 }
 
@@ -2831,6 +2839,7 @@ fn cmd_mount_body(
     views: Vec<ViewSpec>,
     passphrase: Option<Zeroizing<String>>,
     pin_target: e2e_pin::PinTarget,
+    mut held: Option<constellation_platform::LockGuard>,
     verdict: Option<daemonize::Verdict>,
 ) -> Result<()> {
     let fuse_threads = threads.fuse;
@@ -2872,7 +2881,7 @@ fn cmd_mount_body(
         bail!(msg)
     };
     let lock_outcome = loop {
-        match take_state_dir_lock(state_dir)? {
+        match take_state_dir_lock(state_dir, held.take())? {
             LockOutcome::Attach => {
                 startup::phase("probing the daemon that holds daemon.lock");
                 let probe = rt.block_on(control::ping(state_dir, daemon_lock::control_timeout()));
@@ -3203,8 +3212,7 @@ async fn attach_views(
 /// --no-wait`, or one stopped waiting), is waited for the same way.
 /// Ctrl-C stops the wait, not the drain.
 async fn cmd_umount(target: String, state_dir: Option<PathBuf>, no_wait: bool) -> Result<()> {
-    let reg = registry::Registry::load()?;
-    let resolved = target::resolve(&target, &reg);
+    let resolved = resolve(&target)?;
     let dir = target::state_dir(state_dir, &resolved)?;
     let list = || async {
         control::call_bounded::<cm::ViewList>(
@@ -3534,122 +3542,22 @@ async fn wait_for_daemon_exit(
 /// un-register a name. Leaves the cluster (if ever mounted) *while the
 /// daemon is still up* — self-leave drains the journal and releases
 /// leases through the running sync task — then deletes the state dir and
-/// the registry row.
+/// the registry row: `Manager::export`, reaching the daemon through this
+/// CLI's control client (`control::CliDaemons`).
 async fn cmd_export(name: String, force: bool) -> Result<()> {
-    let mut reg = registry::Registry::load_locked()?;
-    let entry = reg
-        .entry(&name)
-        .cloned()
-        .with_context(|| format!("{name:?} is not a registered filesystem"))?;
-    let db_path = entry.state_dir.join("meta.db");
-    let dir = entry.state_dir.clone();
-    // A running daemon holds `fjall`'s single-process lock on `meta.db`
-    // (unlike the old SQLite/WAL engine, which tolerated this direct
-    // open concurrently), so check aliveness first: if it answers at
-    // all it has necessarily already claimed a node id, and opening the
-    // store directly here would otherwise fail with `Locked` and be
-    // swallowed by `.ok()`, silently skipping the self-leave below.
-    let daemon_alive = matches!(
-        control::ping(&dir, daemon_lock::control_timeout()).await,
-        Ok(true)
-    );
-    let node_id_claimed = daemon_alive
-        || (db_path.exists() && {
-            Meta::open(&db_path)
-                .ok()
-                .and_then(|m| m.kv_get("node_id").ok().flatten())
-                .is_some()
-        });
-    if node_id_claimed {
-        match control::try_call::<cm::NodeLeave>(
-            &dir,
-            api::LeaveParams {
-                node_id: None,
-                force,
-            },
-            None,
-        )
-        .await
-        {
-            Ok(Ok(ack)) => {
-                println!("{}", ack.detail);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                while control::socket_exists(&dir) && std::time::Instant::now() < deadline {
-                    if force {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-            Ok(Err(e)) => {
-                let message = e.message;
-                if !force {
-                    bail!("leave failed: {message}");
-                }
-                eprintln!("leave failed (continuing: --force): {message}");
-            }
-            Err(_) => {
-                // Daemon unreachable: it left ungracefully or was never
-                // cleanly stopped. Refuse a live-but-wedged daemon
-                // (lock still held) unless forced; otherwise retire the
-                // node with the admin path directly against the store —
-                // there is no journal to drain from a dead process.
-                let lock_path = entry.state_dir.join("daemon.lock");
-                if lock_path.exists() && !force {
-                    let probe = std::fs::OpenOptions::new().write(true).open(&lock_path);
-                    if let Ok(f) = probe {
-                        // Anything but getting the lock (and releasing it
-                        // again as the guard drops) counts as held.
-                        let held = !matches!(
-                            constellation_platform::native().file_lock.try_lock(f),
-                            Ok(Some(_))
-                        );
-                        if held {
-                            bail!(
-                                "daemon.lock for {name:?} is held by a live process (starting up \
-                                 or wedged, not gone); pass --force to retire it anyway"
-                            );
-                        }
-                    }
-                }
-                let meta = std::sync::Arc::new(Meta::open(&db_path)?);
-                let node_id: u64 = meta
-                    .kv_get("node_id")?
-                    .context("no node_id on record")?
-                    .parse()?;
-                // `cmd_export` is already running on a tokio runtime
-                // (`main` drives it via `rt.block_on`), so this awaits
-                // directly rather than nesting a second runtime — doing
-                // that panics ("Cannot start a runtime from within a
-                // runtime").
-                let backend = backend::open_backend(&entry.s3).await?;
-                let store = ChunkStore::new(backend);
-                let designations = std::sync::Arc::new(designation::DesignationManager::new(
-                    constellation_store_s3::designation::DesignationStore::new(
-                        store.inner().clone(),
-                        constellation_store_s3::designation::DesignationMode::Cas,
-                    ),
-                    meta.clone(),
-                    constellation_net::Peers::disabled(),
-                    node_id,
-                ));
-                // `self_id` only guards "you can't admin-leave yourself
-                // via the admin form" (`target == self_id`); there is no
-                // real "self" here (this CLI process is not a mounted
-                // node), so `0` — never a claimed node id — just needs
-                // to differ from `target`.
-                leave::admin_leave(store.inner().clone(), &designations, 0, node_id, true)
-                    .await
-                    .context("admin-retiring the dead daemon's node")?;
-                println!("retired node {node_id} in the registry (daemon was unreachable)");
-            }
+    let mut notes = |note: manager::ExportNote| match note {
+        manager::ExportNote::Left(detail) => println!("{detail}"),
+        manager::ExportNote::LeaveRefused(message) => {
+            eprintln!("leave failed (continuing: --force): {message}")
         }
-    }
-    if entry.state_dir.exists() {
-        std::fs::remove_dir_all(&entry.state_dir)
-            .with_context(|| format!("removing {}", entry.state_dir.display()))?;
-    }
-    reg.remove(&name)?;
+        manager::ExportNote::Retired(node_id) => {
+            println!("retired node {node_id} in the registry (daemon was unreachable)")
+        }
+    };
+    manager()
+        .export(&name, force, &control::CliDaemons, &mut notes)
+        .await
+        .map_err(refusal)?;
     println!("exported {name}: registry entry and state dir removed");
     Ok(())
 }
@@ -3657,12 +3565,12 @@ async fn cmd_export(name: String, force: bool) -> Result<()> {
 /// `constellation fs list` (plan 21, step 7): every registered
 /// filesystem and its views, analogous to `zfs list`/`zpool list`.
 fn cmd_fs_list(rt: &tokio::runtime::Runtime) -> Result<()> {
-    let reg = registry::Registry::load()?;
+    let entries = manager().list().map_err(refusal)?;
     println!(
         "{:<16} {:<32} {:<40} {:<16} {:<24} MOUNTED?",
         "NAME", "S3", "STATE-DIR", "SUBTREE", "MOUNTPOINT"
     );
-    for (name, entry) in reg.iter() {
+    for (name, entry) in &entries {
         let live: Vec<api::ViewInfo> = rt
             .block_on(control::call::<cm::ViewList>(
                 &entry.state_dir,

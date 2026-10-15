@@ -25,11 +25,35 @@ settings (subtree, mountpoint, `--allow-other`, ...) live in
 share one node identity, cache, and lease keeper but can genuinely
 disagree on those.
 
-`mount` is the only command that *writes* a live entry — give it new
-arguments and it overwrites the stored config for that name/view, the
-same way `zpool import` refreshes `zpool.cache`. `export` (below) is the
-only way to remove one. There is no separate `register`/`unregister`
-verb.
+`mount` writes a name's live entry — give it new arguments and it
+overwrites the stored config for that name/view, the same way `zpool
+import` refreshes `zpool.cache`; `fs create NAME` (and the control
+protocol's `fs.create`/`fs.import`) register one too. `export` (below) is
+the only way to remove one. There is no separate `register`/`unregister`
+verb. The CLI and the control service go through one implementation of
+these rules, the filesystem manager (`constellation_engine::manager`).
+
+A name is one path component: not empty, not `.` or `..`, and without
+`/`, `\`, `:` or control characters (its default state dir is
+`<data dir>/NAME`, which `export` deletes; `NAME:/path` separates a name
+from a path). A name registered before this rule existed that breaks it
+can still be listed (`fs list`) and exported (`export`), but no longer
+mounted or otherwise written: export it and register a valid name.
+
+Identity is pinned to the name. A name's backend URL changes — by
+`mount NAME --s3 URL`, `fs create NAME --s3 URL` or `fs.create` — only
+while its state dir is not in use: no replica (`meta.db`) and no daemon
+holding its `daemon.lock` — which `mount NAME` takes as it registers the
+name, before it reads `meta.json`, prompts or forks, and hands to its
+daemon. A name registered by `fs create` and never
+mounted can therefore be created again elsewhere; one in use needs
+`export NAME` first. `fs.import` refuses any other URL for a registered
+name.
+
+`fs create` refuses a URL where a filesystem already exists, before the
+backend preflight or the passphrase prompt; the control protocol's
+`fs.create` answers the existing filesystem when the parameters match
+(plan 31 §9.2).
 
 ## Naming syntax
 
@@ -229,6 +253,12 @@ constellation export NAME [--force]
    from the cluster registry directly (the admin-leave path); refuses if
    `daemon.lock` is still held by a live process unless `--force`.
 4. Deletes the state dir and the registry row.
+
+Before any of this, `export` refuses a name whose state dir holds (or is)
+another registered name's state or cache dir, the registry, or the data,
+config or runtime dir, and refuses when one of those host dirs cannot be
+located — a row written before names were checked (`mount ..` registered
+`..`) must not take every other name's state with it.
 
 The state dir must go: it is name-keyed now, so leaving it behind would
 make a later `mount NAME` reopen a replica that already recorded

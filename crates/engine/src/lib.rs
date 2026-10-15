@@ -46,6 +46,7 @@ pub mod leave;
 pub mod lifecycle;
 pub mod locks;
 pub mod log_buffer;
+pub mod manager;
 mod mtree_gc;
 pub mod mtree_publish;
 mod mtree_read;

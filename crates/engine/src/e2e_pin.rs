@@ -187,7 +187,7 @@ pub fn pins_store() -> Result<PinStore> {
 /// [`pins_store`] in `host`'s secret store (an engine's injected host).
 pub fn pins_store_in(host: &constellation_platform::HostServices) -> Result<PinStore> {
     if std::env::var("CONSTELLATION_REGISTRY").is_ok_and(|p| !p.is_empty()) {
-        return PinStore::at(&Registry::path()?.with_extension("e2e.toml"));
+        return PinStore::at(&Registry::path_in(host)?.with_extension("e2e.toml"));
     }
     // The default store resolves the config dir per use; fail here, as
     // the registry does, when there is none (no `HOME`).
@@ -227,7 +227,15 @@ pub fn check_in(
     target: &PinTarget,
     meta: &FsMeta,
 ) -> Result<PinCheck> {
-    match pins_store_in(host) {
+    check_with(pins_store_in(host), target, meta)
+}
+
+/// [`check`] against the pins in `store` (the filesystem
+/// [`Manager`](crate::manager::Manager)'s, which may keep them beside a
+/// registry of its own); a store that cannot be located checks nothing,
+/// as [`check_in`] does.
+pub fn check_with(store: Result<PinStore>, target: &PinTarget, meta: &FsMeta) -> Result<PinCheck> {
+    match store {
         Ok(store) => check_at(Some(store), target, meta, accept_change()),
         Err(error) => {
             tracing::warn!(
@@ -343,8 +351,18 @@ impl PinCheck {
 /// `None`: the first unlock adds the fingerprint), and `fs passwd`, which
 /// just rewrapped and reopened it. Best-effort.
 pub fn record(target: &PinTarget, meta: &FsMeta, keys: Option<&E2eKeys>) {
+    record_with(pins_store(), target, meta, keys)
+}
+
+/// [`record`] into `store`.
+pub fn record_with(
+    store: Result<PinStore>,
+    target: &PinTarget,
+    meta: &FsMeta,
+    keys: Option<&E2eKeys>,
+) {
     let pin = E2ePin::observe(&target.s3, meta, keys);
-    let saved = pins_store().and_then(|store| write(&store, &target.key, &pin));
+    let saved = store.and_then(|store| write(&store, &target.key, &pin));
     if let Err(error) = saved {
         tracing::warn!(key = %target.key, %error, "recording the E2E pin failed");
     }
@@ -353,6 +371,11 @@ pub fn record(target: &PinTarget, meta: &FsMeta, keys: Option<&E2eKeys>) {
 fn parse(bytes: &[u8]) -> std::result::Result<BTreeMap<String, E2ePin>, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
     toml::from_str(text).map_err(|e| e.to_string())
+}
+
+/// The pin `store` holds under `key` (a name, or an unregistered URL).
+pub fn pinned(store: &PinStore, key: &str) -> Result<Option<E2ePin>> {
+    Ok(read(store)?.remove(key))
 }
 
 fn read(store: &PinStore) -> Result<BTreeMap<String, E2ePin>> {

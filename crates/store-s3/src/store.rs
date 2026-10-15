@@ -493,7 +493,18 @@ impl ChunkStore {
     /// and therefore every derived key and the gossip topic, is unchanged,
     /// so mounted nodes (which hold the master in memory) keep running
     /// with no remount.
-    pub async fn change_passphrase(&self, old: &str, new: &str) -> Result<(), StoreError> {
+    ///
+    /// `expected` is the keyring block the caller verified (opened with
+    /// `old` and held against its E2E pin): the block read here must be
+    /// that one, and the update is conditional on the object read, so the
+    /// block rewrapped is the block checked — one swapped in between is
+    /// [`StoreError::CasConflict`], and nothing is written.
+    pub async fn change_passphrase(
+        &self,
+        expected: &crate::e2e::KeyringBlock,
+        old: &str,
+        new: &str,
+    ) -> Result<(), StoreError> {
         let key = layout::meta_json();
         let object = self.store.get(&key).await?;
         let version = UpdateVersion {
@@ -508,6 +519,9 @@ impl ChunkStore {
             .keyring
             .as_ref()
             .ok_or_else(|| StoreError::Meta("E2E filesystem has no keyring block".into()))?;
+        if serde_json::to_value(block)? != serde_json::to_value(expected)? {
+            return Err(StoreError::CasConflict);
+        }
         meta.keyring = Some(crate::e2e::rewrap_master(block, old, new)?);
         self.store
             .put_opts(

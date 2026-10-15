@@ -1,9 +1,19 @@
 //! Local, per-user registry of named filesystems (plan 21, step 2) —
 //! `zpool.cache` for constellation. Maps a short name to the backend it
 //! points at, the state dir that owns its node identity, and the views
-//! last mounted for it. `mount` is the only thing that *writes* a live
-//! entry (`merge_and_save`); `export` (step 6) is the only thing that
-//! removes one (`remove`).
+//! last mounted for it. Every write goes through `merge_and_save`
+//! (`mount`, `fs create`, `fs.import`); `export` (step 6) is the only thing
+//! that removes one (`remove`). This is the storage of the filesystem
+//! [`Manager`](crate::manager::Manager), which owns every access to it and
+//! the rules below (plan 31 §4).
+//!
+//! **Identity is pinned to the name** (plan 21): a name owns one state
+//! dir, which owns one replica and one `node_id`. So a name's backend URL
+//! changes only while its state dir is not in use
+//! ([`Registry::check_repoint`]), a name's state dir moves only to a new
+//! or empty dir that is nobody else's ([`Registry::explicit_state_dir`]),
+//! and a name is a single path component ([`validate_name`]): its default
+//! state dir is `<data dir>/<name>`, which `export` deletes.
 //!
 //! Node-level settings (backend, cache, write mode, ...) live directly
 //! under `[NAME]`; per-view settings that could legitimately differ
@@ -97,11 +107,14 @@ pub struct Registry {
     path: PathBuf,
     entries: BTreeMap<String, FsEntry>,
     /// Held for the lifetime of the `Registry` value returned by
-    /// `load_locked` so a whole read-modify-write cycle (as
+    /// `load_locked_at` so a whole read-modify-write cycle (as
     /// `merge_and_save`/`remove` need) is atomic across processes. Plain
-    /// `load` does not take it — a read-only glance (`fs list`, `status`
+    /// `load_at` does not take it — a read-only glance (`fs list`, `status`
     /// name resolution) does not need to serialize against writers.
     _lock: Option<constellation_platform::LockGuard>,
+    /// Where a name's default state dir is (`<data dir>/<name>`): the
+    /// manager's host's dirs, else this process's native ones.
+    dirs: Option<std::sync::Arc<dyn constellation_platform::Dirs>>,
 }
 
 impl Registry {
@@ -109,50 +122,41 @@ impl Registry {
     /// `$XDG_CONFIG_HOME/constellation/registry.toml`, else
     /// `~/.config/constellation/registry.toml`.
     pub fn path() -> Result<PathBuf> {
+        Self::path_in(constellation_platform::native())
+    }
+
+    /// [`Registry::path`] in `host`'s config dir.
+    pub fn path_in(host: &constellation_platform::HostServices) -> Result<PathBuf> {
         if let Ok(p) = std::env::var("CONSTELLATION_REGISTRY") {
             if !p.is_empty() {
                 return Ok(PathBuf::from(p));
             }
         }
-        let config = constellation_platform::native()
-            .dirs
-            .config_dir()
-            .context("locating the config dir")?;
+        let config = host.dirs.config_dir().context("locating the config dir")?;
         Ok(config.join("registry.toml"))
     }
 
-    /// Read-only load: no cross-process lock, safe for concurrent
-    /// readers (`fs list`, target resolution).
-    pub fn load() -> Result<Self> {
-        Self::load_at(Self::path()?)
-    }
-
-    /// Load holding an exclusive advisory lock on the registry file
-    /// (not the per-name `daemon.lock` from Step 4 — this is only the
-    /// convenience file's own writer lock) until the returned value is
-    /// dropped. Use around a `merge_and_save`/`remove` so two `mount`
-    /// invocations for different names cannot interleave writes and
-    /// silently drop one.
-    pub fn load_locked() -> Result<Self> {
-        Self::load_locked_at(Self::path()?)
-    }
-
-    /// Same as [`Registry::load`], against an explicit path rather than
-    /// the process-wide `CONSTELLATION_REGISTRY`/XDG resolution — this is
-    /// what lets tests exercise the registry without mutating shared
-    /// process environment (parallel `#[test]` fns would otherwise race
-    /// on it).
+    /// Read-only load of the registry at `path`: no cross-process lock,
+    /// safe for concurrent readers (`fs list`, target resolution). The
+    /// [`Manager`](crate::manager::Manager) resolves the path (`path_in`),
+    /// or a test or embedder gives its own without touching the
+    /// process-wide `CONSTELLATION_REGISTRY` (parallel `#[test]` fns would
+    /// race on it).
     pub fn load_at(path: PathBuf) -> Result<Self> {
         let entries = Self::read(&path)?;
         Ok(Self {
             path,
             entries,
             _lock: None,
+            dirs: None,
         })
     }
 
-    /// Same as [`Registry::load_locked`], against an explicit path. See
-    /// [`Registry::load_at`].
+    /// Load holding an exclusive advisory lock on the registry file
+    /// (not the per-name `daemon.lock` — this is only the convenience
+    /// file's own writer lock) until the returned value is dropped. Use
+    /// around a `merge_and_save`/`remove` so two writers for different
+    /// names cannot interleave writes and silently drop one.
     pub fn load_locked_at(path: PathBuf) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -170,6 +174,7 @@ impl Registry {
             path,
             entries,
             _lock: Some(lock),
+            dirs: None,
         })
     }
 
@@ -210,13 +215,13 @@ impl Registry {
     /// given, upserts by `subtree` (matching an existing row's
     /// mountpoint/options, or appending a new row).
     ///
-    /// Callers implement the "`--s3` is refused against a populated
-    /// state dir" rule themselves (Step 4) — that check needs to look at
-    /// the state dir's `meta.db`, which this module does not touch.
+    /// `name` must be a valid name ([`validate_name`]). The identity rules
+    /// are not applied here: a caller that changes a name's URL or state
+    /// dir checks [`Registry::check_repoint`] / [`Registry::explicit_state_dir`]
+    /// first, under this registry's lock (the filesystem
+    /// [`Manager`](crate::manager::Manager) does).
     pub fn merge_and_save(&mut self, name: &str, overrides: FsOverrides) -> Result<FsEntry> {
-        if name.is_empty() {
-            bail!("filesystem name must not be empty");
-        }
+        validate_name(name)?;
         let mut entry = self.entries.remove(name).unwrap_or_default();
         if let Some(s3) = overrides.s3 {
             entry.s3 = s3;
@@ -225,7 +230,10 @@ impl Registry {
             entry.state_dir = dir;
         }
         if entry.state_dir.as_os_str().is_empty() {
-            entry.state_dir = default_named_state_dir(name)?;
+            entry.state_dir = match &self.dirs {
+                Some(dirs) => dirs.state_dir(name).context("locating the data dir")?,
+                None => default_named_state_dir(name)?,
+            };
         }
         if let Some(v) = overrides.cache_size {
             entry.cache_size = v;
@@ -294,9 +302,7 @@ impl Registry {
                 // (spelled as stored: a symlink or `..` to it moves nothing)
                 return Ok(stored.clone());
             }
-            if !stored.as_os_str().is_empty()
-                && (stored.join("meta.db").exists() || daemon_lock_held(stored))
-            {
+            if state_dir_in_use(stored) {
                 bail!(
                     "{name}'s state dir is {}, which is in use; `--state-dir {}` would move it. \
                      Run `constellation export {name}` first if you really want to move it.",
@@ -326,17 +332,169 @@ impl Registry {
         Ok(dir)
     }
 
+    /// Whether `name` may point at `s3`: refused while it points elsewhere
+    /// and its state dir is in use ([`state_dir_in_use`]) — that replica
+    /// and its `node_id` would serve, or be abandoned by, a different
+    /// filesystem. A name that is not registered, already points there, or
+    /// was registered but never mounted (`fs create`, then `fs create`
+    /// again elsewhere — the test suites' fixed names) may. Plan 21's rule
+    /// for `mount --s3`, applied by every writer of a name's URL.
+    pub fn check_repoint(&self, name: &str, s3: &str) -> Result<(), Repoint> {
+        let Some(current) = self.entry(name) else {
+            return Ok(());
+        };
+        if current.s3.is_empty() || current.s3 == s3 || !state_dir_in_use(&current.state_dir) {
+            return Ok(());
+        }
+        Err(Repoint {
+            name: name.to_string(),
+            current: current.s3.clone(),
+            requested: s3.to_string(),
+        })
+    }
+
+    /// Whether `export NAME` may delete `name`'s state dir with everything
+    /// in it: never a dir that holds (or is) another registered name's
+    /// state dir or cache dir, the registry itself, or one of the host's
+    /// `dirs` (data, config, runtime) — `export` of a name registered
+    /// before names were checked (`mount ..` made `<data dir>/..` one) must
+    /// not delete them. A host dir that cannot be located refuses too: what
+    /// the state dir holds is then not known.
+    pub fn check_deletable(
+        &self,
+        name: &str,
+        dirs: &[(&str, std::io::Result<PathBuf>)],
+    ) -> Result<()> {
+        let Some(entry) = self.entry(name) else {
+            return Ok(());
+        };
+        let dir = &entry.state_dir;
+        if dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let mut guarded = vec![("the registry".to_string(), self.path.clone())];
+        for (what, located) in dirs {
+            match located {
+                Ok(path) => guarded.push((format!("{what} {}", path.display()), path.clone())),
+                Err(e) => bail!(
+                    "cannot locate {what} ({e}); refusing to delete {name}'s state dir {} \
+                     without knowing it does not hold it",
+                    dir.display()
+                ),
+            }
+        }
+        for (other, e) in self.entries.iter().filter(|(other, _)| *other != name) {
+            guarded.push((format!("the state dir of {other}"), e.state_dir.clone()));
+            if !e.cache_dir.is_empty() {
+                guarded.push((
+                    format!("the cache dir of {other}"),
+                    PathBuf::from(&e.cache_dir),
+                ));
+            }
+        }
+        for (what, path) in guarded {
+            if !path.as_os_str().is_empty() && contains(dir, &path) {
+                bail!(
+                    "{name}'s state dir {} holds {what}; refusing to delete it (remove {name}'s \
+                     row from {} by hand if it is stale)",
+                    dir.display(),
+                    self.path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Remove a whole filesystem's row (`export`, Step 6). A no-op,
     /// successful call if the name was already absent.
     pub fn remove(&mut self, name: &str) -> Result<()> {
         self.entries.remove(name);
         self.write()
     }
+
+    /// Default state dirs under `dirs`' data dir (a manager's host).
+    pub fn with_dirs(mut self, dirs: std::sync::Arc<dyn constellation_platform::Dirs>) -> Self {
+        self.dirs = Some(dirs);
+        self
+    }
+
+    /// Where this registry lives.
+    pub fn file(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// [`Registry::check_repoint`]'s refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repoint {
+    pub name: String,
+    pub current: String,
+    pub requested: String,
+}
+
+impl std::fmt::Display for Repoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Repoint {
+            name,
+            current,
+            requested,
+        } = self;
+        write!(
+            f,
+            "{name} already points at {current:?}, and its state dir is in use; pointing it at \
+             {requested:?} would repoint that replica. Run `constellation export {name}` first \
+             if you really want to re-point it."
+        )
+    }
+}
+
+impl std::error::Error for Repoint {}
+
+/// A filesystem name: what `mount NAME`, `fs create NAME` and `fs.import`
+/// register. One path component (its default state dir is
+/// `<data dir>/<name>`, which `export` deletes, so `..` or `a/b` would put
+/// it somewhere else), with no `:` (`NAME:/path` separates a name from a
+/// path, so `a:b` could never be named) and no control characters.
+pub fn validate_name(name: &str) -> Result<()> {
+    let why = if name.is_empty() {
+        "it is empty"
+    } else if name == "." || name == ".." {
+        "`.` and `..` are not names"
+    } else if name.contains(['/', '\\']) {
+        "it contains a path separator"
+    } else if name.contains(':') {
+        "it contains `:`, which separates a name from a path (`NAME:/path`)"
+    } else if name.chars().any(char::is_control) {
+        "it contains a control character"
+    } else if name.len() > 255 {
+        "it is longer than 255 bytes"
+    } else {
+        return Ok(());
+    };
+    bail!("invalid filesystem name {name:?}: {why}")
+}
+
+/// Whether `dir`, a name's state dir, is in use: populated (`meta.db`, a
+/// replica with its `node_id`), or its `daemon.lock` held — a daemon still
+/// bootstrapping has no `meta.db` yet.
+pub fn state_dir_in_use(dir: &Path) -> bool {
+    !dir.as_os_str().is_empty() && (dir.join("meta.db").exists() || daemon_lock_held(dir))
+}
+
+/// Whether `outer` is `inner` or one of its ancestors, however spelled
+/// (resolved where they exist).
+fn contains(outer: &Path, inner: &Path) -> bool {
+    let resolve = |p: &Path| {
+        std::fs::canonicalize(p)
+            .or_else(|_| std::path::absolute(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    resolve(inner).starts_with(resolve(outer))
 }
 
 /// Whether a process holds `dir`'s `daemon.lock` (the CLI's per-state-dir
-/// daemon lock): probed as `export` does, by trying to take it.
-fn daemon_lock_held(dir: &Path) -> bool {
+/// daemon lock): probed by trying to take it.
+pub fn daemon_lock_held(dir: &Path) -> bool {
     let lock = dir.join("daemon.lock");
     match std::fs::OpenOptions::new().write(true).open(&lock) {
         // Anything but getting the lock (released again as the guard

@@ -513,6 +513,45 @@ pub fn socket_exists(state_dir: &Path) -> bool {
     locate_socket(state_dir).is_some_and(|sock| sock.exists())
 }
 
+/// How the filesystem manager's `export` reaches the daemon of a state
+/// dir: this client, bounded as every liveness probe is
+/// (`CONSTELLATION_CONTROL_TIMEOUT_MS`).
+pub struct CliDaemons;
+
+impl constellation_engine::manager::Daemons for CliDaemons {
+    fn answers<'a>(&'a self, state_dir: &'a Path) -> futures::future::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            matches!(
+                ping(state_dir, crate::daemon_lock::control_timeout()).await,
+                Ok(true)
+            )
+        })
+    }
+
+    fn leave<'a>(
+        &'a self,
+        state_dir: &'a Path,
+        force: bool,
+    ) -> futures::future::BoxFuture<'a, Result<Result<String, ControlError>, ControlError>> {
+        Box::pin(async move {
+            let params = api::LeaveParams {
+                node_id: None,
+                force,
+            };
+            match try_call::<constellation_control::methods::NodeLeave>(state_dir, params, None)
+                .await
+            {
+                Ok(answer) => Ok(answer.map(|ack| ack.detail)),
+                Err(e) => Err(ControlError::unavailable(format!("{e:#}"))),
+            }
+        })
+    }
+
+    fn socket_exists(&self, state_dir: &Path) -> bool {
+        socket_exists(state_dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

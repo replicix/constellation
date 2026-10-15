@@ -1262,7 +1262,7 @@ pub fn standby(
                 // The lock is taken without holding the state: an `Abort`
                 // can still land between two attempts (until the sender's
                 // marker is seen, which ends that).
-                match crate::take_state_dir_lock(state_dir)? {
+                match crate::take_state_dir_lock(state_dir, None)? {
                     crate::LockOutcome::BecomeDaemon => {
                         let mut inner = standby.inner.lock().unwrap();
                         if let Phase::Failed { reason } = &inner.0 {

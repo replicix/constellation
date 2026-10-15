@@ -29203,7 +29203,7 @@ Close-out of [plan 31](wip/31-core-frontend-backend.md). Milestones C0 to C8 are
 | **C6, cancellation in the conformance kit.** The engine target declares `cancellable_waits: false`, so its 4 `cancellation` tests skip, although `ClusterLocks::set` checks the `OpCtx` token between the polls of a wait and before each request to the sequencer. A cancellation flag for the target, and the group running against the engine | done | `crates/vfs/src/conformance/{mod,cancellation}.rs`, `crates/engine/tests/conformance.rs`, `crates/vfs/src/conformance/ENGINE_TARGET.md` | Done: `cancellable_waits: true`; 3 of 4 passed once flipped, the 4th found that a lock wait ignored the op's deadline, now honoured. See "Plan 31 closing: conformance and asserts" |
 | **C6, a two-engine fixture for the `invalidation` group.** The 5 tests skip because a second view of one engine gets no invalidations for the first's mutations and two engines cannot share a file backend; the fixture is two engines over one S3-shaped store (the pattern at the bottom of `crates/engine/src/shipper.rs`) whose first engine's `open_view` is given the recording events | done | `crates/engine/tests/conformance.rs`, `crates/vfs/src/conformance/ENGINE_TARGET.md` | Done: a second engine on the same (local file) backend, `settle` = ship, tail to head, wait for delivery; 5 of 5 pass. The engine target: 92 passed, 0 skipped (was 83 and 9). See the section below |
 | **§6.4, the threading assertion, and §6.10, `ControlVfs` metrics.** `OpCtx::new` debug-asserts that the caller is not a tokio runtime worker (plan 31 §6.4 says it does; it does not yet); the `ControlVfs` browse ops (`browse.stat/read/write/mkdir/rename/delete/xattr`) go through the `Observer` so they are counted and traced like a mount's ops (C7a left them out) | done | `crates/vfs/src/ctx.rs`, `crates/engine/src/control/browse.rs` | Done: the assertion (a caught `block_on` probe, debug builds) and `frontend="control"` op metrics, each with a test that fails without it. See the section below |
-| **`Manager`, unified.** The CLI's `fs` subcommands and the control service's `fs_list/create/export/import/passwd/doctor/unlock` are separate implementations; one shared implementation both call (plan 31 §4's `Manager`, which was never built as a type) | in progress | `crates/cli/src/main.rs`, `crates/engine/src/control/fs.rs`, `crates/engine/src/registry.rs` | *(to be recorded)* |
+| **`Manager`, unified.** The CLI's `fs` subcommands and the control service's `fs_list/create/export/import/passwd/doctor/unlock` are separate implementations; one shared implementation both call (plan 31 §4's `Manager`, which was never built as a type) | done | `crates/engine/src/manager/`, `crates/engine/src/registry.rs`, `crates/engine/src/control/fs.rs`, `crates/cli/src/{main,serve,control}.rs` | `constellation_engine::manager::Manager` owns the registry and implements create/import/export/passwd/doctor/list and the state-dir rules; the CLI's `fs`/`doctor`/`export`/`mount` registration, the control service's `fs.*` and `serve --create`/`--await-unlock` call it, and no rule is duplicated. Every divergence decided (the stricter rule unless a documented reason), each changed side covered by a test that fails on the previous tree. Details, the comparison and the user-visible changes: "Plan 31 closing: one Manager for the CLI and the control service" at the end of this file |
 | **The harness compiles for macOS.** Its host calls (seccomp and `io_uring_setup` denial, CPU-affinity scheduling, `libc::fallocate`/`prctl`, xattr arities, `F_SETLK` typing, the spawner, the sandbox) move behind `constellation-platform`; the `aarch64-apple-darwin constellation-harness` entry of `tools/check-cross-known-failures.txt` is then deleted in the same change, and the nightly `macos` job (`cargo test --workspace`) can build the harness | done | `crates/harness/src/*`, `crates/platform/src/*`, `tools/check-cross-known-failures.txt` | `make check-cross`: `aarch64-apple-darwin` workspace ok, all `x86_64-pc-windows-gnu` library crates ok, the known-failures file holds no entries. Harness calls became `FsPrimitives::{preallocate, punch_hole, set/get/list/remove_xattr}`, `Process::{allowed_cpus, die_with_parent}`, or `cfg(target_os = "linux")` with a SKIP reason; the sandbox was already gated. Details and the Linux scenario results: "Plan 31 closing: the harness behind constellation-platform" at the end of this file |
 | **The closing gate run** (table below): the full harness matrix, pjdfstest 8798/8798, `vfs-bench`, both Linux lanes `linux-fuse` and `linux-fuse-process`, `tests/parity.py` | in progress | see "Closing gate run" | *(to be recorded)* |
 
@@ -47999,3 +47999,182 @@ the mount 300 s passed.
   `-p constellation-platform` pass there; `cargo test --workspace --no-fail-fast` on `81086fe` plus
   this change passed but for `platform::unix::tests::xattrs_round_trip_and_report_a_missing_one`
   (ENOSPC setting an xattr in that host's temp dir; it passes elsewhere).
+
+## Plan 31 closing: one Manager for the CLI and the control service
+
+The "`Manager`, unified" item of "Plan 31 closing". Plan 31 §4 put a
+`Manager` in the engine: the registry and fs create/import/export/passwd and
+doctor, called in-process by the CLI and served by the daemon (§9.2's `fs.*`,
+§9.7). C5 bound `fs.*` in `crates/engine/src/control/fs.rs` and left the
+CLI's `fs` subcommands in `crates/cli/src/main.rs` (C4c: "plan 31 §4's
+`Manager` is C5's"), and `serve --create` had a third copy of the create
+(`crates/cli/src/serve.rs`). They had diverged. Now there is one
+implementation, `constellation_engine::manager::Manager`; the CLI, the
+control service and `serve` call it.
+
+### Where, and its API
+
+`crates/engine/src/manager/` (`mod.rs`, `create.rs`, `passwd.rs`,
+`doctor.rs`, `export.rs`, `credentials.rs`, `tests.rs`), as §4 says: the
+control service is in the engine and the CLI depends on it, and everything
+the manager touches (the registry, `e2e_pin`, `backend`, `leave`,
+`designation`, `Meta`) is the engine's. `registry.rs` stays where it was, as
+the manager's storage: the rules it owns are `Registry` methods the manager
+calls under the registry's lock.
+
+| API | Called by |
+|---|---|
+| `Manager::new(HostServices)`, `::native()`, `::at(registry_path, host)` (tests, embedders), `.with_meta_wait(d)` (control: 2 s) | CLI (`native`), `EngineControl::new` (the engine's host), tests (`at`) |
+| `registry()`, `registry_locked()`, `list()`, `entry(name)`, `resolve(raw)`, `registry_path()`, `pins()` | every `NAME[:path]` the CLI resolves, `fs list`, `fs.list`, `fs.*`'s name lookup |
+| `create(CreateRequest, &mut dyn CreateHooks)` with `Existing::{Refuse, Compare, Accept}`; hooks: the preflight report, the passphrase | `fs create` (Refuse, prompt), `fs.create` (Compare, `fs.unlock`'s passphrase), `serve --create` (Accept) |
+| `passwd(PasswdRequest, secrets)` | `fs passwd` (prompts), `fs.passwd` |
+| `doctor(url, credentials) -> DoctorReport` | `doctor` (prints it as before), `fs.doctor` (rows) |
+| `export(name, force, &dyn Daemons, notes)`: the teardown; `Daemons` is how a state dir's daemon is reached (`control::CliDaemons` in the CLI) | `constellation export` |
+| `export_document(name)`, `import(document, name)` | `fs.export`, `fs.import` |
+| `save_mount(&mut reg, name, s3, state_dir, overrides)`, `remember_endpoint(name, endpoint)` | `mount NAME`'s registration |
+| `credentials::{validate, key_entries, entries, passphrase, source_passphrase, E2E_PASSPHRASE}` | `fs.unlock`, `serve --await-unlock`'s gate |
+
+Errors are `ControlError`s (portable `Code`, kind, message, details,
+remediation): the control service answers them as they are, the CLI prints
+the message.
+
+### The comparison, and what was decided
+
+Before: **CLI** = `crates/cli/src/main.rs`; **control** =
+`crates/engine/src/control/fs.rs`; **serve** = `crates/cli/src/serve.rs`.
+"Now" is both, unless it says otherwise.
+
+| Operation | CLI did | Control did | Decision (now) |
+|---|---|---|---|
+| create: existing filesystem at the URL | preflight, prompt, then the conditional `PUT` failed ("filesystem already exists") | idempotent: compare and answer the uuid, or `Exists` with the differences | Kept per caller (`Existing`): the CLI makes a new filesystem (refused, now **before** the preflight and the prompt, by a `HEAD`), `fs.create` is idempotent (§9.2), `serve --create` uses what is there |
+| create: does `meta.json` exist | not asked (conditional `PUT`) | `GET` first (control and serve) | `HEAD` first, then `GET` only if it exists: a `GET` of a missing key is what a store caching negative answers keeps serving to the next mount (`doctor`'s rule) |
+| create: preflight | yes, report on stderr, refuse required failures | no | Both (and serve): `Unsupported` with the failed operations in `details` |
+| create: E2E `gossip_secret` kept out of `meta.json` | yes | yes (and serve) | One place (`create.rs`), tested |
+| create: empty passphrase | refused at the prompt | accepted from `fs.unlock` (made a keyring under `""`, which `serve` could not start from) | Refused in the manager, and `fs.unlock` refuses an empty `e2e_passphrase` (gate too) |
+| create: name registered at another URL | repointed silently, even with the old filesystem's replica in its state dir | refused (`Exists`) when the filesystem already existed, repointed silently when it was new | Plan 21's identity rule for every writer of a name's URL (`Registry::check_repoint`): repointed only while the state dir is not in use (no `meta.db`, `daemon.lock` not held), else `Exists` — checked before anything is written at the backend and again under the registry lock. The test suites reuse fixed never-mounted names (`tests`, `harness`), hence not "refused always" |
+| create: name syntax | anything | anything | One path component: not empty, `.`, `..`, no `/` `\` `:` or control characters (`registry::validate_name`, in `merge_and_save`, so for every writer, `mount` included). `mount ..` made `<data dir>/..` a state dir, which `export ..` deleted |
+| create: E2E pin | recorded | not recorded | Recorded for a named create (control: in the engine's host's pin store) |
+| create: endpoint in the registry | recorded | not | Recorded (and cleared for a local URL) |
+| create: `CONSTELLATION_ACK` default | applied | ignored | Applied (the daemon's environment, as endpoint/region are) |
+| create: registry check vs write | write only | unlocked read for the comparison, then a locked write | Checked unlocked first (fail fast, before the preflight and the prompt), then under the registry's lock, which is taken right before the conditional `PUT` and held until the name is registered — a check that fails after the `PUT` would leave an unregistered filesystem a retry calls "already exists". Not held across the preflight or the prompt. The refusal of an existing filesystem says `mount NAME MOUNTPOINT --s3 URL` registers one |
+| passwd: the pin | downgrade check before; after the change, the pin **recorded unconditionally** with the rewrapped master (a spliced keyring under a reused passphrase was rewrapped and re-pinned) | no pin check, no pin | Both: downgrade check, then the master the current passphrase opens is held against the pin **before** the rewrap (refused unless `CONSTELLATION_ACCEPT_E2E_CHANGE=1`), then confirmed again after |
+| passwd: which block is rewrapped | `change_passphrase` re-read `meta.json` and rewrapped the block it found, under a CAS on *that* read | same | `ChunkStore::change_passphrase(expected, old, new)`: the block read must be the one checked, and the update is conditional on that read, so a keyring swapped in after the check is a `CasConflict` (`Unavailable`) and nothing is written |
+| passwd: empty new passphrase | refused at the prompt | accepted | Refused |
+| passwd: errors | `changing E2E passphrase: …` | same text, `Failed` | Same text; a transient S3 error is `Unavailable` |
+| doctor | backend, conditional writes (stop without create-if-absent), CAS semantics + versioning (stop on a violation), then the prefix by `HEAD` (missing is not an error) | backend, `meta.json` by `GET` (and stop there when missing), conditional writes; no CAS semantics | The CLI's steps for both. `fs.doctor` rows: `backend`, `conditional_writes`, `cas_semantics`, `versioning`, `meta.json` (as many as ran) |
+| list | registry rows + `view.list` per state dir | registry rows + each backend's `meta.json` (10 s each) | Shared registry read (`Manager::list`); the presentations stay each side's |
+| export | the teardown (leave, retire, delete the state dir, drop the row) | `fs.export`: the row as a TOML document, nothing changed | Two operations under one word, kept: `Manager::export` (CLI only — the daemon that would answer it is the one torn down) and `export_document`/`import` (control only). The teardown now refuses, before leaving, a state dir that holds another name's state or cache dir, the registry, or the data, config or runtime dir, and when one of those host dirs cannot be located |
+| import | — | refused a name registered at another URL; any name | Same refusal (an import brings a name over, it does not repoint); names validated |
+| unlock / credentials | — | `fs.unlock`: validation and store entries; an unlock of a passphrase alone became the name's signing source, a static source with no key pair, so `fs.create`/`fs.passwd`/`fs.doctor` on S3 failed ("the static credential source has no aws_access_key_id") | One reading (`manager::credentials`) for `fs.unlock` and the `serve --await-unlock` gate; an empty passphrase is refused; a passphrase-only unlock signs with the engine's own source (the environment's chain), as the gate's always did (`credentials::signs`) |
+| state dirs | `target::state_dir` (explicit wins), `Registry::explicit_state_dir` (1a5717f), `mount --s3` refused only with a `meta.db` | — (`fs.*` touches no state dir) | `Manager::save_mount` applies both identity rules; `--s3` is now also refused while a daemon still starting holds `daemon.lock` (the state-dir rule's "in use"). A name's default state dir is the manager's host's data dir |
+| mount: registration to `daemon.lock` (pre-existing window) | `mount` released the registry's lock before the `meta.json` check, the passphrase prompt and the fork, and the daemon took `daemon.lock` only after them: in between the state dir was "not in use", so `fs create NAME --s3 OTHER` repointed the row and the daemon then filled a replica of the old URL under it | — | `mount` takes `daemon.lock` (`HeldStateDir`) before it releases the registry's lock and hands that very lock to the daemon (a `flock`, inherited across the fork; `take_state_dir_lock(dir, held)`). A mount that fails before it hands it on removes the lock file, and the state dir if it made it. A second `mount` of the name meanwhile sees the lock held and waits on the attach path, as it did for a starting daemon |
+| registry access | `Registry::load*` from many call sites | `Registry::load()` per call (environment) | Only through the manager (the env-resolving `Registry::load`/`load_locked` are gone) |
+| `meta.json` read waits | the store's default (600 s) | 2 s | Kept per caller (`with_meta_wait`) |
+
+### User-visible changes
+
+- `fs create` on a URL that holds a filesystem: refused before the
+  preflight report and the passphrase prompt.
+- `fs create NAME` / `mount NAME --s3` / `fs.create{name}`: a name whose
+  state dir is in use is not repointed (`… is in use; … Run constellation
+  export NAME first …`); `mount --s3` also counts a held `daemon.lock`.
+- Names must be one path component without `:` (`invalid filesystem name`),
+  for `fs create`, `mount` and `fs.import`. A name registered earlier that
+  breaks the rule can still be listed and exported, but no longer mounted
+  (or written otherwise): export it and register a valid name.
+- `mount NAME` holds the name's state dir (its `daemon.lock`) from its
+  registration on: a create of the name elsewhere meanwhile is refused.
+- `export` refuses a state dir holding another name's state or cache dir,
+  the registry, the data, config or runtime dir, or when one of the host
+  dirs cannot be located.
+- `fs passwd` / `fs.passwd` refuse a keyring that opens to a master other
+  than the pinned one (before rewrapping); `fs.passwd` holds the pin too.
+- `fs.create`: runs the backend preflight for a new filesystem, records the
+  name's E2E pin and endpoint, applies `CONSTELLATION_ACK`, refuses an empty
+  passphrase; `fs.unlock` refuses an empty `e2e_passphrase`, and one with a
+  passphrase alone no longer breaks S3 signing for that name; a transient S3
+  failure in `fs.create`/`fs.passwd` is `Unavailable` (was `Failed`).
+- `fs.doctor`: the rows above; a prefix without a filesystem still gets the
+  capability checks.
+- CLI error text from these commands is one line (`context: cause`) instead
+  of anyhow's `Caused by:` list; stdout of `fs create`, `fs passwd`,
+  `fs list`, `doctor` and `export` is unchanged.
+- No control-protocol type changed: the schema is unchanged
+  (`schema_file_is_current` passes without a re-bless).
+
+Not changed, noted: `fs.unlock` accepts only a registered name or this
+daemon's own filesystem, so a named `fs.create{e2e}` needs the name
+registered first (`fs.import`); `fs passwd` on a local-directory backend
+fails at the conditional update (`PutMode::Update` is not implemented by
+`object_store`'s local store), as before.
+
+### Tests
+
+| What | Where |
+|---|---|
+| Each manager operation once: create (registration, pin, E2E gossip secret, preflight, refuse/compare/accept, aborted or empty passphrase writes nothing), repoint rule (incl. `daemon.lock`), names, export document → import on another host, passwd (rewrap, spliced keyring refused before rewrapping), doctor, export teardown with a scripted `Daemons` (never mounted, live daemon leaves or refuses, `--force`, a starting daemon not retired, the deletion guard), list/resolve, unlock credentials; after review: a keyring swapped in during the prompt is not rewrapped, a name that comes into use during a create makes nothing at the new URL, the runtime dir / another name's cache dir / an unlocatable data dir stop an export (the first two fail with their fix reverted; the third tests guards that did not exist) — 17 tests, private registry and host dirs, no environment | `crates/engine/src/manager/tests.rs` |
+| The control side's changes, against a real engine (own test binary: the service reads the process's registry): empty passphrase not unlocked, a name in use not repointed, a named create pins, passwd holds the keyring against the pin, doctor's rows, import's names — **all 6 fail on the previous tree** (run there with this file added), pass now | `crates/engine/tests/control_fs.rs` |
+| The CLI's: refused-before-preflight, never-mounted name reused, name in use not repointed, names, export's deletion guard — **4 fail with the previous binary**; after review, a create of a name whose mount is still reading `meta.json` (held open with a FIFO) is refused — fails with `HeldStateDir` disabled (`CARGO_BIN_EXE_constellation` pointed at it); output of `fs create`/`doctor`/`fs list` and the reuse of a never-mounted name pass with both (7 tests) | `crates/cli/tests/fs_manager.rs` |
+| Registry, target, `e2e_pin`, `mount_state_dir.rs`, `serve.rs` (gate classification unchanged), the C5 parity test (`fs.*` included) | unchanged, passing |
+
+### Results
+
+On the test host, main `81086fe` plus this change: `cargo fmt --all --
+--check` clean; `cargo clippy --workspace --all-targets -- -D warnings`
+clean; `cargo test --workspace --no-fail-fast`: 2994 passed, 0 failed, 53
+ignored (the C5 parity test and `schema_file_is_current` among them). After
+the last change (`credentials::signs`), clippy again and the engine, CLI and
+control crates' tests: clippy clean, 980 passed, 0 failed, 13 ignored. Fail-before: `control_fs` 6/6 fail
+on the previous tree, `fs_manager` 4/6 fail with the previous binary (the
+other two are output guards and pass on both).
+
+After the review (keyring CAS, the mount's held `daemon.lock`, the lock
+across the create's `PUT`, the wider export guard), on a workstation, main
+`32f3736` plus this change: fmt clean; clippy `-D warnings` clean; `cargo
+test --workspace --no-fail-fast`: 3022 passed, 2 failed, 55 ignored. The two
+are `constellation-csi`'s `engine_pods::tests::{unit_dirs_are_made_for_the_engine_and_never_through_a_link,
+the_policy_writer_never_follows_a_planted_link}`, which refuse the
+workstation's group-writable temp dirs (umask 002) and pass under umask 022;
+the CSI crate is not touched here. The review's three new tests fail with
+their fix reverted (the swapped keyring was rewrapped, with only a warning
+after the fact; the create made `meta.json` at the new URL; the create
+under a reading mount repointed the name).
+
+End to end on the test host (debug binary; private registry, config, data
+and runtime dirs; a `serve` daemon for the control socket; a throwaway
+client for the calls):
+
+- **Local-directory backend, CLI:** `fs create` (preflight report, created),
+  again (refused: already exists, no preflight), `fs create ..` (invalid
+  name), `fs create --e2e` (`meta.json`: keyring present, `gossip_secret`
+  absent), `doctor` (output as before), `fs passwd` of a plaintext
+  filesystem ("not in E2E mode"), `export` of two names.
+- **Local-directory backend, control:** `fs.create` (created, then the same
+  uuid with `created: false`, then `Conflict` with `existing.chunk_size` for
+  another chunk size; `fs.create` of the CLI-made filesystem answers its
+  uuid), `fs.import` of `..` (invalid), `fs.doctor` (the five rows),
+  `fs.passwd` of a plaintext filesystem ("not in E2E mode", the CLI's text),
+  `fs.export` → `fs.import` under another name, `fs.unlock` of an empty
+  passphrase (invalid), an E2E `fs.create` (`gossip_secret` absent). `fs
+  list` shows what the control service registered and `fs.list` what the CLI
+  did; the pin file holds both sides' pins. `fs passwd`/`fs.passwd` of an
+  E2E filesystem fail alike at the local store's missing conditional update.
+- **S3, both:** an E2E `fs create` + two `fs passwd` (CLI) and `fs.import` +
+  `fs.unlock{e2e_passphrase}` + `fs.create{e2e}` + `fs.passwd` (control)
+  succeed (a second `fs.passwd` with the old passphrase fails to open the
+  keyring); `doctor` and `fs.doctor` agree; `gossip_secret` absent from the
+  S3 `meta.json`. Before `credentials::signs` the control half failed with
+  the key-less static source (see the table). The S3 prefix and every local
+  dir were deleted afterwards.
+
+### Exit criteria
+
+- [x] One implementation of create/import/export/passwd/doctor/list, the
+  registry access and the state-dir rules, called by the CLI, the control
+  service and `serve`
+- [x] Every divergence decided and recorded (table above), each changed side
+  covered by a test that fails on the previous tree
+- [x] Nothing that deletes or overwrites a filesystem's state got weaker
+  (export, `--state-dir`, registry locking, E2E secret handling, the pin)
+- [x] fmt, clippy `-D warnings`, `cargo test --workspace`
+- [x] End-to-end on a test host, CLI and control socket, file and S3 backends

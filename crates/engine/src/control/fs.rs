@@ -1,16 +1,16 @@
-//! `fs.*`: the filesystem registry over the control protocol (plan 31
-//! §9.2, §9.8) — what the CLI's `fs create`/`fs list`/`fs passwd` do
-//! in-process, as methods a daemon (and plan 37's CSI controller) can call.
+//! `fs.*`: the filesystem [`Manager`](crate::manager::Manager) over the
+//! control protocol (plan 31 §9.2, §9.8) — the same calls the CLI's
+//! `fs create`/`fs passwd`/`fs list`/`doctor` make in-process, as methods a
+//! daemon (and plan 37's CSI controller) can call. This module maps the
+//! protocol's parameters onto the manager and its answers back; the rules
+//! are the manager's.
 //!
-//! - **`fs.create` is idempotent by `(bucket, prefix)`.** `meta.json` at the
-//!   prefix *is* the filesystem: when one exists, the call compares what it
-//!   asked for (chunk size, compression, `e2e`, and the registered write
-//!   mode when it names a registered filesystem) with what is there and
-//!   answers the existing uuid (`created: false`) when they agree, or
-//!   `Conflict`/`EEXIST` with the differences in `details` when they do
-//!   not — never silently reusing or changing it. Two concurrent creators
-//!   race on `meta.json`'s conditional PUT; the loser re-reads and takes the
-//!   same comparison, so every caller gets the one uuid.
+//! - **`fs.create` is idempotent by `(bucket, prefix)`**
+//!   ([`Existing::Compare`]): `meta.json` at the prefix *is* the
+//!   filesystem, and a call that matches it answers its uuid (`created:
+//!   false`); one that does not is `Conflict`/`EEXIST` with the differences
+//!   in `details`. Two concurrent creators race on `meta.json`'s
+//!   conditional PUT; the loser takes the same comparison.
 //! - **`fs.unlock` holds credentials in memory only**
 //!   ([`CredentialSource::Static`] over an [`EphemeralSecretStore`]). The
 //!   `fs.*` calls naming that filesystem sign with them (and read an E2E
@@ -20,39 +20,33 @@
 //! - **Endpoint and region** come from the daemon's environment (the AWS
 //!   chain, as every backend URL resolves); a call that asks for others is
 //!   refused `Unsupported` rather than quietly using the environment's.
+//! - A `meta.json` read waits at most two seconds for a store that
+//!   disagrees with itself (`Manager::with_meta_wait`): a control call
+//!   answers.
 
 use super::EngineControl;
 use crate::backend;
-use crate::registry::{FsEntry, FsOverrides, Registry};
+use crate::e2e_pin::PinTarget;
+use crate::manager::{
+    credentials, CreateHooks, CreateRequest, DoctorReport, Existing, FsState, PasswdRequest,
+};
+use crate::registry::FsEntry;
 use constellation_control::proto::types::{
     FsCreateParams, FsCreated, FsDoctorCheck, FsDoctorReport, FsExportDocument, FsImportParams,
     FsInfo, FsListing, FsPasswdParams, FsUnlockParams,
 };
 use constellation_control::proto::ControlError;
-use constellation_platform::{CredentialSource, EphemeralSecretStore, SecretStore};
-use constellation_store_s3::{ChunkStore, FsMeta, StoreError};
-use constellation_types::Code;
-use serde::{Deserialize, Serialize};
+use constellation_platform::{CredentialSource, EphemeralSecretStore};
+use constellation_store_s3::ChunkStore;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// The secret name an unlocked E2E passphrase is held under.
-const E2E_PASSPHRASE: &str = "e2e_passphrase";
+use zeroize::Zeroizing;
 
 /// How long a `meta.json` read waits for a store that disagrees with itself.
-const META_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const META_WAIT: Duration = Duration::from_secs(2);
 
 fn failed(e: impl std::fmt::Display) -> ControlError {
     ControlError::failed(format!("{e:#}"))
-}
-
-fn store_err(e: StoreError) -> ControlError {
-    match e {
-        StoreError::NotFound => ControlError::not_found(e.to_string()),
-        StoreError::AlreadyExists => ControlError::from(Code::Exists)
-            .with_details(serde_json::json!({ "reason": e.to_string() })),
-        other => failed(other),
-    }
 }
 
 /// `(bucket, prefix)` of a backend URL, as `FsInfo` shows it.
@@ -83,12 +77,81 @@ fn url_of(bucket: &str, prefix: &str) -> Result<String, ControlError> {
     })
 }
 
-/// A self-contained registry document (`fs.export` → `fs.import`).
-#[derive(Debug, Serialize, Deserialize)]
-struct RegistryDocument {
-    name: String,
-    #[serde(flatten)]
-    entry: FsEntry,
+/// `fs.create`'s passphrase: what `fs.unlock` gave the name.
+struct UnlockedPassphrase(Option<Arc<CredentialSource>>);
+
+impl CreateHooks for UnlockedPassphrase {
+    fn passphrase(&mut self) -> Result<Zeroizing<String>, ControlError> {
+        let source = self.0.as_ref().ok_or_else(|| {
+            ControlError::invalid("an e2e filesystem needs its passphrase")
+                .with_remediation("fs.unlock the name with e2e_passphrase first")
+        })?;
+        credentials::source_passphrase(source)?
+            .ok_or_else(|| ControlError::invalid("no e2e_passphrase was unlocked"))
+    }
+}
+
+/// `fs.doctor`'s rows for one filesystem's report: `backend`,
+/// `conditional_writes`, then — when those let the check go on —
+/// `cas_semantics` and `versioning`, then `meta.json`.
+fn doctor_checks(fs: &str, report: &DoctorReport, checks: &mut Vec<FsDoctorCheck>) {
+    let mut check = |name: &str, result: Result<String, String>| {
+        checks.push(FsDoctorCheck {
+            fs: fs.to_string(),
+            check: name.to_string(),
+            ok: result.is_ok(),
+            detail: result.unwrap_or_else(|e| e),
+        });
+    };
+    check("backend", Ok(report.url.clone()));
+    check(
+        "conditional_writes",
+        match &report.capabilities {
+            Ok(c) if c.create_if_absent && c.etag_cas => Ok("create-if-absent and etag CAS".into()),
+            Ok(c) if c.create_if_absent => Ok("create-if-absent only (single writer)".into()),
+            Ok(_) => Err("no conditional create".into()),
+            Err(e) => Err(e.clone()),
+        },
+    );
+    if let Some(cas) = &report.cas {
+        check(
+            "cas_semantics",
+            match cas {
+                Ok(r) => {
+                    let violations: Vec<&str> = r.violations().map(|p| p.name.as_str()).collect();
+                    let unknown: Vec<&str> = r.unknown().map(|p| p.name.as_str()).collect();
+                    if !violations.is_empty() {
+                        Err(format!(
+                            "not enforced atomically: {}; do not use it for more than one node",
+                            violations.join(", ")
+                        ))
+                    } else if !unknown.is_empty() {
+                        Ok(format!(
+                            "{} probes; unknown semantics: {}",
+                            r.probes.len(),
+                            unknown.join(", ")
+                        ))
+                    } else {
+                        Ok(format!("{} probes as expected", r.probes.len()))
+                    }
+                }
+                Err(e) => Err(e.clone()),
+            },
+        );
+        if let Ok(r) = cas {
+            check("versioning", Ok(r.versioning.as_str().to_string()));
+        }
+    }
+    if let Some(state) = &report.filesystem {
+        check(
+            "meta.json",
+            match state {
+                FsState::Present { uuid, .. } => Ok(format!("uuid {uuid}")),
+                FsState::Missing(found) => Err(format!("no filesystem: {found}")),
+                FsState::Unreadable(e) => Err(e.clone()),
+            },
+        );
+    }
 }
 
 impl EngineControl {
@@ -97,28 +160,24 @@ impl EngineControl {
         self.unlocked.lock().unwrap().get(fs).cloned()
     }
 
-    /// A store at `url`, signed with what `fs.unlock` gave `key`, else
-    /// with this engine's own credential source — the AWS chain for a CLI
-    /// daemon, the unlocked keys of an engine pod started with
+    /// What `fs.*` naming `key` signs with: the key pair `fs.unlock` gave
+    /// it, else this engine's own credential source — the AWS chain for a
+    /// CLI daemon, the unlocked keys of an engine pod started with
     /// `serve --await-unlock` (whose `fs.create` names its own location).
-    async fn open_store(&self, url: &str, key: Option<&str>) -> Result<ChunkStore, ControlError> {
-        let creds = key
-            .and_then(|k| self.unlocked(k))
-            .unwrap_or_else(|| self.engine.credentials().clone());
-        let creds = Some(&creds);
-        let (backend, _) = backend::open_backend_described_with(url, creds)
-            .await
-            .map_err(failed)?;
-        Ok(ChunkStore::new(backend))
+    /// An unlock of a passphrase alone signs with the latter
+    /// (`credentials::signs`), as the gate's does.
+    fn credentials_for(&self, key: Option<&str>) -> Arc<CredentialSource> {
+        key.and_then(|k| self.unlocked(k))
+            .filter(|source| credentials::signs(source))
+            .unwrap_or_else(|| self.engine.credentials().clone())
     }
 
     /// `name` → its registry entry, or `uuid` (or the backend URL itself,
     /// as an engine pod's CSI plugin names it before it knows the uuid) →
     /// this engine's backend.
     fn resolve_fs(&self, fs: &str) -> Result<(String, Option<FsEntry>), ControlError> {
-        let registry = Registry::load().map_err(failed)?;
-        if let Some(entry) = registry.entry(fs) {
-            return Ok((entry.s3.clone(), Some(entry.clone())));
+        if let Some(entry) = self.manager.entry(fs)? {
+            return Ok((entry.s3.clone(), Some(entry)));
         }
         if fs == self.fs_uuid || fs == self.backend {
             return Ok((self.backend.clone(), None));
@@ -129,17 +188,16 @@ impl EngineControl {
     }
 
     pub(crate) async fn fs_list(&self) -> Result<FsListing, ControlError> {
-        let registry = Registry::load().map_err(failed)?;
         let mut out = Vec::new();
         let mut own_listed = false;
-        for (name, entry) in registry.iter() {
+        for (name, entry) in self.manager.list()? {
             let (bucket, prefix) = split_url(&entry.s3);
             let mut info = FsInfo {
                 name: Some(name.clone()),
                 bucket,
                 prefix,
                 write_mode: entry.write_mode.clone(),
-                unlocked: self.unlocked(name).is_some(),
+                unlocked: self.unlocked(&name).is_some(),
                 ..FsInfo::default()
             };
             // A registered filesystem whose backend does not answer is
@@ -149,8 +207,9 @@ impl EngineControl {
                 Some(self.engine.fsmeta().clone())
             } else {
                 let load = async {
-                    let store = self.open_store(&entry.s3, Some(name)).await.ok()?;
-                    store.load_fs_waiting(META_WAIT).await.ok()
+                    let creds = self.credentials_for(Some(&name));
+                    let (store, _) = self.manager.open(&entry.s3, Some(&creds)).await.ok()?;
+                    self.manager.load_meta(&store).await.ok()
                 };
                 tokio::time::timeout(Duration::from_secs(10), load)
                     .await
@@ -197,196 +256,65 @@ impl EngineControl {
             .with_remediation("set AWS_ENDPOINT_URL / AWS_REGION for the daemon, or omit them"));
         }
         let url = url_of(&p.bucket, &p.prefix)?;
-        let chunk_size = p
-            .chunk_size
-            .unwrap_or(constellation_fs_core::DEFAULT_CHUNK_SIZE);
-        constellation_fs_core::validate_chunk_size(chunk_size)
-            .map_err(|e| ControlError::invalid(e.to_string()))?;
-        let compression: constellation_store_s3::CompressionSetting = p
-            .compression
-            .as_deref()
-            .unwrap_or("zstd:3")
-            .parse()
-            .map_err(|e| ControlError::invalid(format!("compression: {e}")))?;
-        if let Some(mode) = &p.write_mode {
-            mode.parse::<crate::writeback::WriteMode>()
-                .map_err(ControlError::invalid)?;
-        }
         let key = p.name.as_deref();
-        let store = self.open_store(&url, key).await?;
-        let existing = match store.load_fs_waiting(META_WAIT).await {
-            Ok(meta) => Some(meta),
-            Err(StoreError::NotFound) => None,
-            Err(e) => return Err(store_err(e)),
+        let req = CreateRequest {
+            name: p.name.clone(),
+            chunk_size: p.chunk_size,
+            compression: p.compression.clone(),
+            e2e: p.e2e,
+            write_mode: p.write_mode.clone(),
+            credentials: Some(self.credentials_for(key)),
+            ..CreateRequest::new(url, Existing::Compare)
         };
-        let (meta, created) = match existing {
-            Some(meta) => (meta, false),
-            None => {
-                let mut meta = FsMeta::new(chunk_size, &compression.to_string());
-                meta.e2e = p.e2e;
-                if p.e2e {
-                    meta.gossip_secret = None;
-                    let source = key.and_then(|k| self.unlocked(k)).ok_or_else(|| {
-                        ControlError::invalid("an e2e filesystem needs its passphrase")
-                            .with_remediation("fs.unlock the name with e2e_passphrase first")
-                    })?;
-                    let passphrase = match &*source {
-                        CredentialSource::Static(store) => store.get(E2E_PASSPHRASE).ok().flatten(),
-                        _ => None,
-                    }
-                    .and_then(|s| s.expose_str().map(str::to_string))
-                    .ok_or_else(|| ControlError::invalid("no e2e_passphrase was unlocked"))?;
-                    meta.keyring = Some(
-                        constellation_store_s3::create_keyring_block(&passphrase)
-                            .map_err(failed)?,
-                    );
-                }
-                match store.create_fs(&meta).await {
-                    Ok(()) => (meta, true),
-                    // Lost the race: whoever won made *a* filesystem here;
-                    // compare against it like any existing one.
-                    Err(StoreError::AlreadyExists) => (
-                        store.load_fs_waiting(META_WAIT).await.map_err(store_err)?,
-                        false,
-                    ),
-                    Err(e) => return Err(store_err(e)),
-                }
-            }
-        };
-        let registered =
-            key.and_then(|name| Registry::load().ok().and_then(|r| r.entry(name).cloned()));
-        if !created {
-            let mut differs = serde_json::Map::new();
-            if p.chunk_size.is_some_and(|c| c != meta.chunk_size) {
-                differs.insert("chunk_size".into(), meta.chunk_size.into());
-            }
-            if p.compression.is_some() && compression.to_string() != meta.compression {
-                differs.insert("compression".into(), meta.compression.clone().into());
-            }
-            if p.e2e != meta.e2e {
-                differs.insert("e2e".into(), meta.e2e.into());
-            }
-            if let (Some(mode), Some(entry)) = (&p.write_mode, &registered) {
-                if !entry.write_mode.is_empty() && &entry.write_mode != mode {
-                    differs.insert("write_mode".into(), entry.write_mode.clone().into());
-                }
-            }
-            if let Some(entry) = &registered {
-                if entry.s3 != url {
-                    differs.insert("name".into(), entry.s3.clone().into());
-                }
-            }
-            if !differs.is_empty() {
-                return Err(ControlError::from(Code::Exists)
-                    .with_details(serde_json::json!({
-                        "uuid": meta.uuid.to_string(),
-                        "existing": differs,
-                    }))
-                    .with_remediation(
-                        "a filesystem already exists at this (bucket, prefix) with other \
-                         parameters; ask for those, or use another prefix",
-                    ));
-            }
-        }
-        if let Some(name) = key {
-            Registry::load_locked()
-                .map_err(failed)?
-                .merge_and_save(
-                    name,
-                    FsOverrides {
-                        s3: Some(url.clone()),
-                        write_mode: p.write_mode.clone(),
-                        ..Default::default()
-                    },
-                )
-                .map_err(failed)?;
-        }
+        let mut hooks = UnlockedPassphrase(key.and_then(|k| self.unlocked(k)));
+        let created = self.manager.create(req, &mut hooks).await?;
         Ok(FsCreated {
-            uuid: meta.uuid.to_string(),
-            created,
+            uuid: created.meta.uuid.to_string(),
+            created: created.created,
         })
     }
 
     pub(crate) fn fs_export(&self, fs: &str) -> Result<FsExportDocument, ControlError> {
-        let registry = Registry::load().map_err(failed)?;
-        let entry = registry
-            .entry(fs)
-            .ok_or_else(|| ControlError::not_found(format!("{fs:?} is not registered")))?;
-        let document = toml::to_string(&RegistryDocument {
-            name: fs.to_string(),
-            entry: entry.clone(),
+        Ok(FsExportDocument {
+            document: self.manager.export_document(fs)?,
         })
-        .map_err(failed)?;
-        Ok(FsExportDocument { document })
     }
 
-    pub(crate) fn fs_import(
-        &self,
-        p: FsImportParams,
-    ) -> Result<constellation_control::proto::types::FsInfo, ControlError> {
-        let doc: RegistryDocument = toml::from_str(&p.document)
-            .map_err(|e| ControlError::invalid(format!("the document: {e}")))?;
-        let name = p.name.unwrap_or(doc.name);
-        let e = doc.entry;
-        let mut registry = Registry::load_locked().map_err(failed)?;
-        if let Some(existing) = registry.entry(&name) {
-            if existing.s3 != e.s3 {
-                return Err(ControlError::from(Code::Exists)
-                    .with_details(serde_json::json!({ "name": name, "s3": existing.s3 })));
-            }
-        }
-        let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
-        let mut entry = registry
-            .merge_and_save(
-                &name,
-                FsOverrides {
-                    s3: Some(e.s3.clone()),
-                    // Host-local: this host's default, or what it had.
-                    state_dir: None,
-                    cache_size: opt(&e.cache_size),
-                    cache_dir: opt(&e.cache_dir),
-                    fsync_mode: opt(&e.fsync_mode),
-                    write_mode: opt(&e.write_mode),
-                    read_only_member: Some(e.read_only_member),
-                    web_ui: Some(e.web_ui),
-                    endpoint: opt(&e.endpoint),
-                    mount: None,
-                },
-            )
-            .map_err(failed)?;
-        for m in e.mounts {
-            entry = registry
-                .merge_and_save(
-                    &name,
-                    FsOverrides {
-                        mount: Some(m),
-                        ..Default::default()
-                    },
-                )
-                .map_err(failed)?;
-        }
+    pub(crate) fn fs_import(&self, p: FsImportParams) -> Result<FsInfo, ControlError> {
+        let (name, entry) = self.manager.import(&p.document, p.name)?;
         let (bucket, prefix) = split_url(&entry.s3);
         Ok(FsInfo {
-            name: Some(name.clone()),
+            unlocked: self.unlocked(&name).is_some(),
+            name: Some(name),
             bucket,
             prefix,
             write_mode: entry.write_mode,
-            unlocked: self.unlocked(&name).is_some(),
             ..FsInfo::default()
         })
     }
 
     pub(crate) async fn fs_passwd(&self, p: FsPasswdParams) -> Result<(), ControlError> {
-        let (url, _) = self.resolve_fs(&p.fs)?;
-        let store = self.open_store(&url, Some(&p.fs)).await?;
-        let meta = store.load_fs_waiting(META_WAIT).await.map_err(store_err)?;
-        if !meta.e2e {
-            return Err(ControlError::invalid("filesystem is not in E2E mode"));
+        let (url, entry) = self.resolve_fs(&p.fs)?;
+        let pin = match entry {
+            Some(_) => PinTarget::named(&p.fs, &url),
+            None => PinTarget::unnamed(&url),
+        };
+        let req = PasswdRequest {
+            credentials: Some(self.credentials_for(Some(&p.fs))),
+            url,
+            pin,
+        };
+        let mut secrets = || {
+            Ok((
+                Zeroizing::new(p.old_passphrase.expose().to_string()),
+                Zeroizing::new(p.new_passphrase.expose().to_string()),
+            ))
+        };
+        let outcome = self.manager.passwd(req, &mut secrets).await?;
+        if let Some(warning) = outcome.warning {
+            tracing::warn!(fs = %p.fs, "fs.passwd: {warning}");
         }
-        store
-            .change_passphrase(p.old_passphrase.expose(), p.new_passphrase.expose())
-            .await
-            .map_err(|e| failed(format!("changing E2E passphrase: {e}")))
+        Ok(())
     }
 
     pub(crate) async fn fs_doctor(
@@ -396,10 +324,11 @@ impl EngineControl {
         let targets: Vec<(String, String)> = match fs {
             Some(fs) => vec![(fs.clone(), self.resolve_fs(&fs)?.0)],
             None => {
-                let registry = Registry::load().map_err(failed)?;
-                let mut all: Vec<_> = registry
-                    .iter()
-                    .map(|(n, e)| (n.clone(), e.s3.clone()))
+                let mut all: Vec<_> = self
+                    .manager
+                    .list()?
+                    .into_iter()
+                    .map(|(n, e)| (n, e.s3))
                     .collect();
                 if !all.iter().any(|(_, url)| *url == self.backend) {
                     all.push((self.fs_uuid.clone(), self.backend.clone()));
@@ -409,49 +338,16 @@ impl EngineControl {
         };
         let mut checks = Vec::new();
         for (fs, url) in targets {
-            let mut check = |name: &str, result: Result<String, String>| {
-                let ok = result.is_ok();
-                checks.push(FsDoctorCheck {
-                    fs: fs.clone(),
-                    check: name.to_string(),
-                    ok,
-                    detail: result.unwrap_or_else(|e| e),
-                });
-                ok
-            };
-            let store = match self.open_store(&url, Some(&fs)).await {
-                Ok(store) => {
-                    check("backend", Ok(url.clone()));
-                    store
-                }
-                Err(e) => {
-                    check("backend", Err(e.message));
-                    continue;
-                }
-            };
-            let meta = store.load_fs_waiting(META_WAIT).await;
-            let meta_ok = check(
-                "meta.json",
-                meta.as_ref()
-                    .map(|m| format!("uuid {}", m.uuid))
-                    .map_err(|e| e.to_string()),
-            );
-            if !meta_ok {
-                continue;
+            let creds = self.credentials_for(Some(&fs));
+            match self.manager.doctor(&url, Some(&creds)).await {
+                Ok(report) => doctor_checks(&fs, &report, &mut checks),
+                Err(e) => checks.push(FsDoctorCheck {
+                    fs,
+                    check: "backend".into(),
+                    ok: false,
+                    detail: e.message,
+                }),
             }
-            check(
-                "conditional_writes",
-                match store.probe_conditional_writes().await {
-                    Ok(c) if c.create_if_absent && c.etag_cas => {
-                        Ok("create-if-absent and etag CAS".into())
-                    }
-                    Ok(c) if c.create_if_absent => {
-                        Ok("create-if-absent only (single writer)".into())
-                    }
-                    Ok(_) => Err("no conditional create".into()),
-                    Err(e) => Err(e.to_string()),
-                },
-            );
         }
         Ok(FsDoctorReport { checks })
     }
@@ -468,41 +364,18 @@ impl EngineControl {
             .0
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let c = p.credentials;
-        let has_keys = c.access_key_id.is_some() || c.secret_access_key.is_some();
-        if has_keys && (c.access_key_id.is_none() || c.secret_access_key.is_none()) {
-            return Err(ControlError::invalid(
-                "access_key_id and secret_access_key go together",
-            ));
-        }
-        if !has_keys && c.e2e_passphrase.is_none() {
-            return Err(ControlError::invalid("no credentials to unlock"));
-        }
+        let c = &p.credentials;
+        let has_keys = credentials::validate(c)?;
         let (_, entry) = self.resolve_fs(&p.fs)?;
         let own = entry.as_ref().is_none_or(|e| e.s3 == self.backend);
         let rotation = own && matches!(&**self.engine.credentials(), CredentialSource::Static(_));
-        if rotation {
-            if let (Some(id), Some(secret)) = (&c.access_key_id, &c.secret_access_key) {
-                let trial = EphemeralSecretStore::new();
-                trial
-                    .replace(&[
-                        (
-                            CredentialSource::ACCESS_KEY_ID,
-                            Some(id.expose().as_bytes()),
-                        ),
-                        (
-                            CredentialSource::SECRET_ACCESS_KEY,
-                            Some(secret.expose().as_bytes()),
-                        ),
-                        (
-                            CredentialSource::SESSION_TOKEN,
-                            c.session_token.as_ref().map(|t| t.expose().as_bytes()),
-                        ),
-                    ])
-                    .map_err(failed)?;
-                self.probe_credentials(&p.fs, CredentialSource::Static(trial))
-                    .await?;
-            }
+        if rotation && has_keys {
+            let trial = EphemeralSecretStore::new();
+            trial
+                .replace(&credentials::key_entries(c))
+                .map_err(failed)?;
+            self.probe_credentials(&p.fs, CredentialSource::Static(trial))
+                .await?;
         }
         // Rotation of this engine's own static source, in place: one
         // generation, so the S3 provider never sees half a key pair and
@@ -511,26 +384,7 @@ impl EngineControl {
             (true, CredentialSource::Static(store)) => store.clone(),
             _ => EphemeralSecretStore::new(),
         };
-        let mut entries: Vec<(&str, Option<&[u8]>)> = Vec::new();
-        if let (Some(id), Some(secret)) = (&c.access_key_id, &c.secret_access_key) {
-            entries.push((
-                CredentialSource::ACCESS_KEY_ID,
-                Some(id.expose().as_bytes()),
-            ));
-            entries.push((
-                CredentialSource::SECRET_ACCESS_KEY,
-                Some(secret.expose().as_bytes()),
-            ));
-            entries.push((
-                CredentialSource::SESSION_TOKEN,
-                c.session_token.as_ref().map(|t| t.expose().as_bytes()),
-            ));
-            // A rotation replaces expiring keys with whatever it brings.
-            entries.push((CredentialSource::EXPIRY, None));
-        }
-        if let Some(passphrase) = &c.e2e_passphrase {
-            entries.push((E2E_PASSPHRASE, Some(passphrase.expose().as_bytes())));
-        }
+        let entries = credentials::entries(c);
         // A slower trial read of an older push must not land after a newer
         // one: the last push (by arrival) wins.
         let mut applied = self.unlock_order.1.lock().unwrap();
@@ -547,8 +401,11 @@ impl EngineControl {
             // successor is kept apart from `store` (a fresh one), and must
             // not go stale.
             if let Some(kept) = self.host.handoff_secrets() {
-                kept.replace(&[(E2E_PASSPHRASE, Some(passphrase.expose().as_bytes()))])
-                    .map_err(failed)?;
+                kept.replace(&[(
+                    credentials::E2E_PASSPHRASE,
+                    Some(passphrase.expose().as_bytes()),
+                )])
+                .map_err(failed)?;
             }
         }
         let source = Arc::new(CredentialSource::Static(store));
