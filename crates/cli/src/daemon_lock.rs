@@ -138,6 +138,13 @@ fn lock_holder_pids(lock: &Path) -> Vec<u32> {
     native().file_lock.holder_pids(lock)
 }
 
+/// Whether `pid` is a process that can still run (not gone, not a zombie
+/// past its exit): a daemon a `umount` or `mount` waits for is gone once
+/// this is false.
+pub fn alive(pid: u32) -> bool {
+    matches!(classify_pid(pid), Holder::Live { .. })
+}
+
 /// Classify `pid` from what the kernel reports about it and its threads.
 fn classify_pid(pid: u32) -> Holder {
     match native().process.facts(pid) {

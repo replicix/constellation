@@ -605,6 +605,23 @@ What `back` gives up, and what it keeps:
   chunks at once even when the sequencer says its stream carries the
   transaction: the stream may have carried it before the node's recovery
   rolled it back, and it does not resend.
+- **Unmounting.** The last view's unmount drains the queue: the daemon
+  uploads every pending chunk and ships the journal (then publishes a
+  last commit, which the next lease holder does instead should it stall)
+  before it exits. `constellation umount` waits for that by
+  default and reports its progress; when it returns successfully the
+  data is in the bucket and the daemon has exited, so nothing that
+  happens to the node afterwards (a `kill -9`, a reboot, losing its
+  disk) loses it. A drain that cannot finish (the bucket unreachable
+  until `CONSTELLATION_SHUTDOWN_STALL_S`, a lost queued chunk) makes
+  `umount` fail, naming what stays queued on the node for its next
+  mount. `umount --no-wait`, or a Ctrl-C while it waits, leaves the
+  drain running in the background with the durability described above
+  until it is done; a `mount` issued meanwhile waits for the drain to
+  end and then serves the rest of the queue. A large backlog (gigabytes
+  queued on a host whose uploads fell behind) takes as long to drain as
+  to upload. See [what `umount` waits
+  for](named-filesystems.md#what-umount-waits-for).
 - **Correctness is unchanged**: rebases, exactly-once forwarding,
   conflict detection, locks (a lock's release flushes through) and
   failover behave as under `through`.

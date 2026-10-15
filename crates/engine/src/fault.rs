@@ -50,6 +50,28 @@ pub fn sync_held() -> bool {
     true
 }
 
+/// `CONSTELLATION_FAULT_HOLD_DRAIN_FILE=<path>`: while that file exists,
+/// a clean shutdown's drain waits before it uploads or ships anything,
+/// and writes `<path>.held` once it does — a long clean-unmount drain
+/// (a large write-back queue on a slow bucket) for as long as a test
+/// needs, so it can show what `umount` and a `mount` issued meanwhile do
+/// while the daemon drains.
+pub fn drain_held() -> bool {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("CONSTELLATION_FAULT_HOLD_DRAIN_FILE").map(PathBuf::from))
+    else {
+        return false;
+    };
+    if !path.exists() {
+        return false;
+    }
+    let mut marker = path.clone().into_os_string();
+    marker.push(".held");
+    let _ = std::fs::write(PathBuf::from(marker), b"held");
+    true
+}
+
 /// `CONSTELLATION_FAULT_INBOX_POLL_PAUSE_FILE=<path>`: while that file
 /// exists, every inbox GET-next this node makes as holder answers "no new
 /// batch" without asking S3 — a holder that has not got round to a

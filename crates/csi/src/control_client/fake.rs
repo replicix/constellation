@@ -1563,7 +1563,10 @@ impl ControlClient for InMemoryControl {
                 ..Default::default()
             })
             .collect();
-        Ok(ViewListing { views })
+        Ok(ViewListing {
+            views,
+            exits_when_empty: false,
+        })
     }
 
     async fn view_unmount(&self, params: ViewUnmountParams) -> Result<Ack, ControlError> {

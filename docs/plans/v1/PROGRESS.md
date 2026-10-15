@@ -47825,3 +47825,177 @@ node 2's own shared grant at t = 6429, both in I/O at t = 6589.
   1,000-seed sweep (203000..204000: 0 failing; 2 before); the
   `locks_*` sim tests and the authority unit suite pass; the harness
   lock scenarios listed in the L0 section passed on this tree.
+
+## Fix: `umount` waits for the clean-unmount drain, and a `mount` during it waits without a trap (2026-10-14)
+
+A verification run on a loaded host: `constellation umount NAME` printed
+"unmounted" at once while the daemon's log only then said "clean unmount
+drain starting pending_uploads=3369 journal_backlog=3171390" (a write-back
+cell whose uploads had fallen 6.5–7 GB behind during its soak). The
+immediate `mount` of the same name logged "startup is still in this phase
+… attaching views to the running daemon" and its caller's 120 s wait
+failed three times; waiting for the old daemon's pid to exit and giving
+the mount 300 s passed.
+
+### Cause
+
+- **`umount` returned before the drain.** `view.unmount` is
+  `NodeRuntime::remove_mount`, which asked the view's session to unmount
+  and then joined the session's thread — the thread that tears the view
+  down and, for the last view, runs the node's shutdown (the drain). But a
+  daemon's main thread takes every session thread's handle into
+  `wait_all` as soon as it is serving (plan 21, `dbc4b78`), so
+  `remove_mount` found nothing to join and returned as soon as the
+  unmount was requested. `cmd_umount` then asked the daemon for its views
+  to decide whether it was the last one (`f68c4c9`, plan 29 M3b, so that
+  `umount NAME:/sub` does not wait for a daemon that keeps serving
+  others): the view was usually still listed — its thread had not reached
+  its bookkeeping — so `umount` took the daemon for one serving other
+  views and returned without waiting. On a loaded host, with a view whose
+  teardown has work to do, it nearly always lost that race. The wait
+  `846da5e` had added (until the control socket goes, with progress) was
+  thereby skipped. The same early answer said "unmounted" for a view
+  still in use (a file open on it): the unprivileged unmount is lazy
+  (`fusermount -u -z` in fuser), so the view leaves the mount table at
+  once but is served — and its node does not drain — until the last
+  file is closed.
+- **The `mount` waited behind the drain, silently, under the wrong
+  name.** The attach to the draining daemon is refused
+  (`SHUTTING_DOWN`, by design since `846da5e`/`8a6f96c`: the drain has
+  stopped the engine's sync core and released its leases; a view added
+  then is never served). The mount then waited up to 600 s for the old
+  daemon's socket to go — still under the startup phase "attaching views
+  to the running daemon", printing nothing the daemonized `mount`'s caller
+  could see — and only then started the next daemon, whose own startup
+  took 1.2–2 min on that host. Its attach timeout also counted from
+  before the wait, so a drain longer than 120 s left the next attempt no
+  time to retry an attach.
+- **Not a retry loop.** "resolving the node identity in the registry"
+  (90 s there) is one registry GET (torn-read re-reads only), but the
+  phase also covered the pending-upload owner check, the staging GC and
+  the chunk cache's rescan (it lists and stats every chunk file — a
+  write-back backlog of gigabytes) up to the conditional-write probe.
+
+### What changed
+
+- `NodeRuntime::detach_view`: unmounts the view and waits for its session
+  thread's word (`ViewEnd`, set after the view is closed, its mount entry
+  removed and the node's shutdown decided under the gate, before the
+  drain runs), whoever holds the thread's handle, for at most a given
+  bound. Returns whether that was the last view, or that the view has
+  not ended yet (still in use). An unmount request that fails is an
+  error unless the view ends anyway within 2 s. `remove_mount` (signals, rollback, `leave`)
+  is `detach_view` plus, for the last view, the wait for the node's
+  shutdown, by join or `wait_stopped`.
+- `view.unmount` uses `detach_view` bounded at 5 s: it answers once the
+  view is gone (saying when that was the daemon's last view), or that it
+  is detached but still in use (it stays listed until it ends); it never
+  waits for the drain.
+- `NodeRuntime::shutdown` records its outcome (`shutdown.result`: clean,
+  or unshipped with the drain's own account, and the daemon's pid) just
+  before it removes the control socket.
+- `constellation umount`: waits until the views it detached have left
+  the list (a view still in use: "waiting for … still in use"), then, for
+  the daemon's last view, waits until the
+  daemon process (identified by `daemon.lock` before the unmount) has
+  exited, printing every 5 s the pending uploads and bytes and the
+  journal backlog, then reports the recorded outcome: success only for a
+  clean drain; a drain that left something (S3 unreachable until
+  `CONSTELLATION_SHUTDOWN_STALL_S`, a lost queued chunk) or a daemon that
+  died mid-drain fails it, naming what stays in the state dir for the
+  next mount. No time limit. Ctrl-C stops the wait (the daemon drains on;
+  said, non-zero). `--no-wait` keeps the old fast return. The process,
+  not the socket, is watched: a `mount` that takes over the moment the
+  old daemon lets go of `daemon.lock` binds the same socket path at once.
+- `mount` during a drain: still waits for the old daemon's exit (the
+  correct behaviour for the design: a draining engine cannot serve a view
+  again, and the next daemon takes up whatever the drain left), now
+  under the phase "waiting for the previous daemon's clean-unmount
+  drain", reporting the drain's progress — through the daemonize status
+  pipe (`PROGRESS:` lines the waiting parent prints on stderr) — with no
+  wall-clock cap; it fails only if the draining daemon stops answering
+  for `CONSTELLATION_ATTACH_TIMEOUT_MS`. The attach timeout restarts once
+  the old daemon is gone.
+- Startup phases: "checking the pending uploads' owner", "clearing
+  orphaned staging files" and "opening the chunk cache (rescanning its
+  files)" are named apart from the registry phase, so the log says where
+  a slow startup spends its time. Nothing else changed there: the cache
+  rescan and fjall's open of `meta.db` under a loaded disk are the
+  likely costs, to be measured from the new phase lines.
+- A signal asks every view to unmount before it waits for any: a view
+  still in use no longer keeps the others mounted.
+- `view.list` says whether the daemon exits once its last view is gone
+  (`exits_when_empty`): `umount` of a persistent (`serve`) daemon's last
+  view says the daemon stays instead of waiting for an exit, and a
+  second `umount` of a daemon already draining (after `--no-wait` or a
+  Ctrl-C) waits for its drain. A lost `view.unmount` answer (the daemon
+  exiting right after a quick drain) or a daemon slow to list its views
+  under load is waited out rather than taken for a failure or for "no
+  views left"; without a known pid the socket is followed by identity
+  (device, inode), not path. An unmount request that fails while the
+  mount is already gone (the CSI plugin unmounts a staging path first)
+  is no error. `shutdown.result` is written by rename.
+- Test hook `CONSTELLATION_FAULT_HOLD_DRAIN_FILE`: a clean shutdown's
+  drain waits while the file exists.
+- Docs: named-filesystems.md (what `umount` waits for, `--no-wait`, a
+  `mount` during a drain, progress through the daemonize pipe),
+  durability-and-failover.md (`--write-mode back`: unmounting),
+  configuration.md.
+
+### Tests
+
+- `node_runtime::tests::remove_mount_waits_for_the_views_teardown_when_wait_all_holds_its_thread`
+  (real FUSE): a `wait_all` thread holds the session thread's handle, the
+  test holds the gate the teardown decides under; `remove_mount` must not
+  return meanwhile, and returns after the node's shutdown once let go.
+  Fails on main (it returns at once, the view still listed).
+- `crates/cli/tests/umount_drain.rs` (real daemonized binary, file
+  backend, FUSE; skipped without it):
+  `umount_waits_for_the_drain_and_a_mount_meanwhile_waits_too` — 24 files
+  queued under `--write-mode back` with the sync rounds held, the drain
+  held: `umount` is still waiting 3 s later and reports "24 uploads"; a
+  `mount` issued then is still waiting 5 s later, nothing mounted; once
+  the drain is let go `umount` reports "drain complete" and the old
+  daemon's pid is gone; the remount comes up having reported the drain,
+  and reads every file back; a fresh ad-hoc node with only the backend
+  reads them all too. On main (with the hook added) it fails: no outcome
+  reported, and in the observed race `umount` returns at once.
+  `umount_fails_when_the_drain_cannot_ship_everything` — a queued chunk
+  lost before its upload (`CONSTELLATION_FAULT_LOSE_CHUNKS`): `umount`
+  exits non-zero, "the daemon exited without shipping everything: final
+  flush failed …". On main: exit 0.
+  `umount_waits_for_a_view_still_in_use` — a file held open on the
+  mount: `umount` is still waiting 8 s later; once it is closed `umount`
+  reports "still in use" and "drain complete". On main: exit 0 at once,
+  "unmounted".
+- `node_runtime::tests::a_view_still_in_use_is_answered_as_such_and_ends_when_closed`:
+  `view.unmount` answers within its bound that the view is still in use,
+  the view stays listed and serves the open file, and ends (and the node
+  with it) once the file is closed. On main: "unmounted" at once.
+- `umount_tests::umount_of_a_non_last_view_returns_and_leaves_the_daemon_serving_the_rest`
+  now runs a `wait_all` thread as the daemon does, and checks that the
+  last view's `umount` returns only after the daemon's shutdown.
+- Real S3 with an E2E filesystem (debug build): 40 × 16 MiB written under
+  `--write-mode back` with the sync rounds held (160 pending uploads,
+  640 MiB), then `umount` and, 2 s later, `mount` of the same name:
+  `umount` reported 132 → 78 → 15 uploads left and returned after 17.4 s
+  with "drain complete"; the `mount` printed the drain's progress through
+  the daemonize pipe and was up at 20.2 s; every file read back through
+  the remount and through a fresh node bootstrapped from the bucket.
+- `node_runtime::tests::a_signal_unmounts_the_free_views_while_one_is_still_in_use`:
+  a file held open on one of four views, `SIGTERM`: the other three
+  leave the mount table at once, the busy one when its file is closed.
+  Fails (2 of 3 runs, by view order) with views removed one by one.
+  `umount_drain::a_second_umount_waits_for_a_drain_in_progress`.
+- `daemonize::tests::progress_lines_come_before_the_verdict`;
+  `a_failed_final_flush_is_reported_and_left_for_the_next_mount` checks
+  the recorded outcome (and that another pid's, or an older, record is
+  not taken for this one).
+- Gates: `cargo fmt --all -- --check` and `cargo clippy --workspace
+  --all-targets -- -D warnings` clean on `ee16b06`; `cargo test -p
+  constellation` (66 + 3 + 17 + 4, and the FUSE `reaper` tests with
+  `--ignored`), `-p constellation-engine`, `-p constellation-control`,
+  `-p constellation-csi` (two link-safety tests need umask 022) and
+  `-p constellation-platform` pass there; `cargo test --workspace --no-fail-fast` on `81086fe` plus
+  this change passed but for `platform::unix::tests::xattrs_round_trip_and_report_a_missing_one`
+  (ENOSPC setting an xattr in that host's temp dir; it passes elsewhere).

@@ -619,6 +619,7 @@ impl Engine {
         // ino prefix (a copied meta.db dropped into an existing state
         // dir). Same-prefix rows stay for crash recovery. On a fresh
         // bootstrap this is a no-op after `clear_pending_uploads`.
+        phase(&on_phase, "checking the pending uploads' owner");
         let purged = meta
             .purge_foreign_pending_uploads(node_id)
             .context("purging foreign pending_upload rows")?;
@@ -649,6 +650,11 @@ impl Engine {
         // Mount-time staging GC (plan 05a step 6): nothing under
         // `staging/` can be live at mount start. A crash mid-write leaves
         // no orphaned staging bytes because this always runs first.
+        // Local disk work, not registry round trips: named apart from the
+        // identity phase, so a slow startup's log says which it was (the
+        // staging GC walks `staging/`, the cache open lists and stats every
+        // chunk file — a write-back backlog of gigabytes on a busy disk).
+        phase(&on_phase, "clearing orphaned staging files");
         let staging_dir = state_dir.join("staging");
         let reclaimed = staging::gc(&staging_dir).context("clearing orphaned staging files")?;
         if reclaimed > 0 {
@@ -682,6 +688,7 @@ impl Engine {
         // startup scan found); `always` re-hashes every disk read.
         let cache_verify = crate::profile::cache_verify(cache_verify);
         tracing::info!(mode = cache_verify.as_str(), "disk cache verification");
+        phase(&on_phase, "opening the chunk cache (rescanning its files)");
         let cache = Arc::new(
             match &e2e_keys {
                 Some(keys) => DiskCache::open_keyed(
@@ -2229,6 +2236,9 @@ impl Engine {
             journal_backlog = backlog,
             "clean unmount drain starting"
         );
+        while crate::fault::drain_held() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let flush = async {
             // Plan 05a step 2: an orderly unmount must not publish manifests
             // for chunks that never made it to S3. If a previous best-effort

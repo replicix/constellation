@@ -14,15 +14,19 @@
 //! (`control.path`)/`daemon.pid`, and
 //! signals.
 //!
-//! `remove_mount` unmounts exactly the requested view (via its
-//! `FuseUnmounter`) and joins that view's thread, leaving siblings
-//! untouched. Every view's session thread performs its own per-view
-//! teardown (`Engine::close_view`: unregistration, ephemeral clone
-//! removal) and, if it happens to be the last view standing, triggers
+//! `detach_view` unmounts exactly the requested view (via its
+//! `FuseUnmounter`) and waits until that view's session has ended and its
+//! teardown has run, leaving siblings untouched; `remove_mount` also waits
+//! for the node's shutdown when that was the last view. Every view's
+//! session thread performs its own per-view teardown
+//! (`Engine::close_view`: unregistration, ephemeral clone removal) and, if
+//! it happens to be the last view standing, triggers
 //! `NodeRuntime::shutdown` itself — this is what makes an
 //! externally-triggered unmount (a bare `fusermount -u`, a kernel-forced
 //! unmount, or a crash) behave the same as an explicit `remove_mount`
-//! call.
+//! call. Neither waits by joining the thread: a daemon's main thread
+//! joins them all (`wait_all`), so the thread says when its teardown is
+//! done ([`ViewEnd`]).
 //!
 //! Plan 31 C4b adds the in-place upgrade (`crate::handover`, whose module
 //! doc has the sequence): a view's session thread may also end
@@ -86,6 +90,68 @@ pub const UPGRADING: &str = "the daemon is being upgraded in place; retry shortl
 /// What `add_mount` answers once the node is going away (the attaching
 /// `mount` matches it to wait for the exit and become the next daemon).
 pub const SHUTTING_DOWN: &str = "daemon is shutting down; retry once it has exited";
+
+/// The state dir's record of how its daemon's last clean shutdown ended,
+/// written just before the daemon removes its control socket: what a
+/// `umount` waiting for that daemon reports once it is gone. It names the
+/// daemon's pid, so a reader can tell it from a previous daemon's record
+/// (the file is never removed: a `mount` taking over at once must not
+/// delete it under the `umount` about to read it).
+pub const SHUTDOWN_RESULT: &str = "shutdown.result";
+
+/// How a daemon's clean shutdown ended ([`SHUTDOWN_RESULT`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownResult {
+    /// The drain finished: every pending upload is in the backend and the
+    /// journal is shipped.
+    Clean,
+    /// The drain could not ship everything; what is left stays in the
+    /// state dir for the next mount. The daemon's own account of it.
+    Unshipped(String),
+}
+
+fn record_shutdown_result(state_dir: &std::path::Path, result: &Result<()>) {
+    let pid = std::process::id();
+    let text = match result {
+        Ok(()) => format!("clean\n{pid}\n"),
+        Err(e) => format!("unshipped\n{pid}\n{e:#}\n"),
+    };
+    // Whole or not at all: a reader never sees half a record.
+    let path = state_dir.join(SHUTDOWN_RESULT);
+    let tmp = state_dir.join(format!("{SHUTDOWN_RESULT}.tmp"));
+    if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
+        tracing::warn!(error = %e, "recording the shutdown's outcome failed");
+    }
+}
+
+/// The outcome the state dir's daemon `pid` (when known) recorded, if it
+/// recorded one no earlier than `since`: another daemon's, or an older
+/// one, is not this shutdown's.
+pub fn read_shutdown_result(
+    state_dir: &std::path::Path,
+    pid: Option<u32>,
+    since: std::time::SystemTime,
+) -> Option<ShutdownResult> {
+    let path = state_dir.join(SHUTDOWN_RESULT);
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    // The kernel stamps files from a coarse clock.
+    if modified + Duration::from_secs(1) < since {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut lines = text.splitn(3, '\n');
+    let verdict = lines.next()?;
+    let writer: u32 = lines.next()?.trim().parse().ok()?;
+    if pid.is_some_and(|pid| pid != writer) {
+        return None;
+    }
+    let rest = lines.next().unwrap_or("");
+    match verdict {
+        "clean" => Some(ShutdownResult::Clean),
+        "unshipped" => Some(ShutdownResult::Unshipped(rest.trim().to_string())),
+        _ => None,
+    }
+}
 
 /// Views being added, against the last view leaving: a node with no view
 /// left shuts down, unless a view is being added — then the add that ends
@@ -270,6 +336,66 @@ pub struct MountInfo {
     pub confine_links: bool,
 }
 
+/// When a view's session thread has finished with the view: its session
+/// ended, the view closed, its mount entry removed, and the node's
+/// shutdown decided — `Some(true)` when this was the node's last view and
+/// the node is now shutting down, `Some(false)` otherwise (also when the
+/// session was handed over, or its thread panicked). Set before the
+/// thread runs that shutdown, so a caller waiting for the view does not
+/// wait for the drain.
+#[derive(Default)]
+pub(crate) struct ViewEnd {
+    closing: Mutex<Option<bool>>,
+    cv: std::sync::Condvar,
+}
+
+impl ViewEnd {
+    /// The first call decides.
+    fn finish(&self, closing: bool) {
+        let mut state = self.closing.lock().unwrap();
+        if state.is_none() {
+            *state = Some(closing);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Whether the node is closing, once the view has ended; `None` if it
+    /// has not within `within` (`None`: no bound).
+    fn wait(&self, within: Option<Duration>) -> Option<bool> {
+        let deadline = within.map(|d| Instant::now() + d);
+        let mut state = self.closing.lock().unwrap();
+        loop {
+            if let Some(closing) = *state {
+                return Some(closing);
+            }
+            state = match deadline {
+                None => self.cv.wait(state).unwrap(),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    self.cv.wait_timeout(state, left).unwrap().0
+                }
+            };
+        }
+    }
+}
+
+/// Finishes a [`ViewEnd`] as "not closing" on every way out of a session
+/// thread that did not finish it itself (a handover, a panic).
+struct FinishOnDrop(Arc<ViewEnd>);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        self.0.finish(false);
+    }
+}
+
+/// How long a view whose unmount request failed gets to end anyway (it
+/// was already being unmounted) before the failure is reported.
+const UNMOUNT_FAILED_GRACE: Duration = Duration::from_secs(2);
+
 pub(crate) struct MountHandle {
     pub(crate) subtree: String,
     pub(crate) mountpoint: PathBuf,
@@ -280,6 +406,8 @@ pub(crate) struct MountHandle {
     /// it took — reported per mount by `node.status.fuse`.
     pub(crate) fuse: Arc<constellation_frontend_fuse::SessionStats>,
     unmounter: Mutex<constellation_frontend_fuse::FuseUnmounter>,
+    /// Set by the session thread once it is done with the view.
+    ended: Arc<ViewEnd>,
     /// Plan 31 C4b: what a handover needs of the view and its session.
     pub(crate) fs_name: String,
     pub(crate) allow_other: bool,
@@ -534,15 +662,31 @@ impl NodeRuntime {
                     }
                     let drain = node.clone();
                     std::thread::spawn(move || {
-                        for id in drain.mount_ids() {
-                            if let Err(e) = drain.remove_mount(id) {
-                                tracing::warn!(error = %e, "signal-triggered unmount failed");
-                            }
+                        // Every view is asked first, then waited for: a
+                        // view still in use (a file open on it) ends only
+                        // when that is closed, and must not keep the
+                        // others mounted meanwhile.
+                        let ends: Vec<_> = drain
+                            .mount_ids()
+                            .into_iter()
+                            .filter_map(|id| match drain.request_detach(id) {
+                                Ok(ended) => Some(ended),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "signal-triggered unmount failed");
+                                    None
+                                }
+                            })
+                            .collect();
+                        let mut closing = false;
+                        for ended in ends {
+                            closing |= ended.wait(None).unwrap_or(false);
                         }
                         // A persistent node outlives its last view, so the
                         // signal itself is what ends it.
                         if drain.persistent {
                             let _ = drain.shutdown();
+                        } else if closing {
+                            drain.wait_stopped();
                         }
                     });
                     // A second signal during the post-unmount drain aborts immediately
@@ -795,6 +939,7 @@ impl NodeRuntime {
         {
             tracing::warn!(error = %e, "recording the mount in the state dir failed");
         }
+        let ended = Arc::new(ViewEnd::default());
         self.mounts.lock().unwrap().insert(
             id,
             MountHandle {
@@ -803,6 +948,7 @@ impl NodeRuntime {
                 since: Instant::now(),
                 fuse,
                 unmounter: Mutex::new(unmounter),
+                ended: ended.clone(),
                 fs_name,
                 allow_other,
                 read_only,
@@ -818,6 +964,7 @@ impl NodeRuntime {
 
         let node = self.clone();
         let thread = std::thread::spawn(move || {
+            let ended = FinishOnDrop(ended);
             match session.run() {
                 // Handed over (`crate::handover`): the view, its record
                 // and its mount entry are the handover's to carry on.
@@ -839,14 +986,17 @@ impl NodeRuntime {
                 let now_empty = mounts.is_empty();
                 (now_empty, now_empty && !node.persistent && gate.leave())
             };
+            // Whoever waits for this view (`detach_view`) goes on now;
+            // the drain below is the node's, waited for separately.
+            ended.0.finish(closing);
             if closing {
                 // `shutdown` logs its own failure (and records it for the
                 // process's exit status).
                 let _ = node.shutdown();
             } else if now_empty && node.stop_when_empty.load(Ordering::SeqCst) {
                 // The deferred signal (`NodeConfig::persistent`). The view
-                // went through `view.unmount`, which joins this thread
-                // before it answers: shutting down here would end the
+                // may have gone through `view.unmount`, which answers once
+                // this view has ended: shutting down at once could end the
                 // process before that answer is written, so the drain runs
                 // on its own thread, a moment later.
                 std::thread::spawn(move || {
@@ -974,27 +1124,79 @@ impl NodeRuntime {
         }
     }
 
-    /// Unmount exactly this view (via its `FuseUnmounter`) and join its
-    /// session thread. Siblings are untouched. If this was the last view,
-    /// the thread itself runs `shutdown()` before this call returns.
-    pub fn remove_mount(&self, id: MountId) -> Result<()> {
+    /// Unmount exactly this view (via its `FuseUnmounter`) and wait until
+    /// its session has ended and its thread has torn it down (the view
+    /// closed, its entry gone from [`Self::mounts`]), for at most `within`
+    /// (`None`: no bound). Siblings are untouched. Returns whether that was
+    /// the node's last view, the node now shutting down: draining in the
+    /// background, its session thread running [`Self::shutdown`]
+    /// ([`Self::wait_stopped`] waits for it); `None` when the view has not
+    /// ended within `within`. An unprivileged unmount detaches the mount
+    /// lazily: a view with files open on it, or a working directory in it,
+    /// leaves the namespace at once but ends only when the last of them is
+    /// closed (it stays listed until then).
+    ///
+    /// It waits for the thread's word rather than by joining it: a
+    /// daemon's main thread holds every session thread's handle
+    /// ([`Self::wait_all`]), and without its own handle to join this
+    /// returned as soon as the unmount was requested, so `view.unmount`
+    /// answered while the view was still listed (`umount` then took the
+    /// daemon for one serving other views and did not wait for the drain
+    /// of its last one). An unmount request that fails while the mount is
+    /// still there (refused by the kernel) is an error, and the view stays
+    /// mounted and served.
+    pub fn detach_view(&self, id: MountId, within: Option<Duration>) -> Result<Option<bool>> {
+        Ok(self.request_detach(id)?.wait(within))
+    }
+
+    /// Ask for this view's unmount, without waiting for its session to
+    /// end: what [`Self::detach_view`] then waits on. An unmount request
+    /// that fails is no failure when the mount is gone anyway (somebody
+    /// unmounted it already — the CSI node plugin unmounts a staging
+    /// path before it asks for the view — and the session is ending, at
+    /// its own pace), nor when the session ends within a short grace;
+    /// otherwise the mount is still there, served as before.
+    fn request_detach(&self, id: MountId) -> Result<Arc<ViewEnd>> {
         if self.handover.in_progress() {
             bail!("{UPGRADING}");
         }
-        {
+        let (ended, mountpoint, unmount_result) = {
             let mounts = self.mounts.lock().unwrap();
             let handle = mounts
                 .get(&id)
                 .with_context(|| format!("no such mount: {id:?}"))?;
-            let unmount_result = handle.unmounter.lock().unwrap().unmount();
-            if let Err(e) = unmount_result {
-                tracing::warn!(error = %e, "unmount request failed (already unmounted?)");
+            let result = handle.unmounter.lock().unwrap().unmount();
+            (handle.ended.clone(), handle.mountpoint.clone(), result)
+        };
+        if let Err(e) = unmount_result {
+            let still_mounted = self.host.mounts.is_mountpoint(&mountpoint).unwrap_or(true);
+            if still_mounted && ended.wait(Some(UNMOUNT_FAILED_GRACE)).is_none() {
+                bail!(
+                    "unmounting {} failed: {e}; the view stays mounted",
+                    mountpoint.display()
+                );
             }
+            tracing::info!(error = %e, ?mountpoint,
+                "unmount request failed, but the view is unmounted or ending anyway");
         }
-        if let Some(thread) = self.threads.lock().unwrap().remove(&id) {
-            if thread.join().is_err() {
-                tracing::warn!("FUSE session thread panicked");
+        Ok(ended)
+    }
+
+    /// [`Self::detach_view`], then, if that was the last view, wait for
+    /// the node's shutdown too (its drain): when this returns, a view
+    /// that was the last one has left nothing running.
+    pub fn remove_mount(&self, id: MountId) -> Result<()> {
+        let closing = self.detach_view(id, None)?.unwrap_or(false);
+        let thread = self.threads.lock().unwrap().remove(&id);
+        match thread {
+            Some(thread) => {
+                if thread.join().is_err() {
+                    tracing::warn!("FUSE session thread panicked");
+                }
             }
+            // `wait_all` joins it; the shutdown is what is left to wait for.
+            None if closing => self.wait_stopped(),
+            None => {}
         }
         Ok(())
     }
@@ -1038,6 +1240,11 @@ impl NodeRuntime {
             .collect()
     }
 
+    /// [`NodeConfig::persistent`].
+    pub(crate) fn is_persistent(&self) -> bool {
+        self.persistent
+    }
+
     fn mount_ids(&self) -> Vec<MountId> {
         self.mounts.lock().unwrap().keys().copied().collect()
     }
@@ -1063,6 +1270,8 @@ impl NodeRuntime {
         // a process that is exiting either way must not leave files
         // behind that make it look like a live daemon is still here.
         let state_dir = self.engine.state_dir();
+        // Before the socket goes: a `umount` waiting for it reads this.
+        record_shutdown_result(state_dir, &result);
         constellation_control::transport::forget_socket(state_dir);
         let _ = std::fs::remove_file(state_dir.join("daemon.pid"));
         let (stopped, cv) = &self.stopped;
@@ -1311,6 +1520,228 @@ mod tests {
         }
     }
 
+    /// A daemon's main thread joins its session threads (`wait_all`), so
+    /// `remove_mount` usually finds no handle of its own to join. It must
+    /// still not return before the view's session has ended and its
+    /// teardown has run — `view.unmount` answered at once otherwise, and
+    /// `umount` asked the daemon for its views while the view was still
+    /// listed, took the daemon for one serving others, and returned while
+    /// the last view's clean-unmount drain had not even started. The
+    /// teardown is held here (the gate it takes its decision under) to
+    /// show `remove_mount` waiting for it; let go, the call returns once
+    /// the node, its last view gone, has shut down.
+    #[test]
+    fn remove_mount_waits_for_the_views_teardown_when_wait_all_holds_its_thread() {
+        unsafe {
+            std::env::set_var("CONSTELLATION_P2P", "off");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = format!("file://{}/backend", root.path().display());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let store = ChunkStore::new(
+                rt.block_on(crate::backend::open_backend(&backend))
+                    .expect("open backend"),
+            );
+            rt.block_on(store.create_fs(&FsMeta::new(1024 * 1024, "raw")))
+                .expect("create_fs");
+        }
+        let mnt = root.path().join("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        let node = start_node(rt.handle(), &backend, root.path().join("state"));
+        let id = node.add_mount(view("/", mnt.clone())).expect("mount");
+        std::fs::write(mnt.join("f"), b"data").unwrap();
+
+        // The daemon's main thread: it takes every session thread's handle.
+        let waiter = {
+            let node = node.clone();
+            std::thread::spawn(move || node.wait_all())
+        };
+        assert!(
+            eventually(Duration::from_secs(10), || node
+                .threads
+                .lock()
+                .unwrap()
+                .is_empty()),
+            "wait_all did not take the session thread"
+        );
+
+        let gate = node.gate.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let remover = {
+            let node = node.clone();
+            std::thread::spawn(move || {
+                let result = node.remove_mount(id);
+                let _ = done_tx.send(());
+                result
+            })
+        };
+        let early = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let still_listed = node.mounts.lock().unwrap().contains_key(&id);
+        drop(gate);
+        assert!(
+            !early,
+            "remove_mount returned before the view's teardown ran (still listed: {still_listed})"
+        );
+        remover
+            .join()
+            .unwrap()
+            .expect("remove_mount of the last view");
+        assert!(node.mounts.lock().unwrap().is_empty());
+        assert!(
+            *node.stopped.0.lock().unwrap(),
+            "remove_mount of the last view returned before the node's shutdown"
+        );
+        waiter.join().unwrap();
+    }
+
+    /// A view with a file open on it: `view.unmount` detaches it from the
+    /// namespace (lazily, as every unprivileged unmount does) and answers
+    /// within its bound that the view is still in use — it neither hangs
+    /// until the file is closed nor says the view is gone. The view stays
+    /// listed and serves the open file; once that is closed the view ends,
+    /// and with it, the last one, the node.
+    #[test]
+    fn a_view_still_in_use_is_answered_as_such_and_ends_when_closed() {
+        unsafe {
+            std::env::set_var("CONSTELLATION_P2P", "off");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = format!("file://{}/backend", root.path().display());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let store = ChunkStore::new(
+                rt.block_on(crate::backend::open_backend(&backend))
+                    .expect("open backend"),
+            );
+            rt.block_on(store.create_fs(&FsMeta::new(1024 * 1024, "raw")))
+                .expect("create_fs");
+        }
+        let mnt = root.path().join("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        let node = start_node(rt.handle(), &backend, root.path().join("state"));
+        let id = node.add_mount(view("/", mnt.clone())).expect("mount");
+        std::fs::write(mnt.join("f"), b"data").unwrap();
+        let waiter = {
+            let node = node.clone();
+            std::thread::spawn(move || node.wait_all())
+        };
+        assert!(eventually(Duration::from_secs(10), || node
+            .threads
+            .lock()
+            .unwrap()
+            .is_empty()));
+
+        let mut open = std::fs::File::open(mnt.join("f")).unwrap();
+        let host = crate::control::DaemonHost {
+            node: Arc::downgrade(&node),
+        };
+        let started = Instant::now();
+        let answer = constellation_engine::control::ControlHost::unmount(&host, &mnt)
+            .expect("view.unmount of a view in use");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "view.unmount waited for the file to be closed"
+        );
+        assert!(answer.contains("still in use"), "{answer}");
+        assert!(node.mounts.lock().unwrap().contains_key(&id));
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut open, &mut data).unwrap();
+        assert_eq!(data, b"data", "the open file is still served");
+        drop(open);
+
+        assert!(
+            eventually(Duration::from_secs(30), || node
+                .mounts
+                .lock()
+                .unwrap()
+                .is_empty()),
+            "the view did not end once its last file was closed"
+        );
+        node.wait_stopped();
+        waiter.join().unwrap();
+    }
+
+    /// A signal unmounts every view at once: a view still in use (a file
+    /// open on it) ends only when that file is closed, and must not keep
+    /// the node's other views mounted and served meanwhile (`systemctl
+    /// stop` would wait out its timeout with them still mounted).
+    #[test]
+    fn a_signal_unmounts_the_free_views_while_one_is_still_in_use() {
+        unsafe {
+            std::env::set_var("CONSTELLATION_P2P", "off");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let backend = format!("file://{}/backend", root.path().display());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let store = ChunkStore::new(
+                rt.block_on(crate::backend::open_backend(&backend))
+                    .expect("open backend"),
+            );
+            rt.block_on(store.create_fs(&FsMeta::new(1024 * 1024, "raw")))
+                .expect("create_fs");
+        }
+        let busy_mnt = root.path().join("busy");
+        let free_mnts: Vec<PathBuf> = (0..3)
+            .map(|i| root.path().join(format!("free{i}")))
+            .collect();
+        std::fs::create_dir_all(&busy_mnt).unwrap();
+        let node = start_node(rt.handle(), &backend, root.path().join("state"));
+        let busy = node
+            .add_mount(view("/", busy_mnt.clone()))
+            .expect("mount /");
+        std::fs::create_dir(busy_mnt.join("sub")).unwrap();
+        std::fs::write(busy_mnt.join("f"), b"data").unwrap();
+        for mnt in &free_mnts {
+            std::fs::create_dir_all(mnt).unwrap();
+            node.add_mount(view("/sub", mnt.clone()))
+                .expect("mount /sub");
+        }
+        let waiter = {
+            let node = node.clone();
+            std::thread::spawn(move || node.wait_all())
+        };
+        let mounted = |mnt: &std::path::Path| {
+            std::fs::read_to_string("/proc/self/mountinfo")
+                .unwrap()
+                .lines()
+                .any(|l| l.split(' ').nth(4) == Some(mnt.to_str().unwrap()))
+        };
+
+        let open = std::fs::File::open(busy_mnt.join("f")).unwrap();
+        node.deliver_signal(SIGTERM);
+        let freed = eventually(Duration::from_secs(20), || {
+            free_mnts.iter().all(|m| !mounted(m)) && node.mounts.lock().unwrap().len() == 1
+        });
+        let busy_listed = node.mounts.lock().unwrap().contains_key(&busy);
+        drop(open);
+        assert!(freed, "a view still in use kept the others mounted");
+        assert!(busy_listed, "the view in use ended while its file was open");
+        assert!(
+            eventually(Duration::from_secs(30), || node
+                .mounts
+                .lock()
+                .unwrap()
+                .is_empty()),
+            "the view in use did not end once its file was closed"
+        );
+        node.wait_stopped();
+        waiter.join().unwrap();
+    }
+
     /// The storm-hang follow-up: a final flush that cannot ship what the
     /// node holds must neither wedge nor pass for a clean exit. Here a
     /// pending upload whose chunk is not in the cache (as with a lost
@@ -1339,9 +1770,19 @@ mod tests {
             rt.block_on(store.create_fs(&meta)).expect("create_fs");
         }
 
+        let since = std::time::SystemTime::now();
         let clean = start_node(rt.handle(), &backend, root.path().join("state-clean"));
         clean.shutdown().expect("nothing to ship: a clean shutdown");
         assert_eq!(clean.shutdown_error(), None);
+        // What a `umount` waiting for the daemon reads once it is gone.
+        assert_eq!(
+            read_shutdown_result(
+                &root.path().join("state-clean"),
+                Some(std::process::id()),
+                since
+            ),
+            Some(ShutdownResult::Clean)
+        );
 
         let node = start_node(rt.handle(), &backend, root.path().join("state-lost"));
         let lost = constellation_fs_core::ChunkHash::of(b"never reached the cache");
@@ -1359,7 +1800,28 @@ mod tests {
             message.contains("final flush failed") && message.contains("1 pending chunk upload"),
             "{message}"
         );
-        assert_eq!(node.shutdown_error(), Some(message));
+        assert_eq!(node.shutdown_error(), Some(message.clone()));
+        assert_eq!(
+            read_shutdown_result(&root.path().join("state-lost"), None, since),
+            Some(ShutdownResult::Unshipped(message))
+        );
+        // Another daemon's record, or an older one, is not this one's.
+        assert_eq!(
+            read_shutdown_result(
+                &root.path().join("state-lost"),
+                Some(std::process::id() + 1),
+                since
+            ),
+            None
+        );
+        assert_eq!(
+            read_shutdown_result(
+                &root.path().join("state-lost"),
+                None,
+                std::time::SystemTime::now() + Duration::from_secs(60)
+            ),
+            None
+        );
         assert_eq!(
             node.engine().meta().pending_upload_count().unwrap(),
             1,

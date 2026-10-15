@@ -140,8 +140,10 @@ constellation umount demo              # every view; the daemon exits with the l
 constellation umount demo:/projects    # or just one view
 ```
 
-`umount` keeps the registration and the local state, so `mount demo` brings it
-back. To remove the filesystem from this machine (leave the cluster, detach
+The last view's `umount` waits until the daemon has uploaded and shipped
+everything still queued (it prints the progress) and exited; `--no-wait`
+leaves that to the daemon in the background. `umount` keeps the registration
+and the local state, so `mount demo` brings it back. To remove the filesystem from this machine (leave the cluster, detach
 all views, delete the local state and the name), use:
 
 ```bash

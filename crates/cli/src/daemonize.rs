@@ -9,7 +9,9 @@
 //! "control socket bound and every requested view attached" or an error,
 //! then exits with the child's verdict — a failure (bad `--s3`, a bind
 //! conflict, an unmountable mountpoint) surfaces synchronously to the
-//! invoking shell instead of silently backgrounding a dead process.
+//! invoking shell instead of silently backgrounding a dead process. Before
+//! its verdict the child may send progress lines (waiting for the previous
+//! daemon's clean-unmount drain), which the parent prints on stderr.
 //!
 //! The detaching itself (fork, `setsid`, stdio to `daemon.log`, the
 //! close-on-exec status pipe) is the host's: `constellation_platform`'s
@@ -65,6 +67,13 @@ impl Verdict {
         self.send(format!("ERR:{message}\n").as_bytes())
     }
 
+    /// A line for the waiting parent to print on stderr: what this mount
+    /// is waiting for. Best-effort (a parent that is gone reads nothing).
+    pub fn progress(&self, message: &str) {
+        let message = message.replace('\n', " ");
+        let _ = (&self.write).write_all(format!("{PROGRESS}{message}\n").as_bytes());
+    }
+
     fn write_pid_file(&self) -> Result<()> {
         std::fs::write(
             self.state_dir.join("daemon.pid"),
@@ -97,15 +106,27 @@ impl Verdict {
 // daemonized `mount` until the reaper exited: harness
 // `named-shared-daemon` took 583 s.)
 
-/// The child's verdict: the first complete line on the status pipe, or
-/// whatever arrived before EOF when the child died without finishing
-/// one. It never waits past the line: the child keeps serving (and its
-/// write end open) after reporting.
-fn read_verdict(pipe: impl Read) -> String {
+/// What starts a progress line on the status pipe (any other line is the
+/// verdict).
+const PROGRESS: &str = "PROGRESS:";
+
+/// The child's verdict: the first complete line on the status pipe that
+/// is not progress (each progress line goes to `progress` as it comes),
+/// or whatever arrived before EOF when the child died without finishing
+/// one. It never waits past the verdict's line: the child keeps serving
+/// (and its write end open) after reporting.
+fn read_verdict(pipe: impl Read, progress: &mut dyn FnMut(&str)) -> String {
     use std::io::BufRead;
-    let mut line = String::new();
-    let _ = std::io::BufReader::new(pipe).read_line(&mut line);
-    line.trim_end_matches('\n').to_string()
+    let mut reader = std::io::BufReader::new(pipe);
+    loop {
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let line = line.trim_end_matches('\n');
+        match line.strip_prefix(PROGRESS) {
+            Some(message) => progress(message),
+            None => return line.to_string(),
+        }
+    }
 }
 
 /// Fork unless `foreground` (or `CONSTELLATION_NO_DAEMONIZE`) says not
@@ -150,7 +171,7 @@ pub fn fork_if_needed(foreground: bool, state_dir: &Path) -> Result<Outcome> {
 /// The invoking process's side: report the child's verdict and exit with
 /// it.
 fn parent_exit(pipe_read: std::fs::File) -> ! {
-    let text = read_verdict(pipe_read);
+    let text = read_verdict(pipe_read, &mut |message| eprintln!("{message}"));
     let verdict = text.as_str();
     if let Some(message) = verdict.strip_prefix("ERR:") {
         eprintln!("mount failed: {message}");
@@ -179,7 +200,7 @@ mod tests {
         writer.write_all(b"OK\n").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(read_verdict(reader));
+            let _ = tx.send(read_verdict(reader, &mut |_| {}));
         });
         let got = rx
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -192,10 +213,31 @@ mod tests {
     fn a_child_that_dies_before_reporting_reads_as_no_verdict() {
         let (reader, writer) = std::io::pipe().unwrap();
         drop(writer);
-        assert_eq!(read_verdict(reader), "");
+        assert_eq!(read_verdict(reader, &mut |_| {}), "");
         let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(b"ERR:bad --s3\n").unwrap();
         drop(writer);
-        assert_eq!(read_verdict(reader), "ERR:bad --s3");
+        assert_eq!(read_verdict(reader, &mut |_| {}), "ERR:bad --s3");
+    }
+
+    /// A mount waiting for the previous daemon's drain says so through
+    /// the parent, line by line, before its verdict; a child that dies
+    /// after progress still reads as no verdict.
+    #[test]
+    fn progress_lines_come_before_the_verdict() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer
+            .write_all(b"PROGRESS:waiting for the drain\nPROGRESS:3 uploads left\nOK\n")
+            .unwrap();
+        let mut seen = Vec::new();
+        assert_eq!(
+            read_verdict(reader, &mut |m| seen.push(m.to_string())),
+            "OK"
+        );
+        assert_eq!(seen, ["waiting for the drain", "3 uploads left"]);
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"PROGRESS:waiting\n").unwrap();
+        drop(writer);
+        assert_eq!(read_verdict(reader, &mut |_| {}), "");
     }
 }

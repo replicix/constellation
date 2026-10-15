@@ -55,7 +55,7 @@ escape hatches for an ad-hoc, unregistered target.
 
 ```
 constellation mount TARGET [MOUNTPOINT] [--s3 URL] [--state-dir DIR] [--foreground]
-constellation umount TARGET
+constellation umount TARGET [--no-wait]
 ```
 
 `TARGET` is a registered name (`myfs`), a name with a subtree/snapshot
@@ -76,7 +76,70 @@ the same argument shape for both commands; `umount` just never takes a
   by that rollback.
 - `umount NAME:/sub` detaches one view; bare `umount NAME` detaches
   every view the daemon currently has mounted. The daemon exits once its
-  last view is gone.
+  last view is gone. See [what `umount` waits for](#what-umount-waits-for).
+
+### What `umount` waits for
+
+Each view is detached from the kernel and torn down before `umount`
+moves on. A view still in use — files open on it, a shell's working
+directory in it — leaves the mount table at once (an unprivileged
+unmount is lazy) but keeps serving those until the last is closed;
+`umount` says so and waits for it, since only then can the daemon
+drain. When that was the daemon's last view, the daemon runs its
+clean-unmount drain — every pending write-back upload into the backend,
+the journal shipped, then a final metadata commit published and its
+leases released — and exits. By default `umount` waits for that too,
+printing the drain's progress every few seconds:
+
+```
+unmounted /mnt/myfs; that was the daemon's last view: it drains and exits
+waiting for the daemon's clean-unmount drain: 3233 uploads (6.6GB) and 3171390 journal records left (5s)…
+…
+drain complete: every pending upload is in the backend and the journal is shipped; the daemon has exited
+```
+
+A drain is clean once every upload is in the backend and the journal is
+shipped. A final commit publish that stalls after that (an S3 path too
+slow for it) is given up, and the drain still counts as clean: the
+shipped journal holds everything, and the next lease holder publishes
+from it. When `umount` returns successfully, what the mount wrote is in
+the backend (under `--write-mode back` as well) and the daemon process
+is gone: a
+crash or `kill -9` of anything afterwards loses none of it, and a
+`mount` right after starts a new daemon at once. There is no time
+limit: the drain ends by itself once it stops making progress
+(`CONSTELLATION_SHUTDOWN_STALL_S`, S3 unreachable), and `umount` then
+fails, quoting what the daemon left behind (it stays in the state dir
+and ships at the next mount). It fails the same way if the daemon dies
+during the drain.
+
+- **Ctrl-C** stops the waiting, not the drain: the daemon drains on in
+  the background and exits when it is done (`umount` says so and exits
+  non-zero).
+- **`--no-wait`** returns once the views are detached and leaves the
+  drain to the daemon (`constellation status NAME` shows how far it
+  got). Nothing is lost by not waiting — what has not shipped is on the
+  node's disk and ships at the next mount — but it is not in the backend
+  yet.
+- **`umount NAME:/sub`** of a view that is not the last one returns once
+  the view is detached; the daemon keeps serving the others. A
+  persistent daemon (`constellation serve`) keeps running after its last
+  view, and `umount` says so instead of waiting for an exit.
+- **`umount NAME` again** while the daemon drains (after `--no-wait` or
+  a Ctrl-C) waits for the drain like the first one would have.
+- A signal (`SIGTERM`, `SIGINT`) unmounts every view at once; one still
+  in use keeps the daemon up until its last file is closed.
+
+A `mount` of the name issued while its daemon drains does not attach to
+it: a daemon past the start of its drain has stopped its engine and
+cannot serve a view again. The `mount` waits for that daemon to exit
+(printing the drain's progress) and then starts the next daemon, which
+takes up whatever the drain left. That wait has no time limit either;
+only a draining daemon that stops answering for
+`CONSTELLATION_ATTACH_TIMEOUT_MS` fails the `mount`. Before this, the
+`mount` waited silently (its log named the phase "attaching views to the
+running daemon") and gave up after 600 s, and `umount` usually returned
+before the drain had even started, inviting exactly that remount.
 
 `--s3`, `--cache-size`, `--write-mode`, and the other flags below become
 registry overrides: give one explicitly and it replaces the stored
@@ -140,7 +203,10 @@ JuiceFS): the parent blocks on a status pipe until the child reports
 either "every requested view attached" or a specific error, then exits
 with that verdict — a bad `--s3`, a bind conflict, or an unmountable
 mountpoint still surfaces synchronously to the shell instead of quietly
-leaving a dead background process. `-f`/`--foreground` opts out (used by
+leaving a dead background process. Before its verdict the child may
+report progress — a `mount` waiting for the previous daemon's drain says
+how far it is — which the parent prints on stderr. `-f`/`--foreground`
+opts out (used by
 the test harness and interactive debugging); `CONSTELLATION_NO_DAEMONIZE`
 forces foreground behavior for every `mount` in an environment (CI
 convenience). A daemonized mount's PID file and log live at

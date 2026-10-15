@@ -130,6 +130,12 @@ pub trait ControlHost: Send + Sync + 'static {
     /// `view.unmount`: the summary line the CLI prints.
     fn unmount(&self, mountpoint: &Path) -> Result<String, ControlError>;
 
+    /// Whether the host shuts down once its last view is gone
+    /// ([`api::ViewListing::exits_when_empty`]).
+    fn exits_when_empty(&self) -> bool {
+        false
+    }
+
     /// Detach every view (after a self-`leave` has been answered).
     fn detach_all(&self);
 
@@ -810,7 +816,10 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
             })
             .collect();
         views.sort_by_key(|v| v.id);
-        Ok(ViewListing { views })
+        Ok(ViewListing {
+            views,
+            exits_when_empty: s.host.exits_when_empty(),
+        })
     });
     unary::<ViewStats>(r, svc, |s, c, p| {
         let hv = s.view_named(p.id, p.mountpoint.as_deref())?;

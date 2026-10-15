@@ -2993,6 +2993,11 @@ pub struct CacheEntryListing {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ViewListing {
     pub views: Vec<ViewInfo>,
+    /// The daemon shuts down (drains and exits) once its last view is
+    /// gone; `false` for one that keeps serving with none (`constellation
+    /// serve`). A `umount` waits for the exit only when this is set.
+    #[serde(default)]
+    pub exits_when_empty: bool,
 }
 
 /// `node.ops` (plan 31 §6.10): the operation watchdog's registry.

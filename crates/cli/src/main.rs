@@ -199,13 +199,22 @@ enum Command {
     },
     /// Detach a view (`umount myfs:/sub`) or every currently-mounted
     /// view (`umount myfs`). The daemon exits once its last view is
-    /// gone.
+    /// gone, after its clean-unmount drain (pending uploads into the
+    /// backend, the journal shipped); `umount` of that last view waits
+    /// for the drain and the exit, reporting progress, and fails if the
+    /// drain could not ship everything. Ctrl-C stops waiting (the daemon
+    /// drains on in the background).
     Umount {
         /// A registered name ("myfs") or a name with a subtree selector
         /// ("myfs:/data") identifying the view(s) to detach.
         target: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Return once the views are detached, leaving the daemon to
+        /// drain and exit in the background (a `mount` meanwhile waits
+        /// for it).
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Permanently remove a registered filesystem: leave the cluster (if
     /// ever mounted), detach every view, delete the state dir, and drop
@@ -2227,7 +2236,11 @@ fn main() -> Result<()> {
         Command::Mount { .. } => unreachable!(
             "Command::Mount is handled earlier in main(), before the shared runtime is built"
         ),
-        Command::Umount { target, state_dir } => rt.block_on(cmd_umount(target, state_dir)),
+        Command::Umount {
+            target,
+            state_dir,
+            no_wait,
+        } => rt.block_on(cmd_umount(target, state_dir, no_wait)),
         Command::Export { name, force } => rt.block_on(cmd_export(name, force)),
     }
 }
@@ -2848,7 +2861,7 @@ fn cmd_mount_body(
     // that is alive but mute makes this mount fail, explained, within
     // the bound.
     startup::phase("taking daemon.lock");
-    let attach_started = std::time::Instant::now();
+    let mut attach_started = std::time::Instant::now();
     let attach_deadline = daemon_lock::attach_timeout();
     let mut took_over = false;
     let fail = |verdict: Option<daemonize::Verdict>, msg: String| -> Result<()> {
@@ -2941,30 +2954,54 @@ fn cmd_mount_body(
                         continue;
                     }
                     AttachOutcome::DaemonShuttingDown => {
-                        eprintln!(
-                            "existing daemon for this mount is shutting down (draining); \
-                         waiting for it to exit before taking over…"
+                        // The daemon is draining for its exit (its last
+                        // view was unmounted): its engine has stopped and
+                        // cannot serve a view again, so this mount waits
+                        // for it to exit and becomes the next daemon,
+                        // which takes up whatever the drain left. For as
+                        // long as the drain takes — it gives up by
+                        // itself when it stops making progress
+                        // (`CONSTELLATION_SHUTDOWN_STALL_S`) — saying how
+                        // far it is; only a daemon that stops answering
+                        // for the attach timeout fails this mount. (It
+                        // used to wait at most 600 s, silently, under the
+                        // phase name "attaching views", and then fail.)
+                        startup::phase("waiting for the previous daemon's clean-unmount drain");
+                        let daemon_pid = match daemon_lock::holder(state_dir) {
+                            daemon_lock::Holder::Live { pid, .. } => Some(pid),
+                            _ => None,
+                        };
+                        let mut report = |line: String| {
+                            tracing::info!("{line}");
+                            match &verdict {
+                                Some(v) => v.progress(&line),
+                                None => eprintln!("{line}"),
+                            }
+                        };
+                        report(
+                            "the filesystem's daemon is draining for its exit (its last view was \
+                             unmounted); this mount waits for it, then starts the next daemon"
+                                .to_string(),
                         );
-                        // Wait for the old daemon to release the lock / remove
-                        // its socket. Bounded so a genuinely wedged daemon
-                        // surfaces an error rather than spinning forever.
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(600);
-                        while control::socket_exists(state_dir)
-                            && std::time::Instant::now() < deadline
-                        {
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                        }
-                        if control::socket_exists(state_dir) {
+                        let waited = rt.block_on(wait_for_daemon_exit(
+                            state_dir,
+                            daemon_pid,
+                            std::time::SystemTime::now(),
+                            std::time::Duration::from_secs(5),
+                            Some(attach_deadline),
+                            &mut report,
+                        ));
+                        if let Err(e) = waited {
                             return fail(
                                 verdict,
-                                "existing daemon is still shutting down after 600s; \
-                             not taking over (retry once it has exited)"
-                                    .to_string(),
+                                format!("{e:#}; not taking over (retry once it has exited)"),
                             );
                         }
-                        // Old daemon is gone: loop and re-take the lock, which
-                        // now yields `BecomeDaemon`.
+                        // Old daemon is gone: loop and re-take the lock,
+                        // which now yields `BecomeDaemon` — with the whole
+                        // attach timeout again for whatever comes next.
+                        startup::phase("taking daemon.lock");
+                        attach_started = std::time::Instant::now();
                         continue;
                     }
                 }
@@ -3155,100 +3192,339 @@ async fn attach_views(
     Ok(AttachOutcome::Attached)
 }
 
-/// `constellation umount`: resolve the target, then send `MountRemove`
-/// for one view or (bare name) every currently-mounted view. The daemon
-/// exits on its own once its last view is gone; this just waits for the
-/// socket to close (or a bounded timeout).
-async fn cmd_umount(target: String, state_dir: Option<PathBuf>) -> Result<()> {
+/// `constellation umount`: resolve the target, then send `view.unmount`
+/// for one view or (bare name) every currently-mounted view, and wait
+/// until they have ended (a view still in use ends when its last file is
+/// closed). The daemon exits on its own once its last view is gone, after
+/// its clean-unmount drain; unless `no_wait`, this then waits for that
+/// exit, reporting the drain's progress, and fails if the drain could not
+/// ship everything (it is left in the state dir for the next mount). A
+/// daemon already draining, its views gone (an earlier `umount
+/// --no-wait`, or one stopped waiting), is waited for the same way.
+/// Ctrl-C stops the wait, not the drain.
+async fn cmd_umount(target: String, state_dir: Option<PathBuf>, no_wait: bool) -> Result<()> {
     let reg = registry::Registry::load()?;
     let resolved = target::resolve(&target, &reg);
     let dir = target::state_dir(state_dir, &resolved)?;
     let list = || async {
-        control::call::<cm::ViewList>(&dir, Default::default())
-            .await
-            .map(|l| l.views)
+        control::call_bounded::<cm::ViewList>(
+            &dir,
+            Default::default(),
+            daemon_lock::control_timeout(),
+        )
+        .await
     };
-    let mountpoints: Vec<PathBuf> = match &resolved {
+    let listing = list().await?;
+    let targets: Vec<api::ViewInfo> = match &resolved {
         target::Target::Named {
             path: Some(subtree),
             ..
         } => {
             let want = subtree.as_str();
-            list()
-                .await?
-                .into_iter()
+            listing
+                .views
+                .iter()
                 .filter(|m| m.subtree == want)
-                .map(|m| PathBuf::from(m.mountpoint))
+                .cloned()
                 .collect()
         }
-        _ => list()
-            .await?
-            .into_iter()
-            .map(|m| PathBuf::from(m.mountpoint))
-            .collect(),
+        _ => listing.views.clone(),
     };
-    if mountpoints.is_empty() {
-        bail!("no matching mounted view for {target:?}");
+    // Who serves the views, to wait for its exit; and from when on an
+    // outcome it records is this shutdown's.
+    let daemon_pid = match daemon_lock::holder(&dir) {
+        daemon_lock::Holder::Live { pid, .. } => Some(pid),
+        _ => None,
+    };
+    let since = std::time::SystemTime::now();
+    if targets.is_empty() {
+        if !(listing.views.is_empty() && listing.exits_when_empty) || no_wait {
+            bail!("no matching mounted view for {target:?}");
+        }
+        eprintln!("no view is mounted: the daemon is draining for its exit");
     }
-    for mountpoint in &mountpoints {
-        let ack = control::call::<cm::ViewUnmount>(
+    let mut unanswered = false;
+    for view in &targets {
+        let mountpoint = PathBuf::from(&view.mountpoint);
+        match control::try_call::<cm::ViewUnmount>(
             &dir,
             api::ViewUnmountParams {
                 mountpoint: mountpoint.clone(),
             },
+            None,
         )
-        .await?;
-        println!("{}", ack.detail);
+        .await
+        {
+            Ok(Ok(ack)) => println!("{}", ack.detail),
+            Ok(Err(refused)) => bail!("{}", refused.message),
+            // The answer can be lost when the daemon, its last view gone
+            // and nothing to drain, exits right after: the daemon's own
+            // record says how it ended.
+            Err(error) => {
+                eprintln!(
+                    "no answer to unmounting {} ({error:#}); asking the daemon's records instead",
+                    mountpoint.display()
+                );
+                unanswered = true;
+            }
+        }
+    }
+    let mine = |v: &api::ViewInfo| targets.iter().any(|t| t.id == v.id);
+    if no_wait {
+        let others = matches!(list().await, Ok(l) if l.views.iter().any(|v| !mine(v)));
+        if !others && listing.exits_when_empty {
+            eprintln!(
+                "not waiting: a view still in use ends when its last file is closed; the daemon, \
+                 its last view ended, drains its pending uploads and journal in the background \
+                 and then exits (`constellation status` shows how far it got; a `mount` \
+                 meanwhile waits for it)"
+            );
+        }
+        return Ok(());
     }
     // Removing a view does not by itself mean the daemon is going away: it
     // only runs its clean-shutdown sequence (and removes its socket) once
-    // its *last* view is gone (`NodeRuntime::remove_mount`). A
-    // `NAME:/sub` umount that leaves sibling views mounted must not wait on
-    // the socket at all — it would never disappear while the daemon keeps
-    // serving them, which is how `umount myfs:/sub` used to hang forever
-    // even though the daemon's own log showed the view cleanly detached
-    // ("FUSE detached") and moved on. Ask the daemon (if still reachable)
-    // whether any view is left before deciding to wait for it to exit.
-    let other_views_remain = matches!(list().await, Ok(views) if !views.is_empty());
-    // Wait for the daemon to actually exit if this removed its last view.
-    // The daemon removes its socket only at the very end of its clean
-    // shutdown (drain uploads + ship journal), so the socket's presence is
-    // the honest "still shutting down" signal. Rather than a fixed 10s cap
-    // — which silently returned "done" while a large drain was still in
-    // flight, tempting a remount that orphaned a mount — poll the live
-    // status and report drain progress until the socket is gone.
-    if !other_views_remain && control::socket_exists(&dir) {
-        wait_for_daemon_exit(&dir).await;
+    // its *last* view is gone (`NodeRuntime::detach_view`), and a
+    // persistent one (`serve`) never does. A `NAME:/sub` umount that
+    // leaves sibling views mounted must not wait for an exit — it would
+    // never come while the daemon keeps serving them, which is how `umount
+    // myfs:/sub` used to hang forever. `view.unmount` answers once the
+    // view is gone from the daemon's list, or says it is still in use (it
+    // stays listed until it ends): wait for that, then look at what is
+    // left. It used to answer as soon as the unmount was requested, when
+    // the view was usually still listed, and `umount` then took the
+    // daemon for one serving other views and returned while the last
+    // view's drain had not even started.
+    let views_ended = async {
+        let started = std::time::Instant::now();
+        let mut last_report: Option<std::time::Instant> = None;
+        loop {
+            let report_due =
+                last_report.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5));
+            match list().await {
+                Ok(listing) => {
+                    let busy: Vec<&str> = listing
+                        .views
+                        .iter()
+                        .filter(|v| mine(v))
+                        .map(|v| v.mountpoint.as_str())
+                        .collect();
+                    if busy.is_empty() {
+                        let others = !listing.views.is_empty();
+                        return (others, listing.exits_when_empty);
+                    }
+                    if report_due {
+                        last_report = Some(std::time::Instant::now());
+                        eprintln!(
+                            "waiting for {} to end: still in use (files open on it or a \
+                             working directory in it) ({}s)…",
+                            busy.join(", "),
+                            started.elapsed().as_secs()
+                        );
+                    }
+                }
+                // Gone (its drain was quick), or going: no view is left.
+                Err(_) if !control::socket_exists(&dir) => return (false, true),
+                Err(_)
+                    if matches!(
+                        control::ping(&dir, daemon_lock::control_timeout()).await,
+                        Ok(false)
+                    ) =>
+                {
+                    return (false, true)
+                }
+                // Mute (a loaded host): it may still serve other views.
+                Err(error) => {
+                    if report_due {
+                        last_report = Some(std::time::Instant::now());
+                        eprintln!(
+                            "waiting for the daemon to answer which views it still serves: \
+                             {error:#} ({}s)…",
+                            started.elapsed().as_secs()
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    };
+    let (other_views_remain, exits_when_empty) = tokio::select! {
+        ended = views_ended => ended,
+        _ = tokio::signal::ctrl_c() => bail!(
+            "stopped waiting: the detached view(s) end when their last file is closed, and \
+             the daemon then drains in the background if they were its last"
+        ),
+    };
+    if other_views_remain {
+        return Ok(());
     }
-    Ok(())
+    if !exits_when_empty {
+        if !unanswered {
+            eprintln!("the daemon keeps running without views (it serves until it is stopped)");
+        }
+        return Ok(());
+    }
+    // The daemon removes its socket only at the very end of its clean
+    // shutdown (drain uploads + ship journal), and its process exits right
+    // after. Rather than a fixed cap — which silently returned "done"
+    // while a large drain was still in flight, tempting a remount that
+    // orphaned a mount — poll the live status, report the drain's
+    // progress, and wait for as long as it takes (the daemon's own drain
+    // gives up when it stops making progress,
+    // `CONSTELLATION_SHUTDOWN_STALL_S`).
+    let mut report = |line: String| eprintln!("{line}");
+    let wait = wait_for_daemon_exit(
+        &dir,
+        daemon_pid,
+        since,
+        std::time::Duration::from_secs(5),
+        None,
+        &mut report,
+    );
+    let exit = tokio::select! {
+        exit = wait => exit?,
+        _ = tokio::signal::ctrl_c() => {
+            bail!(
+                "stopped waiting: the daemon{} keeps draining in the background and exits when \
+                 it is done (`constellation status` shows how far it got; `umount` again waits \
+                 for it, and a `mount` meanwhile waits too)",
+                daemon_pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+            );
+        }
+    };
+    match exit {
+        Some(node_runtime::ShutdownResult::Clean) => {
+            eprintln!(
+                "drain complete: every pending upload is in the backend and the journal is \
+                 shipped; the daemon has exited"
+            );
+            Ok(())
+        }
+        Some(node_runtime::ShutdownResult::Unshipped(why)) => {
+            bail!("the daemon exited without shipping everything: {why}")
+        }
+        None => bail!(
+            "the daemon exited without finishing its drain (killed?; see daemon.log in {}); \
+             whatever it did not ship stays in the state dir and ships at the next mount",
+            dir.display()
+        ),
+    }
 }
 
-/// Poll the daemon's control socket until it disappears (clean shutdown
-/// complete), printing periodic drain progress so `umount` does not look
-/// finished while uploads/journal are still shipping. Purely informational
-/// — a daemon that never finishes draining will keep this waiting, which
-/// is the honest state; the user can Ctrl-C to stop watching (the drain
-/// continues in the daemon regardless).
-async fn wait_for_daemon_exit(state_dir: &Path) {
-    let mut last_report = std::time::Instant::now();
-    let started = last_report;
-    while control::socket_exists(state_dir) {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if last_report.elapsed() >= std::time::Duration::from_secs(2)
-            && control::socket_exists(state_dir)
-        {
-            last_report = std::time::Instant::now();
-            if let Ok(report) = control::call::<cm::NodeStatus>(state_dir, Default::default()).await
-            {
-                let pending = report.writeback.pending_uploads;
-                let backlog = report.spool.journal_backlog;
-                if pending > 0 || backlog > 0 {
-                    eprintln!(
-                        "shutting down: draining {pending} uploads, {backlog} journal entries \
-                         ({}s elapsed)…",
-                        started.elapsed().as_secs()
-                    );
+/// The control socket the state dir's locator names, by identity (device
+/// and inode): a daemon that binds the same path anew has another one.
+fn socket_identity(state_dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let sock = constellation_control::transport::locate_socket(state_dir)?;
+    let meta = std::fs::metadata(sock).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Wait for the daemon of `state_dir`, which is shutting down (draining
+/// before its exit), to be gone: its process `pid` exited (or, when it is
+/// not known, the control socket it had bound removed or replaced), so a
+/// `mount` right after starts the next daemon at once. Every `every`,
+/// `report` gets a line on how far the drain is. Returns the outcome the
+/// daemon recorded for this shutdown (`since`: when it was asked for),
+/// `None` when it recorded none (it died — was killed — before its drain
+/// ended). `mute_limit`: fail once the daemon has not answered for that
+/// long (`None`: keep waiting, saying so).
+///
+/// What is watched is the daemon, not the socket's path: a `mount` that
+/// takes over the moment the old daemon lets go of `daemon.lock` binds the
+/// same path again at once (and then answers `status` with an empty
+/// queue for good). While the old process lives it holds `daemon.lock`,
+/// so whoever answers on its socket meanwhile is that daemon.
+async fn wait_for_daemon_exit(
+    state_dir: &Path,
+    pid: Option<u32>,
+    since: std::time::SystemTime,
+    every: std::time::Duration,
+    mute_limit: Option<std::time::Duration>,
+    report: &mut dyn FnMut(String),
+) -> Result<Option<node_runtime::ShutdownResult>> {
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    let mut last_report = started;
+    let mut last_answer = started;
+    let mut drained: Option<Instant> = None;
+    let mut said_exiting = false;
+    let socket = socket_identity(state_dir);
+    loop {
+        let ours = socket.is_some() && socket_identity(state_dir) == socket;
+        let gone = match pid {
+            Some(pid) => !daemon_lock::alive(pid),
+            None => !ours,
+        };
+        if gone {
+            return Ok(node_runtime::read_shutdown_result(state_dir, pid, since));
+        }
+        if !ours {
+            // Its drain is over (the socket goes last); the process exits.
+            let drained = *drained.get_or_insert_with(Instant::now);
+            if !said_exiting && drained.elapsed() >= Duration::from_secs(2) {
+                if let Some(pid) = pid {
+                    report(format!(
+                        "the daemon's drain has ended; waiting for it (pid {pid}) to exit…"
+                    ));
                 }
+                said_exiting = true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if last_report.elapsed() < every {
+            continue;
+        }
+        last_report = Instant::now();
+        let elapsed = started.elapsed().as_secs();
+        let status = control::call_bounded::<cm::NodeStatus>(
+            state_dir,
+            Default::default(),
+            daemon_lock::control_timeout(),
+        )
+        .await;
+        // Taken only from the daemon waited for: the socket may have
+        // changed hands while the call was out.
+        if socket_identity(state_dir) != socket {
+            continue;
+        }
+        match status {
+            Ok(status) => {
+                last_answer = Instant::now();
+                let pending = status.writeback.pending_uploads;
+                let backlog = status.spool.journal_backlog;
+                report(if pending > 0 || backlog > 0 {
+                    format!(
+                        "waiting for the daemon's clean-unmount drain: {pending} uploads ({}B) \
+                         and {backlog} journal records left ({elapsed}s)…",
+                        snapshot_cli::human_bytes(status.writeback.dirty_bytes)
+                    )
+                } else {
+                    format!(
+                        "waiting for the daemon's clean-unmount drain: shipping its last \
+                         records and releasing its leases ({elapsed}s)…"
+                    )
+                });
+            }
+            Err(error) => {
+                let mute = last_answer.elapsed();
+                if let Some(limit) = mute_limit {
+                    if mute >= limit {
+                        bail!(
+                            "the daemon draining {} has not answered for {}s ({error:#}); {}",
+                            state_dir.display(),
+                            mute.as_secs(),
+                            daemon_lock::holder(state_dir)
+                        );
+                    }
+                }
+                report(format!(
+                    "waiting for the daemon's clean-unmount drain: it has not answered for {}s \
+                     ({elapsed}s)…",
+                    mute.as_secs()
+                ));
             }
         }
     }
@@ -4514,6 +4790,12 @@ mod umount_tests {
             qos: Default::default(),
         })
         .expect("mount sub");
+        // As in the daemon (`cmd_mount_body`), the main thread joins the
+        // session threads: `view.unmount` cannot join them itself.
+        let waiter = {
+            let node = node.clone();
+            std::thread::spawn(move || node.wait_all())
+        };
 
         // Register the name so `target::resolve("myfs:/sub", ..)` finds it
         // (only its *presence*, and this test's explicit `--state-dir`
@@ -4557,7 +4839,7 @@ mod umount_tests {
         rt.block_on(async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                cmd_umount("myfs:/sub".to_string(), Some(state_dir.clone())),
+                cmd_umount("myfs:/sub".to_string(), Some(state_dir.clone()), false),
             )
             .await
             .expect("cmd_umount(\"myfs:/sub\") hung")
@@ -4583,8 +4865,18 @@ mod umount_tests {
             "root view must still be serving reads after the sub view was unmounted"
         );
 
-        // Clean up: unmount the remaining root view so the daemon exits.
-        rt.block_on(cmd_umount("myfs".to_string(), Some(state_dir.clone())))
-            .expect("final umount");
+        // Unmount the remaining root view: the daemon drains and exits, and
+        // `umount` returns only then, with the drain's clean outcome.
+        rt.block_on(cmd_umount(
+            "myfs".to_string(),
+            Some(state_dir.clone()),
+            false,
+        ))
+        .expect("final umount");
+        assert!(
+            !control::socket_exists(&state_dir),
+            "the last view's umount returned before the daemon's shutdown"
+        );
+        waiter.join().unwrap();
     }
 }

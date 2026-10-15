@@ -114,6 +114,10 @@ pub(crate) fn load_policy(
     policy
 }
 
+/// How long `view.unmount` waits for the view to end before it answers
+/// that the view, detached, is still in use.
+const VIEW_UNMOUNT_WAIT: Duration = Duration::from_secs(5);
+
 /// [`ControlHost`] over this daemon's [`NodeRuntime`].
 pub struct DaemonHost {
     pub(crate) node: Weak<NodeRuntime>,
@@ -291,11 +295,41 @@ impl ControlHost for DaemonHost {
             .ok_or_else(|| {
                 ControlError::not_found(format!("no view mounted at {}", mountpoint.display()))
             })?;
-        // `remove_mount` unmounts and then joins the session's OS thread,
-        // which can take a while (draining in-flight requests): the router
-        // runs this on a blocking thread, never a runtime worker.
-        node.remove_mount(id).map_err(failed)?;
-        Ok(format!("unmounted {}", mountpoint.display()))
+        // `detach_view` unmounts and then waits for the session's thread
+        // to have torn the view down, which can take a while (draining
+        // in-flight requests): the router runs this on a blocking thread,
+        // never a runtime worker. It does not wait for the node's own
+        // drain when this was its last view: the caller watches that
+        // (`constellation umount` reports its progress until the daemon
+        // has exited).
+        Ok(
+            match node
+                .detach_view(id, Some(VIEW_UNMOUNT_WAIT))
+                .map_err(failed)?
+            {
+                Some(true) => format!(
+                    "unmounted {}; that was the daemon's last view: it drains and exits",
+                    mountpoint.display()
+                ),
+                Some(false) if node.is_persistent() && node.mounts().is_empty() => format!(
+                    "unmounted {}; the daemon keeps running without views",
+                    mountpoint.display()
+                ),
+                Some(false) => format!("unmounted {}", mountpoint.display()),
+                // Still listed: a caller that needs it gone waits for that.
+                None => format!(
+                    "detached {}, still in use (files open on it or a working directory in \
+                     it): the view ends when they are closed",
+                    mountpoint.display()
+                ),
+            },
+        )
+    }
+
+    fn exits_when_empty(&self) -> bool {
+        self.node
+            .upgrade()
+            .is_some_and(|node| !node.is_persistent())
     }
 
     fn detach_all(&self) {

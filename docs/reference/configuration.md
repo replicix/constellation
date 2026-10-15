@@ -1102,7 +1102,8 @@ operator has cleared.
 |---|---:|---|---|
 | `CONSTELLATION_REGISTRY` | `$XDG_CONFIG_HOME/constellation/registry.toml` | path | local named-filesystem registry file (see [named filesystems](features/named-filesystems.md)) |
 | `CONSTELLATION_NO_DAEMONIZE` | unset | presence (any value, even empty) | force `--foreground` behavior for every `mount` (CI/harness convenience) |
-| `CONSTELLATION_SHUTDOWN_STALL_S` | `120` | seconds, positive | an unmount's drain that makes no progress (the journal and pending uploads stop shrinking, and the final metadata publish reads, writes and locates no tree nodes) for this long gives up and exits non-zero, leaving everything on disk for the next mount |
+| `CONSTELLATION_SHUTDOWN_STALL_S` | `120` | seconds, positive | an unmount's drain that makes no progress (the journal and pending uploads stop shrinking, and the final metadata publish reads, writes and locates no tree nodes) for this long gives up and exits non-zero, leaving everything on disk for the next mount; a waiting `umount` then fails with what was left |
+| `CONSTELLATION_ATTACH_TIMEOUT_MS` | `120000` | milliseconds, positive | how long a `mount` that found `daemon.lock` held keeps trying to attach to a daemon that does not answer; also how long a `mount` waiting for a draining daemon's exit tolerates that daemon not answering (the wait itself has no wall-clock bound: it lasts as long as the drain makes progress) |
 
 ### Control UI
 
@@ -1233,6 +1234,7 @@ filesystem.
 | `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS` | `0` (disabled) | milliseconds | sleeps this long, holder-side, immediately before replying to a forwarded mutation — after the op has already executed and the keepers lock has been released. Used to make a forwarded mutation's reply race the requester's own `CONSTELLATION_FORWARD_TIMEOUT_MS` deadline deterministically (plan 30 `forward-timeout-reexec`); logs one `tracing::warn!` at startup when non-zero |
 | `CONSTELLATION_FAULT_LOSE_CHUNKS` | unset | comma-separated chunk hashes (hex) | plan 30 M4: the upload pass deletes these chunks from the local cache right before reading them, so a pending upload of one finds its content gone (the "missing from local cache" condition, at a precise point; `poison-record-isolation`) |
 | `CONSTELLATION_FAULT_P2P_DENY_FILE` | unset | a file path, one node id per line, re-read on every use | plan 30 M9/M11: drops P2P traffic to and from the listed nodes and reports them unconnected, for backup appends, pre-S3 streaming, delegation, lock, lease-request and promise messages (a one-sided partition) |
+| `CONSTELLATION_FAULT_HOLD_DRAIN_FILE` | unset | a file path | test-only: while the file exists a clean shutdown's drain waits before it uploads or ships anything, and writes `<path>.held` once it does (a long clean-unmount drain, for `umount`/`mount` tests) |
 | `CONSTELLATION_FAULT_HOLD_SYNC_FILE` | unset | a file path | plan 30 M4: while the file exists every managed sync round returns at once (nothing uploads, ships or publishes, and the lease is not renewed — keep holds short); a held round writes `<path>.held`, so a harness knows no round is still in flight |
 
 ## Boolean values

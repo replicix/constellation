@@ -8655,6 +8655,11 @@
     "ViewListing": {
       "description": "`view.list`.",
       "properties": {
+        "exits_when_empty": {
+          "default": false,
+          "description": "The daemon shuts down (drains and exits) once its last view is\ngone; `false` for one that keeps serving with none (`constellation\nserve`). A `umount` waits for the exit only when this is set.",
+          "type": "boolean"
+        },
         "views": {
           "items": {
             "$ref": "#/$defs/ViewInfo"
