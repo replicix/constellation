@@ -15925,6 +15925,80 @@ mod locks {
         assert_eq!(mtime(&h, ino), 4);
     }
 
+    /// A renewal is never answered with a record weaker than the grant
+    /// its holder honours: the holder keeps the stronger mode
+    /// (`LockTables::renewed`), so it would hold exclusive what this table
+    /// knows as shared. Such a record is a stale copy (a fast successor's
+    /// lock mirror from before the holder's grant became exclusive: sim
+    /// `locks-failover-backup-renew` seeds 203170 and 203580): the grant
+    /// is lost, or reclaimed in its own mode during a grace.
+    #[test]
+    fn a_renewal_is_never_answered_with_a_weaker_record() {
+        use constellation_meta::locks::Grant;
+        for same_id in [false, true] {
+            let (mut h, ino) = holder_with_file();
+            let held = GrantId { node: 1, seq: 8 };
+            let stale = if same_id {
+                held
+            } else {
+                GrantId { node: 1, seq: 5 }
+            };
+            let install_stale = |h: &Harness| {
+                h.meta.locks().install(Grant {
+                    id: stale,
+                    node: 2,
+                    ino,
+                    mode: S,
+                    until_ms: h.now.0 + 6_000,
+                    recalled: false,
+                    gen: 0,
+                    confirmed_ms: h.now.0,
+                })
+            };
+            install_stale(&h);
+            let renew = |h: &mut Harness, req: u64| {
+                let out = h.step(Event::Peer {
+                    from: 2,
+                    msg: PeerMsg::LockRenew {
+                        req: OpId(req),
+                        entries: vec![LockRenewEntry {
+                            ino,
+                            grant: held,
+                            mode: X,
+                        }],
+                    },
+                });
+                sends(&out)
+                    .into_iter()
+                    .find_map(|(t, m)| match m {
+                        PeerMsg::LockRenewed { results, .. } if t == 2 => Some(results[0].2),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("no answer: {out:?}"))
+            };
+            // No grace: the table does not know the exclusive grant.
+            assert_eq!(
+                renew(&mut h, 20),
+                LockRenewResult::Lost,
+                "same id: {same_id}"
+            );
+            // During a grace it is reclaimed, in its own mode.
+            h.meta.read_delegations().set_quarantine(h.now.0 + 3_000);
+            let r = renew(&mut h, 21);
+            assert!(
+                matches!(r, LockRenewResult::Ok { id, mode: X, .. } if id == held),
+                "same id {same_id}: {r:?}"
+            );
+            let g = h
+                .meta
+                .locks()
+                .own_grant(ino, 2, h.now.0)
+                .expect("installed");
+            assert_eq!((g.id, g.mode), (held, X));
+            assert_eq!(h.meta.locks().grants_len(), 1);
+        }
+    }
+
     // ---------------------------------------------- plan 41 L0: freshness
 
     /// Plan 41 L0 (review S2): a holder whose cached owner answers its

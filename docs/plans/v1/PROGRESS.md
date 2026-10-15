@@ -47789,3 +47789,39 @@ ignored; the sim's 32 `locks_*` tests and 300-seed sweeps of
 violation tests 13–15 s and the 7/5 clean run 132 s in a debug build.
 Rebased over `9a8549c` (no overlap but PROGRESS): clippy on the
 workspace and the authority unit suite again, on this workstation.
+
+## Fix: a renewal was answered with a weaker record of its holder's grant (sim `locks-failover-backup-renew`, 2026-10-14)
+
+Found by the plan 41 L0 simulation config (seeds 203580 on `d940fa2`,
+203170 and 203580 with L0). `lock_renew_one` renews "that id, or this
+node's newer grant here" (`df14686`; a reply that never arrived replaced
+the holder's id, sim seed 90013): any live record of the holder's node
+on the inode, whatever its mode. `LockTables::renewed` then keeps the
+stronger of the holder's mode and the answer's (`h.mode.max(mode)`). A
+record weaker than the holder's grant is a stale copy: a fast
+successor installs the last lock mirror the old root got through, and
+the old root may since have replaced the holder's shared grant with an
+exclusive one (recalled, released, granted anew). Renewed in its place,
+the holder went on exclusive while the successor's table had it shared,
+and the successor granted a shared lock beside it: seed 203580, node 3's
+exclusive grant 782 renewed at node 2 as `Ok { id: 779, mode: Shared }`,
+node 2's own shared grant at t = 6429, both in I/O at t = 6589.
+
+### What changed
+
+- `lock_renew_one` renews a record only if its mode covers the mode the
+  holder renews (`mode` in `LockRenewEntry`, the holder's): the same id
+  or the node's other record alike. A weaker one is treated as unknown:
+  reclaimed in the holder's mode during a grace if nothing conflicts
+  (`install` replaces the stale record), else `Lost`.
+
+### Tests
+
+- `a_renewal_is_never_answered_with_a_weaker_record` (the stale record
+  under another id and under the same id; no grace: `Lost`; a grace: the
+  exclusive grant reclaimed, one record): fails before (`Ok { mode:
+  Shared }`).
+- `locks-failover-backup-renew`: seeds 203170 and 203580 clean, and the
+  1,000-seed sweep (203000..204000: 0 failing; 2 before); the
+  `locks_*` sim tests and the authority unit suite pass; the harness
+  lock scenarios listed in the L0 section passed on this tree.

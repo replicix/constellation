@@ -2559,11 +2559,26 @@ impl Core {
         let until = now.0 + ttl + self.lock_margin_ms();
         // The grant renewed: that id, or this node's newer grant here (a
         // reply that never arrived replaced it: renew that one and say so
-        // — sim seed 90013 fenced a healthy node otherwise).
+        // — sim seed 90013 fenced a healthy node otherwise). Only a record
+        // whose mode covers the one the holder honours: the holder keeps
+        // the stronger of its own and the answer's (`LockTables::renewed`),
+        // so a weaker record renewed in its place left the holder
+        // exclusive where this table knew it shared, and the table granted
+        // a shared lock beside it (sim `locks-failover-backup-renew` seeds
+        // 203170 and 203580: a fast successor's mirror, which the old root
+        // last reached before the holder's shared grant became an
+        // exclusive one, renewed the shared one). A weaker record is not
+        // the grant: reclaimed during a grace like an unknown one (the
+        // install replaces it), else lost. That holds for a weaker record
+        // under the holder's own id too, without looking further for
+        // another record of the node: a table holds one per node and
+        // inode (`LockTables::install` replaces it).
         let target = match replica.locks().get(id) {
-            Some(g) if g.node == from => Some(g.id),
-            _ => replica.locks().own_grant(ino, from, now.0).map(|g| g.id),
-        };
+            Some(g) if g.node == from => Some(g),
+            _ => replica.locks().own_grant(ino, from, now.0),
+        }
+        .filter(|g| g.mode >= mode)
+        .map(|g| g.id);
         if let Some(target) = target {
             // A renewal moves the end of the window a peer honours, so the
             // restart horizon moves with it, persisted before the answer as
