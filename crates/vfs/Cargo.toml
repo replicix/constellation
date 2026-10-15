@@ -14,6 +14,9 @@ constellation-types.workspace = true
 constellation-platform.workspace = true
 bytes.workspace = true
 smallvec = "1.15"
+# Only `Handle::try_current`/`block_on`, for the debug assertion that an op
+# does not start on a runtime thread (`OpCtx::new`, plan 31 §6.4).
+tokio = { version = "1", default-features = false, features = ["rt"] }
 tracing.workspace = true
 
 [features]
@@ -30,4 +33,5 @@ conformance = ["mock"]
 
 [dev-dependencies]
 proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }

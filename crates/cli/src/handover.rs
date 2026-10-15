@@ -78,8 +78,9 @@
 //! - **Lock waits and cluster locks** refuse the upgrade (step 1, and again
 //!   on the session thread once it stopped, for a wait that began in
 //!   between). A blocking `F_SETLKW`/`flock` has read its request and must
-//!   answer it on the same descriptor from this process; fuser 0.18 cannot
-//!   interrupt it, and draining it could take forever. A granted cluster
+//!   answer it on the same descriptor from this process; only its caller's
+//!   signal interrupts it (the upgrade has none to send), and draining it
+//!   could take forever. A granted cluster
 //!   lock lives in this node's memory and its grant, neither of which
 //!   survives the node's restart. Retry once they are released. (Under
 //!   `--locks local` the kernel holds every lock: nothing to refuse.)

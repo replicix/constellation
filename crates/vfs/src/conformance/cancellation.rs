@@ -3,15 +3,16 @@
 //! deadline) leaves nothing behind.
 //!
 //! The waiting op in the contract today is a blocking lock
-//! (`lock_acquire` with `sleep`). The token exists for NFS, WinFsp and
-//! control-client cancellation and for tests; **Linux FUSE sets it only
-//! for the `fsync` family, and only for a dying caller** (plan 39 §3.3): a
-//! blocked `F_SETLKW`/`flock` on a Linux
-//! mount still returns only once granted, Ctrl-C or not (plan 31 §6.3's
-//! gap, carried forward). A target
-//! declares whether its waits honour the token
-//! ([`super::Declared::cancellable_waits`]); one that does not skips this
-//! group naming the gap.
+//! (`lock_acquire` with `sleep`), which must end `Code::Intr` on the
+//! op's [`CancelToken`] and `Code::TimedOut` at its deadline. The token
+//! exists for NFS, WinFsp and control-client cancellation and for tests;
+//! **Linux FUSE sets it for a blocked `F_SETLKW`/`flock` on any signal**
+//! (interruptible, as POSIX has it) **and, for a dying caller only
+//! (killable), for `fsync`/`fsyncdir`, `O_SYNC`/`O_DSYNC` writes and
+//! `copy_file_range`** (plan 39 §3.3; `constellation-frontend-fuse`'s
+//! adapter module doc). A target declares whether its waits honour the
+//! token ([`super::Declared::cancellable_waits`]); one that does not
+//! skips this group naming the gap.
 
 use super::{must, refused, skip, Client, Env, Fx, TestResult};
 use crate::ctx::{CancelToken, OpKind};
@@ -19,8 +20,8 @@ use crate::types::{Fh, Ino, LockKind, LockOwner, LockRange};
 use constellation_types::Code;
 use std::time::{Duration, Instant};
 
-const GAP: &str = "the target does not honour CancelToken on waits (declared); a Linux FUSE \
-                   frontend sets one only for the fsync family (plan 39 §3.3), not for lock waits (plan 31 §6.3)";
+const GAP: &str =
+    "the target does not honour CancelToken and the deadline on lock waits (declared)";
 
 fn range() -> LockRange {
     LockRange {

@@ -231,7 +231,8 @@ impl CancelToken {
 /// Threading contract (plan 31 §6.4): an op may be called from any thread
 /// that is not a tokio runtime worker — the engine parks the calling
 /// thread on its bounded waits (and its `Runtime::block_on` refuses a
-/// runtime thread outright). Frontends own their dispatch threads.
+/// runtime thread outright); debug builds assert it when the context is
+/// made. Frontends own their dispatch threads.
 pub struct OpCtx<'a> {
     pub op: OpId,
     pub kind: OpKind,
@@ -249,9 +250,49 @@ pub struct OpCtx<'a> {
 
 static NO_SPAN: LazyLock<tracing::Span> = LazyLock::new(tracing::Span::none);
 
+/// Plan 31 §6.4, debug builds only: an op may be started from any thread
+/// that is not driving async tasks (a tokio worker, or the thread inside
+/// a `Runtime::block_on`), because the engine parks the calling thread on
+/// its bounded waits (the sync-handle barriers, a cold chunk fetch it has
+/// not deferred) and a parked worker stalls every task scheduled on it,
+/// including the one that would end the wait. A plain thread, a
+/// `spawn_blocking` thread (what the control protocol's browser runs on)
+/// and a worker inside `block_in_place` are all fine.
+///
+/// `Handle::try_current` cannot tell these apart (it succeeds on all of
+/// them), and tokio exposes no "am I a worker" query. What it does is
+/// refuse, with a panic, a `Handle::block_on` from a thread that is
+/// driving tasks — the very condition the contract is about, and the one
+/// the engine's own `block_on`s trip over later and less legibly. So the
+/// probe is a `block_on` of a future that is ready, caught: free of side
+/// effects, and the panic it catches is tokio's, printed by the panic
+/// hook just before this one. (A `-C panic=abort` debug build would abort
+/// on the probe instead of catching it; release builds have no probe.)
+#[inline]
+pub(crate) fn assert_off_runtime_worker(kind: OpKind) {
+    #[cfg(debug_assertions)]
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        let driving_tasks =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(async {})))
+                .is_err();
+        assert!(
+            !driving_tasks,
+            "a `{}` op was started on a tokio runtime thread that is driving async tasks: \
+             Vfs ops park the calling thread (plan 31 §6.4); run it on a plain or \
+             `spawn_blocking` thread, or inside `block_in_place`",
+            kind.name()
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = kind;
+}
+
 impl<'a> OpCtx<'a> {
     /// A fresh op: a new [`OpId`], no deadline, no cancellation, no span.
+    ///
+    /// Debug builds assert the threading contract ([`assert_off_runtime_worker`]).
     pub fn new(kind: OpKind, caller: &'a Caller) -> Self {
+        assert_off_runtime_worker(kind);
         Self {
             op: OpId::next(),
             kind,
@@ -312,6 +353,47 @@ mod tests {
         let none = Caller::new(1000, 100, None);
         assert!(none.in_group(100));
         assert!(!none.in_group(7));
+    }
+
+    /// Plan 31 §6.4: a context made on a thread that drives async tasks —
+    /// a worker of a multi-thread runtime, or the thread inside
+    /// `block_on` — is refused in debug builds; a plain thread, a
+    /// `spawn_blocking` thread and a worker inside `block_in_place` are
+    /// not.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_context_is_refused_on_a_runtime_thread_that_drives_tasks() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let made = || {
+            let caller = Caller::root();
+            catch_unwind(AssertUnwindSafe(|| {
+                OpCtx::new(OpKind::Getattr, &caller);
+            }))
+            .is_ok()
+        };
+        assert!(made(), "a plain thread");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        // Entered but not driving anything: fine.
+        {
+            let _enter = rt.enter();
+            assert!(made(), "a thread that only entered the runtime");
+        }
+        let (worker, blocking, in_place, driver) = rt.block_on(async {
+            let worker = tokio::spawn(async move { made() }).await.unwrap();
+            let blocking = tokio::task::spawn_blocking(made).await.unwrap();
+            let in_place = tokio::spawn(async move { tokio::task::block_in_place(made) })
+                .await
+                .unwrap();
+            // The thread inside `block_on` drives the future too.
+            (worker, blocking, in_place, made())
+        });
+        assert!(!worker, "a worker thread running a task");
+        assert!(blocking, "a spawn_blocking thread");
+        assert!(in_place, "a worker inside block_in_place");
+        assert!(!driver, "the thread inside block_on");
     }
 
     #[test]

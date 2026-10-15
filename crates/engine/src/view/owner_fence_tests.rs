@@ -539,6 +539,106 @@ fn a_cancelled_blocking_lock_wait_answers_intr_and_holds_nothing() {
     wait(&constellation_vfs::CancelToken::new()).unwrap();
 }
 
+/// A blocked lock wait past its op's deadline answers `TimedOut` and
+/// holds nothing, as a cancelled one answers `Intr`; the conformance
+/// kit's `cancellation` group asserts the same through `Vfs`
+/// (`a_timed_out_wait_leaves_no_waiter_behind`).
+#[test]
+fn a_blocking_lock_wait_past_its_deadline_answers_timed_out_and_holds_nothing() {
+    let f = fenced_fs();
+    let me = std::process::id();
+    let root = Caller::root();
+    let (file, _) = f.create(&root, ROOT_INO, "contended").unwrap();
+    let ino = file.attr.ino;
+    f.lock(ino, me, now_unix_ms() + 60_000);
+    let waiter = Caller::new(0, 0, Some(me));
+    let wait = |within: std::time::Duration| {
+        let started = std::time::Instant::now();
+        let result = Blocking::run(|r| {
+            f.fs.lock_acquire(
+                &OpCtx::new(OpKind::LockAcquire, &waiter).with_deadline(started + within),
+                ino,
+                Fh(ino),
+                LockSpec {
+                    owner: LockOwner(TURN_OWNER + 1),
+                    range: LockRange { start: 0, end: 10 },
+                    kind: LockKind::Write,
+                    pid: me,
+                },
+                true,
+                r,
+            )
+        });
+        (code(result), started.elapsed())
+    };
+    let (refused, took) = wait(std::time::Duration::from_millis(200));
+    assert_eq!(refused, Code::TimedOut);
+    assert!(
+        took >= std::time::Duration::from_millis(200) && took < std::time::Duration::from_secs(5),
+        "ended after {took:?}"
+    );
+    let held = f.meta.locks().local_locks(ino);
+    assert_eq!(held.len(), 1, "only the holder's lock: {held:?}");
+    assert_eq!(held[0].owner, TURN_OWNER);
+    // Past its deadline already when it would have to wait: at once.
+    assert_eq!(wait(std::time::Duration::ZERO).0, Code::TimedOut);
+    // Released, the next wait is granted.
+    f.unlock(&root, ino).unwrap();
+    let granted = Blocking::run(|r| {
+        f.fs.lock_acquire(
+            &OpCtx::new(OpKind::LockAcquire, &waiter),
+            ino,
+            Fh(ino),
+            LockSpec {
+                owner: LockOwner(TURN_OWNER + 1),
+                range: LockRange { start: 0, end: 10 },
+                kind: LockKind::Write,
+                pid: me,
+            },
+            true,
+            r,
+        )
+    });
+    granted.unwrap();
+}
+
+/// A deadline ends a blocking lock wait, never a non-blocking request:
+/// that one is granted, or refused, or (here) goes on to ask the sequencer
+/// — whose channel is closed in this fixture, so it answers `Io`, where a
+/// deadline that applied to it would have answered `TimedOut` first.
+#[test]
+fn a_deadline_times_out_a_blocking_lock_request_and_never_a_non_blocking_one() {
+    let f = fenced_fs();
+    let root = Caller::root();
+    let (file, _) = f.create(&root, ROOT_INO, "ungranted").unwrap();
+    let ino = file.attr.ino;
+    let (tx, closed) = tokio::sync::mpsc::unbounded_channel();
+    drop(closed);
+    let locks = Arc::new(crate::locks::ClusterLocks {
+        meta: f.meta.clone(),
+        tx,
+        inval: None,
+        lineage: Default::default(),
+    });
+    let lock = || constellation_meta::locks::LocalLock {
+        owner: TURN_OWNER + 2,
+        pid: std::process::id(),
+        pid_start: 0,
+        write: true,
+        start: 0,
+        end: 10,
+    };
+    let past = std::time::Instant::now();
+    assert_eq!(
+        locks.lock_here(ino, lock(), true, None, Some(past)),
+        Err(Code::TimedOut)
+    );
+    assert_eq!(
+        locks.lock_here(ino, lock(), false, None, Some(past)),
+        Err(Code::Io)
+    );
+}
+
 // ---- plan 30 §M14 phase 2: the fencing token ----
 
 /// The owner's mutations carry the grant its lock is under (the token:

@@ -20,9 +20,9 @@ use constellation_control::proto::types::{FileStat, WriteResult, XattrOp, XattrR
 use constellation_control::proto::{ControlError, ErrorKind};
 use constellation_types::Code;
 use constellation_vfs::{
-    Attr, Blocking, Caller, CollectDir, Durability, Entry, Fh, FileKind, LockOwner, Name, OpCtx,
-    OpKind, OpenFlags, OpenOwner, RenameFlags, SetAttr, SetXattrFlags, Vfs, VfsError, XattrName,
-    ROOT_INO,
+    Attr, Blocking, Caller, CollectDir, Durability, Entry, Fh, FileKind, LockOwner, Name, Observer,
+    OpCtx, OpKind, OpenFlags, OpenOwner, RenameFlags, SetAttr, SetXattrFlags, Timed, Vfs, VfsError,
+    VfsResult, XattrName, NO_TRANSPORT, ROOT_INO,
 };
 use std::sync::Arc;
 
@@ -33,7 +33,13 @@ const READ_SLICE: u32 = 1024 * 1024;
 pub struct ControlVfs {
     view: Arc<View>,
     caller: Caller,
+    /// Counts and times every op into the unified op metrics, as the FUSE
+    /// session's does (plan 31 §6.10): `frontend="control"`.
+    obs: Observer,
 }
+
+/// The `frontend` label of the browser's ops in `constellation_vfs_ops_total`.
+pub const FRONTEND: &str = "control";
 
 fn vfs_err(path: &str, e: VfsError) -> ControlError {
     let code: Code = e.code();
@@ -58,17 +64,29 @@ fn kind_name(kind: FileKind) -> String {
 
 impl ControlVfs {
     pub fn new(view: Arc<View>, caller: Caller) -> ControlVfs {
-        ControlVfs { view, caller }
+        let obs = Observer::new(FRONTEND, &view.identity(), NO_TRANSPORT);
+        ControlVfs { view, caller, obs }
     }
 
-    fn cx(&self, kind: OpKind) -> OpCtx<'_> {
-        OpCtx::new(kind, &self.caller)
+    /// One op of `kind` on `ino`, the way a frontend session runs it
+    /// ([`Observer::begin`]): an id and a `vfs.op` span for the engine call
+    /// to nest under, and its count and latency recorded when the view
+    /// answers. The responder blocks this (blocking-pool) thread for the
+    /// answer.
+    fn op<T: Send + 'static>(
+        &self,
+        kind: OpKind,
+        ino: u64,
+        call: impl FnOnce(&OpCtx<'_>, Timed<Blocking<T>>),
+    ) -> VfsResult<T> {
+        let op = self.obs.begin(kind, ino);
+        let _in = op.enter();
+        Blocking::run(|r| call(&op.ctx(&self.caller), op.responder(r)))
     }
 
     fn lookup(&self, parent: u64, name: &str, path: &str) -> Result<Entry, ControlError> {
-        Blocking::run(|r| {
-            self.view
-                .lookup(&self.cx(OpKind::Lookup), parent, Name::new(name), r)
+        self.op(OpKind::Lookup, parent, |cx, r| {
+            self.view.lookup(cx, parent, Name::new(name), r)
         })
         .map_err(|e| vfs_err(path, e))
     }
@@ -96,8 +114,10 @@ impl ControlVfs {
     }
 
     fn getattr(&self, ino: u64, path: &str) -> Result<Attr, ControlError> {
-        Blocking::run(|r| self.view.getattr(&self.cx(OpKind::Getattr), ino, None, r))
-            .map_err(|e| vfs_err(path, e))
+        self.op(OpKind::Getattr, ino, |cx, r| {
+            self.view.getattr(cx, ino, None, r)
+        })
+        .map_err(|e| vfs_err(path, e))
     }
 
     fn file_stat(path: &str, a: &Attr) -> FileStat {
@@ -136,14 +156,15 @@ impl ControlVfs {
         let result = f(fh);
         let owner = LockOwner(0);
         let flushed = if flags.contains(OpenFlags::WRITE) {
-            Blocking::run(|r| self.view.flush(&self.cx(OpKind::Flush), ino, fh, owner, r))
-                .map_err(|e| vfs_err(path, e))
+            self.op(OpKind::Flush, ino, |cx, r| {
+                self.view.flush(cx, ino, fh, owner, r)
+            })
+            .map_err(|e| vfs_err(path, e))
         } else {
             Ok(())
         };
-        let _ = Blocking::run(|r| {
-            self.view
-                .release(&self.cx(OpKind::Release), ino, fh, flags, None, r)
+        let _ = self.op(OpKind::Release, ino, |cx, r| {
+            self.view.release(cx, ino, fh, flags, None, r)
         });
         let value = result?;
         flushed?;
@@ -162,11 +183,11 @@ impl ControlVfs {
     ) -> Result<u64, ControlError> {
         let ino = self.resolve(path)?;
         let flags = OpenFlags::READ;
-        let opened = Blocking::run(|r| {
-            self.view
-                .open(&self.cx(OpKind::Open), ino, flags, OpenOwner::NONE, r)
-        })
-        .map_err(|e| vfs_err(path, e))?;
+        let opened = self
+            .op(OpKind::Open, ino, |cx, r| {
+                self.view.open(cx, ino, flags, OpenOwner::NONE, r)
+            })
+            .map_err(|e| vfs_err(path, e))?;
         self.with_handle(ino, opened.fh, flags, path, |fh| {
             let mut off = offset;
             let end = len.map(|l| offset.saturating_add(l));
@@ -177,11 +198,11 @@ impl ControlVfs {
                     Some(end) => (end - off).min(READ_SLICE as u64) as u32,
                     None => READ_SLICE,
                 };
-                let data = Blocking::run(|r| {
-                    self.view
-                        .read(&self.cx(OpKind::Read), ino, fh, off, want, r)
-                })
-                .map_err(|e| vfs_err(path, e))?;
+                let data = self
+                    .op(OpKind::Read, ino, |cx, r| {
+                        self.view.read(cx, ino, fh, off, want, r)
+                    })
+                    .map_err(|e| vfs_err(path, e))?;
                 if data.is_empty() {
                     break;
                 }
@@ -219,27 +240,28 @@ impl ControlVfs {
         };
         let (ino, fh) = match existing {
             Some(ino) => {
-                let opened = Blocking::run(|r| {
-                    self.view
-                        .open(&self.cx(OpKind::Open), ino, flags, OpenOwner::NONE, r)
-                })
-                .map_err(|e| vfs_err(path, e))?;
+                let opened = self
+                    .op(OpKind::Open, ino, |cx, r| {
+                        self.view.open(cx, ino, flags, OpenOwner::NONE, r)
+                    })
+                    .map_err(|e| vfs_err(path, e))?;
                 (ino, opened.fh)
             }
             None => {
                 let mode = constellation_vfs::types::mode::S_IFREG | create_mode.unwrap_or(0o644);
-                let (entry, opened) = Blocking::run(|r| {
-                    self.view.create(
-                        &self.cx(OpKind::Create),
-                        parent,
-                        Name::new(name),
-                        mode,
-                        flags | OpenFlags::CREATE,
-                        OpenOwner::NONE,
-                        r,
-                    )
-                })
-                .map_err(|e| vfs_err(path, e))?;
+                let (entry, opened) = self
+                    .op(OpKind::Create, parent, |cx, r| {
+                        self.view.create(
+                            cx,
+                            parent,
+                            Name::new(name),
+                            mode,
+                            flags | OpenFlags::CREATE,
+                            OpenOwner::NONE,
+                            r,
+                        )
+                    })
+                    .map_err(|e| vfs_err(path, e))?;
                 (entry.attr.ino, opened.fh)
             }
         };
@@ -248,18 +270,19 @@ impl ControlVfs {
             while (written as usize) < data.len() {
                 let rest = &data[written as usize..];
                 let slice = &rest[..rest.len().min(READ_SLICE as usize)];
-                let n = Blocking::run(|r| {
-                    self.view.write(
-                        &self.cx(OpKind::Write),
-                        ino,
-                        fh,
-                        offset + written,
-                        constellation_vfs::WriteData::Borrowed(slice),
-                        flags,
-                        r,
-                    )
-                })
-                .map_err(|e| vfs_err(path, e))?;
+                let n = self
+                    .op(OpKind::Write, ino, |cx, r| {
+                        self.view.write(
+                            cx,
+                            ino,
+                            fh,
+                            offset + written,
+                            constellation_vfs::WriteData::Borrowed(slice),
+                            flags,
+                            r,
+                        )
+                    })
+                    .map_err(|e| vfs_err(path, e))?;
                 if n == 0 {
                     return Err(ControlError::failed(format!("{path}: short write")));
                 }
@@ -270,15 +293,13 @@ impl ControlVfs {
                     size: Some(offset + written),
                     ..SetAttr::default()
                 };
-                Blocking::run(|r| {
-                    self.view
-                        .setattr(&self.cx(OpKind::Setattr), ino, Some(fh), &set, r)
+                self.op(OpKind::Setattr, ino, |cx, r| {
+                    self.view.setattr(cx, ino, Some(fh), &set, r)
                 })
                 .map_err(|e| vfs_err(path, e))?;
             }
-            Blocking::run(|r| {
-                self.view
-                    .fsync(&self.cx(OpKind::Fsync), ino, fh, Durability::Configured, r)
+            self.op(OpKind::Fsync, ino, |cx, r| {
+                self.view.fsync(cx, ino, fh, Durability::Configured, r)
             })
             .map_err(|e| vfs_err(path, e))?;
             Ok(written)
@@ -314,11 +335,11 @@ impl ControlVfs {
                 Ok(entry) if !last => ino = entry.attr.ino,
                 Ok(_) => return Err(ControlError::from(Code::Exists)),
                 Err(e) if e.code == Some(Code::NotFound) && (last || parents) => {
-                    let entry = Blocking::run(|r| {
-                        self.view
-                            .mkdir(&self.cx(OpKind::Mkdir), ino, Name::new(part), mode, r)
-                    })
-                    .map_err(|e| vfs_err(path, e))?;
+                    let entry = self
+                        .op(OpKind::Mkdir, ino, |cx, r| {
+                            self.view.mkdir(cx, ino, Name::new(part), mode, r)
+                        })
+                        .map_err(|e| vfs_err(path, e))?;
                     if last {
                         return Ok(Self::file_stat(path, &entry.attr));
                     }
@@ -339,16 +360,9 @@ impl ControlVfs {
         } else {
             RenameFlags::NOREPLACE
         };
-        Blocking::run(|r| {
-            self.view.rename(
-                &self.cx(OpKind::Rename),
-                p1,
-                Name::new(n1),
-                p2,
-                Name::new(n2),
-                flags,
-                r,
-            )
+        self.op(OpKind::Rename, p1, |cx, r| {
+            self.view
+                .rename(cx, p1, Name::new(n1), p2, Name::new(n2), flags, r)
         })
         .map_err(|e| vfs_err(from, e))
     }
@@ -358,8 +372,16 @@ impl ControlVfs {
         let mut cookie = 0;
         loop {
             let (sink, wait) = CollectDir::pair(512);
-            self.view
-                .readdir(&self.cx(OpKind::Readdir), ino, Fh(0), cookie, false, sink);
+            let op = self.obs.begin(OpKind::Readdir, ino);
+            let _in = op.enter();
+            self.view.readdir(
+                &op.ctx(&self.caller),
+                ino,
+                Fh(0),
+                cookie,
+                false,
+                op.responder(sink),
+            );
             let batch = wait.wait().map_err(|e| vfs_err(path, e))?;
             if batch.is_empty() {
                 return Ok(out);
@@ -389,15 +411,13 @@ impl ControlVfs {
                     self.delete_in(entry.attr.ino, &child, &child_path, true)?;
                 }
             }
-            Blocking::run(|r| {
-                self.view
-                    .rmdir(&self.cx(OpKind::Rmdir), parent, Name::new(name), r)
+            self.op(OpKind::Rmdir, parent, |cx, r| {
+                self.view.rmdir(cx, parent, Name::new(name), r)
             })
             .map_err(|e| vfs_err(path, e))
         } else {
-            Blocking::run(|r| {
-                self.view
-                    .unlink(&self.cx(OpKind::Unlink), parent, Name::new(name), r)
+            self.op(OpKind::Unlink, parent, |cx, r| {
+                self.view.unlink(cx, parent, Name::new(name), r)
             })
             .map_err(|e| vfs_err(path, e))
         }
@@ -415,26 +435,28 @@ impl ControlVfs {
         let mut out = XattrResult::default();
         match op {
             XattrOp::Get { name } => {
-                let value = Blocking::run(|r| {
-                    self.view
-                        .getxattr(&self.cx(OpKind::Getxattr), ino, XattrName::new(name), r)
-                })
-                .map_err(|e| vfs_err(path, e))?;
+                let value = self
+                    .op(OpKind::Getxattr, ino, |cx, r| {
+                        self.view.getxattr(cx, ino, XattrName::new(name), r)
+                    })
+                    .map_err(|e| vfs_err(path, e))?;
                 out.value = Some(value.into());
             }
             XattrOp::List => {
-                let names =
-                    Blocking::run(|r| self.view.listxattr(&self.cx(OpKind::Listxattr), ino, r))
-                        .map_err(|e| vfs_err(path, e))?;
+                let names = self
+                    .op(OpKind::Listxattr, ino, |cx, r| {
+                        self.view.listxattr(cx, ino, r)
+                    })
+                    .map_err(|e| vfs_err(path, e))?;
                 out.names = names
                     .iter()
                     .map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned())
                     .collect();
             }
             XattrOp::Set { name, value } => {
-                Blocking::run(|r| {
+                self.op(OpKind::Setxattr, ino, |cx, r| {
                     self.view.setxattr(
-                        &self.cx(OpKind::Setxattr),
+                        cx,
                         ino,
                         XattrName::new(name),
                         &value.0,
@@ -445,13 +467,8 @@ impl ControlVfs {
                 .map_err(|e| vfs_err(path, e))?;
             }
             XattrOp::Remove { name } => {
-                Blocking::run(|r| {
-                    self.view.removexattr(
-                        &self.cx(OpKind::Removexattr),
-                        ino,
-                        XattrName::new(name),
-                        r,
-                    )
+                self.op(OpKind::Removexattr, ino, |cx, r| {
+                    self.view.removexattr(cx, ino, XattrName::new(name), r)
                 })
                 .map_err(|e| vfs_err(path, e))?;
             }
@@ -484,11 +501,11 @@ impl ControlVfs {
             ));
         }
         let Some(value) = value else {
-            return Blocking::run(|r| {
-                self.view
-                    .removexattr(&self.cx(OpKind::Removexattr), ino, XattrName::new(name), r)
-            })
-            .map_err(|e| vfs_err(path, e));
+            return self
+                .op(OpKind::Removexattr, ino, |cx, r| {
+                    self.view.removexattr(cx, ino, XattrName::new(name), r)
+                })
+                .map_err(|e| vfs_err(path, e));
         };
         if let Err(refusal) = self.view.snapshot_policy_gate(ino, value.as_bytes()) {
             return Err(match refusal.reason {
@@ -502,9 +519,9 @@ impl ControlVfs {
                     .with_details(serde_json::json!({ "path": path })),
             });
         }
-        Blocking::run(|r| {
+        self.op(OpKind::Setxattr, ino, |cx, r| {
             self.view.setxattr(
-                &self.cx(OpKind::Setxattr),
+                cx,
                 ino,
                 XattrName::new(name),
                 value.as_bytes(),
@@ -518,18 +535,17 @@ impl ControlVfs {
     /// `statfs` of the view's root and its recursive size/count (the
     /// virtual `user.constellation.{rsize,rcount}` xattrs): `view.stats`.
     pub fn stats(&self) -> Result<(constellation_vfs::StatFs, u64, u64), ControlError> {
-        let fs = Blocking::run(|r| self.view.statfs(&self.cx(OpKind::Statfs), ROOT_INO, r))
-            .map_err(|e| vfs_err("/", e))?;
-        let number = |name: &str| -> Result<u64, ControlError> {
-            let raw = Blocking::run(|r| {
-                self.view.getxattr(
-                    &self.cx(OpKind::Getxattr),
-                    ROOT_INO,
-                    XattrName::new(name),
-                    r,
-                )
+        let fs = self
+            .op(OpKind::Statfs, ROOT_INO, |cx, r| {
+                self.view.statfs(cx, ROOT_INO, r)
             })
             .map_err(|e| vfs_err("/", e))?;
+        let number = |name: &str| -> Result<u64, ControlError> {
+            let raw = self
+                .op(OpKind::Getxattr, ROOT_INO, |cx, r| {
+                    self.view.getxattr(cx, ROOT_INO, XattrName::new(name), r)
+                })
+                .map_err(|e| vfs_err("/", e))?;
             String::from_utf8_lossy(&raw)
                 .trim()
                 .parse()

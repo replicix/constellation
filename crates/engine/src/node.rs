@@ -2020,6 +2020,20 @@ impl Engine {
         views
     }
 
+    /// Wait until every cache invalidation queued so far has been
+    /// delivered to the views' [`FrontendEvents`] (or dropped as
+    /// redundant): `true` then, `false` if `timeout` ran out first (see
+    /// `KernelInvalidator::wait_idle`). Immediately `true` with
+    /// invalidation off (`CONSTELLATION_KERNEL_INVALIDATE=0`). The
+    /// invalidations a foreign apply produces are queued before the apply
+    /// returns, so this is the barrier after one (the conformance kit's
+    /// `settle`).
+    pub fn wait_invalidations_delivered(&self, timeout: Duration) -> bool {
+        self.kernel_inval
+            .as_ref()
+            .is_none_or(|k| k.wait_idle(timeout))
+    }
+
     /// Invalidate every open view's cached quota cap after a live
     /// `SetQuota`. Quota is node-level, but each view keeps its own
     /// short-TTL read of it (`QUOTA_CACHE_TTL`), which a single-view

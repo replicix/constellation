@@ -49,11 +49,14 @@
 //!   behind ([`close_wait`]).
 //!
 //! A blocked lock wait ends with `EINTR` when the frontend cancels it (the
-//! FUSE adapter does on any signal, as POSIX has `F_SETLKW` do): checked
-//! between the polls of a wait on a conflicting lock of this node and
-//! before each request to the sequencer. A request the owner has parked
-//! (another node holds a conflicting grant) is not withdrawn: that wait
-//! still returns only once the grant comes.
+//! FUSE adapter does on any signal, as POSIX has `F_SETLKW` do), and with
+//! `ETIMEDOUT` when the op's deadline (`OpCtx::deadline`, set by a
+//! frontend that bounds its ops: none in the tree today, the conformance
+//! kit does) passes first:
+//! both are checked between the polls of a wait on a conflicting lock of
+//! this node and before each request to the sequencer. A request the
+//! owner has parked (another node holds a conflicting grant) is not
+//! withdrawn: that wait still returns only once the grant comes.
 //!
 //! Not supported: POSIX deadlock detection (`EDEADLK`) — two owners
 //! waiting on each other wait until a signal ends one wait, as they do
@@ -254,6 +257,35 @@ pub fn first_use_budget_ms(meta: &Meta) -> i64 {
 /// round trips that did not end in a lock (each one lost to a recall that
 /// overtook it: another node wants the file).
 const TRY_ROUNDS: u32 = 4;
+
+/// What ends a lock wait before the lock comes: the op's cancellation
+/// (`Intr`) and its deadline (`TimedOut`), both from its `OpCtx`. Checked
+/// where the wait loops, so a wait that the frontend gave up on holds
+/// nothing and leaves no waiter behind.
+#[derive(Clone, Copy)]
+struct Interrupt<'a> {
+    cancel: Option<&'a CancelToken>,
+    until: Option<std::time::Instant>,
+}
+
+impl Interrupt<'_> {
+    const NONE: Interrupt<'static> = Interrupt {
+        cancel: None,
+        until: None,
+    };
+
+    /// `Err` when the wait must end now. A cancellation wins over a
+    /// deadline that passed at the same time: the caller asked.
+    fn check(&self) -> Result<(), Code> {
+        if self.cancel.is_some_and(CancelToken::is_cancelled) {
+            Err(Code::Intr)
+        } else if self.until.is_some_and(|t| std::time::Instant::now() >= t) {
+            Err(Code::TimedOut)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// The FUSE side of cluster locks, shared by a view's FUSE threads and
 /// the threads that wait for `F_SETLKW`/`flock` (`None` in
@@ -529,7 +561,8 @@ impl ClusterLocks {
     /// CPU) and the release a waiter waits for may itself need it (the
     /// driver's `Action::LockFlush`), so waiters must never be able to
     /// fill it. `cancel` (the op's, set by the frontend on a signal) ends
-    /// the wait with `Intr` (see the module doc for what it reaches).
+    /// the wait with `Intr`, and `until` (the op's deadline) with
+    /// `TimedOut` (see the module doc for what they reach).
     ///
     /// `done` answers the request (the view's completes the op's
     /// responder), on this thread or on the waiter's.
@@ -539,12 +572,13 @@ impl ClusterLocks {
         lock: LocalLock,
         sleep: bool,
         cancel: Option<CancelToken>,
+        until: Option<std::time::Instant>,
         done: F,
     ) where
         F: FnOnce(Result<(), Code>) + Send + 'static,
     {
         if !sleep {
-            done(self.set(ino, lock, false, None, None));
+            done(self.set(ino, lock, false, Interrupt::NONE, None));
             return;
         }
         let this = self.clone();
@@ -558,7 +592,11 @@ impl ClusterLocks {
                 if let Some(op) = op {
                     op.adopt();
                 }
-                done(this.set(ino, lock, true, cancel.as_ref(), None))
+                let interrupt = Interrupt {
+                    cancel: cancel.as_ref(),
+                    until,
+                };
+                done(this.set(ino, lock, true, interrupt, None))
             });
         if let Err(error) = spawned {
             // The reply went with the closure; dropping it answers EIO.
@@ -575,8 +613,9 @@ impl ClusterLocks {
         lock: LocalLock,
         sleep: bool,
         cancel: Option<&CancelToken>,
+        until: Option<std::time::Instant>,
     ) -> Result<(), Code> {
-        self.set(ino, lock, sleep, cancel, None)
+        self.set(ino, lock, sleep, Interrupt { cancel, until }, None)
     }
 
     /// A non-blocking [`Self::lock_here`] that waits for an earlier turn's
@@ -592,7 +631,16 @@ impl ClusterLocks {
         deadline: std::time::Instant,
         cancel: Option<&CancelToken>,
     ) -> Result<(), Code> {
-        self.set(ino, lock, false, cancel, Some(deadline))
+        self.set(
+            ino,
+            lock,
+            false,
+            Interrupt {
+                cancel,
+                until: None,
+            },
+            Some(deadline),
+        )
     }
 
     /// `deadline`: how long a non-blocking request waits for an earlier
@@ -604,14 +652,25 @@ impl ClusterLocks {
         ino: Ino,
         mut lock: LocalLock,
         sleep: bool,
-        cancel: Option<&CancelToken>,
+        interrupt: Interrupt<'_>,
         deadline: Option<std::time::Instant>,
     ) -> Result<(), Code> {
         // FUSE names the locking *thread*; the owner fence (and `getlk`)
         // need its process, named across pid reuse.
         (lock.pid, lock.pid_start) = process_of(lock.pid);
+        // A non-blocking request never waits for the lock, so a deadline
+        // cannot time it out: it is refused (`Again`) or granted. The
+        // cancellation still ends one that is about to ask the sequencer.
+        let interrupt = if sleep {
+            interrupt
+        } else {
+            Interrupt {
+                until: None,
+                ..interrupt
+            }
+        };
         let mut asked = false;
-        let r = self.set_inner(ino, lock, sleep, cancel, deadline, &mut asked);
+        let r = self.set_inner(ino, lock, sleep, interrupt, deadline, &mut asked);
         if r.is_err() && asked {
             // A grant may have come for this request (or its answer was
             // lost after the core installed it) that it will now never
@@ -630,11 +689,10 @@ impl ClusterLocks {
         ino: Ino,
         lock: LocalLock,
         sleep: bool,
-        cancel: Option<&CancelToken>,
+        interrupt: Interrupt<'_>,
         mut deadline: Option<std::time::Instant>,
         asked: &mut bool,
     ) -> Result<(), Code> {
-        let cancelled = || cancel.is_some_and(CancelToken::is_cancelled);
         let mut rounds = 0u32;
         let mut predecessor_counted = false;
         loop {
@@ -673,18 +731,14 @@ impl ClusterLocks {
                         }
                         return Err(Code::Again);
                     }
-                    if cancelled() {
-                        return Err(Code::Intr);
-                    }
+                    interrupt.check()?;
                     std::thread::sleep(LOCAL_POLL);
                 }
                 LocalOutcome::NeedGrant(mode) => {
                     if !sleep && rounds >= TRY_ROUNDS {
                         return Err(Code::Again);
                     }
-                    if cancelled() {
-                        return Err(Code::Intr);
-                    }
+                    interrupt.check()?;
                     if rounds >= 2 {
                         // A grant that keeps being overtaken by recalls:
                         // back off a little instead of spinning on the

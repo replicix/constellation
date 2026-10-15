@@ -137,6 +137,7 @@ impl<'o> ObservedOp<'o> {
     /// The op's context: its id, kind and span, and who asks.
     #[inline]
     pub fn ctx<'a>(&'a self, caller: &'a Caller) -> OpCtx<'a> {
+        crate::ctx::assert_off_runtime_worker(self.kind);
         OpCtx {
             op: self.id,
             kind: self.kind,

@@ -59,12 +59,14 @@
 //! - Permission bits: the kernel checks modes above the trait.
 //! - Timing and durability levels beyond "every level succeeds or is
 //!   `NotSupported`, and the data is there afterwards".
-//! - **Cancellation on Linux FUSE.** The adapter wires `FUSE_INTERRUPT`
-//!   to the `fsync` family only (plan 39 §3.3), so a lock wait's `CancelToken` is
-//!   never set by the kernel (plan 31 §6.3's known gap). The `cancellation`
-//!   group tests the token where a target says its waits honour it
-//!   ([`Declared::cancellable_waits`]) and skips, naming the gap, where it
-//!   does not.
+//! - **The kernel's side of cancellation.** The Linux FUSE adapter sets a
+//!   `CancelToken` from `FUSE_INTERRUPT` (a blocked lock wait on any
+//!   signal; `fsync`, `O_SYNC` writes and `copy_file_range` for a dying
+//!   caller: plan 39 §3.3), which needs a kernel and a signal. The
+//!   `cancellation` group tests what the engine does with a token once it
+//!   is set, where a target says its waits honour it
+//!   ([`Declared::cancellable_waits`]), and skips, naming the gap, where
+//!   it does not.
 
 mod cancellation;
 mod client;
@@ -132,9 +134,10 @@ pub struct Declared {
     /// plan 31 C4 follow-ups); a target that does not declares `false` and
     /// the rename-flag tests skip, naming `rename-flags`.
     pub rename_flags: bool,
-    /// A `CancelToken` set on a waiting op makes it complete `Code::Intr`
-    /// (see the module doc: never true for a Linux FUSE *mount*, which no
-    /// kernel interrupt reaches; a `Vfs` driven directly may).
+    /// A `CancelToken` set on a waiting op (a blocking lock) makes it
+    /// complete `Code::Intr`, and a deadline that passes `Code::TimedOut`
+    /// (see the module doc: what sets the token on a Linux FUSE mount is
+    /// the adapter's, not the target's).
     pub cancellable_waits: bool,
 }
 

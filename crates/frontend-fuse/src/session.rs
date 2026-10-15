@@ -27,8 +27,8 @@
 //!    nothing is quiesced, and the session goes on serving.
 //! 2. **Refuse early** while a request waits for a deferred reply (a
 //!    blocking lock wait: its reply must be written on the descriptor it
-//!    was read from, by a process that still serves it; fuser 0.18 cannot
-//!    interrupt the wait).
+//!    was read from, by a process that still serves it; only its caller's signal
+//!    interrupts the wait, and the upgrade cannot send one).
 //! 3. **Close the notification gate** (`notify`'s module doc) while the
 //!    session still serves, and wait — bounded — for the notification
 //!    writes under way. From here the engine's invalidations are dropped.

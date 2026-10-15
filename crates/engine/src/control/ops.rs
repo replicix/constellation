@@ -568,6 +568,101 @@ pub(super) mod tests {
         assert!(sample.counters["constellation_vfs_ops_refused_total"] >= 2);
     }
 
+    /// Plan 31 C7a: the control protocol's file browser is a frontend of
+    /// the view like the FUSE session, so its ops are counted and timed
+    /// the same way — `frontend="control"` in `/metrics` and in
+    /// `node.status`'s `vfs_ops` — not only seen by the watchdog. Each
+    /// browse call's ops are the ones the view ran for it, by outcome.
+    #[test]
+    fn browse_ops_are_counted_like_a_mounts() {
+        use crate::control::browse::{ControlVfs, FRONTEND};
+        let f = fixture(&[&[("pv", "pv-browse")]]);
+        let view = f.views[0].clone();
+        let browser = ControlVfs::new(view, Caller::root());
+        browser.mkdir("/d", None, false).unwrap();
+        browser.stat("/d").unwrap();
+        assert_eq!(
+            browser.stat("/absent").unwrap_err().code,
+            Some(Code::NotFound)
+        );
+        browser
+            .write("/d/f", 0, b"hello", true, None, false)
+            .unwrap();
+        let mut got = Vec::new();
+        browser
+            .read("/d/f", 0, None, |bytes| {
+                got.extend_from_slice(&bytes);
+                true
+            })
+            .unwrap();
+        assert_eq!(got, b"hello");
+
+        // Per call: `mkdir` looks `/d` up (absent); `stat /d` looks it up
+        // and gets its attributes; `stat /absent` misses; `write` looks
+        // up `/d` and `f` (absent), creates, writes, fsyncs, flushes and
+        // releases, then gets the attributes; `read` looks up both,
+        // opens, reads the data and the end of the file, and releases.
+        let status = f.svc.status();
+        let series: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
+            status
+                .vfs_ops
+                .series
+                .iter()
+                .filter(|s| s.frontend == FRONTEND && s.view.as_deref() == Some("pv-browse"))
+                .map(|s| (s.op.clone(), s.outcomes.clone()))
+                .collect();
+        let count = |op: &str, outcome: &str| {
+            series
+                .get(op)
+                .and_then(|o| o.get(outcome))
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(count("mkdir", "ok"), 1, "{series:?}");
+        assert_eq!(count("lookup", "NotFound"), 3, "{series:?}");
+        assert_eq!(count("lookup", "ok"), 4, "{series:?}");
+        assert_eq!(count("create", "ok"), 1, "{series:?}");
+        assert_eq!(count("open", "ok"), 1, "{series:?}");
+        assert_eq!(count("getattr", "ok"), 2, "{series:?}");
+        assert_eq!(count("flush", "ok"), 1, "{series:?}");
+        assert_eq!(count("write", "ok"), 1, "{series:?}");
+        assert_eq!(count("fsync", "ok"), 1, "{series:?}");
+        assert_eq!(
+            count("read", "ok"),
+            2,
+            "the data, then end of file: {series:?}"
+        );
+        assert_eq!(count("release", "ok"), 2, "{series:?}");
+
+        let app = web::app(Arc::new(router(&f.svc)));
+        let body = f.rt.block_on(async {
+            let request = axum::http::Request::builder()
+                .uri("/metrics")
+                .header("host", "127.0.0.1")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 << 20)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        });
+        let labels = r#"frontend="control",view="pv-browse""#;
+        for line in [
+            format!(
+                r#"constellation_vfs_ops_total{{{labels},op="mkdir",transport="n/a",outcome="ok"}} 1"#
+            ),
+            format!(
+                r#"constellation_vfs_ops_total{{{labels},op="lookup",transport="n/a",outcome="NotFound"}} 3"#
+            ),
+            format!(
+                r#"constellation_vfs_op_seconds_count{{{labels},op="lookup",transport="n/a"}} 7"#
+            ),
+        ] {
+            assert!(body.lines().any(|l| l == line), "{line}\n{body}");
+        }
+    }
+
     /// The chunk memory cache reports in `node.status`'s cache section,
     /// on `/metrics`, and in `stats.subscribe`'s samples.
     #[test]

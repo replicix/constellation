@@ -225,6 +225,10 @@ struct State {
     /// requests in flight: an `InFlightGuard` that brings a count to zero
     /// wakes it.
     gated: bool,
+    /// Everything queued so far has been sent or dropped: the thread has
+    /// seen an empty queue and nothing pending ([`KernelInvalidator::
+    /// wait_idle`]). Cleared by every [`Shared::push`].
+    idle: bool,
 }
 
 /// Counters, for the log and the tests.
@@ -238,6 +242,8 @@ pub struct Stats {
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
+    /// Signalled when [`State::idle`] becomes true.
+    idle: Condvar,
     /// The notification being written to the kernel right now, and since
     /// when (the watchdog's view).
     busy: Mutex<Option<(Instant, Inval)>>,
@@ -248,7 +254,10 @@ struct Shared {
 
 impl Shared {
     fn push(&self, msg: Msg) {
-        self.state.lock().unwrap().queue.push(msg);
+        let mut st = self.state.lock().unwrap();
+        st.queue.push(msg);
+        st.idle = false;
+        drop(st);
         self.wake.notify_one();
     }
 
@@ -314,8 +323,10 @@ impl KernelInvalidator {
                 queue: Vec::new(),
                 inflight: HashMap::new(),
                 gated: false,
+                idle: true,
             }),
             wake: Condvar::new(),
+            idle: Condvar::new(),
             busy: Mutex::new(None),
             closed: AtomicBool::new(false),
             stats: Stats::default(),
@@ -358,6 +369,29 @@ impl KernelInvalidator {
         InodeInvalidator {
             shared: self.shared.clone(),
         }
+    }
+
+    /// Wait until every notification queued so far has been delivered to
+    /// the views' sinks (or dropped as redundant): `true` then, `false`
+    /// when `timeout` ran out first — a notification held back for a
+    /// request in flight on its inode counts as undelivered, so this can
+    /// take up to [`DEFER_MAX`]. A barrier for tests and for a host that
+    /// must know a frontend's cache has been told (the conformance
+    /// kit's `settle`); the notifications queued by an apply are in the
+    /// queue before the apply returns, so waiting after one covers it.
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.shared.state.lock().unwrap();
+        while !st.idle {
+            // A thread that is gone (it panicked in a sink) will never
+            // deliver what is queued.
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() || self.shared.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            st = self.shared.idle.wait_timeout(st, left).unwrap().0;
+        }
+        true
     }
 
     /// The views' registry of ops in flight.
@@ -612,7 +646,22 @@ fn merge(
     }
 }
 
+/// Marks the node's invalidation thread gone, however it ends (a sink
+/// that panics included), and wakes what waits for it to go idle.
+struct ThreadExit(Arc<Shared>);
+
+impl Drop for ThreadExit {
+    fn drop(&mut self) {
+        // Under the state lock, so a waiter between its check and its wait
+        // cannot miss the wake-up.
+        let _st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.0.closed.store(true, Ordering::SeqCst);
+        self.0.idle.notify_all();
+    }
+}
+
 fn run(shared: Arc<Shared>) {
+    let _exit = ThreadExit(shared.clone());
     let mut views: Vec<ViewSink> = Vec::new();
     let mut pending: BTreeMap<Inval, Pending> = BTreeMap::new();
     let mut to_send: Vec<Inval> = Vec::new();
@@ -664,6 +713,10 @@ fn run(shared: Arc<Shared>) {
                 }
                 if !to_send.is_empty() || !to_drop.is_empty() {
                     break;
+                }
+                if pending.is_empty() && !st.idle {
+                    st.idle = true;
+                    shared.idle.notify_all();
                 }
                 st = match next_deadline {
                     Some(deadline) => {
@@ -891,6 +944,57 @@ mod tests {
                 Inval::Inode { ino: 5, data: true },
                 Inval::Inode { ino: 9, data: true },
             ]
+        );
+    }
+
+    /// `wait_idle` returns only once what was queued has reached the
+    /// sinks: with a sink blocked in its first call, it times out; once
+    /// released, it returns with every notification delivered.
+    #[test]
+    fn wait_idle_returns_once_what_was_queued_is_delivered() {
+        let k = KernelInvalidator::start_with(DEFER_MAX);
+        assert!(k.wait_idle(Duration::from_secs(5)), "nothing queued");
+        let rec = Recorder::blocking();
+        k.register(1, Arc::new(rec.clone()), ROOT_INO);
+        k.shared
+            .push(Msg::Batch(vec![entry(ROOT_INO, "a"), entry(ROOT_INO, "b")]));
+        assert!(
+            !k.wait_idle(Duration::from_millis(200)),
+            "a sink is still holding the first notification"
+        );
+        rec.release();
+        assert!(k.wait_idle(Duration::from_secs(5)));
+        assert_eq!(rec.got().len(), 2, "idle only after both were delivered");
+        // A notification held back for a request in flight is undelivered.
+        let inflight = k.inflight();
+        let guard = inflight.enter(&[7]);
+        k.shared.push(Msg::Batch(vec![entry(7, "held")]));
+        assert!(!k.wait_idle(Duration::from_millis(200)));
+        drop(guard);
+        assert!(k.wait_idle(Duration::from_secs(5)));
+        assert_eq!(rec.got().len(), 3);
+    }
+
+    /// A sink that panics ends the invalidation thread; what is queued
+    /// will never be delivered, so `wait_idle` says so at once instead of
+    /// burning its timeout.
+    #[test]
+    fn wait_idle_gives_up_at_once_when_the_thread_is_gone() {
+        struct Panics;
+        impl FrontendEvents for Panics {
+            fn invalidate(&self, _: &[Invalidation]) {
+                panic!("a sink that fails (expected by the test)");
+            }
+        }
+        let k = KernelInvalidator::start_with(DEFER_MAX);
+        k.register(1, Arc::new(Panics), ROOT_INO);
+        k.shared.push(Msg::Batch(vec![entry(ROOT_INO, "a")]));
+        let started = Instant::now();
+        assert!(!k.wait_idle(Duration::from_secs(60)));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
         );
     }
 

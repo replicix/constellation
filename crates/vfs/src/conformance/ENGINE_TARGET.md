@@ -5,7 +5,16 @@
 > (one engine per test on a local file backend, `--locks cluster`) and
 > declaring `rename_flags: true`; results and the engine fixes it drove are
 > in `docs/plans/v1/PROGRESS.md`, "Plan 31 C4 follow-ups". The text below
-> is the original hand-off, kept for its reasoning.
+> is the original hand-off, kept for its reasoning, **except that two of
+> its declared gaps are closed** (PROGRESS.md, "Plan 31 closing:
+> conformance and asserts"): the target declares `cancellable_waits: true`
+> (a blocked lock wait ends `Intr` on the op's `CancelToken` and
+> `TimedOut` at its deadline: `ClusterLocks`, `EINTR` since 346374b, the
+> deadline in the closing round), and its `second_view`/`events`/`settle`
+> hooks run the `invalidation` group against a second engine on the same
+> backend (`Node::peer` in `crates/engine/tests/conformance.rs`; the
+> bullets below say what was first thought missing). Nothing of the kit is
+> skipped on the engine target any more.
 
 Plan 31 C6 asks for the conformance kit to run against the real engine as
 well as the reference filesystem. `constellation-engine` was being
@@ -47,17 +56,20 @@ kit's own run:
   trait, the kit asserts the contract, and the engine does not honour it yet.
   Implementing them in `View::rename` and flipping this flag to `true` is the
   fix.
-- `Declared { cancellable_waits: false, .. }`: `ClusterLocks::lock` waits on
-  its own thread and does not consult `OpCtx::cancel` (and a Linux FUSE mount
-  never has a token set anyway: plan 31 §6.3). The `cancellation` group
-  skips, naming the gap.
-- No `events`/`second_view` hooks: an in-process second `View` over the same
-  `Meta` does not push invalidations the way another *node's* log replay
-  does, so the `invalidation` group skips. It needs a two-`Engine` fixture
-  over one `InMemory` object store (the pattern at the bottom of
-  `engine/src/shipper.rs`) whose first engine's `open_view(spec, caps,
-  events)` is given the `RecordingEvents`; add it as a second fixture
-  constructor when the `Engine` API settles.
+- ~~`Declared { cancellable_waits: false, .. }`~~ (closed: it was declared
+  while `ClusterLocks::lock` ignored `OpCtx::cancel`; it does not any more,
+  and the deadline is honoured too). On a Linux FUSE *mount* the adapter
+  sets the token for a blocked lock on any signal, and for `fsync`,
+  `O_SYNC` writes and `copy_file_range` for a dying caller (plan 39 §3.3).
+- ~~No `events`/`second_view` hooks~~ (closed): an in-process second `View`
+  over the same `Meta` does not push invalidations the way another *node's*
+  log replay does, so the fixture starts a second `Engine` on the same
+  backend, whose changes the first applies as foreign records. The local
+  file backend has no `If-Match`, so the engine runs in its single-writer
+  lease mode; the peer is the only node that mutates, which is all the
+  group needs. `settle` ships the peer (`sync_view`), has the first engine
+  tail the log to its head (`SyncRequest::TailToHead`) and waits for its
+  invalidations to be delivered (`Engine::wait_invalidations_delivered`).
 - Hooks it does offer: `subtree_view` (a second `View` over the same
   replica, `set_subtree_root` + `apply_spec` with `confine_links`) and
   `snapshot` (`SnapshotManager::create`, driven on the fixture's runtime).
@@ -235,11 +247,8 @@ fn the_engine_view_conforms() {
   runtime and `TempDir` are (they are); drop order does not matter.
 - The lock and cancellation groups need a `SyncHandle` with `locks:
   Some(ClusterLocks)`, i.e. the `SyncRequest` receiver of a real `Engine`;
-  they become runnable when the target builds its views with
-  `Engine::open_view(spec, FrontendCaps::linux_fuse(true), events)`
-  instead of `View::new`. Then flip `RunOptions::caps` to
-  `FrontendCaps::linux_fuse(true)` and remove `cancellable_waits: false` only
-  once `ClusterLocks::lock` honours the token.
+  the wired target builds its views with `Engine::open_view(spec,
+  FrontendCaps::linux_fuse(true), events)` instead of `View::new`.
 - Run it as every frontend's `FrontendCaps` and `PolicyStack` (plan 31 §8):
   loop `run(&EngineTarget, &RunOptions { caps, .. })` over the caps of each
   frontend crate that exists, exactly as the reference target's tests do.

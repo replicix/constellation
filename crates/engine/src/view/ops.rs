@@ -2175,9 +2175,10 @@ impl Vfs for View {
     /// another thread (`FrontendCaps::deferrable`; one that cannot waits
     /// here). A blocking wait honours `cx.cancel`: the FUSE adapter
     /// cancels it on any signal (interruptible, as POSIX's `F_SETLKW`),
-    /// and the wait then answers `Intr` (`EINTR`) holding nothing —
+    /// and the wait then answers `Intr` (`EINTR`) holding nothing; and
+    /// `cx.deadline`, past which it answers `TimedOut` the same way —
     /// except a wait parked at another node's sequencer, which stays
-    /// uninterruptible (`crate::locks` module doc).
+    /// uninterruptible by either (`crate::locks` module doc).
     fn lock_acquire<R: Responder<()>>(
         &self,
         cx: &OpCtx<'_>,
@@ -2238,7 +2239,7 @@ impl Vfs for View {
         if !self.caps.deferrable.contains(OpKind::LockAcquire) {
             r.done(
                 locks
-                    .lock_here(ino, local, sleep, cx.cancel)
+                    .lock_here(ino, local, sleep, cx.cancel, cx.deadline)
                     .map_err(VfsError::from),
             );
             return;
@@ -2252,6 +2253,7 @@ impl Vfs for View {
             local,
             sleep,
             cancel,
+            cx.deadline,
             move |result: Result<(), Code>| {
                 r.done(result.map_err(VfsError::from));
                 drop(watch);
