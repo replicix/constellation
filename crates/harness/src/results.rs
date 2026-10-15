@@ -40,9 +40,24 @@
 //!   run was not sharded.
 //! - `started_at`: Unix seconds at which the run started.
 //! - `scenarios`: one entry per *selected* scenario (after name filtering and
-//!   sharding), in execution order. `outcome` is `"passed"`, `"failed"` or
-//!   `"skipped"`; `seconds` is wall-clock time; `reason` is the skip reason
-//!   or the failure error text, `null` for a pass.
+//!   sharding), in execution order. `outcome` is `"passed"`, `"failed"`,
+//!   `"skipped"` or `"inconclusive"`; `seconds` is wall-clock time; `reason`
+//!   is the skip reason, the failure error text, or the inconclusive
+//!   bounds' notes, `null` for a pass.
+//! - `inconclusive` (additive): every correctness check of the scenario
+//!   passed, but a latency upper bound was exceeded while the host was
+//!   demonstrably starved or a load profile was injecting latency
+//!   (`crate::hostlag`): neither a pass nor a failure. `harness run`
+//!   exits 0 when nothing failed; `tests/parity.py` compares it as a pass
+//!   and lists it.
+//! - `host_lag` (optional, additive, per scenario): the host-lag probe's
+//!   summary over the scenario (`crate::hostlag`): per probe the
+//!   overshoot of a 50 ms sleep (p50/p99/max, total), injected pauses,
+//!   and `/proc/pressure` averages.
+//! - `load` (optional, additive, top level): the load profile the run
+//!   used (`CONSTELLATION_HARNESS_LOAD`, `crate::load`); absent without
+//!   one. A scenario's `load_unapplied` (optional, additive) lists the
+//!   profile's `@node` items that matched none of its daemons.
 //!
 //! Consumers (`tests/parity.py`) merge the files of several shards of one
 //! lane by concatenating `scenarios`.
@@ -140,6 +155,8 @@ pub enum Outcome {
     Passed,
     Failed,
     Skipped,
+    /// Correct, but a latency bound could not be judged on a starved host.
+    Inconclusive,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,6 +169,13 @@ pub struct ScenarioResult {
     /// absent when it measured nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub measurements: Option<serde_json::Value>,
+    /// The host-lag probe over the scenario (`crate::hostlag`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_lag: Option<serde_json::Value>,
+    /// Load profile items aimed at a node (`@node`) no daemon of the
+    /// scenario was named: the run's `load` did not apply to it there.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub load_unapplied: Vec<String>,
 }
 
 /// The whole results file; see the module docs for the format.
@@ -166,6 +190,8 @@ pub struct RunResults {
     pub seed: u64,
     pub shard: Option<String>,
     pub started_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load: Option<String>,
     pub scenarios: Vec<ScenarioResult>,
 }
 
@@ -183,6 +209,7 @@ impl RunResults {
             seed,
             shard: shard.map(|s| s.to_string()),
             started_at,
+            load: None,
             scenarios: Vec::new(),
         }
     }
@@ -213,7 +240,24 @@ impl RunResults {
             seconds,
             reason,
             measurements,
+            host_lag: None,
+            load_unapplied: Vec::new(),
         });
+    }
+
+    /// Attach the load items that applied to no daemon to the scenario
+    /// pushed last.
+    pub fn set_load_unapplied(&mut self, unapplied: Vec<String>) {
+        if let Some(last) = self.scenarios.last_mut() {
+            last.load_unapplied = unapplied;
+        }
+    }
+
+    /// Attach the host-lag summary to the scenario pushed last.
+    pub fn set_host_lag(&mut self, host_lag: Option<serde_json::Value>) {
+        if let Some(last) = self.scenarios.last_mut() {
+            last.host_lag = host_lag;
+        }
     }
 
     /// Serialise (pretty JSON, trailing newline) and write to `path`.
@@ -324,6 +368,35 @@ mod tests {
             default_lane("fuse", S3Backend::Process),
             format!("{os}-fuse-process")
         );
+    }
+
+    #[test]
+    fn inconclusive_and_host_lag_are_additive() {
+        let mut r = RunResults::new(DEFAULT_LANE, 1, None);
+        r.push("a", Outcome::Passed, 1.0, None);
+        r.push(
+            "b",
+            Outcome::Inconclusive,
+            2.0,
+            Some("bound: host lag 3s".into()),
+        );
+        r.set_host_lag(Some(serde_json::json!({"probes": []})));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["schema"], 1);
+        assert!(v.get("load").is_none());
+        let s = v["scenarios"].as_array().unwrap();
+        assert!(s[0].get("host_lag").is_none());
+        assert_eq!(s[1]["outcome"], "inconclusive");
+        assert_eq!(s[1]["host_lag"]["probes"], serde_json::json!([]));
+        assert!(s[1].get("load_unapplied").is_none());
+        r.set_load_unapplied(vec!["Cpu@z: no daemon named z".into()]);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["scenarios"][1]["load_unapplied"][0],
+            "Cpu@z: no daemon named z"
+        );
+        r.load = Some("cpu25".into());
+        assert_eq!(serde_json::to_value(&r).unwrap()["load"], "cpu25");
     }
 
     #[test]

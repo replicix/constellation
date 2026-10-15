@@ -311,15 +311,20 @@ pub fn stale_daemon_lock(_seed: u64) -> Result<()> {
             anyhow::ensure!(err.contains(needle), "mount error lacks {needle:?}: {err}");
         }
         anyhow::ensure!(
-            took < Duration::from_secs(30),
-            "the mount took {took:?} to give up (attach timeout 6 s)"
-        );
-        anyhow::ensure!(
             !state_dir
                 .join(format!("daemon.lock.wedged-{mute_pid}"))
                 .exists(),
             "the live holder's lock was rotated"
         );
+        // Gave up on its own (above, exact); how soon past the 6 s attach
+        // timeout is latency.
+        crate::hostlag::latency_bound(
+            "the mount giving up on a live, mute holder",
+            t,
+            took,
+            Duration::from_secs(6),
+            Duration::from_secs(30),
+        )?;
 
         // `status` is bounded the same way.
         let t = Instant::now();

@@ -147,11 +147,6 @@ pub(super) fn snapshot_busy_latency(_seed: u64) -> Result<()> {
                 who.name
             );
             anyhow::ensure!(
-                took <= limit,
-                "snapshot {name} from {} took {took:?} on a busy holder (bound {limit:?})",
-                who.name
-            );
-            anyhow::ensure!(
                 frozen >= floor,
                 "snapshot {name} misses acknowledged writes: counter {frozen} < {floor}"
             );
@@ -163,6 +158,14 @@ pub(super) fn snapshot_busy_latency(_seed: u64) -> Result<()> {
                 frozen <= ceiling,
                 "snapshot {name} holds a write made after it returned: {frozen} > {ceiling}"
             );
+            // Latency, against the idle snapshot measured on this host.
+            crate::hostlag::latency_bound(
+                &format!("snapshot {name} from {} on a busy holder", who.name),
+                started,
+                took,
+                idle,
+                limit,
+            )?;
             Ok(())
         };
         for i in 0..3 {
@@ -181,16 +184,13 @@ pub(super) fn snapshot_busy_latency(_seed: u64) -> Result<()> {
         let took = started.elapsed();
         timings.push(("clone0".into(), took));
         eprintln!("    snapshot-busy-latency: clone on the holder took {took:?}");
-        anyhow::ensure!(
-            took <= limit,
-            "clone on a busy holder took {took:?} (bound {limit:?})"
-        );
         let original = frozen_counter(&c0, "project/.constellation/snapshot/holder0/counter")?;
         let cloned = frozen_counter(&c0, "clone0/counter")?;
         anyhow::ensure!(
             cloned == original,
             "the clone holds counter {cloned}, its snapshot {original}"
         );
+        crate::hostlag::latency_bound("clone on a busy holder", started, took, idle, limit)?;
         Ok(())
     })();
     stop.store(true, Ordering::Relaxed);

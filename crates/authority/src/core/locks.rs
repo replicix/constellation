@@ -1402,6 +1402,9 @@ impl Core {
         self.stats.lock_grants += 1;
         self.lk.mirror_dirty = true;
         let position = self.lock_grant_position(from, ino, replica);
+        // `minter`/`seq` name the grant as the fencing token's
+        // `tagged op executed` lines do (a load campaign's token-order
+        // check pairs them).
         tracing::debug!(
             node = self.cfg.node_id,
             to = from,
@@ -1409,6 +1412,8 @@ impl Core {
             ?mode,
             ttl,
             upgraded = own.is_some(),
+            minter = id.node,
+            seq = id.seq,
             "granted a lock"
         );
         Ok(LockOutcome::Granted {

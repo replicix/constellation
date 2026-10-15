@@ -211,8 +211,8 @@ stressor, verdict, bogo-ops).
   `fiemap`, `verity`) are not excluded: they run and report `skip`, so one
   that starts to pass shows in the table.
 - `tests/stress-ng-baseline.txt` lists reproducible failures that are
-  known semantic gaps, each with a reason (today only `filename`:
-  non-UTF-8 names are stored lossily). A failure not listed fails the
+  known semantic gaps, each with a reason (none today: `filename` was
+  listed until non-UTF-8 names round-tripped). A failure not listed fails the
   run. A listed stressor that passes is printed as
   `IMPROVEMENTS (remove from tests/stress-ng-baseline.txt)`.
 - Both lists are compiled into the harness. `STRESS_NG_FS_EXCLUDE` and
@@ -588,10 +588,19 @@ runs:
    "scenarios": [{"name": "baseline", "outcome": "passed", "seconds": 12.3, "reason": null}]}
   ```
 
-  `outcome` is `passed`, `failed` or `skipped`; `reason` is the skip reason
-  (`fio not installed`) or the failure error text, `null` for a pass;
-  `shard` is `null` for an unsharded run. The format is documented in
-  `crates/harness/src/results.rs`; `tests/parity.py` (plan 31) reads it.
+  `outcome` is `passed`, `failed`, `skipped` or `inconclusive`; `reason`
+  is the skip reason (`fio not installed`), the failure error text, or the
+  notes of the latency bounds that could not be judged, `null` for a pass;
+  `shard` is `null` for an unsharded run. `inconclusive` means every
+  correctness check passed but a latency upper bound was exceeded while
+  the host was demonstrably starved (see "Host-load campaign" below): the
+  run's exit status treats it as a pass, and `tests/parity.py` compares it
+  as one and lists it. Each scenario also carries `host_lag` (the probe's
+  summary), and a run under a load profile records it as `load` (with a
+scenario's `load_unapplied`: the `@node` items that matched none of its
+daemons, so did not apply there). The
+  format is documented in `crates/harness/src/results.rs`;
+  `tests/parity.py` (plan 31) reads it.
 - `--lane <name>` sets the `lane` recorded in that file. Default:
   `<os>-<frontend>`, plus `-process` under `--s3-backend process`, so a
   plain run is `linux-fuse` and a native-S3 run is `linux-fuse-process`.
@@ -3117,6 +3126,196 @@ print what each node serves (length, BLAKE3), its metadata view
 ids) and its position (`head_seq`, the lease). They sample again at 30,
 60 and 120 s: a late agreement is slowness, and a node still serving
 other content after two minutes is a divergence.
+
+## Host-load campaign: load profiles, invariant checkers, `tools/load-campaign`
+
+The requirement: under CPU starvation, scheduling delays, process pauses,
+slow disk and `fsync`, slow or jittery S3 and peer links, and clocks
+within the margins (±500 ms), constellation never corrupts data, loses an
+acknowledged write, returns an error the documented semantics do not
+allow, lets two holders act at once, or hangs; only latency degrades.
+Phase 0 is the tooling that checks exactly that.
+
+**Host lag and `inconclusive`** (`crates/harness/src/hostlag.rs`). Every
+`harness run` scenario runs with a probe thread that sleeps 50 ms in a
+loop and records each wake-up's lateness, plus `/proc/pressure` averages;
+the summary is the scenario's `host_lag` in the results file. A scenario's
+wall-clock upper bound on a latency goes through
+`hostlag::latency_bound(what, started, measured, protocol, bound)`, where
+`protocol` is the protocol's own part of the bound (a TTL plus margin, the
+takeover window) and the rest is host slack. Exceeded, the bound is
+*inconclusive* — noted with the rule that fired, the scenario goes on —
+when:
+
+1. *lost time*: the time the probes lost in the measured window (plus
+   injected pauses) covers the excess — in any lane;
+2. under a load profile only, *single stall*: one stall was longer than
+   the slack and the excess is within one more protocol cycle (plus the
+   lost time);
+3. under a load profile only, *probe-blind injector*: a runtime hog, store
+   stall, S3 or link fault actually applied to a daemon of the scenario
+   (CPU throttling and pauses are measured by the probes, a clock offset
+   adds no latency: they never excuse by themselves).
+
+Nothing excuses a measurement past 3 × the bound (or the bound plus all
+the lost time): that is a failure ("latency may degrade" is not "may
+hang"). Otherwise an exceeded bound fails as a latency regression. A
+scenario with an inconclusive bound and every other check green is
+reported `inconclusive`; `harness run --fail-inconclusive` (or
+`CONSTELLATION_HARNESS_INCONCLUSIVE=fail`) reports it failed instead, and
+`tests/parity.py --max-inconclusive N` (default 2, the nightly sets it)
+fails a lane with more. Correctness assertions (data, exclusion, fencing,
+counters, errno, hangs) stay hard failures, and protocol *lower* bounds
+("not granted before TTL + margin") stay exact. `harness host-lag
+--seconds N` runs the probe alone (JSON), to qualify a host or run beside
+a soak. `eventually` deadlines (liveness) stretch by
+`CONSTELLATION_HARNESS_DEADLINE_SCALE` (default 1; the runner uses 3 under
+load).
+
+Which bounds are latency and which are contracts (load campaign §4):
+
+| Scenario | Bound | Verdict |
+|---|---|---|
+| `delegate-*` (`delegroot.rs`) | failover write ≤ takeover + the successor's logged quarantine (`wait_ms`) + 6.5 s; on the new root ≤ TTL + 3 s + 12 s; after a handoff ≤ 3 s or 2 × the control | latency. No write error, the takeover, by seal when listed, a counted quarantine logged and never longer than configured (`Timings::ack_floor_wait`, the drift tripwire): exact |
+| `backup-failover` (`m9.rs`) | `backup_takeovers` and `seals` counted | contract; the takeover < TTL/2: latency |
+| `ack-s3-failover` (`m9.rs`) | `s3_fast_takeovers` counted, one newer holder, a counted quarantine logged and within the configured cap | contract; B's write across it ≤ max(TTL/2, takeover + the logged quarantine + 6.5 s): latency |
+| `delegate-crash`, `delegate-crash-default-ttl` (`m11.rs`) | reclaimed, not before the default TTL | contract; c's write ≤ TTL-based bound: latency |
+| `flock-cross-node` | granted ≥ 1.4 s after the request | contract (exact) |
+| `lock-holder-partitioned` | granted ≥ TTL/2 after the cut, B fenced before C granted | contract; ≤ TTL + 1 s + 4 s: latency |
+| `lock-holder-killed-contention` | stall ≥ TTL/4 + margin, `expired == 1`, phase 2 no outwait, counter exact, largest gap < 5 × TTL | contract; stall ≤ TTL + margin + 3 s, largest gap < TTL, next waiter < (TTL + margin)/2: latency |
+| `lock-failover` | no EIO across the failover, contender always refused | contract (an EIO is an error to the application, never latency) |
+| `cto-recall-unreachable` (`m8.rs`) | close ≥ TTL + margin − 0.3 s, a recall outwaited, R reads the new content | contract; ≤ TTL + margin + 3 s: latency |
+| `takeover-resolves-awaiting-close` (`m6.rs`) | B's close succeeds under a newer epoch, reads back | contract; < 15 s after A stalled: latency |
+| `session-wait-degrades` (`m6.rs`) | degraded read ≥ budget, no new timeout once shipped | contract; degraded < 3 × budget, recovered < 500 ms: latency |
+| `fsync-soft-timeout`, `fsync-interrupt` | answered ≥ 1.9 s; killed process gone within 30 s (or the hang bound if shorter) | contract; < 15 s, gone < 5 s: latency |
+| `writeback-close-metered-nonowner` (`lifecycle.rs`) | back close and the op after it < 10 s (the bug was a 120 s stall) | latency |
+| `stale-daemon-lock` (`rejoin.rs`) | gives up by itself, names the holder | contract; < 30 s: latency |
+| `snapshot-busy-latency` | snapshot holds every acknowledged write and nothing later | contract; ≤ 3 × idle + 2 s: latency |
+| `inbox-withdraw-hole` (`ec2.rs`) | tombstone read, inbox executed, no lease path | contract; each write ≤ 20 s: latency |
+
+`snapsched-write-overhead`'s "the policy never moves the lease" is left
+to the F2 work, which can use `hostlag::lag_between` and
+`hostlag::inconclusive` for its seal-under-lag case.
+
+**Load profiles** (`crates/harness/src/load.rs`):
+`CONSTELLATION_HARNESS_LOAD=<item>[,<item>...]` applies to every daemon a
+scenario spawns; an item is a preset or `kind[:arg...][@node]`:
+
+| Item | Injector |
+|---|---|
+| `cpu:<pct>`, `cpu:bursty[:hi:lo:period_ms]` (`cpu25`, `cpu10`, `cpu-bursty`) | the daemon in a cgroup v2 of its own (`/sys/fs/cgroup/cst-load-<pid>/<node>-<pid>`) at `cpu.max` (percent of one CPU), with a probe process inside it so the lag the daemon sees is measured; bursty toggles 100 % / 2 % every 3 s |
+| `hogs[:cpu=N][:load=P][:vm=N][:vmbytes=S][:io=N][:hdd=N][:hddbytes=S]` (`hogs`) | `stress-ng` beside the scenario, killed with its process group at the end |
+| `pause:<dur>[:every_ms]` (`pause-takeover`, `pause-lock-lapse`) | `SIGSTOP`/`SIGCONT` of the daemon; `<dur>` is ms or a boundary of `crates/harness/src/timings.rs` with an offset: `takeover`, `lock-half`, `lock-lapse`, `lock-outwait`, `deleg-half`, `deleg-lapse`, `deleg-outwait`, `holder-stall`, `lease-half`, `lease-ttl` (e.g. `lock-lapse+500`), from the daemon's own environment. Injected pauses count as host lag |
+| `step-pause:<dur>[:every_ms]` (`step-pause`) | the daemon stops itself between `Core::handle` and the dispatch of the step's actions (`CONSTELLATION_FAULT_STEP_PAUSE_FILE`), then is resumed after `<dur>` |
+| `store-stall:<ms>[:every_ms]` (`store-stall5`, `store-stall20`) | one ordinary metadata write holds the writer lock `<ms>` (`CONSTELLATION_FAULT_STORE_STALL_FILE`: `<ms>` stalls every non-priority write while the file exists, `<ms> once` one), so the core's step waits behind it |
+| `runtime-hog:<n>:<ms>[:gap_ms]` (`runtime-hog`) | `CONSTELLATION_FAULT_RUNTIME_HOG`: `n` tasks block tokio workers `ms` at a time |
+| `s3:latency:<ms>:<jitter>`, `s3:bandwidth:<kBps>`, `s3:slicer:<bytes>:<delay_us>`, `s3:blackhole:<ms>[:at_ms]` (`s3-jitter`, `s3-jitter-high`, `s3-blackhole`, `s3-slow`) | toxiproxy toxics named `load-*` (a scenario's `heal` keeps them) on its `s3` proxy, and on a `load-s3` proxy that clients given the direct endpoint are routed through, so every client gets them without the scenario's own cuts reaching more clients |
+| `net:<netem args...>`, `net:flap` (`net-lan`, `net-wan`, `net-lossy`, `net-flap`) | `tc netem` on `lo` for the daemon's own UDP (P2P) ports, found from `/proc/<pid>/fd`: a `prio` root with one netem band per node; flap drops everything 2 s in 10 |
+| `clock:<±ms>`, `clock:spread:<ms>` (`clock-skew`) | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` on the protocol clock (`store_s3::lease::now_unix_ms`, which leases, grants, tokens and the core's `now` read), within ±500 ms |
+
+`cpu` and `net` need root (`sudo -n`; the run fails at its start without
+it, and without `tc`/stress-ng for the items that need them). Per-daemon
+network namespaces were the review's first idea; they do not work here:
+`ip netns exec` gives the daemon a private mount namespace (its FUSE mount
+is invisible to the harness), it would run as root behind `sudo`, and the
+S3 endpoint is a loopback port other namespaces cannot reach. The
+fault hooks are compiled in like the other `CONSTELLATION_FAULT_*` and
+cost one cached lookup when unset.
+
+**Invariant checkers** (`crates/harness/src/verify.rs`).
+`CONSTELLATION_HARNESS_VERIFY=1` keeps every daemon log under
+`CONSTELLATION_HARNESS_LOG_DIR/<scenario>/<node>/`, adds
+`constellation::token_exec=debug,constellation_authority::core::locks=debug`
+to the daemons' `RUST_LOG`, sets the FUSE stall watch to half the hang
+bound with backtraces, and runs after every scenario: the **fencing-token
+order** (no op tagged with a grant passes its check — `tagged op
+executed`, the protocol clock, offsets of `clock:` items removed — or
+*lands* — `tagged op landed`, the host clock read after the op's write
+committed, logged by both tagged write funnels — after a conflicting
+grant of the inode went to another node, from `granted a lock … minter=
+seq=` lines; the landed line is what shows finding F1's write admitted
+before its grant ended and committed after a successor's grant), **lease
+epochs** (one node per `acquired the lease` epoch), and, when its S3
+environment goes, the **bucket log** (epochs monotone, one node per epoch,
+every rid completed once; segments listed and decoded are reported). A
+checker that read nothing it should have is a failure, not a pass: marker
+lines that do not parse, tagged ops without any landed line, a kept log
+that is gone, segments that do not decode (E2E aside), a log dir that
+cannot be made. The **hang watch** polls every daemon's in-flight FUSE
+requests: one older than `CONSTELLATION_HARNESS_HANG_S` (120 s) that is
+not a blocking lock wait (nor an `fsync` across an injected S3 outage)
+fails the scenario, keeps gdb (or eu-stack) backtraces and each thread's
+state and `wchan` next to the logs, and aborts the FUSE connection so the
+run goes on. A control socket silent that long fails it too, with
+backtraces, but its connection is aborted only at twice the bound (a
+starved control service may sit beside FUSE threads still moving). `CONSTELLATION_HARNESS_SCENARIO_TIMEOUT_S` bounds a whole scenario the
+same way (and a scenario still blocked a minute after its daemons'
+connections were aborted ends the run, with the rest reported skipped).
+For workloads: self-describing payloads (`verify::payload`,
+`check_payload`: path, writer, sequence, body derived from them), the
+acknowledged-write ledger (`verify::Ledger`: every acknowledged write —
+`fsync` returned; the `close` is checked and its error is the
+application's — rename and unlink; at the end each is intact, or in a
+`.constellation-conflict` copy while the path holds another version
+someone wrote, or lost/corrupt/wrong/phantom; corrupt bytes at a path are
+corruption whatever copy exists; an undone unlink only when a refused
+replay was counted), the protocol counters it depends on
+(`verify::counters`: rolled back, replayed, refused replays, conflict
+copies, depositions, outwaited grants, seals), and the errno
+classification (`verify::ErrnoLog`, counted per class: EIO under a lock
+only as many as the node fenced, EAGAIN on a non-blocking lock — counted
+apart, for F6's rate — ENOLCK for a new lock during an S3 outage, ESTALE
+on a removed file, EINTR on a killed fsync, EIO under a soft fsync
+timeout; an EIO in doubt past the client deadline is a bug unless
+`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`; anything else is a bug). `load-probe` (a campaign-only scenario, `harness list`) runs them
+all on two nodes (and fails if the log checkers parsed no grant, tagged
+op, landed write or lease acquisition: its counter guarantees them);
+`CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<data|ledger|exclusion|token|
+split-brain|errno|stall|log-missing|latency|latency-mild>` breaks one on
+purpose and must fail naming it (`latency-mild`, 2.5 s against a 1 s
+bound, is inconclusive under an applied probe-blind injector only).
+
+**The runner** (`tools/load-campaign/run.py`) runs a
+phase/profile/scenario/seed matrix, one `harness run` per cell with
+verification on, a private docker prefix, the scenario timeout and a wall
+timeout, and writes `<out>/<phase>/<profile>/<scenario>/seed-<n>/`
+(`results.json`, `harness.log`, `logs/`, `run.json`) and
+`<out>/summary.{md,json}`; exit 1 when a cell failed (or a deliberate
+break was missed). Under a pause profile not aimed at one node, the
+scenarios whose exact asserts assume no lock holder or delegate is ever
+paused (`lock-*`, `flock-cross-node`, `sqlite-two-nodes`,
+`git-under-flock*`, `delegate-*`, `root-failover-with-delegates`: a
+holder paused past its grant is fenced with `EIO` by contract) are
+reported `excluded`; aim the pause at a non-holder (`@node`) instead:
+
+```sh
+# every injector under load-probe, then every checker's deliberate break
+tools/load-campaign/run.py --out /tmp/load-smoke --phase smoke \
+    --bin target/release/constellation --notice "$LOAD_NOTICE_FILE"
+# phase 2 or 3 of the campaign (§5.3/§5.4 scenario and profile lists)
+tools/load-campaign/run.py --out /tmp/load-p3 --phase 3 --seeds 42,43,44
+# a cell by hand; `dm-delay` puts the run's TMPDIR on a dm-delay disk
+tools/load-campaign/run.py --out /tmp/load-x --scenario 'lock-*' \
+    --profile 'cpu:25@a' --profile dm-delay,hogs --seeds 7
+tools/load-campaign/run.py --summarize /tmp/load-p3
+```
+
+The runner's own `dm-delay` profile item puts the run's `TMPDIR` (state
+dirs, caches, stress-ng's files) on an ext4 over `dm-delay` over a loop
+file, 20 ms reads and 100 ms writes by default (`--dm-delay-ms`): at the
+review's 500/2000 ms a fresh mount's metadata bootstrap alone takes tens
+of minutes (it is fsync-bound: 18 s at 5/20 ms, over 6 min at 100/400 ms).
+
+`tools/load-campaign/inject.sh` is the shell twin for processes the
+harness did not spawn (the chaos soak, §5.5): `cpu`, `cpu-bursty`,
+`pause`, `hogs-start`, `netem`, `store-stall`, `toxic`, `dmdelay-up`,
+`rotate <secs> <pid>...` (the soak's rotating schedule) and `cleanup`
+(daemons a dead run's injectors left stopped, cgroups, the `lo` qdisc and
+dm devices a crashed run left; it removes the `lo` qdisc unconditionally,
+so not on a host where another campaign runs). The harness sweeps a
+crashed run's cgroups and `lo` qdisc itself (a marker names the harness
+that installed the qdisc; a live one's is left alone), and a guard
+process thaws any daemon its injectors hold stopped if the harness dies.
 
 ## Findings of the real-S3 runs (OVH, EC2)
 

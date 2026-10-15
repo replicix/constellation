@@ -469,7 +469,36 @@ pub fn execute_tagged(
     crate::readdeleg::clear_victims();
     let records = execute_inner(meta, op)?;
     meta.note_unshipped(&records);
+    note_landed(tag);
     Ok(records)
+}
+
+/// Evidence for a harness (off by default, the twin of `check_tag`'s
+/// `tagged op executed`): when an op tagged with each grant *landed* — its
+/// write transaction committed — on the host's clock, read now, after the
+/// writer lock. Both tagged write funnels log it: [`execute_tagged`] and
+/// `Meta::with_lock_tag` (the holder's own manifest commit). `check_tag` runs before the op waits for that lock, so its
+/// line alone cannot show a write delayed past its grant (review finding
+/// F1); the load campaign's token-order check takes the later of the two.
+pub(crate) fn note_landed(tag: &crate::locks::LockTag) {
+    if tag.is_empty()
+        || !tracing::enabled!(target: "constellation::token_exec", tracing::Level::DEBUG)
+    {
+        return;
+    }
+    let host_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    for t in &tag.0 {
+        // In the message, not as fields, as `check_tag`'s line.
+        tracing::debug!(
+            target: "constellation::token_exec",
+            "tagged op landed minter={} seq={} host_ms={host_ms}",
+            t.grant.node,
+            t.grant.seq,
+        );
+    }
 }
 
 fn execute_inner(meta: &Meta, op: &MutateOp) -> Result<Vec<LogRecord>, MetaError> {

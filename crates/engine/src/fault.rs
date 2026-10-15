@@ -106,3 +106,115 @@ pub fn p2p_denied(peer: u64) -> bool {
         .filter_map(|l| l.trim().parse::<u64>().ok())
         .any(|id| id == peer)
 }
+
+/// `CONSTELLATION_FAULT_STEP_PAUSE_FILE=<path>`: once that file exists,
+/// the next authority-core step stops the whole daemon (`SIGSTOP` to its
+/// own pid) between `Core::handle` and the dispatch of the step's actions:
+/// a step decided before a stall and dispatched after it, the production
+/// twin of the deterministic simulation's `StallStep`. The file is
+/// consumed (removed) first and `<path>.stopped` is written *before* the
+/// stop, so each creation stops one step and the marker means "stopped,
+/// or about to be": whoever created the file waits for the stop once it
+/// sees the marker, and sends the `SIGCONT`. Unset, one cached lookup
+/// per step; set, one `unlink(2)` per step.
+pub fn step_pause() {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os("CONSTELLATION_FAULT_STEP_PAUSE_FILE").map(PathBuf::from))
+    else {
+        return;
+    };
+    // Only the step that removes the file stops: two racing steps (there
+    // is one core, but a test may share the path) stop once.
+    if std::fs::remove_file(path).is_err() {
+        return;
+    }
+    let mut marker = path.clone().into_os_string();
+    marker.push(".stopped");
+    let _ = std::fs::write(PathBuf::from(marker), b"stopped");
+    tracing::warn!("fault injection: stopping the daemon mid-step (testing only)");
+    if let Err(error) = constellation_platform::native()
+        .process
+        .suspend(std::process::id())
+    {
+        tracing::warn!(%error, "fault injection: could not stop the daemon mid-step");
+    }
+}
+
+/// `CONSTELLATION_FAULT_RUNTIME_HOG=<n>:<ms>[:<gap_ms>]`: `n` tasks on the
+/// daemon's tokio runtime that each block their worker thread
+/// (`std::thread::sleep(ms)`, deliberately not an `await`) in a loop,
+/// yielding (and, with `gap_ms`, sleeping asynchronously that long)
+/// between blocks — a runtime starved of workers while the process
+/// itself has CPU, which is what a busy host does to the timers and the
+/// heartbeat tasks that share the runtime. Started once per process.
+pub fn start_runtime_hog(rt: &tokio::runtime::Handle) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    let Some((n, block, gap)) = std::env::var("CONSTELLATION_FAULT_RUNTIME_HOG")
+        .ok()
+        .and_then(|v| parse_runtime_hog(&v))
+    else {
+        return;
+    };
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    tracing::warn!(
+        tasks = n,
+        block_ms = block.as_millis() as u64,
+        gap_ms = gap.as_millis() as u64,
+        "fault injection: hogging the runtime's workers (testing only)"
+    );
+    for _ in 0..n {
+        rt.spawn(async move {
+            loop {
+                std::thread::sleep(block);
+                if gap.is_zero() {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(gap).await;
+                }
+            }
+        });
+    }
+}
+
+/// `<n>:<ms>[:<gap_ms>]` of [`start_runtime_hog`].
+fn parse_runtime_hog(v: &str) -> Option<(usize, std::time::Duration, std::time::Duration)> {
+    let mut it = v.trim().split(':');
+    let n: usize = it.next()?.trim().parse().ok()?;
+    let ms: u64 = it.next()?.trim().parse().ok()?;
+    let gap: u64 = match it.next() {
+        Some(g) => g.trim().parse().ok()?,
+        None => 0,
+    };
+    if it.next().is_some() || n == 0 || ms == 0 {
+        return None;
+    }
+    Some((
+        n,
+        std::time::Duration::from_millis(ms),
+        std::time::Duration::from_millis(gap),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn runtime_hog_spec() {
+        assert_eq!(
+            parse_runtime_hog("4:200"),
+            Some((4, Duration::from_millis(200), Duration::ZERO))
+        );
+        assert_eq!(
+            parse_runtime_hog(" 2:50:10 "),
+            Some((2, Duration::from_millis(50), Duration::from_millis(10)))
+        );
+        for bad in ["", "4", "0:100", "4:0", "a:b", "1:2:3:4"] {
+            assert_eq!(parse_runtime_hog(bad), None, "{bad:?}");
+        }
+    }
+}

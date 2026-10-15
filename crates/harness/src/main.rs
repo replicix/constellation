@@ -93,6 +93,23 @@ enum Command {
         /// fail outright rather than just make noisy.
         #[arg(long = "exclude", value_name = "NAME")]
         exclude: Vec<String>,
+        /// Report a scenario whose only problem is an inconclusive latency
+        /// bound (the host was starved, `constellation_harness::hostlag`)
+        /// as FAILED, as before the outcome existed. Also
+        /// `CONSTELLATION_HARNESS_INCONCLUSIVE=fail`.
+        #[arg(long)]
+        fail_inconclusive: bool,
+    },
+    /// The host-lag probe alone (`constellation_harness::hostlag`): sleep
+    /// 50 ms in a loop for --seconds and print the overshoot distribution
+    /// and `/proc/pressure` averages as JSON; with --stream, print every
+    /// sample (`<mono_ns> <late_us>`) until killed (the per-cgroup probe
+    /// of the load profiles).
+    HostLag {
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        #[arg(long)]
+        stream: bool,
     },
     /// Plan 37 §12: scenarios driven through a kind cluster running the
     /// CSI driver (`kubectl`/`helm`; see the `k8s` module docs). Reuses
@@ -326,7 +343,15 @@ fn main() -> Result<()> {
             for s in scenarios::KNOWN_BUG_REPROS {
                 println!("{:22} {}{}", s.name, s.desc, needs(s));
             }
+            println!();
+            println!("load campaign scenarios (run by name only; tools/load-campaign):");
+            for s in scenarios::CAMPAIGN {
+                println!("{:22} {}{}", s.name, s.desc, needs(s));
+            }
             Ok(())
+        }
+        Command::HostLag { seconds, stream } => {
+            constellation_harness::hostlag::host_lag_cmd(seconds, stream)
         }
         Command::Run {
             names,
@@ -340,6 +365,7 @@ fn main() -> Result<()> {
             frontend,
             without_caps,
             exclude,
+            fail_inconclusive,
         } => run(RunOpts {
             names,
             seed,
@@ -352,6 +378,7 @@ fn main() -> Result<()> {
             frontend,
             without_caps,
             exclude,
+            fail_inconclusive,
         }),
         Command::K8sScenario { list: true, .. } => {
             for s in k8s::K8S_SCENARIOS {
@@ -543,6 +570,7 @@ struct RunOpts {
     frontend: String,
     without_caps: Vec<caps::Cap>,
     exclude: Vec<String>,
+    fail_inconclusive: bool,
 }
 
 fn run(opts: RunOpts) -> Result<()> {
@@ -558,11 +586,15 @@ fn run(opts: RunOpts) -> Result<()> {
         frontend,
         without_caps,
         exclude,
+        fail_inconclusive,
     } = opts;
+    let fail_inconclusive = fail_inconclusive
+        || std::env::var("CONSTELLATION_HARNESS_INCONCLUSIVE").is_ok_and(|v| v.trim() == "fail");
     for n in &exclude {
         if !SCENARIOS
             .iter()
             .chain(scenarios::KNOWN_BUG_REPROS.iter())
+            .chain(scenarios::CAMPAIGN.iter())
             .any(|s| s.name == n)
         {
             bail!("unknown scenario {n:?} in --exclude (try `harness list`)");
@@ -574,6 +606,11 @@ fn run(opts: RunOpts) -> Result<()> {
     constellation_harness::client::check_transport_census()?;
     let mut frontend_caps = caps::caps_of(&caps::frontend_caps(&frontend)?);
     frontend_caps.retain(|c| !without_caps.contains(c));
+    // The load campaign's profile and checkers (`load`, `verify`): a
+    // profile that cannot be applied fails the run here, not as a
+    // silently unloaded run.
+    constellation_harness::load::init()?;
+    constellation_harness::verify::start_watch();
     // Set once, before any scenario starts an S3Env.
     let backend = s3env::select_backend(s3_backend)?;
     let lane = lane.unwrap_or_else(|| results::default_lane(&frontend, backend));
@@ -591,6 +628,7 @@ fn run(opts: RunOpts) -> Result<()> {
             match SCENARIOS
                 .iter()
                 .chain(scenarios::KNOWN_BUG_REPROS.iter())
+                .chain(scenarios::CAMPAIGN.iter())
                 .find(|s| s.name == n)
             {
                 Some(s) => v.push(s),
@@ -613,9 +651,12 @@ fn run(opts: RunOpts) -> Result<()> {
     };
 
     let mut report = RunResults::new(&lane, seed, shard).with_setup(backend, &frontend);
+    report.load = constellation_harness::load::label();
     let mut failures = Vec::new();
     let mut skipped = Vec::new();
-    for s in selected {
+    let mut inconclusive = Vec::new();
+    let order: Vec<&'static str> = selected.iter().map(|s| s.name).collect();
+    for (index, s) in selected.into_iter().enumerate() {
         if exclude.iter().any(|e| e == s.name) {
             let reason = "excluded for this run (--exclude)";
             eprintln!("=== {} SKIPPED ({reason})", s.name);
@@ -643,21 +684,67 @@ fn run(opts: RunOpts) -> Result<()> {
         let t0 = std::time::Instant::now();
         constellation_harness::client::set_scenario(s.name);
         eprintln!("=== {} (seed {seed}) ===", s.name);
-        match (s.run)(seed) {
-            Ok(()) => {
-                eprintln!("=== {} PASSED in {:.1?}", s.name, t0.elapsed());
-                report.push(s.name, Outcome::Passed, t0.elapsed().as_secs_f64(), None);
-            }
-            Err(e) => {
-                eprintln!("=== {} FAILED in {:.1?}: {e:#}", s.name, t0.elapsed());
-                report.push(
+        constellation_harness::hostlag::begin(s.name);
+        constellation_harness::load::begin(s.name);
+        let ran = run_one(s, seed);
+        let load = constellation_harness::load::end();
+        let (host_lag, notes) = constellation_harness::hostlag::end();
+        let mut violations = constellation_harness::verify::after_scenario(s.name);
+        violations.extend(
+            load.errors
+                .into_iter()
+                .map(|e| format!("load injector: {e}")),
+        );
+        for u in &load.unapplied {
+            eprintln!("!!! load item applied to no daemon: {u}");
+        }
+        let (mut outcome, mut reason) = verdict(&ran, &violations, &notes);
+        if outcome == Outcome::Inconclusive && fail_inconclusive {
+            outcome = Outcome::Failed;
+            reason = reason.map(|r| format!("inconclusive (--fail-inconclusive): {r}"));
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        match outcome {
+            Outcome::Passed => eprintln!("=== {} PASSED in {:.1?}", s.name, t0.elapsed()),
+            Outcome::Inconclusive => {
+                eprintln!(
+                    "=== {} INCONCLUSIVE in {:.1?}: {}",
                     s.name,
-                    Outcome::Failed,
-                    t0.elapsed().as_secs_f64(),
-                    Some(format!("{e:#}")),
+                    t0.elapsed(),
+                    reason.as_deref().unwrap_or_default()
+                );
+                inconclusive.push(s.name);
+            }
+            _ => {
+                eprintln!(
+                    "=== {} FAILED in {:.1?}: {}",
+                    s.name,
+                    t0.elapsed(),
+                    reason.as_deref().unwrap_or_default()
                 );
                 failures.push(s.name);
             }
+        }
+        report.push(s.name, outcome, secs, reason);
+        report.set_host_lag(host_lag);
+        report.set_load_unapplied(load.unapplied);
+        if let Err(Ran::Wedged(_)) = &ran {
+            // The scenario's thread is still blocked: nothing after it can
+            // run in this process. Say so for the rest, write the results
+            // and leave (the daemons die with the harness).
+            for rest in &order[index + 1..] {
+                report.push(
+                    rest,
+                    Outcome::Skipped,
+                    0.0,
+                    Some(format!("not run: {} wedged the harness", s.name)),
+                );
+            }
+            if let Some(path) = &results_json {
+                report.write(path)?;
+                eprintln!("results written to {}", path.display());
+            }
+            bail!("{} did not finish: the run was abandoned", s.name);
         }
     }
     if let Some(path) = &results_json {
@@ -697,6 +784,14 @@ fn run(opts: RunOpts) -> Result<()> {
     if let Some(census) = census {
         bail!("{census}");
     }
+    if !inconclusive.is_empty() {
+        eprintln!(
+            "{} scenario(s) INCONCLUSIVE (correct; a latency bound could not be judged on a \
+             starved host): {}",
+            inconclusive.len(),
+            inconclusive.join(", ")
+        );
+    }
     if skipped.is_empty() {
         eprintln!("ALL SCENARIOS PASSED");
     } else {
@@ -707,6 +802,111 @@ fn run(opts: RunOpts) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// How a scenario's run ended, short of returning.
+enum Ran {
+    Failed(anyhow::Error),
+    Panicked(String),
+    /// Past `CONSTELLATION_HARNESS_SCENARIO_TIMEOUT_S` and the grace after
+    /// its daemons' FUSE connections were aborted: its thread is stuck.
+    Wedged(String),
+}
+
+/// `CONSTELLATION_HARNESS_SCENARIO_TIMEOUT_S`: a scenario still running
+/// this long is a hang (the load campaign's runner sets it; unset, a
+/// scenario runs as long as it takes).
+fn scenario_timeout() -> Option<std::time::Duration> {
+    std::env::var("CONSTELLATION_HARNESS_SCENARIO_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(std::time::Duration::from_secs)
+}
+
+/// Run one scenario on a thread of its own: a panic is its failure (not
+/// the run's end), and past [`scenario_timeout`] its daemons' backtraces
+/// are kept and their FUSE connections aborted, so that what blocked on
+/// them returns; if even that does not end it within a minute, the
+/// scenario is reported wedged.
+fn run_one(s: &scenarios::Scenario, seed: u64) -> std::result::Result<(), Ran> {
+    use std::time::Duration;
+    let run = s.run;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name(format!("scenario-{}", s.name))
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let _ = tx.send(run(seed));
+        })
+        .map_err(|e| Ran::Failed(anyhow::anyhow!("spawning the scenario thread: {e}")))?;
+    let panicked = |h: std::thread::JoinHandle<()>| match h.join() {
+        Err(p) => p
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "a panic".into()),
+        Ok(()) => "the scenario thread ended without a result".into(),
+    };
+    let first = match scenario_timeout() {
+        None => rx.recv().map_err(|_| None),
+        Some(t) => rx.recv_timeout(t).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => Some(t),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => None,
+        }),
+    };
+    let result = match first {
+        Ok(r) => r,
+        Err(None) => return Err(Ran::Panicked(panicked(handle))),
+        Err(Some(t)) => {
+            let what = constellation_harness::verify::abort_scenario(s.name, t);
+            eprintln!("!!! {}: {what}", s.name);
+            match rx.recv_timeout(Duration::from_secs(60)) {
+                Ok(r) => {
+                    let _ = handle.join();
+                    return Err(Ran::Failed(match r {
+                        Ok(()) => anyhow::anyhow!("hang: {what}"),
+                        Err(e) => anyhow::anyhow!("hang: {what}; then: {e:#}"),
+                    }));
+                }
+                Err(_) => {
+                    return Err(Ran::Wedged(format!(
+                        "hang: {what}; still blocked 60 s later"
+                    )))
+                }
+            }
+        }
+    };
+    let _ = handle.join();
+    result.map_err(Ran::Failed)
+}
+
+/// A scenario's outcome: any failure, verification violation or load
+/// injector problem fails it; otherwise inconclusive latency bounds make
+/// it inconclusive.
+fn verdict(
+    ran: &std::result::Result<(), Ran>,
+    violations: &[String],
+    notes: &[String],
+) -> (Outcome, Option<String>) {
+    let mut reasons = Vec::new();
+    match ran {
+        Ok(()) => {}
+        Err(Ran::Failed(e)) => reasons.push(format!("{e:#}")),
+        Err(Ran::Panicked(p)) => reasons.push(format!("panicked: {p}")),
+        Err(Ran::Wedged(w)) => reasons.push(w.clone()),
+    }
+    reasons.extend(violations.iter().map(|v| format!("verification: {v}")));
+    if !reasons.is_empty() {
+        if !notes.is_empty() {
+            reasons.push(format!("also inconclusive: {}", notes.join("; ")));
+        }
+        return (Outcome::Failed, Some(reasons.join("; ")));
+    }
+    if !notes.is_empty() {
+        return (Outcome::Inconclusive, Some(notes.join("; ")));
+    }
+    (Outcome::Passed, None)
 }
 
 /// See `Command::MuteDaemon`.

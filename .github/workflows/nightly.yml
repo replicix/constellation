@@ -126,6 +126,9 @@ jobs:
       - run: python3 -m unittest discover -s tests -p 'test_parity.py'
       - uses: actions/download-artifact@v4
         with: { path: results, pattern: "harness-*", merge-multiple: true }
+      # `--max-inconclusive`: a lane may have that many scenarios whose
+      # latency bound could not be judged on a starved runner (their
+      # `host_lag` is in the uploaded results, for the trend); more fail.
       # Every lane this workflow runs is required: a lane whose job died
       # before writing its results must fail parity, not drop out of it.
       # linux-csi (plan 37 §12) runs in kind-e2e, on the FUSE runner only;
@@ -135,6 +138,7 @@ jobs:
         run: |
           set -o pipefail
           python3 tests/parity.py --expect tests/platform-parity.toml \
+            --max-inconclusive 2 \
             --require-lane linux-fuse --require-lane linux-fuse-process \
             "$CSI_LANE" linux-csi \
             results/results-*.json | tee -a "$GITHUB_STEP_SUMMARY"

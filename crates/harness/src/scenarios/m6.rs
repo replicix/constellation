@@ -492,12 +492,17 @@ pub fn takeover_resolves_awaiting_close(_seed: u64) -> Result<()> {
             lb["held"] == true && lb["epoch"].as_u64().unwrap_or(0) > epoch,
             "B does not hold a newer epoch than A's {epoch}: {lb}"
         );
-        anyhow::ensure!(
-            after_stall < Duration::from_secs(15),
-            "B's close took {after_stall:?} after A stalled (the seal takes ~1.5 s)"
-        );
         let read = std::fs::read(b.mnt.join("f")).context("B reads f back")?;
         anyhow::ensure!(read == content, "B reads back other content for f");
+        // Latency, once the data checked out: the seal takes ~1.5 s
+        // (`CONSTELLATION_BACKUP_TAKEOVER_MS`), the rest is host slack.
+        crate::hostlag::latency_bound(
+            "B's close after A stalled",
+            stalled,
+            after_stall,
+            Duration::from_millis(1_500),
+            Duration::from_secs(15),
+        )?;
         let _ = std::fs::remove_file(&hold);
         a.resume().context("SIGCONT A")?;
         paused = false;
@@ -648,7 +653,7 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
         for i in 0..3 {
             let started = Instant::now();
             let r = std::fs::metadata(b.mnt.join(format!("absent-{i}")));
-            elapsed.push(started.elapsed());
+            elapsed.push((started.elapsed(), started));
             match r {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 other => {
@@ -658,12 +663,16 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
         }
         let session = session_of(&b)?;
         print_session(NAME, "B", &session);
-        eprintln!("    {NAME}: B's degraded stats took {elapsed:?}");
-        for e in &elapsed {
+        eprintln!(
+            "    {NAME}: B's degraded stats took {:?}",
+            elapsed.iter().map(|e| e.0).collect::<Vec<_>>()
+        );
+        for (e, _) in &elapsed {
+            // The budget is waited out (the protocol's lower bound: exact);
+            // how far past it the answer came is latency (below).
             anyhow::ensure!(
-                *e >= Duration::from_millis(BUDGET_MS - 100)
-                    && *e < Duration::from_millis(BUDGET_MS * 3),
-                "a degraded read took {e:?}, expected about the {BUDGET_MS} ms budget"
+                *e >= Duration::from_millis(BUDGET_MS - 100),
+                "a degraded read took {e:?}, before the {BUDGET_MS} ms budget"
             );
         }
         anyhow::ensure!(
@@ -675,6 +684,15 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
             warnings == 1,
             "expected exactly one timeout warning in B's log, found {warnings}"
         );
+        for (e, at) in &elapsed {
+            crate::hostlag::latency_bound(
+                "a degraded read",
+                *at,
+                *e,
+                Duration::from_millis(BUDGET_MS),
+                Duration::from_millis(BUDGET_MS * 3),
+            )?;
+        }
         // Lift the hold: A ships, B catches up, reads are fast again.
         std::fs::remove_file(&hold)?;
         eventually("g visible on B", Duration::from_secs(20), || {
@@ -686,10 +704,18 @@ pub fn session_wait_degrades(_seed: u64) -> Result<()> {
         let _ = std::fs::metadata(b.mnt.join("absent-9"));
         let fast = started.elapsed();
         let after = session_of(&b)?;
+        // Recovered: no further session timeout (exact); fast (latency).
         anyhow::ensure!(
-            n(&after, "timeouts") == n(&before, "timeouts") && fast < Duration::from_millis(500),
+            n(&after, "timeouts") == n(&before, "timeouts"),
             "reads did not recover once A shipped: {fast:?} {after}"
         );
+        crate::hostlag::latency_bound(
+            "a read once A shipped",
+            started,
+            fast,
+            Duration::ZERO,
+            Duration::from_millis(500),
+        )?;
         Ok(())
     })();
     let _ = std::fs::remove_file(&hold);

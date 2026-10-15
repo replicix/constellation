@@ -70,13 +70,15 @@ pub(crate) fn control_runtime() -> &'static tokio::runtime::Runtime {
 /// unmount"/"mount did not appear" failure. Override with
 /// `CONSTELLATION_HARNESS_MOUNT_TIMEOUT_S` for scenario-specific tuning.
 fn client_timeout() -> Duration {
-    Duration::from_secs(
+    // A liveness bound: the load campaign stretches it (a mount on a
+    // dm-delay disk syncs for minutes).
+    crate::load::scaled(Duration::from_secs(
         std::env::var("CONSTELLATION_HARNESS_MOUNT_TIMEOUT_S")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v: &u64| *v > 0)
             .unwrap_or(120),
-    )
+    ))
 }
 
 /// How long `unmount`/`leave` wait for the daemon to exit. Longer than
@@ -151,11 +153,15 @@ impl Client {
         std::fs::create_dir_all(&mnt)?;
         std::fs::create_dir_all(&state)?;
         crate::sweep::claim(root);
+        // Under verification (`crate::verify`) the logs outlive the
+        // scenario's temp dir: its checks read them afterwards.
+        let log = crate::verify::log_path_for(name)?.unwrap_or_else(|| work.join("mount.log"));
+        crate::verify::note_backend(backend);
         Ok(Self {
             name: name.to_string(),
             backend: backend.to_string(),
             endpoint: endpoint.to_string(),
-            log: work.join("mount.log"),
+            log,
             work,
             mnt,
             state,
@@ -226,6 +232,7 @@ impl Client {
 
     pub fn with_e2e(mut self) -> Self {
         self.e2e = true;
+        crate::verify::note_e2e(&self.backend);
         self.env.push((
             "CONSTELLATION_PASSPHRASE".into(),
             "harness-correct-passphrase".into(),
@@ -259,7 +266,9 @@ impl Client {
             .env("AWS_ACCESS_KEY_ID", "test")
             .env("AWS_SECRET_ACCESS_KEY", "test")
             .env("AWS_DEFAULT_REGION", "us-east-1")
-            .env("AWS_ENDPOINT", &self.endpoint)
+            // A direct endpoint goes through the load profile's proxy
+            // while it injects S3 faults (`crate::load`).
+            .env("AWS_ENDPOINT", crate::load::endpoint_for(&self.endpoint))
             .env("AWS_ALLOW_HTTP", "true")
             // Snappy cross-node propagation for multi-client scenarios.
             .env("CONSTELLATION_SYNC_INTERVAL_MS", "200")
@@ -425,6 +434,7 @@ impl Client {
             let _ = std::fs::rename(&self.log, self.log.with_extension(format!("log.{n}")));
         }
         let logf = std::fs::File::create(&self.log)?;
+        crate::verify::note_log_opened(&self.log);
         // Plan 21: `mount` now takes TARGET MOUNTPOINT as two positionals
         // (TARGET is a registry name, "name:/sub", or — as here, since
         // the harness always mounts ad-hoc via --state-dir/--s3 — a
@@ -460,11 +470,20 @@ impl Client {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let mut cmd = self.cmd(&arg_refs);
         self.sandbox(&mut cmd)?;
+        crate::load::daemon_env(&self.name, &self.work, &self.env, &mut cmd);
         let child = cmd
             .stdout(Stdio::from(logf.try_clone()?))
             .stderr(Stdio::from(logf))
             .spawn_tied()
             .context("spawning mount")?;
+        crate::load::daemon_spawned(
+            &self.name,
+            child.id(),
+            &self.state,
+            &self.mnt,
+            &self.work,
+            &self.env,
+        );
         self.child = Some(child);
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
@@ -823,6 +842,7 @@ impl Client {
     /// the "unreachable holder" case from DESIGN.md §4.
     pub fn pause(&self) -> Result<()> {
         let pid = self.pid().context("not mounted")?;
+        crate::load::note_scenario_pause(pid, true);
         constellation_platform::native()
             .process
             .suspend(pid)
@@ -832,6 +852,7 @@ impl Client {
     /// Thaw a paused daemon (SIGCONT).
     pub fn resume(&self) -> Result<()> {
         let pid = self.pid().context("not mounted")?;
+        crate::load::note_scenario_pause(pid, false);
         constellation_platform::native()
             .process
             .resume(pid)
@@ -1059,6 +1080,11 @@ static SCENARIO: std::sync::Mutex<String> = std::sync::Mutex::new(String::new())
 /// first column).
 pub fn set_scenario(name: &str) {
     *SCENARIO.lock().unwrap_or_else(|e| e.into_inner()) = name.to_string();
+}
+
+/// The scenario [`set_scenario`] named last (empty before any).
+pub fn scenario() -> String {
+    SCENARIO.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Plan 38 Z2c: a file each client appends one line per FUSE mount its
@@ -1368,7 +1394,7 @@ fn release_killed(child: &mut Child, name: &str, mnt: &Path, within: Duration) -
 
 /// The FUSE connection number of the mount at `mountpoint` (Linux:
 /// `/sys/fs/fuse/connections/<n>`), from the host's mount table.
-fn fuse_connection_of(mountpoint: &Path) -> Option<u32> {
+pub(crate) fn fuse_connection_of(mountpoint: &Path) -> Option<u32> {
     constellation_platform::native()
         .mounts
         .list()

@@ -477,7 +477,10 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
         });
         // B keeps writing under its lock: EIO once fenced.
         let mut first_eio = None;
-        let deadline = Instant::now() + Duration::from_millis(LOCK_TTL_MS * 3 + 5_000);
+        // Liveness, not latency: a starved host may take longer, the
+        // hang bound decides "never".
+        let deadline = Instant::now()
+            + Duration::from_millis(LOCK_TTL_MS * 3 + 5_000).max(crate::verify::hang_bound());
         while Instant::now() < deadline {
             match write_at(&mut wb, 0, b"B2") {
                 Ok(()) => {}
@@ -501,18 +504,16 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
             fenced - cut,
             granted - cut
         );
+        // Exclusion and the protocol's lower bound: exact.
         anyhow::ensure!(fenced <= granted, "C was granted before B was fenced");
         anyhow::ensure!(
             granted - cut >= Duration::from_millis(LOCK_TTL_MS / 2),
             "C granted too early: {:?}",
             granted - cut
         );
-        anyhow::ensure!(
-            granted - cut <= Duration::from_millis(LOCK_TTL_MS + 1_000 + 4_000),
-            "C granted too late: {:?}",
-            granted - cut
-        );
         waiter.join().expect("waiter")?;
+        // The upper bound is latency: ttl + margin, plus host slack.
+        let late = (cut, granted - cut);
         // Heal; B's application unlocks (its grant is long gone), and can
         // lock again.
         let _ = std::fs::remove_file(super::m9::c_deny_path(root.path(), &a.name));
@@ -528,6 +529,13 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
         for c in &clients {
             print_locks(NAME, c);
         }
+        crate::hostlag::latency_bound(
+            &format!("{NAME}: C's grant after the cut"),
+            late.0,
+            late.1,
+            Duration::from_millis(LOCK_TTL_MS + 1_000),
+            Duration::from_millis(LOCK_TTL_MS + 1_000 + 4_000),
+        )?;
         Ok(())
     })();
     for c in clients.iter_mut().rev() {
@@ -599,6 +607,15 @@ fn counter_worker(path: PathBuf, n: u64, hold: Option<Hold>) -> CounterRun {
         }
     }
     run
+}
+
+/// When the gap of length `gap` between two of `times` (sorted) began.
+fn gaps_at(times: &[Instant], gap: Duration) -> Instant {
+    times
+        .windows(2)
+        .find(|w| w[1] - w[0] == gap)
+        .map(|w| w[0])
+        .unwrap_or_else(Instant::now)
 }
 
 fn read_counter(path: &Path) -> Result<u64> {
@@ -715,10 +732,10 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
             LOCK_TTL_MS + MARGIN_MS,
             after.len()
         );
-        anyhow::ensure!(
-            stall <= Duration::from_millis(LOCK_TTL_MS + MARGIN_MS + SLACK_MS),
-            "the survivors waited {stall:?} for the dead holder's grant"
-        );
+        // The upper bounds are latency (judged against the host-lag probe
+        // once the exact checks below held); the lower bound and the
+        // counts are the protocol's and stay exact.
+        let phase1_latency = (killed, stall, max_gap, gaps_at(&after, max_gap));
         // And not less than the grant's remaining life: the dead holder
         // renewed at most `ttl/2 + ttl/4` before the kill, so its grant
         // outlives the kill by at least `ttl/4 + margin` at the owner.
@@ -726,11 +743,14 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
             stall >= Duration::from_millis(LOCK_TTL_MS / 4 + MARGIN_MS),
             "the survivors got the lock {stall:?} after the kill: before the dead holder's grant expired"
         );
-        // No second outwait among the living: one would stall everyone
-        // for most of `ttl + margin` again.
+        // No second outwait among the living (one would stall everyone
+        // for most of `ttl + margin` again): `expired == 1` below is the
+        // exact check; the largest gap is latency, with a hard cap a
+        // stuck release (an F3-shaped stall shorter than the hang watch's
+        // bound) cannot hide under.
         anyhow::ensure!(
-            max_gap < Duration::from_millis(LOCK_TTL_MS),
-            "a {max_gap:?} gap between increments after the recovery (an outwait among live nodes?)"
+            max_gap < Duration::from_millis(5 * LOCK_TTL_MS),
+            "a {max_gap:?} gap between increments after the recovery (5 x TTL: a stuck release?)"
         );
         let expected = survivors_done + VICTIM_AT;
         let got = read_counter(&clients[0].mnt.join("counter"))?;
@@ -787,14 +807,34 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
             "    {NAME}: with {} dead in the queue ahead of it, {} was granted {waited:?} after the unlock; outwaited grants {expired} -> {expired2}",
             clients[victim].name, clients[3].name
         );
-        anyhow::ensure!(
-            waited < Duration::from_millis(LOCK_TTL_MS + MARGIN_MS) / 2,
-            "the next waiter waited {waited:?}: the dead waiter's grant was outwaited first"
-        );
+        // An outwait of the dead waiter's grant is counted: exact. How
+        // long the next waiter waited is latency.
         anyhow::ensure!(expired2 == expired, "a grant was outwaited in phase 2");
         for c in &clients {
             print_locks(NAME, c);
         }
+        let (killed, stall, max_gap, gap_at) = phase1_latency;
+        crate::hostlag::latency_bound(
+            &format!("{NAME}: the survivors' stall for the dead holder's grant"),
+            killed,
+            stall,
+            Duration::from_millis(LOCK_TTL_MS + MARGIN_MS),
+            Duration::from_millis(LOCK_TTL_MS + MARGIN_MS + SLACK_MS),
+        )?;
+        crate::hostlag::latency_bound(
+            &format!("{NAME}: the largest gap between increments after the recovery"),
+            gap_at,
+            max_gap,
+            Duration::ZERO,
+            Duration::from_millis(LOCK_TTL_MS),
+        )?;
+        crate::hostlag::latency_bound(
+            &format!("{NAME}: the next waiter's grant after the unlock, a dead waiter ahead"),
+            released,
+            waited,
+            Duration::ZERO,
+            Duration::from_millis(LOCK_TTL_MS + MARGIN_MS) / 2,
+        )?;
         Ok(())
     })();
     if result.is_err() {
@@ -1016,6 +1056,9 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
             flock(&fc, libc::LOCK_EX | libc::LOCK_NB) == Err(Code::Again),
             "the contender got the lock while the locker holds it"
         );
+        let fenced0 = locks_of(&clients[locker_idx])?["fenced_io"]
+            .as_u64()
+            .unwrap_or(0);
         clients[holder].kill9()?;
         let killed = Instant::now();
         let took = wait_holds(&clients[backup_idx], epoch, Duration::from_secs(20))?;
@@ -1046,10 +1089,21 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
         eprintln!(
             "    {NAME}: locker EIOs {eios}, contender refusals {refused} across the failover"
         );
-        anyhow::ensure!(
-            eios == 0,
-            "the locker saw {eios} EIO(s) across the failover"
-        );
+        if eios > 0 {
+            // An error to the application, not latency: a hard failure
+            // whatever the host did. What triage needs: were they fences
+            // (the grant lapsed: its renewal came `(ttl - margin) / 2`
+            // late), and how much time the host took meanwhile.
+            let fenced = locks_of(&clients[locker_idx])?["fenced_io"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(fenced0);
+            bail!(
+                "the locker saw {eios} EIO(s) across the failover ({fenced} fenced by its lapsed \
+                 grant; {})",
+                crate::hostlag::lag_between(killed, until)
+            );
+        }
         held.release();
         let (r, took) = flock_timed(&fc, libc::LOCK_EX);
         r.map_err(|e| anyhow::anyhow!("contender after unlock: {e}"))?;

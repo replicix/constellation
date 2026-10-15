@@ -155,6 +155,16 @@ impl GatedDb {
             since: now,
             thread: std::thread::current(),
         });
+        if !priority {
+            if let Some(hold) = fault_store_stall() {
+                tracing::warn!(
+                    hold_ms = hold.as_millis() as u64,
+                    op = %at,
+                    "fault injection: holding the metadata writer lock (testing only)"
+                );
+                std::thread::sleep(hold);
+            }
+        }
         let waited_us = waited.as_micros() as u64;
         let behind = ahead.map(|h| {
             let held = now.saturating_duration_since(h.since);
@@ -184,6 +194,63 @@ impl GatedDb {
     }
 }
 
+/// `CONSTELLATION_FAULT_STORE_STALL_FILE=<path>` (load campaign): while
+/// that file exists, an ordinary writer (a FUSE worker or a background
+/// pass, never a [`priority_writes`] scope, so never the core's step)
+/// holds the writer lock for the number of milliseconds the file holds
+/// after taking it, and the core's next step waits behind it (finding
+/// 08's slow journal write). `<ms> once`: the first writer to see the
+/// file removes it, so one transaction stalls. `pid=<n>`: only the daemon
+/// of that pid stalls (several daemons may share one path). Write the file
+/// whole (to a temporary name, then rename): a reader that sees a prefix
+/// stalls for the wrong time. Unset, one cached lookup.
+fn fault_store_stall() -> Option<Duration> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let path = PATH
+        .get_or_init(|| {
+            std::env::var_os("CONSTELLATION_FAULT_STORE_STALL_FILE").map(std::path::PathBuf::from)
+        })
+        .as_ref()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let spec = parse_store_stall(&text)?;
+    if spec.pid.is_some_and(|p| p != std::process::id()) {
+        return None;
+    }
+    if spec.once && std::fs::remove_file(path).is_err() {
+        // Another writer took this one.
+        return None;
+    }
+    Some(Duration::from_millis(spec.ms))
+}
+
+/// [`fault_store_stall`]'s file: `<ms>[ once][ pid=<n>]`.
+#[derive(Debug, PartialEq, Eq)]
+struct StoreStall {
+    ms: u64,
+    once: bool,
+    pid: Option<u32>,
+}
+
+fn parse_store_stall(text: &str) -> Option<StoreStall> {
+    let mut it = text.split_whitespace();
+    let ms: u64 = it.next()?.parse().ok()?;
+    let mut spec = StoreStall {
+        ms,
+        once: false,
+        pid: None,
+    };
+    for w in it {
+        match w {
+            "once" if !spec.once => spec.once = true,
+            _ => match w.strip_prefix("pid=") {
+                Some(p) if spec.pid.is_none() => spec.pid = Some(p.parse().ok()?),
+                _ => return None,
+            },
+        }
+    }
+    (ms > 0).then_some(spec)
+}
+
 impl std::ops::Deref for GatedDb {
     type Target = SingleWriterTxDatabase;
 
@@ -198,6 +265,29 @@ mod tests {
     use crate::store::Meta;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn store_stall_spec() {
+        let spec = |ms, once, pid| Some(StoreStall { ms, once, pid });
+        assert_eq!(parse_store_stall("5000"), spec(5000, false, None));
+        assert_eq!(parse_store_stall(" 20000 once\n"), spec(20000, true, None));
+        assert_eq!(
+            parse_store_stall("800 once pid=42"),
+            spec(800, true, Some(42))
+        );
+        assert_eq!(parse_store_stall("800 pid=7"), spec(800, false, Some(7)));
+        for bad in [
+            "",
+            "0",
+            "x",
+            "100 twice",
+            "100 once more",
+            "1 pid=x",
+            "1 once once",
+        ] {
+            assert_eq!(parse_store_stall(bad), None, "{bad:?}");
+        }
+    }
 
     /// Busy ordinary writers take the store's lock back to back (a writer
     /// that lets it go takes it again before a woken waiter runs); the

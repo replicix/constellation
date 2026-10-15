@@ -742,10 +742,15 @@ fn close_race(
             std::fs::write(a.mnt.join(&file), &data)?;
             let took = t.elapsed();
             slowest = slowest.max(took);
-            anyhow::ensure!(
-                took < Duration::from_secs(10),
-                "A's back close of {file} stalled {took:?}"
-            );
+            // The bug this guards was a 120 s stall; 10 s is host slack,
+            // judged against the host-lag probe.
+            crate::hostlag::latency_bound(
+                &format!("{name}: A's back close of {file}"),
+                t,
+                took,
+                Duration::ZERO,
+                Duration::from_secs(10),
+            )?;
             files.push(Acked {
                 name: file,
                 hash: blake3::hash(&data),
@@ -811,6 +816,7 @@ fn close_race(
                 f.write_all(&data)?;
             }
             let close = t.elapsed();
+            let close_at = t;
             let t = Instant::now();
             let kept = if probe == "chmod" {
                 use std::os::unix::fs::PermissionsExt;
@@ -826,11 +832,21 @@ fn close_race(
             };
             let took = t.elapsed();
             eprintln!("    {name} [{mode:?}]: {kept}: close {close:?}, then {probe} {took:?}");
-            anyhow::ensure!(
-                close < Duration::from_secs(10) && took < Duration::from_secs(10),
-                "A's {probe} right after its back close stalled (close {close:?}, \
-                 {probe} {took:?})"
-            );
+            // As above: the bug was a 120 s stall.
+            crate::hostlag::latency_bound(
+                &format!("{name}: A's back close before the {probe}"),
+                close_at,
+                close,
+                Duration::ZERO,
+                Duration::from_secs(10),
+            )?;
+            crate::hostlag::latency_bound(
+                &format!("{name}: A's {probe} right after its back close"),
+                t,
+                took,
+                Duration::ZERO,
+                Duration::from_secs(10),
+            )?;
             files.push(Acked {
                 name: kept,
                 hash: blake3::hash(&data),

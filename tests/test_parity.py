@@ -446,6 +446,42 @@ class ParityTests(unittest.TestCase):
         with Run([results("linux-fuse", {"a": "exploded"})]) as r:
             self.assertEqual(r.code, 2)
 
+    def test_inconclusive_is_a_pass_for_parity_and_is_listed(self):
+        ref = all_passed("linux-fuse")
+        other = results(
+            "linux-fuse-process",
+            {
+                "basic-rw": ("inconclusive", "bound: 9s > 8s; host lag 3s"),
+                "crash-heal": "passed",
+                "fio-latency": "passed",
+            },
+        )
+        with Run([ref, other]) as r:
+            self.assertEqual(r.code, 0, r.stderr)
+        self.assertIn("Inconclusive", r.stdout)
+        self.assertIn("host lag 3s", r.stdout)
+        # Inconclusive in the reference, a failure elsewhere: a failure.
+        ref = results("linux-fuse", {**{n: "passed" for n in SCEN}, "basic-rw": "inconclusive"})
+        bad = results("linux-fuse-process", {**{n: "passed" for n in SCEN}, "basic-rw": "failed"})
+        with Run([ref, bad]) as r:
+            self.assertEqual(r.code, 1, r.stdout)
+        # Inconclusive against a skip differs as a pass does.
+        skip = results("linux-fuse-process", {**{n: "passed" for n in SCEN}, "basic-rw": "skipped"})
+        with Run([ref, skip]) as r:
+            self.assertEqual(r.code, 1, r.stdout)
+        self.assertIn("mismatch", r.stderr)
+
+    def test_too_many_inconclusive_fail(self):
+        many = {n: ("inconclusive", "host lag") for n in SCEN}
+        docs = [results("linux-fuse", many), results("linux-fuse-process", many)]
+        with Run(docs) as r:
+            self.assertEqual(r.code, 1, r.stdout)
+        self.assertIn("more than --max-inconclusive 2", r.stderr)
+        r = Run(docs)
+        r.args = ["--max-inconclusive", "3"] + r.args
+        with r:
+            self.assertEqual(r.code, 0, r.stderr)
+
     def test_additive_result_fields_are_accepted(self):
         docs = [
             all_passed("linux-fuse", s3_backend="docker", frontend="fuse"),

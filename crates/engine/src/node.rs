@@ -459,6 +459,7 @@ impl Engine {
             None => tokio::runtime::Handle::try_current()
                 .context("Engine::start needs a tokio runtime (EngineConfig::runtime)")?,
         };
+        crate::fault::start_runtime_hog(&rt);
         let credentials = Arc::new(credentials);
         // The host's share, or the profile's explicit override of it, and
         // never more than the engine asked for.

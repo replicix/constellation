@@ -64,7 +64,7 @@ fn urlencode(s: &str) -> String {
 /// Every `Completed { rid }` in the filesystem's log, in log order: the
 /// input of the log-level exactly-once check. A non-E2E segment is a zstd
 /// postcard `(v, node, epoch, records)` (`cli::shipper::SegmentEnvelope`).
-fn logged_completions(
+pub(crate) fn logged_completions(
     endpoint: &str,
     prefix: &str,
 ) -> Result<Vec<constellation_chaos::LoggedCompletion>> {
@@ -117,6 +117,47 @@ fn logged_completions(
         }
     }
     Ok(out)
+}
+
+/// One log segment's `(seq, node, epoch)`.
+pub(crate) type Tenure = (u64, u64, u64);
+
+/// Every log segment's tenure, in log order: `(seq, node, epoch)` from
+/// its envelope (`crate::verify::s3_log_check`), and how many segments
+/// were listed. A segment that does not decode as a plain one (an E2E
+/// filesystem's) is skipped: the caller compares the two counts.
+pub(crate) fn segment_tenures(endpoint: &str, prefix: &str) -> Result<(usize, Vec<Tenure>)> {
+    let mut out = Vec::new();
+    let mut keys = list_keys(endpoint, &format!("{prefix}/log/p0/"))?;
+    keys.sort();
+    let listed = keys.len();
+    for key in keys {
+        let Some(seq) = key
+            .rsplit('/')
+            .next()
+            .and_then(|n| n.strip_suffix(".zst"))
+            .and_then(|n| u64::from_str_radix(n, 16).ok())
+        else {
+            continue;
+        };
+        let mut compressed = Vec::new();
+        match crate::s3auth::get(&raw_key(endpoint, &key)).call() {
+            Ok(resp) => {
+                resp.into_reader().read_to_end(&mut compressed)?;
+            }
+            Err(ureq::Error::Status(404, _)) => continue,
+            Err(e) => return Err(e).with_context(|| format!("fetching {key}")),
+        }
+        let Ok(payload) = zstd::decode_all(&compressed[..]) else {
+            continue;
+        };
+        let Ok(((_v, node, epoch), _)) = postcard::take_from_bytes::<(u32, u64, u64)>(&payload)
+        else {
+            continue;
+        };
+        out.push((seq, node, epoch));
+    }
+    Ok((listed, out))
 }
 
 /// `s3://bucket/prefix` → `prefix`.

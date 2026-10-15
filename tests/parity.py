@@ -52,6 +52,13 @@ wildcard from also excusing an unrelated skip; a missing-tool skip (the
 harness's "<tool> not installed") is never a capability skip, so no
 wildcard covers it, whatever its `cap`.
 
+An `inconclusive` outcome (the harness's host-lag verdict: every correctness
+check passed, a latency bound could not be judged on a starved host or
+under an injected load) compares equal to `passed` and is never a
+violation up to `--max-inconclusive N` per lane (default 2; more is a
+violation: a latency regression may hide behind a busy host only so often);
+the summary lists each one with its reason.
+
 Output is a Markdown summary (for $GITHUB_STEP_SUMMARY) on stdout. Exit
 status: 0 = parity holds, 1 = violations, 2 = unusable input or expectations
 file.
@@ -68,7 +75,18 @@ from dataclasses import dataclass, field
 
 SCHEMA = 1
 DEFAULT_REFERENCE = "linux-fuse"
-OUTCOMES = ("passed", "failed", "skipped")
+OUTCOMES = ("passed", "failed", "skipped", "inconclusive")
+DEFAULT_MAX_INCONCLUSIVE = 2
+
+
+def same(a: str, b: str) -> bool:
+    """Outcomes that do not differ for parity: `inconclusive` is a pass
+    whose latency could not be judged."""
+
+    def norm(o: str) -> str:
+        return "passed" if o == "inconclusive" else o
+
+    return norm(a) == norm(b)
 ENTRY_KEYS = {"scenario", "lanes", "outcome", "cap", "reason"}
 TOP_KEYS = {"reference", "lane", "expect"}
 
@@ -275,6 +293,7 @@ def check(
     cfg: Config,
     required: list[str] | tuple[str, ...] = (),
     absent: list[str] | tuple[str, ...] = (),
+    max_inconclusive: int = DEFAULT_MAX_INCONCLUSIVE,
 ) -> Report:
     both = sorted(set(required) & set(absent))
     if both:
@@ -301,6 +320,21 @@ def check(
                     lane,
                     "*",
                     f"required lane has no results (lanes present: {sorted(lanes)})",
+                )
+            )
+
+    # More inconclusive scenarios in a lane than allowed: a latency
+    # regression can hide behind a busy host only so often.
+    for lane in sorted(lanes):
+        inc = sorted(n for n, r in lanes[lane].items() if r.outcome == "inconclusive")
+        if len(inc) > max_inconclusive:
+            add(
+                Violation(
+                    "inconclusive",
+                    lane,
+                    "*",
+                    f"{len(inc)} inconclusive scenario(s), more than --max-inconclusive "
+                    f"{max_inconclusive}: {', '.join(inc)}",
                 )
             )
 
@@ -347,7 +381,7 @@ def check(
                 add(Violation("missing", ref, name, f"present in {lane!r}, absent from {ref!r}"))
                 continue
             got, want = res[name], ref_res[name]
-            if got.outcome == want.outcome:
+            if same(got.outcome, want.outcome):
                 continue
             rep.differences.append((name, lane, want.outcome, got.outcome))
             if got.outcome == "failed" or want.outcome == "failed":
@@ -436,7 +470,7 @@ def stale_check(rep: Report, lanes: Lanes, cfg: Config, used: set[tuple[int, str
                             f"entry says {e.outcome!r} but the lane reports {got.outcome!r}",
                         )
                     )
-                elif ref is not None and ref.outcome == got.outcome:
+                elif ref is not None and same(ref.outcome, got.outcome):
                     add(
                         Violation(
                             "stale-expect",
@@ -473,8 +507,12 @@ def render(rep: Report) -> str:
         f"Reference lane: `{cfg.reference}`. Verdict: **{'PASS' if rep.ok else 'FAIL'}**"
         + ("" if rep.ok else f" ({len(rep.violations)} violation(s))")
     )
-    out += ["", "| Lane | Reference | Scenarios | passed | skipped | failed | Differs from reference |"]
-    out.append("|---|---|---:|---:|---:|---:|---:|")
+    out += [
+        "",
+        "| Lane | Reference | Scenarios | passed | inconclusive | skipped | failed "
+        "| Differs from reference |",
+    ]
+    out.append("|---|---|---:|---:|---:|---:|---:|---:|")
     diffs_by_lane: dict[str, int] = {}
     for _, lane, _, _ in rep.differences:
         diffs_by_lane[lane] = diffs_by_lane.get(lane, 0) + 1
@@ -484,11 +522,12 @@ def render(rep: Report) -> str:
         ref = cfg.reference_of(lane)
         out.append(
             f"| `{lane}` | {'(reference)' if ref == lane else '`' + ref + '`'} | {len(res)} "
-            f"| {n['passed']} | {n['skipped']} | {n['failed']} | {diffs_by_lane.get(lane, 0)} |"
+            f"| {n['passed']} | {n['inconclusive']} | {n['skipped']} | {n['failed']} "
+            f"| {diffs_by_lane.get(lane, 0)} |"
         )
     for lane in rep.absent:
         if lane not in rep.lanes:
-            out.append(f"| `{lane}` | not run (`--absent-lane`) | | | | | |")
+            out.append(f"| `{lane}` | not run (`--absent-lane`) | | | | | | |")
     if rep.violations:
         out += ["", "### Violations", "", "| Kind | Lane | Scenario | Detail |", "|---|---|---|---|"]
         for v in rep.violations:
@@ -505,6 +544,22 @@ def render(rep: Report) -> str:
             out.append(
                 f"| `{md(c.scenario)}` | `{c.lane}` | {c.reference} | {c.outcome} | {md(c.why)} |"
             )
+    inconclusive = [
+        (lane, name, r.reason or "")
+        for lane in sorted(rep.lanes)
+        for name, r in sorted(rep.lanes[lane].items())
+        if r.outcome == "inconclusive"
+    ]
+    if inconclusive:
+        out += [
+            "",
+            "### Inconclusive (correct; a latency bound could not be judged on a starved host)",
+            "",
+            "| Lane | Scenario | Why |",
+            "|---|---|---|",
+        ]
+        for lane, name, why in inconclusive:
+            out.append(f"| `{lane}` | `{md(name)}` | {md(why)} |")
     if rep.ok and not rep.covered:
         out += ["", "Every lane matches the reference on every scenario."]
     return "\n".join(out) + "\n"
@@ -538,12 +593,20 @@ def main(argv: list[str] | None = None) -> int:
         help="a lane deliberately not run (repeatable): its expectations are not checked, "
         "and results for it are a violation",
     )
+    ap.add_argument(
+        "--max-inconclusive",
+        type=int,
+        default=DEFAULT_MAX_INCONCLUSIVE,
+        metavar="N",
+        help="inconclusive scenarios a lane may have before it is a violation "
+        f"(default {DEFAULT_MAX_INCONCLUSIVE})",
+    )
     ap.add_argument("results", nargs="+", metavar="results.json", help="harness --results-json files")
     args = ap.parse_args(argv)
     try:
         cfg = load_config(args.expect)
         lanes = load_results(args.results)
-        rep = check(lanes, cfg, args.require_lane, args.absent_lane)
+        rep = check(lanes, cfg, args.require_lane, args.absent_lane, args.max_inconclusive)
     except ParityError as e:
         print(render_error(str(e)))
         print(f"parity: {e}", file=sys.stderr)

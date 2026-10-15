@@ -793,11 +793,11 @@ fn now_ns() -> i64 {
         .unwrap_or(0)
 }
 
+/// The protocol clock (`lease::now_unix_ms`, which a load campaign may
+/// offset), as the snapshot paths and the scheduler compare it with
+/// lease and batch windows.
 pub fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    constellation_store_s3::lease::now_unix_ms().max(0) as u64
 }
 
 /// One audit record per run under `prune/journal/`, mirroring the GC

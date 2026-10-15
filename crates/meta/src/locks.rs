@@ -2293,7 +2293,9 @@ impl crate::Meta {
             return Err(crate::MetaError::LockLapsed);
         }
         let _tag = crate::store::journal::PendingLockTag::set(tag);
-        f()
+        let out = f()?;
+        crate::mutate::note_landed(tag);
+        Ok(out)
     }
 }
 

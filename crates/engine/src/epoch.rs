@@ -32,11 +32,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// The protocol clock (`lease::now_unix_ms`, which a load campaign may
+/// offset): promise windows are compared across nodes.
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    constellation_store_s3::lease::now_unix_ms()
 }
 
 /// `local` key of the current (or last) epoch's resolution.

@@ -1679,6 +1679,9 @@ impl Driver {
                 self.refresh();
                 let refreshed_us = started.elapsed().as_micros() as u64 - handled_us;
                 let action_kinds: Vec<&'static str> = actions.iter().map(action_kind).collect();
+                // Load campaign: a stop between the decision and its
+                // dispatch (`CONSTELLATION_FAULT_STEP_PAUSE_FILE`).
+                crate::fault::step_pause();
                 self.dispatch(actions);
                 let dispatched_us =
                     started.elapsed().as_micros() as u64 - handled_us - refreshed_us;

@@ -56,6 +56,16 @@ pub(crate) fn prefix_in_use(prefix: &str) -> bool {
     PrefixLock::acquire(prefix).is_err()
 }
 
+/// An environment going away: the load profile's route for its direct
+/// endpoint ends, and verification checks the bucket log of what the
+/// scenario's clients wrote to it (`crate::verify::on_s3_env_drop`).
+impl Drop for S3Env {
+    fn drop(&mut self) {
+        crate::load::unroute_direct(&self.direct_endpoint);
+        crate::verify::on_s3_env_drop(&self.direct_endpoint);
+    }
+}
+
 /// The docker prefix's lock, held by a run that creates prefixed
 /// containers without an [`S3Env`] (`harness k8s-scenario`): released when
 /// dropped, or when the process dies.
@@ -262,6 +272,13 @@ pub struct S3Env {
     /// ports for the process backend).
     proxy_listen: String,
     proxy_upstream: String,
+    /// Where the load profile's own proxy listens (as toxiproxy sees it)
+    /// and its endpoint: clients given [`Self::direct_endpoint`] go
+    /// through it while an `s3:` load item is active (`crate::load`), so
+    /// the profile reaches them without touching the scenario's `s3`
+    /// proxy and the cuts it makes there.
+    load_listen: String,
+    load_endpoint: String,
     /// S3 endpoint (through the proxy) for constellation clients.
     pub endpoint: String,
     /// S3 endpoint bypassing the proxy (for harness-side checks).
@@ -346,10 +363,13 @@ impl S3Env {
                 "127.0.0.1::8474",
                 "-p",
                 "127.0.0.1::4567",
+                "-p",
+                "127.0.0.1::4568",
             ],
         )?;
         let toxi_api = toxi.host_port(8474)?;
         let s3_via_proxy = toxi.host_port(4567)?;
+        let s3_via_load = toxi.host_port(4568)?;
         let s3_direct = floci.host_port(4566)?;
 
         let toxiproxy = Toxiproxy::new(toxi_api);
@@ -359,10 +379,12 @@ impl S3Env {
         wait_s3_ready(&direct_endpoint, 60)?;
         create_bucket(&direct_endpoint, BUCKET, false)?;
 
-        Ok(S3Env {
+        S3Env {
             toxiproxy,
             proxy_listen: "0.0.0.0:4567".to_string(),
             proxy_upstream: format!("{floci_name}:4566"),
+            load_listen: "0.0.0.0:4568".to_string(),
+            load_endpoint: format!("http://127.0.0.1:{s3_via_load}"),
             endpoint: format!("http://127.0.0.1:{s3_via_proxy}"),
             direct_endpoint,
             backend: S3Backend::Docker,
@@ -372,7 +394,8 @@ impl S3Env {
                 _net: net,
                 _lock: lock,
             }),
-        })
+        }
+        .with_load()
     }
 
     fn start_process() -> Result<S3Env> {
@@ -385,8 +408,8 @@ impl S3Env {
             .context("creating the process-backend temp dir")?;
         let data = dir.path().join("data");
         std::fs::create_dir(&data)?;
-        let ports = free_ports(3)?;
-        let (s3_port, api_port, proxy_port) = (ports[0], ports[1], ports[2]);
+        let ports = free_ports(4)?;
+        let (s3_port, api_port, proxy_port, load_port) = (ports[0], ports[1], ports[2], ports[3]);
 
         let mut s3 = ChildGuard::spawn(
             "versitygw",
@@ -418,10 +441,12 @@ impl S3Env {
         })?;
         create_bucket(&direct_endpoint, BUCKET, true)?;
 
-        Ok(S3Env {
+        S3Env {
             toxiproxy,
             proxy_listen: format!("127.0.0.1:{proxy_port}"),
             proxy_upstream: format!("127.0.0.1:{s3_port}"),
+            load_listen: format!("127.0.0.1:{load_port}"),
+            load_endpoint: format!("http://127.0.0.1:{load_port}"),
             endpoint: format!("http://127.0.0.1:{proxy_port}"),
             direct_endpoint,
             backend: S3Backend::Process,
@@ -430,13 +455,30 @@ impl S3Env {
                 _s3: s3,
                 _dir: dir,
             }),
-        })
+        }
+        .with_load()
+    }
+
+    /// Under an `s3:` load item, open the load proxy for the direct
+    /// clients (see [`Self::load_endpoint`]).
+    fn with_load(self) -> Result<S3Env> {
+        if crate::load::s3_active() {
+            self.toxiproxy
+                .create_proxy("load-s3", &self.load_listen, &self.proxy_upstream)
+                .context("creating the load profile's S3 proxy")?;
+            crate::load::on_s3_proxy(&self.toxiproxy, "load-s3");
+            crate::load::route_direct(&self.direct_endpoint, &self.load_endpoint);
+        }
+        Ok(self)
     }
 
     /// The S3 proxy all constellation clients go through.
     pub fn s3_proxy(&self) -> Result<Proxy<'_>> {
-        self.toxiproxy
-            .create_proxy("s3", &self.proxy_listen, &self.proxy_upstream)
+        let p = self
+            .toxiproxy
+            .create_proxy("s3", &self.proxy_listen, &self.proxy_upstream)?;
+        crate::load::on_s3_proxy(&self.toxiproxy, "s3");
+        Ok(p)
     }
 
     /// The S3 proxy [`Self::s3_proxy`] created (for toxics on it later).

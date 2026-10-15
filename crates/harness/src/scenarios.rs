@@ -19,6 +19,7 @@ use std::time::Duration;
 /// The K5 lane's busy-writer loss: an `O_APPEND` writer whose file's
 /// attributes change under it.
 mod appendsize;
+mod campaign;
 /// A P2P cluster's nodes `kill -9`ed and restarted together.
 mod cluster_restart;
 /// Plan 31 §6.12: subtree confinement through the kernel.
@@ -50,6 +51,7 @@ mod m11;
 mod m14;
 /// Plan 30 §M4's scenarios and the chaos runs' whole-cluster checks.
 mod m4;
+pub(crate) use m4::{logged_completions, segment_tenures};
 /// Plan 30 §M5 phase 2: the stale-base rule on the wire.
 mod m5;
 mod m6;
@@ -1778,6 +1780,16 @@ pub const SCENARIOS: &[Scenario] = &[
     },
 ];
 
+/// The host-load campaign's own scenarios (`tools/load-campaign`): run by
+/// name only, never in the default catalog (nor the parity lanes).
+pub const CAMPAIGN: &[Scenario] = &[Scenario {
+    name: "load-probe",
+    desc: "load campaign phase 0: two nodes write self-describing files (ledgered), rename, unlink and increment a flock'ed counter under the load profile; every checker runs (data, acknowledged writes after a remount, fsck, exclusion, errno classes, token order, lease epochs, the bucket log); CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<checker> breaks one on purpose",
+    requires: &[],
+    caps: &[Cap::ClusterLocks],
+    run: campaign::load_probe,
+}];
+
 /// Plan 30 M0: scenarios that reproduce a known, not-yet-fixed bug
 /// (`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md` §1.1).
 /// Kept out of [`SCENARIOS`] so a bare `harness run` (no names) never
@@ -2271,8 +2283,12 @@ fn cold_cache(seed: u64) -> Result<()> {
 /// Poll until `f` succeeds or `deadline` passes (cross-node
 /// propagation is asynchronous: sync interval + FUSE TTLs). An
 /// interrupted run ([`crate::interrupt::aborting`]) stops polling at the
-/// first failure.
+/// first failure. The deadline is a liveness bound, so the load campaign
+/// stretches it (`CONSTELLATION_HARNESS_DEADLINE_SCALE`,
+/// [`crate::load::scaled`]): on a starved host "not yet" must not read as
+/// "never" (the hang watch is what fails a real hang).
 pub fn eventually(what: &str, deadline: Duration, mut f: impl FnMut() -> Result<()>) -> Result<()> {
+    let deadline = crate::load::scaled(deadline);
     let start = std::time::Instant::now();
     loop {
         match f() {

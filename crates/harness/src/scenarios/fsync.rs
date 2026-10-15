@@ -226,12 +226,21 @@ pub(super) fn fsync_soft_timeout(seed: u64) -> Result<()> {
         error.raw_os_error() == Some(libc::EIO),
         "fsync failed with {error}, want EIO"
     );
+    // Never before the timeout (the contract: exact).
     anyhow::ensure!(
-        took >= Duration::from_millis(1900) && took < Duration::from_secs(15),
+        took >= Duration::from_millis(1900),
         "the 2 s soft timeout answered after {took:?}"
     );
     anyhow::ensure!(still_pending > 0, "the data stays pending after the EIO");
     anyhow::ensure!(status_u64(&c, &["fsync", "timeouts"])? >= 1);
+    // How soon after it: latency.
+    crate::hostlag::latency_bound(
+        "the 2 s soft fsync timeout's answer",
+        started,
+        took,
+        Duration::from_secs(2),
+        Duration::from_secs(15),
+    )?;
 
     // Nothing was dropped: after the heal the background rounds upload it
     // with no further fsync, and another node reads it from the bucket.
@@ -319,16 +328,20 @@ pub(super) fn fsync_interrupt(seed: u64) -> Result<()> {
         let killed = Instant::now();
         // SAFETY: as above.
         unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+        // Unkillable is a hang (30 s, or the hang bound if shorter, decide
+        // "never"); how soon the killed process went is latency, below.
         loop {
             if child.try_wait()?.is_some() {
                 break;
             }
             anyhow::ensure!(
-                killed.elapsed() < Duration::from_secs(5),
-                "the process stayed blocked in fsync after SIGKILL (unkillable)"
+                killed.elapsed() < crate::verify::hang_bound().min(Duration::from_secs(30)),
+                "the process stayed blocked in fsync for {:?} after SIGKILL (unkillable)",
+                killed.elapsed()
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+        let gone = killed.elapsed();
         let mut stdout = String::new();
         if let Some(mut out) = child.stdout.take() {
             std::io::Read::read_to_string(&mut out, &mut stdout)?;
@@ -349,6 +362,13 @@ pub(super) fn fsync_interrupt(seed: u64) -> Result<()> {
                 anyhow::ensure!(status_u64(&c, &["fsync", "waiting"])? == 0);
                 Ok(())
             },
+        )?;
+        crate::hostlag::latency_bound(
+            "SIGKILL reaping the fsync's caller",
+            killed,
+            gone,
+            Duration::ZERO,
+            Duration::from_secs(5),
         )?;
         Ok(())
     })();

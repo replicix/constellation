@@ -963,20 +963,26 @@ fn delegate_crash_with(scenario: &'static str, default_ttl: Option<u64>) -> Resu
                 after_kill > Duration::from_millis(DELEG_TTL_MS + 2_000),
                 "reclaimed {after_kill:?} after the kill: the default TTL is not in effect"
             );
-            anyhow::ensure!(
-                c_took < Duration::from_millis(deleg_ttl + 10_000),
-                "c's write waited {c_took:?}"
-            );
-        } else {
-            anyhow::ensure!(
-                c_took < Duration::from_millis(3 * DELEG_TTL_MS + 5_000),
-                "c's write waited {c_took:?}"
-            );
         }
         anyhow::ensure!(
             std::fs::read(a.mnt.join(&name))? == name.as_bytes(),
             "the root does not show c's write"
         );
+        // The reclaim's lower bound above is exact; how long c's write
+        // waited for it is latency (the grant's TTL and margin, plus host
+        // slack), judged against the host-lag probe.
+        let (protocol, bound) = if default_ttl.is_some() {
+            (deleg_ttl + 1_000, deleg_ttl + 10_000)
+        } else {
+            (DELEG_TTL_MS + 1_000, 3 * DELEG_TTL_MS + 5_000)
+        };
+        crate::hostlag::latency_bound(
+            &format!("{scenario}: c's write waiting for the dead delegate's reclaim"),
+            t,
+            c_took,
+            Duration::from_millis(protocol),
+            Duration::from_millis(bound),
+        )?;
         // b returns with its journal.
         clients[1].mount()?;
         let a = &clients[0];

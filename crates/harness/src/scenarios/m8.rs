@@ -431,6 +431,7 @@ pub fn cto_recall_unreachable(_seed: u64) -> Result<()> {
             );
             let a_before = cto_of(a)?;
             r.pause()?;
+            let write_started = Instant::now();
             let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 write_timed(&writer.mnt.join("f"), content.as_bytes())
             }));
@@ -456,11 +457,6 @@ pub fn cto_recall_unreachable(_seed: u64) -> Result<()> {
                 "{}'s close returned {since_grant:?} after R's grant: before TTL + margin",
                 writer.name
             );
-            anyhow::ensure!(
-                took <= Duration::from_millis(TTL_MS) + margin + Duration::from_secs(3),
-                "{}'s close took {took:?}: far past TTL + margin",
-                writer.name
-            );
             let (got, _) = read_timed(&r.mnt.join("f"));
             let got = got.context("R reading f after thawing")?;
             anyhow::ensure!(
@@ -468,6 +464,18 @@ pub fn cto_recall_unreachable(_seed: u64) -> Result<()> {
                 "R read {:?} after thawing, expected {content:?}",
                 String::from_utf8_lossy(&got)
             );
+            // The lower bound above is the protocol's (exact); how far past
+            // TTL + margin the close returned is latency.
+            crate::hostlag::latency_bound(
+                &format!(
+                    "{NAME}: {}'s close with R frozen (round {round})",
+                    writer.name
+                ),
+                write_started,
+                took,
+                Duration::from_millis(TTL_MS) + margin,
+                Duration::from_millis(TTL_MS) + margin + Duration::from_secs(3),
+            )?;
         }
         print_cto(NAME, "A", &cto_of(a)?);
         print_cto(NAME, "R", &cto_of(r)?);

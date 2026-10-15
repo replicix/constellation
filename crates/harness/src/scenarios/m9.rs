@@ -156,6 +156,11 @@ pub(super) fn cluster(
     Ok((env, root, clients, proxies))
 }
 
+/// The timings [`cluster`]'s daemons run with (scenario extras aside).
+fn cluster_timings() -> crate::timings::Timings {
+    crate::timings::Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", TTL_MS.to_string())])
+}
+
 /// The P2P deny file of `name` (`fault::p2p_denied`): peers listed in it
 /// are unreachable from that node. Absent until a scenario cuts a link.
 pub(super) fn c_deny_path(root: &std::path::Path, name: &str) -> std::path::PathBuf {
@@ -304,10 +309,10 @@ pub fn backup_failover(_seed: u64) -> Result<()> {
                 b.name,
                 lease_of(b)?["epoch"]
             );
-            anyhow::ensure!(
-                took < Duration::from_millis(TTL_MS / 2),
-                "takeover took {took:?}: not seal-based (TTL {TTL_MS} ms)"
-            );
+            // Seal-based, not TTL: `backup_takeovers` and `seals` below
+            // say so exactly; the time is latency (the seal window plus
+            // host slack, judged against the host-lag probe).
+            let took_check = (killed, took);
             failovers.push(took);
             // The lease is held before the takeover gate re-applies the
             // tail (the gate runs in the rounds after the claim): give
@@ -333,7 +338,13 @@ pub fn backup_failover(_seed: u64) -> Result<()> {
             anyhow::ensure!(n(&a, "seals") >= 1, "{} did not seal: {a}", b.name);
             // Every acknowledged file is on the new holder, at once.
             all_visible(b, &names, Duration::from_secs(10))?;
-            let _ = killed;
+            crate::hostlag::latency_bound(
+                &format!("{NAME}: round {round}: the seal-based takeover"),
+                took_check.0,
+                took_check.1,
+                cluster_timings().backup_takeover,
+                Duration::from_millis(TTL_MS / 2),
+            )?;
             // The dead node comes back and converges (its stranded
             // journal replays by rid: the rows the tail re-shipped are
             // already completed).
@@ -563,11 +574,11 @@ pub fn ack_s3_failover(_seed: u64) -> Result<()> {
             .context("B's write after A froze")?;
         let took = t.elapsed();
         eprintln!("    {NAME}: B's write returned {took:?} after A froze");
-        anyhow::ensure!(
-            frozen.elapsed() < Duration::from_millis(TTL_MS / 2),
-            "the takeover took {:?}: not the fast path (TTL {TTL_MS} ms)",
-            frozen.elapsed()
-        );
+        // Fast, not TTL: `s3_fast_takeovers` below says so exactly. The
+        // time is latency: the takeover window, plus (plan 41 L0, finding
+        // F4) the successor's strict-read quarantine when it counted one,
+        // capped by the predecessor's lease, plus host slack.
+        let since_freeze = frozen.elapsed();
         // Every live non-holder watches the holder's stream under `ack=s3`
         // and races for the log slot once it falls silent (the slot's CAS
         // picks one): the plan promises that *a* live node takes over
@@ -596,6 +607,30 @@ pub fn ack_s3_failover(_seed: u64) -> Result<()> {
             "{} holds the lease but did not take it over fast: {w_ack}",
             clients[w].name
         );
+        // The successor's quarantine as it logged it (measured), checked
+        // against the configured formula (a tripwire for drift).
+        let t = cluster_timings();
+        let waits = super::delegroot::floor_waits_logged(&clients[w]);
+        let cap = t.ack_floor_wait(true).min(t.lease_ttl).as_millis() as u64;
+        anyhow::ensure!(
+            n(&w_ack, "ack_floor_waits") == 0 || !waits.is_empty(),
+            "{} counted a quarantine (ack_floor_waits) but logged no wait_ms",
+            clients[w].name
+        );
+        anyhow::ensure!(
+            waits.iter().all(|x| *x <= cap),
+            "{}'s quarantine waited {waits:?} ms, past the configured {cap} ms",
+            clients[w].name
+        );
+        let protocol =
+            t.backup_takeover + Duration::from_millis(waits.iter().copied().max().unwrap_or(0));
+        crate::hostlag::latency_bound(
+            &format!("{NAME}: B's write across the fast takeover"),
+            frozen,
+            since_freeze,
+            protocol,
+            Duration::from_millis(TTL_MS / 2).max(protocol + Duration::from_millis(6_500)),
+        )?;
         all_visible(&clients[w], &names, Duration::from_secs(10))?;
         all_visible(&clients[1], &names, Duration::from_secs(10))?;
         clients[0].resume()?;

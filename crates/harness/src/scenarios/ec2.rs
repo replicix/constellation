@@ -989,14 +989,13 @@ pub fn inbox_withdraw_hole(_seed: u64) -> Result<()> {
         cut(true)?;
         std::fs::remove_file(&pause)?;
         std::thread::sleep(Duration::from_secs(2));
-        let mut slow = Vec::new();
+        let mut timed = Vec::new();
         for name in ["f2", "f3", "f4"] {
+            let at = Instant::now();
             let (r, took) = write(name).join().expect(name);
             r.map_err(|e| anyhow::anyhow!(e))?;
             eprintln!("    {NAME}: {name} took {took:?} through the inbox");
-            if took > WRITE_BUDGET {
-                slow.push(format!("{name} {took:?}"));
-            }
+            timed.push((name, at, took));
         }
         let (tombstones, executed) = (inbox(a, "tombstones_read")?, inbox(a, "executed_ops")?);
         eprintln!(
@@ -1005,16 +1004,22 @@ pub fn inbox_withdraw_hole(_seed: u64) -> Result<()> {
             inbox(b, "next_n")?,
             inbox(b, "unavailable")? - unavailable
         );
-        anyhow::ensure!(
-            slow.is_empty(),
-            "inbox writes behind a withdrawn batch took over {WRITE_BUDGET:?}: {slow:?}"
-        );
         anyhow::ensure!(tombstones >= 1, "the holder never read the withdrawn batch");
         anyhow::ensure!(executed >= 3, "the holder executed {executed} inbox ops");
         anyhow::ensure!(
             inbox(b, "unavailable")? == unavailable,
             "an inbox write took the lease path"
         );
+        // Far under the in-doubt deadline: latency, against the probe.
+        for (name, at, took) in timed {
+            crate::hostlag::latency_bound(
+                &format!("inbox write {name} behind a withdrawn batch"),
+                at,
+                took,
+                Duration::ZERO,
+                WRITE_BUDGET,
+            )?;
+        }
 
         // 4. Healed: every write everywhere, once.
         cut(false)?;

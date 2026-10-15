@@ -23,6 +23,7 @@ use super::m11::{
 };
 use super::{eventually, lease_of};
 use crate::client::Client;
+use crate::timings::Timings;
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::PathBuf;
@@ -319,12 +320,53 @@ pub fn delegate_root_loss_ttl(_seed: u64) -> Result<()> {
 /// is no backup (never was, or the root dropped it before it died), the
 /// TTL takeover: the lease's expiry plus the 3 s a non-backup waits past
 /// it, measured from the root's last renewal (at most one TTL before its
-/// death), plus the inbox and escalation steps. Each plus slack for a
-/// loaded host. On kind the wait was over four minutes.
-const FAST_BOUND: Duration = Duration::from_secs(8);
+/// death), plus the inbox and escalation steps. On kind the wait was over
+/// four minutes.
+///
+/// Since plan 41 L0 (`9d00417`) a root that answered a delegation renewal
+/// marks its tenure granting first, so the seal's successor waits out the
+/// predecessor's strict-read horizon before it acknowledges a mutation
+/// (`note_marker_landed`, [`Timings::ack_floor_wait`]: 1.5 + 5 + 6 + 2 =
+/// 14.5 s with [`ENV`]). The fast bound is the protocol's, derived from
+/// the configured timings — the takeover window, plus that wait when the
+/// successor counted one (`ack_floor_waits`) — plus [`FAST_SLACK`] of
+/// host time, and it is judged against the host-lag probe
+/// ([`crate::hostlag::latency_bound`]); the constant 8 s it replaces
+/// predates L0 (finding F4).
+const FAST_SLACK: Duration = Duration::from_millis(6_500);
+
+/// The TTL takeover's protocol part: expiry plus the 3 s a non-backup
+/// waits past it.
+fn ttl_protocol(lease_ttl: Duration) -> Duration {
+    lease_ttl + Duration::from_secs(3)
+}
 
 fn ttl_bound(lease_ttl: Duration) -> Duration {
-    lease_ttl + Duration::from_secs(3) + Duration::from_secs(12)
+    ttl_protocol(lease_ttl) + Duration::from_secs(12)
+}
+
+/// The timings `root_loss`'s daemons run with (see [`delegated_pair`]).
+fn pair_timings(backed: bool) -> Timings {
+    let mut env: Vec<(&str, &str)> = ENV.to_vec();
+    if !backed {
+        env.push(("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "0"));
+        env.push(("CONSTELLATION_LEASE_TTL_MS", "20000"));
+    }
+    Timings::from_pairs(&env)
+}
+
+/// The waits `node`'s log reports for the successor's quarantine
+/// (`wait_ms` of "acknowledging no mutation until its delegation horizon
+/// has passed").
+pub(super) fn floor_waits_logged(node: &Client) -> Vec<u64> {
+    node.log_text()
+        .lines()
+        .filter(|l| l.contains("acknowledging no mutation until its delegation horizon"))
+        .filter_map(|l| {
+            crate::verify::field(&crate::verify::strip_ansi(l), "wait_ms")
+                .and_then(|v| v.parse().ok())
+        })
+        .collect()
 }
 
 /// The backup's handoff before the root's loss: `b` runs `daemon
@@ -441,6 +483,10 @@ fn root_loss(name: &'static str, backed: bool, freeze: bool, handoff_first: bool
             && super::m9::ack_of(&clients[0])?["backups"]
                 .as_array()
                 .is_some_and(|v| v.iter().any(|x| x.as_u64() == Some(b_id)));
+        // The successor's quarantine waits so far (F4: since L0 one
+        // follows every seal of a root that renewed delegations).
+        let floor_waits0 = n(&super::m9::ack_of(&clients[1])?, "ack_floor_waits");
+        let logged0 = floor_waits_logged(&clients[1]).len();
         let killed_at = w.now();
         let killed = Instant::now();
         if freeze {
@@ -469,7 +515,14 @@ fn root_loss(name: &'static str, backed: bool, freeze: bool, handoff_first: bool
                 held_at = Some(w.now());
             }
             if w.now() >= past {
-                break w.wait_ops_after(past, 10, ttl_bound(lease_ttl));
+                // Liveness, not latency: no write may wait for the dead
+                // root. The hang bound is the arbiter of "never" (a
+                // starved host makes the TTL bound alone too short).
+                break w.wait_ops_after(
+                    past,
+                    10,
+                    ttl_bound(lease_ttl).max(crate::verify::hang_bound()),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -503,36 +556,65 @@ fn root_loss(name: &'static str, backed: bool, freeze: bool, handoff_first: bool
         // 150) is no failover wait, and they are bound only by the TTL
         // takeover's bound: no write waits for the dead root.
         let settled = held_at.unwrap_or(past) + Duration::from_secs(2);
+        // (took, when it began).
         let (mut failover, mut later) = (Vec::new(), Vec::new());
         for o in w.ops.lock().unwrap().iter() {
             if o.at + o.took < killed_at {
                 continue;
             }
             if o.at <= settled {
-                failover.push(o.took);
+                failover.push((o.took, w.started + o.at));
             } else {
-                later.push(o.took);
+                later.push((o.took, w.started + o.at));
             }
         }
         let total = w.ops.lock().unwrap().len() as u64;
         w.finish();
-        let longest = failover.iter().max().copied().unwrap_or_default();
+        let longest = failover
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or((Duration::ZERO, killed));
+        let longest_later = later
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or((Duration::ZERO, killed));
         // A listed backup takes over by seal.
         let fast = n(&ack, "backup_takeovers") >= 1;
+        let timings = pair_timings(backed);
+        let quarantined = n(&ack, "ack_floor_waits") > floor_waits0;
+        let waits: Vec<u64> = floor_waits_logged(b)
+            .get(logged0..)
+            .unwrap_or_default()
+            .to_vec();
+        // The protocol's part is what the successor logged it waited
+        // (measured); the mirrored formula is only the cap it is checked
+        // against below, a loud tripwire for drift.
+        let logged = Duration::from_millis(waits.iter().copied().max().unwrap_or(0));
+        let protocol = if fast {
+            timings.backup_takeover + logged
+        } else {
+            ttl_protocol(lease_ttl)
+        };
         let bound = if fast {
-            FAST_BOUND
+            protocol + FAST_SLACK
         } else {
             ttl_bound(lease_ttl)
         };
+        let durations = |v: &[(Duration, Instant)]| v.iter().map(|x| x.0).collect::<Vec<_>>();
         eprintln!(
-            "    {name}: b's writes across the root's loss: {} ({} takeover, bound {bound:?}; b \
-             held the root {:?} after the {}); afterwards: {}; {} inherited generations, {} \
-             reclaimed",
-            dist(&failover),
+            "    {name}: b's writes across the root's loss: {} ({} takeover, protocol {protocol:?}, \
+             bound {bound:?}; successor quarantine {} (logged waits {waits:?} ms, configured at \
+             most {:?}); b held the root {:?} after the {}); afterwards: {}; {} inherited \
+             generations, {} reclaimed",
+            dist(&durations(&failover)),
             if fast { "seal-based" } else { "TTL" },
+            if quarantined { "waited" } else { "none" },
+            timings.ack_floor_wait(true),
             held_at.map(|t| t.saturating_sub(killed_at)),
             if freeze { "freeze" } else { "kill" },
-            dist(&later),
+            dist(&durations(&later)),
             n(&db, "inherited"),
             n(&db, "reclaimed")
         );
@@ -541,15 +623,18 @@ fn root_loss(name: &'static str, backed: bool, freeze: bool, handoff_first: bool
             "writes failed across the failover: {errs:?}"
         );
         anyhow::ensure!(took_over, "b never took the root over");
+        // A counted quarantine is logged (else the measured term above
+        // would be zero: a log text drift), and never longer than the
+        // configured one (it is capped by the predecessor's expiry, so it
+        // may be shorter).
         anyhow::ensure!(
-            longest <= bound,
-            "a write + fsync took {longest:?} across the root's loss (bound {bound:?})"
+            !quarantined || !waits.is_empty(),
+            "the successor counted a quarantine (ack_floor_waits) but logged no wait_ms"
         );
-        let longest_later = later.iter().max().copied().unwrap_or_default();
+        let cap = timings.ack_floor_wait(true).as_millis() as u64;
         anyhow::ensure!(
-            longest_later <= ttl_bound(lease_ttl),
-            "a write + fsync on the new root took {longest_later:?} (bound {:?})",
-            ttl_bound(lease_ttl)
+            waits.iter().all(|w| *w <= cap),
+            "the successor's quarantine waited {waits:?} ms, past the configured {cap} ms"
         );
         if handoff_first {
             anyhow::ensure!(listed, "b was not a's listed backup at the kill");
@@ -574,6 +659,22 @@ fn root_loss(name: &'static str, backed: bool, freeze: bool, handoff_first: bool
             Ok(())
         })?;
         super::ensure_no_conflicts(&[&clients[0], &clients[1]])?;
+        // Latency last, once every correctness check held: judged against
+        // the host-lag probe, inconclusive (not failed) on a starved host.
+        crate::hostlag::latency_bound(
+            &format!("{name}: a write + fsync across the root's loss"),
+            longest.1,
+            longest.0,
+            protocol,
+            bound,
+        )?;
+        crate::hostlag::latency_bound(
+            &format!("{name}: a write + fsync on the new root"),
+            longest_later.1,
+            longest_later.0,
+            ttl_protocol(lease_ttl),
+            ttl_bound(lease_ttl),
+        )?;
         Ok(())
     })();
     dump_logs_on_failure(name, &clients, &result);
@@ -666,6 +767,15 @@ pub fn delegate_handoff_renewal(_seed: u64) -> Result<()> {
             let (across, _) = w.after(up_at);
             let meta = w.meta_after(resumed_at);
             let longest = meta.iter().max().copied().unwrap_or_default();
+            let longest_at = w
+                .ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.at + o.took >= resumed_at && o.meta == longest)
+                .map(|o| w.started + o.at)
+                .next()
+                .unwrap_or_else(Instant::now);
             let slowest_control = control_meta.iter().max().copied().unwrap_or_default();
             // (A host stall slows the writes before the upgrade too.)
             let bound = HANDOFF_BOUND.max(slowest_control * 2);
@@ -711,10 +821,15 @@ pub fn delegate_handoff_renewal(_seed: u64) -> Result<()> {
                 n(&db, "executed") + n(&db, "fast_path_executed") > 0,
                 "the resumed image executed nothing as the delegate: {db}"
             );
-            anyhow::ensure!(
-                longest <= bound,
-                "a create + close after the resume took {longest:?} (bound {bound:?})"
-            );
+            // No wait for a reclaim (the checks above); the time itself is
+            // latency, judged against the host-lag probe.
+            crate::hostlag::latency_bound(
+                &format!("{NAME}: round {round}: a create + close after the resume"),
+                longest_at,
+                longest,
+                Duration::ZERO,
+                bound,
+            )?;
         }
         w.finish();
         print_deleg(NAME, "a", &deleg_of(a)?);
