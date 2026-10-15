@@ -69,6 +69,9 @@ impl Calls {
 pub enum Fault {
     /// Answer with this HTTP status; the operation does not take effect.
     Status(u16),
+    /// [`Fault::Status`] with no error body, so no S3 `<Code>`: what a
+    /// `HEAD` refused by S3 returns (a `HEAD` answer has no body).
+    Bodiless(u16),
     /// The operation times out without taking effect.
     Timeout,
     /// The operation takes effect, then the caller sees this status.
@@ -114,6 +117,22 @@ impl std::fmt::Display for HttpStatus {
 }
 
 impl std::error::Error for HttpStatus {}
+
+/// [`HttpStatus`] for an answer with no body ([`Fault::Bodiless`]).
+#[derive(Debug)]
+struct BodilessStatus(u16);
+
+impl std::fmt::Display for BodilessStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Error performing HEAD (injected) - Server returned non-2xx status code: {}: ",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for BodilessStatus {}
 
 #[derive(Debug)]
 struct Timeout;
@@ -170,6 +189,19 @@ pub fn s3_error(path: &str, status: u16, mode: &PutMode) -> object_store::Error 
             store: "S3",
             source: http(),
         },
+    }
+}
+
+/// A 401 (`Unauthenticated`) or 403 (`PermissionDenied`) of a read.
+fn refused(
+    location: &Path,
+    status: u16,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> object_store::Error {
+    let path = location.to_string();
+    match status {
+        401 => object_store::Error::Unauthenticated { path, source },
+        _ => object_store::Error::PermissionDenied { path, source },
     }
 }
 
@@ -276,7 +308,9 @@ impl ObjectStore for FaultyStore {
         let mode = opts.mode.clone();
         match self.fault_for(OpKind::Put, location) {
             None | Some(Fault::Truncated(_)) => self.inner.put_opts(location, payload, opts).await,
-            Some(Fault::Status(status)) => Err(s3_error(location.as_ref(), status, &mode)),
+            Some(Fault::Status(status) | Fault::Bodiless(status)) => {
+                Err(s3_error(location.as_ref(), status, &mode))
+            }
             Some(Fault::Timeout) => Err(timeout_error()),
             Some(Fault::AppliedThen(status)) => {
                 self.inner.put_opts(location, payload, opts).await?;
@@ -315,9 +349,20 @@ impl ObjectStore for FaultyStore {
                 path: location.to_string(),
                 source: Box::new(HttpStatus(404)),
             }),
+            // A refusal is typed as `object_store`'s S3 client types it.
+            Some(Fault::Status(status @ (401 | 403))) => {
+                Err(refused(location, status, Box::new(HttpStatus(status))))
+            }
             Some(Fault::Status(status)) => {
                 Err(s3_error(location.as_ref(), status, &PutMode::Overwrite))
             }
+            Some(Fault::Bodiless(status @ (401 | 403))) => {
+                Err(refused(location, status, Box::new(BodilessStatus(status))))
+            }
+            Some(Fault::Bodiless(status)) => Err(object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(BodilessStatus(status)),
+            }),
             Some(Fault::Timeout) => Err(timeout_error()),
             Some(Fault::Truncated(n)) => {
                 let full = self.inner.get_opts(location, options).await?;

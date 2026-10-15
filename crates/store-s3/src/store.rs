@@ -398,13 +398,35 @@ impl ChunkStore {
         Ok(meta)
     }
 
-    /// Whether `meta.json` exists, by `HEAD` alone (`doctor`: a `GET` of
+    /// Whether `meta.json` exists, by `HEAD` (`doctor`: a `GET` of
     /// the key before `fs create` is what a store that caches negative
     /// answers would keep serving to the `mount` after it).
+    ///
+    /// A `HEAD` that S3 refuses (401, 403) cannot say why: its answer has
+    /// no body, so no `<Code>` (`InvalidAccessKeyId`,
+    /// `SignatureDoesNotMatch`, `AccessDenied`, ...), the one part of an
+    /// error body [`crate::aws_auth::redacted_error_body`] keeps. The
+    /// refusal is then asked for again by a `GET` and that error is the
+    /// answer: `fs.unlock`'s gate must name a revoked key pair. The `GET`
+    /// goes to a key the same credentials were just refused, never one
+    /// whose `404` a store could cache.
     pub async fn fs_exists(&self) -> Result<bool, StoreError> {
-        match self.store.head(&layout::meta_json()).await {
+        let key = layout::meta_json();
+        let refused = |e: &object_store::Error| {
+            matches!(
+                e,
+                object_store::Error::PermissionDenied { .. }
+                    | object_store::Error::Unauthenticated { .. }
+            )
+        };
+        match self.store.head(&key).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(head) if refused(&head) => match self.store.get(&key).await {
+                Err(get) if refused(&get) => Err(get.into()),
+                // Not refused this time: what the HEAD said stands.
+                _ => Err(head.into()),
+            },
             Err(e) => Err(e.into()),
         }
     }
@@ -1434,6 +1456,54 @@ mod tests {
         assert_eq!(faulty.calls(OpKind::Get, "meta.json"), 4);
         assert!(faulty.calls(OpKind::Head, "meta.json") >= 1);
         assert!(s.fs_exists().await.unwrap());
+    }
+
+    /// Plan 31's closing gate (`csi-credential-revocation`): a revoked key
+    /// pair's refusal must name S3's reason, which only a `GET`'s error
+    /// body carries; the `HEAD` that asks whether `meta.json` exists is
+    /// refused with no body.
+    #[tokio::test]
+    async fn a_refused_head_answers_with_the_refusal_a_get_explains() {
+        use crate::faulty::{Calls, Fault, FaultyStore, OpKind};
+        for status in [401, 403] {
+            let faulty = FaultyStore::new();
+            let s = ChunkStore::new(faulty.clone());
+            s.create_fs(&FsMeta::new(DEFAULT_CHUNK_SIZE, "raw"))
+                .await
+                .unwrap();
+            faulty.script(
+                OpKind::Head,
+                "meta.json",
+                Calls::Every,
+                Fault::Bodiless(status),
+            );
+            faulty.script(
+                OpKind::Get,
+                "meta.json",
+                Calls::Every,
+                Fault::Status(status),
+            );
+            let e = s.fs_exists().await.unwrap_err().to_string();
+            assert!(e.contains("<Code>injected</Code>"), "{status}: {e}");
+            assert_eq!(faulty.calls(OpKind::Get, "meta.json"), 1);
+        }
+        // A GET that is not refused leaves the HEAD's refusal standing.
+        let faulty = FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        faulty.script(
+            OpKind::Head,
+            "meta.json",
+            Calls::Every,
+            Fault::Bodiless(403),
+        );
+        let e = s.fs_exists().await.unwrap_err().to_string();
+        assert!(e.contains("Error performing HEAD"), "{e}");
+        // Anything else a HEAD answers is taken as it is: no GET.
+        let faulty = FaultyStore::new();
+        let s = ChunkStore::new(faulty.clone());
+        faulty.script(OpKind::Head, "meta.json", Calls::Every, Fault::Status(503));
+        assert!(s.fs_exists().await.is_err());
+        assert_eq!(faulty.calls(OpKind::Get, "meta.json"), 0);
     }
 
     /// A 404 that a `HEAD` confirms is "no filesystem", at once.
