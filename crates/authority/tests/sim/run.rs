@@ -367,6 +367,9 @@ pub struct SimConfig {
     /// daemon's usual order: the handlers' stamps first
     /// (`Driver::hand_heard`), as unnumbered beats.
     pub timers_first_after_lag: bool,
+    /// No holder drops a backup for want of acknowledgements
+    /// (`backup_ack_timeouts`): lag costs no reconfiguration either.
+    pub keeps_backups: bool,
 }
 
 /// See `SimConfig::fast_path`.
@@ -596,6 +599,7 @@ impl Default for SimConfig {
             live_holder: false,
             beats_lost: false,
             timers_first_after_lag: false,
+            keeps_backups: false,
         }
     }
 }
@@ -2834,6 +2838,16 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.settle_waits += ls.settle_waits;
     }
     report.acked_rolled_back = rolled_back_acked;
+    if cfg.keeps_backups {
+        let dropped: u64 = report.stats.values().map(|s| s.backup_ack_timeouts).sum();
+        if dropped > 0 {
+            return Err(format!(
+                "a backup was dropped for want of acknowledgements ({dropped} time(s)) though \
+                 it only lagged\n  faults: {:?}",
+                report.faults
+            ));
+        }
+    }
     // The runtime-lag configurations: every holder was alive throughout,
     // only late; a seal or a fast takeover deposed a live one. (Not
     // `backup_takeovers`: that counts any acquisition that re-applies a

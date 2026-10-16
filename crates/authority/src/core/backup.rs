@@ -210,12 +210,19 @@ pub(crate) struct BackupPeer {
     /// It answered an append short since its last progress: it is
     /// processing appends but stuck, whether alive or not.
     pub short_since_progress: bool,
+    /// When it first answered short since its last progress, moved on by
+    /// the gaps in its heartbeat answers since (`on_backup_alive`): how
+    /// long it has been answering short while answering at all.
+    pub short_since: Ms,
     /// An append to it failed at the transport (`Event::PeerFailed`)
     /// since its last answer: alive or not (its heartbeat answers may
     /// come on the liveness lane), it is unreachable on the data lane,
     /// and gets the ordinary acknowledgement timeout, not the slow-core
     /// grace.
     pub unreachable: bool,
+    /// It has answered the holder's heartbeat (`Event::BackupAlive`) in
+    /// this bring-up: a backup known to answer may answer a window late.
+    pub answers_beats: bool,
 }
 
 /// One pipelined append: its request, send time and the rows it carries.
@@ -1211,7 +1218,9 @@ impl Core {
                 candidacy,
                 alive_at: now,
                 short_since_progress: false,
+                short_since: now,
                 unreachable: false,
+                answers_beats: false,
             },
         );
     }
@@ -1354,16 +1363,56 @@ impl Core {
         let timeout = self.cfg.backup_ack_timeout_ms as i64;
         let slow_max = (self.cfg.backup_slow_max_ms as i64).max(timeout);
         let tip_behind = |p: &BackupPeer| !p.inflight.is_empty();
+        // Under host load (`Config::liveness_lag_aware`): the holder's own
+        // lapses are not its backups' silence (its core did not take their
+        // answers meanwhile: the same discount as a seal watch's), and a
+        // backup's answers to the heartbeat may be a window late — its own
+        // runtime held up, its P2P handler cannot answer, and it cannot
+        // say so until it runs again. Each such lapse used to drop a
+        // healthy backup at the ack timeout: a reconfiguration CAS, then a
+        // re-sync from zero. A dead or cut-off one that had answered goes
+        // a window later than before (one that never answered, at the
+        // timeout); one whose appends fail at the transport, at once.
+        let aware = self.cfg.liveness_lag_aware;
+        let grace = if aware {
+            self.cfg.backup_takeover_ms as i64
+        } else {
+            0
+        };
+        let t = self.cfg.backup_takeover_ms.max(1) as i64;
+        let since = |s: &Self, at: Ms| {
+            if aware {
+                s.after_own_lapses(at, t, true)
+            } else {
+                at
+            }
+        };
+        let short_for = if aware { timeout } else { 0 };
+        // How long it has been answering short, not counting the gap it is
+        // in now if it has stopped answering (its gaps before were taken
+        // off as the answers resumed, `on_backup_alive`).
+        let interval = self.cfg.backup_heartbeat_ms as i64;
+        let short_answering = |p: &BackupPeer| {
+            let quiet = now.since(p.alive_at.max(p.short_since)) - interval;
+            now.since(p.short_since) - if aware { quiet.max(0) } else { 0 }
+        };
         let stale: Vec<NodeId> = self
             .ack
             .peers
             .iter()
             .filter(|(_, p)| {
-                let silent = now.since(p.last_progress);
+                let silent = now.since(since(self, p.last_progress));
+                let unheard = now.since(since(self, p.alive_at));
                 tip_behind(p)
                     && silent >= timeout
-                    && (now.since(p.alive_at) >= timeout
-                        || p.short_since_progress
+                    && (unheard >= timeout + if p.answers_beats { grace } else { 0 }
+                        // Short for a while of its answering time, not once:
+                        // a backup that answered short and then lapsed (its
+                        // runtime held up: no answers at all) answers its
+                        // backlog in a burst, one append overtaking another,
+                        // and is not stuck — the silence rule judges the
+                        // lapse.
+                        || (p.short_since_progress && short_answering(p) >= short_for)
                         || p.unreachable
                         || silent >= slow_max)
             })
@@ -1371,6 +1420,17 @@ impl Core {
             .collect();
         for n in stale {
             self.stats.backup_ack_timeouts += 1;
+            if let Some(p) = self.ack.peers.get(&n) {
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    backup = n,
+                    silent_ms = now.since(since(self, p.last_progress)),
+                    unheard_ms = now.since(since(self, p.alive_at)),
+                    short = p.short_since_progress,
+                    unreachable = p.unreachable,
+                    "backup acknowledgement timeout"
+                );
+            }
             if self.ack.candidate == Some(n) {
                 tracing::info!(
                     node = self.cfg.node_id,
@@ -1684,8 +1744,9 @@ impl Core {
         if acked > p.acked || acked >= entry.last {
             p.last_progress = now;
             p.short_since_progress = false;
-        } else {
+        } else if !p.short_since_progress {
             p.short_since_progress = true;
+            p.short_since = now;
         }
         tracing::trace!(
             node = self.cfg.node_id,
@@ -1724,8 +1785,17 @@ impl Core {
     /// `Event::BackupAlive`: `from` answered the holder's heartbeat sent
     /// at `at`.
     pub(crate) fn on_backup_alive(&mut self, from: NodeId, at: Ms) {
+        let interval = self.cfg.backup_heartbeat_ms as i64;
+        let aware = self.cfg.liveness_lag_aware;
         if let Some(p) = self.ack.peers.get_mut(&from) {
+            // A gap in its answers since it began answering short is time
+            // it was not answering at all: not counted as answering short.
+            let gap = at.since(p.alive_at.max(p.short_since)) - interval;
+            if aware && p.short_since_progress && gap > 0 {
+                p.short_since = p.short_since.plus(gap as u64);
+            }
             p.alive_at = p.alive_at.max(at);
+            p.answers_beats = true;
         }
     }
 
@@ -2482,7 +2552,9 @@ impl Core {
     /// `last`, moved past this node's own lapses since it (to the latest
     /// one's end), but by no more than `beyond` — plus the lapses' own
     /// length when `plus_lapses` (a reach in this node's running time;
-    /// otherwise in wall time): [`Self::attentive_since`]'s rule.
+    /// otherwise in wall time): [`Self::attentive_since`]'s rule, and the
+    /// holder's for how long its backups have been silent
+    /// (`backup_timeouts`, a window beyond, plus the lapses).
     fn after_own_lapses(&self, last: Ms, beyond: i64, plus_lapses: bool) -> Ms {
         let (mut latest, mut lapsed) = (last, 0i64);
         for &(from, until) in &self.bk.own_lapses {

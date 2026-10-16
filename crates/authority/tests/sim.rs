@@ -289,6 +289,7 @@ fn replay_seed() {
         Ok("backup-runtime-lag") => backup_runtime_lag_config(),
         Ok("backup-lag-at-expiry") => backup_lag_at_expiry_config(false),
         Ok("backup-lag-at-expiry-beats-lost") => backup_lag_at_expiry_config(true),
+        Ok("backup-lag-keeps-its-backup") => backup_lag_keeps_its_backup_config(),
         Ok("backup-runtime-lag-then-crash") => backup_runtime_lag_then_crash_config(),
         Ok("acks3-runtime-lag") => acks3_runtime_lag_config(),
         Ok("backup-runtime-lag-unaware") => unaware(backup_runtime_lag_config()),
@@ -1785,6 +1786,55 @@ fn a_lagging_backup_still_seals_a_dead_holder() {
     );
 }
 
+/// Lag is no reconfiguration either: the backup's runtime held up for
+/// 0.3–1.0 s, its peers stamped up to 0.2 s after (with a beat interval
+/// on top, under the ack timeout plus a window: 1.6 s here), then the
+/// holder's for 1.0–2.5 s, then the backup's again. The holder keeps its
+/// backup throughout: no acknowledgement timeout, so no reconfiguration
+/// CAS and no re-sync from zero.
+fn backup_lag_keeps_its_backup_config() -> SimConfig {
+    let lag = |at_ms, who, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::RuntimeLag {
+            who,
+            for_ms,
+            stamp_lag_ms: (0, 200),
+        },
+    };
+    SimConfig {
+        faults: vec![
+            lag(1_200, sim::run::LagOf::Backup, (300, 1_000)),
+            lag(4_500, sim::run::LagOf::Holder, (1_000, 2_500)),
+            lag(8_000, sim::run::LagOf::Backup, (300, 1_000)),
+        ],
+        keeps_backups: true,
+        ..backup_runtime_lag_config()
+    }
+}
+
+#[test]
+fn lag_does_not_cost_the_holder_its_backup() {
+    let mut dropped = Vec::new();
+    let mut added = 0;
+    for seed in 0..120u64 {
+        let r = run_seed(seed, backup_lag_keeps_its_backup_config()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=backup-lag-keeps-its-backup"
+            )
+        });
+        added += r.stats.values().map(|s| s.backups_added).sum::<u64>();
+        let timeouts: u64 = r.stats.values().map(|s| s.backup_ack_timeouts).sum();
+        if timeouts > 0 {
+            dropped.push((seed, timeouts, r.faults.clone()));
+        }
+    }
+    assert!(added >= 60, "backups rarely chosen: {added}");
+    assert!(
+        dropped.is_empty(),
+        "lagging backups were dropped: {dropped:#?}"
+    );
+}
+
 /// The holder's lag and the watcher's (`other`), each 1.0–2.5 s, the
 /// peers' backlog stamped up to 0.6 s after.
 fn runtime_lag_faults(other: sim::run::LagOf) -> Vec<ScheduledFault> {
@@ -2932,6 +2982,7 @@ fn sweep_config() {
         "backup-runtime-lag" => backup_runtime_lag_config(),
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
         "backup-lag-at-expiry-beats-lost" => backup_lag_at_expiry_config(true),
+        "backup-lag-keeps-its-backup" => backup_lag_keeps_its_backup_config(),
         "backup-runtime-lag-then-crash" => backup_runtime_lag_then_crash_config(),
         "acks3-runtime-lag" => acks3_runtime_lag_config(),
         "backup-runtime-lag-unaware" => unaware(backup_runtime_lag_config()),

@@ -6563,7 +6563,9 @@ mod pipelined_appends {
                 candidacy: 1,
                 alive_at: h.now,
                 short_since_progress: false,
+                short_since: h.now,
                 unreachable: false,
+                answers_beats: false,
                 acked: 0,
                 sent_through: 0,
                 inflight: Default::default(),
@@ -6908,13 +6910,29 @@ mod pipelined_appends {
         assert!(run(&mut h, slow_max, true), "kept past the slow bound");
         assert!(h.now.since(start) >= slow_max);
         assert!(h.now.since(start) < slow_max + 500);
-        // Silent: dropped at the ack timeout, as before.
-        let mut h = holder_with_candidate();
-        journal(&h, "a", 1);
-        journaled(&mut h, 900);
-        let start = h.now;
-        assert!(run(&mut h, 4 * timeout, false));
-        assert!(h.now.since(start) < timeout + 500, "{}", h.now.since(start));
+        // Silent after answering the heartbeat once: dropped at the ack
+        // timeout plus a window (its answers may be a window late: its own
+        // runtime held up); at the ack timeout with `liveness_lag_aware`
+        // off, as before, and when it never answered at all.
+        let window = h.core.cfg.backup_takeover_ms as i64;
+        for (aware, answered) in [(true, true), (false, true), (true, false)] {
+            let mut h = holder_with_candidate();
+            h.core.cfg.liveness_lag_aware = aware;
+            if answered {
+                let at = h.now;
+                h.step(Event::BackupAlive { from: 2, at });
+            }
+            journal(&h, "a", 1);
+            journaled(&mut h, 900);
+            let start = h.now;
+            assert!(run(&mut h, 6 * timeout, false));
+            let bound = timeout + if aware && answered { window } else { 0 };
+            let took = h.now.since(start);
+            assert!(
+                took >= bound - 900 && took < bound + 500,
+                "{aware} {answered}: {took}"
+            );
+        }
         // Alive at first, then silent: the ack timeout counts from the
         // last answer.
         let mut h = holder_with_candidate();
@@ -6923,7 +6941,7 @@ mod pipelined_appends {
         let start = h.now;
         assert!(!run(&mut h, 3 * timeout, true));
         assert!(run(&mut h, 4 * timeout, false));
-        assert!(h.now.since(start) < 4 * timeout + 500);
+        assert!(h.now.since(start) < 3 * timeout + timeout + window + 500);
         // Alive but answering short: stuck, dropped at the ack timeout.
         let mut h = holder_with_candidate();
         journal(&h, "a", 1);
@@ -6956,6 +6974,20 @@ mod pipelined_appends {
             "an unreachable backup was kept on its heartbeat"
         );
         assert!(h.now.since(start) < timeout + 500, "{}", h.now.since(start));
+
+        // The holder's own lapse (2 s: its core took no answers) is not
+        // its backup's silence.
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        journaled(&mut h, 900);
+        let from = h.now;
+        h.advance(2_000);
+        let until = h.now;
+        h.step(Event::OwnLag { from, until });
+        assert!(
+            !run(&mut h, timeout - 100, false),
+            "dropped a backup for its holder's own lapse"
+        );
     }
 
     /// The backup side: a batch that overtook an earlier one is
