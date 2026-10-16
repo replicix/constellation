@@ -1,0 +1,2594 @@
+# Plan 43 — The commit rule: acknowledged means committed by the configured group
+
+Read `docs/plans/v1/CONVENTIONS.md` first. This plan implements the
+recommendation of the arbiter study (`docs/explanation/ARBITER-STUDY.md`
+§5, Option B2): **S3 stays the configuration master** (the root lease
+and its epoch, the log-slot fence, membership, designations, promises)
+and the P2P replica group stays the data path; what changes is the
+**commit rule**:
+
+1. **Nothing is acknowledged that the configured replica group has not
+   committed.** "Committed" is defined per sequencer (root holder or
+   delegate) by a configuration recorded where the reconfigurer reads it
+   (the lease object for the root's group, the log for a delegation's
+   group), §4.
+2. **Nothing committed is ever re-executed.** A committed row is
+   re-shipped verbatim, under its original identity (`(epoch, jseq)` for
+   a root row, `(gen, idx)` for a delegate row), by whoever reconfigures:
+   no fold, no `MutateOp::Records` copy, no replay by rid, no conflict
+   copy.
+3. **Authority state lives only in the log.** Lock grants, releases,
+   expiries and moves, a delegation's group and its stream cut are log
+   records; every replica derives its lock table and its delegation cuts
+   from the log; no message installs a grant, a floor or a cut.
+4. **Stranded unacknowledged ops fail.** An op the group did not commit
+   is answered `EIO` (or retried by its own client under the same rid);
+   it never becomes a conflict copy and never lands after its client was
+   told it failed.
+5. **Speculation survives in exactly one documented place**: a lone
+   sequencer's own journal (a root holder or delegate with no peer within
+   the RTT budget), acknowledged to its own node's clients only — the
+   offline-first contract. `ack=s3` and offline designation are the two
+   ways to have none.
+
+The study's §6 phased migration is the skeleton (milestones C0–C6),
+plus the clock envelope the maintainer added to the scope (C7: safety
+on a bounded clock *rate* instead of a ±500 ms cross-node *offset*;
+two holes it found in today's code land first as standalone fixes,
+C7-H1 and C7-H2). Every milestone leaves `main` correct and
+shippable: each tightens one rule while keeping every other mechanism
+in place, and each has a simulation or model test that fails before it.
+
+Rules carried into this plan from the maintainer: consistency and
+integrity first, then performance, never one for the other (a trade-off
+is reported, not shipped); trace the history and the existing integrity
+arguments before changing the authority, backup, delegation, replay or
+lock code, and extend them in code comments and docs; no
+backward-compatibility shims and **no version bumps** (wire messages,
+log records, journal rows and on-disk formats change in place); every
+fix or behaviour change comes with a test that fails before it (or,
+for a new mechanism, against the naive variant it guards against);
+under host load (CPU starvation, pauses, slow local disk, slow or
+jittery S3 and peer links) no errors, failures or corruption — only
+latency may degrade; a change made for one host file system must be
+neutral or better on ext4, xfs, btrfs and tmpfs, measured; complex
+milestones get an independent (fable) review before the next starts.
+
+**This plan authorizes changes to `docs/explanation/DESIGN.md`**
+(CONVENTIONS rule 5): the sections and the substance of the new text
+are listed in §6; each milestone edits only the sections it makes true.
+
+## Dependencies
+
+- Plan 30 (all of it: §M3 speculation and replay by rid, §M9 backups,
+  seals and `ack=s3`, §M10 continuation epochs, §M11 delegations, §M13
+  the inbox, §M14 cluster locks and fencing tokens). Committed.
+- Plan 41's L0 integrity fix (`9d00417`, `ee16b06`: fast-tenure
+  renewals need fresh S3 liveness) and the F1 fix (`b4fe2e6`: the
+  fencing token is checked where the write happens). Committed; this
+  plan keeps both rules.
+- The host-load campaign tooling (`516f82e`, `cac2d11`, `b0d1086`,
+  `a0b251d`, `05ef4c9`). Committed; its ledger and checkers are this
+  plan's system-level oracles.
+- Coordinates with plan 41 L1–L4 (the renewal lane): C4 changes what a
+  lock grant *is* (a log record) but not how a window is extended; the
+  lane extends windows from the in-memory table, which C4 derives from
+  the log. Whichever lands second rebases; neither blocks the other.
+- Coordinates with nothing else in flight. Plans 40 and 42 touch the
+  FUSE adapter and the view, not the authority core.
+
+### Paused work: what this plan subsumes, what must land first
+
+Several fixes are paused, waiting on this plan's ordering. Each is
+classified below; the recommended order is at the end. The maintainer
+decides (§11 Q7).
+
+| Work in flight | What it fixes | Relation to plan 43 | Recommendation |
+|---|---|---|---|
+| **The takeover-loss fix in review** (latest revision: a folded truncate replays by its own rid as a base-checked conditional cut; `Conflict` and `LockLapsed` refusals journaled as rid outcomes on every sequencer path; `rebase_on_truncate` removed) | The 2026-10-16 acknowledged-write loss (study §2.1): ten acknowledged, fsynced files emptied on both nodes; and the review's H1 (a remote sequencer's unjournaled refusal lets a `Records` copy land over a newer acknowledged write) and H2 (a no-op completion misread as the truncate's effect: false conflict) | **Subsumed structurally by C2 + C3**: C2 makes the delegate's acknowledgement wait for its group (the truncate is never acknowledged on one disk), C3 deletes the fold, the `Records` copies and the deposed root's replay of appended delegate rows. What survives C3: journaling every definitive refusal as the rid's outcome (H1's rule; C3 keeps it as a general rule), and the conditional truncate as the replay shape **inside the lone-sequencer branch** (C5). | **Land first**, before C0. It closes a live loss on `main` (10 of 10 campaign runs before, 0 of 22 after); C2 is weeks away. C3's deletions then remove its fold parts; its tests stay as regression tests (most become "the state cannot arise" assertions, §7.5). |
+| **The F2 fix in review** (holder heartbeat on its own thread and liveness lane, own-lag discount, late-beat window, echo through the driver for a starved runtime; F2b, the `ack=s3` holder's beat) | False seals of a live holder under host load (study §2.3) | **Independent** (liveness only; the study: "a false deposition is cheap" under B2, but it still costs a reconfiguration, a quarantine and latency). C1–C3 make a false seal cheap; F2 makes it rare. | **Land first** (with its review's M1–M3), before C0: every campaign in this plan runs under load profiles that false-seal today, which would drown C1's fail-before evidence in unrelated seals. |
+| **Seed 9287** of `long-delegated-late-answers` (a client answered `EIO` in doubt for a write whose completion it had applied: a deposed root's journal still carries another delegation's appended row, so `settled_outcome`'s "a deposed journal will be rolled back" rule hides the log's outcome; fix idea `Meta::outcome_from_log`) | A wrong error to the application (in doubt for a landed write) | **Subsumed by C3** (a deposed root keeps another generation's rows as a *member copy*, outside its journal, §5.6: `journal_carries_outcome` can no longer name them). Copies-of-one-op family (two queues hold the row). | **Land first** if its review passes (small; the regression test stays; C3 deletes the `lost && journal_carries_outcome` branch it narrows). |
+| **Seed 2945** of the same config (a marker visible without its data: a deposed root replayed a forwarded marker by rid with its own session's deps, so the new root logged it ahead of the delegate rows it depended on; fix idea: stranded replays carry the per-generation deps of the journal rows ahead of them) | Cross-subtree causal order (a reader sees a marker without its data) — an ordering corruption | **Subsumed by C1 + C3**: a deposed group tenure replays nothing by rid (C1, the marker was never acknowledged; its requester retries the same rid with its own, correct deps); the re-execution path that lost the deps no longer exists. Same family: re-execution by rid of a copy. | **Land first** if its review passes (it is an ordering corruption on `main` today); C3 deletes the `QueuedReplay::deps` field it adds together with the deposed-root replay. |
+| The open design question with them: *should a deposed root drop other delegations' rows from its journal instead of rebuilding?* | — | **Answered by C3** (§5.6): neither drop nor rebuild-and-replay. A deposed root **moves** another generation's appended rows out of its journal into that generation's member-copy store (the delegate-backup tail keyspace that exists today), serves them verbatim to the next root that seals the generation, and discards them once the log carries them. Dropping them is unsafe until C2 (before C2 a delegate without a backup acknowledges on its own disk, and the root's copy may be the only other one). | Do **not** implement it in the interim seed fixes. The simulation's `RebuildReplica` stub (it answers `ok: false`, so a deposed root in the sim never recovers) is fixed in C0. |
+| The ledger's late landing (`05ef4c9`: an op answered in doubt may land once, late, after the application's later ops on the name; "a late in-doubt rename or unlink can remove a later file", by design today) | — | **Ended by C2** (invariant I4: an `EIO` is answered only after the rid is settled — `Refused { rid, Abandoned }` committed — so no copy of it executes afterwards). C2 removes the ledger's late-landing allowance (`Ledger::with_client_deadline`'s `late` set) for every op not answered by a lone sequencer's branch. | Keep the allowance until C2; C2's exit removes it. |
+| **C7-H1, C7-H2** (found by the clock-envelope research, §7 C7): every honour-side duration reads the wall clock, so a backward step extends an honoured window; `note_marker_landed`'s `min(prev_expires, bound)` gives a successor whose clock is ahead no quarantine | Two safety holes under clock steps and offsets beyond the margin | **Independent** of the commit rule; C7 builds on both | **Land first**, each with its fail-before sim config: C7-H2 is a two-line change with a bounded latency cost (a maintainer decision, §11 Q10a); C7-H1 is not small — it is C7a's skeleton (`ProtocolClock`, a second per-step reading, the sim's two clocks, the engine's feeds) and gets its own review (§7 C7) |
+| The host-load review's F1–F11 | | F1: landed (`b4fe2e6`); C4 keeps its rule (the minter judges at its serial apply). F2/F2b: the paused F2 fix above. F3 (a `flush` hang behind a recalled grant renewed forever): independent (under bisect). F4 (successor quarantine bound in `delegate-backup-handoff-failover`): independent harness fix; the "separate marks" refinement is independent. F5 (one lease renewal series at half TTL): independent, but **C1's TTL-path tail fetch makes F5's consequence cheaper** (a TTL successor now carries the group's committed tail). F6, F7: independent (documented contracts). F8 (stale `now` audit): C4 adds lock records and must follow F8's rule (decide at the serialization point). F9 (fast-path rows journaled after the lease ran out): **subsumed by C1 + C2** for every group tenure (the row is not acknowledged until the group holds it, and a sealed group refuses it); remains, documented, for the lone branch (C5). F10: keep the tests. F11: independent. | — |
+
+**Recommended landing order:** the F2 fix → the takeover-loss fix →
+seeds 9287 and 2945 → C7-H2 → C7-H1 (the honour clock: C7a's skeleton,
+reviewed on its own, §7 C7) → C0 → the rest of C7a → C1 → C2 → C3 → C4
+→ C7b → C5 → (C6, decision). Dependencies:
+- C1 needs C0 (its fail-before evidence is C0's oracles).
+- C2 needs C1 (a delegate's group commit rests on the root group's).
+- **C3 (verbatim re-ship, the deletions) needs C1 and C2**: re-execution
+  may be deleted only once every acknowledged row is committed; it also
+  uses `Recall.through`, which C2 lands (§5.3 item 7).
+- **C4 (lock and delegation state in the log) needs C3.** Until C3 a
+  deposed root still queues its appended rows as `MutateOp::Records`
+  replays and a delegate-turned-root replays its own rows; both dedup
+  only by rid. A lock record is rid-less, so a `Records` copy of a
+  `LockGrant` or `LockMove` row would always apply — a grant revived
+  after its `LockExpire`, live grants moved to a dead generation — while
+  I3 is satisfied (every replica folds the same, wrong log). Landing C4
+  after C3 means no lock record ever meets a re-execution path (the
+  review's H4; the alternative, filtering lock records out of every
+  re-execution path until C3, is rejected as a second mechanism to
+  delete later).
+- C5 needs C4. C7a needs C0 (it reuses C0's sim plumbing). C7b needs C1
+  (the claim path) and C4 (the lock barrier is a field of `LockExpire`).
+- Every milestone that knowingly costs latency starts only after the
+  maintainer accepted its measured budget (§10's gate list).
+
+## 1. History
+
+The mechanisms this plan changes, and why each exists (verified with
+`git log -p` at `05ef4c9`).
+
+| When | Commit | What |
+|---|---|---|
+| 2026-08-26 | `1450756` | M3.1 lease authority; the log-slot CAS as fence ("FENCING VIOLATION ... skipping" for a lower-epoch segment). |
+| 2026-09-23 | `01e4f93` (plan 30 M3a) | The speculation log (`spec`, `spec_live`): requester shadows and `Exists` hints with before-images, stranding by a higher epoch, replay by rid. Fixed bug B (phantom effects of a dead holder). |
+| 2026-09-23 | `5e18214` (M3b) | `SpecKind::Local` holder capture, `journal_tx`, deposed-holder rollback and replay by rid, the epoch marker, `MutateOp::Records` (replay of an op-less row), and **the fold** (`folded_into_later_manifest`, `crates/authority/src/core/replay.rs:75-99`: a size-only truncate replayed alone has no base check and would cut a newer write). |
+| 2026-09-24 | `0e1017b` (M9) | `AckPolicy`, the lease's `backups`/`config_version`/`ack_policy`, `BackupAppend`/`BackupAck`, the seal, `apply_backup_tail`, `ack=s3` fast takeover, `StreamAhead` and `SpecKind::Streamed`, `durable_jseq`/`ack_need`, journaled `Refused`, the sim's `strict_durability`. |
+| 2026-09-25 | `2522402` | Nine M9 failure classes: "wait while a backup could be had" (`eligible`/`unassessed`), `TailFollows`, own next-epoch tail re-ship, `backup_claim_grace_ms`, the sim's double-fault `budget_exceeded`. |
+| 2026-09-25 | `1641850`, `5384772` | The fold restored in the takeover gate after `617499b` emptied a file; `truncate_base` and `rebase_on_truncate` (every truncate-then-write had become a conflict copy). |
+| 2026-09-25 | `3c58839` (M16) | Seals fsynced, backup appends buffered (the single-failure contract), ack policy per filesystem. |
+| 2026-09-25 | `381c66d`, `379a00d`, `216ce6c` | Lock hand-over with a delegation that survives an overtaking recall (`handoff`, `handed`, `moved_seen`, `install_if_consistent`); grace and floors carried to the delegate. |
+| 2026-09-25 | `df14686` (M14) | Cluster locks; the asynchronous `LockMirror` to backups ("an availability aid; the grace is what keeps locks exclusive"). |
+| 2026-09-26 | `5face1b` | A backup-tail transaction carries its delegation origin; a takeover strands the successor's own delegate rows and replays them **by rid after the tail**; `deps_lost` → `Held`. |
+| 2026-10-04 | `f57db3c` | Fencing tokens; the restart horizon off the core. |
+| 2026-10-06 | `4c5d184` | Grants on a file unlinked in a delegated subtree travel with the stream batch (`DelegateStream.leaving`); `LateRenew`. |
+| 2026-10-07 | `96f4565` | A generation a takeover strand holed (its rows replayed as root rows) is marked `deleg_stranded` and ended, so a restarted delegate stops re-sending a batch forever (seeds 2477, 2982). |
+| 2026-10-07 | `c465b07`, `9d82ad0`, `fb0c909` | `unlinked-exclusion-5681` (an outwaited generation's undelivered grants revived, restamped), `unlinked-exclusion-7455` (a recall answer after its generation ended put lapsed grants back): `pending_returns` removed, `lock_install_returned`'s late-answer rules. |
+| 2026-10-07 | `304c30c` | `stale-read-outwaited`: barriers, cuts and stream-head stamps carried in renewals and recall answers. |
+| 2026-10-07 | `d7d2eb8` | One-way delegate stream and renewal messages with cumulative acks. |
+| 2026-10-08 | `17ee59c` | `lease-cap-fenced`: four nested margins shrank delegated grants to zero. |
+| 2026-10-15 | `9d00417`, `ee16b06` | Plan 41 L0: fast-tenure renewals need fresh S3 liveness; a renewal is never answered with a weaker record. |
+| 2026-10-16 | `b4fe2e6` | F1: the fencing token checked inside the transaction; the fast path re-checks its lease or delegation there too. |
+| 2026-10-16 | `516f82e` … `05ef4c9` | The host-load campaign tooling; the ledger; `05ef4c9` made the ledger accept an in-doubt op's late landing (by design today). |
+| 2026-10-16 | `7f79ba9` | The arbiter study. |
+
+The pattern the study names (§2.12): every one of the 2026-10-01..16
+data-loss and ordering bugs on the authority path is an
+acknowledgement given before agreement, a second copy of one op in
+another queue, or authority state that moved in a message. Each fix
+above patched one interleaving; this plan removes the states.
+
+## 2. What the code does today
+
+Line numbers at `05ef4c9`.
+
+### 2.1 The acknowledgement gate (root holder)
+
+- `AckPolicy { Local, Backup, S3 }` (`crates/store-s3/src/lease.rs:153-170`);
+  the lease object carries `backups`, `config_version`, `ack_policy`
+  (`:119-134`); `Lease::reconfigured` bumps `config_version`
+  (`:221-231`). A filesystem chooses `local` or `s3` only
+  (`parse_ack_policy`, `crates/engine/src/authority_driver.rs:726-735`);
+  `Backup` is entered automatically when a peer is within
+  `backup_rtt_budget_ms` (5, `CONSTELLATION_BACKUP_RTT_BUDGET_MS`),
+  `backups_max` 1 (`CONSTELLATION_BACKUPS`). A new tenure starts with
+  `backups: []` and `Local` (`crates/authority/src/core/lease.rs:396-424`).
+- Selection and reconfiguration: `backup_candidates`, `backup_select`,
+  `backup_timeouts`, `drop_backup`, `backup_promote`, `issue_reconfig`
+  (a `LeaseSwap` CAS on the object version), `removal_safe`,
+  `on_reconfig_put`/`on_reconfig_reread` (`crates/authority/src/core/backup.rs:1026-1528`).
+- **The gate**: `durable_jseq()` (`backup.rs:487-536`) — `u64::MAX`
+  (no gate) under an epoch hold; `shipped_through` under `S3`; under
+  `Local`/`Backup` with no committed backup, `shipped_through` while a
+  backup *could* be had (a candidate, `eligible`, or unassessed), else
+  `u64::MAX`; otherwise the minimum of the committed backups' `acked`,
+  at least `shipped_through`. `ack_need(&Position)` (`:556-562`).
+  Parked answers are released by `complete_ready`
+  (`crates/authority/src/core/readindex.rs:1410`).
+- **Where an OK is produced**: a forwarded op — `holder_execute`
+  (`crates/authority/src/core/holder.rs:623-734`), then `ack_need`, then
+  `park_reply` or an immediate `MutateReply` (`holder.rs:285-405`); the
+  holder's own op through the core — `execute_local`
+  (`crates/authority/src/core/client.rs:1781-1897`), `park_finish`;
+  the requester — `on_mutate_reply` installs a **shadow** and answers
+  (`client.rs:1043-1094`) or waits for the log (`AwaitingLog`,
+  `:987-1042`).
+- **The FUSE fast path writes first and waits after**: `root_fast_path`
+  (`crates/engine/src/view/write_gate.rs:422`) → `lease.admit()` →
+  `execute_admitted` (journal commit) → if `ack_gated`,
+  `ack_when_durable` → `session.wait_durable(jseq, 30 s)`
+  (`write_gate.rs:453-536`; `crates/meta/src/session.rs:1286-1308`).
+  `DurableWait::Ungated` (the gate went off while the op waited)
+  answers OK **on the local disk alone**. The module doc of
+  `backup.rs:27-36` says the fast path is closed under a non-`Local`
+  policy; that is stale since `0e1017b` (C1 corrects it).
+- The holder's reads wait for durability of unshipped rows they would
+  observe (`Meta::durability_pending`, `session.rs:1522`): DESIGN §9
+  "Nobody observes a tentative effect".
+
+### 2.2 What a deposition or takeover does to acknowledged work
+
+- **Seal path** (`on_backup_watch` → `on_takeover_get` → `backup_seal`
+  (fsynced) → `Acquire` → marker → `complete_gate`,
+  `backup.rs:2154-2350`, `crates/authority/src/core/jobs.rs:1179-1265`).
+  `apply_backup_tail` (`backup.rs:2364-2428`) **re-applies the tail's
+  records** through `apply_records_journaled_inner(adopted = true)`
+  (`crates/meta/src/store/local.rs:840-967`, skip-on-conflict), journals
+  them as **new rows** (new jseqs, the successor's epoch) with the
+  original rid, and marks the marker `TailFollows { prev_epoch }`
+  (`crates/meta/src/record.rs:245-253`; `jobs.rs:4242-4247`).
+- **Subscribers' pre-S3 copies are rolled back at a seal**: the
+  successor's marker is a higher-epoch segment, so it strands every
+  requester's `Shadow` and every subscriber's `Streamed` entry of the
+  predecessor (`crates/meta/src/store/spec.rs:264-270`, `:2711-2729`);
+  they are rolled back from before-images and queued for replay by rid,
+  and the re-shipped tail completes them again moments later.
+  `backup_no_acked_op_lost` (`crates/authority/tests/sim.rs:1500-1510`)
+  documents these *transient rollbacks of acknowledged ops* as expected.
+- **A deposed holder** (`deposed`, `jobs.rs:1334-1355`;
+  `recover_deposed`, `:1381-1410`): `strand_below_epoch` rolls back its
+  own `Local` rows and queues **every** one for replay by rid —
+  including rows the sealing backup holds and re-ships, and rows
+  acknowledged under `Backup`. Rows of other generations it appended
+  (`Local { gen != 0 }`) are never stranded by an epoch
+  (`stranded_by`, `spec.rs:264-269`), so `journal_len() > 0` →
+  `Action::RebuildReplica` → `reset_for_rebuilt_ns_tx`
+  (`spec.rs:2016-2052`) queues them as `MutateOp::Records` replays (no
+  base check, no token): the second copy in the 2026-10-16 loss.
+- **A TTL takeover of a `Backup` lease** by a non-listed node (after
+  `expires + backup_claim_grace_ms`, `lease.rs:345-372`, "a double
+  fault: the tail is lost") obtains **no tail from anyone**
+  (`backup_tail_epoch` needs `bk.role` to match, `jobs.rs:2873-2884`).
+  The group's committed-but-unshipped rows survive only as the deposed
+  holder's replays and the requesters' shadows: re-executed against new
+  state, refused into conflict copies. The sim counts it as
+  `budget_exceeded`. A listed backup claiming at expiry never seals (it
+  still re-ships its own tail: `backup_tail_epoch` matches its role).
+- **The replay queue** (`pending_replay`, `QueuedReplay`,
+  `spec.rs:294-341`) and its executors: the drain (`on_drain_tick`,
+  `replay.rs:107-243`, every 250 ms) and the gate's
+  `replay_queue_locally` (`replay.rs:516-633`, which journals **no
+  refusal** at `05ef4c9`). What is queued as what: a `Shadow` and an own
+  `Streamed` as the original op, a foreign `Streamed` as `Records`
+  copies of another node's committed rows, a `Local` row as its op or
+  `derive_replay_op` (`spec.rs:913-967`; a lone `WriteManifest` as
+  `SetManifest`, anything else `Records`).
+- **Conflict copies**: `refuse_replay` → `try_copy` →
+  `Action::ConflictCopy` → `recovery::materialize_remote`
+  (`replay.rs:322-436`; `crates/engine/src/recovery.rs:316-385`), named
+  `{name}@{node}-{ts}-{rid_seq}` under `.constellation-conflict`
+  (`crates/meta/src/reintegrate.rs`). Not for unacked or foreign rows.
+  Other sources: a close refused for a lapsed grant
+  (`View::keep_refused_commit`), `repair drop-held`.
+
+### 2.3 Delegations
+
+- A delegate executes (`delegate_execute_now`,
+  `crates/authority/src/core/delegate.rs:884-1092`), journals the row
+  as `Local { gen }` speculation with origin `(gen, idx)` (`idx` from
+  the node-local `deleg_idx:{gen}`), and acknowledges when
+  `deleg_stream_durable` (`:1100-1143`): under `ack=s3` once a segment
+  carries it; with a backup once the backup holds it; **with no backup,
+  at once on its own disk**. Its FUSE fast path is closed only while it
+  has a backup (`deleg_fast_path_gated`, `:411-413`).
+- The delegate's backup is chosen **by the delegate alone**
+  (`deleg_backup_select`, `:1148-1187`: within budget, never the root),
+  reported to the root in `DelegRenew.backup`; it is in no
+  configuration the root or a successor root reads before
+  reconfiguring. In a two-node cluster a delegate has no backup (its
+  only peer is the root): Layer A — the 2026-10-16 shape.
+- The root appends stream rows in order (`on_delegate_stream`,
+  `:3301-3439`; `Meta::apply_delegate_tx`, `local.rs:490-520`) as root
+  journal rows with origin `(gen, idx)` and the original rid; acks are
+  cumulative `DelegateStreamAck { through }`.
+- Generation end (`end_generation`, `:3164-3238`): `Recall { dir, gen }`
+  is journaled; the **cut is not in the record** — every replica infers
+  it from what it holds of the stream (`void_stream(gen,
+  stream_applied(gen))`, replay at `crates/meta/src/replay.rs:782-826`;
+  `void_cuts`, `deleg_log_idx:{gen}` in node-local kv).
+- A recalled or outwaited delegate's unappended rows are stranded by the
+  `Recall` and replayed by rid; a delegate that takes the root over
+  (seal path) strands its own unappended rows and replays them **as
+  root rows** (`strand_for_takeover`, `spec.rs:3181-3215`; the fold
+  applies there), leaving a hole in its generation (`96f4565`'s mark).
+- Placement (`crates/authority/src/core/placement.rs`) has no RTT
+  budget and does not consider whether the delegate will have a backup.
+
+### 2.4 Locks
+
+All lock authority state is in memory (`LockTables`,
+`crates/meta/src/locks.rs:779-816`; `LockState`,
+`crates/authority/src/core/locks.rs:163-416`); **no `LogRecord` variant
+carries lock state** (`record.rs:37-305`). The only durable lock write
+is the restart horizon (`KV_LOCK_GRANT_HORIZON`,
+`crates/meta/src/readdeleg.rs:515-559`, synced, off the core). State
+moves in messages: `LockMirror` to backups (installed restamped and
+`UNCONFIRMED` at a fast takeover, `lock_install_mirror`,
+`locks.rs:4235`); the handoff with a delegation in `DelegRenewed.{locks,
+lock_grace_ms, lock_floor, lock_cut_at, lock_cut, lock_barrier}`
+(`handoff`, `handed`, `moved_seen`, `lock_install_moved`); recall answers
+`DelegRecalled.locks: LockHandback { grants, floor, barrier }`
+(`lock_install_returned`, `:4660-4733`, with the late-answer rules);
+leaving grants in `DelegateStream.{leaving, leaving_barriers}`; stream
+heads in `DelegRenew.{stream_head, stream_head_at}`. Restamping
+(`restamp(now) = now + ttl + margin`) at five install sites.
+
+### 2.5 Continuation epochs and designations
+
+- An epoch hold acknowledges on the hold owner's disk alone
+  (`durable_jseq` returns `u64::MAX` under `epoch_held()`); the hold
+  owner streams its whole journal ahead to members (`stream_ahead_soon`
+  to the journal tip), which install it as speculation. "A deposed hold
+  owner recovers like a deposed holder" (`promise.rs:1101-1110`).
+- A designation (`Delegate { designated: true }`) is never reclaimed;
+  its designee acknowledges on its own disk.
+
+### 2.6 The sim and the models today
+
+- The sim's end-of-run checks (`crates/authority/tests/sim/run.rs:2603-3077`)
+  include `strict_durability` (only for `backup_config`, `long_backup`,
+  `ack_s3` and their derivatives: `acked_rolled_back` is **reported,
+  not failed**; `observed_tentative > 0` fails), linearizability with
+  tentative exemptions, `check_exactly_once` (acked ⇒ in the log once,
+  but only on converged runs), `check_in_doubt_answers`. No delegated,
+  flex or lock config is strict. **Nothing checks an acknowledgement
+  at the moment it is given**, against the members of the configuration
+  then in force.
+- The sim's `RebuildReplica` answers `ok: false` ("never asked"), so a
+  deposed root with appended delegate rows never finishes its recovery
+  in the sim (found with seeds 9287 and 2945).
+- `crates/model/src/backup.rs` has `acked_never_lost`, which counts a
+  live deposed holder's stranded replay set as "not lost" — i.e. it
+  accepts re-execution. `crates/model/src/locks.rs` models message-borne
+  handoffs, mirrors and reinstatement (knobs `replicate`, `move_state`,
+  `reinstate_handed`, `resend_handoff`, `handoff_grace`).
+
+## 3. Terminology (Delos / Vertical Paxos, mapped to the code)
+
+The study's vocabulary (§4, from Delos, OSDI'20, and Vertical Paxos /
+PacificA). C0 adds it to DESIGN §4; code comments and docs use it from
+then on. No type is renamed for the sake of the vocabulary.
+
+| Term | Meaning here | Code |
+|---|---|---|
+| **Configuration master** (Delos: MetaStore) | The versioned register that decides who may order writes and with which group. For the root: the lease object in S3 (`leases/p0.json`: holder, epoch, `backups`, `config_version`, `ack_policy`), plus `nodes/` and `designations/`. For a delegation: the root's log (`Delegate`, the new `DelegGroup`, `Recall`) — itself fenced by the root's lease. | `Lease`, `LeaseState::classify`, `issue_reconfig`; `DelegationTable` |
+| **Configuration** | One version of it: `(epoch, config_version, holder, backups, policy)` for the root; `(gen, group_version, delegate, backups)` for a delegation. | `Lease`; new `DelegGroup` record (§5.3) |
+| **Group** (Delos: loglet) | The nodes that hold a sequencer's rows for one configuration: root group = holder + listed backups; delegation group = delegate + its recorded backups, or delegate + root when it records none (§5.4). Write-all, read-any. | `durable_jseq`, `deleg_stream_durable` |
+| **Commit** | A row is committed when every member of the configuration in force when it was journaled holds it (holder journal and every listed backup's `backup_tail`; delegate journal and every recorded member's copy), or when an archive slot carrying it landed. | §4 I1 |
+| **Seal** (Delos: seal) | A member's persisted, synced refusal of any further row of a configuration; it fences the old sequencer before a reconfiguration. Today: `backup_seal` (root), `DelegSeal` (delegation). C1 adds a seal by a holder of its own epoch on request (`SealTail`, §5.3). | `Meta::backup_seal`, `PeerMsg::DelegSeal` |
+| **Sealed tail** (Delos: `checkTail` + the sealed suffix) | The rows a sealed member holds past the archive; re-shipped verbatim by the reconfigurer. | `backup_tail` keyspace; `apply_backup_tail` (re-shipped verbatim from C3) |
+| **Archive** | The S3 log (`log/p0/<seq>`, slot CAS `If-None-Match`) and the commit chain: where committed rows end up, for followers, fresh nodes and P2P-less requesters. A second fence (a deposed sequencer's late segment collides). | `LogStore::put_segment`, `apply_incoming` fencing |
+| **Lone sequencer** | A root holder or delegate whose group is itself because no peer is within the RTT budget (for a delegate: and the root is beyond it too). Its acknowledgements to its own node's clients are **Layer A**: the one speculation place (§5.7). | new `Core::lone(gen)` (C2) |
+| **Non-stealable authority** | An offline designation, and a continuation epoch's hold (§11 Q3, decided): no successor can be installed while the holder lives except by its own handoff or an operator's retire. Its acknowledgements are final, not speculation. | `Delegate { designated: true }`; `promise.rs` hold |
+| **Member copy** | Rows a node holds as a member of a group it no longer sequences for (a deposed holder's committed tail; a deposed root's appended rows of a live generation), kept outside its journal until the archive carries them, served to a reconfigurer. New in C1/C3 (§5.6). | the `backup_tail` keyspace, keyed by `(epoch, first)` or `DELEG_BACKUP_BASE + gen` |
+
+## 4. The invariants
+
+Stated so that the simulation checks them at the moment they could be
+violated and the models check them as properties. Each has a name used
+in the code, in PROGRESS and in failure messages.
+
+- **I1 `acked_implies_committed`.** Every *definitive* answer a client
+  receives for rid `r` — `OK`, or a refusal other than the in-doubt
+  `EIO` — names, at the moment it is sent, a transaction `T` carrying
+  `Completed { r }` or `Refused { r, .. }` that satisfies one of:
+  - **Archive**: `T`'s records are in an applied, unfenced log segment;
+  - **RootGroup**: `T` was journaled by the holder of epoch `e` under
+    configuration version `v`, and the holder's journal and the
+    `backup_tail` of every backup listed in the lease object at version
+    `v` hold `T`;
+  - **DelegGroup**: `T` is row `(g, i)` of generation `g`; the
+    delegate's journal holds it, and so does every member of the
+    generation's group in force when it was journaled — each recorded
+    backup's delegate tail, or, when none is recorded, the root's
+    journal (or the archive) as an appended row with origin `(g, i)`;
+  - **NonStealable**: the answering sequencer is a designee for the
+    keys, or an epoch's hold owner (§11 Q3);
+  - **Lone**: the answering sequencer is the client's own node, and at
+    the answer it is a lone sequencer (§3). Counted.
+  An answer that satisfies none is a violation. The class is reported
+  per answer (`AckClass`), so the oracle verifies the claim against the
+  other nodes' stores, not against the answerer's word. I1 is judged
+  **at the answering sequencer's emission** of the answer (its
+  `MutateReply` send, or its local finish), reading the stores at that
+  instant, and RootGroup **by the lease object in the bucket** at that
+  instant (the configuration a reconfigurer reads). With two or more
+  backups this needs the gate to count a candidate **from the moment its
+  add-CAS is issued** (today it counts only after `on_reconfig_put`,
+  `backup.rs:1443`; with `backups_max = 1` the old set is empty during an
+  add and the bring-up rule waits for the archive, so there is no window;
+  with `CONSTELLATION_BACKUPS=2` there is one, and `permit_allows` lets
+  the new backup seal and claim on that object without the rows the old
+  set acknowledged) — C6 fixes it, with its fail-before.
+- **I2 `one_identity_per_op`.** (a) No rid completes more than once in
+  the log (today's `check_exactly_once`). (b) At no instant is a rid
+  queued for execution in two places: the union of every node's replay
+  queue and every in-flight client submission holds each rid at most
+  once (the client's own same-rid retry and its node's queue entry for
+  the same op merge into one, as `also_client` does today; an `Abandon`
+  replaces the rid's client entry, it does not add one). At C1 (b) is
+  checked for gated rids only: a lone root's answer to a remote forward
+  legitimately has two copies (the deposed lone root's queue and the
+  requester's retry) until C2 makes it Archive-class. (c)
+  **Verbatim**: every committed `T` appears in the archive exactly once,
+  with the records it was committed with, under its original identity
+  — the segment's origin for each row names `(epoch, jseq)` of the
+  journal that first held it (carried transitively: a row re-shipped
+  twice, A → B → C, keeps A's identity), or `(g, i)`. No committed row is ever
+  executed again by rid (no `Records` copy, no fold, no replay).
+- **I3 `authority_state_in_log`.** Every lock grant, release, expiry
+  and move, and every delegation start, group change, end and cut, is a
+  log record applied in log order by every replica. At every step, each
+  replica's derived lock table (grant ids, mode, holder, inode,
+  generation, floor) equals the fold of its applied log plus its own
+  journal (or, for a lock owner, of its own journal plus what it
+  committed). No message installs a grant, a floor, a barrier or a cut;
+  windows (`until`) remain per-replica, clock-bounded (§7.6 of the
+  study, unchanged).
+- **I4 `unacked_fails_never_lands_late`.** A client is answered `EIO`
+  for rid `r` (in doubt) only after `r` is *settled*: `Completed { r }`
+  or `Refused { r, .. }` is committed somewhere (then the client gets
+  that outcome instead) or `Refused { r, Abandoned }` is committed by
+  the sequencer now in force (then `EIO`). The one exception is an
+  *isolated requester* (no sequencer, inbox or lease path answered for
+  `2 × acquire_deadline_ms`), counted as `client.unsettled_eio`. For
+  every settled `EIO`, no execution of `r` exists anywhere afterwards;
+  for an unsettled one, any later execution of `r` is ordered in the log
+  before every op its node's clients invoked after the answer.
+- **I5 `speculation_only_lone`.** An effect a client was told succeeded
+  is rolled back only if its answer was class **Lone**; a conflict copy
+  is created only from (a) a replay of the lone branch, (b) an operator
+  action (`repair drop-held`, the new `repair abandon-group`, §11 Q1), or
+  (c) a fenced writer's refused close (cluster-locks: a close refused for
+  a lapsed grant keeps its content as a copy; nothing was acknowledged).
+  The sim's `tentative` set is a subset of the Lone-class answers.
+
+What does not change (the study's "keep" list): request ids and
+`Completed`/`Refused` records; the fencing token at the write and the
+owner fence; the takeover gate and the epoch marker; the slot CAS; the
+inbox; continuation epochs and promises; offline designations; the
+time discipline of derived grants (`sent + ttl − margin` /
+`granted + ttl + margin`) — C7 revisits only its clock assumption; the
+chunk store; E2E (every new log record is inside the encrypted segment;
+nothing new is plaintext in the bucket); the sans-IO core, the sim and
+the models.
+
+## 5. Design
+
+### 5.1 The commit point per sequencer, and the acknowledgement classes
+
+One function decides, for a row about to be journaled, what its answer
+will wait for: `Core::ack_class(origin, gen, requester_is_remote) ->
+AckClass` (new, `crates/authority/src/core/backup.rs`). The class is
+decided **at journal time** and recorded with the row (§5.2 item 1): it
+is what tells a deposed sequencer whether a row is committed-or-pending
+(member copy) or its own lone speculation (replay queue). With
+
+```rust
+pub enum AckClass {
+    /// Wait for the root group (today's `durable_jseq` under `Backup`).
+    RootGroup,
+    /// Wait for the archive (today's `S3`; also a lone root's answer to
+    /// another node, C2).
+    Archive,
+    /// Wait for the delegation's group (its recorded backups; or the
+    /// root's append when it records none), C2.
+    DelegGroup { gen: u64 },
+    /// No wait: a designation or an epoch hold (§11 Q3).
+    NonStealable,
+    /// No wait: a lone sequencer answering its own node's client
+    /// (Layer A). Counted.
+    Lone,
+}
+```
+
+| Sequencer state | Own node's client (FUSE, local ops) | Another node's forward |
+|---|---|---|
+| Root, `ack=s3` | Archive | Archive |
+| Root with ≥ 1 committed backup | RootGroup | RootGroup |
+| Root with none but one could be had (candidate, eligible, unassessed) | Archive (today's bring-up rule) | Archive |
+| Root, lone (no peer in budget) | **Lone** | **Archive** (C2; today: Layer A with a requester shadow) |
+| Delegate with a recorded backup | DelegGroup | DelegGroup |
+| Delegate, no backup recorded, root in budget | DelegGroup (the root is the second member: wait for `DelegateStreamAck` through the row, C2) | DelegGroup |
+| Delegate, lone (no backup, root beyond budget) | **Lone** | DelegGroup (the group `{delegate, root}`: wait for the root's journaled append, `DelegateStreamAck.through ≥ i`; §11 Q16) |
+| Designee | NonStealable | NonStealable |
+| Epoch hold owner | NonStealable (Q3, decided: non-stealable except by an operator's retire) | NonStealable |
+
+`AckClass` is carried with every answer inside the core (new field on
+`ParkedWhat::Reply`/`Finish` and on the immediate reply path) so the
+sim can record it, and is counted per class in `status.ack.classes`.
+
+### 5.2 C1: a backup-acknowledged row is committed
+
+Today a row acknowledged under `Backup` is committed in fact
+(durability-and-failover.md "Why it is safe") but is still treated as
+speculation by three parties: the deposed holder (replays it by rid),
+requesters (their shadows strand at the successor's marker and replay
+by rid), subscribers (their `Streamed` entries strand and roll back).
+C1 makes every party believe the commit:
+
+1. **Journal rows record their class.** `JournalTx` gains
+   `gated: bool` (`crates/meta/src/store/local.rs:110-155`), set from
+   the row's `AckClass` decided at journal time: `gated := class ∈
+   {RootGroup, Archive, DelegGroup}` — **not** from `durable_jseq() !=
+   u64::MAX`: a lone root's `durable_jseq()` is `u64::MAX`, yet after C2
+   its row for another node's forward is Archive-class, and must never
+   enter the replay queue (the review's H1: it would be replayed by rid
+   while its requester retries it, and a refusal would make a conflict
+   copy of an op nobody was acknowledged). Set through a new
+   `journal::PendingGate` (carrying the class) alongside
+   `PendingLockTag` by `Meta::begin_local`; the core publishes the
+   node's class for its own clients to the session (`set_durable` gains
+   it; the fast path reads the same value through `LeaseView`), and a
+   forward's class is set by the core before it executes. Until C2 the
+   classes in use are C1's (RootGroup, Archive, Lone for everything
+   else); C2 adds DelegGroup and the forward rule without changing the
+   field. `JournalTxHead` gains it too (hot paths need it without the
+   op).
+2. **A deposed holder replays no gated row.** `Meta::strand_below_epoch`
+   (`spec.rs:3136-3150`) splits — a deposed sequencer's gated rows of
+   every class go to the member copy; only Lone-class rows enter the
+   replay queue: a gated `Local { gen: 0 }` row is
+   rolled back from its before-images and **moved, records unchanged,
+   into the member-copy store** (the `backup_tail` keyspace under the
+   node's own `(epoch, first)`; §5.6) — never queued in
+   `pending_replay`; an ungated row (lone branch) is queued as today.
+   Its `completed` row goes with it unless the log carries it (as today).
+   The parked client ops of those rows are already turned into in-doubt
+   same-rid retries by `abort_durable_parks` (`readindex.rs:880-985`):
+   they now dedup against the successor's re-ship (committed rows) or
+   execute once (uncommitted rows the sealer did not hold). Drop
+   `self.replay.unacked.insert(rid)` for gated rows there (nothing is
+   queued to mark).
+3. **The seal path's successor re-ships with identity.** `apply_backup_tail`
+   keeps its current re-application (verbatim identity is C3) but each
+   adopted transaction now records `tail_of: Some(JournalPos { epoch:
+   prev, jseq: tx.first })` in its `JournalTx` (the tail row's own
+   `tail_of` if it has one: the first journal's identity, transitively),
+   and the ship plan writes it into the segment envelope (§5.4's origin
+   variant). The marker
+   becomes `TailFollows { prev_epoch, through }`: `through` is the
+   predecessor's last jseq in the sealed tail.
+4. **Subscribers and requesters keep committed copies.** A `Shadow`,
+   `Hint` or `Streamed` entry of epoch `e` is **not** stranded by a
+   segment of a higher epoch whose marker carries `TailFollows {
+   prev_epoch: e }` and which was installed for a gated answer
+   (`Shadow`/`Hint` gain `gated: bool` from the reply — the holder's
+   `MutateReply` gains `committed: bool`, true for RootGroup/Archive
+   answers; a `Streamed` entry is gated by construction: `stream_ahead`
+   sends only rows ≤ `durable_jseq` outside an epoch; an epoch hold
+   streams to its tip, but a hold's successor writes no `TailFollows`, so
+   those entries strand as today). It retires when a segment carries
+   `Completed { rid }` (shadow) or a tail origin covering
+   `(e, first..=last)` (streamed). New predicate in `LiveEntry`:
+   `stranded_by_epoch(epoch, tail_follows: Option<u64>)`
+   (`spec.rs:264`). An ungated entry strands as today.
+5. **The TTL path carries the tail (tail fetch).** A node about to claim
+   an expired `Backup` lease it is not the sealer of — a non-listed
+   node after the grace (`lease.rs:345-372`), or a listed backup at
+   expiry that has not sealed — first runs **`SealTail`**: new
+   `PeerMsg::SealTail { req, epoch, config_version }` to every member
+   of the old configuration (the holder and each listed backup); a
+   member persists and syncs a seal of `epoch` (`Meta::backup_seal`;
+   the holder itself marks the epoch sealed and stops acknowledging:
+   `mark_lost` with the new `self_sealed` flag, so its gate never
+   releases a parked answer of that epoch again) and answers
+   `PeerMsg::SealedTail { req, epoch, txs: Vec<BackupTx>, through }`
+   with its sealed tail (a backup's `backup_tail`; the holder's own
+   journal rows of that epoch plus its member copy). The first answer
+   is the tail the claimer re-ships (write-all ⇒ any member has every
+   committed row); the claim then proceeds as a seal takeover
+   (`takeover_permit`, `backup_tail_epoch` set, `TailFollows` in the
+   marker). **If no member answers** within `backup_takeover_ms`, the
+   behaviour is §11 Q1's decision: recommended, the claim waits (status
+   `lease.waiting_for_group`, retry every `backup_takeover_ms`, log at
+   WARN once a minute) until a member answers or an operator runs
+   `constellation repair abandon-group --epoch E` (new, §5.8). The
+   listed backup's claim at expiry also seals itself first (today it
+   does not; `on_takeover_get`'s seal is reused). `backup_claim_grace_ms`
+   stays: a listed backup should still get to its own seal and claim
+   first; the grace orders the race, the tail fetch makes losing it
+   harmless. **Acceptance and recovery** (the review's M2): a member
+   accepts `SealTail` only for the epoch and `config_version` it holds
+   (a backup: its `BackupRole`; the holder: its tenure); a holder that
+   self-sealed runs `recover_deposed` at once (its gated rows go to the
+   member copy, item 2) and is from then on an ordinary claimant of its
+   own lease once expired — so if the sealing claimer never claims
+   (lost the CAS race, crashed, lost S3), the outage is bounded by the
+   lease TTL and the holder brings its tail along; `classify`'s refusal
+   of a `lost` node applies only until that recovery finished. Any
+   enrolled peer may seal a holder this way — the same trust as a
+   backup's seal (semi-trusted peers, IAM as the root; ADR-12: the
+   claimer's expiry judgement only *triggers* the seal, safety rests on
+   the seal and the CAS). `SealedTail` is batched like `BackupAppend`
+   (`backup_batch_rows`, one batch in flight, the claimer acks each).
+6. **Docs and the stale comment.** `backup.rs:27-36` says what the fast
+   path does (writes, then waits for the gate; `Ungated` handled in C2).
+
+Why C1 is safe alone: it only stops *re-executing* rows that are
+committed; every committed row is still delivered by the successor's
+re-ship (seal path: write-all ⇒ the sealer has it; TTL path: the tail
+fetch), and an uncommitted row's client was never answered and retries
+by rid. The slot CAS still fences a deposed holder's late segment. What
+it does not yet cover (delegates, the lone root's forwards, the `Ungated`
+fast-path answer) are C2's.
+
+### 5.3 C2: no acknowledgement outside a group where one exists; failed ops are settled
+
+1. **Delegations get a configuration** (the study's step 2a, made
+   exact). New log record `LogRecord::DelegGroup { dir: u64, gen: u64,
+   version: u64, backups: Vec<u64> }`, journaled by the root only, in
+   the generation's lifetime, version increasing. The delegate asks for
+   a change with `DelegRenew.backup` (as today) and the root journals
+   the record when the request differs from the generation's last
+   record; the delegate counts a backup's acknowledgements only once it
+   has applied (from the root's stream or the archive) a `DelegGroup`
+   naming it, and stops needing a removed backup only once the record
+   without it is applied — the lease's add-then-CAS and
+   remove-after-CAS rules (`backup_promote`, `removal_safe`) transposed:
+   the delegate **requests** a record that drops backup B1 only when its
+   own `removal_safe` holds — every index acknowledged via B1 is at or
+   below the root's appended cursor or the replacement's `backup_acked`
+   (`backup.rs:1418` transposed) — so no acknowledged row is left only
+   on a dropped backup (§11 Q14, decided).
+   A generation with no record (or an empty `backups`) has the group
+   `{delegate, root}`: the root's journaled append of `(g, i)` is the
+   second copy. `deleg_stream_durable_with` (`delegate.rs:1127-1143`)
+   becomes: archive carries it, or every recorded backup's
+   `backup_acked ≥ i`, or (no backup recorded) the root's
+   `DelegateStreamAck.through ≥ i` from the current root. The `None =>
+   true` arm is deleted. `deleg_fast_path_gated` becomes "not lone".
+2. **The lone delegate.** A delegate with no backup recorded and the
+   root beyond `backup_rtt_budget_ms` (from `Core`'s link RTTs) is lone:
+   its own node's ops are class Lone, others' forwards wait for the root's
+   append (DelegGroup with the root as member). `status.delegation.mine[]`
+   gains `ack_class`. Placement (`placement.rs:409-458`) is unchanged:
+   a far dominant writer still gets its subtree (that is the
+   offline-first case Layer A exists for). Whether placement should
+   prefer a non-lone candidate is deferred (§11.1) until
+   `status.delegation.mine[].ack_class` has shown how often it happens.
+3. **The lone root answers other nodes from the archive.** In
+   `holder.rs:285-405`, a forward's `durable` wait for class Archive is
+   `shipped_through`; the reply carries `committed: true`; the requester
+   installs no replayable shadow (it waits for the log or the stream, as
+   `AwaitingLog` does). Shadows installed after C2 are therefore always
+   for committed answers (I5). The row is journaled Archive-class
+   (item 1 of §5.2): on the lone root's deposition it goes to the member
+   copy, never to the replay queue; the requester's same-rid retry is
+   its one copy.
+4. **The `Ungated` fast-path answer.** `durable_jseq() == u64::MAX`
+   (the gate off, `session.rs:1286-1308`) holds in exactly two states:
+   a lone `Local` tenure and an epoch hold (`backup.rs:489-530`).
+   `DurableWait::Ungated` therefore answers OK **iff the node is lone or
+   holds an epoch** (class Lone or NonStealable; the session learns both
+   from `set_durable`); any other `Ungated` is an invariant violation
+   (`debug_assert!`, counted in `ack.ungated_unexpected`, answered by
+   resubmitting in doubt). It must never wait for the archive in an
+   epoch: S3 is unreachable there by definition, and that wait is the
+   plan 30 §M10 regression the comment in `durable_jseq` records.
+5. **Settling an op before `EIO` (`Abandon`).** New
+   `MutateOp::Abandon {}` (executed by rid only) and portable
+   `Code::Abandoned` (`crates/types/src/errno.rs`, a new wire number;
+   `EIO` at the FUSE boundary): the executor answers `r`'s outcome if
+   `completed` has one; otherwise journals `Refused { rid: r, code:
+   Abandoned }` and answers it. `on_client_deadline`
+   (`client.rs:2463-2518`) no longer calls `finish_in_doubt` directly:
+   it submits `Abandon` under the same rid (P2P, then inbox, then the
+   lease path: the ordinary routing) and answers the client with the
+   outcome — the late success (`OK`), the refusal, or `EIO` for
+   `Abandoned`. A sequencer's takeover gate re-ships its sealed tail
+   before it executes anything (the gate is closed until then), so an
+   `Abandon` never overtakes a committed copy of `r`. After a further
+   `acquire_deadline_ms` with no answer (isolated requester), the client
+   hears `EIO` unsettled (`stats.client_unsettled_eio`, I4's exception);
+   the `in_doubt_rids` set keeps `r` so a resubmission still dedups.
+   Every dedup site maps `Refused { Abandoned }` to `EIO` (never
+   re-executes). The ledger's late-landing allowance is removed for
+   settled answers. Precisely:
+   - **One client entry.** The `Abandon` reuses the rid's `clients`
+     entry (its phase becomes `Settling`); it never adds a second
+     submission of the rid (I2(b)).
+   - **It waits for its own commit.** `Refused { r, Abandoned }` is a
+     row like any other: under RootGroup or DelegGroup its answer waits
+     for its commit before the `EIO` leaves.
+   - **A copy in flight across a routing change.** `r` forwarded to root
+     R and delayed in the network; `r`'s directory delegated to D
+     meanwhile; the deadline routes `Abandon` to D, D journals the
+     refusal; the delayed `r` arrives at R. R does not execute in a
+     delegated subtree without recalling it first, the recall drains D's
+     stream (which carries the refusal) and `completed` then dedups `r`
+     at R. The takeover case is the gate's (the sealed tail is re-shipped
+     before anything executes). These two are the whole of "no execution
+     of `r` exists anywhere afterwards"; the code comment on
+     `on_client_deadline` states both.
+   - **The deadline.** The existing client deadline (`acquire_deadline_ms`,
+     2 × TTL) is split: the op's own attempts until 1.5 × TTL, the
+     `Abandon` until 2 × TTL, then the unsettled `EIO` (§11 Q9, decided
+     in favour of keeping the user-visible bound at 2 × TTL; the
+     alternative, a second full deadline, would make it 240 s).
+   - **Shape** (§11 Q15, open): a `settle: bool` flag on
+     `PeerMsg::MutateRequest`, the inbox entry and the lease-path submit
+     instead of a `MutateOp::Abandon` variant (an op "executed by rid
+     only" would otherwise leak into the fast path, `derive_replay_op`,
+     `TouchSet::from_op` and the inbox batch format). Recommended: the
+     flag; the rest of this plan writes `Abandon` for either.
+   - `Code::Abandoned`: check `crates/types/src/errno.rs`'s portable
+     table for a reserved hole before appending a new wire number.
+6. **Stranded unacknowledged ops of a delegation are dropped, not
+   replayed.** At a `Recall` (`stranded_by_recall`,
+   `spec.rs:275-283`), a delegate's rows past the cut are uncommitted
+   (after C2 a committed row is at or below the cut, item 7) and their
+   clients were never answered: roll back, drop, and let the parked
+   clients retry by rid (`deleg_abort_stream_parks` already does it for a
+   sealed backup). A requester's `Shadow { gen }` past the cut cannot
+   exist (shadows are only installed for committed answers).
+7. **A generation is ended only with its committed rows, and the cut
+   is in the record.** The root ends a generation (recall drained, or
+   outwait) only once its cursor covers every row a member of the
+   generation's group may hold: with the root as the second member that
+   is its own appended cursor; with recorded backups, the sealed tail
+   of **every backup any `DelegGroup` record of the generation named**
+   whose rows may be uncovered (one `DelegSeal` each; today
+   `on_deleg_expiry`, `delegate.rs:3010-3117`, seals only the latest
+   `gs.backup`, once, and then reclaims without it). A named backup that
+   does not answer is §11 Q1's case for a delegation: the generation is
+   not ended (its subtree's writes wait,
+   `status.delegation.gens[].waiting_for_group`) until a member answers
+   or `constellation repair abandon-group --gen G`.
+   The end is journaled as `LogRecord::Recall { dir, gen, through: u64 }`
+   (`record.rs:243`, field added): `through` is the root's cursor at the
+   end (`end_generation`, `delegate.rs:3164-3238`). Every replica's void
+   cut is `through` (`replay.rs:782-826`: `void_stream(gen, through)`,
+   `note_void_cut(gen, through)`; `session.rs` `seed_generations`), not
+   what the replica happens to hold of the stream; `deleg_log_idx:{gen}`
+   becomes a cache of the log. The generation counter stays the root's
+   (`next_deleg_gen` floored by `max_gen`, both from the log). (Moved
+   here from C4 so that C3 can rely on it; the review's H4.)
+8. **The delegate's fast path keeps the root's shape.** Today
+   `deleg_fast_path_gated` *closes* the delegate's fast path whenever it
+   has a backup (ops go through the core and park, `delegate.rs:411`),
+   while the root's fast path writes on the FUSE thread and waits after
+   (`write_gate.rs:453-536`). C2 gives the delegate the root's shape: the
+   delegate's fast path (`DelegateView::admit_for`,
+   `crates/engine/src/lease.rs:549-576`; `Meta::delegate_execute_admitted`)
+   journals on the FUSE thread, then waits on a per-generation durable
+   watermark (`SessionState::wait_deleg_durable(gen, idx, budget)`, new,
+   fed by the core from `backup_acked`/`DelegateStreamAck` as
+   `set_durable` is for the root), falling back to an in-doubt
+   resubmission on `Lost`/`TimedOut` exactly as the root's does. Under
+   load the core thread is the bottleneck (the F2 review measured 73 %
+   of a loaded delegate's core samples in the parked-acknowledgement
+   check); routing every delegated write through it would put the C2
+   latency gate and the "only latency may degrade" requirement at
+   risk.
+
+Why C2 is safe alone: it only adds waits (a delegate's answer waits for
+a second copy; a lone root's answer to a forward waits for the archive;
+an `Ungated` answer waits for the archive) and replaces an unsettled
+`EIO` by a settled one. Every acknowledged row now satisfies I1, so
+C3's deletions become possible. The generation end records its cut
+(item 7) and covers every committed row (the root appended every row
+acknowledged via the root; every named backup's rows are drained by the
+seal path, `on_deleg_sealed`, before the end).
+
+### 5.4 C3: verbatim re-ship; no re-execution of a committed row
+
+1. **Segment origins** (`crates/authority/src/segment.rs:29-33`):
+   `origins: Vec<(u64, u64)>` becomes `origins: Vec<Origin>` with
+   ```rust
+   pub enum Origin { Own, Deleg { gen: u64, idx: u64 },
+                     Tail { epoch: u64, jseq: u64 } }
+   ```
+   (`Own` replaces `(0, 0)`). `JournalTx` gains `tail_of:
+   Option<JournalPos>` (set in C1) and the ship plan maps it to `Tail`.
+2. **The successor applies a sealed tail verbatim.** `apply_backup_tail`
+   (`backup.rs:2364-2428`) appends each tail transaction to its journal
+   with its records unchanged and `tail_of` set, and applies them
+   through the *tail apply* (`Replica::apply_segment`'s record apply,
+   not `apply_records_journaled_inner`'s skip-on-conflict): the
+   successor's replica is the archive prefix the predecessor built the
+   tail on (it tailed to head before the marker), so the records apply
+   exactly. A record that does not apply cleanly is an invariant
+   violation (`MetaError::TailDiverged`, logged at ERROR with the tail
+   position; the gate stays closed; the sim fails the seed). Rows of
+   the tail whose rid the archive already completed are kept (verbatim:
+   the archive cannot hold a committed row twice unless a bug made it,
+   which I2's check catches) — the dedup-by-rid skip in
+   `apply_backup_tail` becomes a `debug_assert!` plus a counted error.
+3. **A delegate that takes the root over** (the two-node headline case:
+   node a is the delegate of `d1` and the backup of root b; at a's seal
+   takeover a's journal already holds its own rows `(g, 5)`, `(g, 6)`
+   *before* the tail, and b's tail holds b's append of `(g, 5)` with
+   origin `Deleg { g, 5 }` and b's later ops). In the gate, in this
+   order:
+   1. **move** this node's rows of every live generation it holds as
+      delegate out of the journal, their effects rolled back from their
+      before-images, into its member copy of `g` (`backup_tail[DELEG_BACKUP_BASE
+      + g]`, §5.6). The strand stays (it is what keeps the tail from
+      being applied on top of state from later in the log —
+      `delegated-holder-cut` seed 772: a create in `d1` would otherwise
+      ship ahead of the tail's rename of the same name out of `d1`); what
+      is deleted is the re-execution by rid and the generation hole;
+   2. apply the sealed tail **verbatim** (item 2);
+   3. **re-append** the moved rows verbatim under `(g, idx)`, in index
+      order, **skipping every `(g, idx)` the tail already carries**
+      (dedup by delegation origin, not by rid); a skipped row and the
+      tail's copy must be record-identical, else a hard error
+      (`MetaError::TailDiverged`). If the tail itself ends `g`
+      (`Recall { gen: g, through }` in it), the moved rows above
+      `through` are **dropped**, not re-appended: they were never
+      committed (after C2 a delegate row without a recorded backup is
+      acknowledged only once the root appended it, i.e. at or below the
+      cursor the `Recall` recorded; with a recorded backup, the root
+      drained that backup before ending `g`), and their clients retry by
+      rid;
+   4. end each still-live generation with `Recall { through }` (C2's
+      item 7) covering the re-appended rows.
+   Why step 3 applies cleanly on the post-tail replica (the ownership
+   argument): the root executes nothing on keys a live generation owns —
+   an op wholly inside the subtree is the delegate's, and a
+   cross-subtree op recalls the generation first (ADR-23, no 2PC). So if
+   the tail does not end `g`, no tail row other than `g`'s own appended
+   rows (skipped) touches `g`'s keys, and the moved rows re-apply on the
+   post-tail replica exactly as they applied before; if the tail ends
+   `g`, everything above its cut is dropped, and seed 772's shape (the
+   tail's rename of a name out of `d1`, which needed the recall) is
+   ordered correctly by construction. A row that still does not apply is
+   `TailDiverged` (gate closed, the sim fails the seed).
+   Deleted: `strand_for_takeover`'s re-execution of `own_gens` rows by
+   rid (`spec.rs:3181-3215`), the `holed` generations,
+   `mark_deleg_stranded_tx`, `delegate_stranded`, the stopped-at-install
+   rule and the recall answer at `log_stream_idx` (`96f4565`'s
+   machinery): a generation never gets a hole.
+4. **A deposed root keeps another generation's rows as a member copy**
+   (§5.6) instead of the `RebuildReplica` → `reset_for_rebuilt_ns_tx`
+   → `Records` replays path. `recover_deposed` (`jobs.rs:1381-1410`)
+   never emits `RebuildReplica` for captured journals;
+   `reset_for_rebuilt_ns_tx` keeps only the uncaptured fallback
+   (`CONSTELLATION_HOLDER_CAPTURE=0`), where it queues nothing for gated
+   rows.
+5. **Deleted with the paths**: `folded_into_later_manifest` and its two
+   call sites (`replay.rs:75-99`, `:140-144`, `:533-537`),
+   `rebase_on_truncate`, `truncate_base` in `QueuedReplay` (or the
+   takeover-loss fix's conditional-truncate replacement) — **except**
+   inside the lone branch (C5 keeps the conditional truncate there);
+   `MutateOp::Records` as a replay of a committed row: the foreign
+   `Streamed` stranding arm (`spec.rs:1288-1307`), `PendingLocalOp =
+   Records` for appended delegate rows and adopted tails
+   (`local.rs:850-857`); `derive_replay_op` is kept for lone-branch rows
+   only; `settled_outcome`'s `lost && journal_carries_outcome` branch
+   (`client.rs:2547-2569`; the deposed journal no longer holds anything
+   but the lone branch); the 2945 fix's `QueuedReplay.deps` (no deposed
+   replay of a forwarded op exists).
+6. `TailFollows` stays as the seal record (Delos: the sealed loglet's
+   suffix follows) with `through` (C1); its session effect (`owe`) is
+   unchanged.
+
+### 5.5 C4: lock and delegation state in the log
+
+**Delegation state.** The generation's start (`Delegate`), group
+(`DelegGroup`) and end with its cut (`Recall { through }`) are already
+records when C4 starts (C2). C4 adds the locks.
+
+**Lock records** (`crates/meta/src/record.rs`, appended to the enum):
+
+```rust
+LockGrant { id: GrantId, ino: Ino, node: u64, mode: u8, gen: u64,
+            floor: Position },   // floor: what the holder must wait for
+LockRelease { id: GrantId, floor: Position },  // the releaser's frontier
+LockExpire { id: GrantId, barrier: Position }, // outwaited; the cut
+LockMove { ids: Vec<GrantId>, gen: u64 },      // to a generation (0: root)
+```
+
+- The owning sequencer journals them in the same transaction as the
+  decision: a grant when it mints (`lock_try_grant`, `locks.rs:1300`),
+  a release when it processes `LockReleased` (`on_lock_released`,
+  `:2395`), an expiry when it outwaits (`on_lock_grant_expiry`,
+  `lock_take_outwaited`), a move inside the transaction of the
+  `Delegate` record (subtree grants to `gen`), of the `Recall` record
+  (the generation's live grants back to 0), and of an unlink's stream
+  row in a delegated subtree (today's `leaving` grants, moved to 0).
+  A delegate's records are rows of its stream `(gen, i)` and reach the
+  log through the root's append.
+- **A renewal that only extends the window is not logged**: it changes
+  no identity. Windows stay per-replica in memory (`Grant.until_ms`,
+  `HeldGrant.until_ms`); plan 41's lane keeps extending them. A renewal
+  that **installs** a grant — a reclaim during a fast successor's grace
+  (`lock_renew_one`'s "unknown: a reclaim", `core/locks.rs:2666-2697`) —
+  or a request that **changes a grant's mode** (`lock_try_grant`'s
+  `own.mode.max(mode)` upgrade, `:1326`) is a grant decision and
+  journals a `LockGrant` (the same id, the new mode), answered after its
+  commit like any grant.
+- **Derived table**: `Replica::apply_segment` and the journal path
+  apply the records to `LockTables` owner-side (`grants`, `ended`)
+  through one function `LockTables::apply_record(&LogRecord, now)`;
+  a grant learned from the log is installed with
+  `confirmed_ms = UNCONFIRMED` and `until_ms = restamp(now)` (today's
+  mirror semantics, now exact: the set of live ids is the log's). A
+  grant's answer to its holder waits for its record's commit (class of
+  the owner; under RootGroup one LAN round trip; the restart-horizon
+  wait stays and overlaps it).
+- **Floors and barriers** are the records' `floor`/`barrier` fields;
+  the in-memory `floors`, `dir_floors`, `handed_floor`, `barriers`,
+  `dir_barriers`, `cut` (`locks.rs:296-387`) become caches rebuilt from
+  the derived table (a successor rebuilds them at its gate from the
+  log, instead of from a mirror or a handoff).
+- **Fencing token**: the minter judges by the derived table (exact, at
+  its serial apply, inside the transaction — `check_tag_at_write`
+  unchanged); a non-minting executor still judges by the token's window
+  until it applies the `LockExpire`/`LockRelease` (the study's §2.2
+  residual: one mechanism, a window nonetheless).
+- **Deleted** (each listed with the bug it was for, so the reviewer can
+  check the class is gone): `PeerMsg::LockMirror`, `bk_mirror`,
+  `lock_install_mirror`, `mirror_dirty`/`mirror_ver`
+  (`df14686`; model `fast_takeover_with_only_the_async_mirror_violates`);
+  `DelegRenewed.{locks, lock_floor, lock_cut_at, lock_cut,
+  lock_barrier}` and `handoff`, `handed`, `moved_seen`,
+  `lock_take_handoff`, `lock_install_moved`, `install_if_consistent`'s
+  copy rule (`381c66d`, seeds 196252/196102/196004); `DelegRecalled.locks`
+  and `lock_hand_back`/`lock_install_returned` with the late-answer rules
+  (`9d82ad0`, `fb0c909`: `unlinked-exclusion-7455`); `DelegateStream.{leaving,
+  leaving_barriers}`, `lock_install_leaving*`, `lock_take_back_left`,
+  `deleg_drop_left` (`4c5d184`); `lock_on_generation_outwaited`'s
+  restamped grace and the handoff kept until end (`c465b07`:
+  `unlinked-exclusion-5681`); `restamp` at the five install sites except
+  the log-derived install. `DelegRenewed.lock_grace_ms` stays (a grace is
+  a time window, not state) — or, if C4's model shows it derivable from
+  the log (the takeover marker time and the predecessor's expiry are in
+  the log and the lease), is derived; C4's model tests decide.
+- `DelegRenew.{stream_head, stream_head_at}` stay (a renewal reports
+  liveness and progress; the barrier it feeds is now recorded by the
+  owner's `LockExpire.barrier`).
+
+### 5.6 Member copies (C1 for the root's own rows, C3 for appended delegate rows)
+
+A node that stops sequencing for a group it is a member of keeps the
+rows it holds for that group until the archive carries them:
+
+- **A deposed holder** (C1): its gated unshipped rows of epoch `e`
+  move from `journal` to `backup_tail[(e, first)]` (same `BackupTx`
+  shape the backup role uses), with their before-images applied (the
+  replica returns to the archive prefix). It answers `SealTail` for `e`
+  from there. It drops rows `≤ through` when it applies the segment
+  whose `Tail { epoch: e, jseq: through }` origin covers them, and the
+  rest (uncommitted: the sealer did not hold them) when it applies the
+  successor's `TailFollows { prev_epoch: e, through }`. A marker of an
+  epoch above `e` that carries **no** `TailFollows { prev_epoch: e }`
+  drops `e`'s member copy too: after C1 a `Backup` lease's successor
+  always carries `TailFollows`, so such a marker is the TTL successor of
+  a `Local` lease, whose gated rows were Archive-class and never
+  acknowledged (their clients retry by rid). A member copy of an epoch
+  the operator abandoned (§5.8) becomes the lone-branch replay queue
+  (the only path by which it is re-executed).
+- **A deposed root** (C3): another generation's appended rows
+  (`Local { gen != 0 }`) move to `backup_tail[DELEG_BACKUP_BASE + gen]`
+  (the delegate-backup tail keyspace, `crates/meta/src/store/backup.rs:390-444`),
+  and are served on `DelegSeal { gen }` exactly as a recorded backup's
+  are (`on_deleg_sealed` appends them under `(g, i)`). The next root,
+  outwaiting an inherited generation whose group has no recorded backup,
+  sends `DelegSeal` to the previous root(s) named by the archive's
+  epoch markers since the generation's last appended index. Dropped when
+  the log's `deleg_log_idx` passes them or the `Recall { through }`
+  lands.
+- `status.ack.member_copies` lists `(kind, epoch|gen, rows, oldest_ms)`.
+
+This answers the paused seeds' design question: a deposed root neither
+drops nor rebuilds-and-replays; it keeps the copy it holds as a group
+member, so no acknowledged row loses a copy and no copy is executed.
+
+### 5.7 C5: the lone branch, isolated and documented
+
+After C3 the replay queue has exactly one producer: a deposed **lone**
+sequencer's ungated rows (and an operator's abandon). C5:
+
+- renames the queue's meaning in code (`QueuedReplay` → `LoneBranchOp`
+  with `kind: LoneOwn | Abandoned | DropHeld`), asserts at enqueue that
+  the row is ungated (`debug_assert!` and a counted error), and keeps
+  the lone branch's replay shapes (the original op; the conditional
+  truncate; `derive_replay_op` for op-less rows);
+- conflict copies only from that queue (I5); `status.ack` reports
+  `lone`, `lone_acks`, `lone_branch_replays`, `lone_branch_conflicts`;
+- documents the contract (GOALS, DESIGN §4/§9, durability-and-failover):
+  "a writer with no peer within the RTT budget is offline-first: its own
+  acknowledgements rest on its disk; a deposition while it is alive and
+  partitioned brings them back as a branch, with conflict copies where
+  the namespace moved on. `ack=s3` (every acknowledgement waits for the
+  archive) and an offline designation (non-stealable) are the two ways
+  to have none";
+- documents §11 Q3's decision for epoch holds: **non-stealable except
+  by an operator's retire.** The hold owner's deposition paths are
+  `Control::Retire` (`promise.rs:495-507`) — the documented abandonment
+  of a non-stealable authority: "retiring a node gives up its unshipped
+  journal", whose rows go to the lone-branch queue of whoever runs it —
+  and the supersession of an epoch that carried no lease
+  (`release_superseded`, `epochs_superseded`), which acknowledged
+  nothing. C0's flex property `hold_owner_never_deposed_except_by_retire`
+  checks exactly this; if it finds another path, the hold owner's
+  answers to members' forwards wait for one member's copy of its
+  stream-ahead (a new `StreamAheadAck`) — never for S3.
+
+### 5.8 Operator escape: `constellation repair abandon-group`
+
+`constellation repair abandon-group --epoch E` (and `--gen G`): run on
+the node that waits to claim (§5.2 item 5) or to end a generation whose
+group is unreachable. It journals `LogRecord::GroupAbandoned { epoch |
+gen, through_known }` and lets the claim or the generation end proceed;
+every member copy of `E` (or `G`) that later reappears is moved to that
+node's lone-branch queue (replayed by rid, conflict copies on refusal:
+explicitly an operator's choice, counted in `status.ack.abandoned`).
+Refused while any member of the group answers `SealTail`. The command
+exists because §11 Q1 recommends the strict wait; if the maintainer
+chooses the bounded variant instead, it is replaced by the bound.
+
+### 5.9 Why the rules are sufficient (the integrity argument, to be extended in code)
+
+- *Write-all, read-any*: a row is committed only when every member of
+  its configuration holds it (I1). A reconfiguration (seal path, tail
+  fetch, generation end) reads one member's sealed tail after sealing
+  it; the seal stops the old sequencer from committing anything more
+  (it needs every member). So the new sequencer holds every committed
+  row, and re-ships it verbatim (I2c). This is Vertical Paxos with
+  write quorum = all, read quorum = one; the configuration master (the
+  lease CAS, or the root's log for a delegation) guarantees exactly one
+  reconfiguration wins (same object version / serial log).
+- *Nothing committed is lost to a deposition*: the deposed sequencer
+  keeps its copy as a member copy until the archive has it (§5.6), so
+  even a successor that sealed a different member can be cross-checked
+  (and, with Q1's strict rule, a TTL successor cannot start without one).
+- *Nothing uncommitted is acknowledged*: by I1; its client retries by
+  rid, deduped by the re-ship if a member had it, executed once
+  otherwise, or settled by `Abandon` at the deadline (I4).
+- *Authority state cannot be revived by a late message*: no message
+  carries it (I3); a late recall answer or renewal reply is a stale
+  proposal the owner ignores.
+- *What still rests on clocks*: lock and delegation windows, read
+  delegations, the successor's quarantine, the fast-path admission
+  check — unchanged rules (C7 changes their clock assumption, not their
+  structure).
+
+## 6. Specification changes this plan authorizes
+
+CONVENTIONS rule 5 forbids editing `docs/explanation/DESIGN.md` unless
+a plan authorizes it. This plan does, section by section, each in the
+milestone that makes the text true (never earlier). The substance of
+each new text is given; wording is the executor's, in the existing
+style.
+
+| DESIGN section (line at `05ef4c9`) | Milestone | New substance |
+|---|---|---|
+| §1 Overview (L30-37): "Correctness never depends on P2P; S3 remains the arbiter of record" | C2 | S3 is the **configuration master** (who sequences, with which group, at which epoch) and the **archive**; a write is committed when the configured group holds it; P2P carries the group's copies. Correctness never depends on failure detection; a node with no peer in budget commits through S3 or acknowledges as the documented lone writer. |
+| §1 Hard constraints (L70-93) | C2 | Unchanged list; constraint 4 gains: "a writer with no peer in budget acknowledges its own node's writes at local speed as a lone writer (§4), and other nodes' writes once archived". |
+| §4 intro (L582-587) | C0 | The Delos vocabulary (§3 of this plan): configuration master, configuration, group, commit, seal, sealed tail, archive, lone sequencer, member copy. |
+| §4 Local store (L589-626) | C1, C3, C5 | `backup_tail` holds a backup's tail **and member copies** (C1/C3); `spec`/`pending_replay` described as committed-ahead installs plus the lone branch's queue (C5). The before-image funnel stays (it now serves ordering and the lone branch). |
+| §4 One log, one root lease (L628-685) | C1, C3 | Acquire and takeover: a successor re-ships the sealed tail **verbatim** (C3), obtained by its own seal or by a tail fetch from any member (C1); "a predecessor's unshipped tail is replayed by its requesters (Layer A)" holds only for a lone predecessor. `TailFollows { prev_epoch, through }`. Records list gains `DelegGroup` and `Recall.through` (C2), the lock records (C4), `GroupAbandoned` (C1). |
+| §4 Request ids and exactly-once (L687-707) | C2 | "An op still in doubt at its deadline fails with `EIO`" becomes: the requester **settles** the rid (`Abandon`, answered by the sequencer in force) and answers the outcome, `EIO` only for `Abandoned`; an isolated requester's `EIO` after twice the deadline is the documented exception. Replays are no longer listed among the exactly-once users except the lone branch. |
+| §4 "The replica is a log prefix plus explicit speculation" (L709-730) | C1, C3, C5 | Rewritten: the replica is the archive prefix plus **committed rows ahead of the archive** (the group's stream, committed shadows) plus, on a lone sequencer only, its own speculation. Committed entries never strand; they retire when the archive carries their origin. "A replay the namespace no longer admits ... the only source of conflict copies" is narrowed to the lone branch and operator actions. |
+| §4 Positions and log streams (L732-753) | C1 | The pre-S3 stream carries **committed** rows (installed as committed, never rolled back by a seal takeover). |
+| §4 Acknowledgement and durability (L755-774) | C2, C5 | Replaced by the commit rule: the `AckClass` table (§5.1), the delegation group, the lone sequencer, the forward-from-archive rule. Layers A/B/C remain as names for the user-facing policy (`local` = commit by group where one exists, lone otherwise; `s3` = archive). |
+| §4 Delegated sub-sequencers (L776-825) | C2, C4, C3 | The delegate acknowledges once its group holds the row (a recorded backup, or the root's append); `DelegGroup` is the delegation's configuration; the cut is in `Recall`; a delegate that takes the root over appends its own rows as rows of its generation. Fix the TTL drift (L787 says 5 s; the engine default is the lock TTL, 20 s, at least 5 s). |
+| §4 Locks (L843-847) | C4 | Grants, releases, expiries and moves are log records of the owning sequencer; renewals are not. |
+| §5 One Rule (L849-877) | C7 | The time discipline restated as rate-bound: the holder measures from its own send on a clock that never under-counts, the grantor from its own receipt on a clock that never over-counts; `margin ≥ 2ρ·T + transit` replaces `margin > 2 × drift`; the root lease is judged by ETag observation, not by comparing `expires_unix_ms` across nodes; the non-minting token check rests on a one-way delay bound. |
+| §5.2 Offline designation (L895-915) | C5 | A designee's acknowledgements are non-stealable, hence not speculation; the "no speculation" alternative for an offline writer. |
+| §5.3 Continuation epochs (L917-993) | C5 | Per Q3: the hold is a non-stealable authority (its journal is not speculation; "a deposed hold owner rolls back and replays by rid" removed or restricted to the operator's retire), or the hold's acknowledgements join the group rule. |
+| §5 Availability matrix (L995-1014) | C1, C2 | Rows "Holder dies, no backup", "Delegate dies", "Delegate cut from the root": no requester replay; a lone holder's own writes come back as its branch; a group cut from S3 and from the claimer past the TTL: the claimer waits for a member (Q1). |
+| §6 Session guarantees (L1036-1049) | C2 | A shadow is installed only for a committed answer. |
+| §6 Cluster locks (L1091-1168) | C4 | Floors and barriers are record fields; "move with the lock table ... through the backup mirror" removed; failover: a fast successor derives the grant set from the log (exact) and keeps the grace for windows; the fencing-token paragraph's "keeps a refused close's content as a conflict copy" stays (fenced writer). |
+| §6 Staleness, precisely (L1170-1202) | C1, C3 | "prefix plus explicit speculation" → prefix plus committed rows plus a lone sequencer's own speculation; the takeover gate re-ships verbatim. |
+| §9 Failover by topology (L1360-1375) | C1, C2, C5 | Rows rewritten per the commit rule; the "Only distant peers" row is the lone writer's branch; the bring-up rule stays. |
+| §9 Seal-based failover (L1377-1408) | C1, C3 | Verbatim re-ship; the tail fetch on the TTL path; a listed backup seals before it claims at expiry. |
+| §9 Nobody observes a tentative effect (L1410-1418) | C2 | Renamed "Reads observe committed state". **The mechanism is unchanged** (`durability_pending`: under RootGroup the holder's read wait already *is* the commit wait; the study's "retire" of these waits was loose) — only the name and the framing move; the lone-root sentence stays as the lone branch's contract. |
+| §9 Delegates (L1420-1439) | C2, C3 | No requester replay; the delegate's group; a crashed delegate without a recorded backup loses nothing acknowledged (the root holds it); `Held` remains only for the lone branch. |
+| §9 Other failures (L1454-1466) | C1, C3 | "holder deposed ... replays it by rid ... conflict copies" → keeps a member copy; only a lone holder's branch replays. |
+| §9 Other failures, "clock skew" row (L1454-1466) | C7 | Rate within 0.1 % on `CLOCK_MONOTONIC_RAW`, any offset; what stays offset-bound (GC's horizon, timestamps). |
+| §14 GC (L1924-1926) | C2 | "fails with `EIO` rather than being re-executed" → settled by `Abandon`. |
+
+GOALS.md L17-20 ("no conflict copies in the default modes", C5:
+"except a lone writer's branch after it was deposed while partitioned,
+which `ack=s3` or an offline designation avoids") and L21-31
+(offline-first; local-FS-fast: the lone writer's contract).
+
+DECISIONS.md: a new **ADR-32 "Commit is the configured group's
+acknowledgement (Vertical Paxos over S3)"** (C1 writes the decision and
+the rejected options — study §4 A, B1, C, D — and each later milestone
+amends it); amendments to ADR-2 (S3 as configuration master and archive,
+not the per-write arbiter; C2), ADR-14 (the shadow; C2), ADR-18
+(settling before `EIO`; C2), ADR-19 ("superseded in part by ADR-32":
+speculation only in the lone branch; C5), ADR-21 (Layer B commit; the
+tail fetch; C1), ADR-22 (Q3; C5), ADR-23 (delegation group, cut in the
+log, verbatim; C2–C3), ADR-25 (locks in the log; C4).
+
+Reference pages: `forwarded-mutations.md` (exactly-once and in-doubt,
+acknowledgement and durability, speculation and stranded-op recovery
+— the main rewrite, C1/C2/C3/C5; status counters), `durability-and-failover.md`
+(Layer A/B, seal-based failover incl. "Why it is safe", pre-S3
+streaming, epochs, known limits; C1/C2/C5), `delegations.md` (how a
+delegate executes, append path, failures; C2/C4/C3), `cluster-locks.md`
+(the fencing token's replay paragraphs, coherence, failover, delegations;
+C4/C3), `cto-modes.md` (positions of a tenure that ended, the session
+wait's replay step, direct log streams; C1/C3), and
+`docs/how-to-guides/development/TESTING.md` (the oracles, configs and
+scenarios; every milestone).
+
+## 7. Milestones
+
+Each milestone ends green on `cargo fmt`, `clippy -D warnings` and
+`cargo test --workspace`; its own sim sweeps at the seed counts given;
+its harness scenarios 3× green; its campaign cells; its performance
+gates (§9). The full CONVENTIONS gates run at C5's end and at the end of
+the plan (§14). **Every milestone is reviewed (fable) before the next
+starts**: C1, C2 and C3 are complex by any measure; C0 and C4 touch the
+oracles and the lock table that every later proof rests on. A milestone
+that cannot meet its exit criteria stops and reports; it never loosens
+an oracle or an assertion to pass. An existing test whose assertion
+encodes behaviour this plan removes (for example a count of replays
+under a backup) is **rewritten to the new contract**, listed in
+PROGRESS with the old and new assertion and the reason; this plan
+authorizes exactly those rewrites and no other loosening.
+
+Seed counts: "S×N" is N seeds via `sweep_config`
+(`AUTHORITY_SIM_CONFIG=S AUTHORITY_SIM_SEEDS=N cargo test -p
+constellation-authority --test sim -- --ignored sweep_config`); a new
+config is added to both `sweep_config` and `replay_seed`
+(`crates/authority/tests/sim.rs:236-387`, `:2640-2703`), and gets a
+non-ignored test over a small range so CI runs it.
+
+### C0 — Name the commit point and check it (no behaviour change)
+
+**Code.**
+
+- `crates/authority/tests/sim/`: a `ClusterStores` registry passed in
+  `NodeEnv` (node id → `Arc<Meta>`, plus read access to the sim
+  bucket's objects: `Bucket::peek(key)` in `store.rs`) so a check can
+  read every node's store at the instant of an answer.
+- **I1 oracle** `check::committed_at_answer(stores, cfg, rid) ->
+  Option<AckClass>` evaluated **at the answering sequencer's emission**:
+  in the answering node's `Node::dispatch` for `Action::Send {
+  MutateReply }` with a definitive outcome (a forward's answer) and for
+  `Action::Reply` with `ClientReply::Outcome` when the node answers its
+  own client (`node.rs:1306-1320`), reading every store at that instant
+  — not when the requester processes the reply (a `CrashBackup` in
+  between would drop an unsynced tail and give a false violation; a
+  segment landing in between would give a false pass).
+  It classifies independently of the core: Archive (the bucket's
+  segments carry the rid's outcome), RootGroup (the lease object read
+  from the bucket names holder `h`, epoch `e`, `backups` at version
+  `v`; `h`'s journal and every listed backup's `backup_tail` hold the
+  row — the object read at the answer is the right set to check: a
+  backup is listed only after it caught up and removed only once
+  `removal_safe`; after a takeover, the successor's journal holding the
+  re-shipped row and its own group count), DelegGroup (the delegate's journal plus each backup the
+  delegate's `DelegateState` names — C2 switches this to the
+  `DelegGroup` record — or the root's journal row with origin
+  `(g, i)`), NonStealable (`SimConfig.designations` covers the keys;
+  epoch hold), Lone (the answering node is the client's node and has no
+  peer within `backup_rtt_budget_ms` in `SimConfig.rtts`/the bus RTT —
+  for a delegate, the root beyond it too). The first class that holds is
+  recorded in a new `AckLog` (`(node, rid, sim ms, Option<AckClass>)`,
+  shared like `InDoubtLog`, `node.rs:219-224`). `None` is a violation
+  when `SimConfig.strict_commit` (new, default `false`), always counted
+  in `RunReport.uncommitted_acks` (per class that was expected).
+- **I2 oracle**: an `IdentityLedger` (rid → set of `(node, Copy)` with
+  `Copy::{Client, Queued, Executing}`) fed by the client threads
+  (submit/resubmit/answer, `run.rs:1065-1208`) and by each node after
+  every event (`Meta::pending_replays()`, the core's `clients` map via
+  `CoreView`); a rid with copies on two nodes at once (a `Client` copy
+  and a `Queued` copy on the same node with `also_client` merge into
+  one) is a violation under `SimConfig.strict_identity` (new). **I2c**
+  (verbatim): `check::replay_log` additionally records, per rid, the
+  records and origin of the segment row that completed it; at the end,
+  for every rid answered OK under a RootGroup/DelegGroup class, the
+  completing row's records must equal the records the answer named
+  (`AckLog` keeps them) and its origin must be the original identity —
+  violated today by every adopted tail (new jseqs, re-application).
+- **I4 oracle** `check::no_late_landing(in_doubt_log, oracle, history)`:
+  for every `InDoubt` answer `(node, rid, t)` and a later completion of
+  `rid` in the log at `(seq, i)`, every op invoked by that node's
+  clients after `t` and completed in the log must be at a later
+  position; violation under `SimConfig.strict_settle` (new). Reports
+  `late_landings`.
+- **I5 oracle**: `tentative` rids (`node.rs:928-944`) whose answer was
+  not class Lone (from `AckLog`) are counted (`RunReport.non_lone_rollbacks`)
+  and, under `strict_durability`, fail — today `acked_rolled_back` is
+  only reported (`run.rs:2685-2718`).
+- **The sim's `RebuildReplica`** (`node.rs`, the stub answering
+  `ok: false`) runs the production rebuild: a fresh `Meta` from the
+  bucket's commit chain and log (the code path of
+  `authority_driver.rs:5455` `rebuild_replica` →
+  `Meta::replace_ns_from_rebuilt`, `crates/meta/src/store/bootstrap.rs:323`),
+  then `Event::RebuildDone { ok: true }`. Fail-before: the paused seed
+  configs log "rebuilding the deposed replica from the log failed"
+  repeatedly on the old stub; with the rebuild the deposed root recovers.
+- **The operator escape in the sim** (for Q1's strict wait, used from
+  C1): a `FaultKind::Operator(AbandonGroup { epoch | gen })` that the
+  sim fires once a claim or a generation end has waited
+  `SimConfig.abandon_after_ms` (default: never; the double-fault configs
+  set it) — through the same control path as `constellation repair
+  abandon-group` — and a run classification `waiting_for_group` for a
+  run that ends with a claim still waiting and no escape configured.
+  The strict checks accept a `waiting_for_group` run (they check what
+  converged, and that nothing acknowledged was lost or rolled back) and
+  classify an abandoned group's branch as operator-caused (I5(b)), so a
+  double fault under the strict rule neither times out nor passes
+  vacuously.
+- **Models** (fail-before for later milestones, recorded now):
+  - `crates/model/src/backup.rs`: property `acked_never_rolled_back`
+    (no write acknowledged under a non-`Local` policy is ever in a
+    replay set or a rolled-back journal), knob `commit_rule: bool`
+    (C0: `false`, today's protocol). New test
+    `today_a_deposed_holder_replays_committed_rows` (2 nodes, crash of
+    the backup's link, takeover): **violates** with `commit_rule:
+    false`. C1 implements `true`.
+  - `crates/model/src/delegation.rs`: property
+    `acked_ops_are_never_replayed`; test
+    `today_a_delegate_without_a_backup_acks_alone` violates
+    (`backups: false`, the delegate crashes before the root appends).
+  - `crates/model/src/flex.rs`: property
+    `hold_owner_never_deposed_except_by_retire` (a live hold owner's
+    epoch journal is stranded only by an operator's retire, or belongs
+    to an epoch that carried no lease) checked in `full_rule_is_clean`'s
+    config. §11 Q3 is **decided** (non-stealable except retire, §5.7);
+    the property checks the decision, and a counterexample stops C0.
+  - `crates/model/src/protocol.rs`: property `eio_never_lands_late` and
+    knob `abandon: bool` (C0 `false`); test
+    `today_an_in_doubt_op_lands_after_its_eio` violates (the requester's
+    deadline passes, the deposed holder's replay lands afterwards).
+- **Bench**: a new measurement scenario `ack-latency` (harness,
+  `crates/harness/src/scenarios/commit.rs`, in `CAMPAIGN` — run by name,
+  measure-only, prints JSON): per topology and op, p50/p90/p99 over 300
+  ops each of `create`, 4 KiB `write`+`fsync`, `rename`, `unlink`,
+  `chmod`, and the first `flock` from a non-sequencer:
+  1. one node;
+  2. two nodes on loopback: the holder's own ops and a forwarded op (the
+     other node), `ack=backup` automatic;
+  3. two nodes: node a the delegate of its own directory, the root on
+     node b (a's ops; b's forwards into a's directory);
+  4. three nodes: a delegate with a backup;
+  5. two nodes under `net:delay 60ms 20ms` (`CONSTELLATION_HARNESS_LOAD=net-wan`):
+     the lone root's own ops and a forwarded op;
+  6. `ack=s3` holder (reference).
+  `bench/commit-rule/run.sh` runs it (release build, 5 runs; p50 and
+  p90 gate, p99 is reported — five runs cannot gate a p99) and writes
+  `bench/commit-rule/RESULTS.md`. The state dir is on ext4 by default;
+  the four-file-system matrix (ext4, xfs, btrfs, tmpfs) runs at C0 (the
+  baseline) and at the milestones that change what the journal does on
+  disk — C1 (the journal row's shape), C3 (the apply path of a tail) and
+  C4 (journal rows per lock decision) — and at C7a (clock reads). **C0
+  records the baseline**, plus the
+  existing gates' baselines: `make perf-gate`, `make vfs-bench`,
+  `harness meta-bench` (`3node-p2pon-shared-*`, `1node-*`),
+  `lock-latency`, `nonowner-op-latency`, `delegated-op-latency`,
+  `cto-latency`, `backup-failover`'s failover time, `make
+  perf-regression` (full, latency250, bw50).
+- **Docs**: DESIGN §4's vocabulary paragraph (authorized); TESTING.md
+  (the oracles, the flags, `ack-latency`); ADR-32's first draft (status
+  "proposed", decision text only).
+
+**Fail-before (non-vacuity of the oracles).** Each new oracle must find
+today's states, or it proves nothing later. On `05ef4c9` (plus the
+recommended interim fixes), with the strict flags on:
+- I1: `long-delegated` ×2000 and `delegated-backup` ×2000 report
+  uncommitted DelegGroup answers (a delegate with no backup acks
+  alone); `far_config` (`no_peer_in_budget_is_todays_behaviour`,
+  1000..1020) reports Lone-class answers to remote requesters.
+- I2: `backup-crash`'s pinned seeds (`regression_backup_crash_classes`)
+  and `delegated-holder-cut` (seeds 2, 22, 330, 1719, 772, 1039) report
+  two copies (a deposed holder's queue and the requester's retry; a
+  successor's replay of its stranded delegate rows); I2c fails on any
+  `backup_failover_reships_the_tail` seed with a re-shipped tail.
+- I4: `long-delegated-late-answers` ×2000 and `long-backup` ×1000
+  report `late_landings > 0`, or C0 constructs a pinned seed that does
+  (a `CutS3Holder` + `CrashHolder` pair under `acquire_deadline_ms`
+  short enough that the requester's deadline passes before the
+  successor's drain), recorded as `regression_c0_late_landing_seed_N`.
+- I5: `backup_no_acked_op_lost` (700..1300) reports
+  `non_lone_rollbacks > 0` (the transient shadow rollbacks the test's
+  comment describes).
+- The four model tests above violate.
+- Baseline for C6 (the review's M4): `backup-two` (§7 C6) under
+  `strict_commit` on C0's code reports I1 violations in the add window
+  of a second backup (rows acknowledged by `{B1}` after the add-CAS
+  listing B2 landed).
+An oracle that finds nothing it should is a C0 bug: fix the oracle, not
+the expectation.
+
+**Exit criteria.** The oracles, flags and counters in; every existing
+test green (no behaviour change; the flags default off); the baseline
+table of every oracle per config in PROGRESS (counts per class, per
+seed range); the sim rebuild in, with the paused seeds' configs
+recovering; the four model counterexamples recorded; Q3's property
+checked; the performance baselines recorded on four file systems.
+
+### C1 — A backup-acknowledged row is committed (the root group)
+
+**Code** (§5.2): `JournalTx.gated` and `JournalTxHead.gated`
+(`crates/meta/src/store/local.rs`), `journal::PendingGate`
+(`crates/meta/src/store/journal.rs`); `Meta::strand_below_epoch` splits
+gated rows into the member copy (`crates/meta/src/store/spec.rs:3136`;
+member-copy rows in `crates/meta/src/store/backup.rs` under the node's
+own `(epoch, first)`, a new `BackupRole`-like marker
+`member_copy:{epoch}` in `local`); `abort_durable_parks` stops marking
+gated rows `unacked` (`readindex.rs:880-985`); `LiveEntry::stranded_by_epoch(epoch,
+tail_follows)` and `Shadow`/`Hint`'s `gated` (`spec.rs:146-282`);
+`MutateReply.committed` (`crates/authority/src/event.rs`); `JournalTx.tail_of`
+and `TailFollows { prev_epoch, through }` (`record.rs:245-253`,
+`jobs.rs:4242-4247`; the ship plan writes `tail_of` as an origin —
+until C3's `Origin` enum, as a second parallel vector
+`tail_origins: Vec<(u64, u64)>` in the envelope, folded into `Origin`
+by C3); `PeerMsg::SealTail`/`SealedTail` (`event.rs`; engine transport
+in `crates/engine/src/p2p.rs` and `authority_driver.rs` as a
+request/response like `DelegSeal`, timeout `backup_takeover_ms`); the
+claim path (`LeaseState::classify`, `crates/authority/src/core/lease.rs:306-394`:
+a non-listed claimer of an expired `Backup` lease, and a listed backup
+claiming at expiry without a seal, go through a new job phase
+`Phase::TailFetch` before `Acquire`); the holder's self-seal on
+`SealTail` (`mark_lost` with `self_sealed`, persisted with
+`Meta::backup_seal`); `status.ack.member_copies`,
+`status.lease.waiting_for_group`; the stale module doc at
+`backup.rs:27-36`. For Q1's strict wait (recommended):
+`constellation repair abandon-group` (`crates/cli`, the control method in
+`crates/control`, the engine binding) and `LogRecord::GroupAbandoned`.
+
+**Deleted.** Replay-by-rid of gated root rows after a deposition; the
+transient rollback of committed shadows and streamed entries at a seal
+takeover; the "a double fault: the tail is lost" TTL claim of a `Backup`
+lease (`lease.rs:345-356`'s comment and the sim's corresponding
+`budget_exceeded` relaxation for this case).
+
+**Fail-before tests.**
+- Sim, `strict_durability` now fails on `non_lone_rollbacks > 0` and
+  `strict_identity` is on for every `strict_durability` config:
+  `backup_no_acked_op_lost` (700..1300), `backup_failover_reships_the_tail`
+  (800..1400), `ack_s3_no_acked_op_lost`, `backup_departs_reconfigures`,
+  `backup_partition_reconfigures_or_seals`,
+  `fast_failover_with_delegations_keeps_close_to_open`,
+  `pre_s3_streaming_installs_and_retires`, `regression_backup_crash_classes`
+  (whose double-fault seeds 609417 and 802797 must now be clean, not
+  `durability_budget_exceeded`, when one member survives; when none
+  survives for the rest of the run they end `waiting_for_group`, or,
+  with `abandon_after_ms` set, as an operator-abandoned group) — **fail
+  before, pass after**. `long-backup`×5000, `long-acks3`×2000,
+  `backup-hot`×2000.
+- New config **`backup-group-cut-ttl`** (3 nodes; 1 the holder, 2 its
+  backup (RTT within budget), 3 beyond budget; at 1.5 s `CutS3` on 1
+  and 2 and `Partition {1,2} | {3}` for `lease TTL + 4 × backup_takeover_ms`,
+  then heal; workload on 1 and 3): before — 3 claims by TTL without the
+  tail, 1's acknowledged rows come back as replays and conflict copies
+  (`non_lone_rollbacks > 0`); after — 3 waits (Q1 strict) or proceeds
+  per Q1, then fetches the tail from 1 or 2 at the heal, re-ships, no
+  rollback, no conflict copy. ×2000; variants `-holder-only` (2 crashed:
+  3 fetches from 1) and `-backup-only` (1 crashed: from 2).
+- Core unit tests (`crates/authority/src/core/tests.rs`):
+  `a_deposed_backed_holder_queues_no_replay_for_gated_rows`,
+  `a_seal_takeover_keeps_a_committed_shadow_until_the_tail_lands`,
+  `a_ttl_claimer_fetches_the_sealed_tail_before_its_marker`,
+  `a_holder_that_answered_seal_tail_acknowledges_nothing_more`,
+  `a_listed_backup_seals_before_claiming_at_expiry`,
+  `no_member_answering_the_tail_fetch_holds_the_claim` (per Q1). Meta:
+  `strand_below_epoch_moves_gated_rows_to_the_member_copy`,
+  `a_tail_origin_retires_a_streamed_entry`,
+  `the_member_copy_is_dropped_when_the_archive_carries_it`,
+  `a_marker_without_tail_follows_drops_the_member_copy` (M1),
+  `seal_tail_for_another_epoch_or_config_version_is_refused`,
+  `a_self_sealed_holder_recovers_and_claims_its_own_expired_lease`,
+  `sealed_tail_is_sent_in_batches` (M2). Each fails on the parent.
+- Model: `backup.rs` with `commit_rule: true` (deposed holder keeps a
+  member copy, successor re-ships, TTL claimer fetches): new tests
+  `commit_rule_two_nodes_is_clean`, `commit_rule_three_nodes_is_clean`
+  (`acked_never_lost`, `ack_order_is_log_order`,
+  `acked_never_rolled_back`); `today_a_deposed_holder_replays_committed_rows`
+  keeps violating with the knob off; a new
+  `a_ttl_claim_without_the_tail_fetch_rolls_back_an_acked_write`
+  violates with the fetch disabled.
+
+**Harness.** Must pass 3×: `backup-failover`, `backup-failover-with-delegation`,
+`backup-departs`, `backup-partition`, `no-peer-in-budget`,
+`single-node-unchanged`, `ack-s3-failover`, `deposed-reintegration`,
+`deposed-reintegration-backup`, `holder-publishes-log-prefix-backup`,
+`backup-takeover-holds-missing-chunks`, `backup-takeover-drops-held-chunks`,
+`root-failover-with-delegates`, `slow-s3-no-seal`, `holder-kill-rejoin`.
+New **`backup-group-isolated`** (default catalog; `m9.rs`): a and b on
+the harness's LAN, c a third node; a and b's S3 cut by toxiproxy and
+their P2P to c dropped by the `net:` item past the lease TTL; c's
+writes wait (Q1) and resume after the heal by tail fetch; ledger clean,
+`speculation.stranded_replayed == 0` on every node, no conflict copy.
+
+**Campaign.** Phase 3 cells for `backup-failover*`, `backup-partition`,
+`backup-group-isolated`, `slow-s3-no-seal`, `load-probe` under
+`pause-takeover`, `step-pause`, `runtime-hog:4:200@b`, `net-flap`,
+`s3-jitter`, `clock-skew`, seeds 42–44: no failure; the counters
+`stranded_replayed`, `replay_conflicts` and the new `non_lone_rollbacks`
+(harness `verify::counters`) are 0 on every group tenure.
+
+**Performance.** C1 changes no acknowledgement wait. Gate: `ack-latency`
+topologies 1–6 within ±3 % (or one IQR) of C0's baseline on the four
+file systems; `make perf-gate` green; `meta-bench` neutral;
+`backup-failover`'s failover time within +10 % (the tail fetch adds
+nothing to the seal path). The TTL path gains one round trip plus a
+synced seal at a member: reported in `holder-kill-rejoin` and
+`ack-s3-failover` against C0, within +10 % of their failover time.
+
+**Exit criteria.** Every listed sim config green at the counts with the
+strict flags; the new config and variants green; the model tests; the
+harness and campaign cells; the performance gate; DESIGN §4 (Local
+store, One log, Positions and log streams), §9 (Seal-based failover,
+Other failures) and the reference pages updated for C1 (§6); ADR-32
+accepted with C1's decision; PROGRESS.
+
+### C2 — No acknowledgement outside a group where one exists; settle before `EIO`
+
+**Code** (§5.3): `Recall.through` and the recorded void cut (§5.3
+item 7: `record.rs:243`, `end_generation` `delegate.rs:3164-3238`,
+`replay.rs:782-826`, `session.rs` `void_stream`, `note_void_cut`,
+`seed_generations`), and the end-of-generation seal of every backup a
+record named; the delegate's `removal_safe` before it requests a
+backup's removal; the delegate's fast path in the root's write-then-wait
+shape (§5.3 item 8: `DelegateView::admit_for`, `write_gate.rs`,
+`SessionState::wait_deleg_durable`); `AckClass` and `Core::ack_class` (`backup.rs`),
+carried on `ParkedWhat::{Reply, Finish}` and the immediate reply path,
+counted in `status.ack.classes`; `Core::lone(gen)` (from link RTTs and
+`backup_rtt_budget_ms`); `LogRecord::DelegGroup` (`record.rs`, applied in
+`crates/meta/src/replay.rs` into the delegation row,
+`crates/meta/src/delegation.rs`), journaled by `on_deleg_renew`
+(`delegate.rs:2170-2269`) when `DelegRenew.backup` differs; the
+delegate's `deleg_stream_durable_with` rewrite and
+`deleg_fast_path_gated` = not lone (`delegate.rs:411-413`,
+`:1096-1143`; the engine's `DelegateView::set_gated`,
+`authority_driver.rs:1806`); `DelegateStreamAck` acknowledgements count
+toward the delegate's commit (no wire change: `through` already is the
+root's journaled cursor); the holder's Archive wait for forwards to a
+lone root (`holder.rs:285-405`); `MutateReply.committed` set for every
+committed class; `DurableWait::Ungated` handling (`session.rs:1286-1308`,
+`write_gate.rs:498-537`); `MutateOp::Abandon`, `Code::Abandoned`
+(`crates/types/src/errno.rs`, `crates/frontend-fuse/src/reply.rs` maps it
+to `EIO`), executed in `crates/meta/src/mutate.rs` (`execute_inner`:
+outcome if any, else `journal_refusal(rid, Abandoned)`), the deadline
+path (`on_client_deadline`, `client.rs:2463-2518`: submit `Abandon`
+under the rid; `finish_in_doubt` only on the second deadline;
+`stats.client_unsettled_eio`); `Recall` strand drops (not replays)
+uncommitted delegate rows (`spec.rs:275-283`, `:3068-3102`,
+`strand_recalled_speculation` `:3221`); `status.delegation.mine[].ack_class`;
+the ledger (`crates/harness/src/verify.rs`): a new
+`Ledger::with_lone(bool)` — a scenario declares whether its topology
+can have a lone sequencer (it reads `status.ack.lone` of every node at
+the start and after every fault); `false` removes the late-landing
+allowance (`late`, `verify.rs:330-338`, `failed_create`/`failed_rename`
+`:454-484`), so any late landing is a violation; `true` keeps it for
+the lone branch only.
+
+**Deleted.** A delegate's acknowledgement on its own disk when it is not
+lone (`deleg_stream_durable_with`'s `None => true`); Layer A
+acknowledgements to remote requesters (the requester's replayable shadow
+for them); the `Ungated` local-only OK on a non-lone node; the unsettled
+`EIO` at the first deadline; replay by rid of a delegation's rows past
+its cut.
+
+**Fail-before tests.**
+- Sim with `strict_commit: true` (and `strict_identity`, `strict_settle`):
+  `long-delegated`×5000, `long-delegated-backup`×5000,
+  `long-delegated-late-answers`×10000 (the config that found seeds 9287
+  and 2945; their pinned regressions from the interim fixes stay green),
+  `delegated-backup`×2000, `delegated-crash`×2000,
+  `delegated-partition`×2000, `delegated-root-crash`×2000,
+  `delegated-root-gone`×2000, `delegated-delegate-restart`×2000,
+  `delegated-two-gens-root-crash`×2000, `delegated-holder-cut`×2000,
+  `shared_dir_*` ×500 each, `far_config`×1000, `long-sessions`×2000,
+  `flex-crash`×2000 — **fail before** (uncommitted DelegGroup answers,
+  Lone answers to remote requesters, late landings), pass after.
+- New config **`tloss-two-node`**: the 2026-10-16 trace. Two nodes
+  (`deleg_backup_core_config`, so each is within the other's budget);
+  node 2 holds the delegation of `d1` and is the backup of root 1; workload
+  on node 2: per file in `d1`, a size-only `Setattr` (the `O_TRUNC`)
+  then a `SetManifest` (write + fsync) — a new workload op
+  `TruncCommit` in `run.rs` (`SimConfig.trunc_commit_ratio`); faults:
+  `StallStep { node: 1 }` timed after its `apply_delegate_tx` of node
+  2's rows and before its backup stream (a new `StallStep` trigger
+  `after_event: DelegateStream`), long enough for node 2 to seal and
+  take the root over; then 1 resumes deposed. Checks: each file's final
+  size and manifest are those of the last acknowledged commit (a new
+  `history.rs` check for `TruncCommit`, against the oracle's replay),
+  I1, I2, I4. Before C2: I1 fails (node 2's
+  acknowledgements of T and M rest on its disk alone); with the
+  takeover-loss fix landed the data check passes but I2 fails (node 1's
+  `Records` copies queued while node 2 replays) — I2 passes only after
+  C3. ×5000.
+- New config **`delegated-no-backup-root-near`** (`delegated_config`
+  with `backup_rtt_budget_ms` large enough for the root only, i.e. the
+  delegate's only in-budget peer is the root): I1 fails before (Layer A
+  delegate acks), passes after. ×2000.
+- Core tests: `a_delegate_without_a_recorded_backup_waits_for_the_roots_append`,
+  `a_delegate_counts_a_backup_only_after_its_deleg_group_record`,
+  `a_removed_backup_is_needed_until_the_record_without_it_is_applied`,
+  `a_lone_delegate_acks_its_own_node_and_waits_for_the_root_for_others`,
+  `a_lone_root_answers_a_forward_from_the_archive`,
+  `an_ungated_fast_path_wait_on_a_non_lone_node_waits_for_the_archive`,
+  `the_deadline_abandons_the_rid_before_eio`,
+  `an_abandon_after_the_tail_reship_answers_the_late_success`,
+  `a_recalled_delegates_uncommitted_rows_are_dropped_not_replayed`,
+  `a_lone_roots_forwarded_row_never_enters_the_replay_queue` (H1),
+  `an_ungated_wait_in_an_epoch_hold_answers_at_once` and
+  `an_unexpected_ungated_wait_is_counted_and_resubmitted` (H2),
+  `a_backup_is_dropped_from_the_record_only_once_its_rows_are_covered`
+  and `the_generation_end_seals_every_backup_a_record_named` (M3),
+  `the_abandon_reuses_the_rids_client_entry`,
+  `the_abandons_refusal_waits_for_its_commit`,
+  `an_abandon_at_a_new_delegate_dedups_the_delayed_copy_at_the_root`
+  (M7), `the_recall_record_carries_the_cut`,
+  `the_delegates_fast_path_writes_then_waits_for_its_group`. Meta:
+  `abandon_answers_an_existing_outcome_and_refuses_otherwise`,
+  `a_deleg_group_record_updates_the_table_row`,
+  `a_void_cut_is_the_records_through`.
+- `far_config` ×1000 under `strict_identity` (H1: the lone root's
+  remote-forward rows): fails before (the deposed lone root queues them
+  while the requester retries), passes after.
+- Model: `delegation.rs` design with `ack_via_root: true` (new knob;
+  `false` = today) — `acked_ops_are_never_replayed` clean on
+  `design_local_writes_are_clean`'s, `design_forwarded_writes_are_clean`'s,
+  `design_delegate_crash_without_backup_...`'s and
+  `design_unreachable_delegate_is_outwaited_...`'s configs (the two
+  latter tests are renamed to `..._loses_no_acked_op` and
+  `..._fails_unacked_ops` — rename authorized, their old assertion,
+  "replays by rid", encodes removed behaviour); `protocol.rs` with
+  `abandon: true`: `eio_never_lands_late` clean on
+  `recovery_fixes_bug_b_*`'s configs; the C0 counterexamples keep
+  violating with the knobs off.
+
+**Harness.** 3×: `delegated-subtrees`, `cross-subtree-rename`,
+`delegate-crash`, `delegate-crash-default-ttl`, `marker-order`,
+`delegate-partition`, `delegate-crash-backup`, `delegate-root-loss`,
+`delegate-root-blackhole`, `delegate-root-loss-ttl`,
+`delegate-handoff-renewal`, `delegate-backup-handoff-failover`,
+`root-failover-with-delegates`, `auto-placement`,
+`designation-as-delegation`, `shared-dir-multi-writer`,
+`hash-range-split-merge`, `cross-range-rename`, `forward-timeout-reexec`,
+`holder-crash-phantom-shadow`, `holder-crash-phantom-new-holder`,
+`takeover-marker-strands-promptly`, `inbox-*`, `p2p-partition-*`,
+`delegated-op-latency`, `nonowner-op-latency`. New
+**`takeover-loss-two-node`** (default catalog, `delegroot.rs`): two
+nodes, a the delegate of its own directory and the backup of root b
+(placement forced with `constellation delegate`), b paused across
+`takeover` (`Client::pause`) while a overwrites 10 files (`O_TRUNC`,
+write, `fsync`); every fsynced file byte-exact on both nodes after
+quiescence, no conflict copy, `ack.classes` on a shows no Lone answer.
+Fails on `05ef4c9` (the loss); with the takeover-loss fix landed it
+still fails the class assertion; passes after C2.
+
+**Campaign.** `load-probe` under `pause:lock-lapse+500:10000@b` (the
+profile that found the loss) ×20 runs; phase 3's `delegate-*`,
+`root-failover-with-delegates`, `delegate-paused-across-ttl`,
+`two-clients-shared`, `p2p-partition-*` under every phase-3 profile,
+seeds 42–44; the ledger **without** the late-landing allowance on every
+non-lone topology; the errno classifier's in-doubt class must be 0
+except `client.unsettled_eio` (which must be 0 in every cell: no cell
+isolates a requester for twice the deadline).
+
+**Performance.** The only new waits: a delegate with no recorded backup
+waits one round trip to the root (DelegateStreamAck); a lone root's
+answer to another node waits for the archive. Gates:
+- `ack-latency` topology 3 (delegate, root on the LAN): p50 and p90 no
+  more than topology 2's (a backup-gated holder) + 0.5 ms on loopback;
+  topology 4 within ±3 % of C0; topologies 1, 2, 6 within ±3 %.
+- `delegated-op-latency`: every non-owner's median still under half an
+  S3 round trip (the scenario's own bound); the delegate's own median ≤
+  C0's topology-2 holder-own-op p50 + 0.5 ms (relative, not absolute:
+  plan 30 M9 measured one LAN acknowledgement at +2.0 ms p50 on
+  loopback, 1.9 → 3.9 ms, so the delegate moves from local-disk cost to
+  a backed holder's cost — the regression the maintainer accepts or not
+  at §10's gate G1).
+- Topology 5 (WAN, lone root): own ops within ±3 % (Lone); forwarded ops
+  = C0 + one archive commit (expected 28–190 ms by S3 distance,
+  measured, reported; accepted per §11 Q2, not a regression of the
+  gate).
+- `make perf-gate`, `meta-bench` `3node-p2pon-*` within the 20 %
+  tolerance and reported against C0; four file systems.
+If the delegate-without-backup cost exceeds the bound, the fallback
+recorded in §11 Q4 (the root as the delegate's recorded backup: a
+backup append instead of the stream append, same copy count) is
+measured before anything is loosened.
+
+**Exit criteria.** All of the above; DESIGN §1, §4 (Request ids,
+Acknowledgement and durability, Delegated sub-sequencers), §5
+availability matrix, §6 session guarantees, §9 (Nobody observes,
+Delegates), §14, GOALS untouched yet (C5); reference pages; ADR-32
+amended, ADR-2/14/18/23 amended; PROGRESS.
+
+### C3 — Verbatim re-ship; no re-execution of a committed row
+
+**Code** (§5.4, §5.6): `Origin` in the segment envelope
+(`crates/authority/src/segment.rs`; readers in `apply_segment_rows`,
+`journal_origins`, the harness's log checks `crates/harness/src/verify.rs`
+`s3_log_check`, `crates/chaos`); `apply_backup_tail`'s verbatim append
+and apply, `MetaError::TailDiverged`; the delegate-turned-root appends
+its own rows as generation rows before its `Recall`
+(`complete_gate`, `jobs.rs:1179-1265`; `delegation_sync`,
+`delegate.rs:611-615`); the deposed root's member copy of other
+generations (`recover_deposed`, `jobs.rs:1381-1410`; `backup.rs`
+`DELEG_BACKUP_BASE`); `DelegSeal` to previous roots for an inherited
+generation without a recorded backup (`on_deleg_expiry`,
+`delegate.rs:3010-3117`); the deletions below.
+
+**Deleted.** `folded_into_later_manifest` (`replay.rs:75-99`, `:140-144`,
+`:533-537`), `rebase_on_truncate`, `truncate_pre_manifest`,
+`QueuedReplay.truncate_base` and the takeover-loss fix's fold
+replacement — except as the lone branch's replay shape (C5); the foreign
+`Streamed` `Records` replay (`spec.rs:1288-1307`); `PendingLocalOp =
+Records` for appended delegate rows and adopted tails (`local.rs:850-857`);
+`reset_for_rebuilt_ns_tx`'s replay queueing for captured journals
+(`spec.rs:2016-2052`); `strand_for_takeover`'s `own_gens`, the
+`deleg_stranded` mark and everything that reads it (`96f4565`); the
+dedup-by-rid skip in the tail re-ship (becomes an assertion);
+`settled_outcome`'s `lost && journal_carries_outcome` branch; the 2945
+fix's `QueuedReplay.deps` and its `submit` merge; `Held` answers for
+`deps_lost` outside the lone branch (a dependency on a committed row is
+never lost).
+
+**Fail-before tests.**
+- Sim, `strict_identity` with **I2c (verbatim)**: `backup_failover_reships_the_tail`
+  (800..1400), `regression_backup_crash_classes`, `delegated-holder-cut`×2000
+  (its regression test `regression_delegated_holder_cut_takeover_keeps_delegate_rows_in_log_order`
+  asserts `local_rolled_back > 0` on seeds 772 and 1039: rewritten to
+  assert the successor appended its own rows as generation rows,
+  `deleg_appended_after_takeover > 0`, and `local_rolled_back == 0` —
+  rewrite authorized), `delegated-two-gens-root-crash`×2000,
+  `long-delegated-late-answers`×10000, `long-delegated-backup`×5000,
+  `tloss-two-node`×5000, `long-backup`×5000 — **fail before** (re-applied
+  tails with new identities, `Records` copies, own-row replays), pass after.
+- Core tests: `the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit`
+  (`core/tests.rs:1931`, pins the deleted fold) is rewritten as
+  `a_delegate_taking_the_root_appends_its_own_rows_under_their_generation`,
+  covering the overlap (`(g, 5)` both in the tail and among the moved
+  rows: skipped, record-identical), the drop above a tail's own `Recall`,
+  and seed 772's order (the tail's rename of a name out of `d1` after
+  its recall, the moved create above the cut dropped);
+  `delegated-holder-cut` seeds 772 and 1719 are the sim fail-before;
+  `a_restarted_delegate_re_adopts_a_stranded_generation_stopped` and
+  `the_takeover_gate_stops_a_generation_whose_rows_it_stranded`
+  (`:8561`, `:8596`) are replaced by
+  `a_takeover_by_a_delegate_leaves_no_hole_in_its_generation`; the
+  takeover-loss fix's tests are rewritten as "the state cannot arise"
+  assertions (`no_records_copy_of_a_committed_row_is_ever_queued`,
+  `a_deposed_root_keeps_appended_delegate_rows_as_a_member_copy`,
+  `a_member_copy_is_served_to_the_next_roots_seal`). New:
+  `a_sealed_tail_is_applied_verbatim`, `a_diverging_tail_is_an_error_and_keeps_the_gate_closed`,
+  `a_deposed_root_never_asks_for_a_rebuild_with_a_captured_journal`.
+- Model: `holder_side.rs` `recovery_deposed_holder_rolls_back_and_replays`
+  stays for `Protocol::Recovery` (historical); a new protocol variant
+  `Protocol::Commit` in `crates/model/src/protocol.rs` (deposed holder
+  keeps a member copy; successor re-ships verbatim; requester settles at
+  the deadline) with `commit_protocol_is_clean` (`linearizable`,
+  `converged_at_quiescence`, `no_rid_executes_twice`,
+  `eio_never_lands_late`) on the bug-B configs of `today_bugs.rs`.
+
+**Harness.** Everything of C1–C2 again, plus `deposed-reintegration`
+(lone: still replays and copies the true overlap) and
+`takeover-loss-two-node`, `chaos-ci`, `chaos-ci-strict`,
+`stress-ng-fs-nodes` (known-bug repro: report).
+
+**Campaign.** The full `smoke` (with every deliberate break), phase 2,
+phase 3 and `known-bugs` matrices, seeds 42–44; the soak (chaos
+coordinator, `stress-ng-fs-nodes`) 2 × 3 h with the rotating injector
+schedule (`tools/load-campaign/inject.sh rotate`); every checker clean.
+
+**Performance.** The ack path is unchanged from C2. Gates: `ack-latency`
+all topologies ±3 % of C2 (four file systems: the tail apply changes); `backup-failover`'s failover time ≤ C0 + 10 %
+(verbatim apply is no more work than re-application);
+`root-failover-with-delegates` failover time ≤ C0 + 10 %.
+
+**Exit criteria.** All of the above; DESIGN §4 (One log, the replica
+section), §6 Staleness, §9 Seal-based failover and Other failures;
+`forwarded-mutations.md`'s recovery sections; ADR-19 "superseded in
+part"; PROGRESS with every deleted function and the test that pinned it.
+
+### C4 — Lock and delegation state into the log
+
+**Code** (§5.5; `Recall.through` landed in C2): `LockGrant`, `LockRelease`,
+`LockExpire`, `LockMove` (`record.rs`, appended to the enum; `TouchSet`
+touches nothing; E2E: inside segments); `LockTables::apply_record`
+(`crates/meta/src/locks.rs`) called from the journal path and
+`Replica::apply_segment`; the owner journals each decision in the same
+transaction (`lock_try_grant` `core/locks.rs:1300`, `on_lock_released`
+`:2395`, the expiry/outwait paths `:1650-1668`, `lock_on_delegated`
+`:4268` becomes a `LockMove` in the `Delegate` transaction,
+`end_generation` adds the generation's `LockMove { gen: 0 }`, an unlink in
+a delegated subtree adds `LockMove { gen: 0 }` to its stream row);
+grant answers wait for the record's commit (the existing `lock_answer`
+hold, `core/locks.rs:940`, gains the commit condition beside the
+horizon); the successor builds its table and floor caches from the log
+at its gate (replacing `lock_install_mirror` at `jobs.rs:1247`);
+`DelegRenewed`, `DelegRecalled`, `DelegateStream` lose their lock fields
+(`event.rs:549-641`); the model.
+
+**Deleted** (§5.4's list): `LockMirror` and the mirror state, the
+handoff/handed/moved_seen/reinstatement machinery, `LockHandback` and
+the late-answer rules, the leaving-grant fields and functions,
+`restamp` outside the log-derived install, `pending_returns`' remnants;
+the inferred void cut.
+
+**Fail-before tests.**
+- Model (`crates/model/src/locks.rs`): knob `lock_state_in_log: bool`
+  (new; `false` = today's model with its message-borne `Handoff`,
+  `Mirror`, `DelegRecalled` tables). With `true`, the owner's `Grant`,
+  release, expiry and move are entries of a per-model log applied in
+  order by every node (the delegate learns the moved grants by applying
+  the entry, not from `Handoff`), and the knobs `replicate`,
+  `move_state`, `handoff_in_flight`, `reinstate_handed`,
+  `resend_handoff`, `handoff_grace` are ignored. New tests:
+  `a_late_recall_answer_revives_a_grant_without_log_state` (knob
+  `false`, `reinstate_handed: false`, a recall answer delivered after the
+  generation ended: **violates** `mutual_exclusion`),
+  `lock_state_in_log_is_clean` (the configs of
+  `delegation_moves_with_state_are_clean`,
+  `overtaken_handoffs_and_redelegation_are_clean`,
+  `lost_handoffs_resent_are_clean`,
+  `an_outwaited_delegate_with_reinstatement_needs_no_grace` and
+  `fast_takeover_with_grace_is_clean`, all with the knob `true` and the
+  handoff knobs off: clean), `lock_state_in_log_needs_the_grace`
+  (knob `true`, `grace: false`: still violates — the grace guards
+  windows, not state; this keeps the window rule honest). The
+  `fast_takeover_with_only_the_async_mirror_violates` test stays (knob
+  `false`). Also update the model's stale action → code table
+  (`locks.rs:113-130` names `Core::lock_fresh_release`, which does not
+  exist, and `BackupAppend { locks }`).
+- Sim oracle **I3** `lock_table_matches_log` (new, under
+  `SimConfig.strict_locks_log`): after every event, every node's
+  owner-side grant set equals the fold of the lock records it applied and
+  journaled; **fails on the parent** in every delegated or failed-over
+  lock config (grants installed from `DelegRenewed`/`LockMirror` that no
+  record names). New config **`locks-late-answers`**
+  (`locks_unlinked_partition_config` with `deleg_answer_delay` extended
+  to `DelegRecalled` and `LockRenewed`, 0.4–3 s; a new
+  `SimConfig.lock_answer_delay`) ×5000.
+- Regression seeds must stay green with the machinery deleted (the
+  proof that the log replaces it): `regression_locks_unlinked_delegated_dbackup_random_seed_5681`,
+  `regression_locks_unlinked_delegated_partition_late_recall_answer`
+  (7455, 1144, 1682, 1945), `regression_stale_read_after_an_outwait`
+  (276, 297, 935, 2716, 68, 81, 597, 4067, 390),
+  `regression_locks_unlinked_delegated_hcrash_backup_seed_41`,
+  `..._seeds_2477_2982`, `..._seeds_292_6475`,
+  `lease_cap_fenced_seeds_keep_their_grants`, `regression_f1_stall_seeds`.
+  `long_locks` with `AUTHORITY_SIM_SEEDS=1000` (14 configs) and every
+  `locks-*` config ×2000 with `strict_locks_log`.
+- Core tests: `a_grant_is_answered_after_its_record_commits`,
+  `a_delegation_moves_its_subtrees_grants_in_the_delegate_record`,
+  `a_late_recall_answer_installs_nothing`, `a_fast_successor_derives_its_grants_from_the_log`,
+  `a_reclaim_during_the_grace_journals_a_lock_grant`,
+  `a_mode_upgrade_journals_a_lock_grant` (M9); meta:
+  `lock_records_fold_into_the_owner_table`.
+
+**Harness.** 3×: `flock-cross-node`, `sqlite-two-nodes`,
+`lock-holder-partitioned`, `lock-failover`,
+`lock-holder-killed-contention`, `lock-fence-at-close`,
+`lock-release-at-close`, `fence-token-at-write`, `lock-lapse-lone-node`,
+`lock-grant-dead-generation`, `git-under-flock`, `-gc`, `-b2b`,
+`-rounds`, `-causal`, `-faults`, `cto-recall-unreachable`; new
+**`lock-state-from-log-failover`** (`m14.rs`): a holder with a backup
+and 50 grants out to two peers is killed; the successor's table (status
+`locks.owner.grants`) equals the set the log names, before the first
+reclaim; no grant granted twice.
+
+**Campaign.** Phase 3's lock scenarios, `lock-contention-paused-holder`
+(20 rounds per boundary), `lock-contention-stalled-owner`,
+`delegate-paused-across-ttl`, `git-under-flock*`, under every phase-3
+profile, seeds 42–44: counter exact, token order clean, errno classes,
+no stall.
+
+**Performance.**
+- `lock-latency`: first lock from a non-sequencer p50/p90 ≤ C3 + 1 LAN
+  round trip under a backed root (≤ +2 ms on loopback, by plan 30 M9's
+  datum — the cost the maintainer accepts or not at §10's gate G3);
+  cached re-lock unchanged ±3 % (no message, no record); the sequencer's
+  own lock ≤ C3 + 50 µs p50 (one journal row); a contended handoff ≤
+  C3 + 2 ms; lone node `--locks cluster` vs `local` ratio unchanged ±3 %.
+- S3: an idle cluster with 100 grants held for 10 min issues the same
+  number of PUTs as C3 (pure window extensions are not logged; `status.s3` counters);
+  `git-under-flock`'s segment count within +5 %.
+- Journal: four file systems, `meta-bench` neutral.
+
+**Exit criteria.** All of the above; DESIGN §4 Locks, §6 Cluster locks;
+`cluster-locks.md`, `delegations.md`; ADR-25 amended; PROGRESS with the
+deletion list and, per deleted mechanism, the test that pinned it and
+its fate.
+
+### C5 — The lone branch, isolated and documented
+
+**Code** (§5.7): `LoneBranchOp` and the enqueue assertion; the lone
+branch's replay shapes (original op, conditional truncate,
+`derive_replay_op`); conflict copies only from it; status
+(`status.ack.lone`, `lone_acks`, `lone_branch_replays`,
+`lone_branch_conflicts`, `abandoned`); the documentation of Q3's
+decision for epoch holds (§5.7).
+
+**Fail-before tests.**
+- Sim oracle I5 `speculation_only_lone` under `strict_durability` on
+  **every** config (not only the backup ones): before C5 the flex and
+  epoch configs (`flex`, `flex-crash`, `flex-tight`, `flex_backup`)
+  report non-lone rollbacks from a retired hold owner's journal unless
+  its rows are classified operator-abandoned (I5(b)); after C5 clean.
+  ×2000 each.
+- Meta: `a_gated_row_never_enters_the_lone_branch_queue` (debug
+  assertion; the parent accepts it).
+- Harness: `deposed-reintegration` asserts `lone_branch_replays > 0`
+  and exactly one conflict copy (the true overlap); `no-peer-in-budget`
+  asserts `ack.lone == true`; `single-node-unchanged` asserts
+  `ack.lone == true` and no lone-branch replay ever (a single node is
+  never deposed).
+
+**Docs.** GOALS (L17-20, L21-31), DESIGN §4 (Local store, the replica
+section, Acknowledgement and durability), §5.2, §5.3, §9 (Failover by
+topology), `durability-and-failover.md` (Layer A, choosing a mode, known
+limits), `forwarded-mutations.md`, ADR-19, ADR-22; troubleshooting
+entry "my writes came back as conflict copies" (only a lone writer
+deposed while partitioned, or an operator action).
+
+**Exit criteria.** Oracles clean on every config; docs; and **the full
+CONVENTIONS gates** (fmt, clippy, `cargo test --workspace`, smoke,
+integration, the full harness matrix, pjdfstest 8798/8798, PROGRESS).
+
+### C6 — (decision, §11 Q5) Write-all to two backups on a LAN of three
+
+`CONSTELLATION_BACKUPS=2` exists (`backups_max`); C6 makes it correct,
+tested and measured, and decides the default. **Correctness first**
+(the review's M4): from the moment a candidate's add-CAS is issued the
+candidate counts in the gate (`durable_jseq` takes the minimum over the
+committed set *and* any candidate whose add-CAS is in flight or landed
+but not yet applied by `on_reconfig_put`, `backup.rs:1343-1478`), so no
+row is acknowledged by `{B1}` alone once an object listing B2 can exist.
+Fail-before: `backup-two` under `strict_commit` on the parent (C0's
+baseline row) shows I1 violations in the add window; after, clean. A
+core test `a_candidate_counts_from_its_add_cas`. Model: `backup_three_nodes_with_reconfiguration_is_clean`
+(today `#[ignore]`) with `commit_rule: true` and two backups, run in the
+nightly; sim config `backup-two` (4 nodes, two backups in budget, two
+`CrashBackup` and one `CrashHolder` spread over the run) ×2000: no
+rollback, no loss with one failure at a time, and with two
+simultaneous; harness `backup-failover` with `CONSTELLATION_BACKUPS=2`
+and two kills in sequence. Performance: `ack-latency` topology 2 with
+two backups p50 ≤ one backup + 0.3 ms (appends in parallel). Exit: the
+measurement and the maintainer's default decision in PROGRESS.
+
+
+### C7 — Clock envelope: from a ±500 ms offset bound to a rate bound
+
+The maintainer added the study's §7 "clock envelope" to this plan.
+Today every safety decision that reads time reads the **wall clock**
+(`store_s3::lease::now_unix_ms`, `crates/store-s3/src/lease.rs:67-73`:
+`SystemTime` plus the fault offset; the core's `now` is sampled from it
+once per step, `authority_driver.rs:743`), and six decisions compare an
+absolute wall timestamp written by one node against another node's
+clock. Both make safety depend on cross-node *offset* (±500 ms at the
+default margins, `margin > 2 × drift`, DESIGN §5). The literature's
+result (Gray & Cheriton's leases, Liskov 1991, Raft §6.4.1, Chubby,
+ZooKeeper sessions, FaRM) is that a lease needs only a bounded clock
+*rate* if each side measures from its own send (holder) or receipt
+(granter) on its own clock — which is already the shape of every
+derived grant here (`sent + ttl − margin` / `granted + ttl + margin`).
+The inventory (22 sites) is Appendix B; this milestone is its rule set.
+
+**Two holes in today's code, independent of the commit rule** — both
+recommended to **land first as standalone integrity fixes** (before C0,
+with the paused work; §11 Q10). They are not the same size: C7-H2 is a
+two-line change with a bounded latency cost (a maintainer decision);
+C7-H1 is C7a's skeleton and gets its own review:
+
+- **C7-H1: a backward wall-clock step extends an honoured window.**
+  Every "local" duration on the honour side — a lock holder's
+  `HeldGrant::until_ms` and `fenced`, the root's `liveness_fresh`
+  (`backup.rs:147-153`, plan 41 L0's freshness), `LeaseView::usable`
+  (`crates/engine/src/lease.rs:157-164`), a delegate's `until` — compares
+  a stamp taken with `now_unix_ms` against a later `now_unix_ms`. A
+  backward step (NTP step, operator `date`, VM restore) on the holder
+  makes a lapsed window look live: it keeps honouring a grant its owner
+  outwaited, or answers strict reads after a seal. The fix: an
+  **honour clock** `ProtocolClock::honour_ms()` that never runs
+  backward and advances at least as fast as `CLOCK_MONOTONIC_RAW` and
+  `CLOCK_BOOTTIME` (`max(wall, base_wall + max(raw_elapsed,
+  boottime_elapsed))`, so its values stay unix ms and nothing on the
+  wire changes), used by exactly those honour-side checks. **Its real
+  scope** (the review's M5): the core samples one `now` per step
+  (`authority_driver.rs:743`), and the same step makes honour-side
+  checks (`liveness_fresh`, a delegate's `until`, `renew_fresh`) and
+  wait-side ones (outwaits, quarantines); replacing the step's `now` by
+  the honour clock would make the wait-side checks over-count elapsed
+  time (an early outwait). So C7-H1 is `ProtocolClock`, a **second
+  reading per step** (`Event` handling gets `now` and `honour_now`; the
+  honour checks take the latter), the sim clock with the same two
+  readings (`sim/clock.rs`), and the engine's two feeds
+  (`LeaseView::usable`, `crates/meta/src/locks.rs`'s `now_ms()` for
+  `HeldGrant`) — several hundred lines, reviewed on its own. **The
+  invariant it rests on: a stamp and its comparison use the same
+  clock.** The honour clock is monotone and `≥ wall`, so a stamp taken
+  on it and compared on the wall clock would *lengthen* a window (the
+  unsafe mix); the opposite mix only shortens one (conservative). Every
+  honour-side stamp (`HeldGrant`'s `sent`, the lease renewal's send,
+  `note_s3_liveness`'s send, a delegate renewal's send) moves to the
+  honour clock in the same change as its comparison, and a debug
+  assertion tags each stamp with its clock. Fail-before:
+  a new sim fault `ClockStep { node, ms }` (the sim clock steps the
+  node's wall reading) — `locks-skew` with a `ClockStep { holder, -3000 }`
+  inside a grant window, and `backup-runtime-lag`'s holder stepped back
+  3 s during a seal: today the holder keeps honouring (`LockGhost`
+  violation) and answers strict reads past its freshness; after, it
+  lapses on time. Unit tests of `honour_ms` with stubbed clock sources
+  (a backward wall step, a suspend: BOOTTIME advances, RAW does not).
+- **C7-H2: a fast successor whose clock is ahead gets no quarantine.**
+  `note_marker_landed` (`backup.rs:846-893`) computes the read and lock
+  quarantines as `prev_expires.min(bound(..))`: `prev_expires` is the
+  predecessor's `expires_unix_ms` (its wall clock), compared on the
+  successor's. A successor ahead by more than the remaining lease sees
+  it in the past, the `min` yields no quarantine, and it acknowledges
+  mutations and grants locks over the predecessor's live read
+  delegations and lock grants. The bound alone is sound and rate-only
+  (`W + ttl + 2M ≥ (W + ttl − M)(1 + ρ)`); the `min` is an optimisation.
+  Standalone fix: drop the `min` (both lines). Fail-before: a sim
+  config `fast-takeover-skewed-successor` (`backup_strict_config` with
+  the backup's clock `+(lease TTL)` ahead via per-node skew; a strict
+  read delegation and a lock grant live at the seal): today the cto
+  check / lock ghost fails; after, clean ×2000. Cost: a fast successor
+  of a tenure that served strict reads or locks always waits the full
+  bound, where today it sometimes waited only the predecessor's
+  remaining lease. **The cost is bounded** (the review's M6): the `min`
+  bites only when the fast takeover lands within `bound − now` of the
+  predecessor's lease end; otherwise today's wait already is the bound
+  (F4). The read quarantine is ≈ 1.5 + 5 + 2 s (+ 6 s with live
+  delegations), the lock quarantine ≈ 1.5 + 20 + 2 s (+ 6 s); so
+  dropping the `min` adds at most ≈ 14.5 s to acknowledgements and
+  ≈ 29.5 s to new lock grants, only when a fast takeover happens in the
+  predecessor's last seconds and the tenure served strict reads or
+  locks. A knowing latency trade for integrity: the maintainer's
+  decision (§10 gate G5, §11 Q10a; recommended yes). Measured in
+  `delegate-backup-handoff-failover` (whose bound already reads the
+  logged `wait_ms`, F4) and a sim count of how often the `min` bit in
+  `long-backup`.
+
+**The rule set** (C7 proper):
+
+- **Rate budget** ρ = 1 000 ppm on `CLOCK_MONOTONIC_RAW` (oscillators
+  20–100 ppm; RAW is immune to NTP/chrony slewing — chrony's default
+  `maxslewrate` is 83 333 ppm, so a slewed clock must not be budgeted).
+  The clock part of each margin is `2ρ·T` (lease 60 s → 120 ms, lock
+  20 s → 40 ms, delegation 5 s → 10 ms, the 1.5 s takeover window → 3 ms);
+  `expiry_margin_ms` (1 s) stays as transit and processing slack. The
+  documented rule becomes `margin ≥ 2ρ·T + transit`.
+- **Two clocks by role** (`ProtocolClock` in `crates/store-s3/src/lease.rs`
+  or `crates/platform`, with the fault hooks applied there):
+  - *honour side* (a holder of a lease, grant, delegation, read
+    delegation or token; `liveness_fresh`; the fast path's `usable`)
+    must never under-count elapsed time: `elapsed_h = max(RAW, BOOTTIME,
+    wall_delta)` (BOOTTIME counts suspend, the wall delta a VM pause
+    whose guest clocks stopped);
+  - *wait side* (a granter's outwait, a claimant's observation, the seal
+    watch, quarantines, token memory) must never over-count:
+    `elapsed_w = min(RAW, MONOTONIC)`, never the wall clock.
+  Linux: `clock_gettime` (vDSO); macOS: `mach_continuous_time` /
+  `CLOCK_UPTIME_RAW` (plans 34–36); `Instant` elsewhere.
+- **`Ms` becomes node-local protocol time.** Every value that crosses a
+  node boundary is an opaque echo (`sent`), a relative duration
+  (`ttl_ms`, `remaining_ms`, a promise's `d`), or an S3 observation (an
+  ETag).
+- **The six cross-node compares and their replacements** (Appendix B
+  rows 2, 3, 6, 9, 10, 11):
+  1. *Root-lease claimability* (`Lease::is_claimable(now)` in
+     `classify`, `live_leases_held_by`, `fence_retired`): the
+     **ETag-observation rule** — a claimant that saw the object with ETag
+     E at wait-clock t₀ may CAS on E once it still sees E at
+     t₁ ≥ t₀ + ttl_ms·(1 + 2ρ), or at once if `released` or `fenced`.
+     The lease body gains `ttl_ms` (a claimant never assumes the holder's
+     configuration) and `fenced` (an admin retirement, replacing
+     `fence_retired`'s `now.min(expires)`); `expires_unix_ms` stays for
+     status and as the earliest time worth re-reading. A node that
+     already watches the object (renewals, `wanted_by`, the promise
+     watch, the backup's seal watch) has its t₀; only a cold claimant
+     waits a full TTL from its first read.
+  2. *Heartbeat promises* (`heartbeat.rs` `Promise::outlasts`,
+     `takeover_check`; `promise.rs`): **request-anchored** — the taker
+     asks (`PeerMsg::PromiseRequest`) at its wait-clock s, a promise
+     says "no epoch for d_ms from receipt", the taker's CAS must precede
+     s + d·(1 − ρ); without P2P, an `heartbeat/ask-<taker>` nonce object
+     the promisers echo. The membership argument (an epoch's N − f
+     members share a node with the taker's f promisers) is unchanged;
+     the clock argument is replaced.
+  3. *The fencing token at a non-minting executor* (`LockToken::until_ms`
+     judged by `check_tag`/`check_tag_at_write` on the executor's
+     clock): the token carries `remaining_ms` (= `until − now` on the
+     holder at send); the executor stamps receipt r on its wait clock
+     and refuses at r + remaining. Phase 1 judges by `min(absolute,
+     r + remaining)` (safe if either the offset bound or the one-way
+     delay bound `transit(request) + transit(op) < 2M` holds); phase 2
+     drops the absolute stamp once the sim and the campaign show the
+     delay bound holds under load (§11 Q10b). The minter, and a delegate
+     the grant moved to, still judge exactly (C4).
+  4. *The fast-takeover floor*: the bound alone (C7-H2, landed first).
+  5. *The lock cut* (`DelegRenew::stream_head_at`, `lock_cut_here`,
+     `lock_barrier_ready`): **root-anchored** — a delegate sends renewal
+     k only after reply k − 1, so the root's own send time of reply
+     k − 1 is a lower bound on the head's as-of. After C4 this is the
+     `LockExpire.barrier` computation; it costs at most one renewal
+     interval of extra wait after an outwait.
+  6. *`ack=s3` fast takeover timing* (`core/lease.rs:296`, `now −
+     (prev.expires − ttl) ≥ backup_takeover_ms`): "the lease ETag
+     unchanged for `backup_takeover_ms` on my wait clock".
+- **Restart horizons** (`KV_READ_GRANT_HORIZON`, `KV_LOCK_GRANT_HORIZON`):
+  persisted as `(boot_id, CLOCK_BOOTTIME until, wall until)`; same boot →
+  wait the longer of the two (a same-boot restart after a backward wall
+  step still waits the BOOTTIME bound, and the wall bound covers a
+  BOOTTIME anomaly); another boot or missing → wait the full
+  `ttl + margin` from start (a reboot with grants out waits ≈ 21 s
+  before granting).
+- **Suspend/resume**: on resume the honour clock has jumped by the
+  suspend, every window held is past (owner fence, taint, as today); the
+  lease is renewed if its own ETag is still current, else the CAS fails.
+
+**What stays offset-dependent** (documented, Appendix B rows 17–19):
+GC's 7-day horizon against S3's `Last-Modified` (tolerance a day or
+more) and hold expiries; HLC ctime stamps and atime clamps (timestamps,
+not safety); status, log stamps and snapshot names. The non-minting
+token check trades the clock bound for a one-way-delay bound (stated as
+such in `cluster-locks.md`). Cross-restart deadlines across a reboot
+fall back to a full wait.
+
+**Code areas.** `crates/store-s3/src/lease.rs` (`ProtocolClock`;
+`Lease { ttl_ms, fenced }`; `is_claimable` taking an observation
+`(etag, since_wait_ms)`); `crates/authority/src/core/{mod,lease,jobs,promise,backup,delegate,locks}.rs`
+(two readings per step or a role per comparison; the claimant's
+observation state in `LeaseState`; request-anchored promises; the cut
+as-of; the `ack=s3` observation); `crates/meta/src/{locks,readdeleg}.rs`
+(`LockToken { remaining_ms }`, receipt-stamped judging,
+`HeldGrant`/held delegations on the honour clock, boot-id horizons);
+`crates/engine/src/{lease,epoch,authority_driver,p2p,view/write_gate}.rs`
+(feed both clocks; `LeaseView::usable` on the honour clock);
+`crates/store-s3/src/heartbeat.rs`; models `crates/model/src/{cto,locks,flex}.rs`
+(`rate_ppm` beside `max_offset`; the promise proof restated);
+`crates/authority/tests/sim/clock.rs` (per-node `rate_ppm`,
+`suspend(ms)`, `step(ms)`; `clock_skew_ms` allowed far beyond 500);
+`crates/harness/src/load.rs` (lift the ±500 cap on `clock:`; add
+`clock:rate:<ppm>` and `clock:step:<ms>@<s>`; `campaign_load.rs`'s
+`StaleWatch` skew term rate-based). No compatibility: old lease objects,
+tokens and promises are not read.
+
+**Fail-before tests** (each fails on the parent):
+1. Sim `strict_close_to_open_holds_with_clock_skew_and_loss` at
+   `clock_skew_ms = 60_000` (constant offsets, zero rate error): today a
+   claimant 60 s ahead takes a live lease over (two holders); after,
+   clean over 60 seeds (and in CI).
+2. Sim `locks-*` at `clock_skew_ms = 5_000`: a non-minting executor
+   behind the holder lands a tagged op after the next grant today
+   (row 6); after, refused within the delay bound.
+3. Sim: a fast takeover with the successor ahead of the predecessor's
+   remaining lease (row 10) — C7-H2's config, kept.
+4. Sim: an `f = 1` continuation epoch with a taker 20 s ahead of a
+   promiser (row 3): today `outlasts` passes and the epoch splits;
+   after, refused until anchored promises cover the CAS (`flex` model
+   with `rate_ppm` and a 20 s offset: `single_authority` clean).
+5. Sim: a holder whose wall clock steps back 3 s during a seal (rows 4,
+   12) — C7-H1's config, kept.
+6. Sim: a holder suspended (MONOTONIC and RAW stopped, BOOTTIME and wall
+   advancing) across its lock window: a naive `Instant` port would
+   honour on resume; the honour clock lapses it.
+7. Sim: a delegate 2 s ahead of the root under an outwaited grant
+   (row 9): today the floor misses a row (`turn_read` stale); after,
+   the as-of is root-anchored.
+8. Unit: the lease observation rule (ETag unchanged for ttl·(1 + 2ρ); a
+   renewal in between restarts the watch; `fenced` claimable at once;
+   `released` unchanged); `takeover_check` with anchored promises;
+   boot-id horizons.
+9. Load campaign: `clock:5000` and `clock:spread:5000` (refused by the
+   cap today; after, accepted and every checker green on
+   `lock-contention-paused-holder`, `delegate-paused-across-ttl`,
+   `git-under-flock-causal`, `visibility-s3-latency`), plus
+   `clock:rate:50000` on one node and `clock:step:-3000@30` on the
+   holder during the lock scenarios.
+
+**Performance.** No new per-op clock read on the FUSE fast path beyond
+today's one (`usable`); `clock_gettime(RAW)` and `BOOTTIME` are vDSO
+calls on Linux; `vfs-bench` and the single-node stat/open measurements
+neutral. Rate-only costs, reported as latency bounds, not failures: a
+cold claim after a crash waits ttl·(1 + 2ρ) from its first read
+(≈ 60.1 s; `backup`-policy failover is unchanged, it is the seal path);
+a reboot with grants out waits the full horizon.
+
+**Exit criteria.** No safety decision compares a wall-clock value
+produced on one node with a clock on another, except Appendix B row 17
+(documented, tolerance ≥ 1 day); the models check ρ = 1 000 ppm with
+offsets up to a whole TTL; the sim runs `clock_skew_ms = 60_000` in CI
+for the strict and lock configurations, with suspend and step in the
+default fault mix; the campaign's `clock:` injector accepts any offset
+and the campaign requirement reads "clocks with rate error within 0.1 %
+(`CLOCK_MONOTONIC_RAW`), any offset"; DESIGN §5 (the time discipline)
+and §9 ("clock skew" row), `cto-modes.md` "Clocks and margins",
+`cluster-locks.md` (the margin rule and the token's delay assumption),
+`durability-and-failover.md`, ADR-25, a new ADR "Clocks: rate, not
+offset", TESTING.md, and ARBITER-STUDY §7's row rewritten to "rate ≤
+0.1 %; offset unconstrained; delay < 2M for the non-minting token check".
+
+**Place in the order and dependencies.** C7-H1 and C7-H2 land first,
+standalone. C7 proper is largely independent of the commit rule, but it
+edits the same functions as C1 (`LeaseState::classify` and the claim
+path: C1 adds the tail fetch *after* claimability; C7 changes the
+claimability predicate) and C4 (the lock cut: C4 records the barrier;
+C7 changes how its as-of is computed). It is split (C7-H1 above is the
+first part of C7a, landed early):
+- **C7a — clocks by role** (the rest of the honour/wait split on top of
+  C7-H1: the wait clock for outwaits, quarantines and the seal watch,
+  boot-id restart horizons, the sim's rate/suspend/step faults, the
+  harness's `clock:` items; rows 1, 4, 5, 7, 8, 12–15, 21, 22): no
+  overlap with C1–C5 beyond mechanical `now` plumbing; recommended
+  right after C0, so every later milestone's sweeps run with rate faults
+  and large constant offsets.
+- **C7b — the cross-node compares** (rows 2, 3, 6, 9, 11: the observation
+  rule, anchored promises, `remaining_ms` tokens, the root-anchored cut,
+  the `ack=s3` observation): after C1 (the claim path is settled) and
+  C4 (the cut lives in `LockExpire` then); before C5 (no overlap).
+  The observation rule's cold-claim wait (a full TTL from the first
+  read) is a knowing latency cost: §10 gate G6.
+
+## 8. Tests, collected
+
+### 8.1 Simulation (`crates/authority/tests/sim{.rs,/}`)
+
+New `SimConfig` fields (`run.rs:147-305`, defaults `false`/empty):
+`strict_commit` (I1), `strict_identity` (I2, with I2c), `strict_settle`
+(I4), `strict_locks_log` (I3), `trunc_commit_ratio`,
+`lock_answer_delay`, `clock_offsets` (per node, C7-H2),
+`abandon_after_ms` (the operator escape), and the `AckLog`,
+`IdentityLedger` and `ClusterStores` plumbing; I1 is evaluated at the
+answerer's emission. New run classification `waiting_for_group` (C0). `strict_durability`
+additionally fails on `non_lone_rollbacks > 0` (I5) from C1. New
+`FaultKind`s: `Operator(AbandonGroup)` (C0, used from C1),
+`ClockStep { node, ms }` (C7-H1), `StallStep`'s
+`after_event` trigger (C2's `tloss-two-node`), and C7a's `RateSkew` /
+`Suspend`. The sim's `RebuildReplica` runs the production rebuild (C0).
+
+| Config (new unless marked) | Milestone | Fails before because | Seeds |
+|---|---|---|---|
+| every `strict_durability` config (existing: `backup`, `ack-s3`, `backup-crash`, `ack-s3-crash`, `backup-departs`, `backup-partition`, `backup-strict`, `backup-hot`, `placement-hot`, `long-backup`, `long-acks3`) | C1 | transient rollbacks of acknowledged shadows/streamed rows at a seal; deposed holder's replays of committed rows | each test's range; `long-backup`×5000 |
+| `backup-group-cut-ttl` (+ `-holder-only`, `-backup-only`) | C1 | a TTL claimer of a `Backup` lease gets no tail; acknowledged rows replayed and copied | ×2000 each |
+| `long-delegated`, `long-delegated-backup`, `delegated-*` (existing) with `strict_commit` | C2 | a delegate without a backup acknowledges alone | ×2000–5000 (§7 C2) |
+| `long-delegated-late-answers` (existing) with all strict flags | C2, C3 | the same; late landings; copies in two queues | ×10000 (incl. the 9287/2945 regressions) |
+| `tloss-two-node` | C2 (I1), C3 (I2) | the 2026-10-16 loss shape | ×5000 |
+| `delegated-no-backup-root-near` | C2 | Layer A delegate acknowledgements with the root in budget | ×2000 |
+| `far_config` (existing) with `strict_commit` and `strict_identity` | C2 | Layer A answers to remote requesters; a deposed lone root's queue holds a remote forward its requester also retries (H1) | 1000..1020 → ×1000 |
+| `locks-late-answers` | C4 | grants installed from late messages (I3) | ×5000 |
+| every `locks-*` (existing) with `strict_locks_log` | C4 | grants installed from mirrors/handoffs that no record names | ×2000 each; `long_locks` ×1000 |
+| `delegated-holder-cut` (seeds 772, 1719 pinned), `delegated-two-gens-root-crash` (existing) with I2c | C3 | own-row replays as root rows; generation holes; (with the naive C3 rule: `TailDiverged` on the overlap, seed 772's order) | ×2000 |
+| every flex config (existing) with I5 | C5 | a retired hold owner's rows not classified operator-abandoned | ×2000 |
+| `backup-two` | C0 baseline, C6 | rows acknowledged by `{B1}` in the add window of B2 (I1, M4) | ×2000 |
+| `fast-takeover-skewed-successor` | C7-H2 | no quarantine for a successor ahead | ×2000 |
+| `locks-skew` + `ClockStep`, `backup-runtime-lag` + `ClockStep` | C7-H1 | a backward step extends an honoured window | ×2000 |
+| C7's seven sim tests (§7 C7) | C7a/C7b | offsets far beyond the margin | per test |
+
+Pinned regressions that must stay green throughout (they prove the
+deleted machinery's classes stay closed): the 9287 and 2945 seeds,
+`regression_long_delegated_late_answers_seeds_45_1381_3498`,
+`regression_backup_crash_classes`, `regression_long_backup_release_in_doubt_and_deposed_journal`,
+`regression_refused_forward_is_not_re_executed`, the lock regressions
+listed under C4, `regression_f1_stall_seeds`,
+`regression_stale_read_after_an_outwait`, `long_delegated_seed_70075_keeps_stream_order`,
+`flex_crash_regression_seeds`. A pinned regression whose *assertion*
+encodes removed behaviour is rewritten as listed in §7 (C3: the
+delegated-holder-cut test); none is deleted.
+
+### 8.2 Models (`crates/model`)
+
+| Model | New property / knob | Violating test (knob off) | Clean test (design) | Milestone |
+|---|---|---|---|---|
+| `backup.rs` | `acked_never_rolled_back`; `commit_rule` | `today_a_deposed_holder_replays_committed_rows`, `a_ttl_claim_without_the_tail_fetch_rolls_back_an_acked_write` | `commit_rule_two_nodes_is_clean`, `commit_rule_three_nodes_is_clean` | C0 / C1 |
+| `delegation.rs` | `acked_ops_are_never_replayed`; `ack_via_root` | `today_a_delegate_without_a_backup_acks_alone` | the four design configs renamed (§7 C2) | C0 / C2 |
+| `protocol.rs` | `eio_never_lands_late`; `abandon`; `Protocol::Commit` | `today_an_in_doubt_op_lands_after_its_eio` | `commit_protocol_is_clean` | C0 / C2 / C3 |
+| `flex.rs` | `hold_owner_never_deposed_except_by_retire` | (checks Q3's decision; a counterexample stops C0) | `full_rule_is_clean` with it | C0 |
+| `locks.rs` | `lock_state_in_log` | `a_late_recall_answer_revives_a_grant_without_log_state` | `lock_state_in_log_is_clean`; `lock_state_in_log_needs_the_grace` violates | C4 |
+| `cto.rs`, `locks.rs`, `flex.rs` | `rate_ppm` | offsets beyond the margin with the old rules | ρ = 1 000 ppm, offsets up to a TTL | C7 |
+
+Every new test carries an explicit state-count / depth / time cap
+(`today_bugs.rs`'s convention) and finishes under ~60 s in release;
+larger configs are `#[ignore]` and added to the nightly's
+`cargo test -p constellation-model --release -- --ignored` list.
+
+### 8.3 Harness (`crates/harness`)
+
+New scenarios: `ack-latency` (`CAMPAIGN`, measure-only, C0),
+`backup-group-isolated` (C1), `takeover-loss-two-node` (C2),
+`lock-state-from-log-failover` (C4). Changed expectations (authorized
+rewrites, listed in PROGRESS): `deposed-reintegration` gains
+`lone_branch_replays > 0` (C5); `no-peer-in-budget` and
+`single-node-unchanged` assert `ack.lone` (C5). The ledger
+(`verify.rs`): the late-landing allowance only for lone topologies (C2).
+`verify::counters` gains `non_lone_rollbacks`, `ack.classes`,
+`member_copies`, `client_unsettled_eio`; the errno classifier treats an
+`EIO` with a settled `Abandoned` as the documented in-doubt class and an
+unsettled one as a failure unless the scenario isolates the requester.
+
+### 8.4 Load campaign (`tools/load-campaign/run.py`)
+
+Per milestone as listed in §7. At C3 and at the plan's end: the full
+`smoke` matrix (with the deliberate breaks), phases 2 and 3, and
+`known-bugs`, seeds 42–44; the 2 × 3 h soak. A new preset `phase
+"commit"` in `PHASES` (C2) bundles the commit-rule scenarios
+(`takeover-loss-two-node`, `backup-group-isolated`,
+`lock-state-from-log-failover`, `load-probe`, `root-failover-with-delegates`,
+`delegate-paused-across-ttl`) under every phase-3 profile plus
+`pause:lock-lapse+500:10000@b` and `pause-takeover`.
+
+## 9. Performance gates
+
+The measurements (C0 records each baseline; every milestone compares
+against the previous milestone and against C0). p50 and p90 gate; p99
+is reported (five runs cannot gate a p99). The state dir is on ext4
+except where the four-file-system column says otherwise.
+
+| Gate | What | Budget | Four FS |
+|---|---|---|---|
+| `ack-latency` (new) | p50/p90 (p99 reported) per op and topology (§7 C0) | topologies 1, 2, 4, 6: ±3 % (or one IQR) at every milestone; topology 3 (delegate, root on the LAN, no backup): ≤ topology 2 + 0.5 ms from C2 (one LAN acknowledgement, measured +2.0 ms p50 on loopback in plan 30 M9: 1.9 → 3.9 ms) — gate G1; topology 5 forwards: + one archive commit (28–190 ms by S3 distance) — gate G2; topology 5 own ops: ±3 % | C0, C1, C3, C4, C7a |
+| `delegated-op-latency`, `nonowner-op-latency` | per-syscall medians | the scenarios' own bound (under half an S3 round trip) holds; the delegate's own median ≤ C0's topology-2 holder-own-op p50 + 0.5 ms (G1) | C0, C1 |
+| `lock-latency` | first lock from a non-sequencer, cached re-lock, the sequencer's own lock, contended handoff, lone `cluster` vs `local` | first lock ≤ +1 LAN round trip under a backed root (≤ +2 ms on loopback) — gate G3; cached re-lock ±3 %; own lock ≤ +50 µs; handoff ≤ +2 ms; lone ratio ±3 % (C4) | C0, C4 |
+| S3 requests | `status.s3` counters over 10 min idle with 100 held grants; `git-under-flock` segment count | idle: equal; segments: ≤ +5 % (C4) | — |
+| failover time | `backup-failover`, `root-failover-with-delegates`, `delegate-backup-handoff-failover`, `holder-kill-rejoin`, `ack-s3-failover` | ≤ C0 + 10 % (C1, C3); C7-H2's longer quarantine (gate G5) reported against the logged `wait_ms`; C7b's cold claim (gate G6) reported | — |
+| `make perf-gate` | vfs-bench ceilings; harness bench rates (20 % tolerance) | green at every milestone | — |
+| `make vfs-bench` | dispatch < 1 µs/op, allocations | unchanged (no milestone touches the dispatch path) | — |
+| `harness meta-bench` | `1node-*`, `3node-p2pon-{shared,disjoint}-*` | within ±5 % of C0 except where a gate above explains a delta (reported) | C1, C3, C4 |
+| `make perf-regression` | corpus replay, full / latency250 / bw50 | geometric mean within ±5 % of C0 | — |
+
+The four-file-system runs (ext4, xfs, btrfs, tmpfs; the maintainer's
+rule) are where a milestone changes what the journal does on disk: C1
+(a bool and an option in the journal row), C3 (a tail applied by the
+plain record apply instead of re-application), C4 (journal rows per
+lock decision), and C7a (clock reads, for completeness); C0 records the
+baseline on all four. Everything runs on the release build, a Linux
+test host, the usual harness S3 setup, 5 runs each;
+`bench/commit-rule/RESULTS.md` records the table per milestone. A gate
+that fails stops the milestone: report the numbers and hypotheses; do
+not loosen the bar.
+
+## 10. The maintainer's standing requirements, and how this plan meets them
+
+- **Integrity first.** Every milestone strengthens an invariant
+  (I1–I5) checked at the moment it could break, with its fail-before
+  evidence; no milestone trades an invariant for latency.
+- **Knowing latency costs are explicit maintainer gates.** Each is
+  measured on C0's baseline, stated with its budget here, and **the
+  milestone does not start until the maintainer accepted it** (recorded
+  in PROGRESS); none is a silent relaxation:
+
+  | Gate | Milestone | Cost | Budget | Question |
+  |---|---|---|---|---|
+  | G1 | C2 | a delegate without a recorded backup goes from local-disk acknowledgement to one LAN round trip (the root's append) | ≤ a backed holder's own-op p50 + 0.5 ms (loopback: ≈ +2 ms over today) | Q4 |
+  | G2 | C2 | another node's forward to a lone root (or lone delegate) waits for the archive | + one S3 conditional PUT (28–190 ms by distance), WAN topologies only | Q2 |
+  | G3 | C4 | a peer's first lock under a backed root waits for its `LockGrant`'s commit | + one LAN round trip (≤ +2 ms on loopback); the cached re-lock free | Q6 |
+  | G4 | C1 (if Q1 strict) | a claim (or a generation end) waits while no member of the old group answers | unbounded until a member answers or the operator abandons; only when the whole group is cut off | Q1 |
+  | G5 | C7-H2 | a fast successor always waits the full quarantine bound | ≤ +14.5 s on acknowledgements, ≤ +29.5 s on new lock grants, only for a takeover in the predecessor's last seconds after strict reads or locks | Q10a |
+  | G6 | C7b | a cold claimant waits a full TTL from its first read of the lease | ≈ 60.1 s for a cold claim; the seal path and warm claimants unchanged | Q10c |
+- **Under host load, only latency may degrade.** The rules remove whole
+  recovery paths (replays, folds, conflict copies under group tenures),
+  so a false seal under load (F2's class) now costs a reconfiguration
+  and nothing else. The delegate's fast path keeps the root's
+  write-then-wait shape (C2 §5.3 item 8), so C2 adds no core-thread
+  serialization under load. The campaign runs every milestone's
+  scenarios under CPU starvation, runtime hogs, store stalls, pauses at
+  every protocol boundary, S3 jitter and black holes, WAN and flapping
+  links, and clock skew; the checkers (data, ledger without the late
+  allowance, exclusion, token order, split brain, errno classes, hangs)
+  must be green. A new wait introduced by this plan is bounded or is a
+  gate above: a delegate's wait for the root (one round trip; a root
+  that does not answer is the existing renewal/lapse path), the lone
+  root's archive wait (S3; an S3 outage already stalls `ack=s3`), the
+  claim's wait for a group member (G4, with the operator escape), the
+  `Abandon` settle (inside the existing 2 × TTL client deadline).
+- **No regression on any backing file system**: §9's four-FS column.
+- **Fail-before tests**: every milestone lists them; an oracle that
+  finds nothing it should is a bug (C0).
+- **Fable review**: before each next milestone; C1, C2, C3, C7-H1 and
+  C7b at least, as complex changes.
+- **No backcompat, no version bumps**: every wire, record and row change
+  is in place (`MutateReply.committed`, `SealTail`/`SealedTail`,
+  `DelegGroup`, `Recall.through`, the lock records, `Origin`,
+  `JournalTx.{gated, tail_of}`, `Code::Abandoned`, the `Abandon`
+  request (Q15), `GroupAbandoned`, C7's lease body and token fields); a
+  mixed-version cluster is unsupported, as always.
+
+## 11. Open questions for the maintainer
+
+The final list. Each says what it **blocks**; a question that the code
+answered is marked **decided** (the plan implements the decision; the
+maintainer may still overturn it). Blocking before C0: Q7, Q10a.
+Before C1: Q1, Q13. Before C2: Q2, Q4, Q9, Q14, Q15, Q16. Before C4:
+Q6. Before C6: Q5. Before C7b: Q10b, Q10c.
+
+- **Q1 — A claim (or a generation end) when no member of the old group
+  answers.** *Blocks C1 (G4).* Vertical Paxos requires the new
+  configuration to read the old group's tail from a member; today a
+  non-listed claimer of an expired `Backup` lease proceeds after 3 s
+  without it, and the group's acknowledged rows come back as replays
+  and conflict copies. Options: (a) **strict**: wait until a member
+  answers `SealTail` (or `DelegSeal`), with `constellation repair
+  abandon-group` as the escape; `constellation leave --node-id` of every
+  member is equivalent (it already fences their leases and gives up
+  their journals); (b) bounded: proceed after `N × backup_takeover_ms`
+  and accept the branch (counted). *Recommended: (a)*. It needs the
+  holder **and** every backup cut from S3 and from the claimer past the
+  lease TTL (a LAN that lost its uplink; both machines down with disks
+  intact); the rest of the cluster then waits — availability, never
+  acknowledged data.
+- **Q2 — Remote requesters of a lone sequencer are acknowledged after
+  the archive.** *Blocks C2 (G2).* What "speculation only for the lone
+  sequencer's own clients" means: + one S3 PUT on a forward to a root
+  (or delegate) with no peer in budget. *Recommended: yes*;
+  the alternative (keep requester shadows) re-creates a speculation
+  place.
+- **Q3 — Epoch holds and designations: decided.** Non-stealable except
+  by an operator's retire (`promise.rs:495-507`); supersession of an
+  epoch that carried no lease acknowledged nothing. C0's
+  `hold_owner_never_deposed_except_by_retire` checks it; a
+  counterexample stops C0 (then the hold's answers to members' forwards
+  wait for a member's `StreamAheadAck`, never for S3).
+- **Q4 — A delegate without a recorded backup uses the root's append as
+  its second copy.** *Blocks C2 (G1).* + one LAN round trip
+  (≈ +2 ms on loopback) over today's local-disk acknowledgement.
+  *Recommended: yes*; measure the alternative (the root as the
+  delegate's recorded backup: a backup append instead of the stream
+  append, same copy count) only if G1's budget fails.
+- **Q5 — Two backups.** *Blocks C6's default.* Keep
+  `CONSTELLATION_BACKUPS=1` as the default; decide after C6 has fixed
+  the add window (M4) and measured `=2`. *Recommended: keep 1*.
+- **Q6 — Lock grants wait for their record's commit.** *Blocks C4
+  (G3).* + one LAN round trip on a peer's first lock under a backed
+  root. *Recommended: yes* — answering before commit keeps lock state
+  outside the commit rule, the class C4 exists to remove.
+- **Q7 — Landing order.** *Blocks C0.* *Recommended*: the F2 fix → the
+  takeover-loss fix → the seed 9287 and 2945 fixes → C7-H2 → C7-H1 → C0
+  → the rest of C7a → C1 → C2 → C3 → C4 → C7b → C5 → C6 (decision).
+- **Q8 — Placement and lone delegates: deferred** (§11.1).
+- **Q9 — The deadline for `Abandon`: decided.** The existing client
+  deadline (2 × TTL) is split (the op's attempts until 1.5 × TTL, the
+  `Abandon` until 2 × TTL), so the user-visible bound stays; the
+  isolated requester's unsettled `EIO` at 2 × TTL is counted
+  (`client.unsettled_eio`) and documented. *Blocks C2* only if
+  overturned (the alternative is a 240 s worst case).
+- **Q10 — Clock envelope.** (a) *Blocks C0 (G5).* Land C7-H2 and C7-H1
+  first: *recommended yes*, C7-H1 with its real scope and its own
+  review. (b) *Blocks C7b.* The non-minting token check judges by
+  `min(absolute, receipt + remaining)` in phase 1; dropping the absolute
+  stamp is a separate decision on campaign data: *recommended* phase 1
+  only. (c) *Blocks C7b (G6).* A cold claimant waits a full TTL from its
+  first read: *recommended accept* (only a cold `Local`/lone claim pays
+  it; every backup and every waiting node already watches the object).
+- **Q11 — `TailFollows`: decided.** Kept as the seal record, with
+  `through`.
+- **Q12 — `gated` per acknowledgement class: decided** (the review's
+  H1). `gated := class ∈ {RootGroup, Archive, DelegGroup}`, decided at
+  journal time; a lone root's row for a remote forward is Archive-class
+  and goes to the member copy on deposition, never to the replay queue.
+- **Q13 — Who may seal a holder, and how a self-sealed holder
+  recovers: decided** (M2). Any enrolled peer, for the epoch and
+  `config_version` the holder holds (the same trust as a backup's seal);
+  a self-sealed holder recovers at once and claims its own lease once
+  expired, so a claimer that never claims costs at most a TTL.
+  *Blocks C1* only if overturned.
+- **Q14 — Catch-up at a `DelegGroup` backup switch: decided** (M3). The
+  delegate requests a removal only under its `removal_safe`; the root's
+  generation end seals every backup any record of the generation named.
+- **Q15 — `Abandon` as a request flag or a `MutateOp` variant.** *Blocks
+  C2.* *Recommended: a `settle: bool` flag* on `MutateRequest`, the
+  inbox entry and the lease-path submit (a variant "executed by rid
+  only" would leak into the fast path, `derive_replay_op`,
+  `TouchSet::from_op` and the inbox batch format).
+- **Q16 — `DelegateStreamAck.through`: the root's journaled cursor:
+  decided** (L4). The group without a recorded backup is `{delegate,
+  root}`; the delegate cannot observe the root's own backup
+  acknowledgements, and does not need to (two copies are the single-
+  failure contract). The alternative (the root's committed cursor,
+  three copies on a LAN of three, ~2 round trips pipelined) is recorded,
+  not planned.
+
+### 11.1 Deferred (not in this plan)
+
+- **A longer TTL for a `Local` tenure with no `wanted_by`** (the study's
+  step 5: nothing fast depends on it). Deferred: it changes TTL-path
+  availability, which Q1 and C7b already move; revisit with C7b's data.
+- **Placement preferring a non-lone candidate** (the study's step 2a,
+  "placement may prefer not to delegate there"; was Q8). Deferred until
+  `status.delegation.mine[].ack_class` shows how often a lone delegation
+  happens; the placement status decoration with a would-be class is cut
+  from C2 for the same reason.
+
+## 12. Risks
+
+- **The recovery paths are the bug source, and this plan rewrites
+  them.** Mitigated by order (each milestone tightens one rule while
+  every old mechanism still runs, so a missed case is caught by the old
+  safety net and by the new oracle at once), by the oracles at the
+  moment of violation (not end-of-run), and by C3 — the deletion — coming
+  only after C1 and C2 have run the strict oracles at full seed counts,
+  and C4 — the new lock records — only after C3, so no lock record ever
+  meets a re-execution path.
+- **A missed acknowledgement path.** I1 classifies every definitive
+  answer independently of the core's own claim; a path the plan did not
+  list (an inbox ack, a snapshot control op, a scratch publish) shows up
+  as an unclassified answer. `ParkedWhat::Control` (snapshot and admin
+  ops) is included: a control op's success waits for the same commit.
+- **Availability under Q1's strict rule**: a group cut from everything
+  blocks the claimer. Visible (status, WARN) and operator-escapable.
+- **Latency on WAN clusters (Q2)** for forwards to a lone root.
+  Measured; placement mitigates; the alternative is documented.
+- **Member copies accumulate** if the archive never carries an epoch's
+  suffix (abandoned groups). Bounded: dropped at the `TailFollows`/tail
+  origin, at `GroupAbandoned`, or at a `Recall`; reported with age in
+  status.
+- **The derived lock table at a fast successor** keeps today's grace
+  (windows are clock-bounded); the exact grant set removes the mirror's
+  staleness but not the need for the grace (C4's
+  `lock_state_in_log_needs_the_grace`).
+- **C7 touches every time comparison.** Split into C7a (mechanical) and
+  C7b (protocol); the two holes land first as small fixes.
+- **The sim's coverage of the engine**: the fast path's `Ungated` rule,
+  the `SealTail` transport and the member-copy store's disk behaviour are
+  covered by core/meta unit tests, in-process engine tests (the
+  `shipper.rs` pattern) and the harness, not by the sim alone.
+
+## 13. The hard problems that remain (study §7), and how this plan bounds them
+
+| Problem | What this plan does | Bound |
+|---|---|---|
+| Leases need time bounds (locks, read delegations, kernel caches, strict reads) | Grant *identity* moves into the log (C4); windows stay clock-bounded; C7 moves the clock assumption from offset to rate | ρ ≤ 0.1 % on `CLOCK_MONOTONIC_RAW`; margins `2ρT + transit` |
+| A holder under a pause | The admission re-check inside the transaction (F1) stays; a sealed group refuses the paused holder's rows; a row journaled after a seal is never acknowledged (I1) | a missed check is a refused proposal, never a lost write |
+| Failure detection under load | Unchanged mechanisms (F2 lands first); the commit rule makes a false seal cost a reconfiguration only (no rollback, no replay, no copy) | the seal watch's documented 5T bound (F2) |
+| Quorum availability at small sizes | Two nodes: seal + CAS as today; the TTL path now carries the tail (C1) or waits (Q1) | one failure tolerated with a group; the second waits or is an operator action |
+| The lone voter | Exactly one speculation place, documented, visible in status (C5); `ack=s3` and designations as the alternatives | Layer A for a lone writer's own clients only |
+| Clock envelope | C7 | rate, not offset (Appendix B lists what stays offset-bound: GC's horizon, timestamps) |
+| Kernel and store (plan 42 races, `FORGET`, `execve` close, fjall stalls) | Not touched | — |
+
+## 14. Exit criteria
+
+- [ ] Interim work landed or explicitly deferred by the maintainer (Q7):
+      the F2 fix, the takeover-loss fix, the 9287 and 2945 fixes, C7-H2,
+      C7-H1 — each with its fail-before evidence in PROGRESS.
+- [ ] The maintainer's acceptance of each latency gate (§10, G1–G6)
+      recorded before its milestone started.
+- [ ] C0: oracles I1–I5 in the sim with their flags, evaluated at the
+      answerer's emission; the sim rebuild; the operator escape and the
+      `waiting_for_group` classification; the model properties and
+      counterexamples; Q3's property checked; the baseline counts per
+      config (including `backup-two`); the performance baselines on four
+      file systems.
+- [ ] C1: committed rows never re-executed after a deposition or a seal;
+      the tail fetch on the TTL path; strict durability fails on non-lone
+      rollbacks and passes on every backup config; Q1's rule in place.
+- [ ] C2: I1 strict on every config except lone topologies; `gated` per
+      class; `Ungated` only for lone or epoch-held nodes; `Recall.through`
+      and the end-of-generation seal of every named backup; the
+      delegate's write-then-wait fast path; `Abandon` and I4 strict; the
+      ledger's late allowance only for lone topologies;
+      `takeover-loss-two-node` green; the `load-probe` cell that found
+      the loss green ×20.
+- [ ] C3: I2c (verbatim) strict on every config; the delegate-turned-root
+      rule (move, apply verbatim, re-append deduped by origin, end);
+      the fold, `Records` copies, holed generations and the deposed-root
+      rebuild-replay gone (each deleted function listed with the test
+      that pinned it).
+- [ ] C4: no lock or delegation state in any message; reclaims and mode
+      upgrades journal `LockGrant`; I3 strict on every lock config;
+      `long_locks` ×1000 clean; the lock model's `lock_state_in_log`
+      clean, its counterexamples violating.
+- [ ] C5: I5 strict on every config; the lone branch is the only replay
+      producer; the docs' offline-first contract; the full CONVENTIONS
+      gates (pjdfstest 8798/8798).
+- [ ] C6: the add-window rule with its fail-before; measured; the maintainer's default recorded.
+- [ ] C7a, C7b: every exit item of §7 C7.
+- [ ] §9's gates met at every milestone, on the four file systems where
+      §9 says so; `bench/commit-rule/RESULTS.md` complete.
+- [ ] Every §6 document change made in its milestone; ADR-32 and the
+      clock ADR written; the amended ADRs marked.
+- [ ] Every milestone reviewed (fable) before the next started; the
+      reviews' required changes done.
+
+## 15. PROGRESS.md
+
+One section per milestone in the established style (intro paragraph,
+"What landed" table, "Deleted" table with, per removed function or
+message, the commit that introduced it, the bug it was for and the test
+that now shows the class cannot arise, "Unchanged on purpose", "Gates"
+with dates, kernel and host file systems), plus the interim fixes' own
+sections. The first section, `## Plan 43 C0 — The commit point, named
+and checked`, carries the baseline table:
+
+| Config | Seeds | I1 uncommitted (by expected class) | I2 copies | I2c non-verbatim | I4 late landings | I5 non-lone rollbacks |
+|---|---|---|---|---|---|---|
+| … | … | … | … | … | … | … |
+
+and each later milestone's section the same table after it, so the
+progression to zero is the plan's evidence.
+
+## Appendix A — The bugs of 2026-10-01..16 (study §2), mapped
+
+"Impossible" means the state the bug needs cannot exist once the
+milestone lands (and the named oracle would catch it if it did).
+
+| Bug (study §) | Shape | Milestone that makes it impossible | Oracle |
+|---|---|---|---|
+| The 2026-10-16 acknowledged-write loss (§2.1) | delegate's truncate+commit acknowledged on one disk; two copies (stranded delegate rows, the deposed root's `Records` copies); the fold re-executed | **C2** (the delegate's ack waits for the root's append: never on one disk) + **C3** (no fold, no `Records` copy, the deposed root keeps a member copy) | I1, I2, I2c (`tloss-two-node`, `takeover-loss-two-node`) |
+| Its review's H1 (a remote sequencer's unjournaled `Conflict`/`LockLapsed` refusal lets a `Records` copy land over a newer acknowledged write) | a second copy executes after a refusal | **C3** (no `Records` copy of a committed row exists); the takeover-loss fix's journaled refusals stay as a general rule | I2 |
+| Its review's H2 (a fold's no-op completion misread as the truncate's effect: false conflict) | re-execution logic over copies | **C3** (the fold exists only in the lone branch, which has one copy) | I2c |
+| Its review's M3, L6 (a persisted fold destroys `truncate_base`; `[T1, T2, M]` false conflict) | fold machinery | **C3** for group tenures; the lone branch keeps the conditional truncate, whose tests carry over | — |
+| Seed 9287 (in-doubt answer for a landed write: a deposed root's journal still carries another generation's row) | two places claim one row | **C3** (the row is a member copy, outside the journal) | `check_in_doubt_answers`, I2 |
+| Seed 2945 (a marker logged ahead of its data: a deposed root's replay by rid with its own deps) | re-execution of a copy with the wrong identity's deps | **C1** (a deposed group tenure replays nothing) + **C3** | causal cut, I2 |
+| The ledger's late landing (an in-doubt create/rename lands after later acknowledged ops) | a stranded copy re-executes after its client heard `EIO` | **C2** (`Abandon` settles before `EIO`) | I4 |
+| F1 (token checked before the writer lock, `b4fe2e6`) | time-of-check vs serialization point | landed; **C4** makes the minter's judgement the serial apply of the derived table; the non-minter window remains (study §2.2) | the lock ghost, `check_landings` |
+| F2 / F2b (false seals under host load) | failure-detector false positive | **not addressed** (liveness; the F2 fix in review addresses it); **C1** makes a false seal cost a reconfiguration only | — |
+| F3 (a `flush` hangs behind a recalled grant renewed forever) | a local wait without bound; endpoint wedge | **not addressed** (independent; under bisect) | — |
+| F4 (successor quarantine in `delegate-backup-handoff-failover`) | a design wait read as load | **not addressed** (independent harness bound); C7-H2 lengthens the quarantine to the bound and the scenario reads the logged `wait_ms` | — |
+| F5 (one lease renewal series at half TTL) | liveness through one connection | **not addressed** (independent); **C1**'s tail fetch makes the consequent TTL takeover strand nothing | — |
+| F6, F7 (close-wait `EAGAIN`; degraded strict reads) | documented contracts | **not addressed** (independent) | — |
+| F8 (stale `now`) | audit | **not addressed**; C4's records follow its rule (decide at the serialization point) | — |
+| F9 (fast-path rows journaled after the lease ran out, stranded and replayed) | Layer A acknowledgement | **C1 + C2** for every group tenure (not acknowledged until committed; a sealed group refuses it); remains, documented, for the lone branch (C5) | I1, I5 |
+| Plan 41 L0 (a fast-tenure root renewed grants without fresh S3 liveness, `9d00417`) | authority correlated across three time bases | landed; **C4** removes the lock mirror (one of the three); the freshness rule stays (a window); C7-H1 protects it from a backward step | lock ghost |
+| `unlinked-exclusion-5681` (an outwaited generation's undelivered grants revived, `c465b07`) | authority state moved by message and reinstalled restamped | **C4** | I3, model `lock_state_in_log` |
+| `unlinked-exclusion-7455` (a late recall answer put lapsed grants back, `9d82ad0`/`fb0c909`) | the same | **C4** | I3, `a_late_recall_answer_revives_a_grant_without_log_state` |
+| `stale-read-outwaited` (a grant after an outwait carried too old a position, `304c30c`) | floors/barriers carried beside the log | **C4** (the barrier is a field of `LockExpire`); C7b root-anchors its as-of | `turn_read` |
+| `lease-cap-fenced` (four nested margins shrank a delegated grant to zero, `17ee59c`) | time bounds | **not addressed** (a window rule, fixed by the poll); C7's `2ρT` margins shrink the clock part of each margin | — |
+| `unlinked-under-lock` (`4c5d184`'s first draft adopted unknown grants) | state moved by message | **C4** (leaving grants are `LockMove` records) | I3 |
+| `96f4565` (a generation a takeover strand holed; a restarted delegate re-sent forever) | delegate rows re-executed as root rows (new identity) | **C3** (the delegate's own rows are appended as its generation's rows) | I2c |
+| `strand-takeover-quiescence` (the same family) | the same | **C3** | I2c |
+| `c465b07`'s second half (an expired record kept a grant out) | the copy rule `install_if_consistent` | **C4** (no copies) | I3 |
+| `backup-crash` seed 606255 and 603322 (Local acknowledgements while a backup could be had) | an acknowledgement on one disk | landed (the bring-up rule); **C2** generalizes it (`Ungated` waits) | I1 |
+| `long-backup` 802943 (a non-backup claimed at expiry while the backup held an acknowledged create) | TTL claim without the tail | landed partly (the claim grace); **C1** (the tail fetch, Q1) | I1/I5 (`backup-group-cut-ttl`) |
+| `long_backup` 56774, `acks3` 700087, `flex-crash` 2140, `long-delegated-late-answers` 1381 (in-doubt answers vs the log) | which store's outcome to trust | landed; **C3** removes the deposed-journal branch they patched | `check_in_doubt_answers` |
+| Plan 30 bug B (phantom effects of a dead holder) and bug A (at-least-once forwarding) | — | landed in plan 30; kept (rids, `Completed`) | `check_exactly_once` |
+| The clock holes found for C7 (a backward wall step extends an honoured window; a skewed fast successor gets no quarantine) | offset dependence | **C7-H1**, **C7-H2** (standalone, first) | C7's sim tests |
+| Plan 42's races, the partial `FORGET` reap (ADR-31), orphan/`O_PATH` fixes, `F_GETLK`, OFD/`flock` at `RELEASE`, the `execve` close deadlock, fjall/lsm-tree stalls, io_uring hangs, mtime/ctime, staging, `copy_file_range`, READDIRPLUS, CSI, CI (§2.11) | kernel, store, transport | **not addressed** (irrelevant to the commit rule, study §2.11) | — |
+
+## Appendix B — Clock inventory: where time is compared
+
+From the clock-envelope research (C7). Clock: W = wall
+(`now_unix_ms`, `SystemTime` plus the fault offset), I = `Instant`/tokio
+(`CLOCK_MONOTONIC`), S3 = the object store's clock. Breaks: S = safety,
+L = liveness only.
+
+| # | Site | Compared | Clock | If offset > margin | Rate-only re-expression |
+|---|---|---|---|---|---|
+| 1 | Root lease, holder side — `engine/lease.rs` `usable`, `core/lease.rs` `usable`, `store-s3/lease.rs` `granted`/`renewed` | own stamp vs own clock | W | L (a backward step on the holder: honours longer = S) | honour until `renew_sent + ttl − M` on the honour clock; `expires_unix_ms` for status |
+| 2 | Root lease, claimant — `Lease::is_claimable(now)` in `classify`/jobs, `live_leases_held_by`, `fence_retired` | holder's `expires_unix_ms` vs claimant's W | W↔W | **S** (a claimant ahead takes over while the holder writes) | ETag-observation rule; `released` unchanged; `fenced` flag; `ttl_ms` in the body |
+| 3 | Heartbeat promise — `heartbeat.rs` `Promise::outlasts`, `takeover_check`; `promise.rs` | promiser's `no_epoch_until` vs holder's `expires`, read by a third node | W↔W | **S** (split brain through an epoch) | request-anchored promises ("d from receipt"); `ask-<taker>` nonce without P2P |
+| 4 | Lock grant, holder side — `core/locks.rs` (`sent + ttl − margin`), `HeldGrant::until_ms`, `renew_point`, `due_renewals`, `fenced` | own send stamp vs own clock | W | L for offset; **S** for a backward step / suspend | honour clock (C7-H1 first) |
+| 5 | Lock grant, owner side — `until = recv + ttl + margin`, `restamp`, expiry timers, `drop_expired`, quarantines, graces | own receipt stamp vs own clock | W | L (a forward step on the owner: early outwait = S) | wait clock; margin `2ρ·ttl` + transit |
+| 6 | Fencing token at a non-minting executor — `LockToken::until_ms` judged by `check_tag`/`check_tag_at_write`; `unsettled_writes`; token memory | holder's absolute window end vs executor's clock | W↔W | **S** (an executor behind runs a stale op after the next grant) | `remaining_ms` judged from receipt; `min` with the absolute stamp in phase 1 |
+| 7 | Read delegations — `readdeleg.rs`, `write_gate.rs` `deleg.valid`, `model/cto.rs` | own stamps vs own clock | W | L / a step = S as 4–5 | clock change only; the cto model gains a rate knob |
+| 8 | Write delegations — `delegate.rs` `until = sent + ttl − margin`, `deleg_lapse_at`, `reclaim_horizon`, `grant_cap_ms` | own stamps vs own clock | W | as 4–5 | clock change only; `until + 2M` becomes `until + 2ρ·ttl + transit` |
+| 9 | Lock cut / barriers — `DelegRenew::stream_head_at` folded into `lock_cut_here`, `lock_barrier_ready` | delegate's W vs root's W | W↔W | **S** (a delegate ahead: the floor misses a row) | root-anchored (send time of reply k − 1) |
+| 10 | Fast-takeover floor — `note_fast_takeover`, `note_marker_landed` `prev_expires.min(..)` | predecessor's `expires` vs successor's W | W↔W | **S** (a successor ahead gets no quarantine) | the bound alone (C7-H2 first) |
+| 11 | `ack=s3` fast takeover timing — `core/lease.rs:296` | holder's renewal stamp vs taker's W | W↔W | L (the slot CAS fences) | ETag unchanged for `backup_takeover_ms` |
+| 12 | Holder liveness (plan 41 L0) — `liveness_fresh`, `note_s3_liveness`, `strict_answer_allowed`, `LeaseView::reads_locally` | own send stamp vs own clock | W | **S on a backward step > 1.5 s** | honour clock (C7-H1 first) |
+| 13 | Backup seal watch, holder heartbeat, `OffCore::core_responsive`, `note_holder_heard` | own arrival stamps vs own clock | W | L | wait clock |
+| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | `(boot_id, BOOTTIME until)`, else the full horizon |
+| 15 | Epoch claim views — `epoch_closed_claim`, `epoch_reclaim_pending`, `resolve_epoch_claims` | own lease stamp vs own clock; resolution by epoch | W | L | clock change only |
+| 16 | Singleton leases (`_snapsched`, GC) — `singleton.rs`, `snapsched.rs` | holder: own; claimant: holder's W vs own W | W↔W | L (the CAS on the holder's ETag is the safety) | observation rule if wanted; not required |
+| 17 | GC — `gc.rs:407` `last_modified ≤ now − horizon` (7 d), completion retention, `mtree_gc.rs:653`; holds' `expires_unix_ms` | S3 `Last-Modified` vs W; hold writer's W vs GC's W | S3↔W, W↔W | S only at offsets of days (or the hold slack) | **stays** (documented tolerance) |
+| 18 | Inbox `submitted_unix_ms`, registry `last_modified`, designation `created_unix_ms`, names, stall stamps, status | stats, naming | W | none / L | leave |
+| 19 | HLC ctime stamps (`hlc.rs`, 300 s tolerance), atime clamp | peer's W vs own W | W↔W | none (timestamps) | leave |
+| 20 | Kernel attr/entry TTLs, `dentries.rs` filter, session waits, ReadIndex deadlines, forward timeout | kernel / `Instant` | I | L | already monotonic (`Instant` stops in suspend: conservative there) |
+| 21 | Fault hook `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (reaches `now_unix_ms` and rows 1–17) | — | — | capped at ±500 by the campaign (`load.rs:366`) | becomes a constant-offset test (harmless at ±5 s); add rate and step hooks |
+| 22 | Sim `tests/sim/clock.rs` `Clock::skewed` (constant offset), `SimConfig::clock_skew_ms`; models' `max_offset`, `Jump` | — | — | — | add per-node `rate_ppm`, suspend and step |
+
+## Sources
+
+- In-repo: `docs/explanation/ARBITER-STUDY.md` (§2, §4–§7);
+  `docs/explanation/{GOALS,DESIGN,DECISIONS}.md`;
+  `docs/reference/features/{forwarded-mutations,durability-and-failover,delegations,cluster-locks,cto-modes}.md`;
+  `docs/plans/v1/done/30-write-path-resilience-and-scale-out.md`; plans
+  40, 41, 42; `docs/plans/v1/PROGRESS.md`;
+  `docs/how-to-guides/development/TESTING.md` (host-load campaign,
+  authority simulation); `crates/authority/src/core/{backup,holder,client,delegate,replay,jobs,lease,locks,readindex,stream,promise,placement}.rs`,
+  `crates/authority/src/{event,action,segment,replica}.rs`;
+  `crates/meta/src/{record,mutate,replay,session,locks,readdeleg,delegation,reintegrate,rid}.rs`,
+  `crates/meta/src/store/{spec,local,journal,backup,bootstrap,held,inbox}.rs`;
+  `crates/store-s3/src/{lease,log,heartbeat}.rs`;
+  `crates/engine/src/{authority_driver,lease,p2p,recovery}.rs`,
+  `crates/engine/src/view/write_gate.rs`;
+  `crates/authority/tests/sim{.rs,/}`; `crates/model/{src,tests}`;
+  `crates/harness/src/{verify,load,hostlag,scenarios}.rs` and
+  `scenarios/{m9,m11,m14,delegroot,campaign,campaign_load}.rs`;
+  `tools/load-campaign/{run.py,inject.sh}`; `bench/remote/RESULTS.md`
+  (failover times); PROGRESS's plan 30 M9 measurements (the LAN backup's
+  acknowledgement cost).
+- The reviews of the paused fixes (the takeover-loss fix, the F2 fix),
+  the host-load timing review (F1–F11), the notes on seeds 9287 and
+  2945, and the clock-envelope research (summarized here; not in the
+  repository).
+- External, as cited by the study (§8) and the clock research: Delos
+  (OSDI'20); Vertical Paxos (Lamport, Malkhi, Zhou 2009); PacificA;
+  Flexible Paxos; Aurora; Neon; RIFL; Gray & Cheriton, "Leases" (SOSP
+  1989); Liskov, "Practical uses of synchronized clocks" (PODC 1991);
+  Ongaro's thesis §6.4.1; Chubby (OSDI 2006); ZooKeeper sessions; FaRM
+  (SOSP 2015); Spanner (OSDI 2012); Kleppmann on fencing tokens;
+  `clock_gettime(2)` and chrony's `maxslewrate`.
