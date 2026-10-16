@@ -3087,6 +3087,7 @@ fn cmd_mount_body(
                     control_socket: None,
                     persistent: false,
                     signals: None,
+                    profile: None,
                 },
                 handle,
             ) {
@@ -3213,6 +3214,16 @@ async fn attach_views(
 /// Ctrl-C stops the wait, not the drain.
 async fn cmd_umount(target: String, state_dir: Option<PathBuf>, no_wait: bool) -> Result<()> {
     let resolved = resolve(&target)?;
+    umount_resolved(&target, resolved, state_dir, no_wait).await
+}
+
+/// [`cmd_umount`] of `target`, already resolved against the registry.
+async fn umount_resolved(
+    target: &str,
+    resolved: target::Target,
+    state_dir: Option<PathBuf>,
+    no_wait: bool,
+) -> Result<()> {
     let dir = target::state_dir(state_dir, &resolved)?;
     let list = || async {
         control::call_bounded::<cm::ViewList>(
@@ -4631,9 +4642,6 @@ mod umount_tests {
     /// daemon and the sibling view alive.
     #[test]
     fn umount_of_a_non_last_view_returns_and_leaves_the_daemon_serving_the_rest() {
-        unsafe {
-            std::env::set_var("CONSTELLATION_P2P", "off");
-        }
         let root = tempfile::tempdir().unwrap();
         let backend = format!("file://{}/backend", root.path().display());
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -4672,6 +4680,7 @@ mod umount_tests {
                 control_socket: None,
                 persistent: false,
                 signals: None,
+                profile: Some(node_runtime::tests::no_p2p()),
             },
             rt.handle().clone(),
         )
@@ -4715,11 +4724,19 @@ mod umount_tests {
         // Register the name so `target::resolve("myfs:/sub", ..)` finds it
         // (only its *presence*, and this test's explicit `--state-dir`
         // equivalent, matter — `cmd_umount` never consults the registry's
-        // own stored state dir once one is passed explicitly).
+        // own stored state dir once one is passed explicitly). The
+        // registry is this test's own, resolved through a manager of it:
+        // pointing `CONSTELLATION_REGISTRY` at it would change the
+        // environment under the other tests (`node_runtime::tests::no_p2p`).
         let registry_path = root.path().join("registry.toml");
-        unsafe {
-            std::env::set_var("CONSTELLATION_REGISTRY", &registry_path);
-        }
+        let resolve = |raw: &str| {
+            manager::Manager::at(
+                registry_path.clone(),
+                constellation_platform::native().clone(),
+            )
+            .resolve(raw)
+            .unwrap()
+        };
         let mut reg = registry::Registry::load_locked_at(registry_path.clone()).unwrap();
         reg.merge_and_save(
             "myfs",
@@ -4754,11 +4771,16 @@ mod umount_tests {
         rt.block_on(async {
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                cmd_umount("myfs:/sub".to_string(), Some(state_dir.clone()), false),
+                umount_resolved(
+                    "myfs:/sub",
+                    resolve("myfs:/sub"),
+                    Some(state_dir.clone()),
+                    false,
+                ),
             )
             .await
-            .expect("cmd_umount(\"myfs:/sub\") hung")
-            .expect("cmd_umount(\"myfs:/sub\") failed");
+            .expect("umount of myfs:/sub hung")
+            .expect("umount of myfs:/sub failed");
         });
         assert!(
             start.elapsed() < std::time::Duration::from_secs(10),
@@ -4782,8 +4804,9 @@ mod umount_tests {
 
         // Unmount the remaining root view: the daemon drains and exits, and
         // `umount` returns only then, with the drain's clean outcome.
-        rt.block_on(cmd_umount(
-            "myfs".to_string(),
+        rt.block_on(umount_resolved(
+            "myfs",
+            resolve("myfs"),
             Some(state_dir.clone()),
             false,
         ))
@@ -4909,11 +4932,19 @@ mod umount_tests {
             .enable_all()
             .build()
             .unwrap();
+        // Resolved against a registry of the test's own (there is none:
+        // "/" needs no entry), not the one `CONSTELLATION_REGISTRY` names.
+        let resolved = manager::Manager::at(
+            root.path().join("registry.toml"),
+            constellation_platform::native().clone(),
+        )
+        .resolve("/")
+        .unwrap();
         let result = rt
             .block_on(async {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(120),
-                    cmd_umount("/".to_string(), Some(state_dir.clone()), false),
+                    umount_resolved("/", resolved, Some(state_dir.clone()), false),
                 )
                 .await
             })

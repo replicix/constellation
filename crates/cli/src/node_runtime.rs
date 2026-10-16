@@ -245,6 +245,13 @@ pub struct NodeConfig {
     /// the node takes them over instead of installing its own, so a signal
     /// that came in between is not lost. `None`: installed at start.
     pub signals: Option<StopSignals>,
+    /// The engine profile (plan 31 C8). `None`: the daemon's, a desktop
+    /// one as `CONSTELLATION_PROFILE` and its per-mode overrides adjust it
+    /// ([`EngineProfile::from_env`]). In-process tests pass theirs (P2P
+    /// off) rather than set `CONSTELLATION_P2P`: a test that changes the
+    /// process environment while another one spawns a process can
+    /// deadlock the whole test binary.
+    pub profile: Option<EngineProfile>,
 }
 
 /// `SIGTERM`/`SIGINT` handlers, installed once and handed on: a signal
@@ -541,6 +548,7 @@ impl NodeRuntime {
             control_socket,
             persistent,
             signals,
+            profile,
         } = cfg;
         let handoff_config = crate::handover::NodeHandoff::of(&engine, web_ui, fuse_transport);
         let (generation, control_listener) = match resumed {
@@ -562,8 +570,12 @@ impl NodeRuntime {
         // Plan 31 C8: the daemon is a desktop/server host; the environment
         // may pick another profile (`EngineProfile::from_env`:
         // `CONSTELLATION_PROFILE` and its per-mode overrides).
-        let profile =
-            EngineProfile::from_env(EngineProfile::desktop()).map_err(anyhow::Error::msg)?;
+        let profile = match profile {
+            Some(profile) => profile,
+            None => {
+                EngineProfile::from_env(EngineProfile::desktop()).map_err(anyhow::Error::msg)?
+            }
+        };
         let engine = engines.add_engine(fs_id, engine, host.clone(), profile)?;
         // Plan 38 Z3b: `--cache-verify always` (or its env override, which
         // only the engine has resolved) turns passthrough off for every
@@ -1391,7 +1403,7 @@ impl std::fmt::Debug for MountId {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use constellation_store_s3::{ChunkStore, FsMeta};
 
@@ -1414,10 +1426,28 @@ mod tests {
                 control_socket: None,
                 persistent: false,
                 signals: None,
+                profile: Some(no_p2p()),
             },
             rt.clone(),
         )
         .expect("NodeRuntime::start")
+    }
+
+    /// The profile of an in-process test node: a desktop one without P2P
+    /// (no endpoint, key or gossip; nothing to discover in a test), passed
+    /// in the node's config. These tests used to set `CONSTELLATION_P2P`,
+    /// and `std::env::set_var` while another test spawns a process
+    /// (`fusermount3`, a reaper) can deadlock the test binary: the spawn
+    /// holds std's environment lock until the child has exec'd; the
+    /// child's exec closes the files it inherited — one on another test's
+    /// FUSE view among them — and waits for that view's `FLUSH`; the
+    /// view's server, this process, reads the environment to answer it
+    /// and queues behind the writer, which waits for the spawn.
+    pub(crate) fn no_p2p() -> EngineProfile {
+        EngineProfile {
+            p2p: constellation_engine::P2pMode::Off,
+            ..EngineProfile::desktop()
+        }
     }
 
     /// A `mount` attaching while the last view leaves (`umount; mount` back
@@ -1532,9 +1562,6 @@ mod tests {
     /// the node, its last view gone, has shut down.
     #[test]
     fn remove_mount_waits_for_the_views_teardown_when_wait_all_holds_its_thread() {
-        unsafe {
-            std::env::set_var("CONSTELLATION_P2P", "off");
-        }
         let root = tempfile::tempdir().unwrap();
         let backend = format!("file://{}/backend", root.path().display());
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1607,9 +1634,6 @@ mod tests {
     /// and with it, the last one, the node.
     #[test]
     fn a_view_still_in_use_is_answered_as_such_and_ends_when_closed() {
-        unsafe {
-            std::env::set_var("CONSTELLATION_P2P", "off");
-        }
         let root = tempfile::tempdir().unwrap();
         let backend = format!("file://{}/backend", root.path().display());
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1676,9 +1700,6 @@ mod tests {
     /// stop` would wait out its timeout with them still mounted).
     #[test]
     fn a_signal_unmounts_the_free_views_while_one_is_still_in_use() {
-        unsafe {
-            std::env::set_var("CONSTELLATION_P2P", "off");
-        }
         let root = tempfile::tempdir().unwrap();
         let backend = format!("file://{}/backend", root.path().display());
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1751,9 +1772,6 @@ mod tests {
     /// cleanly and records nothing.
     #[test]
     fn a_failed_final_flush_is_reported_and_left_for_the_next_mount() {
-        unsafe {
-            std::env::set_var("CONSTELLATION_P2P", "off");
-        }
         let root = tempfile::tempdir().unwrap();
         let backend = format!("file://{}/backend", root.path().display());
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1842,11 +1860,9 @@ mod tests {
     /// a path does not depend on which, or how many, views expose it.
     #[test]
     fn two_views_of_one_node_converge_with_a_peer_and_pin_is_view_agnostic() {
-        // The gossip/bootstrap poll (up to ~10s) is pure overhead for an
-        // in-process test with no real peer discovery to do.
-        unsafe {
-            std::env::set_var("CONSTELLATION_P2P", "off");
-        }
+        // P2P is off (`start_node`): the gossip/bootstrap poll (up to
+        // ~10s) is pure overhead for an in-process test with no real peer
+        // discovery to do.
         let root = tempfile::tempdir().unwrap();
         let backend = format!("file://{}/backend", root.path().display());
         let rt = tokio::runtime::Builder::new_multi_thread()

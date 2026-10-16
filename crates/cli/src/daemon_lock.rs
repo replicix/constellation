@@ -251,11 +251,28 @@ pub fn attach_timeout() -> Duration {
 /// classifier report that pid as wedged, so the harness can exercise the
 /// takeover with an ordinary live process standing in for a zombie whose
 /// last thread is stuck in the kernel (which no test can fabricate).
+/// This crate's own tests set [`ASSUMED_WEDGED_FOR_TEST`] instead: setting
+/// the environment while another test spawns a process can deadlock the
+/// test binary (`node_runtime::tests::no_p2p`).
 fn assumed_wedged(pid: u32) -> bool {
+    #[cfg(test)]
+    if ASSUMED_WEDGED_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) == pid {
+        return true;
+    }
     std::env::var("CONSTELLATION_FAULT_ASSUME_WEDGED_PID")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         == Some(pid)
+}
+
+/// The test hook's in-process form (0: none).
+#[cfg(test)]
+static ASSUMED_WEDGED_FOR_TEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Assume `pid` wedged (`0`: nobody) for this process's own tests.
+#[cfg(test)]
+fn assume_wedged_for_test(pid: u32) {
+    ASSUMED_WEDGED_FOR_TEST.store(pid, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// The holder, with the test hook applied.
@@ -839,9 +856,9 @@ mod tests {
         }
     }
 
-    /// `takeover_rotates_the_held_lock` sets the process-wide
-    /// `CONSTELLATION_FAULT_ASSUME_WEDGED_PID` to this very process's pid
-    /// while it runs; a test that classifies this process's own lock in
+    /// `takeover_rotates_the_held_lock` sets the process-wide wedged-pid
+    /// hook (`assume_wedged_for_test`) to this very process's pid while it
+    /// runs; a test that classifies this process's own lock in
     /// parallel would see it as wedged (flaky under full-suite load). The
     /// two hold this while they run.
     static WEDGED_HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1024,12 +1041,9 @@ mod tests {
                 holder(&b)
             );
             // Even assumed wedged, it is no holder of `a`'s to take over.
-            std::env::set_var(
-                "CONSTELLATION_FAULT_ASSUME_WEDGED_PID",
-                other_pid.to_string(),
-            );
+            assume_wedged_for_test(other_pid);
             let taken = take_over(&a, other_pid);
-            std::env::remove_var("CONSTELLATION_FAULT_ASSUME_WEDGED_PID");
+            assume_wedged_for_test(0);
             assert!(taken.is_err(), "took a over from b's holder");
             assert!(a.join(LOCK_NAME).exists());
             // A `daemon.pid` naming it is what confirms a holder.
@@ -1094,9 +1108,9 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         constellation_control::transport::record_socket(dir.path(), &sock).unwrap();
         let pid = std::process::id();
-        std::env::set_var("CONSTELLATION_FAULT_ASSUME_WEDGED_PID", pid.to_string());
+        assume_wedged_for_test(pid);
         let outcome = take_over(dir.path(), pid);
-        std::env::remove_var("CONSTELLATION_FAULT_ASSUME_WEDGED_PID");
+        assume_wedged_for_test(0);
         outcome.unwrap();
         assert!(!lock.exists());
         assert!(dir

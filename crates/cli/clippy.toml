@@ -1,0 +1,11 @@
+# No code of this crate, its tests included, changes the process
+# environment. A test that does, while another one spawns a process,
+# deadlocks the test binary: `Command::spawn` holds std's environment lock
+# until the child has exec'd, the child's exec flushes a file it inherited
+# from a FUSE view this process serves, and that view's server waits for
+# the environment lock behind the writer (`node_runtime::tests::no_p2p`).
+# Pass settings in a config (or a child's `Command::env`) instead.
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "changes the environment under every thread of the process (see crates/cli/clippy.toml)" },
+    { path = "std::env::remove_var", reason = "changes the environment under every thread of the process (see crates/cli/clippy.toml)" },
+]

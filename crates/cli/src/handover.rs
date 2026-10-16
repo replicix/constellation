@@ -1098,6 +1098,7 @@ pub fn resume_main(
             control_socket: None,
             persistent: false,
             signals: None,
+            profile: None,
         },
         rt.handle().clone(),
     ) {

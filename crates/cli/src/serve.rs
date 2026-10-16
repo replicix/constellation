@@ -359,6 +359,7 @@ pub fn cmd_serve(
             control_socket: Some(control_socket.clone()),
             persistent: true,
             signals: stop,
+            profile: None,
         },
         rt.handle().clone(),
     );
