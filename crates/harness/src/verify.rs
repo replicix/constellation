@@ -426,15 +426,24 @@ impl Ledger {
         }
     }
 
+    /// `from` was renamed to `to` (acknowledged): `to` holds what `from`
+    /// held — in doubt if `from` was (a failed write's content may have
+    /// landed, and moved with it) — and `from` is gone.
     pub fn acked_rename(&self, from: &str, to: &str) {
         let mut l = self.inner();
         l.ops += 1;
         let moved = l.files.insert(from.to_string(), None).flatten();
-        l.doubtful.remove(from);
-        l.doubtful.remove(to);
+        let in_doubt = l.doubtful.remove(from);
+        if in_doubt {
+            l.doubtful.insert(to.to_string());
+        } else {
+            l.doubtful.remove(to);
+        }
         l.files.insert(to.to_string(), moved);
     }
 
+    /// `rel` was unlinked (acknowledged): whatever it held, in doubt or
+    /// not, is gone.
     pub fn acked_unlink(&self, rel: &str) {
         let mut l = self.inner();
         l.ops += 1;
@@ -504,9 +513,20 @@ impl Ledger {
             files: l.files.len(),
             ..Default::default()
         };
-        let copies = conflict_copies(root);
+        let copies = conflict_copies(root, l.files.keys().chain(&l.doubtful).map(String::as_str));
         let in_copy = |id: &FileId| copies.iter().any(|(_, c)| c == id);
-        let mut dirs: HashSet<PathBuf> = HashSet::new();
+        // A path only ever written in doubt is in doubt too, and its
+        // directory is searched for phantoms like any other.
+        let mut dirs: HashSet<PathBuf> = l
+            .doubtful
+            .iter()
+            .filter_map(|rel| Path::new(rel).parent().map(Path::to_path_buf))
+            .collect();
+        rep.in_doubt = l
+            .doubtful
+            .iter()
+            .filter(|r| !l.files.contains_key(*r))
+            .count();
         for (rel, want) in &l.files {
             if let Some(parent) = Path::new(rel).parent() {
                 dirs.insert(parent.to_path_buf());
@@ -567,12 +587,36 @@ impl Ledger {
     }
 }
 
-/// Every conflict copy under `root/.constellation-conflict` that is a
-/// campaign payload: (its path, whose content).
-pub fn conflict_copies(root: &Path) -> Vec<(PathBuf, FileId)> {
+/// Every conflict copy that is a campaign payload, wherever the engine
+/// may have put one for a file at one of `rels` (relative to the mount
+/// `root`): (its copy's path, whose content). A copy lands in a
+/// `.constellation-conflict` directory either beside its file (a refused
+/// replay of an op without a lock tag, `repair drop-held`, an epoch's
+/// reintegration) or at the root of a mounted view above the file, named
+/// after the file's path below it (a refused commit or replay of an op
+/// under a lock: the writing mount's root, or the deepest mounted view
+/// above the file; the filesystem root when none is narrower). Seen from
+/// `root`, that is the conflict directory of `root` itself or of any
+/// directory between it and the file: all of them are searched
+/// (cluster-locks.md, forwarded-mutations.md, write-path-hygiene.md).
+pub fn conflict_copies<'a>(
+    root: &Path,
+    rels: impl IntoIterator<Item = &'a str>,
+) -> Vec<(PathBuf, FileId)> {
+    use constellation_meta::reintegrate::CONFLICT_DIR;
+    let mut dirs = std::collections::BTreeSet::from([root.join(CONFLICT_DIR)]);
+    for rel in rels {
+        for above in Path::new(rel).ancestors().skip(1) {
+            dirs.insert(root.join(above).join(CONFLICT_DIR));
+        }
+    }
     let mut out = Vec::new();
-    let mut stack = vec![root.join(".constellation-conflict")];
+    let mut seen = HashSet::new();
+    let mut stack: Vec<PathBuf> = dirs.into_iter().collect();
     while let Some(d) = stack.pop() {
+        if !seen.insert(d.clone()) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
         };
@@ -1784,6 +1828,98 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_carries_its_sources_doubt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("w")).unwrap();
+        let l = Ledger::new();
+        let id = |seq| FileId {
+            path: format!("w/f{seq}"),
+            writer: "a".into(),
+            seq,
+        };
+        // f0 acknowledged, then rewritten in doubt (the write landed all
+        // the same), then renamed: g0 holds the doubtful content.
+        l.write(root, "w/f0", id(0), 1000).unwrap();
+        std::fs::write(root.join("w/f0"), payload(&id(10), 1000)).unwrap();
+        l.failed_write("w/f0", id(10));
+        std::fs::rename(root.join("w/f0"), root.join("w/g0")).unwrap();
+        l.acked_rename("w/f0", "w/g0");
+        // f1 only ever written in doubt (it landed), then renamed.
+        std::fs::write(root.join("w/f1"), payload(&id(11), 1000)).unwrap();
+        l.failed_write("w/f1", id(11));
+        std::fs::rename(root.join("w/f1"), root.join("w/g1")).unwrap();
+        l.acked_rename("w/f1", "w/g1");
+        let rep = l.check(root);
+        assert!(rep.violations(0).is_empty(), "{rep:?}");
+        assert_eq!(rep.in_doubt, 2, "{rep:?}");
+        // A certain source clears the target's doubt: what it moved there
+        // must be there.
+        l.failed_write("w/g2", id(12));
+        l.write(root, "w/f2", id(2), 1000).unwrap();
+        std::fs::rename(root.join("w/f2"), root.join("w/g2")).unwrap();
+        l.acked_rename("w/f2", "w/g2");
+        std::fs::remove_file(root.join("w/g2")).unwrap();
+        let rep = l.check(root);
+        assert_eq!(rep.lost.len(), 1, "{rep:?}");
+        assert!(rep.lost[0].starts_with("w/g2"), "{rep:?}");
+        // An acknowledged unlink ends a doubt: a name back is resurrected.
+        l.acked_unlink("w/g0");
+        std::fs::write(root.join("w/g0"), payload(&id(10), 1000)).unwrap();
+        let rep = l.check(root);
+        assert_eq!(rep.resurrected, vec!["w/g0".to_string()], "{rep:?}");
+    }
+
+    #[test]
+    fn conflict_copies_are_found_wherever_the_engine_puts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("v/w")).unwrap();
+        let l = Ledger::new();
+        let id = |seq| FileId {
+            path: format!("v/w/f{seq}"),
+            writer: "a".into(),
+            seq,
+        };
+        for seq in 0..3 {
+            l.write(root, &format!("v/w/f{seq}"), id(seq), 1000)
+                .unwrap();
+            std::fs::remove_file(root.join(format!("v/w/f{seq}"))).unwrap();
+        }
+        let rep = l.check(root);
+        assert_eq!(rep.lost.len(), 3, "{rep:?}");
+        // Under the mount's root, named after the path (a refused commit
+        // under a lock).
+        let at_root = root.join(".constellation-conflict");
+        std::fs::create_dir(&at_root).unwrap();
+        std::fs::write(at_root.join("v%2Fw%2Ff0@1-2-3"), payload(&id(0), 1000)).unwrap();
+        // Under the root of a mounted view above the file (a subtree
+        // mount at v).
+        let at_view = root.join("v/.constellation-conflict");
+        std::fs::create_dir(&at_view).unwrap();
+        std::fs::write(at_view.join("w%2Ff1@1-2-4"), payload(&id(1), 1000)).unwrap();
+        // Beside the file (a refused replay of an op without a lock tag).
+        let beside = root.join("v/w/.constellation-conflict");
+        std::fs::create_dir(&beside).unwrap();
+        std::fs::write(beside.join("f2@1-2-5"), payload(&id(2), 1000)).unwrap();
+        let rep = l.check(root);
+        assert!(rep.lost.is_empty(), "{rep:?}");
+        assert_eq!(rep.in_conflict_copy.len(), 3, "{rep:?}");
+        // A conflict directory beside the file is no phantom.
+        assert!(rep.phantoms.is_empty(), "{rep:?}");
+        let found = conflict_copies(root, ["v/w/f0"]);
+        assert_eq!(found.len(), 3, "{found:?}");
+        // Nothing outside the file's ancestry: a sibling's directory.
+        std::fs::create_dir_all(root.join("x/.constellation-conflict")).unwrap();
+        std::fs::write(
+            root.join("x/.constellation-conflict/f9@1-2-6"),
+            payload(&id(9), 10),
+        )
+        .unwrap();
+        assert_eq!(conflict_copies(root, ["v/w/f0"]).len(), 3);
+    }
+
+    #[test]
     fn timestamps_and_fields_parse() {
         assert_eq!(
             line_unix_ms("1970-01-01T00:00:01.500000Z  INFO x"),
@@ -1860,7 +1996,11 @@ mod tests {
         // (both clocks read whole ms).
         let tie = exec(1, 5_000);
         let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("exec".into(), tie, 0)]);
-        assert!(check_token_order(&ev).is_empty(), "{:?}", check_token_order(&ev));
+        assert!(
+            check_token_order(&ev).is_empty(),
+            "{:?}",
+            check_token_order(&ev)
+        );
         // The same op on an executor whose protocol clock ran 400 ms ahead
         // happened at 4.8 s: in order.
         let ahead = exec(1, 5_200);
@@ -1913,7 +2053,11 @@ mod tests {
                 ("owner".into(), format!("{first}\n{owner_us}"), 0),
                 ("x".into(), line("landed", "host_us", 1, landed), 0),
             ]);
-            assert_eq!(!check_token_order(&ev).is_empty(), caught, "landed at {landed} µs");
+            assert_eq!(
+                !check_token_order(&ev).is_empty(),
+                caught,
+                "landed at {landed} µs"
+            );
         }
         // Executed lines without any landed one: blind to F1.
         let old = line("executed", "at_ms", 1, 4_000);

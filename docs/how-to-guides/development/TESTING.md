@@ -3306,9 +3306,13 @@ For workloads: self-describing payloads (`verify::payload`,
 `check_payload`: path, writer, sequence, body derived from them), the
 acknowledged-write ledger (`verify::Ledger`: every acknowledged write —
 `fsync` returned; the `close` is checked and its error is the
-application's — rename and unlink; at the end each is intact, or in a
+application's — rename and unlink; a failed op leaves its paths in
+doubt until acknowledged again, and a rename moves its source's doubt to
+the new name; at the end each is intact, or in a
 `.constellation-conflict` copy while the path holds another version
-someone wrote, or lost/corrupt/wrong/phantom; corrupt bytes at a path are
+someone wrote (searched wherever the engine puts one: beside the file,
+or at the root of the mount or of any mounted view above it), or
+lost/corrupt/wrong/phantom; corrupt bytes at a path are
 corruption whatever copy exists; an undone unlink only when a refused
 replay was counted), the protocol counters it depends on
 (`verify::counters`: rolled back, replayed, refused replays, conflict
