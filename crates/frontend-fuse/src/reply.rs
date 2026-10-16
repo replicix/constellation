@@ -81,22 +81,25 @@ pub(crate) fn file_type(kind: FileKind) -> FileType {
 /// An entry reply, and the name it hands the kernel (`dentries`; the
 /// node id it hands it is counted there too, `refs`).
 pub(crate) struct EntryReply {
-    pub reply: ReplyEntry,
+    // Before `reply`: fields drop in declaration order, and a responder
+    // dropped without `done` must end its guard before fuser's Drop answers
+    // EIO.
     pub name: EntryGuard,
+    pub reply: ReplyEntry,
 }
 
 impl Responder<Entry> for EntryReply {
     fn done(self, r: VfsResult<Entry>) {
+        let EntryReply { reply, name } = self;
         match r {
             Ok(e) => {
                 // Before the bytes go: the kernel may forget this lookup as
                 // soon as it has the reply, on another worker.
-                self.name.hands_out(e.attr.ino);
-                self.reply
-                    .entry(&e.attr.ttl, &fuse_attr(&e.attr), Generation(e.generation));
-                self.name.replied(e.attr.ttl);
+                name.hands_out(e.attr.ino);
+                reply.entry(&e.attr.ttl, &fuse_attr(&e.attr), Generation(e.generation));
+                name.replied(e.attr.ttl);
             }
-            Err(e) => self.reply.error(reply_code(e.code())),
+            Err(e) => name.failed(|| reply.error(reply_code(e.code()))),
         }
     }
 }
@@ -223,9 +226,12 @@ impl Responder<()> for EmptyReply {
 /// A rename's reply, and the dentries it moves in the kernel
 /// (`dentries`).
 pub(crate) struct RenameReply {
-    pub reply: ReplyEmpty,
+    // Before `reply`: fields drop in declaration order, and a responder
+    // dropped without `done` must end its guard before fuser's Drop answers
+    // EIO.
     pub names: RenameGuard,
     pub exchange: bool,
+    pub reply: ReplyEmpty,
 }
 
 impl Responder<()> for RenameReply {
@@ -235,7 +241,13 @@ impl Responder<()> for RenameReply {
                 self.reply.ok();
                 self.names.renamed(self.exchange);
             }
-            Err(e) => self.reply.error(reply_code(e.code())),
+            Err(e) => {
+                // Nothing moved: the names stop counting as in flight
+                // before the kernel has the error (`EntryGuard::failed`).
+                let RenameReply { reply, names, .. } = self;
+                drop(names);
+                reply.error(reply_code(e.code()));
+            }
         }
     }
 }
@@ -323,12 +335,14 @@ impl Responder<Opened> for OpenReply {
 }
 
 pub(crate) struct CreateReply {
-    pub reply: ReplyCreate,
+    /// The name it hands the kernel (`dentries`), and where the node id
+    /// it hands it is counted (`refs`). Before `reply`: fields drop in
+    /// declaration order, and a responder dropped without `done` must end
+    /// its guard before fuser's Drop answers EIO.
+    pub name: EntryGuard,
     /// `ino` is learnt from the reply; `pre` is always `Unregistered`.
     pub cx: OpenCtx,
-    /// The name it hands the kernel (`dentries`), and where the node id
-    /// it hands it is counted (`refs`).
-    pub name: EntryGuard,
+    pub reply: ReplyCreate,
 }
 
 impl Responder<(Entry, Opened)> for CreateReply {
@@ -381,13 +395,15 @@ impl Responder<(Entry, Opened)> for CreateReply {
                     }
                     None => {
                         (cx.undo)(e.attr.ino, o.fh);
-                        if let OpenAnswer::Refuse(code) = answer {
-                            reply.error(reply_code(code));
-                        }
+                        name.failed(|| {
+                            if let OpenAnswer::Refuse(code) = answer {
+                                reply.error(reply_code(code));
+                            }
+                        });
                     }
                 }
             }
-            Err(e) => reply.error(reply_code(e.code())),
+            Err(e) => name.failed(|| reply.error(reply_code(e.code()))),
         }
     }
 }

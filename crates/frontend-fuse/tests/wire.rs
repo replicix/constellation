@@ -478,6 +478,18 @@ fn inval_entry(n: &Reply) -> (u64, String) {
     )
 }
 
+/// Nothing arrives on the kernel's side within `quiet`; what does is
+/// named, so that a failure says which invalidation it was.
+fn assert_quiet(k: &mut Kernel, quiet: Duration, what: &str) {
+    if let Some(r) = k.recv_within(quiet) {
+        let inval = (r.error == NOTIFY_INVAL_ENTRY).then(|| inval_entry(&r));
+        panic!(
+            "{what}: unique={} error={} written all the same: {inval:?}",
+            r.unique, r.error
+        );
+    }
+}
+
 /// `FUSE_NOTIFY_INVAL_ENTRY` takes the parent directory's `i_rwsem` in the
 /// kernel, cached name or not, and a daemon `kill -9`ed while one waits
 /// for it never exits (`fuse-inval-storm`): so the sink writes one only
@@ -543,7 +555,7 @@ fn entry_invalidations_are_written_only_for_names_the_kernel_may_hold() {
     assert_eq!(inval_entry(&k.recv()), (5, "brief".into()));
     std::thread::sleep(Duration::from_millis(400));
     sink.invalidate(&[entry_inval(5, "brief")]);
-    assert!(k.recv_within(quiet).is_none(), "expired: nothing to drop");
+    assert_quiet(&mut k, quiet, "expired: nothing to drop");
 
     // A failed lookup hands out nothing.
     mock.always_lookup(Script::fail(Code::NotFound));
@@ -552,7 +564,54 @@ fn entry_invalidations_are_written_only_for_names_the_kernel_may_hold() {
         libc::ENOENT
     );
     sink.invalidate(&[entry_inval(5, "gone")]);
-    assert!(k.recv_within(quiet).is_none());
+    assert_quiet(&mut k, quiet, "a failed lookup hands out nothing");
+    k.finish();
+}
+
+/// A request that fails hands the kernel nothing, so it stops counting as
+/// "in flight" before its error reaches the kernel — not after: with the
+/// reply written first, an invalidation decided the moment the caller has
+/// its error still found the name in flight and was written (the last
+/// step of the test above failed 3 runs in 200, 41 in 200 under load).
+#[test]
+fn a_failed_request_leaves_no_name_for_an_invalidation_to_drop() {
+    let mock = MockVfs::new();
+    mock.always_lookup(Script::fail(Code::NotFound));
+    mock.always_mkdir(Script::fail(Code::Exists));
+    mock.always_rename(Script::fail(Code::NotFound));
+    let fs = FuseFs::new(
+        Arc::new(mock.clone()),
+        FrontendCaps::linux_fuse(false),
+        KernelTuning::for_workers(1),
+    );
+    let entries = fs.kernel_entries().clone();
+    let (mut k, notifier) = Kernel::start_fs_notifying(fs, KERNEL_INIT_FLAGS, 0);
+    let sink = FuseNotifySink::new(notifier, entries);
+    let entry_inval = |parent: Ino, name: &str| Invalidation::Entry {
+        parent,
+        name: name.into(),
+    };
+    for i in 0..300 {
+        let (a, b) = (format!("a{i}"), format!("b{i}"));
+        assert_eq!(
+            k.call(op::LOOKUP, 5, &Body::new().cstr(&a)).errno(),
+            libc::ENOENT
+        );
+        sink.invalidate(&[entry_inval(5, &a)]);
+        assert_eq!(
+            k.call(op::MKDIR, 5, &Body::new().u32(0o755).u32(0o22).cstr(&b))
+                .errno(),
+            libc::EEXIST
+        );
+        sink.invalidate(&[entry_inval(5, &b)]);
+        assert_eq!(
+            k.call(op::RENAME, 5, &Body::new().u64(6).cstr(&a).cstr(&b))
+                .errno(),
+            libc::ENOENT
+        );
+        sink.invalidate(&[entry_inval(5, &a), entry_inval(6, &b)]);
+    }
+    assert_quiet(&mut k, Duration::from_millis(300), "no name was handed out");
     k.finish();
 }
 

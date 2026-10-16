@@ -311,6 +311,22 @@ impl EntryGuard {
         self.done = true;
         self.entries.end(self.key, Some(ttl));
     }
+
+    /// The request failed: it installs nothing, and `answer` (the error
+    /// reply) goes out only once the name no longer counts as in flight.
+    ///
+    /// The other order — the reply written, the guard dropped after — has
+    /// a window in which the kernel already has its answer and a
+    /// notification decided right then still finds the name "in flight",
+    /// so it is written, for a name the kernel does not hold: the very
+    /// write this table exists to spare the directory lock. (A caller that
+    /// saw `ENOENT` and had the name invalidated right after hit it: 3 runs
+    /// in 200 of the wire test idle, 41 in 200 loaded.)
+    pub(crate) fn failed(mut self, answer: impl FnOnce()) {
+        self.done = true;
+        self.entries.end(self.key, None);
+        answer();
+    }
 }
 
 impl Drop for EntryGuard {
@@ -410,6 +426,23 @@ mod tests {
         assert!(!e.may_be_cached(1, b"x"));
         e.begin(1, b"y").replied(Duration::ZERO);
         assert!(!e.may_be_cached(1, b"y"));
+    }
+
+    #[test]
+    fn a_failed_request_is_over_before_its_error_goes_out() {
+        let e = KernelEntries::new();
+        let mut seen = None;
+        e.begin(1, b"x")
+            .failed(|| seen = Some(e.may_be_cached(1, b"x")));
+        assert_eq!(
+            seen,
+            Some(false),
+            "the kernel has its answer: a notification decided now has nothing to drop"
+        );
+        // An earlier reply's dentry is still the kernel's.
+        e.begin(1, b"y").replied(Duration::from_secs(60));
+        e.begin(1, b"y")
+            .failed(|| assert!(e.may_be_cached(1, b"y"), "still within its TTL"));
     }
 
     #[test]
