@@ -80,7 +80,7 @@ fn print_ack(scenario: &str, who: &str, s: &serde_json::Value) {
 /// The lease TTL every M9 scenario mounts with: long enough that a
 /// takeover well inside it can only be seal-based (or `ack=s3`'s fast
 /// path), never expiry.
-const TTL_MS: u64 = 20_000;
+pub(super) const TTL_MS: u64 = 20_000;
 
 /// `names` nodes on a fresh filesystem with `extra` env on every mount
 /// (M9's knobs are per mount); node 0 holds the lease and `f` exists

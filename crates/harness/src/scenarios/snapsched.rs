@@ -959,6 +959,162 @@ pub fn snapsched(seed: u64) -> Result<()> {
     result
 }
 
+/// Load campaign §5.4, F11: is a snapshot batch the leader sent before a
+/// long pause and that lands after another node leads refused? Two nodes
+/// as in `snapsched` (b holds the root lease and writes, a takes the
+/// scheduler's lead), a 10 s policy; once the schedule runs, the leader
+/// is frozen for the scheduler lease's TTL + 2 s and thawed. Then: never
+/// two leaders, no bucket with two snapshots, no snapshot the journal
+/// does not record (an orphan) beyond the documented retry of a bucket a
+/// tick created before its audit write, failed creations only on the
+/// frozen node, no writer error, and the root lease unmoved when the
+/// frozen node was not its holder.
+pub fn snapsched_leader_paused(seed: u64) -> Result<()> {
+    const NAME: &str = "snapsched-leader-paused";
+    let (env, root) = setup(NAME)?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("{NAME}-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let node = |name: &str| -> Result<Client> {
+        Ok(tuned(
+            Client::new(root.path(), name, &env.endpoint, &backend)?.with_own_node_key(),
+            Some(TTL_MS),
+            SNAPSCHED_GRACE_S,
+            EXPIRE_EVERY_S,
+        ))
+    };
+    let mut a = node("a")?;
+    let mut b = node("b")?;
+    b.fs_create()?;
+    b.mount()?;
+    a.mount()?;
+    let mut clients = [a, b];
+    let result = (|| -> Result<()> {
+        let ids = [node_id(&clients[0])?, node_id(&clients[1])?];
+        eventually("b holds the root lease", Duration::from_secs(30), || {
+            let (holder, _) = root_lease(&clients[1])?;
+            ensure!(holder == ids[1], "holder {holder}, want b ({})", ids[1]);
+            Ok(())
+        })?;
+        let b_dir = clients[1].mnt.join("proj");
+        std::fs::create_dir(&b_dir)?;
+        bump(&b_dir, 0)?;
+        let mut writer = Writer::start(seed, b_dir.clone(), 0);
+        let a_dir = clients[0].mnt.join("proj");
+        eventually("/proj on a", Duration::from_secs(20), || {
+            ensure!(a_dir.join("counter").is_file(), "not yet");
+            Ok(())
+        })?;
+        let lease_before = root_lease(&clients[1])?;
+        set_xattr(&a_dir, POLICY_XATTR, POLICY.as_bytes()).context("setting the policy")?;
+        let _ = clients[0].snapshot_cli(&["sched", "run"])?;
+        let mut samples = Samples::default();
+        eventually("two auto snapshots", Duration::from_secs(60), || {
+            ensure!(polled(&clients[1])?.len() >= 2, "not yet");
+            Ok(())
+        })?;
+        run_for(Duration::from_secs(20), Duration::from_secs(2), || {
+            samples.take(&clients, &ids)
+        })?;
+        let mut leader = 0;
+        eventually(
+            "exactly one scheduler leader",
+            Duration::from_secs(30),
+            || {
+                leader = match (is_leader(&clients[0])?, is_leader(&clients[1])?) {
+                    (true, false) => 0,
+                    (false, true) => 1,
+                    other => bail!("(a, b) leading = {other:?}"),
+                };
+                Ok(())
+            },
+        )?;
+        let other = 1 - leader;
+        let failed0 = stat(&sched_status(&clients[other])?, "create_failed");
+        let pause = Duration::from_millis(TTL_MS as u64 + 2_000);
+        let t_pause = now_ms();
+        clients[leader].pause()?;
+        // While it is frozen: sample the other node only.
+        let end = Instant::now() + pause;
+        while Instant::now() < end {
+            std::thread::sleep(Duration::from_secs(2).min(end - Instant::now()));
+            for s in polled(&clients[other])? {
+                samples.seen.insert(s.id.clone(), s);
+            }
+        }
+        clients[leader].resume()?;
+        let t_resume = now_ms();
+        eprintln!(
+            "    {NAME}: froze the leader {} for {pause:?}",
+            clients[leader].name
+        );
+        run_for(Duration::from_secs(40), Duration::from_secs(2), || {
+            samples.take(&clients, &ids)
+        })?;
+        writer.stop();
+        let errors = writer.errors.load(Ordering::Relaxed);
+        ensure!(errors == 0, "the writer saw {errors} error(s)");
+        // Failed creations: only the frozen leader's own stale attempts.
+        let failed = stat(&sched_status(&clients[other])?, "create_failed") - failed0;
+        ensure!(
+            failed == 0,
+            "{} (not frozen) failed {failed} creation(s) across the other's freeze",
+            clients[other].name
+        );
+        for c in &clients {
+            eprintln!(
+                "    {NAME}: {}: create_failed {}",
+                c.name,
+                stat(&sched_status(c)?, "create_failed")
+            );
+        }
+        // No bucket twice (gaps may span the freeze).
+        let mut all: Vec<Snap> = samples.seen.values().cloned().collect();
+        all.sort_by_key(|s| (s.created, s.bucket));
+        check_series(NAME, &all, MAX_GAP_MS + pause.as_millis() as i64)?;
+        // No orphan: everything seen is journaled, but for a bucket the
+        // journal records as skipped (the documented retry of a creation
+        // whose tick lost its audit write), around the freeze.
+        let audit = read_audit(&env.direct_endpoint, &prefix)?;
+        let (_, extra) = creation_list(&audit, &samples.seen)?;
+        let skipped: BTreeSet<&str> = audit.skipped.iter().map(|(_, n, _)| n.as_str()).collect();
+        for s in &extra {
+            ensure!(
+                skipped.contains(s.name.as_str())
+                    && s.created >= t_pause - TICK_MS
+                    && s.created <= t_resume + TTL_MS,
+                "an orphan snapshot (listed, never journaled): {s:?}; journal: {}",
+                journal_digest(&env.direct_endpoint, &prefix)
+            );
+        }
+        let lease_after = root_lease(&clients[1])?;
+        if leader == 0 {
+            ensure!(
+                lease_after == lease_before,
+                "freezing the scheduler leader a moved the root lease b holds: {lease_before:?} \
+                 -> {lease_after:?}"
+            );
+        }
+        eprintln!(
+            "    {NAME}: {} snapshots seen, {} unjournaled (each a journaled skip), leader samples \
+             {:?} ({} handovers mid-read)",
+            all.len(),
+            extra.len(),
+            samples.leaders,
+            samples.overlaps
+        );
+        Ok(())
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    for c in clients.iter_mut().rev() {
+        let _ = c.resume();
+        if c.is_mounted() {
+            let _ = c.unmount();
+        }
+    }
+    result
+}
+
 /// What the sampling loops collect: every auto snapshot seen listed (by
 /// id), the leader per sample, and the highest `skipped_grace` a leader
 /// reported.

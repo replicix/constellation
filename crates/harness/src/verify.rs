@@ -663,7 +663,7 @@ pub struct ErrnoRecord {
 pub struct ErrnoLog(Arc<Mutex<Vec<ErrnoRecord>>>);
 
 /// What the classification needs from the daemons: per node, the ops
-/// fenced with `EIO` (`locks.fenced_io`), and the in-doubt deadline.
+/// fenced with `EIO` ([`fenced_ops`]), and the in-doubt deadline.
 #[derive(Debug, Clone, Default)]
 pub struct Evidence {
     pub fenced_io: HashMap<String, u64>,
@@ -671,6 +671,13 @@ pub struct Evidence {
     /// Allow an `EIO` in doubt past the deadline
     /// (`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`, triage runs only).
     pub allow_in_doubt: bool,
+}
+
+/// Ops a node refused with `EIO` for a lapsed lock grant: I/O on a
+/// fenced file (`fenced_io`) and ops of a fenced lock owner
+/// (`owner_fenced_ops`).
+pub fn fenced_ops(locks: &serde_json::Value) -> u64 {
+    locks["fenced_io"].as_u64().unwrap_or(0) + locks["owner_fenced_ops"].as_u64().unwrap_or(0)
 }
 
 impl Evidence {
@@ -683,7 +690,7 @@ impl Evidence {
             let n = c
                 .control_status()
                 .ok()
-                .and_then(|s| s["locks"]["fenced_io"].as_u64())
+                .map(|s| fenced_ops(&s["locks"]))
                 .unwrap_or(0);
             *fenced_io.entry(c.name.clone()).or_insert(0) += n;
         }
@@ -824,6 +831,11 @@ fn classify<'a>(
 /// A daemon log line's timestamp (`2026-10-15T19:27:49.123456Z`, the
 /// tracing default) as unix ms.
 pub fn line_unix_ms(line: &str) -> Option<i64> {
+    line_unix_us(line).map(|us| us.div_euclid(1_000))
+}
+
+/// The same, to the microsecond (the tracing default's six digits).
+pub fn line_unix_us(line: &str) -> Option<i64> {
     let t = line.trim_start();
     let b = t.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[10] != b'T' {
@@ -832,11 +844,11 @@ pub fn line_unix_ms(line: &str) -> Option<i64> {
     let n = |r: std::ops::Range<usize>| t.get(r)?.parse::<i64>().ok();
     let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
     let (h, mi, s) = (n(11..13)?, n(14..16)?, n(17..19)?);
-    let mut ms = 0;
+    let mut us = 0;
     if b.get(19) == Some(&b'.') {
         let frac: String = t[20..].chars().take_while(|c| c.is_ascii_digit()).collect();
-        let f3: String = frac.chars().chain("000".chars()).take(3).collect();
-        ms = f3.parse().ok()?;
+        let f6: String = frac.chars().chain("000000".chars()).take(6).collect();
+        us = f6.parse().ok()?;
     }
     // Days from civil (Howard Hinnant's algorithm).
     let y2 = if mo <= 2 { y - 1 } else { y };
@@ -846,7 +858,7 @@ pub fn line_unix_ms(line: &str) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(((days * 24 + h) * 60 + mi) * 60_000 + s * 1_000 + ms)
+    Some((((days * 24 + h) * 60 + mi) * 60 + s) * 1_000_000 + us)
 }
 
 /// `line` without ANSI escape sequences (the daemons' log styles field
@@ -898,7 +910,8 @@ pub struct GrantRec {
     pub to: u64,
     pub exclusive: bool,
     /// The line's time (host clock, unix ms).
-    pub at_ms: i64,
+    /// When the owner logged it (host clock, unix µs).
+    pub at_us: i64,
 }
 
 /// What the logs say about lock grants and tagged ops: the grants, and
@@ -958,15 +971,15 @@ pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired
             let int = |k: &str| field(&line, k).and_then(|v| v.parse::<i64>().ok());
             match kind {
                 1 | 2 => {
-                    // `executed`: the protocol clock at the check (the
-                    // daemon's offset removed); `landed`: the host clock
-                    // after the write committed.
+                    // In µs. `executed`: the protocol clock at the check, to
+                    // the ms (the daemon's offset removed); `landed`: the
+                    // host clock after the write committed, to the µs.
                     let at = if kind == 1 {
                         ev.raw.executed += 1;
-                        int("at_ms").map(|a| a - offset)
+                        int("at_ms").map(|a| (a - offset) * 1_000)
                     } else {
                         ev.raw.landed += 1;
-                        int("host_ms")
+                        int("host_us")
                     };
                     let (Some(minter), Some(seq), Some(at)) = (num("minter"), num("seq"), at)
                     else {
@@ -984,12 +997,12 @@ pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired
                 }
                 3 => {
                     ev.raw.granted += 1;
-                    let (Some(minter), Some(seq), Some(ino), Some(to), Some(at_ms), Some(mode)) = (
+                    let (Some(minter), Some(seq), Some(ino), Some(to), Some(at_us), Some(mode)) = (
                         num("minter"),
                         num("seq"),
                         num("ino"),
                         num("to"),
-                        line_unix_ms(&line),
+                        line_unix_us(&line),
                         field(&line, "mode"),
                     ) else {
                         continue;
@@ -1010,7 +1023,7 @@ pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired
                         ino,
                         to,
                         exclusive,
-                        at_ms,
+                        at_us,
                     });
                 }
                 _ => {
@@ -1027,7 +1040,7 @@ pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired
             }
         }
     }
-    ev.grants.sort_by_key(|g| g.at_ms);
+    ev.grants.sort_by_key(|g| g.at_us);
     (ev, acquired)
 }
 
@@ -1079,24 +1092,28 @@ pub fn check_token_order(ev: &LockEvidence) -> Vec<String> {
                 continue;
             };
             for b in &gs[i + 1..] {
-                if b.to == a.to || !(a.exclusive || b.exclusive) || b.at_ms < a.at_ms {
+                if b.to == a.to || !(a.exclusive || b.exclusive) || b.at_us < a.at_us {
                     continue;
                 }
                 if (a.minter, a.seq) == (b.minter, b.seq) {
                     continue;
                 }
-                if last >= b.at_ms {
+                // Strictly later, in µs (a landed line and the grant line
+                // are both stamped to the µs; a check line to the ms, taken
+                // as its millisecond's start, so it never reads late).
+                if last > b.at_us {
                     out.push(format!(
-                        "fencing token order: ino {ino}: grant {}/{} to node {} let an op through at {last}, \
-                         {} ms after grant {}/{} of it went to node {} (at {})",
+                        "fencing token order: ino {ino}: grant {}/{} to node {} let an op through at {} \
+                         µs, {:.3} ms after grant {}/{} of it went to node {} (at {} µs)",
                         a.minter,
                         a.seq,
                         a.to,
-                        last - b.at_ms,
+                        last,
+                        (last - b.at_us) as f64 / 1_000.0,
                         b.minter,
                         b.seq,
                         b.to,
-                        b.at_ms
+                        b.at_us
                     ));
                     break;
                 }
@@ -1777,6 +1794,11 @@ mod tests {
             Some(1_792_092_469_123)
         );
         assert_eq!(line_unix_ms("garbage"), None);
+        assert_eq!(
+            line_unix_us("2026-10-15T19:27:49.123456Z DEBUG y"),
+            Some(1_792_092_469_123_456)
+        );
+        assert_eq!(line_unix_us("1970-01-01T00:00:01.5Z x"), Some(1_500_000));
         let styled = "2026-10-15T19:27:49.1Z \u{1b}[34mDEBUG\u{1b}[0m \u{1b}[3mminter\u{1b}[0m\u{1b}[2m=\u{1b}[0m3 seq=17 to=4";
         let line = strip_ansi(styled);
         assert_eq!(field(&line, "minter"), Some("3"));
@@ -1833,7 +1855,12 @@ mod tests {
         let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("exec".into(), bad, 0)]);
         let v = check_token_order(&ev);
         assert_eq!(v.len(), 1, "{v:?}");
-        assert!(v[0].contains("200 ms after grant 1/2"), "{v:?}");
+        assert!(v[0].contains("200.000 ms after grant 1/2"), "{v:?}");
+        // The grant line's own millisecond is no evidence of an overlap
+        // (both clocks read whole ms).
+        let tie = exec(1, 5_000);
+        let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("exec".into(), tie, 0)]);
+        assert!(check_token_order(&ev).is_empty(), "{:?}", check_token_order(&ev));
         // The same op on an executor whose protocol clock ran 400 ms ahead
         // happened at 4.8 s: in order.
         let ahead = exec(1, 5_200);
@@ -1854,25 +1881,40 @@ mod tests {
         .join("\n");
         let base = line_unix_ms("2026-10-15T00:00:00.000Z").unwrap();
         let line = |what: &str, field: &str, seq: u64, at: i64| {
-            format!(
-                "2026-10-15T00:00:00.000Z DEBUG constellation::token_exec: tagged op {what} minter=1 seq={seq} {field}={}",
+            let at = if field == "host_us" {
+                base * 1_000 + at
+            } else {
                 base + at
+            };
+            format!(
+                "2026-10-15T00:00:00.000Z DEBUG constellation::token_exec: tagged op {what} minter=1 seq={seq} {field}={at}"
             )
         };
         // F1's shape: checked at 4 s (before the grant ended), landed at
         // 5.3 s, after grant 1/2 went to node 3 at 5 s.
         let f1 = [
             line("executed", "at_ms", 1, 4_000),
-            line("landed", "host_ms", 1, 5_300),
+            line("landed", "host_us", 1, 5_300_000),
             line("executed", "at_ms", 2, 6_000),
-            line("landed", "host_ms", 2, 6_001),
+            line("landed", "host_us", 2, 6_001_000),
         ]
         .join("\n");
         let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("x".into(), f1, 400)]);
         let v = check_token_order(&ev);
         assert_eq!(v.len(), 1, "{v:?}");
-        assert!(v[0].contains("300 ms after grant 1/2"), "{v:?}");
+        assert!(v[0].contains("300.000 ms after grant 1/2"), "{v:?}");
         assert!(check_blind(&ev).is_empty(), "{:?}", check_blind(&ev));
+        // To the µs: a landing 300 µs after the grant line, in its very
+        // millisecond, is caught; one 300 µs before it is not.
+        let owner_us = grant_line("2026-10-15T00:00:05.000500Z", 1, 2, 3, "Exclusive");
+        let first = grant_line("2026-10-15T00:00:01.000Z", 1, 1, 2, "Exclusive");
+        for (landed, caught) in [(5_000_800, true), (5_000_200, false)] {
+            let (ev, _) = parse_logs(&[
+                ("owner".into(), format!("{first}\n{owner_us}"), 0),
+                ("x".into(), line("landed", "host_us", 1, landed), 0),
+            ]);
+            assert_eq!(!check_token_order(&ev).is_empty(), caught, "landed at {landed} µs");
+        }
         // Executed lines without any landed one: blind to F1.
         let old = line("executed", "at_ms", 1, 4_000);
         let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("x".into(), old, 0)]);

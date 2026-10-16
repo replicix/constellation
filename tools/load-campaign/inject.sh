@@ -31,18 +31,31 @@
 #   inject.sh rotate <secs> <pid>...     the soak schedule: every <secs> pick one
 #                                        of {cpu-bursty 60 s, pause of a random
 #                                        boundary, hogs 60 s} for a random pid
-#   inject.sh cleanup                    thaw daemons a dead run's injectors left
-#                                        stopped, remove every cst-load-* cgroup of
-#                                        a dead run (cst-load-sh when empty), the
-#                                        lo prio qdisc (unconditionally: not on a
-#                                        host where another campaign runs) and dm
-#                                        devices named cst-load-*
+#   inject.sh cleanup [--force]          remove what belongs to this owner or to
+#                                        a dead one, never a live run's: thaw daemons
+#                                        a dead run's injectors left stopped, its
+#                                        cst-load-<pid> cgroups (cst-load-sh when
+#                                        empty), the lo prio qdisc when its marker's
+#                                        owner is this one or dead, dm devices
+#                                        cst-load-dm-<owner>-* likewise; --force:
+#                                        every one of them (a host nobody else uses)
+#
+# OWNER: $CST_LOAD_OWNER (the runner sets its pid), else the calling shell.
 #
 # Every change is printed with a timestamp, for the run's triage log.
 set -euo pipefail
 
 CG=/sys/fs/cgroup
 PREFIX=cst-load
+# Host-wide markers (the harness writes the same ones): who installed the
+# lo qdisc, which daemons a run's injectors hold stopped.
+MARKERS=/tmp
+NETEM_MARKER=$MARKERS/cst-load-netem.marker
+# What this invocation creates belongs to OWNER (a pid: the campaign
+# runner sets it to its own; default the calling shell): `cleanup` removes
+# only what belongs to a dead owner, or to OWNER itself.
+OWNER=${CST_LOAD_OWNER:-$PPID}
+mine_or_dead() { [ "$1" = "$OWNER" ] || ! kill -0 "$1" 2>/dev/null; }
 as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
 note() { echo "$(date -u +%FT%T.%3NZ) inject: $*"; }
 
@@ -112,6 +125,9 @@ netem)
   if ! as_root tc qdisc show dev lo | grep -q ' prio '; then
     as_root tc qdisc show dev lo | grep -q noqueue || { echo "lo has a root qdisc already" >&2; exit 1; }
     as_root tc qdisc add dev lo root handle 1: prio bands 16 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+    echo "$OWNER" > "$NETEM_MARKER"
+  elif [ -f "$NETEM_MARKER" ] && ! mine_or_dead "$(cat "$NETEM_MARKER")"; then
+    echo "lo's qdisc belongs to live pid $(cat "$NETEM_MARKER")" >&2; exit 1
   fi
   band=$(( $(as_root tc qdisc show dev lo | grep -c netem) + 4 ))
   hex=$(printf %x "$band")
@@ -125,7 +141,12 @@ netem)
   done
   ;;
 netem-clear)
+  owner=$(cat "$NETEM_MARKER" 2>/dev/null || true)
+  if [ -n "$owner" ] && ! mine_or_dead "$owner"; then
+    echo "lo's qdisc belongs to live pid $owner: not removed" >&2; exit 1
+  fi
   if as_root tc qdisc show dev lo | grep -q ' prio '; then as_root tc qdisc del dev lo root; fi
+  rm -f "$NETEM_MARKER"
   note "netem cleared"
   ;;
 store-stall)
@@ -144,7 +165,7 @@ toxic-rm)
   note "toxic $3 removed from $2"
   ;;
 dmdelay-up)
-  dir=$1 mib=$2 rd=$3 wr=$4 name=$PREFIX-$$
+  dir=$1 mib=$2 rd=$3 wr=$4 name=$PREFIX-dm-$OWNER-$$
   mkdir -p "$dir/mnt"
   truncate -s "${mib}M" "$dir/disk.img"
   loop=$(as_root losetup --find --show "$dir/disk.img")
@@ -182,12 +203,18 @@ rotate)
   done
   ;;
 cleanup)
-  for f in "${TMPDIR:-/tmp}"/cst-load-stopped-*.pids; do
+  # Only what this run created or a dead run left: never another live
+  # run's (`--force`: everything with the prefix, for a host nobody else
+  # uses).
+  force=${1:-}
+  for f in "$MARKERS"/cst-load-stopped-*.pids; do
     [ -f "$f" ] || continue
     h=${f##*cst-load-stopped-}; h=${h%.pids}
     kill -0 "$h" 2>/dev/null && continue
     for p in $(cat "$f"); do
-      if [ "$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)" = T ]; then
+      # Only a stopped constellation daemon: the pid may have been reused.
+      if [ "$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)" = T ] &&
+        [ "$(cat "/proc/$p/comm" 2>/dev/null)" = constellation ]; then
         kill -CONT "$p" && note "thawed $p (left stopped by run $h)"
       fi
     done
@@ -201,9 +228,29 @@ cleanup)
     as_root sh -c "for c in $g/*/; do [ -d \"\$c\" ] || continue; for p in \$(cat \$c/cgroup.procs); do echo \$p > $CG/cgroup.procs; done; rmdir \$c; done; rmdir $g" || true
     note "removed $g"
   done
-  if as_root tc qdisc show dev lo | grep -q ' prio '; then as_root tc qdisc del dev lo root; note "removed the lo prio qdisc"; fi
-  rm -f "${TMPDIR:-/tmp}/cst-load-netem.marker"
+  owner=$(cat "$NETEM_MARKER" 2>/dev/null || true)
+  if as_root tc qdisc show dev lo | grep -q ' prio '; then
+    if [ "$force" = --force ] || { [ -n "$owner" ] && mine_or_dead "$owner"; }; then
+      as_root tc qdisc del dev lo root
+      rm -f "$NETEM_MARKER"
+      note "removed the lo prio qdisc (owner ${owner:-unknown})"
+    else
+      if [ -n "$owner" ]; then
+        note "left the lo prio qdisc: its owner $owner is alive"
+      else
+        note "left the lo prio qdisc: no owner marker, so not this run's"
+      fi
+    fi
+  elif [ -n "$owner" ] && mine_or_dead "$owner"; then
+    rm -f "$NETEM_MARKER"
+  fi
   for d in $(as_root dmsetup ls 2>/dev/null | awk -v p="$PREFIX-" 'index($1, p) == 1 { print $1 }'); do
+    case $d in
+    "$PREFIX"-dm-*)
+      o=${d#"$PREFIX"-dm-}; o=${o%%-*}
+      if [ "$force" != --force ] && ! mine_or_dead "$o"; then continue; fi ;;
+    *) [ "$force" = --force ] || continue ;;
+    esac
     as_root dmsetup remove "$d" || true
     note "removed dm device $d"
   done

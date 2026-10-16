@@ -3281,10 +3281,10 @@ to the daemons' `RUST_LOG`, sets the FUSE stall watch to half the hang
 bound with backtraces, and runs after every scenario: the **fencing-token
 order** (no op tagged with a grant passes its check — `tagged op
 executed`, the protocol clock, offsets of `clock:` items removed — or
-*lands* — `tagged op landed`, the host clock read after the op's write
-committed, logged by both tagged write funnels — after a conflicting
-grant of the inode went to another node, from `granted a lock … minter=
-seq=` lines; the landed line is what shows finding F1's write admitted
+*lands* — `tagged op landed … host_us=`, the host clock read to the µs
+after the op's write committed, logged by both tagged write funnels —
+after a conflicting grant of the inode went to another node, from
+`granted a lock … minter= seq=` lines, stamped to the µs; the landed line is what shows finding F1's write admitted
 before its grant ended and committed after a successor's grant), **lease
 epochs** (one node per `acquired the lease` epoch), and, when its S3
 environment goes, the **bucket log** (epochs monotone, one node per epoch,
@@ -3360,13 +3360,36 @@ of minutes (it is fsync-bound: 18 s at 5/20 ms, over 6 min at 100/400 ms).
 `tools/load-campaign/inject.sh` is the shell twin for processes the
 harness did not spawn (the chaos soak, §5.5): `cpu`, `cpu-bursty`,
 `pause`, `hogs-start`, `netem`, `store-stall`, `toxic`, `dmdelay-up`,
-`rotate <secs> <pid>...` (the soak's rotating schedule) and `cleanup`
-(daemons a dead run's injectors left stopped, cgroups, the `lo` qdisc and
-dm devices a crashed run left; it removes the `lo` qdisc unconditionally,
-so not on a host where another campaign runs). The harness sweeps a
-crashed run's cgroups and `lo` qdisc itself (a marker names the harness
-that installed the qdisc; a live one's is left alone), and a guard
-process thaws any daemon its injectors hold stopped if the harness dies.
+`rotate <secs> <pid>...` (the soak's rotating schedule) and `cleanup`.
+What `inject.sh` creates belongs to an owner pid (`CST_LOAD_OWNER`, which
+the runner sets to its own; else the calling shell): the `lo` qdisc's
+marker (`/tmp/cst-load-netem.marker`, shared with the harness) and dm
+devices named `cst-load-dm-<owner>-*`. `cleanup` removes only what belongs
+to this owner or to a dead one — daemons a dead run's injectors left
+stopped, dead runs' cgroups, the qdisc, those dm devices — never a live
+run's (`cleanup --force` removes everything with the prefix, for a host
+nobody else uses). The runner's final cleanup is skipped while the
+`--notice` file has another run's line. The harness sweeps a crashed
+run's cgroups and `lo` qdisc itself (a live one's is left alone), and a
+guard process thaws any daemon its injectors hold stopped if the harness
+dies.
+
+The campaign's own scenarios (`harness list`: run by name only, but for
+`fence-token-at-write`; phase 2's and phase 3's presets run them):
+
+| Scenario | What must hold |
+|---|---|
+| `lock-stall-lone-node` | `lock-lapse-lone-node`'s workload with one metadata write holding the writer lock 5/12/20 s (`CONSTELLATION_HARNESS_LONE_STALLS_MS`): every op OK or EIO, the tree exactly what answered OK, the locked file what its close published (what was fsynced when the close was fenced), fsck clean, also after a remount |
+| `fence-token-at-write` (F1; in the default catalog) | a lone node: a rename under a `flock`ed grant passes its token check, its write is held 10 s (the store-stall hook for that caller only: `caller=<task id>`) while the daemon is frozen past the grant's window; it must answer EIO, the next holder's ref is what the file holds. Failed before F1's fix (the token checked again under the writer lock) |
+| `lock-contention-paused-holder` | the flock'ed counter on three nodes, the holder frozen across lock-half, lock-lapse ∓ 500 ms and lock-outwait + 500 ms: exact count, an op after the thaw EIO only when fenced, and always EIO when the freeze outlasted the window the holder honours (lock-lapse and past) or the owner outwaited the grant; a failed `fsync` is the application's error (EIO there is the fence) |
+| `lock-contention-stalled-owner` | the counter while the owner's store stalls 5/12/20 s (`CONSTELLATION_HARNESS_STALLS_MS`): exact count, token order (checks and landed writes), errno classes |
+| `delegate-paused-across-ttl` | the delegate frozen around its grant's lapse and outwait under its writes and a root-side cross-subtree rename: every acknowledged write there, every rid once, the moved file in one place, no generation the root ended live at the delegate afterwards (a late answer installs no stale grant), errors only in doubt past the client deadline (twice the lease TTL) |
+| `acks3-under-load` | an `ack=s3` holder stalling 1-3 s at a time (run under `cpu:25@a`): no fast takeover, nothing acknowledged rolls back (expected to fail until F2b) |
+| `snapsched-leader-paused` | the scheduler's leader frozen for its lease TTL + 2 s: never two leaders, no bucket twice, no orphan snapshot, failed creations only on the frozen node, no writer error |
+| `endpoint-wedge-probe` | one node of three frozen 8 s per round: every link back, no FUSE request stalled past freeze + 10 s (the stall watch set to that), no write lost or failed |
+
+`CONSTELLATION_HARNESS_ROUNDS` sets the rounds per duration (default 3;
+the campaign proper asks 20 per lock boundary and 10 wedge rounds).
 
 ## Findings of the real-S3 runs (OVH, EC2)
 

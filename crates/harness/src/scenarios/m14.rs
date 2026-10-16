@@ -1208,28 +1208,244 @@ pub fn lock_lapse_lone_node(_seed: u64) -> Result<()> {
     c.mount()?;
     // Frozen well past the grant's window (ttl − margin from its last
     // renewal), well inside the lease's TTL.
-    let result = lock_lapse_lone_run(NAME, &c, Duration::from_millis(3 * LOCK_TTL_MS)).and_then(
-        |expected| {
-            // Read back from the bucket and the store, not this mount's
-            // page cache.
-            c.unmount()?;
-            c.mount()?;
-            lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
-            let fsck = c.fsck(false)?;
-            let report = String::from_utf8_lossy(&fsck.stdout).to_string();
-            anyhow::ensure!(
-                fsck.status.success(),
-                "fsck: {report}{}",
-                String::from_utf8_lossy(&fsck.stderr)
+    let result = lock_lapse_lone_run(
+        NAME,
+        &c,
+        LoneStall::Freeze(Duration::from_millis(3 * LOCK_TTL_MS)),
+    )
+    .and_then(|expected| {
+        // Read back from the bucket and the store, not this mount's
+        // page cache.
+        c.unmount()?;
+        c.mount()?;
+        lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
+        let fsck = c.fsck(false)?;
+        let report = String::from_utf8_lossy(&fsck.stdout).to_string();
+        anyhow::ensure!(
+            fsck.status.success(),
+            "fsck: {report}{}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_str(&report).context("fsck's report")?;
+        let mut shown = report.to_string();
+        shown.truncate(400);
+        eprintln!("    {NAME}: fsck clean: {shown}");
+        Ok(())
+    });
+    if result.is_err() {
+        keep_logs(NAME, std::slice::from_ref(&c));
+    }
+    let _ = c.unmount();
+    result
+}
+
+/// Load campaign §5.3: `lock-lapse-lone-node`'s workload with the
+/// daemon stalled from inside instead of frozen: one ordinary metadata
+/// write holds the store's writer lock for 5, 12 and 20 s
+/// (`CONSTELLATION_FAULT_STORE_STALL_FILE`), so the core's step waits
+/// behind a slow FUSE writer (finding 08). Whether the grant lapses
+/// depends on whether the core had to write meanwhile (the lock lane of
+/// plan 41 L1-L4 renews without it; `CONSTELLATION_LOCK_LANE=off` then
+/// makes this its fail-before); what must hold either way: every op
+/// answers OK or EIO, the tree holds exactly what answered OK, the locked
+/// file what its close published (or what was fsynced, when the close
+/// was fenced), and fsck finds nothing, also after a remount.
+pub fn lock_stall_lone_node(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-stall-lone-node";
+    const LOCK_TTL_MS: u64 = 3_000;
+    let stalls: Vec<u64> = std::env::var("CONSTELLATION_HARNESS_LONE_STALLS_MS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .filter(|v: &Vec<u64>| !v.is_empty())
+        .unwrap_or_else(|| vec![5_000, 12_000, 20_000]);
+    for ms in stalls {
+        let (env, root) = setup(NAME)?;
+        let backend = format!("s3://{BUCKET}/{NAME}-{ms}-{}", ts());
+        let file = root.path().join("store-stall");
+        let mut c = Client::new(root.path(), "lone", &env.direct_endpoint, &backend)?
+            .with_write_mode("back")
+            .with_env("CONSTELLATION_LOCKS", "cluster")
+            .with_env("CONSTELLATION_LOCK_TTL_MS", &LOCK_TTL_MS.to_string())
+            .with_env(
+                "CONSTELLATION_FAULT_STORE_STALL_FILE",
+                &file.display().to_string(),
+            )
+            .with_env(
+                "RUST_LOG",
+                "info,constellation_authority::core::locks=debug,constellation::locks=debug",
             );
-            let report: serde_json::Value =
-                serde_json::from_str(&report).context("fsck's report")?;
-            let mut shown = report.to_string();
-            shown.truncate(400);
-            eprintln!("    {NAME}: fsck clean: {shown}");
-            Ok(())
-        },
-    );
+        c.fs_create()?;
+        c.mount()?;
+        eprintln!("    {NAME}: a {ms} ms store stall");
+        let result =
+            lock_lapse_lone_run(NAME, &c, LoneStall::Store { ms, file }).and_then(|expected| {
+                c.unmount()?;
+                c.mount()?;
+                lock_lapse_lone_check(NAME, &c, &expected, "after a remount")?;
+                let fsck = c.fsck(false)?;
+                anyhow::ensure!(
+                    fsck.status.success(),
+                    "fsck: {}{}",
+                    String::from_utf8_lossy(&fsck.stdout),
+                    String::from_utf8_lossy(&fsck.stderr)
+                );
+                Ok(())
+            });
+        if result.is_err() {
+            keep_logs(NAME, std::slice::from_ref(&c));
+        }
+        let _ = c.unmount();
+        result.with_context(|| format!("the {ms} ms store stall"))?;
+    }
+    Ok(())
+}
+
+/// Load campaign §5.3, finding F1 in the real daemon: a fencing token
+/// checked before the op waits for the store's writer lock, and not again
+/// at the write, lets a write admitted under a grant land after the grant
+/// ended. A lone node; `A` (a thread with its own open file description)
+/// holds `flock` on `refs/main.lock`, `B` waits for it. `A`'s
+/// `rename(refs/tmp-a, refs/main)` passes the check, then its write holds
+/// for 10 s (the store-stall hook, armed for `A`'s task only), during
+/// which the daemon is frozen 6 s — past the 3 s grant's window. Then `A`
+/// resumes: its rename must answer `EIO` (ADR-25: an operation admitted
+/// before a lapse and delayed past it never lands), `B` takes the lock
+/// once `A` lets go and renames its own ref, and `refs/main` holds `B`'s,
+/// also after a remount; fsck finds nothing. Before F1's fix (a re-check
+/// under the writer lock) `A`'s rename answers OK.
+pub fn fence_token_at_write(_seed: u64) -> Result<()> {
+    const NAME: &str = "fence-token-at-write";
+    const LOCK_TTL_MS: u64 = 3_000;
+    const STALL_MS: u64 = 10_000;
+    const FREEZE: Duration = Duration::from_secs(6);
+    let (env, root) = setup(NAME)?;
+    let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
+    let file = root.path().join("store-stall");
+    let mut c = Client::new(root.path(), "lone", &env.direct_endpoint, &backend)?
+        .with_env("CONSTELLATION_LOCKS", "cluster")
+        .with_env("CONSTELLATION_LOCK_TTL_MS", &LOCK_TTL_MS.to_string())
+        .with_env(
+            "CONSTELLATION_FAULT_STORE_STALL_FILE",
+            &file.display().to_string(),
+        )
+        .with_env(
+            "RUST_LOG",
+            &format!(
+                "info,constellation::locks=debug,{}",
+                crate::verify::LOG_DIRECTIVES
+            ),
+        );
+    c.fs_create()?;
+    c.mount()?;
+    let result = (|| -> Result<()> {
+        let refs = c.mnt.join("refs");
+        std::fs::create_dir(&refs)?;
+        std::fs::write(refs.join("main"), b"base")?;
+        std::fs::write(refs.join("main.lock"), b"")?;
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel::<u32>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let a = {
+            let refs = refs.clone();
+            std::thread::spawn(move || -> Result<(std::io::Result<()>, Duration)> {
+                let f = open_rw(&refs.join("main.lock"))?;
+                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("A's flock: {e}"))?;
+                let mut t = File::create(refs.join("tmp-a"))?;
+                t.write_all(b"A")?;
+                t.sync_all()?;
+                drop(t);
+                // SAFETY: gettid(2) has no preconditions.
+                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+                let _ = tid_tx.send(tid);
+                let _ = go_rx.recv();
+                let t0 = Instant::now();
+                let r = std::fs::rename(refs.join("tmp-a"), refs.join("main"));
+                let took = t0.elapsed();
+                let _ = flock(&f, libc::LOCK_UN);
+                Ok((r, took))
+            })
+        };
+        let tid = tid_rx
+            .recv_timeout(Duration::from_secs(60))
+            .context("A never took the lock")?;
+        // B queues behind A's lock (its own open file description).
+        let b = {
+            let refs = refs.clone();
+            std::thread::spawn(move || -> Result<std::io::Result<()>> {
+                let f = open_rw(&refs.join("main.lock"))?;
+                flock(&f, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("B's flock: {e}"))?;
+                let r = (|| {
+                    let mut t = File::create(refs.join("tmp-b"))?;
+                    t.write_all(b"B")?;
+                    t.sync_all()?;
+                    drop(t);
+                    std::fs::rename(refs.join("tmp-b"), refs.join("main"))
+                })();
+                let _ = flock(&f, libc::LOCK_UN);
+                Ok(r)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        let tmp = file.with_extension("tmp");
+        std::fs::write(&tmp, format!("{STALL_MS} once caller={tid}"))?;
+        std::fs::rename(&tmp, &file)?;
+        let _ = go_tx.send(());
+        // A's rename passed its check and holds the writer lock: freeze
+        // the daemon past the grant's window.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while file.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        anyhow::ensure!(
+            !file.exists(),
+            "A's rename never took the store stall (caller {tid})"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        c.pause()?;
+        std::thread::sleep(FREEZE);
+        c.resume()?;
+        let (ra, took) = a.join().map_err(|_| anyhow::anyhow!("A panicked"))??;
+        let rb = b.join().map_err(|_| anyhow::anyhow!("B panicked"))??;
+        eprintln!(
+            "    {NAME}: A's rename after {took:?} (stall {STALL_MS} ms, freeze {FREEZE:?}): \
+             {ra:?}; B's: {rb:?}; locks {}",
+            locks_of(&c)?
+        );
+        anyhow::ensure!(
+            took >= Duration::from_millis(STALL_MS) - Duration::from_millis(500),
+            "A's rename took {took:?}: the stall did not hold it"
+        );
+        match &ra {
+            Err(e) if Code::from_os_error(e) == Some(Code::Io) => {}
+            Ok(()) => bail!(
+                "F1: A's rename passed its fencing-token check, waited {took:?} for the writer \
+                 lock past its grant's end, and answered OK: a write under an ended grant landed"
+            ),
+            Err(e) => bail!("A's rename answered {e}, expected EIO (fenced)"),
+        }
+        rb.context("B's rename under its own grant")?;
+        anyhow::ensure!(
+            std::fs::read(refs.join("main"))? == b"B",
+            "refs/main holds {:?}, expected B's ref",
+            String::from_utf8_lossy(&std::fs::read(refs.join("main"))?)
+        );
+        c.unmount()?;
+        c.mount()?;
+        let got = std::fs::read(c.mnt.join("refs/main"))?;
+        anyhow::ensure!(
+            got == b"B",
+            "after a remount refs/main holds {:?}, expected B's ref",
+            String::from_utf8_lossy(&got)
+        );
+        let fsck = c.fsck(false)?;
+        anyhow::ensure!(
+            fsck.status.success(),
+            "fsck: {}{}",
+            String::from_utf8_lossy(&fsck.stdout),
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+        Ok(())
+    })();
+    let _ = c.resume();
     if result.is_err() {
         keep_logs(NAME, std::slice::from_ref(&c));
     }
@@ -1242,10 +1458,29 @@ pub fn lock_lapse_lone_node(_seed: u64) -> Result<()> {
 struct LoneExpected {
     dirs: std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>>,
     synced: Vec<u64>,
+    /// What the locked file holds: what was `fsync`ed under the honoured
+    /// grant when its close answered `EIO` (the dirty writes discarded),
+    /// else every write that answered `OK`, in order.
+    locked: Vec<u8>,
+}
+
+/// How [`lock_lapse_lone_run`] stalls the daemon past the grant's window.
+enum LoneStall {
+    /// `SIGSTOP` for this long: the grant lapses, by construction.
+    Freeze(Duration),
+    /// One ordinary metadata write holds the store's writer lock this
+    /// long (`CONSTELLATION_FAULT_STORE_STALL_FILE` at `file`): the core
+    /// waits behind it whenever it writes, finding 08's shape. Whether
+    /// the grant lapses depends on whether the core had to write
+    /// meanwhile; the correctness checks hold either way.
+    Store { ms: u64, file: PathBuf },
 }
 
 /// The locked file's content: what was `fsync`ed under the honoured grant.
 const LONE_SYNCED: &[u8] = b"UNDER-LOCK";
+/// Written right before the stall, and after it.
+const DIRTY: &[u8] = b"DIRTY-AT-LAPSE";
+const AFTER: &[u8] = b"AFTER-LAPSE";
 
 fn lock_lapse_lone_check(name: &str, c: &Client, e: &LoneExpected, when: &str) -> Result<()> {
     use std::os::unix::fs::FileExt;
@@ -1264,11 +1499,12 @@ fn lock_lapse_lone_check(name: &str, c: &Client, e: &LoneExpected, when: &str) -
     }
     let locked = std::fs::read(m.join("locked"))?;
     anyhow::ensure!(
-        locked == LONE_SYNCED,
-        "{when}: the locked file reads {:?}, expected what was fsynced under the grant ({:?}): \
-         the write under the lapsed grant must be discarded",
+        locked == e.locked,
+        "{when}: the locked file reads {:?}, expected {:?} (what was fsynced under the grant when \
+         the close was fenced: the writes under a lapsed grant are discarded; else every write \
+         that answered OK)",
         String::from_utf8_lossy(&locked),
-        String::from_utf8_lossy(LONE_SYNCED)
+        String::from_utf8_lossy(&e.locked)
     );
     let plain = File::open(m.join("plain"))?;
     for i in &e.synced {
@@ -1286,7 +1522,7 @@ fn lock_lapse_lone_check(name: &str, c: &Client, e: &LoneExpected, when: &str) -
     Ok(())
 }
 
-fn lock_lapse_lone_run(name: &str, c: &Client, frozen: Duration) -> Result<LoneExpected> {
+fn lock_lapse_lone_run(name: &str, c: &Client, stall: LoneStall) -> Result<LoneExpected> {
     use std::os::unix::fs::FileExt;
     let m = c.mnt.clone();
     for d in ["ren", "lnk", "sym", "cre"] {
@@ -1362,14 +1598,29 @@ fn lock_lapse_lone_run(name: &str, c: &Client, frozen: Duration) -> Result<LoneE
         }
         // Dirty when the grant lapses: discarded at the close, never
         // published (it reads longer than what was fsynced).
-        write_at(&mut lf, 0, b"DIRTY-AT-LAPSE").context("the write right before the freeze")?;
-        c.pause()?;
-        let _thaw = Thaw(c);
-        std::thread::sleep(frozen);
+        write_at(&mut lf, 0, DIRTY).context("the write right before the freeze")?;
+        match &stall {
+            LoneStall::Freeze(frozen) => {
+                c.pause()?;
+                let _thaw = Thaw(c);
+                std::thread::sleep(*frozen);
+            }
+            LoneStall::Store { ms, file } => {
+                // Whole, by a rename (a prefix would stall for less).
+                let tmp = file.with_extension("tmp");
+                std::fs::write(&tmp, format!("{ms} once"))?;
+                std::fs::rename(&tmp, file)?;
+                std::thread::sleep(Duration::from_millis(*ms + 1_000));
+                anyhow::ensure!(
+                    !file.exists(),
+                    "no metadata write took the {ms} ms store stall"
+                );
+            }
+        }
     }
     // The workers run into the fence (the grant lapsed while frozen).
     std::thread::sleep(Duration::from_secs(2));
-    let after = write_at(&mut lf, 0, b"AFTER-LAPSE");
+    let after = write_at(&mut lf, 0, AFTER);
     stop.store(true, Ordering::Relaxed);
     let mut outcomes = std::collections::BTreeMap::new();
     for (what, h) in [
@@ -1385,18 +1636,38 @@ fn lock_lapse_lone_run(name: &str, c: &Client, frozen: Duration) -> Result<LoneE
         outcomes.insert(what, v);
     }
     let fence = locks_of(c)?;
+    let freeze = matches!(stall, LoneStall::Freeze(_));
+    let after_eio = after.as_ref().err().and_then(Code::from_os_error) == Some(Code::Io);
+    // A freeze past the window lapses the grant by construction; a store
+    // stall may not (only OK or EIO are right then).
     anyhow::ensure!(
-        after.as_ref().err().and_then(Code::from_os_error) == Some(Code::Io),
-        "the write under the lapsed grant answered {after:?}, expected EIO; locks: {fence}"
+        after_eio || (!freeze && after.is_ok()),
+        "the write after the {} answered {after:?}, expected EIO{}; locks: {fence}",
+        if freeze { "freeze" } else { "store stall" },
+        if freeze { "" } else { " or OK" }
     );
     // The close drops the POSIX lock; the fence is checked before.
     let fd = std::os::unix::io::IntoRawFd::into_raw_fd(lf);
     let rc = unsafe { libc::close(fd) };
-    let close = Code::from_os_error(&std::io::Error::last_os_error());
+    let close = (rc == -1).then(|| Code::from_os_error(&std::io::Error::last_os_error()));
     anyhow::ensure!(
-        rc == -1 && close == Some(Code::Io),
-        "the close under the fence returned {rc} ({close:?}), expected EIO; locks: {fence}"
+        close == Some(Some(Code::Io)) || (!after_eio && close.is_none()),
+        "the close {} returned {rc} ({close:?}), expected EIO{}; locks: {fence}",
+        if after_eio {
+            "under the fence"
+        } else {
+            "after the stall"
+        },
+        if after_eio { "" } else { " or OK" }
     );
+    let locked = if close.is_some() {
+        LONE_SYNCED.to_vec()
+    } else {
+        // Every write answered OK and the close published them.
+        let mut v = DIRTY.to_vec();
+        v[..AFTER.len()].copy_from_slice(AFTER);
+        v
+    };
     let summary: Vec<String> = outcomes
         .iter()
         .map(|(what, v)| {
@@ -1407,11 +1678,18 @@ fn lock_lapse_lone_run(name: &str, c: &Client, frozen: Duration) -> Result<LoneE
         .collect();
     eprintln!("    {name}: {}; locks {fence}", summary.join(", "));
     let fenced_ops = fence["owner_fenced_ops"].as_u64().unwrap_or(0);
-    anyhow::ensure!(
-        fenced_ops > 0,
-        "the daemon was frozen {frozen:?} past a {}-ms lock window and fenced nothing: {fence}",
-        fence["margin_ms"]
-    );
+    if let LoneStall::Freeze(frozen) = &stall {
+        anyhow::ensure!(
+            fenced_ops > 0,
+            "the daemon was frozen {frozen:?} past a {}-ms lock window and fenced nothing: {fence}",
+            fence["margin_ms"]
+        );
+    } else {
+        eprintln!(
+            "    {name}: the grant {} during the store stall ({fenced_ops} fenced ops)",
+            if after_eio { "lapsed" } else { "held" }
+        );
+    }
     for (what, v) in &outcomes {
         if let Some((n, r)) = v.iter().find(|(_, r)| !matches!(r, Ok(()) | Err(Code::Io))) {
             bail!("{what} {n} answered {r:?}: only OK or EIO are right (the op was valid)");
@@ -1451,6 +1729,7 @@ fn lock_lapse_lone_run(name: &str, c: &Client, frozen: Duration) -> Result<LoneE
         } else {
             Vec::new()
         },
+        locked,
     };
     drop(plain);
     lock_lapse_lone_check(name, c, &expected, "on the mount")?;

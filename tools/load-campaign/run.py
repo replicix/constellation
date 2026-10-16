@@ -96,6 +96,8 @@ PHASES: dict[str, dict] = {
     "2": {
         "scenarios": [
             "lock-lapse-lone-node",
+            "lock-stall-lone-node",
+            "fence-token-at-write",
             "stress-ng-fs",
             "fsync-hard-outage",
             "fsync-soft-timeout",
@@ -115,6 +117,13 @@ PHASES: dict[str, dict] = {
             "runtime-hog",
             "s3-jitter-high",
             "s3-blackhole",
+            # Untargeted: the lock scenarios are excluded from these
+            # (NO_UNTARGETED_PAUSE): the lone-node ones inject their own
+            # precisely placed stall, which a second pause would break.
+            "pause-takeover",
+            "pause-lock-lapse",
+            "step-pause",
+            "clock-skew",
         ],
         "seeds": [42, 43, 44],
     },
@@ -144,6 +153,12 @@ PHASES: dict[str, dict] = {
             "snapsched-write-overhead",
             "cto-strict*",
             "load-probe",
+            "lock-contention-paused-holder",
+            "lock-contention-stalled-owner",
+            "delegate-paused-across-ttl",
+            "acks3-under-load",
+            "snapsched-leader-paused",
+            "endpoint-wedge-probe",
         ],
         "profiles": [
             "baseline",
@@ -175,6 +190,7 @@ DM_DELAY = "dm-delay"
 # reported `excluded`; target a pause at a non-holder (`@node`) instead.
 NO_UNTARGETED_PAUSE = [
     "lock-*",
+    "fence-token-at-write",
     "flock-cross-node",
     "sqlite-two-nodes",
     "git-under-flock*",
@@ -253,9 +269,25 @@ class Notice:
 
 
 def inject(*args: str) -> str:
+    # What it creates belongs to this runner (`inject.sh cleanup` removes
+    # only a dead owner's, or ours).
+    env = dict(os.environ, CST_LOAD_OWNER=str(os.getpid()))
     return subprocess.run(
-        [str(HERE / "inject.sh"), *args], capture_output=True, text=True, check=True
+        [str(HERE / "inject.sh"), *args], capture_output=True, text=True, check=True, env=env
     ).stdout
+
+
+def foreign_notices(path: str | None) -> list[str]:
+    """Lines of the shared notice file another run wrote (its load is on
+    the host now)."""
+    if not path:
+        return []
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return []
+    ours = f"[load-campaign pid {os.getpid()}]"
+    return [l for l in lines if l.strip() and not l.endswith(ours)]
 
 
 def run_cell(a, phase: str, profile: str, scenario: str, seed: int, brk: tuple[str, str] | None, notice: Notice) -> dict:
@@ -459,10 +491,16 @@ def main() -> int:
             for name, expect, profile in preset.get("breaks", []):
                 rows.append(run_cell(a, phase, profile, "load-probe", seeds[0], (name, expect), notice))
     finally:
-        try:
-            inject("cleanup")
-        except subprocess.CalledProcessError as e:
-            print(f"!!! cleanup: {e.stderr}", file=sys.stderr)
+        # Only what this run (or a dead one) left; and not at all while
+        # another run's load is on the host by the notice file.
+        foreign = foreign_notices(a.notice)
+        if foreign:
+            print(f"--- cleanup skipped: another run's load is on: {foreign[0]}", file=sys.stderr)
+        else:
+            try:
+                print(inject("cleanup"), end="")
+            except subprocess.CalledProcessError as e:
+                print(f"!!! cleanup: {e.stderr}", file=sys.stderr)
     return summarize(Path(a.out), rows)
 
 

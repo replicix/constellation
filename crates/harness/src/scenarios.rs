@@ -20,6 +20,7 @@ use std::time::Duration;
 /// attributes change under it.
 mod appendsize;
 mod campaign;
+mod campaign_load;
 /// A P2P cluster's nodes `kill -9`ed and restarted together.
 mod cluster_restart;
 /// Plan 31 §6.12: subtree confinement through the kernel.
@@ -1376,6 +1377,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m14::lock_release_at_close,
     },
     Scenario {
+        name: "fence-token-at-write",
+        desc: "load campaign 5.3 (F1): on a lone node, a rename under a flock'ed grant passes its token check, waits 10 s for the store's writer lock while the daemon is frozen past the grant's window, and must answer EIO (the token is checked again at the write); the next holder's ref is what the file holds, also after a remount; fsck is clean",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::fence_token_at_write,
+    },
+    Scenario {
         name: "lock-lapse-lone-node",
         desc: "plan 30 M14: a lone node (write-back) frozen past a lock grant's window while the lock's owner process has fsynced one write under it and left a second dirty, and creates, links, symlinks and renames from other threads: every op answers OK or EIO and the tree holds exactly what answered OK, the write and the close after the lapse answer EIO, the file holds exactly the fsynced write (the dirty one is discarded), the fence lifts with the lock; after a remount the tree, the file and every fsync-acknowledged write are there; fsck is clean",
         requires: &[],
@@ -1782,13 +1790,64 @@ pub const SCENARIOS: &[Scenario] = &[
 
 /// The host-load campaign's own scenarios (`tools/load-campaign`): run by
 /// name only, never in the default catalog (nor the parity lanes).
-pub const CAMPAIGN: &[Scenario] = &[Scenario {
-    name: "load-probe",
-    desc: "load campaign phase 0: two nodes write self-describing files (ledgered), rename, unlink and increment a flock'ed counter under the load profile; every checker runs (data, acknowledged writes after a remount, fsck, exclusion, errno classes, token order, lease epochs, the bucket log); CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<checker> breaks one on purpose",
-    requires: &[],
-    caps: &[Cap::ClusterLocks],
-    run: campaign::load_probe,
-}];
+pub const CAMPAIGN: &[Scenario] = &[
+    Scenario {
+        name: "load-probe",
+        desc: "load campaign phase 0: two nodes write self-describing files (ledgered), rename, unlink and increment a flock'ed counter under the load profile; every checker runs (data, acknowledged writes after a remount, fsck, exclusion, errno classes, token order, lease epochs, the bucket log); CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<checker> breaks one on purpose",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: campaign::load_probe,
+    },
+    Scenario {
+        name: "lock-stall-lone-node",
+        desc: "load campaign 5.3: lock-lapse-lone-node's workload with one metadata write holding the store's writer lock 5/12/20 s instead of a freeze: every op OK or EIO, the tree holds exactly what answered OK, the locked file what its close published (or what was fsynced when the close was fenced), fsck clean, also after a remount",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_stall_lone_node,
+    },
+    Scenario {
+        name: "lock-contention-paused-holder",
+        desc: "load campaign 5.4: a flock'ed counter on three nodes; the holder frozen across each lock boundary (lock-half, lock-lapse -/+500 ms, lock-outwait +500 ms), CONSTELLATION_HARNESS_ROUNDS rounds each: the count exact, an op after the thaw EIO only when fenced, an outwaited grant always fences it; token order, errno classes",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: campaign_load::lock_contention_paused_holder,
+    },
+    Scenario {
+        name: "lock-contention-stalled-owner",
+        desc: "load campaign 5.4 (F1 in the real daemon): the flock'ed counter on three nodes while the owner's store stalls 5/12/20 s: the count exact, the fencing-token order (checks and landed writes), errno classes",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: campaign_load::lock_contention_stalled_owner,
+    },
+    Scenario {
+        name: "delegate-paused-across-ttl",
+        desc: "load campaign 5.4: the delegate of /d1 frozen around its grant's lapse and outwait under its own writes and a root-side cross-subtree rename: every acknowledged write there, every rid once in the bucket log, the moved file in one place, errors only in doubt past the deadline",
+        requires: &[],
+        caps: &[],
+        run: campaign_load::delegate_paused_across_ttl,
+    },
+    Scenario {
+        name: "acks3-under-load",
+        desc: "load campaign 5.4 (F2b): an ack=s3 holder whose store stalls 1-3 s at a time (run under cpu:25@a): no fast takeover of the live holder, nothing acknowledged rolls back, every write there",
+        requires: &[],
+        caps: &[],
+        run: campaign_load::acks3_under_load,
+    },
+    Scenario {
+        name: "snapsched-leader-paused",
+        desc: "load campaign 5.4 (F11): the snapshot scheduler's leader frozen for its lease TTL + 2 s under a 10 s policy: never two leaders, no bucket twice, no orphan snapshot, failed creations only on the frozen node, no writer error",
+        requires: &[],
+        caps: &[],
+        run: snapsched::snapsched_leader_paused,
+    },
+    Scenario {
+        name: "endpoint-wedge-probe",
+        desc: "load campaign 5.4 (F11): one node of a busy three-node cluster frozen 8 s per round: every link back, no FUSE request stalled, no write lost or failed",
+        requires: &[],
+        caps: &[],
+        run: campaign_load::endpoint_wedge_probe,
+    },
+];
 
 /// Plan 30 M0: scenarios that reproduce a known, not-yet-fixed bug
 /// (`docs/plans/v1/done/30-write-path-resilience-and-scale-out.md` §1.1).

@@ -73,8 +73,13 @@ macro_rules! admit {
         };
         // Plan 30 §M14 phase 2: the op's mutations carry the fencing
         // token of the locks its caller holds (one relaxed load while
-        // this node holds none). Dropped before the admission.
-        let _lock_tag = $self.lock_tag_scope($cx);
+        // this node holds none). Dropped before the admission. (With it,
+        // whose request the writes are for, for the store-stall fault
+        // point: inert while unset.)
+        let _lock_tag = (
+            $self.lock_tag_scope($cx),
+            constellation_meta::fault_caller_scope($cx.caller.pid),
+        );
     };
     // The caller checks the owner fence itself (`fsync`: after `enter!`).
     ($self:expr, $cx:expr, $r:ident, $admitted:ident, owner_fence_checked_later) => {
@@ -85,7 +90,10 @@ macro_rules! admit {
                 return;
             }
         };
-        let _lock_tag = $self.lock_tag_scope($cx);
+        let _lock_tag = (
+            $self.lock_tag_scope($cx),
+            constellation_meta::fault_caller_scope($cx.caller.pid),
+        );
     };
 }
 
@@ -1279,7 +1287,10 @@ impl Vfs for View {
         // and publishes counts as that turn's publication from before the
         // drop until its commit is answered: a new turn on the file waits
         // for it (`crate::locks::begin_close`).
-        let _lock_tag = self.lock_tag_scope(cx);
+        let _lock_tag = (
+            self.lock_tag_scope(cx),
+            constellation_meta::fault_caller_scope(cx.caller.pid),
+        );
         let locks = self.cluster_locks().filter(|_| !View::is_synthetic(ino));
         let publishes = self.handles.writes(fh);
         let ends_turn = publishes
@@ -1373,7 +1384,10 @@ impl Vfs for View {
         // `FUSE_RELEASE_FLOCK_UNLOCK` — the last close of an open file
         // drops its `flock` lock (whose owner is the open file). Phase 2:
         // the fencing token is taken before that, as in `flush`.
-        let _lock_tag = self.lock_tag_scope(cx);
+        let _lock_tag = (
+            self.lock_tag_scope(cx),
+            constellation_meta::fault_caller_scope(cx.caller.pid),
+        );
         let locks = self.cluster_locks();
         // The description's own owners (and the `flock` owner the kernel
         // names) lose their locks on the file below: when they held any

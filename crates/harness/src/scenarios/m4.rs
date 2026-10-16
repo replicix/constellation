@@ -23,8 +23,7 @@ fn list_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
             url.push_str(&urlencode(t));
         }
         let mut body = String::new();
-        crate::s3auth::get(&url)
-            .call()
+        get_retrying(&url)
             .with_context(|| format!("listing {prefix}"))?
             .into_reader()
             .read_to_string(&mut body)?;
@@ -46,6 +45,22 @@ fn list_keys(endpoint: &str, prefix: &str) -> Result<Vec<String>> {
         });
         if !truncated || token.is_none() {
             return Ok(keys);
+        }
+    }
+}
+
+/// A GET that retries what a busy S3 emulator does now and then (a reset
+/// connection, a refused one): three tries, 1 s apart. A status is an
+/// answer and is not retried.
+fn get_retrying(url: &str) -> std::result::Result<ureq::Response, Box<ureq::Error>> {
+    let mut tries = 0;
+    loop {
+        match crate::s3auth::get(url).call() {
+            Err(ureq::Error::Transport(_)) if tries < 2 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            other => return other.map_err(Box::new),
         }
     }
 }
@@ -81,13 +96,13 @@ pub(crate) fn logged_completions(
             continue;
         };
         let mut compressed = Vec::new();
-        match crate::s3auth::get(&raw_key(endpoint, &key)).call() {
+        match get_retrying(&raw_key(endpoint, &key)) {
             Ok(resp) => {
                 resp.into_reader().read_to_end(&mut compressed)?;
             }
             // Retention GC may delete a segment between the LIST and the
             // GET; its completions are older than anything in doubt.
-            Err(ureq::Error::Status(404, _)) => continue,
+            Err(e) if matches!(*e, ureq::Error::Status(404, _)) => continue,
             Err(e) => return Err(e).with_context(|| format!("fetching {key}")),
         }
         let payload =
@@ -141,11 +156,11 @@ pub(crate) fn segment_tenures(endpoint: &str, prefix: &str) -> Result<(usize, Ve
             continue;
         };
         let mut compressed = Vec::new();
-        match crate::s3auth::get(&raw_key(endpoint, &key)).call() {
+        match get_retrying(&raw_key(endpoint, &key)) {
             Ok(resp) => {
                 resp.into_reader().read_to_end(&mut compressed)?;
             }
-            Err(ureq::Error::Status(404, _)) => continue,
+            Err(e) if matches!(*e, ureq::Error::Status(404, _)) => continue,
             Err(e) => return Err(e).with_context(|| format!("fetching {key}")),
         }
         let Ok(payload) = zstd::decode_all(&compressed[..]) else {

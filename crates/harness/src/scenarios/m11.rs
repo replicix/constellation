@@ -81,7 +81,7 @@ pub(super) fn print_deleg(scenario: &str, who: &str, d: &serde_json::Value) {
 /// The lease TTL every M11 scenario mounts with: the root keeps its lease
 /// while a delegation is live (the sticky rule), so nothing here is a
 /// takeover.
-const TTL_MS: u64 = 20_000;
+pub(super) const TTL_MS: u64 = 20_000;
 /// The grant TTL (`CONSTELLATION_DELEGATION_TTL_MS`): short enough that a
 /// dead or cut-off delegate is reclaimed within the scenario.
 const DELEG_TTL_MS: u64 = 3_000;

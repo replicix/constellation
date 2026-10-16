@@ -500,15 +500,18 @@ pub(crate) fn note_landed(tag: &crate::locks::LockTag) {
     {
         return;
     }
-    let host_ms = std::time::SystemTime::now()
+    // Microseconds: a landing in the same millisecond as a successor's
+    // grant line (which the tracing default stamps to the µs) is told
+    // apart.
+    let host_us = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
     for t in &tag.0 {
         // In the message, not as fields, as `check_tag`'s line.
         tracing::debug!(
             target: "constellation::token_exec",
-            "tagged op landed minter={} seq={} host_ms={host_ms}",
+            "tagged op landed minter={} seq={} host_us={host_us}",
             t.grant.node,
             t.grant.seq,
         );

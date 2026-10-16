@@ -484,10 +484,10 @@ pub(super) fn load_probe(seed: u64) -> Result<()> {
             // A write admitted under the earlier grant that committed
             // after the later one: what F1 would leave in the logs.
             let line = format!(
-                "\n2026-01-01T00:00:00.000000Z DEBUG constellation::token_exec: tagged op landed minter={} seq={} host_ms={}\n",
+                "\n2026-01-01T00:00:00.000000Z DEBUG constellation::token_exec: tagged op landed minter={} seq={} host_us={}\n",
                 early.minter,
                 early.seq,
-                late.at_ms + 500
+                late.at_us + 500_000
             );
             append(&clients[0], &line)?;
             eprintln!(

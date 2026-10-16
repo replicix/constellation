@@ -72,6 +72,12 @@ impl Timings {
         })
     }
 
+    /// The client op deadline (`acquire_deadline_ms`, twice the lease
+    /// TTL): an op still in doubt then answers `EIO`.
+    pub fn client_deadline(&self) -> Duration {
+        2 * self.lease_ttl
+    }
+
     /// The root's reclaim horizon of a write delegation
     /// (`delegation_ttl + margin`).
     pub fn reclaim_horizon(&self) -> Duration {
@@ -160,6 +166,7 @@ mod tests {
         let t = Timings::from_pairs::<&str, &str>(&[]);
         assert_eq!(t.lease_ttl, ms(60_000));
         assert_eq!(t.margin, ms(1_000));
+        assert_eq!(t.client_deadline(), ms(120_000));
         assert_eq!(t.lock_ttl, ms(20_000));
         // The lock TTL, at least the core's 5 s.
         assert_eq!(t.delegation_ttl, ms(20_000));

@@ -524,6 +524,14 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         Skip::Local(&["compares against mounts with CONSTELLATION_LOCKS=local"]),
     ),
     (
+        "fence-token-at-write",
+        Skip::Local(&[
+            STOP,
+            "holds one caller's metadata write with a fault hook (CONSTELLATION_FAULT_STORE_STALL_FILE)",
+            "shortens the grant TTL (CONSTELLATION_LOCK_TTL_MS)",
+        ]),
+    ),
+    (
         "lock-lapse-lone-node",
         Skip::Local(&[STOP, "shortens the grant TTL (CONSTELLATION_LOCK_TTL_MS)"]),
     ),

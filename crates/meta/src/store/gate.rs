@@ -221,19 +221,22 @@ impl GatedDb {
 /// after taking it, and the core's next step waits behind it (finding
 /// 08's slow journal write). `<ms> once`: the first writer to see the
 /// file removes it, so one transaction stalls. `pid=<n>`: only the daemon
-/// of that pid stalls (several daemons may share one path). Write the file
+/// of that pid stalls (several daemons may share one path). `caller=<n>`:
+/// only a write made for the FUSE request of that caller (the kernel's
+/// task id, as FUSE names it: [`fault_caller_scope`]). Write the file
 /// whole (to a temporary name, then rename): a reader that sees a prefix
 /// stalls for the wrong time. Unset, one cached lookup.
 fn fault_store_stall() -> Option<Duration> {
-    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    let path = PATH
-        .get_or_init(|| {
-            std::env::var_os("CONSTELLATION_FAULT_STORE_STALL_FILE").map(std::path::PathBuf::from)
-        })
-        .as_ref()?;
+    let path = store_stall_path()?;
     let text = std::fs::read_to_string(path).ok()?;
     let spec = parse_store_stall(&text)?;
     if spec.pid.is_some_and(|p| p != std::process::id()) {
+        return None;
+    }
+    if spec
+        .caller
+        .is_some_and(|c| FAULT_CALLER.with(Cell::get) != c)
+    {
         return None;
     }
     if spec.once && std::fs::remove_file(path).is_err() {
@@ -243,12 +246,49 @@ fn fault_store_stall() -> Option<Duration> {
     Some(Duration::from_millis(spec.ms))
 }
 
-/// [`fault_store_stall`]'s file: `<ms>[ once][ pid=<n>]`.
+fn store_stall_path() -> Option<&'static std::path::PathBuf> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("CONSTELLATION_FAULT_STORE_STALL_FILE").map(std::path::PathBuf::from)
+    })
+    .as_ref()
+}
+
+thread_local! {
+    /// The caller of the FUSE request this thread is handling, for
+    /// [`fault_store_stall`]'s `caller=` (0: none).
+    static FAULT_CALLER: Cell<u32> = const { Cell::new(0) };
+}
+
+/// While the returned guard lives, this thread's writes are made for the
+/// FUSE request of `caller` (the kernel's task id), as far as the
+/// store-stall fault point is concerned. Inert (no thread-local touched)
+/// while `CONSTELLATION_FAULT_STORE_STALL_FILE` is unset.
+pub fn fault_caller_scope(caller: Option<u32>) -> FaultCallerScope {
+    if store_stall_path().is_none() {
+        return FaultCallerScope(None);
+    }
+    FaultCallerScope(Some(FAULT_CALLER.with(|c| c.replace(caller.unwrap_or(0)))))
+}
+
+/// See [`fault_caller_scope`].
+pub struct FaultCallerScope(Option<u32>);
+
+impl Drop for FaultCallerScope {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0 {
+            FAULT_CALLER.with(|c| c.set(prev));
+        }
+    }
+}
+
+/// [`fault_store_stall`]'s file: `<ms>[ once][ pid=<n>][ caller=<n>]`.
 #[derive(Debug, PartialEq, Eq)]
 struct StoreStall {
     ms: u64,
     once: bool,
     pid: Option<u32>,
+    caller: Option<u32>,
 }
 
 fn parse_store_stall(text: &str) -> Option<StoreStall> {
@@ -258,15 +298,19 @@ fn parse_store_stall(text: &str) -> Option<StoreStall> {
         ms,
         once: false,
         pid: None,
+        caller: None,
     };
     for w in it {
-        match w {
-            "once" if !spec.once => spec.once = true,
-            _ => match w.strip_prefix("pid=") {
-                Some(p) if spec.pid.is_none() => spec.pid = Some(p.parse().ok()?),
-                _ => return None,
-            },
+        if w == "once" && !spec.once {
+            spec.once = true;
+            continue;
         }
+        if let Some(p) = w.strip_prefix("pid=").filter(|_| spec.pid.is_none()) {
+            spec.pid = Some(p.parse().ok()?);
+            continue;
+        }
+        let p = w.strip_prefix("caller=").filter(|_| spec.caller.is_none())?;
+        spec.caller = Some(p.parse().ok()?);
     }
     (ms > 0).then_some(spec)
 }
@@ -288,15 +332,30 @@ mod tests {
 
     #[test]
     fn store_stall_spec() {
-        let spec = |ms, once, pid| Some(StoreStall { ms, once, pid });
-        assert_eq!(parse_store_stall("5000"), spec(5000, false, None));
-        assert_eq!(parse_store_stall(" 20000 once\n"), spec(20000, true, None));
+        let spec = |ms, once, pid, caller| {
+            Some(StoreStall {
+                ms,
+                once,
+                pid,
+                caller,
+            })
+        };
+        assert_eq!(parse_store_stall("5000"), spec(5000, false, None, None));
+        assert_eq!(
+            parse_store_stall(" 20000 once\n"),
+            spec(20000, true, None, None)
+        );
         assert_eq!(
             parse_store_stall("800 once pid=42"),
-            spec(800, true, Some(42))
+            spec(800, true, Some(42), None)
         );
-        assert_eq!(parse_store_stall("800 pid=7"), spec(800, false, Some(7)));
+        assert_eq!(
+            parse_store_stall("800 pid=7 caller=99 once"),
+            spec(800, true, Some(7), Some(99))
+        );
         for bad in [
+            "1 caller=x",
+            "1 caller=2 caller=3",
             "",
             "0",
             "x",

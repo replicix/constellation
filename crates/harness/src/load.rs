@@ -562,6 +562,12 @@ pub fn scenario_paused(pid: u32) -> bool {
         .contains(&pid)
 }
 
+/// Whether `pid` is a `constellation` daemon (`/proc/<pid>/comm`): a pid
+/// from a dead run's list may since name another process.
+fn is_daemon(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "constellation")
+}
+
 /// The process exists and is not a zombie.
 pub fn alive(pid: u32) -> bool {
     proc_state(pid).is_some_and(|s| s != 'Z' && s != 'X')
@@ -764,9 +770,14 @@ impl Session {
     }
 }
 
-/// What an injector stopped, for the guard (`<tmp>/cst-load-stopped-<pid>.pids`).
+/// Where host-wide load markers live: `/tmp`, whatever `TMPDIR` a run
+/// was given (a dm-delay run's points at its slow disk), so every run and
+/// `inject.sh cleanup` find every other's.
+const MARKER_DIR: &str = "/tmp";
+
+/// What an injector stopped, for the guard (`/tmp/cst-load-stopped-<pid>.pids`).
 fn stopped_file() -> PathBuf {
-    std::env::temp_dir().join(format!("cst-load-stopped-{}.pids", std::process::id()))
+    Path::new(MARKER_DIR).join(format!("cst-load-stopped-{}.pids", std::process::id()))
 }
 
 /// Record that an injector stopped (or thawed) `pid`.
@@ -790,7 +801,9 @@ fn mark_stopped(set: &Mutex<HashSet<u32>>, pid: u32, stopped: bool) {
 fn spawn_guard() -> Option<Child> {
     let script = format!(
         "while kill -0 {h} 2>/dev/null; do sleep 1; done; \
-         [ -f {f} ] && for p in $(cat {f}); do kill -CONT $p 2>/dev/null; done; rm -f {f}",
+         [ -f {f} ] && for p in $(cat {f}); do \
+         [ \"$(cat /proc/$p/comm 2>/dev/null)\" = constellation ] && kill -CONT $p 2>/dev/null; \
+         done; rm -f {f}",
         h = std::process::id(),
         f = sh_quote(&stopped_file().display().to_string())
     );
@@ -806,7 +819,7 @@ fn spawn_guard() -> Option<Child> {
 
 /// A crashed run's injector-stopped daemons (its guard died too): thaw.
 fn sweep_stopped() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = std::fs::read_dir(MARKER_DIR) else {
         return;
     };
     for e in entries.flatten() {
@@ -826,7 +839,8 @@ fn sweep_stopped() {
             .lines()
             .filter_map(|l| l.trim().parse::<u32>().ok())
         {
-            if proc_state(p) == Some('T') {
+            // Only a stopped daemon: the pid may have been reused.
+            if proc_state(p) == Some('T') && is_daemon(p) {
                 signal(p, libc::SIGCONT);
                 eprintln!("    load: thawed pid {p}, left stopped by a crashed run");
             }
@@ -1409,11 +1423,11 @@ impl Netem {
     }
 }
 
-/// Who installed the `lo` qdisc (`<tmp>/cst-load-netem.marker`: the
-/// harness's pid), so a crashed run's is swept and another live run's is
-/// not.
+/// Who installed the `lo` qdisc (`/tmp/cst-load-netem.marker`: the
+/// harness's pid, or `inject.sh`'s owner), so a crashed run's is swept
+/// and another live run's is not.
 fn netem_marker() -> PathBuf {
-    std::env::temp_dir().join("cst-load-netem.marker")
+    Path::new(MARKER_DIR).join("cst-load-netem.marker")
 }
 
 /// The `lo` qdisc of a crashed run (its marker names a dead harness).
