@@ -2286,6 +2286,13 @@ maintainer may still overturn it). Blocking before C0: Q7, Q10a.
 Before C1: Q1, Q13. Before C2: Q2, Q4, Q9, Q14, Q15, Q16. Before C4:
 Q6. Before C6: Q5. Before C7b: Q10b, Q10c.
 
+**Answered by the maintainer (2026-10-17): every recommendation below
+is accepted** — Q1 (a) strict, Q2 yes, Q4 yes, Q6 yes, Q7 the
+recommended order, Q10 (a) land C7-H2 and C7-H1 first, (b) phase 1
+only, (c) accept the cold-claim wait, Q15 the request flag; the gates
+G1–G6 are accepted at their stated budgets (a gate that fails still
+stops its milestone). Q5 stays open until C6's measurement.
+
 - **Q1 — A claim (or a generation end) when no member of the old group
   answers.** *Blocks C1 (G4).* Vertical Paxos requires the new
   configuration to read the old group's tail from a member; today a
