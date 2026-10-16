@@ -98,8 +98,12 @@ impl Drop for PendingLocalOpGuard {
 }
 
 thread_local! {
-    static PENDING_LOCK_TAG: std::cell::RefCell<Option<crate::locks::LockTag>> =
+    static PENDING_LOCK_TAG: std::cell::RefCell<Option<(crate::locks::LockTag, i64)>> =
         const { std::cell::RefCell::new(None) };
+    /// The tags [`PendingLockTag::check_at_write`] pinned on this thread
+    /// (one per transaction of the op), unpinned by the guard's drop.
+    static PINNED_LOCK_TAGS: std::cell::RefCell<Vec<crate::locks::LockTag>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Plan 30 §M14 phase 2: the fencing token of the op whose transaction is
@@ -108,26 +112,155 @@ thread_local! {
 /// thread-local scoping as [`PendingLocalOp`]. Set by
 /// `mutate::execute_tagged` and by [`crate::Meta::with_lock_tag`] (the
 /// holder's own manifest commit, which has no op).
+///
+/// F1: the op's transaction checks it again once it holds the store's
+/// writer lock ([`Self::check_at_write`], from `Meta::begin_local`), and
+/// the guard keeps the grants pinned until the op is over.
 pub(crate) struct PendingLockTag;
 
 impl PendingLockTag {
-    pub(crate) fn set(tag: &crate::locks::LockTag) -> PendingLockTagGuard {
+    /// `checked_ms`: the clock the check before the op read (the
+    /// write-time check's fallback while its table has no clock).
+    pub(crate) fn set<'a>(
+        tag: &crate::locks::LockTag,
+        checked_ms: i64,
+        locks: &'a crate::locks::LockTables,
+    ) -> PendingLockTagGuard<'a> {
         if !tag.is_empty() {
-            PENDING_LOCK_TAG.with(|c| *c.borrow_mut() = Some(tag.clone()));
+            PENDING_LOCK_TAG.with(|c| *c.borrow_mut() = Some((tag.clone(), checked_ms)));
         }
-        PendingLockTagGuard
+        PendingLockTagGuard { locks }
     }
 
-    pub(crate) fn take() -> Option<crate::locks::LockTag> {
-        PENDING_LOCK_TAG.with(|c| c.borrow_mut().take())
+    /// The pending tag, for the `journal_tx` row of each of the op's
+    /// transactions. Not taken: every transaction of the op (one today) is
+    /// checked at the write, pinned and recorded with it, until the guard
+    /// drops.
+    pub(crate) fn current() -> Option<crate::locks::LockTag> {
+        PENDING_LOCK_TAG.with(|c| c.borrow().as_ref().map(|(tag, _)| tag.clone()))
+    }
+
+    /// F1: the token at the write. Called by a transaction that holds the
+    /// store's writer lock and has written nothing yet: refused
+    /// (`LockLapsed`, the transaction is dropped unwritten) when a grant
+    /// the pending tag names is no longer live on `locks`'s clock now;
+    /// otherwise its grants stay pinned until the guard drops
+    /// (`LockTables::check_tag_at_write`). Nothing pending: nothing to do.
+    pub(crate) fn check_at_write(locks: &crate::locks::LockTables) -> Result<(), MetaError> {
+        let pending = PENDING_LOCK_TAG.with(|c| c.borrow().clone());
+        let Some((tag, checked_ms)) = pending else {
+            return Ok(());
+        };
+        #[cfg(any(test, feature = "test-util"))]
+        if !write_check_hook::fire(write_check_hook::At::Check) {
+            return Err(MetaError::NotAdmitted);
+        }
+        if !locks.checks_at_write() {
+            return Ok(());
+        }
+        locks
+            .check_tag_at_write(&tag, checked_ms)
+            .map_err(|_| MetaError::LockLapsed)?;
+        PINNED_LOCK_TAGS.with(|c| c.borrow_mut().push(tag));
+        #[cfg(any(test, feature = "test-util"))]
+        if !write_check_hook::fire(write_check_hook::At::Pinned) {
+            return Err(MetaError::NotAdmitted);
+        }
+        Ok(())
     }
 }
 
-pub(crate) struct PendingLockTagGuard;
+pub(crate) struct PendingLockTagGuard<'a> {
+    locks: &'a crate::locks::LockTables,
+}
 
-impl Drop for PendingLockTagGuard {
+impl Drop for PendingLockTagGuard<'_> {
     fn drop(&mut self) {
         PENDING_LOCK_TAG.with(|c| *c.borrow_mut() = None);
+        let pinned = PINNED_LOCK_TAGS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        for tag in &pinned {
+            self.locks.unpin(tag);
+        }
+    }
+}
+
+/// Tests only (`test-util`): a hook run on the thread of a transaction
+/// that holds the writer lock, right before it checks its op's fencing
+/// token at the write (`At::Check`) and right after the check passed and
+/// pinned the grants (`At::Pinned`): `mutate`'s F1 tests, and the
+/// simulation's `WriterLockHold`, which parks a write there, pinned,
+/// as a slow commit would keep it.
+#[cfg(any(test, feature = "test-util"))]
+pub mod write_check_hook {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum At {
+        Check,
+        Pinned,
+    }
+
+    /// `false` abandons the transaction unwritten (`NotAdmitted`): its
+    /// node died while the write was parked.
+    type Hook = Box<dyn FnMut(At) -> bool>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Install (or, `None`, remove) this thread's hook.
+    pub fn set(hook: Option<Hook>) {
+        HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    pub(crate) fn fire(at: At) -> bool {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        let Some(mut hook) = hook else {
+            return true;
+        };
+        let go = hook(at);
+        HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        go
+    }
+}
+
+thread_local! {
+    static PENDING_ADMISSION: std::cell::RefCell<Option<Box<dyn Fn() -> bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// F1 (and F9): the fast path's admission of the op it executes — the
+/// lease, or the delegation, it was admitted under — re-checked once the
+/// op's transaction holds the store's writer lock
+/// ([`Self::check_at_write`]). The op may have waited for that lock long
+/// enough for its admission to run out; refused there
+/// (`MetaError::NotAdmitted`, nothing written), the op goes through the
+/// authority core instead, as one refused at admission does, rather than
+/// journaling a row a takeover would strand. Set by
+/// [`crate::mutate::execute_admitted`].
+pub(crate) struct PendingAdmission;
+
+impl PendingAdmission {
+    pub(crate) fn set(still: Box<dyn Fn() -> bool>) -> PendingAdmissionGuard {
+        PENDING_ADMISSION.with(|c| *c.borrow_mut() = Some(still));
+        PendingAdmissionGuard
+    }
+
+    pub(crate) fn check_at_write() -> Result<(), MetaError> {
+        let admitted = PENDING_ADMISSION.with(|c| c.borrow().as_ref().is_none_or(|still| still()));
+        if admitted {
+            Ok(())
+        } else {
+            Err(MetaError::NotAdmitted)
+        }
+    }
+}
+
+pub(crate) struct PendingAdmissionGuard;
+
+impl Drop for PendingAdmissionGuard {
+    fn drop(&mut self) {
+        PENDING_ADMISSION.with(|c| *c.borrow_mut() = None);
     }
 }
 

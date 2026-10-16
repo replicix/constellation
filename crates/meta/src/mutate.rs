@@ -450,6 +450,16 @@ pub fn execute(
 /// replay, the inbox drain, the FUSE fast paths — comes through here, so
 /// the check is where the write is recorded. The tag is recorded with the
 /// op's `journal_tx` row for a replay after a deposition.
+///
+/// F1: `now_ms` is read before the op waits for the store's writer lock
+/// (a FUSE thread behind a slow writer, a core step that took its `now`
+/// before it waited), so this check only refuses early. The one that
+/// counts runs again inside the op's transaction, with the writer lock
+/// held and this node's clock read there
+/// ([`crate::locks::LockTables::check_tag_at_write`], from
+/// `Meta::begin_local`), and pins the grants until the op is over: a
+/// position this node reports as covering what it executed waits for it
+/// (`Meta::settle_tagged_writes`).
 pub fn execute_tagged(
     meta: &Meta,
     op: &MutateOp,
@@ -460,7 +470,11 @@ pub fn execute_tagged(
     if meta.locks().check_tag(tag, now_ms).is_err() {
         return Err(MetaError::LockLapsed);
     }
-    let _tag = crate::store::journal::PendingLockTag::set(tag);
+    #[cfg(any(test, feature = "test-util"))]
+    if !before_write::fire() {
+        return Err(MetaError::NotAdmitted);
+    }
+    let _tag = crate::store::journal::PendingLockTag::set(tag, now_ms, meta.locks());
     let _pending = crate::store::journal::PendingCompletion::set(rid);
     // Plan 30 §M3b: the op's own journaled transaction records `(rid, op)`
     // in its `journal_tx` row (`store::local`), so a deposition can replay
@@ -498,6 +512,57 @@ pub(crate) fn note_landed(tag: &crate::locks::LockTag) {
             t.grant.node,
             t.grant.seq,
         );
+    }
+}
+
+/// [`execute_tagged`] on a FUSE fast path: `still_admitted` says whether
+/// what admitted the op there (the lease, a delegation) still does, and is
+/// asked again once the op's transaction holds the store's writer lock —
+/// `false` then refuses the op with [`MetaError::NotAdmitted`], nothing
+/// journaled, and the caller sends it through the authority core (F1,
+/// F9: an op that waited for the lock past its lease's expiry journaled a
+/// row a takeover strands and replays).
+pub fn execute_admitted(
+    meta: &Meta,
+    op: &MutateOp,
+    rid: Option<crate::rid::Rid>,
+    tag: &crate::locks::LockTag,
+    now_ms: i64,
+    still_admitted: Box<dyn Fn() -> bool>,
+) -> Result<Vec<LogRecord>, MetaError> {
+    let _admission = crate::store::journal::PendingAdmission::set(still_admitted);
+    execute_tagged(meta, op, rid, tag, now_ms)
+}
+
+/// Tests only (`test-util`; the simulation's `WriterLockHold`, F1): a hook this thread
+/// runs inside [`execute_tagged`] after the check before the op and before
+/// its transaction — where a FUSE thread waits for the store's writer lock
+/// behind a slow writer. `false` abandons the op unwritten
+/// ([`MetaError::NotAdmitted`]: its node died meanwhile). One
+/// thread-local look per op while unset.
+#[cfg(any(test, feature = "test-util"))]
+pub fn set_before_write_hook_for_tests(hook: Option<Box<dyn FnMut() -> bool>>) {
+    before_write::HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(any(test, feature = "test-util"))]
+mod before_write {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut() -> bool>;
+
+    thread_local! {
+        pub(super) static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn fire() -> bool {
+        let hook = HOOK.with(|h| h.borrow_mut().take());
+        let Some(mut hook) = hook else {
+            return true;
+        };
+        let go = hook();
+        HOOK.with(|h| *h.borrow_mut() = Some(hook));
+        go
     }
 }
 
@@ -1457,5 +1522,286 @@ mod tests {
             ),
             "{seen}"
         );
+    }
+
+    /// F1 (`cst-load-review` §2): the fencing token is checked at the
+    /// write, not only before the op waits for the store's writer lock.
+    /// Node 2's rename under its exclusive grant passes the check at
+    /// `t0`, then waits for the lock (a slow writer ahead of it, the
+    /// finding-08 shape); meanwhile the minter outwaits the grant (and
+    /// may grant node 3, whose ops then go ahead with priority). The
+    /// stale rename must be refused (`LockLapsed` → `EIO`), journaling
+    /// nothing; it used to land and be answered `OK`, overwriting the
+    /// next holder's ref update.
+    #[test]
+    fn a_grant_ended_while_its_write_waited_is_refused_at_the_write() {
+        use crate::locks::{LockMode, LockTag, LockToken};
+        let m = Meta::open_in_memory().unwrap();
+        let tmp = m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
+        let lock_file = m.create(ROOT_INO, "turn.lock", 0o644, 0, 0).unwrap();
+        let g = m
+            .locks()
+            .grant(1, 2, lock_file.ino, LockMode::Exclusive, 30_000, 0);
+        let tag = LockTag(vec![LockToken {
+            grant: g,
+            until_ms: 28_000,
+        }]);
+        let before = m.journal_len().unwrap();
+        // The grant ends at the minter while the op waits for the writer
+        // lock (`At::Before`: right before the op's transaction).
+        window_hook::set(Some(Box::new(move |m: &Meta, at| {
+            if at == window_hook::At::Before {
+                m.locks().forget(g);
+            }
+        })));
+        let r = execute_tagged(
+            &m,
+            &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
+            None,
+            &tag,
+            1_000,
+        );
+        window_hook::set(None);
+        assert!(
+            matches!(r, Err(MetaError::LockLapsed)),
+            "a write under a grant that ended while it waited for the writer lock landed: {r:?}"
+        );
+        assert_eq!(ino_at(&m, ROOT_INO, "tmp"), Some(tmp.ino));
+        assert_eq!(ino_at(&m, ROOT_INO, "ref"), None);
+        assert_eq!(m.journal_len().unwrap(), before, "nothing journaled");
+        assert!(m.locks().stats().token_rejections >= 1);
+    }
+
+    /// F1: an executor that did not mint the grant judges the token by
+    /// its window, on its own clock *at the write*. The check before the
+    /// op read a clock from before it waited for the writer lock (a core
+    /// step's `now`); the window ended during the wait.
+    #[test]
+    fn a_window_that_ended_while_its_write_waited_is_refused_at_the_write() {
+        use crate::locks::{GrantId, LockTag, LockToken};
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::Arc;
+        let m = Meta::open_in_memory().unwrap();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let c = clock.clone();
+        m.locks()
+            .set_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+        m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
+        // Another sequencer's grant: judged by its window here.
+        let tag = LockTag(vec![LockToken {
+            grant: GrantId { node: 9, seq: 1 },
+            until_ms: 5_000,
+        }]);
+        let c = clock.clone();
+        window_hook::set(Some(Box::new(move |_: &Meta, at| {
+            if at == window_hook::At::Before {
+                c.store(5_000, Ordering::SeqCst);
+            }
+        })));
+        let r = execute_tagged(
+            &m,
+            &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
+            None,
+            &tag,
+            1_000,
+        );
+        window_hook::set(None);
+        assert!(matches!(r, Err(MetaError::LockLapsed)), "{r:?}");
+        assert_eq!(ino_at(&m, ROOT_INO, "ref"), None);
+        assert_eq!(m.locks().stats().token_rejections_at_write, 1);
+        // Inside its window the same op goes through, and leaves no pin.
+        clock.store(1_000, Ordering::SeqCst);
+        execute_tagged(
+            &m,
+            &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
+            None,
+            &tag,
+            1_000,
+        )
+        .unwrap();
+        assert!(!m.locks().unsettled_writes());
+    }
+
+    /// F1: a tagged write that passed its check at the write is *pinned*
+    /// until its transaction is over. Once its grant has ended here, a
+    /// position this node reports (a grant's floor, a cut) first waits
+    /// for that write (`Meta::settle_tagged_writes`), so a next holder's
+    /// floor never lacks a write that lands after its grant — the commit
+    /// of a write checked in time can still take seconds (a slow disk).
+    #[test]
+    fn a_position_taken_after_a_grant_ends_waits_for_its_pinned_write() {
+        use crate::locks::{LockMode, LockTag, LockToken};
+        use crate::store::journal::write_check_hook;
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+        let m = Arc::new(Meta::open_in_memory().unwrap());
+        m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
+        let lock_file = m.create(ROOT_INO, "turn.lock", 0o644, 0, 0).unwrap();
+        let g = m
+            .locks()
+            .grant(1, 1, lock_file.ino, LockMode::Exclusive, 30_000, 0);
+        let tag = LockTag(vec![LockToken {
+            grant: g,
+            until_ms: 28_000,
+        }]);
+        // Live grant, nothing in a transaction: nothing to settle.
+        assert!(!m.locks().unsettled_writes());
+        assert!(!m.settle_tagged_writes());
+        let (pinned_tx, pinned_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let writer = {
+            let m = m.clone();
+            let tag = tag.clone();
+            std::thread::spawn(move || {
+                write_check_hook::set(Some(Box::new(move |at| {
+                    if at == write_check_hook::At::Pinned {
+                        pinned_tx.send(()).unwrap();
+                        // The commit is slow: the writer lock stays held.
+                        go_rx.recv().unwrap();
+                    }
+                    true
+                })));
+                let r = execute_tagged(
+                    &m,
+                    &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
+                    None,
+                    &tag,
+                    1_000,
+                );
+                write_check_hook::set(None);
+                r
+            })
+        };
+        pinned_rx.recv().unwrap();
+        // Pinned under a live grant: a position need not wait for it (no
+        // conflicting grant can be made while the grant lives here).
+        assert!(!m.locks().unsettled_writes());
+        // The grant ends at the minter (an outwait) while the write is
+        // in its transaction.
+        m.locks().forget(g);
+        assert!(m.locks().unsettled_writes());
+        let (done_tx, done_rx) = mpsc::channel();
+        let settler = {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                let waited = m.settle_tagged_writes();
+                // What a floor read now covers: the journal as it is.
+                let renamed = ino_at(&m, ROOT_INO, "ref").is_some();
+                done_tx.send(()).unwrap();
+                (waited, renamed)
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a position was taken while a write under the ended grant was still committing"
+        );
+        go_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        let (waited, renamed) = settler.join().unwrap();
+        assert!(waited);
+        assert!(renamed, "the settled position lacks the pinned write");
+        assert!(!m.locks().unsettled_writes(), "the pin is gone with the op");
+        assert_eq!(m.locks().stats().settle_waits, 1);
+        // A write that comes after the end is refused at once.
+        let r = execute_tagged(
+            &m,
+            &rename_op(ROOT_INO, "ref", ROOT_INO, "ref2", false),
+            None,
+            &tag,
+            1_000,
+        );
+        assert!(matches!(r, Err(MetaError::LockLapsed)), "{r:?}");
+    }
+
+    /// F1/F9: a fast path's admission is judged again at the write; one
+    /// that ran out while the op waited for the writer lock refuses it
+    /// unwritten (`NotAdmitted`: the caller sends it through the core).
+    #[test]
+    fn an_admission_that_ran_out_before_the_write_refuses_it_unwritten() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let m = Meta::open_in_memory().unwrap();
+        m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
+        let before = m.journal_len().unwrap();
+        let usable = Arc::new(AtomicBool::new(true));
+        let u = usable.clone();
+        window_hook::set(Some(Box::new(move |_: &Meta, at| {
+            if at == window_hook::At::Before {
+                u.store(false, Ordering::SeqCst);
+            }
+        })));
+        let u = usable.clone();
+        let r = execute_admitted(
+            &m,
+            &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
+            None,
+            &crate::locks::LockTag::NONE,
+            0,
+            Box::new(move || u.load(Ordering::SeqCst)),
+        );
+        window_hook::set(None);
+        assert!(matches!(r, Err(MetaError::NotAdmitted)), "{r:?}");
+        assert_eq!(ino_at(&m, ROOT_INO, "ref"), None);
+        assert_eq!(m.journal_len().unwrap(), before);
+        // Admitted throughout: executed. The admission is gone after the
+        // call (a later plain execution is not judged by it).
+        usable.store(true, Ordering::SeqCst);
+        let u = usable.clone();
+        execute_admitted(
+            &m,
+            &rename_op(ROOT_INO, "tmp", ROOT_INO, "ref", false),
+            None,
+            &crate::locks::LockTag::NONE,
+            0,
+            Box::new(move || u.load(Ordering::SeqCst)),
+        )
+        .unwrap();
+        usable.store(false, Ordering::SeqCst);
+        execute(
+            &m,
+            &rename_op(ROOT_INO, "ref", ROOT_INO, "ref2", false),
+            None,
+        )
+        .unwrap();
+    }
+
+    /// F1 (review M2): a write pinned under another sequencer's grant (a
+    /// delegate running a write under a lock the root minted) needs no
+    /// settle while its token's window is open here: the next grant
+    /// follows only an outwait, after that window. Past it, it does. One
+    /// under a grant this table ended needs it at once.
+    #[test]
+    fn a_pin_under_a_foreign_grant_is_unsettled_only_past_its_window() {
+        use crate::locks::{GrantId, LockMode, LockTag, LockToken};
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::Arc;
+        let m = Meta::open_in_memory().unwrap();
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let c = clock.clone();
+        m.locks()
+            .set_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+        let foreign = LockTag(vec![LockToken {
+            grant: GrantId { node: 9, seq: 1 },
+            until_ms: 5_000,
+        }]);
+        m.locks().check_tag_at_write(&foreign, 1_000).unwrap();
+        assert!(!m.locks().unsettled_writes(), "inside its window");
+        clock.store(5_000, Ordering::SeqCst);
+        assert!(m.locks().unsettled_writes(), "past its window");
+        m.locks().unpin(&foreign);
+        assert!(!m.locks().unsettled_writes());
+        // Minted here: settles once ended, whatever the token's window.
+        let f = m.create(ROOT_INO, "turn.lock", 0o644, 0, 0).unwrap();
+        let g = m.locks().grant(1, 2, f.ino, LockMode::Exclusive, 60_000, 0);
+        let own = LockTag(vec![LockToken {
+            grant: g,
+            until_ms: 50_000,
+        }]);
+        m.locks().check_tag_at_write(&own, 5_000).unwrap();
+        assert!(!m.locks().unsettled_writes(), "live here");
+        m.locks().forget(g);
+        assert!(m.locks().unsettled_writes(), "ended here");
+        m.locks().unpin(&own);
     }
 }

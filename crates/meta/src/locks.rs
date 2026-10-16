@@ -403,6 +403,19 @@ pub struct LockStats {
     /// because a grant they named was no longer live (`EIO`, nothing
     /// journaled).
     pub token_rejections: u64,
+    /// F1: of those, the ones only the check under the store's writer
+    /// lock refused — the op had passed the check before it waited for
+    /// the lock (a slow writer ahead of it, a stalled step).
+    pub token_rejections_at_write: u64,
+    /// F1: positions this node reported as covering what it executed (a
+    /// grant's floor, an outwait's cut, a delegate's stream head) that
+    /// first waited for a tagged write still in its transaction under a
+    /// grant no longer live here.
+    pub settle_waits: u64,
+    /// Node side: recalled grants left to their owner's outwait instead
+    /// of released, because a mutation tagged with them had ended in
+    /// doubt (it may still be committing at an executor).
+    pub doubt_lapses: u64,
 }
 
 /// `BTreeMap`s throughout: the renewal tick and the idle sweep iterate
@@ -471,8 +484,31 @@ struct Inner {
     /// flight ended, so a release that waits for it goes on at once
     /// ([`LockTables::set_release_wake`]).
     release_wake: Option<ReleaseWake>,
+    /// Executor side (F1, the token at the write): per grant, the tagged
+    /// writes that passed [`LockTables::check_tag_at_write`] under the
+    /// store's writer lock and have not finished their transaction yet
+    /// ([`TagPins`]). A position this node reports as covering what was
+    /// executed here ([`crate::Meta::settle_tagged_writes`]) waits for
+    /// those whose grant ended here or whose token's window is over: how
+    /// many are in, and the latest window among their tokens.
+    pins: BTreeMap<GrantId, (u32, i64)>,
+    /// Node side: grants under which a tagged mutation of this node ended
+    /// in doubt, and which ones (by rid, where known): such an op may have
+    /// passed its check at an executor and still be committing there, so
+    /// the grant is not released while one is unresolved, only left to
+    /// its owner's outwait ([`LockTables::doubt_of`]). At most
+    /// [`ENDED_KEPT`], the oldest evicted first.
+    doubted: BTreeMap<GrantId, Doubt>,
+    /// The executor's clock for [`LockTables::check_tag_at_write`] (unix
+    /// ms); `None`: the system clock.
+    clock: Option<LockClock>,
     stats: LockStats,
 }
+
+/// The clock a table reads for the write-time token check
+/// ([`LockTables::set_clock`]): the daemon's wall clock, or a
+/// simulation's node clock.
+pub type LockClock = std::sync::Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// See [`LockTables::set_release_wake`]: called with the inode whose
 /// held grant has no tagged mutation in flight any more.
@@ -632,6 +668,45 @@ impl Inner {
         true
     }
 
+    /// The table's clock now (see `LockTables::set_clock`), or
+    /// `fallback` while none is set.
+    fn now_or(&self, fallback: i64) -> i64 {
+        match &self.clock {
+            Some(clock) => clock(),
+            None => fallback,
+        }
+    }
+
+    /// A mutation tagged with `grant` ended in doubt: `rid` when known
+    /// (resolvable later by its outcome), else an unresolvable doubt —
+    /// unless the grant already has a doubt noted (the op's scope ending
+    /// after the doubt was noted with its rid).
+    fn note_doubted(&mut self, grant: GrantId, now_ms: i64, rid: Option<crate::rid::Rid>) {
+        let e = self.doubted.entry(grant).or_insert_with(|| Doubt {
+            since_ms: now_ms,
+            rids: std::collections::BTreeSet::new(),
+            anon: false,
+        });
+        match rid {
+            Some(r) => {
+                e.rids.insert(r);
+            }
+            None if e.rids.is_empty() => e.anon = true,
+            None => {}
+        }
+        while self.doubted.len() > ENDED_KEPT {
+            let Some(oldest) = self
+                .doubted
+                .iter()
+                .min_by_key(|(_, d)| d.since_ms)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.doubted.remove(&oldest);
+        }
+    }
+
     /// `id` ended here with its record running to `until_ms`.
     fn note_ended(&mut self, id: GrantId, until_ms: i64) {
         let keep = until_ms.saturating_add(self.ended_keep_ms);
@@ -731,6 +806,22 @@ pub struct LockTables {
     /// asked ([`LockTables::take_expired_dropped`]): its backup's mirror
     /// is out of date.
     expired_dropped: AtomicBool,
+    /// The sum of `Inner::pins`: [`LockTables::unsettled_writes`]'s fast
+    /// path while no tagged write is in a transaction here.
+    pinned: AtomicUsize,
+    /// Tests only: [`LockTables::set_tag_check_at_write_for_tests`].
+    no_check_at_write: AtomicBool,
+    /// Tests only: [`LockTables::set_settle_for_tests`].
+    no_settle: AtomicBool,
+}
+
+/// See `Inner::doubted`.
+#[derive(Clone, Debug)]
+struct Doubt {
+    since_ms: i64,
+    rids: std::collections::BTreeSet<crate::rid::Rid>,
+    /// An op whose rid is unknown ended in doubt: never resolved.
+    anon: bool,
 }
 
 /// The default first-use budget: the session wait (2 s), the kernel
@@ -1038,6 +1129,205 @@ impl LockTables {
             return Ok(());
         }
         let mut g = self.lock();
+        self.judge(&mut g, tag, now_ms)
+    }
+
+    /// F1, the token *at the write*: [`Self::check_tag`] on this table's
+    /// clock ([`Self::set_clock`]) read now, called with the store's
+    /// writer lock held, right before the op's transaction writes
+    /// anything (`Meta::begin_local`). The check before the call
+    /// (`mutate::execute_tagged`) ran on a clock read before the op waited
+    /// for that lock — behind a slow writer, or in a core step that took
+    /// its `now` before it waited — and judged a window that may have
+    /// ended meanwhile, or a grant this table has ended since (and
+    /// granted to another node, whose writes may be in already).
+    ///
+    /// Passed, the op's grants are *pinned* until its transaction is over
+    /// ([`Self::unpin`]): a position this node reports as covering what it
+    /// executed waits for a pinned write under a grant no longer live here
+    /// ([`Self::unsettled_writes`]), so a grant ended while the write was
+    /// in its transaction (or its commit was slow) is never followed by a
+    /// next holder whose floor lacks it.
+    ///
+    /// `checked_ms`: the clock the earlier check read, which this one
+    /// reads instead only while no clock is set (unit tests of a core
+    /// with an explicit `now`).
+    pub fn check_tag_at_write(&self, tag: &LockTag, checked_ms: i64) -> Result<(), LockToken> {
+        if tag.is_empty() {
+            return Ok(());
+        }
+        let mut g = self.lock();
+        let now_ms = g.now_or(checked_ms);
+        match self.judge(&mut g, tag, now_ms) {
+            Err(t) => {
+                g.stats.token_rejections_at_write += 1;
+                tracing::info!(
+                    target: "constellation::locks",
+                    minter = t.grant.node,
+                    seq = t.grant.seq,
+                    until_ms = t.until_ms,
+                    now_ms,
+                    "refused a tagged write at the store: its grant ended while it waited for the writer lock"
+                );
+                Err(t)
+            }
+            Ok(()) => {
+                for t in &tag.0 {
+                    let e = g.pins.entry(t.grant).or_insert((0, i64::MIN));
+                    e.0 += 1;
+                    e.1 = e.1.max(t.until_ms);
+                }
+                self.pinned.fetch_add(tag.0.len(), Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+
+    /// The transaction a [`Self::check_tag_at_write`] that passed with
+    /// `tag` pinned for is over (committed or abandoned).
+    pub fn unpin(&self, tag: &LockTag) {
+        if tag.is_empty() {
+            return;
+        }
+        let mut g = self.lock();
+        for t in &tag.0 {
+            if let Some(e) = g.pins.get_mut(&t.grant) {
+                e.0 -= 1;
+                if e.0 == 0 {
+                    g.pins.remove(&t.grant);
+                }
+            }
+        }
+        self.pinned.fetch_sub(tag.0.len(), Ordering::SeqCst);
+    }
+
+    /// F1: a tagged write is in its transaction here under a grant whose
+    /// next holder may be granted already: one this table ended (released,
+    /// outwaited) or whose record here has run out, or — a grant this
+    /// table does not hold (another sequencer's, judged by its window) —
+    /// one whose token's window is over on this clock. A position read now
+    /// could miss it although its op passed every check, so whoever
+    /// reports one as covering what this node executed first waits for the
+    /// writer lock (`Meta::settle_tagged_writes`): such a write holds it
+    /// from its check to its commit.
+    ///
+    /// A write under another sequencer's grant whose window is still open
+    /// here is not waited for: the next grant can follow only an outwait,
+    /// whose barrier is after that window (`2 × margin` past it), and a
+    /// cut as of a time before the window's end settles no barrier after
+    /// it. So a delegate's renewal does not wait for every tagged commit
+    /// in flight — only, after a slow commit outlasted its window, for
+    /// that one. One atomic load while no tagged write is in a
+    /// transaction.
+    pub fn unsettled_writes(&self) -> bool {
+        if self.pinned.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        let g = self.lock();
+        let now_ms = g.now_or(i64::MIN);
+        g.pins
+            .iter()
+            .any(|(id, (_, until))| match g.grants.get(id) {
+                Some(e) => e.until_ms <= now_ms,
+                None => g.ended.contains_key(id) || now_ms >= *until,
+            })
+    }
+
+    /// Tests only (the simulation's non-vacuity knobs for F1): `false`
+    /// switches the token check at the write off for this table, which is
+    /// the code before it — an op is judged only by the check
+    /// `mutate::execute_tagged` runs before it waits for the writer lock.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_tag_check_at_write_for_tests(&self, on: bool) {
+        self.no_check_at_write.store(!on, Ordering::Relaxed);
+    }
+
+    /// See [`Self::set_tag_check_at_write_for_tests`].
+    pub(crate) fn checks_at_write(&self) -> bool {
+        !self.no_check_at_write.load(Ordering::Relaxed)
+    }
+
+    /// Tests only: `false` makes `Meta::settle_tagged_writes` wait for
+    /// nothing (the code before it).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_settle_for_tests(&self, on: bool) {
+        self.no_settle.store(!on, Ordering::Relaxed);
+    }
+
+    /// See [`Self::set_settle_for_tests`].
+    pub(crate) fn settles(&self) -> bool {
+        !self.no_settle.load(Ordering::Relaxed)
+    }
+
+    /// The clock [`Self::check_tag_at_write`] reads (unix ms): the
+    /// daemon's wall clock, which its other lock decisions read too; a
+    /// simulation's node clock. Unset (unit tests driving a core with an
+    /// explicit `now`), the write-time check reads the clock the check
+    /// before it read.
+    pub fn set_clock(&self, clock: LockClock) {
+        self.lock().clock = Some(clock);
+    }
+
+    /// This table's clock now, if one is set ([`Self::set_clock`]).
+    pub fn clock_ms(&self) -> Option<i64> {
+        self.lock().clock.as_ref().map(|c| c())
+    }
+
+    /// Node side: a mutation tagged with `grant` ended in doubt (`rid`:
+    /// which, if known): it may pass its check at an executor and commit
+    /// there after any wait this node could take, so the grant is not
+    /// released while the doubt is unresolved; its owner outwaits it,
+    /// which orders the next grant after whatever lands
+    /// ([`Self::doubt_of`]).
+    pub fn note_doubted(&self, grant: GrantId, now_ms: i64, rid: Option<crate::rid::Rid>) {
+        let mut g = self.lock();
+        g.note_doubted(grant, now_ms, rid);
+    }
+
+    /// The doubt noted on `grant`, if any: whether one of its ops is
+    /// unknown (no rid: never resolvable), and the rids of the others —
+    /// each resolved once its outcome is known
+    /// ([`Self::resolve_doubt`]).
+    pub fn doubt_of(&self, grant: GrantId) -> Option<(bool, Vec<crate::rid::Rid>)> {
+        self.lock()
+            .doubted
+            .get(&grant)
+            .map(|d| (d.anon, d.rids.iter().copied().collect()))
+    }
+
+    /// The in-doubt op `rid` under `grant` has a definitive outcome (it
+    /// executed — its commit is done — or it was refused): no longer a
+    /// doubt. The grant is released normally once none is left.
+    pub fn resolve_doubt(&self, grant: GrantId, rid: crate::rid::Rid) {
+        let mut g = self.lock();
+        if let Some(d) = g.doubted.get_mut(&grant) {
+            d.rids.remove(&rid);
+            if d.rids.is_empty() && !d.anon {
+                g.doubted.remove(&grant);
+            }
+        }
+    }
+
+    /// Whether any doubt is noted on `grant` (resolved or not).
+    pub fn was_doubted(&self, grant: GrantId) -> bool {
+        self.lock().doubted.contains_key(&grant)
+    }
+
+    /// Whether a mutation this node issued under `grant` may still land
+    /// at an executor: one is in flight (not answered yet), or one ended
+    /// in doubt ([`Self::note_doubted`]). An owner that ends its own
+    /// grant meanwhile has not got it in its release floor.
+    pub fn tagged_unsettled(&self, grant: GrantId) -> bool {
+        let g = self.lock();
+        g.doubted.contains_key(&grant)
+            || g.inflight
+                .get(&grant)
+                .is_some_and(|e| e.active > 0 || e.publishing > 0)
+    }
+
+    /// The token check itself (see [`Self::check_tag`]), under the
+    /// table lock.
+    fn judge(&self, g: &mut Inner, tag: &LockTag, now_ms: i64) -> Result<(), LockToken> {
         if g.ended.len() > 256 {
             g.ended.retain(|_, keep| *keep > now_ms);
         }
@@ -1281,6 +1571,21 @@ impl LockTables {
     /// it stays (recalled; the last unlock releases it again). `true`:
     /// dropped.
     pub fn end_release(&self, ino: u64, id: GrantId) -> bool {
+        self.end_held(ino, id, true)
+    }
+
+    /// As [`Self::end_release`], for a grant this node gives up *without*
+    /// a release (left to its owner's outwait: an op tagged with it may
+    /// still land, `core::locks`'s doubt lapse). Tombstoned as a released
+    /// one is — a reply or push of the id that crosses the drop must not
+    /// reinstall what this node gave up — but not recorded as released
+    /// last: that vouches nothing ran under the grant's successor here,
+    /// and the owner will outwait this one, not see a release.
+    pub fn drop_unreleased(&self, ino: u64, id: GrantId) -> bool {
+        self.end_held(ino, id, false)
+    }
+
+    fn end_held(&self, ino: u64, id: GrantId, released: bool) -> bool {
         let mut g = self.lock();
         let pinned = g.local.get(&ino).is_some_and(|v| !v.is_empty());
         match g.held.get_mut(&ino) {
@@ -1291,9 +1596,13 @@ impl LockTables {
                 }
                 g.held.remove(&ino);
                 g.tombstone(id);
-                g.released_last.insert(ino, id);
-                while g.released_last.len() > NEWEST_KEPT {
-                    g.released_last.pop_first();
+                if released {
+                    g.released_last.insert(ino, id);
+                    while g.released_last.len() > NEWEST_KEPT {
+                        g.released_last.pop_first();
+                    }
+                } else {
+                    g.released_last.remove(&ino);
                 }
                 self.track(&g);
                 true
@@ -1712,6 +2021,9 @@ impl LockTables {
         let mut wake = Vec::new();
         let mut g = self.lock();
         for t in &tag.0 {
+            if in_doubt {
+                g.note_doubted(t.grant, now_ms, None);
+            }
             let Some(e) = g.inflight.get_mut(&t.grant) else {
                 continue;
             };
@@ -1747,14 +2059,18 @@ impl LockTables {
     /// over now, before its answer goes out, not only at its
     /// [`Self::tag_end`] — a new turn the answer lets the application
     /// start must already find the pin (`LocalOutcome::Predecessor`).
-    pub fn pin_in_doubt(&self, tag: &LockTag) {
+    /// `rid`: the op's, when known, so the doubt is resolved by its
+    /// outcome ([`Self::resolve_doubt`]).
+    pub fn pin_in_doubt(&self, tag: &LockTag, rid: Option<crate::rid::Rid>) {
         if tag.is_empty() {
             return;
         }
         let mut g = self.lock();
+        let now_ms = g.now_or(0);
         for t in &tag.0 {
             let e = g.inflight.entry(t.grant).or_default();
             e.pinned_until_ms = e.pinned_until_ms.max(t.until_ms);
+            g.note_doubted(t.grant, now_ms, rid);
         }
     }
 
@@ -2278,6 +2594,38 @@ impl crate::Meta {
         &self.locks
     }
 
+    /// F1: before this node reports a position as covering what it
+    /// executed — a grant's floor or position, an outwait barrier's cut, a
+    /// delegate's stream head — every tagged write that passed its check
+    /// at the write under a grant no longer live here has committed
+    /// ([`LockTables::unsettled_writes`]). Such a write holds the store's
+    /// writer lock from its check to its commit, so taking the lock once
+    /// is the wait; nothing else is. A write that checks later finds the
+    /// grant ended (refused), or its window over at an executor that only
+    /// judges it by the window (a cut as of a time past it needs nothing
+    /// from it). `true` if it waited. One atomic load while no tagged
+    /// write is in a transaction.
+    /// Tests only (`test-util`; the simulation's `WriterLockHold`): `hook`
+    /// runs on every thread about to wait for this store's writer lock,
+    /// before it waits — where a write parked inside its transaction (a
+    /// slow commit) is let go, as every writer would wait for it.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_writer_wait_hook_for_tests(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.db.wait_hook.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    pub fn settle_tagged_writes(&self) -> bool {
+        if !self.locks.settles() || !self.locks.unsettled_writes() {
+            return false;
+        }
+        drop(self.db.write_tx());
+        self.locks.with_stats(|s| s.settle_waits += 1);
+        true
+    }
+
     /// Plan 30 §M14 phase 2: run `f` — a journaled write that is not a
     /// `MutateOp` execution (the holder's own manifest commit) — under the
     /// fencing token `tag`, checked at `now_ms` as
@@ -2292,7 +2640,7 @@ impl crate::Meta {
         if self.locks.check_tag(tag, now_ms).is_err() {
             return Err(crate::MetaError::LockLapsed);
         }
-        let _tag = crate::store::journal::PendingLockTag::set(tag);
+        let _tag = crate::store::journal::PendingLockTag::set(tag, now_ms, &self.locks);
         let out = f()?;
         crate::mutate::note_landed(tag);
         Ok(out)
@@ -3566,7 +3914,7 @@ mod token_tests {
             "a close's publication in flight"
         );
         t.publish_end(id, 12);
-        t.pin_in_doubt(&tag);
+        t.pin_in_doubt(&tag, None);
         assert_eq!(
             t.local_set(7, lk(11, true, 0, 9), 15),
             LocalOutcome::Predecessor,

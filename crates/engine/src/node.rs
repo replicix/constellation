@@ -616,6 +616,10 @@ impl Engine {
         // incarnation never repeats, so the pair never does either.
         let incarnation = meta.bump_incarnation()?;
         tracing::info!(node_id, incarnation, "node incarnation");
+        // F1: the fencing token is checked again once an op's transaction
+        // holds the store's writer lock, on this clock read there — the
+        // one every other lock decision of this node reads.
+        meta.locks().set_clock(Arc::new(crate::locks::now_ms));
         // Plan 25: drop pending_upload rows that belong to another node's
         // ino prefix (a copied meta.db dropped into an existing state
         // dir). Same-prefix rows stay for crash recovery. On a fresh

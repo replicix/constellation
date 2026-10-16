@@ -301,6 +301,14 @@ impl LocalTx {
 impl Meta {
     /// Open the local-write bracket for the transaction `tx` just started.
     pub(crate) fn begin_local(&self, tx: &SingleWriterWriteTx) -> Result<LocalTx, MetaError> {
+        // F1: what admitted the op, judged again now that it holds the
+        // writer lock (it may have waited seconds for it): the fast path's
+        // lease or delegation first (refused, the op goes through the
+        // core), then its fencing token on this node's clock now (refused,
+        // `LockLapsed`). Nothing is written yet, so a refusal drops the
+        // transaction unwritten.
+        journal::PendingAdmission::check_at_write()?;
+        journal::PendingLockTag::check_at_write(&self.locks)?;
         let start = journal::peek_next_seq(tx, &self.local)?;
         let epoch = self.holder_epoch.load(Ordering::SeqCst);
         // A holder always captures; a non-holder only while speculation
@@ -397,7 +405,7 @@ impl Meta {
                 op,
                 deps,
                 observed: journal::PendingObserved::take().unwrap_or_default(),
-                lock_tag: journal::PendingLockTag::take().unwrap_or_default(),
+                lock_tag: journal::PendingLockTag::current().unwrap_or_default(),
             },
         )
     }
@@ -422,6 +430,24 @@ impl Meta {
         let records = crate::mutate::execute_tagged(self, op, rid, tag, now_ms)?;
         let idx = self.delegate_idx(gen)?;
         Ok((records, idx))
+    }
+
+    /// [`Self::delegate_execute`] on the delegate's FUSE fast path:
+    /// `still_admitted` is asked again once the op's transaction holds the
+    /// store's writer lock ([`crate::mutate::execute_admitted`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn delegate_execute_admitted(
+        &self,
+        op: &MutateOp,
+        rid: Option<Rid>,
+        gen: u64,
+        deps: crate::session::Position,
+        tag: &crate::locks::LockTag,
+        now_ms: i64,
+        still_admitted: Box<dyn Fn() -> bool>,
+    ) -> Result<(Vec<LogRecord>, u64), MetaError> {
+        let _admission = journal::PendingAdmission::set(still_admitted);
+        self.delegate_execute(op, rid, gen, deps, tag, now_ms)
     }
 
     /// The highest stream index this node assigned under `gen` (0: none).

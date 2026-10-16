@@ -362,6 +362,15 @@ fn replay_seed() {
         Ok("locks-writes") => with_lock_writes(locks_config(), ""),
         Ok("locks-partition-writes") => with_lock_writes(locks_partition_config(), ""),
         Ok("locks-pause-writes") => with_lock_writes(locks_pause_config(), ""),
+        Ok("locks-writer-hold") => locks_writer_hold_config(),
+        Ok("locks-writer-hold-unchecked") => locks_writer_hold_unchecked_config(),
+        Ok("locks-writer-hold-delegated") => locks_writer_hold_delegated_config(),
+        Ok("locks-writer-hold-delegated-unsettled") => {
+            locks_writer_hold_delegated_unsettled_config()
+        }
+        Ok("locks-writer-hold-delegated-doubt") => locks_writer_hold_delegated_doubt_config(),
+        Ok("locks-stall-step") => locks_stall_step_config(),
+        Ok("locks-stall-step-delegated") => locks_stall_step_delegated_config(),
         Ok("locks-nofence") => SimConfig {
             lock_ignore_fence: true,
             ..locks_partition_config()
@@ -2684,6 +2693,13 @@ fn sweep_config() {
         "locks-delegated-writes" => with_lock_writes(locks_delegated_config(), "d2"),
         "locks-released-writes" => with_lock_writes(locks_released_delegated_config(), "d2"),
         "locks-failover-backup-writes" => with_lock_writes(locks_failover_backup_config(), ""),
+        "locks-writer-hold" => locks_writer_hold_config(),
+        "locks-writer-hold-unchecked" => locks_writer_hold_unchecked_config(),
+        "locks-writer-hold-delegated" => locks_writer_hold_delegated_config(),
+        "locks-writer-hold-delegated-unsettled" => locks_writer_hold_delegated_unsettled_config(),
+        "locks-writer-hold-delegated-doubt" => locks_writer_hold_delegated_doubt_config(),
+        "locks-stall-step" => locks_stall_step_config(),
+        "locks-stall-step-delegated" => locks_stall_step_delegated_config(),
         other => panic!("sweep_config: unknown config {other}"),
     };
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -4149,6 +4165,161 @@ fn locks_pause_config() -> SimConfig {
     }
 }
 
+/// F1 (`cst-load-review` §2 F1, §5.2): the lease holder's FUSE fast path
+/// writes a turn under its lock and passes the fencing-token check, then
+/// waits for the store's writer lock behind a slow writer
+/// (`WriterLockHold`). Its core waits behind the same writer, and, served
+/// first after it (priority writes), outwaits the holder's own grant,
+/// grants the lock to the next node and executes that node's turn. The
+/// held write's own transaction comes last: it must be refused there
+/// (`LockLapsed`). Landed — the code before the check at the write, which
+/// `locks-writer-hold-unchecked` reproduces — it overwrote the next
+/// holder's turn and was answered OK (`strict_lock_turns` fails the seed:
+/// a later holder reads the older turn). Holds shorter than a grant
+/// window must land.
+fn locks_writer_hold_config() -> SimConfig {
+    let hold = |at_ms, core_ms, after_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::WriterLockHold {
+            node: 0,
+            core_ms,
+            after_ms,
+        },
+    };
+    SimConfig {
+        fast_path: sim::run::FastPath::Checked,
+        strict_lock_turns: true,
+        ops_per_client: 10,
+        lock_ios: (2, 8),
+        faults: vec![
+            hold(400, 2_600, 1_200),
+            hold(4_000, 3_400, 2_500),
+            hold(9_000, 400, 200),
+            hold(12_000, 2_200, 700),
+            hold(16_000, 5_000, 1_000),
+        ],
+        ..with_lock_writes(locks_config(), "")
+    }
+}
+
+/// F1 (review T1), the executor that did not mint the grant: the lock
+/// files are the root's, the turns go to `d2`, which node 3 sequences as
+/// its delegate. Node 3's own client writes its turn on the delegate's
+/// fast path; the write passes its check at the write and stays in its
+/// transaction, pinned, holding the writer lock (`DelegateWriteHold`),
+/// while node 3 is cut off past its grant's window. The root outwaits the
+/// grant and may grant on only after a cut with node 3's stream head as of
+/// the outwait — which node 3 reports only after its pinned write
+/// committed (`settle_tagged_writes`). The landing check
+/// (`LockGhost::check_landings`) and the turn checks fail a write that
+/// landed inside the next holder's critical section.
+fn locks_writer_hold_delegated_config() -> SimConfig {
+    let hold = |at_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::DelegateWriteHold {
+            node: 3,
+            partition_ms: 2_800,
+            after_ms: 8_000,
+        },
+    };
+    SimConfig {
+        lock_files: 2,
+        lock_ratio: 0.8,
+        lock_dir: None,
+        strict_lock_turns: true,
+        ops_per_client: 10,
+        lock_ios: (2, 8),
+        faults: vec![hold(400), hold(8_000), hold(16_000)],
+        ..with_lock_writes(delegated_config(), "d2")
+    }
+}
+
+/// [`locks_writer_hold_delegated_config`] with the settle off: positions
+/// are reported while a pinned write is still committing.
+fn locks_writer_hold_delegated_unsettled_config() -> SimConfig {
+    SimConfig {
+        settle_tagged_writes: false,
+        ..locks_writer_hold_delegated_config()
+    }
+}
+
+/// F1 (review T2): as [`locks_writer_hold_delegated_config`], but nobody
+/// is cut off and the client gives up on its held write after 700 ms — in
+/// doubt — unlocks and is recalled: the grant is left to the root's
+/// outwait (the doubt lapse) and the next holder is granted only after a
+/// cut that settles the write. (In this simulation a pinned commit ends
+/// at its node's next store write — a core step cannot block behind it —
+/// so a write still committing when the release would go out is not
+/// produced here; the release decision itself is pinned by
+/// `core::tests::locks::a_release_waits_for_the_ops_tagged_with_its_grant`.)
+fn locks_writer_hold_delegated_doubt_config() -> SimConfig {
+    let hold = |at_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::DelegateWriteHold {
+            node: 3,
+            partition_ms: 0,
+            after_ms: 4_000,
+        },
+    };
+    SimConfig {
+        lock_write_wait_ms: Some(700),
+        faults: vec![hold(400), hold(6_000), hold(12_000), hold(18_000)],
+        ..locks_writer_hold_delegated_config()
+    }
+}
+
+/// F1's non-vacuity knob: [`locks_writer_hold_config`] with the token
+/// check at the write off (the code before it).
+fn locks_writer_hold_unchecked_config() -> SimConfig {
+    SimConfig {
+        tag_check_at_write: false,
+        ..locks_writer_hold_config()
+    }
+}
+
+/// F1, F8 (`cst-load-review` §5.2 `locks-stall-step`): steps that take
+/// their `now`, then wait (in the store, or stopped) before deciding with
+/// it, on the lease holder (every grant's owner, and the executor of the
+/// turns) and on lock holders — around half a grant window, a window, and
+/// past one. A step's stale `now` must never let a write past its grant's
+/// end land (the check at the write reads the clock there), nor shorten a
+/// window anyone honours.
+fn locks_stall_step_config() -> SimConfig {
+    let stall = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node, for_ms },
+    };
+    SimConfig {
+        strict_lock_turns: true,
+        ops_per_client: 10,
+        lock_ios: (4, 12),
+        lock_io_ms: (20, 150),
+        faults: vec![
+            stall(500, 0, 500),
+            stall(2_000, 2, 1_000),
+            stall(4_000, 0, 2_100),
+            stall(6_500, 3, 2_100),
+            stall(9_000, 0, 1_100),
+            stall(11_000, 2, 3_000),
+        ],
+        ..with_lock_writes(locks_config(), "")
+    }
+}
+
+/// [`locks_stall_step_config`] with the lock files in `d1` (node 2's) and
+/// the turns in `d2` (node 3's): the turns' executor never minted the
+/// grants and judges their tokens by the window, on a clock its stalled
+/// step read before it waited.
+fn locks_stall_step_delegated_config() -> SimConfig {
+    SimConfig {
+        faults: locks_stall_step_config().faults,
+        strict_lock_turns: true,
+        lock_ios: (4, 12),
+        lock_io_ms: (20, 150),
+        ..with_lock_writes(locks_delegated_config(), "d2")
+    }
+}
+
 /// `stress-ng-fs-faults` (bug B): short S3 outages of the whole cluster
 /// (P2P stays up), each long enough for a continuation epoch carrying
 /// the holder's lease, under the lock workload with long critical
@@ -4503,6 +4674,14 @@ struct M14Totals {
     renew_held: u64,
     renew_probes: u64,
     renew_refused: u64,
+    /// F1: see `Report::held_writes`; recalled grants left to the
+    /// outwait (an op tagged with them in doubt).
+    held_writes: u64,
+    held_refused: u64,
+    held_accepted: u64,
+    doubt_lapses: u64,
+    token_rejections_at_write: u64,
+    settle_waits: u64,
 }
 
 impl M14Totals {
@@ -4559,7 +4738,13 @@ impl M14Totals {
             self.renew_held += s.renew_held;
             self.renew_probes += s.renew_probes;
             self.renew_refused += s.renew_refused;
+            self.doubt_lapses += s.lock_doubt_lapses;
         }
+        self.held_writes += r.held_writes;
+        self.held_refused += r.held_refused;
+        self.held_accepted += r.held_accepted;
+        self.token_rejections_at_write += r.token_rejections_at_write;
+        self.settle_waits += r.settle_waits;
         self.max_simulated_ms = self.max_simulated_ms.max(r.simulated_ms);
     }
 }
@@ -5015,6 +5200,142 @@ fn locks_blips_tight_in_doubt_seeds_acquire() {
 fn locks_under_random_faults() {
     let t = run_m14("locks-faults", locks_faults_config(), 95_000..95_120);
     assert!(t.grants > 500, "{t:?}");
+}
+
+/// F1: a fast-path write held behind a slow writer past its grant's end
+/// is refused at the write; the next holder's turn survives
+/// (`strict_lock_turns`), mutual exclusion holds.
+#[test]
+fn locks_writer_hold_refuses_the_held_write() {
+    let t = run_m14(
+        "locks-writer-hold",
+        locks_writer_hold_config(),
+        230_000..230_060,
+    );
+    assert!(t.held_writes > 60, "writes were rarely held: {t:?}");
+    assert!(
+        t.held_refused > 0,
+        "no held write was refused at the write: {t:?}"
+    );
+    assert!(t.held_accepted > 0, "no short hold landed: {t:?}");
+    assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
+}
+
+/// F1 (review T1): a delegate's write held in its transaction under a
+/// lock the root minted, while the delegate is cut off past the grant's
+/// window: the next holder never gets the lock before the write is under
+/// its floor.
+#[test]
+fn locks_writer_hold_delegated_settles_before_the_head() {
+    let t = run_m14(
+        "locks-writer-hold-delegated",
+        locks_writer_hold_delegated_config(),
+        233_000..233_040,
+    );
+    assert!(t.held_writes > 20, "writes were rarely held: {t:?}");
+    assert!(
+        t.settle_waits > 0,
+        "no position waited for a held write: {t:?}"
+    );
+    assert_eq!(t.clients.stale_turn_reads, 0, "{t:?}");
+}
+
+/// F1 (review T1), the settle's fail-before: the seeds where, with
+/// `settle_tagged_writes` off, the delegate reported its stream head while
+/// its pinned write was still committing, the root granted on from it,
+/// and the write landed in the next holder's critical section (found by a
+/// 2000-seed sweep of `locks-writer-hold-delegated-unsettled`). Each
+/// passes with the settle.
+#[test]
+fn locks_writer_hold_delegated_without_the_settle_is_caught() {
+    let seeds = [504, 534, 583, 910, 979, 1147, 1265];
+    let mut caught = 0;
+    for seed in seeds {
+        if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
+            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+            caught += 1;
+        }
+        run_seed(seed, locks_writer_hold_delegated_config())
+            .unwrap_or_else(|e| panic!("locks-writer-hold-delegated seed {seed}: {e}"));
+    }
+    assert!(
+        caught > 0,
+        "no write landed under the next holder without the settle"
+    );
+}
+
+/// F1 (review T2): the held delegate write's client gives up on it (in
+/// doubt) and unlocks; the recalled grant is left to the root's outwait.
+#[test]
+fn locks_writer_hold_delegated_doubt_lapses_the_grant() {
+    let t = run_m14(
+        "locks-writer-hold-delegated-doubt",
+        locks_writer_hold_delegated_doubt_config(),
+        234_000..234_040,
+    );
+    assert!(t.held_writes > 20, "writes were rarely held: {t:?}");
+    assert!(
+        t.doubt_lapses > 0,
+        "no grant was left to the outwait: {t:?}"
+    );
+}
+
+/// F1's fail-before: without the check at the write, a held write lands
+/// after the next holder's turn and its application is told it succeeded.
+#[test]
+fn locks_writer_hold_without_the_check_at_write_is_caught() {
+    let mut caught = 0;
+    for seed in 230_000..230_060 {
+        if let Err(e) = run_seed(seed, locks_writer_hold_unchecked_config()) {
+            eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+            caught += 1;
+        }
+    }
+    assert!(
+        caught > 0,
+        "a held write past its grant never landed over the next holder's"
+    );
+}
+
+/// The seeds the first sweeps of the F1 configurations failed, on two
+/// older bugs: a late lock reply honoured from its arrival (stall-step
+/// 1934: two exclusive holders) and an own grant dropped unreleased
+/// without a floor (stall-step 826, 1843; writer-hold 195, 1139: a stale
+/// turn read).
+#[test]
+fn regression_f1_stall_seeds() {
+    for (label, cfg, seed) in [
+        ("locks-stall-step", locks_stall_step_config(), 1934),
+        ("locks-stall-step", locks_stall_step_config(), 826),
+        ("locks-stall-step", locks_stall_step_config(), 1843),
+        ("locks-writer-hold", locks_writer_hold_config(), 195),
+        ("locks-writer-hold", locks_writer_hold_config(), 1139),
+    ] {
+        run_seed(seed, cfg).unwrap_or_else(|e| panic!("{label} seed {seed}: {e}"));
+    }
+}
+
+/// F1, F8: stalled steps (a `now` read before a wait in the store) on
+/// grant owners, executors and holders keep mutual exclusion and the
+/// turns, the executor judging tokens by the window included.
+#[test]
+fn locks_survive_stalled_steps() {
+    for (label, cfg, seeds) in [
+        (
+            "locks-stall-step",
+            locks_stall_step_config(),
+            231_000..231_040,
+        ),
+        (
+            "locks-stall-step-delegated",
+            locks_stall_step_delegated_config(),
+            232_000..232_040,
+        ),
+    ] {
+        let t = run_m14(label, cfg, seeds);
+        assert!(t.grants > 300, "{label}: {t:?}");
+        assert!(t.clients.turn_reads > 0, "{label}: {t:?}");
+    }
 }
 
 /// Plan 30 §M14: paused nodes (late replies and pushes, stalled

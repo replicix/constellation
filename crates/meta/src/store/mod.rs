@@ -99,7 +99,7 @@
 pub(crate) mod atime;
 pub mod backup;
 mod bootstrap;
-mod gate;
+pub(crate) mod gate;
 pub use gate::{priority_writes, PriorityStats};
 pub mod held;
 pub mod inbox;

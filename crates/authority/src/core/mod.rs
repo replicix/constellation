@@ -898,6 +898,9 @@ pub struct Stats {
     pub lock_renewals: u64,
     pub lock_lost: u64,
     pub lock_released: u64,
+    /// F1: recalled grants left to their owner's outwait instead of
+    /// released (a mutation tagged with them ended in doubt).
+    pub lock_doubt_lapses: u64,
     pub lock_idle_released: u64,
     pub lock_released_replies: u64,
     // ---- M9: backups, seals, `ack=s3` ----

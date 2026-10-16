@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test seams for other crates' tests (the authority simulation, the
+# engine's unit tests), enabled from their dev-dependencies: hooks that
+# park a write between its checks and its commit, and switches for the F1
+# checks (`set_tag_check_at_write_for_tests`, `set_settle_for_tests`).
+test-util = []
+
 [dependencies]
 constellation-fs-core.workspace = true
 constellation-mtree.workspace = true

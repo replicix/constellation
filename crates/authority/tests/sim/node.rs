@@ -160,6 +160,60 @@ pub struct Shared {
     pub fast_path_executed: AtomicU64,
     /// Every `InDoubt` reply of any incarnation (see `NodeEnv`).
     pub in_doubt: InDoubtLog,
+    /// F1 (`StallStep`): the next event this node handles takes its `now`,
+    /// then waits this long (ms) before the core handles it — a step that
+    /// waited in the store, or a process stopped between its clock read
+    /// and its writes.
+    stall_next: Mutex<Option<u64>>,
+    /// F1 (`WriterLockHold`): the next fast-path write here carrying a
+    /// fencing token passes its check and then waits `(.1)` ms for the
+    /// store's writer lock, while the core's next step waits `(.0)` ms
+    /// behind the same slow writer (and goes first after it: priority
+    /// writes).
+    hold_next: Mutex<Option<(u64, u64)>>,
+    /// Writes held that way, and those of them then refused at the write
+    /// (`LockLapsed`) or executed (`Accepted`).
+    pub held_writes: AtomicU64,
+    pub held_refused: AtomicU64,
+    pub held_accepted: AtomicU64,
+    /// F1 (a held delegate write): the write parked inside its
+    /// transaction, pinned, with the store's writer lock, until a writer
+    /// that waits for that lock (`Meta::set_writer_wait_hook_for_tests`)
+    /// or its time lets it go.
+    held_ctl: Mutex<Option<HeldCtl>>,
+    /// F1 (`DelegateWriteHold`): cut this delegate from `(.0)` (the root)
+    /// for `(.1)` ms once its held write is pinned.
+    hold_partition: Mutex<Option<(NodeId, u64)>>,
+    /// F1: every held write that landed (executed), `(rid, simulated ms)`,
+    /// for the ghost's check that none landed inside another node's
+    /// critical section (`LockGhost::check_landings`).
+    pub landed: Mutex<Vec<(Rid, u64)>>,
+}
+
+/// See `Shared::held_ctl`.
+struct HeldCtl {
+    go: std::sync::mpsc::Sender<bool>,
+    committed: std::sync::mpsc::Receiver<()>,
+    thread: std::thread::ThreadId,
+}
+
+/// The writer-wait hook: a writer other than the held write's own thread
+/// waits for its commit, as every writer waits for a slow commit holding
+/// the lock.
+fn release_held_ctl(shared: &Shared) {
+    let ctl = {
+        let mut g = shared.held_ctl.lock().unwrap();
+        if g.as_ref()
+            .is_some_and(|c| c.thread == std::thread::current().id())
+        {
+            return;
+        }
+        g.take()
+    };
+    if let Some(c) = ctl {
+        let _ = c.go.send(true);
+        let _ = c.committed.recv();
+    }
 }
 
 /// Every `InDoubt` reply a node's core sent: `(node, rid, the log
@@ -196,6 +250,10 @@ pub struct NodeEnv {
     pub seed: u64,
     /// Fix "capture under an epoch hold": the modelled chunks.
     pub world: Arc<ChunkWorld>,
+    /// F1's non-vacuity knob (`SimConfig::tag_check_at_write`).
+    pub tag_check_at_write: bool,
+    /// F1's other one (`SimConfig::settle_tagged_writes`).
+    pub settle_tagged_writes: bool,
 }
 
 impl NodeEnv {
@@ -255,7 +313,28 @@ impl NodeHandle {
             epoch: Mutex::new(epoch),
             fast_path_executed: AtomicU64::new(0),
             in_doubt: env.in_doubt.clone(),
+            stall_next: Mutex::new(None),
+            hold_next: Mutex::new(None),
+            held_writes: AtomicU64::new(0),
+            held_refused: AtomicU64::new(0),
+            held_accepted: AtomicU64::new(0),
+            held_ctl: Mutex::new(None),
+            hold_partition: Mutex::new(None),
+            landed: Mutex::new(Vec::new()),
         });
+        {
+            let shared = shared.clone();
+            meta.set_writer_wait_hook_for_tests(Some(Arc::new(move || release_held_ctl(&shared))));
+        }
+        // F1: the token check at the write reads this node's clock, as
+        // the daemon's reads its wall clock.
+        {
+            let clock = env.clock_of(id);
+            meta.locks().set_clock(Arc::new(move || clock.now().0));
+            meta.locks()
+                .set_tag_check_at_write_for_tests(env.tag_check_at_write);
+            meta.locks().set_settle_for_tests(env.settle_tagged_writes);
+        }
         env.bus.attach(id, tx.clone());
         env.world.register(id, meta.clone());
         let cfg = (env.config)(id, incarnation);
@@ -280,6 +359,7 @@ impl NodeHandle {
             events_handled: 0,
             panic_after_events: env.panic_after_events,
             fast_path: env.fast_path,
+            held: None,
         };
         let task = tokio::spawn(driver.run());
         NodeHandle {
@@ -377,6 +457,25 @@ impl NodeHandle {
             .is_some_and(|until| tokio::time::Instant::now() < until)
     }
 
+    /// F1 (`StallStep`): see `Shared::stall_next`.
+    pub fn stall_next_step(&self, for_ms: u64) {
+        *self.shared.stall_next.lock().unwrap() = Some(for_ms);
+    }
+
+    /// F1 (`WriterLockHold`): see `Shared::hold_next`.
+    pub fn hold_next_tagged_write(&self, core_ms: u64, write_ms: u64) {
+        *self.shared.hold_next.lock().unwrap() = Some((core_ms, write_ms));
+    }
+
+    /// F1 (`DelegateWriteHold`): the next tagged write this delegate
+    /// executes on its fast path is held inside its transaction for
+    /// `write_ms` (unless a writer lets it commit first), and the node is
+    /// cut from `root` for `partition_ms` once it is.
+    pub fn hold_next_delegate_write(&self, root: NodeId, partition_ms: u64, write_ms: u64) {
+        *self.shared.hold_partition.lock().unwrap() = Some((root, partition_ms));
+        *self.shared.hold_next.lock().unwrap() = Some((0, write_ms));
+    }
+
     /// Paused, and since at least `d` ago.
     pub fn paused_for(&self, d: std::time::Duration) -> bool {
         self.paused()
@@ -418,6 +517,88 @@ struct Driver {
     events_handled: u64,
     panic_after_events: Option<u64>,
     fast_path: super::run::FastPath,
+    /// F1: the fast-path write held behind the slow writer, if any.
+    held: Option<HeldWrite>,
+}
+
+/// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
+/// its fencing-token check and waits for the store's writer lock behind a
+/// slow writer. It runs `execute_tagged` on an OS thread of its own, parked
+/// by `set_before_write_hook_for_tests` between that check and its
+/// transaction, holding nothing; the driver goes on meanwhile and lets it
+/// go at `release_at`, waiting for it to finish (so nothing else of the
+/// simulation runs alongside its transaction: deterministic).
+struct HeldWrite {
+    rid: Rid,
+    op: MutateOp,
+    epoch: u64,
+    /// A delegate's write (parked inside its transaction, `Shared::held_ctl`
+    /// holds its go), and its generation.
+    deleg: Option<u64>,
+    shared: Arc<Shared>,
+    release_at: tokio::time::Instant,
+    go: Option<std::sync::mpsc::Sender<bool>>,
+    phase: std::sync::mpsc::Receiver<HeldPhase>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+enum HeldPhase {
+    /// Past the check before the op (or, a delegate's, pinned inside its
+    /// transaction), waiting at the hook.
+    Checked,
+    /// The outcome, a delegate's stream index, and when its transaction
+    /// was over (simulated ms).
+    Done(MutateOutcome, Option<u64>, u64),
+}
+
+impl HeldWrite {
+    /// Let it go (if a writer has not already) and wait for its outcome.
+    fn finish(mut self) -> (MutateOutcome, Option<u64>, u64) {
+        if let Some(go) = self.go.take() {
+            let _ = go.send(true);
+        }
+        if self.deleg.is_some() {
+            release_held_ctl(&self.shared);
+        }
+        let outcome = loop {
+            match self.phase.recv() {
+                Ok(HeldPhase::Done(o, idx, at)) => break (o, idx, at),
+                Ok(HeldPhase::Checked) => continue,
+                Err(_) => break (MutateOutcome::Errno(constellation_types::Code::Io), None, 0),
+            }
+        };
+        if let Some(t) = self.thread.take() {
+            t.join().expect("held write thread");
+        }
+        outcome
+    }
+}
+
+impl Drop for HeldWrite {
+    /// The node died with the write still waiting: it never runs.
+    fn drop(&mut self) {
+        if let Some(go) = self.go.take() {
+            let _ = go.send(false);
+        }
+        if let Some(c) = self.shared.held_ctl.lock().unwrap().take() {
+            let _ = c.go.send(false);
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn outcome_of(
+    r: Result<Vec<constellation_meta::LogRecord>, constellation_meta::MetaError>,
+    epoch: u64,
+) -> MutateOutcome {
+    match r {
+        Ok(records) => MutateOutcome::Accepted { epoch, records },
+        Err(constellation_meta::MetaError::Conflict) => MutateOutcome::Conflict { manifest: None },
+        Err(constellation_meta::MetaError::LockLapsed) => MutateOutcome::LockLapsed,
+        Err(e) => MutateOutcome::Errno(e.code()),
+    }
 }
 
 impl Driver {
@@ -500,7 +681,23 @@ impl Driver {
                 }
             });
         }
-        while let Some(event) = self.rx.recv().await {
+        loop {
+            // F1: a held fast-path write goes on at its time, between
+            // events (`HeldWrite`).
+            let event = match self.held.as_ref().map(|h| h.release_at) {
+                Some(at) => tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(at) => {
+                        self.release_held();
+                        continue;
+                    }
+                    e = self.rx.recv() => e,
+                },
+                None => self.rx.recv().await,
+            };
+            let Some(event) = event else {
+                break;
+            };
             if self.bootstrap.is_some() && matches!(event, Event::Submit { .. }) {
                 self.deferred.push(event);
                 continue;
@@ -513,6 +710,18 @@ impl Driver {
                 *self.shared.paused_until.lock().unwrap() = None;
             }
             let now = self.clock.now();
+            // F1 (`StallStep`): this step's `now` is taken; then it waits
+            // (in the store, or stopped), and decides with that `now`.
+            let stall = self.shared.stall_next.lock().unwrap().take();
+            if let Some(ms) = stall {
+                tracing::debug!(
+                    node = self.id,
+                    now = now.0,
+                    ms,
+                    "sim: step stalled after its clock read"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
             let debug = tracing::enabled!(tracing::Level::DEBUG);
             let debug_event = if debug {
                 format!("{event:?}")
@@ -779,6 +988,19 @@ impl Driver {
         event: &Event,
     ) -> Option<Vec<Action>> {
         use super::run::FastPath;
+        if let Event::Submit {
+            rid,
+            op,
+            policy: Policy::Client,
+            tag,
+        } = event
+        {
+            if !tag.is_empty() && self.held.is_none() {
+                if let Some(actions) = self.delegate_hold(now, *rid, op, tag) {
+                    return Some(actions);
+                }
+            }
+        }
         if self.fast_path == FastPath::Off {
             return None;
         }
@@ -803,16 +1025,264 @@ impl Driver {
             FastPath::Checked => Some(self.meta.root_fast_path(op)?),
             _ => None,
         };
-        let outcome =
-            match constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now.0) {
-                Ok(records) => MutateOutcome::Accepted { epoch, records },
-                Err(constellation_meta::MetaError::Conflict) => {
-                    MutateOutcome::Conflict { manifest: None }
-                }
-                Err(constellation_meta::MetaError::LockLapsed) => MutateOutcome::LockLapsed,
-                Err(e) => MutateOutcome::Errno(e.code()),
-            };
+        // F1 (`WriterLockHold`): this write waits for the writer lock
+        // behind a slow writer, past its check. (The delegation gate is
+        // not held across the wait: the configurations that hold writes
+        // delegate nothing.)
+        if !tag.is_empty() && self.held.is_none() {
+            let hold = self.shared.hold_next.lock().unwrap().take();
+            if let Some((core_ms, write_ms)) = hold {
+                drop(admission);
+                return Some(self.hold_write(now, *rid, op, tag, epoch, core_ms, write_ms));
+            }
+        }
+        let outcome = outcome_of(
+            constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now.0),
+            epoch,
+        );
         drop(admission);
+        Some(self.fast_path_done(now, *rid, op, outcome))
+    }
+
+    /// F1: start the held write (`HeldWrite`) and stall the core's next
+    /// step behind the same writer. Refused by its check before the
+    /// wait, it is answered at once.
+    #[allow(clippy::too_many_arguments)]
+    fn hold_write(
+        &mut self,
+        now: constellation_authority::Ms,
+        rid: Rid,
+        op: &MutateOp,
+        tag: &LockTag,
+        epoch: u64,
+        core_ms: u64,
+        write_ms: u64,
+    ) -> Vec<Action> {
+        let (phase_tx, phase) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<bool>();
+        let rt = tokio::runtime::Handle::current();
+        let thread = {
+            let (meta, op, tag) = (self.meta.clone(), op.clone(), tag.clone());
+            let checked = phase_tx.clone();
+            let clock = self.clock;
+            std::thread::spawn(move || {
+                // The node's clock is the runtime's paused one.
+                let _rt = rt.enter();
+                constellation_meta::set_before_write_hook_for_tests(Some(Box::new(move || {
+                    let _ = checked.send(HeldPhase::Checked);
+                    go_rx.recv().unwrap_or(false)
+                })));
+                let r = constellation_meta::execute_tagged(&meta, &op, Some(rid), &tag, now.0);
+                constellation_meta::set_before_write_hook_for_tests(None);
+                let _ = phase_tx.send(HeldPhase::Done(
+                    outcome_of(r, epoch),
+                    None,
+                    clock.elapsed_ms(),
+                ));
+            })
+        };
+        let mut held = HeldWrite {
+            rid,
+            op: op.clone(),
+            epoch,
+            deleg: None,
+            shared: self.shared.clone(),
+            release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
+            go: Some(go),
+            phase,
+            thread: Some(thread),
+        };
+        match held.phase.recv() {
+            Ok(HeldPhase::Checked) => {
+                tracing::debug!(
+                    node = self.id,
+                    ?rid,
+                    core_ms,
+                    write_ms,
+                    "sim: a tagged fast-path write passed its check and waits for the writer lock"
+                );
+                self.shared.held_writes.fetch_add(1, Ordering::Relaxed);
+                *self.shared.stall_next.lock().unwrap() = Some(core_ms);
+                self.held = Some(held);
+                Vec::new()
+            }
+            Ok(HeldPhase::Done(outcome, _, _)) => {
+                held.go = None;
+                if let Some(t) = held.thread.take() {
+                    t.join().expect("held write thread");
+                }
+                self.fast_path_done(now, rid, op, outcome)
+            }
+            Err(_) => panic!("held write thread vanished"),
+        }
+    }
+
+    /// F1 (`WriterLockHold` on a delegate): the delegate's own client's
+    /// write under a lock another sequencer minted, on the delegate's
+    /// fast path (`View`'s `delegate_execute`), held *inside* its
+    /// transaction — checked at the write, pinned, the writer lock held —
+    /// as a slow commit keeps it. The core goes on; the first writer that
+    /// waits for the lock (a settle, a segment, a forward) lets it commit
+    /// first, as it would wait for it. `None`: no hold armed, or the op is
+    /// not this delegate's to execute here.
+    fn delegate_hold(
+        &mut self,
+        now: constellation_authority::Ms,
+        rid: Rid,
+        op: &MutateOp,
+        tag: &LockTag,
+    ) -> Option<Vec<Action>> {
+        if self.shared.hold_next.lock().unwrap().is_none() {
+            return None;
+        }
+        let constellation_meta::delegation::Ownership::Delegated(d) =
+            self.meta.resolve_ownership(&TouchSet::from_op(op))
+        else {
+            return None;
+        };
+        if d.node != self.id {
+            return None;
+        }
+        let gen = d.gen;
+        let view = self.core.deleg_view();
+        if !view.mine.iter().any(|m| m.1 == gen && !m.3 && now.0 < m.2) {
+            return None;
+        }
+        let session = self.meta.session();
+        let deps = session.deps().filter(|dp| session.reaches(dp))?;
+        let (_, write_ms) = self.shared.hold_next.lock().unwrap().take()?;
+        let epoch = self.core.ship().max_epoch.max(1);
+        let (phase_tx, phase) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<bool>();
+        let (committed_tx, committed) = std::sync::mpsc::channel::<()>();
+        let rt = tokio::runtime::Handle::current();
+        let thread = {
+            let (meta, op, tag) = (self.meta.clone(), op.clone(), tag.clone());
+            let checked = phase_tx.clone();
+            let mut go_rx = Some(go_rx);
+            let clock = self.clock;
+            std::thread::spawn(move || {
+                let _rt = rt.enter();
+                constellation_meta::write_check_hook::set(Some(Box::new(move |at| {
+                    if at != constellation_meta::write_check_hook::At::Pinned {
+                        return true;
+                    }
+                    let _ = checked.send(HeldPhase::Checked);
+                    go_rx.take().is_none_or(|rx| rx.recv().unwrap_or(false))
+                })));
+                let r = meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now.0);
+                constellation_meta::write_check_hook::set(None);
+                let at = clock.elapsed_ms();
+                let _ = committed_tx.send(());
+                let idx = r.as_ref().ok().map(|(_, idx)| *idx);
+                let _ = phase_tx.send(HeldPhase::Done(
+                    outcome_of(r.map(|(records, _)| records), epoch),
+                    idx,
+                    at,
+                ));
+            })
+        };
+        let tid = thread.thread().id();
+        let mut held = HeldWrite {
+            rid,
+            op: op.clone(),
+            epoch,
+            deleg: Some(gen),
+            shared: self.shared.clone(),
+            release_at: tokio::time::Instant::now() + std::time::Duration::from_millis(write_ms),
+            go: None,
+            phase,
+            thread: Some(thread),
+        };
+        match held.phase.recv() {
+            Ok(HeldPhase::Checked) => {
+                tracing::debug!(
+                    node = self.id,
+                    ?rid,
+                    gen,
+                    write_ms,
+                    "sim: a delegate's tagged write is pinned in its transaction (a slow commit)"
+                );
+                *self.shared.held_ctl.lock().unwrap() = Some(HeldCtl {
+                    go,
+                    committed,
+                    thread: tid,
+                });
+                // Cut from every other node (the root first among them):
+                // nothing reaches it that would make it write, so the held
+                // commit lasts until the node's own next writer.
+                let cut = self.shared.hold_partition.lock().unwrap().take();
+                if let Some((_, ms)) = cut.filter(|(_, ms)| *ms > 0) {
+                    let me = self.id;
+                    let others: Vec<NodeId> =
+                        self.bus.nodes().into_iter().filter(|n| *n != me).collect();
+                    for n in &others {
+                        self.bus.set_partition(me, *n, true);
+                    }
+                    let bus = self.bus.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        for n in others {
+                            bus.set_partition(me, n, false);
+                        }
+                    });
+                }
+                self.shared.held_writes.fetch_add(1, Ordering::Relaxed);
+                self.held = Some(held);
+                Some(Vec::new())
+            }
+            Ok(HeldPhase::Done(outcome, idx, _)) => {
+                if let Some(t) = held.thread.take() {
+                    t.join().expect("held write thread");
+                }
+                if let Some(idx) = idx {
+                    session.note_stream(gen, idx);
+                }
+                Some(self.fast_path_done(now, rid, op, outcome))
+            }
+            Err(_) => panic!("held write thread vanished"),
+        }
+    }
+
+    /// F1: the held write's turn came: it runs its transaction now.
+    fn release_held(&mut self) {
+        let Some(held) = self.held.take() else {
+            return;
+        };
+        let (rid, op) = (held.rid, held.op.clone());
+        let _ = held.epoch;
+        let deleg = held.deleg;
+        let (outcome, idx, landed_at) = held.finish();
+        match &outcome {
+            MutateOutcome::LockLapsed => {
+                self.shared.held_refused.fetch_add(1, Ordering::Relaxed);
+            }
+            MutateOutcome::Accepted { .. } => {
+                self.shared.held_accepted.fetch_add(1, Ordering::Relaxed);
+                // When it landed: a writer may have let it commit before
+                // its time (`Shared::held_ctl`).
+                self.shared.landed.lock().unwrap().push((rid, landed_at));
+            }
+            _ => {}
+        }
+        if let (Some(gen), Some(idx)) = (deleg, idx) {
+            self.meta.session().note_stream(gen, idx);
+        }
+        tracing::debug!(node = self.id, ?rid, ?outcome, "sim: the held write ran");
+        let now = self.clock.now();
+        let actions = self.fast_path_done(now, rid, &op, outcome);
+        self.dispatch(actions);
+    }
+
+    /// The fast path's answer to an op it executed: the acknowledgement
+    /// to the core and the reply.
+    fn fast_path_done(
+        &mut self,
+        now: constellation_authority::Ms,
+        rid: Rid,
+        op: &MutateOp,
+        outcome: MutateOutcome,
+    ) -> Vec<Action> {
         self.shared
             .fast_path_executed
             .fetch_add(1, Ordering::Relaxed);
@@ -827,10 +1297,10 @@ impl Driver {
             &*self.meta,
         );
         actions.push(Action::Reply {
-            rid: *rid,
+            rid,
             reply: ClientReply::Outcome(outcome),
         });
-        Some(actions)
+        actions
     }
 
     fn dispatch(&mut self, actions: Vec<Action>) {

@@ -3098,7 +3098,58 @@ grants were dropped (`SWEEP-LATE-HANDBACK`); `locks-unlinked-delegated-partition
 seed 7455 (two exclusive holders after such an answer revived a lapsed
 grant) and seeds that take that path are pinned in
 `regression_locks_unlinked_delegated_partition_late_recall_answer`
-(unlinked-exclusion-7455). Replay one with
+(unlinked-exclusion-7455). Load review F1, the token at the write, has
+two faults of its own. `StallStep` makes a node's next step take its
+`now`, then wait, then decide with it. `WriterLockHold` makes the lease
+holder's next tagged fast-path write pass its check, then wait for the
+writer lock behind a slow writer on a thread of its own, while the core
+waits behind the same writer and then goes first.
+`locks-writer-hold` holds the root's own turn writes past its grant: the
+core outwaits the grant, grants the next node and executes its turn,
+and the held write must then be refused at the write
+(`locks_writer_hold_refuses_the_held_write`, which counts held, refused
+and landed writes). Its non-vacuity twin `locks-writer-hold-unchecked`
+switches that check off (`SimConfig::tag_check_at_write`) and fails 1971
+of 2000 seeds with a stale turn read
+(`locks_writer_hold_without_the_check_at_write_is_caught`). Both run with
+`strict_lock_turns`: a turn whose write was answered `Accepted` is never
+excused as an unacknowledged late landing. Every held write that landed
+is also checked against the critical sections and acknowledged turns of
+the other nodes (`LockGhost::check_landings`): it must not land inside the
+next holder's section, nor over its acknowledged turn. `DelegateWriteHold`
+holds a write of a delegate's own client, under a lock the root minted,
+*inside* its transaction: checked at the write, pinned, the writer lock
+held. The node's next other writer lets it commit first, since a core step
+cannot block in the simulation. The node is cut off past the grant's
+window, so the root outwaits the grant and may grant on only after the
+delegate's stream head covers the write; the delegate's renewal settles
+the pinned write before it reads its head.
+`locks-writer-hold-delegated` stays clean
+(`locks_writer_hold_delegated_settles_before_the_head`). Its twin
+`locks-writer-hold-delegated-unsettled` switches the settle off
+(`SimConfig::settle_tagged_writes`) and fails 7 of 2000 seeds. They are
+pinned in `locks_writer_hold_delegated_without_the_settle_is_caught`, and
+each passes with the settle. `locks-writer-hold-delegated-doubt` has the
+client give up on the held write (in doubt), so the recalled grant takes
+the doubt lapse (`locks_writer_hold_delegated_doubt_lapses_the_grant`).
+Its released twin cannot fail here, because a pinned commit ends at the
+node's next store write. The release decision is pinned in core tests.
+`locks-stall-step` and `locks-stall-step-delegated` (the turns' executor
+judges tokens by the window) stall the steps of owners, executors and
+holders across grant windows (`locks_survive_stalled_steps`). Their
+cleanliness does not depend on the check at the write: the core handles
+one step at a time and reports positions only from later steps. They pin
+the stale-`now` audit of load review F8. Their first 2000-seed sweeps
+found two older bugs, both fixed and pinned in core tests. A late reply
+was honoured from its arrival rather than its request's send (seed 1934,
+`a_late_reply_counts_its_window_from_its_request`). The owner's own
+grant, dropped unreleased after a stall, left no floor (seeds 826, 1843,
+and `locks-writer-hold` 195, 1139:
+`an_own_grant_dropped_unreleased_leaves_its_release_floor`). The model's `delayed_io` and
+`token_check_at_write` knobs check the same argument exhaustively
+(`delayed_io_without_the_write_check_violates`,
+`delayed_io_with_the_write_check_is_clean` in `crates/model/tests/locks.rs`).
+Replay one with
 `AUTHORITY_SIM_SEED=<seed> AUTHORITY_SIM_CONFIG=<config> RUST_LOG=sim=debug,constellation_authority::core::locks=debug cargo test -p constellation-authority --release --test sim replay_seed -- --nocapture --exact`.
 
 Harness scenarios (the harness process is the application: it calls

@@ -889,3 +889,77 @@ fn a_nonowner_fallocate_never_asks_for_the_lease() {
     let ws = fs.writes.lock(file.ino);
     assert_eq!(ws.get(&file.ino).unwrap().file_len, 1 << 20);
 }
+
+/// F1/F9: the fast path judges its lease again once the op's transaction
+/// holds the store's writer lock. One that ran out while the op waited for
+/// the lock (a slow writer ahead of it) journals nothing locally — a row a
+/// takeover would strand and replay — and sends the op through the core
+/// under the same rid, as an op refused at admission goes.
+#[test]
+fn a_lease_that_ran_out_before_the_write_sends_the_op_through_the_core() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    let lease = fs.sync.as_ref().unwrap().lease.clone();
+    let before = meta.journal_len().unwrap();
+    let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    let mut submitted = 0;
+    std::thread::scope(|scope| {
+        let op = scope.spawn(|| {
+            // Admitted; then, waiting for the writer lock, the lease runs
+            // out (the core mirrors a lease it no longer holds).
+            constellation_meta::set_before_write_hook_for_tests(Some(Box::new(move || {
+                lease.mirror(
+                    &LeaseState::default(),
+                    Ms(now_unix_ms()),
+                    &Config::defaults(1, 1),
+                    false,
+                );
+                true
+            })));
+            let r = fs.mutate_op(
+                ROOT_INO,
+                constellation_meta::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "late".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            );
+            constellation_meta::set_before_write_hook_for_tests(None);
+            r
+        });
+        let started = std::time::Instant::now();
+        loop {
+            match core.try_recv() {
+                Ok(SyncRequest::Submit { op, reply, .. }) => {
+                    assert!(matches!(op, constellation_meta::MutateOp::Create { .. }));
+                    assert_eq!(
+                        meta.journal_len().unwrap(),
+                        before,
+                        "journaled locally under a lease that ran out"
+                    );
+                    submitted += 1;
+                    reply
+                        .send(constellation_authority::ClientReply::Outcome(
+                            constellation_meta::MutateOutcome::Accepted {
+                                epoch: 1,
+                                records: Vec::new(),
+                            },
+                        ))
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(_) if op.is_finished() => break,
+                Err(_) => {
+                    assert!(started.elapsed() < Duration::from_secs(10), "stuck");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        op.join().unwrap().unwrap();
+    });
+    assert_eq!(submitted, 1, "the op went through the core once");
+    assert!(meta.lookup(ROOT_INO, "late").unwrap().is_none());
+}

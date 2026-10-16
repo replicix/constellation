@@ -19,9 +19,11 @@ pub mod store;
 
 pub use constellation_mtree::keys::snapshot_id;
 pub use error::MetaError;
+#[cfg(any(test, feature = "test-util"))]
+pub use mutate::set_before_write_hook_for_tests;
 pub use mutate::{
-    execute as execute_mutate, execute_tagged, MutateOp, MutateOutcome, OwnChunks, OwnRows, OwnTx,
-    OWN_ROWS_CAP,
+    execute as execute_mutate, execute_admitted, execute_tagged, MutateOp, MutateOutcome,
+    OwnChunks, OwnRows, OwnTx, OWN_ROWS_CAP,
 };
 pub use prune::{Policy, PolicyError, PRUNE_XATTR};
 pub use readdeleg::{
@@ -40,6 +42,8 @@ pub use snapsched::{SnapPolicy, SNAPSHOT_POLICY_XATTR};
 pub use store::backup::{BackupRole, BackupTx};
 pub use store::held::{DroppedHeld, HeldInode, HeldSummary};
 pub use store::inbox::{CompletedOutcome, InboxAck, InboxAckArmed};
+#[cfg(any(test, feature = "test-util"))]
+pub use store::journal::write_check_hook;
 pub use store::remote::RemoteBlockers;
 pub use store::spec::{
     Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,

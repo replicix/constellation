@@ -911,3 +911,66 @@ fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
         .collect();
     assert_eq!(bases, vec![Some(baseline), Some(elsewhere)], "{queued:?}");
 }
+
+/// F1/F9 (review T3), the path the check at the write leaves to the
+/// log-slot CAS: a holder's tagged write whose transaction began before its
+/// lease's expiry (it passed every check) and committed after a successor
+/// took over is stranded by the successor's segment, rolled back and queued
+/// for replay by rid *with its fencing token*; the replay, at a sequencer
+/// that judges the token by its window and after the window is over, is
+/// refused (`LockLapsed`): the write never lands over the next holder's,
+/// and the stranded op's acknowledgement becomes a conflict copy.
+#[test]
+fn a_tagged_row_stranded_past_its_lease_replays_with_its_token_and_is_refused() {
+    use constellation_meta::locks::{GrantId, LockTag, LockToken};
+    use constellation_meta::{execute_tagged, MetaError};
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let tag = LockTag(vec![LockToken {
+        grant: GrantId { node: 9, seq: 1 },
+        until_ms: 5_000,
+    }]);
+    let op = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "ref".into(),
+        ino: (3 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    execute_tagged(&meta, &op, Some(rid(1)), &tag, 1_000).unwrap();
+    meta.set_holder_epoch(0);
+    let successor = vec![LogRecord::Create {
+        parent: ROOT_INO,
+        name: "theirs".into(),
+        ino: (4 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    }];
+    let applied = meta
+        .apply_segment(1, 2, &successor, &TouchSet::default())
+        .unwrap();
+    assert_eq!(applied.stranded.locals, 1);
+    assert!(
+        meta.lookup(ROOT_INO, "ref").unwrap().is_none(),
+        "rolled back"
+    );
+    let queued = meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].rid, rid(1));
+    assert_eq!(queued[0].lock_tag, tag, "the replay carries its token");
+    // Replayed by rid at a sequencer that never held the grant, after the
+    // window: refused, nothing written.
+    let next = Meta::open_in_memory().unwrap();
+    let r = execute_tagged(
+        &next,
+        &queued[0].op,
+        Some(rid(1)),
+        &queued[0].lock_tag,
+        6_000,
+    );
+    assert!(matches!(r, Err(MetaError::LockLapsed)), "{r:?}");
+    assert!(next.lookup(ROOT_INO, "ref").unwrap().is_none());
+}

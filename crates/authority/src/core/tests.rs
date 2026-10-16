@@ -10390,19 +10390,84 @@ mod locks {
         assert_eq!(flush, GrantId { node: 1, seq: 3 });
     }
 
+    /// Sim `locks-stall-step` seed 1934: the reply to a request a push
+    /// already answered is handled long after the request's send (the
+    /// node's step stalled; a reply slow in transit is the same). Its
+    /// window counts from that send, as every grant's does: counted from
+    /// its arrival, it was honoured past the owner's record of it, which
+    /// the owner had outwaited and granted to another node meanwhile (two
+    /// exclusive holders). One whose window is over on arrival installs
+    /// nothing.
+    #[test]
+    fn a_late_reply_counts_its_window_from_its_request() {
+        for late in [400, 4_600] {
+            let mut r = requester();
+            let sent = r.now;
+            let req = lock_control(&mut r, 50, 42, true);
+            r.advance(50);
+            r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockGranted {
+                    ino: 42,
+                    sent,
+                    outcome: grant_msg(2),
+                },
+            });
+            r.advance(late);
+            r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockReply {
+                    req,
+                    outcome: grant_msg(3),
+                },
+            });
+            let held = r.meta.locks().held(42).unwrap();
+            // ttl 5 s, margin 1 s (the harness's lease): honoured until
+            // `sent + 4 s` at most.
+            assert!(
+                held.until_ms <= sent.0 + 4_000,
+                "late {late}: honoured until {} past its request's window ({})",
+                held.until_ms,
+                sent.0 + 4_000
+            );
+            if late > 4_000 {
+                assert_eq!(held.id, GrantId { node: 1, seq: 2 }, "nothing installed");
+            } else {
+                assert_eq!(held.id, GrantId { node: 1, seq: 3 });
+            }
+        }
+    }
+
     /// Sim `locks-blips-tight-long-lease` seed 3270: the owner's recall of
     /// the re-affirmed id comes before the reply that carries it, and the
-    /// recall adopts the id (`LockTables::recall_held`). The reply then
-    /// extends the grant from its arrival, as a renewal answer would; the
-    /// local lock and the recall continue. Dropped, the grant kept the
-    /// push's window (counted from the first request) and lapsed under
-    /// the I/O it was finishing.
+    /// recall adopts the id (`LockTables::recall_held`). The reply — to the
+    /// waiter's retried request — then extends the grant from that
+    /// request's send, as a renewal answer would; the local lock and the
+    /// recall continue. Dropped, the grant kept the push's window (counted
+    /// from the first request) and lapsed under the I/O it was finishing.
     #[test]
     fn a_reply_whose_id_a_recall_already_adopted_extends_the_grant() {
         let mut r = requester();
         let sent = r.now;
-        let req = lock_control(&mut r, 50, 42, true);
+        let out = lock_control_out(&mut r, 50, 42, true);
+        let timeout = timer_of(&out, TimerKind::LockRequestTimeout);
         r.advance(300);
+        // The first request goes unanswered; the retry is the RPC the
+        // owner's reply answers.
+        let mut out = r.step(Event::Timer { id: timeout });
+        if !sends(&out)
+            .iter()
+            .any(|(_, m)| matches!(m, PeerMsg::LockRequest { .. }))
+        {
+            let retry = timer_of(&out, TimerKind::LockRetry);
+            r.now = r.core.timer_at(retry).unwrap();
+            out = r.step(Event::Timer { id: retry });
+        }
+        let retried = r.now;
+        let req = match sends(&out).as_slice() {
+            [(1, PeerMsg::LockRequest { req, .. })] => *req,
+            other => panic!("expected the retried LockRequest: {other:?}"),
+        };
         let out = r.step(Event::Peer {
             from: 1,
             msg: PeerMsg::LockGranted {
@@ -10461,8 +10526,13 @@ mod locks {
         let held = r.meta.locks().held(42).unwrap();
         assert_eq!(held.id, GrantId { node: 1, seq: 3 });
         assert!(
-            held.until_ms >= pushed_until + 320,
-            "extended from the reply: {} vs {pushed_until}",
+            held.until_ms >= pushed_until + (retried.0 - sent.0),
+            "extended from the retried request's send: {} vs {pushed_until}",
+            held.until_ms
+        );
+        assert!(
+            held.until_ms <= retried.0 + 5_000,
+            "never from the reply's arrival: {} vs {retried:?}",
             held.until_ms
         );
         assert!(held.recalled && !held.first_use && !held.releasing);
@@ -11344,6 +11414,284 @@ mod locks {
         let out = request(&mut h, 6, 11, ino, X, true);
         assert!(grant_to(&out, 6).is_some(), "{out:?}");
         assert_eq!(h.core.stats.lock_barrier_waits, waits);
+    }
+
+    /// F1: a write tagged with node 2's grant passed its check at the
+    /// write here and is still in its transaction (a slow commit) when
+    /// the grant is outwaited. The floor and the cut the next grant is
+    /// made from are taken only after it committed
+    /// (`Replica::settle_tagged_writes`): a position read before would
+    /// lack a write that lands after the next holder's grant. (The wait
+    /// itself is `Meta`'s: `mutate::tests::a_position_taken_after_a_grant_ends_waits_for_its_pinned_write`.)
+    #[test]
+    fn an_outwaited_holders_successor_settles_its_tagged_writes_first() {
+        let mut h = Harness::new(1);
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let op = h.create("turn.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        assert_eq!(h.meta.locks().stats().settle_waits, 0);
+        let g = h.meta.locks().own_grant(ino, 2, h.now.0).unwrap().id;
+        let tag = token(g, h.now.0 + 4_000);
+        h.meta.locks().check_tag_at_write(&tag, h.now.0).unwrap();
+        // Pinned under a live grant: a grant elsewhere does not wait.
+        let other = h.create("other.lock");
+        let MutateOp::Create { ino: other_ino, .. } = other else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &other, None).unwrap();
+        let out = request(&mut h, 3, 6, other_ino, X, true);
+        assert!(grant_to(&out, 3).is_some(), "{out:?}");
+        assert_eq!(h.meta.locks().stats().settle_waits, 0);
+        let out = request(&mut h, 4, 8, ino, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        h.now = h.core.timer_at(expiry).unwrap();
+        let out = h.step(Event::Timer { id: expiry });
+        assert_eq!(h.core.stats.lock_recalls_expired, 1);
+        assert!(grant_to(&out, 4).is_some(), "{out:?}");
+        assert!(
+            h.meta.locks().stats().settle_waits > 0,
+            "the successor's floor was taken without waiting for the write in its transaction"
+        );
+        h.meta.locks().unpin(&tag);
+        assert!(!h.meta.locks().unsettled_writes());
+    }
+
+    /// Sim `locks-writer-hold` / `locks-stall-step` (stale turn reads):
+    /// this node's own grant runs out unreleased here — its core stalled
+    /// past the window — after its holder wrote under it to another file
+    /// (git's refs under its turn file), still in this node's unshipped
+    /// journal. Dropped by the next request's conflict check, it left no
+    /// floor, and the next grant's own position names the journal only
+    /// where it touched the lock file: its holder read the older file.
+    /// The release floor (the whole journal) is the inode's floor now, as
+    /// at an expiry timer's outwait.
+    #[test]
+    fn an_own_grant_dropped_unreleased_leaves_its_release_floor() {
+        let mut h = Harness::new(1);
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let op = h.create("turn.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let data = h.create("ref");
+        let MutateOp::Create { ino: data_ino, .. } = data else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &data, None).unwrap();
+        // Both files have shipped: only the write below is unshipped.
+        let seqs: Vec<u64> = h
+            .meta
+            .peek_journal_after(0)
+            .unwrap()
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        crate::replica::Replica::ack_journal(&h.meta, &seqs, 1, None).unwrap();
+        let out = lock_control_out(&mut h, 50, ino, true);
+        assert!(
+            matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }),
+            "{out:?}"
+        );
+        // The holder's write under the lock, to the other file.
+        constellation_meta::execute_mutate(&h.meta, &setattr_mtime(data_ino, 7), None).unwrap();
+        let written = h.meta.journal_next_seq().unwrap() - 1;
+        let held = h.meta.locks().held(ino).unwrap();
+        let record = h.meta.locks().get(held.id).unwrap();
+        h.now = Ms(record.until_ms + 1);
+        let out = request(&mut h, 4, 8, ino, X, true);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted: {out:?}")
+        };
+        assert!(
+            position.pending.is_some_and(|p| p.jseq >= written),
+            "the grant does not cover the holder's write to the other file: {position:?} (journal seq {written})"
+        );
+    }
+
+    /// F1 (review T1), the executor that did not mint the grant: this
+    /// delegate's own client wrote under a lock the root minted; the write
+    /// passed its check at the write and is still in its transaction,
+    /// pinned (a slow commit, the writer lock held). Before its window is
+    /// over a renewal does not wait for it (no cut it reports can settle a
+    /// barrier that needs it); once over, the renewal's stream head is
+    /// read only after the write committed, so the root's cut after the
+    /// grant's outwait has it. Without the settle the head lacks it.
+    #[test]
+    fn a_delegates_renewal_reports_a_pinned_write_once_its_window_is_over() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        use std::sync::{mpsc, Arc, Mutex};
+        for settle in [false, true] {
+            let mut h = Harness::new(3);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.core.lease.cached_holder = Some(1);
+            let (dir, f) = delegated_file(&h.meta);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            let clock = Arc::new(AtomicI64::new(h.now.0));
+            {
+                let c = clock.clone();
+                h.meta
+                    .locks()
+                    .set_clock(Arc::new(move || c.load(Ordering::SeqCst)));
+            }
+            h.meta.locks().set_settle_for_tests(settle);
+            let before = crate::replica::Replica::delegate_idx(&h.meta, 7);
+            // The root's grant: not in this delegate's table.
+            let tag = token(GrantId { node: 1, seq: 77 }, h.now.0 + 1_000);
+            let op = MutateOp::Create {
+                parent: dir,
+                name: "turn".into(),
+                ino: h.meta.allocate_ino(dir).unwrap(),
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            let rid = Rid {
+                node: 3,
+                incarnation: 1,
+                seq: 1,
+            };
+            let (pinned_tx, pinned_rx) = mpsc::channel::<std::thread::ThreadId>();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            let go: Arc<Mutex<Option<mpsc::Sender<()>>>> = Arc::new(Mutex::new(Some(go_tx)));
+            let done = Arc::new(Mutex::new(done_rx));
+            let now = h.now.0;
+            let head = std::thread::scope(|sc| {
+                let meta = &h.meta;
+                let writer = sc.spawn(move || {
+                    constellation_meta::write_check_hook::set(Some(Box::new(move |at| {
+                        if at == constellation_meta::write_check_hook::At::Pinned {
+                            pinned_tx.send(std::thread::current().id()).unwrap();
+                            go_rx.recv().unwrap();
+                        }
+                        true
+                    })));
+                    let r = meta.delegate_execute(&op, Some(rid), 7, Position::ZERO, &tag, now);
+                    constellation_meta::write_check_hook::set(None);
+                    done_tx.send(()).unwrap();
+                    r
+                });
+                let writer_thread = pinned_rx.recv().unwrap();
+                // Every other writer waits for the pinned commit, as for a
+                // slow one holding the lock.
+                {
+                    let (go, done) = (go.clone(), done.clone());
+                    meta.set_writer_wait_hook_for_tests(Some(Arc::new(move || {
+                        if std::thread::current().id() == writer_thread {
+                            return;
+                        }
+                        if let Some(g) = go.lock().unwrap().take() {
+                            g.send(()).unwrap();
+                            done.lock().unwrap().recv().unwrap();
+                        }
+                    })));
+                }
+                // Inside the window: nothing to wait for.
+                assert!(!meta.locks().unsettled_writes());
+                // Past it, a renewal (asked for at once: the delegation is
+                // short of authority for the lock request below).
+                h.now = h.now.plus(1_500);
+                clock.store(h.now.0, Ordering::SeqCst);
+                let d = h.core.dl.mine.get_mut(&7).expect("installed");
+                d.until = h.now.plus(1_500);
+                d.renew = None;
+                let out = h.core.handle(
+                    h.now,
+                    Event::Peer {
+                        from: 2,
+                        msg: PeerMsg::LockRequest {
+                            req: OpId(9),
+                            ino: f,
+                            mode: X,
+                            blocking: true,
+                            sent: h.now,
+                            incarnation: 1,
+                        },
+                    },
+                    meta,
+                );
+                let head = sends(&out).into_iter().find_map(|(to, m)| match m {
+                    PeerMsg::DelegRenew {
+                        gen: 7,
+                        stream_head,
+                        ..
+                    } if to == 1 => Some(*stream_head),
+                    _ => None,
+                });
+                // Let it go if nothing did.
+                if let Some(g) = go.lock().unwrap().take() {
+                    g.send(()).unwrap();
+                }
+                writer.join().unwrap().unwrap();
+                meta.set_writer_wait_hook_for_tests(None);
+                head.expect("a renewal")
+            });
+            if settle {
+                assert_eq!(head, before + 1, "the head lacks the pinned write");
+                assert_eq!(h.meta.locks().stats().settle_waits, 1);
+            } else {
+                assert_eq!(head, before, "without the settle the head lacks it");
+            }
+        }
+    }
+
+    /// F1: this node's own grant is outwaited here (its core stalled past
+    /// the window, so nothing renewed it) while a mutation of its own
+    /// tagged with it is still in flight — forwarded to the sequencer of
+    /// another subtree, which may commit it after any wait. Its release
+    /// floor does not have it, so the next grant to another node waits
+    /// for a cut, as after another holder's outwait. Without an op in
+    /// flight, nothing changes: no barrier.
+    #[test]
+    fn an_own_grant_outwaited_with_a_mutation_in_flight_leaves_a_barrier() {
+        for (in_flight, doubted) in [(false, false), (true, false), (false, true)] {
+            let mut h = Harness::new(1);
+            h.core.cfg.p2p = true;
+            h.hold(1, None);
+            let op = h.create("turn.lock");
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            let out = lock_control_out(&mut h, 50, ino, true);
+            assert!(
+                matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }),
+                "{out:?}"
+            );
+            let held = h.meta.locks().held(ino).unwrap();
+            if in_flight {
+                h.meta
+                    .locks()
+                    .tag_begin(&token(held.id, held.until_ms), h.now.0);
+            }
+            if doubted {
+                // Ended in doubt (its rid unknown here: never resolved).
+                h.meta
+                    .locks()
+                    .pin_in_doubt(&token(held.id, held.until_ms), None);
+            }
+            // Never renewed: the record runs out here.
+            let record = h.meta.locks().get(held.id).unwrap();
+            h.now = Ms(record.until_ms + 1);
+            let barriers = h.core.stats.lock_outwait_barriers;
+            let out = request(&mut h, 4, 8, ino, X, true);
+            assert!(grant_to(&out, 4).is_some(), "{out:?}");
+            assert_eq!(
+                h.core.stats.lock_outwait_barriers - barriers,
+                u64::from(in_flight || doubted),
+                "in flight: {in_flight}, in doubt: {doubted}"
+            );
+        }
     }
 
     /// A root with generation 7 (node 3's) heard from before node 2's
@@ -15238,14 +15586,68 @@ mod locks {
         wait = timer_of(&out, TimerKind::LockReleaseWait);
         r.now = Ms(held.until_ms);
         let out = r.step(Event::Timer { id: wait });
+        // F1: the in-doubt op's window is over, so no executor checks it
+        // any more, but one that checked it in time may still be
+        // committing it. Never released, then: dropped here, and left to
+        // the owner's outwait (whose barrier waits for a cut every
+        // executor settles its tagged writes for).
         assert!(
-            sends(&out)
+            !sends(&out)
                 .iter()
-                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::LockReleased { .. }))
-                || r.meta.locks().held(42).is_none(),
-            "released (or lapsed) once the window is over: {out:?}"
+                .any(|(_, m)| matches!(m, PeerMsg::LockReleased { .. })),
+            "released after an op tagged with it ended in doubt: {out:?}"
         );
+        assert!(r.meta.locks().held(42).is_none(), "dropped here");
+        assert_eq!(r.core.stats.lock_doubt_lapses, 1);
+        assert_eq!(r.meta.locks().stats().doubt_lapses, 1);
         assert_eq!(r.meta.locks().stats().release_waits, 1);
+    }
+
+    /// F1 (review M1): an op that ended in doubt under the grant, whose
+    /// outcome has since reached this replica (its `Completed` came with
+    /// the log: it executed, so its commit is over), is a doubt no more:
+    /// the recalled grant is released as usual, not left to the outwait.
+    /// One whose outcome is still unknown keeps the lapse.
+    #[test]
+    fn a_doubt_resolved_by_its_outcome_releases_the_grant() {
+        for resolved in [false, true] {
+            let mut r = requester();
+            let rid = r.rid(41);
+            let (g, out) = recalled_and_waiting(&mut r, |r, g, until| {
+                r.meta.locks().pin_in_doubt(&token(g, until), Some(rid));
+            });
+            let wait = timer_of(&out, TimerKind::LockReleaseWait);
+            if resolved {
+                // Its outcome arrives: executed (here, as if from the log).
+                let op = r.create("landed");
+                constellation_meta::execute_mutate(&r.meta, &op, Some(rid)).unwrap();
+            }
+            r.now = Ms(r.meta.locks().held(42).unwrap().until_ms);
+            let out = r.step(Event::Timer { id: wait });
+            assert_eq!(
+                released(&out),
+                resolved,
+                "resolved {resolved}: {out:?} (grant {g:?})"
+            );
+            assert_eq!(r.core.stats.lock_doubt_lapses, u64::from(!resolved));
+        }
+    }
+
+    /// F1: the same for an op answered in time — the release goes out as
+    /// soon as it is answered (no doubt, no lapse).
+    #[test]
+    fn a_release_after_answered_ops_is_not_left_to_the_outwait() {
+        let mut r = requester();
+        let (g, out) = recalled_and_waiting(&mut r, |r, g, until| {
+            r.meta.locks().tag_begin(&token(g, until), r.now.0);
+        });
+        let wait = timer_of(&out, TimerKind::LockReleaseWait);
+        let until = r.meta.locks().held(42).unwrap().until_ms;
+        r.meta.locks().tag_end(&token(g, until), false, r.now.0);
+        r.advance(300);
+        let out = r.step(Event::Timer { id: wait });
+        assert!(released(&out), "{out:?}");
+        assert_eq!(r.core.stats.lock_doubt_lapses, 0);
     }
 
     /// A requester holding grant `g` (seq 3) on inode 42 with nothing

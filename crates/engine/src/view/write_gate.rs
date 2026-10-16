@@ -365,18 +365,26 @@ impl View {
             // overflow) goes through the core, to the root.
             if let Some(deps) = session.deps().filter(|d| session.reaches(d)) {
                 constellation_vfs::watch::stage("delegate execute (meta)");
-                let result = self.meta.delegate_execute(
+                // F1/F9: the delegation is judged again once the op holds
+                // the store's writer lock; one that ran out while the op
+                // waited for it sends the op through the core instead.
+                let delegates = h.delegates.clone();
+                let result = self.meta.delegate_execute_admitted(
                     op,
                     Some(rid),
                     gen,
                     deps,
                     &tag,
                     crate::locks::now_ms(),
+                    Box::new(move || delegates.honours(gen)),
                 );
                 // Journaled (or refused): the admission ends here, before
                 // the core can answer a recall with a `through` this op
                 // would be past.
                 drop(admission);
+                if matches!(result, Err(MetaError::NotAdmitted)) {
+                    return self.submit_to_core(h, op, rid, &tag, false);
+                }
                 // `Journaled`, not `Nudge`: the core streams the row on
                 // any event (`deleg_after_event`); a nudge would start a
                 // sync round per write, whose upload drain races the
@@ -420,13 +428,25 @@ impl View {
         // `lease.rs`'s module doc, "The releasing flag".
         if let Some(admitted) = h.lease.admit() {
             constellation_vfs::watch::stage("local execute (meta)");
-            let result = constellation_meta::execute_tagged(
+            // F1/F9: the lease is judged again once the op holds the
+            // store's writer lock (and its fencing token with it): an op
+            // that waited for the lock past its lease's expiry goes
+            // through the core instead of journaling a row a takeover
+            // would strand.
+            let lease = h.lease.clone();
+            let result = constellation_meta::execute_admitted(
                 &self.meta,
                 op,
                 Some(rid),
                 &tag,
                 crate::locks::now_ms(),
+                Box::new(move || lease.usable()),
             );
+            if matches!(result, Err(MetaError::NotAdmitted)) {
+                drop(admitted);
+                drop(gate);
+                return self.submit_to_core(h, op, rid, &tag, false);
+            }
             // Plan 30 §M9: under a durability gate, the row this op
             // journaled (at or below the tip now) must reach the backups
             // or the log before the acknowledgement.
@@ -551,7 +571,7 @@ impl View {
                 constellation_meta::MutateOutcome::LockLapsed => Err(MutateFail::LockLapsed),
                 // Never a client outcome: the core retries it.
                 constellation_meta::MutateOutcome::Held { .. } => {
-                    crate::locks::note_tag_in_doubt();
+                    crate::locks::note_tag_in_doubt(Some(rid));
                     crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
                         "metadata commit held".into(),
                     ));
@@ -569,7 +589,7 @@ impl View {
                 }
                 constellation_meta::MutateOutcome::Busy
                 | constellation_meta::MutateOutcome::NotHolder { .. } => {
-                    crate::locks::note_tag_in_doubt();
+                    crate::locks::note_tag_in_doubt(Some(rid));
                     crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
                         "no sequencer answered the metadata commit".into(),
                     ));
@@ -584,14 +604,14 @@ impl View {
             Ok(constellation_authority::ClientReply::InDoubt) => {
                 // It may still execute somewhere: its grants wait for its
                 // token's window before a release.
-                crate::locks::note_tag_in_doubt();
+                crate::locks::note_tag_in_doubt(Some(rid));
                 crate::fsync_wait::note(crate::fsync_wait::Failure::Transient(
                     "metadata commit in doubt (S3 or the sequencer unreachable)".into(),
                 ));
                 Err(MutateFail::Errno(Code::Io))
             }
             Err(_) => {
-                crate::locks::note_tag_in_doubt();
+                crate::locks::note_tag_in_doubt(Some(rid));
                 Err(MutateFail::Errno(Code::Io))
             }
         }

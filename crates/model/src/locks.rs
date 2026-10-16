@@ -174,6 +174,18 @@ pub struct LockModel {
     pub scripts: Vec<Vec<Op>>,
     /// A node stops I/O when its grant is no longer honoured.
     pub fencing: bool,
+    /// F1 (`cst-load-review` §2): an `Io` is admitted (`Start`, fenced as
+    /// above) and its effect lands at the owner later, at `Land` — a
+    /// write that passed its fencing-token check and then waited for the
+    /// store's writer lock behind a slow writer. `false`: atomic, as
+    /// before.
+    pub delayed_io: bool,
+    /// F1: the owner checks the write's token where it lands
+    /// (`LockTables::check_tag_at_write`): it lands only while the grant
+    /// is live in the owner's table, and is refused (`EIO`) otherwise.
+    /// `false` is the code before: checked only at admission, it lands
+    /// whenever its turn comes.
+    pub token_check_at_write: bool,
     /// Grants are capped by the owner's own authority.
     pub cap_by_lease: bool,
     /// A fast takeover's successor applies the grace period.
@@ -266,6 +278,8 @@ impl LockModel {
         LockModel {
             scripts,
             fencing: true,
+            delayed_io: false,
+            token_check_at_write: true,
             cap_by_lease: true,
             grace: true,
             probe_freshness: true,
@@ -358,6 +372,12 @@ pub struct Cache {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeOp {
     Idle,
+    /// `delayed_io`: an admitted `Io` under grant `id` in `mode`, waiting
+    /// to land (`Action::Land`).
+    Writing {
+        id: u8,
+        mode: Mode,
+    },
     /// A lock request in flight (or waiting to be (re)sent).
     Locking {
         mode: Mode,
@@ -877,6 +897,8 @@ pub enum Action {
     DelegRenewal,
     /// Root: release the lease (a graceful shutdown).
     Release(u8),
+    /// `delayed_io`: node `i`'s admitted write lands at the owner.
+    Land(u8),
 }
 
 impl Model for LockModel {
@@ -1077,6 +1099,7 @@ impl Model for LockModel {
                         }
                     }
                 }
+                NodeOp::Writing { .. } => actions.push(Action::Land(iu)),
                 NodeOp::Locking { .. } => {
                     let in_flight =
                         s.net.iter().any(|m| {
@@ -1196,6 +1219,11 @@ impl Model for LockModel {
                         s.nodes[i].op = NodeOp::Locking { mode, sent };
                         send_lock(self, &mut s, i);
                     }
+                    Op::Io if self.delayed_io => {
+                        let mode = s.nodes[i].held?;
+                        let id = s.nodes[i].cache.map(|c| c.id).unwrap_or(0);
+                        s.nodes[i].op = NodeOp::Writing { id, mode };
+                    }
                     Op::Io => {
                         let held = s.nodes[i].held?;
                         let c = s.nodes[i].cache;
@@ -1212,6 +1240,33 @@ impl Model for LockModel {
                         s.finish_op(i);
                     }
                 }
+            }
+            Action::Land(i) => {
+                let i = i as usize;
+                let NodeOp::Writing { id, mode } = s.nodes[i].op else {
+                    return None;
+                };
+                // The owner executes it: with the check at the write, only
+                // while the grant is live in its table (its clock); else
+                // refused (the application sees `EIO`), nothing written.
+                let o = s.current_owner();
+                let live = o != NONE && {
+                    let now = s.local(o as usize);
+                    s.nodes[o as usize]
+                        .table
+                        .iter()
+                        .any(|g| g.id == id && g.node == i as u8 && g.until > now)
+                };
+                if live || !self.token_check_at_write {
+                    if let Some((later, _, _)) = s
+                        .issued
+                        .iter()
+                        .find(|(gid, node, m)| *gid > id && *node != i as u8 && m.conflicts(mode))
+                    {
+                        s.violation = Some((i as u8, id, *later));
+                    }
+                }
+                s.finish_op(i);
             }
             Action::SendLock(i) => {
                 let i = i as usize;

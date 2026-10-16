@@ -424,6 +424,21 @@ always a prefix of the durable log plus speculation it can take back:
   flight before it checks the flag, and waited for by the release). No
   local write can land between the final flush and the release, however
   slow the flush.
+- **Admission is judged again at the write.** A FUSE fast-path write is
+  admitted against the wall clock: the lease is usable, or, for a
+  delegate's own writes, its delegation is honoured. It then waits for
+  the store's writer lock, sometimes for seconds behind a slow writer.
+  Once its transaction holds the lock, and before it writes anything,
+  the lease (or the delegation) is checked again on the clock there. If
+  it has run out meanwhile, the write is not journaled. The op goes
+  through the authority core under the same rid, as one refused at
+  admission does (forwarded to the new holder, or the lease path). It
+  is not journaled as a row that a takeover would strand and replay.
+  The log-slot CAS remains the fence: a row whose transaction began
+  just before the expiry and committed after it is still stranded and
+  replayed by rid, and counted as `speculation.stranded_replayed` or
+  `speculation.pending_replay`. The check at the write only stops it
+  becoming the usual case under a slow store (load review F1, F9).
 
 ### The shadow does not win conflicts
 

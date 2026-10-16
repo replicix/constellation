@@ -1442,6 +1442,19 @@ pub struct LockStatus {
     /// executor because a grant they named was no longer live (`EIO` to
     /// their issuer; nothing journaled).
     pub token_rejections: u64,
+    /// F1: of those, the ones only the check under the store's writer
+    /// lock refused (the op had passed the check before it waited for
+    /// the lock).
+    pub token_rejections_at_write: u64,
+    /// F1: positions this node reported as covering what it executed (a
+    /// grant's floor, an outwait's cut, a delegate's stream head) that
+    /// first waited for a tagged write still in its transaction, under a
+    /// grant ended here or whose token's window was over.
+    pub settle_waits: u64,
+    /// F1: recalled grants this node left to their owner's outwait
+    /// instead of releasing them (a mutation tagged with them ended in
+    /// doubt and was not resolved yet).
+    pub doubt_lapses: u64,
     /// Waiters re-parked at their old queue position after a grant to
     /// them went unused, and releases that named a grant id this owner
     /// had replaced (both ended a grant that was otherwise outwaited).

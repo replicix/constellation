@@ -118,13 +118,22 @@ pub(crate) struct GatedDb {
     /// The last writer to take the lock: the one a priority writer waits
     /// behind (it is served next).
     holder: Mutex<Option<Holder>>,
+    /// Tests only: [`crate::Meta::set_writer_wait_hook_for_tests`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) wait_hook: Mutex<Option<WriterWaitHook>>,
 }
+
+/// See [`crate::Meta::set_writer_wait_hook_for_tests`].
+#[cfg(any(test, feature = "test-util"))]
+pub type WriterWaitHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 impl GatedDb {
     pub(crate) fn new(db: SingleWriterTxDatabase) -> Self {
         Self {
             db,
             holder: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            wait_hook: Mutex::new(None),
         }
     }
 
@@ -140,6 +149,17 @@ impl GatedDb {
     #[track_caller]
     pub(crate) fn write_tx(&self) -> SingleWriterWriteTx<'_> {
         let at = Location::caller();
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            let hook = self
+                .wait_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let priority = PRIORITY.with(Cell::get);
         let ahead = if priority {
             self.holder().clone()

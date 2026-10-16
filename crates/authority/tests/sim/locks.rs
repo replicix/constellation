@@ -150,6 +150,22 @@ struct GhostInner {
     turn_rids: BTreeMap<i64, constellation_meta::Rid>,
     /// Turns whose write was acknowledged under the lock.
     turns_acked: std::collections::BTreeSet<i64>,
+    /// F1 (`SimConfig::strict_lock_turns`): turns whose write was answered
+    /// `Accepted`, whether or not the client still honoured its grant
+    /// then, and whether such a turn is never excused as unacknowledged.
+    turns_accepted: std::collections::BTreeSet<i64>,
+    strict_turns: bool,
+    /// See `SimConfig::lock_write_wait_ms`.
+    write_wait_ms: Option<u64>,
+    /// F1: every critical section, `(ino, node, thread, mode, from, until)`
+    /// (`None`: still open), and per turn write the lock it was written
+    /// under `(lock ino, node)`: what a held write's landing is checked
+    /// against (`LockGhost::check_landings`).
+    io_history: Vec<(u64, NodeId, u64, LockMode, u64, Option<u64>)>,
+    turn_locks: BTreeMap<constellation_meta::Rid, (u64, NodeId, u64, i64)>,
+    /// Every turn acknowledged under its lock, `(data ino, turn, node,
+    /// at)`.
+    acked_history: Vec<(u64, i64, NodeId, u64)>,
     /// `(the missed turn's rid, the read turn's rid, the report)`.
     #[allow(clippy::type_complexity)]
     stale_reads: Vec<(
@@ -191,6 +207,104 @@ impl LockGhost {
 
     pub fn set_by_ino(&self, by_ino: bool) {
         self.with(|g| g.by_ino = by_ino);
+    }
+
+    /// See `SimConfig::strict_lock_turns`.
+    pub fn set_strict_turns(&self, on: bool) {
+        self.with(|g| g.strict_turns = on);
+    }
+
+    /// How long a client waits for its turn write's answer before it
+    /// gives up on it (in doubt): 3 s; under `strict_lock_turns` as long
+    /// as an application waits for its FUSE write (a held write is
+    /// answered when it lands), unless `SimConfig::lock_write_wait_ms`
+    /// says otherwise.
+    fn write_wait_ms(&self) -> u64 {
+        self.with(|g| match g.write_wait_ms {
+            Some(ms) => ms,
+            None if g.strict_turns => 30_000,
+            None => 3_000,
+        })
+    }
+
+    /// See `SimConfig::lock_write_wait_ms`.
+    pub fn set_write_wait_ms(&self, ms: Option<u64>) {
+        self.with(|g| g.write_wait_ms = ms);
+    }
+
+    /// F1: the turn write `rid` (turn `turn` into `data`) is issued under
+    /// `lock_ino`'s lock by `node`.
+    fn turn_lock(
+        &self,
+        rid: constellation_meta::Rid,
+        lock_ino: u64,
+        node: NodeId,
+        data: u64,
+        turn: i64,
+    ) {
+        self.with(|g| {
+            g.turn_locks.insert(rid, (lock_ino, node, data, turn));
+        });
+    }
+
+    /// F1: held writes that landed (`(rid, simulated ms)`, the sim
+    /// driver's `Shared::landed`) must not have landed inside another
+    /// node's conflicting critical section on the lock they were written
+    /// under: the next holder's floor then lacked them, and an
+    /// acknowledged or in-doubt write overwrote what it wrote under its
+    /// own lock (the lost update the token at the write and the settle
+    /// prevent). Nor after another node's newer turn into the same file
+    /// was acknowledged: it overwrote that acknowledged write. `skip`: the
+    /// writes rolled back since (tentative), whose effect is gone.
+    pub fn check_landings(
+        &self,
+        landed: &[(constellation_meta::Rid, u64)],
+        skip: &std::collections::HashSet<constellation_meta::Rid>,
+    ) {
+        self.with(|g| {
+            let seed = g.seed;
+            let mut found = Vec::new();
+            for (rid, at) in landed {
+                if skip.contains(rid) {
+                    continue;
+                }
+                let Some((ino, node, data, turn)) = g.turn_locks.get(rid).copied() else {
+                    continue;
+                };
+                for (d, t, n, acked_at) in &g.acked_history {
+                    if *d == data && *n != node && *t > turn && *acked_at < *at {
+                        found.push(format!(
+                            "seed {seed}: ino {data:#x}: node {node}'s held write {rid:?} (turn \
+                             {turn}) landed at t={at}, after node {n}'s turn {t} was \
+                             acknowledged there (t={acked_at}): an acknowledged write lost"
+                        ));
+                    }
+                }
+                for (i, n, _, mode, from, until) in &g.io_history {
+                    if *i == ino
+                        && *n != node
+                        && *mode == LockMode::Exclusive
+                        && *from <= *at
+                        && until.is_none_or(|u| *at < u)
+                    {
+                        found.push(format!(
+                            "seed {seed}: ino {ino:#x}: node {node}'s held write {rid:?} under its \
+                             lock landed at t={at}, inside node {n}'s critical section \
+                             (t={from}..{until:?})"
+                        ));
+                    }
+                }
+            }
+            g.violations.extend(found);
+        });
+    }
+
+    /// F1: a turn's write was answered `Accepted`: its application was
+    /// told it succeeded under the lock.
+    fn turn_accepted(&self, turn: i64) {
+        self.with(|g| {
+            g.turns_accepted.insert(turn);
+        });
     }
 
     /// The inode lock file `i` had at setup, if the clients lock that
@@ -277,6 +391,7 @@ impl LockGhost {
         self.with(|g| {
             g.counters.turns_written += 1;
             g.turns_acked.insert(turn);
+            g.acked_history.push((ino, turn, node, at_ms));
             let e = g.last_turn.entry(ino).or_insert((0, node, at_ms, rid));
             if turn > e.0 {
                 *e = (turn, node, at_ms, rid);
@@ -303,7 +418,14 @@ impl LockGhost {
             // or a retry) landed late over the newer ones: the write
             // outlived its lock, which no grant can order (PROGRESS.md,
             // the fence's flush-start limit).
-            if read.is_some_and(|m| g.turn_rids.contains_key(&m) && !g.turns_acked.contains(&m)) {
+            // F1: not one its application was told had succeeded (the
+            // lock's lost update: an acknowledged write landed over the
+            // next holder's).
+            if read.is_some_and(|m| {
+                g.turn_rids.contains_key(&m)
+                    && !g.turns_acked.contains(&m)
+                    && !(g.strict_turns && g.turns_accepted.contains(&m))
+            }) {
                 g.counters.late_unacked_turns += 1;
                 return;
             }
@@ -428,6 +550,7 @@ impl LockGhost {
                 since_ms: at_ms,
             });
             g.violations.extend(found);
+            g.io_history.push((ino, node, thread, mode, at_ms, None));
         });
     }
 
@@ -440,6 +563,14 @@ impl LockGhost {
             if let Some(v) = g.in_io.get_mut(&ino) {
                 v.retain(|e| !(e.node == node && e.thread == thread));
             }
+            if let Some(e) = g
+                .io_history
+                .iter_mut()
+                .rev()
+                .find(|e| e.0 == ino && e.1 == node && e.2 == thread && e.5.is_none())
+            {
+                e.5 = Some(at_ms);
+            }
         });
     }
 
@@ -449,6 +580,11 @@ impl LockGhost {
         self.with(|g| {
             for v in g.in_io.values_mut() {
                 v.retain(|e| e.node != node);
+            }
+            for e in g.io_history.iter_mut() {
+                if e.1 == node && e.5.is_none() {
+                    e.5 = Some(at_ms);
+                }
             }
             for v in g.waiting.values_mut() {
                 v.retain(|e| e.0 != node);
@@ -900,6 +1036,7 @@ pub async fn client_lock(
                 };
                 h.meta.locks().tag_begin(&tag, h.clock.now().0);
                 let turn = ghost.take_turn(rid);
+                ghost.turn_lock(rid, ino, node, data, turn);
                 // The holder is in I/O while the write is awaited, for as
                 // long as its grant is honoured; once it lapses the write
                 // may land after another node's grant (the fence's
@@ -938,7 +1075,7 @@ pub async fn client_lock(
                                 );
                                 entered = false;
                             }
-                            if clock.elapsed_ms() > t_write + 3_000 {
+                            if clock.elapsed_ms() > t_write + ghost.write_wait_ms() {
                                 break None;
                             }
                         }
@@ -950,6 +1087,9 @@ pub async fn client_lock(
                         constellation_meta::MutateOutcome::Accepted { .. }
                     )))
                 );
+                if acked {
+                    ghost.turn_accepted(turn);
+                }
                 // Answered definitively (executed or refused), or left in
                 // doubt: then its grants wait for its token's window.
                 let settled = matches!(

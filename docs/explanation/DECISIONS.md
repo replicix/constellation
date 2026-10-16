@@ -961,6 +961,46 @@ same round trip, for every holder); a shorter TTL instead of the read
 (a window still decided without a proof). See
 [Leases, renewal and fencing](../reference/features/cluster-locks.md#leases-renewal-and-fencing).
 
+**Amended (the token at the write, load review F1)**: an executor
+checks the fencing token where the write happens: inside the
+operation's own store transaction, with the store's writer lock held,
+on its clock read there. The check before the operation stays, as an
+early refusal. Before, that earlier check was the only one. It ran
+before the operation waited for the writer lock: a FUSE thread behind
+a slow journal write, or a core step that took its `now` before it
+waited. A grant could end during the wait, the next holder be granted
+and write, and the stale write then land and be answered `OK`. For
+data, that was the next holder's read-modify-write rebased over it
+(`commit_manifest_with_rebase`), silently losing an acknowledged
+write. Then the order between the check and the next grant: a write
+that passed the check *pins* its grants until it commits, which can
+still take seconds. A position the node reports as covering what it
+executed (a grant's floor or position, an outwait's cut, a delegate's
+stream head) first waits for the pinned writes under grants no longer
+live in its table — ended there, or, for another sequencer's grant,
+past its token's window (earlier, no cut it reports can settle a
+barrier that needs the write, so a delegate's renewal does not wait for
+every commit in flight). They hold the writer lock, so taking it once is
+the wait. A write that checks later is refused (the grant ended at its
+minter, or its window is over elsewhere). So every write that passed
+a check is under the next holder's floor. That held only for outwaits
+and same-node releases. A release after an operation tagged with the
+grant ended in doubt has no position for that operation, which may
+still be committing at its executor. Such a grant is not released
+while that op is unresolved (its `Completed` or refusal not yet in the
+node's replica): the node drops it and its owner outwaits it, whose
+barrier waits for the cut. An owner's own grant that runs out unreleased while
+one of its operations tagged with it is in flight or in doubt leaves
+the same barrier. The FUSE fast path also re-checks its lease, or its
+delegation, inside the transaction. One that ran out sends the op
+through the core rather than journaling a row a takeover would strand.
+Rejected: re-checking only with a fresh clock after the lock is taken
+(the commit can still outlast the window or follow the next grant);
+holding the lock table's mutex across the commit (every lock operation
+would wait for disk writes); bounding the commit's duration (a blocked
+`write(2)` has no bound). See
+[The fencing token](../reference/features/cluster-locks.md#the-fencing-token).
+
 ## ADR-26: Exact chunk-location reconciliation replaces bloom digests
 
 **Context**: peers learned each other's cached chunks from bloom-filter

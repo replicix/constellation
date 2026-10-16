@@ -460,6 +460,21 @@ impl DelegateView {
         }
     }
 
+    /// F1/F9: whether this node still honours its delegation `gen` now
+    /// (an admission's re-check once its op holds the store's writer
+    /// lock): live, not past its window. A stop (a recall) waits for the
+    /// admissions in flight, so it is not looked at.
+    pub fn honours(&self, gen: u64) -> bool {
+        // The clock the lock and fence decisions read (a unit test's
+        // `advance_test_clock` included), as the check at the write does.
+        let now = crate::locks::now_ms();
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, g, until, _)| *g == gen && now < *until)
+    }
+
     /// Fast-path executions admitted and not yet journaled.
     pub fn in_flight(&self) -> u64 {
         self.in_flight.load(std::sync::atomic::Ordering::Acquire)

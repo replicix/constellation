@@ -197,7 +197,11 @@ authority that backs it: the owning sequencer caps it at its own lease
 same as for [read delegations](cto-modes.md#read-delegations):
 
 - the node honours a grant until `sent + ttl − margin`, measured from
-  when it sent the request or renewal, on its own clock;
+  when it sent the request or renewal, on its own clock — also for a
+  reply that arrives after a push already answered the request, or is
+  handled late (a stalled step): one counted from its arrival was
+  honoured past the owner's record of it (sim `locks-stall-step`: two
+  exclusive holders);
 - the sequencer treats it as live until `granted + ttl + margin`, on its
   own clock;
 - `margin` is the lease's expiry margin (`min(1 s, lease TTL / 4)`), so
@@ -476,6 +480,33 @@ written under it. So the check also happens where the write is recorded
   token. This includes the holder or delegate executing a forward, the
   requester's own lease path, the takeover gate's local replay, the
   inbox drain, and the FUSE fast paths on the sequencer itself.
+  - **Where the write happens.** The check that counts is made inside
+    the operation's own store transaction, once it holds the store's
+    single writer lock and before it writes anything, on the
+    executor's clock read there. An operation can wait for that lock
+    for seconds behind a slow writer (a journal write blocked on the
+    disk), or in an authority-core step that read its clock before it
+    waited. A check made before the wait could pass a grant that ended
+    during it, and the late write then landed after the next holder's
+    writes and was answered `OK` (load review F1). An earlier check
+    before the wait remains, and only refuses sooner.
+  - **Until the commit.** A write that passed this check holds the
+    writer lock until it commits, which can still take seconds. Its
+    grants stay *pinned* until then. Before this node reports a
+    position as covering what it executed — the floor of a grant, the
+    cut an outwait barrier waits for, a delegate's stream head on a
+    renewal — it waits for every pinned write under a grant its table
+    ended or whose record there ran out (`locks.settle_waits`). The next
+    holder's floor therefore has every write that passed a check. A
+    write that checks later finds the grant ended, or its window over,
+    and is refused. An executor that does not hold the grant judges it
+    by the window, and its writes reach the next holder only through a
+    cut as of the outwait, which is `2 × margin` after the window's
+    end. Such an executor (a delegate running a write under a lock the
+    root minted) waits only for a pinned write whose token's window is
+    over on its clock: a cut as of an earlier time settles no barrier.
+    So a delegate's renewal waits for a tagged commit only after that
+    commit outlasted its window, not for every one in flight.
   - A sequencer whose table holds the grant live (the minter, or the
     delegate a grant moved to) judges it exactly: it accepts the token
     whatever its `until` says, since nothing conflicting can be granted
@@ -505,7 +536,9 @@ written under it. So the check also happens where the write is recorded
     subtree.
 - **Refusal.** Nothing is executed or journaled (only an inbox refusal
   is journaled, as every inbox outcome is), and a retry of the rid is
-  refused the same way.
+  refused the same way. A refusal by the check at the write is the same
+  refusal (`LockLapsed`, `EIO` or a re-send as below), and is also
+  counted as `locks.token_rejections_at_write`.
   - If the issuing node still holds and honours every grant the token
     named, under a window renewed since the token was taken, the
     executor judged a stale window (a delegate's clock check, a forward
@@ -550,11 +583,32 @@ written under it. So the check also happens where the write is recorded
   answer: it may still execute somewhere), or is queued, the node waits
   until the token's `until` has passed, after which every executor that
   does not hold the grant refuses it (the minter refuses it once the
-  release ends the grant). So a released grant's stale operation never
-  lands after the next holder's writes. The last operation in flight
-  wakes the waiting release; a 250 ms poll is the fallback. If the wait
-  outlasts the grant's window, the grant lapses there and its owner
-  outwaits it.
+  release ends the grant). The last operation in flight wakes the
+  waiting release; a 250 ms poll is the fallback. If the wait outlasts
+  the grant's window, the grant lapses there and its owner outwaits it.
+  After that wait, a grant under which an operation ended in doubt, or
+  with a stranded one still queued, is **not released**. Its token is no
+  longer checked anywhere, but an executor that checked it in time may
+  still be committing the operation, and a release would let the owner
+  grant the lock at once, from a floor that lacks it. The node drops
+  the grant and leaves it to its owner's outwait (`locks.doubt_lapses`).
+  The outwait's barrier waits for a cut that every executor settles its
+  pinned writes for. On the owner's own grants this costs nothing extra.
+  When the owner's own grant runs out unreleased while one of its
+  operations tagged with it is in flight or ended in doubt, it leaves
+  the same barrier: its own release floor does not have that operation.
+  An operation in doubt is resolved, and the grant released as usual,
+  once its `Completed` (or its refusal) has reached this node's replica
+  with the log: then it has committed, or never will. One that ended in
+  doubt without a request id (the simulation's clients) is never
+  resolved. The next holder waits for the owner's record to end
+  (`ttl + margin` from the last renewal, about `2 × margin` past the
+  holder's window) and then for the barrier's cut. At a root with live
+  delegations, the cut also waits for every live delegate's next
+  renewal sent after the record's end: up to a quarter of the delegation
+  TTL while the delegate has grants out, half otherwise. At a delegate,
+  it waits for the root's next granting renewal answer, which the
+  delegate asks for at once.
   The same holds for the next turn on the same node under the same
   cached grant, for what the earlier turn already counts as done: a
   lock taken when no local lock is left on the file waits (a
@@ -706,7 +760,20 @@ floor:
   are refused everywhere from its window's end, which is `2 × margin`
   minus the transit and the holder's clock skew before the record's end —
   positive by the margin rule (margin ≥ skew + transit) — so whatever was
-  executed under the grant was executed before the record ended.
+  executed under the grant was executed before the record ended. A
+  write that passed its check before then and is still committing is
+  waited for by whoever reports a position for the cut (see
+  [The fencing token](#the-fencing-token), "Until the commit").
+- The owner's own grant needs no barrier: what its clients were
+  acknowledged is in its release floor (its whole unshipped journal,
+  not only the lock file's rows), which becomes the file's floor when
+  the record is outwaited — by the expiry timer, or found expired by
+  the next request. (The second case left no floor: after the owner's
+  core stalled past its own grant's window, the next holder read the
+  older version of a file the lock guarded, sim `locks-stall-step`.) It
+  takes a barrier only while one of its own mutations tagged with the
+  grant may still land at another executor: one in flight, or one that
+  ended in doubt.
 - A cut is the root's own position (its log, its unshipped journal, its
   own generations) joined with every live generation's stream index as
   its delegate's latest renewal reported it. Each `DelegRenew` carries
@@ -1005,6 +1072,16 @@ would make SQLite unusable and would fence I/O whenever S3 is slow. So:
 - Workloads that never lock pay one atomic load per I/O, and one per
   write or namespace operation for the owner fence and the fencing
   token (8 ns per operation measured).
+- The check at the write: every journaled transaction looks for a
+  pending token and admission (two thread-local reads). A tagged one
+  takes the lock table's mutex once more to check and pin, and once to
+  unpin. A position this node reports costs one atomic load while no
+  tagged write is in a transaction. It costs one writer-lock turn, that
+  is a wait for the commit in flight, while a write under a grant this
+  table ended is in one, or a write under another sequencer's grant
+  whose token's window has passed here. A delegate's renewal therefore
+  waits for a slow tagged commit only once that commit outlasted its
+  window.
 - The fencing token: while this node holds any local lock, each
   operation that mutates takes its caller's tag once (its `/proc` status,
   its process's identity and the lock table: about 7.5 µs measured on this host with

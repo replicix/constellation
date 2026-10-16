@@ -52,6 +52,38 @@ pub enum FaultKind {
     CutS3 { node: NodeId, for_ms: u64 },
     /// Stop a node for `for_ms` while its timers keep running.
     Pause { node: NodeId, for_ms: u64 },
+    /// F1 (`cst-load-review` §5.2): the next event `node` handles (0: the
+    /// lease holder) takes its `now`, then waits `for_ms` before the core
+    /// decides with it — a step that waited for the store's writer lock,
+    /// or a process stopped between its clock read and its writes. The
+    /// node's other events queue meanwhile.
+    StallStep { node: NodeId, for_ms: u64 },
+    /// F1: on `node` (0: the lease holder), the next fast-path write that
+    /// carries a fencing token passes its check and then waits for the
+    /// store's writer lock behind a slow writer for `core_ms + after_ms`;
+    /// the core's next step waits `core_ms` behind the same writer and
+    /// goes first after it (priority writes): it handles its backlog —
+    /// grant expiries, the next holder's request and writes — before the
+    /// held write's transaction runs.
+    WriterLockHold {
+        node: NodeId,
+        core_ms: u64,
+        after_ms: u64,
+    },
+    /// F1, the executor that did not mint the grant: delegate `node`'s
+    /// next tagged write on its own fast path (under a lock its root
+    /// minted) passes its check at the write and stays in its transaction,
+    /// pinned, for `after_ms` — a slow commit holding the writer lock;
+    /// the first other writer on the node lets it commit first, as it
+    /// would wait for it. Once it is held the node is cut from its root
+    /// for `partition_ms`: the grant lapses and the root outwaits it, and
+    /// the delegate's stream head must cover the held write before the
+    /// root can grant on (the settle on its renewal).
+    DelegateWriteHold {
+        node: NodeId,
+        partition_ms: u64,
+        after_ms: u64,
+    },
     /// Plan 30 M0's fault knob: delay the holder's forward replies by
     /// `delay_ms` for `for_ms` (bug A's trigger).
     SlowReplies { delay_ms: u64, for_ms: u64 },
@@ -249,6 +281,27 @@ pub struct SimConfig {
     /// the delegate's request timeout (`stress-ng-fs-nodes`). `(0, 0)`:
     /// none.
     pub deleg_answer_delay: (u64, u64),
+    /// F1's non-vacuity knob: `false` switches the fencing-token check at
+    /// the write off on every node (`LockTables::set_tag_check_at_write_for_tests`),
+    /// which is the code before it — a write that waited for the writer
+    /// lock past its grant's end lands.
+    pub tag_check_at_write: bool,
+    /// F1: a turn whose write was *acknowledged* (`Accepted`) is never
+    /// excused as an unacknowledged late landing when a later holder reads
+    /// an older turn than the newest acknowledged one — the application
+    /// was told its write under the lock succeeded (the lock's lost
+    /// update). The client counts its turn acknowledged only while its
+    /// grant was honoured, which a write held past its grant's end is
+    /// not.
+    pub strict_lock_turns: bool,
+    /// F1's other non-vacuity knob: `false` makes every node's
+    /// `Meta::settle_tagged_writes` wait for nothing (the code before it):
+    /// a position is reported while a tagged write that passed its check
+    /// is still committing.
+    pub settle_tagged_writes: bool,
+    /// How long a lock client waits for its turn write's answer before it
+    /// leaves it in doubt (`None`: 3 s, 30 s under `strict_lock_turns`).
+    pub lock_write_wait_ms: Option<u64>,
 }
 
 /// See `SimConfig::fast_path`.
@@ -470,6 +523,10 @@ impl Default for SimConfig {
             lock_writes: false,
             lock_data_dir: None,
             deleg_answer_delay: (0, 0),
+            tag_check_at_write: true,
+            strict_lock_turns: false,
+            settle_tagged_writes: true,
+            lock_write_wait_ms: None,
         }
     }
 }
@@ -494,6 +551,16 @@ pub struct Report {
     /// M12 round 2: ops the modelled FUSE fast path executed
     /// (`SimConfig::fast_path`).
     pub fast_path_executed: u64,
+    /// F1 (`WriterLockHold`): fast-path writes held behind the slow
+    /// writer, and those then refused at the write or executed.
+    pub held_writes: u64,
+    pub held_refused: u64,
+    pub held_accepted: u64,
+    /// F1: tagged writes refused only by the check at the write, and
+    /// positions that waited for a tagged write in its transaction
+    /// (`LockStats`, summed over the nodes' last incarnations).
+    pub token_rejections_at_write: u64,
+    pub settle_waits: u64,
     /// The generic tester ran too (few tentative ops).
     pub stateright_checked: bool,
     /// Refusals explained only by an acked-then-rolled-back effect (L2).
@@ -1596,6 +1663,79 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             let until = tokio::time::Instant::now() + Duration::from_millis(for_ms);
             cluster.get(node).pause_until(until);
         }
+        FaultKind::StallStep { node, for_ms } => {
+            let node = match node {
+                0 => match read_lease(&cluster.env.bucket).await {
+                    Some(lease) => lease.holder,
+                    None => return,
+                },
+                n => n,
+            };
+            if !cluster.ids().contains(&node) || !cluster.get(node).alive() {
+                return;
+            }
+            note(format!(
+                "t={} stall node {node}'s next step for {for_ms}ms",
+                fault.at_ms
+            ));
+            let now = cluster.env.clock.now().0;
+            cluster
+                .note_takedown(node, Some(now + for_ms as i64), fault.at_ms)
+                .await;
+            cluster.get(node).stall_next_step(for_ms);
+        }
+        FaultKind::WriterLockHold {
+            node,
+            core_ms,
+            after_ms,
+        } => {
+            let node = match node {
+                0 => match read_lease(&cluster.env.bucket).await {
+                    Some(lease) => lease.holder,
+                    None => return,
+                },
+                n => n,
+            };
+            if !cluster.ids().contains(&node) || !cluster.get(node).alive() {
+                return;
+            }
+            note(format!(
+                "t={} hold node {node}'s next tagged fast-path write {}ms behind a slow writer (its core {core_ms}ms)",
+                fault.at_ms,
+                core_ms + after_ms
+            ));
+            let now = cluster.env.clock.now().0;
+            cluster
+                .note_takedown(
+                    node,
+                    Some(now + (core_ms + after_ms) as i64 + 5_000),
+                    fault.at_ms,
+                )
+                .await;
+            cluster
+                .get(node)
+                .hold_next_tagged_write(core_ms, core_ms + after_ms);
+        }
+        FaultKind::DelegateWriteHold {
+            node,
+            partition_ms,
+            after_ms,
+        } => {
+            if !cluster.ids().contains(&node) || !cluster.get(node).alive() {
+                return;
+            }
+            let root = read_lease(&cluster.env.bucket)
+                .await
+                .map_or(1, |lease| lease.holder);
+            note(format!(
+                "t={} hold delegate {node}'s next tagged write {after_ms}ms in its transaction, \
+                 then cut it from root {root} for {partition_ms}ms",
+                fault.at_ms
+            ));
+            cluster
+                .get(node)
+                .hold_next_delegate_write(root, partition_ms, after_ms);
+        }
         FaultKind::SlowReplies { delay_ms, for_ms } => {
             let Some(lease) = read_lease(&cluster.env.bucket).await else {
                 return;
@@ -2033,6 +2173,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         clock_skew_ms: cfg.clock_skew_ms,
         seed,
         world: ChunkWorld::new(),
+        tag_check_at_write: cfg.tag_check_at_write,
+        settle_tagged_writes: cfg.settle_tagged_writes,
     };
     env.world
         .hold_ms
@@ -2052,6 +2194,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         slack: cfg.epoch_slack,
         locks: Arc::new(super::locks::LockGhost::new(seed)),
     });
+    cluster.locks.set_strict_turns(cfg.strict_lock_turns);
+    cluster.locks.set_write_wait_ms(cfg.lock_write_wait_ms);
     for ((a, b), ms) in &cfg.rtts {
         bus.set_rtt(*a, *b, *ms);
     }
@@ -2485,6 +2629,28 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     // Plan 30 §M14: mutual exclusion.
     report.locks = cluster.locks.counters();
+    // F1: no held write landed inside another node's critical section,
+    // nor over another node's newer acknowledged turn (unless rolled back
+    // since).
+    let rolled_back: HashSet<Rid> = cluster
+        .ids()
+        .into_iter()
+        .flat_map(|id| {
+            cluster
+                .get(id)
+                .shared
+                .tentative
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for id in cluster.ids() {
+        let landed = cluster.get(id).shared.landed.lock().unwrap().clone();
+        cluster.locks.check_landings(&landed, &rolled_back);
+    }
     let lock_violations = cluster.locks.violations();
     if let Some(what) = lock_violations.first() {
         return Err(format!(
@@ -2541,6 +2707,13 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             .shared
             .fast_path_executed
             .load(std::sync::atomic::Ordering::Relaxed);
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+        report.held_writes += load(&n.shared.held_writes);
+        report.held_refused += load(&n.shared.held_refused);
+        report.held_accepted += load(&n.shared.held_accepted);
+        let ls = n.meta.locks().stats();
+        report.token_rejections_at_write += ls.token_rejections_at_write;
+        report.settle_waits += ls.settle_waits;
     }
     report.acked_rolled_back = rolled_back_acked;
     // Plan 30 §M14: a later holder read an older turn than the one

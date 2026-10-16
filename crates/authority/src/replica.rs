@@ -277,6 +277,13 @@ pub trait Replica {
     /// The highest stream index this node assigned as the delegate of
     /// `gen`.
     fn delegate_idx(&self, gen: u64) -> u64;
+    /// F1: wait until every tagged write that passed its fencing-token
+    /// check at the write here, under a grant no longer live in this
+    /// node's table, has committed (`Meta::settle_tagged_writes`) — before
+    /// a position read next is reported as covering what this node
+    /// executed. `true` if it waited (one writer-lock turn); nothing
+    /// while no such write is in its transaction.
+    fn settle_tagged_writes(&self) -> bool;
     /// A takeover's strand took rows of this delegate's stream `gen` out
     /// of it (`Meta::delegate_stranded`): the generation is never
     /// executed in here again.
@@ -971,6 +978,10 @@ impl Replica for Meta {
 
     fn delegate_idx(&self, gen: u64) -> u64 {
         Meta::delegate_idx(self, gen).unwrap_or(0)
+    }
+
+    fn settle_tagged_writes(&self) -> bool {
+        Meta::settle_tagged_writes(self)
     }
 
     fn delegate_stranded(&self, gen: u64) -> bool {

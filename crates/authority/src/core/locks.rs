@@ -201,8 +201,9 @@ pub(crate) struct LockState {
     /// in flight, by that RPC's id → the inode: the RPC's own reply
     /// (the owner re-affirmed the grant under a *new* id) then installs
     /// that id instead of being dropped, so this node holds the id the
-    /// owner recalls. Bounded (`DONE_REQS_KEPT`).
-    done_reqs: BTreeMap<OpId, Ino>,
+    /// owner recalls. Bounded (`DONE_REQS_KEPT`). With the inode, when
+    /// that RPC was sent: the reply's window counts from it.
+    done_reqs: BTreeMap<OpId, (Ino, Ms)>,
     // ---- owner side ----
     waiters: Vec<Waiter>,
     next_waiter: u64,
@@ -1440,6 +1441,8 @@ impl Core {
     /// The position a grant carries: everything acknowledged on `ino`
     /// before it (as a ReadIndex answer would say).
     fn lock_position(&self, ino: Ino, replica: &dyn Replica) -> Position {
+        // F1: as `lock_release_floor`.
+        replica.settle_tagged_writes();
         if self.cfg.delegation && !replica.delegation_table().is_empty() {
             let keys = Self::read_keys(ino, None);
             if let constellation_meta::delegation::Ownership::Delegated(d) =
@@ -1504,6 +1507,11 @@ impl Core {
     /// raise no frontier). A delegate's own executions are in the
     /// frontier already (its stream index).
     fn lock_release_floor(&self, replica: &dyn Replica) -> Position {
+        // F1: what this node executed includes a tagged write that passed
+        // its check at the write and has not committed yet; under a grant
+        // that has ended here since (the one this floor follows, maybe),
+        // it would land after the floor was taken. Wait for it first.
+        replica.settle_tagged_writes();
         let mut p = replica.frontier();
         // Its own executions as a delegate: the session frontier can
         // trail them (it records what replies and streams brought here,
@@ -1629,14 +1637,38 @@ impl Core {
 
     /// Owner side: the grant records that expired here unreleased since
     /// the last look become barriers on their inodes (see
-    /// [`LockState::barriers`]). This node's own grants are left out:
-    /// what its clients were acknowledged is in its release floor, which
-    /// every grant here joins anyway.
+    /// [`LockState::barriers`]). This node's own grants need none (unless
+    /// a mutation under one may still land elsewhere,
+    /// `lock_own_outwait_barrier`): what its clients were acknowledged is
+    /// in its release floor, which becomes the inode's floor here, as at
+    /// an expiry timer's outwait (`on_lock_grant_expiry`). A grant's own
+    /// position names this node's unshipped journal only where it touched
+    /// the lock file, not the files the lock guards: an own grant dropped
+    /// here unreleased, after a stall of this node's core past its window
+    /// (sim `locks-stall-step`, `locks-writer-hold`), was granted on with
+    /// a floor that lacked the turn its holder wrote to another file.
     fn lock_take_outwaited(&mut self, replica: &dyn Replica) {
         for g in replica.locks().take_outwaited() {
             if g.node != self.cfg.node_id {
                 self.lock_barrier(g.ino, g.until_ms, Some(g.node));
+            } else {
+                let floor = self.lock_release_floor(replica);
+                self.lock_note_floor(g.ino, &floor);
+                self.lock_own_outwait_barrier(&g, replica);
             }
+        }
+    }
+
+    /// F1: this node's own grant ended unreleased (outwaited here) while
+    /// a mutation of this node tagged with it may still land at an
+    /// executor — one in flight, or one that ended in doubt
+    /// (`LockTables::tagged_unsettled`). Its release floor does not have
+    /// it, so the next grant to another node waits for a cut, as after
+    /// another holder's outwait (its own next grant does not).
+    fn lock_own_outwait_barrier(&mut self, g: &Grant, replica: &dyn Replica) {
+        Self::lock_resolve_doubts(g.id, replica);
+        if replica.locks().tagged_unsettled(g.id) {
+            self.lock_barrier(g.ino, g.until_ms, Some(g.node));
         }
     }
 
@@ -1946,6 +1978,20 @@ impl Core {
     /// Delegate: every renewal sent in this event carries this node's
     /// executed stream head of its generation.
     fn lock_fill_renew_heads(&self, replica: &dyn Replica, out: &mut [Action]) {
+        // F1: the head is reported as of the renewal's stamp (this step's
+        // `now`, taken before it): a tagged write that passed its check
+        // before then and is still in its transaction must be under it.
+        if out.iter().any(|a| {
+            matches!(
+                a,
+                Action::Send {
+                    msg: PeerMsg::DelegRenew { .. },
+                    ..
+                }
+            )
+        }) {
+            replica.settle_tagged_writes();
+        }
         for a in out.iter_mut() {
             if let Action::Send {
                 msg:
@@ -2468,6 +2514,8 @@ impl Core {
         // But not what it was acknowledged elsewhere: a barrier.
         if g.node != self.cfg.node_id {
             self.lock_barrier(g.ino, g.until_ms, Some(g.node));
+        } else {
+            self.lock_own_outwait_barrier(&g, replica);
         }
         tracing::info!(
             node = self.cfg.node_id,
@@ -3113,7 +3161,7 @@ impl Core {
         outcome: LockOutcome,
         replica: &dyn Replica,
     ) {
-        let Some(ino) = self.lk.done_reqs.remove(&req) else {
+        let Some((ino, sent)) = self.lk.done_reqs.remove(&req) else {
             return;
         };
         let LockOutcome::Granted {
@@ -3133,6 +3181,15 @@ impl Core {
         }
         let margin = self.lock_margin_ms();
         let ttl = ttl_ms as i64;
+        // The window counts from the RPC's send, as every grant's does
+        // (`lock_op_outcome`), not from the reply's arrival: one handled
+        // late (a stalled step, a reply slow in transit) was honoured
+        // past the owner's record of it — the owner outwaited it and
+        // granted another node while this one still did I/O under it
+        // (sim `locks-stall-step` seed 1934: two exclusive holders).
+        if sent.0 + ttl - margin <= now.0 {
+            return;
+        }
         if cur.id == id {
             // The owner's recall of the new id came first and adopted it
             // (`LockTables::recall_held`): the reply extends that grant
@@ -3144,15 +3201,15 @@ impl Core {
             // after the push's install).
             replica
                 .locks()
-                .renewed(ino, id, id, mode, now.0, ttl, margin, false);
+                .renewed(ino, id, id, mode, sent.0, ttl, margin, false);
             self.stats.lock_late_replies_installed += 1;
             return;
         }
         let held = HeldGrant {
             id,
             mode,
-            until_ms: now.0 + ttl - margin,
-            renew_at_ms: constellation_meta::locks::renew_point(now.0, ttl, margin),
+            until_ms: sent.0 + ttl - margin,
+            renew_at_ms: constellation_meta::locks::renew_point(sent.0, ttl, margin),
             owner: from,
             recalled: false,
             position,
@@ -3222,7 +3279,7 @@ impl Core {
                 self.lk.by_req.remove(&req);
                 // Its reply, if the owner answers it too, installs the
                 // id the owner then tracks (`on_lock_reply`).
-                self.lk.done_reqs.insert(req, ino);
+                self.lk.done_reqs.insert(req, (ino, o.sent_at));
                 while self.lk.done_reqs.len() > DONE_REQS_KEPT {
                     self.lk.done_reqs.pop_first();
                 }
@@ -3959,6 +4016,35 @@ impl Core {
             .max()
     }
 
+    /// F1: the ops that ended in doubt under `grant` whose outcome this
+    /// replica knows now — their `Completed` (or refusal) came with the
+    /// log: executed (so committed) or refused, either way not still
+    /// landing — are doubts no more; a grant with none left is released
+    /// as usual. One without a rid stays a doubt.
+    fn lock_resolve_doubts(grant: GrantId, replica: &dyn Replica) {
+        let Some((_, rids)) = replica.locks().doubt_of(grant) else {
+            return;
+        };
+        for rid in rids {
+            if matches!(replica.completed_outcome(rid), Ok(Some(_))) {
+                replica.locks().resolve_doubt(grant, rid);
+            }
+        }
+    }
+
+    /// F1: one of this node's own stranded ops tagged with `grant` is
+    /// still queued for its replay, unresolved, its token's window over (a
+    /// release waited for that): it may be executing at its new sequencer
+    /// already, as an op in doubt may.
+    fn replay_unresolved(grant: GrantId, replica: &dyn Replica) -> bool {
+        replica.pending_replays().is_ok_and(|queued| {
+            queued
+                .iter()
+                .filter(|q| q.refused.is_none() && !q.foreign)
+                .any(|q| q.lock_tag.0.iter().any(|t| t.grant == grant))
+        })
+    }
+
     /// Phase 2: the last tagged mutation in flight under `ino`'s recalled
     /// grant was answered (`LockTables::set_release_wake`): a release
     /// waiting for it looks again now, not at its next poll.
@@ -4061,10 +4147,37 @@ impl Core {
             self.cancel_timer(timer, out);
         }
         self.lk.flushing.remove(&ino);
-        if !replica.locks().end_release(ino, grant) {
+        // F1: a mutation tagged with the grant ended in doubt (or was
+        // stranded and queued for replay). Its token's window is over now,
+        // so no executor *checks* it any more — but one that checked it
+        // before may still be committing it (a slow writer ahead of it),
+        // and a release would let the owner grant the lock at once, with a
+        // floor that lacks the write. Not released, then: dropped here and
+        // left to the owner's outwait, whose barrier waits for a cut that
+        // every executor settles its tagged writes for (its own record,
+        // when this node is the owner: `lock_own_outwait_barrier`).
+        Self::lock_resolve_doubts(grant, replica);
+        let doubted = replica.locks().was_doubted(grant) || Self::replay_unresolved(grant, replica);
+        let ended = if doubted {
+            replica.locks().drop_unreleased(ino, grant)
+        } else {
+            replica.locks().end_release(ino, grant)
+        };
+        if !ended {
             // Gone already, or a local lock (or the grant's first use)
             // appeared meanwhile: it stays, recalled; the last unlock
             // releases it again (sim seed 90106).
+            return;
+        }
+        if doubted {
+            self.stats.lock_doubt_lapses += 1;
+            replica.locks().with_stats(|s| s.doubt_lapses += 1);
+            tracing::info!(
+                node = self.cfg.node_id,
+                ino,
+                ?grant,
+                "a recalled lock grant is left to its owner's outwait: a mutation tagged with it ended in doubt"
+            );
             return;
         }
         self.stats.lock_released += 1;

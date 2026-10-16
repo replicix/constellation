@@ -1068,7 +1068,7 @@ pub fn reissue_after_lapse() -> bool {
 /// (`LocalOutcome::Predecessor`) — pinned now, before the op answers.
 /// A close that ends its caller's turn on a file pins that file's grant
 /// too ([`begin_close`]).
-pub fn note_tag_in_doubt() {
+pub fn note_tag_in_doubt(rid: Option<constellation_meta::Rid>) {
     SCOPE.with(|s| {
         if let Some(st) = s.borrow_mut().as_mut() {
             if st
@@ -1083,17 +1083,20 @@ pub fn note_tag_in_doubt() {
                 // (`LocalOutcome::Predecessor`), not wait for the scope's
                 // end (`TagScope::drop` pins it again, harmlessly).
                 let table = st.locks.meta.locks();
-                table.pin_in_doubt(&st.doubt);
+                table.pin_in_doubt(&st.doubt, rid);
                 // A close ending its caller's turn on a file
                 // ([`begin_close`]) pins that file's grant too, whatever
                 // its token names (one grant per minter, the one whose
                 // window ends first: maybe another file's), until the
                 // grant's window as held now.
                 if let Some(h) = st.closes.and_then(|ino| table.held(ino)) {
-                    table.pin_in_doubt(&LockTag(vec![constellation_meta::locks::LockToken {
-                        grant: h.id,
-                        until_ms: h.until_ms,
-                    }]));
+                    table.pin_in_doubt(
+                        &LockTag(vec![constellation_meta::locks::LockToken {
+                            grant: h.id,
+                            until_ms: h.until_ms,
+                        }]),
+                        rid,
+                    );
                 }
             }
         }

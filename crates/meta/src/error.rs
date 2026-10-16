@@ -41,6 +41,14 @@ pub enum MetaError {
     #[error("the lock grant the op was issued under is no longer live")]
     LockLapsed,
 
+    /// F1: the fast path's admission of the op (its lease, or the
+    /// delegation it executes under) ran out while the op waited for the
+    /// store's writer lock (`mutate::execute_admitted`). Nothing was
+    /// journaled; the caller sends the op through the authority core, as
+    /// one refused at admission. Never an answer to an application.
+    #[error("the fast path's admission ran out before the write")]
+    NotAdmitted,
+
     #[error("fjall: {0}")]
     Fjall(#[from] fjall::Error),
 
@@ -78,7 +86,7 @@ impl MetaError {
             NoData => Code::NoData,
             Invalid(_) => Code::Invalid,
             Conflict => Code::Again,
-            LockLapsed => Code::Io,
+            LockLapsed | NotAdmitted => Code::Io,
             Fjall(_) | Io(_) | Record(_) | Key(_) | Json(_) | Postcard(_) => Code::Io,
         }
     }

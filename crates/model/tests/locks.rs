@@ -174,6 +174,36 @@ fn no_fencing_violates() {
     assert_violates("no-fencing", &m);
 }
 
+/// F1 (`cst-load-review` §2): node 1's write is admitted while its grant
+/// is honoured and lands at the owner later — it passed its fencing-token
+/// check, then waited for the store's writer lock behind a slow writer.
+/// Meanwhile its grant lapses, the owner outwaits it and grants node 2.
+fn delayed_io(token_check_at_write: bool) -> LockModel {
+    LockModel {
+        delayed_io: true,
+        token_check_at_write,
+        ..LockModel::design(contend())
+    }
+}
+
+/// Checked only at admission (the code before), the write lands under
+/// node 2's grant: mutual exclusion violated (a lost update).
+#[test]
+fn delayed_io_without_the_write_check_violates() {
+    assert_violates("delayed-io-no-write-check", &delayed_io(false));
+}
+
+/// Checked where it lands, against the owner's table: refused once the
+/// grant is gone there, so it lands only before any conflicting grant.
+#[test]
+fn delayed_io_with_the_write_check_is_clean() {
+    assert_clean(
+        "delayed-io-write-check",
+        &delayed_io(true),
+        &["all_ops_done", "recall_expired", "recall_released"],
+    );
+}
+
 /// Clocks within `D = 1` that may each step once: with margins of 1 on
 /// both sides (`M_n + M_s < 4D`) the owner's outwait ends before the
 /// holder's honoured window does.

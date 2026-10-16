@@ -17,6 +17,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The F1 seams the simulation parks writes with (`test-util`).
+constellation-meta = { workspace = true, features = ["test-util"] }
 # Plan 31 C1's two-node test carries a holder's reply through the real P2P
 # envelope (`core::tests::portable_codes`).
 constellation-net.workspace = true

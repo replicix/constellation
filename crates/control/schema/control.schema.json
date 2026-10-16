@@ -3907,6 +3907,12 @@
     "LockStatus": {
       "description": "Plan 30 §M14: `--locks cluster` — lock grants leased from the\nowning sequencer.",
       "properties": {
+        "doubt_lapses": {
+          "description": "F1: recalled grants this node left to their owner's outwait\ninstead of releasing them (a mutation tagged with them ended in\ndoubt and was not resolved yet).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "fenced_io": {
           "description": "I/O refused with `EIO` under a lapsed grant.",
           "format": "uint64",
@@ -4144,6 +4150,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "settle_waits": {
+          "description": "F1: positions this node reported as covering what it executed (a\ngrant's floor, an outwait's cut, a delegate's stream head) that\nfirst waited for a tagged write still in its transaction, under a\ngrant ended here or whose token's window was over.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "stale_incarnation_requests": {
           "format": "uint64",
           "minimum": 0,
@@ -4157,6 +4169,12 @@
         },
         "token_rejections": {
           "description": "Plan 30 §M14 phase 2: tagged mutations this node refused as their\nexecutor because a grant they named was no longer live (`EIO` to\ntheir issuer; nothing journaled).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "token_rejections_at_write": {
+          "description": "F1: of those, the ones only the check under the store's writer\nlock refused (the op had passed the check before it waited for\nthe lock).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4227,6 +4245,9 @@
         "waiters_parked",
         "grace_refusals",
         "token_rejections",
+        "token_rejections_at_write",
+        "settle_waits",
+        "doubt_lapses",
         "requeued_in_place",
         "released_superseded",
         "peers_unreachable",

@@ -1549,7 +1549,7 @@ fn a_new_turn_waits_for_an_op_in_doubt_before_its_scope_ends() {
         s.spawn(move || {
             let _scope = locks.tag_scope(Some(me), Some(0xa));
             crate::locks::current_tag().unwrap();
-            crate::locks::note_tag_in_doubt();
+            crate::locks::note_tag_in_doubt(None);
             tagged.send(()).unwrap();
             let _ = done.recv_timeout(Duration::from_secs(10));
         });
