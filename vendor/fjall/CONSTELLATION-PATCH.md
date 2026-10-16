@@ -1,4 +1,4 @@
-# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock, a persist that says when it flushes
+# Vendored fjall 3.1.10: shutdown deadlock fix, fair writer lock, sync outside the journal lock, slow-commit report, version GC outside the version lock, journal rotation without fsyncs under the journal lock, a persist that says when it flushes, a write halt that holds back only its own writer
 
 This directory is fjall **3.1.10** exactly as published on crates.io
 (checksum `cd201c93…c33f`, upstream commit
@@ -10,7 +10,7 @@ and both texts stay here unchanged.
 
 ## What is changed
 
-There are eight changes, each marked `CONSTELLATION PATCH`:
+There are nine changes, each marked `CONSTELLATION PATCH`:
 
 1. **`src/db.rs`, `impl Drop for DatabaseInner`**: this is the fix. The
    worker shutdown loop never blocks now.
@@ -45,6 +45,11 @@ There are eight changes, each marked `CONSTELLATION PATCH`:
    `persist_with(mode, at_lock)`, a persist that calls `at_lock` with the
    journal writer's lock held right before it flushes. See
    [Change 8](#change-8-a-persist-that-says-when-it-flushes).
+9. **`src/batch/mod.rs`, `src/tx/write_tx.rs`,
+   `src/tx/single_writer/write_tx.rs`**: a single-writer transaction's
+   commit releases the writer lock before its keyspaces' write stall and
+   halt. See
+   [Change 9](#change-9-a-write-halt-holds-back-only-its-own-writer).
 
 The directory is also listed in the workspace `exclude` list. That way it is
 built as a plain dependency, and `cargo clippy --workspace`, `cargo fmt --all`
@@ -461,6 +466,44 @@ follows. `at_lock` is not called when the database is poisoned or the
 lock cannot be taken (the persist fails). `persist` is `persist_with`
 with nothing to call; nothing else changes.
 
+## Change 9: a write halt holds back only its own writer
+
+A commit ends with its keyspaces' back-pressure (`local_backpressure`): a
+write stall while the keyspace has 20 or more L0 runs, and a write halt —
+sleeping 100 ms at a time — while it has four or more sealed memtables
+queued for flushing. Upstream does this inside the batch's commit, and a
+`SingleWriterTxDatabase` write transaction holds the single-writer lock
+until its commit returns: one writer halted on its keyspace's flush
+backlog kept every other writer of the database waiting for those
+flushes, whatever keyspace they wrote to (the authority core's priority,
+change 3, cannot help: it waits for the holder).
+
+`OwnedWriteBatch::commit` is now `commit_then_backpressure` followed by
+the returned `Backpressure`'s `apply` (the rotation check, the stall and
+halt, and change 5's report, timed as before). A single-writer
+transaction's `commit` drops its writer guard in between. At that point
+its batch is in the journal and the memtables and its seqno is published,
+so the next writer's snapshot sees it: transactions stay serialized. The
+halted writer still does not return before its keyspace has caught up;
+another writer into that keyspace halts in its own commit after its batch,
+so the backlog grows by at most one batch per writer thread, as with
+upstream's plain `Database`, whose writers do not share a lock. Batches,
+optimistic transactions and the journal are unchanged.
+
+Found by `crates/meta/tests/compaction_stall.rs`'s
+`journal_rotations_never_freeze_commits` on a loaded host (load average
+30–65, the database on a busy disk): its loader's 1 MiB commits halted
+for 0.6–1.4 s as the flushes fell behind, and the measured 2-row commits
+into another keyspace waited for each halt: the worst commit was over the
+test's 1 s limit in 4 of 51 runs (up to 1.42 s), and 0.56–0.87 s in every
+other run with a halt. With this change, under the same load, 66 of 66
+runs passed with a worst commit of 0.07–0.43 s, while the loader's own
+commits still halted. The deterministic test is
+`a_write_halt_holds_back_only_its_own_writer` in the same file: without
+flush workers a keyspace with four sealed memtables halts every commit
+into it until the test clears it, and a commit into another keyspace must
+go through meanwhile (before: it waited for as long as the halt lasted).
+
 ## Tests
 
 `crates/meta/tests/fjall_drop_deadlock.rs` opens a database with 4 workers,
@@ -495,8 +538,8 @@ If the fix is still needed when moving to a newer fjall before upstream has
 it, vendor that version instead and re-apply the `db.rs` hunk. The hunk is
 self-contained and only touches `impl Drop for DatabaseInner`.
 
-Changes 3, 4, 5, 7 and 8 have no upstream counterpart (7 is filed in
-`../ISSUE-fjall.md`): dropping the vendored copy
+Changes 3, 4, 5, 7, 8 and 9 have no upstream counterpart (7 and 9 are filed
+in `../ISSUE-fjall.md`): dropping the vendored copy
 means re-applying them to the new version (or giving up the writer
 priority and the unlocked sync, which brings back the stalls described
 above). Change 6 goes with the vendored lsm-tree

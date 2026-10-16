@@ -314,9 +314,21 @@ impl BaseTransaction {
     ///
     /// Will return `Err` if an IO error occurs.
     pub(super) fn commit(self) -> crate::Result<()> {
+        if let Some(backpressure) = self.commit_then_backpressure()? {
+            backpressure.apply();
+        }
+        Ok(())
+    }
+
+    /// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 9): the commit,
+    /// with its write stall/halt left to the caller (`None`: nothing was
+    /// written).
+    pub(super) fn commit_then_backpressure(
+        self,
+    ) -> crate::Result<Option<crate::batch::Backpressure>> {
         // skip all the logic if no keys were written to
         if self.memtables.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         // TODO: instead of using batch, write batch::commit as a generic function that takes
@@ -345,9 +357,7 @@ impl BaseTransaction {
             }
         }
 
-        batch.commit()?;
-
-        Ok(())
+        batch.commit_then_backpressure().map(Some)
     }
 
     /// More explicit alternative to dropping the transaction

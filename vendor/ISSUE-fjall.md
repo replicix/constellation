@@ -620,3 +620,29 @@ Why the check is exact: seqnos are allocated under the journal lock and strictly
 
 Two more details: a flush worker waits for a pending old-journal sync before it flushes (as it did, behind the journal lock), and the next rotation does not wait for it (each pending sync is chained to the one before), so the active journal stays near 64 MB under load. Constellation's patch (`vendor/fjall/CONSTELLATION-PATCH.md`, change 7) has the code and the tests: slow-sync latency, crash images at each step with the old journal's unsynced tail cut at several points, a restart followed by a power loss (every journal reset to its contents at its last sync), a damaged batch in a sealed journal, a durable persist that must wait, and a rotation while the previous sync is held.
 
+
+# `SingleWriterTxDatabase`: a commit's write halt keeps the single-writer lock, so one keyspace's flush backlog stalls every writer
+
+## Version
+
+- fjall 3.1.10 (`src/batch/mod.rs`, `src/tx/single_writer/write_tx.rs`, `src/keyspace/mod.rs`)
+- Linux 7.3.0-0.rc4.260925g165768bb7026.42.fc46.x86_64, rustc 1.98; btrfs on NVMe with a disk-and-CPU load running beside the test
+
+## Problem
+
+`WriteBatch::commit` ends with each written keyspace's back-pressure (`Keyspace::local_backpressure`): a write stall while the keyspace has 20 or more L0 runs, and a write halt, `sleep(100 ms)` in a loop, while it has four or more sealed memtables waiting for a flush. A `SingleWriterTxDatabase` write transaction holds the single-writer lock until `commit` returns, so while one writer is halted on its keyspace's flush backlog, every other writer of the database waits in `write_tx()` for as long as the flushes take, whatever keyspace it writes to. The halt is meant to slow down the writer that outruns the flushes; under the lock it stops them all.
+
+## Reproducer
+
+Open a `SingleWriterTxDatabase` with `worker_threads_unchecked(0)` (no flush workers, so a sealed memtable stays sealed). Write a row into keyspace `a` and `rotate_memtable()` it, four times. A thread then commits a row into `a`: the batch lands (it is readable) and the commit halts. Another thread opens a transaction and commits a row into keyspace `b`. It waits in `write_tx()` until the halt ends (here: until `a.clear()`). Constellation's `a_write_halt_holds_back_only_its_own_writer` (`crates/meta/tests/compaction_stall.rs`) is this test.
+
+## Expected vs actual
+
+- Expected: the commit into `b` goes through while the halt on `a` lasts.
+- Actual, 3.1.10: it waits for the halt to end. With real flushes on a loaded host (load average 30–65, 1 MiB transactions into one keyspace at up to 100 MiB/s, 2-row commits into another every millisecond): `slow commit: 1421 ms for 64 items (... backpressure=1403ms)` for the loader, and the 2-row commit that waited behind it took 1.42 s; 4 of 51 runs had a 2-row commit over 1 s.
+
+With the fix below, the same load: worst 2-row commit 0.07–0.43 s in 66 runs, while the loader's own commits still halted.
+
+## Suggested fix
+
+Apply the back-pressure after the single-writer lock is released. Split the batch commit into the commit proper (journal append, memtable inserts, seqno published) and the back-pressure step (memtable rotation check, `local_backpressure`); `SingleWriterTxDatabase`'s `WriteTransaction::commit` drops its writer guard between the two. The batch is published before the lock is released, so the next writer's snapshot sees it and transactions stay serialized; the halted writer still does not return before its keyspace has caught up, and another writer into that keyspace halts in its own commit, so the backlog grows by at most one batch per writer thread (as with a plain `Database`, whose writers share no lock). Constellation's patch (`vendor/fjall/CONSTELLATION-PATCH.md`, change 9) has the code.

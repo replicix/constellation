@@ -365,7 +365,16 @@ impl<'tx> WriteTransaction<'tx> {
     ///
     /// Will return `Err` if an IO error occurs.
     pub fn commit(self) -> crate::Result<()> {
-        self.inner.commit()
+        // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 9): the
+        // writer lock is released before the write stall/halt, which holds
+        // back this writer only.
+        let Self { _guard, inner } = self;
+        let backpressure = inner.commit_then_backpressure()?;
+        drop(_guard);
+        if let Some(backpressure) = backpressure {
+            backpressure.apply();
+        }
+        Ok(())
     }
 
     /// More explicit alternative to dropping the transaction

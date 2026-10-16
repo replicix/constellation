@@ -101,9 +101,22 @@ impl WriteBatch {
     ///
     /// Will return `Err` if an IO error occurs.
     #[allow(clippy::missing_panics_doc)]
-    pub fn commit(mut self) -> crate::Result<()> {
+    pub fn commit(self) -> crate::Result<()> {
+        self.commit_then_backpressure()?.apply();
+        Ok(())
+    }
+
+    // CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 9): the commit
+    // without its keyspaces' write stall/halt, which the returned
+    // [`Backpressure`] applies. A single-writer transaction releases its
+    // writer lock in between: the batch is in the journal and the
+    // memtables, and published, so the next writer may go; only this one
+    // is held back (a halt sleeps until its keyspace's flushes catch up),
+    // not every writer of the database behind it.
+    #[allow(clippy::missing_panics_doc)]
+    pub(crate) fn commit_then_backpressure(mut self) -> crate::Result<Backpressure> {
         if self.is_empty() {
-            return Ok(());
+            return Ok(Backpressure::none());
         }
 
         log::trace!("batch: Acquiring journal writer");
@@ -185,15 +198,44 @@ impl WriteBatch {
         // Otherwise write buffer growth is unbounded when using batches
         self.db.supervisor.write_buffer_size.allocate(batch_size);
 
-        // Check each affected keyspace for write stall/halt
-        for keyspace in &keyspaces_with_possible_stall {
+        Ok(Backpressure {
+            keyspaces: keyspaces_with_possible_stall,
+            timing: Some(timing),
+            items,
+        })
+    }
+}
+
+/// CONSTELLATION PATCH (CONSTELLATION-PATCH.md, change 9): what is left of
+/// a committed batch: its keyspaces' memtable rotation check and write
+/// stall/halt, and its slow-commit report.
+#[must_use]
+pub(crate) struct Backpressure {
+    keyspaces: HashSet<Keyspace>,
+    timing: Option<SlowCommit>,
+    items: usize,
+}
+
+impl Backpressure {
+    fn none() -> Self {
+        Self {
+            keyspaces: HashSet::new(),
+            timing: None,
+            items: 0,
+        }
+    }
+
+    /// Check each affected keyspace for write stall/halt (and a memtable
+    /// rotation), then report a slow commit.
+    pub(crate) fn apply(self) {
+        for keyspace in &self.keyspaces {
             let memtable_size = keyspace.tree.active_memtable().size();
             keyspace.check_memtable_rotate(memtable_size);
             keyspace.local_backpressure();
         }
-        timing.mark(Phase::Backpressure);
-        timing.report(items);
-
-        Ok(())
+        if let Some(mut timing) = self.timing {
+            timing.mark(Phase::Backpressure);
+            timing.report(self.items);
+        }
     }
 }

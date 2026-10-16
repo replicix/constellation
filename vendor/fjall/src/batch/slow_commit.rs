@@ -2,8 +2,8 @@
 // went (see CONSTELLATION-PATCH.md, change 5).
 //
 // A write transaction of a `SingleWriterTxDatabase` holds the database's
-// single-writer lock until its commit returns, so a slow commit stalls
-// every writer. Constellation saw commits of a few rows take up to 11 s
+// single-writer lock through its commit (change 9 releases it before the
+// write stall/halt that follows), so a slow commit stalls every writer. Constellation saw commits of a few rows take up to 11 s
 // under I/O pressure, nearly all of it in the memtable inserts: an insert
 // takes the LSM tree's version-history lock (read), which a flush or a
 // compaction holds (write) while it persists the new version — several

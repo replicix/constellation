@@ -39,6 +39,18 @@
 //! deterministic regression test is the vendored fjall's
 //! `commits_never_wait_for_a_rotation_sync` (journal syncs slowed by
 //! 300 ms).
+//!
+//! On a loaded host the flushes fall behind that loader, and its own
+//! commit halts in fjall's write stall (`local_backpressure`: four sealed
+//! memtables queued in its keyspace). Upstream fjall halts a
+//! single-writer transaction's commit with the writer lock still held,
+//! so every other commit of the database — the measured ones, into
+//! another keyspace — waited for those flushes too: commits of over 1 s
+//! here at a load average of 30–65 with the database on a busy disk.
+//! The vendored fjall releases the lock first (its change 9); the third
+//! test, `a_write_halt_holds_back_only_its_own_writer`, is the
+//! deterministic regression test (a halt that lasts until the test ends
+//! it).
 
 use fjall::{KeyspaceCreateOptions, SingleWriterTxDatabase};
 use std::io::Write;
@@ -319,5 +331,82 @@ fn journal_rotations_never_freeze_commits() {
     assert!(
         max < Duration::from_millis(max_ms),
         "a commit took {max:?} across journal rotations (limit {max_ms} ms)"
+    );
+}
+
+/// A commit that halts in its keyspace's write stall holds back its own
+/// writer, not the database's other writers (vendored fjall change 9).
+/// Without flush workers a sealed memtable stays sealed, so with four of
+/// them the keyspace halts every commit into it until the test clears it:
+/// a commit into another keyspace meanwhile must go through while that
+/// halt lasts. It used to wait for the halted writer's lock, which the
+/// halt kept, for as long as the halt lasted.
+#[test]
+fn a_write_halt_holds_back_only_its_own_writer() {
+    use std::sync::mpsc;
+    let dir = tempfile::Builder::new().prefix("halt-").tempdir().unwrap();
+    let db = SingleWriterTxDatabase::builder(dir.path().join("db"))
+        .worker_threads_unchecked(0)
+        .open()
+        .unwrap();
+    let halted = db
+        .keyspace("halted", KeyspaceCreateOptions::default)
+        .unwrap();
+    let other = db
+        .keyspace("other", KeyspaceCreateOptions::default)
+        .unwrap();
+    for i in 0..4u64 {
+        let mut tx = db.write_tx();
+        tx.insert(&halted, i.to_be_bytes(), b"sealed".to_vec());
+        tx.commit().unwrap();
+        assert!(halted.inner().rotate_memtable().unwrap());
+    }
+    assert_eq!(halted.inner().sealed_memtable_count(), 4);
+
+    // A commit into the halted keyspace: it lands, then halts.
+    let (halt_ended, halt_end) = mpsc::channel();
+    let halting = {
+        let (db, halted) = (db.clone(), halted.clone());
+        std::thread::spawn(move || {
+            let mut tx = db.write_tx();
+            tx.insert(&halted, b"halting".to_vec(), b"row".to_vec());
+            tx.commit().unwrap();
+            halt_ended.send(()).unwrap();
+        })
+    };
+    let landed = Instant::now();
+    while halted.inner().get(b"halting").unwrap().is_none() {
+        assert!(
+            landed.elapsed() < Duration::from_secs(60),
+            "the halting commit never landed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A commit into another keyspace meanwhile.
+    let (committed, other_commit) = mpsc::channel();
+    let writer = {
+        let (db, other) = (db.clone(), other.clone());
+        std::thread::spawn(move || {
+            let mut tx = db.write_tx();
+            tx.insert(&other, b"row".to_vec(), b"row".to_vec());
+            tx.commit().unwrap();
+            committed.send(()).unwrap();
+        })
+    };
+    let went_through = other_commit.recv_timeout(Duration::from_secs(30)).is_ok();
+    let halt_lasted = halt_end.try_recv().is_err();
+
+    // End the halt: clearing the keyspace drops its sealed memtables.
+    halted.inner().clear().unwrap();
+    halting.join().unwrap();
+    writer.join().unwrap();
+    assert!(
+        halt_lasted,
+        "the halt ended before the other commit was looked at"
+    );
+    assert!(
+        went_through,
+        "a commit into another keyspace waited for a write halt"
     );
 }
