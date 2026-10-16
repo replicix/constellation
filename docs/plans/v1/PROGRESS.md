@@ -48178,3 +48178,134 @@ client for the calls):
   (export, `--state-dir`, registry locking, E2E secret handling, the pin)
 - [x] fmt, clippy `-D warnings`, `cargo test --workspace`
 - [x] End-to-end on a test host, CLI and control socket, file and S3 backends
+
+## Fix: a lost `view.unmount` answer is no refusal; `umount` goes by the daemon's record (umount_drain flake, 2026-10-16)
+
+`umount_drain`'s `umount_fails_when_the_drain_cannot_ship_everything` failed
+about 1 run in 30 on an idle host (7 of 210) and 1 in 9 under a CPU and disk
+load (11 of 100), always with `umount` printing "the daemon closed the
+connection" instead of what the drain left behind.
+
+### Cause
+
+The daemon answers `view.unmount` once the view's session has ended, before
+its drain. Here the drain fails within a millisecond (the lost chunk); the
+daemon records `shutdown.result` ("unshipped"), removes its socket and
+exits, and its shutdown can cancel the call (the audit log said
+`cancelled`), or its exit close the connection, before the answer is out.
+`32f3736` meant `umount` to go by the daemon's record when the answer is
+lost, but only for `try_call`'s outer error; a call whose connection ends,
+or that the daemon cancels, comes back as the inner error (the client's own
+`Unavailable`, or `Cancelled`), and `umount` took it for a refusal.
+
+### What changed
+
+`control::went_away` (`Unavailable` or `Cancelled`: the daemon is going
+away); `umount` treats such an answer as none: it waits for the views to
+end and the daemon to exit and reports the recorded outcome. A refusal
+still fails it with its message.
+
+### Verification
+
+`umount_goes_by_the_daemons_record_when_it_exits_before_answering` (a
+stand-in daemon on the real control server that records an unshipped
+drain, removes its socket and ends the call unanswered, by exiting and by
+cancelling) fails before with "the daemon closed the connection". After:
+the `umount_drain` test 200/200 at a load average of 20–35 and 150/150
+under the load that failed it 11 times in 100.
+
+## Fix: the drain's handoff recheck is asked at the test's own `now` (engine flake, 2026-10-16)
+
+`a_drain_rechecks_when_its_first_upload_has_waited_the_window` (`e5a35fd`)
+failed once in a workspace run. It takes `now`, records a PUT issued 5.9 s
+before it, and expects the drain to look again in about 100 ms;
+`handoff_recheck` read the clock itself, so a test thread that reached the
+call 100 ms or more after taking `now` (waiting for the process-wide
+S3-path test lock, taken after `now`, or for a CPU) found the PUT past the
+6 s window ("not stalled yet"). Holding that lock 150 ms from another
+thread as the test starts fails it the same way. No other state is shared
+with it: only `s3://` backends record requests, and no engine unit test
+opens one. `handoff_recheck` now takes the time (its caller passes
+`now_unix_ms()`), and the test asks at its own `now`: the expected recheck
+is exactly 100 ms (it accepted 50–150 ms). Rare before (0 in 3000 runs of
+the five S3-path tests at a load average of 48); after, the 150 ms lock hold
+passes, and 3000/3000 at a load average of 36.
+
+## Fix: a write halt holds back only its own writer (`fjall-write-halt`, 2026-10-16)
+
+`journal_rotations_never_freeze_commits` failed at a load average of about
+29. With the database on a busy disk beside a CPU and disk load (load
+average 30–65), 4 of 51 runs went over its 1 s limit (up to 1.42 s). Each
+slow 2-row commit was all writer-lock wait behind one of the loader's
+1 MiB commits, which fjall's slow-commit report put in back-pressure for as
+long (`slow commit: 1421 ms for 64 items (... backpressure=1403ms)`): under
+load the flushes fall behind, the loader's keyspace queues four sealed
+memtables, and its commit halts in `local_backpressure` — with the
+single-writer lock held, so every other writer of the database, whatever
+keyspace, waited for those flushes (the `fjall-journal-rotation` entry
+above recorded it as "a different stall, not changed here").
+
+Vendored fjall change 9: `WriteBatch::commit` is `commit_then_backpressure`
+and then the returned `Backpressure`'s `apply`; a single-writer
+transaction's commit releases the writer lock in between (its batch is
+published by then, so transactions stay serialized; the halted writer still
+waits for its keyspace, and another writer into it halts after one batch).
+`a_write_halt_holds_back_only_its_own_writer` (no flush workers, four sealed
+memtables: a commit into another keyspace must go through while the halt
+lasts) fails before. After: 66/66 under the same load, worst commit
+0.07–0.43 s, the 1 s limit unchanged; fjall's own tests pass.
+`vendor/fjall/CONSTELLATION-PATCH.md` change 9, `vendor/ISSUE-fjall.md`.
+
+## Fix: no CLI test changes the process environment while others run (CLI test-binary deadlock, 2026-10-16)
+
+`constellation`'s unit-test binary hung under load (6 of 214 loaded runs,
+and once in a workspace run): every test that serves a FUSE view
+in-process stuck past 60 s. Captured thread states:
+a test thread in `clone3` (a `Command::spawn`, which holds std's
+environment lock until the child has exec'd); its child in
+`request_wait_answer` inside `execve` (closing the files it inherited, one
+on another test's FUSE view, sends that view's `FLUSH`); the view's server,
+this process — 7–9 tokio workers of the engines that answer the views'
+requests among 11–14 threads — waiting on std's environment lock
+(`ENV_LOCK`) behind a queued `set_var`, which waits for the spawn (in the
+four hangs captured, `umount_of_a_non_last_view…`'s mid-test `set_var` of
+`CONSTELLATION_REGISTRY`). The writers were
+tests: five `node_runtime` tests and `umount_of_a_non_last_view…` set
+`CONSTELLATION_P2P=off`, the latter also `CONSTELLATION_REGISTRY`, and two
+`daemon_lock` tests the wedged-pid hook.
+
+### What changed
+
+- `NodeConfig::profile`: the engine profile, `None` for the daemon's
+  (`EngineProfile::from_env`); in-process test nodes pass a desktop profile
+  with P2P off (`node_runtime::tests::no_p2p`) instead of setting
+  `CONSTELLATION_P2P`.
+- `cmd_umount` is `resolve` plus `umount_resolved`; the umount test resolves
+  its names through a `Manager` of its own registry instead of pointing
+  `CONSTELLATION_REGISTRY` at it.
+- The wedged-pid hook has an in-process form for this crate's tests
+  (`assume_wedged_for_test`); `CONSTELLATION_FAULT_ASSUME_WEDGED_PID` stays
+  for the harness, which sets it on the child's environment.
+- `crates/cli/clippy.toml` disallows `std::env::set_var` and `remove_var`
+  in the crate, its tests included.
+
+No test of the CLI crate writes the environment now. The other crates'
+test code still does in a few places (`net`'s kill-switch and key-path
+tests, `csi`'s config test, `harness`'s ladder and `s3_process_backend`
+tests, `engine`'s `parity_tests` and `control_fs`/`conformance` fixtures); none
+of those binaries serves FUSE in-process, so this deadlock cannot form
+there (the fixtures set theirs once, before their first engine starts).
+
+### Verification
+
+A stress test (not committed: a view, two files held open on it, two
+threads spawning `/bin/true`, one calling `set_var`) deadlocked within 15 s
+in 6 of 6 runs; without the `set_var` thread it ran 60 s (about 3000
+spawns) in 3 of 3. The CLI unit tests under a CPU and disk load, the
+binaries from before and after alternated: 4 hangs in 72 runs before, 0 in
+108 after (and 0 in another 108 run beside the old binary).
+
+On the test host, main `28c8c7f` plus this change: `cargo fmt --all --
+--check` flags only `crates/meta/src/store/gate.rs` (as on main); clippy
+`--workspace --all-targets -D warnings` clean; the CLI crate's tests pass;
+`cargo test --workspace --no-fail-fast`: 3082 passed, 0 failed, 55 ignored.
