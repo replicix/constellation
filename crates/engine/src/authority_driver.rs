@@ -5154,7 +5154,7 @@ async fn drain_with_handoff(
                 }
                 return result;
             }
-            Err(_) if !tried => match handoff_recheck(&stats, after) {
+            Err(_) if !tried => match handoff_recheck(&stats, after, now_unix_ms()) {
                 None => {
                     tried = true;
                     tracing::info!(
@@ -5180,13 +5180,14 @@ async fn drain_with_handoff(
 /// starts, so at the drain's first check (`after` in) it has not waited
 /// `after` yet: look again when it will have, not a whole `after` later
 /// (which doubled the handoff time under a fresh black hole). Nothing
-/// asked of S3: the full `after`.
+/// asked of S3: the full `after`. `now_ms`: the current time (unix ms).
 fn handoff_recheck(
     stats: &crate::upload::UploadRuntime,
     after: std::time::Duration,
+    now_ms: i64,
 ) -> Option<std::time::Duration> {
     let after_ms = after.as_millis() as i64;
-    match stats.uploads_stall_in(now_unix_ms(), after_ms) {
+    match stats.uploads_stall_in(now_ms, after_ms) {
         Some(0) => None,
         Some(ms) => Some(
             std::time::Duration::from_millis(ms as u64)
@@ -5941,6 +5942,10 @@ mod tests {
     /// little after the drain started; the drain's first check (`after`
     /// in) finds it waiting 100 ms short of the window and looks again
     /// 100 ms later, not a whole `after` later (handoff at ~6 s, not ~12 s).
+    /// The check is asked at `now`: it read the clock itself, and a test
+    /// thread that got to it 100 ms late (waiting for another S3-path
+    /// test's lock, or for a CPU on a loaded host) found the PUT already
+    /// past the window.
     #[test]
     fn a_drain_rechecks_when_its_first_upload_has_waited_the_window() {
         use std::time::Duration;
@@ -5949,19 +5954,19 @@ mod tests {
         let _path = crate::backend::s3_path_for_test(now - 60_000);
         let upload = crate::upload::UploadRuntime::for_test(false);
         // Nothing asked: the full `after`.
-        assert_eq!(super::handoff_recheck(&upload, after), Some(after));
+        assert_eq!(super::handoff_recheck(&upload, after, now), Some(after));
         // The drain started 6 s ago, its first PUT 100 ms after that.
         let put = crate::backend::s3_request_for_test(now - 5_900);
-        let recheck = super::handoff_recheck(&upload, after).expect("not stalled yet");
-        assert!(
-            recheck <= Duration::from_millis(150) && recheck >= Duration::from_millis(50),
-            "{recheck:?}"
+        assert_eq!(
+            super::handoff_recheck(&upload, after, now),
+            Some(Duration::from_millis(100)),
+            "not looking again when the PUT has waited the window"
         );
         drop(put);
         // A PUT unanswered for the whole window: hand off now.
         crate::backend::s3_reset_for_test(now - 60_000);
         let _put = crate::backend::s3_request_for_test(now - 6_100);
-        assert_eq!(super::handoff_recheck(&upload, after), None);
+        assert_eq!(super::handoff_recheck(&upload, after, now), None);
     }
 
     /// The holder's dismissal bookkeeping: a backup it drops (a
