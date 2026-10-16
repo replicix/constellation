@@ -1318,6 +1318,15 @@ pub fn fence_token_at_write(_seed: u64) -> Result<()> {
     const LOCK_TTL_MS: u64 = 3_000;
     const STALL_MS: u64 = 10_000;
     const FREEZE: Duration = Duration::from_secs(6);
+    // The hook's `caller=` is the Linux kernel's task id, which only
+    // Linux's FUSE passes on; another host only type-checks this.
+    if !cfg!(target_os = "linux") {
+        bail!(
+            "{NAME}: the store stall is aimed at a FUSE caller's kernel task id, which is \
+             Linux's (this is {})",
+            std::env::consts::OS
+        );
+    }
     let (env, root) = setup(NAME)?;
     let backend = format!("s3://{BUCKET}/{NAME}-{}", ts());
     let file = root.path().join("store-stall");
@@ -1353,8 +1362,12 @@ pub fn fence_token_at_write(_seed: u64) -> Result<()> {
                 t.write_all(b"A")?;
                 t.sync_all()?;
                 drop(t);
-                // SAFETY: gettid(2) has no preconditions.
-                let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+                // The kernel's task id on Linux (`gettid(2)`), which is
+                // what FUSE names a request's caller by.
+                let tid = constellation_platform::native()
+                    .process
+                    .current_thread()
+                    .tid as u32;
                 let _ = tid_tx.send(tid);
                 let _ = go_rx.recv();
                 let t0 = Instant::now();
