@@ -7264,6 +7264,10 @@ fn fio_blips(_seed: u64) -> Result<()> {
     let (env, root) = setup("fio-blips")?;
     let proxy = env.s3_proxy()?;
     let mut c = one_client(&env, root.path(), &format!("fioblip-{}", ts()))?;
+    // The flapper cuts S3 from its first instruction: a node without the
+    // lease then cannot take one (`hold_lease_before_cut`).
+    std::fs::write(c.mnt.join("canary"), b"ok")?;
+    hold_lease_before_cut(&c)?;
 
     let done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -7293,6 +7297,14 @@ fn stress_ng_flap(_seed: u64) -> Result<()> {
     let (env, root) = setup("stress-flap")?;
     let proxy = env.s3_proxy()?;
     let mut c = one_client(&env, root.path(), &format!("sng-{}", ts()))?;
+    // The flapper cuts S3 from its first instruction, before the churn's
+    // first mkdir. A node that does not hold the lease then cannot take
+    // one, and a continuation epoch forming meanwhile carries none: every
+    // write is refused `EROFS`, as documented
+    // (`durability-and-failover.md`). Unprivileged, the mount's root-owner
+    // adoption takes the lease as a side effect; as root it is skipped.
+    std::fs::write(c.mnt.join("warmup"), b"ok")?;
+    hold_lease_before_cut(&c)?;
 
     let done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {

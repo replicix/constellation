@@ -406,7 +406,14 @@ latency), `fio-blips` (fio verify while S3 is cut for 800 ms every
 leaning on the per-request retry budget, which the harness keeps tight at
 `CONSTELLATION_S3_MAX_RETRIES=2`), and `stress-ng-flap`
 (metadata churn during S3 flapping; the mount must stay healthy and
-the spool drain afterwards); the
+the spool drain afterwards). Both flap from their first instruction, so
+they first write and wait until the node holds the lease: a node without
+it cannot take one while S3 is cut, and a continuation epoch forming
+meanwhile carries none and answers every write `EROFS`
+([durability-and-failover](../../reference/features/durability-and-failover.md)).
+Unprivileged the mount's root-owner adoption takes the lease; as root it
+is skipped (`adopt_root`), so `stress-ng-flap` failed about half its
+runs as root; the
 [`stress-ng-fs` lane](#stress-every-stress-ng-filesystem-stressor-stress-ng-fs)
 runs every applicable stress-ng filesystem stressor at once. Scenarios declare required host binaries
 and are skipped loudly when a tool is missing (CI installs fio and
