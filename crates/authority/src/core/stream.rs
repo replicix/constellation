@@ -765,8 +765,9 @@ impl Core {
     /// a GET per new segment plus one, not a full speculative run); 1
     /// again once a caught-up stream went and nothing hints past the
     /// cursor (`dropped_caught_up`); the configured width otherwise. A
-    /// saturated probe is followed by a full-width one, so a narrow probe
-    /// never stops short of the head.
+    /// saturated probe is followed by a full-width one, unless it was the
+    /// one-GET probe of a stream still caught up (`stream_followup_width`),
+    /// so a narrow probe never stops short of the head.
     pub(crate) fn stream_tail_width(&mut self, now: Ms) -> usize {
         self.stream.last_s3_tail = now;
         let full = self.cfg.tail_width.max(1);
@@ -778,6 +779,25 @@ impl Core {
             1
         } else {
             full
+        }
+    }
+
+    /// The width of the tail probe that follows a saturated one (`probed`
+    /// GETs wide). A one-GET probe of a caught-up stream that hit is the
+    /// stream being a segment behind S3, not a sign of a backlog: the
+    /// holder streams a segment only after its PUT landed, so a probe
+    /// that arrives in between finds it first (`visibility-after-burst`:
+    /// the stream delivered the same segment moments later, as a
+    /// duplicate, and the full-width follow-up was 16 GETs of 404s, 17
+    /// tail GETs in all). While the stream is live and still caught up
+    /// after the hit, the follow-up is one GET again; a stream that is
+    /// not (dead, behind its head, gapped) leaves the full-width run, so
+    /// a narrow probe never stops short of the head.
+    pub(crate) fn stream_followup_width(&self, now: Ms, probed: usize) -> usize {
+        if probed == 1 && self.stream_caught_up(now) {
+            1
+        } else {
+            self.cfg.tail_width.max(1)
         }
     }
 

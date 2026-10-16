@@ -3268,8 +3268,12 @@ impl Core {
                 self.ship.last_error = None;
                 let empty = run.is_empty();
                 let round = matches!(then, TailThen::Round);
+                let probed = self.job.as_ref().map(|j| j.width).unwrap_or(1);
                 match self.apply_run(now, run, round, replica, out) {
-                    Ok(true) => self.issue_tail(out),
+                    Ok(true) => {
+                        let width = self.stream_followup_width(now, probed);
+                        self.issue_tail_width(width, out)
+                    }
                     Ok(false) if empty && self.gap_check_due(now, then) => {
                         self.issue_gap_check(then, out)
                     }

@@ -1990,7 +1990,14 @@ relay of its own so requests can be attributed per role):
   tailer) and on (after both pollers report `status.log_stream.live`) —
   and asserts, for every poller, cross-node visibility p99 < 2 s, no
   marker missed, and with streams on at most 4 S3 tail GETs (`GET` of a
-  `log/` key) during the markers; prints both runs' GET counts.
+  `log/` key) during the markers; prints both runs' GET counts. What is
+  left with streams on is the one-GET backstop probe per
+  `CONSTELLATION_LOG_STREAM_BACKSTOP_MS` (10 s): a probe that lands
+  between a segment's PUT and its stream frame reads the segment first
+  (the stream's frame is then a counted duplicate) and costs one more
+  GET, not a full-width run. Setting the backstop to 300 ms makes the
+  probes frequent enough to see that on every run (a diagnosis knob; the
+  assertion then fails on the probe count alone).
   Diagnosis knobs (harness environment): `VIS_BURST_FILES`,
   `VIS_LATENCY_MS`, `VIS_DEBUG=1` (per-marker write times and
   latencies), `VIS_RUST_LOG=info,constellation_authority::stream=debug,constellation::log_stream=debug`
