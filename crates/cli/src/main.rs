@@ -3254,28 +3254,35 @@ async fn cmd_umount(target: String, state_dir: Option<PathBuf>, no_wait: bool) -
     let mut unanswered = false;
     for view in &targets {
         let mountpoint = PathBuf::from(&view.mountpoint);
-        match control::try_call::<cm::ViewUnmount>(
+        let answer = control::try_call::<cm::ViewUnmount>(
             &dir,
             api::ViewUnmountParams {
                 mountpoint: mountpoint.clone(),
             },
             None,
         )
-        .await
-        {
-            Ok(Ok(ack)) => println!("{}", ack.detail),
-            Ok(Err(refused)) => bail!("{}", refused.message),
-            // The answer can be lost when the daemon, its last view gone
-            // and nothing to drain, exits right after: the daemon's own
-            // record says how it ended.
-            Err(error) => {
-                eprintln!(
-                    "no answer to unmounting {} ({error:#}); asking the daemon's records instead",
-                    mountpoint.display()
-                );
-                unanswered = true;
+        .await;
+        // The answer can be lost when the daemon, its last view gone and
+        // its drain over at once (nothing to drain, or a drain that fails
+        // at once), exits right after: the daemon's own record says how it
+        // ended. The call then fails on the connection, not with a
+        // refusal: the daemon closed it (it exited) or cancelled the call
+        // as it shut its control server down — which one, and whether the
+        // answer got out first, is up to the scheduler.
+        let lost = match answer {
+            Ok(Ok(ack)) => {
+                println!("{}", ack.detail);
+                continue;
             }
-        }
+            Ok(Err(error)) if control::went_away(&error) => error.to_string(),
+            Ok(Err(refused)) => bail!("{}", refused.message),
+            Err(error) => format!("{error:#}"),
+        };
+        eprintln!(
+            "no answer to unmounting {} ({lost}); asking the daemon's records instead",
+            mountpoint.display()
+        );
+        unanswered = true;
     }
     let mine = |v: &api::ViewInfo| targets.iter().any(|t| t.id == v.id);
     if no_wait {
@@ -4786,5 +4793,133 @@ mod umount_tests {
             "the last view's umount returned before the daemon's shutdown"
         );
         waiter.join().unwrap();
+    }
+
+    /// How the stand-in daemon of
+    /// [`umount_goes_by_the_daemons_record_when_it_exits_before_answering`]
+    /// ends the `view.unmount` call it never answers.
+    #[derive(Debug, Clone, Copy)]
+    enum DaemonExit {
+        /// The process exits: the connection closes under the call.
+        Exits,
+        /// It shuts its control server down first: the call is cancelled.
+        CancelsCalls,
+    }
+
+    /// What the stand-in daemon waits for.
+    #[derive(Debug, PartialEq, Eq)]
+    enum StandIn {
+        /// Its `view.unmount` handler ran: time to exit.
+        Unmounted,
+        /// `umount` returned.
+        UmountReturned,
+    }
+
+    /// A daemon whose last view's drain is over at once (nothing to drain,
+    /// or a drain that fails at once: a queued chunk lost from the node's
+    /// disk) records the outcome and exits, and can do so before its
+    /// `view.unmount` answer is out. `umount` must then go by that record
+    /// — here a drain that could not ship everything — instead of failing
+    /// with the lost connection as if the daemon had refused the unmount:
+    /// it said "the daemon closed the connection" in about 1 run in 30 of
+    /// `umount_drain`'s `umount_fails_when_the_drain_cannot_ship_everything`
+    /// on an idle host, 1 in 9 on a loaded one. The stand-in daemon serves
+    /// one view; unmounting it records an unshipped drain, removes the
+    /// socket, and ends the call unanswered either way the daemon can.
+    #[test]
+    fn umount_goes_by_the_daemons_record_when_it_exits_before_answering() {
+        for exit in [DaemonExit::Exits, DaemonExit::CancelsCalls] {
+            let error = umount_of_a_daemon_that_exits_before_answering(exit)
+                .expect_err("umount succeeded after an unshipped drain");
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("without shipping everything") && error.contains("1 pending chunk"),
+                "{exit:?}: umount did not report the daemon's recorded outcome: {error}"
+            );
+        }
+    }
+
+    fn umount_of_a_daemon_that_exits_before_answering(exit: DaemonExit) -> Result<()> {
+        use constellation_control::transport::{
+            ensure_socket_dir, forget_socket, record_socket, UnixSocketListener,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let run = root.path().join("run");
+        ensure_socket_dir(&run).unwrap();
+        let socket = run.join("control.sock");
+
+        let daemon = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (events, stand_in_events) = std::sync::mpsc::channel::<StandIn>();
+        let mut router = constellation_control::Router::new();
+        router.register::<cm::ViewList, _, _>(|_, _| async {
+            Ok(api::ViewListing {
+                views: vec![api::ViewInfo {
+                    id: 1,
+                    mountpoint: "/stand-in".to_string(),
+                    ..Default::default()
+                }],
+                exits_when_empty: true,
+            })
+        });
+        let dir = state_dir.clone();
+        let unmounted = events.clone();
+        router.register::<cm::ViewUnmount, _, _>(move |_, _| {
+            let (dir, unmounted) = (dir.clone(), unmounted.clone());
+            async move {
+                node_runtime::record_shutdown_result(
+                    &dir,
+                    &Err(anyhow::anyhow!(
+                        "final flush failed: 1 pending chunk upload(s) left on disk"
+                    )),
+                );
+                forget_socket(&dir);
+                let _ = unmounted.send(StandIn::Unmounted);
+                std::future::pending::<Result<api::Ack, constellation_control::ControlError>>()
+                    .await
+            }
+        });
+        let server = {
+            let _guard = daemon.enter();
+            let listener = UnixSocketListener::bind(&socket).unwrap();
+            record_socket(&state_dir, &socket).unwrap();
+            constellation_control::server::serve_router(listener, std::sync::Arc::new(router))
+        };
+        // A `umount` that fails before it asks lets the stand-in go too.
+        let stand_in = std::thread::spawn(move || {
+            if stand_in_events.recv() != Ok(StandIn::Unmounted) {
+                return;
+            }
+            match exit {
+                DaemonExit::Exits => daemon.shutdown_background(),
+                DaemonExit::CancelsCalls => {
+                    daemon.block_on(server.shutdown());
+                    // Alive until the cancelled call has been answered.
+                    let _ = stand_in_events.recv();
+                }
+            }
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    cmd_umount("/".to_string(), Some(state_dir.clone()), false),
+                )
+                .await
+            })
+            .expect("umount hung");
+        let _ = events.send(StandIn::UmountReturned);
+        stand_in.join().unwrap();
+        result
     }
 }

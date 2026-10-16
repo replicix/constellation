@@ -429,6 +429,16 @@ pub fn is_unreachable(e: &ControlError) -> bool {
     e.kind == ErrorKind::Unavailable && e.message.starts_with("connecting to ")
 }
 
+/// Whether `e`, a call's error, says the daemon went away while the call
+/// was out rather than that it refused the call: the connection ended
+/// before the answer came (the client's own `Unavailable`: the daemon
+/// exited), the daemon cancelled the call as it shut down its control
+/// server (`Cancelled`; this client cancels nothing it waits for without
+/// a bound), or it answered that it is shutting down (`Unavailable`).
+pub fn went_away(e: &ControlError) -> bool {
+    matches!(e.kind, ErrorKind::Unavailable | ErrorKind::Cancelled)
+}
+
 /// Is the daemon of `state_dir` alive *and answering*? A bare `connect`
 /// succeeding proves only that a listener exists (a wedged process keeps
 /// its listener); a `node.ping` answered within `within` proves the

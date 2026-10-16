@@ -110,7 +110,7 @@ pub enum ShutdownResult {
     Unshipped(String),
 }
 
-fn record_shutdown_result(state_dir: &std::path::Path, result: &Result<()>) {
+pub(crate) fn record_shutdown_result(state_dir: &std::path::Path, result: &Result<()>) {
     let pid = std::process::id();
     let text = match result {
         Ok(()) => format!("clean\n{pid}\n"),
