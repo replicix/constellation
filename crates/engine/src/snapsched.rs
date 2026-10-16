@@ -185,6 +185,11 @@ pub struct SnapSchedStats {
     /// gate refuses every tick, so this stays fresh while one is up.
     pub last_refused_unix_ms: AtomicU64,
     pub last_create_unix_ms: AtomicU64,
+    /// When the ticker last woke (Unix ms), and how late against its
+    /// schedule it woke then and at worst (ms).
+    pub last_tick_unix_ms: AtomicU64,
+    pub tick_late_ms: AtomicU64,
+    pub tick_late_max_ms: AtomicU64,
     /// The scheduler's last failure, as text.
     pub last_error: Mutex<Option<String>>,
     /// The last policy the setxattr gate refused: `(expression, byte
@@ -260,6 +265,9 @@ impl SnapSchedStats {
             last_refused_unix_ms: load(&self.last_refused_unix_ms),
             now_unix_ms: now,
             last_create_unix_ms: load(&self.last_create_unix_ms),
+            last_tick_unix_ms: load(&self.last_tick_unix_ms),
+            tick_late_ms: load(&self.tick_late_ms),
+            tick_late_max_ms: load(&self.tick_late_max_ms),
             last_error: self.last_error.lock().ok().and_then(|g| g.clone()),
             last_parse_error: self.last_parse_error.lock().ok().and_then(|g| g.clone()),
         }
@@ -729,7 +737,25 @@ impl Scheduler {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             timer.tick().await;
             loop {
-                timer.tick().await;
+                let due = timer.tick().await;
+                // How late the ticker woke: a node whose runtime is held
+                // up ticks late, and a tick that comes half a tick late
+                // is said (a policy run can miss its snapshot that way).
+                let late = due.elapsed();
+                let late_ms = late.as_millis() as u64;
+                let stats = &this.deps.stats;
+                stats
+                    .last_tick_unix_ms
+                    .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
+                stats.tick_late_ms.store(late_ms, Ordering::Relaxed);
+                stats.tick_late_max_ms.fetch_max(late_ms, Ordering::Relaxed);
+                if late >= this.deps.config.tick / 2 {
+                    tracing::warn!(
+                        late_ms,
+                        tick_ms = this.deps.config.tick.as_millis() as u64,
+                        "snapshot scheduler: a tick woke late"
+                    );
+                }
                 if let Some(gate) = &background {
                     gate.wait_active().await;
                 }

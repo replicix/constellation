@@ -168,7 +168,11 @@ A backup that has heard nothing from its holder for
 
 1. re-reads the lease, and continues only if it still names that holder
    and epoch, still lists this backup, and the holder was not heard
-   while it was read. A backup the lease no longer lists was removed by
+   while it was read — unless the lease it read has expired: a holder
+   stops acting a margin before its expiry, so what reached the backup
+   then was sent before (the backlog of a stall of the backup's own
+   runtime), and waiting another window would miss the claim grace
+   below. A backup the lease no longer lists was removed by
    a live holder (which stops appending once the removal lands, so the
    backup hears silence): it gives its role and tail up **without
    sealing**, and the holder may invite it back as a candidate in the
@@ -199,21 +203,23 @@ only, the renewal is never starved by the ship loop, the liveness
 heartbeat does not wait for the core at all), and backups are
 chosen within `CONSTELLATION_BACKUP_RTT_BUDGET_MS` (5 ms), so the window
 is several hundred times the link's RTT. Scaling it with the P2P RTT
-would change nothing inside the budget. A longer window would only delay
-a genuine failover, and the seal is safe at any threshold, so there is
-nothing to gain in safety either. `slow-s3-no-seal` (1.5 s per S3
+would change nothing inside the budget. `slow-s3-no-seal` (1.5 s per S3
 request, three minutes of writes from every node) checks that no live
-holder is sealed.
+holder is sealed. It does adapt to the host (see *Silence under host
+load* below): the seal is safe at any threshold, so a longer window
+costs only failover time, and only while a host has shown that it
+stalls.
 
 **What "heard" means: liveness off the core's step.** The holder's
 appends come from its authority core, and a core step can take seconds
 on an overloaded node (CPU, disk, and the metadata writes of a busy
 mount all queue in front of it): its backups used to take that for death
 and seal a live holder about 1.5 s in (`stress-ng-fs-nodes`, three nodes
-of 44 stress-ng stressors each). So, besides the appends, a task of the
-holder's driver sends each listed backup (and a candidate being brought
-up) a `HolderAlive` heartbeat every `CONSTELLATION_BACKUP_HEARTBEAT_MS`,
-off the core's step. It stops when the lease expires, when the driver
+of 44 stress-ng stressors each). So, besides the appends, the holder's
+driver sends each listed backup (and a candidate being brought up) a
+`HolderAlive` heartbeat every `CONSTELLATION_BACKUP_HEARTBEAT_MS`, off
+the core's step (and off the daemon's shared runtime: see *Silence
+under host load* below). It stops when the lease expires, when the driver
 stops, and when the driver loop has made no progress for
 `CONSTELLATION_HOLDER_STALL_MS` (15 s; a core step, or anything else the
 driver does between waits for work): that long is a hung authority, and
@@ -249,6 +255,114 @@ reading and the holder drops it to S3 tailing, as it would anyway. The heartbeat
 beats are still waiting for their answers (each waits up to 5 s; at most
 as many in flight per peer as fit in that wait), so one slow answer
 never silences it past the 1.5 s takeover window.
+
+**Silence under host load.** A busy host can hold up a daemon's shared
+runtime for seconds — every worker inside a blocking store call, or
+simply not scheduled — without stopping the process.
+`snapsched-write-overhead` sealed a live holder `silent_ms=1501` in that
+way: the holder had logged nothing for 2.5 s, no slow step, no stuck
+driver, because its heartbeat was a task of that runtime, and so were
+the timer that sent it and the QUIC connection's driver that carried it.
+Three things make such lag cost latency only:
+
+- *The holder's heartbeat runs on a thread of its own*, with a runtime of
+  its own, and sends on a P2P connection of its own (the liveness lane:
+  dialed, and so driven, by that runtime), so it leaves the process
+  whatever the shared runtime is doing. It still stops for a hung
+  authority: when the driver loop has not woken for
+  `CONSTELLATION_HOLDER_STALL_MS` since the heartbeat sent it an echo on
+  its prompt lane (any wake-up answers it, so an echo queued behind a
+  busy lane does not stop a working driver; a step stuck that long, a
+  frozen runtime, or one starved to a slice every few seconds that
+  serves nobody all fail it), when one wake-up of the loop has lasted
+  that long, or when the shared runtime has run nothing for that long
+  (its lag probe, below, has not ticked). Its backups then seal it a
+  window later — up to four, if its beats had lately come late. What
+  can hold one core step that long: a metadata write waiting for the
+  store's writer lock behind a busy mount's writers, the journal's
+  fsync on a stalled disk, and, under cluster locks, the wait before a
+  lock position is reported for a fenced write that passed its token
+  check under a grant that has since ended and is still committing
+  (`Meta::settle_tagged_writes`; it holds the writer lock until it
+  commits). Each is latency up to the bound; a step held past it is a
+  hung authority, and its tenure is sealed, as it was before the
+  heartbeat left the runtime. `status` shows how close a node's steps
+  come to the bound: `ack.longest_step_ms` (and `longest_step_kind`, its
+  event) since the mount, `ack.recent_longest_step_ms` over the last
+  minute or two. A backup
+  whose appends fail at the transport while its heartbeat answers come
+  on the liveness lane is unreachable on the data lane: it is removed at
+  the ordinary acknowledgement timeout, not kept the slow-backup grace.
+- *A watcher does not count silence across its own lapses.* A task of
+  the shared runtime (the lag probe) wakes every 50 ms and notes how
+  late it woke; a lapse of at least an eighth of the takeover window
+  (187 ms) is the node's own, and the driver tells the core before it
+  handles anything else (a probe that is itself overdue counts as a
+  lapse in progress). Beats that reached the node during a lapse are
+  stamped only when its runtime gets to them — after the seal watch's
+  timer, often — so silence counts from the lapse's end; but never from
+  later than one window plus the lapses' own length after the holder
+  was last heard, so a node that lags again and again still acts on a
+  dead holder. Before the holder's first beat (or a read of the lease
+  object) has told a backup its lease's expiry, the reach is a flat half
+  window, lapses included: its read then comes at most 1.5 windows after
+  the holder's last word in wall time, inside the claim grace past an
+  expiry it could not know of.
+- *A holder whose beats came late lately gets a longer window.* Each beat
+  carries its number and the holder's send time. A beat later than its
+  schedule — sent late (the holder's process was held up: its host), or
+  heard late on the way there (what the watcher's own lapses held up is
+  not counted: those are discounted above) — by at least the lag
+  threshold lengthens the window by twice its lateness for a minute, up
+  to four windows (6 s at the defaults). A beat is credited as heard no
+  later than its send time plus the expiry margin, so one held for
+  seconds in a retransmit queue does not keep a holder that died
+  meanwhile.
+
+Each beat also names the expiry of the lease it beats for, and the
+beats stop there (the backup takes the later of that and its own last
+read of the lease object: both lower bounds, so they end the discount
+early, never late). Within the expiry margin of that expiry the watch
+counts plain silence again, as it always did: silence there is the lease
+ending (a holder cut from S3 that could not renew), and a listed backup
+must then seal and claim within the 3 s (twice the window) during which
+nobody else may claim a `Backup` lease past its expiry — its tail holds
+what the holder acknowledged but did not ship.
+
+Once that expiry has passed, the watch reads the lease at once, however
+recently it heard the holder (it also looks at the expiry itself, not
+only a window after the last word). After a lapse of the backup's own
+across the expiry, its P2P handlers stamp the holder's backlog of beats
+and appends at the lapse's end, and the driver hands those stamps to the
+core before the watch's timer: a window counted from them ended past the
+claim grace, and another node's claim took the lease over from a log
+without the backup's tail. The lease object decides: expired and still
+listing the backup, its epoch is sealed (also when the holder was heard
+during the read: that is the backlog, the holder stops acting a margin
+before its expiry); renewed (what the backup knew was older), a window
+again; moved on, the role ends. What remains: a backup that knows no
+expiry for the tenure at all — no beat named it, and it has not read the
+lease since the holder took it — counts plain silence from its last
+credit, and keeps the claim grace only for a lapse that ends less than a
+window past the expiry. That takes the liveness lane broken for the
+whole tenure, the holder cut from S3 for a TTL, and a lapse of the
+backup's own at the expiry.
+
+So a dead holder's backup reads the lease to seal it **at most five
+windows (7.5 s at the defaults) into the silence, counted in the time the
+backup itself was running** — the window, the lateness extension (three
+windows at most, within a minute of a late beat), and one window more if
+the backup lapsed meanwhile; the time it spent held up comes on top,
+since it could not act then anyway — and exactly one window (1.5 s, as
+before) when neither side has shown lag in the last minute; then the
+lease read, the seal's fsync and the takeover follow as before. In wall
+time that is about `(T + window) / (1 − f)` for a backup held up a
+fraction `f` of the time: twice as long at half time, ten times at 90 %
+(such a node is a poor successor anyway). The TTL path (60 s plus the backups' grace) is unaffected. Under
+`ack=s3` the same rules apply to the subscribers that watch the holder
+(below). None of it is a safety input: the seal and the log-slot CAS
+fence at any window, and nothing the holder does — its strict-read
+freshness rule, its grants — relies on the window being short.
 
 The heartbeat also tells the holder whether its backups are alive: a
 backup answers it with whether its own authority driver is progressing
@@ -336,7 +450,14 @@ before the TTL: every acknowledged record is in a log slot below the
 taker's epoch marker, and the marker's create-if-absent fences the old
 holder. Silence is read from the holder's log stream (it heartbeats the
 stream), so fast takeover needs P2P. With P2P off, `ack=s3` still gives
-S3 durability but fails over at the TTL.
+S3 durability but fails over at the TTL. The stream's frames, its
+heartbeat included, come from the holder's core: a single 1.5 s step (a
+busy host) used to silence it and hand the lease to the first
+subscriber that looked. The holder's off-core heartbeat (see *Silence
+under host load* above) now also goes to its subscribers, a beat counts
+like a frame on a live subscription, and silence is measured as for the
+seal watch (not across the watcher's own lapses, a longer window after
+late beats); without a live subscription the link decides, as before.
 
 The policy is the filesystem's, fixed at creation, and every mount runs
 with it. There is no per-mount `--ack`: what an acknowledgement means is
@@ -964,7 +1085,7 @@ promises cannot gate it. Epochs are kept away from such leases instead:
 | `CONSTELLATION_BACKUP_SLOW_MAX_MS` | `10000` | a backup known alive without progress this long is removed anyway |
 | `CONSTELLATION_BACKUP_TAKEOVER_MS` | `1500` | holder silence before a seal (or an `ack=s3` takeover) |
 | `CONSTELLATION_BACKUP_HEARTBEAT_MS` | `300` | heartbeat append to an idle backup; the off-core liveness heartbeat's interval |
-| `CONSTELLATION_HOLDER_STALL_MS` | `15000` | a driver without progress this long stops the off-core liveness heartbeat (a hung authority is sealed) |
+| `CONSTELLATION_HOLDER_STALL_MS` | `15000` | a driver that has not woken this long since the heartbeat's echo, or is stuck in one wake-up this long, or a runtime that has run nothing this long, stops the off-core liveness heartbeat (a hung authority is sealed) |
 | `CONSTELLATION_PRE_S3_STREAMING` | on | stream backup-acknowledged transactions ahead of S3 |
 | `fs create --epoch-slack f`, `fs set epoch-slack TARGET f` | `0` | continuation epoch slack |
 | `CONSTELLATION_PROMISE_TTL_S` | lease TTL / 4 | promise lifetime |

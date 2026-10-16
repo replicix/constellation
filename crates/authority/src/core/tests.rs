@@ -5845,6 +5845,9 @@ mod epoch_rules {
             candidacy,
             listed,
             at,
+            seq: 0,
+            sent: Ms(0),
+            expires: Ms(0),
         })
     }
 
@@ -5889,6 +5892,9 @@ mod epoch_rules {
             candidacy: 1,
             listed: true,
             at,
+            seq: 0,
+            sent: Ms(0),
+            expires: Ms(0),
         });
         h.step(Event::HolderAlive {
             from: 1,
@@ -5896,11 +5902,477 @@ mod epoch_rules {
             candidacy: 1,
             listed: true,
             at,
+            seq: 0,
+            sent: Ms(0),
+            expires: Ms(0),
         });
         let out = h.step(Event::Timer { id: watch });
         assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
         answer_takeover_read(&mut h, &out);
         assert_eq!(h.core.bk.sealed, 1, "silence seals");
+    }
+
+    /// A numbered beat of holder 1's (epoch 1), sent at `sent`, heard
+    /// at `at`, for a lease two minutes from expiry.
+    fn beat(h: &mut Harness, seq: u64, sent: Ms, at: Ms) -> Vec<Action> {
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 1,
+            candidacy: 1,
+            listed: true,
+            at,
+            seq,
+            sent,
+            expires: at.plus(120_000),
+        })
+    }
+
+    /// A busy host held this backup's runtime up 1.5 s: the holder's
+    /// beats that reached it meanwhile are stamped only when its runtime
+    /// gets to them, maybe after the watch has looked (the timer goes
+    /// first). The watch counts silence from the lapse's end
+    /// (`Event::OwnLag`), so it does not read its own lapse as the
+    /// holder's silence; the beats it then stamps keep the holder. With
+    /// `liveness_lag_aware` off — the watch as it was — the same lapse
+    /// reads the lease to seal.
+    #[test]
+    fn a_backup_does_not_seal_across_its_own_lapse() {
+        for aware in [true, false] {
+            let mut h = Harness::new(2);
+            h.core.cfg.liveness_lag_aware = aware;
+            let watch = backing(&mut h);
+            let t0 = h.now;
+            beat(&mut h, 1, t0, t0);
+            h.advance(1_500);
+            let end = h.now;
+            h.step(Event::OwnLag {
+                from: t0.plus(100),
+                until: end,
+            });
+            let out = h.step(Event::Timer { id: watch });
+            if !aware {
+                assert!(
+                    matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]),
+                    "plain silence: {out:?}"
+                );
+                continue;
+            }
+            assert!(
+                s3_ops(&out).is_empty(),
+                "read across its own lapse: {out:?}"
+            );
+            let watch = timers(&out, TimerKind::BackupWatch)[0];
+            assert_eq!(
+                h.core.timer_at(watch),
+                Some(end.plus(1_500)),
+                "a full window from the lapse's end"
+            );
+            // The backlog is stamped: beats from during the lapse.
+            for i in 2..=6 {
+                h.advance(20);
+                let at = h.now;
+                beat(&mut h, i, t0.plus(300 * (i - 1)), at);
+            }
+            h.now = h.core.timer_at(watch).expect("armed");
+            let out = h.step(Event::Timer { id: watch });
+            assert!(
+                s3_ops(&out).is_empty(),
+                "sealed a holder that beat: {out:?}"
+            );
+            assert_eq!(h.core.bk.sealed, 0);
+        }
+    }
+
+    /// Before the first beat names the lease's expiry (a backup held up
+    /// right as it was brought up), and with no read of the lease naming
+    /// this tenure, the seal watch's discount for its own lapses is a flat
+    /// half window past the holder's last word, lapses included: it cannot
+    /// know how near the expiry is, and must still claim inside the 2T
+    /// grace, in wall time. With a read naming the tenure, its expiry (a
+    /// lower bound) stands in for the beats'.
+    #[test]
+    fn before_the_first_beat_a_lapse_buys_half_a_window() {
+        for read in [false, true] {
+            let mut h = Harness::new(2);
+            let watch = backing(&mut h);
+            let t0 = h.now;
+            if read {
+                let mut lease = root_lease(1, 1, t0.plus(30_000));
+                lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                lease.backups = vec![2];
+                h.core.lease.note_object(t0, &lease);
+            }
+            h.advance(1_500);
+            h.step(Event::OwnLag {
+                from: t0.plus(1_000),
+                until: h.now,
+            });
+            let out = h.step(Event::Timer { id: watch });
+            assert!(s3_ops(&out).is_empty(), "{out:?}");
+            let watch = timers(&out, TimerKind::BackupWatch)[0];
+            let from = if read {
+                // A window past the last word plus the lapse: the lapse's
+                // end.
+                t0.plus(1_500)
+            } else {
+                // Half a window, lapse or not.
+                t0.plus(750)
+            };
+            assert_eq!(
+                h.core.timer_at(watch),
+                Some(from.plus(1_500)),
+                "read {read}"
+            );
+        }
+    }
+
+    /// The holder's beats named its expiry `E` (or, its liveness lane
+    /// broken, this backup read it; the holder is cut from S3 and cannot
+    /// renew), and this backup's runtime lapsed across `E`, ending
+    /// 1.6 s past it. The daemon then hands the core what its P2P
+    /// handlers stamped at the lapse's end (an unnumbered beat), and the
+    /// holder's backlog of appends is credited as it is handled: plain
+    /// silence from there re-armed the watch a window past the lapse's
+    /// end, 3.1 s past `E`, beyond the 2T claim grace (seed 655's class).
+    /// Past that expiry, the watch reads the lease at once, whatever it
+    /// credited: expired and listing this node, it seals; renewed, what
+    /// it knew was older, and it waits a window.
+    #[test]
+    fn past_the_known_expiry_the_watch_reads_at_once() {
+        for (by_read, renewed) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut h = Harness::new(2);
+            let watch = backing(&mut h);
+            let t0 = h.now;
+            let expires = t0.plus(2_000);
+            if by_read {
+                let mut lease = root_lease(1, 1, expires);
+                lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                lease.backups = vec![2];
+                h.core.lease.note_object(t0, &lease);
+            } else {
+                h.step(Event::HolderAlive {
+                    from: 1,
+                    epoch: 1,
+                    candidacy: 1,
+                    listed: true,
+                    at: t0,
+                    seq: 1,
+                    sent: t0,
+                    expires,
+                });
+            }
+            h.advance(3_600);
+            h.step(Event::OwnLag {
+                from: t0.plus(500),
+                until: h.now,
+            });
+            let lapse_end = h.now;
+            alive(&mut h, 0, true, lapse_end);
+            h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::BackupAppend {
+                    req: OpId(8),
+                    epoch: 1,
+                    holder: 1,
+                    config_version: 2,
+                    candidacy: 1,
+                    from: 1,
+                    txs: Vec::new(),
+                    through: 0,
+                },
+            });
+            let out = h.step(Event::Timer { id: watch });
+            assert!(
+                matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]),
+                "read {by_read} renewed {renewed}: no read past the known expiry: {out:?}"
+            );
+            h.advance(30);
+            let mut lease = root_lease(1, 1, if renewed { t0.plus(62_000) } else { expires });
+            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+            lease.backups = vec![2];
+            let out = answer_job_read(&mut h, &out, lease);
+            if renewed {
+                assert_eq!(h.core.bk.sealed, 0, "sealed a renewed holder: {out:?}");
+                assert!(h.core.bk.role.is_some());
+                let watch = timers(&out, TimerKind::BackupWatch);
+                assert_eq!(watch.len(), 1, "{out:?}");
+                assert_eq!(h.core.timer_at(watch[0]), Some(h.now.plus(1_500)));
+            } else {
+                assert_eq!(h.core.bk.sealed, 1, "did not seal past the expiry: {out:?}");
+            }
+        }
+    }
+
+    /// A backup whose runtime lags again and again still seals a dead
+    /// holder: each lapse (200 ms of every 400 here) pushes the silence's
+    /// start to its end, but by no more than a window plus the lapses'
+    /// own length past the last arrival — two windows of the backup's
+    /// attentive time. One long lapse is waited out whole (a window from
+    /// its end), however long.
+    #[test]
+    fn a_backup_that_lags_again_and_again_still_seals_a_dead_holder() {
+        let mut h = Harness::new(2);
+        let mut watch = backing(&mut h);
+        let last = h.now;
+        beat(&mut h, 1, last, last);
+        let mut read_at = None;
+        for _ in 0..200 {
+            h.advance(200);
+            let from = h.now;
+            h.advance(200);
+            let until = h.now;
+            h.step(Event::OwnLag { from, until });
+            if h.core.timer_at(watch).is_some_and(|due| due <= h.now) {
+                let out = h.step(Event::Timer { id: watch });
+                if let [(_, S3Op::LeaseGet)] = s3_ops(&out).as_slice() {
+                    read_at = Some(h.now);
+                    answer_takeover_read(&mut h, &out);
+                    break;
+                }
+                watch = timers(&out, TimerKind::BackupWatch)[0];
+            }
+        }
+        // Attentive half the time: 2 × 1.5 s attentive is ~6 s of wall.
+        let read_at = read_at.expect("never sealed a dead holder");
+        assert!(
+            read_at.since(last) <= 6_400,
+            "read {} ms in",
+            read_at.since(last)
+        );
+        assert_eq!(h.core.bk.sealed, 1, "the dead holder was sealed");
+
+        // One lapse of 5 s: a window from its end.
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        let last = h.now;
+        beat(&mut h, 1, last, last);
+        h.advance(5_000);
+        let end = h.now;
+        h.step(Event::OwnLag {
+            from: last.plus(10),
+            until: end,
+        });
+        let out = h.step(Event::Timer { id: watch });
+        assert!(s3_ops(&out).is_empty(), "read at the lapse's end: {out:?}");
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        assert_eq!(h.core.timer_at(watch), Some(end.plus(1_500)));
+    }
+
+    /// The holder's beats came late lately — sent late (its process was
+    /// held up), or heard late — so its host stalls it: the watch waits
+    /// out twice the latest lateness on top of the window, at most four
+    /// windows, and only for a minute after it. Reordered beats and a
+    /// restarted holder's numbering are not lateness.
+    #[test]
+    fn late_beats_lengthen_the_silence_window() {
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        let t0 = h.now;
+        let window = |h: &Harness| h.core.silence_window((1, 1, true), h.now);
+        assert_eq!(window(&h), 1_500, "no beats: the window");
+        beat(&mut h, 1, t0, t0);
+        beat(&mut h, 2, t0.plus(300), t0.plus(300));
+        // Reordered: 4 before 3, both on time.
+        beat(&mut h, 4, t0.plus(900), t0.plus(905));
+        beat(&mut h, 3, t0.plus(600), t0.plus(910));
+        assert_eq!(window(&h), 1_500, "on time: the window");
+        // Sent 700 ms late (the holder's process was held up).
+        beat(&mut h, 5, t0.plus(1_900), t0.plus(1_905));
+        h.now = t0.plus(1_905);
+        assert_eq!(window(&h), 1_500 + 2 * 700, "sent late");
+        // The holder goes silent: the watch waits the longer window.
+        h.now = t0.plus(1_905 + 1_500);
+        let out = h.step(Event::Timer { id: watch });
+        assert!(
+            s3_ops(&out).is_empty(),
+            "one window: sealed a stalling holder"
+        );
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        assert_eq!(h.core.timer_at(watch), Some(t0.plus(1_905 + 2_900)));
+        // Heard 9 s late: at most four windows.
+        let late = t0.plus(1_905 + 9_200);
+        beat(&mut h, 6, t0.plus(2_200), late);
+        h.now = late;
+        assert_eq!(window(&h), 4 * 1_500, "capped at 4T");
+        // A restarted holder numbers from 1 again: not late.
+        beat(&mut h, 1, late.plus(300), late.plus(300));
+        beat(&mut h, 2, late.plus(600), late.plus(600));
+        // A minute on, the late beats are forgotten.
+        h.now = late.plus(60_000);
+        assert_eq!(window(&h), 1_500, "late beats remembered past a minute");
+        // Off, the window is the window.
+        h.now = late;
+        h.core.cfg.liveness_lag_aware = false;
+        assert_eq!(window(&h), 1_500);
+    }
+
+    /// A lost beat is not lateness (the next arrives on its own schedule,
+    /// `steps` intervals on); a beat this node stamped late because its
+    /// own runtime lapsed is not the holder's lateness either (the lapse
+    /// is discounted once, by `attentive_since`). A new epoch starts the
+    /// numbering and the expiry afresh and keeps the late beats (how the
+    /// holder's host has been doing).
+    #[test]
+    fn lost_beats_and_own_lapses_are_not_the_holders_lateness() {
+        let mut h = Harness::new(2);
+        let _watch = backing(&mut h);
+        let t0 = h.now;
+        let window = |h: &Harness| h.core.silence_window((1, 1, true), h.now);
+        beat(&mut h, 1, t0, t0);
+        // Beat 2 lost: 3 arrives two intervals on.
+        beat(&mut h, 3, t0.plus(600), t0.plus(605));
+        assert_eq!(window(&h), 1_500, "a lost beat read as lateness");
+        // This node lapsed 900 ms: beat 4 is stamped that much late.
+        h.step(Event::OwnLag {
+            from: t0.plus(700),
+            until: t0.plus(1_800),
+        });
+        beat(&mut h, 4, t0.plus(900), t0.plus(1_810));
+        assert_eq!(
+            window(&h),
+            1_500,
+            "this node's own lapse read as the holder's"
+        );
+        // Sent late: the holder's.
+        beat(&mut h, 5, t0.plus(1_900), t0.plus(1_910));
+        assert_eq!(window(&h), 1_500 + 2 * 700);
+        // A new epoch: numbering and expiry afresh, late beats kept.
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 2,
+            candidacy: 1,
+            listed: true,
+            at: t0.plus(2_000),
+            seq: 1,
+            sent: t0.plus(2_000),
+            expires: t0.plus(60_000),
+        });
+        let b = &h.core.bk.beats[&1];
+        assert_eq!(
+            (b.epoch, b.last.map(|l| l.0), b.expires),
+            (2, Some(1), t0.plus(60_000))
+        );
+        assert_eq!(h.core.silence_window((1, 2, true), h.now), 1_500 + 2 * 700);
+    }
+
+    /// F2b at the unit level: an `ack=s3` subscriber whose holder's stream
+    /// frames stopped (a long core step: the frames are the core's) but
+    /// whose off-core beats keep coming does not take the lease over;
+    /// once the beats stop too, it does.
+    #[test]
+    fn an_acks3_holder_that_beats_is_not_taken_over() {
+        let (_holder, mut sub, _req) = stream_pair();
+        let mut lease = root_lease(1, 1, sub.now.plus(60_000));
+        lease.ack_policy = constellation_store_s3::AckPolicy::S3;
+        let now = sub.now;
+        sub.core.lease.note_object(now, &lease);
+        let poke = |h: &mut Harness| {
+            h.step(Event::Activity {
+                last_write: Ms(0),
+                acked_seqs: Vec::new(),
+            })
+        };
+        // 2 s without a frame, a beat every 300 ms.
+        for i in 1..=7u64 {
+            sub.advance(300);
+            let at = sub.now;
+            sub.step(Event::HolderAlive {
+                from: 1,
+                epoch: 1,
+                candidacy: 0,
+                listed: true,
+                at,
+                seq: i,
+                sent: at,
+                expires: at.plus(60_000),
+            });
+            poke(&mut sub);
+        }
+        assert!(sub.core.stream_view().live);
+        assert_eq!(
+            sub.core.stats.s3_fast_takeovers, 0,
+            "took a beating holder over"
+        );
+        // The beats stop too: a window later, taken over.
+        sub.advance(1_600);
+        poke(&mut sub);
+        assert!(sub.core.stream_view().live, "the stream dropped first");
+        assert_eq!(sub.core.stats.s3_fast_takeovers, 1, "a silent holder kept");
+    }
+
+    /// The holder's beats stop at its lease's expiry (they name it):
+    /// silence there is the lease ending, and a listed backup must seal
+    /// and claim before anyone else may, `backup_claim_grace_ms` (2T)
+    /// past the expiry. So within the expiry margin the watch waits the
+    /// plain window, late beats or own lapses or not — and at the expiry
+    /// the beats named it reads the lease, without waiting for a window
+    /// after the last beat.
+    #[test]
+    fn silence_at_the_leases_expiry_waits_the_plain_window() {
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        let t0 = h.now;
+        let expires = t0.plus(4_000);
+        let margin = h.core.cfg.expiry_margin_ms;
+        let at_expiry = |h: &mut Harness, seq: u64, at: Ms| {
+            h.now = at;
+            h.step(Event::HolderAlive {
+                from: 1,
+                epoch: 1,
+                candidacy: 1,
+                listed: true,
+                at,
+                seq,
+                sent: at,
+                expires,
+            })
+        };
+        // A beat 900 ms late: a longer window while the lease runs.
+        at_expiry(&mut h, 1, t0);
+        at_expiry(&mut h, 2, t0.plus(1_200));
+        assert_eq!(h.core.silence_window((1, 1, true), h.now), 1_500 + 2 * 900);
+        // A look while the discount holds is re-armed no later than the
+        // expiry margin, where it ends.
+        h.now = t0.plus(1_500);
+        let out = h.step(Event::Timer { id: watch });
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        assert_eq!(h.core.timer_at(watch), Some(Ms(expires.0 - margin as i64)));
+        // Beats on time up to the expiry, then none (they stop there); a
+        // lapse of the backup's own after it. The watch looks when due.
+        let (mut watch, mut seq, mut beat_at, mut read) = (watch, 2, t0.plus(1_500), None);
+        let mut last_beat = t0.plus(1_200);
+        let mut t = t0.plus(1_500);
+        while t < t0.plus(10_000) && read.is_none() {
+            t = t.plus(50);
+            if beat_at <= t && beat_at < expires {
+                seq += 1;
+                at_expiry(&mut h, seq, beat_at);
+                last_beat = beat_at;
+                beat_at = beat_at.plus(300);
+            }
+            h.now = t;
+            if t == expires.plus(500) {
+                h.step(Event::OwnLag {
+                    from: expires.plus(100),
+                    until: t,
+                });
+            }
+            if h.core.timer_at(watch).is_some_and(|due| due <= t) {
+                let out = h.step(Event::Timer { id: watch });
+                match s3_ops(&out).as_slice() {
+                    [(_, S3Op::LeaseGet)] => read = Some(t),
+                    _ => watch = timers(&out, TimerKind::BackupWatch)[0],
+                }
+            }
+        }
+        assert_eq!(h.core.silence_window((1, 1, true), h.now), 1_500);
+        assert!(last_beat.plus(1_500) > expires);
+        assert_eq!(read, Some(expires), "not at the expiry the beats named");
+        assert!(
+            read.unwrap() < expires.plus(2 * 1_500),
+            "past the claim grace"
+        );
     }
 
     /// The holder dropped this backup (it made no acknowledgement
@@ -6091,6 +6563,7 @@ mod pipelined_appends {
                 candidacy: 1,
                 alive_at: h.now,
                 short_since_progress: false,
+                unreachable: false,
                 acked: 0,
                 sent_through: 0,
                 inflight: Default::default(),
@@ -6465,6 +6938,24 @@ mod pipelined_appends {
         assert!(run(&mut h, 4 * timeout, true), "a stuck backup was kept");
         assert!(h.now.since(start) < timeout + 500);
         let _ = first;
+        // Alive (its heartbeat answers come on the liveness lane) but its
+        // append failed at the transport (a wedged data connection): held
+        // to the ack timeout, not the slow grace, until it answers again.
+        let mut h = holder_with_candidate();
+        journal(&h, "a", 1);
+        let sent = appends(&journaled(&mut h, 900));
+        let start = h.now;
+        h.step(Event::PeerFailed {
+            req: sent[0].0,
+            to: 2,
+            outage: false,
+        });
+        assert!(h.core.ack.peers[&2].unreachable);
+        assert!(
+            run(&mut h, 4 * timeout, true),
+            "an unreachable backup was kept on its heartbeat"
+        );
+        assert!(h.now.since(start) < timeout + 500, "{}", h.now.since(start));
     }
 
     /// The backup side: a batch that overtook an earlier one is
@@ -6584,6 +7075,9 @@ mod pipelined_appends {
                 candidacy,
                 listed: false,
                 at,
+                seq: 0,
+                sent: Ms(0),
+                expires: Ms(0),
             })
         };
         assert_eq!(
@@ -21261,6 +21755,46 @@ fn a_holder_heard_while_the_lease_is_read_is_not_sealed() {
     assert_eq!(h.core.bk.sealed, 0, "sealed a holder that spoke: {out:?}");
     assert!(h.core.job.is_none());
     assert!(h.core.bk.role.is_some());
+}
+
+/// Unless that lease has expired: what the holder sent then was sent
+/// before it (the backlog of a lapse of this node's, stamped as its
+/// runtime got to it), and a backup that re-armed for another window
+/// missed the 2T claim grace (`backup-lag-at-expiry-beats-lost` seed
+/// 655: another node took the lease over by TTL, and the log lost the
+/// order of acknowledged writes).
+#[test]
+fn a_holder_heard_while_its_expired_lease_is_read_is_sealed() {
+    let append = |req| Event::Peer {
+        from: 1,
+        msg: PeerMsg::BackupAppend {
+            req: OpId(req),
+            epoch: 1,
+            holder: 1,
+            config_version: 2,
+            from: 1,
+            txs: Vec::new(),
+            through: 0,
+            candidacy: 1,
+        },
+    };
+    let mut h = Harness::new(2);
+    let out = h.step(append(7));
+    let watch = timers(&out, TimerKind::BackupWatch)[0];
+    h.advance(2_000);
+    let read = h.step(Event::Timer { id: watch });
+    h.advance(100);
+    h.step(append(8));
+    h.advance(100);
+    let mut lease = root_lease(1, 1, Ms(h.now.0 - 300));
+    lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+    lease.backups = vec![2];
+    let out = answer_job_read(&mut h, &read, lease);
+    assert_eq!(
+        h.core.bk.sealed, 1,
+        "re-armed past an expired lease: {out:?}"
+    );
+    assert_eq!(h.core.stats.seals, 1);
 }
 
 /// A continuation epoch that opens while the lease is read: a member of

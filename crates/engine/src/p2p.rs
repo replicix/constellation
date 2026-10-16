@@ -833,7 +833,14 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
-    fn holder_alive(&self, holder: u64, epoch: u64, candidacy: u64, listed: bool) -> bool {
+    fn holder_alive(
+        &self,
+        holder: u64,
+        epoch: u64,
+        candidacy: u64,
+        listed: bool,
+        beat: constellation_net::Beat,
+    ) -> bool {
         let now = constellation_store_s3::lease::now_unix_ms();
         if crate::fault::p2p_denied(holder) {
             return false;
@@ -847,6 +854,7 @@ impl constellation_net::PeerService for P2pBridge {
             candidacy,
             listed,
             at_unix_ms: now,
+            beat,
         });
         // The holder gives a backup that says so longer to acknowledge
         // (`Event::BackupAlive`): true only while this node's driver is

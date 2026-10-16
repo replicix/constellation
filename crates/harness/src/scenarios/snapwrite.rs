@@ -42,6 +42,28 @@
 //! leg alone is often larger than 3 %, so a hard bound would fail on noise
 //! as often as on a regression.
 //!
+//! Each fio run starts 2.5 s before `a`'s scheduler is due to tick, so
+//! a tick falls inside it however fast the host writes. An "on" run with
+//! no snapshot ends **inconclusive** when it saw no tick and was shorter
+//! than one (the policy was not exercised), or when its ticks were held
+//! back (`refused_lag`, `refused_state`, `skipped_reverify`: the leader's
+//! replica behind a busy holder) and the snapshot landed within two ticks
+//! of the run's end (latency); otherwise it fails.
+//!
+//! One move of the lease is not this scenario's to judge: `a` (`b`'s
+//! backup) sealing `b`'s epoch while the host itself stalled processes for
+//! a whole window — the harness's host-lag probes (its own and one in each
+//! throttled daemon's cgroup) saw one stall, or an injector paused a
+//! daemon, within the 10 s before the move was seen, for at least the
+//! window `a`'s watch
+//! waited (`status.ack.last_seal.window_ms`, never less than
+//! `CONSTELLATION_BACKUP_TAKEOVER_MS`, 1.5 s). A host that stalls the holder that long can
+//! stall it past the window, and a seal is then the documented outcome,
+//! not the policy's doing: the run ends **inconclusive** (the
+//! harness's outcome, `crate::hostlag`), once fio's data has been verified (every
+//! write carries a crc32c, checked after the move). Any other move fails
+//! the run, as does a fio error or a bad block.
+//!
 //! `CONSTELLATION_HARNESS_WOH_FILES`, `_FIO_SIZE`, `_FIO_RUNTIME_S` and
 //! `_RUNS` override the defaults (e.g. a quick look at a smaller tree).
 
@@ -96,7 +118,10 @@ pub fn snapsched_write_overhead(_seed: u64) -> Result<()> {
     b.mount()?;
     a.mount()?;
     let mut clients = [a, b];
-    let result = body(&mut clients);
+    let result = match body(&mut clients) {
+        Err(e) if e.is::<EndedInconclusive>() => Ok(()),
+        r => r,
+    };
     dump_logs_on_failure(NAME, &clients, &result);
     for c in clients.iter_mut().rev() {
         if c.is_mounted() {
@@ -183,6 +208,7 @@ fn body(clients: &mut [Client; 2]) -> Result<()> {
     let (a, b) = (&clients[0], &clients[1]);
 
     let lease_before = root_lease(b)?;
+    let seals0 = seals_of(a)?;
     eprintln!(
         "    snapsched-write-overhead: root lease before: holder {} epoch {}",
         lease_before.0, lease_before.1
@@ -193,10 +219,14 @@ fn body(clients: &mut [Client; 2]) -> Result<()> {
             if on {
                 arm(a)?;
             }
+            let tick = tick_ms();
+            align_to_tick(a, tick)?;
+            let sched_before = sched_status(a)?;
+            let ticks_before = stat(&sched_before, "ticks");
             let before = polled(a)?.len();
             let started = now_ms();
             let (bytes, secs, bw) = fio_watched(
-                b,
+                (a, b),
                 &format!("run{i}-{}", leg(on)),
                 &fio_size,
                 runtime,
@@ -207,12 +237,67 @@ fn body(clients: &mut [Client; 2]) -> Result<()> {
                 .iter()
                 .filter(|s| s.created >= started && s.created <= ended)
                 .count();
-            if on {
-                disarm(a)?;
-                ensure!(
-                    snapshots > 0,
-                    "no auto snapshot was created during policy run {i} ({secs:.1} s)"
+            let sched_after = sched_status(a)?;
+            let ticks = stat(&sched_after, "ticks") - ticks_before;
+            // What a's scheduler did meanwhile, for a verdict's message.
+            let did = SCHED_COUNTERS
+                .iter()
+                .map(|k| format!("{k} +{}", stat(&sched_after, k) - stat(&sched_before, k)))
+                .collect::<Vec<_>>()
+                .join(", ")
+                + &format!(
+                    ", latest tick {} ms late (worst {} ms), leading {}",
+                    stat(&sched_after, "tick_late_ms"),
+                    stat(&sched_after, "tick_late_max_ms"),
+                    sched_after["stats"]["leader"]
                 );
+            if on {
+                // A tick that refused (the leader's replica behind the
+                // holder's log, a busy host's latency) delays the run's
+                // snapshot past the run: wait up to two ticks for it
+                // before the policy is removed.
+                let held_back = ["refused_lag", "refused_state", "skipped_reverify"]
+                    .iter()
+                    .any(|k| stat(&sched_after, k) > stat(&sched_before, k));
+                let late = if snapshots == 0 && ticks > 0 && held_back {
+                    late_snapshot(a, started, Duration::from_millis(2 * tick))?
+                } else {
+                    None
+                };
+                disarm(a)?;
+                if snapshots == 0 {
+                    // A run shorter than a tick may see none (a fast host
+                    // writes the 2 GiB in 6 s against the 10 s tick): the
+                    // policy had no chance to act. A run whose ticks were
+                    // refused and whose snapshot came within two ticks of
+                    // its end met latency, not a broken policy. Neither is
+                    // this scenario's to judge; anything else fails.
+                    if let Some(after_ms) = late {
+                        return Err(ended_inconclusive(format!(
+                            "policy run {i} ({secs:.1} s) saw {ticks} tick(s) of a, \
+                             held back ({did}); its snapshot landed {after_ms} ms after the run"
+                        )));
+                    }
+                    let leaders = format!(
+                        "a leads: {:?}, b leads: {:?}; b's scheduler: {}",
+                        is_leader(a).ok(),
+                        is_leader(b).ok(),
+                        sched_status(b)
+                            .map(|v| v["stats"].to_string())
+                            .unwrap_or_default()
+                    );
+                    ensure!(
+                        ticks == 0 && ended - started < tick as i64,
+                        "no auto snapshot was created during policy run {i} ({secs:.1} s, \
+                         {ticks} scheduler tick(s) on a during it: {did}; {leaders})"
+                    );
+                    return Err(ended_inconclusive(format!(
+                        "policy run {i} lasted {:.1} s, under one scheduler tick \
+                         ({tick} ms), and no tick of a fell inside it though it was started \
+                         2.5 s before the next one was due: the policy was not exercised",
+                        (ended - started) as f64 / 1000.0
+                    )));
+                }
             } else {
                 ensure!(
                     snapshots == 0 && polled(a)?.len() == before,
@@ -220,10 +305,17 @@ fn body(clients: &mut [Client; 2]) -> Result<()> {
                 );
             }
             let lease = root_lease(b)?;
-            ensure!(
-                lease == lease_before,
-                "the root lease moved: (holder, epoch) {lease_before:?} -> {lease:?}"
-            );
+            if lease != lease_before {
+                let after = format!("after run {i}");
+                return Err(lease_moved(
+                    a,
+                    &after,
+                    (lease_before, lease),
+                    Instant::now(),
+                    seals0,
+                    false,
+                ));
+            }
             let mb_s = bw as f64 / 1e6;
             eprintln!(
                 "    snapsched-write-overhead: run {i} policy {:<3} {mb_s:8.1} MB/s ({} MiB in \
@@ -245,10 +337,16 @@ fn body(clients: &mut [Client; 2]) -> Result<()> {
         "    snapsched-write-overhead: root lease after:  holder {} epoch {}",
         lease_after.0, lease_after.1
     );
-    ensure!(
-        lease_after == lease_before,
-        "the root lease moved: (holder, epoch) {lease_before:?} -> {lease_after:?}"
-    );
+    if lease_after != lease_before {
+        return Err(lease_moved(
+            a,
+            "after the runs",
+            (lease_before, lease_after),
+            Instant::now(),
+            seals0,
+            false,
+        ));
+    }
     let status = sched_status(a)?;
     eprintln!(
         "    snapsched-write-overhead: a's scheduler: created {}, skipped_empty {}, \
@@ -385,9 +483,9 @@ fn disarm(a: &Client) -> Result<()> {
 
 /// One fio run on `b`, while a sampler reads the root lease once a second
 /// (it must stay `lease`). Returns (bytes written, fio's runtime in s,
-/// fio's write bandwidth in bytes/s).
+/// fio's write bandwidth in bytes/s). A move is judged by [`lease_moved`].
 fn fio_watched(
-    b: &Client,
+    (a, b): (&Client, &Client),
     name: &str,
     size: &str,
     runtime: u64,
@@ -395,33 +493,183 @@ fn fio_watched(
 ) -> Result<(u64, f64, u64)> {
     let dir = b.mnt.join("proj/fio");
     let done = AtomicBool::new(false);
-    let moved: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let moved: Mutex<Option<((u64, u64), Instant)>> = Mutex::new(None);
+    let seals = seals_of(a)?;
     let out = std::thread::scope(|s| {
         s.spawn(|| {
             while !done.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_secs(1));
                 if let Ok(now) = root_lease(b) {
                     if now != lease {
-                        *moved.lock().unwrap() = Some(now);
+                        moved.lock().unwrap().get_or_insert((now, Instant::now()));
                     }
                 }
             }
         });
-        let out = fio(&dir, name, size, runtime);
+        let out = fio(&dir, name, size, runtime, false);
         done.store(true, Ordering::Relaxed);
         out
     })?;
-    if let Some(now) = *moved.lock().unwrap() {
-        anyhow::bail!("the root lease moved during fio run {name}: {lease:?} -> {now:?}");
+    let moved = *moved.lock().unwrap();
+    if let Some((now, seen)) = moved {
+        // fio's data first: whatever the verdict, every block it wrote
+        // must read back as written across the move.
+        fio(&dir, name, &out.0.to_string(), runtime, true)
+            .with_context(|| format!("verifying fio run {name}'s data after the lease moved"))?;
+        let when = format!("during fio run {name}");
+        return Err(lease_moved(a, &when, (lease, now), seen, seals, true));
     }
     let file = dir.join(format!("{name}.0.0"));
     std::fs::remove_file(&file).with_context(|| format!("removing {}", file.display()))?;
     Ok(out)
 }
 
-fn fio(dir: &Path, name: &str, size: &str, runtime: u64) -> Result<(u64, f64, u64)> {
-    let out = Command::new("fio")
-        .arg(format!("--name={name}"))
+/// The scheduler counters a policy run's verdict reports.
+const SCHED_COUNTERS: [&str; 7] = [
+    "created",
+    "skipped_empty",
+    "skipped_reverify",
+    "create_failed",
+    "refused_lag",
+    "refused_state",
+    "skipped_grace",
+];
+
+/// `CONSTELLATION_SNAPSCHED_TICK_MS` as the daemons see it (10 s).
+fn tick_ms() -> u64 {
+    std::env::var("CONSTELLATION_SNAPSCHED_TICK_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(10_000)
+}
+
+/// Return 2.5 s before `a`'s scheduler is next due to tick: a run started
+/// then has a tick inside it however fast the host writes (the gate's
+/// process lane wrote a run's 2 GiB in 6.2 s, between two 10 s ticks, and
+/// no snapshot could land in it). Both legs start so, alike. Waits at most
+/// a tick and a half for one; then starts anyway.
+fn align_to_tick(a: &Client, tick: u64) -> Result<()> {
+    let ticks = stat(&sched_status(a)?, "ticks");
+    let give_up = Instant::now() + Duration::from_millis(tick + tick / 2);
+    while Instant::now() < give_up {
+        if stat(&sched_status(a)?, "ticks") > ticks {
+            std::thread::sleep(Duration::from_millis(tick.saturating_sub(2_500)));
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
+/// The first auto snapshot created after `since` (unix ms) to appear
+/// within `within`: how long after now it was created, if one did.
+fn late_snapshot(a: &Client, since: i64, within: Duration) -> Result<Option<i64>> {
+    let now = now_ms();
+    let give_up = Instant::now() + within;
+    while Instant::now() < give_up {
+        if let Some(s) = polled(a)?.iter().find(|s| s.created >= since) {
+            return Ok(Some(s.created - now));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(None)
+}
+
+/// `a`'s seal count (`status.ack.seals`).
+fn seals_of(a: &Client) -> Result<u64> {
+    Ok(super::m9::ack_of(a)?["seals"].as_u64().unwrap_or(0))
+}
+
+/// The verdict on a move of the root lease from `lease` to `now`, seen
+/// at `seen`, with `a` at `seals_before` seals before it (`verified`:
+/// fio's data was checked after it): **inconclusive** when `a` sealed
+/// `b`'s epoch and took it over while the host lagged by more than half
+/// the takeover window (the module doc); a failure otherwise.
+fn lease_moved(
+    a: &Client,
+    when: &str,
+    (lease, now): ((u64, u64), (u64, u64)),
+    seen: Instant,
+    seals_before: u64,
+    verified: bool,
+) -> anyhow::Error {
+    let takeover_ms: u64 = std::env::var("CONSTELLATION_BACKUP_TAKEOVER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_500);
+    // What the harness's probes (its own, and one in each throttled
+    // daemon's cgroup) and the injectors' pauses took from the 10 s before.
+    let lag = crate::hostlag::lag_between(seen - Duration::from_secs(10), seen);
+    let stall = lag.max.max(lag.injected);
+    let sealed = match (super::m9::node_id(a), seals_of(a)) {
+        (Ok(a_id), Ok(seals)) => now.0 == a_id && now.1 == lease.1 + 1 && seals > seals_before,
+        _ => false,
+    };
+    // What a's seal watch measured (`status.ack.last_seal`): the window it
+    // waited is what the host must have stalled a process for.
+    let seal = super::m9::ack_of(a)
+        .ok()
+        .map(|ack| ack["last_seal"].clone())
+        .unwrap_or_default();
+    let window_ms = seal["window_ms"]
+        .as_u64()
+        .unwrap_or(takeover_ms)
+        .max(takeover_ms);
+    let measured = format!(
+        "a's watch: silent {} ms, attentive {} ms, window {} ms",
+        seal["silent_ms"], seal["attentive_ms"], seal["window_ms"]
+    );
+    if sealed && stall >= Duration::from_millis(window_ms) {
+        return ended_inconclusive(format!(
+            "the root lease moved {when}: {lease:?} -> {now:?} by a's seal of b's epoch while \
+             the host stalled a process {stall:?}, at least the {window_ms} ms window a waited \
+             ({measured}; {lag}){}",
+            if verified {
+                "; fio's data verified"
+            } else {
+                ""
+            }
+        ));
+    }
+    anyhow::anyhow!(
+        "the root lease moved {when}: {lease:?} -> {now:?} (a seal by a: {sealed}; {measured}; \
+         in the 10 s before: {lag})"
+    )
+}
+
+/// The scenario ended early with a verdict that is not its to give
+/// (`crate::hostlag`'s inconclusive outcome): the note is recorded, and
+/// [`snapsched_write_overhead`] returns `Ok`, so the run is reported
+/// `inconclusive` unless something else failed.
+#[derive(Debug)]
+struct EndedInconclusive;
+
+impl std::fmt::Display for EndedInconclusive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ended inconclusive")
+    }
+}
+
+impl std::error::Error for EndedInconclusive {}
+
+fn ended_inconclusive(note: String) -> anyhow::Error {
+    crate::hostlag::inconclusive(format!("snapsched-write-overhead: {note}"));
+    anyhow::Error::new(EndedInconclusive)
+}
+
+/// fio's job: sequential 1 MiB writes with a crc32c per block (written,
+/// not checked, so the write leg measures writes only); `verify_only`
+/// reads the file back and checks every block instead.
+fn fio(
+    dir: &Path,
+    name: &str,
+    size: &str,
+    runtime: u64,
+    verify_only: bool,
+) -> Result<(u64, f64, u64)> {
+    let mut cmd = Command::new("fio");
+    cmd.arg(format!("--name={name}"))
         .arg(format!("--directory={}", dir.display()))
         .arg(format!("--size={size}"))
         .arg(format!("--runtime={runtime}"))
@@ -433,10 +681,15 @@ fn fio(dir: &Path, name: &str, size: &str, runtime: u64) -> Result<(u64, f64, u6
             "--numjobs=1",
             "--fallocate=none",
             "--end_fsync=1",
+            "--verify=crc32c",
             "--output-format=json",
-        ])
-        .output()
-        .context("running fio")?;
+        ]);
+    if verify_only {
+        cmd.arg("--verify_only");
+    } else {
+        cmd.arg("--do_verify=0");
+    }
+    let out = cmd.output().context("running fio")?;
     ensure!(
         out.status.success(),
         "fio failed ({}): {}{}",

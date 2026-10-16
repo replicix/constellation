@@ -814,6 +814,15 @@ pub struct SnapSchedStatus {
     pub last_refused_unix_ms: u64,
     pub now_unix_ms: u64,
     pub last_create_unix_ms: u64,
+    /// When this node's scheduler last ticked (Unix ms; 0 = never), and how
+    /// late against its schedule that tick and the latest of them woke
+    /// (ms): a node whose runtime is held up ticks late or not at all.
+    #[serde(default)]
+    pub last_tick_unix_ms: u64,
+    #[serde(default)]
+    pub tick_late_ms: u64,
+    #[serde(default)]
+    pub tick_late_max_ms: u64,
     pub last_error: Option<String>,
     /// The last policy a setxattr refused: `(expression, byte_offset,
     /// message)`.
@@ -1610,6 +1619,19 @@ pub struct HeldInodeStatus {
     pub seeds: u64,
 }
 
+/// A seal this node made as a backup: the holder and epoch it sealed, the
+/// plain silence (ms), the silence it counted (not across its own runtime
+/// lapses), the window it waited, and when (unix ms).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SealStatus {
+    pub holder: u64,
+    pub epoch: u64,
+    pub silent_ms: i64,
+    pub attentive_ms: i64,
+    pub window_ms: i64,
+    pub at_unix_ms: i64,
+}
+
 /// Plan 30 §M9: the acknowledgement policy, backups and seals.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AckStatus {
@@ -1633,6 +1655,21 @@ pub struct AckStatus {
     pub backing_epoch: u64,
     pub backing_acked: u64,
     pub sealed_epoch: u64,
+    /// The latest seal this node made, as its watch measured the holder's
+    /// silence.
+    #[serde(default)]
+    pub last_seal: Option<SealStatus>,
+    /// The authority core's longest step since the mount (ms) and its
+    /// event's kind, and the longest within the last minute or two: a
+    /// holder whose driver is held in one step past
+    /// `CONSTELLATION_HOLDER_STALL_MS` stops its heartbeat and is sealed,
+    /// so this is the tail that bound must stay above.
+    #[serde(default)]
+    pub longest_step_ms: u64,
+    #[serde(default)]
+    pub longest_step_kind: String,
+    #[serde(default)]
+    pub recent_longest_step_ms: u64,
     // ---- counters ----
     pub backups_added: u64,
     pub backups_removed: u64,

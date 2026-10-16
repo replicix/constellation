@@ -888,6 +888,31 @@ impl Peers {
         self.request_raw_timeout(addr, payload, timeout).await
     }
 
+    /// [`Self::request_to_node_timeout`] on the liveness lane
+    /// ([`crate::endpoint::P2p::request_liveness`]): for the holder's
+    /// heartbeat, sent from a thread with a runtime of its own. No RTT
+    /// sample is taken (the directory's RTT is the pooled connection's).
+    pub async fn request_to_node_liveness(
+        &self,
+        node_id: u64,
+        payload: &Payload,
+        timeout: Duration,
+    ) -> Result<Payload> {
+        let Some(inner) = self.inner.as_ref() else {
+            anyhow::bail!("P2P disabled");
+        };
+        let addr = self
+            .snapshot()
+            .into_iter()
+            .find(|p| p.node_id == node_id)
+            .ok_or_else(|| anyhow::anyhow!("no address for node {node_id}"))?
+            .addr;
+        match tokio::time::timeout(timeout, inner.p2p.request_liveness(addr, payload)).await {
+            Ok(reply) => reply,
+            Err(_) => anyhow::bail!("request timed out"),
+        }
+    }
+
     /// Registry node id enrolled under `pubkey_hex`, if any. Used to
     /// refuse gossip that claims to speak for a different node.
     pub fn node_id_for_key(&self, pubkey_hex: &str) -> Option<u64> {
@@ -1789,8 +1814,9 @@ async fn handle_stream<S: PeerService>(
                 epoch,
                 candidacy,
                 listed,
+                beat,
             } => {
-                let core_responsive = service.holder_alive(holder, epoch, candidacy, listed);
+                let core_responsive = service.holder_alive(holder, epoch, candidacy, listed, beat);
                 Some(Payload::HolderAliveAck { core_responsive })
             }
             Payload::DelegBackupAppend {

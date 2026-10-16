@@ -404,13 +404,15 @@ pub enum SyncRequest {
         txs: Vec<constellation_meta::BackupTx>,
     },
     /// The lease holder's off-core liveness heartbeat, stamped with its
-    /// arrival (unix ms): `Event::HolderAlive`.
+    /// arrival (unix ms): `Event::HolderAlive`, with the beat's number
+    /// and stamps (`constellation_net::Beat`).
     PeerHolderAlive {
         holder: u64,
         epoch: u64,
         candidacy: u64,
         listed: bool,
         at_unix_ms: i64,
+        beat: constellation_net::Beat,
     },
     /// Plan 30 §M10: a would-be taker asks this node for a heartbeat
     /// promise; answered with `(until, epoch_slack)` (`until: None`:

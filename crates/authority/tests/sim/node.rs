@@ -140,6 +140,16 @@ pub struct Shared {
     paused_until: Mutex<Option<tokio::time::Instant>>,
     /// When the last pause began.
     paused_since: Mutex<Option<tokio::time::Instant>>,
+    /// A runtime lag (`FaultKind::RuntimeLag`): until when the node's
+    /// runtime is held up, and until when what peers send it is not yet
+    /// stamped.
+    lag: Mutex<Option<(tokio::time::Instant, tokio::time::Instant)>>,
+    /// When the current runtime lag began.
+    lag_since: Mutex<Option<tokio::time::Instant>>,
+    /// What the off-core heartbeat beats to (the daemon's
+    /// `AliveTargets`): the epoch and expiry of the lease this node
+    /// holds and `Core::liveness_targets`, after every event.
+    liveness: Mutex<Option<(u64, i64, Vec<NodeId>)>>,
     pub conflict_copies: AtomicU64,
     /// Rids whose effects were rolled back at some point (see
     /// `history.rs`): read from the replay queue whenever the core's
@@ -254,6 +264,10 @@ pub struct NodeEnv {
     pub tag_check_at_write: bool,
     /// F1's other one (`SimConfig::settle_tagged_writes`).
     pub settle_tagged_writes: bool,
+    /// See `SimConfig::holder_beats`.
+    pub holder_beats: super::run::HolderBeats,
+    /// See `SimConfig::timers_first_after_lag`.
+    pub timers_first_after_lag: bool,
 }
 
 impl NodeEnv {
@@ -306,6 +320,9 @@ impl NodeHandle {
             alive: AtomicBool::new(true),
             paused_until: Mutex::new(None),
             paused_since: Mutex::new(None),
+            lag: Mutex::new(None),
+            lag_since: Mutex::new(None),
+            liveness: Mutex::new(None),
             conflict_copies: AtomicU64::new(0),
             tentative: Mutex::new(BTreeSet::new()),
             journaled_refusals: Mutex::new(BTreeSet::new()),
@@ -338,6 +355,7 @@ impl NodeHandle {
         env.bus.attach(id, tx.clone());
         env.world.register(id, meta.clone());
         let cfg = (env.config)(id, incarnation);
+        let beat_every_ms = cfg.backup_heartbeat_ms.max(1);
         let driver = Driver {
             id,
             meta: meta.clone(),
@@ -360,8 +378,24 @@ impl NodeHandle {
             panic_after_events: env.panic_after_events,
             fast_path: env.fast_path,
             held: None,
+            ready: std::collections::VecDeque::new(),
+            held_peers: std::collections::VecDeque::new(),
+            peers_held_until: None,
+            lag_queue: Vec::new(),
+            lag_pending: None,
+            stamps_first: !env.timers_first_after_lag,
         };
         let task = tokio::spawn(driver.run());
+        if env.holder_beats != super::run::HolderBeats::Off {
+            tokio::spawn(beat_loop(
+                id,
+                shared.clone(),
+                env.bus.clone(),
+                env.clock_of(id),
+                beat_every_ms,
+                env.holder_beats == super::run::HolderBeats::Runtime,
+            ));
+        }
         NodeHandle {
             id,
             meta,
@@ -476,6 +510,14 @@ impl NodeHandle {
         *self.shared.hold_next.lock().unwrap() = Some((0, write_ms));
     }
 
+    /// `FaultKind::RuntimeLag`: hold the node's runtime up until
+    /// `until`, and leave what peers send it unstamped until
+    /// `peers_until`.
+    pub fn runtime_lag(&self, until: tokio::time::Instant, peers_until: tokio::time::Instant) {
+        *self.shared.lag.lock().unwrap() = Some((until, peers_until));
+        *self.shared.lag_since.lock().unwrap() = Some(tokio::time::Instant::now());
+    }
+
     /// Paused, and since at least `d` ago.
     pub fn paused_for(&self, d: std::time::Duration) -> bool {
         self.paused()
@@ -519,6 +561,19 @@ struct Driver {
     fast_path: super::run::FastPath,
     /// F1: the fast-path write held behind the slow writer, if any.
     held: Option<HeldWrite>,
+    /// A runtime lag's aftermath ([`Driver::next_event`]): what goes
+    /// next, before the queue; what peers sent, held until
+    /// `peers_held_until`.
+    ready: std::collections::VecDeque<Event>,
+    held_peers: std::collections::VecDeque<Event>,
+    peers_held_until: Option<tokio::time::Instant>,
+    /// A runtime lag in progress: what arrived during it, and when it
+    /// ends ([`Driver::finish_lag`]).
+    lag_queue: Vec<Event>,
+    lag_pending: Option<tokio::time::Instant>,
+    /// After a lag, what the daemon's P2P handlers stamped meanwhile goes
+    /// to the core before the timers ([`Driver::finish_lag`]).
+    stamps_first: bool,
 }
 
 /// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
@@ -598,6 +653,66 @@ fn outcome_of(
         Err(constellation_meta::MetaError::Conflict) => MutateOutcome::Conflict { manifest: None },
         Err(constellation_meta::MetaError::LockLapsed) => MutateOutcome::LockLapsed,
         Err(e) => MutateOutcome::Errno(e.code()),
+    }
+}
+
+/// What a peer sent (the P2P receive path, which a runtime lag holds up
+/// longest), as opposed to the node's own timers and IO completions.
+fn from_a_peer(event: &Event) -> bool {
+    matches!(event, Event::Peer { .. } | Event::HolderAlive { .. })
+}
+
+/// The off-core heartbeat (`holder_alive_loop` in the daemon): every
+/// beat interval, while the node is alive, not stopped (`pause_until`:
+/// the whole process) and holding an unexpired lease, a numbered beat to
+/// each of its liveness targets. `on_runtime`: a task of the node's
+/// runtime, as it was, held up by a runtime lag like everything else;
+/// otherwise its own thread, which a runtime lag does not touch.
+async fn beat_loop(
+    id: NodeId,
+    shared: Arc<Shared>,
+    bus: Arc<Bus>,
+    clock: Clock,
+    every_ms: u64,
+    on_runtime: bool,
+) {
+    let mut seq = 0u64;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+        if !shared.alive.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if shared
+            .paused_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| now < until)
+        {
+            continue;
+        }
+        if on_runtime {
+            let lag = *shared.lag.lock().unwrap();
+            if let Some((until, _)) = lag {
+                if now < until {
+                    // The task wakes when the runtime gets to it: once,
+                    // at the lag's end, not once per missed interval.
+                    tokio::time::sleep_until(until).await;
+                    continue;
+                }
+            }
+        }
+        let Some((epoch, until_ms, targets)) = shared.liveness.lock().unwrap().clone() else {
+            continue;
+        };
+        let at = clock.now().0;
+        if at >= until_ms {
+            continue;
+        }
+        seq += 1;
+        for to in targets {
+            bus.send_beat((id, to), epoch, seq, (at, until_ms));
+        }
     }
 }
 
@@ -683,19 +798,8 @@ impl Driver {
         }
         loop {
             // F1: a held fast-path write goes on at its time, between
-            // events (`HeldWrite`).
-            let event = match self.held.as_ref().map(|h| h.release_at) {
-                Some(at) => tokio::select! {
-                    biased;
-                    _ = tokio::time::sleep_until(at) => {
-                        self.release_held();
-                        continue;
-                    }
-                    e = self.rx.recv() => e,
-                },
-                None => self.rx.recv().await,
-            };
-            let Some(event) = event else {
+            // events (`HeldWrite`; `Driver::next_event` wakes for it).
+            let Some(mut event) = self.next_event().await else {
                 break;
             };
             if self.bootstrap.is_some() && matches!(event, Event::Submit { .. }) {
@@ -721,6 +825,28 @@ impl Driver {
                     "sim: step stalled after its clock read"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            // A beat's arrival stamp: when this node got to it (the
+            // daemon stamps it in its P2P handler; a lag delays both).
+            if let Event::HolderAlive {
+                at,
+                from,
+                listed,
+                sent,
+                seq,
+                ..
+            } = &mut event
+            {
+                if at.0 == 0 {
+                    *at = now;
+                }
+                // Answered as the daemon's P2P handler answers it, when
+                // this node gets to it: the holder hears the backup is
+                // alive (`Event::BackupAlive`, stamped with the beat's
+                // send time) and gives it the slow-backup grace.
+                if *listed && *seq != 0 {
+                    self.bus.answer_beat((self.id, *from), *sent);
+                }
             }
             let debug = tracing::enabled!(tracing::Level::DEBUG);
             let debug_event = if debug {
@@ -890,6 +1016,143 @@ impl Driver {
         }
     }
 
+    /// The next event to handle. Under a runtime lag
+    /// (`NodeHandle::runtime_lag`) nothing is handled until it ends;
+    /// then the core first hears of the lapse (`Event::OwnLag`, as the
+    /// daemon's lag probe tells it), then the timers and IO completions
+    /// queued meanwhile, while what peers sent stays unstamped until the
+    /// lag's peer deadline — the order that makes a silence watch look
+    /// before the backlog of beats is in.
+    async fn next_event(&mut self) -> Option<Event> {
+        loop {
+            if let Some(event) = self.ready.pop_front() {
+                return Some(event);
+            }
+            let now = tokio::time::Instant::now();
+            if let Some(t) = self.peers_held_until {
+                if now >= t {
+                    self.peers_held_until = None;
+                    self.ready.extend(self.held_peers.drain(..));
+                    continue;
+                }
+            }
+            if self.lag_pending.is_some_and(|t| now >= t) {
+                self.finish_lag();
+                continue;
+            }
+            // Wake for the first of: the peer lane's hold, the lag's end,
+            // F1's held write (released between events).
+            let held_at = self.held.as_ref().map(|h| h.release_at);
+            let wake = [self.peers_held_until, self.lag_pending, held_at]
+                .into_iter()
+                .flatten()
+                .min();
+            let event = match wake {
+                Some(t) => tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(t) => {
+                        if held_at.is_some_and(|h| h <= tokio::time::Instant::now()) {
+                            self.release_held();
+                        }
+                        continue;
+                    }
+                    e = self.rx.recv() => e?,
+                },
+                None => self.rx.recv().await?,
+            };
+            if self.lag_pending.is_some() {
+                self.lag_queue.push(event);
+                continue;
+            }
+            // Kept while it lasts: a heartbeat on the runtime
+            // (`beat_loop`) is held up by it too.
+            let lag = *self.shared.lag.lock().unwrap();
+            if let Some((until, _)) = lag {
+                self.lag_queue.push(event);
+                self.lag_pending = Some(until);
+                continue;
+            }
+            if self.peers_held_until.is_some() && from_a_peer(&event) {
+                self.held_peers.push_back(event);
+                continue;
+            }
+            return Some(event);
+        }
+    }
+
+    /// A runtime lag ended: the core hears of it first (`Event::OwnLag`),
+    /// then (`stamps_first`, the daemon's order) what its P2P handlers
+    /// stamped meanwhile, then the timers and IO completions that queued,
+    /// while what peers sent waits for the lag's peer deadline.
+    fn finish_lag(&mut self) {
+        self.lag_pending = None;
+        let lag = self.shared.lag.lock().unwrap().take();
+        let Some((_, peers_until)) = lag else {
+            self.ready.extend(self.lag_queue.drain(..));
+            return;
+        };
+        let mut queued = std::mem::take(&mut self.lag_queue);
+        while let Ok(e) = self.rx.try_recv() {
+            queued.push(e);
+        }
+        let now = self.clock.now();
+        let since = self.shared.lag_since.lock().unwrap().take();
+        let lapsed = since.map_or(0, |t| {
+            tokio::time::Instant::now().duration_since(t).as_millis() as i64
+        });
+        self.ready.push_back(Event::OwnLag {
+            from: constellation_authority::Ms(now.0 - lapsed),
+            until: now,
+        });
+        if self.stamps_first {
+            // The daemon's P2P handlers stamp the holder's beats and
+            // appends as its runtime gets to them — at the lapse's end —
+            // and its driver hands those stamps to the core, as unnumbered
+            // beats, before any timer (`Driver::hand_heard`); the appends
+            // themselves (its sync lane) come after the timers, and the
+            // numbered beats with the rest of what peers sent.
+            let mut stamped: Vec<(NodeId, u64)> = Vec::new();
+            for e in &queued {
+                let key = match e {
+                    Event::HolderAlive {
+                        from,
+                        epoch,
+                        listed: true,
+                        ..
+                    } => Some((*from, *epoch)),
+                    Event::Peer {
+                        msg: PeerMsg::BackupAppend { holder, epoch, .. },
+                        ..
+                    } => Some((*holder, *epoch)),
+                    _ => None,
+                };
+                if let Some(key) = key.filter(|k| !stamped.contains(k)) {
+                    stamped.push(key);
+                }
+            }
+            for (from, epoch) in stamped {
+                self.ready.push_back(Event::HolderAlive {
+                    from,
+                    epoch,
+                    candidacy: 0,
+                    listed: true,
+                    at: now,
+                    seq: 0,
+                    sent: constellation_authority::Ms(0),
+                    expires: constellation_authority::Ms(0),
+                });
+            }
+        }
+        self.peers_held_until = Some(peers_until);
+        for e in queued {
+            if from_a_peer(&e) {
+                self.held_peers.push_back(e);
+            } else {
+                self.ready.push_back(e);
+            }
+        }
+    }
+
     fn refresh_view(&self) {
         let lease = self.core.lease();
         let mut view = self.shared.view.lock().unwrap();
@@ -922,6 +1185,12 @@ impl Driver {
             }
             _ => None,
         };
+        let liveness = view.s3_held.map(|(epoch, until)| {
+            let targets = self.core.liveness_targets().into_iter().map(|(n, _)| n);
+            (epoch, until, targets.collect())
+        });
+        drop(view);
+        *self.shared.liveness.lock().unwrap() = liveness;
     }
 
     /// Whenever the core rolled something back, the replay queue names

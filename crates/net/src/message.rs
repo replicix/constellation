@@ -706,12 +706,14 @@ pub enum Payload {
     /// `listed: false` goes to a backup the holder dropped (its
     /// `candidacy`, as in [`Payload::BackupAppend`]): it stops watching
     /// instead of sealing a holder that dropped it. Answered with
-    /// [`Payload::HolderAliveAck`].
+    /// [`Payload::HolderAliveAck`]. `beat` numbers and stamps it
+    /// ([`Beat`]).
     HolderAlive {
         holder: u64,
         epoch: u64,
         candidacy: u64,
         listed: bool,
+        beat: Beat,
     },
     // ---- overload-cascade-2 ----
     /// The answer to [`Payload::HolderAlive`]: whether the backup's own
@@ -723,6 +725,22 @@ pub enum Payload {
     HolderAliveAck {
         core_responsive: bool,
     },
+}
+
+/// One beat of the holder's off-core heartbeat ([`Payload::HolderAlive`]):
+/// `seq` numbers the beats (one per interval, from 1, per process),
+/// `sent_unix_ms` is the holder's clock when it sent this one, and
+/// `expires_unix_ms` the expiry of the lease it beats for (the beats stop
+/// there). A watcher tells from the first two whether beats it heard late
+/// were sent on time (held up on the way, or by its own runtime) or late
+/// (the holder's process itself was held up), and lengthens its silence
+/// window while either has happened lately; from the third, that silence
+/// at the expiry is the lease ending, and is not given that grace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Beat {
+    pub seq: u64,
+    pub sent_unix_ms: i64,
+    pub expires_unix_ms: i64,
 }
 
 /// Plan 30 §M14: `constellation_authority::LockOutcome` on the wire.

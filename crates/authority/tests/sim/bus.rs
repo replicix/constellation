@@ -50,6 +50,9 @@ pub struct Bus {
     /// "far" pair is out of the backup budget); default twice the max
     /// delay.
     rtts: Mutex<HashMap<(NodeId, NodeId), u64>>,
+    /// Every off-core heartbeat beat is lost (`SimConfig::beats_lost`: the
+    /// liveness lane broken while the data lane works).
+    beats_lost: std::sync::atomic::AtomicBool,
 }
 
 /// M7: the stream faults (probabilities per frame).
@@ -82,6 +85,7 @@ impl Bus {
             segment_frames: Mutex::new(0),
             stream_faults_injected: Mutex::new(0),
             rtts: Mutex::new(HashMap::new()),
+            beats_lost: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -100,6 +104,12 @@ impl Bus {
             .get(&(a, b))
             .copied()
             .unwrap_or(2 * self.delay.1.max(1))
+    }
+
+    /// See `SimConfig::beats_lost`.
+    pub fn set_beats_lost(&self, lost: bool) {
+        self.beats_lost
+            .store(lost, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_stream_faults(&self, faults: StreamFaults) {
@@ -320,6 +330,58 @@ impl Bus {
                 None => *bus.dropped.lock().unwrap() += 1,
             }
         });
+    }
+
+    /// One beat of `from`'s off-core heartbeat (`Event::HolderAlive`,
+    /// `Payload::HolderAlive` in the daemon) to `to`: a request whose
+    /// answer nothing waits on, so a lost one is just lost. Its arrival
+    /// stamp is the receiving driver's (`node.rs`).
+    pub fn send_beat(
+        self: &Arc<Self>,
+        (from, to): (NodeId, NodeId),
+        epoch: u64,
+        seq: u64,
+        (sent, expires): (i64, i64),
+    ) {
+        *self.sent.lock().unwrap() += 1;
+        if self.beats_lost.load(std::sync::atomic::Ordering::Relaxed) {
+            *self.dropped.lock().unwrap() += 1;
+            return;
+        }
+        if !self.deliverable(from, to) {
+            *self.dropped.lock().unwrap() += 1;
+            return;
+        }
+        let delay = self.delay();
+        self.deliver_later(
+            to,
+            delay,
+            Event::HolderAlive {
+                from,
+                epoch,
+                candidacy: 0,
+                listed: true,
+                at: constellation_authority::Ms(0),
+                seq,
+                sent: constellation_authority::Ms(sent),
+                expires: constellation_authority::Ms(expires),
+            },
+        );
+    }
+
+    /// `from`'s answer to a beat of `to`'s sent at `sent`
+    /// (`Payload::HolderAliveAck` in the daemon): `Event::BackupAlive` at
+    /// the holder. Lost like the beat when the link is.
+    pub fn answer_beat(
+        self: &Arc<Self>,
+        (from, to): (NodeId, NodeId),
+        sent: constellation_authority::Ms,
+    ) {
+        if !self.deliverable(from, to) {
+            return;
+        }
+        let delay = self.delay();
+        self.deliver_later(to, delay, Event::BackupAlive { from, at: sent });
     }
 
     fn deliver_later(self: &Arc<Self>, to: NodeId, delay: Duration, event: Event) {

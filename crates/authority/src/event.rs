@@ -106,13 +106,28 @@ pub enum Event {
     /// heard at `at` — its arrival, which may be well before this node's
     /// core gets to it. `listed: false`: the holder dropped this node's
     /// `candidacy` (`PeerMsg::BackupAppend::candidacy`) from its backups.
+    /// `seq`, `sent` and `expires` are the beat's number, the holder's
+    /// clock when it sent it and the expiry of the lease it beats for
+    /// (`constellation_net::Beat`); `seq` 0: not a numbered beat (the
+    /// driver handing the latest arrival over, `Driver::hand_heard`).
     HolderAlive {
         from: NodeId,
         epoch: Epoch,
         candidacy: u64,
         listed: bool,
         at: Ms,
+        seq: u64,
+        sent: Ms,
+        expires: Ms,
     },
+    /// This node's own runtime was held up from `from` until `until` (its
+    /// lag probe woke at least an eighth of `backup_takeover_ms` late; a
+    /// lapse still in progress is handed again as it grows, with the same
+    /// `from`): what it stamped as an arrival meanwhile it stamped late,
+    /// and what it has not stamped yet may already be here. A silence
+    /// watch (the seal watch, `ack=s3`'s) counts silence only from the
+    /// end of the latest lapse (`Core::attentive_since`).
+    OwnLag { from: Ms, until: Ms },
     /// The holder's side of the same heartbeat: backup `from` answered
     /// one sent at `at` (its process and link are up, whatever its core
     /// is doing). A backup known alive is given `backup_slow_max_ms`, not

@@ -160,6 +160,29 @@
           "minimum": 0,
           "type": "integer"
         },
+        "last_seal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SealStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The latest seal this node made, as its watch measured the holder's\nsilence."
+        },
+        "longest_step_kind": {
+          "default": "",
+          "type": "string"
+        },
+        "longest_step_ms": {
+          "default": 0,
+          "description": "The authority core's longest step since the mount (ms) and its\nevent's kind, and the longest within the last minute or two: a\nholder whose driver is held in one step past\n`CONSTELLATION_HOLDER_STALL_MS` stops its heartbeat and is sealed,\nso this is the tail that bound must stay above.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "own_record_uploads": {
           "description": "Uploads of this node's pending chunks for its own forwarded `back`\nclose, despite the upload hold, because the close waited for\nrecords only those chunks release: once when the sequencer answered\nthat only this upload brings them back, and once per\n`CONSTELLATION_OWN_RECORD_WAIT_MS` the close then still waited, or\nwaited past a stream the sequencer said would carry them.",
           "format": "uint64",
@@ -184,6 +207,12 @@
         },
         "reads_durability_blocked": {
           "description": "Holder-local reads that waited for durability of the unshipped\nrows they would have observed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recent_longest_step_ms": {
+          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -5831,6 +5860,46 @@
       ],
       "type": "object"
     },
+    "SealStatus": {
+      "description": "A seal this node made as a backup: the holder and epoch it sealed, the\nplain silence (ms), the silence it counted (not across its own runtime\nlapses), the window it waited, and when (unix ms).",
+      "properties": {
+        "at_unix_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "attentive_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "holder": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "silent_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "window_ms": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "holder",
+        "epoch",
+        "silent_ms",
+        "attentive_ms",
+        "window_ms",
+        "at_unix_ms"
+      ],
+      "type": "object"
+    },
     "Secret": {
       "type": "string",
       "writeOnly": true
@@ -6932,6 +7001,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "last_tick_unix_ms": {
+          "default": 0,
+          "description": "When this node's scheduler last ticked (Unix ms; 0 = never), and how\nlate against its schedule that tick and the latest of them woke\n(ms): a node whose runtime is held up ticks late or not at all.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "leader": {
           "description": "This node holds the scheduler's singleton lease.",
           "type": "boolean"
@@ -6993,6 +7069,18 @@
         },
         "skipped_reverify": {
           "description": "Expiry victims whose row changed before the delete (now held,\ngone, or re-owned), and so were not deleted.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tick_late_max_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tick_late_ms": {
+          "default": 0,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

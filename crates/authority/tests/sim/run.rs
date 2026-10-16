@@ -135,6 +135,55 @@ pub enum FaultKind {
     /// the rule's absence, every live peer joins). See
     /// `epochs::holder_cut_epoch`.
     HolderCutEpoch { for_ms: u64, decline: bool },
+    /// `who`'s runtime is held up for a seeded `for_ms` (a busy host, or
+    /// every worker inside a slow blocking call) while its clock, its
+    /// other threads and everyone else run on: its core handles nothing,
+    /// its timers fire late and are handled before what peers sent it
+    /// meanwhile, which is stamped (handed to its core) a seeded
+    /// `stamp_lag_ms` later still — the daemon's P2P receive path runs on
+    /// the same runtime, several tasks deep. Its driver tells its core
+    /// once it runs again (`Event::OwnLag`, the daemon's lag probe). Its
+    /// off-core heartbeat keeps beating unless `SimConfig::holder_beats`
+    /// puts it on the runtime. Nothing is lost or stopped: a run under
+    /// `SimConfig::live_holder` must see no seal and no fast takeover.
+    RuntimeLag {
+        who: LagOf,
+        for_ms: (u64, u64),
+        stamp_lag_ms: (u64, u64),
+    },
+}
+
+/// Whose runtime a [`FaultKind::RuntimeLag`] holds up, as the lease
+/// object names them at the fault's time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LagOf {
+    Holder,
+    /// The first listed backup.
+    Backup,
+    /// The lowest live node that is not the holder (under `ack=s3`, a
+    /// subscriber of its log stream).
+    NonHolder,
+}
+
+/// Where a node's off-core heartbeat runs (the daemon's
+/// `holder_alive_loop`), in the simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HolderBeats {
+    /// Not modelled: a holder's liveness is its core's appends and
+    /// stream frames (every configuration before the runtime-lag ones).
+    /// Their seal watches never learn a lease expiry from a beat, so
+    /// they are always in the unknown-expiry arm of `Core::lag_discount`;
+    /// with no `RuntimeLag` in them, no lapse is ever handed over and
+    /// the arm is inert.
+    #[default]
+    Off,
+    /// On a thread of its own, sending on the liveness lane: a
+    /// [`FaultKind::RuntimeLag`] of the node does not hold it up (a
+    /// `Pause`, the whole process stopped, does).
+    Thread,
+    /// A task of the node's runtime, as it was: held up by a
+    /// [`FaultKind::RuntimeLag`] with everything else.
+    Runtime,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +351,22 @@ pub struct SimConfig {
     /// How long a lock client waits for its turn write's answer before it
     /// leaves it in doubt (`None`: 3 s, 30 s under `strict_lock_turns`).
     pub lock_write_wait_ms: Option<u64>,
+    /// Where the holder's off-core heartbeat runs ([`HolderBeats`]).
+    pub holder_beats: HolderBeats,
+    /// Every holder stays alive: a seal, a backup takeover or an
+    /// `ack=s3` fast takeover fails the seed (the runtime-lag
+    /// configurations: lag is latency, not death).
+    pub live_holder: bool,
+    /// Every beat of the off-core heartbeat is lost on the bus (its lane
+    /// broken while appends get through): a backup never learns the
+    /// holder's lease expiry from a beat.
+    pub beats_lost: bool,
+    /// After a runtime lag, the timers go to the core before what the
+    /// node's P2P handlers stamped meanwhile (the order a driver that
+    /// wakes for its timer before the handlers run would see). Off, the
+    /// daemon's usual order: the handlers' stamps first
+    /// (`Driver::hand_heard`), as unnumbered beats.
+    pub timers_first_after_lag: bool,
 }
 
 /// See `SimConfig::fast_path`.
@@ -527,6 +592,10 @@ impl Default for SimConfig {
             strict_lock_turns: false,
             settle_tagged_writes: true,
             lock_write_wait_ms: None,
+            holder_beats: HolderBeats::Off,
+            live_holder: false,
+            beats_lost: false,
+            timers_first_after_lag: false,
         }
     }
 }
@@ -1651,6 +1720,52 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bucket.set_cut(node, false);
         }
+        FaultKind::RuntimeLag {
+            who,
+            for_ms,
+            stamp_lag_ms,
+        } => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                note(format!("t={} runtime-lag: no lease yet", fault.at_ms));
+                return;
+            };
+            let ids = cluster.ids();
+            let live = |n: &NodeId| ids.contains(n) && cluster.get(*n).alive();
+            let node = match who {
+                LagOf::Holder => Some(lease.holder).filter(live),
+                LagOf::Backup => lease.backups.first().copied().filter(live),
+                LagOf::NonHolder => ids.iter().copied().find(|n| *n != lease.holder && live(n)),
+            };
+            let Some(node) = node else {
+                note(format!(
+                    "t={} runtime-lag {who:?}: nobody (holder {}, backups {:?})",
+                    fault.at_ms, lease.holder, lease.backups
+                ));
+                return;
+            };
+            // Drawn from the seed and the fault's time: the same on every
+            // replay, different per fault.
+            let mut rng =
+                StdRng::seed_from_u64(cluster.env.seed ^ fault.at_ms.wrapping_mul(0x9e37));
+            let draw = |rng: &mut StdRng, (lo, hi): (u64, u64)| {
+                if hi > lo {
+                    rng.random_range(lo..=hi)
+                } else {
+                    lo
+                }
+            };
+            let lag = draw(&mut rng, for_ms);
+            let stamp = draw(&mut rng, stamp_lag_ms);
+            note(format!(
+                "t={} runtime lag on node {node} ({who:?} of holder {} epoch {}) for {lag}ms, \
+                 peers stamped {stamp}ms after",
+                fault.at_ms, lease.holder, lease.epoch
+            ));
+            let until = tokio::time::Instant::now() + Duration::from_millis(lag);
+            cluster
+                .get(node)
+                .runtime_lag(until, until + Duration::from_millis(stamp));
+        }
         FaultKind::Pause { node, for_ms } => {
             note(format!(
                 "t={} pause node {node} for {for_ms}ms",
@@ -2158,6 +2273,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let bucket = Bucket::new(seed, cfg.s3_latency);
     let bus = Bus::new(seed, cfg.p2p_delay, cfg.p2p_drop);
     bus.set_stream_faults(cfg.stream_faults.clone());
+    bus.set_beats_lost(cfg.beats_lost);
     bus.set_deleg_answer_delay(cfg.deleg_answer_delay);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
@@ -2175,6 +2291,8 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         world: ChunkWorld::new(),
         tag_check_at_write: cfg.tag_check_at_write,
         settle_tagged_writes: cfg.settle_tagged_writes,
+        holder_beats: cfg.holder_beats,
+        timers_first_after_lag: cfg.timers_first_after_lag,
     };
     env.world
         .hold_ms
@@ -2716,6 +2834,29 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         report.settle_waits += ls.settle_waits;
     }
     report.acked_rolled_back = rolled_back_acked;
+    // The runtime-lag configurations: every holder was alive throughout,
+    // only late; a seal or a fast takeover deposed a live one. (Not
+    // `backup_takeovers`: that counts any acquisition that re-applies a
+    // backup tail, a released lease's included.)
+    if cfg.live_holder {
+        let taken: Vec<String> = report
+            .stats
+            .iter()
+            .filter(|(_, s)| s.seals + s.s3_fast_takeovers > 0)
+            .map(|(id, s)| {
+                format!(
+                    "node {id}: seals {} s3_fast_takeovers {}",
+                    s.seals, s.s3_fast_takeovers
+                )
+            })
+            .collect();
+        if !taken.is_empty() {
+            return Err(format!(
+                "a live holder was sealed or taken over (it was only late): {taken:?}\n  faults: {:?}",
+                report.faults
+            ));
+        }
+    }
     // Plan 30 §M14: a later holder read an older turn than the one
     // written under the previous exclusive lock — unless that write's
     // acknowledgement was itself rolled back (tentative: `Local`'s L2

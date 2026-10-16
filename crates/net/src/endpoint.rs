@@ -1335,7 +1335,14 @@ pub trait PeerService: Send + Sync + 'static {
     /// ([`Payload::HolderAlive`]); the answer is whether this node's
     /// authority core is responsive ([`Payload::HolderAliveAck`]).
     /// Default ignores it and answers no.
-    fn holder_alive(&self, _holder: u64, _epoch: u64, _candidacy: u64, _listed: bool) -> bool {
+    fn holder_alive(
+        &self,
+        _holder: u64,
+        _epoch: u64,
+        _candidacy: u64,
+        _listed: bool,
+        _beat: crate::message::Beat,
+    ) -> bool {
         false
     }
     /// Plan 30 §M14: a node asks this one, as the owning sequencer, for
@@ -1483,6 +1490,9 @@ pub struct P2p {
     /// `CONSTELLATION_P2P_DIAL_TIMEOUT_MS`, read at spawn.
     dial_timeout: Duration,
     dial_watch: DialWatch,
+    /// The liveness lane ([`Self::request_liveness`]): one connection per
+    /// peer of its own, apart from [`Self::pool`].
+    liveness: Mutex<HashMap<iroh::EndpointId, ConnectionSlot>>,
 }
 
 /// Derive the gossip topic. Prefers the `gossip_secret` from
@@ -1560,6 +1570,7 @@ impl P2p {
             policy,
             dial_timeout: dial_timeout(),
             dial_watch: DialWatch::default(),
+            liveness: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1778,6 +1789,72 @@ impl P2p {
         in_flight.done = true;
         if result.is_err() {
             self.invalidate_connection(expect, conn.stable_id()).await;
+        }
+        result
+    }
+
+    /// [`Self::request`] on the liveness lane: a connection to `peer` of
+    /// its own, dialed by the first liveness request — and so driven,
+    /// like every QUIC connection, by tasks of the runtime that dialed
+    /// it (noq spawns a connection's driver where it is created). The
+    /// holder's heartbeat runs on a thread with a runtime of its own;
+    /// over a pooled connection, whose driver is a task of the daemon's
+    /// shared runtime, a beat went out only when that runtime got to it,
+    /// and a runtime held up for seconds (every worker inside a slow
+    /// store call, a busy host) silenced the holder until its backup
+    /// sealed it. On this lane a beat leaves the process whatever the
+    /// shared runtime is doing. Only the beat uses it: nothing here
+    /// probes, evicts or counts toward the pool's dial watch (the pool
+    /// tracks the connection like any other, so an eviction of the peer
+    /// closes it too, and the next request re-dials).
+    pub async fn request_liveness(&self, peer: EndpointAddr, payload: &Payload) -> Result<Payload> {
+        let expect = peer.id;
+        let gate = self
+            .liveness
+            .lock()
+            .unwrap()
+            .entry(peer.id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .clone();
+        let conn = {
+            let mut slot = gate.lock().await;
+            match slot.as_ref() {
+                Some(conn) if conn.close_reason().is_none() => conn.clone(),
+                _ => {
+                    let conn = tokio::time::timeout(
+                        self.dial_timeout,
+                        self.endpoint.connect(peer.clone(), ALPN),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("dialing peer timed out (liveness lane)"))?
+                    .context("dialing peer (liveness lane)")?;
+                    *slot = Some(conn.clone());
+                    conn
+                }
+            }
+        };
+        let result = async {
+            let (mut send, mut recv) = conn.open_bi().await.context("opening a stream")?;
+            let msg = Signed::new(&self.key, payload)?;
+            crate::message::write_frame(&mut send, &msg).await?;
+            send.finish().ok();
+            let reply = crate::message::read_frame(&mut recv).await?;
+            let (author, body) = reply.verify()?;
+            anyhow::ensure!(
+                author.as_bytes() == expect.as_bytes(),
+                "reply signed by an unexpected key"
+            );
+            Ok(body)
+        }
+        .await;
+        if result.is_err() {
+            let mut slot = gate.lock().await;
+            if slot
+                .as_ref()
+                .is_some_and(|c| c.stable_id() == conn.stable_id())
+            {
+                *slot = None;
+            }
         }
         result
     }

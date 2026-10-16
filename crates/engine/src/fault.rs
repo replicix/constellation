@@ -198,6 +198,71 @@ fn parse_runtime_hog(v: &str) -> Option<(usize, std::time::Duration, std::time::
     ))
 }
 
+/// `CONSTELLATION_FAULT_RUNTIME_HOG_FILE=<path>`: while that file exists
+/// and reads `<tasks>:<block_ms>:<every_ms>[:<node>,...]`, every
+/// `every_ms` the daemon (only the listed nodes, when a list is given)
+/// spawns `tasks` tasks on its shared runtime that each block their
+/// worker thread for `block_ms` (`std::thread::sleep`, deliberately not
+/// `block_in_place`): with `tasks` at least the worker count, the
+/// runtime runs nothing else for `block_ms` while the process, its other
+/// threads and the host are fine — a runtime starved by blocking calls.
+/// Unlike [`start_runtime_hog`] (`CONSTELLATION_FAULT_RUNTIME_HOG`, for
+/// the whole run and every node) it can be aimed at one node — the
+/// lease holder, its backup — and started and stopped mid-run: the file
+/// is read every 200 ms. Started once per process
+/// ([`start_runtime_hog_file`], from the authority driver).
+fn runtime_hog_file(node: u64) -> Option<(usize, u64, u64)> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let path = PATH
+        .get_or_init(|| std::env::var_os("CONSTELLATION_FAULT_RUNTIME_HOG_FILE").map(PathBuf::from))
+        .as_ref()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut fields = text.trim().split(':');
+    let mut num = || fields.next().and_then(|v| v.trim().parse::<u64>().ok());
+    let (tasks, block, every) = (num()?, num()?, num()?);
+    if let Some(nodes) = fields.next() {
+        if !nodes
+            .split(',')
+            .filter_map(|n| n.trim().parse::<u64>().ok())
+            .any(|n| n == node)
+        {
+            return None;
+        }
+    }
+    Some((tasks.clamp(1, 256) as usize, block, every.max(1)))
+}
+
+/// Start [`runtime_hog_file`]'s driver for node `node` on the current runtime,
+/// once per process; a no-op without `CONSTELLATION_FAULT_RUNTIME_HOG_FILE`.
+pub fn start_runtime_hog_file(node: u64) {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if std::env::var_os("CONSTELLATION_FAULT_RUNTIME_HOG_FILE").is_none()
+        || STARTED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            match runtime_hog_file(node) {
+                Some((tasks, block, every)) => {
+                    tracing::info!(
+                        tasks,
+                        block_ms = block,
+                        "fault injection: blocking the runtime"
+                    );
+                    for _ in 0..tasks {
+                        tokio::spawn(async move {
+                            std::thread::sleep(std::time::Duration::from_millis(block));
+                        });
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(every)).await;
+                }
+                None => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

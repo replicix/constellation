@@ -72,7 +72,7 @@ use constellation_store_s3::inbox::InboxKey;
 use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
-pub use backup::{liveness_fresh, AckView};
+pub use backup::{liveness_fresh, AckView, SealRecord};
 pub use client::ClientPhase;
 pub use delegate::{DelegKind, DelegView, RecallPhase};
 
@@ -283,8 +283,20 @@ pub struct Config {
     /// `CONSTELLATION_BACKUP_TAKEOVER_MS` (default 1500): a backup that
     /// has not heard from its holder for this long seals the epoch and
     /// takes the lease over; under `ack=s3`, any peer does. Liveness
-    /// only: safety comes from the seal and the log-slot CAS.
+    /// only: safety comes from the seal and the log-slot CAS. The
+    /// silence is measured as `liveness_lag_aware` says.
     pub backup_takeover_ms: u64,
+    /// The silence watches (a backup's seal watch, `ack=s3`'s holder
+    /// watch) discount this node's own lag (`Event::OwnLag`: silence
+    /// counts from the end of a lapse, at most one window plus the
+    /// lapses' own length later) and
+    /// lengthen the window while the holder's beats have lately arrived
+    /// late (`Core::silence_window`: up to four windows). Default on;
+    /// off is the simulation's non-vacuity knob: plain silence, as the
+    /// watches measured it before (a backup that lagged, or a holder
+    /// whose beats ran late, was sealed `backup_takeover_ms` into the
+    /// silence).
+    pub liveness_lag_aware: bool,
     /// How often the holder sends a heartbeat append to an idle backup
     /// (well inside `backup_takeover_ms`).
     pub backup_heartbeat_ms: u64,
@@ -482,6 +494,7 @@ impl Config {
             promise_wait_ms: 1_000,
             promise_watch_ms: 5_000,
             takeover_promise_check: true,
+            liveness_lag_aware: true,
             delegation: true,
             delegation_ttl_ms: 5_000,
             locks: true,
@@ -1651,7 +1664,18 @@ impl Core {
                 candidacy,
                 listed,
                 at,
-            } => self.on_holder_alive(from, epoch, candidacy, listed, at, replica),
+                seq,
+                sent,
+                expires,
+            } => self.on_holder_alive(
+                from,
+                epoch,
+                candidacy,
+                listed,
+                (at, seq, sent, expires),
+                replica,
+            ),
+            Event::OwnLag { from, until } => self.on_own_lag(from, until),
             Event::BackupAlive { from, at } => self.on_backup_alive(from, at),
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),

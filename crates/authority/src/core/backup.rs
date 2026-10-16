@@ -210,6 +210,12 @@ pub(crate) struct BackupPeer {
     /// It answered an append short since its last progress: it is
     /// processing appends but stuck, whether alive or not.
     pub short_since_progress: bool,
+    /// An append to it failed at the transport (`Event::PeerFailed`)
+    /// since its last answer: alive or not (its heartbeat answers may
+    /// come on the liveness lane), it is unreachable on the data lane,
+    /// and gets the ordinary acknowledgement timeout, not the slow-core
+    /// grace.
+    pub unreachable: bool,
 }
 
 /// One pipelined append: its request, send time and the rows it carries.
@@ -338,6 +344,10 @@ pub(crate) struct BackupState {
     /// When the silence watch issued `takeover_get`: the holder heard
     /// after this is alive, and the epoch is not sealed.
     takeover_read_at: Ms,
+    /// `takeover_get` was issued because the holder's lease expiry as
+    /// this node knew it had passed, not for silence: the object decides
+    /// (`on_takeover_get`) — expired, sealed; renewed, a window again.
+    takeover_read_for_expiry: bool,
     /// Subscriber: the next journal seq a `StreamAhead` may install for
     /// `(epoch, jseq)` — contiguity with what the log and earlier batches
     /// gave us.
@@ -373,6 +383,76 @@ pub(crate) struct BackupState {
     /// append of (0: none since this process started): a dismissal
     /// naming another one is stale.
     candidacy: u64,
+    /// What this node has heard of each holder's off-core heartbeat
+    /// (`Event::HolderAlive`), as a backup or under `ack=s3`
+    /// ([`HolderBeats`]).
+    pub(crate) beats: BTreeMap<NodeId, HolderBeats>,
+    /// The silence measured by the latest seal watch that read the lease
+    /// to seal, and by the latest that sealed ([`SealRecord`]).
+    watch_read: Option<SealRecord>,
+    last_seal: Option<SealRecord>,
+    /// This node's own recent lapses (`Event::OwnLag`), `(from, until)`,
+    /// oldest first, merged where they overlap: no silence counts before
+    /// the latest one ended ([`Core::attentive_since`]).
+    own_lapses: std::collections::VecDeque<(Ms, Ms)>,
+}
+
+/// The most own lapses remembered (older ones than
+/// [`LATE_BEATS_MEMORY_MS`] go first).
+const OWN_LAPSES_MAX: usize = 64;
+
+/// How long a beat that came late lengthens the silence window
+/// ([`Core::silence_window`]).
+const LATE_BEATS_MEMORY_MS: i64 = 60_000;
+/// The most late beats remembered per holder.
+const LATE_BEATS_MAX: usize = 16;
+
+/// What a seal watch measured when it read the lease to seal (`status.ack`
+/// reports the latest seal's): the holder and epoch, the plain silence,
+/// the silence it counted (not across its own lapses), the window it
+/// waited, and when.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SealRecord {
+    pub holder: NodeId,
+    pub epoch: Epoch,
+    pub silent_ms: i64,
+    pub attentive_ms: i64,
+    pub window_ms: i64,
+    pub at: Ms,
+}
+
+/// How far a silence watch's start may move for this node's own lapses
+/// ([`Core::lag_discount`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// This much past the holder's last word, plus the lapses' length:
+    /// a reach in the node's own running time.
+    PlusLapses(i64),
+    /// This much past it, lapses included: a reach in wall time.
+    Flat(i64),
+}
+
+/// What a silence watch watches: `(holder, epoch, seal)` — `seal`: the
+/// backup's seal watch (else `ack=s3`'s holder watch).
+pub(crate) type Watched = (NodeId, Epoch, bool);
+
+/// One holder's off-core heartbeat as this node hears it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HolderBeats {
+    pub(crate) epoch: Epoch,
+    /// The latest arrival of a beat at `epoch` (or of an append, handed
+    /// over by the driver as an unnumbered one).
+    heard_at: Ms,
+    /// The latest numbered beat: `(seq, sent, arrival)`.
+    pub(crate) last: Option<(u64, Ms, Ms)>,
+    /// The latest expiry of the holder's lease its beats at `epoch` named
+    /// (0: none heard): they stop there.
+    pub(crate) expires: Ms,
+    /// Beats that came late lately, `(arrival, ms late)`, oldest first:
+    /// later than one interval after the previous one, as sent (the
+    /// holder's process was held up) or as heard (held up on the way, or
+    /// by this node's own runtime), by at least the lag threshold.
+    late: std::collections::VecDeque<(Ms, i64)>,
 }
 
 /// How many early `StreamAhead` batches a subscriber keeps.
@@ -398,6 +478,8 @@ pub struct AckView {
     pub backing_epoch: Epoch,
     pub backing_acked: u64,
     pub sealed_epoch: Epoch,
+    /// The latest seal this node made: what its watch measured.
+    pub last_seal: Option<SealRecord>,
     pub reconfig_in_flight: bool,
 }
 
@@ -413,6 +495,22 @@ impl Core {
             .chain(self.ack.candidate)
             .map(|n| (n, self.ack.peers.get(&n).map_or(0, |p| p.candidacy)))
             .collect()
+    }
+
+    /// Who the holder's off-core heartbeat goes to, with candidacies:
+    /// under `ack=s3`, the subscribers of its log stream (they read its
+    /// silence, `watch_s3_holder`; candidacy 0, never dismissed);
+    /// otherwise its committed backups and the candidate
+    /// ([`Self::backup_candidacies`]).
+    pub fn liveness_targets(&self) -> Vec<(NodeId, u64)> {
+        if self.lease.ack_policy() == AckPolicy::S3 {
+            return self
+                .stream_subscribers()
+                .into_iter()
+                .map(|n| (n, 0))
+                .collect();
+        }
+        self.backup_candidacies()
     }
 
     pub(crate) fn backup_view(&self) -> AckView {
@@ -438,6 +536,7 @@ impl Core {
             backing_epoch: self.bk.role.map(|r| r.epoch).unwrap_or(0),
             backing_acked: self.bk.acked,
             sealed_epoch: self.bk.sealed,
+            last_seal: self.bk.last_seal,
             reconfig_in_flight: self.ack.reconfig.is_some(),
         }
     }
@@ -1112,6 +1211,7 @@ impl Core {
                 candidacy,
                 alive_at: now,
                 short_since_progress: false,
+                unreachable: false,
             },
         );
     }
@@ -1264,6 +1364,7 @@ impl Core {
                     && silent >= timeout
                     && (now.since(p.alive_at) >= timeout
                         || p.short_since_progress
+                        || p.unreachable
                         || silent >= slow_max)
             })
             .map(|(n, _)| *n)
@@ -1575,6 +1676,7 @@ impl Core {
         }
         let before = self.durable_jseq();
         let p = self.ack.peers.get_mut(&from).expect("present");
+        p.unreachable = false;
         // Progress is the hold advancing, or an append answered in full
         // (a heartbeat's included): a backup that keeps answering short
         // for the same rows is stuck, and the timeout rule drops it
@@ -1637,6 +1739,13 @@ impl Core {
             return false;
         };
         p.inflight.remove(pos);
+        // Its heartbeat may still be answered over the liveness lane, a
+        // connection of its own: that says the backup is alive, not that
+        // it can take appends (a wedged data connection beside a healthy
+        // liveness one). Until it answers an append again it is held to
+        // the ordinary timeout — writes would otherwise park for the
+        // slow-core grace (10 s) behind a backup they cannot reach.
+        p.unreachable = true;
         // Resend from what the backup holds (the timeout counts from
         // `last_progress`); the inserts are idempotent.
         p.sent_through = p.acked;
@@ -2102,9 +2211,28 @@ impl Core {
         epoch: Epoch,
         candidacy: u64,
         listed: bool,
-        at: Ms,
+        (at, seq, sent, expires): (Ms, u64, Ms, Ms),
         replica: &dyn Replica,
     ) {
+        // A numbered beat is credited no later than its send plus the
+        // expiry margin (clocks within it): one held in a retransmit queue
+        // for seconds, arriving after the holder died, buys it nothing.
+        // This makes the seal watch depend on the holder's clock: within
+        // the margin it binds by at most the RTT; a holder clock behind by
+        // more than the margin would have every beat credited that much
+        // early, and a live holder sealed that much early. Clocks within
+        // the margin are what the lease already assumes (its expiry is
+        // judged on every node's clock); this is one more place it holds
+        // weight.
+        let at_credit = if seq != 0 && sent.0 != 0 {
+            at.min(sent.plus(self.cfg.expiry_margin_ms))
+        } else {
+            at
+        };
+        if listed {
+            self.note_beat(from, epoch, (at, at_credit), (seq, sent, expires));
+        }
+        let at = at_credit;
         let Some(role) = self.bk.role else {
             return;
         };
@@ -2139,6 +2267,234 @@ impl Core {
         self.backup_role_ends(replica);
     }
 
+    /// A beat of `from`'s at `epoch`, heard at `at` and credited as heard
+    /// at `credit` (`seq` 0: an arrival the driver handed over, not a
+    /// numbered beat): its arrival, the
+    /// lease expiry it names, and whether it came late
+    /// ([`HolderBeats::late`]).
+    fn note_beat(
+        &mut self,
+        from: NodeId,
+        epoch: Epoch,
+        (at, credit): (Ms, Ms),
+        (seq, sent, expires): (u64, Ms, Ms),
+    ) {
+        let interval = self.cfg.backup_heartbeat_ms as i64;
+        let threshold = self.lag_threshold_ms();
+        let own_lapsed = match self.bk.beats.get(&from).and_then(|b| b.last) {
+            Some((_, _, last_at)) => self.own_lapsed_between(last_at, at),
+            None => 0,
+        };
+        self.bk
+            .beats
+            .retain(|n, b| *n == from || at.since(b.heard_at) < LATE_BEATS_MEMORY_MS);
+        let b = self.bk.beats.entry(from).or_default();
+        if epoch < b.epoch {
+            return;
+        }
+        if epoch > b.epoch {
+            // A new tenure numbers on (the same beat task), or from 1 (a
+            // restarted holder); its late beats still say how its host
+            // has been doing.
+            b.epoch = epoch;
+            b.heard_at = credit;
+            b.last = None;
+            b.expires = Ms(0);
+        }
+        b.heard_at = b.heard_at.max(credit);
+        if seq == 0 {
+            return;
+        }
+        b.expires = b.expires.max(expires);
+        match b.last {
+            Some((last_seq, last_sent, last_at)) if seq > last_seq => {
+                // Late against its own schedule: `steps` intervals after
+                // the previous one, as sent and as heard (a lost beat is
+                // not lateness; a stalled host makes the next one late).
+                let steps = (seq - last_seq) as i64;
+                // Not what this node's own lapses held up: those are
+                // discounted once, by `attentive_since`.
+                let heard_late = at.since(last_at) - steps * interval - own_lapsed;
+                let sent_late = sent.since(last_sent) - steps * interval;
+                let late = heard_late.max(sent_late);
+                if late >= threshold {
+                    if b.late.len() >= LATE_BEATS_MAX {
+                        b.late.pop_front();
+                    }
+                    b.late.push_back((at, late));
+                }
+                b.last = Some((seq, sent, at.max(last_at)));
+            }
+            // A restarted holder numbers from 1 again.
+            Some((last_seq, last_sent, _)) if seq < last_seq && sent > last_sent => {
+                b.last = Some((seq, sent, at));
+            }
+            // Overtaken by a later beat (they go out concurrently).
+            Some(_) => {}
+            None => b.last = Some((seq, sent, at)),
+        }
+    }
+
+    /// How much of `(from, to)` this node spent in its own lapses.
+    fn own_lapsed_between(&self, from: Ms, to: Ms) -> i64 {
+        self.bk
+            .own_lapses
+            .iter()
+            .map(|&(a, b)| b.min(to).since(a.max(from)).max(0))
+            .sum()
+    }
+
+    /// `Event::OwnLag`.
+    pub(crate) fn on_own_lag(&mut self, from: Ms, until: Ms) {
+        if until <= from {
+            return;
+        }
+        let lapses = &mut self.bk.own_lapses;
+        match lapses.back_mut() {
+            // The same lapse, grown, or one that overlaps the last.
+            Some((_, end)) if from <= *end => *end = (*end).max(until),
+            _ => lapses.push_back((from, until)),
+        }
+        while lapses.len() > OWN_LAPSES_MAX
+            || lapses
+                .front()
+                .is_some_and(|(_, end)| until.since(*end) >= LATE_BEATS_MEMORY_MS)
+        {
+            lapses.pop_front();
+        }
+    }
+
+    /// The lapse that counts as lag: an eighth of the takeover window
+    /// (187 ms at the default), well above a healthy runtime's timer
+    /// jitter and a LAN's, well below a window.
+    fn lag_threshold_ms(&self) -> i64 {
+        (self.cfg.backup_takeover_ms as i64 / 8).max(1)
+    }
+
+    /// How far past a holder's last word a watch on `holder` at `epoch`
+    /// may move the start of its silence for this node's own lapses
+    /// ([`Self::attentive_since`]; `None`: no discount, plain silence, and
+    /// no late-beat window either):
+    ///
+    /// - none within the expiry margin of the holder's lease, as its own
+    ///   beats last named the expiry — or, before a beat has, as this
+    ///   node's last read of the lease object did (a lower bound: the
+    ///   holder renews past it, so the discount ends early, never late).
+    ///   Its beats stop at the expiry, so silence there is the lease
+    ///   ending, not a stall — and a backup must seal and claim promptly
+    ///   then: nobody else may claim a `Backup` lease for
+    ///   `backup_claim_grace_ms` (2T) past its expiry, time meant for a
+    ///   listed backup, whose tail holds what the holder acknowledged but
+    ///   did not ship (long-backup seed 802943);
+    /// - a window (T) plus the lapses' length while the lease, so known,
+    ///   runs;
+    /// - with no expiry known at all (no beat heard, no read naming this
+    ///   tenure): for the seal watch a flat half window, lapses included —
+    ///   the read then comes at most 1.5T after the holder's last word in
+    ///   wall time, whatever the lapse, inside the 2T grace past an expiry
+    ///   it could not know of; for `ack=s3`'s watch, which has no such
+    ///   grace to keep (every acknowledged record is in S3), a window plus
+    ///   the lapses.
+    fn lag_discount(&self, (holder, epoch, seal): Watched, now: Ms) -> Option<Reach> {
+        if !self.cfg.liveness_lag_aware {
+            return None;
+        }
+        let t = self.cfg.backup_takeover_ms.max(1) as i64;
+        let margin = self.cfg.expiry_margin_ms as i64;
+        match self.known_expiry(holder, epoch) {
+            Some(expires) => (expires.since(now) > margin).then_some(Reach::PlusLapses(t)),
+            None if seal => Some(Reach::Flat(t / 2)),
+            None => Some(Reach::PlusLapses(t)),
+        }
+    }
+
+    /// The expiry of `holder`'s lease at `epoch` as its beats last named
+    /// it (or as a lease read past it showed it renewed).
+    fn beat_named_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
+        self.bk
+            .beats
+            .get(&holder)
+            .filter(|b| b.epoch == epoch && b.expires.0 != 0)
+            .map(|b| b.expires)
+    }
+
+    /// The expiry of `holder`'s lease at `epoch` as this node knows it:
+    /// the later of what its beats last named and what this node last
+    /// read (each a lower bound: the holder may have renewed since).
+    fn known_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
+        let read = self
+            .lease
+            .last_seen
+            .as_ref()
+            .filter(|l| l.holder == holder && l.epoch == epoch)
+            .map(|l| Ms(l.expires_unix_ms));
+        self.beat_named_expiry(holder, epoch).max(read)
+    }
+
+    /// Whether a watch discounts lag at all ([`Self::lag_discount`]).
+    fn lag_aware(&self, watched: Watched, now: Ms) -> bool {
+        self.lag_discount(watched, now).is_some()
+    }
+
+    /// The silence a watch waits for before it acts on `holder`
+    /// (`backup_takeover_ms`, T): T, plus twice the latest of its beats
+    /// that came late within the last minute ([`HolderBeats::late`]), at
+    /// most 4T. A holder whose host stalled it (or its beats) by `x`
+    /// lately is likely to stall that long again, and silence of `x` is
+    /// then not a death. Liveness only, like the window itself: the seal
+    /// and the log-slot CAS fence at any window (ADR-12), so a longer one
+    /// can only delay a failover — by at most 3T, only within a minute of
+    /// a late beat, and never past the lease's expiry margin
+    /// ([`Self::lag_aware`]).
+    pub(crate) fn silence_window(&self, watched: Watched, now: Ms) -> i64 {
+        let t = self.cfg.backup_takeover_ms.max(1) as i64;
+        if !self.lag_aware(watched, now) {
+            return t;
+        }
+        let holder = watched.0;
+        let late = self.bk.beats.get(&holder).map_or(0, |b| {
+            b.late
+                .iter()
+                .filter(|(at, _)| now.since(*at) < LATE_BEATS_MEMORY_MS)
+                .map(|(_, ms)| *ms)
+                .max()
+                .unwrap_or(0)
+        });
+        t + (2 * late).min(3 * t)
+    }
+
+    /// Since when a watch whose holder was last heard at `last` counts
+    /// silence: not before this node's own latest lapse ended
+    /// (`Event::OwnLag`) — beats that reached it during the lapse are
+    /// stamped when its runtime gets to them, possibly after the watch
+    /// looked — but at most one window plus the length of its lapses
+    /// since `last` after `last`, so a node that lags again and again
+    /// still acts on a dead holder: within a window plus one of its own
+    /// attentive time (the time it was not held up) of the silence.
+    pub(crate) fn attentive_since(&self, watched: Watched, last: Ms, now: Ms) -> Ms {
+        match self.lag_discount(watched, now) {
+            None => last,
+            Some(Reach::PlusLapses(beyond)) => self.after_own_lapses(last, beyond, true),
+            Some(Reach::Flat(reach)) => self.after_own_lapses(last, reach, false),
+        }
+    }
+
+    /// `last`, moved past this node's own lapses since it (to the latest
+    /// one's end), but by no more than `beyond` — plus the lapses' own
+    /// length when `plus_lapses` (a reach in this node's running time;
+    /// otherwise in wall time): [`Self::attentive_since`]'s rule.
+    fn after_own_lapses(&self, last: Ms, beyond: i64, plus_lapses: bool) -> Ms {
+        let (mut latest, mut lapsed) = (last, 0i64);
+        for &(from, until) in &self.bk.own_lapses {
+            if until > last {
+                latest = latest.max(until);
+                lapsed += until.since(from.max(last));
+            }
+        }
+        let reach = beyond + if plus_lapses { lapsed } else { 0 };
+        latest.min(last.plus(reach.max(0) as u64))
+    }
+
     /// Rule (b): the epoch closed; a member backup resumes its watch with
     /// the holder given a full silence window (its re-acquisition after
     /// the close keeps the epoch, and a stale `last_heard` would seal it
@@ -2157,12 +2513,23 @@ impl Core {
             // open (re-armed by `backup_watch_after_epoch`).
             return;
         }
-        let id = self.set_timer(
-            now.plus(self.cfg.backup_takeover_ms.max(1)),
-            Timer::BackupWatch,
-            out,
-        );
+        let mut due = now.plus(self.cfg.backup_takeover_ms.max(1));
+        if let Some(role) = self.bk.role {
+            due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
+        }
+        let id = self.set_timer(due, Timer::BackupWatch, out);
         self.bk.watch_timer = Some(id);
+    }
+
+    /// `due`, but no later than the expiry of `holder`'s lease at `epoch`
+    /// as this node knows it, if that is still ahead: the watch looks at
+    /// the expiry itself, whatever it has credited since
+    /// (`on_backup_watch`).
+    fn watch_due_by_expiry(&self, holder: NodeId, epoch: Epoch, now: Ms, due: Ms) -> Ms {
+        match self.known_expiry(holder, epoch) {
+            Some(expires) if expires > now => due.min(expires),
+            _ => due,
+        }
     }
 
     /// The watch fired: silence past `backup_takeover_ms` reads the lease,
@@ -2204,13 +2571,44 @@ impl Core {
                 return;
             }
         }
-        let silent = now.since(self.bk.last_heard);
-        if silent < self.cfg.backup_takeover_ms as i64 {
-            let id = self.set_timer(
-                self.bk.last_heard.plus(self.cfg.backup_takeover_ms),
-                Timer::BackupWatch,
-                out,
-            );
+        // Silence as this node could have heard it (not across its own
+        // lapse), against a window that is longer while the holder's
+        // beats have lately come late. Plain silence sealed a live holder
+        // `silent_ms=1501` in on a busy host (`snapsched-write-overhead`):
+        // its beats were held up, and nothing told the backup so.
+        let watched = (role.holder, role.epoch, true);
+        let window = self.silence_window(watched, now);
+        let since = self.attentive_since(watched, self.bk.last_heard, now);
+        let silent = now.since(since);
+        // Past the expiry of the holder's lease as this node knows it (its
+        // beats named it, or this node read it), its silence is not the
+        // question; the lease ending is. What this node
+        // credited since may be the backlog of its own lapse — the daemon
+        // stamps beats and appends as its runtime gets to them and hands
+        // the stamps over before this timer — and a window counted from
+        // that credit missed the 2T claim grace past the expiry. So the
+        // lease is read at once, and the object decides
+        // (`on_takeover_get`): expired and still listing this node,
+        // sealed; renewed (what this node knew was older), a window again;
+        // moved on, the role ends. Known that way, the expiry is a lower
+        // bound, so this reads early at worst, never seals early.
+        let expired = self
+            .known_expiry(role.holder, role.epoch)
+            .is_some_and(|expires| now >= expires);
+        if silent < window && !expired {
+            // Looked at again no later than where the discount ends (the
+            // lease's expiry margin, `lag_aware`): from there the plain
+            // window applies, and a backup that waited out a long one
+            // past the expiry would miss its claim grace.
+            let mut due = since.plus(window as u64);
+            if let Some(expires) = self.known_expiry(role.holder, role.epoch) {
+                let aware_until = Ms(expires.0 - self.cfg.expiry_margin_ms as i64);
+                if aware_until > now {
+                    due = due.min(aware_until);
+                }
+            }
+            let due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
+            let id = self.set_timer(due, Timer::BackupWatch, out);
             self.bk.watch_timer = Some(id);
             return;
         }
@@ -2218,12 +2616,25 @@ impl Core {
             node = self.cfg.node_id,
             holder = role.holder,
             epoch = role.epoch,
-            silent_ms = silent,
-            "holder silent: reading the lease before sealing its epoch"
+            silent_ms = now.since(self.bk.last_heard),
+            attentive_ms = silent,
+            window_ms = window,
+            at_expiry = silent < window,
+            "holder silent (or its lease's expiry as this node knew it passed): reading the \
+             lease before sealing its epoch"
         );
+        self.bk.watch_read = Some(SealRecord {
+            holder: role.holder,
+            epoch: role.epoch,
+            silent_ms: now.since(self.bk.last_heard),
+            attentive_ms: silent,
+            window_ms: window,
+            at: now,
+        });
         let op = self.issue_s3(S3Op::LeaseGet, S3For::TakeoverGet, out);
         self.bk.takeover_get = Some(op);
         self.bk.takeover_read_at = now;
+        self.bk.takeover_read_for_expiry = silent < window;
     }
 
     pub(crate) fn on_takeover_get(
@@ -2235,6 +2646,7 @@ impl Core {
     ) {
         self.bk.takeover_get = None;
         let probe = std::mem::take(&mut self.bk.restart_probe);
+        let for_expiry = std::mem::take(&mut self.bk.takeover_read_for_expiry);
         let S3Result::LeaseGet(Ok(object)) = result else {
             self.arm_backup_watch(now, out);
             return;
@@ -2257,8 +2669,32 @@ impl Core {
                     self.arm_backup_watch(now, out);
                     return;
                 }
-                if !probe && self.bk.last_heard >= self.bk.takeover_read_at {
+                if for_expiry && !lease.is_expired(now.0) {
+                    // Read for the expiry this node knew of, not for the
+                    // holder's silence, and it renewed: what this node
+                    // knew was older. A window from here.
+                    if let Some(b) = self.bk.beats.get_mut(&role.holder) {
+                        if b.epoch == role.epoch {
+                            b.expires = b.expires.max(Ms(lease.expires_unix_ms));
+                        }
+                    }
+                    self.lease.note_object(now, &lease);
+                    self.arm_backup_watch(now, out);
+                    return;
+                }
+                if !probe
+                    && self.bk.last_heard >= self.bk.takeover_read_at
+                    && !lease.is_expired(now.0)
+                {
                     // The holder spoke while the lease was read: alive.
+                    // Not once the lease it holds has expired: a holder
+                    // stops acting a margin before that, so what reached
+                    // this node meanwhile was sent before — the backlog
+                    // of this node's own lapse, stamped only as its
+                    // runtime got to it. Waiting a window for silence
+                    // again then missed the 2T claim grace past the
+                    // expiry, and another node took the lease over from
+                    // a log without this node's tail.
                     self.lease.note_object(now, &lease);
                     self.arm_backup_watch(now, out);
                     return;
@@ -2279,6 +2715,17 @@ impl Core {
                     }
                     self.bk.sealed = role.epoch;
                     self.stats.seals += 1;
+                    self.bk.last_seal = Some(
+                        self.bk
+                            .watch_read
+                            .filter(|r| r.holder == role.holder && r.epoch == role.epoch)
+                            .unwrap_or(SealRecord {
+                                holder: role.holder,
+                                epoch: role.epoch,
+                                at: now,
+                                ..Default::default()
+                            }),
+                    );
                     tracing::warn!(
                         node = self.cfg.node_id,
                         holder = role.holder,
@@ -2706,8 +3153,28 @@ impl Core {
         // membership linger for seconds. Without a subscription, the
         // link's `connected` flag is all there is (slower, never wrong
         // for safety: the log slot fences either way).
+        // On a live subscription the holder's off-core heartbeat counts
+        // like a frame (it beats its subscribers): the frames are the
+        // core's (its timer), and a holder whose step took 1.5 s — a busy
+        // host — was taken over by the first subscriber to look. Silence
+        // counts as for the seal watch: not across this node's own lapse,
+        // against a window that is longer while the holder's beats have
+        // lately come late. Without a live subscription the link decides,
+        // as before (a beat heard while subscribed earlier says nothing
+        // about now).
+        let heard = self
+            .bk
+            .beats
+            .get(&seen.holder)
+            .filter(|b| b.epoch == seen.epoch)
+            .map(|b| b.heard_at);
+        let who = (seen.holder, seen.epoch, false);
+        let window = self.silence_window(who, now);
         let silent = match self.stream_last_frame_from(seen.holder) {
-            Some(last) => now.since(last) >= self.cfg.backup_takeover_ms as i64,
+            Some(frame) => {
+                let last = heard.map_or(frame, |h| h.max(frame));
+                now.since(self.attentive_since(who, last, now)) >= window
+            }
             None => {
                 let up = self.links.get(&seen.holder).is_some_and(|l| l.connected)
                     || self.stream_live_from(seen.holder);
@@ -2716,7 +3183,7 @@ impl Core {
                     return;
                 }
                 let since = *self.bk.holder_silent_since.get_or_insert(now);
-                now.since(since) >= self.cfg.backup_takeover_ms as i64
+                now.since(self.attentive_since(who, since, now)) >= window
             }
         };
         if !silent {

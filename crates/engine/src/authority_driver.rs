@@ -170,6 +170,57 @@ pub struct CoreStatus {
     pub connected_links: Vec<u64>,
     /// Plan 31 C8: forward-only and suspended, as the core applies them.
     pub authority: constellation_authority::core::AuthorityMode,
+    /// The longest core step since the driver started, and its event's
+    /// kind; the longest within the last minute or two
+    /// ([`StepTail`]): the tail a holder's stall bound
+    /// (`CONSTELLATION_HOLDER_STALL_MS`) must stay above.
+    pub longest_step_ms: u64,
+    pub longest_step_kind: &'static str,
+    pub recent_longest_step_ms: u64,
+}
+
+/// The core-step tail for `status` ([`CoreStatus::longest_step_ms`]):
+/// the high-water mark, and the longest of the current and the previous
+/// minute.
+#[derive(Debug)]
+struct StepTail {
+    longest: (u64, &'static str),
+    minute: std::time::Instant,
+    this_minute: u64,
+    last_minute: u64,
+}
+
+impl StepTail {
+    fn new() -> Self {
+        Self {
+            longest: (0, ""),
+            minute: std::time::Instant::now(),
+            this_minute: 0,
+            last_minute: 0,
+        }
+    }
+
+    /// A step of `ms` (event `kind`) ended now.
+    fn note(&mut self, ms: u64, kind: &'static str) {
+        let elapsed = self.minute.elapsed();
+        if elapsed >= Duration::from_secs(120) {
+            self.last_minute = 0;
+            self.this_minute = 0;
+            self.minute = std::time::Instant::now();
+        } else if elapsed >= Duration::from_secs(60) {
+            self.last_minute = self.this_minute;
+            self.this_minute = 0;
+            self.minute = std::time::Instant::now();
+        }
+        self.this_minute = self.this_minute.max(ms);
+        if ms > self.longest.0 {
+            self.longest = (ms, kind);
+        }
+    }
+
+    fn recent(&self) -> u64 {
+        self.this_minute.max(self.last_minute)
+    }
 }
 
 /// Short names for the trace line around every core step.
@@ -193,6 +244,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::SubscriberGone { .. } => "SubscriberGone",
         Event::HolderAlive { .. } => "HolderAlive",
         Event::BackupAlive { .. } => "BackupAlive",
+        Event::OwnLag { .. } => "OwnLag",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::Journaled => "Control(Journaled)",
@@ -502,6 +554,9 @@ enum Internal {
     /// subscriber's backlog budget ([`Driver::log_permits`]) until the core
     /// has handled it.
     Frame(Event, tokio::sync::OwnedSemaphorePermit),
+    /// The holder's heartbeat asking whether the driver loop still takes
+    /// work ([`OffCore::echo_sent`]): answered by taking it, no core step.
+    Echo,
 }
 
 /// Read the core's tunables from the environment (the `CONSTELLATION_*`
@@ -829,7 +884,7 @@ pub struct Driver {
     round_upload_wait: Duration,
     /// Who the holder's off-core heartbeat goes to (from the last
     /// refresh), and the driver loop's progress stamp: see
-    /// [`holder_alive_task`].
+    /// [`holder_alive_loop`].
     alive: Arc<Mutex<Option<AliveTargets>>>,
     /// The urgent lane ([`DriverDeps::urgent_rx`]); `None` once closed
     /// (never while the driver holds [`DriverDeps::urgent_tx`]).
@@ -837,6 +892,9 @@ pub struct Driver {
     /// The holders' liveness handed to the core so far
     /// ([`fresh_heard`]).
     heard_handed: HashMap<NodeId, (u64, i64)>,
+    /// The end of the latest own lapse handed to the core
+    /// ([`Driver::hand_lag`]).
+    lag_handed: i64,
     /// The thread the driver loop runs on now (its tokio worker), for the
     /// stuck-driver backtrace.
     loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
@@ -845,6 +903,8 @@ pub struct Driver {
     /// Where the core's time goes, per event kind, logged at debug every
     /// [`STEP_PROFILE_EVERY`] ([`StepProfile`]).
     profile: StepProfile,
+    /// The step-time tail for `status` ([`StepTail`]).
+    step_tail: StepTail,
     /// The core's job and the replica's next log sequence, and since
     /// when both have stayed the same (the stuck-job report,
     /// [`STUCK_JOB`]).
@@ -856,7 +916,7 @@ pub struct Driver {
 /// full: while a job holds the cursor the node applies nothing of the log.
 const STUCK_JOB: Duration = Duration::from_secs(20);
 
-/// The targets of the holder's off-core heartbeat ([`holder_alive_task`]).
+/// The targets of the holder's off-core heartbeat ([`holder_alive_loop`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AliveTargets {
     epoch: u64,
@@ -874,7 +934,7 @@ struct AliveTargets {
 /// before.
 const DISMISS_FOR_MS: i64 = 10_000;
 
-/// The driver's book of who [`holder_alive_task`] beats to: the backups of
+/// The driver's book of who [`holder_alive_loop`] beats to: the backups of
 /// the lease this node holds, and the candidacies it dropped within
 /// [`DISMISS_FOR_MS`]. A node selected again is no longer told it was
 /// dropped (its new candidacy is listed); the backup applies a dismissal
@@ -943,7 +1003,7 @@ fn holder_stall_ms() -> i64 {
     env_ms("CONSTELLATION_HOLDER_STALL_MS", 15_000).max(1) as i64
 }
 
-/// What one tick of [`holder_alive_task`] does.
+/// What one tick of [`holder_alive_loop`] does.
 #[derive(Debug, PartialEq, Eq)]
 enum AliveTick {
     /// Not holding, or past the lease's expiry: nothing.
@@ -955,8 +1015,22 @@ enum AliveTick {
 }
 
 /// `busy_since`: the driver loop's last progress stamp while it works
-/// (unix ms), 0 while it waits for work.
-fn alive_tick(t: Option<&AliveTargets>, now: i64, busy_since: i64, stall: i64) -> AliveTick {
+/// (unix ms), 0 while it waits for work. `runtime_stalled`: how long the
+/// shared runtime has not run its lag probe ([`OffCore::runtime_stalled_ms`]):
+/// a runtime that runs nothing that long is a hung authority too, even
+/// with the driver parked waiting for work (the beat no longer runs on
+/// it, so it no longer stops with it by itself). `echo_sent`: when the
+/// echo still unanswered went to the driver loop (0: none outstanding,
+/// [`OffCore::echo_sent`]): a loop that has not taken a message for that
+/// long serves nothing, however often its runtime gets a slice — the
+/// runtime starved to a slice every few seconds, which neither rule
+/// above sees, keeps beating and renewing while answering nobody.
+fn alive_tick(
+    t: Option<&AliveTargets>,
+    now: i64,
+    (busy_since, runtime_stalled, echo_sent): (i64, i64, i64),
+    stall: i64,
+) -> AliveTick {
     let Some(t) = t else {
         return AliveTick::Idle;
     };
@@ -965,6 +1039,12 @@ fn alive_tick(t: Option<&AliveTargets>, now: i64, busy_since: i64, stall: i64) -
     }
     if busy_since != 0 && now - busy_since > stall {
         return AliveTick::Hung(now - busy_since);
+    }
+    if runtime_stalled > stall {
+        return AliveTick::Hung(runtime_stalled);
+    }
+    if echo_sent != 0 && now - echo_sent > stall {
+        return AliveTick::Hung(now - echo_sent);
     }
     AliveTick::Beat(
         t.listed
@@ -980,7 +1060,7 @@ fn alive_tick(t: Option<&AliveTargets>, now: i64, busy_since: i64, stall: i64) -
 /// its own timers: a step that takes seconds (an overloaded node: CPU,
 /// disk, metadata writes queued behind the mount's) silenced them, and the
 /// backups sealed and deposed a live holder about 1.5 s in
-/// (`stress-ng-fs-nodes`). This task beats every backup heartbeat
+/// (`stress-ng-fs-nodes`). This loop beats every backup heartbeat
 /// interval while the node holds an unexpired lease and the driver loop
 /// has progressed within [`holder_stall_ms`]; a backup counts a beat as
 /// it counts an append (`Event::HolderAlive`), from its arrival
@@ -988,33 +1068,73 @@ fn alive_tick(t: Option<&AliveTargets>, now: i64, busy_since: i64, stall: i64) -
 /// progressing ([`OffCore::core_responsive`]) is alive: the core hears so
 /// (`Event::BackupAlive`) and gives it longer to acknowledge; one whose
 /// driver is stuck answers so, and gets the ordinary acknowledgement
-/// timeout. It runs for as long as [`Driver::run`] does ([`AliveTask`]).
-async fn holder_alive_task(
+/// timeout. Under `ack=s3` it beats the log stream's subscribers, which
+/// read the holder's silence (`Core::liveness_targets`).
+///
+/// It runs on a thread of its own, with a runtime of its own
+/// ([`AliveTask::start`]), and sends on the liveness lane
+/// (`Peers::request_to_node_liveness`: a connection that runtime
+/// dialed, so drives). As a task of the daemon's shared runtime — its
+/// timer, and the pooled connection's driver — it beat only when that
+/// runtime got to it, and a runtime held up for 1.5 s silenced the
+/// holder: its backup sealed a live holder that had logged nothing for
+/// 2.5 s, no slow step, no stuck driver (`snapsched-write-overhead`,
+/// `silent_ms=1501`). What it reads of the driver is atomics and a
+/// mutex the driver never holds across a wait. Each beat carries its
+/// number and send time, so a backup tells beats sent late (this
+/// process held up: the host) from beats heard late (`Core::silence_window`).
+#[allow(clippy::too_many_arguments)]
+async fn holder_alive_loop(
     peers: constellation_net::Peers,
     alive: Arc<Mutex<Option<AliveTargets>>>,
     off_core: Arc<OffCore>,
-    every: Duration,
+    (every, stall): (Duration, i64),
     node_id: NodeId,
-    core: mpsc::UnboundedSender<Internal>,
+    (core, prompt): (
+        mpsc::UnboundedSender<Internal>,
+        mpsc::UnboundedSender<Internal>,
+    ),
     loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let stall = holder_stall_ms();
     let backtraces = constellation_vfs::watch::backtraces_from_env();
     let mut stalled = false;
     let cap = beats_outstanding_max(every);
     // Beats still waiting for their answer, per peer.
     let pending: Arc<Mutex<HashMap<NodeId, usize>>> = Arc::default();
-    loop {
-        tokio::time::sleep(every).await;
+    let mut seq: u64 = 0;
+    let mut due = tokio::time::Instant::now() + every;
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep_until(due).await;
+        // On cadence; a tick this thread itself took late (the host held
+        // the process up) is not caught up with a burst.
+        let woke = tokio::time::Instant::now();
+        due = (due + every).max(woke);
         let targets = alive.lock().unwrap().clone();
         let busy = off_core.busy_since();
         let now = now_unix_ms();
-        let tick = alive_tick(targets.as_ref(), now, busy, stall);
+        let runtime_stalled = off_core.runtime_stalled_ms(now);
+        // One echo outstanding at a time, on the prompt lane (served
+        // after the urgent one, ahead of the internal channel's backlog:
+        // it asks whether the loop takes messages, not whether it has
+        // caught up).
+        let mut echo = off_core.echo_sent.load(Ordering::Relaxed);
+        if echo == 0 {
+            off_core.echo_sent.store(now, Ordering::Relaxed);
+            if prompt.send(Internal::Echo).is_err() {
+                return;
+            }
+            echo = now;
+        }
+        let tick = alive_tick(targets.as_ref(), now, (busy, runtime_stalled, echo), stall);
         // Whether or not this node holds a lease: a driver stuck this
         // long is reported (with the thread's backtrace under
         // `CONSTELLATION_FUSE_STALL_BACKTRACE=1`).
-        let stuck_ms = now - busy;
-        let hung = busy != 0 && stuck_ms > stall;
+        let stuck_ms = if busy != 0 { now - busy } else { 0 }
+            .max(runtime_stalled)
+            .max(now - echo);
+        let hung =
+            (busy != 0 && now - busy > stall) || runtime_stalled > stall || now - echo > stall;
         if hung != stalled {
             stalled = hung;
             if hung {
@@ -1023,6 +1143,7 @@ async fn holder_alive_task(
                     tracing::warn!(
                         node = node_id,
                         stuck_ms,
+                        runtime_stalled_ms = runtime_stalled,
                         tid = thread.tid,
                         holding = true,
                         "the authority driver has made no progress (this holder sends no more \
@@ -1032,6 +1153,7 @@ async fn holder_alive_task(
                     tracing::warn!(
                         node = node_id,
                         stuck_ms,
+                        runtime_stalled_ms = runtime_stalled,
                         tid = thread.tid,
                         holding = false,
                         "the authority driver has made no progress"
@@ -1052,20 +1174,26 @@ async fn holder_alive_task(
         let (AliveTick::Beat(beats), Some(t)) = (tick, targets) else {
             continue;
         };
+        seq += 1;
         for (to, candidacy, listed) in beats {
             if crate::fault::p2p_denied(to) || !beat_slot(&mut pending.lock().unwrap(), to, cap) {
                 continue;
             }
+            let at = Ms(now_unix_ms());
             let payload = Payload::HolderAlive {
                 holder: node_id,
                 epoch: t.epoch,
                 candidacy,
                 listed,
+                beat: constellation_net::Beat {
+                    seq,
+                    sent_unix_ms: at.0,
+                    expires_unix_ms: t.until_unix_ms,
+                },
             };
             let peers = peers.clone();
             let core = core.clone();
             let pending = pending.clone();
-            let at = Ms(now_unix_ms());
             // Answered late is still answered (a loaded peer's runtime
             // takes its time): a request that times out marks the peer's
             // link down in the directory, and timing beats out at the
@@ -1076,17 +1204,15 @@ async fn holder_alive_task(
             // before, silenced the heartbeat for as long as one answer
             // took: up to 5 s against the backup's 1.5 s watch).
             tokio::spawn(async move {
-                let answered = tokio::time::timeout(
-                    BEAT_TIMEOUT,
-                    peers.request_to_node_timeout(to, &payload, BEAT_TIMEOUT),
-                )
-                .await;
+                let answered = peers
+                    .request_to_node_liveness(to, &payload, BEAT_TIMEOUT)
+                    .await;
                 beat_done(&mut pending.lock().unwrap(), to);
                 let responsive = matches!(
                     answered,
-                    Ok(Ok(Payload::HolderAliveAck {
+                    Ok(Payload::HolderAliveAck {
                         core_responsive: true
-                    }))
+                    })
                 );
                 if listed && responsive {
                     let _ = core.send(Internal::Event(Event::BackupAlive { from: to, at }));
@@ -1096,10 +1222,34 @@ async fn holder_alive_task(
     }
 }
 
-/// How long one beat of [`holder_alive_task`] waits for its answer.
+/// The shared runtime's lag probe: a task of the daemon's runtime that
+/// wakes every [`PROBE_EVERY_MS`] and records how late it woke
+/// ([`OffCore::note_probe`]). A lapse of at least the lag threshold is
+/// this node's own: what its runtime stamped as an arrival meanwhile, it
+/// stamped late, and the silence watches do not count it
+/// (`Event::OwnLag`, [`Driver::hand_lag`]); a probe that stops ticking
+/// for [`holder_stall_ms`] stops the holder's heartbeat
+/// ([`alive_tick`]). About 20 wake-ups a second, each two atomic
+/// stores.
+async fn runtime_probe_task(off_core: Arc<OffCore>) {
+    let every = Duration::from_millis(PROBE_EVERY_MS as u64);
+    let mut due = tokio::time::Instant::now() + every;
+    loop {
+        tokio::time::sleep_until(due).await;
+        let woke = tokio::time::Instant::now();
+        let late = woke.saturating_duration_since(due).as_millis() as i64;
+        off_core.note_probe(now_unix_ms(), late);
+        due = woke + every;
+    }
+}
+
+/// The lag probe's period ([`runtime_probe_task`]).
+const PROBE_EVERY_MS: i64 = 50;
+
+/// How long one beat of [`holder_alive_loop`] waits for its answer.
 const BEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The most beats of [`holder_alive_task`] in flight to one peer: a new
+/// The most beats of [`holder_alive_loop`] in flight to one peer: a new
 /// one every interval for as long as one waits for its answer
 /// ([`BEAT_TIMEOUT`]), so a slow answer never delays the next beat, and
 /// no more (a peer that answers nothing costs a bounded number of
@@ -1129,20 +1279,76 @@ fn beat_done(pending: &mut HashMap<NodeId, usize>, to: NodeId) {
     }
 }
 
-/// [`holder_alive_task`] for the life of [`Driver::run`]: dropped when
-/// `run` returns or its task dies, it stops the beats and forgets the
-/// targets.
+/// [`holder_alive_loop`] (on its thread) and [`runtime_probe_task`] for
+/// the life of [`Driver::run`]: dropped when `run` returns or its task
+/// dies, it forgets the targets (no beat goes out after that) and stops
+/// both; the thread ends within an interval.
 struct AliveTask {
-    task: tokio::task::JoinHandle<()>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    probe: tokio::task::JoinHandle<()>,
     alive: Arc<Mutex<Option<AliveTargets>>>,
+}
+
+impl AliveTask {
+    /// Start the beat thread (a current-thread runtime of its own) and
+    /// the lag probe (on the caller's, the shared, runtime).
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        peers: constellation_net::Peers,
+        alive: Arc<Mutex<Option<AliveTargets>>>,
+        off_core: Arc<OffCore>,
+        (every, stall): (Duration, i64),
+        node_id: NodeId,
+        lanes: (
+            mpsc::UnboundedSender<Internal>,
+            mpsc::UnboundedSender<Internal>,
+        ),
+        loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
+    ) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = tokio::spawn(runtime_probe_task(off_core.clone()));
+        let beat = {
+            let (alive, stop) = (alive.clone(), stop.clone());
+            move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(error) => {
+                        tracing::error!(%error, "no runtime for the holder's heartbeat");
+                        return;
+                    }
+                };
+                rt.block_on(holder_alive_loop(
+                    peers,
+                    alive,
+                    off_core,
+                    (every, stall),
+                    node_id,
+                    lanes,
+                    loop_thread,
+                    stop,
+                ));
+            }
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("cst-holder-beat".into())
+            .spawn(beat)
+        {
+            tracing::error!(%error, "could not start the holder's heartbeat thread");
+        }
+        Self { stop, probe, alive }
+    }
 }
 
 impl Drop for AliveTask {
     fn drop(&mut self) {
-        self.task.abort();
         if let Ok(mut alive) = self.alive.lock() {
             *alive = None;
         }
+        self.stop.store(true, Ordering::Relaxed);
+        self.probe.abort();
     }
 }
 
@@ -1160,25 +1366,45 @@ impl Drop for AliveTask {
 ///   evaluated ([`Driver::hand_heard`]).
 /// - **The driver loop's progress stamp** (unix ms of its last wake-up or
 ///   step, 0 while it waits for work): the holder stops its heartbeat
-///   when its own loop is stuck ([`holder_alive_task`]), and a backup
+///   when its own loop is stuck ([`holder_alive_loop`]), and a backup
 ///   answers a heartbeat with whether its loop is
 ///   ([`OffCore::core_responsive`]).
+/// - **The shared runtime's lag** ([`runtime_probe_task`]): its probe's
+///   latest tick and the end of its latest lapse of at least
+///   `lag_threshold_ms`, for the silence watches ([`Driver::hand_lag`])
+///   and the holder's heartbeat ([`alive_tick`]).
 #[derive(Debug)]
 pub struct OffCore {
     busy_since: std::sync::atomic::AtomicI64,
     /// holder → (its latest epoch heard, the latest arrival at it).
     heard: Mutex<HashMap<NodeId, (u64, i64)>>,
     responsive_ms: i64,
+    /// The lag probe's latest tick (unix ms; 0: not started).
+    probe_tick: std::sync::atomic::AtomicI64,
+    /// The probe's latest lapse of at least `lag_threshold_ms`, `(from,
+    /// until)` in unix ms (`(0, 0)`: none).
+    lapse: Mutex<(i64, i64)>,
+    /// What counts as a lapse: the core's lag threshold, an eighth of
+    /// `backup_takeover_ms`.
+    lag_threshold_ms: i64,
+    /// When the holder's heartbeat sent the driver loop the echo it has
+    /// not taken yet (`Internal::Echo`; unix ms, 0: none outstanding).
+    pub(crate) echo_sent: std::sync::atomic::AtomicI64,
 }
 
 impl OffCore {
     /// `responsive_ms`: the longest the driver loop may be inside one
     /// wake-up and still count as responsive ([`Self::core_responsive`]).
+    /// The lag threshold is the default takeover window's (1.5 s / 8).
     pub fn new(responsive_ms: u64) -> Self {
         Self {
             busy_since: std::sync::atomic::AtomicI64::new(0),
             heard: Mutex::new(HashMap::new()),
             responsive_ms: responsive_ms.max(1) as i64,
+            probe_tick: std::sync::atomic::AtomicI64::new(0),
+            lapse: Mutex::new((0, 0)),
+            lag_threshold_ms: 1_500 / 8,
+            echo_sent: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -1187,13 +1413,67 @@ impl OffCore {
     /// steps take seconds (an overloaded host) is responsive and kept
     /// that long; one whose loop is stuck in one wake-up longer answers
     /// that it is not, and is removed at the ordinary acknowledgement
-    /// timeout instead of being waited for.
+    /// timeout instead of being waited for. Lapses count from an eighth
+    /// of `backup_takeover_ms` (the core's threshold).
     pub fn for_config(config: &Config) -> Self {
-        Self::new(config.backup_slow_max_ms / 2)
+        Self {
+            lag_threshold_ms: (config.backup_takeover_ms as i64 / 8).max(1),
+            ..Self::new(config.backup_slow_max_ms / 2)
+        }
+    }
+
+    /// One tick of the lag probe at `now_unix_ms`, `late_ms` after it
+    /// was due.
+    pub(crate) fn note_probe(&self, now_unix_ms: i64, late_ms: i64) {
+        if late_ms >= self.lag_threshold_ms {
+            *self.lapse.lock().unwrap() = (now_unix_ms - late_ms, now_unix_ms);
+        }
+        self.probe_tick.store(now_unix_ms, Ordering::Relaxed);
+    }
+
+    /// Only the latest lapse is kept: two the probe records while the
+    /// driver is inside one long step reach the core as the second alone.
+    /// That undercounts the node's lapses, which can only shorten
+    /// `Core::attentive_since` — an earlier seal, towards the plain
+    /// window, never a later one than the stated bound. A queue would need
+    /// that bound re-derived.
+    ///
+    /// This node's latest lapse as of `now_unix_ms`, `(from, until)`
+    /// (`(0, 0)`: none): the probe's latest, or the one in progress if
+    /// the probe itself is overdue by the threshold — the runtime is
+    /// being held up right now, and the probe cannot say so before it
+    /// runs (it says so with the same start once it does).
+    pub(crate) fn lapse(&self, now_unix_ms: i64) -> (i64, i64) {
+        let tick = self.probe_tick.load(Ordering::Relaxed);
+        if tick != 0 && now_unix_ms - tick >= PROBE_EVERY_MS + self.lag_threshold_ms {
+            return (tick + PROBE_EVERY_MS, now_unix_ms);
+        }
+        *self.lapse.lock().unwrap()
+    }
+
+    /// How long past its period the lag probe has not ticked (0: it is
+    /// ticking, or not started).
+    pub(crate) fn runtime_stalled_ms(&self, now_unix_ms: i64) -> i64 {
+        let tick = self.probe_tick.load(Ordering::Relaxed);
+        if tick == 0 {
+            return 0;
+        }
+        (now_unix_ms - tick - PROBE_EVERY_MS).max(0)
     }
 
     pub(crate) fn set_busy(&self, at_unix_ms: i64) {
         self.busy_since.store(at_unix_ms, Ordering::Relaxed);
+    }
+
+    /// The driver loop woke at `at_unix_ms`, whatever lane woke it: it is
+    /// busy from now, and it answers the heartbeat's echo by iterating at
+    /// all — not only by taking the echo, which rides the prompt lane and
+    /// waits behind the urgent one (a loop saturated by urgent traffic
+    /// — lock renewals, other holders' beats — still iterates, and is not
+    /// hung).
+    pub(crate) fn loop_woke(&self, at_unix_ms: i64) {
+        self.set_busy(at_unix_ms);
+        self.echo_sent.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn busy_since(&self) -> i64 {
@@ -1426,12 +1706,14 @@ impl Driver {
             alive: Arc::default(),
             urgent_rx,
             heard_handed: HashMap::new(),
+            lag_handed: 0,
             loop_thread: Arc::new(Mutex::new(
                 constellation_platform::process::ThreadRef::unknown(),
             )),
             alive_book: AliveBook::default(),
             step_end: std::time::Instant::now(),
             profile: StepProfile::default(),
+            step_tail: StepTail::new(),
             job_since: None,
         }
     }
@@ -1468,25 +1750,28 @@ impl Driver {
             let own_s3 = OwnS3Watch::new(self.deps.upload.clone(), peers.clone());
             tokio::spawn(peer_links_task(peers, own_s3, tx));
         }
-        let _alive_task = self.core.config().p2p.then(|| AliveTask {
-            task: tokio::spawn(holder_alive_task(
+        let _alive_task = self.core.config().p2p.then(|| {
+            AliveTask::start(
                 self.deps.peers.clone(),
                 self.alive.clone(),
                 self.deps.off_core.clone(),
-                Duration::from_millis(self.core.config().backup_heartbeat_ms.max(1)),
+                (
+                    Duration::from_millis(self.core.config().backup_heartbeat_ms.max(1)),
+                    holder_stall_ms(),
+                ),
                 self.node_id,
-                self.int_tx.clone(),
+                (self.int_tx.clone(), self.prompt_tx.clone()),
                 self.loop_thread.clone(),
-            )),
-            alive: self.alive.clone(),
+            )
         });
+        crate::fault::start_runtime_hog_file(self.node_id);
         self.step_end = std::time::Instant::now();
         enum Wake {
             Internal(Internal),
             Request(SyncRequest),
         }
         loop {
-            // Waiting for work is not being stuck (`holder_alive_task`).
+            // Waiting for work is not being stuck (`holder_alive_loop`).
             self.deps.off_core.set_busy(0);
             let urgent_open = self.urgent_rx.is_some();
             // The urgent lane first (with the answers to this node's own
@@ -1528,10 +1813,14 @@ impl Driver {
                     None => break,
                 },
             };
-            self.deps.off_core.set_busy(now_unix_ms());
+            self.deps.off_core.loop_woke(now_unix_ms());
             *self.loop_thread.lock().unwrap() =
                 constellation_platform::native().process.current_thread();
+            self.hand_lag();
             let internal = match wake {
+                // Answered by the wake-up itself (`loop_woke`); the echo
+                // is what wakes a loop that is waiting for work.
+                Wake::Internal(Internal::Echo) => continue,
                 Wake::Internal(internal) => internal,
                 Wake::Request(req) => match self.on_request(req) {
                     Some(internal) => internal,
@@ -1602,6 +1891,25 @@ impl Driver {
         }
     }
 
+    /// Hand the core this node's latest own lapse (`Event::OwnLag`,
+    /// [`OffCore::lapse`]) when it ended materially later than the
+    /// last one handed (by half the lag threshold): before every wake-up
+    /// is handled, so a silence watch never measures across a lapse it
+    /// was not told of. The probe's own staleness counts, so a wake-up
+    /// right after the runtime was held up hands the lapse over even when
+    /// the probe has not run yet. Costs a core step only per lapse.
+    fn hand_lag(&mut self) {
+        let off = &self.deps.off_core;
+        let (from, until) = off.lapse(now_unix_ms());
+        if until > self.lag_handed + off.lag_threshold_ms / 2 {
+            self.lag_handed = until;
+            self.step(Internal::Event(Event::OwnLag {
+                from: Ms(from),
+                until: Ms(until),
+            }));
+        }
+    }
+
     /// Hand the core the holders heard from since the last hand-off
     /// ([`OffCore`]), as heartbeats at their arrival: the seal watch then
     /// measures the holder's silence, not this node's backlog.
@@ -1614,6 +1922,9 @@ impl Driver {
                 candidacy: 0,
                 listed: true,
                 at: Ms(at),
+                seq: 0,
+                sent: Ms(0),
+                expires: Ms(0),
             }));
         }
     }
@@ -1635,6 +1946,8 @@ impl Driver {
                 Event::Control { op, req }
             }
             Internal::Timer { id, .. } => Event::Timer { id },
+            // Taken by the loop itself (`Driver::run`), never stepped.
+            Internal::Echo => return,
         };
         self.deps
             .last_sync_ms
@@ -1707,6 +2020,13 @@ impl Driver {
             sync_pending,
             self.urgent_rx.as_ref().map_or(0, |rx| rx.len()),
         );
+        self.step_tail.note(step_us / 1_000, kind);
+        {
+            let mut status = self.deps.status.lock().unwrap();
+            status.longest_step_ms = self.step_tail.longest.0;
+            status.longest_step_kind = self.step_tail.longest.1;
+            status.recent_longest_step_ms = self.step_tail.recent();
+        }
         if step_us >= SLOW_STEP_US {
             // Everything the core does (backup heartbeats included)
             // waits for this step: a long one silences the node.
@@ -1819,7 +2139,7 @@ impl Driver {
             .set_claim_view(self.core.epoch_claim_view(now));
     }
 
-    /// What [`holder_alive_task`] beats to: the lease this node holds,
+    /// What [`holder_alive_loop`] beats to: the lease this node holds,
     /// its committed backups and candidate, and the candidacies it
     /// dropped lately ([`AliveBook`]).
     fn publish_alive_targets(&mut self, now: Ms) {
@@ -1829,7 +2149,7 @@ impl Driver {
             _ => None,
         };
         let listed = if held.is_some() {
-            self.core.backup_candidacies()
+            self.core.liveness_targets()
         } else {
             Vec::new()
         };
@@ -2434,12 +2754,16 @@ impl Driver {
                 candidacy,
                 listed,
                 at_unix_ms,
+                beat,
             } => Some(Internal::Event(Event::HolderAlive {
                 from: holder,
                 epoch,
                 candidacy,
                 listed,
                 at: Ms(at_unix_ms),
+                seq: beat.seq,
+                sent: Ms(beat.sent_unix_ms),
+                expires: Ms(beat.expires_unix_ms),
             })),
             SyncRequest::PeerPromiseRequest {
                 requester,
@@ -6030,23 +6354,75 @@ mod tests {
             dismissed: vec![(3, 11)],
             until_unix_ms: 50_000,
         };
-        assert_eq!(alive_tick(None, 1_000, 0, 15_000), AliveTick::Idle);
-        assert_eq!(alive_tick(Some(&t), 50_000, 0, 15_000), AliveTick::Idle);
-        let beats = AliveTick::Beat(vec![(2, 10, true), (3, 11, false)]);
-        assert_eq!(alive_tick(Some(&t), 20_000, 0, 15_000), beats);
-        assert_eq!(alive_tick(Some(&t), 20_000, 10_000, 15_000), beats);
+        assert_eq!(alive_tick(None, 1_000, (0, 0, 0), 15_000), AliveTick::Idle);
         assert_eq!(
-            alive_tick(Some(&t), 30_000, 10_000, 15_000),
+            alive_tick(Some(&t), 50_000, (0, 0, 0), 15_000),
+            AliveTick::Idle
+        );
+        let beats = AliveTick::Beat(vec![(2, 10, true), (3, 11, false)]);
+        assert_eq!(alive_tick(Some(&t), 20_000, (0, 0, 0), 15_000), beats);
+        assert_eq!(alive_tick(Some(&t), 20_000, (10_000, 0, 0), 15_000), beats);
+        assert_eq!(
+            alive_tick(Some(&t), 30_000, (10_000, 0, 0), 15_000),
             AliveTick::Hung(20_000)
         );
-        assert_eq!(alive_tick(Some(&t), 30_000, 29_000, 15_000), beats);
+        assert_eq!(alive_tick(Some(&t), 30_000, (29_000, 0, 0), 15_000), beats);
     }
 
-    /// The task lives as long as `Driver::run`: dropping its guard (run
-    /// returned, or its task died) stops it and forgets the targets.
+    /// The lag probe's view: a wake-up at least the threshold (an eighth
+    /// of the takeover window) late is a lapse, from when it was due to
+    /// when it woke; a probe that is itself that overdue is a lapse in
+    /// progress (the same start, growing). A runtime that has run nothing
+    /// for the stall bound stops the heartbeat, like a stuck driver,
+    /// though the driver is parked waiting for work.
+    #[test]
+    fn the_lag_probe_reports_lapses_and_a_runtime_that_runs_nothing() {
+        use super::{alive_tick, AliveTargets, AliveTick, OffCore};
+        let off = OffCore::new(5_000);
+        assert_eq!(off.lapse(1_000), (0, 0));
+        assert_eq!(off.runtime_stalled_ms(1_000), 0, "not started");
+        off.note_probe(10_000, 20);
+        assert_eq!(off.lapse(10_010), (0, 0), "20 ms late is no lapse");
+        off.note_probe(10_500, 450);
+        assert_eq!(off.lapse(10_510), (10_050, 10_500));
+        assert_eq!(
+            off.lapse(10_500 + 50 + 187),
+            (10_550, 10_737),
+            "in progress"
+        );
+        assert_eq!(off.runtime_stalled_ms(10_500 + 50 + 1_000), 1_000);
+        let t = AliveTargets {
+            epoch: 1,
+            listed: vec![(2, 1)],
+            dismissed: Vec::new(),
+            until_unix_ms: i64::MAX,
+        };
+        assert_eq!(
+            alive_tick(Some(&t), 30_000, (0, 15_001, 0), 15_000),
+            AliveTick::Hung(15_001)
+        );
+        assert_eq!(
+            alive_tick(Some(&t), 30_000, (0, 14_000, 0), 15_000),
+            AliveTick::Beat(vec![(2, 1, true)])
+        );
+        // An echo the driver loop has not taken for the stall bound.
+        assert_eq!(
+            alive_tick(Some(&t), 30_000, (0, 0, 14_000), 15_000),
+            AliveTick::Hung(16_000)
+        );
+        assert_eq!(
+            alive_tick(Some(&t), 30_000, (0, 0, 20_000), 15_000),
+            AliveTick::Beat(vec![(2, 1, true)])
+        );
+    }
+
+    /// The heartbeat lives as long as `Driver::run`: dropping its guard
+    /// (run returned, or its task died) forgets the targets, tells the
+    /// beat thread to stop and stops the lag probe.
     #[tokio::test]
     async fn the_heartbeat_task_stops_with_the_driver_loop() {
         use super::{AliveTargets, AliveTask};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
         let alive = Arc::new(Mutex::new(Some(AliveTargets {
             epoch: 1,
@@ -6054,14 +6430,17 @@ mod tests {
             dismissed: Vec::new(),
             until_unix_ms: i64::MAX,
         })));
-        let task = tokio::spawn(std::future::pending::<()>());
-        let abort = task.abort_handle();
+        let probe = tokio::spawn(std::future::pending::<()>());
+        let abort = probe.abort_handle();
+        let stop = Arc::new(AtomicBool::new(false));
         drop(AliveTask {
-            task,
+            stop: stop.clone(),
+            probe,
             alive: alive.clone(),
         });
         tokio::task::yield_now().await;
-        assert!(abort.is_finished(), "still running");
+        assert!(abort.is_finished(), "the probe still runs");
+        assert!(stop.load(Ordering::Relaxed), "the beat thread was not told");
         assert!(alive.lock().unwrap().is_none(), "targets kept");
     }
 
@@ -6429,6 +6808,406 @@ mod tests {
         assert_eq!(parse_u64_zero_ok(Some(" 35 "), 20), 35);
         assert_eq!(parse_u64_zero_ok(None, 20), 20);
         assert_eq!(parse_u64_zero_ok(Some("off"), 20), 20);
+    }
+
+    /// A holder (node 1, on `rt_a`, its shared runtime: one worker) and a
+    /// backup (node 2, on a runtime of its own) over real P2P, the backup
+    /// recording each beat's arrival and number; the pooled connection
+    /// dialed by the holder's runtime, as its appends dial it.
+    struct BeatRig {
+        rt_a: tokio::runtime::Runtime,
+        rt_b: tokio::runtime::Runtime,
+        peers_a: constellation_net::Peers,
+        peers_b: constellation_net::Peers,
+        backup: std::sync::Arc<RigBackup>,
+        _dir: tempfile::TempDir,
+    }
+
+    #[derive(Default)]
+    struct RigBackup {
+        beats: std::sync::Mutex<Vec<(std::time::Instant, u64)>>,
+    }
+
+    impl constellation_net::PeerService for RigBackup {
+        fn segment_published(&self, _part: &str, _seq: u64, _epoch: u64) {}
+        fn lease_requested(
+            &self,
+            _part: String,
+            _requester: u64,
+            _epoch_applied: Option<u64>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>,
+        > {
+            Box::pin(async move { constellation_net::Payload::Ping { node_id: 2 } })
+        }
+        fn holder_alive(
+            &self,
+            _holder: u64,
+            _epoch: u64,
+            _candidacy: u64,
+            _listed: bool,
+            beat: constellation_net::Beat,
+        ) -> bool {
+            self.beats
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), beat.seq));
+            true
+        }
+        fn node_id(&self) -> u64 {
+            2
+        }
+    }
+
+    impl BeatRig {
+        fn new(tag: &str) -> Self {
+            use constellation_net::{Payload, Peers};
+            use std::time::Duration;
+            let dir = tempfile::tempdir().unwrap();
+            let topic = constellation_net::topic_for(Some(&[41u8; 32]), tag);
+            let (key_a, _) = constellation_net::load_or_create(&dir.path().join("a.key")).unwrap();
+            let (key_b, _) = constellation_net::load_or_create(&dir.path().join("b.key")).unwrap();
+            let rt_b = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let rt_a = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let pa = rt_a
+                .block_on(constellation_net::P2p::spawn(key_a, topic))
+                .unwrap();
+            let pb = rt_b
+                .block_on(constellation_net::P2p::spawn(key_b, topic))
+                .unwrap();
+            let registry = vec![
+                (
+                    1u64,
+                    pa.pubkey_hex(),
+                    serde_json::to_value(pa.addr()).unwrap(),
+                ),
+                (
+                    2u64,
+                    pb.pubkey_hex(),
+                    serde_json::to_value(pb.addr()).unwrap(),
+                ),
+            ];
+            let peers_a = rt_a.block_on(async { Peers::new(pa, 1) });
+            let peers_b = rt_b.block_on(async { Peers::new(pb, 2) });
+            peers_a.refresh_registry(registry.clone());
+            peers_b.refresh_registry(registry);
+            let backup = std::sync::Arc::new(RigBackup::default());
+            {
+                let (peers_b, backup) = (peers_b.clone(), backup.clone());
+                rt_b.spawn(async move { peers_b.serve(backup).await });
+            }
+            let ping = Payload::Ping { node_id: 1 };
+            rt_a.block_on(peers_a.request_to_node_timeout(2, &ping, Duration::from_secs(10)))
+                .unwrap();
+            Self {
+                rt_a,
+                rt_b,
+                peers_a,
+                peers_b,
+                backup,
+                _dir: dir,
+            }
+        }
+
+        /// The holder's heartbeat (beating node 2 every 300 ms, stall
+        /// bound `stall`), the driver's prompt lane's receiver, and the
+        /// guard.
+        fn heartbeat(
+            &self,
+            off_core: std::sync::Arc<super::OffCore>,
+            stall: i64,
+        ) -> (
+            tokio::sync::mpsc::UnboundedReceiver<super::Internal>,
+            super::AliveTask,
+        ) {
+            use std::sync::{Arc, Mutex};
+            let alive = Arc::new(Mutex::new(Some(super::AliveTargets {
+                epoch: 1,
+                listed: vec![(2, 1)],
+                dismissed: Vec::new(),
+                until_unix_ms: i64::MAX,
+            })));
+            let (core_tx, _core_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let _in = self.rt_a.enter();
+            let task = super::AliveTask::start(
+                self.peers_a.clone(),
+                alive,
+                off_core,
+                (std::time::Duration::from_millis(300), stall),
+                1,
+                (core_tx, prompt_tx),
+                Arc::new(Mutex::new(
+                    constellation_platform::process::ThreadRef::unknown(),
+                )),
+            );
+            (prompt_rx, task)
+        }
+
+        /// The driver loop on `rt_a`, taking each echo after `delay`.
+        fn driver(
+            &self,
+            off_core: std::sync::Arc<super::OffCore>,
+            mut prompt_rx: tokio::sync::mpsc::UnboundedReceiver<super::Internal>,
+            delay: std::time::Duration,
+        ) -> tokio::task::JoinHandle<()> {
+            self.rt_a.spawn(async move {
+                while let Some(m) = prompt_rx.recv().await {
+                    if matches!(m, super::Internal::Echo) {
+                        tokio::time::sleep(delay).await;
+                        off_core
+                            .echo_sent
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        }
+
+        /// Block the holder's runtime (its one worker) for `ms`; returns
+        /// when the block began.
+        fn block(&self, ms: u64) -> std::time::Instant {
+            let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let s = started.clone();
+            self.rt_a.spawn(async move {
+                s.wait();
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            });
+            started.wait();
+            std::time::Instant::now()
+        }
+
+        /// The longest gap between beats heard within `around` (its
+        /// edges included).
+        fn max_gap(&self, around: (std::time::Instant, std::time::Instant)) -> std::time::Duration {
+            let heard: Vec<std::time::Instant> = self
+                .backup
+                .beats
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(t, _)| *t)
+                .filter(|t| *t >= around.0 && *t <= around.1)
+                .collect();
+            let edges = [around.0]
+                .into_iter()
+                .chain(heard)
+                .chain([around.1])
+                .collect::<Vec<_>>();
+            edges.windows(2).map(|w| w[1] - w[0]).max().unwrap()
+        }
+    }
+
+    /// `snapsched-write-overhead`: a backup sealed a live holder
+    /// `silent_ms=1501` in, the holder having logged nothing for 2.5 s —
+    /// its heartbeat was a task of the daemon's shared runtime, over a
+    /// pooled connection that runtime drove, and the runtime was held
+    /// up. The heartbeat now runs on a thread of its own and sends on the
+    /// liveness lane: with the holder's runtime blocked for 2.5 s (its one
+    /// worker inside a blocking call), the backup still hears a beat
+    /// every interval, numbered and stamped. The old shape — a task of
+    /// the holder's runtime beating over the pooled connection — is
+    /// silenced by the same block for all of it (the second half).
+    #[test]
+    fn the_holders_heartbeat_survives_a_starved_runtime() {
+        use constellation_net::Payload;
+        use std::time::Duration;
+        let rig = BeatRig::new("starved-holder");
+        let off = std::sync::Arc::new(super::OffCore::new(5_000));
+        let (prompt_rx, task) = rig.heartbeat(off.clone(), 15_000);
+        let _driver = rig.driver(off, prompt_rx, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(1_500));
+        let t0 = rig.block(2_500);
+        std::thread::sleep(Duration::from_millis(3_000));
+        drop(task);
+        std::thread::sleep(Duration::from_millis(400));
+        let thread_gap = rig.max_gap((t0, t0 + Duration::from_millis(2_500)));
+        let seqs: Vec<u64> = rig
+            .backup
+            .beats
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, s)| *s)
+            .collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1] || w[1] == 1),
+            "beats out of their numbering: {seqs:?}"
+        );
+
+        // The old shape: a task of the holder's runtime, over the pool.
+        rig.backup.beats.lock().unwrap().clear();
+        let old = {
+            let peers_a = rig.peers_a.clone();
+            rig.rt_a.spawn(async move {
+                let mut seq = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    seq += 1;
+                    let beat = Payload::HolderAlive {
+                        holder: 1,
+                        epoch: 1,
+                        candidacy: 1,
+                        listed: true,
+                        beat: constellation_net::Beat {
+                            seq,
+                            ..Default::default()
+                        },
+                    };
+                    let peers_a = peers_a.clone();
+                    tokio::spawn(async move {
+                        let _ = peers_a
+                            .request_to_node_timeout(2, &beat, Duration::from_secs(5))
+                            .await;
+                    });
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(1_500));
+        let t1 = rig.block(2_500);
+        std::thread::sleep(Duration::from_millis(3_000));
+        old.abort();
+        let task_gap = rig.max_gap((t1, t1 + Duration::from_millis(2_500)));
+        eprintln!(
+            "longest gap heard while the holder's runtime was blocked 2.5 s: beat thread \
+             {thread_gap:?}, runtime task {task_gap:?}"
+        );
+        // Five intervals: the test process itself may be descheduled on
+        // a loaded host; the old shape's gap is the whole block.
+        assert!(
+            thread_gap < Duration::from_millis(1_500),
+            "the beat thread went silent for {thread_gap:?}"
+        );
+        assert!(
+            task_gap >= Duration::from_millis(2_000),
+            "the old shape kept beating ({task_gap:?}): the block did not starve the runtime"
+        );
+    }
+
+    /// A driver loop that takes no message for the stall bound serves
+    /// nobody, however often its runtime runs: the heartbeat stops and the
+    /// backup seals it, as before the heartbeat left the runtime. Without
+    /// the echo, the beat thread beat on (the runtime's lag probe ticked,
+    /// the driver was parked waiting, not busy) and the holder kept its
+    /// lease answering nothing. A driver that takes the echo, however
+    /// slowly within the bound (a loaded one), keeps beating.
+    #[test]
+    fn a_holder_whose_driver_takes_nothing_stops_beating() {
+        use std::time::{Duration, Instant};
+        let rig = BeatRig::new("deaf-holder");
+        // Loaded: each echo taken 1 s late, within a 1.5 s bound.
+        let off = std::sync::Arc::new(super::OffCore::new(5_000));
+        let (prompt_rx, task) = rig.heartbeat(off.clone(), 1_500);
+        let driver = rig.driver(off, prompt_rx, Duration::from_millis(1_000));
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(5_000));
+        let loaded_gap = rig.max_gap((t0 + Duration::from_millis(500), Instant::now()));
+        drop(task);
+        driver.abort();
+        std::thread::sleep(Duration::from_millis(400));
+        rig.backup.beats.lock().unwrap().clear();
+        // Deaf: the echo is never taken (the receiver is held, unread).
+        let off = std::sync::Arc::new(super::OffCore::new(5_000));
+        let (_prompt_rx, task) = rig.heartbeat(off, 1_500);
+        let t1 = Instant::now();
+        std::thread::sleep(Duration::from_millis(4_000));
+        drop(task);
+        let heard: Vec<Duration> = rig
+            .backup
+            .beats
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(t, _)| t.duration_since(t1))
+            .collect();
+        eprintln!("loaded driver's longest gap {loaded_gap:?}; deaf driver's beats at {heard:?}");
+        assert!(
+            loaded_gap < Duration::from_millis(1_500),
+            "a loaded driver's heartbeat went silent for {loaded_gap:?}"
+        );
+        let last = heard.last().copied().unwrap_or_default();
+        assert!(
+            last < Duration::from_millis(2_500),
+            "a driver that takes nothing still beat {last:?} in (bound 1.5 s)"
+        );
+    }
+
+    /// A driver loop that iterates on other lanes the whole time — its
+    /// urgent lane saturated, the echo on the prompt lane never taken —
+    /// is not a hung one: every wake-up answers the echo
+    /// (`OffCore::loop_woke`, what `Driver::run` calls on each wake-up),
+    /// and the heartbeat goes on. (Before, only taking the echo answered
+    /// it, and such a loop was declared hung after the stall bound.)
+    #[test]
+    fn a_holder_whose_driver_iterates_on_another_lane_keeps_beating() {
+        use std::time::{Duration, Instant};
+        let rig = BeatRig::new("busy-urgent-holder");
+        let off = std::sync::Arc::new(super::OffCore::new(5_000));
+        // The prompt lane is held, unread; the loop wakes every 100 ms on
+        // its urgent lane.
+        let (_prompt_rx, task) = rig.heartbeat(off.clone(), 1_500);
+        let iterating = {
+            let off = off.clone();
+            rig.rt_a.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    off.loop_woke(super::now_unix_ms());
+                    off.set_busy(0);
+                }
+            })
+        };
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(4_000));
+        let gap = rig.max_gap((t0 + Duration::from_millis(500), Instant::now()));
+        iterating.abort();
+        drop(task);
+        eprintln!("longest gap of a holder whose loop iterates on its urgent lane: {gap:?}");
+        assert!(
+            gap < Duration::from_millis(1_500),
+            "a loop that iterated was taken for hung: silent {gap:?}"
+        );
+    }
+
+    /// The liveness lane recovers from a lost connection: the backup
+    /// closes every connection (a suspension and resume), the next beat
+    /// fails and clears the lane's slot, and the one after re-dials.
+    #[test]
+    fn the_liveness_lane_redials_after_its_connection_is_lost() {
+        use std::time::{Duration, Instant};
+        let rig = BeatRig::new("lane-redial");
+        let off = std::sync::Arc::new(super::OffCore::new(5_000));
+        let (prompt_rx, task) = rig.heartbeat(off.clone(), 15_000);
+        let _driver = rig.driver(off, prompt_rx, Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(1_000));
+        // A suspension and resume of the backup's P2P (plan 31 C8):
+        // every connection closed with a close frame, then dials again.
+        let closed = rig.rt_b.block_on(rig.peers_b.quiesce());
+        rig.rt_b.block_on(rig.peers_b.unquiesce(false));
+        let t0 = Instant::now();
+        std::thread::sleep(Duration::from_millis(4_000));
+        drop(task);
+        let after: Vec<Duration> = rig
+            .backup
+            .beats
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| *t > t0)
+            .map(|(t, _)| t.duration_since(t0))
+            .collect();
+        eprintln!("closed {closed} connection(s); beats after: {after:?}");
+        assert!(closed >= 1, "nothing to close");
+        assert!(
+            after.iter().any(|d| *d < Duration::from_millis(2_500)),
+            "the lane never came back: {after:?}"
+        );
     }
 
     /// `startup-link-lag`: a peer that enrols shows up connected in the

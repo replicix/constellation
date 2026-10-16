@@ -286,6 +286,20 @@ fn replay_seed() {
         Ok("backup-departs") => backup_departs_config(),
         Ok("backup-partition") => backup_partition_config(),
         Ok("long-backup") => long_backup_config(),
+        Ok("backup-runtime-lag") => backup_runtime_lag_config(),
+        Ok("backup-lag-at-expiry") => backup_lag_at_expiry_config(false),
+        Ok("backup-lag-at-expiry-beats-lost") => backup_lag_at_expiry_config(true),
+        Ok("backup-runtime-lag-then-crash") => backup_runtime_lag_then_crash_config(),
+        Ok("acks3-runtime-lag") => acks3_runtime_lag_config(),
+        Ok("backup-runtime-lag-unaware") => unaware(backup_runtime_lag_config()),
+        Ok("acks3-runtime-lag-unaware") => unaware(acks3_runtime_lag_config()),
+        Ok("backup-lag-at-expiry-beats-lost-unaware") => unaware(backup_lag_at_expiry_config(true)),
+        Ok("backup-lag-at-expiry-timers-first") => timers_first(backup_lag_at_expiry_config(false)),
+        Ok("backup-lag-at-expiry-beats-lost-timers-first") => {
+            timers_first(backup_lag_at_expiry_config(true))
+        }
+        Ok("backup-runtime-lag-timers-first") => timers_first(backup_runtime_lag_config()),
+        Ok("acks3-runtime-lag-timers-first") => timers_first(acks3_runtime_lag_config()),
         Ok("backup-hot") => backup_hot_config(),
         Ok("placement-hot") => placement_hot_config(),
         // `long_backup`'s odd seeds: the same, under `ack=s3`.
@@ -1683,6 +1697,280 @@ fn local_policy_rollbacks_are_found() {
     );
 }
 
+// ---- runtime lag: a live holder is late, not dead ----
+
+/// A host that holds a node's runtime up (busy workers, a starved
+/// process) without stopping it: the lease holder's, then its backup's,
+/// for 1.0–2.5 s each (the takeover window here is 1 s), with the
+/// holder writing throughout. Lag is latency, never a failover: a seal
+/// or a takeover of the live holder fails the seed (`live_holder`),
+/// and every acknowledged op stays (`strict_durability`). The holder's
+/// off-core heartbeat runs on its own thread, as the daemon's does.
+fn backup_runtime_lag_config() -> SimConfig {
+    SimConfig {
+        clients_per_node: 2,
+        ops_per_client: 30,
+        random_faults: 0,
+        join_fresh: false,
+        holder_beats: sim::run::HolderBeats::Thread,
+        live_holder: true,
+        faults: runtime_lag_faults(sim::run::LagOf::Backup),
+        ..backup_config()
+    }
+}
+
+/// The same under `ack=s3`: the holder's runtime, then a subscriber's
+/// (no backups; any peer watches the holder's silence on its stream).
+fn acks3_runtime_lag_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+        faults: runtime_lag_faults(sim::run::LagOf::NonHolder),
+        ..backup_runtime_lag_config()
+    }
+}
+
+/// The backup lags (1.0–2.5 s, its peers stamped up to 0.6 s after) and
+/// the holder dies in the middle of it: the lapse discount must not keep
+/// a dead holder. The backup still seals and takes over — within its
+/// bound, a window plus one of its own running time plus its lapse, and
+/// in time for the claim grace (2T past the lease's expiry), so nothing
+/// acknowledged is lost (`strict_durability`).
+fn backup_runtime_lag_then_crash_config() -> SimConfig {
+    SimConfig {
+        live_holder: false,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::RuntimeLag {
+                    who: sim::run::LagOf::Backup,
+                    for_ms: (1_000, 2_500),
+                    stamp_lag_ms: (0, 600),
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_700,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: None,
+                    keep_journal: true,
+                },
+            },
+        ],
+        ..backup_runtime_lag_config()
+    }
+}
+
+/// See [`backup_runtime_lag_then_crash_config`]: the dead holder is
+/// sealed by its lagging backup, within the bound.
+#[test]
+fn a_lagging_backup_still_seals_a_dead_holder() {
+    let t = run_m9(
+        "backup-runtime-lag-then-crash",
+        backup_runtime_lag_then_crash_config(),
+        0..120,
+    );
+    assert!(t.seals >= 60, "the lagging backup rarely sealed: {t:?}");
+    // 2T of the backup's running time plus its lapse (at most 2.5 s, and
+    // its peers' 0.6 s), then the read, the seal and the takeover.
+    let bound = 2 * 1_000 + 2_500 + 600 + 1_500;
+    let late: Vec<u64> = t
+        .failovers
+        .iter()
+        .copied()
+        .filter(|ms| *ms > bound)
+        .collect();
+    assert!(
+        late.is_empty(),
+        "failovers past {bound} ms: {late:?}; {}",
+        t.failover_dist()
+    );
+}
+
+/// The holder's lag and the watcher's (`other`), each 1.0–2.5 s, the
+/// peers' backlog stamped up to 0.6 s after.
+fn runtime_lag_faults(other: sim::run::LagOf) -> Vec<ScheduledFault> {
+    let lag = |at_ms, who| ScheduledFault {
+        at_ms,
+        kind: FaultKind::RuntimeLag {
+            who,
+            for_ms: (1_000, 2_500),
+            stamp_lag_ms: (0, 600),
+        },
+    };
+    vec![
+        lag(1_200, other),
+        lag(4_500, sim::run::LagOf::Holder),
+        lag(8_000, other),
+    ]
+}
+
+/// The claim-grace corner of the lapse discount: the holder is cut from
+/// S3 (it cannot renew, its lease runs out while it is alive and its
+/// backup still gets appends), and its backup's runtime is held up
+/// across that expiry (1.5–2.0 s, from about 0.5 s before it). The
+/// backup must still read, seal and claim inside the 2T a non-listed
+/// node waits past the expiry — or the other nodes' writes take the
+/// lease over by TTL from a log without the backup's tail, and
+/// acknowledged writes are lost or reordered (`strict_durability`,
+/// long-backup seed 802943's class). `beats_lost`: the liveness lane is
+/// broken all along, so no beat ever names the expiry and only the
+/// lease the backup read does (the seal watch's unknown-expiry arm
+/// before that fallback: it waited a window past the lapse's end).
+fn backup_lag_at_expiry_config(beats_lost: bool) -> SimConfig {
+    SimConfig {
+        clients_per_node: 2,
+        ops_per_client: 30,
+        random_faults: 0,
+        join_fresh: false,
+        holder_beats: sim::run::HolderBeats::Thread,
+        beats_lost,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_100,
+                kind: FaultKind::CutS3Holder { for_ms: 9_000 },
+            },
+            ScheduledFault {
+                at_ms: 5_600,
+                kind: FaultKind::RuntimeLag {
+                    who: sim::run::LagOf::Backup,
+                    for_ms: (1_500, 2_000),
+                    stamp_lag_ms: (0, 400),
+                },
+            },
+        ],
+        ..backup_config()
+    }
+}
+
+/// See [`backup_lag_at_expiry_config`]: nothing acknowledged is lost, with
+/// the expiry known from beats or from a lease read, the P2P handlers'
+/// stamps handed over before the timers after the lapse (the daemon's
+/// order) or after them, and the backup seals in time (in at least 100
+/// of each 120 seeds; before, with no beat naming the expiry and timers
+/// first, it sealed in 1: in the others it waited a window past its
+/// lapse and the expired lease was claimed first — by itself, by TTL,
+/// unsealed, or by another node). The seeds of 0..2000 that lost the
+/// order of acknowledged writes before are pinned. What is left fails
+/// `backup-lag-at-expiry-beats-lost` seeds 1788 and 1791: a backup that
+/// knows no expiry for the tenure at all (no beat, no read of the lease
+/// since the holder took it) counts plain silence from the backlog's
+/// credit, the documented residual.
+#[test]
+fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
+    let configs = |label: &str| match label {
+        "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
+        "backup-lag-at-expiry-timers-first" => timers_first(backup_lag_at_expiry_config(false)),
+        "backup-lag-at-expiry-beats-lost" => backup_lag_at_expiry_config(true),
+        _ => timers_first(backup_lag_at_expiry_config(true)),
+    };
+    for label in [
+        "backup-lag-at-expiry",
+        "backup-lag-at-expiry-timers-first",
+        "backup-lag-at-expiry-beats-lost",
+        "backup-lag-at-expiry-beats-lost-timers-first",
+    ] {
+        let t = run_m9(label, configs(label), 0..120);
+        assert!(t.seals >= 100, "{label}: the backup rarely sealed: {t:?}");
+    }
+    let pinned: [(&str, &[u64]); 3] = [
+        // Stamps first: the backlog's credit re-armed the watch a window
+        // past the lapse's end, past the claim grace (before the watch
+        // read the lease at the expiry it knew of: here its beats named
+        // it, there only a read of the lease did).
+        (
+            "backup-lag-at-expiry",
+            &[60, 260, 609, 644, 830, 1034, 1106, 1252, 1624, 1852, 1863],
+        ),
+        ("backup-lag-at-expiry-beats-lost", &[655, 837, 981, 1025]),
+        // Timers first: the unknown-expiry arm waiting a window past the
+        // lapse, or (655) the backlog heard during the lease read
+        // re-arming the watch past the expired lease.
+        (
+            "backup-lag-at-expiry-beats-lost-timers-first",
+            &[655, 837, 981, 1025, 1788, 1791],
+        ),
+    ];
+    for (label, seeds) in pinned {
+        for &seed in seeds {
+            if let Err(e) = run_seed(seed, configs(label)) {
+                panic!("seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}");
+            }
+        }
+    }
+}
+
+/// After a lag, the timers before what the P2P handlers stamped
+/// meanwhile (`SimConfig::timers_first_after_lag`): the other order a
+/// daemon's driver can see, swept beside the usual one.
+fn timers_first(cfg: SimConfig) -> SimConfig {
+    SimConfig {
+        timers_first_after_lag: true,
+        ..cfg
+    }
+}
+
+/// Plain silence, and the heartbeat a task of the runtime: the watches
+/// and the holder as they were (`Config::liveness_lag_aware` off). The
+/// non-vacuity half of the runtime-lag configurations.
+fn unaware(cfg: SimConfig) -> SimConfig {
+    let core = cfg.core.clone();
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Runtime,
+        core: std::sync::Arc::new(move |id, inc| {
+            let mut c = core(id, inc);
+            c.liveness_lag_aware = false;
+            c
+        }),
+        ..cfg
+    }
+}
+
+/// A host's lag on the holder and on its backup seals no live holder,
+/// loses nothing acknowledged. (The sweep: `AUTHORITY_SIM_CONFIG=
+/// backup-runtime-lag … --ignored sweep_config`.)
+#[test]
+fn backup_runtime_lag_never_seals_a_live_holder() {
+    let t = run_m9("backup-runtime-lag", backup_runtime_lag_config(), 0..120);
+    assert!(t.backups_added >= 60, "backups rarely chosen: {t:?}");
+    assert_eq!(t.seals, 0, "{t:?}");
+}
+
+/// The same under `ack=s3`: no fast takeover of a live holder.
+#[test]
+fn acks3_runtime_lag_never_takes_a_live_holder_over() {
+    let t = run_m9("acks3-runtime-lag", acks3_runtime_lag_config(), 0..120);
+    assert_eq!(t.s3_fast_takeovers, 0, "{t:?}");
+}
+
+/// The runtime-lag checks are not vacuous: with the watches measuring
+/// plain silence and the heartbeat on the runtime, the same lags seal
+/// (or, under `ack=s3`, take over) live holders.
+#[test]
+fn runtime_lag_without_lag_awareness_deposes_live_holders() {
+    for (label, cfg) in [
+        (
+            "backup-runtime-lag-unaware",
+            unaware(backup_runtime_lag_config()),
+        ),
+        (
+            "acks3-runtime-lag-unaware",
+            unaware(acks3_runtime_lag_config()),
+        ),
+    ] {
+        let deposed = (0..60u64)
+            .filter(|seed| {
+                run_seed(*seed, cfg.clone())
+                    .err()
+                    .is_some_and(|e| e.contains("a live holder was sealed or taken over"))
+            })
+            .count();
+        eprintln!("{label}: {deposed}/60 seeds deposed a live holder");
+        assert!(
+            deposed >= 10,
+            "{label}: only {deposed}/60 seeds deposed a live holder"
+        );
+    }
+}
+
 fn long_backup_config() -> SimConfig {
     SimConfig {
         strict_durability: true,
@@ -2641,6 +2929,27 @@ fn sweep_config() {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "long-delegated" => long_delegated_config(),
         "long-backup" => long_backup_config(),
+        "backup-runtime-lag" => backup_runtime_lag_config(),
+        "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
+        "backup-lag-at-expiry-beats-lost" => backup_lag_at_expiry_config(true),
+        "backup-runtime-lag-then-crash" => backup_runtime_lag_then_crash_config(),
+        "acks3-runtime-lag" => acks3_runtime_lag_config(),
+        "backup-runtime-lag-unaware" => unaware(backup_runtime_lag_config()),
+        "acks3-runtime-lag-unaware" => unaware(acks3_runtime_lag_config()),
+        "backup-lag-at-expiry-beats-lost-unaware" => unaware(backup_lag_at_expiry_config(true)),
+        "backup-lag-at-expiry-timers-first" => timers_first(backup_lag_at_expiry_config(false)),
+        "backup-lag-at-expiry-beats-lost-timers-first" => {
+            timers_first(backup_lag_at_expiry_config(true))
+        }
+        "backup-runtime-lag-timers-first" => timers_first(backup_runtime_lag_config()),
+        "acks3-runtime-lag-timers-first" => timers_first(acks3_runtime_lag_config()),
+        "backup" => backup_config(),
+        "backup-crash" => backup_crash_config(),
+        "backup-crash-slow" => SimConfig {
+            s3_latency: (60, 200),
+            ..backup_crash_config()
+        },
+        "acks3-crash" => ack_s3_crash_config(),
         // `long_backup`'s odd seeds.
         "long-acks3" => SimConfig {
             core: std::sync::Arc::new(sim::run::ack_s3_core_config),
