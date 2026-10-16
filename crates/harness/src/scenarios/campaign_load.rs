@@ -48,12 +48,6 @@ use std::time::{Duration, Instant};
 
 const LOCK_TTL_MS: u64 = 3_000;
 
-/// The client op deadline of `m9::cluster`'s daemons (twice its lease TTL).
-fn m9_deadline() -> Duration {
-    Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", super::m9::TTL_MS.to_string())])
-        .client_deadline()
-}
-
 fn rounds(default: usize) -> usize {
     std::env::var("CONSTELLATION_HARNESS_ROUNDS")
         .ok()
@@ -216,7 +210,7 @@ fn finish_counter(
          were in doubt (lost or doubled increments)"
     );
     let refs: Vec<&Client> = clients.iter().collect();
-    let ev = Evidence::from_clients(&refs, m9_deadline());
+    let ev = Evidence::from_clients(&refs, super::m9::client_deadline());
     let rep = errnos.judge(&ev);
     eprintln!("    {name}: errors by class {:?}", rep.counts);
     anyhow::ensure!(
@@ -473,9 +467,12 @@ fn ledger_writer(
     (slowest, at, seq)
 }
 
-/// Wait until `ledger` checks out on every client's mount (or 90 s), and
-/// fail with what it found otherwise.
+/// After quiescence (no op answered in doubt can still land), wait until
+/// `ledger` checks out on every client's mount (or 90 s), and fail with
+/// what it found otherwise.
 fn ledger_converges(name: &str, clients: &[Client], ledger: &Ledger) -> Result<()> {
+    let refs: Vec<&Client> = clients.iter().collect();
+    crate::verify::wait_quiescent(&refs, crate::load::scaled(Duration::from_secs(120)))?;
     let deadline = Instant::now() + crate::load::scaled(Duration::from_secs(90));
     loop {
         let refused: u64 = clients
@@ -539,7 +536,10 @@ pub(super) fn acks3_under_load(seed: u64) -> Result<()> {
         let epoch = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
         let ack = clients[0].control_status()?["ack"].clone();
         anyhow::ensure!(ack["policy"] == "s3", "a is not under ack=s3: {ack}");
-        let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
+        let (ledger, errnos) = (
+            Ledger::with_client_deadline(super::m9::client_deadline()),
+            ErrnoLog::new(),
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
             let (mnt, l, e, stop) = (
@@ -576,7 +576,7 @@ pub(super) fn acks3_under_load(seed: u64) -> Result<()> {
         );
         ledger_converges(NAME, &clients, &ledger)?;
         let refs: Vec<&Client> = clients.iter().collect();
-        let rep = errnos.judge(&Evidence::from_clients(&refs, m9_deadline()));
+        let rep = errnos.judge(&Evidence::from_clients(&refs, super::m9::client_deadline()));
         anyhow::ensure!(
             rep.bugs.is_empty(),
             "errors outside the documented set: {}",
@@ -648,7 +648,10 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
                     .unwrap_or(0)
             })
             .collect();
-        let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
+        let (ledger, errnos) = (
+            Ledger::with_client_deadline(super::m9::client_deadline()),
+            ErrnoLog::new(),
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let writers: Vec<_> = clients
             .iter()
@@ -706,7 +709,7 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
         }
         ledger_converges(NAME, &clients, &ledger)?;
         let refs: Vec<&Client> = clients.iter().collect();
-        let rep = errnos.judge(&Evidence::from_clients(&refs, m9_deadline()));
+        let rep = errnos.judge(&Evidence::from_clients(&refs, super::m9::client_deadline()));
         anyhow::ensure!(
             rep.bugs.is_empty(),
             "errors outside the documented set: {}",
@@ -861,7 +864,10 @@ pub(super) fn delegate_paused_across_ttl(_seed: u64) -> Result<()> {
                 .iter()
                 .map(|s| (s.to_string(), t.duration_of(s).expect("a boundary")))
                 .collect();
-        let (ledger, errnos) = (Ledger::new(), ErrnoLog::new());
+        let (ledger, errnos) = (
+            Ledger::with_client_deadline(t.client_deadline()),
+            ErrnoLog::new(),
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let writer = {
             let (mnt, l, e, stop) = (b.mnt.clone(), ledger.clone(), errnos.clone(), stop.clone());

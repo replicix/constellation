@@ -82,6 +82,12 @@ fn print_ack(scenario: &str, who: &str, s: &serde_json::Value) {
 /// path), never expiry.
 pub(super) const TTL_MS: u64 = 20_000;
 
+/// The client op deadline of [`cluster`]'s daemons (twice the lease TTL).
+pub(super) fn client_deadline() -> Duration {
+    crate::timings::Timings::from_pairs(&[("CONSTELLATION_LEASE_TTL_MS", TTL_MS.to_string())])
+        .client_deadline()
+}
+
 /// `names` nodes on a fresh filesystem with `extra` env on every mount
 /// (M9's knobs are per mount); node 0 holds the lease and `f` exists
 /// everywhere. The first `counting` nodes reach S3 through a counting

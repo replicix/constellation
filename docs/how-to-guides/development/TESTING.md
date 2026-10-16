@@ -3314,7 +3314,13 @@ someone wrote (searched wherever the engine puts one: beside the file,
 or at the root of the mount or of any mounted view above it), or
 lost/corrupt/wrong/phantom; corrupt bytes at a path are
 corruption whatever copy exists; an undone unlink only when a refused
-replay was counted), the protocol counters it depends on
+replay was counted, or as the late landing of an op answered in doubt
+(`EIO` at the client deadline: a stranded execution may still be
+replayed by rid on a node's drain, once, after the application's later
+ops on the name): a create's name back empty, a rename's target back
+with what its source held, nothing else; checked after quiescence, no
+speculation outstanding nor replay pending on any node), the protocol
+counters it depends on
 (`verify::counters`: rolled back, replayed, refused replays, conflict
 copies, depositions, outwaited grants, seals), and the errno
 classification (`verify::ErrnoLog`, counted per class: EIO under a lock

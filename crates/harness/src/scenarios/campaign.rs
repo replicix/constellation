@@ -112,7 +112,7 @@ fn writer(
                 Ok(()) => ledger.acked_rename(&rel, &to),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    ledger.failed_op(&[&rel, &to]);
+                    ledger.failed_rename(&rel, &to, &e, t.elapsed());
                     errnos.record(node, "rename", &e, t, OpCtx::default())
                 }
             }
@@ -223,7 +223,7 @@ pub(super) fn load_probe(seed: u64) -> Result<()> {
     let extra_refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let (env, _root, mut clients, _) = cluster(NAME, &["a", "b"], &extra_refs, 0)?;
     let result = (|| -> Result<()> {
-        let ledger = Ledger::new();
+        let ledger = Ledger::with_client_deadline(super::m9::client_deadline());
         let errnos = ErrnoLog::new();
         let epoch0 = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
         eprintln!(
@@ -362,7 +362,12 @@ pub(super) fn load_probe(seed: u64) -> Result<()> {
             }
             _ => {}
         }
-        // ---- convergence, then every check.
+        // ---- quiescence (no op answered in doubt can still land), then
+        // convergence, then every check.
+        crate::verify::wait_quiescent(
+            &clients.iter().collect::<Vec<_>>(),
+            crate::load::scaled(Duration::from_secs(120)),
+        )?;
         let deadline = Instant::now() + Duration::from_secs(90);
         let reports = loop {
             let reps: Vec<_> = clients.iter().map(|c| ledger.check(&c.mnt)).collect();
@@ -391,13 +396,14 @@ pub(super) fn load_probe(seed: u64) -> Result<()> {
         for (c, r) in clients.iter().zip(&reports) {
             eprintln!(
                 "    {NAME}: ledger on {}: {} ops, {} files, {} intact, {} in conflict copies, \
-                 {} undone unlinks; counters {}",
+                 {} undone unlinks, {} late landings of ops in doubt; counters {}",
                 c.name,
                 r.acked_ops,
                 r.files,
                 r.intact,
                 r.in_conflict_copy.len(),
                 r.resurrected.len(),
+                r.late_landed.len(),
                 crate::verify::counters(c)
             );
         }
@@ -440,7 +446,7 @@ pub(super) fn load_probe(seed: u64) -> Result<()> {
         );
         // ---- errors the workload saw.
         let refs: Vec<&Client> = clients.iter().collect();
-        let ev = Evidence::from_clients(&refs, Duration::from_secs(120));
+        let ev = Evidence::from_clients(&refs, super::m9::client_deadline());
         let rep = errnos.judge(&ev);
         for a in &rep.allowed {
             eprintln!("    {NAME}: allowed error: {a}");
