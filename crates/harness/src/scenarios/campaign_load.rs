@@ -20,7 +20,8 @@
 //!   rename: every write once (the bucket log), every acknowledged one
 //!   there, the moved file in one place, no generation the root ended
 //!   live at the delegate afterwards (a recalled generation's late answer
-//!   installs no stale grant), errors only in doubt past the deadline.
+//!   installs no stale grant; live past the clock-skew margin in two
+//!   samples in a row), errors only in doubt past the deadline.
 //! - `acks3-under-load`: an `ack=s3` holder whose store stalls 1-3 s at a
 //!   time (run it under `cpu:25@a`): no fast takeover of a live holder, no
 //!   rollback of an acknowledged write (finding F2b's twin).
@@ -138,7 +139,11 @@ fn increment(f: &std::fs::File) -> std::result::Result<(), IncFail> {
 fn note_failed(node: &str, fail: &IncFail, t: Instant, errnos: &ErrnoLog, c: &mut Count) {
     errnos.record(
         node,
-        if fail.at_fsync { "increment fsync" } else { "increment" },
+        if fail.at_fsync {
+            "increment fsync"
+        } else {
+            "increment"
+        },
         &fail.err,
         t,
         OpCtx {
@@ -745,13 +750,17 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
 /// must not be one the root `a` ended (`ended` accumulates what the root
 /// reported ended, across calls): a recalled or reclaimed generation's
 /// late answer never installs it again (cluster-locks.md, delegations).
+/// `until_ms` is on `b`'s protocol clock, which may run up to `skew` off
+/// the harness's: see [`StaleWatch`].
 fn no_stale_generation(
     a: &Client,
     b: &Client,
     ended: &mut std::collections::BTreeSet<u64>,
+    skew: Duration,
     within: Duration,
 ) -> Result<()> {
     let until = Instant::now() + within;
+    let mut watch = StaleWatch::new(skew);
     loop {
         let root = a.control_status()?["delegation"].clone();
         for g in root["gens"].as_array().into_iter().flatten() {
@@ -759,24 +768,65 @@ fn no_stale_generation(
                 ended.insert(g[2].as_u64().unwrap_or(0));
             }
         }
-        let now = super::snapsched::now_ms();
         let mine = b.control_status()?["delegation"]["mine"].clone();
-        for m in mine.as_array().into_iter().flatten() {
-            let (gen, until_ms, stopped) = (
-                m[1].as_u64().unwrap_or(0),
-                m[2].as_i64().unwrap_or(0),
-                m[3] == true,
-            );
-            anyhow::ensure!(
-                stopped || until_ms <= now || !ended.contains(&gen),
-                "b holds generation {gen} live (until {until_ms}) that the root ended: a late \
-                 answer installed a stale grant"
+        if let Some((gen, until_ms, now)) = watch.sample(&mine, ended, super::snapsched::now_ms()) {
+            bail!(
+                "b holds generation {gen} live (until {until_ms}, harness clock {now}) that the \
+                 root ended, in two samples in a row: a late answer installed a stale grant"
             );
         }
         if Instant::now() >= until {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// [`no_stale_generation`]'s rule over `delegation.mine` samples. A
+/// generation is suspect when the root ended it and `b` holds it neither
+/// stopped nor lapsed even if `b`'s clock runs `skew` ahead of the
+/// harness's (`until_ms > now + skew`); it is a stale grant once suspect
+/// in two samples in a row, so neither a clock-skew transient nor one
+/// sample racing the stop is called one.
+struct StaleWatch {
+    skew_ms: i64,
+    suspect: std::collections::BTreeSet<u64>,
+}
+
+impl StaleWatch {
+    fn new(skew: Duration) -> StaleWatch {
+        StaleWatch {
+            skew_ms: skew.as_millis() as i64,
+            suspect: Default::default(),
+        }
+    }
+
+    /// One sample of `mine` (`[dir, gen, until_ms, stopped, …]` rows) at
+    /// harness time `now` (ms): the stale grant `(gen, until_ms, now)`, if
+    /// one was suspect in the previous sample too.
+    fn sample(
+        &mut self,
+        mine: &serde_json::Value,
+        ended: &std::collections::BTreeSet<u64>,
+        now: i64,
+    ) -> Option<(u64, i64, i64)> {
+        let mut suspect = std::collections::BTreeSet::new();
+        let mut stale = None;
+        for m in mine.as_array().into_iter().flatten() {
+            let (gen, until_ms, stopped) = (
+                m[1].as_u64().unwrap_or(0),
+                m[2].as_i64().unwrap_or(0),
+                m[3] == true,
+            );
+            if !stopped && until_ms > now + self.skew_ms && ended.contains(&gen) {
+                suspect.insert(gen);
+                if stale.is_none() && self.suspect.contains(&gen) {
+                    stale = Some((gen, until_ms, now));
+                }
+            }
+        }
+        self.suspect = suspect;
+        stale
     }
 }
 
@@ -845,7 +895,7 @@ pub(super) fn delegate_paused_across_ttl(_seed: u64) -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("the mover panicked"))?;
                 // A recalled generation's late answer installs nothing: no
                 // generation the root ended is live at b afterwards.
-                no_stale_generation(a, b, &mut ended, Duration::from_secs(5))
+                no_stale_generation(a, b, &mut ended, t.margin, Duration::from_secs(5))
                     .with_context(|| format!("{what} round {round}"))?;
                 eprintln!(
                     "    {NAME}: {what} ({d:?}) round {round}: the root's rename of {x} {r:?} \
@@ -957,5 +1007,71 @@ mod tests {
             t.duration_of("deleg-outwait+1000"),
             Some(Duration::from_millis(7_000))
         );
+    }
+
+    #[test]
+    fn a_stale_generation_is_one_held_past_the_skew_in_two_samples() {
+        // The scenario's margin covers the ±500 ms clock injectors.
+        let t = Timings::from_pairs(&[
+            ("CONSTELLATION_DELEGATION_TTL_MS", "5000".to_string()),
+            (
+                "CONSTELLATION_LEASE_TTL_MS",
+                super::super::m11::TTL_MS.to_string(),
+            ),
+        ]);
+        assert!(t.margin >= Duration::from_millis(500), "{t:?}");
+        let ended: std::collections::BTreeSet<u64> = [3].into();
+        let row = |gen: u64, until: i64, stopped: bool| {
+            serde_json::json!([7, gen, until, stopped, 0, 0, 0])
+        };
+        let mine = |rows: Vec<serde_json::Value>| serde_json::Value::Array(rows);
+        let now = 1_000_000;
+        let mut w = StaleWatch::new(Duration::from_millis(1_000));
+        // Within the skew of the harness's clock: b may have lapsed it.
+        assert_eq!(
+            w.sample(&mine(vec![row(3, now + 400, false)]), &ended, now),
+            None
+        );
+        assert_eq!(
+            w.sample(&mine(vec![row(3, now + 900, false)]), &ended, now + 500),
+            None
+        );
+        // Live past the skew, but once: not yet a stale grant.
+        let mut w = StaleWatch::new(Duration::from_millis(1_000));
+        assert_eq!(
+            w.sample(&mine(vec![row(3, now + 5_000, false)]), &ended, now),
+            None
+        );
+        // Twice in a row: one.
+        assert_eq!(
+            w.sample(&mine(vec![row(3, now + 5_000, false)]), &ended, now + 500),
+            Some((3, now + 5_000, now + 500))
+        );
+        // Suspect, then not, then suspect again: no two in a row.
+        let mut w = StaleWatch::new(Duration::from_millis(1_000));
+        assert_eq!(
+            w.sample(&mine(vec![row(3, now + 5_000, false)]), &ended, now),
+            None
+        );
+        assert_eq!(
+            w.sample(&mine(vec![row(3, now + 5_000, true)]), &ended, now + 500),
+            None
+        );
+        assert_eq!(
+            w.sample(&mine(vec![row(3, now + 5_000, false)]), &ended, now + 1_000),
+            None
+        );
+        // Stopped, or a generation the root did not end: never.
+        let mut w = StaleWatch::new(Duration::from_millis(1_000));
+        for at in [now, now + 500] {
+            assert_eq!(
+                w.sample(
+                    &mine(vec![row(3, now + 5_000, true), row(4, now + 5_000, false)]),
+                    &ended,
+                    at
+                ),
+                None
+            );
+        }
     }
 }
