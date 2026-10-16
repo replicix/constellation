@@ -68,6 +68,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 fio stress-ng
+      # `csi-credential-revocation` needs a native, signature-checking
+      # versitygw whatever --s3-backend is (floci accepts any key pair).
+      - run: bash tests/ci/install-native-s3.sh
       - run: cargo build --release -p constellation -p constellation-harness -p constellation-chaos
       # `pipefail`: the run's exit status must survive `tee`.
       - run: |
