@@ -70,7 +70,7 @@
 use super::m11::dump_logs_on_failure;
 use super::m9::node_id;
 use super::snapsched::{is_leader, now_ms, polled, root_lease, sched_status, stat};
-use super::{eventually, journal_drained, set_xattr, setup, ts, wait_for_p2p};
+use super::{eventually, journal_drained, set_xattr, setup, take_root_lease, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::s3env::BUCKET;
 use anyhow::{ensure, Context, Result};
@@ -116,6 +116,7 @@ pub fn snapsched_write_overhead(_seed: u64) -> Result<()> {
     let mut b = node("b")?.with_env("CONSTELLATION_SNAPSCHED", "0");
     b.fs_create()?;
     b.mount()?;
+    take_root_lease(&b)?;
     a.mount()?;
     let mut clients = [a, b];
     let result = match body(&mut clients) {

@@ -23,7 +23,7 @@
 //! (`cto-strict-root`, finding R2-4, lives with the other `--cto`
 //! scenarios in `m8.rs`.)
 
-use super::{eventually, lease_of, setup, ts, wait_for_p2p};
+use super::{eventually, lease_of, setup, take_root_lease, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::reqlog::CountingProxy;
 use crate::s3env::BUCKET;
@@ -1108,6 +1108,9 @@ pub fn s3_cut_create_holder_restart(_seed: u64) -> Result<()> {
     let mut c = tune(node(root.path(), "c", &pc, &backend)?);
     a.fs_create()?;
     a.mount()?;
+    // A is the holder the scenario restarts; a root mount holds no lease
+    // until something is written (`take_root_lease`).
+    take_root_lease(&a)?;
     b.mount()?;
     c.mount()?;
     let mut failures: Vec<String> = Vec::new();

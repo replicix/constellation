@@ -575,6 +575,47 @@ and — with S3 cut via toxiproxy — reads must keep succeeding at full
 speed while the atime updates are simply lost (atime never blocks a
 read).
 
+### Running the lanes as root
+
+The passthrough and zero-copy scenarios need root, so a full lane is
+sometimes run as root:
+
+```bash
+sudo env HOME=/root PATH=$PATH TMPDIR=/var/tmp \
+    CONSTELLATION_HARNESS_DOCKER_PREFIX=me-root \
+    CONSTELLATION_BIN=$PWD/target/release/constellation \
+    CHAOS_BIN=$PWD/target/release/chaos \
+    target/release/harness run --results-json root.json
+```
+
+`sudo` drops the environment, so every `CONSTELLATION_*` and `CHAOS_*`
+variable the run needs is named after `env` (a missing `CONSTELLATION_BIN`
+makes the first mount fail with `ENOENT`). An unprivileged run is the
+reference: `nightly.yml` runs the lanes that way, and a scenario that
+passes there and fails as root has a root-only assumption.
+
+The one the harness met so far: an unprivileged first mount of a new
+filesystem takes the root lease as a side effect (`adopt_root` hands the
+root directory to the mounting user, a `Setattr` through the lease path),
+and a daemon with euid 0 skips that, because the root directory is already
+its own. As root a mount holds no lease, and so selects no backup, until
+its first mutation. That is the product's behaviour (a lease is taken on
+demand, and the CSI daemon runs as root), not a bug. A scenario that waits
+for the lease, or for a backup, before it writes anything must take the
+lease first with `take_root_lease` (a probe file created and removed in the
+mount's root), as `snapsched`, `snapsched-budget`, `snapsched-write-overhead`,
+`snapsched-leader-paused`, `holder-publishes-log-prefix-backup` and
+`s3-cut-create-holder-restart` do; one that cuts S3 before its first write
+uses `hold_lease_before_cut` or `create_holding` (the `fsync-*`
+scenarios, `stress-ng-flap`, `fio-blips`).
+Before that, these failed as root with `'b holds the root lease' not
+reached within 30s: holder 0`, `A has no backup yet` and `'A holds the
+lease' not reached within 20s: {"held":false,"holder":0}`.
+
+Do not run as root with `HOME` set to a real user's home: the harness's
+registry file under `$HOME/.config/constellation` is created root-owned
+and that user's next run cannot read it.
+
 ### Sharding and machine-readable results (plan 31 C0)
 
 `harness run` takes three flags for CI matrices and for tools that compare

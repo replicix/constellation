@@ -61,7 +61,7 @@ use super::snapsched::{
     auto_snaps, facts, grace_window, journal_entries, now_ms, parse_policy, read_state, root_lease,
     sched_status, stat, tuned, Snap,
 };
-use super::{eventually, set_xattr, setup, ts, wait_for_p2p};
+use super::{eventually, set_xattr, setup, take_root_lease, ts, wait_for_p2p};
 use crate::client::Client;
 use crate::s3env::BUCKET;
 use anyhow::{bail, ensure, Context, Result};
@@ -114,6 +114,7 @@ pub fn snapsched_budget(seed: u64) -> Result<()> {
     let c = node("c")?;
     b.fs_create()?;
     b.mount()?;
+    take_root_lease(&b)?;
     let mut clients = [a, b, c];
     let result = (|| {
         clients[0].mount()?;

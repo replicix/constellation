@@ -71,7 +71,7 @@
 
 use super::m11::dump_logs_on_failure;
 use super::m9::node_id;
-use super::{eventually, raw_objects, set_xattr, setup, ts};
+use super::{eventually, raw_objects, set_xattr, setup, take_root_lease, ts};
 use crate::client::Client;
 use crate::s3env::BUCKET;
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -944,9 +944,11 @@ pub fn snapsched(seed: u64) -> Result<()> {
     let mut a = node("a")?;
     let mut b = node("b")?;
     // b creates the filesystem and mounts first: it takes the root lease
-    // at mount and keeps it, as the writer and the only node that writes.
+    // at mount (as root, with a probe: `take_root_lease`) and keeps it, as
+    // the writer and the only node that writes.
     b.fs_create()?;
     b.mount()?;
+    take_root_lease(&b)?;
     a.mount()?;
     let mut clients = [a, b];
     let result = snapsched_body(seed, &mut clients, &env.direct_endpoint, &prefix);
@@ -987,6 +989,7 @@ pub fn snapsched_leader_paused(seed: u64) -> Result<()> {
     let mut b = node("b")?;
     b.fs_create()?;
     b.mount()?;
+    take_root_lease(&b)?;
     a.mount()?;
     let mut clients = [a, b];
     let result = (|| -> Result<()> {

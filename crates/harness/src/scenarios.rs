@@ -3919,6 +3919,34 @@ fn hold_lease_before_cut(c: &Client) -> Result<()> {
     )
 }
 
+/// Make `c` hold the root lease now, as an unprivileged first mount does
+/// by itself.
+///
+/// The first mount of a new filesystem hands the root directory to the
+/// mounting user (`engine::node::adopt_root`, a `Setattr` through the
+/// lease path), and that takes the lease as a side effect. A daemon with
+/// euid 0 skips the adoption (the root is already its own), so as root a
+/// mount holds no lease until its first mutation, and a scenario that
+/// waits for the lease (or for a backup, which the holder picks) before
+/// writing anything times out on a root run and passes unprivileged.
+/// Creating and removing a file in the root is the mutation: it leaves no
+/// entry behind and takes the lease the same way as root or not.
+pub(crate) fn take_root_lease(c: &Client) -> Result<()> {
+    let probe = c.mnt.join(".take-root-lease");
+    std::fs::File::create(&probe)
+        .and_then(|_| std::fs::remove_file(&probe))
+        .with_context(|| format!("{}: taking the root lease with a probe file", c.name))?;
+    eventually(
+        &format!("{} holds the lease its probe took", c.name),
+        Duration::from_secs(30),
+        || {
+            let lease = lease_of(c)?;
+            anyhow::ensure!(lease["held"] == true, "{lease}");
+            Ok(())
+        },
+    )
+}
+
 /// P2P state from a node's control API.
 fn p2p_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["p2p"].clone())
@@ -11314,6 +11342,9 @@ fn holder_publishes_log_prefix_mode(_seed: u64, backup: bool) -> Result<()> {
     let mut b = tune(Client::new(root.path(), "b", &env.endpoint, &backend)?);
     a.fs_create()?;
     a.mount()?;
+    // A is the holder whose backup the scenario waits for; a root mount
+    // holds no lease until something is written (`take_root_lease`).
+    take_root_lease(&a)?;
     b.mount()?;
     wait_for_p2p(&[&a, &b])?;
     let a_node = a.control_status()?["node_id"]
