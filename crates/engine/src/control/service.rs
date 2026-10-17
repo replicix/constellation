@@ -405,6 +405,7 @@ impl EngineControl {
                     executed: stats.deleg_executed,
                     fast_path_executed: core.delegation_fast_path_executed,
                     fast_path_routed: core.delegation_fast_path_routed,
+                    fast_path_fenced: core.delegation_fast_path_fenced,
                     forwarded_to_delegate: stats.deleg_forwarded,
                     deps_waits: stats.deleg_deps_waits,
                     parked_expired: stats.deleg_parked_expired,

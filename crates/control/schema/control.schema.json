@@ -1312,6 +1312,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "fast_path_fenced": {
+          "description": "Ops the delegate's FUSE fast path sent through the core because its\ngeneration ended at this node's takeover gate while the op waited\nfor the store's writer lock (counted apart from `fast_path_routed`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "fast_path_routed": {
           "description": "Plan 30 §M12: ops the root's fast path sent through the core\nbecause a live delegation owned their keys.",
           "format": "uint64",
@@ -1631,6 +1637,7 @@
         "executed",
         "fast_path_executed",
         "fast_path_routed",
+        "fast_path_fenced",
         "forwarded_to_delegate",
         "deps_waits",
         "parked_expired",

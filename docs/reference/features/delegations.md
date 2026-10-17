@@ -453,7 +453,11 @@ writer whatever the share, and `MIN_OPS=0` drops the rate floor. See
 table, `mine` (this node's generations), `gens`, `kinds`, `backups`, and
 `placement`: the busiest subtrees as `(dir, node, node_ops,
 subtree_ops)`. Counters include `executed`, `fast_path_executed`, `lapsed`,
-`fast_path_routed`, `forwarded_to_delegate`, `deps_waits`,
+`fast_path_routed` (ops the root's fast path sent through the core because
+a live delegation owned their keys), `fast_path_fenced` (ops the delegate's
+fast path sent through the core because its generation ended at this
+node's takeover gate while the op waited for the store's writer lock),
+`forwarded_to_delegate`, `deps_waits`,
 `streamed_txs`, `appended_txs`, `cross_subtree`, `recalls_sent`,
 `recalls_drained`, `recalls_expired`, `reclaimed`, `ended`,
 `redelegated`, `deps_overflow_to_root`, `refused_designated`, and the

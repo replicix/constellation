@@ -48681,8 +48681,10 @@ pending); the delegate's was fenced by a mirror that lags the core.
   (`idx: Some`) and the root's own path are not affected. The engine
   already sends `NotAdmitted` through the core (`submit_to_core`), whose
   gate parks the op until the replay is done, so it executes once, after
-  the stranded rows; the site now logs at INFO ("delegate fast path
-  refused at the write") and counts it in `delegation_fast_path_routed`.
+  the stranded rows; the site logs a fenced op at INFO ("delegate fast path
+  refused at the write") and counts it in `status.delegation.fast_path_fenced`
+  (a lapsed delegation, the same `NotAdmitted` before, logs at debug and is
+  not counted).
 - The core's `my_generation_for` also refuses a generation the store has
   marked (the core's own delegate path never executes under it, nor
   journals a refusal into it).

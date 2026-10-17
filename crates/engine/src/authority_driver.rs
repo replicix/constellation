@@ -155,6 +155,9 @@ pub struct CoreStatus {
     /// Plan 30 §M12: ops the FUSE fast path sent through the core because
     /// a live delegation owned their keys.
     pub delegation_fast_path_routed: u64,
+    /// Ops the delegate's FUSE fast path sent through the core because its
+    /// generation ended at this node's takeover gate.
+    pub delegation_fast_path_fenced: u64,
     /// Phase 2b: the placement's busiest subtrees, `(dir, node, node_ops,
     /// subtree_ops)`.
     pub placement_top: Vec<(u64, u64, u64, u64)>,
@@ -2120,6 +2123,7 @@ impl Driver {
         status.delegation_enabled = cfg.delegation;
         status.delegation_fast_path_executed = self.deps.delegates.executed();
         status.delegation_fast_path_routed = self.deps.delegates.routed();
+        status.delegation_fast_path_fenced = self.deps.delegates.fenced();
         self.deps.delegates.mirror(&status.delegation);
         self.deps
             .delegates

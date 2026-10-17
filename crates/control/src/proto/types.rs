@@ -267,6 +267,10 @@ pub struct DelegationReport {
     /// Plan 30 §M12: ops the root's fast path sent through the core
     /// because a live delegation owned their keys.
     pub fast_path_routed: u64,
+    /// Ops the delegate's FUSE fast path sent through the core because its
+    /// generation ended at this node's takeover gate while the op waited
+    /// for the store's writer lock (counted apart from `fast_path_routed`).
+    pub fast_path_fenced: u64,
     pub forwarded_to_delegate: u64,
     pub deps_waits: u64,
     pub parked_expired: u64,

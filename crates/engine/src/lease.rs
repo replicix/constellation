@@ -430,6 +430,10 @@ pub struct DelegateView {
     /// Plan 30 §M12: ops the root's fast path sent through the core
     /// because a live delegation owned their keys (`status`).
     routed: std::sync::atomic::AtomicU64,
+    /// Ops the delegate's fast path sent through the core because its
+    /// generation ended at this node's takeover gate while the op waited
+    /// for the store's writer lock (`Meta::begin_local`).
+    fenced: std::sync::atomic::AtomicU64,
 }
 
 /// A fast-path execution admitted under a grant; dropped once the op is
@@ -530,6 +534,18 @@ impl DelegateView {
 
     pub fn routed(&self) -> u64 {
         self.routed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The delegate's fast path was refused at the write under a
+    /// generation its own takeover gate ended, and sent the op through the
+    /// core.
+    pub fn note_fenced(&self) {
+        self.fenced
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn fenced(&self) -> u64 {
+        self.fenced.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn mirror(&self, view: &constellation_authority::core::DelegView) {

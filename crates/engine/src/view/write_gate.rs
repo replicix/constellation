@@ -383,18 +383,26 @@ impl View {
                 // would be past.
                 drop(admission);
                 if matches!(result, Err(MetaError::NotAdmitted)) {
-                    // The delegation lapsed, or the generation ended under
-                    // this node's own takeover gate (`Meta::begin_local`),
-                    // while the op waited for the writer lock: the core
-                    // orders the op, after the stranded rows its gate
-                    // replays.
-                    tracing::info!(
-                        ?rid,
-                        gen,
-                        ?op,
-                        "delegate fast path refused at the write: its delegation lapsed or its generation ended; through the core"
-                    );
-                    h.delegates.note_routed();
+                    // The delegation lapsed while the op waited for the
+                    // writer lock, or the generation ended under this
+                    // node's own takeover gate (`Meta::begin_local`): the
+                    // core orders the op either way, and after the
+                    // stranded rows its gate replays in the second case.
+                    if self.meta.delegate_stranded(gen).unwrap_or(false) {
+                        tracing::info!(
+                            ?rid,
+                            gen,
+                            ?op,
+                            "delegate fast path refused at the write: its generation ended at the takeover gate; through the core"
+                        );
+                        h.delegates.note_fenced();
+                    } else {
+                        tracing::debug!(
+                            ?rid,
+                            gen,
+                            "delegate fast path refused at the write: its delegation lapsed; through the core"
+                        );
+                    }
                     return self.submit_to_core(h, op, rid, &tag, false);
                 }
                 // `Journaled`, not `Nudge`: the core streams the row on
