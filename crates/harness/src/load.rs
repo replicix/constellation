@@ -436,6 +436,24 @@ pub fn injecting() -> Option<String> {
     (!applied.is_empty()).then(|| applied.join(", "))
 }
 
+/// The store stalls armed so far, as `(armed, armed + length)`: a
+/// daemon taking an armed stall (it stalls its next ordinary write) is
+/// held that long from about the arming, whichever node it is.
+static STORE_STALLS: Mutex<Vec<(Instant, Instant)>> = Mutex::new(Vec::new());
+
+/// The store stalls armed at or after `since`, from [`STORE_STALLS`]
+/// (the intervals a scenario's own measurements may be excused by, or
+/// judged against, while a `store-stall` item runs).
+pub fn store_stalls_since(since: Instant) -> Vec<(Instant, Instant)> {
+    STORE_STALLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .filter(|(armed, _)| *armed >= since)
+        .collect()
+}
+
 /// Note that a probe-blind injector applied (see [`injecting`]).
 fn note_applied(what: String) {
     if let Some(s) = SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -1246,6 +1264,11 @@ impl Session {
                 if std::fs::write(&tmp, format!("{ms} once")).is_ok() {
                     let _ = std::fs::rename(&tmp, &file);
                 }
+                let armed = Instant::now();
+                STORE_STALLS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((armed, armed + Duration::from_millis(ms)));
                 eprintln!(
                     "    load: store stall of {ms} ms armed on {} (pid {})",
                     d.node, d.pid
