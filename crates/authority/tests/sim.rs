@@ -4393,6 +4393,25 @@ fn regression_long_delegated_late_answers_seed_2945() {
     });
 }
 
+/// `long-delegated-backup` seed 3585 (a replay held forever): the paused
+/// root ended two delegations itself after appending their rows and
+/// executed a cross-subtree rename after them, then was deposed with the
+/// `Recall`s unshipped; its successor ended the same generations lower.
+/// The rename's replay (by rid) named the rows between the two cuts: the
+/// deposed node's session did not call them lost (its own cut was above
+/// them), the successor refused them as lost, `Held`, forever, and the
+/// node never went quiet. A replay's recorded rows are kept only for the
+/// generations the log's table still lists.
+#[test]
+fn regression_long_delegated_backup_seed_3585() {
+    run_seed(3_585, long_delegated_backup_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-backup seed 3585: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-backup"
+        )
+    });
+}
+
 // ===================================================================
 // Plan 30 §M14: cross-node `flock`/`fcntl`.
 

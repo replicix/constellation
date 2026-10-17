@@ -381,6 +381,75 @@ fn a_deposed_roots_replay_names_the_delegate_rows_it_was_ordered_after() {
     assert_eq!(queued[0].deps.iter().collect::<Vec<_>>(), vec![(gen, idx)]);
 }
 
+/// A grant the stranded tenure journaled and never shipped is not a cause
+/// the replay waits for. The log never had it, and the successor
+/// allocates above the log's highest generation, so the number it issues
+/// next is this grant's own: a dependency recorded under it would be
+/// judged against the successor's unrelated stream of that number and the
+/// replay would wait for that stream to reach the index (long-delegated-
+/// backup seed 3585's review). The rows of a grant that shipped (the
+/// test above: its `Delegate` is not in the journal) stay named.
+#[test]
+fn a_replay_does_not_name_rows_of_a_grant_the_strand_undoes() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let (gen, idx) = (4, 7);
+    let dir = (2 << 40) | 9;
+    meta.apply_records_journaled(&[LogRecord::Delegate {
+        dir,
+        node: 2,
+        gen,
+        designated: false,
+        range: (0, 0),
+    }])
+    .unwrap();
+    let data = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "data".into(),
+        ino: (2 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let data_rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    assert!(meta
+        .apply_delegate_tx(
+            &[data],
+            Some(data_rid),
+            gen,
+            idx,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    let marker = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "marker".into(),
+        ino: (3 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    execute_mutate(&meta, &marker, Some(rid(1))).unwrap();
+    meta.set_holder_epoch(0);
+
+    meta.strand_below_epoch(2).unwrap();
+    let queued = meta.pending_replays().unwrap();
+    let replay = queued
+        .iter()
+        .find(|q| q.rid == rid(1))
+        .expect("the marker is queued for replay");
+    assert_eq!(
+        replay.deps.iter().collect::<Vec<_>>(),
+        Vec::<(u64, u64)>::new(),
+        "the undone grant's row is no dependency"
+    );
+}
+
 /// A late, unfenced segment tailed while this node holds unshipped work
 /// belongs *before* that work in the log: the replica must equal the
 /// segment followed by the local records, and the publish view must equal

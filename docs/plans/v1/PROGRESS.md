@@ -48553,3 +48553,75 @@ folded truncate (which inherits the truncate's deps: `as_folded` builds
 from `..op.clone()`), from the gate to the drain after the fold decision
 was taken on the gate's state; the sequencer's base check then makes a
 counted conflict copy.
+
+## Fix: a deposed root's replay does not wait for rows of a generation the log ended (long-delegated-backup seed 3585)
+
+`long-delegated-backup` seed 3585 never went quiet: node 1 kept two
+queued replays, and the cross-subtree `rename` at their head was
+answered `Held` ("deps lost with their generation") on every re-send. It
+passed on `7441c47` and failed from `05de21d` (the replay-deps fix,
+`StrandedOp::deps`).
+
+Timeline (simulated ms): node 1, the root, is paused (2935) and node 2
+takes over its tenure (4355). Resumed (about 7580), node 1 has appended
+generation 9's rows 13-14 and generation 11's row 2 into its journal,
+ends both generations itself (`end_generation`: `Recall` journaled,
+session `void_stream`/`note_void_cut` at its cursors 14 and 2) and
+executes the `rename` after them. At 7639 it learns it was deposed; the
+`Recall`s never shipped. Node 3 takes the lease (7884), inherits both
+generations from the log at cursors 12 and 1 and ends them there (7898).
+Node 1's recovery (7996) queues the `rename` by rid with `deps` `(9,13)`,
+`(11,2)` (`05de21d`). Every forward of the replay names those rows; node
+3 refuses them (`Replica::deps_lost`: past its cuts 12 and 1) with
+`Held`; node 1's `hold_for_lost_deps` asks its own replica, whose
+session still remembers the cuts it ended the generations at (14 and 2)
+and whose per-generation index counts its own unshipped rows, so the rows
+are not lost *there*, it never refreshes the deps, and the replay is
+re-sent unchanged for ever.
+
+Fix: a replay's recorded rows are kept only for the generations the
+delegation table this replica holds from the log still lists
+(`live_rows`); a generation it does not list has ended in the log (the
+rows below its cut are in the log, those above are lost) or never shipped,
+so nothing is waited for there, whatever the session remembers of it.
+`hold_for_lost_deps` refreshes a replay whenever its recorded rows name an
+unlisted generation, and records what remains owed in the replay's
+`Origin::Replay { deps }`, so the next call asks again only when another
+generation ends: every hold resolves, either the rows arrive (listed
+generation, the delegate re-streams) or the generation ends and the
+dependency stops. This replaces the lost-based filter of `05de21d`'s
+refresh (a generation lost by this session's cut), which is a special case
+of it; 2945's guarantee (a marker is not replayed before the data its
+journal held ahead of it while that data can still arrive) is kept: its
+generation is listed in the log's table.
+
+Generation numbers: a successor allocates above the log's `max_gen`, which
+is also the number a deposed root's first unshipped grant carried, so the
+two coincide every time. A row recorded under the undone grant would be
+judged, once the successor's `Delegate` of that number is applied here
+(the table then lists it), against the successor's unrelated stream of the
+number, and the replay (and with it this node's reads and publishing, via
+`has_pending_replays`) would wait for that stream to reach the index, for a
+long-lived delegation as long as it lives. So `stranded_local_deps` does
+not record rows of a generation whose `Delegate` row the same pass takes
+out of the journal (`undone_grants`, taken before the pass strands
+anything: it goes oldest first and the grant's row is gone by the time a
+later transaction is examined). It does not filter by the table at strand
+time: a shipped grant's number is in the log and never collides, and its
+unshipped `Recall` older than the transaction is rolled back only after the
+transaction is examined (the 2945 case). What remains: the delegate's
+acknowledged rows under an undone grant come back only as the delegate's own
+replays by rid, unordered against this replay (as before; plan 43 C3).
+
+Tests: `regression_long_delegated_backup_seed_3585` (sim; fails with the
+quiescence failure on `4eedfc9`), and the core test
+`a_replay_does_not_keep_rows_of_a_generation_the_log_ended_below_its_own_cut`
+(fails on `4eedfc9`: the replay keeps `(4,7)`), the meta test
+`a_replay_does_not_name_rows_of_a_grant_the_strand_undoes` and the core test
+`a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number`
+(both fail without `undone_grants`: the replay names `(4,7)` and the gate
+holds it behind the successor's stream of number 4; the simulation's
+delegations are too short-lived to reach the collision, so no seed pins
+it); the generation-5 test
+`a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one` now lists
+its live generation in the table.

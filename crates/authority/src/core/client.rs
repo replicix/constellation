@@ -359,6 +359,23 @@ fn journal_carries_outcome(replica: &dyn Replica, rid: Rid) -> bool {
         })
 }
 
+/// The rows of `streams` whose generation is live in the delegation table
+/// this replica holds from the log. A generation the table does not list
+/// has ended (its `Recall` is applied: its rows are in the log below the
+/// cut, or lost with it) or was never in the log (a deposed root's
+/// delegation that did not ship): the rows named in it can only be met or
+/// are never coming, so nobody waits for them.
+fn live_rows(streams: &Streams, replica: &dyn Replica) -> Streams {
+    let table = replica.delegation_table();
+    let mut live = Streams::NONE;
+    for (gen, idx) in streams.iter() {
+        if idx > 0 && table.iter().any(|d| d.gen == gen) {
+            live.raise(gen, idx);
+        }
+    }
+    live
+}
+
 impl Core {
     // ---- entry ----
 
@@ -635,7 +652,8 @@ impl Core {
     /// they are taken afresh — ordering after wherever the replays
     /// landed — and it proceeds. `true`: held. A replay itself is never
     /// held (the queue is what the others wait for); its own lost `deps`
-    /// are refreshed.
+    /// are refreshed, and so are the recorded rows (`StrandedOp::deps`) of
+    /// a generation the log has ended (see `live_rows`).
     pub(crate) fn hold_for_lost_deps(
         &mut self,
         now: Ms,
@@ -652,7 +670,13 @@ impl Core {
         let lost = replica.deps_lost(&c.deps);
         let replay = matches!(c.origin, Origin::Replay { .. });
         let unsettled = !replay && self.own_replays_unsettled(replica);
-        if !lost && !unsettled && !c.deps_held {
+        // A replay's recorded rows (`StrandedOp::deps`) of a generation
+        // the log has ended are not waited for either: see below.
+        let ended = match &c.origin {
+            Origin::Replay { deps, .. } => live_rows(deps, replica) != *deps,
+            _ => false,
+        };
+        if !lost && !unsettled && !c.deps_held && !ended {
             return false;
         }
         if unsettled {
@@ -673,21 +697,24 @@ impl Core {
             return true;
         }
         let mut deps = self.fresh_deps(now, replica);
-        // A replay's recorded rows of generations that are not lost stay
-        // owed: only the lost ones are replaced by the fresh session.
-        if replay {
-            let live = self.clients.get(&rid).map_or(Streams::NONE, |c| {
-                let mut live = Streams::NONE;
-                for (gen, idx) in c.deps.streams.iter() {
-                    let mut one = Position::ZERO;
-                    one.streams.raise(gen, idx);
-                    if !replica.deps_lost(&one) {
-                        live.raise(gen, idx);
-                    }
-                }
-                live
-            });
+        // A replay's recorded rows of the generations that are still live
+        // stay owed (the delegate re-streams them to the log's root, and
+        // the executor waits for them): only the rows of an ended
+        // generation are replaced by the fresh session. Which generation
+        // ended is the log's word, not this replica's own memory of it:
+        // a deposed root's session still holds the cut at which it ended
+        // the generation itself (`end_generation`, a `Recall` that was
+        // journaled and never shipped), above the one the successor's
+        // `Recall` made of it in the log, and its `deps_lost` calls the
+        // rows between them present while the executor refuses them as
+        // lost (long-delegated-backup seed 3585: `Held`, re-sent, forever).
+        let mut owed = None;
+        if let Some(Origin::Replay { deps: recorded, .. }) =
+            self.clients.get(&rid).map(|c| &c.origin)
+        {
+            let live = live_rows(recorded, replica);
             deps.streams = live.join(&deps.streams).unwrap_or(live);
+            owed = Some(live);
         }
         tracing::debug!(
             node = self.cfg.node_id,
@@ -699,6 +726,11 @@ impl Core {
         if let Some(c) = self.clients.get_mut(&rid) {
             c.deps = deps;
             c.deps_held = false;
+            // What the replay still owes is what stays recorded: the next
+            // call asks again only when another generation ends.
+            if let (Origin::Replay { deps, .. }, Some(live)) = (&mut c.origin, owed) {
+                *deps = live;
+            }
         }
         false
     }

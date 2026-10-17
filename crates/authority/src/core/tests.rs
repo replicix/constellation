@@ -22947,17 +22947,28 @@ fn the_gate_forgets_a_replay_the_log_already_settled_whatever_its_deps() {
     assert_eq!(h.core.stats.replays_held_for_stream, 0);
 }
 
-/// An op held with lost `deps` proceeds with fresh ones; a replay keeps
-/// the recorded rows of the generations that are not lost (it is still
-/// ordered after them), and drops only the lost generation's.
-#[test]
-fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
-    let (mut h, rid, q) = deposed_root_with_a_marker_replay();
-    let mut deps = constellation_meta::Streams::NONE;
-    deps.raise(4, 7);
-    deps.raise(5, 3);
-    // Generation 4 ended below row 7; generation 5 is live.
-    crate::replica::Replica::void_stream(&h.meta, 4, 0);
+/// List generation `gen` (a delegation of `dir` to node 3) in the table
+/// this replica holds from the log, as a `Delegate` record applied.
+fn list_generation(h: &Harness, dir: u64, gen: u64) {
+    h.meta
+        .apply_records_journaled(&[LogRecord::Delegate {
+            dir,
+            node: 3,
+            gen,
+            designated: false,
+            range: (0, 0),
+        }])
+        .unwrap();
+}
+
+/// Submit the marker's replay (`q`) with the recorded `deps`, as the drain
+/// does; it stays in flight (parked on a row of a live generation).
+fn submit_the_replay(
+    h: &mut Harness,
+    rid: Rid,
+    q: &constellation_meta::StrandedOp,
+    deps: constellation_meta::Streams,
+) {
     let mut out = Vec::new();
     h.core.submit(
         h.now,
@@ -22972,10 +22983,29 @@ fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
         &h.meta,
         &mut out,
     );
+}
+
+fn kept_deps(h: &Harness, rid: Rid) -> Vec<(u64, u64)> {
+    let held = h.core.clients.get(&rid).expect("the replay is in flight");
+    held.deps.streams.iter().collect()
+}
+
+/// An op held with lost `deps` proceeds with fresh ones; a replay keeps
+/// the recorded rows of the generations that are still live (it is still
+/// ordered after them), and drops only those of a generation that ended.
+#[test]
+fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
+    let (mut h, rid, q) = deposed_root_with_a_marker_replay();
+    let mut deps = constellation_meta::Streams::NONE;
+    deps.raise(4, 7);
+    deps.raise(5, 3);
+    // Generation 4 ended below row 7; generation 5 is live.
+    list_generation(&h, 1 << 40, 5);
+    crate::replica::Replica::void_stream(&h.meta, 4, 0);
+    submit_the_replay(&mut h, rid, &q, deps);
     let mut out = Vec::new();
     h.core.hold_for_lost_deps(h.now, rid, &h.meta, &mut out);
-    let held = h.core.clients.get(&rid).expect("the replay is in flight");
-    let kept: Vec<_> = held.deps.streams.iter().collect();
+    let kept = kept_deps(&h, rid);
     assert!(
         kept.contains(&(5, 3)),
         "the live generation's row: {kept:?}"
@@ -22983,5 +23013,142 @@ fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
     assert!(
         !kept.iter().any(|(g, i)| (*g, *i) == (4, 7)),
         "the lost generation's row is replaced: {kept:?}"
+    );
+}
+
+/// The successor allocates its first new generation above the log's
+/// highest, which is the number a deposed root's unshipped grant carried:
+/// once the successor's `Delegate` of that number is applied here, a row
+/// recorded under the undone grant would be a dependency on an unrelated
+/// stream, and the replay would wait for it to reach the index. The strand
+/// does not record it, so the replay runs.
+#[test]
+fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(1, None);
+    let dir = (2u64 << 40) | 9;
+    h.meta
+        .apply_records_journaled(&[LogRecord::Delegate {
+            dir,
+            node: 2,
+            gen: 4,
+            designated: false,
+            range: (0, 0),
+        }])
+        .unwrap();
+    let data = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "data".into(),
+        ino: (2 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let data_rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    assert!(h
+        .meta
+        .apply_delegate_tx(
+            &[data],
+            Some(data_rid),
+            4,
+            7,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    let marker = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "marker".into(),
+        ino: (3 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &marker,
+        Some(Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        }),
+    )
+    .unwrap();
+    h.meta.strand_below_epoch(2).unwrap();
+    h.hold(3, None);
+    // The successor's own grant of number 4 (another directory) is applied
+    // here before the drain reaches the replay.
+    list_generation(&h, (3u64 << 40) | 9, 4);
+    let queued = h.meta.pending_replays().unwrap();
+    let replay = queued
+        .iter()
+        .find(|q| q.op == marker)
+        .expect("the marker is queued");
+    assert!(replay.deps.iter().next().is_none(), "{:?}", replay.deps);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert_eq!(h.core.stats.replays_held_for_stream, 0);
+    assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
+}
+
+/// Long-delegated-backup seed 3585: a deposed root ended generations 9 and
+/// 11 itself after appending their rows (13, 14 and 2) and executed a
+/// cross-subtree rename after them; the `Recall` it journaled never
+/// shipped. Its session still holds the cut it ended them at, while the
+/// log's successor ended them lower (12 and 1). The rename's replay named
+/// the rows, this replica did not call them lost (they are below its own
+/// cut), the executor refused them as lost (`Held`), and every re-send
+/// came back the same: the replay never ran and node 1 never went quiet.
+/// A replay's recorded rows of a generation the log's table no longer
+/// lists are not waited for, whatever this session remembers of it.
+#[test]
+fn a_replay_does_not_keep_rows_of_a_generation_the_log_ended_below_its_own_cut() {
+    let (mut h, rid, q) = deposed_root_with_a_marker_replay();
+    // This replica's own memory: generation 4 ended at its cursor 7 (the
+    // rows it appended), so row 7 is not lost *here*.
+    crate::replica::Replica::note_stream(&h.meta, 4, 7);
+    crate::replica::Replica::void_stream(&h.meta, 4, 7);
+    crate::replica::Replica::note_void_cut(&h.meta, 4, 7);
+    let mut named = constellation_meta::Position::ZERO;
+    named.streams.raise(4, 7);
+    assert!(
+        !crate::replica::Replica::deps_lost(&h.meta, &named),
+        "the session's own cut does not call row 7 lost"
+    );
+    // The log's table does not list generation 4 (its successor ended it
+    // below row 7, or the delegation never shipped), and lists 5.
+    list_generation(&h, 1 << 40, 5);
+    let mut deps = constellation_meta::Streams::NONE;
+    deps.raise(4, 7);
+    deps.raise(5, 3);
+    submit_the_replay(&mut h, rid, &q, deps);
+    let kept = kept_deps(&h, rid);
+    assert!(
+        !kept.iter().any(|(g, _)| *g == 4),
+        "the replay would be re-sent naming row 7 of the ended generation, \
+         which the executor refuses as lost forever: {kept:?}"
+    );
+    assert!(
+        kept.contains(&(5, 3)),
+        "the live generation stays: {kept:?}"
+    );
+    // And when generation 5 ends too, the next re-send drops it.
+    let dir = 1 << 40;
+    h.meta
+        .apply_records_journaled(&[LogRecord::Recall { dir, gen: 5 }])
+        .unwrap();
+    let mut out = Vec::new();
+    h.core.hold_for_lost_deps(h.now, rid, &h.meta, &mut out);
+    let kept = kept_deps(&h, rid);
+    assert!(
+        !kept.iter().any(|(g, _)| *g == 4 || *g == 5),
+        "no hold outlives its generation: {kept:?}"
     );
 }

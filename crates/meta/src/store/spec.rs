@@ -965,11 +965,12 @@ fn strand_local_tx(
     first: u64,
     key: u64,
     before: &Before,
+    undone: &HashSet<u64>,
 ) -> Result<(), MetaError> {
     let Some(row) = local::get_journal_tx(&*tx, meta, first)? else {
         return Ok(());
     };
-    let deps = stranded_local_deps(&*tx, meta, first)?;
+    let deps = stranded_local_deps(&*tx, meta, first, undone)?;
     let rows = local::journal_records(&*tx, meta, first, row.last)?;
     for (seq, _) in &rows {
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
@@ -1045,13 +1046,30 @@ fn strand_local_tx(
 /// it has appended these (`reaches_streams`), as it does any forward's
 /// `deps`. A table that does not fit keeps the highest generations
 /// (the older a generation, the likelier the log has it already).
-fn stranded_local_deps(r: &impl Readable, meta: &Meta, first: u64) -> Result<Streams, MetaError> {
+///
+/// Not the generations whose grant this pass takes out of the journal too
+/// (`undone`: a `Delegate` row of the stranded tenure, never shipped): the
+/// log never had them, and a successor allocates above the log's highest
+/// number, so the number it issues next is the very one such a grant
+/// carried. A row recorded under it would be judged against the
+/// successor's unrelated stream of that number, and the replay would wait
+/// for it to reach the index. The set is taken before the pass strands
+/// anything, as the pass goes oldest first and the grant's own row is
+/// gone from the journal by the time a later transaction is examined. A
+/// shipped grant's number is in the log, so it never lands here; its
+/// unshipped `Recall` does not put it there either (the 2945 case).
+fn stranded_local_deps(
+    r: &impl Readable,
+    meta: &Meta,
+    first: u64,
+    undone: &HashSet<u64>,
+) -> Result<Streams, MetaError> {
     let mut highest: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     for (start, head) in local::read_journal_tx_heads(r, meta)? {
         if start >= first {
             break;
         }
-        if head.gen != 0 {
+        if head.gen != 0 && !undone.contains(&head.gen) {
             let e = highest.entry(head.gen).or_insert(0);
             *e = (*e).max(head.idx);
         }
@@ -1061,6 +1079,28 @@ fn stranded_local_deps(r: &impl Readable, meta: &Meta, first: u64) -> Result<Str
         deps.raise(gen, idx);
     }
     Ok(deps)
+}
+
+/// The delegation generations whose `Delegate` record sits in the journal
+/// transactions starting at `firsts` — the grants a pass that strands
+/// those transactions undoes (see [`stranded_local_deps`]).
+fn undone_grants(
+    r: &impl Readable,
+    meta: &Meta,
+    firsts: impl IntoIterator<Item = u64>,
+) -> Result<HashSet<u64>, MetaError> {
+    let mut gens = HashSet::new();
+    for first in firsts {
+        let Some(row) = local::get_journal_tx(r, meta, first)? else {
+            continue;
+        };
+        for (_, rec) in local::journal_records(r, meta, first, row.last)? {
+            if let LogRecord::Delegate { gen, .. } = rec {
+                gens.insert(gen);
+            }
+        }
+    }
+    Ok(gens)
 }
 
 // ------------------------------------------------------------- rollback
@@ -1184,6 +1224,14 @@ fn rewind_tx(
 ) -> Result<(Stranded, usize), MetaError> {
     let rows = read_rows_from(tx, &meta.spec, cutoff)?;
     let plain = meta.dirty_for_ns();
+    let undone = undone_grants(
+        &*tx,
+        meta,
+        rows.iter().filter_map(|(seq, row)| match row.kind {
+            SpecKind::Local { first, .. } if stranded.contains(seq) => Some(first),
+            _ => None,
+        }),
+    )?;
 
     // 1. Roll back, newest first, so each key ends at the value it had
     //    before the earliest rolled-back row touched it.
@@ -1200,7 +1248,9 @@ fn rewind_tx(
     let Some(ins) = insert else {
         // 3. Redo, oldest first, what still stands.
         for (seq, row) in rows {
-            redo_row_tx(tx, meta, staged, live, stranded, &mut out, false, seq, row)?;
+            redo_row_tx(
+                tx, meta, staged, live, stranded, &mut out, false, seq, row, &undone,
+            )?;
         }
         return Ok((out, skipped));
     };
@@ -1210,7 +1260,9 @@ fn rewind_tx(
         .into_iter()
         .partition(|(_, row)| matches!(row.kind, SpecKind::Foreign { .. }));
     for (seq, row) in durable {
-        redo_row_tx(tx, meta, staged, live, stranded, &mut out, true, seq, row)?;
+        redo_row_tx(
+            tx, meta, staged, live, stranded, &mut out, true, seq, row, &undone,
+        )?;
     }
 
     // 2b. The inserted segment, in the rolled-back rows' place.
@@ -1242,7 +1294,7 @@ fn rewind_tx(
     // 3. Redo, oldest first, what still stands.
     for (seq, row) in rest {
         redo_row_tx(
-            tx, meta, staged, live, stranded, &mut out, renumber, seq, row,
+            tx, meta, staged, live, stranded, &mut out, renumber, seq, row, &undone,
         )?;
     }
     Ok((out, skipped))
@@ -1262,6 +1314,7 @@ fn redo_row_tx(
     renumber: bool,
     seq: u64,
     mut row: SpecRow,
+    undone: &HashSet<u64>,
 ) -> Result<(), MetaError> {
     if stranded.contains(&seq) {
         tx.remove(&meta.spec, seq_key(seq));
@@ -1284,7 +1337,7 @@ fn redo_row_tx(
                 out.shadows += 1;
             }
             SpecKind::Local { first, .. } => {
-                strand_local_tx(tx, meta, first, row.origin, &row.before)?;
+                strand_local_tx(tx, meta, first, row.origin, &row.before, undone)?;
                 out.locals += 1;
             }
             SpecKind::Streamed { own, source, .. } => {
@@ -1525,9 +1578,12 @@ fn insert_streamed_tx(
         }
     }
     let none = HashSet::new();
+    let no_grants = HashSet::new();
     let mut out = Stranded::default();
     for (seq, row) in ahead {
-        redo_row_tx(tx, meta, staged, &live, &none, &mut out, true, seq, row)?;
+        redo_row_tx(
+            tx, meta, staged, &live, &none, &mut out, true, seq, row, &no_grants,
+        )?;
     }
     match (adopted, t.adopt) {
         (Some((seq, mut row)), Some((_, rid, op, tag))) => {
@@ -1545,7 +1601,9 @@ fn insert_streamed_tx(
                     last: t.last,
                 },
             );
-            redo_row_tx(tx, meta, staged, &live, &none, &mut out, true, seq, row)?;
+            redo_row_tx(
+                tx, meta, staged, &live, &none, &mut out, true, seq, row, &no_grants,
+            )?;
         }
         (None, None) => {
             let capture = Capture::new();
@@ -1590,7 +1648,9 @@ fn insert_streamed_tx(
         }
     }
     for (seq, row) in behind {
-        redo_row_tx(tx, meta, staged, &live, &none, &mut out, true, seq, row)?;
+        redo_row_tx(
+            tx, meta, staged, &live, &none, &mut out, true, seq, row, &no_grants,
+        )?;
     }
     Ok(())
 }
@@ -2063,7 +2123,9 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
         }
     }
     counter_set_tx(tx, &meta.local, KV_SPEC_LIVE_COUNT, 0);
-    for (first, row) in local::read_journal_txs(&*tx, meta)? {
+    let journal = local::read_journal_txs(&*tx, meta)?;
+    let undone = undone_grants(&*tx, meta, journal.iter().map(|(first, _)| *first))?;
+    for (first, row) in journal {
         let (key, before) = match row.spec_seq {
             Some(seq) => match tx.get(&meta.spec, seq_key(seq))? {
                 Some(v) => {
@@ -2074,7 +2136,7 @@ pub(crate) fn reset_for_rebuilt_ns_tx(
             },
             None => (next_spec_seq_tx(tx, &meta.local)?, Vec::new()),
         };
-        strand_local_tx(tx, meta, first, key, &before)?;
+        strand_local_tx(tx, meta, first, key, &before, &undone)?;
     }
     // Every journaled transaction is gone now: drop every row.
     let from = journal_from(tx, meta)?;
