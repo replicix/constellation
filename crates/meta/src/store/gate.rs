@@ -309,7 +309,9 @@ fn parse_store_stall(text: &str) -> Option<StoreStall> {
             spec.pid = Some(p.parse().ok()?);
             continue;
         }
-        let p = w.strip_prefix("caller=").filter(|_| spec.caller.is_none())?;
+        let p = w
+            .strip_prefix("caller=")
+            .filter(|_| spec.caller.is_none())?;
         spec.caller = Some(p.parse().ok()?);
     }
     (ms > 0).then_some(spec)
