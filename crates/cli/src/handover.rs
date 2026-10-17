@@ -119,7 +119,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The handoff's format: an old and a new binary must agree on it
 /// (`daemon --handover-abi`). Since the maintainer's rule (2026-10-03) it
@@ -614,32 +614,36 @@ fn unread_rollback(text: &str) -> Result<(RawFd, Vec<u8>), String> {
 /// Run `binary --handover-abi` (bounded) and check it speaks this
 /// handover.
 fn preflight(binary: &Path) -> Result<(), String> {
-    let mut child = std::process::Command::new(binary)
+    preflight_within(binary, Duration::from_secs(30))
+}
+
+/// What `binary` may print before the preflight stops caring: the last 64
+/// KiB are kept (the answer is a line of JSON), the rest is read and
+/// dropped so that no output, however long, blocks the binary.
+const PREFLIGHT_KEEP: usize = 64 << 10;
+
+fn preflight_within(binary: &Path, within: Duration) -> Result<(), String> {
+    let child = std::process::Command::new(binary)
         .args(["daemon", "--handover-abi"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("{} does not run: {e}", binary.display()))?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{} --handover-abi did not answer",
-                    binary.display()
-                ));
-            }
-        }
+    // The binary is whatever the operator named: its stdout is read while
+    // it runs. Reading it only after the exit hung a binary that printed
+    // more than a pipe holds (64 KiB, or 8 KiB on a host with many pipes)
+    // until the deadline, and reported it as not answering.
+    let done = constellation_platform::drain::DrainedChild::with_keep(child, PREFLIGHT_KEEP)
+        .finish(within)
+        .map_err(|e| format!("{} --handover-abi: {e}", binary.display()))?;
+    if done.timed_out {
+        return Err(format!(
+            "{} --handover-abi did not answer",
+            binary.display()
+        ));
     }
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut out);
-    }
+    let out = String::from_utf8_lossy(&done.output.stdout).into_owned();
     let abi: serde_json::Value = serde_json::from_str(out.trim()).map_err(|_| {
         format!(
             "{} does not support in-place upgrades (no --handover-abi)",
@@ -1462,6 +1466,55 @@ mod tests {
         assert_eq!(get(), 0);
         set_cloexec(fd, true).unwrap();
         assert_ne!(get(), 0);
+    }
+
+    /// A `binary` that is a script printing `body` for `daemon
+    /// --handover-abi`, preflighted with `within`.
+    fn preflight_script(body: &str, within: Duration) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("constellation");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread forking while the script was open for
+        // writing holds it for an instant: exec answers ETXTBSY then.
+        for _ in 0..50 {
+            match preflight_within(&bin, within) {
+                Err(e) if e.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                other => return other,
+            }
+        }
+        panic!("the script stayed busy");
+    }
+
+    #[test]
+    fn the_preflight_accepts_a_binary_that_speaks_this_handover() {
+        let body = format!("echo '{{\"handover\": {HANDOVER_VERSION}}}'");
+        assert_eq!(preflight_script(&body, Duration::from_secs(30)), Ok(()));
+        let body = format!("echo '{{\"handover\": {}}}'", HANDOVER_VERSION + 1);
+        let err = preflight_script(&body, Duration::from_secs(30)).unwrap_err();
+        assert!(err.contains("speaks handover version"), "{err}");
+    }
+
+    #[test]
+    fn the_preflight_gives_up_on_a_binary_that_never_answers() {
+        let err = preflight_script("exec sleep 60", Duration::from_millis(500)).unwrap_err();
+        assert!(err.contains("did not answer"), "{err}");
+    }
+
+    /// A binary that prints far more than a pipe holds, then exits, is
+    /// told apart from one that hangs: it answered, and not with an ABI.
+    /// (The preflight read its stdout only after the exit, so it blocked
+    /// the binary on a full pipe and waited out the whole deadline.)
+    #[test]
+    fn the_preflight_is_not_blocked_by_a_chatty_binary() {
+        let t = std::time::Instant::now();
+        let err =
+            preflight_script("head -c 300000 /dev/zero", Duration::from_secs(60)).unwrap_err();
+        assert!(err.contains("does not support in-place upgrades"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(30), "{:?}", t.elapsed());
     }
 
     #[test]

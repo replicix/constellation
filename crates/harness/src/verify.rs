@@ -1711,33 +1711,17 @@ pub fn backtraces(pid: u32) -> String {
     out
 }
 
+/// `argv` with a deadline: its stdout, as far as it got (the process is
+/// killed at `bound`). Both pipes are read while it runs: gdb and eu-stack
+/// are chatty on stderr, and a full pipe would block them until the bound.
 fn run_bounded(argv: &[&str], bound: Duration) -> Option<String> {
-    let mut child = std::process::Command::new(argv[0])
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    let mut cmd = std::process::Command::new(argv[0]);
+    cmd.args(&argv[1..]).stdin(std::process::Stdio::null());
+    let done = constellation_platform::drain::DrainedChild::spawn(&mut cmd)
+        .ok()?
+        .finish(bound)
         .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = std::io::Read::read_to_string(&mut stdout, &mut s);
-        s
-    });
-    let t = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if t.elapsed() < bound => std::thread::sleep(Duration::from_millis(100)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    reader.join().ok()
+    Some(String::from_utf8_lossy(&done.output.stdout).into_owned())
 }
 
 /// Abort the FUSE connection of the mount at `mnt` (its blocked callers
@@ -1880,6 +1864,24 @@ mod tests {
         // A short payload is its header alone.
         let short = payload(&id, 1);
         assert_eq!(check_payload(&short), Ok(id));
+    }
+
+    /// A tool that writes more to stderr than a pipe holds (gdb does) is
+    /// not blocked by it: `run_bounded` used to read only stdout, so such
+    /// a tool sat in `write(2)` until the bound killed it and the
+    /// backtrace was lost.
+    #[test]
+    fn run_bounded_reads_stderr_too() {
+        let t = Instant::now();
+        let got = run_bounded(
+            &["sh", "-c", "head -c 300000 /dev/zero >&2; echo backtrace"],
+            Duration::from_secs(60),
+        );
+        assert_eq!(got.as_deref(), Some("backtrace\n"));
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "it ran into its bound"
+        );
     }
 
     #[test]

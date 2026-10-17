@@ -400,8 +400,17 @@ mod tests {
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            std::io::Write::write_all(&mut c.stdin.take().unwrap(), script.as_bytes()).unwrap();
+            // Fed from a thread of its own: a script longer than the pipe
+            // (8 KiB on a host with many pipes) must not block this end
+            // while `sh` blocks on writing its output, which is only read
+            // below.
+            let mut stdin = c.stdin.take().unwrap();
+            let script = script.to_string();
+            let feeder = std::thread::spawn(move || {
+                std::io::Write::write_all(&mut stdin, script.as_bytes())
+            });
             let out = c.wait_with_output().unwrap();
+            feeder.join().unwrap().unwrap();
             assert!(
                 out.status.success(),
                 "{}",

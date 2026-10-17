@@ -650,7 +650,10 @@ impl Client {
         self.state.join("meta.db")
     }
 
-    pub fn gc_process(&self) -> Result<Child> {
+    /// `gc run` as a child whose stdout and stderr are read while it runs:
+    /// a GC round logs more than a pipe holds (8 KiB on a host with many
+    /// pipes), and a parent that waits for it first would wait for ever.
+    pub fn gc_process(&self) -> Result<constellation_platform::drain::DrainedChild> {
         // "/" is a placeholder TARGET positional (plan 21): unregistered,
         // so `--s3`/`--state-dir` below are what actually get used.
         let args = vec![
@@ -662,11 +665,12 @@ impl Client {
             "--state-dir",
             self.state.to_str().unwrap(),
         ];
-        Ok(self
+        let child = self
             .cmd(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn_tied()?)
+            .spawn_tied()?;
+        Ok(constellation_platform::drain::DrainedChild::new(child))
     }
 
     pub fn gc_run(&self) -> Result<std::process::Output> {

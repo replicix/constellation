@@ -47,6 +47,11 @@
 //! `constellation_platform::native()` for the engine's injected bundle
 //! (grep for it). New engine code should not add more of them.
 //!
+//! [`drain`] is not a host service either: it is how code that runs a
+//! child reads the child's piped output while the child runs, so that a
+//! pipe the host made small (Linux does that under pressure) cannot
+//! block it.
+//!
 //! The Linux/FUSE-only helpers that are not host services in the
 //! cross-platform sense — the privileged `/dev/fuse` mount
 //! ([`linux::fuse_mount_fd`]), and the `/proc` text parsers — are free
@@ -54,6 +59,7 @@
 
 pub mod daemon;
 pub mod dirs;
+pub mod drain;
 pub mod fs;
 pub mod lifecycle;
 pub mod lock;

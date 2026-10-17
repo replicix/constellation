@@ -7,9 +7,10 @@
 //! mountpoint (a path that does not exist), so no FUSE is needed: by then
 //! the daemon has taken the state dir it serves (`daemon.lock`).
 
+use constellation_platform::drain::{small_stdio_pipes, DrainedChild};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// nextest remaps binary paths when a test runs from an extracted archive
 /// (`--archive-file`/`--extract-to`): it exposes the remapped path as
@@ -28,28 +29,29 @@ fn bin() -> &'static str {
 /// A `constellation` with its registry, config, data and runtime dirs in
 /// `dir`, and no P2P endpoint.
 fn constellation(dir: &Path, args: &[&str]) -> Output {
-    let mut child = Command::new(bin())
-        .args(args)
+    let mut cmd = Command::new(bin());
+    // Deterministically what a loaded host gives every new pipe (8 KiB
+    // past `pipe-user-pages-soft`): `mount` writes ~19 KiB to stderr, and
+    // a parent that waits for the exit before it reads the pipe hangs.
+    small_stdio_pipes(&mut cmd, 4096);
+    cmd.args(args)
         .env("CONSTELLATION_REGISTRY", dir.join("config/registry.toml"))
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_RUNTIME_DIR", dir.join("run"))
         .env("CONSTELLATION_P2P", "off")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stdin(Stdio::null());
     // A mount that unexpectedly succeeds serves in the foreground for good.
-    let t = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if t.elapsed() > Duration::from_secs(120) {
-            let _ = child.kill();
-            panic!("constellation {args:?} still running after 120 s");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    child.wait_with_output().unwrap()
+    let done = DrainedChild::spawn(&mut cmd)
+        .unwrap()
+        .finish(Duration::from_secs(120))
+        .unwrap();
+    assert!(
+        !done.timed_out,
+        "constellation {args:?} still running after 120 s; stderr:\n{}",
+        String::from_utf8_lossy(&done.output.stderr)
+    );
+    done.output
 }
 
 fn p(path: &Path) -> &str {

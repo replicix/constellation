@@ -875,9 +875,8 @@ fn git_within(
     args: &[&str],
     within: Duration,
 ) -> Result<std::process::Output> {
-    use std::io::Read;
     use std::process::Stdio;
-    let mut child = Command::new("git")
+    let child = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(GIT_CONFIG)
@@ -890,38 +889,18 @@ fn git_within(
         .stderr(Stdio::piped())
         .spawn_tied()
         .with_context(|| format!("running git {args:?}"))?;
-    let mut out = child.stdout.take().unwrap();
-    let mut err = child.stderr.take().unwrap();
-    let out_t = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = out.read_to_end(&mut v);
-        v
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err.read_to_end(&mut v);
-        v
-    });
-    let t = Instant::now();
-    let status = loop {
-        if let Some(s) = child.try_wait()? {
-            break s;
-        }
-        if t.elapsed() > within {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "git {args:?} in {} did not finish within {within:?}",
-                repo.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    Ok(std::process::Output {
-        status,
-        stdout: out_t.join().unwrap_or_default(),
-        stderr: err_t.join().unwrap_or_default(),
-    })
+    // Both pipes are read while git runs (a `ls-tree -r` of a big tree
+    // is far more than a pipe holds), and all of it is kept: the
+    // callers parse the listing whole.
+    let done =
+        constellation_platform::drain::DrainedChild::with_keep(child, usize::MAX).finish(within)?;
+    if done.timed_out {
+        bail!(
+            "git {args:?} in {} did not finish within {within:?}",
+            repo.display()
+        );
+    }
+    Ok(done.output)
 }
 
 /// UTC time of day (`HH:MM:SS.mmmZ`), to line a finding up with the

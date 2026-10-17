@@ -20,8 +20,10 @@
 //! Needs FUSE (`/dev/fuse`, `fusermount3`); skipped, loudly, without it.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use constellation_platform::drain::{small_stdio_pipes, DrainedChild};
 
 /// nextest remaps binary paths when a test runs from an extracted archive
 /// (`--archive-file`/`--extract-to`): it exposes the remapped path as
@@ -46,13 +48,17 @@ fn fuse_available() -> bool {
 
 /// A `constellation` with its registry, config, data and runtime dirs in
 /// `dir`, no P2P endpoint, the drain held while `hold` exists and the
-/// sync rounds (the write-back uploads) while `hold` + `-sync` does.
-fn command(dir: &Path, hold: &Path, args: &[&str]) -> Command {
+/// sync rounds (the write-back uploads) while `hold` + `-sync` does. Its
+/// stdout and stderr are read while it runs ([`DrainedChild`]), over
+/// pipes of 4 KiB: what a loaded host gives every new pipe, so a parent
+/// that read them only after the exit would hang on a chatty child.
+fn command(dir: &Path, hold: &Path, args: &[&str]) -> DrainedChild {
     command_env(dir, hold, args, &[])
 }
 
-fn command_env(dir: &Path, hold: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
+fn command_env(dir: &Path, hold: &Path, args: &[&str], env: &[(&str, &str)]) -> DrainedChild {
     let mut cmd = Command::new(bin());
+    small_stdio_pipes(&mut cmd, 4096);
     cmd.envs(env.iter().copied());
     cmd.args(args)
         .env("CONSTELLATION_REGISTRY", dir.join("config/registry.toml"))
@@ -63,36 +69,46 @@ fn command_env(dir: &Path, hold: &Path, args: &[&str], env: &[(&str, &str)]) -> 
         .env("CONSTELLATION_FAULT_HOLD_DRAIN_FILE", hold)
         .env("CONSTELLATION_FAULT_HOLD_SYNC_FILE", sync_hold(hold))
         .env_remove("CONSTELLATION_NO_DAEMONIZE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd
+        .stdin(Stdio::null());
+    DrainedChild::spawn(&mut cmd).unwrap()
 }
 
 fn sync_hold(hold: &Path) -> PathBuf {
     PathBuf::from(format!("{}-sync", hold.display()))
 }
 
-fn finish(mut child: Child, what: &str, within: Duration) -> Output {
-    let t = Instant::now();
-    while child.try_wait().unwrap().is_none() {
-        if t.elapsed() > within {
-            let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
-            panic!(
-                "{what} still running after {within:?}; stderr: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    child.wait_with_output().unwrap()
+fn finish(child: DrainedChild, what: &str, within: Duration) -> Output {
+    let done = child.finish(within).unwrap();
+    assert!(
+        !done.timed_out,
+        "{what} still running after {within:?}; stderr: {}",
+        String::from_utf8_lossy(&done.output.stderr)
+    );
+    done.output
+}
+
+/// `finish` returns a child that writes far more than a pipe holds (here
+/// 4 KiB): it used to poll `try_wait` and read the pipes only after the
+/// exit, which a full pipe never lets come. Needs no FUSE.
+#[test]
+fn finish_reads_a_child_that_writes_more_than_its_pipes_hold() {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg("head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2; echo done");
+    small_stdio_pipes(&mut cmd, 4096);
+    let out = finish(
+        DrainedChild::spawn(&mut cmd).unwrap(),
+        "a chatty child",
+        Duration::from_secs(60),
+    );
+    assert!(out.status.success());
+    assert_eq!(out.stdout.len(), 300_000 + "done\n".len());
+    assert_eq!(out.stderr.len(), 300_000);
 }
 
 fn run(dir: &Path, hold: &Path, args: &[&str]) -> Output {
-    let child = command(dir, hold, args).spawn().unwrap();
     finish(
-        child,
+        command(dir, hold, args),
         &format!("constellation {args:?}"),
         Duration::from_secs(180),
     )
@@ -241,7 +257,7 @@ fn umount_waits_for_the_drain_and_a_mount_meanwhile_waits_too() {
     // The drain will wait until the hold file is gone.
     std::fs::write(&hold, b"").unwrap();
     let held_marker = PathBuf::from(format!("{}.held", hold.display()));
-    let umount = command(dir, &hold, &["umount", "myfs"]).spawn().unwrap();
+    let umount = command(dir, &hold, &["umount", "myfs"]);
     wait_until(
         "the daemon's drain to start",
         Duration::from_secs(60),
@@ -257,9 +273,7 @@ fn umount_waits_for_the_drain_and_a_mount_meanwhile_waits_too() {
     );
 
     // A mount now must wait for the drain, not fail and not attach.
-    let mut remount = command(dir, &hold, &["mount", "myfs", p(&mnt)])
-        .spawn()
-        .unwrap();
+    let mut remount = command(dir, &hold, &["mount", "myfs", p(&mnt)]);
     std::thread::sleep(Duration::from_secs(5));
     assert!(
         remount.try_wait().unwrap().is_none(),
@@ -359,7 +373,7 @@ fn umount_fails_when_the_drain_cannot_ship_everything() {
     let lost_hex = constellation_fs_core::ChunkHash::of(&lost).to_hex();
     let env = [("CONSTELLATION_FAULT_LOSE_CHUNKS", lost_hex.as_str())];
     let run_env = |args: &[&str]| {
-        let child = command_env(dir, &hold, args, &env).spawn().unwrap();
+        let child = command_env(dir, &hold, args, &env);
         finish(
             child,
             &format!("constellation {args:?}"),
@@ -440,7 +454,7 @@ fn umount_waits_for_a_view_still_in_use() {
     );
     write_files(&mnt);
     let open = std::fs::File::open(mnt.join("d/f0")).unwrap();
-    let mut umount = command(dir, &hold, &["umount", "myfs"]).spawn().unwrap();
+    let mut umount = command(dir, &hold, &["umount", "myfs"]);
     std::thread::sleep(Duration::from_secs(8));
     assert!(
         umount.try_wait().unwrap().is_none(),
@@ -513,7 +527,7 @@ fn a_second_umount_waits_for_a_drain_in_progress() {
         Duration::from_secs(60),
         || held_marker.exists(),
     );
-    let mut again = command(dir, &hold, &["umount", "myfs"]).spawn().unwrap();
+    let mut again = command(dir, &hold, &["umount", "myfs"]);
     std::thread::sleep(Duration::from_secs(3));
     assert!(
         again.try_wait().unwrap().is_none(),

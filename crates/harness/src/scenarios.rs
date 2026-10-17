@@ -2475,23 +2475,27 @@ fn gc_dedup_race(_seed: u64) -> Result<()> {
 /// then is killed and its output reported, rather than the scenario
 /// hanging on it.
 fn gc_run_bounded(client: &Client, deadline: Duration) -> Result<std::process::Output> {
-    let mut child = client.gc_process()?;
-    let start = std::time::Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
-        }
-        if start.elapsed() > deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            anyhow::bail!(
-                "gc run did not finish within {deadline:?}; killed. stdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    bounded_output(client.gc_process()?, "gc run", deadline)
+}
+
+/// `child`'s output once it exits; if it has not by `deadline` it is
+/// killed and reported. Its pipes are read while it runs (the child is a
+/// [`constellation_platform::drain::DrainedChild`]), so a chatty child
+/// is never what keeps it from finishing.
+fn bounded_output(
+    child: constellation_platform::drain::DrainedChild,
+    what: &str,
+    deadline: Duration,
+) -> Result<std::process::Output> {
+    let done = child.finish(deadline)?;
+    if done.timed_out {
+        anyhow::bail!(
+            "{what} did not finish within {deadline:?}; killed. stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&done.output.stdout),
+            String::from_utf8_lossy(&done.output.stderr)
+        );
     }
+    Ok(done.output)
 }
 
 /// Object keys under `prefix` (one LIST page; the scenarios below list a
@@ -12421,6 +12425,47 @@ fn inbox_holder_takeover_pending_batch(_seed: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use constellation_platform::drain::{small_stdio_pipes, DrainedChild};
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn sh(script: &str) -> DrainedChild {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script);
+        // What a host with many pipes gives every new one, on any host.
+        small_stdio_pipes(&mut cmd, 4096);
+        DrainedChild::spawn(&mut cmd).unwrap()
+    }
+
+    /// A `gc run` that logs more than its pipes hold finishes (the plan 31
+    /// gate saw `log-retention-gap-*` killed after 120 s with exactly
+    /// 8192 bytes of its stdout recorded).
+    #[test]
+    fn a_gc_run_that_logs_more_than_a_pipe_holds_finishes() {
+        let out = super::bounded_output(
+            sh("head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2"),
+            "gc run",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 300_000));
+    }
+
+    #[test]
+    fn a_gc_run_past_its_deadline_is_killed_and_reported_with_its_output() {
+        let err = super::bounded_output(
+            sh("echo so far; echo trouble >&2; exec sleep 60"),
+            "gc run",
+            Duration::from_millis(500),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("gc run did not finish within"), "{err}");
+        assert!(err.contains("stdout:\nso far\n"), "{err}");
+        assert!(err.contains("stderr:\ntrouble\n"), "{err}");
+    }
+
     #[test]
     fn a_convergence_failure_names_its_path() {
         let err = "convergence not reached within 60s after write_full_duel:wf293: \
