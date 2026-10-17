@@ -860,6 +860,24 @@ seal path, `on_deleg_sealed`, before the end).
    suffix follows) with `through` (C1); its session effect (`owe`) is
    unchanged.
 
+**Design inputs found before C3 started (2026-10-17).** Two shapes the
+pre-C3 fixes left open, which C3's re-ship must close: (1) on the rebuild
+path (`recover_deposed` → `RebuildReplica` → `reset_for_rebuilt_ns_tx`)
+a deposed root's appended delegate rows become `Records` copies queued
+*behind* a dependent op with empty deps, so its own queue can land a
+marker before its data (the 2945 symptom via the copies); (2) a
+delegate's acknowledged rows under a grant the deposed root never shipped
+come back only as the delegate's own replays by rid, unordered against
+the root's dependent replay. For a never-shipped generation the root's
+appended copies are the natural carrier and sit ahead of the dependent op
+in journal order: C3's verbatim re-ship keeps that order, and the
+delegate's replays of the same rids then dedup. Also: nothing of a node
+may execute on its replica between a takeover's strand and the end of its
+re-ship (a delegate fast-path write landed in that window, `f7`); C3
+step 1 must keep the fence the stopgap adds (own generations marked
+stranded in the strand transaction, `begin_local` answering
+`NotAdmitted`), since C3 deletes `mark_deleg_stranded_tx` as written.
+
 ### 5.5 C4: lock and delegation state in the log
 
 **Delegation state.** The generation's start (`Delegate`), group
