@@ -775,6 +775,7 @@ impl constellation_net::PeerService for P2pBridge {
                 holder,
                 epoch,
                 constellation_store_s3::lease::now_unix_ms(),
+                0,
             );
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
@@ -846,7 +847,8 @@ impl constellation_net::PeerService for P2pBridge {
             return false;
         }
         if listed {
-            self.off_core.note_holder_heard(holder, epoch, now);
+            self.off_core
+                .note_holder_heard(holder, epoch, now, beat.expires_unix_ms);
         }
         let _ = self.urgent.send(sync::SyncRequest::PeerHolderAlive {
             holder,

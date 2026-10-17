@@ -49064,3 +49064,76 @@ shape. Both fixes survive C1 to C4 as rules ("an op's hold for the node's
 replays covers only the entries ordered before its own"; "the write gate never
 refuses because the lease is lost, and the core never forwards a node's op
 ahead of its own stranded writes").
+## Fix: a backup sealed a live holder at the edge of its lease (host load, `snapsched`)
+
+Harness `snapsched` under a host load of about 43 had a backup seal the
+epoch of a holder that was renewing its lease (`holder silent ...
+silent_ms=3226 attentive_ms=3226 window_ms=1500`). Nothing was lost (the
+seal fenced), but load produced a failover, not latency. The snapshot bug
+this seal exposed is the `snap-head` entry above.
+
+### Mechanism
+
+- The holder's core held up 6.7 s in one step (the host did not run it: no
+  store wait, no sync), so its 10 s lease, renewed when 5 s are left, was
+  not renewed in time and the expiry its beats named came within the 1 s
+  expiry margin.
+- The backup's runtime lapsed 2.9 s in the same stretch, and the liveness
+  lane to the holder broke meanwhile (the holder's beat runtime closed the
+  connection to the frozen peer and re-dialed): nothing reached the
+  backup's peer service for 3.2 s, and no backlog of beats followed.
+- Its core was 14 s behind on its urgent lane (a store write held its
+  step), so `known_expiry`, fed only by beats the core had handled, named
+  an expiry long renewed past; `lag_discount` is `None` past or inside the
+  margin by design (silence at the expiry may be the lease ending), so the
+  watch counted plain silence, read the lease, found it unexpired and still
+  listing the backup, and `on_takeover_get` sealed on that silence.
+- The margin's purpose (a listed backup seals and claims inside the 2T
+  grace past an expiry) is met by the read (the margin, R5) and by an
+  expired object sealing. Letting plain silence seal an *unexpired* object
+  only threw away the backup's own lapse, the one thing F2's discounts see.
+
+### Fix
+
+- `Core::on_takeover_get`: the margin and R5 decide when the watch reads;
+  an unexpired object that still lists this node is sealed only if the
+  holder's silence in this node's attentive time
+  (`after_own_lapses(last_heard, T, true)`, plain with
+  `liveness_lag_aware` off) is a window or more. Heard within it: the
+  object's expiry is noted and the watch re-armed a window out, no later
+  than that expiry (`watch_due_by_expiry`), where it reads again and an
+  expired object seals. Seals only get later (ADR-12). A dead holder's
+  backup still reads the lease where it did; with an expiry known, the seal
+  comes within F2's bound or at the expiry at worst (inside the margin: at
+  most 1 s later, inside the 2T claim grace). With no expiry known (no beat
+  named one, no read of the tenure) the read still comes within 1.5 windows
+  of the last word, but the seal is now bounded by the object's expiry
+  while the backup keeps lapsing, so such a backup can take up to the
+  lease's remaining TTL to fail over a dead holder (still inside the claim
+  grace past it).
+- Hygiene: the peer service notes the expiry a beat names with its arrival
+  stamp (`OffCore::heard` is `(epoch, arrival, expiry)`, `hand_heard` hands
+  it in the unnumbered `HolderAlive`, `Core::note_beat` takes an expiry
+  from a seq 0 arrival), so `known_expiry` is as fresh as the stamps
+  however far behind the core is.
+- Docs: "Seal-based failover" step 1 and "Silence under host load" (the
+  margin paragraph and the stamps), the doc comments of `on_backup_watch`, `lag_discount`, `note_beat` and
+  `takeover_read_for_expiry`.
+
+### Tests
+
+- Core `a_lapse_inside_the_expiry_margin_does_not_seal_an_unexpired_lease`
+  (both sub-cases: renewed, not renewed): fails on `main` ("sealed a live
+  holder on this node's own lapse"), passes with the fix.
+- Core `an_arrival_handed_over_with_the_expiry_it_named_moves_the_known_expiry`
+  and `a_renewal_named_by_an_arrival_keeps_the_watch_from_reading_at_the_old_expiry`
+  fail without the stamps' expiry; engine
+  `the_seal_watch_is_handed_the_holders_latest_arrival` covers the tuple.
+- Sim `backup-lag-in-margin` (new knob `beats_lost_in_lag`: the beats sent
+  to a node while its runtime lags are lost, as when the lane is re-dialed):
+  65 of 2000 seeds seal a live holder on `main`, 0 with the fix; its
+  `-unaware` twin deposes it in 743 of 2000; the `-cut` twin (the holder
+  truly cut from S3) seals in time in every seed. The sim's lag stamps carry
+  the highest expiry the queued beats named, as the bridge's do, and the
+  beats' loss ends with the lag. Test
+  `a_backup_frozen_with_its_holders_lease_at_the_margin_does_not_seal_it`.

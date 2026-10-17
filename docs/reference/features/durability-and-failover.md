@@ -172,7 +172,12 @@ A backup that has heard nothing from its holder for
    stops acting a margin before its expiry, so what reached the backup
    then was sent before (the backlog of a stall of the backup's own
    runtime), and waiting another window would miss the claim grace
-   below. A backup the lease no longer lists was removed by
+   below. A lease that has not expired and lists the backup continues
+   only if the holder's silence, measured in the backup's attentive
+   time (its own lapses discounted), is still a window or more;
+   otherwise the holder is given a window again, no later than the
+   lease's expiry, where the lease is read again ("Silence under host
+   load" below). A backup the lease no longer lists was removed by
    a live holder (which stops appending once the removal lands, so the
    backup hears silence): it gives its role and tail up **without
    sealing**, and the holder may invite it back as a candidate in the
@@ -322,12 +327,17 @@ Three things make such lag cost latency only:
 Each beat also names the expiry of the lease it beats for, and the
 beats stop there (the backup takes the later of that and its own last
 read of the lease object: both lower bounds, so they end the discount
-early, never late). Within the expiry margin of that expiry the watch
-counts plain silence again, as it always did: silence there is the lease
-ending (a holder cut from S3 that could not renew), and a listed backup
-must then seal and claim within the 3 s (twice the window) during which
-nobody else may claim a `Backup` lease past its expiry — its tail holds
-what the holder acknowledged but did not ship.
+early, never late). The daemon's peer service notes that expiry with the
+beat's arrival stamp, so the backup knows the latest expiry any beat
+named even when its core is seconds behind on the beats themselves.
+Within the expiry margin of that expiry the watch counts plain silence
+again and reads the lease, as it always did: silence there may be the
+lease ending (a holder cut from S3 that could not renew), and a listed
+backup must then seal and claim within the 3 s (twice the window) during
+which nobody else may claim a `Backup` lease past its expiry — its tail
+holds what the holder acknowledged but did not ship. The margin decides
+when the watch *reads*, not whether an unexpired lease is *sealed* (next
+paragraph).
 
 Once that expiry has passed, the watch reads the lease at once, however
 recently it heard the holder (it also looks at the expiry itself, not
@@ -339,14 +349,32 @@ claim grace, and another node's claim took the lease over from a log
 without the backup's tail. The lease object decides: expired and still
 listing the backup, its epoch is sealed (also when the holder was heard
 during the read: that is the backlog, the holder stops acting a margin
-before its expiry); renewed (what the backup knew was older), a window
-again; moved on, the role ends. What remains: a backup that knows no
-expiry for the tenure at all — no beat named it, and it has not read the
-lease since the holder took it — counts plain silence from its last
-credit, and keeps the claim grace only for a lapse that ends less than a
-window past the expiry. That takes the liveness lane broken for the
-whole tenure, the holder cut from S3 for a TTL, and a lapse of the
-backup's own at the expiry.
+before its expiry); unexpired and still listing it, the holder's silence
+is judged in the backup's attentive time (its own lapses discounted, a
+window plus their length at most; the window is the plain T here, without
+the late-beat extension, which the margin ends), and a holder heard
+within a window of that is given a window again, no later than the
+lease's expiry, where the watch reads again and an expired lease is
+sealed; moved on, the role ends. So a backup frozen with its holder's
+lease at the margin does not seal it: on 2026-10-16 `snapsched` under a
+host load of 43, the holder's core was held up 6.7 s (no renewal, its
+10 s lease inside the margin) while the backup's runtime lapsed 2.9 s
+with the liveness lane to it broken, and the backup, counting plain
+silence (`silent_ms=3226 attentive_ms=3226`), sealed a live holder. A
+seal is only ever delayed by this (ADR-12), and inside the margin the
+worst case moves from at once to at the expiry, at most the margin (1 s)
+later and still inside the claim grace. What remains: a backup that
+knows no expiry for the tenure at all — no beat named it, and it has not
+read the lease since the holder took it — counts plain silence from its
+last credit, and keeps the claim grace only for a lapse that ends less
+than a window past the expiry. That takes the liveness lane broken for
+the whole tenure, the holder cut from S3 for a TTL, and a lapse of the
+backup's own at the expiry. Such a backup still reads the lease within
+1.5 windows of the holder's last word, as before; but what it reads now
+bounds the seal by the lease's expiry while the backup keeps lapsing,
+where it used to seal at once, so it can take up to the lease's
+remaining TTL to fail over a dead holder (still inside the claim grace
+past that expiry).
 
 So a dead holder's backup reads the lease to seal it **at most five
 windows (7.5 s at the defaults) into the silence, counted in the time the

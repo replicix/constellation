@@ -268,6 +268,8 @@ pub struct NodeEnv {
     pub holder_beats: super::run::HolderBeats,
     /// See `SimConfig::timers_first_after_lag`.
     pub timers_first_after_lag: bool,
+    /// See `SimConfig::beats_lost_in_lag`.
+    pub beats_lost_in_lag: bool,
 }
 
 impl NodeEnv {
@@ -384,6 +386,7 @@ impl NodeHandle {
             lag_queue: Vec::new(),
             lag_pending: None,
             stamps_first: !env.timers_first_after_lag,
+            beats_lost_in_lag: env.beats_lost_in_lag,
         };
         let task = tokio::spawn(driver.run());
         if env.holder_beats != super::run::HolderBeats::Off {
@@ -574,6 +577,8 @@ struct Driver {
     /// After a lag, what the daemon's P2P handlers stamped meanwhile goes
     /// to the core before the timers ([`Driver::finish_lag`]).
     stamps_first: bool,
+    /// See `SimConfig::beats_lost_in_lag`.
+    beats_lost_in_lag: bool,
 }
 
 /// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
@@ -660,6 +665,12 @@ fn outcome_of(
 /// longest), as opposed to the node's own timers and IO completions.
 fn from_a_peer(event: &Event) -> bool {
     matches!(event, Event::Peer { .. } | Event::HolderAlive { .. })
+}
+
+/// A beat of the holder's off-core heartbeat (numbered; an unnumbered one
+/// is the driver's own hand-over of an arrival stamp).
+fn is_numbered_beat(event: &Event) -> bool {
+    matches!(event, Event::HolderAlive { seq, .. } if *seq != 0)
 }
 
 /// The off-core heartbeat (`holder_alive_loop` in the daemon): every
@@ -1060,6 +1071,20 @@ impl Driver {
                 },
                 None => self.rx.recv().await?,
             };
+            if self.beats_lost_in_lag && is_numbered_beat(&event) && {
+                // The lane is down only while the lag lasts, not until
+                // an event finds the lag over.
+                let now = tokio::time::Instant::now();
+                let until = self.shared.lag.lock().unwrap().map(|(until, _)| until);
+                until
+                    .into_iter()
+                    .chain(self.lag_pending)
+                    .any(|until| now < until)
+            } {
+                // The liveness lane to this node is down while its runtime
+                // is held up (`SimConfig::beats_lost_in_lag`).
+                continue;
+            }
             if self.lag_pending.is_some() {
                 self.lag_queue.push(event);
                 continue;
@@ -1093,7 +1118,9 @@ impl Driver {
         };
         let mut queued = std::mem::take(&mut self.lag_queue);
         while let Ok(e) = self.rx.try_recv() {
-            queued.push(e);
+            if !(self.beats_lost_in_lag && is_numbered_beat(&e)) {
+                queued.push(e);
+            }
         }
         let now = self.clock.now();
         let since = self.shared.lag_since.lock().unwrap().take();
@@ -1111,26 +1138,33 @@ impl Driver {
             // beats, before any timer (`Driver::hand_heard`); the appends
             // themselves (its sync lane) come after the timers, and the
             // numbered beats with the rest of what peers sent.
-            let mut stamped: Vec<(NodeId, u64)> = Vec::new();
+            // Each stamp carries the highest expiry the beats it stands
+            // for named (an append names none: 0), as the bridge's does
+            // (`OffCore::note_holder_heard`).
+            let mut stamped: Vec<((NodeId, u64), i64)> = Vec::new();
             for e in &queued {
                 let key = match e {
                     Event::HolderAlive {
                         from,
                         epoch,
                         listed: true,
+                        expires,
                         ..
-                    } => Some((*from, *epoch)),
+                    } => Some(((*from, *epoch), expires.0)),
                     Event::Peer {
                         msg: PeerMsg::BackupAppend { holder, epoch, .. },
                         ..
-                    } => Some((*holder, *epoch)),
+                    } => Some(((*holder, *epoch), 0)),
                     _ => None,
                 };
-                if let Some(key) = key.filter(|k| !stamped.contains(k)) {
-                    stamped.push(key);
+                if let Some((key, expires)) = key {
+                    match stamped.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, e)) => *e = (*e).max(expires),
+                        None => stamped.push((key, expires)),
+                    }
                 }
             }
-            for (from, epoch) in stamped {
+            for ((from, epoch), expires) in stamped {
                 self.ready.push_back(Event::HolderAlive {
                     from,
                     epoch,
@@ -1139,7 +1173,7 @@ impl Driver {
                     at: now,
                     seq: 0,
                     sent: constellation_authority::Ms(0),
-                    expires: constellation_authority::Ms(0),
+                    expires: constellation_authority::Ms(expires),
                 });
             }
         }

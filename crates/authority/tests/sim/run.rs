@@ -367,6 +367,13 @@ pub struct SimConfig {
     /// daemon's usual order: the handlers' stamps first
     /// (`Driver::hand_heard`), as unnumbered beats.
     pub timers_first_after_lag: bool,
+    /// The numbered beats sent to a node while its runtime lags are lost
+    /// (the daemon's shape when the holder's beat runtime closes the
+    /// liveness lane to a frozen peer and re-dials it: what it sent
+    /// meanwhile never arrives, and the backup's lapse is followed by
+    /// silence, not by a backlog of beats). Appends, which the sync lane
+    /// carries, are queued and stamped at the lapse's end as before.
+    pub beats_lost_in_lag: bool,
     /// No holder drops a backup for want of acknowledgements
     /// (`backup_ack_timeouts`): lag costs no reconfiguration either.
     pub keeps_backups: bool,
@@ -599,6 +606,7 @@ impl Default for SimConfig {
             live_holder: false,
             beats_lost: false,
             timers_first_after_lag: false,
+            beats_lost_in_lag: false,
             keeps_backups: false,
         }
     }
@@ -2297,6 +2305,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         settle_tagged_writes: cfg.settle_tagged_writes,
         holder_beats: cfg.holder_beats,
         timers_first_after_lag: cfg.timers_first_after_lag,
+        beats_lost_in_lag: cfg.beats_lost_in_lag,
     };
     env.world
         .hold_ms

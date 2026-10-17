@@ -290,6 +290,9 @@ fn replay_seed() {
         Ok("backup-lag-at-expiry") => backup_lag_at_expiry_config(false),
         Ok("backup-lag-at-expiry-beats-lost") => backup_lag_at_expiry_config(true),
         Ok("backup-lag-keeps-its-backup") => backup_lag_keeps_its_backup_config(),
+        Ok("backup-lag-in-margin") => backup_lag_in_margin_config(),
+        Ok("backup-lag-in-margin-cut") => backup_lag_in_margin_cut_config(),
+        Ok("backup-lag-in-margin-unaware") => unaware(backup_lag_in_margin_config()),
         Ok("backup-runtime-lag-then-crash") => backup_runtime_lag_then_crash_config(),
         Ok("acks3-runtime-lag") => acks3_runtime_lag_config(),
         Ok("backup-runtime-lag-unaware") => unaware(backup_runtime_lag_config()),
@@ -1948,6 +1951,85 @@ fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
     }
 }
 
+/// 2026-10-16 `snapsched` under host load: the holder's runtime is held
+/// up across a renewal (2.3-2.6 s from 6.0 s; the lease here is 6 s, its
+/// margin 0.5 s and the renewal due 3 s before the expiry), so the expiry
+/// its beats named (about 9.1-9.8 s for the lease the holder took at
+/// 0.2-0.8 s and renewed once) comes within the margin before it has
+/// renewed again; its backup's runtime is held up (1.5-1.9 s from 6.8 s)
+/// so that the lapse ends inside that margin with the holder still
+/// silent, and the liveness lane to the backup is closed meanwhile
+/// (`beats_lost_in_lag`), so no backlog of beats follows the lapse. The
+/// backup's silence, counted plain inside the margin, is more than a
+/// window; counted in its own attentive time it is none. A listed backup
+/// that finds the lease unexpired must not seal it: the holder renews as
+/// soon as its runtime runs again.
+fn backup_lag_in_margin_config() -> SimConfig {
+    let lag = |at_ms, who, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::RuntimeLag {
+            who,
+            for_ms,
+            stamp_lag_ms: (0, 200),
+        },
+    };
+    SimConfig {
+        beats_lost_in_lag: true,
+        faults: vec![
+            lag(6_000, sim::run::LagOf::Holder, (2_300, 2_600)),
+            lag(6_800, sim::run::LagOf::Backup, (1_500, 1_900)),
+        ],
+        ..backup_runtime_lag_config()
+    }
+}
+
+/// The twin of [`backup_lag_in_margin_config`] with a holder that is
+/// truly cut from S3 (it cannot renew, its lease runs out) in place of
+/// the holder's lag: the same backup lapse across the expiry, the same
+/// lost beats. The backup still seals in time.
+fn backup_lag_in_margin_cut_config() -> SimConfig {
+    SimConfig {
+        beats_lost_in_lag: true,
+        ..backup_lag_at_expiry_config(false)
+    }
+}
+
+/// A backup whose runtime is held up with its live holder's lease at the
+/// expiry margin does not seal it ([`backup_lag_in_margin_config`]); the
+/// same lapse with a holder that is cut off still seals in time (in at
+/// least 100 of 120 seeds, as `backup-lag-at-expiry`), and the backup
+/// that counts plain silence does seal the live holder
+/// (`backup-lag-in-margin-unaware`: the non-vacuity half).
+#[test]
+fn a_backup_frozen_with_its_holders_lease_at_the_margin_does_not_seal_it() {
+    let t = run_m9(
+        "backup-lag-in-margin",
+        backup_lag_in_margin_config(),
+        0..120,
+    );
+    assert_eq!(t.seals, 0, "{t:?}");
+    assert!(t.backups_added >= 60, "backups rarely chosen: {t:?}");
+    let t = run_m9(
+        "backup-lag-in-margin-cut",
+        backup_lag_in_margin_cut_config(),
+        0..120,
+    );
+    assert!(t.seals >= 100, "the backup rarely sealed: {t:?}");
+    let cfg = unaware(backup_lag_in_margin_config());
+    let deposed = (0..60u64)
+        .filter(|seed| {
+            run_seed(*seed, cfg.clone())
+                .err()
+                .is_some_and(|e| e.contains("a live holder was sealed or taken over"))
+        })
+        .count();
+    eprintln!("backup-lag-in-margin-unaware: {deposed}/60 seeds deposed a live holder");
+    assert!(
+        deposed >= 5,
+        "only {deposed}/60 seeds deposed a live holder"
+    );
+}
+
 /// After a lag, the timers before what the P2P handlers stamped
 /// meanwhile (`SimConfig::timers_first_after_lag`): the other order a
 /// daemon's driver can see, swept beside the usual one.
@@ -2983,6 +3065,9 @@ fn sweep_config() {
         "backup-lag-at-expiry" => backup_lag_at_expiry_config(false),
         "backup-lag-at-expiry-beats-lost" => backup_lag_at_expiry_config(true),
         "backup-lag-keeps-its-backup" => backup_lag_keeps_its_backup_config(),
+        "backup-lag-in-margin" => backup_lag_in_margin_config(),
+        "backup-lag-in-margin-cut" => backup_lag_in_margin_cut_config(),
+        "backup-lag-in-margin-unaware" => unaware(backup_lag_in_margin_config()),
         "backup-runtime-lag-then-crash" => backup_runtime_lag_then_crash_config(),
         "acks3-runtime-lag" => acks3_runtime_lag_config(),
         "backup-runtime-lag-unaware" => unaware(backup_runtime_lag_config()),

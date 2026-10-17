@@ -894,7 +894,7 @@ pub struct Driver {
     urgent_rx: Option<mpsc::UnboundedReceiver<SyncRequest>>,
     /// The holders' liveness handed to the core so far
     /// ([`fresh_heard`]).
-    heard_handed: HashMap<NodeId, (u64, i64)>,
+    heard_handed: HashMap<NodeId, Heard>,
     /// The end of the latest own lapse handed to the core
     /// ([`Driver::hand_lag`]).
     lag_handed: i64,
@@ -1361,7 +1361,9 @@ impl Drop for AliveTask {
 ///
 /// - **When each holder was last heard from**, as a backup: the arrival
 ///   of its latest heartbeat (`HolderAlive`) or append, by holder and
-///   epoch. The core's seal watch measures the holder's silence; fed
+///   epoch, with the lease expiry that heartbeat named. The core's seal
+///   watch measures the holder's silence and reads its lease's expiry
+///   from these, however far behind its own steps are; fed
 ///   only by the events it handled, it measured this node's own backlog
 ///   too — a backup whose steps took seconds sealed a live holder that
 ///   was sending to it the whole time (`silent_ms=21872`). The driver
@@ -1379,8 +1381,9 @@ impl Drop for AliveTask {
 #[derive(Debug)]
 pub struct OffCore {
     busy_since: std::sync::atomic::AtomicI64,
-    /// holder → (its latest epoch heard, the latest arrival at it).
-    heard: Mutex<HashMap<NodeId, (u64, i64)>>,
+    /// holder → (its latest epoch heard, the latest arrival at it, the
+    /// latest lease expiry a heartbeat of that epoch named; 0: none).
+    heard: Mutex<HashMap<NodeId, Heard>>,
     responsive_ms: i64,
     /// The lag probe's latest tick (unix ms; 0: not started).
     probe_tick: std::sync::atomic::AtomicI64,
@@ -1491,36 +1494,53 @@ impl OffCore {
     }
 
     /// The holder `holder` was heard from at `epoch` (a heartbeat or an
-    /// append arrived) at `at_unix_ms`. An older epoch's is ignored.
-    pub(crate) fn note_holder_heard(&self, holder: NodeId, epoch: u64, at_unix_ms: i64) {
+    /// append arrived) at `at_unix_ms`; a heartbeat names the expiry of
+    /// its lease, `expires_unix_ms` (0: an append names none). An older
+    /// epoch's is ignored.
+    pub(crate) fn note_holder_heard(
+        &self,
+        holder: NodeId,
+        epoch: u64,
+        at_unix_ms: i64,
+        expires_unix_ms: i64,
+    ) {
         let mut heard = self.heard.lock().unwrap();
-        let e = heard.entry(holder).or_insert((epoch, at_unix_ms));
+        let e = heard
+            .entry(holder)
+            .or_insert((epoch, at_unix_ms, expires_unix_ms));
         if epoch > e.0 {
-            *e = (epoch, at_unix_ms);
+            *e = (epoch, at_unix_ms, expires_unix_ms);
         } else if epoch == e.0 {
             e.1 = e.1.max(at_unix_ms);
+            e.2 = e.2.max(expires_unix_ms);
         }
     }
 
-    fn heard(&self) -> HashMap<NodeId, (u64, i64)> {
+    fn heard(&self) -> HashMap<NodeId, Heard> {
         self.heard.lock().unwrap().clone()
     }
 }
 
+/// A holder as the peer service heard it: `(epoch, arrival, expiry)`
+/// (unix ms; the expiry 0: none named yet).
+type Heard = (u64, i64, i64);
+
 /// The holders heard from since what was handed to the core
-/// (`handed`, updated): `(holder, epoch, arrival)`.
+/// (`handed`, updated): `(holder, epoch, arrival, expiry)`. A newer
+/// expiry alone (an arrival that named a later one at the same stamp)
+/// is fresh too.
 fn fresh_heard(
-    heard: HashMap<NodeId, (u64, i64)>,
-    handed: &mut HashMap<NodeId, (u64, i64)>,
-) -> Vec<(NodeId, u64, i64)> {
-    let mut fresh: Vec<(NodeId, u64, i64)> = heard
+    heard: HashMap<NodeId, Heard>,
+    handed: &mut HashMap<NodeId, Heard>,
+) -> Vec<(NodeId, u64, i64, i64)> {
+    let mut fresh: Vec<(NodeId, u64, i64, i64)> = heard
         .into_iter()
         .filter(|(holder, now)| handed.get(holder).is_none_or(|was| now > was))
-        .map(|(holder, (epoch, at))| (holder, epoch, at))
+        .map(|(holder, (epoch, at, expires))| (holder, epoch, at, expires))
         .collect();
     fresh.sort_unstable();
-    for &(holder, epoch, at) in &fresh {
-        handed.insert(holder, (epoch, at));
+    for &(holder, epoch, at, expires) in &fresh {
+        handed.insert(holder, (epoch, at, expires));
     }
     fresh
 }
@@ -1918,7 +1938,7 @@ impl Driver {
     /// measures the holder's silence, not this node's backlog.
     fn hand_heard(&mut self) {
         let heard = self.deps.off_core.heard();
-        for (from, epoch, at) in fresh_heard(heard, &mut self.heard_handed) {
+        for (from, epoch, at, expires) in fresh_heard(heard, &mut self.heard_handed) {
             self.step(Internal::Event(Event::HolderAlive {
                 from,
                 epoch,
@@ -1927,7 +1947,7 @@ impl Driver {
                 at: Ms(at),
                 seq: 0,
                 sent: Ms(0),
-                expires: Ms(0),
+                expires: Ms(expires),
             }));
         }
     }
@@ -6483,23 +6503,38 @@ mod tests {
         let off = OffCore::new(5_000);
         let mut handed = std::collections::HashMap::new();
         assert!(fresh_heard(off.heard(), &mut handed).is_empty());
-        off.note_holder_heard(1, 4, 1_000);
-        off.note_holder_heard(1, 4, 1_300);
-        off.note_holder_heard(1, 4, 1_200);
-        off.note_holder_heard(2, 7, 900);
+        off.note_holder_heard(1, 4, 1_000, 5_000);
+        off.note_holder_heard(1, 4, 1_300, 0);
+        off.note_holder_heard(1, 4, 1_200, 4_000);
+        off.note_holder_heard(2, 7, 900, 0);
+        // The latest arrival, and the latest expiry any beat named.
         assert_eq!(
             fresh_heard(off.heard(), &mut handed),
-            vec![(1, 4, 1_300), (2, 7, 900)]
+            vec![(1, 4, 1_300, 5_000), (2, 7, 900, 0)]
         );
         assert!(
             fresh_heard(off.heard(), &mut handed).is_empty(),
             "handed twice"
         );
-        off.note_holder_heard(1, 4, 1_600);
-        off.note_holder_heard(1, 3, 9_000);
-        assert_eq!(fresh_heard(off.heard(), &mut handed), vec![(1, 4, 1_600)]);
-        off.note_holder_heard(1, 5, 1_500);
-        assert_eq!(fresh_heard(off.heard(), &mut handed), vec![(1, 5, 1_500)]);
+        off.note_holder_heard(1, 4, 1_600, 0);
+        off.note_holder_heard(1, 3, 9_000, 9_000);
+        assert_eq!(
+            fresh_heard(off.heard(), &mut handed),
+            vec![(1, 4, 1_600, 5_000)]
+        );
+        // A renewal named at an arrival already handed is fresh too: the
+        // core's idea of the holder's expiry follows the stamps.
+        off.note_holder_heard(1, 4, 1_600, 6_000);
+        assert_eq!(
+            fresh_heard(off.heard(), &mut handed),
+            vec![(1, 4, 1_600, 6_000)]
+        );
+        // A newer epoch replaces the older one's arrival and expiry.
+        off.note_holder_heard(1, 5, 1_500, 0);
+        assert_eq!(
+            fresh_heard(off.heard(), &mut handed),
+            vec![(1, 5, 1_500, 0)]
+        );
     }
 
     /// A backup answers the holder's heartbeat with whether its own

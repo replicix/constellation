@@ -354,6 +354,8 @@ pub(crate) struct BackupState {
     /// `takeover_get` was issued because the holder's lease expiry as
     /// this node knew it had passed, not for silence: the object decides
     /// (`on_takeover_get`) — expired, sealed; renewed, a window again.
+    /// (A read for silence that finds the lease unexpired judges the
+    /// silence again in this node's attentive time, the same way.)
     takeover_read_for_expiry: bool,
     /// Subscriber: the next journal seq a `StreamAhead` may install for
     /// `(epoch, jseq)` — contiguity with what the log and earlier batches
@@ -2339,9 +2341,9 @@ impl Core {
 
     /// A beat of `from`'s at `epoch`, heard at `at` and credited as heard
     /// at `credit` (`seq` 0: an arrival the driver handed over, not a
-    /// numbered beat): its arrival, the
-    /// lease expiry it names, and whether it came late
-    /// ([`HolderBeats::late`]).
+    /// numbered beat; it carries the expiry the beat named, if it was
+    /// one, and nothing to tell its lateness by): its arrival, the lease
+    /// expiry it names, and whether it came late ([`HolderBeats::late`]).
     fn note_beat(
         &mut self,
         from: NodeId,
@@ -2372,10 +2374,15 @@ impl Core {
             b.expires = Ms(0);
         }
         b.heard_at = b.heard_at.max(credit);
+        // The expiry a beat names, numbered or an arrival the driver
+        // handed over (the peer service notes it with the stamp, so it is
+        // as fresh as the stamp however far behind this node's steps are).
+        if expires.0 != 0 {
+            b.expires = b.expires.max(expires);
+        }
         if seq == 0 {
             return;
         }
-        b.expires = b.expires.max(expires);
         match b.last {
             Some((last_seq, last_sent, last_at)) if seq > last_seq => {
                 // Late against its own schedule: `steps` intervals after
@@ -2450,12 +2457,16 @@ impl Core {
     ///   beats last named the expiry — or, before a beat has, as this
     ///   node's last read of the lease object did (a lower bound: the
     ///   holder renews past it, so the discount ends early, never late).
-    ///   Its beats stop at the expiry, so silence there is the lease
+    ///   Its beats stop at the expiry, so silence there may be the lease
     ///   ending, not a stall — and a backup must seal and claim promptly
     ///   then: nobody else may claim a `Backup` lease for
     ///   `backup_claim_grace_ms` (2T) past its expiry, time meant for a
     ///   listed backup, whose tail holds what the holder acknowledged but
-    ///   did not ship (long-backup seed 802943);
+    ///   did not ship (long-backup seed 802943). The margin ends the
+    ///   discount for *when the watch reads*; whether an unexpired lease
+    ///   that still lists this node is sealed keeps it
+    ///   ([`Self::on_takeover_get`]: the holder's silence in this node's
+    ///   attentive time, 2026-10-16 `snapsched`);
     /// - a window (T) plus the lapses' length while the lease, so known,
     ///   runs;
     /// - with no expiry known at all (no beat heard, no read naming this
@@ -2491,7 +2502,7 @@ impl Core {
     /// The expiry of `holder`'s lease at `epoch` as this node knows it:
     /// the later of what its beats last named and what this node last
     /// read (each a lower bound: the holder may have renewed since).
-    fn known_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
+    pub(crate) fn known_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
         let read = self
             .lease
             .last_seen
@@ -2617,7 +2628,12 @@ impl Core {
     /// the removal. Read first, a removed backup sees itself unlisted,
     /// gives its role up unsealed and is invited back as a candidate. The
     /// read costs no failover time: it was issued right after the seal
-    /// before, and the seal is a local write.
+    /// before, and the seal is a local write. What the read finds decides
+    /// (`on_takeover_get`): an expired lease that lists this node is
+    /// sealed; an unexpired one is sealed only if the holder's silence,
+    /// measured in this node's attentive time (its own lapses
+    /// discounted), is still a window or more — also when the watch,
+    /// inside the lease's expiry margin, counted plain silence to read.
     pub(crate) fn on_backup_watch(&mut self, now: Ms, out: &mut Vec<Action>) {
         let Some(role) = self.bk.role else {
             return;
@@ -2661,9 +2677,13 @@ impl Core {
         // that credit missed the 2T claim grace past the expiry. So the
         // lease is read at once, and the object decides
         // (`on_takeover_get`): expired and still listing this node,
-        // sealed; renewed (what this node knew was older), a window again;
-        // moved on, the role ends. Known that way, the expiry is a lower
-        // bound, so this reads early at worst, never seals early.
+        // sealed; unexpired, the holder's silence judged in this node's
+        // attentive time (its own lapses discounted, though the watch
+        // counted plain silence inside the expiry margin), and a holder
+        // heard within a window of that has a window again, no later than
+        // the object's expiry; moved on, the role ends. Known that way,
+        // the expiry is a lower bound, so this reads early at worst, never
+        // seals early.
         let expired = self
             .known_expiry(role.holder, role.epoch)
             .is_some_and(|expires| now >= expires);
@@ -2741,18 +2761,44 @@ impl Core {
                     self.arm_backup_watch(now, out);
                     return;
                 }
-                if for_expiry && !lease.is_expired(now.0) {
-                    // Read for the expiry this node knew of, not for the
-                    // holder's silence, and it renewed: what this node
-                    // knew was older. A window from here.
-                    if let Some(b) = self.bk.beats.get_mut(&role.holder) {
-                        if b.epoch == role.epoch {
-                            b.expires = b.expires.max(Ms(lease.expires_unix_ms));
+                if !lease.is_expired(now.0) {
+                    // The object is unexpired and lists this node. Whether
+                    // the holder is silent is judged in this node's
+                    // attentive time (`after_own_lapses`: its own lapses
+                    // discounted, by a window plus their length at most),
+                    // whatever the watch counted: inside the expiry margin,
+                    // or past an expiry it knew of (a lower bound: beats its
+                    // core had not got to yet named a newer one), the watch
+                    // counts plain silence and reads — so that a listed
+                    // backup seals and claims inside the 2T grace past the
+                    // expiry, and so that the object decides. Heard within a
+                    // window of attentive time (or read for the expiry it
+                    // knew of, which the object moved), the holder is alive:
+                    // a window again, no later than the object's expiry
+                    // (`watch_due_by_expiry`), where the watch reads again
+                    // and an expired object seals. 2026-10-16 `snapsched`
+                    // under host load: the holder's core held up 6.7 s (no
+                    // renewal, its 10 s lease inside the margin), the
+                    // backup's runtime 2.9 s with its liveness lane broken
+                    // meanwhile: plain silence `silent_ms=3226
+                    // attentive_ms=3226` sealed the live holder.
+                    let t = self.cfg.backup_takeover_ms.max(1) as i64;
+                    let since = if self.cfg.liveness_lag_aware {
+                        self.after_own_lapses(self.bk.last_heard, t, true)
+                    } else {
+                        self.bk.last_heard
+                    };
+                    let window = self.silence_window((role.holder, role.epoch, true), now);
+                    if for_expiry || now.since(since) < window {
+                        if let Some(b) = self.bk.beats.get_mut(&role.holder) {
+                            if b.epoch == role.epoch {
+                                b.expires = b.expires.max(Ms(lease.expires_unix_ms));
+                            }
                         }
+                        self.lease.note_object(now, &lease);
+                        self.arm_backup_watch(now, out);
+                        return;
                     }
-                    self.lease.note_object(now, &lease);
-                    self.arm_backup_watch(now, out);
-                    return;
                 }
                 if !probe
                     && self.bk.last_heard >= self.bk.takeover_read_at

@@ -7487,6 +7487,235 @@ mod epoch_rules {
         );
     }
 
+    /// 2026-10-16, `snapsched` under a host load of ~43 (plan 43 F2
+    /// follow-up): the holder's core was held up 6.7 s, so it renewed
+    /// nothing and the expiry its beats had named came within the expiry
+    /// margin; the backup's own runtime then lapsed 2.9 s (the same
+    /// host), its liveness lane broke meanwhile, and no beat reached it
+    /// for 3.2 s. Inside the margin the watch counted plain silence (the
+    /// lapse discount ends there), read the lease, found it unexpired and
+    /// still listing the backup, and sealed the live holder
+    /// (`silent_ms=3226 attentive_ms=3226 window_ms=1500`). The margin
+    /// ends the discount for *when to read*, never for *whether an
+    /// unexpired lease is sealed*: the object decides, with the holder's
+    /// silence measured in the backup's attentive time. Unexpired, listing
+    /// the backup, and the holder silent for less than a window of that
+    /// time: a window again, no later than the object's expiry — where
+    /// the watch reads again, and an expired object seals, inside the 2T
+    /// claim grace.
+    #[test]
+    fn a_lapse_inside_the_expiry_margin_does_not_seal_an_unexpired_lease() {
+        for renewed in [true, false] {
+            let mut h = Harness::new(2);
+            let watch = backing(&mut h);
+            let t0 = h.now;
+            let expires = t0.plus(4_000);
+            let beat_naming = |h: &mut Harness, seq: u64, at: Ms, expires: Ms| {
+                h.now = at;
+                h.step(Event::HolderAlive {
+                    from: 1,
+                    epoch: 1,
+                    candidacy: 1,
+                    listed: true,
+                    at,
+                    seq,
+                    sent: at,
+                    expires,
+                });
+            };
+            // Beats on time naming `expires`, the last 3.4 s before it.
+            for seq in 1..=3u64 {
+                beat_naming(&mut h, seq, t0.plus(300 * (seq - 1)), expires);
+            }
+            let last = h.now;
+            // This node's runtime held up from just after that beat to
+            // 100 ms before the expiry; nothing of the holder's reached it
+            // meanwhile (its liveness lane broke). The watch's timer, due
+            // long ago, is handled now, after the lapse.
+            h.now = Ms(expires.0 - 100);
+            h.step(Event::OwnLag {
+                from: last.plus(100),
+                until: h.now,
+            });
+            let out = h.step(Event::Timer { id: watch });
+            // Inside the margin the watch reads, as before.
+            assert!(
+                matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]),
+                "renewed {renewed}: no read inside the margin: {out:?}"
+            );
+            // The object: the holder's lease, unexpired (renewed while this
+            // node was held up, or simply not yet expired), listing this node.
+            let obj_expires = if renewed {
+                expires.plus(8_000)
+            } else {
+                expires
+            };
+            let mut lease = root_lease(1, 1, obj_expires);
+            lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+            lease.backups = vec![2];
+            let out = answer_job_read(&mut h, &out, lease);
+            assert_eq!(
+                h.core.bk.sealed, 0,
+                "renewed {renewed}: sealed a live holder on this node's own lapse: {out:?}"
+            );
+            assert!(
+                h.core.bk.role.is_some(),
+                "renewed {renewed}: gave the role up"
+            );
+            assert!(s3_ops(&out).is_empty(), "renewed {renewed}: {out:?}");
+            let watch = timers(&out, TimerKind::BackupWatch);
+            assert_eq!(watch.len(), 1, "renewed {renewed}: not re-armed: {out:?}");
+            let due = h.core.timer_at(watch[0]).expect("armed");
+            assert!(
+                due <= obj_expires && due <= h.now.plus(1_500),
+                "renewed {renewed}: re-armed at {due:?} (now {:?}, expiry {obj_expires:?})",
+                h.now
+            );
+            if renewed {
+                // The holder's beats resume, naming the renewed expiry: the
+                // watch finds it heard and reads nothing.
+                beat_naming(&mut h, 4, Ms(due.0 - 100), obj_expires);
+                h.now = due;
+                let out = h.step(Event::Timer { id: watch[0] });
+                assert!(s3_ops(&out).is_empty(), "read a holder that beat: {out:?}");
+                assert_eq!(h.core.bk.sealed, 0);
+            } else {
+                // Liveness: nothing more from the holder. At the expiry the
+                // watch reads at once, and the expired object seals, inside
+                // the 2T claim grace.
+                assert_eq!(due, expires, "not re-armed at the expiry");
+                h.now = due;
+                let out = h.step(Event::Timer { id: watch[0] });
+                assert!(
+                    matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]),
+                    "no read at the expiry: {out:?}"
+                );
+                h.advance(30);
+                let mut lease = root_lease(1, 1, expires);
+                lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+                lease.backups = vec![2];
+                let out = answer_job_read(&mut h, &out, lease);
+                assert_eq!(
+                    h.core.bk.sealed, 1,
+                    "did not seal the expired lease: {out:?}"
+                );
+                assert!(h.now.since(expires) < 2 * 1_500, "past the claim grace");
+            }
+        }
+    }
+
+    /// The expiry an arrival the driver hands over names (the peer
+    /// service stamps it with the beat's arrival, ahead of the core's
+    /// backlog) is the holder's expiry as this backup knows it: an
+    /// unnumbered beat that names one moves it (never back), one that
+    /// names none (`Ms(0)`: an append's arrival) leaves it, and a newer
+    /// epoch starts over. Otherwise a core 14 s behind its urgent lane
+    /// knew an expiry long renewed past, and read for it at once
+    /// (2026-10-16, `snapsched` under host load).
+    #[test]
+    fn an_arrival_handed_over_with_the_expiry_it_named_moves_the_known_expiry() {
+        let mut h = Harness::new(2);
+        let _watch = backing(&mut h);
+        let t0 = h.now;
+        assert_eq!(h.core.known_expiry(1, 1), None);
+        let arrival = |h: &mut Harness, epoch: u64, at: Ms, expires: Ms| {
+            h.step(Event::HolderAlive {
+                from: 1,
+                epoch,
+                candidacy: 0,
+                listed: true,
+                at,
+                seq: 0,
+                sent: Ms(0),
+                expires,
+            });
+        };
+        // An arrival that names none changes nothing.
+        arrival(&mut h, 1, t0, Ms(0));
+        assert_eq!(h.core.known_expiry(1, 1), None);
+        // One that names an expiry sets it, with no numbered beat handled.
+        arrival(&mut h, 1, t0.plus(100), t0.plus(6_000));
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)));
+        assert_eq!(h.core.bk.last_heard, t0.plus(100));
+        // A later arrival that names none, or an older expiry, leaves it.
+        arrival(&mut h, 1, t0.plus(200), Ms(0));
+        arrival(&mut h, 1, t0.plus(300), t0.plus(5_000));
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)));
+        // A renewal moves it.
+        arrival(&mut h, 1, t0.plus(400), t0.plus(11_000));
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        // Another epoch's expiry is not this one's.
+        assert_eq!(h.core.known_expiry(1, 2), None);
+        // The numbered beat the core gets to later, naming an older expiry
+        // (it sat on the urgent lane), does not take it back.
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 1,
+            candidacy: 1,
+            listed: true,
+            at: t0.plus(500),
+            seq: 1,
+            sent: t0.plus(500),
+            expires: t0.plus(6_000),
+        });
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        // A holder not listing this node is not tracked at all.
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 1,
+            candidacy: 0,
+            listed: false,
+            at: t0.plus(600),
+            seq: 0,
+            sent: Ms(0),
+            expires: t0.plus(90_000),
+        });
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+    }
+
+    /// With the expiry handed along, the watch is not blind to a renewal
+    /// its core is behind on: the holder's beats (stamped at the bridge)
+    /// named an expiry far past the one the core's own numbered beats
+    /// named, so the watch armed no later than the old one reads nothing
+    /// at it and keeps the window. Without it, it read "past the known
+    /// expiry" (a wasted GET and a plain-silence decision).
+    #[test]
+    fn a_renewal_named_by_an_arrival_keeps_the_watch_from_reading_at_the_old_expiry() {
+        let mut h = Harness::new(2);
+        let watch = backing(&mut h);
+        let t0 = h.now;
+        // The core got to one numbered beat, naming 3 s.
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 1,
+            candidacy: 1,
+            listed: true,
+            at: t0,
+            seq: 1,
+            sent: t0,
+            expires: t0.plus(3_000),
+        });
+        // The holder kept beating and renewed; the bridge's stamps say so.
+        h.now = t0.plus(3_500);
+        let at = h.now;
+        h.step(Event::HolderAlive {
+            from: 1,
+            epoch: 1,
+            candidacy: 0,
+            listed: true,
+            at,
+            seq: 0,
+            sent: Ms(0),
+            expires: t0.plus(13_000),
+        });
+        let out = h.step(Event::Timer { id: watch });
+        assert!(
+            s3_ops(&out).is_empty(),
+            "read the lease of a holder that beat and renewed: {out:?}"
+        );
+        assert_eq!(h.core.bk.sealed, 0);
+    }
+
     /// The holder dropped this backup (it made no acknowledgement
     /// progress) and says so: the backup stops watching and discards its
     /// tail, instead of sealing the live holder 1.5 s later. A dismissal
