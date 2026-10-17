@@ -20,7 +20,7 @@ use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{
     CompletedOutcome, KeySet, LogRecord, MetaError, MutateOp, MutateOutcome, OwnChunks, Position,
-    Rid, TouchSet,
+    Rid, Streams, TouchSet,
 };
 use constellation_types::Code;
 use std::collections::BTreeSet;
@@ -35,6 +35,9 @@ pub(crate) enum Origin {
     /// A queued stranded op (`pending_replay` row `queue_seq`).
     Replay {
         queue_seq: u64,
+        /// Plan 30 §M11: the delegate-stream rows the stranded
+        /// transaction was ordered after (`StrandedOp::deps`).
+        deps: Streams,
     },
 }
 
@@ -403,7 +406,13 @@ impl Core {
             out,
         );
         let keys = conflict_keys(&op, replica);
-        let deps = self.fresh_deps(now, replica);
+        let mut deps = self.fresh_deps(now, replica);
+        // Plan 30 §M11: a replay is ordered after this node's session
+        // and after the delegate-stream rows its first execution was
+        // (`StrandedOp::deps`). Those are kept when both do not fit.
+        if let Origin::Replay { deps: queued, .. } = origin {
+            deps.streams = queued.join(&deps.streams).unwrap_or(queued);
+        }
         // A rid this core already answered `InDoubt` may have taken
         // effect somewhere: its resubmission is in doubt from the start.
         // So is a stranded op's replay (`Origin::Replay`): its first
@@ -648,7 +657,23 @@ impl Core {
             c.deps_held = true;
             return true;
         }
-        let deps = self.fresh_deps(now, replica);
+        let mut deps = self.fresh_deps(now, replica);
+        // A replay's recorded rows of generations that are not lost stay
+        // owed: only the lost ones are replaced by the fresh session.
+        if replay {
+            let live = self.clients.get(&rid).map_or(Streams::NONE, |c| {
+                let mut live = Streams::NONE;
+                for (gen, idx) in c.deps.streams.iter() {
+                    let mut one = Position::ZERO;
+                    one.streams.raise(gen, idx);
+                    if !replica.deps_lost(&one) {
+                        live.raise(gen, idx);
+                    }
+                }
+                live
+            });
+            deps.streams = live.join(&deps.streams).unwrap_or(live);
+        }
         tracing::debug!(
             node = self.cfg.node_id,
             ?rid,
@@ -2622,7 +2647,7 @@ impl Core {
                     reply: ClientReply::InDoubt,
                 });
             }
-            Origin::Replay { queue_seq } => {
+            Origin::Replay { queue_seq, .. } => {
                 if c.also_client {
                     out.push(Action::Reply {
                         rid,
@@ -2689,7 +2714,7 @@ impl Core {
                     reply: ClientReply::Outcome(outcome),
                 });
             }
-            Origin::Replay { queue_seq } => {
+            Origin::Replay { queue_seq, .. } => {
                 if c.also_client {
                     if rid.node == self.cfg.node_id && rid.incarnation == self.cfg.incarnation {
                         self.acked.mark_done(rid.seq);

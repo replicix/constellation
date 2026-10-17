@@ -21929,3 +21929,157 @@ fn a_continuation_epoch_opened_during_the_takeover_read_blocks_the_seal() {
     assert_eq!(h.core.stats.seals, 0);
     assert!(h.core.job.is_none());
 }
+
+// ---- a stranded transaction's replay names the delegate rows ahead of it ----
+
+/// A deposed root (epoch 1) that appended generation 4's stream row 7 and
+/// executed `marker` after it, stranded by epoch 2: the marker is queued
+/// for replay by rid with `deps` `(4, 7)`, and the row stays in the
+/// journal. Returns the new holder's harness (epoch 3, which has not
+/// appended that row), the marker's rid and the queued entry.
+fn deposed_root_with_a_marker_replay() -> (Harness, Rid, constellation_meta::StrandedOp) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(1, None);
+    let data = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "data".into(),
+        ino: (2 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let data_rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    assert!(h
+        .meta
+        .apply_delegate_tx(
+            &[data],
+            Some(data_rid),
+            4,
+            7,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    let marker = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "marker".into(),
+        ino: (3 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let rid = Rid {
+        node: 1,
+        incarnation: 1,
+        seq: 1,
+    };
+    constellation_meta::execute_mutate(&h.meta, &marker, Some(rid)).unwrap();
+    h.meta.strand_below_epoch(2).unwrap();
+    let queued = h.meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].deps.iter().collect::<Vec<_>>(), vec![(4, 7)]);
+    h.hold(3, None);
+    (h, rid, queued[0].clone())
+}
+
+/// The takeover gate does not execute a replay ahead of the delegate rows
+/// it was ordered after (long-delegated-late-answers seed 2945): it stays
+/// queued for the drain, whose submit makes the root wait for them.
+#[test]
+fn the_gate_leaves_a_replay_to_the_drain_until_its_delegate_rows_are_here() {
+    let (mut h, _rid, _q) = deposed_root_with_a_marker_replay();
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none());
+    assert_eq!(h.meta.pending_replays().unwrap().len(), 1, "held");
+    assert_eq!(h.core.stats.replays_held_for_stream, 1);
+    // The delegate's stream through row 7 is here: the gate runs it.
+    crate::replica::Replica::note_stream(&h.meta, 4, 7);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+}
+
+/// A replay whose rid the log already settled is forgotten at the gate,
+/// not parked behind rows it no longer has to be ordered after (a parked
+/// entry keeps `has_pending_replays` true, which holds reads and
+/// publishing).
+#[test]
+fn the_gate_forgets_a_replay_the_log_already_settled_whatever_its_deps() {
+    let (mut h, rid, _q) = deposed_root_with_a_marker_replay();
+    let seg = [
+        LogRecord::Create {
+            parent: ROOT_INO,
+            name: "marker".into(),
+            ino: (3 << 40) | 1,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            time_ns: 5,
+        },
+        LogRecord::Completed { rid },
+    ];
+    h.meta
+        .apply_segment(1, 3, &seg, &constellation_meta::TouchSet::default())
+        .unwrap();
+    assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
+    assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert!(
+        h.meta.pending_replays().unwrap().is_empty(),
+        "forgotten, not held"
+    );
+    assert_eq!(h.core.stats.replays_held_for_stream, 0);
+}
+
+/// An op held with lost `deps` proceeds with fresh ones; a replay keeps
+/// the recorded rows of the generations that are not lost (it is still
+/// ordered after them), and drops only the lost generation's.
+#[test]
+fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
+    let (mut h, rid, q) = deposed_root_with_a_marker_replay();
+    let mut deps = constellation_meta::Streams::NONE;
+    deps.raise(4, 7);
+    deps.raise(5, 3);
+    // Generation 4 ended below row 7; generation 5 is live.
+    crate::replica::Replica::void_stream(&h.meta, 4, 0);
+    let mut out = Vec::new();
+    h.core.submit(
+        h.now,
+        rid,
+        q.op.clone(),
+        Policy::Client,
+        q.lock_tag.clone(),
+        crate::core::client::Origin::Replay {
+            queue_seq: q.queue_seq,
+            deps,
+        },
+        &h.meta,
+        &mut out,
+    );
+    let mut out = Vec::new();
+    h.core.hold_for_lost_deps(h.now, rid, &h.meta, &mut out);
+    let held = h.core.clients.get(&rid).expect("the replay is in flight");
+    let kept: Vec<_> = held.deps.streams.iter().collect();
+    assert!(
+        kept.contains(&(5, 3)),
+        "the live generation's row: {kept:?}"
+    );
+    assert!(
+        !kept.iter().any(|(g, i)| (*g, *i) == (4, 7)),
+        "the lost generation's row is replaced: {kept:?}"
+    );
+}

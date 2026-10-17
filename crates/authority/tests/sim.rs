@@ -4374,6 +4374,25 @@ fn delegate_answers_later_than_the_request_timeout_still_count() {
     assert!(timeouts > 0 && unmatched > 0 && appended > 0);
 }
 
+/// `long-delegated-late-answers` seed 2945 (marker before its data): the
+/// root, paused and then deposed, had appended `d1`'s stream rows 6–10
+/// (the data among them) and executed a forwarded marker in `d2` after
+/// them; neither shipped. The deposition queued the marker for replay by
+/// rid with the deposed node's own session `deps`, which no longer named
+/// `d1`'s rows, and the successor executed it before `d1`'s delegate,
+/// restarted, re-streamed them. A stranded transaction's replay now
+/// names the delegate rows its journal held ahead of it
+/// (`StrandedOp::deps`).
+#[test]
+fn regression_long_delegated_late_answers_seed_2945() {
+    run_seed(2_945, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 2945: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
+        )
+    });
+}
+
 // ===================================================================
 // Plan 30 §M14: cross-node `flock`/`fcntl`.
 

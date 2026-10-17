@@ -8,7 +8,7 @@ use crate::action::Action;
 use crate::event::Policy;
 use crate::ids::Ms;
 use crate::replica::Replica;
-use constellation_meta::{MutateOp, MutateOutcome, Rid, StrandedOp};
+use constellation_meta::{MutateOp, MutateOutcome, Position, Rid, StrandedOp};
 use constellation_types::Code;
 use std::collections::BTreeMap;
 
@@ -234,6 +234,7 @@ impl Core {
                 head.lock_tag.clone(),
                 Origin::Replay {
                     queue_seq: head.queue_seq,
+                    deps: head.deps,
                 },
                 replica,
                 out,
@@ -575,6 +576,21 @@ impl Core {
         // delegate's earlier, acknowledged unlink). The delegations this
         // node holds itself are its own to execute (its stranded rows
         // are in this very queue, in order).
+        // Plan 30 §M11: nor ahead of the delegate-stream rows it was
+        // ordered after (`StrandedOp::deps`) while they are still to be
+        // appended here: the drain tick submits it, and the root's
+        // execution waits for them as for any op's `deps`.
+        let deps = Position {
+            streams: queued.deps,
+            ..Position::ZERO
+        };
+        if !replica.reaches_streams(&deps)
+            && !replica.deps_lost(&deps)
+            && completed_as_outcome(replica, queued.rid, 0).is_none()
+        {
+            self.stats.replays_held_for_stream += 1;
+            return Ok(());
+        }
         let keys = super::holder::keys_of_op_in(&queued.op, replica);
         let foreign_owner = match replica.resolve_ownership(&keys) {
             constellation_meta::delegation::Ownership::Root => false,

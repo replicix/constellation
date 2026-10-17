@@ -116,7 +116,7 @@ use crate::mutate::MutateOp;
 use crate::record::LogRecord;
 use crate::replay::{apply_batch_tx, apply_record, ApplyCx, TouchSet};
 use crate::rid::Rid;
-use crate::session::{JournalPos, Position};
+use crate::session::{JournalPos, Position, Streams};
 use crate::store::local::{self, LogPrefixView};
 use crate::store::{
     adjust_usage_tx, counter_add_tx, counter_get, counter_set_tx, kv_get_tx, kv_set_tx, misc, ns,
@@ -319,6 +319,12 @@ struct QueuedReplay {
     /// Plan 30 §M14 phase 2: the op's fencing token: the replay carries
     /// it, and is rejected wherever a grant it names has ended.
     lock_tag: LockTag,
+    /// Plan 30 §M11: the delegate-stream rows a deposed root's stranded
+    /// transaction was ordered after — every row of another generation
+    /// its journal held ahead of it, which the successor appends from
+    /// the delegate's re-stream, not from this replay
+    /// ([`stranded_local_deps`]). The replay carries them as `deps`.
+    deps: Streams,
 }
 
 /// A stranded op waiting to be replayed by rid (plan 30 §M3a recovery
@@ -338,6 +344,8 @@ pub struct StrandedOp {
     pub gen: u64,
     /// Plan 30 §M14 phase 2: see `QueuedReplay::lock_tag`.
     pub lock_tag: LockTag,
+    /// Plan 30 §M11: see `QueuedReplay::deps`.
+    pub deps: Streams,
 }
 
 /// What a stranding pass rolled back.
@@ -730,7 +738,7 @@ fn enqueue_replay_tx(
     tag: LockTag,
     before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, tag, None, 0, before)
+    enqueue_replay_as_tx(tx, meta, key, rid, op, tag, None, 0, Streams::NONE, before)
 }
 
 /// [`enqueue_replay_tx`] for a shadow a delegate accepted under `gen`.
@@ -745,14 +753,26 @@ fn enqueue_replay_gen_tx(
     gen: u64,
     before: &Before,
 ) -> Result<(), MetaError> {
-    enqueue_replay_as_tx(tx, meta, key, rid, op, tag, None, gen, before)
+    enqueue_replay_as_tx(
+        tx,
+        meta,
+        key,
+        rid,
+        op,
+        tag,
+        None,
+        gen,
+        Streams::NONE,
+        before,
+    )
 }
 
 /// Queue `op` for replay by `rid` under `key`. `before` is the stranded
 /// row's before-images (empty when there are none): a truncate keeps the
 /// manifest it cut from them, and a manifest commit queued after one is
 /// rebased onto it ([`rebase_on_truncate`]). `foreign`: the node whose
-/// stream carried another node's entry (see `QueuedReplay::source`).
+/// stream carried another node's entry (see `QueuedReplay::source`);
+/// `deps`: see `QueuedReplay::deps`.
 #[allow(clippy::too_many_arguments)]
 fn enqueue_replay_as_tx(
     tx: &mut SingleWriterWriteTx,
@@ -763,6 +783,7 @@ fn enqueue_replay_as_tx(
     lock_tag: LockTag,
     foreign: Option<u64>,
     gen: u64,
+    deps: Streams,
     before: &Before,
 ) -> Result<(), MetaError> {
     let truncate_base = truncate_pre_manifest(tx, meta, &op, before);
@@ -776,6 +797,7 @@ fn enqueue_replay_as_tx(
         gen,
         truncate_base,
         lock_tag,
+        deps,
     };
     if tx.get(&meta.pending_replay, seq_key(key))?.is_none() {
         counter_add_tx(tx, &meta.local, KV_PENDING_REPLAY_COUNT, 1)?;
@@ -991,6 +1013,7 @@ fn strand_local_tx(
     let Some(row) = local::get_journal_tx(&*tx, meta, first)? else {
         return Ok(());
     };
+    let deps = stranded_local_deps(&*tx, meta, first)?;
     let rows = local::journal_records(&*tx, meta, first, row.last)?;
     for (seq, _) in &rows {
         tx.remove(&meta.journal_ks, seq.to_be_bytes().to_vec());
@@ -1045,9 +1068,43 @@ fn strand_local_tx(
         None => derive_replay_op(&records),
     };
     if let Some(op) = op {
-        enqueue_replay_tx(tx, meta, key, rid, op, row.lock_tag, before)?;
+        enqueue_replay_as_tx(tx, meta, key, rid, op, row.lock_tag, None, 0, deps, before)?;
     }
     Ok(())
+}
+
+/// Plan 30 §M11: what a stranded transaction of this node, starting at
+/// journal seq `first`, was ordered after on the stream side: for every
+/// delegation generation, the highest index of a row of it still in the
+/// journal ahead of `first` — on a root, the delegates' transactions it
+/// appended and never shipped. A deposition strands the root's own rows
+/// (the transaction is replayed by rid) but not those (they belong to
+/// their generation, and the delegate re-streams them to the successor
+/// root), so the log would otherwise carry the two in whichever order
+/// they reach the successor: a replayed forward ahead of the delegate's
+/// row it had been ordered after (long-delegated-late-answers seed 2945:
+/// a deposed root's marker, executed after it appended the data from
+/// `d1`'s stream, replayed through the successor before `d1`'s delegate
+/// re-streamed the data). The successor executes the replay only once
+/// it has appended these (`reaches_streams`), as it does any forward's
+/// `deps`. A table that does not fit keeps the highest generations
+/// (the older a generation, the likelier the log has it already).
+fn stranded_local_deps(r: &impl Readable, meta: &Meta, first: u64) -> Result<Streams, MetaError> {
+    let mut highest: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    for (start, head) in local::read_journal_tx_heads(r, meta)? {
+        if start >= first {
+            break;
+        }
+        if head.gen != 0 {
+            let e = highest.entry(head.gen).or_insert(0);
+            *e = (*e).max(head.idx);
+        }
+    }
+    let mut deps = Streams::NONE;
+    for (gen, idx) in highest.into_iter().rev().take(crate::session::STREAMS_CAP) {
+        deps.raise(gen, idx);
+    }
+    Ok(deps)
 }
 
 // ------------------------------------------------------------- rollback
@@ -1302,6 +1359,7 @@ fn redo_row_tx(
                             LockTag::NONE,
                             Some(source),
                             0,
+                            Streams::NONE,
                             &[],
                         )?;
                     }
@@ -2144,6 +2202,7 @@ pub(crate) fn refuse_queued_tx(
         gen: 0,
         truncate_base: None,
         lock_tag: LockTag::NONE,
+        deps: Streams::NONE,
     };
     tx.insert(
         &meta.pending_replay,
@@ -2208,6 +2267,7 @@ pub(crate) fn read_pending_replays(
             source: row.source,
             gen: row.gen,
             lock_tag: row.lock_tag,
+            deps: row.deps,
         });
     }
     Ok(out)

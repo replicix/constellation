@@ -301,6 +301,86 @@ fn a_segment_from_a_later_epoch_strands_a_deposed_holders_journal() {
     assert_eq!(meta.usage_bytes_files(), reference.usage_bytes_files());
 }
 
+/// Plan 30 §M11 (long-delegated-late-answers seed 2945): a deposed root
+/// strands its own unshipped transaction but not the delegate's row it
+/// appended ahead of it (that row belongs to its generation; the
+/// delegate re-streams it to the successor). The queued replay names
+/// that row as its `deps`, so the successor does not execute it first;
+/// a row appended after the transaction is not named.
+#[test]
+fn a_deposed_roots_replay_names_the_delegate_rows_it_was_ordered_after() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let (gen, idx) = (4, 7);
+    let data = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "data".into(),
+        ino: (2 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let data_rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    assert!(meta
+        .apply_delegate_tx(
+            &[data],
+            Some(data_rid),
+            gen,
+            idx,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    let marker = MutateOp::Create {
+        parent: ROOT_INO,
+        name: "marker".into(),
+        ino: (3 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    execute_mutate(&meta, &marker, Some(rid(1))).unwrap();
+    // A row appended after it is not a cause.
+    let later = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "later".into(),
+        ino: (2 << 40) | 2,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 6,
+    };
+    let later_rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 2,
+    };
+    assert!(meta
+        .apply_delegate_tx(
+            &[later],
+            Some(later_rid),
+            gen,
+            idx + 1,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    meta.set_holder_epoch(0);
+
+    let stranded = meta.strand_below_epoch(2).unwrap();
+    assert_eq!(stranded.locals, 1);
+    assert!(meta.lookup(ROOT_INO, "marker").unwrap().is_none());
+    // The delegate's row stays in the journal (its generation's).
+    assert!(meta.journal_len().unwrap() > 0);
+    let queued = meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!((queued[0].rid, &queued[0].op), (rid(1), &marker));
+    assert_eq!(queued[0].deps.iter().collect::<Vec<_>>(), vec![(gen, idx)]);
+}
+
 /// A late, unfenced segment tailed while this node holds unshipped work
 /// belongs *before* that work in the log: the replica must equal the
 /// segment followed by the local records, and the publish view must equal
