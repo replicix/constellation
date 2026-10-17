@@ -153,6 +153,7 @@ PHASES: dict[str, dict] = {
             "snapsched-write-overhead",
             "cto-strict*",
             "load-probe",
+            "load-probe-takeover",
             "lock-contention-paused-holder",
             "lock-contention-stalled-owner",
             "delegate-paused-across-ttl",
@@ -173,6 +174,19 @@ PHASES: dict[str, dict] = {
             "step-pause",
         ],
         "seeds": [42, 43, 44],
+    },
+    # The takeover cells: load-probe-takeover mounts `b` first, so a pause
+    # aimed at `b` deposes the root and `a` (its backup, the delegate of
+    # its own directory) seals and takes over under load. The scenario
+    # fails a cell where no takeover happened.
+    "takeover": {
+        "scenarios": ["load-probe-takeover"],
+        "profiles": [
+            "pause:lock-lapse+500:10000@b",
+            "pause:takeover+300:15000@b",
+            "step-pause:2000:8000@b",
+        ],
+        "seeds": [42, 43, 44, 55],
     },
     "known-bugs": {
         "scenarios": ["stress-ng-fs-nodes", "stress-ng-fs-faults", "chaos-ci"],

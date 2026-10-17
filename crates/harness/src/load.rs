@@ -387,6 +387,21 @@ pub fn profile() -> Option<&'static Profile> {
     .as_ref()
 }
 
+/// Whether the profile pauses `node` by name for a spec'd length
+/// (`pause:<dur>@<node>`; a `step-pause` stops the daemon mid-step for
+/// 2 s steps that may stay under any seal window, and an item aimed at
+/// every node pauses the whole cluster).
+pub fn pauses_node(node: &str) -> bool {
+    profile().is_some_and(|p| pauses(p, node))
+}
+
+fn pauses(p: &Profile, node: &str) -> bool {
+    p.items.iter().any(|i| {
+        matches!(i.kind, Kind::Pause { step: false, .. })
+            && matches!(&i.target, Target::Node(n) if n == node)
+    })
+}
+
 /// `CONSTELLATION_HARNESS_DEADLINE_SCALE` (default 1): the factor the
 /// campaign stretches liveness deadlines by under load.
 pub fn deadline_scale() -> f64 {
@@ -1665,6 +1680,14 @@ mod tests {
             }
         );
         assert_eq!(parse("baseline").unwrap().items, vec![]);
+        // Which node a profile pauses by name (the takeover cells' check).
+        let pauses_b = |spec| pauses(&parse(spec).unwrap(), "b");
+        assert!(pauses_b("pause:lock-lapse+500:10000@b"));
+        assert!(pauses_b("cpu:25, pause:2000:8000@b"));
+        assert!(!pauses_b("pause:lock-lapse+500:10000@a"));
+        assert!(!pauses_b("pause:lock-lapse+500:10000"), "every node");
+        assert!(!pauses_b("step-pause:2000:8000@b"));
+        assert!(!pauses_b("baseline"));
         // A preset aimed at one node.
         assert_eq!(
             parse("runtime-hog@b").unwrap().items,

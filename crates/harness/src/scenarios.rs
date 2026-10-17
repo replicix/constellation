@@ -1799,6 +1799,13 @@ pub const CAMPAIGN: &[Scenario] = &[
         run: campaign::load_probe,
     },
     Scenario {
+        name: "load-probe-takeover",
+        desc: "load-probe with the root on b: a pause profile aimed at b by name (pause:...@b) deposes the root and a, its backup and the delegate of its own directory, seals and takes over under load (the scenario fails a cell where it did not; a step-pause@b may not depose it and is not checked)",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: campaign::load_probe_takeover,
+    },
+    Scenario {
         name: "lock-stall-lone-node",
         desc: "load campaign 5.3: lock-lapse-lone-node's workload with one metadata write holding the store's writer lock 5/12/20 s instead of a freeze: every op OK or EIO, the tree holds exactly what answered OK, the locked file what its close published (or what was fsynced when the close was fenced), fsck clean, also after a remount",
         requires: &[],

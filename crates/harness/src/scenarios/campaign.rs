@@ -203,6 +203,19 @@ fn read_counter(path: &Path) -> Result<u64> {
 }
 
 pub(super) fn load_probe(seed: u64) -> Result<()> {
+    load_probe_with(seed, &["a", "b"], false)
+}
+
+/// `load-probe-takeover`: the same workload with the root on `b`, so a
+/// load profile aimed at `b` (`pause:...@b`; a `step-pause:...@b` may)
+/// deposes the root and `a`, its backup and the delegate of `w-a`, seals
+/// and takes over under load. The workload starts once `b` lists `a` as
+/// its backup, so the first pause meets a seal, not a lease expiry.
+pub(super) fn load_probe_takeover(seed: u64) -> Result<()> {
+    load_probe_with(seed, &["b", "a"], true)
+}
+
+fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
     let brk = breaking()?;
     let secs = probe_secs();
     let stall_file =
@@ -221,15 +234,22 @@ pub(super) fn load_probe(seed: u64) -> Result<()> {
         ));
     }
     let extra_refs: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let (env, _root, mut clients, _) = cluster(NAME, &["a", "b"], &extra_refs, 0)?;
+    let (env, _root, mut clients, _) = cluster(NAME, names, &extra_refs, 0)?;
     let result = (|| -> Result<()> {
         let ledger = Ledger::with_client_deadline(super::m9::client_deadline());
         let errnos = ErrnoLog::new();
         let epoch0 = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
         eprintln!(
-            "    {NAME}: a holds epoch {epoch0}; workload {secs} s under load {:?}",
+            "    {NAME}: {} holds epoch {epoch0}; workload {secs} s under load {:?}",
+            clients[0].name,
             crate::load::label().unwrap_or_else(|| "none".into())
         );
+        // The takeover cell's first pause must find the backup enrolled:
+        // before that, the lease expires and the other node acquires it
+        // without sealing anything (no backup takeover, no stranded rows).
+        if takeover {
+            super::m9::wait_for_backup(&clients[0], crate::load::scaled(Duration::from_secs(30)))?;
+        }
         // ---- data and acknowledged writes.
         let until = Instant::now() + Duration::from_secs(secs);
         let slowest = std::thread::scope(|s| {
@@ -417,6 +437,29 @@ pub(super) fn load_probe(seed: u64) -> Result<()> {
             })
             .collect();
         anyhow::ensure!(bad.is_empty(), "acknowledged writes: {}", bad.join("; "));
+        // A profile that pauses the node mounted first (the root) must
+        // have deposed it: the other node sealed its epoch and took the
+        // root over through its backup. Without a takeover the cell
+        // proved nothing about one (`load-probe` mounts `a` first, so
+        // `pause:...@b` never touches the root there).
+        if crate::load::pauses_node(&clients[0].name) {
+            let takeovers: u64 = clients[1..]
+                .iter()
+                .map(|c| {
+                    crate::verify::counters(c)["backup_takeovers"]
+                        .as_u64()
+                        .unwrap_or(0)
+                })
+                .sum();
+            anyhow::ensure!(
+                takeovers >= 1,
+                "the pause did not depose the root: {} held the root, no other node took it \
+                 over through its backup (backup_takeovers {takeovers}): the cell proved \
+                 nothing",
+                clients[0].name
+            );
+            eprintln!("    {NAME}: the root was taken over ({takeovers} backup takeover(s))");
+        }
         let got = read_counter(&clients[0].mnt.join("counter"))?;
         eprintln!("    {NAME}: counter {got}: {done} increments acknowledged, {doubt} in doubt");
         anyhow::ensure!(

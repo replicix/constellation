@@ -3349,6 +3349,22 @@ op, landed write or lease acquisition: its counter guarantees them);
 split-brain|errno|stall|log-missing|latency|latency-mild>` breaks one on
 purpose and must fail naming it (`latency-mild`, 2.5 s against a 1 s
 bound, is inconclusive under an applied probe-blind injector only).
+`load-probe` mounts `a` first, so `a` holds the root and a pause aimed at
+`b` (`pause:...@b`) never touches it. `load-probe-takeover` is the same
+workload with `b` mounted first, started once `b` lists `a` as its backup
+(so the first pause meets a seal, not a lease expiry): a pause aimed at `b`
+deposes the root, and `a`, its backup and the delegate of its own
+directory (`w-a`), seals and takes over through its backup with its own
+delegate rows stranded (about 110 to 170 rows in a run), the gate
+replaying them while the node's own writes go on. It fails a cell whose
+profile pauses `b` by name (`pause:...@b`; not a `step-pause`, whose 2 s
+steps may stay under the seal window) when the other node's
+`backup_takeovers` is still 0 afterwards: such a cell proved nothing. It is
+the cell that found the truncate loss across a takeover and the one where
+a write of the delegate's own, admitted before the gate's strand, executed
+between the strand and the replay (the takeover fence,
+`Meta::begin_local`). The runner's `takeover` phase runs it under the
+targeted pause profiles, and phase 3 under its own list.
 
 **The runner** (`tools/load-campaign/run.py`) runs a
 phase/profile/scenario/seed matrix, one `harness run` per cell with
