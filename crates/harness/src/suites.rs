@@ -201,6 +201,12 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// A fio job that writes with `--verify` saves its state to
+/// `<host>-<job>-<n>-verify.state` in the harness's working directory (the
+/// checkout), however the job's data directory is set. No fio run here
+/// reads it back (a verify pass is told its size), so none saves it.
+pub const FIO_NO_STATE: &str = "--verify_state_save=0";
+
 /// fio random write with crc32c end-to-end verification: any corruption
 /// or lost write under the injected fault surfaces as a verify error.
 pub fn fio_verify(mnt: &Path, size: &str, jobs: u32) -> Result<()> {
@@ -219,9 +225,7 @@ pub fn fio_verify(mnt: &Path, size: &str, jobs: u32) -> Result<()> {
             "--end_fsync=1",
             "--group_reporting",
             "--output-format=terse",
-            // Otherwise fio leaves `local-harness-verify-*-verify.state`
-            // in the harness's working directory (the checkout).
-            "--verify_state_save=0",
+            FIO_NO_STATE,
         ]);
     run(cmd, "fio verify")
 }

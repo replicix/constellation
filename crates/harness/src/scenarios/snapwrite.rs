@@ -659,16 +659,8 @@ fn ended_inconclusive(note: String) -> anyhow::Error {
     anyhow::Error::new(EndedInconclusive)
 }
 
-/// fio's job: sequential 1 MiB writes with a crc32c per block (written,
-/// not checked, so the write leg measures writes only); `verify_only`
-/// reads the file back and checks every block instead.
-fn fio(
-    dir: &Path,
-    name: &str,
-    size: &str,
-    runtime: u64,
-    verify_only: bool,
-) -> Result<(u64, f64, u64)> {
+/// The `fio` command for [`fio`]'s job.
+fn fio_command(dir: &Path, name: &str, size: &str, runtime: u64, verify_only: bool) -> Command {
     let mut cmd = Command::new("fio");
     cmd.arg(format!("--name={name}"))
         .arg(format!("--directory={}", dir.display()))
@@ -684,12 +676,27 @@ fn fio(
             "--end_fsync=1",
             "--verify=crc32c",
             "--output-format=json",
+            crate::suites::FIO_NO_STATE,
         ]);
     if verify_only {
         cmd.arg("--verify_only");
     } else {
         cmd.arg("--do_verify=0");
     }
+    cmd
+}
+
+/// fio's job: sequential 1 MiB writes with a crc32c per block (written,
+/// not checked, so the write leg measures writes only); `verify_only`
+/// reads the file back and checks every block instead.
+fn fio(
+    dir: &Path,
+    name: &str,
+    size: &str,
+    runtime: u64,
+    verify_only: bool,
+) -> Result<(u64, f64, u64)> {
+    let mut cmd = fio_command(dir, name, size, runtime, verify_only);
     let out = cmd.output().context("running fio")?;
     ensure!(
         out.status.success(),
@@ -708,4 +715,42 @@ fn fio(
         w["runtime"].as_u64().unwrap_or(0) as f64 / 1000.0,
         w["bw_bytes"].as_u64().unwrap_or(0),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fio write-then-verify of the scenario's job leaves nothing in the
+    /// working directory it runs from (the harness's is the checkout): fio
+    /// otherwise saves `<host>-<job>-<n>-verify.state` there.
+    #[test]
+    fn fio_leaves_no_state_file_in_the_working_directory() {
+        if !crate::suites::have("fio") {
+            eprintln!("skipped: no fio");
+            return;
+        }
+        let cwd = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        for verify_only in [false, true] {
+            let out = fio_command(data.path(), "run0-off", "4M", 5, verify_only)
+                .current_dir(cwd.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "fio (verify_only {verify_only}): {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let left: Vec<_> = std::fs::read_dir(cwd.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "fio left {left:?} in its working directory"
+        );
+    }
 }
