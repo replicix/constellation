@@ -891,7 +891,85 @@ mod tests {
         assert!(err.to_string().contains("changed hands"), "{err}");
         assert!(lock.exists());
         drop(file);
-        assert!(!lock_holder_pids(&lock).contains(&std::process::id()));
+        assert_eq!(wait_released(&lock), Vec::<u32>::new());
+    }
+
+    /// Wait (up to 10 s) for this process to stop holding the flock on
+    /// `lock` after its `File` is dropped; this process's pid if it still
+    /// holds it when the wait ends (none: it was released).
+    ///
+    /// Dropping the `File` closes our descriptor, but a flock belongs to the
+    /// open file description, which lives on while any process holds a copy
+    /// of the descriptor. A child that a sibling test thread spawns holds
+    /// such a copy between its `fork` and its `exec` (the descriptor is
+    /// close-on-exec, so the exec drops it; spawning with `vfork` or
+    /// `posix_spawn` shares the descriptor table the same way), and
+    /// `/proc/locks` goes on naming our pid until then. So the release is
+    /// not immediate under a parallel test run, only prompt.
+    #[cfg(target_os = "linux")]
+    fn wait_released(lock: &Path) -> Vec<u32> {
+        let me = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let holders = lock_holder_pids(lock);
+            if !holders.contains(&me) || Instant::now() >= deadline {
+                return holders.into_iter().filter(|p| *p == me).collect();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The flock outlives its `File` while a forked child that has not yet
+    /// exec'd holds a copy of the descriptor, and is released once it
+    /// execs: [`wait_released`] covers that window, an immediate check does
+    /// not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_flock_is_released_once_a_forked_child_execs() {
+        use std::io::Read;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+        use std::os::unix::process::CommandExt;
+        let _hook = wedged_hook_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(LOCK_NAME);
+        let file = native()
+            .file_lock
+            .lock(std::fs::File::create(&lock).unwrap())
+            .unwrap();
+        // The child reports through a pipe that it forked, then sleeps
+        // 200 ms before it execs (`status` returns only after the exec, so
+        // it runs on a thread).
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: plain syscall on a two-element array.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the pipe's descriptors are ours and used once each.
+        let (mut forked, wfd) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        let wfd_raw = wfd.as_raw_fd();
+        let spawner = std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("true");
+            // SAFETY: only async-signal-safe calls (`write`, `usleep`)
+            // between the fork and the exec.
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::write(wfd_raw, b"x".as_ptr().cast(), 1);
+                    libc::usleep(200_000);
+                    Ok(())
+                });
+            }
+            let status = cmd.status().unwrap();
+            drop(wfd);
+            status
+        });
+        let mut byte = [0u8; 1];
+        forked.read_exact(&mut byte).unwrap();
+        drop(file);
+        assert_eq!(wait_released(&lock), Vec::<u32>::new());
+        assert!(spawner.join().unwrap().success());
     }
 
     /// The reaper stays while its parent holds the lock and leaves once
