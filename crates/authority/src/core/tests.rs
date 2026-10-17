@@ -3396,6 +3396,44 @@ fn a_stranded_replay_is_not_gated_behind_an_op_awaiting_a_dead_epochs_log() {
     assert_eq!(requester.core.stats.awaiting_log_rerouted, 1);
 }
 
+/// The same wait the other way round: the op awaiting a dead epoch's log
+/// is itself the head of the replay queue (a fast-path row stranded and
+/// resubmitted in doubt) and another replay is queued behind it. The drain
+/// stops at the live client op, so the reroute must not wait for the entry
+/// behind it: it decides per op, for the replays ahead of the op's own
+/// entry (the whole queue, global, waited the 40 s client deadline).
+#[test]
+fn an_op_awaiting_a_dead_epochs_log_is_not_rerouted_only_after_the_replays_behind_it() {
+    let (mut requester, rid_u, _) = awaiting_log_forward("u");
+    requester.core.cfg.delegation = true;
+    let unlink_u = requester.create("u");
+    let rid_r = requester.rid(7);
+    let behind = requester.create("behind");
+    // The op's own entry first, then another replay of the node.
+    requester
+        .meta
+        .queue_replay(rid_u, &unlink_u, &Default::default())
+        .unwrap();
+    requester
+        .meta
+        .queue_replay(rid_r, &behind, &Default::default())
+        .unwrap();
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 2, 0, &[], &[], &[]).unwrap();
+    requester.core.ship.max_epoch = 2;
+    requester.core.ship.next_seq = 2;
+    requester.core.lease.cached_holder = Some(3);
+    let out = activity(&mut requester);
+    let sent: Vec<Rid> = sends(&out)
+        .iter()
+        .filter_map(|(to, m)| match m {
+            PeerMsg::MutateRequest { rid, .. } if *to == 3 => Some(*rid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, vec![rid_u], "{out:?}");
+    assert_eq!(requester.core.stats.awaiting_log_rerouted, 1);
+}
+
 /// Not moot: the acceptance was under the epoch this node holds (a
 /// delegate's stream, or a lease this node re-took at the same epoch) —
 /// the log carries it; and a continuation-epoch hold (S3 away:
@@ -23268,4 +23306,259 @@ fn a_replay_does_not_keep_rows_of_a_generation_the_log_ended_below_its_own_cut()
         !kept.iter().any(|(g, _)| *g == 4 || *g == 5),
         "no hold outlives its generation: {kept:?}"
     );
+}
+
+// ---- a deposed node's op is held for the replays ahead of it, not behind it ----
+
+/// A node (1) deposed with one fast-path row journaled under epoch 1 per
+/// name (rids seq 1, 2, ...), stranded and queued for replay by rid in
+/// that order, its lease mirror recovered (`clear_lost`: the recovery
+/// round's end) with node 2 as the cached holder. Returns the harness and
+/// the rids and ops in journal order.
+fn deposed_with_stranded_rows<const N: usize>(names: [&str; N]) -> (Harness, [(Rid, MutateOp); N]) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(1, None);
+    let rows: [(Rid, MutateOp); N] =
+        std::array::from_fn(|i| (h.rid(i as u64 + 1), h.create(names[i])));
+    for (rid, op) in &rows {
+        constellation_meta::execute_mutate(&h.meta, op, Some(*rid)).unwrap();
+    }
+    h.core.lease.mark_lost(2, 2, 1);
+    h.meta.strand_below_epoch(2).unwrap();
+    h.meta.set_holder_epoch(0);
+    let queued: Vec<Rid> = h
+        .meta
+        .pending_replays()
+        .unwrap()
+        .iter()
+        .map(|s| s.rid)
+        .collect();
+    let journal_order: Vec<Rid> = rows.iter().map(|(rid, _)| *rid).collect();
+    assert_eq!(queued, journal_order, "journal order");
+    h.core.lease.clear_lost();
+    (h, rows)
+}
+
+/// The `DurableWait::Lost` resubmission of `rid`: a live client op of the
+/// node, while the same rid is in the replay queue.
+fn resubmit_in_doubt(h: &mut Harness, rid: Rid, op: &MutateOp) -> Vec<Action> {
+    h.core.in_doubt_rids.insert(rid);
+    let mut out = Vec::new();
+    h.core.submit(
+        h.now,
+        rid,
+        op.clone(),
+        Policy::Client,
+        Default::default(),
+        crate::core::client::Origin::Client,
+        &h.meta,
+        &mut out,
+    );
+    assert!(h.core.clients.contains_key(&rid), "the op is live");
+    out
+}
+
+/// `rid` settled in the log, as the new holder's segment carries it.
+fn settle_in_the_log(h: &mut Harness, rid: Rid, op: &MutateOp) {
+    let MutateOp::Create {
+        parent,
+        name,
+        ino,
+        mode,
+        uid,
+        gid,
+    } = op
+    else {
+        panic!("a create");
+    };
+    let seg = [
+        LogRecord::Create {
+            parent: *parent,
+            name: name.clone(),
+            ino: *ino,
+            mode: *mode,
+            uid: *uid,
+            gid: *gid,
+            time_ns: 5,
+        },
+        LogRecord::Completed { rid },
+    ];
+    h.meta
+        .apply_segment(2, 2, &seg, &constellation_meta::TouchSet::default())
+        .unwrap();
+}
+
+fn forwards_of(out: &[Action], rid: Rid) -> bool {
+    sends(out)
+        .iter()
+        .any(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateRequest { rid: r, .. } if *r == rid))
+}
+
+fn queued_rids(h: &Harness) -> Vec<Rid> {
+    h.meta
+        .pending_replays()
+        .unwrap()
+        .iter()
+        .map(|s| s.rid)
+        .collect()
+}
+
+/// `load-probe-takeover` under `pause:lock-lapse+500:10000@b`: the
+/// fast-path write a deposed node executes at its unpause is resubmitted
+/// in doubt through the core and is also the head of the replay queue the
+/// deposition built. The drain stops at a head that is a live client op;
+/// the op was held for the entries behind it — which the drain could not
+/// reach — so each waited for the other until the client deadline (32 of
+/// 40 cells, `EIO` after 43 s). An op is held only for the replays ahead
+/// of its own entry.
+#[test]
+fn a_deposed_nodes_own_op_at_the_head_of_its_replay_queue_is_not_held_behind_the_rest() {
+    let (mut h, [(rx, x), (ry, _y)]) = deposed_with_stranded_rows(["x", "y"]);
+    let out = resubmit_in_doubt(&mut h, rx, &x);
+    // It goes to the holder at once (held, it sat in a backoff).
+    assert!(forwards_of(&out, rx), "forwarded: {out:?}");
+    assert_eq!(h.core.stats.deps_lost_holds, 0);
+    assert_ne!(h.core.clients[&rx].phase_kind(), ClientPhase::Backoff);
+    let mut out = Vec::new();
+    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    // The drain does not take the head's place, and keeps the order.
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert!(sends(&out).is_empty(), "nothing submitted: {out:?}");
+    assert!(!h.core.clients.contains_key(&ry), "ry waits behind rx");
+    assert_eq!(h.core.stats.replays_waiting_on_client, 1);
+    assert_eq!(queued_rids(&h), vec![rx, ry]);
+    // rx settles in the log (the forward's answer, applied): its entry is
+    // forgotten and the drain goes on with ry.
+    h.core.clients.remove(&rx);
+    settle_in_the_log(&mut h, rx, &x);
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert!(forwards_of(&out, ry), "ry goes to the holder: {out:?}");
+}
+
+/// The ordering the rule above keeps: an op behind another stranded
+/// replay of its node is held until that replay settles (a later write
+/// must not overtake it).
+#[test]
+fn a_deposed_nodes_own_op_behind_another_replay_is_held_until_it_settles() {
+    let (mut h, [(ry, y), (rx, x)]) = deposed_with_stranded_rows(["y", "x"]);
+    let out = resubmit_in_doubt(&mut h, rx, &x);
+    assert!(!forwards_of(&out, rx), "held, not forwarded: {out:?}");
+    assert_eq!(h.core.clients[&rx].phase_kind(), ClientPhase::Backoff);
+    assert!(h.core.stats.deps_lost_holds >= 1);
+    // The drain replays the entry ahead of it.
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert!(forwards_of(&out, ry), "ry goes to the holder: {out:?}");
+    assert_eq!(h.core.stats.replays_waiting_on_client, 0);
+    // Held while ry is in flight.
+    let mut out = Vec::new();
+    assert!(h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    // ry settles: rx proceeds.
+    h.core.clients.remove(&ry);
+    h.core.replay.in_flight = None;
+    settle_in_the_log(&mut h, ry, &y);
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    let mut out = Vec::new();
+    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+}
+
+/// The middle of three: held for the entry ahead of it, not for the one
+/// behind it (which the drain reaches only after it).
+#[test]
+fn a_deposed_nodes_own_op_in_the_middle_of_its_queue_is_held_for_the_one_ahead_only() {
+    let (mut h, [(ry, y), (rx, x), (rz, _z)]) = deposed_with_stranded_rows(["y", "x", "z"]);
+    let out = resubmit_in_doubt(&mut h, rx, &x);
+    assert!(!forwards_of(&out, rx), "held for ry: {out:?}");
+    let mut out = Vec::new();
+    assert!(h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    // ry goes, lands in the log, its entry is forgotten.
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert!(forwards_of(&out, ry), "{out:?}");
+    h.core.clients.remove(&ry);
+    h.core.replay.in_flight = None;
+    settle_in_the_log(&mut h, ry, &y);
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert_eq!(
+        queued_rids(&h),
+        vec![rx, rz],
+        "rz is still queued behind rx"
+    );
+    // rz is unsettled, yet rx proceeds (it is the head now).
+    let mut out = Vec::new();
+    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(
+        h.core.own_replays_unsettled(&h.meta),
+        "a barrier still waits"
+    );
+}
+
+/// A client op that is also a queue entry owes the rows its entry
+/// recorded of the generations that are still live, as its replay would
+/// (the executor waits for them): the hold joins them into the op's
+/// `deps`. (The op's submit-time `deps` are cleared here: it was held, or
+/// its session had voided the rows, and so did not name them.)
+#[test]
+fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(1, None);
+    let data = LogRecord::Create {
+        parent: ROOT_INO,
+        name: "data".into(),
+        ino: (2 << 40) | 1,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let data_rid = Rid {
+        node: 2,
+        incarnation: 1,
+        seq: 1,
+    };
+    assert!(h
+        .meta
+        .apply_delegate_tx(
+            &[data],
+            Some(data_rid),
+            4,
+            7,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    let rx = h.rid(1);
+    let x = h.create("marker");
+    constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
+    h.core.lease.mark_lost(2, 2, 1);
+    h.meta.strand_below_epoch(2).unwrap();
+    h.meta.set_holder_epoch(0);
+    h.core.lease.clear_lost();
+    let queued = h.meta.pending_replays().unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].deps.iter().collect::<Vec<_>>(), vec![(4, 7)]);
+    // Generation 4 is live.
+    list_generation(&h, 1 << 40, 4);
+    resubmit_in_doubt(&mut h, rx, &x);
+    h.core.clients.get_mut(&rx).unwrap().deps.streams = constellation_meta::Streams::NONE;
+    let mut out = Vec::new();
+    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert_eq!(kept_deps(&h, rx), vec![(4, 7)]);
+    // An ended generation's rows are not owed.
+    crate::replica::Replica::void_stream(&h.meta, 4, 0);
+    h.core.clients.get_mut(&rx).unwrap().deps.streams = constellation_meta::Streams::NONE;
+    h.meta
+        .apply_records_journaled(&[LogRecord::Recall {
+            dir: 1 << 40,
+            gen: 4,
+        }])
+        .unwrap();
+    let mut out = Vec::new();
+    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert_eq!(kept_deps(&h, rx), Vec::<(u64, u64)>::new());
 }

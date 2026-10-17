@@ -600,6 +600,11 @@ pub struct Stats {
     pub deps_lost_holds: u64,
     pub deps_refreshed: u64,
     pub deps_lost_refused: u64,
+    /// Drain ticks that stopped at the head of the replay queue because
+    /// its rid is in flight as a client op (a fast-path row stranded by a
+    /// deposition and resubmitted through the core): a handful per
+    /// episode, never running on for the client deadline.
+    pub replays_waiting_on_client: u64,
     /// Delegate transactions a root did not append because their `deps`
     /// named a newer root tenure (it was deposed without knowing yet).
     pub deleg_append_newer_tenure: u64,

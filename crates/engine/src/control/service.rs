@@ -661,6 +661,8 @@ impl EngineControl {
             forward_dedup_hits: stats.forward_dedup_hits,
             forward_retries: stats.forward_retries,
             forward_indoubt_resolved: stats.forward_indoubt_resolved,
+            deps_lost_holds: stats.deps_lost_holds,
+            replays_waiting_on_client: stats.replays_waiting_on_client,
             own_s3: api::OwnS3Status {
                 stalled: core.own_s3.stalled,
                 peers_reach_s3: core.own_s3.peers_reach_s3,

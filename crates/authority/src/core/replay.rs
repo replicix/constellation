@@ -255,7 +255,11 @@ impl Core {
             }
             if self.clients.contains_key(&head.rid) {
                 // Still in flight as a client op (its reply is what will
-                // resolve it); nothing to do this tick.
+                // resolve it); nothing to do this tick. (Counted: an op
+                // held for the replays behind this entry would wait for
+                // this very drain; `hold_for_lost_deps` holds an op only
+                // for the entries ahead of its own.)
+                self.stats.replays_waiting_on_client += 1;
                 return;
             }
             // Chunk close-stall-followup: in a continuation epoch that

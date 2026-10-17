@@ -174,7 +174,15 @@ executed (a delegate or the root answers `Held`; an inbox op stays in
 the inbox and its requester withdraws it), and the requester re-sends
 it with fresh `deps` once its own replays have landed. A node holds its
 new writes while it has stranded ops of its own to replay, so its
-writes stay in the order it issued them. Which generations a replica
+writes stay in the order it issued them. An op that is itself one of
+the stranded ops (a fast-path write a deposition rolled back after its
+acknowledgement wait had already ended in doubt, resubmitted by rid) is
+held only for the replays queued ahead of it, and it carries the
+delegate rows its own entry recorded (as its replay would): held for the
+ones behind, it and the replay drain would wait for each other until the
+client deadline. `status` counts the checks that held an op for replays
+(`deps_lost_holds`) and the drain ticks that stopped at a head that is such
+an op (`replays_waiting_on_client`); both stay small. Which generations a replica
 holds, and which have ended, is rebuilt when it reopens its store
 (from the delegation table's highest generation and live rows, and the
 log's per-generation index): a watermark naming a generation that

@@ -235,6 +235,9 @@ impl super::Core {
             if parked_local.contains_key(rid) {
                 state.push_str("+ack-parked");
             }
+            if c.deps_held {
+                state.push_str("+held-for-replays");
+            }
             if c.history.last().is_none_or(|(_, s)| *s != state) && c.history.len() < HISTORY_CAP {
                 c.history.push((now.since(c.submitted), state));
             }
@@ -648,8 +651,14 @@ impl Core {
     /// long-delegated seeds 74189, 76967, long-delegated-backup 77901).
     ///
     /// So a client op is held (a backoff, re-checked on its timer) while
-    /// this node has replays to settle; then, if its `deps` were lost,
-    /// they are taken afresh — ordering after wherever the replays
+    /// this node has replays to settle *ahead of its own entry, if it has
+    /// one* (a fast-path row a deposition stranded is resubmitted through
+    /// the core by `DurableWait::Lost` and is also queued; held for the
+    /// entries behind it, the op and the drain — which waits for a live
+    /// client op at the head of the queue — waited for each other until
+    /// the client deadline: `load-probe-takeover` under
+    /// `pause:lock-lapse+500:10000@b`, 32 of 40 cells); then, if its
+    /// `deps` were lost, they are taken afresh — ordering after wherever the replays
     /// landed — and it proceeds. `true`: held. A replay itself is never
     /// held (the queue is what the others wait for); its own lost `deps`
     /// are refreshed, and so are the recorded rows (`StrandedOp::deps`) of
@@ -669,7 +678,22 @@ impl Core {
         };
         let lost = replica.deps_lost(&c.deps);
         let replay = matches!(c.origin, Origin::Replay { .. });
-        let unsettled = !replay && self.own_replays_unsettled(replica);
+        let first_hold = !c.deps_held;
+        let unsettled = !replay && self.own_replays_unsettled_ahead_of(replica, Some(rid));
+        // A client op that is also a queue entry (a deposition stranded its
+        // row after the op was resubmitted in doubt) owes the rows its
+        // entry recorded of the generations that are still live, as its
+        // replay would (`live_rows`): the executor waits for them.
+        let queued_owed = if replay {
+            Streams::NONE
+        } else {
+            self.queued_rows_owed(rid, replica)
+        };
+        let owing = c
+            .deps
+            .streams
+            .join(&queued_owed)
+            .filter(|j| *j != c.deps.streams);
         // A replay's recorded rows (`StrandedOp::deps`) of a generation
         // the log has ended are not waited for either: see below.
         let ended = match &c.origin {
@@ -677,10 +701,36 @@ impl Core {
             _ => false,
         };
         if !lost && !unsettled && !c.deps_held && !ended {
+            if let Some(joined) = owing {
+                if let Some(c) = self.clients.get_mut(&rid) {
+                    c.deps.streams = joined;
+                }
+            }
             return false;
         }
         if unsettled {
             self.stats.deps_lost_holds += 1;
+            if first_hold && tracing::enabled!(tracing::Level::DEBUG) {
+                // A silent hold hid a 40 s deadlock once: say what the op
+                // waits for (it is also in the op's history, as
+                // `+held-for-replays`), by the hold's own rule.
+                let queue = replica.pending_replays().unwrap_or_default();
+                let own = queue.iter().find(|s| s.rid == rid).map(|s| s.queue_seq);
+                let table = replica.delegation_table();
+                let waiting_for: Vec<_> = queue
+                    .iter()
+                    .filter(|s| self.is_unsettled_replay_ahead(s, own, &table))
+                    .take(4)
+                    .map(|s| (s.rid, s.queue_seq, s.gen))
+                    .collect();
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    ?rid,
+                    in_flight = ?self.replay.in_flight,
+                    ?waiting_for,
+                    "an op is held for this node's replays queued ahead of it"
+                );
+            }
             let old = self.clients.get_mut(&rid).and_then(|c| c.timer.take());
             if let Some(t) = old {
                 self.cancel_timer(t, out);
@@ -715,6 +765,8 @@ impl Core {
             let live = live_rows(recorded, replica);
             deps.streams = live.join(&deps.streams).unwrap_or(live);
             owed = Some(live);
+        } else if let Some(joined) = deps.streams.join(&queued_owed) {
+            deps.streams = joined;
         }
         tracing::debug!(
             node = self.cfg.node_id,
@@ -741,22 +793,78 @@ impl Core {
     /// delegate re-streams it in order — and not one whose rid is already
     /// in flight as a client op).
     pub(super) fn own_replays_unsettled(&self, replica: &dyn Replica) -> bool {
-        if self.replay.in_flight.is_some() {
+        self.own_replays_unsettled_ahead_of(replica, None)
+    }
+
+    /// [`Self::own_replays_unsettled`], for an op of the given rid: only
+    /// the entries the drain replays *before the op's own entry* count
+    /// (those with a smaller `queue_seq`; the drain walks the queue in
+    /// that order), and so none do for an op at the head of the queue.
+    /// An op whose rid is not queued (or `None`: a barrier has no rid)
+    /// waits for every entry.
+    ///
+    /// The distinction is one of liveness. A fast-path row a deposition
+    /// strands is a live client op (the `DurableWait::Lost` resubmission)
+    /// and a queue entry at once; the drain stops at an entry that is in
+    /// flight as a client op, so it never reaches the entries behind it,
+    /// and an op held for them is held until its deadline.
+    pub(super) fn own_replays_unsettled_ahead_of(
+        &self,
+        replica: &dyn Replica,
+        rid: Option<Rid>,
+    ) -> bool {
+        // A barrier (no rid) waits for everything, a replay in flight
+        // included, without reading the queue.
+        if rid.is_none() && self.replay.in_flight.is_some() {
             return true;
         }
         let Ok(queue) = replica.pending_replays() else {
-            return false;
+            return self.replay.in_flight.is_some();
         };
+        let own = rid.and_then(|rid| queue.iter().find(|s| s.rid == rid).map(|s| s.queue_seq));
+        if self
+            .replay
+            .in_flight
+            .is_some_and(|q| own.is_none_or(|own| q < own))
+        {
+            return true;
+        }
         if queue.is_empty() {
             return false;
         }
         let table = replica.delegation_table();
-        queue.iter().any(|s| {
-            s.refused.is_none()
-                && !s.foreign
-                && !self.clients.contains_key(&s.rid)
-                && (s.gen == 0 || !table.iter().any(|d| d.gen == s.gen))
-        })
+        queue
+            .iter()
+            .any(|s| self.is_unsettled_replay_ahead(s, own, &table))
+    }
+
+    /// The hold's rule for one queue entry: an op whose own entry has
+    /// `queue_seq` `own` (none: it has none) waits for `entry` when the
+    /// drain replays it first and it is this node's own, not refused, not
+    /// held while its generation lives, and not a live client op itself.
+    fn is_unsettled_replay_ahead(
+        &self,
+        entry: &constellation_meta::StrandedOp,
+        own: Option<u64>,
+        table: &constellation_meta::delegation::DelegationTable,
+    ) -> bool {
+        own.is_none_or(|own| entry.queue_seq < own)
+            && entry.refused.is_none()
+            && !entry.foreign
+            && !self.clients.contains_key(&entry.rid)
+            && (entry.gen == 0 || !table.iter().any(|d| d.gen == entry.gen))
+    }
+
+    /// The rows of live generations the queue entry of `rid` recorded (its
+    /// `StrandedOp::deps`, `live_rows`); none when the rid is not queued.
+    fn queued_rows_owed(&self, rid: Rid, replica: &dyn Replica) -> Streams {
+        let Ok(queue) = replica.pending_replays() else {
+            return Streams::NONE;
+        };
+        queue
+            .iter()
+            .find(|s| s.rid == rid)
+            .map_or(Streams::NONE, |s| live_rows(&s.deps, replica))
     }
 
     /// Ops of this node waiting in an S3 inbox with lost `deps`: the root
@@ -2505,7 +2613,7 @@ impl Core {
         let max = self.ship.max_epoch;
         let ended =
             |c: &ClientOp| matches!(c.phase, Phase::AwaitingLog { epoch, .. } if epoch < max);
-        if !self.clients.values().any(ended) || self.own_replays_unsettled(replica) {
+        if !self.clients.values().any(ended) {
             return;
         }
         let mut rids: Vec<(u64, Rid, Epoch)> = self
@@ -2519,6 +2627,13 @@ impl Core {
         rids.sort_unstable();
         for (_, rid, epoch) in rids {
             if !self.clients.get(&rid).is_some_and(&ended) {
+                continue;
+            }
+            // Per op, as `hold_for_lost_deps` holds it: for the replays
+            // queued ahead of its own entry (an op that is itself the head
+            // of the queue is not held for the entries behind it, which
+            // the drain cannot reach while it is in flight).
+            if self.own_replays_unsettled_ahead_of(replica, Some(rid)) {
                 continue;
             }
             if let Some(outcome) = completed_as_outcome(replica, rid, epoch) {

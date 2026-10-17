@@ -474,6 +474,16 @@ pub struct StatusReport {
     /// `completed` instead of re-executing (a genuine takeover finding
     /// the op already happened).
     pub forward_indoubt_resolved: u64,
+    /// Checks of this node's client ops held behind its own stranded
+    /// replays (an op is held only for the replays queued ahead of its
+    /// own entry): small per deposition, never running on for the client
+    /// deadline.
+    pub deps_lost_holds: u64,
+    /// Replay-drain ticks that stopped at the head of the replay queue
+    /// because its rid is in flight as a client op (a fast-path row a
+    /// deposition stranded, resubmitted through the core): a handful per
+    /// episode.
+    pub replays_waiting_on_client: u64,
     /// EC2 campaign 8 A-1: this node's own S3 path, and what its ops did
     /// without it.
     pub own_s3: OwnS3Status,

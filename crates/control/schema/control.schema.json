@@ -8245,6 +8245,12 @@
           "$ref": "#/$defs/DelegationReport",
           "description": "Plan 30 §M11."
         },
+        "deps_lost_holds": {
+          "description": "Checks of this node's client ops held behind its own stranded\nreplays (an op is held only for the replays queued ahead of its\nown entry): small per deposition, never running on for the client\ndeadline.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "designations": {
           "description": "Live offline designations visible to this node (phase 4a,\nDESIGN.md §5.2). Replicated via S3, so every node's view should\nagree modulo the periodic refresh lag.",
           "items": {
@@ -8389,6 +8395,12 @@
           "$ref": "#/$defs/ReintegrationStatus",
           "description": "Stranded-journal reintegration (phase 4b)."
         },
+        "replays_waiting_on_client": {
+          "description": "Replay-drain ticks that stopped at the head of the replay queue\nbecause its rid is in flight as a client op (a fast-path row a\ndeposition stranded, resubmitted through the core): a handful per\nepisode.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "s3": {
           "$ref": "#/$defs/S3RequestStatus",
           "description": "Object-store requests this daemon has issued since it started\n(every filesystem it serves), by kind and by key area."
@@ -8464,6 +8476,8 @@
         "forward_dedup_hits",
         "forward_retries",
         "forward_indoubt_resolved",
+        "deps_lost_holds",
+        "replays_waiting_on_client",
         "own_s3",
         "inbox",
         "quota",
