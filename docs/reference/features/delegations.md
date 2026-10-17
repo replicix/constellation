@@ -390,10 +390,19 @@ designations create no delegation.
   re-journals the predecessor's appends of delegate streams under their
   delegation origin, in the predecessor's order; if it was itself a
   delegate, its own unappended transactions are rolled back and
-  replayed by rid after that tail, never shipped ahead of it. Such a
-  generation is marked in the same local transaction: its stream now
-  has a hole (the replayed rows are root rows), so the node never
-  executes in it again. It ends the generation itself once its gate
+  replayed by rid after that tail, never shipped ahead of it. Every
+  generation the node holds is marked in that same local transaction (a
+  holed one: its stream now has a hole, the replayed rows are root
+  rows), so the node never executes in it again. The mark is also the
+  gate's fence: the strand, the tail and the replay are separate store
+  transactions, and the node's own writes in its subtree execute on the
+  store directly, admitted by a mirror of the delegation table that
+  lags the core by an event. A write admitted before the strand and
+  reaching the store's writer lock after it is refused there (the
+  store's `NotAdmitted`, nothing written) and goes through the core,
+  whose gate parks it until the replay is done: it lands after the
+  stranded rows, never before them under their names. The mark is never
+  cleared (generations are not reused). It ends the generation itself once its gate
   opens; if it crashes or loses the lease first, it comes back as a
   stopped delegate that answers a recall at the log's index of the
   stream, and the next root ends it there. A generation the successor inherits is learned when its takeover gate

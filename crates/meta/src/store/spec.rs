@@ -3232,8 +3232,8 @@ impl Meta {
     /// [`Self::strand_below_epoch`] strands, and this node's own
     /// transactions as the *delegate* of generations `own_gens` (a
     /// `Local` row of one of them; the fast path may have executed some
-    /// after the lease was acquired, under its epoch). A delegate that takes the root over
-    /// has those rows in its journal *before* the predecessor's backup
+    /// after the lease was acquired, under its epoch). A delegate that
+    /// takes the root over has those rows in its journal *before* the predecessor's backup
     /// tail it is about to re-apply, but the log orders them the other
     /// way: the tail holds the predecessor's appends of them (after the
     /// `Delegate` that granted them, and before whatever it appended
@@ -3244,19 +3244,35 @@ impl Meta {
     /// the appended ones in their place (completing their rids) and the
     /// queued replay re-executes the rest by rid after it, in order.
     ///
-    /// Such a generation's stream has a hole from here on: the rows the
-    /// predecessor never appended are root rows now, but this node's
-    /// persisted stream counter still counts them, so its next row of
-    /// the generation would follow the hole and no root's cursor ever
-    /// reaches it. The generation is marked stranded in the same
-    /// transaction ([`Meta::delegate_stranded`]): this node never
-    /// executes in it again, and it ends at what the log holds of it —
-    /// ended by this node once its gate opens, or by whichever root
-    /// inherits it if this node crashes or loses the lease first
-    /// (`locks-unlinked-delegated-dbackup-random` seeds 2477 and 2982:
-    /// the delegate-turned-root crashed inside its takeover gate,
-    /// restarted as the generation's delegate and streamed index 6 to a
-    /// root waiting for 3, forever).
+    /// A generation that lost rows has a hole in its stream from here on:
+    /// the rows the predecessor never appended are root rows now, but
+    /// this node's persisted stream counter still counts them, so its
+    /// next row of the generation would follow the hole and no root's
+    /// cursor ever reaches it. Every own generation, holed or not, is
+    /// marked in the same transaction ([`Meta::delegate_stranded`]): it
+    /// ends at this gate, and this node never executes in it again.
+    /// It ends at what the log holds of it, by this node once its gate
+    /// opens, or by whichever root inherits it if this node crashes or
+    /// loses the lease first (`locks-unlinked-delegated-dbackup-random`
+    /// seeds 2477 and 2982: the delegate-turned-root crashed inside its
+    /// takeover gate, restarted as the generation's delegate and
+    /// streamed index 6 to a root waiting for 3, forever). The mark is
+    /// never cleared: generations are never reused.
+    ///
+    /// The mark is also the gate's fence. The strand, the backup tail
+    /// and the replay are separate store transactions, and nothing of
+    /// this node may execute on the replica between the strand and the
+    /// end of the replay; the delegate's own fast path executes straight
+    /// against the store, admitted by the engine's mirror of the core's
+    /// delegation table, which lags the core by an event. A write that
+    /// had been admitted before the strand and reached the writer lock
+    /// after it landed first, under the stranded rows' names (`f7`: the
+    /// replay found the name taken, the stranded rename moved the fresh
+    /// inode). [`Meta::begin_local`] therefore refuses a delegate's own
+    /// execution under a marked generation (`MetaError::NotAdmitted`),
+    /// unwritten, at the write under the writer lock, and the engine
+    /// sends the op through the core, whose gate parks it until the
+    /// replay is done.
     pub fn strand_for_takeover(&self, epoch: u64, own_gens: &[u64]) -> Result<Stranded, MetaError> {
         let mut tx = self.db.write_tx();
         let staged = UsageTracker::staging();
@@ -3264,18 +3280,29 @@ impl Meta {
             LiveEntry::Local { gen, .. } if *gen != 0 && own_gens.contains(gen) => Some(*gen),
             _ => None,
         };
-        let holed: HashSet<u64> = read_live(&tx, self)?
-            .iter()
-            .filter_map(|(_, entry)| own(entry))
-            .collect();
         let stranded = strand_tx(&mut tx, self, &staged, |entry| {
             entry.stranded_by(epoch) || own(entry).is_some()
         })?;
-        if !stranded.any() {
+        if !stranded.any() && own_gens.is_empty() {
             return Ok(stranded);
         }
-        for gen in holed {
-            local::mark_deleg_stranded_tx(&mut tx, &self.local, gen);
+        // Every generation this node holds as the delegate ends here,
+        // whether or not the strand took rows of it: from this
+        // transaction on, under the writer lock, its own delegate
+        // execution is refused (`Meta::begin_local`), and the op goes
+        // through the core, whose gate parks it until the replay is done.
+        // The core's own `stopped` (set from this mark after the strand
+        // returns) and the engine's mirror of it lag by an event; the
+        // store is the fence. A write the fast path had admitted before
+        // the strand and that reached the writer lock after it used to
+        // land first, under the stranded rows' names: the replay then
+        // found `f7` taken, the stranded rename moved the fresh inode,
+        // and acknowledged writes were lost (load campaign
+        // `load-probe-takeover` under `pause:lock-lapse+500:10000@b`,
+        // seeds 55/69/75/77). Nothing of this node executes on the
+        // replica between this strand and the end of the gate's replay.
+        for gen in own_gens {
+            local::mark_deleg_stranded_tx(&mut tx, &self.local, *gen);
         }
         let from = journal_from(&tx, self)?;
         compact_tx(&mut tx, self, from)?;

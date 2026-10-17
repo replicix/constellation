@@ -836,6 +836,23 @@ seal path, `on_deleg_sealed`, before the end).
    `mark_deleg_stranded_tx`, `delegate_stranded`, the stopped-at-install
    rule and the recall answer at `log_stream_idx` (`96f4565`'s
    machinery): a generation never gets a hole.
+   **Not deleted without a replacement: the fence.** The mark is also what
+   keeps the node's own delegate fast path off the replica during the
+   gate (`Meta::begin_local` refuses a delegate's own execution under a
+   marked generation, `NotAdmitted`, at the write under the writer lock;
+   the engine then sends the op through the core, whose gate parks it).
+   The engine's admission is a mirror of the core's table, refreshed
+   after an event, so without a store-level fence an own write queued
+   behind step 1's "move" transaction executes between the move and the
+   re-append: its fresh row precedes the moved rows and the verbatim
+   re-append of `Create f7` fails with `TailDiverged` (the gate closed,
+   a stuck takeover; load campaign `load-probe-takeover` seeds
+   55/69/75/77 lost the acknowledged file to this race before the
+   fence). Step 1's "move" must therefore end the node's own generations
+   in its own transaction, under a key of C3's own, and `begin_local`
+   must refuse the delegate execution under an ended generation: the
+   rule is that while a sequencer's gate is open none of its own paths
+   executes a mutation on the replica.
 4. **A deposed root keeps another generation's rows as a member copy**
    (§5.6) instead of the `RebuildReplica` → `reset_for_rebuilt_ns_tx`
    → `Records` replays path. `recover_deposed` (`jobs.rs:1381-1410`)

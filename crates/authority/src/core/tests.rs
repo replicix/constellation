@@ -2430,6 +2430,123 @@ fn a_folded_truncate_replays_as_the_base_checked_cut() {
     );
 }
 
+/// Load campaign `load-probe-takeover` (`pause:lock-lapse+500:10000@b`,
+/// seeds 55/69/75/77): a delegate that takes the root over strands its own
+/// unappended rows in one store transaction and replays them in another.
+/// A write of its own that the fast path had admitted before the strand
+/// reaches the store's writer lock after it, and used to execute there,
+/// before the replay: the fresh `Create f7` took the name, the stranded
+/// `Create f7` was refused (`EEXIST`) with its commit (`no such inode`),
+/// and the stranded rename moved the fresh inode to `g7`; acknowledged
+/// writes lost. The strand ends every own generation in its transaction
+/// and the store refuses a delegate's own execution under an ended one
+/// (`NotAdmitted`, nothing written; the engine sends the op through the
+/// core, whose gate parks it behind the replay): the stranded rows replay
+/// first, and the refused write goes the root's way after them.
+#[test]
+fn a_delegates_own_write_between_the_takeovers_strand_and_its_replay_lands_after_it() {
+    use constellation_meta::MetaError;
+    let mut h = Harness::new(2);
+    let dir = h
+        .meta
+        .mkdir_at(
+            ROOT_INO,
+            "w-a",
+            h.meta.allocate_ino(ROOT_INO).unwrap(),
+            0o755,
+            0,
+            0,
+        )
+        .unwrap()
+        .ino;
+    // Everything so far is in the log.
+    let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    let tag = constellation_meta::locks::LockTag::NONE;
+    let now = 0;
+    let create = |ino| MutateOp::Create {
+        parent: dir,
+        name: "f7".into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    // The delegate's acknowledged rows of generation 1, never appended:
+    // the create of `f7` (seq 427), its commit, and the rename to `g7`.
+    let x = h.meta.allocate_ino(dir).unwrap();
+    let rename = MutateOp::Rename {
+        parent: dir,
+        name: "f7".into(),
+        new_parent: dir,
+        new_name: "g7".into(),
+        noreplace: false,
+    };
+    for (seq, op) in [
+        (1325, create(x)),
+        (1326, commit_of(x, None, b"seq-427")),
+        (1478, rename),
+    ] {
+        h.meta
+            .delegate_execute(&op, Some(a2(seq)), 1, Default::default(), &tag, now)
+            .unwrap();
+    }
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+    assert!(
+        MetaStore::journal_len(&h.meta).unwrap() > 0,
+        "the delegate's rows are unshipped Local rows"
+    );
+    assert!(h.meta.lookup(dir, "g7").unwrap().is_some());
+    // The gate's strand: the rows are rolled back and queued by rid.
+    let stranded = h.meta.strand_for_takeover(2, &[1]).unwrap();
+    assert_eq!(stranded.locals, 3, "{stranded:?}");
+    assert_eq!(h.meta.pending_replays().unwrap().len(), 3);
+    assert!(h.meta.lookup(dir, "f7").unwrap().is_none());
+    assert!(h.meta.lookup(dir, "g7").unwrap().is_none());
+    // The race: the fast path's next write (seq 487, a create of `f7`),
+    // admitted before the strand, reaches the writer lock after it.
+    let journal = MetaStore::journal_len(&h.meta).unwrap();
+    let y = h.meta.allocate_ino(dir).unwrap();
+    let raced =
+        h.meta
+            .delegate_execute(&create(y), Some(a2(1514)), 1, Default::default(), &tag, now);
+    assert!(
+        matches!(raced, Err(MetaError::NotAdmitted)),
+        "the ended generation executed the write ahead of the replay: {raced:?}"
+    );
+    assert_eq!(
+        MetaStore::journal_len(&h.meta).unwrap(),
+        journal,
+        "nothing was written"
+    );
+    assert!(h.meta.lookup(dir, "f7").unwrap().is_none());
+    // The gate's replay goes first, in order.
+    h.hold(2, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+    assert_eq!(h.core.stats.replay_conflicts, 0);
+    assert!(
+        !out.iter().any(|a| matches!(a, Action::ConflictCopy { .. })),
+        "{out:?}"
+    );
+    let g7 = h
+        .meta
+        .lookup(dir, "g7")
+        .unwrap()
+        .expect("the stranded rename landed");
+    assert_eq!(g7.ino, x, "g7 is the stranded create's file");
+    assert_eq!(content(&h.meta, x), (Some(manifest_of(b"seq-427")), 7));
+    assert!(h.meta.lookup(dir, "f7").unwrap().is_none());
+    // The refused write goes the root's way, after the replay.
+    constellation_meta::execute_mutate(&h.meta, &create(y), Some(a2(1514))).unwrap();
+    assert_eq!(h.meta.lookup(dir, "f7").unwrap().unwrap().ino, y);
+    assert_eq!(h.meta.lookup(dir, "g7").unwrap().unwrap().ino, x);
+}
+
 fn a2(seq: u64) -> Rid {
     Rid {
         node: 2,

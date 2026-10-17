@@ -754,7 +754,11 @@ impl Core {
         match replica.resolve_ownership(keys) {
             Ownership::Delegated(d) if d.node == self.me() => {
                 let s = self.dl.mine.get(&d.gen)?;
-                (!s.stopped && !s.lapsed).then_some(d.gen)
+                // `stopped` follows the store's mark at the next event; a
+                // generation a takeover's strand ended is refused at the
+                // write already (`Meta::begin_local`), so the core never
+                // executes under it, nor journals a refusal into it.
+                (!s.stopped && !s.lapsed && !replica.delegate_stranded(d.gen)).then_some(d.gen)
             }
             _ => None,
         }

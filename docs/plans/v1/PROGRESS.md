@@ -48625,3 +48625,122 @@ delegations are too short-lived to reach the collision, so no seed pins
 it); the generation-5 test
 `a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one` now lists
 its live generation in the table.
+
+## Fix: nothing of a taking-over delegate executes between its gate's strand and its replay (load campaign, 2026-10-17)
+
+Found by the host-load campaign with `b` mounted first (`b` holds the
+root, `a` is its backup and the delegate of its own directory `w-a`):
+`load-probe` under `pause:lock-lapse+500:10000@b`, seeds 55, 69, 75 and 77
+(the cell that found the truncate loss, after its fix). The ledger lost
+`a`'s acknowledged `f7`: it read back at `g7`, `f7` did not exist, and
+the acknowledged writes of the first `f7` and its rename were gone, with
+six empty conflict copies ("entry already exists" for the create, "no such
+inode" for the five commits of the file it never made). The unfixed runs
+of seeds 43 and 54 are the same loss, its ledger masked by wrong
+content.
+
+`a` sealed `b`'s epoch and took the root over. Its takeover gate runs
+three store transactions in one core call: `strand_for_takeover` (162
+unappended delegate rows rolled back and queued for replay by rid),
+`apply_backup_tail` (empty here) and `replay_queue_locally` (one
+transaction per row). `a`'s own writes in `w-a` do not go through the
+core: the FUSE thread executes them against the store as the delegate
+(`DelegateView::admit_for`, `Meta::delegate_execute_admitted`), admitted
+by the engine's mirror of the core's delegation table, which is refreshed
+after each core event. The core marks the generation `stopped` only
+after the strand returns, and the write-time re-check
+(`DelegateView::honours`) ignores `stopped` by design. So an own write the
+fast path had admitted before the strand and that reached the store's
+writer lock after it, in the 1.1 ms between the strand's commit and the
+replay's first transaction (it waits for that lock behind the strand
+transaction, which takes 7 ms), executed there: a fresh `Create f7`
+(seq 487) landed first. The replay then ran on top of it: the stranded
+`Create f7` (seq 427) got `EEXIST`, its commits "no such inode", and the
+stranded `Rename f7 -> g7` (seq 475) moved the fresh inode. The same
+microsecond pattern in all four seeds (the slow FUSE mutation entered the
+write gate 23 to 39 us after the strand's log line).
+
+The broken rule: nothing of the node may execute on the replica between
+the gate's strand and the end of its replay. The root's fast path already
+obeys it (`LeaseView::open_for_new_mutation` is false while the gate is
+pending); the delegate's was fenced by a mirror that lags the core.
+
+### What changed
+
+- `Meta::strand_for_takeover` marks every generation the node holds as the
+  delegate (`mark_deleg_stranded_tx`), not only the ones it holed, in the
+  strand's own transaction (also where the strand found nothing to roll
+  back: a write between the strand and the backup tail's re-journal would
+  precede the tail). The mark is never cleared: generations are never
+  reused, and it survives a restart (a restarted core installs the
+  generation stopped).
+- `Meta::begin_local` refuses a delegate's own execution
+  (`PendingDelegate { idx: None }`) under a marked generation with
+  `MetaError::NotAdmitted`, unwritten, under the store's writer lock: one
+  point read per delegate write. The root's append of a delegate's row
+  (`idx: Some`) and the root's own path are not affected. The engine
+  already sends `NotAdmitted` through the core (`submit_to_core`), whose
+  gate parks the op until the replay is done, so it executes once, after
+  the stranded rows; the site now logs at INFO ("delegate fast path
+  refused at the write") and counts it in `delegation_fast_path_routed`.
+- The core's `my_generation_for` also refuses a generation the store has
+  marked (the core's own delegate path never executes under it, nor
+  journals a refusal into it).
+- Plan 43 C3 deletes the mark with the strand's re-execution; its step 1
+  must carry this fence under its own key (noted in the plan).
+
+### Tests
+
+- `a_delegates_own_write_between_the_takeovers_strand_and_its_replay_lands_after_it`
+  (core, real `Meta`): the delegate's rows `Create f7`, its commit and
+  `Rename f7 -> g7`, the gate's strand, an own `Create f7` after it
+  (`NotAdmitted`, nothing journaled), the replay (`g7` holds the commit,
+  no conflict, nothing in the queue), then the refused write through the
+  root's path. On the previous tree the write executes (`Ok`).
+- `a_takeover_strand_ends_every_own_generation` (meta; replaces
+  `a_takeover_strand_marks_the_generations_it_holed`): every own
+  generation marked, a generation of another node not, the delegate's own
+  execution under a marked one refused with the journal and the stream
+  counter untouched, the root's append of its row and the root's own
+  write applied, and a strand that found nothing still marks.
+- Load campaign `load-probe-takeover` under `pause:lock-lapse+500:10000@b`
+  with verification on: see the results below.
+- Load campaign `load-probe-takeover` under `pause:lock-lapse+500:10000@b`,
+  verification on, seeds 55, 69, 75, 77 and 42..61, on this tree over
+  `9e59706`: no data or ledger violation in any of the 24 cells, no
+  replay conflict and no conflict copy on any node (the unfixed tree had 6
+  of each on these four seeds), 22 cells took the root over through the
+  backup (`a` rolled back and replayed 112 to 166 delegate rows). The
+  fence refused an own write at the store in 16 of the 24 (the INFO line
+  "delegate fast path refused at the write"). Two cells (seeds 46 and 52
+  of the second set) saw no backup takeover (`a` took the lease by expiry
+  before it was `b`'s backup) and fail the scenario's own check, as
+  intended. 21 of the 22 takeover cells still fail the errno check on the
+  two known, independent shapes (17 of them `b`'s in-doubt `EIO` past the
+  acquire deadline, 4 `b`'s `[bug] EIO` right after its first pause; not
+  touched here). On `4eedfc9` with only the scenario change,
+  the same four seeds did not lose the file in this run (the race needs an
+  own write in flight at the strand; two ended at the errno check, one
+  without a takeover): the unit test, not the campaign, is the
+  deterministic pin.
+- Sim sweeps, 2000 seeds each (0..2000), 0 failing: `delegated-holder-cut`,
+  `delegated-backup`, `placement-hot`, `long-backup`, `long-acks3`,
+  `backup-hot`, `long-delegated`, `locks-failover-backup`,
+  `delegated-two-gens-root-crash`, `delegated-root-gone`,
+  `delegated-delegate-restart`, `locks-writer-hold-delegated`,
+  `locks-stall-step-delegated`, `long-delegated-late-answers`,
+  `long-delegated-backup` (and its seed 3585). The simulation does not
+  model a delegate write queued behind the strand, so no seed pins the
+  window.
+- Harness, seed 42 (12 scenarios: `deposed-reintegration`,
+  `deposed-reintegration-backup`, `root-failover-with-delegates`,
+  `delegate-root-loss`, `delegate-crash`, `delegate-crash-backup`,
+  `delegate-backup-handoff-failover`, `auto-placement`, `backup-failover`,
+  `backup-failover-with-delegation`, `lock-failover`, `git-under-flock`):
+  all passed.
+- `cargo fmt --all -- --check` (only `crates/meta/src/store/gate.rs`, as on
+  `main`), clippy `--workspace --all-targets -D warnings` clean,
+  `cargo test --workspace --no-fail-fast`: 3144 passed, 55 ignored; the
+  one failure, `daemon_lock::tests::own_flock_is_found_and_live`, passes
+  alone and in the package rerun (70 passed): it reads `/proc/locks` on a
+  host busy with other runs.

@@ -383,6 +383,18 @@ impl View {
                 // would be past.
                 drop(admission);
                 if matches!(result, Err(MetaError::NotAdmitted)) {
+                    // The delegation lapsed, or the generation ended under
+                    // this node's own takeover gate (`Meta::begin_local`),
+                    // while the op waited for the writer lock: the core
+                    // orders the op, after the stranded rows its gate
+                    // replays.
+                    tracing::info!(
+                        ?rid,
+                        gen,
+                        ?op,
+                        "delegate fast path refused at the write: its delegation lapsed or its generation ended; through the core"
+                    );
+                    h.delegates.note_routed();
                     return self.submit_to_core(h, op, rid, &tag, false);
                 }
                 // `Journaled`, not `Nudge`: the core streams the row on

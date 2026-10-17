@@ -308,6 +308,21 @@ impl Meta {
         // `LockLapsed`). Nothing is written yet, so a refusal drops the
         // transaction unwritten.
         journal::PendingAdmission::check_at_write()?;
+        // This node's own execution as the delegate of a generation its
+        // takeover gate ended (`Meta::strand_for_takeover` marks every own
+        // generation in the strand's transaction, under this writer lock):
+        // refused unwritten, and the op goes through the core, whose gate
+        // parks it until the stranded rows are replayed. The engine's
+        // mirror of the delegation table lags the core by an event, so an
+        // op admitted before the strand reaches this lock after it; the
+        // store is the fence. The root's append of a delegate's row
+        // (`idx: Some`) is not an execution of this node's.
+        if let Some(d) = journal::PendingDelegate::peek() {
+            if d.idx.is_none() && kv_get_tx(tx, &self.local, &deleg_stranded_key(d.gen))?.is_some()
+            {
+                return Err(MetaError::NotAdmitted);
+            }
+        }
         journal::PendingLockTag::check_at_write(&self.locks)?;
         let start = journal::peek_next_seq(tx, &self.local)?;
         let epoch = self.holder_epoch.load(Ordering::SeqCst);
@@ -1469,38 +1484,131 @@ mod root_substitution_tests {
     }
 
     /// A takeover's strand of this node's own delegate rows leaves its
-    /// stream counter past them; the generation is marked in the same
-    /// transaction, and only a generation that lost rows is.
+    /// stream counter past them; every generation this node holds is
+    /// marked in the same transaction, holed or not: it ends at the gate.
+    /// From the mark on, under the writer lock, the node's own delegate
+    /// execution under it is refused unwritten (`NotAdmitted`: the fast
+    /// path admitted it before the strand, the store is the fence), while
+    /// the root's append of a delegate's row and the root's own writes are
+    /// not.
     #[test]
-    fn a_takeover_strand_marks_the_generations_it_holed() {
+    fn a_takeover_strand_ends_every_own_generation() {
         let meta = Meta::open_in_memory().unwrap();
         let tag = crate::locks::LockTag::NONE;
+        let create = |name: &str, n: u64| MutateOp::Create {
+            parent: ROOT_INO,
+            name: name.into(),
+            ino: (3 << 40) | n,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let rid = |seq| Rid {
+            node: 3,
+            incarnation: 1,
+            seq,
+        };
         for n in 1..=3 {
-            let op = MutateOp::Create {
-                parent: ROOT_INO,
-                name: format!("f{n}"),
-                ino: (3 << 40) | n,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-            };
-            let rid = Rid {
-                node: 3,
-                incarnation: 1,
-                seq: n,
-            };
             let (_, idx) = meta
-                .delegate_execute(&op, Some(rid), 5, Default::default(), &tag, 0)
+                .delegate_execute(
+                    &create(&format!("f{n}"), n),
+                    Some(rid(n)),
+                    5,
+                    Default::default(),
+                    &tag,
+                    0,
+                )
                 .unwrap();
             assert_eq!(idx, n);
         }
+        // Before the strand the generation executes.
+        assert!(!meta.delegate_stranded(5).unwrap());
         let stranded = meta.strand_for_takeover(2, &[5, 9]).unwrap();
         assert_eq!(stranded.locals, 3, "{stranded:?}");
         assert!(meta.delegate_stranded(5).unwrap());
-        assert!(!meta.delegate_stranded(9).unwrap(), "no row of 9 was here");
+        assert!(
+            meta.delegate_stranded(9).unwrap(),
+            "a generation without a row here ends at the gate too"
+        );
+        assert!(
+            !meta.delegate_stranded(11).unwrap(),
+            "not one of this node's"
+        );
         assert_eq!(meta.delegate_idx(5).unwrap(), 3, "the counter stays");
         assert_eq!(meta.log_stream_idx(5).unwrap(), 0);
         assert!(meta.delegate_txs_from(5, 1, usize::MAX).unwrap().is_empty());
+
+        // The fence: the node's own execution under an ended generation is
+        // refused, nothing written, no index consumed.
+        let journal = meta.journal_len().unwrap();
+        for gen in [5, 9] {
+            let refused = meta.delegate_execute(
+                &create("f4", 4),
+                Some(rid(4)),
+                gen,
+                Default::default(),
+                &tag,
+                0,
+            );
+            assert!(
+                matches!(refused, Err(MetaError::NotAdmitted)),
+                "gen {gen}: {refused:?}"
+            );
+            assert_eq!(meta.journal_len().unwrap(), journal);
+            assert_eq!(meta.delegate_idx(5).unwrap(), 3);
+            assert!(meta.lookup(ROOT_INO, "f4").unwrap().is_none());
+        }
+        // A generation this node still delegates is not fenced.
+        meta.delegate_execute(
+            &create("f4", 4),
+            Some(rid(4)),
+            11,
+            Default::default(),
+            &tag,
+            0,
+        )
+        .unwrap();
+
+        // The root's append of a delegate's row of the ended generation is
+        // not this node's execution: it applies.
+        let delegate = Meta::open_in_memory().unwrap();
+        let (records, idx) = delegate
+            .delegate_execute(
+                &create("f5", 5),
+                Some(rid(5)),
+                9,
+                Default::default(),
+                &tag,
+                0,
+            )
+            .unwrap();
+        assert!(meta
+            .apply_delegate_tx(&records, Some(rid(5)), 9, idx, Default::default())
+            .unwrap());
+        assert!(meta.lookup(ROOT_INO, "f5").unwrap().is_some());
+        // And the root's own path keeps working.
+        execute(&meta, &create("f6", 6), Some(rid(6))).unwrap();
+        assert!(meta.lookup(ROOT_INO, "f6").unwrap().is_some());
+
+        // Nothing stranded at all (the tail is the whole gate's work): the
+        // generation still ends, or a write between the strand and the
+        // tail's re-journal would precede it.
+        let quiet = Meta::open_in_memory().unwrap();
+        assert!(!quiet.strand_for_takeover(2, &[7]).unwrap().any());
+        assert!(quiet.delegate_stranded(7).unwrap());
+        let refused = quiet.delegate_execute(
+            &create("f1", 1),
+            Some(rid(1)),
+            7,
+            Default::default(),
+            &tag,
+            0,
+        );
+        assert!(
+            matches!(refused, Err(MetaError::NotAdmitted)),
+            "{refused:?}"
+        );
+        assert!(!quiet.strand_for_takeover(3, &[]).unwrap().any());
     }
 }
 
