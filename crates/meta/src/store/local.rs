@@ -903,7 +903,13 @@ impl Meta {
             journal::append_tx(&mut tx, &self.journal_ks, &self.local, &self.completed, rec)?;
         }
         if n == 0 {
-            if let Some(rid) = rid {
+            // The rid is this transaction's own, or the one `execute`
+            // armed for the `MutateOp::Records` op it runs (which no row
+            // took above): a replay by rid whose records all lost to a
+            // newer state, or a folded truncate's no-op replay
+            // (`authority::core::replay`'s `as_folded`), completes its rid all the same, and
+            // every other copy of the op queued by that rid dedups to it.
+            if let Some(rid) = rid.or_else(journal::PendingCompletion::take) {
                 // Nothing of it applied (every record lost to a newer
                 // state), but the op completed here: the log must still
                 // say so, once.

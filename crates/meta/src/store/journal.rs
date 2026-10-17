@@ -361,7 +361,7 @@ impl PendingCompletion {
         PendingCompletionGuard
     }
 
-    fn take() -> Option<Rid> {
+    pub(crate) fn take() -> Option<Rid> {
         PENDING_COMPLETION.with(|c| c.take())
     }
 }
@@ -519,7 +519,9 @@ pub(crate) fn append_tx(
 }
 
 /// Plan 30 §M9: a `Completed { rid }` row on its own (a re-applied
-/// transaction none of whose records took effect any more).
+/// transaction none of whose records took effect any more, or the no-op
+/// replay of a folded truncate's rid). Inside an inbox execution, the
+/// position it answers rides behind it, as in [`append_tx`].
 pub(crate) fn append_completion_tx(
     tx: &mut SingleWriterWriteTx,
     journal: &SingleWriterTxKeyspace,
@@ -537,6 +539,13 @@ pub(crate) fn append_completion_tx(
         rid.to_key(),
         Meta::encode_completed_row(cseq, now_ms),
     );
+    if let Some(ack) = PendingInboxAck::take() {
+        let aseq = next_seq_tx(tx, local)?;
+        let ack_row = ack.record();
+        tx.insert(journal, seq_key(aseq), ack_row.to_postcard()?);
+        OwnRows::note(aseq, &ack_row);
+        crate::store::inbox::set_inbox_ack_tx(tx, local, ack)?;
+    }
     Ok(cseq)
 }
 

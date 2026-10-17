@@ -212,9 +212,17 @@ journals it as `Refused { rid, code }` (the portable `Code`, carried as
 its own wire number rather than an OS errno), which ships like `Completed`
 and enters `completed` on every replica, so a second execution of the
 rid (a retry after a lost reply, a deposed holder's replay, an inbox
-drain) answers the same errno instead of re-evaluating the op. A
-transient refusal (`Conflict`, a stale manifest base) is not recorded; a
-`SetManifest` rebase is a new op with a new rid.
+drain) answers the same errno instead of re-evaluating the op. A stale
+manifest base (`Conflict`) and an ended lock grant (`LockLapsed`) are
+recorded the same way (`Refused { rid, Stale }`, which a dedup answers as
+the `Conflict` it was, and `ENOLCK`, which a dedup answers as the
+`LockLapsed` it was; the inbox drain records an ended grant as `EIO`):
+to the client they are final — a
+`SetManifest` rebase, or a re-send under a fresh token, is a new op with a
+new rid — and left unrecorded, a copy of the op queued by the same rid
+elsewhere (as `MutateOp::Records`, which carries neither the base check
+nor the token: see Replay by rid below) could still land later, over the
+write the refusal protected.
 
 **Requester-side retry.** A timeout, a transport error, or `Busy` leaves
 the op *in doubt*, never refused — only an explicit `Errno`, `Conflict`,
@@ -348,11 +356,19 @@ always a prefix of the durable log plus speculation it can take back:
   whoever holds the lease now; if a queued op cannot reach a holder for
   10 s, the node takes the lease itself. Exactly-once holds because every
   holder answers a rid it already executed from `recent` or `completed`
-  without executing it again. An accepted replay becomes a fresh shadow
-  and retires normally. A stranded transaction without an op of its own is
-  replayed from its records: a lone manifest commit as an optimistic
-  `SetManifest`, anything else (a snapshot row, a quota change, a clone)
-  as `MutateOp::Records`, under a rid derived from its journal position.
+  without executing it again, and because every resolution of a replay
+  leaves the rid's outcome in the log (a completion or a journaled
+  refusal, the fold below included): the same op can be queued
+  by the same rid on other nodes too — a deposed root's appends of a
+  delegate's stream, a subscriber's streamed rows — as
+  `MutateOp::Records`, which apply without the op's base check or lock
+  token, and only the rid's outcome keeps such a copy from running it
+  again, later and out of order. An accepted replay becomes a fresh
+  shadow and retires normally. A stranded transaction without an op of
+  its own is replayed from its records: a lone manifest commit as an
+  optimistic `SetManifest`, anything else (a snapshot row, a quota
+  change, a clone) as `MutateOp::Records`, under a rid derived from its
+  journal position.
   A manifest replay first uploads the inode's pending chunks, so the
   holder never receives a manifest naming a chunk S3 does not have.
 - **Refusals.** A replay the log no longer admits (the name was taken in
@@ -360,7 +376,11 @@ always a prefix of the durable log plus speculation it can take back:
   since plan 30 M14 phase 2, a cluster-lock grant its `lock_tag` names
   has ended: `LockLapsed`) is a genuine conflict. It is materialized as a
   `.constellation-conflict/<name>@<node>-<ts>-<seq>` copy (`<seq>`: the
-  refused op's rid sequence) and counted. The copy keeps the op's (or
+  refused op's rid sequence) and counted. The refusal is journaled as
+  the rid's outcome wherever it is decided — the takeover gate's local
+  replay, a holder or a delegate answering the drain, a stale base or an
+  ended grant included — so a copy of the op elsewhere dedups to it
+  instead of landing what the refusal kept out. The copy keeps the op's (or
   the inode's) owner and only the owner's permission bits, in a `0700`
   directory owned by the directory it is created in. The copy sits
   beside its file, except for an op that carried a `lock_tag`: that one
@@ -372,6 +392,22 @@ always a prefix of the durable log plus speculation it can take back:
   truncating write) queued before a manifest commit for the same inode is
   folded into it: the commit carries the final size, and truncating on its
   own would cut whatever the log put there when the commit is refused.
+  The truncate's rid is still settled: it replays by its own rid, in its
+  turn ahead of the commit, as the base-checked commit of the cut — from
+  the manifest the inode had just before the truncate (the stranded
+  row's before-image) to the manifest the truncate cut that to. It lands
+  where the file is still what it cut, or already the cut (a
+  predecessor's re-journaled backup tail carried the truncate but not the
+  commit), and is refused where another node wrote the file since; its
+  refusal is recorded for its rid but makes no conflict copy (the commit
+  decides), and the commit keeps the base it was composed on. Without a
+  before-image of the inode (or for a truncate up, which cut nothing) it
+  replays as the no-op of its rid, an empty `MutateOp::Records` that
+  journals the rid's completion and nothing else. Dropped instead of
+  settled, the truncate's rid stayed open, and a deposed root's copy of
+  it (its append of the delegate's row) ran the truncate after the
+  commit: the file came back empty on every node (load campaign, a
+  delegate that sealed its root's epoch).
 - **Takeover gate and epoch marker.** A node that wins a lease CAS keeps
   its lease view closed — no FUSE write, local forward or peer's forwarded
   op executes, and nothing ships — until its gate completes:
@@ -578,8 +614,12 @@ to exactly one execution, never a repeat.
 
 The default request timeout is 500 ms
 (`CONSTELLATION_FORWARD_TIMEOUT_MS`). An op still in doubt at its client
-deadline (twice the lease TTL) fails with `EIO` and is never
-re-executed. Setting `CONSTELLATION_FORWARD=off`
+deadline (twice the lease TTL) fails with `EIO` and is not retried by
+the requester. A stranded execution of it (an executor's journal row,
+queued for replay by rid after a takeover or a deposition) may still be
+replayed and land later, after ops the client issued since (plan 30 §M9:
+an accepted replay of an unacknowledged op lands; only a refused one is
+the client's answer). The rid executes once either way. Setting `CONSTELLATION_FORWARD=off`
 disables requester-side forwarding entirely: every non-holder mutation
 takes the lease-acquisition path (P2P handoff, then S3 CAS) directly, with
 no rid retries to attempt first, restoring writer-follows-lease placement.

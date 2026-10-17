@@ -1996,7 +1996,893 @@ fn the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit() {
         queue[0].refused.is_some(),
         "the manifest commit is refused on its base (its conflict copy follows)"
     );
-    assert!(h.meta.completed_outcome(a(1)).unwrap().is_none());
+    // Folded, the truncate is still settled: its rid completes (as a
+    // no-op) in the log, and the commit's refusal is the commit's outcome.
+    assert!(matches!(
+        h.meta.completed_outcome(a(1)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Executed { .. })
+    ));
+    assert_eq!(
+        h.meta.completed_outcome(a(2)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused {
+            code: constellation_types::Code::Stale
+        })
+    );
+}
+
+/// The file's content and size, for the fold tests below.
+fn content(meta: &Meta, ino: constellation_fs_core::Ino) -> (Option<Vec<u8>>, u64) {
+    (
+        MetaStore::manifest(meta, ino).unwrap(),
+        meta.getattr(ino).unwrap().unwrap().size,
+    )
+}
+
+/// A `bytes`-long manifest of one chunk, and the commit of it over `base`.
+fn manifest_of(bytes: &[u8]) -> Vec<u8> {
+    use constellation_fs_core::{ChunkHash, Manifest};
+    let chunks = [(0u64, ChunkHash::of(bytes))].into_iter().collect();
+    Manifest::from_sparse_chunks(4096, bytes.len() as u64, chunks, 64, ChunkHash::of)
+        .0
+        .encode()
+}
+
+fn commit_of(ino: constellation_fs_core::Ino, base: Option<Vec<u8>>, bytes: &[u8]) -> MutateOp {
+    MutateOp::SetManifest {
+        ino,
+        base_manifest: base,
+        manifest: manifest_of(bytes),
+        size: bytes.len() as u64,
+        mtime_ns: None,
+        ctime_ns: None,
+    }
+}
+
+fn truncate_of(ino: constellation_fs_core::Ino) -> MutateOp {
+    MutateOp::Setattr {
+        ino,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(0),
+        atime_ns: None,
+        mtime_ns: None,
+    }
+}
+
+/// What a deposed root holds of a delegate's truncate it appended but
+/// never shipped (`Meta::apply_delegate_tx`'s journal row, queued for
+/// replay by the delegate's rid as `MutateOp::Records` by
+/// `reset_for_rebuilt_ns_tx` or a stranding).
+fn appended_truncate_of(ino: constellation_fs_core::Ino) -> MutateOp {
+    MutateOp::Records {
+        records: vec![LogRecord::Setattr {
+            ino,
+            mode: None,
+            uid: None,
+            gid: None,
+            size: Some(0),
+            atime_ns: None,
+            mtime_ns: None,
+            time_ns: 1,
+        }],
+    }
+}
+
+/// `from`'s replay of `op` by `rid`, forwarded to the holder `h`.
+fn replay_copy_at(h: &mut Harness, from: NodeId, rid: Rid, op: MutateOp) -> MutateOutcome {
+    let out = h.step(Event::Peer {
+        from,
+        msg: PeerMsg::MutateRequest {
+            req: OpId(9_001),
+            rid,
+            op,
+            acked_through: 0,
+            deps: Default::default(),
+            applied: 0,
+            tag: Default::default(),
+        },
+    });
+    sends(&out)
+        .into_iter()
+        .find_map(|(to, msg)| match msg {
+            PeerMsg::MutateReply { req, outcome, .. } if to == from && *req == OpId(9_001) => {
+                Some(outcome.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no reply to the copy: {out:?}"))
+}
+
+/// Load campaign `pause:lock-lapse+500:10000@b`, seeds 42 and 61 (ten
+/// acknowledged, fsynced files read back empty on both nodes, no conflict
+/// copy). `a` is the delegate of `w-a` under root `b` and `b`'s backup;
+/// it overwrites a file (`O_TRUNC`: a size-only truncate, then the write's
+/// manifest commit at `fsync`) and acknowledges both itself (Layer A).
+/// `b` appends both from a's stream into its own journal, is paused
+/// before its backup stream carries them, and `a` seals `b`'s epoch: its
+/// takeover gate strands its own two rows and replays them, the truncate
+/// folded into the commit. `b`, deposed, queues its two appended rows for
+/// replay by a's rids, as `Records` (no base check). The commit's copy
+/// dedups; the truncate's rid had no outcome — the fold only forgot the
+/// truncate — so b's copy ran it after the commit (at a, forwarded, or in
+/// b's own gate when it took the lease back) and emptied the file
+/// everywhere. The fold must settle the truncate's rid in the log.
+#[test]
+fn a_folded_truncates_rid_is_settled_so_a_queued_copy_never_empties_the_file() {
+    let mut h = Harness::new(1);
+    let file = h.meta.create(ROOT_INO, "f1", 0o644, 0, 0).unwrap();
+    let old = manifest_of(b"payload-1");
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
+        .unwrap();
+    let a = |seq| Rid {
+        node: 1,
+        incarnation: 1,
+        seq,
+    };
+    // a's own stranded rows (`strand_for_takeover`), in order.
+    h.meta
+        .queue_replay(a(783), &truncate_of(file.ino), &Default::default())
+        .unwrap();
+    h.meta
+        .queue_replay(
+            a(785),
+            &commit_of(file.ino, Some(old), b"payload-two"),
+            &Default::default(),
+        )
+        .unwrap();
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    let written = (Some(manifest_of(b"payload-two")), 11);
+    assert_eq!(content(&h.meta, file.ino), written, "the gate's replay");
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+    // b's copy of the truncate, replayed by rid at the new holder.
+    let outcome = replay_copy_at(&mut h, 2, a(783), appended_truncate_of(file.ino));
+    assert_eq!(
+        content(&h.meta, file.ino),
+        written,
+        "the acknowledged write survives the copy (was emptied: {outcome:?})"
+    );
+    assert!(
+        matches!(outcome, MutateOutcome::Accepted { ref records, .. }
+            if records.iter().all(|r| matches!(r, LogRecord::Completed { .. }))),
+        "the copy is answered from the rid's outcome: {outcome:?}"
+    );
+    assert!(matches!(
+        h.meta.completed_outcome(a(783)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Executed { .. })
+    ));
+    let journal: Vec<LogRecord> = MetaStore::take_journal(&h.meta, usize::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    let completes = |rid: Rid| {
+        journal
+            .iter()
+            .position(|r| matches!(r, LogRecord::Completed { rid: c } if *c == rid))
+    };
+    assert!(
+        completes(a(783)).is_some_and(|t| completes(a(785)).is_some_and(|m| t < m)),
+        "the log settles the truncate's rid, ahead of the commit: {journal:?}"
+    );
+}
+
+/// The same fold on the replay drain of a node that does not hold the
+/// lease: the truncate goes to the holder as the no-op replay of its rid,
+/// ahead of the commit, so the holder's log settles it and a copy of the
+/// truncate replayed by that rid from a third node (a deposed root's
+/// append of it) dedups instead of emptying the file.
+#[test]
+fn the_drains_fold_settles_the_truncates_rid_at_the_holder() {
+    let (mut holder, mut requester) = pair();
+    let file = holder.meta.create(ROOT_INO, "f1", 0o644, 0, 0).unwrap();
+    let old = manifest_of(b"payload-1");
+    constellation_meta::execute_mutate(
+        &holder.meta,
+        &commit_of(file.ino, None, b"payload-1"),
+        None,
+    )
+    .unwrap();
+    let batch = MetaStore::take_journal(&holder.meta, 100).unwrap();
+    let seqs: Vec<u64> = batch.iter().map(|(s, _)| *s).collect();
+    let through = holder.meta.journal_through_after(&seqs).unwrap();
+    holder.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    let records: Vec<_> = batch.into_iter().map(|(_, r)| r).collect();
+    crate::replica::Replica::apply_segment(&requester.meta, 1, 1, through, &[], &[], &records)
+        .unwrap();
+    let r = |seq| Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    };
+    requester
+        .meta
+        .queue_replay(r(10), &truncate_of(file.ino), &Default::default())
+        .unwrap();
+    requester
+        .meta
+        .queue_replay(
+            r(11),
+            &commit_of(file.ino, Some(old), b"payload-two"),
+            &Default::default(),
+        )
+        .unwrap();
+    let mut forwarded = Vec::new();
+    for _ in 0..4 {
+        let mut out = Vec::new();
+        requester
+            .core
+            .on_drain_tick(requester.now, &requester.meta, &mut out);
+        for (to, msg) in sends(&out) {
+            let PeerMsg::MutateRequest { rid, op, .. } = msg else {
+                continue;
+            };
+            assert_eq!(to, 1);
+            forwarded.push((*rid, op.clone()));
+            let answer = holder.step(Event::Peer {
+                from: 2,
+                msg: msg.clone(),
+            });
+            for (_, reply) in sends(&answer) {
+                requester.step(Event::Peer {
+                    from: 1,
+                    msg: reply.clone(),
+                });
+            }
+        }
+        requester.advance(250);
+        holder.advance(250);
+    }
+    let written = (Some(manifest_of(b"payload-two")), 11);
+    assert_eq!(content(&holder.meta, file.ino), written);
+    let outcome = replay_copy_at(&mut holder, 3, r(10), appended_truncate_of(file.ino));
+    assert_eq!(
+        content(&holder.meta, file.ino),
+        written,
+        "the acknowledged write survives the copy (was emptied: {outcome:?})"
+    );
+    assert!(
+        matches!(outcome, MutateOutcome::Accepted { ref records, .. }
+            if records.iter().all(|r| matches!(r, LogRecord::Completed { .. }))),
+        "{outcome:?}"
+    );
+    assert!(
+        matches!(forwarded.first(), Some((rid, MutateOp::Records { records })) if *rid == r(10) && records.is_empty()),
+        "the folded truncate goes first, as the no-op of its rid: {forwarded:?}"
+    );
+    assert!(
+        forwarded
+            .iter()
+            .any(|(rid, op)| *rid == r(11) && matches!(op, MutateOp::SetManifest { .. })),
+        "{forwarded:?}"
+    );
+    assert!(
+        requester.meta.pending_replays().unwrap().is_empty(),
+        "{:?}",
+        requester.meta.pending_replays()
+    );
+    assert!(matches!(
+        holder.meta.completed_outcome(r(10)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Executed { .. })
+    ));
+}
+
+/// Load campaign seed 63, after the fix above: the truncate and the commit
+/// are both stranded on the delegate turned root, but the predecessor's
+/// backup tail carried the root's append of the truncate (not of the
+/// commit): re-journaled by the gate, the truncate took effect. The commit
+/// used to be rebased onto the uncut manifest the truncate cut, for the
+/// fold; against the truncate's own effect that base was stale, the commit
+/// and every later one of the file were refused, and the file stayed empty
+/// with its acknowledged writes in conflict copies. The commit keeps the
+/// cut it was composed on and lands.
+#[test]
+fn a_truncate_the_tail_carried_leaves_its_commit_on_the_cut_base() {
+    let mut h = Harness::new(2);
+    let file = h.meta.create(ROOT_INO, "f7", 0o644, 0, 0).unwrap();
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
+        .unwrap();
+    // Everything so far is in the log.
+    let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    let a = |seq| Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    };
+    // Executed here under epoch 1 (captured), then stranded by the
+    // takeover: the truncate, and the write's commit on the cut file.
+    h.meta.set_holder_epoch(1);
+    let truncated =
+        constellation_meta::execute_mutate(&h.meta, &truncate_of(file.ino), Some(a(1))).unwrap();
+    let cut = MetaStore::manifest(&h.meta, file.ino).unwrap();
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &commit_of(file.ino, cut, b"payload-two"),
+        Some(a(2)),
+    )
+    .unwrap();
+    h.meta.set_holder_epoch(0);
+    h.meta.strand_below_epoch(2).unwrap();
+    assert_eq!(h.meta.pending_replays().unwrap().len(), 2);
+    // The tail's copy of the truncate, re-journaled by the gate.
+    crate::replica::Replica::apply_backup_tx_journaled(&h.meta, &truncated, Some(a(1)), (0, 0))
+        .unwrap();
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert_eq!(
+        content(&h.meta, file.ino),
+        (Some(manifest_of(b"payload-two")), 11),
+        "the acknowledged write is in the file (was refused: {:?})",
+        h.meta.pending_replays()
+    );
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+    assert!(matches!(
+        h.meta.completed_outcome(a(2)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Executed { .. })
+    ));
+}
+
+/// The stranded `[T, M]` of a node that executed them itself (captured, so
+/// the truncate keeps the manifest it cut): the gate replays T as the
+/// base-checked commit of the cut, by T's rid, and M on the base it was
+/// composed on. Where nobody else wrote the file both land (and a copy of
+/// T by its rid later dedups); where another node did, T is refused
+/// without a conflict copy of its own, M makes the one copy, and neither
+/// T's nor M's copy touches the winner.
+#[test]
+fn a_folded_truncate_replays_as_the_base_checked_cut() {
+    let stranded = |h: &mut Harness| {
+        let file = h.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+        constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
+            .unwrap();
+        let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+        let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+        h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+        h.meta.set_holder_epoch(1);
+        constellation_meta::execute_mutate(&h.meta, &truncate_of(file.ino), Some(a2(1))).unwrap();
+        let cut = MetaStore::manifest(&h.meta, file.ino).unwrap();
+        constellation_meta::execute_mutate(
+            &h.meta,
+            &commit_of(file.ino, cut.clone(), b"payload-two"),
+            Some(a2(2)),
+        )
+        .unwrap();
+        h.meta.set_holder_epoch(0);
+        h.meta.strand_below_epoch(2).unwrap();
+        let queue = h.meta.pending_replays().unwrap();
+        assert!(
+            matches!(&queue[1].op, MutateOp::SetManifest { base_manifest, .. } if *base_manifest == cut),
+            "the commit keeps the base it was composed on: {queue:?}"
+        );
+        (file.ino, cut)
+    };
+
+    // Nobody else wrote the file.
+    let mut h = Harness::new(2);
+    let (ino, _) = stranded(&mut h);
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    let written = (Some(manifest_of(b"payload-two")), 11);
+    assert_eq!(content(&h.meta, ino), written);
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+    for rid in [a2(1), a2(2)] {
+        assert!(matches!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Executed { .. })
+        ));
+    }
+    replay_copy_at(&mut h, 1, a2(1), appended_truncate_of(ino));
+    assert_eq!(content(&h.meta, ino), written, "a copy of T dedups");
+
+    // Another node wrote it since (in the log before this node's gate).
+    let mut h = Harness::new(2);
+    let (ino, _) = stranded(&mut h);
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &commit_of(ino, Some(manifest_of(b"payload-1")), b"winner-from-c"),
+        None,
+    )
+    .unwrap();
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    let winner = (Some(manifest_of(b"winner-from-c")), 13);
+    assert_eq!(content(&h.meta, ino), winner);
+    assert_eq!(
+        h.meta.completed_outcome(a2(1)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused {
+            code: constellation_types::Code::Stale
+        }),
+        "T's refusal is its rid's outcome"
+    );
+    let queue = h.meta.pending_replays().unwrap();
+    assert_eq!(
+        queue.len(),
+        1,
+        "T leaves the queue, M is refused: {queue:?}"
+    );
+    assert_eq!(queue[0].rid, a2(2));
+    assert!(queue[0].refused.is_some());
+    let copies = out
+        .iter()
+        .filter(|a| matches!(a, Action::ConflictCopy { .. }))
+        .count();
+    assert!(copies <= 1, "no conflict copy of T's own: {out:?}");
+    replay_copy_at(&mut h, 1, a2(1), appended_truncate_of(ino));
+    assert_eq!(
+        content(&h.meta, ino),
+        winner,
+        "a copy of T never cuts the winner"
+    );
+}
+
+fn a2(seq: u64) -> Rid {
+    Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    }
+}
+
+/// Fable's review, H2: another node settled T's rid as the no-op (it had
+/// no before-image of the inode), so T never took effect, and this node's
+/// gate holds its own `[T, M]` with M composed on the cut. The file is
+/// still what T would cut: M stands for T and lands, checked against the
+/// uncut manifest (a version of the patch rebased M onto the cut here and
+/// refused it, a false conflict).
+#[test]
+fn a_no_op_completion_is_not_the_truncates_effect() {
+    let mut h = Harness::new(2);
+    let file = h.meta.create(ROOT_INO, "f7", 0o644, 0, 0).unwrap();
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
+        .unwrap();
+    let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    h.meta.set_holder_epoch(1);
+    constellation_meta::execute_mutate(&h.meta, &truncate_of(file.ino), Some(a2(1))).unwrap();
+    let cut = MetaStore::manifest(&h.meta, file.ino).unwrap();
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &commit_of(file.ino, cut, b"payload-two"),
+        Some(a2(2)),
+    )
+    .unwrap();
+    h.meta.set_holder_epoch(0);
+    h.meta.strand_below_epoch(2).unwrap();
+    // The log's no-op completion of T (another node's fold), tailed here.
+    crate::replica::Replica::apply_backup_tx_journaled(
+        &h.meta,
+        &[LogRecord::Completed { rid: a2(1) }],
+        Some(a2(1)),
+        (0, 0),
+    )
+    .unwrap();
+    assert_eq!(
+        content(&h.meta, file.ino),
+        (Some(manifest_of(b"payload-1")), 9)
+    );
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert_eq!(
+        content(&h.meta, file.ino),
+        (Some(manifest_of(b"payload-two")), 11),
+        "the acknowledged write lands on the uncut file: {:?}",
+        h.meta.pending_replays()
+    );
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+}
+
+/// Fable's review, L6: two truncates and the commit after them (`[T1, T2,
+/// M]`). Each truncate replays as the base-checked cut of what it found,
+/// and M on the base it was composed on: all land. (Rebased onto the
+/// nearest truncate's uncut manifest, M was refused against the original.)
+#[test]
+fn two_folded_truncates_and_their_commit_all_land() {
+    let mut h = Harness::new(2);
+    let file = h.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
+        .unwrap();
+    let rows = MetaStore::take_journal(&h.meta, usize::MAX).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    h.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    h.meta.set_holder_epoch(1);
+    let truncate_to = |size| MutateOp::Setattr {
+        ino: file.ino,
+        mode: None,
+        uid: None,
+        gid: None,
+        size: Some(size),
+        atime_ns: None,
+        mtime_ns: None,
+    };
+    constellation_meta::execute_mutate(&h.meta, &truncate_to(4), Some(a2(1))).unwrap();
+    constellation_meta::execute_mutate(&h.meta, &truncate_to(0), Some(a2(2))).unwrap();
+    let cut = MetaStore::manifest(&h.meta, file.ino).unwrap();
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &commit_of(file.ino, cut, b"payload-two"),
+        Some(a2(3)),
+    )
+    .unwrap();
+    h.meta.set_holder_epoch(0);
+    h.meta.strand_below_epoch(2).unwrap();
+    assert_eq!(h.meta.pending_replays().unwrap().len(), 3);
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert_eq!(
+        content(&h.meta, file.ino),
+        (Some(manifest_of(b"payload-two")), 11),
+        "{:?}",
+        h.meta.pending_replays()
+    );
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+}
+
+/// Fable's review, M3: the drain sends a folded truncate out as what it
+/// replays as, but the queue row stays the truncate with its before-image,
+/// so a gate of this node's own (a replay-fallback takeover after an
+/// in-doubt answer) still replays it by the rule.
+#[test]
+fn the_drain_leaves_a_folded_truncates_row_as_it_was() {
+    let (_holder, mut requester) = pair();
+    let file = requester.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    constellation_meta::execute_mutate(
+        &requester.meta,
+        &commit_of(file.ino, None, b"payload-1"),
+        None,
+    )
+    .unwrap();
+    let rows = MetaStore::take_journal(&requester.meta, usize::MAX).unwrap();
+    let seqs: Vec<u64> = rows.iter().map(|(s, _)| *s).collect();
+    requester.meta.ack_journal_rows_at(&seqs, 1).unwrap();
+    requester.meta.set_holder_epoch(1);
+    constellation_meta::execute_mutate(&requester.meta, &truncate_of(file.ino), Some(a2(1)))
+        .unwrap();
+    let cut = MetaStore::manifest(&requester.meta, file.ino).unwrap();
+    constellation_meta::execute_mutate(
+        &requester.meta,
+        &commit_of(file.ino, cut, b"payload-two"),
+        Some(a2(2)),
+    )
+    .unwrap();
+    requester.meta.set_holder_epoch(0);
+    requester.meta.strand_below_epoch(2).unwrap();
+    let before = requester.meta.pending_replays().unwrap();
+    let mut out = Vec::new();
+    requester
+        .core
+        .on_drain_tick(requester.now, &requester.meta, &mut out);
+    let sent: Vec<_> = sends(&out)
+        .into_iter()
+        .filter_map(|(_, m)| match m {
+            PeerMsg::MutateRequest { rid, op, .. } => Some((*rid, op.clone())),
+            _ => None,
+        })
+        .collect();
+    let MutateOp::SetManifest {
+        base_manifest: m_base,
+        ..
+    } = &before[1].op
+    else {
+        panic!("{before:?}")
+    };
+    assert!(
+        matches!(sent.as_slice(), [(rid, MutateOp::SetManifest { base_manifest, manifest, .. })]
+            if *rid == a2(1) && *base_manifest == Some(manifest_of(b"payload-1"))
+                && Some(manifest) == m_base.as_ref()),
+        "the truncate goes out as the cut from its before-image: {sent:?}"
+    );
+    assert_eq!(
+        requester.meta.pending_replays().unwrap(),
+        before,
+        "the queue is unchanged"
+    );
+}
+
+/// Fable's review, H1: a requester's drain forwards a stranded commit; the
+/// holder refuses it on a stale base. The refusal is the rid's outcome
+/// there, so a third node's `Records` copy of the same rid dedups to it
+/// instead of landing over the winner.
+#[test]
+fn a_remote_refusal_of_a_replay_is_its_rids_outcome() {
+    let (mut holder, mut requester) = pair();
+    let file = holder.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
+    let base = manifest_of(b"baseline");
+    constellation_meta::execute_mutate(&holder.meta, &commit_of(file.ino, None, b"baseline"), None)
+        .unwrap();
+    constellation_meta::execute_mutate(
+        &holder.meta,
+        &commit_of(file.ino, Some(base.clone()), b"winner-from-c"),
+        None,
+    )
+    .unwrap();
+    requester
+        .meta
+        .queue_replay(
+            a2(11),
+            &commit_of(file.ino, Some(base), b"loser-from-b"),
+            &Default::default(),
+        )
+        .unwrap();
+    let mut replies = Vec::new();
+    for _ in 0..4 {
+        let mut out = Vec::new();
+        requester
+            .core
+            .on_drain_tick(requester.now, &requester.meta, &mut out);
+        for (to, msg) in sends(&out) {
+            let PeerMsg::MutateRequest { .. } = msg else {
+                continue;
+            };
+            assert_eq!(to, 1);
+            let answer = holder.step(Event::Peer {
+                from: 2,
+                msg: msg.clone(),
+            });
+            for (_, reply) in sends(&answer) {
+                if let PeerMsg::MutateReply { outcome, .. } = reply {
+                    replies.push(outcome.clone());
+                }
+                requester.step(Event::Peer {
+                    from: 1,
+                    msg: reply.clone(),
+                });
+            }
+        }
+        requester.advance(250);
+        holder.advance(250);
+    }
+    assert!(
+        replies
+            .iter()
+            .any(|o| matches!(o, MutateOutcome::Conflict { .. })),
+        "{replies:?}"
+    );
+    let winner = (Some(manifest_of(b"winner-from-c")), 13);
+    assert_eq!(content(&holder.meta, file.ino), winner);
+    let copy = MutateOp::Records {
+        records: vec![LogRecord::WriteManifest {
+            ino: file.ino,
+            base_manifest: None,
+            manifest: manifest_of(b"loser-from-b"),
+            size: 12,
+            time_ns: 1,
+            mtime_ns: 1,
+        }],
+    };
+    let outcome = replay_copy_at(&mut holder, 3, a2(11), copy);
+    assert_eq!(
+        content(&holder.meta, file.ino),
+        winner,
+        "a third node's copy of the remotely refused commit lands over the winner: {outcome:?}"
+    );
+    assert!(
+        matches!(outcome, MutateOutcome::Conflict { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        holder.meta.completed_outcome(a2(11)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused {
+            code: constellation_types::Code::Stale
+        })
+    );
+}
+
+/// The same on a delegate (H1), and its dedup answers the recorded stale
+/// base as the conflict a client rebases on, as every other sequencer
+/// does — never `ESTALE` (L4).
+#[test]
+fn a_delegates_refusal_of_a_stale_commit_is_the_rids_outcome() {
+    let (mut h, dir) = streaming_delegate();
+    let file = h.meta.create(dir, "f", 0o644, 0, 0).unwrap();
+    let base = manifest_of(b"baseline");
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"baseline"), None)
+        .unwrap();
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &commit_of(file.ino, Some(base.clone()), b"winner-from-c"),
+        None,
+    )
+    .unwrap();
+    let stale = commit_of(file.ino, Some(base), b"loser-from-b");
+    let first = replay_copy_at(&mut h, 2, a2(21), stale.clone());
+    assert!(matches!(first, MutateOutcome::Conflict { .. }), "{first:?}");
+    assert_eq!(
+        h.meta.completed_outcome(a2(21)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused {
+            code: constellation_types::Code::Stale
+        })
+    );
+    let again = replay_copy_at(&mut h, 2, a2(21), stale);
+    assert!(
+        matches!(again, MutateOutcome::Conflict { .. }),
+        "a retry of the rid is the conflict, not ESTALE: {again:?}"
+    );
+    let copy = MutateOp::Records {
+        records: vec![LogRecord::WriteManifest {
+            ino: file.ino,
+            base_manifest: None,
+            manifest: manifest_of(b"loser-from-b"),
+            size: 12,
+            time_ns: 1,
+            mtime_ns: 1,
+        }],
+    };
+    replay_copy_at(&mut h, 4, a2(21), copy);
+    assert_eq!(
+        content(&h.meta, file.ino),
+        (Some(manifest_of(b"winner-from-c")), 13)
+    );
+}
+
+/// Fable's review, L5: a folded truncate whose rid already has a refusal
+/// (another node's replay of it was refused) leaves the queue without a
+/// conflict copy of its own.
+#[test]
+fn a_folded_truncate_refused_elsewhere_leaves_without_a_copy() {
+    let mut h = Harness::new(1);
+    let file = h.meta.create(ROOT_INO, "f", 0o644, 0, 0).unwrap();
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"payload-1"), None)
+        .unwrap();
+    h.meta
+        .queue_replay(a2(1), &truncate_of(file.ino), &Default::default())
+        .unwrap();
+    h.meta
+        .queue_replay(
+            a2(2),
+            &commit_of(file.ino, Some(manifest_of(b"payload-1")), b"payload-two"),
+            &Default::default(),
+        )
+        .unwrap();
+    h.meta
+        .journal_refusal(a2(1), constellation_types::Code::Stale, None)
+        .unwrap();
+    h.hold(2, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert!(
+        !out.iter()
+            .any(|a| matches!(a, Action::ConflictCopy { rid, .. } if *rid == a2(1))),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.replay_conflicts, 0);
+    assert!(h.meta.pending_replays().unwrap().is_empty());
+    assert_eq!(
+        content(&h.meta, file.ino),
+        (Some(manifest_of(b"payload-two")), 11)
+    );
+}
+
+/// Load campaign seed 61, the refusal side of the same hole: the takeover
+/// gate's local replay refused a stranded commit on its base (a conflict
+/// copy), but recorded nothing for its rid, and the deposed root's copy of
+/// the commit (`Records`, which carry no base check) was then executed by
+/// that rid and landed in the file anyway, over what the refusal had kept.
+/// The gate's refusal is the rid's outcome, journaled.
+#[test]
+fn the_gates_refused_replay_is_the_rids_outcome_for_every_copy() {
+    let mut h = Harness::new(1);
+    let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
+    let base = manifest_of(b"baseline");
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"baseline"), None)
+        .unwrap();
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &commit_of(file.ino, Some(base.clone()), b"winner-from-c"),
+        None,
+    )
+    .unwrap();
+    let a = |seq| Rid {
+        node: 1,
+        incarnation: 1,
+        seq,
+    };
+    let stale = commit_of(file.ino, Some(base), b"loser-from-a");
+    h.meta
+        .queue_replay(a(823), &stale, &Default::default())
+        .unwrap();
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    let winner = (Some(manifest_of(b"winner-from-c")), 13);
+    assert_eq!(content(&h.meta, file.ino), winner);
+    assert!(h.meta.pending_replays().unwrap()[0].refused.is_some());
+    let copy = MutateOp::Records {
+        records: vec![LogRecord::WriteManifest {
+            ino: file.ino,
+            base_manifest: None,
+            manifest: manifest_of(b"loser-from-a"),
+            size: 12,
+            time_ns: 1,
+            mtime_ns: 1,
+        }],
+    };
+    let outcome = replay_copy_at(&mut h, 2, a(823), copy);
+    assert_eq!(
+        content(&h.meta, file.ino),
+        winner,
+        "the refused commit's copy never lands (it did, over the winner: {outcome:?})"
+    );
+    assert!(
+        matches!(outcome, MutateOutcome::Conflict { .. }),
+        "the copy dedups to the refusal: {outcome:?}"
+    );
+    assert_eq!(
+        h.meta.completed_outcome(a(823)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused {
+            code: constellation_types::Code::Stale
+        }),
+        "the refusal is journaled as the rid's outcome"
+    );
+}
+
+/// A holder's own drain replaying a stranded commit refused on its base
+/// (`execute_local`): final for a replay, so journaled as the rid's
+/// outcome, as the gate's is.
+#[test]
+fn a_holders_drain_journals_a_refused_replay() {
+    let mut h = Harness::new(1);
+    let file = h.meta.create(ROOT_INO, "same", 0o644, 0, 0).unwrap();
+    let base = manifest_of(b"baseline");
+    constellation_meta::execute_mutate(&h.meta, &commit_of(file.ino, None, b"baseline"), None)
+        .unwrap();
+    constellation_meta::execute_mutate(
+        &h.meta,
+        &commit_of(file.ino, Some(base.clone()), b"winner-from-c"),
+        None,
+    )
+    .unwrap();
+    let a = |seq| Rid {
+        node: 2,
+        incarnation: 1,
+        seq,
+    };
+    h.meta
+        .queue_replay(
+            a(5),
+            &commit_of(file.ino, Some(base), b"loser-from-b"),
+            &Default::default(),
+        )
+        .unwrap();
+    h.hold(1, None);
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert_eq!(
+        h.meta.completed_outcome(a(5)).unwrap(),
+        Some(constellation_meta::CompletedOutcome::Refused {
+            code: constellation_types::Code::Stale
+        }),
+        "{out:?}"
+    );
+    assert_eq!(
+        content(&h.meta, file.ino),
+        (Some(manifest_of(b"winner-from-c")), 13)
+    );
 }
 
 /// Plan 30 §M9 meets §M3b (harness `deposed-reintegration-backup`): the
@@ -15831,12 +16717,20 @@ mod locks {
         );
         assert_eq!(mutate_reply(&out, 2, 21), MutateOutcome::LockLapsed);
         assert_eq!(mtime(&h, data_ino), 3, "node 3's write stands");
+        // Nothing of the op ran; its refusal is the rid's outcome, so a
+        // copy of it by the rid (a `Records` row, which carries no token)
+        // can never land over node 3's write either.
         assert_eq!(
             crate::replica::Replica::journal_next_seq(&h.meta).unwrap(),
-            next,
-            "nothing journaled"
+            next + 1,
+            "the refusal alone is journaled"
         );
-        assert!(h.meta.completed_outcome(rid2).unwrap().is_none());
+        assert_eq!(
+            h.meta.completed_outcome(rid2).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused {
+                code: crate::core::client::LAPSED_CODE
+            })
+        );
         // Its retry by rid (the reply was lost) is refused again.
         h.advance(200);
         let out = forward_tagged(
@@ -15848,8 +16742,9 @@ mod locks {
             token(g2, window2),
         );
         assert_eq!(mutate_reply(&out, 2, 22), MutateOutcome::LockLapsed);
-        assert_eq!(h.core.stats.lock_lapsed_refusals, 2);
-        assert_eq!(h.meta.locks().stats().token_rejections, 2);
+        // (Answered from the recorded refusal: checked once.)
+        assert_eq!(h.core.stats.lock_lapsed_refusals, 1);
+        assert_eq!(h.meta.locks().stats().token_rejections, 1);
     }
 
     /// The same op, landing while the grant is still honoured, executes:
@@ -16014,7 +16909,14 @@ mod locks {
         );
         assert_eq!(
             crate::replica::Replica::journal_next_seq(&h.meta).unwrap(),
-            next
+            next + 1,
+            "the refusal alone is journaled"
+        );
+        assert_eq!(
+            h.meta.completed_outcome(rid).unwrap(),
+            Some(constellation_meta::CompletedOutcome::Refused {
+                code: crate::core::client::LAPSED_CODE
+            })
         );
         assert_ne!(mtime(&h, ino), 7);
     }

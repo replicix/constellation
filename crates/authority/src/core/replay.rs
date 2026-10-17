@@ -98,6 +98,50 @@ fn folded_into_later_manifest(op: &StrandedOp, queue: &[StrandedOp]) -> bool {
         })
 }
 
+/// What a truncate [`folded_into_later_manifest`] replays as, by its own
+/// rid, in its turn ahead of the commit. Folded, its effect is the
+/// commit's to carry (truncating on its own would cut whatever another
+/// node wrote since), but its rid must be settled all the same — in the
+/// log, by the sequencer: a copy of the truncate may be queued elsewhere
+/// by the same rid (a deposed root's append of this node's delegate
+/// stream row, a subscriber's streamed row), as `Records` that apply
+/// unconditionally, and only an outcome for the rid keeps it from running
+/// the truncate on its own after the commit (load campaign seeds 42, 61:
+/// the file came back empty on every node).
+///
+/// With the inode's manifest from before the truncate at hand (the
+/// stranded row's before-image), it replays as the base-checked commit
+/// of the cut ([`StrandedOp::conditional_truncate`]): applied where the
+/// file is still what it cut, or already the cut (a predecessor's
+/// re-journaled backup tail carried the truncate: load campaign seed
+/// 63), refused where another node wrote the file since. The commit then
+/// replays on the base it was composed on. Without one (no before-image,
+/// or a truncate up, which cut nothing) it replays as the no-op of its
+/// rid (an empty `MutateOp::Records`, no token), which journals the rid's
+/// completion and nothing else. Either way a refusal of it is no conflict
+/// of its own: the commit after it decides (see `replay_locally`).
+///
+/// Both forms are built from `..op.clone()` on purpose: whatever else the
+/// stranded row carries (its origin, source, generation, and any ordering
+/// the replay is held for, such as replay deps) is the truncate's own and
+/// the folded replay inherits it, so it is held and released exactly as
+/// the truncate would be. Do not build the replay from defaults.
+fn as_folded(op: &StrandedOp) -> StrandedOp {
+    match op.conditional_truncate() {
+        Some(conditional) => StrandedOp {
+            op: conditional,
+            ..op.clone()
+        },
+        None => StrandedOp {
+            op: MutateOp::Records {
+                records: Vec::new(),
+            },
+            lock_tag: Default::default(),
+            ..op.clone()
+        },
+    }
+}
+
 impl Core {
     /// One drain tick: refused ops get their conflict copy (with backoff,
     /// never holding up the queue); the oldest unresolved op goes down
@@ -137,11 +181,18 @@ impl Core {
             if self.drop_retired_origin(head, replica) {
                 continue;
             }
-            if folded_into_later_manifest(head, &queued) {
-                let _ = replica.forget_replay(head.queue_seq);
-                self.stats.stranded_replayed += 1;
-                continue;
-            }
+            // The fold: a size-only truncate with a manifest commit of the
+            // inode queued after it goes out as `as_folded` (computed here,
+            // from the queue, every tick: the row keeps the truncate and its
+            // before-image for a gate of this node's own).
+            let folded = folded_into_later_manifest(head, &queued);
+            let replayed;
+            let head = if folded {
+                replayed = as_folded(head);
+                &replayed
+            } else {
+                head
+            };
             if let Some(refusal) = &head.refused {
                 let reason = refusal.reason.clone();
                 self.try_copy(now, head, reason, replica, out);
@@ -152,6 +203,15 @@ impl Core {
             }
             if let Some(outcome) = completed_as_outcome(replica, head.rid, 0) {
                 self.replay.stuck_since = None;
+                if folded {
+                    // Settled; a refusal of it is no conflict of its own.
+                    if !matches!(outcome, MutateOutcome::Accepted { .. }) {
+                        self.note_unacked_refused(head);
+                        self.stats.stranded_replayed += 1;
+                    }
+                    let _ = replica.forget_replay(head.queue_seq);
+                    continue;
+                }
                 match outcome {
                     MutateOutcome::Accepted { .. } => {
                         let _ = replica.forget_replay(head.queue_seq);
@@ -173,6 +233,10 @@ impl Core {
                     }
                     MutateOutcome::Conflict { .. } => {
                         let reason = "stale manifest base (inbox)".to_string();
+                        self.refuse_replay(now, head, reason, replica, out);
+                    }
+                    MutateOutcome::LockLapsed => {
+                        let reason = "the lock grant it was issued under has ended".to_string();
                         self.refuse_replay(now, head, reason, replica, out);
                     }
                     _ => {}
@@ -449,18 +513,17 @@ impl Core {
         if self.replay.in_flight == Some(queue_seq) {
             self.replay.in_flight = None;
         }
-        let queued = match replica.pending_replays() {
-            Ok(q) => q.into_iter().find(|s| s.queue_seq == queue_seq),
-            Err(_) => None,
-        };
-        let Some(queued) = queued else {
+        let queue = replica.pending_replays().unwrap_or_default();
+        let Some(queued) = queue.iter().find(|s| s.queue_seq == queue_seq).cloned() else {
             return;
         };
         // Plan 30 §M9: a foreign entry (another node's op, stranded here
         // as streamed speculation) only ever waits for the successor's
         // verdict; refused, it is simply forgotten — its own requester
-        // makes any conflict copy.
-        if queued.foreign
+        // makes any conflict copy. So is a folded truncate's replay
+        // (`as_folded`): the sequencer journaled its refusal, and the
+        // commit after it decides.
+        if (queued.foreign || folded_into_later_manifest(&queued, &queue))
             && matches!(
                 outcome,
                 Some(
@@ -521,6 +584,16 @@ impl Core {
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
         let queue = replica.pending_replays()?;
+        // Inodes whose folded truncate's rid this replica already holds
+        // completed while the file is still what the truncate would cut:
+        // another node settled it as the no-op (it had no before-image of
+        // the inode), so the truncate never took effect and the commit
+        // after it must stand for it — checked against the uncut manifest
+        // the truncate started from, not the cut it was composed on.
+        let mut settled_uncut: std::collections::HashMap<
+            constellation_fs_core::Ino,
+            (Vec<u8>, Vec<u8>),
+        > = Default::default();
         for queued in &queue {
             // The drain tick's rule, here too (it was the pre-M5
             // `recovery::takeover_gate`'s, lost when the gate moved into
@@ -530,22 +603,60 @@ impl Core {
             // on its own it has no base to check — a takeover gate that
             // replayed it truncated the file another node had written
             // since (harness `deposed-reintegration`: B's `same` became
-            // empty while A's manifest was, correctly, refused).
+            // empty while A's manifest was, correctly, refused). It replays
+            // as `as_folded`, by its own rid.
             if folded_into_later_manifest(queued, &queue) {
-                replica.forget_replay(queued.queue_seq)?;
-                self.stats.stranded_replayed += 1;
+                if let (
+                    Some(MutateOutcome::Accepted { .. }),
+                    Some(MutateOp::SetManifest {
+                        ino,
+                        base_manifest: Some(pre),
+                        manifest: cut,
+                        ..
+                    }),
+                ) = (
+                    completed_as_outcome(replica, queued.rid, 0),
+                    queued.conditional_truncate(),
+                ) {
+                    if replica.manifest(ino).as_ref() == Some(&pre) {
+                        settled_uncut.insert(ino, (cut, pre));
+                    }
+                }
+                self.replay_locally(now, &as_folded(queued), true, replica, out)?;
                 continue;
             }
-            self.replay_locally(now, queued, replica, out)?;
+            if let MutateOp::SetManifest {
+                ino,
+                base_manifest: Some(base),
+                ..
+            } = &queued.op
+            {
+                if let Some((cut, pre)) = settled_uncut.remove(ino) {
+                    if *base == cut {
+                        let mut on_uncut = queued.clone();
+                        if let MutateOp::SetManifest { base_manifest, .. } = &mut on_uncut.op {
+                            *base_manifest = Some(pre);
+                        }
+                        self.replay_locally(now, &on_uncut, false, replica, out)?;
+                        continue;
+                    }
+                }
+            }
+            self.replay_locally(now, queued, false, replica, out)?;
         }
         self.replay.in_flight = None;
         Ok(())
     }
 
+    /// `folded`: `queued` is a truncate folded into the commit after it
+    /// (`as_folded`): whatever its outcome, it leaves the queue — its
+    /// refusal is journaled as its rid's outcome but makes no conflict copy
+    /// of its own (the commit after it decides).
     fn replay_locally(
         &mut self,
         now: Ms,
         queued: &StrandedOp,
+        folded: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
@@ -604,6 +715,14 @@ impl Core {
             return Ok(());
         }
         if let Some(outcome) = completed_as_outcome(replica, queued.rid, 0) {
+            if folded {
+                if !matches!(outcome, MutateOutcome::Accepted { .. }) {
+                    self.note_unacked_refused(queued);
+                    self.stats.stranded_replayed += 1;
+                }
+                replica.forget_replay(queued.queue_seq)?;
+                return Ok(());
+            }
             match outcome {
                 MutateOutcome::Accepted { .. } => {
                     replica.forget_replay(queued.queue_seq)?;
@@ -617,6 +736,10 @@ impl Core {
                 }
                 MutateOutcome::Errno(code) => {
                     let reason = format!("refused with {code} (inbox)");
+                    self.refuse_replay(now, queued, reason, replica, out);
+                }
+                MutateOutcome::LockLapsed => {
+                    let reason = "the lock grant it was issued under has ended".to_string();
                     self.refuse_replay(now, queued, reason, replica, out);
                 }
                 _ => {
@@ -636,7 +759,28 @@ impl Core {
                 replica.forget_replay(queued.queue_seq)?;
             }
             Err(error) => {
-                if queued.foreign || refusal_is_satisfied(&queued.op, error.code()) {
+                // A refusal here is final (the replay is satisfied, or
+                // becomes a conflict copy), so it is the rid's outcome,
+                // journaled as the forwarded path journals one
+                // (`record_refusal`) — a stale base or a lapsed grant
+                // included, which are final for a replay. Left unrecorded,
+                // a copy of the op queued by the same rid on another node
+                // (a deposed root's append of this node's delegate row,
+                // queued there as `Records`, which apply without the base
+                // check) was executed later and overwrote what this refusal
+                // kept out (load campaign seed 61: the conflict-copied
+                // commit landed in the file anyway).
+                let code = match error {
+                    constellation_meta::MetaError::Conflict => Code::Stale,
+                    constellation_meta::MetaError::LockLapsed => super::client::LAPSED_CODE,
+                    ref e => e.code(),
+                };
+                // (`NotAdmitted` is no outcome: nothing ran, and it never
+                // answers anyone.)
+                if !matches!(error, constellation_meta::MetaError::NotAdmitted) {
+                    self.record_refusal(queued.rid, code, Some(&queued.op), replica);
+                }
+                if folded || queued.foreign || refusal_is_satisfied(&queued.op, error.code()) {
                     self.note_unacked_refused(queued);
                     self.stats.stranded_replayed += 1;
                     replica.forget_replay(queued.queue_seq)?;

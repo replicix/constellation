@@ -647,14 +647,7 @@ impl Core {
             }
             Some(constellation_meta::CompletedOutcome::Refused { code }) => {
                 self.stats.forward_dedup_hits += 1;
-                return (
-                    if code == Code::Stale {
-                        MutateOutcome::Conflict { manifest: None }
-                    } else {
-                        MutateOutcome::Errno(code)
-                    },
-                    None,
-                );
+                return (super::client::refused_as_outcome(code), None);
             }
             None => {}
         }
@@ -677,18 +670,31 @@ impl Core {
                 let inos = constellation_meta::recall_inos_executed(&records);
                 return (MutateOutcome::Accepted { epoch, records }, Some(inos));
             }
+            // A stale manifest base, or (below) an ended grant, is a
+            // definitive answer: a client rebases or reissues under a
+            // fresh rid, a replay makes its conflict copy. So it is the
+            // rid's outcome, journaled (`Code::Stale`, which a dedup
+            // answers as the conflict it was) as the inbox drain journals
+            // it: left open, a copy of the op queued by the same rid on
+            // another node — a deposed root's append of a delegate's row,
+            // a subscriber's streamed row, as `Records` that carry neither
+            // the base check nor the token — was executed later and landed
+            // over the newer write the refusal had protected.
             Err(MetaError::Conflict) => match op {
-                MutateOp::SetManifest { ino, .. } => MutateOutcome::Conflict {
-                    manifest: replica.manifest(*ino),
-                },
+                MutateOp::SetManifest { ino, .. } => {
+                    self.record_refusal(rid, Code::Stale, Some(op), replica);
+                    MutateOutcome::Conflict {
+                        manifest: replica.manifest(*ino),
+                    }
+                }
                 _ => MutateOutcome::Errno(Code::Again),
             },
             // Plan 30 §M14 phase 2, the fencing token: a grant the op was
-            // issued under is no longer live here. Not journaled (nothing
-            // ran, and a retry of the rid is refused the same way: a
-            // token never comes back to life), never executed.
+            // issued under is no longer live here. Never executed; the
+            // refusal is journaled as the rid's outcome (see above).
             Err(MetaError::LockLapsed) => {
                 self.stats.lock_lapsed_refusals += 1;
+                self.record_refusal(rid, super::client::LAPSED_CODE, Some(op), replica);
                 tracing::info!(
                     node = self.cfg.node_id,
                     ?rid,

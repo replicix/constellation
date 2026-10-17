@@ -313,6 +313,24 @@ pub(crate) fn named_child(op: &MutateOp) -> Option<(Ino, &str)> {
     }
 }
 
+/// The code a refusal for an ended lock grant (`LockLapsed`) is journaled
+/// under on the P2P paths (`ENOLCK`, which no mutation refuses with
+/// otherwise), so a dedup of the rid answers `LockLapsed` again: a client
+/// re-sends under a fresh token while it still holds the grant, or keeps
+/// its refused commit as a conflict copy (`refused_as_outcome`).
+pub(crate) const LAPSED_CODE: Code = Code::NoLock;
+
+/// A journaled refusal (`Refused { rid, code }`) as the outcome the
+/// sequencer gave: a stale base is the `Conflict` a client rebases on, an
+/// ended grant `LockLapsed`, anything else its errno.
+pub(crate) fn refused_as_outcome(code: Code) -> MutateOutcome {
+    match code {
+        Code::Stale => MutateOutcome::Conflict { manifest: None },
+        LAPSED_CODE => MutateOutcome::LockLapsed,
+        code => MutateOutcome::Errno(code),
+    }
+}
+
 /// What the local log already says about `rid`, as the outcome a
 /// forward would have produced (`inbox::local_outcome`).
 pub(crate) fn completed_as_outcome(
@@ -325,10 +343,7 @@ pub(crate) fn completed_as_outcome(
             epoch,
             records: Vec::new(),
         }),
-        CompletedOutcome::Refused { code: Code::Stale } => {
-            Some(MutateOutcome::Conflict { manifest: None })
-        }
-        CompletedOutcome::Refused { code } => Some(MutateOutcome::Errno(code)),
+        CompletedOutcome::Refused { code } => Some(refused_as_outcome(code)),
     }
 }
 
@@ -1879,11 +1894,25 @@ impl Core {
                 let wait = self.recall_needed(now, &inos, None, replica, out);
                 (MutateOutcome::Accepted { epoch, records }, wait)
             }
-            Err(MetaError::Conflict) => (MutateOutcome::Conflict { manifest: None }, None),
-            // Plan 30 §M14 phase 2: the op's lock grant ended; nothing was
-            // journaled, so there is nothing to wait for either.
+            // A stale base or an ended grant is a definitive answer (a
+            // client rebases or reissues under a fresh rid; a replay makes
+            // its conflict copy): the rid's outcome, journaled like any
+            // refusal (`Code::Stale`: a dedup answers it as the conflict it
+            // was), as the inbox drain journals it. Unrecorded, a copy of
+            // the op queued by the same rid on another node (as `Records`,
+            // which apply without the base check or the token) could still
+            // run it.
+            Err(MetaError::Conflict) => {
+                if matches!(op, MutateOp::SetManifest { .. }) {
+                    self.record_refusal(rid, Code::Stale, Some(&op), replica);
+                }
+                (MutateOutcome::Conflict { manifest: None }, None)
+            }
+            // Plan 30 §M14 phase 2: the op's lock grant ended; nothing ran
+            // but the refusal's row, so there is nothing to wait for.
             Err(MetaError::LockLapsed) => {
                 self.stats.lock_lapsed_refusals += 1;
+                self.record_refusal(rid, LAPSED_CODE, Some(&op), replica);
                 return MutateOutcome::LockLapsed;
             }
             Err(error) => {

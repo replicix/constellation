@@ -1566,10 +1566,10 @@ impl Core {
                     replica.journal_inbox_refusal(rid, Code::Stale, ack, decoded.as_ref().ok())?;
                     self.stats.inbox_refused_ops += 1;
                 }
-                // Plan 30 §M14 phase 2: the op's lock grant ended. Unlike a
-                // P2P refusal it is journaled (`EIO`): the requester learns
-                // inbox outcomes from the log, and the position must be
-                // answered for the drain to move on. Nothing else ran.
+                // Plan 30 §M14 phase 2: the op's lock grant ended. Journaled
+                // (`EIO`), as a P2P refusal is: the requester learns inbox
+                // outcomes from the log, and the position must be answered
+                // for the drain to move on. Nothing else ran.
                 Err(error) => {
                     if matches!(error, MetaError::LockLapsed) {
                         self.stats.lock_lapsed_refusals += 1;

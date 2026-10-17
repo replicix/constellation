@@ -48399,3 +48399,157 @@ result, and seed 2945's recording happens at strand time, so neither
 depends on the simulation's `RebuildReplica` stub; seed 2945's ordering
 guarantee does depend on which recovery path runs (see above). The
 regression tests stay.
+
+## Fix: a folded truncate and a refused replay settle their rid in the log (load campaign, 2026-10-15)
+
+Found by the host-load campaign: `load-probe` under
+`pause:lock-lapse+500:10000@b` (seed 42 in the smoke run; seed 61 of a
+20-seed sweep, where the lease reaches `b` by placement only now and
+then). Ten acknowledged, fsynced files of node `a` read back empty on
+both nodes, with no conflict copy and the bucket log clean.
+
+`a` handed the root to `b`, became `b`'s backup and, by placement, the
+delegate of its own directory. Each overwrite there is a size-only
+truncate (the `O_TRUNC` open) and the write's manifest commit (the
+`fsync`), both executed and acknowledged by `a` as the delegate and
+streamed to the root. `b` appended both into its journal under `a`'s
+rids, and was paused inside that very core step (`slow core step
+event="DelegateStream" handled_us=4506966`), so its backup stream never
+carried them. `a` sealed `b`'s epoch; its takeover gate stranded its
+own unappended delegate rows and replayed them after `b`'s tail
+(`strand_for_takeover`, `5face1b`), the truncate folded into the commit
+(`1641850`): the commit ran, the truncate was forgotten, and nothing
+recorded its rid. `b`, deposed, rebuilt from the log and queued its
+unshipped journal for replay by rid, `a`'s appended rows included, as
+`MutateOp::Records` (no base check, no token). The commits' copies
+dedup'd; the truncates' rids had no outcome, so their copies executed —
+forwarded to `a` by `b`'s drain (seed 42), or in `b`'s own takeover gate
+once the lease came back to it (seed 61) — after the commits, on every
+replica. Seed 61 also showed the refusal side: `a`'s gate refused a
+stranded commit on its base (a conflict copy) and recorded nothing for
+the rid; `b`'s copy of the commit then landed in the file anyway.
+
+No node acted on a stale epoch or token. Exactly-once by rid holds only
+if every way a replay is resolved leaves the rid's outcome in the log:
+the same op is queued by the same rid on other nodes too (a deposed
+root's appends of a delegate's stream, a subscriber's streamed rows), as
+`Records` that apply unconditionally.
+
+### What changed
+
+- A folded truncate replays by its own rid, in its turn ahead of the
+  commit, at the gate and on the drain alike (computed from the queue,
+  nothing rewritten in it): as the base-checked commit of the cut, from
+  the manifest the inode had just before it (the stranded row's
+  before-image, `StrandedOp::conditional_truncate`) to the manifest it
+  cut that to. It lands where the file is still what it cut, or already
+  the cut (a predecessor's re-journaled backup tail carried it: load
+  campaign seed 63, where the old rebase refused the commit and every
+  later one of the file against the truncate's own effect), and is
+  refused where another node wrote the file since. Its refusal is
+  journaled for its rid but makes no conflict copy (the commit decides),
+  and the commit keeps the base it was composed on: `rebase_on_truncate`
+  is gone, and with it the false conflict of `[T1, T2, M]`. Without a
+  before-image (or for a truncate up, which cut nothing) it replays as
+  the no-op of its rid, an empty `MutateOp::Records` that journals
+  `Completed { rid }` (and, through the inbox, the position it answers)
+  and nothing else: `apply_records_journaled_inner` now journals the
+  completion `execute` armed when no record applied. A gate that finds
+  such a no-op completion of its own folded truncate, with the file still
+  uncut, checks the commit after it against the uncut manifest.
+- Every sequencer journals a stale base (`Conflict`, as `Code::Stale`)
+  and an ended grant (`LockLapsed`, as `ENOLCK`) as the rid's outcome:
+  the takeover gate's local replay, a holder's own drain and client ops
+  (`execute_local`), a forwarded op (`holder_execute`) and a delegate's
+  (`delegate_execute_now`), as the inbox drain already did. Both are
+  definitive for a client (a rebase or a re-send under a fresh token is a
+  new rid); every dedup answers them as the `Conflict` and the
+  `LockLapsed` they were (`refused_as_outcome`; the delegate's used to
+  answer `ESTALE`). Left open, a third node's `Records` copy of a commit
+  a remote holder had refused landed over the newer write (fable's
+  review, H1).
+- A folded truncate whose rid has a refusal already leaves the queue
+  without a conflict copy of its own (and is never logged as one).
+
+### Tests
+
+- Core and meta (real `Meta`), failing on the previous tree:
+  `a_folded_truncates_rid_is_settled_so_a_queued_copy_never_empties_the_file`
+  (the root's `Records` copy of the truncate emptied the file: size 0),
+  `the_drains_fold_settles_the_truncates_rid_at_the_holder`,
+  `a_folded_truncate_replays_as_the_base_checked_cut` (both outcomes: a
+  file nobody else wrote, and one written since),
+  `a_truncate_the_tail_carried_leaves_its_commit_on_the_cut_base`,
+  `a_no_op_completion_is_not_the_truncates_effect`,
+  `two_folded_truncates_and_their_commit_all_land`,
+  `the_drain_leaves_a_folded_truncates_row_as_it_was`,
+  `the_gates_refused_replay_is_the_rids_outcome_for_every_copy`,
+  `a_holders_drain_journals_a_refused_replay`,
+  `a_remote_refusal_of_a_replay_is_its_rids_outcome`,
+  `a_delegates_refusal_of_a_stale_commit_is_the_rids_outcome` (and its
+  dedup is the conflict, not `ESTALE`),
+  `a_folded_truncate_refused_elsewhere_leaves_without_a_copy`,
+  `an_empty_records_op_by_rid_completes_its_rid`. The store tests of the
+  rebase (`holder_capture`) now pin the conditional cut, and F1's
+  lapsed-token tests that a refusal is the rid's outcome and its retry
+  still `LockLapsed`.
+- Load campaign, `load-probe` under `pause:lock-lapse+500:10000@b`,
+  seeds 42..61, verification on, on the tree with this change (on `main`
+  `e9f3f68`): 20 of 20 passed, no data or ledger violation. That cell
+  does not reach the takeover on its own (the lease reaches `b` by
+  placement only now and then: none of the 20 runs rolled a row back or
+  replayed one, and the unfixed tree passes the same 20 seeds), so it is
+  no test of the fix. With `b` mounted first, so that it holds the root and `a` is its
+  backup and the delegate of its own directory (a local one-line change
+  of the probe, not committed), every run exercises the takeover (160 to
+  166 delegate rows rolled back and replayed). Unfixed, 18 of 20 seeds
+  (42..61) lost acknowledged files (5 to 8 files of 0 bytes each), the
+  other 2 ended in the errno check only. With the change, none of those 20
+  seeds read back an empty or corrupt file or lost a write to the
+  truncate. The errno check failed in 35 of the 40 seeds run (42..81)
+  (the deposed `b`'s in-doubt `EIO`, also before the fix: reported to the
+  campaign) and the ledger in 4: seeds 55, 69, 75 and 77 lost the
+  writes of `a`'s `create f7` (the round after `f7` was renamed to `g7`),
+  which the gate refused with "entry already exists" (6 conflict copies,
+  none holding the file: its `SetManifest` named an inode the refused
+  create never made). The same 40 seeds on the tree before the deps-hold
+  fix (`630d1a0` plus this change, seeds 62..81) lost it once (seed 74).
+  The refusal is not new: the unfixed runs of seeds 43 and 54 refused
+  creates of the same kind (6 conflict copies each), their ledgers masked
+  by the empty files. Open: its cause has not been found.
+- Sim sweeps, 10,000 seeds each (0..10000), on the tree with this change
+  over `e9f3f68`: `delegated-holder-cut`, `delegated-backup`,
+  `placement-hot`, `long-backup`, `long-acks3`, `backup-hot`,
+  `long-delegated`, `locks-failover-backup`,
+  `delegated-two-gens-root-crash`, `delegated-root-gone`,
+  `delegated-delegate-restart`, `locks-writer-hold-delegated`,
+  `locks-stall-step-delegated` and `long-delegated-late-answers`: 0
+  failing. `long-delegated-backup` fails seed 3585 (quiescence: node 1's
+  replay of a cross-subtree `rename` stays queued while the holder keeps
+  answering it `Held` for deps lost with their generation); `e9f3f68`
+  without this change fails it identically, and the tree before the
+  deps-hold fix (`7441c47` plus this change) passed all 10,000 seeds.
+- Harness, seed 42 (24 scenarios: `deposed-reintegration`,
+  `deposed-reintegration-backup`, `root-failover-with-delegates`,
+  `delegate-root-loss`, `delegate-root-loss-ttl`,
+  `delegate-root-blackhole`, `delegate-backup-handoff-failover`,
+  `delegate-crash`, `delegate-crash-backup`, `lock-failover`,
+  `lock-holder-killed-contention`, `ack-s3-failover`, `backup-failover`,
+  `backup-failover-with-delegation`, `backup-partition`, `backup-departs`,
+  `backup-takeover-drops-held-chunks`,
+  `backup-takeover-holds-missing-chunks`, `auto-placement`,
+  `lease-fencing`, `lease-handover`, `git-under-flock`,
+  `flock-cross-node`, `fence-token-at-write`): all passed.
+- `cargo fmt --all -- --check` (only `crates/meta/src/store/gate.rs`, as
+  on `main`), clippy `--workspace --all-targets -D warnings` clean,
+  `cargo test --workspace --no-fail-fast`: 3140 passed, 0 failed, 55
+  ignored.
+
+Plan 43 C3 replaces replay by rid with a verbatim re-ship; the fold and
+the re-execution machinery above (`as_folded`, the conditional cut, the
+gate's uncut-base rule) is narrowed by it. A replay held by the replay-deps
+fix (`StrandedOp::deps`) can defer the commit, and the no-op or cut of its
+folded truncate (which inherits the truncate's deps: `as_folded` builds
+from `..op.clone()`), from the gate to the drain after the fold decision
+was taken on the gate's state; the sequencer's base check then makes a
+counted conflict copy.

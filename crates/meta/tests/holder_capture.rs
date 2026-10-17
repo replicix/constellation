@@ -841,16 +841,16 @@ fn one_chunk_manifest(tag: &[u8], len: u64) -> Vec<u8> {
 /// Harness `deposed-reintegration`'s `a-only`, in the store: a deposed
 /// holder's `O_TRUNC` rewrite of a file — a size-only `setattr` to 0,
 /// then the write session's manifest commit — strands as those two ops,
-/// and the replay drain folds the truncate into the commit. A truncate
-/// clips the stored manifest (`replay::clip_manifest`), so the commit
-/// composed on the *clipped* manifest; queued, it must carry the
-/// manifest the truncate cut as its base instead, or on the successor
-/// (which never ran the truncate) it is refused as a stale base even
-/// when nobody else touched the file — a conflict copy for a clean edit.
-/// Rebased, it is accepted there, and still refused where another node
-/// wrote the file since (the genuine edit-vs-edit overlap).
+/// and the replay folds the truncate into the commit. A truncate clips
+/// the stored manifest (`replay::clip_manifest`), so the commit composed
+/// on the *clipped* manifest, and it keeps that base; the truncate
+/// replays, by its own rid, as the base-checked commit of the cut from
+/// the manifest it found (`StrandedOp::conditional_truncate`). On the
+/// successor (which never ran the truncate) both land when nobody else
+/// touched the file; where another node wrote it since, both are refused
+/// and the newer write stays (the genuine edit-vs-edit overlap).
 #[test]
-fn a_stranded_truncate_then_write_replays_on_the_uncut_base() {
+fn a_stranded_truncate_then_write_replays_as_the_cut_then_the_commit() {
     let holder = Meta::open_in_memory().unwrap();
     let successor = Meta::open_in_memory().unwrap();
     let overwritten = Meta::open_in_memory().unwrap();
@@ -905,6 +905,19 @@ fn a_stranded_truncate_then_write_replays_on_the_uncut_base() {
     let queued = holder.pending_replays().unwrap();
     assert_eq!(queued.len(), 2, "{queued:?}");
     assert_eq!(queued[0].op, truncate);
+    let conditional = queued[0].conditional_truncate().expect("a before-image");
+    assert_eq!(
+        conditional,
+        MutateOp::SetManifest {
+            ino: f,
+            base_manifest: Some(baseline.clone()),
+            manifest: clipped.clone(),
+            size: 0,
+            mtime_ns: None,
+            ctime_ns: None,
+        },
+        "the truncate replays as the cut, checked against what it found"
+    );
     let MutateOp::SetManifest {
         base_manifest,
         manifest,
@@ -915,17 +928,21 @@ fn a_stranded_truncate_then_write_replays_on_the_uncut_base() {
     };
     assert_eq!(
         base_manifest.as_deref(),
-        Some(baseline.as_slice()),
-        "the commit is rebased onto the manifest the folded truncate cut"
+        Some(clipped.as_slice()),
+        "the commit keeps the base it was composed on"
     );
     assert_eq!(manifest, &mine);
 
-    // Folded into the commit (the drain forgets the truncate), it lands
-    // where nobody else wrote the file ...
+    // Where nobody else wrote the file, both land ...
+    execute_mutate(&successor, &conditional, Some(queued[0].rid)).unwrap();
     execute_mutate(&successor, &queued[1].op, Some(queued[1].rid)).unwrap();
     assert_eq!(successor.manifest(f).unwrap(), Some(mine.clone()));
     assert_eq!(successor.getattr(f).unwrap().unwrap().size, 15);
-    // ... and is refused where somebody did.
+    // ... and where somebody did, neither cuts nor overwrites it.
+    assert!(
+        execute_mutate(&overwritten, &conditional, Some(queued[0].rid)).is_err(),
+        "the truncate never cuts a file written since"
+    );
     assert!(
         execute_mutate(&overwritten, &queued[1].op, Some(queued[1].rid)).is_err(),
         "an edit-vs-edit overlap must still fail the base check"
@@ -933,9 +950,9 @@ fn a_stranded_truncate_then_write_replays_on_the_uncut_base() {
     assert_eq!(overwritten.manifest(f).unwrap(), Some(theirs));
 }
 
-/// The rebase applies only to a commit composed on exactly the cut: one
-/// whose base is something else keeps it (and fails its check as
-/// before), and a truncate that cut nothing leaves the commit alone.
+/// A commit queued after a truncate keeps whatever base it was composed
+/// on, and a truncate that cut nothing (a truncate up) has no conditional
+/// form: it replays as the no-op of its rid when folded.
 #[test]
 fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
     let holder = Meta::open_in_memory().unwrap();
@@ -990,6 +1007,12 @@ fn a_stranded_commit_not_composed_on_the_cut_keeps_its_base() {
         })
         .collect();
     assert_eq!(bases, vec![Some(baseline), Some(elsewhere)], "{queued:?}");
+    assert_eq!(
+        queued[0].conditional_truncate(),
+        None,
+        "a truncate up cut nothing"
+    );
+    assert!(queued[2].conditional_truncate().is_some());
 }
 
 /// F1/F9 (review T3), the path the check at the write leaves to the

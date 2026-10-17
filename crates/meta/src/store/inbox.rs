@@ -480,6 +480,41 @@ mod tests {
         assert_eq!(m.refused_code(rid(5)).unwrap(), None);
     }
 
+    /// A folded truncate's no-op replay (`authority::core::replay`'s `as_folded`): an empty
+    /// `MutateOp::Records` executed by rid journals the rid's completion and
+    /// nothing else — through the inbox too, with the position it answers —
+    /// so every other copy of the op queued by that rid dedups to it.
+    #[test]
+    fn an_empty_records_op_by_rid_completes_its_rid() {
+        let noop = MutateOp::Records {
+            records: Vec::new(),
+        };
+        let m = Meta::open_in_memory().unwrap();
+        let rows = execute(&m, &noop, Some(rid(4))).unwrap();
+        assert!(
+            matches!(rows.as_slice(), [LogRecord::Completed { rid: r }] if *r == rid(4)),
+            "{rows:?}"
+        );
+        assert!(m.completed_position(rid(4)).unwrap().is_some());
+        // Without a rid there is nothing to journal.
+        assert!(execute(&m, &noop, None).unwrap().is_empty());
+        assert_eq!(m.journal_len().unwrap(), 1);
+        // Through the inbox: the completion, then the position's ack.
+        let armed = m.pending_inbox_ack(ack(1, 0));
+        execute(&m, &noop, Some(rid(6))).unwrap();
+        drop(armed);
+        assert!(m.completed_position(rid(6)).unwrap().is_some());
+        assert_eq!(m.inbox_ack(3, 7).unwrap(), Some(ack(1, 0)));
+        let rows = m.peek_journal_after(0).unwrap();
+        assert!(
+            matches!(
+                rows.last().map(|r| &r.1),
+                Some(LogRecord::InboxAck { n: 1, i: 0, .. })
+            ),
+            "{rows:?}"
+        );
+    }
+
     #[test]
     fn a_deduplicated_position_still_advances_the_watermark() {
         let m = Meta::open_in_memory().unwrap();

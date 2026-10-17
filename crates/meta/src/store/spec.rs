@@ -313,8 +313,8 @@ struct QueuedReplay {
     gen: u64,
     /// A size-only `setattr` (the FUSE truncate path, `O_TRUNC`
     /// included): the manifest its inode had just before it, from the
-    /// stranded row's before-image. A manifest commit for the same inode
-    /// queued after it is rebased onto this (see [`rebase_on_truncate`]).
+    /// stranded row's before-image (see
+    /// [`StrandedOp::conditional_truncate`]).
     truncate_base: Option<Vec<u8>>,
     /// Plan 30 §M14 phase 2: the op's fencing token: the replay carries
     /// it, and is rejected wherever a grant it names has ended.
@@ -346,6 +346,42 @@ pub struct StrandedOp {
     pub lock_tag: LockTag,
     /// Plan 30 §M11: see `QueuedReplay::deps`.
     pub deps: Streams,
+    /// See `QueuedReplay::truncate_base`.
+    pub truncate_base: Option<Vec<u8>>,
+}
+
+impl StrandedOp {
+    /// A size-only truncate as a base-checked commit: the manifest its
+    /// inode had just before it (`truncate_base`) to the manifest it cut
+    /// that to, at its size. The replay drain and the takeover gate send
+    /// a truncate folded into the manifest commit queued after it this
+    /// way, by its own rid (`authority::core::replay`): it lands where the
+    /// file is still what it cut — or already the cut, which the commit
+    /// check accepts as done (a predecessor's re-journaled backup tail
+    /// carried it) — and is refused where another node wrote the file
+    /// since, which it must never cut. The commit after it keeps the base
+    /// it was composed on, the cut. `None` when the op is no truncate, the
+    /// row had no before-image of the inode, or the truncate cut nothing
+    /// (a truncate up: the commit composed on the uncut manifest).
+    pub fn conditional_truncate(&self) -> Option<MutateOp> {
+        let ino = size_only_truncate(&self.op)?;
+        let MutateOp::Setattr {
+            size: Some(size), ..
+        } = &self.op
+        else {
+            return None;
+        };
+        let pre = self.truncate_base.as_ref()?;
+        let cut = crate::replay::clip_manifest(pre, *size)?;
+        Some(MutateOp::SetManifest {
+            ino,
+            base_manifest: Some(pre.clone()),
+            manifest: cut,
+            size: *size,
+            mtime_ns: None,
+            ctime_ns: None,
+        })
+    }
 }
 
 /// What a stranding pass rolled back.
@@ -769,17 +805,16 @@ fn enqueue_replay_gen_tx(
 
 /// Queue `op` for replay by `rid` under `key`. `before` is the stranded
 /// row's before-images (empty when there are none): a truncate keeps the
-/// manifest it cut from them, and a manifest commit queued after one is
-/// rebased onto it ([`rebase_on_truncate`]). `foreign`: the node whose
-/// stream carried another node's entry (see `QueuedReplay::source`);
-/// `deps`: see `QueuedReplay::deps`.
+/// manifest it cut from them ([`StrandedOp::conditional_truncate`]).
+/// `foreign`: the node whose stream carried another node's entry (see
+/// `QueuedReplay::source`); `deps`: see `QueuedReplay::deps`.
 #[allow(clippy::too_many_arguments)]
 fn enqueue_replay_as_tx(
     tx: &mut SingleWriterWriteTx,
     meta: &Meta,
     key: u64,
     rid: Rid,
-    mut op: MutateOp,
+    op: MutateOp,
     lock_tag: LockTag,
     foreign: Option<u64>,
     gen: u64,
@@ -787,7 +822,6 @@ fn enqueue_replay_as_tx(
     before: &Before,
 ) -> Result<(), MetaError> {
     let truncate_base = truncate_pre_manifest(tx, meta, &op, before);
-    rebase_on_truncate(tx, meta, key, &mut op)?;
     let row = QueuedReplay {
         rid,
         op,
@@ -844,84 +878,6 @@ fn truncate_pre_manifest(
     let (_, value) = before.iter().find(|(k, _)| *k == key)?;
     let rec = InodeRecord::decode(value.as_deref()?).ok()?;
     manifest_bytes(tx, &meta.blobs, Some(&rec)).ok().flatten()
-}
-
-/// A manifest commit queued right after a truncate of its inode is
-/// rebased onto the manifest the truncate cut.
-///
-/// A truncate clips the stored manifest in its own transaction
-/// (`replay::clip_manifest`), so a write session that follows it — the
-/// write after an `O_TRUNC` open, say — commits with the *clipped*
-/// manifest as its base. The replay drain folds the truncate into that
-/// commit (executed alone it would have no base check, and would cut a
-/// file another node wrote since), so the commit's base must stand for
-/// the truncate too: the manifest the truncate started from. Left as
-/// the clipped one, it is compared against the holder's uncut file —
-/// the truncate never ran there — and every truncate-then-write of a
-/// file nobody else touched was refused as a stale base and turned
-/// into a conflict copy (harness `deposed-reintegration`'s `a-only`).
-/// Rebased, a file changed elsewhere since still fails the check, as
-/// the edit-vs-edit overlap it is.
-///
-/// Only when the commit composed on exactly that cut (its base is the
-/// clipped pre-image), and only onto the nearest earlier queued size or
-/// manifest change of the inode, which must be such a truncate.
-fn rebase_on_truncate(
-    tx: &SingleWriterWriteTx,
-    meta: &Meta,
-    key: u64,
-    op: &mut MutateOp,
-) -> Result<(), MetaError> {
-    let MutateOp::SetManifest {
-        ino,
-        base_manifest: Some(base),
-        ..
-    } = op
-    else {
-        return Ok(());
-    };
-    if counter_get(tx, &meta.local, KV_PENDING_REPLAY_COUNT)? == 0 {
-        return Ok(());
-    }
-    let mut nearest: Option<QueuedReplay> = None;
-    for guard in tx.range(&meta.pending_replay, ..seq_key(key)).rev() {
-        let (_, v) = guard.into_inner()?;
-        let row: QueuedReplay = postcard::from_bytes(&v)?;
-        let touches = match &row.op {
-            MutateOp::SetManifest { ino: i, .. } => i == ino,
-            MutateOp::Setattr {
-                ino: i,
-                size: Some(_),
-                ..
-            } => i == ino,
-            _ => false,
-        };
-        if touches {
-            nearest = Some(row);
-            break;
-        }
-    }
-    let Some(truncate) = nearest else {
-        return Ok(());
-    };
-    let (
-        MutateOp::Setattr {
-            size: Some(size), ..
-        },
-        Some(pre),
-        None,
-    ) = (&truncate.op, &truncate.truncate_base, &truncate.refused)
-    else {
-        return Ok(());
-    };
-    if size_only_truncate(&truncate.op).is_none() {
-        return Ok(());
-    }
-    let cut = crate::replay::clip_manifest(pre, *size);
-    if cut.as_deref().unwrap_or(pre) == base.as_slice() {
-        *base = pre.clone();
-    }
-    Ok(())
 }
 
 // --------------------------------------------------- stranded local work
@@ -2268,6 +2224,7 @@ pub(crate) fn read_pending_replays(
             gen: row.gen,
             lock_tag: row.lock_tag,
             deps: row.deps,
+            truncate_base: row.truncate_base,
         });
     }
     Ok(out)

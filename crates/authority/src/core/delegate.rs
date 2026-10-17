@@ -965,8 +965,11 @@ impl Core {
                     epoch,
                     records: Vec::new(),
                 },
+                // As every other sequencer answers it: a stale base is the
+                // conflict a client rebases on (never `ESTALE`), an ended
+                // grant `LockLapsed`.
                 constellation_meta::CompletedOutcome::Refused { code } => {
-                    MutateOutcome::Errno(code)
+                    super::client::refused_as_outcome(code)
                 }
             }
         } else {
@@ -983,16 +986,32 @@ impl Core {
                     exec_idx = Some(idx);
                     MutateOutcome::Accepted { epoch, records }
                 }
+                // A stale base or an ended grant: the rid's outcome,
+                // journaled into the stream like any refusal (see
+                // `holder_execute`), so no `Records` copy of the op by the
+                // same rid runs it later.
                 Err(MetaError::Conflict) => match op {
-                    MutateOp::SetManifest { ino, .. } => MutateOutcome::Conflict {
-                        manifest: replica.manifest(*ino),
-                    },
+                    MutateOp::SetManifest { ino, .. } => {
+                        self.record_delegate_refusal(rid, Code::Stale, gen, deps, replica);
+                        exec_idx = Some(replica.delegate_idx(gen));
+                        MutateOutcome::Conflict {
+                            manifest: replica.manifest(*ino),
+                        }
+                    }
                     _ => MutateOutcome::Errno(Code::Again),
                 },
                 // Plan 30 §M14 phase 2: a grant the op was issued under
-                // ended. Nothing journaled or streamed.
+                // ended. Nothing ran; the refusal is the rid's outcome.
                 Err(MetaError::LockLapsed) => {
                     self.stats.lock_lapsed_refusals += 1;
+                    self.record_delegate_refusal(
+                        rid,
+                        super::client::LAPSED_CODE,
+                        gen,
+                        deps,
+                        replica,
+                    );
+                    exec_idx = Some(replica.delegate_idx(gen));
                     MutateOutcome::LockLapsed
                 }
                 Err(MetaError::Exists) => {
