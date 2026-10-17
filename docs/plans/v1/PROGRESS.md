@@ -48309,3 +48309,93 @@ On the test host, main `28c8c7f` plus this change: `cargo fmt --all --
 --check` flags only `crates/meta/src/store/gate.rs` (as on main); clippy
 `--workspace --all-targets -D warnings` clean; the CLI crate's tests pass;
 `cargo test --workspace --no-fail-fast`: 3082 passed, 0 failed, 55 ignored.
+
+## Fix: two deposed-root bugs of `long-delegated-late-answers` (seeds 9287 and 2945, 2026-10-17)
+
+Plan 43's landing order, step 2: the two simulation failures that
+`9d00417` (a fast-tenure root renews lock grants and delegations only with
+fresh S3 liveness; timing only) exposed. Bisected: `9a8549c` passes both
+seeds, `9d00417` fails both. Each is an older bug of its own, and each
+fix alone leaves the other seed failing. Both start the same way: a root
+that was paused resumes, executes a backlog under its old epoch (appending
+its delegates' stream rows to its journal, then its own and forwarded
+operations), and loses the lease to a backup that sealed its epoch. A
+deposition strands the root's own transactions but never another
+delegation's rows, which belong to their generation (the delegate
+re-streams them to the successor).
+
+### Seed 9287: `EIO` in doubt for a write that had landed
+
+`check_in_doubt_answers`: the root's own create, executed by `d1`'s
+delegate, was in the root's journal as a row of `d1`'s generation when
+the successor's segment carrying the create's `Completed` record was
+applied. At the op's deadline `settled_outcome` read "lease lost and the
+journal still carries the outcome" as "not the log's" (the rule that keeps
+a deposed holder from answering its own unshipped rows, `long_backup`
+seed 56774) and the client heard `EIO`. `Meta::outcome_from_log` (the
+`completed` row records position 0 when a segment wrote it, a journal seq
+when the journal did) lets the journal decide only while the row is its
+own.
+
+### Seed 2945: a marker visible without its data
+
+`marker_watcher`: the root had appended `d1`'s rows 6-10 (the data) and
+then executed node 2's forwarded marker (deps `(1,9)`, `(2,6)`); it was
+deposed, the delegate crashed, and the marker was replayed by rid with the
+deposed node's own session deps `(1,5)`. The new root accepted it before
+`d1`'s restarted delegate re-sent rows 6-10, so the log held the marker
+ahead of its data. `strand_local_tx` now records, per generation, the
+highest row of it still in the journal ahead of the stranded transaction
+(`StrandedOp::deps`, a new field of the queued replay); `submit` joins
+them into the replay's deps and the takeover gate's local replay leaves
+such an op to the drain until the rows have arrived or their generation
+is lost; an entry whose rid the log already settled is forgotten, not
+parked (a parked entry holds reads and publishing), and a replay whose
+deps are lost with one generation keeps the recorded rows of the others.
+The `QueuedReplay` encoding changed: a replay queue persisted by an older
+binary fails to decode, so drain it before an upgrade (no compatibility, by
+project rule).
+
+Not closed: on the production rebuild path (`recover_deposed` ->
+`RebuildReplica` -> `reset_for_rebuilt_ns_tx`) the appended generation
+rows are stranded too, as `Records` copies queued behind the marker with
+empty deps. With the delegate back, the marker waits for its re-stream, as
+above; if it never returns, the generation voids, the marker executes, and
+the copies of the data follow it (the 2945 symptom via the copies). No sim
+configuration reaches this path (the `RebuildReplica` stub never
+succeeds). Plan 43 C3 closes it.
+
+### Verification
+
+On `1db406e` plus only the two simulation tests, both seeds fail with the
+stated invariants. The two meta tests (`a_segment_carrying_a_journaled_rid_
+makes_its_outcome_the_logs`, `a_deposed_roots_replay_names_the_delegate_
+rows_it_was_ordered_after`) fail with the behaviour of each fix switched
+off (`outcome_from_log` false, no deps recorded); the two core tests of the
+gate and refresh rules (`the_gate_forgets_a_replay_the_log_already_
+settled_whatever_its_deps`, `a_replay_with_one_lost_generation_keeps_the_
+rows_of_the_live_one`) fail with the settled-rid check and the keeping of
+live rows removed. On the test host: `cargo fmt --all -- --check` flags
+only `crates/meta/src/store/gate.rs` (as on main); clippy `--workspace
+--all-targets -D warnings` clean; `cargo test --workspace --no-fail-fast`
+on `630d1a0` plus both fixes: 3127 passed, 0 failed, 55 ignored (each fix
+alone on `1db406e`: 3106 passed, 0 failed, 55 ignored; fix B alone again
+on `630d1a0`: clippy clean, authority and meta tests 345 passed, 0
+failed). `long-delegated-late-answers` 0..10000: 0 failing with both;
+with fix A alone only 2945 fails, with fix B alone only 9287. The
+delegated configurations, 0..2000 each (`delegated-holder-cut`,
+`long-delegated-backup`, `delegated-backup`, `long-delegated`,
+`delegated-two-gens-root-crash`, `delegated-root-gone`,
+`delegated-delegate-restart`, `placement-hot`,
+`locks-writer-hold-delegated`, `locks-stall-step-delegated`, `long-backup`,
+`long-acks3`): 0 failing.
+
+Plan 43: narrowed by C3, which moves a deposed root's appended rows of
+other generations out of its journal (so `journal_carries_outcome` no
+longer names them) and ends the deposed root's replay by rid; it deletes
+`QueuedReplay::deps` and the `lost && journal_carries_outcome` branch seed
+9287 narrows. Seed 9287's fix reads `completed` rows, not a rebuild's
+result, and seed 2945's recording happens at strand time, so neither
+depends on the simulation's `RebuildReplica` stub; seed 2945's ordering
+guarantee does depend on which recovery path runs (see above). The
+regression tests stay.
