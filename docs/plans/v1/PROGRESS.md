@@ -48916,3 +48916,151 @@ A delegation that lapses under CPU load just before the upgrade
 after a resume against `delegate-handoff-renewal`'s 3 s bound (1.4–3.1 s
 idle, up to 5.4 s loaded), were seen in the same campaign on the stock
 build: findings of their own, not this fix.
+
+## Fix: the two application-visible `EIO` shapes of `load-probe-takeover` (2026-10-17)
+
+`load-probe-takeover` under `pause:lock-lapse+500:10000@b` (`b` is the root
+and is SIGSTOPped 4.5 s every 10 s; `a`, its backup and the delegate of its
+own directory, seals and takes over during the first pause; lease TTL 20 s,
+client deadline 2 x TTL) failed on `3e7237b` in 19 of 20 cells (seeds
+42..61) on two errno shapes the documented semantics do not allow (16
+in-doubt `EIO`, 3 `[bug]` `EIO`), both on `b`, the deposed node. Two
+independent bugs; two commits.
+
+### Shape 1: a deadlock between the deposed node's replay drain and its own op
+
+At its unpause `b`'s FUSE fast path executes one more write under its old,
+locally unexpired lease. The acknowledgement wait ends `DurableWait::Lost`
+and the op is resubmitted in doubt through the core, as a client op. The
+deposition recovery rolls the same row back and queues it for replay by rid:
+the rid is at once a live client op and an entry of the replay queue, often
+its head (behind it: the 72 or so delegate rows `b` had appended as root,
+queued as its own entries). The drain stops at a head that is a live client
+op ("its reply is what will resolve it"); the client op was held in a silent
+50 ms backoff by `hold_for_lost_deps`, because `own_replays_unsettled`
+counted every unsettled entry, the ones behind the op too, which the drain
+cannot reach. Neither logged anything and nothing else drives `b`'s lease
+machine in that state, so for 40 s `b` neither forwarded nor claimed the
+lease, although `a` served every forward from 8.5 s on and had released the
+lease to `b` (its registered wanter) for the last 27 to 33 s. At the client
+deadline the op was answered in doubt (`EIO`, `took_ms=43474 attempts=1
+history=[WaitingLease, AcquireRetry, Forwarded->2, Backoff]`); within 250 ms
+`b` forwarded, claimed the free lease and replayed the op locally.
+
+Fix (`fix(authority)`): `own_replays_unsettled_ahead_of(replica, Some(rid))`:
+an op is held only for the unsettled entries the drain replays before its own
+(smaller `queue_seq`), so the head of the queue is held by nothing; an op
+whose rid is not queued is held for every entry as before, and the barrier
+keeps the all-entries variant. The same per-op rule decides
+`reroute_ended_epoch_waits` (an op awaiting a dead epoch's log that is itself
+a queue head waited for the whole queue: the same mutual wait). The head op
+keeps what its replay would carry: the rows of still-live generations its
+queue entry recorded are joined into its `deps`. Observability: the first
+hold logs at debug with the entries it waits for (the hold's own predicate),
+the op's history shows `+held-for-replays`, and `status` exports
+`deps_lost_holds` and the new `replays_waiting_on_client` (drain ticks that
+stop at a head that is a live client op); schema re-blessed.
+
+### Shape 2: the write gate refused every mutation while the lease mirror said lost
+
+`write_gate.rs` returned `EIO` for `lease.is_lost()` to every mutation that
+missed the fast path between `LEASE LOST` and the recovery round's
+`clear_lost` (89 to 206 ms here, seconds under a slow S3), including the
+manifest commit an `fsync` flushes. The rule dates from the first lease
+implementation, before forwarding, the inbox and the deposition recovery
+existed. The core handles that case: the fast path is closed and the core
+never executes locally under `lost`; `mark_lost` records the new holder;
+`classify` refuses the node's own re-acquisition while lost, so the op waits
+on its acquire retry; the op resubmitted in doubt by `DurableWait::Lost`
+already bypassed the refusal and took that route.
+
+Fix (`fix(engine)`): delete the refusal. Review found the route it opens was
+not safe on one path: `on_acquire_retry` ("one more look at forwarding") and
+the S3-stalled forward of an op waiting on the lease path forwarded to the
+cached holder without the guards `route` and the forward backoff have, so an
+op admitted while deposed was forwarded about 200 ms later, ahead of the
+node's own stranded writes whenever the new holder's gate was already open
+(an out-of-order landing, or `ENOENT` for a create in a directory this node
+created and had not shipped). The campaign did not show it because the new
+holder's takeover gate answers `Busy` for 8.5 s and the op then passes the
+backoff's hold. Now the retry holds the op for the node's replays
+(`hold_for_lost_deps`), takes the lease path again while the node is lost and
+its journal holds rows no holder has, and the stalled-S3 forward holds it too.
+A deposed node whose recovery cannot complete used to answer each mutation
+with `EIO` at once; each now waits for the client deadline (2 x TTL) and ends
+in doubt (documented). The `--fsync-mode s3` barrier refusal while lost is a
+separate site, classified transient (pinned).
+
+### Tests
+
+- Shape 1: `a_deposed_nodes_own_op_at_the_head_of_its_replay_queue_is_not_held_behind_the_rest`
+  (the head is forwarded at once, the drain keeps its order),
+  `…_in_the_middle_of_its_queue_is_held_for_the_one_ahead_only`,
+  `…_keeps_the_live_rows_its_queue_entry_recorded` and
+  `an_op_awaiting_a_dead_epochs_log_is_not_rerouted_only_after_the_replays_behind_it`
+  fail before and pass after; `a_deposed_nodes_own_op_behind_another_replay_is_held_until_it_settles`
+  pins the ordering rule (passes before and after).
+- Shape 2: engine `a_deposed_nodes_write_goes_through_the_core_not_eio` and
+  `a_deposed_nodes_fsync_commits_through_the_core_not_eio` fail before (`EIO`,
+  no submit reaches the core); authority
+  `a_deposed_nodes_op_is_not_forwarded_before_the_recovery`,
+  `a_deposed_nodes_op_waits_for_its_own_earlier_write_then_forwards` and
+  `a_stalled_s3_does_not_forward_a_deposed_nodes_op_ahead_of_its_own_write`
+  fail without the retry's guards; `the_deposed_barrier_refusal_is_transient`.
+
+### Verification
+
+Each fix on its own base (`7fc8ef1`); the campaign and the harness scenarios on
+a tree with both. Cells are `load-probe-takeover`, `pause:lock-lapse+500:10000@b`,
+`CONSTELLATION_HARNESS_VERIFY=1`, `RUST_LOG` with the lock targets at debug and
+the node logs kept; a cell's verdict `inconclusive` is a pass whose 10 s latency
+bound the 4.5 s injected pause explains.
+
+| tree | seeds | cells | in-doubt `EIO` | `[bug]` `EIO` | other |
+|---|---|---:|---:|---:|---|
+| `3e7237b`, no fix (before) | 42..61 | 20 | 16 | 3 | |
+| both fixes (this change) | 42..61, 69, 75, 77 | 23 | 0 | 0 | 22 inconclusive, 1 passed; every cell one deposition, one backup takeover, no error of any class; slowest write+fsync 10.3 to 11.5 s (5.6 s once) against 43 to 48 s before |
+| shape 1 only (earlier run, before the review) | 42..49, 55, 69 | 10 | 0 | 4 | the `[bug]` ones are shape 2; seed 44 also failed on a lock-lapse `EIO` of `a`'s counter increment |
+| shape 2 only (earlier run) | 42..49, 55, 69 | 10 | 8 | 0 | the 8 are shape 1 (`b` at about 48 s) |
+
+The seed-44 failure (shape 1 only, `a` not paused: its counter increment got
+a `LockLapsed` refusal about 9 s into the run, kept as a conflict copy, and a
+second `EIO` 2 ms later flagged `[bug]` by the checker because it is counted
+neither in `fenced_io` nor in `owner_fenced_ops`) is not the documented
+contract of `cluster-locks.md` (a grant of a node that is not paused lapses
+only past its remaining window, 9.5 s or more, and `a`'s path to its sequencer
+was down for at most `b`'s 4.5 s pause). It did not recur in the 23 cells above
+(also not at seed 44); the cause is open and under investigation, and the
+second `EIO` may be a checker-evidence gap (the documented follow-on of a
+refused commit). The node logs of those cells carry the lock targets at debug.
+
+- Sim sweeps, 10,000 seeds each, on the shape 1 tree and on the tree with both
+  fixes: `long-delegated`, `long-delegated-backup`,
+  `long-delegated-late-answers`, `delegated-root-gone`,
+  `delegated-delegate-restart`, `delegated-holder-cut`: 0 failing. No sim
+  config models either shape (the sim's `RebuildReplica` stub never recovers a
+  deposed root; plan 43 C0).
+- Harness, seed 42, both fixes, native S3 backend (24 scenarios:
+  `deposed-reintegration`, `deposed-reintegration-backup`,
+  `root-failover-with-delegates`, `delegate-root-loss`,
+  `delegate-root-loss-ttl`, `delegate-root-blackhole`,
+  `delegate-backup-handoff-failover`, `delegate-crash`, `delegate-crash-backup`,
+  `lock-failover`, `lock-holder-killed-contention`, `ack-s3-failover`,
+  `backup-failover`, `backup-failover-with-delegation`, `backup-partition`,
+  `backup-departs`, `backup-takeover-drops-held-chunks`,
+  `backup-takeover-holds-missing-chunks`, `auto-placement`, `lease-fencing`,
+  `lease-handover`, `git-under-flock`, `flock-cross-node`,
+  `fence-token-at-write`): all passed.
+- `cargo fmt --all -- --check` (only `crates/meta/src/store/gate.rs`, as on
+  `main` at `7fc8ef1`; clean on the rebase onto `be53974`), clippy `--workspace --all-targets -D warnings` clean,
+  `cargo test --workspace --no-fail-fast`: 3154 passed on each of the two
+  trees, 0 failed, 55 ignored.
+
+Plan 43 does not fix either: C2's `Abandon` would turn shape 1's `EIO` into a
+settled `EIO` at the same deadline, and C3's member copies remove the delegate
+rows from the deposed root's queue but not the deadlock (two of its own
+fast-path rows at the unpause recreate it); C2 item 8 keeps the write gate's
+shape. Both fixes survive C1 to C4 as rules ("an op's hold for the node's
+replays covers only the entries ordered before its own"; "the write gate never
+refuses because the lease is lost, and the core never forwards a node's op
+ahead of its own stranded writes").
