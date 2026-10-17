@@ -444,6 +444,20 @@ always a prefix of the durable log plus speculation it can take back:
   capture off, the namespace is instead rebuilt from the shared log (a
   side replica bootstrapped from the head commit) and the journal's ops
   queued the same way.
+  A mutation an application issues on the deposed node before that
+  recovery has run is not refused: it goes through the authority core
+  like any other op that misses the fast path. It waits for the recovery
+  (the node does not re-acquire the lease while deposed, and while its
+  journal holds rows no holder has it is not forwarded), is then held
+  until this node's own stranded ops queued ahead of it have landed, and
+  is forwarded to the new holder under the same rid. How long the
+  recovery takes depends on the case: with holder capture on it is a
+  tail to head and a rollback from before-images; with capture off, or
+  for rows capture did not cover, a replica rebuilt from the log, as long
+  as that read takes. A deposed node whose recovery cannot complete (the
+  log is unreadable) used to answer each mutation with `EIO` at once;
+  each now waits for the client deadline (twice the lease TTL) and ends
+  in doubt.
 - **Publishing.** A commit is always the log-prefix state at the
   `applied` position it claims. A node with outstanding shadows or hints
   does not publish; its dirty set waits for them to retire or roll back. A

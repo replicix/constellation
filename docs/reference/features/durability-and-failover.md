@@ -437,6 +437,13 @@ deadline (2 × TTL) and end in doubt first. A delegate's own writes take
 the lease path once its unrenewed grant lapses (see
 [Delegations](delegations.md#failures)).
 
+A holder that is deposed (paused or partitioned past its lease while a
+backup or another node took over) answers no application mutation with
+`EIO` for that: a mutation issued on it before its recovery has run is
+forwarded to the new holder after the recovery, behind the node's own
+stranded writes, never refused (see
+[Forwarded mutations](forwarded-mutations.md#speculation-and-stranded-op-recovery)).
+
 ### Layer C: `ack=s3`
 
 A filesystem created with `fs create --ack-policy s3` (or with

@@ -963,3 +963,138 @@ fn a_lease_that_ran_out_before_the_write_sends_the_op_through_the_core() {
     assert_eq!(submitted, 1, "the op went through the core once");
     assert!(meta.lookup(ROOT_INO, "late").unwrap().is_none());
 }
+
+/// The view of a node the core has just reported deposed (`LEASE LOST`:
+/// node 2 holds epoch 2): the mirror says `lost`, the fast path is
+/// closed, and the recovery round has not run yet.
+fn mirror_deposed(fs: &View) {
+    let mut state = LeaseState::default();
+    state.mark_lost(2, 2, 1);
+    let lease = &fs.sync.as_ref().unwrap().lease;
+    lease.mirror(&state, Ms(now_unix_ms()), &Config::defaults(1, 1), false);
+    assert!(lease.is_lost());
+    assert!(lease.admit().is_none(), "the fast path is closed");
+}
+
+/// `load-probe-takeover` under `pause:lock-lapse+500:10000@b`: a deposed
+/// node's mutation admitted between `LEASE LOST` and the recovery round
+/// (a replica rebuild from the log: 90 to 200 ms there, seconds on a slow
+/// S3) was refused with `EIO` at the write gate. It goes through the
+/// core, which forwards it to the new holder once the node's replays are
+/// settled, like the one resubmitted in doubt and every one admitted
+/// after the round.
+#[test]
+fn a_deposed_nodes_write_goes_through_the_core_not_eio() {
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    mirror_deposed(&fs);
+    let before = meta.journal_len().unwrap();
+    let ino = meta.allocate_ino(ROOT_INO).unwrap();
+    let mut submitted = 0;
+    std::thread::scope(|scope| {
+        let op = scope.spawn(|| {
+            fs.mutate_op(
+                ROOT_INO,
+                constellation_meta::MutateOp::Create {
+                    parent: ROOT_INO,
+                    name: "deposed".into(),
+                    ino,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+        });
+        let started = std::time::Instant::now();
+        loop {
+            match core.try_recv() {
+                Ok(SyncRequest::Submit { op, reply, .. }) => {
+                    assert!(matches!(op, constellation_meta::MutateOp::Create { .. }));
+                    assert_eq!(
+                        meta.journal_len().unwrap(),
+                        before,
+                        "journaled locally by a deposed node"
+                    );
+                    submitted += 1;
+                    reply
+                        .send(constellation_authority::ClientReply::Outcome(
+                            constellation_meta::MutateOutcome::Accepted {
+                                epoch: 2,
+                                records: Vec::new(),
+                            },
+                        ))
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(_) if op.is_finished() => break,
+                Err(_) => {
+                    assert!(started.elapsed() < Duration::from_secs(10), "stuck");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        op.join().unwrap().expect("not refused while deposed");
+    });
+    assert_eq!(submitted, 1, "the op went through the core once");
+}
+
+/// The same refusal met by the commit an `fsync` flushes: the manifest
+/// commit of a deposed node is submitted to the core (which forwards it),
+/// and the `fsync` returns once the core answers it.
+#[test]
+fn a_deposed_nodes_fsync_commits_through_the_core_not_eio() {
+    use constellation_vfs::{Blocking, Caller, OpCtx, OpKind, Vfs};
+    let meta = Arc::new(Meta::open_in_memory().unwrap());
+    let file = meta.create(ROOT_INO, "a", 0o644, 0, 0).unwrap();
+    let (fs, _dir, mut core) = holder_fs(meta.clone(), false);
+    fs.do_write(file.ino, 0, b"must reach the bucket").unwrap();
+    mirror_deposed(&fs);
+    let caller = Caller::new(0, 0, None);
+    let mut commits = 0;
+    let mut result = None;
+    std::thread::scope(|scope| {
+        let fsync = scope.spawn(|| {
+            Blocking::run(|r| {
+                fs.fsync(
+                    &OpCtx::new(OpKind::Fsync, &caller),
+                    file.ino,
+                    constellation_vfs::Fh(0),
+                    constellation_vfs::Durability::Configured,
+                    r,
+                )
+            })
+            .map_err(|e| e.code())
+        });
+        let started = std::time::Instant::now();
+        while !fsync.is_finished() {
+            match core.try_recv() {
+                Ok(SyncRequest::DrainInode { reply, .. }) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(SyncRequest::Submit { op, reply, .. }) => {
+                    assert!(
+                        matches!(op, constellation_meta::MutateOp::SetManifest { .. }),
+                        "{op:?}"
+                    );
+                    commits += 1;
+                    reply
+                        .send(constellation_authority::ClientReply::Outcome(
+                            constellation_meta::MutateOutcome::Accepted {
+                                epoch: 2,
+                                records: Vec::new(),
+                            },
+                        ))
+                        .unwrap();
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(started.elapsed() < Duration::from_secs(10), "stuck");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        result = Some(fsync.join().unwrap());
+    });
+    assert_eq!(commits, 1, "the commit went through the core once");
+    assert_eq!(result, Some(Ok(())));
+}

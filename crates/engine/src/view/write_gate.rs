@@ -496,9 +496,17 @@ impl View {
             };
         }
         drop(gate);
-        if h.lease.is_lost() {
-            return Err(MutateFail::Errno(Code::Io));
-        }
+        // A lost lease is not a refusal. The core forwards the op to the
+        // new holder (`LeaseState::mark_lost` records it) once this node's
+        // replays are settled (`hold_for_lost_deps`), or retries the lease
+        // path until the recovery round has run (`classify` refuses this
+        // node's own re-acquisition while it is lost). Refusing here
+        // returned `EIO` for every write admitted between `LEASE LOST` and
+        // the recovery round's `clear_lost` — a replica rebuild from the
+        // log, as long as that read takes (`load-probe-takeover` under
+        // `pause:lock-lapse+500:10000@b`: 4 to 8 ops per cell in 90 to
+        // 200 ms; seconds under a slow S3).
+        //
         // Plan 30 M5: everything else — forwarding with its same-rid
         // retries, the inbox when there is no P2P path, the lease path
         // with its in-doubt resolution against `completed` (and an inbox

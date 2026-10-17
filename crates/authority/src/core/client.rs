@@ -1638,6 +1638,15 @@ impl Core {
             if !matches!(c.phase, Phase::WaitingLease | Phase::AcquireRetry) {
                 continue;
             }
+            // Not ahead of this node's own stranded writes (a deposed
+            // node's recovery needs S3 too): held, it forwards from its
+            // backoff once they have landed.
+            if self.hold_for_lost_deps(now, rid, replica, out) {
+                continue;
+            }
+            let Some(c) = self.clients.get_mut(&rid) else {
+                continue;
+            };
             if let Some(t) = c.timer.take() {
                 self.cancel_timer(t, out);
             }
@@ -1874,6 +1883,24 @@ impl Core {
         if let Some(epoch) = self.lease.new_mutation_epoch(now, &self.cfg) {
             let outcome = self.resolve_in_doubt_then_execute(now, rid, epoch, replica, out);
             self.finish(now, rid, outcome, replica, out);
+            return;
+        }
+        // A node's later write must not overtake its own earlier ones: the
+        // replays this node has to settle first (a deposition's, queued by
+        // rid) hold the op here, as they hold one that was forwarded
+        // (`on_forward_backoff`); and while the deposition's journal is
+        // still unshipped (the recovery round has not run) only the lease
+        // path is open to it, which the deposed node's own re-acquisition
+        // refusal turns into this retry. A deposed node's mutations are not
+        // refused at the write gate: this is where they wait.
+        if self.hold_for_lost_deps(now, rid, replica, out) {
+            return;
+        }
+        if self.lease.lost
+            && replica.journal_len().unwrap_or(0) > 0
+            && replica.journal_has_undelegated()
+        {
+            self.lease_path(now, rid, replica, out);
             return;
         }
         // Before re-asking S3, one more look at forwarding: the holder may

@@ -22987,6 +22987,170 @@ fn a_continuation_epoch_opened_during_the_takeover_read_blocks_the_seal() {
     assert!(h.core.job.is_none());
 }
 
+// ---- a deposed node's op is never refused: it waits for the recovery and for its own earlier writes, then forwards ----
+
+/// A node (1) that held epoch 1 with one own row (`before`) journaled,
+/// deposed by node 2's epoch 2 (`LEASE LOST`), and a client op `after`
+/// submitted to its core while the recovery round has not run: the lease
+/// path is refused at once ("deposed; refusing to reacquire before
+/// recovery") and the op waits on its acquire retry timer. Returns the
+/// harness, `before`'s rid and op, `after`'s rid and the retry timer.
+fn op_submitted_while_deposed() -> (Harness, (Rid, MutateOp), Rid, TimerId) {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.hold(1, None);
+    let before = (h.rid(1), h.create("before"));
+    constellation_meta::execute_mutate(&h.meta, &before.1, Some(before.0)).unwrap();
+    h.core.lease.mark_lost(2, 2, 1);
+    let rid = h.rid(2);
+    let op = h.create("after");
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    assert!(sends(&out).is_empty(), "{out:?}");
+    assert!(replies(&out).is_empty(), "never refused: {out:?}");
+    assert_eq!(h.core.lease.held, None);
+    let retry = timers(&out, TimerKind::AcquireRetry);
+    assert_eq!(retry.len(), 1, "the op waits for the recovery: {out:?}");
+    assert!(matches!(
+        h.core.clients().find(|(r, _)| *r == rid),
+        Some((_, ClientPhase::AcquireRetry))
+    ));
+    (h, before, rid, retry[0])
+}
+
+/// The recovery round of that node: the unshipped row is stranded and
+/// queued for replay by rid, the mirror clears.
+fn recover_deposed_node(h: &mut Harness) {
+    h.meta.strand_below_epoch(2).unwrap();
+    h.meta.set_holder_epoch(0);
+    h.core.lease.clear_lost();
+}
+
+fn forwards_to_2(out: &[Action], rid: Rid) -> bool {
+    sends(out)
+        .iter()
+        .any(|(to, m)| *to == 2 && matches!(m, PeerMsg::MutateRequest { rid: r, .. } if *r == rid))
+}
+
+/// The engine's write gate no longer refuses a mutation while the lease
+/// mirror says `lost` (`load-probe-takeover` under
+/// `pause:lock-lapse+500:10000@b`: `EIO` for every write admitted between
+/// `LEASE LOST` and the recovery round). What that relies on: until the
+/// recovery has run the node's journal holds rows no holder has, so the
+/// retry of such an op takes the lease path again, not a forward (a
+/// holder would refuse it, `ENOENT` for a name this node created and has
+/// not shipped), whenever the new holder's gate is already open.
+#[test]
+fn a_deposed_nodes_op_is_not_forwarded_before_the_recovery() {
+    let (mut h, _before, rid, retry) = op_submitted_while_deposed();
+    h.advance(1_000);
+    let out = h.step(Event::Timer { id: retry });
+    assert!(replies(&out).is_empty(), "never refused: {out:?}");
+    assert!(
+        !forwards_to_2(&out, rid),
+        "forwarded ahead of the node's own unshipped write: {out:?}"
+    );
+    assert_eq!(
+        timers(&out, TimerKind::AcquireRetry).len(),
+        1,
+        "waits for the recovery again: {out:?}"
+    );
+}
+
+/// After the recovery the node's own earlier write is a queued replay of
+/// the new holder; a later write of the node is held until it has landed
+/// (a retry that forwarded at once executed it ahead of that write at the
+/// new holder), then forwarded under the same rid.
+#[test]
+fn a_deposed_nodes_op_waits_for_its_own_earlier_write_then_forwards() {
+    let (mut h, (before_rid, before_op), rid, retry) = op_submitted_while_deposed();
+    recover_deposed_node(&mut h);
+    assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
+    h.advance(1_000);
+    let out = h.step(Event::Timer { id: retry });
+    assert!(replies(&out).is_empty(), "never refused: {out:?}");
+    assert!(
+        !forwards_to_2(&out, rid),
+        "forwarded ahead of the node's stranded write: {out:?}"
+    );
+    let backoff = timers(&out, TimerKind::ForwardBackoff);
+    assert_eq!(backoff.len(), 1, "held on its backoff: {out:?}");
+    assert!(matches!(
+        h.core.clients().find(|(r, _)| *r == rid),
+        Some((_, ClientPhase::Backoff))
+    ));
+    // The earlier write lands in the log (the new holder executed its
+    // replay); the drain forgets the entry and the op goes.
+    let MutateOp::Create {
+        parent,
+        name,
+        ino,
+        mode,
+        uid,
+        gid,
+    } = &before_op
+    else {
+        panic!("a create");
+    };
+    let seg = [
+        LogRecord::Create {
+            parent: *parent,
+            name: name.clone(),
+            ino: *ino,
+            mode: *mode,
+            uid: *uid,
+            gid: *gid,
+            time_ns: 5,
+        },
+        LogRecord::Completed { rid: before_rid },
+    ];
+    h.meta
+        .apply_segment(2, 2, &seg, &constellation_meta::TouchSet::default())
+        .unwrap();
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert!(h.meta.pending_replays().unwrap().is_empty(), "{out:?}");
+    h.advance(1_000);
+    let out = h.step(Event::Timer { id: backoff[0] });
+    assert!(replies(&out).is_empty(), "never refused: {out:?}");
+    assert!(forwards_to_2(&out, rid), "forwarded to the holder: {out:?}");
+}
+
+/// The S3-stalled forward of an op waiting on the lease path has the same
+/// rule (a deposed node's recovery needs S3 as well): not ahead of the
+/// node's own stranded write.
+#[test]
+fn a_stalled_s3_does_not_forward_a_deposed_nodes_op_ahead_of_its_own_write() {
+    let (mut h, _before, rid, _retry) = op_submitted_while_deposed();
+    recover_deposed_node(&mut h);
+    h.advance(1_000);
+    let out = stalled(&mut h, None);
+    assert!(
+        !forwards_to_2(&out, rid),
+        "forwarded ahead of the node's stranded write: {out:?}"
+    );
+    assert_eq!(h.core.stats.s3_less_forwards, 0);
+    assert!(matches!(
+        h.core.clients().find(|(r, _)| *r == rid),
+        Some((_, ClientPhase::Backoff))
+    ));
+}
+
+/// `--fsync-mode s3` through a deposition: the barrier refusal a deposed
+/// node answers is classified transient, so the `fsync` waiting on it
+/// retries (until the recovery round has run) instead of failing.
+#[test]
+fn the_deposed_barrier_refusal_is_transient() {
+    assert_eq!(
+        constellation_store_s3::classify_message(&Core::barrier_refused_deposed()),
+        constellation_store_s3::ErrorClass::Transient
+    );
+}
+
 // ---- a stranded transaction's replay names the delegate rows ahead of it ----
 
 /// A deposed root (epoch 1) that appended generation 4's stream row 7 and
