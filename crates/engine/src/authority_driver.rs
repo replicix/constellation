@@ -5932,6 +5932,30 @@ impl Standalone {
             .await
     }
 
+    /// What the daemon does when it starts a publisher (`node.rs`):
+    /// adopt the chain head as the publish parent (tests of a follower
+    /// whose parent is older than the head it follows).
+    #[cfg(test)]
+    pub(crate) async fn warm_up(&mut self) -> Result<()> {
+        self.publisher
+            .as_mut()
+            .context("this standalone driver has no tree publisher")?
+            .warm_up()
+            .await
+    }
+
+    /// One `Action::FollowHead` of a non-holder's idle cadence, which this
+    /// driver otherwise answers as failed: clear the dirty keys the chain
+    /// head covers, leaving the publish parent where it was.
+    #[cfg(test)]
+    pub(crate) async fn follow_head(&mut self) -> Result<usize> {
+        self.publisher
+            .as_mut()
+            .context("this standalone driver has no tree publisher")?
+            .follow_head()
+            .await
+    }
+
     /// Copy the core's lease state into `view`, as the daemon's driver
     /// does after every event (tests that need the fast path's gate).
     pub fn mirror(&self, view: &crate::lease::LeaseView) {

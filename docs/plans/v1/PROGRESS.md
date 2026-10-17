@@ -48746,3 +48746,103 @@ pending); the delegate's was fenced by a mirror that lags the core.
   one failure, `daemon_lock::tests::own_flock_is_found_and_live`, passes
   alone and in the package rerun (70 passed): it reads `/proc/locks` on a
   host busy with other runs.
+
+## Fix: a follower that became the holder froze a stale commit (`snap-head`)
+
+Harness `snapsched` under host load (load average ~43) failed its
+monotonicity check: `auto-…T230130Z froze counter 170 after 271`. The
+snapshot was a well-formed, older log prefix: the commit its node had
+adopted at its restart, three minutes before, although its replica held
+every acknowledged write.
+
+### Mechanism
+
+- `TreePublisher::publish_now` and `publish_through` answered "nothing is
+  dirty" with `state`, the last commit the publisher published or adopted
+  as a parent. The shortcut dates from plan 28 (`da91c8c`; `publish_through`
+  copied it in `b323b85`), when only the publisher cleared dirty keys, and
+  only against what it had published itself.
+- Plan 30 §M4 item 3's `follow_head` (a non-holder's idle cadence) clears
+  the dirty keys against the chain head it discovered and, by design, does
+  not move `state` (adopting the head needs its pack indices). On a follower
+  "nothing dirty" therefore means "the replica matches the head it
+  followed", not "`state` reflects the replica".
+- A false seal of the live holder under load (a stall of the node's own
+  store lock read as the holder's silence) made that follower the holder
+  with nothing dirty, and the scheduler's bucket batch ran on it:
+  `publish_through` returned the restart-time parent. The skip-empty check
+  then compared it to the previous snapshot, found a difference, and did not
+  skip the idle bucket. Retention later kept the older-valued snapshot beside
+  a newer one.
+- Five unloaded `snapsched` reruns passed because their only planned holder
+  change is the `kill -9` of the scheduler leader: either the holder does not
+  change, or the writer retargets to the new holder at once and its dirty
+  keys send the publish down the normal adopt-and-publish path. Only an
+  unplanned holder change onto an idle follower exposes it.
+
+### Fix (`mtree_publish.rs`)
+
+- A publisher answers "this commit reflects the replica" without publishing
+  only for the chain head it has adopted, never for an older parent.
+  `reflecting_head()` (hydrate, `adopt_head`, return `state`) is what
+  `publish_now` returns when nothing is dirty, and what `publish_through`
+  returns when nothing is dirty and `state.applied` does not cover the drain
+  (a holder that just published keeps its fast path). It costs one GET-next
+  probe on the snapshot path and never a PUT, so a follower still publishes
+  nothing (`publish-only-holder`).
+- `adopt_head`'s early return (`head <= known`) leaves `state` as it is: then
+  `state` already is the head, and its pack indices were loaded when it was
+  adopted or by `warm_up`'s catalog attach. When the head is newer,
+  `adopt_head` loads its pack indices as it does for a publish.
+- A guard (from the review): `adopt_head` hands back the old parent when the
+  head it discovered cannot be read (or names no shard 0 root). The publisher
+  knows the head its dirty keys were cleared against (`followed`), so
+  `reflecting_head` bails with `PUBLISH_DEFERRED` ("retry shortly") when the
+  adopted parent is older than it. Both snapshot hooks retry that marker, so
+  a transient failure retries and a persistent one is a snapshot error, never
+  a stale snapshot. A node that never followed has `followed == 0`.
+  `adopt_head` now also probes from `known.max(followed)`, as `follow_head`
+  does, and `publish_through` stops probing after an empty-chain `None`.
+- The module docs state the invariant: the dirty set is the read set
+  relative to the adopted head, and `follow_head` is the one clear made
+  against something other than `state`. `publish_through`, `publish_now`
+  and `follow_head` docs say so.
+- Not done: moving `state` in `follow_head`. It would be the cleaner
+  invariant, but `adopt_head` would then skip loading the head's pack indices
+  and the next `publish_batch` could build on a root whose indices were
+  never loaded.
+
+### Tests
+
+- Unit (`mtree_publish`): `a_followed_head_that_cannot_be_adopted_defers_the_snapshot_not_a_stale_one`
+  (the followed commit deleted from the bucket: both paths return the
+  deferred error; without the guard they return the stale parent). A follower whose parent is commit 1 and whose
+  dirty keys `follow_head` cleared against commit 2 gets commit 2 from
+  `publish_through` (`a_follower_turned_holder_snapshots_the_head_it_followed_not_its_stale_parent`)
+  and from `publish_now` (`..._manual_snapshot_freezes_the_head_it_followed`;
+  separate follower, since the first call adopts the head). Both failed on
+  `main` ("handed back the stale parent (commit 1), not the head … (commit 2)").
+- End to end (`snapshot_batch`): `a_follower_turned_holder_snapshots_what_it_followed`.
+  B writes 9 steps and publishes twice, A warms up, follows, B releases, A
+  takes the lease in the batch with nothing dirty: the snapshot froze 3 steps
+  before the fix, 9 after. `Standalone` gained `#[cfg(test)]` `warm_up` and
+  `follow_head` passthroughs.
+- Harness `snapshot-takeover-idle`: b holds the root lease and bumps a counter
+  to 20, a mounts after b's first commit (its parent), b bumps to 60 and
+  idles, a's cadence clears against b's final commit (checked in a's log),
+  b is `kill -9`ed, and `snapshot create /proj@after` on a (which has written
+  nothing: a write would dirty it and hide the hole) must freeze 60. Before
+  the fix it froze 20 (the parent), deterministic; after, 60.
+
+### Gates
+
+- Fail-before: the three unit/e2e tests fail on `main`'s `mtree_publish`
+  code and pass with the fix; `snapshot-takeover-idle` froze 20 of 60 before
+  and 60 of 60 after (seeds 42, 7, 8).
+- `cargo fmt --all -- --check` (only `crates/meta/src/store/gate.rs`, as on
+  `main`), clippy `--workspace --all-targets -D warnings` clean, engine
+  `--lib mtree_publish` 15 passed (1 ignored), `--lib snapshot` 60 passed,
+  `cargo test --workspace --no-fail-fast`: 3148 passed, 55 ignored, 0 failed.
+- Harness, release, seed 42, all passed: `snapshot-takeover-idle` (29 s),
+  `snapshot-lifecycle`, `snapshot-busy-latency`, `publish-only-holder`,
+  `snapshot-churn`, `snapsched-leader-paused`, `snapsched`.

@@ -1848,6 +1848,13 @@ pub const CAMPAIGN: &[Scenario] = &[
         run: snapsched::snapsched_leader_paused,
     },
     Scenario {
+        name: "snapshot-takeover-idle",
+        desc: "a follower that cleared its dirty keys against the chain head (its publish parent an older commit) becomes the root lease holder with nothing to publish and is asked for a snapshot: it freezes the head it followed, the writer's last value, not the older parent",
+        requires: &[],
+        caps: &[],
+        run: snapsched::snapshot_takeover_idle,
+    },
+    Scenario {
         name: "endpoint-wedge-probe",
         desc: "load campaign 5.4 (F11): one node of a busy three-node cluster frozen 8 s per round: every link back, no FUSE request stalled, no write lost or failed",
         requires: &[],

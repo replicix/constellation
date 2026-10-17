@@ -54,6 +54,28 @@
 //! the plan), and a publish — or a splice onto a lost race's winner —
 //! proceeds only when this replica's vector covers the other one.
 //!
+//! ## What the dirty set is relative to
+//!
+//! A publish's invariant is: `ns` == tree(adopted head) ⊕ the current
+//! values of the dirty keys. `publish_batch` adopts the head before it
+//! plans and clears only what it just wrote onto it, so the invariant
+//! holds against `state`. [`TreePublisher::follow_head`] is the one clear
+//! made against something else: a follower clears against the head it
+//! discovered and leaves `state` at its older parent (adopting would need
+//! the head's pack indices, a cost only a would-be holder should pay). On
+//! a follower the invariant therefore holds against the *followed head*,
+//! not against `state`, so "nothing dirty" does not mean "`state` reflects
+//! the replica". Code that wants the commit reflecting a replica with
+//! nothing dirty (a snapshot, [`TreePublisher::publish_now`] and
+//! [`TreePublisher::publish_through`]) must adopt the head first
+//! (`reflecting_head`) — a 2026-10-16 `snapsched` run did not: a follower
+//! became the holder, was asked for a snapshot with nothing dirty, and
+//! froze the commit it had adopted at its restart. History: plan 28's
+//! "nothing dirty → last commit" shortcut was sound while only the
+//! publisher cleared dirty keys, and only against what it published
+//! itself; plan 30 §M4 item 3's `follow_head` is what made `state` and
+//! the cleared-against tree diverge.
+//!
 //! ## The §P3 splice, restated for key deltas
 //!
 //! A lost CAS diffs the winner's root against the parent this batch was
@@ -412,6 +434,13 @@ impl TreePublisher {
     /// and only while something is dirty. Does not adopt the head as a
     /// publish parent: that needs the head's pack indices, which only a
     /// publish loads (`adopt_head`), should this node become the holder.
+    /// So after this call `state` is *not* what the replica matches: the
+    /// dirty set was cleared against the head, `state` stayed an older
+    /// parent. This is the one clear made against something other than
+    /// `state` (module docs, "What the dirty set is relative to"); the
+    /// snapshot paths adopt the head on demand (`reflecting_head`) before
+    /// they hand a commit out for a replica with nothing dirty, and
+    /// `publish_batch` adopts it before planning.
     /// Returns how many dirty keys were cleared.
     pub async fn follow_head(&mut self) -> Result<usize> {
         if !self.meta.has_dirty() || self.meta.has_outstanding_speculation() {
@@ -451,9 +480,12 @@ impl TreePublisher {
 
     /// Publish whatever is dirty and return the commit that now
     /// reflects this replica: the new one, or — when nothing was dirty
-    /// — the last one, which already does. A deferred publish is an
-    /// error, because a caller asking for "now" (a snapshot) must not be
-    /// handed an older state.
+    /// — the chain head, adopted ([`Self::reflecting_head`]), which
+    /// already does. Not `state`: a node that followed the head with
+    /// nothing dirty and then took the lease has a `state` older than the
+    /// tree its replica matches. A deferred publish is an error, because
+    /// a caller asking for "now" (a snapshot) must not be handed an older
+    /// state.
     pub async fn publish_now(&mut self, epoch: u64) -> Result<(u64, NodeHash)> {
         // Plan 30 §M3b: a commit substituted around unshipped local work
         // would be the log prefix, not "now" — so for a caller that needs
@@ -485,18 +517,22 @@ impl TreePublisher {
                  or a concurrent commit overlaps its batch); retry shortly"
             );
         }
-        let state = self
-            .state
-            .as_ref()
-            .context("nothing has been published on this mount yet")?;
-        Ok((state.seq, state.root))
+        self.reflecting_head()
+            .await?
+            .context("nothing has been published on this mount yet")
     }
 
     /// The commit a snapshot retains once its barrier has shipped every
     /// journal row admitted before it: one whose `applied` position
     /// covers `applied` (this replica's applied log position after that
-    /// drain), or — nothing dirty — the last one, which reflects the
-    /// replica whole.
+    /// drain), or — nothing dirty — the chain head, adopted
+    /// ([`Self::reflecting_head`]): the commit a follower's dirty clears
+    /// were made against, which reflects the replica whole. Never merely
+    /// `state` in that case, which a follower leaves at an older parent
+    /// (2026-10-16 `snapsched`: a snapshot froze a three-minute-old tree
+    /// and a later one then froze a newer counter value than it). A
+    /// holder that has just published (`state.applied` covers the drain)
+    /// answers from `state` without a probe.
     ///
     /// Fix (snap-drain-busy): unlike [`Self::publish_now`] this does not
     /// wait for an empty journal. A commit is the log prefix at its
@@ -535,9 +571,17 @@ impl TreePublisher {
             if let Some(state) = self
                 .state
                 .as_ref()
-                .filter(|s| vector_covers(s.applied, applied) || !self.meta.has_dirty())
+                .filter(|s| vector_covers(s.applied, applied))
             {
                 return Ok((state.seq, state.root));
+            }
+            if !self.meta.has_dirty() {
+                match self.reflecting_head().await? {
+                    Some(head) => return Ok(head),
+                    // An empty chain with nothing published here: another
+                    // probe would find the same.
+                    None => break,
+                }
             }
         }
         if self.state.is_none() && !self.meta.has_dirty() {
@@ -548,6 +592,41 @@ impl TreePublisher {
              this replica is behind the chain head, or a concurrent commit overlaps its batch); \
              retry shortly"
         )
+    }
+
+    /// The commit that reflects this replica when nothing is dirty: the
+    /// chain head, adopted. `state` is only the publisher's last parent:
+    /// a follower's [`Self::follow_head`] clears its dirty keys against the
+    /// head it discovered without moving `state`, so `state` can be an
+    /// ancestor of the tree the replica actually matches (2026-10-16
+    /// `snapsched`: a snapshot cut at a freshly promoted holder froze the
+    /// commit it had adopted at its restart, three minutes stale). Costs
+    /// one GET-next probe when nothing moved (`adopt_head`'s
+    /// `head <= known` return leaves `state` as it is — it already is the
+    /// head, so its pack indices were loaded when it was adopted).
+    /// `None` while the chain is empty and nothing was ever published here.
+    /// Errors with [`PUBLISH_DEFERRED`] when the head `follow_head` cleared
+    /// against cannot be adopted (it vanished or is unreadable): the old
+    /// parent is never handed out in its place.
+    async fn reflecting_head(&mut self) -> Result<Option<(u64, NodeHash)>> {
+        self.hydrate().await?;
+        self.adopt_head().await?;
+        // `adopt_head` hands back the old parent when the head it
+        // discovered cannot be read or names no shard 0 root. This
+        // replica's dirty keys were cleared against `followed`, so a parent
+        // older than it is exactly the stale answer this method exists to
+        // prevent: defer (the snapshot hooks retry on `PUBLISH_DEFERRED`)
+        // rather than hand it out. A node that never followed has
+        // `followed == 0`.
+        if let Some(parent) = self.state.as_ref().filter(|s| s.seq < self.followed) {
+            anyhow::bail!(
+                "{PUBLISH_DEFERRED} (the chain head {} this replica's dirty keys were cleared \
+                 against could not be adopted; its parent is commit {}); retry shortly",
+                self.followed,
+                parent.seq
+            );
+        }
+        Ok(self.state.as_ref().map(|s| (s.seq, s.root)))
     }
 
     async fn publish_batch(&mut self, epoch: u64) -> Result<Outcome> {
@@ -876,6 +955,9 @@ impl TreePublisher {
     /// slot after the newest commit rather than at one that is taken.
     async fn adopt_head(&mut self) -> Result<u64> {
         let known = self.state.as_ref().map(|s| s.seq).unwrap_or(0);
+        // Probe from the newest commit `follow_head` saw, as it does: a
+        // long-idle follower's parent can be many commits behind it.
+        let probe_from = known.max(self.followed);
         let retention = std::time::Duration::from_secs(
             std::env::var("CONSTELLATION_COMMIT_RETENTION_S")
                 .ok()
@@ -890,7 +972,7 @@ impl TreePublisher {
         {
             return Ok(0);
         }
-        let Some(head) = self.chain.discover_head(known).await? else {
+        let Some(head) = self.chain.discover_head(probe_from).await? else {
             if known == 0 {
                 self.empty_chain_seen = Some(std::time::Instant::now());
             }
@@ -1326,6 +1408,132 @@ mod tests {
         meta.create(ROOT_INO, "mine", 0o644, 0, 0).unwrap();
         assert_eq!(follower.follow_head().await.unwrap(), 0);
         assert!(meta.has_dirty());
+    }
+
+    /// The state of the 2026-10-16 `snapsched` failure (`a: auto-…T230130Z
+    /// froze counter 170 after 271`): a follower whose publish parent is
+    /// the commit it adopted at its restart (`first`), whose dirty keys
+    /// `follow_head` has since cleared against a newer head (`second`)
+    /// without moving that parent, and whose replica holds everything
+    /// `second` does. Returns the fixture (it owns the bucket and the
+    /// caches), the follower, and `second`.
+    async fn follower_behind_the_head() -> (Fixture, TreePublisher, Commit) {
+        let mut f = Fixture::new();
+        let dir = seed(&f.meta, 3);
+        f.meta.set_applied_seq(5).unwrap();
+        let mut holder = f.publisher(1);
+        let first = publish(&mut holder).await.expect("a first commit");
+        assert_eq!(first.applied, 5);
+
+        // The follower tails the same records and, as a restarted node's
+        // `warm_up` does, adopts the head as its publish parent.
+        let journal = f.meta.peek_journal_after(0).unwrap();
+        let last_seq = journal.iter().map(|(s, _)| *s).max().unwrap();
+        let records: Vec<LogRecord> = journal.into_iter().map(|(_, r)| r).collect();
+        let meta = Arc::new(crate::mtree_publish::test_meta());
+        meta.set_node_prefix(2).unwrap();
+        meta.apply_records(&records).unwrap();
+        meta.set_applied_seq(5).unwrap();
+        let store = Arc::clone(&f.store);
+        let mut follower = f.publisher_over(Arc::clone(&meta), store, 2);
+        follower.warm_up().await.unwrap();
+        assert_eq!(follower.published().map(|(_, s)| s), Some(first.seq));
+        assert!(follower.follow_head().await.unwrap() > 0);
+        assert!(!meta.has_dirty());
+
+        // The holder writes on and publishes again; the follower applies
+        // the records and clears them against the new head. Its parent is
+        // still `first`.
+        f.meta.create(dir, "later", 0o644, 1000, 1000).unwrap();
+        f.meta.set_applied_seq(9).unwrap();
+        let second = publish(&mut holder).await.expect("a second commit");
+        assert_eq!(second.applied, 9);
+        let records: Vec<LogRecord> = f
+            .meta
+            .peek_journal_after(last_seq)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect();
+        assert!(!records.is_empty());
+        meta.apply_records(&records).unwrap();
+        meta.set_applied_seq(9).unwrap();
+        assert!(meta.has_dirty());
+        assert!(follower.follow_head().await.unwrap() > 0);
+        assert!(!meta.has_dirty());
+        assert_eq!(follower.published().map(|(_, s)| s), Some(first.seq));
+        (f, follower, second)
+    }
+
+    /// Fail-before for the 2026-10-16 `snapsched` failure under host load
+    /// (`a: auto-…T230130Z froze counter 170 after 271`): a follower that
+    /// became the holder cut a snapshot from the commit it had adopted at
+    /// its restart, three minutes stale, although its replica held every
+    /// acknowledged write. `follow_head` clears a follower's dirty keys
+    /// against the chain head without moving `state`, and `publish_through`
+    /// / `publish_now` handed back `state` whenever nothing was dirty. The
+    /// commit a snapshot gets on a node that followed with nothing dirty
+    /// must be the head it followed (one covering its applied position),
+    /// never an older parent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_turned_holder_snapshots_the_head_it_followed_not_its_stale_parent() {
+        let (_f, mut follower, second) = follower_behind_the_head().await;
+        // The follower now holds the lease; a snapshot's barrier drained
+        // and asks for a commit covering applied position 9.
+        let (seq, root) = follower.publish_through(2, 9).await.unwrap();
+        assert_eq!(
+            seq, second.seq,
+            "publish_through handed back the stale parent (commit {seq}), not the head covering \
+             applied 9 (commit {})",
+            second.seq
+        );
+        assert_eq!(root, second.root(SHARD0).unwrap());
+        // The head is now the publisher's parent, and asking again costs
+        // no new commit.
+        assert_eq!(follower.published().map(|(_, s)| s), Some(second.seq));
+        let (again, _) = follower.publish_through(2, 9).await.unwrap();
+        assert_eq!(again, second.seq);
+    }
+
+    /// The guard behind it: when the head a follower cleared against
+    /// cannot be read (here: the commit is gone from the bucket), the
+    /// snapshot paths defer with the retryable marker instead of handing
+    /// out the stale parent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_followed_head_that_cannot_be_adopted_defers_the_snapshot_not_a_stale_one() {
+        let (f, mut follower, second) = follower_behind_the_head().await;
+        f.store
+            .delete(&object_store::path::Path::from(format!(
+                "commits/{:016x}",
+                second.seq
+            )))
+            .await
+            .unwrap();
+        let error = follower.publish_through(2, 9).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains(PUBLISH_DEFERRED), "{text}");
+        assert!(text.contains("retry shortly"), "{text}");
+        let error = follower.publish_now(2).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains(PUBLISH_DEFERRED),
+            "publish_now: {error:#}"
+        );
+    }
+
+    /// The manual snapshot's path (`publish_now`) is the same question,
+    /// on a fresh follower so the earlier test's adoption does not answer
+    /// it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_turned_holder_manual_snapshot_freezes_the_head_it_followed() {
+        let (_f, mut follower, second) = follower_behind_the_head().await;
+        let (seq, root) = follower.publish_now(2).await.unwrap();
+        assert_eq!(
+            seq, second.seq,
+            "publish_now handed back the stale parent (commit {seq}), not the head (commit {})",
+            second.seq
+        );
+        assert_eq!(root, second.root(SHARD0).unwrap());
+        assert_eq!(follower.published().map(|(_, s)| s), Some(second.seq));
     }
 
     /// The claim the whole step rests on: a tree grown one publish at a

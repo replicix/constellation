@@ -961,6 +961,174 @@ pub fn snapsched(seed: u64) -> Result<()> {
     result
 }
 
+/// The newest commit seq in the bucket (0 for none).
+fn newest_commit(endpoint: &str, prefix: &str) -> Result<u64> {
+    Ok(raw_objects(endpoint, &format!("{prefix}/commits/"))?
+        .iter()
+        .filter_map(|(key, _)| u64::from_str_radix(key.rsplit('/').next()?, 16).ok())
+        .max()
+        .unwrap_or(0))
+}
+
+/// The newest chain head a follower's `follow_head` has cleared its dirty
+/// keys against, from the node's log (`mtree_publish`'s debug line).
+fn followed_head(c: &Client) -> u64 {
+    c.log_text()
+        .lines()
+        .filter(|l| l.contains("follower cleared dirty keys the head commit covers"))
+        .filter_map(|l| {
+            // Strip ANSI colouring, then `head=<n>`.
+            let mut plain = String::new();
+            let mut chars = l.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\u{1b}' {
+                    for ch in chars.by_ref() {
+                        if ch.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                } else {
+                    plain.push(ch);
+                }
+            }
+            let rest = plain.split("head=").nth(1)?;
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// 2026-10-16 `snapsched` under load: a snapshot cut at a node that had
+/// *followed* the chain head and was then made the root lease holder froze
+/// the commit it had adopted at its mount, not the tree its replica held
+/// (`TreePublisher::follow_head` clears a follower's dirty keys against
+/// the head without moving the publish parent; the snapshot paths used to
+/// answer "nothing dirty" with that parent). Two nodes: `b` holds the root
+/// lease and bumps a counter, `a` mounts after b's first commit (its
+/// publish parent is that commit), `b` bumps on and goes idle, `a`'s idle
+/// cadence clears its dirty keys against b's final commit, `b` is
+/// `kill -9`ed, and `a`, which has written nothing, takes the root lease
+/// when `snapshot create /proj@after` asks and must freeze b's last value.
+/// (A write by `a` before the snapshot would dirty its replica and send
+/// the publish down the normal adopt-and-publish path, hiding the hole.)
+pub fn snapshot_takeover_idle(seed: u64) -> Result<()> {
+    const NAME: &str = "snapshot-takeover-idle";
+    const EARLY: u64 = 20;
+    const TOTAL: u64 = 60;
+    let (env, root) = setup(NAME)?;
+    let _proxy = env.s3_proxy()?;
+    let prefix = format!("{NAME}-{}", ts());
+    let backend = format!("s3://{BUCKET}/{prefix}");
+    let node = |name: &str| -> Result<Client> {
+        Ok(Client::new(root.path(), name, &env.endpoint, &backend)?
+            .with_own_node_key()
+            // The follower's head check runs on the idle-publish
+            // cadence: shorten it so it falls inside the scenario.
+            .with_env("CONSTELLATION_PUBLISH_IDLE_S", "2")
+            .with_env("CONSTELLATION_SYNC_IDLE_MAX_MS", "2000")
+            .with_env("CONSTELLATION_LEASE_TTL_MS", &TTL_MS.to_string())
+            .with_env("CONSTELLATION_LEASE_PLACEMENT", "off")
+            .with_env("CONSTELLATION_LEASE_IDLE_RELEASE_MS", "600000")
+            .with_env("RUST_LOG", "info,constellation_engine::mtree_publish=debug"))
+    };
+    let a = node("a")?;
+    let mut b = node("b")?;
+    b.fs_create()?;
+    b.mount()?;
+    take_root_lease(&b)?;
+    let mut clients = [a, b];
+    let endpoint = env.direct_endpoint.clone();
+    let result = (|| -> Result<()> {
+        let [a, b] = &mut clients;
+        let b_dir = b.mnt.join("proj");
+        std::fs::create_dir(&b_dir)?;
+        for v in 0..=EARLY {
+            bump(&b_dir, v)?;
+        }
+        // b's first commit (its idle publish), which a will adopt at its
+        // mount as its publish parent.
+        eventually("b's first commit", Duration::from_secs(60), || {
+            ensure!(newest_commit(&endpoint, &prefix)? >= 1, "no commit yet");
+            Ok(())
+        })?;
+        std::thread::sleep(Duration::from_secs(5));
+        let first = newest_commit(&endpoint, &prefix)?;
+        a.mount()?;
+        let a_dir = a.mnt.join("proj");
+        eventually("/proj on a", Duration::from_secs(30), || {
+            ensure!(a_dir.join("counter").is_file(), "not yet");
+            Ok(())
+        })?;
+
+        // b bumps on (seeded pace) and goes idle.
+        let mut rng = StdRng::seed_from_u64(seed);
+        for v in EARLY + 1..=TOTAL {
+            bump(&b_dir, v)?;
+            std::thread::sleep(Duration::from_millis(rng.random_range(5..40)));
+        }
+        eventually("a has b's last value", Duration::from_secs(60), || {
+            let text = std::fs::read_to_string(a_dir.join("counter"))?;
+            ensure!(text.trim() == TOTAL.to_string(), "a reads {text:?}");
+            Ok(())
+        })?;
+        // Three idle periods: b's final commit exists and a's cadence has
+        // run against it.
+        std::thread::sleep(Duration::from_secs(6));
+        let last = newest_commit(&endpoint, &prefix)?;
+        ensure!(last > first, "b published nothing after the early commit");
+        eventually(
+            "a follows b's final commit",
+            Duration::from_secs(60),
+            || {
+                let followed = followed_head(a);
+                ensure!(
+                    followed >= last,
+                    "a last cleared against commit {followed}, b's final is {last}"
+                );
+                Ok(())
+            },
+        )?;
+        ensure!(
+            newest_commit(&endpoint, &prefix)? == last,
+            "b published again while a followed"
+        );
+        eprintln!(
+            "    {NAME}: b's commits {first} (a's parent) .. {last} (a followed it, nothing dirty)"
+        );
+
+        // b dies; a asks for a snapshot with nothing of its own to
+        // publish. It takes the lease once b's lapses (before that the
+        // request reaches a holder it cannot talk to and fails).
+        let node_a = node_id(a)?;
+        b.kill9()?;
+        std::thread::sleep(Duration::from_millis(TTL_MS as u64 + 2_000));
+        eventually("a creates /proj@after", Duration::from_secs(90), || {
+            a.snapshot_create("/proj@after")
+        })?;
+        let (holder, _) = root_lease(a)?;
+        ensure!(
+            holder == node_a,
+            "the root lease is held by {holder}, not a"
+        );
+        let frozen = frozen_counter(a, "after")?;
+        ensure!(
+            frozen == TOTAL,
+            "a's snapshot froze counter {frozen}; b acknowledged up to {TOTAL}, and a's replica \
+             held all of it"
+        );
+        eprintln!("    {NAME}: the snapshot at the new holder froze counter {frozen} of {TOTAL}");
+        Ok(())
+    })();
+    dump_logs_on_failure(NAME, &clients, &result);
+    for c in clients.iter_mut().rev() {
+        if c.is_mounted() {
+            let _ = c.unmount();
+        }
+    }
+    result
+}
+
 /// Load campaign §5.4, F11: is a snapshot batch the leader sent before a
 /// long pause and that lands after another node leads refused? Two nodes
 /// as in `snapsched` (b holds the root lease and writes, a takes the

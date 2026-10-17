@@ -2005,6 +2005,56 @@ pub(crate) mod tests {
         assert_eq!(b.rows(), vec![pinned]);
     }
 
+    /// The 2026-10-16 `snapsched` failure (`auto-…T230130Z froze counter 170
+    /// after 271`), end to end: A follows B's chain head on its idle
+    /// cadence (`follow_head` clears its dirty keys against the head and
+    /// leaves its publish parent at the commit it adopted when it started),
+    /// B releases, and A takes the lease and runs a snapshot batch with
+    /// nothing dirty and no write of its own. The snapshot must freeze
+    /// everything B acknowledged, not the old parent's tree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_turned_holder_snapshots_what_it_followed() {
+        let (_store, a, b, data, counter) = holder_b().await;
+        for k in 1..=3 {
+            write_step(&b.meta, data, counter, k);
+        }
+        b.sync().await;
+        b.driver.lock().await.publish().await.unwrap();
+        a.tail().await;
+        // A's publisher starts: it adopts B's first commit as its parent.
+        a.driver.lock().await.warm_up().await.unwrap();
+        assert!(a.driver.lock().await.follow_head().await.unwrap() > 0);
+
+        // B writes on and publishes again; A follows it, parent unchanged.
+        for k in 4..=9 {
+            write_step(&b.meta, data, counter, k);
+        }
+        b.sync().await;
+        b.driver.lock().await.publish().await.unwrap();
+        a.tail().await;
+        assert!(a.driver.lock().await.follow_head().await.unwrap() > 0);
+
+        // B lets go (its final flush publishes once more); A has applied
+        // everything and cleared it against that head.
+        b.driver.lock().await.flush_release().await.unwrap();
+        a.tail().await;
+        a.driver.lock().await.follow_head().await.unwrap();
+        assert!(!a.meta.has_dirty(), "A has nothing left to publish");
+
+        let report = a
+            .batcher
+            .run(a.batcher.next_rid(), vec![create("/data", "after", 1)])
+            .await
+            .unwrap();
+        assert_eq!(report.route, Route::Acquired);
+        let row = created(&report.results[0]);
+        assert_eq!(
+            frozen_prefix(&a.snapshots, &row).await,
+            9,
+            "the snapshot froze an older tree than the one A's replica holds"
+        );
+    }
+
     /// A duplicate batch (same rid) is answered from the holder's memory
     /// and creates nothing; a retry that crosses a holder change finds
     /// its own `snaps/` object and answers `AlreadyExists`.
