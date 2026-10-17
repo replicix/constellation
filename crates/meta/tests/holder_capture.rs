@@ -974,3 +974,49 @@ fn a_tagged_row_stranded_past_its_lease_replays_with_its_token_and_is_refused() 
     assert!(matches!(r, Err(MetaError::LockLapsed)), "{r:?}");
     assert!(next.lookup(ROOT_INO, "ref").unwrap().is_none());
 }
+
+/// Plan 30 §M11 (long-delegated-late-answers seed 9287): a root's
+/// appended row of a delegate's transaction is its generation's, so a
+/// deposition leaves it in the journal; a segment of the successor that
+/// carries the same rid's outcome makes the `completed` row the log's
+/// (`outcome_from_log`) although the journal still holds the record.
+#[test]
+fn a_segment_carrying_a_journaled_rid_makes_its_outcome_the_logs() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_epoch(1);
+    let create = |name: &str, ino: u64| LogRecord::Create {
+        parent: ROOT_INO,
+        name: name.into(),
+        ino,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        time_ns: 5,
+    };
+    let r = rid(1);
+    assert!(meta
+        .apply_delegate_tx(
+            &[create("m", (2 << 40) | 1)],
+            Some(r),
+            4,
+            1,
+            constellation_meta::Position::ZERO
+        )
+        .unwrap());
+    assert!(meta.completed_position(r).unwrap().is_some());
+    assert!(!meta.outcome_from_log(r).unwrap(), "the journal's row");
+    meta.set_holder_epoch(0);
+    meta.strand_below_epoch(2).unwrap();
+    assert!(
+        meta.journal_len().unwrap() > 0,
+        "the generation's row stays"
+    );
+    assert!(!meta.outcome_from_log(r).unwrap());
+
+    let seg = [create("m", (2 << 40) | 1), LogRecord::Completed { rid: r }];
+    meta.apply_segment(1, 2, &seg, &TouchSet::default())
+        .unwrap();
+    assert!(meta.journal_len().unwrap() > 0);
+    assert!(meta.outcome_from_log(r).unwrap());
+    assert!(!meta.outcome_from_log(rid(2)).unwrap(), "no row at all");
+}

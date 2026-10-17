@@ -2543,11 +2543,22 @@ impl Core {
     /// still waits for (long-delegated-late-answers seed 1381: a backup
     /// took over 120 ms before its own forwarded create's deadline; the
     /// create was at log seq 15, the new holder's first segments were not
-    /// durable yet, and the client heard `EIO`).
+    /// durable yet, and the client heard `EIO`). The journal decides only
+    /// while the `completed` row is its own: once an applied segment
+    /// carried the rid's outcome, the row is the log's (position 0, as
+    /// `store::spec`'s stranding tells them apart), whatever the deposed
+    /// journal still holds (long-delegated-late-answers seed 9287: a
+    /// deposed root's journal kept its delegate's appended row of the
+    /// root's own create — a generation's row, which a deposition does
+    /// not strand — while the successor's segment carrying the create was
+    /// applied; the client heard `EIO` for a write the log carried).
     pub(crate) fn settled_outcome(&self, rid: Rid, replica: &dyn Replica) -> Option<MutateOutcome> {
         let holds = self.lease.held.is_some() || self.lease.epoch_held();
         if !holds {
-            if self.lease.lost && journal_carries_outcome(replica, rid) {
+            if self.lease.lost
+                && journal_carries_outcome(replica, rid)
+                && !replica.outcome_from_log(rid)
+            {
                 return None;
             }
             return completed_as_outcome(replica, rid, self.ship.max_epoch);

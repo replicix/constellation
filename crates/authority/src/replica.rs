@@ -57,6 +57,9 @@ pub trait Replica {
     /// M13: what the log says about `rid` — executed, or refused with an
     /// code (an inbox refusal is an outcome too).
     fn completed_outcome(&self, rid: Rid) -> Result<Option<CompletedOutcome>, MetaError>;
+    /// Whether `rid`'s outcome row came from an applied segment, not this
+    /// node's journal (`Meta::outcome_from_log`).
+    fn outcome_from_log(&self, rid: Rid) -> bool;
     /// The entry behind an `EEXIST` refusal (`MutateOutcome::Exists`).
     fn entry_as_record(&self, parent: Ino, name: &str) -> Option<LogRecord>;
     fn manifest(&self, ino: Ino) -> Option<Vec<u8>>;
@@ -566,6 +569,10 @@ impl Replica for Meta {
 
     fn completed_outcome(&self, rid: Rid) -> Result<Option<CompletedOutcome>, MetaError> {
         Meta::completed_outcome(self, rid)
+    }
+
+    fn outcome_from_log(&self, rid: Rid) -> bool {
+        Meta::outcome_from_log(self, rid).unwrap_or(false)
     }
 
     fn entry_as_record(&self, parent: Ino, name: &str) -> Option<LogRecord> {

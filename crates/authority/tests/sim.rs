@@ -5906,6 +5906,25 @@ fn regression_long_delegated_late_answers_seeds_45_1381_3498() {
     }
 }
 
+/// `long-delegated-late-answers` seed 9287 (in doubt for a landed
+/// write): the root's own create, executed by `d1`'s delegate, was in the
+/// root's journal as an appended row of `d1`'s generation when a backup
+/// took the root over; a deposition does not strand a generation's rows,
+/// so the journal kept it while the successor's segment carrying the
+/// create was applied. At the op's deadline the deposed node read "my
+/// journal carries the outcome" as "not the log's", and the client heard
+/// `EIO`. A `completed` row an applied segment wrote is the log's
+/// (`Core::settled_outcome`).
+#[test]
+fn regression_long_delegated_late_answers_seed_9287() {
+    run_seed(9_287, long_delegated_late_answers_config()).unwrap_or_else(|e| {
+        panic!(
+            "long-delegated-late-answers seed 9287: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=long-delegated-late-answers"
+        )
+    });
+}
+
 /// `locks-unlinked-delegated-dbackup-random` seed 5681 (mutual
 /// exclusion): `d1`'s generation was outwaited while grants the root had
 /// moved to it were still undelivered (the root and the delegate were

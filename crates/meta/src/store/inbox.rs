@@ -155,6 +155,18 @@ impl Meta {
         }
     }
 
+    /// Whether `rid`'s `completed` row came from the log: an applied
+    /// segment's (position 0), not this node's own journal's (its journal
+    /// seq). A segment carrying the rid's outcome overwrites a journaled
+    /// row, so this is the log's answer even while that journal still
+    /// holds the rid's record.
+    pub fn outcome_from_log(&self, rid: Rid) -> Result<bool, MetaError> {
+        let r = self.db.read_tx();
+        Ok(r.get(&self.completed, rid.to_key())?
+            .and_then(|v| v.get(0..8).map(|p| p.iter().all(|b| *b == 0)))
+            .unwrap_or(false))
+    }
+
     /// The code the log refused `rid` with, if it did.
     pub fn refused_code(&self, rid: Rid) -> Result<Option<Code>, MetaError> {
         Ok(match self.completed_outcome(rid)? {
