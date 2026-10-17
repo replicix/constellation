@@ -37,8 +37,13 @@
 //!    are exported. If any detach fails, the ones already detached are
 //!    resumed in place on the same descriptors and the upgrade is refused:
 //!    the daemon carries on as before.
-//! 3. The request is answered ("handing over"), and the rest runs on a
-//!    thread of its own:
+//! 3. The request is answered ("handing over"): the handler returns the
+//!    answer to the control server, which writes it from its own task,
+//!    while the rest runs on a thread of its own. The answer is queued, not
+//!    sent, when the thread starts: with nothing to drain the `exec` (step
+//!    5) can come first and close the connection (close-on-exec) before
+//!    the answer is out. `daemon --upgrade` takes such a call for no
+//!    refusal and goes by `status` (the next generation serving):
 //! 4. **Durability barrier**: each view is closed for the handover
 //!    (`Engine::close_view_for_handover`: unregistered, its ephemeral clone
 //!    and open-orphan claims left in place), then the node shuts down

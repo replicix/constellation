@@ -4283,6 +4283,16 @@ fn print_quota(q: api::QuotaStatus) -> Result<()> {
 /// daemon re-executes the path it was started from, whose version only the
 /// daemon knows; this binary's version stands in for it, and a mismatch is
 /// only warned about.
+///
+/// The daemon answers the request before it hands over, and the `exec`
+/// can close the call's connection before that answer is out (with
+/// nothing to drain it comes about a millisecond after the answer is
+/// queued). A call that ends that way (`control::went_away`) is no refusal:
+/// the command goes by `status` the same way, and only an answered refusal
+/// fails it as "upgrade refused". When nobody listens on the daemon's
+/// socket any more (the listener crosses the `exec`, so that means the
+/// process is gone) it fails at once with "is gone" instead of waiting out
+/// `within`.
 async fn cmd_daemon_upgrade(
     state_dir: &Path,
     binary: Option<PathBuf>,
@@ -4309,6 +4319,16 @@ async fn cmd_daemon_upgrade(
     .await?
     {
         Ok(report) => println!("{}", report.detail),
+        // The daemon answers before it hands over, and the handover runs
+        // on a thread of its own: with nothing to drain it reaches the
+        // `exec` in about a millisecond, and the `exec` closes this call's
+        // connection (close-on-exec) — before the answer is out when the
+        // control server's task was not scheduled first. That is no
+        // refusal: the daemon's `status` says how the handover went.
+        Err(e) if control::went_away(&e) => eprintln!(
+            "no answer to the upgrade request ({}); going by the daemon's status instead",
+            e.message
+        ),
         Err(e) => bail!("upgrade refused: {}", e.message),
     }
     // The daemon's preflight has just run `--handover-abi` on it: it answers.
@@ -4323,13 +4343,39 @@ async fn cmd_daemon_upgrade(
         None => None,
     };
     let started = std::time::Instant::now();
+    let mut gone = 0;
     loop {
         if started.elapsed() > within {
             bail!("the upgraded daemon did not report serving within {within:?}");
         }
         // The new image answers once it serves; during the handover the
         // connection waits in the listener's backlog.
-        if let Ok(now) = status(std::time::Duration::from_secs(5)).await {
+        let now = status(std::time::Duration::from_secs(5)).await;
+        // The listener crosses the `exec` (it is inherited, so during a
+        // handover a connection waits in its backlog): nobody listening
+        // means the daemon's process is gone (the new image and its
+        // rollback both failed to start, or it exited), not a handover
+        // still under way. Two observations in a row, not one, so that a
+        // single refused connect (a full backlog's `EAGAIN` reads as
+        // unreachable too) does not end a healthy upgrade. This holds for
+        // an answered upgrade as much as for a lost answer.
+        if now.is_err()
+            && matches!(
+                control::ping(state_dir, std::time::Duration::from_secs(5)).await,
+                Ok(false)
+            )
+        {
+            gone += 1;
+            if gone >= 2 {
+                bail!(
+                    "the daemon of {} is gone: it exited during the upgrade (its log says why)",
+                    state_dir.display()
+                );
+            }
+        } else {
+            gone = 0;
+        }
+        if let Ok(now) = now {
             if now.handover.generation > before.handover.generation && !now.handover.upgrading {
                 let expected = target
                     .clone()
@@ -4951,6 +4997,174 @@ mod umount_tests {
             .expect("umount hung");
         let _ = events.send(StandIn::UmountReturned);
         stand_in.join().unwrap();
+        result
+    }
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+    use constellation_control::transport::{ensure_socket_dir, record_socket, UnixSocketListener};
+
+    /// How the stand-in daemon of
+    /// [`upgrade_goes_by_the_new_images_status_when_the_handoff_answer_is_lost`]
+    /// leaves the `node.handoff` call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OldImage {
+        /// It "execs" before the answer is out: the call's connection
+        /// closes unanswered and the next image serves the inherited
+        /// listener at the next generation.
+        ExecsBeforeAnswering,
+        /// It refuses the upgrade (an answered refusal).
+        Refuses,
+        /// It exits before answering, and no image serves after it.
+        ExitsBeforeAnswering,
+    }
+
+    fn status(generation: u32, last_error: Option<String>) -> api::StatusReport {
+        api::StatusReport {
+            handover: api::HandoverStatus {
+                generation,
+                pid: std::process::id(),
+                upgrading: false,
+                last_error,
+            },
+            version: env!("CONSTELLATION_VERSION").to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The old image answers `node.handoff` before it hands over, and the
+    /// handover runs on a thread of its own: with nothing to drain it
+    /// reaches the `exec` in about a millisecond, and the `exec` closes
+    /// the call's connection (close-on-exec) — before the answer is out
+    /// when the control server's task was not scheduled first. The upgrade
+    /// happened (the new image serves the inherited listener at the next
+    /// generation), so `daemon --upgrade` must report it, not "upgrade
+    /// refused: the daemon closed the connection" (the plan 31 closing
+    /// gate's delegate-handoff-renewal, unprivileged linux-fuse lane).
+    #[test]
+    fn upgrade_goes_by_the_new_images_status_when_the_handoff_answer_is_lost() {
+        upgrade_of_a_stand_in(OldImage::ExecsBeforeAnswering)
+            .expect("daemon --upgrade failed although the next image serves");
+    }
+
+    /// The old image closes the call unanswered and nothing serves after
+    /// it: the command says the daemon is gone, at once.
+    #[test]
+    fn upgrade_reports_a_daemon_that_is_gone() {
+        let error = upgrade_of_a_stand_in(OldImage::ExitsBeforeAnswering)
+            .expect_err("an upgrade of a daemon that exited succeeded");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("is gone: it exited during the upgrade"),
+            "{error}"
+        );
+    }
+
+    /// A refusal the daemon answers is still the command's error.
+    #[test]
+    fn an_answered_refusal_still_fails_the_upgrade() {
+        let error = upgrade_of_a_stand_in(OldImage::Refuses).expect_err("a refusal succeeded");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("upgrade refused: a handover is already under way"),
+            "{error}"
+        );
+    }
+
+    fn upgrade_of_a_stand_in(old: OldImage) -> Result<()> {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let run = root.path().join("run");
+        ensure_socket_dir(&run).unwrap();
+        let socket = run.join("control.sock");
+
+        let old_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (events, stand_in_events) = std::sync::mpsc::channel::<bool>();
+        let exec_tx = events.clone();
+        let mut router = constellation_control::Router::new();
+        router.register::<cm::NodeStatus, _, _>(|_, _| async { Ok(status(0, None)) });
+        router.register::<cm::NodeHandoff, _, _>(move |_, _| {
+            let exec_tx = exec_tx.clone();
+            async move {
+                if old == OldImage::Refuses {
+                    return Err(constellation_control::ControlError::failed(
+                        "a handover is already under way",
+                    ));
+                }
+                let _ = exec_tx.send(true);
+                std::future::pending::<
+                    Result<api::HandoffReport, constellation_control::ControlError>,
+                >()
+                .await
+            }
+        });
+        let (server, inherited) = {
+            let _guard = old_rt.enter();
+            let listener = UnixSocketListener::bind(&socket)
+                .unwrap()
+                .keep_path_on_drop();
+            let inherited = listener.try_clone_std().unwrap();
+            record_socket(&state_dir, &socket).unwrap();
+            (
+                constellation_control::server::serve_router(listener, std::sync::Arc::new(router)),
+                inherited,
+            )
+        };
+        let sock = socket.clone();
+        let stand_in = std::thread::spawn(move || {
+            if stand_in_events.recv() != Ok(true) {
+                drop(server);
+                old_rt.shutdown_background();
+                return None;
+            }
+            // The exec: the old image's runtime, its connections and its
+            // descriptor of the listener go at once, unanswered.
+            drop(server);
+            old_rt.shutdown_background();
+            if old == OldImage::ExitsBeforeAnswering {
+                drop(inherited);
+                return None;
+            }
+            let new_rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut router = constellation_control::Router::new();
+            router.register::<cm::NodeStatus, _, _>(|_, _| async { Ok(status(1, None)) });
+            let server = {
+                let _guard = new_rt.enter();
+                let listener = UnixSocketListener::from_std(inherited, &sock).unwrap();
+                constellation_control::server::serve_router(listener, std::sync::Arc::new(router))
+            };
+            Some((new_rt, server))
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    cmd_daemon_upgrade(&state_dir, None, std::time::Duration::from_secs(30)),
+                )
+                .await
+            })
+            .expect("daemon --upgrade hung");
+        drop(rt);
+        let _ = events.send(false);
+        if let Some((new_rt, _server)) = stand_in.join().unwrap() {
+            new_rt.shutdown_background();
+        }
         result
     }
 }

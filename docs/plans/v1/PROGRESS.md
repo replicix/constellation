@@ -48846,3 +48846,73 @@ every acknowledged write.
 - Harness, release, seed 42, all passed: `snapshot-takeover-idle` (29 s),
   `snapshot-lifecycle`, `snapshot-busy-latency`, `publish-only-holder`,
   `snapshot-churn`, `snapsched-leader-paused`, `snapsched`.
+
+## Fix: a lost `node.handoff` answer is no refusal; `daemon --upgrade` goes by the daemon's status (plan 31 closing gate, 2026-10-17)
+
+The plan 31 closing gate's `delegate-handoff-renewal` failed with
+`daemon --upgrade failed … Error: upgrade refused: the daemon closed the
+connection`, for an upgrade that had happened: the daemon's log shows the
+same pid resuming as generation 1 and serving the view 117 ms after the
+`exec`.
+
+### Cause
+
+`node.handoff` returns "handing over" to the control server after it has
+started the handover thread, and the server's task writes the answer later.
+With nothing to drain (no lease held, no pending uploads or journal: 0.6 ms
+in the failing round) the thread reaches the `exec` about a millisecond
+after the answer was queued, and the `exec` closes the accepted control
+connection (close-on-exec) before the task has written it whenever the
+daemon's tokio worker is not scheduled within that millisecond. The client
+read EOF and `cmd_daemon_upgrade` turned the inner `Unavailable` into
+"upgrade refused", as `umount` once did with `view.unmount` (`02e46cb`).
+Not `630d1a0` (the pipe drain of the preflight finishes before the detach).
+The window is scheduling-bound: 0 lost answers in 421 upgrades on the build
+box (idle and under CPU load), about 1 in 66 on the gate host, and every
+one when the answer is delayed by 50 ms (a scratch patch, never committed).
+
+### What changed
+
+- `cmd_daemon_upgrade`: a call that ends with `control::went_away`
+  (`Unavailable` or `Cancelled`) is no refusal: the command notes the lost
+  answer on stderr and goes by `status` as it does after an answer (a higher
+  generation serving is success, a version unchanged where the target's is
+  another is a rollback, a recorded `last_error` is reported). An answered
+  refusal still fails with "upgrade refused: …".
+- The wait loop fails at once with "the daemon of … is gone: it exited
+  during the upgrade" when `status` fails and `control::ping` finds nobody
+  listening on two polls in a row (the listener crosses the `exec`, so no
+  listener means the process is gone), instead of waiting out `--timeout-s`
+  (300 s) to say "did not report serving".
+- Docs: `handover.rs` step 3 (the answer is queued, not sent, when the
+  handover thread starts), `cmd_daemon_upgrade`, `control::went_away`,
+  TESTING.md.
+
+### Verification
+
+`cli::upgrade_tests` (a stand-in daemon on the real control server that
+never answers `node.handoff`, drops its runtime as the "exec" and serves
+the inherited listener at generation 1): the lost answer must end in
+success, and a daemon that is gone must fail within seconds; both fail
+before ("upgrade refused: the daemon closed the connection"); a third test
+(an answered refusal still fails the upgrade) passes before and after. The
+three pass 50 of 50 runs. Harness, release build, `linux-fuse-process`
+lane: idle `session-handover-idle` 50/50, `delegate-handoff-renewal` 10/10,
+`upgrade-under-load` 10/10; under `stress-ng --cpu 16` with ~1100 pipes held
+(load average up to 51) `session-handover-idle` 100/100,
+`delegate-handoff-renewal` 20/20, `upgrade-under-load` 20/20,
+`delegate-backup-handoff-failover` 10/10, `passthrough-handover` 10/10,
+`transport-detach-refused` 5/5 (the lane's kernel offers no ring, so the
+scenario takes its served branch; the refusal is covered by the unit test),
+`transport-cluster-locks-auto` 5/5. With the 50 ms answer delay, every
+`session-handover-idle` upgrade (10/10) and 3 of the 9 upgrades of three
+`upgrade-under-load` runs took the lost-answer path and passed; the other
+six had a drain longer than the delay.
+
+### Not changed
+
+A delegation that lapses under CPU load just before the upgrade
+(`b's generation 1 did not survive the handoff`), and the first create
+after a resume against `delegate-handoff-renewal`'s 3 s bound (1.4–3.1 s
+idle, up to 5.4 s loaded), were seen in the same campaign on the stock
+build: findings of their own, not this fix.

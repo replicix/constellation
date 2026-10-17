@@ -3828,7 +3828,11 @@ flight, a detach that waits for an op in flight, a resume that serves the
 requests the kernel queued while nobody read, the lock-wait refusal,
 `NegotiatedInit` round trips) and `constellation-engine`'s
 `view::handoff::tests` (open handles, an unlinked-open orphan and synthetic
-numbers crossing to a second view; the handle table's wire forms).
+numbers crossing to a second view; the handle table's wire forms) and the
+CLI's `upgrade_tests` (a stand-in daemon on the real control server whose
+`node.handoff` answer is lost to the "exec": the upgrade goes by the next
+image's `status`; a daemon that is gone fails the command at once; an
+answered refusal still fails it).
 
 ## Engine profiles and host lifecycle (plan 31 C8)
 

@@ -435,6 +435,9 @@ pub fn is_unreachable(e: &ControlError) -> bool {
 /// exited), the daemon cancelled the call as it shut down its control
 /// server (`Cancelled`; this client cancels nothing it waits for without
 /// a bound), or it answered that it is shutting down (`Unavailable`).
+/// `umount` goes by the daemon's record for such a call, and
+/// `daemon --upgrade` by its `status` (the `exec` of the handover closes
+/// the call's connection, close-on-exec, before the answer may be out).
 pub fn went_away(e: &ControlError) -> bool {
     matches!(e.kind, ErrorKind::Unavailable | ErrorKind::Cancelled)
 }
