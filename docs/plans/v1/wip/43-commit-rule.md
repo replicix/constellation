@@ -2184,40 +2184,164 @@ harness scenario `s3-cut-holder-failover-with-locks` (an S3-cut holder
 still alive on P2P, strict reads and a held lock; PROGRESS "a fast
 successor whose clock is ahead got no quarantine").
 
-- **F-a — shorten the floor by the successor's own observation.** The
-  floor counts from the marker for the whole bound because the
-  predecessor's last grant may have been decided up to
-  `backup_takeover_ms` after its last proof of liveness, which the
-  successor cannot read on its own clock. It can observe the
-  predecessor's last *renewal* (the lease object's ETag changing) on its
-  own wait clock, which is same-clock and rate-only (C7b's observation
-  rule, rows 2 and 11): a holder cut from S3 stops renewing, so a floor
-  counted from the last observed renewal would end `bound` after it.
-  **The premise needs work (review R2-3):** the holder's proofs of
-  liveness are not only renewals. `note_s3_liveness` counts `SegmentRun`
-  and `SegmentPut` successes too, which are S3 operations the successor
-  cannot observe (a segment landing is visible in the log, a `SegmentRun`
-  is a read nobody sees), and a holder answers strict reads and grants
-  within `backup_takeover_ms` of the latest of them, not of its last
-  renewal. A floor from the last observed renewal would then be too short
-  for every holder that is not cut from S3. F-a must either narrow
-  `liveness_fresh` to renewals (a holder answers strict reads and grants
-  only within `backup_takeover_ms` of a renewal's send: more renewals, or
-  a shorter window for the answers), or have the successor count the
-  holder's observed segment landings as well and exclude the unobservable
-  reads from the proofs. An expiry compare is not an option (it is the
-  hole C7-H2 closed). Goal: the S3-cut holder's failover back to (near) no
-  extra wait over the expiry-based takeover. Fail-before: the scenario's
-  first-write and first-lock-grant times.
-- **F-b — lock requests during the lock grace cost latency, not errors.**
-  Inside the grace a non-blocking lock on a free file gets `EAGAIN`
-  (`WouldBlock`), and on ring-transport cluster-lock mounts blocking
-  requests past `depth − 1` waiters per queue are downgraded and answered
-  `ENOLCK` (`session.rs`). Both become waits: a request during the grace
-  is parked until it ends (bounded by the grace, no error), with a
-  deferred answer for the ring. Fail-before: the scenario's `EAGAIN` count
-  (75 of 108 attempts after the takeover on the landed patch) and an
-  io_uring cluster-lock mount test for `ENOLCK`.
+- **F-a — the floor capped by the predecessor's own heartbeat (specified
+  2026-10-18; the approach is §11 Q17).**
+  *Why not the renewal premise.* The bound counts from the marker because
+  the predecessor answers within `backup_takeover_ms` (W) of its latest
+  proof of S3 liveness, and those proofs are not only renewals:
+  `note_s3_liveness` counts `SegmentRun` and `SegmentPut` successes and a
+  `LeaseGet` that shows the holder its own lease (plan 41 L0's
+  `renew_probe`, which review R2-3 did not list); neither read is
+  observable by anyone. Narrowing `liveness_fresh` to lease writes costs a
+  conditional PUT every W while strict reads or locks are served (about
+  0.7 PUT/s per busy holder, each a CAS racing the renewals and the
+  requesters' `wanted_by`); counting announced proofs needs the backups
+  to acknowledge each before the holder may use it, a co-signed freshness
+  protocol of its own. Neither is needed: what the S3-cut holder's
+  successor cannot see end is the predecessor's *lease*, not its
+  freshness window, and the lease is observable rate-only.
+  *The rule.* Every answer a successor waits out is capped by the
+  predecessor's lease: strict answers only while `usable` (the expiry
+  less M), read delegations (`maybe_grant`), lock grants and renewals
+  (`lock_cap_ms`), write delegations and renewals (`grant_cap_ms`) end at
+  the expiry less M, and their holders honour them from their own send
+  less another M; what a delegate grants is capped by its own `until`.
+  So nothing is honoured after the holder's clock reads `E_h`, the expiry
+  it holds. The holder's off-core heartbeat (`HolderAlive`, every
+  `backup_heartbeat_ms`, to its listed backups, or to its stream
+  subscribers under `ack=s3`; it stops at the expiry) carries `sent` and
+  `expires`, both on the holder's clock, and is stamped `at` on arrival
+  on the successor's: each beat says the holder's clock read `sent` no
+  later than the successor's read `at`. The **cap** is
+  `X + min(at − sent) + M`, the minimum over the beats of the replaced
+  tenure sent within `250·M` of `X` (so the two clocks' rate error,
+  `2ρ·(X − sent)` at ρ = 1 000 ppm, stays under `M/2`), with
+  `X = max(prev.expires_unix_ms, the highest expiry its beats named, the
+  highest guard they named)`. The floor is `min(bound, cap)`, for
+  acknowledgements and new lock grants alike; a cap already past when the
+  marker lands sets none. `X − sent` is a difference on the holder's
+  clock, `at` and the cap are stamps of the successor's: rate-only, like
+  the bound, and C7-H2's skewed configurations stay its test (the
+  arrival, never the beat's credit `min(at, sent + M)`, which is the
+  holder's clock).
+  *Why `E_h ≤ X`.* The successor's CAS replaced version T (`prev`), so no
+  later write of the holder landed; the holder adopts only versions its
+  own PUT or read returned, all at or before T; along that chain the
+  expiry only grows (renewals write `now + ttl`, everything else copies
+  it). The two ways it could shrink are covered: a holder that restarted
+  in its epoch with a shorter TTL (its earlier incarnation's grants are
+  behind its restart quarantine, which the guard names), and a backward
+  step of the holder's wall clock (C7-H1's hole, which breaks every
+  honour-side check alike; the honour clock makes the chain monotone).
+  *The guard.* A predecessor may itself be waiting out grants its lease
+  does not cap: its own takeover floor (the harness's 20 s lease is
+  shorter than the 23.5 s lock floor), a released takeover's lock grace,
+  a restart quarantine. The beat carries `guard_unix_ms`: `i64::MAX`
+  while its takeover gate is pending or a floor is due, else the latest
+  of its `floor_until`, the read and lock tables' quarantines and its
+  subtree graces (0: none). A `MAX` heard at the epoch disables the cap.
+  *F-a0: a tenure that inherits a floor is marked from its first CAS.*
+  A successor arms a floor only if the replaced lease says
+  `granted_delegations`, and a fresh taker's lease is marked at once
+  only on strict mounts (`granted_lease`); so the seal of a tenure that
+  is still inside its own floor and served nothing yet (locks without
+  strict mounts) arms none, and the grants that floor protected (the
+  unmirrored ones of the tenure before) are open. Found while designing
+  F-a, not yet shown by a seed: the claim CAS body (`acquire_cas`) is
+  marked when the takeover inherits such a duty (a permitted takeover of
+  a marked lease; a released lease under locks). Fail-before first, with
+  the sim configuration `double-seal-inside-the-grace`; if no seed shows
+  it, a core test pins the rule and PROGRESS says so. Its own commit,
+  before the cap.
+  *What it buys.* An S3-cut holder alive on P2P beats until its expiry,
+  so its successor's floor ends about M after it reads the lease as
+  expired: the scenario's first acknowledged write and first lock grant
+  go from +22.2 s / +37.2 s to about +14.6 s (+13.8 / +13.7 s before
+  C7-H2). A holder that died or lost P2P mid-lease: unchanged (with
+  half-TTL renewals its lease has at least 30 s left, more than the
+  23.5 s bound), except in the lease's last seconds, where the cap gives
+  back the pre-C7-H2 `min` without its offset. No beat heard at the epoch
+  (the successor restarted, the beats were lost): the bound.
+  *Interactions.* Appendix B row 6 (the non-minting token check,
+  offset-bound until C7b) loses the slack the whole bound gave it: back to
+  its pre-C7-H2 exposure, inside the documented ±500 ms. F-c: the grace
+  in which the successor admits reclaims gets short or vanishes; F-c's
+  "park until the reclaim is admitted" must not assume a grace. C7a moves
+  the beat's arrival stamp to the wait clock together with the floor's own
+  (a stamp and its comparison use one clock). Appendix B row 27.
+  Fail-before: core tests of the cap (the parent waits the bound), of the
+  arrival against the credit (a holder clock behind), of the guard, of a
+  `MAX` guard and of stale or foreign beats; the sim's
+  `fast-takeover-skewed-successor` clean over 2 000 seeds and failing
+  with the credit used instead of the arrival; a new
+  `fast-takeover-skewed-holder` (the holder ahead) and
+  `locks-s3-cut-holder-alive` (the holder cut from S3 only, sealed at its
+  expiry), the latter's floors measured shortened; the models with a beat
+  action (clean far ahead; failing when a beat older than a renewal is
+  used); the scenario's first write and lock grant within M + 1 s of the
+  takeover.
+- **F-b — lock requests wait for a grace instead of failing (specified
+  2026-10-18; the semantics are §11 Q18).**
+  *Semantics.* A non-blocking request (`F_SETLK`, `flock(LOCK_NB)`) on a
+  lock the owner's table shows no conflict for, refused today only because
+  the owner may not grant yet, waits until it may, and is then granted, or
+  refused `EAGAIN` if the table then shows a conflict. A known conflict
+  (or the requester's own grant under recall) is `EAGAIN` at once, as
+  today. POSIX's "return immediately" is about waiting for a conflicting
+  lock; a network file system answers when it knows. Precedent: Linux's
+  NLM client resends a request the server refused for its grace period
+  every 5 s until the grace ends, blocking or not (only a signal ends the
+  wait, `EINTR`); the NFSv4 client retries `NFS4ERR_GRACE` the same way;
+  DLM-based file systems (GFS2, OCFS2) hold lock requests through
+  recovery. Linux documents `EINTR` for `F_SETLK` on a remote file.
+  *Which refusals.* At the owner (`lock_serve`): the grace
+  (`lock_grace_active`: the takeover, restart and released-takeover
+  quarantines, the subtree graces), and the refusals of `lock_try_grant`
+  that name no conflict: the tenure floor (`lock_tenure_floor_ready`,
+  which after F-a is the main one), an outwaited holder's barrier, a
+  delegate's short authority. For a non-blocking request they answer
+  `Waiting { retry_ms, grace: true }`: the grace's remainder (a
+  difference on the owner's clock), at most 1 s, or
+  `lock_resume_retry_ms` for the others. The requester spends no attempt
+  on it and asks again at `retry_ms`, up to `lock_grace_wait_max_ms` from
+  the request (the floor's largest bound plus the S3-less deadline,
+  49.5 s at the defaults); past that it answers `EAGAIN`, counted
+  (`lock_grace_wait_gave_up`, which the campaign's errno checker expects
+  at 0). A stale owner's `Busy` for a free lock (no fresh S3 liveness, a
+  lease not yet marked), which still fails a non-blocking request
+  `ENOLCK` after three attempts (documented), joins the same wait if
+  Q18 (c) says so.
+  *No FUSE thread held.* A non-blocking request is answered on the
+  calling worker today; over the ring that is the ring's one offload
+  thread, so a wait of up to the 23.5 s lock grace there would stall
+  every offloaded request of those queues. A request that has to wait is
+  handed to a `lock-wait` thread like a blocking one: the core answers
+  the engine's request `LockAnswer::Wait { retry_ms }` instead of
+  retrying itself, `ClusterLocks` moves the retries to that thread, and
+  the adapter tracks the reply as deferred (a handover refuses while it
+  waits) and interruptible (a signal ends it with `EINTR`) on cluster-lock
+  mounts. A frontend that cannot defer waits inline, as its blocking
+  requests do.
+  *The ring.* A `FUSE_SETLKW` past the queue's `depth − 1` waiters is
+  served as a non-blocking one: in a grace it now waits (deferred) and is
+  granted rather than answered `ENOLCK`. It holds its entry meanwhile,
+  which is not the deadlock the budget exists for (a waiter on a holder
+  whose unlock needs the entry): a grace ends by time, or by other nodes'
+  progress, whatever this queue does. A contended request past the
+  budget stays `ENOLCK` (plan 38 Z2c's contract).
+  *The grace's end.* A timer at each grace's end serves the parked
+  waiters (`lock_reserve_all`); today a blocking waiter is served only
+  at its next re-attach, up to `recall_hold_ms` plus a retry later.
+  Fail-before: the scenario's non-blocking attempts (75 of 108 `EAGAIN`
+  on the landed patch; 0 after, each attempt across the grace answered
+  by the grant); core tests per refusal kind (a non-blocking request in
+  the grace, behind the tenure floor, behind a barrier: `WouldBlock` on
+  the parent, `Waiting { grace }` after; a known conflict still
+  `WouldBlock`; the requester's bound); an engine test that the waiting
+  request does not hold the calling thread; and a harness ring test
+  (`transport-lock-grace`: a ring cluster-lock mount at queue depth 2,
+  three blocking `flock`s on free files across a seal: `ENOLCK` on the
+  parent, granted after).
 
 - **F-c — an application whose lock grant lapsed during a root failover
   gets `EIO`.** In `s3-cut-holder-failover-with-locks` the locker's grant
@@ -2237,12 +2361,28 @@ successor whose clock is ahead got no quarantine").
   S3-cut failover time, `lease_ttl`). Baseline: the scenario with the
   locker in the harness process (`CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1`)
   — numbers in PROGRESS, "a fast successor whose clock is ahead got no
-  quarantine". Not part of C7-H2.
+  quarantine". Not part of C7-H2. After F-a the grace in which a
+  successor admits reclaims is short or absent after an S3-cut failover,
+  so the first candidate needs a reclaim rule that does not assume one
+  (admitted while nothing conflicting was granted since, by the mirrored
+  table); F-b's deferred wait is the machinery a parked owner's I/O can
+  reuse.
 
-None changes the floor's safety argument; F-a changes where it starts,
-F-b and F-c only what an application sees while it runs. All three land
-right after C7-H2 and before C0 (they touch `note_marker_landed` and
-`core/locks.rs`, which C4 rewrites).
+F-a changes the floor's argument by one step (the floor ends at the
+earlier of the bound and the cap, each sufficient on its own); F-b and
+F-c only what an application sees while it runs. All three land right
+after C7-H2 and before C0 (they touch `note_marker_landed` and
+`core/locks.rs`, which C4 rewrites). F-a and F-b touch different code
+(F-a: `core/{backup,jobs,lease}.rs`, the beat in `constellation_net`, the
+driver's alive targets, the sim's beat loop, the models; F-b:
+`core/locks.rs`, `LockOutcome`/`LockAnswer` and their wire form,
+`engine/locks.rs`, the view's `lock_acquire`, the FUSE adapter) and meet
+only in additions to `event.rs`, `net/message.rs`, `core/mod.rs`'s
+config, stats and timers: they are implemented in parallel, in separate
+worktrees, and land F-a0, F-a, then F-b rebased on them, the lock
+simulations and the scenario re-run on the combined tree (F-b's measured
+waits are F-a's grace lengths). F-c starts after F-b (it needs F-b's
+wait machinery and F-a's grace lengths).
 
 ## 8. Tests, collected
 
@@ -2413,7 +2553,8 @@ The final list. Each says what it **blocks**; a question that the code
 answered is marked **decided** (the plan implements the decision; the
 maintainer may still overturn it). Blocking before C0: Q7, Q10a.
 Before C1: Q1, Q13. Before C2: Q2, Q4, Q9, Q14, Q15, Q16. Before C4:
-Q6. Before C6: Q5. Before C7b: Q10b, Q10c.
+Q6. Before C6: Q5. Before C7b: Q10b, Q10c. Before C7-F: Q17 (F-a),
+Q18 (F-b).
 
 **Answered by the maintainer (2026-10-17): every recommendation below
 is accepted** — Q1 (a) strict, Q2 yes, Q4 yes, Q6 yes, Q7 the
@@ -2512,6 +2653,36 @@ to land before C0.
   failure contract). The alternative (the root's committed cursor,
   three copies on a LAN of three, ~2 round trips pipelined) is recorded,
   not planned.
+
+- **Q17 — F-a's approach.** *Blocks F-a.* (a) **The beat cap**
+  (recommended): the floor ends at the earlier of the bound and the
+  predecessor's lease as its own heartbeat places it on the successor's
+  clock, plus M; no change to `liveness_fresh`, one field on the beat;
+  it gives back the S3-cut failover (about +1 s over the takeover) and
+  the last-seconds case, not a mid-lease crash. (b) The maintainer's
+  framing, narrowing `liveness_fresh` to lease writes: a conditional PUT
+  every `backup_takeover_ms` while strict reads or locks are served, the
+  renewals announced to the backups (the successor must see them early),
+  and on a mid-lease crash it saves only the time from the last renewal
+  to the marker (the seal's own window and the claim: a few seconds of
+  the 8.5 s / 23.5 s). (c) Both, (b) later on top of (a), if a mid-lease
+  crash's floor turns out to matter.
+  Also: the slack is M (1 s) until C7a names ρ, then `2ρ·(X − sent)`
+  (≈ 0.1 s); and F-a0 (mark a tenure that inherits a floor) lands with
+  F-a, fail-before first: *recommended yes*.
+- **Q18 — F-b's semantics.** *Blocks F-b.* (a) A non-blocking request on
+  a lock with no known conflict waits out a grace (and the tenure floor,
+  barriers, a delegate's short authority) instead of `EAGAIN`: up to
+  23.5 s (29.5 s) after a mid-lease crash at the defaults, about 1 s
+  after an S3-cut failover once F-a is in. *Recommended yes* (NLM, NFSv4
+  and DLM do; "latency, not errors"). (b) Past `lock_grace_wait_max_ms`
+  (49.5 s) the wait gives up with `EAGAIN`, counted; a signal ends it with
+  `EINTR` (as a blocking lock): *recommended yes*. (c) A stale owner's
+  `Busy` for a free lock (the pre-takeover window of an S3-cut holder,
+  today `ENOLCK` after three attempts) waits the same way, bounded the
+  same: *recommended yes*, as F-b's second commit, after measuring it in
+  the scenario at the default 60 s lease. A contended request past the
+  ring's lock-wait budget stays `ENOLCK` (plan 38 Z2c), not in scope.
 
 ### 11.1 Deferred (not in this plan)
 
@@ -2704,6 +2875,7 @@ L = liveness only.
 | 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 |
 | 25 | `promise_check_needed` — `!prev.is_expired(now)` (`promise.rs`) | predecessor's `expires` vs the taker's W | W↔W | L (a sealed taker ahead does a promise check it would skip; only conservative) | with row 3's anchored promises: C7b |
 | 26 | `acquire_won`'s fast classification — `fast_prev` (`!p.is_expired(now)`) | predecessor's `expires` vs the successor's W | W↔W | was **S** (a sealed backup ahead by more than the lease's remainder took a TTL takeover: no floor) | **fixed (C7-H2)**: a takeover the permit allowed is fast whatever the clock says; the expiry is no longer kept |
+| 27 | Fast-takeover floor's beat cap (C7-F F-a) — `HolderBeats` (`note_beat`), `note_fast_takeover`, `note_marker_landed` | the predecessor's `expires`/`guard` minus its beat's `sent` (one clock), added to the beat's arrival `at` (the successor's) | W−W (holder), W (successor) | none for offset (a difference on one clock plus a stamp on the other); a backward step on the holder lengthens its honour (C7-H1); a forward step on the successor shortens every wait-side window alike | already rate-only: `2ρ·(X − sent) ≤ M/2` for beats within `250·M`; C7a moves `at` to the wait clock with the floor |
 
 ## Sources
 
