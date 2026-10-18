@@ -890,6 +890,11 @@ In order, all green:
 
 ## 12. Open questions for the maintainer
 
+**Answered by the maintainer (2026-10-18): all four as proposed** — 16 MiB
+default, configurable; keep the `0` (synchronous) switch until the
+fail-before evidence is recorded, then remove it; the harness's `kill -9`
+tail is a note, not a violation; no logger process for now.
+
 1. Default queue size 16 MiB (proposed) — or smaller for small hosts.
 2. `CONSTELLATION_LOG_QUEUE_BYTES=0` keeps the synchronous writer as an
    A/B and test switch (proposed) — or no synchronous mode at all once
