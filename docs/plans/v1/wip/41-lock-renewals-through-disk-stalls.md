@@ -93,11 +93,19 @@ a daemonized node redirects to `daemon.log` in its state dir,
 `crates/cli/src/daemonize.rs:83-87`) blocked core steps 9–14 s on a
 loaded btrfs.
 
-**Accepted interim guidance** (the maintainer declined a non-blocking
-log writer for now): mount the state dir's file system with
-`lazytime` (or `noatime`), and put the daemon's log on a fast disk
-(or a journald/pipe target that does not share the stalling device).
-`docs/` has no such text yet; L7 writes it.
+**Superseded interim guidance.** On 2026-10-14 the maintainer declined
+a non-blocking log writer for now and accepted host mitigations instead:
+mount the state dir's file system with `lazytime` (or `noatime`), and put
+the daemon's log on a fast disk (or a journald/pipe target that does not
+share the stalling device). On 2026-10-18 the decision was reversed on
+new evidence (core steps blocked 0.7-12.6 s in `LogWriter::write`, one of
+them losing a delegation by itself, and the F2 heartbeat thread blocked
+1.6 s and 7.3 s in stderr writes): **logging never blocks a daemon
+thread; lines that cannot be queued are dropped and counted** — plan 44
+(`wip/44-non-blocking-log-writer.md`). The host mitigations stay useful as
+general guidance (fewer stalls of the store's journal, fewer dropped log
+lines), no longer as the answer to a blocked log writer; L7 writes them
+as such.
 
 ## 2. What the code does today
 
@@ -118,7 +126,7 @@ log writer for now): mount the state dir's file system with
   `refresh()` (the FUSE-facing mirrors and status), then `dispatch`.
   Nothing else of the node's authority runs while a step waits. A step
   over 500 ms logs `slow core step` (`SLOW_STEP_US`, `:58`) — through
-  the same synchronous log writer.
+  the same synchronous log writer (non-blocking after plan 44).
 
 ### 2.2 The renewal paths
 
@@ -295,7 +303,9 @@ uses the same predicate.
   debug, off by default) while holding the mutex
   (`crates/meta/src/locks.rs:1066-1077`): enabled, a blocked log writer
   holds the mutex. **Fixed in L1** (log after the guard drops);
-  load-bearing for the same reason.
+  load-bearing for the same reason. After plan 44 a log call no longer
+  waits on the disk, but formatting under the mutex still costs every
+  FUSE fence check: L1's fix stays.
 - Under `ack=s3` the holder's stream heartbeat is a core timer
   (`core/stream.rs:369`), and a subscriber takes the lease over after
   `backup_takeover_ms` of silence (`watch_s3_holder`, `backup.rs:2522`):
@@ -733,8 +743,11 @@ heuristics (unused grants, unreachable peers, queue positions) exact.
   core logs one `info` line when a driver stall ends during which the
   lane renewed anything ("the renewal lane renewed N own, M held and K
   peer grants during a core stall of X ms"), from the core's thread,
-  which logs anyway. This is the bounded logging change: no
-  non-blocking writer.
+  which logs anyway. Plan 44 makes every log write non-blocking (lines
+  dropped and counted when the sink cannot keep up); the lane still does
+  not log: a dropped line is lost evidence, a log storm could crowd out
+  the lines that matter, and the lane's liveness must not depend on the
+  log's queue.
 - Sim: the same `lane.rs` driven by a task in
   `crates/authority/tests/sim/node.rs`, the bus routing `LockRenew` to
   it first (§8.1).
@@ -1081,10 +1094,11 @@ milestone below mentions them, it applies only if they were chosen.
     their freshness, `ack=s3` holders deposed), a new subsection
     "Renewals off the core" after `:236`, the max-stall bound,
     troubleshooting entries; `docs/reference/features/durability-and-failover.md`
-    (L6 only: the lane's probe as an S3 request); **the accepted
-    interim host guidance** (§1): `lazytime`/`noatime` on the state
-    dir's file system, the daemon log on a fast disk or a target off the
-    stalling device, the journal on its own device (D6), in the
+    (L6 only: the lane's probe as an S3 request); **the host
+    guidance** (§1, D6): `lazytime`/`noatime` on the state dir's file
+    system and the journal on its own device (fewer store stalls), the
+    daemon log on a device that does not stall (fewer dropped log lines:
+    since plan 44 the log no longer stalls the daemon), in the
     operations/troubleshooting docs and in `cluster-locks.md`'s
     troubleshooting; `docs/how-to-guides/development/TESTING.md` (sim
     configs, scenarios, the fault point).
@@ -1308,11 +1322,11 @@ the numbers and hypotheses; do not loosen the bar.
    `ack=s3` holder, so the lane buys almost nothing there) — or a
    follow-up plan moves that heartbeat off the core like
    `holder_alive_task`.
-8. **No logging from the lane** plus the core's summary line, as the
-   bounded logging change; the host-level mitigations (`lazytime`/
-   `noatime` on the state dir, logs on a fast disk) are the **accepted
-   interim guidance** — the maintainer declined a non-blocking log
-   writer for now — and L7 writes them into the docs.
+8. **No logging from the lane** plus the core's summary line. Decided
+   since: the non-blocking log writer the maintainer declined on
+   2026-10-14 was decided for on 2026-10-18 (plan 44); the host-level
+   mitigations (`lazytime`/`noatime` on the state dir, logs on a fast
+   disk) remain general guidance, which L7 writes into the docs.
 9. **The test-only fault point** in `meta`'s write path
    (`CONSTELLATION_FAULT_STORE_STALL_FILE`).
 10. **Delegated owner side** as a follow-up plan.
