@@ -36,6 +36,20 @@ pub enum Event {
         /// refuses it once a named grant is no longer live.
         tag: LockTag,
     },
+    /// `Submit` of a rid this node executed but never acknowledged: the
+    /// FUSE fast path's acknowledgement wait ended with the lease lost
+    /// (`DurableWait::Lost`) or ran out (`TimedOut`), and the write comes
+    /// back through the core under its rid. The core marks the rid in
+    /// doubt and submits it in one step, so the op can never run as one
+    /// never sent: it reads `completed` before it executes, and a copy of
+    /// the rid already live here (the deposition's queue entry) is the
+    /// same op, not a second one.
+    SubmitInDoubt {
+        rid: Rid,
+        op: MutateOp,
+        policy: Policy,
+        tag: LockTag,
+    },
     /// A peer's message was delivered.
     Peer { from: NodeId, msg: PeerMsg },
     /// A peer request the core sent (`Action::Send` of a `PeerMsg`
@@ -205,10 +219,6 @@ pub enum Control {
     /// event itself is a no-op: every event ends in
     /// `backup_after_event`).
     Journaled,
-    /// Plan 30 §M9: the next `Submit` of `rid` is a resubmission of an
-    /// op this node executed but never acknowledged (its fast-path wait
-    /// ended with the lease lost): the client machine starts it in doubt.
-    InDoubt { rid: Rid },
     /// `--fsync-mode s3` barrier: ship this node's journal, then answer.
     Barrier { ino: Option<Ino> },
     /// Ship everything and publish a commit now (snapshots).

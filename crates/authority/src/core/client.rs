@@ -26,7 +26,7 @@ use constellation_types::Code;
 use std::collections::BTreeSet;
 
 /// How many `InDoubt` rids the core remembers for their resubmission.
-const MAX_IN_DOUBT_RIDS: usize = 10_000;
+pub(super) const MAX_IN_DOUBT_RIDS: usize = 10_000;
 
 /// Who submitted the op and therefore where its outcome goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -396,13 +396,29 @@ impl Core {
         self.submit(now, rid, op, policy, tag, Origin::Client, replica, out);
     }
 
-    /// Plan 30 §M9 (`Control::InDoubt`): the next `submit` of `rid`
+    /// Plan 30 §M9 (`Event::SubmitInDoubt`): `rid` is a resubmission of
+    /// an op this node may have executed. If the rid's op is live here (the
+    /// deposition's queue entry for the same write), that op is marked in
+    /// doubt: it reads `completed` before any local execution instead of
+    /// running as one never sent. Otherwise the next `submit` of `rid`
     /// starts in doubt (see `in_doubt_rids`).
+    ///
+    /// `load-probe-takeover` seed 46: a fast-path write resubmitted when
+    /// its acknowledgement wait ended `DurableWait::Lost` was also the
+    /// queue entry; the takeover gate replayed that entry (`Completed`),
+    /// and the waiting op, not in doubt, executed a second time: refused
+    /// (`EEXIST`, `ENOENT`), journaled as the rid's second outcome and
+    /// answered to the application.
     pub(crate) fn note_in_doubt(&mut self, rid: Rid) {
+        if let Some(c) = self.clients.get_mut(&rid) {
+            c.forwarded = true;
+            return;
+        }
         self.in_doubt_rids.insert(rid);
         while self.in_doubt_rids.len() > MAX_IN_DOUBT_RIDS {
             let first = *self.in_doubt_rids.iter().next().expect("non-empty");
             self.in_doubt_rids.remove(&first);
+            self.in_doubt_batches.remove(&first);
         }
     }
 

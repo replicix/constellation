@@ -151,8 +151,17 @@ its backup, which stops hearing heartbeats at expiry, sealed it.)
 (accepted *or refused*: a refusal was evaluated against the same
 unshipped state) only once every backup listed in the *committed* lease
 object holds the journal through the position it was evaluated at. The
-op has already executed; only its reply waits. The FUSE fast path is
-closed under this policy, so local writes wait the same way.
+op has already executed; only its reply waits. The holder's FUSE fast
+path executes its own writes the same way and then waits for their rows
+to be durable before it answers. If the lease is lost during that wait
+(or the wait runs out), the write is in doubt: it is resubmitted through
+the authority core under the same rid, in one event that marks the rid in
+doubt and submits it (`SubmitInDoubt`), so the core never sees the op
+without its mark. The core then answers it from `completed` wherever the
+rid already has an outcome, and executes it only if it has none. If a
+deposition also queued the write's row for replay by rid, the replay and
+the resubmission are the same op: whichever runs first decides it, and
+the other finds that outcome and does not run again.
 
 **Reconfiguration.** A backup that makes no acknowledgement progress for
 `CONSTELLATION_BACKUP_ACK_TIMEOUT_MS` (1 s), or whose link goes down, is

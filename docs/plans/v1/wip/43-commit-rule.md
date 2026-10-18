@@ -412,6 +412,12 @@ in the code, in PROGRESS and in failure messages.
   journal that first held it (carried transitively: a row re-shipped
   twice, A → B → C, keeps A's identity), or `(g, i)`. No committed row is ever
   executed again by rid (no `Records` copy, no fold, no replay).
+  Evidence for (b): `load-probe-takeover` seed 46 (a log-sink stall)
+  decided one rid twice, `Completed` then `Refused`, in one segment: the
+  deposed node's fast-path write was a live client op (resubmitted in
+  doubt) and its own queue entry at once, and the two were not merged. The
+  in-doubt mark (`Event::SubmitInDoubt`) keeps the second copy from
+  deciding until C1/C3 remove the deposed tenure's replay.
 - **I3 `authority_state_in_log`.** Every lock grant, release, expiry
   and move, and every delegation start, group change, end and cut, is a
   log record applied in log order by every replica. At every step, each

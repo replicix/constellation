@@ -458,6 +458,20 @@ always a prefix of the durable log plus speculation it can take back:
   log is unreadable) used to answer each mutation with `EIO` at once;
   each now waits for the client deadline (twice the lease TTL) and ends
   in doubt.
+  A write the deposed node's fast path had already executed, whose
+  acknowledgement was still waiting for durability, is resubmitted
+  through the core *in doubt*: one event (`SubmitInDoubt`) marks the rid
+  and submits it, so the op never runs as one that was never sent. The
+  recovery also queues its row for replay by rid, so one op is both a
+  live client op and a queue entry. The drain leaves that entry to the
+  client op. If the node takes the lease back, its takeover gate replays
+  the entry, and the client op is then answered from `completed`. If it
+  does not, the client op is forwarded under the same rid and the holder
+  decides it once; the queue entry is then resolved from `completed`. In
+  neither case is the op executed a second time. (Without the mark the
+  client op ran as an op never sent: it skipped the `completed` check,
+  was refused by its own effect, and the log held the rid's completion
+  and its refusal side by side.)
 - **Publishing.** A commit is always the log-prefix state at the
   `applied` position it claims. A node with outstanding shadows or hints
   does not publish; its dirty set waits for them to retire or roll back. A

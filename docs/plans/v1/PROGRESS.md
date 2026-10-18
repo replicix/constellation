@@ -49359,3 +49359,55 @@ waits for the probe either.
 The delegation lost to a stuck authority core under a disk stall
 (`b's generation 1 did not survive the handoff`, the other finding of the
 same loop) waits for the maintainer's decision.
+
+## Fix: an in-doubt resubmission is marked in doubt in the step that submits it (`load-probe-takeover` seed 46)
+
+`load-probe-takeover` seed 46 (`pause:lock-lapse+500:10000@b` with a
+log-sink stall, on a plan-44 build) left one rid's `Completed` and
+`Refused` side by side in one segment, journaled by the same node and
+epoch. The op took effect and was then refused by its own effect; the
+application was answered the refusal (most likely `ENOENT` for a rename or
+unlink, which the load-probe writer ignores).
+
+### Mechanism
+
+- When the FUSE fast path's acknowledgement wait ends `Lost` or `TimedOut`,
+  the engine resubmits the rid through the core in doubt. The driver
+  queued `Control::InDoubt` on its internal channel and returned
+  `Event::Submit`, which the loop steps at once, so the core saw the
+  `Submit` first: the op started with `forwarded = false` and skipped the
+  `completed` check.
+- `Lost`: the deposition's queue entry for the same row was replayed by the
+  takeover gate (`Completed`), then the waiting client op executed again
+  (`Refused`). `TimedOut` with the lease still held: the `Submit`
+  re-executed the op in its own step. The second shape has been reachable
+  (rarely: it needs the 30 s budget to run out with the lease kept) since
+  M9 (`0e1017b`); the first became reachable with `0344ead`.
+- This is plan 43's I2(b) in a live case: the rid was a client op and a
+  queue entry at once, unmerged. C1/C3 remove the deposed tenure's replay;
+  until then the mark is what keeps the second copy from deciding.
+
+### Fix
+
+- New core event `Event::SubmitInDoubt { rid, op, policy, tag }`: the core
+  runs `note_in_doubt(rid)` and then the `Submit` path in one step.
+  `Control::InDoubt` and its producer are gone; the driver returns
+  `SubmitInDoubt` for a resubmission in doubt, with no nested step, so the
+  wrong order cannot be written.
+- `note_in_doubt` marks a live op for the rid in doubt (and leaves
+  `in_doubt_rids` alone); otherwise it records the rid as before. Its
+  eviction now drops the rid's `in_doubt_batches` entry too, as
+  `finish_in_doubt` does.
+- Docs: `durability-and-failover.md` (acknowledgement, the in-doubt
+  resubmission), `forwarded-mutations.md` (Deposition), plan 43 I2(b).
+
+### Tests
+
+- Core `a_lost_fast_path_write_resubmitted_in_doubt_is_decided_once_across_a_takeover_replay`
+  and `a_timed_out_fast_path_write_resubmitted_in_doubt_while_holding_is_answered_from_completed`:
+  fail when `SubmitInDoubt` is handled as a plain submit (answered `EEXIST`,
+  the journal holds `Completed` then `Refused`), pass with the mark.
+- Core `a_rid_the_core_already_completed_is_answered_from_completed_when_resubmitted_in_doubt`
+  (same fail-before), `a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid`
+  (one decide, at the holder; passes either way, it pins the merge) and
+  `evicting_an_in_doubt_rid_drops_its_inbox_batches` (fails before).

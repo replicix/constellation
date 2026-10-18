@@ -23870,18 +23870,7 @@ fn deposed_with_stranded_rows<const N: usize>(names: [&str; N]) -> (Harness, [(R
 /// The `DurableWait::Lost` resubmission of `rid`: a live client op of the
 /// node, while the same rid is in the replay queue.
 fn resubmit_in_doubt(h: &mut Harness, rid: Rid, op: &MutateOp) -> Vec<Action> {
-    h.core.in_doubt_rids.insert(rid);
-    let mut out = Vec::new();
-    h.core.submit(
-        h.now,
-        rid,
-        op.clone(),
-        Policy::Client,
-        Default::default(),
-        crate::core::client::Origin::Client,
-        &h.meta,
-        &mut out,
-    );
+    let out = submit_in_doubt(h, rid, op);
     assert!(h.core.clients.contains_key(&rid), "the op is live");
     out
 }
@@ -24088,4 +24077,223 @@ fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
     let mut out = Vec::new();
     assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
     assert_eq!(kept_deps(&h, rx), Vec::<(u64, u64)>::new());
+}
+
+/// Every `Completed`/`Refused` record for `rid` in this node's journal,
+/// in order (`true`: a refusal).
+fn journaled_outcomes(h: &Harness, rid: Rid) -> Vec<bool> {
+    crate::replica::Replica::journal_txs_from(&h.meta, 0, usize::MAX)
+        .iter()
+        .flat_map(|tx| tx.records.clone())
+        .filter_map(|rec| match rec {
+            LogRecord::Completed { rid: r } if r == rid => Some(false),
+            LogRecord::Refused { rid: r, .. } if r == rid => Some(true),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The engine's resubmission of `rid` in doubt, as the driver delivers it:
+/// one event.
+fn submit_in_doubt(h: &mut Harness, rid: Rid, op: &MutateOp) -> Vec<Action> {
+    h.step(Event::SubmitInDoubt {
+        rid,
+        op: op.clone(),
+        policy: Policy::Client,
+        tag: Default::default(),
+    })
+}
+
+/// The one answer in `out` is the op's acceptance.
+fn assert_accepted_once(out: &[Action]) {
+    let answered = replies(out);
+    assert_eq!(answered.len(), 1, "{out:?}");
+    assert!(
+        matches!(
+            answered[0].1,
+            ClientReply::Outcome(MutateOutcome::Accepted { .. })
+        ),
+        "the op took effect: {:?}",
+        answered[0].1
+    );
+}
+
+/// `load-probe-takeover` seed 46 under `pause:lock-lapse+500:10000@b`
+/// with a log-sink stall: one rid completed and refused in the same
+/// segment, `#1` and `#2`, by the same node and epoch. The node's FUSE
+/// fast path executed a write under its old lease at the unpause; the
+/// acknowledgement wait ended `DurableWait::Lost` and the engine
+/// resubmitted the rid in doubt (`Event::SubmitInDoubt`). The deposition
+/// recovery queued the same row for replay by rid. The node took the
+/// lease back (a handoff), its gate replayed the queue locally
+/// (`Completed`), and the waiting client op, not in doubt, executed
+/// again: refused (`EEXIST` here), journaled as the rid's second outcome,
+/// and answered to the application. Without the mark `SubmitInDoubt`
+/// handles, the op is an op never sent and skips the `completed` check.
+#[test]
+fn a_lost_fast_path_write_resubmitted_in_doubt_is_decided_once_across_a_takeover_replay() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let rx = h.rid(1);
+    let x = h.create("x");
+    // The fast path's write, under epoch 1.
+    constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
+    // Sealed: the lease is lost; the acknowledgement wait ends `Lost` and
+    // the rid comes back through the core.
+    h.core.lease.mark_lost(2, 2, 1);
+    let out = submit_in_doubt(&mut h, rx, &x);
+    assert!(replies(&out).is_empty(), "{out:?}");
+    // The recovery rolls the row back and queues it for replay by rid.
+    recover_deposed_node(&mut h);
+    assert_eq!(queued_rids(&h), vec![rx]);
+    assert!(h.core.clients.contains_key(&rx), "the op is live");
+    // The lease comes back to this node; its gate replays the queue.
+    h.hold(3, None);
+    let mut out = Vec::new();
+    h.core
+        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .unwrap();
+    assert!(queued_rids(&h).is_empty(), "replayed");
+    assert_eq!(journaled_outcomes(&h, rx), vec![false]);
+    // The view is open: the waiting op runs on its timer.
+    let timer = h.core.clients[&rx].timer.expect("the op waits on a timer");
+    h.advance(1_000);
+    let out = h.step(Event::Timer { id: timer });
+    assert_accepted_once(&out);
+    assert_eq!(
+        journaled_outcomes(&h, rx),
+        vec![false],
+        "one outcome for the rid"
+    );
+}
+
+/// The `DurableWait::TimedOut` shape of the same resubmission: the lease
+/// is still held, so the op would execute in the very step that submits
+/// it. Marked in doubt in that step, it reads `completed` first: answered
+/// from it, one outcome for the rid.
+#[test]
+fn a_timed_out_fast_path_write_resubmitted_in_doubt_while_holding_is_answered_from_completed() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let rx = h.rid(1);
+    let x = h.create("x");
+    constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
+    let out = submit_in_doubt(&mut h, rx, &x);
+    assert_accepted_once(&out);
+    assert_eq!(journaled_outcomes(&h, rx), vec![false]);
+}
+
+/// The rid's op ran and completed earlier through the core (its answer
+/// lost on the way to the application); the resubmission in doubt is
+/// answered from `completed`, not decided again.
+#[test]
+fn a_rid_the_core_already_completed_is_answered_from_completed_when_resubmitted_in_doubt() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let rx = h.rid(1);
+    let x = h.create("x");
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid: rx,
+        op: x.clone(),
+        tag: Default::default(),
+    });
+    assert_accepted_once(&out);
+    assert!(!h.core.clients.contains_key(&rx), "answered");
+    let out = submit_in_doubt(&mut h, rx, &x);
+    assert_accepted_once(&out);
+    assert_eq!(
+        journaled_outcomes(&h, rx),
+        vec![false],
+        "one outcome for the rid"
+    );
+}
+
+/// The deposition shape in the other order: the recovery's queue entry is
+/// a live `Replay` op of the rid (the drain forwarded it to the holder)
+/// when the resubmission in doubt arrives. They are one op: the
+/// resubmission merges into the replay, takes no second copy anywhere,
+/// and the holder's one answer settles both.
+#[test]
+fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let rx = h.rid(1);
+    let x = h.create("x");
+    constellation_meta::execute_mutate(&h.meta, &x, Some(rx)).unwrap();
+    h.core.lease.mark_lost(2, 2, 1);
+    // The recovery queues the row, and the drain forwards it as a replay.
+    recover_deposed_node(&mut h);
+    assert_eq!(queued_rids(&h), vec![rx]);
+    let mut out = Vec::new();
+    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    assert!(matches!(
+        h.core.clients.get(&rx).map(|c| &c.origin),
+        Some(crate::core::client::Origin::Replay { .. })
+    ));
+    let PeerMsg::MutateRequest { req, .. } = sends(&out)
+        .into_iter()
+        .find(|(_, m)| matches!(m, PeerMsg::MutateRequest { rid, .. } if *rid == rx))
+        .expect("the replay goes to the holder")
+        .1
+    else {
+        unreachable!()
+    };
+    let req = *req;
+    // The resubmission in doubt: merged, not answered, not forwarded again.
+    let out = submit_in_doubt(&mut h, rx, &x);
+    assert!(replies(&out).is_empty(), "merged, not answered: {out:?}");
+    assert!(sends(&out).is_empty(), "no second copy: {out:?}");
+    assert!(h.core.clients[&rx].also_client, "merged into the replay");
+    assert!(
+        !h.core.in_doubt_rids.contains(&rx),
+        "the live op took the mark"
+    );
+    // The holder decides it once; its answer settles the replay and
+    // answers the client.
+    let out = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::MutateReply {
+            req,
+            outcome: MutateOutcome::Accepted {
+                epoch: 2,
+                records: Vec::new(),
+            },
+            base: Some(0),
+            position: constellation_meta::Position::ZERO,
+            gen: 0,
+            own_chunks: OwnChunks::None,
+            own_rows: None,
+        },
+    });
+    assert_accepted_once(&out);
+    assert!(!h.core.clients.contains_key(&rx), "settled");
+    assert_eq!(
+        journaled_outcomes(&h, rx),
+        Vec::<bool>::new(),
+        "this node decided nothing: one decide, at the holder"
+    );
+}
+
+/// A mark that evicts the oldest in-doubt rid forgets its inbox batch
+/// keys with it, as `finish_in_doubt` does.
+#[test]
+fn evicting_an_in_doubt_rid_drops_its_inbox_batches() {
+    let mut h = Harness::new(1);
+    let first = h.rid(1);
+    h.core.in_doubt_rids.insert(first);
+    h.core.in_doubt_batches.insert(first, Vec::new());
+    for seq in 2..=(crate::core::client::MAX_IN_DOUBT_RIDS as u64 + 1) {
+        let rid = h.rid(seq);
+        h.core.note_in_doubt(rid);
+    }
+    assert_eq!(
+        h.core.in_doubt_rids.len(),
+        crate::core::client::MAX_IN_DOUBT_RIDS
+    );
+    assert!(!h.core.in_doubt_rids.contains(&first), "evicted");
+    assert!(
+        !h.core.in_doubt_batches.contains_key(&first),
+        "its batches went with it"
+    );
 }

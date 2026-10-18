@@ -230,6 +230,7 @@ impl StepTail {
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::Submit { .. } => "Submit",
+        Event::SubmitInDoubt { .. } => "SubmitInDoubt",
         Event::Peer { msg, .. } => msg.kind(),
         Event::PeerFailed { .. } => "PeerFailed",
         Event::Timer { .. } => "Timer",
@@ -2621,12 +2622,6 @@ impl Driver {
                 reply,
             } => {
                 self.replies.insert(rid, reply);
-                if in_doubt {
-                    let _ = self.int_tx.send(Internal::Control {
-                        req: Control::InDoubt { rid },
-                        reply: ControlReply::None,
-                    });
-                }
                 let acked = self.drain_acks();
                 if !acked.is_empty() {
                     let _ = self.int_tx.send(Internal::Event(Event::Activity {
@@ -2634,11 +2629,22 @@ impl Driver {
                         acked_seqs: acked,
                     }));
                 }
-                Some(Internal::Event(Event::Submit {
-                    rid,
-                    op,
-                    policy,
-                    tag,
+                // One event carries the in-doubt mark with the op, so the
+                // core can never see the op without its mark.
+                Some(Internal::Event(if in_doubt {
+                    Event::SubmitInDoubt {
+                        rid,
+                        op,
+                        policy,
+                        tag,
+                    }
+                } else {
+                    Event::Submit {
+                        rid,
+                        op,
+                        policy,
+                        tag,
+                    }
                 }))
             }
             SyncRequest::ReadIndex {

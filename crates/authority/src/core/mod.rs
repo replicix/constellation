@@ -1596,6 +1596,15 @@ impl Core {
                 policy,
                 tag,
             } => self.on_submit(now, rid, op, policy, tag, replica, &mut out),
+            Event::SubmitInDoubt {
+                rid,
+                op,
+                policy,
+                tag,
+            } => {
+                self.note_in_doubt(rid);
+                self.on_submit(now, rid, op, policy, tag, replica, &mut out)
+            }
             Event::Peer { from, msg } => self.on_peer(now, from, msg, replica, &mut out),
             Event::PeerFailed { req, to, outage } => {
                 self.on_peer_failed(now, req, to, outage, replica, &mut out)
@@ -2180,13 +2189,6 @@ impl Core {
                 });
             }
             Control::Journaled => {
-                out.push(Action::ControlDone {
-                    op,
-                    result: Ok(ControlOk::Done),
-                });
-            }
-            Control::InDoubt { rid } => {
-                self.note_in_doubt(rid);
                 out.push(Action::ControlDone {
                     op,
                     result: Ok(ControlOk::Done),
