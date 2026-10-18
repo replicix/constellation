@@ -98,6 +98,7 @@ use constellation_meta::{Meta, MetaStore};
 use constellation_platform::{LifecycleEvent, LifecycleSource};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -234,8 +235,13 @@ impl Lifecycle {
                     return;
                 }
                 match subscription.recv_timeout(Duration::from_millis(500)) {
-                    Some(event) => this.apply(event),
-                    None => continue,
+                    Ok(event) => this.apply(event),
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    // The source is gone: nothing will ever arrive, and
+                    // `recv_timeout` no longer waits (looping on it would
+                    // spin a core until the engine's shutdown, which an
+                    // engine that is dropped without one never sets).
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             });
         if let Err(error) = spawned {
@@ -694,6 +700,30 @@ mod tests {
     impl Drop for Node {
         fn drop(&mut self) {
             let _ = self.engine.shutdown();
+        }
+    }
+
+    /// The lifecycle thread ends when its source is gone. It used to treat
+    /// "gone" like "nothing yet" and spin a core until the engine's
+    /// shutdown (a hung test binary carried 15 such threads at 55 % each
+    /// for four hours). The thread holds a clone of the controller, so its
+    /// exit is the controller's strong count falling back.
+    #[test]
+    fn the_lifecycle_thread_ends_when_its_source_is_gone() {
+        let n = node(EngineProfile::default());
+        let lifecycle = n.engine.lifecycle().clone();
+        let before = Arc::strong_count(&lifecycle);
+        let source = constellation_platform::ManualLifecycle::new();
+        lifecycle.spawn(&source, Arc::new(AtomicBool::new(false)));
+        assert_eq!(Arc::strong_count(&lifecycle), before + 1);
+        drop(source);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Arc::strong_count(&lifecycle) > before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lifecycle thread is still running with its source gone"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 

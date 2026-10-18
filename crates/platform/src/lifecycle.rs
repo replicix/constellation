@@ -10,7 +10,7 @@
 //! quiesce P2P on `Suspending`) is `constellation_engine::lifecycle`'s;
 //! this module only delivers them.
 
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -50,9 +50,11 @@ impl Subscription {
         self.rx.try_recv().ok()
     }
 
-    /// Wait up to `timeout` for the next event.
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<LifecycleEvent> {
-        self.rx.recv_timeout(timeout).ok()
+    /// Wait up to `timeout` for the next event: `Err(Timeout)` when none
+    /// came, `Err(Disconnected)` (at once, not after the timeout) once the
+    /// source is gone, so a loop over this must end on it or it spins.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<LifecycleEvent, RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
     }
 }
 
@@ -133,7 +135,7 @@ mod tests {
         }
         for sub in [&a, &b] {
             for event in events {
-                assert_eq!(sub.recv_timeout(Duration::from_secs(1)), Some(event));
+                assert_eq!(sub.recv_timeout(Duration::from_secs(1)), Ok(event));
             }
             // The event pushed before subscribing is not replayed.
             assert_eq!(sub.try_recv(), None);
@@ -179,7 +181,26 @@ mod tests {
         .unwrap();
         assert_eq!(
             sub.recv_timeout(Duration::from_secs(5)),
-            Some(LifecycleEvent::LowPower)
+            Ok(LifecycleEvent::LowPower)
         );
+    }
+
+    /// A gone source is reported at once, apart from a timeout: a loop that
+    /// treats both as "nothing yet" spins forever once the source drops.
+    #[test]
+    fn a_gone_source_is_not_a_timeout() {
+        let source = ManualLifecycle::new();
+        let sub = source.subscribe();
+        assert_eq!(
+            sub.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout)
+        );
+        drop(source);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            sub.recv_timeout(Duration::from_secs(30)),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
