@@ -1,7 +1,10 @@
 # Plan 31 — Core-isation: `constellation-engine`, the `constellation-vfs` frontend contract, `constellation-platform`, the control protocol, and the test architecture that makes it all verifiable
 
 > **Editorial note (plan 31 closing).** This is the design as written on
-> 2026-09-28; the milestones C0-C8 have been built. Where the tree differs
+> 2026-09-28; the milestones C0-C8 have been built, and the plan was closed
+> on 2026-10-18 (moved from `wip/` to `done/`; the closing gate run and its
+> results are in `docs/plans/v1/PROGRESS.md`, "Plan 31 closing", "Closing
+> gate run"). Where the tree differs
 > from a passage, the passage is either corrected in place (names,
 > signatures) or followed by an **As built:** / **Superseded:** note
 > (design history). The status of every milestone, the numbers, and what is
@@ -2364,9 +2367,10 @@ milestone's DoD includes every earlier one still green):
    designed), plus `fs.unlock`/`view.stats`/`node.handoff` and fd passing
    (§9.8-9.9) work end-to-end; the unix↔HTTP parity test passes.
 7. **C6**: the conformance kit runs in CI against `linux-fuse`; `MockVfs`
-   has adapter unit-test coverage; `linux-fuse-process` lane green;
-   `tests/parity.py` unit-tested against a synthetic mismatch (proves it
-   fails closed). Status and the open items: PROGRESS "Plan 31 C6" and
+   has adapter unit-test coverage; `linux-fuse-process` lane green
+   (226 of 226 at `975b494`, PROGRESS "Plan 31 closing", "Closing gate
+   run"); `tests/parity.py` unit-tested against a synthetic mismatch (proves
+   it fails closed). Status and the open items: PROGRESS "Plan 31 C6" and
    "Plan 31 closing".
 8. **C7**: `vfs-bench` is part of the gated perf suite; `OpWatch` reachable
    over `node.ops`; metrics named per §6.10 are emitted and scraped by a

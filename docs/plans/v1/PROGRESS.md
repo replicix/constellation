@@ -27670,7 +27670,7 @@ table refuses a cached grant once it is recalled. What did not:
 
 ## Plan 31 C0 — Baselines and guardrails
 
-Milestone C0 of [plan 31](wip/31-core-frontend-backend.md) (§11): the
+Milestone C0 of [plan 31](done/31-core-frontend-backend.md) (§11): the
 harness gets machine-readable output and sharding, a cross-target
 type-check gate exists with today's failures recorded, and CI runs it.
 Nothing in the product code changes. Base commit: `99472fa`.
@@ -27755,11 +27755,11 @@ from `tools/check-cross-known-failures.txt`).
   refusals cross the signed postcard P2P envelope as `Code` wire numbers
 - [x] FUSE parity test: every `Code` the adapter produces equals fuser's `Errno::E*`
 - [x] Zero `libc::E*` outside the conversion module
-- [ ] Full gates — run once at the end of the plan-31 run
+- [x] Full gates — run once at the end of the plan-31 run — run in the closing gate ("Plan 31 closing", "Closing gate run")
 
 ## Plan 31 C2 — `constellation-platform`
 
-Milestone C2 of [plan 31](wip/31-core-frontend-backend.md) (§3, §4, §11):
+Milestone C2 of [plan 31](done/31-core-frontend-backend.md) (§3, §4, §11):
 every host service the product crates use goes through one injectable
 bundle, `HostServices`, with Linux and macOS implementations and
 compile-only stubs for Windows, Android, iOS and FreeBSD.
@@ -27822,11 +27822,11 @@ gone; the rest are FUSE-frontend types for C4).
 - [x] Unit tests: lock contention between two opens, punch hole seen by
   `SEEK_HOLE`, secret files `0600`, ephemeral store writes nothing,
   `classify` tests green, lifecycle fan-out
-- [ ] Full gates — run once at the end of the plan-31 run
+- [x] Full gates — run once at the end of the plan-31 run — run in the closing gate ("Plan 31 closing", "Closing gate run")
 
 ## Plan 31 C3 — `constellation-engine`
 
-Milestone C3 of [plan 31](wip/31-core-frontend-backend.md) (§4, §5, §11):
+Milestone C3 of [plan 31](done/31-core-frontend-backend.md) (§4, §5, §11):
 the 40 engine modules leave the `constellation` binary for a library
 crate, `constellation-engine`, behaviour-neutrally: files moved with
 `git mv`, and the only code changes are paths, visibility, and the
@@ -27944,13 +27944,13 @@ unix-socket server; past that, `staging.rs`'s
 - [x] Every moved unit test runs under `cargo test -p constellation-engine`;
   engine + cli test sets equal the pre-move cli set
 - [x] `make check-cross` exits 0 with the updated known-failures file
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+- [x] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798, perf within 3% of C0) — run once at the end of the
-  plan-31 run
+  plan-31 run — run in the closing gate ("Plan 31 closing", "Closing gate run"); the perf figure is the superseding gates'
 
 ## Plan 31 C4a — `constellation-vfs` and `constellation-frontend-fuse`
 
-The core of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+The core of milestone C4 of [plan 31](done/31-core-frontend-backend.md)
 (§6.1-§6.8, §11 "C4"): the frontend contract as its own crate, the
 mounted view moved into the engine beneath it, and FUSE rebuilt as a thin
 adapter over it — behaviour-neutrally. Session handover / `vendor/fuser` /
@@ -28010,12 +28010,12 @@ C6's conformance seed).
   read/rename/unlink, mkdir/readdir, xattrs, hard link, symlink, FIFO,
   `flock` and blocking `F_SETLKW` under `--locks cluster`, clean exit) —
   output identical to the pre-change binary
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
-  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+- [x] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end — run in the closing gate ("Plan 31 closing", "Closing gate run"); the perf figure is the superseding gates'
 
 ## Plan 31 C4c — `Engine`/`EngineHost`/`ViewSpec`, subtree confinement
 
-The rest of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+The rest of milestone C4 of [plan 31](done/31-core-frontend-backend.md)
 bar session handover (C4b): the engine API of §4/§4.1 with the node
 assembly moved behind it, `ViewSpec`/`ViewQos` (§9.10), `EngineProfile`
 as a type (§10; its lifecycle behaviour is C8), credentials in
@@ -28187,12 +28187,12 @@ harness's darwin errors stay at its known 8.
 - [x] `cargo build --workspace`; clippy `-D warnings` clean for every
   crate this change touches; `cargo fmt` on the touched crates
 - [x] `make check-cross` exits 0
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
-  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+- [x] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end — run in the closing gate ("Plan 31 closing", "Closing gate run"); the perf figure is the superseding gates'
 
 ## Plan 31 C4b — FUSE session handover
 
-The last part of milestone C4 of [plan 31](wip/31-core-frontend-backend.md)
+The last part of milestone C4 of [plan 31](done/31-core-frontend-backend.md)
 (§6.11): a FUSE session handed from one process image to the next without
 the kernel ever seeing an unmount, and `constellation daemon --upgrade` on
 plain Linux built on it. The gate — a real kernel mount surviving a daemon
@@ -28344,13 +28344,13 @@ non-FUSE frontend lane will need one.
 - [x] `cargo build --workspace`; `cargo clippy --workspace --all-targets
   -- -D warnings` clean; `cargo fmt` on the touched crates
 - [x] `make check-cross` exits 0 (known failures unchanged)
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
-  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end
+- [x] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798, §6.9 perf) — run by the coordinator at the end — run in the closing gate ("Plan 31 closing", "Closing gate run"); the perf figure is the superseding gates'
 
 ## Plan 31 C4 follow-ups
 
 Three follow-ups to milestone C4 of
-[plan 31](wip/31-core-frontend-backend.md): `renameat2` flags, the
+[plan 31](done/31-core-frontend-backend.md): `renameat2` flags, the
 conformance kit (§8) run against the real engine, and a bug report about
 unlinked open files.
 
@@ -28456,7 +28456,7 @@ unlinked file is ever published. Unit test:
 
 ## Plan 31 C5 — `constellation-control` replaces `crates/api`
 
-Milestone C5 of [plan 31](wip/31-core-frontend-backend.md) (§9), second
+Milestone C5 of [plan 31](done/31-core-frontend-backend.md) (§9), second
 half (C5b; C5a built `constellation-control` itself): the daemon, the CLI,
 the harness and the web UI speak the control protocol, every method of its
 table is bound to the engine, and `crates/api` — the line-JSON
@@ -28635,12 +28635,12 @@ failed only while other suites ran alongside.
 - [x] Harness `scratch-publish`, `subtree-confinement`,
   `gc-open-orphan-hold`, `stale-base-rename-divergence`,
   `cross-subtree-rename`, `fuse-inval-storm`: PASSED (debug binary)
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
-  pjdfstest 8798/8798) — run by the coordinator at the end
+- [x] Full gates (workspace tests, smoke, integration, harness matrix,
+  pjdfstest 8798/8798) — run by the coordinator at the end — run in the closing gate ("Plan 31 closing", "Closing gate run")
 
 ## Plan 31 C6 — test architecture: conformance kit, `MockVfs`, harness lanes, parity checker
 
-Milestone C6 of [plan 31](wip/31-core-frontend-backend.md) (§8, §11, §12), built in two parts: **C6a** (`ceca163`: the parity checker, the process S3 backend, `harness smoke` and `harness interop`, the nightly lane jobs) and **C6b** (`b265b6f`: the conformance kit, `MockVfs`, the FUSE wire tests, the property tests, the harness `Cap`s and the platform-neutral `Client`). Both commits were reviewed and corrected before they landed (the fixes are listed in their messages). This section was written when plan 31 was closed, from those commits and the tree; counts are the tree's, with the C6b count where it differs. What was still open, and the results of the closing gate run, are in "Plan 31 closing" below.
+Milestone C6 of [plan 31](done/31-core-frontend-backend.md) (§8, §11, §12), built in two parts: **C6a** (`ceca163`: the parity checker, the process S3 backend, `harness smoke` and `harness interop`, the nightly lane jobs) and **C6b** (`b265b6f`: the conformance kit, `MockVfs`, the FUSE wire tests, the property tests, the harness `Cap`s and the platform-neutral `Client`). Both commits were reviewed and corrected before they landed (the fixes are listed in their messages). This section was written when plan 31 was closed, from those commits and the tree; counts are the tree's, with the C6b count where it differs. What was still open, and the results of the closing gate run, are in "Plan 31 closing" below.
 
 | Item | State | Where |
 |---|---|---|
@@ -28694,13 +28694,13 @@ Milestone C6 of [plan 31](wip/31-core-frontend-backend.md) (§8, §11, §12), bu
 - [x] `tests/parity.py` unit-tested against synthetic mismatches (it fails closed); `tests/platform-parity.toml` in use (the `linux-csi` lane's entries; `linux-fuse-process` has none by design)
 - [x] Harness `--frontend`, `--s3-backend process`, derived `Cap`, `harness smoke`, `harness interop`
 - [x] The engine conformance target runs the `cancellation` and `invalidation` groups instead of skipping them ("Plan 31 closing: conformance and asserts")
-- [ ] The harness's host calls behind `constellation-platform`, so that it compiles for macOS — in progress ("Plan 31 closing")
-- [ ] `linux-fuse-process` green: no run is recorded — the closing gate run
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest 8798/8798) — the closing gate run
+- [x] The harness's host calls behind `constellation-platform`, so that it compiles for macOS ("Plan 31 closing"; `make check-cross` OK in the closing gate run, run 5)
+- [x] `linux-fuse-process` green: 226 of 226 as root on an EC2 instance at `975b494`, 211 passed, 0 failed, 15 environmental skips on the workstation ("Plan 31 closing", "Closing gate run", runs 4 and 5)
+- [x] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest 8798/8798) — the closing gate run ("Plan 31 closing", "Closing gate run")
 
 ## Plan 31 C7a — op metrics, tracing, `node.ops`, `vfs-bench`
 
-First half of milestone C7 of [plan 31](wip/31-core-frontend-backend.md)
+First half of milestone C7 of [plan 31](done/31-core-frontend-backend.md)
 (§6.9, §6.10, §9.10): the unified op metrics, a span and id for every op,
 `node.ops` attributed to views, and the `vfs-bench` gate. (The deferral of
 cold reads/lease waits and the Mountpoint-derived candidates of C7 are not in
@@ -28758,12 +28758,12 @@ begun and answered through the observed responder, so they are counted too.)
 - [x] Every op has an `OpId` and a `vfs.op` span, allocation-free when disabled
 - [x] `node.ops` `view` filter, with labels; covered by tests
 - [x] `vfs-bench` recorded, within the §6.9 dispatch target
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator
+- [x] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator — run in the closing gate ("Plan 31 closing", "Closing gate run")
 
 
 ## Plan 31 C8 — engine profiles and lifecycle
 
-Milestone C8 of [plan 31](wip/31-core-frontend-backend.md) (§10, §10.1,
+Milestone C8 of [plan 31](done/31-core-frontend-backend.md) (§10, §10.1,
 §11 "C8", §15 item 9): `EngineProfile`'s modes take effect, the engine
 applies its host's `LifecycleSource` events, `node.lifecycle` injects them on
 Linux/macOS, and three harness scenarios exercise suspend/resume/metered
@@ -28895,11 +28895,11 @@ path), which this manual-source milestone cannot exercise.
 - [x] Suspend/resume semantics (§10), within a deadline, reported
 - [x] `node.lifecycle` works end-to-end against a real daemon (harness)
 - [x] Lifecycle scenarios pass on Linux (3 × 3)
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator
+- [x] Full gates (workspace tests, smoke, integration, harness matrix, pjdfstest) — coordinator — run in the closing gate ("Plan 31 closing", "Closing gate run")
 
 ## Plan 31 C7b — deferral and performance candidates
 
-Second half of milestone C7 of [plan 31](wip/31-core-frontend-backend.md)
+Second half of milestone C7 of [plan 31](done/31-core-frontend-backend.md)
 (§6.3, §6.4, §6.9, §11 "C7"): the cold-read deferral the measurements
 justified, the five Mountpoint-derived candidates measured and decided, and
 `vfs-bench` in the gated perf suite. Host: this container, 4 vCPU (so 4 FUSE
@@ -29043,9 +29043,9 @@ so only back-to-back pairs are compared.) `make perf-gate`'s vfs stage:
   explicit decision: (a) REJECT, (b) ADOPT hex/path fix + REJECT splice,
   (c) REJECT, (d) ADOPT behind `CONSTELLATION_CACHE_READ_RESERVE_PCT` (default
   off), (e) REJECT
-- [ ] Full gates (workspace tests, smoke, integration, harness matrix,
+- [x] Full gates (workspace tests, smoke, integration, harness matrix,
   pjdfstest 8798/8798; `writeback-backpressure` fails on the base too) —
-  coordinator
+  coordinator — run in the closing gate ("Plan 31 closing", "Closing gate run")
 
 ## Chunk memory cache (follow-up to plan 31 C7b)
 
@@ -29194,7 +29194,7 @@ which are the gate run's.
 
 ## Plan 31 closing
 
-Close-out of [plan 31](wip/31-core-frontend-backend.md). Milestones C0 to C8 are in the sections above ("Plan 31 C0" through "Plan 31 C8", with C6 written at the close). This section records, in one place: the work still in progress when the plan text was reconciled with the tree, the decisions taken, the statements in the sections above that later work superseded, the contradictions with `docs/explanation/DESIGN.md` (CONVENTIONS rule 5: the spec is not edited by plans), and the closing gate run. The in-progress items are being done by separate changes; **their results are recorded in the "Result" column when each lands, and nothing here claims one done before that.** The plan text itself (`wip/31-core-frontend-backend.md`) was amended in the same change as this section: stale names and signatures corrected in place, design history followed by "As built" or "Superseded" notes.
+Close-out of [plan 31](done/31-core-frontend-backend.md). Milestones C0 to C8 are in the sections above ("Plan 31 C0" through "Plan 31 C8", with C6 written at the close). This section records, in one place: the work still in progress when the plan text was reconciled with the tree, the decisions taken, the statements in the sections above that later work superseded, the contradictions with `docs/explanation/DESIGN.md` (CONVENTIONS rule 5: the spec is not edited by plans), and the closing gate run. The in-progress items were done by separate changes; **their results are in the "Result" column, recorded when each landed.** The plan text itself (`done/31-core-frontend-backend.md`) was amended in the same change as this section: stale names and signatures corrected in place, design history followed by "As built" or "Superseded" notes.
 
 ### Remaining items
 
@@ -29205,7 +29205,7 @@ Close-out of [plan 31](wip/31-core-frontend-backend.md). Milestones C0 to C8 are
 | **§6.4, the threading assertion, and §6.10, `ControlVfs` metrics.** `OpCtx::new` debug-asserts that the caller is not a tokio runtime worker (plan 31 §6.4 says it does; it does not yet); the `ControlVfs` browse ops (`browse.stat/read/write/mkdir/rename/delete/xattr`) go through the `Observer` so they are counted and traced like a mount's ops (C7a left them out) | done | `crates/vfs/src/ctx.rs`, `crates/engine/src/control/browse.rs` | Done: the assertion (a caught `block_on` probe, debug builds) and `frontend="control"` op metrics, each with a test that fails without it. See the section below |
 | **`Manager`, unified.** The CLI's `fs` subcommands and the control service's `fs_list/create/export/import/passwd/doctor/unlock` are separate implementations; one shared implementation both call (plan 31 §4's `Manager`, which was never built as a type) | done | `crates/engine/src/manager/`, `crates/engine/src/registry.rs`, `crates/engine/src/control/fs.rs`, `crates/cli/src/{main,serve,control}.rs` | `constellation_engine::manager::Manager` owns the registry and implements create/import/export/passwd/doctor/list and the state-dir rules; the CLI's `fs`/`doctor`/`export`/`mount` registration, the control service's `fs.*` and `serve --create`/`--await-unlock` call it, and no rule is duplicated. Every divergence decided (the stricter rule unless a documented reason), each changed side covered by a test that fails on the previous tree. Details, the comparison and the user-visible changes: "Plan 31 closing: one Manager for the CLI and the control service" at the end of this file |
 | **The harness compiles for macOS.** Its host calls (seccomp and `io_uring_setup` denial, CPU-affinity scheduling, `libc::fallocate`/`prctl`, xattr arities, `F_SETLK` typing, the spawner, the sandbox) move behind `constellation-platform`; the `aarch64-apple-darwin constellation-harness` entry of `tools/check-cross-known-failures.txt` is then deleted in the same change, and the nightly `macos` job (`cargo test --workspace`) can build the harness | done | `crates/harness/src/*`, `crates/platform/src/*`, `tools/check-cross-known-failures.txt` | `make check-cross`: `aarch64-apple-darwin` workspace ok, all `x86_64-pc-windows-gnu` library crates ok, the known-failures file holds no entries. Harness calls became `FsPrimitives::{preallocate, punch_hole, set/get/list/remove_xattr}`, `Process::{allowed_cpus, die_with_parent}`, or `cfg(target_os = "linux")` with a SKIP reason; the sandbox was already gated. Details and the Linux scenario results: "Plan 31 closing: the harness behind constellation-platform" at the end of this file |
-| **The closing gate run** (table below): the full harness matrix, pjdfstest 8798/8798, `vfs-bench`, both Linux lanes `linux-fuse` and `linux-fuse-process`, `tests/parity.py` | in progress | see "Closing gate run" | *(to be recorded)* |
+| **The closing gate run** (table below): the full harness matrix, pjdfstest 8798/8798, `vfs-bench`, both Linux lanes `linux-fuse` and `linux-fuse-process`, `tests/parity.py` | done | see "Closing gate run" | Done, 2026-10-18: six runs on two hosts; the last full run (`975b494`, an EC2 instance as root) passed both lanes 226 of 226, parity, pjdfstest 8798 of 8798; the workstation run of the same commit had one failure (`delegate-handoff-renewal`), fixed and confirmed on `12fe351`. The perf floors of `tests/perf-baseline.json` are host-specific and are not counted against closing. Runs, results, the fixes they led to and the open follow-ups: "Closing gate run" |
 
 ### Decisions
 
@@ -29232,6 +29232,7 @@ The sections above are a log and stay as written; this is where the later facts 
 | C0 census, C2 and C3 cross-check tables | `x86_64-pc-windows-gnu`: `constellation-api`, `-authority`, `-chaos`, `-engine` FAIL (known); `aarch64-apple-darwin`: `constellation-chaos` FAIL | `constellation-api` was deleted (C5); `-authority` has been clean since C1 (its `ESTALE` sites carry `Code`); `-chaos` compiles for darwin since C2, and with `constellation-pod-load` (POSIX test tooling) it is excluded from the Windows library list in `tools/check-cross.sh`; `-engine`'s staging I/O and zero-copy check were made portable. The last three are commit `eae81c1`. The one known failure left is `constellation-harness` on darwin (`tools/check-cross-known-failures.txt`, whose header says so) |
 | C2 table ("Left in place: … the harness's `fusermount3`/`SIGSTOP`/`fallocate` (C6)") | C6 moves them | C6b moved the harness `Client`'s; the rest moved in the closing item "The harness compiles for macOS" (done) |
 | C6 gap table and exit criteria ("The harness does not compile for macOS", "The harness's host calls behind `constellation-platform`") | in progress; `aarch64-apple-darwin constellation-harness` is a known failure, 21 errors | Done: the entry is gone; the nightly `macos` job's `cargo test --workspace` can build the harness (the errors were 25 on `main` at `d940fa2`) |
+| C6 "What has run" table (`linux-fuse-process`, parity with that lane, the conformance count of 92, the "closing gate run" rows) | `linux-fuse-process`: no run recorded; parity with it, the 92-test conformance run: the closing gate run | Recorded: "Closing gate run" (both lanes 226 of 226 as root at `975b494`; parity clean; the engine target 92 passed, 0 failed, 0 skipped) |
 | C4a table (`trait Vfs`, "30 ops") | 30 ops | 31: `copy_file_range` (commit `2acd591`) |
 | C4 follow-ups and C6b: the engine target "72 passed / 0 failed / 9 skipped" | 81 tests | The kit has 92 tests; the engine target's skips are the closing items above |
 | C5 tables | `node.handoff` `Socket` → `Unsupported` (plan 37's second-process handover); `node.lifecycle` → `Unsupported` until C8; the table has 57 methods | `Socket` is implemented (plan 37 K5, `crates/cli/src/handoff_socket.rs`); `node.lifecycle` is implemented (C8); `METHODS` has 72 methods |
@@ -29265,20 +29266,92 @@ Recorded, not edited here (code comments and files other changes own):
 
 ### Closing gate run
 
-The gates of CONVENTIONS plus plan 31's. Every earlier plan 31 section left "Full gates" for this run. Not yet run.
+The gates of CONVENTIONS plus plan 31's. Every earlier plan 31 section left "Full gates" for this run. **Closed 2026-10-18.** The gate was run six times, on two kinds of host, and each run that found something led to fixes before the next; the last full run (run 4 and run 5, commit `975b494`) and the targeted confirmation after it (run 6, `12fe351`) are what the exit criteria below rest on. The `linux-csi` lane was not run in any of them (no kind cluster on either host; `parity.py` was given `--absent-lane linux-csi`); its last recorded run is "Plan 37 K7".
 
-| Gate | Command | State | Result |
+#### The runs
+
+| Run | Date | Commit | Host |
 |---|---|---|---|
-| Format, lint | `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings` | not yet run | *(to be recorded)* |
-| Unit and integration tests | `cargo test --workspace` | not yet run | *(to be recorded)* |
-| Conformance | `cargo test -p constellation-vfs --features conformance`; `cargo test -p constellation-engine --test conformance` | not yet run | *(to be recorded: tests, passed, failed, skipped)* |
-| Smoke, integration | `bash tests/smoke.sh`; `bash tests/integration.sh` | not yet run | *(to be recorded)* |
-| Full harness matrix, lane `linux-fuse` | `target/release/harness run --results-json results-linux-fuse.json` | not yet run | *(to be recorded: scenarios passed, failed, skipped)* |
-| Full harness matrix, lane `linux-fuse-process` | `target/release/harness run --s3-backend process --frontend fuse --results-json results-linux-fuse-process.json` | not yet run | *(to be recorded; this lane has no earlier recorded run)* |
-| Lane parity | `python3 -m unittest discover -s tests -p 'test_parity.py'`; `python3 tests/parity.py --expect tests/platform-parity.toml --require-lane linux-fuse --require-lane linux-fuse-process …` | not yet run | *(to be recorded)* |
-| pjdfstest | `docker compose --profile test run --rm compliance` | not yet run | *(to be recorded: 8798/8798 expected, empty baseline)* |
-| Performance | `make perf-gate` (`vfs-bench`, then the harness `bench` rates); `make vfs-bench` for the numbers | not yet run | *(to be recorded: `vfs-bench` table next to C7a's and C7b's)* |
-| Cross-check | `make check-cross` | not yet run | *(to be recorded: the known failure should be gone with the macOS item)* |
+| 1 | 2026-10-15 | `28fec6a` | a Linux workstation, kernel 7.0.x, 32 cores, shared with other work; no root, `fuse.enable_uring=N` (every mount on `/dev/fuse`); `-j 8`; versitygw and toxiproxy-server installed with `go install` |
+| 2 | 2026-10-16 | `ce4c1ec`; reruns and 23 scenarios on `86d0163` | an EC2 instance, 16 vCPU, 30 GiB, Fedora, kernel 7.3, `fuse.enable_uring=Y`, SELinux enforcing; the lanes run as root, the other gates as a user |
+| 3 | 2026-10-16 | `ce4c1ec`; reruns on `86d0163` | the workstation of run 1, same configuration |
+| 4 | 2026-10-17/18 | `975b494` | the EC2 instance of run 2, as root |
+| 5 | 2026-10-17/18 | `975b494` | the workstation of run 1 |
+| 6 | 2026-10-18 | `12fe351` (main) | the EC2 instance, as root; a targeted confirmation, not the full matrix |
+
+#### Results
+
+Format and counts are the run's own. "fmt" is `cargo fmt --all -- --check`; "clippy" is `cargo clippy --workspace --all-targets -- -D warnings`; the tests are `cargo test --workspace --no-fail-fast` (55 ignored in every run); the lanes are `harness run` with seed 42 (`linux-fuse`) and `harness run --s3-backend process --frontend fuse` (`linux-fuse-process`), 225 scenarios in run 1 and 226 in runs 2 to 5.
+
+| Gate | 1: `28fec6a`, workstation | 2: `ce4c1ec`, EC2 | 3: `ce4c1ec`, workstation | 4: `975b494`, EC2 | 5: `975b494`, workstation | 6: `12fe351`, EC2 |
+|---|---|---|---|---|---|---|
+| fmt | pass | 1 hunk, `crates/meta/src/store/gate.rs` (not a formatter difference: unformatted since `cac2d11`) | same hunk | same hunk | same hunk | clean |
+| clippy | pass | pass | pass | pass | pass | pass |
+| workspace tests | 3025 passed, 0 failed | 3102 passed, 0 failed (3104 on `86d0163`) | 3100 passed, **1 failed** (`mount_state_dir`, a 120 s pipe-full hang; 5 of 5 reruns; same on `86d0163`) | 3145 passed, 0 failed | 3144 passed, 0 failed | 3169 passed, 0 failed |
+| conformance | vfs kit 55 + 12 passed; engine target 92 passed, 0 failed, 0 skipped | vfs 67 passed; engine 92 / 0 / 0 | vfs 55 + 12; engine 2 test functions passed | vfs 55 + 12; engine 92 / 0 / 0 | vfs kit 92 / 0 / 0; engine 2 passed | vfs 55 + 12; engine 2 passed |
+| smoke, integration | pass, pass | pass, pass | pass, pass | pass, pass | pass, pass | pass, pass |
+| `linux-fuse` | **199 passed, 15 skipped, 11 failed** | **221 passed, 5 failed**, 0 skipped | **209 passed, 2 failed, 15 skipped** | **226 / 226** | **210 passed, 1 failed, 15 skipped** | 73 of 73 targeted scenarios passed |
+| `linux-fuse-process` | **198 passed, 15 skipped, 12 failed** | **220 passed, 6 failed**, 0 skipped | **209 passed, 2 failed, 15 skipped** | **226 / 226** | **211 passed, 0 failed, 15 skipped** | the same 73 passed |
+| parity | unit tests 31 OK; **FAIL**, 23 violations (all scenario failures) | unit tests 33 OK; **FAIL**, 11 violations (all scenario failures) | **FAIL**, 4 violations | pass ("every lane matches the reference on every scenario") | **FAIL**, 1 violation (`delegate-handoff-renewal`) | not rerun |
+| pjdfstest | 8798 / 8798, empty baseline | 8798 / 8798 (also on `86d0163`) | 8798 / 8798 (also on `86d0163`) | 8798 / 8798 | 8798 / 8798 | not rerun |
+| perf gate, `vfs-bench` stage | pass | pass | pass | pass | pass | not rerun |
+| perf gate, `bench` rates | below the floor on 4 of 8 | 1 of 8 (`writeback_import_files_per_sec`) | 1 of 8 (the same) | 1 of 8 (the same) | 2 of 8 (`writeback_import_files_per_sec`, `warm_random_read_iops`) | not rerun |
+| `make check-cross` | not run | not verified (the host has no `zig`) | **1 new failure**: `aarch64-apple-darwin constellation-harness`, `SYS_gettid` | not run (no `zig`) | **OK** (macOS workspace ok, 13 Windows library crates ok, no known failures) | not run |
+
+Notes on the table:
+
+- The 15 skips of the workstation runs are environmental and the same 15 in both lanes: `transport-refused-registration`, `transport-enomem-ring`, `transport-abort-while-armed`, `transport-lock-wait-budget` (no FUSE-over-io_uring), the 7 `passthrough-*` scenarios (need `CAP_SYS_ADMIN`) and the 4 `zero-copy-*` scenarios (need Linux 7.3). On the EC2 instance, as root on 7.3 with io_uring, all 226 scenarios ran and none was skipped; those 15 passed in run 4.
+- `stress-ng-fs` passed in both lanes of every run that reached it (EC2: 44 passed, 4 skipped, 0 baselined, 0 failed; workstation: 39 passed, 3 skipped, 0 baselined, 0 failed). `tests/stress-ng-baseline.txt` is empty.
+- Run 4 is the clean full record: both lanes 226 of 226 as root, parity clean, pjdfstest 8798 of 8798, no scenario failed, skipped or was inconclusive, and the five scenarios that failed as root in run 2 and `stress-ng-flap` all passed. The build gates of run 4 used a target directory that was already fresh for the tree, so its clippy and release build were no-ops; run 5 compiled the same tree from scratch.
+- Run 5's only failure, `delegate-handoff-renewal` (`linux-fuse` lane: "upgrade refused: the daemon closed the connection"), was an upgrade that had happened whose answer the exec cut off. It passed in the process lane. It is fixed by `0bb90d4` (below); run 6 ran it 10 of 10 on `12fe351`, and 73 of 73 targeted scenarios passed in both lanes.
+- Run 6 selected every scenario whose name contains snap, handover, upgrade, handoff, delegate, backup, lease, lock, failover, deposed, takeover or slow-s3, plus `stress-ng-fs`, `stress-ng-flap`, `fio-blips`, `git-under-flock`, `e2e-basic` and `e2e-two-nodes`, in each lane as one `harness run` (about 1 h 15 min each), and looped `delegate-handoff-renewal`, `session-handover-idle` and `snapshot-takeover-idle` 10 times each (10 of 10, all three). Parity, pjdfstest and the perf gate were not rerun, and neither was the full matrix: after `975b494` the full matrix has not been run. `4537353` (the handed-over node closes its P2P connections) and the changes between `975b494` and `12fe351` carry their own test and scenario results in their entries.
+- Run 1 ran before any of the fixes below, so its column is history: 11 and 12 scenarios failed, and the causes are in the next table.
+
+#### What the runs found, and the fixes
+
+Only the fixes that answer a finding of a gate run are listed; the commit message of each has the mechanism and the before and after.
+
+| Finding | Seen in | Fix |
+|---|---|---|
+| `git-under-flock` and its five variants, `lock-failover` and `lock-holder-killed-contention` hung until the FUSE connection was aborted: a `flush` sent from inside the caller's `execve` waited on a `/proc/<pid>/stat` read, which on a kernel that has `6650527444da` but not `e780259b54e6` (the 7.0 distribution kernel) waits for that same exec | run 1, both lanes | `b724d37`: a close sent from inside its caller's `execve` is answered; a process is named by its pidfd inode on kernels with pidfs, so naming a caller waits for nothing a task holds |
+| `csi-credential-revocation`: the refusal of a revoked key pair no longer named `InvalidAccessKeyId` (`serve --create` asks `meta.json`'s existence with a `HEAD`, whose refusal has no body) | run 1, both lanes | `b3260bf`: a refused existence check asks again with a `GET` and names S3's reason |
+| The nightly `harness` job did not install the native versitygw that `csi-credential-revocation` needs in every lane | found in run 2 | `8b19f4b` |
+| `mount_state_dir` (CLI test) and `log-retention-gap-follower` / `-taker`: a child with piped output blocked once the pipe was full (a new pipe held 8 KiB, not 64 KiB, with the user's pipes past `pipe-user-pages-soft`) while the parent waited for its exit | run 3 | `630d1a0`: every site that waited for a child before reading its pipes now reads them while it runs (audit of all 36 `Stdio::piped()` lines; one was production code, the upgrade's preflight) |
+| `visibility-after-burst`: a backstop probe that beat a live stream made 17 S3 tail GETs (bound 4) | run 3, process lane | `7441c47`: such a probe is followed by one GET |
+| `make check-cross` failed for the harness on `aarch64-apple-darwin` (`SYS_gettid`) | run 3 | `b9d0a4e`: the thread id goes through `constellation_platform` |
+| Five scenarios failed every time as root and passed as a user (`snapsched`, `snapsched-budget`, `snapsched-write-overhead`, `holder-publishes-log-prefix-backup`, `s3-cut-create-holder-restart`): they wait for a lease that, unprivileged, the mount's root-owner adoption takes as a side effect, and as root only the first mutation takes. Not a product bug | run 2, both lanes | `975b494`: the scenarios take the lease themselves (`take_root_lease`) |
+| `stress-ng-flap` (and `fio-blips`, same setup) failed once in the process lane as root: the first S3 cut landed before the lease was held, and a lone node with no lease is refused `EROFS` after its grace | run 2 | `25a6627`: both hold the lease before they flap S3 |
+| A flaky FUSE adapter wire test, `entry_invalidations_are_written_only_for_names_the_kernel_may_hold`: the adapter, not the test, was wrong (a failed entry request still counted as in flight when its error reached the kernel) | around runs 2 and 3 | `86d0163` |
+| `snapsched-write-overhead` ("the root lease moved during fio run"): a busy host sealed a live holder, and a backup dropped healthy backups per lapse | run 1 | `0228149` (the holder's heartbeat on a thread and a lane of its own; watches count silence in their own attentive time), `ce4c1ec` (a lagging backup or holder no longer costs a reconfiguration); passed in runs 3 to 5 (also as root in run 4) |
+| `delegate-backup-handoff-failover` and `delegate-root-blackhole`: a write + fsync took 14.5 s across the root's loss against an 8 s bound | runs 1-2 | not a regression: plan 41 L0 (`9d00417`) made the successor's quarantine (1.5 + read ttl 5 + reclaim horizon 6 + 2 s) unconditional, and the scenarios' fixed 8 s bound predated it; `516f82e` derives the bound from the configured timings and checks the logged `wait_ms` (the load-campaign tooling's F4); passed from run 3 on |
+| `snapsched` failed its monotonicity check under host load (`froze counter 170 after 271`): a follower that became the holder froze the stale parent it had adopted at its restart | host-load testing after run 4 (its tree does not hold the fix) | `7fc8ef1`: a snapshot freezes the chain head the follower followed. The false seal that exposed it: `5778d8b` |
+| Unformatted line in the store-stall hook | runs 2 to 5 | `8858111` |
+| `own_flock_is_found_and_live` failed twice under load (the flock outlives the dropped descriptor until a sibling test's forked child execs) | workspace tests under load | `677a789`: waits for the release |
+| `snapsched-write-overhead`'s fio left `local-run*-verify.state` files in the checkout (root-owned when the lane ran as root) | runs 4 and 5 | `be53974` |
+| `delegate-handoff-renewal`: the answer to `node.handoff` was lost when the exec closed the control connection first, and `daemon --upgrade` reported "upgrade refused" for an upgrade that had happened | run 5 | `0bb90d4`: a call that ends unanswered is no refusal; the upgrade goes by the daemon's status |
+| Looping the same scenario then showed the first write of every resumed delegate waiting 2.0 to 2.7 s for the root's restart probe (the scenario's 3 s bound hid it) | after run 5 | `4537353`: a handed-over node closes its P2P connections before the exec (0.2 ms idle, 9 ms at load 17 after); the scenario's bound is 1.5 s. Its K5 part is not verified, see the follow-ups |
+| Load-induced flakes of unit tests fixed on the way, in the same families (a close in `execve` against a held environment lock, a lost `view.unmount` answer, a clock read inside the test, a write halt holding back every commit) | workspace tests under load | `fff2ef4`, `02e46cb`, `a932dde`, `28c8c7f` (entries "Fix: no CLI test changes the process environment…", "…a lost `view.unmount` answer…", "…the drain's handoff recheck…", "…a write halt holds back only its own writer…") |
+
+Landed meanwhile and not gate findings: plan 43's takeover-loss, seed, fencing-token, errno and margin-seal fixes (`b4fe2e6`, `05de21d`, `07aad0b`, `212b7ee`, `4eedfc9`, `da4124c`, `0344ead`, `8126f51`, `5778d8b`, `12fe351` and their tests and scenarios); their entries are "Fix: two deposed-root bugs of `long-delegated-late-answers`", "Fix: a folded truncate and a refused replay settle their rid in the log", "Fix: a deposed root's replay does not wait for rows of a generation the log ended", "Fix: nothing of a taking-over delegate executes between its gate's strand and its replay", "Fix: the two application-visible `EIO` shapes of `load-probe-takeover`" and "Fix: a backup sealed a live holder at the edge of its lease" above.
+
+#### The performance floors
+
+Decision of the maintainer, 2026-10-17: the `bench` floors in `tests/perf-baseline.json` come from a faster host, and the misses of the gate runs are the host. `writeback_import_files_per_sec` missed its floor (1573) in every run that ran the stage: 727 in run 1, 1473 and 1456 in run 2, 1434 in run 3, 1500 and 1436 in run 4, 1431 in run 5; `warm_random_read_iops` missed in run 1 (769 k) and run 5 (1.126 M against a floor of 1.153 M; 1.160 M, 0.6 % above, in run 3); run 1 also missed `writeback_durable_files_per_sec` (593) and `metadata_walk_files_per_sec` (62.5 k). A same-host A/B on the workstation (336 interleaved runs of `harness bench`, both backends, the load below 4 at each start, ABBA order, Mann-Whitney) measured the commit that last changed the baseline file and main alike: writeback import about 570 (versitygw) and 720 (floci) files per second on both, writeback durable 430 to 600, warm random read 763 k on both. Even the commit that created the baseline misses three of those metrics on that host (the baseline host is roughly twice as fast at write-back and 1.6 times at warm random reads). So the misses are recorded with that evidence and **are not counted against closing**. `vfs-bench` passed in every run, with a per-op overhead of 44 to 213 ns against 1000 ns and allocations at the ceilings (`view/getattr` 3 of 4, `view/lookup` 11, `view/read` 18, `observer/getattr` 0).
+
+The A/B also found two real regressions between the baseline-file commit and main, on the floci backend:
+
+- `metadata_walk_files_per_sec` fell 21 % at `7d6dcc0` (84.3 k to 66.4 k, p < 1e-28; a 500-file walk 5.8 ms to 7.7 ms), not on versitygw. The cause was not that commit's code: an unprivileged mount runs `fusermount3` through fuser, whose `pre_exec` hook made the standard library fork, and the fork write-protected every private page of the daemon's replica and caches, so the walk's first readdirs took ~1700 minor faults. Fixed by `92e4067` (fuser `f896abd` spawns the helper without fork): 65.5 k to 82.6 k, ~1710 faults to ~70, other metrics within noise on both backends.
+- `cold_read_files_per_sec` fell about 8 to 12 % as a drift over many commits; `92e4067` gave back about 7 %. The residual of about 4 % is the lookup's wait for the child's inode (`5e15078`): a correctness cost, since a `stat` by path that missed the kernel's caches answered a row from before a commit the node had acknowledged. Accepted.
+
+Follow-up, not blocking: re-baseline `tests/perf-baseline.json` on the CI runner (the nightly `performance` job is the judge, as "Plan 31 C7b" said).
+
+#### Open follow-ups (not blocking the close)
+
+- The K5 local-handoff scenarios (`csi-engine-pod-handoff-under-load`, `csi-plugin-restart-survives`) and an `ack=s3` local handoff are to be run before the next CSI gate; `4537353` added the P2P close to `stop_for_local_handoff` without them (no kind cluster on either host), and the call is to be dropped (one line) if either regresses. See the entry "Fix: the first write after every `daemon --upgrade` waited 2 s for the root's restart probe".
+- The CI runner re-baseline of `tests/perf-baseline.json` (above).
+- A delegation is lost to a stuck authority core under a disk stall (`b's generation 1 did not survive the handoff`, found by the same loop as `4537353`), and the question of a non-blocking log writer: both wait for the maintainer's decision.
+- Seed 44's lock-lapse `EIO` (plan 43) is open.
+- The `linux-csi` lane was not part of the gate runs.
 
 ### Plan 31 exit criteria
 
@@ -29286,9 +29359,9 @@ The gates of CONVENTIONS plus plan 31's. Every earlier plan 31 section left "Ful
 - [x] The plan text matches the tree: stale names and signatures corrected, design history annotated "As built" or "Superseded"
 - [x] The contradictions with `DESIGN.md` are recorded here, and the spec was not edited
 - [x] The C0 baseline decision is recorded (Decisions)
-- [ ] The five in-progress items above landed, with their results recorded
-- [ ] The closing gate run recorded, with the earlier sections' "Full gates" items ticked
-- [ ] `docs/plans/v1/wip/31-core-frontend-backend.md` moved to `docs/plans/v1/done/` after the two items above
+- [x] The five in-progress items above landed, with their results recorded (the table above; the gate run in "Closing gate run")
+- [x] The closing gate run recorded, with the earlier sections' "Full gates" items ticked ("Closing gate run"; the perf floors are recorded there as a host difference and not counted against closing)
+- [x] `docs/plans/v1/wip/31-core-frontend-backend.md` moved to `docs/plans/v1/done/` after the two items above (2026-10-18)
 
 ## Plan 38 Z0a — FUSE-over-io_uring session handover spike
 
@@ -47483,7 +47556,7 @@ keeps its Linux-only `AT_EMPTY_PATH` helper behind `cfg` with its stub.
 
 ## Plan 31 closing: conformance and asserts
 
-Three of the closing items of [plan 31](wip/31-core-frontend-backend.md) ("Plan 31 closing", Remaining items): the engine conformance target runs its `cancellation` and `invalidation` groups, `OpCtx` asserts §6.4's threading contract, and the control browser's ops are counted like a mount's (§6.10, C7a).
+Three of the closing items of [plan 31](done/31-core-frontend-backend.md) ("Plan 31 closing", Remaining items): the engine conformance target runs its `cancellation` and `invalidation` groups, `OpCtx` asserts §6.4's threading contract, and the control browser's ops are counted like a mount's (§6.10, C7a).
 
 ### Conformance: the engine target runs every test
 

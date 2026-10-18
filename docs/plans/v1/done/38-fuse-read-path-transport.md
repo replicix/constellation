@@ -481,7 +481,7 @@ verified against the vendored source, not assumed"): test coverage (the
 Skory fork's own suite — 44–47 unit tests, pjdfstest parity, REPORTED —
 re-run against *our* vendored copy, not trusted from the README), pjdfstest
 parity specifically (does it stay 8798/8798 against a real kernel, the same
-bar C4 and C7 hold, `docs/plans/v1/wip/31-core-frontend-backend.md` §15
+bar C4 and C7 hold, `docs/plans/v1/done/31-core-frontend-backend.md` §15
 items 4–5), and code size/shape (how much of it is a clean lift into
 `vendor/fuser`'s existing layout versus a rewrite against this plan's own
 `NegotiatedInit`/`Transport` extension). **Vendor-vs-rewrite is decided at
@@ -1521,7 +1521,7 @@ updated), plus, per milestone (cumulative):
 | `docs/plans/v1/PROGRESS.md` on `main`, "## Chunk memory cache" and "## Plan 31 C7b" sections | The memcache's design/measurements (§1, §2.1 row 4), the deferral/Mountpoint-candidate findings this plan reconciles with (§2's "Reconciling with C7b") | VERIFIED |
 | `docs/plans/v1/CONVENTIONS.md` | Gates, reporting format, harness scenario checklist (§6, §7, §9) | VERIFIED (this repo, `main`) |
 | `docs/plans/v1/done/37-kubernetes-csi.md` (lines 1–120) | Style template, VERIFIED/REPORTED convention, the K0 re-verification precedent §3(a)/§7 follow | VERIFIED (this repo, `main`) |
-| `docs/plans/v1/wip/31-core-frontend-backend.md` §6.2, §6.4, §6.6, §6.9, §6.11, §11 (C4, C7), §14, §15 | The `Vfs`/`Responder`/`FrontendCaps`/threading contract this plan builds on (§3), the session-handover design and risk (§3(e)), the perf-target and DoD style (§4, §9) | VERIFIED (this repo, `main`) |
+| `docs/plans/v1/done/31-core-frontend-backend.md` §6.2, §6.4, §6.6, §6.9, §6.11, §11 (C4, C7), §14, §15 | The `Vfs`/`Responder`/`FrontendCaps`/threading contract this plan builds on (§3), the session-handover design and risk (§3(e)), the perf-target and DoD style (§4, §9) | VERIFIED (this repo, `main`) |
 | kernel.org, `fs/fuse/dev.c` (`torvalds/master`), the 6.14 FUSE-io_uring kernel doc, the 7.3 FUSE pull request | §2.1 rows 1–2's splice/vmsplice mechanism, §2.4's kernel version gates, §3(a)/§3(d)'s transport/zero-copy mechanism | VERIFIED (per the research notes' own primary-source citations) |
 | `bench/fuse-uring-handover/RESULTS.md`, `results/summary-tables.md`, `results/*/summary.jsonl` (this repo) | §3(e)'s handover findings and decision, §6's refusal scenario, §7 Z0a's result, §8's handover risk | VERIFIED (Z0a's own run, 2026-09-30, three kernels) |
 | `fs/fuse/dev_uring.c`, `dev.c` at `gregkh/linux` `v6.17.13`, `v7.0.14` and `torvalds/linux@165768bb7026` (= `v7.3-rc5` for `dev_uring.c`): `fuse_dev_release`, `fuse_uring_cancel`, `fuse_uring_do_register`, `fuse_uring_register`, `fuse_uring_cmd`, `fuse_uring_queue_fuse_req`, `fuse_uring_ent_avail`, `fuse_uring_next_fuse_req`, `fuse_uring_commit`, `fuse_uring_send_in_task`, 7.3's `fuse_uring_add_queue`/`add_bufpool` | §3(e)'s mechanisms (why (a)/(b)/(c) come out as they do), with line numbers per version in RESULTS.md | VERIFIED (read before the run, predictions confirmed by it) |
