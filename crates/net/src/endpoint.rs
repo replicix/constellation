@@ -1624,6 +1624,40 @@ impl P2p {
         self.pool.close_all(why).await
     }
 
+    /// A node that hands its identity to a successor process (the
+    /// in-place upgrade's `exec`, the local handoff's exit) says goodbye:
+    /// refuse new inbound connections and gossip, close every connection
+    /// with a close frame ([`Self::close_all`]), then close the endpoint,
+    /// which closes what is left (the liveness lane's connections are not
+    /// pooled, `Pool::tracked`) and waits for the peers' acknowledgements.
+    /// The endpoint is unusable afterwards.
+    ///
+    /// Without it the old image's UDP socket just disappears with the
+    /// process: no peer is told, and each keeps its pooled connection to
+    /// the dead incarnation. The successor has the same node key (the same
+    /// `EndpointId`) on a new port, and a peer that sees it dial in afresh
+    /// only *suspects* a restart (`Suspicion::Restarted`): it keeps
+    /// sending over the old connection until its probe window
+    /// (`RESTART_PROBE_WINDOW`, 2 s) closes it. A peer's answer to the
+    /// successor's first request (a delegation's first renewal, say) goes
+    /// into the dead connection and is lost, so that request waited out the
+    /// window. A closed connection is dropped by the pool at once and with
+    /// no connection left iroh forgets the dead address, so the peer's
+    /// next dial reaches the successor. For a crash nothing can be said,
+    /// and the probe stays; for a planned handover the old image is alive
+    /// until the `exec`.
+    ///
+    /// `Endpoint::close` can take seconds when a peer does not answer;
+    /// callers bound it. A plain daemon exit could say goodbye the same
+    /// way. Returns the connections [`Self::close_all`] closed.
+    pub async fn close_for_successor(&self) -> usize {
+        self.set_accept_inbound(false);
+        self.set_gossip(false);
+        let closed = self.pool.close_all("handed over").await;
+        self.endpoint.close().await;
+        closed
+    }
+
     /// Plan 31 C8 / plan 36 settled decision 20: the host says the
     /// network changed (an interface, a route, Wi-Fi to cellular); iroh
     /// re-probes its paths now instead of when it next notices.

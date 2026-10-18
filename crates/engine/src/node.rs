@@ -367,6 +367,14 @@ pub struct Engine {
 /// takeover this much later than the backup's usual budget.
 pub const LOCAL_HANDOFF_BACKUP_HOLD: Duration = Duration::from_secs(15);
 
+/// The longest a node handing its identity to a successor waits for its
+/// peers to acknowledge the close of its P2P connections
+/// ([`Engine::close_p2p_for_successor`]). The close takes a fraction of a
+/// millisecond to a few milliseconds when the peers answer (0.3 ms for 4
+/// connections measured); a peer that does not is left to its restart
+/// probe, as before.
+const SUCCESSOR_CLOSE_BUDGET: Duration = Duration::from_millis(500);
+
 impl Engine {
     /// Open what [`Self::start`] can open without the state dir (see
     /// [`Preopened`]) — for plan 37 §8's standby, which may not touch the
@@ -2101,12 +2109,59 @@ impl Engine {
     /// writer (applications still hold those files open, across the
     /// handover). The replica is synced to disk last: the process may
     /// `exec` rather than exit, and nothing is dropped then.
+    ///
+    /// Every P2P connection is closed last, with a close frame
+    /// ([`Self::close_p2p_for_successor`]): the new image has this node's
+    /// identity on a new port, and a peer that is not told keeps answering
+    /// into the old connection for its 2 s restart probe.
     pub fn shutdown_for_handover(&self) -> Result<()> {
         let result = self.shutdown_inner(false);
         if let Err(error) = self.meta.sync() {
             tracing::warn!(%error, "syncing the replica before the handover failed");
         }
+        self.close_p2p_for_successor();
         result
+    }
+
+    /// Say goodbye on P2P before the process gives its node identity to
+    /// a successor (the in-place upgrade's `exec`, the local handoff's
+    /// exit): every connection is closed with a close frame and the
+    /// endpoint closed ([`constellation_net::Peers::close_for_successor`]),
+    /// so each peer drops its pooled connection to this incarnation now and
+    /// its next request reaches the successor, instead of the successor's
+    /// first request waiting for the peer's answer into the dead connection
+    /// until its 2 s restart probe (a delegation's first renewal after a
+    /// resume: 2.0-2.7 s before). Bounded by [`SUCCESSOR_CLOSE_BUDGET`]; a
+    /// peer that does not acknowledge in time is left to its probe. Nothing
+    /// is sent or accepted on P2P afterwards, so call it once nothing needs
+    /// it. A plain daemon exit could say goodbye the same way (not done:
+    /// there is no successor whose first request waits).
+    pub fn close_p2p_for_successor(&self) {
+        if !self.peers.is_enabled() {
+            return;
+        }
+        let peers = self.peers.clone();
+        let started = Instant::now();
+        let closed = self.rt.block_on(async move {
+            tokio::time::timeout(SUCCESSOR_CLOSE_BUDGET, peers.close_for_successor())
+                .await
+                .ok()
+        });
+        let took_ms = started.elapsed().as_millis() as u64;
+        match closed {
+            Some(closed) => {
+                tracing::info!(
+                    closed,
+                    took_ms,
+                    "closed every P2P connection for the successor"
+                )
+            }
+            None => tracing::warn!(
+                took_ms,
+                "peers did not acknowledge the close of their P2P connections in time; \
+                 they fall back to probing this incarnation"
+            ),
+        }
     }
 
     /// Stop for a handoff to a **successor on this very state dir**, with
@@ -2140,6 +2195,22 @@ impl Engine {
     /// started, longer than a backup's takeover budget, and a backup that
     /// sealed the epoch meanwhile would leave the successor without one
     /// (`PeerMsg::BackupHold`). Returns the backups that confirmed.
+    ///
+    /// Last, every P2P connection is closed with a close frame
+    /// ([`Self::close_p2p_for_successor`]): the successor has this node's
+    /// identity, and its first request would otherwise wait for a peer's
+    /// answer into the dead incarnation's connection (the peers' 2 s
+    /// restart probe). The exit that follows is silence to the backups
+    /// holding their seal watch either way, and a closed connection is
+    /// nothing more than that to them. One consequence: under `ack=s3`, a
+    /// peer with no live log-stream subscription decides the holder's
+    /// liveness on link state alone, so its takeover clock now starts at
+    /// this close rather than when the dead connection was noticed (3-30 s
+    /// later): it may take the lease about 1.5 s after the handoff, before
+    /// the successor serves. That is fenced by the log-slot CAS (latency,
+    /// not safety); the K5 local-handoff scenarios and an `ack=s3` local
+    /// handoff must be run before the next CSI gate, and this call dropped
+    /// if they regress.
     pub fn stop_for_local_handoff(&self) -> Result<Vec<u64>> {
         let held = self.hold_backups_for_handoff();
         self.shutdown_started.store(true, Ordering::SeqCst);
@@ -2153,9 +2224,17 @@ impl Engine {
             backups_holding = ?held,
             "stopping for a handoff on this state dir: the successor ships what is left"
         );
-        self.meta
+        let synced = self
+            .meta
             .sync()
-            .context("syncing the replica before the handoff")?;
+            .context("syncing the replica before the handoff");
+        // A closed connection is silence to the backups holding their seal
+        // watch, as the exit that follows is (`BackupHold` extends
+        // `last_heard`; no link event moves a backup). It lets every
+        // other peer drop this incarnation now, so the successor's first
+        // request is answered at once.
+        self.close_p2p_for_successor();
+        synced?;
         Ok(held)
     }
 
@@ -2945,6 +3024,103 @@ mod tests {
             "no views once shutting down"
         );
         assert_eq!(engine.shutdown_error(), None);
+    }
+
+    /// Two P2P engines on one backend, `a` with a pooled connection to
+    /// `b`; `b` hands its identity over with `how`. Returns how long
+    /// `a`'s pooled connection to `b` stayed open afterwards (`None`: it
+    /// still was after 3 s).
+    fn closed_after_handover(how: fn(&Engine)) -> Option<Duration> {
+        let root = tempfile::tempdir().unwrap();
+        let backend = format!("file://{}/backend", root.path().display());
+        let runtime = || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let (rt_a, rt_b) = (runtime(), runtime());
+        create_fs(&rt_a, &backend);
+        let start = |rt: &tokio::runtime::Runtime, state: &str| {
+            // Each node its own key (the host's secret store is the default
+            // key's home, and one process's engines would share it).
+            let host = HostServices {
+                secrets: Arc::new(constellation_platform::FileSecretStore::new(
+                    root.path().join(format!("{state}-secrets")),
+                )),
+                ..HostServices::native()
+            };
+            Engine::start(
+                config(rt, &backend, root.path().join(state)),
+                host,
+                EngineProfile::desktop(),
+            )
+            .expect("Engine::start")
+        };
+        let a = start(&rt_a, "state-a");
+        let b = start(&rt_b, "state-b");
+        // The registry poll (5 s in the daemon), at once.
+        for engine in [&b, &a] {
+            engine.runtime().block_on(crate::p2p::refresh_peers(
+                engine.peers(),
+                engine.store().inner().clone(),
+                None,
+            ));
+        }
+        let b_id = b.node_id();
+        assert!(
+            rt_a.block_on(a.peers().ping_node(b_id)),
+            "a reaches b over P2P"
+        );
+        assert!(
+            rt_a.block_on(a.peers().connection_alive(b_id)),
+            "a pooled its connection to b"
+        );
+
+        how(&b);
+        let handed_over = Instant::now();
+        let mut closed = None;
+        while handed_over.elapsed() < Duration::from_secs(3) {
+            if !rt_a.block_on(a.peers().connection_alive(b_id)) {
+                closed = Some(handed_over.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        a.shutdown().expect("a shuts down");
+        closed
+    }
+
+    /// The upgrade's drain ends with a goodbye on P2P: the peer's pooled
+    /// connection to the old image is closed by a close frame, now, not
+    /// dropped by its 2 s restart probe once the successor dials in (a
+    /// delegate's first renewal after the `exec` waited that out). Without
+    /// the close it stays open for the QUIC idle timeout.
+    #[test]
+    fn a_handover_drain_closes_the_peers_connections_at_once() {
+        let closed = closed_after_handover(|engine| {
+            engine.shutdown_for_handover().expect("the drain");
+        })
+        .expect("a's pooled connection to b was still open 3 s after the handover");
+        assert!(
+            closed < Duration::from_millis(200),
+            "a's pooled connection to b closed {closed:?} after the handover"
+        );
+    }
+
+    /// The same for the local handoff (37-k5a), whose process exits
+    /// right after: the exit's silence would leave every peer probing.
+    #[test]
+    fn a_local_handoff_stop_closes_the_peers_connections_at_once() {
+        let closed = closed_after_handover(|engine| {
+            engine.stop_for_local_handoff().expect("the handoff stop");
+        })
+        .expect("a's pooled connection to b was still open 3 s after the handoff");
+        assert!(
+            closed < Duration::from_millis(200),
+            "a's pooled connection to b closed {closed:?} after the handoff"
+        );
     }
 
     /// Plan 37 §8 (37-k5a): `stop_for_local_handoff` drains nothing, and a

@@ -2341,9 +2341,13 @@ relay of its own so requests can be attributed per role):
       - `delegate-handoff-renewal`: `b` runs `daemon --upgrade` three
         times under the writer. The resumed image keeps the generation
         (the same one on both sides, nothing reclaimed or recalled, no
-        `NotHolder` bounce at `a`) and its create + close stay within
-        3 s (or twice the control's on a loaded host). Before the fix
-        the root outwaited the grant and the first write took 7 s.
+        `NotHolder` bounce at `a`) and its create + close, and a whole
+        write across the upgrade less the upgrade's own time, stay
+        within 1.5 s (or twice the control's on a loaded host). The old
+        image closes its P2P connections before the `exec`; before that
+        the root answered the first renewal into the dead incarnation's
+        connection and the first write waited 2.0-2.7 s for its restart
+        probe, and before the re-adoption, for the grant (7 s).
       - `delegate-backup-handoff-failover`: `b` (the backup) runs
         `daemon --upgrade` first. `a` drops it across the restart gap;
         `b` must not seal `a`'s live epoch, and `a` must list it again

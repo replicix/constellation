@@ -373,9 +373,16 @@ designations create no delegation.
   it starts, renews them at once, and re-streams its unappended rows
   from the log's index. Its writes wait for that first renewal (one
   round trip), not for the root to reclaim the grant, which used to
-  hold them for about the grant's ttl (`delegate-handoff-renewal`). A
-  generation that ended meanwhile is refused at the renewal and dropped
-  when the log says so.
+  hold them for about the grant's ttl (`delegate-handoff-renewal`). For
+  that, a planned handoff (`daemon --upgrade`, the local handoff of an
+  engine pod) closes every P2P connection with a close frame after its
+  drain and before the `exec` or exit, so the root's answer travels over a
+  fresh connection to the successor; before, the root answered into its
+  pooled connection to the dead incarnation until its 2 s restart probe
+  evicted it, and the first write after every resume waited 2.0-2.7 s.
+  After a crash nothing says goodbye, and the probe still bounds the
+  wait. A generation that ended meanwhile is refused at the renewal and
+  dropped when the log says so.
 - **Root dies and the delegate is no backup** (no backup in budget, or
   the root dropped it before it died): only a TTL takeover replaces the
   root. The delegate's grant lapses unrenewed (above), its writes take

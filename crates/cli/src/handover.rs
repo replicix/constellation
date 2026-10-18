@@ -49,10 +49,16 @@
 //!    and open-orphan claims left in place), then the node shuts down
 //!    exactly as a clean unmount does — dirty chunks uploaded, the journal
 //!    shipped, a metadata commit published, the lease released
-//!    (`Engine::shutdown_for_handover`) — and the replica is synced to
-//!    disk. A drain that cannot finish (S3 down) leaves its journal and
-//!    pending rows on disk, which the new image ships, exactly as a
-//!    remount's; nothing is lost, since the state dir is the same.
+//!    (`Engine::shutdown_for_handover`) — the replica is synced to disk,
+//!    and every P2P connection is closed with a close frame, bounded at
+//!    500 ms (peers drop their pooled connections to this image and
+//!    re-dial the new one at once; left open, the socket just vanishes
+//!    with the `exec` and a peer keeps answering into the dead
+//!    incarnation until its 2 s restart probe — a delegate's first write
+//!    after every resume waited that out). A drain that cannot finish
+//!    (S3 down) leaves its journal and pending rows on disk, which the
+//!    new image ships, exactly as a remount's; nothing is lost, since the
+//!    state dir is the same.
 //! 5. **`exec`** the new binary, `constellation daemon --resume-from <fd>`,
 //!    `<fd>` a memfd holding [`DaemonHandoff`] (JSON). The FUSE
 //!    descriptors, the lock, the control listener and a descriptor of the

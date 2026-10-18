@@ -49137,3 +49137,152 @@ this seal exposed is the `snap-head` entry above.
   the highest expiry the queued beats named, as the bridge's do, and the
   beats' loss ends with the lag. Test
   `a_backup_frozen_with_its_holders_lease_at_the_margin_does_not_seal_it`.
+
+## Fix: the first write after every `daemon --upgrade` waited 2 s for the root's restart probe (delegate-handoff-renewal, 2026-10-18)
+
+Looping `delegate-handoff-renewal` on the plan-43 build box (idle and under
+load) showed that the first create of a resumed delegate takes 2.0-2.7 s,
+every time: 30 of 30 rounds idle, 29 of 30 under `stress-ng --cpu 16` (the
+30th was a wait that fell on a write's `fsync`), on `12fe351`. The scenario's
+3 s bound (sized for the grant's old reclaim wait) hid it; under load the
+extra seconds crossed it. `delegations.md` "Failures" promised one round
+trip.
+
+### Cause
+
+`hand_over` drains (`Engine::shutdown_for_handover`) and `exec`s. The iroh
+endpoint is never closed: the UDP socket goes with the old image, no
+CONNECTION_CLOSE is sent, and the new image binds a new endpoint under the
+same node key (the same `EndpointId`, a new port). The root keeps its
+pooled QUIC connection to the dead incarnation. Per `Pool`'s design
+(`c876080`, the same-identity restart fix above) a peer that dials in afresh
+is only a *suspicion* (`Suspicion::Restarted`): the pooled connection gets
+`RESTART_PROBE_WINDOW` (2 s) to show a datagram before it is evicted, and
+every other connection to the peer with it (iroh keeps sending a new
+handshake to the dead incarnation's address while any connection to the
+`EndpointId` is open). That is right after a crash, where nothing told the
+peer, and needless for a planned handover, where the old image is alive
+until the `exec`.
+
+The re-adopted delegation's first renewal is sent as the new image starts
+(`f3052f4`), and its writes park until that renewal's answer
+(`honoured=false`). The root grants it within 1 ms (`delegation renewal
+node=1 from=2 gen=1`), but `DelegRenewed` is a `one_way` over the pooled
+connection to the dead incarnation and is lost; the delegate re-sends every
+500 ms (`deleg_request_timeout_ms`), each answer lost the same way, until
+the root's probe evicts the connection 2.00 s after the new incarnation
+dialed in, and the next answer dials afresh. Debug logs (`idle1` run): the
+renewal granted at 36.348, the parked create at 36.370, `pooled P2P
+connection is dead ... why=Restarted window_ms=2000 closed=5` at 38.355,
+the create executed 1 ms after. Not the cause (checked): the session
+(resumed in 7 ms), the replica (23 ms), the lease (the delegate holds none),
+the store (no slow commit or step), and any hold of the root's answer (it
+logs each grant within 1 ms of the send).
+
+### What changed
+
+- `P2p::close_for_successor` / `Peers::close_for_successor` (`constellation-net`):
+  refuse inbound and gossip, close every connection with a close frame
+  (`Pool::close_all`), then `Endpoint::close`, which also closes what the
+  pool does not track (the liveness lane's connections) and waits for the
+  peers' acknowledgements. A closed connection is dropped by the pool at
+  once (`Pool::probe`: `close_reason().is_some()`) and, with no connection
+  left to the `EndpointId`, iroh forgets the dead address, so the peer's
+  next dial reaches the successor.
+- `Engine::close_p2p_for_successor`: that, bounded by
+  `SUCCESSOR_CLOSE_BUDGET` (500 ms; a peer that does not acknowledge is left
+  to its probe, as before; INFO with `closed` and `took_ms`, WARN when the
+  budget ran out). Called at the end of `Engine::shutdown_for_handover` (the
+  drain before it released the lease, so no backup seals anything; the
+  upgrade's `exec` follows, and the rollback path `exec`s or exits, so
+  nothing needs P2P afterwards) and of `Engine::stop_for_local_handoff`
+  (see below).
+- `stop_for_local_handoff` is the same situation for the peers: the
+  successor is the same identity on a new process, and the exit 50 ms later
+  leaves the sockets silent. What differs is that the lease is kept and the
+  backups hold their seal watch (`BackupHold`); that hold extends the
+  backup's `last_heard`, and no link event moves a backup's seal watch (the
+  only reader of a holder's link state is the `ack=s3` subscribers' fast
+  takeover, `core/backup.rs`, which a vanished connection also feeds,
+  later, at the idle timeout). **The K5 local-handoff scenarios
+  (`csi-engine-pod-handoff-under-load`, `csi-plugin-restart-survives`) could
+  not be run: the build box has no kind cluster.** The call is covered by an
+  engine test and kept; run those two before merging, and drop the call
+  from `stop_for_local_handoff` (one line) if either regresses.
+- The harness: `HANDOFF_BOUND` 3 s to 1.5 s (one round trip after the
+  re-adoption plus host load; 1.5 s separates the two populations
+  measured: 2.0-2.7 s before, 0.4 ms idle and 11 ms at load 17 after), and
+  the longest whole write across the upgrade, less the upgrade's own
+  duration, is bounded the same way, so a wait that lands on a write's
+  `fsync` rather than its create is caught (idle1 round 1).
+- Docs: `delegations.md` "Failures" (*Delegate restarts or is handed off*),
+  `handover.rs` step 4, TESTING.md, the doc comments of
+  `close_for_successor`, `shutdown_for_handover`, `stop_for_local_handoff`.
+  A plain daemon exit could say goodbye the same way; not done (no successor
+  whose first request waits).
+- Follow-up, open: under `ack=s3`, a peer with no live log-stream
+  subscription judges the holder on link state alone, so after a local
+  (K5) handoff its takeover clock starts at the close instead of when the
+  dead connection was noticed (3-30 s later) and it may take the lease
+  ~1.5 s after the handoff, before the successor serves (fenced by the
+  log-slot CAS: latency, not safety). The K5 local-handoff scenarios
+  (`csi-engine-pod-handoff-under-load`, `csi-plugin-restart-survives`) and
+  an `ack=s3` local handoff were not run (no kind cluster on the test
+  host): run them before the next CSI gate and drop the close in
+  `stop_for_local_handoff` if they regress. Watch item: the scenario's
+  whole-write bound now includes the `fsync`'s chunk upload; if it flakes
+  on an S3 hiccup, bound only the metadata part.
+
+### Measurements
+
+First create + close after the resume (the longest metadata part of a
+write after `daemon --upgrade` returned), `delegate-handoff-renewal`, 3
+rounds per run, release build, 16-core box, `12fe351` against this change:
+
+| conditions | build | rounds | min / p50 / p90 / max | over 1 s | longest write across the upgrade (p50 / max) |
+|---|---|---|---|---|---|
+| idle | stock | 30 | 1986 / 2052 / 2487 / 2549 ms | 30 of 30 | 2062 / 2615 ms |
+| idle | fix | 30 | 0.2 / 0.2 / 0.3 / 0.4 ms | 0 | 56 / 78 ms |
+| `stress-ng --cpu 16` (load 17) | stock | 30 | 10 / 2136 / 2170 / 2593 ms | 29 of 30 | 2153 / 2608 ms |
+| `stress-ng --cpu 16` (load 17) | fix | 30 | 4.1 / 9.4 / 9.8 / 11.4 ms | 0 | 147 / 217 ms |
+
+The upgrade's own time is unchanged (idle p50 226 ms stock, 224 ms fix).
+The earlier prototype's heavier load (both lanes at once, ~1100 held
+pipes, a cargo build on the same btrfs, load 27-36) measured p90 8-204 ms,
+max 861 ms over 102 rounds, 0 over 1 s. `delegate-backup-handoff-failover`
+(`a` lists `b` again after `b`'s upgrade): 4.2 s stock (3 runs), 3.1-3.3 s
+with the close (3 runs): the peer's link to the new incarnation no longer
+waits for the probe either.
+
+### Tests
+
+- Net `a_handed_over_peer_is_answered_within_a_round_trip`
+  (`same_identity_restart.rs`; the victim child closes on a command and
+  exits, a successor under the same key sends the observer a request at
+  once): the observer's first successful request to the successor 34 ms
+  after the successor's own request arrived (bound 500 ms). With the close
+  turned into a no-op: 2.02 s, the test fails. Its control,
+  `a_handed_over_peer_that_did_not_close_waits_for_the_probe` (the
+  predecessor exits without closing), asserts at least 1.5 s and passes at
+  2.02 s: it documents the probe the close bypasses.
+- Engine `a_handover_drain_closes_the_peers_connections_at_once` and
+  `a_local_handoff_stop_closes_the_peers_connections_at_once` (two P2P
+  engines on one backend, a pooled connection from `a` to `b`, `b` hands
+  over): `a`'s pooled connection to `b` is closed within 200 ms. With
+  `close_p2p_for_successor` a no-op both fail ("still open 3 s after").
+  (`P2p::probes_started` is crate-private, so "no probe started" is not
+  asserted; a probe's eviction takes 2 s, so 200 ms excludes it.)
+- Harness `delegate-handoff-renewal`'s tightened bounds: fail on stock
+  (every round at 2.0-2.7 s idle against 1.5 s), pass with the fix.
+- Gates (box): `cargo fmt --check`, `clippy --workspace --all-targets -D
+  warnings`; net, engine and cli tests; `cargo test --workspace`;
+  harness release, `linux-fuse-process` lane: `delegate-handoff-renewal`
+  10/10 idle and 10/10 under `stress-ng --cpu 16` with the 1.5 s bound,
+  `session-handover-idle` 20/20, `upgrade-under-load` 5/5,
+  `passthrough-handover` 3/3, `delegate-backup-handoff-failover` 3/3.
+
+### Not changed
+
+The delegation lost to a stuck authority core under a disk stall
+(`b's generation 1 did not survive the handoff`, the other finding of the
+same loop) waits for the maintainer's decision.

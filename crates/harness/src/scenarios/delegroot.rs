@@ -43,11 +43,18 @@ const ENV: &[(&str, &str)] = &[
 ];
 
 /// How long a write + `fsync` + close may take right after a handoff of
-/// the delegate. The old image's delegation is re-adopted with the node
-/// identity, so no write waits for the root to reclaim it: that wait was
-/// the grant's ttl (5 s) and its margin, 3.4-4.7 s on kind and up to 7 s
-/// in the harness.
-const HANDOFF_BOUND: Duration = Duration::from_secs(3);
+/// the delegate, beyond the upgrade itself: one round trip after the
+/// re-adoption (the resumed image's first renewal, answered over a fresh
+/// connection), plus host load. The old image's delegation is re-adopted
+/// with the node identity, so no write waits for the root to reclaim it
+/// (that wait was the grant's ttl and margin, 3.4-4.7 s on kind and up to
+/// 7 s in the harness); and the old image closes its P2P connections
+/// before the `exec`, so the root does not answer into the dead
+/// incarnation's connection until its 2 s restart probe evicts it (the
+/// first create waited 2.0-2.7 s for that, every resume). 1.5 s separates
+/// the two: 0.9 s at most measured at a load average of 36, against 2.0 s
+/// and more without the close.
+const HANDOFF_BOUND: Duration = Duration::from_millis(1_500);
 
 /// One write + `fsync` + close: when it started (since the writer's
 /// start) and how long it took.
@@ -734,7 +741,14 @@ fn ensure_delegated(name: &str, a: &Client, b: &Client) -> Result<u64> {
 /// [`HANDOFF_BOUND`], or twice the longest of the writes just
 /// before the upgrade, or the upgrade's own duration, if the host is
 /// slower than that (its load, not a wait on the delegation — that wait
-/// was the grant's ttl and more, and the mechanism checks catch it).
+/// was the grant's ttl and more, and the mechanism checks catch it). The
+/// same bound holds for the longest whole write overlapping the upgrade,
+/// less the upgrade's own duration, so a wait that lands on a write's
+/// `fsync` (the first renewal's answer was 2.0-2.7 s late while the old
+/// image left its P2P connections open) is caught as well. That whole-write
+/// bound includes the `fsync`'s chunk upload: twice the control writes
+/// absorbs steady S3 latency, but a single S3 hiccup could fail the run —
+/// if it flakes, bound only the metadata part.
 pub fn delegate_handoff_renewal(_seed: u64) -> Result<()> {
     const NAME: &str = "delegate-handoff-renewal";
     let (_env, _root, mut clients) = delegated_pair(NAME, true)?;
@@ -765,6 +779,16 @@ pub fn delegate_handoff_renewal(_seed: u64) -> Result<()> {
             // image's first ones.
             let (ops, errs) = w.after(resumed_at);
             let (across, _) = w.after(up_at);
+            let longest_across = across.iter().max().copied().unwrap_or_default();
+            let longest_across_at = w
+                .ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| o.at + o.took >= up_at && o.took == longest_across)
+                .map(|o| w.started + o.at)
+                .next()
+                .unwrap_or_else(Instant::now);
             let meta = w.meta_after(resumed_at);
             let longest = meta.iter().max().copied().unwrap_or_default();
             let longest_at = w
@@ -779,6 +803,11 @@ pub fn delegate_handoff_renewal(_seed: u64) -> Result<()> {
             let slowest_control = control_meta.iter().max().copied().unwrap_or_default();
             // (A host stall slows the writes before the upgrade too.)
             let bound = HANDOFF_BOUND.max(slowest_control * 2);
+            // The same for a whole write overlapping the upgrade, less the
+            // upgrade's own duration: a wait that lands on a write's
+            // `fsync` rather than its create is a wait all the same.
+            let slowest_control_write = control.iter().max().copied().unwrap_or_default();
+            let across_bound = HANDOFF_BOUND.max(slowest_control_write * 2);
             let da = deleg_of(a)?;
             let db = deleg_of(b)?;
             let gen_after = db["mine"]
@@ -829,6 +858,15 @@ pub fn delegate_handoff_renewal(_seed: u64) -> Result<()> {
                 longest,
                 Duration::ZERO,
                 bound,
+            )?;
+            crate::hostlag::latency_bound(
+                &format!(
+                    "{NAME}: round {round}: a write across the upgrade, less the upgrade's {took:?}"
+                ),
+                longest_across_at,
+                longest_across,
+                took,
+                took + across_bound,
             )?;
         }
         w.finish();

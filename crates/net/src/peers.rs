@@ -753,6 +753,20 @@ impl Peers {
         inner.p2p.close_all("suspended").await
     }
 
+    /// A node that hands its identity to a successor process says
+    /// goodbye: every connection closed with a close frame and the
+    /// endpoint closed ([`crate::endpoint::P2p::close_for_successor`]),
+    /// so peers re-dial the successor at once instead of probing the
+    /// dead incarnation. Nothing is sent or accepted afterwards. The
+    /// caller bounds it. Returns the connections closed (0 with P2P
+    /// disabled).
+    pub async fn close_for_successor(&self) -> usize {
+        let Some(inner) = self.inner.as_ref() else {
+            return 0;
+        };
+        inner.p2p.close_for_successor().await
+    }
+
     /// Plan 31 C8: undo [`Self::quiesce`] (inbound stays refused when
     /// `dial_only`), tell iroh the network may have changed while this
     /// node was away, then re-dial every peer and re-form the gossip

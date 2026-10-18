@@ -9,10 +9,16 @@
 //! exactly what a crashed daemon leaves behind. The observer stays in
 //! this process and behaves like a daemon: it keeps the victim enrolled,
 //! pings it on a ticker, and consumes the gossip topic.
+//!
+//! A *planned* handover (the in-place upgrade's `exec`) is the other
+//! way a node is replaced under the same key: the old incarnation is
+//! alive until it goes and can say goodbye. The victim then closes its
+//! connections (`Peers::close_for_successor`) on a command from the
+//! parent, or exits without (the control).
 
 use constellation_net::{run_gossip, P2p, Payload, PeerService, Peers, RelayPolicy};
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +38,10 @@ const MEASURE: Duration = Duration::from_secs(45);
 struct Recorder {
     node: u64,
     segments: Mutex<Vec<(String, Instant)>>,
+    /// When each request (a lease request, which every victim
+    /// incarnation sends once at start) arrived, like a delegate's first
+    /// renewal after a resume.
+    requests: Mutex<Vec<Instant>>,
 }
 
 impl PeerService for Recorder {
@@ -47,6 +57,7 @@ impl PeerService for Recorder {
         _requester: u64,
         _epoch_applied: Option<u64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
+        self.requests.lock().unwrap().push(Instant::now());
         Box::pin(async move {
             Payload::LeaseHandoff {
                 part,
@@ -142,6 +153,44 @@ async fn restart_victim_child() {
             }
         });
     }
+    // Commands from the parent, one per line: `CLOSE` says goodbye as a
+    // handover does (bounded, as the engine bounds it) and exits; `EXIT`
+    // exits at once without (an `exec` closes the socket the same way).
+    {
+        let (peers, handle) = (peers.clone(), tokio::runtime::Handle::current());
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                match line.unwrap_or_default().as_str() {
+                    "CLOSE" => {
+                        let closed = handle.block_on(async {
+                            tokio::time::timeout(
+                                Duration::from_millis(500),
+                                peers.close_for_successor(),
+                            )
+                            .await
+                        });
+                        eprintln!("victim closed for its successor: {closed:?}");
+                        std::process::exit(0);
+                    }
+                    "EXIT" => std::process::exit(0),
+                    _ => {}
+                }
+            }
+        });
+    }
+    // At once, like a delegate's first renewal after a resume: one
+    // request to the observer.
+    {
+        let peers = peers.clone();
+        tokio::spawn(async move {
+            let hello = Payload::LeaseRequest {
+                part: "hello".into(),
+                requester: VICTIM,
+                epoch_applied: None,
+            };
+            let _ = peers.request_to_node(OBSERVER, &hello).await;
+        });
+    }
     println!("VICTIM_ADDR {}", serde_json::to_string(&addr).unwrap());
     let mut seq = 0u64;
     loop {
@@ -163,7 +212,18 @@ fn topic_id() -> iroh_gossip::proto::TopicId {
 
 struct Victim {
     child: Child,
+    stdin: ChildStdin,
     addr: iroh::EndpointAddr,
+}
+
+impl Victim {
+    /// Send the child a command and wait for it to exit.
+    fn command_and_wait(&mut self, command: &str) {
+        writeln!(self.stdin, "{command}").unwrap();
+        self.stdin.flush().unwrap();
+        let status = self.child.wait().unwrap();
+        assert!(status.success(), "the victim exited with {status}");
+    }
 }
 
 fn spawn_victim(
@@ -181,10 +241,12 @@ fn spawn_victim(
             serde_json::to_string(observer_addr).unwrap(),
         )
         .env(INCARNATION_ENV, incarnation.to_string())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
+    let stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let addr = loop {
         let line = lines
@@ -197,7 +259,7 @@ fn spawn_victim(
     };
     // Keep draining so the child never blocks on a full pipe.
     std::thread::spawn(move || for _ in lines.by_ref() {});
-    Victim { child, addr }
+    Victim { child, stdin, addr }
 }
 
 /// Time until the observer reaches the victim again, on every channel
@@ -395,4 +457,99 @@ async fn a_crashed_peer_stops_counting_as_reachable_promptly() {
     // One 500 ms request timeout, then the probe window.
     let bound = Duration::from_millis(500) + Duration::from_secs(3) + Duration::from_secs(2);
     assert!(took <= bound, "took {took:?} (bound {bound:?})");
+}
+
+/// How long the observer's requests to a handed-over peer's successor
+/// may fail after the successor's own first request reached it: a round
+/// trip (and a re-dial), not a probe window.
+const HANDOVER_BOUND: Duration = Duration::from_millis(500);
+
+/// A planned handover of the victim's identity: incarnation 0 either
+/// says goodbye (`close`) or just goes, as an `exec` does; incarnation 1
+/// starts under the same key and sends the observer a request at once.
+/// Returns the time from that request's arrival to the observer's first
+/// successful request to the victim, as a delegate's first renewal
+/// waits for its root's answer.
+async fn handover_to_successor(close: bool) -> Duration {
+    let victim_key = iroh::SecretKey::generate();
+    let observer = Observer::start(&victim_key).await;
+    let mut victim = observer.spawn_victim(&victim_key, 0);
+    observer.join_gossip(&victim).await;
+    observer.reached(0).await;
+    let asked_before = observer.recorder.requests.lock().unwrap().len();
+    assert!(asked_before >= 1, "the first incarnation's request");
+
+    victim.command_and_wait(if close { "CLOSE" } else { "EXIT" });
+    let mut successor = observer.spawn_victim(&victim_key, 1);
+    let waiting = Instant::now();
+    let arrived = loop {
+        if let Some(at) = observer
+            .recorder
+            .requests
+            .lock()
+            .unwrap()
+            .get(asked_before)
+            .copied()
+        {
+            break at;
+        }
+        assert!(
+            waiting.elapsed() < MEASURE,
+            "the successor's request never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let mut reached = None;
+    while arrived.elapsed() < MEASURE {
+        if observer.peers.ping_node(VICTIM).await {
+            reached = Some(arrived.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    crash(&mut successor);
+    reached.unwrap_or_else(|| panic!("the successor was never reachable within {MEASURE:?}"))
+}
+
+/// The planned handover's goodbye: the old incarnation closes its
+/// connections before it exits, so the observer drops its pooled
+/// connection to it at once and its next request reaches the successor
+/// — it does not send into the dead incarnation's connection until the
+/// restart probe's window (2 s) is over. This is what a delegate's first
+/// renewal after an in-place upgrade needs: the root answers over its
+/// pooled connection, and before the close that answer was lost for
+/// 2.0-2.7 s (`delegate-handoff-renewal`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handed_over_peer_is_answered_within_a_round_trip() {
+    if std::env::var(VICTIM_KEY_ENV).is_ok() {
+        return; // we are the child
+    }
+    let took = handover_to_successor(true).await;
+    eprintln!("handover with the close: first successful request {took:?} after the successor's");
+    assert!(
+        took <= HANDOVER_BOUND,
+        "the observer took {took:?} to reach a successor whose predecessor closed its \
+         connections (bound {HANDOVER_BOUND:?})"
+    );
+}
+
+/// The control of the test above, and the probe it bypasses: a
+/// predecessor that exits without closing (a crash, or the `exec`
+/// before the close was added) leaves the observer sending into its
+/// connection until the restart probe (2 s after the successor dialed
+/// in) evicts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handed_over_peer_that_did_not_close_waits_for_the_probe() {
+    if std::env::var(VICTIM_KEY_ENV).is_ok() {
+        return; // we are the child
+    }
+    let took = handover_to_successor(false).await;
+    eprintln!(
+        "handover without the close: first successful request {took:?} after the successor's"
+    );
+    assert!(
+        took >= Duration::from_millis(1_500),
+        "the restart probe's window is gone: reached the successor after {took:?} \
+         with nothing closed"
+    );
 }
