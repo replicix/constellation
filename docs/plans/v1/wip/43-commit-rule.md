@@ -2670,6 +2670,9 @@ to land before C0.
   Also: the slack is M (1 s) until C7a names ρ, then `2ρ·(X − sent)`
   (≈ 0.1 s); and F-a0 (mark a tenure that inherits a floor) lands with
   F-a, fail-before first: *recommended yes*.
+  **Answered 2026-10-18:** (a) the beat cap; the slack is M until C7a;
+  F-a0 lands on its own as soon as its fail-before and review are done,
+  ahead of F-a (a safety fix does not wait for the latency work).
 - **Q18 — F-b's semantics.** *Blocks F-b.* (a) A non-blocking request on
   a lock with no known conflict waits out a grace (and the tenure floor,
   barriers, a delegate's short authority) instead of `EAGAIN`: up to
@@ -2683,6 +2686,9 @@ to land before C0.
   same: *recommended yes*, as F-b's second commit, after measuring it in
   the scenario at the default 60 s lease. A contended request past the
   ring's lock-wait budget stays `ENOLCK` (plan 38 Z2c), not in scope.
+  **Answered 2026-10-18:** (a) yes, wait; (b) yes, 49.5 s then `EAGAIN`,
+  counted, and `EINTR` on a signal; (c) yes, measured first at the
+  default 60 s lease, then as F-b's second commit.
 
 ### 11.1 Deferred (not in this plan)
 
