@@ -18,6 +18,7 @@ use constellation_types::Code;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1114,6 +1115,325 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
         clients[holder].mount()?;
         let refs: Vec<&Client> = clients.iter().collect();
         wait_for_p2p(&refs)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        keep_logs(NAME, &clients);
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}
+
+// ------------------------------------------------------------------ s3-cut-holder-failover-with-locks
+
+/// An exclusive `flock` held by a child process (`flock(1)` around a
+/// `sleep`): an application of its own, so that the owner fence of a
+/// lapsed grant (EIO on every file of the mount for that owner, until its
+/// locks are gone) falls on the child alone and not on the harness
+/// process that measures reads and writes on the same mount.
+struct ChildLock(std::process::Child);
+
+impl ChildLock {
+    fn take(path: &Path, other_mount: &Path) -> Result<Self> {
+        let child = std::process::Command::new("flock")
+            .arg("-x")
+            .arg(path)
+            .args(["sleep", "3600"])
+            .stdin(std::process::Stdio::null())
+            // Its own process group: `flock(1)` forks the command, so the
+            // whole group is killed (an orphaned `sleep` would hold the
+            // harness's output pipe open).
+            .process_group(0)
+            .spawn()
+            .context("running flock(1)")?;
+        let held = ChildLock(child);
+        // Held once another node's non-blocking attempt is refused.
+        let probe = open_rw(other_mount)?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match flock(&probe, libc::LOCK_EX | libc::LOCK_NB) {
+                Err(Code::Again) => return Ok(held),
+                Ok(()) => {
+                    let _ = flock(&probe, libc::LOCK_UN);
+                }
+                Err(e) => bail!("probing the child's lock: {e}"),
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the child never took its lock on {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for ChildLock {
+    fn drop(&mut self) {
+        // SAFETY: a plain signal to the group this child leads.
+        unsafe {
+            libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = self.0.wait();
+    }
+}
+
+/// What one application thread saw: `(started, returned, answer)` of each
+/// op, relative to the S3 cut.
+type Seen = Vec<(Duration, Duration, std::result::Result<(), Code>)>;
+
+/// Plan 43 C7-H2's cost (gate G5), measured: the holder loses S3 but not
+/// P2P, so it stays alive and keeps its backup's heartbeats while its
+/// lease runs out; the backup seals once it reads the lease expired and
+/// takes over. A tenure that served strict reads and locks makes that
+/// successor wait the whole floor (the read-delegation TTL and the lock
+/// TTL plus the takeover window and margins) before it acknowledges a
+/// write or grants a lock. Four nodes, `--cto strict`: a reader keeps a
+/// read delegation, and a locker (a child process: the lock owner's fence
+/// must not fall on the reader) holds an exclusive lock on the same
+/// mount; a writer creates files; a contender tries a non-blocking lock
+/// on a free file every 200 ms. Printed, relative to the cut: the
+/// takeover, the first write acknowledged and the first lock granted
+/// after it, the longest write, every errno the applications saw, and how
+/// often the nodes' logs refused a lock owner whose grant lapsed (the
+/// owner fence: `EIO` for that owner on every file of the mount). Failed
+/// by a write error, a read error (the reader is no lock owner) or a lock
+/// refused with other than `EAGAIN`.
+/// `CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1` holds the lock in the
+/// harness process instead, the control: the reader then sees the fence.
+pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
+    const NAME: &str = "s3-cut-holder-failover-with-locks";
+    let (_env, _root, mut clients, proxies) = cluster(
+        NAME,
+        &["a", "b", "c", "d"],
+        &[
+            ("CONSTELLATION_CTO", "strict"),
+            (
+                "RUST_LOG",
+                "info,constellation_authority::core::backup=info,constellation::locks=debug",
+            ),
+        ],
+        1,
+    )?;
+    let result = (|| -> Result<()> {
+        let holder = 0usize;
+        let backups = wait_for_backup(&clients[holder], Duration::from_secs(30))?;
+        let backup_idx = (0..clients.len())
+            .find(|i| node_id(&clients[*i]).ok() == Some(backups[0]))
+            .context("backup is not one of ours")?;
+        let reader_idx = (1..clients.len())
+            .find(|i| *i != backup_idx)
+            .expect("four nodes");
+        let writer_idx = (1..clients.len())
+            .find(|i| *i != backup_idx && *i != reader_idx)
+            .expect("four nodes");
+        let epoch = lease_of(&clients[holder])?["epoch"].as_u64().unwrap_or(0);
+        eprintln!(
+            "    {NAME}: {} holds epoch {epoch}; backup {}; reader+locker {}; writer+contender {}",
+            clients[holder].name,
+            clients[backup_idx].name,
+            clients[reader_idx].name,
+            clients[writer_idx].name
+        );
+        // The tenure serves strict reads and locks: a delegation on `f`,
+        // an exclusive lock on `h` held through the run.
+        for _ in 0..5 {
+            std::fs::read(clients[reader_idx].mnt.join("f")).context("reading f")?;
+        }
+        let in_process = std::env::var_os("CONSTELLATION_HARNESS_LOCKER_IN_PROCESS").is_some();
+        let (held, held_child) = if in_process {
+            (
+                Some(hold_flock(
+                    clients[reader_idx].mnt.join("h"),
+                    libc::LOCK_EX,
+                    Duration::from_secs(20),
+                )?),
+                None,
+            )
+        } else {
+            (
+                None,
+                Some(ChildLock::take(
+                    &clients[reader_idx].mnt.join("h"),
+                    &clients[writer_idx].mnt.join("h"),
+                )?),
+            )
+        };
+        let free = open_rw(&clients[writer_idx].mnt.join("g"))?;
+        anyhow::ensure!(
+            flock(&free, libc::LOCK_EX | libc::LOCK_NB).is_ok(),
+            "the free lock was refused before the cut"
+        );
+        flock(&free, libc::LOCK_UN).ok();
+        let stop = Arc::new(AtomicBool::new(false));
+        let cut = Instant::now();
+        let reads: Arc<std::sync::Mutex<Seen>> = Arc::default();
+        let writes: Arc<std::sync::Mutex<Seen>> = Arc::default();
+        let grabs: Arc<std::sync::Mutex<Seen>> = Arc::default();
+        let spawn = |log: Arc<std::sync::Mutex<Seen>>,
+                     mut op: Box<dyn FnMut(u64) -> std::result::Result<(), Code> + Send>,
+                     every: u64| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut i = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    i += 1;
+                    let started = cut.elapsed();
+                    let r = op(i);
+                    log.lock().unwrap().push((started, cut.elapsed(), r));
+                    std::thread::sleep(Duration::from_millis(every));
+                }
+            })
+        };
+        let rpath = clients[reader_idx].mnt.join("f");
+        let wdir = clients[writer_idx].mnt.clone();
+        let gpath = clients[writer_idx].mnt.join("g");
+        let t_reader = spawn(
+            reads.clone(),
+            Box::new(move |_| {
+                std::fs::read(&rpath)
+                    .map(|_| ())
+                    .map_err(|e| Code::from_io_error(&e))
+            }),
+            100,
+        );
+        let t_writer = spawn(
+            writes.clone(),
+            Box::new(move |i| {
+                std::fs::write(wdir.join(format!("w{i}")), b"w")
+                    .map_err(|e| Code::from_io_error(&e))
+            }),
+            250,
+        );
+        let t_grab = spawn(
+            grabs.clone(),
+            Box::new(move |_| {
+                let f = open_rw(&gpath).map_err(|_| Code::Io)?;
+                let r = flock(&f, libc::LOCK_EX | libc::LOCK_NB);
+                if r.is_ok() {
+                    let _ = flock(&f, libc::LOCK_UN);
+                }
+                r
+            }),
+            200,
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        proxies[0].blackhole();
+        let cut_at = cut.elapsed();
+        eprintln!(
+            "    {NAME}: {}'s S3 black-holed ({}); P2P stays up",
+            clients[holder].name,
+            lease_of(&clients[holder])?
+        );
+        let took = wait_holds(&clients[backup_idx], epoch, Duration::from_secs(150))?;
+        let took_over = cut.elapsed();
+        eprintln!(
+            "    {NAME}: {} took over {:?} after the cut",
+            clients[backup_idx].name,
+            took_over - cut_at
+        );
+        let _ = took;
+        // Until the first lock grant on the free file after the takeover
+        // (and at least 20 s of writes past it).
+        let grant_deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let granted = grabs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(s, _, r)| *s >= took_over && r.is_ok());
+            if granted || Instant::now() > grant_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        stop.store(true, Ordering::Relaxed);
+        for t in [t_reader, t_writer, t_grab] {
+            t.join().ok();
+        }
+        let rel = |d: Duration| d.saturating_sub(cut_at);
+        let first_ok_after = |log: &Seen, after: Duration| {
+            log.iter()
+                .filter(|(_, ret, r)| *ret >= after && r.is_ok())
+                .map(|(_, ret, _)| rel(*ret))
+                .min()
+        };
+        // Per errno: how many ops, and the first start and last return
+        // (relative to the cut) of the ones that failed with it.
+        let codes = |log: &Seen| {
+            let mut m = std::collections::BTreeMap::<String, (usize, Duration, Duration)>::new();
+            for (start, ret, r) in log {
+                if let Err(c) = r {
+                    let e = m
+                        .entry(format!("{c:?}"))
+                        .or_insert((0, rel(*start), rel(*ret)));
+                    e.0 += 1;
+                    e.2 = rel(*ret);
+                }
+            }
+            m
+        };
+        let writes = writes.lock().unwrap();
+        let grabs = grabs.lock().unwrap();
+        let reads = reads.lock().unwrap();
+        let longest = writes
+            .iter()
+            .max_by_key(|(s, r, _)| *r - *s)
+            .map(|(s, r, _)| (rel(*s), *r - *s));
+        eprintln!(
+            "    {NAME}: takeover at +{:?}; first write acknowledged after it +{:?}; first lock \
+             granted after it +{:?}; longest write {longest:?} ({} writes)",
+            took_over - cut_at,
+            first_ok_after(&writes, took_over),
+            first_ok_after(&grabs, took_over),
+            writes.len()
+        );
+        eprintln!(
+            "    {NAME}: errnos as (count, first start, last return) after the cut: writes {:?} \
+             ({} writes), non-blocking lock attempts {:?} ({} attempts), reads {:?} ({} reads)",
+            codes(&writes),
+            writes.len(),
+            codes(&grabs),
+            grabs.len(),
+            codes(&reads),
+            reads.len()
+        );
+        let fenced: usize = clients
+            .iter()
+            .map(|c| {
+                c.log_text()
+                    .matches("refused: the caller's lock grant lapsed")
+                    .count()
+            })
+            .sum();
+        eprintln!(
+            "    {NAME}: lock owners refused for a lapsed grant in the nodes' logs: {fenced} \
+             (locker {})",
+            if in_process {
+                "in the harness process"
+            } else {
+                "in a child process"
+            }
+        );
+        let bad_write = !codes(&writes).is_empty();
+        let bad_read = !in_process && !codes(&reads).is_empty();
+        let bad_grab = codes(&grabs).keys().any(|k| k != "Again");
+        proxies[0].heal();
+        if let Some(held) = held {
+            held.release();
+        }
+        drop(held_child);
+        anyhow::ensure!(
+            !bad_write && !bad_read && !bad_grab,
+            "a write or a read failed, or a lock attempt failed with other than EAGAIN (see the line above)"
+        );
+        anyhow::ensure!(
+            first_ok_after(&grabs, took_over).is_some(),
+            "no lock was granted on a free file within 90 s of the takeover"
+        );
         Ok(())
     })();
     if result.is_err() {

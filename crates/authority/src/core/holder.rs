@@ -784,11 +784,14 @@ impl Core {
             });
         };
         // Plan 30 §M11: no handoff while a delegation is live (the root
-        // stays; see `round_release`).
+        // stays; see `round_release`), nor inside the takeover floor (plan
+        // 43 C7-H2: the gate covers the read quarantine only with the
+        // inbox on, and not the lock grace at all).
         let can_serve = self.lease.ship_epoch(now, &self.cfg).is_some()
             && !self.lease.fenced()
             && self.deleg_live_generations() == 0
-            && replica.locks().grants_len() == 0;
+            && replica.locks().grants_len() == 0
+            && !self.in_takeover_floor(now);
         if !can_serve {
             self.stats.handoffs_declined += 1;
             out.push(Action::Send {

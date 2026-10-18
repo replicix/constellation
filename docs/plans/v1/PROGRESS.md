@@ -49541,3 +49541,403 @@ a starved host.
   pass with the stress gone). With `close_p2p_for_successor` a no-op both
   tests still fail ("still open 3 s after"). The net test: 240 of 240 pass
   at 16 copies beside the stress.
+
+## Fix: a fast successor whose clock is ahead got no quarantine (plan 43 C7-H2)
+
+Found by the clock-envelope research for plan 43 (§7 C7, Appendix B row
+10), recommended there to land first as a standalone integrity fix and
+accepted by the maintainer with its latency cost (§10 gate G5, §11 Q10a;
+the cost as landed, below, accepted again on 2026-10-18). A backup that
+seals a holder, or an `ack=s3` peer that takes an unexpired lease over,
+must not acknowledge a mutation or grant a lock while the predecessor's
+clients may still honour what it granted: a strict-read delegation (for
+`read_delegation_ttl_ms`), a lock grant (for the lock TTL), a write
+delegation (the reclaim horizon). `note_marker_landed` set that
+quarantine at `min(prev_expires, bound)`, where `bound` is the
+successor's marker time plus `backup_takeover_ms` plus the grant's TTL
+plus the reclaim horizon plus two expiry margins, and `prev_expires` is
+the *predecessor's* lease expiry, a stamp of the predecessor's wall
+clock, compared with the successor's.
+
+### Mechanism
+
+- A successor whose clock runs ahead of the predecessor's by `d` reads
+  that expiry `d` too early: the quarantine ends `d` before the
+  predecessor's grants do, and with `d` at least what the lease had left
+  there is none at all (`until <= now` returned before arming it).
+- A second reading of the same stamp sits one step earlier, in
+  `acquire_won`: the takeover counted as a fast one (`note_fast_takeover`,
+  which arms the floor) only if `!prev.is_expired(now)` on the
+  successor's clock. A sealed backup (or an `ack=s3` peer) ahead of its
+  predecessor by more than the lease has left, so that it reads the lease
+  as already expired, was taken for a TTL takeover and got no floor, with
+  or without the `min`. Dropping the `min` alone (the plan's change)
+  leaves this: on the skewed sim configuration below it fails in 62 of
+  2000 seeds, the full fix in none. (Appendix B row 26.)
+- The whole-bound floor outlasts a dwell, which exposed a hang older than
+  this change: `delegated-holder-cut` seeds 65 and 97 (2 of seeds
+  0..256). The sealing successor idle-released its lease to a node that
+  wanted it at t=6614 while its takeover gate was still pending (the
+  quarantine ran to t=16011). A successor adopts its predecessor's
+  delegation table (`dl.gens`) only once it is `root_usable()`, which
+  needs a ship epoch, which a pending gate lacks, so the "the root stays
+  while a delegation is live" rule saw no generation and the lease went
+  out with the log still naming this node root of live generations; the
+  delegates' forwards were refused `NotHolder` for ever. The sim's 6 s
+  lease had hidden it (the old floor, cut at the old expiry, ended
+  before the 1.5 s dwell and the wanted grace let the lease go); with
+  production timings (5 s dwell, 5 s wanted grace, a gate of 8.5-14.5 s)
+  a wanted successor was exposed the same way.
+- And a safety-side reason for guarding the floor itself: the node that
+  takes a *released* lease over gets no floor (`fast_prev` is false for a
+  released lease; `lock_on_released_takeover` covers the releaser's own
+  grants only), so a release inside the floor handed the lease to a node
+  that could acknowledge over the predecessor's delegations. With the
+  inbox off the gate does not wait out the read quarantine, and no gate
+  covers the lock grace, so a peer's handoff request inside the floor was
+  served (review S3; no sim seed shows it, the strict readers' grants are
+  short, but a core test does). The same holds for an operator's flush
+  (`leave`, plan 31 C8's suspension: the process keeps running) and a
+  shutdown (unmount, stop, the in-place upgrade's handover): they released
+  the lease at once, inside the gate and inside the floor (review R2-1),
+  and "the releaser is going away" does not make that safe: the taker of
+  the released lease has no floor either way.
+
+### Fix
+
+- `Core::note_marker_landed`: the floor is the bound alone, for
+  acknowledgements (`read_delegation_ttl_ms`) and for new lock grants
+  (`max(read_delegation_ttl_ms, lock_ttl_ms)`). `pending_floor` is a bool
+  (the tenure served strict reads or locks); the predecessor's expiry is
+  not read, and `PendingGate::fast_prev` is a bool too (the expiry it
+  carried is gone). The bound counts only the successor's own elapsed
+  time, so it needs a bounded clock *rate*, not a bounded offset (`W +
+  ttl + 2M >= (W + ttl - M)(1 + rho)`, plan 43 §7 C7).
+- `acquire_won`: a takeover the permit allowed (`takeover_permit` names
+  the previous lease's epoch and holder: a seal, or an `ack=s3` takeover
+  after the holder's silence) is a fast one whatever the successor's
+  clock says of the expiry.
+- No release of the lease inside the tenure's gate or takeover floor
+  (`Core::in_takeover_floor`, from the `floor_until` that
+  `note_marker_landed` records, reset when the tenure ends,
+  `end_takeover_floor`): the idle release (`round_release`: gate or
+  floor), a peer's handoff request (`on_lease_request` and, for one
+  queued behind the round that armed the floor, `begin_handoff`), a
+  continuation epoch's flush release (the gate too, with a debug
+  assertion that it is not expected) and, below, the operator's flush. Chosen over a check in
+  `issue_release` because that is the last step, after the flush's side
+  effects (`releasing` closes the view, the pause begins); declining there
+  would leave the tenure fenced half-way. And over a released lease that
+  carries the floor's remaining time (the taker applies `now + remaining`
+  from its own read: rate-only and conservative, and it would cover every
+  release path at no latency to the releaser): a lease-object change, left
+  to plan 43's C4/C7b which rewrite that object.
+- An operator's flush and a shutdown (`Control::Flush`, `Control::Shutdown`
+  through `JobReq::Flush`) release only outside the gate and the floor:
+  `begin_flush` parks the request (`PendingFlush`, the job slot stays
+  free because the gate completes in rounds; a `FlushFloor` timer looks
+  again every 200 ms) and starts the flush, which ships and publishes
+  and releases, once neither stands; a flush that had begun and meets the
+  gate or floor at its release step (queued behind the acquisition) parks
+  there. The floor is never given up on (review R3-1: it is bounded and
+  ends on its own, and a release inside it is the hole; with a lock TTL
+  of 100 s the floor outlasts any cap): the cap, a fixed 40 s
+  (`flush_floor_cap_ms`, a `Config` field with no environment key), is for
+  a takeover *gate* that stays pending. At it the flush gives up: nothing
+  is released and `ControlDone` says so. A stop (a shutdown) still stops
+  the core and leaves the lease to lapse by its TTL, which outlasts the
+  floor (its successor takes it by TTL or seal); any other flush leaves
+  the node running and renewing, and the next idle round releases the
+  lease once the gate is over.
+- The upgrade's handover (`shutdown_for_handover`) releases the lease to
+  the cluster (the new image restarts on the state dir and re-claims a
+  released lease like any node) and does not hand its floor over: the
+  floor is in memory only, and the new image's restart horizons cover this
+  node's own grants (`KV_*_GRANT_HORIZON`), not the predecessor's. So the
+  upgrade waits for the gate and floor like an unmount, but *before it
+  detaches the views* (review R3-3: with the wait inside the drain, after
+  `close_view_for_handover` and the detach, every application on the node
+  stalled in the kernel's queue for the whole wait): `handover::upgrade`
+  polls `LeaseView::release_hold` (the driver mirrors the core's
+  `takeover_floor_until_ms` and `fast_gate_pending`) every 100-250 ms
+  until no fast takeover's gate is pending and the floor has passed (the
+  gate bounded at 40 s, the floor not), with the views serving, then goes
+  on as before; the drain that follows stalls them for its usual short
+  time. `leave` and a suspension keep their views open throughout
+  already.
+- The continuation epoch's flush release holds for the floor and for a
+  *fast takeover's* gate before its marker landed (review R3-2: no floor
+  yet, no adopted delegation table), not for the epoch's own re-claim gate
+  (`locks-blips-tight-faults` seed 5379).
+- The off-core liveness beat to the backups (`holder_alive_loop`) goes on
+  while a shutdown is parked (review R3-4 asked to keep it): it already
+  does. Its stop flag is the `AliveTask`'s own, set when `Driver::run`
+  returns (the core stopped), not the engine's `stop` that
+  `drain_for_shutdown` sets; the review read the two as one. The
+  unmount scenario now checks it: the third node (X's backup by then)
+  seals nothing during the 23.6 s wait.
+- The models classify fast from the permit like the core
+  (`crates/model/src/{cto,locks}.rs`: the taker's clock against the old
+  expiry no longer decides the floor or the grace), and drop the `min`.
+- The log text of the floor ("took a lease over by seal or ack=s3 from a
+  tenure that served strict reads or locks; acknowledging no mutation
+  until its delegation horizon has passed") no longer says "unexpired";
+  the harness greps the part that did not change.
+- Docs: the module doc of `core/backup.rs`, `cluster-locks.md` (the
+  failover grace), `durability-and-failover.md` (new paragraph "What a
+  seal's successor waits for"), TESTING.md; plan 43 (Appendix B rows 10,
+  22, 23-26, C7b's rows, gate G5, §7 C7-F); the harness's drift tripwires
+  (`Timings::ack_floor_wait`, `delegroot.rs`, `m9.rs`) no longer allow a
+  wait shorter than the configured one by the predecessor's expiry.
+
+### Cost (gate G5)
+
+A fast successor of a tenure that served strict reads or locks now waits
+the whole bound where it used to wait `min(expiry - now, bound)`, or
+nothing. Production timings (60 s lease, 1.5 s takeover window, 5 s read
+delegations, 20 s lock TTL, 1 s margin): the bound is 1.5 + 5 + 2 = 8.5 s
+for acknowledgements (+ 6 s with live write delegations, 14.5 s) and
+1.5 + 20 + 2 = 23.5 s for new lock grants (+ 6 s, 29.5 s). That is the
+plan's G5 for a takeover in the predecessor's last seconds. **It is also
+paid by a case G5's wording did not name**: a holder cut from S3 but
+alive on P2P (it keeps heartbeating its backup) whose lease runs out. Its
+backup seals at the expiry it reads; before this change that was a TTL
+takeover with no floor (`!is_expired` was false), now the permit makes it
+fast, so the successor waits the whole bound on top of the ≈ one-TTL
+failover, and a non-blocking lock request for a free lock answers
+`EAGAIN` meanwhile (on ring-transport cluster-lock mounts, blocking
+requests past `depth - 1` waiters per queue answer `ENOLCK`). The code
+cannot tell this case from a successor ahead of the old holder without
+trusting offsets, so the rule is right; the cost is the price of it.
+**Maintainer's decision, 2026-10-18: land with the full floor** (safety
+first), and follow-ups, separate work (plan 43 §7 C7-F, Q10a): F-a,
+shorten the floor from the successor's own observation of the old
+holder's last renewal (same-clock, rate-only: it must first deal with the
+unobservable `SegmentRun`/`SegmentPut` proofs of `note_s3_liveness`) so
+this failover gets back to (near) no extra wait; F-b, lock requests
+during the grace cost latency, not errors; F-c (review R2-2), a lock
+owner whose grant lapsed during the failover gets `EIO`, below. The
+numbers below are their baseline.
+
+**Added latency of the release paths** (review R2-1): a `leave`, a
+suspension's flush, an unmount, a stop and the upgrade's handover right
+after a seal now release only after the gate and the floor: at most the
+floor's remainder, which is 23.5 s (29.5 s with write delegations) at the
+defaults, where cluster locks are on and the floor is the lock grace's
+(8.5 s, 14.5 s, with locks off), and nothing when the floor has passed or
+the tenure served neither strict reads nor locks. Measured with
+`unmount-inside-the-takeover-floor` (a 3 s delegation TTL, the default
+20 s lock TTL): the unmount of the successor right after its seal took
+0.10 s on `2cdab96` (released at once) and 23.6 s on the patch, twice
+each. Waiting for the read floor alone (6.5 s here) would be an option,
+but it leaves the sealed tenure's unmirrored lock grants to chance. An
+upgrade takes as long, and its applications do not stall for it
+(`upgrade-after-a-seal`, below). A takeover gate that stays pending
+past 40 s ends the wait without a release (a stop: the lease lapses by
+its TTL).
+Measured:
+
+- Harness `s3-cut-holder-failover-with-locks` (new: four nodes, 20 s
+  lease, `--cto strict`; a reader holds a delegation on `f`, a locker (a
+  child process: the owner fence must not fall on the reader) an
+  exclusive lock on `h`; node A, the holder, loses S3 but not P2P; a
+  writer creates a file every 250 ms and a contender tries a non-blocking
+  lock on a free file every 200 ms), two runs each, `ed93500` against the
+  patch, times from the cut:
+
+  | | takeover | first write acknowledged after it | first lock granted after it | longest write | non-blocking lock attempts |
+  |---|---|---|---|---|
+  | `ed93500` | +13.50 / +13.66 s | +13.70 / +13.95 s | +13.57 / +13.72 s | 2.0 s | 34, none refused |
+  | patch | +13.58 / +13.61 s | +22.16 / +22.16 s | +37.18 / +37.17 s | 10.0 s (at +12.1 s) | 108, 75 `EAGAIN` (+11.4 s .. +37.0 s) |
+
+  The takeover itself is the same (the lease's remaining 13.6 s); the
+  floor adds 8.2 s before the first acknowledgement and 23.5 s before the
+  first lock grant (the bound, less the time the takeover's own steps
+  took), no write and no read fails (the reader's 49-50 and 198-199 reads
+  all succeed), and the lock refusals are all `EAGAIN`.
+- The `EIO` of the first measurement was the owner fence, not strict
+  reads (review R2-2): the locker's `flock` was held by a thread of the
+  harness process, so once the cut holder could not renew the grant (at
+  about +9.5 s, the renewal half-life of the 20 s lock TTL) the
+  documented fence answered `EIO` to every read that process issued on
+  the mount, until the lock was released at the end of the run. The
+  control (`CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1`): `ed93500` 25 of
+  50 reads `EIO` (+9.5 s .. +15.9 s), the patch 175 of 200 (+9.5 s ..
+  +39.3 s), and the nodes' logs say "refused: the caller's lock grant
+  lapsed" 50 and 350 times, against none with the locker in a child
+  process. The window is the run's length (first lock grant plus 2 s), not
+  a property of the floor. It is a fault-caused error to an application
+  that holds a lock and works through a root failover, in tension with
+  "only latency may degrade": plan 43 §7 C7-F, **F-c** (candidate fixes:
+  park the fenced owner's I/O until the successor admits its reclaim, or
+  keep grants renewable across the failover gap), with these numbers as
+  its baseline. Not part of C7-H2.
+- Sim (6 s lease, so the bound is always at least the lease and the `min`
+  bites by construction; this is the upper end of the distribution, not
+  the production rate). Floors set, and by how much the whole bound
+  exceeds `min(expiry - now, bound)`, extra ms p50 / p90 / max:
+  `backup-strict` 200 floors, 3469 / 3559 / 7000 (acknowledgements and
+  lock grants alike); `locks-failover-backup` 2000 floors, 3011 / 3109 /
+  4494; `locks-failover-backup-renew` 3993 floors, 3197 / 3452 / 5779;
+  `delegated-holder-cut` 1777 floors (a write-delegation tenure, bound
+  12.5 s), 9816 / 9898 / 9981. `long-backup` and `long-acks3`, 2000 seeds
+  each: no floor is ever set (no strict reads, no locks), so the `min`
+  never bit and the change costs nothing there. The permit rule adds a
+  floor to a sealed takeover the successor's clock reads as expired: 3 of
+  the 200 `backup-strict` seeds, each now waiting the whole 7 s bound
+  where it waited nothing.
+- Harness `delegate-backup-handoff-failover` (60 s lease, the kill at a
+  random point of the renewal cycle, so the lease has at least 30 s left
+  at the seal): the successor's logged `wait_ms` is 14500 (the configured
+  bound, write delegations live) in every run that counted a quarantine,
+  before and after (it bites only in the last seconds); the runs that
+  counted none are those where the root had not yet marked its tenure
+  granting at the kill: no mark, no floor. `backup-failover-with-delegation`
+  (3 s delegation TTL): the write returns 6.6-6.7 s after the kill on both.
+
+### Tests
+
+- Core `a_fast_takeover_floor_ignores_the_predecessors_expiry`: the
+  predecessor's expiry 3 s past, 1 ms past, now, 1 ms ahead, 1 s, 4 s and
+  60 s ahead: the read quarantine and the lock quarantine are always the
+  bound, `ack_floor_waits` 1. Fails on `ed93500` (an expiry in the past:
+  no quarantine; one a few seconds ahead: the quarantine stops at it).
+- Core `a_sealed_takeover_is_fast_though_the_successors_clock_reads_the_lease_expired`:
+  a sealed backup takes over a lease its clock reads as 2 s expired,
+  whose tenure served strict reads: the floor is set once the marker
+  lands. Fails on `ed93500` and with the `min` dropped alone (no floor).
+- Core `a_tenure_inside_its_takeover_floor_is_not_idle_released`: an idle
+  holder a node wants hands the lease over (control), not inside its
+  floor (acknowledgement floor, lock grace), not with the takeover gate
+  pending (`round_release`; fails without the gate in the guard), and the
+  floor ends with its tenure (fails without `end_takeover_floor`).
+- Core `a_handoff_inside_the_takeover_floor_is_declined`: a peer's
+  `LeaseRequest` after the floor was armed is declined with the inbox off
+  (the harness's default is the inbox on), served past it; fails without
+  the guard in `on_lease_request` (the guard of `begin_handoff` alone
+  would decline it too, hence the next test).
+- Core `a_queued_handoff_that_meets_the_takeover_floor_is_declined`: the
+  request arrives while a round holds the slot, before any floor exists
+  (`on_lease_request` admits it), and the floor is armed by the time the
+  job starts: declined by `begin_handoff` alone; fails without that guard.
+- Core `a_flush_or_shutdown_inside_the_takeover_floor_waits_for_it`
+  (review R2-1): with the floor armed, with the takeover gate pending
+  (inbox on, `drained: false`), and with both, a `Control::Flush` and a
+  `Control::Shutdown` upload nothing, send no released `LeaseSwap`, answer
+  nothing, hold no job slot and arm a `FlushFloor` look; the look while
+  the gate or floor stands changes nothing; once both end, the next look
+  runs the flush, which releases and answers (a shutdown stops); and a
+  gate that never ends makes the flush give up at the cap (no release,
+  `ControlDone` an error, a shutdown still stops). Fails without the hold
+  (released at once, as on `2cdab96`).
+- Core `a_flush_waits_out_a_floor_longer_than_its_cap` (review R3-1): a
+  100 s lock TTL and a 1 s cap: the flush is still parked (no release, no
+  answer) every 200 ms for the whole 100 s floor and releases after it;
+  fails when the cap applies inside the floor.
+- Core `a_flush_that_meets_the_floor_at_its_release_step_parks_there`
+  (review R3-5): a flush already running when the marker lands releases
+  nothing at its release step, is not answered, frees the slot and runs
+  again after the floor.
+- Core `an_epoch_flush_holds_for_a_fast_takeovers_gate_only` (review
+  R3-2): the epoch's flush release with a fast takeover's pre-marker gate
+  pending is held, with the epoch's own re-claim gate it still goes; fails
+  without the fast-gate hold.
+- The two handoff tests now pin their own guards (review R3-5): the
+  admission test checks the decline carries the holder's own epoch (the
+  handoff job's carries 0) and that nothing was uploaded or shipped; the
+  queued one checks the job's decline (epoch 0) before its own upload (the
+  round's is the only one). Each fails when its guard alone is removed.
+- Engine `the_release_hold_names_the_gate_or_the_floors_remainder`.
+- Harness `upgrade-after-a-seal` (new; review R3-3): a strict reader holds
+  a delegation from A, A dies, its backup X takes over and is upgraded at
+  once, a reader and a writer running on X's mount. The upgrade takes
+  24.1 s (the floor, 23.5 s from the marker, plus the drain); 933 reads
+  and 188 writes complete with no error; the first ones wait 6.6 s for the
+  takeover's own gate (the read floor; not the upgrade's), and 100+ reads
+  are served during the wait after it, none longer than a few seconds,
+  whatever of the wait, the detach or the exec it falls in. With the wait
+  after the detach (the previous version of this change) one read stalls
+  for the whole 24.0 s and none starts in the wait: the scenario fails on
+  it. Two runs on the patch.
+- Models `fast_takeover_is_clean_with_a_successor_far_ahead` (cto,
+  offsets 0 / 9 / 9 against a lease of 6) and
+  `fast_takeover_with_grace_is_clean_with_a_backup_far_ahead` (locks):
+  both fail on `ed93500`'s models (classified by the taker's clock) and
+  pass.
+- Sim: new `SimConfig::clock_offsets` (an exact per-node clock offset on
+  top of `clock_skew_ms`), and `fast-takeover-skewed-successor`:
+  `locks-failover-backup-renew` (the holder cut from S3 and from its
+  backup, the backup seals and takes over before the lease expires, lock
+  holders still reach the old root) with nodes 2 and 3 four seconds ahead
+  of the 6 s lease. On `ed93500` 63 of 2000 seeds (193000..195000) violate
+  mutual exclusion (a lock granted over a holder still in its section);
+  with only the `min` dropped, 62; with the fix, 0. Test
+  `a_skewed_successor_grants_no_lock_inside_the_old_roots_window` (200
+  seeds; fails on `ed93500` at seed 193001), and the configuration in
+  `long_locks`, `sweep_config` and `replay_seed`. (A whole-lease offset on
+  every follower, as the plan sketched, also lets a follower claim a live
+  lease it reads as expired: that is C7b, row 2, so the offset stays below
+  the lease and above what the predecessor's grants outlast.)
+- Sim `regression_a_sealing_successor_keeps_the_lease_through_its_floor`
+  (`delegated-holder-cut` seeds 65 and 97): never ended before the guard,
+  ends with it. `backup-strict-inbox-off` (new sweep configuration:
+  `backup-strict` with `CONSTELLATION_INBOX=off`).
+- `a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over` asserted a
+  failover inside the 6 s TTL, which only the `min` made possible. It is
+  now per seed: every failover over 1 s is in a seed with a seal-based
+  takeover and lies between the floor less two takeover windows and the
+  floor plus two windows and a second, a window the holder's own return
+  (9 s after the crash) and a TTL failover miss. A pinned assertion that
+  encoded the removed behaviour (plan 43 §8.1).
+- The `backup-strict` configuration's close-to-open check did not fail
+  under a successor offset in the 400 seeds tried at 2, 4 and 6 s: its
+  readers' delegations are granted by a root that renews them while it
+  lives and are capped at its lease; the lock configuration is the
+  sharper witness.
+
+### Gates
+
+`cargo fmt --check` and `cargo clippy --workspace --all-targets -D
+warnings` clean; `cargo test --workspace --no-fail-fast` (38 min): 3197
+passed, 0 failed, 55 ignored. Every job ran under `timeout
+--kill-after=30s`; none hit it. Sim sweeps, all clean:
+`fast-takeover-skewed-successor` 193000..195000, `backup`, `backup-crash`,
+`backup-crash-slow`, `locks-failover-backup`, `locks-failover-backup-renew`,
+`backup-lag-at-expiry`, `delegated-holder-cut` (0..2000 each),
+`long-backup`, `long-acks3` (50000..52000), `backup-strict-inbox-off`
+0..1000, `delegated-holder-cut` 20000..22000, `locks-blips-tight-faults`
+5000..6000 (seed 5379 included): 0 failing seeds each. Harness (release,
+seed 42), all pass: `delegate-backup-handoff-failover`, `backup-failover`
+(failover 1.49 s), `ack-s3-failover`, `lock-failover`,
+`backup-failover-with-delegation`, `s3-cut-holder-failover-with-locks`,
+`unmount-inside-the-takeover-floor` (23.6 s; the third node sealed
+nothing meanwhile), `upgrade-after-a-seal` twice (24.1 s; 866 and 865
+reads served after the gate opened, the longest 1.06 s, at the drain),
+`upgrade-under-load`, `node-leave`, `lifecycle-suspend-mid-write`,
+`lifecycle-resume-rejoin`, `session-handover-idle`, `kill9-remount`,
+`unmount-drain`. (`lock-failover` ran with the contender granted 0.6 ms
+and, in other runs, 16 s after the unlock, whichever of the four nodes
+became the backup: the same spread as before this change.)
+
+### Not changed (found on the way; tracked in plan 43)
+
+- `lock_on_released_takeover`'s gate (`!p.is_expired(now)`, a taker
+  ahead of the releaser gets no lock grace), the seal watch's expiry
+  compares and `promise_check_needed` read the predecessor's expiry on the
+  successor's clock: Appendix B rows 23, 24, 25, C7b.
+- A sealed takeover of a lease that really had expired, by a holder
+  silent past its lease (not the S3-cut holder alive on P2P, above), is
+  treated as fast: its successor waits the bound if the tenure served
+  strict reads or locks, where it waited nothing. Harmless to safety; the
+  successor cannot tell the two cases without a clock it trusts (C7a).
+- The takeover floor is in memory only: a successor that restarts inside
+  it forgets it, and the upgrade's handover (which releases the lease, and
+  now waits out the floor first) does not carry it to the new image. The
+  restart horizons (`KV_*_GRANT_HORIZON`) cover the restarted node's own
+  grants, not the sealed predecessor's: Appendix B row 14 now says so.
+- A released-takeover grace and a restart's horizon are not protected
+  against a second idle release: their quarantines have other sources
+  (`lock_on_released_takeover`, epoch takeovers, restarts) and guarding
+  them all slowed cooperative handoffs in `backup-lag-keeps-its-backup`
+  (a backup dropped for ack timeouts), so only the takeover floor this
+  change lengthened is guarded.

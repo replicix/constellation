@@ -104,6 +104,10 @@ pub struct Config {
     /// left.
     pub expiry_margin_ms: u64,
     pub idle_release_ms: u64,
+    /// Plan 43 C7-H2: how long a flush or shutdown waits for the takeover
+    /// gate and floor to end before it gives up and leaves the lease to
+    /// lapse (more than the longest floor: 29.5 s at the defaults).
+    pub flush_floor_cap_ms: u64,
     pub dwell_ms: u64,
     pub wanted_grace_ms: u64,
     pub handoff_pause_ms: u64,
@@ -404,6 +408,7 @@ impl Config {
             ttl_ms,
             expiry_margin_ms: 1_000,
             idle_release_ms: 30_000,
+            flush_floor_cap_ms: 40_000,
             dwell_ms: 5_000,
             wanted_grace_ms: 5_000,
             handoff_pause_ms: 2_000,
@@ -1166,6 +1171,8 @@ enum Timer {
     StreamWatchdog,
     GrantExpiry(u64),
     GrantQuarantine,
+    /// Plan 43 C7-H2: `Core::service_pending_flushes`.
+    FlushFloor,
     HeldReply(u64),
     ReadIndexTimeout(OpId),
     ReadIndexRetry(OpId),
@@ -1220,6 +1227,7 @@ impl Timer {
             Timer::StreamWatchdog => TimerKind::StreamWatchdog,
             Timer::GrantExpiry(_) => TimerKind::GrantExpiry,
             Timer::GrantQuarantine => TimerKind::GrantQuarantine,
+            Timer::FlushFloor => TimerKind::FlushFloor,
             Timer::HeldReply(_) => TimerKind::HeldReply,
             Timer::ReadIndexTimeout(_) => TimerKind::ReadIndexTimeout,
             Timer::ReadIndexRetry(_) => TimerKind::ReadIndexRetry,
@@ -1260,6 +1268,12 @@ pub struct Core {
     /// The authority job slot and the requests waiting for it.
     job: Option<jobs::Job>,
     queued_jobs: VecDeque<jobs::JobReq>,
+    /// Plan 43 C7-H2: flushes and shutdowns (`Control::Flush`, `Shutdown`)
+    /// that wait for the takeover gate and floor to end before they
+    /// release the lease; they do not hold the job slot meanwhile (the
+    /// gate completes in rounds).
+    pending_flushes: Vec<jobs::PendingFlush>,
+    flush_floor_timer: Option<TimerId>,
     clients: BTreeMap<Rid, client::ClientOp>,
     /// Rids answered `InDoubt` and not yet resubmitted.
     in_doubt_rids: std::collections::BTreeSet<Rid>,
@@ -1385,6 +1399,8 @@ impl Core {
             next_timer: 1,
             job: None,
             queued_jobs: VecDeque::new(),
+            pending_flushes: Vec::new(),
+            flush_floor_timer: None,
             clients: BTreeMap::new(),
             in_doubt_rids: std::collections::BTreeSet::new(),
             in_doubt_batches: std::collections::BTreeMap::new(),
@@ -2112,6 +2128,10 @@ impl Core {
             }
             Timer::JobRequestTimeout(req) => {
                 self.on_job_peer_failed(now, req, 0, replica, out);
+            }
+            Timer::FlushFloor => {
+                self.flush_floor_timer = None;
+                self.service_pending_flushes(now, replica, out);
             }
             Timer::InboxPoll => {
                 self.inbox.poll_timer = None;

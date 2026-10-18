@@ -290,6 +290,27 @@ fn fast_takeover_with_grace_is_clean() {
     );
 }
 
+/// Plan 43 C7-H2: the backup's clock is ahead of the old root's by more
+/// than the lease (9 against 6), so it reads the lease as expired; its
+/// takeover, a permitted one, is a fast one with the grace all the same.
+/// (Classified by its clock against the old expiry, as the model did, it
+/// counted as a TTL takeover: no grace, a grant over a honoured one.)
+#[test]
+fn fast_takeover_with_grace_is_clean_with_a_backup_far_ahead() {
+    let m = LockModel {
+        backup: 2,
+        replicate: false,
+        grace: true,
+        lease_ttl: 6,
+        lock_ttl: 3,
+        init_offsets: Some(vec![0, 0, 9]),
+        max_drops: 0,
+        max_tick: 6,
+        ..LockModel::design(contend())
+    };
+    assert_clean("fast-grace-far-ahead", &m, &["fast_takeover", "reclaimed"]);
+}
+
 #[test]
 fn fast_takeover_with_grace_and_mirror_is_clean() {
     let m = LockModel {

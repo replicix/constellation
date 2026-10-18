@@ -43,7 +43,7 @@
 //!   from the backup's asynchronously mirrored table (`replicate`) and
 //!   applies M9's acknowledgement floor as a **grace period**: no new
 //!   grant until `now + takeover_window + lock_ttl + 2·seq_margin`
-//!   (capped at the old expiry), while reclaims are accepted. The old
+//!   (not cut short by the old expiry), while reclaims are accepted. The old
 //!   root keeps answering until it probes the register, and answers only
 //!   within `takeover_window` of a probe (M8's probe freshness) — new
 //!   grants and renewals alike, its own grants' renewals included
@@ -1141,7 +1141,16 @@ impl Model for LockModel {
                 let i = i as usize;
                 let now = s.local(i);
                 let prev = s.reg;
-                let fast = now < prev.expires;
+                // A takeover the backup's permit allowed is a fast one,
+                // whatever its clock says of the old expiry (a stamp of
+                // the old holder's clock: plan 43 C7-H2, the code's
+                // `acquire_won`); any other takeover claimed an expired
+                // lease by its own clock. The backup is always permitted
+                // here: a superset of the code's permit, so the backup's
+                // takeovers explore no path without the grace (the code's
+                // floor-less TTL path of a backup is the sim's).
+                let permitted = self.backup == i as u8 && prev.holder != i as u8;
+                let fast = permitted || now < prev.expires;
                 let epoch = prev.epoch + 1;
                 let expires = now + self.lease_ttl;
                 s.reg = Reg {
@@ -1181,10 +1190,7 @@ impl Model for LockModel {
                     if self.grace {
                         let bound =
                             now + self.takeover_window + self.lock_ttl + 2 * self.seq_margin;
-                        let floor = prev.expires.min(bound);
-                        if floor > now {
-                            s.nodes[i].floor = Some(floor);
-                        }
+                        s.nodes[i].floor = Some(bound);
                     }
                 } else {
                     s.saw |= SAW_TTL_TAKEOVER;

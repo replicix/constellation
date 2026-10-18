@@ -88,9 +88,9 @@ impl Timings {
     /// tenure marked granting waits, from its marker, before it
     /// acknowledges a mutation (`note_marker_landed`): the takeover
     /// window, the read-delegation TTL, the reclaim horizon when write
-    /// delegations were live, and two margins — capped by the
-    /// predecessor's lease expiry, which this does not know (an upper
-    /// bound, then).
+    /// delegations were live, and two margins — exactly, whatever the
+    /// predecessor's lease had left (the floor no longer takes the
+    /// minimum with its expiry, a stamp of another node's clock).
     pub fn ack_floor_wait(&self, delegations_live: bool) -> Duration {
         self.backup_takeover
             + self.read_delegation_ttl

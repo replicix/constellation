@@ -357,6 +357,27 @@ fn fast_takeover_is_clean_under_drift_within_the_margin() {
     assert_clean("fast-drift", &m, &["fast_takeover", "floor_waited"]);
 }
 
+/// Plan 43 C7-H2: the successor's clock is ahead of the old holder's by
+/// more than the lease (offsets of 9 against a lease of 6): it reads every
+/// lease as expired, but a takeover the permit allowed is a fast one all
+/// the same and waits the whole floor. (Classified by the taker's clock
+/// against the old expiry, as the model did, the takeover counted as a TTL
+/// one: no floor, and the reader's delegation is read stale.)
+#[test]
+fn fast_takeover_is_clean_with_a_successor_far_ahead() {
+    let m = CtoModel {
+        init_offsets: Some(vec![0, 9, 9]),
+        max_tick: 6,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+    };
+    assert_clean(
+        "fast-far-ahead",
+        &m,
+        &["fast_takeover", "floor_waited", "read_under_delegation"],
+    );
+}
+
 /// A tenure without strict mounts and no strict reader costs its
 /// successor nothing: no floor is set, and bounded-mode writes stay
 /// clean (bounded reads make no promise).

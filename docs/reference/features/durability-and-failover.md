@@ -460,6 +460,68 @@ takeover CAS and the holder's CAS removing that backup are on the same
 lease version, so exactly one wins. None of the timeouts decides safety;
 they only decide when to try.
 
+**What a seal's successor waits for.** The old holder's *clients* may
+still honour what it granted: a strict-read delegation, a lock grant, a
+write delegation. A successor that took a lease over by a seal or an
+`ack=s3` takeover, and whose predecessor served strict reads or locks
+(the lease's `granted_delegations` mark, set before the first answer),
+therefore acknowledges no mutation, and grants no new lock, until its own
+marker time plus the takeover window plus the grant's TTL plus two expiry
+margins: the read-delegation TTL (plus the write delegations' reclaim
+horizon when some were live) for acknowledgements, the longer of the
+read-delegation and lock TTLs for new lock grants (about 8.5 s and
+23.5 s at the defaults, plus the reclaim horizon when write delegations
+were live). The wait counts only the successor's own elapsed time. It is
+never shortened to the old lease's expiry: that is a stamp of the old
+holder's clock, and a successor whose clock runs ahead of it by more than
+the lease has left would read it as past and wait for nothing while the
+old holder's grants were still honoured. Nor does the successor's reading
+of that expiry decide whether the takeover was a fast one: a seal or an
+`ack=s3` takeover is, whatever its clock says.
+
+The cost: a takeover in the last seconds of the old lease waits the whole
+bound where it used to wait only until the expiry, and so does a takeover
+after the lease ran out of a holder cut from S3 but alive on P2P: its
+backup seals at the expiry it reads, which used to be a TTL takeover with
+no wait at all. Measured with strict reads and a held lock,
+that failover's first acknowledged write moved from the takeover itself to
+about 8.5 s after it, and the first new lock grant to about 23.5 s after
+it; a non-blocking lock request on a free file answers `EAGAIN` meanwhile
+(and a ring-transport mount may answer `ENOLCK` past its queue depth).
+Only a tenure that served strict reads or locks costs its successor
+anything. Shortening the wait from the successor's own observation of the
+old holder's last renewal, and turning those errors into waits, are
+planned (plan 43, C7-F).
+
+The successor keeps the lease through its takeover gate and until both
+waits have passed: it does not idle-release it to a node that wants it,
+nor serve a peer's handoff request or a continuation epoch's flush
+release. An operator's flush (`leave`, a suspension) and a shutdown
+(unmount, stop, the in-place upgrade's handover) are parked *before they
+start*: nothing is uploaded, shipped or published for them until the gate
+and the floor are over (the rounds still ship, and the node serves as
+before), then the flush runs and releases. So a `leave` or an unmount
+right after a seal takes up to the floor's remainder longer (23.5 s, or
+29.5 s with write delegations, at the defaults; 8.5 s and 14.5 s with
+locks off). The in-place upgrade waits for it *before it detaches the
+views*, which keep serving meanwhile: only the drain that follows stalls
+the applications, as without a seal; and it waits out a floor in full,
+because a new image would re-adopt the lease without it (the floor is in
+memory only, plan 43 Appendix B row 14). The floor is never given up on.
+A takeover gate that stays pending is: after a fixed 40 s cap (the gate
+only) a shutdown or `stop` ends without releasing, and the lease lapses by
+its TTL, which outlasts the floor, so the next holder takes it over by TTL
+or seal; a `leave` or a suspension reports that the release did not happen
+and the node, which keeps renewing, releases the lease at an idle round
+once the gate is over. Releasing inside the floor would hand the lease to
+a node that starts without it (a released lease is no fast takeover), and
+a lease released inside the gate left the log naming the releaser root of
+delegations its delegates could no longer use.
+
+`ack_floor_waits` counts the waits, and the log line "took a lease over by
+seal or ack=s3 from a tenure that served strict reads or locks" carries
+the wait in `wait_ms`.
+
 A node that is not listed as a backup must wait 3 s (twice the takeover
 time) past a `Backup` lease's expiry before it may claim it, so a listed
 backup gets there first. A new tenure starts with no backups and picks

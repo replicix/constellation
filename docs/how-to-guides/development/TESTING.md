@@ -4011,7 +4011,13 @@ Plan 30 M8: `SimConfig::strict` makes client reads `cto=strict` (local
 under a read delegation on the directory, else `Control::ReadIndex`
 through the core, then the session wait at the answer's position), and
 `SimConfig::clock_skew_ms` gives every node a clock off by a seeded
-constant within ± that (leases and delegations are judged on it). Every
+constant within ± that (leases and delegations are judged on it);
+`SimConfig::clock_offsets` adds an exact offset to named nodes (plan 43
+C7-H2: `fast-takeover-skewed-successor`, `locks-failover-backup-renew`
+with nodes 2 and 3 four seconds ahead of the 6 s lease, whose
+`a_skewed_successor_grants_no_lock_inside_the_old_roots_window` fails on
+the min-with-expiry floor: a lock granted over a holder still in its
+section). Every
 run checks close-to-open across nodes (`tests/sim/cto.rs`: a read
 invoked after another node's write returned `Ok` must be explained by
 that write's state or a later one, with the log as the version order),

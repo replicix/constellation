@@ -911,15 +911,24 @@ owner has replaced it.
   grants it does not know as *reclaims*. The grace covers what the old
   holder answered within the takeover window of its last proof of S3
   liveness, which is all it may answer, grants and renewals alike (see
-  [Leases, renewal and fencing](#leases-renewal-and-fencing)). The grace is `min(old expiry,
-  marker + takeover window + max(read delegation TTL, lock TTL) + 2 ×
-  margin)`. It holds back new lock grants only: the acknowledgement
-  floor that protects read delegations is computed with the read
-  delegation TTL alone, so a long lock TTL does not stall writes after a
-  takeover. The holder also mirrors its lock table to its backups
-  asynchronously (`LockMirror`), and a fast successor installs the last
-  mirror. The mirror is only an availability aid; the grace is what
-  keeps locks exclusive.
+  [Leases, renewal and fencing](#leases-renewal-and-fencing)). The grace
+  is `marker + takeover window + max(read delegation TTL, lock TTL) + 2 ×
+  margin` on the successor's own clock, counted from its own marker. The
+  old lease's expiry never cuts it short: that is a stamp of the old
+  holder's clock, and a successor ahead of it would read it as past and
+  grant over locks the old holder's nodes still honour. (A takeover in
+  the last seconds of the old lease therefore waits the full grace, where
+  it used to wait only until that expiry; and a seal or an `ack=s3`
+  takeover is a fast one, with the full grace, even when the successor's
+  clock reads the old lease as already expired.) It holds back new lock
+  grants only: the acknowledgement floor that protects read delegations
+  is computed with the read delegation TTL alone, so a long lock TTL does
+  not stall writes after a takeover. The holder also mirrors its lock
+  table to its backups asynchronously (`LockMirror`), and a fast
+  successor installs the last mirror. The mirror is only an availability
+  aid; the grace is what keeps locks exclusive. Until the grace ends, a
+  non-blocking request for a free lock answers `EAGAIN` (planned: wait
+  instead, plan 43 C7-F).
 - **Restart inside the lease**: lock grants persist a horizon of their
   own (next to the read delegations' one). A holder that restarts grants
   no lock until that horizon has passed, and accepts reclaims meanwhile;

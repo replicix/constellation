@@ -632,8 +632,8 @@ fn root_loss(name: &'static str, backed: bool, freeze: bool, handoff_first: bool
         anyhow::ensure!(took_over, "b never took the root over");
         // A counted quarantine is logged (else the measured term above
         // would be zero: a log text drift), and never longer than the
-        // configured one (it is capped by the predecessor's expiry, so it
-        // may be shorter).
+        // configured one (it is exactly that one, less the reclaim horizon
+        // when no write delegation was live).
         anyhow::ensure!(
             !quarantined || !waits.is_empty(),
             "the successor counted a quarantine (ack_floor_waits) but logged no wait_ms"

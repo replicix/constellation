@@ -257,6 +257,8 @@ pub struct NodeEnv {
     /// Plan 30 §M8: every node's clock is off by up to this (ms), by a
     /// seeded constant per node.
     pub clock_skew_ms: i64,
+    /// See `SimConfig::clock_offsets`.
+    pub clock_offsets: Vec<(NodeId, i64)>,
     pub seed: u64,
     /// Fix "capture under an epoch hold": the modelled chunks.
     pub world: Arc<ChunkWorld>,
@@ -274,16 +276,22 @@ pub struct NodeEnv {
 
 impl NodeEnv {
     /// Node `id`'s clock: the shared one, off by a seeded constant within
-    /// `±clock_skew_ms`.
+    /// `±clock_skew_ms`, and by its `clock_offsets` entry if it has one.
     pub fn clock_of(&self, id: NodeId) -> Clock {
+        let fixed: i64 = self
+            .clock_offsets
+            .iter()
+            .filter(|(n, _)| *n == id)
+            .map(|(_, ms)| ms)
+            .sum();
         if self.clock_skew_ms == 0 {
-            return self.clock;
+            return self.clock.skewed(fixed);
         }
         let h = (self.seed ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15))
             .wrapping_mul(0xbf58_476d_1ce4_e5b9);
         let span = 2 * self.clock_skew_ms + 1;
         self.clock
-            .skewed((h % span as u64) as i64 - self.clock_skew_ms)
+            .skewed((h % span as u64) as i64 - self.clock_skew_ms + fixed)
     }
 }
 

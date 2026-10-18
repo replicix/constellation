@@ -149,9 +149,10 @@
 //! - **Acknowledgement floor** (`horizon_wait`): a successor of an
 //!   unexpired lease whose tenure served strict reads (`Reg::marked`,
 //!   the `granted_delegations` flag set by a CAS before the first answer)
-//!   acknowledges no write until its clock reaches `min(old expiry,
-//!   marker time + takeover_window + deleg_ttl + 2·seq_margin)`
-//!   (`FloorPassed`). The delegate honours a grant made at `G` until
+//!   acknowledges no write until its clock reaches
+//!   `marker time + takeover_window + deleg_ttl + 2·seq_margin`
+//!   (`FloorPassed`; never cut short by the old expiry, a stamp of the
+//!   old holder's clock). The delegate honours a grant made at `G` until
 //!   `G + ttl − deleg_margin`; with `G < marker + takeover_window + 2D`
 //!   the floor covers it iff `seq_margin + deleg_margin > 4D` — the
 //!   lease's `M > 2D` again. A tenure that never served a strict read
@@ -879,18 +880,27 @@ impl Model for CtoModel {
                 s.saw |= SAW_TAKEOVER;
                 // Plan 30 §M9: an unexpired predecessor that served strict
                 // reads: hold every acknowledgement until its horizon.
-                let unexpired = prev.holder != NONE && !prev.released && now < prev.expires;
+                // The permit decides, not the clock: a fast takeover is a
+                // fast one whatever the taker's clock says of the old
+                // expiry (a stamp of the old holder's clock: plan 43
+                // C7-H2, the code's `acquire_won`). With `fast_takeover`
+                // every takeover of a live holder counts as permitted: a
+                // superset of the code's permit (a seal, `ack=s3` after
+                // silence), so this model explores no takeover that waits
+                // no floor; the code's no-floor TTL path is the sim's.
+                let permitted = self.fast_takeover && prev.holder != NONE && prev.holder != i as u8;
+                let unexpired =
+                    prev.holder != NONE && !prev.released && (permitted || now < prev.expires);
                 if unexpired {
                     s.saw |= SAW_FAST_TAKEOVER;
                 }
                 s.nodes[i].ack_floor = None;
                 if self.horizon_wait && unexpired && prev.marked {
                     let bound = now + self.takeover_window + self.deleg_ttl + 2 * self.seq_margin;
-                    let floor = prev.expires.min(bound);
-                    if floor > now {
-                        s.nodes[i].ack_floor = Some(floor);
-                        s.saw |= SAW_FLOOR_WAIT;
-                    }
+                    // Not `min(prev.expires, bound)`: the old expiry is the
+                    // old holder's clock (the code's floor is the bound).
+                    s.nodes[i].ack_floor = Some(bound);
+                    s.saw |= SAW_FLOOR_WAIT;
                 }
             }
             Action::Probe(i) => {

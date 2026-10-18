@@ -1174,6 +1174,20 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m9::backup_failover_with_delegation,
     },
     Scenario {
+        name: "upgrade-after-a-seal",
+        desc: "plan 43 C7-H2 (review R3-3): a strict reader holds a delegation from the holder, which dies; its backup takes over and is upgraded (daemon --upgrade) at once with a reader and a writer running on its mount: the upgrade waits out the takeover floor before it hands over, no read on that mount stalls past a few seconds or fails, and the generation advances",
+        requires: &[],
+        caps: &[],
+        run: handover::upgrade_after_a_seal,
+    },
+    Scenario {
+        name: "unmount-inside-the-takeover-floor",
+        desc: "plan 43 C7-H2 (review R2-1): a strict reader holds a delegation from the holder, which dies; its backup takes over and is unmounted at once: the unmount waits out the takeover floor before it releases the lease (prints its duration), and exits cleanly",
+        requires: &[],
+        caps: &[],
+        run: m9::unmount_inside_the_takeover_floor,
+    },
+    Scenario {
         name: "holder-kill-rejoin",
         desc: "campaign 6 B-1: four nodes, backups on; HOLDER_KILL_ROUNDS (10) rounds of kill -9 the lease holder (plain, with a flock held on it, or a backup instead) and remount it with P2P on within 60 s, then every node converges; prints the remount-time distribution",
         requires: &[],
@@ -1347,6 +1361,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::lock_holder_partitioned,
+    },
+    Scenario {
+        name: "s3-cut-holder-failover-with-locks",
+        desc: "plan 43 C7-H2 cost (gate G5): four nodes, strict reads, a held lock; the holder loses S3 but not P2P, its backup seals once the lease reads expired and takes over; prints the failover, the first write acknowledged and the first lock granted after it, the longest write, and every errno the applications saw (fails only on an errno other than EAGAIN)",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::s3_cut_holder_failover_with_locks,
     },
     Scenario {
         name: "lock-failover",

@@ -25,11 +25,11 @@ pub struct PendingGate {
     /// M13: every older epoch's inbox batch has been executed and deleted
     /// (or the inbox is off).
     pub drained: bool,
-    /// Plan 30 §M9: the lease this one took over had not expired (a
-    /// sealed backup's or an `ack=s3` fast takeover): its expiry and
-    /// whether that tenure served strict reads, for the successor's
-    /// acknowledgement floor (see `core::backup`).
-    pub fast_prev: Option<(i64, bool)>,
+    /// Plan 30 §M9: this tenure took its lease over by permit (a sealed
+    /// backup's or an `ack=s3` fast takeover), whatever this node's clock
+    /// says of the old expiry (plan 43 C7-H2: that is a stamp of another
+    /// node's clock and is not kept).
+    pub fast_prev: bool,
     /// Plan 30 §M9: this node backed the predecessor at this epoch and
     /// must apply what is left of its backup tail before its view opens
     /// (`None` once applied, or when it backed nobody).
@@ -666,7 +666,7 @@ mod tests {
                 takeover: true,
                 marker_shipped: false,
                 drained: true,
-                fast_prev: None,
+                fast_prev: false,
                 backup_tail_epoch: None,
                 shippable: false,
             }),

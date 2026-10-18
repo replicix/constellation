@@ -5023,6 +5023,7 @@ impl Core {
         // the tenure is over: nothing continues it any more.
         let kept = std::mem::take(&mut self.lk.keep_grants);
         if !kept {
+            self.end_takeover_floor();
             self.lock_quarantine_dropped_tenure(now, replica);
             self.pr.closed_tenure.clear();
             self.pr.closed_lease = None;

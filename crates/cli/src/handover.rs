@@ -740,6 +740,13 @@ pub fn upgrade(node: &Arc<NodeRuntime>, binary: Option<&Path>) -> Result<String,
         Some(binary) => binary,
         None => return Err(state.fail("the daemon's executable is unknown".into())),
     };
+    // Plan 43 C7-H2: the drain that follows releases the lease, which a
+    // node inside its takeover gate or floor holds back until they end. The
+    // wait is here, before the sessions detach: the views keep serving
+    // through it, and only the short drain stalls the applications.
+    if let Err(why) = preflight(&binary).map(|()| wait_out_takeover_floor(node)) {
+        return Err(state.fail(why));
+    }
     let detached = match prepare(node, &binary) {
         Ok(detached) => detached,
         Err(why) => return Err(state.fail(why)),
@@ -762,6 +769,44 @@ pub fn upgrade(node: &Arc<NodeRuntime>, binary: Option<&Path>) -> Result<String,
     }
     tracing::info!("{message}");
     Ok(message)
+}
+
+/// How long a fast takeover's pending gate is waited for before the upgrade
+/// goes on (the floor is always waited out: it is bounded and ends on its
+/// own; a release inside it is what the wait prevents). The same bound as
+/// the authority core's flush.
+const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(40);
+
+/// Wait, with the views serving, until releasing the lease would no longer
+/// be held back: no fast takeover's gate pending, the takeover floor past
+/// (plan 43 C7-H2). Returns at once on a node that holds no such tenure.
+fn wait_out_takeover_floor(node: &Arc<NodeRuntime>) {
+    use constellation_engine::lease::ReleaseHold;
+    let started = std::time::Instant::now();
+    let mut announced = false;
+    loop {
+        let hold = node.engine().lease().release_hold();
+        let step = match hold {
+            None => return,
+            Some(ReleaseHold::Gate) if started.elapsed() >= GATE_WAIT => {
+                tracing::warn!(
+                    "the takeover gate stayed pending for {GATE_WAIT:?}; handing over anyway"
+                );
+                return;
+            }
+            Some(ReleaseHold::Gate) => std::time::Duration::from_millis(100),
+            Some(ReleaseHold::Floor(left)) => left.min(std::time::Duration::from_millis(250)),
+        };
+        if !announced {
+            announced = true;
+            tracing::info!(
+                ?hold,
+                "the upgrade waits for the takeover gate and floor before it hands over: the \
+                 views keep serving"
+            );
+        }
+        std::thread::sleep(step);
+    }
 }
 
 /// Steps 1-2: preflight, then detach every view (undoing on failure).

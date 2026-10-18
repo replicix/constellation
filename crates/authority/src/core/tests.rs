@@ -421,7 +421,7 @@ fn a_peers_forward_is_busy_while_fenced_and_executes_once_the_gate_opens() {
             takeover: true,
             marker_shipped: true,
             drained: true,
-            fast_prev: None,
+            fast_prev: false,
             backup_tail_epoch: None,
             shippable: false,
         }),
@@ -923,6 +923,575 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
         "the rounds never settled to the poll cadence"
     );
     assert!(h.core.job().is_none(), "no round follows at once");
+}
+
+/// Plan 43 C7-H2 (`delegated-holder-cut` seeds 65 and 97 with the floor
+/// the whole bound): a tenure inside its takeover floor is not
+/// idle-released for a node that wants the lease. The floor stands for the
+/// predecessor's grants and lives in this node's tables; the node that
+/// takes a released lease over starts without it. (And in the sim the
+/// delegate that named this node owner of its subtree had its forwards
+/// refused `NotHolder` for ever once it let go.)
+#[test]
+fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
+    // One round of the poll at `h.now`: every upload and S3 request is
+    // answered; whether a release CAS (a released lease) was sent.
+    fn releases(h: &mut Harness) -> bool {
+        let mut out = Vec::new();
+        h.core.start(h.now, &h.meta, &mut out);
+        let poll = timers(&out, TimerKind::Poll)[0];
+        let mut acts = h.step(Event::Timer { id: poll });
+        let mut released = h.core.lease.releasing;
+        for _ in 0..20 {
+            if let Some(upload) = acts.iter().find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            }) {
+                acts = h.step(Event::UploadsDone {
+                    op: upload,
+                    result: UploadResult::Done { held: 0 },
+                });
+                released |= h.core.lease.releasing;
+                continue;
+            }
+            let Some((op, req)) = s3_ops(&acts).first().map(|(o, r)| (*o, (*r).clone())) else {
+                break;
+            };
+            let result = match req {
+                S3Op::SegmentPut { .. } => S3Result::SegmentPut(Ok(())),
+                S3Op::LeaseSwap { lease, .. } => {
+                    released |= lease.released;
+                    S3Result::LeasePut(Ok(tag()))
+                }
+                S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                other => panic!("unexpected S3 op in the round: {other:?}"),
+            };
+            acts = h.step(Event::S3 { op, result });
+            released |= h.core.lease.releasing;
+        }
+        released
+    }
+    let idle = |h: &mut Harness| {
+        let long_ago = Ms(h.now.0 - 1_000_000);
+        h.core.lease.wanted = vec![2];
+        h.core.lease.wanted_since = Some(long_ago);
+        h.core.lease.held_since = Some(long_ago);
+        h.core.lease.last_write = long_ago;
+        assert!(h.core.lease.wants_handoff(h.now, h.core.config()));
+    };
+    // Control: nothing pending, the idle holder hands the lease over.
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    idle(&mut h);
+    assert!(releases(&mut h), "the control never released");
+    // A takeover of a tenure that served strict reads (the floor), then
+    // one that only granted locks: the lease stays until the floor ends,
+    // and past it the same idle holder releases.
+    for locks in [false, true] {
+        let mut h = Harness::new(1);
+        h.core.cfg.locks = locks;
+        h.core.cfg.lock_ttl_ms = 20_000;
+        h.core.cfg.read_delegation_ttl_ms = 5_000;
+        h.hold(1, None);
+        let prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
+        h.core.note_fast_takeover(&prev);
+        let mut out = Vec::new();
+        let landed = h.now;
+        h.core.note_marker_landed(landed, &h.meta, &mut out);
+        let margins = 2 * h.core.cfg.expiry_margin_ms as i64 + h.core.cfg.backup_takeover_ms as i64;
+        let until = landed.0 + margins + if locks { 20_000 } else { 5_000 };
+        assert!(h.core.in_takeover_floor(Ms(until - 1)));
+        assert!(!h.core.in_takeover_floor(Ms(until)));
+        idle(&mut h);
+        assert!(
+            !releases(&mut h),
+            "released inside the takeover floor (locks {locks})"
+        );
+        h.now = Ms(until + 1);
+        idle(&mut h);
+        assert!(
+            releases(&mut h),
+            "never released past the takeover floor (locks {locks})"
+        );
+    }
+    // A takeover gate still pending (no ship epoch, so no inherited
+    // generation is live yet): the lease stays whatever the floor. The
+    // round's end decides (`round_release`); a gate-free holder releases.
+    for pending in [false, true] {
+        let mut h = Harness::new(1);
+        let gate = pending.then_some(PendingGate {
+            epoch: 1,
+            takeover: true,
+            marker_shipped: false,
+            drained: false,
+            fast_prev: true,
+            backup_tail_epoch: None,
+            shippable: false,
+        });
+        h.hold(1, gate);
+        idle(&mut h);
+        let mut out = Vec::new();
+        h.core.round_release(h.now, &h.meta, &mut out);
+        assert_eq!(
+            h.core.lease.releasing, !pending,
+            "idle release with the takeover gate pending: {pending}"
+        );
+    }
+    // The tenure ends: the guard ends with it.
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    h.core
+        .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+    let mut out = Vec::new();
+    h.core.note_marker_landed(h.now, &h.meta, &mut out);
+    assert!(h.core.in_takeover_floor(h.now));
+    h.core.lock_on_lease_gone(h.now, &h.meta, &mut out);
+    assert!(
+        !h.core.in_takeover_floor(h.now),
+        "the floor outlived its tenure"
+    );
+}
+
+/// What [`drive_job`] saw.
+#[derive(Default)]
+struct Driven {
+    /// A `LeaseSwap` that releases the lease was sent.
+    released: bool,
+    uploads: usize,
+    /// `ControlDone`: the control and whether it succeeded.
+    done: Vec<(OpId, bool)>,
+    /// `LeaseHandoff` answers: the requester and `released`.
+    handoffs: Vec<(NodeId, bool)>,
+    /// The epoch those answers carry: the holder's own when `on_lease_request`
+    /// declined, 0 when the handoff job did.
+    handoff_epochs: Vec<u64>,
+    /// `SegmentPut`s sent (shipping).
+    puts: usize,
+    /// The `FlushFloor` look armed last.
+    look: Option<TimerId>,
+}
+
+/// Answers a job's uploads and S3 requests until it asks for nothing more.
+fn drive_job(h: &mut Harness, mut acts: Vec<Action>) -> Driven {
+    let mut d = Driven::default();
+    for _ in 0..40 {
+        d.uploads += acts
+            .iter()
+            .filter(|a| matches!(a, Action::UploadDirtyChunks { .. }))
+            .count();
+        for a in &acts {
+            match a {
+                Action::ControlDone { op, result } => d.done.push((*op, result.is_ok())),
+                Action::Send {
+                    to,
+                    msg:
+                        PeerMsg::LeaseHandoff {
+                            released, epoch, ..
+                        },
+                } => {
+                    d.handoffs.push((*to, *released));
+                    d.handoff_epochs.push(*epoch);
+                }
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::FlushFloor,
+                    ..
+                } => d.look = Some(*id),
+                _ => {}
+            }
+        }
+        if let Some(upload) = acts.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            acts = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+            continue;
+        }
+        if let Some(op) = acts.iter().find_map(|a| match a {
+            Action::Publish { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            acts = h.step(Event::PublishDone { op, ok: true });
+            continue;
+        }
+        let Some((op, req)) = s3_ops(&acts).first().map(|(o, r)| (*o, (*r).clone())) else {
+            break;
+        };
+        let result = match req {
+            S3Op::SegmentPut { .. } => {
+                d.puts += 1;
+                S3Result::SegmentPut(Ok(()))
+            }
+            S3Op::LeaseSwap { lease, .. } => {
+                d.released |= lease.released;
+                S3Result::LeasePut(Ok(tag()))
+            }
+            S3Op::InboxRun { .. } => S3Result::InboxRun(Ok(Vec::new())),
+            S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+            S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+            other => panic!("unexpected S3 op: {other:?}"),
+        };
+        acts = h.step(Event::S3 { op, result });
+    }
+    d
+}
+
+/// Plan 43 C7-H2 (review R2-1): an operator flush (`leave`, a suspension)
+/// or a shutdown (unmount, stop, an upgrade's handover) does not release
+/// the lease inside the takeover floor or with the takeover gate pending:
+/// the node that took a released lease over would start without them. It
+/// waits (the job slot stays free: the gate completes in rounds) and
+/// releases right after, or gives up at the cap and leaves the lease to
+/// lapse.
+#[test]
+fn a_flush_or_shutdown_inside_the_takeover_floor_waits_for_it() {
+    let arm = |h: &mut Harness| {
+        h.core
+            .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+        let mut out = Vec::new();
+        let now = h.now;
+        h.core.note_marker_landed(now, &h.meta, &mut out);
+        assert!(h.core.in_takeover_floor(h.now));
+    };
+    let gate = || PendingGate {
+        epoch: 1,
+        takeover: true,
+        marker_shipped: false,
+        drained: false,
+        fast_prev: true,
+        backup_tail_epoch: None,
+        shippable: false,
+    };
+    for (stop, what) in [
+        (false, "floor"),
+        (true, "floor"),
+        (false, "gate"),
+        (true, "gate"),
+        (false, "gate and floor"),
+    ] {
+        let mut h = Harness::new(1);
+        h.hold(1, what.starts_with("gate").then(gate));
+        if what != "gate" {
+            arm(&mut h);
+        }
+        let flush = OpId(7);
+        let out = h.step(Event::Control {
+            op: flush,
+            req: if stop {
+                Control::Shutdown
+            } else {
+                Control::Flush
+            },
+        });
+        let d = drive_job(&mut h, out);
+        assert!(
+            !d.released,
+            "released inside the takeover {what} (stop {stop})"
+        );
+        assert!(
+            d.done.is_empty() && d.uploads == 0,
+            "the flush ran inside the takeover {what}"
+        );
+        assert_eq!(h.core.job(), None, "the flush holds the job slot ({what})");
+        assert!(!h.core.stopped());
+        let look = d.look.unwrap_or_else(|| panic!("no look armed ({what})"));
+        // Looking again while the gate or floor stands changes nothing.
+        h.advance(300);
+        let out = h.step(Event::Timer { id: look });
+        let d = drive_job(&mut h, out);
+        assert!(!d.released && d.done.is_empty());
+        let look = d
+            .look
+            .unwrap_or_else(|| panic!("the look was not re-armed ({what})"));
+        // The gate and the floor end: the flush runs and releases.
+        h.core.lease.gate = None;
+        h.now = Ms(h
+            .meta
+            .read_delegations()
+            .quarantine_until()
+            .max(h.meta.locks().quarantine_until())
+            .max(h.now.0)
+            + 1);
+        let out = h.step(Event::Timer { id: look });
+        let d = drive_job(&mut h, out);
+        assert!(
+            d.released,
+            "never released after the takeover {what} (stop {stop})"
+        );
+        assert_eq!(
+            d.done,
+            vec![(flush, true)],
+            "the flush was not answered after the {what}"
+        );
+        assert_eq!(h.core.stopped(), stop);
+    }
+    // A pending gate that never ends: at the cap the flush gives up. The
+    // lease is not released, the caller is told, a shutdown stops.
+    for stop in [false, true] {
+        let mut h = Harness::new(1);
+        h.core.cfg.flush_floor_cap_ms = 5_000;
+        h.hold(1, Some(gate()));
+        let flush = OpId(8);
+        let out = h.step(Event::Control {
+            op: flush,
+            req: if stop {
+                Control::Shutdown
+            } else {
+                Control::Flush
+            },
+        });
+        let mut look = drive_job(&mut h, out).look.expect("a look");
+        let mut answered = None;
+        for _ in 0..40 {
+            h.advance(200);
+            let out = h.step(Event::Timer { id: look });
+            let d = drive_job(&mut h, out);
+            assert!(!d.released, "released at the cap (stop {stop})");
+            if let Some((_, ok)) = d.done.first() {
+                answered = Some(*ok);
+                break;
+            }
+            look = d.look.expect("re-armed");
+        }
+        assert_eq!(
+            answered,
+            Some(false),
+            "the flush never gave up (stop {stop})"
+        );
+        assert_eq!(h.core.stopped(), stop);
+    }
+}
+
+/// Plan 43 C7-H2 (review R2-6): the handoff guard in `begin_handoff` alone.
+/// The request arrives while a round holds the slot, before the floor
+/// exists (`on_lease_request` admits it and queues the job); the floor is
+/// armed by the time the job starts.
+#[test]
+fn a_queued_handoff_that_meets_the_takeover_floor_is_declined() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let mut out = Vec::new();
+    h.core.start(h.now, &h.meta, &mut out);
+    let poll = timers(&out, TimerKind::Poll)[0];
+    let round = h.step(Event::Timer { id: poll });
+    assert_eq!(h.core.job(), Some(JobKind::Round));
+    let queued = h.step(Event::Peer {
+        from: 2,
+        msg: PeerMsg::LeaseRequest {
+            req: OpId(5),
+            epoch_applied: None,
+        },
+    });
+    assert!(sends(&queued).is_empty(), "answered at once: {queued:?}");
+    h.core
+        .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+    let now = h.now;
+    h.core.note_marker_landed(now, &h.meta, &mut out);
+    let d = drive_job(&mut h, round);
+    assert!(!d.released, "released inside the floor");
+    assert_eq!(
+        d.handoffs,
+        vec![(2, false)],
+        "the queued request was not declined"
+    );
+    // By `begin_handoff` (the job's answer carries epoch 0), before it
+    // uploaded anything: the release-step check would have declined it too,
+    // but only after an upload.
+    assert_eq!(d.handoff_epochs, vec![0], "not declined when the job began");
+    assert_eq!(
+        d.uploads, 1,
+        "the declined job uploaded too (the round's own upload is the one)"
+    );
+}
+
+/// Plan 43 C7-H2 (review R3-5): a flush that is already running when the
+/// takeover floor begins (it was queued behind the round that landed the
+/// marker, or its upload took the time) parks at its release step: nothing
+/// is released, the caller is not answered, and once the floor ends the
+/// flush runs again and releases.
+#[test]
+fn a_flush_that_meets_the_floor_at_its_release_step_parks_there() {
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    let flush = OpId(7);
+    let out = h.step(Event::Control {
+        op: flush,
+        req: Control::Flush,
+    });
+    assert_eq!(
+        h.core.job(),
+        Some(JobKind::Flush),
+        "the flush did not start"
+    );
+    // The marker lands while the flush's upload is out.
+    h.core
+        .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+    let mut none = Vec::new();
+    let now = h.now;
+    h.core.note_marker_landed(now, &h.meta, &mut none);
+    assert!(h.core.in_takeover_floor(h.now));
+    let d = drive_job(&mut h, out);
+    assert!(!d.released, "released at the release step inside the floor");
+    assert!(d.done.is_empty(), "answered inside the floor");
+    assert_eq!(h.core.job(), None, "the parked flush holds the slot");
+    let look = d.look.expect("no look armed");
+    h.now = Ms(h
+        .meta
+        .read_delegations()
+        .quarantine_until()
+        .max(h.meta.locks().quarantine_until())
+        + 1);
+    let out = h.step(Event::Timer { id: look });
+    let d = drive_job(&mut h, out);
+    assert!(d.released, "never released after the floor");
+    assert_eq!(d.done, vec![(flush, true)]);
+}
+
+/// Plan 43 C7-H2 (review R3-1): a flush never gives up while the floor
+/// stands, however long: the cap is for a gate that stays pending. With a
+/// floor much longer than the cap it waits the floor out and releases.
+#[test]
+fn a_flush_waits_out_a_floor_longer_than_its_cap() {
+    let mut h = Harness::new(1);
+    h.core.cfg.flush_floor_cap_ms = 1_000;
+    h.core.cfg.lock_ttl_ms = 100_000;
+    h.hold(1, None);
+    h.core
+        .note_fast_takeover(&Lease::granted("p0", 1, 1, 600_000).with_granted_delegations());
+    let mut none = Vec::new();
+    let landed = h.now;
+    h.core.note_marker_landed(landed, &h.meta, &mut none);
+    let floor_end = h.meta.locks().quarantine_until();
+    assert!(floor_end > landed.0 + 90_000, "the floor is not long");
+    let flush = OpId(9);
+    let out = h.step(Event::Control {
+        op: flush,
+        req: Control::Flush,
+    });
+    let mut look = drive_job(&mut h, out).look.expect("a look");
+    while h.now.0 + 200 < floor_end {
+        h.advance(200);
+        let out = h.step(Event::Timer { id: look });
+        let d = drive_job(&mut h, out);
+        assert!(
+            !d.released && d.done.is_empty(),
+            "gave up or released {} ms into a floor of {} ms",
+            h.now.0 - landed.0,
+            floor_end - landed.0
+        );
+        look = d.look.expect("the look was not re-armed");
+    }
+    h.now = Ms(floor_end + 1);
+    let out = h.step(Event::Timer { id: look });
+    let d = drive_job(&mut h, out);
+    assert!(d.released, "not released after the floor");
+    assert_eq!(d.done, vec![(flush, true)]);
+}
+
+/// Plan 43 C7-H2 (review R3-2): the continuation epoch's flush release
+/// holds for a *fast takeover's* gate before its marker landed (no floor
+/// yet), and still releases at the epoch's own re-claim gate
+/// (`locks-blips-tight-faults` seed 5379).
+#[test]
+fn an_epoch_flush_holds_for_a_fast_takeovers_gate_only() {
+    for fast in [true, false] {
+        let mut h = Harness::new(1);
+        h.hold(
+            1,
+            Some(PendingGate {
+                epoch: 1,
+                takeover: true,
+                marker_shipped: false,
+                drained: false,
+                fast_prev: fast,
+                backup_tail_epoch: None,
+                shippable: false,
+            }),
+        );
+        h.step(Event::Control {
+            op: OpId(1 << 40),
+            req: Control::Epoch {
+                open: false,
+                active: false,
+                frozen: false,
+                flushing: true,
+                base: 0,
+                members: vec![1, 2],
+                carrier: None,
+                stale_below: 1,
+            },
+        });
+        let mut out = Vec::new();
+        h.core.round_release(h.now, &h.meta, &mut out);
+        assert_eq!(
+            h.core.lease.releasing, !fast,
+            "the epoch's flush release with a gate pending (fast takeover: {fast})"
+        );
+    }
+}
+
+/// Plan 43 C7-H2 (review S3): a peer's handoff request inside the takeover
+/// floor is declined, with the inbox off too (the gate waits out the read
+/// quarantine only with the inbox on, and not the lock grace at all). The
+/// node that takes a released lease over gets no floor.
+#[test]
+fn a_handoff_inside_the_takeover_floor_is_declined() {
+    let request = |h: &mut Harness| {
+        h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LeaseRequest {
+                req: OpId(5),
+                epoch_applied: None,
+            },
+        })
+    };
+    let mut h = Harness::new(1);
+    h.hold(1, None);
+    // Control: no floor, the request starts the handoff job.
+    request(&mut h);
+    assert_eq!(h.core.job(), Some(JobKind::Handoff));
+    for locks in [false, true] {
+        let mut h = Harness::new(1);
+        h.core.cfg.locks = locks;
+        h.hold(1, None);
+        h.core
+            .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+        let mut out = Vec::new();
+        let landed = h.now;
+        h.core.note_marker_landed(landed, &h.meta, &mut out);
+        let out = request(&mut h);
+        let d = drive_job(&mut h, out);
+        assert_eq!(
+            d.handoffs,
+            vec![(2, false)],
+            "the request was not declined inside the floor (locks {locks})"
+        );
+        // Declined at admission (`on_lease_request`): the answer carries
+        // the holder's own epoch, the handoff job's carries 0, and nothing
+        // was uploaded or shipped for it.
+        assert_eq!(d.handoff_epochs, vec![1], "not declined at admission");
+        assert!(d.uploads == 0 && d.puts == 0 && !d.released);
+        assert_eq!(h.core.job(), None);
+        // Past the floor the same request is served.
+        h.now = Ms(h
+            .meta
+            .read_delegations()
+            .quarantine_until()
+            .max(h.meta.locks().quarantine_until())
+            + 1);
+        h.hold(1, None);
+        request(&mut h);
+        assert_eq!(
+            h.core.job(),
+            Some(JobKind::Handoff),
+            "never served (locks {locks})"
+        );
+    }
 }
 
 /// Fix "capture under an epoch hold": a handoff whose flush cannot drain
@@ -3260,7 +3829,7 @@ fn an_awaiting_log_forward_is_answered_from_completed_once_this_node_holds() {
             takeover: true,
             marker_shipped: false,
             drained: false,
-            fast_prev: None,
+            fast_prev: false,
             backup_tail_epoch: None,
             shippable: false,
         }),
@@ -9964,7 +10533,7 @@ mod backup_crash {
             "the gate re-ships the sealed tail"
         );
         assert!(
-            h.core.lease.gate.is_some_and(|g| g.fast_prev.is_some()),
+            h.core.lease.gate.is_some_and(|g| g.fast_prev),
             "the replaced (unexpired) lease stays the predecessor: its \
              strict-read horizon is this tenure's acknowledgement floor"
         );
@@ -9990,6 +10559,90 @@ mod backup_crash {
             "the acknowledged create is in this tenure's journal"
         );
         assert!(MetaStore::lookup(&h.meta, ROOT_INO, "a").unwrap().is_some());
+    }
+
+    /// Plan 43 C7-H2: a sealed backup's takeover is a fast one whatever its
+    /// own clock says of the lease it replaces. The lease's expiry is a
+    /// stamp of the holder's clock; a backup ahead of it by more than the
+    /// lease has left reads it as expired, and the takeover then counted
+    /// as a TTL takeover: no floor, so the successor acknowledged and
+    /// granted over the delegations and locks the holder's clients still
+    /// honoured.
+    #[test]
+    fn a_sealed_takeover_is_fast_though_the_successors_clock_reads_the_lease_expired() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &holder.create("a"), Some(rid)).unwrap();
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        let mut h = Harness::new(2);
+        h.core.cfg.takeover_promise_check = false;
+        h.core.cfg.read_delegation_ttl_ms = 5_000;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs,
+                through: 0,
+                expires_unix_ms: 0,
+            },
+        });
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        h.advance(5_000);
+        let out = h.step(Event::Timer { id: watch });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        // The holder served strict reads; its lease ends 2 s from now on
+        // the holder's clock, which this node's clock is 4 s ahead of.
+        let theirs = Lease {
+            granted_delegations: true,
+            ..backup_lease(1, 1, h.now.0 - 2_000, vec![2])
+        };
+        assert!(theirs.is_expired(h.now.0));
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+        });
+        assert_eq!(h.core.bk.sealed, 1);
+        let mut marker_landed = false;
+        for _ in 0..12 {
+            let next = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead));
+            let Some((op, req)) = next else { break };
+            let result = match req {
+                S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                S3Op::SegmentPut { .. } => {
+                    marker_landed = true;
+                    S3Result::SegmentPut(Ok(()))
+                }
+                other => panic!("unexpected {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+            if marker_landed {
+                break;
+            }
+        }
+        assert!(marker_landed, "the takeover's marker never landed");
+        assert_eq!(
+            h.core.stats.ack_floor_waits, 1,
+            "a permitted takeover is a fast one: the floor was never set"
+        );
+        assert!(
+            h.meta.read_delegations().quarantine_until() > h.now.0 + 5_000,
+            "no acknowledgement floor after a sealed takeover"
+        );
     }
 
     /// backup-crash-slow seed 601692: the sealed successor crashed inside
@@ -10605,7 +11258,7 @@ mod locks {
                 takeover: true,
                 marker_shipped: true,
                 drained: false,
-                fast_prev: None,
+                fast_prev: false,
                 backup_tail_epoch: Some(1),
                 shippable: true,
             }),
@@ -14598,7 +15251,7 @@ mod locks {
                 takeover: true,
                 marker_shipped: true,
                 drained: false,
-                fast_prev: Some((h.now.plus(10_000).0, true)),
+                fast_prev: true,
                 backup_tail_epoch: None,
                 shippable: true,
             }),
@@ -15560,6 +16213,42 @@ mod locks {
             now.0 + 20_000 + margins,
             "new lock grants wait for the lock grants"
         );
+    }
+
+    /// Plan 43 C7-H2: the successor's floor is the bound alone, counted on
+    /// its own clock from its own marker. The predecessor's lease expiry
+    /// is a stamp of the predecessor's clock: a successor ahead of it by
+    /// more than the lease has left reads it as past (or about to be), and
+    /// `min(expiry, bound)` ended the floor before the predecessor's
+    /// delegations and lock grants did (here: no quarantine at all).
+    #[test]
+    fn a_fast_takeover_floor_ignores_the_predecessors_expiry() {
+        for expires_after in [-3_000, -1, 0, 1, 1_000, 4_000, 60_000] {
+            let mut h = Harness::new(2);
+            h.core.cfg.lock_ttl_ms = 20_000;
+            h.core.cfg.read_delegation_ttl_ms = 5_000;
+            let mut prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
+            prev.expires_unix_ms = h.now.0 + expires_after;
+            h.core.note_fast_takeover(&prev);
+            let mut out = Vec::new();
+            let now = h.now;
+            h.core.note_marker_landed(now, &h.meta, &mut out);
+            let margins =
+                2 * h.core.cfg.expiry_margin_ms as i64 + h.core.cfg.backup_takeover_ms as i64;
+            assert_eq!(
+                h.meta.read_delegations().quarantine_until(),
+                now.0 + 5_000 + margins,
+                "acknowledgements wait the whole bound, the predecessor's \
+                 expiry {expires_after} ms from now notwithstanding"
+            );
+            assert_eq!(
+                h.meta.locks().quarantine_until(),
+                now.0 + 20_000 + margins,
+                "new lock grants wait the whole bound, the predecessor's \
+                 expiry {expires_after} ms from now notwithstanding"
+            );
+            assert_eq!(h.core.stats.ack_floor_waits, 1);
+        }
     }
 
     /// The lock-exclusion review's follow-up: a recalled grant whose
@@ -16980,7 +17669,7 @@ mod locks {
                 takeover: true,
                 marker_shipped: false,
                 drained: true,
-                fast_prev: None,
+                fast_prev: false,
                 backup_tail_epoch: None,
                 shippable: false,
             }),

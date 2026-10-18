@@ -77,12 +77,20 @@
 //!   once. So every strict answer the old holder gives is sent within
 //!   `backup_takeover_ms + 2D` of the last moment before the successor's
 //!   marker existed.
-//! - A successor of an *unexpired* lease whose tenure served strict
-//!   reads (`Lease::granted_delegations`, set by one CAS before the first
-//!   answer) acknowledges no mutation until
-//!   `min(old expiry, marker time + backup_takeover_ms + read_delegation_ttl + 2M)`
-//!   — through the M8 quarantine every acknowledgement already waits on.
-//!   A tenure that never served a strict read costs its successor nothing.
+//! - A successor of a lease it took over by permit (a seal, or `ack=s3`:
+//!   before the expiry, or past it by the successor's clock alone) whose
+//!   tenure served strict reads (`Lease::granted_delegations`, set by one
+//!   CAS before the first answer) acknowledges no mutation until
+//!   `marker time + backup_takeover_ms + read_delegation_ttl + 2M`
+//!   (plus the reclaim horizon when write delegations were live) —
+//!   through the M8 quarantine every acknowledgement already waits on.
+//!   The predecessor's lease expiry is no shortcut: it is a stamp of the
+//!   predecessor's wall clock, and a successor whose clock runs ahead
+//!   reads it as past (or too near) while the predecessor's grants are
+//!   still honoured. The bound alone counts only the successor's own
+//!   elapsed time, so it needs a bounded clock *rate*, not a bounded
+//!   offset (`W + ttl + 2M ≥ (W + ttl − M)(1 + ρ)`). A tenure that never
+//!   served a strict read costs its successor nothing.
 //!
 //! # Continuation epochs (plan 30 §M10's claim rule, enforced here)
 //!
@@ -286,9 +294,15 @@ pub(crate) struct AckState {
     pub(crate) renew_held_deleg: Vec<(FreshHold, NodeId, PeerMsg)>,
     /// What the replica's durability gate was last told.
     reported: Option<(bool, u64, bool)>,
-    /// The tenure's marker time, for the successor's floor (see the
-    /// module doc); `None` after the floor was set or when none is due.
-    pending_floor: Option<(i64, Ms)>,
+    /// A fast takeover of a tenure that served strict reads is waiting for
+    /// its marker, where the successor's floor starts (see the module
+    /// doc); `false` after the floor was set or when none is due.
+    pending_floor: bool,
+    /// Where this tenure's takeover floor ends (the later of its
+    /// acknowledgement floor and its lock grace, `note_marker_landed`),
+    /// 0 for a tenure with none: the lease is not idle-released before it
+    /// (`in_takeover_floor`).
+    floor_until: i64,
     /// The journal seq the last stream-ahead covered, for every
     /// subscriber.
     streamed_through: u64,
@@ -938,17 +952,51 @@ impl Core {
 
     // --------------------------------------------------------- the floor
 
-    /// `acquire_won`: the lease taken over had not expired (a seal or an
-    /// `ack=s3` fast takeover). Once the marker lands, the successor's
-    /// acknowledgements wait out the predecessor's strict-read horizon —
-    /// unless that tenure never served one.
+    /// `acquire_won`: a seal or an `ack=s3` fast takeover (the lease had
+    /// not expired, or this node's clock cannot tell). Once the marker
+    /// lands, the successor's acknowledgements wait out the predecessor's
+    /// strict-read horizon — unless that tenure never served one. The
+    /// predecessor's lease expiry plays no part in the wait
+    /// (`note_marker_landed`).
     pub(crate) fn note_fast_takeover(&mut self, prev: &Lease) {
         // Plan 41 L0: a predecessor's generations are outwaited the
         // takeover window longer (`DelegationState::inherit_slack_ms`).
         self.dl.inherit_slack_ms = self.cfg.backup_takeover_ms;
-        self.ack.pending_floor = prev
-            .granted_delegations
-            .then_some((prev.expires_unix_ms, Ms(0)));
+        self.ack.pending_floor = prev.granted_delegations;
+    }
+
+    /// This tenure is inside its takeover floor (`note_marker_landed`).
+    /// The floor stands for grants of the predecessor's tenure that only
+    /// this node's tables know to wait for, and the node that takes a
+    /// released lease over starts without it (`fast_prev` is false for a
+    /// released lease, and `lock_on_released_takeover` covers this node's
+    /// own grants only): the lease is not released to another node
+    /// meanwhile, by idle release, by a peer's handoff request or by a
+    /// continuation epoch's flush. (An operator's flush and stop is not
+    /// held: the process is going away.)
+    pub(crate) fn in_takeover_floor(&self, now: Ms) -> bool {
+        now.0 < self.ack.floor_until
+    }
+
+    /// Where this tenure's takeover floor ends, in unix ms (0: none): the
+    /// engine's upgrade handover waits for it before it detaches the views,
+    /// which keep serving meanwhile.
+    pub fn takeover_floor_until_ms(&self) -> i64 {
+        self.ack.floor_until
+    }
+
+    /// A fast takeover's gate is pending (its marker, tail or quarantine
+    /// not done): a release now would hand the lease on without a floor.
+    pub fn fast_gate_pending(&self) -> bool {
+        self.lease.gate.as_ref().is_some_and(|g| g.fast_prev)
+    }
+
+    /// The tenure ended (`lock_on_lease_gone`): a floor not yet armed is
+    /// not the next tenure's, and the guard on releasing ends with it (the
+    /// tables' quarantines run on).
+    pub(crate) fn end_takeover_floor(&mut self) {
+        self.ack.pending_floor = false;
+        self.ack.floor_until = 0;
     }
 
     /// The takeover's marker landed at `now`.
@@ -958,9 +1006,14 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        let Some((prev_expires, _)) = self.ack.pending_floor.take() else {
+        // The predecessor's expiry is a stamp of its own clock: compared
+        // with this node's it is offset-dependent (a successor ahead by
+        // more than the remaining lease would read it as past and wait
+        // for nothing), so the floor is the bound alone, which counts
+        // only this node's own elapsed time.
+        if !std::mem::take(&mut self.ack.pending_floor) {
             return;
-        };
+        }
         // Plan 30 §M11 phase 2b: a tenure with live write delegations
         // has grants (and, under them, read grants a delegate gave)
         // that its successor cannot see renewed; one constant covers
@@ -982,22 +1035,23 @@ impl Core {
         // a lock grant still honoured elsewhere does not make an
         // acknowledgement stale — so their (longer) ttl is a quarantine
         // of the lock table's own.
-        let locks_until = prev_expires.min(bound(
-            self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms),
-        ));
-        if self.cfg.locks && locks_until > now.0 {
+        let locks_until = bound(self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms));
+        if self.cfg.locks {
             replica.locks().set_quarantine(locks_until);
         }
-        let until = prev_expires.min(bound(self.cfg.read_delegation_ttl_ms));
-        if until <= now.0 {
-            return;
-        }
+        let until = bound(self.cfg.read_delegation_ttl_ms);
+        self.ack.floor_until = if self.cfg.locks {
+            locks_until.max(until)
+        } else {
+            until
+        };
         self.stats.ack_floor_waits += 1;
         tracing::info!(
             node = self.cfg.node_id,
             wait_ms = until - now.0,
-            "took an unexpired lease over from a tenure that served strict reads; \
-             acknowledging no mutation until its delegation horizon has passed"
+            "took a lease over by seal or ack=s3 from a tenure that served strict \
+             reads or locks; acknowledging no mutation until its delegation \
+             horizon has passed"
         );
         replica.read_delegations().set_quarantine(until);
         self.arm_grant_quarantine(Ms(until), out);

@@ -95,7 +95,8 @@ decides (§11 Q7).
 | The host-load review's F1–F11 | | F1: landed (`b4fe2e6`); C4 keeps its rule (the minter judges at its serial apply). F2/F2b: the paused F2 fix above. F3 (a `flush` hang behind a recalled grant renewed forever): independent (under bisect). F4 (successor quarantine bound in `delegate-backup-handoff-failover`): independent harness fix; the "separate marks" refinement is independent. F5 (one lease renewal series at half TTL): independent, but **C1's TTL-path tail fetch makes F5's consequence cheaper** (a TTL successor now carries the group's committed tail). F6, F7: independent (documented contracts). F8 (stale `now` audit): C4 adds lock records and must follow F8's rule (decide at the serialization point). F9 (fast-path rows journaled after the lease ran out): **subsumed by C1 + C2** for every group tenure (the row is not acknowledged until the group holds it, and a sealed group refuses it); remains, documented, for the lone branch (C5). F10: keep the tests. F11: independent. | — |
 
 **Recommended landing order:** the F2 fix → the takeover-loss fix →
-seeds 9287 and 2945 → C7-H2 → C7-H1 (the honour clock: C7a's skeleton,
+seeds 9287 and 2945 → C7-H2 → **C7-F (F-a, F-b, F-c: the floor's cost taken
+back, decided 2026-10-18)** → C7-H1 (the honour clock: C7a's skeleton,
 reviewed on its own, §7 C7) → C0 → the rest of C7a → C1 → C2 → C3 → C4
 → C7b → C5 → (C6, decision). Dependencies:
 - C1 needs C0 (its fail-before evidence is C0's oracles).
@@ -1954,6 +1955,20 @@ C7-H1 is C7a's skeleton and gets its own review:
   mutations and grants locks over the predecessor's live read
   delegations and lock grants. The bound alone is sound and rate-only
   (`W + ttl + 2M ≥ (W + ttl − M)(1 + ρ)`); the `min` is an optimisation.
+  *As landed (PROGRESS, "a fast successor whose clock is ahead got no
+  quarantine"): not two lines.* A successor ahead by more than what the
+  lease had left never reached the `min`: `acquire_won` took its takeover
+  for a TTL takeover (`!p.is_expired(now)`) and armed no floor at all, so
+  the fast/TTL classification goes by the permit too (Appendix B row 26);
+  and the whole-bound floor outlasts a dwell, which exposed an idle
+  release inside the gate (the lease is now held through the gate and the
+  floor). **Decided 2026-10-18 (maintainer, Q10a):** landed with the full
+  floor as is, including the S3-cut holder's failover (measured in the
+  harness scenario `s3-cut-holder-failover-with-locks`: the first
+  acknowledged write and the first lock grant after the takeover moved
+  from +0.3 s / +0.1 s to about +8.5 s / +23.5 s, with `EAGAIN` on
+  non-blocking requests for a free lock meanwhile); the two follow-ups are
+  §7 C7-F.
   Standalone fix: drop the `min` (both lines). Fail-before: a sim
   config `fast-takeover-skewed-successor` (`backup_strict_config` with
   the backup's clock `+(lease TTL)` ahead via per-node skew; a strict
@@ -2032,7 +2047,9 @@ C7-H1 is C7a's skeleton and gets its own review:
      drops the absolute stamp once the sim and the campaign show the
      delay bound holds under load (§11 Q10b). The minter, and a delegate
      the grant moved to, still judge exactly (C4).
-  4. *The fast-takeover floor*: the bound alone (C7-H2, landed first).
+  4. *The fast-takeover floor*: the bound alone, and the fast/TTL
+     classification by the permit (C7-H2, landed first; Appendix B rows
+     10 and 26).
   5. *The lock cut* (`DelegRenew::stream_head_at`, `lock_cut_here`,
      `lock_barrier_ready`): **root-anchored** — a delegate sends renewal
      k only after reply k − 1, so the root's own send time of reply
@@ -2149,12 +2166,83 @@ first part of C7a, landed early):
   overlap with C1–C5 beyond mechanical `now` plumbing; recommended
   right after C0, so every later milestone's sweeps run with rate faults
   and large constant offsets.
-- **C7b — the cross-node compares** (rows 2, 3, 6, 9, 11: the observation
+- **C7b — the cross-node compares** (rows 2, 3, 6, 9, 11, and the sites
+  C7-H2 found and left: 23 the released-takeover lock grace, 24 the seal
+  watch's expiry compares, 25 `promise_check_needed`: the observation
   rule, anchored promises, `remaining_ms` tokens, the root-anchored cut,
-  the `ack=s3` observation): after C1 (the claim path is settled) and
+  the `ack=s3` observation, a lock grace that does not read the releaser's
+  expiry): after C1 (the claim path is settled) and
   C4 (the cut lives in `LockExpire` then); before C5 (no overlap).
   The observation rule's cold-claim wait (a full TTL from the first
   read) is a knowing latency cost: §10 gate G6.
+
+### C7-F — The floor's cost, taken back (follow-ups of C7-H2; decided 2026-10-18)
+
+The maintainer accepted C7-H2's full floor (§10 gate G5, Q10a) and asked
+for two separate pieces of work right after it. Baseline for both: the
+harness scenario `s3-cut-holder-failover-with-locks` (an S3-cut holder
+still alive on P2P, strict reads and a held lock; PROGRESS "a fast
+successor whose clock is ahead got no quarantine").
+
+- **F-a — shorten the floor by the successor's own observation.** The
+  floor counts from the marker for the whole bound because the
+  predecessor's last grant may have been decided up to
+  `backup_takeover_ms` after its last proof of liveness, which the
+  successor cannot read on its own clock. It can observe the
+  predecessor's last *renewal* (the lease object's ETag changing) on its
+  own wait clock, which is same-clock and rate-only (C7b's observation
+  rule, rows 2 and 11): a holder cut from S3 stops renewing, so a floor
+  counted from the last observed renewal would end `bound` after it.
+  **The premise needs work (review R2-3):** the holder's proofs of
+  liveness are not only renewals. `note_s3_liveness` counts `SegmentRun`
+  and `SegmentPut` successes too, which are S3 operations the successor
+  cannot observe (a segment landing is visible in the log, a `SegmentRun`
+  is a read nobody sees), and a holder answers strict reads and grants
+  within `backup_takeover_ms` of the latest of them, not of its last
+  renewal. A floor from the last observed renewal would then be too short
+  for every holder that is not cut from S3. F-a must either narrow
+  `liveness_fresh` to renewals (a holder answers strict reads and grants
+  only within `backup_takeover_ms` of a renewal's send: more renewals, or
+  a shorter window for the answers), or have the successor count the
+  holder's observed segment landings as well and exclude the unobservable
+  reads from the proofs. An expiry compare is not an option (it is the
+  hole C7-H2 closed). Goal: the S3-cut holder's failover back to (near) no
+  extra wait over the expiry-based takeover. Fail-before: the scenario's
+  first-write and first-lock-grant times.
+- **F-b — lock requests during the lock grace cost latency, not errors.**
+  Inside the grace a non-blocking lock on a free file gets `EAGAIN`
+  (`WouldBlock`), and on ring-transport cluster-lock mounts blocking
+  requests past `depth − 1` waiters per queue are downgraded and answered
+  `ENOLCK` (`session.rs`). Both become waits: a request during the grace
+  is parked until it ends (bounded by the grace, no error), with a
+  deferred answer for the ring. Fail-before: the scenario's `EAGAIN` count
+  (75 of 108 attempts after the takeover on the landed patch) and an
+  io_uring cluster-lock mount test for `ENOLCK`.
+
+- **F-c — an application whose lock grant lapsed during a root failover
+  gets `EIO`.** In `s3-cut-holder-failover-with-locks` the locker's grant
+  (20 s TTL, renewed at half) lapses at about +9.5 s after the cut: the
+  holder cannot renew, and the successor only exists at +13.6 s. From then
+  the *owner fence* (`lock_owner_fenced`: the lock owner is fenced on
+  every file of the mount, until its local locks are gone) answers `EIO`
+  to every I/O the lock owner issues, whatever the successor does after
+  (documented: cluster-locks.md, "Leases, renewal and fencing"). That is
+  an error caused by a fault, an application that holds a lock and
+  reads or writes through a root failover, in tension with "under host
+  load only latency may degrade". Candidate fixes: park the fenced
+  owner's I/O until the successor admits its reclaim (resume: exclusion
+  held throughout, nobody else could be granted during the grace) or
+  until someone else is granted (then `EIO`); or keep grants renewable
+  across the failover gap (the renewal point and the lock TTL against the
+  S3-cut failover time, `lease_ttl`). Baseline: the scenario with the
+  locker in the harness process (`CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1`)
+  — numbers in PROGRESS, "a fast successor whose clock is ahead got no
+  quarantine". Not part of C7-H2.
+
+None changes the floor's safety argument; F-a changes where it starts,
+F-b and F-c only what an application sees while it runs. All three land
+right after C7-H2 and before C0 (they touch `note_marker_landed` and
+`core/locks.rs`, which C4 rewrites).
 
 ## 8. Tests, collected
 
@@ -2289,7 +2377,7 @@ not loosen the bar.
   | G2 | C2 | another node's forward to a lone root (or lone delegate) waits for the archive | + one S3 conditional PUT (28–190 ms by distance), WAN topologies only | Q2 |
   | G3 | C4 | a peer's first lock under a backed root waits for its `LockGrant`'s commit | + one LAN round trip (≤ +2 ms on loopback); the cached re-lock free | Q6 |
   | G4 | C1 (if Q1 strict) | a claim (or a generation end) waits while no member of the old group answers | unbounded until a member answers or the operator abandons; only when the whole group is cut off | Q1 |
-  | G5 | C7-H2 | a fast successor always waits the full quarantine bound | ≤ +14.5 s on acknowledgements, ≤ +29.5 s on new lock grants, only for a takeover in the predecessor's last seconds after strict reads or locks | Q10a |
+  | G5 | C7-H2 | a fast successor always waits the full quarantine bound | ≤ +14.5 s on acknowledgements, ≤ +29.5 s on new lock grants, after strict reads or locks: for a takeover in the predecessor's last seconds, **and** for a takeover after the lease ran out of an S3-cut holder still alive on P2P (its backup seals at the expiry it reads: before C7-H2 that was a TTL takeover with no floor, now it is fast and waits the bound, on top of the ≈ one-TTL failover; applications see the lock grace as `EAGAIN` on non-blocking requests, `ENOLCK` past the ring's queue depth) | Q10a, **accepted 2026-10-18** with the full floor as landed (safety first); the follow-ups F-a, F-b and F-c (§7 C7-F) take the cost back; `leave`, unmount and the upgrade's handover right after a seal also wait out the floor before they release the lease |
   | G6 | C7b | a cold claimant waits a full TTL from its first read of the lease | ≈ 60.1 s for a cold claim; the seal path and warm claimants unchanged | Q10c |
 - **Under host load, only latency may degrade.** The rules remove whole
   recovery paths (replays, folds, conflict copies under group tenures),
@@ -2332,7 +2420,12 @@ is accepted** — Q1 (a) strict, Q2 yes, Q4 yes, Q6 yes, Q7 the
 recommended order, Q10 (a) land C7-H2 and C7-H1 first, (b) phase 1
 only, (c) accept the cold-claim wait, Q15 the request flag; the gates
 G1–G6 are accepted at their stated budgets (a gate that fails still
-stops its milestone). Q5 stays open until C6's measurement.
+stops its milestone). Q5 stays open until C6's measurement. **2026-10-18:** G5's
+full floor accepted as landed in C7-H2, with two follow-ups (§7 C7-F:
+F-a, the floor from the successor's own observation of the last renewal;
+F-b, lock requests during the grace wait instead of failing; F-c, an
+application whose lock grant lapsed during a root failover gets `EIO`)
+to land before C0.
 
 - **Q1 — A claim (or a generation end) when no member of the old group
   answers.** *Blocks C1 (G4).* Vertical Paxos requires the new
@@ -2594,11 +2687,11 @@ L = liveness only.
 | 7 | Read delegations — `readdeleg.rs`, `write_gate.rs` `deleg.valid`, `model/cto.rs` | own stamps vs own clock | W | L / a step = S as 4–5 | clock change only; the cto model gains a rate knob |
 | 8 | Write delegations — `delegate.rs` `until = sent + ttl − margin`, `deleg_lapse_at`, `reclaim_horizon`, `grant_cap_ms` | own stamps vs own clock | W | as 4–5 | clock change only; `until + 2M` becomes `until + 2ρ·ttl + transit` |
 | 9 | Lock cut / barriers — `DelegRenew::stream_head_at` folded into `lock_cut_here`, `lock_barrier_ready` | delegate's W vs root's W | W↔W | **S** (a delegate ahead: the floor misses a row) | root-anchored (send time of reply k − 1) |
-| 10 | Fast-takeover floor — `note_fast_takeover`, `note_marker_landed` `prev_expires.min(..)` | predecessor's `expires` vs successor's W | W↔W | **S** (a successor ahead gets no quarantine) | the bound alone (C7-H2 first) |
+| 10 | Fast-takeover floor — `note_fast_takeover`, `note_marker_landed` `prev_expires.min(..)` | predecessor's `expires` vs successor's W | W↔W | **S** (a successor ahead gets no quarantine) | the bound alone (C7-H2 first; **landed**: the floor is the bound alone, `acquire_won` and the models classify fast by the permit, row 26) |
 | 11 | `ack=s3` fast takeover timing — `core/lease.rs:296` | holder's renewal stamp vs taker's W | W↔W | L (the slot CAS fences) | ETag unchanged for `backup_takeover_ms` |
 | 12 | Holder liveness (plan 41 L0) — `liveness_fresh`, `note_s3_liveness`, `strict_answer_allowed`, `LeaseView::reads_locally` | own send stamp vs own clock | W | **S on a backward step > 1.5 s** | honour clock (C7-H1 first) |
 | 13 | Backup seal watch, holder heartbeat, `OffCore::core_responsive`, `note_holder_heard` | own arrival stamps vs own clock | W | L | wait clock |
-| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | `(boot_id, BOOTTIME until)`, else the full horizon |
+| 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | `(boot_id, BOOTTIME until)`, else the full horizon. Also: a successor's takeover floor (C7-H2) is not persisted at all (`set_quarantine` in memory), so a successor that restarts inside it, or whose upgrade handover gives up its release, forgets it: persist it under these keys |
 | 15 | Epoch claim views — `epoch_closed_claim`, `epoch_reclaim_pending`, `resolve_epoch_claims` | own lease stamp vs own clock; resolution by epoch | W | L | clock change only |
 | 16 | Singleton leases (`_snapsched`, GC) — `singleton.rs`, `snapsched.rs` | holder: own; claimant: holder's W vs own W | W↔W | L (the CAS on the holder's ETag is the safety) | observation rule if wanted; not required |
 | 17 | GC — `gc.rs:407` `last_modified ≤ now − horizon` (7 d), completion retention, `mtree_gc.rs:653`; holds' `expires_unix_ms` | S3 `Last-Modified` vs W; hold writer's W vs GC's W | S3↔W, W↔W | S only at offsets of days (or the hold slack) | **stays** (documented tolerance) |
@@ -2606,7 +2699,11 @@ L = liveness only.
 | 19 | HLC ctime stamps (`hlc.rs`, 300 s tolerance), atime clamp | peer's W vs own W | W↔W | none (timestamps) | leave |
 | 20 | Kernel attr/entry TTLs, `dentries.rs` filter, session waits, ReadIndex deadlines, forward timeout | kernel / `Instant` | I | L | already monotonic (`Instant` stops in suspend: conservative there) |
 | 21 | Fault hook `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (reaches `now_unix_ms` and rows 1–17) | — | — | capped at ±500 by the campaign (`load.rs:366`) | becomes a constant-offset test (harmless at ±5 s); add rate and step hooks |
-| 22 | Sim `tests/sim/clock.rs` `Clock::skewed` (constant offset), `SimConfig::clock_skew_ms`; models' `max_offset`, `Jump` | — | — | — | add per-node `rate_ppm`, suspend and step |
+| 22 | Sim `tests/sim/clock.rs` `Clock::skewed` (constant offset), `SimConfig::clock_skew_ms` (plus `clock_offsets`, C7-H2); models' `max_offset`, `Jump` | — | — | — | add per-node `rate_ppm`, suspend and step |
+| 23 | Released-takeover lock grace — `lock_on_released_takeover`'s gate in `acquire_won` (`takeover && p.released && !p.is_expired(now)`) | released lease's `expires_unix_ms` (its W) vs the taker's W | W↔W | **S** (a taker ahead by more than the released lease's remaining TTL gets no lock grace, while the releaser's grants are honoured) | grace by the taker's own observation of the release, or always (the grace is bounded by `lock_ttl`): C7b |
+| 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 |
+| 25 | `promise_check_needed` — `!prev.is_expired(now)` (`promise.rs`) | predecessor's `expires` vs the taker's W | W↔W | L (a sealed taker ahead does a promise check it would skip; only conservative) | with row 3's anchored promises: C7b |
+| 26 | `acquire_won`'s fast classification — `fast_prev` (`!p.is_expired(now)`) | predecessor's `expires` vs the successor's W | W↔W | was **S** (a sealed backup ahead by more than the lease's remainder took a TTL takeover: no floor) | **fixed (C7-H2)**: a takeover the permit allowed is fast whatever the clock says; the expiry is no longer kept |
 
 ## Sources
 

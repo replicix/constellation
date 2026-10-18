@@ -228,6 +228,10 @@ pub struct SimConfig {
     /// Plan 30 §M8: each node's clock is off by a seeded constant within
     /// `±clock_skew_ms` (leases and delegations are judged on it).
     pub clock_skew_ms: i64,
+    /// Plan 43 C7-H2: nodes whose clock is off by exactly this many ms
+    /// (on top of any `clock_skew_ms` draw): a node ahead of its
+    /// predecessor by more than the lease it takes over has left.
+    pub clock_offsets: Vec<(NodeId, i64)>,
     /// Plan 30 §M9: the run's acknowledgements are durable (a backup
     /// within budget, or `ack=s3`): an acknowledged op is never
     /// tentative — its rollback is a failure, not an exemption — and a
@@ -572,6 +576,7 @@ impl Default for SimConfig {
             stream_faults: StreamFaults::default(),
             strict: false,
             clock_skew_ms: 0,
+            clock_offsets: Vec::new(),
             strict_durability: false,
             rtts: Vec::new(),
             epoch_slack: 0,
@@ -2299,6 +2304,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         panic_after_events: cfg.panic_after_events,
         fast_path: cfg.fast_path,
         clock_skew_ms: cfg.clock_skew_ms,
+        clock_offsets: cfg.clock_offsets.clone(),
         seed,
         world: ChunkWorld::new(),
         tag_check_at_write: cfg.tag_check_at_write,

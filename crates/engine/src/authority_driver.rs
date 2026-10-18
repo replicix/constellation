@@ -2103,6 +2103,10 @@ impl Driver {
         self.deps
             .view
             .set_liveness(self.core.fast_tenure(), self.core.last_s3_fresh().0);
+        self.deps.view.set_release_hold(
+            self.core.takeover_floor_until_ms(),
+            self.core.fast_gate_pending(),
+        );
         let mut status = self.deps.status.lock().unwrap();
         status.stats = self.core.stats;
         status.ship = Some(self.core.ship().clone());

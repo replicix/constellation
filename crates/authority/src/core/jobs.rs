@@ -98,6 +98,18 @@ pub(crate) enum JobReq {
     },
 }
 
+/// How often a parked flush looks at the gate and the floor again.
+const FLUSH_FLOOR_LOOK_MS: u64 = 200;
+
+/// A `Control::Flush` or `Shutdown` that found the tenure inside its
+/// takeover gate or floor and waits (plan 43 C7-H2).
+#[derive(Debug)]
+pub(crate) struct PendingFlush {
+    control: OpId,
+    stop: bool,
+    since: Ms,
+}
+
 /// The kind of the job in the slot (`status`, tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -435,7 +447,7 @@ impl Core {
                     });
                     self.issue_tail(out);
                 }
-                JobReq::Flush { control, stop } => self.begin_flush(control, stop, out),
+                JobReq::Flush { control, stop } => self.begin_flush(now, control, stop, out),
             }
         }
     }
@@ -2001,7 +2013,7 @@ impl Core {
         self.round_release(now, replica, out);
     }
 
-    fn round_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn round_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         let backlog = replica.journal_len().unwrap_or(0);
         // The continuation epoch's flush: its journal is in S3 and the
         // lease taken for it can go — unless lock grants are live under
@@ -2014,7 +2026,17 @@ impl Core {
             && !self.lease.lost
             && !self.lease.epoch_held()
             && backlog == 0;
-        if flushed && replica.locks().live_grants_len(now.0) > 0 {
+        // The takeover floor holds an epoch's flush release too, and so does
+        // a *fast takeover's* gate before its marker landed (no floor yet,
+        // no adopted delegation table). Not the epoch's own re-claim's
+        // gate: `locks-blips-tight-faults` seed 5379 reaches that one, and
+        // there the release is the epoch's design.
+        let fast_gate = self.lease.gate.as_ref().is_some_and(|g| g.fast_prev);
+        if flushed
+            && (replica.locks().live_grants_len(now.0) > 0
+                || self.in_takeover_floor(now)
+                || fast_gate)
+        {
             out.push(Action::EpochFlushed);
         } else if flushed {
             self.lease.releasing = true;
@@ -2034,6 +2056,20 @@ impl Core {
         }
         if self.lease.held.is_none() || self.lease.lost || !self.lease.wants_handoff(now, &self.cfg)
         {
+            self.finish_round(now, None, replica, out);
+            return;
+        }
+        // Nor while the takeover gate is pending, nor inside the takeover
+        // floor. The gate: a successor adopts its predecessor's delegation
+        // table only once it is `root_usable`, which needs a ship epoch,
+        // which a pending gate lacks, so the live-generation check below
+        // sees none; released, the lease left the log's table naming this
+        // node root of live generations and their delegates' forwards were
+        // refused `NotHolder` for ever (`delegated-holder-cut` seeds 65
+        // and 97, which the whole-bound floor of plan 43 C7-H2 exposed).
+        // The floor (`in_takeover_floor`): the node that takes a released
+        // lease over starts without it.
+        if self.lease.gate.is_some() || self.in_takeover_floor(now) {
             self.finish_round(now, None, replica, out);
             return;
         }
@@ -2837,15 +2873,23 @@ impl Core {
         // strict-read horizon becomes this tenure's acknowledgement floor
         // once the marker lands, and a backup's tail is re-applied inside
         // the gate.
-        self.lease.takeover_permit = None;
-        let fast_prev = prev
+        let permitted = prev
             .as_ref()
-            .filter(|p| {
-                takeover && !p.released && !p.is_expired(now.0) && p.holder != self.cfg.node_id
-            })
-            .map(|p| (p.expires_unix_ms, p.granted_delegations));
+            .is_some_and(|p| self.lease.takeover_permit == Some((p.epoch, p.holder)));
+        self.lease.takeover_permit = None;
+        // A permitted takeover is a fast one whatever this node's clock
+        // says of the lease's expiry (a stamp of the predecessor's clock:
+        // a successor ahead of it by more than the lease has left would
+        // read the lease as expired, take it for a TTL takeover and wait
+        // for nothing while the predecessor's grants are still honoured).
+        let fast_prev = prev.as_ref().is_some_and(|p| {
+            takeover
+                && !p.released
+                && (permitted || !p.is_expired(now.0))
+                && p.holder != self.cfg.node_id
+        });
         self.dl.inherit_slack_ms = 0;
-        if let Some(p) = prev.as_ref().filter(|_| fast_prev.is_some()) {
+        if let Some(p) = prev.as_ref().filter(|_| fast_prev) {
             self.note_fast_takeover(p);
         }
         // The sealed backup's tail is re-applied by the tenure that
@@ -3025,7 +3069,12 @@ impl Core {
                 "declining a stale lease request: its requester stopped waiting"
             );
         }
-        let epoch = self.lease.ship_epoch(now, &self.cfg).filter(|_| !stale);
+        // (Declined inside the takeover floor too: the request may have
+        // been queued behind the round that armed it.)
+        let epoch = self
+            .lease
+            .ship_epoch(now, &self.cfg)
+            .filter(|_| !stale && !self.in_takeover_floor(now));
         let Some(epoch) = epoch else {
             self.stats.handoffs_declined += 1;
             out.push(Action::Send {
@@ -3055,7 +3104,103 @@ impl Core {
         });
     }
 
-    fn begin_flush(&mut self, control: OpId, stop: bool, out: &mut Vec<Action>) {
+    /// Whether releasing the lease now would hand a node a tenure without
+    /// the gate or the floor of the takeover this one is still inside: it
+    /// would start without them (`fast_prev` is false for a released
+    /// lease) and the delegations and locks of the sealed tenure are still
+    /// honoured elsewhere.
+    fn release_held_back(&self, now: Ms) -> bool {
+        self.lease.held.is_some()
+            && !self.lease.lost
+            && (self.lease.gate.is_some() || self.in_takeover_floor(now))
+    }
+
+    /// Hold a flush or shutdown back until the takeover gate and floor are
+    /// over (`service_pending_flushes`). It leaves the job slot free: the
+    /// gate completes in rounds.
+    fn park_flush(&mut self, now: Ms, control: OpId, stop: bool, since: Ms, out: &mut Vec<Action>) {
+        tracing::info!(
+            node = self.cfg.node_id,
+            stop,
+            "a flush waits for the takeover gate and floor before it releases the lease"
+        );
+        self.pending_flushes.push(PendingFlush {
+            control,
+            stop,
+            since,
+        });
+        self.arm_flush_floor(now, out);
+    }
+
+    fn arm_flush_floor(&mut self, now: Ms, out: &mut Vec<Action>) {
+        if self.flush_floor_timer.is_none() && !self.pending_flushes.is_empty() {
+            let id = self.set_timer(now.plus(FLUSH_FLOOR_LOOK_MS), super::Timer::FlushFloor, out);
+            self.flush_floor_timer = Some(id);
+        }
+    }
+
+    /// Start the parked flushes once the lease may be released; give up on
+    /// the ones whose takeover *gate* stayed pending past the cap
+    /// (`flush_floor_cap_ms`, a fixed 40 s). Never while the floor stands:
+    /// it is bounded and ends on its own, and a release before it ends is
+    /// the hole the wait closes (an upgrade's new image re-adopts the lease
+    /// without the floor). The lease is then not released and the flush
+    /// reports that: a stop leaves it to lapse by its TTL (its successor
+    /// takes it over by TTL or seal), any other flush keeps renewing it and
+    /// the next round releases it when it is idle.
+    pub(crate) fn service_pending_flushes(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        if self.pending_flushes.is_empty() {
+            return;
+        }
+        if !self.release_held_back(now) {
+            for p in std::mem::take(&mut self.pending_flushes) {
+                self.enqueue_job(
+                    now,
+                    JobReq::Flush {
+                        control: p.control,
+                        stop: p.stop,
+                    },
+                    replica,
+                    out,
+                );
+            }
+            return;
+        }
+        let cap = self.cfg.flush_floor_cap_ms as i64;
+        let floor = self.in_takeover_floor(now);
+        let (expired, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_flushes)
+            .into_iter()
+            .partition(|p| !floor && now.since(p.since) >= cap);
+        self.pending_flushes = waiting;
+        for p in expired {
+            tracing::warn!(
+                node = self.cfg.node_id,
+                waited_ms = now.since(p.since),
+                "a flush gave up waiting for the takeover floor: the lease is not released and lapses"
+            );
+            out.push(Action::ControlDone {
+                op: p.control,
+                result: Err(
+                    "the lease was not released: the takeover floor outlasted the wait".into(),
+                ),
+            });
+            if p.stop {
+                self.stopped = true;
+            }
+        }
+        self.arm_flush_floor(now, out);
+    }
+
+    fn begin_flush(&mut self, now: Ms, control: OpId, stop: bool, out: &mut Vec<Action>) {
+        if self.release_held_back(now) {
+            self.park_flush(now, control, stop, now, out);
+            return;
+        }
         let op = self.op_id();
         self.job = Some(Job {
             what: What::Flush {
@@ -3156,6 +3301,21 @@ impl Core {
                         "handoff declined: lock grants were made while it flushed"
                     );
                     self.finish_flush_job(now, false, replica, out);
+                    return;
+                }
+                // The gate or the floor began while this job ran (a handoff
+                // or a flush queued behind the acquisition): not released
+                // inside them.
+                if self.release_held_back(now) {
+                    match self.job.as_ref().map(|j| &j.what) {
+                        Some(What::Flush { control, stop, .. }) => {
+                            let (control, stop) = (*control, *stop);
+                            self.job = None;
+                            self.park_flush(now, control, stop, now, out);
+                            self.start_next_job(now, replica, out);
+                        }
+                        _ => self.finish_flush_job(now, false, replica, out),
+                    }
                     return;
                 }
                 if self.lease.held.is_some() && !self.lease.lost {
@@ -4148,7 +4308,7 @@ impl Core {
                 takeover: false,
                 marker_shipped: true,
                 drained: true,
-                fast_prev: None,
+                fast_prev: false,
                 backup_tail_epoch: None,
                 shippable: false,
             });

@@ -274,6 +274,7 @@ fn replay_seed() {
         Ok("acks3") => ack_s3_config(),
         Ok("backup-far") => far_config(),
         Ok("backup-strict") => backup_strict_config(),
+        Ok("backup-strict-inbox-off") => backup_strict_inbox_off_config(),
         Ok("backup-crash") => backup_crash_config(),
         Ok("holder-cut") => holder_cut_crash_config(true),
         Ok("delegated-holder-cut") => delegated_holder_cut_config(),
@@ -353,6 +354,7 @@ fn replay_seed() {
         Ok("locks-failover") => locks_failover_config(),
         Ok("locks-failover-backup") => locks_failover_backup_config(),
         Ok("locks-failover-backup-renew") => locks_failover_backup_renew_config(),
+        Ok("fast-takeover-skewed-successor") => fast_takeover_skewed_successor_config(),
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-blips") => locks_blips_config(),
         Ok("locks-blips-tight") => locks_blips_tight_config(),
@@ -1469,6 +1471,21 @@ fn backup_strict_config() -> SimConfig {
         read_ratio: 0.6,
         strict: true,
         ..backup_crash_config()
+    }
+}
+
+/// `backup-strict` with the inbox off (`CONSTELLATION_INBOX=off`): the
+/// takeover gate then does not wait out the read quarantine, so nothing but
+/// the takeover floor itself keeps the successor from handing the lease on
+/// inside it (plan 43 C7-H2, review S3).
+fn backup_strict_inbox_off_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.inbox = false;
+            c
+        }),
+        ..backup_strict_config()
     }
 }
 
@@ -2966,8 +2983,9 @@ fn a_holder_alone_cut_from_s3_forms_no_epoch_and_fails_over() {
 /// (the delegates are the members that reach S3 and decline the cut
 /// root's proposal; the root dies; its backup takes over inside the
 /// TTL and inherits the delegation table from the log, the delegates
-/// re-stream to it). No epoch, a failover well inside the restart,
-/// every directory's history linearizable (`run_seed`'s checks).
+/// re-stream to it). No epoch, a failover by seal (the successor's
+/// delegation floor, not the holder's return), every directory's history
+/// linearizable (`run_seed`'s checks).
 fn delegated_holder_cut_config() -> SimConfig {
     SimConfig {
         faults: holder_cut_crash_config(true).faults,
@@ -2978,7 +2996,22 @@ fn delegated_holder_cut_config() -> SimConfig {
 
 #[test]
 fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
-    let restart = 9_000;
+    // The successor waits its predecessor's delegations out for the whole
+    // floor (plan 43 C7-H2: the takeover window, the read-delegation TTL,
+    // the write delegations' reclaim horizon and two margins, from its
+    // marker; it used to stop at the old lease's expiry, inside the TTL),
+    // after the window the seal itself takes: a failover by seal lands
+    // between the two bounds below, which neither the holder's return (9 s
+    // after the crash, under the lower one) nor a TTL failover can meet.
+    let c = sim::run::backup_core_config(1, 1);
+    let floor = c.backup_takeover_ms
+        + c.read_delegation_ttl_ms
+        + c.delegation_ttl_ms
+        + 3 * c.expiry_margin_ms;
+    let (lowest, highest) = (
+        floor - 2 * c.backup_takeover_ms,
+        floor + 2 * c.backup_takeover_ms + 1_000,
+    );
     let mut epochs = 0;
     let mut failovers = Vec::new();
     let mut executed = 0;
@@ -2992,18 +3025,51 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
         epochs += report.epochs_formed;
         failovers.extend(report.failover_ms.iter().copied());
         executed += report.stats.values().map(|s| s.deleg_executed).sum::<u64>();
+        let seals: u64 = report.stats.values().map(|s| s.backup_takeovers).sum();
+        for ms in report.failover_ms.iter().copied().filter(|ms| *ms >= 1_000) {
+            assert!(
+                seals > 0,
+                "seed {seed}: a failover of {ms} ms with no seal-based takeover"
+            );
+            assert!(
+                (lowest..=highest).contains(&ms),
+                "seed {seed}: a failover of {ms} ms is not a seal and its floor \
+                 ({lowest}..={highest} ms)"
+            );
+        }
     }
     eprintln!(
         "delegated-holder-cut: epochs {epochs}, failovers {failovers:?}, executed {executed}"
     );
     assert_eq!(epochs, 0, "a delegate that reaches S3 joined an epoch");
     assert!(executed > 0, "the delegates never executed");
-    assert!(!failovers.is_empty(), "no failover measured");
-    let ttl = sim::run::backup_core_config(1, 1).ttl_ms;
     assert!(
-        failovers.iter().all(|ms| *ms < ttl.min(restart)),
-        "a failover waited for the TTL or the holder's return: {failovers:?}"
+        failovers.iter().any(|ms| *ms >= 1_000),
+        "no failover by seal measured: {failovers:?}"
     );
+}
+
+/// Plan 43 C7-H2: `delegated-holder-cut` seeds 65 and 97. The backup that
+/// seals the cut root waits out its predecessor's delegations for the whole
+/// bound (it used to stop at the old lease's expiry), longer than the
+/// dwell: with a node wanting the lease it idle-released the lease while
+/// its takeover gate was still pending. A successor adopts the
+/// predecessor's delegation table only once it can ship, which a pending
+/// gate cannot, so the "root stays while a delegation is live" rule saw no
+/// generation; the lease was let go with the log still naming this node
+/// root of live generations, and the delegate's forwards were refused
+/// `NotHolder` for ever (the run never ended). `round_release` now keeps the
+/// lease through the gate and the takeover floor.
+#[test]
+fn regression_a_sealing_successor_keeps_the_lease_through_its_floor() {
+    for seed in [65, 97] {
+        run_seed(seed, delegated_holder_cut_config()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-holder-cut seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-holder-cut"
+            )
+        });
+    }
 }
 
 /// The `delegated-holder-cut` seeds outside the CI range that failed on
@@ -3084,6 +3150,8 @@ fn sweep_config() {
         "backup-runtime-lag-timers-first" => timers_first(backup_runtime_lag_config()),
         "acks3-runtime-lag-timers-first" => timers_first(acks3_runtime_lag_config()),
         "backup" => backup_config(),
+        "backup-strict" => backup_strict_config(),
+        "backup-strict-inbox-off" => backup_strict_inbox_off_config(),
         "backup-crash" => backup_crash_config(),
         "backup-crash-slow" => SimConfig {
             s3_latency: (60, 200),
@@ -3117,6 +3185,7 @@ fn sweep_config() {
         "locks-failover" => locks_failover_config(),
         "locks-failover-backup" => locks_failover_backup_config(),
         "locks-failover-backup-renew" => locks_failover_backup_renew_config(),
+        "fast-takeover-skewed-successor" => fast_takeover_skewed_successor_config(),
         "locks-faults" => locks_faults_config(),
         "locks-blips" => locks_blips_config(),
         "locks-blips-tight" => locks_blips_tight_config(),
@@ -4624,6 +4693,26 @@ fn locks_failover_backup_renew_config() -> SimConfig {
     }
 }
 
+/// Plan 43 C7-H2: `locks-failover-backup-renew` with the clocks of nodes 2
+/// and 3 ahead of node 1's by 4 s (the sim's lease is 6 s), so a backup
+/// that seals a holder and takes its lease over before it expires reads
+/// the lease's expiry (the holder's clock) as past, or too near, while the
+/// lock holders still honour what the old root granted. The successor's
+/// grace is its own bound from its own marker, however its clock compares
+/// with the expiry: before, a takeover its clock read as expired set no
+/// grace at all (`acquire_won` took it for a TTL takeover) and one it read
+/// as about to expire cut the grace short (`min(expiry, bound)`); new
+/// grants then landed inside an old grant's window (two holders of one
+/// lock). Offsets of more than the whole lease also let a node whose
+/// clock is ahead claim a live lease it reads as expired: plan 43's C7b,
+/// not this chunk.
+fn fast_takeover_skewed_successor_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(2, 4_000), (3, 4_000)],
+        ..locks_failover_backup_renew_config()
+    }
+}
+
 /// Nodes stop (their events queue, their clients keep running) while
 /// their clients wait for or hold locks: renewals stall, grants lapse
 /// under critical sections, and replies and pushes are handled late —
@@ -5358,6 +5447,25 @@ fn locks_survive_a_backup_seal_under_renewals() {
         "the backup rarely took over: {t:?}"
     );
     assert!(t.renew_held > 0, "no renewal waited for liveness: {t:?}");
+}
+
+/// Plan 43 C7-H2: a backup whose clock is ahead of its holder's seals and
+/// takes the lease over; no lock is granted inside the window of a grant
+/// the old root made (mutual exclusion), however the successor's clock
+/// compares with the old lease's expiry. (On `e797ca3`: about one seed in
+/// 25 of this range, a lock granted over a holder still in its section.)
+#[test]
+fn a_skewed_successor_grants_no_lock_inside_the_old_roots_window() {
+    let t = run_m14(
+        "fast-takeover-skewed-successor",
+        fast_takeover_skewed_successor_config(),
+        193_000..193_200,
+    );
+    assert!(t.grants > 3_000, "{t:?}");
+    assert!(
+        t.backup_takeovers > 100,
+        "the backup rarely took over: {t:?}"
+    );
 }
 
 /// `stress-ng-fs-faults` (bug B): a node that keeps its lease through an
@@ -6479,6 +6587,11 @@ fn long_locks() {
         "locks-failover-backup-renew",
         locks_failover_backup_renew_config(),
         203_000..203_000 + n,
+    );
+    run_m14(
+        "fast-takeover-skewed-successor",
+        fast_takeover_skewed_successor_config(),
+        206_000..206_000 + n,
     );
     run_m14("locks-faults", locks_faults_config(), 195_000..195_000 + n);
     run_m14("locks-pause", locks_pause_config(), 197_000..197_000 + n);

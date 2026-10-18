@@ -96,6 +96,22 @@ pub struct LeaseView {
     fast_tenure: AtomicBool,
     last_s3_fresh_ms: AtomicI64,
     fresh_window_ms: AtomicI64,
+    /// Plan 43 C7-H2: where the takeover floor ends (unix ms; 0: none) and
+    /// whether a fast takeover's gate is pending: releasing the lease now
+    /// would hand it on without them (`release_hold`).
+    floor_until_ms: AtomicI64,
+    fast_gate: AtomicBool,
+}
+
+/// Why releasing the lease now would be held back (`LeaseView::release_hold`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseHold {
+    /// A fast takeover's gate is pending; it ends when the gate's work
+    /// does (bounded by the caller).
+    Gate,
+    /// The takeover floor ends in this long (on its own: never given up
+    /// on).
+    Floor(std::time::Duration),
 }
 
 /// A new mutation admitted through [`LeaseView::admit`]: counted in
@@ -185,6 +201,22 @@ impl LeaseView {
             self.last_s3_fresh_ms.load(Ordering::Relaxed),
             self.fresh_window_ms.load(Ordering::Relaxed),
         )
+    }
+
+    /// Plan 43 C7-H2: the driver mirrors what holds a release back.
+    pub fn set_release_hold(&self, floor_until_ms: i64, fast_gate: bool) {
+        self.floor_until_ms.store(floor_until_ms, Ordering::Relaxed);
+        self.fast_gate.store(fast_gate, Ordering::Relaxed);
+    }
+
+    /// What would hold back a release of the lease now, if anything: a
+    /// fast takeover's pending gate, or the takeover floor.
+    pub fn release_hold(&self) -> Option<ReleaseHold> {
+        if self.fast_gate.load(Ordering::Relaxed) {
+            return Some(ReleaseHold::Gate);
+        }
+        let left = self.floor_until_ms.load(Ordering::Relaxed) - now_unix_ms();
+        (left > 0).then(|| ReleaseHold::Floor(std::time::Duration::from_millis(left as u64)))
     }
 
     /// Plan 30 §M9: the driver mirrors the core's liveness bookkeeping.
@@ -306,6 +338,29 @@ mod tests {
         })
     }
 
+    /// Plan 43 C7-H2: what holds back a release, as the upgrade's handover
+    /// waits on it: nothing, a fast takeover's pending gate, or the floor
+    /// with its remainder (the gate first: it has no end of its own).
+    #[test]
+    fn the_release_hold_names_the_gate_or_the_floors_remainder() {
+        use std::time::Duration;
+        let view = LeaseView::default();
+        assert_eq!(view.release_hold(), None);
+        view.set_release_hold(now_unix_ms() - 1, false);
+        assert_eq!(view.release_hold(), None, "a floor in the past holds");
+        view.set_release_hold(now_unix_ms() + 5_000, false);
+        match view.release_hold() {
+            Some(ReleaseHold::Floor(left)) => {
+                assert!(left > Duration::from_millis(4_000) && left <= Duration::from_secs(5))
+            }
+            other => panic!("{other:?}"),
+        }
+        view.set_release_hold(now_unix_ms() + 5_000, true);
+        assert_eq!(view.release_hold(), Some(ReleaseHold::Gate));
+        view.set_release_hold(0, false);
+        assert_eq!(view.release_hold(), None);
+    }
+
     /// The mirror follows the core's state: held opens the fast path;
     /// the releasing flag, a pending gate and the handoff pause close it
     /// (a pause leaves `usable` alone, so shipping still drains); a
@@ -344,7 +399,7 @@ mod tests {
             takeover: true,
             marker_shipped: false,
             drained: true,
-            fast_prev: None,
+            fast_prev: false,
             backup_tail_epoch: None,
             shippable: false,
         });

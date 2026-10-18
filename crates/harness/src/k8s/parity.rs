@@ -477,6 +477,8 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ),
     ("single-node-unchanged", Skip::Local(&[COUNT])),
     ("backup-failover-with-delegation", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
+    ("upgrade-after-a-seal", Skip::Local(&[KILL, CTO_STRICT, UPGRADE, NODES3])),
+    ("unmount-inside-the-takeover-floor", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
     ("holder-kill-rejoin", Skip::Local(&[KILL, NODES4])),
     ("fuse-inval-storm", Skip::Local(&[KILL, NODES3])),
     (
@@ -515,6 +517,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     (
         "lock-holder-partitioned",
         Skip::Local(&[P2P_CUT, NODES3, "shortens the grant TTL (CONSTELLATION_LOCK_TTL_MS)"]),
+    ),
+    (
+        "s3-cut-holder-failover-with-locks",
+        Skip::Local(&[S3_FAULTS, CTO_STRICT, NODES4]),
     ),
     ("lock-failover", Skip::Local(&[KILL, NODES4])),
     ("lock-holder-killed-contention", Skip::Local(&[KILL, NODES4])),

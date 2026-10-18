@@ -450,3 +450,162 @@ pub fn upgrade_under_load(seed: u64) -> Result<()> {
     let _ = c.unmount();
     result
 }
+
+/// Plan 43 C7-H2 (review R3-3): an upgrade right after a seal waits out the
+/// successor's takeover floor before it hands over (the drain releases the
+/// lease, which the floor holds back), and the wait must not stall the
+/// node's applications: the views keep serving until the drain. Reader R
+/// holds a strict delegation from A, A dies, its backup X takes over and is
+/// upgraded at once, with a reader of `f` and a writer running on X's
+/// mount. The upgrade takes about the floor (23.5 s with the default lock
+/// TTL). The takeover's own gate holds X's first reads and writes for the
+/// read floor (6.5 s here: reported, it is the takeover's doing, not the
+/// upgrade's); after it no read on X's mount waits more than a few
+/// seconds, whichever of the wait, the detach or the exec it falls in, and
+/// none fails. (With the wait after the detach, as in the first version of
+/// this change, every read stalled for the whole 24 s.)
+pub fn upgrade_after_a_seal(_seed: u64) -> Result<()> {
+    use super::m9::{cluster, wait_for_backup, wait_holds};
+    const NAME: &str = "upgrade-after-a-seal";
+    // The longest a read on X's mount may take once the takeover gate is
+    // open (it opens `1.5 + 3 + 2 = 6.5 s` after the marker).
+    const READ_BOUND: Duration = Duration::from_secs(4);
+    const GATE_OPEN: Duration = Duration::from_secs(8);
+    let deleg = "3000".to_string();
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "x", "r"],
+        &[
+            ("CONSTELLATION_FUSE_TRANSPORT", "dev-fuse"),
+            ("CONSTELLATION_CTO", "strict"),
+            ("CONSTELLATION_READ_DELEGATION_TTL_MS", &deleg),
+            ("CONSTELLATION_READ_INDEX_BUDGET_MS", "20000"),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let backups = wait_for_backup(&clients[0], Duration::from_secs(30))?;
+        let x_idx = (0..clients.len())
+            .find(|i| super::m9::node_id(&clients[*i]).ok() == Some(backups[0]))
+            .context("the backup is not one of ours")?;
+        let r_idx = (1..clients.len())
+            .find(|i| *i != x_idx)
+            .expect("three nodes");
+        for _ in 0..5 {
+            std::fs::read(clients[r_idx].mnt.join("f")).context("R reading f")?;
+        }
+        let epoch = super::lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
+        clients[0].kill9()?;
+        let took = wait_holds(&clients[x_idx], epoch, Duration::from_secs(15))?;
+        eprintln!(
+            "    {NAME}: {} took over after {took:?}; upgrading it at once",
+            clients[x_idx].name
+        );
+        let first = generation(&clients[x_idx])?;
+        let stop = Arc::new(AtomicBool::new(false));
+        // (start since the upgrade began, how long, outcome) per op.
+        type Ops = Arc<Mutex<Vec<(Duration, Duration, std::io::Result<()>)>>>;
+        let begun = Instant::now();
+        let spawn = |ops: Ops, op: Box<dyn Fn(u64) -> std::io::Result<()> + Send>, every: u64| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut i = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    i += 1;
+                    let started = begun.elapsed();
+                    let r = op(i);
+                    ops.lock()
+                        .unwrap()
+                        .push((started, begun.elapsed() - started, r));
+                    std::thread::sleep(Duration::from_millis(every));
+                }
+            })
+        };
+        let reads: Ops = Arc::default();
+        let writes: Ops = Arc::default();
+        let rpath = clients[x_idx].mnt.join("f");
+        let wdir = clients[x_idx].mnt.clone();
+        let t_reads = spawn(
+            reads.clone(),
+            Box::new(move |_| std::fs::read(&rpath).map(|_| ())),
+            20,
+        );
+        let t_writes = spawn(
+            writes.clone(),
+            Box::new(move |i| std::fs::write(wdir.join(format!("w{i}")), b"w")),
+            100,
+        );
+        let upgrade_took = upgrade(&clients[x_idx])?;
+        std::thread::sleep(Duration::from_secs(3));
+        stop.store(true, Ordering::Relaxed);
+        for t in [t_reads, t_writes] {
+            t.join().ok();
+        }
+        let (reads, writes) = (reads.lock().unwrap(), writes.lock().unwrap());
+        let longest = |ops: &[(Duration, Duration, std::io::Result<()>)]| {
+            ops.iter()
+                .max_by_key(|o| o.1)
+                .map(|o| (o.0, o.1))
+                .unwrap_or_default()
+        };
+        let read_errors: Vec<String> = reads
+            .iter()
+            .filter_map(|o| o.2.as_ref().err().map(|e| format!("+{:?}: {e}", o.0)))
+            .collect();
+        let write_errors: Vec<String> = writes
+            .iter()
+            .filter_map(|o| o.2.as_ref().err().map(|e| format!("+{:?}: {e}", o.0)))
+            .collect();
+        eprintln!(
+            "    {NAME}: the upgrade took {upgrade_took:?}; {} reads on X's mount, longest \
+             (start, took) {:?}, {} errors; {} writes, longest {:?}, {} errors",
+            reads.len(),
+            longest(&reads),
+            read_errors.len(),
+            writes.len(),
+            longest(&writes),
+            write_errors.len()
+        );
+        ensure!(
+            generation(&clients[x_idx])? == first + 1,
+            "the upgrade did not advance the generation"
+        );
+        ensure!(
+            upgrade_took >= Duration::from_secs(15),
+            "the upgrade took only {upgrade_took:?}: it did not wait out the takeover floor"
+        );
+        let after_gate: Vec<_> = reads
+            .iter()
+            .filter(|o| o.0 >= GATE_OPEN)
+            .map(|o| (o.0, o.1))
+            .collect();
+        let worst = after_gate.iter().max_by_key(|o| o.1).copied();
+        eprintln!(
+            "    {NAME}: {} reads started after the gate opened, longest (start, took) {worst:?}",
+            after_gate.len()
+        );
+        // Reads must have been *served* during the wait itself, between the
+        // gate's opening and the drain: with the views detached early one
+        // read blocks for the whole wait and none starts in it.
+        let in_wait = after_gate
+            .iter()
+            .filter(|o| o.0 + Duration::from_secs(3) < upgrade_took)
+            .count();
+        ensure!(
+            in_wait > 100,
+            "only {in_wait} reads were served during the upgrade's wait: the views were \
+             detached before it"
+        );
+        ensure!(
+            worst.is_some_and(|w| w.1 <= READ_BOUND),
+            "a read on X's mount stalled {worst:?} (bound {READ_BOUND:?}) after the takeover \
+             gate opened: the views were detached during the wait"
+        );
+        ensure!(read_errors.is_empty(), "reads failed: {read_errors:?}");
+        ensure!(write_errors.is_empty(), "writes failed: {write_errors:?}");
+        clients[0].mount()?;
+        Ok(())
+    })();
+    super::m9::unmount_all(&mut clients);
+    result
+}

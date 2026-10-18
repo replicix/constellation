@@ -582,8 +582,9 @@ pub fn ack_s3_failover(_seed: u64) -> Result<()> {
         eprintln!("    {NAME}: B's write returned {took:?} after A froze");
         // Fast, not TTL: `s3_fast_takeovers` below says so exactly. The
         // time is latency: the takeover window, plus (plan 41 L0, finding
-        // F4) the successor's strict-read quarantine when it counted one,
-        // capped by the predecessor's lease, plus host slack.
+        // F4) the successor's strict-read quarantine when it counted one
+        // (the whole bound, however little the predecessor's lease had
+        // left), plus host slack.
         let since_freeze = frozen.elapsed();
         // Every live non-holder watches the holder's stream under `ack=s3`
         // and races for the log slot once it falls silent (the slot's CAS
@@ -617,7 +618,7 @@ pub fn ack_s3_failover(_seed: u64) -> Result<()> {
         // against the configured formula (a tripwire for drift).
         let t = cluster_timings();
         let waits = super::delegroot::floor_waits_logged(&clients[w]);
-        let cap = t.ack_floor_wait(true).min(t.lease_ttl).as_millis() as u64;
+        let cap = t.ack_floor_wait(true).as_millis() as u64;
         anyhow::ensure!(
             n(&w_ack, "ack_floor_waits") == 0 || !waits.is_empty(),
             "{} counted a quarantine (ack_floor_waits) but logged no wait_ms",
@@ -853,6 +854,81 @@ pub fn backup_failover_with_delegation(_seed: u64) -> Result<()> {
         let refs: Vec<&Client> = clients.iter().collect();
         wait_for_p2p(&refs)?;
         ensure_no_conflicts(&refs)?;
+        Ok(())
+    })();
+    unmount_all(&mut clients);
+    result
+}
+
+/// Plan 43 C7-H2 (review R2-1): an unmount right after a seal waits out
+/// the successor's takeover floor before it releases the lease (a released
+/// lease is no fast takeover: its taker would start without the floor).
+/// Strict reader R holds a delegation from A, A dies, its backup X takes
+/// over and is unmounted at once; prints how long the unmount took (the
+/// added cost of the wait: before, it released at once) and what the lease
+/// looks like to R afterwards. Fails if the daemon does not exit cleanly
+/// or the lease is still held by X.
+pub fn unmount_inside_the_takeover_floor(_seed: u64) -> Result<()> {
+    const NAME: &str = "unmount-inside-the-takeover-floor";
+    let deleg = "3000".to_string();
+    let (_env, _root, mut clients, _) = cluster(
+        NAME,
+        &["a", "x", "r"],
+        &[
+            ("CONSTELLATION_CTO", "strict"),
+            ("CONSTELLATION_READ_DELEGATION_TTL_MS", &deleg),
+            ("CONSTELLATION_READ_INDEX_BUDGET_MS", "20000"),
+        ],
+        0,
+    )?;
+    let result = (|| -> Result<()> {
+        let a = &clients[0];
+        let backups = wait_for_backup(a, Duration::from_secs(30))?;
+        let x_idx = (0..clients.len())
+            .find(|i| {
+                clients[*i].name
+                    == by_id(&clients, backups[0])
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default()
+            })
+            .expect("ours");
+        let r_idx = (1..clients.len())
+            .find(|i| *i != x_idx)
+            .expect("three nodes");
+        for _ in 0..5 {
+            read_timed(&clients[r_idx].mnt.join("f"))
+                .0
+                .context("R reading f")?;
+        }
+        let epoch = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
+        let seals0 = n(&ack_of(&clients[r_idx])?, "seals");
+        clients[0].kill9()?;
+        let took = wait_holds(&clients[x_idx], epoch, Duration::from_secs(15))?;
+        eprintln!(
+            "    {NAME}: {} took over after {took:?}; unmounting it at once",
+            clients[x_idx].name
+        );
+        let t = Instant::now();
+        let status = clients[x_idx].unmount_exit(Duration::from_secs(60))?;
+        let unmount_took = t.elapsed();
+        eprintln!(
+            "    {NAME}: the unmount took {unmount_took:?} (exit {status}); R's view of the lease: {}",
+            lease_of(&clients[r_idx])?
+        );
+        anyhow::ensure!(status.success(), "X did not exit cleanly: {status}");
+        // Its liveness beats to its backup (the off-core heartbeat) go on
+        // until the core answers the shutdown, however long that waits: R,
+        // which may be X's backup by now, sealed nothing meanwhile.
+        let seals = n(&ack_of(&clients[r_idx])?, "seals");
+        eprintln!(
+            "    {NAME}: R sealed {} epoch(s) during the wait",
+            seals - seals0
+        );
+        anyhow::ensure!(
+            seals == seals0,
+            "R sealed the unmounting successor's epoch while its shutdown waited"
+        );
+        clients[0].mount()?;
         Ok(())
     })();
     unmount_all(&mut clients);
