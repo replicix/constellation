@@ -505,8 +505,10 @@ pub enum Payload {
     /// is the journal seq the batch starts at (the seq after what the
     /// backup last acknowledged), `through` the holder's shipped-through
     /// seq. `candidacy` names the holder's bring-up of this backup (a
-    /// dismissal, [`Payload::HolderAlive`], applies to it only). Answered
-    /// by [`Payload::BackupAck`].
+    /// dismissal, [`Payload::HolderAlive`], applies to it only).
+    /// `expires_unix_ms` is the expiry of the lease the holder holds at
+    /// `epoch` when it builds the append (0: none held), the same as a
+    /// [`Beat`] names. Answered by [`Payload::BackupAck`].
     BackupAppend {
         holder: u64,
         req_id: u64,
@@ -516,6 +518,7 @@ pub enum Payload {
         from: u64,
         txs: Vec<u8>,
         through: u64,
+        expires_unix_ms: i64,
     },
     /// Plan 30 §M9: the backup holds every row through `acked`, or has
     /// `sealed` the epoch (it will never acknowledge it again).

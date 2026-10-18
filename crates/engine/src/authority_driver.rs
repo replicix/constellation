@@ -1494,8 +1494,8 @@ impl OffCore {
     }
 
     /// The holder `holder` was heard from at `epoch` (a heartbeat or an
-    /// append arrived) at `at_unix_ms`; a heartbeat names the expiry of
-    /// its lease, `expires_unix_ms` (0: an append names none). An older
+    /// append arrived) at `at_unix_ms`; both name the expiry of the
+    /// holder's lease, `expires_unix_ms` (0: none held). An older
     /// epoch's is ignored.
     pub(crate) fn note_holder_heard(
         &self,
@@ -2693,6 +2693,7 @@ impl Driver {
                 from,
                 txs,
                 through,
+                expires_unix_ms,
                 reply,
             } => {
                 let req = self.control_id();
@@ -2709,6 +2710,7 @@ impl Driver {
                         from,
                         txs,
                         through,
+                        expires_unix_ms,
                     },
                 }))
             }
@@ -4227,6 +4229,7 @@ impl Driver {
                 from,
                 txs,
                 through,
+                expires_unix_ms,
             } => {
                 let tx = self.int_tx.clone();
                 let peers = self.deps.peers.clone();
@@ -4269,6 +4272,7 @@ impl Driver {
                         from,
                         txs,
                         through,
+                        expires_unix_ms,
                     };
                     let started = std::time::Instant::now();
                     let reply = tokio::time::timeout(

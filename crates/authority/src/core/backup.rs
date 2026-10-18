@@ -1324,6 +1324,9 @@ impl Core {
                     from: start,
                     txs,
                     through,
+                    // The lease as the holder holds it now: the beats'
+                    // source too (`publish_alive_targets`).
+                    expires_unix_ms: lease.expires_unix_ms,
                 },
             });
         }
@@ -2073,7 +2076,7 @@ impl Core {
         (epoch, holder, config_version, candidacy): (Epoch, NodeId, u64, u64),
         from_jseq: u64,
         txs: Vec<BackupTx>,
-        through: u64,
+        (through, expires): (u64, Ms),
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2143,6 +2146,7 @@ impl Core {
         self.bk.restarted = false;
         self.lease.cached_holder = Some(holder);
         self.bk.holder_silent_since = None;
+        self.note_named_expiry(holder, epoch, now, expires);
         // What is acknowledged is held *contiguously* (or is in the log:
         // rows through the holder's shipped-through seq, `through`, are
         // durable in S3, so a batch may start past them). The holder
@@ -2360,20 +2364,9 @@ impl Core {
         self.bk
             .beats
             .retain(|n, b| *n == from || at.since(b.heard_at) < LATE_BEATS_MEMORY_MS);
-        let b = self.bk.beats.entry(from).or_default();
-        if epoch < b.epoch {
+        let Some(b) = self.beats_at(from, epoch, credit) else {
             return;
-        }
-        if epoch > b.epoch {
-            // A new tenure numbers on (the same beat task), or from 1 (a
-            // restarted holder); its late beats still say how its host
-            // has been doing.
-            b.epoch = epoch;
-            b.heard_at = credit;
-            b.last = None;
-            b.expires = Ms(0);
-        }
-        b.heard_at = b.heard_at.max(credit);
+        };
         // The expiry a beat names, numbered or an arrival the driver
         // handed over (the peer service notes it with the stamp, so it is
         // as fresh as the stamp however far behind this node's steps are).
@@ -2409,6 +2402,46 @@ impl Core {
             // Overtaken by a later beat (they go out concurrently).
             Some(_) => {}
             None => b.last = Some((seq, sent, at)),
+        }
+    }
+
+    /// `from`'s [`HolderBeats`] at `epoch`, heard at `credit`: a new
+    /// tenure numbers on (the same beat task), or from 1 (a restarted
+    /// holder), so the entry starts afresh, though its late beats still
+    /// say how the host has been doing; `None`: `from` has since been
+    /// heard at a later epoch.
+    fn beats_at(&mut self, from: NodeId, epoch: Epoch, credit: Ms) -> Option<&mut HolderBeats> {
+        let b = self.bk.beats.entry(from).or_default();
+        if epoch < b.epoch {
+            return None;
+        }
+        if epoch > b.epoch {
+            b.epoch = epoch;
+            b.heard_at = credit;
+            b.last = None;
+            b.expires = Ms(0);
+        }
+        b.heard_at = b.heard_at.max(credit);
+        Some(b)
+    }
+
+    /// An append of `from`'s at `epoch`, arrived at `at`, names the
+    /// expiry of the lease it holds (`expires`; 0: unknown): recorded
+    /// where a beat's is, for [`Self::known_expiry`]. Appends reach a
+    /// backup whose heartbeat lane is broken, and a tenure that sent at
+    /// least one has named its expiry. Never lowered, and no other
+    /// epoch's: an epoch's expiry only moves later, so each value is a
+    /// lower bound, and a lower bound can only make the watch read the
+    /// lease early (which seals nothing: `on_takeover_get` seals only an
+    /// expired object that lists this node). Through `beats_at` it also
+    /// moves `HolderBeats::heard_at` to the core's `now`, which the
+    /// `ack=s3` holder watch reads: by at most one core lag, within the epoch.
+    fn note_named_expiry(&mut self, from: NodeId, epoch: Epoch, at: Ms, expires: Ms) {
+        if expires.0 <= 0 {
+            return;
+        }
+        if let Some(b) = self.beats_at(from, epoch, at) {
+            b.expires = b.expires.max(expires);
         }
     }
 
@@ -2454,9 +2487,10 @@ impl Core {
     /// no late-beat window either):
     ///
     /// - none within the expiry margin of the holder's lease, as its own
-    ///   beats last named the expiry — or, before a beat has, as this
-    ///   node's last read of the lease object did (a lower bound: the
-    ///   holder renews past it, so the discount ends early, never late).
+    ///   beats and appends last named the expiry — or, before either has,
+    ///   as this node's last read of the lease object did (a lower
+    ///   bound: the holder renews past it, so the discount ends early,
+    ///   never late).
     ///   Its beats stop at the expiry, so silence there may be the lease
     ///   ending, not a stall — and a backup must seal and claim promptly
     ///   then: nobody else may claim a `Backup` lease for
@@ -2469,7 +2503,7 @@ impl Core {
     ///   attentive time, 2026-10-16 `snapsched`);
     /// - a window (T) plus the lapses' length while the lease, so known,
     ///   runs;
-    /// - with no expiry known at all (no beat heard, no read naming this
+    /// - with no expiry known at all (no beat or append heard, no read naming this
     ///   tenure): for the seal watch a flat half window, lapses included —
     ///   the read then comes at most 1.5T after the holder's last word in
     ///   wall time, whatever the lapse, inside the 2T grace past an expiry
@@ -2489,8 +2523,8 @@ impl Core {
         }
     }
 
-    /// The expiry of `holder`'s lease at `epoch` as its beats last named
-    /// it (or as a lease read past it showed it renewed).
+    /// The expiry of `holder`'s lease at `epoch` as its beats and appends
+    /// last named it (or as a lease read past it showed it renewed).
     fn beat_named_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
         self.bk
             .beats
@@ -2500,8 +2534,14 @@ impl Core {
     }
 
     /// The expiry of `holder`'s lease at `epoch` as this node knows it:
-    /// the later of what its beats last named and what this node last
-    /// read (each a lower bound: the holder may have renewed since).
+    /// the latest of what its beats and its appends named and what this
+    /// node last read (each a lower bound: the holder may have renewed
+    /// since). Every `BackupAppend` carries the expiry the holder holds,
+    /// so a backup with a broken heartbeat lane that never read the lease
+    /// during the tenure still knows it, once the holder has sent it one
+    /// append; `None` is a tenure that sent this node no append, no beat
+    /// (and none read): it has nothing unshipped to lose, a holder lists
+    /// a backup only to append to it.
     pub(crate) fn known_expiry(&self, holder: NodeId, epoch: Epoch) -> Option<Ms> {
         let read = self
             .lease

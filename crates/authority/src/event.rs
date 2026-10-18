@@ -500,7 +500,11 @@ pub enum PeerMsg {
     /// `candidacy` names the holder's bring-up of this backup (unique per
     /// holder and growing; a backup dropped and re-added gets a new one):
     /// a dismissal (`HolderAlive { listed: false }`) applies only to the
-    /// candidacy it names.
+    /// candidacy it names. `expires_unix_ms` is the expiry of the lease
+    /// the holder holds at `epoch`, as it knows it when it builds the
+    /// append (0: none): a lower bound of the tenure's expiry, which only
+    /// moves later. A backup whose heartbeat lane is broken learns from
+    /// it when to read the lease (`Core::known_expiry`).
     BackupAppend {
         req: OpId,
         epoch: Epoch,
@@ -510,6 +514,7 @@ pub enum PeerMsg {
         from: u64,
         txs: Vec<BackupTx>,
         through: u64,
+        expires_unix_ms: i64,
     },
     /// Plan 30 §M9: the backup holds every row through `acked`
     /// (durably), or has `sealed` the epoch and will never acknowledge

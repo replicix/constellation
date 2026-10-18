@@ -308,11 +308,11 @@ Three things make such lag cost latency only:
   timer, often — so silence counts from the lapse's end; but never from
   later than one window plus the lapses' own length after the holder
   was last heard, so a node that lags again and again still acts on a
-  dead holder. Before the holder's first beat (or a read of the lease
-  object) has told a backup its lease's expiry, the reach is a flat half
-  window, lapses included: its read then comes at most 1.5 windows after
-  the holder's last word in wall time, inside the claim grace past an
-  expiry it could not know of.
+  dead holder. Before the holder's first beat or append (or a read of the
+  lease object) has told a backup its lease's expiry, the reach is a flat
+  half window, lapses included: its read then comes at most 1.5 windows
+  after the holder's last word in wall time, inside the claim grace past
+  an expiry it could not know of.
 - *A holder whose beats came late lately gets a longer window.* Each beat
   carries its number and the holder's send time. A beat later than its
   schedule — sent late (the holder's process was held up: its host), or
@@ -325,19 +325,23 @@ Three things make such lag cost latency only:
   meanwhile.
 
 Each beat also names the expiry of the lease it beats for, and the
-beats stop there (the backup takes the later of that and its own last
-read of the lease object: both lower bounds, so they end the discount
-early, never late). The daemon's peer service notes that expiry with the
-beat's arrival stamp, so the backup knows the latest expiry any beat
-named even when its core is seconds behind on the beats themselves.
-Within the expiry margin of that expiry the watch counts plain silence
-again and reads the lease, as it always did: silence there may be the
-lease ending (a holder cut from S3 that could not renew), and a listed
-backup must then seal and claim within the 3 s (twice the window) during
-which nobody else may claim a `Backup` lease past its expiry — its tail
-holds what the holder acknowledged but did not ship. The margin decides
-when the watch *reads*, not whether an unexpired lease is *sealed* (next
-paragraph).
+beats stop there; so does every `BackupAppend`, which carries the expiry
+of the lease the holder holds when it builds the append (the same source
+as the beats'; 0 when it holds none, which a backup takes as unknown).
+The backup takes the latest of what its beats and appends named and its
+own last read of the lease object: all lower bounds (an epoch's expiry
+only moves later), so they end the discount early, never late. The
+daemon's peer service notes the expiry a beat names with the beat's
+arrival stamp (and the one an append names with the append's), so the
+backup knows the latest expiry any of them named even when its core is
+seconds behind on the messages themselves. Within the expiry margin of
+that expiry the watch counts plain silence again and reads the lease, as
+it always did: silence there may be the lease ending (a holder cut from
+S3 that could not renew), and a listed backup must then seal and claim
+within the 3 s (twice the window) during which nobody else may claim a
+`Backup` lease past its expiry — its tail holds what the holder
+acknowledged but did not ship. The margin decides when the watch
+*reads*, not whether an unexpired lease is *sealed* (next paragraph).
 
 Once that expiry has passed, the watch reads the lease at once, however
 recently it heard the holder (it also looks at the expiry itself, not
@@ -363,18 +367,24 @@ with the liveness lane to it broken, and the backup, counting plain
 silence (`silent_ms=3226 attentive_ms=3226`), sealed a live holder. A
 seal is only ever delayed by this (ADR-12), and inside the margin the
 worst case moves from at once to at the expiry, at most the margin (1 s)
-later and still inside the claim grace. What remains: a backup that
-knows no expiry for the tenure at all — no beat named it, and it has not
-read the lease since the holder took it — counts plain silence from its
-last credit, and keeps the claim grace only for a lapse that ends less
-than a window past the expiry. That takes the liveness lane broken for
-the whole tenure, the holder cut from S3 for a TTL, and a lapse of the
-backup's own at the expiry. Such a backup still reads the lease within
-1.5 windows of the holder's last word, as before; but what it reads now
-bounds the seal by the lease's expiry while the backup keeps lapsing,
-where it used to seal at once, so it can take up to the lease's
-remaining TTL to fail over a dead holder (still inside the claim grace
-past that expiry).
+later and still inside the claim grace. The appends close what used to
+remain: with the liveness lane broken for the whole tenure and the
+backup never having read the lease during it, no beat named the expiry,
+and a backup lapsing across it counted plain silence from its last
+credit, past the claim grace (the holder cut from S3 for a TTL and a
+lapse of the backup's own at the expiry were all it took). A backup is
+listed, and holds a role to watch for, only once an append has reached
+it, and the holder sends one at least every heartbeat interval, so for
+any tenure that sent it an append the expiry is known to within the
+holder's last renewal. What remains is a tenure that sent this node no
+append and no beat: it has nothing of the holder's to lose (the holder
+acknowledges nothing a listed backup has not held), and a backup that
+restarted mid-tenure starts by reading the lease. A backup that knows no
+expiry when it reads still reads the lease within 1.5 windows of the
+holder's last word, as before; what it reads bounds the seal by the
+lease's expiry while the backup keeps lapsing, where it used to seal at
+once, so it can take up to the lease's remaining TTL to fail over a dead
+holder (still inside the claim grace past that expiry).
 
 So a dead holder's backup reads the lease to seal it **at most five
 windows (7.5 s at the defaults) into the silence, counted in the time the

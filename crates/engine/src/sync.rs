@@ -379,6 +379,7 @@ pub enum SyncRequest {
         from: u64,
         txs: Vec<constellation_meta::BackupTx>,
         through: u64,
+        expires_unix_ms: i64,
         reply: tokio::sync::oneshot::Sender<(u64, bool)>,
     },
     /// Plan 37 §8: the holder this node backs is being replaced on its

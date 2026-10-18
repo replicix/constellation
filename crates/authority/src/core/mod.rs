@@ -1805,6 +1805,7 @@ impl Core {
                 from: from_jseq,
                 txs,
                 through,
+                expires_unix_ms,
             } => self.on_backup_append(
                 now,
                 from,
@@ -1812,7 +1813,7 @@ impl Core {
                 (epoch, holder, config_version, candidacy),
                 from_jseq,
                 txs,
-                through,
+                (through, Ms(expires_unix_ms)),
                 replica,
                 out,
             ),

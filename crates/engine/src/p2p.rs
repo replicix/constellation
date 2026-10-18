@@ -749,6 +749,7 @@ impl constellation_net::PeerService for P2pBridge {
         from: u64,
         txs: Vec<u8>,
         through: u64,
+        expires_unix_ms: i64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -775,7 +776,7 @@ impl constellation_net::PeerService for P2pBridge {
                 holder,
                 epoch,
                 constellation_store_s3::lease::now_unix_ms(),
-                0,
+                expires_unix_ms,
             );
             let (reply, receive) = tokio::sync::oneshot::channel();
             if self
@@ -788,6 +789,7 @@ impl constellation_net::PeerService for P2pBridge {
                     from,
                     txs,
                     through,
+                    expires_unix_ms,
                     reply,
                 })
                 .is_err()

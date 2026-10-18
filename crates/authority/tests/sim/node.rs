@@ -1138,8 +1138,8 @@ impl Driver {
             // beats, before any timer (`Driver::hand_heard`); the appends
             // themselves (its sync lane) come after the timers, and the
             // numbered beats with the rest of what peers sent.
-            // Each stamp carries the highest expiry the beats it stands
-            // for named (an append names none: 0), as the bridge's does
+            // Each stamp carries the highest expiry the beats and appends
+            // it stands for named, as the bridge's does
             // (`OffCore::note_holder_heard`).
             let mut stamped: Vec<((NodeId, u64), i64)> = Vec::new();
             for e in &queued {
@@ -1152,9 +1152,15 @@ impl Driver {
                         ..
                     } => Some(((*from, *epoch), expires.0)),
                     Event::Peer {
-                        msg: PeerMsg::BackupAppend { holder, epoch, .. },
+                        msg:
+                            PeerMsg::BackupAppend {
+                                holder,
+                                epoch,
+                                expires_unix_ms,
+                                ..
+                            },
                         ..
-                    } => Some(((*holder, *epoch), 0)),
+                    } => Some(((*holder, *epoch), *expires_unix_ms)),
                     _ => None,
                 };
                 if let Some((key, expires)) = key {

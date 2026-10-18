@@ -1902,11 +1902,10 @@ fn backup_lag_at_expiry_config(beats_lost: bool) -> SimConfig {
 /// first, it sealed in 1: in the others it waited a window past its
 /// lapse and the expired lease was claimed first — by itself, by TTL,
 /// unsealed, or by another node). The seeds of 0..2000 that lost the
-/// order of acknowledged writes before are pinned. What is left fails
-/// `backup-lag-at-expiry-beats-lost` seeds 1788 and 1791: a backup that
-/// knows no expiry for the tenure at all (no beat, no read of the lease
-/// since the holder took it) counts plain silence from the backlog's
-/// credit, the documented residual.
+/// order of acknowledged writes before are pinned, 1788 and 1791 of
+/// `backup-lag-at-expiry-beats-lost` among them: with the liveness lane
+/// broken for the whole tenure and no read of the lease since the holder
+/// took it, nothing but the appends named the expiry (they carry it).
 #[test]
 fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
     let configs = |label: &str| match label {
@@ -1933,7 +1932,12 @@ fn a_backup_lapsing_at_its_holders_expiry_still_claims_in_time() {
             "backup-lag-at-expiry",
             &[60, 260, 609, 644, 830, 1034, 1106, 1252, 1624, 1852, 1863],
         ),
-        ("backup-lag-at-expiry-beats-lost", &[655, 837, 981, 1025]),
+        // (1788 and 1791: the beats lost for the whole tenure and no read
+        // of the lease, so only the appends named the expiry.)
+        (
+            "backup-lag-at-expiry-beats-lost",
+            &[655, 837, 981, 1025, 1788, 1791],
+        ),
         // Timers first: the unknown-expiry arm waiting a window past the
         // lapse, or (655) the backlog heard during the lease read
         // re-arming the watch past the expired lease.

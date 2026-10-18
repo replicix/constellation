@@ -1793,6 +1793,7 @@ async fn handle_stream<S: PeerService>(
                 from,
                 txs,
                 through,
+                expires_unix_ms,
             } => Some(
                 service
                     .backup_append_requested(
@@ -1803,6 +1804,7 @@ async fn handle_stream<S: PeerService>(
                         from,
                         txs,
                         through,
+                        expires_unix_ms,
                     )
                     .await,
             ),

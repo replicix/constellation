@@ -6821,6 +6821,7 @@ mod epoch_rules {
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
+                expires_unix_ms: 0,
             },
         });
         assert!(matches!(
@@ -6874,6 +6875,7 @@ mod epoch_rules {
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
+                expires_unix_ms: 0,
             },
         };
         let hold = |from, epoch, for_ms| Event::Peer {
@@ -6943,6 +6945,7 @@ mod epoch_rules {
                 from: 1,
                 txs: Vec::new(),
                 through: 0,
+                expires_unix_ms: 0,
             },
         });
         let watch = timers(&out, TimerKind::BackupWatch);
@@ -7191,6 +7194,7 @@ mod epoch_rules {
                     from: 1,
                     txs: Vec::new(),
                     through: 0,
+                    expires_unix_ms: 0,
                 },
             });
             let out = h.step(Event::Timer { id: watch });
@@ -7213,6 +7217,84 @@ mod epoch_rules {
                 assert_eq!(h.core.bk.sealed, 1, "did not seal past the expiry: {out:?}");
             }
         }
+    }
+
+    /// The expiry reaches the backup in every append, whatever the
+    /// liveness lane does: no beat at all, no read of the lease, and the
+    /// holder (cut from S3, so it cannot renew) appends with the expiry
+    /// `E` it holds. The backup's runtime lapses across `E`; the daemon's
+    /// P2P handlers stamp the holder's backlog at the lapse's end, and
+    /// the watch then reads the lease at once, expired and listing this
+    /// node: sealed. Before, with nothing naming the tenure's expiry, the
+    /// reach was a flat half window from the backlog's credit, past the
+    /// 2T claim grace (`backup-lag-at-expiry-beats-lost` seeds 1788,
+    /// 1791). An append names the expiry for its own epoch only, never
+    /// lowers it, and 0 is unknown.
+    #[test]
+    fn appends_name_the_expiry_when_no_beat_does() {
+        let mut h = Harness::new(2);
+        let t0 = h.now;
+        let expires = t0.plus(2_000);
+        let append = |h: &mut Harness, req, epoch, expires: Ms| {
+            h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::BackupAppend {
+                    req: OpId(req),
+                    epoch,
+                    holder: 1,
+                    config_version: 2,
+                    candidacy: 1,
+                    from: 1,
+                    txs: Vec::new(),
+                    through: 0,
+                    expires_unix_ms: expires.0,
+                },
+            })
+        };
+        let out = append(&mut h, 7, 1, Ms(0));
+        let watch = timers(&out, TimerKind::BackupWatch)[0];
+        assert_eq!(h.core.known_expiry(1, 1), None, "0 is unknown");
+        append(&mut h, 8, 1, expires);
+        assert_eq!(h.core.known_expiry(1, 1), Some(expires));
+        // Never lowered, by an older value or by a 0.
+        append(&mut h, 9, 1, t0.plus(500));
+        append(&mut h, 10, 1, Ms(0));
+        assert_eq!(h.core.known_expiry(1, 1), Some(expires));
+        assert_eq!(h.core.bk.beats[&1].epoch, 1);
+
+        h.advance(3_600);
+        h.step(Event::OwnLag {
+            from: t0.plus(500),
+            until: h.now,
+        });
+        let lapse_end = h.now;
+        alive(&mut h, 0, true, lapse_end);
+        append(&mut h, 11, 1, expires);
+        let out = h.step(Event::Timer { id: watch });
+        assert!(
+            matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]),
+            "no read past the expiry the appends named: {out:?}"
+        );
+        h.advance(30);
+        let mut lease = root_lease(1, 1, expires);
+        lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
+        lease.backups = vec![2];
+        let out = answer_job_read(&mut h, &out, lease);
+        assert_eq!(h.core.bk.sealed, 1, "did not seal past the expiry: {out:?}");
+
+        // Another epoch's expiry is not this one's: the role is at
+        // epoch 2, and a (late) append of epoch 1 names a far one.
+        let mut h = Harness::new(2);
+        let t0 = h.now;
+        let far = t0.plus(600_000);
+        append(&mut h, 7, 2, t0.plus(2_000));
+        append(&mut h, 8, 1, far);
+        assert_eq!(h.core.known_expiry(1, 2), Some(t0.plus(2_000)));
+        assert_eq!(h.core.known_expiry(1, 1), None);
+        // A new tenure's expiry replaces the old tenure's, not maxes with it.
+        append(&mut h, 9, 3, t0.plus(1_000));
+        assert_eq!(h.core.known_expiry(1, 3), Some(t0.plus(1_000)));
+        assert_eq!(h.core.known_expiry(1, 2), None);
     }
 
     /// A backup whose runtime lags again and again still seals a dead
@@ -7673,6 +7755,49 @@ mod epoch_rules {
         assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
     }
 
+    /// A numbered beat records the expiry it names, as an arrival does
+    /// and as an append does (`note_named_expiry`): raised by a later
+    /// one, never lowered, started over by a newer epoch. `note_beat`
+    /// shares the entry's epoch handling with the append's path
+    /// (`beats_at`), but the expiry a numbered beat names is its own to
+    /// record.
+    #[test]
+    fn a_numbered_beat_naming_an_expiry_raises_the_known_expiry() {
+        let mut h = Harness::new(2);
+        let _watch = backing(&mut h);
+        let t0 = h.now;
+        assert_eq!(h.core.known_expiry(1, 1), None);
+        let numbered = |h: &mut Harness, epoch: u64, seq: u64, expires: Ms| {
+            let at = h.now;
+            h.step(Event::HolderAlive {
+                from: 1,
+                epoch,
+                candidacy: 1,
+                listed: true,
+                at,
+                seq,
+                sent: at,
+                expires,
+            });
+        };
+        numbered(&mut h, 1, 1, t0.plus(6_000));
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)));
+        h.advance(100);
+        numbered(&mut h, 1, 2, t0.plus(5_000));
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(6_000)), "lowered");
+        h.advance(100);
+        numbered(&mut h, 1, 3, t0.plus(11_000));
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        // A beat naming none leaves it; a newer epoch starts over.
+        h.advance(100);
+        numbered(&mut h, 1, 4, Ms(0));
+        assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
+        h.advance(100);
+        numbered(&mut h, 2, 1, t0.plus(20_000));
+        assert_eq!(h.core.known_expiry(1, 2), Some(t0.plus(20_000)));
+        assert_eq!(h.core.known_expiry(1, 1), None);
+    }
+
     /// With the expiry handed along, the watch is not blind to a renewal
     /// its core is behind on: the holder's beats (stamped at the bridge)
     /// named an expiry far past the one the core's own numbered beats
@@ -8046,6 +8171,7 @@ mod pipelined_appends {
                 from: 1,
                 txs: batch,
                 through: 0,
+                expires_unix_ms: 0,
             },
         });
         let acked = out
@@ -8355,6 +8481,7 @@ mod pipelined_appends {
                     from: tx.first,
                     txs: vec![tx.clone()],
                     through: 0,
+                    expires_unix_ms: 0,
                 },
             });
             out.iter()
@@ -8422,6 +8549,7 @@ mod pipelined_appends {
                     from,
                     txs,
                     through: 0,
+                    expires_unix_ms: 0,
                 },
             });
             out.iter()
@@ -9751,6 +9879,7 @@ mod backup_crash {
                 from: 1,
                 txs,
                 through: 0,
+                expires_unix_ms: 0,
             },
         });
         let watch = timers(&out, TimerKind::BackupWatch)[0];
@@ -9892,6 +10021,7 @@ mod backup_crash {
                 from: 1,
                 txs,
                 through: 0,
+                expires_unix_ms: 0,
             },
         });
         h.meta.backup_seal(1).unwrap();
@@ -23083,6 +23213,7 @@ fn a_backup_its_live_holder_removed_does_not_seal_and_can_be_invited_back() {
             txs: Vec::new(),
             through: 0,
             candidacy,
+            expires_unix_ms: 0,
         },
     };
     let mut h = Harness::new(2);
@@ -23130,6 +23261,7 @@ fn a_holder_heard_while_the_lease_is_read_is_not_sealed() {
             txs: Vec::new(),
             through: 0,
             candidacy: 1,
+            expires_unix_ms: 0,
         },
     };
     let mut h = Harness::new(2);
@@ -23165,6 +23297,7 @@ fn a_holder_heard_while_its_expired_lease_is_read_is_sealed() {
             txs: Vec::new(),
             through: 0,
             candidacy: 1,
+            expires_unix_ms: 0,
         },
     };
     let mut h = Harness::new(2);
@@ -23203,6 +23336,7 @@ fn a_continuation_epoch_opened_during_the_takeover_read_blocks_the_seal() {
             txs: Vec::new(),
             through: 0,
             candidacy: 1,
+            expires_unix_ms: 0,
         },
     });
     let watch = timers(&out, TimerKind::BackupWatch)[0];
