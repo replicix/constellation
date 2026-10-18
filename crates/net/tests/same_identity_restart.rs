@@ -461,8 +461,12 @@ async fn a_crashed_peer_stops_counting_as_reachable_promptly() {
 
 /// How long the observer's requests to a handed-over peer's successor
 /// may fail after the successor's own first request reached it: a round
-/// trip (and a re-dial), not a probe window.
-const HANDOVER_BOUND: Duration = Duration::from_millis(500);
+/// trip (and a re-dial), not a probe window. The re-dial is a QUIC
+/// handshake that a starved host stretches to several hundred ms (400 ms
+/// seen with 16 copies of this test beside 32 busy threads); the other
+/// outcome is the restart probe's 2 s (the control below needs 1.5 s), so
+/// the bound sits between the two, not at a round trip's idle cost.
+const HANDOVER_BOUND: Duration = Duration::from_millis(1_000);
 
 /// A planned handover of the victim's identity: incarnation 0 either
 /// says goodbye (`close`) or just goes, as an `exec` does; incarnation 1

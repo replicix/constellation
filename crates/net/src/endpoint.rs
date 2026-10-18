@@ -331,7 +331,7 @@ impl Pool {
                  live); replacing only this one"
             );
             if let Some(conn) = self.unpool(&gate, stable).await {
-                conn.close(iroh::endpoint::VarInt::from_u32(0), b"unresponsive");
+                close_unless_closed(&conn, b"unresponsive");
             }
         } else {
             tracing::info!(
@@ -592,7 +592,7 @@ impl Pool {
         let Some(conn) = self.unpool(&gate, stable).await else {
             return;
         };
-        conn.close(iroh::endpoint::VarInt::from_u32(0), why.as_bytes());
+        close_unless_closed(&conn, why.as_bytes());
         let others = self.tracked.lock().unwrap().remove(&id).unwrap_or_default();
         let mut closed = 0usize;
         for other in others.iter().filter_map(|weak| weak.upgrade()) {
@@ -746,6 +746,17 @@ pub(crate) fn log_version_mismatch(peer: &iroh::EndpointId, theirs: Option<&[u8]
             "P2P protocol version mismatch: the peer refused this node's version and \
              none it knows (it runs a newer one?); the two nodes cannot talk P2P"
         ),
+    }
+}
+
+/// Close `conn` with `reason` unless it is closed already. The transport
+/// takes a second close for a new reason, so a connection the peer had
+/// just closed (with a goodbye, say) would read as closed locally to
+/// whoever then asks why, and the probe that found it dead closes it
+/// again as a matter of course.
+fn close_unless_closed(conn: &iroh::endpoint::Connection, reason: &[u8]) {
+    if conn.close_reason().is_none() {
+        conn.close(iroh::endpoint::VarInt::from_u32(0), reason);
     }
 }
 
@@ -2232,6 +2243,22 @@ impl P2p {
         let gate = self.pool.gate(&peer)?;
         let id = gate.lock().await.as_ref().map(|conn| conn.stable_id());
         id
+    }
+
+    /// A watch on the connection pooled to `peer` right now: resolves,
+    /// when that very connection closes, to why (the peer's close reason,
+    /// or the transport's error). Unlike [`Self::connection_alive`] it
+    /// does not go through the pool's gate, which a request re-dialing a
+    /// peer that just said goodbye holds until its own timeout; and it
+    /// tells a close frame from an idle timeout. For tests.
+    #[doc(hidden)]
+    pub async fn watch_pooled_connection(
+        &self,
+        peer: iroh::EndpointId,
+    ) -> Option<impl std::future::Future<Output = String> + Send + 'static> {
+        let gate = self.pool.gate(&peer)?;
+        let conn = gate.lock().await.clone()?;
+        Some(async move { conn.closed().await.to_string() })
     }
 
     #[cfg(test)]

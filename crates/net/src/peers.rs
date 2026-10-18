@@ -392,6 +392,18 @@ impl Peers {
         inner.p2p.path_summary_now(id)
     }
 
+    /// [`crate::endpoint::P2p::watch_pooled_connection`] for `node_id`.
+    /// For tests.
+    #[doc(hidden)]
+    pub async fn watch_pooled_connection(
+        &self,
+        node_id: u64,
+    ) -> Option<impl std::future::Future<Output = String> + Send + 'static> {
+        let inner = self.inner.as_ref()?;
+        let id = inner.peers.lock().unwrap().get(&node_id)?.addr.id;
+        inner.p2p.watch_pooled_connection(id).await
+    }
+
     /// The id of the connection pooled to `node_id`, to tell whether it
     /// was replaced. For tests.
     #[doc(hidden)]

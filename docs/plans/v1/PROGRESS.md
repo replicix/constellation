@@ -49487,3 +49487,57 @@ Read against the workload, the reasons are:
   every run: the check flagged nothing on either tree, so no false positive
   to fix and no run to flip. The break `enoent` (seed 42) fails naming
   `enoent-owned`.
+
+## Test: the handover-close tests watch the connection instead of timing a pool poll (2026-10-18)
+
+The engine tests `a_handover_drain_closes_the_peers_connections_at_once` and
+`a_local_handoff_stop_closes_the_peers_connections_at_once` failed on their
+200 ms bound during `cargo test --workspace` with six simulation sweeps on
+the same host. Load-induced, so a bug of the product or of the test: of the
+test.
+
+### What the bound guards
+
+That the goodbye (`close_p2p_for_successor`) reaches the peer as a close
+frame, now, and not as the QUIC path idle timeout (5 s) or the successor's
+2 s restart probe. The product meets it by a wide margin: the old image's
+`how` takes 10-150 ms and the frame leaves first.
+
+### Why it failed
+
+The test polled `connection_alive`, which takes the pool's gate for the
+peer. `a`'s pool drops the closed connection at once, and the next request
+re-dials `b`, which refuses inbound from the moment it hands over: that
+dial holds the gate until the request's own 500 ms timeout drops it. The
+poll waited that out (calls of 489-498 ms, then `false`) and read ~500 ms
+when the close had arrived in a few. Debug output of the pool's dial
+showed the third dial starting at the close and never finishing. Two other
+load-sensitive spots: the setup's `ping_node` (500 ms `REQUEST_TIMEOUT`
+over the first QUIC handshake) failed the test outright in about one run in ten on
+a starved host.
+
+### What changed
+
+- `Peers::watch_pooled_connection` / `P2p::watch_pooled_connection` (hidden,
+  for tests): a future on the pooled connection itself that resolves to its
+  close reason, without the gate. The tests assert the reason is the
+  goodbye (`handed over`) and that it came within a quarter of the idle
+  timeout, which a loaded host cannot trip and an idle-out cannot meet. The
+  setup uses a 20 s ping, and retakes the pooled connection if `a`'s own
+  probe dropped it before the handover started.
+- The transport takes a second `close` on a closed connection as the new
+  reason, so a probe that evicts a connection the peer just closed turned
+  the peer's `handed over` into `closed` for anyone asking why (4 of 320
+  loaded runs). `Pool::probe`'s and `evict`'s close go through
+  `close_unless_closed`.
+- `same_identity_restart`'s `HANDOVER_BOUND` goes from 500 ms to 1 s: the
+  re-dial after the goodbye measured up to 401 ms with 16 copies beside 32
+  busy threads; the control (no close) needs at least 1.5 s.
+
+### Tests
+
+- Local, debug build, `stress-ng --cpu 32` and 8 copies of both tests at a
+  time: before, 8 of 200 runs (of both tests) failed; after, 0 of 600 (and 0 of 480 on an
+  pass with the stress gone). With `close_p2p_for_successor` a no-op both
+  tests still fail ("still open 3 s after"). The net test: 240 of 240 pass
+  at 16 copies beside the stress.

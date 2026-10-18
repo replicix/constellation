@@ -3028,9 +3028,17 @@ mod tests {
 
     /// Two P2P engines on one backend, `a` with a pooled connection to
     /// `b`; `b` hands its identity over with `how`. Returns how long
-    /// `a`'s pooled connection to `b` stayed open afterwards (`None`: it
-    /// still was after 3 s).
-    fn closed_after_handover(how: fn(&Engine)) -> Option<Duration> {
+    /// `a`'s pooled connection to `b` stayed open from the start of `how`,
+    /// and why it closed (`None`: it still was after 3 s).
+    ///
+    /// The connection is watched itself, not polled through the pool: the
+    /// request that finds it closed re-dials `b` (which refuses inbound
+    /// from now on) and holds the pool's gate for that dial until its own
+    /// 500 ms timeout, so a poll of `connection_alive` waited that out
+    /// and read ~500 ms on a loaded host when the close had arrived in
+    /// a few. The close reason also tells the goodbye (`handed over`)
+    /// from the connection idling out.
+    fn closed_after_handover(how: fn(&Engine)) -> Option<(Duration, String)> {
         let root = tempfile::tempdir().unwrap();
         let backend = format!("file://{}/backend", root.path().display());
         let runtime = || {
@@ -3069,27 +3077,76 @@ mod tests {
             ));
         }
         let b_id = b.node_id();
-        assert!(
-            rt_a.block_on(a.peers().ping_node(b_id)),
-            "a reaches b over P2P"
-        );
-        assert!(
-            rt_a.block_on(a.peers().connection_alive(b_id)),
-            "a pooled its connection to b"
-        );
-
-        how(&b);
-        let handed_over = Instant::now();
-        let mut closed = None;
-        while handed_over.elapsed() < Duration::from_secs(3) {
-            if !rt_a.block_on(a.peers().connection_alive(b_id)) {
-                closed = Some(handed_over.elapsed());
+        let ping = constellation_net::Payload::Ping {
+            node_id: a.node_id(),
+        };
+        // A connection that a's own pool dropped before the handover (a
+        // probe that found it unresponsive on a starved host) is no
+        // evidence about the handover: take the pooled one again, up to a
+        // few times, until the one watched is open when `how` starts.
+        let mut watch = None;
+        for _ in 0..5 {
+            // Not `ping_node`: its 500 ms `REQUEST_TIMEOUT` has to cover
+            // the first QUIC handshake, which a loaded host can outrun;
+            // this only sets the connection up.
+            let pong = rt_a.block_on(a.peers().request_to_node_timeout(
+                b_id,
+                &ping,
+                Duration::from_secs(20),
+            ));
+            assert!(
+                matches!(pong, Ok(constellation_net::Payload::Pong { .. })),
+                "a reaches b over P2P: {pong:?}"
+            );
+            let mut candidate = Box::pin(
+                rt_a.block_on(a.peers().watch_pooled_connection(b_id))
+                    .expect("a pooled its connection to b"),
+            );
+            let already_closed = rt_a
+                .block_on(async { tokio::time::timeout(Duration::ZERO, candidate.as_mut()).await })
+                .is_ok();
+            if !already_closed {
+                watch = Some(candidate);
                 break;
             }
-            std::thread::sleep(Duration::from_millis(5));
         }
+        let watch = watch.expect("a kept a pooled connection to b open for the handover");
+
+        let handed_over = Instant::now();
+        // `elapsed()` runs when the connection closes, on a's runtime, so
+        // the time is the close's, not when this thread next got a CPU.
+        let closed = rt_a.spawn(async move { (handed_over.elapsed(), watch.await) });
+        how(&b);
+        let closed = rt_a
+            .block_on(async { tokio::time::timeout(Duration::from_secs(3), closed).await })
+            .ok()
+            .map(|joined| joined.unwrap());
         a.shutdown().expect("a shuts down");
         closed
+    }
+
+    /// What the two handover tests below prove: a goodbye, not a timeout.
+    /// `a`'s connection to `b` is closed by `b`'s close frame (reason
+    /// `handed over`, which only [`Engine::close_p2p_for_successor`]
+    /// sends), and well before the QUIC path idle timeout (5 s) that would
+    /// close it without one. A quarter of the idle timeout is far above
+    /// the milliseconds a close takes and far below the 5 s it does not,
+    /// so a loaded host cannot trip it. The reason is the exact proof; the
+    /// time only guards against a goodbye that arrives late.
+    fn assert_closed_by_goodbye(closed: Option<(Duration, String)>, what: &str) {
+        const PATH_IDLE: Duration = Duration::from_secs(5);
+        let (took, reason) = closed.unwrap_or_else(|| {
+            panic!("a's pooled connection to b was still open 3 s after the {what}")
+        });
+        assert!(
+            reason.contains("handed over"),
+            "a's pooled connection to b closed {took:?} after the {what}, but not by the \
+             goodbye: {reason}"
+        );
+        assert!(
+            took < PATH_IDLE / 4,
+            "a's pooled connection to b closed {took:?} after the {what}"
+        );
     }
 
     /// The upgrade's drain ends with a goodbye on P2P: the peer's pooled
@@ -3101,12 +3158,8 @@ mod tests {
     fn a_handover_drain_closes_the_peers_connections_at_once() {
         let closed = closed_after_handover(|engine| {
             engine.shutdown_for_handover().expect("the drain");
-        })
-        .expect("a's pooled connection to b was still open 3 s after the handover");
-        assert!(
-            closed < Duration::from_millis(200),
-            "a's pooled connection to b closed {closed:?} after the handover"
-        );
+        });
+        assert_closed_by_goodbye(closed, "handover");
     }
 
     /// The same for the local handoff (37-k5a), whose process exits
@@ -3115,12 +3168,8 @@ mod tests {
     fn a_local_handoff_stop_closes_the_peers_connections_at_once() {
         let closed = closed_after_handover(|engine| {
             engine.stop_for_local_handoff().expect("the handoff stop");
-        })
-        .expect("a's pooled connection to b was still open 3 s after the handoff");
-        assert!(
-            closed < Duration::from_millis(200),
-            "a's pooled connection to b closed {closed:?} after the handoff"
-        );
+        });
+        assert_closed_by_goodbye(closed, "handoff");
     }
 
     /// Plan 37 §8 (37-k5a): `stop_for_local_handoff` drains nothing, and a
