@@ -337,6 +337,48 @@ struct LedgerInner {
     /// The daemons' client deadline (zero: no op is in doubt).
     client_deadline: Duration,
     ops: u64,
+    /// Per path, the last op the application was certainly told
+    /// succeeded (what [`Ledger::ownership`] reports a refusal against).
+    last: BTreeMap<String, Certain>,
+    /// Paths a rename or an unlink failed on, ever: a stranded execution
+    /// of it (answered in doubt, replayed by rid on a drain) may still
+    /// land, move or remove the path after later acknowledged ops on it,
+    /// so no refusal of the path is certain to be a wrong one.
+    tainted: HashSet<String>,
+}
+
+/// The last certain (acknowledged) op on a path.
+#[derive(Debug, Clone)]
+enum Certain {
+    Write(u64),
+    RenamedIn(String),
+    RenamedAway(String),
+    Unlinked,
+}
+
+impl std::fmt::Display for Certain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Certain::Write(seq) => write!(f, "acknowledged write seq {seq}"),
+            Certain::RenamedIn(from) => write!(f, "acknowledged rename from {from}"),
+            Certain::RenamedAway(to) => write!(f, "acknowledged rename to {to}"),
+            Certain::Unlinked => write!(f, "acknowledged unlink"),
+        }
+    }
+}
+
+/// What the ledger knows about whether a path exists right now, for
+/// judging an `ENOENT` the application got on it ([`Ledger::ownership`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ownership {
+    /// The writer certainly made the name and nothing since removed or
+    /// moved it: it exists. `last` is the last certain op on it.
+    Owned { last: String },
+    /// A failed op leaves the name's state open (`why`).
+    Uncertain(&'static str),
+    /// The name is not one the writer has: never made, or acknowledged
+    /// removed or renamed away.
+    Absent,
 }
 
 /// Whether an op that failed with `e` after `took` was answered in doubt:
@@ -351,8 +393,9 @@ pub fn answered_in_doubt(e: &std::io::Error, took: Duration, deadline: Duration)
 /// application was told succeeded (and each that failed, which may have
 /// landed all the same), and [`Ledger::check`] compares the tree with it.
 /// Paths are relative to the mount; each path must have one writer at a
-/// time (a workload's own directory), so the ledger's order is the
-/// writer's.
+/// time (a workload's own directory, which no other node, process or
+/// load item touches), so the ledger's order is the writer's and what it
+/// says is certain about a name is what the filesystem must show.
 #[derive(Debug, Clone, Default)]
 pub struct Ledger(Arc<Mutex<LedgerInner>>);
 
@@ -435,6 +478,7 @@ impl Ledger {
         l.ops += 1;
         l.acked.insert(id.clone());
         l.doubtful.remove(rel);
+        l.last.insert(rel.to_string(), Certain::Write(id.seq));
         l.files.insert(rel.to_string(), Some(id));
     }
 
@@ -486,6 +530,7 @@ impl Ledger {
         let mut l = self.inner();
         for r in rels {
             l.doubtful.insert(r.to_string());
+            l.tainted.insert(r.to_string());
             // What it held may now be anywhere among them.
             if let Some(Some(id)) = l.files.get(*r).cloned() {
                 l.attempted.insert(id);
@@ -506,6 +551,10 @@ impl Ledger {
         } else {
             l.doubtful.remove(to);
         }
+        l.last
+            .insert(to.to_string(), Certain::RenamedIn(from.to_string()));
+        l.last
+            .insert(from.to_string(), Certain::RenamedAway(to.to_string()));
         l.files.insert(to.to_string(), moved);
     }
 
@@ -515,7 +564,34 @@ impl Ledger {
         let mut l = self.inner();
         l.ops += 1;
         l.doubtful.remove(rel);
+        l.last.insert(rel.to_string(), Certain::Unlinked);
         l.files.insert(rel.to_string(), None);
+    }
+
+    /// Whether `rel` exists right now, as far as the ledger is certain:
+    /// the writer's own acknowledged ops decide ([`Ownership::Owned`]: a
+    /// refusal of an op on it with `ENOENT` is the filesystem refusing the
+    /// application's own effect), unless an op on it failed, since or
+    /// before, in a way that may still land ([`Ownership::Uncertain`]).
+    pub fn ownership(&self, rel: &str) -> Ownership {
+        let l = self.inner();
+        if l.doubtful.contains(rel) {
+            return Ownership::Uncertain("the name's last write, rename or unlink failed");
+        }
+        if l.tainted.contains(rel) {
+            return Ownership::Uncertain(
+                "a rename or unlink on the name failed once: it may still land",
+            );
+        }
+        match l.files.get(rel) {
+            Some(Some(_)) => Ownership::Owned {
+                last: l
+                    .last
+                    .get(rel)
+                    .map_or_else(|| "none recorded".to_string(), |c| c.to_string()),
+            },
+            _ => Ownership::Absent,
+        }
     }
 
     /// Write `id` as a payload of `len` bytes at `root/rel` (`fsync`ed),
@@ -794,6 +870,10 @@ pub struct OpCtx {
     pub killed: bool,
     /// The file may have been removed meanwhile (`ESTALE`).
     pub removable: bool,
+    /// `ENOENT` on a name the workload certainly owns
+    /// ([`Ledger::ownership`]): the op was refused for a name that is
+    /// there, a wrong answer.
+    pub owned_absent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -804,6 +884,9 @@ pub struct ErrnoRecord {
     pub started: Instant,
     pub took: Duration,
     pub ctx: OpCtx,
+    /// What the workload knew about the op (its path, the ledger's last
+    /// certain op on it), for the verdict's text; may be empty.
+    pub detail: String,
 }
 
 /// The errors a workload's ops saw.
@@ -869,7 +952,46 @@ impl ErrnoLog {
                 started,
                 took: started.elapsed(),
                 ctx,
+                detail: String::new(),
             });
+    }
+
+    /// `op` on `rel` (a path with one writer, `ledger`'s) answered
+    /// `ENOENT`; `rel` is the name the answer is about (a rename's
+    /// source). Recorded as an error when the ledger is certain the name
+    /// exists ([`Ownership::Owned`]: the writer made it, or the op had
+    /// taken effect, and nothing removed it: the answer refuses the
+    /// application's own effect). Ignored (`false`) when the name is not
+    /// one the writer has (an unlink of what was never made or is already
+    /// removed) or its state is open (an earlier op on it failed).
+    pub fn record_notfound(
+        &self,
+        ledger: &Ledger,
+        node: &str,
+        op: &str,
+        rel: &str,
+        e: &std::io::Error,
+        started: Instant,
+    ) -> bool {
+        let Ownership::Owned { last } = ledger.ownership(rel) else {
+            return false;
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ErrnoRecord {
+                node: node.to_string(),
+                op: op.to_string(),
+                errno: e.raw_os_error().unwrap_or(0),
+                started,
+                took: started.elapsed(),
+                ctx: OpCtx {
+                    owned_absent: true,
+                    ..Default::default()
+                },
+                detail: format!("{rel}, last certain op on it: {last}"),
+            });
+        true
     }
 
     pub fn records(&self) -> Vec<ErrnoRecord> {
@@ -882,7 +1004,7 @@ impl ErrnoLog {
         let mut rep = ErrnoReport::default();
         let mut eio_under_lock: HashMap<&str, u64> = HashMap::new();
         for r in &recs {
-            let what = format!(
+            let mut what = format!(
                 "{} {} errno {} ({}) after {:?}",
                 r.node,
                 r.op,
@@ -890,6 +1012,9 @@ impl ErrnoLog {
                 std::io::Error::from_raw_os_error(r.errno),
                 r.took
             );
+            if !r.detail.is_empty() {
+                what.push_str(&format!(" on {}", r.detail));
+            }
             let (class, verdict) = classify(r, ev, &mut eio_under_lock);
             *rep.counts.entry(class).or_insert(0) += 1;
             match verdict {
@@ -915,8 +1040,10 @@ pub struct ErrnoReport {
 /// allow it there (the load campaign's §5.1 set). An `EIO` in doubt past
 /// the client deadline is documented, but it is what load must never
 /// reach: a bug unless [`Evidence::allow_in_doubt`] (triage runs).
-/// `EAGAIN` on a non-blocking lock is allowed without proof that another
-/// holder existed: counted apart, so a rate of spurious ones shows.
+/// `ENOENT` is an error only with [`OpCtx::owned_absent`] (the ledger says
+/// the name is there); a workload that drops the error otherwise never
+/// records it. `EAGAIN` on a non-blocking lock is allowed without proof
+/// that another holder existed: counted apart, so a rate of spurious ones shows.
 fn classify<'a>(
     r: &'a ErrnoRecord,
     ev: &Evidence,
@@ -927,6 +1054,15 @@ fn classify<'a>(
 ) {
     let e = r.errno;
     let c = r.ctx;
+    if e == libc::ENOENT && c.owned_absent {
+        return (
+            "enoent-owned",
+            Err(
+                "ENOENT for a name the writer certainly owns: the filesystem refused the \
+                 application's own effect",
+            ),
+        );
+    }
     if e == libc::EIO {
         if c.under_lock {
             let n = eio_under_lock.entry(&r.node).or_insert(0);
@@ -2295,6 +2431,7 @@ mod tests {
             started: Instant::now(),
             took,
             ctx,
+            detail: String::new(),
         };
         let log = ErrnoLog::new();
         let under_lock = OpCtx {
@@ -2342,6 +2479,88 @@ mod tests {
         // Triage runs may allow the in-doubt one.
         ev.allow_in_doubt = true;
         assert_eq!(log.judge(&ev).allowed.len(), 3);
+    }
+
+    /// The writer's rename and unlink drop `ENOENT`; a name the ledger
+    /// holds as certainly there is the exception: an answer that refuses
+    /// the application's own effect.
+    #[test]
+    fn enoent_of_an_owned_name_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("w")).unwrap();
+        let l = Ledger::new();
+        let id = |seq| FileId {
+            path: format!("w/f{seq}"),
+            writer: "a".into(),
+            seq,
+        };
+        let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
+        let log = ErrnoLog::new();
+        let ev = Evidence::default();
+        let notfound =
+            |rel: &str, op: &str| log.record_notfound(&l, "a", op, rel, &enoent, Instant::now());
+        // Never made: the unlink of a name the writer does not have.
+        assert_eq!(l.ownership("w/g1"), Ownership::Absent);
+        assert!(!notfound("w/g1", "unlink"));
+        // Acknowledged write: owned; the rename's ENOENT is a wrong answer.
+        l.write(root, "w/f1", id(1), 100).unwrap();
+        assert!(matches!(l.ownership("w/f1"), Ownership::Owned { .. }));
+        assert!(notfound("w/f1", "rename"));
+        // Renamed in: owned under the new name, absent under the old.
+        std::fs::rename(root.join("w/f1"), root.join("w/g1")).unwrap();
+        l.acked_rename("w/f1", "w/g1");
+        assert_eq!(l.ownership("w/f1"), Ownership::Absent);
+        assert!(!notfound("w/f1", "rename"));
+        assert!(notfound("w/g1", "unlink"));
+        // Unlinked: absent, the designed noise.
+        std::fs::remove_file(root.join("w/g1")).unwrap();
+        l.acked_unlink("w/g1");
+        assert_eq!(l.ownership("w/g1"), Ownership::Absent);
+        assert!(!notfound("w/g1", "unlink"));
+        // A failed write leaves the name open until acknowledged again.
+        l.failed_write("w/f2", id(2));
+        assert!(matches!(l.ownership("w/f2"), Ownership::Uncertain(_)));
+        assert!(!notfound("w/f2", "rename"));
+        l.write(root, "w/f2", id(3), 100).unwrap();
+        assert!(matches!(l.ownership("w/f2"), Ownership::Owned { .. }));
+        // A failed rename or unlink may still land, once, later: both
+        // names stay uncertain for good, whatever was acknowledged since.
+        l.write(root, "w/f4", id(4), 100).unwrap();
+        l.failed_rename(
+            "w/f4",
+            "w/g4",
+            &std::io::Error::from_raw_os_error(libc::EIO),
+            Duration::ZERO,
+        );
+        l.write(root, "w/f4", id(5), 100).unwrap();
+        assert!(matches!(l.ownership("w/f4"), Ownership::Uncertain(_)));
+        assert!(matches!(l.ownership("w/g4"), Ownership::Uncertain(_)));
+        assert!(!notfound("w/f4", "rename"));
+        l.write(root, "w/f6", id(6), 100).unwrap();
+        l.failed_op(&["w/f6"]);
+        l.write(root, "w/f6", id(7), 100).unwrap();
+        assert!(!notfound("w/f6", "unlink"));
+        // The verdict names the op, the path and the last certain op,
+        // counted under its own class.
+        let rep = log.judge(&ev);
+        assert_eq!(rep.counts["enoent-owned"], 2, "{rep:?}");
+        assert_eq!(rep.bugs.len(), 2, "{:?}", rep.bugs);
+        assert!(rep.allowed.is_empty());
+        assert!(
+            rep.bugs[0].contains("a rename errno 2")
+                && rep.bugs[0].contains("w/f1")
+                && rep.bugs[0].contains("acknowledged write seq 1"),
+            "{:?}",
+            rep.bugs
+        );
+        assert!(
+            rep.bugs[1].contains("a unlink")
+                && rep.bugs[1].contains("w/g1")
+                && rep.bugs[1].contains("acknowledged rename from w/f1"),
+            "{:?}",
+            rep.bugs
+        );
     }
 
     #[test]

@@ -16,14 +16,15 @@
 //! before the log checks), `latency` (a forged 30 s against a 1 s bound:
 //! past the hard cap, a failure under any profile) and `latency-mild` (a
 //! forged 2.5 s against 1 s, no host lag: a failure, except under an
-//! applied probe-blind injector, where it is inconclusive).
+//! applied probe-blind injector, where it is inconclusive) and `enoent` (a
+//! forged `ENOENT` of a rename of a name the writer certainly owns).
 //! `CONSTELLATION_HARNESS_LOAD_PROBE_S` sets the workload's length
 //! (default 20 s).
 
 use super::m9::{cluster, node_id};
 use super::{eventually, lease_of};
 use crate::client::Client;
-use crate::verify::{ErrnoLog, Evidence, FileId, Ledger, OpCtx};
+use crate::verify::{ErrnoLog, Evidence, FileId, Ledger, OpCtx, Ownership};
 use anyhow::{bail, Context, Result};
 use rand::{Rng, SeedableRng};
 use std::os::unix::fs::FileExt;
@@ -43,6 +44,7 @@ pub(super) const BREAKS: &[&str] = &[
     "log-missing",
     "latency",
     "latency-mild",
+    "enoent",
 ];
 
 /// A write + `fsync` this slow, with the host attentive, is a latency
@@ -74,6 +76,17 @@ fn probe_secs() -> u64 {
 /// One node's writer: overwrites, renames and unlinks in its own
 /// directory, every acknowledged op in the ledger, every error in the
 /// errno log; the slowest write + `fsync` and when it began.
+///
+/// `ENOENT` of a rename or an unlink is ignored only for a name this
+/// writer does not have: the unlink picks a name by arithmetic, so it
+/// mostly names a file never renamed into place or already unlinked. The
+/// directory is the writer's own (no other node, process or load item
+/// touches it), so for a name the ledger holds as acknowledged made and
+/// not removed since, with no failed rename or unlink on it, `ENOENT` is
+/// the filesystem refusing the application's own effect: an error
+/// (`enoent-owned`, [`ErrnoLog::record_notfound`]). A name whose last op
+/// failed, or that a failed rename or unlink touched (an in-doubt op may
+/// still land, once, later), stays ignored.
 fn writer(
     mnt: &Path,
     node: &str,
@@ -110,7 +123,11 @@ fn writer(
             let t = Instant::now();
             match std::fs::rename(mnt.join(&rel), mnt.join(&to)) {
                 Ok(()) => ledger.acked_rename(&rel, &to),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // ENOENT: the name is not there, which is an answer only
+                // when this writer does not have it (see `notfound`).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    errnos.record_notfound(ledger, node, "rename", &rel, &e, t);
+                }
                 Err(e) => {
                     ledger.failed_rename(&rel, &to, &e, t.elapsed());
                     errnos.record(node, "rename", &e, t, OpCtx::default())
@@ -122,7 +139,9 @@ fn writer(
             let t = Instant::now();
             match std::fs::remove_file(mnt.join(&gone)) {
                 Ok(()) => ledger.acked_unlink(&gone),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    errnos.record_notfound(ledger, node, "unlink", &gone, &e, t);
+                }
                 Err(e) => {
                     ledger.failed_op(&[&gone]);
                     errnos.record(node, "unlink", &e, t, OpCtx::default())
@@ -138,12 +157,19 @@ fn writer(
 /// doubt: the write went out but the fsync or the unlock failed).
 fn counter(mnt: &Path, node: &str, errnos: &ErrnoLog) -> (u64, u64) {
     let (mut done, mut doubt) = (0, 0);
-    let Ok(f) = std::fs::OpenOptions::new()
+    let t = Instant::now();
+    let f = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(mnt.join("counter"))
-    else {
-        return (0, 0);
+    {
+        Ok(f) => f,
+        Err(e) => {
+            // The counter was created and seen on both mounts: an open
+            // that fails is an error the application sees.
+            errnos.record(node, "open counter", &e, t, OpCtx::default());
+            return (0, 0);
+        }
     };
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut i = 0;
@@ -318,6 +344,21 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
                     .context("nothing to remove")?;
                 std::fs::remove_file(clients[0].mnt.join(&rel))?;
                 eprintln!("    {NAME}: BREAK ledger: removed {rel} behind the ledger");
+            }
+            Some("enoent") => {
+                let (rel, _) = ledger
+                    .expected()
+                    .into_iter()
+                    .find(|(rel, id)| {
+                        id.is_some() && matches!(ledger.ownership(rel), Ownership::Owned { .. })
+                    })
+                    .context("no name the writer certainly owns")?;
+                let forged = std::io::Error::from_raw_os_error(libc::ENOENT);
+                anyhow::ensure!(
+                    errnos.record_notfound(&ledger, "a", "rename", &rel, &forged, Instant::now()),
+                    "the forged ENOENT of {rel} was not recorded"
+                );
+                eprintln!("    {NAME}: BREAK enoent: a forged ENOENT of a rename of {rel}");
             }
             Some("errno") => {
                 errnos.record(

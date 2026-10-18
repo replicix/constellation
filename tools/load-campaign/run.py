@@ -79,6 +79,7 @@ PHASES: dict[str, dict] = {
             ("token", r"fencing token order", "baseline"),
             ("split-brain", r"split brain", "baseline"),
             ("errno", r"outside the documented set", "baseline"),
+            ("enoent", r"enoent-owned", "baseline"),
             ("stall", r"hang: ", "baseline"),
             ("log-missing", r"log missing", "baseline"),
             # Past the hard cap: a failure under any profile.

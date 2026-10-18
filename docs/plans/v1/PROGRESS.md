@@ -49411,3 +49411,79 @@ unlink, which the load-probe writer ignores).
   (same fail-before), `a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid`
   (one decide, at the holder; passes either way, it pins the merge) and
   `evicting_an_in_doubt_rid_drops_its_inbox_batches` (fails before).
+
+## Test: `load-probe` judges an `ENOENT` of a rename or unlink on a name the writer owns (2026-10-18)
+
+An exactly-once violation of `load-probe-takeover` (a client op that had
+taken effect, then answered with a refusal by its own effect) left the run's
+`errors by class {}` empty: the writer dropped every `NotFound` of its
+`rename` and `unlink`, and only the bucket-log check (a rid completed and
+refused in one segment) saw it. An application-visible wrong errno is an
+error, so the workload must see it.
+
+### Why the ignore was there
+
+It came with the writer (`516f82e`, the campaign tooling) with no comment.
+Read against the workload, the reasons are:
+
+- The unlink picks its victim by arithmetic (`g{(k+3)%12}`, every 7th op),
+  and a `g*` name exists only after a rename (every 5th op, `f{k}` to
+  `g{k}`) and until the next unlink of it: most unlinks name a file never
+  renamed into place or already unlinked. `ENOENT` is the designed answer.
+- The rename's source `f{k}` was written in the same iteration, but that
+  write may have failed (create refused, `fsync` failed): the name is then
+  in doubt.
+- An op answered in doubt (`EIO` at the client deadline) may still land,
+  once, later (a stranded execution replayed by rid on a node's drain),
+  after later acknowledged ops on that name: it can move or remove a name
+  the writer holds.
+- No other actor touches the names: each node writes its own `w-<node>`
+  directory; the load items stop or slow daemons, none touches the tree;
+  nothing remounts mid-workload.
+
+### What changed
+
+- `verify::Ledger` keeps, per path, the last certain (acknowledged) op, and
+  the paths a failed rename or unlink touched (sticky: a failed op's late
+  landing has no end). `Ledger::ownership(rel)` answers `Owned { last }`
+  (acknowledged made and not removed or renamed away since, last op not
+  failed, no failed rename or unlink ever on it), `Uncertain` or `Absent`
+  (never made, or acknowledged removed or renamed away). The per-op cost is
+  one map insert beside an `fsync`.
+- `ErrnoLog::record_notfound` records an `ENOENT` of the writer's rename or
+  unlink as class `enoent-owned` only for an `Owned` name; the classifier
+  makes it an error, named with the node, the op, the path and the ledger's
+  last certain op on it (`a rename errno 2 ... on w-a/f0, last certain op on
+  it: acknowledged write seq 804`). `Uncertain` and `Absent` names stay
+  ignored, as before.
+- Other ignores in the writer, reviewed: `File::create` never answers
+  `EEXIST` (it truncates) and every failed step of `Ledger::write` was
+  already in the errno log; `create_dir_all` of the writer's directory is
+  unchecked, but a failure shows as an `ENOENT` of the first create (a bug
+  by the classifier). The counter's `open` returned `(0, 0)` silently on any
+  error: now recorded. Nothing else ignores an errno.
+- `CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=enoent` forges the refusal of a
+  rename of an owned name and must fail naming `enoent-owned` (in the
+  runner's smoke break matrix).
+
+### Tests
+
+- `verify::tests::enoent_of_an_owned_name_is_an_error`: never made ignored;
+  acknowledged write owned; renamed in owned under the new name, absent
+  under the old; unlinked absent; failed write uncertain until acknowledged
+  again; a failed rename or unlink makes both names uncertain for good; the
+  verdict's text and the class count. With the ownership check turned off
+  (`record_notfound` never records) it fails at the first owned name.
+- Runs (box, release; `tools/load-campaign/run.py`, seeds 42..51, no load
+  items except where named), on `4b97f57` + this change: `load-probe` 10/10
+  pass, `errors by class {}`; `load-probe-takeover` 10/10 pass;
+  `load-probe-takeover` under `pause:lock-lapse+500:10000@b`: 2 pass, 7
+  inconclusive (the 10 s write bound, covered by the injected pauses), 1
+  failed (seed 46: "the pause did not depose the root", the cell's own
+  check; it ran before the errno judgement). Ten more pause seeds (52..61):
+  10 inconclusive the same way. On `b735045` (the in-doubt fix) + this
+  change: pause seeds 42..51 10 inconclusive (seed 46 included: the root
+  was taken over), `load-probe-takeover` 10/10. `errors by class {}` in
+  every run: the check flagged nothing on either tree, so no false positive
+  to fix and no run to flip. The break `enoent` (seed 42) fails naming
+  `enoent-owned`.

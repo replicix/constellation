@@ -1793,7 +1793,7 @@ pub const SCENARIOS: &[Scenario] = &[
 pub const CAMPAIGN: &[Scenario] = &[
     Scenario {
         name: "load-probe",
-        desc: "load campaign phase 0: two nodes write self-describing files (ledgered), rename, unlink and increment a flock'ed counter under the load profile; every checker runs (data, acknowledged writes after a remount, fsck, exclusion, errno classes, token order, lease epochs, the bucket log); CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<checker> breaks one on purpose",
+        desc: "load campaign phase 0: two nodes write self-describing files (ledgered), rename, unlink and increment a flock'ed counter under the load profile; every checker runs (data, acknowledged writes after a remount, fsck, exclusion, errno classes (an ENOENT of a rename or unlink on a name the writer certainly owns is one), token order, lease epochs, the bucket log); CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<checker> breaks one on purpose",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: campaign::load_probe,

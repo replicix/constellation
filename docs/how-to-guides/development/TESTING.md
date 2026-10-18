@@ -3387,11 +3387,22 @@ only as many as the node fenced, EAGAIN on a non-blocking lock — counted
 apart, for F6's rate — ENOLCK for a new lock during an S3 outage, ESTALE
 on a removed file, EINTR on a killed fsync, EIO under a soft fsync
 timeout; an EIO in doubt past the client deadline is a bug unless
-`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`; anything else is a bug). `load-probe` (a campaign-only scenario, `harness list`) runs them
+`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`; anything else is a bug). The
+workload's rename and unlink drop `ENOENT` only for a name its ledger does
+not hold (the unlink picks a name by arithmetic, so it mostly names a file
+never renamed into place or already unlinked). For a name the ledger holds
+as acknowledged made and not removed since, in a directory no other node,
+process or load item touches, `ENOENT` is the filesystem refusing the
+application's own effect: an error of class `enoent-owned`, counted in
+`errors by class`, failing the scenario with the path, the op and the
+ledger's last certain op on the name. A name whose last write, rename or
+unlink failed, or that a failed rename or unlink ever touched (an op
+answered in doubt may still land, once, later), stays ignored: its state is
+open. `load-probe` (a campaign-only scenario, `harness list`) runs them
 all on two nodes (and fails if the log checkers parsed no grant, tagged
 op, landed write or lease acquisition: its counter guarantees them);
 `CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<data|ledger|exclusion|token|
-split-brain|errno|stall|log-missing|latency|latency-mild>` breaks one on
+split-brain|errno|enoent|stall|log-missing|latency|latency-mild>` breaks one on
 purpose and must fail naming it (`latency-mild`, 2.5 s against a 1 s
 bound, is inconclusive under an applied probe-blind injector only).
 `load-probe` mounts `a` first, so `a` holds the root and a pause aimed at
