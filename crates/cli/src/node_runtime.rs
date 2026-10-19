@@ -1040,9 +1040,10 @@ impl NodeRuntime {
         // policy can be told this daemon's own canonical socket path
         // (plan 33 U1's `kind = "service"` grants match against it, never
         // anything a client claims — see `Policy::with_bound_socket`).
-        // `UnixSocketListener::bind`/`from_std` register with Tokio's
-        // reactor, so this needs the engine's runtime entered first — the
-        // same guard the actual `serve_router` call below has always needed.
+        // The listener is bound here but registered with the reactor of
+        // the control server's own thread when that first polls it
+        // (`UnixSocketListener`); the engine's runtime is entered for
+        // `serve_router`, which dispatches the handlers to it.
         let _guard = e.runtime().enter();
         let bind_result = (|| -> Result<constellation_control::transport::UnixSocketListener> {
             use constellation_control::transport::{
@@ -1108,13 +1109,13 @@ impl NodeRuntime {
             let state_dir = e.state_dir();
             *self.handover.control.lock().unwrap() = Some(listener.try_clone_std()?);
             record_socket(state_dir, listener.path()).context("recording control.path")?;
-            // Held for the daemon's life: dropping the handle does not stop
-            // the server, and the listener's own drop (which would remove
-            // the socket file) never runs before exit or `exec`.
-            std::mem::forget(constellation_control::server::serve_router(
-                listener,
-                router.clone(),
-            ));
+            // Held for the daemon's life: dropping the handle would stop
+            // the server's thread, and the listener's own drop (which would
+            // remove the socket file) never runs before exit or `exec`.
+            std::mem::forget(
+                constellation_control::server::serve_router(listener, router.clone())
+                    .context("starting the control server thread")?,
+            );
             Ok(())
         })();
         if let Err(err) = served {

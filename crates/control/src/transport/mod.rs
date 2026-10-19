@@ -195,6 +195,14 @@ pub trait Transport: Send + Sync + 'static {
 
 /// Something that accepts connections (a bound socket, a test double).
 pub trait Listener: Send + 'static {
+    /// Make the listener ready to be polled by the runtime that is
+    /// current (the server's own, entered by `serve_router`), reporting
+    /// why it cannot be there and then, not on the first `accept`. A
+    /// listener that needs nothing keeps the default.
+    fn register(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Wait for the next connection.
     fn accept(&mut self) -> BoxFuture<'_, std::io::Result<Arc<dyn Transport>>>;
 }

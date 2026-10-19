@@ -230,7 +230,7 @@ fn start_unix(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("control.sock");
     let listener = UnixSocketListener::bind(&path).unwrap();
-    let handle = serve(listener, router, policy, audit);
+    let handle = serve(listener, router, policy, audit).unwrap();
     UnixServer {
         _dir: dir,
         handle,
@@ -364,6 +364,7 @@ async fn a_connection_that_never_says_hello_is_dropped() {
         server_end,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     let frame = tokio::time::timeout(Duration::from_secs(5), client_end.recv_frame())
         .await
@@ -388,6 +389,7 @@ async fn garbage_instead_of_hello_is_refused() {
         server_end,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     client_end
         .send_frame(Frame::new(FrameKind::Request, Bytes::from_static(b"{}")))
@@ -752,6 +754,7 @@ async fn reusing_an_in_flight_request_id_is_rejected() {
         server_end,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     handshake_raw(&client_end, Encoding::Json).await;
     let req = |id| {
@@ -791,6 +794,7 @@ async fn request_id_zero_is_reserved() {
         server_end,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     handshake_raw(&client_end, Encoding::Json).await;
     let r = Request {
@@ -827,6 +831,7 @@ async fn cancel_racing_completion_yields_exactly_one_response_per_call() {
         server_end,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     handshake_raw(&client_end, Encoding::Postcard).await;
     let enc = Encoding::Postcard;
@@ -1414,6 +1419,7 @@ async fn chunk_frames_have_seq_and_a_single_last() {
         server_end,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     handshake_raw(&client_end, Encoding::Json).await;
     let req = Request {
@@ -1473,6 +1479,7 @@ async fn event_frames_use_the_request_id_and_cancel_ends_them() {
         server_end,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     handshake_raw(&client_end, Encoding::Json).await;
     let req = Request {
@@ -1888,7 +1895,7 @@ async fn a_service_grant_over_a_real_socket_grants_the_role_and_names_the_servic
             label: "csi-node-plugin".into(),
         }
     );
-    let handle = serve(listener, test_router(&probes), policy, audit.clone());
+    let handle = serve(listener, test_router(&probes), policy, audit.clone()).unwrap();
     let client = Client::connect_unix(&path).await.unwrap();
     let welcome_roles = client.welcome().roles.clone();
     client
@@ -1928,7 +1935,7 @@ async fn a_service_grant_over_a_real_socket_grants_the_role_and_names_the_servic
         if let Some(bound) = bound.clone() {
             policy = policy.with_bound_socket(bound);
         }
-        let handle = serve(listener, test_router(&probes), policy, null_audit());
+        let handle = serve(listener, test_router(&probes), policy, null_audit()).unwrap();
         let client = Client::connect_unix(&elsewhere).await.unwrap();
         assert!(client.welcome().roles.is_empty(), "{bound:?}");
         let err = client
@@ -2003,6 +2010,7 @@ async fn fd_methods_on_a_transport_without_fd_passing_fail_promptly() {
         server_side,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     let client_side = Arc::new(StreamTransport::new(a, Principal::InProcess));
     let client = Client::from_transport(client_side, ClientOptions::default())
@@ -2091,6 +2099,7 @@ async fn fd_passing_over_a_socketpair_end_to_end() {
         server_side,
         router,
         CancellationToken::new(),
+        tokio::runtime::Handle::current(),
     ));
     let client = Client::from_transport(
         UnixSocket::from_stream(a).unwrap(),
@@ -2629,4 +2638,318 @@ async fn connecting_to_nothing_says_the_daemon_may_not_be_running() {
         .unwrap_err();
     assert_eq!(err.kind, ErrorKind::Unavailable);
     assert!(err.remediation.unwrap().contains("daemon"));
+}
+
+// ---------------------------------------------------------------------------
+// The control thread
+// ---------------------------------------------------------------------------
+
+/// Serve a router on a one-worker runtime ("the engine's"), then block its
+/// only worker for `hog`. Returns what the test needs to talk to the
+/// server and to see whether the hog is still on.
+struct HoggedEngine {
+    engine: tokio::runtime::Runtime,
+    path: std::path::PathBuf,
+    hogging: Arc<AtomicBool>,
+    handle: crate::server::ServerHandle,
+    _dir: tempfile::TempDir,
+}
+
+fn hogged_engine(hog: Duration) -> HoggedEngine {
+    let engine = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sock");
+    let mut router = Router::new().with_policy(owner_policy());
+    router.register_blocking::<NodePing, _>(|_c, _p| Ok(Pong {}));
+    router.register::<PinList, _, _>(|_c, _p| async { Ok(PinListing { pins: Vec::new() }) });
+    let handle = {
+        let _enter = engine.enter();
+        let listener = UnixSocketListener::bind(&path).unwrap();
+        crate::server::serve_router(listener, Arc::new(router)).unwrap()
+    };
+    let hogging = Arc::new(AtomicBool::new(true));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let flag = hogging.clone();
+    engine.spawn(async move {
+        started_tx.send(()).unwrap();
+        std::thread::sleep(hog);
+        flag.store(false, Ordering::SeqCst);
+    });
+    started_rx.recv().unwrap();
+    HoggedEngine {
+        engine,
+        path,
+        hogging,
+        handle,
+        _dir: dir,
+    }
+}
+
+/// A runtime of the client's own (never the hogged one).
+fn client_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn the_control_plane_answers_while_the_engines_runtime_is_blocked() {
+    let hog = hogged_engine(Duration::from_secs(6));
+    let rt = client_runtime();
+    let started = std::time::Instant::now();
+    rt.block_on(async {
+        // Accept, Hello/Welcome and a blocking method: none of them
+        // needs a worker of the hogged runtime.
+        let client = tokio::time::timeout(Duration::from_secs(3), Client::connect_unix(&hog.path))
+            .await
+            .expect("the handshake waited for the blocked runtime")
+            .unwrap();
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(3), client.call::<NodePing>(Empty {}))
+                .await
+                .expect("a blocking method waited for the blocked runtime")
+                .unwrap();
+        }
+        assert!(
+            hog.hogging.load(Ordering::SeqCst),
+            "the runtime was free again: the test proved nothing ({:?})",
+            started.elapsed()
+        );
+        // A handler that is a future still runs on the engine's runtime:
+        // it waits for the worker, and is answered once there is one.
+        let slow = client.call::<PinList>(Empty {});
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), slow)
+                .await
+                .is_err(),
+            "an async handler ran with the runtime blocked"
+        );
+        drop(client);
+    });
+    // After the hog the async handler is served as before.
+    let client = rt.block_on(Client::connect_unix(&hog.path)).unwrap();
+    let listing = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), client.call::<PinList>(Empty {})).await
+        })
+        .expect("the async handler was never answered")
+        .unwrap();
+    assert!(listing.pins.is_empty());
+    assert!(!hog.hogging.load(Ordering::SeqCst));
+    drop(client);
+    rt.block_on(hog.handle.shutdown());
+    hog.engine.shutdown_background();
+}
+
+/// The server as it was before the control thread: the accept loop and
+/// every connection are tasks of the runtime the handlers run on. The
+/// fail-before of the test above: with that runtime's only worker blocked,
+/// the handshake is never answered.
+#[test]
+fn a_server_on_the_blocked_runtime_misses_its_handshake() {
+    let engine = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sock");
+    let mut router = Router::new().with_policy(owner_policy());
+    router.register_blocking::<NodePing, _>(|_c, _p| Ok(Pong {}));
+    let router = Arc::new(router);
+    {
+        let _enter = engine.enter();
+        let mut listener = UnixSocketListener::bind(&path).unwrap();
+        let engine_handle = engine.handle().clone();
+        tokio::spawn(async move {
+            use crate::transport::Listener;
+            loop {
+                let Ok(transport) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(serve_connection(
+                    transport,
+                    router.clone(),
+                    CancellationToken::new(),
+                    engine_handle.clone(),
+                ));
+            }
+        });
+    }
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    engine.spawn(async move {
+        started_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(4));
+    });
+    started_rx.recv().unwrap();
+    let rt = client_runtime();
+    let handshake = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), Client::connect_unix(&path)).await
+    });
+    assert!(
+        handshake.is_err(),
+        "the old arrangement answered a Hello with its runtime blocked"
+    );
+    // Free again, it answers.
+    let client = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), Client::connect_unix(&path)).await
+        })
+        .expect("never answered after the hog")
+        .unwrap();
+    drop(client);
+    engine.shutdown_background();
+}
+
+#[test]
+fn a_server_handle_dropped_stops_its_thread_and_releases_the_listener() {
+    let engine = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.sock");
+    let mut router = Router::new().with_policy(owner_policy());
+    router.register_blocking::<NodePing, _>(|_c, _p| Ok(Pong {}));
+    let (listener, inherited) = {
+        let _enter = engine.enter();
+        let listener = UnixSocketListener::bind(&path).unwrap().keep_path_on_drop();
+        let inherited = listener.try_clone_std().unwrap();
+        (listener, inherited)
+    };
+    let handle = {
+        let _enter = engine.enter();
+        crate::server::serve_router(listener, Arc::new(router)).unwrap()
+    };
+    let rt = client_runtime();
+    let client = rt.block_on(Client::connect_unix(&path)).unwrap();
+    rt.block_on(client.call::<NodePing>(Empty {})).unwrap();
+    drop(client);
+    drop(handle);
+    // The thread stops accepting (the clone in `inherited` keeps the
+    // socket open, as the next image's descriptor does): a connection
+    // now waits in the backlog of a listener nobody serves.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut stopped = false;
+    while std::time::Instant::now() < deadline {
+        let handshake = rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(300), Client::connect_unix(&path)).await
+        });
+        if handshake.is_err() {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "the dropped server still accepts");
+    drop(inherited);
+    engine.shutdown_background();
+}
+
+/// Connections that come and go while others arrive: every one is
+/// answered (the accept loop never drops a connection it has taken).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_that_come_and_go_are_all_answered() {
+    let probes = Probes::default();
+    let server = start_unix(test_router(&probes), owner_policy(), null_audit());
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let path = server.path.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..100 {
+                let client = Client::connect_unix(&path).await.unwrap();
+                client.call::<NodePing>(Empty {}).await.unwrap();
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    server.handle.shutdown().await;
+}
+
+/// A listener that cannot be registered with the server's runtime is an
+/// error of `serve_router`, not a warning every 100 ms from a thread
+/// nobody watches.
+#[test]
+fn a_listener_that_cannot_be_registered_is_an_error_of_serve_router() {
+    struct Broken;
+    impl crate::transport::Listener for Broken {
+        fn register(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("epoll_ctl: no space left"))
+        }
+        fn accept(
+            &mut self,
+        ) -> futures::future::BoxFuture<'_, std::io::Result<Arc<dyn Transport>>> {
+            Box::pin(async { std::future::pending().await })
+        }
+    }
+    let engine = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _enter = engine.enter();
+    let Err(err) = crate::server::serve_router(Broken, Arc::new(Router::new())) else {
+        panic!("a listener that cannot be registered was served");
+    };
+    assert!(err.to_string().contains("no space left"), "{err}");
+    // From inside a runtime's task too (the entered guard of the server's
+    // own runtime nests under it).
+    engine.block_on(async {
+        assert!(crate::server::serve_router(Broken, Arc::new(Router::new())).is_err());
+    });
+}
+
+/// `accept` is cancel-safe: a connection it had taken from the kernel
+/// and was still identifying when its future was dropped is finished by
+/// the listener, never lost.
+#[tokio::test]
+async fn a_dropped_accept_loses_no_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l.sock");
+    let mut listener = UnixSocketListener::bind(&path).unwrap();
+    crate::transport::Listener::register(&mut listener).unwrap();
+    for _ in 0..40 {
+        let client = tokio::spawn({
+            let path = path.clone();
+            async move { Client::connect_unix(&path).await }
+        });
+        // Poll an accept once per scheduler turn and drop it (what a
+        // `select!` against a stop signal does) until it is done or has
+        // taken a connection and is waiting for its identification.
+        let mut taken = None;
+        for _ in 0..1000 {
+            let mut accept = crate::transport::Listener::accept(&mut listener);
+            match futures::poll!(&mut accept) {
+                std::task::Poll::Ready(r) => {
+                    taken = Some(r.unwrap());
+                    break;
+                }
+                std::task::Poll::Pending => {}
+            }
+            drop(accept);
+            if let Some(r) = listener.finish_pending().await {
+                taken = Some(r.unwrap());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let transport = taken.expect("the connection was lost");
+        // And it is a working connection: serve it.
+        let router = Arc::new(test_router(&Probes::default()).with_policy(owner_policy()));
+        tokio::spawn(serve_connection(
+            transport,
+            router,
+            CancellationToken::new(),
+            tokio::runtime::Handle::current(),
+        ));
+        let client = client.await.unwrap().unwrap();
+        client.call::<NodePing>(Empty {}).await.unwrap();
+    }
 }

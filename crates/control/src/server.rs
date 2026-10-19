@@ -42,6 +42,60 @@
 //! `Event`/`Chunk` frames until the stream ends, errors, or is cancelled,
 //! then sends the one terminal `Response`.
 //!
+//! ## Isolation: the control thread
+//!
+//! A socket server ([`serve_router`]) does the *connection* work — accepting,
+//! the handshake, reading frames, and writing the final `Response` of every
+//! call — on one OS thread of its own (`cst-control`) running a
+//! single-threaded Tokio runtime of its own, never on the runtime it was
+//! started from. So a client's `Hello` is answered, and a finished call's
+//! `Response` is sent, while every worker of the shared runtime is busy:
+//! blocked by a synchronous store write, starved by the host, or saturated
+//! (a daemon under load once answered no `Hello` within 10 s because the
+//! accept loop and the handshake needed a worker of the runtime that also
+//! runs the authority core).
+//!
+//! What the thread does *not* do is run handlers, and not every call is
+//! independent of the shared runtime:
+//!
+//! - A method registered with [`Router::register_blocking`] — a plain
+//!   function: `node.status` and `node.ping` in the daemon — is handed by the
+//!   control thread straight to the shared runtime's blocking pool and
+//!   awaited there, with no task of the runtime's in between: it is answered
+//!   whatever the workers are doing. This holds for the call as a whole only
+//!   if the body itself never waits on the runtime. The engine's other
+//!   `unary` bodies are registered the same way, but many of them park on
+//!   the runtime inside (`block_in_place` and `Handle::block_on`: pins,
+//!   the snapshot scheduler, snapshot space, a metadata barrier): they are
+//!   dispatched without a worker and finish only when one is free to drive
+//!   what they wait for.
+//! - A handler that is a future (`register`) and every stream
+//!   (`register_events`, `register_chunks`) runs as a task of the shared
+//!   runtime, exactly as before, and waits for a worker. A stream's `Event`
+//!   and `Chunk` frames are encoded and sent from that task (`run_async`,
+//!   `ConnSink`; only the socket's readiness is driven by the control
+//!   thread's reactor), so a subscription stalls with the runtime; only its
+//!   terminal `Response` is written by the control thread.
+//!
+//! Audit records of a blocking method are written on its blocking thread,
+//! with the handler's own outcome: a call the client cancelled (and was
+//! answered `Cancelled` for after the grace period) is recorded `ok` if its
+//! body went on to succeed — which is what happened to the state, where the
+//! record used to say `cancelled` while the detached work finished. A body
+//! that never returns leaves no record at all (before, the cancel and the
+//! grace period wrote one). Futures and streams are recorded as before.
+//!
+//! The thread starts with the server and stops when the
+//! [`ServerHandle`] is shut down or dropped; a daemon that serves for its
+//! life `mem::forget`s the handle. An `exec` (the in-place upgrade) ends it
+//! with every other thread, the listener descriptor handed on being a
+//! clone. Nothing on the thread logs above `debug` on the request path
+//! (the log sink may block on a stalled disk); a failed `accept` and a
+//! response that cannot be encoded are the only warnings. The listener is
+//! registered with the thread's runtime before [`serve_router`] returns (an
+//! error of that call if it cannot be). The listen backlog is the
+//! platform's (`somaxconn`), no longer tokio's 1024.
+//!
 //! ## Limits
 //!
 //! [`ServeOptions::max_inflight_per_connection`] bounds concurrent calls per
@@ -71,7 +125,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// The biggest single `Chunk` the server emits; larger buffers from a
@@ -189,8 +242,14 @@ type ItemStream = BoxStream<'static, Result<StreamItem, ControlError>>;
 type StreamFn =
     dyn Fn(CallCtx, Blob) -> BoxFuture<'static, Result<ItemStream, ControlError>> + Send + Sync;
 
+/// A method whose whole body is blocking work: a plain function the
+/// server hands to a blocking-pool thread of the engine's runtime.
+type BlockingWork = Box<dyn FnOnce() -> Result<Blob, ControlError> + Send>;
+type BlockingFn = dyn Fn(CallCtx, Blob) -> BlockingWork + Send + Sync;
+
 enum Handler {
     Unary(Box<UnaryFn>),
+    Blocking(Box<BlockingFn>),
     Stream(Box<StreamFn>),
 }
 
@@ -355,6 +414,59 @@ impl Router {
         self
     }
 
+    /// Register the handler of a non-streaming method whose body is
+    /// blocking work (it reads a lock, a file, a snapshot — it never
+    /// awaits). Served from a socket, the call runs on a blocking-pool
+    /// thread of the runtime the server dispatches to **without a task
+    /// on that runtime in between**, so it is answered even while every
+    /// worker of that runtime is busy (module docs, "Isolation"); every
+    /// other path (in-process, tests) runs it under `spawn_blocking` of
+    /// the current runtime, which is what a `register` handler that does
+    /// exactly that would do.
+    ///
+    /// # Panics
+    ///
+    /// If `M` is a streaming method or already has a handler.
+    pub fn register_blocking<M, F>(&mut self, handler: F) -> &mut Router
+    where
+        M: Method,
+        F: Fn(CallCtx, M::Params) -> Result<M::Result, ControlError> + Send + Sync + 'static,
+    {
+        assert_eq!(
+            M::STREAMING,
+            StreamKind::None,
+            "{} streams: use register_events or register_chunks",
+            M::NAME
+        );
+        let handler = Arc::new(handler);
+        let wrapped: Box<BlockingFn> = Box::new(move |ctx: CallCtx, params: Blob| {
+            let encoding = ctx.encoding;
+            let params = match params.decode::<M::Params>() {
+                Ok(p) => p,
+                Err(e) => return Box::new(move || Err(e)),
+            };
+            if let Err(e) = check_fd::<M>(&ctx, &params) {
+                return Box::new(move || Err(e));
+            }
+            let handler = handler.clone();
+            Box::new(move || Blob::encode(encoding, &handler(ctx, params)?))
+        });
+        self.insert::<M>(Handler::Blocking(wrapped));
+        self
+    }
+
+    /// Whether `method` is registered with
+    /// [`register_blocking`](Self::register_blocking).
+    pub(crate) fn is_blocking(&self, method: &str) -> bool {
+        matches!(
+            self.handlers.get(method),
+            Some(Entry {
+                handler: Handler::Blocking(_),
+                ..
+            })
+        )
+    }
+
     /// Register a subscription: the handler returns a stream of events; the
     /// router frames them and ends the call when the stream ends.
     ///
@@ -441,6 +553,13 @@ impl Router {
     /// Steps 1–5 of the module docs. Errors before the handler runs are
     /// returned here (and audited if the method is mutating).
     pub(crate) fn start(&self, inv: Invocation) -> Result<Started, ControlError> {
+        self.start_raw(inv).map(Raw::awaitable)
+    }
+
+    /// [`start`](Self::start), but a blocking method comes back as the
+    /// function to run ([`Raw::Blocking`]) instead of a future that
+    /// runs it under `spawn_blocking` of whichever runtime polls it.
+    fn start_raw(&self, inv: Invocation) -> Result<Raw, ControlError> {
         let entry = self.handlers.get(inv.method.as_str());
         let known = entry
             .map(|e| e.info)
@@ -541,15 +660,19 @@ impl Router {
             fd_passing: inv.fd_passing,
         };
         Ok(match &entry.handler {
-            Handler::Unary(f) => Started::Unary {
+            Handler::Unary(f) => Raw::Started(Started::Unary {
                 fut: f(ctx, inv.params),
                 ticket,
+            }),
+            Handler::Blocking(f) => Raw::Blocking {
+                work: f(ctx, inv.params),
+                ticket,
             },
-            Handler::Stream(f) => Started::Stream {
+            Handler::Stream(f) => Raw::Started(Started::Stream {
                 kind: entry.info.streaming,
                 fut: f(ctx, inv.params),
                 ticket,
-            },
+            }),
         })
     }
 }
@@ -573,11 +696,41 @@ pub(crate) enum Started {
         fut: BoxFuture<'static, Result<Blob, ControlError>>,
         ticket: AuditTicket,
     },
+
     Stream {
         kind: StreamKind,
         fut: BoxFuture<'static, Result<ItemStream, ControlError>>,
         ticket: AuditTicket,
     },
+}
+
+/// What [`Router::start_raw`] found.
+enum Raw {
+    Started(Started),
+    /// A [`Router::register_blocking`] method: the function to run, for
+    /// whoever picks the thread.
+    Blocking {
+        work: BlockingWork,
+        ticket: AuditTicket,
+    },
+}
+
+impl Raw {
+    /// A blocking method as a future that runs it under `spawn_blocking`
+    /// of the runtime polling it.
+    fn awaitable(self) -> Started {
+        match self {
+            Raw::Started(started) => started,
+            Raw::Blocking { work, ticket } => Started::Unary {
+                fut: Box::pin(async move {
+                    tokio::task::spawn_blocking(work)
+                        .await
+                        .map_err(|e| ControlError::failed(format!("the handler failed: {e}")))?
+                }),
+                ticket,
+            },
+        }
+    }
 }
 
 /// An open audit record awaiting its outcome.
@@ -959,6 +1112,7 @@ pub(crate) async fn serve_connection(
     transport: Arc<dyn Transport>,
     router: Arc<Router>,
     shutdown: CancellationToken,
+    engine: tokio::runtime::Handle,
 ) {
     let hs = match handshake(&transport, &router).await {
         Ok(hs) => hs,
@@ -976,6 +1130,8 @@ pub(crate) async fn serve_connection(
     let conn_cancel = shutdown.child_token();
     let inflight: Arc<Mutex<HashMap<u64, CancellationToken>>> = Arc::default();
     let limit = router.options.max_inflight_per_connection;
+    // The calls' tasks (each holds the connection's sending half).
+    let mut calls = tokio::task::JoinSet::new();
 
     loop {
         let frame = tokio::select! {
@@ -1053,8 +1209,10 @@ pub(crate) async fn serve_connection(
                     request,
                     fd: frame.take_fd(),
                     token,
+                    conn_cancel: conn_cancel.clone(),
                 };
-                tokio::spawn(call.run());
+                while calls.try_join_next().is_some() {}
+                calls.spawn(call.run(engine.clone()));
             }
             FrameKind::Cancel => match conn.encoding.from_bytes::<Cancel>(&frame.payload) {
                 Ok(cancel) => {
@@ -1076,7 +1234,18 @@ pub(crate) async fn serve_connection(
             }
         }
     }
+    // The connection is over. Its calls are cancelled — a handler still
+    // running sees its token — and each still ends in its one `Response`
+    // (a cancelled one after at most the grace period) unless the server
+    // itself is shutting down: then the daemon is going away, nobody is
+    // owed an answer, and the tasks that would write them end now. Their
+    // `Conn` is the last holder of the socket: the peer sees it close
+    // before this returns.
     conn_cancel.cancel();
+    if shutdown.is_cancelled() {
+        calls.abort_all();
+    }
+    while calls.join_next().await.is_some() {}
 }
 
 /// Why a request was not admitted.
@@ -1095,10 +1264,17 @@ struct Call {
     request: Request,
     fd: Option<OwnedFd>,
     token: CancellationToken,
+    /// The connection's: cancelled when the daemon's runtime is gone.
+    conn_cancel: CancellationToken,
 }
 
 impl Call {
-    async fn run(self) {
+    /// Run the call and answer it. This runs on the connection's own
+    /// runtime (the control thread's, when served from a socket); the
+    /// handler runs on `engine`, and only its outcome comes back here to
+    /// be written, so neither reading the request nor writing the answer
+    /// waits for a worker of `engine`.
+    async fn run(self, engine: tokio::runtime::Handle) {
         let Call {
             conn,
             router,
@@ -1107,8 +1283,10 @@ impl Call {
             request,
             fd,
             token,
+            conn_cancel,
         } = self;
         let id = request.id;
+        let blocking = router.is_blocking(&request.method);
         let inv = Invocation {
             principal,
             method: request.method,
@@ -1120,48 +1298,43 @@ impl Call {
             fd_passing: conn.transport.supports_fd_passing(),
             encoding: conn.encoding,
         };
-        let work = async {
-            match router.start(inv) {
-                Err(e) => Err(e),
-                Ok(Started::Unary { fut, ticket }) => {
-                    // The handler itself runs on this task; a panic must not
-                    // take the connection's response with it.
-                    let result = std::panic::AssertUnwindSafe(run_unary(
-                        fut,
-                        &token,
-                        router.options.cancel_grace,
-                    ));
-                    let result = futures::FutureExt::catch_unwind(result)
-                        .await
-                        .unwrap_or_else(|_| Err(ControlError::failed("the handler panicked")));
-                    ticket.complete(outcome_of(&result));
-                    result
-                }
-                Ok(Started::Stream { kind, fut, ticket }) => {
-                    let mut sink = ConnSink {
-                        conn: &conn,
-                        id,
-                        kind,
-                        seq: 0,
-                        held: None,
-                    };
-                    let end = std::panic::AssertUnwindSafe(pump_stream(fut, &token, &mut sink));
-                    let end = futures::FutureExt::catch_unwind(end)
-                        .await
-                        .unwrap_or_else(|_| Err(ControlError::failed("the handler panicked")));
-                    ticket.complete(outcome_of(&end));
-                    end.and_then(|end| Blob::encode(conn.encoding, &end))
+        // A task that did not finish: a panic is answered as one; one the
+        // runtime dropped means the runtime is shutting down (the daemon is
+        // exiting), and a connection that cannot be served any more is
+        // closed rather than answered with a made-up error.
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let joined = |gone: Arc<std::sync::atomic::AtomicBool>| {
+            move |e: tokio::task::JoinError| {
+                if e.is_panic() {
+                    ControlError::failed("the handler panicked")
+                } else {
+                    gone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    ControlError::unavailable("the daemon is shutting down")
                 }
             }
         };
-        // Everything above — including the synchronous part of a handler
-        // (the closure body before its `async` block) and the audit sink —
-        // may panic; the call must still end in a Response and free its
-        // in-flight slot.
-        let result: Result<Blob, ControlError> = std::panic::AssertUnwindSafe(work)
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| Err(ControlError::failed("the handler panicked")));
+        let result: Result<Blob, ControlError> = if blocking {
+            // A blocking method is a function: the blocking pool runs it
+            // with no task of the engine's in between; the grace period
+            // for a cancel is timed here.
+            let work = {
+                let router = router.clone();
+                engine.spawn_blocking(move || run_blocking(&router, inv))
+            };
+            let on_join_error = joined(gone.clone());
+            let work: BoxFuture<'static, Result<Blob, ControlError>> =
+                Box::pin(async move { work.await.unwrap_or_else(|e| Err(on_join_error(e))) });
+            run_unary(work, &token, router.options.cancel_grace).await
+        } else {
+            engine
+                .spawn(run_async(router, conn.clone(), inv, token))
+                .await
+                .unwrap_or_else(|e| Err(joined(gone.clone())(e)))
+        };
+        if gone.load(std::sync::atomic::Ordering::SeqCst) {
+            conn_cancel.cancel();
+            return;
+        }
         // Forget the id *before* answering, so a client that reuses ids
         // (ours never does) cannot race the bookkeeping. A `Cancel` that
         // arrives after this point is ignored, exactly as documented.
@@ -1173,23 +1346,105 @@ impl Call {
     }
 }
 
+/// A [`Router::register_blocking`] call, start to audit record, on the
+/// thread that runs it.
+fn run_blocking(router: &Router, inv: Invocation) -> Result<Blob, ControlError> {
+    let panicked = || ControlError::failed("the handler panicked");
+    // Everything below — authorization, the audit sink, the handler —
+    // may panic; the call must still end in a Response.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match router.start_raw(inv)? {
+            Raw::Blocking { work, ticket } => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                    .unwrap_or_else(|_| Err(panicked()));
+                ticket.complete(outcome_of(&result));
+                result
+            }
+            Raw::Started(_) => Err(ControlError::failed(
+                "a blocking method started as an async one",
+            )),
+        }
+    }))
+    .unwrap_or_else(|_| Err(panicked()))
+}
+
+/// Any other call, start to audit record, as a task of the engine's
+/// runtime: unary and streaming handlers are futures that task polls.
+async fn run_async(
+    router: Arc<Router>,
+    conn: Arc<Conn>,
+    inv: Invocation,
+    token: CancellationToken,
+) -> Result<Blob, ControlError> {
+    let id = inv.call_id;
+    let work = async {
+        match router.start(inv) {
+            Err(e) => Err(e),
+            Ok(Started::Unary { fut, ticket }) => {
+                // The handler itself runs on this task; a panic must not
+                // take the connection's response with it.
+                let result = std::panic::AssertUnwindSafe(run_unary(
+                    fut,
+                    &token,
+                    router.options.cancel_grace,
+                ));
+                let result = futures::FutureExt::catch_unwind(result)
+                    .await
+                    .unwrap_or_else(|_| Err(ControlError::failed("the handler panicked")));
+                ticket.complete(outcome_of(&result));
+                result
+            }
+            Ok(Started::Stream { kind, fut, ticket }) => {
+                let mut sink = ConnSink {
+                    conn: &conn,
+                    id,
+                    kind,
+                    seq: 0,
+                    held: None,
+                };
+                let end = std::panic::AssertUnwindSafe(pump_stream(fut, &token, &mut sink));
+                let end = futures::FutureExt::catch_unwind(end)
+                    .await
+                    .unwrap_or_else(|_| Err(ControlError::failed("the handler panicked")));
+                ticket.complete(outcome_of(&end));
+                end.and_then(|end| Blob::encode(conn.encoding, &end))
+            }
+        }
+    };
+    // Everything above — including the synchronous part of a handler
+    // (the closure body before its `async` block) and the audit sink —
+    // may panic; the call must still end in a Response and free its
+    // in-flight slot.
+    std::panic::AssertUnwindSafe(work)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| Err(ControlError::failed("the handler panicked")))
+}
+
 // ---------------------------------------------------------------------------
 // serve
 // ---------------------------------------------------------------------------
 
-/// A running server. Dropping it does **not** stop it; call
-/// [`shutdown`](ServerHandle::shutdown).
+/// A running server. Dropping it stops it (without waiting, and without
+/// answering what is in flight); [`shutdown`](ServerHandle::shutdown)
+/// stops it and waits. A daemon that serves for the life of its process
+/// `mem::forget`s it.
 pub struct ServerHandle {
     shutdown: CancellationToken,
-    task: JoinHandle<()>,
+    exited: Option<tokio::sync::oneshot::Receiver<()>>,
     router: Arc<Router>,
 }
 
 impl ServerHandle {
-    /// Stop accepting, cancel every in-flight call and close connections.
-    pub async fn shutdown(self) {
+    /// Stop accepting, cancel every in-flight call and close connections
+    /// (a client with a call outstanding sees the connection close).
+    /// Returns once the server's thread is done with them, bounded by
+    /// [`ServeOptions::cancel_grace`] plus a second.
+    pub async fn shutdown(mut self) {
         self.shutdown.cancel();
-        let _ = self.task.await;
+        if let Some(exited) = self.exited.take() {
+            let _ = exited.await;
+        }
     }
 
     /// A token that stops the server when cancelled.
@@ -1203,6 +1458,12 @@ impl ServerHandle {
     }
 }
 
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
 /// Serve `router` on `listener` under `policy`, recording mutating calls to
 /// `audit`. Each accepted connection runs the handshake and then its calls
 /// concurrently; see the module docs.
@@ -1211,40 +1472,123 @@ pub fn serve<L: Listener>(
     router: Router,
     policy: Policy,
     audit: Arc<dyn AuditSink>,
-) -> ServerHandle {
+) -> std::io::Result<ServerHandle> {
     let router = Arc::new(router.with_policy(policy).with_audit(audit));
     serve_router(listener, router)
 }
 
 /// [`serve`] for a router that already carries its policy and audit sink
 /// (one shared with a [`dispatch_in_process`] caller, say).
-pub fn serve_router<L: Listener>(mut listener: L, router: Arc<Router>) -> ServerHandle {
+///
+/// Everything about the *connections* — accepting, the handshake, reading
+/// requests, writing responses and events — runs on a thread of its own
+/// (`cst-control`) with a single-threaded runtime of its own, so the
+/// control plane answers while the runtime the caller is in is saturated
+/// or blocked. The handlers run on that caller's runtime (the one
+/// current here), as they always have. The listener is registered with the
+/// new runtime before this returns (an error if it cannot be), so it need
+/// not have been bound or cloned on that thread.
+///
+/// # Panics
+///
+/// Outside a Tokio runtime: the handlers need one.
+pub fn serve_router<L: Listener>(
+    mut listener: L,
+    router: Arc<Router>,
+) -> std::io::Result<ServerHandle> {
+    /// A runtime that is never dropped in the caller's async context (a
+    /// plain drop waits for its blocking pool and panics there): it is shut
+    /// down in the background on every path that does not run it.
+    struct OwnRuntime(Option<tokio::runtime::Runtime>);
+    impl Drop for OwnRuntime {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.0.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+    let engine = tokio::runtime::Handle::current();
+    let runtime = OwnRuntime(Some(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?,
+    ));
+    // Registered with the new runtime's reactor here, so that a listener
+    // that cannot be served is an error of this call, not a warning every
+    // 100 ms from a thread nobody watches.
+    if let Some(runtime) = runtime.0.as_ref() {
+        let _enter = runtime.enter();
+        listener.register()?;
+    }
     let shutdown = CancellationToken::new();
     let token = shutdown.clone();
     let served = router.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            let accepted = tokio::select! {
-                biased;
-                _ = token.cancelled() => break,
-                accepted = listener.accept() => accepted,
-            };
-            match accepted {
-                Ok(transport) => {
-                    tokio::spawn(serve_connection(transport, served.clone(), token.clone()));
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "accepting a control connection failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+    let (exited_tx, exited) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("cst-control".into())
+        .spawn(move || {
+            if let Some(rt) = runtime.0.as_ref() {
+                rt.block_on(accept_loop(listener, served, token, engine));
+            }
+            let _ = exited_tx.send(());
+            // `runtime` drops here, in the background: a blocking-pool
+            // thread still in a group database lookup must not hold the
+            // exit up.
+            drop(runtime);
+        })?;
+    Ok(ServerHandle {
+        shutdown,
+        exited: Some(exited),
+        router,
+    })
+}
+
+/// Accept until `token` is cancelled, then let the connections finish
+/// answering what the cancellation ended.
+async fn accept_loop<L: Listener>(
+    mut listener: L,
+    router: Arc<Router>,
+    token: CancellationToken,
+    engine: tokio::runtime::Handle,
+) {
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        // `accept` is raced against nothing but the shutdown: it is not
+        // cancel-safe (a connection it has taken from the kernel and is
+        // still identifying — the peer's group lookup runs off-thread —
+        // would be dropped with it).
+        let accepted = tokio::select! {
+            biased;
+            _ = token.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        // Reap the connections that ended since the last one arrived, so a
+        // long-lived server holds no finished task per connection it ever
+        // served.
+        while connections.try_join_next().is_some() {}
+        match accepted {
+            Ok(transport) => {
+                connections.spawn(serve_connection(
+                    transport,
+                    router.clone(),
+                    token.clone(),
+                    engine.clone(),
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "accepting a control connection failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-    });
-    ServerHandle {
-        shutdown,
-        task,
-        router,
     }
+    // Another acceptor (the next image's, a clone of the descriptor)
+    // serves from here on.
+    drop(listener);
+    let drain = router.options.cancel_grace + Duration::from_secs(1);
+    let _ = tokio::time::timeout(drain, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------

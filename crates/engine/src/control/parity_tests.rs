@@ -587,10 +587,9 @@ fn unix_socket_and_http_dispatch_the_whole_table_identically() {
         let sock = root.path().join(format!("p-{}.sock", compared));
         let (client, app) = rt.block_on(async {
             let listener = UnixSocketListener::bind(&sock).unwrap();
-            std::mem::forget(constellation_control::server::serve_router(
-                listener,
-                router.clone(),
-            ));
+            std::mem::forget(
+                constellation_control::server::serve_router(listener, router.clone()).unwrap(),
+            );
             (
                 Client::connect_unix(&sock).await.unwrap(),
                 constellation_control::web::app_as(router.clone(), web_principal.clone()),

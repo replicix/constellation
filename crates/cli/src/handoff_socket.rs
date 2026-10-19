@@ -1343,7 +1343,7 @@ fn serve_standby(rt: &tokio::runtime::Handle, socket: &Path, standby: &Arc<Stand
     let policy =
         crate::control::load_policy(crate::control::policy_path().as_deref(), owner, Some(bound));
     let mut router = constellation_control::Router::new().with_policy(policy);
-    router.register::<NodePing, _, _>(|_c, _p| async { Ok(Pong {}) });
+    router.register_blocking::<NodePing, _>(|_c, _p| Ok(Pong {}));
     let handler = standby.clone();
     router.register::<NodeHandoff, _, _>(move |mut ctx, p| {
         let handler = handler.clone();
@@ -1365,10 +1365,10 @@ fn serve_standby(rt: &tokio::runtime::Handle, socket: &Path, standby: &Arc<Stand
         }
     });
     // Held for the process's life, as the daemon's own control server.
-    std::mem::forget(constellation_control::server::serve_router(
-        listener,
-        Arc::new(router),
-    ));
+    std::mem::forget(
+        constellation_control::server::serve_router(listener, Arc::new(router))
+            .context("starting the handoff socket's server thread")?,
+    );
     Ok(())
 }
 

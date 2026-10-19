@@ -575,6 +575,25 @@ and — with S3 cut via toxiproxy — reads must keep succeeding at full
 speed while the atime updates are simply lost (atime never blocks a
 read).
 
+### The control plane under a blocked runtime (`control-runtime-hog`)
+
+The daemon serves its control socket from a thread of its own
+(`cst-control`, a single-threaded runtime of its own;
+`crates/control/src/server.rs`), so the shared runtime being blocked must
+not cost a `Hello`. `control-runtime-hog` mounts one node with
+`CONSTELLATION_TOKIO_THREADS=2` and the runtime-hog fault
+(`CONSTELLATION_FAULT_RUNTIME_HOG_FILE=2:12000:600000`: both workers
+blocked for 12 s, confirmed from the workers' `hrtimer_nanosleep`
+`wchan` in `/proc/<pid>/task`), and calls `node.status` on a fresh connection over
+and over for 7 s: every call is answered, the slowest in well under 2 s,
+and the node serves normally once the hog ends. Against a daemon whose
+control server runs on the shared runtime (the build before this scenario:
+`CONSTELLATION_BIN` of a base build) the first call after the hog starts
+fails with "did not answer Hello" after its 10 s bound. The same fail-before
+is a unit test in `crates/control`
+(`a_server_on_the_blocked_runtime_misses_its_handshake` against
+`the_control_plane_answers_while_the_engines_runtime_is_blocked`).
+
 ### Running the lanes as root
 
 The passthrough and zero-copy scenarios need root, so a full lane is

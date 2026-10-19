@@ -381,7 +381,20 @@ pub(crate) fn recv_with_fds(
 
 /// A bound, listening control socket.
 pub struct UnixSocketListener {
-    listener: UnixListener,
+    /// The bound socket, not yet known to any reactor: it is handed to
+    /// the reactor of the runtime that first polls [`Listener::accept`],
+    /// so a listener may be bound (and cloned for a handover) on any
+    /// thread and served on the one that owns its control runtime.
+    unregistered: Option<std::os::unix::net::UnixListener>,
+    /// The same socket once registered.
+    listener: Option<UnixListener>,
+    /// A connection taken from the kernel whose peer is still being
+    /// identified (the group lookup runs off-thread). Kept here, not in
+    /// the `accept` future, so that dropping that future (a `select!`
+    /// against a stop signal) never drops the connection with it: the
+    /// next `accept` — or [`UnixSocketListener::finish_pending`] — finishes
+    /// it.
+    pending: Option<tokio::task::JoinHandle<io::Result<Arc<UnixSocket>>>>,
     path: PathBuf,
     /// Remove the socket file on drop (the default).
     unlink: bool,
@@ -443,13 +456,16 @@ impl UnixSocketListener {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let listener = UnixListener::bind(path)?;
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
+        listener.set_nonblocking(true)?;
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
         }
         Ok(UnixSocketListener {
-            listener,
+            unregistered: Some(listener),
+            listener: None,
+            pending: None,
             path: path.to_path_buf(),
             unlink: true,
         })
@@ -465,7 +481,9 @@ impl UnixSocketListener {
     ) -> io::Result<UnixSocketListener> {
         listener.set_nonblocking(true)?;
         Ok(UnixSocketListener {
-            listener: UnixListener::from_std(listener)?,
+            unregistered: Some(listener),
+            listener: None,
+            pending: None,
             path: path.to_path_buf(),
             unlink: true,
         })
@@ -484,20 +502,73 @@ impl UnixSocketListener {
     /// an in-place upgrade while this one keeps serving).
     pub fn try_clone_std(&self) -> io::Result<std::os::unix::net::UnixListener> {
         use std::os::fd::AsFd;
-        let fd = self.listener.as_fd().try_clone_to_owned()?;
+        let fd = match (&self.listener, &self.unregistered) {
+            (Some(listener), _) => listener.as_fd().try_clone_to_owned()?,
+            (None, Some(listener)) => listener.as_fd().try_clone_to_owned()?,
+            (None, None) => return Err(io::Error::other("the listener could not be registered")),
+        };
         Ok(std::os::unix::net::UnixListener::from(fd))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// The connection a dropped `accept` had taken, if one was being
+    /// identified: wait for it and return it.
+    pub async fn finish_pending(&mut self) -> Option<io::Result<Arc<dyn Transport>>> {
+        let pending = self.pending.take()?;
+        Some(Self::identified(pending).await)
+    }
+
+    async fn identified(
+        pending: tokio::task::JoinHandle<io::Result<Arc<UnixSocket>>>,
+    ) -> io::Result<Arc<dyn Transport>> {
+        let socket: Arc<dyn Transport> = pending.await.map_err(io::Error::other)??;
+        Ok(socket)
+    }
 }
 
 impl Listener for UnixSocketListener {
+    /// Register with the reactor of the runtime that is current. (A
+    /// failure — `epoll_ctl` out of memory or watches — consumes the
+    /// descriptor: the listener is then unusable, and says so.)
+    fn register(&mut self) -> io::Result<()> {
+        if self.listener.is_none() {
+            let bound = self
+                .unregistered
+                .take()
+                .ok_or_else(|| io::Error::other("the listener could not be registered"))?;
+            self.listener = Some(UnixListener::from_std(bound)?);
+        }
+        Ok(())
+    }
+
     fn accept(&mut self) -> BoxFuture<'_, io::Result<Arc<dyn Transport>>> {
         Box::pin(async move {
-            let (stream, _) = self.listener.accept().await?;
-            let socket: Arc<dyn Transport> = UnixSocket::from_stream_async(stream).await?;
+            // Normally done by `serve_router`, on its own runtime, before
+            // the server returns; a listener polled directly registers
+            // with whichever runtime polls it.
+            self.register()?;
+            if self.pending.is_none() {
+                let Some(listener) = self.listener.as_ref() else {
+                    return Err(io::Error::other("the listener could not be registered"));
+                };
+                let (stream, _) = listener.accept().await?;
+                // Off the async threads (NSS may block); the handle is
+                // kept in `self` before anything is awaited again.
+                self.pending = Some(tokio::task::spawn_blocking(move || {
+                    UnixSocket::from_stream(stream)
+                }));
+            }
+            let Some(pending) = self.pending.as_mut() else {
+                return Err(io::Error::other("no connection pending"));
+            };
+            // Cancel-safe: `JoinHandle` polls again after a drop of this
+            // future; it is taken only once it has finished.
+            let joined = (&mut *pending).await;
+            self.pending = None;
+            let socket: Arc<dyn Transport> = joined.map_err(io::Error::other)??;
             Ok(socket)
         })
     }

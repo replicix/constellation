@@ -555,6 +555,13 @@ pub const SKIPPED: &[(&str, Skip)] = &[
     ),
     ("delegate-handoff-renewal", Skip::Local(&[UPGRADE])),
     (
+        "control-runtime-hog",
+        Skip::Local(&[
+            "blocks the daemon's runtime workers with a fault hook (CONSTELLATION_FAULT_RUNTIME_HOG_FILE) and shrinks them (CONSTELLATION_TOKIO_THREADS=2)",
+            "reads the daemon's threads from /proc/<pid>/task of a local process",
+        ]),
+    ),
+    (
         "delegate-store-stall",
         Skip::Local(&[
             "holds one caller's metadata write with a fault hook (CONSTELLATION_FAULT_STORE_STALL_FILE)",

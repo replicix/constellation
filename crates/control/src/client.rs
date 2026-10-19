@@ -471,6 +471,7 @@ impl Client {
             server_end,
             router.into(),
             CancellationToken::new(),
+            tokio::runtime::Handle::current(),
         ));
         Client::from_transport(client_end, options).await
     }

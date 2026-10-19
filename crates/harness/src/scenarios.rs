@@ -27,6 +27,8 @@ mod cluster_restart;
 mod confinement;
 mod coop_churn;
 mod credrot;
+/// The control socket answers while the daemon's shared runtime is blocked.
+mod ctlplane;
 /// The K5a fix round: a delegate that is the root's backup loses the
 /// root, or is handed off.
 mod delegroot;
@@ -1468,6 +1470,17 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: delegroot::delegate_handoff_renewal,
+    },
+    Scenario {
+        name: "control-runtime-hog",
+        desc: "one node whose runtime has two workers, both blocked for 12 s by the \
+               runtime-hog fault: node.status is still answered (fresh connection each \
+               time, Hello/Welcome included) within a second for the whole hog -- the \
+               control socket is served by a thread of its own -- and the node serves \
+               normally once the hog ends",
+        requires: &[],
+        caps: &[],
+        run: ctlplane::control_runtime_hog,
     },
     Scenario {
         name: "delegate-store-stall",

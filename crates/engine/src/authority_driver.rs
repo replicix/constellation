@@ -1403,7 +1403,7 @@ impl DelegLane {
 /// for [`holder_stall_ms`] stops the holder's heartbeat
 /// ([`alive_tick`]). About 20 wake-ups a second, each two atomic
 /// stores.
-async fn runtime_probe_task(off_core: Arc<OffCore>) {
+pub(crate) async fn runtime_probe_task(off_core: Arc<OffCore>) {
     let every = Duration::from_millis(PROBE_EVERY_MS as u64);
     let mut due = tokio::time::Instant::now() + every;
     loop {
@@ -1457,6 +1457,7 @@ fn beat_done(pending: &mut HashMap<NodeId, usize>, to: NodeId) {
 /// both; the thread ends within an interval.
 struct AliveTask {
     stop: Arc<std::sync::atomic::AtomicBool>,
+    off_core: Arc<OffCore>,
     probe: tokio::task::JoinHandle<()>,
     alive: Arc<Mutex<Option<AliveTargets>>>,
 }
@@ -1479,6 +1480,7 @@ impl AliveTask {
     ) -> Self {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let probe = tokio::spawn(runtime_probe_task(off_core.clone()));
+        let probe_owner = off_core.clone();
         let beat = {
             let (alive, stop) = (alive.clone(), stop.clone());
             move || {
@@ -1510,7 +1512,12 @@ impl AliveTask {
         {
             tracing::error!(%error, "could not start the holder's heartbeat thread");
         }
-        Self { stop, probe, alive }
+        Self {
+            stop,
+            off_core: probe_owner,
+            probe,
+            alive,
+        }
     }
 }
 
@@ -1521,6 +1528,9 @@ impl Drop for AliveTask {
         }
         self.stop.store(true, Ordering::Relaxed);
         self.probe.abort();
+        // A probe that no longer runs is not a stalled runtime
+        // ([`OffCore::runtime_stalled`]).
+        self.off_core.probe_stopped();
     }
 }
 
@@ -1732,6 +1742,21 @@ impl OffCore {
             return 0;
         }
         (now_unix_ms - tick - PROBE_EVERY_MS).max(0)
+    }
+
+    /// How long the lag probe has not ticked past its period: the shared
+    /// runtime has run nothing for that long (zero while it ticks, and
+    /// while no probe runs: before the driver starts, after it ends).
+    /// `node.ping` fails past a bound of it
+    /// ([`crate::control::PING_FAILS_AFTER`]).
+    pub(crate) fn runtime_stalled(&self) -> Duration {
+        Duration::from_millis(self.runtime_stalled_ms(now_unix_ms()) as u64)
+    }
+
+    /// The probe was stopped with the driver: not started, as far as
+    /// [`Self::runtime_stalled`] is concerned.
+    pub(crate) fn probe_stopped(&self) {
+        self.probe_tick.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn set_busy(&self, at_unix_ms: i64) {
@@ -6839,13 +6864,21 @@ mod tests {
         let probe = tokio::spawn(std::future::pending::<()>());
         let abort = probe.abort_handle();
         let stop = Arc::new(AtomicBool::new(false));
+        let off_core = Arc::new(super::OffCore::new(1_000));
+        off_core.note_probe(1, 0);
         drop(AliveTask {
             stop: stop.clone(),
+            off_core: off_core.clone(),
             probe,
             alive: alive.clone(),
         });
         tokio::task::yield_now().await;
         assert!(abort.is_finished(), "the probe still runs");
+        assert_eq!(
+            off_core.runtime_stalled(),
+            std::time::Duration::ZERO,
+            "a stopped probe reads as a stalled runtime"
+        );
         assert!(stop.load(Ordering::Relaxed), "the beat thread was not told");
         assert!(alive.lock().unwrap().is_none(), "targets kept");
     }

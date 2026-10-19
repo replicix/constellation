@@ -15,6 +15,7 @@ pub mod k8s;
 pub mod load;
 pub mod metabench;
 pub mod model;
+pub mod procsnap;
 pub mod reqlog;
 pub mod results;
 pub mod s3auth;

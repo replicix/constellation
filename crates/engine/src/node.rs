@@ -296,6 +296,9 @@ pub struct Engine {
     delegates: Arc<lease::DelegateView>,
     /// The core's observable state, for `status` and the tickers.
     core_status: Arc<Mutex<crate::authority_driver::CoreStatus>>,
+    /// What the driver's runtime probe says of the shared runtime
+    /// ([`Engine::runtime_stalled`]).
+    off_core: Arc<crate::authority_driver::OffCore>,
     /// Rid seqs the views' fast path completed, drained by the driver.
     pending_acks: Arc<Mutex<Vec<u64>>>,
     acquire_deadline: Duration,
@@ -1697,6 +1700,7 @@ impl Engine {
             lease: lease_view,
             delegates: delegate_view,
             core_status,
+            off_core,
             pending_acks,
             acquire_deadline,
             write_mode,
@@ -2491,6 +2495,11 @@ impl Engine {
     }
     pub fn core_status(&self) -> &Arc<Mutex<crate::authority_driver::CoreStatus>> {
         &self.core_status
+    }
+    /// How long the shared runtime has run nothing, as the driver's lag
+    /// probe measures it (zero while the probe ticks or none runs).
+    pub fn runtime_stalled(&self) -> std::time::Duration {
+        self.off_core.runtime_stalled()
     }
     pub fn write_mode(&self) -> &Arc<writeback::WriteModeState> {
         &self.write_mode

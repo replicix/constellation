@@ -1044,6 +1044,24 @@ object with its reason.
 | `CONSTELLATION_HANDOFF_STANDBY_TIMEOUT_S` | `300` | seconds | how long `serve --handoff-socket`, finding its state dir held, waits as a handoff standby for a sealed handoff before it exits 0 (plan 37 §8; a CSI engine pod's startup and liveness probes also ask the handoff socket, so kubelet lets it wait). Once sealed, it waits for the sender's commit until the seal's `deadline_ms`, and after the commit for the state dir without a bound |
 | `CONSTELLATION_PREOPENED_INIT_WAIT_MS` | `10000` | milliseconds | how long a `view.mount{PreopenedFd}` waits for the connection's `FUSE_INIT` before refusing the descriptor as not a fresh mount (a handed-over connection is resumed, never re-initialised) |
 
+The control socket is not served by these runtimes: a thread of its own
+(`cst-control`, one more per server, with a single-threaded runtime of its
+own and idle at zero cost) accepts, shakes hands, reads requests and writes
+each call's final response, so a `Hello` is answered while every worker of
+the shared runtime is busy. Only `node.status` and `node.ping` are answered
+independently of it: the other methods' bodies run on the shared runtime's
+blocking pool, many parking on the runtime inside, and handlers that are
+futures and streams (whose `Event`/`Chunk` frames are written from the
+shared runtime) wait for a worker (see the module docs of
+`crates/control/src/server.rs`). `node.ping` is answered off the runtime
+but fails (`Failed`) once the runtime's lag probe shows it has run nothing
+for 30 s, so a CSI engine pod's liveness/startup/readiness probe
+(`control-relay --ping`), the controller's `Identity.Probe` and a `mount`'s
+attach check (`daemon_socket_is_live`) still tell a wedged daemon from a
+slow one: long enough for a store stall or a transient hog, short enough
+to get a wedged pod restarted. The `--await-unlock` credential gate and a
+handoff standby answer a plain ping (they have no runtime to attest).
+
 The CSI node plugin (`constellation-csi --node`; the chart sets these from
 `engineProfile.handoff` and `node.metricsPort`):
 

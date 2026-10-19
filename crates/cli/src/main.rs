@@ -4958,6 +4958,7 @@ mod umount_tests {
             let listener = UnixSocketListener::bind(&socket).unwrap();
             record_socket(&state_dir, &socket).unwrap();
             constellation_control::server::serve_router(listener, std::sync::Arc::new(router))
+                .unwrap()
         };
         // A `umount` that fails before it asks lets the stand-in go too.
         let stand_in = std::thread::spawn(move || {
@@ -5113,7 +5114,8 @@ mod upgrade_tests {
             let inherited = listener.try_clone_std().unwrap();
             record_socket(&state_dir, &socket).unwrap();
             (
-                constellation_control::server::serve_router(listener, std::sync::Arc::new(router)),
+                constellation_control::server::serve_router(listener, std::sync::Arc::new(router))
+                    .unwrap(),
                 inherited,
             )
         };
@@ -5143,6 +5145,7 @@ mod upgrade_tests {
                 let _guard = new_rt.enter();
                 let listener = UnixSocketListener::from_std(inherited, &sock).unwrap();
                 constellation_control::server::serve_router(listener, std::sync::Arc::new(router))
+                    .unwrap()
             };
             Some((new_rt, server))
         });

@@ -1566,6 +1566,9 @@ browser (rename/move/delete/up/download, inspect, history), cache (states,
 hit rates, prefetch efficiency, pins), leases/designations (+ admin
 force-release), snapshots/clones (create, browse, delete, mounts),
 compression settings, ops (log tail, fsck, doctor), Prometheus `/metrics`.
+The socket is served by a thread of its own, apart from the engine's shared
+runtime, so the control plane answers while that runtime is saturated or
+blocked.
 
 CLI highlights: `fs create|set|passwd|list`, `mount [SOURCE[@snap]]
 MOUNTPOINT`, `umount`, `export`, `status` (includes `node_id` /

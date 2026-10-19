@@ -50623,3 +50623,138 @@ report (`lock_errors_reported`).
   (both with a refusal, both with the double `EIO`); with the fix 30 of
   30 passed, 16 of them with a refused commit (18 refusals, each one
   `EIO`, the count exact); `lock-contention-paused-holder` 6 of 6.
+
+## Fix: the control socket is served off the shared runtime (`node.status: the daemon did not answer Hello`, 2026-10-19)
+
+### Finding
+
+A harness run under host load 5-21 failed `node.status: the daemon did not answer
+Hello` (the 10 s bound). Handlers were already isolated (`node.status` runs under
+`spawn_blocking` and reads lock-free snapshots), but the accept loop, the
+Hello/Welcome handshake and the response write were tasks of the daemon's shared Tokio
+runtime (`serve_router` was a plain `tokio::spawn`, one more per connection), the one
+that also runs the authority driver's inline step (a synchronous priority write holds
+its worker for a whole store stall) and every task that logs. A runtime with its workers
+blocked or saturated answered no `Hello`, whatever the process, the host's other threads
+and the handler were doing.
+
+### What changed
+
+- `constellation_control::server::serve_router` (and `serve`) now return
+  `io::Result<ServerHandle>` and serve the *connections* on one OS thread of their own,
+  `cst-control`, running a single-threaded Tokio runtime of its own (the shape of the
+  existing `cst-holder-beat` thread): accept, handshake, frame reads and every call's
+  final `Response`. The handlers run on the runtime that was current at the call (the
+  daemon's shared one, through its `Handle`), as before, and only their outcome crosses
+  back to be written. A stream's `Event`/`Chunk` frames are still written by its task on
+  the shared runtime (only the socket's readiness is the control thread's), so a
+  subscription stalls with that runtime. Every place that starts a control server goes through it: the daemon
+  (`ensure_status`, which covers mount, serve and the resume after an upgrade), `serve`'s
+  credential gate (`--await-unlock`) and the handoff standby's socket. The CSI plugin
+  talks to the engine's socket as a client and starts none.
+- `Router::register_blocking` (new): a method whose body is plain blocking work is handed
+  by the control thread straight to the engine runtime's blocking pool and awaited there,
+  with no task of the engine's in between. `node.status` (a pure read of snapshots) and
+  `node.ping` are runtime-independent that way: answered while every worker is blocked.
+  The engine's other `unary` bodies are registered the same way (they already ran under
+  `spawn_blocking`), but many park on the runtime inside (`block_in_place` +
+  `Handle::block_on`: pins, the snapshot scheduler and space, the metadata barrier): they
+  are dispatched without a worker and finish only when one is free. A handler that is a
+  future still needs a worker to be polled, exactly as before (the unit test shows it
+  waiting and then being answered). A blocking call's audit record is written on the
+  blocking thread, so the audit sink's disk write is off the workers too; its outcome is the
+  handler's even when the client's cancel won the race (recorded `ok` for a body that went
+  on to succeed, where it said `cancelled` while the detached work finished), and a body
+  that never returns leaves no record (a cancel and the grace period used to write one).
+- `node.ping` of the daemon fails (`Failed`: "the engine's runtime has run nothing for
+  Ns ... wedged") when the driver's lag probe shows the shared runtime has run nothing for
+  more than 30 s (`control::PING_FAILS_AFTER`; zero while the probe ticks, before the
+  driver starts and after it ends). Answered off the runtime on its own, a ping would pass
+  for a runtime wedged for good, and the CSI engine pod's liveness/startup/readiness probe
+  (`control-relay --ping`), `Identity.Probe` and `mount`'s attach check
+  (`daemon_socket_is_live`) would keep a wedged pod alive and attach to it. Each reads the
+  `Failed` answer as not alive and not as "nobody listens": `control::ping` returns an error
+  (not `Ok(false)`), so `mount` does not attach and waits out its deadline, a wedged-holder
+  takeover is still decided by the kernel's view; `control-relay --ping` exits non-zero;
+  the controller's probe is not ready; `daemon --upgrade`'s gone-detection counts only
+  unreachable sockets. 30 s is long enough that a store stall or a transient hog (the
+  `control-runtime-hog` scenario blocks 12 s) fails no kubelet probe, short enough that a
+  runtime that never comes back is restarted. The gate's and the handoff standby's pings
+  stay plain: they answer for a process that is waiting.
+- `ServerHandle` stops the thread when dropped as well as on `shutdown()` (it only
+  cancelled before, leaving the task); `shutdown()` waits for the thread to be done with
+  its connections, bounded by `cancel_grace` plus a second. The daemon `mem::forget`s its
+  handle, as it did, so the thread lives as long as the process; an upgrade's `exec` ends
+  it with every other thread (the listener it served is a clone of the descriptor the new
+  image inherits, as before). Nothing runs before the `exec` that was not there.
+- `UnixSocketListener` is registered with the reactor of the control thread's runtime
+  by `serve_router` (new `Listener::register`) before it returns: a listener that cannot
+  be served is an error of that call, not a warning every 100 ms. It was the runtime
+  current when bound; a listener bound and cloned for a handover on any thread is served
+  by the control thread. Bound through std, the listen backlog is the platform's
+  (`somaxconn`) instead of tokio's 1024.
+- `UnixSocketListener::accept` is cancel-safe: the connection it has taken whose peer is
+  still being identified is kept in the listener, not in the future. `GateListener`
+  (which raced `accept` against its stop signal) finishes that connection after `stop`
+  instead of dropping it with the descriptor (`a_dropped_accept_loses_no_connection`).
+- Nothing on the connection path logs above `debug` (a log sink that blocks on a stalled
+  disk must not hold a handshake).
+- Found while testing: a first version raced `accept()` against the reaping of finished
+  connections in one `select!`. `accept` is not cancel-safe (it has taken the connection
+  from the kernel and is identifying the peer off-thread), so a connection arriving as
+  another ended was dropped: `connection closed` on the very first call. It races only
+  the shutdown now, and reaps with `try_join_next` after each accept;
+  `connections_that_come_and_go_are_all_answered` fails on the racing version (reset by
+  peer, 400 connections from 4 tasks) and passes on the fix.
+- `harness::procsnap` (a daemon's threads from `/proc/<pid>/task/*`, classified by what they
+  are in) and the `control-runtime-hog` scenario (below). Docs: the module docs of
+  `server.rs` (Isolation: the control thread), `configuration.md`, `DESIGN.md` §10,
+  `TESTING.md`.
+
+### Fail-before
+
+Unit tests (`crates/control`): a one-worker runtime whose only worker is blocked for 6 s
+(`the_control_plane_answers_while_the_engines_runtime_is_blocked`): a fresh connection's
+Hello/Welcome and three `node.ping`s are answered inside 3 s each while the worker is
+still blocked; an async handler waits for the worker (500 ms without an answer) and is
+answered once it is free. The old arrangement, the accept loop and the connections as
+tasks of that runtime (`a_server_on_the_blocked_runtime_misses_its_handshake`): the
+handshake is not answered for 2 s and is answered after the hog.
+
+`node.ping` (`engine/src/control/ping_tests.rs`: a one-worker runtime with the driver's lag
+probe on it, the ping served from a socket with a 700 ms bound in the test): the only
+worker blocked 2 s: a ping at 250 ms is answered (under the bound), one at about 950 ms
+fails `Failed`/"wedged" (past it), and after the runtime recovers it answers again; a probe
+that never ran or was stopped with the driver reads as not stalled. A listener that cannot
+be registered is an error of `serve_router`
+(`a_listener_that_cannot_be_registered_is_an_error_of_serve_router`, which also caught a
+replacement of mine that had silently not applied).
+
+Harness, `control-runtime-hog` (one node, `CONSTELLATION_TOKIO_THREADS=2`,
+`CONSTELLATION_FAULT_RUNTIME_HOG_FILE=2:12000:600000`, both workers blocked in
+`nanosleep`: `fault.rs`'s hog, 12 s): `node.status` on a fresh connection every 100 ms
+for 7 s. On the previous build (the base binary, this harness): FAILED at 10.0 s into
+the hog, `node.status on a (<socket>): the daemon did not answer Hello; daemon pid ...:
+35 threads: 20 futex, 10 idle, 5 sleep [... 2 tokio-rt-worker sleep]; tasks kept in
+.../control-timeout-node-status-<ms>.tasks` (the diagnostics of the next fix, with the
+node and the socket the old error dropped). On this build: PASSED, 69 calls over 7.1 s
+with 2 of 2 workers blocked, the slowest 7.2 ms (a `node.ping` too in each round, since
+the 12 s hog is under the ping's 30 s bound), and the node writes and answers normally
+after the hog.
+
+### Perf
+
+`node.status` over the control socket, 400 calls per run, six alternated base/after runs
+on the box at load 19-20 from other jobs (run-to-run spread 1.0-2.3 ms for a fresh
+connection, so read the medians): fresh connection + `node.status` p50, base 1.12, 1.26,
+1.35, 1.14, 1.87, 2.29 ms, median 1.30; this build 1.58, 1.04, 1.41, 1.22, 2.29, 1.01,
+median 1.31. `node.status` on one connection p50, base median 279 µs, this build 299 µs
+(the middle values, 242-346 µs, overlap; each side had one 0.4-2 ms outlier run). A
+trivial `node.ping` on one connection 7 µs before, 13 µs after: the one extra wake-up of
+the hop between the control thread and the handler's thread, hidden by `node.status`'s own
+250 µs. Idle: 0 clock ticks for `cst-control` over 30 s (twice); the daemon's other
+threads as before.
+
+### Gates
+
+See the end of the second entry.

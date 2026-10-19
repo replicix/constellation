@@ -872,7 +872,7 @@ impl Gate {
         let mut router = constellation_control::Router::new().with_unregistered_error(
             ControlError::unavailable(constellation_control::proto::AWAITING_UNLOCK),
         );
-        router.register::<NodePing, _, _>(|_, _| async { Ok(Pong {}) });
+        router.register_blocking::<NodePing, _>(|_, _| Ok(Pong {}));
         let own = s3.to_string();
         router.register::<FsUnlock, _, _>(move |_, p: FsUnlockParams| {
             let tx = tx.clone();
@@ -908,7 +908,8 @@ impl Gate {
                 stop: stopped,
             },
             Arc::new(router),
-        );
+        )
+        .context("starting the credential gate's server thread")?;
         Ok(Gate {
             unlocks,
             stop,
@@ -987,11 +988,27 @@ struct GateListener {
 }
 
 impl Listener for GateListener {
+    fn register(&mut self) -> std::io::Result<()> {
+        match self.inner.as_mut() {
+            Some(listener) => listener.register(),
+            None => Ok(()),
+        }
+    }
+
     fn accept(&mut self) -> BoxFuture<'_, std::io::Result<Arc<dyn Transport>>> {
         Box::pin(async move {
             let GateListener { inner, stop } = self;
             loop {
                 if *stop.borrow() {
+                    // The connection a cancelled accept had taken (its peer
+                    // still being identified) is served, not dropped with
+                    // the descriptor.
+                    if let Some(taken) = match inner.as_mut() {
+                        Some(listener) => listener.finish_pending().await,
+                        None => None,
+                    } {
+                        return taken;
+                    }
                     *inner = None;
                 }
                 let Some(listener) = inner.as_mut() else {

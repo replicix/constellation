@@ -59,6 +59,8 @@ mod streams;
 #[cfg(test)]
 mod parity_tests;
 #[cfg(test)]
+mod ping_tests;
+#[cfg(test)]
 mod snapsched_tests;
 #[cfg(test)]
 mod snapshot_tests;
@@ -84,7 +86,7 @@ use constellation_vfs::Caller;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// One view a host serves, as `view.list`, `view.stats` and `node.status`
 /// see it.
@@ -556,23 +558,58 @@ pub(crate) struct Call {
 type Body<M> =
     fn(&EngineControl, Call, <M as Method>::Params) -> Result<<M as Method>::Result, ControlError>;
 
-/// Register `M` as a blocking body over `svc`.
+/// Register `M` as a blocking body over `svc`: the control server runs it
+/// on a blocking-pool thread straight from its own thread, so it is
+/// answered whatever the engine runtime's workers are doing.
 fn unary<M: Method>(router: &mut Router, svc: &Arc<EngineControl>, body: Body<M>) {
     let svc = svc.clone();
-    router.register::<M, _, _>(move |mut ctx: CallCtx, params| {
-        let svc = svc.clone();
+    router.register_blocking::<M, _>(move |mut ctx: CallCtx, params| {
         let call = Call {
             principal: ctx.principal.clone(),
             role: ctx.role,
             service: ctx.service.take(),
             fd: ctx.take_fd(),
         };
-        async move { blocking(move || body(&svc, call, params)).await }
+        body(&svc, call, params)
     });
 }
 
 fn ack(r: Result<String, String>) -> Result<Ack, ControlError> {
     r.map(Ack::new).map_err(failed)
+}
+
+/// How long the shared runtime may have run nothing before the daemon's
+/// `node.ping` fails. `node.ping` is answered off the runtime (a handshake
+/// and a ping must not wait for a worker), so on its own it would pass for
+/// a runtime that is wedged for good; the engine pod's liveness probe,
+/// `daemon_socket_is_live` and `Identity.Probe` ask it to show the runtime
+/// is serving. Long enough that a store stall (the authority driver's
+/// synchronous priority write blocks its worker for a whole stall) or a
+/// transient hog does not fail a kubelet liveness probe, short enough that
+/// a runtime that never comes back gets its pod restarted, and a `mount`
+/// does not attach to it.
+pub const PING_FAILS_AFTER: Duration = Duration::from_secs(30);
+
+/// Register `node.ping`: answered on the blocking pool, but failing
+/// (`Failed`, which every prober treats as not alive, never as "nobody
+/// listens") once `stalled()`, how long the shared runtime has run nothing,
+/// exceeds `fails_after`.
+pub fn register_ping(
+    r: &mut Router,
+    stalled: impl Fn() -> Duration + Send + Sync + 'static,
+    fails_after: Duration,
+) {
+    r.register_blocking::<NodePing, _>(move |_c, _p| {
+        let stalled = stalled();
+        if stalled > fails_after {
+            return Err(ControlError::failed(format!(
+                "the engine's runtime has run nothing for {}s (more than {}s): wedged",
+                stalled.as_secs(),
+                fails_after.as_secs()
+            )));
+        }
+        Ok(Pong {})
+    });
 }
 
 /// A router serving `svc` for every method in the table.
@@ -585,7 +622,8 @@ pub fn router(svc: &Arc<EngineControl>) -> Router {
 /// Register every method of the table on `router`, served by `svc`.
 pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     // ---- node ----
-    r.register::<NodePing, _, _>(|_c, _p| async { Ok(Pong {}) });
+    let engine = svc.engine.clone();
+    register_ping(r, move || engine.runtime_stalled(), PING_FAILS_AFTER);
     unary::<NodeStatus>(r, svc, |s, _, _| Ok(s.status()));
     unary::<NodeReintegrate>(r, svc, |s, _, _| ack(s.reintegrate()));
     unary::<NodeLeave>(r, svc, |s, _, p| ack(s.leave(p.node_id, p.force)));
