@@ -326,10 +326,14 @@ impl ControlHost for DaemonHost {
         )
     }
 
+    /// A node already gone (its last view ended, its drain over, the
+    /// process on its way out: the control server outlives the node by up
+    /// to the runtime's shutdown grace) is exiting, whatever kind it was:
+    /// `umount` must wait for that exit and go by its recorded outcome,
+    /// not take the daemon for a persistent one that keeps serving
+    /// without views and report success over an unshipped drain.
     fn exits_when_empty(&self) -> bool {
-        self.node
-            .upgrade()
-            .is_some_and(|node| !node.is_persistent())
+        self.node.upgrade().is_none_or(|node| !node.is_persistent())
     }
 
     fn detach_all(&self) {
@@ -569,6 +573,23 @@ impl constellation_engine::manager::Daemons for CliDaemons {
 mod tests {
     use super::*;
     use constellation_control::authz::{Principal, Role};
+
+    /// A `view.list` answered after the daemon's node is gone (a drain
+    /// over at once, the node dropped, the control server still serving
+    /// until the process exits) says the daemon exits, as it does: it used
+    /// to say it keeps running without views, and `umount` returned success
+    /// over a drain that had left a chunk unshipped (`umount_drain`'s
+    /// `umount_fails_when_the_drain_cannot_ship_everything`, once under
+    /// load).
+    #[test]
+    fn a_daemon_whose_node_is_gone_exits_when_empty() {
+        let host = DaemonHost { node: Weak::new() };
+        assert!(host.views().is_empty());
+        assert!(
+            constellation_engine::control::ControlHost::exits_when_empty(&host),
+            "a daemon whose node is gone was reported as one that keeps serving"
+        );
+    }
 
     fn unix(uid: u32) -> Principal {
         Principal::Unix {

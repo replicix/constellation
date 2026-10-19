@@ -52555,3 +52555,43 @@ seed counts) 0 failing, the two controls fail as designed. Tests: the core tests
 18 of the 39 fail on `7780c8e`), and pins for seeds 1249 and 1774 of the plain
 configuration and seed 2 of the heavy one (fail on `7780c8e`). The remaining
 failures are the delegate's idle-grant outwaits, not moves.
+
+## Fix: a daemon whose node is gone exits, says `view.list`; `umount` no longer reports success over an unshipped drain (umount_drain flake, 2026-10-20)
+
+`umount_drain`'s `umount_fails_when_the_drain_cannot_ship_everything` failed
+once in a workspace run at a load average of about 20, with `umount`
+succeeding and printing "the daemon keeps running without views" although
+the drain had left the lost chunk unshipped. 2 of 200 runs of the test alone
+failed the same way at a load average of 27 to 35 (a CPU load on top of the
+host's own).
+
+### Cause
+
+`umount` answered by `view.unmount` waits for the views to end with
+`view.list`, and its listing's `exits_when_empty` decides whether to wait for
+the daemon's exit and its recorded outcome. `DaemonHost::exits_when_empty`
+read it from the node through a `Weak`, and said `false` when the node was
+gone. The daemon's main thread drops the node once its drain is over and only
+then lets its runtime go (`rt.shutdown_timeout`, up to 10 s) and exits; the
+control server's thread serves until the exit. A `view.list` connected before
+the drain removed the socket and served after the node was dropped (a drain
+that fails at once, a loaded host) said "no views, does not exit", and
+`umount` took the daemon for a persistent one and returned success without
+reading the recorded outcome ("unshipped"). Nothing was lost by it: what the
+drain did not ship stays in the state dir and ships at the next mount; but
+the user was told the unmount was clean, which invites dropping or moving the
+state dir.
+
+### What changed
+
+`DaemonHost::exits_when_empty` says `true` when the node is gone: such a
+daemon is exiting, whatever kind it was. `umount` then waits for the exit and
+reports the recorded outcome.
+
+### Verification
+
+`control::tests::a_daemon_whose_node_is_gone_exits_when_empty` fails before.
+The `umount_drain` test alone under a CPU load (load average 27 to 35): 2 of
+200 failing before, 200 of 200 passing after. With `view.list`'s answer
+delayed 500 ms in the daemon (a diagnostic build only): 2 of 20 failing
+before, 20 of 20 passing after, on the same host without the extra load.
