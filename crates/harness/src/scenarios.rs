@@ -46,6 +46,7 @@ mod handover;
 mod inval_storm;
 /// Plan 31 C8: the engine's host lifecycle (suspend, resume, metered).
 mod lifecycle;
+mod logsink;
 /// Plan 30 §M10: flexible-quorum continuation epochs.
 mod m10;
 /// Plan 30 §M11: delegated sub-sequencers, one log.
@@ -1507,6 +1508,13 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: delegroot::delegate_store_stall,
+    },
+    Scenario {
+        name: "log-sink-stall",
+        desc: "plan 44: a daemon's log sink stalls (CONSTELLATION_FAULT_LOG_STALL_FILE) and no daemon thread notices. A: b, the root's holder with a backup, under an flock holder's appends, 12 s three times: no takeover, no epoch change, no append waits 2 s, lines queued not lost, none dropped. B: a lone node with a 64 KiB queue drops lines, counted and marked in the log once. C: b the delegate of /d1 keeps its generation through 12 s twice. CONSTELLATION_HARNESS_LOG_SINK_STALL_CONTROL=1: A and C on the synchronous writer must fail (a scenario whose control passes proved nothing)",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: logsink::log_sink_stall,
     },
     Scenario {
         name: "delegate-backup-handoff-failover",

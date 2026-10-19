@@ -13,6 +13,7 @@
 //! | `pause:<dur>[:<every_ms>]` | `SIGSTOP`/`SIGCONT` of the daemon for `<dur>` every `<every_ms>` (default 15 s) |
 //! | `step-pause:<dur>[:<every_ms>]` | the same, but the daemon stops itself mid-step (`CONSTELLATION_FAULT_STEP_PAUSE_FILE`) |
 //! | `store-stall:<ms>[:<every_ms>]` | one metadata write holds the writer lock `<ms>` every `<every_ms>` (`CONSTELLATION_FAULT_STORE_STALL_FILE`) |
+//! | `log-stall:<ms>[:<every_ms>]` | the daemon's log sink stalls `<ms>` (one write, holding std's stderr lock) every `<every_ms>` (`CONSTELLATION_FAULT_LOG_STALL_FILE`). Not probe-blind: the daemon's log writer never blocks a thread, so a log stall must cost the workload no latency and the latency bounds apply |
 //! | `runtime-hog:<n>:<ms>[:<gap_ms>]` | `CONSTELLATION_FAULT_RUNTIME_HOG` |
 //! | `s3:latency:<ms>:<jitter>` / `s3:bandwidth:<kBps>` / `s3:slicer:<bytes>:<delay_us>` / `s3:blackhole:<ms>[:<at_ms>]` | toxics on the S3 path of every client |
 //! | `net:<netem args...>` / `net:flap[:<netem args...>]` | `tc netem` on the daemon's own P2P (UDP) ports on `lo`; flap: loss 100 % for 2 s every 10 s |
@@ -64,6 +65,7 @@ pub const PRESETS: &[(&str, &str)] = &[
     ("runtime-hog", "runtime-hog:4:200"),
     ("store-stall5", "store-stall:5000:15000"),
     ("store-stall20", "store-stall:20000:40000"),
+    ("log-stall12", "log-stall:12000:20000"),
     ("step-pause", "step-pause:lock-lapse+500:20000"),
     ("pause-takeover", "pause:takeover+300:15000"),
     ("pause-lock-lapse", "pause:lock-lapse+500:20000"),
@@ -136,6 +138,12 @@ pub enum Kind {
         step: bool,
     },
     StoreStall {
+        ms: u64,
+        every: Duration,
+    },
+    /// The daemon's log sink stalls `ms` (one write) every `every`
+    /// (plan 44).
+    LogStall {
         ms: u64,
         every: Duration,
     },
@@ -303,6 +311,10 @@ fn parse_item(body: &str, target: Target, spec: &str) -> Result<Item> {
             ms: num(arg(0), "store-stall:<ms>")?,
             every: ms_arg(arg(1), 15_000, "store-stall every")?,
         },
+        "log-stall" => Kind::LogStall {
+            ms: num(arg(0), "log-stall:<ms>")?,
+            every: ms_arg(arg(1), 15_000, "log-stall every")?,
+        },
         "runtime-hog" => {
             anyhow::ensure!(
                 (2..=3).contains(&rest.len())
@@ -399,6 +411,17 @@ fn pauses(p: &Profile, node: &str) -> bool {
     p.items.iter().any(|i| {
         matches!(i.kind, Kind::Pause { step: false, .. })
             && matches!(&i.target, Target::Node(n) if n == node)
+    })
+}
+
+/// Whether the profile stalls the daemons' log sinks (a `log-stall` item):
+/// a handover then may find lines its old image had not written
+/// (`unwritten at its exec`).
+pub fn stalls_log() -> bool {
+    profile().is_some_and(|p| {
+        p.items
+            .iter()
+            .any(|i| matches!(i.kind, Kind::LogStall { .. }))
     })
 }
 
@@ -674,6 +697,12 @@ pub fn daemon_env(node: &str, work: &Path, env: &[(String, String)], cmd: &mut C
                     load_dir(work).join("store-stall"),
                 );
             }
+            Kind::LogStall { .. } => {
+                cmd.env(
+                    "CONSTELLATION_FAULT_LOG_STALL_FILE",
+                    load_dir(work).join("log-stall"),
+                );
+            }
             _ => {}
         }
     }
@@ -755,6 +784,12 @@ pub fn daemon_spawned(
                 if !a.contains(&what) {
                     a.push(what);
                 }
+                Ok(())
+            }
+            Kind::LogStall { ms, every } => {
+                // Not recorded as a probe-blind injector ([`injecting`]): a
+                // log stall must cost the workload no latency.
+                session.spawn_log_stall(&d, *ms, *every, load_dir(work).join("log-stall"));
                 Ok(())
             }
             Kind::Net { netem, flap } => session.place_net(&d, netem, *flap),
@@ -1278,6 +1313,28 @@ impl Session {
         }));
     }
 
+    /// Stall the daemon's log sink for `ms` every `every`: the file is
+    /// written whole (a rename: a daemon reading a prefix would stall for
+    /// the wrong time) and names this daemon's pid, so daemons that share
+    /// the path stall only their own sink.
+    fn spawn_log_stall(&mut self, d: &Daemon, ms: u64, every: Duration, file: PathBuf) {
+        let stop = self.stop.clone();
+        let d = d.clone();
+        self.threads.push(std::thread::spawn(move || {
+            while sleep_unless(&stop, every) && alive(d.pid) {
+                let tmp = file.with_extension("tmp");
+                if std::fs::write(&tmp, format!("{ms} once pid={}", d.pid)).is_ok() {
+                    let _ = std::fs::rename(&tmp, &file);
+                }
+                eprintln!(
+                    "    load: log sink stall of {ms} ms armed on {} (pid {})",
+                    d.node, d.pid
+                );
+            }
+            let _ = std::fs::remove_file(&file);
+        }));
+    }
+
     fn place_net(&mut self, d: &Daemon, netem: &[String], flap: bool) -> Result<()> {
         if self.netem.is_none() {
             self.netem = Some(Netem::install()?);
@@ -1730,6 +1787,34 @@ mod tests {
         );
     }
 
+    /// Plan 44 §6 W3: the log-sink stall item and its preset.
+    #[test]
+    fn the_log_stall_item_parses_and_is_not_probe_blind() {
+        let p = parse("log-stall:3000:4000@b, log-stall:500").unwrap();
+        assert_eq!(
+            p.items[0],
+            Item {
+                kind: Kind::LogStall {
+                    ms: 3_000,
+                    every: Duration::from_secs(4)
+                },
+                target: Target::Node("b".into())
+            }
+        );
+        assert_eq!(
+            p.items[1].kind,
+            Kind::LogStall {
+                ms: 500,
+                every: Duration::from_secs(15)
+            }
+        );
+        assert_eq!(
+            parse("log-stall12@b").unwrap().items,
+            parse("log-stall:12000:20000@b").unwrap().items
+        );
+        assert!(parse("log-stall:fast").is_err());
+    }
+
     #[test]
     fn bad_items_are_refused() {
         for bad in [
@@ -1743,6 +1828,7 @@ mod tests {
             "s3:wobble",
             "net",
             "hogs:gpu",
+            "log-stall",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} parsed");
         }

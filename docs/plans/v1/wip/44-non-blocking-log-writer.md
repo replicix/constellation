@@ -957,7 +957,7 @@ tail is a note, not a violation; no logger process for now.
 - [x] W2: the daemons start the writer after the fork; exit, exec, abort
       and panic paths flush or queue as §4.4; status `log`,
       `node.logs.flush`, metrics, schema re-blessed; tests 7.2.
-- [ ] W3: the harness's 128 MiB, `check_blind` and the watch on drops,
+- [x] W3: the harness's 128 MiB, `check_blind` and the watch on drops,
       the kill barrier, the `log-stall` load item, `log-sink-stall` with
       its control arm, the `log-drop` break, the upgrade order check.
 - [ ] W4: configuration, named filesystems, troubleshooting, TESTING,

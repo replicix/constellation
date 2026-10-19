@@ -30,6 +30,19 @@
 //!   another node. A checker that reads nothing it should is a failure,
 //!   not a pass ([`check_blind`]: marker lines that do not parse, tagged
 //!   ops with no landed line; a missing kept log).
+//! - **A log that lost lines** ([`check_blind`], the hang watch): the
+//!   checkers above read the daemons' logs, so a line the daemon's log sink
+//!   did not take is a check that could not see it. A daemon's non-blocking
+//!   log writer (plan 44) drops lines when its sink stalls longer than its
+//!   queue holds, and says so with one `log lines dropped` line per episode
+//!   and `status.log.dropped_lines`; the harness gives its daemons a queue
+//!   too large to drop in practice (`CONSTELLATION_LOG_QUEUE_BYTES`, 128 MiB)
+//!   and fails the scenario on any drop, unless the scenario drops on
+//!   purpose ([`expect_log_drops`]). A `kill -9` loses what its writer had
+//!   queued: the harness flushes the log first (`node.logs.flush`,
+//!   [`note_kill_tail`]) and reports what a flush could not write as a
+//!   *partial tail* — a note, never a violation: a killed process's last
+//!   lines are not a property of the daemon.
 //! - **Errors to applications** ([`ErrnoLog`]): every errno a workload
 //!   saw is classified as one the documented semantics allow at that
 //!   point, or a bug, and counted per class ([`ErrnoReport`]); an `EIO`
@@ -119,6 +132,14 @@ struct ScenarioState {
     e2e: HashSet<String>,
     /// Logs a daemon was started on (a missing one of these was removed).
     opened: HashSet<PathBuf>,
+    /// Clients whose daemon drops log lines on purpose ([`expect_log_drops`]).
+    expected_drops: HashSet<String>,
+    /// What a `kill -9` may have taken from a log ([`note_kill_tail`]).
+    partial_tails: Vec<String>,
+    /// The most any daemon's log queue held (`log.queued_bytes_max`, which
+    /// the hang watch polls) and the bound it ran with: the headroom the
+    /// campaign records per cell (plan 44 §9).
+    log_queue_peak: Option<(u64, u64)>,
 }
 
 /// A daemon was started writing to `log` (`Client`'s mount).
@@ -127,6 +148,39 @@ pub fn note_log_opened(log: &Path) {
     with_state(&scenario, |s| {
         s.opened.insert(log.to_path_buf());
     });
+}
+
+/// `client`'s daemon drops log lines on purpose in this scenario (a small
+/// queue behind a stalled sink): its `log lines dropped` lines and its
+/// status's `log.dropped_lines` are reported, not violations.
+pub fn expect_log_drops(client: &crate::client::Client) {
+    let scenario = crate::client::scenario();
+    with_state(&scenario, |s| {
+        s.expected_drops.insert(client.name.clone());
+    });
+}
+
+/// Whether the scenario declared that `client`'s daemon drops log lines.
+fn drops_expected(scenario: &str, client: &str) -> bool {
+    with_state(scenario, |s| s.expected_drops.contains(client))
+}
+
+/// `client`'s daemon is about to be `kill -9`ed and its log may lack up to
+/// `unwritten` lines, because `why` (the flush barrier could not write what
+/// was queued, did not answer, or the daemon was stopped): a note, counted
+/// in the scenario's verify summary, never a violation. `log` is the
+/// incarnation the daemon is writing.
+pub fn note_kill_tail(client: &str, log: &Path, unwritten: u64, why: &str) {
+    let file = log
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mount.log".into());
+    let note = format!(
+        "verify: {client}'s {file} may lack up to {unwritten} line(s) logged before its kill -9 ({why})"
+    );
+    eprintln!("    {note}");
+    let scenario = crate::client::scenario();
+    with_state(&scenario, |s| s.partial_tails.push(note));
 }
 
 static STATE: Mutex<BTreeMap<String, ScenarioState>> = Mutex::new(BTreeMap::new());
@@ -1266,6 +1320,11 @@ pub struct LockEvidence {
     /// fewer parsed than carried is a checker gone blind (a format drift).
     pub raw: LineCounts,
     pub parsed: LineCounts,
+    /// Per log label (`<client>:<file>`), the lines a `log lines dropped`
+    /// summary line says its daemon's log sink did not take.
+    pub dropped: Vec<(String, u64)>,
+    /// The clients whose drops the scenario declared ([`expect_log_drops`]).
+    pub declared_drops: HashSet<String>,
 }
 
 /// Lines per marker text (see [`LockEvidence::raw`]).
@@ -1275,6 +1334,8 @@ pub struct LineCounts {
     pub executed: usize,
     pub landed: usize,
     pub acquired: usize,
+    /// `log lines dropped`: a daemon's log writer dropped lines (plan 44).
+    pub dropped: usize,
 }
 
 /// One acquisition: who, which epoch, from which log.
@@ -1300,6 +1361,8 @@ pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired
                 3
             } else if raw.contains("acquired the lease") {
                 4
+            } else if raw.contains("log lines dropped") {
+                5
             } else {
                 continue;
             };
@@ -1363,6 +1426,13 @@ pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired
                         at_us,
                     });
                 }
+                5 => {
+                    ev.raw.dropped += 1;
+                    if let Some(lines) = num("dropped_lines") {
+                        ev.parsed.dropped += 1;
+                        ev.dropped.push((label.clone(), lines));
+                    }
+                }
                 _ => {
                     ev.raw.acquired += 1;
                     if let (Some(node), Some(epoch)) = (num("node"), num("epoch")) {
@@ -1393,6 +1463,7 @@ pub fn check_blind(ev: &LockEvidence) -> Vec<String> {
         ("tagged op executed", r.executed, p.executed),
         ("tagged op landed", r.landed, p.landed),
         ("acquired the lease", r.acquired, p.acquired),
+        ("log lines dropped", r.dropped, p.dropped),
     ] {
         if parsed < raw {
             v.push(format!(
@@ -1405,6 +1476,24 @@ pub fn check_blind(ev: &LockEvidence) -> Vec<String> {
             "checker blind: {} `tagged op executed` line(s) but no `tagged op landed` one: \
              the token check cannot see a write delayed past its grant",
             p.executed
+        ));
+    }
+    // A daemon whose log sink did not keep up dropped lines: the checks
+    // above cannot see them (a dropped `granted a lock` or `tagged op
+    // landed` removes a pair from the token check, a dropped `acquired the
+    // lease` a node from the split-brain check).
+    for (label, lines) in &ev.dropped {
+        let client = label.split(':').next().unwrap_or(label);
+        if ev.declared_drops.contains(client) {
+            eprintln!(
+                "    verify: {label}: {lines} dropped log line(s), declared by the scenario \
+                 (not checked)"
+            );
+            continue;
+        }
+        v.push(format!(
+            "checker blind: {label}: {lines} log line(s) dropped (the daemon's log sink did not \
+             keep up; status log.dropped_lines): the token, grant and epoch checks cannot see them"
         ));
     }
     v
@@ -1514,7 +1603,8 @@ fn log_violations(scenario: &str, logs: &[(String, PathBuf)]) -> Vec<String> {
             }
         }
     }
-    let (ev, acquired) = parse_logs(&texts);
+    let (mut ev, acquired) = parse_logs(&texts);
+    ev.declared_drops = with_state(scenario, |s| s.expected_drops.clone());
     v.extend(check_token_order(&ev));
     v.extend(check_lease_epochs(&acquired));
     v.extend(check_blind(&ev));
@@ -1572,7 +1662,8 @@ pub fn check_logs(clients: &[&crate::client::Client]) -> Result<LogCounts> {
             })
         })
         .collect();
-    let (ev, acquired) = parse_logs(&texts);
+    let (mut ev, acquired) = parse_logs(&texts);
+    ev.declared_drops = with_state(&scenario, |s| s.expected_drops.clone());
     let mut v = check_token_order(&ev);
     v.extend(check_lease_epochs(&acquired));
     v.extend(check_blind(&ev));
@@ -1718,6 +1809,10 @@ fn watch_loop() {
     let mut silence_reported: HashSet<u32> = HashSet::new();
     // Its status schema drift reported.
     let mut blind_reported: HashSet<u32> = HashSet::new();
+    // Its dropped log lines reported (once per daemon).
+    let mut drops_reported: HashSet<u32> = HashSet::new();
+    // Its failed log writes reported (once per daemon).
+    let mut sink_reported: HashSet<u32> = HashSet::new();
     // Often enough to catch a hang within a third of the bound, rarely
     // enough not to load the daemons it watches.
     let every = (bound / 3).clamp(Duration::from_secs(1), Duration::from_secs(5));
@@ -1743,6 +1838,31 @@ fn watch_loop() {
                     if let Some(blind) = watch_blind(&s) {
                         if blind_reported.insert(d.pid) {
                             let msg = format!("{} (pid {}): {blind}", d.node, d.pid);
+                            eprintln!("!!! {msg}");
+                            with_state(&d.scenario, |st| st.violations.push(msg));
+                        }
+                    }
+                    if let Some(peak) = s["log"]["queued_bytes_max"].as_u64() {
+                        let limit = s["log"]["limit_bytes"].as_u64().unwrap_or(0);
+                        with_state(&d.scenario, |st| {
+                            let known = st.log_queue_peak.map_or(0, |(p, _)| p);
+                            if peak >= known {
+                                st.log_queue_peak = Some((peak, limit));
+                            }
+                        });
+                    }
+                    // Also covers a daemon killed before its summary line
+                    // reached the file.
+                    if let Some(failed) = watch_sink_errors(&s) {
+                        if sink_reported.insert(d.pid) {
+                            let msg = format!("{} (pid {}): {failed}", d.node, d.pid);
+                            eprintln!("!!! {msg}");
+                            with_state(&d.scenario, |st| st.violations.push(msg));
+                        }
+                    }
+                    if let Some(drop) = watch_drops(&s) {
+                        if !drops_expected(&d.scenario, &d.node) && drops_reported.insert(d.pid) {
+                            let msg = format!("{} (pid {}): {drop}", d.node, d.pid);
                             eprintln!("!!! {msg}");
                             with_state(&d.scenario, |st| st.violations.push(msg));
                         }
@@ -1783,13 +1903,46 @@ fn watch_loop() {
 /// `stalled_requests` list: the schema changed under the watch, which can
 /// then see no hang — a checker gone blind, so a violation.
 fn watch_blind(status: &serde_json::Value) -> Option<String> {
-    (status.get("fuse_requests").is_some()
-        && !status["fuse_requests"]["stalled_requests"].is_array())
-    .then(|| {
-        "checker blind: status.fuse_requests has no stalled_requests list (schema drift): the \
-         hang watch cannot see stalled requests"
+    status.get("fuse_requests")?;
+    if !status["fuse_requests"]["stalled_requests"].is_array() {
+        return Some(
+            "checker blind: status.fuse_requests has no stalled_requests list (schema drift): \
+             the hang watch cannot see stalled requests"
+                .to_string(),
+        );
+    }
+    // The drop counter is the watch's second job (plan 44): a status that
+    // no longer carries it cannot be told apart from a daemon that dropped
+    // nothing.
+    (!status["log"]["dropped_lines"].is_u64()).then(|| {
+        "checker blind: status.log has no dropped_lines (schema drift): the log-drop check \
+         cannot see dropped log lines"
             .to_string()
     })
+}
+
+/// A daemon whose writes to its log failed (status `log.sink_errors`: a full
+/// disk, an I/O error, a closed pipe): the chunks they carried are lost, and
+/// that is a violation whatever the scenario declared about drops, since a
+/// harness run's log is its evidence.
+fn watch_sink_errors(status: &serde_json::Value) -> Option<String> {
+    let failed = status["log"]["sink_errors"].as_u64().filter(|n| *n > 0)?;
+    Some(format!(
+        "checker blind: {failed} write(s) to the daemon's log failed (status log.sink_errors; \
+         a full or failing disk under the log): the lines they carried are lost, so the token, \
+         grant and epoch checks cannot see them"
+    ))
+}
+
+/// A daemon whose log writer dropped lines (status `log.dropped_lines`): a
+/// violation unless the scenario declared it ([`expect_log_drops`]) — the
+/// token, grant and epoch checks cannot see those lines.
+fn watch_drops(status: &serde_json::Value) -> Option<String> {
+    let lines = status["log"]["dropped_lines"].as_u64().filter(|n| *n > 0)?;
+    Some(format!(
+        "checker blind: {lines} log line(s) dropped (the daemon's log sink did not keep up; \
+         status log.dropped_lines): the token, grant and epoch checks cannot see them"
+    ))
 }
 
 /// The first request in `status` stalled past `bound` that is a hang (not
@@ -1977,6 +2130,20 @@ pub fn after_scenario(scenario: &str) -> Vec<String> {
         return Vec::new();
     }
     let (logs, checked, mut out) = with_state(scenario, |s| {
+        if !s.partial_tails.is_empty() {
+            eprintln!(
+                "    verify: {} partial log tail(s) (a kill -9 may have taken the last lines; \
+                 a note, not a violation)",
+                s.partial_tails.len()
+            );
+            s.partial_tails.clear();
+        }
+        if let Some((peak, limit)) = s.log_queue_peak.take() {
+            eprintln!(
+                "    verify: log queue peak {peak} bytes of {limit} (daemons' log.queued_bytes_max, \
+                 as last polled)"
+            );
+        }
         let mut out = std::mem::take(&mut s.hangs);
         out.extend(std::mem::take(&mut s.violations));
         // Only the logs a daemon wrote to (a client that never mounted
@@ -2656,9 +2823,106 @@ mod tests {
         let drifted = serde_json::json!({"fuse_requests": {"in_flight": 3}});
         assert!(watch_blind(&drifted).is_some_and(|v| v.contains("checker blind")));
         assert_eq!(stalled_request(&drifted, Duration::ZERO), None);
-        let fine = serde_json::json!({"fuse_requests": {"stalled_requests": []}});
+        let fine = serde_json::json!({
+            "fuse_requests": {"stalled_requests": []},
+            "log": {"dropped_lines": 0}
+        });
         assert_eq!(watch_blind(&fine), None);
         assert_eq!(watch_blind(&serde_json::json!({})), None);
+        // Plan 44: a status without the log section is schema drift too.
+        let no_log = serde_json::json!({"fuse_requests": {"stalled_requests": []}});
+        assert!(watch_blind(&no_log).is_some_and(|v| v.contains("status.log")));
+    }
+
+    fn summary_line(lines: u64) -> String {
+        format!(
+            "2026-10-18T10:15:42.123456Z  WARN constellation::log: log lines dropped: the log \
+             sink did not keep up dropped_lines={lines} dropped_bytes=402117 \
+             first_dropped_unix_ms=1792318530000 queue_limit_bytes=16777216"
+        )
+    }
+
+    /// Plan 44 §5.2: a daemon's `log lines dropped` line makes the checkers
+    /// blind, so it is a violation naming the log; an unparsable one is
+    /// format drift; a scenario that drops on purpose declares it.
+    #[test]
+    fn a_dropped_log_line_summary_is_a_blind_spot() {
+        let grant = grant_line("2026-10-15T00:00:02.000Z", 1, 2, 3, "Shared");
+        let text = format!("{grant}\n{}\n", summary_line(1834));
+        let (mut ev, _) = parse_logs(&[("a:mount.log.1".into(), text, 0)]);
+        assert_eq!((ev.raw.dropped, ev.parsed.dropped), (1, 1));
+        assert_eq!(ev.dropped, [("a:mount.log.1".to_string(), 1834)]);
+        let b = check_blind(&ev);
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert!(
+            b[0].contains("a:mount.log.1")
+                && b[0].contains("1834 log line(s) dropped")
+                && b[0].contains("log.dropped_lines"),
+            "{b:?}"
+        );
+        // Declared by the scenario: reported, not a violation.
+        ev.declared_drops.insert("a".into());
+        assert!(check_blind(&ev).is_empty());
+        // Another client's drops are still a violation.
+        let (mut ev, _) = parse_logs(&[("b:mount.log".into(), summary_line(7), 0)]);
+        ev.declared_drops.insert("a".into());
+        assert_eq!(check_blind(&ev).len(), 1);
+        // A summary line whose field cannot be read is format drift.
+        let drifted = summary_line(5).replace("dropped_lines=5", "dropped=5");
+        let (ev, _) = parse_logs(&[("a".into(), drifted, 0)]);
+        assert_eq!((ev.raw.dropped, ev.parsed.dropped), (1, 0));
+        let b = check_blind(&ev);
+        assert!(
+            b.iter()
+                .any(|v| v.contains("1 `log lines dropped` line(s) in the logs, 0 parsed")),
+            "{b:?}"
+        );
+        // A log without a summary line is as clean as before.
+        let (ev, _) = parse_logs(&[("a".into(), grant, 0)]);
+        assert!(check_blind(&ev).is_empty());
+    }
+
+    /// Plan 44 §5.3: the hang watch reads the counter.
+    /// The summary lines of the other two causes (the previous image's
+    /// `exec`, a failed write) parse like the one for a full queue.
+    #[test]
+    fn the_summary_lines_of_every_cause_are_read() {
+        for words in [
+            "the previous image exec'd before its log writer was done",
+            "writes to the log sink failed",
+        ] {
+            let line = summary_line(11).replace("the log sink did not keep up", words);
+            let (ev, _) = parse_logs(&[("b:mount.log".into(), line, 0)]);
+            assert_eq!((ev.raw.dropped, ev.parsed.dropped), (1, 1), "{words}");
+            assert_eq!(ev.dropped, [("b:mount.log".to_string(), 11)]);
+            assert_eq!(check_blind(&ev).len(), 1);
+        }
+    }
+
+    #[test]
+    fn the_watch_flags_a_daemon_whose_log_writes_failed() {
+        let clean = serde_json::json!({"log": {"sink_errors": 0, "dropped_lines": 0}});
+        assert_eq!(watch_sink_errors(&clean), None);
+        assert_eq!(watch_sink_errors(&serde_json::json!({})), None);
+        let failed = serde_json::json!({"log": {"sink_errors": 3}});
+        let v = watch_sink_errors(&failed).unwrap();
+        assert!(
+            v.contains("3 write(s)") && v.contains("full or failing disk"),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn the_watch_flags_a_daemon_that_dropped_log_lines() {
+        let clean = serde_json::json!({"log": {"dropped_lines": 0}});
+        assert_eq!(watch_drops(&clean), None);
+        assert_eq!(watch_drops(&serde_json::json!({})), None);
+        let dropped = serde_json::json!({"log": {"dropped_lines": 12}});
+        let v = watch_drops(&dropped).unwrap();
+        assert!(
+            v.contains("12 log line(s) dropped") && v.contains("checker blind"),
+            "{v}"
+        );
     }
 
     #[test]

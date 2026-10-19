@@ -573,6 +573,13 @@ pub const SKIPPED: &[(&str, Skip)] = &[
             "shortens the grant TTL (CONSTELLATION_DELEGATION_TTL_MS)",
         ]),
     ),
+    (
+        "log-sink-stall",
+        Skip::Local(&[
+            "stalls a daemon's log sink through a fault file on the node's host (CONSTELLATION_FAULT_LOG_STALL_FILE)",
+            "shortens the grant TTL (CONSTELLATION_LOCK_TTL_MS)",
+        ]),
+    ),
     ("delegate-backup-handoff-failover", Skip::Local(&[UPGRADE, KILL])),
     (
         "auto-placement",

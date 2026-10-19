@@ -9,6 +9,9 @@
 //! without the lock), `token` (a forged `tagged op landed` line: a write
 //! that committed after a conflicting grant, finding F1's shape),
 //! `split-brain` (a forged second `acquired the lease` of one epoch),
+//! `log-drop` (a forged `log lines dropped` summary line in a's log: a
+//! daemon's log sink did not keep up, so the log checkers could not see
+//! every line, plan 44),
 //! `errno` (an error outside the documented set), `stall` (a FUSE write on
 //! `a` held past the hang bound by the store-stall hook: needs
 //! `CONSTELLATION_HARNESS_VERIFY=1` and a short
@@ -39,6 +42,7 @@ pub(super) const BREAKS: &[&str] = &[
     "exclusion",
     "token",
     "split-brain",
+    "log-drop",
     "errno",
     "stall",
     "log-missing",
@@ -597,6 +601,16 @@ fn load_probe_with(seed: u64, names: &[&str], takeover: bool) -> Result<()> {
             );
             append(&clients[1], &line)?;
             eprintln!("    {NAME}: BREAK split-brain: forged node {other} acquiring a's epoch");
+        }
+        Some("log-drop") => {
+            // What a daemon's log writer leaves in its log when its sink
+            // stalled longer than its queue held.
+            let line =
+                "\n2026-01-01T00:00:00.000000Z  WARN constellation::log: log lines dropped: \
+                        the log sink did not keep up dropped_lines=3 dropped_bytes=600 \
+                        first_dropped_unix_ms=1767225600000 queue_limit_bytes=16777216\n";
+            append(&clients[0], line)?;
+            eprintln!("    {NAME}: BREAK log-drop: forged a log lines dropped line in a's log");
         }
         Some("log-missing") => {
             for p in clients[1].log_files() {

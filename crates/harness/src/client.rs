@@ -222,6 +222,9 @@ pub(crate) fn control_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// The log queue the harness gives every daemon (see [`Client::cmd`]).
+pub const HARNESS_LOG_QUEUE_BYTES: &str = "134217728";
+
 /// How long `mount_view` polls for the mountpoint to appear before giving
 /// up (and the floor of [`exit_timeout`]). The loop returns
 /// as soon as the condition is met, so a generous ceiling costs nothing for
@@ -443,7 +446,15 @@ impl Client {
             // Fail fast when toxiproxy cuts S3 so FUSE threads are not
             // stuck in object_store's default 180s retry budget.
             .env("CONSTELLATION_S3_MAX_RETRIES", "2")
-            .env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "2000");
+            .env("CONSTELLATION_S3_RETRY_TIMEOUT_MS", "2000")
+            // The daemon's log queue (plan 44) is large enough never to
+            // drop: the log checkers read these logs, and a dropped line is
+            // a check that could not see it. 128 MiB takes a 12 s sink
+            // stall at 10 MB/s of logging; memory is taken only while lines
+            // wait. Not `0` (the synchronous writer): the loaded runs are
+            // where the blocking was found. A scenario may override it
+            // (`log-sink-stall` drops on purpose).
+            .env("CONSTELLATION_LOG_QUEUE_BYTES", HARNESS_LOG_QUEUE_BYTES);
         for (k, v) in &self.env {
             if v == UNSET {
                 c.env_remove(k);
@@ -691,6 +702,9 @@ impl Client {
         let (deny, limit) = (self.deny_io_uring, self.address_space);
         if deny || limit.is_some() {
             // SAFETY: both hooks make only async-signal-safe syscalls.
+            // No log call in this closure (plan 44 §4.4): it runs in the forked
+            // child, where the log mutex another thread of the daemon held at the
+            // fork stays locked for good.
             unsafe {
                 cmd.pre_exec(move || {
                     if let Some(bytes) = limit {
@@ -954,6 +968,7 @@ impl Client {
     /// Crash: SIGKILL the daemon, then clean up the dead mountpoint.
     pub fn kill9(&mut self) -> Result<()> {
         self.record_daemon_census("kill9");
+        self.flush_log_before_kill();
         let mut child = self.child.take().context("not mounted")?;
         kill9(&mut child).context("SIGKILL")?;
         let released = release_killed(&mut child, &self.name, &self.mnt, KILLED_EXIT);
@@ -971,6 +986,7 @@ impl Client {
     /// the mount, the zombie and the lock are cleaned up all the same.
     pub fn kill9_within(&mut self, within: Duration) -> Result<Duration> {
         self.record_daemon_census("kill9");
+        self.flush_log_before_kill();
         let mut child = self.child.take().context("not mounted")?;
         let pid = child.id();
         kill9(&mut child).context("SIGKILL")?;
@@ -1006,6 +1022,46 @@ impl Client {
                 self.name,
                 released.map(|e| format!("; {e:#}")).unwrap_or_default()
             ),
+        }
+    }
+
+    /// The barrier before a `kill -9` (plan 44 §5.4, verification on): a
+    /// `kill -9` loses what the daemon's log writer has queued, which the
+    /// checkers that read the log would take for lines that were never
+    /// logged. One `node.logs.flush` round trip (500 ms for the writer,
+    /// 1.5 s for the call) leaves the same microsecond window between an
+    /// op's commit and its log line as before the queue. What a flush
+    /// cannot write, a call that fails, and a stopped daemon (which cannot
+    /// answer) are noted as a partial tail ([`crate::verify::note_kill_tail`]):
+    /// a note, not a violation, because a killed process's last lines are
+    /// not a property of the daemon.
+    fn flush_log_before_kill(&self) {
+        if !crate::verify::enabled() {
+            return;
+        }
+        let Some(pid) = self.pid().filter(|pid| crate::load::alive(*pid)) else {
+            // Nothing to ask: a daemon that is already gone took its queue
+            // with it, whatever this call does.
+            return;
+        };
+        let tail = if crate::load::proc_state(pid) == Some('T') {
+            Some((0, "the daemon is stopped".to_string()))
+        } else {
+            match self.control_call(
+                "node.logs.flush",
+                serde_json::json!({"within_ms": 500}),
+                Duration::from_millis(1_500),
+            ) {
+                Ok(report) if report["complete"] == true => None,
+                Ok(report) => Some((
+                    report["unwritten_lines"].as_u64().unwrap_or(0),
+                    "its log sink did not take the queue within 500 ms".to_string(),
+                )),
+                Err(e) => Some((0, format!("no answer to node.logs.flush: {e:#}"))),
+            }
+        };
+        if let Some((unwritten, why)) = tail {
+            crate::verify::note_kill_tail(&self.name, &self.log, unwritten, &why);
         }
     }
 

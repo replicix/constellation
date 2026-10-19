@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 /// a 5 s delegation grant, which is a stress setting (the default is the
 /// lock grant's ttl, 20 s, since c612585: about 11 s of renewal slack, not
 /// the 3.5 s this leaves). The M11 scenarios shorten both further.
-const ENV: &[(&str, &str)] = &[
+pub(super) const ENV: &[(&str, &str)] = &[
     ("CONSTELLATION_LEASE_TTL_MS", "60000"),
     ("CONSTELLATION_DELEGATION_TTL_MS", "5000"),
     ("CONSTELLATION_BACKUP_RTT_BUDGET_MS", "50"),
@@ -75,7 +75,7 @@ struct Op {
 
 /// A writer creating, `fsync`ing and closing small files under `dir` of
 /// `mnt` in a loop until stopped.
-struct Writer {
+pub(super) struct Writer {
     stop: Arc<AtomicBool>,
     started: Instant,
     /// The start of the op in flight (ms since `started`, `u64::MAX` when
@@ -86,7 +86,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn start(mnt: PathBuf, dir: &str) -> Writer {
+    pub(super) fn start(mnt: PathBuf, dir: &str) -> Writer {
         let stop = Arc::new(AtomicBool::new(false));
         let inflight = Arc::new(AtomicU64::new(u64::MAX));
         let ops = Arc::new(Mutex::new(Vec::new()));
@@ -134,13 +134,18 @@ impl Writer {
     }
 
     /// Now, on the writer's clock.
-    fn now(&self) -> Duration {
+    pub(super) fn now(&self) -> Duration {
         self.started.elapsed()
     }
 
     /// Wait until `count` ops completed after `since` (writer clock), or
     /// `deadline` passed; `Err` names the op still in flight.
-    fn wait_ops_after(&self, since: Duration, count: usize, deadline: Duration) -> Result<()> {
+    pub(super) fn wait_ops_after(
+        &self,
+        since: Duration,
+        count: usize,
+        deadline: Duration,
+    ) -> Result<()> {
         let t = Instant::now();
         loop {
             let after = self
@@ -173,7 +178,7 @@ impl Writer {
     }
 
     /// Stop and join (only once no op hangs).
-    fn finish(mut self) {
+    pub(super) fn finish(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -182,7 +187,7 @@ impl Writer {
 
     /// The ops in flight at `since` or started after it, the errors, and
     /// the longest of those ops.
-    fn after(&self, since: Duration) -> (Vec<Duration>, Vec<String>) {
+    pub(super) fn after(&self, since: Duration) -> (Vec<Duration>, Vec<String>) {
         let ops = self.ops.lock().unwrap();
         let mut took = Vec::new();
         let mut errs = Vec::new();
@@ -233,7 +238,7 @@ impl Drop for Writer {
     }
 }
 
-fn dist(v: &[Duration]) -> String {
+pub(super) fn dist(v: &[Duration]) -> String {
     if v.is_empty() {
         return "no ops".into();
     }
@@ -260,7 +265,7 @@ fn delegated_pair(
 }
 
 /// [`delegated_pair`] with `extra` env on both nodes.
-fn delegated_pair_with(
+pub(super) fn delegated_pair_with(
     name: &str,
     backed: bool,
     extra: &[(&str, &str)],
@@ -277,7 +282,7 @@ fn delegated_pair_with(
 
 /// Delegate `/d1` to `b` (and, when `backed`, wait until `a` backs up to
 /// `b`). Inside each scenario's body, so a failure keeps the logs.
-fn delegate_d1(name: &str, clients: &[Client], backed: bool) -> Result<()> {
+pub(super) fn delegate_d1(name: &str, clients: &[Client], backed: bool) -> Result<()> {
     let a = &clients[0];
     let b = &clients[1];
     let b_id = node_id(b)?;
