@@ -197,6 +197,129 @@ pub struct Flush {
     pub unwritten_lines: u64,
 }
 
+/// The log an image had not written when it `exec`ed, handed to the next
+/// image (plan 44 W6): `lines` in order, the first `in_doubt` of them the
+/// chunk that was being written, the old image's drop counters (its
+/// accounting continues), and `lost`, the lines that did not fit the memfd's
+/// bound.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecTail {
+    pub lines: Vec<Arc<str>>,
+    pub in_doubt: usize,
+    pub lost: u64,
+    pub dropped_lines: u64,
+    pub dropped_bytes: u64,
+    pub drop_episodes: u64,
+    pub sink_errors: u64,
+}
+
+const TAIL_MAGIC: &[u8; 8] = b"CSTLOGT1";
+/// The size of the header [`ExecTail::encode_header`] writes.
+pub const TAIL_HEADER_LEN: usize = 8 + 7 * 8;
+
+impl ExecTail {
+    /// The bytes of the memfd: the header ([`ExecTail::encode_header`]),
+    /// then each line as a `u32` length and its bytes. No allocation beyond
+    /// the one buffer, whose size is at most the old image's queue bound plus
+    /// 4 bytes a line.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(TAIL_HEADER_LEN + self.lines_len());
+        out.extend_from_slice(&self.encode_header(self.lines.len()));
+        self.encode_lines_into(&mut out);
+        out
+    }
+
+    /// The fixed-size header at the memfd's start: the magic, seven
+    /// little-endian `u64`s (`in_doubt`, `lost`, the four counters, the line
+    /// count `count`). A tail that grew after it was written is brought up to
+    /// date by appending lines ([`ExecTail::encode_lines`]) and rewriting this.
+    pub fn encode_header(&self, count: usize) -> [u8; TAIL_HEADER_LEN] {
+        let mut out = [0u8; TAIL_HEADER_LEN];
+        out[..8].copy_from_slice(TAIL_MAGIC);
+        for (i, n) in [
+            self.in_doubt as u64,
+            self.lost,
+            self.dropped_lines,
+            self.dropped_bytes,
+            self.drop_episodes,
+            self.sink_errors,
+            count as u64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out[8 + 8 * i..16 + 8 * i].copy_from_slice(&n.to_le_bytes());
+        }
+        out
+    }
+
+    /// The lines alone, each as a `u32` length and its bytes (what follows
+    /// the header).
+    pub fn encode_lines(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.lines_len());
+        self.encode_lines_into(&mut out);
+        out
+    }
+
+    fn lines_len(&self) -> usize {
+        self.lines.iter().map(|l| l.len() + 4).sum()
+    }
+
+    fn encode_lines_into(&self, out: &mut Vec<u8>) {
+        for line in &self.lines {
+            out.extend_from_slice(&(line.len() as u32).to_le_bytes());
+            out.extend_from_slice(line.as_bytes());
+        }
+    }
+
+    /// How many lines a memfd's bytes say they hold or lost, when the header
+    /// parses: what the new image counts as lost when it cannot read the rest.
+    pub fn lines_in_header(bytes: &[u8]) -> Option<u64> {
+        let rest = bytes.strip_prefix(TAIL_MAGIC)?;
+        let field = |i: usize| -> Option<u64> {
+            let chunk = rest.get(8 * i..8 * i + 8)?;
+            Some(u64::from_le_bytes(chunk.try_into().ok()?))
+        };
+        field(1)?.checked_add(field(6)?)
+    }
+
+    /// [`ExecTail::encode`]'s inverse; `None` for anything that is not
+    /// exactly what it writes (the caller then counts the loss it was told
+    /// of, if any).
+    pub fn decode(bytes: &[u8]) -> Option<ExecTail> {
+        let rest = bytes.strip_prefix(TAIL_MAGIC)?;
+        let mut fields = [0u64; 7];
+        let mut rest = rest;
+        for field in &mut fields {
+            let (head, tail) = rest.split_first_chunk::<8>()?;
+            *field = u64::from_le_bytes(*head);
+            rest = tail;
+        }
+        let [in_doubt, lost, dropped_lines, dropped_bytes, drop_episodes, sink_errors, count] =
+            fields;
+        let mut lines = Vec::with_capacity((count as usize).min(rest.len() / 4));
+        for _ in 0..count {
+            let (len, tail) = rest.split_first_chunk::<4>()?;
+            let len = u32::from_le_bytes(*len) as usize;
+            if tail.len() < len {
+                return None;
+            }
+            let (text, tail) = tail.split_at(len);
+            lines.push(Arc::from(std::str::from_utf8(text).ok()?));
+            rest = tail;
+        }
+        rest.is_empty().then_some(ExecTail {
+            lines,
+            in_doubt: (in_doubt as usize).min(count as usize),
+            lost,
+            dropped_lines,
+            dropped_bytes,
+            drop_episodes,
+            sink_errors,
+        })
+    }
+}
+
 /// What `constellation status` reports about the writer (plan 44 §4.3).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogStats {
@@ -223,8 +346,12 @@ pub struct LogStats {
     /// How long the write in progress has been running (0: none).
     pub writing_for_ms: u64,
     pub sink_errors: u64,
-    /// Lines the previous image left unwritten at its `exec`.
-    pub unwritten_at_previous_exec: u64,
+    /// Lines the previous image's writer had not written at its `exec` and
+    /// handed to this one through a memfd (written first, in order).
+    pub carried_at_previous_exec: u64,
+    /// Lines the previous image could not hand over (no memfd, or more than
+    /// its bound): counted as dropped.
+    pub lost_at_previous_exec: u64,
     /// The writer's byte buffer (bytes) and the queue's blocks, for the
     /// idle-capacity test.
     pub writer_buffer_bytes: u64,
@@ -334,6 +461,25 @@ impl Blocks {
         line
     }
 
+    /// The newest `n` lines (all of them when fewer), oldest first.
+    fn last_n(&self, n: usize) -> Vec<Arc<str>> {
+        let mut out: Vec<Arc<str>> = self
+            .blocks
+            .iter()
+            .rev()
+            .flat_map(|b| b.iter().rev())
+            .take(n)
+            .cloned()
+            .collect();
+        out.reverse();
+        out
+    }
+
+    /// Every queued line, oldest first.
+    fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.blocks.iter().flat_map(VecDeque::iter)
+    }
+
     /// Move everything queued into `batch`, which must be empty (O(1)): the
     /// two lists of blocks trade places, so neither is ever reallocated, and
     /// `self` keeps its spare blocks.
@@ -364,9 +510,16 @@ struct State {
     // The sink queue.
     mode: Mode,
     queue: Blocks,
+    /// What the writer took out of `queue` and has not finished: the batch
+    /// not yet in a chunk, and the chunk in the write now (`in_write`), kept
+    /// where an `exec` can read them (see [`LogBuffer::freeze_for_exec`]).
+    batch: Blocks,
+    in_write: Vec<Arc<str>>,
+    /// The writer takes nothing more (an `exec` is about to carry what is
+    /// left to the next image).
+    frozen: bool,
     queued_bytes: usize,
     inflight_bytes: usize,
-    inflight_lines: usize,
     writer_idle: bool,
     /// Lines admitted to the queue, and lines the writer is done with (the
     /// flush barrier's coordinates; summary and panic lines count).
@@ -389,7 +542,20 @@ struct State {
     dropped_bytes: u64,
     drop_episodes: u64,
     sink_errors: u64,
-    unwritten_at_previous_exec: u64,
+    carried_at_previous_exec: u64,
+    lost_at_previous_exec: u64,
+    /// Where the queue stood when an `exec`'s freeze copied it (see
+    /// [`LogBuffer::exec_tail_update`]).
+    exec_mark: Option<ExecMark>,
+}
+
+/// What [`LogBuffer::freeze_for_exec`] left for [`LogBuffer::exec_tail_update`]:
+/// the lines accepted by then, the bytes the tail holds and its bound.
+#[derive(Clone, Copy)]
+struct ExecMark {
+    accepted: u64,
+    bytes: usize,
+    limit: usize,
 }
 
 impl State {
@@ -400,9 +566,11 @@ impl State {
             total: 0,
             mode: Mode::Sync,
             queue: Blocks::default(),
+            batch: Blocks::default(),
+            in_write: Vec::new(),
+            frozen: false,
             queued_bytes: 0,
             inflight_bytes: 0,
-            inflight_lines: 0,
             writer_idle: false,
             accepted: 0,
             written: 0,
@@ -417,7 +585,9 @@ impl State {
             dropped_bytes: 0,
             drop_episodes: 0,
             sink_errors: 0,
-            unwritten_at_previous_exec: 0,
+            carried_at_previous_exec: 0,
+            lost_at_previous_exec: 0,
+            exec_mark: None,
         }
     }
 
@@ -773,13 +943,179 @@ impl LogBuffer {
     /// before the `exec`, and over by what its last chunk wrote meanwhile.
     pub fn note_exec_loss(&self, lines: u64) {
         let mut st = lock(&self.0.state);
-        st.unwritten_at_previous_exec = lines;
+        st.lost_at_previous_exec = lines;
         if lines == 0 {
             return;
         }
         st.record_loss(lines, 0, Cause::Exec);
         if st.close_episode(true) {
             self.0.work.notify_one();
+        }
+    }
+
+    /// Stop the writer taking anything more and copy out what it has not
+    /// finished writing, oldest first: the chunk in its write now (in doubt:
+    /// the write may complete before the `exec`), the rest of its batch and
+    /// the queue, up to the queue's byte bound (what does not fit is counted
+    /// in `lost`). For an `exec` that hands the log to the next image
+    /// ([`ExecTail`]); the lines stay here, so [`LogBuffer::unfreeze`] undoes
+    /// it when the `exec` fails. Sync mode has nothing to carry.
+    pub fn freeze_for_exec(&self) -> ExecTail {
+        let mut st = lock(&self.0.state);
+        let limit = match st.mode {
+            Mode::Queue { limit } => limit,
+            Mode::Sync => 0,
+        };
+        st.frozen = true;
+        let mut tail = ExecTail {
+            in_doubt: st.in_write.len(),
+            dropped_lines: st.dropped_lines,
+            dropped_bytes: st.dropped_bytes,
+            drop_episodes: st.drop_episodes,
+            sink_errors: st.sink_errors,
+            ..ExecTail::default()
+        };
+        let mut bytes = 0usize;
+        let mut full = false;
+        for line in st
+            .in_write
+            .iter()
+            .chain(st.batch.iter())
+            .chain(st.queue.iter())
+        {
+            bytes += line.len() + 1;
+            full |= bytes > limit;
+            if full {
+                tail.lost += 1;
+            } else {
+                tail.lines.push(line.clone());
+            }
+        }
+        tail.in_doubt = tail.in_doubt.min(tail.lines.len());
+        st.exec_mark = Some(ExecMark {
+            accepted: st.accepted,
+            bytes: bytes.min(limit),
+            limit,
+        });
+        tail
+    }
+
+    /// What the log took in since [`LogBuffer::freeze_for_exec`] copied it,
+    /// for the last moment before the `exec` (other threads still log): a
+    /// tail with the lines accepted since (those that fit the tail's bound),
+    /// `lost` raised by those that do not, and the counters as they stand
+    /// now. `sent` is what the freeze returned. The caller appends the lines
+    /// to what it handed over and rewrites the header
+    /// ([`ExecTail::encode_header`]). The writer is frozen, so the queue only
+    /// grew at its end and the newest `accepted - mark` lines are the new
+    /// ones; nothing is lost silently but what is logged after this call.
+    pub fn exec_tail_update(&self, sent: &ExecTail) -> ExecTail {
+        let st = lock(&self.0.state);
+        let mut update = ExecTail {
+            in_doubt: sent.in_doubt,
+            lost: sent.lost,
+            dropped_lines: st.dropped_lines,
+            dropped_bytes: st.dropped_bytes,
+            drop_episodes: st.drop_episodes,
+            sink_errors: st.sink_errors,
+            ..ExecTail::default()
+        };
+        let Some(mark) = st.exec_mark else {
+            return update;
+        };
+        let late = st.accepted.saturating_sub(mark.accepted) as usize;
+        if late == 0 {
+            return update;
+        }
+        let mut bytes = mark.bytes;
+        let mut full = false;
+        for line in st.queue.last_n(late) {
+            bytes += line.len() + 1;
+            full |= bytes > mark.limit;
+            if full {
+                update.lost += 1;
+            } else {
+                update.lines.push(line);
+            }
+        }
+        update
+    }
+
+    /// The writer takes lines again ([`LogBuffer::freeze_for_exec`], when the
+    /// `exec` did not happen).
+    pub fn unfreeze(&self) {
+        lock(&self.0.state).frozen = false;
+        self.0.work.notify_one();
+    }
+
+    /// The new image's side of an `exec` that carried the old one's unwritten
+    /// log: the lines go to the sink first, in order, ahead of anything this
+    /// image logs (call it right after [`LogBuffer::start`], before the first
+    /// line), the ring gets them too, and the old image's counters
+    /// continue here. A line the old image could not fit is counted as
+    /// dropped (the loss and its summary line, as for a
+    /// [`LogBuffer::note_exec_loss`]). If the old image's last write was in
+    /// flight at the `exec`, its lines may be written twice: a line before
+    /// them says so.
+    pub fn adopt_exec_tail(&self, tail: ExecTail) {
+        let mut st = lock(&self.0.state);
+        st.dropped_lines += tail.dropped_lines;
+        st.dropped_bytes += tail.dropped_bytes;
+        st.drop_episodes += tail.drop_episodes;
+        st.sink_errors += tail.sink_errors;
+        st.carried_at_previous_exec = tail.lines.len() as u64;
+        st.lost_at_previous_exec = tail.lost;
+        let mut text = String::new();
+        let stamp = |text: &mut String| {
+            let mut stamp = String::new();
+            let _ = SystemTime.format_time(&mut FmtWriter::new(&mut stamp));
+            text.push_str(&stamp);
+        };
+        let mut lines: Vec<Arc<str>> = Vec::with_capacity(tail.lines.len() + 2);
+        if tail.in_doubt > 0 {
+            stamp(&mut text);
+            text.push_str(&format!(
+                "  WARN constellation::log: the previous image's last write was in flight at its \
+                 exec: its {} line(s) below may repeat lines it wrote",
+                tail.in_doubt
+            ));
+            lines.push(std::mem::take(&mut text).into());
+        }
+        lines.extend(tail.lines.iter().cloned());
+        if !tail.lines.is_empty() {
+            stamp(&mut text);
+            text.push_str(&format!(
+                "  INFO constellation::log: the {} line(s) above were unwritten at the previous \
+                 image's exec and carried over by it",
+                tail.lines.len()
+            ));
+            lines.push(std::mem::take(&mut text).into());
+        }
+        let sync = st.mode == Mode::Sync;
+        let mut wake = false;
+        for line in &lines {
+            st.push_ring(line.clone());
+            if !sync {
+                // Past the bound, like a panic's message: it is bounded by
+                // the old image's own bound.
+                wake |= st.enqueue(line.clone());
+            }
+        }
+        if tail.lost > 0 {
+            st.record_loss(tail.lost, 0, Cause::Exec);
+            wake |= st.close_episode(true);
+        }
+        drop(st);
+        if wake {
+            self.0.work.notify_one();
+        }
+        if sync {
+            let mut bytes = Vec::new();
+            for line in &lines {
+                bytes.extend_from_slice(line.as_bytes());
+                bytes.push(b'\n');
+            }
+            self.0.sync_write(&bytes);
         }
     }
 
@@ -885,7 +1221,7 @@ impl LogBuffer {
                 Mode::Sync => 0,
             },
             queued_bytes: st.used() as u64,
-            queued_lines: (st.queue.len() + st.inflight_lines) as u64,
+            queued_lines: (st.queue.len() + st.batch.len() + st.in_write.len()) as u64,
             queued_bytes_max: st.queued_bytes_max as u64,
             queue_entries_max: st.queue_entries_max as u64,
             accepted_lines: st.accepted,
@@ -900,7 +1236,8 @@ impl LogBuffer {
                 self.0.now_ms().saturating_sub(started - 1)
             },
             sink_errors: st.sink_errors,
-            unwritten_at_previous_exec: st.unwritten_at_previous_exec,
+            carried_at_previous_exec: st.carried_at_previous_exec,
+            lost_at_previous_exec: st.lost_at_previous_exec,
             writer_buffer_bytes: self.0.writer_buffer_bytes.load(Ordering::Relaxed),
             queue_blocks: st.queue.blocks.len() as u64,
             blocks_allocated: st.queue.allocated,
@@ -1083,62 +1420,63 @@ fn stall_for_fault() {
     }
 }
 
-/// The writer thread: take the whole queue out (O(1) under the lock), write
-/// it to the sink in chunks, account for each chunk. Each line's block is
-/// freed as the line is consumed.
+/// The writer thread: move the queue into `batch` (O(1) under the lock),
+/// then, one chunk at a time, take up to 256 KiB of lines out of it, write
+/// them, account for them. What the writer holds stays in the shared state
+/// (`batch`, and the chunk in `in_write`) until its write has returned, so an
+/// `exec` can carry it to the next image. Each line's block is freed as the
+/// line is consumed.
 fn writer_loop(shared: Arc<Shared>, mut sink: Box<dyn Write + Send>) {
     let mut buf: Vec<u8> = Vec::with_capacity(IDLE_BUF_BYTES);
     let mut torn = false;
     let mut emptied: Vec<VecDeque<Arc<str>>> = Vec::with_capacity(SPARE_BLOCKS);
-    let mut batch = Blocks::default();
+    let mut chunk: Vec<Arc<str>> = Vec::new();
     loop {
-        {
+        let cost = {
             let mut st = lock(&shared.state);
-            while st.queue.is_empty() {
+            loop {
+                if !st.frozen {
+                    if st.batch.is_empty() && !st.queue.is_empty() {
+                        st.inflight_bytes += std::mem::take(&mut st.queued_bytes);
+                        let State { queue, batch, .. } = &mut *st;
+                        queue.swap_out(batch);
+                    }
+                    if !st.batch.is_empty() {
+                        break;
+                    }
+                }
                 st.writer_idle = true;
                 st = shared.work.wait(st).unwrap_or_else(PoisonError::into_inner);
             }
             st.writer_idle = false;
-            st.inflight_bytes += std::mem::take(&mut st.queued_bytes);
-            st.inflight_lines = st.queue.len();
-            st.queue.swap_out(&mut batch);
-        }
-        let mut chunk_lines = 0u64;
-        let mut chunk_cost = 0usize;
-        while let Some(line) = batch.pop_front(&mut emptied) {
+            chunk.clear();
+            let (mut bytes, mut cost) = (0usize, 0usize);
+            while bytes < WRITE_CHUNK {
+                let Some(line) = st.batch.pop_front(&mut emptied) else {
+                    break;
+                };
+                bytes += line.len() + 1;
+                cost += line.len() + 1 + LINE_OVERHEAD;
+                chunk.push(line);
+            }
+            st.in_write.clear();
+            st.in_write.extend(chunk.iter().cloned());
+            st.queue.adopt_spares(&mut emptied);
+            cost
+        };
+        for line in &chunk {
             buf.extend_from_slice(line.as_bytes());
             buf.push(b'\n');
-            chunk_lines += 1;
-            chunk_cost += line.len() + 1 + LINE_OVERHEAD;
-            drop(line);
-            if buf.len() >= WRITE_CHUNK || batch.is_empty() {
-                write_chunk(
-                    &shared,
-                    &mut sink,
-                    &mut buf,
-                    &mut torn,
-                    chunk_lines,
-                    chunk_cost,
-                );
-                chunk_lines = 0;
-                chunk_cost = 0;
-            }
         }
+        let lines = chunk.len() as u64;
+        chunk.clear();
+        write_chunk(&shared, &mut sink, &mut buf, &mut torn, lines, cost);
         if buf.capacity() > SHRINK_BUF_BYTES {
             buf = Vec::with_capacity(IDLE_BUF_BYTES);
         }
         shared
             .writer_buffer_bytes
             .store(buf.capacity() as u64, Ordering::Relaxed);
-        // A storm that ended, or a log gone quiet, closes its episode here
-        // (the next pass of the loop writes the summary).
-        let mut st = lock(&shared.state);
-        st.queue.adopt_spares(&mut emptied);
-        if let Mode::Queue { limit } = st.mode {
-            if st.episode.is_some() && st.used() < limit / 2 {
-                st.close_episode(false);
-            }
-        }
     }
 }
 
@@ -1205,7 +1543,7 @@ fn write_chunk(
         let mut st = lock(&shared.state);
         st.written += lines;
         st.inflight_bytes = st.inflight_bytes.saturating_sub(cost);
-        st.inflight_lines = st.inflight_lines.saturating_sub(lines as usize);
+        st.in_write.clear();
         match result {
             Ok(()) => st.sink_failing = false,
             Err(_) => {
@@ -1213,6 +1551,15 @@ fn write_chunk(
                 st.sink_failing = true;
                 st.failed += lines;
                 st.record_loss(lines, bytes, Cause::SinkFailed);
+            }
+        }
+        // A storm that ended, or a log gone quiet, closes its episode once
+        // the batch is through (the next pass writes the summary).
+        if st.batch.is_empty() {
+            if let Mode::Queue { limit } = st.mode {
+                if st.episode.is_some() && st.used() < limit / 2 {
+                    st.close_episode(false);
+                }
             }
         }
     }
@@ -1288,6 +1635,37 @@ pub fn queue_last_words(text: &str) -> bool {
         out.push_str(line);
     }
     buffer.push_panic(&out)
+}
+
+/// [`LogBuffer::freeze_for_exec`] on the process's buffer (an empty tail
+/// when none is registered or it is synchronous).
+pub fn freeze_process_for_exec() -> ExecTail {
+    PROCESS
+        .get()
+        .map(LogBuffer::freeze_for_exec)
+        .unwrap_or_default()
+}
+
+/// [`LogBuffer::exec_tail_update`] on the process's buffer.
+pub fn exec_tail_update_process(sent: &ExecTail) -> ExecTail {
+    PROCESS
+        .get()
+        .map(|buffer| buffer.exec_tail_update(sent))
+        .unwrap_or_default()
+}
+
+/// [`LogBuffer::unfreeze`] on the process's buffer.
+pub fn unfreeze_process() {
+    if let Some(buffer) = PROCESS.get() {
+        buffer.unfreeze();
+    }
+}
+
+/// [`LogBuffer::adopt_exec_tail`] on the process's buffer.
+pub fn adopt_process_exec_tail(tail: ExecTail) {
+    if let Some(buffer) = PROCESS.get() {
+        buffer.adopt_exec_tail(tail);
+    }
 }
 
 /// Route a panic's message through the process's queue, in order with the
@@ -2279,7 +2657,7 @@ mod tests {
             (
                 stats.dropped_lines,
                 stats.drop_episodes,
-                stats.unwritten_at_previous_exec
+                stats.lost_at_previous_exec
             ),
             (376, 1, 376)
         );
@@ -2291,6 +2669,242 @@ mod tests {
             lines[0].contains("exec'd before its log writer was done"),
             "{lines:?}"
         );
+    }
+
+    /// The tail the old image carries over an `exec`, bit for bit.
+    #[test]
+    fn an_exec_tail_encodes_and_decodes() {
+        let tail = ExecTail {
+            lines: vec!["one".into(), "".into(), "tre\u{e9}s".into()],
+            in_doubt: 2,
+            lost: 7,
+            dropped_lines: 11,
+            dropped_bytes: 222,
+            drop_episodes: 3,
+            sink_errors: 1,
+        };
+        let bytes = tail.encode();
+        assert_eq!(ExecTail::decode(&bytes), Some(tail.clone()));
+        assert_eq!(
+            ExecTail::decode(&ExecTail::default().encode()),
+            Some(ExecTail::default())
+        );
+        // Anything that is not exactly what `encode` writes is no tail.
+        for cut in [0, 7, 8, 40, bytes.len() - 1] {
+            assert_eq!(ExecTail::decode(&bytes[..cut]), None, "cut at {cut}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(ExecTail::decode(&longer), None);
+        let mut other = bytes;
+        other[0] = b'X';
+        assert_eq!(ExecTail::decode(&other), None);
+    }
+
+    /// A stalled old image's unwritten log is the new image's first output,
+    /// in order, ahead of the new image's own lines; the old image's counters
+    /// continue (before, the lines were lost and counted dropped).
+    #[test]
+    fn a_frozen_log_is_written_first_by_the_next_image_in_order() {
+        let old_sink = BlockingSink::shut();
+        let old = queued(1 << 20, &old_sink);
+        for i in 0..50 {
+            log(&old, &format!("old {i:02}"));
+        }
+        // The writer has a chunk in its (stalled) write.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock(&old.0.state).in_write.is_empty() {
+            assert!(Instant::now() < deadline, "the writer never took a chunk");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let tail = old.freeze_for_exec();
+        assert_eq!(
+            tail.lines.len(),
+            50,
+            "everything unwritten, in doubt or not"
+        );
+        assert!(tail.in_doubt >= 1 && tail.lost == 0, "{tail:?}");
+        // Frozen: the writer takes nothing more, even when the sink opens
+        // after the write in flight (that chunk is in doubt: it may be
+        // written by both images).
+        let decoded = ExecTail::decode(&tail.encode()).unwrap();
+
+        let new_sink = BlockingSink::shut();
+        new_sink.open();
+        let new = queued(1 << 20, &new_sink);
+        new.adopt_exec_tail(decoded);
+        for i in 0..5 {
+            log(&new, &format!("new {i}"));
+        }
+        assert!(new.flush(Duration::from_secs(5)).complete);
+        let lines = new_sink.lines();
+        let old_at = lines.iter().position(|l| l == "old 00").unwrap();
+        let first_new = lines.iter().position(|l| l == "new 0").unwrap();
+        assert!(old_at < first_new, "{lines:?}");
+        let olds: Vec<_> = lines.iter().filter(|l| l.starts_with("old ")).collect();
+        let want: Vec<String> = (0..50).map(|i| format!("old {i:02}")).collect();
+        assert_eq!(olds, want.iter().collect::<Vec<_>>());
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("may repeat lines it wrote")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("50 line(s) above were unwritten")));
+        assert_eq!(new.tail(1000).len(), lines.len(), "the ring has them too");
+        let stats = new.stats();
+        assert_eq!(
+            (stats.carried_at_previous_exec, stats.lost_at_previous_exec),
+            (50, 0)
+        );
+        assert_eq!(stats.dropped_lines, 0);
+
+        // The exec failed instead: the old image's writer goes on.
+        old.unfreeze();
+        old_sink.open();
+        assert!(old.flush(Duration::from_secs(5)).complete);
+        assert_eq!(old_sink.lines().len(), 50);
+    }
+
+    /// The tail is the chunk in the write, then the rest of the writer's
+    /// batch, then the queue: the order the lines were logged in.
+    #[test]
+    fn a_frozen_log_is_the_chunk_in_write_then_the_batch_then_the_queue() {
+        let sink = BlockingSink::shut();
+        let buffer = queued(1 << 20, &sink);
+        {
+            // The writer is idle: set the three places by hand.
+            let mut st = lock(&buffer.0.state);
+            st.in_write.push("a".into());
+            st.batch.push_back("b".into());
+            st.batch.push_back("c".into());
+            st.queue.push_back("d".into());
+        }
+        let tail = buffer.freeze_for_exec();
+        let lines: Vec<&str> = tail.lines.iter().map(|l| &**l).collect();
+        assert_eq!(lines, ["a", "b", "c", "d"]);
+        assert_eq!((tail.in_doubt, tail.lost), (1, 0));
+    }
+
+    /// Lines other threads log after the freeze (R3-1): the update has them,
+    /// in order, up to the tail's bound, counts those past it as lost, and has
+    /// the counters as they stand; header and lines patched on, the memfd's
+    /// bytes decode to the whole.
+    #[test]
+    fn the_update_after_a_freeze_has_what_was_logged_since_in_order() {
+        let sink = BlockingSink::shut();
+        let limit = 64 << 10;
+        let buffer = queued(limit, &sink);
+        log(&buffer, "early 0");
+        log(&buffer, "early 1");
+        let sent = buffer.freeze_for_exec();
+        assert_eq!(sent.lines.len(), 2);
+        // Nothing since: no lines, the same loss.
+        let none = buffer.exec_tail_update(&sent);
+        assert!(none.lines.is_empty() && none.lost == sent.lost, "{none:?}");
+        log(&buffer, "late 0");
+        log(&buffer, "late 1");
+        let update = buffer.exec_tail_update(&sent);
+        let lines: Vec<&str> = update.lines.iter().map(|l| &**l).collect();
+        assert_eq!(lines, ["late 0", "late 1"]);
+        assert_eq!(update.lost, 0);
+        // The memfd after the patch: the first bytes, the late lines, the
+        // header rewritten with the whole count.
+        let mut bytes = sent.encode();
+        bytes.extend_from_slice(&update.encode_lines());
+        bytes[..TAIL_HEADER_LEN]
+            .copy_from_slice(&update.encode_header(sent.lines.len() + update.lines.len()));
+        let whole = ExecTail::decode(&bytes).expect("a whole tail");
+        let all: Vec<&str> = whole.lines.iter().map(|l| &**l).collect();
+        assert_eq!(all, ["early 0", "early 1", "late 0", "late 1"]);
+        // A storm past the bound: what fits the tail's bound is carried, the
+        // rest is counted lost, and the drops the queue itself made are in the
+        // counters. Nothing is unaccounted for.
+        let big = "x".repeat(4_000);
+        let mut logged = 0u64;
+        for _ in 0..200 {
+            log(&buffer, &big);
+            logged += 1;
+        }
+        let update = buffer.exec_tail_update(&sent);
+        let carried: usize = update.lines.iter().map(|l| l.len() + 1).sum::<usize>()
+            + sent.lines.iter().map(|l| l.len() + 1).sum::<usize>();
+        assert!(carried <= limit, "{carried} of {limit}");
+        let accepted_since = buffer.stats().accepted_lines - 2;
+        assert_eq!(
+            update.lines.len() as u64 + update.lost - sent.lost,
+            accepted_since,
+            "every line the queue took after the freeze is carried or lost"
+        );
+        assert_eq!(
+            accepted_since + (update.dropped_lines - sent.dropped_lines),
+            2 + logged,
+            "and every other one is a counted drop"
+        );
+        buffer.unfreeze();
+    }
+
+    /// An unreadable tail is counted from its header.
+    #[test]
+    fn the_header_says_how_many_lines_a_broken_tail_held() {
+        let tail = ExecTail {
+            lines: vec!["a".into(), "b".into()],
+            lost: 5,
+            ..ExecTail::default()
+        };
+        let bytes = tail.encode();
+        assert_eq!(ExecTail::lines_in_header(&bytes), Some(7));
+        assert_eq!(
+            ExecTail::lines_in_header(&bytes[..TAIL_HEADER_LEN]),
+            Some(7)
+        );
+        assert_eq!(
+            ExecTail::lines_in_header(&bytes[..TAIL_HEADER_LEN - 1]),
+            None
+        );
+        assert_eq!(ExecTail::lines_in_header(b"CSTLOGX1"), None);
+        assert_eq!(ExecTail::lines_in_header(b""), None);
+    }
+
+    /// The old image's drop accounting continues in the new one, and what did
+    /// not fit the old queue's bound is counted as lost (and said so).
+    #[test]
+    fn the_counters_travel_and_what_did_not_fit_is_lost_and_counted() {
+        let sink = BlockingSink::shut();
+        let limit = 64 << 10;
+        let old = queued(limit, &sink);
+        // Fill past the bound with panic messages (they bypass it), then
+        // drop an ordinary line: a counter to carry.
+        for i in 0..40 {
+            old.push_panic(&format!("panic {i} {}", "x".repeat(4_000)));
+        }
+        log(&old, "an ordinary line, dropped");
+        let tail = old.freeze_for_exec();
+        assert!(
+            tail.lost > 0,
+            "the bound holds the memfd: {}",
+            tail.lines.len()
+        );
+        let carried: usize = tail.lines.iter().map(|l| l.len() + 1).sum();
+        assert!(carried <= limit, "{carried} bytes of {limit}");
+        assert!(tail.dropped_lines >= 1);
+
+        let sink2 = BlockingSink::shut();
+        sink2.open();
+        let new = queued(limit, &sink2);
+        new.adopt_exec_tail(tail.clone());
+        assert!(new.flush_final(Duration::from_secs(5)).complete);
+        let stats = new.stats();
+        assert_eq!(stats.lost_at_previous_exec, tail.lost);
+        assert_eq!(stats.dropped_lines, tail.dropped_lines + tail.lost);
+        let lines = sink2.lines();
+        let said: u64 = lines
+            .iter()
+            .filter(|l| l.contains("log lines dropped"))
+            .map(|l| field(l, "dropped_lines"))
+            .sum();
+        assert_eq!(said, tail.lost);
+        old.unfreeze();
+        sink.open();
     }
 
     const CHILD_ENV: &str = "CST_LOGW_CHILD";

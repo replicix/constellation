@@ -32,7 +32,8 @@ pub(crate) fn log_status(stats: &crate::log_buffer::LogStats) -> api::LogStatus 
         longest_write_ms: stats.longest_write_ms,
         writing_for_ms: stats.writing_for_ms,
         sink_errors: stats.sink_errors,
-        unwritten_at_previous_exec: stats.unwritten_at_previous_exec,
+        carried_at_previous_exec: stats.carried_at_previous_exec,
+        lost_at_previous_exec: stats.lost_at_previous_exec,
     }
 }
 

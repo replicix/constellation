@@ -4577,6 +4577,12 @@
     "LogStatus": {
       "description": "The daemon's log writer (plan 44): one queue between every logging\nthread and the log's sink (`daemon.log`, a container's pipe), drained by\na writer thread. A thread that logs never waits for the sink; when the\nqueue is full the incoming line is dropped and counted, and the log\nitself says where lines are missing (a `log lines dropped` line).",
       "properties": {
+        "carried_at_previous_exec": {
+          "description": "Lines the previous image had not written when it handed this daemon\nover (its log sink was stalled at the `exec`) and carried across in a\nmemfd: this image wrote them first, in order. 0 normally.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "drop_episodes": {
           "description": "Separate runs of drops; each ends with one `log lines dropped` line\nin the log.",
           "format": "uint64",
@@ -4603,6 +4609,12 @@
         },
         "longest_write_ms": {
           "description": "The longest single write to the sink since the daemon started, in\nmilliseconds. Seconds here mean the disk under the log stalled at\nsome point, whether or not lines were dropped.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lost_at_previous_exec": {
+          "description": "Lines the previous image could not carry (no memfd, or more than its\nqueue's bound): counted in `dropped_lines`; 0 normally.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4635,12 +4647,6 @@
           "minimum": 0,
           "type": "integer"
         },
-        "unwritten_at_previous_exec": {
-          "description": "Lines the previous image left unwritten when it handed this daemon\nover (its log sink was stalled at the `exec`); 0 normally.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
         "writing_for_ms": {
           "description": "How long the write to the sink in progress has been running, in\nmilliseconds; 0 when none is. Growing without end: the sink is\nwedged.",
           "format": "uint64",
@@ -4667,7 +4673,8 @@
         "longest_write_ms",
         "writing_for_ms",
         "sink_errors",
-        "unwritten_at_previous_exec"
+        "carried_at_previous_exec",
+        "lost_at_previous_exec"
       ],
       "type": "object"
     },

@@ -654,9 +654,10 @@ pub(super) mod tests {
             (
                 log.dropped_lines,
                 log.drop_episodes,
-                log.unwritten_at_previous_exec
+                log.lost_at_previous_exec,
+                log.carried_at_previous_exec
             ),
-            (5, 1, 5)
+            (5, 1, 5, 0)
         );
         // A bound above the cap is capped, not an error.
         assert!(f.svc.logs_flush(u64::MAX).complete);

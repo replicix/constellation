@@ -263,8 +263,9 @@ now, growing without end when the file's disk is wedged), `queued_bytes` and
 `constellation log tail` reads the daemon's in-memory ring of the last 2 000
 lines, which has every line whether or not the file got it. What was queued
 is written before a clean exit and before the handover's `exec` (an upgrade
-drains the log, up to 2 s, before it detaches the views; what is still queued at
-the `exec` is counted as dropped by the new image and says so in a `log lines
+drains the log, up to 2 s, before it detaches the views; what is still unwritten
+at the `exec` goes to the new image in a memfd and is the first thing it writes;
+only what cannot be carried is counted as dropped and says so in a `log lines
 dropped` line); a write to the file that fails (a full disk) drops its chunk,
 counted in `dropped_lines` and `sink_errors`; a `kill -9` loses the lines of the
 last moments (behind a stalled disk, the backlog). A

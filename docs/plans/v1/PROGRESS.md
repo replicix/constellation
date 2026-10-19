@@ -52091,8 +52091,9 @@ backup's 1.5 s takeover window.
   flush of an exit, an `exec` or an abort always writes the summary.
 - Every lost line is a counted one: a full queue, a sink write that failed
   (`ENOSPC`, `EIO`: the chunk is dropped, counted, `sink_errors` too, a torn line
-  kept apart, `WouldBlock` polled), the previous image's unwritten tail at a
-  handover's `exec` (counted as dropped by the new image, with a summary line).
+  kept apart, `WouldBlock` polled). A handover's `exec` loses none (W6): the
+  unwritten queue and the drop accounting go to the new image in a memfd and
+  are written first, in order; a failed memfd falls back to a counted loss.
 - The writer starts after the daemonizer's fork (`start_daemon_logging`; for
   `serve` and a resumed daemon before their first line); flushed with a bound at
   exit (1 s; an `Err` from `main` is queued, not printed through std), before
@@ -52161,8 +52162,8 @@ parentheses was run on the box's tree, the failure quoted):
   the daemon's error on exit bypasses the `RUST_LOG` filter (R2-4,
   `the_error_return_is_logged_whatever_the_filter`: not logged at all with a
   filter that hides this crate); the fault point fires once per `write()` call;
-  docs. The exec-loss policy for W5's disk-load cells (strict, a note, or a
-  lossless handover through a memfd) is the maintainer's decision, open.
+  docs. R2-5, the exec-loss policy, was decided on 2026-10-19: lossless
+  through a memfd (W6, below).
 - The first cut's own fail-before (unit tests with their naive arms, the
   scenario's control arm) is unchanged: the synchronous writer on a gated sink
   blocks all 4 threads; the control arm shows `a` taking over, `b`'s lease lost,
@@ -52225,23 +52226,93 @@ function) loses its message if the writer had not written it, where std's hook
 wrote it synchronously, and so does a double panic; a `write(2)` in
 uninterruptible sleep still delays `execve` and exit (the fault point sleeps,
 which is interruptible: W5's gap measurement must say so); lines logged between
-the old writer's last wait and the `exec` are not in the loss count, and a chunk
-in flight may have been written; a write that failed half way leaves a torn line
+the old writer's last wait and the `exec` travel in the memfd with the queue, and
+the chunk in flight at the freeze may be written twice (once by the old image,
+once by the new one: never lost); a memfd that cannot be made, or that the new
+image cannot read, falls back to the counted loss; a write that failed half way leaves a torn line
 (kept apart); a dead writer thread leaves the queue to fill and drop (`status`
 shows `writing_for_ms` 0 at the limit); the `kill -9` barrier costs up to 1.5 s
 behind a stalled sink; `tools/check-cross.sh` was not run (the engine now pulls
 `tracing-subscriber`).
 
+### W6, a lossless handover `exec` (decision R2-5, 2026-10-19)
+
+`before_exec` gives the log a short flush (20 ms; it was 200 ms: the carry no
+longer needs the wait to save a line, it only lets a healthy sink catch up so
+that the `exec'ing` line is in the file and the chunk in doubt is rarer) and
+then freezes the writer: it takes no new chunk, and the chunk in its write now
+is marked in doubt (the kernel may finish that `write(2)`, so the new image may
+write those lines a second time; a WARN line says so). The lines it had not
+finished (that chunk, the rest of its batch, the queue), up to the queue's byte
+bound, are encoded into a memfd by `before_exec` on the handover thread, not in
+a `pre_exec` closure (encoding allocates, after the freeze; nothing there
+logs). The memfd is created close-on-exec so no child spawned meanwhile
+inherits it, and `ExecLog::finish`, the last step before `Command::exec`,
+brings it up to date and lifts the flag: other threads keep logging after the
+freeze, so the lines accepted since are appended (those past the bound are
+counted in the header's `lost`) and the header, the counters included, is
+rewritten (a memfd is made then when the freeze found nothing to carry). Only a
+line logged in the microseconds of the `exec` itself can still go with the old
+image. The memfd's number reaches the new image as
+`CONSTELLATION_LOG_TAIL_FD=<fd>:<pid>`: an `exec` keeps the pid, so a child
+that inherited the variable has another and ignores it (the image does not
+remove the variable: the crate's `clippy.toml` forbids `set_var` and
+`remove_var`). The new image, once per process (the resumed daemon starts its
+logging twice), accepts the descriptor only if it is a memfd, reads it right
+after it starts its writer, before its first line, writes the carried lines
+first and in order, continues the drop accounting (`carried_at_previous_exec`
+in `status.log`) and closes it. A tail it cannot read is counted as dropped
+(the header's line count when it parses, else one line; a `log lines dropped`
+summary and a WARN, which the harness fails on). If the exec fails, the memfd is
+closed and the writer unfrozen: nothing was lost, the lines are still queued. If
+no memfd can be made, the lines are a counted loss in the new image
+(`lost_at_previous_exec`, env `CONSTELLATION_LOG_UNWRITTEN_AT_EXEC`). It covers
+`serve`, `daemon --resume-from` and the upgrade and rollback paths, which share
+`exec_body`. The order check now fails on any loss, summary or warning, waits
+for a complete flush (sleeping between calls) and prints how many lines were
+carried.
+
+Round 3 (review of 2026-10-19): R3-1 lines logged by other threads between the
+freeze and the `exec` (and, when the sink had kept up, after the flush) went
+into the dead queue uncounted: now carried or counted (above);
+`the_update_after_a_freeze_has_what_was_logged_since_in_order`,
+`lines_logged_after_the_freeze_of_a_written_log_are_carried`, the late line in
+`before_exec_hands_the_unwritten_log_to_the_next_image`, and
+`a_storm_from_another_thread_across_the_exec_is_carried_whole` (a real `exec` of
+the test binary, a thread logging numbered lines for 100 ms past the freeze:
+without the update 1 153 of 3 018 lines were missing; with it none). R3-2:
+`a_log_tail_round_trips_through_a_memfd` (not a tail, a truncated body counted
+from its header, a pipe left open and unread),
+`the_header_says_how_many_lines_a_broken_tail_held`. R3-3: the tail memfd is
+close-on-exec until `finish` (the test fails with the flag off), the flush
+loop sleeps, the pre-exec flush is 20 ms. Not re-measured: the writer pops each
+chunk's lines under the state lock and clones them into `in_write`, where the
+queue swap was O(1), and the handover gap grows with the backlog (freeze, memfd
+write, the new image's read and queue): W5 must re-run the micro-bench on the
+four file systems and measure the gap with a full 128 MiB queue.
+
 ### Deviations from the plan, and what the code contradicted
 
 Recorded in the plan's section 15 ("Implementation notes").
 
-### Gates (W1-W4, build box, 16 vCPU, rebased on 5a7f659)
+### Gates (W1-W6, build box, 16 vCPU, rebased on 5a7f659)
+
+Round 3 (W4 and W6 rebased on main 62b04bd, with W1-W3 landed): `cargo fmt` and
+`cargo clippy --workspace --all-targets -- -D warnings` clean; `cargo test` of
+the engine, control, harness and cli crates: 1 248 passed, 0 failed (the
+workspace run below was not repeated). `upgrade-under-load` under
+`log-stall:6000:2500`, 2 of 2 PASSED with no line lost, 1 914 and 2 407 lines
+carried over two `exec`s, longest syscall 351 and 473 ms (581-619 ms before the
+flush was cut to 20 ms); idle 1 of 1 PASSED, longest syscall 225 ms. The
+numbers below are those of the W1-W6 tree before round 3.
 
 `cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings`
 clean, each milestone on its own; `cargo test --workspace --no-fail-fast -j 8`
-(under `timeout`): 3 337 passed, 0 failed, 56 ignored (the round-2 tree). Scenarios (every job under
-`timeout --kill-after=30s`), seed 42, verification on:
+(under `timeout`): 3 344 passed, 0 failed, 56 ignored (the first run of the
+final tree failed `schema_file_is_current`: the control schema had not been
+re-blessed after W6's `log` status fields; re-blessed, the crate's tests
+pass). Scenarios (every job under `timeout --kill-after=30s`), seed 42,
+verification on:
 
 - `log-sink-stall` normal arm 3 of 3 PASSED (103-104 s), control arm 3 of 3
   PASSED, parts A, B and C each failing as required (a takeover and `b`'s lease
@@ -52251,12 +52322,22 @@ clean, each milestone on its own; `cargo test --workspace --no-fail-fast -j 8`
   longer loses the delegation, so part C now also bounds b's writes at 2 s.
   Part B paces its ops (5 ms): unpaced on an idle host it wrote 13 000 metadata
   segments in the 5 s, more than the bucket log check of part C could read back
-  ("Connection reset by peer").
-- `upgrade-under-load` idle 3 of 3 PASSED (upgrades 237-308 ms, longest syscall
-  281-286 ms); under `log-stall:3000:4000` 3 of 3 PASSED, no line lost, longest
-  syscall 364 ms; under `log-stall:6000:2500` 2 of 2 PASSED with one lossy
-  `exec` each (2 103 and 2 068 lines, counted and declared), longest syscall
-  647 and 628 ms.
+  ("Connection reset by peer"). On the W6 tree both arms were run again: normal
+  3 of 3 PASSED, control 3 of 3 PASSED (failing as required).
+- `upgrade-under-load` idle 4 of 4 PASSED (upgrades 237-313 ms, longest syscall
+  247-288 ms); under `log-stall:3000:4000` 4 of 4 PASSED, no line lost (the third
+  upgrade 2.2-2.3 s: it waits for the drain, the application does not), longest
+  syscall 329-366 ms; under `log-stall:6000:2500` (W1-W4: 2 103 and 2 068 lines
+  counted lost at the `exec`) 3 of 3 PASSED with **no line lost**, 4 418-4 448
+  lines carried over two `exec`s in the memfd and written first by the new
+  image, no summary line, no loss warning, longest syscall 581-619 ms.
+  W6 found two things in the first runs: the resumed daemon runs
+  `start_daemon_logging` twice, so the memfd was adopted twice (the second read
+  failed on a closed descriptor number and warned "could not be read", and could
+  have closed a descriptor that had reused the number: adoption is once per
+  process), and the order check read the log before a stalled sink had written
+  the carried chunks (one stall per 256 KiB chunk: it now waits for a complete
+  flush, up to 120 s).
 - `load-probe` with the `log-drop` break fails naming "3 log line(s) dropped";
   `session-handover-idle` and `kill9-remount` PASSED.
 - `vfs_bench` (no subscriber installed): unchanged, 3 / 11 / 18 allocations per

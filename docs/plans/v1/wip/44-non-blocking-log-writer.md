@@ -404,20 +404,44 @@ struct State {
   return from `main`: `flush_process(1 s)`. One second: an exit is not on
   a latency path, but the second-signal exit (`node_runtime.rs:711`)
   promises to be prompt and a container restart waits for it.
-- **Exec.** `exec_body` (`handover.rs:533`) calls `flush_process(200 ms)`
-  right before `Command::exec`; when lines are left it sets
-  `CONSTELLATION_LOG_UNWRITTEN_AT_EXEC=<n>` on the command. The new
-  image (`resume_main`, after starting its writer) reads it, keeps it in
-  `unwritten_at_previous_exec`, counts them as dropped (a `log lines
-  dropped` summary line, `status.log.dropped_lines`: §15.11) and logs one
-  WARN that says what the number is (`the previous image's log writer
-  stopped waiting at its exec with N line(s) unwritten ...`). 200 ms: the
-  handover's gap is application-visible latency; a stalled sink may add at
-  most that, and the loss is reported; the upgrade also drains the log
-  (2 s, before the views are detached) so the 200 ms has little to wait for. (A writer thread
-  inside a `write(2)` in uninterruptible sleep delays `execve`'s
-  thread teardown until the write returns — the kernel's, not ours; today
-  the exec'ing thread's own last log write has the same exposure. §11.)
+- **Exec.** `exec_body` (`handover.rs`) gives the log `flush_process(20 ms)`
+  and then **hands what is unwritten to the new image** (W6, the maintainer's
+  decision of 2026-10-19, §12). The writer is frozen (it takes no new chunk;
+  the chunk in its write now is in doubt); the lines it had not finished (that
+  chunk, the rest of its batch, the queue), up to the queue's byte bound, are
+  copied into a memfd by `before_exec` (never in a `pre_exec` closure). The
+  memfd is created close-on-exec, so no child another thread spawns meanwhile
+  inherits it; `ExecLog::finish`, the last step before `Command::exec`, brings
+  it up to date and lifts the flag: other threads keep logging after the
+  freeze, and what the old image's queue takes in then would go with it, so
+  the lines accepted since are appended (those past the bound are counted in
+  the header's `lost`) and the header, the counters included, is rewritten
+  (`LogBuffer::exec_tail_update`; where the freeze found nothing, the memfd is
+  made then). What is logged after that, the microseconds of the `exec`
+  itself, is the only gap. The memfd's number goes to the new image in
+  `CONSTELLATION_LOG_TAIL_FD=<fd>:<pid>`. The new image checks that the
+  descriptor is a memfd (a stale value must not make it read, block on or
+  close another descriptor), reads and closes it right after it starts its
+  writer, before it logs a line, and writes the lines first, in order; the
+  old image's drop counters continue in it, and a line says that the lines
+  were carried (and, when a write was in flight, that its first lines may
+  repeat). A tail it cannot read is counted as dropped, by the lines the
+  header names (one if even that does not parse), and warned; the harness
+  fails on that warning. If the `exec` fails the memfd is closed and the
+  writer goes on (the lines never left). Where no memfd can be made, or the
+  tail exceeds the bound, the old behaviour stands for what is left: the new
+  image is told the number (`CONSTELLATION_LOG_UNWRITTEN_AT_EXEC=<n>`), counts
+  it as dropped (a `log lines dropped` summary line,
+  `status.log.dropped_lines`, `lost_at_previous_exec`: §15.11) and logs one
+  WARN. The wait is 20 ms, not the 200 ms it was: the carry no longer needs it
+  to save any line, it only lets a healthy sink catch up so that the
+  `exec'ing` line is in the file and the chunk in doubt, which the new image
+  may write a second time, is rarer; a stalled sink does not take it in 200 ms
+  either, and the handover's gap is application-visible latency. The upgrade
+  also drains the log (2 s, before the views are detached). (A writer thread
+  inside a `write(2)` in uninterruptible sleep delays `execve`'s thread
+  teardown until the write returns — the kernel's, not ours; today the
+  exec'ing thread's own last log write has the same exposure. §11.)
 - **Abort.** `node.rs:1222`: `log_buffer::flush_process(500 ms)` between
   the `tracing::error!` and `std::process::abort()`, so the line that
   says why survives a healthy sink.
@@ -451,7 +475,7 @@ struct State {
   stalls the daemon): for A/B measurements and the fail-before arms
   only, documented as such.
 - The constants (reserve `1/8`, close at `1/2`, line overhead 64 B, exit
-  1 s, exec 200 ms, abort 500 ms, 64 panic records, 256 KiB write chunk)
+  1 s, exec 20 ms, abort 500 ms, 64 panic records, 256 KiB write chunk)
   are not knobs.
 
 ### 4.6 The harness's setting
@@ -683,9 +707,78 @@ together before W5's campaign.
 - `docs/plans/v1/PROGRESS.md`: a `## Fix:`-style entry with the
   before/after numbers (§8) and the gate results.
 
+### W6 — The handover's `exec` loses no log line (cli, engine, harness)
+
+The maintainer's decision of 2026-10-19 (§12), implemented as its own patch
+after W1-W4.
+
+- `crates/engine/src/log_buffer.rs`: the writer keeps what it has not
+  finished in the shared state (`batch`, and the chunk in the write now,
+  `in_write`; one lock per 256 KiB chunk, which pops the chunk's lines and
+  clones them into `in_write`); `State::frozen` stops it taking more.
+  `LogBuffer::freeze_for_exec() -> ExecTail` (the lines in order, the first
+  `in_doubt` of them the chunk in the write, the old image's drop counters,
+  `lost`: the lines beyond the queue's byte bound), `unfreeze()`,
+  `adopt_exec_tail(ExecTail)` (the new image's side: the lines into the ring
+  and the queue ahead of anything else, the counters continued, `lost` counted
+  as dropped with a summary line, two explanatory lines), `ExecTail::encode`
+  and `decode` (a magic, seven little-endian `u64`s, each line as a `u32`
+  length and its bytes: at most the bound plus four bytes a line).
+  `status.log` loses `unwritten_at_previous_exec` and gains
+  `carried_at_previous_exec` and `lost_at_previous_exec` (the schema is
+  re-blessed).
+- `crates/cli/src/handover.rs`: `before_exec(command, flush, freeze, store)`
+  returns an `ExecLog` and always freezes the writer (lines logged up to the
+  `exec` are carried even when the sink kept up); `store` is
+  `write_tail_memfd` (close-on-exec). `ExecLog::finish(command, update)`, the
+  last step before `Command::exec`, appends the lines accepted since the
+  freeze (`LogBuffer::exec_tail_update`), rewrites the header (`lost`, the
+  counters, the line count: fixed offsets, `ExecTail::encode_header`), makes
+  the memfd when there was none, and lifts close-on-exec; `abort` after a
+  failed `exec` closes the memfd and unfreezes. `adopt_log_tail_from_env()` is
+  called by `start_daemon_logging` right after the writer starts (so for
+  `serve` and `daemon --resume-from` alike, and a rollback image), once per
+  process (the resumed daemon starts its logging twice). The variable is
+  `<fd>:<pid>` and the image acts only on its own pid: an `exec` keeps the pid,
+  a child that inherited the variable has another; the image does not remove
+  the variable from its environment, because the crate's `clippy.toml`
+  forbids `std::env::set_var` and `remove_var` (they change the environment
+  under every thread). The descriptor must be a memfd (`/proc/self/fd/<fd>`
+  names `memfd:`), else it is left alone; an unreadable tail is counted
+  (`ExecTail::lines_in_header`) and warned.
+- `crates/harness/src/scenarios/handover.rs`: `check_upgrade_log` expects no
+  loss, under a `log-stall` item too: each `exec'ing` line followed by its
+  `resuming` line (a marker repeated by an in-flight write counts once), no
+  summary line, no loss warning, status `dropped_lines` and
+  `lost_at_previous_exec` 0, and prints how many lines were carried; the
+  scenario no longer declares a loss.
+- Tests, each failing without its mechanism: `ExecTail` encode/decode;
+  `a_frozen_log_is_written_first_by_the_next_image_in_order` (order, the
+  in-doubt marker, the ring, the counters, the `exec` that fails);
+  `the_counters_travel_and_what_did_not_fit_is_lost_and_counted`;
+  `before_exec_hands_the_unwritten_log_to_the_next_image` (the memfd, its
+  number, the writer frozen and then released, nothing written twice by the old
+  image), `before_exec_falls_back_to_a_counted_loss_without_a_memfd`,
+  `before_exec_hands_over_nothing_when_the_log_is_written`,
+  `a_log_tail_round_trips_through_a_memfd` (also: not a tail, a truncated
+  body counted from its header, a pipe left open and unread),
+  `the_update_after_a_freeze_has_what_was_logged_since_in_order`,
+  `the_header_says_how_many_lines_a_broken_tail_held`,
+  `lines_logged_after_the_freeze_of_a_written_log_are_carried`, the late line
+  in `before_exec_hands_the_unwritten_log_to_the_next_image` and the late
+  lines counted when no memfd can be made; and `upgrade-under-load` under
+  `log-stall:6000:2500`: 0 lost lines (1 473-2 103 before).
+
 ### W5 — Measurements and the campaign
 
-§8 and §9.
+§8 and §9. After W6: the handover's application-visible gap grows with the
+backlog (the freeze copies an `Arc` per line under the state lock, the memfd is
+written, the new image reads, decodes and queues it all), so it must be
+measured with a full queue (the harness's 128 MiB, about two million lines),
+not only idle and under a short stall; and the micro-bench (§8) must be re-run
+on the four file systems, because the writer now pops the lines of each chunk
+and clones them into `in_write` under the state lock, where the queue swap was
+O(1) (the W6 numbers in PROGRESS say what that cost).
 
 ## 7. Tests
 
@@ -935,6 +1028,13 @@ In order, all green:
 
 ## 12. Open questions for the maintainer
 
+**Decision of 2026-10-19 (round-2 review, R2-5): the handover's `exec` is
+made lossless.** The old image hands its unwritten queue to the new one
+through a memfd and the new image writes it first, in order; the old image's
+drop accounting continues across; a loss is counted only where the memfd
+cannot be made or the bound is exceeded (W6, §6 and §4.4). Until it landed an
+exec-time loss was a verification failure unless declared.
+
 **Answered by the maintainer (2026-10-18): all four as proposed** — 16 MiB
 default, configurable; keep the `0` (synchronous) switch until the
 fail-before evidence is recorded, then remove it; the harness's `kill -9`
@@ -962,6 +1062,8 @@ tail is a note, not a violation; no logger process for now.
       its control arm, the `log-drop` break, the upgrade order check.
 - [x] W4: configuration, named filesystems, troubleshooting, TESTING,
       ADR-32, PROGRESS.
+- [x] W6: the handover's `exec` hands the unwritten log to the next image
+      (memfd), lossless under `log-stall:6000:2500`, with the fallback.
 - [ ] W5: §8's measurements on four file systems, every gate of §9, the
       peak queue occupancy per campaign cell recorded.
 - [ ] Independent review of W1-W3 before W5's campaign.
@@ -1041,7 +1143,8 @@ done. Items 1-3 and 12-14 were also edited into the sections they concern.
     an upgrade that left its `exec'ing` line, its `resuming` line, or a counted
     loss, requires the last image's `resuming` line, and requires the log's
     `log lines dropped` summaries to add up to the warnings.
-11. **Lost lines at an exec are dropped lines (review F3).** The new image
+11. **Lost lines at an exec are dropped lines (review F3; since W6, §15.22,
+    only where the memfd cannot carry them).** The new image
     counts the old image's unwritten tail (its `unwritten_lines` when its
     200 ms flush gave up) as dropped: `status.log.dropped_lines`, a
     `log lines dropped` summary line (cause: the previous image's `exec`), so
@@ -1114,6 +1217,25 @@ done. Items 1-3 and 12-14 were also edited into the sections they concern.
     (retries after `WouldBlock` and partial writes included). Exec losses stay
     verification failures unless declared; whether W5's disk-load cells should
     treat them as notes is the maintainer's decision.
+
+22. **W6, lossless exec.** §4.4 and §6. The writer now keeps its batch and its
+    chunk in the shared state (a lock per chunk, the chunk's lines cloned into
+    `in_write`), so an `exec` can read them; nothing is removed by reading, so
+    a failed `exec` loses nothing. The one doubt is the chunk in the write at
+    the `exec`: the sink may take it (the kernel finishes a `write(2)` already
+    in progress) and the new image writes it again; a line before the carried
+    lines says which (`in_doubt`). Not done: de-duplicating it (the old image
+    cannot know how much of its chunk the sink took).
+23. **Round-3 review (W6).** Lines other threads logged between the freeze and
+    the `exec` went into the dead queue, uncounted (and, when the sink had
+    kept up, the same after the flush): `ExecLog::finish` appends them to the
+    memfd, counts those past the bound in the header's `lost`, and the writer
+    is always frozen. An unreadable tail is counted from its header and the
+    harness fails on the warning; the descriptor must be a memfd; the memfd is
+    created close-on-exec and lifted just before the `exec`; the pre-exec flush
+    is 20 ms (§4.4 says why); the order check's flush loop sleeps between
+    calls. Only a line logged in the microseconds of the `exec` itself is
+    lost, and nothing counts it.
 
 ## Sources
 

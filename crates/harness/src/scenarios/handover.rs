@@ -395,103 +395,95 @@ pub(super) fn verify_load(mnt: &Path, seed: u64, appended: u64, created: u64) ->
     Ok(())
 }
 
-/// Plan 44 §4.4, §7.4: across `upgrades` handovers the daemon's log has,
-/// in order, each `exec'ing the new binary` line (the old image's, flushed
-/// before its `exec`) followed by the new image's `resuming a handed-over
-/// daemon` line, and no loss: the old image's writer had nothing left.
-///
-/// Under a `log-stall` load item a stall may overlap an `exec`. The old
-/// image gives up after 200 ms and its last lines are lost: its `exec'ing`
-/// line, and, when the stall also reaches the next upgrade, the next image's
-/// own `resuming` line and warning. The new image counts the loss as dropped
-/// lines (`stopped waiting at its exec` warning, a `log lines dropped`
-/// summary line, `status.log.dropped_lines`), so a lost line is accounted
-/// for: a marker line may be missing only when a loss was counted (one loss
-/// can take several: a stall that reaches two upgrades takes the lines of
-/// the image in between), the last image's `resuming` line is there, the
-/// summary lines add up to the warnings, and the final image's status says
-/// what its own warning did. The scenario declares
-/// the loss (`verify::expect_log_drops`: those lines are not seen by the log
-/// checks, and the note below says how many).
+/// Plan 44 §4.4, W6: across `upgrades` handovers the daemon's log has, in
+/// order, each `exec'ing the new binary` line (the old image's) followed by
+/// the new image's `resuming a handed-over daemon` line, and **no loss**,
+/// stalled sink or not: what the old image's writer had not written at its
+/// `exec` travels to the new image in a memfd and is the first thing the new
+/// image writes (so the old image's `exec'ing` line can be in the file only
+/// after its new image has started). A chunk that was being written at the
+/// `exec` may be written by both images: consecutive repeats of a marker
+/// line are one, and a line before them says so. A line the old image could
+/// not carry is counted as dropped (status, a summary line), which fails
+/// this check and the run's verification.
 fn check_upgrade_log(c: &Client, upgrades: usize) -> Result<()> {
-    c.control("node.logs.flush", serde_json::json!({"within_ms": 10_000}))
-        .context("flushing the daemon's log")?;
+    // Under a `log-stall` item the new image writes what the old one carried
+    // over one 256 KiB chunk per stalled `write()`: wait for all of it.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let report = c
+            .control("node.logs.flush", serde_json::json!({"within_ms": 10_000}))
+            .context("flushing the daemon's log")?;
+        if report["complete"].as_bool() == Some(true) {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the daemon's log was still not written after 120 s: {report}"
+        );
+        // (A flush that returns at once, a third waiter, must not be called
+        // back to back.)
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let text = c.log_text();
-    let stalls = crate::load::stalls_log();
-    let (mut execs, mut resumes, mut warned, mut summed) = (0usize, 0usize, 0u64, 0u64);
-    let mut warnings = 0usize;
-    let mut summaries = 0usize;
-    let mut last_warned = 0u64;
     let mut sequence: Vec<&str> = Vec::new();
+    let (mut carried, mut handovers_with_a_tail) = (0u64, 0usize);
+    let (mut repeats, mut summaries, mut warnings) = (0usize, 0usize, 0usize);
     for line in text.lines() {
         let line = crate::verify::strip_ansi(line);
-        let count =
-            |key: &str| crate::verify::field(&line, key).and_then(|v| v.parse::<u64>().ok());
-        if line.contains("exec'ing the new binary") {
-            execs += 1;
-            sequence.push("exec");
-        } else if line.contains("stopped waiting at its exec") {
-            warnings += 1;
-            last_warned = count("lines").context("a loss warning without its count")?;
-            warned += last_warned;
-            sequence.push("lost");
+        let marker = if line.contains("exec'ing the new binary") {
+            Some("exec")
         } else if line.contains("resuming a handed-over daemon") {
-            resumes += 1;
-            sequence.push("resume");
+            Some("resume")
+        } else {
+            None
+        };
+        if let Some(marker) = marker {
+            if sequence.last() == Some(&marker) {
+                repeats += 1;
+            } else {
+                sequence.push(marker);
+            }
+        } else if line.contains("line(s) above were unwritten at the previous image's exec") {
+            handovers_with_a_tail += 1;
+            carried += line
+                .split("the ")
+                .nth(1)
+                .and_then(|r| r.split(' ').next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+        } else if line.contains("could not hand its log over")
+            || line.contains("could not be read; its")
+        {
+            warnings += 1;
         } else if line.contains("log lines dropped") {
             summaries += 1;
-            summed += count("dropped_lines").context("a summary line without its count")?;
         }
     }
-    if stalls {
-        // Every upgrade is accounted for: its `exec'ing` line, its
-        // `resuming` line, or a loss the new image counted. The last image
-        // was never exec'd again: its `resuming` line is there.
-        ensure!(
-            execs <= upgrades
-                && resumes <= upgrades
-                && resumes >= 1
-                && (warnings >= 1 || (execs == upgrades && resumes == upgrades))
-                && sequence.last() == Some(&"resume"),
-            "under a stalled log sink the log's marker lines are {sequence:?} for {upgrades} \
-             upgrades and {warnings} loss warning(s); log:\n{}",
-            c.tail_log_n(60)
-        );
-        // The two lines of a loss are queued back to back, but a stall that
-        // ends between them and an `exec` right after can take one and not
-        // the other: the sums are compared when every loss left both.
-        ensure!(
-            summaries != warnings || summed == warned,
-            "the log's summary lines count {summed} dropped lines, the loss warnings {warned}"
-        );
-        ensure!(
-            summaries.abs_diff(warnings) <= 1,
-            "{summaries} summary line(s) for {warnings} loss warning(s)"
-        );
-        eprintln!(
-            "    verify: upgrade-under-load: {warned} line(s) lost at an exec across {warnings} \
-             upgrade(s) under a stalled log sink (declared, counted as dropped)"
-        );
-    } else {
-        let expected: Vec<&str> = (0..upgrades).flat_map(|_| ["exec", "resume"]).collect();
-        ensure!(
-            sequence == expected && summed == 0,
-            "the log's marker lines are {sequence:?}, expected each `exec'ing the new binary` line \
-             followed by its `resuming` line, and no loss ({summed} dropped); log:\n{}",
-            c.tail_log_n(60)
-        );
-    }
+    let expected: Vec<&str> = (0..upgrades).flat_map(|_| ["exec", "resume"]).collect();
+    ensure!(
+        sequence == expected && warnings == 0 && summaries == 0,
+        "the log's marker lines are {sequence:?} ({warnings} loss warning(s), {summaries} summary \
+         line(s)), expected each `exec'ing the new binary` line followed by its `resuming` line \
+         and no loss; log:\n{}",
+        c.tail_log_n(60)
+    );
     let status = c.control_status()?;
     let log = &status["log"];
-    let (dropped, unwritten) = (
-        log["dropped_lines"].as_u64(),
-        log["unwritten_at_previous_exec"].as_u64(),
-    );
     ensure!(
-        dropped == unwritten && (unwritten == Some(0) || unwritten == Some(last_warned)),
-        "the final image's status says dropped {dropped:?} and unwritten at the previous exec \
-         {unwritten:?}; its warning said {last_warned}"
+        log["dropped_lines"].as_u64() == Some(0)
+            && log["lost_at_previous_exec"].as_u64() == Some(0),
+        "the final image's status says dropped {:?}, lost at the previous exec {:?}: {log}",
+        log["dropped_lines"],
+        log["lost_at_previous_exec"]
     );
+    if handovers_with_a_tail > 0 {
+        eprintln!(
+            "    verify: upgrade-under-load: {carried} line(s) carried over {handovers_with_a_tail} \
+             exec(s) in a memfd, written first by the new image ({repeats} repeated marker \
+             line(s) from a write in flight)"
+        );
+    }
     Ok(())
 }
 
@@ -502,11 +494,6 @@ pub fn upgrade_under_load(seed: u64) -> Result<()> {
     let result = (|| -> Result<()> {
         let pid = c.pid().context("no daemon pid")?;
         let first = generation(&c)?;
-        if crate::load::stalls_log() {
-            // A stall that overlaps an `exec` costs the old image its
-            // unwritten tail; that is counted, and declared here.
-            crate::verify::expect_log_drops(&c);
-        }
         let watcher = Watcher::start(&c.mnt)?;
         let load = start_load(&c.mnt, seed)?;
         std::thread::sleep(Duration::from_millis(1500));

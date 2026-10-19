@@ -601,9 +601,13 @@ pub struct LogStatus {
     /// Writes to the sink that failed (`ENOSPC`, `EIO`, a closed pipe);
     /// their lines are lost.
     pub sink_errors: u64,
-    /// Lines the previous image left unwritten when it handed this daemon
-    /// over (its log sink was stalled at the `exec`); 0 normally.
-    pub unwritten_at_previous_exec: u64,
+    /// Lines the previous image had not written when it handed this daemon
+    /// over (its log sink was stalled at the `exec`) and carried across in a
+    /// memfd: this image wrote them first, in order. 0 normally.
+    pub carried_at_previous_exec: u64,
+    /// Lines the previous image could not carry (no memfd, or more than its
+    /// queue's bound): counted in `dropped_lines`; 0 normally.
+    pub lost_at_previous_exec: u64,
 }
 
 /// `node.logs.flush`: wait until every line logged before the call has been

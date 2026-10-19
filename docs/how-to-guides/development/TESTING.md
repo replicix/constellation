@@ -3623,15 +3623,12 @@ see it, and the harness is built so that never happens silently:
   check; the `log-stall` load item (above) stalls a daemon's sink, and
   `upgrade-under-load` checks that across its three upgrades the log has, in
   order, each `exec'ing the new binary` line followed by the new image's
-  `resuming a handed-over daemon` line and no loss (under a `log-stall` item
-  a stall may overlap an `exec`: the old image gives up after 200 ms and its
-  last lines are lost, the `exec'ing` line among them, and with a stall that
-  reaches two upgrades the next image's own `resuming` line; the new image
-  counts the loss as dropped lines, writes a `log lines dropped` summary and a
-  `stopped waiting at its exec` warning, and the check accepts an upgrade that
-  left its `exec'ing` line, its `resuming` line or such a counted loss, with
-  the summaries adding up to the warnings. The scenario declares the loss
-  with `expect_log_drops` and prints its count);
+  `resuming a handed-over daemon` line and no loss, also under a `log-stall`
+  item: a stall that overlaps an `exec` leaves the old image's unwritten
+  queue to the new image through a memfd (plan 44 W6), which writes it first
+  and in order, so nothing is lost and no `log lines dropped` line appears
+  (the check fails on one, and on a `could not hand its log over` warning,
+  which only a failed memfd would write);
 - `log-sink-stall` (`scenarios/logsink.rs`, in the default catalog;
   `kind` skips it: the stall is a fault file on the node's host). Part A: `b`
   the root's holder with `a` its backup, an `flock` holder on `b` appending

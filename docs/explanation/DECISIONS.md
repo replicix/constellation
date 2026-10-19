@@ -1279,7 +1279,7 @@ within seven eighths of the bound, `WARN` and `ERROR` within all of it), and
 one `log lines dropped` summary line, written outside `RUST_LOG`, marks the
 gap once the queue is back under half. The writer starts only after the
 daemonizer's fork; the queue is flushed with a bound at exit (1 s), before
-the handover's `exec` (200 ms; what is left is reported by the new image) and
+the handover's `exec` (20 ms; what is left goes to the new image in a memfd) and
 before an abort (500 ms), and a panic's message goes through the same queue.
 The harness gives its daemons a 128 MiB queue and fails a run's verification
 on any drop, so its log checkers never go silently blind.
@@ -1313,8 +1313,9 @@ follow-up).
 
 **Consequences**: lines can be lost behind a stalled sink, counted
 (`status` `log.dropped_lines`, `/metrics`) and marked in the log; so are the
-lines of a write the sink refused (a full disk) and the unwritten tail the
-previous image left at a handover's `exec` (the new image counts it); the
+lines of a write the sink refused (a full disk); a handover's `exec` loses
+none: the unwritten queue goes to the new image in a memfd and is written
+first (only a failed memfd falls back to a counted loss, plan 44 W6); the
 in-memory ring `constellation log tail` reads keeps every line. A `kill -9`,
 `SIGSEGV` or OOM kill loses what is queued (the lines of the last few
 microseconds on a sink that keeps up; the harness flushes before its own

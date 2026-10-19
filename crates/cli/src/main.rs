@@ -1321,6 +1321,9 @@ pub(crate) fn start_daemon_logging(buffer: &log_buffer::LogBuffer) {
         // logs it, as before.
         tracing::warn!(%error, "could not start the log writer thread; logging stays synchronous");
     }
+    // A handover's old image may have carried its unwritten log over: it goes
+    // to the sink before anything this image logs.
+    handover::adopt_log_tail_from_env();
     log_buffer::install_panic_hook();
     ATEXIT.call_once(|| {
         // SAFETY: registers a handler that only reads the process's

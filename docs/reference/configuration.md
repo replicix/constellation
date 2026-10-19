@@ -1140,8 +1140,10 @@ whether or not the sink got them. A short-lived command (`status`,
 `umount`, `fs create`, ...) writes to stderr itself, as it always did.
 What the daemon had queued is written before it exits, before the
 handover's `exec` (an upgrade first drains the log, up to 2 s, while the
-views are still served, and the last wait before the `exec` is 200 ms; what
-is still queued then is counted as dropped lines by the new image) and
+views are still served, and the last wait before the `exec` is 20 ms; what
+is still unwritten then travels to the new image in a memfd and is the first
+thing it writes, in order; only what cannot be carried is counted as dropped
+lines by the new image) and
 before an abort. A write to the sink that fails (a full disk, an I/O error)
 drops its chunk, counted the same way (`log.sink_errors` too). A `kill -9`
 loses what was queued. `RUST_LOG` filters as before (default `info`).

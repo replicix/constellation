@@ -462,7 +462,26 @@ fn write_handoff(handoff: &DaemonHandoff) -> std::io::Result<RawFd> {
 
 /// A memfd (inherited across `exec`) holding `body`.
 fn write_memfd(body: &[u8]) -> std::io::Result<RawFd> {
-    let fd = memfd()?;
+    write_memfd_named(c"constellation-handoff", 0, body)
+}
+
+/// The log tail's memfd ([`LOG_TAIL_FD_ENV`]): close-on-exec until
+/// [`ExecLog::finish`] lifts it, right before the `exec`, so that no child
+/// another thread spawns meanwhile inherits it.
+fn write_tail_memfd(body: &[u8]) -> std::io::Result<RawFd> {
+    write_memfd_named(c"constellation-log-tail", MFD_CLOEXEC, body)
+}
+
+/// `MFD_CLOEXEC` (the constant is Linux-only in `libc`; this module
+/// type-checks elsewhere).
+const MFD_CLOEXEC: libc::c_uint = 1;
+
+fn write_memfd_named(
+    name: &std::ffi::CStr,
+    flags: libc::c_uint,
+    body: &[u8],
+) -> std::io::Result<RawFd> {
+    let fd = memfd(name, flags)?;
     // SAFETY: a descriptor we just created and own.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     file.write_all(body)?;
@@ -471,10 +490,10 @@ fn write_memfd(body: &[u8]) -> std::io::Result<RawFd> {
 }
 
 #[cfg(target_os = "linux")]
-fn memfd() -> std::io::Result<RawFd> {
-    // SAFETY: a NUL-terminated name and no flags (no close-on-exec: the
-    // next image reads it).
-    let fd = unsafe { libc::memfd_create(c"constellation-handoff".as_ptr(), 0) };
+fn memfd(name: &std::ffi::CStr, flags: libc::c_uint) -> std::io::Result<RawFd> {
+    // SAFETY: a NUL-terminated name; the handoff's flags are none (no
+    // close-on-exec: the next image reads it).
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -484,7 +503,7 @@ fn memfd() -> std::io::Result<RawFd> {
 /// In-place upgrade is Linux-only (`upgrade` refuses elsewhere); other
 /// hosts only type-check this module.
 #[cfg(not(target_os = "linux"))]
-fn memfd() -> std::io::Result<RawFd> {
+fn memfd(_name: &std::ffi::CStr, _flags: libc::c_uint) -> std::io::Result<RawFd> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "in-place upgrade is Linux-only",
@@ -532,11 +551,15 @@ fn exec_with(binary: &Path, handoff: &DaemonHandoff) -> std::io::Error {
     }
 }
 
-/// How long the old image waits for its log to reach the sink before the
-/// `exec`. The handover's gap is application-visible latency: a stalled sink
-/// may add at most this, and what it did not take is reported by the new
-/// image ([`UNWRITTEN_AT_EXEC_ENV`]).
-const EXEC_LOG_FLUSH: Duration = Duration::from_millis(200);
+/// How long the old image waits for its log to reach the sink before it
+/// freezes the writer for the `exec`. The handover's gap is application-visible
+/// latency. With the lossless carry (plan 44 W6) the wait no longer protects
+/// any line: what the sink has not taken goes to the new image whatever this
+/// is. It only lets a healthy sink catch up (a few milliseconds), so that the
+/// `exec'ing` line is in the file and the chunk in doubt, which the new image
+/// may write a second time, is rarer. A stalled sink will not take it in 200 ms
+/// either, so the wait is short.
+const EXEC_LOG_FLUSH: Duration = Duration::from_millis(20);
 
 /// How long an upgrade waits, before it detaches the views, for the log to
 /// reach its sink (see [`drain_log_before_detach`]).
@@ -548,32 +571,166 @@ fn drain_log_before_detach(drain: impl FnOnce(Duration) -> crate::log_buffer::Fl
     let _ = drain(UPGRADE_LOG_DRAIN);
 }
 
-/// Set by [`before_exec`] on the new image's environment: how many log lines
-/// the old image's writer had not written when it gave up waiting. The new
-/// image (`resume_main`) keeps it in `status`'s
-/// `log.unwritten_at_previous_exec` and logs one WARN. Not in the handoff:
-/// that format is not touched by plan 44.
+/// Set by [`before_exec`] on the new image's environment when the log could
+/// not be handed over ([`LOG_TAIL_FD_ENV`]: no memfd): how many log lines the
+/// old image's writer had not written. The new image counts them as dropped
+/// (`resume_main`) and warns once.
 const UNWRITTEN_AT_EXEC_ENV: &str = "CONSTELLATION_LOG_UNWRITTEN_AT_EXEC";
 
-/// Right before an `exec`: give the log `flush` (bounded to
-/// [`EXEC_LOG_FLUSH`]) to reach its sink, so the line that says what is
-/// being done is in the file before the image is replaced, and tell the new
-/// image what was left. The writer thread dies with the image; a line it had
-/// not written is lost, loudly (the new image's warning).
-fn before_exec(
-    command: &mut std::process::Command,
-    flush: impl FnOnce(Duration) -> crate::log_buffer::Flush,
-) {
-    let flushed = flush(EXEC_LOG_FLUSH);
-    if flushed.complete {
-        // This process's own environment may carry the previous image's.
-        command.env_remove(UNWRITTEN_AT_EXEC_ENV);
-    } else {
-        command.env(UNWRITTEN_AT_EXEC_ENV, flushed.unwritten_lines.to_string());
+/// Set by [`before_exec`] on the new image's environment, as `<fd>:<pid>`:
+/// the number of an inherited memfd holding the log the old image had not written
+/// ([`crate::log_buffer::ExecTail`]). The new image reads it right after it
+/// starts its writer, closes it, and writes those lines first, in order
+/// (plan 44 W6). Not in the handoff: that format is not touched by plan 44.
+/// An `exec` keeps the pid, so the image that finds its own pid there is the
+/// one it was meant for: a child process that inherited the variable ignores it
+/// (this crate does not change its environment, `clippy.toml`).
+const LOG_TAIL_FD_ENV: &str = "CONSTELLATION_LOG_TAIL_FD";
+
+/// What [`before_exec`] left in place: the writer is frozen, and the log's
+/// tail is in a memfd when there was anything to carry. [`ExecLog::finish`]
+/// brings the memfd up to date just before the `exec`; [`ExecLog::abort`]
+/// undoes everything when the `exec` did not happen.
+#[must_use]
+struct ExecLog {
+    tail_fd: Option<RawFd>,
+    frozen: bool,
+    /// What the freeze copied, and how many bytes of the memfd it took.
+    sent: crate::log_buffer::ExecTail,
+    end: u64,
+    /// Lines the new image was told (not carried) are lost.
+    told: u64,
+    store: fn(&[u8]) -> std::io::Result<RawFd>,
+}
+
+impl ExecLog {
+    /// The `exec` failed: the lines are still ours. Close the memfd and let
+    /// the writer go on (`unfreeze`).
+    fn abort(self, unfreeze: impl FnOnce()) {
+        if let Some(fd) = self.tail_fd {
+            // SAFETY: the descriptor `before_exec` created; the exec did not
+            // happen, so nothing else holds it.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        if self.frozen {
+            unfreeze();
+        }
+    }
+
+    /// The last step before the `exec`, in the thread that makes it: other
+    /// threads kept logging since the freeze, and the `exec` throws their
+    /// lines away. `update` returns what the log took in since
+    /// ([`crate::log_buffer::LogBuffer::exec_tail_update`]): those lines are
+    /// appended to the memfd (one is made when the freeze found nothing to
+    /// carry) and its header, the counters included, is rewritten; those that
+    /// do not fit its bound are counted lost in it. Where that fails the new
+    /// image is told how many were lost ([`UNWRITTEN_AT_EXEC_ENV`]). Then the
+    /// memfd stops being close-on-exec. Only a line logged after this is
+    /// lost, and nothing counts it: the few microseconds of the `exec` itself.
+    fn finish(
+        &mut self,
+        command: &mut std::process::Command,
+        update: impl FnOnce(&crate::log_buffer::ExecTail) -> crate::log_buffer::ExecTail,
+    ) {
+        if !self.frozen {
+            return;
+        }
+        let update = update(&self.sent);
+        let late = update.lines.len() as u64 + update.lost - self.sent.lost;
+        match self.tail_fd {
+            Some(fd) => {
+                if patch_log_tail(fd, self.end, &self.sent, &update).is_err() && late > 0 {
+                    command.env(UNWRITTEN_AT_EXEC_ENV, (self.told + late).to_string());
+                }
+            }
+            None if late > 0 => match (self.store)(&update.encode()) {
+                Ok(fd) => {
+                    command.env(LOG_TAIL_FD_ENV, format!("{fd}:{}", std::process::id()));
+                    self.tail_fd = Some(fd);
+                }
+                Err(_) => {
+                    command.env(UNWRITTEN_AT_EXEC_ENV, (self.told + late).to_string());
+                }
+            },
+            None => {}
+        }
+        if let Some(fd) = self.tail_fd {
+            // Now, and not at its creation: see `write_tail_memfd`.
+            let _ = set_cloexec(fd, false);
+        }
     }
 }
 
-/// `resume_main`'s side of [`before_exec`].
+/// Append what the log took in since the freeze to the memfd (`end` bytes are
+/// in it) and rewrite its header.
+fn patch_log_tail(
+    fd: RawFd,
+    end: u64,
+    sent: &crate::log_buffer::ExecTail,
+    update: &crate::log_buffer::ExecTail,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    // SAFETY: the memfd `before_exec` made; not closed here.
+    let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    if !update.lines.is_empty() {
+        file.write_all_at(&update.encode_lines(), end)?;
+    }
+    let header = update.encode_header(sent.lines.len() + update.lines.len());
+    file.write_all_at(&header, 0)
+}
+
+/// Right before an `exec`: give the log `flush` (bounded to
+/// [`EXEC_LOG_FLUSH`]) to reach its sink, so the line that says what is
+/// being done is in the file before the image is replaced. What is still
+/// unwritten then is **handed to the new image** (plan 44 W6): the writer is
+/// frozen (`freeze`: it takes nothing more, the chunk it is writing is in
+/// doubt), the lines are copied into a memfd by `store` (not in a `pre_exec`
+/// closure: nothing there may allocate), and the memfd's number goes into the
+/// new image's environment. Where that cannot be done (`store` fails: no
+/// memfd) the new image is told only how many lines are lost
+/// ([`UNWRITTEN_AT_EXEC_ENV`]) and counts them as dropped. The tail is at most
+/// the old queue's byte bound, so is the memfd. The writer is frozen even when
+/// the sink kept up: lines other threads log up to the `exec` are carried too
+/// ([`ExecLog::finish`]).
+fn before_exec(
+    command: &mut std::process::Command,
+    flush: impl FnOnce(Duration) -> crate::log_buffer::Flush,
+    freeze: impl FnOnce() -> crate::log_buffer::ExecTail,
+    store: fn(&[u8]) -> std::io::Result<RawFd>,
+) -> ExecLog {
+    let _ = flush(EXEC_LOG_FLUSH);
+    // This process's own environment may carry the previous image's.
+    command.env_remove(UNWRITTEN_AT_EXEC_ENV);
+    command.env_remove(LOG_TAIL_FD_ENV);
+    let sent = freeze();
+    let mut log = ExecLog {
+        tail_fd: None,
+        frozen: true,
+        end: 0,
+        told: 0,
+        store,
+        sent,
+    };
+    if log.sent.lines.is_empty() && log.sent.lost == 0 {
+        return log;
+    }
+    let encoded = log.sent.encode();
+    match store(&encoded) {
+        Ok(fd) => {
+            command.env(LOG_TAIL_FD_ENV, format!("{fd}:{}", std::process::id()));
+            log.tail_fd = Some(fd);
+            log.end = encoded.len() as u64;
+        }
+        Err(_) => {
+            log.told = log.sent.lines.len() as u64 + log.sent.lost;
+            command.env(UNWRITTEN_AT_EXEC_ENV, log.told.to_string());
+        }
+    }
+    log
+}
+
+/// `resume_main`'s side of [`before_exec`] when the log could not be handed
+/// over.
 fn note_unwritten_at_previous_exec(value: Option<&str>) {
     let Some(lines) = value.and_then(|v| v.parse::<u64>().ok()).filter(|n| *n > 0) else {
         return;
@@ -583,10 +740,85 @@ fn note_unwritten_at_previous_exec(value: Option<&str>) {
     crate::log_buffer::note_unwritten_at_exec(lines);
     tracing::warn!(
         lines,
-        "the previous image's log writer stopped waiting at its exec with {lines} line(s) unwritten \
-         (its log sink was stalled); counted as dropped. The count is taken when it stopped \
-         waiting: lines it logged afterwards are not in it, and its last write may have taken some"
+        "the previous image's log writer could not hand its log over at its exec: {lines} line(s) \
+         unwritten (its log sink was stalled); counted as dropped. The count is taken when it \
+         stopped waiting: lines it logged afterwards are not in it, and its last write may have \
+         taken some"
     );
+}
+
+/// The log tail an inherited memfd holds, and the descriptor closed. `Err`:
+/// the lines to count as lost: the header's, when it parses, else one. A
+/// descriptor that is not a memfd is left alone (a stale variable and a reused
+/// pid must not make this image read, block on or close somebody else's).
+fn read_log_tail(fd: RawFd) -> Result<crate::log_buffer::ExecTail, u64> {
+    let is_memfd = std::fs::read_link(format!("/proc/self/fd/{fd}")).is_ok_and(|target| {
+        // (`/memfd:<name> (deleted)`)
+        target
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .starts_with("memfd:")
+    });
+    if !is_memfd {
+        return Err(1);
+    }
+    // SAFETY: a memfd the previous image passed us, ours now.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut bytes = Vec::new();
+    if file.rewind().is_err() || file.read_to_end(&mut bytes).is_err() {
+        return Err(1);
+    }
+    crate::log_buffer::ExecTail::decode(&bytes).ok_or_else(|| {
+        crate::log_buffer::ExecTail::lines_in_header(&bytes)
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
+/// The descriptor [`LOG_TAIL_FD_ENV`] names for the process `pid`, if it is for
+/// it.
+fn parse_log_tail_env(value: &str, pid: u32) -> Option<RawFd> {
+    let (fd, for_pid) = value.split_once(':')?;
+    (for_pid.parse::<u32>().ok()? == pid).then(|| fd.parse().ok())?
+}
+
+/// The new image's side of the handed-over log (see [`LOG_TAIL_FD_ENV`]): to
+/// be called right after its writer starts, before it logs a line, so that
+/// the old image's lines are the first in the sink.
+pub(crate) fn adopt_log_tail_from_env() {
+    // `start_daemon_logging` runs more than once on some paths (the resumed
+    // daemon starts its writer in `main`, then again in `resume_main`): the
+    // memfd is read once, and its number may be somebody else's by the second
+    // call.
+    static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ADOPTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Some(fd) = std::env::var(LOG_TAIL_FD_ENV)
+        .ok()
+        .and_then(|v| parse_log_tail_env(&v, std::process::id()))
+    else {
+        return;
+    };
+    if fd <= 2 {
+        return;
+    }
+    // Not inherited by what this image spawns while it is still being read.
+    // SAFETY: `fcntl` on a descriptor of ours.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    match read_log_tail(fd) {
+        Ok(tail) => crate::log_buffer::adopt_process_exec_tail(tail),
+        Err(lines) => {
+            // Counted as dropped (status, /metrics, a summary line), where the
+            // log checks look.
+            crate::log_buffer::note_unwritten_at_exec(lines);
+            tracing::warn!(
+                lines,
+                "the log handed over by the previous image could not be read; its {lines} \
+                 line(s) are counted as dropped"
+            );
+        }
+    }
 }
 
 /// `exec` `binary` with `body` as its handoff, every descriptor it names
@@ -600,10 +832,29 @@ fn exec_body(binary: &Path, body: &[u8]) -> std::io::Error {
     command
         .arg0("constellation")
         .args(["daemon", "--resume-from", &memfd.to_string()]);
-    before_exec(&mut command, crate::log_buffer::flush_process);
-    let err = command.exec();
+    let err = exec_with_log(command, || {});
     // SAFETY: ours; the exec did not happen.
     drop(unsafe { OwnedFd::from_raw_fd(memfd) });
+    err
+}
+
+/// `exec` `command` with the log handed over (see [`before_exec`] and
+/// [`ExecLog::finish`]); `after_freeze` runs between the two (a test's other
+/// thread logs there). Returns only on failure, the log released again.
+fn exec_with_log(
+    mut command: std::process::Command,
+    after_freeze: impl FnOnce(),
+) -> std::io::Error {
+    let mut log = before_exec(
+        &mut command,
+        crate::log_buffer::flush_process,
+        crate::log_buffer::freeze_process_for_exec,
+        write_tail_memfd,
+    );
+    after_freeze();
+    log.finish(&mut command, crate::log_buffer::exec_tail_update_process);
+    let err = command.exec();
+    log.abort(crate::log_buffer::unfreeze_process);
     err
 }
 
@@ -800,7 +1051,7 @@ pub fn upgrade(node: &Arc<NodeRuntime>, binary: Option<&Path>) -> Result<String,
         None => return Err(state.fail("the daemon's executable is unknown".into())),
     };
     // The views are still served: let a stalled sink's backlog drain now, so
-    // the 200 ms flush right before the `exec`, which is inside the
+    // the short flush right before the `exec` (`EXEC_LOG_FLUSH`), inside the
     // application-visible gap, has only what is logged from here on to wait
     // for. Bounded, and not on a serving thread; before the floor wait below,
     // which must be the last wait before the detach (a gate or floor that
@@ -1662,50 +1913,53 @@ mod tests {
         assert_eq!(asked, Some(Duration::from_secs(2)));
     }
 
-    /// Plan 44 §4.4: right before the `exec` the old image gives its log a
-    /// bounded moment to reach the sink, and tells the new image what was
-    /// left. (The buffer is behind a gate that stays shut: a stalled disk.)
-    #[test]
-    fn before_exec_flushes_with_a_bound_and_reports_the_rest() {
-        use std::io::Write;
-        use std::sync::{Arc, Condvar, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
+    /// A sink behind a gate that stays shut (a stalled disk), and what it got.
+    struct Stalled {
+        gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        got: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
 
-        struct Gate(Arc<(Mutex<bool>, Condvar)>);
-        impl Write for Gate {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                // Bounded: a failing test must not hang the test binary.
-                let (open, timeout) = self
-                    .0
-                     .1
-                    .wait_timeout_while(
-                        self.0 .0.lock().unwrap(),
-                        std::time::Duration::from_secs(30),
-                        |open| !*open,
-                    )
-                    .unwrap();
-                if timeout.timed_out() && !*open {
-                    return Err(std::io::ErrorKind::TimedOut.into());
-                }
-                drop(open);
-                Ok(bytes.len())
+    impl std::io::Write for Stalled {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // Bounded: a failing test must not hang the test binary.
+            let (open, timeout) = self
+                .gate
+                .1
+                .wait_timeout_while(
+                    self.gate.0.lock().unwrap(),
+                    Duration::from_secs(30),
+                    |open| !*open,
+                )
+                .unwrap();
+            if timeout.timed_out() && !*open {
+                return Err(std::io::ErrorKind::TimedOut.into());
             }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+            drop(open);
+            self.got.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
         }
-        let env_of = |command: &std::process::Command| {
-            command
-                .get_envs()
-                .find(|(name, _)| *name == UNWRITTEN_AT_EXEC_ENV)
-                .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
-        };
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    type Gate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    type Got = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+    /// A buffer whose sink is stalled, with five lines logged behind it.
+    fn stalled_buffer() -> (crate::log_buffer::LogBuffer, Gate, Got) {
+        use std::io::Write;
+        use tracing_subscriber::fmt::MakeWriter;
+        let gate: Gate = Default::default();
+        let got: Got = Default::default();
         let buffer = crate::log_buffer::LogBuffer::default();
         buffer
             .start(
                 crate::log_buffer::QueueConfig::with_limit(1 << 20),
-                Box::new(Gate(gate.clone())),
+                Box::new(Stalled {
+                    gate: gate.clone(),
+                    got: got.clone(),
+                }),
             )
             .unwrap();
         for i in 0..5 {
@@ -1714,22 +1968,341 @@ mod tests {
                 .write_all(format!("line {i}\n").as_bytes())
                 .unwrap();
         }
-        let mut command = std::process::Command::new("true");
-        let started = std::time::Instant::now();
-        before_exec(&mut command, |within| buffer.flush(within));
-        let took = started.elapsed();
-        assert!(
-            took >= Duration::from_millis(200) && took < Duration::from_millis(450),
-            "{took:?}"
-        );
-        assert_eq!(env_of(&command), Some(Some("5".to_string())));
+        // Wait for the writer to have a chunk in its (stalled) write.
+        std::thread::sleep(Duration::from_millis(50));
+        (buffer, gate, got)
+    }
 
-        // An open sink: nothing is left, and the variable the previous image
-        // set (this process's own environment) is taken away.
+    fn open(gate: &Gate) {
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
+    }
+
+    fn cloexec(fd: RawFd) -> bool {
+        // SAFETY: F_GETFD on a descriptor number.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "fd {fd} is not open");
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    fn env_of(command: &std::process::Command, name: &str) -> Option<Option<String>> {
+        command
+            .get_envs()
+            .find(|(n, _)| *n == name)
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    /// Plan 44 W6: right before the `exec` the old image gives its log a
+    /// bounded moment to reach the sink, and **hands the rest to the new
+    /// image** in an inherited memfd (before, it told the new image how many
+    /// lines it had lost). The writer is frozen meanwhile; when the `exec`
+    /// fails the lines are still ours and the writer goes on.
+    #[test]
+    fn before_exec_hands_the_unwritten_log_to_the_next_image() {
+        let (buffer, gate, got) = stalled_buffer();
         let mut command = std::process::Command::new("true");
-        before_exec(&mut command, |within| buffer.flush(within));
-        assert_eq!(env_of(&command), Some(None));
+        let started = std::time::Instant::now();
+        let mut log = before_exec(
+            &mut command,
+            |within| buffer.flush(within),
+            || buffer.freeze_for_exec(),
+            write_tail_memfd,
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= EXEC_LOG_FLUSH && took < EXEC_LOG_FLUSH + Duration::from_millis(500),
+            "{took:?}"
+        );
+        assert_eq!(env_of(&command, UNWRITTEN_AT_EXEC_ENV), Some(None));
+        let fd = env_of(&command, LOG_TAIL_FD_ENV)
+            .flatten()
+            .expect("the memfd's number");
+        let fd = parse_log_tail_env(&fd, std::process::id()).expect("our fd");
+        assert_eq!(parse_log_tail_env(&format!("{fd}:1"), 2), None);
+        assert_eq!(parse_log_tail_env("7", 2), None);
+        assert_eq!(Some(fd), log.tail_fd);
+        // Close-on-exec until the last moment: a child another thread spawns
+        // meanwhile does not inherit it.
+        assert!(cloexec(fd), "the tail memfd is close-on-exec until finish");
+        // Frozen: a line another thread logs now is not in the freeze's copy
+        // and would be thrown away with the old image.
+        {
+            use std::io::Write;
+            use tracing_subscriber::fmt::MakeWriter;
+            buffer.make_writer().write_all(b"line 5\n").unwrap();
+        }
+        log.finish(&mut command, |sent| buffer.exec_tail_update(sent));
+        assert!(!cloexec(fd), "finish lifts it for the exec");
+        // The new image reads (and closes) it: every line, in order, the one
+        // being written first and in doubt, and the late line last.
+        // SAFETY: a duplicate, so that this test can read the memfd twice.
+        let copy = unsafe { libc::dup(fd) };
+        let tail = read_log_tail(copy).expect("a tail");
+        let lines: Vec<&str> = tail.lines.iter().map(|l| &**l).collect();
+        assert_eq!(
+            lines,
+            ["line 0", "line 1", "line 2", "line 3", "line 4", "line 5"]
+        );
+        assert!((1..=5).contains(&tail.in_doubt), "{}", tail.in_doubt);
+        assert_eq!(tail.lost, 0);
+        // The exec failed: the memfd is closed, the writer goes on, and the
+        // sink gets everything, once.
+        log.abort(|| buffer.unfreeze());
+        // SAFETY: querying a descriptor that must be closed now.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        open(&gate);
+        assert!(buffer.flush(Duration::from_secs(5)).complete);
+        assert_eq!(
+            String::from_utf8_lossy(&got.lock().unwrap()),
+            "line 0\nline 1\nline 2\nline 3\nline 4\nline 5\n"
+        );
+    }
+
+    /// Where the memfd cannot be made, the old behaviour stands: the new image
+    /// is told how many lines are lost.
+    #[test]
+    fn before_exec_falls_back_to_a_counted_loss_without_a_memfd() {
+        let (buffer, gate, got) = stalled_buffer();
+        let mut command = std::process::Command::new("true");
+        let mut log = before_exec(
+            &mut command,
+            |within| buffer.flush(within),
+            || buffer.freeze_for_exec(),
+            |_| Err(std::io::Error::other("no memfd")),
+        );
+        assert_eq!(env_of(&command, LOG_TAIL_FD_ENV), Some(None));
+        assert_eq!(
+            env_of(&command, UNWRITTEN_AT_EXEC_ENV),
+            Some(Some("5".to_string()))
+        );
+        assert!(log.tail_fd.is_none());
+        // Lines logged after the freeze are counted too (the memfd that would
+        // carry them cannot be made either).
+        {
+            use std::io::Write;
+            use tracing_subscriber::fmt::MakeWriter;
+            buffer.make_writer().write_all(b"late 0\nlate 1\n").unwrap();
+        }
+        log.finish(&mut command, |sent| buffer.exec_tail_update(sent));
+        assert_eq!(
+            env_of(&command, UNWRITTEN_AT_EXEC_ENV),
+            Some(Some("7".to_string())),
+            "the five the freeze found and the two logged after it"
+        );
+        log.abort(|| buffer.unfreeze());
+        open(&gate);
+        assert!(buffer.flush(Duration::from_secs(5)).complete);
+        assert_eq!(
+            got.lock().unwrap().iter().filter(|b| **b == b'\n').count(),
+            7
+        );
+    }
+
+    /// Nothing is left (the sink kept up): nothing is handed over, and what a
+    /// previous image set (this process's own environment) is taken away. The
+    /// writer is frozen all the same: lines other threads log up to the `exec`
+    /// are carried.
+    #[test]
+    fn before_exec_hands_over_nothing_when_the_log_is_written() {
+        let (buffer, gate, _got) = stalled_buffer();
+        open(&gate);
+        let mut command = std::process::Command::new("true");
+        let mut log = before_exec(
+            &mut command,
+            |within| buffer.flush(within),
+            || buffer.freeze_for_exec(),
+            |_| panic!("nothing to store"),
+        );
+        assert!(log.tail_fd.is_none() && log.frozen);
+        log.finish(&mut command, |sent| buffer.exec_tail_update(sent));
+        assert!(log.tail_fd.is_none());
+        assert_eq!(env_of(&command, UNWRITTEN_AT_EXEC_ENV), Some(None));
+        assert_eq!(env_of(&command, LOG_TAIL_FD_ENV), Some(None));
+        log.abort(|| buffer.unfreeze());
+    }
+
+    /// The sink kept up, so the freeze found nothing, but another thread logs
+    /// after it: `finish` makes the memfd then (R3-1: before, those lines went
+    /// with the old image, uncounted).
+    #[test]
+    fn lines_logged_after_the_freeze_of_a_written_log_are_carried() {
+        let (buffer, gate, _got) = stalled_buffer();
+        open(&gate);
+        let mut command = std::process::Command::new("true");
+        let mut log = before_exec(
+            &mut command,
+            |within| buffer.flush(within),
+            || buffer.freeze_for_exec(),
+            write_tail_memfd,
+        );
+        assert!(log.tail_fd.is_none());
+        {
+            use std::io::Write;
+            use tracing_subscriber::fmt::MakeWriter;
+            buffer.make_writer().write_all(b"late 0\nlate 1\n").unwrap();
+        }
+        log.finish(&mut command, |sent| buffer.exec_tail_update(sent));
+        let fd = log.tail_fd.expect("a memfd made at the last moment");
+        assert!(!cloexec(fd));
+        let env = env_of(&command, LOG_TAIL_FD_ENV).flatten().expect("env");
+        assert_eq!(parse_log_tail_env(&env, std::process::id()), Some(fd));
+        let tail = read_log_tail(fd).expect("a tail");
+        let lines: Vec<&str> = tail.lines.iter().map(|l| &**l).collect();
+        assert_eq!(lines, ["late 0", "late 1"]);
+        assert_eq!((tail.lost, tail.in_doubt), (0, 0));
+        // (the descriptor was closed by the read)
+        buffer.unfreeze();
+    }
+
+    /// The tail survives the memfd, whole; what is not a tail is counted, and
+    /// a descriptor that is not a memfd is not touched (R3-2).
+    #[test]
+    fn a_log_tail_round_trips_through_a_memfd() {
+        let tail = crate::log_buffer::ExecTail {
+            lines: vec!["a".into(), "bb".into(), "ccc".into()],
+            in_doubt: 2,
+            lost: 4,
+            dropped_lines: 5,
+            dropped_bytes: 60,
+            drop_episodes: 1,
+            sink_errors: 2,
+        };
+        let fd = write_memfd(&tail.encode()).unwrap();
+        assert_eq!(read_log_tail(fd), Ok(tail.clone()));
+        // Not a tail at all: one line counted (and the memfd closed).
+        let fd = write_memfd(b"not a tail").unwrap();
+        assert_eq!(read_log_tail(fd), Err(1));
+        // SAFETY: a closed descriptor must answer EBADF.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        // A header that parses over a truncated body: the lines it names are
+        // counted (3 held and 4 lost).
+        let mut bytes = tail.encode();
+        bytes.truncate(bytes.len() - 2);
+        let fd = write_memfd(&bytes).unwrap();
+        assert_eq!(read_log_tail(fd), Err(7));
+        // A pipe (a stale variable, a reused pid): left open and unread.
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: two descriptors for the pipe.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        assert_eq!(read_log_tail(ends[0]), Err(1));
+        // SAFETY: still open: the check is how it was found out.
+        assert!(unsafe { libc::fcntl(ends[0], libc::F_GETFD) } >= 0);
+        // SAFETY: the pipe's own descriptors.
+        unsafe {
+            libc::close(ends[0]);
+            libc::close(ends[1]);
+        }
+    }
+
+    const EXEC_CHILD: &str = "CST_P44_EXEC_CHILD";
+    const STORM_OLD: &str =
+        "handover::tests::a_storm_from_another_thread_across_the_exec_is_carried_whole";
+    const STORM_NEW: &str = "handover::tests::the_new_image_of_the_storm_test";
+
+    /// The second image of the storm test: adopts what the first carried and
+    /// flushes it (a test run on its own does nothing).
+    #[test]
+    fn the_new_image_of_the_storm_test() {
+        if std::env::var(EXEC_CHILD).as_deref() != Ok("new") {
+            return;
+        }
+        let buffer = crate::log_buffer::LogBuffer::default();
+        crate::start_daemon_logging(&buffer);
+        let done = buffer.flush(Duration::from_secs(10)).complete;
+        std::process::exit(if done { 0 } else { 3 });
+    }
+
+    /// R3-1 across a real `exec`: a thread logs numbered lines without a pause
+    /// while the old image freezes, and goes on for 100 ms after the freeze;
+    /// the image `exec`s a second one that adopts the tail. Every line logged
+    /// before the thread was stopped is in the file, none missing, in order
+    /// (the chunk in doubt may appear twice).
+    #[test]
+    fn a_storm_from_another_thread_across_the_exec_is_carried_whole() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use tracing_subscriber::fmt::MakeWriter;
+        match std::env::var(EXEC_CHILD).as_deref() {
+            Ok("old") => {
+                let buffer = crate::log_buffer::LogBuffer::default();
+                crate::start_daemon_logging(&buffer);
+                let stop = std::sync::Arc::new(AtomicBool::new(false));
+                let logged = std::sync::Arc::new(AtomicU64::new(0));
+                let storm = {
+                    let (buffer, stop, logged) = (buffer.clone(), stop.clone(), logged.clone());
+                    std::thread::spawn(move || {
+                        let mut n = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            buffer
+                                .make_writer()
+                                .write_all(format!("storm {n}\n").as_bytes())
+                                .unwrap();
+                            n += 1;
+                            logged.store(n, Ordering::Relaxed);
+                            std::thread::sleep(Duration::from_micros(30));
+                        }
+                    })
+                };
+                std::thread::sleep(Duration::from_millis(150));
+                let results = std::env::var("CST_P44_RESULTS").unwrap();
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", STORM_NEW, "--nocapture"])
+                    .env(EXEC_CHILD, "new");
+                let err = exec_with_log(command, || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    stop.store(true, Ordering::Relaxed);
+                    storm.join().unwrap();
+                    std::fs::write(&results, logged.load(Ordering::Relaxed).to_string()).unwrap();
+                });
+                eprintln!("the exec failed: {err}");
+                std::process::exit(2);
+            }
+            Ok(_) => return,
+            Err(_) => {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // The first write stalls, so a backlog builds behind it.
+        let fault = dir.path().join("stall");
+        std::fs::write(&fault, "300 once").unwrap();
+        let log = std::fs::File::create(dir.path().join("stderr.log")).unwrap();
+        let results = dir.path().join("results");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", STORM_OLD, "--nocapture"])
+            .env(EXEC_CHILD, "old")
+            .env("CST_P44_RESULTS", &results)
+            .env("CONSTELLATION_FAULT_LOG_STALL_FILE", &fault)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .status()
+            .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("stderr.log")).unwrap();
+        assert!(status.success(), "{status}: {text}");
+        let logged: u64 = std::fs::read_to_string(&results).unwrap().parse().unwrap();
+        assert!(logged > 100, "the storm logged {logged} lines");
+        let mut seen = std::collections::BTreeSet::new();
+        let mut last = None;
+        for line in text.lines() {
+            if let Some(n) = line
+                .strip_prefix("storm ")
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                // In order, repeats only of the chunk in doubt.
+                assert!(last.is_none_or(|l| n <= l + 1), "storm {n} after {last:?}");
+                last = Some(last.map_or(n, |l: u64| l.max(n)));
+                seen.insert(n);
+            }
+        }
+        let missing: Vec<u64> = (0..logged).filter(|n| !seen.contains(n)).take(5).collect();
+        assert!(
+            missing.is_empty(),
+            "of {logged} lines logged lines are missing, from {missing:?}"
+        );
+        assert!(
+            text.contains("unwritten at the previous image's exec"),
+            "{text}"
+        );
+        assert!(!text.contains("log lines dropped"));
     }
 }
