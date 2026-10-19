@@ -279,6 +279,15 @@ pub enum SyncRequest {
         through: u64,
         refused: bool,
     },
+    /// The off-core lane sent a delegation renewal (urgent lane, ahead of
+    /// its answer: [`Event::DelegRenewSentOffCore`]).
+    DelegRenewSentOffCore {
+        gen: u64,
+        round: u64,
+        to: u64,
+        req_id: u64,
+        sent: i64,
+    },
     /// Plan 30 §M11, one way: a delegate's renewal. The core answers
     /// with its own `DelegRenewed`.
     PeerDelegRenew {
@@ -292,6 +301,22 @@ pub enum SyncRequest {
         /// it sent the renewal (its clock).
         stream_head: u64,
         stream_head_at: i64,
+    },
+    /// One way: a delegate's off-core renewal (no backup, no head:
+    /// `PeerMsg::DelegRenewOffCore`). The core answers with its own
+    /// `DelegRenewed`.
+    PeerDelegRenewOffCore {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        round: u64,
+    },
+    /// The off-core lane's request `req_id` to `to` failed at the transport
+    /// (urgent lane, behind its registration): the core takes it off its
+    /// pending renewals (`Event::PeerFailed`).
+    DelegRenewOffCoreFailed {
+        to: u64,
+        req_id: u64,
     },
     /// Plan 30 §M11, one way: the root's answer to this delegate's
     /// renewal: the ttl (0: refused) and (§M14) the root's lock grants

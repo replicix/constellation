@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// A node's tap on the messages it receives (see [`Bus::taps`]).
+pub type Tap = Arc<dyn Fn(NodeId, &PeerMsg) + Send + Sync>;
+
 pub struct Bus {
     rng: Mutex<StdRng>,
     delay: (u64, u64),
@@ -33,6 +36,10 @@ pub struct Bus {
     /// Ordered: `broadcast` draws one delay per recipient from the seeded
     /// rng, so recipient order must be the same on every replay.
     senders: Mutex<BTreeMap<NodeId, mpsc::UnboundedSender<Event>>>,
+    /// What a node's P2P service sees of a message as it arrives, before the
+    /// node's driver queue (the daemon's handlers run off the core): the
+    /// off-core renewal lane's tap on the root's answers.
+    taps: Mutex<BTreeMap<NodeId, Tap>>,
     /// Plan 30 M0's `CONSTELLATION_FAULT_FORWARD_REPLY_DELAY_MS`: extra
     /// delay on a holder's `MutateReply`s, per sender.
     reply_delay: Mutex<HashMap<NodeId, u64>>,
@@ -75,6 +82,7 @@ impl Bus {
             partitions: Mutex::new(HashSet::new()),
             dead: Mutex::new(HashSet::new()),
             senders: Mutex::new(BTreeMap::new()),
+            taps: Mutex::new(BTreeMap::new()),
             reply_delay: Mutex::new(HashMap::new()),
             deleg_answer_delay: Mutex::new((0, 0)),
             sent: Mutex::new(0),
@@ -123,6 +131,11 @@ impl Bus {
     pub fn attach(&self, node: NodeId, tx: mpsc::UnboundedSender<Event>) {
         self.senders.lock().unwrap().insert(node, tx);
         self.dead.lock().unwrap().remove(&node);
+    }
+
+    /// Replace `node`'s tap (see [`Bus::taps`]).
+    pub fn set_tap(&self, node: NodeId, tap: Tap) {
+        self.taps.lock().unwrap().insert(node, tap);
     }
 
     pub fn detach(&self, node: NodeId) {
@@ -226,6 +239,10 @@ impl Bus {
             if deliverable {
                 let tx = bus.senders.lock().unwrap().get(&to).cloned();
                 if let Some(tx) = tx {
+                    let tap = bus.taps.lock().unwrap().get(&to).cloned();
+                    if let Some(tap) = tap {
+                        tap(from, &msg);
+                    }
                     let _ = tx.send(Event::Peer { from, msg });
                     return;
                 }

@@ -1370,6 +1370,13 @@
           },
           "type": "array"
         },
+        "grants_lost": {
+          "default": 0,
+          "description": "Every delegation this node lost (a lapse, a refusal after the grant\nran out, the log ending the generation after it ran out): the two\nclassified counts above are a part of it; the rest is unexplained.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "inherited": {
           "format": "uint64",
           "minimum": 0,
@@ -1406,6 +1413,39 @@
         },
         "lapsed": {
           "description": "Grants this delegate gave up unrenewed past the root's reclaim\nhorizon (the root dead or cut off).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapses_during_freeze": {
+          "default": 0,
+          "description": "Delegations this node lost (a lapse, or a refusal after the grant ran\nout) while its off-core heartbeat thread was frozen across the time\nfrom the renewal's due time to the loss: the whole process did not\nrun, and nothing in it could renew. Counted apart from `lapsed`; the\nlength (ms) and generation of the latest.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lapses_root_silent": {
+          "default": 0,
+          "description": "Delegations this node lost (a lapse, or the log ending the generation\nafter its grant ran out) while a renewal it had sent in time to save\nthem was unanswered: the root did not answer within the grant, its\ncore being stuck (the root answers renewals from its core).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_freeze_gen": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_freeze_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_silent_gen": {
+          "default": 0,
+          "description": "The generation of the latest of those.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1580,6 +1620,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "renewals_off_core": {
+          "description": "Renewals this delegate's off-core lane sent while its core was\nstuck in a step (answered ones count as late answers, from their\nown send): each one a grant a stalled core would have lost.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "renewals_refused": {
           "format": "uint64",
           "minimum": 0,
@@ -1648,6 +1694,7 @@
         "stream_refused",
         "renewals",
         "renewals_refused",
+        "renewals_off_core",
         "recalls_received",
         "delegated",
         "appended_txs",

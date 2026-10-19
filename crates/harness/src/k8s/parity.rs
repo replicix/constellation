@@ -554,6 +554,13 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         Skip::Local(&[STOP, "turns backups off (CONSTELLATION_BACKUP_RTT_BUDGET_MS)"]),
     ),
     ("delegate-handoff-renewal", Skip::Local(&[UPGRADE])),
+    (
+        "delegate-store-stall",
+        Skip::Local(&[
+            "holds one caller's metadata write with a fault hook (CONSTELLATION_FAULT_STORE_STALL_FILE)",
+            "shortens the grant TTL (CONSTELLATION_DELEGATION_TTL_MS)",
+        ]),
+    ),
     ("delegate-backup-handoff-failover", Skip::Local(&[UPGRADE, KILL])),
     (
         "auto-placement",

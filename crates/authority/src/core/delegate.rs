@@ -186,6 +186,26 @@ pub(crate) struct DelegateState {
     /// When this node installed the generation: a grant it never got
     /// renewed lapses counting from here (`deleg_lapse_at`).
     pub installed: Ms,
+    /// The latest renewal of this generation known to have gone out: one
+    /// of the core's that was answered (its send time), or one registered
+    /// from the off-core lane ([`Core::on_deleg_renew_sent_off_core`]);
+    /// `Ms(0)`: none yet. Not a renewal the core only decided on: the
+    /// action that sends it may still wait behind a blocking one in the
+    /// same step (the driver notes the dispatched ones, `OffCore`). The
+    /// lane's next renewal is due a period after the later of the two.
+    pub last_renew_sent: Ms,
+    /// The send time of the latest renewal of this generation that was
+    /// *answered* with a grant (the core's, or a lane's counted as a late
+    /// answer): `Ms(0)`: none. The renewal after it falls due a period on,
+    /// and that is the due time a loss is judged from
+    /// ([`Core::deleg_loss_due`]); `last_renew_sent` also moves with the
+    /// lane's unanswered registrations, which postpone only the lane.
+    pub answered_sent: Ms,
+    /// The period the core renews at (`on_deleg_renewed` arms its next
+    /// timer so: a quarter of the ttl while the generation has lock
+    /// grants out, else half); `0` before the first answer, when the
+    /// request timeout is the period.
+    pub renew_period_ms: u64,
     /// The lapse watch (`on_deleg_lapse`), re-armed by every renewal.
     pub lapse_timer: Option<TimerId>,
     /// The grant lapsed unrenewed (`on_deleg_lapse`): nothing executes
@@ -259,6 +279,36 @@ struct LateReq {
     sent: Ms,
 }
 
+/// What the off-core renewal lane (`crate::deleg_lane`) needs to renew one
+/// generation of this node's while the core is stuck in a step: published
+/// after every step ([`Core::deleg_renew_certs`]), so it is the state at
+/// the end of the last finished step, never newer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegRenewCert {
+    pub gen: u64,
+    /// The root the generation renews with, and the stream round it is in.
+    pub root: NodeId,
+    pub round: u64,
+    /// When the next renewal is due: a period after the latest one known
+    /// to have gone out and been answered or registered (the install,
+    /// before the first). The driver adds the core's dispatched sends.
+    pub next_due: Ms,
+    pub period_ms: u64,
+}
+
+/// Who sent a renewal the root is answering ([`Core::on_deleg_renew`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenewFrom {
+    /// The delegate's core: its backup, and (noted by the caller before
+    /// this) the stream head it executed by the time it sent.
+    Core { backup: Option<NodeId> },
+    /// The delegate's off-core lane (`crate::deleg_lane`): the core was
+    /// stuck, and the lane knows neither its head nor its current backup.
+    /// The root extends the grant, answers as for any renewal, and learns
+    /// nothing from it about the delegate's stream or backup.
+    OffCore,
+}
+
 /// How long a late answer is still used ([`LateReq`]).
 const LATE_ANSWER_MS: i64 = 60_000;
 
@@ -295,6 +345,9 @@ impl DelegationState {
 /// not named yet is remembered ([`DelegationState::handed_back`]).
 const HANDED_BACK_UNSEEN_MS: i64 = 60_000;
 
+/// How many freezes [`DelegationState::freezes`] keeps.
+const FREEZES_KEPT: usize = 8;
+
 #[derive(Debug, Default)]
 pub(crate) struct DelegationState {
     /// Plan 41 L0: this tenure took an unexpired lease over (a seal, or
@@ -317,6 +370,9 @@ pub(crate) struct DelegationState {
     /// waiting for: their answer may still come, and is used when it does
     /// (`LateReq`).
     late: BTreeMap<OpId, LateReq>,
+    /// The latest freezes of the heartbeat thread handed over
+    /// (`Event::OwnFreeze`), oldest first, at most [`FREEZES_KEPT`].
+    freezes: Vec<(Ms, Ms)>,
     /// Local ops whose execution waits for a recall or for `deps` (their
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
@@ -514,6 +570,9 @@ impl Core {
                     renew: None,
                     renew_timer: None,
                     installed: now,
+                    last_renew_sent: Ms(0),
+                    answered_sent: Ms(0),
+                    renew_period_ms: 0,
                     lapse_timer: None,
                     lapsed: false,
                     parked: Vec::new(),
@@ -645,13 +704,23 @@ impl Core {
         self.deleg_after_event(now, replica, out);
     }
 
-    fn drop_delegate_state(
+    pub(crate) fn drop_delegate_state(
         &mut self,
         now: Ms,
         gen: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
+        // The log ended the generation (the root's reclaim, a recall's record)
+        // before this node's own lapse watch or a refusal did: a grant that
+        // had already run out is a grant lost, counted as one in a freeze
+        // if one explains it. A recalled or refused generation (`stopped`),
+        // and one already counted at its lapse (`lapsed`), are not.
+        if self.dl.mine.get(&gen).is_some_and(|d| {
+            !d.lapsed && !d.stopped && !d.designated && now >= self.deleg_lapse_at(d)
+        }) {
+            self.deleg_note_loss(gen, true);
+        }
         let Some(d) = self.dl.mine.remove(&gen) else {
             return;
         };
@@ -2033,6 +2102,13 @@ impl Core {
         req: OpId,
         out: &mut Vec<Action>,
     ) -> bool {
+        // The off-core lane's request failed at the transport (the
+        // heartbeat thread tells the core on the urgent lane, behind the
+        // lane's own registration): it is not pending any more, and a loss
+        // is not to be put down to a root that never answered it.
+        if req.0 & crate::deleg_lane::LANE_REQ_BIT != 0 {
+            return self.dl.late.remove(&req).is_some();
+        }
         let Some((gen, kind)) = self.dl.by_req.remove(&req) else {
             return false;
         };
@@ -2188,7 +2264,10 @@ impl Core {
         self.deleg_lapsed_retry(now, gen, out);
     }
 
-    /// Root side: grant (or refuse) a renewal.
+    /// Root side: grant (or refuse) a renewal. `backup`: the delegate's
+    /// backup as its core names it ([`RenewFrom::Core`]), or the off-core
+    /// lane's renewal ([`RenewFrom::OffCore`]), which carries neither a
+    /// backup nor a stream head and so extends the grant and nothing else.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_renew(
         &mut self,
@@ -2197,7 +2276,7 @@ impl Core {
         req: OpId,
         gen: u64,
         round: u64,
-        backup: Option<NodeId>,
+        source: RenewFrom,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2229,8 +2308,15 @@ impl Core {
                         }
                         g.renewed_until = g.renewed_until.max(until);
                     }
-                    if g.backup != backup {
-                        g.backup = backup;
+                    // The backup is the delegate's core's to name: the
+                    // lane's certificate can be a step old, and a root that
+                    // took a stale `None` (or the previous backup) would
+                    // not seal the one the core chose and clients were
+                    // acknowledged by.
+                    if let RenewFrom::Core { backup } = source {
+                        if g.backup != backup {
+                            g.backup = backup;
+                        }
                     }
                 }
             }
@@ -2415,12 +2501,16 @@ impl Core {
             self.arm_deleg_lapse(now, gen, out);
             return;
         }
+        let (dir, until_ms) = (d.dir, d.until.0);
+        let (frozen, root_silent) = self.deleg_note_loss(gen, true);
         tracing::warn!(
             node = self.me(),
             gen,
-            dir = d.dir,
+            dir,
             root = self.root_node().unwrap_or(0),
-            until_ms = d.until.0,
+            until_ms,
+            frozen,
+            root_silent,
             "delegation lapsed unrenewed past the root's earliest reclaim: \
              releasing its parked ops, still renewing"
         );
@@ -2453,6 +2543,237 @@ impl Core {
             out,
         );
         self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
+    }
+
+    /// What the off-core lane may renew while the core is stuck: one
+    /// certificate per generation of this node's that executes and renews
+    /// (not stopped, not a designation) with a root that is known and is
+    /// not this node. The lane only *sends* from them
+    /// ([`Core::on_deleg_renew_sent_off_core`]); nothing here is the grant,
+    /// the backup or the stream head: the lane's renewal carries none of
+    /// them ([`RenewFrom::OffCore`]).
+    pub fn deleg_renew_certs(&self) -> Vec<DelegRenewCert> {
+        self.deleg_renew_cert_iter().collect()
+    }
+
+    /// Whether [`Core::deleg_renew_certs`] would differ from `published`:
+    /// compared in place, nothing allocated (the driver asks after every
+    /// step, and a delegate's certificates change a few times a minute).
+    pub fn deleg_renew_certs_differ(&self, published: &[DelegRenewCert]) -> bool {
+        let mut now = self.deleg_renew_cert_iter();
+        for p in published {
+            if now.next().as_ref() != Some(p) {
+                return true;
+            }
+        }
+        now.next().is_some()
+    }
+
+    fn deleg_renew_cert_iter(&self) -> impl Iterator<Item = DelegRenewCert> + '_ {
+        let root = self.root_node();
+        let timeout = self.deleg_request_timeout_ms();
+        self.dl
+            .mine
+            .values()
+            .filter(move |d| root.is_some() && !d.stopped && !d.designated)
+            .map(move |d| {
+                let (next_due, period_ms) = Self::deleg_next_renewal(d, timeout);
+                DelegRenewCert {
+                    gen: d.gen,
+                    root: root.expect("filtered"),
+                    round: d.stream_round,
+                    next_due,
+                    period_ms,
+                }
+            })
+    }
+
+    /// When generation `d`'s next renewal falls due, and the period: a
+    /// period after the latest renewal known to have gone out (the install,
+    /// before the first), the period the core renews at (the request
+    /// timeout before the first answer).
+    fn deleg_next_renewal(d: &DelegateState, request_timeout_ms: u64) -> (Ms, u64) {
+        let period = if d.renew_period_ms > 0 {
+            d.renew_period_ms
+        } else {
+            request_timeout_ms
+        };
+        let base = if d.last_renew_sent.0 > 0 {
+            d.last_renew_sent
+        } else {
+            d.installed
+        };
+        (base.plus(period), period)
+    }
+
+    /// The heartbeat thread was frozen from `from` to `until`
+    /// ([`Event::OwnFreeze`]); the same freeze, grown, replaces the last.
+    pub(crate) fn on_own_freeze(&mut self, from: Ms, until: Ms) {
+        if until <= from {
+            return;
+        }
+        let f = &mut self.dl.freezes;
+        match f.last_mut() {
+            Some((a, b)) if *a == from => *b = (*b).max(until),
+            _ => f.push((from, until)),
+        }
+        if f.len() > FREEZES_KEPT {
+            f.remove(0);
+        }
+    }
+
+    /// When the renewal that would have saved generation `d`'s grant fell
+    /// due: a period after the latest renewal *answered* (the install,
+    /// before the first). Not [`Core::deleg_next_renewal`]'s, which the lane's
+    /// unanswered registrations push out.
+    fn deleg_loss_due(d: &DelegateState, request_timeout_ms: u64) -> Ms {
+        let period = if d.renew_period_ms > 0 {
+            d.renew_period_ms
+        } else {
+            request_timeout_ms
+        };
+        let base = if d.answered_sent.0 > 0 {
+            d.answered_sent
+        } else {
+            d.installed
+        };
+        base.plus(period)
+    }
+
+    /// This node gave up its grant of `gen` (a lapse, a refusal or the log's
+    /// end of the generation after the grant ran out): count the loss, and
+    /// say what explains it, apart from the plain counters.
+    ///
+    /// - `lapses_during_freeze` if a freeze of the heartbeat thread covers
+    ///   the time from the renewal's due time to the point the grant ran out
+    ///   (`deleg_lapse_at`, the root's earliest reclaim): nothing in the
+    ///   process could renew, so the loss is neither the lane's nor the
+    ///   core's;
+    /// - else, if `silent_allowed`, `lapses_root_silent` if a renewal sent
+    ///   by the time the lane would have acted (a due time plus
+    ///   [`FREEZE_REACTION_MS`](crate::deleg_lane::FREEZE_REACTION_MS), the
+    ///   freeze's own rule) was never answered: the root, which answers
+    ///   renewals from its core, did not answer within the grant. A renewal
+    ///   sent later than that, or none, is the lane's or the core's failure
+    ///   and is counted in neither.
+    ///
+    /// `(frozen, silent)`.
+    fn deleg_note_loss(&mut self, gen: u64, silent_allowed: bool) -> (bool, bool) {
+        let Some(d) = self.dl.mine.get(&gen) else {
+            return (false, false);
+        };
+        self.stats.deleg_grants_lost += 1;
+        let due = Self::deleg_loss_due(d, self.deleg_request_timeout_ms());
+        let lapse_point = self.deleg_lapse_at(d);
+        if let Some(len) = crate::deleg_lane::freeze_explains(&self.dl.freezes, due, lapse_point) {
+            self.stats.deleg_lapses_frozen += 1;
+            self.stats.deleg_last_freeze_ms = len as u64;
+            self.stats.deleg_last_freeze_gen = gen;
+            return (true, false);
+        }
+        if !silent_allowed {
+            return (false, false);
+        }
+        let horizon = self.reclaim_horizon_ms() as i64;
+        let root = self.root_node();
+        let pending = d.renew.map(|(_, sent)| sent).into_iter().chain(
+            self.dl
+                .late
+                .values()
+                .filter(|l| l.gen == gen && l.kind == ReqKind::Renew && l.to == root)
+                .map(|l| l.sent),
+        );
+        let in_time = |sent: Ms| {
+            sent.0 <= due.0 + crate::deleg_lane::FREEZE_REACTION_MS
+                && sent.0 + horizon >= lapse_point.0
+        };
+        if !pending.into_iter().any(in_time) {
+            return (false, false);
+        }
+        self.stats.deleg_lapses_root_silent += 1;
+        self.stats.deleg_last_silent_gen = gen;
+        (false, true)
+    }
+
+    /// The off-core lane sent renewal `req` of `gen` (stream round `round`)
+    /// to `to` at `sent` (this node's clock, read before the request was
+    /// handed to the transport): its answer counts as a late answer does
+    /// ([`LateReq`]), honoured from that send, and nothing else changes.
+    ///
+    /// The lane exists for a core stuck in a step (a priority metadata
+    /// write waiting for the store's writer lock behind a slow journal
+    /// write, a blocking log write) for longer than the renewal's slack:
+    /// no renewal went out, and the root reclaimed a delegation that was
+    /// alive. Integrity, the same inequality as an in-time renewal:
+    ///
+    /// 1. The request is registered here before it can be answered (the
+    ///    lane sends this event on the urgent lane first, and the answer
+    ///    comes in on it too), and `sent` is read before the send. The root
+    ///    grants from its receipt (`granted ≥ sent`) and reclaims no
+    ///    earlier than `granted + ttl + margin`; this node honours
+    ///    `sent + ttl − margin` ([`Core::deleg_late_renewed`]): it stops at
+    ///    least two margins before the root's earliest reclaim.
+    /// 2. Only the core decides. `until`, the lapse, the parked ops, the
+    ///    execution, the lock handoff the answer carries all go through
+    ///    `on_deleg_renewed` → `deleg_late_renewed`, with its root and round
+    ///    checks. A refusal on a lane request is dropped there, as any
+    ///    late refusal: the log ends the generation.
+    /// 3. The root's rules for granting are the same: no grant once a
+    ///    recall or a reclaim began, its usability, its freshness hold. What
+    ///    it *learns* from the request is narrower: the lane's renewal is
+    ///    its own message ([`PeerMsg::DelegRenewOffCore`]) with no stream
+    ///    head and no backup, and the root extends the grant and notes
+    ///    neither. A head needs the core (`settle_tagged_writes`, and the
+    ///    fast path executes rows while the core is stuck): the as-of time
+    ///    of the root's lock cut and a new tenure's wait for the delegate's
+    ///    head stay as the core's last renewal left them, so a lock barrier
+    ///    under the subtree does not settle on a position that lacks rows
+    ///    the delegate executed since (liveness only: it settles when the
+    ///    core renews). The backup is the core's to name: a certificate a
+    ///    step old must not unname the backup the core just chose.
+    /// 4. The certificate may be older than the generation (a step that
+    ///    stops it — a refusal, a strand — is running): at most one more
+    ///    renewal per period reaches the root for a generation this node no
+    ///    longer executes in. That costs liveness only; the generation
+    ///    still ends through the log or a recall.
+    ///
+    /// Ignored unless the generation is still this node's, executing (not
+    /// stopped, not a designation), in the round the lane read, and
+    /// renewed with `to`.
+    pub(crate) fn on_deleg_renew_sent_off_core(
+        &mut self,
+        gen: u64,
+        round: u64,
+        to: NodeId,
+        req: OpId,
+        sent: Ms,
+    ) {
+        if self.root_node() != Some(to) {
+            return;
+        }
+        let Some(d) = self.dl.mine.get_mut(&gen) else {
+            return;
+        };
+        if d.stopped || d.designated || d.stream_round != round {
+            return;
+        }
+        d.last_renew_sent = d.last_renew_sent.max(sent);
+        self.dl.late.insert(
+            req,
+            LateReq {
+                gen,
+                kind: ReqKind::Renew,
+                to: Some(to),
+                sent,
+            },
+        );
+        self.stats.deleg_renewals_off_core += 1;
+    }
+
+    /// The requests whose late answers are still used (tests).
+    #[cfg(test)]
+    pub(crate) fn deleg_late_reqs(&self) -> Vec<OpId> {
+        self.dl.late.keys().copied().collect()
     }
 
     /// Plan 30 §M14: this node's honoured end of generation `gen` as its
@@ -2546,13 +2867,22 @@ impl Core {
             // (A lapsed generation's retry.)
             self.cancel_timer(t, out);
         }
-        let Some(d) = self.dl.mine.get_mut(&gen) else {
+        let Some(d) = self.dl.mine.get(&gen) else {
             return true;
         };
         if ttl_ms == 0 {
             // Refused: the generation is ending; stop executing (the log
-            // ends it), keep the parked ops for `NotHolder` then.
+            // ends it), keep the parked ops for `NotHolder` then. A root
+            // that reclaimed a grant this node's frozen process could not
+            // renew refuses the renewal it sends on thawing, before the
+            // lapse watch is handled: counted as a loss in a freeze too.
             self.stats.deleg_renewals_refused += 1;
+            let ran_out = !d.lapsed && now >= self.deleg_lapse_at(d);
+            if ran_out {
+                // (The root answered: it cannot have been silent.)
+                self.deleg_note_loss(gen, false);
+            }
+            let d = self.dl.mine.get_mut(&gen).expect("present");
             d.stopped = true;
             let parked = std::mem::take(&mut d.parked);
             let root = self.root_node().unwrap_or(0);
@@ -2561,12 +2891,15 @@ impl Core {
             }
             return true;
         }
+        let d = self.dl.mine.get_mut(&gen).expect("present");
         // Measured from the send (M8's discipline): honoured until
         // `sent + ttl − margin` on this clock.
         let until = sent.plus(ttl_ms.saturating_sub(self.cfg.expiry_margin_ms));
         if until > d.until {
             d.until = until;
         }
+        d.last_renew_sent = d.last_renew_sent.max(sent);
+        d.answered_sent = d.answered_sent.max(sent);
         if d.lapsed && now < d.until {
             // The link came back before the root reclaimed: the grant is
             // honoured again.
@@ -2586,7 +2919,11 @@ impl Core {
             sent.plus(ttl_ms / 2)
         };
         let t = self.set_timer(at.max(now.plus(1)), Timer::DelegRenew(gen), out);
-        self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
+        {
+            let d = self.dl.mine.get_mut(&gen).expect("present");
+            d.renew_timer = Some(t);
+            d.renew_period_ms = at.since(sent).max(1) as u64;
+        }
         self.arm_deleg_lapse(now, gen, out);
         let d = self.dl.mine.get_mut(&gen).expect("present");
         if d.backup.is_some() && d.renew_backup != d.backup {
@@ -2637,6 +2974,8 @@ impl Core {
             "a late delegation renewal counted"
         );
         d.until = until;
+        d.last_renew_sent = d.last_renew_sent.max(late.sent);
+        d.answered_sent = d.answered_sent.max(late.sent);
         if d.lapsed && now < d.until {
             tracing::info!(
                 node = self.cfg.node_id,

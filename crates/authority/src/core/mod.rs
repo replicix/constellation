@@ -74,7 +74,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub use backup::{liveness_fresh, AckView, SealRecord};
 pub use client::ClientPhase;
-pub use delegate::{DelegKind, DelegView, RecallPhase};
+pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 
 /// Plan 30 §M11 phase 2b: read delegations a *delegate* grants carry
 /// `epoch = DELEG_READ_EPOCH_BASE + gen`, so a `Recall` of the
@@ -742,6 +742,26 @@ pub struct Stats {
     pub deleg_stream_refused: u64,
     pub deleg_renewals: u64,
     pub deleg_renewals_refused: u64,
+    /// Renewals the off-core lane sent while the core was stuck in a step
+    /// ([`Core::on_deleg_renew_sent_off_core`]).
+    pub deleg_renewals_off_core: u64,
+    /// Delegations this node lost (a lapse; a refusal after the grant ran
+    /// out) while a freeze of its heartbeat thread covered the time from
+    /// the renewal's due time to the loss: nothing in the process could
+    /// renew. The length (ms) and generation of the latest.
+    pub deleg_lapses_frozen: u64,
+    pub deleg_last_freeze_ms: u64,
+    pub deleg_last_freeze_gen: u64,
+    /// Delegations this node lost (a lapse, or the log ending the generation
+    /// after its grant ran out) while a renewal sent in time to have saved
+    /// them was unanswered: the root did not answer, its core being stuck.
+    pub deleg_lapses_root_silent: u64,
+    /// The generation of the latest loss counted in `deleg_lapses_root_silent`.
+    pub deleg_last_silent_gen: u64,
+    /// Every delegation this node lost (a lapse, a refusal after the grant
+    /// ran out, the log ending the generation after it ran out): the
+    /// classified ones above are a part of it.
+    pub deleg_grants_lost: u64,
     pub deleg_recalls_received: u64,
     /// Root: delegations written, transactions appended, batches
     /// refused, appends whose `deps` were not here (the causal-cut
@@ -1706,6 +1726,14 @@ impl Core {
                 replica,
             ),
             Event::OwnLag { from, until } => self.on_own_lag(from, until),
+            Event::OwnFreeze { from, until } => self.on_own_freeze(from, until),
+            Event::DelegRenewSentOffCore {
+                gen,
+                round,
+                to,
+                req,
+                sent,
+            } => self.on_deleg_renew_sent_off_core(gen, round, to, req, sent),
             Event::BackupAlive { from, at } => self.on_backup_alive(from, at),
             Event::Slack { epoch_slack } => self.on_slack(now, epoch_slack, replica, &mut out),
             Event::Control { op, req } => self.on_control(now, op, req, replica, &mut out),
@@ -1897,8 +1925,31 @@ impl Core {
                 stream_head_at,
             } => {
                 self.lock_note_delegate_head(now, from, gen, stream_head, stream_head_at);
-                self.on_deleg_renew(now, from, req, gen, round, backup, replica, out)
+                self.on_deleg_renew(
+                    now,
+                    from,
+                    req,
+                    gen,
+                    round,
+                    delegate::RenewFrom::Core { backup },
+                    replica,
+                    out,
+                )
             }
+            // The off-core lane's renewal: no head to note (the as-of
+            // time of the root's lock cut stays the core's last, and a
+            // new tenure's `tenure_waiting` still waits for a head the
+            // core reports), no backup to take.
+            PeerMsg::DelegRenewOffCore { req, gen, round } => self.on_deleg_renew(
+                now,
+                from,
+                req,
+                gen,
+                round,
+                delegate::RenewFrom::OffCore,
+                replica,
+                out,
+            ),
             PeerMsg::DelegRenewed {
                 req,
                 gen,

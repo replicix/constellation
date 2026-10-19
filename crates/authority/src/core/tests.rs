@@ -13962,6 +13962,19 @@ mod locks {
         })
     }
 
+    /// The same delegate's off-core lane renewal (`DelegRenewOffCore`: no
+    /// head, no backup).
+    fn renew_gen7_off_core(h: &mut Harness, req: u64) -> Vec<Action> {
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRenewOffCore {
+                req: OpId(crate::deleg_lane::LANE_REQ_BIT | req),
+                gen: 7,
+                round: 0,
+            },
+        })
+    }
+
     /// Any grant to `node` among the replies and pushes in `out`.
     fn grant_to(out: &[Action], node: NodeId) -> Option<Position> {
         lock_replies(out)
@@ -14064,6 +14077,114 @@ mod locks {
         let out = request(&mut h, 6, 11, ino, X, true);
         assert!(grant_to(&out, 6).is_some(), "{out:?}");
         assert_eq!(h.core.stats.lock_barrier_waits, waits);
+    }
+
+    /// The off-core lane's renewal says nothing about what the delegate
+    /// executed (review of the lane: it first carried `stream_head: 0` with
+    /// its own send time as the stamp, and the root moved the as-of time of
+    /// its lock cut forward with the core's old head). The delegate's core
+    /// renews at head 2; it then executes rows 3..5 under the holder's
+    /// grant (the fast path runs while the core is stuck); the holder's
+    /// grant is outwaited and its barrier waits for a cut as of the grant's
+    /// end. A lane renewal after that end does not settle it, and the next
+    /// grant is made only once the core renews with a head that covers the
+    /// rows (sim `locks-unlinked-delegated-dbackup-random` seed 276's class).
+    #[test]
+    fn an_off_core_renewal_does_not_settle_a_barrier_on_a_stale_head() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        let now = h.now.0;
+        // The delegate's core renews at head 2.
+        renew_gen7(&mut h, 90, 2, now);
+        let t0 = h.now;
+        let out = request(&mut h, 2, 7, ino, X, true);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let out = request(&mut h, 4, 8, ino, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        let end = t0.plus(6_000);
+        h.now = end;
+        h.step(Event::Timer { id: expiry });
+        assert!(h.core.stats.lock_barrier_waits > 0);
+        // The delegate executed rows 3..5, then its core got stuck; its
+        // lane renews, after the record's end.
+        h.advance(100);
+        renew_gen7_off_core(&mut h, 1);
+        h.advance(100);
+        renew_gen7_off_core(&mut h, 2);
+        let out = request(&mut h, 4, 9, ino, X, true);
+        if let Some(position) = grant_to(&out, 4) {
+            panic!(
+                "granted on the lane's head-less renewal: stream 7 at {:?}, the delegate executed 5",
+                position.streams.get(7)
+            );
+        }
+        // The core renews (head 5, sent at or after the end): settled.
+        h.advance(100);
+        let at = h.now.0;
+        renew_gen7(&mut h, 92, 5, at);
+        let out = request(&mut h, 4, 10, ino, X, true);
+        let Some(position) = grant_to(&out, 4) else {
+            panic!("not granted once the core renewed with its head: {out:?}")
+        };
+        assert!(position.streams.get(7) >= Some(5), "{position:?}");
+    }
+
+    /// The same for a new root tenure (`tenure_waiting`): its first grants
+    /// wait for the head of every inherited delegation's next renewal, and
+    /// an off-core renewal is no such head.
+    #[test]
+    fn an_off_core_renewal_does_not_release_a_new_tenures_wait_for_a_head() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        // The tenure's first grant collects the inherited generation 7.
+        let out = request(&mut h, 5, 99, ROOT_INO, X, false);
+        assert!(grant_to(&out, 5).is_none(), "{out:?}");
+        let waits = h.core.stats.lock_tenure_waits;
+        assert!(waits > 0, "the new tenure did not wait for the delegate");
+        // Lane renewals arrive, any number: still waiting.
+        for i in 1..=3 {
+            h.advance(100);
+            renew_gen7_off_core(&mut h, i);
+            let out = request(&mut h, 2, 70 + i, ino, X, true);
+            assert!(
+                grant_to(&out, 2).is_none(),
+                "granted on a lane renewal, with no head from the delegate: {out:?}"
+            );
+        }
+        // Its core's renewal (head 2) releases the wait, and the grant's
+        // floor names the head.
+        h.advance(100);
+        let now = h.now.0;
+        let out = renew_gen7(&mut h, 90, 2, now);
+        let granted = grant_to(&out, 2).or_else(|| {
+            let out = request(&mut h, 2, 80, ino, X, true);
+            grant_to(&out, 2)
+        });
+        let Some(position) = granted else {
+            panic!("not granted after the delegate's core renewed")
+        };
+        assert!(position.streams.get(7) >= Some(2), "{position:?}");
     }
 
     /// F1: a write tagged with node 2's grant passed its check at the
@@ -23647,6 +23768,572 @@ fn a_lapsed_delegation_renewed_before_the_reclaim_executes_again() {
     let d = &h.core.dl.mine[&7];
     assert!(d.stopped, "{d:?}");
     assert!(d.renew_timer.is_none());
+}
+
+/// A delegate of `/d` (generation 7, root node 1) whose first renewal was
+/// answered at `t0` with a 5 s ttl (honoured until `t0 + 4 s`, lapse
+/// watch at `t0 + 6 s`, next renewal due at `t0 + 2.5 s`), and the watch
+/// that was armed. The off-core lane's tests start here.
+fn delegate_renewed_once() -> (Harness, constellation_fs_core::Ino, Ms, TimerId) {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    let t0 = h.now;
+    let out = h.step(renewed(&h, req, 7, 5_000));
+    let lapse = timers(&out, TimerKind::DelegLapse);
+    assert_eq!(lapse.len(), 1, "{out:?}");
+    assert_eq!(h.core.deleg_mine_until(7), Some(t0.plus(4_000)));
+    (h, dir, t0, lapse[0])
+}
+
+/// The off-core lane's registration of its renewal `req` of generation 7,
+/// sent at `sent` to the root (node 1).
+fn lane_sent(h: &Harness, req: u64, sent: Ms) -> Event {
+    Event::DelegRenewSentOffCore {
+        gen: 7,
+        round: round_of(h, 7),
+        to: 1,
+        req: OpId(crate::deleg_lane::LANE_REQ_BIT | req),
+        sent,
+    }
+}
+
+fn lane_answer(h: &Harness, req: u64, ttl_ms: u64) -> Event {
+    renewed(h, OpId(crate::deleg_lane::LANE_REQ_BIT | req), 7, ttl_ms)
+}
+
+/// A delegate's renewal is a step of its core, and a core stuck in one
+/// step (a priority store write behind a slow journal write, a blocking
+/// log write) for longer than the grant's slack sent none: the root
+/// reclaimed a delegation whose node was alive (`delegate-store-stall`).
+/// The off-core lane sends the renewals meanwhile, registering each send
+/// first; the core, running again, takes the registrations and the
+/// answers off the urgent lane before the lapse watch, and honours the
+/// grant from the lane's latest send. The stuck core's old lapse watch
+/// then finds the grant renewed.
+#[test]
+fn deleg_off_core_renewal_keeps_the_grant() {
+    let (mut h, dir, t0, old_lapse) = delegate_renewed_once();
+    let certs = h.core.deleg_renew_certs();
+    assert_eq!(certs.len(), 1, "{certs:?}");
+    let c = &certs[0];
+    assert_eq!((c.gen, c.root), (7, 1));
+    assert_eq!((c.next_due, c.period_ms), (t0.plus(2_500), 2_500));
+    // The core is stuck from t0 + 1 s to t0 + 9 s. The lane sends at
+    // t0 + 2.5, 5.0 and 7.5 s; the registrations and the answers wait on
+    // the urgent lane, in the order they were made.
+    h.advance(9_000);
+    for (i, at) in [2_500u64, 5_000, 7_500].into_iter().enumerate() {
+        let n = i as u64 + 1;
+        h.step(lane_sent(&h, n, t0.plus(at)));
+        assert_eq!(h.core.deleg_renew_certs()[0].next_due, t0.plus(at + 2_500));
+        h.step(lane_answer(&h, n, 5_000));
+        // Honoured from that send: sent + ttl − margin.
+        assert_eq!(h.core.deleg_mine_until(7), Some(t0.plus(at + 4_000)));
+    }
+    assert_eq!(h.core.stats.deleg_renewals_off_core, 3);
+    // The old watch (it fired at t0 + 6 s, while the core was stuck) is
+    // stale: the answers re-armed it.
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 0);
+    let d = &h.core.dl.mine[&7];
+    assert!(!d.lapsed && !d.stopped, "{d:?}");
+    assert_eq!(h.core.deleg_mine_until(7), Some(t0.plus(11_500)));
+    let live = d.lapse_timer.expect("no lapse watch armed");
+    assert!(h.core.timers.contains_key(&live));
+    // The delegate executes: it is honoured, nothing parks.
+    let rid = h.rid(1);
+    let op = MutateOp::Create {
+        parent: dir,
+        name: "f".into(),
+        ino: h.meta.allocate_ino(dir).unwrap(),
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    let out = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    assert!(
+        replies(&out).iter().any(|(r, _)| *r == rid),
+        "not executed here: {out:?}"
+    );
+    assert_eq!(h.core.dl.mine[&7].executed, 1);
+}
+
+/// The control of the test above, and what stock did: answers to requests
+/// the core never heard of (the lane's, unregistered) say nothing about
+/// the grant, and the old lapse watch gives it up.
+#[test]
+fn deleg_unregistered_answers_do_not_keep_the_grant() {
+    let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+    h.advance(9_000);
+    h.step(lane_answer(&h, 1, 5_000));
+    assert_eq!(h.core.deleg_mine_until(7), Some(t0.plus(4_000)));
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 1);
+    assert!(h.core.dl.mine[&7].lapsed);
+}
+
+/// The registration is the only thing the lane does to the core: a
+/// registration alone changes no honoured end and no lapse; one for a
+/// generation, round or root that is not the current one is ignored (no
+/// late answer is recorded, so its answer counts for nothing); and a
+/// refusal on a lane request does not stop the generation.
+#[test]
+fn deleg_off_core_registration_is_only_a_late_answer_record() {
+    let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+    h.advance(3_000);
+    let until = h.core.deleg_mine_until(7);
+    let lapse = h.core.dl.mine[&7].lapse_timer;
+    // A stale round, another root, an unknown generation.
+    let round = round_of(&h, 7);
+    for (gen, round, to) in [(7, round + 1, 1), (7, round, 2), (8, round, 1)] {
+        h.step(Event::DelegRenewSentOffCore {
+            gen,
+            round,
+            to,
+            req: OpId(crate::deleg_lane::LANE_REQ_BIT | 9),
+            sent: t0.plus(2_500),
+        });
+        assert!(h.core.deleg_late_reqs().is_empty());
+    }
+    assert_eq!(h.core.stats.deleg_renewals_off_core, 0);
+    // The right one records the request and the send, nothing else.
+    h.step(lane_sent(&h, 1, t0.plus(2_500)));
+    assert_eq!(h.core.deleg_late_reqs().len(), 1);
+    assert_eq!(h.core.stats.deleg_renewals_off_core, 1);
+    assert_eq!(h.core.deleg_mine_until(7), until);
+    assert_eq!(h.core.dl.mine[&7].lapse_timer, lapse);
+    // A refusal on it does not stop the generation (the log ends it).
+    h.step(lane_answer(&h, 1, 0));
+    let d = &h.core.dl.mine[&7];
+    assert!(!d.stopped && !d.lapsed, "{d:?}");
+    assert_eq!(h.core.deleg_mine_until(7), until);
+    // An answer is used once, and a stopped generation takes none.
+    h.step(lane_sent(&h, 2, t0.plus(2_600)));
+    h.step(lane_answer(&h, 2, 5_000));
+    assert_eq!(h.core.deleg_mine_until(7), Some(t0.plus(6_600)));
+    h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+    h.step(lane_sent(&h, 3, t0.plus(2_700)));
+    assert!(!h
+        .core
+        .deleg_late_reqs()
+        .contains(&OpId(crate::deleg_lane::LANE_REQ_BIT | 3)));
+    assert!(h.core.deleg_renew_certs().is_empty());
+}
+
+/// The delegate's heartbeat thread was frozen across the whole window in
+/// which its renewal could have gone out (due at t0 + 2.5 s, the grant's
+/// lapse point t0 + 6 s): the lapse is counted as a loss in a freeze, apart
+/// from the plain lapse counter, with the freeze's length.
+#[test]
+fn a_lapse_under_a_freeze_covering_due_to_lapse_is_counted_as_frozen() {
+    let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+    // The whole process was frozen from t0 + 2.4 s to t0 + 6.1 s; the
+    // driver hands the freeze over as it wakes, before the lapse watch.
+    h.advance(6_100);
+    h.step(Event::OwnFreeze {
+        from: t0.plus(2_400),
+        until: t0.plus(6_100),
+    });
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 1);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 1);
+    assert_eq!(h.core.stats.deleg_last_freeze_ms, 3_700);
+    assert_eq!(h.core.stats.deleg_last_freeze_gen, 7);
+}
+
+/// A freeze far from the loss, or one that began after the renewal had its
+/// chance, or one that ended with time to renew in, excuses nothing: the
+/// lapse is counted plain, so a lane or core failure near an old freeze is
+/// still a failure.
+#[test]
+fn a_lapse_is_not_counted_as_frozen_by_a_freeze_that_does_not_explain_it() {
+    for (from, until) in [
+        (-20_000i64, -12_000i64), // long before
+        (100, 4_000),             // right after the renewal, thawed in time
+        (3_501, 6_500),           // began after the lane's chance (due + 1 s)
+    ] {
+        let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+        h.advance(6_100);
+        h.step(Event::OwnFreeze {
+            from: Ms(t0.0 + from),
+            until: Ms(t0.0 + until),
+        });
+        h.step(Event::Timer { id: old_lapse });
+        assert_eq!(h.core.stats.deleg_lapsed, 1, "freeze {from}..{until}");
+        assert_eq!(
+            h.core.stats.deleg_lapses_frozen, 0,
+            "freeze {from}..{until} was taken to explain the lapse"
+        );
+    }
+}
+
+/// A freeze right after a renewal that the grant survives (the core renews
+/// when the process thaws) is no loss, counts nothing, and does not excuse a
+/// later lapse of a later grant.
+#[test]
+fn a_freeze_the_grant_survives_counts_nothing_and_excuses_no_later_lapse() {
+    let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+    // Frozen t0 + 0.1 s .. 3.5 s: the renewal due at 2.5 s goes out at the
+    // thaw, and is answered.
+    h.now = t0.plus(3_500);
+    h.step(Event::OwnFreeze {
+        from: t0.plus(100),
+        until: t0.plus(3_500),
+    });
+    let timer = h.core.dl.mine[&7].renew_timer.expect("no renewal timer");
+    let out = h.step(Event::Timer { id: timer });
+    let req = renew_req(&out, 7).expect("no renewal sent at the thaw");
+    h.advance(10);
+    h.step(renewed(&h, req, 7, 5_000));
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 0);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 0);
+    // The root then goes silent: the next grant lapses with no freeze in its
+    // window; the earlier one must not be taken for it.
+    let lapse = h.core.dl.mine[&7].lapse_timer.expect("no lapse watch");
+    h.advance(6_500);
+    h.step(Event::Timer { id: lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 1);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 0);
+}
+
+/// The root reclaimed the grant while the delegate's process was frozen; on
+/// thawing it sends its renewal and the root refuses it before the lapse
+/// watch is handled: counted as a loss in a freeze, as the lapse would have
+/// been.
+#[test]
+fn a_refusal_after_the_grant_ran_out_under_a_freeze_is_counted_as_frozen() {
+    let (mut h, _dir, t0, _old_lapse) = delegate_renewed_once();
+    h.advance(6_100);
+    h.step(Event::OwnFreeze {
+        from: t0.plus(2_400),
+        until: t0.plus(6_100),
+    });
+    let timer = h.core.dl.mine[&7].renew_timer.expect("no renewal timer");
+    let out = h.step(Event::Timer { id: timer });
+    let req = renew_req(&out, 7).expect("no renewal sent at the thaw");
+    h.step(renewed(&h, req, 7, 0));
+    assert!(h.core.dl.mine[&7].stopped);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 1);
+    assert_eq!(h.core.stats.deleg_lapsed, 0);
+}
+
+/// The root reclaimed a grant the delegate's frozen process could not renew,
+/// and the log's record of it reaches the delegate before its own lapse watch
+/// or a refusal does (sim `delegated-core-freeze` seed 425): the generation
+/// ends here with its grant run out, counted as a loss in a freeze too. A
+/// generation that was recalled (stopped) is no loss, and one whose grant is
+/// still honoured is not either.
+#[test]
+fn a_generation_the_log_ended_after_its_grant_ran_out_under_a_freeze_is_counted() {
+    let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+    h.advance(6_100);
+    h.step(Event::OwnFreeze {
+        from: t0.plus(2_400),
+        until: t0.plus(6_100),
+    });
+    let mut out = Vec::new();
+    h.core.drop_delegate_state(h.now, 7, &h.meta, &mut out);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 1);
+    assert_eq!(h.core.stats.deleg_last_freeze_gen, 7);
+    // Recalled before: not a loss.
+    let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+    h.advance(6_100);
+    h.step(Event::OwnFreeze {
+        from: t0.plus(2_400),
+        until: t0.plus(6_100),
+    });
+    h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+    h.core.drop_delegate_state(h.now, 7, &h.meta, &mut out);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 0);
+    // Grant still honoured: not a loss.
+    let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+    h.advance(3_000);
+    h.step(Event::OwnFreeze {
+        from: t0.plus(100),
+        until: t0.plus(2_900),
+    });
+    h.core.drop_delegate_state(h.now, 7, &h.meta, &mut out);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 0);
+}
+
+/// The root did not answer renewals the delegate sent in time (the lane's,
+/// registered with the core as it resumed, none answered by the point the
+/// grant ran out): the lapse is counted as one under a silent root, apart
+/// from the plain counter and the freeze counter. "In time" is by the time
+/// the lane would have acted: a due time plus a second (the freeze's own
+/// rule). A renewal sent later (a buggy lane that fires 3.3 s late, sending at
+/// 5.8 s of a grant lapsing at 6 s: the root, perfectly responsive, refused it
+/// just after the lapse watch fired) and a delegate that sent nothing are a
+/// failure, counted in neither.
+#[test]
+fn a_lapse_with_a_renewal_sent_in_time_and_unanswered_is_counted_as_root_silent() {
+    let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+    // The core is stuck from t0 + 1 s; its lane registers renewals at
+    // t0 + 2.6 s and 4.0 s, which the root does not answer.
+    h.advance(6_100);
+    h.step(lane_sent(&h, 1, t0.plus(2_600)));
+    h.step(lane_sent(&h, 2, t0.plus(4_000)));
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 1);
+    assert_eq!(h.core.stats.deleg_lapses_root_silent, 1);
+    assert_eq!(h.core.stats.deleg_last_silent_gen, 7);
+    assert_eq!(h.core.stats.deleg_grants_lost, 1);
+    assert_eq!(h.core.stats.deleg_lapses_frozen, 0);
+    // The grant's renewal fell due at t0 + 2.5 s: a renewal first sent at
+    // 5.8 s (the lane 3.3 s late) is not in time, and the root's silence is
+    // no excuse for it. Nor is one sent right at the due time plus a second
+    // and a millisecond.
+    for sent in [5_800, 3_501] {
+        let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+        h.advance(6_100);
+        h.step(lane_sent(&h, 1, t0.plus(sent)));
+        h.step(Event::Timer { id: old_lapse });
+        assert_eq!(h.core.stats.deleg_lapsed, 1);
+        assert_eq!(
+            h.core.stats.deleg_lapses_root_silent, 0,
+            "a renewal sent at +{sent} ms was taken for one sent in time"
+        );
+        assert_eq!(h.core.stats.deleg_grants_lost, 1);
+    }
+    // ... and exactly at the limit is.
+    let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+    h.advance(6_100);
+    h.step(lane_sent(&h, 1, t0.plus(3_500)));
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapses_root_silent, 1);
+    // Nothing sent at all: a failure.
+    let (mut h, _dir, _t0, old_lapse) = delegate_renewed_once();
+    h.advance(6_100);
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 1);
+    assert_eq!(h.core.stats.deleg_lapses_root_silent, 0);
+    assert_eq!(h.core.stats.deleg_grants_lost, 1);
+}
+
+/// The lane's send failed at the transport (link down, a dial failure, the
+/// liveness connection): the heartbeat thread tells the core, as the core's
+/// own renewals are told, and the request is not pending any more. A loss is
+/// not put down to a root that never answered a request that never got there.
+#[test]
+fn a_lane_request_that_failed_at_the_transport_is_not_a_pending_renewal() {
+    let (mut h, _dir, t0, old_lapse) = delegate_renewed_once();
+    h.advance(6_100);
+    let req = OpId(crate::deleg_lane::LANE_REQ_BIT | 1);
+    h.step(lane_sent(&h, 1, t0.plus(2_600)));
+    assert_eq!(h.core.deleg_late_reqs(), vec![req]);
+    h.step(Event::PeerFailed {
+        req,
+        to: 1,
+        outage: false,
+    });
+    assert!(h.core.deleg_late_reqs().is_empty());
+    h.step(Event::Timer { id: old_lapse });
+    assert_eq!(h.core.stats.deleg_lapsed, 1);
+    assert_eq!(h.core.stats.deleg_lapses_root_silent, 0);
+    assert_eq!(h.core.stats.deleg_grants_lost, 1);
+    // A failure the core knows nothing of is no event.
+    h.step(Event::PeerFailed {
+        req: OpId(crate::deleg_lane::LANE_REQ_BIT | 99),
+        to: 1,
+        outage: false,
+    });
+}
+
+/// A registration that arrives after a step made the generation a
+/// designation is a no-op, as the certificates exclude designations.
+#[test]
+fn deleg_off_core_registration_ignores_a_designation() {
+    let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
+    h.core.dl.mine.get_mut(&7).unwrap().designated = true;
+    h.step(lane_sent(&h, 1, t0.plus(2_500)));
+    assert!(h.core.deleg_late_reqs().is_empty());
+    assert_eq!(h.core.stats.deleg_renewals_off_core, 0);
+}
+
+/// The lane renews only what the core would: a generation it executes
+/// (not stopped, not a designation) with a root that is another node.
+#[test]
+fn deleg_renew_certs_name_only_what_the_core_would_renew() {
+    let (mut h, _dir, _t0, _lapse) = delegate_renewed_once();
+    assert_eq!(h.core.deleg_renew_certs().len(), 1);
+    // Root unknown: nothing to send to.
+    h.core.lease.cached_holder = None;
+    assert!(h.core.deleg_renew_certs().is_empty());
+    // This node is the root itself.
+    h.core.lease.cached_holder = Some(3);
+    assert!(h.core.deleg_renew_certs().is_empty());
+    h.core.lease.cached_holder = Some(1);
+    h.core.dl.mine.get_mut(&7).unwrap().designated = true;
+    assert!(h.core.deleg_renew_certs().is_empty());
+    h.core.dl.mine.get_mut(&7).unwrap().designated = false;
+    h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
+    assert!(h.core.deleg_renew_certs().is_empty());
+}
+
+/// Before its first answer a generation renews at the request timeout,
+/// from its install; the core's own renewal is the latest "sent" too.
+#[test]
+fn deleg_renew_cert_before_the_first_answer_and_after_a_core_renewal() {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    let _dir = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    let req = renew_req(&out, 7).expect("no renewal on install");
+    let t0 = h.now;
+    let timeout = h.core.deleg_request_timeout_ms();
+    let c = h.core.deleg_renew_certs().remove(0);
+    assert_eq!((c.next_due, c.period_ms), (t0.plus(timeout), timeout));
+    // Answered: the period is the core's (half the ttl).
+    h.advance(10);
+    h.step(renewed(&h, req, 7, 5_000));
+    let c = h.core.deleg_renew_certs().remove(0);
+    assert_eq!((c.next_due, c.period_ms), (t0.plus(2_500), 2_500));
+    // The core's timer renewal, decided on but not answered, moves nothing
+    // (the driver tells the lane when it dispatched it): the lane would
+    // otherwise wait a period for a renewal that may not have gone out.
+    h.now = t0.plus(2_500);
+    let timer = h.core.dl.mine[&7].renew_timer.expect("no renewal timer");
+    let out = h.step(Event::Timer { id: timer });
+    let req = renew_req(&out, 7).expect("no renewal sent");
+    let c = h.core.deleg_renew_certs().remove(0);
+    assert_eq!((c.next_due, c.period_ms), (t0.plus(2_500), 2_500));
+    // Its answer moves the next one a period on, from its send.
+    h.advance(10);
+    h.step(renewed(&h, req, 7, 5_000));
+    let c = h.core.deleg_renew_certs().remove(0);
+    assert_eq!((c.next_due, c.period_ms), (t0.plus(5_000), 2_500));
+}
+
+/// The root of generation 7 (node 3 its delegate), granted its first
+/// renewal naming backup `backup`.
+fn root_with_delegate_backed_by(backup: NodeId) -> Harness {
+    let mut h = Harness::new(1);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.cfg.delegation_ttl_ms = 1_000;
+    h.hold(1, None);
+    let _ = delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    assert!(h.core.dl.gens.contains_key(&7));
+    h.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::DelegRenew {
+            req: OpId(1),
+            gen: 7,
+            round: 1,
+            backup: Some(backup),
+            stream_head: 0,
+            stream_head_at: 0,
+        },
+    });
+    h
+}
+
+/// The delegate's core chose backup 4 and announced it; the lane's renewal,
+/// made from a certificate a step older (or sent late on its own thread),
+/// reaches the root after. The root still has 4: the backup is the core's
+/// to name, and it is the node the root seals if the delegate goes silent.
+#[test]
+fn an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate() {
+    let mut h = root_with_delegate_backed_by(4);
+    assert_eq!(h.core.dl.gens[&7].backup, Some(4));
+    h.advance(100);
+    h.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::DelegRenewOffCore {
+            req: OpId(crate::deleg_lane::LANE_REQ_BIT | 1),
+            gen: 7,
+            round: 1,
+        },
+    });
+    assert_eq!(
+        h.core.dl.gens[&7].backup,
+        Some(4),
+        "the lane's renewal unnamed the delegate's backup"
+    );
+    // It did extend the grant: that is what it is for.
+    let until = h.core.dl.gens[&7].until;
+    assert!(until >= h.now.plus(1_000), "{until:?}");
+    // The core's own renewal still changes it.
+    h.advance(100);
+    h.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::DelegRenew {
+            req: OpId(2),
+            gen: 7,
+            round: 1,
+            backup: None,
+            stream_head: 0,
+            stream_head_at: 0,
+        },
+    });
+    assert_eq!(h.core.dl.gens[&7].backup, None);
+}
+
+/// A lane renewal for a generation whose root recalled it, or that the
+/// root does not know, is refused as any renewal is: the grant is not
+/// extended, `ttl_ms` is 0.
+#[test]
+fn an_off_core_renewal_of_a_recalled_generation_is_refused() {
+    let mut h = root_with_delegate_backed_by(4);
+    h.core.dl.gens.get_mut(&7).unwrap().recall = RecallPhase::Sent;
+    let until = h.core.dl.gens[&7].until;
+    h.advance(100);
+    let out = h.step(Event::Peer {
+        from: 3,
+        msg: PeerMsg::DelegRenewOffCore {
+            req: OpId(crate::deleg_lane::LANE_REQ_BIT | 1),
+            gen: 7,
+            round: 1,
+        },
+    });
+    assert_eq!(h.core.dl.gens[&7].until, until);
+    assert!(
+        sends(&out)
+            .iter()
+            .any(|(to, m)| *to == 3 && matches!(m, PeerMsg::DelegRenewed { ttl_ms: 0, .. })),
+        "{out:?}"
+    );
+}
+
+/// The certificates change only when something the lane needs changed:
+/// `deleg_renew_certs_differ` compares in place.
+#[test]
+fn deleg_renew_certs_differ_notices_exactly_a_changed_certificate() {
+    let (mut h, _dir, _t0, _lapse) = delegate_renewed_once();
+    let published = h.core.deleg_renew_certs();
+    assert!(!h.core.deleg_renew_certs_differ(&published));
+    assert!(h.core.deleg_renew_certs_differ(&[]));
+    let mut other = published.clone();
+    other[0].next_due = other[0].next_due.plus(1);
+    assert!(h.core.deleg_renew_certs_differ(&other));
+    other.push(other[0].clone());
+    assert!(h.core.deleg_renew_certs_differ(&other));
+    // A core renewal that is only decided on (not answered) changes none.
+    h.advance(2_500);
+    let timer = h.core.dl.mine[&7].renew_timer.expect("no renewal timer");
+    h.step(Event::Timer { id: timer });
+    assert!(!h.core.deleg_renew_certs_differ(&published));
+    // Its answer does.
+    let req = h.core.dl.mine[&7].renew.expect("no renewal in flight").0;
+    h.step(renewed(&h, req, 7, 5_000));
+    assert!(h.core.deleg_renew_certs_differ(&published));
 }
 
 fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {

@@ -283,6 +283,35 @@ pub struct DelegationReport {
     pub stream_refused: u64,
     pub renewals: u64,
     pub renewals_refused: u64,
+    /// Renewals this delegate's off-core lane sent while its core was
+    /// stuck in a step (answered ones count as late answers, from their
+    /// own send): each one a grant a stalled core would have lost.
+    pub renewals_off_core: u64,
+    /// Delegations this node lost (a lapse, or a refusal after the grant ran
+    /// out) while its off-core heartbeat thread was frozen across the time
+    /// from the renewal's due time to the loss: the whole process did not
+    /// run, and nothing in it could renew. Counted apart from `lapsed`; the
+    /// length (ms) and generation of the latest.
+    #[serde(default)]
+    pub lapses_during_freeze: u64,
+    #[serde(default)]
+    pub last_freeze_ms: u64,
+    #[serde(default)]
+    pub last_freeze_gen: u64,
+    /// Delegations this node lost (a lapse, or the log ending the generation
+    /// after its grant ran out) while a renewal it had sent in time to save
+    /// them was unanswered: the root did not answer within the grant, its
+    /// core being stuck (the root answers renewals from its core).
+    #[serde(default)]
+    pub lapses_root_silent: u64,
+    /// The generation of the latest of those.
+    #[serde(default)]
+    pub last_silent_gen: u64,
+    /// Every delegation this node lost (a lapse, a refusal after the grant
+    /// ran out, the log ending the generation after it ran out): the two
+    /// classified counts above are a part of it; the rest is unexplained.
+    #[serde(default)]
+    pub grants_lost: u64,
     pub recalls_received: u64,
     pub delegated: u64,
     pub appended_txs: u64,

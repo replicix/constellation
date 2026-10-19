@@ -49358,7 +49358,8 @@ waits for the probe either.
 
 The delegation lost to a stuck authority core under a disk stall
 (`b's generation 1 did not survive the handoff`, the other finding of the
-same loop) waits for the maintainer's decision.
+same loop) was decided separately: see "Fix: a delegation lost to a stuck
+authority core" below.
 
 ## Fix: an in-doubt resubmission is marked in doubt in the step that submits it (`load-probe-takeover` seed 46)
 
@@ -49941,3 +49942,351 @@ became the backup: the same spread as before this change.)
   them all slowed cooperative handoffs in `backup-lag-keeps-its-backup`
   (a backup dropped for ack timeouts), so only the takeover floor this
   change lengthened is guarded.
+
+## Fix: a delegation lost to a stuck authority core (`delegate-handoff-renewal` under load, 2026-10-18)
+
+A stopgap, approved by the maintainer ahead of plan 41's full renewal lane
+(which will replace it): the delegate's renewals of its own delegation get
+a sender off the core, active only while the core is stuck.
+
+### Finding
+
+Looping `delegate-handoff-renewal` on the plan-43 build box showed a
+generation lost before a round (`b's generation 1 did not survive the
+handoff (now 0)`), 3 of 25 runs on 2026-10-17 and 2 of about 30 on
+2026-10-18, only while a co-tenant wrote gigabytes to the same btrfs (a
+cargo build): idle 0 of 40. No error reached the application: every write
+answered OK. What the application saw was latency. The writes caught behind
+the stall took 6.7-11.9 s (the disk), and afterwards `b`'s writes in `/d1`
+went through the root (create + close p50 4.5 ms against 1.0 ms before) until
+something delegated the directory again.
+
+### Cause
+
+A delegate's renewal is a step of its authority core: the `DelegRenew`
+timer, then a send. The step that blocked was either:
+
+- a priority metadata write waiting for the store's writer lock behind a
+  FUSE thread's commit, whose fjall journal flush is a buffered `write(2)`
+  that blocked 6.7-11.9 s on btrfs under write pressure (4 of 5 losses; `b`,
+  as `a`'s backup, was in `BackupAppend`, `store_lock_wait_us` equal to the
+  step), or
+- the core's own synchronous log write (`LogWriter::write` to the daemon's
+  log file on the same btrfs): 5 of the 6 core steps of 0.7-12.55 s that a
+  diagnostic build logged in 68 loaded runs were spent in the stderr write.
+
+With the renewal due at half the 5 s grant (the scenario's stress setting;
+the default is the lock ttl, 20 s, since `c612585`), a core stuck longer
+than the slack (about `ttl/2 + margin`: 3.5 s here, 11 s at the default) sent
+none, the root reclaimed at `granted + ttl + margin`, and `b` lapsed when it
+ran again. Timeline of the 2026-10-17 loss (`fail-1`): last renewal sent
+19:47:40.352; the core in `BackupAppend` from 19:47:40.557 behind `fuser-6`'s
+`allocate_ino` (a 10.17 s journal write); next renewal due 19:47:42.85;
+honoured end 19:47:44.352; the root reclaimed at 19:47:46.353; `b` noticed at
+19:47:50.422 when the step ended. `delegations.md` and plan 41 §5.10 had left
+the delegate's renewal core-driven; the F2 change (`0228149`) had moved only
+the holder's liveness heartbeat off the core.
+
+Deterministic reproduction with `CONSTELLATION_FAULT_STORE_STALL_FILE` (one
+ordinary writer holds the writer lock 9 s): 6 of 6 runs reclaimed on stock.
+
+### What changed
+
+- `constellation-authority`: `Core::deleg_renew_certs` (one `DelegRenewCert`
+  per generation the node executes and renews: generation, root, round, when
+  the next renewal is due, the period; no backup; the state after the last
+  finished step, with the core's own renewals counted once *answered*, and the
+  driver adds the ones it *dispatched*), `Core::deleg_renew_certs_differ`
+  (compared in place), `Event::DelegRenewSentOffCore` and
+  `Core::on_deleg_renew_sent_off_core` (records the lane's request as a late
+  answer, `LateReq`, from its own send; ignores a stopped generation, a
+  designation, another round or root), `DelegateState::last_renew_sent` and
+  `renew_period_ms`, `stats.deleg_renewals_off_core`; `deleg_lane::due`
+  (sans-IO: which certificates are due, only while the driver has been stuck
+  for a quarter of the renewal period, at most 500 ms and at least 100 ms,
+  and not past the hung bound) and `deleg_lane::with_granted_ttl`. The wire: a
+  new message `DelegRenewOffCore` (`PeerMsg`, `Payload`, `SyncRequest`) with no
+  backup and no stream head, appended at the end of `Payload` so the other
+  variants keep their postcard indices (a test pins it).
+- The root's handling of it (`RenewFrom::OffCore`): the same rules for
+  granting (no grant once a recall or a reclaim began, usability, the freshness
+  hold, the cap of its own lease), the same `DelegRenewed` answer, and
+  `until`/`renewed_until` extended; it does **not** note a stream head
+  (`lock_note_delegate_head`: the as-of time of the lock cut), does **not**
+  touch `tenure_waiting`, and does **not** change `g.backup`. The first
+  version sent `stream_head: 0, stream_head_at: now` and the certificate's
+  backup as an ordinary renewal; the review showed that moved the as-of time
+  of the root's lock cut forward on the core's old head (a lock barrier settled
+  with a position missing rows the delegate executed after its core's last
+  renewal: the stale-read class of sim `locks-unlinked-delegated-dbackup-random`
+  seed 276), released a new tenure's wait for a head with none, and could
+  overwrite the root's backup of the delegate with a stale one. Both a head and
+  the backup need the core (the head: `settle_tagged_writes`, and the FUSE
+  fast path executes rows while the core is stuck), so the lane carries
+  neither. The cost is liveness only: a lock barrier under the subtree settles
+  when the core renews.
+- `constellation-engine`: `DelegLane` in the heartbeat thread's tick
+  (`holder_alive_loop`, the F2 thread with its own runtime and liveness
+  connection), on any node with a delegation, holder or not: for each due
+  certificate it sends `SyncRequest::DelegRenewSentOffCore` on the urgent lane
+  first, then the `DelegRenewOffCore` on the liveness lane. `Driver::refresh`
+  publishes the certificates when they changed (compared in place under one
+  lock: no allocation on a step that changed none; the per-step cost is that
+  lock and a walk over the node's delegations), and the driver notes each
+  dispatched core renewal (`OffCore::renewals_dispatched`), so a renewal the
+  core decided on but a blocking action ahead of its send in the same step
+  delayed does not postpone the lane. `CONSTELLATION_DELEG_LANE=off` turns the
+  lane off (A/B runs).
+- The lane follows the grant the root named. The P2P service notes the
+  granted ttl of every `DelegRenewed` that reaches it, per generation and
+  round with the node it came from (`OffCore::note_granted_ttl`, off the core,
+  advisory: it can only shorten the period), and the lane renews at a quarter of
+  it, not below 250 ms, where that is shorter than the core's period, counting
+  only the answers of the root its certificate names. The root caps every grant by what is left
+  of its own lease (`expires - margin`) outside a continuation-epoch hold: a
+  lease renewal that runs late (a slow or throttled S3 lease PUT, the root's
+  own core stuck behind the same slow disk) or a grant inherited from an old
+  root leaves a grant of a second or so (with a 60 s lease and a 20 s grant it
+  takes a lease renewal about 9 s late: rare, not never, and correlated with
+  the lane's own trigger); the first version renewed at the period of the last
+  full grant, which came after the root's reclaim: 14 of 20000 seeds of
+  `delegated-core-stall-lease6` lost a grant (seed 2079: the renewal at 31.5 s
+  was answered with a ttl capped to 1.07 s, the next lane renewal came 2.4 s
+  later, the root reclaimed at 33.08 s). Now 0 of 20000.
+- The core says itself what a loss is. The heartbeat thread stamps when its
+  next tick is due (`OffCore::beat_due`) and records a freeze it sees end (one
+  packed atomic word: 42 bits of unix ms, 22 of length, boundary-tested; the
+  first encoding had 41 and overflowed in 2039); the driver, waking first after
+  a freeze, reads the thread's missed tick before the thread has run, and hands
+  the core `Event::OwnFreeze` (`Driver::hand_freeze`) **only if the shared
+  runtime's own lag probe missed the same interval** (`deleg_lane::whole_process`:
+  the whole process, not the heartbeat thread held up alone in a log line or on a
+  mutex, which is the lane's thread failing). When the core gives a grant up (a
+  lapse, a refusal after the grant ran out, or the log ending the generation
+  after it ran out) it counts it in `grants_lost` and, apart, in
+  `lapses_during_freeze` (and `last_freeze_ms`, `last_freeze_gen`) if a freeze
+  began no later than a second after the renewal fell due and lasted to within a
+  round trip of the grant's end: nothing in the process could renew. A freeze far
+  from the loss, one that began after the lane had its chance, and one that ended
+  with time to renew in explain nothing. Failing that, `lapses_root_silent` (and
+  `last_silent_gen`) if a renewal sent by `due + 1 s` (the freeze's own rule: a
+  late lane's renewal is never taken for one sent in time) was never answered.
+  The due time is that of the latest renewal *answered* (`answered_sent`), not
+  moved by the lane's unanswered registrations. A lane request that fails at the
+  transport is reported to the core on the urgent lane (behind its registration)
+  and dropped from its pending renewals, as a core renewal's failure is, so a
+  failed send is not put down to a silent root. A delegate that sent nothing in
+  time is counted in neither. The plain `lapsed` counter is unchanged. The root
+  cannot see the delegate's freeze; the delegate's counter explains the root's
+  reclaim of the same grant (the reclaim point is the delegate's lapse point).
+- Harness: new `delegate-store-stall` (5, 9, 12 s stalls: the same
+  generation, nothing reclaimed, recalled or lapsed, the lane sent, the
+  writes back to the control's create + close; then a 25 s stall, past the
+  bound: reclaimed, nothing fails). `delegate-handoff-renewal` no longer
+  delegates again silently ("host load"): it fails on a lapse at `b`, a reclaim
+  at `a`, a generation gone before a round, or a mechanism check after a
+  handoff, **unless the daemon classified every grant lost in the window as under
+  a freeze of its whole process, for that generation** (`Losses::excused`: the
+  counters are deltas over the round, `grants_lost` is compared with
+  `lapses_during_freeze`, like with like, and `last_freeze_gen` must be the
+  generation), or `b`'s core was stuck for the hung bound: then a labelled `NOTE`,
+  and the run is **INCONCLUSIVE, not passed**, unless the freeze is the run's
+  own injection. **A silent root is not an excuse**: it fails with the label
+  `KNOWN-GAP root core stuck` so batches can count it (the root answers
+  renewals from its core; the one measured case, `g6-renewal` run 14, was the
+  root's core and the delegate's blocked 7 s in the same instant in a shared log
+  sink, plan 44's class, not an S3 put as an earlier version of this entry said;
+  plan 44 is expected to remove it). After a handoff the new image's counters
+  start over, so the note is carried to the next round only when the generation
+  is actually gone (`gen_after != gen`). The re-delegation is from `a` while it
+  holds the lease; a node whose delegation was lost writes through the root and
+  the lease follows it, so if `b` holds it the rest of the run is skipped and the
+  run is INCONCLUSIVE. Write errors, data loss and the whole-write latency
+  bounds fail regardless. An INCONCLUSIVE scenario ends the harness run with
+  `NO SCENARIO FAILED, n INCONCLUSIVE (not passed)` and not `ALL SCENARIOS
+  PASSED`; `tools/load-campaign/run.py` fails a campaign with more than
+  `--max-inconclusive-pct` (10) of its judged runs inconclusive
+  (`tests/test_load_campaign.py`); the box's loop script does the same per
+  batch. The stale comment above `ENV` (5 s is a stress setting, the default is
+  20 s) is corrected. `CONSTELLATION_HARNESS_DELEG_FREEZE_MS=<ms>` freezes `b`
+  (`SIGSTOP`) at the start of round 0, outside the measured windows, to
+  exercise the classified-freeze path.
+- Not in this change (the maintainer's decision): a never-block log mode for
+  the heartbeat thread. A general non-blocking log writer for every thread is
+  designed separately (plan 44). Until then the lane's thread can itself block
+  in a log write (noq/iroh's own lines, which the liveness connection's runtime
+  emits; the lane adds none per send); with the runtime running on that is a
+  heartbeat thread held up alone, a failure, not a freeze, and it is not excused.
+
+- The integrity argument is in `delegations.md` "Grants, renewal and expiry"
+  and on `on_deleg_renew_sent_off_core`: the lane stamps `sent` before the
+  send, the root grants from its receipt and reclaims no earlier than
+  `granted + ttl + margin`, the core honours `sent + ttl - margin`: the same
+  inequality as an in-time renewal, so the delegate stops at least two margins
+  before the root's earliest reclaim. Only the core decides (`until`, lapse,
+  parked ops, execution, the lock handoff the answer carries: all by the
+  existing `on_deleg_renewed` -> `deleg_late_renewed` path, with its root and
+  round checks); a refusal on a lane request is dropped there. The certificate
+  can be stale by one step: at most one extra renewal per period for a
+  generation just stopped. The lane stops at `CONSTELLATION_HOLDER_STALL_MS`
+  (15 s): a hung delegate is reclaimed at most that much later than before.
+- Harness: new `delegate-store-stall` (5, 9, 12 s stalls: the same
+  generation, nothing reclaimed, recalled or lapsed, the lane sent, the
+  writes back to the control's create + close; then a 25 s stall, past the
+  bound: reclaimed, nothing fails). `delegate-handoff-renewal` no longer
+  delegates again silently ("host load"): it fails on a lapse at `b`, a reclaim
+  at `a`, a generation gone before a round, or a mechanism check after a
+  handoff, **unless the daemon classified it**: every lapse and reclaim of the
+  window being judged (the counters are deltas over the round) has a
+  `lapses_during_freeze` (for that generation) or a `lapses_root_silent`, or `b`'s
+  core was stuck for the hung bound: then a labelled `NOTE`. After a handoff the
+  new image's counters start over, so the note is carried to the next round
+  only when the generation is actually gone (`gen_after != gen`), and excuses
+  only that generation's absence. The re-delegation is from `a` while it holds
+  the lease; a node whose delegation was lost writes through the root and the
+  lease follows it, so if `b` holds it the rest of the run is skipped with a note
+  (inconclusive, not failed). Write errors, data loss and the whole-write latency
+  bounds fail regardless. The earlier excuse (a lateness record with no time
+  window) is gone, with the status fields it used. The stale comment above its
+  `ENV` (5 s is a stress setting, the default is 20 s) is corrected.
+  `CONSTELLATION_HARNESS_DELEG_FREEZE_MS=<ms>` freezes `b` (`SIGSTOP`) at the start of round 0,
+  outside the measured windows, to exercise the classified-freeze path.
+- Not in this change (the maintainer's decision): a never-block log mode for
+  the heartbeat thread. A general non-blocking log writer for every thread is
+  designed separately (plan 44). Until then the lane's thread can itself block
+  in a log write (noq/iroh's own lines, which the liveness connection's runtime
+  emits; the lane adds none per send), as the holder heartbeat can: that is the
+  same freeze to the lane, and is classified as one.
+
+### Measurements
+
+Store-stall fault (one writer holds the lock), `delegate-store-stall`, 2 nodes,
+5 s ttl, 16-core box (shared with other jobs):
+
+| build | stall | runs | reclaimed at `a` | lapsed at `b` | lane renewals |
+|---|---|---|---|---|---|
+| lane off (stock behaviour) | 9 s | 4 + 3 + 3 | 10 of 10 | 10 of 10 | 0 |
+| lane off | 12 s | 4 | 4 of 4 | 4 of 4 | 0 |
+| lane on (this build, quiet box) | 5, 9, 12 s | 10 | 0 | 0 | 1-2, 3, 4 per run |
+| lane on | 25 s (past the bound) | 10 | 10 of 10 (the bound) | most | 5-6 per run |
+
+(The lane-off runs are the fail-before: never excused, no freeze and no silent
+root classified. This round's quiet-box batch: load 0.1-2.3.) With the lane the
+writes after a 9 or 12 s stall run on the delegate again at once; without it the
+delegation is gone and they went through the root.
+
+Simulation, 20000 seeds each (5 s ttl, a delegate's core stuck 6.5, 9 and
+12.5 s, another's 8 s): `delegated-core-stall` (12 s root lease, as production
+runs it against the grant) 0 reclaimed, lapsed or ended; `-forwarded` (every
+node's second client forwarding into the other delegate's directory) 0;
+`delegated-core-hang` (26 s) reclaimed in all; `delegated-core-stall-unlaned`
+(lane off), 2000 seeds: every one reclaims and lapses. **`delegated-core-stall-lease6`**
+(the sim's default 6 s root lease, where the root caps a grant by what is left
+of its own lease): 14 of 20000 seeds lost a grant (1447, 2079, 6242, 6915, 7730,
+8896, 9285, 12071, 14434, 16813, 18153, 18622, 19444, 19884) while the lane renewed
+at the period of the last full grant (mechanism above); with the lane following
+the granted ttl: 0 of 20000, and seeds 1447 and 2079 are a regression test.
+`delegated-core-freeze` (a delegate's whole process paused 7, 8 and 9 s, past its
+5 s grant): every loss counted as lost under a freeze, 0 of 20000 failing.
+
+### Tests
+
+- Core: the lane (`deleg_off_core_renewal_keeps_the_grant`;
+  `deleg_unregistered_answers_do_not_keep_the_grant`: without the registration
+  the old lapse watch gives the grant up, the fail-before;
+  `deleg_off_core_registration_is_only_a_late_answer_record`, which also covers a
+  stopped or designated generation and a refusal; certificates and their
+  periods; `deleg_renew_certs_differ_notices_exactly_a_changed_certificate`;
+  `deleg_off_core_registration_ignores_a_designation`; `deleg_lane::tests`) and the
+  root's side of it, all failing with the lane's renewal handled as a core
+  renewal and passing as `RenewFrom::OffCore`: `an_off_core_renewal_does_not_settle_a_barrier_on_a_stale_head`,
+  `an_off_core_renewal_does_not_release_a_new_tenures_wait_for_a_head`,
+  `an_off_core_renewal_never_changes_the_roots_backup_of_a_delegate`,
+  `an_off_core_renewal_of_a_recalled_generation_is_refused`.
+- Core, the classification (each fails with its rule reverted, checked): a lapse
+  under a freeze covering due to lapse is counted; a freeze far from the loss, one
+  right after a renewal that the grant survives, and one that began after the
+  lane's chance are not; a refusal after the grant ran out, and the log ending
+  the generation, are counted; a silent root counts only for a renewal sent by
+  `due + 1 s` (`a_lapse_with_a_renewal_sent_in_time_and_unanswered_is_counted_as_root_silent`:
+  one sent at 5.8 s of a grant lapsing at 6 s, a late lane, does not; none sent does
+  not), and not for one whose send failed at the transport
+  (`a_lane_request_that_failed_at_the_transport_is_not_a_pending_renewal`).
+  `deleg_lane`: the freezes the driver reads, the freeze encoding at the boundary of
+  its 42 bits, `freeze_explains` by window, `whole_process`, `with_granted_ttl` and
+  its 250 ms floor.
+- Engine: `the_delegation_lane_registers_then_sends_only_while_the_driver_is_stuck`,
+  `the_delegation_lane_counts_only_renewals_that_went_out`,
+  `a_freeze_of_the_heartbeat_thread_is_seen_by_the_driver_before_the_thread_runs`,
+  `a_heartbeat_thread_held_up_alone_is_no_freeze_of_the_process`,
+  `the_delegation_lane_follows_the_grant_the_root_named` and
+  `..._follows_only_the_roots_answers_down_to_a_floor`,
+  `a_failed_lane_send_is_reported_to_the_core_on_the_urgent_lane`. Net:
+  `the_off_core_renewal_message_is_appended_after_every_other_variant`. Harness:
+  `Losses::excused` per generation, like with like, and the `KNOWN-GAP` label;
+  an excused loss leaves the run inconclusive. `tests/test_load_campaign.py`: a
+  campaign with more than 10% inconclusive runs fails.
+- Sim: `a_delegate_stuck_in_a_step_keeps_its_grant` (24 seeds of
+  `delegated-core-stall`, `-forwarded` and the `-unlaned` twin, whose seeds must
+  all lose their grants, so the configuration is not vacuous),
+  `a_delegate_hung_past_the_bound_is_reclaimed`,
+  `a_capped_grant_before_a_stall_is_renewed_at_the_capped_period_on_a_short_lease`
+  (seeds 1447 and 2079: failed before the lane followed the granted ttl),
+  `a_delegate_frozen_past_its_grant_counts_its_loss_as_one_in_a_freeze` (and a
+  stall with the process alive is never counted as a freeze); the sim models the lane
+  in its own task (`deleg_lane_loop`, a `StallStep` is a stuck step, a `Pause` a
+  frozen process, its registrations go ahead of everything on an urgent queue, its
+  renewal is the `DelegRenewOffCore` message, the bus taps the granted ttl with
+  its sender).
+- Harness `delegate-store-stall`, and the stricter `delegate-handoff-renewal`.
+
+### Gates
+
+On the plan-43 box, release build where it matters; every job under `timeout`.
+`cargo fmt --check`, `clippy --workspace --all-targets -D warnings`,
+`cargo test --workspace --no-fail-fast` once on the final tree: 3225 passed, 0
+failed (a first run, started at load 88 from another job, had `hostlag::the_probe_measures_its_own_sleep`
+fail, a timing test of the harness's own probe, which passes on the quiet box and is
+untouched; and `schema_file_is_current`, the control schema not yet re-blessed for the
+new status fields: done). Sims at 2000 seeds (box load 2-12), all on the final tree:
+`long-delegated`, `long-delegated-backup`, `long-delegated-late-answers`,
+`delegated-holder-cut`, `delegated-root-gone`, `delegated-delegate-restart`,
+`locks-stall-step-delegated`, `delegated-core-freeze`: 0 failing; 20000 seeds (load
+10-12): `delegated-core-stall`, `-lease6`, `-forwarded`, `delegated-core-hang`,
+`delegated-core-freeze`: 0 failing.
+Harness (`linux-fuse-process`, seed 42), every batch with its status line (rc,
+load, inconclusive, known-gap; the batch fails above 10% inconclusive), on a quiet
+box (another job's sweeps had held it at load 15-60 earlier in the round: see
+below): `delegate-store-stall` x10 at load 0.1-2.3: 10 of 10, 0 inconclusive, 0
+`KNOWN-GAP root core stuck`; lane off x3 at 9 s: 3 of 3 fail, unexcused (the generic
+verdict, not the known-gap one); `delegate-handoff-renewal` x20 at load 0.3-3.3: 20 of
+20, 0 inconclusive, 0 known-gap; the stress-ng loaded batch (`stress-ng --cpu 16`
+for the whole batch) x10 at load 4.9-16.9: 10 of 10, 0 inconclusive, 0 known-gap; the
+scenario's own 6 s `SIGSTOP` of `b` (`CONSTELLATION_HARNESS_DELEG_FREEZE_MS`) x6 at
+load 0.4-0.8: 6 of 6, each lapse classified by the daemon as under a freeze, 0
+known-gap (the injection is expected, not inconclusive). Once each at load 0.4, all
+passed: `root-failover-with-delegates`, `delegate-crash`, `delegate-crash-backup`,
+`delegate-partition`, `backup-failover-with-delegation`, `delegate-paused-across-ttl`,
+`delegate-root-loss`, `delegate-root-loss-ttl`, `delegate-backup-handoff-failover`,
+`auto-placement`, `delegated-subtrees`, `flock-cross-node` and every `lock-*`
+(`lock-grant-dead-generation`, `lock-holder-partitioned`, `lock-failover`,
+`lock-holder-killed-contention`, `lock-fence-at-close`, `lock-release-at-close`,
+`lock-lapse-lone-node`, `lock-latency`, `lock-stall-lone-node`,
+`lock-contention-paused-holder`, `lock-contention-stalled-owner`).
+`delegate-store-stall` x10 under another job's load (another agent's sim sweeps, load
+5-21 while it ran, none of it mine): runs 1-3 passed, then 2 of the next 4 failed `KNOWN-GAP root
+core stuck` (b's core stuck 9-10 s at a 5 s and a 9 s stall, a renewal sent in time
+never answered), one failed on the write latency after the stall (p50 445 ms against a
+control p90 of 3.6 ms, an overloaded host) and one on `node.status: the daemon did not
+answer Hello` (96 s): so the batch counts 2 of 7 known-gap at that load, and the
+batch was stopped and rerun above on the quiet box. Earlier rounds' measurement of
+the same: `delegate-handoff-renewal` x20, 2 failures at load 1-8 on whole-write bounds
+during a host-wide disk stall.
+Cost while the driver is not stuck: the heartbeat thread's CPU was 0.03-0.09 ms per
+second with the lane on or off on the first version (10 ms resolution, 219 and 302
+thread-seconds; since added: two atomic stores and a compare per 300 ms tick); per
+core step on a node that has a delegation, one mutex lock and an in-place walk of its
+certificates (no allocation unless one changed); per driver wake-up two atomic loads
+(the runtime's probe is read only when the heartbeat thread was late); `vfs-bench`
+(it exercises no core, so it only shows that nothing else moved) the same on main and
+on the first version over three runs each.

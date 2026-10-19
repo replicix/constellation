@@ -792,7 +792,20 @@ fn run(opts: RunOpts) -> Result<()> {
             inconclusive.join(", ")
         );
     }
-    if skipped.is_empty() {
+    if !inconclusive.is_empty() {
+        // Not a pass: no scenario failed, but these were not judged (exit
+        // status 0 as before; the results file and the campaign runner count
+        // them, and fail a batch with too many).
+        eprintln!(
+            "NO SCENARIO FAILED, {} INCONCLUSIVE (not passed){}",
+            inconclusive.len(),
+            if skipped.is_empty() {
+                String::new()
+            } else {
+                format!(", {} skipped: {}", skipped.len(), skipped.join(", "))
+            }
+        );
+    } else if skipped.is_empty() {
         eprintln!("ALL SCENARIOS PASSED");
     } else {
         eprintln!(

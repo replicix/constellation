@@ -142,6 +142,25 @@ pub enum Event {
     /// watch (the seal watch, `ack=s3`'s) counts silence only from the
     /// end of the latest lapse (`Core::attentive_since`).
     OwnLag { from: Ms, until: Ms },
+    /// The off-core delegation renewal lane (`crate::deleg_lane`) sent a
+    /// renewal of `gen` (stream round `round`) to root `to` as request `req`
+    /// at `sent` (this node's clock, read before the send), because the
+    /// core was stuck in a step. Sent on the urgent lane ahead of the
+    /// answer, so the answer is known when it arrives
+    /// ([`Core::on_deleg_renew_sent_off_core`]).
+    DelegRenewSentOffCore {
+        gen: u64,
+        round: u64,
+        to: NodeId,
+        req: OpId,
+        sent: Ms,
+    },
+    /// The off-core heartbeat thread did not run from `from` to `until`
+    /// (this node's clock): the whole process was frozen, and nothing in it
+    /// could renew a delegation (`Core::on_own_freeze`). The core uses it
+    /// only to say, when it gives a grant up, whether the freeze alone
+    /// explains the loss (`Stats::deleg_lapses_frozen`).
+    OwnFreeze { from: Ms, until: Ms },
     /// The holder's side of the same heartbeat: backup `from` answered
     /// one sent at `at` (its process and link are up, whatever its core
     /// is doing). A backup known alive is given `backup_slow_max_ms`, not
@@ -628,6 +647,18 @@ pub enum PeerMsg {
         /// cut is as of the earliest of these (`Core::lock_cut_here`).
         stream_head_at: i64,
     },
+    /// A delegate's off-core lane renews its grant on `gen` while its
+    /// core is stuck in a step (`crate::deleg_lane`). The root answers with
+    /// the same `DelegRenewed`. It carries no backup and no stream head
+    /// (the lane has neither: the core's are not known to be current, and
+    /// a head needs the core's `settle_tagged_writes`), so the root
+    /// extends the grant and learns nothing about the delegate's stream
+    /// or backup from it.
+    DelegRenewOffCore {
+        req: OpId,
+        gen: u64,
+        round: u64,
+    },
     DelegRenewed {
         req: OpId,
         gen: u64,
@@ -811,6 +842,7 @@ impl PeerMsg {
             PeerMsg::DelegateStream { .. } => "DelegateStream",
             PeerMsg::DelegateStreamAck { .. } => "DelegateStreamAck",
             PeerMsg::DelegRenew { .. } => "DelegRenew",
+            PeerMsg::DelegRenewOffCore { .. } => "DelegRenewOffCore",
             PeerMsg::DelegRenewed { .. } => "DelegRenewed",
             PeerMsg::DelegRecall { .. } => "DelegRecall",
             PeerMsg::DelegRecalled { .. } => "DelegRecalled",
@@ -867,6 +899,7 @@ impl PeerMsg {
             | PeerMsg::PromiseRequest { req, .. }
             | PeerMsg::DelegateStream { req, .. }
             | PeerMsg::DelegRenew { req, .. }
+            | PeerMsg::DelegRenewOffCore { req, .. }
             | PeerMsg::DelegRecall { req, .. }
             | PeerMsg::DelegBackupAppend { req, .. }
             | PeerMsg::DelegSeal { req, .. }

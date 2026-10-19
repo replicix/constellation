@@ -728,6 +728,17 @@ pub enum Payload {
     HolderAliveAck {
         core_responsive: bool,
     },
+    // ---- the off-core delegation renewal lane ----
+    /// A delegate's off-core lane renews its grant on `gen` while its core
+    /// is stuck: as [`Payload::DelegRenew`] without the backup and the
+    /// stream head, which the lane does not know (the root extends the
+    /// grant and notes nothing else). Answered by [`Payload::DelegRenewed`].
+    DelegRenewOffCore {
+        from: u64,
+        req_id: u64,
+        gen: u64,
+        round: u64,
+    },
 }
 
 /// One beat of the holder's off-core heartbeat ([`Payload::HolderAlive`]):
@@ -1059,6 +1070,35 @@ mod tests {
                 .is_err(),
             "a length-prefixed frame must not be accepted as a bare payload"
         );
+    }
+
+    /// The off-core delegation renewal message is the last variant of
+    /// [`Payload`] (postcard encodes the variant index: the others keep
+    /// theirs, and a binary without it fails to decode it rather than
+    /// reading another message).
+    #[test]
+    fn the_off_core_renewal_message_is_appended_after_every_other_variant() {
+        let tag = |payload: &Payload| postcard::to_allocvec(payload).unwrap()[0];
+        let ack = tag(&Payload::HolderAliveAck {
+            core_responsive: true,
+        });
+        let off_core = tag(&Payload::DelegRenewOffCore {
+            from: 1,
+            req_id: 2,
+            gen: 3,
+            round: 4,
+        });
+        assert!(ack < 0x80 && off_core < 0x80, "one-byte variant indices");
+        assert_eq!(off_core, ack + 1);
+        let payload = Payload::DelegRenewOffCore {
+            from: 2,
+            req_id: 9,
+            gen: 7,
+            round: 1,
+        };
+        let k = key();
+        let signed = Signed::new(&k, &payload).unwrap();
+        assert_eq!(signed.verify().unwrap().1, payload);
     }
 
     /// Plan 32 Step 0.1: the snapshot batch variants are appended after

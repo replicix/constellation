@@ -218,6 +218,105 @@ delegated directory do not wait for its ship either. Status:
   never outlives the lease it came from. A renewal not answered within
   the request timeout is sent again; a grant that comes later still
   counts, from its own renewal's send, for up to a minute.
+- A delegate's renewal is a step of its authority core, and a core stuck
+  in one step (a priority metadata write waiting for the store's writer
+  lock behind a FUSE thread's slow journal write, a blocking log write)
+  sends none. Past the renewal slack (about `ttl/2 + margin`) the root
+  reclaimed a delegation whose node was alive. So while the driver has
+  made no progress for a quarter of the renewal period (500 ms at most,
+  100 ms at least) and for no longer than `CONSTELLATION_HOLDER_STALL_MS`
+  (15 s: past that it is hung, not slow), the heartbeat thread (the
+  holder's off-core liveness thread, with its own runtime and connection)
+  sends each renewal that is due, from a certificate the core publishes
+  when it changes (the generation, its root and round, when a renewal is
+  next due, the period; per step the driver compares it in place under
+  one lock, allocating nothing unless it changed), counting a renewal the
+  core dispatched as sent only once the driver dispatched it. The lane
+  sends its own message (`DelegRenewOffCore`), which carries no backup and
+  no stream head. It registers each request with the core first, on the
+  urgent lane, and the core counts the answer as it counts any late one:
+  honoured from the lane's send. The lane never sets a grant's honoured
+  end, its lapse, the parked ops or the execution, and it logs nothing per
+  send. `CONSTELLATION_DELEG_LANE=off` turns it off (for A/B runs). Why
+  this is safe:
+  1. The lane stamps `sent` before it hands the request to the transport,
+     the root grants from its receipt (`granted ≥ sent`) and reclaims no
+     earlier than `granted + ttl + margin`, and the core honours `sent +
+     ttl − margin`: the delegate stops at least two margins before the
+     root's earliest reclaim, the same inequality as an in-time renewal.
+  2. Only the core decides: the answer goes through `on_deleg_renewed` and
+     its root and round checks; a refusal on a lane request is dropped, as
+     any late refusal is, and the log ends the generation.
+  3. The root grants by the same rules (no grant once a recall or a
+     reclaim has begun, its freshness hold, the cap of its own lease), but
+     it learns less from the lane's renewal than from the core's: it
+     extends the grant and answers, and notes **no stream head and no
+     backup**. Both need the core. The head is what the delegate executed
+     by the renewal's stamp; the core settles its tagged writes before it
+     reports it, and the FUSE fast path keeps executing rows while the core
+     is stuck, so a lane could only report a head that is too old. The root
+     takes the as-of time of its lock cut, and a new tenure's wait for a
+     head, from the core's renewals alone; a lock barrier under the
+     subtree therefore settles when the core renews, not on the lane's
+     word (liveness only: a holder outwaited meanwhile is granted on
+     after). The backup is the node the root seals when the delegate goes
+     silent and whose acknowledgements clients were given; a certificate
+     one step old must not unname the one the core just chose.
+  4. The certificate is the state after the last finished step. A step in
+     progress that stops the generation (a refusal, a strand) can be
+     followed by at most one lane renewal per period from the old
+     certificate: the root's `until` moves one period later for a
+     generation the delegate no longer executes in. That costs liveness
+     only; the generation still ends through the log or a recall.
+  5. Bound: no lane renewal once the driver is stuck past the hung bound,
+     so a hung delegate's subtree is reclaimed at most that bound plus
+     `ttl + margin` after the hang began.
+  The lane follows the grant the root named: the answers reach the node's
+  P2P service off the core, which notes the granted ttl per generation and
+  round with the node it came from, and the lane renews at a quarter of it
+  (not below 250 ms) where that is shorter than the core's period, counting
+  only the answers of the root its certificate names. The root caps every
+  grant by what is left of its own lease (`expires − margin`) outside a
+  continuation-epoch hold: a lease renewal that runs late (a slow or
+  throttled S3 lease PUT, the root's own core stuck behind the same slow
+  disk, which is correlated with the delegate's stall) or a grant inherited
+  from an old root after a failover leaves a grant of a second or so, and a
+  period of half the previous full grant would come after the root's
+  reclaim. (With a 60 s lease, a 20 s grant and a 1 s margin this needs the
+  lease renewal about 9 s late; rare, not never.) Only the lane's period
+  follows it; the core still decides everything. A lane request that fails at
+  the transport is reported to the core (on the urgent lane, behind its
+  registration), which drops it from its pending renewals, as it does a core
+  renewal's failure.
+  Not covered, and told apart by the core when it gives a grant up (a lapse, a
+  refusal after the grant ran out, or the log ending the generation after it
+  ran out; each is also counted in `grants_lost`):
+  - A freeze of the whole process, no thread of which runs, from a renewal's
+    due time to the grant's loss. The heartbeat thread stamps when its next
+    tick is due; the driver, waking first after a freeze, reads the missed
+    tick, and hands the core the freeze only if the shared runtime's own lag
+    probe missed the same interval (the whole process, not the heartbeat
+    thread held up alone, in a log line or on a mutex, which is a failure of
+    the lane's thread, not a freeze). If it began no later than a second
+    after the renewal fell due and lasted to within a round trip of the
+    grant's end, the loss is counted in `lapses_during_freeze` (with
+    `last_freeze_ms` and `last_freeze_gen`). A freeze that ended in time to
+    renew in, or began after the lane had its chance, or is far from the
+    loss, explains nothing. The root cannot see the delegate's freeze: a
+    reclaim that follows one is explained by the delegate's counter for the
+    same grant (the reclaim point is the delegate's lapse point).
+  - A root that did not answer: a renewal the delegate had sent by the time the
+    lane would have acted (a due time plus a second, the freeze's own rule,
+    so that a late lane's renewal is never taken for one sent in time) stayed
+    unanswered until the grant ran out. The root answers renewals from its
+    core, which this lane does not cover; counted in `lapses_root_silent`
+    (with `last_silent_gen`) as a diagnosis, not an excuse. The one such case
+    measured was the root's core, and the delegate's, blocked in the same
+    instant in a shared log sink (plan 44's class), not a slow S3 put.
+  A delegate that sent nothing in time, or whose lane's request never got to
+  the root, is counted in neither: that is the lane's or the transport's failure.
+  The heartbeat thread can still block in a log write (plan 44's non-blocking
+  writer is to address it); that is the second case, or a failure.
 - The delegate honours a grant until `sent + ttl − margin` on its own
   clock; the root considers it live until `granted + ttl + margin` on
   its clock (the same discipline as read delegations and lock grants).
@@ -367,6 +466,21 @@ designations create no delegation.
 - **Delegate partitioned from the root**: it stops at `sent + ttl −
   margin`, before the root may reclaim; its unstreamed rows are stranded
   and replayed.
+- **Delegate's core stalled behind a slow disk** (a store write that holds
+  the writer lock for seconds on a loaded btrfs or network volume, a log
+  write blocked the same way): the delegate keeps its grant for as long as
+  the stall is below `CONSTELLATION_HOLDER_STALL_MS` (15 s), because the
+  off-core lane renews it meanwhile (above); its writes wait for the stall
+  and nothing else, and the delegation is not lost. Before, a stall longer
+  than the renewal slack (about `ttl/2 + margin`: 3.5 s at a 5 s ttl, 11 s
+  at the 20 s default) lost it: the root reclaimed, the delegate lapsed,
+  and every later write in the subtree went through the root, 4 to 12 times
+  slower, until something delegated it again (`delegate-store-stall`). A
+  stall past the hung bound is the delegate being hung, not slow: the lane
+  stops there and the root reclaims, as for a dead delegate. The root's own
+  answering stays in its core: a root stuck in a step answers late (it
+  reclaims nothing meanwhile), so a delegate may lapse then, and keeps its
+  grant unless ops were parked.
 - **Delegate restarts or is handed off** (a crash and remount, `daemon
   --upgrade`, a K5 engine-pod handoff: the same node identity and
   journal): it re-adopts the generations the table names for it when
@@ -446,6 +560,7 @@ designations create no delegation.
 |---|---|---|
 | `CONSTELLATION_DELEGATION` | on | delegate and accept delegations |
 | `CONSTELLATION_DELEGATION_TTL_MS` | lock TTL (20 s), at least `5000` | grant lifetime |
+| `CONSTELLATION_DELEG_LANE` | on | the off-core renewal lane for a stuck core; `off` for A/B runs |
 | `CONSTELLATION_DELEGATION_PLACEMENT` | on | automatic placement and splits |
 | `CONSTELLATION_DELEGATION_WINDOW_MS` | `30000` | placement window |
 | `CONSTELLATION_DELEGATION_MIN_OPS` | `200` | rate floor per window |
@@ -475,6 +590,12 @@ node's takeover gate while the op waited for the store's writer lock),
 `forwarded_to_delegate`, `deps_waits`,
 `streamed_txs`, `appended_txs`, `cross_subtree`, `recalls_sent`,
 `recalls_drained`, `recalls_expired`, `reclaimed`, `ended`,
+`renewals_off_core` (renewals the off-core lane sent while the core was
+stuck in a step), `grants_lost` (every grant the node gave up), of which
+`lapses_during_freeze` with `last_freeze_ms` and `last_freeze_gen` (the
+node's whole process was frozen) and `lapses_root_silent` with
+`last_silent_gen` (a renewal sent in time was never answered by the root)
+are classified: see "Grants, renewal and expiry",
 `redelegated`, `deps_overflow_to_root`, `refused_designated`, and the
 placement's `place_evaluations`, `place_delegated`, `place_recalled`,
 `place_splits`, `place_range_recalls`, `place_skipped_cooldown` and
@@ -532,6 +653,6 @@ Recall the delegations, or turn placement off, to let it move.
   `delegate-crash`, `marker-order`, `root-failover-with-delegates`,
   `auto-placement`, `shared-dir-multi-writer`, `delegate-root-loss`,
   `delegate-root-blackhole`, `delegate-root-loss-ttl`,
-  `delegate-handoff-renewal`
+  `delegate-handoff-renewal`, `delegate-store-stall`
 - [Lease placement](lease-placement.md), [Forwarded mutations](forwarded-mutations.md),
   [Cluster locks](cluster-locks.md)

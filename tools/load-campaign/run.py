@@ -18,8 +18,9 @@ and DIR/summary.md. A cell's verdict is the scenario's outcome (`passed`,
 `inconclusive`, `failed`, `skipped`), or `harness-error` when the harness
 itself did not finish (killed at --wall), or, for a smoke break run,
 `caught`/`missed`. The exit status is 1 when any cell failed (or a break
-was missed), else 0: `inconclusive` is a pass whose latency could not be
-judged on a starved host.
+was missed), or when more than `--max-inconclusive-pct` (10) of the judged
+cells are `inconclusive` (not a pass: its bounds could not be judged on a
+starved host, or part of it was skipped), else 0.
 
 Profiles are the harness's (presets: `harness` load.rs PRESETS, or items
 like `cpu:25@a,s3:latency:500:400`), plus the runner's own `dm-delay`
@@ -420,7 +421,22 @@ def worst_lag(h: dict | None) -> str:
     return f"{w['source']} p99 {w['p99_ms']:.1f} ms, max {w['max_ms']:.0f} ms, lost {w['stolen_ms']} ms; cpu psi {psi}%"
 
 
-def summarize(out: Path, rows: list[dict] | None = None) -> int:
+# More than this share of the judged cells ending `inconclusive` (a verdict that
+# is no pass: the scenario's bounds could not be judged, or part of it was
+# skipped) fails the campaign: a batch that proves nothing must not stay green.
+MAX_INCONCLUSIVE_PCT = 10.0
+
+
+def too_many_inconclusive(rows: list[dict], max_pct: float) -> str | None:
+    judged = [r for r in rows if r["verdict"] not in ("excluded", "skipped")]
+    inc = [r for r in judged if r["verdict"] == "inconclusive"]
+    if judged and 100.0 * len(inc) / len(judged) > max_pct:
+        return (f"{len(inc)} of {len(judged)} judged runs are inconclusive "
+                f"({100.0 * len(inc) / len(judged):.0f}% > {max_pct:g}%)")
+    return None
+
+
+def summarize(out: Path, rows: list[dict] | None = None, max_inconclusive_pct: float = MAX_INCONCLUSIVE_PCT) -> int:
     if rows is None:
         rows = [json.loads(p.read_text()) for p in sorted(out.glob("**/run.json"))]
     (out / "summary.json").write_text(json.dumps(rows, indent=2) + "\n")
@@ -444,7 +460,10 @@ def summarize(out: Path, rows: list[dict] | None = None) -> int:
         )
     (out / "summary.md").write_text("\n".join(md) + "\n")
     print("\n".join(md[:3]))
-    return 1 if any(r["verdict"] in bad for r in rows) else 0
+    many = too_many_inconclusive(rows, max_inconclusive_pct)
+    if many:
+        print(f"!!! {many}: the batch proves too little", file=sys.stderr)
+    return 1 if any(r["verdict"] in bad for r in rows) or many else 0
 
 
 def main() -> int:
@@ -470,9 +489,11 @@ def main() -> int:
     ap.add_argument("--notice", help="append a line here while a run injects load (shared hosts)")
     ap.add_argument("--env", action="append", default=[], help="K=V for every harness run (repeatable)")
     ap.add_argument("--summarize", metavar="DIR", help="only (re)write DIR's summary")
+    ap.add_argument("--max-inconclusive-pct", type=float, default=MAX_INCONCLUSIVE_PCT,
+                    help="fail when more than this share of the judged runs is inconclusive")
     a = ap.parse_args()
     if a.summarize:
-        return summarize(Path(a.summarize))
+        return summarize(Path(a.summarize), None, a.max_inconclusive_pct)
     if not a.out or not (a.phase or a.scenario):
         ap.error("--out and --phase or --scenario are required")
     preset = PHASES.get(a.phase or "", {})
@@ -516,7 +537,7 @@ def main() -> int:
                 print(inject("cleanup"), end="")
             except subprocess.CalledProcessError as e:
                 print(f"!!! cleanup: {e.stderr}", file=sys.stderr)
-    return summarize(Path(a.out), rows)
+    return summarize(Path(a.out), rows, a.max_inconclusive_pct)
 
 
 if __name__ == "__main__":

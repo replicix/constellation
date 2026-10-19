@@ -381,6 +381,11 @@ pub struct SimConfig {
     /// No holder drops a backup for want of acknowledgements
     /// (`backup_ack_timeouts`): lag costs no reconfiguration either.
     pub keeps_backups: bool,
+    /// The off-core delegation renewal lane is modelled (a delegate's
+    /// driver stuck in a step has its renewals sent for it,
+    /// `deleg_lane_loop`). `false` is the code before it, the non-vacuity
+    /// knob of the core-stall configurations.
+    pub deleg_lane: bool,
 }
 
 /// See `SimConfig::fast_path`.
@@ -613,6 +618,7 @@ impl Default for SimConfig {
             timers_first_after_lag: false,
             beats_lost_in_lag: false,
             keeps_backups: false,
+            deleg_lane: true,
         }
     }
 }
@@ -2312,6 +2318,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         holder_beats: cfg.holder_beats,
         timers_first_after_lag: cfg.timers_first_after_lag,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
+        deleg_lane: cfg.deleg_lane,
     };
     env.world
         .hold_ms

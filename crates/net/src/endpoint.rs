@@ -1243,6 +1243,9 @@ pub trait PeerService: Send + Sync + 'static {
         _stream_head_at: i64,
     ) {
     }
+    /// One way: a delegate's off-core renewal ([`Payload::DelegRenewOffCore`],
+    /// answered by the root's [`Payload::DelegRenewed`]). Default: ignored.
+    fn deleg_renew_off_core(&self, _from: u64, _req_id: u64, _gen: u64, _round: u64) {}
     /// Plan 30 §M11, one way: the root's answer to a renewal. Default:
     /// ignored.
     #[allow(clippy::too_many_arguments)]

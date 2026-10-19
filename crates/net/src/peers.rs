@@ -1519,6 +1519,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | DelegateStream { from, .. }
         | DelegateStreamAck { from, .. }
         | DelegRenew { from, .. }
+        | DelegRenewOffCore { from, .. }
         | DelegRenewed { from, .. }
         | DelegBackupAppend { from, .. }
         | StreamAhead { from, .. }
@@ -1731,6 +1732,15 @@ async fn handle_stream<S: PeerService>(
                     stream_head,
                     stream_head_at,
                 );
+                Some(Payload::Ok { req_id })
+            }
+            Payload::DelegRenewOffCore {
+                from,
+                req_id,
+                gen,
+                round,
+            } => {
+                service.deleg_renew_off_core(from, req_id, gen, round);
                 Some(Payload::Ok { req_id })
             }
             Payload::DelegRenewed {

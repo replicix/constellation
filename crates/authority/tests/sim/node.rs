@@ -24,7 +24,7 @@ use constellation_store_s3::heartbeat::HeartbeatStore;
 use constellation_store_s3::inbox::InboxStore;
 use constellation_store_s3::{LeaseMode, LeaseStore, LogStore, StoreError};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -198,6 +198,24 @@ pub struct Shared {
     /// for the ghost's check that none landed inside another node's
     /// critical section (`LockGhost::check_landings`).
     pub landed: Mutex<Vec<(Rid, u64)>>,
+    /// The off-core delegation renewal lane's view of the driver
+    /// (`deleg_lane_loop`, the daemon's `OffCore`): when its current step
+    /// began, on this node's clock (0: none — only a `StallStep` is
+    /// modelled as a stuck step), the certificates its core published
+    /// after its last event, and the urgent lane the lane's registrations
+    /// go to.
+    busy_since: AtomicI64,
+    /// When the lane thread's next tick is due, and the last freeze it saw
+    /// end (the daemon's `OffCore::beat_due` / `beat_freeze`): a paused
+    /// process skips its ticks, and the driver, waking first, reads the
+    /// missed one (`deleg_lane::freezes`).
+    beat_due: AtomicI64,
+    beat_freeze: AtomicU64,
+    /// The root's latest grant per generation and round, tapped off the bus
+    /// as the answer arrives (the daemon's `OffCore::granted_ttl`).
+    granted_ttl: Mutex<HashMap<(u64, u64), (NodeId, u64)>>,
+    deleg_certs: Mutex<Vec<constellation_authority::DelegRenewCert>>,
+    urgent: mpsc::UnboundedSender<Event>,
 }
 
 /// See `Shared::held_ctl`.
@@ -272,6 +290,8 @@ pub struct NodeEnv {
     pub timers_first_after_lag: bool,
     /// See `SimConfig::beats_lost_in_lag`.
     pub beats_lost_in_lag: bool,
+    /// See `SimConfig::deleg_lane`.
+    pub deleg_lane: bool,
 }
 
 impl NodeEnv {
@@ -320,6 +340,7 @@ impl NodeHandle {
         // new FUSE session.
         meta.session().reset();
         let (tx, rx) = mpsc::unbounded_channel();
+        let (urgent_tx, urgent_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             replies: Mutex::new(HashMap::new()),
             controls: Mutex::new(HashMap::new()),
@@ -348,6 +369,12 @@ impl NodeHandle {
             held_ctl: Mutex::new(None),
             hold_partition: Mutex::new(None),
             landed: Mutex::new(Vec::new()),
+            busy_since: AtomicI64::new(0),
+            beat_due: AtomicI64::new(0),
+            beat_freeze: AtomicU64::new(0),
+            granted_ttl: Mutex::new(HashMap::new()),
+            deleg_certs: Mutex::new(Vec::new()),
+            urgent: urgent_tx,
         });
         {
             let shared = shared.clone();
@@ -363,9 +390,30 @@ impl NodeHandle {
             meta.locks().set_settle_for_tests(env.settle_tagged_writes);
         }
         env.bus.attach(id, tx.clone());
+        {
+            let shared = shared.clone();
+            env.bus.set_tap(
+                id,
+                Arc::new(move |from: NodeId, msg: &PeerMsg| {
+                    if let PeerMsg::DelegRenewed {
+                        gen, round, ttl_ms, ..
+                    } = msg
+                    {
+                        if *ttl_ms > 0 {
+                            shared
+                                .granted_ttl
+                                .lock()
+                                .unwrap()
+                                .insert((*gen, *round), (from, *ttl_ms));
+                        }
+                    }
+                }),
+            );
+        }
         env.world.register(id, meta.clone());
         let cfg = (env.config)(id, incarnation);
         let beat_every_ms = cfg.backup_heartbeat_ms.max(1);
+        let lane = env.deleg_lane && cfg.delegation && cfg.p2p;
         let driver = Driver {
             id,
             meta: meta.clone(),
@@ -377,6 +425,7 @@ impl NodeHandle {
             clock: env.clock_of(id),
             tx: tx.clone(),
             rx,
+            urgent_rx,
             shared: shared.clone(),
             rolled_back_seen: (0, 0),
             journal_seen: None,
@@ -393,10 +442,20 @@ impl NodeHandle {
             peers_held_until: None,
             lag_queue: Vec::new(),
             lag_pending: None,
+            freeze_handed: (0, 0),
             stamps_first: !env.timers_first_after_lag,
             beats_lost_in_lag: env.beats_lost_in_lag,
         };
         let task = tokio::spawn(driver.run());
+        if lane {
+            tokio::spawn(deleg_lane_loop(
+                id,
+                shared.clone(),
+                env.bus.clone(),
+                env.clock_of(id),
+                beat_every_ms,
+            ));
+        }
         if env.holder_beats != super::run::HolderBeats::Off {
             tokio::spawn(beat_loop(
                 id,
@@ -552,6 +611,10 @@ struct Driver {
     clock: Clock,
     tx: mpsc::UnboundedSender<Event>,
     rx: mpsc::UnboundedReceiver<Event>,
+    /// The daemon's urgent lane, as far as the delegation renewal lane
+    /// uses it: its registrations are taken ahead of everything queued
+    /// ([`Driver::next_event`]).
+    urgent_rx: mpsc::UnboundedReceiver<Event>,
     shared: Arc<Shared>,
     rolled_back_seen: (u64, u64),
     /// `(journal tip, journal length)` when `Shared::journaled_refusals`
@@ -582,6 +645,8 @@ struct Driver {
     /// ends ([`Driver::finish_lag`]).
     lag_queue: Vec<Event>,
     lag_pending: Option<tokio::time::Instant>,
+    /// The latest freeze of the lane thread handed to the core.
+    freeze_handed: (i64, i64),
     /// After a lag, what the daemon's P2P handlers stamped meanwhile goes
     /// to the core before the timers ([`Driver::finish_lag`]).
     stamps_first: bool,
@@ -735,6 +800,95 @@ async fn beat_loop(
     }
 }
 
+/// The off-core delegation renewal lane (`DelegLane` in the daemon's
+/// `holder_alive_loop`): every beat interval, while the node is alive and
+/// not stopped as a process (`pause_until`), if its driver has been stuck
+/// in a step for `DELEG_LANE_STUCK_MS` and not past the hung bound, the
+/// renewals that are due ([`constellation_authority::deleg_lane::due`],
+/// from the certificates its core published after its last event) are
+/// registered with the core on the urgent lane and sent to the root over
+/// the bus. Only a `StallStep` is a stuck step here. Its own thread: a
+/// runtime lag does not hold it up.
+async fn deleg_lane_loop(
+    id: NodeId,
+    shared: Arc<Shared>,
+    bus: Arc<Bus>,
+    clock: Clock,
+    every_ms: u64,
+) {
+    use constellation_authority::deleg_lane::{due, with_granted_ttl, FREEZE_MIN_MS, LANE_REQ_BIT};
+    let mut seq = 0u64;
+    let mut sent: HashMap<(u64, u64), constellation_authority::Ms> = HashMap::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
+        if !shared.alive.load(Ordering::SeqCst) {
+            return;
+        }
+        if shared
+            .paused_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| tokio::time::Instant::now() < until)
+        {
+            continue;
+        }
+        let now = clock.now();
+        // This tick ran; if it ran late, the process was frozen meanwhile.
+        let due_was = shared.beat_due.load(Ordering::SeqCst);
+        if due_was > 0 && now.0 - due_was >= FREEZE_MIN_MS {
+            shared.beat_freeze.store(
+                constellation_authority::deleg_lane::pack_freeze(due_was, now.0 - due_was),
+                Ordering::SeqCst,
+            );
+        }
+        shared
+            .beat_due
+            .store(now.0 + every_ms as i64, Ordering::SeqCst);
+        let busy = shared.busy_since.load(Ordering::SeqCst);
+        let stuck_ms = if busy != 0 { now.0 - busy } else { 0 };
+        let mut certs = shared.deleg_certs.lock().unwrap().clone();
+        for c in certs.iter_mut() {
+            if let Some((from, ttl)) = shared.granted_ttl.lock().unwrap().get(&(c.gen, c.round)) {
+                if *from == c.root {
+                    *c = with_granted_ttl(c, *ttl);
+                }
+            }
+        }
+        sent.retain(|k, _| certs.iter().any(|c| (c.gen, c.round) == *k));
+        for c in due(&certs, now, stuck_ms, SIM_HOLDER_STALL_MS, &sent) {
+            seq += 1;
+            let req = OpId(LANE_REQ_BIT | seq);
+            if shared
+                .urgent
+                .send(Event::DelegRenewSentOffCore {
+                    gen: c.gen,
+                    round: c.round,
+                    to: c.root,
+                    req,
+                    sent: now,
+                })
+                .is_err()
+            {
+                return;
+            }
+            sent.insert((c.gen, c.round), now);
+            bus.send(
+                id,
+                c.root,
+                PeerMsg::DelegRenewOffCore {
+                    req,
+                    gen: c.gen,
+                    round: c.round,
+                },
+            );
+        }
+    }
+}
+
+/// `holder_stall_ms()`'s default in the daemon: a driver stuck longer is
+/// hung, not slow (`CONSTELLATION_HOLDER_STALL_MS`).
+const SIM_HOLDER_STALL_MS: i64 = 15_000;
+
 impl Driver {
     async fn run(mut self) {
         let now = self.clock.now();
@@ -833,6 +987,28 @@ impl Driver {
                 *self.shared.paused_until.lock().unwrap() = None;
             }
             let now = self.clock.now();
+            // The daemon's `Driver::hand_freeze`: a freeze of the lane thread
+            // the driver sees as it wakes, before the thread has run again.
+            for (from, until) in constellation_authority::deleg_lane::freezes(
+                self.shared.beat_freeze.load(Ordering::SeqCst),
+                self.shared.beat_due.load(Ordering::SeqCst),
+                now.0,
+            ) {
+                let (hf, hu) = self.freeze_handed;
+                if from != hf || until > hu + 200 {
+                    self.freeze_handed = (from, until);
+                    // (A step like any other: `handle` may emit actions.)
+                    let actions = self.core.handle(
+                        now,
+                        Event::OwnFreeze {
+                            from: constellation_authority::Ms(from),
+                            until: constellation_authority::Ms(until),
+                        },
+                        &*self.meta,
+                    );
+                    self.dispatch(actions);
+                }
+            }
             // F1 (`StallStep`): this step's `now` is taken; then it waits
             // (in the store, or stopped), and decides with that `now`.
             let stall = self.shared.stall_next.lock().unwrap().take();
@@ -843,7 +1019,11 @@ impl Driver {
                     ms,
                     "sim: step stalled after its clock read"
                 );
+                // The step is stuck: the delegation renewal lane sees it
+                // (`deleg_lane_loop`) from here.
+                self.shared.busy_since.store(now.0, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                self.shared.busy_since.store(0, Ordering::SeqCst);
             }
             // A beat's arrival stamp: when this node got to it (the
             // daemon stamps it in its P2P handler; a lag delays both).
@@ -1044,6 +1224,15 @@ impl Driver {
     /// before the backlog of beats is in.
     async fn next_event(&mut self) -> Option<Event> {
         loop {
+            // The urgent lane first (the lane's registrations: they must
+            // precede their answers, and the timers that fired meanwhile).
+            let mut urgent = Vec::new();
+            while let Ok(e) = self.urgent_rx.try_recv() {
+                urgent.push(e);
+            }
+            for e in urgent.into_iter().rev() {
+                self.ready.push_front(e);
+            }
             if let Some(event) = self.ready.pop_front() {
                 return Some(event);
             }
@@ -1069,6 +1258,10 @@ impl Driver {
             let event = match wake {
                 Some(t) => tokio::select! {
                     biased;
+                    Some(e) = self.urgent_rx.recv() => {
+                        self.ready.push_back(e);
+                        continue;
+                    }
                     _ = tokio::time::sleep_until(t) => {
                         if held_at.is_some_and(|h| h <= tokio::time::Instant::now()) {
                             self.release_held();
@@ -1077,7 +1270,14 @@ impl Driver {
                     }
                     e = self.rx.recv() => e?,
                 },
-                None => self.rx.recv().await?,
+                None => tokio::select! {
+                    biased;
+                    Some(e) = self.urgent_rx.recv() => {
+                        self.ready.push_back(e);
+                        continue;
+                    }
+                    e = self.rx.recv() => e?,
+                },
             };
             if self.beats_lost_in_lag && is_numbered_beat(&event) && {
                 // The lane is down only while the lag lasts, not until
@@ -1233,12 +1433,14 @@ impl Driver {
             }
             _ => None,
         };
+        let certs = self.core.deleg_renew_certs();
         let liveness = view.s3_held.map(|(epoch, until)| {
             let targets = self.core.liveness_targets().into_iter().map(|(n, _)| n);
             (epoch, until, targets.collect())
         });
         drop(view);
         *self.shared.liveness.lock().unwrap() = liveness;
+        *self.shared.deleg_certs.lock().unwrap() = certs;
     }
 
     /// Whenever the core rolled something back, the replay queue names

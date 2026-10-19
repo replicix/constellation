@@ -249,6 +249,8 @@ fn event_kind(event: &Event) -> &'static str {
         Event::HolderAlive { .. } => "HolderAlive",
         Event::BackupAlive { .. } => "BackupAlive",
         Event::OwnLag { .. } => "OwnLag",
+        Event::OwnFreeze { .. } => "OwnFreeze",
+        Event::DelegRenewSentOffCore { .. } => "DelegRenewSentOffCore",
         Event::Control { req, .. } => match req {
             Control::Nudge => "Control(Nudge)",
             Control::Journaled => "Control(Journaled)",
@@ -899,6 +901,9 @@ pub struct Driver {
     /// The end of the latest own lapse handed to the core
     /// ([`Driver::hand_lag`]).
     lag_handed: i64,
+    /// The latest freeze of the heartbeat thread handed to the core
+    /// ([`Driver::hand_freeze`]), `(from, until)`.
+    freeze_handed: (i64, i64),
     /// The thread the driver loop runs on now (its tokio worker), for the
     /// stuck-driver backtrace.
     loop_thread: Arc<Mutex<constellation_platform::process::ThreadRef>>,
@@ -1107,13 +1112,24 @@ async fn holder_alive_loop(
     // Beats still waiting for their answer, per peer.
     let pending: Arc<Mutex<HashMap<NodeId, usize>>> = Arc::default();
     let mut seq: u64 = 0;
+    let mut lane = DelegLane::from_env();
     let mut due = tokio::time::Instant::now() + every;
+    off_core.note_beat_due(now_unix_ms() + every.as_millis() as i64);
     while !stop.load(Ordering::Relaxed) {
         tokio::time::sleep_until(due).await;
         // On cadence; a tick this thread itself took late (the host held
         // the process up) is not caught up with a burst.
         let woke = tokio::time::Instant::now();
+        // How late this thread ran its tick: the whole process (or at
+        // least this thread) was frozen that long. Recorded (one atomic
+        // store) only when it matters to a grant; nothing is logged.
+        let woke_ms = now_unix_ms();
+        let late = woke.saturating_duration_since(due).as_millis() as i64;
+        if late >= constellation_authority::deleg_lane::FREEZE_MIN_MS {
+            off_core.note_beat_freeze(woke_ms - late, late);
+        }
         due = (due + every).max(woke);
+        off_core.note_beat_due(woke_ms + due.saturating_duration_since(woke).as_millis() as i64);
         let targets = alive.lock().unwrap().clone();
         let busy = off_core.busy_since();
         let now = now_unix_ms();
@@ -1139,6 +1155,25 @@ async fn holder_alive_loop(
             .max(now - echo);
         let hung =
             (busy != 0 && now - busy > stall) || runtime_stalled > stall || now - echo > stall;
+        // The delegation renewals the stuck core cannot send
+        // ([`DelegLane`]); on any node with a delegation, holder or not.
+        for (root, payload) in lane.tick(&off_core, node_id, now, stuck_ms, stall) {
+            let peers = peers.clone();
+            let off_core = off_core.clone();
+            tokio::spawn(async move {
+                let req_id = match &payload {
+                    Payload::DelegRenewOffCore { req_id, .. } => *req_id,
+                    _ => 0,
+                };
+                if peers
+                    .request_to_node_liveness(root, &payload, BEAT_TIMEOUT)
+                    .await
+                    .is_err()
+                {
+                    off_core.lane_send_failed(root, req_id);
+                }
+            });
+        }
         if hung != stalled {
             stalled = hung;
             if hung {
@@ -1223,6 +1258,139 @@ async fn holder_alive_loop(
                 }
             });
         }
+    }
+}
+
+/// The off-core delegation renewal lane's part of the heartbeat thread's
+/// tick (`crate::authority_driver::holder_alive_loop`, the lane
+/// `constellation_authority::deleg_lane` specifies).
+///
+/// A delegate's renewal is a step of its core. A core stuck in one step —
+/// a priority metadata write waiting for the store's writer lock behind a
+/// slow journal write, a blocking log write — for longer than the grant's
+/// slack renewed nothing, and the root reclaimed a delegation whose node
+/// was alive (`delegate-store-stall`: a 9 s store stall, 6 of 6 runs). While
+/// the driver has been stuck for a quarter of the renewal period (at most
+/// `DELEG_LANE_STUCK_MS`) and not longer than the hung bound
+/// ([`holder_stall_ms`]), this sends each
+/// renewal that is due from the certificates the core published after its
+/// last step, on the liveness lane (a connection and a runtime of the
+/// thread's own). Each send is registered with the core on the urgent lane
+/// first, so the answer, which comes in on that lane too, is known when it
+/// arrives: the core counts it as a late answer, honoured from the send
+/// (`Core::on_deleg_renew_sent_off_core`). The lane only sends. It never
+/// sets a delegation's honoured end, its lapse, its parked ops or its
+/// execution, and logs nothing per send. `CONSTELLATION_DELEG_LANE=off`
+/// turns it off (A/B runs, the fail-before of `delegate-store-stall`).
+struct DelegLane {
+    on: bool,
+    seq: u64,
+    /// The latest send per generation and stream round.
+    sent: HashMap<(u64, u64), Ms>,
+}
+
+impl DelegLane {
+    fn new(on: bool) -> Self {
+        Self {
+            on,
+            seq: 0,
+            sent: HashMap::new(),
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::new(!matches!(
+            std::env::var("CONSTELLATION_DELEG_LANE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false"
+        ))
+    }
+
+    /// The renewals to send now, as `(root, payload)`; each is registered
+    /// on the urgent lane already (`SyncRequest::DelegRenewSentOffCore`,
+    /// with `now` as its send time: read before the send, so the grant
+    /// is honoured no later than the root's receipt allows). One that
+    /// cannot be registered (no driver) is not sent.
+    fn tick(
+        &mut self,
+        off_core: &OffCore,
+        node_id: NodeId,
+        now: i64,
+        stuck_ms: i64,
+        hung_ms: i64,
+    ) -> Vec<(NodeId, Payload)> {
+        // The common case, a driver that progresses: two compares.
+        if !self.on
+            || !(constellation_authority::deleg_lane::DELEG_LANE_STUCK_MIN_MS..=hung_ms)
+                .contains(&stuck_ms)
+        {
+            return Vec::new();
+        }
+        let mut certs = off_core.deleg_certs.lock().unwrap().clone();
+        {
+            // The root's latest grant of each, as its answer reached the P2P
+            // service: shorter than the core's period if the root capped it.
+            let granted = off_core.granted_ttl.lock().unwrap();
+            for c in certs.iter_mut() {
+                // Only the root the certificate names: another node's
+                // answer says nothing of this grant.
+                if let Some((from, ttl)) = granted.get(&(c.gen, c.round)) {
+                    if *from == c.root {
+                        *c = constellation_authority::deleg_lane::with_granted_ttl(c, *ttl);
+                    }
+                }
+            }
+        }
+        if certs.is_empty() {
+            self.sent.clear();
+            return Vec::new();
+        }
+        self.sent
+            .retain(|k, _| certs.iter().any(|c| (c.gen, c.round) == *k));
+        // What went out: the lane's own sends, and the core's that the
+        // driver dispatched since the certificate was made.
+        let mut went_out = self.sent.clone();
+        for (k, at) in off_core.renewals_dispatched.lock().unwrap().iter() {
+            let e = went_out.entry(*k).or_insert(Ms(*at));
+            *e = (*e).max(Ms(*at));
+        }
+        let mut out = Vec::new();
+        for c in
+            constellation_authority::deleg_lane::due(&certs, Ms(now), stuck_ms, hung_ms, &went_out)
+        {
+            if crate::fault::p2p_denied(c.root) {
+                continue;
+            }
+            self.seq += 1;
+            let req_id = constellation_authority::deleg_lane::LANE_REQ_BIT | self.seq;
+            let registered = off_core.urgent.lock().unwrap().as_ref().is_some_and(|tx| {
+                tx.send(SyncRequest::DelegRenewSentOffCore {
+                    gen: c.gen,
+                    round: c.round,
+                    to: c.root,
+                    req_id,
+                    sent: now,
+                })
+                .is_ok()
+            });
+            if !registered {
+                continue;
+            }
+            self.sent.insert((c.gen, c.round), Ms(now));
+            out.push((
+                c.root,
+                Payload::DelegRenewOffCore {
+                    from: node_id,
+                    req_id,
+                    gen: c.gen,
+                    round: c.round,
+                },
+            ));
+        }
+        out
     }
 }
 
@@ -1397,6 +1565,30 @@ pub struct OffCore {
     /// When the holder's heartbeat sent the driver loop the echo it has
     /// not taken yet (`Internal::Echo`; unix ms, 0: none outstanding).
     pub(crate) echo_sent: std::sync::atomic::AtomicI64,
+    /// The delegation renewal certificates, published after every step
+    /// (`Core::deleg_renew_certs`), and the urgent lane's sender, for the
+    /// off-core delegation renewal lane ([`holder_alive_loop`]).
+    pub(crate) deleg_certs: Mutex<Vec<constellation_authority::DelegRenewCert>>,
+    pub(crate) urgent: Mutex<Option<mpsc::UnboundedSender<SyncRequest>>>,
+    /// When the driver dispatched the core's latest renewal of each
+    /// generation and round (unix ms), kept for the certificates' keys: a
+    /// renewal the core decided on may wait behind a blocking action of the
+    /// same step, and the lane counts only what went out.
+    pub(crate) renewals_dispatched: Mutex<HashMap<(u64, u64), i64>>,
+    /// When the heartbeat thread's next tick is due (unix ms; 0: it has not
+    /// started), written at every tick: a thread that has not run since
+    /// is frozen, and the driver, waking first, can say so before the
+    /// thread can ([`deleg_lane::freezes`]).
+    beat_due: std::sync::atomic::AtomicI64,
+    /// The last freeze the thread saw end, `(from, length)` packed in one
+    /// word ([`deleg_lane::pack_freeze`]: one atomic, no torn read).
+    beat_freeze: std::sync::atomic::AtomicU64,
+    /// The latest grant (ttl, ms) an answer of the root named, per
+    /// generation and round, noted by the P2P service as it arrives
+    /// (`note_granted_ttl`): the lane's period follows it
+    /// ([`deleg_lane::with_granted_ttl`]), where the core's bookkeeping is
+    /// behind a stuck step. The root caps a grant by its own lease.
+    pub(crate) granted_ttl: Mutex<HashMap<(u64, u64), (NodeId, u64)>>,
 }
 
 impl OffCore {
@@ -1412,7 +1604,81 @@ impl OffCore {
             lapse: Mutex::new((0, 0)),
             lag_threshold_ms: 1_500 / 8,
             echo_sent: std::sync::atomic::AtomicI64::new(0),
+            deleg_certs: Mutex::new(Vec::new()),
+            urgent: Mutex::new(None),
+            renewals_dispatched: Mutex::new(HashMap::new()),
+            beat_due: std::sync::atomic::AtomicI64::new(0),
+            beat_freeze: std::sync::atomic::AtomicU64::new(0),
+            granted_ttl: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The core's renewal of `(gen, round)` was dispatched at `at_unix_ms`.
+    pub(crate) fn note_renewal_dispatched(&self, gen: u64, round: u64, at_unix_ms: i64) {
+        self.renewals_dispatched
+            .lock()
+            .unwrap()
+            .insert((gen, round), at_unix_ms);
+    }
+
+    /// The heartbeat thread's next tick is due at `at_unix_ms`.
+    pub(crate) fn note_beat_due(&self, at_unix_ms: i64) {
+        self.beat_due.store(at_unix_ms, Ordering::Relaxed);
+    }
+
+    /// The heartbeat thread ran `len_ms` late: it did not run from
+    /// `from_unix_ms` (and neither did anything else in the process).
+    pub(crate) fn note_beat_freeze(&self, from_unix_ms: i64, len_ms: i64) {
+        self.beat_freeze.store(
+            constellation_authority::deleg_lane::pack_freeze(from_unix_ms, len_ms),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The freezes of the heartbeat thread as of `now_unix_ms`, oldest
+    /// first (`deleg_lane::freezes`).
+    pub(crate) fn beat_freezes(&self, now_unix_ms: i64) -> Vec<(i64, i64)> {
+        constellation_authority::deleg_lane::freezes(
+            self.beat_freeze.load(Ordering::Relaxed),
+            self.beat_due.load(Ordering::Relaxed),
+            now_unix_ms,
+        )
+    }
+
+    /// An answer of `from` granted `ttl_ms` of generation `gen`, round
+    /// `round` (the P2P service, off the core). The lane uses it only if
+    /// `from` is the root its certificate names.
+    pub(crate) fn note_granted_ttl(&self, from: NodeId, gen: u64, round: u64, ttl_ms: u64) {
+        self.granted_ttl
+            .lock()
+            .unwrap()
+            .insert((gen, round), (from, ttl_ms));
+    }
+
+    /// The lane's request `req_id` to `to` failed at the transport: the core
+    /// is told on the urgent lane, after the lane's registration of it (one
+    /// FIFO), so it drops the pending entry the registration made.
+    pub(crate) fn lane_send_failed(&self, to: NodeId, req_id: u64) {
+        if let Some(tx) = self.urgent.lock().unwrap().as_ref() {
+            let _ = tx.send(SyncRequest::DelegRenewOffCoreFailed { to, req_id });
+        }
+    }
+
+    /// The freezes of the heartbeat thread (`beat_freezes`) that were the
+    /// whole process's: the shared runtime's lag probe missed the same
+    /// interval ([`deleg_lane::whole_process`]). A heartbeat thread held up
+    /// alone, in a log line or on a mutex, is not handed to the core as a
+    /// freeze: the lane's thread failed, the loss is not excused.
+    pub(crate) fn whole_process_freezes(&self, now_unix_ms: i64) -> Vec<(i64, i64)> {
+        let freezes = self.beat_freezes(now_unix_ms);
+        if freezes.is_empty() {
+            return freezes;
+        }
+        let runtime = self.lapse(now_unix_ms);
+        freezes
+            .into_iter()
+            .filter(|f| constellation_authority::deleg_lane::whole_process(*f, runtime))
+            .collect()
     }
 
     /// The default for a node with `config`: half the holder's bound for
@@ -1731,6 +1997,7 @@ impl Driver {
             urgent_rx,
             heard_handed: HashMap::new(),
             lag_handed: 0,
+            freeze_handed: (0, 0),
             loop_thread: Arc::new(Mutex::new(
                 constellation_platform::process::ThreadRef::unknown(),
             )),
@@ -1774,6 +2041,7 @@ impl Driver {
             let own_s3 = OwnS3Watch::new(self.deps.upload.clone(), peers.clone());
             tokio::spawn(peer_links_task(peers, own_s3, tx));
         }
+        *self.deps.off_core.urgent.lock().unwrap() = self.deps.urgent_tx.clone();
         let _alive_task = self.core.config().p2p.then(|| {
             AliveTask::start(
                 self.deps.peers.clone(),
@@ -1841,6 +2109,7 @@ impl Driver {
             *self.loop_thread.lock().unwrap() =
                 constellation_platform::native().process.current_thread();
             self.hand_lag();
+            self.hand_freeze();
             let internal = match wake {
                 // Answered by the wake-up itself (`loop_woke`); the echo
                 // is what wakes a loop that is waiting for work.
@@ -1931,6 +2200,26 @@ impl Driver {
                 from: Ms(from),
                 until: Ms(until),
             }));
+        }
+    }
+
+    /// Hand the core a freeze of the heartbeat thread it has not been told of
+    /// (`Event::OwnFreeze`), before the wake-up is handled: a process that
+    /// was frozen wakes its driver and the heartbeat thread together, and the
+    /// driver reads the thread's missed tick (`OffCore::beat_freezes`) before
+    /// the thread has run to record it. The core only uses it to say, when it
+    /// gives a grant up, whether the freeze explains the loss. The same
+    /// freeze, grown by more than 200 ms or finished, is handed again.
+    fn hand_freeze(&mut self) {
+        for (from, until) in self.deps.off_core.whole_process_freezes(now_unix_ms()) {
+            let (hf, hu) = self.freeze_handed;
+            if from != hf || until > hu + 200 {
+                self.freeze_handed = (from, until);
+                self.step(Internal::Event(Event::OwnFreeze {
+                    from: Ms(from),
+                    until: Ms(until),
+                }));
+            }
         }
     }
 
@@ -2085,6 +2374,22 @@ impl Driver {
     fn refresh(&mut self) {
         let now = now();
         self.publish_alive_targets(now);
+        {
+            // Compared in place: nothing is allocated on a step that
+            // changed no certificate (the lock and the walk over the
+            // node's one delegation are the whole cost).
+            let mut c = self.deps.off_core.deleg_certs.lock().unwrap();
+            if self.core.deleg_renew_certs_differ(&c) {
+                *c = self.core.deleg_renew_certs();
+                let keep = |k: &(u64, u64)| c.iter().any(|x| (x.gen, x.round) == *k);
+                let off = &self.deps.off_core;
+                off.renewals_dispatched
+                    .lock()
+                    .unwrap()
+                    .retain(|k, _| keep(k));
+                off.granted_ttl.lock().unwrap().retain(|k, _| keep(k));
+            }
+        }
         // Plan 30 §M12: what the FUSE fast path executed since the last
         // event, for the placement.
         let notes = self.deps.delegates.take_fast_path_notes();
@@ -2505,6 +2810,19 @@ impl Driver {
                     refused,
                 },
             })),
+            SyncRequest::DelegRenewSentOffCore {
+                gen,
+                round,
+                to,
+                req_id,
+                sent,
+            } => Some(Internal::Event(Event::DelegRenewSentOffCore {
+                gen,
+                round,
+                to,
+                req: OpId(req_id),
+                sent: Ms(sent),
+            })),
             SyncRequest::PeerDelegRenew {
                 from,
                 req_id,
@@ -2524,6 +2842,26 @@ impl Driver {
                     stream_head_at,
                 },
             })),
+            SyncRequest::PeerDelegRenewOffCore {
+                from,
+                req_id,
+                gen,
+                round,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::DelegRenewOffCore {
+                    req: OpId(req_id),
+                    gen,
+                    round,
+                },
+            })),
+            SyncRequest::DelegRenewOffCoreFailed { to, req_id } => {
+                Some(Internal::Event(Event::PeerFailed {
+                    req: OpId(req_id),
+                    to,
+                    outage: false,
+                }))
+            }
             SyncRequest::PeerDelegRenewed {
                 from,
                 req_id,
@@ -3767,6 +4105,12 @@ impl Driver {
                 stream_head,
                 stream_head_at,
             } => {
+                // Dispatched: the lane's next renewal is a period from
+                // here, not from when the core decided on this one (a
+                // blocking action earlier in the step may have delayed it).
+                self.deps
+                    .off_core
+                    .note_renewal_dispatched(gen, round, now_unix_ms());
                 let payload = Payload::DelegRenew {
                     from: self.node_id,
                     req_id: req.0,
@@ -6565,6 +6909,295 @@ mod tests {
         assert!(!off.core_responsive(105_001), "stuck");
         off.set_busy(0);
         assert!(off.core_responsive(200_000), "idle again");
+    }
+
+    /// The off-core delegation renewal lane sends only while the driver
+    /// is stuck (at least `DELEG_LANE_STUCK_MS`, at most the hung bound),
+    /// and each renewal it sends is registered on the urgent lane first
+    /// (`DelegRenewSentOffCore`, the send's stamp) and carries a lane id.
+    /// Not twice within a period, nothing for a generation the core
+    /// stopped publishing, and nothing with the lane off.
+    #[test]
+    fn the_delegation_lane_registers_then_sends_only_while_the_driver_is_stuck() {
+        use super::{DelegLane, OffCore, Payload, SyncRequest};
+        use constellation_authority::deleg_lane::{DELEG_LANE_STUCK_MS, LANE_REQ_BIT};
+        use constellation_authority::{DelegRenewCert, Ms};
+        let off = OffCore::new(5_000);
+        let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
+        *off.urgent.lock().unwrap() = Some(tx);
+        *off.deleg_certs.lock().unwrap() = vec![DelegRenewCert {
+            gen: 7,
+            root: 1,
+            round: 3,
+            next_due: Ms(10_000),
+            period_ms: 2_500,
+        }];
+        let hung = 15_000;
+        let mut lane = DelegLane::new(true);
+        // The driver progresses, or is stuck for less than the minimum,
+        // or past the hung bound: nothing, and nothing registered.
+        for stuck in [0, DELEG_LANE_STUCK_MS - 1, hung + 1] {
+            assert!(lane.tick(&off, 3, 12_000, stuck, hung).is_empty());
+        }
+        // Stuck for 2 s with the renewal due: one registration, then one
+        // request with a lane id, the same id and stamp.
+        let sent = lane.tick(&off, 3, 12_000, 2_000, hung);
+        let reg = urgent.try_recv().expect("not registered");
+        let (req_id, stamp) = match reg {
+            SyncRequest::DelegRenewSentOffCore {
+                gen: 7,
+                round: 3,
+                to: 1,
+                req_id,
+                sent,
+            } => (req_id, sent),
+            _ => panic!("not the lane's registration"),
+        };
+        assert_eq!(stamp, 12_000);
+        assert!(req_id & LANE_REQ_BIT != 0);
+        assert!(urgent.try_recv().is_err());
+        assert_eq!(sent.len(), 1);
+        // The off-core message: no backup, no stream head.
+        match &sent[0] {
+            (
+                1,
+                Payload::DelegRenewOffCore {
+                    from: 3,
+                    req_id: id,
+                    gen: 7,
+                    round: 3,
+                },
+            ) => assert_eq!(*id, req_id),
+            other => panic!("{other:?}"),
+        }
+        // Not again within the period; again after it, with a new id.
+        assert!(lane.tick(&off, 3, 12_300, 2_300, hung).is_empty());
+        assert!(lane.tick(&off, 3, 14_499, 4_499, hung).is_empty());
+        assert!(urgent.try_recv().is_err());
+        let sent = lane.tick(&off, 3, 14_500, 4_500, hung);
+        assert_eq!(sent.len(), 1);
+        match urgent.try_recv().expect("not registered") {
+            SyncRequest::DelegRenewSentOffCore {
+                req_id: id, sent, ..
+            } => {
+                assert_ne!(id, req_id);
+                assert_eq!(sent, 14_500);
+            }
+            _ => panic!("not the lane's registration"),
+        }
+        // The core no longer publishes the generation: nothing.
+        off.deleg_certs.lock().unwrap().clear();
+        assert!(lane.tick(&off, 3, 30_000, 2_000, hung).is_empty());
+        assert!(urgent.try_recv().is_err());
+        // Without a driver to register with (the urgent lane closed or
+        // never set) a renewal is not sent.
+        *off.deleg_certs.lock().unwrap() = vec![DelegRenewCert {
+            gen: 8,
+            root: 1,
+            round: 1,
+            next_due: Ms(0),
+            period_ms: 2_500,
+        }];
+        drop(urgent);
+        assert!(lane.tick(&off, 3, 30_000, 2_000, hung).is_empty());
+        // Off: nothing at all.
+        let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
+        *off.urgent.lock().unwrap() = Some(tx);
+        let mut off_lane = DelegLane::new(false);
+        assert!(off_lane.tick(&off, 3, 30_000, 2_000, hung).is_empty());
+        assert!(urgent.try_recv().is_err());
+    }
+
+    /// The driver tells the core of a freeze of the heartbeat thread as it
+    /// wakes, before the thread has run to record it: from the tick it
+    /// missed, while it is in progress; and the thread's own record, one
+    /// atomic word, once it has run (`Event::OwnFreeze`).
+    #[test]
+    fn a_freeze_of_the_heartbeat_thread_is_seen_by_the_driver_before_the_thread_runs() {
+        use super::OffCore;
+        let off = OffCore::new(5_000);
+        // Never started: nothing.
+        assert!(off.beat_freezes(1_000_000).is_empty());
+        // Ticking on time (next tick due at 1_000_300): nothing.
+        off.note_beat_due(1_000_300);
+        assert!(off.beat_freezes(1_000_400).is_empty());
+        // The process was stopped: at 1_006_000 the driver wakes and the
+        // thread has not run since its tick due at 1_000_300.
+        assert_eq!(off.beat_freezes(1_006_000), vec![(1_000_300, 1_006_000)]);
+        // The thread runs: it records the freeze it saw end (from, length),
+        // and its next tick is due.
+        off.note_beat_freeze(1_000_300, 5_702);
+        off.note_beat_due(1_006_302);
+        assert_eq!(off.beat_freezes(1_006_400), vec![(1_000_300, 1_006_002)]);
+        // A later freeze in progress comes after it.
+        assert_eq!(
+            off.beat_freezes(1_009_000),
+            vec![(1_000_300, 1_006_002), (1_006_302, 1_009_000)]
+        );
+    }
+
+    /// The root capped a grant to about a second (its own lease was about to
+    /// end): the answer reaches the P2P service, off the core, and the lane
+    /// renews at a quarter of what was granted, not at the period of the
+    /// last full grant, which would come after the root's reclaim.
+    #[test]
+    fn the_delegation_lane_follows_the_grant_the_root_named() {
+        use super::{DelegLane, OffCore};
+        use constellation_authority::{DelegRenewCert, Ms};
+        let off = OffCore::new(5_000);
+        let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
+        *off.urgent.lock().unwrap() = Some(tx);
+        // The core's last renewal went out at 7_500 (period 2_500).
+        *off.deleg_certs.lock().unwrap() = vec![DelegRenewCert {
+            gen: 7,
+            root: 1,
+            round: 3,
+            next_due: Ms(10_000),
+            period_ms: 2_500,
+        }];
+        let mut lane = DelegLane::new(true);
+        // Stuck at 10_100: the lane renews (due), and the root's answer
+        // granted 1_072 ms.
+        assert_eq!(lane.tick(&off, 3, 10_100, 1_000, 15_000).len(), 1);
+        assert!(urgent.try_recv().is_ok());
+        off.note_granted_ttl(1, 7, 3, 1_072);
+        // The next one is due a quarter of the grant after the send
+        // (268 ms), not 2_500 ms.
+        assert!(lane.tick(&off, 3, 10_300, 1_200, 15_000).is_empty());
+        assert_eq!(lane.tick(&off, 3, 10_368, 1_268, 15_000).len(), 1);
+        assert!(urgent.try_recv().is_ok());
+        // A full grant afterwards puts the period back at the certificate's.
+        off.note_granted_ttl(1, 7, 3, 10_000);
+        assert!(lane.tick(&off, 3, 10_700, 1_600, 15_000).is_empty());
+        assert!(lane.tick(&off, 3, 12_867, 3_700, 15_000).is_empty());
+        assert_eq!(lane.tick(&off, 3, 12_868, 3_700, 15_000).len(), 1);
+    }
+
+    /// A freeze of the heartbeat thread is handed to the core only if the
+    /// shared runtime's lag probe missed the same interval: a thread held up
+    /// alone (blocked in a log line) while the runtime ran on is no freeze of
+    /// the process, and the loss it causes is not excused.
+    #[test]
+    fn a_heartbeat_thread_held_up_alone_is_no_freeze_of_the_process() {
+        use super::OffCore;
+        let off = OffCore::new(5_000);
+        // The probe ticks on time up to 1_000_250 and then keeps ticking:
+        // no lapse. The heartbeat thread's next tick was due at 1_000_300
+        // and it ran at 1_006_000: 5.7 s late, alone.
+        off.note_probe(1_000_250, 0);
+        off.note_beat_due(1_000_300);
+        off.note_probe(1_006_000, 0);
+        assert!(off.whole_process_freezes(1_006_010).is_empty());
+        off.note_beat_freeze(1_000_300, 5_700);
+        off.note_beat_due(1_006_300);
+        assert!(
+            off.whole_process_freezes(1_006_100).is_empty(),
+            "a thread held up alone was handed over as a freeze"
+        );
+        // The runtime missed it too (the whole process was frozen): its
+        // probe woke 5.75 s late. Now it is handed over.
+        let off = OffCore::new(5_000);
+        off.note_beat_due(1_000_300);
+        off.note_probe(1_006_000, 5_750);
+        off.note_beat_freeze(1_000_300, 5_700);
+        off.note_beat_due(1_006_300);
+        assert_eq!(
+            off.whole_process_freezes(1_006_040),
+            vec![(1_000_300, 1_006_000)]
+        );
+        // In progress: the driver wakes first, before either has run.
+        let off = OffCore::new(5_000);
+        off.note_probe(1_000_250, 0);
+        off.note_beat_due(1_000_300);
+        assert_eq!(
+            off.whole_process_freezes(1_006_000),
+            vec![(1_000_300, 1_006_000)]
+        );
+    }
+
+    /// The lane's request failed at the transport: the core hears of it on
+    /// the urgent lane (behind the registration) and drops the pending entry.
+    #[test]
+    fn a_failed_lane_send_is_reported_to_the_core_on_the_urgent_lane() {
+        use super::{OffCore, SyncRequest};
+        let off = OffCore::new(5_000);
+        // No driver yet: nothing to tell, nothing panics.
+        off.lane_send_failed(1, 5);
+        let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
+        *off.urgent.lock().unwrap() = Some(tx);
+        off.lane_send_failed(1, (1 << 62) | 5);
+        match urgent.try_recv().expect("not reported") {
+            SyncRequest::DelegRenewOffCoreFailed { to, req_id } => {
+                assert_eq!((to, req_id), (1, (1 << 62) | 5));
+            }
+            _ => panic!("not the failure report"),
+        }
+        assert!(urgent.try_recv().is_err());
+    }
+
+    /// The lane follows only the root's answers, and no shorter than the
+    /// floor: another node's answer is ignored, and a nearly-gone grant does
+    /// not make the lane renew every tick.
+    #[test]
+    fn the_delegation_lane_follows_only_the_roots_answers_down_to_a_floor() {
+        use super::{DelegLane, OffCore};
+        use constellation_authority::{DelegRenewCert, Ms};
+        let cert = DelegRenewCert {
+            gen: 7,
+            root: 1,
+            round: 3,
+            next_due: Ms(10_000),
+            period_ms: 2_500,
+        };
+        // An answer from node 2 (not the root of the certificate): ignored.
+        let off = OffCore::new(5_000);
+        let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
+        *off.urgent.lock().unwrap() = Some(tx);
+        *off.deleg_certs.lock().unwrap() = vec![cert.clone()];
+        let mut lane = DelegLane::new(true);
+        assert_eq!(lane.tick(&off, 3, 10_100, 1_000, 15_000).len(), 1);
+        assert!(urgent.try_recv().is_ok());
+        off.note_granted_ttl(2, 7, 3, 1_072);
+        assert!(lane.tick(&off, 3, 10_400, 1_300, 15_000).is_empty());
+        // The root's: followed (268 ms), but a 600 ms grant is not followed
+        // below the 250 ms floor.
+        off.note_granted_ttl(1, 7, 3, 600);
+        assert!(lane.tick(&off, 3, 10_349, 1_249, 15_000).is_empty());
+        assert_eq!(lane.tick(&off, 3, 10_350, 1_250, 15_000).len(), 1);
+    }
+
+    /// A renewal the core decided on but the driver has not dispatched (a
+    /// blocking action ahead of the send in the same step) is not a
+    /// renewal that went out: the certificate counts only answered ones,
+    /// the lane renews at once, and one the driver dispatched postpones the
+    /// lane's by a period.
+    #[test]
+    fn the_delegation_lane_counts_only_renewals_that_went_out() {
+        use super::{DelegLane, OffCore};
+        use constellation_authority::{DelegRenewCert, Ms};
+        let off = OffCore::new(5_000);
+        let (tx, mut urgent) = tokio::sync::mpsc::unbounded_channel();
+        *off.urgent.lock().unwrap() = Some(tx);
+        // The last answered renewal was at 7_500: due at 10_000. The core
+        // decided on the next at 10_000, stuck before sending it.
+        *off.deleg_certs.lock().unwrap() = vec![DelegRenewCert {
+            gen: 7,
+            root: 1,
+            round: 3,
+            next_due: Ms(10_000),
+            period_ms: 2_500,
+        }];
+        let mut lane = DelegLane::new(true);
+        assert_eq!(lane.tick(&off, 3, 10_700, 700, 15_000).len(), 1);
+        assert!(urgent.try_recv().is_ok());
+        // Fresh lane (a new heartbeat thread, or the lane's book lost):
+        // the core's renewal is dispatched at 10_900, the lane waits a
+        // period from it, not from the decision.
+        let mut lane = DelegLane::new(true);
+        off.note_renewal_dispatched(7, 3, 10_900);
+        assert!(lane.tick(&off, 3, 13_399, 3_399, 15_000).is_empty());
+        assert_eq!(lane.tick(&off, 3, 13_400, 3_400, 15_000).len(), 1);
+        assert!(urgent.try_recv().is_ok());
     }
 
     /// The heartbeat goes out every interval however long earlier beats

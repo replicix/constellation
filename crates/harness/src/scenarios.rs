@@ -1470,6 +1470,18 @@ pub const SCENARIOS: &[Scenario] = &[
         run: delegroot::delegate_handoff_renewal,
     },
     Scenario {
+        name: "delegate-store-stall",
+        desc: "two nodes, b the root's backup and the delegate of /d1, writing and fsyncing \
+               there; one metadata write on b holds the store's writer lock 5, 9 and 12 s \
+               (fault hook) so b's core sends no renewal for longer than the grant's slack: \
+               the off-core renewal lane keeps the delegation (same generation, nothing \
+               reclaimed, recalled or lapsed, no write fails, the writes after the stall run \
+               on the delegate); a 25 s stall, past the hung bound, is reclaimed",
+        requires: &[],
+        caps: &[],
+        run: delegroot::delegate_store_stall,
+    },
+    Scenario {
         name: "delegate-backup-handoff-failover",
         desc: "two nodes, b the root's backup and the delegate of /d1, writing and fsyncing \
                there; b is handed off (daemon --upgrade) and the root lists it as its backup \

@@ -30,6 +30,7 @@
 
 pub mod action;
 pub mod core;
+pub mod deleg_lane;
 pub mod event;
 pub mod ids;
 pub mod replica;
@@ -39,8 +40,8 @@ pub use action::{
     Action, ClientReply, ControlOk, LockAnswer, LockTestAnswer, ReadAnswer, S3Op, TimerKind,
 };
 pub use core::{
-    lease_may_carry, resolve_epoch_claims, Config, Core, EpochClaimView, EpochState, InboxView,
-    LockView, ShipState, Stats,
+    lease_may_carry, resolve_epoch_claims, Config, Core, DelegRenewCert, EpochClaimView,
+    EpochState, InboxView, LockView, ShipState, Stats,
 };
 pub use event::{
     Carrier, CasFailure, Control, Event, LockOutcome, LockRenewEntry, LockRenewResult,

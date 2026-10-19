@@ -347,6 +347,12 @@ fn replay_seed() {
         Ok("long-delegated") => long_delegated_config(),
         Ok("long-delegated-backup") => long_delegated_backup_config(),
         Ok("long-delegated-late-answers") => long_delegated_late_answers_config(),
+        Ok("delegated-core-stall") => delegated_core_stall_config(),
+        Ok("delegated-core-stall-lease6") => delegated_core_stall_lease6_config(),
+        Ok("delegated-core-freeze") => delegated_core_freeze_config(),
+        Ok("delegated-core-stall-forwarded") => delegated_core_stall_forwarded_config(),
+        Ok("delegated-core-stall-unlaned") => delegated_core_stall_unlaned_config(),
+        Ok("delegated-core-hang") => delegated_core_hang_config(),
         // Plan 30 §M14.
         Ok("locks") => locks_config(),
         Ok("locks-partition") => locks_partition_config(),
@@ -3171,6 +3177,12 @@ fn sweep_config() {
         "delegated-delegate-restart" => delegated_delegate_restart_config(),
         "long-delegated-backup" => long_delegated_backup_config(),
         "long-delegated-late-answers" => long_delegated_late_answers_config(),
+        "delegated-core-stall" => delegated_core_stall_config(),
+        "delegated-core-stall-lease6" => delegated_core_stall_lease6_config(),
+        "delegated-core-freeze" => delegated_core_freeze_config(),
+        "delegated-core-stall-forwarded" => delegated_core_stall_forwarded_config(),
+        "delegated-core-stall-unlaned" => delegated_core_stall_unlaned_config(),
+        "delegated-core-hang" => delegated_core_hang_config(),
         "placement-hot" => placement_hot_config(),
         "backup-hot" => backup_hot_config(),
         "flex" => flex_config(),
@@ -3261,6 +3273,11 @@ fn sweep_config() {
                 break;
             }
             match run_seed(seed, config(&label)) {
+                Ok(report) if core_stall_check(&label, &report).is_err() => {
+                    let e = core_stall_check(&label, &report).unwrap_err();
+                    eprintln!("SWEEP-FAIL {label} seed {seed}: {e}");
+                    failures.lock().unwrap().push(seed);
+                }
                 Ok(report) => {
                     let ord = std::sync::atomic::Ordering::Relaxed;
                     for s in report.stats.values() {
@@ -3729,6 +3746,272 @@ fn long_delegated_late_answers_config() -> SimConfig {
     SimConfig {
         deleg_answer_delay: (400, 2_500),
         ..long_delegated_backup_config()
+    }
+}
+
+/// `delegate-store-stall` in the simulation: a delegate whose core is
+/// stuck in a step (`StallStep`: a priority store write behind a slow
+/// journal write) for longer than its renewal's slack, but below the hung
+/// bound. Delegations: `d1` to node 2, `d2` to node 3; each node's one
+/// client writes in its own directory, so nothing forwards to a delegate
+/// or recalls its generation (the lane's integrity is the question, not
+/// the recall's). Node 2's core is stuck 6.5 s, 9 s and 12.5 s (1.3, 1.8
+/// and 2.5 × the 5 s ttl; the renewal is due at half of it, the grant is
+/// honoured 4.5 s, the root reclaims 5.5 s after the last renewal), node 3's
+/// 8 s. With the lane no grant is reclaimed, none lapses and none ends;
+/// without it (`delegated-core-stall-unlaned`, the code before) the root
+/// reclaims.
+fn delegated_core_stall_config() -> SimConfig {
+    let stall = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::StallStep { node, for_ms },
+    };
+    SimConfig {
+        clients_per_node: 1,
+        ops_per_client: 60,
+        cross_ratio: 0.0,
+        // A lease of 12 s, long against the 5 s grant: no cap by the root's
+        // own lease (`delegated-core-stall-lease6` has it).
+        core: std::sync::Arc::new(|node, incarnation| {
+            let mut c = sim::run::sim_core_config(node, incarnation);
+            c.ttl_ms = 12_000;
+            c
+        }),
+        faults: vec![
+            stall(1_500, 2, 6_500),
+            stall(4_000, 3, 8_000),
+            stall(11_000, 2, 9_000),
+            stall(22_000, 2, 12_500),
+        ],
+        settle_ms: 40_000,
+        ..delegated_config()
+    }
+}
+
+/// [`delegated_core_stall_config`] on the sim's default 6 s root lease,
+/// shorter than a grant plus its margin plus half a lease: the root caps a
+/// grant by what is left of its own lease (`expires - margin`), to a second
+/// or so when the lease's renewal comes late. Production has the same cap,
+/// with the margins scaled up (a 60 s lease, a 20 s grant: a lease renewal
+/// about 9 s late, a slow S3 lease PUT or a root core stuck behind the same
+/// disk, or a grant inherited after a failover). Seeds 1447, 2079, 6242,
+/// 6915, 7730, 8896, 9285, 12071, 14434, 16813, 18153, 18622, 19444 and 19884
+/// lost a grant to the 12.5 s stall while the lane renewed at the period of
+/// the last full grant (seed 2079: the renewal at 31.5 s was answered with a
+/// ttl capped to 1.07 s, the next lane renewal came 2.4 s later, after the
+/// root's reclaim at 33.08 s); the lane now follows the granted ttl
+/// (`deleg_lane::with_granted_ttl`, the answers tapped off the bus), and the
+/// sweep of this config is clean. `delegated-core-stall` runs a 12 s lease
+/// (no cap) as the main configuration.
+fn delegated_core_stall_lease6_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(sim::run::sim_core_config),
+        ..delegated_core_stall_config()
+    }
+}
+
+/// [`delegated_core_stall_config`] with every node's second client writing
+/// in the other delegate's directory: the forwards to a stalled delegate
+/// wait for it (or reach the root, which may recall the generation). The
+/// lane must still lose no grant to the stall: none reclaimed, none
+/// lapsed.
+fn delegated_core_stall_forwarded_config() -> SimConfig {
+    SimConfig {
+        clients_per_node: 2,
+        ops_per_client: 30,
+        ..delegated_core_stall_config()
+    }
+}
+
+/// [`delegated_core_stall_config`] without the lane: what stock did.
+fn delegated_core_stall_unlaned_config() -> SimConfig {
+    SimConfig {
+        deleg_lane: false,
+        ..delegated_core_stall_config()
+    }
+}
+
+/// A delegate's whole process is frozen (`Pause`: stopped, as `SIGSTOP`, a
+/// starved host or a saturated disk does) for 7, 8 and 9 s, beyond the 5 s
+/// grant's reach: nothing in the process, the lane's thread included, can
+/// renew, and the root reclaims. The delegate's core must say so when it
+/// gives the grant up (`deleg_lapses_frozen`), so that no one has to guess a
+/// freeze from a lateness record: each loss is counted as one in a freeze.
+fn delegated_core_freeze_config() -> SimConfig {
+    let pause = |at_ms, node, for_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::Pause { node, for_ms },
+    };
+    SimConfig {
+        faults: vec![
+            pause(2_500, 2, 7_000),
+            pause(14_000, 3, 8_000),
+            pause(26_000, 2, 9_000),
+        ],
+        settle_ms: 40_000,
+        ..delegated_core_stall_config()
+    }
+}
+
+/// One stall past the hung bound (`CONSTELLATION_HOLDER_STALL_MS`, 15 s):
+/// the lane stops there, its last grant runs out, and the root reclaims
+/// (a hung delegate is a dead one, as it always was).
+fn delegated_core_hang_config() -> SimConfig {
+    SimConfig {
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::StallStep {
+                node: 2,
+                for_ms: 26_000,
+            },
+        }],
+        settle_ms: 60_000,
+        ..delegated_core_stall_config()
+    }
+}
+
+/// What the core-stall configurations demand of a seed (`label`; any other
+/// configuration: nothing).
+fn core_stall_check(label: &str, r: &Report) -> Result<(), String> {
+    let sum =
+        |f: fn(&constellation_authority::Stats) -> u64| -> u64 { r.stats.values().map(f).sum() };
+    let (reclaimed, lapsed) = (sum(|s| s.deleg_reclaimed), sum(|s| s.deleg_lapsed));
+    let (ended, off_core) = (sum(|s| s.deleg_ended), sum(|s| s.deleg_renewals_off_core));
+    let lost = || {
+        format!(
+            "reclaimed {reclaimed}, lapsed {lapsed}, ended {ended}, lane renewals {off_core}, \
+             installed {}, recalls {}: a delegate stalled below the hung bound lost its grant",
+            sum(|s| s.deleg_installed),
+            sum(|s| s.deleg_recalls_sent),
+        )
+    };
+    match label {
+        // (The unlaned variant is judged as the laned one: it fails.)
+        "delegated-core-stall" | "delegated-core-stall-lease6" | "delegated-core-stall-unlaned"
+            if reclaimed + lapsed + ended > 0 || off_core == 0 =>
+        {
+            Err(lost())
+        }
+        "delegated-core-stall-forwarded" if reclaimed + lapsed > 0 || off_core == 0 => Err(lost()),
+        "delegated-core-freeze" => {
+            let frozen = sum(|s| s.deleg_lapses_frozen);
+            if reclaimed == 0 || frozen < reclaimed {
+                Err(format!(
+                    "reclaimed {reclaimed}, losses counted as frozen {frozen}, lapsed {lapsed}: \
+                     a delegate whose process was frozen past its grant lost it, and each loss \
+                     must be counted as one in a freeze"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        "delegated-core-hang" if reclaimed == 0 => Err(format!(
+            "a delegate hung past the bound was never reclaimed (lapsed {lapsed}, ended {ended}, \
+             lane renewals {off_core}, recalls {})",
+            sum(|s| s.deleg_recalls_sent),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn run_core_stall(label: &str, config: fn() -> SimConfig, seed: u64) -> Report {
+    let r = run_seed(seed, config()).unwrap_or_else(|e| {
+        panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+    });
+    core_stall_check(label, &r).unwrap_or_else(|e| {
+        panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+    });
+    r
+}
+
+#[test]
+fn a_delegate_stuck_in_a_step_keeps_its_grant() {
+    let seeds = 24u64;
+    let (mut lane, mut unlaned) = (0, (0, 0));
+    for seed in 0..seeds {
+        let r = run_core_stall("delegated-core-stall", delegated_core_stall_config, seed);
+        lane += r
+            .stats
+            .values()
+            .map(|s| s.deleg_renewals_off_core)
+            .sum::<u64>();
+        run_core_stall(
+            "delegated-core-stall-forwarded",
+            delegated_core_stall_forwarded_config,
+            seed,
+        );
+        // The naive variant, the same seeds: the grant is lost.
+        let r = run_seed(seed, delegated_core_stall_unlaned_config()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=delegated-core-stall-unlaned"
+            )
+        });
+        assert_eq!(
+            r.stats
+                .values()
+                .map(|s| s.deleg_renewals_off_core)
+                .sum::<u64>(),
+            0,
+            "the lane sent with the lane off"
+        );
+        unlaned.0 += r.stats.values().map(|s| s.deleg_reclaimed).sum::<u64>();
+        unlaned.1 += r.stats.values().map(|s| s.deleg_lapsed).sum::<u64>();
+    }
+    eprintln!("delegated-core-stall: lane renewals {lane}, unlaned reclaimed/lapsed {unlaned:?}");
+    assert!(lane > 0, "the lane never sent");
+    assert!(
+        unlaned.0 >= seeds && unlaned.1 >= seeds,
+        "without the lane the stalled delegates kept their grants: the configuration is \
+         vacuous ({unlaned:?})"
+    );
+}
+
+/// A grant the root capped to a second or so (its own lease was about to end)
+/// before a stall: the lane learns the granted ttl from the answers that reach
+/// the node's P2P service, off the core, and renews at a quarter of it, not at
+/// the period of the last uncapped grant (`delegated_core_stall_lease6_config`:
+/// seeds 1447 and 2079 lost their grant to the 12.5 s stall: the lane's next
+/// renewal came 2.4 s after one answered with 1.07 s).
+#[test]
+fn a_capped_grant_before_a_stall_is_renewed_at_the_capped_period_on_a_short_lease() {
+    for seed in [1447u64, 2079] {
+        let r = run_seed(seed, delegated_core_stall_lease6_config()).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=delegated-core-stall-lease6"
+            )
+        });
+        core_stall_check("delegated-core-stall-lease6", &r).unwrap_or_else(|e| {
+            panic!(
+                "seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG=delegated-core-stall-lease6"
+            )
+        });
+    }
+}
+
+#[test]
+fn a_delegate_frozen_past_its_grant_counts_its_loss_as_one_in_a_freeze() {
+    let mut frozen_total = 0;
+    for seed in 0..30u64 {
+        let r = run_core_stall("delegated-core-freeze", delegated_core_freeze_config, seed);
+        frozen_total += r.stats.values().map(|s| s.deleg_lapses_frozen).sum::<u64>();
+    }
+    assert!(frozen_total > 0);
+    // The stalls that are no freeze (the core stuck, the process alive) are
+    // never counted as one: the lane is to keep those grants.
+    for seed in 0..10u64 {
+        let r = run_core_stall("delegated-core-stall", delegated_core_stall_config, seed);
+        assert_eq!(
+            r.stats.values().map(|s| s.deleg_lapses_frozen).sum::<u64>(),
+            0,
+            "seed {seed}: a stall with the process alive was counted as a freeze"
+        );
+    }
+}
+
+#[test]
+fn a_delegate_hung_past_the_bound_is_reclaimed() {
+    for seed in 0..20u64 {
+        run_core_stall("delegated-core-hang", delegated_core_hang_config, seed);
     }
 }
 

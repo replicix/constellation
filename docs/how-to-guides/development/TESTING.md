@@ -2347,7 +2347,42 @@ relay of its own so requests can be attributed per role):
         image closes its P2P connections before the `exec`; before that
         the root answered the first renewal into the dead incarnation's
         connection and the first write waited 2.0-2.7 s for its restart
-        probe, and before the re-adoption, for the grant (7 s).
+        probe, and before the re-adoption, for the grant (7 s). The run
+        also fails if `b`'s delegation lapsed or `a` reclaimed it at any
+        point, or was gone before a round. Excused only a loss the daemon
+        classified as under a freeze of its whole process (status
+        `delegation.lapses_during_freeze`: the heartbeat thread and the
+        runtime's lag probe both missed the time from the renewal's due time
+        to the loss), for that generation, within that round, covering every
+        grant lost (`grants_lost`), or a core stuck for the hung bound
+        (`CONSTELLATION_HOLDER_STALL_MS`): a labelled `NOTE`, and the run is
+        INCONCLUSIVE (not passed) unless the freeze is the scenario's own
+        injection. A loss classified as a silent root (`lapses_root_silent`:
+        a renewal sent in time that the root's stuck core never answered) is
+        not excused: it fails with the label `KNOWN-GAP root core stuck`, to
+        count over a batch (plan 44's shared log sink is its measured case).
+        `/d1` is delegated again from `a` if it still holds the lease, else the
+        rest of the run is skipped and the run is INCONCLUSIVE. The note is
+        carried only to a round that finds that generation gone. Write errors
+        and the latency bounds fail regardless. `CONSTELLATION_HARNESS_DELEG_FREEZE_MS=6000`
+        freezes `b` (`SIGSTOP`) that long at the start of round 0, outside the
+        measured windows, to exercise the classified-freeze path. The end of a
+        run with INCONCLUSIVE scenarios says "NO SCENARIO FAILED, n INCONCLUSIVE
+        (not passed)", and `tools/load-campaign/run.py` fails a campaign with
+        more than `--max-inconclusive-pct` (10) of its judged runs inconclusive.
+      - `delegate-store-stall`: one metadata write on `b` holds the
+        store's writer lock for 5, 9 and 12 s (the store-stall fault
+        hook), and `b`'s core, persisting the tail `a` appends as its
+        backup, waits behind it: no renewal of its 5 s grant for longer
+        than the renewal slack. The off-core renewal lane renews meanwhile:
+        the same generation before and after, nothing reclaimed, recalled
+        or lapsed, no write fails, the lane sent (`renewals_off_core`), and
+        the create + close after the stall is back to the control's. A
+        25 s stall, past the 15 s hung bound, is reclaimed by the root and
+        nothing fails. `CONSTELLATION_DELEG_LANE=off` is the fail-before:
+        the 9 and 12 s stalls then lose the delegation, which no
+        classification excuses.
+        `CONSTELLATION_HARNESS_DELEG_STALLS_MS=9000,12000` runs only those.
       - `delegate-backup-handoff-failover`: `b` (the backup) runs
         `daemon --upgrade` first. `a` drops it across the restart gap;
         `b` must not seal `a`'s live epoch, and `a` must list it again

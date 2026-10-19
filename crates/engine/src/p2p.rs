@@ -598,6 +598,18 @@ impl constellation_net::PeerService for P2pBridge {
         });
     }
 
+    fn deleg_renew_off_core(&self, from: u64, req_id: u64, gen: u64, round: u64) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.urgent.send(sync::SyncRequest::PeerDelegRenewOffCore {
+            from,
+            req_id,
+            gen,
+            round,
+        });
+    }
+
     fn deleg_renewed(
         &self,
         from: u64,
@@ -614,6 +626,13 @@ impl constellation_net::PeerService for P2pBridge {
     ) {
         if crate::fault::p2p_denied(from) {
             return;
+        }
+        // What the root granted, for the off-core renewal lane's period
+        // (`OffCore::note_granted_ttl`): the core's bookkeeping is behind
+        // its step, and a grant the root capped is shorter than the period
+        // it renews at. Advisory: it can only shorten the lane's period.
+        if ttl_ms > 0 {
+            self.off_core.note_granted_ttl(from, gen, round, ttl_ms);
         }
         // On the urgent lane, as the renewal was at the root: a grant
         // handled late here lapses all the same.

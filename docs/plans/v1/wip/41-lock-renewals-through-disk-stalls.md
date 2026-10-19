@@ -802,10 +802,18 @@ Failure modes:
 
 - Delegations: the lane's owner side is off on a delegate and on a root
   with live delegations (its node side works). A delegate's renewals of
-  its delegation stay core-driven (and the root's answers to them get
-  L0's freshness predicate). Deferred to a follow-up (it needs the
-  delegation model's tenure facts in the mirror and route stamps per
-  grant).
+  its delegation stay core-driven in this plan (and the root's answers to
+  them get L0's freshness predicate). **Stopgap landed** (2026-10-18, ahead
+  of this plan's lane, which will replace it): an off-core sender on the
+  holder-heartbeat thread, active only while the driver is stuck (500 ms to
+  `CONSTELLATION_HOLDER_STALL_MS`), registers each delegation renewal on
+  the urgent lane and counts its answer as a late one from its own send
+  (`crates/authority/src/deleg_lane.rs`, `DelegLane` in
+  `authority_driver.rs`, `delegations.md` "Grants, renewal and expiry",
+  PROGRESS "a delegation lost to a stuck authority core"). It sets no
+  honoured end and decides nothing; the full design (the delegation
+  model's tenure facts in the mirror, route stamps per grant, the root's
+  answering off the core) remains deferred to this plan's follow-up.
 - Without L5/L6 (§11): peers' renewals at a stalled owner, the horizon
   lead and the lane's lease probe.
 - Continuation epochs: the owner side defers.
