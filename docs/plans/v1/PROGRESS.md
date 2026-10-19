@@ -51323,3 +51323,376 @@ wait at the engine's bound (`wait_gave_up`, counted; a long partition would
 otherwise be a "stuck" failure of a wait that the engine ends `EAGAIN`).
 (The sweeps need `TMPDIR` on a tmpfs: on the box's `/home` they took two
 orders of magnitude longer.)
+
+## Fix: a fast successor's floor ends with the old holder's lease as its own heartbeat placed it (plan 43 C7-F F-a)
+
+Follow-up of C7-H2 (§7 C7-F; approach: §11 Q17, answered 2026-10-18 as
+(a), the beat cap, with the slack `M` until C7a names the clock-rate
+bound ρ). C7-H2 made a fast successor of a tenure that served strict reads
+or locks wait the whole bound (8.5 s on acknowledgements, 23.5 s on new
+lock grants at the defaults) from its marker. That is right for a holder
+that died or was cut off mid-lease, and expensive for the case the
+maintainer measured: a holder cut from S3 only keeps beating on P2P to
+the end of its lease, its backup seals at the expiry it reads, and then
+waits the bound on top of the TTL failover (harness
+`s3-cut-holder-failover-with-locks`: first acknowledged write +22.2 s and
+first lock grant +37.2 s from the cut, takeover +13.6 s). F-a0 (a tenure
+that inherits a floor is marked from its first CAS) is a separate commit
+and lands before this one; this change does not depend on it.
+
+### Mechanism
+
+- Review R2-3 of C7-H2 showed why counting from the last renewal the
+  successor observed is unsafe: `note_s3_liveness` also counts
+  `SegmentRun` and `SegmentPut` successes and the `renew_probe` lease
+  read, which no one else sees, and the holder answers within the
+  takeover window of any of them. What the successor cannot see end is
+  the predecessor's *freshness window*, but everything that window let it
+  answer is capped by its *lease* (strict answers only while the lease is
+  usable, read delegations, lock grants and renewals and write delegations
+  at the expiry less M, their holders honouring them from their own send
+  less another M, a delegate's grants by its own `until`), and the lease
+  is observable, on a bounded rate and no offset, from the holder's
+  off-core heartbeat: a beat carries `sent` and `expires` on the holder's
+  clock and is stamped `at` on arrival on the successor's, so the holder's
+  clock read `sent` no later than the successor's read `at`.
+- The cap is `X + min(at − sent) + M`, `X = max(the replaced lease's
+  expiry, the highest expiry the beats named, the highest guard they
+  named)`, over the numbered beats of the replaced tenure (holder and
+  epoch) sent within `250·M` of `X` (the rate error `2ρ(X − sent) ≤ M/2`
+  at 1 000 ppm). The floor is `min(bound, cap)` for acknowledgements and
+  new lock grants alike; a cap already past when the marker lands arms no
+  floor (`ack_floor_capped_out`, not counted in `ack_floor_waits`).
+  Never the beat's credit `min(at, sent + M)` (the seal watch's: an
+  instant of the holder's clock) and never the expiry read against the
+  successor's clock; the module doc of `core/backup.rs` has the safety
+  argument (the five steps of the spec: lease caps everything; `E_h ≤ X`;
+  the beat links the clocks; the guard; the cap).
+- New wire field `Beat::guard_unix_ms` (appended at the end, with
+  `Event::HolderAlive::guard`): what the holder itself waits out and its
+  lease does not cap (`Core::beat_guard_unix_ms`: its own takeover floor,
+  the read and lock quarantines, its subtree graces), `i64::MAX` while its
+  takeover gate or a floor due is pending, which gives the successor no
+  cap. The driver's `AliveTargets` carry it (a change republishes them).
+- Status: `ack_floor_capped`, `ack_floor_capped_out`,
+  `ack_floor_cap_saved_ms` (control `AckStatus`, schema re-blessed); the
+  floor's log line gains `lock_wait_ms`, `bound_ms`, `capped` and keeps
+  its text.
+
+### Tests
+
+Core (`beat_cap` module in `core/tests.rs`; every one fails on the parent,
+which has neither the cap nor the guard, and the mutations named were run
+against the others):
+- `a_fast_takeover_floor_ends_where_the_predecessors_beats_put_its_lease`
+  (the cap, the smallest lag over the beats, a cap already past: no
+  quarantine, `ack_floor_capped_out == 1`, no floor; fails with `max`
+  instead of `min`);
+- `a_sealed_takeover_caps_its_floor_by_the_beats_it_heard` (the same
+  through a driven seal: events, the watch, the claim, the marker);
+- `the_beat_cap_reads_the_arrival_not_its_credit` (holder clock 4 s behind:
+  the recorded lag is the arrival's, 4 010 ms; the credited cap would end
+  3 s early);
+- `the_beat_cap_covers_the_predecessors_own_floor` (guard above the lease;
+  the highest named expiry; a renewed `prev`; fails with `X = prev.expires`
+  alone or without `named_max`);
+- `a_beat_from_a_pending_gate_disables_the_cap` (`i64::MAX`: the bound);
+- `beats_of_another_epoch_or_holder_or_unnumbered_give_no_cap`;
+- `beats_older_than_the_span_give_no_cap` (an old beat with lag 0 does not
+  set the cap; fails without the span filter; a beat sent after its own
+  expiry is left out; at most 64 lags kept);
+- `the_cap_never_lengthens_the_floor`,
+  `a_cap_between_the_bounds_shortens_only_the_longer_floor`;
+- `the_beat_guard_names_the_floor_and_the_quarantines`,
+  `the_beat_guard_is_unknown_while_a_takeover_gate_is_pending`;
+- `a_grant_made_under_an_epoch_hold_is_in_the_guard_and_the_cap_covers_it`
+  (review F1: lease ttl 10 s, lock ttl 30 s, a grant under a hold; the
+  guard names its end and a successor's cap covers it; with a guard of 0
+  the cap ends 16 s before it; fails with `note_hold_grant` a no-op).
+Engine: `AliveBook::update` carries the guard and a change republishes
+(`alive_book_*`); net: `a_beat_carries_its_guard_at_the_end` (signing and
+framing round trip, the old three fields keep their encoding).
+Models (`crates/model`): `beat_cap` and `beat_cap_from_named_expiry` on
+`CtoModel` and `LockModel` with a `Beat` action, a `heard` record per
+node, `floor_capped`/`grace_capped` non-vacuity properties. Clean:
+`fast_takeover_with_beat_cap_is_clean` (cto), `..._far_ahead_and_far_behind`,
+`..._under_drift_and_renewals`, `..._with_a_delegating_holder_that_renews`
+(the far-ahead/far-behind pair now also needs the non-vacuity property
+`cap_computed`: the cap was computed from heard beats, whether or not it
+shortened the floor; `floor_capped` stays in the others);
+locks: `fast_takeover_with_beat_cap_is_clean` (level, far ahead, far
+behind; exhaustive, 24.9 M states each) and `..._under_drift`. The naive
+variant (`X` = what the beats named) is shown violating by a directed
+trace, because a checker search for it is too deep for the budget (~22
+actions over 8 ticks; a DFS run exhausted 30 GB of memory, the BFS reached
+depth 14 without it): `naive_beat_cap_with_a_renewal_after_the_beat_splits`
+(cto: stale read) and `naive_beat_cap_with_a_renewal_after_the_beat_violates`
+(locks: two exclusive holders), each with a sibling test
+(`the_beat_cap_counts_the_lease_the_takeover_replaced`) showing the same
+trace is held back by the real cap (floor 11, not 7). The cto "clean"
+tests run under a 10 M generated-state budget (a quarter of the others':
+a breadth-first search keeps what it generates), bounded like theirs
+(`is_done` is true on reaching it, 2.1-2.6 M unique states: not an
+exhaustive claim, and the failure message no longer says so); the locks
+ones are exhaustive. Memory: the `cto` test binary peaks at 21-25 GB on
+the 30 GB box without this change (21 tests, each search keeping its states
+until its test ends; two runs on the base, 21.5 and 25.5 GB, 90-150 s), and
+the six new 10 M-state searches took it to 28-30 GB (the kernel killed it
+in a workspace run). The fix: one representative (`fast_takeover_with_beat_
+cap_is_clean`, 4 M states, ~0.5 GB, without the `read_under_delegation`
+witness the older tests have) stays in the default suite and the other
+three clean runs (far ahead/behind, drift, delegating holder; ~1 GB and
+20-40 s each) are `#[ignore]`d with the command in `TESTING.md` (`--ignored
+beat_cap --test-threads=1`: 3 pass, peak 1.9 GB, 68 s). The binary then
+peaks at 21-24 GB, 84-165 s: the base's own range (the box was loaded by
+other jobs, so single runs vary by that much); the naive-cap traces are
+cheap and always run.
+Sim (`crates/authority/tests/sim.rs`): `SimConfig::beats_credited` (the
+negative control: arrival replaced by credit), `fast-takeover-skewed-
+successor-credited`, `fast-takeover-skewed-successor` now with the
+holder's beats on a thread (`-nobeats` is the C7-H2 configuration),
+`fast-takeover-skewed-holder`, `locks-s3-cut-holder-alive`,
+`AUTHORITY_SIM_BEATS=thread` on `sweep_config`, `SWEEP-FLOORS` (counts and
+the floor length distribution) and the report's `floor_ms`;
+`a_credited_arrival_cap_splits` (seeds 194557 and 194714),
+`an_s3_cut_holder_that_beats_on_costs_its_successor_about_a_margin`,
+`a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over` (its lower
+bound, `floor - 2W`, is C7-H2's: `delegated-holder-cut` models no holder
+beat, so the cap is inert there; restored in review F4);
+`a_reader_cut_off_inside_the_takeover_floor_misses_no_acknowledged_write`
+and `a_credited_arrival_cap_splits_on_the_strict_side` (the strict side,
+below), `a_holder_ahead_of_its_successors_costs_no_exclusion` (12 seeds of
+`fast-takeover-skewed-holder`). Harness: `s3-cut-holder-failover-with-locks` fails
+unless the first write and the first lock grant come within 3 s of the
+takeover and the successor counted the cap; `upgrade-after-a-seal` takes
+its reference floor from the successor's log (the cap can end it before
+the bound: killing A anywhere in its 20 s lease leaves 0..20 s of it).
+
+### Negative controls and which rows carry load
+
+Review F3 found that the first set of sweeps proved less than they
+seemed. Measured here on the rebased tree with the floor skipped, the
+lock-side configurations fail (`fast-takeover-skewed-successor` 71 of
+2 000, `-holder` 24, `locks-failover-backup-renew` with beats 59,
+`double-seal-inside-the-grace` 80, 77 with beats; `locks-s3-cut-holder-
+alive` 0, as it must: its holder is dead to the lock table), but the
+strict and read-delegation ones do not (`backup-strict` with beats,
+`delegated-holder-cut` with beats: 0 of 2 000 with no floor at all): a
+reader learns of a seal from S3 or the new holder within half a second and
+drops its delegation before the successor can acknowledge anything. Those
+rows are no evidence for the floor; the rows that are:
+
+- **The strict side: `strict-isolated-reader`** (new). Node 3, whose
+  clients only read (`SimConfig::reader_nodes`), holds a read delegation
+  from the holder and is cut from the other nodes and from S3
+  (`FaultKind::IsolateReader`, `CutS3`) at 1.4 s; the holder crashes at
+  1.5 s, its backup (node 2, whose clients write from 1.6 s:
+  `SimConfig::client_plan`) seals and takes over, inbox off (the takeover
+  gate does not wait the quarantine out); the reader serves from its
+  delegation until it lapses (about 5 s). On a build that arms no floor
+  (`note_marker_landed` returning early, a local mutation, not in the
+  patch): **335 of 2 000 seeds fail** (close-to-open: the reader misses a
+  write the successor acknowledged inside its delegation), 329 with the
+  holder's beats on; with the real floor **0 of 2 000** in both: C7-H2's
+  bound (no beats) and the cap (beats on: floors p50 4.1 s against 7.0 s).
+  `-skewed` (node 2's clock 4 s ahead) is clean too.
+- **The credited control, strengthened:
+  `strict-isolated-reader-skewed-credited`** (the cap counted from the
+  beat's credit, `beats_credited`): **209 of 2 000 seeds fail** (10 %:
+  floors end at 0.85 s against 4.35 s), 0 of 2 000 with the arrival.
+  `a_credited_arrival_cap_splits_on_the_strict_side` pins seeds 9, 40, 47.
+  The old one, `fast-takeover-skewed-successor-credited`, still fails but
+  narrowly: 4 of 2 000 at 193000.. and 4 at 300000.. on the rebased tree (2
+  at 193000.. before it; the review found 0 at 300000..).
+- Lock side: `fast-takeover-skewed-successor`, `-holder`,
+  `locks-failover-backup-renew` (beats on), `double-seal-inside-the-grace`:
+  the figures above with no floor, 0 with the real one (one exception,
+  below).
+
+### Sweeps (2 000 seeds unless noted; rebased on F-a0)
+
+Each sweep ran as the configuration stands (most model no holder beat, so
+their floors are the bound and the cap is inert) and with
+`AUTHORITY_SIM_BEATS=thread` (the daemon's off-core beat on). Floor length
+is simulated ms from the marker. Failing seeds in every row: 0.
+
+| Configuration | seeds | no beats: floors armed, p50 | with beats: armed, capped, cap past, p50 / p90 / max |
+|---|---|---|---|
+| `fast-takeover-skewed-successor` (`-nobeats` is the no-beat one) | 193000.., 300000.. | 2009, 7000 | 4006, 4006, 0: 4366 / 4476 / 4870 (300000..: 4007, 4367) |
+| `fast-takeover-skewed-holder` (one failover) | 196000.., 310000.. | | 2003, 2003, 0: 4061 / 4173 / 4376 (310000..: the same to 5 ms) |
+| `locks-s3-cut-holder-alive` | 197000.., 320000.. | | 1851, 1851, 149: 328 / 377 / 434 (320000..: 1826, 174) |
+| `double-seal-inside-the-grace` | 0.. | 3999, 7000 | 3994, 3994, 1: 4314 / 5061 / 5343 (1 failing, below) |
+| `locks-failover-backup-renew` | 20000.., 330000.. | 2000, 7000 | 4000, 4000, 0: 4289 / 4749 / 5101 (330000..: 4290) |
+| `locks-failover-backup` | 0.. | 1994, 7000 | 1997, 1997, 0: 4449 / 4538 / 4730 |
+| `backup-strict` | 0.. | 1656, 7000 | 1648, 1636, 12: 4031 / 4176 / 7000 |
+| `backup-strict-inbox-off` | 0.. | 1994, 7000 | 1984, 1968, 11: 4036 / 4342 / 7000 |
+| `delegated-holder-cut` | 0.. | 1787, 12500 | 1782, 1782, 0: 3178 / 3262 / 3347 |
+| `strict-isolated-reader`, `-beats`, `-skewed` | 0.. | 2000, 7000 | 2000, 2000, 0: 4129 / 4288 / 4446 (`-skewed`: 4352 / 4392 / 4504) |
+| `backup`, `backup-crash`, `backup-crash-slow`, `backup-lag-at-expiry`, `long-backup`, `long-acks3` (50000..), `locks-blips-tight-faults` (5000..6000, 1 000) | | at most 18 floors in 2 000 seeds (none for `-slow`, `-at-expiry`, `-tight-faults`) | the same, capped where armed |
+
+Rows that carry load for the floor (fail with none): the lock-side four
+above and `strict-isolated-reader*`; the `backup-strict*` and
+`delegated-holder-cut` rows do not (0 failing without a floor either) and
+are regression coverage of the paths only. A floor of 7000 ms in the
+`backup-strict` rows with beats on is a tenure the beats said nothing about
+(no beat heard, or a `MAX` guard).
+
+`double-seal-inside-the-grace` with beats: seed 1703 failed (mutual
+exclusion, t = 16.0..16.7 s, long after both floors, in the lock table's
+recalled-grant outwait after an in-place `Shared` to `Exclusive` upgrade).
+It was not the cap: with the cap disabled the same configuration failed 4
+of 20 000 seeds with beats on (4674, 4914, 9595, 18418) and 4 of 20 000
+with them off (4796, 6156, 17999, 19978). Main's 11ff444 (a grant made in
+place never ends the node's record sooner than the one it replaces) fixes
+it: on the rebased tree seed 1703 passes and 0 of 20 000 seeds (0..20000)
+fail with beats on and with them off.
+
+`fast-takeover-skewed-holder` (the holder's clock 4 s ahead of its
+successors') as first written (offset on node 1 for both failovers) fails
+5 of 2 000 seeds with the cap and 15 without it: node 1, ahead of
+whichever node holds the lease at the second cut (t = 9 s), reads a live
+lease as expired and claims it by TTL (no floor), granting over node 2's
+renewed grants: C7b (Appendix B rows 2 and 10), as the review confirmed
+by replaying 196170, 196343 and 197654 on a cap-disabled build. The
+configuration is one failover: 0 of 2 000 with the cap.
+
+Guard rises (`SWEEP-FLOORS`: "beat guards that rose after being
+published", and "of them base"): a finite guard may rise after a beat
+named it only by what protects a lease-capped right: a subtree grace
+(`lock_on_generation_outwaited`, set after the beat that last named the
+guard: the grants it protects were made by a delegate under its own
+`until`, itself within the root's lease) and the grants made under an
+epoch hold (F1, below). `Core::beat_guard_parts` splits the guard into
+that part and the base (the floor and the quarantines); the sim counts
+rises of the base and `run_seed` fails the seed on any: **0 in every sweep
+above**. The rises of the whole guard: 164 (163 with beats on) in
+`delegated-holder-cut`, 4 401 in `locks-blips-tight-faults`, 0 elsewhere.
+
+### Cost and result
+
+Harness `s3-cut-holder-failover-with-locks`, three runs each on the box,
+all times from the S3 cut (the parent is `c9bee29`, built apart):
+
+| | takeover | first write acknowledged after the takeover | first lock granted after the takeover |
+|---|---|---|---|
+| parent | +13.62, +13.57, +13.57 s | +22.16, +22.16, +22.16 s | +37.18, +37.13, +37.13 s |
+| F-a | +13.65, +13.83, +13.58 s | +14.74, +15.35, +14.84 s | +14.83, +14.83, +14.58 s |
+
+(first write / first lock = takeover + 1.0..1.5 s, against the spec's
+target of +14.6..15.0 s from the cut: one run's first write came at
++15.35 s; the successor's floor counted once each time, shortened by the
+cap by 22.5 s in all). Other
+scenarios, once each, all pass: `backup-failover` (failover 1.50 s),
+`ack-s3-failover`, `lock-failover` (contender granted 0.5 ms after the
+unlock), `backup-failover-with-delegation`, `delegate-backup-handoff-
+failover` (a root killed mid-lease: the successor still waited the 14.5 s
+bound; `shortened by the beat cap 0`), `unmount-inside-the-takeover-floor`
+(23.6 s in one run, 14.1 s in another: where in A's lease the kill fell),
+`upgrade-after-a-seal` (24.1 s once, 14.7 s three times, 0 errors; the
+first version of the assertion expected the bound and failed on the
+shorter floor, as the spec foresaw). A mid-lease crash with most of the
+lease left is unchanged: the bound.
+
+### Review fixes (2026-10-19)
+
+- **F1 (continuation-epoch grants).** Under an epoch hold the lease has no
+  expiry and `lock_cap_ms`/`grant_cap_ms` cap a grant by its ttl alone;
+  `epoch_tenure_resumed` keeps those grants across the re-claim, whose
+  lease can end before them when a ttl is longer than the lease's (legal:
+  `CONSTELLATION_LEASE_TTL_MS=10000` against the 20 s lock and
+  delegation ttls). The two cap functions now record the latest end of what
+  they allowed under a hold (`AckState::hold_grant_until`, an `AtomicI64`:
+  `Core` must stay `Sync`; an upper bound: a query may not end in a grant)
+  and the beat's guard names it. Residual, in the module doc: a holder that
+  dies after the re-claim but before the first beat sent after its last
+  hold-era grant (one beat interval). Not taken: a lease/ttl precondition
+  (a new startup failure mode), or guard `MAX` for a resumed tenure (it
+  gives up the cap in the S3-cut case that motivates it).
+- **F2 (the holder's clock).** The cap is rate-only for offsets but a
+  forward step `J` of the holder's wall clock moves it early by `J`
+  (unsafe past `3M + δ`); the same class as C7-H1 (the root's own grant
+  table judges expiry on its wall clock). In the module doc next to
+  C7-H1's exception, in Appendix B row 27 and in plan 43 (C7-H1/C7a must
+  stamp `sent` on the honour clock). The optional wall-vs-monotonic
+  detection is not implemented.
+- **F3 (test strength).** The strict-side configurations and the
+  strengthened credited control above; `fast-takeover-skewed-holder`,
+  `locks-s3-cut-holder-alive` and `fast-takeover-skewed-successor-nobeats`
+  run in `long_locks`; a 12-seed non-ignored test of the first.
+- **F4.** The lower bound `floor - 2W` of
+  `a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over` is back.
+- **Guard.** Kept as the maximum over the beats of the epoch with `MAX`
+  poisoning it (not the latest-sent refinement: it would forget a
+  restarted incarnation's floor, which lives in memory); the invariant is
+  reworded and enforced above.
+- **Docs.** `durability-and-failover.md`: one `MAX` beat disables the cap
+  for the whole epoch.
+- **Follow-up (plan 43 C7-F, not done here).** Beats on by default in the
+  simulator (`HolderBeats::Thread` in `SimConfig::default`): re-sweeps of
+  every backup and `ack=s3` configuration and re-pinned seeds (65, 97,
+  548, 194557 and 194714).
+- New simulator knobs: `FaultKind::IsolateReader`,
+  `SimConfig::reader_nodes` and `client_plan`, `Step::PacedRead`/`Delay`,
+  and `AUTHORITY_SIM_BEATS=thread` for `replay_seed` too.
+
+### Gates
+
+`cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`
+clean (after the rebase on F-a0 and the review fixes). `cargo test
+--workspace --no-fail-fast` on the box: 3274 passed, 0 failed, 55 ignored.
+(The first full run, before the review fixes, had one failure, the
+engine's `the_holders_heartbeat_survives_a_starved_runtime` under box load,
+which passes alone, and the `cto` model binary killed by the kernel for
+memory: see Tests. The review found the heartbeat test unrelated to this
+change.) Harness, after the rebase and fixes, on the box:
+`s3-cut-holder-failover-with-locks` twice: takeover +13.62 s, first write
++14.74 s, first lock grant +14.83 s from the cut (the two runs within 3 ms
+of each other), the successor's floor armed once and shortened by the cap
+(22 504 ms saved); `backup-failover` 1.50 s, `ack-s3-failover`,
+`lock-failover` (granted 0.56 ms after the unlock),
+`backup-failover-with-delegation`, `delegate-backup-handoff-failover`
+(the root killed mid-lease: waited the 14.5 s bound, cap 0),
+`unmount-inside-the-takeover-floor` (14.3 s), `upgrade-after-a-seal`
+(14.7 s, 0 errors) all pass. Every job ran under `timeout
+--kill-after=30s`; none hit it.
+
+Rebased on 0fbc74f (which has 11ff444) and the cto budget change, rerun
+on the box: fmt and clippy -D warnings clean; `cargo test --release -p
+constellation-authority` 598 passed, 0 failed, 13 ignored; `cargo test -p
+constellation-model` 154 passed, 0 failed, 18 ignored; `cargo test -p
+constellation-engine --lib` 766 passed, 0 failed, 9 ignored; harness
+`s3-cut-holder-failover-with-locks`: takeover +13.63 s, first write
++14.76 s, first lock grant +14.83 s, floor shortened by the cap (22 507 ms).
+
+Rebased on 5a7f659 (F-b: lock grace waits): `cargo clippy --workspace
+--all-targets -D warnings` and `cargo fmt --check` clean; `cargo test
+--release -p constellation-authority` passes (lib 442, sim 165); 5 000
+seeds of `double-seal-inside-the-grace` clean with beats on and off;
+harness `s3-cut-holder-failover-with-locks`: takeover +13.60 s, first
+write +14.74 s, first lock grant +14.83 s from the cut (the contender's
+non-blocking request now waits for the grace and is granted at its end: the
+longest attempt 4.0 s), floor shortened by the cap (22 505 ms saved).
+
+### Interactions
+
+- Appendix B row 6 (the non-minting fencing-token check, offset-bound until
+  C7b) loses the slack the whole bound gave it: back to its pre-C7-H2
+  exposure, inside the documented ±500 ms.
+- F-c: after an S3-cut failover the grace in which the successor admits
+  reclaims is short or absent; F-c's "park until the reclaim is admitted"
+  must not assume a grace. F-b's deferred wait is reusable for parked owner
+  I/O.
+- C7a: the beat's arrival stamp moves to the wait clock together with the
+  floor's own; C7-H1's honour clock makes the expiry chain monotone
+  (safety step 2's exception).
+- Appendix B row 14 unchanged: the floor and the beats are in memory; a
+  restarted successor has no beats and waits the bound.
+
+### Not changed
+
+- `dl.inherit_slack_ms` and the inherited generations' reclaim wait: a
+  possible later use of the same cap.
+- The simulator's other configurations still model no holder beat: only
+  the ones above (and `AUTHORITY_SIM_BEATS=thread`) exercise the cap.
+- `fast-takeover-skewed-holder`'s two-failover form (C7b, above).
+- No new environment keys (`configuration.md` unchanged).

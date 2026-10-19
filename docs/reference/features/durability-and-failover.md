@@ -473,13 +473,52 @@ margins: the read-delegation TTL (plus the write delegations' reclaim
 horizon when some were live) for acknowledgements, the longer of the
 read-delegation and lock TTLs for new lock grants (about 8.5 s and
 23.5 s at the defaults, plus the reclaim horizon when write delegations
-were live). The wait counts only the successor's own elapsed time. It is
-never shortened to the old lease's expiry: that is a stamp of the old
-holder's clock, and a successor whose clock runs ahead of it by more than
-the lease has left would read it as past and wait for nothing while the
-old holder's grants were still honoured. Nor does the successor's reading
-of that expiry decide whether the takeover was a fast one: a seal or an
-`ack=s3` takeover is, whatever its clock says.
+were live). The bound counts only the successor's own elapsed time. It is
+never shortened to the old lease's expiry read against the successor's
+clock: that expiry is a stamp of the old holder's clock, and a successor
+whose clock runs ahead of it by more than the lease has left would read it
+as past and wait for nothing while the old holder's grants were still
+honoured. Nor does the successor's reading of that expiry decide whether
+the takeover was a fast one: a seal or an `ack=s3` takeover is, whatever
+its clock says.
+
+**The old holder's own heartbeat can end the wait earlier.** Everything
+the old holder answered or granted is capped by its lease (strict answers
+only while the lease is usable, grants and renewals to the expiry less a
+margin, their holders honouring them from their own send less another
+margin), so nothing it answered is honoured once its own clock reads the
+expiry of the lease it held. Its off-core heartbeat (every
+`backup_heartbeat_ms`, to its backups, or to its stream subscribers under
+`ack=s3`) carries the holder's clock when it was sent and the expiry it
+beats for, and is stamped on arrival with the successor's clock: each beat
+says the holder's clock read the one value no later than the successor's
+read the other. The successor therefore ends its wait at the earlier of
+the bound and `X + min(arrival − sent) + one margin`, where `X` is the
+latest of the expiry of the lease it replaced, the expiries the beats
+named, and what the beats named as the holder's *guard*, and `min` is over
+the beats sent within 250 margins of `X` (so the two clocks' rates, within
+1 000 ppm, cannot drift apart by more than half a margin over the span);
+if that has passed when its marker lands, there is no wait at all. The
+guard is what the holder itself waits out and its lease does not cap: its
+own takeover floor (which can be longer than its lease: 23.5 s against a
+20 s lease at the defaults), a released takeover's lock grace, a
+restart's quarantine, a subtree grace, the grants it made under a
+continuation epoch's hold (a lock or delegation ttl can be longer than the
+lease's); while its takeover gate is pending the guard is unknown, and one
+such beat heard in an epoch disables the cap for the whole epoch (the
+successor takes the maximum over the beats). The cap uses the beat's
+arrival stamp on the successor's clock, never the credit the seal watch
+gives it (`min(arrival, sent + margin)`, an instant of the holder's
+clock). It is a difference on one clock added to a stamp of the other, so
+it needs a bounded clock *rate*, not a bounded offset; it does need the
+holder's clock not to step forward (a forward step moves the cap early by
+the step: unsafe past three margins; the holder's own grant table has the
+same dependence, plan 43 C7-H1). Counting from the
+last renewal the successor saw instead would be unsafe: the holder's other
+proofs of S3 liveness (segment runs and puts, a lease read) are invisible
+to the successor, and the holder answers within the takeover window of
+any of them. The beats are in memory: a successor that restarted has none
+and waits the bound.
 
 A tenure that waits out its predecessor's grants is one its own successor
 must wait out, even if it serves nothing first. The claim CAS of a
@@ -501,23 +540,28 @@ arms a floor even if it never granted anything, and a chain of seals
 keeps paying one.)
 
 The cost: a takeover in the last seconds of the old lease waits the whole
-bound where it used to wait only until the expiry, and so does a takeover
-after the lease ran out of a holder cut from S3 but alive on P2P: its
-backup seals at the expiry it reads, which used to be a TTL takeover with
-no wait at all. Measured with strict reads and a held lock,
-that failover's first acknowledged write moved from the takeover itself to
-about 8.5 s after it, and the first new lock grant to about 23.5 s after
-it; a non-blocking lock request on a free file waits for the grace
-meanwhile, on a thread of the mount's pool, and is granted at its end
-(`EAGAIN` only after 112.5 s with the defaults, `EINTR` on a signal; with
-a holder cut from S3 the wait begins at the stale owner and lasts 37 to
-61 s at the production lease; see [Cluster
+bound where it used to wait only until the expiry, unless the old holder
+was beating, and so does a takeover after the lease ran out of a holder
+cut from S3 but alive on P2P (its backup seals at the expiry it reads,
+which used to be a TTL takeover with no wait at all) — except that the
+holder, alive, beat until its lease ended, so the successor's wait ends
+about one margin after it: in the harness, the first acknowledged write
+and the first new lock grant come about a second after the takeover
+instead of 8.5 s and 23.5 s after it. A holder that died or lost P2P
+mid-lease sent no beats after that, but the lease it held still ends where
+it ends: the successor's wait is the earlier of the bound and the end of
+that lease as the last beats placed it, so a crash with more than the
+bound left on a 60 s lease still waits the bound (8.5 s and 23.5 s at the
+defaults) and one in the lease's last seconds waits only until it ends.
+While the wait lasts, a non-blocking lock request on a free file waits for
+the grace meanwhile, on a thread of the mount's pool, and is granted at its
+end (`EAGAIN` only after 112.5 s with the defaults, `EINTR` on a signal;
+with a holder cut from S3 the wait begins at the stale owner and lasts 37
+to 61 s at the production lease; see [Cluster
 locks](cluster-locks.md#waiting-for-a-grace)); a request that a
 ring-transport mount has no queue entry to wait on is answered at once,
-as before.
-Only a tenure that served strict reads or locks costs its successor
-anything. Shortening the wait from the successor's own observation of the
-old holder's last renewal is planned (plan 43, C7-F).
+as before. Only a tenure that served strict reads or locks costs its
+successor anything.
 
 The successor keeps the lease through its takeover gate and until both
 waits have passed: it does not idle-release it to a node that wants it,
@@ -529,7 +573,8 @@ and the floor are over (the rounds still ship, and the node serves as
 before), then the flush runs and releases. So a `leave` or an unmount
 right after a seal takes up to the floor's remainder longer (23.5 s, or
 29.5 s with write delegations, at the defaults; 8.5 s and 14.5 s with
-locks off). The in-place upgrade waits for it *before it detaches the
+locks off; about a margin after a holder that was beating to the end of its
+lease). The in-place upgrade waits for it *before it detaches the
 views*, which keep serving meanwhile: only the drain that follows stalls
 the applications, as without a seal; and it waits out a floor in full,
 because a new image would re-adopt the lease without it (the floor is in

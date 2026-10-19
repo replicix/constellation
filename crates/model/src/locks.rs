@@ -86,6 +86,21 @@
 //!   (`grace_follows_delegation`, the code's `DelegRenewed::lock_grace_ms`);
 //!   left at the root, the delegate granted over a released grant.
 //!
+//! # Plan 43 C7-F F-a: the grace capped by the old root's beats
+//!
+//! With `beat_cap` the old root (a node holding a lease, while its clock
+//! is below the expiry) beats to the backup (`Beat(h)`), which records on
+//! its own clock the smallest `local(b) − local(h)` (the code's `at −
+//! sent`, never the credit), the highest expiry named and the highest
+//! guard (the root's own grace, the code's `Beat::guard_unix_ms`; the
+//! model's root has no takeover gate, so the unknown guard never arises
+//! here). The backup's fast takeover of that root and epoch ends its
+//! grace at `min(bound, X + lag + seq_margin)`, `X = max(old expiry,
+//! named, guard)`; none if that has passed. No span filter: see
+//! `cto.rs`. `beat_cap_from_named_expiry` is the naive variant (`X` =
+//! what the beats named), which must be found violating: a root that
+//! renews after its last beat.
+//!
 //! # The property
 //!
 //! `mutual_exclusion` (always): a node never performs I/O under a grant
@@ -270,6 +285,12 @@ pub struct LockModel {
     pub recall_by_ttl: bool,
     /// The root may renew its lease.
     pub allow_renew: bool,
+    // ---- plan 43 C7-F F-a ----
+    /// The backup's grace after a fast takeover is capped by what the old
+    /// root's beats say of its lease.
+    pub beat_cap: bool,
+    /// The naive cap: `X` is only what the beats named. Must violate.
+    pub beat_cap_from_named_expiry: bool,
 }
 
 impl LockModel {
@@ -316,6 +337,8 @@ impl LockModel {
             delegate: NONE,
             recall_by_ttl: false,
             allow_renew: false,
+            beat_cap: false,
+            beat_cap_from_named_expiry: false,
         }
     }
 
@@ -429,6 +452,10 @@ pub struct Node {
     pub mirror: (u8, Vec<Grant>),
     /// Root side: the mirror version counter.
     pub mirror_ver: u8,
+    /// Backup side (`beat_cap`): what it heard of one root's beats
+    /// `(holder, epoch, lag, named, guard)`: the smallest arrival minus
+    /// send, the highest expiry and guard named (0: none).
+    pub heard: Option<(u8, u8, i16, i16, i16)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -521,6 +548,7 @@ pub const SAW_REINSTATED: u16 = 1024;
 pub const SAW_RESENT: u16 = 2048;
 pub const SAW_RELEASED_TAKEOVER: u16 = 4096;
 pub const SAW_GRACE_INHERITED: u16 = 8192;
+pub const SAW_GRACE_CAPPED: u16 = 16384;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -897,6 +925,8 @@ pub enum Action {
     DelegRenewal,
     /// Root: release the lease (a graceful shutdown).
     Release(u8),
+    /// Plan 43 C7-F F-a: root `h` beats to the backup (`beat_cap`).
+    Beat(u8),
     /// `delayed_io`: node `i`'s admitted write lands at the owner.
     Land(u8),
 }
@@ -930,6 +960,7 @@ impl Model for LockModel {
                 moved_seen: Vec::new(),
                 mirror: (0, Vec::new()),
                 mirror_ver: 0,
+                heard: None,
             })
             .collect();
         let h = self.initial_holder as usize;
@@ -1033,6 +1064,13 @@ impl Model for LockModel {
                 }
             } else if node.lease.is_some() && self.backup != NONE && s.reg.holder != iu {
                 actions.push(Action::Probe(iu));
+            }
+            if self.beat_cap && self.backup != NONE && self.backup != iu {
+                if let Some((_, expires)) = node.lease {
+                    if now < expires {
+                        actions.push(Action::Beat(iu));
+                    }
+                }
             }
             let ttl_claimable = self.ttl_takeover && now >= s.reg.expires;
             let fast = self.backup == iu && s.reg.holder != iu;
@@ -1190,12 +1228,46 @@ impl Model for LockModel {
                     if self.grace {
                         let bound =
                             now + self.takeover_window + self.lock_ttl + 2 * self.seq_margin;
-                        s.nodes[i].floor = Some(bound);
+                        // Plan 43 C7-F F-a: capped by the old root's beats
+                        // (the code's `Core::beat_cap`): none if passed.
+                        let cap = if self.beat_cap {
+                            s.nodes[i]
+                                .heard
+                                .filter(|h| h.0 == prev.holder && h.1 == prev.epoch)
+                                .map(|(_, _, lag, named, guard)| {
+                                    let x = if self.beat_cap_from_named_expiry {
+                                        named
+                                    } else {
+                                        prev.expires.max(named).max(guard)
+                                    };
+                                    x + lag + self.seq_margin
+                                })
+                        } else {
+                            None
+                        };
+                        let end = cap.map_or(bound, |c| bound.min(c));
+                        if end < bound {
+                            s.saw |= SAW_GRACE_CAPPED;
+                        }
+                        s.nodes[i].floor = (end > now).then_some(end);
                     }
                 } else {
                     s.saw |= SAW_TTL_TAKEOVER;
                     s.nodes[i].table.clear();
                 }
+            }
+            Action::Beat(h) => {
+                let h = h as usize;
+                let b = self.backup as usize;
+                let (epoch, expires) = s.nodes[h].lease?;
+                let lag = s.local(b) - s.local(h);
+                let guard = s.nodes[h].floor.unwrap_or(0);
+                s.nodes[b].heard = Some(match s.nodes[b].heard {
+                    Some((o, e, l, n, g)) if o == h as u8 && e == epoch => {
+                        (o, e, l.min(lag), n.max(expires), g.max(guard))
+                    }
+                    _ => (h as u8, epoch, lag, expires, guard),
+                });
             }
             Action::Probe(i) => {
                 let i = i as usize;
@@ -1493,6 +1565,7 @@ impl Model for LockModel {
             Property::sometimes("grace_inherited", |_, s: &State| {
                 s.saw & SAW_GRACE_INHERITED != 0
             }),
+            Property::sometimes("grace_capped", |_, s: &State| s.saw & SAW_GRACE_CAPPED != 0),
         ]
     }
 

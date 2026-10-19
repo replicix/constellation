@@ -750,11 +750,22 @@ pub enum Payload {
 /// (the holder's process itself was held up), and lengthens its silence
 /// window while either has happened lately; from the third, that silence
 /// at the expiry is the lease ending, and is not given that grace.
+///
+/// Plan 43 C7-F F-a: `guard_unix_ms` and `sent_unix_ms` also let the
+/// watcher, once it has taken the lease over, place the end of what the
+/// holder's grants could still be honoured on its own clock
+/// (`Core::beat_cap`): a difference on the holder's clock added to the
+/// beat's arrival stamp on the watcher's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beat {
     pub seq: u64,
     pub sent_unix_ms: i64,
     pub expires_unix_ms: i64,
+    /// The latest instant on the holder's clock at which grants it waits
+    /// out but its lease does not cap may still be honoured: its takeover
+    /// floor, its lock and read quarantines, its subtree graces. 0: none;
+    /// `i64::MAX`: unknown (its takeover gate is pending).
+    pub guard_unix_ms: i64,
 }
 
 /// Plan 30 §M14: `constellation_authority::LockOutcome` on the wire.
@@ -1401,6 +1412,48 @@ mod tests {
         assert!(
             msg.encode().is_ok(),
             "children-only reply exceeds MAX_FRAME"
+        );
+    }
+
+    /// Plan 43 C7-F F-a: the beat's guard rides at the end of the struct
+    /// (the earlier fields keep their encoding) and survives signing and
+    /// framing, the unknown value (`i64::MAX`) included.
+    #[test]
+    fn a_beat_carries_its_guard_at_the_end() {
+        let k = key();
+        for guard_unix_ms in [0, 123_456_789, i64::MAX] {
+            let beat = Beat {
+                seq: 7,
+                sent_unix_ms: 1_000,
+                expires_unix_ms: 7_000,
+                guard_unix_ms,
+            };
+            let payload = Payload::HolderAlive {
+                holder: 1,
+                epoch: 2,
+                candidacy: 3,
+                listed: true,
+                beat,
+            };
+            let signed = Signed::new(&k, &payload).unwrap();
+            let frame = signed.encode().unwrap();
+            let back = Signed::decode(&frame[4..]).unwrap();
+            assert_eq!(back.verify().unwrap().1, payload);
+        }
+        // The first three fields are the encoding they had before the
+        // guard, the guard follows.
+        let head = postcard::to_stdvec(&(7u64, 1_000i64, 7_000i64)).unwrap();
+        let whole = postcard::to_stdvec(&Beat {
+            seq: 7,
+            sent_unix_ms: 1_000,
+            expires_unix_ms: 7_000,
+            guard_unix_ms: 42,
+        })
+        .unwrap();
+        assert!(whole.starts_with(&head));
+        assert_eq!(
+            whole[head.len()..],
+            postcard::to_stdvec(&42i64).unwrap()[..]
         );
     }
 

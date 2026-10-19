@@ -637,12 +637,14 @@ fn root_loss(name: &'static str, backed: bool, freeze: bool, handoff_first: bool
         eprintln!(
             "    {name}: b's writes across the root's loss: {} ({} takeover, protocol {protocol:?}, \
              bound {bound:?}; successor quarantine {} (logged waits {waits:?} ms, configured at \
-             most {:?}); b held the root {:?} after the {}); afterwards: {}; {} inherited \
+             most {:?}; shortened by the beat cap {}, cap already past {}); b held the root {:?} after the {}); afterwards: {}; {} inherited \
              generations, {} reclaimed",
             dist(&durations(&failover)),
             if fast { "seal-based" } else { "TTL" },
             if quarantined { "waited" } else { "none" },
             timings.ack_floor_wait(true),
+            n(&ack, "ack_floor_capped"),
+            n(&ack, "ack_floor_capped_out"),
             held_at.map(|t| t.saturating_sub(killed_at)),
             if freeze { "freeze" } else { "kill" },
             dist(&durations(&later)),

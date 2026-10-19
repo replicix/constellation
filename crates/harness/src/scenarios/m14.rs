@@ -1180,6 +1180,15 @@ impl Drop for ChildLock {
     }
 }
 
+/// Plan 43 C7-F F-a's tripwire on [`s3_cut_holder_failover_with_locks`]:
+/// the cut holder beats until its lease ends, so its successor's floor is
+/// capped at the lease's end plus one expiry margin (1 s: `EXPIRY_MARGIN_MS`
+/// of the engine's lease) and the first write acknowledged and the first
+/// lock granted after the takeover come within the margin and two seconds
+/// of slack. (Without the cap the whole floor stands: +8.6 s on writes and
+/// +23.6 s on locks past the takeover.)
+const CAP_SLACK: Duration = Duration::from_secs(3);
+
 /// What one application thread saw: `(started, returned, answer)` of each
 /// op, relative to the S3 cut.
 type Seen = Vec<(Duration, Duration, std::result::Result<(), Code>)>;
@@ -1204,6 +1213,11 @@ type Seen = Vec<(Duration, Duration, std::result::Result<(), Code>)>;
 /// for the successor's grace and is granted at its end (plan 43 F-b; it
 /// answered `EAGAIN` for the whole floor before). Printed with the errnos:
 /// the longest attempt, which is the longest wait.
+/// Plan 43 C7-F F-a: the first write acknowledged and the first lock
+/// granted after the takeover must come within [`CAP_SLACK`] of it (the
+/// successor's floor ends at the cut holder's last beat's lease plus a
+/// margin), and the status counters must show the cap at work
+/// (`ack_floor_capped` or `ack_floor_capped_out`).
 /// `CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1` holds the lock in the
 /// harness process instead, the control: the reader then sees the fence.
 pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
@@ -1479,6 +1493,23 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
             .collect();
         eprintln!("    {NAME}: lock counters {counters:?}");
         let gave_up: u64 = grace_waits.iter().map(|(_, _, g)| *g).sum();
+        let ack = super::m9::ack_of(&clients[backup_idx])?;
+        let (capped, capped_out) = (
+            super::m9::n(&ack, "ack_floor_capped"),
+            super::m9::n(&ack, "ack_floor_capped_out"),
+        );
+        eprintln!(
+            "    {NAME}: the successor's floor: armed {} time(s), shortened by the cap {capped}, \
+             cap already past {capped_out} (saved {} ms)",
+            super::m9::n(&ack, "ack_floor_waits"),
+            super::m9::n(&ack, "ack_floor_cap_saved_ms")
+        );
+        let late =
+            |first: Option<Duration>| first.is_none_or(|f| f > (took_over - cut_at) + CAP_SLACK);
+        let (late_write, late_grab) = (
+            late(first_ok_after(&writes, took_over)),
+            late(first_ok_after(&grabs, took_over)),
+        );
         proxies[0].heal();
         if let Some(held) = held {
             held.release();
@@ -1495,6 +1526,16 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
         anyhow::ensure!(
             gave_up == 0,
             "{gave_up} lock wait(s) gave up at the bound (the wait for the owner outlasted it)"
+        );
+        anyhow::ensure!(
+            !late_write && !late_grab,
+            "the successor's floor outlasted the cut holder's lease by more than {CAP_SLACK:?} \
+             (first write acknowledged / first lock granted after the takeover: see the line \
+             above): the beat cap did not apply"
+        );
+        anyhow::ensure!(
+            capped + capped_out > 0,
+            "the successor's floor was never capped by the cut holder's beats"
         );
         Ok(())
     })();

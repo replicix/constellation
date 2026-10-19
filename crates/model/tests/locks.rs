@@ -10,7 +10,7 @@
 //!
 //! `cargo test -p constellation-model --release --test locks -- --nocapture`
 
-use constellation_model::locks::{LockModel, Mode, Op, NONE};
+use constellation_model::locks::{Action, LockModel, Mode, Msg, Op, State, NONE};
 use stateright::{Checker, HasDiscoveries, Model};
 use std::time::{Duration, Instant};
 
@@ -309,6 +309,163 @@ fn fast_takeover_with_grace_is_clean_with_a_backup_far_ahead() {
         ..LockModel::design(contend())
     };
     assert_clean("fast-grace-far-ahead", &m, &["fast_takeover", "reclaimed"]);
+}
+
+/// Plan 43 C7-F F-a: the root beats to the backup (`beat_cap`); the
+/// backup's grace ends where its own clock puts the root's lease, plus a
+/// margin, when that is before the bound. Clean with the backup's clock
+/// level with, far ahead of and far behind the root's; the cap witnessed
+/// where it can be (level).
+#[test]
+fn fast_takeover_with_beat_cap_is_clean() {
+    for (label, offsets) in [
+        ("level", vec![0, 0, 0]),
+        ("far-ahead", vec![0, 0, 9]),
+        ("far-behind", vec![0, 0, -9]),
+    ] {
+        let m = LockModel {
+            backup: 2,
+            replicate: false,
+            grace: true,
+            beat_cap: true,
+            lease_ttl: 6,
+            lock_ttl: 3,
+            init_offsets: Some(offsets),
+            max_drops: 0,
+            max_tick: 6,
+            ..LockModel::design(contend())
+        };
+        let expect: &[&'static str] = if label == "level" {
+            &["fast_takeover", "reclaimed", "grace_capped"]
+        } else {
+            &["fast_takeover", "reclaimed"]
+        };
+        assert_clean(&format!("fast-beat-cap-{label}"), &m, expect);
+    }
+}
+
+/// One locker on the old root, one on the backup, neither unlocking: the
+/// smallest scripts that can show a grant honoured past a grace.
+fn two_lockers() -> Vec<Vec<Op>> {
+    vec![vec![], vec![Lock(X), Io], vec![Lock(X), Io]]
+}
+
+/// The same under clocks within `D = 1` that step once, margins of 3.
+#[test]
+fn fast_takeover_with_beat_cap_is_clean_under_drift() {
+    let m = LockModel {
+        backup: 2,
+        replicate: false,
+        grace: true,
+        beat_cap: true,
+        seq_margin: 3,
+        node_margin: 3,
+        lease_margin: 3,
+        lease_ttl: 12,
+        lock_ttl: 4,
+        max_offset: 1,
+        init_offsets: Some(vec![-1, 1, -1]),
+        max_jumps: 1,
+        max_drops: 0,
+        max_tick: 5,
+        ..LockModel::design(two_lockers())
+    };
+    assert_clean("fast-beat-cap-drift", &m, &["fast_takeover"]);
+}
+
+/// Executes `a` in `s`, which must be enabled there.
+fn step(m: &LockModel, s: &State, a: Action) -> State {
+    let mut enabled = Vec::new();
+    m.actions(s, &mut enabled);
+    assert!(enabled.contains(&a), "{a:?} is not enabled at t={}", s.t);
+    m.next_state(s, a).expect("a state")
+}
+
+/// Delivers the first message in flight that `is` matches.
+fn deliver(m: &LockModel, s: &State, is: impl Fn(&Msg) -> bool) -> State {
+    let k = s.net.iter().position(is).expect("the message is in flight");
+    step(m, s, Action::Deliver(k))
+}
+
+/// The scenario the naive cap gets wrong, as a trace (the checker's
+/// search for it exceeds the budget): the root (node 0, lease to 6) beats
+/// to the backup (node 2) at t = 0, renews at t = 4 (to 10), grants node 1
+/// an exclusive lock honoured until 8, and node 2 takes the lease over at
+/// t = 4. Returns the state after the takeover.
+fn renewal_after_the_beat(m: &LockModel) -> State {
+    let mut s = m.init_states().remove(0);
+    s = step(m, &s, Action::Beat(0));
+    for _ in 0..4 {
+        s = step(m, &s, Action::Tick);
+    }
+    s = step(m, &s, Action::RenewLease(0));
+    s = step(m, &s, Action::Start(1));
+    s = deliver(m, &s, |x| matches!(x, Msg::LockReq { .. }));
+    s = deliver(m, &s, |x| matches!(x, Msg::LockReply { .. }));
+    assert_eq!(s.nodes[1].cache.map(|c| c.until), Some(8));
+    step(m, &s, Action::Takeover(2))
+}
+
+fn renewing_root(naive: bool) -> LockModel {
+    LockModel {
+        backup: 2,
+        replicate: false,
+        grace: true,
+        beat_cap: true,
+        beat_cap_from_named_expiry: naive,
+        allow_renew: true,
+        lease_ttl: 6,
+        lock_ttl: 5,
+        max_drops: 0,
+        max_tick: 8,
+        ..LockModel::design(two_lockers())
+    }
+}
+
+/// The naive cap (`X` = what the beats named) with a root that renews its
+/// lease after the last beat: the grace ends (named 6 + lag 0 + margin 1
+/// = 7) while the renewed lease still backs a grant honoured until 8, and
+/// the backup grants over it.
+#[test]
+fn naive_beat_cap_with_a_renewal_after_the_beat_violates() {
+    let m = renewing_root(true);
+    let mut s = renewal_after_the_beat(&m);
+    assert_eq!(s.nodes[2].floor, Some(7));
+    s = step(&m, &s, Action::Start(2));
+    s = deliver(&m, &s, |x| matches!(x, Msg::LockReq { .. }));
+    for _ in 0..3 {
+        s = step(&m, &s, Action::Tick);
+    }
+    // The new root probes the register (it answers within a window of a
+    // probe), then its grace is over and its parked request is served.
+    s = step(&m, &s, Action::Probe(2));
+    s = step(&m, &s, Action::FloorPassed(2));
+    s = step(&m, &s, Action::Start(1));
+    println!("naive cap: mutual exclusion violated: {:?}", s.violation);
+    assert!(
+        s.violation.is_some(),
+        "node 1 wrote under a superseded grant"
+    );
+}
+
+/// The same trace under the real cap: the grace counts the renewed lease
+/// the takeover replaced (10), so the backup grants nothing before 11.
+#[test]
+fn the_beat_cap_counts_the_lease_the_takeover_replaced() {
+    let m = renewing_root(false);
+    let mut s = renewal_after_the_beat(&m);
+    assert_eq!(s.nodes[2].floor, Some(11));
+    s = step(&m, &s, Action::Start(2));
+    s = deliver(&m, &s, |x| matches!(x, Msg::LockReq { .. }));
+    for _ in 0..3 {
+        s = step(&m, &s, Action::Tick);
+    }
+    let mut enabled = Vec::new();
+    m.actions(&s, &mut enabled);
+    assert!(
+        !enabled.contains(&Action::FloorPassed(2)),
+        "the grace ended inside the old root's renewed lease"
+    );
 }
 
 #[test]

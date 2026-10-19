@@ -721,14 +721,24 @@ impl Core {
 
     /// The root's grants never outlive its lease's usable end (under a
     /// continuation epoch the lease has no expiry; the ttl stands).
-    fn lock_cap_ms(&self, now: Ms) -> i64 {
+    pub(crate) fn lock_cap_ms(&self, now: Ms) -> i64 {
         let Some((lease, _)) = &self.lease.held else {
             return 0;
         };
         if self.lease.epoch_held() {
-            return self.lock_ttl_ms();
+            let ttl = self.lock_ttl_ms();
+            self.ack.note_hold_grant(now.0 + ttl);
+            return ttl;
         }
         lease.expires_unix_ms - self.lock_margin_ms() - now.0
+    }
+
+    /// The latest end of a subtree grace on this tenure (an outwaited
+    /// delegate's, a delegation that started inside the root's), unix ms; 0
+    /// none: what the holder's beat names as its guard
+    /// ([`Core::beat_guard_unix_ms`]).
+    pub(crate) fn lock_grace_until_ms(&self) -> i64 {
+        self.lk.grace.iter().map(|(_, u)| u.0).max().unwrap_or(0)
     }
 
     /// The inode is under a subtree grace (an outwaited delegate), or is
@@ -5307,7 +5317,7 @@ impl Core {
             .map(|g| g.until_ms)
             .max()
             .unwrap_or(0);
-        let grace = self.lk.grace.iter().map(|(_, u)| u.0).max().unwrap_or(0);
+        let grace = self.lock_grace_until_ms();
         let until = grants.max(grace);
         if until > now.0 {
             replica.locks().set_quarantine(until);

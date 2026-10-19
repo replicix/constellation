@@ -23,7 +23,7 @@ pub(super) fn ack_of(c: &Client) -> Result<serde_json::Value> {
     Ok(c.control_status()?["ack"].clone())
 }
 
-fn n(v: &serde_json::Value, key: &str) -> u64 {
+pub(super) fn n(v: &serde_json::Value, key: &str) -> u64 {
     v[key].as_u64().unwrap_or(0)
 }
 
@@ -39,8 +39,8 @@ fn print_ack(scenario: &str, who: &str, s: &serde_json::Value) {
          config_version {} durable {} parked {} gated {} | backing {}@{} through {} sealed {} | \
          added {} removed {} reconfig-cas {} appends {} acks {} timeouts {} acks-waited {} \
          (ms total {}) aborted {} streamed {}/{} installed {} dropped {} persisted {} seals {} \
-         takeovers {} tail-applied {} s3-fast-takeovers {} floor-waits {} stale-refusals {} \
-         reads-durability-blocked {}",
+         takeovers {} tail-applied {} s3-fast-takeovers {} floor-waits {} (capped {}, cap past {}, \
+         saved {} ms) stale-refusals {} reads-durability-blocked {}",
         s["policy"],
         s["ack_s3"],
         s["backups"],
@@ -72,6 +72,9 @@ fn print_ack(scenario: &str, who: &str, s: &serde_json::Value) {
         n(s, "backup_tail_applied"),
         n(s, "s3_fast_takeovers"),
         n(s, "ack_floor_waits"),
+        n(s, "ack_floor_capped"),
+        n(s, "ack_floor_capped_out"),
+        n(s, "ack_floor_cap_saved_ms"),
         n(s, "stale_liveness_refusals"),
         n(s, "reads_durability_blocked"),
     );

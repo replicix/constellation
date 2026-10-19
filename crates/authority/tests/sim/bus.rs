@@ -358,7 +358,7 @@ impl Bus {
         (from, to): (NodeId, NodeId),
         epoch: u64,
         seq: u64,
-        (sent, expires): (i64, i64),
+        (sent, expires, guard): (i64, i64, i64),
     ) {
         *self.sent.lock().unwrap() += 1;
         if self.beats_lost.load(std::sync::atomic::Ordering::Relaxed) {
@@ -382,6 +382,7 @@ impl Bus {
                 seq,
                 sent: constellation_authority::Ms(sent),
                 expires: constellation_authority::Ms(expires),
+                guard: constellation_authority::Ms(guard),
             },
         );
     }

@@ -451,6 +451,23 @@ pub fn upgrade_under_load(seed: u64) -> Result<()> {
     result
 }
 
+/// The floor the node armed at its last fast takeover, as it logged it:
+/// the later of its acknowledgement wait and its lock wait.
+fn floor_logged(node: &Client) -> Option<Duration> {
+    node.log_text()
+        .lines()
+        .rfind(|l| l.contains("acknowledging no mutation until its delegation horizon"))
+        .map(|l| {
+            let l = crate::verify::strip_ansi(l);
+            let ms = |k: &str| {
+                crate::verify::field(&l, k)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            Duration::from_millis(ms("wait_ms").max(ms("lock_wait_ms")))
+        })
+}
+
 /// Plan 43 C7-H2 (review R3-3): an upgrade right after a seal waits out the
 /// successor's takeover floor before it hands over (the drain releases the
 /// lease, which the floor holds back), and the wait must not stall the
@@ -458,7 +475,8 @@ pub fn upgrade_under_load(seed: u64) -> Result<()> {
 /// holds a strict delegation from A, A dies, its backup X takes over and is
 /// upgraded at once, with a reader of `f` and a writer running on X's
 /// mount. The upgrade takes about the floor (23.5 s with the default lock
-/// TTL). The takeover's own gate holds X's first reads and writes for the
+/// TTL; less when A's beats put the end of its lease earlier, plan 43
+/// C7-F F-a: the floor X logged is the reference). The takeover's own gate holds X's first reads and writes for the
 /// read floor (6.5 s here: reported, it is the takeover's doing, not the
 /// upgrade's); after it no read on X's mount waits more than a few
 /// seconds, whichever of the wait, the detach or the exec it falls in, and
@@ -570,9 +588,16 @@ pub fn upgrade_after_a_seal(_seed: u64) -> Result<()> {
             generation(&clients[x_idx])? == first + 1,
             "the upgrade did not advance the generation"
         );
+        // The floor X armed: the later of its two waits as it logged them
+        // (plan 43 C7-F F-a: the cap on the dead holder's lease can end
+        // the floor before the bound, and where in its 20 s lease A was
+        // killed decides how much is left of it).
+        let floor = floor_logged(&clients[x_idx]);
+        eprintln!("    {NAME}: X's floor as it logged it: {floor:?}");
         ensure!(
-            upgrade_took >= Duration::from_secs(15),
-            "the upgrade took only {upgrade_took:?}: it did not wait out the takeover floor"
+            floor.is_some_and(|f| upgrade_took + Duration::from_secs(1) >= f),
+            "the upgrade took only {upgrade_took:?}: it did not wait out the takeover floor \
+             ({floor:?})"
         );
         let after_gate: Vec<_> = reads
             .iter()
@@ -591,10 +616,14 @@ pub fn upgrade_after_a_seal(_seed: u64) -> Result<()> {
             .iter()
             .filter(|o| o.0 + Duration::from_secs(3) < upgrade_took)
             .count();
+        // A read every 20 ms: about 50 a second between the gate's opening
+        // and the drain, if the wait reaches that far (a floor the cap
+        // shortened may end before the gate does).
+        let window = upgrade_took.saturating_sub(GATE_OPEN + Duration::from_secs(3));
         ensure!(
-            in_wait > 100,
-            "only {in_wait} reads were served during the upgrade's wait: the views were \
-             detached before it"
+            in_wait as f64 > (window.as_secs_f64() * 50.0 * 0.5).min(100.0),
+            "only {in_wait} reads were served during the upgrade's wait ({window:?} between the \
+             gate and the drain): the views were detached before it"
         );
         ensure!(
             worst.is_some_and(|w| w.1 <= READ_BOUND),

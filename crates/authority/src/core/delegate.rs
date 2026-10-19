@@ -2797,12 +2797,14 @@ impl Core {
     }
 
     /// A grant never outlives the root lease's usable end (the cap).
-    fn grant_cap_ms(&self, now: Ms) -> u64 {
+    pub(crate) fn grant_cap_ms(&self, now: Ms) -> u64 {
         let Some((lease, _)) = &self.lease.held else {
             return 0;
         };
         if self.lease.epoch_held() {
-            return self.cfg.delegation_ttl_ms;
+            let ttl = self.cfg.delegation_ttl_ms;
+            self.ack.note_hold_grant(now.0 + ttl as i64);
+            return ttl;
         }
         let end = lease.expires_unix_ms - self.cfg.expiry_margin_ms as i64;
         (end - now.0).max(0) as u64

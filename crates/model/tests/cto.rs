@@ -9,19 +9,23 @@
 //! that disagree and step within the lease's margin. Each search prints
 //! its state counts and time.
 
-use constellation_model::cto::{CtoModel, Op};
+use constellation_model::cto::{Action, CtoModel, Msg, Op, State};
 use stateright::{Checker, Model};
 use std::time::{Duration, Instant};
 
 const CAP: (usize, Duration) = (40_000_000, Duration::from_secs(55));
 
 fn run(label: &str, model: &CtoModel) -> impl Checker<CtoModel> {
+    run_within(label, model, CAP)
+}
+
+fn run_within(label: &str, model: &CtoModel, cap: (usize, Duration)) -> impl Checker<CtoModel> {
     let started = Instant::now();
     let checker = model
         .clone()
         .checker()
-        .target_state_count(CAP.0)
-        .timeout(CAP.1)
+        .target_state_count(cap.0)
+        .timeout(cap.1)
         .spawn_bfs()
         .join();
     println!(
@@ -48,10 +52,19 @@ fn assert_violates(label: &str, model: &CtoModel) {
 }
 
 fn assert_clean(label: &str, model: &CtoModel, sometimes: &[&'static str]) {
-    let checker = run(label, model);
+    assert_clean_within(label, model, sometimes, CAP);
+}
+
+fn assert_clean_within(
+    label: &str,
+    model: &CtoModel,
+    sometimes: &[&'static str],
+    cap: (usize, Duration),
+) {
+    let checker = run_within(label, model, cap);
     assert!(
         checker.is_done(),
-        "{label}: expected exhaustive exploration within budget"
+        "{label}: the search did not finish within the budget"
     );
     if let Some(d) = checker.discovery("close_to_open") {
         panic!(
@@ -376,6 +389,213 @@ fn fast_takeover_is_clean_with_a_successor_far_ahead() {
         &m,
         &["fast_takeover", "floor_waited", "read_under_delegation"],
     );
+}
+
+// ---- plan 43 C7-F F-a: the floor capped by the old holder's beats ----
+
+/// The beat configurations' budget: a quarter of the others' (a breadth-
+/// first search stores every state it generates: about 1.1 GB at this
+/// budget, 4.5 GB at the others'). Bounded, like theirs: `is_done` is true
+/// on reaching it, so a clean result is "no violation within the budget",
+/// not exhaustive. Three of the four clean runs are `#[ignore]`d (the
+/// binary already peaks at ~23 GB with all its tests at once): run them with
+/// `cargo test -p constellation-model --test cto -- --ignored beat_cap
+/// --test-threads=1` (TESTING.md); one cheaper representative stays on.
+const BEAT_CAP: (usize, Duration) = (10_000_000, Duration::from_secs(40));
+/// The representative's: it needs no `read_under_delegation` witness (the
+/// older tests have it) and reaches `floor_capped` well inside it.
+const BEAT_CAP_LIGHT: (usize, Duration) = (4_000_000, Duration::from_secs(40));
+
+/// The old holder beats to the nodes (`beat_cap`); a successor that heard
+/// them ends its floor where its own clock puts the holder's lease, plus a
+/// margin, when that is before the bound. Clean, the cap witnessed.
+#[test]
+fn fast_takeover_with_beat_cap_is_clean() {
+    let m = CtoModel {
+        beat_cap: true,
+        max_tick: 8,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+    };
+    assert_clean_within(
+        "fast-beat-cap",
+        &m,
+        &["fast_takeover", "floor_waited", "floor_capped"],
+        BEAT_CAP_LIGHT,
+    );
+}
+
+/// The two C7-H2 configurations, with the cap: a successor far ahead of
+/// the old holder (the beat's lag is large, so the cap is later than the
+/// bound: the bound stands) and one far behind it (the lag is negative,
+/// and the cap, on the successor's clock, still ends no earlier than the
+/// holder's lease).
+#[test]
+#[ignore = "heavy (1 GB, ~20 s): cargo test -p constellation-model --test cto -- --ignored beat_cap --test-threads=1"]
+fn fast_takeover_with_beat_cap_is_clean_far_ahead_and_far_behind() {
+    for (label, offsets) in [
+        ("far-ahead", vec![0, 9, 9]),
+        ("far-behind", vec![0, -9, -9]),
+    ] {
+        let m = CtoModel {
+            init_offsets: Some(offsets),
+            beat_cap: true,
+            max_tick: 6,
+            max_drops: 0,
+            ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+        };
+        assert_clean_within(
+            &format!("fast-beat-cap-{label}"),
+            &m,
+            // The cap is computed in both (the beats were heard): far
+            // ahead its lag puts it past the bound, which stands.
+            &["fast_takeover", "floor_waited", "cap_computed"],
+            BEAT_CAP,
+        );
+    }
+}
+
+/// The cap with the lease renewed after the last beat and clocks off by
+/// one that step once, margins of 3 (> 2D).
+#[test]
+#[ignore = "heavy (1 GB, ~20 s): cargo test -p constellation-model --test cto -- --ignored beat_cap --test-threads=1"]
+fn fast_takeover_with_beat_cap_is_clean_under_drift_and_renewals() {
+    let m = CtoModel {
+        max_offset: 1,
+        max_jumps: 1,
+        seq_margin: 3,
+        deleg_margin: 3,
+        lease_margin: 3,
+        lease_ttl: 12,
+        deleg_ttl: 4,
+        takeover_window: 2,
+        allow_renew: true,
+        beat_cap: true,
+        max_tick: 6,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![R, R], vec![W], vec![W]])
+    };
+    assert_clean_within(
+        "fast-beat-cap-drift",
+        &m,
+        &["fast_takeover", "floor_waited"],
+        BEAT_CAP,
+    );
+}
+
+/// The cap in the one configuration where the old holder's answers are
+/// delegations to another node (node 0 holds and only answers; node 1
+/// reads, node 2 writes and takes over), the holder renewing its lease
+/// between its beats and the takeover.
+fn delegating_holder() -> CtoModel {
+    CtoModel {
+        allow_renew: true,
+        beat_cap: true,
+        deleg_ttl: 4,
+        max_tick: 9,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![], vec![R, R], vec![W]])
+    }
+}
+
+#[test]
+#[ignore = "heavy (1 GB, ~20 s): cargo test -p constellation-model --test cto -- --ignored beat_cap --test-threads=1"]
+fn fast_takeover_with_beat_cap_is_clean_with_a_delegating_holder_that_renews() {
+    assert_clean_within(
+        "fast-beat-cap-delegating",
+        &delegating_holder(),
+        &[
+            "fast_takeover",
+            "floor_waited",
+            "floor_capped",
+            "read_under_delegation",
+        ],
+        BEAT_CAP,
+    );
+}
+
+/// Executes `a` in `s`, which must be enabled there.
+fn step(m: &CtoModel, s: &State, a: Action) -> State {
+    let mut enabled = Vec::new();
+    m.actions(s, &mut enabled);
+    assert!(enabled.contains(&a), "{a:?} is not enabled at t={}", s.t);
+    m.next_state(s, a).expect("a state")
+}
+
+/// Delivers the first message in flight that `is` matches.
+fn deliver(m: &CtoModel, s: &State, is: impl Fn(&Msg) -> bool) -> State {
+    let k = s.net.iter().position(is).expect("the message is in flight");
+    step(m, s, Action::Deliver(k))
+}
+
+/// The scenario the naive cap gets wrong, as a trace (the checker's
+/// search is too deep for it within budget: ~22 actions over 8 ticks):
+/// node 0 holds (epoch 1, lease to 6) and beats to node 2 at t = 0; it
+/// renews at t = 4 (to 10); at t = 5 it answers node 1's ReadIndex with a
+/// delegation honoured until 8; node 2 takes over at t = 5. Returns the
+/// state just after the takeover.
+fn renewal_after_the_beat(m: &CtoModel) -> State {
+    let mut s = m.init_states().remove(0);
+    s = step(m, &s, Action::Beat(0, 2));
+    for _ in 0..4 {
+        s = step(m, &s, Action::Tick);
+    }
+    s = step(m, &s, Action::Renew(0));
+    s = step(m, &s, Action::Tick);
+    s = step(m, &s, Action::Start(1));
+    s = step(m, &s, Action::SendReadIndex(1));
+    s = deliver(m, &s, |x| matches!(x, Msg::ReadIndex { .. }));
+    s = deliver(m, &s, |x| matches!(x, Msg::ReadIndexReply { .. }));
+    assert_eq!(s.nodes[1].deleg.map(|d| d.until), Some(8));
+    step(m, &s, Action::Takeover(2))
+}
+
+/// The naive cap, `X` = what the beats named: the holder renews after its
+/// last beat, grants a delegation under the renewed lease, and the
+/// successor's floor ends at the old expiry (plus the lag and a margin),
+/// while the reader still honours the grant: a stale read. The cap must
+/// count the lease the takeover replaced.
+#[test]
+fn naive_beat_cap_with_a_renewal_after_the_beat_splits() {
+    let m = CtoModel {
+        beat_cap_from_named_expiry: true,
+        ..delegating_holder()
+    };
+    let mut s = renewal_after_the_beat(&m);
+    // Naive floor: named 6 + lag 0 + margin 1 = 7, below the grant's end.
+    assert_eq!(s.nodes[2].ack_floor, Some(7));
+    s = step(&m, &s, Action::Start(2));
+    s = step(&m, &s, Action::Tick);
+    s = step(&m, &s, Action::Tick);
+    s = step(&m, &s, Action::FloorPassed(2));
+    assert_eq!(s.closed, 1, "the write was acknowledged");
+    s = step(&m, &s, Action::FinishRead(1));
+    s = step(&m, &s, Action::Start(1));
+    s = step(&m, &s, Action::ReadUnderDelegation(1));
+    s = step(&m, &s, Action::FinishRead(1));
+    println!("naive cap: close-to-open violated: {:?}", s.violation);
+    assert!(s.violation.is_some(), "the stale read happened");
+}
+
+/// The same trace under the real cap: the floor counts the renewed lease
+/// the takeover replaced (10), so it outlasts the delegation; the write
+/// is still held when the reader's delegation has lapsed.
+#[test]
+fn the_beat_cap_counts_the_lease_the_takeover_replaced() {
+    let m = delegating_holder();
+    let mut s = renewal_after_the_beat(&m);
+    // max(10, 6) + lag 0 + margin 1.
+    assert_eq!(s.nodes[2].ack_floor, Some(11));
+    s = step(&m, &s, Action::Start(2));
+    s = step(&m, &s, Action::Tick);
+    s = step(&m, &s, Action::Tick);
+    let mut enabled = Vec::new();
+    m.actions(&s, &mut enabled);
+    assert!(
+        !enabled.contains(&Action::FloorPassed(2)),
+        "the write was acknowledged inside the old holder's renewed lease"
+    );
+    assert_eq!(s.closed, 0);
 }
 
 /// A tenure without strict mounts and no strict reader costs its

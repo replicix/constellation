@@ -1046,6 +1046,14 @@ pub struct Stats {
     /// Successor: takeovers that had to wait out the predecessor's
     /// delegation horizon before acknowledging mutations.
     pub ack_floor_waits: u64,
+    /// Plan 43 C7-F F-a: floors the predecessor's beats shortened
+    /// (`ack_floor_capped`, by `ack_floor_cap_saved_ms` in all against the
+    /// bound), and takeovers whose cap had passed by the time the marker
+    /// landed, which armed none (`ack_floor_capped_out`; not counted in
+    /// `ack_floor_waits`).
+    pub ack_floor_capped: u64,
+    pub ack_floor_capped_out: u64,
+    pub ack_floor_cap_saved_ms: u64,
     /// Holder: ReadIndex answers and grants refused for stale S3
     /// liveness (a probe was started instead).
     pub stale_liveness_refusals: u64,
@@ -1778,12 +1786,13 @@ impl Core {
                 seq,
                 sent,
                 expires,
+                guard,
             } => self.on_holder_alive(
                 from,
                 epoch,
                 candidacy,
                 listed,
-                (at, seq, sent, expires),
+                (at, seq, sent, expires, guard),
                 replica,
             ),
             Event::OwnLag { from, until } => self.on_own_lag(from, until),

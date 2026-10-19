@@ -364,6 +364,20 @@ fn replay_seed() {
         Ok("locks-long-grants-seal") => locks_long_grants_seal_config(),
         Ok("fast-takeover-skewed-successor") => fast_takeover_skewed_successor_config(),
         Ok("double-seal-inside-the-grace") => double_seal_inside_the_grace_config(),
+        Ok("fast-takeover-skewed-successor-nobeats") => {
+            fast_takeover_skewed_successor_nobeats_config()
+        }
+        Ok("fast-takeover-skewed-successor-credited") => {
+            fast_takeover_skewed_successor_credited_config()
+        }
+        Ok("fast-takeover-skewed-holder") => fast_takeover_skewed_holder_config(),
+        Ok("locks-s3-cut-holder-alive") => locks_s3_cut_holder_alive_config(),
+        Ok("strict-isolated-reader") => strict_isolated_reader_config(),
+        Ok("strict-isolated-reader-beats") => strict_isolated_reader_beats_config(),
+        Ok("strict-isolated-reader-skewed") => strict_isolated_reader_skewed_config(),
+        Ok("strict-isolated-reader-skewed-credited") => {
+            strict_isolated_reader_skewed_credited_config()
+        }
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-blips") => locks_blips_config(),
         Ok("locks-blips-tight") => locks_blips_tight_config(),
@@ -426,6 +440,17 @@ fn replay_seed() {
             Ok("root") => Some(String::new()),
             Ok(d) => Some(d.to_string()),
             Err(_) => config.lock_data_dir.clone(),
+        },
+        ..config
+    };
+    // `AUTHORITY_SIM_BEATS=thread`: as for `sweep_config`.
+    let config = SimConfig {
+        holder_beats: if std::env::var("AUTHORITY_SIM_BEATS").as_deref() == Ok("thread")
+            && config.holder_beats == sim::run::HolderBeats::Off
+        {
+            sim::run::HolderBeats::Thread
+        } else {
+            config.holder_beats
         },
         ..config
     };
@@ -1495,6 +1520,95 @@ fn backup_strict_inbox_off_config() -> SimConfig {
             c
         }),
         ..backup_strict_config()
+    }
+}
+
+/// Plan 43 C7-F F-a (review F3): the acknowledgement/read-delegation side
+/// of the floor under load. Node 3, a reader (its clients only read), holds
+/// a strict read delegation from the holder (node 1) and is cut from both
+/// others and from S3 at 1.4 s; the holder is crashed at 1.5 s, its backup seals and takes
+/// over (the inbox off: the takeover gate does not wait the read quarantine
+/// out), and the reader, which learns nothing of it, serves its reads from
+/// the delegation until it lapses (about 5 s in; it would otherwise learn
+/// the new epoch from S3 and drop it within half a second). The successor's floor is all that
+/// keeps it from acknowledging a write the reader then misses: on a build
+/// with no floor this fails (close-to-open), with the real floor and cap
+/// it passes. The holder's beats are off here: the floor is C7-H2's bound
+/// (`strict-isolated-reader-beats` has them on, the cap in play).
+fn strict_isolated_reader_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.inbox = false;
+            c
+        }),
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_400,
+                kind: FaultKind::IsolateReader {
+                    node: 3,
+                    for_ms: 8_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_400,
+                kind: FaultKind::CutS3 {
+                    node: 3,
+                    for_ms: 8_000,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: Some(7_000),
+                    keep_journal: true,
+                },
+            },
+        ],
+        random_faults: 0,
+        ops_per_client: 40,
+        read_ratio: 0.5,
+        reader_nodes: vec![3],
+        // Node 1 writes a little before the cut and then not at all (a
+        // write recalls the readers' delegations); node 2, which will
+        // hold, writes from just after the crash.
+        client_plan: vec![(1, 0, 2), (2, 1_600, 25), (3, 600, 40)],
+        ..backup_strict_config()
+    }
+}
+
+/// `strict-isolated-reader` with the holder's off-core beat on (as the
+/// daemon has it): the floor is capped by the beats the successor heard.
+fn strict_isolated_reader_beats_config() -> SimConfig {
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Thread,
+        ..strict_isolated_reader_config()
+    }
+}
+
+/// `strict-isolated-reader-beats` with the successor's clock (node 2, the
+/// backup) 4 s ahead of the holder's: the cap's lag is large and the beats'
+/// arrival stamps are on the successor's clock, as in
+/// `fast-takeover-skewed-successor` but on the strict side, where a floor
+/// ended early lets the successor acknowledge a write inside the reader's
+/// delegation. Clean with the arrival; with the credit
+/// (`strict-isolated-reader-skewed-credited`) it fails on a large share of
+/// seeds: the control for the cap's choice of stamp that does not hang on
+/// a narrow window.
+fn strict_isolated_reader_skewed_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: vec![(2, 4_000)],
+        ..strict_isolated_reader_beats_config()
+    }
+}
+
+/// The negative control of `strict-isolated-reader-skewed`: every
+/// numbered beat's arrival stamp replaced by its credit
+/// (`SimConfig::beats_credited`).
+fn strict_isolated_reader_skewed_credited_config() -> SimConfig {
+    SimConfig {
+        beats_credited: true,
+        ..strict_isolated_reader_skewed_config()
     }
 }
 
@@ -3012,6 +3126,8 @@ fn a_delegating_root_cut_from_s3_forms_no_epoch_and_fails_over() {
     // after the window the seal itself takes: a failover by seal lands
     // between the two bounds below, which neither the holder's return (9 s
     // after the crash, under the lower one) nor a TTL failover can meet.
+    // This configuration models no holder beat (`holder_beats` is off), so
+    // the cap of plan 43 C7-F F-a is inert here and the bounds are C7-H2's.
     let c = sim::run::backup_core_config(1, 1);
     let floor = c.backup_takeover_ms
         + c.read_delegation_ttl_ms
@@ -3204,6 +3320,16 @@ fn sweep_config() {
         "locks-long-grants-seal" => locks_long_grants_seal_config(),
         "fast-takeover-skewed-successor" => fast_takeover_skewed_successor_config(),
         "double-seal-inside-the-grace" => double_seal_inside_the_grace_config(),
+        "fast-takeover-skewed-successor-nobeats" => fast_takeover_skewed_successor_nobeats_config(),
+        "fast-takeover-skewed-successor-credited" => {
+            fast_takeover_skewed_successor_credited_config()
+        }
+        "fast-takeover-skewed-holder" => fast_takeover_skewed_holder_config(),
+        "locks-s3-cut-holder-alive" => locks_s3_cut_holder_alive_config(),
+        "strict-isolated-reader" => strict_isolated_reader_config(),
+        "strict-isolated-reader-beats" => strict_isolated_reader_beats_config(),
+        "strict-isolated-reader-skewed" => strict_isolated_reader_skewed_config(),
+        "strict-isolated-reader-skewed-credited" => strict_isolated_reader_skewed_credited_config(),
         "locks-faults" => locks_faults_config(),
         "locks-blips" => locks_blips_config(),
         "locks-blips-tight" => locks_blips_tight_config(),
@@ -3238,6 +3364,19 @@ fn sweep_config() {
         "locks-stall-step-delegated" => locks_stall_step_delegated_config(),
         other => panic!("sweep_config: unknown config {other}"),
     };
+    // Plan 43 C7-F F-a: `AUTHORITY_SIM_BEATS=thread` runs any configuration
+    // with the holder's off-core heartbeat on a thread of its own, as the
+    // daemon has it: the floors of its fast takeovers are then capped by
+    // the beats (the configurations that predate the cap model none).
+    let config = move |label: &str| {
+        let mut c = config(label);
+        if std::env::var("AUTHORITY_SIM_BEATS").as_deref() == Ok("thread")
+            && c.holder_beats == sim::run::HolderBeats::Off
+        {
+            c.holder_beats = sim::run::HolderBeats::Thread;
+        }
+        c
+    };
     let streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let streamed_deleg = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let epoch_streamed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -3261,14 +3400,20 @@ fn sweep_config() {
         std::sync::atomic::AtomicU64::new(0),
     ]);
     let fenced_seeds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    // Plan 43 C7-F: [takeovers, takeovers by a backup's seal, takeover
-    // floors armed], summed over the run's nodes: what a rule that arms
-    // more or fewer floors costs.
+    // Plan 43 C7-F: [takeovers, takeovers by a seal, floors armed, floors
+    // the cap shortened, takeovers whose cap had passed, ms saved by the
+    // cap], over the run's nodes, and the length of every floor armed.
     let floors = std::sync::Arc::new([
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
         std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
     ]);
+    let floor_ms = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let guard_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let guard_base_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Open epochs replaced by their closed carrier's (`epochs::try_form`).
     let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
@@ -3280,7 +3425,9 @@ fn sweep_config() {
         let epoch_streamed = epoch_streamed.clone();
         let chunks = chunks.clone();
         let (fenced, fenced_seeds) = (fenced.clone(), fenced_seeds.clone());
-        let floors = floors.clone();
+        let (floors, floor_ms) = (floors.clone(), floor_ms.clone());
+        let guard_rises = guard_rises.clone();
+        let guard_base_rises = guard_base_rises.clone();
         let superseded = superseded.clone();
         handles.push(std::thread::spawn(move || loop {
             let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3303,6 +3450,18 @@ fn sweep_config() {
                         floors[0].fetch_add(s.takeovers, ord);
                         floors[1].fetch_add(s.backup_takeovers, ord);
                         floors[2].fetch_add(s.ack_floor_waits, ord);
+                        floors[3].fetch_add(s.ack_floor_capped, ord);
+                        floors[4].fetch_add(s.ack_floor_capped_out, ord);
+                        floors[5].fetch_add(s.ack_floor_cap_saved_ms, ord);
+                    }
+                    floor_ms.lock().unwrap().extend(report.floor_ms.iter().copied());
+                    guard_rises.fetch_add(report.guard_rises, ord);
+                    guard_base_rises.fetch_add(report.guard_base_rises, ord);
+                    if report.guard_rises > 0 {
+                        eprintln!(
+                            "SWEEP-GUARD-RISE {label} seed {seed}: {} rises",
+                            report.guard_rises
+                        );
                     }
                     chunks[0].fetch_add(report.remote_enrolled, ord);
                     chunks[1].fetch_add(report.deferred_seen, ord);
@@ -3371,11 +3530,30 @@ fn sweep_config() {
             s
         },
     );
+    let ord = std::sync::atomic::Ordering::Relaxed;
+    let mut lengths = floor_ms.lock().unwrap().clone();
+    lengths.sort_unstable();
+    let pct = |p: usize| {
+        lengths
+            .get((lengths.len().saturating_sub(1)) * p / 100)
+            .copied()
+    };
     eprintln!(
-        "SWEEP-FLOORS {label}: takeovers {}, by a seal {}, floors armed {}",
-        floors[0].load(std::sync::atomic::Ordering::Relaxed),
-        floors[1].load(std::sync::atomic::Ordering::Relaxed),
-        floors[2].load(std::sync::atomic::Ordering::Relaxed),
+        "SWEEP-FLOORS {label}: takeovers {}, by a seal {}, floors armed {} (capped {}, saved {} ms \
+         in all), cap already past {}; floor ms p50 {:?} p90 {:?} max {:?} over {} floors; \
+         beat guards that rose after being published: {} (of them base: {})",
+        floors[0].load(ord),
+        floors[1].load(ord),
+        floors[2].load(ord),
+        floors[3].load(ord),
+        floors[5].load(ord),
+        floors[4].load(ord),
+        pct(50),
+        pct(90),
+        lengths.last().copied(),
+        lengths.len(),
+        guard_rises.load(ord),
+        guard_base_rises.load(ord),
     );
     assert!(f.is_empty(), "failing seeds: {f:?}");
 }
@@ -5056,7 +5234,22 @@ fn locks_long_grants_seal_config() -> SimConfig {
 /// lock). Offsets of more than the whole lease also let a node whose
 /// clock is ahead claim a live lease it reads as expired: plan 43's C7b,
 /// not this chunk.
+///
+/// Plan 43 C7-F F-a: with the holder's off-core heartbeat on a thread of
+/// its own (as the daemon has it), so the successor's floor is capped by
+/// the beats it heard: the beats' arrival stamps are on the successor's
+/// clock, 4 s ahead of the holder's, and a cap counted from their credit
+/// (`fast-takeover-skewed-successor-credited`) would end the floor 3 s
+/// early. `fast-takeover-skewed-successor-nobeats` is the configuration as
+/// C7-H2 left it (no beats: the floor is the bound alone).
 fn fast_takeover_skewed_successor_config() -> SimConfig {
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Thread,
+        ..fast_takeover_skewed_successor_nobeats_config()
+    }
+}
+
+fn fast_takeover_skewed_successor_nobeats_config() -> SimConfig {
     SimConfig {
         clock_offsets: vec![(2, 4_000), (3, 4_000)],
         ..locks_failover_backup_renew_config()
@@ -5096,6 +5289,52 @@ fn double_seal_inside_the_grace_config() -> SimConfig {
             c
         }),
         faults: cut(1_200).into_iter().chain(cut(2_700)).collect(),
+        ..locks_failover_backup_renew_config()
+    }
+}
+
+/// Plan 43 C7-F F-a's negative control: `fast-takeover-skewed-successor`
+/// with every numbered beat's arrival stamp replaced by its credit
+/// (`SimConfig::beats_credited`), the instant `sent + M` of the holder's
+/// clock the seal watch counts. The cap of the successor's floor then
+/// ends early by the 4 s the holder's clock is behind: this configuration
+/// must FAIL (mutual exclusion), which `a_credited_arrival_cap_splits`
+/// asserts; the real cap (the raw arrival) passes the one above.
+fn fast_takeover_skewed_successor_credited_config() -> SimConfig {
+    SimConfig {
+        beats_credited: true,
+        ..fast_takeover_skewed_successor_config()
+    }
+}
+
+/// Plan 43 C7-F F-a: the other way round, the old holder's clock ahead of
+/// its successors' by 4 s (the cap's lag is negative: the beats' arrival
+/// is on the successors' earlier clocks). One failover only: with a second
+/// cut at 9 s, node 1, ahead of whichever node holds, reads a live lease
+/// as expired and claims it by TTL (plan 43's C7b, outside this chunk: 5
+/// of 2 000 seeds violate mutual exclusion that way with the cap, 15
+/// without it).
+fn fast_takeover_skewed_holder_config() -> SimConfig {
+    let first = locks_failover_backup_renew_config().faults;
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Thread,
+        clock_offsets: vec![(1, 4_000)],
+        faults: first.into_iter().take(2).collect(),
+        ..locks_failover_backup_renew_config()
+    }
+}
+
+/// Plan 43 C7-F F-a: the holder is cut from S3 only (no partition from its
+/// backup): it keeps beating, its 6 s lease runs out, and its backup seals
+/// at the expiry it reads. The successor's floor is capped by the beats
+/// (about one margin past the expiry) instead of the whole bound.
+fn locks_s3_cut_holder_alive_config() -> SimConfig {
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Thread,
+        faults: vec![ScheduledFault {
+            at_ms: 1_200,
+            kind: FaultKind::CutS3Holder { for_ms: 9_000 },
+        }],
         ..locks_failover_backup_renew_config()
     }
 }
@@ -5897,6 +6136,132 @@ fn a_second_seal_inside_the_grace_waits_out_the_first_holders_grants() {
         t.backup_takeovers > 100,
         "the backups rarely took over: {t:?}"
     );
+}
+
+/// Plan 43 C7-F F-a: the same configuration with the cap counted from the
+/// beats' *credit* (the holder's clock: `min(at, sent + M)`) instead of
+/// their arrival must split: the holder's clock is 4 s behind its
+/// successors', and the cap ends their floor 3 s early (a lock granted
+/// inside an old grant's window). The control that makes the clean sweeps
+/// of the real cap mean something: 2 of the 2 000 seeds 193000..195000
+/// fail (seeds 194557 and 194714, pinned here), none with the real cap.
+#[test]
+fn a_credited_arrival_cap_splits() {
+    for seed in [194_557, 194_714] {
+        let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
+            .expect_err("a cap counted from the credit never failed: no control");
+        assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
+        run_seed(seed, fast_takeover_skewed_successor_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7-F F-a: the holder's clock 4 s ahead of its successors'
+/// (the cap's lag is negative): the first failover is clean (one failover
+/// only, see the configuration), over a dozen seeds in the default run
+/// (`long_locks` and `AUTHORITY_SIM_CONFIG=fast-takeover-skewed-holder`
+/// run more: 0 of 2 000 at 196000.. and 310000.., 27 of 2 000 with no floor
+/// at all).
+#[test]
+fn a_holder_ahead_of_its_successors_costs_no_exclusion() {
+    let mut t = M14Totals::default();
+    for seed in 196_000..196_012u64 {
+        let report = run_seed(seed, fast_takeover_skewed_holder_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        t.add(&report);
+    }
+    assert!(t.backup_takeovers > 0, "nobody sealed: {t:?}");
+}
+
+/// Plan 43 C7-F F-a (review F3): the strict side of the floor. A reader
+/// cut from the holder and its backup serves from its read delegation
+/// while the backup, having sealed the crashed holder, takes over: with the
+/// floor (C7-H2's bound with no beats, the cap with them) no write is
+/// acknowledged inside the delegation, and none is missed. On a build with
+/// no floor at all the same seeds violate close-to-open: counts in
+/// PROGRESS (`strict-isolated-reader`, 2 000 seeds), where the sweep is
+/// `AUTHORITY_SIM_CONFIG=strict-isolated-reader[-beats]`.
+#[test]
+fn a_reader_cut_off_inside_the_takeover_floor_misses_no_acknowledged_write() {
+    for (label, config) in [
+        ("strict-isolated-reader", strict_isolated_reader_config()),
+        (
+            "strict-isolated-reader-beats",
+            strict_isolated_reader_beats_config(),
+        ),
+        (
+            "strict-isolated-reader-skewed",
+            strict_isolated_reader_skewed_config(),
+        ),
+    ] {
+        let mut sealed = 0;
+        for seed in 0..40u64 {
+            let report = run_seed(seed, config.clone()).unwrap_or_else(|e| {
+                panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+            });
+            sealed += report
+                .stats
+                .values()
+                .map(|s| s.backup_takeovers)
+                .sum::<u64>();
+        }
+        assert!(sealed > 10, "{label}: the backups rarely sealed: {sealed}");
+    }
+}
+
+/// Plan 43 C7-F F-a (review F3): the credited-arrival control on the
+/// strict side, where the window it needs is wide: with the successor's
+/// clock 4 s ahead, a cap counted from the beats' credit ends the floor
+/// about 3 s early and the successor acknowledges writes inside the cut-off
+/// reader's delegation: 209 of 2 000 seeds fail (10 %), none with the
+/// arrival. Three of them are pinned.
+#[test]
+fn a_credited_arrival_cap_splits_on_the_strict_side() {
+    for seed in [9, 40, 47] {
+        let e = run_seed(seed, strict_isolated_reader_skewed_credited_config())
+            .expect_err("a cap counted from the credit never failed: no control");
+        assert!(e.contains("close-to-open violated"), "seed {seed}: {e}");
+        run_seed(seed, strict_isolated_reader_skewed_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7-F F-a: the holder is cut from S3 and keeps beating until its
+/// lease ends; the backup seals at the expiry it reads and its floor ends
+/// about one margin after it, not after the whole bound. Every floor armed
+/// is capped (or capped out), and none outlasts the margin plus two
+/// takeover windows past its marker. On the parent every floor is the
+/// bound (`ack_floor_capped` does not exist).
+#[test]
+fn an_s3_cut_holder_that_beats_on_costs_its_successor_about_a_margin() {
+    let mut t = M14Totals::default();
+    let mut floors = Vec::new();
+    let mut capped = 0;
+    let mut capped_out = 0;
+    for seed in 207_000..207_012u64 {
+        let report = run_seed(seed, locks_s3_cut_holder_alive_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        t.add(&report);
+        for s in report.stats.values() {
+            capped += s.ack_floor_capped;
+            capped_out += s.ack_floor_capped_out;
+        }
+        floors.extend(report.floor_ms.iter().copied());
+    }
+    let cfg = sim::run::backup_core_config(2, 1);
+    let limit = cfg.expiry_margin_ms + 2 * cfg.backup_takeover_ms;
+    eprintln!(
+        "locks-s3-cut-holder-alive: floors {floors:?}, capped {capped}, capped out {capped_out}"
+    );
+    assert!(
+        capped + capped_out > 0,
+        "no floor was capped: {t:?}, floors {floors:?}"
+    );
+    assert!(
+        floors.iter().all(|f| *f <= limit),
+        "a floor outlasted the margin and two windows ({limit} ms): {floors:?}"
+    );
+    assert!(t.backup_takeovers > 0, "nobody sealed: {t:?}");
 }
 
 /// `stress-ng-fs-faults` (bug B): a node that keeps its lease through an
@@ -7033,6 +7398,21 @@ fn long_locks() {
         "locks-long-grants-seal",
         locks_long_grants_seal_config(),
         208_000..208_000 + n,
+    );
+    run_m14(
+        "fast-takeover-skewed-successor-nobeats",
+        fast_takeover_skewed_successor_nobeats_config(),
+        211_000..211_000 + n,
+    );
+    run_m14(
+        "fast-takeover-skewed-holder",
+        fast_takeover_skewed_holder_config(),
+        212_000..212_000 + n,
+    );
+    run_m14(
+        "locks-s3-cut-holder-alive",
+        locks_s3_cut_holder_alive_config(),
+        213_000..213_000 + n,
     );
     run_m14("locks-faults", locks_faults_config(), 195_000..195_000 + n);
     run_m14("locks-pause", locks_pause_config(), 197_000..197_000 + n);

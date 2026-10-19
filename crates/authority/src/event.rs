@@ -133,6 +133,13 @@ pub enum Event {
         seq: u64,
         sent: Ms,
         expires: Ms,
+        /// Plan 43 C7-F F-a: the latest instant on the holder's clock at
+        /// which grants it waits out but its lease does not cap may still
+        /// be honoured (its takeover floor, its lock and read
+        /// quarantines, its subtree graces); 0: none, or an unnumbered
+        /// arrival; `i64::MAX`: unknown (its takeover gate is pending),
+        /// which disables the cap (`Core::beat_cap`).
+        guard: Ms,
     },
     /// This node's own runtime was held up from `from` until `until` (its
     /// lag probe woke at least an eighth of `backup_takeover_ms` late; a

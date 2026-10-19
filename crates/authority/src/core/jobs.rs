@@ -2915,7 +2915,8 @@ impl Core {
         });
         self.dl.inherit_slack_ms = 0;
         if let Some(p) = prev.as_ref().filter(|_| fast_prev) {
-            self.note_fast_takeover(p);
+            let cap = self.beat_cap(p);
+            self.note_fast_takeover(p, cap);
         }
         // The sealed backup's tail is re-applied by the tenure that
         // succeeds the epoch it backed: a takeover from that holder, or

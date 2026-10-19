@@ -2185,7 +2185,17 @@ still alive on P2P, strict reads and a held lock; PROGRESS "a fast
 successor whose clock is ahead got no quarantine").
 
 - **F-a — the floor capped by the predecessor's own heartbeat (specified
-  2026-10-18; the approach is §11 Q17).**
+  2026-10-18; the approach is §11 Q17). Landed (PROGRESS "Plan 43 C7-F
+  F-a"): the beat carries `guard_unix_ms`; `Core::beat_cap` (`X +
+  min(at − sent) + M`, beats within `250·M` of `X`) caps the floor of a
+  fast takeover, none if it has passed when the marker lands; the
+  slack is `M` until C7a names ρ. Not changed: F-a0 (its own commit,
+  before this one), `dl.inherit_slack_ms` and the inherited generations'
+  reclaim wait (a possible later use of the same cap). Found: most
+  simulator configurations model no holder beat
+  (`SimConfig::holder_beats` is `Off`), so their floors stay the bound
+  and the cap is inert there; the cap's sweeps use
+  `AUTHORITY_SIM_BEATS=thread` and the new beat configurations.**
   *Why not the renewal premise.* The bound counts from the marker because
   the predecessor answers within `backup_takeover_ms` (W) of its latest
   proof of S3 liveness, and those proofs are not only renewals:
@@ -2236,10 +2246,20 @@ successor whose clock is ahead got no quarantine").
   *The guard.* A predecessor may itself be waiting out grants its lease
   does not cap: its own takeover floor (the harness's 20 s lease is
   shorter than the 23.5 s lock floor), a released takeover's lock grace,
-  a restart quarantine. The beat carries `guard_unix_ms`: `i64::MAX`
-  while its takeover gate is pending or a floor is due, else the latest
-  of its `floor_until`, the read and lock tables' quarantines and its
-  subtree graces (0: none). A `MAX` heard at the epoch disables the cap.
+  a restart quarantine, and the grants it made under a continuation
+  epoch's hold (capped by the lock or delegation ttl alone, no lease
+  having an expiry then, and kept across the re-claim: with a ttl longer
+  than the lease's they outlast the re-claimed lease; review F1). The
+  beat carries `guard_unix_ms`: `i64::MAX` while its takeover gate is
+  pending or a floor is due, else the latest of its `floor_until`, the
+  read and lock tables' quarantines, its subtree graces and its hold-era
+  grants (0: none). The successor takes the maximum over the epoch's
+  beats: a `MAX` heard at the epoch disables the cap for all of it
+  (conservative; the refinement that lets a later finite beat clear it
+  is not taken: it would forget a restarted incarnation's floor, which
+  lives in memory). A finite guard may rise after a beat named it only by
+  what protects a lease-capped right (a subtree grace; the hold-era
+  grants): the simulator asserts the base of the guard never does.
   *F-a0: a tenure that inherits a floor is marked from its first CAS.*
   A successor arms a floor only if the replaced lease says
   `granted_delegations`, and a fresh taker's lease is marked at once
@@ -2303,6 +2323,24 @@ successor whose clock is ahead got no quarantine").
   "park until the reclaim is admitted" must not assume a grace. C7a moves
   the beat's arrival stamp to the wait clock together with the floor's own
   (a stamp and its comparison use one clock). Appendix B row 27.
+  *The holder's clock.* The cap is rate-only for offsets but assumes the
+  holder's wall clock does not step forward: a forward step `J` lowers
+  every later beat's `at − sent` by `J` (the minimum keeps it for the
+  beats retained), which moves the cap early by `J`, unsafe when `J > 3M +
+  δ` with the holder beating on past the step and sealed mid-lease. The
+  same class as C7-H1 (the root's own grant table judges expiry on its
+  wall clock; a 2.5 s forward step broke lock exclusion in 73 of 2 000
+  review-sim seeds with the cap and with it off alike): F-a adds a
+  dependency on it. **C7-H1 and C7a must stamp `sent` (and read `sent`'s
+  clock for `X`) on the holder's honour clock**, which the step does not
+  move. A detection (wall against monotonic time between beats, guard
+  `MAX` after a step) was left out.
+  *Follow-up (not in F-a).* Most simulator configurations model no holder
+  beat, so the cap is inert in them; beats on by default
+  (`HolderBeats::Thread` in `SimConfig::default`) is a separate commit
+  with full re-sweeps of every backup and `ack=s3` configuration and
+  re-pinned regression seeds (65, 97, 548, 194557 and 194714 among them),
+  keeping `-nobeats` variants for the no-beat path.
   Fail-before: core tests of the cap (the parent waits the bound), of the
   arrival against the credit (a holder clock behind), of the guard, of a
   `MAX` guard and of stale or foreign beats; the sim's
@@ -2964,7 +3002,7 @@ L = liveness only.
 | 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 |
 | 25 | `promise_check_needed` — `!prev.is_expired(now)` (`promise.rs`) | predecessor's `expires` vs the taker's W | W↔W | L (a sealed taker ahead does a promise check it would skip; only conservative) | with row 3's anchored promises: C7b |
 | 26 | `acquire_won`'s fast classification — `fast_prev` (`!p.is_expired(now)`) | predecessor's `expires` vs the successor's W | W↔W | was **S** (a sealed backup ahead by more than the lease's remainder took a TTL takeover: no floor) | **fixed (C7-H2)**: a takeover the permit allowed is fast whatever the clock says; the expiry is no longer kept |
-| 27 | Fast-takeover floor's beat cap (C7-F F-a) — `HolderBeats` (`note_beat`), `note_fast_takeover`, `note_marker_landed` | the predecessor's `expires`/`guard` minus its beat's `sent` (one clock), added to the beat's arrival `at` (the successor's) | W−W (holder), W (successor) | none for offset (a difference on one clock plus a stamp on the other); a backward step on the holder lengthens its honour (C7-H1); a forward step on the successor shortens every wait-side window alike | already rate-only: `2ρ·(X − sent) ≤ M/2` for beats within `250·M`; C7a moves `at` to the wait clock with the floor |
+| 27 | Fast-takeover floor's beat cap (C7-F F-a) — `HolderBeats` (`note_beat`), `note_fast_takeover`, `note_marker_landed` | the predecessor's `expires`/`guard` minus its beat's `sent` (one clock), added to the beat's arrival `at` (the successor's) | W−W (holder), W (successor) | none for offset (a difference on one clock plus a stamp on the other); a backward step on the holder lengthens its honour (C7-H1); a forward step on the successor shortens every wait-side window alike; **a forward step `J` on the holder moves the cap early by `J` (unsafe when `J > 3M + δ`, the holder beating on and sealed mid-lease): the same class as the root's own grant table (C7-H1), which breaks exclusion with or without the cap** | already rate-only: `2ρ·(X − sent) ≤ M/2` for beats within `250·M`; C7a moves `at` to the wait clock with the floor; C7-H1/C7a stamp `sent` on the holder's honour clock, which closes the forward step |
 
 ## Sources
 

@@ -1073,14 +1073,25 @@ owner has replaced it.
   liveness, which is all it may answer, grants and renewals alike (see
   [Leases, renewal and fencing](#leases-renewal-and-fencing)). The grace
   is `marker + takeover window + max(read delegation TTL, lock TTL) + 2 ×
-  margin` on the successor's own clock, counted from its own marker. The
-  old lease's expiry never cuts it short: that is a stamp of the old
-  holder's clock, and a successor ahead of it would read it as past and
-  grant over locks the old holder's nodes still honour. (A takeover in
-  the last seconds of the old lease therefore waits the full grace, where
-  it used to wait only until that expiry; and a seal or an `ack=s3`
-  takeover is a fast one, with the full grace, even when the successor's
-  clock reads the old lease as already expired.) It holds back new lock
+  margin` on the successor's own clock, counted from its own marker, or,
+  if earlier, the old lease's end as the old holder's own heartbeat places
+  it on the successor's clock, plus one margin (`X + min(arrival − sent) +
+  margin`, where `X` is the latest of the expiry of the lease the takeover
+  replaced, the expiries the beats named and the guard they named: what the
+  old holder itself waited out, such as its own takeover floor; see [the
+  heartbeat's cap](durability-and-failover.md#what-a-seals-successor-waits-for)).
+  The old lease's expiry read against the successor's clock never cuts it
+  short: that is a stamp of the old holder's clock, and a successor ahead
+  of it would read it as past and grant over locks the old holder's nodes
+  still honour; the heartbeat's `sent` is on the holder's clock too, but
+  it enters only as a difference on that clock, added to the beat's
+  arrival stamp on the successor's. (A takeover in the last seconds of the
+  old lease therefore waits the full grace unless the old holder was
+  beating, where it used to wait only until that expiry; a holder cut from
+  S3 and alive beats to the end of its lease, so its successor's grace
+  ends about a margin after it; and a seal or an `ack=s3` takeover is a
+  fast one, with the grace, even when the successor's clock reads the old
+  lease as already expired.) It holds back new lock
   grants only: the acknowledgement floor that protects read delegations
   is computed with the read delegation TTL alone, so a long lock TTL does
   not stall writes after a takeover. The holder also mirrors its lock

@@ -996,7 +996,7 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         h.core.cfg.read_delegation_ttl_ms = 5_000;
         h.hold(1, None);
         let prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
-        h.core.note_fast_takeover(&prev);
+        h.core.note_fast_takeover(&prev, None);
         let mut out = Vec::new();
         let landed = h.now;
         h.core.note_marker_landed(landed, &h.meta, &mut out);
@@ -1042,8 +1042,10 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
     // The tenure ends: the guard ends with it.
     let mut h = Harness::new(1);
     h.hold(1, None);
-    h.core
-        .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+    h.core.note_fast_takeover(
+        &Lease::granted("p0", 1, 1, 60_000).with_granted_delegations(),
+        None,
+    );
     let mut out = Vec::new();
     h.core.note_marker_landed(h.now, &h.meta, &mut out);
     assert!(h.core.in_takeover_floor(h.now));
@@ -1151,8 +1153,10 @@ fn drive_job(h: &mut Harness, mut acts: Vec<Action>) -> Driven {
 #[test]
 fn a_flush_or_shutdown_inside_the_takeover_floor_waits_for_it() {
     let arm = |h: &mut Harness| {
-        h.core
-            .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+        h.core.note_fast_takeover(
+            &Lease::granted("p0", 1, 1, 60_000).with_granted_delegations(),
+            None,
+        );
         let mut out = Vec::new();
         let now = h.now;
         h.core.note_marker_landed(now, &h.meta, &mut out);
@@ -1288,8 +1292,10 @@ fn a_queued_handoff_that_meets_the_takeover_floor_is_declined() {
         },
     });
     assert!(sends(&queued).is_empty(), "answered at once: {queued:?}");
-    h.core
-        .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+    h.core.note_fast_takeover(
+        &Lease::granted("p0", 1, 1, 60_000).with_granted_delegations(),
+        None,
+    );
     let now = h.now;
     h.core.note_marker_landed(now, &h.meta, &mut out);
     let d = drive_job(&mut h, round);
@@ -1329,8 +1335,10 @@ fn a_flush_that_meets_the_floor_at_its_release_step_parks_there() {
         "the flush did not start"
     );
     // The marker lands while the flush's upload is out.
-    h.core
-        .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+    h.core.note_fast_takeover(
+        &Lease::granted("p0", 1, 1, 60_000).with_granted_delegations(),
+        None,
+    );
     let mut none = Vec::new();
     let now = h.now;
     h.core.note_marker_landed(now, &h.meta, &mut none);
@@ -1361,8 +1369,10 @@ fn a_flush_waits_out_a_floor_longer_than_its_cap() {
     h.core.cfg.flush_floor_cap_ms = 1_000;
     h.core.cfg.lock_ttl_ms = 100_000;
     h.hold(1, None);
-    h.core
-        .note_fast_takeover(&Lease::granted("p0", 1, 1, 600_000).with_granted_delegations());
+    h.core.note_fast_takeover(
+        &Lease::granted("p0", 1, 1, 600_000).with_granted_delegations(),
+        None,
+    );
     let mut none = Vec::new();
     let landed = h.now;
     h.core.note_marker_landed(landed, &h.meta, &mut none);
@@ -1459,8 +1469,10 @@ fn a_handoff_inside_the_takeover_floor_is_declined() {
         let mut h = Harness::new(1);
         h.core.cfg.locks = locks;
         h.hold(1, None);
-        h.core
-            .note_fast_takeover(&Lease::granted("p0", 1, 1, 60_000).with_granted_delegations());
+        h.core.note_fast_takeover(
+            &Lease::granted("p0", 1, 1, 60_000).with_granted_delegations(),
+            None,
+        );
         let mut out = Vec::new();
         let landed = h.now;
         h.core.note_marker_landed(landed, &h.meta, &mut out);
@@ -7532,6 +7544,7 @@ mod epoch_rules {
             seq: 0,
             sent: Ms(0),
             expires: Ms(0),
+            guard: Ms(0),
         })
     }
 
@@ -7579,6 +7592,7 @@ mod epoch_rules {
             seq: 0,
             sent: Ms(0),
             expires: Ms(0),
+            guard: Ms(0),
         });
         h.step(Event::HolderAlive {
             from: 1,
@@ -7589,6 +7603,7 @@ mod epoch_rules {
             seq: 0,
             sent: Ms(0),
             expires: Ms(0),
+            guard: Ms(0),
         });
         let out = h.step(Event::Timer { id: watch });
         assert!(matches!(s3_ops(&out).as_slice(), [(_, S3Op::LeaseGet)]));
@@ -7608,6 +7623,7 @@ mod epoch_rules {
             seq,
             sent,
             expires: at.plus(120_000),
+            guard: Ms(0),
         })
     }
 
@@ -7743,6 +7759,7 @@ mod epoch_rules {
                     seq: 1,
                     sent: t0,
                     expires,
+                    guard: Ms(0),
                 });
             }
             h.advance(3_600);
@@ -8009,6 +8026,7 @@ mod epoch_rules {
             seq: 1,
             sent: t0.plus(2_000),
             expires: t0.plus(60_000),
+            guard: Ms(0),
         });
         let b = &h.core.bk.beats[&1];
         assert_eq!(
@@ -8048,6 +8066,7 @@ mod epoch_rules {
                 seq: i,
                 sent: at,
                 expires: at.plus(60_000),
+                guard: Ms(0),
             });
             poke(&mut sub);
         }
@@ -8088,6 +8107,7 @@ mod epoch_rules {
                 seq,
                 sent: at,
                 expires,
+                guard: Ms(0),
             })
         };
         // A beat 900 ms late: a longer window while the lease runs.
@@ -8172,6 +8192,7 @@ mod epoch_rules {
                     seq,
                     sent: at,
                     expires,
+                    guard: Ms(0),
                 });
             };
             // Beats on time naming `expires`, the last 3.4 s before it.
@@ -8279,6 +8300,7 @@ mod epoch_rules {
                 seq: 0,
                 sent: Ms(0),
                 expires,
+                guard: Ms(0),
             });
         };
         // An arrival that names none changes nothing.
@@ -8308,6 +8330,7 @@ mod epoch_rules {
             seq: 1,
             sent: t0.plus(500),
             expires: t0.plus(6_000),
+            guard: Ms(0),
         });
         assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
         // A holder not listing this node is not tracked at all.
@@ -8320,6 +8343,7 @@ mod epoch_rules {
             seq: 0,
             sent: Ms(0),
             expires: t0.plus(90_000),
+            guard: Ms(0),
         });
         assert_eq!(h.core.known_expiry(1, 1), Some(t0.plus(11_000)));
     }
@@ -8347,6 +8371,7 @@ mod epoch_rules {
                 seq,
                 sent: at,
                 expires,
+                guard: Ms(0),
             });
         };
         numbered(&mut h, 1, 1, t0.plus(6_000));
@@ -8388,6 +8413,7 @@ mod epoch_rules {
             seq: 1,
             sent: t0,
             expires: t0.plus(3_000),
+            guard: Ms(0),
         });
         // The holder kept beating and renewed; the bridge's stamps say so.
         h.now = t0.plus(3_500);
@@ -8401,6 +8427,7 @@ mod epoch_rules {
             seq: 0,
             sent: Ms(0),
             expires: t0.plus(13_000),
+            guard: Ms(0),
         });
         let out = h.step(Event::Timer { id: watch });
         assert!(
@@ -9148,6 +9175,7 @@ mod pipelined_appends {
                 seq: 0,
                 sent: Ms(0),
                 expires: Ms(0),
+                guard: Ms(0),
             })
         };
         assert_eq!(
@@ -16908,7 +16936,7 @@ mod locks {
         h.core.cfg.read_delegation_ttl_ms = 5_000;
         let mut prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
         prev.expires_unix_ms = h.now.0 + 60_000;
-        h.core.note_fast_takeover(&prev);
+        h.core.note_fast_takeover(&prev, None);
         let mut out = Vec::new();
         let now = h.now;
         h.core.note_marker_landed(now, &h.meta, &mut out);
@@ -16939,7 +16967,7 @@ mod locks {
             h.core.cfg.read_delegation_ttl_ms = 5_000;
             let mut prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
             prev.expires_unix_ms = h.now.0 + expires_after;
-            h.core.note_fast_takeover(&prev);
+            h.core.note_fast_takeover(&prev, None);
             let mut out = Vec::new();
             let now = h.now;
             h.core.note_marker_landed(now, &h.meta, &mut out);
@@ -20323,7 +20351,7 @@ mod locks {
         h.core.cfg.p2p = true;
         let mut prev = Lease::granted("p0", 1, 1, 60_000).with_granted_delegations();
         prev.expires_unix_ms = h.now.0 + 60_000;
-        h.core.note_fast_takeover(&prev);
+        h.core.note_fast_takeover(&prev, None);
         h.hold(2, None);
         delegated_file(&h.meta);
         let mut out = Vec::new();
@@ -26723,4 +26751,580 @@ fn evicting_an_in_doubt_rid_drops_its_inbox_batches() {
         !h.core.in_doubt_batches.contains_key(&first),
         "its batches went with it"
     );
+}
+
+/// Plan 43 C7-F F-a: the floor of a fast takeover is capped by what the
+/// predecessor's own heartbeat says of where its lease ends on the
+/// successor's clock (`Core::beat_cap`, `backup.rs`'s module doc).
+mod beat_cap {
+    use super::*;
+    use crate::core::lease::PendingGate;
+    use constellation_store_s3::AckPolicy;
+
+    const HOLDER: NodeId = 1;
+
+    fn find_s3(out: &[Action], pred: impl Fn(&S3Op) -> bool) -> OpId {
+        s3_ops(out)
+            .into_iter()
+            .find(|(_, r)| pred(r))
+            .map(|(op, _)| op)
+            .unwrap_or_else(|| panic!("no matching S3 request in {out:?}"))
+    }
+
+    fn margin(h: &Harness) -> i64 {
+        h.core.cfg.expiry_margin_ms as i64
+    }
+
+    /// A successor whose floor bound is far past the caps below: read
+    /// delegations 20 s, lock grants 30 s.
+    fn successor() -> Harness {
+        let mut h = Harness::new(2);
+        h.core.cfg.read_delegation_ttl_ms = 20_000;
+        h.core.cfg.lock_ttl_ms = 30_000;
+        h
+    }
+
+    /// The predecessor's lease as the takeover CAS replaced it: it served
+    /// strict reads (`granted_delegations`) and ends at `expires` on its
+    /// own clock.
+    fn predecessor(expires: i64) -> Lease {
+        let mut prev = Lease::granted("p0", HOLDER, 1, 60_000).with_granted_delegations();
+        prev.expires_unix_ms = expires;
+        prev
+    }
+
+    /// One numbered beat of the predecessor's epoch 1, sent at `sent` on
+    /// its clock and stamped `at` on arrival on the successor's.
+    fn beat(h: &mut Harness, seq: u64, (sent, at): (i64, i64), expires: i64, guard: i64) {
+        h.core.on_holder_alive(
+            HOLDER,
+            1,
+            0,
+            true,
+            (Ms(at), seq, Ms(sent), Ms(expires), Ms(guard)),
+            &h.meta,
+        );
+    }
+
+    /// The takeover of `prev` as `acquire_won` makes it (`beat_cap`, then
+    /// `note_fast_takeover`), and its marker landing now.
+    fn take_over(h: &mut Harness, prev: &Lease) {
+        let cap = h.core.beat_cap(prev);
+        h.core.note_fast_takeover(prev, cap);
+        let mut out = Vec::new();
+        let now = h.now;
+        h.core.note_marker_landed(now, &h.meta, &mut out);
+    }
+
+    /// The bound of the floor on acknowledgements and on lock grants at the
+    /// landing instant `now` (no write delegations).
+    fn bounds(h: &Harness, now: Ms) -> (i64, i64) {
+        let c = &h.core.cfg;
+        let base = now.0 + c.backup_takeover_ms as i64 + 2 * c.expiry_margin_ms as i64;
+        (
+            base + c.read_delegation_ttl_ms as i64,
+            base + c.read_delegation_ttl_ms.max(c.lock_ttl_ms) as i64,
+        )
+    }
+
+    /// The cap ends the floor where the predecessor's beats place its
+    /// lease on this node's clock, plus a margin; a cap already past by
+    /// the time the marker lands leaves no floor at all. Fails on the
+    /// parent: the floor is the bound (`ack_floor_capped*` do not exist).
+    #[test]
+    fn a_fast_takeover_floor_ends_where_the_predecessors_beats_put_its_lease() {
+        let m = margin(&successor());
+        // The predecessor's lease ends 3 s from now; its last renewal
+        // (named by the beats) is the same instant. Clocks agree, beats
+        // take 10 ms.
+        {
+            let mut h = successor();
+            let now0 = h.now.0;
+            let x = now0 + 3_000;
+            for k in 0..5u64 {
+                let sent = now0 - 1_500 + 300 * k as i64;
+                // The smallest lag counts, whichever beat had it.
+                let lag = if k == 2 { 10 } else { 10 + 15 * k as i64 };
+                beat(&mut h, k + 1, (sent, sent + lag), x, 0);
+            }
+            let prev = predecessor(x);
+            assert_eq!(h.core.beat_cap(&prev), Some(Ms(x + 10 + m)));
+            take_over(&mut h, &prev);
+            let (read_bound, lock_bound) = bounds(&h, h.now);
+            assert!(x + 10 + m < read_bound, "the cap is the shorter");
+            assert_eq!(h.meta.read_delegations().quarantine_until(), x + 10 + m);
+            assert_eq!(h.meta.locks().quarantine_until(), x + 10 + m);
+            assert!(lock_bound > read_bound);
+            assert_eq!(h.core.takeover_floor_until_ms(), x + 10 + m);
+            assert!(h.core.in_takeover_floor(h.now));
+            let s = h.core.stats;
+            assert_eq!((s.ack_floor_waits, s.ack_floor_capped), (1, 1));
+            assert_eq!(s.ack_floor_capped_out, 0);
+            assert_eq!(
+                s.ack_floor_cap_saved_ms as i64,
+                lock_bound - (x + 10 + m),
+                "saved against the longer (lock) bound"
+            );
+        }
+        // The same lease ended 1.5 s before the marker landed: nothing to
+        // wait for.
+        {
+            let mut h = successor();
+            let now0 = h.now.0;
+            let x = now0 - 1_500;
+            for k in 0..5u64 {
+                let sent = now0 - 3_500 + 300 * k as i64;
+                beat(&mut h, k + 1, (sent, sent + 10), x, 0);
+            }
+            let prev = predecessor(x);
+            assert!(h.core.beat_cap(&prev).unwrap().0 <= now0);
+            take_over(&mut h, &prev);
+            assert_eq!(h.meta.read_delegations().quarantine_until(), 0);
+            assert_eq!(h.meta.locks().quarantine_until(), 0);
+            assert_eq!(h.core.takeover_floor_until_ms(), 0);
+            assert!(!h.core.in_takeover_floor(h.now));
+            let s = h.core.stats;
+            assert_eq!((s.ack_floor_capped_out, s.ack_floor_waits), (1, 0));
+            assert_eq!(s.ack_floor_capped, 0);
+        }
+    }
+
+    /// The same through a real seal (the driven acquisition: the watch
+    /// reads the lease, seals, claims, lands the marker): the beats heard
+    /// as events cap the floor `acquire_won` arms. Fails on the parent for
+    /// the same reason.
+    #[test]
+    fn a_sealed_takeover_caps_its_floor_by_the_beats_it_heard() {
+        let holder = Harness::new(1);
+        holder.meta.set_holder_epoch(1);
+        let rid = Rid {
+            node: 1,
+            incarnation: 1,
+            seq: 1,
+        };
+        constellation_meta::execute_mutate(&holder.meta, &holder.create("a"), Some(rid)).unwrap();
+        let txs = holder.meta.journal_txs_from(1, 1000).unwrap();
+        let mut h = successor();
+        h.core.cfg.takeover_promise_check = false;
+        let t0 = h.now.0;
+        let out = h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::BackupAppend {
+                req: OpId(1),
+                epoch: 1,
+                holder: 1,
+                config_version: 2,
+                candidacy: 1,
+                from: 1,
+                txs,
+                through: 0,
+                expires_unix_ms: 0,
+            },
+        });
+        let watch = timers(&out, crate::TimerKind::BackupWatch)[0];
+        // The holder beats for half a second, naming a lease to t0 + 6 s,
+        // then goes quiet (cut from S3 only, it would go on to the expiry;
+        // the watch seals at the expiry it reads).
+        let x = t0 + 6_000;
+        for k in 0..5u64 {
+            let sent = t0 + 100 * k as i64;
+            h.step(Event::HolderAlive {
+                from: 1,
+                epoch: 1,
+                candidacy: 0,
+                listed: true,
+                at: Ms(sent + 5),
+                seq: k + 1,
+                sent: Ms(sent),
+                expires: Ms(x),
+                guard: Ms(0),
+            });
+        }
+        h.advance(5_000);
+        let out = h.step(Event::Timer { id: watch });
+        let get = find_s3(&out, |r| matches!(r, S3Op::LeaseGet));
+        let theirs = Lease {
+            granted_delegations: true,
+            backups: vec![2],
+            ack_policy: AckPolicy::Backup,
+            config_version: 2,
+            ..lease_of(1, 1, x)
+        };
+        let mut out = h.step(Event::S3 {
+            op: get,
+            result: S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+        });
+        assert_eq!(h.core.bk.sealed, 1);
+        let mut landed = false;
+        for _ in 0..12 {
+            let next = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead));
+            let Some((op, req)) = next else { break };
+            let result = match req {
+                S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((theirs.clone(), tag())))),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                S3Op::LeaseSwap { .. } => S3Result::LeasePut(Ok(tag())),
+                S3Op::SegmentPut { .. } => {
+                    landed = true;
+                    S3Result::SegmentPut(Ok(()))
+                }
+                other => panic!("unexpected {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+            if landed {
+                break;
+            }
+        }
+        assert!(landed, "the takeover's marker never landed");
+        let m = margin(&h);
+        // The lease's end as the beats put it: x + 5 (arrival minus send)
+        // + a margin; the bound is 20 s and more past the landing.
+        assert_eq!(h.meta.read_delegations().quarantine_until(), x + 5 + m);
+        assert_eq!(h.meta.locks().quarantine_until(), x + 5 + m);
+        assert_eq!(h.core.stats.ack_floor_capped, 1);
+        assert_eq!(h.core.stats.ack_floor_waits, 1);
+    }
+
+    /// The arrival, never its credit: a holder whose clock is 4 s behind
+    /// this node's. The seal watch credits a beat no later than `sent + M`
+    /// (an instant of the holder's clock); the cap counts the raw arrival
+    /// (`at − sent` = the offset plus the transit time), so its end on this
+    /// node's clock is not early. With the credit it would end 3 s early
+    /// (`x + M + M` against `x + 4 s`): the sim's skewed-successor
+    /// configuration fails that variant.
+    #[test]
+    fn the_beat_cap_reads_the_arrival_not_its_credit() {
+        let mut h = successor();
+        let m = margin(&h);
+        let behind = 4_000;
+        let now0 = h.now.0;
+        // The holder's clock reads now0 − behind; its lease ends 2 s on.
+        let x = now0 - behind + 2_000;
+        for k in 0..4u64 {
+            let at = now0 - 1_000 + 300 * k as i64;
+            beat(&mut h, k + 1, (at - behind - 10, at), x, 0);
+        }
+        let prev = predecessor(x);
+        let cap = h.core.beat_cap(&prev).unwrap().0;
+        let true_end = x + behind;
+        assert_eq!(cap, x + behind + 10 + m);
+        assert!(cap >= true_end + m, "ends no earlier than the true end");
+        let credited = x + m + m;
+        assert!(credited < true_end, "the credit would end it early");
+        let b = &h.core.bk.beats[&HOLDER];
+        assert!(b.lags.iter().all(|&(_, lag)| lag == behind + 10));
+    }
+
+    /// The predecessor's own floor outlasts its lease (a lease of 20 s
+    /// against a lock floor of 23.5 s): the cap counts the guard.
+    #[test]
+    fn the_beat_cap_covers_the_predecessors_own_floor() {
+        let mut h = successor();
+        let m = margin(&h);
+        let now0 = h.now.0;
+        let x = now0 + 2_000;
+        let guard = x + 8_000;
+        for k in 0..4u64 {
+            let sent = now0 - 1_000 + 300 * k as i64;
+            beat(&mut h, k + 1, (sent, sent + 10), x, guard);
+        }
+        let prev = predecessor(x);
+        assert_eq!(h.core.beat_cap(&prev), Some(Ms(guard + 10 + m)));
+        // The highest expiry the beats named counts too (a renewal the
+        // successor's CAS may or may not have replaced): above both.
+        beat(&mut h, 8, (now0 + 400, now0 + 410), x + 9_000, 0);
+        assert_eq!(h.core.beat_cap(&prev), Some(Ms(x + 9_000 + 10 + m)));
+        let (sent_late, at_late) = (now0 + 500, now0 + 510);
+        // A later beat naming a smaller guard (its floor over: 0) does not
+        // lower what was heard.
+        beat(&mut h, 9, (sent_late, at_late), x, 0);
+        assert_eq!(h.core.beat_cap(&prev), Some(Ms(x + 9_000 + 10 + m)));
+        // A lease renewed after the last beat is counted too: the cap is
+        // from the lease the takeover replaced.
+        let renewed = predecessor(guard + 3_000);
+        assert_eq!(h.core.beat_cap(&renewed), Some(Ms(guard + 3_000 + 10 + m)));
+    }
+
+    /// While the predecessor's takeover gate was pending (its floor not
+    /// known yet), one beat of that kind disables the cap: the successor
+    /// waits the bound. Fails on the parent: no cap, always the bound
+    /// (this test pins the unknown value; test 1 pins the cap).
+    #[test]
+    fn a_beat_from_a_pending_gate_disables_the_cap() {
+        let mut h = successor();
+        let now0 = h.now.0;
+        let x = now0 + 2_000;
+        for k in 0..4u64 {
+            let sent = now0 - 1_000 + 300 * k as i64;
+            let guard = if k == 1 { i64::MAX } else { 0 };
+            beat(&mut h, k + 1, (sent, sent + 10), x, guard);
+        }
+        let prev = predecessor(x);
+        assert_eq!(h.core.beat_cap(&prev), None);
+        take_over(&mut h, &prev);
+        let (read_bound, lock_bound) = bounds(&h, h.now);
+        assert_eq!(h.meta.read_delegations().quarantine_until(), read_bound);
+        assert_eq!(h.meta.locks().quarantine_until(), lock_bound);
+        assert_eq!(h.core.stats.ack_floor_capped, 0);
+        // The next epoch's beats start afresh.
+        h.core.on_holder_alive(
+            HOLDER,
+            2,
+            0,
+            true,
+            (Ms(now0 + 10), 5, Ms(now0), Ms(x), Ms(0)),
+            &h.meta,
+        );
+        let next = Lease {
+            epoch: 2,
+            ..predecessor(x)
+        };
+        assert!(h.core.beat_cap(&next).is_some());
+        assert_eq!(h.core.beat_cap(&prev), None, "epoch 1 was left behind");
+    }
+
+    /// Only numbered beats of the replaced tenure count: unnumbered
+    /// arrivals (`seq` 0, the driver handing a stamp over), beats of
+    /// another holder, of an older or newer epoch than the replaced
+    /// lease's, or none at all give the bound.
+    #[test]
+    fn beats_of_another_epoch_or_holder_or_unnumbered_give_no_cap() {
+        let mut h = successor();
+        let now0 = h.now.0;
+        let x = now0 + 2_000;
+        let prev = predecessor(x);
+        assert_eq!(h.core.beat_cap(&prev), None, "no beat heard");
+        // Unnumbered (an arrival handed over) and `sent` 0.
+        beat(&mut h, 0, (0, now0), x, 0);
+        beat(&mut h, 3, (0, now0), x, 0);
+        assert_eq!(h.core.beat_cap(&prev), None, "unnumbered");
+        // Another holder's beats.
+        h.core.on_holder_alive(
+            3,
+            1,
+            0,
+            true,
+            (Ms(now0), 4, Ms(now0 - 10), Ms(x), Ms(0)),
+            &h.meta,
+        );
+        assert_eq!(h.core.beat_cap(&prev), None, "another holder");
+        // A newer epoch's beats say nothing of epoch 1's lease; an older
+        // epoch's after them are not recorded.
+        h.core.on_holder_alive(
+            HOLDER,
+            2,
+            0,
+            true,
+            (Ms(now0), 5, Ms(now0 - 10), Ms(x), Ms(0)),
+            &h.meta,
+        );
+        assert_eq!(h.core.beat_cap(&prev), None, "a newer epoch");
+        beat(&mut h, 6, (now0 - 10, now0), x, 0);
+        assert_eq!(h.core.beat_cap(&prev), None, "an older epoch, late");
+        // An unlisted arrival (a dismissal) is no beat of the lease.
+        let mut h = successor();
+        h.core.on_holder_alive(
+            HOLDER,
+            1,
+            1,
+            false,
+            (Ms(now0), 1, Ms(now0 - 10), Ms(x), Ms(0)),
+            &h.meta,
+        );
+        assert_eq!(h.core.beat_cap(&prev), None, "unlisted");
+    }
+
+    /// Beats sent longer than `250·M` before the instant the cap counts
+    /// to are no evidence of the clocks' rates: a beat that old with a
+    /// (suspiciously) small lag does not set the cap; the recent ones do.
+    #[test]
+    fn beats_older_than_the_span_give_no_cap() {
+        let mut h = successor();
+        let m = margin(&h);
+        let span = 250 * m;
+        let now0 = h.now.0;
+        let x = now0 + 1_000;
+        // Old: sent more than the span before x, lag 0.
+        beat(&mut h, 1, (x - span - 1, x - span - 1), x, 0);
+        let prev = predecessor(x);
+        assert_eq!(h.core.beat_cap(&prev), None, "only an old beat");
+        // At the span: counts.
+        beat(&mut h, 2, (x - span, x - span + 700), x, 0);
+        assert_eq!(h.core.beat_cap(&prev), Some(Ms(x + 700 + m)));
+        // Recent ones with larger lags do not lower it, the old one with
+        // lag 0 stays out.
+        beat(&mut h, 3, (x - 500, x - 500 + 900), x, 0);
+        assert_eq!(h.core.beat_cap(&prev), Some(Ms(x + 700 + m)));
+        // A beat sent after the expiry it names cannot be (beats stop
+        // there): a stepped clock, not evidence, left out.
+        beat(&mut h, 4, (x + 5_000, x + 5_000), x, 0);
+        assert_eq!(h.core.beat_cap(&prev), Some(Ms(x + 700 + m)));
+        // The kept lags are bounded.
+        for k in 0..200u64 {
+            beat(&mut h, 10 + k, (x - 400, x - 400 + 800), x, 0);
+        }
+        assert!(h.core.bk.beats[&HOLDER].lags.len() <= 64);
+    }
+
+    /// The cap never lengthens the floor: a cap past the bound leaves the
+    /// bound.
+    #[test]
+    fn the_cap_never_lengthens_the_floor() {
+        let mut h = successor();
+        let now0 = h.now.0;
+        let x = now0 + 90_000;
+        // Beats sent within the span of x, an hour of lag between clocks.
+        for k in 0..4u64 {
+            let sent = x - 1_000 + 100 * k as i64;
+            beat(&mut h, k + 1, (sent, sent + 3_600_000), x, 0);
+        }
+        let prev = predecessor(x);
+        assert!(h.core.beat_cap(&prev).unwrap().0 > bounds(&h, h.now).1);
+        take_over(&mut h, &prev);
+        let (read_bound, lock_bound) = bounds(&h, h.now);
+        assert_eq!(h.meta.read_delegations().quarantine_until(), read_bound);
+        assert_eq!(h.meta.locks().quarantine_until(), lock_bound);
+        assert_eq!(h.core.stats.ack_floor_capped, 0);
+        assert_eq!(h.core.stats.ack_floor_waits, 1);
+    }
+
+    /// A cap between the two bounds shortens the lock floor and leaves the
+    /// acknowledgement floor (already shorter) alone.
+    #[test]
+    fn a_cap_between_the_bounds_shortens_only_the_longer_floor() {
+        let mut h = successor();
+        let now0 = h.now.0;
+        let (read_bound, lock_bound) = bounds(&h, h.now);
+        let m = margin(&h);
+        let x = (read_bound + lock_bound) / 2 - m - 10;
+        for k in 0..4u64 {
+            let sent = x - 1_000 + 100 * k as i64;
+            beat(&mut h, k + 1, (sent, sent + 10), x, 0);
+        }
+        let prev = predecessor(x);
+        take_over(&mut h, &prev);
+        assert!(x > now0);
+        assert_eq!(h.meta.read_delegations().quarantine_until(), read_bound);
+        assert_eq!(h.meta.locks().quarantine_until(), x + 10 + m);
+        assert_eq!(h.core.takeover_floor_until_ms(), x + 10 + m);
+        assert_eq!(h.core.stats.ack_floor_capped, 1);
+    }
+
+    /// Holder side: the beat's guard is the latest of the takeover floor,
+    /// the read and lock quarantines and the subtree graces; unknown
+    /// (`i64::MAX`) while a takeover gate or a floor due is pending. Fails
+    /// on the parent: `beat_guard_unix_ms` does not exist.
+    #[test]
+    fn the_beat_guard_names_the_floor_and_the_quarantines() {
+        let mut h = successor();
+        h.hold(2, None);
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), 0, "nothing waited on");
+        // A restart's lock quarantine.
+        h.meta.locks().set_quarantine(h.now.0 + 4_000);
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), h.now.0 + 4_000);
+        // A read quarantine (the kernel drain's, a floor's).
+        h.meta.read_delegations().set_quarantine(h.now.0 + 6_000);
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), h.now.0 + 6_000);
+        // A subtree grace.
+        h.core.lk.grace.push((ROOT_INO + 1, Ms(h.now.0 + 7_000)));
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), h.now.0 + 7_000);
+        // The tenure's own takeover floor, once the marker landed.
+        let mut h = successor();
+        h.hold(2, None);
+        let prev = predecessor(h.now.0 + 3_000);
+        h.core.note_fast_takeover(&prev, None);
+        assert_eq!(
+            h.core.beat_guard_unix_ms(&h.meta),
+            i64::MAX,
+            "a floor due, its marker not landed"
+        );
+        let mut out = Vec::new();
+        let now = h.now;
+        h.core.note_marker_landed(now, &h.meta, &mut out);
+        let (_, lock_bound) = bounds(&h, h.now);
+        assert_eq!(h.core.takeover_floor_until_ms(), lock_bound);
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), lock_bound);
+        // The floor is kept as the guard when it is over (the successor
+        // takes the highest it heard); the tenure ending drops it.
+        h.advance(100_000);
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), lock_bound);
+        h.core.end_takeover_floor();
+        assert_eq!(h.core.takeover_floor_until_ms(), 0);
+    }
+
+    /// Review F1: a lock or delegation grant answered under a continuation
+    /// epoch's hold is capped by its ttl alone, and the re-claimed S3 tenure
+    /// keeps it (`epoch_tenure_resumed`); with a ttl longer than the lease's
+    /// (legal: 30 s against a 10 s lease here) the re-claimed lease ends
+    /// before it. The guard names it, so a fast successor's cap covers it.
+    /// Fails on the parent (the guard is 0 and the cap ends 16 s early).
+    #[test]
+    fn a_grant_made_under_an_epoch_hold_is_in_the_guard_and_the_cap_covers_it() {
+        // The holder: lease ttl 10 s (`Harness::hold`), lock ttl 30 s,
+        // delegation ttl 20 s, under an epoch hold.
+        let mut h = Harness::new(HOLDER);
+        h.core.cfg.lock_ttl_ms = 30_000;
+        h.core.cfg.delegation_ttl_ms = 20_000;
+        h.hold(2, None);
+        let t0 = h.now.0;
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), 0, "nothing granted yet");
+        // Outside a hold the cap is the lease's: nothing recorded.
+        assert!(h.core.lock_cap_ms(h.now) <= 10_000);
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), 0, "capped by the lease");
+        let now = h.now;
+        h.core.lease.adopt_epoch_hold(now, 2);
+        assert_eq!(h.core.lock_cap_ms(h.now), 30_000, "the ttl alone");
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), t0 + 30_000);
+        h.advance(1_000);
+        assert_eq!(h.core.grant_cap_ms(h.now), 20_000, "the ttl alone");
+        assert_eq!(
+            h.core.beat_guard_unix_ms(&h.meta),
+            t0 + 30_000,
+            "the lock grant's end stands (the later of the two)"
+        );
+        // The hold ends and the node re-claims 4 s after the first grant:
+        // its lease (what the successor's CAS replaces) ends at t0 + 14 s,
+        // the grant at t0 + 30 s. The guard of the holder's beats is what
+        // the successor takes the maximum of.
+        let granted_until = t0 + 30_000;
+        let guard = h.core.beat_guard_unix_ms(&h.meta);
+        let m = margin(&successor());
+        for (named_guard, covered) in [(guard, true), (0, false)] {
+            let mut s = successor();
+            let prev = predecessor(t0 + 14_000);
+            beat(
+                &mut s,
+                1,
+                (t0 + 3_000, t0 + 3_010),
+                t0 + 14_000,
+                named_guard,
+            );
+            let cap = s.core.beat_cap(&prev).expect("a cap").0;
+            assert_eq!(
+                cap >= granted_until + m,
+                covered,
+                "guard {named_guard}: cap {cap}, the grant ends {granted_until}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_beat_guard_is_unknown_while_a_takeover_gate_is_pending() {
+        let mut h = successor();
+        let gate = PendingGate {
+            epoch: 2,
+            takeover: true,
+            marker_shipped: false,
+            drained: false,
+            fast_prev: true,
+            backup_tail_epoch: None,
+            shippable: false,
+        };
+        h.hold(2, Some(gate));
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), i64::MAX);
+        h.core.lease.gate = None;
+        assert_eq!(h.core.beat_guard_unix_ms(&h.meta), 0);
+    }
 }

@@ -15,6 +15,22 @@
     "AckStatus": {
       "description": "Plan 30 §M9: the acknowledgement policy, backups and seals.",
       "properties": {
+        "ack_floor_cap_saved_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ack_floor_capped": {
+          "description": "Plan 43 C7-F F-a: floors the predecessor's heartbeat shortened,\nthe milliseconds that saved in all, and takeovers that needed no\nfloor because the cap had passed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ack_floor_capped_out": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "ack_floor_waits": {
           "format": "uint64",
           "minimum": 0,
@@ -357,6 +373,9 @@
         "s3_fast_takeovers",
         "dead_root_acquires",
         "ack_floor_waits",
+        "ack_floor_capped",
+        "ack_floor_capped_out",
+        "ack_floor_cap_saved_ms",
         "stale_liveness_refusals",
         "epoch_carry_refused",
         "refusals_journaled",

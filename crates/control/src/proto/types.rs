@@ -1793,6 +1793,12 @@ pub struct AckStatus {
     /// waiting for the log) needed a root whose lease had run out.
     pub dead_root_acquires: u64,
     pub ack_floor_waits: u64,
+    /// Plan 43 C7-F F-a: floors the predecessor's heartbeat shortened,
+    /// the milliseconds that saved in all, and takeovers that needed no
+    /// floor because the cap had passed.
+    pub ack_floor_capped: u64,
+    pub ack_floor_capped_out: u64,
+    pub ack_floor_cap_saved_ms: u64,
     pub stale_liveness_refusals: u64,
     /// Plan 30 §M10's claim rule: continuation-epoch activations that
     /// did not carry this node's lease (an `ack=s3` lease, or a backup

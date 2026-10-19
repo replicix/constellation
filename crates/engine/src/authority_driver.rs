@@ -936,6 +936,11 @@ struct AliveTargets {
     dismissed: Vec<(NodeId, u64)>,
     /// The lease's expiry: no heartbeat at or past it.
     until_unix_ms: i64,
+    /// Plan 43 C7-F F-a: what this holder waits out that its lease does
+    /// not cap (`Core::beat_guard_unix_ms`), carried on every beat so a
+    /// successor that seals this holder can end its own floor with the
+    /// lease: 0 none, `i64::MAX` unknown.
+    guard_unix_ms: i64,
 }
 
 /// How long a dropped backup is told it was dropped (`HolderAlive` with
@@ -957,16 +962,16 @@ struct AliveBook {
 }
 
 impl AliveBook {
-    /// The targets for this refresh: `held` is the epoch and expiry of a
-    /// lease this node holds (`None`: none, or only within an open
-    /// continuation epoch), `listed` its backups.
+    /// The targets for this refresh: `held` is the epoch, the expiry and
+    /// the guard of a lease this node holds (`None`: none, or only within
+    /// an open continuation epoch), `listed` its backups.
     fn update(
         &mut self,
         now_unix_ms: i64,
-        held: Option<(u64, i64)>,
+        held: Option<(u64, i64, i64)>,
         listed: Vec<(NodeId, u64)>,
     ) -> Option<AliveTargets> {
-        let Some((epoch, until_unix_ms)) = held else {
+        let Some((epoch, until_unix_ms, guard_unix_ms)) = held else {
             self.dismissed.clear();
             self.prev = None;
             return None;
@@ -998,6 +1003,7 @@ impl AliveBook {
             listed,
             dismissed,
             until_unix_ms,
+            guard_unix_ms,
         })
     }
 }
@@ -1228,6 +1234,7 @@ async fn holder_alive_loop(
                     seq,
                     sent_unix_ms: at.0,
                     expires_unix_ms: t.until_unix_ms,
+                    guard_unix_ms: t.guard_unix_ms,
                 },
             };
             let peers = peers.clone();
@@ -2263,6 +2270,7 @@ impl Driver {
                 seq: 0,
                 sent: Ms(0),
                 expires: Ms(expires),
+                guard: Ms(0),
             }));
         }
     }
@@ -2504,7 +2512,11 @@ impl Driver {
     fn publish_alive_targets(&mut self, now: Ms) {
         let lease = self.core.lease();
         let held = match &lease.held {
-            Some((l, _)) if !lease.epoch_held() => Some((l.epoch, l.expires_unix_ms)),
+            Some((l, _)) if !lease.epoch_held() => Some((
+                l.epoch,
+                l.expires_unix_ms,
+                self.core.beat_guard_unix_ms(&*self.deps.meta),
+            )),
             _ => None,
         };
         let listed = if held.is_some() {
@@ -3163,6 +3175,7 @@ impl Driver {
                 seq: beat.seq,
                 sent: Ms(beat.sent_unix_ms),
                 expires: Ms(beat.expires_unix_ms),
+                guard: Ms(beat.guard_unix_ms),
             })),
             SyncRequest::PeerPromiseRequest {
                 requester,
@@ -6734,10 +6747,25 @@ mod tests {
     fn the_alive_book_dismisses_dropped_candidacies_until_reselected() {
         use super::{AliveBook, DISMISS_FOR_MS};
         let mut book = AliveBook::default();
-        let held = Some((4, 100_000));
+        let held = Some((4, 100_000, 0));
         let t = book.update(1_000, held, vec![(2, 10), (3, 11)]).unwrap();
         assert_eq!(t.listed, vec![(2, 10), (3, 11)]);
         assert!(t.dismissed.is_empty());
+        // Plan 43 C7-F F-a: the holder's guard rides the targets, and a
+        // change of it republishes them (the driver compares the targets).
+        assert_eq!(t.guard_unix_ms, 0);
+        let g = book
+            .update(1_050, Some((4, 100_000, i64::MAX)), vec![(2, 10), (3, 11)])
+            .unwrap();
+        assert_eq!(g.guard_unix_ms, i64::MAX, "unknown while a gate is pending");
+        assert_ne!(g, t);
+        let g2 = book
+            .update(1_060, Some((4, 100_000, 9_000)), vec![(2, 10), (3, 11)])
+            .unwrap();
+        assert_eq!(g2.guard_unix_ms, 9_000);
+        assert_ne!(g2, g);
+        let t = book.update(1_070, held, vec![(2, 10), (3, 11)]).unwrap();
+        assert_eq!(t.guard_unix_ms, 0);
         // Node 3's candidacy timed out.
         let t = book.update(1_100, held, vec![(2, 10)]).unwrap();
         assert_eq!(t.dismissed, vec![(3, 11)]);
@@ -6764,7 +6792,9 @@ mod tests {
         assert!(t.dismissed.is_empty());
         // A new epoch forgets the old one's dismissals; no lease, all.
         book.update(20_200, held, Vec::new());
-        let t = book.update(20_300, Some((5, 100_000)), Vec::new()).unwrap();
+        let t = book
+            .update(20_300, Some((5, 100_000, 0)), Vec::new())
+            .unwrap();
         assert!(
             t.dismissed.is_empty(),
             "an old epoch's dismissal carried over"
@@ -6784,6 +6814,7 @@ mod tests {
             listed: vec![(2, 10)],
             dismissed: vec![(3, 11)],
             until_unix_ms: 50_000,
+            guard_unix_ms: 0,
         };
         assert_eq!(alive_tick(None, 1_000, (0, 0, 0), 15_000), AliveTick::Idle);
         assert_eq!(
@@ -6827,6 +6858,7 @@ mod tests {
             listed: vec![(2, 1)],
             dismissed: Vec::new(),
             until_unix_ms: i64::MAX,
+            guard_unix_ms: 0,
         };
         assert_eq!(
             alive_tick(Some(&t), 30_000, (0, 15_001, 0), 15_000),
@@ -6860,6 +6892,7 @@ mod tests {
             listed: Vec::new(),
             dismissed: Vec::new(),
             until_unix_ms: i64::MAX,
+            guard_unix_ms: 0,
         })));
         let probe = tokio::spawn(std::future::pending::<()>());
         let abort = probe.abort_handle();
@@ -7677,6 +7710,7 @@ mod tests {
                 listed: vec![(2, 1)],
                 dismissed: Vec::new(),
                 until_unix_ms: i64::MAX,
+                guard_unix_ms: 0,
             })));
             let (core_tx, _core_rx) = tokio::sync::mpsc::unbounded_channel();
             let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();

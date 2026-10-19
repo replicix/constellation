@@ -99,6 +99,13 @@ pub enum FaultKind {
     /// Plan 30 §M9: cut P2P between the holder and its first listed
     /// backup (S3 stays reachable to both) for `for_ms`.
     PartitionBackup { for_ms: u64 },
+    /// Plan 43 C7-F F-a (review F3): cut P2P between `node` (a reader, with
+    /// a strict read delegation from the holder: `SimConfig::reader_nodes`)
+    /// and every other node for `for_ms`: it learns nothing of a seal and
+    /// keeps serving from its delegation until it lapses, so the
+    /// successor's floor is all that keeps it from acknowledging a write
+    /// the reader then misses.
+    IsolateReader { node: NodeId, for_ms: u64 },
     /// Fix "capture under an epoch hold": once a continuation epoch is
     /// active, kill a member that is not the hold owner — preferably one
     /// whose epoch write's chunk the owner awaits (`chunks.rs`), so the
@@ -357,6 +364,16 @@ pub struct SimConfig {
     pub lock_write_wait_ms: Option<u64>,
     /// Where the holder's off-core heartbeat runs ([`HolderBeats`]).
     pub holder_beats: HolderBeats,
+    /// Plan 43 C7-F F-a (review F3): nodes whose clients only read (the
+    /// names their ops would have touched), so a node cut off from the
+    /// others (`FaultKind::IsolateReader`) goes on reading from its
+    /// delegation instead of blocking on a write.
+    pub reader_nodes: Vec<NodeId>,
+    /// Plan 43 C7-F F-a (review F3): `(node, start_ms, ops)`: that node's
+    /// clients start after `start_ms` and run only the first `ops` of the
+    /// `ops_per_client` they would have (the draws stay the same), so one
+    /// node can write early and another late.
+    pub client_plan: Vec<(NodeId, u64, usize)>,
     /// Every holder stays alive: a seal, a backup takeover or an
     /// `ack=s3` fast takeover fails the seed (the runtime-lag
     /// configurations: lag is latency, not death).
@@ -371,6 +388,14 @@ pub struct SimConfig {
     /// daemon's usual order: the handlers' stamps first
     /// (`Driver::hand_heard`), as unnumbered beats.
     pub timers_first_after_lag: bool,
+    /// Plan 43 C7-F F-a's negative control: every numbered beat's arrival
+    /// stamp is replaced by its credit, `min(at, sent + M)` (what the seal
+    /// watch counts: an instant of the *holder's* clock), before the core
+    /// sees it, so the cap of a fast takeover's floor is computed from the
+    /// credit. A holder whose clock is behind the successor's by more than
+    /// M then ends the successor's floor early: this must fail
+    /// `fast-takeover-skewed-successor`.
+    pub beats_credited: bool,
     /// The numbered beats sent to a node while its runtime lags are lost
     /// (the daemon's shape when the holder's beat runtime closes the
     /// liveness lane to a frozen peer and re-dials it: what it sent
@@ -613,9 +638,12 @@ impl Default for SimConfig {
             settle_tagged_writes: true,
             lock_write_wait_ms: None,
             holder_beats: HolderBeats::Off,
+            reader_nodes: Vec::new(),
+            client_plan: Vec::new(),
             live_holder: false,
             beats_lost: false,
             timers_first_after_lag: false,
+            beats_credited: false,
             beats_lost_in_lag: false,
             keeps_backups: false,
             deleg_lane: true,
@@ -670,6 +698,17 @@ pub struct Report {
     /// Plan 30 §M9: per holder crash, simulated ms from the crash to the
     /// first mutation any node acknowledged afterwards.
     pub failover_ms: Vec<u64>,
+    /// Plan 43 C7-F: the length of every takeover floor armed in the run
+    /// (simulated ms from the marker's landing), over all nodes and
+    /// incarnations.
+    pub floor_ms: Vec<u64>,
+    /// Plan 43 C7-F: times a beat guard that had been published as a
+    /// finite non-zero value rose later in its epoch (see
+    /// `Shared::guard_seen`).
+    pub guard_rises: u64,
+    /// Of those, rises of the guard's base (its floor and quarantines),
+    /// not a subtree grace or a hold-era grant: asserted 0.
+    pub guard_base_rises: u64,
     /// The longest a client's single submit waited (simulated ms).
     pub longest_submit_ms: u64,
     /// Plan 30 §M10: continuation epochs formed (and with a roster node
@@ -877,7 +916,7 @@ impl Cluster {
         // stranded by the root's recall and replayed as a conflict copy,
         // was checked as durable once its node had restarted — the new
         // incarnation's set was empty).
-        let (tentative, refusals) = self
+        let (tentative, refusals, floors) = self
             .nodes
             .lock()
             .unwrap()
@@ -886,11 +925,13 @@ impl Cluster {
                 (
                     old.shared.tentative.lock().unwrap().clone(),
                     old.shared.journaled_refusals.lock().unwrap().clone(),
+                    old.shared.floor_ms.lock().unwrap().clone(),
                 )
             })
             .unwrap_or_default();
         let handle = NodeHandle::start_with(&self.env, id, meta, epoch);
         handle.shared.tentative.lock().unwrap().extend(tentative);
+        *handle.shared.floor_ms.lock().unwrap() = floors;
         // (Kept only with the journal: a fresh replica has none to drop.)
         if meta_kept {
             *handle.shared.journaled_refusals.lock().unwrap() = refusals;
@@ -1052,6 +1093,10 @@ pub enum Step {
     Op(NsOp),
     /// Plan 30 §M6: look a name up in the local replica.
     Read(String),
+    /// `SimConfig::reader_nodes`: a read after the client's pace.
+    PacedRead(String),
+    /// `SimConfig::client_plan`: the client starts after this many ms.
+    Delay(u64),
     /// Fix "capture under an epoch hold": write the file (a manifest
     /// naming one fresh chunk, dirty on this node).
     Write(String),
@@ -1172,6 +1217,18 @@ async fn client_thread(
             Step::Op(op) => (Some(op), None),
             Step::Write(name) => (None, Some(name)),
             Step::Read(name) => {
+                let handle = cluster.get(node);
+                if handle.alive() {
+                    client_read(&handle, &history, thread, name, wait, strict).await;
+                }
+                continue;
+            }
+            Step::Delay(ms) => {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                continue;
+            }
+            Step::PacedRead(name) => {
+                tokio::time::sleep(Duration::from_millis(pace_ms)).await;
                 let handle = cluster.get(node);
                 if handle.alive() {
                     client_read(&handle, &history, thread, name, wait, strict).await;
@@ -1392,6 +1449,18 @@ fn gen_ops_unique(
                     b = pool[(pool.iter().position(|x| *x == a).unwrap() + 1) % pool.len()].clone();
                 }
                 NsOp::Rename(a, b)
+            }
+        })
+        .collect()
+}
+
+/// `SimConfig::reader_nodes`: a read of every name `ops` would have
+/// touched.
+fn reads_only(ops: Vec<NsOp>) -> Vec<Step> {
+    ops.into_iter()
+        .map(|op| match op {
+            NsOp::Create(n) | NsOp::Unlink(n) | NsOp::Put(n) | NsOp::Rename(n, _) => {
+                Step::PacedRead(n)
             }
         })
         .collect()
@@ -2036,6 +2105,27 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bus.set_partition(lease.holder, backup, false);
         }
+        FaultKind::IsolateReader { node, for_ms } => {
+            let others: Vec<NodeId> = cluster
+                .nodes
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .filter(|n| *n != node)
+                .collect();
+            note(format!(
+                "t={} isolate reader {node} from {others:?} for {for_ms}ms",
+                fault.at_ms
+            ));
+            for o in &others {
+                cluster.env.bus.set_partition(node, *o, true);
+            }
+            tokio::time::sleep(Duration::from_millis(for_ms)).await;
+            for o in &others {
+                cluster.env.bus.set_partition(node, *o, false);
+            }
+        }
         FaultKind::CrashEpochMember { restart_ms } => {
             crash_epoch_member(&cluster, fault.at_ms, restart_ms, &note).await;
         }
@@ -2317,6 +2407,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         settle_tagged_writes: cfg.settle_tagged_writes,
         holder_beats: cfg.holder_beats,
         timers_first_after_lag: cfg.timers_first_after_lag,
+        beats_credited: cfg.beats_credited,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         deleg_lane: cfg.deleg_lane,
     };
@@ -2402,16 +2493,28 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
                     cfg.cross_ratio,
                 )
             };
+            let plan = cfg.client_plan.iter().find(|(n, _, _)| *n == node);
+            let mut ops = ops;
+            if let Some((_, _, n)) = plan {
+                ops.truncate(*n);
+            }
             let pace = rng.random_range(20..400);
             // Reads draw from their own generator, so a config without
             // reads replays exactly the schedules it had before M6.
             let mut read_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x5e55);
-            let steps = with_reads(&mut read_rng, ops, cfg.names, cfg.read_ratio);
+            let steps = if cfg.reader_nodes.contains(&node) {
+                reads_only(ops)
+            } else {
+                with_reads(&mut read_rng, ops, cfg.names, cfg.read_ratio)
+            };
             let mut write_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0xc4a1);
             let steps = with_writes(&mut write_rng, steps, cfg.chunk_writes);
             // Plan 30 §M14: locks from their own generator too.
             let mut lock_rng = StdRng::seed_from_u64(seed ^ (node << 32) ^ k ^ 0x10c5);
-            let steps = with_locks(&mut lock_rng, steps, &cfg);
+            let mut steps = with_locks(&mut lock_rng, steps, &cfg);
+            if let Some((_, start, _)) = plan {
+                steps.insert(0, Step::Delay(*start));
+            }
             clients.push(tokio::spawn(client_thread(
                 cluster.clone(),
                 history.clone(),
@@ -2851,6 +2954,17 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             }
         }
         report.stats.insert(id, n.view().stats);
+        report
+            .floor_ms
+            .extend(n.shared.floor_ms.lock().unwrap().iter().copied());
+        report.guard_rises += n
+            .shared
+            .guard_rises
+            .load(std::sync::atomic::Ordering::Relaxed);
+        report.guard_base_rises += n
+            .shared
+            .guard_base_rises
+            .load(std::sync::atomic::Ordering::Relaxed);
         report.fast_path_executed += n
             .shared
             .fast_path_executed
@@ -3216,6 +3330,18 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     }
     // Plan 30 §M8: close-to-open across nodes (see `cto.rs`); enforced
     // under `strict`, reported otherwise.
+    // Plan 43 C7-F F-a: a holder's beat guard is meant to be fixed once its
+    // takeover is over, save for what protects a lease-capped right (a
+    // subtree grace, a hold-era grant): a base that rose after a successor
+    // may have heard the lower value would let it cap its floor below what
+    // the holder waits out.
+    if report.guard_base_rises > 0 {
+        return Err(format!(
+            "a beat guard's base (floor, quarantines) rose after it was published \
+             {} time(s)\n  faults: {:?}",
+            report.guard_base_rises, report.faults
+        ));
+    }
     report.cto = super::cto::check_cto(
         &events,
         &history.ticks(),

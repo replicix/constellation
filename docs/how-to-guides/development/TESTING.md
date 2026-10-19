@@ -3190,6 +3190,14 @@ Model: `cargo test -p constellation-model --release --test locks -- --nocapture`
 (`crates/model/src/locks.rs`; counterexamples for no fencing, a grant
 before expiry plus margin under drift, failover without grace, moves
 that lose state, an outwaited delegate without grace; the design clean).
+The cto model (`crates/model/src/cto.rs`) also checks the takeover floor
+capped by the old holder's beats (plan 43 C7-F F-a): one representative run
+is in the default suite (`fast_takeover_with_beat_cap_is_clean`, 4 M states,
+~1 GB), the far-ahead/far-behind, drift and delegating-holder runs (1 GB
+and 20-40 s each; the whole `cto` binary already peaks near 23 GB) are
+`#[ignore]`d: `cargo test -p constellation-model --test cto -- --ignored
+beat_cap --test-threads=1`. The naive cap's violating traces are cheap and
+always run.
 
 Simulation: `cargo test -p constellation-authority --release` runs the
 lock configurations (`locks`, `locks-partition`, `locks-skew`,
@@ -3317,6 +3325,7 @@ Harness scenarios (the harness process is the application: it calls
 | `lock-holder-partitioned` | the lock holder cut from the owner is fenced (`EIO`) and the waiter is granted only after ttl + margin, never before the fence; the healed node locks again |
 | `lock-failover` | the holder is killed with a lock held under an M9 backup; the successor reclaims/mirrors the grant (no `EIO` for the locker), refuses the contender throughout, grants it after the unlock |
 | `lock-grace-wait` | plan 43 F-b: the holder is killed with a lock held under an M9 backup; in the successor's lock grace a non-blocking `F_SETLK` on a free file waits and is granted at the grace's end (never `EAGAIN`), one with a `SIGALRM` after 8 s ends `EINTR`, a blocking `F_SETLKW` parked at the successor is served by the grace-end timer, and the held lock is refused `EAGAIN` at once afterwards; `grace_waits` is counted, `grace_wait_gave_up` is 0 |
+| `s3-cut-holder-failover-with-locks` | four nodes, `--cto strict`: the holder is cut from S3 only (P2P up, so it beats until its lease ends); its backup seals at the expiry it reads and takes over. A reader keeps a read delegation, a child process holds an exclusive lock, a writer creates files, a contender tries a non-blocking lock on a free file every 200 ms. Prints, from the cut: the takeover, the first write acknowledged and the first lock granted after it, the errnos and the successor's floor counters. Plan 43 C7-F F-a's tripwire: both come within 3 s (a margin and 2 s of slack) of the takeover, and the successor counts the floor as shortened by the cap or already past (`ack_floor_capped`, `ack_floor_capped_out`); without the cap they come 8.6 s and 23.6 s after it. No write or read fails, a lock attempt fails only with `EAGAIN` |
 | `lock-latency` | measurements: first lock from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff, and a lone node under `cluster` against `local` |
 | `lock-holder-killed-contention` | four nodes increment one `flock`ed counter (read, add, write, `fsync`); the holder is `kill -9`'d with the lock held. The survivors stall only until its grant is outwaited (ttl + margin, never less than its remaining life), hand the lock on with no further outwait (the owner's `recalls_expired` is 1), and the count is exact. Then a node killed while parked first in line costs the next waiter nothing (granted within milliseconds of the unlock, not ttl + margin later) |
 | `lock-fence-at-close` | B writes under a lock and is cut from the owner past its grant; C takes the lock and writes. B's close returns `EIO` (`fcntl` closed while still locked; `flock` unlocked first, then closed), and the file holds C's data on every node |
@@ -4146,8 +4155,38 @@ off, no strict mounts: the second seal comes while the first successor is
 still inside the floor it inherited and has granted nothing itself), whose
 `a_second_seal_inside_the_grace_waits_out_the_first_holders_grants` fails
 without the inherited mark (seed 548). `AUTHORITY_SIM_CONFIG=double-seal-inside-the-grace`
-replays it, and the sweep summary prints `SWEEP-FLOORS` (takeovers, seals,
-floors armed). Every
+replays it. Plan 43 C7-F F-a, the floor's cap by the old holder's
+heartbeat: `SimConfig::holder_beats` (the daemon's off-core beat; most
+older configurations model none, so their floors are the bound and the cap
+is inert: `AUTHORITY_SIM_BEATS=thread` on `sweep_config` runs any of them
+with beats on), `fast-takeover-skewed-successor` now with beats on a
+thread (`-nobeats` is the C7-H2 configuration as it was),
+`fast-takeover-skewed-holder` (the holder's clock 4 s ahead; one failover only: with a second, node 1 ahead of the new holder claims its live lease by TTL, plan 43 C7b),
+`locks-s3-cut-holder-alive` (the holder cut from S3 only and beating to the
+end of its lease: the successor's floor ends about a margin after it;
+`an_s3_cut_holder_that_beats_on_costs_its_successor_about_a_margin`), and
+`SimConfig::beats_credited`, the negative control behind
+`fast-takeover-skewed-successor-credited` (the cap counted from the beat's
+credit, an instant of the holder's clock: `a_credited_arrival_cap_splits`
+pins the seeds 194557 and 194714 that violate mutual exclusion with it and
+pass without; it fails only 2 of 2 000 seeds, so the strict-side control
+below is the one that carries weight). The strict side of the floor has its
+own configurations: `strict-isolated-reader` (node 3, whose clients only
+read, `SimConfig::reader_nodes`, is cut from the others and from S3 with a
+read delegation from the holder, `FaultKind::IsolateReader` and `CutS3`;
+node 1 writes only at the start and node 2, the backup, only after the
+crash: `SimConfig::client_plan`), `-beats` (the holder's beat on: the cap in
+play) and `-skewed` (node 2's clock 4 s ahead), with
+`strict-isolated-reader-skewed-credited` the credited control
+(`a_credited_arrival_cap_splits_on_the_strict_side`). Without any floor
+these fail on a sixth of the seeds (a build that returns early from
+`note_marker_landed` shows it: PROGRESS has the counts). `sweep_config`
+prints `SWEEP-FLOORS`: takeovers, floors armed, shortened and already past,
+the floor length distribution and the beat guards that rose after being
+published (those whose *base* rose are failures: `run_seed` fails the seed).
+`AUTHORITY_SIM_CONFIG=fast-takeover-skewed-holder`, `locks-s3-cut-holder-alive`
+and `-successor-nobeats` also run in `long_locks`.
+Every
 run checks close-to-open across nodes (`tests/sim/cto.rs`: a read
 invoked after another node's write returned `Ok` must be explained by
 that write's state or a later one, with the log as the version order),

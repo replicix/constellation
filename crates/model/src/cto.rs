@@ -158,6 +158,29 @@
 //!   lease's `M > 2D` again. A tenure that never served a strict read
 //!   (`marked == false`) costs its successor nothing.
 //!
+//! # Plan 43 C7-F F-a: the floor capped by the old holder's beats
+//!
+//! With `beat_cap` the old holder (any node holding its lease, while its
+//! clock is below the expiry: its beats stop there) may send a beat
+//! (`Beat(h, b)`) to a node `b`, which records what it says on its own
+//! clock: the smallest `local(b) − local(h)` over the beats (the arrival
+//! minus the send: the code's `at − sent`, never the credit, which is an
+//! instant of the holder's clock), the highest expiry they named and the
+//! highest guard (the holder's own floor, if it has one: the code's
+//! `Beat::guard_unix_ms`; the model's holder has no takeover gate, so the
+//! unknown guard never arises here). A takeover of the holder whose
+//! beats `b` heard (same holder and epoch) ends its floor at
+//! `min(bound, X + lag + seq_margin)`, `X = max(old expiry, named,
+//! guard)`; none if that has passed. The code takes only beats sent
+//! within `250·M` of `X`, so that the rate error stays under `M/2`; the
+//! model has no rates, only offsets and steps within `max_offset`, and
+//! margins above `2D`, so it needs no span. A beat is delivered at once
+//! here: a later delivery makes the lag larger, hence the floor longer.
+//! `beat_cap_from_named_expiry` is the naive variant (`X` = what the
+//! beats named, ignoring the lease the takeover replaced: a holder that
+//! renews after its last beat is then outlived), and must be found
+//! violating.
+//!
 //! `tests/cto.rs` shows each rule is load-bearing (a fast takeover
 //! without the floor, and with the floor but without the probe, both
 //! violate close-to-open) and that with both the design is clean,
@@ -237,6 +260,12 @@ pub struct CtoModel {
     /// `inherits_duty`). Off, a tenure sealed inside its floor before it
     /// served a strict read leaves its successor no floor.
     pub inherit_mark: bool,
+    // ---- plan 43 C7-F F-a ----
+    /// A successor's floor is capped by what the old holder's beats say
+    /// of its lease.
+    pub beat_cap: bool,
+    /// The naive cap: `X` is only what the beats named. Must violate.
+    pub beat_cap_from_named_expiry: bool,
 }
 
 impl CtoModel {
@@ -273,6 +302,8 @@ impl CtoModel {
             takeover_window: 2,
             mark_at_takeover: true,
             inherit_mark: true,
+            beat_cap: false,
+            beat_cap_from_named_expiry: false,
         }
     }
 
@@ -381,6 +412,21 @@ pub struct Node {
     /// and the writes held until it passes.
     pub ack_floor: Option<i16>,
     pub floor_held: Vec<(u8, u8)>,
+    /// Plan 43 C7-F F-a: what this node heard of one holder's beats.
+    pub heard: Option<Heard>,
+}
+
+/// What a node heard of the beats of `holder` at `epoch` (`beat_cap`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Heard {
+    pub holder: u8,
+    pub epoch: u8,
+    /// The smallest `arrival − send` over the beats, each on its own
+    /// clock (the heard node's minus the holder's).
+    pub lag: i16,
+    /// The highest expiry named, and the highest guard named (0: none).
+    pub named: i16,
+    pub guard: i16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -418,13 +464,18 @@ pub enum Msg {
 }
 
 /// Ghost bits for the `sometimes` (non-vacuity) properties.
-pub const SAW_DELEG_READ: u8 = 1;
-pub const SAW_RECALL_ACK: u8 = 2;
-pub const SAW_RECALL_EXPIRED: u8 = 4;
-pub const SAW_TAKEOVER: u8 = 8;
-pub const SAW_READINDEX_READ: u8 = 16;
-pub const SAW_FAST_TAKEOVER: u8 = 32;
-pub const SAW_FLOOR_WAIT: u8 = 64;
+pub const SAW_DELEG_READ: u16 = 1;
+pub const SAW_RECALL_ACK: u16 = 2;
+pub const SAW_RECALL_EXPIRED: u16 = 4;
+pub const SAW_TAKEOVER: u16 = 8;
+pub const SAW_READINDEX_READ: u16 = 16;
+pub const SAW_FAST_TAKEOVER: u16 = 32;
+pub const SAW_FLOOR_WAIT: u16 = 64;
+pub const SAW_FLOOR_CAPPED: u16 = 128;
+/// A floor was armed with a cap computed from heard beats, whether or not
+/// it ended the floor before the bound (the far-ahead successor's cap is
+/// later than the bound: it stands).
+pub const SAW_CAP_COMPUTED: u16 = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -442,7 +493,7 @@ pub struct State {
     /// A read returned less than its `must`: `(node, must, got)`.
     pub violation: Option<(u8, u8, u8)>,
     pub next_id: u8,
-    pub saw: u8,
+    pub saw: u16,
 }
 
 impl State {
@@ -622,6 +673,8 @@ pub enum Action {
     /// Plan 30 §M9: successor `h`'s acknowledgement floor passed (by its
     /// clock): the writes held for it are acknowledged.
     FloorPassed(u8),
+    /// Plan 43 C7-F F-a: holder `h` beats to `b` (`beat_cap`).
+    Beat(u8, u8),
 }
 
 impl Model for CtoModel {
@@ -660,6 +713,7 @@ impl Model for CtoModel {
                         last_probe: 0,
                         ack_floor: None,
                         floor_held: Vec::new(),
+                        heard: None,
                     })
                     .collect();
                 let mut reg = Reg {
@@ -762,6 +816,18 @@ impl Model for CtoModel {
             }
             if node.lease.is_some() && self.fast_takeover {
                 actions.push(Action::Probe(iu));
+            }
+            // Plan 43 C7-F F-a: the holder's beats stop at its expiry.
+            if self.beat_cap {
+                if let Some((_, expires)) = node.lease {
+                    if s.local(i) < expires {
+                        for b in 0..n {
+                            if b != i {
+                                actions.push(Action::Beat(iu, b as u8));
+                            }
+                        }
+                    }
+                }
             }
             if node
                 .ack_floor
@@ -915,9 +981,58 @@ impl Model for CtoModel {
                     let bound = now + self.takeover_window + self.deleg_ttl + 2 * self.seq_margin;
                     // Not `min(prev.expires, bound)`: the old expiry is the
                     // old holder's clock (the code's floor is the bound).
-                    s.nodes[i].ack_floor = Some(bound);
-                    s.saw |= SAW_FLOOR_WAIT;
+                    //
+                    // Plan 43 C7-F F-a: capped by what the old holder's
+                    // beats say of its lease, on this node's clock (the
+                    // code's `Core::beat_cap`): none if that has passed.
+                    let cap = if self.beat_cap {
+                        s.nodes[i]
+                            .heard
+                            .filter(|h| h.holder == prev.holder && h.epoch == prev.epoch)
+                            .map(|h| {
+                                let x = if self.beat_cap_from_named_expiry {
+                                    h.named
+                                } else {
+                                    prev.expires.max(h.named).max(h.guard)
+                                };
+                                x + h.lag + self.seq_margin
+                            })
+                    } else {
+                        None
+                    };
+                    let end = cap.map_or(bound, |c| bound.min(c));
+                    if cap.is_some() {
+                        s.saw |= SAW_CAP_COMPUTED;
+                    }
+                    if end < bound {
+                        s.saw |= SAW_FLOOR_CAPPED;
+                    }
+                    if end > now {
+                        s.nodes[i].ack_floor = Some(end);
+                        s.saw |= SAW_FLOOR_WAIT;
+                    }
                 }
+            }
+            Action::Beat(h, b) => {
+                let (h, b) = (h as usize, b as usize);
+                let (epoch, expires) = s.nodes[h].lease?;
+                let lag = s.local(b) - s.local(h);
+                let guard = s.nodes[h].ack_floor.unwrap_or(0);
+                s.nodes[b].heard = Some(match s.nodes[b].heard {
+                    Some(o) if o.holder == h as u8 && o.epoch == epoch => Heard {
+                        lag: o.lag.min(lag),
+                        named: o.named.max(expires),
+                        guard: o.guard.max(guard),
+                        ..o
+                    },
+                    _ => Heard {
+                        holder: h as u8,
+                        epoch,
+                        lag,
+                        named: expires,
+                        guard,
+                    },
+                });
             }
             Action::Probe(i) => {
                 let i = i as usize;
@@ -1051,6 +1166,8 @@ impl Model for CtoModel {
                 s.saw & SAW_FAST_TAKEOVER != 0
             }),
             Property::sometimes("floor_waited", |_, s: &State| s.saw & SAW_FLOOR_WAIT != 0),
+            Property::sometimes("floor_capped", |_, s: &State| s.saw & SAW_FLOOR_CAPPED != 0),
+            Property::sometimes("cap_computed", |_, s: &State| s.saw & SAW_CAP_COMPUTED != 0),
         ]
     }
 

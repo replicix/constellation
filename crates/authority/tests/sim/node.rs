@@ -148,9 +148,27 @@ pub struct Shared {
     lag_since: Mutex<Option<tokio::time::Instant>>,
     /// What the off-core heartbeat beats to (the daemon's
     /// `AliveTargets`): the epoch and expiry of the lease this node
-    /// holds and `Core::liveness_targets`, after every event.
-    liveness: Mutex<Option<(u64, i64, Vec<NodeId>)>>,
+    /// holds, `Core::beat_guard_unix_ms` and `Core::liveness_targets`,
+    /// after every event.
+    liveness: Mutex<Option<Liveness>>,
     pub conflict_copies: AtomicU64,
+    /// Plan 43 C7-F: the length of every takeover floor this node armed
+    /// (simulated ms from the event that set it to its end), and the end
+    /// last seen.
+    pub floor_ms: Mutex<Vec<u64>>,
+    floor_seen: AtomicI64,
+    /// Plan 43 C7-F F-a: the beat guard published last, per epoch of this
+    /// node's tenure `(epoch, guard, base)`, and how many times a finite
+    /// guard rose after it had been published as a finite non-zero one (it
+    /// may rise by what protects a lease-capped right: a subtree grace, a
+    /// hold-era grant; `guard_base_rises` counts the rest, which must not).
+    /// 0 → value is the acquisition setting a quarantine, not a rise.
+    guard_seen: Mutex<(u64, i64, i64)>,
+    pub guard_rises: AtomicU64,
+    /// Rises of the guard's *base* (`Core::beat_guard_parts`: the floor and
+    /// the quarantines), which are not explained by a subtree grace or a
+    /// hold-era grant: must stay 0.
+    pub guard_base_rises: AtomicU64,
     /// Rids whose effects were rolled back at some point (see
     /// `history.rs`): read from the replay queue whenever the core's
     /// rollback counters move.
@@ -288,6 +306,8 @@ pub struct NodeEnv {
     pub holder_beats: super::run::HolderBeats,
     /// See `SimConfig::timers_first_after_lag`.
     pub timers_first_after_lag: bool,
+    /// See `SimConfig::beats_credited`.
+    pub beats_credited: bool,
     /// See `SimConfig::beats_lost_in_lag`.
     pub beats_lost_in_lag: bool,
     /// See `SimConfig::deleg_lane`.
@@ -355,6 +375,11 @@ impl NodeHandle {
             lag_since: Mutex::new(None),
             liveness: Mutex::new(None),
             conflict_copies: AtomicU64::new(0),
+            floor_ms: Mutex::new(Vec::new()),
+            floor_seen: AtomicI64::new(0),
+            guard_seen: Mutex::new((0, 0, 0)),
+            guard_rises: AtomicU64::new(0),
+            guard_base_rises: AtomicU64::new(0),
             tentative: Mutex::new(BTreeSet::new()),
             journaled_refusals: Mutex::new(BTreeSet::new()),
             commits: env.commits.clone(),
@@ -444,6 +469,9 @@ impl NodeHandle {
             lag_pending: None,
             freeze_handed: (0, 0),
             stamps_first: !env.timers_first_after_lag,
+            credit_margin: env
+                .beats_credited
+                .then(|| (env.config)(id, 1).expiry_margin_ms as i64),
             beats_lost_in_lag: env.beats_lost_in_lag,
         };
         let task = tokio::spawn(driver.run());
@@ -650,9 +678,15 @@ struct Driver {
     /// After a lag, what the daemon's P2P handlers stamped meanwhile goes
     /// to the core before the timers ([`Driver::finish_lag`]).
     stamps_first: bool,
+    /// `SimConfig::beats_credited`: the expiry margin a numbered beat's
+    /// arrival stamp is credited with.
+    credit_margin: Option<i64>,
     /// See `SimConfig::beats_lost_in_lag`.
     beats_lost_in_lag: bool,
 }
+
+/// What the off-core heartbeat beats to: `(epoch, expiry, guard, targets)`.
+type Liveness = (u64, i64, i64, Vec<NodeId>);
 
 /// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
 /// its fencing-token check and waits for the store's writer lock behind a
@@ -786,7 +820,8 @@ async fn beat_loop(
                 }
             }
         }
-        let Some((epoch, until_ms, targets)) = shared.liveness.lock().unwrap().clone() else {
+        let Some((epoch, until_ms, guard, targets)) = shared.liveness.lock().unwrap().clone()
+        else {
             continue;
         };
         let at = clock.now().0;
@@ -795,7 +830,7 @@ async fn beat_loop(
         }
         seq += 1;
         for to in targets {
-            bus.send_beat((id, to), epoch, seq, (at, until_ms));
+            bus.send_beat((id, to), epoch, seq, (at, until_ms, guard));
         }
     }
 }
@@ -1038,6 +1073,9 @@ impl Driver {
             {
                 if at.0 == 0 {
                     *at = now;
+                }
+                if let (Some(margin), true) = (self.credit_margin, *seq != 0 && sent.0 != 0) {
+                    *at = (*at).min(constellation_authority::Ms(sent.0 + margin));
                 }
                 // Answered as the daemon's P2P handler answers it, when
                 // this node gets to it: the holder hears the backup is
@@ -1388,6 +1426,7 @@ impl Driver {
                     seq: 0,
                     sent: constellation_authority::Ms(0),
                     expires: constellation_authority::Ms(expires),
+                    guard: constellation_authority::Ms(0),
                 });
             }
         }
@@ -1425,6 +1464,16 @@ impl Driver {
         view.lock_waiters = locks.waiters;
         view.lock_recalls = locks.recalls_in_flight;
         let now = self.clock.now();
+        let floor = self.core.takeover_floor_until_ms();
+        if floor != 0 && floor != self.shared.floor_seen.swap(floor, Ordering::SeqCst) {
+            self.shared
+                .floor_ms
+                .lock()
+                .unwrap()
+                .push((floor - now.0).max(0) as u64);
+        } else if floor == 0 {
+            self.shared.floor_seen.store(0, Ordering::SeqCst);
+        }
         view.claim = self.core.epoch_claim_view(now);
         view.epoch_held = lease.epoch_held();
         view.s3_held = match &lease.held {
@@ -1436,7 +1485,25 @@ impl Driver {
         let certs = self.core.deleg_renew_certs();
         let liveness = view.s3_held.map(|(epoch, until)| {
             let targets = self.core.liveness_targets().into_iter().map(|(n, _)| n);
-            (epoch, until, targets.collect())
+            let (base, protecting) = self.core.beat_guard_parts(&*self.meta);
+            let guard = base.max(protecting);
+            let mut seen = self.shared.guard_seen.lock().unwrap();
+            if seen.0 != epoch {
+                *seen = (epoch, 0, 0);
+            }
+            if guard != i64::MAX {
+                if seen.1 > 0 && guard > seen.1 {
+                    self.shared.guard_rises.fetch_add(1, Ordering::SeqCst);
+                }
+                seen.1 = guard;
+            }
+            if base != i64::MAX {
+                if seen.2 > 0 && base > seen.2 {
+                    self.shared.guard_base_rises.fetch_add(1, Ordering::SeqCst);
+                }
+                seen.2 = base;
+            }
+            (epoch, until, guard, targets.collect())
         });
         drop(view);
         *self.shared.liveness.lock().unwrap() = liveness;

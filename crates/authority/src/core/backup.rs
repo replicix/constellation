@@ -92,6 +92,86 @@
 //!   offset (`W + ttl + 2M ≥ (W + ttl − M)(1 + ρ)`). A tenure that never
 //!   served a strict read costs its successor nothing.
 //!
+//! ## The floor ends earlier when the predecessor's own beats say its lease did
+//!
+//! The bound counts from the marker whatever the predecessor did; it is
+//! the right answer for a holder that died or was cut off mid-lease, but
+//! for one cut from S3 only, which went on beating until its lease ran
+//! out, the successor (which seals at that expiry) waited the whole bound
+//! on top of the lease. [`Core::beat_cap`] takes that back. Notation: H
+//! the predecessor, S the successor, `E_h` the expiry of the lease H holds
+//! at a decision (H's clock), `M` the expiry margin.
+//! 1. *Everything S waits out is capped by H's lease.* Strict answers only
+//!    while the lease is `usable` (expiry − now > M); read delegations
+//!    (`maybe_grant`), lock grants and renewals (`lock_cap_ms`), write
+//!    delegations and their renewals (`grant_cap_ms`) end at the expiry
+//!    less M, their holders honour them from their own send less another
+//!    M, and what a delegate grants is capped by its own `until − M`. So
+//!    (with `2ρ·ttl ≤ 2M`) nothing H answered is honoured, in real time,
+//!    after H's clock reads `E_h`. Exception: under a continuation epoch's
+//!    hold the lease has no expiry, and `lock_cap_ms` and `grant_cap_ms`
+//!    cap a grant by its ttl alone; the grants kept across the re-claim
+//!    (`epoch_tenure_resumed`) can then outlast the re-claimed lease (a
+//!    lock or delegation ttl longer than the lease ttl: legal), which a fast
+//!    seal of that tenure would cap. They are in the guard
+//!    (`hold_grant_until`, step 4), so `X` covers them once a beat sent
+//!    after the grant is heard (a holder that dies within one beat interval
+//!    of its last hold-era grant, after the re-claim, is the residual). The
+//!    hold itself is never taken over fast (`epoch_may_carry`).
+//! 2. *`E_h ≤ X`.* S's CAS replaced version T, so no later write of H
+//!    landed; H adopts only versions its own PUT or read returned, all at
+//!    or before T, and along that chain the expiry only grows (renewals
+//!    write `now + ttl`, everything else copies it). So `E_h ≤
+//!    T.expires`; `X` also takes the highest expiry any beat named and the
+//!    highest guard. Exceptions: a restart of H within its epoch with a
+//!    shorter TTL (its earlier incarnation's grants are behind its restart
+//!    quarantine, which the guard names) and a backward step of H's wall
+//!    clock (C7-H1's hole, which breaks every honour-side check alike).
+//!    (The cap's own dependence on the holder's clock is step 3's.)
+//!    Counting from the *last renewal S observed* instead would be unsafe:
+//!    H's other proofs of S3 liveness (segment runs and puts, a lease
+//!    read) are invisible to S, and H answers within `W` of any of them.
+//! 3. *The beat links the clocks.* A beat says H's clock read `sent` no
+//!    later than S's clock read `at` (its arrival stamp: `sent` < real
+//!    send < real arrival ≤ `at`). H's clock reaches `X` at most
+//!    `(X − sent)(1 + ρ)/(1 − ρ)` real ms after `sent`, S's runs at least
+//!    `1 − ρ` per real ms, so S's clock reading `at + (X − sent) + M` is
+//!    after H's clock passed `X` as long as `2ρ(X − sent) < M`: beats
+//!    sent within `250·M` of `X` only (`2ρ·250·M = M/2` at ρ = 1 000 ppm).
+//!    A difference on H's clock plus a stamp of S's: rate-only, no offset,
+//!    **provided H's clock does not step forward**: a forward step `J`
+//!    lowers every later beat's `at − sent` by `J` (and the minimum keeps
+//!    it for the 64 beats retained), which moves the cap early by `J`; it
+//!    is unsafe when `J > 3M + δ` (δ the beat's delay), with H beating on
+//!    past the step and sealed mid-lease. The same class as C7-H1: H's own
+//!    grant table judges expiry on its wall clock, so such a step breaks
+//!    exclusion with or without the cap (a forward step of 2.5 s broke it in
+//!    73 of 2 000 sim seeds with the cap and with it off alike); the cap
+//!    adds a dependency on it, which C7-H1/C7a remove by stamping `sent` on
+//!    the honour clock. Not detected here (plan 43 Appendix B row 27).
+//! 4. *The guard* is what H itself waits out and its lease does not cap:
+//!    its own takeover floor (which can outlast its lease), a released
+//!    takeover's lock grace, restart quarantines, subtree graces
+//!    ([`Core::beat_guard_unix_ms`]); `i64::MAX` while its takeover gate
+//!    or a floor still to be armed is pending (the marker may be ahead,
+//!    and H's predecessor's proofs extend until then): no cap. The guard
+//!    is the *maximum* over the beats of the epoch, so one `i64::MAX` beat
+//!    disables the cap for the whole epoch (conservative; a finite guard
+//!    may rise afterwards only by what protects a lease-capped right: a
+//!    subtree grace, or the hold-era grants above).
+//! 5. The cap is `X + min(at − sent) + M`; the floor is `min(bound, cap)`,
+//!    none if the cap has passed when the marker lands. Each is sufficient
+//!    alone (the bound by the argument above, the cap by 1–4).
+//!
+//! Never the beat's *credit*, `min(at, sent + M)` (what the seal watch
+//! counts): `sent + M` is an instant of H's clock, and a successor whose
+//! clock runs ahead of H's by more than M would end its floor that much
+//! early (the sim's `fast-takeover-skewed-successor` is the control). And
+//! never the lease's expiry compared with S's clock. No beat, a beat of
+//! another holder or epoch, or none sent within `250·M` of `X`: the bound.
+//! The floor and the beats are in memory (plan 43 Appendix B rows 14 and
+//! 27): a successor that restarted waits the bound.
+//!
 //! # Continuation epochs (plan 30 §M10's claim rule, enforced here)
 //!
 //! A fast takeover cannot be gated by an epoch's promises (it happens
@@ -298,6 +378,20 @@ pub(crate) struct AckState {
     /// its marker, where the successor's floor starts (see the module
     /// doc); `false` after the floor was set or when none is due.
     pub(crate) pending_floor: bool,
+    /// Plan 43 C7-F F-a: the cap the predecessor's beats put on the
+    /// pending floor (`Core::beat_cap`, an instant of this node's clock);
+    /// `None`: no usable beats, or the predecessor's guard was unknown.
+    pending_cap: Option<Ms>,
+    /// Plan 43 C7-F F-a (review F1): the latest end, unix ms, of a lock or
+    /// delegation grant this node answered under a continuation epoch's
+    /// hold (`lock_cap_ms`, `grant_cap_ms`: capped by the ttl alone, the
+    /// lease having no expiry then). `epoch_tenure_resumed` keeps those
+    /// grants across the re-claim, whose lease may end before them when a
+    /// ttl is longer than the lease's: the beat's guard names it, so a
+    /// fast successor's cap never ends before them. Recorded by the cap
+    /// functions on every query under a hold (an upper bound: a query may
+    /// not end in a grant).
+    pub(crate) hold_grant_until: std::sync::atomic::AtomicI64,
     /// Where this tenure's takeover floor ends (the later of its
     /// acknowledgement floor and its lock grace, `note_marker_landed`),
     /// 0 for a tenure with none: the lease is not idle-released before it
@@ -345,6 +439,14 @@ pub(crate) struct AckState {
     acked_hwm: u64,
     /// The last candidacy handed out (`BackupPeer::candidacy`).
     last_candidacy: u64,
+}
+
+impl AckState {
+    /// A grant made under an epoch hold ends by `until` (`hold_grant_until`).
+    pub(crate) fn note_hold_grant(&self, until: i64) {
+        self.hold_grant_until
+            .fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// This node as a backup, and as a pre-S3 stream subscriber.
@@ -471,12 +573,33 @@ pub(crate) struct HolderBeats {
     /// The latest expiry of the holder's lease its beats at `epoch` named
     /// (0: none heard): they stop there.
     pub(crate) expires: Ms,
+    /// Plan 43 C7-F F-a: what the numbered beats of `epoch` say of where
+    /// the holder's lease ends on *this* node's clock, for the cap of a
+    /// fast takeover's floor ([`Core::beat_cap`]): `(sent, at − sent)` of
+    /// the latest [`BEAT_LAGS_KEPT`] beats, `at` being the arrival as this
+    /// node stamped it, never the credit the seal watch counts
+    /// (`min(at, sent + M)` is an instant of the holder's clock).
+    pub(crate) lags: std::collections::VecDeque<(Ms, i64)>,
+    /// The highest expiry and the highest guard those beats named (the
+    /// guard `i64::MAX`: unknown, the holder's takeover gate was pending,
+    /// which gives no cap for the epoch).
+    pub(crate) named_max: i64,
+    pub(crate) guard_max: i64,
     /// Beats that came late lately, `(arrival, ms late)`, oldest first:
     /// later than one interval after the previous one, as sent (the
     /// holder's process was held up) or as heard (held up on the way, or
     /// by this node's own runtime), by at least the lag threshold.
     late: std::collections::VecDeque<(Ms, i64)>,
 }
+
+/// How many beats' `(sent, at − sent)` a [`HolderBeats`] keeps for the cap
+/// of a fast takeover's floor (about 19 s of beats at the default
+/// interval; the cap needs only the recent ones).
+const BEAT_LAGS_KEPT: usize = 64;
+
+/// How many expiry margins before the instant a cap counts to a beat may
+/// have been sent to be used for it (`2ρ·250·M ≤ M/2` at ρ = 1 000 ppm).
+const BEAT_CAP_SPAN_MARGINS: i64 = 250;
 
 /// How many early `StreamAhead` batches a subscriber keeps.
 const AHEAD_WAITING_MAX: usize = 32;
@@ -956,13 +1079,96 @@ impl Core {
     /// not expired, or this node's clock cannot tell). Once the marker
     /// lands, the successor's acknowledgements wait out the predecessor's
     /// strict-read horizon — unless that tenure never served one. The
-    /// predecessor's lease expiry plays no part in the wait
-    /// (`note_marker_landed`).
-    pub(crate) fn note_fast_takeover(&mut self, prev: &Lease) {
+    /// predecessor's lease expiry plays no part in the wait on its own
+    /// (`note_marker_landed`); `cap` is the end of that lease as the
+    /// predecessor's own heartbeat places it on this node's clock
+    /// ([`Core::beat_cap`]), which ends the wait earlier when it is.
+    pub(crate) fn note_fast_takeover(&mut self, prev: &Lease, cap: Option<Ms>) {
         // Plan 41 L0: a predecessor's generations are outwaited the
         // takeover window longer (`DelegationState::inherit_slack_ms`).
         self.dl.inherit_slack_ms = self.cfg.backup_takeover_ms;
         self.ack.pending_floor = prev.granted_delegations;
+        self.ack.pending_cap = cap.filter(|_| prev.granted_delegations);
+    }
+
+    /// Plan 43 C7-F F-a: where the lease of `prev`'s tenure ends on this
+    /// node's clock, as that tenure's beats at `prev.epoch` placed it, plus
+    /// one expiry margin (see the module doc, "The delegation horizon
+    /// across a fast failover"): `X + min(at − sent) + M`, with `X` the
+    /// latest of the replaced lease's expiry, the expiries the beats named
+    /// and the guards they named, over the beats sent within
+    /// `250·M` of `X` (so the rate error `2ρ·(X − sent)` stays under
+    /// `M/2`). `None`: no beat of that tenure heard, none that recent, or
+    /// one named an unknown guard (the holder's own takeover gate was
+    /// pending: what it waited out was not known yet).
+    ///
+    /// `at` is the arrival as this node stamped it. The seal watch counts
+    /// a beat's *credit*, `min(at, sent + M)`, which is an instant of the
+    /// holder's clock: used here, a holder whose clock is behind this
+    /// node's by more than M ends the floor that much early (the sim's
+    /// `fast-takeover-skewed-successor`).
+    pub(crate) fn beat_cap(&self, prev: &Lease) -> Option<Ms> {
+        let b = self
+            .bk
+            .beats
+            .get(&prev.holder)
+            .filter(|b| b.epoch == prev.epoch)?;
+        if b.guard_max == i64::MAX {
+            return None;
+        }
+        let margin = self.cfg.expiry_margin_ms as i64;
+        let x = prev.expires_unix_ms.max(b.named_max).max(b.guard_max);
+        let span = BEAT_CAP_SPAN_MARGINS.saturating_mul(margin);
+        let lag = b
+            .lags
+            .iter()
+            // A beat sent after `x` cannot be (they stop at the expiry):
+            // a clock that stepped, not evidence; left out, which only
+            // lengthens the floor.
+            .filter(|(sent, _)| (0..=span).contains(&x.saturating_sub(sent.0)))
+            .map(|(_, lag)| *lag)
+            .min()?;
+        Some(Ms(x.saturating_add(lag).saturating_add(margin)))
+    }
+
+    /// Plan 43 C7-F F-a: what this node, as the holder, waits out that its
+    /// lease does not cap, on its own clock, for its beats to name
+    /// ([`constellation_net::Beat::guard_unix_ms`]; 0: none): its takeover
+    /// floor (it can outlast the lease: the lock floor of a 20 s lease),
+    /// its read and lock quarantines (a restart's, a released takeover's),
+    /// its subtree graces and the grants it made under a continuation
+    /// epoch's hold (`hold_grant_until`). `i64::MAX` while its takeover gate or a
+    /// floor still to be armed is pending: the marker may be ahead of it,
+    /// and its own predecessor's proofs extend until then, so the floor
+    /// is not known yet and a successor must not cap its own.
+    pub fn beat_guard_unix_ms(&self, replica: &dyn Replica) -> i64 {
+        let (base, protecting) = self.beat_guard_parts(replica);
+        base.max(protecting)
+    }
+
+    /// The guard in two parts, `(base, protecting)`: the base (its own
+    /// floor, the read and lock quarantines; `i64::MAX` while the gate or a
+    /// floor due is pending) is set when the tenure takes over and is
+    /// meant not to rise once published; `protecting` (the subtree graces
+    /// and the grants made under an epoch hold) may rise later, by what
+    /// protects a lease-capped right: a delegate outwaited after the beat
+    /// last named the guard granted under its own `until`, which the root's
+    /// lease caps. The simulator asserts the base never rises.
+    pub fn beat_guard_parts(&self, replica: &dyn Replica) -> (i64, i64) {
+        if self.lease.gate.is_some() || self.ack.pending_floor {
+            return (i64::MAX, 0);
+        }
+        let base = self
+            .ack
+            .floor_until
+            .max(replica.read_delegations().quarantine_until())
+            .max(replica.locks().quarantine_until());
+        let protecting = self
+            .ack
+            .hold_grant_until
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(self.lock_grace_until_ms());
+        (base, protecting)
     }
 
     /// This tenure is inside its takeover floor (`note_marker_landed`).
@@ -997,6 +1203,7 @@ impl Core {
     /// tables' quarantines run on).
     pub(crate) fn end_takeover_floor(&mut self) {
         self.ack.pending_floor = false;
+        self.ack.pending_cap = None;
         self.ack.floor_until = 0;
     }
 
@@ -1010,11 +1217,14 @@ impl Core {
         // The predecessor's expiry is a stamp of its own clock: compared
         // with this node's it is offset-dependent (a successor ahead by
         // more than the remaining lease would read it as past and wait
-        // for nothing), so the floor is the bound alone, which counts
-        // only this node's own elapsed time.
+        // for nothing), so the floor is the bound, which counts only this
+        // node's own elapsed time — or, if earlier, the cap its own beats
+        // put on its lease (`beat_cap`: a difference on the holder's clock
+        // added to the beat's arrival stamp on this node's).
         if !std::mem::take(&mut self.ack.pending_floor) {
             return;
         }
+        let cap = self.ack.pending_cap.take().map(|c| c.0);
         // Plan 30 §M11 phase 2b: a tenure with live write delegations
         // has grants (and, under them, read grants a delegate gave)
         // that its successor cannot see renewed; one constant covers
@@ -1031,31 +1241,65 @@ impl Core {
                 + deleg
                 + 2 * self.cfg.expiry_margin_ms as i64
         };
+        let capped = |bound: i64| cap.map_or(bound, |c| bound.min(c));
         // Plan 30 §M14: lock grants are capped like read delegations and
         // marked the same way, but only new lock grants wait for them —
         // a lock grant still honoured elsewhere does not make an
         // acknowledgement stale — so their (longer) ttl is a quarantine
         // of the lock table's own.
-        let locks_until = bound(self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms));
-        if self.cfg.locks {
-            replica.locks().set_quarantine(locks_until);
-        }
-        let until = bound(self.cfg.read_delegation_ttl_ms);
-        self.ack.floor_until = if self.cfg.locks {
+        let locks_bound = bound(self.cfg.read_delegation_ttl_ms.max(self.cfg.lock_ttl_ms));
+        let locks_until = capped(locks_bound);
+        let bound_until = bound(self.cfg.read_delegation_ttl_ms);
+        let until = capped(bound_until);
+        let floor_bound = if self.cfg.locks {
+            locks_bound.max(bound_until)
+        } else {
+            bound_until
+        };
+        let floor_end = if self.cfg.locks {
             locks_until.max(until)
         } else {
             until
         };
+        if floor_end <= now.0 {
+            // The predecessor's lease, as its beats placed it, ended
+            // before this marker landed: everything it granted is
+            // lapsed, and no floor remains.
+            self.ack.floor_until = 0;
+            self.stats.ack_floor_capped_out += 1;
+            tracing::info!(
+                node = self.cfg.node_id,
+                bound_ms = floor_bound - now.0,
+                cap_ms = floor_end - now.0,
+                "took a lease over by seal or ack=s3 from a tenure that served strict \
+                 reads or locks; its lease, as its beats placed it, has ended: no floor"
+            );
+            return;
+        }
+        if self.cfg.locks && locks_until > now.0 {
+            replica.locks().set_quarantine(locks_until);
+        }
+        self.ack.floor_until = floor_end;
         self.stats.ack_floor_waits += 1;
+        let capped_by = floor_bound - floor_end;
+        if capped_by > 0 {
+            self.stats.ack_floor_capped += 1;
+            self.stats.ack_floor_cap_saved_ms += capped_by as u64;
+        }
         tracing::info!(
             node = self.cfg.node_id,
-            wait_ms = until - now.0,
+            wait_ms = until.max(now.0) - now.0,
+            lock_wait_ms = locks_until.max(now.0) - now.0,
+            bound_ms = bound_until - now.0,
+            capped = capped_by > 0,
             "took a lease over by seal or ack=s3 from a tenure that served strict \
              reads or locks; acknowledging no mutation until its delegation \
              horizon has passed"
         );
-        replica.read_delegations().set_quarantine(until);
-        self.arm_grant_quarantine(Ms(until), out);
+        if until > now.0 {
+            replica.read_delegations().set_quarantine(until);
+            self.arm_grant_quarantine(Ms(until), out);
+        }
     }
 
     // ------------------------------------------------------ holder side
@@ -2342,7 +2586,7 @@ impl Core {
         epoch: Epoch,
         candidacy: u64,
         listed: bool,
-        (at, seq, sent, expires): (Ms, u64, Ms, Ms),
+        (at, seq, sent, expires, guard): (Ms, u64, Ms, Ms, Ms),
         replica: &dyn Replica,
     ) {
         // A numbered beat is credited no later than its send plus the
@@ -2361,7 +2605,7 @@ impl Core {
             at
         };
         if listed {
-            self.note_beat(from, epoch, (at, at_credit), (seq, sent, expires));
+            self.note_beat(from, epoch, (at, at_credit), (seq, sent, expires, guard));
         }
         let at = at_credit;
         let Some(role) = self.bk.role else {
@@ -2403,12 +2647,15 @@ impl Core {
     /// numbered beat; it carries the expiry the beat named, if it was
     /// one, and nothing to tell its lateness by): its arrival, the lease
     /// expiry it names, and whether it came late ([`HolderBeats::late`]).
+    /// A numbered beat also records what it says of the holder's lease on
+    /// this node's clock (`lags`, with the raw `at`: see
+    /// [`Core::beat_cap`]) and the guard it names.
     fn note_beat(
         &mut self,
         from: NodeId,
         epoch: Epoch,
         (at, credit): (Ms, Ms),
-        (seq, sent, expires): (u64, Ms, Ms),
+        (seq, sent, expires, guard): (u64, Ms, Ms, Ms),
     ) {
         let interval = self.cfg.backup_heartbeat_ms as i64;
         let threshold = self.lag_threshold_ms();
@@ -2430,6 +2677,14 @@ impl Core {
         }
         if seq == 0 {
             return;
+        }
+        if sent.0 != 0 {
+            if b.lags.len() >= BEAT_LAGS_KEPT {
+                b.lags.pop_front();
+            }
+            b.lags.push_back((sent, at.0.saturating_sub(sent.0)));
+            b.named_max = b.named_max.max(expires.0);
+            b.guard_max = b.guard_max.max(guard.0);
         }
         match b.last {
             Some((last_seq, last_sent, last_at)) if seq > last_seq => {
@@ -2475,6 +2730,9 @@ impl Core {
             b.heard_at = credit;
             b.last = None;
             b.expires = Ms(0);
+            b.lags.clear();
+            b.named_max = 0;
+            b.guard_max = 0;
         }
         b.heard_at = b.heard_at.max(credit);
         Some(b)
