@@ -2018,6 +2018,14 @@ mod tests {
             .flatten()
             .expect("the memfd's number");
         let fd = parse_log_tail_env(&fd, std::process::id()).expect("our fd");
+        // The memfd's identity, to tell it from whatever other test takes its
+        // number once it is closed (tests run in parallel in one process).
+        let ident = |fd: i32| {
+            // SAFETY: fstat into a zeroed stat; a closed fd just fails.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev, st.st_ino))
+        };
+        let memfd = ident(fd).expect("the memfd is open");
         assert_eq!(parse_log_tail_env(&format!("{fd}:1"), 2), None);
         assert_eq!(parse_log_tail_env("7", 2), None);
         assert_eq!(Some(fd), log.tail_fd);
@@ -2048,8 +2056,9 @@ mod tests {
         // The exec failed: the memfd is closed, the writer goes on, and the
         // sink gets everything, once.
         log.abort(|| buffer.unfreeze());
-        // SAFETY: querying a descriptor that must be closed now.
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        // The memfd is closed now: its number is either free or already
+        // another test's descriptor, never still this memfd.
+        assert_ne!(ident(fd), Some(memfd), "the memfd is still open");
         open(&gate);
         assert!(buffer.flush(Duration::from_secs(5)).complete);
         assert_eq!(
