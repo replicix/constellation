@@ -468,6 +468,9 @@ impl Process for LinuxProcess {
         use std::os::unix::process::CommandExt;
         // SAFETY: only async-signal-safe calls (prctl, getppid, _exit) run
         // in the forked child before exec.
+        // No log call in this closure (plan 44 §4.4): it runs in the forked
+        // child, where the log mutex another thread of the daemon held at the
+        // fork stays locked for good.
         unsafe {
             let parent = libc::getpid();
             cmd.pre_exec(move || {

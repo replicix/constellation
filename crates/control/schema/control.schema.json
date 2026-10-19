@@ -4535,6 +4535,142 @@
       ],
       "type": "object"
     },
+    "LogFlushParams": {
+      "description": "`node.logs.flush`: wait until every line logged before the call has been\nwritten to the log's sink, up to `within_ms` (capped at 10 000).",
+      "properties": {
+        "within_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "LogFlushReport": {
+      "description": "`node.logs.flush`'s result.",
+      "properties": {
+        "complete": {
+          "description": "Every line logged before the call is in the sink.",
+          "type": "boolean"
+        },
+        "dropped_lines": {
+          "description": "The daemon's `log.dropped_lines` at that moment.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unwritten_lines": {
+          "description": "Lines still waiting when the call gave up.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "complete",
+        "unwritten_lines",
+        "dropped_lines"
+      ],
+      "type": "object"
+    },
+    "LogStatus": {
+      "description": "The daemon's log writer (plan 44): one queue between every logging\nthread and the log's sink (`daemon.log`, a container's pipe), drained by\na writer thread. A thread that logs never waits for the sink; when the\nqueue is full the incoming line is dropped and counted, and the log\nitself says where lines are missing (a `log lines dropped` line).",
+      "properties": {
+        "drop_episodes": {
+          "description": "Separate runs of drops; each ends with one `log lines dropped` line\nin the log.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped_bytes": {
+          "description": "The bytes of those lines.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dropped_lines": {
+          "description": "Lines dropped because the queue was full. Nonzero: the log is\nmissing lines (the ring `node.logs.tail` reads still has the recent\nones), and the disk or pipe under the log stalled for longer than\nthe queue holds. The daemon itself was not slowed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limit_bytes": {
+          "description": "The queue's bound in bytes (0 in `sync` mode).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "longest_write_ms": {
+          "description": "The longest single write to the sink since the daemon started, in\nmilliseconds. Seconds here mean the disk under the log stalled at\nsome point, whether or not lines were dropped.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "description": "`queue` (the default for a daemon), or `sync`: the writer thread is\nnot running, a slow log sink stalls the threads that log\n(`CONSTELLATION_LOG_QUEUE_BYTES=0`, for measurements only).",
+          "type": "string"
+        },
+        "queued_bytes": {
+          "description": "Bytes waiting for the sink or in a write to it now, counted with\ntheir per-line overhead against `limit_bytes`. Near the limit: the\nsink is behind and lines are about to be, or are being, dropped.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queued_bytes_max": {
+          "description": "The most `queued_bytes` has been. A value near `limit_bytes` means\nthe sink fell far behind at some point.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queued_lines": {
+          "description": "Lines waiting for the sink or in a write to it now.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sink_errors": {
+          "description": "Writes to the sink that failed (`ENOSPC`, `EIO`, a closed pipe);\ntheir lines are lost.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unwritten_at_previous_exec": {
+          "description": "Lines the previous image left unwritten when it handed this daemon\nover (its log sink was stalled at the `exec`); 0 normally.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "writing_for_ms": {
+          "description": "How long the write to the sink in progress has been running, in\nmilliseconds; 0 when none is. Growing without end: the sink is\nwedged.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "written_lines": {
+          "description": "Lines the writer is done with (written, or failed: see\n`sink_errors`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "limit_bytes",
+        "queued_bytes",
+        "queued_bytes_max",
+        "queued_lines",
+        "written_lines",
+        "dropped_lines",
+        "dropped_bytes",
+        "drop_episodes",
+        "longest_write_ms",
+        "writing_for_ms",
+        "sink_errors",
+        "unwritten_at_previous_exec"
+      ],
+      "type": "object"
+    },
     "LogStreamStatus": {
       "description": "Plan 30 §M7: the direct log stream.",
       "properties": {
@@ -8580,6 +8716,10 @@
           "$ref": "#/$defs/LockStatus",
           "description": "Plan 30 §M14: `--locks` and cross-node lock grants."
         },
+        "log": {
+          "$ref": "#/$defs/LogStatus",
+          "description": "Plan 44: the daemon's log writer. Logging never blocks a daemon\nthread; what the log sink could not keep up with is counted here."
+        },
         "log_stream": {
           "$ref": "#/$defs/LogStreamStatus",
           "description": "Plan 30 §M7: the direct log stream (this node's subscription to\nthe holder, or the subscribers it serves as the holder)."
@@ -8729,7 +8869,8 @@
         "s3",
         "vfs_ops",
         "fuse",
-        "clock"
+        "clock",
+        "log"
       ],
       "type": "object"
     },
@@ -9897,6 +10038,17 @@
       },
       "result": {
         "$ref": "#/$defs/LifecycleReport"
+      },
+      "streaming": "none"
+    },
+    "node.logs.flush": {
+      "min_role": "viewer",
+      "mutating": false,
+      "params": {
+        "$ref": "#/$defs/LogFlushParams"
+      },
+      "result": {
+        "$ref": "#/$defs/LogFlushReport"
       },
       "streaming": "none"
     },

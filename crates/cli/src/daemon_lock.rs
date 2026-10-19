@@ -954,6 +954,9 @@ mod tests {
             let mut cmd = std::process::Command::new("true");
             // SAFETY: only async-signal-safe calls (`write`, `usleep`)
             // between the fork and the exec.
+            // No log call in this closure (plan 44 §4.4): it runs in the forked
+            // child, where the log mutex another thread of the daemon held at the
+            // fork stays locked for good.
             unsafe {
                 cmd.pre_exec(move || {
                     libc::write(wfd_raw, b"x".as_ptr().cast(), 1);

@@ -954,7 +954,7 @@ tail is a note, not a violation; no logger process for now.
 
 - [x] W1: the queue, the reserve, the summary line, the flush, the fault
       point; unit tests 7.1.1-7.1.9 with their naive arms.
-- [ ] W2: the daemons start the writer after the fork; exit, exec, abort
+- [x] W2: the daemons start the writer after the fork; exit, exec, abort
       and panic paths flush or queue as §4.4; status `log`,
       `node.logs.flush`, metrics, schema re-blessed; tests 7.2.
 - [ ] W3: the harness's 128 MiB, `check_blind` and the watch on drops,

@@ -2333,6 +2333,7 @@ fn stub_router() -> Router {
         NodeSetWriteMode,
         NodeDoctor,
         NodeOps,
+        NodeLogsFlush,
         NodeHandoff,
         NodeLifecycle,
         PinAdd,

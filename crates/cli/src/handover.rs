@@ -532,6 +532,63 @@ fn exec_with(binary: &Path, handoff: &DaemonHandoff) -> std::io::Error {
     }
 }
 
+/// How long the old image waits for its log to reach the sink before the
+/// `exec`. The handover's gap is application-visible latency: a stalled sink
+/// may add at most this, and what it did not take is reported by the new
+/// image ([`UNWRITTEN_AT_EXEC_ENV`]).
+const EXEC_LOG_FLUSH: Duration = Duration::from_millis(200);
+
+/// How long an upgrade waits, before it detaches the views, for the log to
+/// reach its sink (see [`drain_log_before_detach`]).
+const UPGRADE_LOG_DRAIN: Duration = Duration::from_secs(2);
+
+/// Give the log `drain` (bounded to [`UPGRADE_LOG_DRAIN`]) before the views
+/// are detached: the application-visible gap does not include it.
+fn drain_log_before_detach(drain: impl FnOnce(Duration) -> crate::log_buffer::Flush) {
+    let _ = drain(UPGRADE_LOG_DRAIN);
+}
+
+/// Set by [`before_exec`] on the new image's environment: how many log lines
+/// the old image's writer had not written when it gave up waiting. The new
+/// image (`resume_main`) keeps it in `status`'s
+/// `log.unwritten_at_previous_exec` and logs one WARN. Not in the handoff:
+/// that format is not touched by plan 44.
+const UNWRITTEN_AT_EXEC_ENV: &str = "CONSTELLATION_LOG_UNWRITTEN_AT_EXEC";
+
+/// Right before an `exec`: give the log `flush` (bounded to
+/// [`EXEC_LOG_FLUSH`]) to reach its sink, so the line that says what is
+/// being done is in the file before the image is replaced, and tell the new
+/// image what was left. The writer thread dies with the image; a line it had
+/// not written is lost, loudly (the new image's warning).
+fn before_exec(
+    command: &mut std::process::Command,
+    flush: impl FnOnce(Duration) -> crate::log_buffer::Flush,
+) {
+    let flushed = flush(EXEC_LOG_FLUSH);
+    if flushed.complete {
+        // This process's own environment may carry the previous image's.
+        command.env_remove(UNWRITTEN_AT_EXEC_ENV);
+    } else {
+        command.env(UNWRITTEN_AT_EXEC_ENV, flushed.unwritten_lines.to_string());
+    }
+}
+
+/// `resume_main`'s side of [`before_exec`].
+fn note_unwritten_at_previous_exec(value: Option<&str>) {
+    let Some(lines) = value.and_then(|v| v.parse::<u64>().ok()).filter(|n| *n > 0) else {
+        return;
+    };
+    // Counted as dropped (status, /metrics) with a summary line, where the log
+    // checks look; the warning says what the number is.
+    crate::log_buffer::note_unwritten_at_exec(lines);
+    tracing::warn!(
+        lines,
+        "the previous image's log writer stopped waiting at its exec with {lines} line(s) unwritten \
+         (its log sink was stalled); counted as dropped. The count is taken when it stopped \
+         waiting: lines it logged afterwards are not in it, and its last write may have taken some"
+    );
+}
+
 /// `exec` `binary` with `body` as its handoff, every descriptor it names
 /// already inheritable; returns only on failure.
 fn exec_body(binary: &Path, body: &[u8]) -> std::io::Error {
@@ -539,10 +596,12 @@ fn exec_body(binary: &Path, body: &[u8]) -> std::io::Error {
         Ok(fd) => fd,
         Err(e) => return e,
     };
-    let err = std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    command
         .arg0("constellation")
-        .args(["daemon", "--resume-from", &memfd.to_string()])
-        .exec();
+        .args(["daemon", "--resume-from", &memfd.to_string()]);
+    before_exec(&mut command, crate::log_buffer::flush_process);
+    let err = command.exec();
     // SAFETY: ours; the exec did not happen.
     drop(unsafe { OwnedFd::from_raw_fd(memfd) });
     err
@@ -740,6 +799,13 @@ pub fn upgrade(node: &Arc<NodeRuntime>, binary: Option<&Path>) -> Result<String,
         Some(binary) => binary,
         None => return Err(state.fail("the daemon's executable is unknown".into())),
     };
+    // The views are still served: let a stalled sink's backlog drain now, so
+    // the 200 ms flush right before the `exec`, which is inside the
+    // application-visible gap, has only what is logged from here on to wait
+    // for. Bounded, and not on a serving thread; before the floor wait below,
+    // which must be the last wait before the detach (a gate or floor that
+    // began during this drain is then waited out too).
+    drain_log_before_detach(crate::log_buffer::drain_process);
     // Plan 43 C7-H2: the drain that follows releases the lease, which a
     // node inside its takeover gate or floor holds back until they end. The
     // wait is here, before the sessions detach: the views keep serving
@@ -1078,6 +1144,8 @@ pub fn resume_main(
     threads: crate::parallelism::ThreadPlan,
     log_buffer: crate::log_buffer::LogBuffer,
 ) -> Result<()> {
+    crate::start_daemon_logging(&log_buffer);
+    note_unwritten_at_previous_exec(std::env::var(UNWRITTEN_AT_EXEC_ENV).ok().as_deref());
     let text = read_handoff_text(handoff_fd)?;
     let handoff = match parse_handoff(&text) {
         Ok(handoff) => handoff,
@@ -1577,5 +1645,91 @@ mod tests {
     fn the_abi_probe_names_this_handover_version() {
         let abi: serde_json::Value = serde_json::from_str(&handover_abi()).unwrap();
         assert_eq!(abi["handover"], HANDOVER_VERSION);
+    }
+
+    /// The upgrade drains the log before it detaches the views (bounded),
+    /// so the flush inside the gap has little left to wait for.
+    #[test]
+    fn the_upgrade_drains_the_log_before_it_detaches_the_views() {
+        let mut asked = None;
+        drain_log_before_detach(|within| {
+            asked = Some(within);
+            crate::log_buffer::Flush {
+                complete: true,
+                unwritten_lines: 0,
+            }
+        });
+        assert_eq!(asked, Some(Duration::from_secs(2)));
+    }
+
+    /// Plan 44 §4.4: right before the `exec` the old image gives its log a
+    /// bounded moment to reach the sink, and tells the new image what was
+    /// left. (The buffer is behind a gate that stays shut: a stalled disk.)
+    #[test]
+    fn before_exec_flushes_with_a_bound_and_reports_the_rest() {
+        use std::io::Write;
+        use std::sync::{Arc, Condvar, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        struct Gate(Arc<(Mutex<bool>, Condvar)>);
+        impl Write for Gate {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                // Bounded: a failing test must not hang the test binary.
+                let (open, timeout) = self
+                    .0
+                     .1
+                    .wait_timeout_while(
+                        self.0 .0.lock().unwrap(),
+                        std::time::Duration::from_secs(30),
+                        |open| !*open,
+                    )
+                    .unwrap();
+                if timeout.timed_out() && !*open {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                drop(open);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let env_of = |command: &std::process::Command| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == UNWRITTEN_AT_EXEC_ENV)
+                .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let buffer = crate::log_buffer::LogBuffer::default();
+        buffer
+            .start(
+                crate::log_buffer::QueueConfig::with_limit(1 << 20),
+                Box::new(Gate(gate.clone())),
+            )
+            .unwrap();
+        for i in 0..5 {
+            buffer
+                .make_writer()
+                .write_all(format!("line {i}\n").as_bytes())
+                .unwrap();
+        }
+        let mut command = std::process::Command::new("true");
+        let started = std::time::Instant::now();
+        before_exec(&mut command, |within| buffer.flush(within));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_millis(450),
+            "{took:?}"
+        );
+        assert_eq!(env_of(&command), Some(Some("5".to_string())));
+
+        // An open sink: nothing is left, and the variable the previous image
+        // set (this process's own environment) is taken away.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let mut command = std::process::Command::new("true");
+        before_exec(&mut command, |within| buffer.flush(within));
+        assert_eq!(env_of(&command), Some(None));
     }
 }

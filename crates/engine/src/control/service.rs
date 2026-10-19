@@ -12,6 +12,29 @@ use crate::{
 use constellation_control::proto::types as api;
 use constellation_control::proto::ControlError;
 use constellation_store_s3::ChunkStore;
+use std::time::Duration;
+
+/// The longest a `node.logs.flush` waits (plan 44).
+const MAX_LOG_FLUSH_MS: u64 = 10_000;
+
+/// The log writer's counters as `status` reports them.
+pub(crate) fn log_status(stats: &crate::log_buffer::LogStats) -> api::LogStatus {
+    api::LogStatus {
+        mode: if stats.queued_mode { "queue" } else { "sync" }.into(),
+        limit_bytes: stats.limit_bytes,
+        queued_bytes: stats.queued_bytes,
+        queued_bytes_max: stats.queued_bytes_max,
+        queued_lines: stats.queued_lines,
+        written_lines: stats.written_lines,
+        dropped_lines: stats.dropped_lines,
+        dropped_bytes: stats.dropped_bytes,
+        drop_episodes: stats.drop_episodes,
+        longest_write_ms: stats.longest_write_ms,
+        writing_for_ms: stats.writing_for_ms,
+        sink_errors: stats.sink_errors,
+        unwritten_at_previous_exec: stats.unwritten_at_previous_exec,
+    }
+}
 
 /// A replicated snapshot row as the control protocol reports it. Plan 32
 /// §0.4's `origin` is a small integer in the row and a word on the wire,
@@ -800,6 +823,21 @@ impl EngineControl {
                 skew_tolerance_s: constellation_meta::hlc::skew_tolerance_ns() / 1_000_000_000,
                 rejected_stamps: constellation_meta::hlc::rejected_stamps(),
             },
+            log: log_status(&self.log_buffer.stats()),
+        }
+    }
+
+    /// `node.logs.flush`: wait (bounded) until every line logged before the
+    /// call is in the log's sink. Runs on a blocking thread, never on a
+    /// worker; at most two wait at once (the rest are told at once that the
+    /// log is not flushed), since each holds a thread of the shared pool.
+    pub(crate) fn logs_flush(&self, within_ms: u64) -> api::LogFlushReport {
+        let within = Duration::from_millis(within_ms.min(MAX_LOG_FLUSH_MS));
+        let flush = self.log_buffer.viewer_flush(within);
+        api::LogFlushReport {
+            complete: flush.complete,
+            unwritten_lines: flush.unwritten_lines,
+            dropped_lines: self.log_buffer.stats().dropped_lines,
         }
     }
 

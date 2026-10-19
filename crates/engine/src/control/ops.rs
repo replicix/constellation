@@ -547,6 +547,15 @@ pub(super) mod tests {
         ] {
             assert!(body.lines().any(|l| l == line), "{line}\n{body}");
         }
+        // Plan 44: the log writer's counters.
+        for line in [
+            "# TYPE constellation_log_dropped_lines_total counter",
+            "constellation_log_dropped_lines_total 0",
+            "# TYPE constellation_log_queued_bytes gauge",
+            "constellation_log_queued_bytes 0",
+        ] {
+            assert!(body.lines().any(|l| l == line), "{line}\n{body}");
+        }
         // Cumulative, monotone buckets ending at the count.
         let cumulative: Vec<u64> = body
             .lines()
@@ -566,6 +575,91 @@ pub(super) mod tests {
         let sample = streams::sample_of(&f.svc.status());
         assert!(sample.counters["constellation_vfs_ops_total"] >= 5);
         assert!(sample.counters["constellation_vfs_ops_refused_total"] >= 2);
+    }
+
+    /// Plan 44: `status` carries the log writer's counters, and
+    /// `node.logs.flush`'s barrier waits for the lines logged before it.
+    #[test]
+    fn status_reports_the_log_writer_and_flush_waits_for_it() {
+        use crate::log_buffer::QueueConfig;
+        use std::io::Write;
+        use tracing_subscriber::fmt::MakeWriter;
+        struct Gate(
+            Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            Arc<std::sync::Mutex<Vec<u8>>>,
+        );
+        impl Write for Gate {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                // Bounded: a failing test must not hang the test binary.
+                let (open, timeout) = self
+                    .0
+                     .1
+                    .wait_timeout_while(
+                        self.0 .0.lock().unwrap(),
+                        std::time::Duration::from_secs(30),
+                        |open| !*open,
+                    )
+                    .unwrap();
+                if timeout.timed_out() && !*open {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                drop(open);
+                self.1.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let f = fixture(&[&[]]);
+        assert_eq!(f.svc.status().log.mode, "sync");
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        f.svc
+            .log_buffer
+            .start(
+                QueueConfig::with_limit(1 << 20),
+                Box::new(Gate(gate.clone(), got.clone())),
+            )
+            .unwrap();
+        for i in 0..3 {
+            f.svc
+                .log_buffer
+                .make_writer()
+                .write_all(format!("line {i}\n").as_bytes())
+                .unwrap();
+        }
+        // The sink is stalled: status shows the queue, the flush gives up
+        // at its bound and says how much is left.
+        let log = f.svc.status().log;
+        assert_eq!((log.mode.as_str(), log.limit_bytes), ("queue", 1 << 20));
+        assert_eq!(
+            (log.queued_lines, log.written_lines, log.dropped_lines),
+            (3, 0, 0)
+        );
+        assert!(log.queued_bytes > 0);
+        let flush = f.svc.logs_flush(50);
+        assert!(!flush.complete);
+        assert_eq!(flush.unwritten_lines, 3);
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let flush = f.svc.logs_flush(5_000);
+        assert!(flush.complete, "{flush:?}");
+        assert_eq!(f.svc.status().log.written_lines, 3);
+        assert_eq!(got.lock().unwrap().as_slice(), b"line 0\nline 1\nline 2\n");
+        // Lines the previous image lost at its exec are dropped lines here.
+        f.svc.log_buffer.note_exec_loss(5);
+        let log = f.svc.status().log;
+        assert_eq!(
+            (
+                log.dropped_lines,
+                log.drop_episodes,
+                log.unwritten_at_previous_exec
+            ),
+            (5, 1, 5)
+        );
+        // A bound above the cap is capped, not an error.
+        assert!(f.svc.logs_flush(u64::MAX).complete);
     }
 
     /// Plan 31 C7a: the control protocol's file browser is a frontend of

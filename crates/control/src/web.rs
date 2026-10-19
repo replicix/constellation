@@ -44,7 +44,8 @@ use crate::authz::Principal;
 use crate::methods::SnapshotSchedStatus;
 use crate::methods::{method_info, NodeStatus, StreamKind};
 use crate::proto::types::{
-    FileStat, FuseStatus, SnapSchedReport, SnapSchedStatus, StatusReport, VfsOpSeries, VfsOpsStatus,
+    FileStat, FuseStatus, LogStatus, SnapSchedReport, SnapSchedStatus, StatusReport, VfsOpSeries,
+    VfsOpsStatus,
 };
 use crate::proto::{ControlError, ErrorKind};
 use crate::server::{
@@ -924,7 +925,25 @@ pub fn render_metrics(status: &StatusReport, sched: Option<&SnapSchedReport>) ->
     );
     render_vfs_ops(&mut output, &status.vfs_ops);
     render_fuse(&mut output, &status.fuse);
+    render_log(&mut output, &status.log);
     output
+}
+
+/// Plan 44: the log writer's two numbers an alert wants. Lines dropped
+/// because the log's sink did not keep up (the daemon was not slowed), and
+/// what is waiting for the sink now.
+fn render_log(output: &mut String, log: &LogStatus) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        output,
+        "# HELP constellation_log_dropped_lines_total Log lines dropped because the log sink did not keep up.\n\
+         # TYPE constellation_log_dropped_lines_total counter\n\
+         constellation_log_dropped_lines_total {}\n\
+         # HELP constellation_log_queued_bytes Log bytes waiting for the log sink.\n\
+         # TYPE constellation_log_queued_bytes gauge\n\
+         constellation_log_queued_bytes {}",
+        log.dropped_lines, log.queued_bytes
+    );
 }
 
 /// Plan 32 Step 9's scheduler metrics: `constellation_snapsched_*` from

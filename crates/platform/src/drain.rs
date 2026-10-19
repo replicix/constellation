@@ -260,6 +260,9 @@ pub fn small_stdio_pipes(cmd: &mut Command, bytes: usize) -> &mut Command {
         // `fcntl` calls (async-signal-safe) on the descriptors std has just
         // set up as the child's stdout and stderr; it allocates nothing
         // and ignores their result (a non-pipe answers an error).
+        // No log call in this closure (plan 44 §4.4): it runs in the forked
+        // child, where the log mutex another thread of the daemon held at the
+        // fork stays locked for good.
         unsafe {
             cmd.pre_exec(move || {
                 libc::fcntl(1, libc::F_SETPIPE_SZ, bytes);

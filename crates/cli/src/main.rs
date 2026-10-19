@@ -1286,7 +1286,93 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for IrohNoise {
     }
 }
 
-fn main() -> Result<()> {
+/// Start the daemon's non-blocking log writer (plan 44): from here on a
+/// log line is queued and the thread that logged it carries on; one writer
+/// thread (`cst-log-writer`) writes the queue to stderr (`daemon.log`, a
+/// harness `mount.log`, a container's pipe).
+///
+/// Called by every daemon — `mount` (`--foreground` and the daemonized
+/// child), `serve`, a resumed `daemon --resume-from` — at its top, and for
+/// the daemonizer **after** its fork: the fork copies only the calling
+/// thread, so a writer thread started earlier would be dead in the child.
+/// A short-lived command never calls it: its stderr stays in step with its
+/// own `eprintln!` output, written by the thread that logs. Idempotent.
+///
+/// Also installs what keeps the tail of the log when the process ends on
+/// purpose: a panic's message goes through the queue (in order, without
+/// waiting for the sink), and an `atexit` hook flushes it with a bound
+/// (`exit(3)` runs it, so every `std::process::exit` and a return from
+/// `main` are covered; the handover's `exec` and the authority driver's
+/// abort flush on their own paths).
+pub(crate) fn start_daemon_logging(buffer: &log_buffer::LogBuffer) {
+    /// An exit is not on a latency path, but the second-signal exit
+    /// promises to be prompt and a container restart waits for it.
+    const EXIT_FLUSH: std::time::Duration = std::time::Duration::from_secs(1);
+    extern "C" fn flush_at_exit() {
+        let _ = std::panic::catch_unwind(|| log_buffer::flush_process(EXIT_FLUSH));
+    }
+    static ATEXIT: std::sync::Once = std::sync::Once::new();
+
+    log_buffer::set_process(buffer);
+    let config = log_buffer::QueueConfig::from_env();
+    let warning = config.warning.clone();
+    if let Err(error) = buffer.start(config, Box::new(log_buffer::StderrSink)) {
+        // No thread to write with: every line is written by the thread that
+        // logs it, as before.
+        tracing::warn!(%error, "could not start the log writer thread; logging stays synchronous");
+    }
+    log_buffer::install_panic_hook();
+    ATEXIT.call_once(|| {
+        // SAFETY: registers a handler that only reads the process's
+        // buffer; `atexit` returns nonzero only when out of memory, which
+        // costs the exit flush, not correctness.
+        unsafe { libc::atexit(flush_at_exit) };
+    });
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
+}
+
+/// A command that is a daemon from its first log line and never forks starts
+/// the writer before any line is logged: a line written synchronously by the
+/// main thread would wait for a stalled sink, and for a resumed daemon
+/// (`daemon --resume-from`, the new image of a handover: the same process)
+/// that wait is inside the application-visible gap (an `upgrade-under-load`
+/// under a 6 s sink stall showed a 6.6 s gap). `mount` forks later and starts
+/// its writer after the fork.
+fn daemon_from_the_first_line(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Serve { .. }
+            | Command::Daemon {
+                resume_from: Some(_),
+                ..
+            }
+    )
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => exit_with_error(&error),
+    }
+}
+
+/// What std's `main` does for an `Err` (`Error: {error:?}`, exit status 1),
+/// except in a daemon: its stderr may be a stalled sink, and the print would
+/// wait for it before `exit`'s bounded flush could run. There the error goes
+/// through the queue and the process leaves after a flush that is bounded.
+fn exit_with_error(error: &anyhow::Error) -> std::process::ExitCode {
+    // Past `RUST_LOG`'s filter, like a panic's message.
+    if log_buffer::queue_last_words(&format!("Error: {error:?}")) {
+        log_buffer::flush_process(std::time::Duration::from_secs(1));
+    } else {
+        eprintln!("Error: {error:?}");
+    }
+    std::process::ExitCode::FAILURE
+}
+
+fn run() -> Result<()> {
     let log_buffer = log_buffer::LogBuffer::default();
     let log_writer = log_buffer.clone();
     // aws_config logs the loaded credentials (access key id included) at
@@ -1315,6 +1401,10 @@ fn main() -> Result<()> {
             .init();
     }
     let cli = Cli::parse();
+    // (See [`daemon_from_the_first_line`].)
+    if daemon_from_the_first_line(&cli.command) {
+        start_daemon_logging(&log_buffer);
+    }
     let threads = parallelism::thread_plan();
     tracing::info!(
         cpus = threads.cpus,
@@ -2842,6 +2932,14 @@ fn cmd_mount_body(
     mut held: Option<constellation_platform::LockGuard>,
     verdict: Option<daemonize::Verdict>,
 ) -> Result<()> {
+    // After the daemonizer's fork (the writer thread must not exist at it).
+    start_daemon_logging(&log_buffer);
+    // The `eprintln!`s below stay direct: they are a `mount`'s own words to
+    // the terminal that ran it (and, daemonized, the verdict pipe's relay of
+    // the same), written by the main thread before and while views attach,
+    // never by a thread that serves. A sink that stalls delays this startup
+    // output, nothing else; sending it through the log would change what a
+    // foreground mount prints.
     let fuse_threads = threads.fuse;
     // Built here, strictly after `daemonize::fork_if_needed` has already
     // decided whether (and forked if so) — never before it. See the
@@ -5169,5 +5267,260 @@ mod upgrade_tests {
             new_rt.shutdown_background();
         }
         result
+    }
+}
+
+/// Plan 44 §7.2: the exit and panic paths of [`start_daemon_logging`], in
+/// child processes (they install a process-wide panic hook and `atexit`
+/// handler, and end with `exit`). Each test re-executes this test binary on
+/// itself with `CST_P44_CHILD` set and stderr a file.
+#[cfg(test)]
+mod log_child_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const CHILD: &str = "CST_P44_CHILD";
+
+    /// A daemon's logging in this process: the writer started, a subscriber
+    /// writing into it (no ANSI), held for the process's life.
+    fn daemon_logging() {
+        let buffer = log_buffer::LogBuffer::default();
+        start_daemon_logging(&buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer)
+            .with_ansi(false)
+            .finish();
+        std::mem::forget(tracing::subscriber::set_default(subscriber));
+    }
+
+    /// Run `test` as the child `mode`, its stderr in a temp file; its exit
+    /// status, how long it ran, what it printed and what it wrote.
+    fn run_child(
+        test: &str,
+        mode: &str,
+        envs: &[(&str, &str)],
+    ) -> (bool, Duration, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(dir.path().join("stderr.log")).unwrap();
+        let started = Instant::now();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, mode)
+            .envs(envs.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log))
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            started.elapsed(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            std::fs::read_to_string(dir.path().join("stderr.log")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_panic_reaches_the_log_in_order() {
+        const TEST: &str = "log_child_tests::a_panic_reaches_the_log_in_order";
+        if std::env::var(CHILD).is_ok() {
+            daemon_logging();
+            // The first line's write stalls (the fault point): the panicking
+            // thread must neither wait for it nor overtake it.
+            tracing::info!("p44 before the panic");
+            let started = Instant::now();
+            let _ = std::thread::Builder::new()
+                .name("p44-panicker".into())
+                .spawn(|| panic!("p44 boom"))
+                .unwrap()
+                .join();
+            println!("PANIC_JOIN_MS={}", started.elapsed().as_millis());
+            tracing::info!("p44 after the panic");
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fault = dir.path().join("stall");
+        std::fs::write(&fault, "600 once").unwrap();
+        let (ok, _, out, log) = run_child(
+            TEST,
+            "panic",
+            &[(
+                "CONSTELLATION_FAULT_LOG_STALL_FILE",
+                fault.to_str().unwrap(),
+            )],
+        );
+        assert!(ok, "{log}");
+        let joined: u64 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("PANIC_JOIN_MS="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            joined < 400,
+            "the panicking thread waited {joined} ms behind a 600 ms sink stall"
+        );
+        // The line of each (std's own message has the thread's id after
+        // its name, ours does not: match on the parts they share).
+        let at = |parts: &[&str]| {
+            let hits: Vec<usize> = log
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| parts.iter().all(|p| l.contains(p)))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(hits.len(), 1, "{parts:?} must be there once:\n{log}");
+            hits[0]
+        };
+        let (a, p, b) = (
+            at(&["p44 before the panic"]),
+            at(&["p44-panicker", "panicked at"]),
+            at(&["p44 after the panic"]),
+        );
+        assert!(a < p && p < b, "out of order:\n{log}");
+        assert!(log.contains("p44 boom"));
+    }
+
+    /// The commands that start the log writer before their first line (the
+    /// resumed daemon's first line must not wait for a stalled sink inside
+    /// the handover's gap), and `mount`, which forks first, does not.
+    #[test]
+    fn the_resumed_daemon_and_serve_start_their_writer_first() {
+        use clap::Parser;
+        let first = |args: &[&str]| {
+            let cli =
+                Cli::try_parse_from(std::iter::once("constellation").chain(args.iter().copied()))
+                    .unwrap();
+            daemon_from_the_first_line(&cli.command)
+        };
+        assert!(first(&["daemon", "--resume-from", "7"]));
+        assert!(first(&[
+            "serve",
+            "--s3",
+            "file:///tmp/x",
+            "--state-dir",
+            "/tmp/s",
+            "--control-socket",
+            "/tmp/s/c.sock"
+        ]));
+        assert!(!first(&["daemon", "--upgrade"]));
+        assert!(!first(&["mount", "x", "/mnt/x"]));
+    }
+
+    /// A daemon's `main` returning `Err` does not print the error to a
+    /// stalled sink before the bounded flush: it queues it and leaves within
+    /// the bound (before, std's print waited out the stall: 2 s here).
+    #[test]
+    fn an_error_return_leaves_within_the_flush_bound() {
+        const TEST: &str = "log_child_tests::an_error_return_leaves_within_the_flush_bound";
+        if std::env::var(CHILD).is_ok() {
+            daemon_logging();
+            tracing::info!("p44 first line, stalled");
+            // The writer is in its stalled write, holding std's stderr lock.
+            std::thread::sleep(Duration::from_millis(200));
+            let started = Instant::now();
+            let _ = exit_with_error(&anyhow::anyhow!("p44 the error"));
+            println!("EXIT_MS={}", started.elapsed().as_millis());
+            std::process::exit(1);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fault = dir.path().join("stall");
+        std::fs::write(&fault, "2000 once").unwrap();
+        let (_, _, out, _) = run_child(
+            TEST,
+            "error",
+            &[(
+                "CONSTELLATION_FAULT_LOG_STALL_FILE",
+                fault.to_str().unwrap(),
+            )],
+        );
+        let ms: u64 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("EXIT_MS="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (1_000..1_500).contains(&ms),
+            "the error return took {ms} ms behind a 2 s stall (bound: the 1 s flush)"
+        );
+    }
+
+    /// A daemon's last words do not depend on `RUST_LOG`: with a filter that
+    /// hides this crate's events the error still reaches the log (it went
+    /// through `tracing::error!` and was filtered out before).
+    #[test]
+    fn the_error_return_is_logged_whatever_the_filter() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+        const TEST: &str = "log_child_tests::the_error_return_is_logged_whatever_the_filter";
+        if std::env::var(CHILD).is_ok() {
+            let buffer = log_buffer::LogBuffer::default();
+            start_daemon_logging(&buffer);
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(buffer)
+                    .with_ansi(false)
+                    .with_filter(tracing_subscriber::EnvFilter::new(
+                        "constellation_authority=debug",
+                    )),
+            );
+            std::mem::forget(tracing::subscriber::set_default(subscriber));
+            tracing::info!("p44 an event the filter hides");
+            let _ = exit_with_error(&anyhow::anyhow!("p44 hidden error").context("p44 context"));
+            std::process::exit(1);
+        }
+        let (_, _, _, log) = run_child(TEST, "filter", &[]);
+        assert!(!log.contains("p44 an event the filter hides"), "{log}");
+        assert!(
+            log.contains("ERROR constellation: Error: p44 context"),
+            "{log}"
+        );
+        assert!(log.contains("p44 hidden error"), "{log}");
+    }
+
+    #[test]
+    fn exit_flushes_the_tail() {
+        const TEST: &str = "log_child_tests::exit_flushes_the_tail";
+        if std::env::var(CHILD).is_ok() {
+            daemon_logging();
+            let started = Instant::now();
+            for i in 0..1_000 {
+                tracing::info!(i, "p44 tail line");
+            }
+            println!("LOGGED_MS={}", started.elapsed().as_millis());
+            std::process::exit(0);
+        }
+        let lines = |log: &str| log.matches("p44 tail line").count();
+        // A healthy sink: every line is in the file.
+        let (ok, _, _, log) = run_child(TEST, "idle", &[]);
+        assert!(ok);
+        assert_eq!(lines(&log), 1_000);
+        // The first write stalls for 2 s: the exit waits 1 s for it, no more.
+        let dir = tempfile::tempdir().unwrap();
+        let fault = dir.path().join("stall");
+        std::fs::write(&fault, "2000 once").unwrap();
+        let (ok, took, out, log) = run_child(
+            TEST,
+            "stalled",
+            &[(
+                "CONSTELLATION_FAULT_LOG_STALL_FILE",
+                fault.to_str().unwrap(),
+            )],
+        );
+        assert!(ok);
+        let logged: u64 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("LOGGED_MS="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let exit_took = took.saturating_sub(Duration::from_millis(logged));
+        assert!(
+            exit_took >= Duration::from_millis(1_000) && exit_took < Duration::from_millis(1_800),
+            "the exit took {exit_took:?} behind a 2 s stall (child ran {took:?})"
+        );
+        assert!(lines(&log) < 1_000, "the stalled sink wrote it all?");
+        assert!(!fault.exists(), "the stall fired once");
     }
 }

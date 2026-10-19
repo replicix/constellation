@@ -550,6 +550,79 @@ pub struct StatusReport {
     /// Plan 30 §M12: the hybrid logical clock inode times come from, and
     /// the stamps of other nodes' clocks it refused to follow.
     pub clock: ClockStatus,
+    /// Plan 44: the daemon's log writer. Logging never blocks a daemon
+    /// thread; what the log sink could not keep up with is counted here.
+    pub log: LogStatus,
+}
+
+/// The daemon's log writer (plan 44): one queue between every logging
+/// thread and the log's sink (`daemon.log`, a container's pipe), drained by
+/// a writer thread. A thread that logs never waits for the sink; when the
+/// queue is full the incoming line is dropped and counted, and the log
+/// itself says where lines are missing (a `log lines dropped` line).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LogStatus {
+    /// `queue` (the default for a daemon), or `sync`: the writer thread is
+    /// not running, a slow log sink stalls the threads that log
+    /// (`CONSTELLATION_LOG_QUEUE_BYTES=0`, for measurements only).
+    pub mode: String,
+    /// The queue's bound in bytes (0 in `sync` mode).
+    pub limit_bytes: u64,
+    /// Bytes waiting for the sink or in a write to it now, counted with
+    /// their per-line overhead against `limit_bytes`. Near the limit: the
+    /// sink is behind and lines are about to be, or are being, dropped.
+    pub queued_bytes: u64,
+    /// The most `queued_bytes` has been. A value near `limit_bytes` means
+    /// the sink fell far behind at some point.
+    pub queued_bytes_max: u64,
+    /// Lines waiting for the sink or in a write to it now.
+    pub queued_lines: u64,
+    /// Lines the writer is done with (written, or failed: see
+    /// `sink_errors`).
+    pub written_lines: u64,
+    /// Lines dropped because the queue was full. Nonzero: the log is
+    /// missing lines (the ring `node.logs.tail` reads still has the recent
+    /// ones), and the disk or pipe under the log stalled for longer than
+    /// the queue holds. The daemon itself was not slowed.
+    pub dropped_lines: u64,
+    /// The bytes of those lines.
+    pub dropped_bytes: u64,
+    /// Separate runs of drops; each ends with one `log lines dropped` line
+    /// in the log.
+    pub drop_episodes: u64,
+    /// The longest single write to the sink since the daemon started, in
+    /// milliseconds. Seconds here mean the disk under the log stalled at
+    /// some point, whether or not lines were dropped.
+    pub longest_write_ms: u64,
+    /// How long the write to the sink in progress has been running, in
+    /// milliseconds; 0 when none is. Growing without end: the sink is
+    /// wedged.
+    pub writing_for_ms: u64,
+    /// Writes to the sink that failed (`ENOSPC`, `EIO`, a closed pipe);
+    /// their lines are lost.
+    pub sink_errors: u64,
+    /// Lines the previous image left unwritten when it handed this daemon
+    /// over (its log sink was stalled at the `exec`); 0 normally.
+    pub unwritten_at_previous_exec: u64,
+}
+
+/// `node.logs.flush`: wait until every line logged before the call has been
+/// written to the log's sink, up to `within_ms` (capped at 10 000).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LogFlushParams {
+    #[serde(default)]
+    pub within_ms: u64,
+}
+
+/// `node.logs.flush`'s result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LogFlushReport {
+    /// Every line logged before the call is in the sink.
+    pub complete: bool,
+    /// Lines still waiting when the call gave up.
+    pub unwritten_lines: u64,
+    /// The daemon's `log.dropped_lines` at that moment.
+    pub dropped_lines: u64,
 }
 
 /// The hybrid logical clock every inode time comes from (plan 30 §M12,

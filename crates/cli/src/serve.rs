@@ -133,6 +133,8 @@ pub fn cmd_serve(
     args: ServeArgs,
     log_buffer: log_buffer::LogBuffer,
 ) -> Result<()> {
+    // `serve` never forks: the writer can start at once.
+    crate::start_daemon_logging(&log_buffer);
     let ServeArgs {
         s3,
         state_dir,

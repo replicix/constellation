@@ -89,11 +89,15 @@ impl Verdict {
     }
 }
 
-// `tracing`'s writer already tees every event to stderr via
-// `log_buffer::LogWriter`, so the detach's redirect of stdout/stderr to
-// `state_dir/daemon.log` (append mode) alone is what makes daemonized
-// output land in the log file instead of a terminal nobody is attached to
-// anymore.
+// The detach's redirect of stdout/stderr to `state_dir/daemon.log` (append
+// mode) alone is what makes daemonized output land in the log file instead
+// of a terminal nobody is attached to anymore: `tracing`'s writer
+// (`log_buffer::LogBuffer`) writes to whatever fd 2 is. Until the daemon
+// starts the buffer's writer thread (`start_daemon_logging`, after this
+// fork) every line is written by the logging thread itself, and nothing is
+// queued. That is what keeps the fork safe: it copies only the calling
+// thread, so a writer thread (or a queued line) that existed before it
+// would be dead in the child, or written twice. `fork_if_needed` asserts it.
 //
 // The status pipe is close-on-exec at both ends. `fork` keeps them (the
 // child needs its write end), but nothing the daemon later *executes* may
@@ -139,6 +143,10 @@ pub fn fork_if_needed(foreground: bool, state_dir: &Path) -> Result<Outcome> {
     }
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
+    debug_assert!(
+        !crate::log_buffer::process_started(),
+        "the log writer thread must start after the daemonizer's fork, never before it"
+    );
 
     // SAFETY: detaching (a `fork()` here) is safe specifically because
     // this runs before the tokio runtime, the shipper, any lease keeper,

@@ -9,7 +9,7 @@
 //! embedding host calls it in-process through the same [`Router`]. It lives
 //! in the engine, not in the CLI, because every host of an engine (the
 //! desktop daemon today; plan 37's CSI engine pod, plan 36's Android
-//! service) needs the same 72 methods with the same semantics, and
+//! service) needs the same 73 methods with the same semantics, and
 //! everything they touch — the metadata replica, the sync task, the
 //! snapshot manager, the registry, the op watchdog — is the engine's.
 //!
@@ -629,6 +629,8 @@ pub fn register(r: &mut Router, svc: &Arc<EngineControl>) {
     unary::<NodeLeave>(r, svc, |s, _, p| ack(s.leave(p.node_id, p.force)));
     unary::<NodeSetWriteMode>(r, svc, |s, _, p| ack(s.set_write_mode(&p.mode)));
     streams::register_logs_tail(r, svc);
+    // The wait runs on a blocking thread (`unary`), never on a worker.
+    unary::<NodeLogsFlush>(r, svc, |s, _, p| Ok(s.logs_flush(p.within_ms)));
     unary::<NodeDoctor>(r, svc, |s, _, _| s.doctor().map_err(failed));
     unary::<NodeOps>(r, svc, |s, _, p| s.node_ops(&p));
     unary::<NodeHandoff>(r, svc, |s, call, p| {

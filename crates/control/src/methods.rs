@@ -22,7 +22,7 @@
 //!
 //! Because [`METHODS`], [`visit_all`] and the `impl Method` blocks come out of
 //! the same macro invocation, "a method exists but is missing from the table"
-//! cannot happen; the tests instead pin the *contents* (72 methods, no
+//! cannot happen; the tests instead pin the *contents* (73 methods, no
 //! duplicates, every one of the 37 old `Request` variants maps to exactly
 //! one).
 //!
@@ -37,7 +37,7 @@
 //!
 //! | class | role | methods |
 //! |---|---|---|
-//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/ops`, `*.list*`, `snapshot.refs/resolve/reclaim/space`, `snapshot.policy.check/simulate/list/show`, `snapshot.sched.status`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
+//! | reads, listings, browsing | viewer | `node.ping/status/logs.tail/logs.flush/ops`, `*.list*`, `snapshot.refs/resolve/reclaim/space`, `snapshot.policy.check/simulate/list/show`, `snapshot.sched.status`, `quota.get`, `browse.readdir/inspect/stat/read`, `view.stats`, `peers.list`, `stats.subscribe`, `events.subscribe` |
 //! | node-local mutation (and probes that write to the backend) | operator | `pin.add/remove`, `designation.offline/online/delegate/undelegate`, `node.reintegrate/set_write_mode/doctor`, `snapshot.create`, `snapshot.hold`, `snapshot.space.verify` (a heavy read-only probe), `clone.create`, `cache.prune`, `browse.write/mkdir/rename/xattr`, `fs.doctor` |
 //! | destructive or cluster-wide | admin | `node.leave/handoff/lifecycle`, `prune.run`, `gc.run`, `fsck.run`, `snapshot.delete/delete_many`, `snapshot.policy.set/remove/pause`, `snapshot.sched.run`, `locks.*`, `quota.set`, `view.mount/unmount`, `browse.delete`, `fs.create/import/export/passwd/unlock` |
 //!
@@ -204,6 +204,11 @@ define_methods! {
     /// the old all-at-once `LogTail`.
     NodeLogsTail { name: "node.logs.tail", role: Viewer, mutating: false, stream: Chunks,
         params: LogTailParams, result: StreamEnd }
+    /// Wait (bounded) until every line logged so far is in the log's sink
+    /// (plan 44): the barrier before a `kill -9`, and what a test reads the
+    /// log file after. Reads nothing and changes nothing.
+    NodeLogsFlush { name: "node.logs.flush", role: Viewer, mutating: false, stream: None,
+        params: LogFlushParams, result: LogFlushReport }
     /// Run the backend capability probes.
     NodeDoctor { name: "node.doctor", role: Operator, mutating: false, stream: None,
         params: Empty, result: DoctorStatus }
@@ -565,11 +570,11 @@ mod tests {
         assert_eq!(unique.len(), METHODS.len(), "duplicate method names");
         assert_eq!(
             METHODS.len(),
-            72,
+            73,
             "36 old methods + 21 new ones + snapshot.hold + snapshot.policy.check/simulate \
              + snapshot.policy.list/show/set/remove/pause \
              + snapshot.resolve/delete_many + snapshot.sched.status/run \
-             + snapshot.reclaim/space/space.verify"
+             + snapshot.reclaim/space/space.verify + node.logs.flush"
         );
         for m in METHODS {
             assert!(
