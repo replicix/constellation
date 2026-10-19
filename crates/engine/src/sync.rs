@@ -333,8 +333,9 @@ pub enum SyncRequest {
         lock_grace_ms: u64,
         lock_floor: constellation_meta::Position,
         lock_cut_at: i64,
-        lock_cut: constellation_meta::Position,
+        lock_cut: Box<constellation_meta::Position>,
         lock_barrier: i64,
+        lock_carry: Vec<(constellation_meta::locks::GrantId, u64)>,
     },
     /// Plan 30 §M11: the root recalls a generation this node holds;
     /// answered with the highest stream index executed here (and, §M14,

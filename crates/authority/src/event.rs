@@ -701,6 +701,12 @@ pub enum PeerMsg {
         /// under the subtree (0: none): the delegate's grants there wait
         /// for a cut as of it too.
         lock_barrier: i64,
+        /// What is left, in ms on the root's clock at this send, of the
+        /// record of each grant of `locks`: the delegate records
+        /// `now + left + margin` from the receipt, never later than a
+        /// restamp (`Core::lock_install_moved`); a grant not listed it
+        /// restamps. A duration: no clock's absolute crosses nodes.
+        lock_carry: Vec<(constellation_meta::locks::GrantId, u64)>,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops executing under it and answers with the highest

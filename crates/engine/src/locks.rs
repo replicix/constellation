@@ -1910,6 +1910,24 @@ pub fn grants_wire(grants: &[Grant]) -> Vec<u8> {
     postcard::to_allocvec(grants).unwrap_or_default()
 }
 
+/// What is left of each carried grant's record on the wire
+/// (`PeerMsg::DelegRenewed::lock_carry`, `LockHandback::carry`;
+/// postcard, empty: none). An undecodable one is empty: the receiver
+/// restamps the grants, which is never sooner.
+pub fn carry_wire(carry: &[(constellation_meta::locks::GrantId, u64)]) -> Vec<u8> {
+    if carry.is_empty() {
+        return Vec::new();
+    }
+    postcard::to_allocvec(carry).unwrap_or_default()
+}
+
+pub fn carry_of(bytes: &[u8]) -> Vec<(constellation_meta::locks::GrantId, u64)> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    postcard::from_bytes(bytes).unwrap_or_default()
+}
+
 /// A lock floor on the wire (empty: none).
 pub fn floor_wire(p: &constellation_meta::Position) -> Vec<u8> {
     if *p == constellation_meta::Position::ZERO {
@@ -2024,5 +2042,14 @@ mod tests {
         }];
         assert_eq!(grants_of(&grants_wire(&grants)), grants);
         assert!(grants_of(&[]).is_empty());
+        let carry = vec![
+            (GrantId { node: 1, seq: 2 }, 0),
+            (GrantId { node: 7, seq: 9 }, 20_999),
+        ];
+        assert_eq!(carry_of(&carry_wire(&carry)), carry);
+        assert!(carry_wire(&[]).is_empty());
+        assert!(carry_of(&[]).is_empty());
+        // Undecodable: nothing carried (the receiver restamps).
+        assert!(carry_of(&[0xff, 0xff, 0xff]).is_empty());
     }
 }

@@ -2911,6 +2911,7 @@ impl Driver {
                 lock_cut_at,
                 lock_cut,
                 lock_barrier,
+                lock_carry,
             } => Some(Internal::Event(Event::Peer {
                 from,
                 msg: PeerMsg::DelegRenewed {
@@ -2922,8 +2923,9 @@ impl Driver {
                     lock_grace_ms,
                     lock_floor,
                     lock_cut_at,
-                    lock_cut: Box::new(lock_cut),
+                    lock_cut,
                     lock_barrier,
+                    lock_carry,
                 },
             })),
             SyncRequest::PeerDelegRecall {
@@ -3873,6 +3875,7 @@ impl Driver {
                 lock_cut_at,
                 lock_cut,
                 lock_barrier,
+                lock_carry,
             } => {
                 let payload = Payload::DelegRenewed {
                     from: self.node_id,
@@ -3886,6 +3889,7 @@ impl Driver {
                     lock_cut_at,
                     lock_cut: crate::locks::floor_wire(&lock_cut),
                     lock_barrier,
+                    lock_carry: crate::locks::carry_wire(&lock_carry),
                 };
                 self.one_way(to, payload);
             }
@@ -4228,6 +4232,7 @@ impl Driver {
                             locks,
                             lock_floor,
                             lock_barrier,
+                            lock_carry,
                         })) if req_id == req.0 => {
                             let _ = tx.send(Internal::Event(Event::Peer {
                                 from: to,
@@ -4237,6 +4242,7 @@ impl Driver {
                                     through,
                                     locks: constellation_meta::locks::LockHandback {
                                         grants: crate::locks::grants_of(&locks),
+                                        carry: crate::locks::carry_of(&lock_carry),
                                         floor: crate::locks::floor_of(&lock_floor),
                                         barrier: lock_barrier,
                                     },

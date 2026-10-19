@@ -4287,6 +4287,12 @@
           "description": "`cluster` or `local`.",
           "type": "string"
         },
+        "moved_carried": {
+          "description": "Grants a delegation move installed here carrying what was left of\ntheir record instead of a restamp (every moved grant does).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "not_yet_answers": {
           "format": "uint64",
           "minimum": 0,
@@ -4531,7 +4537,8 @@
         "stale_incarnation_requests",
         "requests_in_flight",
         "waiters",
-        "recalls_in_flight"
+        "recalls_in_flight",
+        "moved_carried"
       ],
       "type": "object"
     },

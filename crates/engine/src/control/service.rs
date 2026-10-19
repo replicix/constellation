@@ -623,6 +623,7 @@ impl EngineControl {
                     requests_in_flight: core.lock_requests_in_flight as u64,
                     waiters: core.lock_waiters as u64,
                     recalls_in_flight: core.lock_recalls_in_flight as u64,
+                    moved_carried: stats.lock_moved_carried,
                 }
             },
             coop,

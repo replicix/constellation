@@ -982,6 +982,9 @@ pub struct Stats {
     pub renew_refused: u64,
     pub lock_reclaimed: u64,
     pub lock_moved: u64,
+    /// Of those, the grants that carried what was left of their record
+    /// instead of a restamp (every moved grant does).
+    pub lock_moved_carried: u64,
     /// Root: a delegate's grants on inodes that left its subtree
     /// (unlinked under their lock), installed with the batch that carried
     /// them (`Core::lock_install_leaving`).
@@ -2066,6 +2069,7 @@ impl Core {
                 lock_cut_at,
                 lock_cut,
                 lock_barrier,
+                lock_carry,
             } => {
                 // The renewal installs the generation's window first; the
                 // handoff is tagged with the generation itself. A grace
@@ -2093,7 +2097,7 @@ impl Core {
                     );
                 }
                 if ttl_ms > 0 && !locks.is_empty() {
-                    self.lock_install_moved(now, gen, locks, replica);
+                    self.lock_install_moved(now, gen, locks, &lock_carry, replica);
                 }
             }
             PeerMsg::DelegRecall { req, gen, .. } => {

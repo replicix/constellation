@@ -1656,6 +1656,9 @@ pub struct LockStatus {
     pub requests_in_flight: u64,
     pub waiters: u64,
     pub recalls_in_flight: u64,
+    /// Grants a delegation move installed here carrying what was left of
+    /// their record instead of a restamp (every moved grant does).
+    pub moved_carried: u64,
 }
 
 /// One lock owner fenced on this node (`LockStatus::fenced_owners`).

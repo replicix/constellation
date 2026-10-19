@@ -1380,6 +1380,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m14::lock_contention_delegated,
     },
     Scenario {
+        name: "lock-contention-delegated-moves",
+        desc: "a delegation move carries what is left of an unused lock grant: lock-contention-delegated with a recall and a new delegation of the subtree (two moves of its lock table) 0.5 s after every unlock, and a ghost contender (a flock(1) killed as the holder lets go) queued first; the count exact, every handoff within 9 s (a restamp is 21 s per move), judged against the host-lag probe; prints the gaps, recalls_expired and moved_carried per node",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_contention_delegated_moves,
+    },
+    Scenario {
         name: "lock-grace-wait",
         desc: "plan 43 F-b: three nodes, the holder killed with a lock held; in the successor's lock grace a non-blocking F_SETLK on a free file waits and is granted at its end (never EAGAIN), one with a SIGALRM at 8 s ends EINTR, a blocking F_SETLKW parked at the successor is served by the grace-end timer, and the held lock is refused EAGAIN at once afterwards; grace_waits counted, grace_wait_gave_up 0",
         requires: &[],

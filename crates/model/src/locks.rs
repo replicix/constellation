@@ -89,7 +89,8 @@
 //! # A moved grant's window carried as a duration (`move_stamp`)
 //!
 //! A move restamps every grant to `now + lock_ttl + seq_margin` at its
-//! receiver (`MoveStamp::Restamp`, the code today). For a grant nobody
+//! receiver (`MoveStamp::Restamp`, the rule before the carry, and the default
+//! here). For a grant nobody
 //! uses (its reply was lost, or found no request waiting) that is a full
 //! window more for whoever waits behind it, at every move. The rule
 //! (`MoveStamp::CarryUnproven`): a grant never renewed or reclaimed since
@@ -169,9 +170,9 @@
 //! | `Handoff` delivered / dropped | `lock_install_moved` (`deleg_mine_until`, `moved_seen`, `install_if_consistent`) |
 //! | reinstated copies | `lock_on_generation_ended` from `end_generation` (`core/delegate.rs`) |
 //! | `Mirror` | `BackupAppend { locks }` (a snapshot rides the next append) |
-//! | `carry_of` (`carry` on `Handoff`/`DelegRecalled`) | proposed: `lock_take_handoff` and `lock_hand_back` measure what is left of each unproven grant (`DelegRenewed::lock_carry`, `LockHandback::carry`); today every moved grant is restamped (`MoveStamp::Restamp`) |
-//! | `stamp_moved` | proposed: `lock_install_moved` (`carried_until`); today `restamp` |
-//! | `Grant::proven` | `LockState::unproven` (inverted: an id leaves it at a renewal, a release or an outwait) |
+//! | `carry_of` (`carry` on `Handoff`/`DelegRecalled`) | `lock_take_handoff` and `lock_hand_back` measure what is left of every grant (`DelegRenewed::lock_carry`, `LockHandback::carry`): `MoveStamp::CarryAll`; `MoveStamp::Restamp` is the rule before |
+//! | `stamp_moved` | `lock_install_moved` (`carried_until`; `install_keeping_later` at the root); `restamp` for every other grant |
+//! | `Grant::proven` | not read by the code: it carries every grant (`CarryAll`; `CarryUnproven` is the narrower rule the sim measured, see PROGRESS) |
 
 use stateright::{Model, Property};
 

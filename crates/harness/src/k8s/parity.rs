@@ -526,6 +526,10 @@ pub const SKIPPED: &[(&str, Skip)] = &[
         "lock-contention-delegated",
         Skip::Local(&[NODES3, "delegates a directory by hand (designation.delegate)"]),
     ),
+    (
+        "lock-contention-delegated-moves",
+        Skip::Local(&[NODES3, "delegates a directory by hand (designation.delegate)"]),
+    ),
     ("lock-grace-wait", Skip::Local(&[KILL, CTO_STRICT, NODES3])),
     ("lock-failover", Skip::Local(&[KILL, NODES4])),
     ("lock-holder-killed-contention", Skip::Local(&[KILL, NODES4])),

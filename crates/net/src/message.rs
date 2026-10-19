@@ -439,6 +439,10 @@ pub enum Payload {
         lock_cut_at: i64,
         lock_cut: Vec<u8>,
         lock_barrier: i64,
+        /// Postcard of `Vec<(GrantId, u64)>`: what is left (ms, on the
+        /// root's clock at the send) of the record of each listed grant
+        /// of `locks` (empty: none) — see `PeerMsg::DelegRenewed::lock_carry`.
+        lock_carry: Vec<u8>,
     },
     /// Plan 30 §M11: the root recalls generation `gen` on `dir`; the
     /// delegate stops and answers the highest stream index it executed.
@@ -459,6 +463,11 @@ pub enum Payload {
         /// latest outwait barrier under it (0: none).
         lock_floor: Vec<u8>,
         lock_barrier: i64,
+        /// Postcard of `Vec<(GrantId, u64)>`: what is left (ms, on the
+        /// delegate's clock at the answer) of the record of each listed
+        /// grant of `locks` (empty: none) — see
+        /// `constellation_meta::locks::LockHandback::carry`.
+        lock_carry: Vec<u8>,
     },
     /// Plan 30 §M11 phase 2b: a delegate's append to its backup (postcard
     /// `Vec<DelegateTx>`), and the backup's contiguous hold (or `sealed`).
@@ -1535,6 +1544,16 @@ mod tests {
                 lock_cut_at: 6,
                 lock_cut: vec![7],
                 lock_barrier: 8,
+                lock_carry: vec![9, 10],
+            },
+            Payload::DelegRecalled {
+                req_id: 3,
+                gen: 2,
+                through: 5,
+                locks: vec![1, 2],
+                lock_floor: vec![3],
+                lock_barrier: 4,
+                lock_carry: vec![5, 6, 7],
             },
         ] {
             let signed = Signed::new(&k, &payload).unwrap();

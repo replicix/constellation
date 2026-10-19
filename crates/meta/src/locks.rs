@@ -236,6 +236,12 @@ impl Grant {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockHandback {
     pub grants: Vec<Grant>,
+    /// What was left, in ms on the delegate's clock when it built this, of
+    /// the record of each grant of `grants`: the root records it from the
+    /// receipt, plus the margin, never later than a restamp
+    /// (`Core::lock_install_moved`). A grant not listed is restamped.
+    /// Durations only: no clock's absolute crosses nodes.
+    pub carry: Vec<(GrantId, u64)>,
     pub floor: Position,
     /// The latest outwait barrier under the subtree that no cut has
     /// settled yet (the delegate's clock; 0: none): the root's grants
@@ -996,6 +1002,26 @@ impl LockTables {
         let mut g = self.lock();
         g.grants
             .retain(|_, e| !(e.node == grant.node && e.ino == grant.ino));
+        g.grants.insert(grant.id, grant);
+    }
+
+    /// [`Self::install`] for a grant that moved carrying what was left of
+    /// its record (a delegation's recall answer, `Core::lock_install_moved`):
+    /// the record it replaces — the same node's on the same inode, live or
+    /// expired — is never shortened, the later end of the two is kept (a
+    /// reclaim this table answered in a grace before the move arrived
+    /// extended its holder's window past what the carried record says).
+    pub fn install_keeping_later(&self, grant: Grant) {
+        let mut g = self.lock();
+        let mut grant = grant;
+        g.grants.retain(|_, e| {
+            if e.node == grant.node && e.ino == grant.ino {
+                grant.until_ms = grant.until_ms.max(e.until_ms);
+                false
+            } else {
+                true
+            }
+        });
         g.grants.insert(grant.id, grant);
     }
 
@@ -2871,6 +2897,44 @@ mod tests {
         assert!(t.install_if_consistent(copy(3, 3, LockMode::Shared), 0));
         assert!(!t.install_if_consistent(copy(3, 3, LockMode::Shared), 0));
         assert_eq!(t.grants_len(), 2);
+    }
+
+    /// A grant that moved carrying what was left of its record replaces the
+    /// node's record on the inode but never shortens it: a reclaim answered
+    /// in a grace before the move arrived extended its holder's window.
+    #[test]
+    fn install_keeping_later_never_shortens_the_replaced_record() {
+        let at = |seq: u64, until_ms: i64| Grant {
+            id: GrantId { node: 9, seq },
+            node: 2,
+            ino: 7,
+            mode: LockMode::Exclusive,
+            until_ms,
+            recalled: false,
+            gen: 0,
+            confirmed_ms: Grant::UNCONFIRMED,
+        };
+        let t = LockTables::default();
+        // A later record of the same node on the inode (another id): kept.
+        t.install(at(1, 900));
+        t.install_keeping_later(at(2, 300));
+        assert_eq!(t.grants_len(), 1);
+        assert_eq!(t.get(GrantId { node: 9, seq: 1 }), None);
+        assert_eq!(t.get(GrantId { node: 9, seq: 2 }).unwrap().until_ms, 900);
+        // An earlier one: replaced by the new one.
+        t.install_keeping_later(at(3, 1500));
+        assert_eq!(t.grants_len(), 1);
+        assert_eq!(t.get(GrantId { node: 9, seq: 3 }).unwrap().until_ms, 1500);
+        // Another node's record on the inode is left alone.
+        let other = Grant {
+            node: 3,
+            ..at(4, 5000)
+        };
+        t.install(other);
+        t.install_keeping_later(at(5, 100));
+        assert_eq!(t.grants_len(), 2);
+        assert_eq!(t.get(GrantId { node: 9, seq: 5 }).unwrap().until_ms, 1500);
+        assert_eq!(t.get(GrantId { node: 9, seq: 4 }).unwrap().until_ms, 5000);
     }
 
     /// An expired record is no grant: a copy of the same node, or a

@@ -2356,13 +2356,15 @@ impl Core {
         // first renewal that grants, and again with every later one while
         // they may be live (the reply can be lost).
         // So does what is left of a lock grace here that covers it.
-        let (locks, lock_grace_ms) = if ttl_ms > 0 {
+        let (locks, lock_carry, lock_grace_ms) = if ttl_ms > 0 {
+            let (locks, carry) = self.lock_take_handoff(now, gen);
             (
-                self.lock_take_handoff(now, gen),
+                locks,
+                carry,
                 self.lock_grace_for_generation(now, gen, replica),
             )
         } else {
-            (Vec::new(), 0)
+            (Vec::new(), Vec::new(), 0)
         };
         // The cut first: a barrier it settles raises the floor.
         let (lock_cut_at, lock_cut, lock_barrier) = if ttl_ms > 0 {
@@ -2387,6 +2389,7 @@ impl Core {
             lock_cut_at,
             lock_cut,
             lock_barrier,
+            lock_carry,
         };
         self.deleg_answer_renewal(now, from, hold.filter(|_| ttl_ms > 0), msg, out);
     }
@@ -3024,7 +3027,7 @@ impl Core {
         };
         // Plan 30 §M14: the subtree's lock grants go back with the answer;
         // its waiters are told to ask the root.
-        let locks = self.lock_hand_back(gen, replica);
+        let locks = self.lock_hand_back(now, gen, replica);
         let seen = replica
             .delegation_table()
             .iter()

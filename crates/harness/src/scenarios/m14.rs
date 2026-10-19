@@ -1773,6 +1773,216 @@ pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
     result
 }
 
+// ------------------------------------------------------------------ lock-contention-delegated-moves
+
+/// `lock-contention-delegated` while a delegation move happens at every
+/// handoff: 0.5 s after each unlock the root recalls the delegation of the
+/// directory (`undelegate`) and delegates it to node b again (two moves of its
+/// lock table, as a rename across the subtree's boundary makes). A ghost
+/// contender queues first: a blocking `flock(1)` on the node that is neither
+/// the holder nor the other waiter, killed as the holder lets go, so that a
+/// grant served to it may reach its node with nothing waiting (the race with
+/// its cancel: it does not always). A grant that nobody uses used to be
+/// restamped at each move to a full lock TTL and margin (21 s at the default
+/// TTL): the waiter behind it waited for that. Now it moves with what is left
+/// of its record (`Core::carried_until`): the waiter is granted within a
+/// delegate's capped grant (2 to 3 s), the margins of the moves and the slack
+/// below, judged against the host-lag probe. The next hold starts once the
+/// delegate serves again. Prints each gap and the nodes' `recalls_expired`
+/// and `moved_carried`.
+pub fn lock_contention_delegated_moves(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-contention-delegated-moves";
+    const DELEG_TTL_MS: u64 = 5_000;
+    const ROUNDS: usize = 6;
+    const HOLD: Duration = Duration::from_secs(4);
+    // A grant capped at 3 s and its margin, two moves' margins, and the
+    // handoff itself; a restamp is 21 s per move.
+    const MAX_GAP: Duration = Duration::from_millis(9_000);
+    let (_env, _root, mut clients, _) =
+        super::m11::cluster_with_deleg_ttl(NAME, &["a", "b", "c"], &[], 0, Some(DELEG_TTL_MS))?;
+    let result = (|| -> Result<()> {
+        let b_id = node_id(&clients[1])?;
+        std::fs::create_dir(clients[0].mnt.join("d1"))?;
+        for c in &clients[1..] {
+            eventually("d1 visible", Duration::from_secs(20), || {
+                anyhow::ensure!(c.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        super::m11::delegate(&clients[0], "/d1", b_id)?;
+        super::m11::wait_installed(&clients[1], "/d1", Duration::from_secs(20))?;
+        std::fs::write(clients[0].mnt.join("d1/counter"), [0u8; 8])?;
+        for c in &clients[1..] {
+            eventually("counter visible", Duration::from_secs(30), || {
+                anyhow::ensure!(read_counter(&c.mnt.join("d1/counter"))? == 0);
+                Ok(())
+            })?;
+        }
+        // The mover: after each unlock, 0.5 s later, a rename across the
+        // boundary (the recall) and a new delegation of d1 to b.
+        let (go, moves) = std::sync::mpsc::channel::<()>();
+        let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
+        let root_client = &clients[0];
+        let delegate_client = &clients[1];
+        let window = Instant::now();
+        let ran = std::thread::scope(|scope| -> Result<()> {
+            let mover = scope.spawn(move || -> Result<usize> {
+                let mut done = 0;
+                while moves.recv().is_ok() {
+                    std::thread::sleep(Duration::from_millis(500));
+                    // The recall: the table moves to the root.
+                    super::m11::undelegate(root_client, "/d1")?;
+                    done += 1;
+                    let end = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match super::m11::delegate(root_client, "/d1", b_id) {
+                            Ok(_) => break,
+                            Err(e) if Instant::now() < end => {
+                                let _ = e;
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    super::m11::wait_installed(delegate_client, "/d1", Duration::from_secs(20))?;
+                    let _ = moved_tx.send(());
+                }
+                Ok(done)
+            });
+            let mut gaps: Vec<Duration> = Vec::new();
+            let started = Instant::now();
+            for round in 0..ROUNDS {
+                let holder = round % 3;
+                // The ghost is on a node that is neither the holder nor the
+                // owner (a local op's grant is installed at once and released
+                // with the process).
+                let ghost = if holder == 0 { 2 } else { 0 };
+                let waiter = (0..3)
+                    .find(|n| *n != holder && *n != ghost)
+                    .expect("3 nodes");
+                let hf = open_rw(&clients[holder].mnt.join("d1/counter"))?;
+                flock(&hf, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("holder flock: {e}"))?;
+                let ghost_child = std::process::Command::new("flock")
+                    .arg("-x")
+                    .arg(clients[ghost].mnt.join("d1/counter"))
+                    .arg("true")
+                    .stdin(std::process::Stdio::null())
+                    .process_group(0)
+                    .spawn()
+                    .context("running flock(1) as the ghost")?;
+                let ghost_pid = ghost_child.id() as libc::pid_t;
+                let mut ghost_child = ghost_child;
+                std::thread::sleep(Duration::from_millis(500));
+                let path = clients[waiter].mnt.join("d1/counter");
+                let live = std::thread::spawn(move || counter_turn(path, Duration::ZERO));
+                std::thread::sleep(HOLD);
+                {
+                    use std::os::unix::fs::FileExt;
+                    let mut buf = [0u8; 8];
+                    let got = hf.read_at(&mut buf, 0)?;
+                    let cur = if got == 8 { u64::from_be_bytes(buf) } else { 0 };
+                    hf.write_at(&(cur + 1).to_be_bytes(), 0)?;
+                    hf.sync_all()?;
+                }
+                // The ghost goes as the lock is let go.
+                // SAFETY: a signal to the group this child leads.
+                unsafe {
+                    libc::kill(-ghost_pid, libc::SIGKILL);
+                }
+                let released = Instant::now();
+                flock(&hf, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("holder unlock: {e}"))?;
+                drop(hf);
+                let _ = go.send(());
+                let (acquired, _unlocked, took) = live.join().expect("counter turn")?;
+                let _ = ghost_child.wait();
+                // The next hold starts once the move is over and the delegate
+                // serves again: a holder whose grant straddles a move is a
+                // different measure (its renewals meet the recall).
+                match moved_rx.recv_timeout(Duration::from_secs(40)) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // The mover ended: its error says why.
+                        return match mover.join().expect("mover") {
+                            Err(e) => Err(e.context("the mover failed")),
+                            Ok(_) => Err(anyhow::anyhow!("the mover ended early")),
+                        };
+                    }
+                    Err(e) => bail!("the move did not finish: {e}"),
+                }
+                let gap = acquired.saturating_duration_since(released);
+                eprintln!(
+                "    {NAME}: round {round} (held by {}, ghost {}, waiter {}): gap {gap:?}, waited {took:?}",
+                clients[holder].name, clients[ghost].name, clients[waiter].name
+            );
+                gaps.push(gap);
+            }
+            drop(go);
+            let moved = mover.join().expect("mover")?;
+            let longest = gaps.iter().max().copied().unwrap_or_default();
+            let expected = 2 * ROUNDS as u64;
+            let got = read_counter(&clients[0].mnt.join("d1/counter"))?;
+            for c in &clients {
+                let l = locks_of(c)?;
+                eprintln!(
+                    "    {NAME}: {}: recalls_expired {}, moved_carried {}, grants_made {}",
+                    c.name,
+                    l["recalls_expired"].as_u64().unwrap_or(0),
+                    l["moved_carried"].as_u64().unwrap_or(0),
+                    l["grants_made"].as_u64().unwrap_or(0),
+                );
+            }
+            eprintln!(
+                "    {NAME}: counter {got}, {moved} moves; handoff gaps {}",
+                super::m8::dist(gaps.clone())
+            );
+            anyhow::ensure!(
+                got == expected,
+                "counter {got}, expected {expected} (lost or doubled increments)"
+            );
+            anyhow::ensure!(moved >= ROUNDS, "{moved} moves in {ROUNDS} rounds");
+            crate::hostlag::latency_bound_over(
+                &format!("{NAME}: the longest handoff gap"),
+                (started, Instant::now()),
+                longest,
+                Duration::from_millis(100),
+                MAX_GAP,
+            )?;
+            Ok(())
+        });
+        // A holder whose grant lapsed because the host stalled (a core
+        // step of seconds on a loaded box) is fenced: `EIO`. Not the rule's.
+        match ran {
+            Err(e)
+                if e.root_cause()
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.raw_os_error() == Some(libc::EIO)) =>
+            {
+                let lag = crate::hostlag::lag_between(window, Instant::now());
+                anyhow::ensure!(
+                    lag.max >= Duration::from_millis(500),
+                    "a holder was fenced (EIO) and no host stall explains it (longest {:?}): {e:#}",
+                    lag.max
+                );
+                crate::hostlag::inconclusive(format!(
+                    "{NAME}: a holder was fenced (EIO); the host stalled {:?}",
+                    lag.max
+                ));
+                Ok(())
+            }
+            other => other,
+        }
+    })();
+    if result.is_err() {
+        for c in &clients {
+            print_locks(NAME, c);
+        }
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}
+
 // ------------------------------------------------------------------ lock-grace-wait
 
 /// Three nodes after the holder was killed with a lock held (plan 43

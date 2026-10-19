@@ -45,8 +45,19 @@
 //!   renewal re-sends the live copies (the reply can be lost), and a
 //!   generation that ends without handing one back — its recall
 //!   overtook the reply — leaves it reinstated in the root's table,
-//!   where the subtree's next delegation takes it along. A delegate
-//!   outwaited by TTL also leaves a grace on its subtree. An
+//!   where the subtree's next delegation takes it along. A grant that
+//!   moves does not get a fresh lock TTL at its receiver, which a
+//!   restamp (`now + ttl + margin`) did: it travels with what is left of
+//!   its record, a duration the sender measures as the grant leaves its
+//!   table, and the receiver records `min(restamp, now + left + margin)`
+//!   ([`Core::lock_install_moved`]). Its holder may be gone (a push that
+//!   lapsed or found no op, a holder that lapsed under the delegate's short
+//!   authority or released at the old owner after the move), and then
+//!   whoever waits behind it waited a whole lock TTL again at every move
+//!   (21 s at the production TTL, sim `locks-delegated-production-ttl`
+//!   seed 15, and 694 of 2000 seeds of its heavy variant). The leaving
+//!   grants stay restamped. A delegate outwaited by TTL also leaves a
+//!   grace on its subtree. An
 //!   asynchronous mirror rides to the backups (`LockMirror`); a fast
 //!   successor installs it, restamped, next to the floor.
 //!
@@ -522,6 +533,20 @@ impl Core {
         self.lk.waiters.len()
     }
 
+    /// Owner side: how many grants served to `node` in a row went unused
+    /// and were outwaited (tests).
+    #[cfg(test)]
+    pub(crate) fn lock_unused_grants(&self, node: NodeId) -> u32 {
+        self.lk.unused_grants.get(&node).copied().unwrap_or(0)
+    }
+
+    /// Owner side: `id` was served from the queue and not seen used since
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn lock_is_unproven(&self, id: GrantId) -> bool {
+        self.lk.unproven.contains(&id)
+    }
+
     /// Owner side: peers taken for unreachable right now (tests).
     #[cfg(test)]
     pub(crate) fn lock_unreachable(&self) -> usize {
@@ -619,6 +644,41 @@ impl Core {
     /// what its holder measured.
     fn restamp(&self, now: Ms) -> i64 {
         now.0 + self.lock_ttl_ms() + self.lock_margin_ms()
+    }
+
+    /// The record of a moved grant that carried what was left of its
+    /// own (`left_ms`: the sender's measure, a duration, at its send):
+    /// from this receipt, plus the margin for this clock — each hop
+    /// measures one more duration on one more clock — and never later
+    /// than a restamp.
+    ///
+    /// Why it never ends before a window a holder honours: the sender's
+    /// record already ended no sooner (the invariant 11ff444 restored:
+    /// an owner's record is at least `ttl + margin` from the request it
+    /// answered, and a re-grant in place keeps the later end); the
+    /// sender measured `left` in the step that took the grant out of its
+    /// table (`lock_on_delegated`, `lock_hand_back`) and extends nothing
+    /// after (it renews and reclaims no grant it does not have, and
+    /// routes the inode elsewhere), so only this receiver can extend a
+    /// holder's window from there; this receipt is after that
+    /// measure in real time; and the margin pays for the second clock.
+    /// A restamp ends no sooner than any such window either (from a send
+    /// before now), so the minimum of the two is as safe as each, and is
+    /// never longer than a restamp (what a move gave before). Model:
+    /// `MoveStamp::CarryAll` (`crates/model/src/locks.rs`).
+    fn carried_until(&self, now: Ms, left_ms: u64) -> i64 {
+        now.0
+            .saturating_add(left_ms.min(i64::MAX as u64) as i64)
+            .saturating_add(self.lock_margin_ms())
+            .min(self.restamp(now))
+    }
+
+    /// What is left of `g`'s record on the sender's clock at `now`, in
+    /// ms: the duration a moved grant carries. An expired record not yet
+    /// dropped carries 0 (it arrives as `now + margin`, and its expiry
+    /// there is an outwait like any other).
+    fn lock_left(now: Ms, g: &Grant) -> u64 {
+        (g.until_ms - now.0).max(0) as u64
     }
 
     // ------------------------------------------------------------ routing
@@ -5362,13 +5422,25 @@ impl Core {
 
     /// Delegate: the generation is recalled — its grants and its
     /// subtree's floor go back with the answer.
+    ///
+    /// Every grant goes back with what is left of its record
+    /// (`LockHandback::carry`, measured here, in the step that takes it out
+    /// of the table and stops the generation: nothing here renews or
+    /// reclaims it after); the root records it from the receipt
+    /// (`Core::carried_until`). The grants that left the subtree are
+    /// restamped by the root.
     pub(crate) fn lock_hand_back(
         &mut self,
+        now: Ms,
         gen: u64,
         replica: &dyn Replica,
     ) -> constellation_meta::locks::LockHandback {
         let dir = self.dl.mine.get(&gen).map(|d| d.dir);
         let grants = self.lock_take_generation(gen, replica);
+        let carry: Vec<(GrantId, u64)> = grants
+            .iter()
+            .map(|g| (g.id, Self::lock_left(now, g)))
+            .collect();
         let (floor, barrier) = match dir {
             Some(dir) => (
                 self.lock_subtree_floor(dir, |ino| replica.is_under(ino, dir), replica),
@@ -5378,6 +5450,7 @@ impl Core {
         };
         constellation_meta::locks::LockHandback {
             grants,
+            carry,
             floor,
             barrier,
         }
@@ -5387,7 +5460,17 @@ impl Core {
     /// waiting for its first one, and again every grant handed to it
     /// before that this root would still consider live (see
     /// [`LockState::handed`]; the delegate installs each id once).
-    pub(crate) fn lock_take_handoff(&mut self, now: Ms, gen: u64) -> Vec<Grant> {
+    ///
+    /// Every copy comes with what is left of its record, measured now (it
+    /// shrinks at every re-send: the receipt is later each time, which only
+    /// lengthens the delegate's record in real time). The copy itself is
+    /// frozen: the subtree's route is the delegate's, so nothing here
+    /// renews it.
+    pub(crate) fn lock_take_handoff(
+        &mut self,
+        now: Ms,
+        gen: u64,
+    ) -> (Vec<Grant>, Vec<(GrantId, u64)>) {
         let pending = self.lk.handoff.remove(&gen).unwrap_or_default();
         let handed = self.lk.handed.entry(gen).or_default();
         handed.extend(pending);
@@ -5396,7 +5479,11 @@ impl Core {
         if grants.is_empty() {
             self.lk.handed.remove(&gen);
         }
-        grants
+        let carry = grants
+            .iter()
+            .map(|g| (g.id, Self::lock_left(now, g)))
+            .collect();
+        (grants, carry)
     }
 
     /// Root: generation `gen` ended. What was waiting for its first
@@ -5449,6 +5536,7 @@ impl Core {
     ) {
         let constellation_meta::locks::LockHandback {
             grants,
+            carry,
             floor,
             barrier,
         } = back;
@@ -5511,17 +5599,30 @@ impl Core {
             self.lock_install_leaving(now, gen, left, replica);
         }
         if !grants.is_empty() {
-            self.lock_install_moved(now, 0, grants, replica);
+            self.lock_install_moved(now, 0, grants, &carry, replica);
         }
     }
 
     /// Delegate: grants that came with a renewal or, root: with a recall
-    /// answer — installed restamped.
+    /// answer — installed from this receipt with what was left of their
+    /// record (`carry`: ids with the sender's measure, a duration;
+    /// `Core::carried_until`), and restamped when the sender listed none
+    /// (a message from a sender without the measure, an undecodable one, the
+    /// leaving grants).
+    ///
+    /// Invariants (tests: `a_carried_*`, `a_moved_twice_*`):
+    /// - the record never ends before a window a holder may honour for
+    ///   the grant (`Core::carried_until`);
+    /// - at the root (`gen == 0`) it is never below the record it
+    ///   replaces: a reclaim answered in a grace before the move arrived
+    ///   put a later end there (`install_keeping_later`);
+    /// - never later than a restamp.
     pub(crate) fn lock_install_moved(
         &mut self,
         now: Ms,
         gen: u64,
         grants: Vec<Grant>,
+        carry: &[(GrantId, u64)],
         replica: &dyn Replica,
     ) {
         if gen != 0 && self.deleg_mine_until(gen).is_none() {
@@ -5540,9 +5641,11 @@ impl Core {
             }
             return;
         }
-        let until = self.restamp(now);
+        let restamp = self.restamp(now);
         let mut n = 0;
         for g in grants {
+            let left = carry.iter().find(|(id, _)| *id == g.id).map(|(_, l)| *l);
+            let until = left.map_or(restamp, |l| self.carried_until(now, l));
             // Tagged with the generation the move names (0: the root's
             // table) — never resolved from the delegation table, which
             // may not say yet (a handoff arrives with the renewal that
@@ -5554,7 +5657,11 @@ impl Core {
                 ..g
             };
             if gen == 0 {
-                replica.locks().install(g);
+                if left.is_some() {
+                    replica.locks().install_keeping_later(g);
+                } else {
+                    replica.locks().install(g);
+                }
             } else {
                 // A re-sent handoff: each id once, and never over a
                 // newer grant of the same node, or next to a conflicting
@@ -5568,6 +5675,18 @@ impl Core {
             }
             self.stats.lock_moved += 1;
             n += 1;
+            if let Some(left) = left {
+                self.stats.lock_moved_carried += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    gen,
+                    holder = g.node,
+                    ino = g.ino,
+                    left,
+                    until,
+                    "a moved lock grant carried what was left of its record"
+                );
+            }
         }
         if n > 0 {
             tracing::debug!(

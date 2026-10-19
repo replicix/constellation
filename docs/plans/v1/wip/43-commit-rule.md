@@ -1741,6 +1741,18 @@ the late-answer rules, the leaving-grant fields and functions,
 `restamp` outside the log-derived install, `pending_returns`' remnants;
 the inferred void cut.
 
+**Carry across `LockMove` (PROGRESS "Fix: a delegation move carries what is
+left of a lock grant's record").** The log-derived install restamps, which is
+the 21 s per move the carry removed (sim
+`locks-delegated-production-ttl-heavy`: 729 of 2000 seeds failed, 33 now). So
+`LockMove` must carry, per moved grant, the remaining duration measured at the
+append (`lock_left`, `core/locks.rs`), and the derived install records
+`min(restamp, now + left + margin)` at the apply (`carried_until`: the apply
+is after the append), never below a record the table already has of the node
+on the inode (`install_keeping_later`). The derived install must not restamp
+them, or the 21 s wait returns with C4. C4's model keeps `MoveStamp::CarryAll`
+(`crates/model/src/locks.rs`).
+
 **Keep (the ask-again rule, PROGRESS "Fix: a pushed lock grant is never older
 than its holder's first renewal").** The rewrite of `core/locks.rs` carries
 over what only withholds, orders or tells: `lock_try_grant` pushes a grant to
@@ -1958,6 +1970,16 @@ step cannot move; four commits) and gets its own reviews:
     requester's wall clock between a request and a cancel makes the owner
     drop a live waiter (`w.sent < upto`); liveness only, its next re-send
     repairs it. C7-H1 moves both with the other `sent` stamps.
+  The delegation move's carry (PROGRESS "Fix: a delegation move carries what
+  is left of an unused lock grant") adds two more wait-side stamps, both
+  durations: `lock_left` (the sender's `until − now` of a grant leaving its
+  table, `DelegRenewed::lock_carry`, `LockHandback::carry`) and
+  `carried_until` (the receiver's `now + left + margin`) are WAIT-clock
+  sites, like every other record of the owner's grant table. Nothing crosses
+  nodes but the duration. C7-H1 converts them with `restamp` and the grant
+  records (a forward step of the sender between the grant and the move
+  shortens `left`: the same early-outwait class as a step of the root's own
+  grant table, covered by the same fix).
   *Specified 2026-10-19* (the coder spec is kept with the reviews). The
   fix is the step-safe half of C7a: no local duration reads the wall
   clock.

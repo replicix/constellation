@@ -3524,13 +3524,14 @@ fn sweep_config() {
                             eprintln!(
                                 "SWEEP-SLOW {label} seed {seed}: longest acquisition {} ms, longest \
                                  handoff gap {} ms, {} overtakes; grants outwaited {}, short \
-                                 authority waits {}, grants moved {}, asks {}, passed over {}",
+                                 authority waits {}, grants moved {} (carried {}), asks {}, passed over {}",
                                 report.locks.max_wait_ms,
                                 report.locks.max_handoff_gap_ms,
                                 report.locks.overtaken,
                                 sum(|s| s.lock_recalls_expired),
                                 sum(|s| s.lock_short_authority_waits),
                                 sum(|s| s.lock_moved),
+                                sum(|s| s.lock_moved_carried),
                                 sum(|s| s.lock_asked_again),
                                 sum(|s| s.lock_ask_again_passed_over),
                             );
@@ -3545,6 +3546,7 @@ fn sweep_config() {
                             asked_again: sum(|s| s.lock_asked_again),
                             passed_over: sum(|s| s.lock_ask_again_passed_over),
                             reserved_waits: sum(|s| s.lock_reserved_waits),
+                            carried: sum(|s| s.lock_moved_carried),
                             acquired: report.locks.acquired,
                             ios: report.locks.ios,
                         });
@@ -3621,7 +3623,8 @@ fn sweep_config() {
                 "SWEEP-LOCKS {label}: {} seeds; per-seed longest acquisition p50/p90/p99/max \
                  {w50}/{w90}/{w99}/{wmax} ms; longest handoff gap {g50}/{g90}/{g99}/{gmax} ms; \
                  overtakes {} (in {} seeds); asked again {}; passed over {} (in {} seeds); \
-                 reserved waits {}; locks acquired {}, I/Os {}; seeds with the owner node's \
+                 reserved waits {}; grants carried across a move {} (in {} seeds); locks acquired {}, \
+                 I/Os {}; seeds with the owner node's \
                  longest wait over 45 s / 50 s: {} / {}, the other nodes': {} / {}",
                 seeds.len(),
                 seeds.iter().map(|e| e.overtaken).sum::<u64>(),
@@ -3630,6 +3633,8 @@ fn sweep_config() {
                 seeds.iter().map(|e| e.passed_over).sum::<u64>(),
                 seeds.iter().filter(|e| e.passed_over > 0).count(),
                 seeds.iter().map(|e| e.reserved_waits).sum::<u64>(),
+                seeds.iter().map(|e| e.carried).sum::<u64>(),
+                seeds.iter().filter(|e| e.carried > 0).count(),
                 seeds.iter().map(|e| e.acquired).sum::<u64>(),
                 seeds.iter().map(|e| e.ios).sum::<u64>(),
                 seeds
@@ -6080,6 +6085,7 @@ struct M14Totals {
     renewals_served: u64,
     reclaimed: u64,
     moved: u64,
+    moved_carried: u64,
     leaving_installed: u64,
     reinstated: u64,
     graces_inherited: u64,
@@ -6165,6 +6171,7 @@ impl M14Totals {
             self.renewals_served += s.lock_renewals_served;
             self.reclaimed += s.lock_reclaimed;
             self.moved += s.lock_moved;
+            self.moved_carried += s.lock_moved_carried;
             self.leaving_installed += s.lock_leaving_installed;
             self.reinstated += s.lock_reinstated;
             self.graces_inherited += s.lock_graces_inherited;
@@ -6337,6 +6344,8 @@ struct SeedLocks {
     asked_again: u64,
     passed_over: u64,
     reserved_waits: u64,
+    /// Moved grants that carried what was left of their record.
+    carried: u64,
     /// Locks acquired and I/Os done in the critical sections (fenced ones
     /// apart).
     acquired: u64,
@@ -6371,6 +6380,7 @@ fn run_lock_seeds(
             asked_again: 0,
             passed_over: 0,
             reserved_waits: 0,
+            carried: report.stats.values().map(|s| s.lock_moved_carried).sum(),
             acquired: report.locks.acquired,
             ios: report.locks.ios,
         });
@@ -6518,6 +6528,67 @@ fn capped_grants_hand_a_lock_over_within_a_round_trip() {
             report.locks.max_wait_owner_ms
         );
     }
+}
+
+/// A delegation move carries what is left of a grant's record instead of
+/// restamping it to a full lock ttl (`Core::carried_until`; the core tests
+/// `a_*_hands_*_what_was_left_of_it`). At the production TTL, with nine ops on
+/// a file and renames crossing subtrees, a waiter behind a grant whose holder
+/// was gone (a push that lapsed, a holder fenced under a delegate's short
+/// authority, a release that reached the old owner after the move) waited 21 s
+/// per move: on `7780c8e` 729 of the 2000 seeds of the configuration never got
+/// a lock in 60 s (28 without moves), 33 do with the carry. This range of the
+/// configuration has none of the 33; 18 of its 39 seeds fail on `7780c8e`.
+#[test]
+fn delegation_moves_carry_what_is_left_of_a_grant() {
+    let (per_seed, totals) = run_lock_seeds(
+        "locks-delegated-production-ttl-heavy",
+        locks_delegated_production_ttl_heavy_config(),
+        25..64,
+        &[|s| s.lock_moved_carried, |s| s.lock_moved],
+    );
+    let [carried, moved] = totals[..] else {
+        unreachable!()
+    };
+    assert!(
+        moved > 0 && carried > 0,
+        "vacuous: {moved} moved, {carried} carried"
+    );
+    assert!(
+        per_seed.iter().filter(|s| s.carried > 0).count() >= 20,
+        "carried in too few seeds: {carried} grants"
+    );
+}
+
+/// Seeds 1249 and 1774 of the delegated production-TTL configuration: the two
+/// of 2000 that still never got a lock in 60 s after the ask-again rule
+/// (`7780c8e`). Each moved a grant twice, and the move that restamped it left
+/// its record to be outwaited 21 s later (1249: a grant of the delegate's own
+/// node; 1774: the grant of the root's node, restamped by the second move).
+#[test]
+fn regression_locks_delegated_production_ttl_moved_grants_seeds_1249_1774() {
+    for seed in [1249, 1774] {
+        run_seed(seed, locks_delegated_production_ttl_config()).unwrap_or_else(|e| {
+            panic!(
+                "locks-delegated-production-ttl seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-delegated-production-ttl"
+            )
+        });
+    }
+}
+
+/// Seed 2 of the heavy configuration: three grants answered directly (not
+/// from a queue) lapsed at their holders (fenced at 2.2 s) just before a move
+/// at 2.4 s, and the restamp kept them 21 s: the first lock was granted at
+/// 24 s and a client waited past 60 s.
+#[test]
+fn regression_locks_delegated_production_ttl_heavy_moved_lapsed_grants_seed_2() {
+    run_seed(2, locks_delegated_production_ttl_heavy_config()).unwrap_or_else(|e| {
+        panic!(
+            "locks-delegated-production-ttl-heavy seed 2: {e}\n  replay with \
+             AUTHORITY_SIM_CONFIG=locks-delegated-production-ttl-heavy"
+        )
+    });
 }
 
 /// Two waiters of one node on one file, served in one pass, the second

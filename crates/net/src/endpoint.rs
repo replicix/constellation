@@ -1262,6 +1262,7 @@ pub trait PeerService: Send + Sync + 'static {
         _lock_cut_at: i64,
         _lock_cut: Vec<u8>,
         _lock_barrier: i64,
+        _lock_carry: Vec<u8>,
     ) {
     }
     /// Plan 30 §M11: the root's recall. Default: nothing executed.
@@ -1280,6 +1281,7 @@ pub trait PeerService: Send + Sync + 'static {
                 locks: Vec::new(),
                 lock_floor: Vec::new(),
                 lock_barrier: 0,
+                lock_carry: Vec::new(),
             }
         })
     }

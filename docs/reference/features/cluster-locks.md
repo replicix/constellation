@@ -1264,8 +1264,34 @@ its predecessor's live exclusive grant (`locks-blips-tight` seed 2723).
 
 The lock table follows the subtree. The root hands a subtree's grants to
 its delegate with the delegate's first renewal, and gets them back when
-the delegation is recalled. The receiver restamps each grant so that it
-never expires at the owner before it lapses at the node.
+the delegation is recalled. A grant does not get a fresh lock TTL at its
+receiver, as it would from a restamp (`now + ttl + margin`): it moves with
+what is left of its record, a *duration* the sender measures as the grant
+leaves its table (the root as the delegation is granted, re-measured at
+every re-send of the handoff; the delegate as it answers the recall), and the
+receiver records `min(restamp, now + left + margin)` from the receipt.
+
+The restamp was the cost of every move to whoever waited behind a grant whose
+holder was gone: a push that lapsed or found no op, a holder fenced under a
+delegate's short authority, a holder that released at the old owner after the
+move (its release finds no record there, and the new owner keeps the copy).
+Nobody releases such a record, so the waiter waited for it to end: a whole lock
+TTL again at every move, 21 s at the production TTL. A move of the heavy
+delegated production-TTL configuration (nine ops on a file, renames crossing
+subtrees) of the sim failed 729 of 2000 seeds, the same configuration without
+moves 28; carried, 33.
+
+The carry is safe because the sender's record already ended no sooner than any
+window its holder honours, the sender gives the grant up as it measures (the
+root's copy is frozen, the delegate stops serving at the recall; neither renews
+it afterwards), the receipt is after the measure, and the margin added at it
+pays for the second clock: each hop adds one, and a carried record is never
+longer than a restamp. Only durations cross nodes. The root also never lets the
+carried record end before one it already has for the same node on the inode (a
+reclaim it answered meanwhile). The mirror to the backups, the grants that leave
+with an unlinked file and a grace's end are still restamped. `lock_moved_carried`
+(status `locks.moved_carried`) counts the grants a move installed carried. (The
+model checks this: `crates/model/src/locks.rs`, `MoveStamp::CarryAll`.)
 
 A delegate's grants are capped by its delegation (`delegation_ttl −
 2 × margin` at most, less what is spent since its last renewal): 13 to
@@ -1398,19 +1424,17 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   program sees it and must retry.
 - **Handoffs the ask does not cover.** Two causes of a waiter's wait past
   the round trip are known and not changed by it. (1) A grant moved with
-  its subtree (a delegation recalled, a rename across subtrees) is
-  restamped to a full lock ttl and margin, so a grant that lapsed at its
-  holder meanwhile (an idle one a delegate's short authority could not
-  renew) is outwaited for 21 s: in the sim at a short delegation two seeds
-  of 2000 with two moves each still wait more than a minute. A tighter
-  restamp (the remaining duration instead of a full ttl, for grants the
-  sender knows were never renewed) needs a model check first. (2) A
+  its subtree (a delegation recalled, a rename across subtrees) carries what
+  was left of its record ([Delegations](#delegations)); a holder that is gone
+  is outwaited for that, not a lock ttl more. (2) A
   delegate's own idle grant lapses with its short authority
   (`ShortAuthority` waits), and the outwait and the barrier after it cost
   `ttl + margin` and more (3 to 4.5 s). A waiter whose op nothing waits
   for at its node and whose cancel was lost, or whose op left meanwhile,
   is asked once in vain: 600 ms of its queue's wait
-  (`ask_again_passed_over`).
+  (`ask_again_passed_over`). In the sim's heavy delegated
+  production-TTL configuration chains of 4 to 11 such outwaits in one wait
+  fail 33 of 2000 seeds (28 of the same without moves).
 - **No deadlock detection.** There is no `EDEADLK`: two owners waiting
   on each other wait until a signal ends one of the waits, as they do
   with `flock`.

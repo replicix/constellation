@@ -52451,3 +52451,107 @@ configuration. 39 lock configurations on 0b1600d (0..2000, long-grants 3000,
 double-seal 8000): unchanged up to sweep noise in fault configurations.
 Gates: fmt, clippy `-p constellation-authority --all-targets -D warnings`,
 authority lib 467 passed.
+
+## Fix: a delegation move carries what is left of an unused lock grant instead of a full lock TTL
+
+The restamp on a delegation's move (the "Not done" 4(b) of the ask-again entry
+above): every grant a move carried was recorded at its receiver as `now + lock
+TTL + margin` (21 s at the production TTL), so whoever waited behind a grant
+nobody would ever release waited that long again at every move. The rule now: a
+grant served from the queue to a remote waiter and not renewed, released or
+outwaited since (`LockState::unproven`, decision D1) travels with what is left
+of its record, a duration (`DelegRenewed::lock_carry` for the root's handoff,
+re-measured at every re-send; `LockHandback::carry` for the delegate's recall
+answer, measured as it takes the grants out of its table), and the receiver
+records `min(restamp, now + left + margin)` (`carried_until`); at the root never
+below the record it replaces (`LockTables::install_keeping_later`); a carried
+grant joins the receiver's `unproven` (D2). Everything else is restamped as
+before (mirror, leaving grants, graces, renewed or directly answered grants).
+Safety (spec §3): the sender's record already ends no sooner than any window its
+holder honours; both carrying moves take the grant out of the sender's table in
+the step that measures it, so only the receiver can extend a window afterwards;
+the receipt is after the measure; the margin pays for the second clock; durations
+only; never longer than a restamp. The model (`MoveStamp`, 0b1600d) checks it:
+`CarryUnproven` and `CarryAll` clean; no margin and a kept absolute violate.
+Wire: append-only (`lock_carry` on `DelegRenewed`, `carry` in `LockHandback`,
+`lock_carry` on the two payloads); status `locks.moved_carried`.
+
+**What the sweep says (measured, and not what was expected).** Heavy delegated
+production-TTL configuration, 0..2000 (`locks-delegated-production-ttl-heavy`):
+
+| tree | failing |
+|---|---|
+| `7780c8e` | 729 |
+| this fix (D1: unproven only) | 694 (36 fixed, 1 new, seed 1150) |
+| carry every grant never renewed (variant) | 669 |
+| `CarryAll` | 33 |
+| `7780c8e`, no moves (`+nomove`) | 28 |
+
+All 729 and 694 are waits of 60 s, none a violation. Of the 694, 665 pass under
+`CarryAll` and 29 fail there too: so the restamps that still hurt are of grants
+that D1 does not carry: answered directly (not from a queue: seed 2, three shared
+grants fenced at their holders at 2.2 s, moved at 2.4 s, outwaited at 23.5 s),
+renewed ones, a grant of the node that owns the table (excluded from `unproven`,
+D2: seed 1774's second hop), and records left by a release that reached the old
+owner after the move (D6 a: seed 1249). `CarryAll` leaves 33, of the same kind as
+the 28 without moves: chains of 4 to 11 outwaits of idle grants of the delegate's
+short authority (3 to 6 s each) inside one 60 s wait. The non-heavy configuration
+(`locks-delegated-production-ttl`, 2000): `7780c8e` and D1 fail 1249 and 1774,
+`CarryAll` none; `+heavy+solo` and `locks-production-ttl` 0 everywhere. The
+recommendation is `CarryAll` (the model has it clean, it is simpler: no
+`handed_unproven`, no `unproven` use), a delta on this patch.
+
+Tests (fail-before with the receiver ignoring the carry, the types and senders in
+place): ten core tests (`a_recalled_delegation_hands_an_unused_grant_back_with_what_was_left_of_it`,
+`a_delegation_hands_an_unused_grant_over_with_what_was_left_of_it`,
+`an_unused_grant_moved_twice_is_outwaited_within_its_own_window`,
+`a_renewed_grant_moved_is_restamped` (guard, passes both ways),
+`a_carried_record_never_ends_sooner_than_the_record_it_replaces` (passes before;
+fails with a plain `install`), `a_carried_window_is_never_longer_than_a_restamp`
+(passes before; fails without the cap),
+`an_expired_unused_record_moved_is_outwaited_with_its_barrier`,
+`a_resent_handoff_carries_what_is_left_at_each_send`,
+`a_grant_renewed_at_the_delegate_is_handed_back_restamped`,
+`a_carried_grant_joins_the_receivers_unused_count`): 7 fail before. Mutations in
+the product code: no margin fails five, a sender's absolute kept fails five, the
+plain `install` one, no cap one. Meta `install_keeping_later_never_shortens_the_replaced_record`,
+net and engine wire round trips. Sim: `delegation_moves_carry_unused_grants` (twelve
+heavy seeds that fail on `7780c8e`; seed 38 moved at 12.6 s was outwaited at 33.7 s,
+now 18.1 s) and `regression_locks_delegated_production_ttl_seed_15`.
+
+Sweeps on this tree, 2000 seeds each unless noted, all 0 failing: every `locks*`
+configuration (list in `/tmp/cst-lockexp-analysis.md`), `locks-long-grants(-seal)`
+3000, `double-seal-inside-the-grace` 8000, `locks-blips-tight-faults` 5000..6000;
+the controls fail as designed (`locks-writer-hold-unchecked` 1974,
+`locks-writer-hold-delegated-unsettled` 2). Harness `lock-contention-delegated-moves`
+(new: a recall and a new delegation 0.5 s after each unlock, a ghost contender): the
+ghost's grant rarely goes unused on a real kernel (the cancel wins the race), so it is
+a smoke test; one run on the fix carried the ghost's grant and outwaited it 5.5 s
+after the move (21 s with a restamp).
+
+Not done (D6): dropping the root's handed copy when a release reaches it after the
+move; carrying the waiter's queue position across a move. Plan 43: C4's log-derived
+install must carry (note in C4), and the two measurements are WAIT-clock sites of
+C7-H1 (note there).
+
+### The rule becomes `CarryAll` (the decision D1 revisited on the sweep above)
+
+Every grant of the two carrying moves now travels with what is left of its
+record (the model's `MoveStamp::CarryAll`, clean), not only the `unproven` ones.
+Removed: `LockState::handed_unproven`, its pruning, the filters in
+`lock_on_delegated`, `lock_take_handoff` and `lock_hand_back`, and the carried
+grants' join of the receiver's `unproven` (an outwait of a carried grant is not an
+unused grant of its node: no moved grant ever counted). Same safety argument (it
+never used "unused": §3); the mirror, the leaving grants and graces stay
+restamped. Heavy delegated production-TTL 0..2000: 33 failing (729 on `7780c8e`;
+chains of 4 to 11 outwaits of idle grants, 28 of the same without moves);
+`locks-delegated-production-ttl` 0..2000: 0 (2 before); `+heavy+solo` and
+`locks-production-ttl` 0; every `locks*` configuration (the list above, the same
+seed counts) 0 failing, the two controls fail as designed. Tests: the core tests
+4, 9 and 10 now say what the new rule does (`a_renewed_grant_moved_is_carried_too`,
+`a_grant_renewed_at_the_delegate_is_handed_back_with_its_renewed_record`,
+`a_carried_grant_outwaited_at_the_receiver_is_not_counted_unused`); the sim has
+`delegation_moves_carry_what_is_left_of_a_grant` (heavy seeds 25..64, none of the 33;
+18 of the 39 fail on `7780c8e`), and pins for seeds 1249 and 1774 of the plain
+configuration and seed 2 of the heavy one (fail on `7780c8e`). The remaining
+failures are the delegate's idle-grant outwaits, not moves.

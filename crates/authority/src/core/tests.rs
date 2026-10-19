@@ -11880,7 +11880,7 @@ mod locks {
             "left in the root's table under gen 8: {:?}",
             h.meta.locks().grants_snapshot()
         );
-        let handed = h.core.lock_take_handoff(now, 8);
+        let (handed, _) = h.core.lock_take_handoff(now, 8);
         assert_eq!(handed.len(), 1, "{handed:?}");
         assert_eq!(handed[0].id, live.id);
         assert_eq!(handed[0].until_ms, live.until_ms, "restamped: {handed:?}");
@@ -11942,6 +11942,7 @@ mod locks {
                 gen: 7,
                 through: 0,
                 locks: constellation_meta::locks::LockHandback {
+                    carry: Vec::new(),
                     grants: vec![lapsed],
                     floor: Position::ZERO,
                     barrier: 0,
@@ -12016,6 +12017,7 @@ mod locks {
                 gen: 7,
                 through: 0,
                 locks: constellation_meta::locks::LockHandback {
+                    carry: Vec::new(),
                     grants: vec![live],
                     floor: Position::ZERO,
                     barrier: 0,
@@ -14896,6 +14898,7 @@ mod locks {
                 lock_cut_at: cut_at,
                 lock_cut: Box::new(cut),
                 lock_barrier: 0,
+                lock_carry: Vec::new(),
             },
         };
         let mut cut = Position::ZERO;
@@ -18381,7 +18384,7 @@ mod locks {
         );
         // Handed over: the root keeps its copy.
         let now = h.now;
-        assert_eq!(h.core.lock_take_handoff(now, 7).len(), 1);
+        assert_eq!(h.core.lock_take_handoff(now, 7).0.len(), 1);
         assert!(
             h.core.lock_duty_live(now, &h.meta),
             "handed, not handed back"
@@ -22249,6 +22252,587 @@ mod locks {
         assert_eq!(h.core.stats.lease_renewals_for_grants, 1);
         assert!(next_round_renews(&mut h));
     }
+
+    // ---- a delegation move carries what is left of an unused grant ----
+    //
+    // A grant served from the queue and never seen used moves with what is
+    // left of its record (`Core::carried_until`), not a restamp (a full lock
+    // ttl more, at every move: sim `locks-delegated-production-ttl` seed
+    // 15). Both ends are cores of their own; times are real (one clock for
+    // all of them here: durations, not absolutes, cross).
+
+    /// `d/turn.lock` in a replica that does not delegate `d` yet:
+    /// `(dir, f)` as [`delegated_file`] makes them.
+    fn plain_dir_file(meta: &Meta) -> (Ino, Ino) {
+        let dir = meta.allocate_ino(ROOT_INO).unwrap();
+        let f = meta.allocate_ino(dir).unwrap();
+        crate::replica::Replica::apply_segment(
+            meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Create {
+                    parent: dir,
+                    name: "turn.lock".into(),
+                    ino: f,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 2,
+                },
+            ],
+        )
+        .unwrap();
+        (dir, f)
+    }
+
+    /// The root delegates `dir` (as `gen`) to node 3, as its log says it.
+    fn delegate_to_3(meta: &Meta, dir: Ino, gen: u64) {
+        crate::replica::Replica::apply_segment(
+            meta,
+            3,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Delegate {
+                dir,
+                node: 3,
+                gen,
+                designated: false,
+                range: (0, 0),
+            }],
+        )
+        .unwrap();
+    }
+
+    /// The root (node 1) with `d/turn.lock` not delegated.
+    fn carry_root(lock_ttl_ms: u64) -> (Harness, Ino, Ino) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.lock_ttl_ms = lock_ttl_ms;
+        h.hold(1, None);
+        let (dir, f) = plain_dir_file(&h.meta);
+        uncap(&mut h);
+        (h, dir, f)
+    }
+
+    /// A delegate (node 3, generation 7) with its first renewal pending
+    /// (`req`); returns `(h, dir, f, req)`.
+    fn carry_delegate(lock_ttl_ms: u64) -> (Harness, Ino, Ino, OpId) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.lock_ttl_ms = lock_ttl_ms;
+        h.core.lease.cached_holder = Some(1);
+        // The root's inode numbers (every node's replica has the same
+        // namespace: they are allocated under the prefix of the node that
+        // created them).
+        h.meta.set_node_prefix(1).unwrap();
+        let (dir, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let req = renew_req(&out, 7).expect("the first renewal");
+        (h, dir, f, req)
+    }
+
+    /// The root (node 1) of a delegation of `dir` to node 3 (gen 7) that
+    /// it recalled: `(h, dir, f, recall)`.
+    fn recalling_root(lock_ttl_ms: u64) -> (Harness, Ino, Ino, OpId) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.lock_ttl_ms = lock_ttl_ms;
+        h.hold(1, None);
+        let (dir, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let out = h.step(Event::Control {
+            op: OpId(1 << 50),
+            req: Control::Undelegate { dir },
+        });
+        let recall = sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegRecall { req, gen: 7, .. } if to == 3 => Some(*req),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no recall sent: {out:?}"));
+        (h, dir, f, recall)
+    }
+
+    /// Node 2 holds `ino`, node 4 waits; node 2 releases and node 4 is
+    /// served from the queue — a grant it never uses (its push was lost).
+    /// Returns node 4's grant.
+    fn unused_grant(h: &mut Harness, ino: Ino) -> GrantId {
+        let out = request(h, 2, 7, ino, X, true);
+        let rs = lock_replies(&out);
+        assert!(!rs.is_empty(), "node 2 is granted: {out:?}");
+        let (g2, _) = granted(&rs[0].2);
+        h.advance(10);
+        let out = request(h, 4, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        h.advance(10);
+        let out = release_of(h, 2, ino, g2);
+        let gs = grants_to(&out);
+        let [(4, g4)] = gs.as_slice() else {
+            panic!("node 4 is served from the queue: {out:?}")
+        };
+        assert!(h.core.lock_is_unproven(*g4));
+        *g4
+    }
+
+    /// The root's answer of generation 7's recall as sent by delegate `d`.
+    fn recall_answer(
+        d: &mut Harness,
+        dir: Ino,
+        req: OpId,
+    ) -> constellation_meta::locks::LockHandback {
+        let out = d.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall { req, dir, gen: 7 },
+        });
+        sends(&out)
+            .into_iter()
+            .find_map(|(to, m)| match m {
+                PeerMsg::DelegRecalled { locks, .. } if to == 1 => Some(locks.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no recall answer: {out:?}"))
+    }
+
+    /// The delegate's answer to a recall, as the root receives it.
+    fn recalled(
+        r: &mut Harness,
+        recall: OpId,
+        locks: constellation_meta::locks::LockHandback,
+    ) -> Vec<Action> {
+        r.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::DelegRecalled {
+                req: recall,
+                gen: 7,
+                through: 0,
+                locks,
+            },
+        })
+    }
+
+    /// The root's granting renewal answer carrying `locks`, as the
+    /// delegate receives it.
+    fn handoff_to(
+        d: &mut Harness,
+        req: OpId,
+        locks: Vec<constellation_meta::locks::Grant>,
+        lock_carry: Vec<(GrantId, u64)>,
+    ) {
+        let round = round_of(d, 7);
+        d.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRenewed {
+                req,
+                gen: 7,
+                round,
+                ttl_ms: 60_000,
+                locks,
+                lock_grace_ms: 0,
+                lock_floor: Position::ZERO,
+                lock_cut_at: 0,
+                lock_cut: Box::default(),
+                lock_barrier: 0,
+                lock_carry,
+            },
+        });
+    }
+
+    /// The end of `id`'s record in `h`'s table.
+    fn record_end(h: &Harness, id: GrantId) -> i64 {
+        h.meta
+            .locks()
+            .get(id)
+            .unwrap_or_else(|| panic!("{id:?} is not in the table"))
+            .until_ms
+    }
+
+    /// Core test 1: the recalled delegate hands an unused grant back with
+    /// what was left of its record, and the root records it from the
+    /// receipt, plus the margin: not a restamp.
+    #[test]
+    fn a_recalled_delegation_hands_an_unused_grant_back_with_what_was_left_of_it() {
+        let (mut d, dir, f, _) = carry_delegate(5_000);
+        delegation_left(&mut d, 60_000);
+        let g = unused_grant(&mut d, f);
+        let until = record_end(&d, g);
+        d.advance(3_000);
+        let sent = d.now;
+        let back = recall_answer(&mut d, dir, OpId(5));
+        let left = (until - sent.0) as u64;
+        assert!(left > 0);
+        assert_eq!(back.grants.len(), 1, "{back:?}");
+        assert_eq!(back.carry, vec![(g, left)], "{back:?}");
+        assert_eq!(d.meta.locks().grants_len(), 0, "left the delegate's table");
+        // The root has it 300 ms later.
+        let (mut r, _, _, recall) = recalling_root(5_000);
+        r.now = sent.plus(300);
+        recalled(&mut r, recall, back);
+        let margin = r.core.lock_margin_ms();
+        let restamp = r.now.0 + r.core.lock_ttl_ms() + margin;
+        assert_eq!(record_end(&r, g), r.now.0 + left as i64 + margin);
+        assert!(record_end(&r, g) < restamp, "a restamp");
+        assert_eq!(r.core.stats.lock_moved_carried, 1);
+    }
+
+    /// Core test 2: the root hands an unused grant over with the first
+    /// renewal that grants, with what was left of its record at that send.
+    #[test]
+    fn a_delegation_hands_an_unused_grant_over_with_what_was_left_of_it() {
+        let (mut r, dir, f) = carry_root(5_000);
+        let g = unused_grant(&mut r, f);
+        let until = record_end(&r, g);
+        r.advance(3_000);
+        delegate_to_3(&r.meta, dir, 7);
+        r.core.lock_on_delegated(7, &r.meta);
+        assert_eq!(r.meta.locks().grants_len(), 0, "moved out of the table");
+        let (grants, carry) = r.core.lock_take_handoff(r.now, 7);
+        let left = (until - r.now.0) as u64;
+        assert_eq!(grants.len(), 1);
+        assert_eq!(carry, vec![(g, left)]);
+        // The delegate receives it 200 ms later.
+        let (mut d, _, _, req) = carry_delegate(5_000);
+        d.now = r.now.plus(200);
+        handoff_to(&mut d, req, grants, carry);
+        let margin = d.core.lock_margin_ms();
+        assert_eq!(record_end(&d, g), d.now.0 + left as i64 + margin);
+        assert!(record_end(&d, g) < d.now.0 + d.core.lock_ttl_ms() + margin);
+        assert_eq!(d.core.stats.lock_moved_carried, 1);
+    }
+
+    /// Core test 3, seed 15's shape: an unused grant moved delegate → root
+    /// → delegate within a second is outwaited within its own window (each
+    /// hop adds a margin), not 21 s after the second move.
+    #[test]
+    fn an_unused_grant_moved_twice_is_outwaited_within_its_own_window() {
+        const TTL: u64 = 20_000;
+        let (mut d1, dir, f, _) = carry_delegate(TTL);
+        // The delegation has 3.5 s left: its grants are that short.
+        delegation_left(&mut d1, 3_500);
+        let g = unused_grant(&mut d1, f);
+        let until = record_end(&d1, g);
+        let margin = d1.core.lock_margin_ms();
+        assert!(until < d1.now.0 + 4_000, "capped by the delegation");
+        d1.advance(1_700);
+        let t1 = d1.now;
+        let back = recall_answer(&mut d1, dir, OpId(5));
+        // Move 1: to the root, at once.
+        let (mut r, _, _, recall) = recalling_root(TTL);
+        r.now = t1;
+        recalled(&mut r, recall, back);
+        assert_eq!(record_end(&r, g), until + margin);
+        // Move 2: delegated again 500 ms later (generation 8: the recall
+        // and the new delegation are in the log).
+        r.advance(500);
+        let t2 = r.now;
+        crate::replica::Replica::apply_segment(
+            &r.meta,
+            4,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Recall { dir, gen: 7 },
+                LogRecord::Delegate {
+                    dir,
+                    node: 3,
+                    gen: 8,
+                    designated: false,
+                    range: (0, 0),
+                },
+            ],
+        )
+        .unwrap();
+        r.core.lock_on_delegated(8, &r.meta);
+        let (grants, carry) = r.core.lock_take_handoff(t2, 8);
+        assert_eq!(carry.len(), 1, "carried again: {carry:?}");
+        let (mut d2, _, _, req) = carry_delegate(TTL);
+        d2.now = t2;
+        handoff_to(&mut d2, req, grants, carry);
+        assert_eq!(record_end(&d2, g), until + 2 * margin);
+        // A waiter behind it: the grant is outwaited at its record's end.
+        let out = request(&mut d2, 5, 30, f, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        let end = d2.core.timer_at(expiry).unwrap();
+        assert_eq!(end.0, until + 2 * margin, "outwaited at its record's end");
+        assert!(
+            end.0 < t2.0 + TTL as i64 + margin,
+            "outwaited a restamp (a lock ttl) after the second move"
+        );
+    }
+
+    /// Core test 4: a grant its holder renewed is carried too (it may be
+    /// gone since, or have released at the old owner after the move): the
+    /// receiver records what was left of it, not a restamp.
+    #[test]
+    fn a_renewed_grant_moved_is_carried_too() {
+        let (mut d, dir, f, _) = carry_delegate(5_000);
+        delegation_left(&mut d, 60_000);
+        let g = unused_grant(&mut d, f);
+        d.advance(2_000);
+        let out = d.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockRenew {
+                req: OpId(40),
+                entries: vec![LockRenewEntry {
+                    ino: f,
+                    grant: g,
+                    mode: X,
+                }],
+            },
+        });
+        let [(4, PeerMsg::LockRenewed { results, .. })] = sends(&out).as_slice() else {
+            panic!("expected an answer: {out:?}")
+        };
+        assert!(
+            matches!(results.as_slice(), [(_, _, LockRenewResult::Ok { .. })]),
+            "{results:?}"
+        );
+        let renewed_until = record_end(&d, g);
+        d.advance(3_000);
+        let sent = d.now;
+        let back = recall_answer(&mut d, dir, OpId(5));
+        let left = (renewed_until - sent.0) as u64;
+        assert_eq!(back.carry, vec![(g, left)], "{back:?}");
+        let (mut r, _, _, recall) = recalling_root(5_000);
+        r.now = sent.plus(100);
+        recalled(&mut r, recall, back);
+        let margin = r.core.lock_margin_ms();
+        let restamp = r.now.0 + r.core.lock_ttl_ms() + margin;
+        assert_eq!(record_end(&r, g), r.now.0 + left as i64 + margin);
+        assert!(record_end(&r, g) < restamp);
+        assert_eq!(r.core.stats.lock_moved_carried, 1);
+    }
+
+    /// A handback of node 4's grant `id` on `ino`, ending at `until_ms` at
+    /// its delegate (not seen used when `carry` is its remaining ms).
+    fn handback_of(
+        id: GrantId,
+        ino: Ino,
+        until_ms: i64,
+        carry: Option<u64>,
+    ) -> constellation_meta::locks::LockHandback {
+        constellation_meta::locks::LockHandback {
+            grants: vec![constellation_meta::locks::Grant {
+                id,
+                node: 4,
+                ino,
+                mode: X,
+                until_ms,
+                recalled: false,
+                gen: 7,
+                confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+            }],
+            carry: carry.map(|l| (id, l)).into_iter().collect(),
+            floor: Position::ZERO,
+            barrier: 0,
+        }
+    }
+
+    /// Core test 5 (C2): the root already holds a record of the node on
+    /// the inode that ends later (a reclaim it answered in a grace before
+    /// the move arrived): the carried one never shortens it.
+    #[test]
+    fn a_carried_record_never_ends_sooner_than_the_record_it_replaces() {
+        let (mut r, _, f, recall) = recalling_root(5_000);
+        let later = r.now.0 + 30_000;
+        r.meta.locks().install(constellation_meta::locks::Grant {
+            id: GrantId { node: 1, seq: 50 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until_ms: later,
+            recalled: false,
+            gen: 0,
+            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+        });
+        let g = GrantId { node: 3, seq: 9 };
+        let back = handback_of(g, f, r.now.0 + 500, Some(500));
+        recalled(&mut r, recall, back);
+        assert_eq!(record_end(&r, g), later, "shortened by the carry");
+        assert_eq!(r.meta.locks().grants_len(), 1);
+    }
+
+    /// Core test 6 (C5): a carry longer than a restamp (a crafted message)
+    /// is a restamp.
+    #[test]
+    fn a_carried_window_is_never_longer_than_a_restamp() {
+        let (mut r, _, f, recall) = recalling_root(5_000);
+        let g = GrantId { node: 3, seq: 9 };
+        let back = handback_of(g, f, r.now.0, Some(1_000_000));
+        recalled(&mut r, recall, back);
+        let restamp = r.now.0 + r.core.lock_ttl_ms() + r.core.lock_margin_ms();
+        assert_eq!(record_end(&r, g), restamp);
+        // And a carry of u64::MAX does not overflow.
+        let (mut r, _, f, recall) = recalling_root(5_000);
+        let back = handback_of(g, f, r.now.0, Some(u64::MAX));
+        recalled(&mut r, recall, back);
+        assert_eq!(record_end(&r, g), restamp);
+    }
+
+    /// Core test 7: an expired record the sender had not dropped yet moves
+    /// as 0 left: installed `now + margin`, and its expiry there is an
+    /// outwait like any other (the waiter behind it served).
+    #[test]
+    fn an_expired_record_moved_is_outwaited_with_its_barrier() {
+        let (mut d, dir, f, _) = carry_delegate(5_000);
+        delegation_left(&mut d, 60_000);
+        let g = unused_grant(&mut d, f);
+        let until = record_end(&d, g);
+        d.now = Ms(until + 500);
+        let back = recall_answer(&mut d, dir, OpId(5));
+        assert_eq!(back.carry, vec![(g, 0)], "{back:?}");
+        let (mut r, _, _, recall) = recalling_root(5_000);
+        r.now = d.now.plus(50);
+        // (Its delegation is still honoured: not an outwaited generation.)
+        r.core.dl.gens.get_mut(&7).unwrap().until = r.now.plus(60_000);
+        recalled(&mut r, recall, back);
+        let margin = r.core.lock_margin_ms();
+        assert_eq!(record_end(&r, g), r.now.0 + margin);
+        // A waiter behind it: recalled, outwaited at the record's end.
+        let out = request(&mut r, 5, 30, f, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        assert_eq!(r.core.timer_at(expiry), Some(Ms(r.now.0 + margin)));
+        r.advance(margin as u64);
+        let out = r.step(Event::Timer { id: expiry });
+        assert_eq!(r.core.stats.lock_recalls_expired, 1);
+        assert!(
+            grants_to(&out).iter().any(|(to, _)| *to == 5),
+            "the waiter is served: {out:?}"
+        );
+    }
+
+    /// Core test 8: every granting renewal re-sends the live copies, each
+    /// with what is left of its record at that send (it shrinks); the
+    /// delegate installs the id once.
+    #[test]
+    fn a_resent_handoff_carries_what_is_left_at_each_send() {
+        let (mut r, dir, f) = carry_root(5_000);
+        let g = unused_grant(&mut r, f);
+        let until = record_end(&r, g);
+        r.advance(2_000);
+        delegate_to_3(&r.meta, dir, 7);
+        r.core.lock_on_delegated(7, &r.meta);
+        let (grants1, carry1) = r.core.lock_take_handoff(r.now, 7);
+        assert_eq!(carry1, vec![(g, (until - r.now.0) as u64)]);
+        let t1 = r.now;
+        r.advance(1_000);
+        let (grants2, carry2) = r.core.lock_take_handoff(r.now, 7);
+        assert_eq!(grants2.len(), 1);
+        assert_eq!(carry2, vec![(g, (until - r.now.0) as u64)]);
+        assert_eq!(carry2[0].1 + 1_000, carry1[0].1, "one second less");
+        // The delegate installs the first copy once; the second is not
+        // installed over it.
+        let (mut d, _, _, req) = carry_delegate(5_000);
+        d.now = t1;
+        handoff_to(&mut d, req, grants1, carry1);
+        let margin = d.core.lock_margin_ms();
+        let first = record_end(&d, g);
+        assert_eq!(first, t1.0 + (until - t1.0) + margin);
+        d.now = r.now;
+        d.core
+            .lock_install_moved(d.now, 7, grants2, &carry2, &d.meta);
+        assert_eq!(record_end(&d, g), first, "installed twice");
+        assert_eq!(d.core.stats.lock_moved_carried, 1);
+        // A copy that is gone from the root's table and from its
+        // handed copies carries nothing: past its end it is not sent.
+        r.now = Ms(until + 1);
+        let (grants3, carry3) = r.core.lock_take_handoff(r.now, 7);
+        assert!(grants3.is_empty() && carry3.is_empty());
+    }
+
+    /// Core test 9: carried in, then renewed at the delegate, then handed
+    /// back: carried again, with what is left of its renewed record.
+    #[test]
+    fn a_grant_renewed_at_the_delegate_is_handed_back_with_its_renewed_record() {
+        let (mut r, dir, f) = carry_root(5_000);
+        let g = unused_grant(&mut r, f);
+        r.advance(3_000);
+        delegate_to_3(&r.meta, dir, 7);
+        r.core.lock_on_delegated(7, &r.meta);
+        let (grants, carry) = r.core.lock_take_handoff(r.now, 7);
+        let (mut d, ddir, df, req) = carry_delegate(5_000);
+        d.now = r.now;
+        handoff_to(&mut d, req, grants, carry);
+        d.advance(200);
+        let out = d.step(Event::Peer {
+            from: 4,
+            msg: PeerMsg::LockRenew {
+                req: OpId(40),
+                entries: vec![LockRenewEntry {
+                    ino: df,
+                    grant: g,
+                    mode: X,
+                }],
+            },
+        });
+        assert!(
+            sends(&out).iter().any(|(_, m)| matches!(
+                m,
+                PeerMsg::LockRenewed { results, .. }
+                    if matches!(results.as_slice(), [(_, _, LockRenewResult::Ok { .. })])
+            )),
+            "{out:?}"
+        );
+        let renewed_until = record_end(&d, g);
+        d.advance(3_000);
+        let sent = d.now;
+        let back = recall_answer(&mut d, ddir, OpId(5));
+        let left = (renewed_until - sent.0) as u64;
+        assert_eq!(back.carry, vec![(g, left)], "{back:?}");
+        let (mut root, _, _, recall) = recalling_root(5_000);
+        root.now = sent.plus(100);
+        // (Its delegation is still honoured: not an outwaited generation.)
+        root.core.dl.gens.get_mut(&7).unwrap().until = root.now.plus(60_000);
+        recalled(&mut root, recall, back);
+        let margin = root.core.lock_margin_ms();
+        assert_eq!(record_end(&root, g), root.now.0 + left as i64 + margin);
+        assert!(record_end(&root, g) < root.now.0 + root.core.lock_ttl_ms() + margin);
+    }
+
+    /// Core test 10: a carried grant is not a grant served from the
+    /// receiver's queue: outwaited there it does not count toward an
+    /// unreachable holder (as no moved grant did).
+    #[test]
+    fn a_carried_grant_outwaited_at_the_receiver_is_not_counted_unused() {
+        let (mut r, dir, f) = carry_root(5_000);
+        let g = unused_grant(&mut r, f);
+        r.advance(3_000);
+        delegate_to_3(&r.meta, dir, 7);
+        r.core.lock_on_delegated(7, &r.meta);
+        let (grants, carry) = r.core.lock_take_handoff(r.now, 7);
+        let (mut d, _, df, req) = carry_delegate(5_000);
+        d.now = r.now;
+        handoff_to(&mut d, req, grants, carry);
+        // A waiter behind it recalls it; nobody answers: outwaited.
+        let out = request(&mut d, 5, 30, df, X, true);
+        let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
+        d.now = d.core.timer_at(expiry).unwrap();
+        d.step(Event::Timer { id: expiry });
+        assert_eq!(d.core.stats.lock_recalls_expired, 1);
+        assert_eq!(d.core.lock_unused_grants(4), 0, "counted unused: {g:?}");
+    }
 }
 
 // ---- M16 fixes ----
@@ -25429,6 +26013,7 @@ fn renewed(h: &Harness, req: OpId, gen: u64, ttl_ms: u64) -> Event {
             lock_cut_at: 0,
             lock_cut: Box::default(),
             lock_barrier: 0,
+            lock_carry: Vec::new(),
         },
     }
 }
@@ -25971,6 +26556,7 @@ fn a_root_change_mid_stream_drops_the_old_rounds_answers() {
             lock_cut_at: 0,
             lock_cut: Default::default(),
             lock_barrier: 0,
+            lock_carry: Vec::new(),
         },
     });
     assert_eq!(
@@ -26043,6 +26629,7 @@ fn a_late_answer_for_an_ended_generation_leaves_the_cut() {
             lock_cut_at: 500,
             lock_cut: Default::default(),
             lock_barrier: 0,
+            lock_carry: Vec::new(),
         },
     });
     let (root, at, _) = h.core.lk.cut.expect("the cut is gone");
@@ -26086,6 +26673,7 @@ fn an_answer_to_a_previous_incarnation_does_not_count() {
             lock_cut_at: 0,
             lock_cut: Default::default(),
             lock_barrier: 0,
+            lock_carry: Vec::new(),
         },
     });
     assert_eq!(h.core.dl.mine[&7].until, Ms(0), "renewed by an old answer");
