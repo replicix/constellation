@@ -716,7 +716,11 @@ holder sleep through its own renewal. Its poll also fires at the moment
 the renewal falls due (half the TTL left), so the renewal goes out then
 rather than up to a quarter TTL later: what is left of the lease caps
 the root's delegations and lock grants, and through a delegation every
-delegated lock grant.
+delegated lock grant. A lease short enough that a delegation renewal it
+caps falls under four margins, or a lock grant of the root's own under
+two, is renewed at the next round instead (at most once per lease expiry, and only if renewing buys at least a margin):
+below about eight margins (8 s at the 1 s margin) a delegated lock's
+window ended before the half-TTL renewal.
 
 #### Publish cadence
 

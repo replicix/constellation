@@ -1674,7 +1674,9 @@ impl Core {
     }
 
     /// Whether the held lease should be renewed now: half its TTL is
-    /// gone (or a deposition hint asked for it). Never under an epoch
+    /// gone, a deposition hint asked for it, or a lease-capped grant asked
+    /// for an early renewal of this very lease (`ShipState::renew_early_of`,
+    /// `Core::lease_renew_for_grants`). Never under an epoch
     /// hold: the epoch carries exactly the lease object, and its other
     /// members close once S3 shows another (`epoch_carrier_checked`), so a
     /// renewal that lands changes what they wait on while this node still
@@ -1690,6 +1692,7 @@ impl Core {
             && match &self.lease.held {
                 Some((lease, _)) => {
                     self.ship.renew_now
+                        || self.ship.renew_early_of == Some(lease.expires_unix_ms)
                         || lease.expires_in_ms(now.0) <= (self.cfg.ttl_ms / 2) as i64
                 }
                 None => false,
@@ -1704,8 +1707,43 @@ impl Core {
             return None;
         }
         let (lease, _) = self.lease.held.as_ref()?;
+        if self.ship.renew_early_of == Some(lease.expires_unix_ms) {
+            return None;
+        }
         let left = lease.expires_in_ms(now.0) - (self.cfg.ttl_ms / 2) as i64;
         (left > 0).then_some(left as u64)
+    }
+
+    /// A grant this root answered (a delegation's renewal, a lock grant
+    /// or renewal of its own) was capped by its lease's usable end below
+    /// what its holder needs (`grant_cap_ms`, `lock_cap_ms`): the lease is
+    /// renewed at the next round, not at half its ttl. Each layer under
+    /// the lease takes a margin off (the lease's usable end, the
+    /// delegate's honoured window, its grant cap, the holder's window),
+    /// so a delegated lock's window ends four margins before the lease
+    /// expires: past the half-ttl renewal of a lease under eight margins
+    /// (a 6 s lease at the 1 s margin). Asked once per lease expiry, and
+    /// only while a renewal buys a margin or more: a lease renewed early
+    /// is not renewed again for a margin. A renewal already due is asked
+    /// for too: a round that began just before it fell due ends without
+    /// it, and the next one came at the idle poll (up to a quarter ttl
+    /// later: `-heavy` seed 1656, the root's own grant lapsed 1.2 s
+    /// before its lease was renewed).
+    pub(crate) fn lease_renew_for_grants(&mut self, now: Ms, out: &mut Vec<Action>) {
+        if self.lease.lost || self.lease.epoch_held() || self.lease.releasing {
+            return;
+        }
+        let Some((lease, _)) = self.lease.held.as_ref() else {
+            return;
+        };
+        let expires = lease.expires_unix_ms;
+        let gain = self.cfg.ttl_ms as i64 - lease.expires_in_ms(now.0);
+        if self.ship.renew_early_of == Some(expires) || gain < self.cfg.expiry_margin_ms as i64 {
+            return;
+        }
+        self.ship.renew_early_of = Some(expires);
+        self.stats.lease_renewals_for_grants += 1;
+        self.nudge(now, out);
     }
 
     fn issue_renew(&mut self, now: Ms, mid_ship: bool, out: &mut Vec<Action>) {

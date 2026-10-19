@@ -52344,3 +52344,110 @@ verification on:
   view op, overhead 70-112 ns.
 - Not run (W5): `smoke.sh`, `integration.sh`, `perf-gate.sh`'s harness bench,
   pjdfstest, the full harness matrix, the seeds 42..61 cells.
+
+## Fix: a root whose lease caps a grant below what its holder needs renews the lease at once (R2-3, 2026-10-19)
+
+Found in review of the ask-again fix (R2-3): `locks-delegated-production-ttl`
+and `-heavy` (no fault: the production lock TTL 20 s and margin 1 s, the sim's
+6 s lease and the core's 5 s delegation) fenced lock I/O, identically before
+and after it.
+
+### Cause (`-heavy` seed 10, `sim=debug`, `core::locks`, `core::delegate`)
+
+Every layer under the lease keeps its own margin, as `lease-cap-fenced`
+(2026-10-08) laid out: the root caps a delegation renewal at the lease's
+usable end (`grant_cap_ms`), the delegate honours it a margin less, caps its
+lock grants a margin before that, and the holder honours a grant a margin
+less. A delegated lock's window ends four margins before the lease expires
+(the root's own grants: two), and the root renews its lease once half its TTL
+is left. At a 500 ms margin that left 1 s; at the production 1 s margin under
+a 6 s lease it is a hole of about a second every lease period:
+
+- t=611: the delegate grants lk0 for 2477 ms; t=1350 the holder's renewal
+  finds 1738 ms, under `2 × margin`, and the delegate renews its delegation at
+  once (`deleg_renew_wanted`), as designed.
+- The root answers 3739: its lease (expiring at ≈6102) caps it, so the
+  delegation ends where it did. Every later renewal (about ten by t=2104) is
+  answered the same way; the lock ttls fall 1364, 1199, 1094, 1054, 1019,
+  1003, and the holder's window closes at ≈2100 inside its section.
+- t=2311: fenced. The lease renewal was due at ≈3102.
+
+The holder schedules from the capped ttl it was answered, and the delegate
+renews in time; the root had no "renew wanted" of its own.
+
+### What changed
+
+| change | where |
+|---|---|
+| `lease_renew_for_grants`: renew the lease at the next sync round (`nudge`) — once per lease expiry (`ShipState::renew_early_of`, read by `renew_due`), only if a renewal buys a margin or more, never under an epoch hold, lost or releasing; also when the renewal is due already (a round that began just before it fell due ended without it, and the next came at the idle poll: `-heavy` seed 1656, 1.2 s late) | `crates/authority/src/core/jobs.rs`, `mod.rs` |
+| called by `on_deleg_renew` for an answer the lease caps below `lock_min_grant + 2 × margin` (4 margins) and below the delegation TTL | `crates/authority/src/core/delegate.rs` |
+| called by `lock_serve` and (via `lk.lease_renew_wanted`, `lock_renew_authority`) `lock_renew_one` for the root's own grant or renewal capped below `lock_min_grant` | `crates/authority/src/core/locks.rs` |
+| stat `lease_renewals_for_grants` | `mod.rs` |
+| docs: the margin chain and the early renewal | `docs/reference/features/cluster-locks.md`, `docs/reference/configuration.md` |
+
+### Why it keeps every safety rule
+
+- Only when the lease is renewed moves, and only earlier; the renewal is the
+  same `LeaseSwap` CAS (a lost one deposes, as today).
+- No cap, margin, grant record, holder window, grant id or recall rule
+  changes: every grant still ends within the lease or delegation behind it.
+- Plan 41 L0's fresh-liveness rule and the fast successor's floors follow the
+  lease as written, as for any renewal.
+
+### Reachability
+
+- Defaults (60 s lease, 1 s margin, 20 s lock and delegation TTLs): not
+  reachable; the cap at the half-TTL point is 29 s and the trigger never
+  fires.
+- `CONSTELLATION_LEASE_TTL_MS` of about 8 s or less (delegated locks), 4 s or
+  less (the root's own): fenced with no fault on main.
+- `CONSTELLATION_DELEGATION_TTL_MS` is not capped by a 60 s lease; at 4 s or
+  less (4 margins) a delegate can never give a `2 × margin` grant and every
+  lock request in its subtree waits for good (open: clamp it at 5 margins
+  when cluster locks are on).
+
+### Tests
+
+- Core `a_root_whose_lease_caps_a_delegation_below_a_lock_grant_renews_it_early`
+  (4.7 s left of a 6 s lease: answered 3700, the next round renews; 5.5 s
+  left, or a renewal buying under a margin: no renewal) and
+  `a_root_whose_lease_caps_its_own_lock_grant_renews_it_early` (a 4 s lease,
+  a grant and a renewal answered 1800; due already: polled now, once per
+  lease). Both fail with `lease_renew_for_grants` a no-op.
+- Sim `production_margin_lease_cap_seeds_keep_their_grants`:
+  `-production-ttl` 2, 424, 791; `-heavy` 10, 72, 337, 1881;
+  `locks-production-ttl-heavy` 113, 1010: 0 fenced, 0 lost (fails on
+  7780c8e: `-heavy` seed 10, 16 fenced; on 0b1600d, before the ask-again
+  fix: seed 2, 1 fenced).
+
+### Results (`sweep_config` 0..2000, TMPDIR on tmpfs)
+
+| config | 7780c8e failing / fenced | with this fix |
+|---|---|---|
+| `locks-delegated-production-ttl` | 2 / 104 | 2 / **0** |
+| `locks-delegated-production-ttl-heavy` | 729 / 14799 | 14 / 26 |
+| `locks-production-ttl` | 0 / 0 | 0 / 0 |
+| `locks-production-ttl-heavy` | 0 / 26 | 0 / **0** |
+| `locks-delegated-production-ttl-heavy+nomove` | 28 / 28223 | 0 / **0** |
+| `locks-delegated-production-ttl+nomove` | 0 / 119 | 0 / **0** |
+
+In `locks-delegated-production-ttl` the two failing seeds change, [1249,
+1774] → [958, 1000], and both new ones are 60 s lock-acquisition waits,
+not fences (without the fix those seeds already waited 49 s and 23 s): the
+open lock-waiter starvation class, not this change.
+
+On 0b1600d (before the ask-again fix): 122 / 159 → 24 / 0, 1779 / 240 →
+959 / 7, 18 / 32 → 17 / 0. The 26 I/Os left in 13 `-heavy` seeds each come
+0.3–0.6 s after a re-delegation to the same node (a cross-subtree rename),
+none without moves: a separate bug (open). The first renewal of the new
+generation is dropped as stale because the delegate's own renewal, answered
+`NotOwner { 0 }` by the root, cleared its cached holder and restarted its
+stream round; the subtree answers `NotOwner { 0 }` until that renewal times
+out.
+
+Early renewals: about 13 per seed (delegated), 50 (`-heavy`), 3 (root),
+32 (root heavy) at the 6 s lease; 0 in every fault-free default lock
+configuration. 39 lock configurations on 0b1600d (0..2000, long-grants 3000,
+double-seal 8000): unchanged up to sweep noise in fault configurations.
+Gates: fmt, clippy `-p constellation-authority --all-targets -D warnings`,
+authority lib 467 passed.

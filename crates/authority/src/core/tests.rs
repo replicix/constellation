@@ -22083,6 +22083,172 @@ mod locks {
             }
         }
     }
+
+    /// Sets the held lease's expiry `left_ms` from now.
+    fn lease_left(h: &mut Harness, left_ms: i64) {
+        let now = h.now.0;
+        h.core.lease.held.as_mut().expect("held").0.expires_unix_ms = now + left_ms;
+    }
+
+    /// Whether the round the pending poll starts renews the lease.
+    fn next_round_renews(h: &mut Harness) -> bool {
+        let poll = h.core.poll_timer.expect("a poll is armed");
+        let mut out = h.step(Event::Timer { id: poll });
+        if let Some(upload) = out.iter().find_map(|a| match a {
+            Action::UploadDirtyChunks { op, .. } => Some(*op),
+            _ => None,
+        }) {
+            out = h.step(Event::UploadsDone {
+                op: upload,
+                result: UploadResult::Done { held: 0 },
+            });
+        }
+        s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseSwap { lease, .. } if !lease.released))
+    }
+
+    /// The root's delegation renewal answer, if any.
+    fn deleg_answer(out: &[Action]) -> Option<u64> {
+        sends(out).into_iter().find_map(|(t, m)| match m {
+            PeerMsg::DelegRenewed { ttl_ms, .. } if t == 3 => Some(*ttl_ms),
+            _ => None,
+        })
+    }
+
+    /// Sim `locks-delegated-production-ttl-heavy` seed 10 (no fault): a
+    /// 6 s lease, 1 s margins, a 5 s delegation and 20 s locks. Every
+    /// layer takes a margin off: the root's delegation renewals end a
+    /// margin before its lease, the delegate honours them a margin less,
+    /// caps its lock grants a margin before that, and the holder honours
+    /// those a margin less — four margins before the lease expires, while
+    /// the root renewed it at half its ttl, three before. The delegate
+    /// asked again and again (its lock renewals found less than
+    /// `2 × margin` left) and every answer ended where the last one did,
+    /// so the holder's window closed under its section (fenced I/O). Now
+    /// a delegation renewal the lease caps below what a lock grant needs
+    /// renews the lease at the next round. Fails on the parent: the round
+    /// does not renew (the clock says 1.7 s more).
+    #[test]
+    fn a_root_whose_lease_caps_a_delegation_below_a_lock_grant_renews_it_early() {
+        let root = || {
+            let mut h = Harness::new(1);
+            h.core.cfg.delegation = true;
+            h.core.cfg.p2p = true;
+            h.core.cfg.ttl_ms = 6_000;
+            h.core.cfg.expiry_margin_ms = 1_000;
+            h.core.cfg.delegation_ttl_ms = 5_000;
+            h.core.cfg.lock_ttl_ms = 20_000;
+            h.hold(1, None);
+            delegated_file(&h.meta);
+            let mut out = Vec::new();
+            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            h
+        };
+        // 4.7 s of the lease left (its renewal is due at 3 s): the answer
+        // is 3.7 s, the delegate honours 2.7 s of it and caps its grants
+        // at 1.7 s, under the 2 s a grant needs.
+        let mut h = root();
+        lease_left(&mut h, 4_700);
+        assert!(h.core.renew_due_in_ms(h.now).is_some(), "due by the clock");
+        let now = h.now.0;
+        let out = renew_gen7(&mut h, 90, 0, now);
+        assert_eq!(deleg_answer(&out), Some(3_700), "{out:?}");
+        assert!(
+            next_round_renews(&mut h),
+            "a lease that caps a delegation short of a lock grant is not renewed"
+        );
+        assert_eq!(h.core.stats.lease_renewals_for_grants, 1);
+        // 5.5 s left: 4.5 s answered, enough; the lease waits for its time.
+        let mut h = root();
+        lease_left(&mut h, 5_500);
+        let now = h.now.0;
+        let out = renew_gen7(&mut h, 90, 0, now);
+        assert_eq!(deleg_answer(&out), Some(4_500), "{out:?}");
+        assert!(!next_round_renews(&mut h), "renewed with no need");
+        assert_eq!(h.core.stats.lease_renewals_for_grants, 0);
+        // A renewal would buy less than a margin (a 4.5 s lease, 4 s
+        // left): not asked for, however short the answer.
+        let mut h = root();
+        h.core.cfg.ttl_ms = 4_500;
+        lease_left(&mut h, 4_000);
+        let now = h.now.0;
+        let out = renew_gen7(&mut h, 90, 0, now);
+        assert_eq!(deleg_answer(&out), Some(3_000), "{out:?}");
+        assert!(!next_round_renews(&mut h), "renewed for less than a margin");
+        assert_eq!(h.core.stats.lease_renewals_for_grants, 0);
+    }
+
+    /// The same at the root's own grants: they end a margin before its
+    /// lease and their holder honours them a margin less, so a lease of
+    /// four margins or less (4 s at the 1 s margin) ended every grant at
+    /// or before its half-ttl renewal. A grant or renewal capped below
+    /// `2 × margin` renews the lease at the next round. Fails on the
+    /// parent.
+    #[test]
+    fn a_root_whose_lease_caps_its_own_lock_grant_renews_it_early() {
+        for renewal in [false, true] {
+            let (mut h, ino) = holder_with_file();
+            h.core.cfg.ttl_ms = 4_000;
+            h.core.cfg.expiry_margin_ms = 1_000;
+            h.core.cfg.lock_ttl_ms = 20_000;
+            let id = if renewal {
+                lease_left(&mut h, 3_900);
+                let out = request(&mut h, 2, 7, ino, X, true);
+                let Some((_, _, LockOutcome::Granted { id, .. })) = lock_replies(&out).pop() else {
+                    panic!("not granted: {out:?}")
+                };
+                assert_eq!(h.core.stats.lease_renewals_for_grants, 0);
+                Some(id)
+            } else {
+                None
+            };
+            // 2.8 s left (the renewal is due at 2 s): 1.8 s answered.
+            lease_left(&mut h, 2_800);
+            let out = match id {
+                Some(id) => renew(&mut h, 2, 8, ino, id),
+                None => request(&mut h, 2, 7, ino, X, true),
+            };
+            assert!(
+                sends(&out).iter().any(|(to, m)| *to == 2
+                    && matches!(m, PeerMsg::LockReply { .. } | PeerMsg::LockRenewed { .. })),
+                "{out:?}"
+            );
+            assert!(
+                next_round_renews(&mut h),
+                "renewal {renewal}: a lease that caps a lock grant is not renewed"
+            );
+            assert_eq!(h.core.stats.lease_renewals_for_grants, 1);
+        }
+        // Due already (1.9 s left of the 4 s lease, a round having ended
+        // just before): the round is started now, not at the idle poll.
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.ttl_ms = 4_000;
+        h.core.cfg.expiry_margin_ms = 1_000;
+        h.core.cfg.lock_ttl_ms = 20_000;
+        lease_left(&mut h, 1_900);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let now = h.now;
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::SetTimer { kind: TimerKind::Poll, at, .. } if *at == now
+            )),
+            "a due renewal a capped grant needs waits for the idle poll: {out:?}"
+        );
+        assert_eq!(h.core.stats.lease_renewals_for_grants, 1);
+        // Asked once for this lease: a second capped answer asks nothing.
+        h.advance(10);
+        let out = request(&mut h, 2, 8, ino, X, true);
+        assert!(
+            lock_replies(&out)
+                .iter()
+                .any(|(_, _, o)| matches!(o, LockOutcome::Granted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.lease_renewals_for_grants, 1);
+        assert!(next_round_renews(&mut h));
+    }
 }
 
 // ---- M16 fixes ----

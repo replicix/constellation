@@ -5844,6 +5844,50 @@ fn lease_cap_fenced_seeds_keep_their_grants() {
     }
 }
 
+/// The same class at the production margin (1 s) and lock TTL (20 s),
+/// no fault: under the sim's 6 s lease every layer's margin adds up to
+/// four (the lease's usable end, the delegation's window, the delegate's
+/// grant cap, the holder's window), past the root's half-TTL renewal, so
+/// a delegated holder's window closed before the lease was renewed while
+/// the delegate's renewals came back no longer (seed 10 of `-heavy`: 1738
+/// … 1003 ms, fenced at t=2311). The root's own grants end two margins
+/// before the lease (`locks-production-ttl-heavy`). The root now renews
+/// its lease at the next round when it caps a delegation below a lock
+/// grant's need, or a lock grant of its own below `2 × margin`
+/// (`Core::lease_renew_for_grants`).
+#[test]
+fn production_margin_lease_cap_seeds_keep_their_grants() {
+    let cases: [(&str, bool, bool, &[u64]); 3] = [
+        (
+            "locks-delegated-production-ttl",
+            true,
+            false,
+            &[2, 424, 791],
+        ),
+        (
+            "locks-delegated-production-ttl-heavy",
+            true,
+            true,
+            &[10, 72, 337, 1881],
+        ),
+        ("locks-production-ttl-heavy", false, true, &[113, 1010]),
+    ];
+    for (name, deleg, heavy, seeds) in cases {
+        for &seed in seeds {
+            let report = run_seed(seed, production_ttl(deleg, heavy)).unwrap_or_else(|e| {
+                panic!("{name} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={name}")
+            });
+            let mut t = M14Totals::default();
+            t.add(&report);
+            assert_eq!(t.lost, 0, "{name} seed {seed}: grants lost: {t:?}");
+            assert_eq!(
+                t.clients.fenced_ios, 0,
+                "{name} seed {seed}: I/O fenced: {t:?}"
+            );
+        }
+    }
+}
+
 /// `locks-blips-tight` with `locks-blips`' in-doubt lease PUTs back:
 /// back-to-back cuts with acquisition and release CASes that land but
 /// answer a timeout. On main before chunk lock-release-drop it failed

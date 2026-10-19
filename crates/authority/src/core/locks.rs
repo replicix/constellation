@@ -240,6 +240,9 @@ pub(crate) struct LockState {
     /// Delegate: generations whose renewal a lock renewal asked for
     /// (too little of the delegation left to extend the grant by much).
     deleg_renew_wanted: std::collections::BTreeSet<u64>,
+    /// Root: a lock renewal it answered was capped by its lease below a
+    /// grant worth holding (`Core::lease_renew_for_grants`).
+    lease_renew_wanted: bool,
     /// A lease read to relearn the owner for renewals is in flight.
     relearning: bool,
     /// Node side, per generation this node's table still delegates: the
@@ -607,7 +610,7 @@ impl Core {
     /// The shortest grant worth making: its holder honours it for
     /// `ttl − margin` and renews half-way through that, so under
     /// `2 × margin` there is barely time for one renewal round trip.
-    fn lock_min_grant_ms(&self) -> i64 {
+    pub(crate) fn lock_min_grant_ms(&self) -> i64 {
         (2 * self.lock_margin_ms()).min(self.lock_ttl_ms())
     }
 
@@ -1732,6 +1735,9 @@ impl Core {
                 self.deleg_renew_now(now, gen, out);
                 return Err(Blocked::NotYet(NotYet::ShortAuthority));
             }
+            // The root, short of lease: what it grants now is renewed
+            // under the lease it renews at once.
+            self.lease_renew_for_grants(now, out);
             if ttl <= 0 {
                 return Ok(LockOutcome::Busy);
             }
@@ -3063,8 +3069,17 @@ impl Core {
             results.push((e.ino, e.grant, r));
         }
         self.lock_answer(now, from, PeerMsg::LockRenewed { req, results }, out);
+        self.lock_renew_authority(now, out);
+    }
+
+    /// Renewals answered short of authority ask for more of it: a
+    /// delegate's renewal of its delegation, the root's of its lease.
+    fn lock_renew_authority(&mut self, now: Ms, out: &mut Vec<Action>) {
         for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
             self.deleg_renew_now(now, gen, out);
+        }
+        if std::mem::take(&mut self.lk.lease_renew_wanted) {
+            self.lease_renew_for_grants(now, out);
         }
     }
 
@@ -3109,6 +3124,9 @@ impl Core {
             // A delegate short of authority: renew the delegation now
             // (the caller does), so the next renewal gives more.
             self.lk.deleg_renew_wanted.insert(gen);
+        } else if gen == 0 && ttl < self.lock_min_grant_ms() {
+            // The root, short of lease: renew it now (the caller does).
+            self.lk.lease_renew_wanted = true;
         }
         let until = now.0 + ttl + self.lock_margin_ms();
         // The grant renewed: that id, or this node's newer grant here (a
@@ -4361,9 +4379,7 @@ impl Core {
                     } else {
                         self.lock_apply_renew_result(now, me, ino, h.id, now, r, replica, out);
                     }
-                    for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
-                        self.deleg_renew_now(now, gen, out);
-                    }
+                    self.lock_renew_authority(now, out);
                 }
                 Route::Node(n) if self.cfg.p2p && self.reaches(now, n) => {
                     by_owner.entry(n).or_default().push((ino, h));

@@ -268,7 +268,18 @@ new on less than `2 × margin` (the request waits for the delegation's
 renewal). The root caps the delegation in turn by what is left of its
 lease, less the margin, and renews its lease as soon as half its TTL
 is gone (its sync poll is armed for that moment), so a delegated grant
-is not squeezed by a lease left close to its expiry. A grant under a
+is not squeezed by a lease left close to its expiry. Every layer keeps
+its own margin (the lease's usable end, the delegate's window, its
+grant cap, the holder's window), so a delegated lock's window ends four
+margins before the lease expires, and its own grants' two: under a
+lease of eight margins (a 6 s lease at the 1 s margin) that comes
+before the half-TTL renewal. So the root also renews its lease at its
+next sync round when it answers a delegation renewal it capped below
+`4 × margin` (what a delegate needs for a `2 × margin` lock grant), or
+a lock grant or renewal of its own it capped below `2 × margin`; at
+most once per lease expiry, and only if the renewal buys at least a
+margin. At the default
+60 s lease the cap never comes that close. A grant under a
 delegation is therefore never longer than what is left of the delegation (`CONSTELLATION_DELEGATION_TTL_MS`, by
 default the lock TTL, so a delegate's grants get about the same window as
 the root's; at the 5 s it used to default to, a lock in a delegated

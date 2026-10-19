@@ -1015,6 +1015,10 @@ pub struct Stats {
     /// delegation was left to grant a lock worth holding (the
     /// delegation's renewal is asked for at once).
     pub lock_short_authority_waits: u64,
+    /// Root: lease renewals brought forward because a grant it answered
+    /// was capped by the lease below what its holder needs
+    /// (`Core::lease_renew_for_grants`).
+    pub lease_renewals_for_grants: u64,
     /// Node side.
     pub lock_requests: u64,
     pub lock_unavailable: u64,
@@ -1151,6 +1155,10 @@ pub struct ShipState {
     /// A tailed segment carried an epoch above the one this node holds:
     /// renew now, not at half-TTL (`prepare_renew_now`).
     pub renew_now: bool,
+    /// The lease (by its expiry) a capped grant asked to renew at the
+    /// next round (`Core::lease_renew_for_grants`); nothing clears it, a
+    /// renewal makes it stale (it no longer matches the lease's expiry).
+    pub renew_early_of: Option<i64>,
     /// The epoch of the last segment this node shipped (a commit carries
     /// its author's epoch).
     pub last_ship_epoch: Epoch,
@@ -1172,6 +1180,7 @@ impl Default for ShipState {
             last_publish: Ms(0),
             held_tail_at: None,
             renew_now: false,
+            renew_early_of: None,
             last_ship_epoch: 0,
             last_error: None,
             probe_now: false,

@@ -2332,6 +2332,20 @@ impl Core {
                 self.stats.deleg_renewals += 1;
                 self.lease.touch(now);
                 self.arm_gen_expiry(now, gen, out);
+                // Capped by the lease below what the delegate needs to
+                // grant a lock (it honours `ttl − margin` and caps its
+                // grants a margin before that): the lease is renewed now.
+                // At half its ttl, a short lease ended the chain of caps
+                // (its own margin, the delegation's, the delegate's grant
+                // cap, the holder's) before its renewal: the delegate's
+                // renewals came back no longer, and a held lock lapsed
+                // with no fault (sim `locks-delegated-production-ttl-heavy`
+                // seed 10: a 6 s lease, 1 s margins).
+                if ttl_ms < self.cfg.delegation_ttl_ms
+                    && (ttl_ms as i64) < self.lock_min_grant_ms() + 2 * self.lock_margin_ms()
+                {
+                    self.lease_renew_for_grants(now, out);
+                }
             } else {
                 self.stats.deleg_renewals_refused += 1;
             }
