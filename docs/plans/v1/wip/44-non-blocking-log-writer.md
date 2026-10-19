@@ -203,7 +203,7 @@ btrfs volume as the daemons' state):
   `docs/how-to-guides/operations/diagnose-lease-thrash.md`, the
   troubleshooting sections that name WARN lines. A missing line during a
   stall is visible as the summary line (§4.3) and in status.
-- **`node.logs.tail`** (the web UI, `constellation logs`): served from the
+- **`node.logs.tail`** (the web UI, `constellation log tail`): served from the
   in-memory ring, which keeps every line whether or not the sink got it.
 
 ## 3. Requirements
@@ -242,7 +242,7 @@ struct State {
     lines: VecDeque<Arc<str>>, partial: Vec<u8>, total: u64,
     // the sink queue
     mode: Mode,                             // Sync (today) | Queue { limit }
-    queue: VecDeque<Arc<str>>,              // capacity pre-reserved: 4096
+    queue: Blocks,                          // 1 024-entry blocks, see below
     queued_bytes: usize, inflight_bytes: usize, inflight_lines: usize,
     writer_idle: bool,
     accepted: u64, written: u64,            // lines, for flush barriers
@@ -264,18 +264,35 @@ struct State {
   mode, after unlocking, the fault point (§6 W3) and
   `std::io::stderr().write_all(bytes)` exactly as today.
 - The writer thread (`cst-log-writer`), one per process: wait on `work`
-  while the queue is empty; swap the whole queue out (`mem::swap` with
-  its own empty deque, so both keep their capacity: O(1) under the
-  lock), move `queued_bytes` to `inflight_bytes`, stamp the write's
+  while the queue is empty; take the whole queue out (`mem::take`: O(1)
+  under the lock), move `queued_bytes` to `inflight_bytes`, stamp the write's
   start, unlock; append each line plus `\n` to a reused byte buffer and
   `write_all` it to the sink in chunks of up to 256 KiB (one `write(2)`
-  per chunk instead of one per line); relock, advance `written`, clear
-  `inflight_*`, record the write's duration, close a drop episode if the
-  queue is below half (§4.3), unlock, `written.notify_all()`. Shrink the
-  byte buffer and the spare deque back to 64 KiB / 4096 entries after a
-  batch that grew them past 1 MiB / 64 Ki entries, so a stall does not
-  leave its peak resident. Sink errors (`EPIPE`, `ENOSPC`, `EIO`) are
-  ignored as today, and counted.
+  per chunk instead of one per line); after **each chunk** relock, advance
+  `written`, release the chunk's share of `inflight_*`, unlock,
+  `written.notify_all()` (a flush that times out in the middle of a big
+  batch reports what is really left; the duration of each write is kept
+  in atomics, so status never waits behind the writer); after the batch,
+  close a drop episode if the queue is below half (§4.3). The queue is a
+  list of blocks of 1 024 entries: a push allocates at most one 16 KiB
+  block and never grows or copies an array under the lock (a deque that
+  doubled under the mutex once a stall's backlog passed its capacity, 16 MiB
+  at 128 MiB's two million lines, was the review's F5), and the writer frees
+  a block when it has consumed it, so what a stall's backlog took is
+  returned at once and nothing is held for a spare. The byte buffer shrinks
+  back to 64 KiB after a batch that grew it past 1 MiB. **The memory bound:**
+  accounted bytes never pass `limit` (plus at most 64 panic messages, the
+  summary lines the reserve holds, and one partly used block per end); real
+  memory is below the accounted, since a line's `Arc` is freed when the
+  writer has copied it while its bytes stay accounted until the write
+  returns. **A failed write** (`ENOSPC`, `EIO`, a closed pipe) drops the
+  chunk: its lines are counted as dropped, in an episode whose summary
+  follows once a write succeeds (none while the sink is failing: it would
+  meet the same error and open the next episode), and as `sink_errors`; a
+  write that went half way leaves a torn line, and the next chunk starts
+  with a newline so the fragment stays a line of its own (the residual).
+  A sink that answers `WouldBlock` (a non-blocking fd 2) is polled every
+  2 ms for up to 10 s and the chunk finished.
 - Ordering: one queue filled under one mutex in acceptance order, one
   consumer: the file's order is the order in which events entered
   `write`, which preserves each thread's order and is the same global
@@ -298,6 +315,12 @@ struct State {
   admitted while the queue stays within `limit − limit/8`, a reserved one
   within `limit`: in a storm of info/debug lines behind a stalled sink,
   the last eighth stays free for warnings and errors. Neither ever waits.
+  While an episode is open (§4.3) an ordinary line is dropped even if it
+  would fit, until the queue is back under `limit/2`: otherwise the lines
+  admitted between half and seven eighths would sit between the gap and
+  its summary and the gap would not be one run (a WARN or ERROR that fits
+  is still admitted; the writer drains a stall's backlog in 256 KiB
+  writes, so the window is short).
 - A line that does not fit is **dropped**: the newest, i.e. the incoming
   one. Why not the oldest: dropping the incoming line is O(1) and touches
   nothing the writer may be holding; it keeps the lines that led into the
@@ -317,7 +340,11 @@ struct State {
   `written_lines`, `longest_write_ms` (the longest single sink write: a
   slow disk shows here before it shows anywhere else), `writing_for_ms`
   (the write in progress now, 0 when idle), `sink_errors`,
-  `unwritten_at_previous_exec` (§4.4).
+  `unwritten_at_previous_exec` (§4.4). `dropped_lines` counts every line
+  lost to the log: the queue was full, a sink write failed, or the previous
+  image's `exec` took it (the new image counts the old one's unwritten tail
+  as dropped and says so in a summary line, so a lost line is a counted
+  one whatever took it); `written_lines` counts what reached the sink.
 - An **episode** opens at the first drop (its unix ms, lines, bytes) and
   closes when the queue is back under `limit/2` — checked by the caller
   that admits a line and by the writer after each batch, so a storm that
@@ -333,7 +360,11 @@ struct State {
   It is not a `tracing` event: it bypasses `RUST_LOG` (a drop must be
   visible whatever the filter) and cannot recurse into the writer. It is
   pushed into the ring too. The `limit/2` hysteresis keeps a sustained
-  overload from alternating one summary per accepted line.
+  overload from alternating one summary per accepted line. A viewer's
+  `flush` (the control method) closes an open episode only when its summary
+  fits in what the bound leaves (a loop of `node.logs.flush` calls behind a
+  stalled sink must not grow the queue: the review's F1); the last flush of
+  an exit, an `exec` or an abort always closes it.
 - At a flush (§4.4) an open episode is closed first, so the summary is
   part of what the flush writes.
 
@@ -377,10 +408,13 @@ struct State {
   right before `Command::exec`; when lines are left it sets
   `CONSTELLATION_LOG_UNWRITTEN_AT_EXEC=<n>` on the command. The new
   image (`resume_main`, after starting its writer) reads it, keeps it in
-  `unwritten_at_previous_exec` and logs one WARN: `the previous image
-  left N log line(s) unwritten at its exec (its log sink was stalled)`.
-  200 ms: the handover's gap is application-visible latency; a stalled
-  sink may add at most that, and the loss is reported. (A writer thread
+  `unwritten_at_previous_exec`, counts them as dropped (a `log lines
+  dropped` summary line, `status.log.dropped_lines`: §15.11) and logs one
+  WARN that says what the number is (`the previous image's log writer
+  stopped waiting at its exec with N line(s) unwritten ...`). 200 ms: the
+  handover's gap is application-visible latency; a stalled sink may add at
+  most that, and the loss is reported; the upgrade also drains the log
+  (2 s, before the views are detached) so the 200 ms has little to wait for. (A writer thread
   inside a `write(2)` in uninterruptible sleep delays `execve`'s
   thread teardown until the write returns — the kernel's, not ours; today
   the exec'ing thread's own last log write has the same exposure. §11.)
@@ -530,8 +564,11 @@ together before W5's campaign.
     signatures (`Vec<String>`, built from the ring's `Arc<str>`s).
   - `impl<'a> MakeWriter<'a> for LogBuffer` (`make_writer` → `Ordinary`,
     `make_writer_for` → by level).
-  - `pub struct QueueConfig { limit: usize }` with `from_env()` (§4.5)
-    and `sync()`.
+    - `pub struct QueueConfig { limit: usize, warning: Option<String> }`
+    (`warning`: what `from_env()` could not use, for the caller to log
+    after the start) with `from_env()` (§4.5), `with_limit()` and
+    `sync()`; the stderr sink is `StderrSink` (std's stderr lock around
+    the fault point and the write).
   - `pub fn start(&self, config: QueueConfig, sink: Box<dyn Write +
     Send>) -> std::io::Result<()>` (idempotent; `Sync` config: no
     thread).
@@ -799,9 +836,10 @@ The output is byte-identical modulo timestamps (51 000 lines, same md5
 with the timestamps removed). The one worse number, the worst single
 event with 8 threads logging flat out (1.6 M lines/s, three orders of
 magnitude past any daemon's rate), is the queue's `VecDeque` growing
-under the mutex while callers outrun the writer; W1 pre-reserves 4096
-entries and keeps both deques' capacity across swaps, and W5 re-measures
-it. At realistic rates the queue's worst case is below today's.
+under the mutex while callers outrun the writer; W1 first reserved 4096
+entries, then (review F5) made the queue a list of 1 024-entry blocks so no
+push ever grows an array, and W5 re-measures it. At realistic rates the
+queue's worst case is below today's.
 
 Gates (W5): `vfs_bench` (no subscriber installed: unchanged by
 construction, run to show it); `tests/perf-gate.sh`'s harness `bench`
@@ -881,6 +919,13 @@ In order, all green:
 - **Silent loss.** Every drop is counted in status and `/metrics`, and
   marked in the log once the writer catches up; a sink that never comes
   back shows `writing_for_ms` growing in status.
+- **A panic that then aborts.** A panic in a `Drop` while unwinding, or one
+  escaping an `extern "C"` function, aborts the process from inside the panic
+  machinery: the message is queued by the hook (and, when the sink keeps up,
+  written within microseconds), but nothing flushes it before the abort, where
+  std's hook wrote it synchronously. The same holds for a panic that ends in
+  `SIGSEGV` or an OOM kill. The authority driver's deliberate abort flushes
+  first (§4.4).
 - **Order across a panic.** A panic's message is queued with the rest,
   in order; it no longer appears on stderr ahead of earlier queued lines.
 - **The writer thread dies** (it cannot panic short of an allocation
@@ -907,7 +952,7 @@ tail is a note, not a violation; no logger process for now.
 
 ## 13. Exit criteria
 
-- [ ] W1: the queue, the reserve, the summary line, the flush, the fault
+- [x] W1: the queue, the reserve, the summary line, the flush, the fault
       point; unit tests 7.1.1-7.1.9 with their naive arms.
 - [ ] W2: the daemons start the writer after the fork; exit, exec, abort
       and panic paths flush or queue as §4.4; status `log`,
@@ -928,6 +973,147 @@ evidence of §1 (numbers only), the design in five lines, the fail-before
 results (unit tests' naive arms, the scenario's control arm), §8's
 before/after table on each file system, the campaign cells with seeds and
 verdicts, the peak queue occupancy, and the residual risks of §11.
+
+## 15. Implementation notes (W1-W4)
+
+Where the code or the measurements differ from the text above, and what was
+done. Items 1-3 and 12-14 were also edited into the sections they concern.
+
+1. **One contiguous gap (§4.2, §4.3).** Admitting an ordinary line whenever it
+   fits leaves, once the queue drains below seven eighths but not below half,
+   admitted lines between the gap and its summary: the gap is then not one run
+   and the marker is not where the loss was. While an episode of a full queue
+   is open an ordinary line is dropped even if it fits, until the queue is
+   under `limit/2`; WARN and ERROR that fit are still admitted (so the run is
+   one run of ordinary lines). Unit test
+   `an_open_episode_drops_ordinary_lines_until_the_queue_is_half_empty`.
+2. **Accounting per chunk (§4.1).** The writer advances `written` and releases
+   `inflight_*` after each 256 KiB write instead of each batch, so a flush that
+   gives up in the middle of a big batch reports what is really left and the
+   bound is released as it is written. The duration of each write is kept in
+   atomics (status never waits behind the writer).
+3. **`QueueConfig` carries `warning` (§4.5).** `from_env()` cannot log (no
+   writer yet); the caller logs `warning` after the start. `StderrSink` (std's
+   stderr lock around the fault point and the write) is a public type.
+4. **`memchr`** (already in the lock file) is a dependency of the engine: the
+   split at `\n` is a vectorised search, as §4.1 asks, not a byte loop.
+5. **`accepted_lines`.** The flush barrier's coordinates count every admitted
+   line, summary and panic lines included, so `dropped + accepted == written`
+   in §7.1.1 holds only while no episode has closed (the test asserts it
+   before any flush).
+6. **Panic text (§4.4).** Formatted as the plan says (`thread '<name>' panicked
+   at <location>:\n<msg>`); the std of this toolchain (1.98) also prints the
+   thread's OS id after the name, the queued form does not. Tests match on the
+   parts they share. std's own panic output bypasses the stderr lock, so the
+   fault point (which holds that lock) does not delay std's hook:
+   `a_panic_reaches_the_log_in_order`'s discriminating assertion is the order
+   (std's message overtakes lines queued behind a stalled write), the join time
+   is kept as a property check.
+7. **Exit window (§7.2.3).** 1.0-1.8 s, not 1.0-1.3 s: the child's start-up
+   and a loaded host.
+8. **The micro-bench is written in W1** (`crates/engine/benches/log_writer.rs`,
+   the synchronous column a copy of the pre-plan writer, each cell in a child
+   process whose stderr is the file); W5 runs it on a quiet host. Its pass
+   rule: allocations per event not above the synchronous writer's, per-event
+   cost within 10 %, no drops.
+9. **`log-sink-stall` (§7.3).** The harness's cluster helpers give every node
+   the same environment, so the stall file is shared and armed with
+   `pid=<the node's pid>` (all three parts), and the control arm's
+   `CONSTELLATION_LOG_QUEUE_BYTES=0` (and part C's debug `RUST_LOG`) is on both
+   nodes. Part A lets appends land for 3 s before the first stall: a control
+   arm whose only tagged write was refused leaves `tagged op executed` with no
+   `tagged op landed` in the whole log, which `check_blind` reads as a blind
+   checker (correctly: it saw no write-time evidence). In the control arm the
+   first stall already costs `b` the root and it stops logging, so a later
+   stall is never taken: the arm stops stalling instead of failing for it (in
+   the normal arm a stall that is never taken fails the scenario). Part B's
+   bound is 1 s per op (the 5 s stall is what the synchronous writer's ops wait
+   out) and the control arm runs it too: it must fail the bound; its ops are
+   paced (5 ms) because on an idle host an unpaced loop wrote 13 000 metadata
+   segments in the 5 s, more than the bucket log check of the next part could
+   read back.
+10. **`upgrade-under-load` order (§6 W3, §7.4).** The loss warning
+    (`stopped waiting at its exec`) is logged at the top of `resume_main`, so it
+    comes *before* the new image's `resuming` line. Where a stall overlapped
+    the `exec` the old image's `exec'ing the new binary` line is itself among
+    the lost lines, and a stall that reaches two consecutive upgrades also
+    takes the next image's own `resuming` line and warning. The check accepts
+    an upgrade that left its `exec'ing` line, its `resuming` line, or a counted
+    loss, requires the last image's `resuming` line, and requires the log's
+    `log lines dropped` summaries to add up to the warnings.
+11. **Lost lines at an exec are dropped lines (review F3).** The new image
+    counts the old image's unwritten tail (its `unwritten_lines` when its
+    200 ms flush gave up) as dropped: `status.log.dropped_lines`, a
+    `log lines dropped` summary line (cause: the previous image's `exec`), so
+    `check_blind` and the hang watch see it and verification fails unless the
+    scenario declares it (`upgrade-under-load` under a `log-stall` item does,
+    with a printed note holding the count). The count is exact only as of the
+    moment the old writer stopped waiting: lines logged between that and the
+    `exec` are not in it, and the last chunk may have been written meanwhile
+    (it can over- and undercount); the warning says so. The loss itself is
+    smaller than it was: an upgrade drains the log, bounded to 2 s, before it
+    detaches the views (review F9), while the daemon still serves, so the
+    flush inside the gap has only what is logged from there on. The `exec`'s
+    thread teardown waits for a writer in an uninterruptible `write(2)`, which
+    the fault point (a `sleep`, interruptible) cannot reproduce: W5's gap
+    measurement must say so. Passing the unwritten queue to the new image
+    (a memfd named in the environment) would lose nothing; not done (the chunk
+    in flight would be written twice).
+12. **Failed writes are dropped lines (review F4).** See §4.1: `sink_errors > 0`
+    in the status is a harness violation of its own (a full disk under
+    `mount.log`), the lines of the failed chunk are in `dropped_lines`.
+13. **Panics past the cap (review F2).** The first 64 messages of a process
+    bypass the bound; later ones are admitted like WARN and ERROR lines and,
+    dropped, are counted in an episode with its summary line.
+14. **`watch_blind` (§5.3).** A status with `fuse_requests` but without
+    `log.dropped_lines` is schema drift; the existing unit test's "fine"
+    status gained the `log` section for that reason.
+15. **The queue's peak** (`log.queued_bytes_max`) is kept by the hang watch and
+    printed in each scenario's verify summary (`verify: log queue peak N bytes
+    of L`), the number W5's cells record.
+16. **Method count.** `node.logs.flush` makes 73 methods (`methods.rs`, the
+    engine's `control/mod.rs` doc, the control crate's stub-router table).
+17. **Exit order (review F10).** `main` returning an error in a daemon no
+    longer prints through std (its error is queued past the `RUST_LOG` filter) (which would wait for a stalled sink before the
+    bounded exit flush): the error is queued and flushed, bounded to 1 s. The
+    `eprintln!`s of `cmd_mount_body` stay direct: they are the `mount`
+    command's own words to the terminal that ran it, written by the main
+    thread, never by a serving thread.
+18. **A hung test run on the build box, and a lifecycle spin found with it.**
+    An engine test binary ran four hours at 825 % CPU. Cause of the hang: a
+    stale binary of an earlier fail-before experiment (the queue arm ran the
+    synchronous writer, the sources were restored with their old mtimes by
+    `rsync -a`, and cargo reused the mutated binary as fresh), whose gated tests
+    blocked forever; the box's sync script no longer preserves mtimes, and the
+    tests' gate sinks (`log_buffer`, `handover`, `control::ops`) now wait at
+    most 30 s and then fail the write. The CPU burn was a separate, older bug
+    the hang exposed: the engine's `engine-lifecycle` thread looped on
+    `Subscription::recv_timeout`, which returns at once once the source is
+    gone, and ended only at the engine's shutdown (15 leaked threads at 55 %
+    each). Fixed in its own commit (ed93500). The logger itself never
+    busy-waits: every wait in it is a condvar wait, bounded where a caller
+    bounds it.
+19. **Pre-reserve (§8).** Superseded by the block queue (§4.1, review F5);
+    numbers in PROGRESS.
+20. **Part C against main's delegation lane.** Since the delegate renews its
+    grant off the core (1b4e642), a core step stuck in a synchronous log write
+    no longer loses the delegation: the control arm of part C kept generation 1
+    with nothing reclaimed or lapsed while a write waited 12.0 s. Part C
+    therefore also bounds b's writes at 2 s, which is what the synchronous
+    writer still fails.
+
+21. **Round-2 review.** A sink that failed after the queue filled used to wedge
+    ordinary lines (the episode of the full queue kept blocking them, the
+    failing mark was cleared only by a write, and nothing was written): a failed
+    write now makes the open episode the sink's (it no longer blocks ordinary
+    lines), and no summary is built while the sink is failing. `node.logs.flush`
+    lets two calls wait at once (`viewer_flush`); the rest return at once with
+    `complete: false`. The upgrade's drain runs before the takeover-floor wait.
+    The daemon's error on exit is queued outside `RUST_LOG`
+    (`queue_last_words`). The fault point fires once per `write()` call
+    (retries after `WouldBlock` and partial writes included). Exec losses stay
+    verification failures unless declared; whether W5's disk-load cells should
+    treat them as notes is the maintainer's decision.
 
 ## Sources
 

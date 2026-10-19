@@ -1259,6 +1259,7 @@ dependencies = [
  "criterion",
  "fjall",
  "futures",
+ "memchr",
  "object_store",
  "postcard",
  "serde",
@@ -1270,6 +1271,7 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

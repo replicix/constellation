@@ -44,6 +44,12 @@ futures.workspace = true
 bytes.workspace = true
 blake3.workspace = true
 tracing.workspace = true
+# `log_buffer`'s `MakeWriter` and the summary line's timestamp (plan 44); the
+# workspace already builds it for `cli`.
+tracing-subscriber.workspace = true
+# `log_buffer` splits a write at its newlines with a vectorised search; the
+# crate is already in the workspace's graph.
+memchr = "2"
 thiserror.workspace = true
 # The object store's trait is an `async_trait` (`backend::CountingStore`).
 async-trait = "0.1"
@@ -71,4 +77,10 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 
 [[bench]]
 name = "vfs_bench"
+harness = false
+
+# `benches/log_writer.rs` (plan 44 §8): the cost of one log event with the
+# synchronous writer and with the sink queue, on a file sink.
+[[bench]]
+name = "log_writer"
 harness = false

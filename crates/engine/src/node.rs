@@ -1229,6 +1229,9 @@ impl Engine {
                 if let Err(error) = driver_task.await {
                     if error.is_panic() {
                         tracing::error!(%error, "the authority driver panicked; aborting");
+                        // The line that says why survives a healthy sink;
+                        // a stalled one cannot hold the abort (plan 44).
+                        crate::log_buffer::flush_process(std::time::Duration::from_millis(500));
                         std::process::abort();
                     }
                 }

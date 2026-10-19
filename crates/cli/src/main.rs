@@ -1309,7 +1309,7 @@ fn main() -> Result<()> {
             .with(iroh_noise)
             .with(
                 tracing_subscriber::fmt::layer()
-                    .with_writer(move || log_writer.writer())
+                    .with_writer(log_writer)
                     .with_filter(filter),
             )
             .init();
