@@ -1264,3 +1264,73 @@ rolls back to the old image, and the views take a remount to move.
 **See**: `crates/frontend-fuse/src/refs.rs`; PROGRESS, "Fix: a partial
 `FORGET` reaped an orphan the kernel still referenced";
 [plan 40 §4.4](../plans/v1/wip/40-readdirplus.md). Amends plan 31 §6.11.
+
+## ADR-32: Logging never blocks a daemon thread
+
+**Decision**: a daemon (`mount`, `serve`, a resumed `daemon --resume-from`)
+never makes a thread wait for its log's sink. Every log line goes, under the
+mutex the control ring already took, into the ring and into a bounded sink
+queue as one `Arc<str>`; one writer thread (`cst-log-writer`) writes the
+queue to stderr (`daemon.log`, a container's pipe, a harness `mount.log`) in
+batches of up to 256 KiB. The queue is bounded in bytes
+(`CONSTELLATION_LOG_QUEUE_BYTES`, 16 MiB by default): a line that does not
+fit is dropped and counted, the incoming one (an ordinary line is admitted
+within seven eighths of the bound, `WARN` and `ERROR` within all of it), and
+one `log lines dropped` summary line, written outside `RUST_LOG`, marks the
+gap once the queue is back under half. The writer starts only after the
+daemonizer's fork; the queue is flushed with a bound at exit (1 s), before
+the handover's `exec` (200 ms; what is left is reported by the new image) and
+before an abort (500 ms), and a panic's message goes through the same queue.
+The harness gives its daemons a 128 MiB queue and fails a run's verification
+on any drop, so its log checkers never go silently blind.
+
+**Why**: the 2026-10-17/18 investigation of delegations lost under a
+co-tenant build on the same btrfs volume found five of the six core steps of
+half a second or more spent in `LogWriter::write` (up to 12.55 s, one of
+which lost a delegation by itself), and the holder's off-core heartbeat
+thread blocked 7.25 s in stderr writes against a backup's 1.5 s takeover
+window. A buffered `write(2)` to a busy btrfs waits for the page's writeback
+(`folio_wait_bit_common`); `lazytime`/`noatime` do not remove that wait and
+"logs on a fast disk" is advice an operator may not be able to follow (a
+container's pipe, a single-volume host). The decision of 2026-10-14 (host
+mitigations only, plan 41 §1) is reversed on that evidence: it was a
+decision about which cost to accept, and a lost delegation is not one.
+
+**Rejected**: a per-thread never-block mode for the threads that must not
+stall (the evidence has the core, FUSE workers and tokio workers blocked
+too). `tracing_appender::non_blocking` (one more allocation per line, a
+bound in lines, a worker spawned before the fork, flushed only by a guard's
+`Drop` that `exit` and `exec` skip, no level reserve, no in-log summary).
+Dropping the oldest line (O(1) is the incoming one, it keeps the lines that
+led into a stall, and it leaves one contiguous gap, marked where it
+happened). Blocking, or waiting a bounded time, for `ERROR` (an error logged
+by the core during a disk stall is exactly the case that cost a delegation).
+`O_NONBLOCK` on fd 2 (a regular file ignores it; a pipe's lines split at
+`EAGAIN`; the flags are shared with the parent). A separate logger process
+(it would survive `kill -9`, but the in-process side still needs the queue
+and it adds a process to supervise across the handover; a possible
+follow-up).
+
+**Consequences**: lines can be lost behind a stalled sink, counted
+(`status` `log.dropped_lines`, `/metrics`) and marked in the log; so are the
+lines of a write the sink refused (a full disk) and the unwritten tail the
+previous image left at a handover's `exec` (the new image counts it); the
+in-memory ring `constellation log tail` reads keeps every line. A `kill -9`,
+`SIGSEGV` or OOM kill loses what is queued (the lines of the last few
+microseconds on a sink that keeps up; the harness flushes before its own
+`kill -9` and reports what it could not as a partial tail). A stalled
+`write(2)` in uninterruptible sleep still delays `execve` and process exit;
+the flush bounds only our wait, as the logging thread's own write did before.
+A panic's message is queued in order with the lines before it and no longer
+appears on stderr ahead of them; a panic that then aborts the process from
+inside the panic machinery (a panic in a `Drop` while unwinding) loses its
+message if the writer had not written it yet. `CONSTELLATION_LOG_QUEUE_BYTES=0` keeps the
+synchronous writer for A/B measurements and failing-before tests. The audit
+trail (a synchronous, never-lossy file), the `SIGUSR2` backtrace handler, the
+CSI driver, `chaos` and the harness's own logging are untouched.
+
+**See**: `crates/engine/src/log_buffer.rs`; `log-sink-stall` and its control
+arm ([TESTING.md](../how-to-guides/development/TESTING.md)); PROGRESS, "Fix:
+logging never blocks a daemon thread (plan 44)";
+[plan 44](../plans/v1/wip/44-non-blocking-log-writer.md). Supersedes plan 41
+§1's interim guidance.

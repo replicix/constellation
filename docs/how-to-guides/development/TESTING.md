@@ -3432,6 +3432,7 @@ Which bounds are latency and which are contracts (load campaign §4):
 
 | Scenario | Bound | Verdict |
 |---|---|---|
+| `log-sink-stall` (`logsink.rs`) | no takeover, no epoch change, no append ≥ 2 s, no delegation reclaimed or lapsed while a daemon's log sink stalls 12 s; part B's ops < 1 s | contract (the stall must be shown: `log.longest_write_ms`); the 2 s and 1 s bounds: latency |
 | `delegate-*` (`delegroot.rs`) | failover write ≤ takeover + the successor's logged quarantine (`wait_ms`) + 6.5 s; on the new root ≤ TTL + 3 s + 12 s; after a handoff ≤ 3 s or 2 × the control | latency. No write error, the takeover, by seal when listed, a counted quarantine logged and never longer than configured (`Timings::ack_floor_wait`, the drift tripwire): exact |
 | `backup-failover` (`m9.rs`) | `backup_takeovers` and `seals` counted | contract; the takeover < TTL/2: latency |
 | `ack-s3-failover` (`m9.rs`) | `s3_fast_takeovers` counted, one newer holder, a counted quarantine logged and within the configured cap | contract; B's write across it ≤ max(TTL/2, takeover + the logged quarantine + 6.5 s): latency |
@@ -3464,6 +3465,7 @@ scenario spawns; an item is a preset or `kind[:arg...][@node]`:
 | `pause:<dur>[:every_ms]` (`pause-takeover`, `pause-lock-lapse`) | `SIGSTOP`/`SIGCONT` of the daemon; `<dur>` is ms or a boundary of `crates/harness/src/timings.rs` with an offset: `takeover`, `lock-half`, `lock-lapse`, `lock-outwait`, `deleg-half`, `deleg-lapse`, `deleg-outwait`, `holder-stall`, `lease-half`, `lease-ttl` (e.g. `lock-lapse+500`), from the daemon's own environment. Injected pauses count as host lag |
 | `step-pause:<dur>[:every_ms]` (`step-pause`) | the daemon stops itself between `Core::handle` and the dispatch of the step's actions (`CONSTELLATION_FAULT_STEP_PAUSE_FILE`), then is resumed after `<dur>` |
 | `store-stall:<ms>[:every_ms]` (`store-stall5`, `store-stall20`) | one ordinary metadata write holds the writer lock `<ms>` (`CONSTELLATION_FAULT_STORE_STALL_FILE`: `<ms>` stalls every non-priority write while the file exists, `<ms> once` one), so the core's step waits behind it |
+| `log-stall:<ms>[:every_ms]` (`log-stall12` = `log-stall:12000:20000`) | one write to the daemon's log sink sleeps `<ms>` holding std's stderr lock (`CONSTELLATION_FAULT_LOG_STALL_FILE`, written whole by a rename as `<ms> once pid=<pid>` every `every_ms`: a stalled `write(2)` to a busy disk, plan 44). **Not probe-blind**: the daemon's log writer never blocks a thread, so a log stall costs the workload no latency and the latency bounds apply |
 | `runtime-hog:<n>:<ms>[:gap_ms]` (`runtime-hog`) | `CONSTELLATION_FAULT_RUNTIME_HOG`: `n` tasks block tokio workers `ms` at a time |
 | `s3:latency:<ms>:<jitter>`, `s3:bandwidth:<kBps>`, `s3:slicer:<bytes>:<delay_us>`, `s3:blackhole:<ms>[:at_ms]` (`s3-jitter`, `s3-jitter-high`, `s3-blackhole`, `s3-slow`) | toxiproxy toxics named `load-*` (a scenario's `heal` keeps them) on its `s3` proxy, and on a `load-s3` proxy that clients given the direct endpoint are routed through, so every client gets them without the scenario's own cuts reaching more clients |
 | `net:<netem args...>`, `net:flap` (`net-lan`, `net-wan`, `net-lossy`, `net-flap`) | `tc netem` on `lo` for the daemon's own UDP (P2P) ports, found from `/proc/<pid>/fd`: a `prio` root with one netem band per node; flap drops everything 2 s in 10 |
@@ -3555,8 +3557,10 @@ open. `load-probe` (a campaign-only scenario, `harness list`) runs them
 all on two nodes (and fails if the log checkers parsed no grant, tagged
 op, landed write or lease acquisition: its counter guarantees them);
 `CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=<data|ledger|exclusion|token|
-split-brain|errno|enoent|stall|log-missing|latency|latency-mild>` breaks one on
-purpose and must fail naming it (`latency-mild`, 2.5 s against a 1 s
+split-brain|log-drop|errno|enoent|stall|log-missing|latency|latency-mild>` breaks one on
+purpose and must fail naming it (`log-drop` forges a `log lines dropped`
+summary line in `a`'s log and must fail naming `log line(s) dropped`)
+(`latency-mild`, 2.5 s against a 1 s
 bound, is inconclusive under an applied probe-blind injector only).
 `load-probe` mounts `a` first, so `a` holds the root and a pause aimed at
 `b` (`pause:...@b`) never touches it. `load-probe-takeover` is the same
@@ -3574,6 +3578,84 @@ a write of the delegate's own, admitted before the gate's strand, executed
 between the strand and the replay (the takeover fence,
 `Meta::begin_local`). The runner's `takeover` phase runs it under the
 targeted pause profiles, and phase 3 under its own list.
+
+**A log that lost lines, and the `kill -9` tail** (plan 44). A daemon's
+log writer never blocks a thread: lines go into a queue and are dropped,
+counted and marked when the log's sink stalls longer than the queue holds
+(`CONSTELLATION_LOG_QUEUE_BYTES`, 16 MiB by default). The verification
+checkers read the daemons' logs, so a dropped line is a check that could not
+see it, and the harness is built so that never happens silently:
+
+- every daemon the harness starts gets a 128 MiB queue
+  (`CONSTELLATION_LOG_QUEUE_BYTES=134217728`, `Client::cmd`, before the
+  client's own `env`; a scenario may override it), which holds a 12 s sink
+  stall at 10 MB/s of logging. Not `0`, the synchronous writer: the loaded
+  runs are where the blocking was found. The hang watch keeps the largest
+  `log.queued_bytes_max` it polled, and the scenario's verify summary prints
+  it (`verify: log queue peak N bytes of 134217728`); the campaign records it
+  per cell and requires 4x headroom;
+- `check_blind` counts a fifth marker, `log lines dropped`, per log (raw
+  and parsed, so a format drift is caught like the other markers) and fails
+  the scenario naming the log and the count (`checker blind: <label>: <n>
+  log line(s) dropped ...`); the hang watch fails it too when a daemon's
+  `node.status` has `log.dropped_lines` above 0 (this also covers a daemon
+  killed before its summary line reached the file), and a status without
+  that field is schema drift, and `log.sink_errors` above 0 (a full or
+  failing disk under `mount.log`: the failed chunks are lost lines) is a
+  violation of its own that no declaration excuses. A scenario that drops on
+  purpose declares it: `verify::expect_log_drops(&client)` (reported, not a
+  violation). Lines a handover's `exec` took are dropped lines too (the new
+  image counts them and writes a summary line), so they fail the run unless
+  declared;
+- a `kill -9` loses what the daemon's writer had queued. With verification
+  on, `Client::kill9` and `kill9_within` first call `node.logs.flush`
+  (500 ms for the writer, 1.5 s for the call) unless the daemon is stopped.
+  A complete flush leaves the same microsecond window between an op's commit
+  and its log line as before the queue. What a flush could not write, a
+  failed call and a stopped daemon are printed (`verify: b's mount.log may
+  lack up to N line(s) logged before its kill -9 (<why>)`) and counted in
+  the scenario's verify summary as **partial tails**: a note, never a
+  violation, since a killed process's last lines are not a property of the
+  daemon. The barrier costs a control round trip, and up to 1.5 s behind a
+  stalled sink, before every kill: a scenario that kills inside a timing window
+  under a `log-stall` item can miss it;
+- `CONSTELLATION_HARNESS_LOAD_PROBE_BREAK=log-drop` (above) proves the
+  check; the `log-stall` load item (above) stalls a daemon's sink, and
+  `upgrade-under-load` checks that across its three upgrades the log has, in
+  order, each `exec'ing the new binary` line followed by the new image's
+  `resuming a handed-over daemon` line and no loss (under a `log-stall` item
+  a stall may overlap an `exec`: the old image gives up after 200 ms and its
+  last lines are lost, the `exec'ing` line among them, and with a stall that
+  reaches two upgrades the next image's own `resuming` line; the new image
+  counts the loss as dropped lines, writes a `log lines dropped` summary and a
+  `stopped waiting at its exec` warning, and the check accepts an upgrade that
+  left its `exec'ing` line, its `resuming` line or such a counted loss, with
+  the summaries adding up to the warnings. The scenario declares the loss
+  with `expect_log_drops` and prints its count);
+- `log-sink-stall` (`scenarios/logsink.rs`, in the default catalog;
+  `kind` skips it: the stall is a fault file on the node's host). Part A: `b`
+  the root's holder with `a` its backup, an `flock` holder on `b` appending
+  and `fsync`ing every 100 ms, `b`'s sink stalled 12 s three times, 15 s
+  apart, `b` at `info` plus the lock targets at `debug`: `a` takes nothing
+  over, `b`'s epoch holds, no append waits 2 s, `b`'s `log.longest_write_ms`
+  shows the stall (else the scenario proved nothing and fails),
+  `log.dropped_lines` is 0 and `b`'s log has lines stamped inside each
+  window (queued, not lost). Part B: a lone node, 64 KiB queue, `RUST_LOG=debug`,
+  `expect_log_drops`, one 5 s stall under a workload: lines were dropped,
+  the log's `log lines dropped` lines sum to the status counter and are as
+  many as `drop_episodes`, no op waited 1 s (the stall is armed for the
+  node's pid). Part C: `/d1` delegated to
+  `b` (5 s grants), a writer on `b`, `b`'s sink stalled 12 s twice: `b`'s
+  generation unchanged, `a` reclaimed and recalled nothing, `b`'s grant never
+  lapsed, no write error, no write waits 2 s (a stalled core no longer loses the
+  delegation, since the off-core renewal lane, so the latency is what shows the
+  synchronous writer). **The control arm**
+  (`CONSTELLATION_HARNESS_LOG_SINK_STALL_CONTROL=1`, run once per gate)
+  runs A, B and C with `CONSTELLATION_LOG_QUEUE_BYTES=0`: the synchronous
+  writer, where the fault sleeps in the logging thread as a stalled disk did
+  before plan 44. They must **fail** their assertions (a takeover or seal of
+  `b`, a lost delegation, an error, a slow append, an op that waited the
+  stall out); a control arm that passes fails the scenario.
 
 **The runner** (`tools/load-campaign/run.py`) runs a
 phase/profile/scenario/seed matrix, one `harness run` per cell with

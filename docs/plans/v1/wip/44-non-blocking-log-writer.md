@@ -960,7 +960,7 @@ tail is a note, not a violation; no logger process for now.
 - [x] W3: the harness's 128 MiB, `check_blind` and the watch on drops,
       the kill barrier, the `log-stall` load item, `log-sink-stall` with
       its control arm, the `log-drop` break, the upgrade order check.
-- [ ] W4: configuration, named filesystems, troubleshooting, TESTING,
+- [x] W4: configuration, named filesystems, troubleshooting, TESTING,
       ADR-32, PROGRESS.
 - [ ] W5: §8's measurements on four file systems, every gate of §9, the
       peak queue occupancy per campaign cell recorded.

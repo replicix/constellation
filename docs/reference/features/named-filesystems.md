@@ -218,7 +218,9 @@ a daemon that answers; a holder that does not answer is classified from
 daemon logs each startup phase with its duration, and a
 `startup-watchdog` thread warns every `CONSTELLATION_STARTUP_WARN_S`
 (30) that a phase is still running, so a stuck startup names its phase
-in `daemon.log`.
+in `daemon.log` (a `log lines dropped` line in it, or a `log.longest_write_ms`
+in seconds in `constellation status`, means the disk under the log stalled;
+see [the daemon's log never blocks it](#the-daemons-log-never-blocks-it)).
 
 ## Daemonization
 
@@ -235,6 +237,44 @@ the test harness and interactive debugging); `CONSTELLATION_NO_DAEMONIZE`
 forces foreground behavior for every `mount` in an environment (CI
 convenience). A daemonized mount's PID file and log live at
 `<state-dir>/daemon.pid` and `<state-dir>/daemon.log`.
+
+### The daemon's log never blocks it
+
+A daemon (`mount`, `serve`, a resumed `daemon --resume-from`) does not wait
+for `daemon.log`: each log line goes into a queue (16 MiB by default,
+`CONSTELLATION_LOG_QUEUE_BYTES`) and one writer thread appends the queue to
+the file in batches. A disk that stalls (a buffered write to a busy btrfs or
+a loaded network volume can wait seconds) stalls that thread alone; the
+authority core, the FUSE workers and the lease heartbeat keep running.
+Behind a stall longer than the queue holds, the *incoming* line is dropped
+(the last eighth of the queue is kept for `WARN` and `ERROR` lines), and
+once the file is writable again one line marks the gap:
+
+```text
+2026-10-18T10:15:42.123456Z  WARN constellation::log: log lines dropped: the log sink did not keep up dropped_lines=1834 dropped_bytes=402117 first_dropped_unix_ms=1792318530000 queue_limit_bytes=16777216
+```
+
+`constellation status` has a `log` section: `dropped_lines` (nonzero: the
+file is missing lines, the daemon was not slowed), `longest_write_ms` (the
+longest single write to the file, in seconds when the disk under it stalled,
+whether or not lines were dropped), `writing_for_ms` (the write in progress
+now, growing without end when the file's disk is wedged), `queued_bytes` and
+`queued_bytes_max`, and `sink_errors` (writes that failed: a full disk).
+`constellation log tail` reads the daemon's in-memory ring of the last 2 000
+lines, which has every line whether or not the file got it. What was queued
+is written before a clean exit and before the handover's `exec` (an upgrade
+drains the log, up to 2 s, before it detaches the views; what is still queued at
+the `exec` is counted as dropped by the new image and says so in a `log lines
+dropped` line); a write to the file that fails (a full disk) drops its chunk,
+counted in `dropped_lines` and `sink_errors`; a `kill -9` loses the lines of the
+last moments (behind a stalled disk, the backlog). A
+`log` section with `mode: "sync"` means the queue is off
+(`CONSTELLATION_LOG_QUEUE_BYTES=0`, for measurements only) and a slow disk
+does stall the daemon.
+
+Host guidance that still helps, with fewer drops as the only effect:
+`lazytime`/`noatime` on the state directory's file system, and the state
+directory (or at least `daemon.log`) on a device that does not stall.
 
 ## `export`
 

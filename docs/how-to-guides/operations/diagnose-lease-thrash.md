@@ -12,6 +12,12 @@ journalctl --user -u constellation -f | grep 'handed the lease to a peer'
 ```
 
 `handed the lease to a peer` means a requester used the handoff fallback.
+Lines can be missing from a log whose disk stalled: a `log lines dropped`
+line in `daemon.log`, or a `log.dropped_lines` (or a `log.longest_write_ms`
+in seconds) in `constellation status`, says so. The daemon kept running (its
+log writer never blocks a thread, unless the queue is off:
+`CONSTELLATION_LOG_QUEUE_BYTES=0`); look at the disk under the log, not at
+the lease.
 Occasional lines during startup or a holder failure are expected. Repeated
 lines during steady writes indicate forwarding is timing out, being declined,
 or targeting stale holder information.

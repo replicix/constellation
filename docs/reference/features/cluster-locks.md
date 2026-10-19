@@ -1568,7 +1568,11 @@ no longer live". The usual cause is a stall of the node, or a
 partition from the owning sequencer, longer than
 `CONSTELLATION_LOCK_TTL_MS` (on the holder itself, a stall of its
 authority core: renewals of its own grants run there too, so a
-`slow core step` of that length in the log fences them), or a TTL
+`slow core step` of that length in the log fences them; the disk under
+`daemon.log` is not such a cause (unless the queue is off,
+`CONSTELLATION_LOG_QUEUE_BYTES=0`): a daemon's log writer never blocks the
+core, and a `log lines dropped` line says where that disk made the log lose
+lines), or a TTL
 takeover of the root lease. An S3 blip no longer does (see
 [Failover](#failover)). Close
 the file or unlock, then lock again. The application must assume that

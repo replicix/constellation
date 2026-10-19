@@ -52058,3 +52058,208 @@ lib 140 passed; the sweeps of `locks`, `locks-delegated`, `locks-long-grants`,
 the production-ttl configs, `locks-failover-backup-renew` and
 `locks-blips-tight-faults` unchanged to the digit (the L1 field and the
 engine's back-off touch no path of them).
+
+## Fix: logging never blocks a daemon thread (plan 44)
+
+The maintainer's decision of 2026-10-18 (reversing 2026-10-14): a daemon's
+threads never wait for the log's sink; when the writer cannot keep up, lines
+are dropped and counted. Milestones W1-W4 of
+[plan 44](wip/44-non-blocking-log-writer.md), reviewed twice (ten findings, then six more,
+all addressed below); W5, the measurement campaign, follows.
+
+### Evidence (numbers only)
+
+Loaded runs on btrfs-over-EBS under a co-tenant build, 2026-10-17/18: of the
+six core steps of 0.5 s or more in 68 runs, five were spent in
+`LogWriter::write` (0.69, 0.70, 6.85, 12.14, 12.55 s; CPU 110 µs, run-queue
+delay tens of µs), the 12.55 s one lost a delegation by itself; the holder's
+heartbeat thread blocked 1.555 s and 7.25 s in stderr writes against a
+backup's 1.5 s takeover window.
+
+### Design
+
+- One mutex, one `Arc<str>` per line: the control ring and a byte-bounded
+  sink queue (`CONSTELLATION_LOG_QUEUE_BYTES`, 16 MiB) are fed together; one
+  writer thread (`cst-log-writer`) writes the queue to stderr in 256 KiB
+  chunks. No allocation per line beyond the ring's old one (the queue is a list
+  of 1 024-entry blocks, reused and freed as consumed: nothing grows or copies
+  under the lock).
+- A full queue drops the incoming line (WARN and ERROR keep the last eighth),
+  counts it, and one `log lines dropped` line marks the gap once the queue is
+  under half; an open episode drops ordinary lines too, so the gap is one run.
+  A viewer's `node.logs.flush` cannot grow the queue past its bound; the last
+  flush of an exit, an `exec` or an abort always writes the summary.
+- Every lost line is a counted one: a full queue, a sink write that failed
+  (`ENOSPC`, `EIO`: the chunk is dropped, counted, `sink_errors` too, a torn line
+  kept apart, `WouldBlock` polled), the previous image's unwritten tail at a
+  handover's `exec` (counted as dropped by the new image, with a summary line).
+- The writer starts after the daemonizer's fork (`start_daemon_logging`; for
+  `serve` and a resumed daemon before their first line); flushed with a bound at
+  exit (1 s; an `Err` from `main` is queued, not printed through std), before
+  the handover's `exec` (200 ms; an upgrade drains the log, 2 s, before it
+  detaches the views) and before the authority driver's abort (500 ms); a
+  panic's message goes through the queue (past the 64th, like WARN).
+- `status.log`, `node.logs.flush`, `constellation_log_dropped_lines_total`,
+  `constellation_log_queued_bytes`; the sink's stall fault point
+  `CONSTELLATION_FAULT_LOG_STALL_FILE`.
+- The harness: 128 MiB queues, `check_blind` and the hang watch fail a run on
+  any drop (and on `sink_errors`), `node.logs.flush` before a `kill -9`
+  (partial tails are a note), the `log-stall` load item, the `log-sink-stall`
+  scenario with its control arm (parts A, B, C), the `log-drop` break, the
+  upgrade order check.
+
+### Review findings and their fail-before
+
+Each new behaviour has a test that fails without it (the mutation in
+parentheses was run on the box's tree, the failure quoted):
+
+- F1, a viewer's flush grew the queue: `a_viewers_flush_cannot_grow_the_queue_past_its_bound`
+  ("queued 65780 of 65536 after 292 calls"; before: 80x the bound in 20 000
+  calls) and `the_final_flush_closes_the_episode_whatever_the_queue_holds`.
+- F2, panics past the 64th were dropped uncounted: `panics_past_the_cap_are_logged_or_counted`
+  (128 of 400 lines reached the sink with no episode).
+- F3, lines lost at an exec: `an_exec_loss_is_counted_as_dropped_with_a_summary_line`
+  and the status assertion in `status_reports_the_log_writer_and_flush_waits_for_it`
+  (counter 0, expected 376 / 5); the scenario declares the loss and checks that
+  the summaries add up to the warnings (`upgrade-under-load` under
+  `log-stall:6000:2500`: 901, 1 040 and 972 lines counted, declared).
+- F4, failed writes: `a_failing_sink_drops_its_chunk_counted_and_marked`
+  (counted as written, 0 dropped), the torn line (glued to the next: "firstsecond
+  line"), `a_would_block_sink_is_polled_not_dropped` (nothing written),
+  `a_sink_that_keeps_failing_is_not_spun_on` (without the failing-sink rule 50
+  summary lines for 20 failures); `the_watch_flags_a_daemon_whose_log_writes_failed`.
+- F5, memory: the block queue (`a_backlog_is_held_in_blocks_that_go_as_they_are_consumed`,
+  `a_writer_that_keeps_up_reuses_its_blocks`: without the spare blocks 2 000
+  blocks for 2 000 lines, an allocation per line more than the old writer;
+  the bench caught it at 1.5-2.5 allocations per event before the fix).
+- F7, the order check: accepts a counted loss that takes the lines of two
+  upgrades (the first version failed 3 of 3 runs under a 6 s stall).
+- F8, `log-sink-stall` part B: armed for the node's pid, 1 s per op; its control
+  arm now fails it (an op waited 4.98 s behind the stalled sink).
+- F9, the drain before the views detach: under `log-stall:3000:4000` the third
+  `exec` of the first cut lost 376 and 344 lines; with the drain (2 s, while the
+  views are served) three runs lost none (a 6 s stall outlasts the drain, and
+  the loss is then counted: below). Found with it: the resumed image's first
+  line, written synchronously before its writer started, waited out the stall
+  (`upgrade-under-load` under `log-stall:6000:2500`: longest syscall 6.6 s,
+  upgrades 8.8 s); the writer now starts before that line for `serve` and
+  `daemon --resume-from`
+  (`the_resumed_daemon_and_serve_start_their_writer_first`; the same cell:
+  longest syscall 0.6 s) and the scenario bounds the gap at 3 s under a log
+  stall. The upgrade *command* takes 2.3 s under a 3 s stall (it waits for the
+  drain; the application does not).
+- F10, `an_error_return_leaves_within_the_flush_bound` (std's print waited out
+  the stall: 1.8 s against the 1 s flush bound).
+- Round 2: a sink that failed after the queue filled wedged ordinary lines
+  (R2-1: the episode of the full queue kept blocking them and nothing was
+  written to clear the failing mark; `ordinary_lines_resume_after_a_full_queue_and_a_failed_then_recovered_sink`:
+  0 of 200 lines reached the sink, 2 200 counted dropped; a failed write now
+  makes the episode the sink's, and no summary is built while the sink fails);
+  `node.logs.flush` lets two calls wait at once (R2-2,
+  `viewer_flushes_are_limited_and_the_excess_returns_at_once`: the third waited its
+  whole bound); the upgrade's drain runs before the takeover-floor wait (R2-3);
+  the daemon's error on exit bypasses the `RUST_LOG` filter (R2-4,
+  `the_error_return_is_logged_whatever_the_filter`: not logged at all with a
+  filter that hides this crate); the fault point fires once per `write()` call;
+  docs. The exec-loss policy for W5's disk-load cells (strict, a note, or a
+  lossless handover through a memfd) is the maintainer's decision, open.
+- The first cut's own fail-before (unit tests with their naive arms, the
+  scenario's control arm) is unchanged: the synchronous writer on a gated sink
+  blocks all 4 threads; the control arm shows `a` taking over, `b`'s lease lost,
+  12.0 s for an append, a write 12.27 s late, an op 4.98 s late (part B).
+
+### Performance (`crates/engine/benches/log_writer.rs`)
+
+One `info!` of six fields (about 250 bytes) through the fmt layer, the sink a
+file on each file system, ns per event on the logging threads, synchronous
+writer (a copy of the one before plan 44) -> queue, medians of 5 on the build
+box at a load average of 8-12. Allocations per event: 1.001 for both writers on
+every file system.
+
+| File system | 1 thread | 8 threads flat out | 8 threads at 80 k/s |
+|---|---:|---:|---:|
+| tmpfs | 1 359 -> 1 270 | 4 268 -> 3 445 | 2 365 -> 2 124 |
+| btrfs | 2 065 -> 1 027 | 18 057 -> 3 136 | 5 894 -> 1 980 |
+| ext4 (loop image) | 1 388 -> 1 350 | 5 056 -> 2 835 | 3 765 -> 2 125 |
+| xfs (loop image) | 1 478 -> 1 309 | 6 106 -> 2 665 | 4 452 -> 2 054 |
+
+The queue is at or below the synchronous writer in every cell. The first cut's
++6.7 % on xfs with one thread (3 repetitions at a load of 30) was the host's
+noise, not the writer's: five repetitions at a load of 12 read 1 478 -> 1 309.
+The worst single event is the scheduler's at these loads (the queue's and the
+synchronous writer's both reach milliseconds in the flat-out cells; behind a
+slow device the queue peaks at tens of thousands of entries and the block queue
+grows by allocating one 16 KiB block at a time, not by copying a large array
+under the lock). `vfs_bench` (no subscriber installed): unchanged.
+
+### Hung test run and lifecycle spin (found while gating W1; fixed in ed93500)
+
+An engine test binary on the build box ran 4 h 7 min at 825 % CPU. gdb stacks
+(kept on the build box): six `log_buffer::tests` threads parked in
+`BlockingSink::write` on a gate that never opens, called from the *synchronous*
+writer, and 15 `engine-lifecycle` threads in `Subscription::recv_timeout`. The
+binary was a fail-before mutation of the tests (the queue arm swapped for the
+synchronous writer), restored in the sources by `rsync -a` with old mtimes, so
+cargo took the mutated test binary for fresh: a harness mistake, fixed (the sync
+script no longer preserves mtimes; the gate sinks of the tests wait at most 30 s
+and then fail). The unmutated tree's engine lib tests finish, as do main's. The
+CPU burn was an old bug in `engine/src/lifecycle.rs`: the lifecycle thread
+treated a source that was gone like a timeout and looped until the engine's
+shutdown, so every engine dropped without one left a thread spinning a core
+(55 % each). Fixed in its own commit.
+
+### The `lpts-46` finding
+
+`load-probe-takeover` under the stall cell, seed 46, failed the bucket log's
+exactly-once check once ("rid (1, 1, 119) decided twice ... completed in segment
+375 #1 ... refused in segment 375 #2"). It was root-caused to a pre-existing
+ordering bug in the authority driver's in-doubt resubmission and fixed separately
+(b735045); plan 44 does not touch that path.
+
+### Residual risks (plan 44 §11)
+
+`kill -9`, `SIGSEGV` and OOM kills lose what is queued (the harness flushes
+before its own `kill -9`); a panic that then aborts from inside the panic
+machinery (a panic in a `Drop` while unwinding, one escaping an `extern "C"`
+function) loses its message if the writer had not written it, where std's hook
+wrote it synchronously, and so does a double panic; a `write(2)` in
+uninterruptible sleep still delays `execve` and exit (the fault point sleeps,
+which is interruptible: W5's gap measurement must say so); lines logged between
+the old writer's last wait and the `exec` are not in the loss count, and a chunk
+in flight may have been written; a write that failed half way leaves a torn line
+(kept apart); a dead writer thread leaves the queue to fill and drop (`status`
+shows `writing_for_ms` 0 at the limit); the `kill -9` barrier costs up to 1.5 s
+behind a stalled sink; `tools/check-cross.sh` was not run (the engine now pulls
+`tracing-subscriber`).
+
+### Deviations from the plan, and what the code contradicted
+
+Recorded in the plan's section 15 ("Implementation notes").
+
+### Gates (W1-W4, build box, 16 vCPU, rebased on 5a7f659)
+
+`cargo fmt --all` clean, `cargo clippy --workspace --all-targets -- -D warnings`
+clean, each milestone on its own; `cargo test --workspace --no-fail-fast -j 8`
+(under `timeout`): 3 337 passed, 0 failed, 56 ignored (the round-2 tree). Scenarios (every job under
+`timeout --kill-after=30s`), seed 42, verification on:
+
+- `log-sink-stall` normal arm 3 of 3 PASSED (103-104 s), control arm 3 of 3
+  PASSED, parts A, B and C each failing as required (a takeover and `b`'s lease
+  lost, an op 4.99 s late, a delegate write 12.0 s late). On the rebased tree
+  part C's control arm first passed every assertion: since the delegate renews
+  its grant off the core (1b4e642) a core stuck in a synchronous log write no
+  longer loses the delegation, so part C now also bounds b's writes at 2 s.
+  Part B paces its ops (5 ms): unpaced on an idle host it wrote 13 000 metadata
+  segments in the 5 s, more than the bucket log check of part C could read back
+  ("Connection reset by peer").
+- `upgrade-under-load` idle 3 of 3 PASSED (upgrades 237-308 ms, longest syscall
+  281-286 ms); under `log-stall:3000:4000` 3 of 3 PASSED, no line lost, longest
+  syscall 364 ms; under `log-stall:6000:2500` 2 of 2 PASSED with one lossy
+  `exec` each (2 103 and 2 068 lines, counted and declared), longest syscall
+  647 and 628 ms.
+- `load-probe` with the `log-drop` break fails naming "3 log line(s) dropped";
+  `session-handover-idle` and `kill9-remount` PASSED.
+- `vfs_bench` (no subscriber installed): unchanged, 3 / 11 / 18 allocations per
+  view op, overhead 70-112 ns.
+- Not run (W5): `smoke.sh`, `integration.sh`, `perf-gate.sh`'s harness bench,
+  pjdfstest, the full harness matrix, the seeds 42..61 cells.

@@ -173,6 +173,12 @@ If leases still move frequently with placement disabled, inspect
 path (a requester with no P2P path escalating from the S3 inbox, or a
 lease-path fallback), not placement.
 
+Lines can be missing from `daemon.log` when the disk under it stalled (a
+`log lines dropped` line, or `log.dropped_lines` and `log.longest_write_ms`
+in `constellation status`): the daemon's log writer never blocks the
+authority core or the heartbeat, so a stalled log disk is not why a lease
+moved (unless the queue is off, `CONSTELLATION_LOG_QUEUE_BYTES=0`).
+
 ## References
 
 - [Delegations](delegations.md)

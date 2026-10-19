@@ -39,6 +39,7 @@ AWS credentials follow the ordinary AWS SDK chain (`AWS_REGION`,
   - [FUSE and runtime threads](#fuse-and-runtime-threads)
   - [Filesystem stats and quota](#filesystem-stats-and-quota)
   - [Named filesystems and daemonization](#named-filesystems-and-daemonization)
+  - [Logging](#logging)
   - [Control UI](#control-ui)
   - [Control allowlist (plan 31 §9.5 / plan 33 U1)](#control-allowlist-plan-31-95--plan-33-u1)
   - [Fault injection (testing only)](#fault-injection-testing-only)
@@ -1124,6 +1125,32 @@ operator has cleared.
 | `CONSTELLATION_SHUTDOWN_STALL_S` | `120` | seconds, positive | an unmount's drain that makes no progress (the journal and pending uploads stop shrinking, and the final metadata publish reads, writes and locates no tree nodes) for this long gives up and exits non-zero, leaving everything on disk for the next mount; a waiting `umount` then fails with what was left |
 | `CONSTELLATION_ATTACH_TIMEOUT_MS` | `120000` | milliseconds, positive | how long a `mount` that found `daemon.lock` held keeps trying to attach to a daemon that does not answer; also how long a `mount` waiting for a draining daemon's exit tolerates that daemon not answering (the wait itself has no wall-clock bound: it lasts as long as the drain makes progress) |
 
+### Logging
+
+A daemon (`mount`, `serve`, a resumed `daemon --resume-from`) never waits
+for its log's sink: every log line goes into a queue and one writer thread
+writes the queue to stderr (`daemon.log`, a container's pipe, a harness
+`mount.log`). When the sink stalls longer than the queue holds, the
+incoming line is dropped and counted, `WARN` and `ERROR` keep the queue's
+last eighth to themselves, and one `log lines dropped` line says how many
+were lost once the sink catches up; `constellation status` and `/metrics`
+carry the counters (`log.dropped_lines`, `constellation_log_dropped_lines_total`).
+The recent lines stay in the in-memory ring `constellation log tail` reads
+whether or not the sink got them. A short-lived command (`status`,
+`umount`, `fs create`, ...) writes to stderr itself, as it always did.
+What the daemon had queued is written before it exits, before the
+handover's `exec` (an upgrade first drains the log, up to 2 s, while the
+views are still served, and the last wait before the `exec` is 200 ms; what
+is still queued then is counted as dropped lines by the new image) and
+before an abort. A write to the sink that fails (a full disk, an I/O error)
+drops its chunk, counted the same way (`log.sink_errors` too). A `kill -9`
+loses what was queued. `RUST_LOG` filters as before (default `info`).
+
+| Variable | Default | Unit / values | Subsystem |
+|---|---:|---|---|
+| `CONSTELLATION_LOG_QUEUE_BYTES` | `16777216` (16 MiB) | bytes; below `65536` is raised to it; unparsable keeps the default (with a warning in the log) | the daemon's log queue bound, read once at start, each line counted with its overhead until it is written. At the info level a busy node writes a few KB/s, so the default holds minutes of a stall. Memory is taken only while lines wait (a queue of 1 024-entry blocks, freed as the writer consumes them) and stays within the bound, plus at most 64 panic messages, the `log lines dropped` summaries the bound's reserve holds, and the queue's slack: two part-used 16 KiB blocks, up to four spare blocks kept by the queue and four emptied ones held by the writer (at most 128 KiB in all), and the writer's chunk buffer (256 KiB plus one line, shrunk after 1 MiB). A line's allocation is freed once copied for writing, while its bytes stay counted until the write returns. **`0` keeps the synchronous writer** (a slow log sink stalls every thread that logs): for A/B measurements and failing-before tests only |
+| `RUST_LOG` | `info` | `tracing` filter | which events are logged (`aws_config` stays at `warn` unless named). The `log lines dropped` line ignores the filter |
+
 ### Control UI
 
 | Variable | Default | Unit / values | Subsystem |
@@ -1255,6 +1282,7 @@ filesystem.
 | `CONSTELLATION_FAULT_P2P_DENY_FILE` | unset | a file path, one node id per line, re-read on every use | plan 30 M9/M11: drops P2P traffic to and from the listed nodes and reports them unconnected, for backup appends, pre-S3 streaming, delegation, lock, lease-request and promise messages (a one-sided partition) |
 | `CONSTELLATION_FAULT_HOLD_DRAIN_FILE` | unset | a file path | test-only: while the file exists a clean shutdown's drain waits before it uploads or ships anything, and writes `<path>.held` once it does (a long clean-unmount drain, for `umount`/`mount` tests) |
 | `CONSTELLATION_FAULT_RUNTIME_HOG_FILE` | unset | a file path whose content is `<tasks>:<block_ms>:<every_ms>[:<node>,...]`, re-read every 200 ms | while the file exists, every `every_ms` the daemon (only the listed nodes, if any) spawns `tasks` tasks that each block a worker of its shared runtime for `block_ms` (a runtime starved by blocking calls while the process and the host are fine) |
+| `CONSTELLATION_FAULT_LOG_STALL_FILE` | unset | a file path whose content is `<ms>[ once][ pid=<n>]`, read at every write to the log's sink | plan 44: while the file exists, each write to the daemon's log sink first sleeps `<ms>` holding std's stderr lock, as a stalled `write(2)` to a busy disk does (on the log writer thread; with `CONSTELLATION_LOG_QUEUE_BYTES=0` on the logging thread, where every thread that logs then waits). `once` removes the file at the first write that sees it, `pid=<n>` stalls only the daemon of that pid (several share a path). Write the file whole, by a rename. It fires once per `write()` call of the writer, retries after `WouldBlock` and partial writes included, so a stall file without `once` stalls each of them. Never logs |
 | `CONSTELLATION_FAULT_HOLD_SYNC_FILE` | unset | a file path | plan 30 M4: while the file exists every managed sync round returns at once (nothing uploads, ships or publishes, and the lease is not renewed — keep holds short); a held round writes `<path>.held`, so a harness knows no round is still in flight |
 
 ## Boolean values
