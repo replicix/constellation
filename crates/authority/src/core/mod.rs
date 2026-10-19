@@ -410,6 +410,30 @@ impl Config {
             + self.s3_less_deadline_ms
     }
 
+    /// The one bound of every wait a non-blocking lock request takes for an
+    /// owner that cannot grant yet, from the request's start (plan 43 F-b):
+    /// a grace, a tenure's floor, a stale or an unreachable owner. A stale
+    /// owner is the lease holder cut from S3, whose lease may have just been
+    /// renewed (`ttl_ms`, and the margin that clock skew may add to its
+    /// expiry), until its backup seals and acquires (`acquire_retry_max_ms`
+    /// at most), and then its successor's grace ([`Self::lock_grace_wait_max_ms`]).
+    /// Finite for every configuration, so a wait never lasts for ever,
+    /// not even one for a continuation epoch with no successor.
+    pub fn lock_owner_wait_max_ms(&self) -> u64 {
+        self.ttl_ms
+            + self.expiry_margin_ms
+            + self.acquire_retry_max_ms
+            + self.lock_grace_wait_max_ms()
+    }
+
+    /// How soon a non-blocking lock request told to wait for an owner that
+    /// cannot say when it may grant (a floor, a barrier, a stale or an
+    /// unreachable owner) asks again, the first time; the engine backs off
+    /// from there to a second.
+    pub fn lock_poll_ms(&self) -> u64 {
+        (self.forward_backoff_ms / 4).max(10)
+    }
+
     /// Production defaults (the `CONSTELLATION_*` defaults of the code the
     /// core replaces), for `node_id` at `incarnation`.
     pub fn defaults(node_id: NodeId, incarnation: u32) -> Self {
@@ -869,6 +893,19 @@ pub struct Stats {
     /// ends that served parked waiters (`Timer::LockGraceEnd`).
     pub lock_grace_waits: u64,
     pub lock_not_yet_waits: u64,
+    /// Non-blocking requests told to wait by an owner that may not grant
+    /// at all yet (no fresh S3 liveness, a lease not marked as granting),
+    /// which answered `Busy` before (Q18c).
+    pub lock_stale_owner_waits: u64,
+    /// Non-blocking requests told to wait because their owner could not be
+    /// reached (its link dead, the lease read again still naming it): a
+    /// failover in progress (they failed `ENOLCK` before).
+    pub lock_unreachable_waits: u64,
+    /// Answers that grant and extend nothing and went ahead of a held
+    /// answer to the same peer (they used to queue behind it), and answers
+    /// that waited for the order of the answers to their peer alone.
+    pub lock_order_bypassed: u64,
+    pub lock_order_holds: u64,
     pub lock_grace_end_serves: u64,
     pub lock_grace_periods: u64,
     pub lock_recalls_sent: u64,

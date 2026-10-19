@@ -394,7 +394,7 @@ pub struct LockStats {
     /// Plan 43 F-b: non-blocking requests that waited for an owner that
     /// could not grant yet (a grace, the tenure's floor, a barrier), the
     /// milliseconds those waits took in all, and the ones that gave up
-    /// with `EAGAIN` after `lock_grace_wait_max_ms` (a campaign expects
+    /// with `EAGAIN` after `lock_owner_wait_max_ms` (a campaign expects
     /// none).
     pub grace_waits: u64,
     pub grace_wait_ms_total: u64,

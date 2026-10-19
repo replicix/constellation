@@ -51153,3 +51153,173 @@ entry (they ran on the two patches together).
   The review's follow-up: give the non-blocking round trip a short inline
   budget (`recall_hold_ms`, 100 ms) and hand what is pending to the wait
   pool. Not done here.
+
+## Fix: a stale or unreachable owner is a wait, not `ENOLCK` (plan 43 C7-F, F-b, Q18b/c)
+
+The second part of F-b. Two owners that could not grant at all answered a
+non-blocking request for a free lock with an error: a **stale owner** (no
+fresh S3 liveness, a holder cut from S3 whose lease is not over, which its
+backup could seal; or a lease not yet marked as granting) answered `Busy`,
+which the requester retried three times and failed `ENOLCK`; and an
+**unreachable owner** (its link dead, the lease read again still naming it,
+a successor not named yet) failed it `ENOLCK` once its attempts and one
+lease read were spent. The maintainer's decision of 2026-10-19: both wait,
+bounded, as a grace does.
+
+### Measurement before
+
+`s3-cut-holder-failover-with-locks` at the production lease
+(`CONSTELLATION_HARNESS_LEASE_TTL_MS=60000`, new: the scenario's cluster runs
+a 20 s lease otherwise), on the tree of the first part, three runs:
+takeover +53.5 to +53.6 s after the cut, first write acknowledged +62.3 to
++63.4 s, first lock granted +77.1 to +77.8 s; `ENOLCK` on 6, 7 and 7 of the
+contender's 41, 42 and 42 non-blocking attempts, the first from +15.7 s,
+none `EAGAIN`.
+
+### What changed
+
+- **A stale owner's `Busy` for a free lock is a wait**: `lock_serve` answers
+  a non-blocking request with no conflicting grant `Waiting { grace: true }`
+  (counted: `lock_stale_owner_waits`, status `stale_owner_answers`); a
+  request that a live grant conflicts with is refused all the same, a
+  blocking one still `Busy`.
+- **An unreachable owner is a wait** (new): a non-blocking request out of
+  attempts, its lease read spent, is answered the engine `LockAnswer::Wait`
+  (`lock_give_up`, counted `lock_unreachable_waits`, status
+  `unreachable_owner_waits`) instead of `Unavailable`; the engine asks again
+  as a fresh request on the wait pool (fresh attempts, a fresh lease read,
+  routed to the successor as soon as the lease names it). Without P2P it
+  stays `ENOLCK` (no path at all, documented).
+- **One bound for every wait**, from the request's start,
+  `lock_owner_wait_max_ms = ttl_ms + expiry_margin_ms +
+  acquire_retry_max_ms + lock_grace_wait_max_ms` (`Config`; no knob;
+  `ClusterLocks::owner_wait_max`): a stale owner's lease, which may have
+  just been renewed, with the margin clock skew may add to its expiry; its
+  backup's acquisition (`acquire_retry_max_ms` at most); and its successor's
+  grace with the bound an op has without a sequencer, which was the whole
+  bound of the first part. 112.5 s at the defaults, 72.5 s at the harness's
+  20 s lease. Every term checked against the code: the lease TTL is
+  `Config::ttl_ms`, not `lease_ttl_ms`; the margin is `expiry_margin_ms`.
+  The measured need at the production lease is 61.5 s (a request begun at
+  +15.6 s, the first lock granted at +77.1 s), 25.7 s at 20 s. Finite for
+  every configuration: a wait is never unbounded, a continuation epoch with
+  no successor included. A give-up is counted like a grace's
+  (`grace_wait_gave_up`, `EAGAIN`; a signal still ends a wait `EINTR` within
+  100 ms). A test pins the formula and the values (core
+  `the_owner_wait_bound_covers_a_stale_owner_and_its_successors_grace`) and
+  the engine's give-up at the bound is the first part's
+  `a_graced_wait_past_its_bound_gives_up_with_eagain_and_is_counted`.
+- **Back off** (F6): an owner's polling hint (`lock_poll_ms`, 50 ms: the
+  floor, the barrier, a stale or an unreachable owner) used to be followed
+  every time, 800 requests per waiter over the 40 s of a stale owner's
+  lease, at an owner that is already cut from S3, 2000 requests a second for
+  a hundred waiters. A run of such hints now backs off, twice the last
+  interval up to a second (50, 100, 200, 400, 800, 1000, ...); a hint longer
+  than the polling one is a grace's remainder, exact, followed as told and
+  ending the run (`ClusterLocks::next_wait`, `poll_hint`).
+- **Answer order** (F5). `lock_answer` queues an answer behind an earlier
+  held answer to the same peer, and a stale owner holds the renewals it
+  answers until a lease read says it still holds, which S3's absence makes
+  as long as S3 takes. The refusal or request to wait of a different request
+  to that peer sat behind it, reached its requester after the request's
+  timeout, three times in a row: `ENOLCK`. Answers that grant and extend
+  nothing (`Waiting`, `WouldBlock`, `NotOwner`, `Busy`, with no restart
+  horizon to wait for) now go at once. New counters
+  `lock_order_bypassed` (answers that went ahead of a held one: status
+  `answers_order_bypassed`) and `lock_order_holds` (answers that still wait
+  for the order alone: `answers_order_held`), and debug lines saying for how
+  long.
+
+### Tests
+
+Core: `a_tenure_that_may_not_grant_yet_still_refuses_a_conflicting_try`
+(extended: a free lock waits, `Busy` before; a blocking request is `Busy`),
+`a_nonblocking_lock_waits_for_an_owner_without_fresh_s3_liveness`
+(`Busy` before), `an_unreachable_cached_holder_rereads_the_lease_once`,
+`a_non_blocking_request_out_of_attempts_rereads_the_lease_once` and
+`busy_fails_a_non_blocking_lock_fast_and_waiting_does_not` (`Unavailable`
+before, `Wait` now, counted),
+`an_unreachable_owner_is_a_wait_for_a_nonblocking_request_over_p2p` and
+the first test's `!p2p` half (`Unavailable`, counted apart),
+`the_owner_wait_bound_covers_a_stale_owner_and_its_successors_grace`,
+`a_refusal_is_not_held_behind_a_held_renewal_to_the_same_peer` (fails with
+the bypass off; asserts `lock_order_bypassed`). Engine:
+`a_run_of_polling_hints_backs_off_and_a_graces_remainder_is_followed`
+(50, 100, ... 1000; a grace's remainder followed; the run restarts).
+
+### Measurement after (both parts, this tree)
+
+`s3-cut-holder-failover-with-locks` at the production lease, three runs:
+takeover +53.5 to +53.7 s, first write acknowledged +62.6 to +62.7 s, first
+lock granted +77.0 to +77.1 s; **0 `ENOLCK`, 0 `EAGAIN`, 0 give-ups** on
+35 attempts in each run (was `ENOLCK` on 6 to 7 of 42); the longest
+attempt 61.4 to 61.5 s (it began at +15.6 s, the first lock was granted
+at +77.1 s): shorter than the bound of 112.5 s by a factor of two, longer
+than the first part's 49.5 s, which is why the first part alone could
+not have ended this failover without an `EAGAIN`. At the harness's 20 s
+lease, two runs: 0 errors on 34 attempts, the longest 25.7 s against a
+bound of 72.5 s (before, on 7ef243f: 75 of 108 attempts `EAGAIN`, in both
+runs; at 60 s the base run shows the same, since its scenario has no lease
+knob). `grace_wait_gave_up` 0 on every node; the contender's
+`unreachable_owner_waits` 1 (the request that began a second before the
+takeover and used to fail `ENOLCK`) at the production lease, 0 at 20 s;
+the stale owner's `stale_owner_answers` 37 and `answers_order_bypassed` 22
+at the production lease, 0 at 20 s (an owner that is stale only when the
+lease is long).
+
+**The order exception (F5), shown.** The same run with the bypass off (a
+build that queues refusals behind held answers again, the part-one rule),
+twice, at the production lease: 0 errors and the same 61.5 s as with it
+(the unreachable-owner wait now ends what the queued refusals used to
+fail, so the exception no longer decides the errno), but `answers_order_held`
+28 at the stale owner, each answer held 0.84 to 18.0 s, median 10.0 s, for
+the order alone (the request timeout is 0.5 s), and 43 `stale_owner_answers`
+of which 28 are those late ones; the contender's `unreachable_owner_waits`
+8 instead of 1: the late answers made the requester time out and ask again
+eight times instead of once. With the exception: 22 answers went ahead of a
+held renewal, held 2.1 to 19.6 s (median 8.6 s), and 1 unreachable-owner
+wait. That is the mechanism end to end: the held answers are the wait of
+the refusals the part-one measurement saw as `ENOLCK`. It is a latency
+and request count the exception saves, not an errno any more, which is a
+fair thing to say of the ordering rule it relaxes: the exception stays
+(the order of grants and renewals is untouched) and is covered by its
+counters.
+
+On the final tree (main 0fbc74f) the 60 s run once more: takeover at +53.9 s,
+0 errors on 35 attempts, the longest wait 61.75 s, first lock at +77.4 s.
+
+`lock-grace-wait`, `transport-lock-grace`, `transport-lock-grace-queue`
+(depth 2 and 4), `transport-lock-wait-budget`: see the first entry.
+Every other lock scenario of the harness passes once on this tree
+(`flock-cross-node`, `lock-failover`, `lock-holder-partitioned`,
+`lock-holder-killed-contention`, `lock-fence-at-close`,
+`lock-lapse-lone-node`, `lock-release-at-close`, `lock-stall-lone-node`,
+`lock-contention-paused-holder`, `lock-grant-dead-generation`,
+`fence-token-at-write`).
+
+### Gates
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets --features
+constellation-frontend-fuse/io-uring -D warnings` clean.
+`cargo test --workspace --no-fail-fast` (both parts, on the box, with the
+ring feature): 3253 passed, 2 failed, 55 ignored. The two are not this
+change's: `constellation-net`'s `addr_churn` (a network-namespace test; it
+passes alone, 2 of 2, on this tree and on 7ef243f, and failed under the
+box's load) and `constellation-model`'s `cto`, which was `SIGKILL`ed (a
+model run of some 26 GB on a 31 GB box shared with other jobs). Lock simulations, 2000 seeds each, **0 failing in all 38
+configurations**: `locks`, `-partition`, `-skew`, `-failover`,
+`-failover-backup`, `-failover-backup-renew`, `-faults`, `-blips`,
+`-blips-tight` (and `-single`, `-long-lease`, `-in-doubt`, `-delegated`,
+`-faults` 0..2000 and 5000..6000), `-pause`, `-delegated`,
+`-unlinked-delegated` (and `-hcrash`, `-hcrash-backup`, `-dcrash`,
+`-dcrash-nb`, `-random`, `-dbackup-random`, `-blips`, `-partition`),
+`-delegated-partition`, `-released-delegated`, `-writes`,
+`-delegated-writes`, `-released-writes`, `-failover-backup-writes`,
+`-writer-hold`, `-delegated`, `-delegated-doubt`, `-stall-step`,
+`-delegated`, and `fast-takeover-skewed-successor` 193000..195000; the two
+negative controls (`locks-writer-hold-unchecked`, `-delegated-unsettled`)
+fail as they are meant to. The sim's lock client gives up a non-blocking
+wait at the engine's bound (`wait_gave_up`, counted; a long partition would
+otherwise be a "stuck" failure of a wait that the engine ends `EAGAIN`).
+(The sweeps need `TMPDIR` on a tmpfs: on the box's `/home` they took two
+orders of magnitude longer.)

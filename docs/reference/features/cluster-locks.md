@@ -764,7 +764,22 @@ the owner may not grant yet:
 - a new root tenure's floor, not known yet;
 - an outwaited holder's barrier, not settled yet;
 - a delegate's authority, too short to grant anything the holder could
-  keep (the delegation is renewed meanwhile).
+  keep (the delegation is renewed meanwhile);
+- an owner that may not grant at all yet: its S3 liveness is stale (a
+  holder cut from S3 whose lease is not over, which a backup could seal)
+  or its lease is not marked as granting yet (`stale_owner_answers`); it
+  answered `Busy` to such a request, which the requester retried three
+  times and failed `ENOLCK`;
+- an owner that cannot be reached at all: its link is dead and the lease,
+  read again, still names it (a failover under way, its successor not
+  named yet). The requester asks again as a fresh request, with fresh
+  attempts and a fresh lease read, routed to the successor as soon as the
+  lease names it (`unreachable_owner_waits`). Without P2P there is no path
+  to wait for: `ENOLCK`, as documented.
+
+A refusal or a request to wait is answered at once, never queued behind
+an answer the owner holds back for a lease read or a durable write (see
+"Answer order" below).
 
 A conflicting grant, and the requester's own grant under recall, still
 answer `EAGAIN` at once, as before, whichever of these the owner is
@@ -811,20 +826,54 @@ How it ends:
 
 - granted: the lock is taken at the end of the grace (the wait is as long
   as the grace is, up to 23.5 s after a mid-lease crash with the defaults,
-  longer with delegations);
+  longer with delegations). After an S3-cut holder's failover the wait
+  starts at the stale owner and lasts until its backup has taken over and
+  its successor's grace is over: 37 to 61 s measured at the production
+  lease (60 s: a request began 15.6 s after the cut, the takeover came at
+  +53.6 s, the first lock was granted at +77.1 s), about half that at the
+  harness's 20 s lease;
 - `EAGAIN`, if the table then shows a conflict, or if the request has
-  waited `lock_grace_wait_max_ms` from its start: the longest bound an
-  owner can have (the takeover window, the longest grant, the delegations'
-  reclaim horizon and the two margins) plus the 20 s an operation waits
-  for a sequencer (49.5 s with the core's defaults; computed from the
-  node's configuration, no knob). That `EAGAIN` is counted
-  (`grace_wait_gave_up`); a load campaign expects it to stay 0;
+  waited `lock_owner_wait_max_ms` from its start, one bound for every wait
+  on an owner: a stale owner's lease (it may have just been renewed) and
+  the margin clock skew adds to its expiry, its backup's acquisition
+  (`acquire_retry_max_ms` at most), and the successor's grace with the
+  bound an operation has without a sequencer (`lock_grace_wait_max_ms`:
+  the takeover window, the longest grant, the delegations' reclaim horizon
+  and the two margins, plus 20 s; 49.5 s at the defaults): 112.5 s with the
+  defaults, 72.5 s at a 20 s lease. Computed from the node's
+  configuration, no knob, and finite for every configuration: no wait is
+  unbounded, one for a continuation epoch with no successor included. That
+  `EAGAIN` is counted (`grace_wait_gave_up`); a load campaign expects it
+  to stay 0;
 - `EINTR`, when a signal reaches the process (the mount cancels the wait
   as it does for `F_SETLKW`): Linux documents `EINTR` for `F_SETLK` on a
   file system that waits, as NFS does. It is observed between attempts,
   within 100 ms; an attempt in flight (the request's first, or a re-issue)
   finishes first, and that is a round trip to the owner, a few seconds
   against an owner that cannot be reached.
+
+A request told to wait for an owner that cannot say when it may grant (a
+floor, a barrier, a stale or an unreachable owner: the owner hints
+`lock_poll_ms`, a quarter of the forward backoff, 50 ms) asks again with
+backoff: twice the last interval, up to a second, so a hundred requests
+waiting forty seconds for a stale owner ask it a few hundred times in all,
+not two thousand a second. A hint longer than the polling one is a grace's
+remainder, exact, and is followed as told.
+
+**Answer order.** An owner sends the answers to one peer in order: an
+answer made after a held one waits behind it (a grant must not reach its
+holder before the recall it follows). A stale owner holds the renewals it
+answers until a lease read says it still holds, and with S3 away that read
+takes as long as S3 does (20 s in the harness's failover): the refusal, or
+request to wait, to a different request of the same peer sat behind it and
+arrived after the request's own timeout, three times in a row. Answers
+that grant and extend nothing (a wait, a refusal, a redirection) now go
+ahead of held ones. Counted: `answers_order_bypassed` (answers that went
+ahead: in the S3-cut failover at the production lease, 22 to the
+contender, behind a renewal held 2.1 to 19.6 s, median 8.6 s: each would
+have waited out the request's timeout) and `answers_order_held` (answers
+that still wait for the order alone); a debug line of
+`constellation_authority::core::locks` says for how long.
 
 The precedent is the grace period of NFS and NLM: their clients retry a
 request the server refused for its grace, blocking or not, until the
@@ -1085,10 +1134,12 @@ owner has replaced it.
   restart horizon as any renewal does. Where the table is dropped, a
   token naming one of its grants is judged by its `until`, and nothing
   conflicting is granted before that has passed. After the flush, the lease stays while grants are
-  live, as with any idle holder. Any other `Busy` from an owner (no
-  fresh S3 liveness, a lease not marked as granting yet) still fails a
-  non-blocking request with `ENOLCK` after the usual few attempts.
-  Before, every close dropped
+  live, as with any idle holder. An owner that may not grant at all yet
+  (no fresh S3 liveness, a lease not marked as granting yet) makes a
+  non-blocking request for a lock nothing conflicts with wait for it,
+  as for a grace ([Waiting for a grace](#waiting-for-a-grace)); it used
+  to answer `Busy`, which a non-blocking request failed with `ENOLCK`
+  after the usual few attempts. Before, every close dropped
   the table: each lock holder's next renewal was answered `lost` (its
   I/O fenced with `EIO`), a new lock could fail with `ENOLCK`, and in a
   cluster the owner could grant a conflicting lock while the old holder
@@ -1170,17 +1221,20 @@ One S3 round trip per lock, plus renewals every few seconds as S3 writes,
 would make SQLite unusable and would fence I/O whenever S3 is slow. So:
 
 - with P2P off, the mode is `local`;
-- with P2P on but the owning sequencer unreachable, a non-blocking lock
-  fails with `ENOLCK` after the forward retries, and a blocking lock
-  keeps retrying until the sequencer is reachable again. The node
-  re-reads the lease from S3 to find the current owner, and a
-  non-blocking lock re-reads it once before it gives up on the owner it
-  knew (a dead holder whose successor gossip has not announced yet).
+- with P2P on but the owning sequencer unreachable, a blocking lock keeps
+  retrying until the sequencer is reachable again, and a non-blocking
+  lock waits too, up to `lock_owner_wait_max_ms` (112.5 s at the
+  defaults; [Waiting for a grace](#waiting-for-a-grace)), where it used
+  to fail `ENOLCK` after the forward retries. The node re-reads the lease
+  from S3 to find the current owner, and a non-blocking lock re-reads it
+  once before it asks again as a fresh request (a dead holder whose
+  successor gossip has not announced yet). Without P2P, `ENOLCK`.
 - a successor that has taken the lease over but may not grant yet (its
   lease is not marked as granting, or its S3 liveness is stale) still
   refuses a non-blocking lock that a grant it knows of conflicts with
-  (`EWOULDBLOCK`, as before the failover); only a lock it would have to
-  grant gets `ENOLCK` after the retries.
+  (`EWOULDBLOCK`, as before the failover); a lock it would have to grant
+  waits for it ([Waiting for a grace](#waiting-for-a-grace); it got
+  `ENOLCK` after the retries before).
 
 ### Cost
 
@@ -1348,9 +1402,15 @@ for both roles:
   lock, see [Leases, renewal and fencing](#leases-renewal-and-fencing)),
   `grace_waits` (non-blocking requests that waited for an owner's grace,
   see [Waiting for a grace](#waiting-for-a-grace)), `grace_wait_ms_total`
-  (the time those waits took in all) and `grace_wait_gave_up` (the ones
-  that gave up with `EAGAIN` after `lock_grace_wait_max_ms`; 0 in every
-  load campaign),
+  (the time those waits took in all), `grace_wait_gave_up` (the ones
+  that gave up with `EAGAIN` after `lock_owner_wait_max_ms`; 0 in every
+  load campaign), `grace_wait_refused_ring` and `grace_wait_refused_pool`
+  (waits that could not begin and failed `EAGAIN` as before: the ring
+  queue's lock-wait budget was spent, or no `lock-wait` thread could
+  start; 0 in every load campaign), `unreachable_owner_waits` (requests
+  told to wait because their owner could not be reached),
+  `stale_owner_answers`, `answers_order_bypassed` and
+  `answers_order_held` (above),
   `fenced_owners` (the owners fenced now: `owner`, `pid`, `since_ms`,
   and `grant`, the `[minter, seq]` whose end fenced it), `margin_ms`
   (the clock-skew margin the lock machinery assumes),
@@ -1360,9 +1420,10 @@ for both roles:
   close publication or mutation in doubt, once per request);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
-  `grace_refusals`, `grace_wait_answers` and `not_yet_answers`
-  (non-blocking requests told to wait: for a grace, and for a tenure
-  floor, a barrier or a delegate's authority), `grace_end_serves` (grace
+  `grace_refusals`, `grace_wait_answers`, `not_yet_answers` and
+  `stale_owner_answers` (non-blocking requests told to wait: for a
+  grace, for a tenure floor, a barrier or a delegate's authority, and
+  for an owner that may not grant at all yet), `grace_end_serves` (grace
   ends that served parked waiters), `requeued_in_place`,
   `released_superseded`,
   `peers_unreachable` (nodes taken for unreachable, see
@@ -1406,8 +1467,11 @@ itself (the per-file taint) are not kept.
 The owner is in a grace (a failover, a restart) and the request waits for
 it ([Waiting for a grace](#waiting-for-a-grace)): `grace_waits` rises on
 the node, `grace_wait_answers` on the owner. It is granted at the end of
-the grace, or fails `EAGAIN` after `lock_grace_wait_max_ms`
-(`grace_wait_gave_up`), or `EINTR` on a signal.
+the grace, or fails `EAGAIN` after `lock_owner_wait_max_ms`
+(`grace_wait_gave_up`), or `EINTR` on a signal. After the failover of a
+holder cut from S3 it can take most of a minute at the production lease
+(the stale owner first, then its successor's grace): `stale_owner_answers`
+on the old owner, `unreachable_owner_waits` on the node.
 
 ### `flock -n` or `F_SETLK` fails once, then succeeds
 

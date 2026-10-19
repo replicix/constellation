@@ -1049,7 +1049,7 @@ impl ErrnoLog {
             }
         }
         // A non-blocking lock request waits for an owner's grace instead
-        // of failing; one that gave up (`lock_grace_wait_max_ms`) is the
+        // of failing; one that gave up (`lock_owner_wait_max_ms`) is the
         // grace having outlasted its bound: a bug, whether or not the
         // workload recorded the `EAGAIN` it got.
         let mut gave_up: Vec<(&String, &u64)> =
@@ -1059,7 +1059,7 @@ impl ErrnoLog {
             *rep.counts.entry("grace-wait-gave-up").or_insert(0) += *n as usize;
             rep.bugs.push(format!(
                 "{node}: {n} non-blocking lock request(s) gave up waiting for an owner's grace \
-                 (EAGAIN after lock_grace_wait_max_ms): [grace-wait-gave-up] the grace outlasted \
+                 (EAGAIN after lock_owner_wait_max_ms): [grace-wait-gave-up] the grace outlasted \
                  its bound"
             ));
         }

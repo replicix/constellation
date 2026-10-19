@@ -2397,7 +2397,8 @@ successor whose clock is ahead got no quarantine").
   request waits)* (PROGRESS "Fix: lock requests inside a lock grace wait
   for it"): the owner answers `Waiting { retry_ms,
   grace: true }`, the requester `LockAnswer::Wait`, the engine's
-  `lock-wait` pool retries up to `lock_grace_wait_max_ms` (computed from
+  `lock-wait` pool retries up to `lock_grace_wait_max_ms` (second commit:
+  `lock_owner_wait_max_ms`, which has it as its last term; computed from
   the core's configuration; no knob; `grace_wait_gave_up` counts the
   `EAGAIN` past it and the campaign's errno judge fails on one); the FUSE
   adapter registers a request that has to wait as deferred and
@@ -2408,7 +2409,21 @@ successor whose clock is ahead got no quarantine").
   after (one request waited 25.7 s, the whole grace; F-a shortens it).
   `transport-lock-grace`, `transport-lock-grace-queue` (depth 2 and 4)
   and `transport-lock-wait-budget` ran on a ring host, on a real kernel.
-  (c), the stale owner's `Busy`, is the second commit.
+  *(c) landed as the second commit* (PROGRESS "Fix: a stale or
+  unreachable owner is a wait, not `ENOLCK`"): measured at the production
+  lease first (`ENOLCK` on 6 to 7 of 42 attempts before), the stale
+  owner's `Busy` and an owner that cannot be reached are waits too, with
+  one bound for every wait from the request's start,
+  `lock_owner_wait_max_ms` (lease TTL + margin + acquisition retry +
+  `lock_grace_wait_max_ms`: 112.5 s at the defaults); a run of polling
+  answers backs off to a second; the refusals and waits are no longer
+  queued behind a held renewal: 0 errors on 35 attempts in three runs, the
+  longest wait 61.5 s, 0 give-ups. Follow-up: every re-issue of a request
+  whose owner's link is dead reads the lease once from S3 (not coalesced),
+  about one GET per waiter per second after the backoff; with hundreds of
+  waiters on a node in such a window, hundreds of GETs a second. Coalesce
+  the lease reads in flight per node, or hint `forward_backoff_ms` for an
+  unreachable wait.
 
 - **F-c — an application whose lock grant lapsed during a root failover
   gets `EIO`.** In `s3-cut-holder-failover-with-locks` the locker's grant

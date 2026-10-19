@@ -5631,6 +5631,7 @@ struct M14Totals {
     /// served parked waiters.
     grace_waits: u64,
     not_yet_waits: u64,
+    stale_owner_waits: u64,
     grace_end_serves: u64,
     grace_periods: u64,
     idle_released: u64,
@@ -5702,6 +5703,7 @@ impl M14Totals {
             self.grace_refusals += s.lock_grace_refusals;
             self.grace_waits += s.lock_grace_waits;
             self.not_yet_waits += s.lock_not_yet_waits;
+            self.stale_owner_waits += s.lock_stale_owner_waits;
             self.grace_end_serves += s.lock_grace_end_serves;
             self.grace_periods += s.lock_grace_periods;
             self.idle_released += s.lock_idle_released;

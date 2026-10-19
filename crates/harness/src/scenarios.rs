@@ -1366,7 +1366,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "s3-cut-holder-failover-with-locks",
-        desc: "plan 43 C7-H2 cost (gate G5): four nodes, strict reads, a held lock; the holder loses S3 but not P2P, its backup seals once the lease reads expired and takes over; prints the failover, the first write acknowledged and the first lock granted after it, the longest write, the longest non-blocking lock attempt (a request on a free lock waits for the grace: plan 43 F-b) and every errno the applications saw (fails on any write, read or lock error)",
+        desc: "plan 43 C7-H2 cost (gate G5): four nodes, strict reads, a held lock; the holder loses S3 but not P2P, its backup seals once the lease reads expired and takes over; prints the failover, the first write acknowledged and the first lock granted after it, the longest write, the longest non-blocking lock attempt (a request on a free lock waits for the grace: plan 43 F-b) and every errno the applications saw (fails on any write, read or lock error); CONSTELLATION_HARNESS_LEASE_TTL_MS=60000 runs it at the production lease",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::s3_cut_holder_failover_with_locks,

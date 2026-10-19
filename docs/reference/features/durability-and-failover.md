@@ -509,10 +509,12 @@ that failover's first acknowledged write moved from the takeover itself to
 about 8.5 s after it, and the first new lock grant to about 23.5 s after
 it; a non-blocking lock request on a free file waits for the grace
 meanwhile, on a thread of the mount's pool, and is granted at its end
-(`EAGAIN` only after 49.5 s with the defaults, `EINTR` on a signal; see
-[Cluster locks](cluster-locks.md#waiting-for-a-grace)); a request that a
-ring-transport mount has no queue entry to wait on is answered at once, as
-before.
+(`EAGAIN` only after 112.5 s with the defaults, `EINTR` on a signal; with
+a holder cut from S3 the wait begins at the stale owner and lasts 37 to
+61 s at the production lease; see [Cluster
+locks](cluster-locks.md#waiting-for-a-grace)); a request that a
+ring-transport mount has no queue entry to wait on is answered at once,
+as before.
 Only a tenure that served strict reads or locks costs its successor
 anything. Shortening the wait from the successor's own observation of the
 old holder's last renewal is planned (plan 43, C7-F).

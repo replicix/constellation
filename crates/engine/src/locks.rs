@@ -74,7 +74,7 @@
 //! start) the request is answered now as before F-b, `EAGAIN`, counted
 //! (`grace_wait_refused_ring`, `grace_wait_refused_pool`). The wait ends
 //! with the grant, with `EAGAIN` when the table then shows a conflict or
-//! once [`ClusterLocks::grace_wait_max`] has passed since the request
+//! once [`ClusterLocks::owner_wait_max`] has passed since the request
 //! (counted: `grace_wait_gave_up`), and with `EINTR` when the frontend
 //! cancels it.
 //!
@@ -302,6 +302,10 @@ pub enum NbStep {
 /// How often a wait on an owner's grace looks at its cancellation.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 
+/// The longest interval a request polls an owner at that cannot say when it
+/// may grant ([`ClusterLocks::next_wait`]).
+const POLL_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
 /// What ends a lock wait before the lock comes: the op's cancellation
 /// (`Intr`) and its deadline (`TimedOut`), both from its `OpCtx`. Checked
 /// where the wait loops, so a wait that the frontend gave up on holds
@@ -345,8 +349,18 @@ pub struct ClusterLocks {
     pub lineage: Mutex<LineageCache>,
     /// How long a non-blocking request waits for an owner that cannot
     /// grant yet before it fails `EAGAIN`
-    /// (`constellation_authority::Config::lock_grace_wait_max_ms`).
-    pub grace_wait_max: Duration,
+    /// (`constellation_authority::Config::lock_owner_wait_max_ms`): one
+    /// bound, from the request's start, for every wait on an owner (a
+    /// grace, a floor, a stale or an unreachable owner).
+    pub owner_wait_max: Duration,
+    /// The retry interval an owner hints for a wait it cannot time (a
+    /// floor, a barrier, a stale or an unreachable owner:
+    /// `Config::lock_poll_ms`). A request told so again and again asks
+    /// less and less often (twice the last interval, up to a second): a
+    /// hundred requests waiting forty seconds for a stale owner would
+    /// otherwise ask it two thousand times a second. A hint longer than
+    /// this is a grace's remainder, exact, and is followed.
+    pub poll_hint: Duration,
     /// The threads that wait out non-blocking requests an owner cannot
     /// grant yet ([`Self::lock_nb_deferred`]).
     pub waits: WaitPool,
@@ -399,6 +413,8 @@ struct WaitTask {
     ino: Ino,
     lock: LocalLock,
     started: std::time::Instant,
+    /// The last interval of its run of polling hints ([`ClusterLocks::next_wait`]).
+    poll: Option<Duration>,
     /// When it asks again.
     due: std::time::Instant,
     cancel: Option<CancelToken>,
@@ -776,10 +792,12 @@ impl ClusterLocks {
         let started = std::time::Instant::now();
         let mut deadline = deadline;
         let mut waited = false;
+        let mut poll = None;
         let result = loop {
             match self.nb_step(ino, lock, interrupt, deadline) {
                 NbStep::Done(r) => break r,
                 NbStep::Wait(d) => {
+                    let d = self.next_wait(&mut poll, d);
                     if !std::mem::replace(&mut waited, true) {
                         self.meta.locks().with_stats(|s| s.grace_waits += 1);
                     }
@@ -852,8 +870,26 @@ impl ClusterLocks {
         }
     }
 
+    /// How long a request told to wait `hint` waits: the hint if it is a
+    /// grace's remainder, which is exact; a hint that is the owner's polling
+    /// interval (`poll_hint`, for a wait it cannot time) backs off, twice the
+    /// last interval up to a second (`poll`: the last of the run of such
+    /// hints).
+    pub(crate) fn next_wait(&self, poll: &mut Option<Duration>, hint: Duration) -> Duration {
+        if hint > self.poll_hint {
+            *poll = None;
+            return hint;
+        }
+        let wait = match *poll {
+            Some(last) => (last * 2).min(POLL_BACKOFF_MAX).max(hint),
+            None => hint,
+        };
+        *poll = Some(wait);
+        wait
+    }
+
     /// Sleep `d` (in slices, looking at the cancellation), unless the
-    /// request is past [`Self::grace_wait_max`] from `started` (its
+    /// request is past [`Self::owner_wait_max`] from `started` (its
     /// start): then `EAGAIN`, counted.
     fn wait_out(
         &self,
@@ -865,7 +901,7 @@ impl ClusterLocks {
         loop {
             interrupt.check()?;
             let now = std::time::Instant::now();
-            if now.duration_since(started) >= self.grace_wait_max {
+            if now.duration_since(started) >= self.owner_wait_max {
                 self.meta.locks().with_stats(|s| s.grace_wait_gave_up += 1);
                 return Err(Code::Again);
             }
@@ -898,7 +934,7 @@ impl ClusterLocks {
     /// the request began), waited out by the [`WaitPool`]: never the
     /// calling frontend worker, never the tokio blocking pool (see
     /// [`Self::lock`]), and above all never the offload thread of an
-    /// io_uring ring, which a wait of up to [`Self::grace_wait_max`] would
+    /// io_uring ring, which a wait of up to [`Self::owner_wait_max`] would
     /// hold for every other request offloaded to it. A pool thread asks
     /// again after each wait until the lock is taken, refused (`EAGAIN`:
     /// the table then shows a conflict, or the bound passed, counted in
@@ -925,11 +961,14 @@ impl ClusterLocks {
             .waits
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut poll = None;
+        let first_wait = self.next_wait(&mut poll, first_wait);
         let task = WaitTask {
             id,
             ino,
             lock: Self::prepared(lock),
             started,
+            poll,
             due: std::time::Instant::now() + first_wait,
             cancel,
             // The request's watchdog entry moves with the reply: the pool
@@ -1008,7 +1047,7 @@ impl ClusterLocks {
             for (i, t) in st.tasks.iter().enumerate() {
                 if t.due <= now
                     || t.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
-                    || now.duration_since(t.started) >= self.grace_wait_max
+                    || now.duration_since(t.started) >= self.owner_wait_max
                 {
                     ready = Some(i);
                     break;
@@ -1055,7 +1094,7 @@ impl ClusterLocks {
         };
         let result = if let Err(code) = interrupt.check() {
             Err(code)
-        } else if task.started.elapsed() >= self.grace_wait_max {
+        } else if task.started.elapsed() >= self.owner_wait_max {
             self.meta.locks().with_stats(|s| s.grace_wait_gave_up += 1);
             Err(Code::Again)
         } else {
@@ -1063,6 +1102,7 @@ impl ClusterLocks {
             match self.nb_step(task.ino, task.lock, interrupt, None) {
                 NbStep::Done(r) => r,
                 NbStep::Wait(d) => {
+                    let d = self.next_wait(&mut task.poll, d);
                     task.due = std::time::Instant::now() + d;
                     if let Some(op) = &task.op {
                         op.release();

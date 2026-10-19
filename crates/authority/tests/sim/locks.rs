@@ -78,6 +78,10 @@ pub struct LockCounters {
     /// could not grant yet, nothing in conflict), honoured by asking
     /// again after `retry_ms`.
     pub grace_waits: u64,
+    /// A non-blocking request that waited past the engine's bound
+    /// (`Config::lock_owner_wait_max_ms`) and gave up, `EAGAIN` in the
+    /// engine.
+    pub wait_gave_up: u64,
     pub unavailable: u64,
     /// A `Granted` after which `local_set` still needed a grant (it had
     /// lapsed or been taken back meanwhile).
@@ -787,6 +791,11 @@ pub async fn client_lock(
     let jitter = thread % 7;
     let t0 = clock.elapsed_ms();
     let deadline = t0 + LOCK_WAIT_CAP_MS;
+    // A non-blocking request told to wait gives up at the engine's bound
+    // (`ClusterLocks::owner_wait_max`), inside the cap.
+    let nb_bound = (cluster.env.config)(node, inc)
+        .lock_owner_wait_max_ms()
+        .min(LOCK_WAIT_CAP_MS - 1_000);
     let stuck = |h: &NodeHandle| {
         format!(
             "lock client t{thread} on node {node}: {:?} lock on {name} ({ino:#x}) not \
@@ -809,6 +818,10 @@ pub async fn client_lock(
             ghost.count(|c| c.abandoned += 1);
             return;
         };
+        if !step.blocking && clock.elapsed_ms() - t0 > nb_bound {
+            ghost.count(|c| c.wait_gave_up += 1);
+            return;
+        }
         if clock.elapsed_ms() > deadline {
             failures.lock().unwrap().push(stuck(&h));
             return;

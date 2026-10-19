@@ -17405,14 +17405,89 @@ mod locks {
             },
         });
         assert_eq!(lock_answer(&out, 60), LockAnswer::Unavailable);
+        // (Plan 43 F-b: with P2P, an owner that cannot be reached is a
+        // wait instead: `an_unreachable_cached_holder_rereads_the_lease_once`.)
+        assert_eq!(lone.core.stats.lock_unavailable, 1);
+        assert_eq!(lone.core.stats.lock_unreachable_waits, 0);
+    }
+
+    /// Plan 43 F-b (Q18b, the maintainer's decision of 2026-10-19): one
+    /// bound for every wait on an owner, from the request's start: a stale
+    /// owner's lease (it may have just been renewed, plus the margin skew
+    /// may add), its backup's acquisition, and the successor's grace. At the
+    /// defaults 112.5 s; at the harness's 20 s lease 72.5 s; finite for every
+    /// configuration. The measured need at the production lease was 61.5 s
+    /// (a request begun at +15.6 s, the first lock granted at +77.1 s).
+    #[test]
+    fn the_owner_wait_bound_covers_a_stale_owner_and_its_successors_grace() {
+        let mut cfg = Config::defaults(1, 1);
+        assert_eq!(cfg.lock_grace_wait_max_ms(), 49_500);
+        assert_eq!(cfg.lock_owner_wait_max_ms(), 112_500);
+        cfg.ttl_ms = 20_000;
+        assert_eq!(cfg.lock_owner_wait_max_ms(), 72_500);
+        assert!(cfg.lock_owner_wait_max_ms() > cfg.ttl_ms + cfg.lock_grace_wait_max_ms());
+        assert_eq!(cfg.lock_poll_ms(), cfg.forward_backoff_ms / 4);
+    }
+
+    /// A non-blocking request whose owner cannot be reached (over P2P) is
+    /// handed back to the engine to wait, counted; a blocking one keeps
+    /// trying inside the core, and none is `Unavailable`.
+    #[test]
+    fn an_unreachable_owner_is_a_wait_for_a_nonblocking_request_over_p2p() {
+        let mut r = requester();
+        r.core.cfg.p2p = true;
+        let mut out = lock_control_out(&mut r, 90, 42, false);
+        let mut answered = None;
+        for _ in 0..40 {
+            if let Some(a) = out.iter().find_map(|a| match a {
+                Action::ControlDone {
+                    op: OpId(90),
+                    result: Ok(ControlOk::Lock(answer)),
+                } => Some(*answer),
+                _ => None,
+            }) {
+                answered = Some(a);
+                break;
+            }
+            let mut next = Vec::new();
+            for t in timers(&out, TimerKind::LockRequestTimeout) {
+                r.advance(r.core.cfg.forward_timeout_ms);
+                next.extend(r.step(Event::Timer { id: t }));
+            }
+            for t in timers(&out, TimerKind::LockRetry) {
+                r.advance(300);
+                next.extend(r.step(Event::Timer { id: t }));
+            }
+            for (op, req) in s3_ops(&out) {
+                if matches!(req, S3Op::LeaseGet) {
+                    // The lease still names node 1, which is gone.
+                    let expires = r.now.0 + 10_000;
+                    next.extend(r.step(Event::S3 {
+                        op,
+                        result: S3Result::LeaseGet(Ok(Some((lease_of(1, 1, expires), tag())))),
+                    }));
+                }
+            }
+            out = next;
+        }
+        assert_eq!(
+            answered,
+            Some(LockAnswer::Wait {
+                retry_ms: r.core.lock_resume_retry_ms()
+            })
+        );
+        assert_eq!(r.core.stats.lock_unreachable_waits, 1);
+        assert_eq!(r.core.stats.lock_unavailable, 0);
     }
 
     /// The harness's lock-failover (`contender flock: ENOLCK`): the
     /// cached holder died and the backup took the lease over before
     /// gossip told this node. A non-blocking request whose cached holder
     /// cannot be reached re-reads the lease once and asks the successor;
-    /// if the lease still names the unreachable holder, it is unavailable
-    /// — after one read, not a loop of them.
+    /// if the lease still names the unreachable holder, it is told to
+    /// wait (plan 43 F-b: a failover in progress; `ENOLCK` before) — after
+    /// one read, not a loop of them; the engine asks again as a fresh
+    /// request.
     #[test]
     fn an_unreachable_cached_holder_rereads_the_lease_once() {
         let mut r = requester();
@@ -17470,14 +17545,23 @@ mod locks {
             op: get,
             result: S3Result::LeaseGet(Ok(Some((lease_of(1, 1, expires), tag())))),
         });
-        assert_eq!(lock_answer(&out, 71), LockAnswer::Unavailable);
+        assert_eq!(
+            lock_answer(&out, 71),
+            LockAnswer::Wait {
+                retry_ms: r.core.lock_resume_retry_ms()
+            }
+        );
+        assert_eq!(r.core.stats.lock_unreachable_waits, 1);
+        assert_eq!(r.core.stats.lock_unavailable, 0);
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
 
     /// A tenure that may not grant yet (its lease is not marked as
     /// granting: a fresh successor) still refuses a non-blocking request
     /// that a live grant conflicts with — a refusal grants nothing — and
-    /// answers `Busy` only when it would have to grant.
+    /// makes it wait only when it would have to grant (plan 43 F-b, Q18c:
+    /// `Busy` before, which the requester spent three attempts on and
+    /// failed `ENOLCK`); a blocking request is still told `Busy`.
     #[test]
     fn a_tenure_that_may_not_grant_yet_still_refuses_a_conflicting_try() {
         let (mut h, ino) = holder_with_file();
@@ -17493,16 +17577,79 @@ mod locks {
             ),
             "{out:?}"
         );
-        // A free file: it would have to grant, so not yet.
+        // A free file: it would have to grant, so not yet: it waits.
         let other = h.meta.allocate_ino(ROOT_INO).unwrap();
         let out = request(&mut h, 3, 3, other, X, false);
+        assert_eq!(grace_wait(&out, 3), h.core.lock_resume_retry_ms());
+        assert_eq!(h.core.stats.lock_stale_owner_waits, 1);
+        // A blocking request is told `Busy`, as before (it retries).
+        let out = request(&mut h, 3, 4, other, X, true);
         assert!(
             matches!(
                 lock_replies(&out).as_slice(),
-                [(3, OpId(3), LockOutcome::Busy)]
+                [(3, OpId(4), LockOutcome::Busy)]
             ),
             "{out:?}"
         );
+        assert_eq!(h.core.stats.lock_stale_owner_waits, 1);
+        // The tenure is marked again: granted.
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = true;
+        let out = request(&mut h, 3, 5, other, X, false);
+        granted(&lock_replies(&out)[0].2);
+    }
+
+    /// The same without fresh S3 liveness (a holder cut from S3 whose
+    /// lease is not over yet, and whose backup could seal it): a
+    /// non-blocking request on a free file waits for it instead of
+    /// `ENOLCK` after three attempts, a conflicting one is refused, and a
+    /// blocking one is told `Busy`.
+    #[test]
+    fn a_nonblocking_lock_waits_for_an_owner_without_fresh_s3_liveness() {
+        let (mut h, ino) = fast_holder_with_file();
+        let free = h.meta.allocate_ino(ROOT_INO).unwrap();
+        // Fresh: granted (the first request and a re-ask).
+        let out = request(&mut h, 2, 1, ino, X, false);
+        granted(&lock_replies(&out)[0].2);
+        // Past the takeover window since the last S3 proof.
+        h.advance(h.core.cfg.backup_takeover_ms + 100);
+        assert!(!h.core.renew_fresh(h.now));
+        let out = request(&mut h, 3, 2, free, X, false);
+        assert_eq!(grace_wait(&out, 2), h.core.lock_resume_retry_ms());
+        assert_eq!(h.core.stats.lock_stale_owner_waits, 1);
+        assert_eq!(h.core.stats.stale_liveness_refusals, 1);
+        // A live grant that conflicts is refused all the same.
+        let out = request(&mut h, 3, 3, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(3), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        // A blocking request: `Busy`, as before.
+        let out = request(&mut h, 3, 4, free, X, true);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(4), LockOutcome::Busy)]
+            ),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.lock_stale_owner_waits, 1);
+        // The requester's side: told to wait, it answers its engine.
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, false);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 50,
+                    grace: true,
+                },
+            },
+        });
+        assert_eq!(lock_answer(&out, 50), LockAnswer::Wait { retry_ms: 50 });
     }
 
     /// The same failover seen earlier: the dead holder's link is not
@@ -17591,11 +17738,17 @@ mod locks {
             sends(&out).as_slice(),
             [(3, PeerMsg::LockRequest { ino: 42, .. })]
         ));
-        // Node 3 does not answer either: unavailable, no second read.
+        // Node 3 does not answer either: told to wait (the engine asks
+        // again as a fresh request), no second read.
         let out = r.step(Event::Timer {
             id: timer_of(&out, TimerKind::LockRequestTimeout),
         });
-        assert_eq!(lock_answer(&out, 80), LockAnswer::Unavailable);
+        assert_eq!(
+            lock_answer(&out, 80),
+            LockAnswer::Wait {
+                retry_ms: r.core.lock_resume_retry_ms()
+            }
+        );
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
     /// Answers every S3 request against `object` (a lease swap or create
@@ -18456,10 +18609,12 @@ mod locks {
     }
 
     /// Should-fix 3 of the review: only an owner about to own the root
-    /// again makes a non-blocking request wait (`Waiting`, up to
-    /// `s3_less_deadline_ms`); an owner answering `Busy` for any other
-    /// reason (no fresh S3 liveness, an unmarked lease) still fails it
-    /// fast (`ENOLCK` after the attempts and one lease read), as before.
+    /// again makes a non-blocking request wait inside the core
+    /// (`Waiting`, up to `s3_less_deadline_ms`); an owner answering `Busy`
+    /// for any other reason (a blocking request's answer from a stale
+    /// owner) hands the request back fast, after the attempts and one
+    /// lease read: told to wait, for the engine to ask again (plan 43 F-b;
+    /// `ENOLCK` before), the core not kept busy with it.
     #[test]
     fn busy_fails_a_non_blocking_lock_fast_and_waiting_does_not() {
         let mut r = requester();
@@ -18504,10 +18659,15 @@ mod locks {
             }
             out = next;
         }
-        assert_eq!(answered, Some(LockAnswer::Unavailable));
+        assert_eq!(
+            answered,
+            Some(LockAnswer::Wait {
+                retry_ms: r.core.lock_resume_retry_ms()
+            })
+        );
         assert!(
             r.now.0 - start.0 < 5_000,
-            "Busy waited {} ms",
+            "Busy kept the core busy {} ms",
             r.now.0 - start.0
         );
         // `Waiting` to a non-blocking request: retried without failing,
@@ -18558,10 +18718,15 @@ mod locks {
             out = next;
         }
         let waited = r.now.0 - start.0;
-        assert_eq!(answered, Some(LockAnswer::Unavailable));
+        assert_eq!(
+            answered,
+            Some(LockAnswer::Wait {
+                retry_ms: r.core.lock_resume_retry_ms()
+            })
+        );
         assert!(
             waited >= r.core.cfg.s3_less_deadline_ms as i64,
-            "gave up after {waited} ms"
+            "handed back after {waited} ms"
         );
     }
 
@@ -20337,6 +20502,36 @@ mod locks {
         }
         assert_eq!(h.core.stats.renew_probes, 1);
         assert!(!h.core.lease.lost);
+    }
+
+    /// A refusal or a request to wait goes at once, though an answer to
+    /// the same peer is held for the lease read: queued behind a held
+    /// renewal it reached the requester after its timeout, and a
+    /// non-blocking lock on a free file failed `ENOLCK` three timeouts later
+    /// (`s3-cut-holder-failover-with-locks` at the production lease, plan 43
+    /// F-b, Q18c). A grant stays behind what it must follow.
+    #[test]
+    fn a_refusal_is_not_held_behind_a_held_renewal_to_the_same_peer() {
+        let (mut h, ino) = fast_holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let free = h.meta.allocate_ino(ROOT_INO).unwrap();
+        h.advance(2_000);
+        let out = peer_renew(&mut h, 20, ino, g2);
+        assert!(renewed_of(&out, 2).is_none(), "held: {out:?}");
+        let probe = lease_probe(&out);
+        // Node 2's request for a free lock: the owner may not grant (stale),
+        // so it waits - and says so now.
+        let out = request(&mut h, 2, 21, free, X, false);
+        assert_eq!(grace_wait(&out, 21), h.core.lock_resume_retry_ms());
+        assert_eq!(
+            h.core.stats.lock_order_bypassed, 1,
+            "counted: it went ahead of the held renewal"
+        );
+        // The renewal's answer still waits for the read.
+        h.advance(40);
+        let out = answer_probe(&mut h, probe, None);
+        assert!(renewed_of(&out, 2).is_some(), "{out:?}");
     }
 
     /// The same read shows that node 4 (the backup) took the lease over: the held

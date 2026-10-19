@@ -4041,6 +4041,17 @@
     "LockStatus": {
       "description": "Plan 30 §M14: `--locks cluster` — lock grants leased from the\nowning sequencer.",
       "properties": {
+        "answers_order_bypassed": {
+          "description": "Lock answers that grant and extend nothing and went ahead of a held\nanswer to the same peer, and answers that waited for the order of\nthe answers to their peer alone.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "answers_order_held": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "doubt_lapses": {
           "description": "F1: recalled grants this node left to their owner's outwait\ninstead of releasing them (a mutation tagged with them ended in\ndoubt and was not resolved yet).",
           "format": "uint64",
@@ -4104,7 +4115,7 @@
           "type": "integer"
         },
         "grace_waits": {
-          "description": "Plan 43 F-b: non-blocking requests that waited for an owner that\ncould not grant yet (a grace after a takeover or a restart, the\ntenure's floor, a barrier, a delegate's short authority) instead of\nfailing `EAGAIN`, the milliseconds those waits took in all, and the\nones that gave up with `EAGAIN` after `lock_grace_wait_max_ms` (a\nload campaign expects none).",
+          "description": "Plan 43 F-b: non-blocking requests that waited for an owner that\ncould not grant yet (a grace after a takeover or a restart, the\ntenure's floor, a barrier, a delegate's short authority) instead of\nfailing `EAGAIN`, the milliseconds those waits took in all, and the\nones that gave up with `EAGAIN` after `lock_owner_wait_max_ms` (a\nload campaign expects none).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4338,6 +4349,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "stale_owner_answers": {
+          "description": "... and for an owner that may not grant at all yet (no fresh S3\nliveness, a lease not marked as granting), which answered `Busy`\nbefore.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "tagged_ops": {
           "description": "Plan 30 §M14 phase 2 (the fencing token): mutations issued here\ntagged with their owner's grants, and recalled grants whose\nrelease waited for such a mutation to be answered.",
           "format": "uint64",
@@ -4357,6 +4374,12 @@
           "type": "integer"
         },
         "unavailable": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unreachable_owner_waits": {
+          "description": "Non-blocking requests of this node told to wait because their\nowner could not be reached (a failover in progress: `ENOLCK`\nbefore).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4428,6 +4451,10 @@
         "grace_refusals",
         "grace_wait_answers",
         "not_yet_answers",
+        "stale_owner_answers",
+        "unreachable_owner_waits",
+        "answers_order_bypassed",
+        "answers_order_held",
         "grace_end_serves",
         "token_rejections",
         "token_rejections_at_write",

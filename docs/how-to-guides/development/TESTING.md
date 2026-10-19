@@ -3504,7 +3504,7 @@ apart, for F6's rate — ENOLCK for a new lock during an S3 outage, ESTALE
 on a removed file, EINTR on a killed fsync, EIO under a soft fsync
 timeout; an EIO in doubt past the client deadline is a bug unless
 `CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`; a node's `locks.grace_wait_gave_up`
-above 0 — a non-blocking lock that waited out `lock_grace_wait_max_ms` for
+above 0 — a non-blocking lock that waited out `lock_owner_wait_max_ms` for
 an owner's grace and failed `EAGAIN` — is a bug of the class
 `grace-wait-gave-up`, whether or not the workload recorded the error;
 so is a node's `locks.grace_wait_refused_ring` or `grace_wait_refused_pool`

@@ -1484,7 +1484,7 @@ pub struct LockStatus {
     /// could not grant yet (a grace after a takeover or a restart, the
     /// tenure's floor, a barrier, a delegate's short authority) instead of
     /// failing `EAGAIN`, the milliseconds those waits took in all, and the
-    /// ones that gave up with `EAGAIN` after `lock_grace_wait_max_ms` (a
+    /// ones that gave up with `EAGAIN` after `lock_owner_wait_max_ms` (a
     /// load campaign expects none).
     pub grace_waits: u64,
     pub grace_wait_ms_total: u64,
@@ -1509,6 +1509,19 @@ pub struct LockStatus {
     /// short authority; grace ends that served parked waiters.
     pub grace_wait_answers: u64,
     pub not_yet_answers: u64,
+    /// ... and for an owner that may not grant at all yet (no fresh S3
+    /// liveness, a lease not marked as granting), which answered `Busy`
+    /// before.
+    pub stale_owner_answers: u64,
+    /// Non-blocking requests of this node told to wait because their
+    /// owner could not be reached (a failover in progress: `ENOLCK`
+    /// before).
+    pub unreachable_owner_waits: u64,
+    /// Lock answers that grant and extend nothing and went ahead of a held
+    /// answer to the same peer, and answers that waited for the order of
+    /// the answers to their peer alone.
+    pub answers_order_bypassed: u64,
+    pub answers_order_held: u64,
     pub grace_end_serves: u64,
     /// Plan 30 §M14 phase 2: tagged mutations this node refused as their
     /// executor because a grant they named was no longer live (`EIO` to

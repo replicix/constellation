@@ -494,7 +494,8 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
             tx: h.tx.clone(),
             inval: None,
             lineage: Default::default(),
-            grace_wait_max: std::time::Duration::from_secs(50),
+            owner_wait_max: std::time::Duration::from_secs(50),
+            poll_hint: std::time::Duration::from_millis(50),
             waits: Default::default(),
         }));
     }

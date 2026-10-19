@@ -21,8 +21,10 @@
 //!   answered `Waiting { grace: true }`, and its requester answers its
 //!   engine `LockAnswer::Wait` (plan 43 F-b): the engine retries it,
 //!   bounded, on a thread of its own. A known conflict still answers
-//!   `WouldBlock`. A timer at each grace's end (`Timer::LockGraceEnd`)
-//!   serves the parked waiters it held back.
+//!   `WouldBlock`. The same for an owner that may not grant at all yet
+//!   (no fresh S3 liveness, a lease not marked as granting: it answered
+//!   `Busy`, `ENOLCK` after three attempts). A timer at each grace's end
+//!   (`Timer::LockGraceEnd`) serves the parked waiters it held back.
 //! - A recalled node releases (`LockReleased`) or is outwaited by the
 //!   grant's expiry (`Timer::LockGrantExpiry`); either serves the
 //!   waiters. A waiter whose request was answered `Waiting` (so the RPC
@@ -457,6 +459,13 @@ pub(crate) struct HeldAnswer {
     fresh: Option<FreshHold>,
     to: NodeId,
     msg: PeerMsg,
+    /// When it was held (the debug line of an answer that waited only for
+    /// the order of the answers to its peer says for how long).
+    since: Ms,
+    /// What it waits for is nothing but an earlier held answer to the same
+    /// peer (its own window is durable and its tenure proven): counted in
+    /// `lock_order_holds` when it goes.
+    order_only: bool,
 }
 
 /// How many subtree floors an owner keeps before folding them into one
@@ -782,7 +791,7 @@ impl Core {
                 retry_ms: self.lock_resume_retry_ms(),
                 grace: false,
             };
-            self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out);
+            self.lock_answer(now, from, PeerMsg::LockReply { req, outcome }, out);
             return;
         }
         // A re-sent request of a parked node: re-attach (and answer at
@@ -821,7 +830,7 @@ impl Core {
             out,
         ) {
             Served::Outcome(outcome) => {
-                self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out)
+                self.lock_answer(now, from, PeerMsg::LockReply { req, outcome }, out)
             }
             Served::Parked => {}
         }
@@ -891,7 +900,7 @@ impl Core {
                         retry_ms: self.lock_resume_retry_ms(),
                         grace: false,
                     };
-                    self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out);
+                    self.lock_answer(now, from, PeerMsg::LockReply { req, outcome }, out);
                 }
                 if !inos.contains(&w.ino) {
                     inos.push(w.ino);
@@ -972,14 +981,54 @@ impl Core {
     /// refused (`NotOwner { 0 }`) if it shows a deposition. Holding
     /// rather than refusing at once: a refusal makes the holder re-read
     /// the lease and send again, a round trip to S3 either way.
-    fn lock_answer(&mut self, to: NodeId, msg: PeerMsg, out: &mut Vec<Action>) {
+    fn lock_answer(&mut self, now: Ms, to: NodeId, msg: PeerMsg, out: &mut Vec<Action>) {
         let need = std::mem::take(&mut self.lk.horizon_need);
         let fresh = self.lk.fresh_need.take();
-        let behind = self.lk.horizon_held.iter().any(|h| h.to == to);
-        if need <= self.lk.horizon_durable && fresh.is_none() && !behind {
+        // An answer that grants and extends nothing (a refusal, a request
+        // to wait, a redirection) has no window to hold back, and none
+        // that an earlier held answer to the same peer needs to precede:
+        // it goes at once. Queued behind a held renewal (which a stale
+        // owner holds for a lease read, S3 being away) it reached its
+        // requester after the request's timeout, three times in a row:
+        // `ENOLCK` for a lock nothing held (plan 43 F-b, Q18c).
+        let refusal = matches!(
+            &msg,
+            PeerMsg::LockReply {
+                outcome: LockOutcome::Waiting { .. }
+                    | LockOutcome::WouldBlock
+                    | LockOutcome::NotOwner { .. }
+                    | LockOutcome::Busy,
+                ..
+            }
+        ) && need == 0
+            && fresh.is_none();
+        let oldest_held = self
+            .lk
+            .horizon_held
+            .iter()
+            .filter(|h| h.to == to)
+            .map(|h| h.since)
+            .min();
+        let behind = !refusal && oldest_held.is_some();
+        if refusal {
+            if let Some(since) = oldest_held {
+                // What the order rule would have queued behind a held
+                // answer (plan 43 F-b review F5): counted, so that a run
+                // shows what the exception saved.
+                self.stats.lock_order_bypassed += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    to,
+                    held_ms = now.0 - since.0,
+                    "an answer that grants nothing goes ahead of a held answer to the same peer"
+                );
+            }
+        }
+        if (need <= self.lk.horizon_durable && fresh.is_none() && !behind) || refusal {
             out.push(Action::Send { to, msg });
             return;
         }
+        let order_only = behind && need <= self.lk.horizon_durable && fresh.is_none();
         if fresh.is_none() || need > self.lk.horizon_durable {
             self.stats.lock_horizon_held += 1;
         }
@@ -1005,6 +1054,8 @@ impl Core {
             fresh,
             to,
             msg,
+            since: now,
+            order_only,
         });
         self.lock_horizon_write(out);
     }
@@ -1093,6 +1144,20 @@ impl Core {
                 h.fresh = None;
             }
             if h.need <= durable && h.fresh.is_none() && !keep.iter().any(|k| k.to == h.to) {
+                if h.order_only || h.since != now {
+                    // Held for the order of the answers to its peer alone
+                    // (or released later than it was held): how long.
+                    if h.order_only {
+                        self.stats.lock_order_holds += 1;
+                    }
+                    tracing::debug!(
+                        node = self.cfg.node_id,
+                        to = h.to,
+                        held_ms = now.0 - h.since.0,
+                        order_only = h.order_only,
+                        "a held lock answer goes"
+                    );
+                }
                 out.push(Action::Send {
                     to: h.to,
                     msg: h.msg,
@@ -1256,9 +1321,22 @@ impl Core {
             // tenure may grant (a fresh successor whose lease is not
             // marked yet: the harness's lock-failover contender got
             // `Busy`, then `ENOLCK`, while the locker held its grant).
+            // With nothing in conflict a non-blocking request waits for
+            // the tenure to be able to grant (plan 43 F-b, Q18c), as for
+            // a grace: it got `Busy`, three attempts and `ENOLCK`.
             return Served::Outcome(
                 self.lock_conflict_refusal(now, from, ino, mode, blocking, replica)
-                    .unwrap_or(LockOutcome::Busy),
+                    .unwrap_or_else(|| {
+                        if blocking {
+                            LockOutcome::Busy
+                        } else {
+                            self.stats.lock_stale_owner_waits += 1;
+                            LockOutcome::Waiting {
+                                retry_ms: self.lock_resume_retry_ms(),
+                                grace: true,
+                            }
+                        }
+                    }),
             );
         }
         if self.lock_grace_active(now, ino, replica) {
@@ -1456,7 +1534,7 @@ impl Core {
     /// How soon a request waiting for this node to own the root again
     /// (`lock_owner_resuming`) asks again.
     pub(crate) fn lock_resume_retry_ms(&self) -> u64 {
-        (self.cfg.forward_backoff_ms / 4).max(10)
+        self.cfg.lock_poll_ms()
     }
 
     /// How long the queue waits for an unreachable waiter's next request
@@ -2580,8 +2658,8 @@ impl Core {
             return;
         }
         match req {
-            Some(req) => self.lock_answer(node, PeerMsg::LockReply { req, outcome }, out),
-            None => self.lock_answer(node, PeerMsg::LockGranted { ino, sent, outcome }, out),
+            Some(req) => self.lock_answer(now, node, PeerMsg::LockReply { req, outcome }, out),
+            None => self.lock_answer(now, node, PeerMsg::LockGranted { ino, sent, outcome }, out),
         }
     }
 
@@ -2756,7 +2834,7 @@ impl Core {
             let r = self.lock_renew_one(now, from, e.ino, e.grant, e.mode, replica);
             results.push((e.ino, e.grant, r));
         }
-        self.lock_answer(from, PeerMsg::LockRenewed { req, results }, out);
+        self.lock_answer(now, from, PeerMsg::LockRenewed { req, results }, out);
         for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
             self.deleg_renew_now(now, gen, out);
         }
@@ -3136,8 +3214,15 @@ impl Core {
         }
     }
 
-    /// No P2P path to the owner: a non-blocking request fails
-    /// (`ENOLCK`); a blocking one keeps trying.
+    /// No P2P path to the owner (or none that works: its link is dead
+    /// and the lease, read again, still names it): a blocking request
+    /// keeps trying; a non-blocking one over P2P is handed back to its
+    /// engine to wait (plan 43 F-b, the maintainer's decision of
+    /// 2026-10-19: a stale owner is a failover in progress, and a lock
+    /// request in a failover costs latency, not `ENOLCK`); the engine asks
+    /// again as a fresh request (fresh attempts, a fresh lease read,
+    /// routed to the successor as soon as the lease names it), up to its
+    /// bound. Without P2P there is no path at all: `ENOLCK`, as documented.
     fn lock_op_unreachable(&mut self, now: Ms, op: OpId, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
@@ -3146,12 +3231,29 @@ impl Core {
             self.lock_retry(now, op, out);
             return;
         }
-        self.stats.lock_unavailable += 1;
+        self.lock_give_up(op, out);
+    }
+
+    /// A non-blocking request out of attempts, its lease read spent: told
+    /// to wait if there is a P2P path to wait for, else `Unavailable`
+    /// ([`Self::lock_op_unreachable`]).
+    fn lock_give_up(&mut self, op: OpId, out: &mut Vec<Action>) {
         self.lk.ops.remove(&op);
-        out.push(Action::ControlDone {
-            op,
-            result: Ok(ControlOk::Lock(LockAnswer::Unavailable)),
-        });
+        if self.cfg.p2p {
+            self.stats.lock_unreachable_waits += 1;
+            out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Lock(LockAnswer::Wait {
+                    retry_ms: self.lock_resume_retry_ms(),
+                })),
+            });
+        } else {
+            self.stats.lock_unavailable += 1;
+            out.push(Action::ControlDone {
+                op,
+                result: Ok(ControlOk::Lock(LockAnswer::Unavailable)),
+            });
+        }
     }
 
     /// The holder this node asked (or would ask) cannot be reached: it
@@ -3188,12 +3290,7 @@ impl Core {
             if self.lock_reread_holder(op, out) {
                 return;
             }
-            self.stats.lock_unavailable += 1;
-            self.lk.ops.remove(&op);
-            out.push(Action::ControlDone {
-                op,
-                result: Ok(ControlOk::Lock(LockAnswer::Unavailable)),
-            });
+            self.lock_give_up(op, out);
             return;
         }
         let delay = (self.cfg.forward_backoff_ms / 4).max(10) * u64::from(o.attempts.clamp(1, 8));

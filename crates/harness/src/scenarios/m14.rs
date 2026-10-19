@@ -1208,18 +1208,24 @@ type Seen = Vec<(Duration, Duration, std::result::Result<(), Code>)>;
 /// harness process instead, the control: the reader then sees the fence.
 pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
     const NAME: &str = "s3-cut-holder-failover-with-locks";
-    let (_env, _root, mut clients, proxies) = cluster(
-        NAME,
-        &["a", "b", "c", "d"],
-        &[
-            ("CONSTELLATION_CTO", "strict"),
-            (
-                "RUST_LOG",
-                "info,constellation_authority::core::backup=info,constellation::locks=debug",
-            ),
-        ],
-        1,
-    )?;
+    // `CONSTELLATION_HARNESS_LEASE_TTL_MS`: the production lease (60000)
+    // instead of the harness cluster's 20 s: the holder is cut from S3 a
+    // full lease before its backup may seal it, so the requests the stale
+    // holder answers before the takeover show.
+    let lease_ttl = std::env::var("CONSTELLATION_HARNESS_LEASE_TTL_MS").ok();
+    // `CONSTELLATION_HARNESS_LOCK_DEBUG=1`: the owner's lock answers too
+    // (every renewal: a lot of lines), for the held-answer lines.
+    let rust_log = if std::env::var_os("CONSTELLATION_HARNESS_LOCK_DEBUG").is_some() {
+        "info,constellation_authority::core::backup=info,constellation::locks=debug,\
+         constellation_authority::core::locks=debug"
+    } else {
+        "info,constellation_authority::core::backup=info,constellation::locks=debug"
+    };
+    let mut extra = vec![("CONSTELLATION_CTO", "strict"), ("RUST_LOG", rust_log)];
+    if let Some(ttl) = lease_ttl.as_deref() {
+        extra.push(("CONSTELLATION_LEASE_TTL_MS", ttl));
+    }
+    let (_env, _root, mut clients, proxies) = cluster(NAME, &["a", "b", "c", "d"], &extra, 1)?;
     let result = (|| -> Result<()> {
         let holder = 0usize;
         let backups = wait_for_backup(&clients[holder], Duration::from_secs(30))?;
@@ -1448,6 +1454,31 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
             })
             .collect();
         eprintln!("    {NAME}: (node, grace_waits, grace_wait_gave_up) {grace_waits:?}");
+        // What the waits and the answers were (plan 43 F-b): per node, the
+        // requester's waits for an unreachable owner and refused waits,
+        // the owner's answers to wait (stale owner, floor) and the answers
+        // that went ahead of a held one, or waited for the order alone.
+        let counters: Vec<_> = clients
+            .iter()
+            .filter_map(|c| locks_of(c).ok().map(|l| (c.name.clone(), l)))
+            .map(|(n, l)| {
+                let g = |k: &str| l[k].as_u64().unwrap_or(0);
+                (
+                    n,
+                    [
+                        ("unreachable_owner_waits", g("unreachable_owner_waits")),
+                        ("refused_ring", g("grace_wait_refused_ring")),
+                        ("refused_pool", g("grace_wait_refused_pool")),
+                        ("stale_owner_answers", g("stale_owner_answers")),
+                        ("not_yet_answers", g("not_yet_answers")),
+                        ("order_bypassed", g("answers_order_bypassed")),
+                        ("order_held", g("answers_order_held")),
+                    ],
+                )
+            })
+            .collect();
+        eprintln!("    {NAME}: lock counters {counters:?}");
+        let gave_up: u64 = grace_waits.iter().map(|(_, _, g)| *g).sum();
         proxies[0].heal();
         if let Some(held) = held {
             held.release();
@@ -1460,6 +1491,10 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
         anyhow::ensure!(
             first_ok_after(&grabs, took_over).is_some(),
             "no lock was granted on a free file within 90 s of the takeover"
+        );
+        anyhow::ensure!(
+            gave_up == 0,
+            "{gave_up} lock wait(s) gave up at the bound (the wait for the owner outlasted it)"
         );
         Ok(())
     })();

@@ -30,8 +30,8 @@ fn fenced_fs() -> Fenced {
 }
 
 /// [`fenced_fs`], whose non-blocking lock requests give up waiting for an
-/// owner's grace after `grace_wait_max`.
-fn fenced_fs_waiting(grace_wait_max: std::time::Duration) -> Fenced {
+/// owner's grace after `owner_wait_max`.
+fn fenced_fs_waiting(owner_wait_max: std::time::Duration) -> Fenced {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let (mut fs, dir, core) = holder_fs(meta.clone(), false);
     let (tx, locks_core) = tokio::sync::mpsc::unbounded_channel();
@@ -40,7 +40,8 @@ fn fenced_fs_waiting(grace_wait_max: std::time::Duration) -> Fenced {
         tx,
         inval: None,
         lineage: Default::default(),
-        grace_wait_max,
+        owner_wait_max,
+        poll_hint: std::time::Duration::from_millis(50),
         waits: Default::default(),
     }));
     fs.caps.cluster_locks = true;
@@ -627,7 +628,8 @@ fn a_deadline_times_out_a_blocking_lock_request_and_never_a_non_blocking_one() {
         tx,
         inval: None,
         lineage: Default::default(),
-        grace_wait_max: std::time::Duration::from_secs(50),
+        owner_wait_max: std::time::Duration::from_secs(50),
+        poll_hint: std::time::Duration::from_millis(50),
         waits: Default::default(),
     });
     let lock = || constellation_meta::locks::LocalLock {
@@ -2649,4 +2651,31 @@ fn closing_the_file_during_a_graced_wait_leaves_nothing_behind() {
     );
     assert!(f.meta.locks().local_locks(ino).is_empty());
     assert!(f.meta.locks().held(ino).is_none());
+}
+
+/// Plan 43 F-b review F6: a request told again and again to wait for an
+/// owner that cannot time it (the owner's polling hint: 50 ms) asks less
+/// and less often, twice the last interval up to a second, instead of
+/// every 50 ms for the whole of a stale owner's lease; a hint that is a
+/// grace's remainder (longer than the polling hint) is exact and followed,
+/// and ends the run.
+#[test]
+fn a_run_of_polling_hints_backs_off_and_a_graces_remainder_is_followed() {
+    let f = fenced_fs();
+    let locks = f.fs.cluster_locks().expect("cluster locks");
+    let ms = std::time::Duration::from_millis;
+    let mut poll = None;
+    let seq: Vec<_> = (0..9).map(|_| locks.next_wait(&mut poll, ms(50))).collect();
+    assert_eq!(
+        seq,
+        [50, 100, 200, 400, 800, 1_000, 1_000, 1_000, 1_000].map(ms)
+    );
+    // A grace's remainder: followed as told, and the run starts again.
+    assert_eq!(locks.next_wait(&mut poll, ms(700)), ms(700));
+    assert_eq!(locks.next_wait(&mut poll, ms(50)), ms(50));
+    assert_eq!(locks.next_wait(&mut poll, ms(50)), ms(100));
+    // A hint below the polling one (a grace's last few ms) is followed
+    // too, never lengthened past what the run had.
+    let mut poll = None;
+    assert_eq!(locks.next_wait(&mut poll, ms(20)), ms(20));
 }
