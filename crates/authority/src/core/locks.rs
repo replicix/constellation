@@ -1357,7 +1357,20 @@ impl Core {
                 return Ok(LockOutcome::Busy);
             }
         }
-        let until = base.0.min(now.0) + ttl + self.lock_margin_ms();
+        // Never sooner than the record it replaces (`LockTables::grant`
+        // keeps one per node and inode): that grant is live, and its
+        // holder honours it — under its old id, or under this one, which
+        // keeps the later of the two windows (`LockTables::install_held`,
+        // as a renewal's answer does). Counted from this request alone (a
+        // waiter's last arrival, older than the renewal or the grant the
+        // record holds), the record ended inside the holder's window: the
+        // owner outwaited it and granted the lock to another node while
+        // the holder was still in its section (sim
+        // `double-seal-inside-the-grace` seed 4796: two exclusive holders,
+        // a second waiter of the node served after the first in one pass,
+        // from a request 2.4 s older).
+        let until = (base.0.min(now.0) + ttl + self.lock_margin_ms())
+            .max(own.map_or(i64::MIN, |g| g.until_ms));
         // The horizon is what this node's restart waits out, for grants
         // honoured elsewhere. A grant to itself dies with the process (its
         // held table and local locks are in memory, and a handover is

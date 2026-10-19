@@ -668,7 +668,17 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    `Waiting` after a short hold (`recall_hold_ms`, 250 ms). The node
    re-sends it every `(ttl − margin) / 2`, and the grant is pushed to the
    node (`LockGranted`) when it becomes free. A parked request is granted
-   live from its latest arrival, not from when it is served. A waiter
+   live from its latest arrival, not from when it is served — but never
+   ending sooner than the node's live grant on the file that it
+   replaces (an upgrade, or a re-affirmation under a new id): the
+   sequencer keeps one record per node and file, and the node honours
+   the later of the two windows. Two ops of one node waiting in one
+   mode are two waiters, and the node's re-sends refresh only the first,
+   so the second's arrival can be many seconds old when both are served
+   in one pass. Its grant, counted from there, replaced the first one's
+   record with one that ended inside the window the node honoured, and
+   the sequencer outwaited it and granted the lock to another node while
+   the first op was still in its section. A waiter
    silent for longer than `ttl − margin` is passed over: a grant would
    already have lapsed when it arrived. A grant that arrives with less
    than a quarter of the margin of its window left (the window counts

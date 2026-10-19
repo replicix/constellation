@@ -50466,3 +50466,106 @@ authority lib (415) and sim suite (159), the model crate, the engine lib
   separate finding).
 - The lock model has no marks, so the inherited mark is modelled in the
   close-to-open model only.
+
+## Fix: a grant made in place never ends the node's record sooner than the one it replaces (2026-10-19)
+
+Found while reproducing plan 43 C7-F F-a0: its sim configuration
+`double-seal-inside-the-grace` met a mutual-exclusion violation long
+after its faults (seeds 4796 and 6156, and 4097 and 4955 with one seal),
+with and without F-a0.
+
+### Mechanism
+
+- A sequencer keeps one lock record per node and inode
+  (`LockTables::grant` replaces the node's record), and every grant is a
+  new id, an upgrade or a re-affirmation of the node's live grant
+  included. Since the queue's grants count from the request's arrival
+  (`fc3c5f6`), `lock_try_grant` ended the record at `min(base, now) + ttl
+  + margin`, `base` being the last arrival of the request it answered,
+  even when the record it replaced ended later.
+- The node honours the later of the two windows: it keeps the first id
+  when the second grant lapses on arrival, and `install_held` keeps the
+  later `until` when it merges a newer id of the same owner (`27941de`), as
+  a renewal's answer does. So the record ended inside the window the
+  holder honoured. With another node waiting, the owner recalled the
+  grant, the holder (still in its section) did not release, and the owner
+  outwaited the shortened record and granted the other node.
+- The base is older than the replaced record's when a node has two ops
+  parked on one inode in two modes (two waiters, each refreshed by its
+  own re-sends) and both are served in one pass: the second re-affirms or
+  upgrades the first one's fresh grant from its own last arrival, up to a
+  re-send period older. Seed 4796: node 1's exclusive waiter was granted
+  from an arrival 164 ms old (record until 24714), its shared waiter then
+  re-affirmed it as exclusive from one 2.4 s old (record cut to 22477);
+  node 1 honoured the first grant until 23712 and would have renewed it at
+  22702. The owner outwaited the record at 22477 and granted node 2
+  exclusive while node 1 was in I/O. The same happens when the holder
+  renewed its grant after a parked upgrade's request arrived.
+- The window is lost whenever the base is more than two margins older,
+  and the owner outwaits before the holder's first renewal when it is more
+  than `(ttl + 3 margin) / 2` older (sooner still: the record can end
+  before it is made). A grant capped by the root's lease or by a delegation
+  makes that routine: at the production lock TTL (20 s, margin 1 s, the
+  5 s delegation), `locks-delegated`'s workload in a delegated directory
+  granted a lock over a holder in 7 of 300 seeds with no fault (the second
+  waiter's record ended before it was made, and the delegate granted its
+  own op in the same pass). At an undelegated root with an uncapped grant
+  it takes one lost re-send.
+
+### Change
+
+`lock_try_grant` ends the record at the later of the two. The answer is
+unchanged (the holder counts its window from its own send), and so is the
+rule that a dead waiter costs one window from its last message: a node's
+live record was already promised. The other writes of a node's record do
+not shorten it: a renewal extends (max); a reclaim, a mirror, a
+delegation move and a leaving grant restamp it to `now + ttl + margin`; a
+handoff never installs over a record of the same node.
+
+### Tests
+
+- Core `a_grant_reaffirmed_in_place_from_an_older_request_keeps_the_later_window`
+  (two waiters of one node in two modes, at the production lock TTL with
+  one lost re-send: the record ended 16.8 s before the holder's window,
+  and before its first renewal) and
+  `an_upgrade_served_in_place_keeps_the_window_a_renewal_gave`: both fail
+  on `c9bee29` and on `7ef243f` (F-a0 landed), as do
+  `double-seal-inside-the-grace` seeds 4796 and 6156 there.
+- Sim configurations `locks-long-grants` (5 s grants under the sim's 6 s
+  lease, nine ops on one file, half of them shared, sections up to 3.6 s,
+  no fault: 11 of seeds 0..1000 failed on `c9bee29`) and
+  `locks-long-grants-seal` (the same grants after a backup's seal), both
+  in `long_locks`; CI test `a_grant_reaffirmed_in_place_never_shortens_the_record`
+  (`locks-long-grants` 0..60; seed 10 failed on `c9bee29` and `7ef243f`).
+- The sim's lock drain check waits `4 × lock ttl` (at least the 10 s it
+  waited) for a waiter nobody asks for any more to be dropped: with 5 s
+  grants one seed of a milder variant of `locks-long-grants` failed the
+  10 s check before and after the change, and drained within 30 s.
+
+### Gates
+
+On `7ef243f` with the change: `cargo fmt --check` clean, `cargo clippy -p
+constellation-authority --all-targets -D warnings` clean, `cargo test
+--release -p constellation-authority` 417 + 4 + 160 passed, 0 failed.
+Every job ran under `timeout --kill-after=30s`; none hit it. Sim sweeps,
+0 failing seeds each: `double-seal-inside-the-grace` 0..8000 (and 0..20000
+on `c9bee29` with F-a0's patch; its single-seal variant 0..20000 there),
+`locks-long-grants` and `locks-long-grants-seal` 0..3000 (0..5000 on
+`c9bee29`), `locks-blips-tight-faults` 5000..6000, and every other `locks-*`
+configuration and `fast-takeover-skewed-successor` 0..2000. (The
+non-vacuity controls `locks-writer-hold-unchecked` and
+`locks-writer-hold-delegated-unsettled` still fail as they should, on
+`c9bee29`.)
+
+### Found on the way (not changed)
+
+- At the production lock TTL a delegate's grants are capped by what is
+  left of its 5 s delegation (2 to 4 s), while a parked remote waiter
+  re-sends every `(lock_ttl − margin) / 2` (9.5 s) and is served up to
+  `lock_ttl − margin` (19 s) after its last message. Most pushes then
+  lapse on arrival and are outwaited. `locks-delegated`'s workload in the
+  delegated directory at 20 s grants (margin 1 s) left a lock client
+  waiting over the sim's 60 s in 12 to 15 of 300 seeds, before and after
+  this change, and the fairness check reported hundreds of overtakes. The
+  same workload at the root (whose grants are not capped under an epoch)
+  had none. Liveness and latency only; tracked separately.

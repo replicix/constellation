@@ -15167,6 +15167,166 @@ mod locks {
         assert_eq!(h.core.lock_view().waiters, 0);
     }
 
+    /// Two ops of one node waiting for one inode in two modes are two
+    /// waiters, each refreshed by its own re-sends. Served in one pass when
+    /// the lock frees, the first (exclusive) is granted from its fresh
+    /// re-send, and the second (shared, its last re-send lost) re-affirms
+    /// that grant in place from its old arrival. The table holds one
+    /// record per node and inode, so the record then ended where the
+    /// second request's window would — before the window the node honours
+    /// under the first grant, and before that grant's first renewal: the
+    /// owner outwaited it and granted the lock to another node while the
+    /// first op was still in its section (sim `double-seal-inside-the-
+    /// grace` seed 4796, under grants its lease capped). At the
+    /// production lock TTL, with one lost message.
+    #[test]
+    fn a_grant_reaffirmed_in_place_from_an_older_request_keeps_the_later_window() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        h.core.lease.held.as_mut().unwrap().0.expires_unix_ms = h.now.plus(3_600_000).0;
+        let (ttl, margin) = (20_000, 1_000);
+        let out = request(&mut h, 3, 7, ino, X, true);
+        let (g3, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        // Node 2's two ops park behind node 3: exclusive, then shared.
+        let first = park(&mut h, 2, 8, ino);
+        h.advance(10);
+        let out = request(&mut h, 2, 9, ino, S, true);
+        let second = timer_of(&out, TimerKind::LockHeldReply);
+        h.advance(250);
+        h.step(Event::Timer { id: first });
+        h.step(Event::Timer { id: second });
+        assert_eq!(h.core.lock_view().waiters, 2);
+        // The exclusive op re-sends every `(ttl − margin) / 2`; the shared
+        // op's re-send at 9.5 s is lost.
+        for at in [9_500, 18_800] {
+            h.now = t0.plus(at);
+            let held = park(&mut h, 2, 10 + at, ino);
+            h.advance(250);
+            h.step(Event::Timer { id: held });
+        }
+        let resent = t0.plus(18_800);
+        // Node 3 releases inside the shared waiter's window.
+        h.now = t0.plus(18_900);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g3,
+                position: Position::ZERO,
+            },
+        });
+        let ps = pushes(&out);
+        let [(2, _, a), (2, _, b)] = ps.as_slice() else {
+            panic!("expected both of node 2's waiters served: {out:?}")
+        };
+        let (ga, _) = granted(a);
+        let (gb, _) = granted(b);
+        assert!(h.meta.locks().get(ga).is_none(), "replaced in place");
+        // Node 2 honours the first grant until `resent + ttl − margin`
+        // and renews it half-way through that, at `resent + 9.5 s`; the
+        // second lapsed on its arrival there (its window counts from the
+        // lost re-send's predecessor) and is asked for again. The record
+        // here must outlast the first grant's window.
+        let honoured = resent.0 + ttl - margin;
+        let until = h.meta.locks().get(gb).unwrap().until_ms;
+        assert_eq!(
+            until,
+            resent.0 + ttl + margin,
+            "the record keeps the first grant's window, not the second request's \
+             (t0 + {})",
+            until - t0.0
+        );
+        assert!(until > honoured);
+        // Past where the second request's window alone would have ended
+        // (and before node 2's first renewal), node 4 does not get the
+        // lock: node 2's grant is recalled.
+        h.now = Ms(t0.0 + 10 + ttl + margin + 100);
+        let out = request(&mut h, 4, 30, ino, X, false);
+        let rs = lock_replies(&out);
+        assert!(
+            matches!(rs.as_slice(), [(4, OpId(30), LockOutcome::WouldBlock)]),
+            "node 2 still holds it: {out:?}"
+        );
+        assert!(
+            recalls(&out)
+                .iter()
+                .any(|(to, _, _, g)| *to == 2 && *g == gb),
+            "{out:?}"
+        );
+    }
+
+    /// A renewal moves a record's end later than a parked upgrade's
+    /// request would: the upgrade, served in place, keeps the renewal's
+    /// end, which its holder keeps too (`LockTables::install_held` merges
+    /// a newer id of the same owner, the later window kept).
+    #[test]
+    fn an_upgrade_served_in_place_keeps_the_window_a_renewal_gave() {
+        let (mut h, ino) = holder_with_file();
+        let (ttl, margin) = (5_000, 1_000);
+        let out = request(&mut h, 2, 7, ino, S, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let out = request(&mut h, 3, 8, ino, S, true);
+        let (g3, _) = granted(&lock_replies(&out)[0].2);
+        // Node 2 asks to upgrade; node 3's shared grant is recalled.
+        h.advance(100);
+        let out = request(&mut h, 2, 9, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let held = timer_of(&out, TimerKind::LockHeldReply);
+        h.advance(250);
+        h.step(Event::Timer { id: held });
+        // Its re-send is lost; it renews its shared grant 3.4 s after the
+        // upgrade request arrived.
+        h.advance(3_150);
+        let renewed = h.now;
+        let out = h.step(Event::Peer {
+            from: 2,
+            msg: PeerMsg::LockRenew {
+                req: OpId(20),
+                entries: vec![LockRenewEntry {
+                    ino,
+                    grant: g2,
+                    mode: S,
+                }],
+            },
+        });
+        assert!(
+            matches!(
+                sends(&out).as_slice(),
+                [(2, PeerMsg::LockRenewed { results, .. })]
+                    if matches!(results[0].2, LockRenewResult::Ok { .. })
+            ),
+            "{out:?}"
+        );
+        assert_eq!(
+            h.meta.locks().get(g2).unwrap().until_ms,
+            renewed.0 + ttl + margin
+        );
+        // Node 3 releases: the upgrade is served from its request.
+        h.advance(100);
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant: g3,
+                position: Position::ZERO,
+            },
+        });
+        let ps = pushes(&out);
+        let [(2, _, o)] = ps.as_slice() else {
+            panic!("expected node 2's upgrade pushed: {out:?}")
+        };
+        let (gx, _) = granted(o);
+        let until = h.meta.locks().get(gx).unwrap().until_ms;
+        assert_eq!(
+            until,
+            renewed.0 + ttl + margin,
+            "the upgrade keeps the renewal's end"
+        );
+        // Node 2 honours it exclusively until `renewed + ttl − margin`.
+        assert!(until > renewed.0 + ttl - margin);
+    }
+
     /// A renewal extends a known grant (and reports its recalled flag);
     /// an unknown one is lost — unless a grace period admits a reclaim.
     #[test]

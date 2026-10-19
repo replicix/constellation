@@ -360,6 +360,8 @@ fn replay_seed() {
         Ok("locks-failover") => locks_failover_config(),
         Ok("locks-failover-backup") => locks_failover_backup_config(),
         Ok("locks-failover-backup-renew") => locks_failover_backup_renew_config(),
+        Ok("locks-long-grants") => locks_long_grants_config(),
+        Ok("locks-long-grants-seal") => locks_long_grants_seal_config(),
         Ok("fast-takeover-skewed-successor") => fast_takeover_skewed_successor_config(),
         Ok("double-seal-inside-the-grace") => double_seal_inside_the_grace_config(),
         Ok("locks-faults") => locks_faults_config(),
@@ -3198,6 +3200,8 @@ fn sweep_config() {
         "locks-failover" => locks_failover_config(),
         "locks-failover-backup" => locks_failover_backup_config(),
         "locks-failover-backup-renew" => locks_failover_backup_renew_config(),
+        "locks-long-grants" => locks_long_grants_config(),
+        "locks-long-grants-seal" => locks_long_grants_seal_config(),
         "fast-takeover-skewed-successor" => fast_takeover_skewed_successor_config(),
         "double-seal-inside-the-grace" => double_seal_inside_the_grace_config(),
         "locks-faults" => locks_faults_config(),
@@ -4996,6 +5000,49 @@ fn locks_failover_backup_renew_config() -> SimConfig {
     }
 }
 
+/// Grants of 5 s (the sim's are 1.5 s) under the sim's 6 s lease, which
+/// caps the root's grants at what is left of it; nine ops on one file,
+/// half of them shared, with critical sections up to 3.6 s. A node often
+/// has two ops parked on the file in two modes (two waiters, each
+/// refreshed by its own re-sends, every 2.25 s), and the two are served in
+/// one pass when the lock frees: the second re-affirms the first one's
+/// grant in place, from its own older arrival, and must not end the
+/// node's record sooner than the window the node honours under the first
+/// (on `c9bee29`: 11 of seeds 0..1000 granted the lock over a holder
+/// inside its section, with no fault).
+fn locks_long_grants_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.lock_ttl_ms = 5_000;
+            c
+        }),
+        clients_per_node: 3,
+        ops_per_client: 8,
+        lock_files: 1,
+        lock_shared_ratio: 0.5,
+        lock_ios: (4, 12),
+        lock_io_ms: (50, 300),
+        ..locks_config()
+    }
+}
+
+/// `locks-failover-backup-renew` with 5 s grants, the inbox off and one
+/// seal (at 1.2 s): the successor serves the rest of the run with grants
+/// capped by its lease, as `locks-long-grants`, after a takeover.
+fn locks_long_grants_seal_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.inbox = false;
+            c.lock_ttl_ms = 5_000;
+            c
+        }),
+        faults: locks_failover_backup_renew_config().faults[..2].to_vec(),
+        ..locks_failover_backup_renew_config()
+    }
+}
+
 /// Plan 43 C7-H2: `locks-failover-backup-renew` with the clocks of nodes 2
 /// and 3 ahead of node 1's by 4 s (the sim's lease is 6 s), so a backup
 /// that seals a holder and takes its lease over before it expires reads
@@ -5787,6 +5834,18 @@ fn locks_survive_a_backup_seal_under_renewals() {
         "the backup rarely took over: {t:?}"
     );
     assert!(t.renew_held > 0, "no renewal waited for liveness: {t:?}");
+}
+
+/// Two waiters of one node on one file, served in one pass, the second
+/// re-affirming the first one's grant in place from an older request: the
+/// owner's record of the node's grant never ends before the window the
+/// node honours (on `c9bee29`: seeds 10 and 32 of this range granted the
+/// lock to another node while the holder was inside its section).
+#[test]
+fn a_grant_reaffirmed_in_place_never_shortens_the_record() {
+    let t = run_m14("locks-long-grants", locks_long_grants_config(), 0..60);
+    assert!(t.grants > 500, "{t:?}");
+    assert!(t.recalls_sent > 100, "grants rarely contended: {t:?}");
 }
 
 /// Plan 43 C7-H2: a backup whose clock is ahead of its holder's seals and
@@ -6952,6 +7011,16 @@ fn long_locks() {
         "fast-takeover-skewed-successor",
         fast_takeover_skewed_successor_config(),
         206_000..206_000 + n,
+    );
+    run_m14(
+        "locks-long-grants",
+        locks_long_grants_config(),
+        207_000..207_000 + n,
+    );
+    run_m14(
+        "locks-long-grants-seal",
+        locks_long_grants_seal_config(),
+        208_000..208_000 + n,
     );
     run_m14("locks-faults", locks_faults_config(), 195_000..195_000 + n);
     run_m14("locks-pause", locks_pause_config(), 197_000..197_000 + n);

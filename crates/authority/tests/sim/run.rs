@@ -2716,10 +2716,14 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
 
     // Plan 30 §M14: no lock request, waiter or recall is left: every
     // parked request was served and every recall answered or outwaited.
+    // A waiter nobody asks for any more is dropped after `4 × lock ttl`
+    // of silence (`lock_serve_waiters`): the wait covers that, and is at
+    // least 10 s.
     let mut locks_stuck = None;
     if cfg.lock_files > 0 {
         let mut drained = false;
-        for _ in 0..100 {
+        let lock_ttl_ms = (cfg.core)(1, 1).lock_ttl_ms;
+        for _ in 0..(4 * lock_ttl_ms / 100 + 20).max(100) {
             let busy: Vec<(NodeId, usize, usize, usize)> = cluster
                 .ids()
                 .into_iter()
