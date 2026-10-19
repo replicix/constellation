@@ -16688,6 +16688,83 @@ mod locks {
         assert_eq!(r.core.stats.lock_released, 1);
     }
 
+    /// Two ops of one node on one inode (the second's request in flight):
+    /// the owner re-affirmed the grant under id 5 for the second request,
+    /// then again under id 6 and recalled it, and the recall overtook the
+    /// reply carrying 5. The held grant adopts 6 and is released; the
+    /// reply for 5, arriving after, is refused. Installed it was a second
+    /// exclusive holder beside whoever the owner granted next (sim
+    /// `locks-long-grants` seed 32392: the recall had adopted the id but
+    /// not raised the newest one seen).
+    #[test]
+    fn a_reply_older_than_an_adopted_and_released_id_installs_nothing() {
+        let mut r = requester();
+        let req_a = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_a,
+                outcome: grant_msg(4),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        // The FUSE thread takes and drops its local lock (the first use).
+        let lock = LocalLock {
+            owner: 9,
+            pid: 1,
+            pid_start: 0,
+            write: true,
+            start: 0,
+            end: u64::MAX,
+        };
+        assert_eq!(
+            r.meta.locks().local_set(42, lock, r.now.0),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        assert!(r.meta.locks().local_unlock(42, 9, 0, u64::MAX, r.now.0));
+        // A second op asks; its request is in flight.
+        r.advance(10);
+        let req_b = lock_control(&mut r, 51, 42, true);
+        // The recall of id 6 overtakes the reply that carries 5.
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 6 },
+            },
+        });
+        assert!(out
+            .iter()
+            .any(|a| matches!(a, Action::LockFlush { ino: 42, .. })));
+        let out = r.step(Event::LockFlushed {
+            ino: 42,
+            grant: GrantId { node: 1, seq: 6 },
+            ok: true,
+        });
+        assert!(matches!(
+            sends(&out).as_slice(),
+            [(1, PeerMsg::LockReleased { ino: 42, grant, .. })] if *grant == GrantId { node: 1, seq: 6 }
+        ));
+        assert!(r.meta.locks().held(42).is_none());
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_b,
+                outcome: grant_msg(5),
+            },
+        });
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(51), .. })),
+            "the older grant was installed: {out:?}"
+        );
+        assert!(r.meta.locks().held(42).is_none(), "two holders: {out:?}");
+    }
+
     /// `git-under-flock-b2b` (two committers in the turn lock at once): a
     /// grant recalled before its first use — the other committer asked
     /// while this node's FUSE thread still waited for the grant's floor

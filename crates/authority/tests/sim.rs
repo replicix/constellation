@@ -6092,6 +6092,18 @@ fn locks_survive_a_backup_seal_under_renewals() {
 /// owner's record of the node's grant never ends before the window the
 /// node honours (on `c9bee29`: seeds 10 and 32 of this range granted the
 /// lock to another node while the holder was inside its section).
+/// A recall that adopts a newer id of the owner raises the newest id the
+/// node has seen of it: the reply that carries an id in between, which the
+/// recall overtook, is refused after the adopted one is released (it was
+/// installed beside the owner's next grantee: two exclusive holders, seed
+/// 32392 once a node re-sent all of its idle ops at once; the core test
+/// `a_reply_older_than_an_adopted_and_released_id_installs_nothing` and the
+/// meta one are the reproductions that fail without the fix).
+#[test]
+fn regression_locks_long_grants_a_recall_overtaking_an_older_reply_seed_32392() {
+    run_seed(32392, locks_long_grants_config()).unwrap_or_else(|e| panic!("seed 32392: {e}"));
+}
+
 #[test]
 fn a_grant_reaffirmed_in_place_never_shortens_the_record() {
     let t = run_m14("locks-long-grants", locks_long_grants_config(), 0..60);

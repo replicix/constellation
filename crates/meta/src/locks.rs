@@ -1663,6 +1663,19 @@ impl LockTables {
         if old != id {
             g.tombstone(old);
             g.stats.recalled_superseded += 1;
+            // The owner keeps one record per node and inode and mints a
+            // fresh id per answer, so every id of its below the adopted
+            // one is dead there. A reply carrying one that is still in
+            // flight (the recall overtook it) must not install once the
+            // adopted id is released: it was a second exclusive holder
+            // beside the owner's next grantee (sim `locks-long-grants`
+            // seed 32392 with the ask-again patch; reachable without it
+            // whenever a recall overtakes the reply of an older in-place
+            // grant).
+            let n = g.newest.entry((ino, id.node)).or_insert(id.seq);
+            if *n < id.seq {
+                *n = id.seq;
+            }
         }
         let busy = g.local.get(&ino).is_some_and(|v| !v.is_empty());
         g.stats.recalled += 1;
@@ -3590,6 +3603,32 @@ mod supersede_tests {
             t.begin_release(7).map(|h| h.id),
             Some(GrantId { node: 1, seq: 6 })
         );
+    }
+
+    /// A recall that adopts a newer id raises the newest id the node has
+    /// seen of that owner: after the adopted id is released, a reply that
+    /// carries an id in between (the recall overtook it) is refused, not
+    /// installed beside the owner's next grantee (two exclusive holders).
+    #[test]
+    fn a_reply_older_than_an_adopted_and_released_id_is_refused() {
+        let t = LockTables::default();
+        assert!(matches!(t.install_held(7, held(4)), Installed::Ok { .. }));
+        // The first use of the grant, then idle.
+        assert_eq!(t.local_set(7, lock(), 0), LocalOutcome::Done);
+        assert!(t.local_unlock(7, 9, 0, u64::MAX, 1));
+        // The recall of id 6 overtook the reply that carries 5.
+        assert_eq!(t.recall_held(7, GrantId { node: 1, seq: 6 }), Some(false));
+        let h = t.begin_release(7).expect("idle and recalled: released");
+        assert_eq!(h.id, GrantId { node: 1, seq: 6 });
+        assert!(t.end_release(7, h.id));
+        assert!(t.held(7).is_none());
+        assert!(matches!(t.install_held(7, held(5)), Installed::Released));
+        assert!(
+            t.held(7).is_none(),
+            "nothing installed beside the owner's next grantee"
+        );
+        // A newer id of the owner is still installed.
+        assert!(matches!(t.install_held(7, held(7)), Installed::Ok { .. }));
     }
 
     /// The owner's newer id arriving as a reply (the request a push had

@@ -51696,3 +51696,54 @@ longest attempt 4.0 s), floor shortened by the cap (22 505 ms saved).
   the ones above (and `AUTHORITY_SIM_BEATS=thread`) exercise the cap.
 - `fast-takeover-skewed-holder`'s two-failover form (C7b, above).
 - No new environment keys (`configuration.md` unchanged).
+
+## Fix: a recall that adopts a newer grant id raises the newest id the node has seen (two exclusive holders)
+
+A node's grant table (`LockTables::held`) adopts the owner's newer id when a
+recall names one (`recall_held`: the owner re-affirmed the grant under a new
+id for a request that crossed the old id's push) and tombstones the id it
+held. It did not raise `newest[(inode, minting owner)]`, which
+`install_held` uses to refuse an id the owner has already replaced. So with
+ids 4 (held), 5 (a reply still in flight) and 6 (the recall, adopted), the
+node released 6 once idle, and the reply carrying 5 then installed: the
+owner had dropped the node's record on that release and granted the lock to
+another node, whose section overlapped the late holder's. Two exclusive
+holders, from a legitimate interleaving (an owner answering two requests of
+one node in one pass, the second answer upgrading in place and recalled at
+once, the recall overtaking the first reply).
+
+Found in review of the ask-again patch, where it reproduced in
+`locks-long-grants` seed 32392 (a node re-sends all its idle ops at once after
+an ask, which made the interleaving systematic). It is not caused by that
+patch: any recall that overtakes the reply of an older in-place grant on main
+does the same. On 5a7f659 no seed of the sim shows it (`locks-long-grants`
+15000..45000: one failing seed, 32644, a client of the owner node not winning
+the local lottery for 60 s, the same on the fixed tree); with the ask-again
+patch and without this fix the same range fails 4 seeds, 32392 among them
+(`mutual exclusion violated`: node 1 `Exclusive` and node 2 `Shared`), and
+with the fix 3, all lottery. So the reproductions are the unit tests, which
+fail on 5a7f659 and pass with the fix.
+
+### What changed
+
+`recall_held` raises `newest` to the adopted id's sequence when it adopts a
+newer id (an owner keeps one record per node and inode and mints a fresh id
+per answer, so every id of its below the adopted one is dead there). One
+statement; no other behaviour changes.
+
+### Tests
+
+- meta `a_reply_older_than_an_adopted_and_released_id_is_refused`: install 4,
+  recall 6 adopts, release 6, then `install_held(5)` must be `Released`
+  (fails on 5a7f659: it installs).
+- core (requester) `a_reply_older_than_an_adopted_and_released_id_installs_nothing`:
+  the same message sequence through the core: a second op's request in flight,
+  the recall of 6, the flush and release, then `LockReply` for 5 answers no
+  `ControlDone Granted` and installs nothing (fails on 5a7f659).
+- sim pin `regression_locks_long_grants_a_recall_overtaking_an_older_reply_seed_32392`
+  (it fails only with the ask-again patch and without this fix).
+- Gates: fmt, `clippy -p constellation-meta -p constellation-authority
+  --all-targets -D warnings`, meta `locks::` (38), authority lib (431) and
+  release suite (sim 161) pass; the 38 `locks-*` and takeover configs at 2000
+  seeds, `locks-long-grants` and `-seal` 3000, `double-seal-inside-the-grace`
+  8000, `locks-blips-tight-faults` 0..2000 and 5000..6000: 0 failing.
