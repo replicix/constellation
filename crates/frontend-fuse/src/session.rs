@@ -26,7 +26,8 @@
 //!    there is nothing to hand over. This comes before everything below —
 //!    nothing is quiesced, and the session goes on serving.
 //! 2. **Refuse early** while a request waits for a deferred reply (a
-//!    blocking lock wait: its reply must be written on the descriptor it
+//!    blocking lock wait, or a non-blocking one waiting for its lock
+//!    owner's grace: its reply must be written on the descriptor it
 //!    was read from, by a process that still serves it; only its caller's signal
 //!    interrupts the wait, and the upgrade cannot send one).
 //! 3. **Close the notification gate** (`notify`'s module doc) while the
@@ -90,7 +91,12 @@ use std::time::Duration;
 /// past `depth - 1` waiters on one queue as a non-blocking one — granted
 /// if free, `ENOLCK` if contended (`RingCommit::reserve_lock_wait`) —
 /// which removes the deadlock and replaces it with an error that
-/// `/dev/fuse` mounts never return. The project owner's decision
+/// `/dev/fuse` mounts never return. (Plan 43 F-b's waits of non-blocking
+/// requests for a lock their owner cannot grant yet, a grace after a
+/// failover, hold their entry too, and are counted against the same
+/// budget: `fuser::ReplyEmpty::hold_for_wait`. A request past it, a
+/// downgraded `FUSE_SETLKW` included, is answered at once, `EAGAIN` or
+/// `ENOLCK`, as before F-b.) The project owner's decision
 /// (2026-10-05, replacing Z2c's of 2026-10-02): a mount whose frontend
 /// forwards locks to the cluster ([`FrontendCaps::cluster_locks`], the
 /// default with P2P) takes the ladder under [`Self::Auto`] like any
@@ -2838,6 +2844,57 @@ mod tests {
         // Still serving.
         std::fs::write(m.dir.path().join("still"), b"up").unwrap();
         end(m.control, m.thread);
+    }
+
+    /// Plan 43 F-b: on a cluster-lock mount a non-blocking lock request
+    /// that waits for an owner's grace is a deferred reply like a blocking
+    /// one: a detach refuses while it waits, and goes once it is granted.
+    #[test]
+    fn a_detach_refuses_while_a_nonblocking_lock_waits_for_a_grace() {
+        if !kernel_available() {
+            return;
+        }
+        let vfs = MockVfs::reference(crate::caps(true));
+        let dir = MountDir::new();
+        let session = match mount(
+            Arc::new(vfs.clone()),
+            dir.path(),
+            &options(),
+            crate::caps(true),
+        ) {
+            Ok(session) => session,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: mount(2) refused here ({e})");
+                return;
+            }
+            Err(e) => panic!("mount: {e}"),
+        };
+        let (control, thread) = serve(session);
+        let path = dir.path().join("graced");
+        std::fs::write(&path, b"x").unwrap();
+        vfs.lock_grace(Some(Duration::from_millis(1_500)));
+        let waiter = std::thread::spawn(move || {
+            let f = std::fs::File::open(&path).unwrap();
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock(2) on a descriptor we own.
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            (rc, std::io::Error::last_os_error().raw_os_error())
+        });
+        let waiting = std::time::Instant::now();
+        while control.deferred_replies() == 0 {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(5),
+                "the request never waited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let refused = control.detach(|| ()).expect_err("a lock wait blocks it");
+        assert_eq!(refused.code, Code::Busy);
+        let (rc, errno) = waiter.join().unwrap();
+        assert_eq!(rc, 0, "granted after the grace (errno {errno:?})");
+        assert_eq!(control.deferred_replies(), 0);
+        end(control, thread);
+        drop(dir);
     }
 
     /// What the view cannot carry out of this process (here: scripted)

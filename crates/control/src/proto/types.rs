@@ -1480,6 +1480,20 @@ pub struct LockStatus {
     pub grants_waited: u64,
     pub grant_wait_ms_total: u64,
     pub grants_degraded: u64,
+    /// Plan 43 F-b: non-blocking requests that waited for an owner that
+    /// could not grant yet (a grace after a takeover or a restart, the
+    /// tenure's floor, a barrier, a delegate's short authority) instead of
+    /// failing `EAGAIN`, the milliseconds those waits took in all, and the
+    /// ones that gave up with `EAGAIN` after `lock_grace_wait_max_ms` (a
+    /// load campaign expects none).
+    pub grace_waits: u64,
+    pub grace_wait_ms_total: u64,
+    pub grace_wait_gave_up: u64,
+    /// Waits refused at their start and answered `EAGAIN` as before F-b:
+    /// the ring queue's lock-wait budget was spent, or no `lock-wait`
+    /// thread could be started (a campaign expects none).
+    pub grace_wait_refused_ring: u64,
+    pub grace_wait_refused_pool: u64,
     // ---- this node as a sequencer ----
     /// Live grants in this node's table.
     pub grants_table: u64,
@@ -1490,6 +1504,12 @@ pub struct LockStatus {
     pub reclaimed: u64,
     pub waiters_parked: u64,
     pub grace_refusals: u64,
+    /// Plan 43 F-b, as the owner: non-blocking requests answered "wait"
+    /// for a grace, and for a tenure floor, a barrier or a delegate's
+    /// short authority; grace ends that served parked waiters.
+    pub grace_wait_answers: u64,
+    pub not_yet_answers: u64,
+    pub grace_end_serves: u64,
     /// Plan 30 §M14 phase 2: tagged mutations this node refused as their
     /// executor because a grant they named was no longer live (`EIO` to
     /// their issuer; nothing journaled).

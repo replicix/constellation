@@ -12236,7 +12236,11 @@ mod locks {
         for t in timers(out, TimerKind::LockHeldReply) {
             let out = h.step(Event::Timer { id: t });
             for (to, _, o) in lock_replies(&out) {
-                let LockOutcome::Waiting { retry_ms } = o else {
+                let LockOutcome::Waiting {
+                    retry_ms,
+                    grace: false,
+                } = o
+                else {
                     panic!("held reply not Waiting: {o:?}")
                 };
                 waits.push((to, retry_ms));
@@ -13331,7 +13335,13 @@ mod locks {
             unreachable!()
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
-        assert!(matches!(lock(&mut h, 8, later), LockAnswer::WouldBlock));
+        // (Plan 43 F-b: the grace answers a non-blocking request "wait",
+        // not "would block": nothing conflicts, the owner may not grant
+        // yet.)
+        assert!(matches!(
+            lock(&mut h, 8, later),
+            LockAnswer::Wait { retry_ms } if retry_ms <= 1_000
+        ));
         assert_eq!(h.core.stats.lock_grace_refusals, 1);
     }
 
@@ -15009,8 +15019,14 @@ mod locks {
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
         h.advance(250);
         let out = h.step(Event::Timer { id: held });
-        let [(3, OpId(8), LockOutcome::Waiting { retry_ms: 2_000 })] =
-            lock_replies(&out).as_slice()
+        let [(
+            3,
+            OpId(8),
+            LockOutcome::Waiting {
+                retry_ms: 2_000,
+                grace: false,
+            },
+        )] = lock_replies(&out).as_slice()
         else {
             panic!("expected Waiting, re-sent within (ttl - margin) / 2: {out:?}")
         };
@@ -15617,6 +15633,412 @@ mod locks {
         let [(3, OpId(8), LockOutcome::NotOwner { .. })] = lock_replies(&out).as_slice() else {
             panic!("{out:?}")
         };
+    }
+
+    // ---- plan 43 F-b: a non-blocking request waits for what is not yet ----
+
+    /// The `Waiting { grace: true }` of a reply: its retry interval.
+    fn grace_wait(out: &[Action], req: u64) -> u64 {
+        let rs = lock_replies(out);
+        let [(
+            _,
+            r,
+            LockOutcome::Waiting {
+                retry_ms,
+                grace: true,
+            },
+        )] = rs.as_slice()
+        else {
+            panic!("expected a grace wait: {out:?}")
+        };
+        assert_eq!(*r, OpId(req));
+        *retry_ms
+    }
+
+    /// A non-blocking request in a grace, on a lock nothing holds, waits
+    /// for the grace to end (the remainder, at most a second) instead of
+    /// being refused `EAGAIN`; a live grant that conflicts still refuses
+    /// it at once; past the grace it is granted. On c9bee29 the grace
+    /// answered `WouldBlock`.
+    #[test]
+    fn a_nonblocking_lock_in_the_grace_waits_for_it() {
+        let (mut h, ino) = holder_with_file();
+        let op = h.create("g");
+        let MutateOp::Create { ino: free, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        // Node 2 holds `ino` when the grace begins.
+        let out = request(&mut h, 2, 7, ino, X, false);
+        granted(&lock_replies(&out)[0].2);
+        let until = h.now.0 + 5_000;
+        h.meta.locks().set_quarantine(until);
+        // A long grace: asked again within a second.
+        let out = request(&mut h, 3, 8, free, X, false);
+        assert_eq!(grace_wait(&out, 8), 1_000);
+        assert_eq!(h.core.stats.lock_grace_waits, 1);
+        // A conflicting live grant is refused at once, as before.
+        let out = request(&mut h, 3, 9, ino, X, false);
+        let [(3, OpId(9), LockOutcome::WouldBlock)] = lock_replies(&out).as_slice() else {
+            panic!("a known conflict is no wait: {out:?}")
+        };
+        assert_eq!(h.core.stats.lock_grace_waits, 1);
+        // Close to the end: the remainder, and a millisecond.
+        h.now = Ms(until - 300);
+        let out = request(&mut h, 3, 10, free, X, false);
+        assert_eq!(grace_wait(&out, 10), 301);
+        // Past it: granted.
+        h.now = Ms(until + 1);
+        let out = request(&mut h, 3, 11, free, X, false);
+        granted(&lock_replies(&out)[0].2);
+    }
+
+    /// A harness whose root tenure's floor is not known yet (the lease
+    /// holder's own quarantine is over, the delegate's first renewal has
+    /// not come), with a file `ino` for requests of another node.
+    fn tenure_floor_unknown() -> (Harness, Ino, i64) {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        h.meta.note_lock_grant_horizon(h.now.0 + 3_000).unwrap();
+        let until = h.meta.load_lock_quarantine(h.now.0).expect("quarantined");
+        let now = h.now;
+        h.core.locks_start(now, &h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.now = Ms(until + 10);
+        (h, ino, until)
+    }
+
+    /// The same behind the tenure floor of a new root tenure, which a
+    /// non-blocking request used to be refused for (`WouldBlock`): the
+    /// floor itself first (the request for the root's own lock is what
+    /// it counts), then the barrier of the delegate's renewal.
+    #[test]
+    fn a_nonblocking_lock_behind_the_tenure_floor_waits() {
+        let (mut h, ino, until) = tenure_floor_unknown();
+        let (tenure, barrier) = (
+            h.core.stats.lock_tenure_waits,
+            h.core.stats.lock_barrier_waits,
+        );
+        let out = request(&mut h, 5, 99, ROOT_INO, X, false);
+        assert_eq!(
+            grace_wait(&out, 99),
+            h.core.lock_resume_retry_ms(),
+            "{out:?}"
+        );
+        assert_eq!(
+            h.core.stats.lock_tenure_waits,
+            tenure + 1,
+            "the floor refused it"
+        );
+        assert_eq!(h.core.stats.lock_barrier_waits, barrier, "not the barrier");
+        renew_gen7(&mut h, 90, 2, until - 1);
+        let waits = h.core.stats.lock_not_yet_waits;
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert_eq!(
+            grace_wait(&out, 8),
+            h.core.lock_resume_retry_ms(),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.lock_not_yet_waits, waits + 1);
+        // The floor is taken with the renewal; the next try is granted.
+        renew_gen7(&mut h, 91, 3, until);
+        let out = request(&mut h, 4, 9, ino, X, false);
+        assert!(grant_to(&out, 4).is_some(), "{out:?}");
+    }
+
+    /// Plan 43 F-b review F1: behind the tenure floor a live grant that
+    /// conflicts, and the requester's own grant under recall, still
+    /// refuse a non-blocking request at once (`EAGAIN`, no wait), as
+    /// before; recalls are not sent from there, as before. A request
+    /// nothing conflicts with waits. Fails with the wait for everything
+    /// (patch 1 as first written: `Waiting` for both).
+    #[test]
+    fn a_known_conflict_behind_the_tenure_floor_is_refused_at_once() {
+        let (mut h, ino, _until) = tenure_floor_unknown();
+        let id = h.meta.locks().grant(1, 3, ino, X, h.now.0 + 30_000, 0);
+        let before = (
+            h.core.stats.lock_tenure_waits,
+            h.core.stats.lock_not_yet_waits,
+        );
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert_eq!(
+            h.core.stats.lock_tenure_waits,
+            before.0 + 1,
+            "the tenure floor"
+        );
+        assert_eq!(h.core.stats.lock_not_yet_waits, before.1, "no wait");
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(4, OpId(8), LockOutcome::WouldBlock)]
+            ),
+            "a known conflict is EAGAIN at once: {out:?}"
+        );
+        assert!(
+            sends(&out)
+                .iter()
+                .all(|(_, m)| !matches!(m, PeerMsg::LockRecall { .. })),
+            "no recall from behind the floor: {out:?}"
+        );
+        // Node 4's own grant under recall: refused too.
+        h.meta.locks().forget(id);
+        let own = h.meta.locks().grant(1, 4, ino, X, h.now.0 + 30_000, 0);
+        assert!(h.meta.locks().mark_recalled(own));
+        let out = request(&mut h, 4, 9, ino, X, false);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(4, OpId(9), LockOutcome::WouldBlock)]
+            ),
+            "{out:?}"
+        );
+        // Nothing conflicts: it waits.
+        h.meta.locks().forget(own);
+        let out = request(&mut h, 4, 10, ino, X, false);
+        assert_eq!(
+            grace_wait(&out, 10),
+            h.core.lock_resume_retry_ms(),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.lock_not_yet_waits, before.1 + 1);
+    }
+
+    /// An outwaited holder's barrier: another node's non-blocking request
+    /// waits for it (the lapsed holder itself is not held by it).
+    #[test]
+    fn a_nonblocking_lock_behind_a_barrier_waits() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        delegated_file(&h.meta);
+        let op = h.create("root.lock");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        request(&mut h, 5, 99, ROOT_INO, X, false);
+        let now = h.now.0;
+        renew_gen7(&mut h, 90, 2, now);
+        let out = request(&mut h, 2, 7, ino, X, false);
+        assert!(grant_to(&out, 2).is_some(), "{out:?}");
+        let end = h.meta.locks().own_grant(ino, 2, h.now.0).unwrap().until_ms;
+        h.now = Ms(end + 10);
+        let waits = h.core.stats.lock_not_yet_waits;
+        let out = request(&mut h, 4, 8, ino, X, false);
+        assert_eq!(
+            grace_wait(&out, 8),
+            h.core.lock_resume_retry_ms(),
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.lock_barrier_waits, 1);
+        assert_eq!(h.core.stats.lock_not_yet_waits, waits + 1);
+    }
+
+    /// A delegate with too little authority left: the non-blocking
+    /// request waits for the delegation's renewal (asked for at once)
+    /// instead of being refused.
+    #[test]
+    fn a_nonblocking_lock_on_a_delegates_short_authority_waits() {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        let (_, f) = {
+            let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+            let f = h.meta.allocate_ino(dir).unwrap();
+            crate::replica::Replica::apply_segment(
+                &h.meta,
+                1,
+                1,
+                0,
+                &[],
+                &[],
+                &[
+                    LogRecord::Mkdir {
+                        parent: ROOT_INO,
+                        name: "d".into(),
+                        ino: dir,
+                        mode: 0o755,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 1,
+                    },
+                    LogRecord::Create {
+                        parent: dir,
+                        name: "turn.lock".into(),
+                        ino: f,
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        time_ns: 2,
+                    },
+                    LogRecord::Delegate {
+                        dir,
+                        node: 3,
+                        gen: 7,
+                        designated: false,
+                        range: (0, 0),
+                    },
+                ],
+            )
+            .unwrap();
+            (dir, f)
+        };
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        let d = h.core.dl.mine.get_mut(&7).expect("installed");
+        d.until = h.now.plus(1_500);
+        d.renew = None;
+        let out = request(&mut h, 2, 9, f, X, false);
+        assert_eq!(grace_wait(&out, 9), h.core.lock_resume_retry_ms());
+        assert!(
+            sends(&out)
+                .iter()
+                .any(|(to, m)| *to == 1 && matches!(m, PeerMsg::DelegRenew { gen: 7, .. })),
+            "the delegation is not renewed at once: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_short_authority_waits, 1);
+        assert_eq!(h.core.stats.lock_not_yet_waits, 1);
+    }
+
+    /// The requester's side: a `Waiting { grace }` answers the engine
+    /// `Wait` (the retry and the bound are its own), forgets the request
+    /// and spends no attempt; a blocking request told so (a race) asks
+    /// again by itself.
+    #[test]
+    fn a_nonblocking_request_told_to_wait_answers_the_engine_wait() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, false);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 700,
+                    grace: true,
+                },
+            },
+        });
+        assert_eq!(lock_answer(&out, 50), LockAnswer::Wait { retry_ms: 700 });
+        assert!(timers(&out, TimerKind::LockRetry).is_empty(), "{out:?}");
+        assert_eq!(r.core.lock_view().requests_in_flight, 0);
+        // A refused attempt count: the engine asks again as a new request
+        // and is not out of attempts after any number of waits.
+        for op in 51..60 {
+            let req = lock_control(&mut r, op, 42, false);
+            let out = r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockReply {
+                    req,
+                    outcome: LockOutcome::Waiting {
+                        retry_ms: 700,
+                        grace: true,
+                    },
+                },
+            });
+            assert_eq!(lock_answer(&out, op), LockAnswer::Wait { retry_ms: 700 });
+        }
+        // Blocking: the core retries it itself, no answer to the engine.
+        let sent = r.now;
+        let req = lock_control(&mut r, 70, 43, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 700,
+                    grace: true,
+                },
+            },
+        });
+        let retry = timer_of(&out, TimerKind::LockRetry);
+        assert_eq!(r.core.timer_at(retry), Some(sent.plus(700)));
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(70), .. })),
+            "{out:?}"
+        );
+    }
+
+    /// The owner is this node: its own non-blocking request in a grace is
+    /// answered `Wait` without a round trip.
+    #[test]
+    fn a_local_nonblocking_request_in_the_grace_answers_the_engine_wait() {
+        let (mut h, ino) = holder_with_file();
+        h.meta.locks().set_quarantine(h.now.0 + 5_000);
+        let out = h.step(Event::Control {
+            op: OpId(5),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: false,
+            },
+        });
+        assert_eq!(lock_answer(&out, 5), LockAnswer::Wait { retry_ms: 1_000 });
+        assert_eq!(h.core.lock_view().requests_in_flight, 0);
+    }
+
+    /// A blocking waiter parked in a grace is served at the grace's end by
+    /// the `LockGraceEnd` timer, without waiting for its next re-attach
+    /// (on c9bee29: only the waiter tick or its re-send, up to
+    /// `recall_hold_ms` later).
+    #[test]
+    fn a_blocking_waiter_is_served_at_the_end_of_the_grace() {
+        let (mut h, ino) = holder_with_file();
+        let until = h.now.0 + 2_000;
+        h.meta.locks().set_quarantine(until);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let end = timer_of(&out, TimerKind::LockGraceEnd);
+        assert_eq!(h.core.timer_at(end), Some(Ms(until)));
+        // The grace ends: the held request is answered with the grant at
+        // the timer, before the waiter tick or the held-reply timer.
+        h.now = Ms(until);
+        let out = h.step(Event::Timer { id: end });
+        let rs = lock_replies(&out);
+        let [(3, OpId(8), LockOutcome::Granted { .. })] = rs.as_slice() else {
+            panic!("not served at the grace's end: {out:?}")
+        };
+        assert_eq!(h.core.stats.lock_grace_end_serves, 1);
+        assert_eq!(h.core.lock_view().waiters, 0);
+    }
+
+    /// One timer, at the earliest end: a grace that ends earlier than the
+    /// armed timer re-arms it; the timer does not pile up.
+    #[test]
+    fn the_grace_end_timer_follows_the_earliest_end() {
+        let (mut h, ino) = holder_with_file();
+        let now = h.now.0;
+        h.meta.locks().set_quarantine(now + 4_000);
+        let out = request(&mut h, 3, 8, ino, X, true);
+        let first = timer_of(&out, TimerKind::LockGraceEnd);
+        assert_eq!(h.core.timer_at(first), Some(Ms(now + 4_000)));
+        // A subtree grace that ends sooner.
+        h.core.lk.grace.push((ROOT_INO, Ms(now + 1_000)));
+        let out = request(&mut h, 4, 9, ino, X, true);
+        let cancelled = out
+            .iter()
+            .any(|a| matches!(a, Action::CancelTimer { id } if *id == first));
+        assert!(cancelled, "the later timer stays armed: {out:?}");
+        let second = timer_of(&out, TimerKind::LockGraceEnd);
+        assert_eq!(h.core.timer_at(second), Some(Ms(now + 1_000)));
+        // At the earlier end the next is armed.
+        h.now = Ms(now + 1_000);
+        let out = h.step(Event::Timer { id: second });
+        let third = timer_of(&out, TimerKind::LockGraceEnd);
+        assert_eq!(h.core.timer_at(third), Some(Ms(now + 4_000)));
     }
 
     // ---- the node side ----
@@ -16421,7 +16843,9 @@ mod locks {
         h.advance(100);
         h.hold(2, None);
         let out = request(&mut h, 3, 8, ino, X, false);
-        let [(3, OpId(8), LockOutcome::WouldBlock)] = lock_replies(&out).as_slice() else {
+        let [(3, OpId(8), LockOutcome::Waiting { grace: true, .. })] =
+            lock_replies(&out).as_slice()
+        else {
             panic!("granted over a dropped live grant: {out:?}")
         };
         // Lapsed: granted.
@@ -16447,7 +16871,9 @@ mod locks {
         h.core.lock_on_released_takeover(now, &h.meta);
         assert!(h.meta.locks().quarantine_until() > now.0);
         let out1 = request(&mut h, 3, 8, ino, X, false);
-        let [(3, OpId(8), LockOutcome::WouldBlock)] = lock_replies(&out1).as_slice() else {
+        let [(3, OpId(8), LockOutcome::Waiting { grace: true, .. })] =
+            lock_replies(&out1).as_slice()
+        else {
             panic!("granted inside the grace: {out1:?}")
         };
         // The tenure ends (released, no grant of its own) and the same
@@ -16457,7 +16883,9 @@ mod locks {
         h.advance(100);
         h.hold(2, None);
         let out2 = request(&mut h, 3, 9, ino, X, false);
-        let [(3, OpId(9), LockOutcome::WouldBlock)] = lock_replies(&out2).as_slice() else {
+        let [(3, OpId(9), LockOutcome::Waiting { grace: true, .. })] =
+            lock_replies(&out2).as_slice()
+        else {
             panic!("the grace went with the tenure: {out2:?}")
         };
         h.now = Ms(h.meta.locks().quarantine_until() + 1);
@@ -16922,7 +17350,10 @@ mod locks {
             from: 1,
             msg: PeerMsg::LockReply {
                 req,
-                outcome: LockOutcome::Waiting { retry_ms: 2_500 },
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 2_500,
+                    grace: false,
+                },
             },
         });
         let retry = timer_of(&out, TimerKind::LockRetry);
@@ -18103,7 +18534,10 @@ mod locks {
                         from: to,
                         msg: PeerMsg::LockReply {
                             req: *req,
-                            outcome: LockOutcome::Waiting { retry_ms: 50 },
+                            outcome: LockOutcome::Waiting {
+                                retry_ms: 50,
+                                grace: false,
+                            },
                         },
                     }));
                 }

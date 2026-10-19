@@ -999,8 +999,12 @@ pub enum LockOutcome {
         position: Position,
     },
     /// Parked (a blocking request): ask again in `retry_ms` (the grant
-    /// may be pushed before that).
-    Waiting { retry_ms: u64 },
+    /// may be pushed before that). `grace`: the owner may not grant yet
+    /// but nothing conflicts (a grace, the tenure's floor, a barrier, a
+    /// delegate's short authority; plan 43 F-b): a non-blocking request
+    /// waits too, asking again at `retry_ms` without spending an
+    /// attempt, instead of being refused.
+    Waiting { retry_ms: u64, grace: bool },
     /// A conflicting grant is held elsewhere (recalled now); a
     /// non-blocking request.
     WouldBlock,

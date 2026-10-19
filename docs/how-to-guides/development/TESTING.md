@@ -2929,6 +2929,8 @@ with the artifacts), never one transport's numbers with another's.
 |---|---|---|
 | `transport-cluster-locks-auto` | `auto` puts a cluster-lock mount on the ring at depth 32 (no fallback, no lock-wait downgrade, one `FUSE transport` line) and it serves; an explicit `CONSTELLATION_FUSE_URING_QUEUE_DEPTH=16` wins; `--locks local` gets depth 8; `uring` is the same as `auto`; `daemon --upgrade` of the `auto` mount is refused on the ring (naming the transport, the mount keeps serving) and served on a fallback (the resumed mount keeps its first rung). Off a ring host, every leg is `dev_fuse` and names a rung other than the locks | every host |
 | `transport-lock-wait-budget` | **real kernel**: a cluster-lock mount on the ring under `auto`, `depth + 3` processes pinned to one CPU (`taskset`) blocking in `F_SETLKW` while a process on the same CPU holds the lock. `depth - 1` wait, the rest get `ENOLCK` at once, a `stat` from that CPU is served, the holder's `write` and unlock go through, every waiter that waited is granted, and `lock_wait_downgrades` (per mount and process-wide) equals the refusals. At depth 4 and at the shipped 32 | ring hosts (`fuse-uring`, `taskset`) |
+| `transport-lock-grace` | **real kernel**, plan 43 F-b: three nodes on the ring at queue depth 4 (budget: three lock waits per CPU's queue); the holder is killed with a lock held, and inside the successor's lock grace two `F_SETLKW` and one non-blocking `F_SETLK` on free files, pinned to one CPU of another node, take the three waits. All three are granted at the grace's end (none `ENOLCK` or `EAGAIN`, none refused: `lock_wait_downgrades`, `grace_wait_refused_ring` 0), and a read from that CPU and from another is answered meanwhile (the queue's last entry stays free) | ring hosts (`fuse-uring`, `taskset`) |
+| `transport-lock-grace-queue` | **real kernel**, plan 43 F-b: `DEPTH` non-blocking `F_SETLK`s on free files pinned to one CPU inside a failover's grace at queue depth `DEPTH` (2; `CONSTELLATION_HARNESS_QUEUE_DEPTH`): `DEPTH - 1` wait and are granted at its end, the last is refused at once (`EAGAIN`, as before F-b, counted in `grace_wait_refused_ring`), and a `cat` from that CPU, once the first attempts are over, is answered within seconds, not at the grace's end (the review measured 9.95 s with every entry held, at depths 2 and 4) | ring hosts (`fuse-uring`, `taskset`) |
 
 ### Every downgrade, injected (plan 38 Z2a)
 
@@ -3314,6 +3316,7 @@ Harness scenarios (the harness process is the application: it calls
 | `sqlite-two-nodes` (needs `sqlite3`) | concurrent `sqlite3` writers on one database from two nodes; `PRAGMA integrity_check` ok on both, every committed row present |
 | `lock-holder-partitioned` | the lock holder cut from the owner is fenced (`EIO`) and the waiter is granted only after ttl + margin, never before the fence; the healed node locks again |
 | `lock-failover` | the holder is killed with a lock held under an M9 backup; the successor reclaims/mirrors the grant (no `EIO` for the locker), refuses the contender throughout, grants it after the unlock |
+| `lock-grace-wait` | plan 43 F-b: the holder is killed with a lock held under an M9 backup; in the successor's lock grace a non-blocking `F_SETLK` on a free file waits and is granted at the grace's end (never `EAGAIN`), one with a `SIGALRM` after 8 s ends `EINTR`, a blocking `F_SETLKW` parked at the successor is served by the grace-end timer, and the held lock is refused `EAGAIN` at once afterwards; `grace_waits` is counted, `grace_wait_gave_up` is 0 |
 | `lock-latency` | measurements: first lock from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff, and a lone node under `cluster` against `local` |
 | `lock-holder-killed-contention` | four nodes increment one `flock`ed counter (read, add, write, `fsync`); the holder is `kill -9`'d with the lock held. The survivors stall only until its grant is outwaited (ttl + margin, never less than its remaining life), hand the lock on with no further outwait (the owner's `recalls_expired` is 1), and the count is exact. Then a node killed while parked first in line costs the next waiter nothing (granted within milliseconds of the unlock, not ttl + margin later) |
 | `lock-fence-at-close` | B writes under a lock and is cut from the owner past its grant; C takes the lock and writes. B's close returns `EIO` (`fcntl` closed while still locked; `flock` unlocked first, then closed), and the file holds C's data on every node |
@@ -3500,7 +3503,14 @@ only as many as the node fenced, EAGAIN on a non-blocking lock — counted
 apart, for F6's rate — ENOLCK for a new lock during an S3 outage, ESTALE
 on a removed file, EINTR on a killed fsync, EIO under a soft fsync
 timeout; an EIO in doubt past the client deadline is a bug unless
-`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`; anything else is a bug). The
+`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`; a node's `locks.grace_wait_gave_up`
+above 0 — a non-blocking lock that waited out `lock_grace_wait_max_ms` for
+an owner's grace and failed `EAGAIN` — is a bug of the class
+`grace-wait-gave-up`, whether or not the workload recorded the error;
+so is a node's `locks.grace_wait_refused_ring` or `grace_wait_refused_pool`
+above 0 (a wait that could not begin, for want of a ring queue entry or a
+thread, and failed `EAGAIN` as before F-b: class `grace-wait-refused`);
+anything else is a bug). The
 workload's rename and unlink drop `ENOENT` only for a name its ledger does
 not hold (the unlink picks a name by arithmetic, so it mostly names a file
 never renamed into place or already unlinked). For a name the ledger holds

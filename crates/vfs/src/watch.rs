@@ -484,12 +484,19 @@ pub fn current() -> Option<Current> {
 }
 
 /// An op handed from one thread to another ([`current`]).
+#[derive(Clone)]
 pub struct Current(Arc<Entry>);
 
 impl Current {
     /// Make it the calling thread's current op.
-    pub fn adopt(self) {
-        set_current(Some(self.0));
+    pub fn adopt(&self) {
+        set_current(Some(self.0.clone()));
+    }
+
+    /// The calling thread stops naming this op, if it still does (a pool
+    /// thread that served it for a while, and serves others).
+    pub fn release(&self) {
+        clear_current(&self.0);
     }
 }
 

@@ -74,6 +74,10 @@ pub struct LockCounters {
     /// `Control::Lock` answers.
     pub granted: u64,
     pub would_block: u64,
+    /// Plan 43 F-b: `Wait` answers (a non-blocking request the owner
+    /// could not grant yet, nothing in conflict), honoured by asking
+    /// again after `retry_ms`.
+    pub grace_waits: u64,
     pub unavailable: u64,
     /// A `Granted` after which `local_set` still needed a grant (it had
     /// lapsed or been taken back meanwhile).
@@ -822,7 +826,10 @@ pub async fn client_lock(
                 tokio::time::sleep(Duration::from_millis(10 + jitter)).await;
             }
             LocalOutcome::NeedGrant(mode) => {
-                if wait.is_none() {
+                if wait.is_none() && step.blocking {
+                    // (A non-blocking request holds no place in a queue:
+                    // the owner does not park it, and it may be
+                    // overtaken while it waits for a grace to end.)
                     ghost.wait_begin(ino, node, thread, t0);
                     wait = Some(WaitGuard {
                         ghost: ghost.clone(),
@@ -918,6 +925,19 @@ pub async fn client_lock(
                             return;
                         }
                         tokio::time::sleep(Duration::from_millis(50 + jitter)).await;
+                    }
+                    Ok(ControlOk::Lock(LockAnswer::Wait { retry_ms })) => {
+                        // The engine's wait (`ClusterLocks::lock_nb_deferred`),
+                        // bounded here by the step's cap.
+                        ghost.count(|c| c.grace_waits += 1);
+                        if step.blocking {
+                            failures.lock().unwrap().push(format!(
+                                "lock client t{thread} on node {node}: a blocking request \
+                                 was told to wait for a grace by the engine's answer"
+                            ));
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(retry_ms)).await;
                     }
                     Ok(ControlOk::Lock(LockAnswer::Unavailable)) => {
                         ghost.count(|c| c.unavailable += 1);

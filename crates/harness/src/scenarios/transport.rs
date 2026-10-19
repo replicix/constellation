@@ -937,8 +937,11 @@ pub fn transport_cluster_locks_auto(seed: u64) -> Result<()> {
 }
 
 /// `harness lock-probe ROLE FILE [INDEX]` (see the subcommand's doc): one
-/// process of [`transport_lock_wait_budget`]. Returns the exit code: 0
-/// done (`waiter`: granted), 3 `ENOLCK`, 1 anything else.
+/// process of [`transport_lock_wait_budget`] (and, with the roles
+/// `nonblocking` and `waiter`, of `lock-grace-wait` and
+/// `transport-lock-grace`). Returns the exit code: 0 done (`waiter`:
+/// granted), 3 `ENOLCK`, 1 anything else; `nonblocking`: 0 granted, 4
+/// `EINTR`, 5 `EAGAIN`.
 pub fn lock_probe(role: &str, file: &Path, index: u64) -> i32 {
     use std::io::{BufRead, Write};
     use std::os::fd::AsRawFd;
@@ -996,6 +999,55 @@ pub fn lock_probe(role: &str, file: &Path, index: u64) -> i32 {
             }
             say("unlocked");
             0
+        }
+        // Plan 43 F-b: one non-blocking `F_SETLK` for the whole file; with
+        // an `index` of N > 0 a `SIGALRM` after N ms, which must not
+        // restart it. Exits 0 granted, 4 `EINTR`, 5 `EAGAIN`, 1 other; says
+        // which, and how long it took.
+        "nonblocking" => {
+            if index > 0 {
+                extern "C" fn on_alarm(_: libc::c_int) {}
+                // SAFETY: a handler that does nothing, installed without
+                // SA_RESTART, and a one-shot interval timer.
+                unsafe {
+                    let mut sa: libc::sigaction = std::mem::zeroed();
+                    sa.sa_sigaction = on_alarm as extern "C" fn(libc::c_int) as usize;
+                    libc::sigemptyset(&mut sa.sa_mask);
+                    libc::sigaction(libc::SIGALRM, &sa, std::ptr::null_mut());
+                    let timer = libc::itimerval {
+                        it_interval: libc::timeval {
+                            tv_sec: 0,
+                            tv_usec: 0,
+                        },
+                        it_value: libc::timeval {
+                            tv_sec: (index / 1000) as libc::time_t,
+                            tv_usec: ((index % 1000) * 1000) as libc::suseconds_t,
+                        },
+                    };
+                    libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut());
+                }
+            }
+            let t = std::time::Instant::now();
+            let r = lock(libc::F_SETLK, libc::F_WRLCK as _);
+            let took = t.elapsed();
+            match r {
+                Ok(()) => {
+                    say(&format!("granted after {took:?}"));
+                    0
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {
+                    say(&format!("EINTR after {took:?}"));
+                    4
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    say(&format!("EAGAIN after {took:?}"));
+                    5
+                }
+                Err(e) => {
+                    say(&format!("lock: {e} after {took:?}"));
+                    1
+                }
+            }
         }
         "waiter" => match lock(libc::F_SETLKW, libc::F_WRLCK as _) {
             Ok(()) => {
@@ -1250,5 +1302,287 @@ pub fn transport_lock_wait_budget(_seed: u64) -> Result<()> {
         Ok(())
     })();
     let _ = c.unmount();
+    result
+}
+
+/// Plan 43 F-b on the ring, on a **real kernel**: lock requests inside a
+/// failover's grace, and the queue's lock-wait budget they are counted
+/// against. Three nodes on the ring at queue depth 4 (budget: three lock
+/// waits per CPU's queue, one entry always left for the other requests); a
+/// child process on the contender's node holds a lock, the holder is
+/// killed, and inside the successor's lock grace three processes pinned to
+/// one CPU of the contender's node ask for three free files: two block in
+/// `F_SETLKW`, one is a non-blocking `F_SETLK`. All three take the budget's
+/// three waits, wait for the grace (the view's `lock-wait` pool and the
+/// successor's grace-end timer serve them) and are granted at its end;
+/// where c9bee29 answered the non-blocking one `EAGAIN` and, with the queue
+/// short, a `SETLKW` `ENOLCK`. While they wait, the queue's last entry
+/// serves everything else of that CPU: an `open` from the waiters' own CPU
+/// and from another is answered within seconds, none of the three being
+/// refused (`lock_wait_downgrades`, `grace_wait_refused_ring` 0).
+pub fn transport_lock_grace(_seed: u64) -> Result<()> {
+    use super::m14::{graced_failover, probe};
+    const NAME: &str = "transport-lock-grace";
+    let mut g = graced_failover(
+        NAME,
+        &[
+            ("CONSTELLATION_FUSE_TRANSPORT", "auto"),
+            ("CONSTELLATION_FUSE_URING_QUEUE_DEPTH", "4"),
+        ],
+        &["grace-0", "grace-1", "grace-2"],
+    )?;
+    let result = (|| -> Result<()> {
+        let c = &g.clients[g.contender];
+        let mount = fuse_mount(c)?;
+        ensure!(
+            mount["transport"].as_str().is_some_and(is_ring),
+            "the contender's cluster-lock mount must be on the ring here: {mount}"
+        );
+        ensure!(
+            mount["uring_queue_depth"] == 4,
+            "expected queue depth 4: {mount}"
+        );
+        let cpus = constellation_platform::native()
+            .process
+            .allowed_cpus()
+            .map_err(|e| anyhow::anyhow!("sched_getaffinity: {e}"))?;
+        ensure!(cpus.len() >= 2, "two CPUs are needed: {cpus:?}");
+        let (cpu, other) = (cpus[cpus.len() - 1].to_string(), cpus[0].to_string());
+        let within = Duration::from_secs(90);
+        // Read `f` from both CPUs first. The first strict read after the
+        // holder's kill waits for the new owner's session position (2.5 s,
+        // and past 5 s on a loaded host, answered from the local replica,
+        // counted): that is the failover's cost, not the lock waits', and
+        // it must not fail the check below that the waits hold no entry.
+        // (Excluding a counted session wait from the check instead would
+        // mean reading the node's log.) The waits start with most of the
+        // grace left.
+        for on in [&cpu, &other] {
+            let st = std::process::Command::new("timeout")
+                .arg("60")
+                .arg("taskset")
+                .arg("-c")
+                .arg(on)
+                .arg("cat")
+                .arg(c.mnt.join("f"))
+                .stdout(std::process::Stdio::null())
+                .status()?;
+            ensure!(st.success(), "warming f from CPU {on}: {st}");
+        }
+        let roles = ["waiter", "waiter", "nonblocking"];
+        let waiters: Vec<_> = roles
+            .iter()
+            .enumerate()
+            .map(|(i, role)| {
+                // (A non-blocking probe's index is a `SIGALRM` after that
+                // many ms: none here.)
+                probe(
+                    role,
+                    &c.mnt.join(format!("grace-{i}")),
+                    if *role == "waiter" { i as u64 } else { 0 },
+                    Some(&cpu),
+                    within,
+                )
+            })
+            .collect::<Result<_>>()?;
+        std::thread::sleep(Duration::from_millis(500));
+        // Every other request is served meanwhile, from the waiters' CPU
+        // (its queue keeps an entry) and from another.
+        let mut opens = Vec::new();
+        for on in [&cpu, &other] {
+            let t = std::time::Instant::now();
+            let st = std::process::Command::new("taskset")
+                .arg("-c")
+                .arg(on)
+                .arg("cat")
+                .arg(c.mnt.join("f"))
+                .stdout(std::process::Stdio::null())
+                .status()?;
+            ensure!(st.success(), "reading f from CPU {on} failed");
+            ensure!(
+                t.elapsed() < Duration::from_secs(5),
+                "an open from CPU {on} took {:?} while the lock requests waited: they hold \
+                 what the others need",
+                t.elapsed()
+            );
+            opens.push(t.elapsed());
+        }
+        let done: Vec<_> = waiters
+            .into_iter()
+            .map(|w| w.join().expect("probe thread"))
+            .collect::<Result<_>>()?;
+        for (i, p) in done.iter().enumerate() {
+            eprintln!(
+                "    {NAME}: {} {i}: {} (exit {}) after {:?}",
+                roles[i], p.said, p.code, p.took
+            );
+        }
+        ensure!(
+            done.iter().all(|p| p.code == 0),
+            "every lock request in the grace must be granted (none answered ENOLCK or EAGAIN): \
+             {:?}",
+            done.iter().map(|p| p.code).collect::<Vec<_>>()
+        );
+        let mount = fuse_mount(c)?;
+        ensure!(
+            mount["lock_wait_downgrades"].as_u64().unwrap_or(0) == 0,
+            "no request may have been refused the queue's budget: {mount}"
+        );
+        let status = c.control_status()?;
+        ensure!(
+            status["locks"]["grace_wait_refused_ring"].as_u64() == Some(0)
+                && status["locks"]["grace_wait_refused_pool"].as_u64() == Some(0)
+                && status["locks"]["grace_wait_gave_up"].as_u64() == Some(0),
+            "no wait may have been refused or given up: {}",
+            status["locks"]
+        );
+        eprintln!(
+            "    {NAME}: opens from the waiters' CPU {:?} and another CPU {:?}; grace_waits {}",
+            opens[0], opens[1], status["locks"]["grace_waits"]
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        g.keep_logs(NAME);
+    }
+    g.finish();
+    result
+}
+
+/// Plan 43 F-b (review F2) on a **real kernel**: the waits of non-blocking
+/// `F_SETLK`s inside a failover's grace hold their ring entries, and a
+/// queue lends only `depth - 1` of them to waits. A graced failover on the
+/// ring at queue depth `DEPTH` (2 by default,
+/// `CONSTELLATION_HARNESS_QUEUE_DEPTH`), and `DEPTH` non-blocking
+/// `F_SETLK`s on free files pinned to one CPU of the contender's node,
+/// started inside the grace: `DEPTH - 1` wait and are granted at its end,
+/// the last is refused at once, `EAGAIN` as before F-b (counted:
+/// `grace_wait_refused_ring`); and a `cat` (open + read) of another file
+/// from that CPU, made once the requests' first attempts are over (6 s),
+/// is answered within seconds, not at the grace's end (every entry of the
+/// queue held it for the whole grace: 9.95 s measured, at depths 2 and 4).
+/// (`CONSTELLATION_HARNESS_QUEUE_SETTLE_S` shortens the 6 s: a read inside
+/// the first attempts fails the scenario, which is how its failure path is
+/// exercised.)
+pub fn transport_lock_grace_queue(_seed: u64) -> Result<()> {
+    use super::m14::{graced_failover, probe};
+    const NAME: &str = "transport-lock-grace-queue";
+    let depth: u64 = std::env::var("CONSTELLATION_HARNESS_QUEUE_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    ensure!(depth >= 2, "a queue of one entry lends none to a wait");
+    let files: Vec<String> = (0..depth).map(|i| format!("nb-{i}")).collect();
+    let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+    let depth_s = depth.to_string();
+    let mut g = graced_failover(
+        NAME,
+        &[
+            ("CONSTELLATION_FUSE_TRANSPORT", "auto"),
+            ("CONSTELLATION_FUSE_URING_QUEUE_DEPTH", depth_s.as_str()),
+        ],
+        &refs,
+    )?;
+    let result = (|| -> Result<()> {
+        let c = &g.clients[g.contender];
+        let mount = fuse_mount(c)?;
+        ensure!(
+            mount["transport"].as_str().is_some_and(is_ring),
+            "the contender's cluster-lock mount must be on the ring here: {mount}"
+        );
+        ensure!(
+            mount["uring_queue_depth"] == depth,
+            "expected queue depth {depth}: {mount}"
+        );
+        let cpus = constellation_platform::native()
+            .process
+            .allowed_cpus()
+            .map_err(|e| anyhow::anyhow!("sched_getaffinity: {e}"))?;
+        ensure!(cpus.len() >= 2, "two CPUs are needed: {cpus:?}");
+        let (cpu, other) = (cpus[cpus.len() - 1].to_string(), cpus[0].to_string());
+        let within = Duration::from_secs(90);
+        let probes: Vec<_> = (0..depth)
+            .map(|i| {
+                // (No `SIGALRM`: index 0.)
+                probe(
+                    "nonblocking",
+                    &c.mnt.join(format!("nb-{i}")),
+                    0,
+                    Some(&cpu),
+                    within,
+                )
+            })
+            .collect::<Result<_>>()?;
+        // Past the requests' first attempts: each asks the new owner on its
+        // offload thread and holds its entry meanwhile, 4.5 s while the
+        // owner is found (as before F-b: a follow-up of the review), which
+        // is not what this checks; the waits are what remains.
+        let settle: u64 = std::env::var("CONSTELLATION_HARNESS_QUEUE_SETTLE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
+        std::thread::sleep(Duration::from_secs(settle));
+        let timed = |on: &str| -> Result<Duration> {
+            let t = std::time::Instant::now();
+            let st = std::process::Command::new("timeout")
+                .arg("60")
+                .arg("taskset")
+                .arg("-c")
+                .arg(on)
+                .arg("cat")
+                .arg(c.mnt.join("f"))
+                .stdout(std::process::Stdio::null())
+                .status()?;
+            ensure!(st.success(), "reading f from CPU {on}: {st}");
+            Ok(t.elapsed())
+        };
+        // (The first read after a failover is a strict read that waits for
+        // the new owner: 2.5 s, from whichever CPU it comes; the second one
+        // shows what the queue itself costs.)
+        let elsewhere = timed(&other)?;
+        let same = timed(&cpu)?;
+        eprintln!(
+            "    {NAME}: cat from another CPU {elsewhere:?}, then from the waiters' CPU {same:?}"
+        );
+        ensure!(
+            same < Duration::from_secs(5),
+            "an open from the waiters' CPU took {same:?}: the lock waits hold every entry of \
+             its queue"
+        );
+        let done: Vec<_> = probes
+            .into_iter()
+            .map(|w| w.join().expect("probe thread"))
+            .collect::<Result<_>>()?;
+        for (i, p) in done.iter().enumerate() {
+            eprintln!(
+                "    {NAME}: probe {i}: {} (exit {}) after {:?}",
+                p.said, p.code, p.took
+            );
+        }
+        let granted = done.iter().filter(|p| p.code == 0).count() as u64;
+        ensure!(
+            granted == depth - 1,
+            "{} of {depth} probes granted, expected {}: {:?}",
+            granted,
+            depth - 1,
+            done.iter().map(|p| p.code).collect::<Vec<_>>()
+        );
+        let status = c.control_status()?;
+        ensure!(
+            status["locks"]["grace_wait_refused_ring"].as_u64() == Some(1),
+            "the refused wait must be counted: {}",
+            status["locks"]
+        );
+        ensure!(
+            status["locks"]["grace_wait_gave_up"].as_u64() == Some(0),
+            "no wait may have given up: {}",
+            status["locks"]
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        g.keep_logs(NAME);
+    }
+    g.finish();
     result
 }

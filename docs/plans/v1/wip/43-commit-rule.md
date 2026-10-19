@@ -2356,13 +2356,28 @@ successor whose clock is ahead got no quarantine").
   waits) and interruptible (a signal ends it with `EINTR`) on cluster-lock
   mounts. A frontend that cannot defer waits inline, as its blocking
   requests do.
-  *The ring.* A `FUSE_SETLKW` past the queue's `depth − 1` waiters is
-  served as a non-blocking one: in a grace it now waits (deferred) and is
-  granted rather than answered `ENOLCK`. It holds its entry meanwhile,
-  which is not the deadlock the budget exists for (a waiter on a holder
-  whose unlock needs the entry): a grace ends by time, or by other nodes'
-  progress, whatever this queue does. A contended request past the
-  budget stays `ENOLCK` (plan 38 Z2c's contract).
+  *The ring.* A waiting request holds its ring entry until it is
+  answered, and while every entry of a queue is held the kernel holds back
+  every further request of that CPU. So a wait is counted against the
+  queue's lock-wait budget (`depth − 1` entries per queue, one budget
+  with `FUSE_SETLKW`'s: the frontend is asked when the view decides to
+  wait, `Responder::begin_wait`, over a ring `ReplyEmpty::hold_for_wait`
+  in the vendored fuser), so that one entry stays free; with none to give,
+  the request is answered at once as before: `EAGAIN` for a non-blocking
+  request, `ENOLCK` for a `FUSE_SETLKW` served as non-blocking past the
+  budget (plan 38 Z2c's contract), counted
+  (`grace_wait_refused_ring`, the ring's `lock_wait_downgrades`; the
+  campaign fails on them). (The first version let these waits hold
+  entries outside the budget: two waiters at depth 2 or 4 stalled every
+  request of their CPU for the whole grace, 9.95 s measured, found by the
+  review.) A request's first attempt, which asks the new owner on its
+  offload thread and holds its entry meanwhile (4.5 s while the owner is
+  found), is as before F-b: a follow-up is to hand it to the wait pool
+  after a short inline budget. The same attempts are why `EINTR` is
+  observed between attempts (within 100 ms) and not during one: the core's
+  answer is awaited with a blocking receive. Follow-up: await it in
+  slices, looking at the cancellation, so a signal ends a request against
+  an unreachable owner at once instead of after its round trip.
   *The grace's end.* A timer at each grace's end serves the parked
   waiters (`lock_reserve_all`); today a blocking waiter is served only
   at its next re-attach, up to `recall_hold_ms` plus a retry later.
@@ -2376,6 +2391,24 @@ successor whose clock is ahead got no quarantine").
   (`transport-lock-grace`: a ring cluster-lock mount at queue depth 2,
   three blocking `flock`s on free files across a seal: `ENOLCK` on the
   parent, granted after).
+  *Status (2026-10-18): (a) and (b) landed; the review of 2026-10-19
+  changed the ring part, a known conflict behind the tenure floor, the
+  threads (a bounded pool) and the adapter's registration (when the
+  request waits)* (PROGRESS "Fix: lock requests inside a lock grace wait
+  for it"): the owner answers `Waiting { retry_ms,
+  grace: true }`, the requester `LockAnswer::Wait`, the engine's
+  `lock-wait` pool retries up to `lock_grace_wait_max_ms` (computed from
+  the core's configuration; no knob; `grace_wait_gave_up` counts the
+  `EAGAIN` past it and the campaign's errno judge fails on one); the FUSE
+  adapter registers a request that has to wait as deferred and
+  interruptible (nothing for one answered at once); `Timer::LockGraceEnd`
+  serves parked waiters at the grace's end. Measured on the landed tree
+  (`s3-cut-holder-failover-with-locks` at the 20 s lease, two runs
+  each): 75 of 108 non-blocking attempts `EAGAIN` before (7ef243f), 0 of 34
+  after (one request waited 25.7 s, the whole grace; F-a shortens it).
+  `transport-lock-grace`, `transport-lock-grace-queue` (depth 2 and 4)
+  and `transport-lock-wait-budget` ran on a ring host, on a real kernel.
+  (c), the stale owner's `Busy`, is the second commit.
 
 - **F-c — an application whose lock grant lapsed during a root failover
   gets `EIO`.** In `s3-cut-holder-failover-with-locks` the locker's grant
@@ -2551,7 +2584,7 @@ not loosen the bar.
   | G2 | C2 | another node's forward to a lone root (or lone delegate) waits for the archive | + one S3 conditional PUT (28–190 ms by distance), WAN topologies only | Q2 |
   | G3 | C4 | a peer's first lock under a backed root waits for its `LockGrant`'s commit | + one LAN round trip (≤ +2 ms on loopback); the cached re-lock free | Q6 |
   | G4 | C1 (if Q1 strict) | a claim (or a generation end) waits while no member of the old group answers | unbounded until a member answers or the operator abandons; only when the whole group is cut off | Q1 |
-  | G5 | C7-H2 | a fast successor always waits the full quarantine bound | ≤ +14.5 s on acknowledgements, ≤ +29.5 s on new lock grants, after strict reads or locks: for a takeover in the predecessor's last seconds, **and** for a takeover after the lease ran out of an S3-cut holder still alive on P2P (its backup seals at the expiry it reads: before C7-H2 that was a TTL takeover with no floor, now it is fast and waits the bound, on top of the ≈ one-TTL failover; applications see the lock grace as `EAGAIN` on non-blocking requests, `ENOLCK` past the ring's queue depth) | Q10a, **accepted 2026-10-18** with the full floor as landed (safety first); the follow-ups F-a, F-b and F-c (§7 C7-F) take the cost back; `leave`, unmount and the upgrade's handover right after a seal also wait out the floor before they release the lease |
+  | G5 | C7-H2 | a fast successor always waits the full quarantine bound | ≤ +14.5 s on acknowledgements, ≤ +29.5 s on new lock grants, after strict reads or locks: for a takeover in the predecessor's last seconds, **and** for a takeover after the lease ran out of an S3-cut holder still alive on P2P (its backup seals at the expiry it reads: before C7-H2 that was a TTL takeover with no floor, now it is fast and waits the bound, on top of the ≈ one-TTL failover; applications saw the lock grace as `EAGAIN` on non-blocking requests, `ENOLCK` past the ring's queue depth: F-b made both a wait) | Q10a, **accepted 2026-10-18** with the full floor as landed (safety first); the follow-ups F-a, F-b and F-c (§7 C7-F) take the cost back; `leave`, unmount and the upgrade's handover right after a seal also wait out the floor before they release the lease |
   | G6 | C7b | a cold claimant waits a full TTL from its first read of the lease | ≈ 60.1 s for a cold claim; the seal path and warm claimants unchanged | Q10c |
 - **Under host load, only latency may degrade.** The rules remove whole
   recovery paths (replays, folds, conflict copies under group tenures),

@@ -445,6 +445,9 @@ struct Inner {
     /// Which inode's [`Vfs::forget`] waits before it acts, and how long
     /// ([`MockVfs::delay_forget`]).
     forget_delay: Mutex<Option<(Ino, Duration)>>,
+    /// How long a non-blocking lock request waits before it is tried
+    /// ([`MockVfs::lock_grace`]).
+    lock_grace: Mutex<Option<Duration>>,
 }
 
 /// A recording, scriptable [`Vfs`]; see the module doc.
@@ -475,6 +478,10 @@ where
             inner.record_completion(&self.call, &result);
         }
         self.r.done(result);
+    }
+
+    fn begin_wait(&mut self) -> crate::responder::WaitStart {
+        self.r.begin_wait()
     }
 }
 
@@ -514,6 +521,7 @@ impl MockVfs {
                 handover_blockers: Mutex::new(Vec::new()),
                 forgets: Mutex::new(Vec::new()),
                 forget_delay: Mutex::new(None),
+                lock_grace: Mutex::new(None),
             }),
         }
     }
@@ -530,6 +538,14 @@ impl MockVfs {
     /// requests that came after it.
     pub fn delay_forget(&self, delay: Option<(Ino, Duration)>) {
         *self.inner.forget_delay.lock().unwrap() = delay;
+    }
+
+    /// Make a non-blocking `lock_acquire` wait `grace` first (`None`: none
+    /// does), on a thread of its own that a cancellation ends with
+    /// `Intr`: the engine's view waiting for a lock owner that cannot
+    /// grant yet.
+    pub fn lock_grace(&self, grace: Option<Duration>) {
+        *self.inner.lock_grace.lock().unwrap() = grace;
     }
 
     /// Make [`Vfs::handover_blockers`] answer `blockers`.
@@ -1371,12 +1387,47 @@ impl Vfs for MockVfs {
                 },
             );
         };
-        let r = Tap {
+        let mut r = Tap {
             r,
             inner: Arc::downgrade(&self.inner),
             call,
         };
+        let mut cancel = cancel;
         let cancelled = cancel.as_ref().is_some_and(CancelToken::is_cancelled);
+        let grace = *self.inner.lock_grace.lock().unwrap();
+        if let Some(grace) = grace.filter(|_| !sleep) {
+            // A non-blocking request an owner cannot grant yet, as the
+            // engine's view waits for one (plan 43 F-b): the frontend is
+            // told first (it may refuse: answered at once, `EAGAIN`), then
+            // a thread of its own, cancellable, waits and the request is
+            // tried.
+            match r.begin_wait() {
+                crate::responder::WaitStart::Refused => {
+                    return r.done(Err(VfsError::new(Code::Again)));
+                }
+                crate::responder::WaitStart::Held(own) => {
+                    cancel = own.or(cancel);
+                }
+            }
+            let view = view.clone();
+            let _ = std::thread::Builder::new()
+                .name("mock-lock-grace".into())
+                .spawn(move || {
+                    let end = Instant::now() + grace;
+                    while Instant::now() < end {
+                        if cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                            return r.done(Err(VfsError::new(Code::Intr)));
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    match view.lock_try(ino, lock) {
+                        Ok(reffs::LockTry::Granted) => r.done(Ok(())),
+                        Ok(reffs::LockTry::Conflict) => r.done(Err(VfsError::new(Code::Again))),
+                        Err(e) => r.done(Err(e)),
+                    }
+                });
+            return;
+        }
         match view.lock_try(ino, lock) {
             Ok(reffs::LockTry::Granted) => r.done(Ok(())),
             Ok(reffs::LockTry::Conflict) if !sleep => r.done(Err(VfsError::new(Code::Again))),

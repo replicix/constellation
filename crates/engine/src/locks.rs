@@ -58,6 +58,26 @@
 //! owner has parked (another node holds a conflicting grant) is not
 //! withdrawn: that wait still returns only once the grant comes.
 //!
+//! A non-blocking request on a lock nothing conflicts with, which its owner
+//! may not grant yet (a grace after a takeover or a restart, the tenure's
+//! floor, a barrier, a delegate's short authority; plan 43 F-b), waits
+//! instead of failing with `EAGAIN`: the core answers `Wait { retry_ms }`
+//! and the retries run on a bounded pool of `lock-wait` threads
+//! ([`ClusterLocks::lock_nb_deferred`], [`WaitPool`]: never a frontend
+//! worker, nor an offload thread of an io_uring ring, which a wait of tens
+//! of seconds would stall for every other request offloaded to it). A
+//! frontend that cannot answer from another thread waits inline. The
+//! frontend is asked first (`Responder::begin_wait`): it registers the wait
+//! for the caller's signal and, over a ring, reserves one of its queue's
+//! `depth - 1` lock-wait entries, since a waiting request **holds its ring
+//! entry** until it is answered; with none to give (or no pool thread to
+//! start) the request is answered now as before F-b, `EAGAIN`, counted
+//! (`grace_wait_refused_ring`, `grace_wait_refused_pool`). The wait ends
+//! with the grant, with `EAGAIN` when the table then shows a conflict or
+//! once [`ClusterLocks::grace_wait_max`] has passed since the request
+//! (counted: `grace_wait_gave_up`), and with `EINTR` when the frontend
+//! cancels it.
+//!
 //! Not supported: POSIX deadlock detection (`EDEADLK`) — two owners
 //! waiting on each other wait until a signal ends one wait, as they do
 //! with `flock`.
@@ -260,6 +280,28 @@ pub fn first_use_budget_ms(meta: &Meta) -> i64 {
 /// overtook it: another node wants the file).
 const TRY_ROUNDS: u32 = 4;
 
+/// How a [`ClusterLocks::set_inner`] pass ended without an error.
+enum Step {
+    /// The lock is taken.
+    Done,
+    /// The owner may not grant yet and nothing conflicts: ask again after
+    /// this long (a non-blocking request only).
+    Wait(Duration),
+}
+
+/// One attempt of a non-blocking request ([`ClusterLocks::try_lock_step`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum NbStep {
+    /// Answered: the lock is taken, or the error.
+    Done(Result<(), Code>),
+    /// Nothing conflicts but the owner may not grant yet: ask again after
+    /// this long (the request waits, see the module doc).
+    Wait(Duration),
+}
+
+/// How often a wait on an owner's grace looks at its cancellation.
+const WAIT_SLICE: Duration = Duration::from_millis(100);
+
 /// What ends a lock wait before the lock comes: the op's cancellation
 /// (`Intr`) and its deadline (`TimedOut`), both from its `OpCtx`. Checked
 /// where the wait loops, so a wait that the frontend gave up on holds
@@ -301,6 +343,67 @@ pub struct ClusterLocks {
     /// Each task's process ancestry, for the owner fence and the fencing
     /// token (see [`Self::ancestry`]).
     pub lineage: Mutex<LineageCache>,
+    /// How long a non-blocking request waits for an owner that cannot
+    /// grant yet before it fails `EAGAIN`
+    /// (`constellation_authority::Config::lock_grace_wait_max_ms`).
+    pub grace_wait_max: Duration,
+    /// The threads that wait out non-blocking requests an owner cannot
+    /// grant yet ([`Self::lock_nb_deferred`]).
+    pub waits: WaitPool,
+}
+
+/// Most threads of a [`WaitPool`]: a waiting request is a timer and a
+/// short step every so often, not a thread.
+pub const WAIT_POOL_THREADS: usize = 16;
+
+/// How long a pool thread with nothing to serve stays.
+const WAIT_POOL_IDLE: Duration = Duration::from_secs(5);
+
+/// The bounded pool of `lock-wait` threads behind
+/// [`ClusterLocks::lock_nb_deferred`].
+#[derive(Default)]
+pub struct WaitPool {
+    state: Mutex<PoolState>,
+    wake: std::sync::Condvar,
+    next_id: std::sync::atomic::AtomicU64,
+    /// Tests: starting a thread fails.
+    #[cfg(test)]
+    fail_spawn: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct PoolState {
+    tasks: Vec<WaitTask>,
+    workers: usize,
+    idle: usize,
+}
+
+impl WaitPool {
+    /// Threads running now.
+    #[cfg(test)]
+    pub fn threads(&self) -> usize {
+        self.state.lock().unwrap().workers
+    }
+
+    /// Make starting a pool thread fail (tests).
+    #[cfg(test)]
+    pub fn fail_spawn(&self, fail: bool) {
+        self.fail_spawn
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A non-blocking request waiting for an owner's grace.
+struct WaitTask {
+    id: u64,
+    ino: Ino,
+    lock: LocalLock,
+    started: std::time::Instant,
+    /// When it asks again.
+    due: std::time::Instant,
+    cancel: Option<CancelToken>,
+    op: Option<constellation_vfs::watch::Current>,
+    done: Box<dyn FnOnce(Result<(), Code>) + Send>,
 }
 
 /// A process and its ancestors, nearest first: `(pid, start time)`.
@@ -649,41 +752,331 @@ impl ClusterLocks {
     /// turn's close publication or op in doubt ([`Self::try_lock_by`]);
     /// [`close_wait`] from its first
     /// `Predecessor` when `None`.
+    ///
+    /// A non-blocking request the owner cannot grant yet waits here, on
+    /// the calling thread (a frontend that cannot answer from another
+    /// one): see [`Self::lock_nb_deferred`] for the bound.
     fn set(
         &self,
         ino: Ino,
-        mut lock: LocalLock,
+        lock: LocalLock,
         sleep: bool,
         interrupt: Interrupt<'_>,
         deadline: Option<std::time::Instant>,
     ) -> Result<(), Code> {
-        // FUSE names the locking *thread*; the owner fence (and `getlk`)
-        // need its process, named across pid reuse.
-        (lock.pid, lock.pid_start) = process_of(lock.pid);
-        // A non-blocking request never waits for the lock, so a deadline
-        // cannot time it out: it is refused (`Again`) or granted. The
-        // cancellation still ends one that is about to ask the sequencer.
-        let interrupt = if sleep {
-            interrupt
-        } else {
-            Interrupt {
-                until: None,
-                ..interrupt
+        let lock = Self::prepared(lock);
+        if sleep {
+            let mut asked = false;
+            let r = self
+                .set_inner(ino, lock, true, interrupt, deadline, &mut asked)
+                .map(|_| ());
+            return self.settled(ino, r, asked);
+        }
+        let interrupt = Self::nonblocking(interrupt);
+        let started = std::time::Instant::now();
+        let mut deadline = deadline;
+        let mut waited = false;
+        let result = loop {
+            match self.nb_step(ino, lock, interrupt, deadline) {
+                NbStep::Done(r) => break r,
+                NbStep::Wait(d) => {
+                    if !std::mem::replace(&mut waited, true) {
+                        self.meta.locks().with_stats(|s| s.grace_waits += 1);
+                    }
+                    // (The close wait of the next attempt starts afresh.)
+                    deadline = None;
+                    if let Err(code) = self.wait_out(d, started, interrupt) {
+                        break Err(code);
+                    }
+                }
             }
         };
-        let mut asked = false;
-        let r = self.set_inner(ino, lock, sleep, interrupt, deadline, &mut asked);
-        if r.is_err() && asked {
-            // A grant may have come for this request (or its answer was
-            // lost after the core installed it) that it will now never
-            // use: the grant must not wait for that first lock — recalled,
-            // it would be renewed for ever and its waiters would wait for
-            // ever.
-            if self.meta.locks().abandon_first_use(ino, now_ms()) {
-                self.idle(ino);
-            }
+        if waited {
+            self.note_grace_waited(started);
+        }
+        result
+    }
+
+    /// A request that waited for a grace is over (granted or not).
+    fn note_grace_waited(&self, started: std::time::Instant) {
+        let ms = started.elapsed().as_millis() as u64;
+        self.meta
+            .locks()
+            .with_stats(|s| s.grace_wait_ms_total += ms);
+    }
+
+    /// `FUSE` names the locking *thread*; the owner fence (and `getlk`)
+    /// need its process, named across pid reuse.
+    fn prepared(mut lock: LocalLock) -> LocalLock {
+        (lock.pid, lock.pid_start) = process_of(lock.pid);
+        lock
+    }
+
+    /// A non-blocking request never waits for the lock, so a deadline
+    /// cannot time it out: it is refused (`Again`) or granted. The
+    /// cancellation still ends one that is about to ask the sequencer.
+    fn nonblocking(interrupt: Interrupt<'_>) -> Interrupt<'_> {
+        Interrupt {
+            until: None,
+            ..interrupt
+        }
+    }
+
+    /// The end of a request: on an error after the sequencer was asked, a
+    /// grant may have come for it (or its answer was lost after the core
+    /// installed it) that it will now never use: the grant must not wait
+    /// for that first lock — recalled, it would be renewed for ever and
+    /// its waiters would wait for ever.
+    fn settled(&self, ino: Ino, r: Result<(), Code>, asked: bool) -> Result<(), Code> {
+        if r.is_err() && asked && self.meta.locks().abandon_first_use(ino, now_ms()) {
+            self.idle(ino);
         }
         r
+    }
+
+    /// One attempt of a non-blocking request for a `lock` already
+    /// [`prepared`](Self::prepared) and an `interrupt` already
+    /// [`nonblocking`](Self::nonblocking).
+    fn nb_step(
+        &self,
+        ino: Ino,
+        lock: LocalLock,
+        interrupt: Interrupt<'_>,
+        deadline: Option<std::time::Instant>,
+    ) -> NbStep {
+        let mut asked = false;
+        match self.set_inner(ino, lock, false, interrupt, deadline, &mut asked) {
+            Ok(Step::Done) => NbStep::Done(Ok(())),
+            Ok(Step::Wait(d)) => NbStep::Wait(d),
+            Err(e) => NbStep::Done(self.settled(ino, Err(e), asked)),
+        }
+    }
+
+    /// Sleep `d` (in slices, looking at the cancellation), unless the
+    /// request is past [`Self::grace_wait_max`] from `started` (its
+    /// start): then `EAGAIN`, counted.
+    fn wait_out(
+        &self,
+        d: Duration,
+        started: std::time::Instant,
+        interrupt: Interrupt<'_>,
+    ) -> Result<(), Code> {
+        let end = std::time::Instant::now() + d;
+        loop {
+            interrupt.check()?;
+            let now = std::time::Instant::now();
+            if now.duration_since(started) >= self.grace_wait_max {
+                self.meta.locks().with_stats(|s| s.grace_wait_gave_up += 1);
+                return Err(Code::Again);
+            }
+            if now >= end {
+                return Ok(());
+            }
+            std::thread::sleep((end - now).min(WAIT_SLICE));
+        }
+    }
+
+    /// One attempt of a non-blocking request, for the view to hand to
+    /// [`Self::lock_nb_deferred`] when it has to wait. As
+    /// [`Self::try_lock_by`], which waits instead.
+    pub fn try_lock_step(
+        &self,
+        ino: Ino,
+        lock: LocalLock,
+        deadline: std::time::Instant,
+        cancel: Option<&CancelToken>,
+    ) -> NbStep {
+        let interrupt = Interrupt {
+            cancel,
+            until: None,
+        };
+        self.nb_step(ino, Self::prepared(lock), interrupt, Some(deadline))
+    }
+
+    /// A non-blocking request the owner cannot grant yet (its first
+    /// attempt answered [`NbStep::Wait`] `first_wait`; `started` is when
+    /// the request began), waited out by the [`WaitPool`]: never the
+    /// calling frontend worker, never the tokio blocking pool (see
+    /// [`Self::lock`]), and above all never the offload thread of an
+    /// io_uring ring, which a wait of up to [`Self::grace_wait_max`] would
+    /// hold for every other request offloaded to it. A pool thread asks
+    /// again after each wait until the lock is taken, refused (`EAGAIN`:
+    /// the table then shows a conflict, or the bound passed, counted in
+    /// `grace_wait_gave_up`) or cancelled (`EINTR`), and answers through
+    /// `done`.
+    ///
+    /// The pool has at most [`WAIT_POOL_THREADS`] threads, however many
+    /// requests wait (a wait is a timer and a short step, not a thread).
+    /// When it cannot start even one (the process is out of threads) the
+    /// request is answered now, as it was before it could wait: `EAGAIN`,
+    /// counted (`grace_wait_refused_pool`), never `EIO`.
+    pub fn lock_nb_deferred<F>(
+        self: &Arc<Self>,
+        ino: Ino,
+        lock: LocalLock,
+        first_wait: Duration,
+        started: std::time::Instant,
+        cancel: Option<CancelToken>,
+        done: F,
+    ) where
+        F: FnOnce(Result<(), Code>) + Send + 'static,
+    {
+        let id = self
+            .waits
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let task = WaitTask {
+            id,
+            ino,
+            lock: Self::prepared(lock),
+            started,
+            due: std::time::Instant::now() + first_wait,
+            cancel,
+            // The request's watchdog entry moves with the reply: the pool
+            // thread's stages name it (`constellation_vfs::watch::current`).
+            op: constellation_vfs::watch::current(),
+            done: Box::new(done),
+        };
+        // Counted once the wait is in hand (a request the pool cannot take
+        // is counted as refused, not as having waited).
+        let counted = || self.meta.locks().with_stats(|s| s.grace_waits += 1);
+        let mut st = self.waits.state.lock().unwrap();
+        st.tasks.push(task);
+        if st.idle > 0 {
+            counted();
+            self.waits.wake.notify_one();
+            return;
+        }
+        if st.workers >= WAIT_POOL_THREADS {
+            // Every thread is at work; one of them comes to it.
+            counted();
+            return;
+        }
+        st.workers += 1;
+        drop(st);
+        let this = self.clone();
+        #[cfg(test)]
+        let fail = self
+            .waits
+            .fail_spawn
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let fail = false;
+        let spawned = if fail {
+            Err(std::io::Error::other("no thread (test)"))
+        } else {
+            std::thread::Builder::new()
+                .name("lock-wait".into())
+                .spawn(move || this.pool_worker())
+        };
+        if let Err(error) = spawned {
+            tracing::warn!(%error, ino, "could not start a lock-wait thread");
+            let mut st = self.waits.state.lock().unwrap();
+            st.workers -= 1;
+            if st.workers > 0 {
+                // The threads that run serve it, later.
+                counted();
+                return;
+            }
+            let task = st
+                .tasks
+                .iter()
+                .position(|t| t.id == id)
+                .map(|i| st.tasks.swap_remove(i));
+            drop(st);
+            if let Some(task) = task {
+                self.meta
+                    .locks()
+                    .with_stats(|s| s.grace_wait_refused_pool += 1);
+                self.note_grace_waited(task.started);
+                (task.done)(Err(Code::Again));
+            }
+        } else {
+            counted();
+        }
+    }
+
+    /// A [`WaitPool`] thread: serves the waiting requests that are due
+    /// (their wait is over), cancelled or past their bound, until none is
+    /// left for [`WAIT_POOL_IDLE`].
+    fn pool_worker(self: Arc<Self>) {
+        let mut st = self.waits.state.lock().unwrap();
+        loop {
+            let now = std::time::Instant::now();
+            let mut ready = None;
+            let mut next = None::<std::time::Instant>;
+            for (i, t) in st.tasks.iter().enumerate() {
+                if t.due <= now
+                    || t.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+                    || now.duration_since(t.started) >= self.grace_wait_max
+                {
+                    ready = Some(i);
+                    break;
+                }
+                next = Some(next.map_or(t.due, |n| n.min(t.due)));
+            }
+            if let Some(i) = ready {
+                let task = st.tasks.swap_remove(i);
+                drop(st);
+                let again = self.advance(task);
+                st = self.waits.state.lock().unwrap();
+                if let Some(task) = again {
+                    st.tasks.push(task);
+                }
+                continue;
+            }
+            // Nothing due: look again when the first is, at the latest a
+            // slice from now (the cancellations), or end when idle.
+            let idle = st.tasks.is_empty();
+            let wait = match next {
+                Some(next) => (next - now).min(WAIT_SLICE),
+                None => WAIT_POOL_IDLE,
+            };
+            st.idle += 1;
+            let (guard, timeout) = self.waits.wake.wait_timeout(st, wait).unwrap();
+            st = guard;
+            st.idle -= 1;
+            if idle && timeout.timed_out() && st.tasks.is_empty() {
+                st.workers -= 1;
+                return;
+            }
+        }
+    }
+
+    /// One step of a waiting request that is due, cancelled or past its
+    /// bound: its end (`None`, answered), or the request to wait again.
+    fn advance(&self, mut task: WaitTask) -> Option<WaitTask> {
+        if let Some(op) = &task.op {
+            op.adopt();
+        }
+        let interrupt = Interrupt {
+            cancel: task.cancel.as_ref(),
+            until: None,
+        };
+        let result = if let Err(code) = interrupt.check() {
+            Err(code)
+        } else if task.started.elapsed() >= self.grace_wait_max {
+            self.meta.locks().with_stats(|s| s.grace_wait_gave_up += 1);
+            Err(Code::Again)
+        } else {
+            constellation_vfs::watch::stage("lock grace (owner)");
+            match self.nb_step(task.ino, task.lock, interrupt, None) {
+                NbStep::Done(r) => r,
+                NbStep::Wait(d) => {
+                    task.due = std::time::Instant::now() + d;
+                    if let Some(op) = &task.op {
+                        op.release();
+                    }
+                    return Some(task);
+                }
+            }
+        };
+        self.note_grace_waited(task.started);
+        (task.done)(result);
+        if let Some(op) = &task.op {
+            op.release();
+        }
+        None
     }
 
     fn set_inner(
@@ -694,7 +1087,7 @@ impl ClusterLocks {
         interrupt: Interrupt<'_>,
         mut deadline: Option<std::time::Instant>,
         asked: &mut bool,
-    ) -> Result<(), Code> {
+    ) -> Result<Step, Code> {
         let mut rounds = 0u32;
         let mut predecessor_counted = false;
         loop {
@@ -705,7 +1098,7 @@ impl ClusterLocks {
                 self.meta.locks().with_stats(|s| s.predecessor_waits += 1);
             }
             match outcome {
-                LocalOutcome::Done => return Ok(()),
+                LocalOutcome::Done => return Ok(Step::Done),
                 LocalOutcome::Predecessor
                     if !sleep
                         && *deadline
@@ -768,6 +1161,19 @@ impl ClusterLocks {
                             // The owner parks blocking requests, so this
                             // is a race with a recall; ask again shortly.
                             std::thread::sleep(LOCAL_POLL);
+                        }
+                        LockAnswer::Wait { retry_ms } => {
+                            // Nothing conflicts, the owner may not grant
+                            // yet. Not a round that was lost to a recall.
+                            rounds -= 1;
+                            let d = Duration::from_millis(retry_ms);
+                            if !sleep {
+                                return Ok(Step::Wait(d));
+                            }
+                            // The owner parks blocking requests, so this
+                            // is a race too: wait it out.
+                            interrupt.check()?;
+                            std::thread::sleep(d);
                         }
                         LockAnswer::Unavailable => return Err(Code::NoLock),
                     }
@@ -1290,8 +1696,9 @@ pub fn outcome_wire(o: &LockOutcome) -> LockOutcomeWire {
             position_pending: position.pending.map(|p| (p.epoch, p.jseq)),
             position_streams: position.streams_wire(),
         },
-        LockOutcome::Waiting { retry_ms } => LockOutcomeWire::Waiting {
+        LockOutcome::Waiting { retry_ms, grace } => LockOutcomeWire::Waiting {
             retry_ms: *retry_ms,
+            grace: *grace,
         },
         LockOutcome::WouldBlock => LockOutcomeWire::WouldBlock,
         LockOutcome::NotOwner { owner } => LockOutcomeWire::NotOwner { owner: *owner },
@@ -1319,7 +1726,7 @@ pub fn outcome_of(w: LockOutcomeWire) -> LockOutcome {
             }
             .with_streams_wire(&position_streams),
         },
-        LockOutcomeWire::Waiting { retry_ms } => LockOutcome::Waiting { retry_ms },
+        LockOutcomeWire::Waiting { retry_ms, grace } => LockOutcome::Waiting { retry_ms, grace },
         LockOutcomeWire::WouldBlock => LockOutcome::WouldBlock,
         LockOutcomeWire::NotOwner { owner } => LockOutcome::NotOwner { owner },
         LockOutcomeWire::Busy => LockOutcome::Busy,
@@ -1485,7 +1892,14 @@ mod tests {
         };
         assert_eq!(outcome_of(outcome_wire(&granted)), granted);
         for o in [
-            LockOutcome::Waiting { retry_ms: 3 },
+            LockOutcome::Waiting {
+                retry_ms: 3,
+                grace: true,
+            },
+            LockOutcome::Waiting {
+                retry_ms: 3,
+                grace: false,
+            },
             LockOutcome::WouldBlock,
             LockOutcome::NotOwner { owner: 4 },
             LockOutcome::Busy,

@@ -26,6 +26,12 @@ struct Fenced {
 }
 
 fn fenced_fs() -> Fenced {
+    fenced_fs_waiting(std::time::Duration::from_secs(50))
+}
+
+/// [`fenced_fs`], whose non-blocking lock requests give up waiting for an
+/// owner's grace after `grace_wait_max`.
+fn fenced_fs_waiting(grace_wait_max: std::time::Duration) -> Fenced {
     let meta = Arc::new(Meta::open_in_memory().unwrap());
     let (mut fs, dir, core) = holder_fs(meta.clone(), false);
     let (tx, locks_core) = tokio::sync::mpsc::unbounded_channel();
@@ -34,6 +40,8 @@ fn fenced_fs() -> Fenced {
         tx,
         inval: None,
         lineage: Default::default(),
+        grace_wait_max,
+        waits: Default::default(),
     }));
     fs.caps.cluster_locks = true;
     Fenced {
@@ -619,6 +627,8 @@ fn a_deadline_times_out_a_blocking_lock_request_and_never_a_non_blocking_one() {
         tx,
         inval: None,
         lineage: Default::default(),
+        grace_wait_max: std::time::Duration::from_secs(50),
+        waits: Default::default(),
     });
     let lock = || constellation_meta::locks::LocalLock {
         owner: TURN_OWNER + 2,
@@ -2148,4 +2158,495 @@ fn a_grant_lapsing_between_a_copys_steps_ends_it_short() {
     drop(hook);
     assert_eq!(n, 10);
     assert_eq!(f.fs.current_attr(obj.attr.ino).unwrap().unwrap().size, cs);
+}
+
+// ---- plan 43 F-b: a non-blocking lock request waits for an owner's grace ----
+
+/// What the core's lock path answers a request, in order (the last one
+/// again for any further request).
+#[derive(Clone, Copy)]
+enum Scripted {
+    /// "Nothing conflicts, ask again in this many ms."
+    Wait(u64),
+    WouldBlock,
+    /// Installs a grant on the inode, then grants.
+    Grant,
+}
+
+/// A stand-in for the core: answers each `SyncRequest::Lock` from
+/// `script`, noting whether the request was `blocking`.
+fn script_core(
+    f: &mut Fenced,
+    ino: Ino,
+    script: Vec<Scripted>,
+) -> Arc<std::sync::Mutex<Vec<bool>>> {
+    let (_dead, closed) = tokio::sync::mpsc::unbounded_channel();
+    let mut rx = std::mem::replace(&mut f._locks_core, closed);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let meta = f.meta.clone();
+    std::thread::spawn(move || {
+        let mut n = 0;
+        while let Some(req) = rx.blocking_recv() {
+            let SyncRequest::Lock {
+                blocking, reply, ..
+            } = req
+            else {
+                continue;
+            };
+            log.lock().unwrap().push(blocking);
+            let step = script[n.min(script.len() - 1)];
+            n += 1;
+            let answer = match step {
+                Scripted::Wait(retry_ms) => constellation_authority::LockAnswer::Wait { retry_ms },
+                Scripted::WouldBlock => constellation_authority::LockAnswer::WouldBlock,
+                Scripted::Grant => {
+                    let now = now_unix_ms();
+                    meta.locks().install_held(
+                        ino,
+                        HeldGrant {
+                            id: GrantId { node: 9, seq: 1 },
+                            mode: LockMode::Exclusive,
+                            until_ms: now + 60_000,
+                            renew_at_ms: now + 30_000,
+                            owner: 9,
+                            recalled: false,
+                            position: constellation_meta::Position::ZERO,
+                            renewing: None,
+                            releasing: false,
+                            first_use: false,
+                            idle_since_ms: None,
+                            installed_ms: now,
+                        },
+                    );
+                    constellation_authority::LockAnswer::Granted {
+                        position: constellation_meta::Position::ZERO,
+                    }
+                }
+            };
+            let _ = reply.send(answer);
+        }
+    });
+    seen
+}
+
+/// Reports who answered the op, and when.
+struct Reports(std::sync::mpsc::Sender<(Result<(), Code>, Option<String>, std::time::Instant)>);
+
+impl constellation_vfs::Responder<()> for Reports {
+    fn done(self, result: VfsResult<()>) {
+        let _ = self.0.send((
+            result.map_err(|e| e.code()),
+            std::thread::current().name().map(String::from),
+            std::time::Instant::now(),
+        ));
+    }
+}
+
+type Answer = (Result<(), Code>, Option<String>, std::time::Instant);
+
+/// [`Reports`] of a frontend that cannot hold one more waiting request
+/// (`Responder::begin_wait` refuses: a ring queue's lock-wait budget is
+/// spent).
+struct RefusesToWait(Reports);
+
+impl constellation_vfs::Responder<()> for RefusesToWait {
+    fn done(self, result: VfsResult<()>) {
+        self.0.done(result);
+    }
+
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        constellation_vfs::WaitStart::Refused
+    }
+}
+
+/// [`Reports`] of a frontend that registers the wait for its caller's
+/// signal at `begin_wait` (a lazy registration), by this token.
+struct RegistersAtWait(
+    Reports,
+    constellation_vfs::CancelToken,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+impl constellation_vfs::Responder<()> for RegistersAtWait {
+    fn done(self, result: VfsResult<()>) {
+        self.0.done(result);
+    }
+
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        constellation_vfs::WaitStart::Held(Some(self.1.clone()))
+    }
+}
+
+impl Fenced {
+    /// A non-blocking exclusive lock request on `ino`, asked of the view
+    /// like a frontend does; the answer comes through the returned
+    /// channel. `cancel`: the op's cancellation.
+    fn lock_nb(
+        &self,
+        ino: Ino,
+        cancel: Option<&constellation_vfs::CancelToken>,
+    ) -> std::sync::mpsc::Receiver<Answer> {
+        self.lock_nb_with(ino, Fh(ino), cancel, Box::new(Reports))
+    }
+
+    /// [`Self::lock_nb`] from the description `fh`, with the responder
+    /// `make` builds around the reporter.
+    fn lock_nb_with<R: constellation_vfs::Responder<()>>(
+        &self,
+        ino: Ino,
+        fh: Fh,
+        cancel: Option<&constellation_vfs::CancelToken>,
+        make: Box<dyn FnOnce(std::sync::mpsc::Sender<Answer>) -> R>,
+    ) -> std::sync::mpsc::Receiver<Answer> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller = Caller::new(0, 0, Some(std::process::id()));
+        let mut cx = OpCtx::new(OpKind::LockAcquire, &caller);
+        if let Some(cancel) = cancel {
+            cx = cx.with_cancel(cancel);
+        }
+        self.fs.lock_acquire(
+            &cx,
+            ino,
+            fh,
+            LockSpec {
+                owner: LockOwner(TURN_OWNER + 7),
+                range: LockRange {
+                    start: 0,
+                    end: u64::MAX,
+                },
+                kind: LockKind::Write,
+                pid: std::process::id(),
+            },
+            false,
+            make(tx),
+        );
+        rx
+    }
+}
+
+const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The core answers a non-blocking request "nothing conflicts, ask again"
+/// (a grace): the call returns at once, without an answer, and the waiting
+/// is done by a `lock-wait` pool thread, which asks again until it is
+/// granted. Neither the calling worker nor (over a ring) an offload thread
+/// is held for the grace: the pool thread is. On c9bee29 the core answered
+/// `WouldBlock`, the view `EAGAIN` at once.
+#[test]
+fn a_nonblocking_lock_in_a_grace_does_not_hold_the_calling_thread() {
+    let mut f = fenced_fs();
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "graced").unwrap();
+    let ino = file.attr.ino;
+    let seen = script_core(
+        &mut f,
+        ino,
+        vec![Scripted::Wait(200), Scripted::Wait(200), Scripted::Grant],
+    );
+    let started = std::time::Instant::now();
+    let rx = f.lock_nb(ino, None);
+    let returned = started.elapsed();
+    assert!(
+        returned < std::time::Duration::from_millis(150),
+        "the calling thread waited {returned:?}"
+    );
+    assert!(rx.try_recv().is_err(), "no answer yet");
+    let (result, thread, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Ok(()));
+    assert_eq!(thread.as_deref(), Some("lock-wait"));
+    assert!(
+        at.duration_since(started) >= std::time::Duration::from_millis(400),
+        "waited the two intervals it was told: {:?}",
+        at.duration_since(started)
+    );
+    assert_eq!(*seen.lock().unwrap(), vec![false, false, false]);
+    let stats = f.meta.locks().stats();
+    assert_eq!(stats.grace_waits, 1);
+    assert!(stats.grace_wait_ms_total >= 400, "{stats:?}");
+    assert_eq!(stats.grace_wait_gave_up, 0);
+}
+
+/// Waiting for a grace spends no attempt: more answers than the rounds a
+/// request that keeps losing to recalls gets (`TRY_ROUNDS`) still end in
+/// the grant.
+#[test]
+fn waiting_for_a_grace_is_no_lost_round() {
+    let mut f = fenced_fs();
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "many").unwrap();
+    let ino = file.attr.ino;
+    let mut script = vec![Scripted::Wait(10); 9];
+    script.push(Scripted::Grant);
+    script_core(&mut f, ino, script);
+    let rx = f.lock_nb(ino, None);
+    let (result, _, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Ok(()));
+}
+
+/// A signal ends the wait: the op's cancellation answers `EINTR`, within
+/// a slice, holding nothing.
+#[test]
+fn a_cancellation_ends_a_graced_wait_with_eintr() {
+    let mut f = fenced_fs();
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "signalled").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::Wait(10_000)]);
+    let cancel = constellation_vfs::CancelToken::new();
+    let rx = f.lock_nb(ino, Some(&cancel));
+    assert!(rx.recv_timeout(SECOND / 5).is_err(), "waiting");
+    let cancelled = std::time::Instant::now();
+    cancel.cancel();
+    let (result, thread, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Err(Code::Intr));
+    assert_eq!(thread.as_deref(), Some("lock-wait"));
+    assert!(
+        at.duration_since(cancelled) < SECOND / 2,
+        "ended within a slice: {:?}",
+        at.duration_since(cancelled)
+    );
+    assert!(f.meta.locks().local_locks(ino).is_empty());
+    assert_eq!(f.meta.locks().stats().grace_wait_gave_up, 0);
+}
+
+/// Past the bound the request gives up with `EAGAIN`, counted.
+#[test]
+fn a_graced_wait_past_its_bound_gives_up_with_eagain_and_is_counted() {
+    let mut f = fenced_fs_waiting(SECOND / 3);
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "too_long").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::Wait(50)]);
+    let started = std::time::Instant::now();
+    let rx = f.lock_nb(ino, None);
+    let (result, thread, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Err(Code::Again));
+    assert_eq!(thread.as_deref(), Some("lock-wait"));
+    let took = at.duration_since(started);
+    assert!(took >= SECOND / 3 && took < 2 * SECOND, "{took:?}");
+    let stats = f.meta.locks().stats();
+    assert_eq!(stats.grace_waits, 1);
+    assert_eq!(stats.grace_wait_gave_up, 1);
+}
+
+/// A known conflict is no wait: `EAGAIN` at once, on the calling thread.
+#[test]
+fn a_known_conflict_still_refuses_a_nonblocking_lock_at_once() {
+    let mut f = fenced_fs();
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "held").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::WouldBlock]);
+    let rx = f.lock_nb(ino, None);
+    let (result, thread, _) = rx.try_recv().expect("answered before the call returned");
+    assert_eq!(result, Err(Code::Again));
+    assert_ne!(thread.as_deref(), Some("lock-wait"));
+    assert_eq!(f.meta.locks().stats().grace_waits, 0);
+}
+
+/// A frontend that cannot answer from another thread waits inline, as it
+/// does for a blocking lock.
+#[test]
+fn a_frontend_that_cannot_defer_waits_in_the_call() {
+    let mut f = fenced_fs();
+    f.fs.caps.deferrable = constellation_vfs::OpKindSet::EMPTY;
+    let (file, _) = f.create(&Caller::root(), ROOT_INO, "inline").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::Wait(100), Scripted::Grant]);
+    let started = std::time::Instant::now();
+    let rx = f.lock_nb(ino, None);
+    let (result, thread, _) = rx.try_recv().expect("answered before the call returned");
+    assert_eq!(result, Ok(()));
+    assert_ne!(thread.as_deref(), Some("lock-wait"));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+    assert_eq!(f.meta.locks().stats().grace_waits, 1);
+}
+
+/// Plan 43 F-b review F2: the frontend is told when a request is about to
+/// wait (`Responder::begin_wait`), and the wait begins only if it may hold
+/// what it holds (over a ring, one of its queue's `depth - 1` entries that
+/// lock waits may take, so one stays free for every other request of that
+/// CPU). When it may not, the request is answered now, as it was before it
+/// could wait: `EAGAIN`, on the calling thread, counted apart
+/// (`grace_wait_refused_ring`), and the core is asked once.
+#[test]
+fn a_wait_the_frontend_cannot_hold_is_answered_at_once() {
+    let mut f = fenced_fs();
+    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "refused").unwrap();
+    let ino = file.attr.ino;
+    let seen = script_core(&mut f, ino, vec![Scripted::Wait(100), Scripted::Grant]);
+    let rx = f.lock_nb_with(
+        ino,
+        opened.fh,
+        None,
+        Box::new(|tx| RefusesToWait(Reports(tx))),
+    );
+    let (result, thread, _) = rx.try_recv().expect("answered before the call returned");
+    assert_eq!(result, Err(Code::Again));
+    assert_ne!(thread.as_deref(), Some("lock-wait"));
+    assert_eq!(seen.lock().unwrap().len(), 1, "asked once, never again");
+    let stats = f.meta.locks().stats();
+    assert_eq!(stats.grace_wait_refused_ring, 1);
+    assert_eq!(stats.grace_waits, 0, "it never waited");
+    assert!(f.meta.locks().local_locks(ino).is_empty());
+}
+
+/// The wait is registered for the caller's signal when it begins, by the
+/// token `begin_wait` returns, not by the request's context (a non-blocking
+/// request carries none, so an answer at once registers nothing): the token
+/// ends the wait `EINTR`, and a request answered at once never asks.
+#[test]
+fn a_wait_registers_for_signals_only_when_it_begins() {
+    let mut f = fenced_fs();
+    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "late").unwrap();
+    let ino = file.attr.ino;
+    script_core(&mut f, ino, vec![Scripted::Wait(10_000)]);
+    let token = constellation_vfs::CancelToken::new();
+    let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let r = registered.clone();
+    let t = token.clone();
+    let rx = f.lock_nb_with(
+        ino,
+        opened.fh,
+        None,
+        Box::new(move |tx| RegistersAtWait(Reports(tx), t, r)),
+    );
+    assert_eq!(registered.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(rx.recv_timeout(SECOND / 5).is_err(), "waiting");
+    token.cancel();
+    let (result, thread, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Err(Code::Intr));
+    assert_eq!(thread.as_deref(), Some("lock-wait"));
+    // Answered at once: never registered.
+    let g = fenced_fs();
+    let (file, opened) = g.create(&Caller::root(), ROOT_INO, "at_once").unwrap();
+    let mut g = g;
+    script_core(&mut g, file.attr.ino, vec![Scripted::WouldBlock]);
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = n.clone();
+    let rx = g.lock_nb_with(
+        file.attr.ino,
+        opened.fh,
+        None,
+        Box::new(move |tx| RegistersAtWait(Reports(tx), constellation_vfs::CancelToken::new(), c)),
+    );
+    assert_eq!(rx.try_recv().expect("answered").0, Err(Code::Again));
+    assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Plan 43 F-b review F8: the waits of any number of requests are served
+/// by a bounded pool of `lock-wait` threads, not a thread each. Forty
+/// requests wait, ask again twice, and are all answered (here `EAGAIN`, a
+/// conflict having appeared); the pool never had more than
+/// `WAIT_POOL_THREADS` threads.
+#[test]
+fn many_waits_are_served_by_a_bounded_pool() {
+    let mut f = fenced_fs();
+    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "crowd").unwrap();
+    let ino = file.attr.ino;
+    let mut script = vec![Scripted::Wait(100); 80];
+    script.push(Scripted::WouldBlock);
+    script_core(&mut f, ino, script);
+    let rxs: Vec<_> = (0..40)
+        .map(|_| f.lock_nb_with(ino, opened.fh, None, Box::new(Reports)))
+        .collect();
+    let locks = f.fs.cluster_locks().expect("cluster locks");
+    let workers = locks.waits.threads();
+    assert!(
+        (1..=crate::locks::WAIT_POOL_THREADS).contains(&workers),
+        "{workers} pool threads for 40 waits"
+    );
+    for rx in rxs {
+        let (result, thread, _) = rx.recv_timeout(10 * SECOND).expect("answered");
+        assert_eq!(result, Err(Code::Again));
+        assert_eq!(thread.as_deref(), Some("lock-wait"));
+    }
+    assert!(locks.waits.threads() <= crate::locks::WAIT_POOL_THREADS);
+    let stats = f.meta.locks().stats();
+    assert_eq!(stats.grace_waits, 40);
+    assert_eq!(stats.grace_wait_gave_up, 0);
+}
+
+/// A pool that cannot start a thread answers the request now, `EAGAIN` as
+/// before F-b and counted (`grace_wait_refused_pool`), never `EIO`; one
+/// that has threads queues the wait for them.
+#[test]
+fn a_pool_that_cannot_start_a_thread_answers_eagain_and_counts_it() {
+    let mut f = fenced_fs();
+    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "nothreads").unwrap();
+    let ino = file.attr.ino;
+    script_core(
+        &mut f,
+        ino,
+        vec![
+            Scripted::Wait(50),
+            Scripted::Wait(50),
+            Scripted::Wait(50),
+            Scripted::Wait(50),
+            Scripted::WouldBlock,
+        ],
+    );
+    let locks = f.fs.cluster_locks().expect("cluster locks");
+    locks.waits.fail_spawn(true);
+    let rx = f.lock_nb_with(ino, opened.fh, None, Box::new(Reports));
+    let (result, thread, _) = rx.try_recv().expect("answered before the call returned");
+    assert_eq!(result, Err(Code::Again), "not EIO");
+    assert_ne!(thread.as_deref(), Some("lock-wait"));
+    assert_eq!(f.meta.locks().stats().grace_wait_refused_pool, 1);
+    assert_eq!(
+        f.meta.locks().stats().grace_waits,
+        0,
+        "refused for want of a thread: not also counted as a wait"
+    );
+    assert_eq!(locks.waits.threads(), 0);
+    // With a thread running, the next one only queues.
+    locks.waits.fail_spawn(false);
+    let first = f.lock_nb_with(ino, opened.fh, None, Box::new(Reports));
+    locks.waits.fail_spawn(true);
+    let second = f.lock_nb_with(ino, opened.fh, None, Box::new(Reports));
+    assert!(second.try_recv().is_err(), "queued for the running thread");
+    for rx in [first, second] {
+        let (result, thread, _) = rx.recv_timeout(5 * SECOND).expect("answered");
+        assert_eq!(result, Err(Code::Again));
+        assert_eq!(thread.as_deref(), Some("lock-wait"));
+    }
+    assert_eq!(f.meta.locks().stats().grace_wait_refused_pool, 1);
+    assert_eq!(f.meta.locks().stats().grace_waits, 2, "the two that waited");
+}
+
+/// Plan 43 F-b review F8: the file is closed during the wait, and the
+/// process exits (its files closed and its request interrupted): the wait
+/// ends `EINTR`, asks the core no more, installs no local lock and keeps
+/// no grant for an owner that is gone.
+#[test]
+fn closing_the_file_during_a_graced_wait_leaves_nothing_behind() {
+    let mut f = fenced_fs();
+    let caller = Caller::new(0, 0, Some(std::process::id()));
+    let (file, opened) = f.create(&Caller::root(), ROOT_INO, "closed").unwrap();
+    let ino = file.attr.ino;
+    let seen = script_core(&mut f, ino, vec![Scripted::Wait(300), Scripted::Grant]);
+    let cancel = constellation_vfs::CancelToken::new();
+    let rx = f.lock_nb_with(ino, opened.fh, Some(&cancel), Box::new(Reports));
+    assert!(rx.recv_timeout(SECOND / 10).is_err(), "waiting");
+    Blocking::run(|r| {
+        f.fs.release(
+            &OpCtx::new(OpKind::Release, &caller),
+            ino,
+            opened.fh,
+            OpenFlags::WRITE,
+            None,
+            r,
+        )
+    })
+    .expect("the close answers while a lock waits on the file");
+    let exited = std::time::Instant::now();
+    cancel.cancel();
+    let (result, _, at) = rx.recv_timeout(5 * SECOND).expect("answered");
+    assert_eq!(result, Err(Code::Intr));
+    assert!(at.duration_since(exited) < SECOND / 2);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "never asked again: no grant to a dead owner"
+    );
+    assert!(f.meta.locks().local_locks(ino).is_empty());
+    assert!(f.meta.locks().held(ino).is_none());
 }

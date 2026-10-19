@@ -396,6 +396,20 @@ pub struct Config {
 }
 
 impl Config {
+    /// How long a non-blocking lock request may wait for an owner that
+    /// cannot grant yet (plan 43 F-b) before it gives up with `EAGAIN`:
+    /// the longest bound such an owner can have (a fast successor's
+    /// floor: the takeover window, the longest grant, the delegations'
+    /// reclaim horizon and the two margins), and the bound an op without
+    /// its sequencer has on top, for the failover that precedes it.
+    pub fn lock_grace_wait_max_ms(&self) -> u64 {
+        self.backup_takeover_ms
+            + self.read_delegation_ttl_ms.max(self.lock_ttl_ms)
+            + (self.delegation_ttl_ms + self.expiry_margin_ms)
+            + 2 * self.expiry_margin_ms
+            + self.s3_less_deadline_ms
+    }
+
     /// Production defaults (the `CONSTELLATION_*` defaults of the code the
     /// core replaces), for `node_id` at `incarnation`.
     pub fn defaults(node_id: NodeId, incarnation: u32) -> Self {
@@ -850,6 +864,12 @@ pub struct Stats {
     pub lock_grants: u64,
     pub lock_would_block: u64,
     pub lock_grace_refusals: u64,
+    /// Plan 43 F-b: non-blocking requests told to wait for a grace, and
+    /// for a tenure floor, a barrier or a delegate's authority; grace
+    /// ends that served parked waiters (`Timer::LockGraceEnd`).
+    pub lock_grace_waits: u64,
+    pub lock_not_yet_waits: u64,
+    pub lock_grace_end_serves: u64,
     pub lock_grace_periods: u64,
     pub lock_recalls_sent: u64,
     pub lock_recalls_released: u64,
@@ -1214,6 +1234,9 @@ enum Timer {
     LockGrantExpiry(constellation_meta::locks::GrantId),
     LockRenewTick,
     LockWaiterTick,
+    /// Plan 43 F-b: the earliest end of a lock grace
+    /// (`Core::lock_arm_grace_end`).
+    LockGraceEnd,
     LockRenewTimeout(OpId),
     LockTestTimeout(OpId),
     /// M14 phase 2: re-check whether `(ino, grant)`'s release may go
@@ -1265,6 +1288,7 @@ impl Timer {
             Timer::LockRenewTick => TimerKind::LockRenewTick,
             Timer::LockReleaseWait(..) => TimerKind::LockReleaseWait,
             Timer::LockWaiterTick => TimerKind::LockWaiterTick,
+            Timer::LockGraceEnd => TimerKind::LockGraceEnd,
             Timer::LockRenewTimeout(_) => TimerKind::LockRenewTimeout,
             Timer::LockTestTimeout(_) => TimerKind::LockTestTimeout,
             Timer::DelegRenew(_) => TimerKind::DelegRenew,
@@ -2236,6 +2260,7 @@ impl Core {
                 self.on_lock_flushed(now, ino, grant, true, replica, out)
             }
             Timer::LockWaiterTick => self.on_lock_waiter_tick(now, replica, out),
+            Timer::LockGraceEnd => self.on_lock_grace_end(now, replica, out),
             Timer::LockRenewTimeout(req) => self.on_lock_renew_timeout(req, replica, out),
             Timer::LockTestTimeout(req) => self.on_lock_test_timeout(req, out),
             Timer::DelegStream => self.on_deleg_stream_timer(now, replica, out),

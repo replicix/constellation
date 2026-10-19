@@ -5626,6 +5626,12 @@ struct M14Totals {
     released: u64,
     granted_recalled: u64,
     grace_refusals: u64,
+    /// Plan 43 F-b: non-blocking requests told to wait, for a grace and
+    /// for a floor, a barrier or a delegate's authority; grace ends that
+    /// served parked waiters.
+    grace_waits: u64,
+    not_yet_waits: u64,
+    grace_end_serves: u64,
     grace_periods: u64,
     idle_released: u64,
     backup_takeovers: u64,
@@ -5660,6 +5666,7 @@ impl M14Totals {
         c.local_conflicts += l.local_conflicts;
         c.granted += l.granted;
         c.would_block += l.would_block;
+        c.grace_waits += l.grace_waits;
         c.unavailable += l.unavailable;
         c.regrants += l.regrants;
         c.idle_sent += l.idle_sent;
@@ -5693,6 +5700,9 @@ impl M14Totals {
             self.released += s.lock_released;
             self.granted_recalled += s.lock_granted_recalled;
             self.grace_refusals += s.lock_grace_refusals;
+            self.grace_waits += s.lock_grace_waits;
+            self.not_yet_waits += s.lock_not_yet_waits;
+            self.grace_end_serves += s.lock_grace_end_serves;
             self.grace_periods += s.lock_grace_periods;
             self.idle_released += s.lock_idle_released;
             self.backup_takeovers += s.backup_takeovers;

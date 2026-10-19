@@ -16,8 +16,9 @@
 //! lock capabilities `--locks cluster` needs) happens here.
 //!
 //! Every op answers inline on the calling fuser worker, as it always did,
-//! except a blocking lock, which the view completes from its `lock-wait`
-//! thread, and a cold read (a chunk in no local cache), which the engine
+//! except a lock on a cluster-lock mount that may have to wait (a blocking
+//! one, or a non-blocking one the lock's owner cannot grant yet, plan 43
+//! F-b), which the view completes from its `lock-wait` thread, and a cold read (a chunk in no local cache), which the engine
 //! completes from its completion pool (`FrontendCaps::linux_fuse` declares
 //! every op deferrable; locks and cold reads defer so far — plan 31 §6.3,
 //! C7b), and an `fsync`, which the engine finishes on its `fsync` pool
@@ -37,8 +38,16 @@
 //! `SIGKILL`, the request being already in userspace — is released to
 //! die, and the data stays pending.
 //!
-//! A blocking lock (`F_SETLKW`, `F_OFD_SETLKW`, `flock` without `LOCK_NB`)
-//! registers too, under the other policy: **interruptible**. POSIX ends
+//! A lock request registers too, under the other policy: **interruptible**
+//! (on a cluster-lock mount; on other mounts the kernel keeps the locks and
+//! never asks). A blocking one (`F_SETLKW`, `F_OFD_SETLKW`, `flock` without
+//! `LOCK_NB`) waits for the lock and registers from the start; a
+//! non-blocking one answers at once unless the owner of the lock may not
+//! grant it yet (a grace after a failover), when it waits for that: it
+//! registers, and counts as a deferred reply, only when the view says it
+//! waits ([`constellation_vfs::Responder::begin_wait`], which over a ring
+//! also reserves the queue's lock-wait entry the wait holds), so the usual
+//! request, answered at once, pays for neither. POSIX ends
 //! such a wait with `EINTR` on any signal, a handled one included, and
 //! programs rely on it — an `alarm(2)` bounding a lock wait, a timer that
 //! ends a worker (stress-ng's `lockf`/`lockmix`, whose processes otherwise
@@ -331,6 +340,18 @@ impl Deferred {
         self.track_as(reply, false)
     }
 
+    /// A reply counted only from the moment its op says it waits
+    /// ([`constellation_vfs::Responder::begin_wait`]): a non-blocking lock
+    /// request that is answered at once is never counted.
+    fn track_when_waiting<R>(self: &Arc<Self>, reply: R) -> Tracked<R> {
+        Tracked {
+            reply: Some(reply),
+            deferred: self.clone(),
+            bounded: false,
+            counted: false,
+        }
+    }
+
     fn track_bounded<R>(self: &Arc<Self>, reply: R) -> Tracked<R> {
         self.track_as(reply, true)
     }
@@ -342,6 +363,7 @@ impl Deferred {
             reply: Some(reply),
             deferred: self.clone(),
             bounded,
+            counted: true,
         }
     }
 }
@@ -383,6 +405,8 @@ struct Tracked<R> {
     reply: Option<R>,
     deferred: Arc<Deferred>,
     bounded: bool,
+    /// Counted in `deferred` (from the start, or since `begin_wait`).
+    counted: bool,
 }
 
 impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for Tracked<R> {
@@ -391,15 +415,33 @@ impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for 
             reply.done(result);
         }
     }
+
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        let Some(reply) = self.reply.as_mut() else {
+            return constellation_vfs::WaitStart::Held(None);
+        };
+        let started = constellation_vfs::Responder::<T>::begin_wait(reply);
+        if !self.counted && !matches!(started, constellation_vfs::WaitStart::Refused) {
+            // Counted before the call returns on the worker, so a detach
+            // that has quiesced the workers sees the wait.
+            self.counted = true;
+            self.deferred
+                .counter(self.bounded)
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        started
+    }
 }
 
 impl<R> Drop for Tracked<R> {
     fn drop(&mut self) {
         // The reply (if `done` never ran) answers from its own drop first.
         drop(self.reply.take());
-        self.deferred
-            .counter(self.bounded)
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if self.counted {
+            self.deferred
+                .counter(self.bounded)
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -524,10 +566,18 @@ struct InterruptState {
 }
 
 impl InterruptState {
+    /// Forget the early interrupts that are too old: from the front (they
+    /// are in the order they came), so a registration pays only for what it
+    /// removes.
     fn prune_early(&mut self) {
         let now = std::time::Instant::now();
-        self.early
-            .retain(|(_, at)| now.duration_since(*at) < EARLY_INTERRUPT_KEPT);
+        while self
+            .early
+            .front()
+            .is_some_and(|(_, at)| now.duration_since(*at) >= EARLY_INTERRUPT_KEPT)
+        {
+            self.early.pop_front();
+        }
     }
 
     /// Interrupted, or over a ring, and not cancelled yet.
@@ -627,10 +677,28 @@ impl Interrupts {
         );
         if interrupted && any_signal {
             token.cancel();
-        } else {
+        } else if interrupted {
+            // A killable request whose interrupt came first: look now.
             self.watch(st);
+        } else if lossy {
+            // Over a ring the interrupt may never come: the watcher
+            // looks at the request once it is overdue. Registration costs
+            // no more than this (it used to scan every waiting request and
+            // read `/proc` for the overdue ones, on the registering
+            // thread: about a millisecond with a hundred lock waiters).
+            self.ensure_watcher(st);
         }
         token
+    }
+
+    /// Start the watcher thread if none runs.
+    fn ensure_watcher(self: &Arc<Self>, mut st: std::sync::MutexGuard<'_, InterruptState>) {
+        if st.watcher {
+            return;
+        }
+        st.watcher = true;
+        drop(st);
+        self.spawn_watcher();
     }
 
     pub(crate) fn unregister(&self, unique: u64) {
@@ -679,9 +747,14 @@ impl Interrupts {
         st.watcher |= spawn;
         drop(st);
         self.probe(checks);
-        if !spawn {
-            return;
+        if spawn {
+            self.spawn_watcher();
         }
+    }
+
+    /// The watcher thread (the caller has set `watcher`): checks every
+    /// [`FATAL_POLL`] and ends once nothing is watched.
+    fn spawn_watcher(self: &Arc<Self>) {
         let this = Arc::downgrade(self);
         let spawned = std::thread::Builder::new()
             .name("fuse-interrupts".into())
@@ -711,6 +784,26 @@ impl Interrupts {
             reply: Some(reply),
             interrupts: self.clone(),
             unique,
+            lazy: None,
+        }
+    }
+
+    /// A reply whose request is registered interruptible only once its op
+    /// says it waits ([`constellation_vfs::Responder::begin_wait`]), by the
+    /// token that call returns: a non-blocking lock request that is
+    /// answered at once registers nothing.
+    fn guard_when_waiting<R>(
+        self: &Arc<Self>,
+        unique: u64,
+        pid: u32,
+        lossy: bool,
+        reply: R,
+    ) -> Interruptible<R> {
+        Interruptible {
+            reply: Some(reply),
+            interrupts: self.clone(),
+            unique,
+            lazy: Some((pid, lossy)),
         }
     }
 }
@@ -721,20 +814,47 @@ struct Interruptible<R> {
     reply: Option<R>,
     interrupts: Arc<Interrupts>,
     unique: u64,
+    /// Not registered yet: `(caller thread, lossy)` to register with at
+    /// `begin_wait` ([`Interrupts::guard_when_waiting`]); `None` once it
+    /// is (or from the start).
+    lazy: Option<(u32, bool)>,
 }
 
 impl<T, R: constellation_vfs::Responder<T>> constellation_vfs::Responder<T> for Interruptible<R> {
     fn done(mut self, result: constellation_vfs::VfsResult<T>) {
-        self.interrupts.unregister(self.unique);
+        if self.lazy.is_none() {
+            self.interrupts.unregister(self.unique);
+        }
         if let Some(reply) = self.reply.take() {
             reply.done(result);
+        }
+    }
+
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        let Some(reply) = self.reply.as_mut() else {
+            return constellation_vfs::WaitStart::Held(None);
+        };
+        let started = constellation_vfs::Responder::<T>::begin_wait(reply);
+        let constellation_vfs::WaitStart::Held(own) = started else {
+            return started;
+        };
+        match self.lazy.take() {
+            // The request is registered from here on; an interrupt that
+            // came before is found among the early ones.
+            Some((pid, lossy)) => constellation_vfs::WaitStart::Held(Some(
+                self.interrupts
+                    .register_interruptible(self.unique, pid, lossy),
+            )),
+            None => constellation_vfs::WaitStart::Held(own),
         }
     }
 }
 
 impl<R> Drop for Interruptible<R> {
     fn drop(&mut self) {
-        self.interrupts.unregister(self.unique);
+        if self.lazy.is_none() {
+            self.interrupts.unregister(self.unique);
+        }
     }
 }
 
@@ -1707,11 +1827,16 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
     }
 
     /// Plan 30 §M14: `F_SETLK`/`F_SETLKW`/`flock` under `--locks
-    /// cluster`. Non-blocking requests are answered on this worker; the
-    /// view answers a blocking one (`sleep`) from a thread of its own, so
-    /// a contended lock never pins a FUSE worker. Interrupts are wired to
-    /// `fsync` only ([`Interrupts`]): a blocked lock wait cannot be
-    /// cancelled by a signal.
+    /// cluster`. The view answers a blocking request (`sleep`) from a
+    /// thread of its own, so a contended lock never pins a FUSE worker,
+    /// and so a non-blocking one that has to wait for its owner's grace
+    /// (plan 43 F-b). Both are tracked as deferred replies and are
+    /// interruptible ([`Interrupts`]): a signal ends the wait with
+    /// `EINTR`. A blocking request is registered and tracked from the
+    /// start; a non-blocking one when the view says it waits
+    /// (`Responder::begin_wait`: nothing for a request answered at once,
+    /// which is the usual one, and the request is refused the wait, to be
+    /// answered now, when a ring queue has no entry to lend it).
     fn setlk(
         &self,
         req: &Request,
@@ -1755,21 +1880,45 @@ impl<V: Vfs> Filesystem for FuseFs<V> {
         let op = self.obs().begin(OpKind::LockAcquire, ino.0);
         let _in = op.enter();
         let spec = lock_spec(lock_owner, start, end, kind, pid);
-        if sleep {
+        // A non-blocking request waits too, for an owner that cannot grant
+        // yet (plan 43 F-b), when the mount's locks are the cluster's:
+        // the view then answers it from its `lock-wait` thread.
+        if sleep || self.caps.cluster_locks {
+            // A blocking request waits for sure: registered interruptible
+            // and counted as a deferred reply from the start. A
+            // non-blocking one only if its lock's owner cannot grant yet
+            // (the view says so: `Responder::begin_wait`): it registers
+            // and counts then, and a request answered at once pays
+            // neither (one registration of an interrupt costs more than the
+            // whole of a cached `F_SETLK`).
             // May answer from the view's `lock-wait` thread: counted, and
             // counted as an op when that thread answers. Interruptible
             // (the module doc): a signal ends the wait with `EINTR`.
             let unique = req.unique().0;
-            let token = self
-                .interrupts
-                .register_interruptible(unique, req.pid(), self.lossy());
-            let reply = op.responder(
-                self.deferred
-                    .track(self.interrupts.guard(unique, EmptyReply(reply))),
-            );
-            let cx = op.ctx(&caller).with_cancel(&token);
-            self.vfs
-                .lock_acquire(&cx, ino.0, Fh(fh.0), spec, true, reply);
+            if sleep {
+                let token = self
+                    .interrupts
+                    .register_interruptible(unique, req.pid(), self.lossy());
+                let reply = op.responder(
+                    self.deferred
+                        .track(self.interrupts.guard(unique, EmptyReply(reply))),
+                );
+                let cx = op.ctx(&caller).with_cancel(&token);
+                self.vfs
+                    .lock_acquire(&cx, ino.0, Fh(fh.0), spec, true, reply);
+            } else {
+                let reply = op.responder(self.deferred.track_when_waiting(
+                    self.interrupts.guard_when_waiting(
+                        unique,
+                        req.pid(),
+                        self.lossy(),
+                        EmptyReply(reply),
+                    ),
+                ));
+                let cx = op.ctx(&caller);
+                self.vfs
+                    .lock_acquire(&cx, ino.0, Fh(fh.0), spec, false, reply);
+            }
         } else {
             let cx = op.ctx(&caller);
             self.vfs.lock_acquire(
@@ -1794,6 +1943,149 @@ mod tests {
     static DYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     fn probe(pid: u32) -> bool {
         pid == 66 && DYING.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Plan 43 F-b review F3: a non-blocking lock request is registered
+    /// interruptible, and counted as a deferred reply, only when its op
+    /// says it waits (`Responder::begin_wait`): answered at once, it costs
+    /// neither. A waiting one is cancelled by the interrupt, and an
+    /// interrupt that came before its registration is not lost.
+    #[test]
+    fn a_lock_request_answered_at_once_registers_and_counts_nothing() {
+        use constellation_vfs::{FnResponder, Responder, WaitStart};
+        let i = Arc::new(Interrupts::default());
+        let d = Arc::new(Deferred::default());
+        let reply = || FnResponder::<(), _>::new(|_| {});
+        let registered = |i: &Arc<Interrupts>| i.state.lock().unwrap().waiting.len();
+        let r = d.track_when_waiting(i.guard_when_waiting(7, 5, true, reply()));
+        assert_eq!((d.count(), registered(&i)), (0, 0), "nothing at the start");
+        r.done(Ok(()));
+        assert_eq!((d.count(), registered(&i)), (0, 0), "nothing after");
+        // One that waits.
+        let mut r = d.track_when_waiting(i.guard_when_waiting(8, 5, false, reply()));
+        let WaitStart::Held(Some(token)) = Responder::<()>::begin_wait(&mut r) else {
+            panic!("a wait registers its token");
+        };
+        assert_eq!((d.count(), registered(&i)), (1, 1));
+        i.interrupt(8);
+        assert!(token.is_cancelled(), "any signal ends a lock wait");
+        r.done(Ok(()));
+        assert_eq!((d.count(), registered(&i)), (0, 0));
+        // An interrupt that overtook the registration.
+        i.interrupt(9);
+        let mut r = d.track_when_waiting(i.guard_when_waiting(9, 5, false, reply()));
+        let WaitStart::Held(Some(token)) = Responder::<()>::begin_wait(&mut r) else {
+            panic!("a wait registers its token");
+        };
+        assert!(token.is_cancelled(), "the early interrupt is found");
+        drop(r);
+        assert_eq!((d.count(), registered(&i)), (0, 0), "dropped: unregistered");
+    }
+
+    /// Plan 43 F-b review F3, N1: registering a request costs the
+    /// registering thread no `/proc` probe, however many overdue ring
+    /// requests are already registered; the watcher thread looks at them.
+    /// (Before: `watch()` ran every overdue request's probe on the thread
+    /// that registered the next one, 1 ms per registration with a hundred
+    /// lock waiters on a ring.)
+    #[test]
+    fn registering_a_request_probes_nothing_on_the_registering_thread() {
+        use std::sync::Mutex;
+        static PROBERS: Mutex<Vec<std::thread::ThreadId>> = Mutex::new(Vec::new());
+        fn counting(_: u32) -> bool {
+            PROBERS.lock().unwrap().push(std::thread::current().id());
+            false
+        }
+        let i = Arc::new(Interrupts::with_probes(counting, counting));
+        let me = std::thread::current().id();
+        // A hundred overdue lossy waiters (a ring's lock waits)...
+        for u in 0..100u64 {
+            let _ = i.register_interruptible(u, 55, true);
+        }
+        std::thread::sleep(FATAL_POLL * 2 + std::time::Duration::from_millis(50));
+        let before = PROBERS.lock().unwrap().len();
+        // ...and a hundred more registrations while those are overdue.
+        for u in 100..200u64 {
+            let _ = i.register_interruptible(u, 55, true);
+        }
+        let probers = PROBERS.lock().unwrap().clone();
+        assert!(before > 0, "the watcher looks at overdue requests");
+        assert!(
+            !probers.contains(&me),
+            "registering probed /proc on the registering thread"
+        );
+    }
+
+    /// Bench (plan 43 F-b review F3; `cargo test --release -- --ignored
+    /// bench_interrupt_registration --nocapture`): the cost of one lock
+    /// request's interrupt registration (`register_interruptible` + guard
+    /// drop: what a request that waits pays, once) and of the request that
+    /// is answered at once (`guard_when_waiting` + `track_when_waiting`,
+    /// answered: nothing registered), by threads, transport (lossy = ring)
+    /// and long-waiting registered requests (blocking lock waiters). Real
+    /// /proc probes, the caller being this process.
+    #[test]
+    #[ignore]
+    fn bench_interrupt_registration() {
+        let me = std::process::id();
+        for lossy in [false, true] {
+            for waiters in [0usize, 100] {
+                for threads in [1usize, 8, 32] {
+                    let i = Arc::new(Interrupts::default());
+                    for w in 0..waiters {
+                        let _ = i.register_interruptible(1_000_000_000 + w as u64, me, lossy);
+                    }
+                    // Make the lossy waiters overdue.
+                    std::thread::sleep(FATAL_POLL + std::time::Duration::from_millis(50));
+                    let iters = 20_000usize / threads.max(1) * 4;
+                    let barrier = Arc::new(std::sync::Barrier::new(threads));
+                    let t0 = std::time::Instant::now();
+                    let hs: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let i = i.clone();
+                            let b = barrier.clone();
+                            std::thread::spawn(move || {
+                                b.wait();
+                                let s = std::time::Instant::now();
+                                for k in 0..iters {
+                                    let u = (t as u64) << 32 | k as u64;
+                                    let _tok = i.register_interruptible(u, me, lossy);
+                                    drop(i.guard(u, ()));
+                                }
+                                s.elapsed()
+                            })
+                        })
+                        .collect();
+                    let per: Vec<_> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+                    let wall = t0.elapsed();
+                    let total = (iters * threads) as f64;
+                    let avg_ns = per.iter().map(|d| d.as_nanos() as f64).sum::<f64>()
+                        / threads as f64
+                        / iters as f64;
+                    eprintln!(
+                        "BENCH lossy={lossy} waiters={waiters} threads={threads}: per-op (per thread) {avg_ns:.0} ns, aggregate {:.0} ops/s",
+                        total / wall.as_secs_f64()
+                    );
+                    // The same count of requests answered at once.
+                    let d = Arc::new(Deferred::default());
+                    let n = iters * threads;
+                    let t1 = std::time::Instant::now();
+                    for k in 0..n {
+                        let r = d.track_when_waiting(i.guard_when_waiting(
+                            k as u64,
+                            me,
+                            lossy,
+                            constellation_vfs::FnResponder::<(), _>::new(|_| {}),
+                        ));
+                        constellation_vfs::Responder::<()>::done(r, Ok(()));
+                    }
+                    eprintln!(
+                        "BENCH lossy={lossy} waiters={waiters}: answered at once, one thread: {:.0} ns",
+                        t1.elapsed().as_nanos() as f64 / n as f64
+                    );
+                }
+            }
+        }
     }
 
     /// Killable, not interruptible (plan 39 §3.3): an interrupt cancels

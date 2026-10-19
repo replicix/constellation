@@ -26,6 +26,7 @@
 //! something unbounded (a lock grant) moves it to another thread and
 //! returns the calling thread at once (plan 31 §6.3).
 
+use crate::ctx::CancelToken;
 use crate::error::{VfsError, VfsResult};
 use crate::name::NameBuf;
 use crate::types::{FileKind, Ino};
@@ -38,6 +39,32 @@ use std::time::Duration;
 /// rules every implementation follows).
 pub trait Responder<T>: Send + 'static {
     fn done(self, result: VfsResult<T>);
+
+    /// An op that has found it must wait for something outside this
+    /// process, for a time it cannot bound (a lock its owner cannot grant
+    /// yet; plan 43 F-b), and will answer from another thread, tells its
+    /// responder first. The frontend registers what ends the wait (the
+    /// caller's signal: the token it returns, which the wait watches) and
+    /// reserves what the wait holds (a FUSE-over-io_uring request holds its
+    /// ring entry, and a queue lends only `depth - 1` of them to waits:
+    /// [`WaitStart::Refused`] once they are spent, and the op then answers
+    /// now, as it did before it could wait). Called at most once, before
+    /// `done`, on the thread that is about to hand the wait over. The
+    /// default holds nothing and registers nothing.
+    fn begin_wait(&mut self) -> WaitStart {
+        WaitStart::Held(None)
+    }
+}
+
+/// What [`Responder::begin_wait`] answers.
+#[derive(Debug)]
+pub enum WaitStart {
+    /// The op may wait. `Some`: the token that the caller's signal
+    /// cancels, registered for this wait (an op whose context already
+    /// carries one is given none).
+    Held(Option<CancelToken>),
+    /// The frontend cannot hold one more waiting request: answer now.
+    Refused,
 }
 
 /// A responder that hands the result to a thread parked on a

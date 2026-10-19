@@ -50,7 +50,7 @@ pub use name::{Name, NameBuf, XattrName, XattrNameBuf};
 pub use observe::{ObservedOp, Observer, ViewIdentity};
 pub use policy::{IdentityMap, NamePolicy, PolicyStack, XattrPolicy, NAME_MAX};
 pub use responder::{
-    Blocking, BlockingWait, CollectDir, DirEntry, DirSink, FnResponder, Responder,
+    Blocking, BlockingWait, CollectDir, DirEntry, DirSink, FnResponder, Responder, WaitStart,
 };
 pub use types::{
     Attr, CopyFlags, Durability, Entry, FallocateMode, Fh, FileKind, Ino, LockKind, LockOwner,

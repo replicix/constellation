@@ -17,6 +17,7 @@ between nodes safely. It is on by default whenever P2P is on.
   - [Leases, renewal and fencing](#leases-renewal-and-fencing)
   - [The fencing token](#the-fencing-token)
   - [Conflicts, recalls and blocking waits](#conflicts-recalls-and-blocking-waits)
+  - [Waiting for a grace](#waiting-for-a-grace)
   - [Coherence from one holder to the next](#coherence-from-one-holder-to-the-next)
   - [Failover](#failover)
   - [Delegations](#delegations)
@@ -742,7 +743,95 @@ When a node asks for a grant that conflicts with grants held elsewhere:
 4. A non-blocking request (`F_SETLK`, `flock -n`) that conflicts gets
    `EAGAIN` at once. The recall still goes out, so a retry succeeds once
    the other node's application unlocks (SQLite's busy loop relies on
-   this).
+   this). One that nothing conflicts with, but which the owner may not
+   grant yet, waits (next section).
+
+Each grace ends at a time the owner knows, and a timer at that time
+serves the parked waiters it held back (`grace_end_serves`): they used to
+be served only at their next re-send, up to `recall_hold_ms` plus a retry
+later.
+
+### Waiting for a grace
+
+A non-blocking request for a lock that the owner's table shows no
+conflicting grant for, and which the owner may not grant *yet*, waits
+until it may, and is then granted, instead of failing with `EAGAIN`. What
+the owner may not grant yet:
+
+- a grace: the takeover floor of a fast successor, a restart's horizon, a
+  released takeover's or a dropped tenure's grace, a subtree grace after
+  an outwaited delegate ([Failover](#failover));
+- a new root tenure's floor, not known yet;
+- an outwaited holder's barrier, not settled yet;
+- a delegate's authority, too short to grant anything the holder could
+  keep (the delegation is renewed meanwhile).
+
+A conflicting grant, and the requester's own grant under recall, still
+answer `EAGAIN` at once, as before, whichever of these the owner is
+waiting for (behind a new tenure's floor too): only a lock nobody holds
+waits. The
+owner answers "wait", with the time to ask again (the grace's remainder,
+at most a second, so a request is routed afresh when the ownership moves;
+a quarter of the forward backoff for the others), and the requester asks
+again without spending one of its attempts, so any number of answers
+leads to the grant.
+
+The wait never holds a frontend thread. A request that has to wait is
+handed to a bounded pool of `lock-wait` threads (at most 16, however many
+requests wait: a wait is a timer and a short step every so often), and the
+mount answers it from there. It holds neither the FUSE worker nor, over
+the io_uring transport, an offload thread (the `n_threads` of the pool,
+shared by every ring: a wait of 23.5 s on one would have stalled whatever
+else is offloaded to it). It counts as a deferred reply, so an upgrade's
+handover refuses while it waits, and it is not reported as a stalled
+request. The FUSE adapter registers the wait for the caller's signal, and
+counts it, only when the request has to wait, so a request answered at once
+(the usual one) pays for neither. A frontend that cannot answer from
+another thread waits in the call, as for a blocking lock.
+
+**Over the io_uring transport the waiting request holds its ring entry.**
+The kernel queues a request on the queue of the CPU that sent it and
+serves it from no other queue and not over `/dev/fuse`; a request that is
+not answered keeps its entry, and while every entry of a queue is held the
+kernel holds back every further request of that CPU, whatever the file or
+the opcode, until one is answered (here: until the grace ends, up to the
+wait's bound). That is why a queue lends at most `depth − 1` of its entries
+to requests that wait on something other than the daemon, one budget for
+`FUSE_SETLKW` and for these waits (`RingCommit::reserve_lock_wait` in the
+vendored fuser, asked for through `ReplyEmpty::hold_for_wait`), so that
+one entry stays free for the others. When the budget is spent, a request
+that would have to wait is answered at once, as before the wait existed:
+`EAGAIN` for a non-blocking request, `ENOLCK` for a `FUSE_SETLKW` served
+as non-blocking past the budget; both counted (`grace_wait_refused_ring`,
+and the ring's `lock_wait_downgrades`), and the load campaign fails on
+them. With the default depth of 32 that takes 31 simultaneous lock waits
+on one CPU's queue.
+
+How it ends:
+
+- granted: the lock is taken at the end of the grace (the wait is as long
+  as the grace is, up to 23.5 s after a mid-lease crash with the defaults,
+  longer with delegations);
+- `EAGAIN`, if the table then shows a conflict, or if the request has
+  waited `lock_grace_wait_max_ms` from its start: the longest bound an
+  owner can have (the takeover window, the longest grant, the delegations'
+  reclaim horizon and the two margins) plus the 20 s an operation waits
+  for a sequencer (49.5 s with the core's defaults; computed from the
+  node's configuration, no knob). That `EAGAIN` is counted
+  (`grace_wait_gave_up`); a load campaign expects it to stay 0;
+- `EINTR`, when a signal reaches the process (the mount cancels the wait
+  as it does for `F_SETLKW`): Linux documents `EINTR` for `F_SETLK` on a
+  file system that waits, as NFS does. It is observed between attempts,
+  within 100 ms; an attempt in flight (the request's first, or a re-issue)
+  finishes first, and that is a round trip to the owner, a few seconds
+  against an owner that cannot be reached.
+
+The precedent is the grace period of NFS and NLM: their clients retry a
+request the server refused for its grace, blocking or not, until the
+grace ends, and a signal ends the wait. A `FUSE_SETLKW` past the
+`depth − 1` waiters of its queue is served as a non-blocking request and
+cannot wait: it answers `ENOLCK` at once, a free lock in a grace
+included, as before.
 
 Two local owners on the same node that conflict are resolved on the
 node, without the sequencer.
@@ -949,8 +1038,9 @@ owner has replaced it.
   table to its backups asynchronously (`LockMirror`), and a fast
   successor installs the last mirror. The mirror is only an availability
   aid; the grace is what keeps locks exclusive. Until the grace ends, a
-  non-blocking request for a free lock answers `EAGAIN` (planned: wait
-  instead, plan 43 C7-F).
+  non-blocking request for a lock nothing conflicts with waits for it
+  (see [Waiting for a grace](#waiting-for-a-grace)) instead of failing
+  `EAGAIN`; a blocking one is parked, and served at the grace's end.
 - **Restart inside the lease**: lock grants persist a horizon of their
   own (next to the read delegations' one). A holder that restarts grants
   no lock until that horizon has passed, and accepts reclaims meanwhile;
@@ -1138,7 +1228,10 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   `flock` with `EINTR` while it waits on a lock held on its own node, or
   before its request reaches the owning sequencer. Once the owner has
   parked the request because another node holds a conflicting grant, the
-  wait returns only once the lock is granted.
+  wait returns only once the lock is granted. (A non-blocking request's
+  wait for an owner's grace, [Waiting for a grace](#waiting-for-a-grace),
+  is interruptible wherever the owner is: it is retried from the mount,
+  not parked at the owner.)
 - **`EINTR` even under `SA_RESTART`.** A signal whose handler was
   installed with `SA_RESTART` restarts a native `F_SETLKW` transparently.
   Over FUSE the wait ends with a plain `EINTR` (as with libfuse), so the
@@ -1253,6 +1346,11 @@ for both roles:
   (their operations refused with `EIO`, on any file),
   `first_use_abandoned` (recalled grants released before their first
   lock, see [Leases, renewal and fencing](#leases-renewal-and-fencing)),
+  `grace_waits` (non-blocking requests that waited for an owner's grace,
+  see [Waiting for a grace](#waiting-for-a-grace)), `grace_wait_ms_total`
+  (the time those waits took in all) and `grace_wait_gave_up` (the ones
+  that gave up with `EAGAIN` after `lock_grace_wait_max_ms`; 0 in every
+  load campaign),
   `fenced_owners` (the owners fenced now: `owner`, `pid`, `since_ms`,
   and `grant`, the `[minter, seq]` whose end fenced it), `margin_ms`
   (the clock-skew margin the lock machinery assumes),
@@ -1262,7 +1360,11 @@ for both roles:
   close publication or mutation in doubt, once per request);
 - sequencer side: `grants_table`, `grants_made`, `recalls_sent`,
   `recalls_released`, `recalls_expired`, `reclaimed`, `waiters_parked`,
-  `grace_refusals`, `requeued_in_place`, `released_superseded`,
+  `grace_refusals`, `grace_wait_answers` and `not_yet_answers`
+  (non-blocking requests told to wait: for a grace, and for a tenure
+  floor, a barrier or a delegate's authority), `grace_end_serves` (grace
+  ends that served parked waiters), `requeued_in_place`,
+  `released_superseded`,
   `peers_unreachable` (nodes taken for unreachable, see
   [Conflicts, recalls and blocking waits](#conflicts-recalls-and-blocking-waits)),
   `unreachable_passed_over` (their waiters passed over meanwhile),
@@ -1298,6 +1400,14 @@ are kept as a conflict copy under `/.constellation-conflict/` at the
 filesystem root, named after the file's path, logged as "kept as a
 conflict copy". Writes discarded on the node
 itself (the per-file taint) are not kept.
+
+### `flock -n` or `F_SETLK` takes seconds to return
+
+The owner is in a grace (a failover, a restart) and the request waits for
+it ([Waiting for a grace](#waiting-for-a-grace)): `grace_waits` rises on
+the node, `grace_wait_answers` on the owner. It is granted at the end of
+the grace, or fails `EAGAIN` after `lock_grace_wait_max_ms`
+(`grace_wait_gave_up`), or `EINTR` on a signal.
 
 ### `flock -n` or `F_SETLK` fails once, then succeeds
 

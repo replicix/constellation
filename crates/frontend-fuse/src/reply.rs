@@ -221,6 +221,17 @@ impl Responder<()> for EmptyReply {
             Err(e) => self.0.error(reply_code(e.code())),
         }
     }
+
+    /// Over a ring the waiting request holds its entry: one of the
+    /// queue's `depth - 1` that lock waits may hold
+    /// ([`fuser::ReplyEmpty::hold_for_wait`]).
+    fn begin_wait(&mut self) -> constellation_vfs::WaitStart {
+        if self.0.hold_for_wait() {
+            constellation_vfs::WaitStart::Held(None)
+        } else {
+            constellation_vfs::WaitStart::Refused
+        }
+    }
 }
 
 /// A rename's reply, and the dentries it moves in the kernel

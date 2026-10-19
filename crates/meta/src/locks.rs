@@ -391,6 +391,20 @@ pub struct LockStats {
     pub grants_waited: u64,
     pub grant_wait_ms_total: u64,
     pub grants_degraded: u64,
+    /// Plan 43 F-b: non-blocking requests that waited for an owner that
+    /// could not grant yet (a grace, the tenure's floor, a barrier), the
+    /// milliseconds those waits took in all, and the ones that gave up
+    /// with `EAGAIN` after `lock_grace_wait_max_ms` (a campaign expects
+    /// none).
+    pub grace_waits: u64,
+    pub grace_wait_ms_total: u64,
+    pub grace_wait_gave_up: u64,
+    /// Waits refused when they would have begun, answered `EAGAIN` as
+    /// before F-b (a campaign expects none): the frontend could not hold
+    /// one more waiting request (a ring queue's lock-wait budget was
+    /// spent), or no `lock-wait` thread could be started.
+    pub grace_wait_refused_ring: u64,
+    pub grace_wait_refused_pool: u64,
     // ---- sequencer side ----
     pub grants_made: u64,
     pub recalls_sent: u64,

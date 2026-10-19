@@ -818,6 +818,173 @@ fn blocking_lock_waits_never_take_a_queues_last_entry() {
     k.finish();
 }
 
+/// Plan 43 F-b (review F2): a `FUSE_SETLKW` past the queue's budget is
+/// served as a non-blocking one, and the budget is what a wait for an
+/// owner's grace is counted against too: the queue has no entry to lend
+/// it, so the request is answered at once as it was before F-b, `ENOLCK`
+/// (a downgraded `SETLKW` is never allowed to hold an entry), counted as
+/// a downgrade, and it holds neither the queue's last entry nor the
+/// offload thread: an open on the same queue and one on another are
+/// answered at once.
+#[test]
+fn a_downgraded_lock_wait_in_a_grace_is_answered_at_once_and_holds_no_entry() {
+    let mock = MockVfs::reference(FrontendCaps::linux_fuse(true));
+    let c = constellation_vfs::Caller::with_groups(1000, 100, &[]);
+    let make = |name: &str| {
+        let (made, opened) = constellation_vfs::Blocking::run(|r| {
+            use constellation_vfs::Vfs;
+            mock.create(
+                &constellation_vfs::OpCtx::new(OpKind::Create, &c),
+                constellation_vfs::ROOT_INO,
+                constellation_vfs::Name::new(name),
+                0o100_644,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .expect("create");
+        (made.attr.ino, opened.fh.0)
+    };
+    let (held, held_fh) = make("held");
+    let (free, free_fh) = make("free");
+    let mut k =
+        Kernel::try_start_with(&mock, Leg::Ring, None, FrontendCaps::linux_fuse(true)).unwrap();
+    assert_eq!(k.transport, Transport::Uring);
+    let k_downgrades = k.lock_wait_downgrades.clone();
+    let (p, waiter, other) = (0xA, 0xB, 0xC);
+    let quiet = Duration::from_millis(300);
+    let held_lock = k.send_on(0, op::SETLK, held, &lk_body(held_fh, p, libc::F_WRLCK));
+    assert_eq!(
+        k.recv_within(Duration::from_secs(5)).unwrap().unique(),
+        held_lock
+    );
+    // The first waiter takes one of the queue's two entries.
+    let first = k.send_on(
+        0,
+        op::SETLKW,
+        held,
+        &lk_body(held_fh, waiter, libc::F_WRLCK),
+    );
+    assert!(k.recv_within(quiet).is_none(), "the waiter waits");
+    // The owner is in a grace now: a lock nothing holds is not grantable
+    // yet (the view waits 1.5 s before it asks).
+    mock.lock_grace(Some(Duration::from_millis(1_500)));
+    // A second would take the last entry: served as a non-blocking one;
+    // the wait would hold that entry, which the queue cannot spare: the
+    // answer is at once, and `ENOLCK`, as for a contended lock.
+    let second = k.send_on(0, op::SETLKW, free, &lk_body(free_fh, other, libc::F_WRLCK));
+    let started = std::time::Instant::now();
+    let r = k.recv_within(Duration::from_secs(5)).expect("an answer");
+    assert_eq!(r.unique(), second, "answered, not left waiting");
+    assert_eq!(r.error(), -libc::ENOLCK, "past the budget, as before F-b");
+    assert!(started.elapsed() < Duration::from_millis(1_000));
+    assert_eq!(
+        k_downgrades.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the downgrade is counted"
+    );
+    // The queue's last entry is free: an open on it, and one on another
+    // queue, are answered at once.
+    for queue in [0, 1] {
+        let started = std::time::Instant::now();
+        let open = k.send_on(
+            queue,
+            op::OPEN,
+            held,
+            &Body::default().u32(libc::O_RDWR as u32).u32(0),
+        );
+        let r = k.recv_within(Duration::from_secs(5)).expect("an answer");
+        assert_eq!(r.unique(), open, "the open on queue {queue} is answered");
+        assert!(
+            started.elapsed() < Duration::from_millis(1_000),
+            "the open on queue {queue} waited {:?}",
+            started.elapsed()
+        );
+    }
+    // Cleanup: release the lock, the first waiter is granted.
+    mock.lock_grace(None);
+    let unlock = k.send_on(1, op::SETLK, held, &lk_body(held_fh, p, libc::F_UNLCK));
+    let mut got: Vec<(u64, i32)> = (0..2)
+        .map(|_| {
+            let r = k.recv_within(Duration::from_secs(5)).expect("an answer");
+            (r.unique(), r.error())
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(first, 0), (unlock, 0)]);
+    k.finish();
+}
+
+/// Plan 43 F-b review F2: plain non-blocking `FUSE_SETLK`s for free locks
+/// inside an owner's grace, from one CPU, are counted against the queue's
+/// lock-wait budget like a `FUSE_SETLKW`: at depth 2 the first waits (one
+/// entry held), the second is refused at once, `EAGAIN` as before F-b, and
+/// an unrelated `OPEN` from that CPU is answered at once, an entry being
+/// free. Before the budget, both waits held both entries and the open was
+/// not answered until the grace ended.
+#[test]
+fn nonblocking_grace_waits_leave_their_queue_an_entry() {
+    let mock = MockVfs::reference(FrontendCaps::linux_fuse(true));
+    let c = constellation_vfs::Caller::with_groups(1000, 100, &[]);
+    let make = |name: &str| {
+        let (made, opened) = constellation_vfs::Blocking::run(|r| {
+            use constellation_vfs::Vfs;
+            mock.create(
+                &constellation_vfs::OpCtx::new(OpKind::Create, &c),
+                constellation_vfs::ROOT_INO,
+                constellation_vfs::Name::new(name),
+                0o100_644,
+                OpenFlags::READ | OpenFlags::WRITE,
+                OpenOwner::NONE,
+                r,
+            )
+        })
+        .expect("create");
+        (made.attr.ino, opened.fh.0)
+    };
+    let (a, a_fh) = make("a");
+    let (b, b_fh) = make("b");
+    let mut k =
+        Kernel::try_start_with(&mock, Leg::Ring, None, FrontendCaps::linux_fuse(true)).unwrap();
+    assert_eq!(k.transport, Transport::Uring);
+    let grace = Duration::from_millis(3_000);
+    mock.lock_grace(Some(grace));
+    let t0 = std::time::Instant::now();
+    let la = k.send_on(0, op::SETLK, a, &lk_body(a_fh, 0xA, libc::F_WRLCK));
+    assert!(
+        k.recv_within(Duration::from_millis(300)).is_none(),
+        "one waits"
+    );
+    let lb = k.send_on(0, op::SETLK, b, &lk_body(b_fh, 0xB, libc::F_WRLCK));
+    let refused = k.recv_within(Duration::from_secs(10)).expect("an answer");
+    assert_eq!(refused.unique(), lb, "the second is answered, not held");
+    assert_eq!(refused.error(), -libc::EAGAIN, "as before F-b");
+    let open = k.send_on(
+        0,
+        op::OPEN,
+        a,
+        &Body::default().u32(libc::O_RDWR as u32).u32(0),
+    );
+    let answered = k.recv_within(Duration::from_secs(10)).expect("an answer");
+    let first_at = t0.elapsed();
+    assert_eq!(
+        answered.unique(),
+        open,
+        "the open on the waiters' queue is answered"
+    );
+    assert!(
+        first_at < Duration::from_millis(1_500),
+        "the open on the waiters' queue waited {first_at:?} (the grace is {grace:?})"
+    );
+    // The grace ends: the first is granted.
+    let granted = k.recv_within(Duration::from_secs(10)).expect("the grant");
+    assert_eq!(granted.unique(), la);
+    assert_eq!(granted.error(), 0);
+    mock.lock_grace(None);
+    k.finish();
+}
+
 /// Plan 38 Z4b: an open the view marked zero-copy is answered with
 /// `FOPEN_IO_URING_ZERO_COPY` on every leg (the kernel ignores the flag
 /// where no zero-copy queue serves it), and a read the view answered with

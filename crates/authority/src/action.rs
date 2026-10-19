@@ -273,6 +273,8 @@ pub enum TimerKind {
     LockGrantExpiry,
     LockRenewTick,
     LockWaiterTick,
+    /// Plan 43 F-b: a lock grace ends; the parked waiters are served.
+    LockGraceEnd,
     LockRenewTimeout,
     LockTestTimeout,
     /// M14 phase 2: a recalled grant's release waits for the mutations
@@ -357,6 +359,12 @@ pub enum LockAnswer {
     },
     /// A conflicting grant is held by another node (`EAGAIN`).
     WouldBlock,
+    /// A non-blocking request the owner may not grant yet, with nothing
+    /// in conflict (a grace, the tenure's floor, a barrier, a delegate's
+    /// short authority; plan 43 F-b): ask again after `retry_ms`. The
+    /// retry and its bound belong to the engine (`ClusterLocks`), on a
+    /// thread of its own; the core has forgotten the request.
+    Wait { retry_ms: u64 },
     /// No sequencer reachable over P2P (`ENOLCK`).
     Unavailable,
 }

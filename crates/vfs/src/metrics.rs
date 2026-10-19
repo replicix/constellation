@@ -246,6 +246,13 @@ impl<T, R: Responder<T>> Responder<T> for Timed<R> {
         );
         inner.done(result);
     }
+
+    fn begin_wait(&mut self) -> crate::responder::WaitStart {
+        match self.inner.as_mut() {
+            Some(inner) => Responder::<T>::begin_wait(inner),
+            None => crate::responder::WaitStart::Held(None),
+        }
+    }
 }
 
 impl<R> Drop for Timed<R> {

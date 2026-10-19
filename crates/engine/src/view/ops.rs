@@ -2221,9 +2221,10 @@ impl Vfs for View {
         fh: Fh,
         lock: LockSpec,
         sleep: bool,
-        r: R,
+        mut r: R,
     ) {
-        let watch = if sleep {
+        let started = std::time::Instant::now();
+        let mut watch = if sleep {
             self.watch.enter_blocking("setlk", ino)
         } else {
             self.watch.enter("setlk", ino)
@@ -2258,17 +2259,83 @@ impl Vfs for View {
             // whose last close was just answered waits for their
             // `RELEASE`, which the kernel sends without waiting for it
             // (`lock_handles`' module doc), and asks again.
-            let result = self.past_closing_locks(
+            if !self.caps.deferrable.contains(OpKind::LockAcquire) {
+                // A frontend that cannot answer from another thread waits
+                // here for an owner that cannot grant yet (plan 43 F-b),
+                // as it does for a blocking lock.
+                let result = self.past_closing_locks(
+                    locks,
+                    ino,
+                    local.owner,
+                    (local.start, local.end),
+                    local.write,
+                    deadline,
+                    |deadline| locks.try_lock_by(ino, local, deadline, cx.cancel),
+                    |r| *r == Err(Code::Again),
+                );
+                r.done(result.map_err(VfsError::from));
+                return;
+            }
+            let step = self.past_closing_locks(
                 locks,
                 ino,
                 local.owner,
                 (local.start, local.end),
                 local.write,
                 deadline,
-                |deadline| locks.try_lock_by(ino, local, deadline, cx.cancel),
-                |r| *r == Err(Code::Again),
+                |deadline| locks.try_lock_step(ino, local, deadline, cx.cancel),
+                // (A request to wait is no refusal.)
+                |step| *step == crate::locks::NbStep::Done(Err(Code::Again)),
             );
-            r.done(result.map_err(VfsError::from));
+            match step {
+                crate::locks::NbStep::Done(result) => {
+                    r.done(result.map_err(VfsError::from));
+                }
+                crate::locks::NbStep::Wait(first_wait) => {
+                    // Nothing conflicts but the owner may not grant yet
+                    // (a grace after a takeover or a restart, the tenure's
+                    // floor...): the request waits on a `lock-wait` thread,
+                    // like a blocking one, so it holds neither this worker
+                    // nor, over a ring, an offload thread that every other
+                    // request offloaded to it needs. It may
+                    // wait for tens of seconds by design: not a stall.
+                    //
+                    // The frontend is told first: it registers the wait
+                    // for the caller's signal, and reserves what the wait
+                    // holds (over a ring, one of the queue's `depth - 1`
+                    // entries that lock waits may hold, so that one stays
+                    // free for every other request of that CPU). When it
+                    // cannot, the request is answered now, as it was before
+                    // it could wait.
+                    let own = match r.begin_wait() {
+                        constellation_vfs::WaitStart::Held(own) => own,
+                        constellation_vfs::WaitStart::Refused => {
+                            locks
+                                .meta
+                                .locks()
+                                .with_stats(|s| s.grace_wait_refused_ring += 1);
+                            r.done(err(Code::Again));
+                            return;
+                        }
+                    };
+                    drop(std::mem::replace(
+                        &mut watch,
+                        self.watch.enter_blocking("setlk", ino),
+                    ));
+                    let cancel = own.or_else(|| cx.cancel.cloned());
+                    locks.lock_nb_deferred(
+                        ino,
+                        local,
+                        first_wait,
+                        started,
+                        cancel,
+                        move |result: Result<(), Code>| {
+                            r.done(result.map_err(VfsError::from));
+                            drop(watch);
+                        },
+                    );
+                }
+            }
             return;
         }
         if !self.caps.deferrable.contains(OpKind::LockAcquire) {

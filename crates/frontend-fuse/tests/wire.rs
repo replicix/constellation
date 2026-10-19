@@ -1734,6 +1734,91 @@ fn an_interrupt_ends_a_blocked_setlkw_with_eintr() {
     k.finish();
 }
 
+/// Plan 43 F-b: on a mount whose locks are the cluster's, a non-blocking
+/// `F_SETLK` that has to wait for an owner's grace is answered from the
+/// view's thread like a blocking one, not on the worker (the worker, and
+/// over a ring the offload thread, serve other requests meanwhile), and a
+/// signal ends it with `EINTR`. On a mount without cluster locks the
+/// request is answered inline and an interrupt names nothing.
+#[test]
+fn a_nonblocking_setlk_in_a_grace_is_deferred_and_interruptible_on_a_cluster_lock_mount() {
+    let lk = |fh: u64, owner: u64, typ: i32| {
+        Body::new()
+            .u64(fh)
+            .u64(owner)
+            .u64(0)
+            .u64(i64::MAX as u64)
+            .i32(typ)
+            .u32(owner as u32)
+            .u32(0)
+            .u32(0)
+    };
+    for cluster in [true, false] {
+        let mock = MockVfs::reference(FrontendCaps::linux_fuse(cluster));
+        let mut k = Kernel::start(Arc::new(mock.clone()), FrontendCaps::linux_fuse(cluster), 1);
+        let r = k.call(
+            op::CREATE,
+            ROOT_INO,
+            &Body::new()
+                .i32(RW | libc::O_CREAT)
+                .u32(0o100_644)
+                .u32(0)
+                .u32(0)
+                .cstr("graced"),
+        );
+        let (ino, fh) = (r.u64_at(0), r.u64_at(128));
+        mock.lock_grace(Some(Duration::from_secs(10)));
+        let waiter = k.send_as(
+            op::SETLK,
+            ino,
+            (1000, 100, 4242),
+            &lk(fh, 2, libc::F_WRLCK).0,
+        );
+        assert!(
+            k.recv_within(Duration::from_millis(300)).is_none(),
+            "waits for the grace"
+        );
+        // The worker is free meanwhile.
+        k.call(op::GETATTR, ino, &Body::new().u32(0).u32(0).u64(0))
+            .ok();
+        k.send(op::INTERRUPT, 0, &Body::new().u64(waiter).0);
+        if cluster {
+            let r = k.recv();
+            assert_eq!(r.unique, waiter, "the interrupt itself is not answered");
+            assert_eq!(r.errno(), libc::EINTR);
+            let done = mock
+                .completions()
+                .into_iter()
+                .rev()
+                .find(|c| c.op == OpKind::LockAcquire)
+                .unwrap();
+            assert_eq!(done.thread.name.as_deref(), Some("mock-lock-grace"));
+        } else {
+            // Not registered as interruptible: the signal changes nothing,
+            // as before.
+            assert!(
+                k.recv_within(Duration::from_millis(300)).is_none(),
+                "an interrupt names nothing here"
+            );
+            mock.lock_grace(None);
+        }
+        // A short grace ends in the grant, on the same terms.
+        if cluster {
+            mock.lock_grace(Some(Duration::from_millis(300)));
+            let waiter = k.send_as(
+                op::SETLK,
+                ino,
+                (1000, 100, 4242),
+                &lk(fh, 3, libc::F_WRLCK).0,
+            );
+            let r = k.recv();
+            assert_eq!(r.unique, waiter);
+            assert_eq!(r.errno(), 0, "granted once the grace is over");
+        }
+        k.finish();
+    }
+}
+
 #[test]
 fn forget_needs_no_reply_and_unknown_opcodes_are_refused_not_fatal() {
     let (mut k, mock) = plain();

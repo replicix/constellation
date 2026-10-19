@@ -1133,10 +1133,10 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
 /// lapsed grant (EIO on every file of the mount for that owner, until its
 /// locks are gone) falls on the child alone and not on the harness
 /// process that measures reads and writes on the same mount.
-struct ChildLock(std::process::Child);
+pub(super) struct ChildLock(std::process::Child);
 
 impl ChildLock {
-    fn take(path: &Path, other_mount: &Path) -> Result<Self> {
+    pub(super) fn take(path: &Path, other_mount: &Path) -> Result<Self> {
         let child = std::process::Command::new("flock")
             .arg("-x")
             .arg(path)
@@ -1200,7 +1200,10 @@ type Seen = Vec<(Duration, Duration, std::result::Result<(), Code>)>;
 /// often the nodes' logs refused a lock owner whose grant lapsed (the
 /// owner fence: `EIO` for that owner on every file of the mount). Failed
 /// by a write error, a read error (the reader is no lock owner) or a lock
-/// refused with other than `EAGAIN`.
+/// attempt that failed at all: a non-blocking request on a free lock waits
+/// for the successor's grace and is granted at its end (plan 43 F-b; it
+/// answered `EAGAIN` for the whole floor before). Printed with the errnos:
+/// the longest attempt, which is the longest wait.
 /// `CONSTELLATION_HARNESS_LOCKER_IN_PROCESS=1` holds the lock in the
 /// harness process instead, the control: the reader then sees the fence.
 pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
@@ -1420,7 +1423,31 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
         );
         let bad_write = !codes(&writes).is_empty();
         let bad_read = !in_process && !codes(&reads).is_empty();
-        let bad_grab = codes(&grabs).keys().any(|k| k != "Again");
+        let bad_grab = !codes(&grabs).is_empty();
+        let longest_grab = grabs
+            .iter()
+            .max_by_key(|(s, r, _)| *r - *s)
+            .map(|(s, r, _)| (rel(*s), *r - *s));
+        eprintln!(
+            "    {NAME}: longest non-blocking lock attempt (start, took) {longest_grab:?}; \
+             attempts that took over a second: {}",
+            grabs
+                .iter()
+                .filter(|(s, r, _)| *r - *s > Duration::from_secs(1))
+                .count()
+        );
+        let grace_waits: Vec<(String, u64, u64)> = clients
+            .iter()
+            .filter_map(|c| locks_of(c).ok().map(|l| (c.name.clone(), l)))
+            .map(|(n, l)| {
+                (
+                    n,
+                    l["grace_waits"].as_u64().unwrap_or(0),
+                    l["grace_wait_gave_up"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        eprintln!("    {NAME}: (node, grace_waits, grace_wait_gave_up) {grace_waits:?}");
         proxies[0].heal();
         if let Some(held) = held {
             held.release();
@@ -1428,7 +1455,7 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
         drop(held_child);
         anyhow::ensure!(
             !bad_write && !bad_read && !bad_grab,
-            "a write or a read failed, or a lock attempt failed with other than EAGAIN (see the line above)"
+            "a write or a read failed, or a non-blocking lock attempt on a free file failed (see the lines above)"
         );
         anyhow::ensure!(
             first_ok_after(&grabs, took_over).is_some(),
@@ -1442,6 +1469,342 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
     for c in clients.iter_mut().rev() {
         let _ = c.unmount();
     }
+    result
+}
+
+// ------------------------------------------------------------------ lock-grace-wait
+
+/// Three nodes after the holder was killed with a lock held (plan 43
+/// F-b's setting): the backup has taken the lease over by seal and is in
+/// the lock grace (`marker + takeover window + lock TTL + 2 × margin`,
+/// about 18.5 s here), granting no new lock.
+pub(super) struct GracedFailover {
+    pub clients: Vec<Client>,
+    /// The successor.
+    pub backup: usize,
+    /// The node that holds a lock (a child process of its own) and asks
+    /// for the others in the grace.
+    pub contender: usize,
+    /// When the backup held the lease.
+    pub took_over: Instant,
+    locker: Option<ChildLock>,
+    _env: crate::s3env::S3Env,
+    _root: tempfile::TempDir,
+}
+
+impl GracedFailover {
+    pub(super) fn keep_logs(&self, scenario: &str) {
+        keep_logs(scenario, &self.clients);
+    }
+
+    /// The child's lock is let go (its process group killed) and every
+    /// mount unmounted.
+    pub(super) fn finish(&mut self) {
+        drop(self.locker.take());
+        // A probe still waiting on a lock (a scenario that failed before
+        // joining it) holds its mount busy: unmounting waited for it for
+        // ten minutes.
+        kill_live_probes();
+        for c in self.clients.iter_mut().rev() {
+            let _ = c.unmount();
+        }
+    }
+}
+
+/// [`GracedFailover`]: `--cto strict`, a lock TTL of 15 s, `extra` env on
+/// every mount; `files` are made on the contender's mount (the successor
+/// acknowledges no write inside its floor); a child process on the
+/// contender's node holds an exclusive lock (so the tenure is one a fast
+/// successor waits out), the holder is killed and the backup takes over.
+pub(super) fn graced_failover(
+    scenario: &str,
+    extra: &[(&str, &str)],
+    files: &[&str],
+) -> Result<GracedFailover> {
+    let mut env_pairs = vec![
+        ("CONSTELLATION_CTO", "strict"),
+        ("CONSTELLATION_LOCK_TTL_MS", "15000"),
+        (
+            "RUST_LOG",
+            "info,constellation_authority::core::locks=debug,constellation::locks=debug",
+        ),
+    ];
+    env_pairs.extend_from_slice(extra);
+    let (env, root, mut clients, _) = cluster(scenario, &["a", "b", "c"], &env_pairs, 0)?;
+    let setup = (|| -> Result<(usize, usize, Instant, ChildLock)> {
+        let backups = wait_for_backup(&clients[0], Duration::from_secs(30))?;
+        let backup = (0..clients.len())
+            .find(|i| node_id(&clients[*i]).ok() == Some(backups[0]))
+            .context("backup is not one of ours")?;
+        let contender = (1..clients.len())
+            .find(|i| *i != backup)
+            .expect("three nodes");
+        let epoch = lease_of(&clients[0])?["epoch"].as_u64().unwrap_or(0);
+        // The tenure serves strict reads and a lock.
+        for _ in 0..5 {
+            std::fs::read(clients[contender].mnt.join("f")).context("reading f")?;
+        }
+        for name in files {
+            std::fs::write(clients[contender].mnt.join(name), b"x")
+                .with_context(|| format!("making {name}"))?;
+        }
+        let locker = ChildLock::take(
+            &clients[contender].mnt.join("h"),
+            &clients[backup].mnt.join("h"),
+        )?;
+        eprintln!(
+            "    {scenario}: {} holds epoch {epoch}; backup {}; contender {} (its child holds h)",
+            clients[0].name, clients[backup].name, clients[contender].name
+        );
+        clients[0].kill9()?;
+        wait_holds(&clients[backup], epoch, Duration::from_secs(30))?;
+        Ok((backup, contender, Instant::now(), locker))
+    })();
+    match setup {
+        Ok((backup, contender, took_over, locker)) => Ok(GracedFailover {
+            clients,
+            backup,
+            contender,
+            took_over,
+            locker: Some(locker),
+            _env: env,
+            _root: root,
+        }),
+        Err(e) => {
+            keep_logs(scenario, &clients);
+            for c in clients.iter_mut().rev() {
+                let _ = c.unmount();
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Takes a probe off [`LIVE_PROBES`] when it has ended.
+struct LiveProbe(u32);
+
+impl Drop for LiveProbe {
+    fn drop(&mut self) {
+        LIVE_PROBES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|p| *p != self.0);
+    }
+}
+
+/// What a `harness lock-probe nonblocking|waiter` child said and how it
+/// ended: its stdout line, its exit code and how long it ran.
+pub(super) struct Probed {
+    pub said: String,
+    pub code: i32,
+    pub took: Duration,
+}
+
+/// The `lock-probe` children running now (their process ids): a scenario
+/// that ends early kills them before it unmounts ([`kill_live_probes`]).
+static LIVE_PROBES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn kill_live_probes() {
+    let pids = std::mem::take(&mut *LIVE_PROBES.lock().unwrap_or_else(|e| e.into_inner()));
+    for pid in &pids {
+        // SAFETY: kill(2) of a child this process started and has not
+        // reaped (it is removed from the list when it is).
+        unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+    }
+    // The mount stays busy until they are gone (a process killed inside a
+    // FUSE request dies when the daemon answers it, which a lock wait does
+    // when its caller's signal reaches it): an unmount that raced them
+    // failed `EBUSY` and its daemon then never exited, ten minutes.
+    let end = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < end {
+        let alive = pids
+            .iter()
+            .any(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Run `lock-probe ROLE FILE INDEX` (this binary), pinned to `cpu` when
+/// given, and wait for it (at most `within`).
+pub(super) fn probe(
+    role: &str,
+    file: &Path,
+    index: u64,
+    cpu: Option<&str>,
+    within: Duration,
+) -> Result<std::thread::JoinHandle<Result<Probed>>> {
+    use crate::spawn::TiedSpawn;
+    let me = std::env::current_exe()?;
+    let mut cmd = match cpu {
+        Some(cpu) => {
+            let mut c = std::process::Command::new("taskset");
+            c.arg("-c").arg(cpu).arg(&me);
+            c
+        }
+        None => std::process::Command::new(&me),
+    };
+    cmd.arg("lock-probe")
+        .arg(role)
+        .arg(file)
+        .arg(index.to_string())
+        .stdout(std::process::Stdio::piped());
+    let started = Instant::now();
+    let mut child = cmd.spawn_tied()?;
+    let pid = child.id();
+    LIVE_PROBES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(pid);
+    let role = role.to_string();
+    Ok(std::thread::spawn(move || {
+        use std::io::Read;
+        let mut _live = Some(LiveProbe(pid));
+        let mut out = child.stdout.take().context("probe stdout")?;
+        let reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = out.read_to_string(&mut s);
+            s
+        });
+        let deadline = started + within;
+        let status = loop {
+            if let Some(st) = child.try_wait()? {
+                // Reaped: its pid may be reused now, so it is off the list
+                // of what `kill_live_probes` signals.
+                drop(_live.take());
+                break st;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("lock-probe {role} still running after {within:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Ok(Probed {
+            said: reader.join().unwrap_or_default().trim().to_string(),
+            code: status.code().unwrap_or(-1),
+            took: started.elapsed(),
+        })
+    }))
+}
+
+/// Plan 43 F-b on a real kernel: the lock requests of an application
+/// inside a failover's lock grace cost latency, not errors. Three nodes;
+/// a child process on the contender's node holds a lock (the tenure serves
+/// locks), the lock holder is killed, and the backup takes over: it grants
+/// no new lock for the rest of its grace. In it the contender's node runs
+/// three applications on free files: a non-blocking `F_SETLK` (waits, is
+/// granted at the grace's end: on c9bee29 it answered `EAGAIN` at once), a
+/// non-blocking one with a `SIGALRM` after eight seconds (ends `EINTR`,
+/// as a blocking lock's wait would), and a blocking `F_SETLKW` (parked at the
+/// successor, served by the timer at the grace's end). The lock the child
+/// holds is still refused `EAGAIN` once the grace is over (a conflict is
+/// no wait). Printed: how long each waited, and the lag of the blocking
+/// waiter behind the non-blocking one (the grace-end timer serves it at
+/// once; before it, at its next re-send). The nodes' counters: the
+/// contender's `grace_waits` (2: the granted and the interrupted),
+/// `grace_wait_gave_up` 0; the successor's `grace_wait_answers`.
+pub fn lock_grace_wait(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-grace-wait";
+    let mut g = graced_failover(NAME, &[], &["free1", "free2", "free3"])?;
+    let result = (|| -> Result<()> {
+        let mnt = g.clients[g.contender].mnt.clone();
+        let within = Duration::from_secs(90);
+        let nb = probe("nonblocking", &mnt.join("free1"), 0, None, within)?;
+        // The signal comes 8 s into the request: after its first attempt
+        // (a few seconds to find the new owner; that one answers when the
+        // core does, as a blocking lock's does), well inside the grace.
+        let intr = probe("nonblocking", &mnt.join("free2"), 8_000, None, within)?;
+        let blocked = probe("waiter", &mnt.join("free3"), 0, None, within)?;
+        let intr = intr.join().expect("probe thread")?;
+        let nb = nb.join().expect("probe thread")?;
+        let blocked = blocked.join().expect("probe thread")?;
+        let since = |p: &Probed| p.took;
+        eprintln!(
+            "    {NAME}: {:?} after the takeover: non-blocking {:?} ({}), with a SIGALRM at 8 s \
+             {:?} ({}), blocking {:?} ({})",
+            g.took_over.elapsed(),
+            since(&nb),
+            nb.said,
+            since(&intr),
+            intr.said,
+            since(&blocked),
+            blocked.said
+        );
+        anyhow::ensure!(
+            nb.code == 0,
+            "the non-blocking lock on a free file in the grace must be granted, not refused \
+             ({}, exit {})",
+            nb.said,
+            nb.code
+        );
+        anyhow::ensure!(
+            nb.took >= Duration::from_secs(3),
+            "the non-blocking lock did not wait for the grace ({:?}): is the grace over already?",
+            nb.took
+        );
+        anyhow::ensure!(
+            intr.code == 4
+                && intr.took >= Duration::from_secs(8)
+                && intr.took + Duration::from_secs(2) < nb.took,
+            "the signal must end the wait with EINTR 8 s into it, well before the grace ends: {} \
+             (exit {}, after {:?}; the non-blocking request took {:?})",
+            intr.said,
+            intr.code,
+            intr.took,
+            nb.took
+        );
+        anyhow::ensure!(
+            blocked.code == 0,
+            "the blocking lock must be granted: {} (exit {})",
+            blocked.said,
+            blocked.code
+        );
+        let lag = blocked.took.abs_diff(nb.took);
+        eprintln!(
+            "    {NAME}: the blocking waiter was granted {lag:?} from the non-blocking one \
+             (the grace-end timer serves it at the end)"
+        );
+        // A conflict is no wait: the child's lock, now that the grace is
+        // over.
+        let probe_h = open_rw(&g.clients[g.backup].mnt.join("h"))?;
+        let t = Instant::now();
+        let r = flock(&probe_h, libc::LOCK_EX | libc::LOCK_NB);
+        anyhow::ensure!(
+            r == Err(Code::Again) && t.elapsed() < Duration::from_secs(3),
+            "the held lock must be refused EAGAIN at once after the grace: {r:?} after {:?}",
+            t.elapsed()
+        );
+        let on = locks_of(&g.clients[g.contender])?;
+        let owner = locks_of(&g.clients[g.backup])?;
+        eprintln!(
+            "    {NAME}: contender grace_waits {} (ms total {}, gave up {}); successor \
+             grace_wait_answers {}, grace_end_serves {}, grace_refusals {}",
+            on["grace_waits"],
+            on["grace_wait_ms_total"],
+            on["grace_wait_gave_up"],
+            owner["grace_wait_answers"],
+            owner["grace_end_serves"],
+            owner["grace_refusals"]
+        );
+        anyhow::ensure!(
+            on["grace_waits"].as_u64().unwrap_or(0) >= 2 && on["grace_wait_gave_up"] == 0,
+            "the contender must have counted both waits and no give-up: {on}"
+        );
+        anyhow::ensure!(
+            owner["grace_wait_answers"].as_u64().unwrap_or(0) >= 1
+                && owner["grace_end_serves"].as_u64().unwrap_or(0) >= 1,
+            "the successor must have answered the wait and served its parked waiter at the grace's end: {owner}"
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        g.keep_logs(NAME);
+    }
+    g.finish();
     result
 }
 

@@ -1366,10 +1366,17 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "s3-cut-holder-failover-with-locks",
-        desc: "plan 43 C7-H2 cost (gate G5): four nodes, strict reads, a held lock; the holder loses S3 but not P2P, its backup seals once the lease reads expired and takes over; prints the failover, the first write acknowledged and the first lock granted after it, the longest write, and every errno the applications saw (fails only on an errno other than EAGAIN)",
+        desc: "plan 43 C7-H2 cost (gate G5): four nodes, strict reads, a held lock; the holder loses S3 but not P2P, its backup seals once the lease reads expired and takes over; prints the failover, the first write acknowledged and the first lock granted after it, the longest write, the longest non-blocking lock attempt (a request on a free lock waits for the grace: plan 43 F-b) and every errno the applications saw (fails on any write, read or lock error)",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::s3_cut_holder_failover_with_locks,
+    },
+    Scenario {
+        name: "lock-grace-wait",
+        desc: "plan 43 F-b: three nodes, the holder killed with a lock held; in the successor's lock grace a non-blocking F_SETLK on a free file waits and is granted at its end (never EAGAIN), one with a SIGALRM at 8 s ends EINTR, a blocking F_SETLKW parked at the successor is served by the grace-end timer, and the held lock is refused EAGAIN at once afterwards; grace_waits counted, grace_wait_gave_up 0",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_grace_wait,
     },
     Scenario {
         name: "lock-failover",
@@ -1803,6 +1810,20 @@ pub const SCENARIOS: &[Scenario] = &[
         requires: &[crate::suites::FUSE_URING, "taskset"],
         caps: &[],
         run: transport::transport_lock_wait_budget,
+    },
+    Scenario {
+        name: "transport-lock-grace",
+        desc: "plan 43 F-b, real kernel: three nodes on the ring at queue depth 4, the holder killed with a lock held; inside the successor's lock grace two F_SETLKW and one non-blocking F_SETLK on free files, pinned to one CPU, take the queue's three lock waits and are all granted at the grace's end (none ENOLCK or EAGAIN, none refused), while a read from that CPU and from another is answered meanwhile (one entry stays free)",
+        requires: &[crate::suites::FUSE_URING, "taskset"],
+        caps: &[Cap::ClusterLocks],
+        run: transport::transport_lock_grace,
+    },
+    Scenario {
+        name: "transport-lock-grace-queue",
+        desc: "plan 43 F-b on the ring: in a failover's grace, DEPTH non-blocking F_SETLKs on free files pinned to one CPU at queue depth DEPTH (2; CONSTELLATION_HARNESS_QUEUE_DEPTH): DEPTH - 1 wait (the queue's lock-wait budget) and are granted at the grace's end, the last is refused at once EAGAIN as before F-b and counted (grace_wait_refused_ring), and a read of another file from that CPU is answered within seconds, not at the grace's end",
+        requires: &[crate::suites::FUSE_URING, "taskset"],
+        caps: &[Cap::ClusterLocks],
+        run: transport::transport_lock_grace_queue,
     },
     Scenario {
         name: "lifecycle-suspend-mid-write",

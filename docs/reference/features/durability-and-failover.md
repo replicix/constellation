@@ -507,12 +507,15 @@ backup seals at the expiry it reads, which used to be a TTL takeover with
 no wait at all. Measured with strict reads and a held lock,
 that failover's first acknowledged write moved from the takeover itself to
 about 8.5 s after it, and the first new lock grant to about 23.5 s after
-it; a non-blocking lock request on a free file answers `EAGAIN` meanwhile
-(and a ring-transport mount may answer `ENOLCK` past its queue depth).
+it; a non-blocking lock request on a free file waits for the grace
+meanwhile, on a thread of the mount's pool, and is granted at its end
+(`EAGAIN` only after 49.5 s with the defaults, `EINTR` on a signal; see
+[Cluster locks](cluster-locks.md#waiting-for-a-grace)); a request that a
+ring-transport mount has no queue entry to wait on is answered at once, as
+before.
 Only a tenure that served strict reads or locks costs its successor
 anything. Shortening the wait from the successor's own observation of the
-old holder's last renewal, and turning those errors into waits, are
-planned (plan 43, C7-F).
+old holder's last renewal is planned (plan 43, C7-F).
 
 The successor keeps the lease through its takeover gate and until both
 waits have passed: it does not idle-release it to a node that wants it,

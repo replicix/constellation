@@ -898,6 +898,15 @@ pub struct ErrnoLog(Arc<Mutex<Vec<ErrnoRecord>>>);
 #[derive(Debug, Clone, Default)]
 pub struct Evidence {
     pub fenced_io: HashMap<String, u64>,
+    /// Per node, the non-blocking lock requests that gave up waiting for
+    /// an owner's grace (`locks.grace_wait_gave_up`, plan 43 F-b): none
+    /// may, under any load.
+    pub grace_gave_up: HashMap<String, u64>,
+    /// Per node, the waits that could not begin and were answered
+    /// `EAGAIN` as before F-b (`locks.grace_wait_refused_ring`: a ring
+    /// queue's lock-wait budget was spent; `grace_wait_refused_pool`: no
+    /// `lock-wait` thread): none may.
+    pub grace_refused: HashMap<String, u64>,
     pub acquire_deadline: Duration,
     /// Allow an `EIO` in doubt past the deadline
     /// (`CONSTELLATION_HARNESS_ALLOW_IN_DOUBT=1`, triage runs only).
@@ -917,16 +926,33 @@ impl Evidence {
         acquire_deadline: Duration,
     ) -> Evidence {
         let mut fenced_io = HashMap::new();
+        let mut grace_gave_up = HashMap::new();
+        let mut grace_refused = HashMap::new();
         for c in clients {
-            let n = c
-                .control_status()
-                .ok()
+            let status = c.control_status().ok();
+            let n = status
+                .as_ref()
                 .map(|s| fenced_ops(&s["locks"]))
                 .unwrap_or(0);
             *fenced_io.entry(c.name.clone()).or_insert(0) += n;
+            let g = status
+                .as_ref()
+                .and_then(|s| s["locks"]["grace_wait_gave_up"].as_u64())
+                .unwrap_or(0);
+            *grace_gave_up.entry(c.name.clone()).or_insert(0) += g;
+            let r = status
+                .as_ref()
+                .map(|s| {
+                    s["locks"]["grace_wait_refused_ring"].as_u64().unwrap_or(0)
+                        + s["locks"]["grace_wait_refused_pool"].as_u64().unwrap_or(0)
+                })
+                .unwrap_or(0);
+            *grace_refused.entry(c.name.clone()).or_insert(0) += r;
         }
         Evidence {
             fenced_io,
+            grace_gave_up,
+            grace_refused,
             acquire_deadline,
             allow_in_doubt: std::env::var("CONSTELLATION_HARNESS_ALLOW_IN_DOUBT")
                 .is_ok_and(|v| v.trim() == "1"),
@@ -1021,6 +1047,33 @@ impl ErrnoLog {
                 Ok(why) => rep.allowed.push(format!("{what}: [{class}] {why}")),
                 Err(why) => rep.bugs.push(format!("{what}: [{class}] {why}")),
             }
+        }
+        // A non-blocking lock request waits for an owner's grace instead
+        // of failing; one that gave up (`lock_grace_wait_max_ms`) is the
+        // grace having outlasted its bound: a bug, whether or not the
+        // workload recorded the `EAGAIN` it got.
+        let mut gave_up: Vec<(&String, &u64)> =
+            ev.grace_gave_up.iter().filter(|(_, n)| **n > 0).collect();
+        gave_up.sort();
+        for (node, n) in gave_up {
+            *rep.counts.entry("grace-wait-gave-up").or_insert(0) += *n as usize;
+            rep.bugs.push(format!(
+                "{node}: {n} non-blocking lock request(s) gave up waiting for an owner's grace \
+                 (EAGAIN after lock_grace_wait_max_ms): [grace-wait-gave-up] the grace outlasted \
+                 its bound"
+            ));
+        }
+        let mut refused: Vec<(&String, &u64)> =
+            ev.grace_refused.iter().filter(|(_, n)| **n > 0).collect();
+        refused.sort();
+        for (node, n) in refused {
+            *rep.counts.entry("grace-wait-refused").or_insert(0) += *n as usize;
+            rep.bugs.push(format!(
+                "{node}: {n} non-blocking lock request(s) could not begin the wait for an \
+                 owner's grace and failed EAGAIN as before it existed (the ring queue's \
+                 lock-wait budget was spent, or no lock-wait thread could start): \
+                 [grace-wait-refused]"
+            ));
         }
         rep
     }
@@ -2463,6 +2516,8 @@ mod tests {
         }
         let mut ev = Evidence {
             fenced_io: [("a".to_string(), 1)].into(),
+            grace_gave_up: HashMap::new(),
+            grace_refused: HashMap::new(),
             acquire_deadline: Duration::from_secs(120),
             allow_in_doubt: false,
         };
@@ -2479,6 +2534,26 @@ mod tests {
         // Triage runs may allow the in-doubt one.
         ev.allow_in_doubt = true;
         assert_eq!(log.judge(&ev).allowed.len(), 3);
+        // A non-blocking request that gave up waiting for a grace is a
+        // bug of its own, recorded or not (plan 43 F-b).
+        ev.grace_gave_up.insert("b".to_string(), 2);
+        let rep = log.judge(&ev);
+        assert_eq!(rep.counts["grace-wait-gave-up"], 2);
+        assert!(
+            rep.bugs.iter().any(|b| b.starts_with("b: 2 non-blocking")),
+            "{:?}",
+            rep.bugs
+        );
+        // So is one that could not begin the wait (ring budget, thread).
+        ev.grace_gave_up.clear();
+        ev.grace_refused.insert("c".to_string(), 1);
+        let rep = log.judge(&ev);
+        assert_eq!(rep.counts["grace-wait-refused"], 1);
+        assert!(
+            rep.bugs.iter().any(|b| b.starts_with("c: 1 non-blocking")),
+            "{:?}",
+            rep.bugs
+        );
     }
 
     /// The writer's rename and unlink drop `ENOENT`; a name the ledger

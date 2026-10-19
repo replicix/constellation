@@ -331,6 +331,9 @@ pub struct Engine {
     /// Plan 30 §M14: the effective `--locks` mode, and every view's flush
     /// for a recalled grant.
     locks_cluster: bool,
+    /// Plan 43 F-b: how long a non-blocking lock request waits for an
+    /// owner that cannot grant yet (`Config::lock_grace_wait_max_ms`).
+    lock_grace_wait_max_ms: u64,
     lock_flushers: Arc<crate::locks::LockFlushers>,
     /// Open-orphan holds (DESIGN.md §3): every view's open-handle table,
     /// and the writer of this node's `holds/<node>.json`.
@@ -1065,6 +1068,7 @@ impl Engine {
         // Plan 30 §M14: cluster locks need a P2P path to the sequencer.
         let locks_cluster = crate::locks::cluster_effective(locks, peers.is_enabled())?;
         core_config.locks = locks_cluster;
+        let lock_grace_wait_max_ms = core_config.lock_grace_wait_max_ms();
         tracing::info!(
             locks = if locks_cluster { "cluster" } else { "local" },
             "file locks"
@@ -1725,6 +1729,7 @@ impl Engine {
             )),
             cto_strict,
             locks_cluster,
+            lock_grace_wait_max_ms,
             lock_flushers,
             hold_sources,
             holds,
@@ -1885,6 +1890,10 @@ impl Engine {
                             tx: self.sync_tx.clone(),
                             inval: self.kernel_inval.as_ref().map(|k| k.inodes()),
                             lineage: Default::default(),
+                            grace_wait_max: std::time::Duration::from_millis(
+                                self.lock_grace_wait_max_ms,
+                            ),
+                            waits: Default::default(),
                         })
                     }),
                     lease: self.lease.clone(),

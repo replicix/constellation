@@ -14,7 +14,15 @@
 //!   locks is one its fast successor waits out), the grace (M9's
 //!   acknowledgement floor, the restart quarantine, or the subtree grace
 //!   after an outwaited delegate), then grant, or recall the conflicting
-//!   grants and park the request (a waiter, FIFO per inode).
+//!   grants and park the request (a waiter, FIFO per inode). A
+//!   non-blocking request that nothing conflicts with but which this
+//!   owner may not grant yet (the grace, a new tenure's floor, an
+//!   outwaited holder's barrier, a delegate's short authority) is
+//!   answered `Waiting { grace: true }`, and its requester answers its
+//!   engine `LockAnswer::Wait` (plan 43 F-b): the engine retries it,
+//!   bounded, on a thread of its own. A known conflict still answers
+//!   `WouldBlock`. A timer at each grace's end (`Timer::LockGraceEnd`)
+//!   serves the parked waiters it held back.
 //! - A recalled node releases (`LockReleased`) or is outwaited by the
 //!   grant's expiry (`Timer::LockGrantExpiry`); either serves the
 //!   waiters. A waiter whose request was answered `Waiting` (so the RPC
@@ -80,6 +88,28 @@ struct LockOp {
     /// The lease was re-read once because the cached holder could not be
     /// reached (see `lock_route_op`).
     reread: bool,
+}
+
+/// Why `lock_try_grant` did not grant.
+enum Blocked {
+    /// Live grants of other nodes conflict: to recall.
+    Conflict(Vec<Grant>),
+    /// The requester's own grant is recalled and being given up.
+    Recalled,
+    /// Nothing conflicts, but this owner may not grant yet.
+    NotYet(NotYet),
+}
+
+/// What a request that nothing conflicts with is waiting for (plan 43
+/// F-b: a non-blocking request waits for it too).
+#[derive(Clone, Copy, Debug)]
+enum NotYet {
+    /// A new root tenure's floor is not known yet.
+    TenureFloor,
+    /// An outwaited holder's barrier is not settled yet.
+    Barrier,
+    /// A delegate with too little authority left to grant anything.
+    ShortAuthority,
 }
 
 /// How often a release held back for tagged mutations in flight looks
@@ -250,6 +280,9 @@ pub(crate) struct LockState {
     /// tick — a refusal for stale liveness, an unmarked lease or a grace
     /// period has no event of its own that ends it.
     waiter_tick: Option<TimerId>,
+    /// Owner side: the timer at the earliest end of a grace still to
+    /// come, and when it fires (`lock_arm_grace_end`).
+    grace_end_timer: Option<(TimerId, Ms)>,
     recalls: BTreeMap<GrantId, Recalling>,
     recall_by_req: BTreeMap<OpId, GrantId>,
     /// Subtree grace after an outwaited delegate: `(dir, until)`.
@@ -747,6 +780,7 @@ impl Core {
             // gone; `Waiting` asks nothing of a live one.
             let outcome = LockOutcome::Waiting {
                 retry_ms: self.lock_resume_retry_ms(),
+                grace: false,
             };
             self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out);
             return;
@@ -855,6 +889,7 @@ impl Core {
                 if let Some(req) = w.req {
                     let outcome = LockOutcome::Waiting {
                         retry_ms: self.lock_resume_retry_ms(),
+                        grace: false,
                     };
                     self.lock_answer(from, PeerMsg::LockReply { req, outcome }, out);
                 }
@@ -1201,6 +1236,7 @@ impl Core {
                     self.lock_conflict_refusal(now, from, ino, mode, blocking, replica)
                         .unwrap_or(LockOutcome::Waiting {
                             retry_ms: self.lock_resume_retry_ms(),
+                            grace: false,
                         }),
                 );
             }
@@ -1227,18 +1263,61 @@ impl Core {
         }
         if self.lock_grace_active(now, ino, replica) {
             self.stats.lock_grace_refusals += 1;
-            return if blocking {
+            if blocking {
                 self.lock_park(now, from, ino, mode, req, op, sent, out);
-                Served::Parked
-            } else {
-                Served::Outcome(LockOutcome::WouldBlock)
-            };
+                return Served::Parked;
+            }
+            // Nothing granted in a grace, and a live grant that conflicts
+            // is refused all the same; with none the request waits for
+            // the grace to end (plan 43 F-b), as NLM and NFSv4 clients do
+            // for a server in its grace period.
+            return Served::Outcome(
+                match self.lock_conflict_refusal(now, from, ino, mode, false, replica) {
+                    Some(refused) => refused,
+                    None => {
+                        self.stats.lock_grace_waits += 1;
+                        LockOutcome::Waiting {
+                            retry_ms: self.lock_grace_retry_ms(now, ino, replica),
+                            grace: true,
+                        }
+                    }
+                },
+            );
         }
-        let conflicting =
+        let blocked =
             match self.lock_try_grant(now, now, from, ino, mode, cap_ms, gen, out, replica) {
                 Ok(outcome) => return Served::Outcome(outcome),
-                Err(conflicting) => conflicting,
+                Err(blocked) => blocked,
             };
+        let conflicting = match blocked {
+            Blocked::Conflict(conflicting) => conflicting,
+            // Behind the tenure floor `lock_try_grant` has not looked at
+            // the table yet: a live conflict, or the requester's own grant
+            // under recall, is refused at once all the same (a refusal
+            // grants nothing; the barrier and the short authority come
+            // after these checks, so it is no change for them).
+            Blocked::NotYet(_)
+                if !blocking && self.lock_known_refusal(now, from, ino, mode, replica) =>
+            {
+                self.stats.lock_would_block += 1;
+                return Served::Outcome(LockOutcome::WouldBlock);
+            }
+            Blocked::NotYet(why) if !blocking => {
+                self.stats.lock_not_yet_waits += 1;
+                tracing::debug!(
+                    node = self.cfg.node_id,
+                    to = from,
+                    ino,
+                    ?why,
+                    "a non-blocking lock request waits: nothing conflicts, the owner may not grant yet"
+                );
+                return Served::Outcome(LockOutcome::Waiting {
+                    retry_ms: self.lock_resume_retry_ms(),
+                    grace: true,
+                });
+            }
+            Blocked::Recalled | Blocked::NotYet(_) => Vec::new(),
+        };
         for g in conflicting {
             self.lock_recall(now, g, replica, out);
         }
@@ -1249,6 +1328,79 @@ impl Core {
             self.stats.lock_would_block += 1;
             Served::Outcome(LockOutcome::WouldBlock)
         }
+    }
+
+    /// How soon a non-blocking request refused for a grace asks again:
+    /// the grace's remainder (a difference on this owner's clock), at
+    /// most a second, so that it is routed afresh promptly should the
+    /// ownership move meanwhile.
+    fn lock_grace_retry_ms(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> u64 {
+        let left = self.lock_grace_end(now, ino, replica) - now.0;
+        (left + 1).clamp(10, 1_000) as u64
+    }
+
+    /// When the grace on `ino` ends: the whole-namespace quarantine or
+    /// the latest subtree grace covering it (see `lock_in_grace`).
+    fn lock_grace_end(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> i64 {
+        use constellation_fs_core::types::ROOT_INO;
+        self.lk.grace.retain(|(_, until)| *until > now);
+        let unlinked = ino != ROOT_INO && !replica.is_under(ino, ROOT_INO);
+        let mut end = Self::lock_quarantine_until(replica);
+        for (d, until) in &self.lk.grace {
+            if unlinked || *d == ROOT_INO || replica.is_under(ino, *d) {
+                end = end.max(until.0);
+            }
+        }
+        end
+    }
+
+    /// Keep one timer at the earliest end of a grace still to come
+    /// (`Timer::LockGraceEnd`): the parked waiters are served the moment
+    /// a grace ends, not at their next re-attach. Called wherever a
+    /// grace is set, and by what parks a waiter.
+    pub(crate) fn lock_arm_grace_end(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.lk.grace.retain(|(_, until)| *until > now);
+        let quarantine = Self::lock_quarantine_until(replica);
+        let next = self
+            .lk
+            .grace
+            .iter()
+            .map(|(_, until)| until.0)
+            .chain((quarantine > now.0).then_some(quarantine))
+            .min();
+        let Some(next) = next else {
+            return;
+        };
+        if let Some((id, at)) = self.lk.grace_end_timer {
+            if at.0 <= next {
+                return;
+            }
+            self.cancel_timer(id, out);
+        }
+        let id = self.set_timer(Ms(next), Timer::LockGraceEnd, out);
+        self.lk.grace_end_timer = Some((id, Ms(next)));
+    }
+
+    /// A grace ended: serve the waiters it held back, and look at the
+    /// next end.
+    pub(crate) fn on_lock_grace_end(
+        &mut self,
+        now: Ms,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
+        self.lk.grace_end_timer = None;
+        let parked = self.lk.waiters.len();
+        self.lock_reserve_all(now, replica, out);
+        if self.lk.waiters.len() < parked {
+            self.stats.lock_grace_end_serves += 1;
+        }
+        // (The next end is armed after this event: `locks_after_event`.)
     }
 
     /// A non-blocking request that a live grant conflicts with, asked of
@@ -1276,9 +1428,34 @@ impl Core {
         Some(LockOutcome::WouldBlock)
     }
 
+    /// Whether a non-blocking request is refused for what the table knows
+    /// whatever this owner may grant yet: the requester's own grant is
+    /// under recall, or a live grant of another node conflicts
+    /// (`lock_try_grant`'s own tests, without its effects).
+    fn lock_known_refusal(
+        &self,
+        now: Ms,
+        from: NodeId,
+        ino: Ino,
+        mode: LockMode,
+        replica: &dyn Replica,
+    ) -> bool {
+        let own = replica.locks().own_grant(ino, from, now.0);
+        if own.is_some_and(|g| g.recalled) {
+            return true;
+        }
+        let mode = own.map_or(mode, |g| g.mode.max(mode));
+        let reaffirm = own.is_some_and(|g| g.mode == mode);
+        !reaffirm
+            && !replica
+                .locks()
+                .conflicting(ino, from, mode, now.0)
+                .is_empty()
+    }
+
     /// How soon a request waiting for this node to own the root again
     /// (`lock_owner_resuming`) asks again.
-    fn lock_resume_retry_ms(&self) -> u64 {
+    pub(crate) fn lock_resume_retry_ms(&self) -> u64 {
         (self.cfg.forward_backoff_ms / 4).max(10)
     }
 
@@ -1308,12 +1485,13 @@ impl Core {
         gen: u64,
         out: &mut Vec<Action>,
         replica: &dyn Replica,
-    ) -> Result<LockOutcome, Vec<Grant>> {
+    ) -> Result<LockOutcome, Blocked> {
         // A new root tenure grants nothing until its floor is known
-        // (parked, or `WouldBlock`; reclaims go on).
+        // (parked, or `Waiting` for a non-blocking request; reclaims go
+        // on).
         if gen == 0 && !self.lock_tenure_floor_ready(replica) {
             self.stats.lock_tenure_waits += 1;
-            return Err(Vec::new());
+            return Err(Blocked::NotYet(NotYet::TenureFloor));
         }
         let own = replica.locks().own_grant(ino, from, now.0);
         if own.is_some_and(|g| g.recalled) {
@@ -1322,7 +1500,7 @@ impl Core {
             // the id, and the release then dropped a grant with locks
             // under it — the harness's SQLite run found this). The
             // request parks (or would block) until the release.
-            return Err(Vec::new());
+            return Err(Blocked::Recalled);
         }
         let mode = own.map_or(mode, |g| g.mode.max(mode));
         let reaffirm = own.is_some_and(|g| g.mode == mode);
@@ -1333,13 +1511,13 @@ impl Core {
         };
         self.lock_take_outwaited(replica);
         if !conflicting.is_empty() {
-            return Err(conflicting);
+            return Err(Blocked::Conflict(conflicting));
         }
         // A holder of this inode was outwaited: what it did under its
         // grant must be under this one's floor first (parked, or
         // `WouldBlock`). A re-affirmation gives the node nothing new.
         if !reaffirm && !self.lock_barrier_ready(now, from, ino, gen, replica, out) {
-            return Err(Vec::new());
+            return Err(Blocked::NotYet(NotYet::Barrier));
         }
         let ttl = self.lock_ttl_ms().min(cap_ms);
         if ttl < self.lock_min_grant_ms() {
@@ -1351,7 +1529,7 @@ impl Core {
             if gen != 0 {
                 self.stats.lock_short_authority_waits += 1;
                 self.deleg_renew_now(now, gen, out);
-                return Err(Vec::new());
+                return Err(Blocked::NotYet(NotYet::ShortAuthority));
             }
             if ttl <= 0 {
                 return Ok(LockOutcome::Busy);
@@ -2226,7 +2404,10 @@ impl Core {
                 to: w.node,
                 msg: PeerMsg::LockReply {
                     req,
-                    outcome: LockOutcome::Waiting { retry_ms },
+                    outcome: LockOutcome::Waiting {
+                        retry_ms,
+                        grace: false,
+                    },
                 },
             });
         }
@@ -2362,12 +2543,13 @@ impl Core {
         }
         match self.lock_try_grant(now, base, from, ino, mode, cap_ms, gen, out, replica) {
             Ok(outcome) => Some(outcome),
-            Err(conflicting) => {
+            Err(Blocked::Conflict(conflicting)) => {
                 for g in conflicting {
                     self.lock_recall(now, g, replica, out);
                 }
                 None
             }
+            Err(Blocked::Recalled | Blocked::NotYet(_)) => None,
         }
     }
 
@@ -3395,11 +3577,33 @@ impl Core {
                     self.stats.lock_granted_recalled += 1;
                 }
             }
-            LockOutcome::Waiting { retry_ms } => {
-                // A non-blocking request is told to wait only by an owner
-                // about to own the root again (`lock_serve`): within the
-                // bound an op without its sequencer has; past it, as
-                // `Busy`.
+            LockOutcome::Waiting {
+                retry_ms,
+                grace: true,
+            } => {
+                // The owner may not grant yet, and nothing conflicts
+                // (plan 43 F-b). A non-blocking request is handed back
+                // to the engine to wait on a thread of its own, up to
+                // its bound, without spending an attempt; a blocking one
+                // (the owner parks those: a race) asks again.
+                if o.blocking {
+                    self.set_timer(now.plus(retry_ms), Timer::LockRetry(op), out);
+                } else {
+                    self.lk.ops.remove(&op);
+                    out.push(Action::ControlDone {
+                        op,
+                        result: Ok(ControlOk::Lock(LockAnswer::Wait { retry_ms })),
+                    });
+                }
+            }
+            LockOutcome::Waiting {
+                retry_ms,
+                grace: false,
+            } => {
+                // A non-blocking request is told to wait this way only by
+                // an owner about to own the root again (`lock_serve`):
+                // within the bound an op without its sequencer has; past
+                // it, as `Busy`.
                 let late = !o.blocking && now.0 - o.since.0 >= self.cfg.s3_less_deadline_ms as i64;
                 if late {
                     self.lock_retry(now, op, out);
@@ -5104,6 +5308,7 @@ impl Core {
         let outcome = if kept {
             LockOutcome::Waiting {
                 retry_ms: self.lock_resume_retry_ms(),
+                grace: false,
             }
         } else {
             LockOutcome::NotOwner { owner: 0 }
@@ -5136,6 +5341,12 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.lock_fill_renew_heads(replica, out);
+        // Every grace is set by some event (a takeover's marker, a
+        // restart, an outwaited delegate, a released takeover): the
+        // timer at its end is armed right after it.
+        if self.cfg.locks {
+            self.lock_arm_grace_end(now, replica, out);
+        }
         let dirs = std::mem::take(&mut self.lk.pending_dir_floors);
         if !dirs.is_empty() {
             let floor = self.lock_release_floor(replica);

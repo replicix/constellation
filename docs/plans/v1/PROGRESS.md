@@ -50860,3 +50860,296 @@ review: 5 of 5); the two fail-before variants again on the review's window chang
 - The control thread is one thread for all connections: it encodes and writes the final
   `Response` of every call (a very large `status` is encoded there). Measured idle at 0
   ticks and `node.status` unchanged; a per-connection thread is not needed so far.
+
+## Fix: lock requests inside a lock grace wait for it (plan 43 C7-F, F-b)
+
+The maintainer's answer to Q18 (2026-10-18): a lock request during a
+failover's lock grace costs latency, not an error. A non-blocking request
+(`F_SETLK`, `flock -n`) for a lock nothing conflicts with, which the owner
+may not grant *yet*, answered `EAGAIN` (`WouldBlock`) for the whole
+grace; a blocking one parked at the owner, was served at the next waiter
+tick, and on a ring mount past the queue's `depth - 1` budget (served as a
+non-blocking request) got `ENOLCK`. NLM and NFSv4 clients retry a
+request the server refused for its grace period until the grace ends; a
+network file system answers when it knows.
+
+This entry is the patch after the review of 2026-10-19 (changes needed: F1, F2,
+F3, F7, F8, all made; the first version of this entry, with its
+measurements, is replaced by this one).
+
+### What changed
+
+- **Owner** (`core/locks.rs`): `lock_try_grant` returns
+  `Result<LockOutcome, Blocked>` (`Conflict(grants)`, `Recalled`,
+  `NotYet(TenureFloor | Barrier | ShortAuthority)`). In the grace, and
+  for a `NotYet`, a non-blocking request with no conflicting grant is
+  answered `Waiting { retry_ms, grace: true }` (`retry_ms`: the grace's
+  remainder, at most 1 s so the request is routed afresh when the
+  ownership moves; a quarter of the forward backoff for the others); a
+  live conflict and the requester's own grant under recall are still
+  `WouldBlock` at once, **behind the tenure floor too** (F1:
+  `lock_known_refusal`; `lock_try_grant` returns the floor before it has
+  looked at the table, and the first version answered a known conflict
+  there with a wait, which the docs said it did not); a blocking request
+  still parks.
+- **Requester**: `Waiting { grace: true }` for a non-blocking op forgets
+  the op and answers the engine `LockAnswer::Wait { retry_ms }` (new): no
+  attempt is spent, however many answers come. A blocking op told so (a
+  race: owners park those) retries itself. `LockOutcome::Waiting` and its
+  wire form `LockOutcomeWire::Waiting` carry `grace`.
+- **The frontend is asked first** (F2, F3): `Responder::begin_wait`
+  (`constellation-vfs`; `WaitStart::Held(Option<CancelToken>)` or
+  `Refused`), called by the view when its first attempt says wait, on the
+  frontend's own thread, before the wait is handed over. The FUSE adapter
+  answers it by registering the request interruptible and counting it as a
+  deferred reply *then* (before, every `F_SETLK` of a cluster-lock mount
+  did, whether it waited or not), and by asking fuser to hold the request.
+- **The ring budget** (F2). A request that waits holds its ring entry until
+  it is answered; the kernel queues a request on the queue of the CPU that
+  sent it, serves it from no other queue, and holds back every further
+  request of that CPU while every entry of the queue is held. First
+  version: two waits at depth 2 or 4 stalled every request of their CPU
+  for the whole grace (9.95 s, measured by the review on a real kernel;
+  at the default depth 32 it takes 31 waits on one CPU). Now a wait is
+  counted against the queue's lock-wait budget, the one `FUSE_SETLKW`
+  already had (`depth - 1` entries per queue, one always left for the other
+  requests): `ReplyEmpty::hold_for_wait()` in the vendored fuser
+  (`RingCommit::reserve_lock_wait`, now idempotent and false for a
+  `SETLKW` that was downgraded for the budget); `true` over `/dev/fuse`.
+  With none to give, the request is answered at once, as before F-b:
+  `EAGAIN` for a non-blocking request, `ENOLCK` for a `FUSE_SETLKW` served
+  as non-blocking past the budget (plan 38 Z2c), counted
+  (`grace_wait_refused_ring`, and the ring's `lock_wait_downgrades`); the
+  load campaign's errno judge fails on both (class `grace-wait-refused`).
+  The fuser change is `hold_for_wait` on fuser's `io-uring` branch
+  (`db6e9f8`, where the budget lives), merged up through `ring-idle-wait`
+  into `replicix`; `Cargo.toml` and `Cargo.lock` pin the `replicix` merge,
+  `5cf4fa77108a1724b359fc6b0260ae6646759265`.
+- **Engine** (`engine/locks.rs`, `view/ops.rs`): the non-blocking path is
+  `NbStep { Done, Wait }`. A request that has to wait is handed to a
+  bounded pool of `lock-wait` threads (F8: `WaitPool`, at most 16 threads
+  started on demand and gone after 5 s idle, however many requests wait: a
+  waiting request is a timer and a short step, not a thread; `lock()`'s
+  blocking requests keep their thread each, as before), which asks again
+  after each `retry_ms` until the lock is taken, refused (`EAGAIN`: the
+  table then shows a conflict), cancelled (`EINTR`, looked at between
+  attempts, within 100 ms: an attempt in flight, a round trip to the owner
+  that takes seconds against one that cannot be reached, finishes first;
+  slicing it is a follow-up) or past `lock_grace_wait_max_ms` from the request (`EAGAIN`,
+  counted). A pool that cannot start a thread answers the request now,
+  `EAGAIN`, counted (`grace_wait_refused_pool`), never `EIO` (the first
+  version dropped the reply, which answers `EIO`, a new errno for
+  `F_SETLK`); one that has threads queues the wait for them. Nothing waits
+  on the frontend's worker or, over a ring, on an offload thread (a 23.5 s
+  wait there stalls whatever else is offloaded to it). The watchdog entry
+  becomes a blocking one (not a stall). A frontend that cannot defer
+  (`FrontendCaps::deferrable`) waits inline, as for a blocking lock.
+  `lock_grace_wait_max_ms` = takeover window + max(read delegation TTL,
+  lock TTL) + reclaim horizon + 2 margins + `s3_less_deadline_ms` (49.5 s
+  at the defaults), `Config::lock_grace_wait_max_ms`, no knob.
+- **FUSE adapter** (F3): registering an interrupt costs, per request, a
+  scan of every waiting request and, over a ring, a `/proc` read for each
+  that is overdue, on the registering thread (the review measured 1 ms with
+  a hundred lock waiters on a ring, 10 to 40 µs at 32 threads on
+  `/dev/fuse`). Registration is O(1) now (the early-interrupt list is
+  pruned from its front, the watcher thread, not the registering one,
+  looks at overdue requests), and a request answered at once registers
+  nothing (above).
+- **A timer at each grace's end** (`Timer::LockGraceEnd`,
+  `Core::lock_arm_grace_end`): one timer at the earliest end of a grace
+  still to come, armed after every event that may have set one
+  (`locks_after_event`), serves the parked waiters when it fires
+  (`grace_end_serves`). Before, a waiter parked in the grace was served at
+  the next waiter tick (`recall_hold_ms`) or its re-attach.
+- **Counters** (`status.locks`): node side `grace_waits`,
+  `grace_wait_ms_total`, `grace_wait_gave_up`, `grace_wait_refused_ring`,
+  `grace_wait_refused_pool`; owner side `grace_wait_answers`,
+  `not_yet_answers`, `grace_end_serves`. The load campaign's errno judge
+  fails on `grace_wait_gave_up`, `grace_wait_refused_ring` and `_pool` above
+  0 (`Evidence::grace_gave_up`, `grace_refused`; classes
+  `grace-wait-gave-up`, `grace-wait-refused`).
+- Harness: `s3-cut-holder-failover-with-locks` fails on any lock attempt
+  error (it tolerated `EAGAIN`) and prints the longest attempt;
+  `lock-grace-wait` (dev-fuse), `transport-lock-grace` (ring, depth 4) and
+  `transport-lock-grace-queue` (ring, depth 2 and 4; the reviewer's
+  `review-ring-stall`), with `lock-probe nonblocking` and a
+  `graced_failover` fixture, whose `finish` kills the lock probes still
+  running before it unmounts and waits for them to exit (a failed run
+  spent 600 s in an `EBUSY` unmount); `transport-lock-grace` reads `f` from
+  both CPUs before it starts its probes (the first strict read after the
+  kill waits for the new owner's session position: 2.5 s, past 5 s on a
+  loaded host, and that is the failover's, not the lock waits'); the mock `Vfs` has `lock_grace` and asks its responder
+  `begin_wait`.
+
+### Tests (fail-before = what c9bee29 does, or the first version of this patch)
+
+- Core (`core/tests.rs`, `mod locks`):
+  `a_nonblocking_lock_in_the_grace_waits_for_it` (c9bee29: `WouldBlock`;
+  a live conflict stays `WouldBlock`), `..._behind_a_barrier_waits`,
+  `..._on_a_delegates_short_authority_waits` (each `WouldBlock`),
+  `a_nonblocking_lock_behind_the_tenure_floor_waits` (now really the
+  floor: asserts `lock_tenure_waits` moves and the barrier's does not; the
+  first version's asserted request was refused by the barrier),
+  `a_known_conflict_behind_the_tenure_floor_is_refused_at_once` (F1;
+  fails with the wait for everything: `Waiting` for both a conflicting
+  grant and the requester's own recalled one),
+  `a_nonblocking_request_told_to_wait_answers_the_engine_wait` and
+  `a_local_nonblocking_request_in_the_grace_answers_the_engine_wait`
+  (new variant; pin the mapping, the spent attempts and the blocking
+  race), `a_blocking_waiter_is_served_at_the_end_of_the_grace` (c9bee29:
+  nothing at the grace's end), `the_grace_end_timer_follows_the_earliest_end`.
+- Engine (`view/owner_fence_tests.rs`):
+  `a_nonblocking_lock_in_a_grace_does_not_hold_the_calling_thread` (the
+  call returns at once, the answer comes from a `lock-wait` thread after
+  the two told intervals; c9bee29: `EAGAIN` at once),
+  `waiting_for_a_grace_is_no_lost_round`,
+  `a_cancellation_ends_a_graced_wait_with_eintr`,
+  `a_graced_wait_past_its_bound_gives_up_with_eagain_and_is_counted`,
+  `a_known_conflict_still_refuses_a_nonblocking_lock_at_once`,
+  `a_frontend_that_cannot_defer_waits_in_the_call`; and the review's:
+  `a_wait_the_frontend_cannot_hold_is_answered_at_once` (F2: `EAGAIN`
+  on the calling thread, `grace_wait_refused_ring`, the core asked once),
+  `a_wait_registers_for_signals_only_when_it_begins` (F3: the token comes
+  from `begin_wait`; a request answered at once never registers),
+  `many_waits_are_served_by_a_bounded_pool` (F8: 40 waits, at most 16
+  threads, all answered), `a_pool_that_cannot_start_a_thread_answers_eagain_and_counts_it`
+  (F8: `EAGAIN` not `EIO`, `grace_wait_refused_pool` and not also
+  `grace_waits`, a wait queues behind a running thread), `closing_the_file_during_a_graced_wait_leaves_nothing_behind`
+  (F8: the file closed, the process interrupted: `EINTR` within a slice, the
+  core asked no more, no local lock, no grant).
+- Adapter: `adapter.rs`
+  `a_lock_request_answered_at_once_registers_and_counts_nothing` (F3: a
+  request answered at once registers and counts nothing; one that waits
+  does, an interrupt ends it, an interrupt that came first is found),
+  `registering_a_request_probes_nothing_on_the_registering_thread` (F3's
+  O(1): with a hundred overdue ring waiters registered, registering more
+  runs no `/proc` probe on the registering thread; counting probes, it
+  fails with the old `watch()` on the registration path);
+  `wire.rs`
+  `a_nonblocking_setlk_in_a_grace_is_deferred_and_interruptible_on_a_cluster_lock_mount`
+  (without the wrap: no `EINTR`); `wire_uring.rs` (the in-memory ring, the
+  mock standing in for the view, the real fuser behind it)
+  `nonblocking_grace_waits_leave_their_queue_an_entry` (the review's test,
+  fixed: at depth 2 the first wait holds an entry, the second is refused at
+  once `EAGAIN`, an `OPEN` from the waiters' queue is answered at once;
+  without `hold_for_wait` the second waits too and the open is answered
+  after the grace), `a_downgraded_lock_wait_in_a_grace_is_answered_at_once_and_holds_no_entry`
+  (`ENOLCK` at once, counted as a downgrade, an open on the same queue and
+  on another answered; without the budget it waits and is granted),
+  `session.rs` `a_detach_refuses_while_a_nonblocking_lock_waits_for_a_grace`
+  (needs root: skipped without it). Harness: the judge's
+  `grace-wait-refused` class (`verify.rs`).
+
+### Measurements
+All on the build box (release, seed 42, harness pinned where said), FUSE
+io_uring enabled for the ring lanes.
+
+**`s3-cut-holder-failover-with-locks`, 20 s lease** (this tree has F-a0 but
+not F-a, so the grace is the full floor). Before (7ef243f), two runs: 75 of
+108 non-blocking attempts `EAGAIN` in each (the first at +11.4 s), takeover
++13.6 s, first acknowledged write +22.2 s, first lock granted +37.1 s. After
+(this patch alone is not measured; with both patches, below): 0 errors in 34
+attempts in each of 2 runs, the longest attempt 25.7 s (it began at +11.4 s,
+the first grant is unchanged at +37.1 s), takeover and first write
+unchanged, `grace_waits` 1 (node d), `grace_wait_gave_up` 0. (The
+production-lease runs are in the second entry.)
+
+**`lock-grace-wait`** (three nodes, the holder killed with a lock held, a
+child process holding a lock): a non-blocking lock on a free file inside the
+grace waits (the lock call 14.5 s) and is granted; with a `SIGALRM` after
+8 s it ends `EINTR` 8.04 s into the request; a blocking `F_SETLKW` is
+granted 1 to 12 ms after the non-blocking one, by the grace-end timer; the
+held lock is `EAGAIN` at once after the grace. Contender `grace_waits` 2,
+`grace_wait_gave_up` 0; successor `grace_wait_answers` 14, `grace_end_serves`
+1. Four runs of it pass on the final tree, and the c9bee29 daemon fails it
+(`EAGAIN` at once).
+
+**The ring, on a real kernel.** `transport-lock-grace` (queue depth 4, two
+`F_SETLKW` and one non-blocking `F_SETLK` on free files pinned to one CPU of
+the contender's node, the holder killed): all three granted at the grace's
+end (18.5 s after the takeover), none `ENOLCK`/`EAGAIN`, none refused, and a
+read from the waiters' CPU 2.4 ms and from another CPU 2.4 ms while they
+wait. `transport-lock-grace-queue` (the review's `review-ring-stall`, now a
+test: `DEPTH` non-blocking `F_SETLK`s pinned to one CPU), depth 2: the first
+granted at the grace's end (18.5 s), the second refused at once (`EAGAIN`
+after 4.5 s, the first attempt's time) and counted
+(`grace_wait_refused_ring` 1), the `cat` from the waiters' CPU 2.0 ms;
+depth 4: three granted, one refused, the `cat` 2.4 ms. The review measured
+9.95 s for that `cat` on the first version, at depth 2 and 4 (and 11 ms at
+depth 32 with two waiters). `transport-lock-wait-budget` passes. (Each lane
+passed in two or three runs; the first runs of `transport-lock-grace-queue`
+failed on the harness itself, not on the daemon: they timed the `cat`
+during the requests' first attempts, 4.5 s, which hold their entries as
+before F-b, and a failed run spent ten minutes in an `EBUSY` unmount; the
+scenario now settles 6 s and kills its probes before it unmounts.)
+
+**Rerun on the final tree (main 0fbc74f, fuser from the git remote):**
+`transport-lock-grace` twice (all granted at 18.5 s, opens from both CPUs
+1.1 to 1.3 ms, after the warm-up read), `transport-lock-grace-queue` at
+depth 2 (probe 0 refused after the first attempt's 4.5 s, probe 1 granted at
+the grace's end; the `cat` from the waiters' CPU 12.7 ms), `lock-grace-wait`
+(`EINTR` 8.07 s after the `SIGALRM`, the blocking waiter served 0.7 ms after
+the non-blocking one): pass.
+
+**Interrupt registration** (F3), `bench_interrupt_registration` (release,
+pinned to 8 CPUs, real `/proc` probes), per request, first version / now:
+
+| transport | other waiters | 1 thread | 8 threads | 32 threads |
+|---|---|---|---|---|
+| `/dev/fuse` | 0 | 155 ns / 110 ns | 1.0 µs / 3.2 µs | 13.0 µs / 12.1 µs |
+| `/dev/fuse` | 100 | 1.35 µs / 114 ns | 11.4 µs / 3.1 µs | 36.4 µs / 11.6 µs |
+| ring | 0 | 195 ns / 110 ns | 1.1 µs / 3.8 µs | 17.3 µs / 12.3 µs |
+| ring | 100 (overdue) | **872 µs** / 111 ns | **1.27 ms** / 3.1 µs | **4.3 ms** / 14.4 µs |
+
+That is the cost of a request that waits (it registers once). (A later
+interleaved base/after run of the same bench body on a quiet box, by the
+reviewer, finds the new code faster in every cell, 8 threads and no waiters
+included: 3.0 µs against 3.8 to 4.2 µs; the figures above, taken at
+different times of a loaded box, are not comparable cell to cell.) The common
+request, answered at once, registers nothing: 23 ns for the responder's
+wrapping (`guard_when_waiting` + `track_when_waiting`, in every row). Nothing
+in a registration depends on the number of waiters any more.
+
+**`lock-latency`** (the lock latency gate), tmpfs, ext4, xfs and btrfs (the
+last three on loopback images), release builds of 7ef243f and this tree
+interleaved, 5 runs each, the harness pinned to 4 CPUs; medians, base →
+after: cached re-lock `flock` p50 23.4 → 24.3 / 24.0 → 24.2 / 23.6 → 24.1 /
+24.8 → 25.0 µs (+3.6, +0.8, +2.5, +0.8 %), cached `fcntl` p50 21.9 → 22.3 /
+21.9 → 22.3 / 21.7 → 21.8 / 23.1 → 22.1 µs (+1.6, +1.8, +0.7, −4.3 %),
+sequencer's own lock p50 22.8 → 22.8 / 22.8 → 22.3 / 22.6 → 22.4 / 24.2 →
+22.9 µs, lone node under `cluster` `flock` 22.8 → 23.1 / 22.7 → 22.7 /
+22.4 → 22.6 / 23.4 → 23.3 µs, `fcntl` 21.6 → 21.7 / 21.7 → 21.7 / 21.5 →
+21.8 / 22.9 → 22.3 µs, first lock from a non-sequencer +2.3, +0.5, −2.7,
+−10.9 % (about 275 µs; btrfs is noisy), contended handoff +0.1, −3.2, −4.3,
+−28.9 % (btrfs: runs of 1.2 to 3.2 ms in the base too). The largest p50
+difference, cached `flock` on tmpfs, is 0.84 µs of 23.4 (+3.6 %). The review
+repeated the gate in ABBA order (mine always ran the base first), 10 pairs on
+tmpfs, ext4 and btrfs and 4 on xfs: cached `flock` p50 +1.3, −0.8, +0.4,
+−0.3 %, cached `fcntl` p50 −4.9, +4.7, −2.0, −0.2 % (the two take the same
+new path and move in opposite directions: noise), every other measure
+within ±3 %; the effect is bounded at about 0.3 µs (1 %) per lock. What the
+code adds to a request answered at once is two `Arc` clones, one
+`Instant::now()` and a few branches.
+
+
+### Gates
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets --features
+constellation-frontend-fuse/io-uring -D warnings` clean; the tests of the
+whole workspace and the 38 lock simulation configurations are in the second
+entry (they ran on the two patches together).
+
+### Found on the way, and not done
+
+- `lock-contention-stalled-owner` fails on c9bee29 too (2 runs in 3 on the
+  build box under its usual load: the counter one above the acknowledged
+  increments, none in doubt), a blocking `flock` counter scenario that does
+  not touch this change's path; not investigated here, it needs its own
+  triage.
+- A request's first attempt (the `NeedGrant` round trip, 4.5 s while the new
+  owner is found) still runs on the calling thread, which over a ring is an
+  offload thread, holding its entry; it did before F-b (`EAGAIN` at the end
+  of it), and eight concurrent ones hold eight offload threads of a mount.
+  The review's follow-up: give the non-blocking round trip a short inline
+  budget (`recall_hold_ms`, 100 ms) and hand what is pending to the wait
+  pool. Not done here.

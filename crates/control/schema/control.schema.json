@@ -4066,7 +4066,45 @@
           "minimum": 0,
           "type": "integer"
         },
+        "grace_end_serves": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "grace_refusals": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grace_wait_answers": {
+          "description": "Plan 43 F-b, as the owner: non-blocking requests answered \"wait\"\nfor a grace, and for a tenure floor, a barrier or a delegate's\nshort authority; grace ends that served parked waiters.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grace_wait_gave_up": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grace_wait_ms_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grace_wait_refused_pool": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grace_wait_refused_ring": {
+          "description": "Waits refused at their start and answered `EAGAIN` as before F-b:\nthe ring queue's lock-wait budget was spent, or no `lock-wait`\nthread could be started (a campaign expects none).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "grace_waits": {
+          "description": "Plan 43 F-b: non-blocking requests that waited for an owner that\ncould not grant yet (a grace after a takeover or a restart, the\ntenure's floor, a barrier, a delegate's short authority) instead of\nfailing `EAGAIN`, the milliseconds those waits took in all, and the\nones that gave up with `EAGAIN` after `lock_grace_wait_max_ms` (a\nload campaign expects none).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -4186,6 +4224,11 @@
         "mode": {
           "description": "`cluster` or `local`.",
           "type": "string"
+        },
+        "not_yet_answers": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "owner_fenced_ops": {
           "format": "uint64",
@@ -4370,6 +4413,11 @@
         "grants_waited",
         "grant_wait_ms_total",
         "grants_degraded",
+        "grace_waits",
+        "grace_wait_ms_total",
+        "grace_wait_gave_up",
+        "grace_wait_refused_ring",
+        "grace_wait_refused_pool",
         "grants_table",
         "grants_made",
         "recalls_sent",
@@ -4378,6 +4426,9 @@
         "reclaimed",
         "waiters_parked",
         "grace_refusals",
+        "grace_wait_answers",
+        "not_yet_answers",
+        "grace_end_serves",
         "token_rejections",
         "token_rejections_at_write",
         "settle_waits",

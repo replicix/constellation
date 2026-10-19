@@ -770,6 +770,7 @@ pub enum LockOutcomeWire {
     },
     Waiting {
         retry_ms: u64,
+        grace: bool,
     },
     WouldBlock,
     NotOwner {
