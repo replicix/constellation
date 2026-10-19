@@ -568,7 +568,9 @@ written under it. So the check also happens where the write is recorded
     directories that mean something to their application (beside
     `.git/refs/heads/master.lock` a copy is a ref with a bad name, and
     `git fsck` fails). Every open description of the file reports `EIO`
-    once. A refused replay also leaves a conflict copy, never its
+    once: the one whose close, `fsync` or `O_SYNC` write was refused
+    reports it with that answer, and not again at its next `fsync` (whose
+    data then lands). A refused replay also leaves a conflict copy, never its
     effect: for an operation issued under a lock (one that carried a
     fencing token), under the root of the deepest mounted view above its
     file, named the same way (beside the file only when no mounted view

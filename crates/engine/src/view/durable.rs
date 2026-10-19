@@ -309,16 +309,26 @@ impl View {
     /// kernel cap) it answers `EIO`, never `EINTR`: the bytes are written,
     /// but they are not durable, and an `O_SYNC` write that returns
     /// claims they are. The data stays pending either way.
+    ///
+    /// Its `EIO`, as an `fsync`'s, is `fh`'s report of every discard on
+    /// the file it has not reported yet, the one its own publication may
+    /// just have raised (a commit refused for an ended grant) among them.
     pub(super) fn flush_sync_write(
         &self,
         ino: Ino,
+        fh: Fh,
         cancel: Option<constellation_vfs::CancelToken>,
     ) -> Result<(), Code> {
-        self.durable_run(ino, cancel, || Ok(()))
+        let r = self
+            .durable_run(ino, cancel, || Ok(()))
             .map_err(|code| match code {
                 Code::Intr => Code::Io,
                 code => code,
-            })
+            });
+        if r == Err(Code::Io) {
+            self.lock_errors_reported(ino, fh);
+        }
+        r
     }
 }
 

@@ -117,9 +117,10 @@ impl View {
         Ok(current != 0 && self.handles.take_error(fh, ino, current))
     }
 
-    /// `fh` reports an `EIO` for another reason (the owner fence): it
-    /// counts as the report of every discard on `ino` it has not reported
-    /// yet.
+    /// `fh` reports an `EIO` for another reason (the owner fence, or its
+    /// own `fsync` or close failing — a commit refused for an ended grant
+    /// raises a discard event as it fails): it counts as the report of
+    /// every discard on `ino` it has not reported yet.
     pub(crate) fn lock_errors_reported(&self, ino: Ino, fh: constellation_vfs::Fh) {
         let current = self.meta.locks().error_seq(ino);
         if current != 0 {

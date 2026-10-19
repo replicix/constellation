@@ -50569,3 +50569,57 @@ non-vacuity controls `locks-writer-hold-unchecked` and
   this change, and the fairness check reported hundreds of overtakes. The
   same workload at the root (whose grants are not capped under an epoch)
   had none. Liveness and latency only; tracked separately.
+
+## Fix: a refused commit's `EIO` reported twice (`lock-contention-stalled-owner`, 2026-10-19)
+
+### Finding
+
+`lock-contention-stalled-owner` failed in about two of three runs on a
+loaded build box (2 of 14 on main in a quieter hour), always the same way:
+the flock'ed counter ended exactly one above the acknowledged increments,
+none in doubt. Every failing run had exactly one commit refused at the
+store for an ended grant on the owner (`refused a tagged write at the
+store`, then the conflict copy); every passing run had none. With each
+failed increment printed: the owner's worker got two `fsync` `EIO`s in a
+row (the refused one after the 5 or 12 s stall, then the next one within
+1 ms, or after the next stall), and the second increment's commit is in
+the log as landed.
+
+### Cause
+
+`View::publish_inode`, on a commit refused for its fencing token, keeps
+the writes as a conflict copy and raises a discard error event
+(`note_discard`: every open description reports `EIO` once, errseq-style),
+then returns `EIO`. The `fsync` (or close, or `O_SYNC` write) that ran the
+publication answered that `EIO`, but its own description was not marked
+as having seen the event it had just raised. Its next `fsync` found it
+owed, published its own data and answered `EIO` anyway: the application
+was told an increment failed that took effect. Present since the token's
+refusal path (f57db3c); the owner-fence `EIO` already counted as the
+report (`lock_errors_reported`).
+
+### What changed
+
+- `constellation-engine`: an `EIO` answered by `fsync` (from its
+  publication or its publish gate), by `flush` (close), or by an `O_SYNC`
+  write's or `copy_file_range`'s publication (`flush_sync_write`, which
+  now takes the handle) is that description's report of every discard on
+  the file it has not reported yet (`lock_errors_reported`). Other
+  descriptions open at the time still report it once.
+- Harness: `finish_counter` prints the errors by class before the count
+  check.
+- `cluster-locks.md`: who reports a refused commit's discard.
+
+### Tests
+
+- `owner_fence_tests::a_refused_commits_eio_is_its_own_report_of_the_discard`:
+  the store's lock-table clock past the grant's window while the node
+  still honours it; the refused `fsync`, close and `O_SYNC` write answer
+  `EIO`, each next `fsync` of published data answers 0, another
+  description reports the events once. Fails on the parent at the second
+  `fsync` (`Err(Io)`).
+- Engine lib tests (764), clippy `-D warnings` on engine and harness.
+- `lock-contention-stalled-owner` on the build box: main 2 failed of 14
+  (both with a refusal, both with the double `EIO`); with the fix 30 of
+  30 passed, 16 of them with a refused commit (18 refusals, each one
+  `EIO`, the count exact); `lock-contention-paused-holder` 6 of 6.

@@ -204,15 +204,17 @@ fn finish_counter(
 ) -> Result<()> {
     let got = read_counter(&clients[0].mnt.join("counter"))?;
     eprintln!("    {name}: counter {got}: {acked} increments acknowledged, {doubt} in doubt");
+    // The errors first: a miscount is read against what the increments
+    // were answered.
+    let refs: Vec<&Client> = clients.iter().collect();
+    let ev = Evidence::from_clients(&refs, super::m9::client_deadline());
+    let rep = errnos.judge(&ev);
+    eprintln!("    {name}: errors by class {:?}", rep.counts);
     anyhow::ensure!(
         got >= acked && got <= acked + doubt,
         "lock exclusion: the counter is {got}, {acked} increments were acknowledged and {doubt} \
          were in doubt (lost or doubled increments)"
     );
-    let refs: Vec<&Client> = clients.iter().collect();
-    let ev = Evidence::from_clients(&refs, super::m9::client_deadline());
-    let rep = errnos.judge(&ev);
-    eprintln!("    {name}: errors by class {:?}", rep.counts);
     anyhow::ensure!(
         rep.bugs.is_empty(),
         "errors outside the documented set: {}",

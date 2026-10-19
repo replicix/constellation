@@ -848,6 +848,137 @@ fn a_commit_refused_for_an_ended_grant_becomes_a_conflict_copy() {
     );
 }
 
+/// Harness `lock-contention-stalled-owner`: an `fsync` (or a close) whose
+/// own commit is refused for an ended grant — the store read its clock
+/// past the grant's window while the commit waited for the writer lock —
+/// answers `EIO`, and that `EIO` is its description's report of the
+/// discard. The next `fsync` through it, of data written and published
+/// under a window still honoured, answers 0. Before, the refusal's discard
+/// event stayed owed to the very description that had just reported it:
+/// the next increment's `fsync` answered `EIO` for data that landed, and
+/// the counter ended one above what was acknowledged. The same for a close
+/// and an `O_SYNC` write. A description that was open at the time and
+/// reported nothing yet still reports it, once.
+#[test]
+fn a_refused_commits_eio_is_its_own_report_of_the_discard() {
+    use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
+    let mut f = fenced_fs();
+    // The sync task: every drain and barrier succeeds.
+    let mut core = std::mem::replace(&mut f._core, tokio::sync::mpsc::unbounded_channel().1);
+    std::thread::spawn(move || {
+        while let Some(req) = core.blocking_recv() {
+            match req {
+                SyncRequest::DrainInode { reply, .. } | SyncRequest::Barrier { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
+                _ => {}
+            }
+        }
+    });
+    let me = std::process::id();
+    let owner = Caller::new(0, 0, Some(me));
+    let other = Caller::new(0, 0, Some(std::os::unix::process::parent_id()));
+    let root = Caller::root();
+    let (file, mine) = f.create(&root, ROOT_INO, "counter").unwrap();
+    let ino = file.attr.ino;
+    let theirs = f.open_write(&root, ino).unwrap();
+    // The store's clock, `ahead` ms past this node's.
+    let ahead = Arc::new(AtomicI64::new(0));
+    let store_clock = ahead.clone();
+    f.meta
+        .locks()
+        .set_clock(Arc::new(move || now_unix_ms() + store_clock.load(Relaxed)));
+    f.lock(ino, me, now_unix_ms() + 60_000);
+    let fsync = |caller: &Caller, fh: Fh| {
+        Blocking::run(|r| {
+            f.fs.fsync(
+                &OpCtx::new(OpKind::Fsync, caller),
+                ino,
+                fh,
+                constellation_vfs::Durability::Configured,
+                r,
+            )
+        })
+        .map_err(|e| e.code())
+    };
+    let flush = |caller: &Caller, fh: Fh| {
+        Blocking::run(|r| {
+            f.fs.flush(
+                &OpCtx::new(OpKind::Flush, caller),
+                ino,
+                fh,
+                LockOwner(0xf00),
+                r,
+            )
+        })
+        .map_err(|e| e.code())
+    };
+    let size = || f.meta.getattr(ino).unwrap().unwrap().size;
+    let cx = OpCtx::new(OpKind::Write, &owner);
+
+    assert_eq!(f.write(&cx, ino, mine.fh), Ok(6));
+    ahead.store(120_000, Relaxed);
+    assert_eq!(
+        fsync(&owner, mine.fh),
+        Err(Code::Io),
+        "refused at the store"
+    );
+    assert_eq!(size(), 0, "not published");
+    ahead.store(0, Relaxed);
+    assert_eq!(f.write(&cx, ino, mine.fh), Ok(6));
+    assert_eq!(
+        fsync(&owner, mine.fh),
+        Ok(()),
+        "the refused fsync's EIO reported the discard"
+    );
+    assert_eq!(size(), 6, "published");
+
+    // The same through a close (`FLUSH`) that a `dup` of the description
+    // outlives.
+    assert_eq!(f.write(&cx, ino, mine.fh), Ok(6));
+    ahead.store(120_000, Relaxed);
+    assert_eq!(
+        flush(&owner, mine.fh),
+        Err(Code::Io),
+        "refused at the store"
+    );
+    ahead.store(0, Relaxed);
+    assert_eq!(f.write(&cx, ino, mine.fh), Ok(6));
+    assert_eq!(
+        fsync(&owner, mine.fh),
+        Ok(()),
+        "the refused close's EIO reported the discard"
+    );
+
+    // And through an `O_SYNC` write, which publishes before it answers.
+    let sync_write = |fh: Fh| {
+        Blocking::run(|r| {
+            f.fs.write(
+                &cx,
+                ino,
+                fh,
+                0,
+                WriteData::Borrowed(b"object"),
+                OpenFlags::WRITE | OpenFlags::SYNC,
+                r,
+            )
+        })
+        .map_err(|e| e.code())
+    };
+    ahead.store(120_000, Relaxed);
+    assert_eq!(sync_write(mine.fh), Err(Code::Io), "refused at the store");
+    ahead.store(0, Relaxed);
+    assert_eq!(f.write(&cx, ino, mine.fh), Ok(6));
+    assert_eq!(
+        fsync(&owner, mine.fh),
+        Ok(()),
+        "the refused O_SYNC write's EIO reported the discard"
+    );
+
+    assert_eq!(fsync(&other, theirs.fh), Err(Code::Io), "reported once");
+    assert_eq!(fsync(&other, theirs.fh), Ok(()));
+}
+
 /// Review round 2, must-fix 1: on a subtree view, the refused commit's
 /// copy is queued under the view's root (named after the path below it),
 /// not the filesystem root, and carries the file's owner and its owner

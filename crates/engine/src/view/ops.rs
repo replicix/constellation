@@ -1212,7 +1212,7 @@ impl Vfs for View {
         &self,
         cx: &OpCtx<'_>,
         ino: Ino,
-        _fh: Fh,
+        fh: Fh,
         off: u64,
         data: WriteData<'_>,
         flags: OpenFlags,
@@ -1252,7 +1252,7 @@ impl Vfs for View {
         let cancel = cx.cancel.cloned();
         let Some(view) = self.fsync_deferral(OpKind::Write) else {
             r.done(
-                self.flush_sync_write(ino, cancel)
+                self.flush_sync_write(ino, fh, cancel)
                     .map(|()| n)
                     .map_err(VfsError::from),
             );
@@ -1267,7 +1267,7 @@ impl Vfs for View {
             watch.adopt();
             let _lock_tag = caller.as_ref().map(|c| c.enter());
             r.done(
-                view.flush_sync_write(ino, cancel)
+                view.flush_sync_write(ino, fh, cancel)
                     .map(|()| n)
                     .map_err(VfsError::from),
             );
@@ -1332,6 +1332,13 @@ impl Vfs for View {
             }
             Ok(())
         });
+        // As in `fsync`: this close's `EIO` reports every discard its
+        // description has not reported yet, including the one its own
+        // publication raised; the description (a `dup` of it may stay
+        // open) does not report it again.
+        if result == Err(Code::Io) {
+            self.lock_errors_reported(ino, fh);
+        }
         // The release of a recalled grant flushes the file first; asking
         // for it only after this flush lets that flush find it done.
         if let (Some(l), Some(true)) = (locks, idle) {
@@ -1536,6 +1543,11 @@ impl Vfs for View {
         let owed = match self.lock_publish_gate(ino, fh) {
             Ok(owed) => owed,
             Err(e) => {
+                // As the owner fence's `EIO` above: the report of every
+                // discard this description has not reported yet.
+                if e == Code::Io {
+                    self.lock_errors_reported(ino, fh);
+                }
                 r.done(self.ino_err(ino, e));
                 return;
             }
@@ -1543,6 +1555,15 @@ impl Vfs for View {
         let cancel = cx.cancel.cloned();
         let finish = move |view: &View| match view.fsync_durable(ino, level, cancel) {
             Ok(()) if owed => Err(Code::Io),
+            // This `EIO` is the report of every discard on the file this
+            // description has not reported yet — the one its own
+            // publication just raised (a commit refused for an ended
+            // grant, `View::publish_inode`) among them: the next `fsync`
+            // must not report it again, for data that then did land.
+            Err(Code::Io) => {
+                view.lock_errors_reported(ino, fh);
+                Err(Code::Io)
+            }
             result => result,
         };
         // Plan 39 §3.3: the wait may last an S3 outage, so it runs on the
@@ -1832,7 +1853,7 @@ impl Vfs for View {
                 Err((ino, code)) => return fail(ino, code),
             };
             if sync && n > 0 {
-                if let Err(code) = view.flush_sync_write(dst, cancel.clone()) {
+                if let Err(code) = view.flush_sync_write(dst, fh_out, cancel.clone()) {
                     return fail(dst, code);
                 }
             }
