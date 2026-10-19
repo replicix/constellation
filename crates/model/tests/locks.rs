@@ -10,7 +10,7 @@
 //!
 //! `cargo test -p constellation-model --release --test locks -- --nocapture`
 
-use constellation_model::locks::{Action, LockModel, Mode, Msg, Op, State, NONE};
+use constellation_model::locks::{Action, LockModel, Mode, MoveStamp, Msg, Op, State, NONE};
 use stateright::{Checker, HasDiscoveries, Model};
 use std::time::{Duration, Instant};
 
@@ -956,6 +956,291 @@ fn a_capped_delegate_outwaited_is_clean() {
         "deleg-ttl-capped",
         &m,
         &["all_ops_done", "recall_by_ttl", "moved"],
+    );
+}
+
+// ---- a moved grant's window carried as a duration ----
+
+/// Node 1 and the delegate (node 2) contend for `X` across delegation
+/// moves. A grant goes unused when its reply is lost, or when a move
+/// clears the parked request it answers and the node asks again (the
+/// reply then answers a stale request).
+fn carrying(
+    stamp: MoveStamp,
+    max_tick: u8,
+    max_moves: u8,
+    max_drops: u8,
+    max_renews: u8,
+    max_deleg_renews: u8,
+) -> LockModel {
+    LockModel {
+        delegate: 2,
+        max_moves,
+        max_deleg_renews,
+        max_drops,
+        max_renews,
+        max_tick,
+        move_stamp: stamp,
+        ..LockModel::design(contend())
+    }
+}
+
+/// Delegated, recalled and delegated again (the sim's seed 15: a grant
+/// carried delegate → root → delegate): unused and used grants and recalls
+/// in flight at a move, records carried twice and outwaited.
+fn across_three_moves(stamp: MoveStamp) -> LockModel {
+    carrying(stamp, 5, 3, 0, 0, 0)
+}
+
+const ACROSS_THREE_MOVES: &[&str] = &[
+    "all_ops_done",
+    "moved",
+    "reinstated",
+    "carried",
+    "carried_unused",
+    "carried_used",
+    "carried_recalling",
+    "carried_outwaited",
+    "carried_twice",
+];
+
+/// Delegated and recalled, with a renewal: renewals (and their answers)
+/// in flight at a move.
+fn with_a_renewal(stamp: MoveStamp) -> LockModel {
+    carrying(stamp, 5, 2, 0, 1, 0)
+}
+
+const WITH_A_RENEWAL: &[&str] = &[
+    "all_ops_done",
+    "carried",
+    "carried_unused",
+    "carried_used",
+    "carried_renewing",
+    "carried_outwaited",
+];
+
+/// One delegation whose handoff may be lost: the copies re-sent with the
+/// next renewal carry what is left at that send.
+fn with_a_lost_handoff(stamp: MoveStamp) -> LockModel {
+    carrying(stamp, 4, 1, 1, 0, 1)
+}
+
+const WITH_A_LOST_HANDOFF: &[&str] = &[
+    "all_ops_done",
+    "resent",
+    "carried",
+    "carried_unused",
+    "carried_used",
+    "carried_outwaited",
+];
+
+/// The rule: a grant never renewed carries what is left of its record,
+/// plus the margin at the receipt.
+#[test]
+fn carrying_unproven_grants_across_three_moves_is_clean() {
+    assert_clean(
+        "carry-unproven-3-moves",
+        &across_three_moves(MoveStamp::CarryUnproven),
+        ACROSS_THREE_MOVES,
+    );
+}
+
+#[test]
+fn carrying_unproven_grants_with_a_renewal_is_clean() {
+    assert_clean(
+        "carry-unproven-renewal",
+        &with_a_renewal(MoveStamp::CarryUnproven),
+        WITH_A_RENEWAL,
+    );
+}
+
+#[test]
+fn carrying_unproven_grants_with_a_lost_handoff_is_clean() {
+    assert_clean(
+        "carry-unproven-lost-handoff",
+        &with_a_lost_handoff(MoveStamp::CarryUnproven),
+        WITH_A_LOST_HANDOFF,
+    );
+}
+
+/// Renewed grants carried too ("carry every grant"): clean as well. The
+/// moves give a grant up as they measure it (the root at the delegation,
+/// the delegate at the recall), so a renewal the sender answered is in the
+/// record it measures, and one that reaches it later is refused: whether
+/// the grant was used is not what makes the carry safe.
+#[test]
+fn carrying_all_grants_across_three_moves_is_clean() {
+    assert_clean(
+        "carry-all-3-moves",
+        &across_three_moves(MoveStamp::CarryAll),
+        ACROSS_THREE_MOVES,
+    );
+}
+
+#[test]
+fn carrying_all_grants_with_a_renewal_is_clean() {
+    assert_clean(
+        "carry-all-renewal",
+        &with_a_renewal(MoveStamp::CarryAll),
+        WITH_A_RENEWAL,
+    );
+}
+
+#[test]
+fn carrying_all_grants_with_a_lost_handoff_is_clean() {
+    assert_clean(
+        "carry-all-lost-handoff",
+        &with_a_lost_handoff(MoveStamp::CarryAll),
+        WITH_A_LOST_HANDOFF,
+    );
+}
+
+/// Clocks within `D = 1` that may step three times; margins of 2, the
+/// least a grant made in place needs (`M_n + M_s ≥ 4D`: two clocks, a
+/// step on each). One move (the handoff), so three clocks measure a
+/// carried window: the holder's, the sender's (from the request's arrival
+/// to the send) and the receiver's (from the receipt to the expiry). Each
+/// is off by up to `2D`, which the margin at the receipt pays for. Two
+/// ticks are enough for the counterexample without the margin and keep
+/// the clean runs exhaustive (27.6M states, 8.8M unique).
+fn carrying_under_drift(stamp: MoveStamp, max_tick: u8) -> LockModel {
+    LockModel {
+        delegate: 2,
+        max_moves: 1,
+        max_deleg_renews: 0,
+        max_drops: 0,
+        max_renews: 0,
+        seq_margin: 2,
+        node_margin: 2,
+        lease_margin: 3,
+        lease_ttl: 30,
+        lock_ttl: 4,
+        deleg_ttl: 8,
+        max_offset: 1,
+        init_offsets: Some(vec![-1, 1, -1]),
+        max_jumps: 3,
+        max_tick,
+        move_stamp: stamp,
+        ..LockModel::design(contend())
+    }
+}
+
+#[test]
+fn restamping_is_clean_under_drift() {
+    assert_clean(
+        "carry-drift-restamp",
+        &carrying_under_drift(MoveStamp::Restamp, 2),
+        &["all_ops_done", "moved"],
+    );
+}
+
+#[test]
+fn carrying_unproven_grants_is_clean_under_drift() {
+    assert_clean(
+        "carry-drift-unproven",
+        &carrying_under_drift(MoveStamp::CarryUnproven, 2),
+        &[
+            "all_ops_done",
+            "moved",
+            "carried",
+            "carried_unused",
+            "carried_used",
+            "carried_recalling",
+        ],
+    );
+}
+
+/// Without the margin at the receipt: the sender's clock steps forward
+/// between the request's arrival and the send (less is left), the
+/// receiver's while it counts that down, and the holder's back while it
+/// honours the grant. The record ends inside the holder's window.
+#[test]
+fn carrying_without_the_margin_violates_under_drift() {
+    assert_violates_soon(
+        "carry-drift-no-margin",
+        &carrying_under_drift(MoveStamp::CarryNoMargin, 2),
+    );
+}
+
+/// The counterexample above as a trace, under both stamps: node 1 is
+/// granted at the root (holder honours to 3 on its clock, the root's
+/// record ends at 5 on the root's), the root's clock steps forward and it
+/// delegates at once (4 left), the delegate (clock −1) records 3 without
+/// the margin and its clock steps forward, node 1's steps back. At t = 2
+/// the delegate's record has ended while node 1 still honours its grant.
+fn carried_across_three_steps(m: &LockModel) -> State {
+    let mut s = m.init_states().remove(0);
+    s = step(m, &s, Action::Start(1));
+    s = deliver(m, &s, |x| matches!(x, Msg::LockReq { .. }));
+    s = deliver(m, &s, |x| matches!(x, Msg::LockReply { .. }));
+    assert_eq!(s.nodes[1].cache.map(|c| c.until), Some(3));
+    assert_eq!(s.nodes[0].table.first().map(|g| g.until), Some(5));
+    s = step(m, &s, Action::Jump(0, 1));
+    s = step(m, &s, Action::Delegate(2));
+    s = deliver(m, &s, |x| matches!(x, Msg::Handoff { .. }));
+    s = step(m, &s, Action::Jump(2, 1));
+    s = step(m, &s, Action::Jump(1, -1));
+    s = step(m, &s, Action::Tick);
+    s = step(m, &s, Action::Tick);
+    s = step(m, &s, Action::Start(2));
+    deliver(m, &s, |x| matches!(x, Msg::LockReq { .. }))
+}
+
+#[test]
+fn a_record_carried_without_the_margin_ends_inside_the_holders_window() {
+    let m = carrying_under_drift(MoveStamp::CarryNoMargin, 2);
+    let mut s = carried_across_three_steps(&m);
+    assert_eq!(
+        s.issued.len(),
+        2,
+        "the delegate granted itself over the carried record"
+    );
+    s = step(&m, &s, Action::Start(1));
+    println!("no margin: mutual exclusion violated: {:?}", s.violation);
+    assert!(
+        s.violation.is_some(),
+        "node 1 wrote under a superseded grant"
+    );
+}
+
+#[test]
+fn a_record_carried_with_the_margin_outlasts_the_holders_window() {
+    let m = carrying_under_drift(MoveStamp::CarryUnproven, 2);
+    let s = carried_across_three_steps(&m);
+    assert_eq!(s.nodes[2].table.iter().map(|g| g.until).max(), Some(5));
+    assert_eq!(
+        s.issued.len(),
+        1,
+        "the delegate granted itself inside the carried record"
+    );
+}
+
+/// Clocks `3` apart and steady (no step), margins of 2: any duration is
+/// exact, so the rule is clean; the sender's `until` kept as is ends the
+/// record `6` early on a receiver that far ahead.
+fn offset_clocks(stamp: MoveStamp) -> LockModel {
+    LockModel {
+        max_jumps: 0,
+        max_offset: 3,
+        init_offsets: Some(vec![-3, 0, 3]),
+        ..carrying_under_drift(stamp, 9)
+    }
+}
+
+#[test]
+fn keeping_the_senders_until_violates_under_offsets() {
+    assert_violates_soon(
+        "carry-keep-absolute",
+        &offset_clocks(MoveStamp::KeepAbsolute),
+    );
+}
+
+#[test]
+fn carrying_unproven_grants_is_clean_under_offsets() {
+    assert_clean(
+        "carry-offsets-unproven",
+        &offset_clocks(MoveStamp::CarryUnproven),
+        &["all_ops_done", "moved", "carried"],
     );
 }
 

@@ -86,6 +86,32 @@
 //!   (`grace_follows_delegation`, the code's `DelegRenewed::lock_grace_ms`);
 //!   left at the root, the delegate granted over a released grant.
 //!
+//! # A moved grant's window carried as a duration (`move_stamp`)
+//!
+//! A move restamps every grant to `now + lock_ttl + seq_margin` at its
+//! receiver (`MoveStamp::Restamp`, the code today). For a grant nobody
+//! uses (its reply was lost, or found no request waiting) that is a full
+//! window more for whoever waits behind it, at every move. The rule
+//! (`MoveStamp::CarryUnproven`): a grant never renewed or reclaimed since
+//! it was made (`Grant::proven`) travels with what is left of its record,
+//! `until − now` on the sender's clock at the send, and the receiver
+//! records `min(restamp, now + remaining + seq_margin)` on its own clock
+//! (a duration: no clock's absolute crosses nodes). The sender gives up
+//! the grant as it measures (a delegate stops serving at the recall; the
+//! root takes the subtree's grants out of its table at the delegation
+//! and keeps only its frozen copy), so nothing extends a holder's window
+//! past that record but the receiver itself; the receipt is after the
+//! send in real time; and the margin pays for the second clock (each hop
+//! measures one more duration: `2D`). A renewed grant is restamped. The
+//! variants: `CarryAll` (renewed grants carried too), `CarryNoMargin`
+//! (no margin at the receipt) and `KeepAbsolute` (the sender's `until`
+//! kept as is, an absolute of another clock). The backup's mirror is
+//! restamped under every stamp: it is not frozen (the old root renews
+//! after the snapshot), and the fast takeover's grace is its argument.
+//! `Grant::carried` and the `carried_*` witnesses mark what the checker
+//! saw: an unused grant, a used one, a renewal and a recall in flight at
+//! the move, and a carried record outwaited at its receiver.
+//!
 //! # Plan 43 C7-F F-a: the grace capped by the old root's beats
 //!
 //! With `beat_cap` the old root (a node holding a lease, while its clock
@@ -143,6 +169,9 @@
 //! | `Handoff` delivered / dropped | `lock_install_moved` (`deleg_mine_until`, `moved_seen`, `install_if_consistent`) |
 //! | reinstated copies | `lock_on_generation_ended` from `end_generation` (`core/delegate.rs`) |
 //! | `Mirror` | `BackupAppend { locks }` (a snapshot rides the next append) |
+//! | `carry_of` (`carry` on `Handoff`/`DelegRecalled`) | proposed: `lock_take_handoff` and `lock_hand_back` measure what is left of each unproven grant (`DelegRenewed::lock_carry`, `LockHandback::carry`); today every moved grant is restamped (`MoveStamp::Restamp`) |
+//! | `stamp_moved` | proposed: `lock_install_moved` (`carried_until`); today `restamp` |
+//! | `Grant::proven` | `LockState::unproven` (inverted: an id leaves it at a renewal, a release or an outwait) |
 
 use stateright::{Model, Property};
 
@@ -173,6 +202,24 @@ pub enum Op {
     /// Read or write `X` under the lock held.
     Io,
     Unlock,
+}
+
+/// How the receiver of a moved grant stamps its record (see the module
+/// doc, "A moved grant's window carried as a duration").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MoveStamp {
+    /// As if renewed at the receipt: `now + lock_ttl + seq_margin`.
+    Restamp,
+    /// The rule: a grant never renewed nor reclaimed carries what is left
+    /// of its record (`min(restamp, now + remaining + seq_margin)`); a
+    /// renewed one is restamped.
+    CarryUnproven,
+    /// Every grant of a delegation move carried, renewed ones too.
+    CarryAll,
+    /// Naive: carried with no margin at the receipt (`now + remaining`).
+    CarryNoMargin,
+    /// Naive: the sender's `until` kept as is (another clock's absolute).
+    KeepAbsolute,
 }
 
 /// Who owns `X`'s lock table (the replicated delegation table).
@@ -291,6 +338,8 @@ pub struct LockModel {
     pub beat_cap: bool,
     /// The naive cap: `X` is only what the beats named. Must violate.
     pub beat_cap_from_named_expiry: bool,
+    /// How a moved grant is stamped at its receiver.
+    pub move_stamp: MoveStamp,
 }
 
 impl LockModel {
@@ -339,7 +388,25 @@ impl LockModel {
             allow_renew: false,
             beat_cap: false,
             beat_cap_from_named_expiry: false,
+            move_stamp: MoveStamp::Restamp,
         }
+    }
+
+    /// Whether a grant that changes owner travels with what is left of
+    /// its record (else it is restamped).
+    fn carries(&self, g: &Grant) -> bool {
+        match self.move_stamp {
+            MoveStamp::Restamp => false,
+            MoveStamp::CarryUnproven => !g.proven,
+            MoveStamp::CarryAll | MoveStamp::CarryNoMargin | MoveStamp::KeepAbsolute => true,
+        }
+    }
+
+    /// The table's grants are marked when renewed (`proven`) and when
+    /// carried only under a carrying rule (the restamp's state space is
+    /// unchanged).
+    fn marks(&self) -> bool {
+        self.move_stamp != MoveStamp::Restamp
     }
 
     fn n(&self) -> usize {
@@ -366,6 +433,12 @@ pub struct Grant {
     pub until: i16,
     pub id: u8,
     pub recalled: bool,
+    /// Renewed (or reclaimed) since it was made: its holder used it
+    /// (marked only under a carrying `move_stamp`).
+    pub proven: bool,
+    /// Its record was carried, not restamped, at a move (ghost; marked
+    /// only under a carrying `move_stamp`).
+    pub carried: bool,
 }
 
 /// Owner side: a blocking request waiting for recalls.
@@ -516,6 +589,9 @@ pub enum Msg {
         table: Vec<Grant>,
         /// What is left of the root's grace (0: none).
         grace: i16,
+        /// What is left of each carried grant's record at the send, by
+        /// id (`move_stamp`; `KeepAbsolute`: the sender's `until`).
+        carry: Vec<(u8, i16)>,
     },
     DelegRecall {
         to: u8,
@@ -523,6 +599,8 @@ pub enum Msg {
     DelegRecalled {
         to: u8,
         table: Vec<Grant>,
+        /// As `Handoff::carry`.
+        carry: Vec<(u8, i16)>,
     },
 }
 
@@ -534,21 +612,35 @@ pub enum RenewOutcome {
     NotOwner,
 }
 
-pub const SAW_LOCAL_RELOCK: u16 = 1;
-pub const SAW_RECALL_RELEASED: u16 = 2;
-pub const SAW_RECALL_EXPIRED: u16 = 4;
-pub const SAW_RECLAIM: u16 = 8;
-pub const SAW_MOVE: u16 = 16;
-pub const SAW_FAST_TAKEOVER: u16 = 32;
-pub const SAW_TTL_TAKEOVER: u16 = 64;
-pub const SAW_FENCED: u16 = 128;
-pub const SAW_RECALL_BY_TTL: u16 = 256;
-pub const SAW_MIRROR_USED: u16 = 512;
-pub const SAW_REINSTATED: u16 = 1024;
-pub const SAW_RESENT: u16 = 2048;
-pub const SAW_RELEASED_TAKEOVER: u16 = 4096;
-pub const SAW_GRACE_INHERITED: u16 = 8192;
-pub const SAW_GRACE_CAPPED: u16 = 16384;
+pub const SAW_LOCAL_RELOCK: u32 = 1;
+pub const SAW_RECALL_RELEASED: u32 = 2;
+pub const SAW_RECALL_EXPIRED: u32 = 4;
+pub const SAW_RECLAIM: u32 = 8;
+pub const SAW_MOVE: u32 = 16;
+pub const SAW_FAST_TAKEOVER: u32 = 32;
+pub const SAW_TTL_TAKEOVER: u32 = 64;
+pub const SAW_FENCED: u32 = 128;
+pub const SAW_RECALL_BY_TTL: u32 = 256;
+pub const SAW_MIRROR_USED: u32 = 512;
+pub const SAW_REINSTATED: u32 = 1024;
+pub const SAW_RESENT: u32 = 2048;
+pub const SAW_RELEASED_TAKEOVER: u32 = 4096;
+pub const SAW_GRACE_INHERITED: u32 = 8192;
+pub const SAW_GRACE_CAPPED: u32 = 16384;
+/// A grant's record was carried at a move, shorter than a restamp.
+pub const SAW_CARRIED: u32 = 1 << 15;
+/// Carried while its holder had not installed it (unused).
+pub const SAW_CARRIED_UNUSED: u32 = 1 << 16;
+/// Carried while its holder held it (used).
+pub const SAW_CARRIED_USED: u32 = 1 << 17;
+/// Carried with a renewal of it, or its answer, in flight.
+pub const SAW_CARRIED_RENEWING: u32 = 1 << 18;
+/// Carried with a recall of it in flight.
+pub const SAW_CARRIED_RECALLING: u32 = 1 << 19;
+/// A carried record outwaited at its receiver.
+pub const SAW_CARRIED_OUTWAITED: u32 = 1 << 20;
+/// Carried over two moves (the sim's seed 15: delegate → root → delegate).
+pub const SAW_CARRIED_TWICE: u32 = 1 << 21;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -569,7 +661,7 @@ pub struct State {
     pub issued: Vec<(u8, u8, Mode)>,
     /// `(node, its grant id, the conflicting later grant id)`.
     pub violation: Option<(u8, u8, u8)>,
-    pub saw: u16,
+    pub saw: u32,
 }
 
 impl State {
@@ -715,6 +807,8 @@ impl State {
             until: base.min(now) + ttl + cfg.seq_margin,
             id,
             recalled: false,
+            proven: false,
+            carried: false,
         });
         self.nodes[h].table.sort();
         self.issued.push((id, node, mode));
@@ -884,15 +978,103 @@ impl State {
         self.nodes[r].table.sort();
     }
 
-    fn restamp(&self, cfg: &LockModel, h: usize, table: Vec<Grant>) -> Vec<Grant> {
+    /// Sender `h` gives up `table`: what is left of each carried grant's
+    /// record, measured now on its clock (`KeepAbsolute`: its `until`).
+    /// Notes what the move found of each carried grant at its holder and
+    /// in flight.
+    fn carry_of(&mut self, cfg: &LockModel, h: usize, table: &[Grant]) -> Vec<(u8, i16)> {
         let now = self.local(h);
-        table
-            .into_iter()
-            .map(|g| Grant {
-                until: now + cfg.lock_ttl + cfg.seq_margin,
-                ..g
-            })
-            .collect()
+        let mut carry = Vec::new();
+        for g in table.iter().filter(|g| cfg.carries(g)) {
+            let left = match cfg.move_stamp {
+                MoveStamp::KeepAbsolute => g.until,
+                _ => g.until - now,
+            };
+            carry.push((g.id, left));
+            let held = self.nodes[g.node as usize]
+                .cache
+                .is_some_and(|c| c.id == g.id);
+            self.saw |= if held {
+                SAW_CARRIED_USED
+            } else {
+                SAW_CARRIED_UNUSED
+            };
+            if self.net.iter().any(
+                |m| matches!(m, Msg::Renew { id, .. } | Msg::RenewAck { id, .. } if *id == g.id),
+            ) {
+                self.saw |= SAW_CARRIED_RENEWING;
+            }
+            if self
+                .net
+                .iter()
+                .any(|m| matches!(m, Msg::Recall { id, .. } if *id == g.id))
+            {
+                self.saw |= SAW_CARRIED_RECALLING;
+            }
+        }
+        carry
+    }
+
+    /// Receiver `h` stamps a moved `table`: a carried grant's record ends
+    /// what was left of it after the receipt, plus the margin, never later
+    /// than a restamp; any other is restamped. With each, the witnesses
+    /// its install sets.
+    fn stamp_moved(
+        &self,
+        cfg: &LockModel,
+        h: usize,
+        table: Vec<Grant>,
+        carry: &[(u8, i16)],
+    ) -> Vec<(Grant, u32)> {
+        let now = self.local(h);
+        let restamp = now + cfg.lock_ttl + cfg.seq_margin;
+        let mut out = Vec::with_capacity(table.len());
+        for g in table {
+            let Some(&(_, left)) = carry.iter().find(|(id, _)| *id == g.id) else {
+                out.push((
+                    Grant {
+                        until: restamp,
+                        carried: false,
+                        ..g
+                    },
+                    0,
+                ));
+                continue;
+            };
+            let until = restamp.min(match cfg.move_stamp {
+                MoveStamp::KeepAbsolute => left,
+                MoveStamp::CarryNoMargin => now + left.max(0),
+                _ => now + left.max(0) + cfg.seq_margin,
+            });
+            let mut saw = 0;
+            if until < restamp {
+                saw |= SAW_CARRIED;
+                if g.carried {
+                    saw |= SAW_CARRIED_TWICE;
+                }
+            }
+            out.push((
+                Grant {
+                    until,
+                    carried: true,
+                    ..g
+                },
+                saw,
+            ));
+        }
+        out
+    }
+
+    /// Installs a whole moved table at `h` (a recall's answer, an atomic
+    /// delegation).
+    fn install_moved(&mut self, cfg: &LockModel, h: usize, table: Vec<Grant>, carry: &[(u8, i16)]) {
+        let stamped = self.stamp_moved(cfg, h, table, carry);
+        let mut t = Vec::with_capacity(stamped.len());
+        for (g, saw) in stamped {
+            self.saw |= saw;
+            t.push(g);
+        }
+        self.nodes[h].table = t;
     }
 }
 
@@ -1224,7 +1406,18 @@ impl Model for LockModel {
                     if !mirrored.is_empty() {
                         s.saw |= SAW_MIRROR_USED;
                     }
-                    s.nodes[i].table = s.restamp(self, i, mirrored);
+                    // Restamped, whatever the move stamp: the mirror is
+                    // not frozen (the old root renewed after the
+                    // snapshot), and the grace covers it anyway.
+                    let restamp = now + self.lock_ttl + self.seq_margin;
+                    s.nodes[i].table = mirrored
+                        .into_iter()
+                        .map(|g| Grant {
+                            until: restamp,
+                            carried: false,
+                            ..g
+                        })
+                        .collect();
                     if self.grace {
                         let bound =
                             now + self.takeover_window + self.lock_ttl + 2 * self.seq_margin;
@@ -1387,6 +1580,9 @@ impl Model for LockModel {
                     if g.recalled {
                         s.saw |= SAW_RECALL_EXPIRED;
                     }
+                    if g.carried {
+                        s.saw |= SAW_CARRIED_OUTWAITED;
+                    }
                     s.grant_done(self, h, g.id);
                 }
             }
@@ -1416,13 +1612,16 @@ impl Model for LockModel {
                     let sent = s.local(d);
                     let gen = s.gen;
                     let grace = s.grace_left(self, r);
+                    let table = if self.move_state { table } else { Vec::new() };
+                    let carry = s.carry_of(self, r, &table);
                     s.send(Msg::Handoff {
                         to: d as u8,
                         gen,
                         sent,
                         first: true,
-                        table: if self.move_state { table } else { Vec::new() },
+                        table,
                         grace,
+                        carry,
                     });
                 } else {
                     let grace = s.grace_left(self, r);
@@ -1431,11 +1630,12 @@ impl Model for LockModel {
                         s.saw |= SAW_GRACE_INHERITED;
                     }
                     s.nodes[d].dtenure = Some(s.local(d) + self.deleg_ttl - self.node_margin);
-                    s.nodes[d].table = if self.move_state {
-                        s.restamp(self, d, table)
+                    if self.move_state {
+                        let carry = s.carry_of(self, r, &table);
+                        s.install_moved(self, d, table, &carry);
                     } else {
-                        Vec::new()
-                    };
+                        s.nodes[d].table = Vec::new();
+                    }
                 }
             }
             Action::RecallDelegation => {
@@ -1499,6 +1699,7 @@ impl Model for LockModel {
                 let sent = s.local(d as usize);
                 let gen = s.gen;
                 let grace = s.grace_left(self, r);
+                let carry = s.carry_of(self, r, &table);
                 s.send(Msg::Handoff {
                     to: d,
                     gen,
@@ -1506,6 +1707,7 @@ impl Model for LockModel {
                     first: false,
                     table,
                     grace,
+                    carry,
                 });
             }
         }
@@ -1566,6 +1768,23 @@ impl Model for LockModel {
                 s.saw & SAW_GRACE_INHERITED != 0
             }),
             Property::sometimes("grace_capped", |_, s: &State| s.saw & SAW_GRACE_CAPPED != 0),
+            Property::sometimes("carried", |_, s: &State| s.saw & SAW_CARRIED != 0),
+            Property::sometimes("carried_unused", |_, s: &State| {
+                s.saw & SAW_CARRIED_UNUSED != 0
+            }),
+            Property::sometimes("carried_used", |_, s: &State| s.saw & SAW_CARRIED_USED != 0),
+            Property::sometimes("carried_renewing", |_, s: &State| {
+                s.saw & SAW_CARRIED_RENEWING != 0
+            }),
+            Property::sometimes("carried_recalling", |_, s: &State| {
+                s.saw & SAW_CARRIED_RECALLING != 0
+            }),
+            Property::sometimes("carried_outwaited", |_, s: &State| {
+                s.saw & SAW_CARRIED_OUTWAITED != 0
+            }),
+            Property::sometimes("carried_twice", |_, s: &State| {
+                s.saw & SAW_CARRIED_TWICE != 0
+            }),
         ]
     }
 
@@ -1719,6 +1938,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                     if g.id == id {
                         g.until = g.until.max(now + ttl + cfg.seq_margin);
                         recalled = g.recalled;
+                        g.proven |= cfg.marks();
                     }
                 }
                 RenewOutcome::Ok(ttl, recalled)
@@ -1737,6 +1957,8 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                     until: now + ttl + cfg.seq_margin,
                     id,
                     recalled: false,
+                    proven: cfg.marks(),
+                    carried: false,
                 });
                 s.nodes[h].table.sort();
                 s.mirror_push(cfg, h);
@@ -1808,6 +2030,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             first,
             table,
             grace,
+            carry,
         } => {
             let d = to as usize;
             if s.nodes[d].dmine != Some(gen) {
@@ -1824,7 +2047,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             }
             let tenure = sent + cfg.deleg_ttl - cfg.node_margin;
             s.nodes[d].dtenure = Some(s.nodes[d].dtenure.map_or(tenure, |u| u.max(tenure)));
-            for g in s.restamp(cfg, d, table) {
+            for (g, saw) in s.stamp_moved(cfg, d, table, &carry) {
                 if s.nodes[d].moved_seen.contains(&g.id) {
                     continue;
                 }
@@ -1837,6 +2060,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 }
                 s.nodes[d].table.push(g);
                 s.nodes[d].table.sort();
+                s.saw |= saw;
                 if !first {
                     s.saw |= SAW_RESENT;
                 }
@@ -1850,12 +2074,15 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             s.nodes[d].dtenure = None;
             s.nodes[d].parks.clear();
             let table = std::mem::take(&mut s.nodes[d].table);
+            let table = if cfg.move_state { table } else { Vec::new() };
+            let carry = s.carry_of(cfg, d, &table);
             s.send(Msg::DelegRecalled {
                 to: r,
-                table: if cfg.move_state { table } else { Vec::new() },
+                table,
+                carry,
             });
         }
-        Msg::DelegRecalled { to, table } => {
+        Msg::DelegRecalled { to, table, carry } => {
             let r = to as usize;
             let Owner::Recalling(_) = s.owner else {
                 return;
@@ -1864,7 +2091,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 return;
             }
             s.nodes[r].dgen = None;
-            s.nodes[r].table = s.restamp(cfg, r, table.clone());
+            s.install_moved(cfg, r, table.clone(), &carry);
             s.reinstate_handed(cfg, r, &table);
             if cfg.handoff_grace && std::mem::take(&mut s.nodes[r].handoff_sent) {
                 s.nodes[r].floor = Some(s.local(r) + cfg.lock_ttl + cfg.seq_margin);
