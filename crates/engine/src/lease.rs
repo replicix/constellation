@@ -375,7 +375,7 @@ mod tests {
         assert!(!view.usable());
         assert!(view.admit().is_none());
 
-        let lease = state.granted_lease(now, &cfg, None);
+        let lease = state.granted_lease(now, &cfg, None, false);
         state.adopt(now, lease, tag(), None);
         view.mirror(&state, now, &cfg, false);
         assert!(view.usable());
@@ -423,7 +423,7 @@ mod tests {
         let now = Ms(now_unix_ms());
         let view = std::sync::Arc::new(LeaseView::default());
         let mut state = LeaseState::default();
-        let lease = state.granted_lease(now, &cfg, None);
+        let lease = state.granted_lease(now, &cfg, None, false);
         state.adopt(now, lease, tag(), None);
         view.mirror(&state, now, &cfg, false);
         let rt = tokio::runtime::Builder::new_multi_thread()

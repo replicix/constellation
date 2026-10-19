@@ -226,6 +226,17 @@ pub struct CtoModel {
     pub probe_freshness: bool,
     /// The takeover detection window (`backup_takeover_ms`), in ticks.
     pub takeover_window: i16,
+    // ---- plan 43 C7-F F-a0 ----
+    /// A new tenure's register is marked at its first CAS (strict mounts:
+    /// `Config::strict_mounts`). Off: only a tenure that serves a strict
+    /// read marks it, before its first answer.
+    pub mark_at_takeover: bool,
+    /// A takeover that waits out its predecessor's grants (a fast one of a
+    /// marked tenure: the floor above) writes its register marked, so
+    /// its own successor waits too (`LeaseState::granted_lease`'s
+    /// `inherits_duty`). Off, a tenure sealed inside its floor before it
+    /// served a strict read leaves its successor no floor.
+    pub inherit_mark: bool,
 }
 
 impl CtoModel {
@@ -260,6 +271,8 @@ impl CtoModel {
             horizon_wait: true,
             probe_freshness: true,
             takeover_window: 2,
+            mark_at_takeover: true,
+            inherit_mark: true,
         }
     }
 
@@ -668,7 +681,7 @@ impl Model for CtoModel {
                         // A tenure with strict mounts serves strict reads
                         // from the start (the code marks the lease at
                         // acquisition when this node has `cto=strict`).
-                        marked: self.strict,
+                        marked: self.strict && self.mark_at_takeover,
                     };
                     log.push(1);
                     for node in nodes.iter_mut() {
@@ -859,25 +872,6 @@ impl Model for CtoModel {
                 let now = s.local(i);
                 let expires = now + self.lease_ttl;
                 let prev = s.reg;
-                s.reg = Reg {
-                    holder: i as u8,
-                    epoch,
-                    expires,
-                    released: false,
-                    marked: self.strict,
-                };
-                // Tail to head, then the marker.
-                while (s.nodes[i].applied as usize) < s.log.len() {
-                    s.apply_next(self, i);
-                }
-                s.log.push(epoch);
-                s.nodes[i].applied = s.log.len() as u8;
-                s.nodes[i].lease = Some((epoch, expires));
-                s.nodes[i].last_probe = now;
-                // A new tenure's table is empty.
-                s.nodes[i].grants.clear();
-                s.nodes[i].held.clear();
-                s.saw |= SAW_TAKEOVER;
                 // Plan 30 §M9: an unexpired predecessor that served strict
                 // reads: hold every acknowledgement until its horizon.
                 // The permit decides, not the clock: a fast takeover is a
@@ -891,6 +885,28 @@ impl Model for CtoModel {
                 let permitted = self.fast_takeover && prev.holder != NONE && prev.holder != i as u8;
                 let unexpired =
                     prev.holder != NONE && !prev.released && (permitted || now < prev.expires);
+                // Plan 43 C7-F F-a0: a tenure that inherits a floor is
+                // marked from its first CAS.
+                let inherits = self.inherit_mark && self.horizon_wait && unexpired && prev.marked;
+                s.reg = Reg {
+                    holder: i as u8,
+                    epoch,
+                    expires,
+                    released: false,
+                    marked: (self.strict && self.mark_at_takeover) || inherits,
+                };
+                // Tail to head, then the marker.
+                while (s.nodes[i].applied as usize) < s.log.len() {
+                    s.apply_next(self, i);
+                }
+                s.log.push(epoch);
+                s.nodes[i].applied = s.log.len() as u8;
+                s.nodes[i].lease = Some((epoch, expires));
+                s.nodes[i].last_probe = now;
+                // A new tenure's table is empty.
+                s.nodes[i].grants.clear();
+                s.nodes[i].held.clear();
+                s.saw |= SAW_TAKEOVER;
                 if unexpired {
                     s.saw |= SAW_FAST_TAKEOVER;
                 }

@@ -4946,6 +4946,35 @@ impl Core {
         self.stats.lock_grace_periods += 1;
     }
 
+    /// Plan 43 C7-F F-a0: this tenure may have lock grants that are still
+    /// honoured, or waits out some of an earlier tenure's: a lease released
+    /// now says so (`granted_delegations`), because the node that takes a
+    /// released lease over grants no lock for a grace
+    /// ([`Core::lock_on_released_takeover`]) and is then a tenure its own
+    /// successor must wait out too (`acquire_cas`'s `inherits_duty`). A
+    /// tenure with nothing of the kind costs its successor's successor
+    /// nothing, so a handoff that served nothing (a start-up's) does not
+    /// make the next seal pay a floor.
+    pub(crate) fn lock_duty_live(&self, now: Ms, replica: &dyn Replica) -> bool {
+        self.cfg.locks
+            && (replica.locks().quarantine_until() > now.0
+                || replica
+                    .locks()
+                    .grants_snapshot()
+                    .iter()
+                    .any(|g| g.until_ms > now.0)
+                // Grants moved out of the table toward a delegate
+                // (`lock_on_delegated`) are honoured all the same.
+                || self
+                    .lk
+                    .handoff
+                    .values()
+                    .chain(self.lk.handed.values())
+                    .flatten()
+                    .any(|g| g.until_ms > now.0)
+                || self.lk.grace.iter().any(|(_, u)| u.0 > now.0))
+    }
+
     /// The tenure ends and its grant table is dropped (`lock_on_lease_gone`
     /// without a close that keeps it): grants still live there may be
     /// honoured by their holders until they lapse, and so may grants a

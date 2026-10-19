@@ -361,6 +361,7 @@ fn replay_seed() {
         Ok("locks-failover-backup") => locks_failover_backup_config(),
         Ok("locks-failover-backup-renew") => locks_failover_backup_renew_config(),
         Ok("fast-takeover-skewed-successor") => fast_takeover_skewed_successor_config(),
+        Ok("double-seal-inside-the-grace") => double_seal_inside_the_grace_config(),
         Ok("locks-faults") => locks_faults_config(),
         Ok("locks-blips") => locks_blips_config(),
         Ok("locks-blips-tight") => locks_blips_tight_config(),
@@ -3198,6 +3199,7 @@ fn sweep_config() {
         "locks-failover-backup" => locks_failover_backup_config(),
         "locks-failover-backup-renew" => locks_failover_backup_renew_config(),
         "fast-takeover-skewed-successor" => fast_takeover_skewed_successor_config(),
+        "double-seal-inside-the-grace" => double_seal_inside_the_grace_config(),
         "locks-faults" => locks_faults_config(),
         "locks-blips" => locks_blips_config(),
         "locks-blips-tight" => locks_blips_tight_config(),
@@ -3255,6 +3257,14 @@ fn sweep_config() {
         std::sync::atomic::AtomicU64::new(0),
     ]);
     let fenced_seeds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Plan 43 C7-F: [takeovers, takeovers by a backup's seal, takeover
+    // floors armed], summed over the run's nodes: what a rule that arms
+    // more or fewer floors costs.
+    let floors = std::sync::Arc::new([
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ]);
     // Open epochs replaced by their closed carrier's (`epochs::try_form`).
     let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
@@ -3266,6 +3276,7 @@ fn sweep_config() {
         let epoch_streamed = epoch_streamed.clone();
         let chunks = chunks.clone();
         let (fenced, fenced_seeds) = (fenced.clone(), fenced_seeds.clone());
+        let floors = floors.clone();
         let superseded = superseded.clone();
         handles.push(std::thread::spawn(move || loop {
             let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3285,6 +3296,9 @@ fn sweep_config() {
                         streamed_deleg.fetch_add(s.awaited_log_streamed_deleg, ord);
                         epoch_streamed.fetch_add(s.epoch_streamed_installed, ord);
                         chunks[3].fetch_add(s.own_rows_excused, ord);
+                        floors[0].fetch_add(s.takeovers, ord);
+                        floors[1].fetch_add(s.backup_takeovers, ord);
+                        floors[2].fetch_add(s.ack_floor_waits, ord);
                     }
                     chunks[0].fetch_add(report.remote_enrolled, ord);
                     chunks[1].fetch_add(report.deferred_seen, ord);
@@ -3352,6 +3366,12 @@ fn sweep_config() {
             s.sort_unstable();
             s
         },
+    );
+    eprintln!(
+        "SWEEP-FLOORS {label}: takeovers {}, by a seal {}, floors armed {}",
+        floors[0].load(std::sync::atomic::Ordering::Relaxed),
+        floors[1].load(std::sync::atomic::Ordering::Relaxed),
+        floors[2].load(std::sync::atomic::Ordering::Relaxed),
     );
     assert!(f.is_empty(), "failing seeds: {f:?}");
 }
@@ -4996,6 +5016,43 @@ fn fast_takeover_skewed_successor_config() -> SimConfig {
     }
 }
 
+/// Plan 43 C7-F F-a0: `locks-failover-backup-renew` twice in a row. The
+/// holder is cut from S3 and from its backup and sealed by the backup; the
+/// new holder, 1.5 s later and still inside the floor it inherited, is
+/// cut in turn (it has granted nothing yet, and without strict mounts its
+/// lease was not marked as granting) and sealed by its own backup. That
+/// second successor must wait out the first holder's grants too, the ones
+/// its backup's lock mirror never carried (the first holder's partition
+/// from its backup began with its S3 cut). A lock grant lives 5 s here:
+/// with the sim's 1.5 s the first holder's last unmirrored grant has
+/// lapsed by the time the second seal can happen (a seal waits a silence
+/// window after its cut). The inbox is off, as in `backup-strict-inbox-off`:
+/// the takeover gate then does not wait the read quarantine out either.
+fn double_seal_inside_the_grace_config() -> SimConfig {
+    let cut = |at_ms| {
+        [
+            ScheduledFault {
+                at_ms,
+                kind: FaultKind::CutS3Holder { for_ms: 6_000 },
+            },
+            ScheduledFault {
+                at_ms,
+                kind: FaultKind::PartitionBackup { for_ms: 6_000 },
+            },
+        ]
+    };
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.inbox = false;
+            c.lock_ttl_ms = 5_000;
+            c
+        }),
+        faults: cut(1_200).into_iter().chain(cut(2_700)).collect(),
+        ..locks_failover_backup_renew_config()
+    }
+}
+
 /// Nodes stop (their events queue, their clients keep running) while
 /// their clients wait for or hold locks: renewals stall, grants lapse
 /// under critical sections, and replies and pushes are handled late —
@@ -5748,6 +5805,26 @@ fn a_skewed_successor_grants_no_lock_inside_the_old_roots_window() {
     assert!(
         t.backup_takeovers > 100,
         "the backup rarely took over: {t:?}"
+    );
+}
+
+/// Plan 43 C7-F F-a0: a backup that seals a holder still inside the floor
+/// it inherited from its own seal waits out the first holder's grants
+/// too, though its predecessor's lease was never marked as granting (no
+/// strict mounts; it granted nothing in its own tenure). On `ccebe74`
+/// seed 548 of `double-seal-inside-the-grace` shows two nodes inside
+/// conflicting lock sections (as do seeds 27 and 1751 at a 1.25 s gap and
+/// 368 and 1091 at 1.75 s).
+#[test]
+fn a_second_seal_inside_the_grace_waits_out_the_first_holders_grants() {
+    let t = run_m14(
+        "double-seal-inside-the-grace",
+        double_seal_inside_the_grace_config(),
+        548..648,
+    );
+    assert!(
+        t.backup_takeovers > 100,
+        "the backups rarely took over: {t:?}"
     );
 }
 

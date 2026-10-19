@@ -4052,7 +4052,14 @@ C7-H2: `fast-takeover-skewed-successor`, `locks-failover-backup-renew`
 with nodes 2 and 3 four seconds ahead of the 6 s lease, whose
 `a_skewed_successor_grants_no_lock_inside_the_old_roots_window` fails on
 the min-with-expiry floor: a lock granted over a holder still in its
-section). Every
+section). Plan 43 C7-F F-a0: `double-seal-inside-the-grace`
+(`locks-failover-backup-renew` twice in a row, 5 s lock grants, the inbox
+off, no strict mounts: the second seal comes while the first successor is
+still inside the floor it inherited and has granted nothing itself), whose
+`a_second_seal_inside_the_grace_waits_out_the_first_holders_grants` fails
+without the inherited mark (seed 548). `AUTHORITY_SIM_CONFIG=double-seal-inside-the-grace`
+replays it, and the sweep summary prints `SWEEP-FLOORS` (takeovers, seals,
+floors armed). Every
 run checks close-to-open across nodes (`tests/sim/cto.rs`: a read
 invoked after another node's write returned `Ok` must be explained by
 that write's state or a later one, with the log as the version order),

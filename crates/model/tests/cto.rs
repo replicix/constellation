@@ -397,3 +397,37 @@ fn an_unmarked_tenure_sets_no_floor() {
         "a floor was set although nobody served a strict read"
     );
 }
+
+// ---- plan 43 C7-F F-a0: a tenure that inherits a floor is marked ----
+
+/// Strict reads without strict mounts: a tenure's register says it serves
+/// them only from its first answer. The first holder serves a reader
+/// (marked), a successor seals it and waits the floor out, and is sealed
+/// in turn inside that floor before it served anything (so its register
+/// is unmarked): its own successor waits no floor, and acknowledges a
+/// write while the first holder's delegation is still honoured at the
+/// reader.
+fn double_seal(inherit_mark: bool) -> CtoModel {
+    CtoModel {
+        mark_at_takeover: false,
+        inherit_mark,
+        max_tick: 5,
+        max_epoch: 3,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![W], vec![R, R], vec![W]])
+    }
+}
+
+#[test]
+fn a_tenure_sealed_inside_its_floor_leaves_no_floor_without_the_inherited_mark() {
+    assert_violates("double-seal-unmarked", &double_seal(false));
+}
+
+#[test]
+fn a_tenure_that_inherits_a_floor_marks_its_register_and_the_double_seal_is_clean() {
+    assert_clean(
+        "double-seal-marked",
+        &double_seal(true),
+        &["fast_takeover", "floor_waited"],
+    );
+}

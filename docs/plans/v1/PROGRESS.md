@@ -50290,3 +50290,179 @@ certificates (no allocation unless one changed); per driver wake-up two atomic l
 (the runtime's probe is read only when the heartbeat thread was late); `vfs-bench`
 (it exercises no core, so it only shows that nothing else moved) the same on main and
 on the first version over three runs each.
+
+## Fix: a tenure that inherits a floor is marked from its first CAS (plan 43 C7-F, F-a0)
+
+Found while designing C7-F's F-a (§7), accepted by the maintainer as its
+own commit ahead of F-a (2026-10-18). A successor arms a takeover floor
+only if the lease it replaced says it granted (`Lease::granted_delegations`,
+`note_fast_takeover`), and a fresh taker's lease says so at once only on
+strict mounts (`LeaseState::granted_lease`); otherwise the tenure marks
+it at its first grant (`ensure_granting_marked`).
+
+### Mechanism
+
+With cluster locks and no strict mounts: P0 grants locks; P1 seals P0
+(P0's lease is marked), lands its marker and arms its floor, which
+protects P0's grants the asynchronous `LockMirror` did not carry. P1 is
+inside that floor and grants nothing, so its lease stays unmarked; P1
+has a listed backup P2, which seals P1: `prev.granted_delegations` is
+false, **no floor at P2**, and P2 grants a lock over a P0 grant that is
+still honoured. (Reachable when P1 can list a backup inside its floor
+and be sealed there: with the inbox off, where the takeover gate does not
+wait the read quarantine out, or with a lock TTL longer than the read
+delegation TTL, where the gate opens before the lock floor ends: the
+defaults, 20 s against 5 s. Under the inbox and a lock TTL below the read
+TTL the gate holds the view closed for the whole floor and P1 lists no
+backup meanwhile.)
+
+### Fix
+
+- `LeaseState::granted_lease(.., inherits_duty)`: `granted_delegations =
+  strict_mounts || inherits_duty || re-adopted own mark`. `acquire_cas`
+  (not the create path) computes `inherits_duty = takeover_of(prev) &&
+  prev.granted_delegations && if prev.released { locks } else { permitted }`:
+  a permitted (sealed or `ack=s3`) takeover of a marked lease, whose floor
+  `acquire_won` arms, or the take-over of a marked released lease under
+  locks, whose grace `lock_on_released_takeover` sets (a permit naming a
+  released lease does not count: `acquire_won`'s `fast_prev` needs
+  `!released`). It reads no expiry (a stamp of the predecessor's clock).
+- The released case needs the *releaser's* lease to say it left a duty.
+  Every root grant marks its tenure's lease (`lock_serve`, `ensure_granting_marked`),
+  but a duty also comes from what no grant of the tenure marked: reclaims,
+  installs and kept grants, a quarantine, a subtree grace. So
+  `issue_release` writes the released lease's mark as exactly
+  `lock_duty_live` (`Lease::released_granting`): locks on, and the lock
+  table holds a live grant, a grant moved toward a delegate
+  (`lock_on_delegated`'s handoff and handed copies), a subtree grace or a
+  quarantine. The held lease's own mark is not carried over (the first
+  form of this change OR-ed `lock_duty_live` into it, and the mark then
+  passed down every chain of releases, each taker paying a floor at its
+  seal whatever its tenure left). The mark of a released lease is read by
+  nothing else. (The first form taken from the plan, marking the taker of
+  any released lease under locks, made every seal of a start-up handoff's
+  taker pay the floor, 7 s in the sim; see Cost.)
+- `acquire_won` marks the lease when it arms a floor for an unmarked one
+  (`pending_floor` after the gate has left `Phase::Cas`: one
+  `ensure_granting_marked` CAS before the tenure serves anything). The
+  claim CAS reads the takeover permit when it goes out, `acquire_won`
+  when it is won, and a seal's watch can set it in between (a TTL claim
+  by the claimant's own clock): the floor was armed for a lease written
+  unmarked. Chosen over recording the permit in `Phase::Cas`: using the
+  permit as of the CAS at the win would drop the floor for that case
+  too, and the floor is the conservative answer under a skewed clock.
+- Not changed, documented: an inherited mark stays for the tenure's life,
+  so the tenure's own seal arms a floor even if it never granted
+  anything; a chain of seals keeps paying one. Follow-ups, in plan 43 §7
+  C7-F ("F-a0 follow-ups"): (b) clear an inherited mark by CAS once the
+  floor has passed and nothing is live; L3 duties no claim CAS marks (a
+  re-claim of the node's own released lease with a live quarantine, a
+  restart quarantine over an unmarked lease, reclaims admitted into a
+  `Local` tenure: mark at the reconfiguration that adds a backup, and at
+  the `ack=s3` claim); L4 the lock model's mark and a violate/clean pair.
+- `CtoModel` gets `mark_at_takeover` (strict mounts) and `inherit_mark`;
+  `LockModel` has no mark (its fast takeover always arms the grace), so
+  it is unchanged.
+- An operator's flush or stop inside a floor does not release: C7-H2
+  parks it (`service_pending_flushes`); one that gives up on a stuck gate
+  releases nothing and the lease lapses by its TTL. A comment on
+  `in_takeover_floor` that said otherwise is corrected.
+
+### Tests (each fails before)
+
+- Core `a_takeover_that_inherits_a_floor_marks_its_lease_from_its_first_cas`:
+  P0 marked, P1 claims it with a permit, P2 seals P1's lease; before:
+  `P2 sealed P1 inside P1's floor and armed none` (`pending_floor` false
+  at P2, the claim lease unmarked). Also: an unmarked predecessor, an
+  expired lease (a TTL takeover), a released lease marked, unmarked, and
+  with locks off. `a_release_marks_the_lease_only_when_lock_grants_are_left_behind`
+  (new mechanism: a live grant marks the released lease whether or not
+  the held one was marked, nothing live leaves it unmarked even when the
+  held one was; the chain case fails before the review's fix),
+  `a_permit_arriving_during_the_claim_cas_still_marks_the_lease` (the
+  permit set while the claim CAS is out: a floor armed, a mark CAS
+  issued) and `grants_moved_to_a_delegate_are_a_lock_duty_until_they_lapse`.
+- Model `a_tenure_sealed_inside_its_floor_leaves_no_floor_without_the_inherited_mark`
+  (found: a read of the first holder's delegation under a write acknowledged
+  by the second seal's successor) and
+  `a_tenure_that_inherits_a_floor_marks_its_register_and_the_double_seal_is_clean`
+  (exhaustive within the 40 M-state cap); the M9 fast-takeover models
+  unchanged and green.
+- Sim `double-seal-inside-the-grace` (`locks-failover-backup-renew` twice
+  in a row, the second cut 1.5 s after the first, 5 s lock grants, inbox
+  off, no strict mounts) and
+  `a_second_seal_inside_the_grace_waits_out_the_first_holders_grants`
+  (seeds 548..648; fails before at seed 548). Seeds 0..6000 on `ccebe74`:
+  4 violate mutual exclusion (548, 2476, 3087, 4242: a node in a section
+  of a lock the first holder's tenure granted, and the second successor
+  granting another node the same lock); 6000..12000: 2 more, one of them
+  (7759) the same. After: 0 of that kind. With the sim's own 1.5 s lock TTL and
+  the same faults, 0 of 2000 seeds at a 1.5 s gap (and 0 of 300 at each
+  of 2.0-4.0 s) on `ccebe74`, although 176 of the 4080 seals of the
+  2000-seed sweep armed no floor: the first holder's last
+  unmirrored grant has lapsed by the time the second seal can happen, so
+  the seeds show the missing floor (`SWEEP-FLOORS` fewer floors than
+  seals) but no violation. The longer TTL is what makes it reachable. The sweep
+  now prints `SWEEP-FLOORS` (takeovers, seals, floors armed).
+
+### Cost
+
+More tenures say they granted, so more seals arm a floor: the floor is
+the same one any seal of a marked tenure pays (8.5 s / 23.5 s at the
+defaults), now also after a seal of a tenure that was itself inside a
+floor or took a released lease with locks live. Floors armed per seals
+(2000 seeds each, before -> after): `locks-failover-backup` 1974 -> 1994
+of 2039 -> 2023, `locks-failover-backup-renew` 2000 -> 2000,
+`fast-takeover-skewed-successor` (193000..195000) 2011 -> 2009,
+`delegated-holder-cut` 1787 -> 1787, `backup-strict` 1656 -> 1656,
+`backup-strict-inbox-off` 1802 -> 1994 of 2215 -> 2205, `backup` 0 -> 3,
+`backup-crash` 0 -> 1, `locks-blips-tight-faults` (5000..6000) 0 -> 0.
+`double-seal-inside-the-grace` (6000): 10393 of 12222 -> 11992 of 12391
+(counts of the first form of this change, before the review's fixes; the
+next paragraph has the final ones).
+The plan's first form (any released lease under locks) was 0 -> 92 in
+`backup` and 0 -> 19 in `backup-crash`, and failed
+`a_lagging_backup_still_seals_a_dead_holder` (two failovers of 10 s past
+its 6.6 s bound: a seal of a start-up handoff's taker that served nothing).
+
+After the review's fixes (M1a, L1, L2), on the delegation-lane base, the
+same sweeps give the same floors armed per seals as before M1a:
+`locks-failover-backup` 1994 of 2023, `-renew` 2000 of 2006 (2007 before
+M1a), `backup` 3 of 1103, `backup-crash` 1 of 2017, `backup-strict` 1656 of
+2456, `backup-strict-inbox-off` 1994 of 2207 (2205), `delegated-holder-cut`
+1787 of 2401, `fast-takeover-skewed-successor` 2009 of 2009,
+`locks-blips-tight-faults` 0 of 0, `double-seal-inside-the-grace` (12000)
+23986 of 24781 (24814). Those runs have one or two failovers each, so they
+cannot show what the release fix changes: a mark that passes down a chain
+of releases and seals (every later seal paying 8.5 s / 23.5 s however long
+ago the last grant was). That is shown by the core test alone
+(`a_release_marks_the_lease_only_when_lock_grants_are_left_behind`: a marked
+held lease with nothing live releases unmarked).
+
+### Gates
+
+Sweeps (after, 0 failing each): `fast-takeover-skewed-successor`
+193000..195000, `locks-failover-backup`, `locks-failover-backup-renew`,
+`backup`, `backup-crash`, `delegated-holder-cut`, `backup-strict`,
+`backup-strict-inbox-off` 0..2000, `locks-blips-tight-faults` 5000..6000;
+`double-seal-inside-the-grace` 0..12000: only the late seeds 4796 and 6156
+(below), none of F-a0's cause. Also clean: fmt, clippy `-D warnings`, the
+authority lib (415) and sim suite (159), the model crate, the engine lib
+(763), the lease tests of `store-s3`.
+
+### Not changed (found on the way)
+
+- `double-seal-inside-the-grace` also meets a different late violation on
+  both builds (before: 6085; after: 4796, 6156; 2 of 12000 after, 1 of
+  12000 before): a node in a section of a lock whose grant the stable root
+  (the second successor, long past every fault) outwaited 0.6 s after
+  granting it to that node. The grant was minted in place over an
+  earlier one in the same event (`granted a lock ... upgraded=false`, then
+  `upgraded=true` for the same node, the table's expiry 619 ms past the
+  grant against a reply of 2520 ms): `lock_try_grant` computes
+  `until = min(base, now) + ttl + margin` from each waiter's arrival, so an
+  in-place upgrade can replace a grant with an earlier expiry than one
+  already answered. Unconfirmed beyond the log; not touched here (a
+  separate finding).
+- The lock model has no marks, so the inherited mark is modelled in the
+  close-to-open model only.

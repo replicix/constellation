@@ -393,7 +393,21 @@ impl LeaseState {
     /// with it, and its successor still waits their horizon out. Dropped,
     /// a re-claim that S3 cut again could not mark the lease, and every
     /// lock request was answered `Busy` (then `ENOLCK`) until S3 returned.
-    pub fn granted_lease(&self, now: Ms, cfg: &Config, prev: Option<&Lease>) -> Lease {
+    ///
+    /// Plan 43 C7-F F-a0: `inherits_duty` marks the lease from its first
+    /// CAS too. A tenure that waits out its predecessor's grants (a
+    /// takeover inside a floor, or a lock grace after a released lease) is
+    /// one its own successor must wait out: it may be sealed before it
+    /// grants anything itself, and a lease still unmarked then would arm no
+    /// floor at that successor (`note_fast_takeover`), leaving the grants
+    /// this tenure's floor protected open to conflicting ones.
+    pub fn granted_lease(
+        &self,
+        now: Ms,
+        cfg: &Config,
+        prev: Option<&Lease>,
+        inherits_duty: bool,
+    ) -> Lease {
         let own = prev.filter(|p| p.holder == cfg.node_id && !p.released);
         let epoch = match prev {
             None => 1,
@@ -415,7 +429,9 @@ impl LeaseState {
             } else {
                 AckPolicy::Local
             },
-            granted_delegations: cfg.strict_mounts || own.is_some_and(|p| p.granted_delegations),
+            granted_delegations: cfg.strict_mounts
+                || inherits_duty
+                || own.is_some_and(|p| p.granted_delegations),
             retired: prev.map(|p| p.retired.clone()).unwrap_or_default(),
         }
     }
@@ -594,7 +610,7 @@ mod tests {
         let now = Ms(1_000_000);
         assert_eq!(st.classify(now, &cfg, None, 0), Plan::Create);
         // A live foreign holder is busy.
-        let mut foreign = st.granted_lease(now, &cfg, None);
+        let mut foreign = st.granted_lease(now, &cfg, None, false);
         foreign.holder = 3;
         match st.classify(now, &cfg, Some((foreign.clone(), tag())), 0) {
             Plan::Busy { holder: 3, .. } => {}
@@ -625,7 +641,7 @@ mod tests {
         }
         // Our own live lease we do not track: re-adopted through the gate
         // (M4); tracked: held.
-        let mine = st.granted_lease(now, &cfg, None);
+        let mine = st.granted_lease(now, &cfg, None, false);
         match st.classify(now, &cfg, Some((mine.clone(), tag())), 0) {
             Plan::Claim {
                 takeover: true,
@@ -656,7 +672,7 @@ mod tests {
         let now = Ms(5_000_000);
         let mut st = LeaseState::default();
         assert_eq!(st.new_mutation_epoch(now, &cfg), None);
-        let lease = st.granted_lease(now, &cfg, None);
+        let lease = st.granted_lease(now, &cfg, None, false);
         st.adopt(
             now,
             lease,
@@ -704,7 +720,7 @@ mod tests {
             release_when_idle: true,
             ..LeaseState::default()
         };
-        let lease = st.granted_lease(t0, &cfg, None);
+        let lease = st.granted_lease(t0, &cfg, None, false);
         st.adopt(t0, lease, tag(), None);
         assert!(!st.wants_handoff(t0.plus(900), &cfg), "dwell not met");
         st.touch(t0.plus(800));
@@ -727,7 +743,7 @@ mod tests {
         cfg.wanted_grace_ms = 2_000;
         let t0 = Ms(1_000_000);
         let mut st = LeaseState::default();
-        let lease = st.granted_lease(t0, &cfg, None);
+        let lease = st.granted_lease(t0, &cfg, None, false);
         st.adopt(t0, lease.clone(), tag(), None);
         assert!(!st.wants_handoff(t0.plus(9_000), &cfg), "nobody waiting");
         st.renewed(t0.plus(500), lease.wanting(9), tag());

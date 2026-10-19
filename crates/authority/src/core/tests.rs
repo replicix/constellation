@@ -9749,6 +9749,7 @@ mod m10 {
             now,
             h.core.config(),
             Some(&Lease::granted("p0", 1, 4, 10_000)),
+            false,
         );
         assert_eq!(
             granted.epoch, 5,
@@ -16372,6 +16373,258 @@ mod locks {
         }
     }
 
+    fn backup_lease_of(holder: NodeId, epoch: Epoch, expires: i64, backups: Vec<NodeId>) -> Lease {
+        Lease {
+            backups,
+            ack_policy: constellation_store_s3::AckPolicy::Backup,
+            config_version: 2,
+            ..lease_of(holder, epoch, expires)
+        }
+    }
+
+    /// Plan 43 C7-F F-a0: the lease a holder releases says whether its
+    /// tenure leaves lock grants (or a grace) behind, so the taker of the
+    /// released lease, which waits them out, is a tenure its own successor
+    /// must wait out too. The mark is exactly that: the held lease's own is
+    /// no part of it (a marked tenure that has nothing live at its release
+    /// releases an unmarked lease, or the mark would pass down every chain
+    /// of releases and seals, each paying a floor for nothing).
+    #[test]
+    fn a_release_marks_the_lease_only_when_lock_grants_are_left_behind() {
+        // `held_marked` is the held lease's own mark when it is let go;
+        // `live`: a lock grant, still honoured at the release.
+        let released_lease = |held_marked: bool, live: bool| {
+            let (mut h, ino) = holder_with_file();
+            let mut out = request(&mut h, 2, 7, ino, X, true);
+            granted(&lock_replies(&out)[0].2);
+            if !live {
+                // The grant lapsed (the tenure's own mark, set by the
+                // grant, stays: a tenure that granted once is marked).
+                let until = h.meta.locks().grants_snapshot()[0].until_ms;
+                h.now = Ms(until + 1);
+            }
+            h.core.lease.held.as_mut().unwrap().0.granted_delegations = held_marked;
+            assert_eq!(h.core.lock_duty_live(h.now, &h.meta), live);
+            out.clear();
+            h.core.issue_release(h.now, &h.meta, &mut out);
+            s3_ops(&out)
+                .into_iter()
+                .find_map(|(_, r)| match r {
+                    S3Op::LeaseSwap { lease, .. } if lease.released => Some(lease.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no release CAS: {out:?}"))
+        };
+        for held_marked in [false, true] {
+            assert!(
+                released_lease(held_marked, true).granted_delegations,
+                "live grants, held lease marked: {held_marked}"
+            );
+            assert!(
+                !released_lease(held_marked, false).granted_delegations,
+                "nothing live, held lease marked: {held_marked}"
+            );
+        }
+    }
+
+    /// Plan 43 C7-F F-a0: grants moved toward a delegate
+    /// (`lock_on_delegated`: the handoff, then the root's copy of what it
+    /// handed) are no longer in the root's table, and are honoured all the
+    /// same: a release with them behind is marked.
+    #[test]
+    fn grants_moved_to_a_delegate_are_a_lock_duty_until_they_lapse() {
+        let mut h = Harness::new(1);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.hold(1, None);
+        let (_dir, f) = delegated_file(&h.meta);
+        assert!(!h.core.lock_duty_live(h.now, &h.meta));
+        let until = h.now.0 + 5_000;
+        h.meta.locks().install(constellation_meta::locks::Grant {
+            id: GrantId { node: 1, seq: 1 },
+            node: 4,
+            ino: f,
+            mode: X,
+            until_ms: until,
+            recalled: false,
+            gen: 0,
+            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
+        });
+        assert!(h.core.lock_duty_live(h.now, &h.meta));
+        h.core.lock_on_delegated(7, &h.meta);
+        assert_eq!(h.meta.locks().grants_len(), 0);
+        assert!(
+            h.core.lock_duty_live(h.now, &h.meta),
+            "moved out of the table, to hand over with the first renewal"
+        );
+        // Handed over: the root keeps its copy.
+        let now = h.now;
+        assert_eq!(h.core.lock_take_handoff(now, 7).len(), 1);
+        assert!(
+            h.core.lock_duty_live(now, &h.meta),
+            "handed, not handed back"
+        );
+        assert!(!h.core.lock_duty_live(Ms(until + 1), &h.meta), "lapsed");
+    }
+
+    /// Drives `h` (a node that was handed a takeover permit by its seal)
+    /// through the acquisition of `prev` up to its claim CAS: the lease
+    /// read, the tail, the gap check, the swap. Returns the lease the
+    /// claim CAS wrote; the CAS is answered as won.
+    fn claim_over(h: &mut Harness, prev: &Lease, permitted: bool) -> Lease {
+        claim_over_with(h, prev, permitted, false).0
+    }
+
+    /// [`claim_over`], also with the permit arriving while the claim CAS
+    /// is in flight (`permit_in_flight`), and the actions the won CAS led
+    /// to.
+    fn claim_over_with(
+        h: &mut Harness,
+        prev: &Lease,
+        permitted: bool,
+        permit_in_flight: bool,
+    ) -> (Lease, Vec<Action>) {
+        h.core.cfg.takeover_promise_check = false;
+        if permitted {
+            h.core.lease.takeover_permit = Some((prev.epoch, prev.holder));
+            h.core.bk.sealed = prev.epoch;
+        }
+        let mut out = Vec::new();
+        h.core.enqueue_job(
+            h.now,
+            super::super::jobs::JobReq::Acquire {
+                reason: "test",
+                ask_handoff: false,
+            },
+            &h.meta,
+            &mut out,
+        );
+        for _ in 0..8 {
+            let Some((op, req)) = s3_ops(&out)
+                .into_iter()
+                .find(|(_, r)| !matches!(r, S3Op::HeartbeatRead))
+                .map(|(op, r)| (op, r.clone()))
+            else {
+                panic!("the acquisition stalled: {out:?}")
+            };
+            let result = match &req {
+                S3Op::LeaseGet => S3Result::LeaseGet(Ok(Some((prev.clone(), tag())))),
+                S3Op::SegmentRun { .. } => S3Result::SegmentRun(Ok(Vec::new())),
+                S3Op::SegmentGap { .. } => S3Result::SegmentGap(Ok(None)),
+                S3Op::LeaseSwap { lease, .. } => {
+                    let sent = lease.clone();
+                    if permit_in_flight {
+                        // The seal watch fires while the CAS is out.
+                        h.core.lease.takeover_permit = Some((prev.epoch, prev.holder));
+                        h.core.bk.sealed = prev.epoch;
+                    }
+                    let won = h.step(Event::S3 {
+                        op,
+                        result: S3Result::LeasePut(Ok(tag())),
+                    });
+                    return (sent, won);
+                }
+                other => panic!("unexpected request {other:?}"),
+            };
+            out = h.step(Event::S3 { op, result });
+        }
+        panic!("no claim CAS: {out:?}")
+    }
+
+    /// Plan 43 C7-F F-a0: a takeover that inherits a floor writes its
+    /// claim lease marked as granting. `note_fast_takeover` arms a floor
+    /// only for a replaced lease that says it granted, and a fresh taker's
+    /// lease is marked at once only on strict mounts: with cluster locks
+    /// and no strict mounts the seal of a tenure that was itself still
+    /// inside the floor it inherited (it granted nothing yet, so nothing
+    /// marked it) armed none, and the grants that floor protected (the
+    /// tenure before's, which the lock mirror did not carry) were open to
+    /// conflicting grants. P0 granted; P1 seals P0 and is sealed by P2
+    /// inside its own floor: P2 must wait too.
+    #[test]
+    fn a_takeover_that_inherits_a_floor_marks_its_lease_from_its_first_cas() {
+        let mut p1 = Harness::new(2);
+        assert!(p1.core.cfg.locks && !p1.core.cfg.strict_mounts);
+        let mut p0_lease = backup_lease_of(1, 1, p1.now.0 + 5_000, vec![2]);
+        p0_lease.granted_delegations = true;
+        let claimed = claim_over(&mut p1, &p0_lease, true);
+        assert_eq!((claimed.holder, claimed.epoch), (2, 2));
+        // P1 backs P2, grants nothing (inside its floor), and is sealed by
+        // P2: the lease P2 replaces is P1's, as renewed and reconfigured.
+        let mut p1_lease = backup_lease_of(2, 2, p1.now.0 + 9_000, vec![3]);
+        p1_lease.granted_delegations = claimed.granted_delegations;
+        let mut p2 = Harness::new(3);
+        claim_over(&mut p2, &p1_lease, true);
+        assert!(
+            p2.core.ack.pending_floor,
+            "P2 sealed P1 inside P1's floor and armed none"
+        );
+        assert!(
+            claimed.granted_delegations,
+            "P1 took over a tenure that granted: its own successor must \
+             wait out what P1's floor protects"
+        );
+        // A permitted takeover of an unmarked lease inherits nothing.
+        let mut h = Harness::new(2);
+        let unmarked = backup_lease_of(1, 1, h.now.0 + 5_000, vec![2]);
+        let claimed = claim_over(&mut h, &unmarked, true);
+        assert!(!claimed.granted_delegations);
+        // Not a seal: an expired lease (a TTL takeover) waits for nothing.
+        let mut h = Harness::new(2);
+        let mut expired = backup_lease_of(1, 1, h.now.0 - 1, vec![]);
+        expired.ack_policy = constellation_store_s3::AckPolicy::Local;
+        expired.granted_delegations = true;
+        let claimed = claim_over(&mut h, &expired, false);
+        assert!(!claimed.granted_delegations);
+        // A released lease whose tenure left lock grants behind (it was
+        // marked at its release): the grace is a duty too, with locks on.
+        let mut h = Harness::new(2);
+        let mut released = backup_lease_of(1, 1, h.now.0 + 5_000, vec![]);
+        released.released = true;
+        released.granted_delegations = true;
+        let claimed = claim_over(&mut h, &released, false);
+        assert!(claimed.granted_delegations, "released, marked, locks on");
+        let mut h = Harness::new(2);
+        h.core.cfg.locks = false;
+        let claimed = claim_over(&mut h, &released, false);
+        assert!(!claimed.granted_delegations, "released, marked, locks off");
+        // A handoff that served nothing (start-up's) is no duty: a seal of
+        // its taker must not pay a floor.
+        let mut h = Harness::new(2);
+        released.granted_delegations = false;
+        let claimed = claim_over(&mut h, &released, false);
+        assert!(!claimed.granted_delegations, "released, unmarked");
+    }
+
+    /// Plan 43 C7-F F-a0 (review L1): the permit is read when the claim CAS
+    /// goes out (`acquire_cas`) and again when it is won (`acquire_won`).
+    /// A listed backup's TTL claim of a marked lease (expired by its own
+    /// clock, so unpermitted at the CAS) whose seal watch fires while the
+    /// CAS is in flight arms a floor at the win, for a lease written
+    /// unmarked: the tenure then marks it before it serves anything, so a
+    /// seal of it inside that floor arms one too.
+    #[test]
+    fn a_permit_arriving_during_the_claim_cas_still_marks_the_lease() {
+        let mut h = Harness::new(2);
+        let mut prev = backup_lease_of(1, 1, h.now.0 - 1, vec![2]);
+        prev.granted_delegations = true;
+        let (sent, won) = claim_over_with(&mut h, &prev, false, true);
+        assert!(!sent.granted_delegations, "unpermitted when it went out");
+        assert!(h.core.ack.pending_floor, "permitted when it was won");
+        let marked = s3_ops(&won).into_iter().any(|(_, r)| {
+            matches!(r, S3Op::LeaseSwap { lease, .. }
+                if lease.granted_delegations && !lease.released && lease.holder == 2)
+        });
+        assert!(marked, "no mark CAS for the floor it armed: {won:?}");
+        // Without the permit there is no floor and no mark.
+        let mut h = Harness::new(2);
+        let (_, won) = claim_over_with(&mut h, &prev, false, false);
+        assert!(!h.core.ack.pending_floor);
+        assert!(!s3_ops(&won)
+            .into_iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseSwap { .. })));
+    }
+
     /// The lock-exclusion review's follow-up: a recalled grant whose
     /// first local lock never comes (the requester gave up: its answer
     /// lost, a non-blocking request that lost a race) is renewed only
@@ -17821,16 +18074,25 @@ mod locks {
         assert!(!h.core.cfg.strict_mounts);
         let mut own = lease_of(1, 4, h.now.0 + 5_000);
         own.granted_delegations = true;
-        let next = h.core.lease.granted_lease(h.now, &h.core.cfg, Some(&own));
+        let next = h
+            .core
+            .lease
+            .granted_lease(h.now, &h.core.cfg, Some(&own), false);
         assert_eq!(next.epoch, 4);
         assert!(next.granted_delegations);
         let mut other = lease_of(2, 4, h.now.0 + 5_000);
         other.granted_delegations = true;
-        let next = h.core.lease.granted_lease(h.now, &h.core.cfg, Some(&other));
+        let next = h
+            .core
+            .lease
+            .granted_lease(h.now, &h.core.cfg, Some(&other), false);
         assert_eq!(next.epoch, 5);
         assert!(!next.granted_delegations);
         own.released = true;
-        let next = h.core.lease.granted_lease(h.now, &h.core.cfg, Some(&own));
+        let next = h
+            .core
+            .lease
+            .granted_lease(h.now, &h.core.cfg, Some(&own), false);
         assert!(
             !next.granted_delegations,
             "a released lease ended its tenure"

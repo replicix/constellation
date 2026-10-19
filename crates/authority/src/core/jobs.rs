@@ -2144,7 +2144,7 @@ impl Core {
     /// so plan 30 §M8's read delegations must all be recalled (or
     /// outwaited) first. `releasing` is up by now: no new grant is made
     /// while the recalls run or the CAS is in flight.
-    fn issue_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(super) fn issue_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.lease.held.is_none() {
             return;
         }
@@ -2165,9 +2165,15 @@ impl Core {
             self.job_failed(now, "persisting the released lease".into(), replica, out);
             return;
         }
+        // Plan 43 C7-F F-a0: a release that leaves lock grants (or a grace
+        // for an earlier tenure's) behind says so, as a marked tenure's
+        // lease does: whoever takes it over inherits the duty. The mark is
+        // exactly that: the held lease's own is not carried over, or it
+        // would pass down every chain of releases whatever they left.
+        let released = lease.released_granting(self.lock_duty_live(now, replica));
         let op = self.issue_s3(
             S3Op::LeaseSwap {
-                lease: lease.released(),
+                lease: released,
                 tag,
             },
             S3For::Job,
@@ -2605,7 +2611,7 @@ impl Core {
                 self.finish_acquire(now, false, replica, out);
             }
             Plan::Create => {
-                let lease = self.lease.granted_lease(now, &self.cfg, None);
+                let lease = self.lease.granted_lease(now, &self.cfg, None, false);
                 let op = self.issue_s3(
                     S3Op::LeaseCreate {
                         lease: lease.clone(),
@@ -2796,7 +2802,26 @@ impl Core {
         let Plan::Claim { prev, tag, .. } = &plan else {
             return;
         };
-        let lease = self.lease.granted_lease(now, &self.cfg, Some(prev));
+        // Plan 43 C7-F F-a0: a takeover that will wait out what its
+        // predecessor granted (a seal of a tenure that granted: the floor
+        // `acquire_won` arms; a released lease whose tenure left lock
+        // grants behind, marked at its release: the grace
+        // `lock_on_released_takeover` sets) writes a lease that says so,
+        // so its own successor waits too even if this tenure serves
+        // nothing first. (Not read: `prev.is_expired(now)`, a stamp of
+        // the predecessor's clock.)
+        let takeover_of = prev.holder != 0 && prev.holder != self.cfg.node_id;
+        let permitted = self.lease.takeover_permit == Some((prev.epoch, prev.holder));
+        let inherits_duty = takeover_of
+            && prev.granted_delegations
+            && if prev.released {
+                self.cfg.locks
+            } else {
+                permitted
+            };
+        let lease = self
+            .lease
+            .granted_lease(now, &self.cfg, Some(prev), inherits_duty);
         let op = self.issue_s3(
             S3Op::LeaseSwap {
                 lease: lease.clone(),
@@ -2946,6 +2971,16 @@ impl Core {
         self.shipped_floor = self.ship.head_seq;
         self.ship.held_tail_at = Some(now);
         self.acquire_gate(now, replica, out);
+        // Plan 43 C7-F F-a0: a floor armed (`note_fast_takeover`) means a
+        // lease that says so. The claim CAS wrote it so when the permit was
+        // there when it went out (`acquire_cas`); a seal's watch that set
+        // the permit while that CAS was in flight (a TTL claim by this
+        // node's clock) armed the floor above for a lease written
+        // unmarked: mark it now, one CAS before the tenure serves anything
+        // (after the gate has left `Phase::Cas`, which would hold it back).
+        if self.ack.pending_floor {
+            self.ensure_granting_marked(out);
+        }
     }
 
     fn acquire_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {

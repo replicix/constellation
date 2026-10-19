@@ -2247,12 +2247,46 @@ successor whose clock is ahead got no quarantine").
   is still inside its own floor and served nothing yet (locks without
   strict mounts) arms none, and the grants that floor protected (the
   unmirrored ones of the tenure before) are open. Found while designing
-  F-a, not yet shown by a seed: the claim CAS body (`acquire_cas`) is
+  F-a and then shown by seeds: the claim CAS body (`acquire_cas`) is
   marked when the takeover inherits such a duty (a permitted takeover of
-  a marked lease; a released lease under locks). Fail-before first, with
-  the sim configuration `double-seal-inside-the-grace`; if no seed shows
-  it, a core test pins the rule and PROGRESS says so. Its own commit,
-  before the cap.
+  a marked lease; a released lease whose release marked it because the
+  tenure left lock grants or a grace behind: the plan's first form, any
+  released lease under locks, made every seal after a start-up handoff pay
+  the floor, and `a_lagging_backup_still_seals_a_dead_holder` failed on it). *Landed on its own,
+  ahead of F-a* (the maintainer's decision, 2026-10-18). Fail-before:
+  the core test
+  `a_takeover_that_inherits_a_floor_marks_its_lease_from_its_first_cas`,
+  the model test
+  `a_tenure_sealed_inside_its_floor_leaves_no_floor_without_the_inherited_mark`
+  and the sim configuration `double-seal-inside-the-grace` (5 of 12000
+  seeds violate mutual exclusion before, seed 548 among them; none after
+  for that cause; PROGRESS has the counts and an unrelated late failure
+  the configuration also meets).
+  *F-a0 follow-ups* (found by F-a0's review; not implemented, each its
+  own fail-before first). (b) *The inherited mark outlives its floor.* A
+  tenure that takes over a marked lease is marked for its life, so its own
+  sealer arms a floor even if the tenure never granted, and a chain of
+  seals keeps paying 8.5 s / 23.5 s at the defaults for nothing; only the
+  release chain is cut (a released lease's mark is exactly `lock_duty_live`).
+  Clear an inherited mark by CAS once the floor has passed, `lock_duty_live`
+  is false, no read or write delegation is live and the tenure made no
+  grant of its own; `ensure_granting_marked` re-marks before the next
+  grant, so a racing seal at worst over-waits. (L3) *Duties no claim CAS
+  marks:* a node re-claiming its own released lease with a live quarantine
+  (`lock_quarantine_dropped_tenure`; `granted_lease`'s `own` excludes
+  released leases), a restart quarantine over an unmarked previous lease,
+  and reclaims admitted into a `Local` tenure (its renewals are not held,
+  so the reclaimed grants install unmarked; the lock mirror goes only to
+  the backups listed when the table changed). Each becomes F-a0's hole if
+  that tenure lists a backup and is sealed before its next mark CAS. Mark
+  where the tenure becomes sealable: at the reconfiguration that adds a
+  backup (`issue_reconfig`, `backup.rs` about 1616) when `lock_duty_live ||
+  pending_floor || in_takeover_floor ||` read delegations are live, and at
+  the claim CAS for `ack_s3`. (L4) *The lock model has no mark:* its fast
+  takeover always arms the grace. Add `Reg::marked` (a root grant marks,
+  a release marks per `lock_duty_live`, a takeover inherits per
+  `acquire_cas`, the grace arms only on a marked `prev`) and a
+  violate/clean pair for the double seal and the released chain.
   *What it buys.* An S3-cut holder alive on P2P beats until its expiry,
   so its successor's floor ends about M after it reads the lease as
   expired: the scenario's first acknowledged write and first lock grant
@@ -2668,11 +2702,12 @@ to land before C0.
   the 8.5 s / 23.5 s). (c) Both, (b) later on top of (a), if a mid-lease
   crash's floor turns out to matter.
   Also: the slack is M (1 s) until C7a names ρ, then `2ρ·(X − sent)`
-  (≈ 0.1 s); and F-a0 (mark a tenure that inherits a floor) lands with
-  F-a, fail-before first: *recommended yes*.
+  (≈ 0.1 s); and F-a0 (mark a tenure that inherits a floor) lands on its
+  own, fail-before first: *recommended yes*.
   **Answered 2026-10-18:** (a) the beat cap; the slack is M until C7a;
   F-a0 lands on its own as soon as its fail-before and review are done,
-  ahead of F-a (a safety fix does not wait for the latency work).
+  ahead of F-a (a safety fix does not wait for the latency work). F-a0
+  has landed (see F-a0 below).
 - **Q18 — F-b's semantics.** *Blocks F-b.* (a) A non-blocking request on
   a lock with no known conflict waits out a grace (and the tenure floor,
   barriers, a delegate's short authority) instead of `EAGAIN`: up to

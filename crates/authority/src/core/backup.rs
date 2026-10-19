@@ -297,7 +297,7 @@ pub(crate) struct AckState {
     /// A fast takeover of a tenure that served strict reads is waiting for
     /// its marker, where the successor's floor starts (see the module
     /// doc); `false` after the floor was set or when none is due.
-    pending_floor: bool,
+    pub(crate) pending_floor: bool,
     /// Where this tenure's takeover floor ends (the later of its
     /// acknowledgement floor and its lock grace, `note_marker_landed`),
     /// 0 for a tenure with none: the lease is not idle-released before it
@@ -972,8 +972,9 @@ impl Core {
     /// released lease, and `lock_on_released_takeover` covers this node's
     /// own grants only): the lease is not released to another node
     /// meanwhile, by idle release, by a peer's handoff request or by a
-    /// continuation epoch's flush. (An operator's flush and stop is not
-    /// held: the process is going away.)
+    /// continuation epoch's flush. (An operator's flush or stop waits for
+    /// it too, parked: `service_pending_flushes`; one that gives up on a
+    /// stuck gate releases nothing and leaves the lease to lapse.)
     pub(crate) fn in_takeover_floor(&self, now: Ms) -> bool {
         now.0 < self.ack.floor_until
     }

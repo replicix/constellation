@@ -240,6 +240,22 @@ impl Lease {
         }
     }
 
+    /// This lease released, its `granted_delegations` set to exactly
+    /// `granting` (not carried over from the tenure: a released lease says
+    /// what its tenure leaves behind, not what the tenures before it did;
+    /// `config_version` bumped when the mark changes).
+    pub fn released_granting(&self, granting: bool) -> Self {
+        let released = self.released();
+        if released.granted_delegations == granting {
+            return released;
+        }
+        Self {
+            granted_delegations: granting,
+            config_version: released.config_version + 1,
+            ..released
+        }
+    }
+
     /// Same holder and epoch, pushed-out expiry. Any pending request in
     /// `wanted_by` survives: it is addressed to this holder and is only
     /// answered by releasing.

@@ -249,6 +249,16 @@ reached by lock holders and not yet aware of it, up to the lock TTL
 past its successor's grace. A lone node, or any lease holder without
 backups under the default `ack=local`, is not affected.
 
+A fast takeover's successor is itself marked as granting from its first
+CAS (no strict mounts needed), and so is the taker of a released lease
+whose tenure left lock grants (or a grace) behind (the release marks its
+lease exactly then, whatever the released lease said before; grants moved
+toward a delegate count): both wait out grants of the tenure before, and a
+successor of theirs, sealed in before they granted anything, must wait out
+the same grants. A mark inherited this way stays for the tenure's life. A successor with no such mark in its lease would arm no grace, and
+a lock the first holder's tenure granted without the mirror seeing it could
+be granted over.
+
 A delegate's grants are capped by what is left of its own delegation,
 so it keeps that authority topped up: while it has grants out it renews
 the delegation at a quarter of its TTL, a lock renewal that finds less

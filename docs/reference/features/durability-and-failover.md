@@ -464,7 +464,9 @@ they only decide when to try.
 still honour what it granted: a strict-read delegation, a lock grant, a
 write delegation. A successor that took a lease over by a seal or an
 `ack=s3` takeover, and whose predecessor served strict reads or locks
-(the lease's `granted_delegations` mark, set before the first answer),
+(the lease's `granted_delegations` mark, set before the first answer, or
+at once on a takeover that itself waits out such a predecessor's grants:
+see below),
 therefore acknowledges no mutation, and grants no new lock, until its own
 marker time plus the takeover window plus the grant's TTL plus two expiry
 margins: the read-delegation TTL (plus the write delegations' reclaim
@@ -478,6 +480,25 @@ the lease has left would read it as past and wait for nothing while the
 old holder's grants were still honoured. Nor does the successor's reading
 of that expiry decide whether the takeover was a fast one: a seal or an
 `ack=s3` takeover is, whatever its clock says.
+
+A tenure that waits out its predecessor's grants is one its own successor
+must wait out, even if it serves nothing first. The claim CAS of a
+takeover that arms a floor (a seal or an `ack=s3` takeover of a marked
+tenure) therefore writes the new lease already marked, and so does the
+claim of a released lease that says its tenure left lock grants behind (a
+release marks its lease exactly when the lock table holds a live grant, a
+grant moved toward a delegate or a grace; the taker of a released lease
+grants no lock for a grace of its own, and the mark of the lease being
+released is not carried over). A
+second seal inside the first successor's floor, before it had granted
+anything itself, found an unmarked lease and armed no floor, and the grants
+the first floor protected (those of the tenure before, which the lock
+mirror had not carried) were open to conflicting ones. A handoff that
+left nothing live behind releases an unmarked lease, however the tenure
+before it was marked: a seal of its taker waits for nothing. (What
+remains: a mark a tenure inherits stays for its life, so a seal of it
+arms a floor even if it never granted anything, and a chain of seals
+keeps paying one.)
 
 The cost: a takeover in the last seconds of the old lease waits the whole
 bound where it used to wait only until the expiry, and so does a takeover
