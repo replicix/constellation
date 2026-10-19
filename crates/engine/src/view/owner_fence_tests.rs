@@ -548,6 +548,98 @@ fn a_cancelled_blocking_lock_wait_answers_intr_and_holds_nothing() {
     wait(&constellation_vfs::CancelToken::new()).unwrap();
 }
 
+/// Every round of one blocking lock call carries how long the application
+/// has waited since the call began (`waited_ms`), so that a call that lost
+/// a round keeps its place in the owner's queue; the first round carries
+/// nothing, and a round that got a grant does not lengthen the back-off of
+/// the next (a client that lost the local race to another is not a reason
+/// to wait longer than the others).
+#[test]
+fn every_round_of_a_blocking_lock_call_carries_how_long_it_has_waited() {
+    let mut f = fenced_fs();
+    let root = Caller::root();
+    let (file, _) = f.create(&root, ROOT_INO, "rounds").unwrap();
+    let ino = file.attr.ino;
+    let (seen, waits) = script_core_waits(
+        &mut f,
+        ino,
+        vec![
+            Scripted::WouldBlock,
+            Scripted::Wait(40),
+            Scripted::WouldBlock,
+            Scripted::Grant,
+        ],
+    );
+    let me = std::process::id();
+    let waiter = Caller::new(0, 0, Some(me));
+    Blocking::run(|r| {
+        f.fs.lock_acquire(
+            &OpCtx::new(OpKind::LockAcquire, &waiter),
+            ino,
+            Fh(ino),
+            LockSpec {
+                owner: LockOwner(TURN_OWNER + 1),
+                range: LockRange { start: 0, end: 10 },
+                kind: LockKind::Write,
+                pid: me,
+            },
+            true,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    let waits = waits.lock().unwrap().clone();
+    assert_eq!(
+        waits[0], 0,
+        "the first round: nothing waited yet: {waits:?}"
+    );
+    assert!(
+        waits.windows(2).all(|w| w[0] <= w[1]) && waits[3] >= 40,
+        "each round carries what the call has waited since it began: {waits:?}"
+    );
+}
+
+/// A core that keeps answering `Granted` for a lock the local tables do
+/// not take (`local_set` still says `NeedGrant`) is not spun on: the
+/// back-off the rounds build is kept (it was reset by every `Granted`: no
+/// pause at all). Eight such rounds pause 10 ms times 2 to 8, 350 ms.
+#[test]
+fn a_grant_the_local_tables_refuse_keeps_the_back_off() {
+    let mut f = fenced_fs();
+    let root = Caller::root();
+    let (file, _) = f.create(&root, ROOT_INO, "refused").unwrap();
+    let ino = file.attr.ino;
+    let mut script = vec![Scripted::GrantNothing; 8];
+    script.push(Scripted::Grant);
+    let seen = script_core(&mut f, ino, script);
+    let me = std::process::id();
+    let waiter = Caller::new(0, 0, Some(me));
+    let started = std::time::Instant::now();
+    Blocking::run(|r| {
+        f.fs.lock_acquire(
+            &OpCtx::new(OpKind::LockAcquire, &waiter),
+            ino,
+            Fh(ino),
+            LockSpec {
+                owner: LockOwner(TURN_OWNER + 1),
+                range: LockRange { start: 0, end: 10 },
+                kind: LockKind::Write,
+                pid: me,
+            },
+            true,
+            r,
+        )
+    })
+    .unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 9);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(300),
+        "no back-off between rounds that were granted and refused: {:?}",
+        started.elapsed()
+    );
+}
+
 /// A blocked lock wait past its op's deadline answers `TimedOut` and
 /// holds nothing, as a cancelled one answers `Intr`; the conformance
 /// kit's `cancellation` group asserts the same through `Vfs`
@@ -2173,6 +2265,9 @@ enum Scripted {
     WouldBlock,
     /// Installs a grant on the inode, then grants.
     Grant,
+    /// Answers `Granted` and installs nothing: a core granting what the
+    /// local tables refuse.
+    GrantNothing,
 }
 
 /// A stand-in for the core: answers each `SyncRequest::Lock` from
@@ -2182,26 +2277,47 @@ fn script_core(
     ino: Ino,
     script: Vec<Scripted>,
 ) -> Arc<std::sync::Mutex<Vec<bool>>> {
+    script_core_waits(f, ino, script).0
+}
+
+/// What a scripted core saw: per request, whether it was `blocking`, and
+/// the `waited_ms` it carried.
+type Seen = (
+    Arc<std::sync::Mutex<Vec<bool>>>,
+    Arc<std::sync::Mutex<Vec<u64>>>,
+);
+
+/// [`script_core`], and the `waited_ms` each request carried.
+fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
     let (_dead, closed) = tokio::sync::mpsc::unbounded_channel();
     let mut rx = std::mem::replace(&mut f._locks_core, closed);
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
+    let waits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let waited_log = waits.clone();
     let meta = f.meta.clone();
     std::thread::spawn(move || {
         let mut n = 0;
         while let Some(req) = rx.blocking_recv() {
             let SyncRequest::Lock {
-                blocking, reply, ..
+                blocking,
+                waited_ms,
+                reply,
+                ..
             } = req
             else {
                 continue;
             };
             log.lock().unwrap().push(blocking);
+            waited_log.lock().unwrap().push(waited_ms);
             let step = script[n.min(script.len() - 1)];
             n += 1;
             let answer = match step {
                 Scripted::Wait(retry_ms) => constellation_authority::LockAnswer::Wait { retry_ms },
                 Scripted::WouldBlock => constellation_authority::LockAnswer::WouldBlock,
+                Scripted::GrantNothing => constellation_authority::LockAnswer::Granted {
+                    position: constellation_meta::Position::ZERO,
+                },
                 Scripted::Grant => {
                     let now = now_unix_ms();
                     meta.locks().install_held(
@@ -2229,7 +2345,7 @@ fn script_core(
             let _ = reply.send(answer);
         }
     });
-    seen
+    (seen, waits)
 }
 
 /// Reports who answered the op, and when.

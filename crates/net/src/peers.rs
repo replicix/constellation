@@ -1524,6 +1524,7 @@ fn claimed_node_id(payload: &Payload) -> Option<u64> {
         | DelegBackupAppend { from, .. }
         | StreamAhead { from, .. }
         | LockGranted { from, .. }
+        | LockCancel { from, .. }
         | LockReleased { from, .. }
         | LockRenew { from, .. }
         | LockMirror { from, .. } => *from,
@@ -1878,6 +1879,7 @@ async fn handle_stream<S: PeerService>(
                 blocking,
                 sent,
                 incarnation,
+                waited_ms,
             } => Some(
                 service
                     .lock_requested(
@@ -1888,6 +1890,7 @@ async fn handle_stream<S: PeerService>(
                         blocking,
                         sent,
                         incarnation,
+                        waited_ms,
                     )
                     .await,
             ),
@@ -1925,6 +1928,16 @@ async fn handle_stream<S: PeerService>(
                 outcome,
             } => {
                 service.lock_granted(from, ino, sent, outcome);
+                Some(Payload::Ok { req_id: 0 })
+            }
+            Payload::LockCancel {
+                from,
+                ino,
+                exclusive,
+                shared,
+                upto,
+            } => {
+                service.lock_cancel(from, ino, exclusive, shared, upto);
                 Some(Payload::Ok { req_id: 0 })
             }
             Payload::LockReleased {

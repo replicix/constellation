@@ -1741,6 +1741,30 @@ the late-answer rules, the leaving-grant fields and functions,
 `restamp` outside the log-derived install, `pending_returns`' remnants;
 the inferred void cut.
 
+**Keep (the ask-again rule, PROGRESS "Fix: a pushed lock grant is never older
+than its holder's first renewal").** The rewrite of `core/locks.rs` carries
+over what only withholds, orders or tells: `lock_try_grant` pushes a grant to
+a waiter whose RPC is gone only from a request no older than half of
+`ttl − margin` of the granted (capped) ttl, and otherwise asks the waiter to
+re-send (`Waiter::ask`, `Blocked::AskAgain`, the `LockGranted` push carrying
+`Waiting { retry_ms: 0 }`); the asked waiter's turn is held, with no
+conflicting grant to anyone else meanwhile (`lock_reserved_against`), then it
+is passed over (`lock_serve_waiters`); its node's handler re-sends idle ops
+and leaves an op with a request in flight alone (`on_lock_granted_push`). A
+request carries how long its application has waited (`LockRequest::waited_ms`,
+`Control::Lock::waited_ms`) and is queued from there (`lock_waited_since`); a
+grant installed, not recalled, answers the ops of its node that it covers
+(`lock_wake_covered`); one that arrives recalled makes the others ask again
+(`lock_resend_idle`); `LockCancel` drops the waiters of an op that left.
+**Not in that patch, to be decided with C4's records** (safety-sensitive, a
+model check first: two ops per node, a move between a push and the first
+renewal): the restamp of a grant moved with its subtree to a full lock ttl and
+margin (`restamp`: 21 s for one that lapsed at its holder meanwhile; the
+narrow fix is the remaining duration for grants the sender knows were never
+renewed and stops renewing at the take, the full restamp kept for renewed
+grants, root copies, mirrors and reclaims), the residual slow-transit lapse
+path, and the model's two ops per node with the holder's max-merge.
+
 **Fail-before tests.**
 - Model (`crates/model/src/locks.rs`): knob `lock_state_in_log: bool`
   (new; `false` = today's model with its message-borne `Handoff`,
@@ -1926,6 +1950,14 @@ step cannot move; four commits) and gets its own reviews:
   - The F-a review measured the wait side: a +2.5 s step of the root broke
     lock exclusion in 73 of 2 000 seeds, with the beat cap and without it.
   - F-a's cap itself breaks under a forward step of the holder (row 27).
+  - The ask-again patch (PROGRESS "a pushed lock grant is never older than
+    its holder's first renewal") adds two wall stamps of a requester that
+    belong on the WAIT clock: the `sent` of a lock request and the `upto` of
+    a `LockCancel`, compared only with the same node's earlier `sent` (never
+    across nodes: `waited_ms` is a duration). A backward step of the
+    requester's wall clock between a request and a cancel makes the owner
+    drop a live waiter (`w.sent < upto`); liveness only, its next re-send
+    repairs it. C7-H1 moves both with the other `sent` stamps.
   *Specified 2026-10-19* (the coder spec is kept with the reviews). The
   fix is the step-safe half of C7a: no local duration reads the wall
   clock.
@@ -2270,6 +2302,23 @@ first part of C7a, landed early):
   the `ack=s3` observation, a lock grace that does not read the releaser's
   expiry): after C1 (the claim path is settled) and
   C4 (the cut lives in `LockExpire` then); before C5 (no overlap).
+  *Evidence found by the ask-again review (row 6's class, a clock offset
+  beyond the envelope):* `fast-takeover-skewed-successor` (the real cap)
+  violates mutual exclusion at the second failover, t about 15 to 16 s, with
+  nodes 2 and 3 four seconds ahead, about once in 15000 seeds on 63da672
+  (seeds 11087, 18138) and with the ask-again patch (5570, 11942, 202261;
+  its trajectories differ): a node whose clock is ahead reads the live
+  holder's lease as expired and seals its epoch, the next holder takes the
+  lease and grants 0.35 to 0.8 s later, and the old holder, alive, keeps
+  admitting I/O under its own grants (seed 5570: its own client enters at
+  15274 after "a backup sealed our epoch" at 15209) or even grants
+  (seed 202261: node 2 at 15651, after node 3's takeover at 15458). Pinned
+  as `#[ignore]`d known-gap tests (`fast_takeover_skewed_successor_known_gaps`
+  in `crates/authority/tests/sim.rs`). To check with C7b: a holder that
+  learns it was sealed stops admitting new local sections under its
+  self-grants; a successor of a lease it read as expired on a skewed clock
+  waits out the bound.
+
   The observation rule's cold-claim wait (a full TTL from the first
   read) is a knowing latency cost: §10 gate G6.
 
@@ -2436,7 +2485,9 @@ successor whose clock is ahead got no quarantine").
   beat, so the cap is inert in them; beats on by default
   (`HolderBeats::Thread` in `SimConfig::default`) is a separate commit
   with full re-sweeps of every backup and `ack=s3` configuration and
-  re-pinned regression seeds (65, 97, 548, 194557 and 194714 among them),
+  re-pinned regression seeds (65, 97, 548, and the credited control's 193262,
+  197625 and 198196, which replaced 194557 and 194714 when the ask-again
+  traffic moved the trajectories, among them),
   keeping `-nobeats` variants for the no-beat path.
   Fail-before: core tests of the cap (the parent waits the bound), of the
   arrival against the credit (a holder clock behind), of the guard, of a

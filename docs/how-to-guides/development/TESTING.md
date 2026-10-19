@@ -3236,7 +3236,27 @@ fences no I/O in 0..4000 (482 before chunk delegate-fenced-io: holders
 renewing at a delegate that a continuation epoch's recall had stopped,
 before the `Recall` record reached their tables); its seeds and the
 `locks-delegated-writes` seeds whose pushed grant arrived all but lapsed
-are pinned in `delegate_fenced_io_seeds_keep_their_grants`. Seed 2723 is pinned
+are pinned in `delegate_fenced_io_seeds_keep_their_grants`. The ask-again rule (a grant is
+pushed only from a request recent enough to reach its holder before its first
+renewal; an older one is asked to send it again; a request carries how long its
+application has waited and is queued from there; a grant answers the ops of its
+node that it covers) has four sweep configs at the production lock ttl (20 s,
+margin 1 s) and a short delegation (the core's own 5 s, which the sim's
+`Config::defaults` keeps whatever its lock ttl; the daemon's default is the lock
+ttl): `locks-delegated-production-ttl`, `-heavy` (nine ops on one file) and the
+same two at the root (`locks-production-ttl`, `-heavy`; the sim's 6 s lease caps
+the root's grants too). A `+` after any config's label applies variants:
+`+nomove` (no rename across subtrees: a delegation's move restamps its grants to
+a full lock ttl) and `+solo` (one lock client per node). `sweep_config` prints
+per config the distribution of each seed's longest wait and longest handoff gap
+(the idle time after the last conflicting section, `max_handoff_gap_ms`, none
+for a lock's first acquisition) with the overtakes, the asks and the seeds in
+which the owner node's clients or the others' waited over 45 s and 50 s
+(`SWEEP-LOCKS`); `capped_grants_hand_a_lock_over_within_a_round_trip` asserts
+no hang, no overtake and a longest wait under the 9.5 s re-send interval (the
+non-heavy configs), a gap of at most 6 s, no unanswered ask, and that six seeds
+of `locks-long-grants` that kept the owner node's own client waiting 51 to 56 s
+no longer do. Seed 2723 is pinned
 (`locks_blips_tight_seed_2723_release_keeps_exclusion`: a handoff that
 dropped two live exclusive grants, and a successor whose release grace
 went with its own tenure). `locks-blips-tight-in-doubt` (sweep only, plus
@@ -3326,6 +3346,7 @@ Harness scenarios (the harness process is the application: it calls
 | `lock-failover` | the holder is killed with a lock held under an M9 backup; the successor reclaims/mirrors the grant (no `EIO` for the locker), refuses the contender throughout, grants it after the unlock |
 | `lock-grace-wait` | plan 43 F-b: the holder is killed with a lock held under an M9 backup; in the successor's lock grace a non-blocking `F_SETLK` on a free file waits and is granted at the grace's end (never `EAGAIN`), one with a `SIGALRM` after 8 s ends `EINTR`, a blocking `F_SETLKW` parked at the successor is served by the grace-end timer, and the held lock is refused `EAGAIN` at once afterwards; `grace_waits` is counted, `grace_wait_gave_up` is 0 |
 | `s3-cut-holder-failover-with-locks` | four nodes, `--cto strict`: the holder is cut from S3 only (P2P up, so it beats until its lease ends); its backup seals at the expiry it reads and takes over. A reader keeps a read delegation, a child process holds an exclusive lock, a writer creates files, a contender tries a non-blocking lock on a free file every 200 ms. Prints, from the cut: the takeover, the first write acknowledged and the first lock granted after it, the errnos and the successor's floor counters. Plan 43 C7-F F-a's tripwire: both come within 3 s (a margin and 2 s of slack) of the takeover, and the successor counts the floor as shortened by the cap or already past (`ack_floor_capped`, `ack_floor_capped_out`); without the cap they come 8.6 s and 23.6 s after it. No write or read fails, a lock attempt fails only with `EAGAIN` |
+| `lock-contention-delegated` | plan 43 ask-again: three nodes at the default lock TTL and a 5 s delegation TTL (the core's default; the daemon's is the lock TTL, `CONSTELLATION_HARNESS_DELEGATION_TTL_MS=default` runs it there) contend for one `flock`ed counter in a directory delegated to b, whose grants a 2 to 3 s delegation caps; each round one node holds the lock 4 s while the other two wait, then every node increments: the count is exact, the median handoff gap is within 30 ms and the longest within 2.5 s (judged against the host-lag probe: seconds, and outwaited grants, before), no grant is outwaited without a host stall to explain it, and b asked a stale waiter to ask again (short delegation only); prints each handoff gap, the waits and the owner's `asked_again`, `ask_again_passed_over`, `reserved_waits`, `recalls_expired` |
 | `lock-latency` | measurements: first lock from a non-sequencer, cached re-locks, the sequencer's own locks, a contended handoff, and a lone node under `cluster` against `local` |
 | `lock-holder-killed-contention` | four nodes increment one `flock`ed counter (read, add, write, `fsync`); the holder is `kill -9`'d with the lock held. The survivors stall only until its grant is outwaited (ttl + margin, never less than its remaining life), hand the lock on with no further outwait (the owner's `recalls_expired` is 1), and the count is exact. Then a node killed while parked first in line costs the next waiter nothing (granted within milliseconds of the unlock, not ttl + margin later) |
 | `lock-fence-at-close` | B writes under a lock and is cut from the owner past its grant; C takes the lock and writes. B's close returns `EIO` (`fcntl` closed while still locked; `flock` unlocked first, then closed), and the file holds C's data on every node |

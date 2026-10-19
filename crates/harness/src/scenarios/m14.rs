@@ -555,6 +555,8 @@ pub fn lock_holder_partitioned(_seed: u64) -> Result<()> {
 struct CounterRun {
     done: u64,
     times: Vec<Instant>,
+    /// How long each `flock(LOCK_EX)` took.
+    waits: Vec<Duration>,
     error: Option<String>,
 }
 
@@ -564,11 +566,14 @@ type Hold = (
     std::sync::mpsc::Receiver<()>,
 );
 
-fn counter_worker(path: PathBuf, n: u64, hold: Option<Hold>) -> CounterRun {
+/// `section`: how long each increment keeps the lock before it reads the
+/// counter (the work an application does under it).
+fn counter_worker(path: PathBuf, n: u64, hold: Option<Hold>, section: Duration) -> CounterRun {
     use std::os::unix::fs::FileExt;
     let mut run = CounterRun {
         done: 0,
         times: Vec::new(),
+        waits: Vec::new(),
         error: None,
     };
     let f = match open_rw(&path) {
@@ -579,9 +584,14 @@ fn counter_worker(path: PathBuf, n: u64, hold: Option<Hold>) -> CounterRun {
         }
     };
     for i in 0..n {
-        if let Err(e) = flock(&f, libc::LOCK_EX) {
+        let (locked, took) = flock_timed(&f, libc::LOCK_EX);
+        if let Err(e) = locked {
             run.error = Some(format!("flock: {e}"));
             return run;
+        }
+        run.waits.push(took);
+        if !section.is_zero() {
+            std::thread::sleep(section);
         }
         if let Some((at, tx, rx)) = &hold {
             if i == *at {
@@ -682,7 +692,7 @@ pub fn lock_holder_killed_contention(_seed: u64) -> Result<()> {
             let path = c.mnt.join("counter");
             let h = if i == victim { hold.take() } else { None };
             workers.push(std::thread::spawn(move || {
-                counter_worker(path, PER_NODE, h)
+                counter_worker(path, PER_NODE, h, Duration::ZERO)
             }));
         }
         held_rx
@@ -1548,6 +1558,221 @@ pub fn s3_cut_holder_failover_with_locks(_seed: u64) -> Result<()> {
     result
 }
 
+// ------------------------------------------------------------------ lock-contention-delegated
+
+/// One node of a `lock-contention-delegated` round: waits `start_after`,
+/// then `flock(LOCK_EX)` and one increment of the counter, `fsync`
+/// included, then unlocks. Returns when the lock was granted and when it
+/// was given up.
+fn counter_turn(path: PathBuf, start_after: Duration) -> Result<(Instant, Instant, Duration)> {
+    use std::os::unix::fs::FileExt;
+    std::thread::sleep(start_after);
+    let f = open_rw(&path)?;
+    let (locked, took) = flock_timed(&f, libc::LOCK_EX);
+    locked.map_err(|e| anyhow::anyhow!("flock: {e}"))?;
+    let acquired = Instant::now();
+    let mut buf = [0u8; 8];
+    let got = f.read_at(&mut buf, 0)?;
+    let cur = if got == 8 { u64::from_be_bytes(buf) } else { 0 };
+    f.write_at(&(cur + 1).to_be_bytes(), 0)?;
+    f.sync_all()?;
+    let unlocked = Instant::now();
+    flock(&f, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("unlock: {e}"))?;
+    Ok((acquired, unlocked, took))
+}
+
+/// Three nodes at the default lock TTL (20 s) and a delegation TTL of 5 s
+/// (the core's default; the daemon's is the lock TTL: see `DELEG_TTL_MS`)
+/// contend for one `flock`ed counter in a directory delegated to node b,
+/// whose grants a 2 to 3 s delegation caps, while a waiter re-sends its
+/// request every 9.5 s. Each round one node holds the lock for 4 s (an
+/// application doing its work under it: a `git commit`), the other two ask
+/// for it a third of a second after it, and every node increments once. A
+/// grant pushed to a waiter whose request was seconds old reached it lapsed,
+/// was recalled by the waiter behind it and outwaited: the waiters got the
+/// lock seconds after the holder let go (sim `locks-delegated-production-ttl`:
+/// 14 of 300 seeds never got a lock in a minute). Now the owner asks such a
+/// waiter to send its request again and grants over it (plan 43 "ask
+/// again"): the lock changes hands within `MEDIAN_GAP` of the unlock at the median
+/// and `MAX_GAP` at most, the count is exact, and b asked (`asked_again`). Prints each handoff's gap, the
+/// waits' distribution and the owner's `asked_again`, `ask_again_passed_over`,
+/// `reserved_waits` and `recalls_expired`.
+pub fn lock_contention_delegated(_seed: u64) -> Result<()> {
+    const NAME: &str = "lock-contention-delegated";
+    // A short delegation, the core's own 5 s (`Config::delegation_ttl_ms`,
+    // as the sim runs it): a delegate's grants are capped at 2 to 3 s.
+    // The daemon's default is the lock TTL
+    // (`Config::default_delegation_ttl_ms`), which caps them at ~17 s: no
+    // stale waiter then (a push is old only past ~8 s). A deployment that
+    // sets the delegation TTL short (`CONSTELLATION_DELEGATION_TTL_MS`) is
+    // the one the rule is for; `CONSTELLATION_HARNESS_DELEGATION_TTL_MS=default`
+    // runs the scenario at the daemon's default (nothing is asked then, and
+    // the handoffs must be as fast).
+    const DELEG_TTL_MS: u64 = 5_000;
+    let at_default =
+        std::env::var("CONSTELLATION_HARNESS_DELEGATION_TTL_MS").as_deref() == Ok("default");
+    const ROUNDS: usize = 6;
+    const HOLD: Duration = Duration::from_secs(4);
+    // The handoff itself: the holder's unlock (a flush of what it wrote), the
+    // owner's grant, the waiter's session wait, and its `fsync`. The bug's
+    // signature is seconds: a re-send interval (9.5 s) or an outwait
+    // (`ttl + margin` of a 2 to 3 s grant).
+    const MAX_GAP: Duration = Duration::from_millis(2_500);
+    const MEDIAN_GAP: Duration = Duration::from_millis(30);
+    let (_env, _root, mut clients, _) = super::m11::cluster_with_deleg_ttl(
+        NAME,
+        &["a", "b", "c"],
+        &[],
+        0,
+        (!at_default).then_some(DELEG_TTL_MS),
+    )?;
+    let result = (|| -> Result<()> {
+        let b_id = node_id(&clients[1])?;
+        std::fs::create_dir(clients[0].mnt.join("d1"))?;
+        for c in &clients[1..] {
+            eventually("d1 visible", Duration::from_secs(20), || {
+                anyhow::ensure!(c.mnt.join("d1").is_dir());
+                Ok(())
+            })?;
+        }
+        super::m11::delegate(&clients[0], "/d1", b_id)?;
+        super::m11::wait_installed(&clients[1], "/d1", Duration::from_secs(20))?;
+        std::fs::write(clients[0].mnt.join("d1/counter"), [0u8; 8])?;
+        for c in &clients[1..] {
+            eventually("counter visible", Duration::from_secs(30), || {
+                anyhow::ensure!(read_counter(&c.mnt.join("d1/counter"))? == 0);
+                Ok(())
+            })?;
+        }
+        let mut gaps: Vec<Duration> = Vec::new();
+        let mut waits: Vec<Duration> = Vec::new();
+        let started = Instant::now();
+        for round in 0..ROUNDS {
+            let holder = round % 3;
+            // The holder takes the lock, the others queue behind it.
+            let hf = open_rw(&clients[holder].mnt.join("d1/counter"))?;
+            flock(&hf, libc::LOCK_EX).map_err(|e| anyhow::anyhow!("holder flock: {e}"))?;
+            let waiters: Vec<_> = (0..3)
+                .filter(|n| *n != holder)
+                .map(|n| {
+                    let path = clients[n].mnt.join("d1/counter");
+                    std::thread::spawn(move || counter_turn(path, Duration::from_millis(300)))
+                })
+                .collect();
+            std::thread::sleep(HOLD);
+            {
+                use std::os::unix::fs::FileExt;
+                let mut buf = [0u8; 8];
+                let got = hf.read_at(&mut buf, 0)?;
+                let cur = if got == 8 { u64::from_be_bytes(buf) } else { 0 };
+                hf.write_at(&(cur + 1).to_be_bytes(), 0)?;
+                hf.sync_all()?;
+            }
+            let released = Instant::now();
+            flock(&hf, libc::LOCK_UN).map_err(|e| anyhow::anyhow!("holder unlock: {e}"))?;
+            drop(hf);
+            let mut turns = Vec::new();
+            for w in waiters {
+                turns.push(w.join().expect("counter turn")?);
+            }
+            turns.sort_by_key(|t| t.0);
+            let mut free_since = released;
+            for (acquired, unlocked, took) in &turns {
+                gaps.push(acquired.saturating_duration_since(free_since));
+                waits.push(*took);
+                free_since = *unlocked;
+            }
+            eprintln!(
+                "    {NAME}: round {round} (held by {}): handoff gaps {:?}",
+                clients[holder].name,
+                &gaps[gaps.len() - turns.len()..]
+            );
+        }
+        let longest = gaps.iter().max().copied().unwrap_or_default();
+        eprintln!(
+            "    {NAME}: handoff gaps (unlock to the next grant) {}; waits behind the 4 s hold {}",
+            super::m8::dist(gaps.clone()),
+            super::m8::dist(waits)
+        );
+        let expected = 3 * ROUNDS as u64;
+        let got = read_counter(&clients[0].mnt.join("d1/counter"))?;
+        let b = locks_of(&clients[1])?;
+        let g = |k: &str| b[k].as_u64().unwrap_or(0);
+        eprintln!(
+            "    {NAME}: counter {got}; the delegate's asked_again {}, ask_again_passed_over {}, \
+             reserved_waits {}, recalls_expired {}; asks answered by the requesters: a {} c {}",
+            g("asked_again"),
+            g("ask_again_passed_over"),
+            g("reserved_waits"),
+            g("recalls_expired"),
+            locks_of(&clients[0])?["asks_answered"]
+                .as_u64()
+                .unwrap_or(0),
+            locks_of(&clients[2])?["asks_answered"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+        anyhow::ensure!(
+            got == expected,
+            "counter {got}, expected {expected} (lost or doubled increments)"
+        );
+        // The protocol's own cost of a handoff is the unlock's flush and the
+        // grant's round trip (a few ms); a stale waiter's lapsed push cost
+        // 50 ms more (its retry) and, now and then, an outwait. Judged
+        // against the host-lag probe, as the other latency bounds are.
+        let mut sorted = gaps.clone();
+        sorted.sort();
+        let median = sorted[sorted.len() / 2];
+        crate::hostlag::latency_bound_over(
+            &format!("{NAME}: the median handoff gap"),
+            (started, Instant::now()),
+            median,
+            Duration::from_millis(5),
+            MEDIAN_GAP,
+        )?;
+        // The bug's signature is seconds (a re-send interval, an outwait);
+        // judged against the host-lag probe like the median.
+        crate::hostlag::latency_bound_over(
+            &format!("{NAME}: the longest handoff gap"),
+            (started, Instant::now()),
+            longest,
+            Duration::from_millis(100),
+            MAX_GAP,
+        )?;
+        // An outwaited grant in a run without a fault is a push that arrived
+        // lapsed. The residual path is a transit slower than `margin / 4`
+        // (a host stall): excused only by a stall the probe saw that long.
+        let expired = g("recalls_expired");
+        if expired > 0 {
+            let lag = crate::hostlag::lag_between(started, Instant::now());
+            anyhow::ensure!(
+                lag.max >= Duration::from_millis(250),
+                "the delegate outwaited {expired} grant(s) in a run without a fault, and no host \
+                 stall of a quarter margin explains it (longest stall {:?})",
+                lag.max
+            );
+            crate::hostlag::inconclusive(format!(
+                "{NAME}: {expired} grant(s) outwaited; the host stalled {:?}",
+                lag.max
+            ));
+        }
+        anyhow::ensure!(
+            at_default || g("asked_again") > 0,
+            "the delegate never asked a stale waiter to ask again: the scenario did not exercise the rule"
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        for c in &clients {
+            print_locks(NAME, c);
+        }
+    }
+    for c in clients.iter_mut().rev() {
+        let _ = c.unmount();
+    }
+    result
+}
+
 // ------------------------------------------------------------------ lock-grace-wait
 
 /// Three nodes after the holder was killed with a lock held (plan 43
@@ -1822,10 +2047,38 @@ pub fn lock_grace_wait(_seed: u64) -> Result<()> {
             "the non-blocking lock did not wait for the grace ({:?}): is the grace over already?",
             nb.took
         );
+        // The probe arms its 8 s alarm when it starts and its lock call
+        // follows after the process start and the open of the file (2 s or
+        // 4 s on the box, bimodal): it says how long the lock call waited
+        // (`EINTR after`), the harness how long the whole probe took, and
+        // the difference is the start. Printed, so that a slow start shows.
+        let eintr_after = intr
+            .said
+            .strip_prefix("EINTR after ")
+            .and_then(|d| d.strip_suffix('s'))
+            .and_then(|d| d.parse::<f64>().ok())
+            .map(Duration::from_secs_f64);
+        eprintln!(
+            "    {NAME}: the interrupted probe started {:?} before its lock call, the \
+             non-blocking one {:?}",
+            eintr_after.map(|d| intr.took.saturating_sub(d)),
+            nb.said
+                .strip_prefix("granted after ")
+                .and_then(|d| d.strip_suffix('s'))
+                .and_then(|d| d.parse::<f64>().ok())
+                .map(|d| nb.took.saturating_sub(Duration::from_secs_f64(d)))
+        );
+        // The signal ends the wait inside the grace, not at its end: the
+        // call's own wait is the 8 s of the alarm, and the probe's end
+        // (its start, the alarm's 8 s) comes before the grace's end (the
+        // non-blocking probe's) by a margin that a slow start and the
+        // timer's wakeups cannot eat: half a second. (It was 2 s: with a
+        // 4 s start the two ended 12.08 and 14.1 s after their spawns, 6 ms
+        // from failing on the base daemon.)
         anyhow::ensure!(
             intr.code == 4
-                && intr.took >= Duration::from_secs(8)
-                && intr.took + Duration::from_secs(2) < nb.took,
+                && eintr_after.is_some_and(|d| d >= Duration::from_secs(8))
+                && intr.took + Duration::from_millis(500) < nb.took,
             "the signal must end the wait with EINTR 8 s into it, well before the grace ends: {} \
              (exit {}, after {:?}; the non-blocking request took {:?})",
             intr.said,

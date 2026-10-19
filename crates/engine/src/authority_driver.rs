@@ -703,7 +703,7 @@ pub fn load_config(
     // it is measured under heavier load.
     c.delegation_ttl_ms = env_ms(
         "CONSTELLATION_DELEGATION_TTL_MS",
-        c.lock_ttl_ms.max(c.delegation_ttl_ms),
+        constellation_authority::Config::default_delegation_ttl_ms(c.lock_ttl_ms),
     );
     // Plan 30 §M11 phase 2b: the placement's knobs.
     // Plan 30 §M12: on by default (a dominant writer's subtree moves to
@@ -3279,12 +3279,14 @@ impl Driver {
                 ino,
                 mode,
                 blocking,
+                waited_ms,
                 reply,
             } => control(
                 Control::Lock {
                     ino,
                     mode,
                     blocking,
+                    waited_ms,
                 },
                 ControlReply::Lock(reply),
             ),
@@ -3303,6 +3305,7 @@ impl Driver {
                 blocking,
                 sent,
                 incarnation,
+                waited_ms,
                 reply,
             } => {
                 let req = self.control_id();
@@ -3320,6 +3323,7 @@ impl Driver {
                         blocking,
                         sent: constellation_authority::Ms(sent),
                         incarnation,
+                        waited_ms,
                     },
                 }))
             }
@@ -3396,6 +3400,21 @@ impl Driver {
                     ino,
                     grant,
                     position,
+                },
+            })),
+            SyncRequest::PeerLockCancel {
+                from,
+                ino,
+                exclusive,
+                shared,
+                upto,
+            } => Some(Internal::Event(Event::Peer {
+                from,
+                msg: PeerMsg::LockCancel {
+                    ino,
+                    exclusive,
+                    shared,
+                    upto: constellation_authority::Ms(upto),
                 },
             })),
             SyncRequest::PeerLockMirror {
@@ -3907,6 +3926,7 @@ impl Driver {
                 blocking,
                 sent,
                 incarnation,
+                waited_ms,
             } => {
                 let payload = Payload::LockRequest {
                     requester: self.node_id,
@@ -3916,6 +3936,7 @@ impl Driver {
                     blocking,
                     sent: sent.0,
                     incarnation,
+                    waited_ms,
                 };
                 self.lock_rpc(to, req, payload, |reply, req| match reply {
                     Payload::LockReply { req_id, outcome } if req_id == req.0 => {
@@ -3972,6 +3993,21 @@ impl Driver {
                     ino,
                     sent: sent.0,
                     outcome: crate::locks::outcome_wire(&outcome),
+                };
+                self.one_way(to, payload);
+            }
+            PeerMsg::LockCancel {
+                ino,
+                exclusive,
+                shared,
+                upto,
+            } => {
+                let payload = Payload::LockCancel {
+                    from: self.node_id,
+                    ino,
+                    exclusive,
+                    shared,
+                    upto: upto.0,
                 };
                 self.one_way(to, payload);
             }

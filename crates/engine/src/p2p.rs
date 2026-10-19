@@ -894,6 +894,7 @@ impl constellation_net::PeerService for P2pBridge {
         blocking: bool,
         sent: i64,
         incarnation: u32,
+        waited_ms: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = constellation_net::Payload> + Send + '_>>
     {
         Box::pin(async move {
@@ -907,6 +908,7 @@ impl constellation_net::PeerService for P2pBridge {
                     blocking,
                     sent,
                     incarnation,
+                    waited_ms,
                     reply,
                 })
                 .is_ok()
@@ -1040,6 +1042,19 @@ impl constellation_net::PeerService for P2pBridge {
             ino,
             sent,
             outcome: crate::locks::outcome_of(outcome),
+        });
+    }
+
+    fn lock_cancel(&self, from: u64, ino: u64, exclusive: bool, shared: bool, upto: i64) {
+        if crate::fault::p2p_denied(from) {
+            return;
+        }
+        let _ = self.nudge.send(sync::SyncRequest::PeerLockCancel {
+            from,
+            ino,
+            exclusive,
+            shared,
+            upto,
         });
     }
 

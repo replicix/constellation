@@ -1372,6 +1372,7 @@ pub trait PeerService: Send + Sync + 'static {
         _blocking: bool,
         _sent: i64,
         _incarnation: u32,
+        _waited_ms: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Payload> + Send + '_>> {
         Box::pin(async move {
             Payload::LockReply {
@@ -1440,6 +1441,8 @@ pub trait PeerService: Send + Sync + 'static {
         _outcome: crate::message::LockOutcomeWire,
     ) {
     }
+    /// One way: `from` no longer waits for `ino` in the modes named.
+    fn lock_cancel(&self, _from: u64, _ino: u64, _exclusive: bool, _shared: bool, _upto: i64) {}
     /// Plan 30 §M14, one way: a holder released a grant.
     fn lock_released(&self, _from: u64, _ino: u64, _grant: (u64, u64), _position: &[u8]) {}
     /// Plan 30 §M14, one way: the holder's grant table, for a backup.

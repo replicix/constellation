@@ -491,6 +491,8 @@ pub enum SyncRequest {
         ino: Ino,
         mode: constellation_meta::locks::LockMode,
         blocking: bool,
+        /// How long the application has waited for this lock call so far.
+        waited_ms: u64,
         reply: tokio::sync::oneshot::Sender<constellation_authority::LockAnswer>,
     },
     /// Plan 30 §M14: the last local lock under a recalled grant on `ino`
@@ -521,6 +523,8 @@ pub enum SyncRequest {
         /// The requester's clock when it sent (echoed in a push).
         sent: i64,
         incarnation: u32,
+        /// How long its application has waited (a duration).
+        waited_ms: u64,
         reply: tokio::sync::oneshot::Sender<constellation_authority::LockOutcome>,
     },
     /// Plan 30 §M14: the owner recalls a grant this node holds; answered
@@ -573,6 +577,14 @@ pub enum SyncRequest {
         ino: Ino,
         sent: i64,
         outcome: constellation_authority::LockOutcome,
+    },
+    /// One way: a peer no longer waits for `ino` in the modes named.
+    PeerLockCancel {
+        from: u64,
+        ino: Ino,
+        exclusive: bool,
+        shared: bool,
+        upto: i64,
     },
     /// Plan 30 §M14, one way: a holder released a grant.
     PeerLockReleased {

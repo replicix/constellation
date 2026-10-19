@@ -1523,6 +1523,24 @@ pub struct LockStatus {
     pub answers_order_bypassed: u64,
     pub answers_order_held: u64,
     pub grace_end_serves: u64,
+    /// Plan 43 "ask again": waiters whose turn came with a request too
+    /// old for a pushed grant to reach them before its first renewal was
+    /// due, which this owner asked to send another; those that did not
+    /// within two request cycles and were passed over until their next
+    /// request; requests refused for a turn held for an asked waiter
+    /// (parked, or `EAGAIN`); and, as a requester, asks answered by a
+    /// re-sent request.
+    pub asked_again: u64,
+    pub ask_again_passed_over: u64,
+    pub reserved_waits: u64,
+    pub asks_answered: u64,
+    /// Ask again, the node's side: ops woken by a grant installed for
+    /// another op of the node on the inode, and `LockCancel`s sent for the
+    /// waiters they and ghost waiters left; the owner's: waiters dropped by
+    /// one.
+    pub covered_woken: u64,
+    pub cancels_sent: u64,
+    pub cancelled: u64,
     /// Plan 30 §M14 phase 2: tagged mutations this node refused as their
     /// executor because a grant they named was no longer live (`EIO` to
     /// their issuer; nothing journaled).

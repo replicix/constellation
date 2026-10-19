@@ -283,6 +283,11 @@ pub enum Control {
         ino: Ino,
         mode: constellation_meta::locks::LockMode,
         blocking: bool,
+        /// How long the application has been waiting for this lock (a
+        /// duration: the engine's rounds of one lock call, the clocks of
+        /// nodes never compared). The owner queues the request from there,
+        /// so a client that lost a round keeps its place.
+        waited_ms: u64,
     },
     /// Plan 30 §M14: the last local lock under a recalled grant on `ino`
     /// left; the grant is released (`Done` at once).
@@ -757,6 +762,9 @@ pub enum PeerMsg {
         /// The requester's incarnation: the owner drops what an earlier
         /// one left queued (`LockState::incarnations`).
         incarnation: u32,
+        /// How long the application has been waiting for this lock, a
+        /// duration (`Control::Lock::waited_ms`, plus time in this core).
+        waited_ms: u64,
     },
     LockReply {
         req: OpId,
@@ -769,6 +777,21 @@ pub enum PeerMsg {
         ino: Ino,
         sent: Ms,
         outcome: LockOutcome,
+    },
+    /// The requester no longer waits for `ino` in the modes named: an ask
+    /// to ask again found no op of it to re-send, or the op left without
+    /// needing the owner (another op's grant covered it, it gave up). The
+    /// owner drops its parked waiters of the node there, at once and
+    /// without counting an unused turn.
+    LockCancel {
+        ino: Ino,
+        exclusive: bool,
+        shared: bool,
+        /// The requester's clock when it decided: only waiters whose last
+        /// request was sent before it are dropped (a request of the node
+        /// sent after the cancel, which a different stream may deliver
+        /// first, stays).
+        upto: Ms,
     },
     /// Plan 30 §M14: the owner recalls `grant`; the holder acks receipt
     /// and releases (`LockReleased`) once no local lock is under it and
@@ -860,6 +883,7 @@ impl PeerMsg {
             PeerMsg::LockRequest { .. } => "LockRequest",
             PeerMsg::LockReply { .. } => "LockReply",
             PeerMsg::LockGranted { .. } => "LockGranted",
+            PeerMsg::LockCancel { .. } => "LockCancel",
             PeerMsg::LockRecall { .. } => "LockRecall",
             PeerMsg::LockRecalled { .. } => "LockRecalled",
             PeerMsg::LockReleased { .. } => "LockReleased",

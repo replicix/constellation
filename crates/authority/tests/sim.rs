@@ -233,7 +233,16 @@ fn replay_seed() {
     else {
         return;
     };
-    let config = match std::env::var("AUTHORITY_SIM_CONFIG").as_deref() {
+    let label = std::env::var("AUTHORITY_SIM_CONFIG");
+    // `<config>+nomove+solo`: see `config_variant`.
+    let (base_label, variants) = match label.as_deref() {
+        Ok(l) => {
+            let (b, v) = l.split_once('+').unwrap_or((l, ""));
+            (Ok(b), v)
+        }
+        Err(e) => (Err(e), ""),
+    };
+    let config = match base_label {
         Ok("buga") => bug_a_config(),
         Ok("bugb") => bug_b_config(),
         Ok(s) if s.starts_with("s3:") => s3_rule_config(s[3..].parse().expect("rule index")),
@@ -388,6 +397,10 @@ fn replay_seed() {
         Ok("locks-blips-tight-in-doubt") => locks_blips_tight_in_doubt_config(),
         Ok("locks-pause") => locks_pause_config(),
         Ok("locks-delegated") => locks_delegated_config(),
+        Ok("locks-delegated-production-ttl") => locks_delegated_production_ttl_config(),
+        Ok("locks-delegated-production-ttl-heavy") => locks_delegated_production_ttl_heavy_config(),
+        Ok("locks-production-ttl") => locks_production_ttl_config(),
+        Ok("locks-production-ttl-heavy") => locks_production_ttl_heavy_config(),
         Ok("locks-released-delegated") => locks_released_delegated_config(),
         Ok("locks-delegated-writes") => with_lock_writes(locks_delegated_config(), "d2"),
         Ok("locks-unlinked-delegated") => locks_unlinked_delegated_config(),
@@ -428,6 +441,10 @@ fn replay_seed() {
             ..SimConfig::default()
         },
     };
+    let config = variants
+        .split('+')
+        .filter(|v| !v.is_empty())
+        .fold(config, config_variant);
     // Plan 30 §M14: `AUTHORITY_SIM_LOCK_WRITES=1` adds the lock-to-unlock
     // coherence check (turns written under exclusive locks) to any
     // lock configuration.
@@ -3252,7 +3269,7 @@ fn sweep_config() {
     let seeds = env("AUTHORITY_SIM_SEEDS", 2_000);
     let threads = env("AUTHORITY_SIM_THREADS", 8);
     let label = std::env::var("AUTHORITY_SIM_CONFIG").unwrap_or("delegated-holder-cut".into());
-    let config = |label: &str| match label {
+    let base_config = |label: &str| match label {
         "delegated-holder-cut" => delegated_holder_cut_config(),
         "long-delegated" => long_delegated_config(),
         "long-backup" => long_backup_config(),
@@ -3340,6 +3357,10 @@ fn sweep_config() {
         "locks-blips-tight-delegated" => locks_blips_tight_delegated_config(),
         "locks-pause" => locks_pause_config(),
         "locks-delegated" => locks_delegated_config(),
+        "locks-delegated-production-ttl" => locks_delegated_production_ttl_config(),
+        "locks-delegated-production-ttl-heavy" => locks_delegated_production_ttl_heavy_config(),
+        "locks-production-ttl" => locks_production_ttl_config(),
+        "locks-production-ttl-heavy" => locks_production_ttl_heavy_config(),
         "locks-unlinked-delegated" => locks_unlinked_delegated_config(),
         "locks-unlinked-delegated-hcrash" => locks_unlinked_hcrash_config(false),
         "locks-unlinked-delegated-hcrash-backup" => locks_unlinked_hcrash_config(true),
@@ -3363,6 +3384,14 @@ fn sweep_config() {
         "locks-stall-step" => locks_stall_step_config(),
         "locks-stall-step-delegated" => locks_stall_step_delegated_config(),
         other => panic!("sweep_config: unknown config {other}"),
+    };
+    // `<config>+nomove+solo`: see `config_variant`.
+    let config = move |label: &str| {
+        let (base, variants) = label.split_once('+').unwrap_or((label, ""));
+        variants
+            .split('+')
+            .filter(|v| !v.is_empty())
+            .fold(base_config(base), config_variant)
     };
     // Plan 43 C7-F F-a: `AUTHORITY_SIM_BEATS=thread` runs any configuration
     // with the holder's off-core heartbeat on a thread of its own, as the
@@ -3414,6 +3443,10 @@ fn sweep_config() {
     let floor_ms = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
     let guard_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let guard_base_rises = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The lock configurations, per seed `(seed, longest acquisition,
+    // longest handoff gap, overtakes, asks, passed over, reserved)`: the
+    // distribution the ask-again rule is measured by (`SWEEP-LOCKS`).
+    let lock_seeds: std::sync::Arc<std::sync::Mutex<Vec<SeedLocks>>> = Default::default();
     // Open epochs replaced by their closed carrier's (`epochs::try_form`).
     let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
@@ -3429,6 +3462,7 @@ fn sweep_config() {
         let guard_rises = guard_rises.clone();
         let guard_base_rises = guard_base_rises.clone();
         let superseded = superseded.clone();
+        let lock_seeds = lock_seeds.clone();
         handles.push(std::thread::spawn(move || loop {
             let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if seed >= start + seeds {
@@ -3482,6 +3516,39 @@ fn sweep_config() {
                         );
                     }
                     superseded.fetch_add(report.epochs_superseded as u64, ord);
+                    if report.locks.steps > 0 {
+                        let sum = |f: fn(&constellation_authority::Stats) -> u64| -> u64 {
+                            report.stats.values().map(f).sum()
+                        };
+                        if report.locks.max_handoff_gap_ms > 3_000 || report.locks.overtaken > 0 {
+                            eprintln!(
+                                "SWEEP-SLOW {label} seed {seed}: longest acquisition {} ms, longest \
+                                 handoff gap {} ms, {} overtakes; grants outwaited {}, short \
+                                 authority waits {}, grants moved {}, asks {}, passed over {}",
+                                report.locks.max_wait_ms,
+                                report.locks.max_handoff_gap_ms,
+                                report.locks.overtaken,
+                                sum(|s| s.lock_recalls_expired),
+                                sum(|s| s.lock_short_authority_waits),
+                                sum(|s| s.lock_moved),
+                                sum(|s| s.lock_asked_again),
+                                sum(|s| s.lock_ask_again_passed_over),
+                            );
+                        }
+                        lock_seeds.lock().unwrap().push(SeedLocks {
+                            seed,
+                            max_wait_ms: report.locks.max_wait_ms,
+                            max_wait_owner_ms: report.locks.max_wait_owner_ms,
+                            max_wait_rest_ms: report.locks.max_wait_rest_ms,
+                            max_gap_ms: report.locks.max_handoff_gap_ms,
+                            overtaken: report.locks.overtaken,
+                            asked_again: sum(|s| s.lock_asked_again),
+                            passed_over: sum(|s| s.lock_ask_again_passed_over),
+                            reserved_waits: sum(|s| s.lock_reserved_waits),
+                            acquired: report.locks.acquired,
+                            ios: report.locks.ios,
+                        });
+                    }
                     fenced[0].fetch_add(report.locks.fenced_ios, ord);
                     fenced[1].fetch_add(lost, ord);
                     if report.locks.fenced_ios > 0 || lost > 0 {
@@ -3538,6 +3605,46 @@ fn sweep_config() {
             .get((lengths.len().saturating_sub(1)) * p / 100)
             .copied()
     };
+    {
+        let seeds = lock_seeds.lock().unwrap();
+        if !seeds.is_empty() {
+            // Percentiles over the seeds of each seed's maximum.
+            let pct = |k: fn(&SeedLocks) -> u64| {
+                let mut v: Vec<u64> = seeds.iter().map(k).collect();
+                v.sort_unstable();
+                let at = |p: usize| v[((v.len() - 1) * p) / 100];
+                (at(50), at(90), at(99), v[v.len() - 1])
+            };
+            let (w50, w90, w99, wmax) = pct(|e| e.max_wait_ms);
+            let (g50, g90, g99, gmax) = pct(|e| e.max_gap_ms);
+            eprintln!(
+                "SWEEP-LOCKS {label}: {} seeds; per-seed longest acquisition p50/p90/p99/max \
+                 {w50}/{w90}/{w99}/{wmax} ms; longest handoff gap {g50}/{g90}/{g99}/{gmax} ms; \
+                 overtakes {} (in {} seeds); asked again {}; passed over {} (in {} seeds); \
+                 reserved waits {}; locks acquired {}, I/Os {}; seeds with the owner node's \
+                 longest wait over 45 s / 50 s: {} / {}, the other nodes': {} / {}",
+                seeds.len(),
+                seeds.iter().map(|e| e.overtaken).sum::<u64>(),
+                seeds.iter().filter(|e| e.overtaken > 0).count(),
+                seeds.iter().map(|e| e.asked_again).sum::<u64>(),
+                seeds.iter().map(|e| e.passed_over).sum::<u64>(),
+                seeds.iter().filter(|e| e.passed_over > 0).count(),
+                seeds.iter().map(|e| e.reserved_waits).sum::<u64>(),
+                seeds.iter().map(|e| e.acquired).sum::<u64>(),
+                seeds.iter().map(|e| e.ios).sum::<u64>(),
+                seeds
+                    .iter()
+                    .filter(|e| e.max_wait_owner_ms > 45_000)
+                    .count(),
+                seeds
+                    .iter()
+                    .filter(|e| e.max_wait_owner_ms > 50_000)
+                    .count(),
+                seeds.iter().filter(|e| e.max_wait_rest_ms > 45_000).count(),
+                seeds.iter().filter(|e| e.max_wait_rest_ms > 50_000).count(),
+            );
+        }
+    }
     eprintln!(
         "SWEEP-FLOORS {label}: takeovers {}, by a seal {}, floors armed {} (capped {}, saved {} ms \
          in all), cap already past {}; floor ms p50 {:?} p90 {:?} max {:?} over {} floors; \
@@ -5774,6 +5881,77 @@ fn locks_delegated_config() -> SimConfig {
     }
 }
 
+/// `locks-delegated` at the production lock TTL (20 s, margin 1 s; the
+/// delegation's default 5 s): a delegate's grants are capped at about 2–3 s
+/// while waiters re-send every 9.5 s (the ask-again rule).
+fn locks_delegated_production_ttl_config() -> SimConfig {
+    production_ttl(true, false)
+}
+
+/// ... and with nine ops on one file, as `locks-long-grants` has.
+fn locks_delegated_production_ttl_heavy_config() -> SimConfig {
+    production_ttl(true, true)
+}
+
+/// The same at the root (the sim's 6 s lease caps the root's grants too).
+fn locks_production_ttl_config() -> SimConfig {
+    production_ttl(false, false)
+}
+
+fn locks_production_ttl_heavy_config() -> SimConfig {
+    production_ttl(false, true)
+}
+
+/// A variant of a configuration, named after a `+` in its label
+/// (`locks-delegated-production-ttl+nomove+solo`):
+/// - `nomove`: no rename crossing subtrees, so a delegation is not recalled
+///   for one and its lock table does not move (a move restamps the grants
+///   it carries to a full lock ttl and margin: a waiter then waits that
+///   long for a grant that lapsed at its holder meanwhile);
+/// - `solo`: one lock client per node (and three times the ops), so a node
+///   never has two ops waiting for one file, whose first grant covers the
+///   second (an op the node's push does not wake: it waits for its own
+///   re-send, 9.5 s at the production lock ttl).
+fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
+    match variant {
+        "nomove" => SimConfig {
+            cross_ratio: 0.0,
+            ..cfg
+        },
+        "solo" => SimConfig {
+            clients_per_node: 1,
+            ops_per_client: cfg.ops_per_client * 3,
+            ..cfg
+        },
+        other => panic!("unknown configuration variant +{other}"),
+    }
+}
+
+fn production_ttl(deleg: bool, heavy: bool) -> SimConfig {
+    let base = SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.lock_ttl_ms = 20_000;
+            c.expiry_margin_ms = 1_000;
+            c
+        }),
+        lock_dir: if deleg { Some("d1".into()) } else { None },
+        ..locks_delegated_config()
+    };
+    if !heavy {
+        return base;
+    }
+    SimConfig {
+        clients_per_node: 3,
+        ops_per_client: 8,
+        lock_files: 1,
+        lock_shared_ratio: 0.5,
+        lock_ios: (4, 12),
+        lock_io_ms: (50, 300),
+        ..base
+    }
+}
+
 /// Plan 30 §M14: a takeover of a *released* lease, then a delegation
 /// inside the new root's lock grace. The lock files live in `d1`, which
 /// is the root's (`d2` is delegated to node 3); at 1.5 s the holder shuts
@@ -5872,6 +6050,13 @@ struct M14Totals {
     not_yet_waits: u64,
     stale_owner_waits: u64,
     grace_end_serves: u64,
+    /// The ask-again rule: waiters asked to send their request again,
+    /// those passed over for not doing so, requests refused for a turn
+    /// held for an asked waiter, asks answered by the nodes.
+    asked_again: u64,
+    ask_again_passed_over: u64,
+    reserved_waits: u64,
+    asks_answered: u64,
     grace_periods: u64,
     idle_released: u64,
     backup_takeovers: u64,
@@ -5913,6 +6098,9 @@ impl M14Totals {
         c.position_timeouts += l.position_timeouts;
         c.abandoned += l.abandoned;
         c.max_wait_ms = c.max_wait_ms.max(l.max_wait_ms);
+        c.max_wait_owner_ms = c.max_wait_owner_ms.max(l.max_wait_owner_ms);
+        c.max_wait_rest_ms = c.max_wait_rest_ms.max(l.max_wait_rest_ms);
+        c.max_handoff_gap_ms = c.max_handoff_gap_ms.max(l.max_handoff_gap_ms);
         c.visibility_checks += l.visibility_checks;
         c.visibility_gaps += l.visibility_gaps;
         c.turns_written += l.turns_written;
@@ -5944,6 +6132,10 @@ impl M14Totals {
             self.not_yet_waits += s.lock_not_yet_waits;
             self.stale_owner_waits += s.lock_stale_owner_waits;
             self.grace_end_serves += s.lock_grace_end_serves;
+            self.asked_again += s.lock_asked_again;
+            self.ask_again_passed_over += s.lock_ask_again_passed_over;
+            self.reserved_waits += s.lock_reserved_waits;
+            self.asks_answered += s.lock_asks_answered;
             self.grace_periods += s.lock_grace_periods;
             self.idle_released += s.lock_idle_released;
             self.backup_takeovers += s.backup_takeovers;
@@ -6087,6 +6279,203 @@ fn locks_survive_a_backup_seal_under_renewals() {
     assert!(t.renew_held > 0, "no renewal waited for liveness: {t:?}");
 }
 
+/// One seed's lock measures (`SWEEP-LOCKS`,
+/// `capped_grants_hand_a_lock_over_within_a_round_trip`).
+struct SeedLocks {
+    seed: u64,
+    max_wait_ms: u64,
+    /// The longest wait of a client of node 1 (the owner) and of one of the
+    /// other nodes.
+    max_wait_owner_ms: u64,
+    max_wait_rest_ms: u64,
+    max_gap_ms: u64,
+    overtaken: u64,
+    asked_again: u64,
+    passed_over: u64,
+    reserved_waits: u64,
+    /// Locks acquired and I/Os done in the critical sections (fenced ones
+    /// apart).
+    acquired: u64,
+    ios: u64,
+}
+
+/// `seeds` of `cfg`, the lock measures of each (a seed that fails, a client
+/// that does not get its lock in 60 s of simulated time included, panics),
+/// and the sums over the nodes of the counters `f` picks.
+fn run_lock_seeds(
+    label: &str,
+    cfg: SimConfig,
+    seeds: std::ops::Range<u64>,
+    sums: &[fn(&constellation_authority::Stats) -> u64],
+) -> (Vec<SeedLocks>, Vec<u64>) {
+    let mut out = Vec::new();
+    let mut totals = vec![0; sums.len()];
+    for seed in seeds {
+        let report = run_seed(seed, cfg.clone()).unwrap_or_else(|e| {
+            panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+        });
+        for (t, f) in totals.iter_mut().zip(sums) {
+            *t += report.stats.values().map(f).sum::<u64>();
+        }
+        out.push(SeedLocks {
+            seed,
+            max_wait_ms: report.locks.max_wait_ms,
+            max_wait_owner_ms: report.locks.max_wait_owner_ms,
+            max_wait_rest_ms: report.locks.max_wait_rest_ms,
+            max_gap_ms: report.locks.max_handoff_gap_ms,
+            overtaken: report.locks.overtaken,
+            asked_again: 0,
+            passed_over: 0,
+            reserved_waits: 0,
+            acquired: report.locks.acquired,
+            ios: report.locks.ios,
+        });
+    }
+    let q = |k: fn(&SeedLocks) -> u64, p: usize| {
+        let mut v: Vec<u64> = out.iter().map(k).collect();
+        v.sort_unstable();
+        v[(v.len() - 1) * p / 100]
+    };
+    eprintln!(
+        "{label}: {} seeds; per-seed longest acquisition p50/p90/max {}/{}/{} ms; longest handoff \
+         gap {}/{}/{} ms; overtakes {}; stats {totals:?}",
+        out.len(),
+        q(|s| s.max_wait_ms, 50),
+        q(|s| s.max_wait_ms, 90),
+        q(|s| s.max_wait_ms, 100),
+        q(|s| s.max_gap_ms, 50),
+        q(|s| s.max_gap_ms, 90),
+        q(|s| s.max_gap_ms, 100),
+        out.iter().map(|s| s.overtaken).sum::<u64>(),
+    );
+    (out, totals)
+}
+
+/// The ask-again rule (cluster-locks.md): at the production lock TTL (20 s,
+/// waiters re-sending every 9.5 s) and a short delegation, a delegate's
+/// grants are capped by its delegation (about 2–3 s), so a grant pushed to a
+/// waiter whose request is seconds old reached its holder lapsed. Waits ran
+/// to a re-send interval and a restamped outwait (21 s); 122 of 2000 seeds of
+/// the delegated config never got a lock in 60 s (seed 15 the first), the
+/// sim's lease-capped root had waits of 9.8 s in a tenth of its seeds, and
+/// the owner node's own clients lost the local lottery for a minute
+/// (`locks-long-grants`). No fault: a handoff to a stale waiter now costs a
+/// round trip, the clients of a node keep their place in the queue whatever
+/// round they lose (`waited_ms`), and a grant answers every op of its node
+/// that it covers.
+///
+/// The delegated configuration has no rename crossing subtrees (`+nomove`: a
+/// delegation's move restamps its grants to a full lock ttl, 21 s for a
+/// grant that lapsed at its holder meanwhile: a follow-up in PROGRESS, not
+/// the rule's). Its remaining gaps, up to 5 s, are a grant its own node, or
+/// a cancelled non-blocking wait, left unused: outwaited (`ttl + margin`, 3
+/// to 4.5 s at its 2 to 3 s authority) and the barrier that follows. The
+/// nine-op configurations are one client per node (`+solo`: sections add up
+/// there). Before, on the delegated one the longest wait per seed was 20 s
+/// at the median and 60 s at most, the gap 11 and 30 s, and 201 handoffs
+/// were overtaken; on the root 9.8 s at the 90th percentile.
+#[test]
+fn capped_grants_hand_a_lock_over_within_a_round_trip() {
+    use constellation_authority::Stats;
+    let sums: [fn(&Stats) -> u64; 5] = [
+        |s| s.lock_asked_again,
+        |s| s.lock_ask_again_passed_over,
+        |s| s.lock_grants,
+        |s| s.lock_recalls_sent,
+        |s| s.lock_asks_answered,
+    ];
+    // (label, config, seeds, heavy: nine ops on a file, asked: an ask is
+    // expected in these seeds)
+    for (label, cfg, seeds, heavy, asked) in [
+        (
+            "locks-delegated-production-ttl+nomove",
+            config_variant(locks_delegated_production_ttl_config(), "nomove"),
+            0..40,
+            false,
+            true,
+        ),
+        (
+            "locks-production-ttl",
+            locks_production_ttl_config(),
+            0..60,
+            false,
+            false,
+        ),
+        (
+            "locks-production-ttl-heavy+solo",
+            config_variant(locks_production_ttl_heavy_config(), "solo"),
+            0..40,
+            true,
+            true,
+        ),
+        (
+            "locks-delegated-production-ttl-heavy+solo+nomove",
+            config_variant(
+                config_variant(locks_delegated_production_ttl_heavy_config(), "solo"),
+                "nomove",
+            ),
+            0..40,
+            true,
+            true,
+        ),
+    ] {
+        let (per_seed, totals) = run_lock_seeds(label, cfg, seeds, &sums);
+        for s in &per_seed {
+            assert!(
+                s.max_gap_ms <= 6_000,
+                "{label} seed {}: a handoff idled {} ms (replay with AUTHORITY_SIM_CONFIG={label})",
+                s.seed,
+                s.max_gap_ms
+            );
+            if !heavy {
+                // Nobody waits a re-send interval for a free lock, and no
+                // one is overtaken. (With nine ops on a file, sections add
+                // up, and an in-place re-affirmation of a node's shared
+                // grant may pass a parked exclusive waiter: reported.)
+                assert!(
+                    s.max_wait_ms < 9_500 && s.overtaken == 0,
+                    "{label} seed {}: waited {} ms, {} overtakes",
+                    s.seed,
+                    s.max_wait_ms,
+                    s.overtaken
+                );
+            }
+        }
+        let [asked_again, passed_over, grants, recalls, answered] = totals[..] else {
+            unreachable!()
+        };
+        if asked {
+            assert!(asked_again > 0, "{label}: no waiter was ever asked");
+            assert!(answered > 0, "{label}: no ask was ever answered");
+        }
+        assert_eq!(passed_over, 0, "{label}: an ask went unanswered");
+        assert!(grants > 200 && recalls > 50, "{label}: little contention");
+    }
+    // The delegate with its renames crossing subtrees and two clients per
+    // node: nobody waits for ever (122 of 2000 seeds before, seed 15 the
+    // first).
+    run_lock_seeds(
+        "locks-delegated-production-ttl",
+        locks_delegated_production_ttl_config(),
+        0..60,
+        &[],
+    );
+    // The owner node's own clients take a node's grant in one pass and race
+    // for it; the ones that lost used to join the queue again at the back,
+    // and a few lost every round for 50 s and more (these seeds: 51 to 56 s
+    // before; 11 of 15000 seeds over 50 s, 32 over 45 s). Their place is kept
+    // now (`waited_ms`).
+    for seed in [5324, 5731, 6261, 6549, 6923, 10042] {
+        let report = run_seed(seed, locks_long_grants_config())
+            .unwrap_or_else(|e| panic!("locks-long-grants seed {seed}: {e}"));
+        assert!(
+            report.locks.max_wait_owner_ms <= 45_000,
+            "locks-long-grants seed {seed}: the owner node's client waited {} ms",
+            report.locks.max_wait_owner_ms
+        );
+    }
+}
+
 /// Two waiters of one node on one file, served in one pass, the second
 /// re-affirming the first one's grant in place from an older request: the
 /// owner's record of the node's grant never ends before the window the
@@ -6155,16 +6544,72 @@ fn a_second_seal_inside_the_grace_waits_out_the_first_holders_grants() {
 /// their arrival must split: the holder's clock is 4 s behind its
 /// successors', and the cap ends their floor 3 s early (a lock granted
 /// inside an old grant's window). The control that makes the clean sweeps
-/// of the real cap mean something: 2 of the 2 000 seeds 193000..195000
-/// fail (seeds 194557 and 194714, pinned here), none with the real cap.
+/// of the real cap mean something: 1 of the 2 000 seeds 193000..195000 and
+/// 7 of the 8 000 seeds 195000..203000 fail (three pinned here), and these
+/// three pass with the real cap. (The ask-again traffic changed the
+/// trajectories: the earlier pins, 194557 and 194714, no longer fail.) The
+/// real cap is not clean over every range: it violates at the *second*
+/// failover (about 15 s, a clock beyond the envelope), a different and
+/// older failure (`fast_takeover_skewed_successor_known_gaps`), so the
+/// control also requires the violation to be inside the first failover's
+/// floor window, where the cap ends the floor early.
 #[test]
 fn a_credited_arrival_cap_splits() {
-    for seed in [194_557, 194_714] {
+    for seed in [193_262, 197_625, 198_196] {
         let e = run_seed(seed, fast_takeover_skewed_successor_credited_config())
             .expect_err("a cap counted from the credit never failed: no control");
         assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
+        let at = violation_ms(&e).unwrap_or_else(|| panic!("seed {seed}: no time in {e}"));
+        assert!(
+            at < FIRST_FAILOVER_FLOOR_END_MS,
+            "seed {seed}: the violation is at t={at}, not inside the first failover's floor \
+             window (a failure of the second failover is not this control's): {e}"
+        );
         run_seed(seed, fast_takeover_skewed_successor_config())
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// The end of the first failover's floor window in
+/// `fast-takeover-skewed-successor` (the cut at 1 s, the successor's floor a
+/// lease TTL and margin later: about 3 to 4 s of simulated time; the second
+/// failover comes at about 15 s).
+const FIRST_FAILOVER_FLOOR_END_MS: u64 = 6_000;
+
+/// The simulated time (ms) a mutual-exclusion violation message names (its
+/// last ` at t=` or ` landed at t=`).
+fn violation_ms(e: &str) -> Option<u64> {
+    let i = e.rfind(" at t=")? + " at t=".len();
+    e[i..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Known gap, not a regression (plan 43 C7b, the cross-node lease-expiry
+/// compare under a clock offset beyond the envelope): the *real* cap of
+/// `fast-takeover-skewed-successor` violates mutual exclusion at its second
+/// failover (t about 15 to 16 s; nodes 2 and 3 run 4 s ahead) in about one
+/// seed of 15 000, on 63da672 (seeds 11087 and 18138, which pass with the
+/// ask-again traffic) and with it (5570, 11942, 202261): a node whose clock
+/// is ahead reads the live holder's lease as expired and seals its epoch, the
+/// next holder takes the lease and grants 0.35 to 0.8 s later, and the old
+/// holder, alive, keeps admitting I/O under its own grants. Pinned here so
+/// that C7b sees them fail and then pass; run with `--ignored`.
+#[test]
+#[ignore = "known gap: plan 43 C7b (a clock offset beyond the envelope)"]
+fn fast_takeover_skewed_successor_known_gaps() {
+    for seed in [5_570, 11_942, 202_261] {
+        let e = run_seed(seed, fast_takeover_skewed_successor_config())
+            .expect_err("fixed? then move the seed to the regression list");
+        assert!(e.contains("mutual exclusion violated"), "seed {seed}: {e}");
+        let at = violation_ms(&e).unwrap_or_else(|| panic!("seed {seed}: no time in {e}"));
+        assert!(
+            at >= FIRST_FAILOVER_FLOOR_END_MS,
+            "seed {seed}: a violation at t={at}: {e}"
+        );
     }
 }
 
@@ -6647,15 +7092,22 @@ fn locks_writer_hold_delegated_settles_before_the_head() {
 /// `settle_tagged_writes` off, the delegate reported its stream head while
 /// its pinned write was still committing, the root granted on from it,
 /// and the write landed in the next holder's critical section (found by a
-/// 2000-seed sweep of `locks-writer-hold-delegated-unsettled`). Each
-/// passes with the settle.
+/// 3000-seed sweep of `locks-writer-hold-delegated-unsettled`: 4 seeds
+/// with the ask-again traffic, which changed the earlier trajectories).
+/// Each passes with the settle.
 #[test]
 fn locks_writer_hold_delegated_without_the_settle_is_caught() {
-    let seeds = [504, 534, 583, 910, 979, 1147, 1265];
+    let seeds = [745, 1081, 2045, 2369];
     let mut caught = 0;
     for seed in seeds {
         if let Err(e) = run_seed(seed, locks_writer_hold_delegated_unsettled_config()) {
             eprintln!("seed {seed}: {}", e.lines().next().unwrap_or(""));
+            // The intended signature, not any error: the held write landed
+            // inside the next holder's critical section.
+            assert!(
+                e.contains("held write") && e.contains("inside"),
+                "seed {seed}: another failure: {e}"
+            );
             caught += 1;
         }
         run_seed(seed, locks_writer_hold_delegated_config())

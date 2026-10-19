@@ -4071,6 +4071,38 @@
           "minimum": 0,
           "type": "integer"
         },
+        "ask_again_passed_over": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "asked_again": {
+          "description": "Plan 43 \"ask again\": waiters whose turn came with a request too\nold for a pushed grant to reach them before its first renewal was\ndue, which this owner asked to send another; those that did not\nwithin two request cycles and were passed over until their next\nrequest; requests refused for a turn held for an asked waiter\n(parked, or `EAGAIN`); and, as a requester, asks answered by a\nre-sent request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "asks_answered": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cancelled": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cancels_sent": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "covered_woken": {
+          "description": "Ask again, the node's side: ops woken by a grant installed for\nanother op of the node on the inode, and `LockCancel`s sent for the\nwaiters they and ghost waiters left; the owner's: waiters dropped by\none.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "doubt_lapses": {
           "description": "F1: recalled grants this node left to their owner's outwait\ninstead of releasing them (a mutation tagged with them ended in\ndoubt and was not resolved yet).",
           "format": "uint64",
@@ -4357,6 +4389,11 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reserved_waits": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "settle_waits": {
           "description": "F1: positions this node reported as covering what it executed (a\ngrant's floor, an outwait's cut, a delegate's stream head) that\nfirst waited for a tagged write still in its transaction, under a\ngrant ended here or whose token's window was over.",
           "format": "uint64",
@@ -4475,6 +4512,13 @@
         "answers_order_bypassed",
         "answers_order_held",
         "grace_end_serves",
+        "asked_again",
+        "ask_again_passed_over",
+        "reserved_waits",
+        "asks_answered",
+        "covered_woken",
+        "cancels_sent",
+        "cancelled",
         "token_rejections",
         "token_rejections_at_write",
         "settle_waits",

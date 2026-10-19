@@ -111,7 +111,7 @@ pub(super) fn cluster(
 }
 
 /// [`cluster`] with the grant TTL `deleg_ttl_ms` (`None`: the default).
-fn cluster_with_deleg_ttl(
+pub(super) fn cluster_with_deleg_ttl(
     scenario: &str,
     names: &[&str],
     extra: &[(&str, &str)],

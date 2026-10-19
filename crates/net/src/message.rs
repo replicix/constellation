@@ -579,6 +579,9 @@ pub enum Payload {
         /// The requester's node incarnation: the owner drops what an
         /// earlier one left queued.
         incarnation: u32,
+        /// How long the application has been waiting for the lock (ms):
+        /// the owner queues the request from there. Appended.
+        waited_ms: u64,
     },
     LockReply {
         req_id: u64,
@@ -738,6 +741,17 @@ pub enum Payload {
         req_id: u64,
         gen: u64,
         round: u64,
+    },
+    // ---- ask again (appended) ----
+    /// One way: `from` no longer waits for `ino` in the modes named; the
+    /// owner drops its parked waiters of `from` there.
+    LockCancel {
+        from: u64,
+        ino: u64,
+        exclusive: bool,
+        shared: bool,
+        /// The requester's clock: waiters last sent before it are dropped.
+        upto: i64,
     },
 }
 
@@ -1469,6 +1483,14 @@ mod tests {
                 blocking: false,
                 sent: 7,
                 incarnation: 2,
+                waited_ms: 1_500,
+            },
+            Payload::LockCancel {
+                from: 3,
+                ino: 4,
+                exclusive: true,
+                shared: false,
+                upto: 9,
             },
             Payload::LockReply {
                 req_id: 2,

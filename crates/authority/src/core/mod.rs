@@ -434,6 +434,17 @@ impl Config {
         (self.forward_backoff_ms / 4).max(10)
     }
 
+    /// The delegation TTL a deployment gets when it sets none: the lock
+    /// TTL, and at least the core's own 5 s. One rule for every host of the
+    /// core: the daemon's default (`CONSTELLATION_DELEGATION_TTL_MS` unset)
+    /// is this, so a delegate's grants are capped by about `lock_ttl − 2 ×
+    /// margin` there and by 2 to 3 s only where the TTL is set short (the
+    /// sim's `Config::defaults` keeps the 5 s: its delegations are the short
+    /// ones, whatever its lock TTL).
+    pub fn default_delegation_ttl_ms(lock_ttl_ms: u64) -> u64 {
+        lock_ttl_ms.max(5_000)
+    }
+
     /// Production defaults (the `CONSTELLATION_*` defaults of the code the
     /// core replaces), for `node_id` at `incarnation`.
     pub fn defaults(node_id: NodeId, incarnation: u32) -> Self {
@@ -907,6 +918,21 @@ pub struct Stats {
     pub lock_order_bypassed: u64,
     pub lock_order_holds: u64,
     pub lock_grace_end_serves: u64,
+    /// Owner: waiters whose turn came with a request too old for a pushed
+    /// grant, asked to ask again (`lock_asked_again`); those that did not
+    /// within the hold and were passed over until their next request;
+    /// requests refused (parked, or `EAGAIN`) for a turn held for an asked
+    /// waiter. Node: asks answered by a re-sent request.
+    pub lock_asked_again: u64,
+    pub lock_ask_again_passed_over: u64,
+    pub lock_reserved_waits: u64,
+    pub lock_asks_answered: u64,
+    /// Node: ops woken by a grant installed for another op of the node
+    /// (`lock_wake_covered`), and `LockCancel`s sent for the waiters they
+    /// and ghost waiters left; owner: waiters dropped by one.
+    pub lock_covered_woken: u64,
+    pub lock_cancels_sent: u64,
+    pub lock_cancelled: u64,
     pub lock_grace_periods: u64,
     pub lock_recalls_sent: u64,
     pub lock_recalls_released: u64,
@@ -2099,6 +2125,7 @@ impl Core {
                 blocking,
                 sent,
                 incarnation,
+                waited_ms,
             } => self.on_lock_request(
                 now,
                 from,
@@ -2108,6 +2135,7 @@ impl Core {
                 blocking,
                 sent,
                 incarnation,
+                waited_ms,
                 replica,
                 out,
             ),
@@ -2117,6 +2145,12 @@ impl Core {
             PeerMsg::LockGranted { ino, sent, outcome } => {
                 self.on_lock_granted_push(now, from, ino, sent, outcome, replica, out)
             }
+            PeerMsg::LockCancel {
+                ino,
+                exclusive,
+                shared,
+                upto,
+            } => self.on_lock_cancel(now, from, ino, exclusive, shared, upto, replica, out),
             PeerMsg::LockRecall { req, ino, grant } => {
                 self.on_lock_recall(now, from, req, ino, grant, replica, out)
             }
@@ -2432,7 +2466,8 @@ impl Core {
                 ino,
                 mode,
                 blocking,
-            } => self.on_lock_control(now, op, ino, mode, blocking, replica, out),
+                waited_ms,
+            } => self.on_lock_control(now, op, ino, mode, blocking, waited_ms, replica, out),
             Control::LockIdle { ino } => self.on_lock_idle_control(now, op, ino, replica, out),
             Control::LockReleaseWake { ino } => {
                 self.on_lock_release_wake(now, op, ino, replica, out)

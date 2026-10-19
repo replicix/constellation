@@ -1129,7 +1129,16 @@ impl ClusterLocks {
         asked: &mut bool,
     ) -> Result<Step, Code> {
         let mut rounds = 0u32;
+        // The last round brought a grant (the core said `Granted`); if the
+        // next look finds another client of this node holding the lock
+        // under it, the round was lost to that client, not to a recall.
+        let mut granted_round = false;
         let mut predecessor_counted = false;
+        // When the application began to wait: every request of this call
+        // carries how long that is, so that a call that lost a round to a
+        // recall (or to another client of this node) keeps its place in
+        // the owner's queue instead of joining it again at the back.
+        let started = std::time::Instant::now();
         loop {
             let outcome = self.meta.locks().local_set(ino, lock, now_ms());
             if outcome == LocalOutcome::Predecessor && !predecessor_counted {
@@ -1167,17 +1176,31 @@ impl ClusterLocks {
                         return Err(Code::Again);
                     }
                     interrupt.check()?;
+                    // A round that got its grant and lost the local race
+                    // to another client of this node does not count: its
+                    // place in the owner's queue is kept (`waited_ms`), so
+                    // it is no reason to wait longer than the others.
+                    // (Only after that: a `Granted` that `local_set` still
+                    // answers `NeedGrant` to keeps its back-off, or a core
+                    // granting what the tables refuse would be spun on.)
+                    if std::mem::take(&mut granted_round) {
+                        rounds = 0;
+                    }
                     std::thread::sleep(LOCAL_POLL);
                 }
                 LocalOutcome::NeedGrant(mode) => {
+                    granted_round = false;
                     if !sleep && rounds >= TRY_ROUNDS {
                         return Err(Code::Again);
                     }
                     interrupt.check()?;
                     if rounds >= 2 {
-                        // A grant that keeps being overtaken by recalls:
-                        // back off a little instead of spinning on the
-                        // sequencer.
+                        // A request that keeps being answered without a
+                        // grant (a recall overtook it), or with one the
+                        // local tables do not take: back off a little
+                        // instead of spinning on the sequencer. A round
+                        // that did get a grant, and lost the local race to
+                        // another client, does not count (`granted_round`).
                         std::thread::sleep(Duration::from_millis(10 * u64::from(rounds.min(20))));
                     }
                     rounds += 1;
@@ -1189,11 +1212,19 @@ impl ClusterLocks {
                             ino,
                             mode,
                             blocking: sleep,
+                            waited_ms: if sleep {
+                                started.elapsed().as_millis() as u64
+                            } else {
+                                0
+                            },
                             reply,
                         })
                         .map_err(|_| Code::Io)?;
                     match answer.blocking_recv().map_err(|_| Code::Io)? {
-                        LockAnswer::Granted { position } => self.granted(ino, &position),
+                        LockAnswer::Granted { position } => {
+                            self.granted(ino, &position);
+                            granted_round = sleep;
+                        }
                         LockAnswer::WouldBlock => {
                             if !sleep {
                                 return Err(Code::Again);

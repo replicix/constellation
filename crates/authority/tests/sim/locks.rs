@@ -94,6 +94,11 @@ pub struct LockCounters {
     pub abandoned: u64,
     /// The longest acquisition (simulated ms).
     pub max_wait_ms: u64,
+    /// ... of a client of node 1, the lock files' owner (the root), and of
+    /// the clients of the other nodes: the owner's own clients share a
+    /// table with the owner, which the others' do not.
+    pub max_wait_owner_ms: u64,
+    pub max_wait_rest_ms: u64,
     /// Plan 30 §M14 (lock-to-unlock coherence): grants whose holder was
     /// checked against the frontier the previous exclusive holder on
     /// another node had at its unlock, and those whose replica did not
@@ -117,6 +122,16 @@ pub struct LockCounters {
     /// overtaken). Faults reorder legitimately (a paused or partitioned
     /// waiter is skipped); a fault-free run should count none.
     pub overtaken: u64,
+    /// The longest idle time a blocking waiter waited for a lock after the
+    /// last critical section that conflicted with it had ended: `acquired
+    /// at − max(its wait began, the last conflicting section's end)` (none
+    /// for the first acquisition of a lock). It
+    /// does not depend on the queue ahead of it or on the sections' length:
+    /// what a handoff costs when the lock is free and the waiter is next
+    /// (an exclusive waiter conflicts with any section, a shared one with
+    /// exclusive ones). The ask-again rule's measure: a stale push, an
+    /// outwait or a 9.5 s re-send shows here.
+    pub max_handoff_gap_ms: u64,
 }
 
 /// See [`LockCounters::overtaken`]: `2 × (ttl + margin)` of the sim's
@@ -182,9 +197,12 @@ struct GhostInner {
         String,
     )>,
     /// Fairness: per inode, the clients waiting for a grant `(node,
-    /// thread, since)`.
-    waiting: BTreeMap<u64, Vec<(NodeId, u64, u64)>>,
+    /// thread, since, mode)`.
+    waiting: BTreeMap<u64, Vec<(NodeId, u64, u64, LockMode)>>,
     overtakes: Vec<String>,
+    /// Per inode, when the last critical section ended `(any, exclusive)`
+    /// ([`LockCounters::max_handoff_gap_ms`]).
+    section_ends: BTreeMap<u64, (u64, u64)>,
 }
 
 /// The mutual-exclusion ghost and the lock clients' counters.
@@ -569,6 +587,13 @@ impl LockGhost {
         );
         self.with(|g| {
             if let Some(v) = g.in_io.get_mut(&ino) {
+                if let Some(e) = v.iter().find(|e| e.node == node && e.thread == thread) {
+                    let ends = g.section_ends.entry(ino).or_default();
+                    ends.0 = ends.0.max(at_ms);
+                    if e.mode == LockMode::Exclusive {
+                        ends.1 = ends.1.max(at_ms);
+                    }
+                }
                 v.retain(|e| !(e.node == node && e.thread == thread));
             }
             if let Some(e) = g
@@ -586,7 +611,14 @@ impl LockGhost {
     pub fn drop_node(&self, node: NodeId, at_ms: u64) {
         self.note(at_ms, format!("node {node} crashed"));
         self.with(|g| {
-            for v in g.in_io.values_mut() {
+            for (ino, v) in g.in_io.iter_mut() {
+                for e in v.iter().filter(|e| e.node == node) {
+                    let ends = g.section_ends.entry(*ino).or_default();
+                    ends.0 = ends.0.max(at_ms);
+                    if e.mode == LockMode::Exclusive {
+                        ends.1 = ends.1.max(at_ms);
+                    }
+                }
                 v.retain(|e| e.node != node);
             }
             for e in g.io_history.iter_mut() {
@@ -602,11 +634,11 @@ impl LockGhost {
 
     /// `thread` on `node` starts waiting for a grant on `ino` (its first
     /// `NeedGrant`).
-    pub fn wait_begin(&self, ino: u64, node: NodeId, thread: u64, at_ms: u64) {
+    pub fn wait_begin(&self, ino: u64, node: NodeId, thread: u64, mode: LockMode, at_ms: u64) {
         self.with(|g| {
             let v = g.waiting.entry(ino).or_default();
             if !v.iter().any(|e| e.0 == node && e.1 == thread) {
-                v.push((node, thread, at_ms));
+                v.push((node, thread, at_ms, mode));
             }
         });
     }
@@ -616,17 +648,37 @@ impl LockGhost {
     pub fn wait_end(&self, ino: u64, node: NodeId, thread: u64, at_ms: u64, acquired: bool) {
         self.with(|g| {
             let seed = g.seed;
+            let ends = g.section_ends.get(&ino).copied().unwrap_or((0, 0));
             let Some(v) = g.waiting.get_mut(&ino) else {
                 return;
             };
             let mine = v
                 .iter()
                 .find(|e| e.0 == node && e.1 == thread)
-                .map(|e| e.2);
+                .map(|e| (e.2, e.3));
             v.retain(|e| !(e.0 == node && e.1 == thread));
-            let (Some(since), true) = (mine, acquired) else {
+            let (Some((since, mode)), true) = (mine, acquired) else {
                 return;
             };
+            let conflicting_end = if mode == LockMode::Exclusive {
+                ends.0
+            } else {
+                ends.1
+            };
+            let gap = at_ms.saturating_sub(since.max(conflicting_end));
+            // (The first acquisition of a lock is nobody's handoff: its wait
+            // is the cluster's start-up, the delegation's installation.)
+            if conflicting_end > 0 {
+                g.counters.max_handoff_gap_ms = g.counters.max_handoff_gap_ms.max(gap);
+            }
+            if conflicting_end > 0 && gap > 3_000 {
+                tracing::debug!(
+                    t = at_ms,
+                    "lock ghost: SLOW HANDOFF node {node} t{thread} {mode:?} on {ino:#x}: waiting \
+                     since t={since}, last conflicting section ended t={conflicting_end}, acquired \
+                     at t={at_ms}: idle {gap} ms"
+                );
+            }
             let overtaken: Vec<String> = v
                 .iter()
                 .filter(|e| e.0 != node && e.2 + LOCK_FAIR_MS < since)
@@ -843,7 +895,7 @@ pub async fn client_lock(
                     // (A non-blocking request holds no place in a queue:
                     // the owner does not park it, and it may be
                     // overtaken while it waits for a grace to end.)
-                    ghost.wait_begin(ino, node, thread, t0);
+                    ghost.wait_begin(ino, node, thread, step.mode, t0);
                     wait = Some(WaitGuard {
                         ghost: ghost.clone(),
                         ino,
@@ -872,10 +924,19 @@ pub async fn client_lock(
                     tokio::time::sleep(Duration::from_millis(1 + jitter)).await;
                 }
                 after_grant = false;
+                // The application's wait so far travels with every round
+                // of one call (as the engine's lock call does), so a loser
+                // keeps its place in the owner's queue.
+                let waited_ms = if step.blocking {
+                    clock.elapsed_ms().saturating_sub(t0)
+                } else {
+                    0
+                };
                 let rx = h.control(Control::Lock {
                     ino,
                     mode,
                     blocking: step.blocking,
+                    waited_ms,
                 });
                 let answer = await_control(&cluster, node, inc, deadline, rx).await;
                 let answer = match answer {
@@ -978,6 +1039,11 @@ pub async fn client_lock(
     ghost.count(|c| {
         c.acquired += 1;
         c.max_wait_ms = c.max_wait_ms.max(waited);
+        if node == 1 {
+            c.max_wait_owner_ms = c.max_wait_owner_ms.max(waited);
+        } else {
+            c.max_wait_rest_ms = c.max_wait_rest_ms.max(waited);
+        }
     });
     // The critical section.
     let mut entered = false;

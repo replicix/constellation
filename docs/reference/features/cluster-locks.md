@@ -681,13 +681,85 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    in one pass. Its grant, counted from there, replaced the first one's
    record with one that ended inside the window the node honoured, and
    the sequencer outwaited it and granted the lock to another node while
-   the first op was still in its section. A waiter
-   silent for longer than `ttl − margin` is passed over: a grant would
-   already have lapsed when it arrived. A grant that arrives with less
+   the first op was still in its section.
+   A grant is pushed only from a request recent enough for the grant to
+   reach its holder before its first renewal is due: no older than half
+   of `ttl − margin` of the *granted* ttl (the holder renews that far
+   into its window). That is 9.5 s for an uncapped 20 s grant, but a
+   delegate's grants (and a lease-capped root's) are capped by what is
+   left of its authority: about 2 to 3 s under a delegation of 5 s, so
+   for them it is 0.5 to 1 s, against a waiter that re-sends every 9.5 s
+   (the daemon's default delegation TTL is the lock TTL, `Config::
+   default_delegation_ttl_ms`: its delegates' grants are capped at 13 to
+   18 s and the window at 6 to 8.5 s, so the rule asks less there; it is
+   for a short delegation TTL, a delegate whose renewals lag under load,
+   a root near the end of its lease, and a push slow in transit). Served
+   from an older request, a grant counted from that request reached its
+   holder lapsed (below), asked again behind the next waiter's recall, and
+   the owner's record of it, counted from the same request, was expired
+   when it was made: the next waiter of the pass was granted over it, or
+   the unused grant was outwaited. So a waiter whose turn has come with an
+   older request is not granted. The owner asks it to ask again
+   (`asked_again`: the `LockGranted` push carrying `Waiting { retry_ms: 0
+   }`, no new message) and holds its turn for up to two request cycles
+   (`2 × (recall_hold_ms + poll)`, 600 ms at the defaults, and four round
+   trips of the node more as the core measures them, at most three times
+   that): nothing that conflicts with it is granted to anyone else
+   meanwhile, and a conflicting non-blocking request is refused `EAGAIN`
+   (`reserved_waits`; the lock is promised and in flight, so it is a known
+   conflict). The node answers the ask by re-sending the request of every
+   op of it waiting on the inode with none in flight (one in flight is
+   left alone: its reply carries the grant), and the owner grants over
+   that request, from its arrival. The ask grants nothing and extends
+   nothing. A waiter that does not ask again within the hold is passed
+   over until its next request (`ask_again_passed_over`), keeps its place
+   in the queue when it comes, and two asks in a row left unanswered mark
+   its node unreachable (below). Any request that comes after an ask, in
+   the hold or after the pass-over, is heard: it resets what unused grants
+   and unanswered asks counted against the node.
+   A waiter's place is where its application's wait began. Every request
+   carries how long the application has waited (`waited_ms`, a duration:
+   the clocks of nodes are never compared; the engine's lock call and the
+   sim's client send it with every round), and the owner queues the
+   request from `now − waited_ms` (at most `4 × ttl` back), the owner's
+   own ops likewise (`Control::Lock`). A client that lost a round to a
+   recall, or to another client of its node, so keeps its place; it
+   used to join the queue again at the back, and among the clients of the
+   owner's own node, which take the grant in one pass and race for it, the
+   same few lost every round for a minute (`locks-long-grants`: the owner
+   node's longest wait over 50 s in 11 of 15000 seeds before, 30 with the
+   ask alone). A grant that is installed and not recalled answers every
+   other op of the node on the inode that it covers at once (an op's
+   request in flight is moved to `done_reqs`, as a push moves it): one
+   push used to wake the one op it was matched to and leave the others to
+   their own re-send, 9.5 s later at the production lock ttl
+   (`covered_woken`). A grant that arrives recalled admits one local lock
+   and wakes no other. The waiters those ops left at the owner, and a
+   waiter an ask finds no op of its node for (an op another op's grant
+   covered, or that left), are cancelled (`LockCancel`, one way; the owner
+   drops its parked waiters of the node there that it last had a request
+   of before the cancel was decided: `cancels_sent`, `cancelled`), so that
+   the owner does not hold its queue for a turn nobody takes.
+   `waited_ms` is the requester's claim and only places a request in the
+   queue: a peer that overstated it could jump ahead by at most `4 × ttl`
+   (80 s at the production lock ttl), the same bound as a served node's kept
+   place. The cancel's `upto` and a request's `sent` are the requester's
+   own wall stamps, compared only with each other: a backward step of its
+   clock between a request and a cancel can make the owner drop a waiter
+   that is still waited for (liveness only: its next re-send parks it
+   again; plan 43 C7-H1 moves both stamps to the wait clock).
+   The cost of an ask is one round trip per handoff to a stale waiter.
+   A waiter
+   silent for longer than `ttl − margin` is passed over (the ask covers
+   the range between half of it and that: older, a request is taken for
+   lost): a grant would already have lapsed when it arrived. A grant that
+   arrives with less
    than a quarter of the margin of its window left (the window counts
    from the request's send) is treated as lapsed on arrival: the node
    asks again, and the owner re-affirms the grant from the fresh
-   request. Installed, it lapsed under the I/O it let in before a
+   request. This is now the fallback for a push held up in transit or
+   behind a stalled step; before the ask it was the normal case of a
+   delegate's queue. Installed, it lapsed under the I/O it let in before a
    renewal could come back: a waiter served from a delegate's queue
    near the end of its re-send interval, under a ttl capped by the
    delegation, got 5 to 20 ms of it (`locks-delegated-writes`). After `4 × ttl` of silence the
@@ -741,7 +813,8 @@ When a node asks for a grant that conflicts with grants held elsewhere:
    (`stale_incarnation_requests`). The previous incarnation's grants stay
    until they are released or outwaited.
 4. A non-blocking request (`F_SETLK`, `flock -n`) that conflicts gets
-   `EAGAIN` at once. The recall still goes out, so a retry succeeds once
+   `EAGAIN` at once, also while a waiter's turn is held after an ask
+   (above). The recall still goes out, so a retry succeeds once
    the other node's application unlocks (SQLite's busy loop relies on
    this). One that nothing conflicts with, but which the owner may not
    grant yet, waits (next section).
@@ -1183,6 +1256,17 @@ its delegate with the delegate's first renewal, and gets them back when
 the delegation is recalled. The receiver restamps each grant so that it
 never expires at the owner before it lapses at the node.
 
+A delegate's grants are capped by its delegation (`delegation_ttl −
+2 × margin` at most, less what is spent since its last renewal): 13 to
+18 s under the daemon's default delegation TTL (the lock TTL: `Config::
+default_delegation_ttl_ms`, which `CONSTELLATION_DELEGATION_TTL_MS`
+overrides), about 2 to 3 s under a short one (the core's own 5 s, and the
+sim's). A handoff to a waiter whose last request is older than half of
+that (minus the margin) costs one round trip more, the ask described under
+[Conflicts, recalls and blocking
+waits](#conflicts-recalls-and-blocking-waits), not a 9.5 s re-send or an
+outwait.
+
 The handoff rides a renewal reply, so it can arrive after the
 delegation's recall, or not at all. The root therefore keeps a copy of
 what it handed. Every renewal it grants re-sends the copies that are
@@ -1301,6 +1385,21 @@ WAN numbers are measured separately (`lock-latency`, `bench/remote`).
   installed with `SA_RESTART` restarts a native `F_SETLKW` transparently.
   Over FUSE the wait ends with a plain `EINTR` (as with libfuse), so the
   program sees it and must retry.
+- **Handoffs the ask does not cover.** Two causes of a waiter's wait past
+  the round trip are known and not changed by it. (1) A grant moved with
+  its subtree (a delegation recalled, a rename across subtrees) is
+  restamped to a full lock ttl and margin, so a grant that lapsed at its
+  holder meanwhile (an idle one a delegate's short authority could not
+  renew) is outwaited for 21 s: in the sim at a short delegation two seeds
+  of 2000 with two moves each still wait more than a minute. A tighter
+  restamp (the remaining duration instead of a full ttl, for grants the
+  sender knows were never renewed) needs a model check first. (2) A
+  delegate's own idle grant lapses with its short authority
+  (`ShortAuthority` waits), and the outwait and the barrier after it cost
+  `ttl + margin` and more (3 to 4.5 s). A waiter whose op nothing waits
+  for at its node and whose cancel was lost, or whose op left meanwhile,
+  is asked once in vain: 600 ms of its queue's wait
+  (`ask_again_passed_over`).
 - **No deadlock detection.** There is no `EDEADLK`: two owners waiting
   on each other wait until a signal ends one of the waits, as they do
   with `flock`.
@@ -1442,7 +1541,16 @@ for both roles:
   `unreachable_passed_over` (their waiters passed over meanwhile),
   `incarnation_waiters_dropped` (waiters a restarted node's previous
   incarnation left queued), `stale_incarnation_requests` (requests from
-  an older incarnation, answered and not served), `requests_in_flight`, `waiters`, `recalls_in_flight`,
+  an older incarnation, answered and not served), `asked_again`
+  (waiters asked to send their request again because their last one was
+  too old for a pushed grant), `ask_again_passed_over` (those that did
+  not within the hold; 0 without a fault), `reserved_waits` (requests
+  refused or parked for a turn held for an asked waiter),
+  `asks_answered` (node side: asks answered by a re-sent request),
+  `covered_woken` (node side: ops answered by a grant installed for
+  another op of the node), `cancels_sent` (node side: `LockCancel`s sent),
+  `cancelled` (owner side: waiters a cancel dropped),
+  `requests_in_flight`, `waiters`, `recalls_in_flight`,
   `token_rejections` (operations refused for a dead fencing token).
 
 These counters are not exported to `/metrics` or shown in the web UI.

@@ -12070,6 +12070,30 @@ mod locks {
                 blocking,
                 sent: h.now,
                 incarnation,
+                waited_ms: 0,
+            },
+        })
+    }
+
+    /// [`request`] of an application that has waited `waited_ms` already.
+    fn request_waited(
+        h: &mut Harness,
+        from: NodeId,
+        req: u64,
+        ino: Ino,
+        mode: LockMode,
+        waited_ms: u64,
+    ) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::LockRequest {
+                req: OpId(req),
+                ino,
+                mode,
+                blocking: true,
+                sent: h.now,
+                incarnation: 1,
+                waited_ms,
             },
         })
     }
@@ -12346,8 +12370,10 @@ mod locks {
             "an unreachable waiter re-sends at once ({retry} ms, normally {normal_retry} ms)"
         );
         assert_eq!(h.core.stats.lock_requeued_in_place, 0);
-        // Node 4 re-sends as a live waiter does (its Waiting answered).
-        h.advance(500);
+        // Node 4 re-sends as a live waiter does (its Waiting answered), the
+        // last time just before node 3's grant is outwaited (a request
+        // recent enough for a push: the ask-again rule).
+        h.now = Ms(h.meta.locks().get(g3).unwrap().until_ms - 500);
         let out = request(&mut h, 4, 19, ino, X, true);
         answer_held(&mut h, &out);
         // Node 3's grant is outwaited: node 4 is served, not node 3.
@@ -12770,6 +12796,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking: true,
+                waited_ms: 0,
             },
         });
         assert!(!lock_granted(&out), "granted beside node 3's: {out:?}");
@@ -13251,6 +13278,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
@@ -13319,6 +13347,7 @@ mod locks {
                     ino,
                     mode: X,
                     blocking: false,
+                    waited_ms: 0,
                 },
             });
             lock_answer(&out, op)
@@ -13745,6 +13774,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
@@ -14426,6 +14456,7 @@ mod locks {
                             blocking: true,
                             sent: h.now,
                             incarnation: 1,
+                            waited_ms: 0,
                         },
                     },
                     meta,
@@ -15040,6 +15071,11 @@ mod locks {
     #[test]
     fn an_unanswered_recall_is_outwaited_and_the_grant_is_pushed() {
         let (mut h, ino) = holder_with_file();
+        // The lease out of the way: the grant pushed at the outwait is for
+        // the lock ttl, and a request 1.5 s old is recent enough for it
+        // (`(ttl - margin) / 2` = 2 s; capped by the lease it would be
+        // asked to ask again).
+        uncap(&mut h);
         let granted_at = h.now;
         request(&mut h, 2, 7, ino, X, true);
         let out = request(&mut h, 3, 8, ino, X, true);
@@ -15087,6 +15123,13 @@ mod locks {
         timer_of(&out, TimerKind::LockHeldReply)
     }
 
+    /// [`park`] in `mode`.
+    fn park_as(h: &mut Harness, node: NodeId, req: u64, ino: Ino, mode: LockMode) -> TimerId {
+        let out = request(h, node, req, ino, mode, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        timer_of(&out, TimerKind::LockHeldReply)
+    }
+
     /// A waiter killed while parked (the EC2 lock run: node c died with
     /// its request queued) is granted from its request's *arrival*: the
     /// grant is outwaited `ttl + margin` after the last message it sent,
@@ -15107,13 +15150,10 @@ mod locks {
         h.step(Event::Timer { id: held3 });
         h.advance(100);
         h.step(Event::Timer { id: held4 });
-        h.now = t0.plus(2_350);
-        let held4 = park(&mut h, 4, 10, ino);
-        h.advance(250);
-        h.step(Event::Timer { id: held4 });
-        // Node 2 releases 3 s after node 3's request: node 3 (first in
-        // line, still inside its window) is granted — live from t0.
-        h.now = t0.plus(3_000);
+        // Node 2 releases 1.9 s after node 3's request: node 3 (first in
+        // line, its request recent enough for a push: at most `(ttl -
+        // margin) / 2` old, the ask-again rule) is granted — live from t0.
+        h.now = t0.plus(1_900);
         let out = h.step(Event::Peer {
             from: 2,
             msg: PeerMsg::LockReleased {
@@ -15134,6 +15174,15 @@ mod locks {
         );
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
         assert_eq!(h.core.timer_at(expiry), Some(t0.plus(6_000)));
+        // Node 4 keeps re-sending (every 2.25 s); the last one is 1.4 s old
+        // when node 3's grant is outwaited (the lease out of the way: a
+        // grant capped by it would be one for a request that young to be
+        // asked about, not pushed).
+        uncap(&mut h);
+        h.now = t0.plus(2_350);
+        let held4 = park(&mut h, 4, 10, ino);
+        h.advance(250);
+        h.step(Event::Timer { id: held4 });
         h.now = t0.plus(4_600);
         let held4 = park(&mut h, 4, 11, ino);
         h.advance(250);
@@ -15222,7 +15271,10 @@ mod locks {
     /// owner outwaited it and granted the lock to another node while the
     /// first op was still in its section (sim `double-seal-inside-the-
     /// grace` seed 4796, under grants its lease capped). At the
-    /// production lock TTL, with one lost message.
+    /// production lock TTL, with one late message (the shared op's request
+    /// is 9.5 s old at the release, the oldest a push may be made from:
+    /// `a_second_waiter_of_a_node_whose_re_send_was_lost_is_asked_not_pushed`
+    /// has it older).
     #[test]
     fn a_grant_reaffirmed_in_place_from_an_older_request_keeps_the_later_window() {
         let (mut h, ino) = holder_with_file();
@@ -15241,13 +15293,23 @@ mod locks {
         h.step(Event::Timer { id: first });
         h.step(Event::Timer { id: second });
         assert_eq!(h.core.lock_view().waiters, 2);
-        // The exclusive op re-sends every `(ttl − margin) / 2`; the shared
-        // op's re-send at 9.5 s is lost.
+        // The exclusive op re-sends every `(ttl − margin) / 2`. The shared
+        // op's re-send comes at 9.4 s and its next one would be at 18.9 s,
+        // too late: at the release it is 9.5 s old, the oldest a request may
+        // be for a grant to be pushed (the ask-again rule; an older one is
+        // asked to send its request again,
+        // `a_second_waiter_of_a_node_whose_re_send_was_lost_is_asked_not_pushed`).
+        h.now = t0.plus(9_400);
+        let out = request(&mut h, 2, 40, ino, S, true);
+        let shared = timer_of(&out, TimerKind::LockHeldReply);
         for at in [9_500, 18_800] {
             h.now = t0.plus(at);
             let held = park(&mut h, 2, 10 + at, ino);
             h.advance(250);
             h.step(Event::Timer { id: held });
+            if at == 9_500 {
+                h.step(Event::Timer { id: shared });
+            }
         }
         let resent = t0.plus(18_800);
         // Node 3 releases inside the shared waiter's window.
@@ -15269,8 +15331,8 @@ mod locks {
         assert!(h.meta.locks().get(ga).is_none(), "replaced in place");
         // Node 2 honours the first grant until `resent + ttl − margin`
         // and renews it half-way through that, at `resent + 9.5 s`; the
-        // second lapsed on its arrival there (its window counts from the
-        // lost re-send's predecessor) and is asked for again. The record
+        // second lapsed on its arrival there (its window counts from its
+        // own, older request) and is asked for again. The record
         // here must outlast the first grant's window.
         let honoured = resent.0 + ttl - margin;
         let until = h.meta.locks().get(gb).unwrap().until_ms;
@@ -15285,7 +15347,7 @@ mod locks {
         // Past where the second request's window alone would have ended
         // (and before node 2's first renewal), node 4 does not get the
         // lock: node 2's grant is recalled.
-        h.now = Ms(t0.0 + 10 + ttl + margin + 100);
+        h.now = Ms(t0.0 + 9_400 + ttl + margin + 100);
         let out = request(&mut h, 4, 30, ino, X, false);
         let rs = lock_replies(&out);
         assert!(
@@ -15319,9 +15381,11 @@ mod locks {
         let held = timer_of(&out, TimerKind::LockHeldReply);
         h.advance(250);
         h.step(Event::Timer { id: held });
-        // Its re-send is lost; it renews its shared grant 3.4 s after the
-        // upgrade request arrived.
-        h.advance(3_150);
+        // Its re-send is lost; it renews its shared grant 1.65 s after the
+        // upgrade request arrived, and the lock is released 0.1 s later: the
+        // upgrade's request is then 1.75 s old, within the 2 s (`(ttl -
+        // margin) / 2`) a grant may be pushed from (the ask-again rule).
+        h.advance(1_400);
         let renewed = h.now;
         let out = h.step(Event::Peer {
             from: 2,
@@ -15369,6 +15433,1084 @@ mod locks {
         );
         // Node 2 honours it exclusively until `renewed + ttl − margin`.
         assert!(until > renewed.0 + ttl - margin);
+    }
+
+    // ---- ask again: a pushed grant is never older than its holder's first
+    // renewal (cluster-locks.md, "Conflicts, recalls and blocking waits") ----
+
+    /// `LockReleased` of `grant` from `from`.
+    fn release_of(h: &mut Harness, from: NodeId, ino: Ino, grant: GrantId) -> Vec<Action> {
+        h.step(Event::Peer {
+            from,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant,
+                position: Position::ZERO,
+            },
+        })
+    }
+
+    /// The nodes a lock owner asked to ask again in `out`.
+    fn asked(out: &[Action]) -> Vec<NodeId> {
+        pushes(out)
+            .into_iter()
+            .filter(|(_, _, o)| {
+                matches!(
+                    o,
+                    LockOutcome::Waiting {
+                        retry_ms: 0,
+                        grace: false
+                    }
+                )
+            })
+            .map(|(to, _, _)| to)
+            .collect()
+    }
+
+    /// The lease out of the way: grants are the lock ttl, not what is left
+    /// of the lease.
+    fn uncap(h: &mut Harness) {
+        h.core.lease.held.as_mut().unwrap().0.expires_unix_ms = h.now.plus(3_600_000).0;
+    }
+
+    /// A delegate (node 3, generation 7) of the directory of the returned
+    /// file, at lock ttl `lock_ttl_ms`.
+    fn lock_delegate(lock_ttl_ms: u64) -> (Harness, Ino) {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.cfg.lock_ttl_ms = lock_ttl_ms;
+        h.core.lease.cached_holder = Some(1);
+        let (_, f) = delegated_file(&h.meta);
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        (h, f)
+    }
+
+    /// The delegate is honoured for `ms` more.
+    fn delegation_left(h: &mut Harness, ms: u64) {
+        let d = h.core.dl.mine.get_mut(&7).expect("installed");
+        d.until = h.now.plus(ms);
+        d.renew = None;
+    }
+
+    /// Another file in the replica.
+    fn second_file(h: &mut Harness) -> Ino {
+        let op = h.create("g");
+        let MutateOp::Create { ino, .. } = op else {
+            unreachable!()
+        };
+        constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+        ino
+    }
+
+    /// How long an asked waiter's turn is held (`lock_ask_again_wait_ms`).
+    fn ask_wait(h: &Harness) -> u64 {
+        2 * (h.core.cfg.recall_hold_ms + h.core.cfg.lock_poll_ms())
+    }
+
+    /// Fire the waiter tick `tick` and return the one it armed.
+    fn tick_waiters(h: &mut Harness, tick: TimerId) -> (Vec<Action>, Option<TimerId>) {
+        let out = h.step(Event::Timer { id: tick });
+        let next = timers(&out, TimerKind::LockWaiterTick);
+        (out, next.first().copied())
+    }
+
+    /// Node 2 holds the lock, node 3 parked behind it at `t0 + 10` and was
+    /// answered `Waiting` (to re-send in 9.5 s at a 20 s lock ttl); returns
+    /// `t0`, node 2's grant and the waiter tick that is armed.
+    fn node_3_parked_behind_node_2(h: &mut Harness, ino: Ino) -> (Ms, GrantId, TimerId) {
+        let out = request(h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        h.advance(10);
+        let out = request(h, 3, 8, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        let held = timer_of(&out, TimerKind::LockHeldReply);
+        let tick = timer_of(&out, TimerKind::LockWaiterTick);
+        h.advance(250);
+        let out = h.step(Event::Timer { id: held });
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(
+                    3,
+                    OpId(8),
+                    LockOutcome::Waiting {
+                        retry_ms: 9_500,
+                        grace: false
+                    }
+                )]
+            ),
+            "{out:?}"
+        );
+        (t0, g2, tick)
+    }
+
+    /// The sim's delegated production-TTL config at its smallest, at a
+    /// lease-capped root (the sim's 6 s lease caps its root too). Node 3
+    /// re-sends every 9.5 s; the lock is released 5 s after its request, and
+    /// what the lease allows is 4 s: honoured for 3 s, renewed 1.5 s in. A
+    /// grant pushed from that request reached node 3 with 1 s of its window
+    /// left or none (it drops one that lapses within `margin / 4` and asks
+    /// again, behind the next waiter's recall), and the owner's record of it
+    /// ended `ttl + margin` after a request 5 s old: expired when made, so
+    /// the next waiter of the pass was granted over it. Now the owner grants
+    /// nothing: it asks node 3 to send its request again, holds its turn
+    /// (nobody that conflicts is granted meanwhile), and grants over the
+    /// request that comes.
+    #[test]
+    fn a_capped_grant_for_a_stale_waiter_asks_it_to_ask_again() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        let margin = 1_000;
+        let (t0, g2, _) = node_3_parked_behind_node_2(&mut h, ino);
+        h.now = t0.plus(5_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert!(grants_to(&out).is_empty(), "nothing is granted: {out:?}");
+        let ps = pushes(&out);
+        let [(
+            3,
+            i,
+            LockOutcome::Waiting {
+                retry_ms: 0,
+                grace: false,
+            },
+        )] = ps.as_slice()
+        else {
+            panic!("node 3 is asked to ask again: {out:?}")
+        };
+        assert_eq!(*i, ino);
+        assert_eq!(h.core.stats.lock_asked_again, 1);
+        assert!(
+            h.meta.locks().own_grant(ino, 3, h.now.0).is_none(),
+            "nothing minted for it"
+        );
+        // Node 4 asks during node 3's turn: it parks, nothing is granted.
+        h.advance(10);
+        let out = request(&mut h, 4, 9, ino, X, true);
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
+        assert_eq!(h.core.stats.lock_reserved_waits, 1);
+        assert!(h.meta.locks().own_grant(ino, 4, h.now.0).is_none());
+        // Node 3 sends its request again: granted over it, from it.
+        h.advance(20);
+        let out = request(&mut h, 3, 10, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(3, OpId(10), o)] = rs.as_slice() else {
+            panic!("node 3 is granted over its request: {out:?}")
+        };
+        let (g3, ttl) = granted(o);
+        assert_eq!(ttl, 3_970, "what the lease allows");
+        assert_eq!(
+            h.meta.locks().get(g3).unwrap().until_ms,
+            h.now.0 + ttl as i64 + margin,
+            "live from the request that arrived now"
+        );
+        assert!(pushes(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.lock_asked_again, 1);
+    }
+
+    /// An asked waiter that does not ask again is passed over after two
+    /// request cycles, and the waiter behind it is served; it is not asked
+    /// or held again, and its next request re-queues it at its old place
+    /// (ahead of a waiter that parked after it, whose own request is newer).
+    #[test]
+    fn an_unanswered_ask_passes_the_waiter_over_and_its_next_request_keeps_its_place() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
+        h.advance(10);
+        let held4 = park(&mut h, 4, 9, ino);
+        h.advance(250);
+        h.step(Event::Timer { id: held4 });
+        // 12 s after node 3's request (older than the 9.5 s a push may be)
+        // the lock is released: node 3 is asked, nobody else is served.
+        h.now = t0.plus(12_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        let ask_at = h.now;
+        let wait = ask_wait(&h);
+        // Node 4, a live waiter, re-sends meanwhile: held behind node 3's turn.
+        h.advance(100);
+        let out = request(&mut h, 4, 10, ino, X, true);
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        h.now = ask_at.plus(wait - 1);
+        let (out, tick) = tick_waiters(&mut h, tick);
+        assert!(grants_to(&out).is_empty(), "still held: {out:?}");
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 0);
+        // Past the hold, node 3 is passed over and node 4 is served over its
+        // request.
+        h.advance(1);
+        let (out, _) = tick_waiters(&mut h, tick.expect("armed while a waiter is held"));
+        let rs = lock_replies(&out);
+        let [(4, OpId(10), LockOutcome::Granted { id: g4, .. })] = rs.as_slice() else {
+            panic!("node 4 is served over its request: {out:?}")
+        };
+        let g4 = *g4;
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 1);
+        assert_eq!(h.core.lock_view().waiters, 1, "node 3 is still parked");
+        assert_eq!(h.core.lock_unreachable(), 0, "one is not two");
+        // Node 5 parks after it. Node 3's request, when it comes, queues at
+        // its old place, ahead of node 5's.
+        h.advance(100);
+        let held5 = park(&mut h, 5, 11, ino);
+        h.advance(100);
+        let out = request(&mut h, 3, 12, ino, X, true);
+        assert!(lock_replies(&out).is_empty(), "behind node 4: {out:?}");
+        h.step(Event::Timer { id: held5 });
+        h.advance(50);
+        let out = release_of(&mut h, 4, ino, g4);
+        let rs = lock_replies(&out);
+        assert!(
+            matches!(rs.as_slice(), [(3, OpId(12), LockOutcome::Granted { .. })]),
+            "node 3 is served ahead of node 5: {out:?}"
+        );
+        assert!(
+            asked(&out).is_empty() && grants_to(&out).len() == 1,
+            "{out:?}"
+        );
+        assert_eq!(h.core.stats.lock_asked_again, 1, "never asked again");
+    }
+
+    /// Two asks in a row that a node leaves unanswered take it for
+    /// unreachable (as two grants left unused do): from then on it is
+    /// granted over its own requests only. (On two files: a request of the
+    /// node after a turn was passed over proves it alive and forgives it,
+    /// `a_request_after_the_pass_over_is_heard`.)
+    #[test]
+    fn two_unanswered_asks_in_a_row_mark_the_waiters_node_unreachable() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let ino2 = second_file(&mut h);
+        let out = request(&mut h, 2, 20, ino2, X, true);
+        let (g2b, _) = granted(&lock_replies(&out)[0].2);
+        let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
+        let wait = ask_wait(&h);
+        let held = park(&mut h, 3, 21, ino2);
+        h.advance(250);
+        h.step(Event::Timer { id: held });
+        h.now = t0.plus(12_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        h.advance(wait);
+        let (_, tick) = tick_waiters(&mut h, tick);
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 1);
+        assert_eq!(h.core.lock_unreachable(), 0, "one is not two");
+        h.advance(100);
+        let out = release_of(&mut h, 2, ino2, g2b);
+        assert_eq!(asked(&out), vec![3], "asked again: {out:?}");
+        assert_eq!(h.core.stats.lock_asked_again, 2);
+        h.advance(wait);
+        tick_waiters(&mut h, tick.expect("armed"));
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 2);
+        assert_eq!(h.core.lock_unreachable(), 1);
+        assert_eq!(h.core.stats.lock_peers_unreachable, 1);
+    }
+
+    /// A request of the node that arrives after its turn was passed over
+    /// (a slow step, a late answer) proves it alive all the same: what the
+    /// unanswered ask counted against it is forgotten, so a second one on
+    /// another file does not take it for unreachable.
+    #[test]
+    fn a_request_after_the_pass_over_is_heard() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let ino2 = second_file(&mut h);
+        let out = request(&mut h, 2, 20, ino2, X, true);
+        let (g2b, _) = granted(&lock_replies(&out)[0].2);
+        let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
+        let wait = ask_wait(&h);
+        let held = park(&mut h, 3, 21, ino2);
+        h.advance(250);
+        h.step(Event::Timer { id: held });
+        h.now = t0.plus(12_000);
+        release_of(&mut h, 2, ino, g2);
+        h.advance(wait);
+        let (_, tick) = tick_waiters(&mut h, tick);
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 1);
+        // Its request comes after the pass-over (and is granted: free).
+        h.advance(100);
+        let out = request(&mut h, 3, 22, ino, X, true);
+        let [(3, OpId(22), LockOutcome::Granted { .. })] = lock_replies(&out).as_slice() else {
+            panic!("{out:?}")
+        };
+        // The second ask, on the other file, goes unanswered too.
+        h.advance(100);
+        let out = release_of(&mut h, 2, ino2, g2b);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        h.advance(wait);
+        tick_waiters(&mut h, tick.expect("armed"));
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 2);
+        assert_eq!(h.core.lock_unreachable(), 0, "heard in between");
+    }
+
+    /// The queue waits behind an asked waiter's turn, even for a request
+    /// that would not conflict with it: a shared waiter behind a shared one
+    /// that was asked is not served until the asked one has had its turn (or
+    /// lost it), as nobody is served behind a waiter the lock cannot be
+    /// granted to yet.
+    #[test]
+    fn the_queue_waits_behind_an_asked_waiters_turn() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        h.advance(10);
+        let out = request(&mut h, 3, 8, ino, S, true);
+        let (held3, tick) = (
+            timer_of(&out, TimerKind::LockHeldReply),
+            timer_of(&out, TimerKind::LockWaiterTick),
+        );
+        h.advance(10);
+        let held4 = park_as(&mut h, 4, 9, ino, S);
+        h.advance(250);
+        h.step(Event::Timer { id: held3 });
+        h.step(Event::Timer { id: held4 });
+        h.now = t0.plus(12_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert_eq!(
+            asked(&out),
+            vec![3],
+            "only the first in line is asked: {out:?}"
+        );
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        // Node 4 re-sends meanwhile: it is not served ahead of node 3.
+        h.advance(100);
+        let out = request(&mut h, 4, 10, ino, S, true);
+        assert!(grants_to(&out).is_empty(), "behind node 3's turn: {out:?}");
+        let wait = ask_wait(&h);
+        h.now = t0.plus(12_000 + wait - 1);
+        let (out, _) = tick_waiters(&mut h, tick);
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        // Node 3's request: both are served in the pass.
+        h.advance(1);
+        let out = request(&mut h, 3, 11, ino, S, true);
+        let mut gs: Vec<(NodeId, OpId)> = lock_replies(&out)
+            .into_iter()
+            .filter(|(_, _, o)| matches!(o, LockOutcome::Granted { .. }))
+            .map(|(to, req, _)| (to, req))
+            .collect();
+        gs.sort();
+        assert_eq!(gs, vec![(3, OpId(11)), (4, OpId(10))], "{out:?}");
+    }
+
+    /// An asked node that sends its request inside the hold is heard: what
+    /// its earlier unanswered ask counted against it is forgotten, so a
+    /// later unanswered one does not take it for unreachable. (On another
+    /// inode, so that no release of the node's resets the count by itself.)
+    #[test]
+    fn a_waiter_asked_again_answers_and_is_heard() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let ino2 = {
+            let op = h.create("g");
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            ino
+        };
+        // Node 2 holds the other file too; node 3 waits for it from t0 + 260.
+        let out = request(&mut h, 2, 20, ino2, X, true);
+        let (g2b, _) = granted(&lock_replies(&out)[0].2);
+        let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
+        let wait = ask_wait(&h);
+        let held = park(&mut h, 3, 21, ino2);
+        h.advance(250);
+        h.step(Event::Timer { id: held });
+        // The first ask goes unanswered: counted against node 3.
+        h.now = t0.plus(12_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        h.advance(wait);
+        let (_, tick) = tick_waiters(&mut h, tick);
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 1);
+        // The second is answered inside the hold: granted over the request.
+        h.advance(100);
+        let out = release_of(&mut h, 2, ino2, g2b);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        h.advance(100);
+        let out = request(&mut h, 3, 22, ino2, X, true);
+        assert!(
+            matches!(
+                lock_replies(&out).as_slice(),
+                [(3, OpId(22), LockOutcome::Granted { .. })]
+            ),
+            "{out:?}"
+        );
+        // The third, on the first file again, is not answered either: with
+        // the second one heard it is the first in a row, not the second.
+        h.advance(100);
+        let out = request(&mut h, 4, 30, ino, X, true);
+        let (g4, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(100);
+        let out = request(&mut h, 3, 23, ino, X, true);
+        let held3 = timer_of(&out, TimerKind::LockHeldReply);
+        let recv3 = h.now;
+        h.advance(250);
+        h.step(Event::Timer { id: held3 });
+        h.now = recv3.plus(12_000);
+        let out = release_of(&mut h, 4, ino, g4);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        assert_eq!(h.core.stats.lock_asked_again, 3);
+        h.advance(wait);
+        tick_waiters(&mut h, tick.expect("armed"));
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 2);
+        assert_eq!(h.core.lock_unreachable(), 0, "heard in between");
+    }
+
+    /// The no-regression pin: a waiter whose request is recent enough is
+    /// pushed its grant as before, with no ask; a stale one whose lock is
+    /// still held by another node is recalled for and not asked.
+    #[test]
+    fn a_fresh_waiters_grant_is_still_pushed_and_a_blocked_one_is_not_asked() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
+        // A stale waiter, the lock still held: nothing is pushed to it.
+        h.now = t0.plus(12_000);
+        let (out, _) = tick_waiters(&mut h, tick);
+        assert!(pushes(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.lock_asked_again, 0);
+        // A fresh one (re-sent 5 s before the release) is pushed the grant.
+        let out = request(&mut h, 3, 9, ino, X, true);
+        let held = timer_of(&out, TimerKind::LockHeldReply);
+        h.advance(250);
+        h.step(Event::Timer { id: held });
+        h.advance(4_750);
+        let out = release_of(&mut h, 2, ino, g2);
+        let ps = pushes(&out);
+        let [(3, _, LockOutcome::Granted { ttl_ms: 20_000, .. })] = ps.as_slice() else {
+            panic!("node 3 is pushed its grant: {out:?}")
+        };
+        assert_eq!(h.core.stats.lock_asked_again, 0);
+        assert_eq!(h.core.stats.lock_reserved_waits, 0);
+    }
+
+    /// The same at a delegate (a generation other than 0): its grants are
+    /// capped by what is left of its delegation (3 s here), so a waiter whose
+    /// request is 1.5 s old is asked, and granted over its next request.
+    #[test]
+    fn a_delegates_capped_grant_asks_a_stale_waiter_and_grants_over_its_re_send() {
+        let (mut h, f) = lock_delegate(20_000);
+        delegation_left(&mut h, 4_000);
+        let out = request(&mut h, 2, 7, f, X, true);
+        let (g2, ttl2) = granted(&lock_replies(&out)[0].2);
+        assert_eq!(ttl2, 3_000, "capped by the delegation");
+        let t0 = h.now;
+        h.advance(10);
+        let held = park(&mut h, 4, 8, f);
+        h.advance(250);
+        h.step(Event::Timer { id: held });
+        // Released 1.6 s later, the delegation renewed meanwhile (3 s of
+        // grant again): a push from node 4's request, 1.59 s old, would
+        // reach it with less than its first renewal's 1 s.
+        h.now = t0.plus(1_600);
+        delegation_left(&mut h, 4_000);
+        let out = release_of(&mut h, 2, f, g2);
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        assert_eq!(asked(&out), vec![4], "{out:?}");
+        h.advance(20);
+        delegation_left(&mut h, 4_000);
+        let out = request(&mut h, 4, 9, f, X, true);
+        let rs = lock_replies(&out);
+        let [(4, OpId(9), o)] = rs.as_slice() else {
+            panic!("node 4 is granted over its request: {out:?}")
+        };
+        let (g4, ttl) = granted(o);
+        assert_eq!(ttl, 3_000);
+        assert_eq!(
+            h.meta.locks().get(g4).unwrap().until_ms,
+            h.now.0 + 3_000 + 1_000
+        );
+        assert_eq!(h.core.stats.lock_asked_again, 1);
+    }
+
+    /// The owner's own op (a local waiter; its requests are granted on
+    /// arrival when the lock is free) does not take the turn of a waiter
+    /// that was asked to ask again: it parks, and is served after it.
+    #[test]
+    fn a_local_op_does_not_overtake_an_asked_waiter() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        let (t0, g2, _) = node_3_parked_behind_node_2(&mut h, ino);
+        h.now = t0.plus(5_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        h.advance(10);
+        let out = h.step(Event::Control {
+            op: OpId(60),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(60), .. })),
+            "not granted during node 3's turn: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_reserved_waits, 1);
+        assert_eq!(h.core.lock_view().waiters, 2, "node 3, and the local op");
+        // Node 3's request: it is granted; the local op waits for its release.
+        h.advance(20);
+        let out = request(&mut h, 3, 10, ino, X, true);
+        let rs = lock_replies(&out);
+        let [(3, OpId(10), LockOutcome::Granted { id: g3, .. })] = rs.as_slice() else {
+            panic!("node 3 is granted over its request: {out:?}")
+        };
+        let g3 = *g3;
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(60), .. })),
+            "{out:?}"
+        );
+        h.advance(20);
+        let out = release_of(&mut h, 3, ino, g3);
+        assert!(
+            matches!(lock_answer(&out, 60), LockAnswer::Granted { .. }),
+            "served after it: {out:?}"
+        );
+    }
+
+    /// Two ops of a node waiting on one inode in two modes, the shared one's
+    /// request not re-sent for 18.8 s (lost): served in one pass, the
+    /// exclusive op (fresh) is pushed its grant and the shared one, whose
+    /// request is too old for a push, is asked to send it again. (The
+    /// in-place re-affirmation from an old request that
+    /// `a_grant_reaffirmed_in_place_from_an_older_request_keeps_the_later_window`
+    /// covers is a request that is still fresh.)
+    #[test]
+    fn a_second_waiter_of_a_node_whose_re_send_was_lost_is_asked_not_pushed() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 3, 7, ino, X, true);
+        let (g3, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        let first = park(&mut h, 2, 8, ino);
+        h.advance(10);
+        let out = request(&mut h, 2, 9, ino, S, true);
+        let second = timer_of(&out, TimerKind::LockHeldReply);
+        h.advance(250);
+        h.step(Event::Timer { id: first });
+        h.step(Event::Timer { id: second });
+        for at in [9_500, 18_800] {
+            h.now = t0.plus(at);
+            let held = park(&mut h, 2, 10 + at, ino);
+            h.advance(250);
+            h.step(Event::Timer { id: held });
+        }
+        h.now = t0.plus(18_900);
+        let out = release_of(&mut h, 3, ino, g3);
+        // (The grant's push waits for the horizon it needs to be durable,
+        // the ask does not: it grants nothing.)
+        let ps = pushes(&out);
+        assert_eq!(ps.len(), 2, "{out:?}");
+        assert!(
+            ps.iter().any(|(to, _, o)| *to == 2
+                && matches!(
+                    o,
+                    LockOutcome::Granted {
+                        mode: X,
+                        ttl_ms: 20_000,
+                        ..
+                    }
+                )),
+            "the fresh op is pushed its grant: {out:?}"
+        );
+        assert_eq!(asked(&out), vec![2], "the stale one is asked: {out:?}");
+        assert_eq!(h.core.stats.lock_asked_again, 1);
+    }
+
+    /// A request carries how long its application has waited (a duration:
+    /// the clocks of nodes are never compared): the owner queues it from
+    /// when that wait began, so a client that lost a round (to a recall, or
+    /// to another client of its node) keeps its place instead of joining the
+    /// queue again at the back.
+    #[test]
+    fn a_request_that_has_waited_queues_from_when_its_wait_began() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        h.advance(10);
+        let held3 = park(&mut h, 3, 8, ino);
+        // Node 4 asks later, for the second time of one call: it began
+        // waiting 5 s before.
+        h.advance(90);
+        let out = request_waited(&mut h, 4, 9, ino, X, 5_000);
+        let held4 = timer_of(&out, TimerKind::LockHeldReply);
+        h.advance(250);
+        h.step(Event::Timer { id: held3 });
+        h.step(Event::Timer { id: held4 });
+        h.now = t0.plus(1_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        let gs = grants_to(&out);
+        let [(4, _)] = gs.as_slice() else {
+            panic!("node 4 is served first, node 3 not: {out:?}")
+        };
+    }
+
+    /// The same for the owner's own op (`Control::Lock::waited_ms`).
+    #[test]
+    fn a_local_op_that_has_waited_queues_from_when_its_wait_began() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        h.advance(10);
+        let held3 = park(&mut h, 3, 8, ino);
+        h.advance(90);
+        let out = h.step(Event::Control {
+            op: OpId(60),
+            req: Control::Lock {
+                ino,
+                mode: X,
+                blocking: true,
+                waited_ms: 5_000,
+            },
+        });
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(60), .. })),
+            "parked behind node 2: {out:?}"
+        );
+        h.advance(250);
+        h.step(Event::Timer { id: held3 });
+        h.now = t0.plus(1_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert!(
+            matches!(lock_answer(&out, 60), LockAnswer::Granted { .. }),
+            "the local op is first: {out:?}"
+        );
+        assert!(grants_to(&out).is_empty(), "node 3 waits: {out:?}");
+    }
+
+    /// A grant installed for one op of a node answers every other op of the
+    /// node on the inode that it covers, at once, instead of leaving each
+    /// to its own request or its re-send (9.5 s at the production lock ttl):
+    /// the request one of them has in flight is moved to `done_reqs` (its
+    /// reply installs over the held id), and the waiters they left at the
+    /// owner are cancelled.
+    #[test]
+    fn a_grant_answers_the_ops_of_its_node_that_it_covers() {
+        let mut r = requester();
+        let req_a = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        // A shared op, its request answered `Waiting` (idle, retry timer),
+        // and an exclusive one with its request in flight.
+        let out = r.step(Event::Control {
+            op: OpId(51),
+            req: Control::Lock {
+                ino: 42,
+                mode: S,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        let req_s = match sends(&out).as_slice() {
+            [(1, PeerMsg::LockRequest { req, .. })] => *req,
+            other => panic!("{other:?}"),
+        };
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_s,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 9_500,
+                    grace: false,
+                },
+            },
+        });
+        let req_x = lock_control(&mut r, 52, 42, true);
+        // Another inode's op is not covered.
+        let req_other = lock_control(&mut r, 53, 43, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_a,
+                outcome: grant_msg(1),
+            },
+        });
+        for op in [50, 51, 52] {
+            assert!(
+                matches!(lock_answer(&out, op), LockAnswer::Granted { .. }),
+                "op {op}: {out:?}"
+            );
+        }
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(53), .. })),
+            "another inode: {out:?}"
+        );
+        assert_eq!(r.core.stats.lock_covered_woken, 2);
+        let cancels: Vec<_> = sends(&out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::LockCancel {
+                    ino,
+                    exclusive,
+                    shared,
+                    ..
+                } => Some((to, *ino, *exclusive, *shared)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancels,
+            vec![(1, 42, true, true)],
+            "the waiters the woken ops left at the owner: {out:?}"
+        );
+        // The exclusive op's request had been answered meanwhile: its reply,
+        // the owner's re-affirmation under a newer id, installs over the
+        // held id instead of being dropped.
+        r.advance(10);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_x,
+                outcome: grant_msg(2),
+            },
+        });
+        assert_eq!(r.core.stats.lock_late_replies_installed, 1);
+        let _ = req_other;
+    }
+
+    /// A grant that arrives recalled admits one local lock (its first use)
+    /// and nothing more: the other ops are not answered with a grant they
+    /// cannot use, but they ask again at once (their retry is 9.5 s away,
+    /// and the waiter the owner kept for them was the one this grant
+    /// served), from where their wait began.
+    #[test]
+    fn a_grant_that_arrives_recalled_answers_only_its_op() {
+        let mut r = requester();
+        let req_a = lock_control(&mut r, 50, 42, true);
+        let req_b = lock_control(&mut r, 51, 42, true);
+        // The second op's request was answered `Waiting` meanwhile: idle.
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_b,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 9_500,
+                    grace: false,
+                },
+            },
+        });
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 1 },
+            },
+        });
+        r.advance(30);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_a,
+                outcome: grant_msg(1),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(51), .. })),
+            "{out:?}"
+        );
+        assert_eq!(r.core.stats.lock_covered_woken, 0);
+        // It asks again now (the grant is recalled: after the release, in
+        // 10 ms polls), not at its 9.5 s retry.
+        let retry = timers(&out, TimerKind::LockRetry);
+        assert_eq!(retry.len(), 1, "{out:?}");
+        assert_eq!(r.core.timer_at(retry[0]), Some(r.now.plus(10)));
+    }
+
+    /// A shared grant does not answer an exclusive op of its node: it does
+    /// not cover it. (The exclusive op's request stays in flight; the
+    /// shared op is woken only by its own reply.)
+    #[test]
+    fn a_shared_grant_does_not_answer_an_exclusive_op() {
+        let mut r = requester();
+        let out = r.step(Event::Control {
+            op: OpId(50),
+            req: Control::Lock {
+                ino: 42,
+                mode: S,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        let req_s = match sends(&out).as_slice() {
+            [(1, PeerMsg::LockRequest { req, .. })] => *req,
+            other => panic!("{other:?}"),
+        };
+        // Exclusive: the op's request is answered `Waiting` (idle).
+        let out = r.step(Event::Control {
+            op: OpId(51),
+            req: Control::Lock {
+                ino: 42,
+                mode: X,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        let req_x = match sends(&out).as_slice() {
+            [(1, PeerMsg::LockRequest { req, .. })] => *req,
+            other => panic!("{other:?}"),
+        };
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_x,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 9_500,
+                    grace: false,
+                },
+            },
+        });
+        r.advance(10);
+        let LockOutcome::Granted {
+            id,
+            ttl_ms,
+            position,
+            ..
+        } = grant_msg(1)
+        else {
+            unreachable!()
+        };
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: req_s,
+                outcome: LockOutcome::Granted {
+                    id,
+                    mode: S,
+                    ttl_ms,
+                    position,
+                },
+            },
+        });
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(51), .. })),
+            "a shared grant does not cover the exclusive op: {out:?}"
+        );
+        assert_eq!(r.core.stats.lock_covered_woken, 0);
+    }
+
+    /// A cancel decided before a request was sent does not drop it, however
+    /// the two cross on the way: the request of the node's later call (its
+    /// `sent` is at or after `upto`) is kept.
+    #[test]
+    fn a_request_sent_after_a_cancel_was_decided_is_kept() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (_g2, _) = granted(&lock_replies(&out)[0].2);
+        h.advance(10);
+        let held3 = park(&mut h, 3, 8, ino);
+        // Node 3 decides at `decided` that nothing waits for the file, and
+        // then (a new call) sends a request: it reaches the owner before
+        // the cancel does.
+        h.advance(100);
+        let decided = h.now;
+        h.advance(40);
+        request_waited(&mut h, 3, 9, ino, X, 0);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockCancel {
+                ino,
+                exclusive: true,
+                shared: false,
+                upto: decided,
+            },
+        });
+        assert_eq!(h.core.lock_view().waiters, 1, "the later request stays");
+        assert_eq!(h.core.stats.lock_cancelled, 0);
+        let _ = held3;
+    }
+
+    /// `waited_ms` moves a request back by at most `4 × lock_ttl`: a peer
+    /// claiming a wait of days queues with one that waited the cap, in
+    /// arrival order, not ahead of it.
+    #[test]
+    fn a_claimed_wait_is_capped_at_four_lock_ttls() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        h.advance(10);
+        // Node 3 waited exactly the cap and arrives first; node 4 claims
+        // a million seconds, in the same millisecond.
+        let out = request_waited(&mut h, 3, 8, ino, X, 80_000);
+        let held3 = timer_of(&out, TimerKind::LockHeldReply);
+        let out = request_waited(&mut h, 4, 9, ino, X, 1_000_000_000);
+        let held4 = timer_of(&out, TimerKind::LockHeldReply);
+        h.advance(250);
+        h.step(Event::Timer { id: held3 });
+        h.step(Event::Timer { id: held4 });
+        h.now = t0.plus(1_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        let gs = grants_to(&out);
+        let [(3, _)] = gs.as_slice() else {
+            panic!("node 3 (first at the cap) is served first: {out:?}")
+        };
+    }
+
+    /// An ask for an inode no op of the node waits for finds a ghost
+    /// waiter (an op another op's grant covered, or that left): the node
+    /// says so (`LockCancel`) instead of leaving the owner to hold its queue
+    /// for a turn nobody takes.
+    #[test]
+    fn an_ask_nothing_waits_for_cancels_the_waiter() {
+        let mut r = requester();
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockGranted {
+                ino: 42,
+                sent: r.now,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 0,
+                    grace: false,
+                },
+            },
+        });
+        assert!(
+            matches!(
+                sends(&out).as_slice(),
+                [(
+                    1,
+                    PeerMsg::LockCancel {
+                        ino: 42,
+                        exclusive: true,
+                        shared: true,
+                        ..
+                    }
+                )]
+            ),
+            "{out:?}"
+        );
+        assert_eq!(r.core.stats.lock_cancels_sent, 1);
+        assert_eq!(r.core.stats.lock_asks_answered, 0);
+    }
+
+    /// The owner drops the waiters a node cancels (those it last sent
+    /// before the cancel), serves the ones behind them, and does not count
+    /// an unused turn.
+    #[test]
+    fn a_cancel_drops_the_nodes_waiters_and_serves_those_behind() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (g2, _) = granted(&lock_replies(&out)[0].2);
+        let t0 = h.now;
+        h.advance(10);
+        let held3 = park(&mut h, 3, 8, ino);
+        h.advance(10);
+        let held4 = park(&mut h, 4, 9, ino);
+        h.advance(250);
+        h.step(Event::Timer { id: held3 });
+        h.step(Event::Timer { id: held4 });
+        // Node 3's cancel: its waiter goes (a cancel older than the
+        // waiter's last request would not).
+        h.advance(100);
+        let old = Ms(t0.0 + 10);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockCancel {
+                ino,
+                exclusive: true,
+                shared: false,
+                upto: old,
+            },
+        });
+        assert_eq!(
+            h.core.lock_view().waiters,
+            2,
+            "sent after the cancel was decided"
+        );
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockCancel {
+                ino,
+                exclusive: true,
+                shared: false,
+                upto: h.now,
+            },
+        });
+        assert_eq!(h.core.lock_view().waiters, 1);
+        assert_eq!(h.core.stats.lock_cancelled, 1);
+        h.now = t0.plus(2_000);
+        // Node 4 re-sends, a request in hand for the turn.
+        request_waited(&mut h, 4, 10, ino, X, 0);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert!(
+            asked(&out).is_empty(),
+            "no ask for a waiter that left: {out:?}"
+        );
+        assert!(
+            matches!(grants_to(&out).as_slice(), [(4, _)]),
+            "node 4 is next: {out:?}"
+        );
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 0);
+    }
+
+    /// An asked waiter's hold grows with the round trip the core measures to
+    /// its node (four of them, at most three times the base): a node across
+    /// a WAN is not passed over before its request could have come.
+    #[test]
+    fn an_asked_waiters_hold_grows_with_its_round_trip() {
+        let (mut h, ino) = holder_with_file();
+        h.core.cfg.lock_ttl_ms = 20_000;
+        uncap(&mut h);
+        h.step(Event::Peers {
+            links: vec![crate::event::PeerLink {
+                node: 3,
+                connected: true,
+                last_seen: None,
+                rtt_ms: Some(150),
+                since: None,
+            }],
+        });
+        let (t0, g2, tick) = node_3_parked_behind_node_2(&mut h, ino);
+        let base = ask_wait(&h);
+        h.now = t0.plus(12_000);
+        let out = release_of(&mut h, 2, ino, g2);
+        assert_eq!(asked(&out), vec![3], "{out:?}");
+        // Past the base hold, inside four round trips more: still held,
+        // and a conflicting request still parks.
+        h.advance(base + 100);
+        let (_, tick) = tick_waiters(&mut h, tick);
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 0);
+        let out = request(&mut h, 4, 9, ino, X, true);
+        assert!(grants_to(&out).is_empty(), "{out:?}");
+        assert_eq!(h.core.stats.lock_reserved_waits, 1);
+        h.advance(4 * 150);
+        tick_waiters(&mut h, tick.expect("armed"));
+        assert_eq!(h.core.stats.lock_ask_again_passed_over, 1);
     }
 
     /// A renewal extends a known grant (and reports its recalled flag);
@@ -16012,6 +17154,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert_eq!(lock_answer(&out, 5), LockAnswer::Wait { retry_ms: 1_000 });
@@ -16095,6 +17238,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking,
+                waited_ms: 0,
             },
         });
         match sends(&out).as_slice() {
@@ -16114,6 +17258,90 @@ mod locks {
                 streams: Default::default(),
             },
         }
+    }
+
+    /// The owner's ask to ask again (a pushed `Waiting`): the node sends
+    /// its request at once, for every op of it waiting on the inode with no
+    /// request in flight; one that has a request in flight is left alone, and
+    /// that request's reply installs its grant. (A generic push moved the
+    /// request in flight to `done_reqs`: the grant it brought was dropped as
+    /// the reply to a request nothing waited for, and outwaited.)
+    #[test]
+    fn an_ask_re_sends_idle_requests_and_leaves_one_in_flight() {
+        let mut r = requester();
+        let req = lock_control(&mut r, 50, 42, true);
+        r.advance(10);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::Waiting {
+                    retry_ms: 9_500,
+                    grace: false,
+                },
+            },
+        });
+        assert!(
+            sends(&out).is_empty(),
+            "nothing sent before its retry: {out:?}"
+        );
+        let ask = |r: &mut Harness| {
+            r.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockGranted {
+                    ino: 42,
+                    sent: r.now,
+                    outcome: LockOutcome::Waiting {
+                        retry_ms: 0,
+                        grace: false,
+                    },
+                },
+            })
+        };
+        // Asked, long before its retry: the request goes now.
+        r.advance(5_000);
+        let out = ask(&mut r);
+        let reqs: Vec<OpId> = sends(&out)
+            .into_iter()
+            .filter_map(|(to, m)| match m {
+                PeerMsg::LockRequest {
+                    req,
+                    ino: 42,
+                    mode: X,
+                    blocking: true,
+                    ..
+                } if to == 1 => Some(*req),
+                _ => None,
+            })
+            .collect();
+        let [req2] = reqs.as_slice() else {
+            panic!("one request to the owner at once: {out:?}")
+        };
+        assert_eq!(r.core.stats.lock_asks_answered, 1);
+        // Asked again with that request in flight: nothing more is sent.
+        r.advance(5);
+        let out = ask(&mut r);
+        assert!(
+            !sends(&out)
+                .iter()
+                .any(|(_, m)| matches!(m, PeerMsg::LockRequest { .. })),
+            "the request in flight answers it: {out:?}"
+        );
+        assert_eq!(r.core.stats.lock_asks_answered, 1);
+        // Its reply installs the grant and answers the op.
+        r.advance(5);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: *req2,
+                outcome: grant_msg(7),
+            },
+        });
+        assert!(
+            matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }),
+            "{out:?}"
+        );
+        assert!(r.meta.locks().held(42).is_some());
     }
 
     /// A delegate's short grant (2 s: honoured for 1 s): the renewal tick
@@ -16374,6 +17602,7 @@ mod locks {
                 ino: f,
                 mode: X,
                 blocking: true,
+                waited_ms: 0,
             },
         });
         let [(3, PeerMsg::LockRequest { req, .. })] = sends(&out).as_slice() else {
@@ -17507,6 +18736,7 @@ mod locks {
                 ino: 42,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert_eq!(lock_answer(&out, 60), LockAnswer::Unavailable);
@@ -17615,6 +18845,7 @@ mod locks {
                     ino,
                     mode: X,
                     blocking: false,
+                    waited_ms: 0,
                 },
             })
         };
@@ -17810,6 +19041,7 @@ mod locks {
                 ino: 42,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         // Every request to node 1 goes unanswered.
@@ -18021,6 +19253,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
@@ -18226,6 +19459,7 @@ mod locks {
                 ino: fresh,
                 mode: X,
                 blocking: true,
+                waited_ms: 0,
             },
         });
         epoch_pump(&mut h, &[1, 2], &mut other, out);
@@ -18615,6 +19849,7 @@ mod locks {
                 ino: peer_ino,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert_eq!(lock_answer(&out, 10), LockAnswer::WouldBlock);
@@ -18625,6 +19860,7 @@ mod locks {
                 ino: fresh,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert!(
@@ -18661,6 +19897,7 @@ mod locks {
                 ino: fresh,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         let mut faults = PumpFaults {
@@ -18678,6 +19915,47 @@ mod locks {
         );
         assert_eq!(h.core.stats.lock_unavailable, 0);
         assert_eq!(h.meta.locks().grants_len(), 3, "the kept grants stand");
+    }
+
+    /// The deadline for waiting out an owner that is resuming (the bound an
+    /// op without its sequencer has: `s3_less_deadline_ms`) counts from when
+    /// the op reached the core, not from where its application's wait began
+    /// (`waited_ms`, which only places it in the owner's queue): a call that
+    /// has waited longer than the bound already still waits for the re-claim
+    /// without spending attempts.
+    #[test]
+    fn a_resuming_owners_own_op_that_has_waited_long_still_waits_for_it() {
+        let (mut h, _ino, _peer_ino, _peer_grant, _object) = holder_with_grants_in_an_epoch();
+        h.step(epoch_report(
+            false,
+            false,
+            false,
+            &[1, 2],
+            h.core.pr.carried,
+        ));
+        let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let waited_ms = h.core.cfg.s3_less_deadline_ms + 40_000;
+        let out = h.step(Event::Control {
+            op: OpId(70),
+            req: Control::Lock {
+                ino: fresh,
+                mode: X,
+                blocking: true,
+                waited_ms,
+            },
+        });
+        assert_eq!(
+            timers(&out, TimerKind::LockRetry).len(),
+            1,
+            "waits for the re-claim with a retry timer: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::ControlDone { op: OpId(70), .. })),
+            "{out:?}"
+        );
+        // Its grant-time statistics count from when it reached the core.
+        assert_eq!(h.core.stats.lock_grant_ms_total, 0);
     }
 
     /// A peer's request to the node in its re-claim window: a conflict
@@ -18897,6 +20175,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));
@@ -18970,6 +20249,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking,
+                waited_ms: 0,
             },
         })
     }
@@ -19749,6 +21029,7 @@ mod locks {
                 ino: fresh,
                 mode: X,
                 blocking: true,
+                waited_ms: 0,
             },
         });
         epoch_pump(h, members, object, out);
@@ -19827,6 +21108,7 @@ mod locks {
                 ino: fresh,
                 mode: X,
                 blocking: true,
+                waited_ms: 0,
             },
         });
         epoch_pump(&mut h, &[1, 2], &mut other, out);
@@ -20509,6 +21791,7 @@ mod locks {
                 ino,
                 mode: X,
                 blocking: false,
+                waited_ms: 0,
             },
         });
         assert!(matches!(lock_answer(&out, 5), LockAnswer::Granted { .. }));

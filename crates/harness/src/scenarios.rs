@@ -1372,6 +1372,13 @@ pub const SCENARIOS: &[Scenario] = &[
         run: m14::s3_cut_holder_failover_with_locks,
     },
     Scenario {
+        name: "lock-contention-delegated",
+        desc: "plan 43 ask-again: three nodes at the default lock TTL and a 5 s delegation TTL (the core's default; the daemon's is the lock TTL: CONSTELLATION_HARNESS_DELEGATION_TTL_MS=default runs it there) contend for one flock'ed counter in a directory delegated to b, whose grants a 2-3 s delegation caps; each round one node holds the lock 4 s while the other two wait, then every node increments: the count exact, the median handoff gap within 30 ms and the longest within 2.5 s (seconds, and outwaited grants, before), no grant outwaited without a host stall to explain it, b asked a stale waiter to ask again (short delegation); prints each handoff gap, the waits and the owner's asked_again, ask_again_passed_over, reserved_waits, recalls_expired",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: m14::lock_contention_delegated,
+    },
+    Scenario {
         name: "lock-grace-wait",
         desc: "plan 43 F-b: three nodes, the holder killed with a lock held; in the successor's lock grace a non-blocking F_SETLK on a free file waits and is granted at its end (never EAGAIN), one with a SIGALRM at 8 s ends EINTR, a blocking F_SETLKW parked at the successor is served by the grace-end timer, and the held lock is refused EAGAIN at once afterwards; grace_waits counted, grace_wait_gave_up 0",
         requires: &[],

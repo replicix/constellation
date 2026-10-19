@@ -51747,3 +51747,314 @@ statement; no other behaviour changes.
   release suite (sim 161) pass; the 38 `locks-*` and takeover configs at 2000
   seeds, `locks-long-grants` and `-seal` 3000, `double-seal-inside-the-grace`
   8000, `locks-blips-tight-faults` 0..2000 and 5000..6000: 0 failing.
+
+## Fix: a pushed lock grant is never older than its holder's first renewal (plan 43 note, "ask again")
+
+A remote waiter re-sends its blocking request every `(lock_ttl − margin) / 2`
+(9.5 s at the production lock TTL). The grant pushed to it counts from that
+request's send, and the holder honours it for `sent + ttl − margin` only. A
+delegate caps its grants at what is left of its delegation (about 2 to 3 s
+under a delegation of 5 s, the core's default and the sim's), so a push served
+more than about 1 to 1.75 s after the waiter's last send arrived lapsed (the
+holder drops one with less than `margin / 4` left and asks again). The owner's
+record of it, counted from the same old request, was expired when it was made
+(the next waiter of the pass was granted over it: an overtake, and an outwait
+barrier), or the waiter behind recalled the unused grant, the holder's retry
+parked behind the recall and the owner outwaited it. These cycles repeated
+until a push landed within about 1.5 s of a re-send. 11ff444 fixed a safety
+bug on this path and measured this one (12 failing seeds before it, 15
+after); it did not cause it.
+
+The first version of the rule (an ask, below) fixed the stale push and was
+reviewed (`F2`, `F4`, `F5`, `F6`, 4(a), 4(c), 4(d)): it left two things that
+the sims showed, and this entry is the reworked patch, on top of the meta fix
+63da672 (a recall that adopts a newer grant id raises the newest id: stage 1).
+(1) A client that lost a round to a recall, or to another client of its node,
+joined the owner's queue again at the back: among the owner node's own
+clients, which take a node's grant in one pass and race for it, the same few
+lost every round for a minute (`locks-long-grants`; with the ask alone the
+owner node's waits over 45 s were two to three times as frequent as on
+63da672: the held turn adds a round each time). (2) One push answered
+one op of the node; a second op waiting for the same file, covered by that
+grant, waited for its own re-send (9.5 s at the root in `locks-production-ttl`).
+
+### What changed
+
+- **The rule** (`lock_try_grant`): a grant that would be pushed (a remote
+  waiter with no RPC held) is made only from a request no older than
+  `(ttl − margin) / 2` of the granted, capped ttl (the holder's renew point).
+  Everywhere, the root included. Otherwise `Blocked::AskAgain`, returned
+  before anything is minted or replaced.
+- **The ask** (`lock_serve_waiters`): the existing `LockGranted` push carrying
+  `LockOutcome::Waiting { retry_ms: 0 }` (no wire change for it; a pushed
+  `Waiting` was never sent before), sent directly (it grants and extends
+  nothing), counted `lock_asked_again`. `Waiter::ask` holds the waiter's turn
+  for two request cycles plus four round trips of its node as the core
+  measures them, at most three times the base (`lock_ask_again_wait_ms`: 600
+  ms at the defaults on a fast link; F4): the queue waits behind it, and
+  `lock_reserved_against` makes every request that conflicts with it from
+  another node (the owner's own local ops included) park, or a non-blocking
+  one `EAGAIN` (the lock is promised and in flight), counted
+  `lock_reserved_waits`. A waiter that does not ask again within the hold is
+  passed over until its next request (`lock_ask_again_passed_over`), keeps its
+  place when the request comes, and counts as an unused turn: two in a row
+  mark its node unreachable (the existing mechanism). Any request that
+  arrives after an ask, in the hold or after the pass-over, is heard
+  (`lock_peer_heard`: F4; the re-send that crosses the pass-over used to
+  count against the node).
+- **The wait is in the request** (F2, 4(c)): `Control::Lock` and
+  `PeerMsg::LockRequest` carry `waited_ms`, how long the application's call
+  has waited (a duration; clocks of nodes are never compared; the engine's
+  lock call and the sim's client send it with every round). The owner
+  queues the request from `now − waited_ms` (`lock_waited_since`, at most
+  `4 × lock_ttl` back; a trusted peer that claimed more could jump 80 s at
+  the production TTL, the same bound as the `served` positions), its own ops
+  likewise: the owner's local lottery is first come first served by the
+  application's wait, not by the round. The back-dated time is the queue's
+  alone: `LockOp::created` keeps when the op reached the core, for the
+  S3-less deadline of `lock_op_while_resuming` and the grant-time statistics
+  (round 2 of the review, L1). The engine's back-off restarts only after a
+  round that got its grant and lost the local race to another client of the
+  node (L2): a `Granted` that `local_set` still answers `NeedGrant` to keeps
+  it, or a core granting what the tables refuse would be spun on.
+- **A grant answers the ops it covers** (4(a), `lock_wake_covered`): a grant
+  installed and not recalled answers every other op of the node on the inode
+  that it covers at once, moving an op's request in flight to `done_reqs` as
+  a push does (`lock_covered_woken`). One that arrives recalled admits one
+  local lock; the other idle ops ask again (`lock_resend_idle`: a covered
+  wake would hand them a lock the recall takes back at once; the root's
+  9.8 s waits of seed 46 were the idle ops that waited a re-send).
+- **A waiter nobody waits for is cancelled** (4(d)): `PeerMsg::LockCancel {
+  ino, exclusive, shared, upto }` (appended at the end of the wire; one way)
+  is sent when an ask finds no op of the node for the inode, or when an op
+  leaves without needing the owner; the owner drops the node's parked
+  waiters there that it last had a request of before `upto`
+  (`lock_cancels_sent`, `lock_cancelled`). A request that came after the
+  cancel was decided stays.
+- **The node** (`on_lock_granted_push`): a pushed `Waiting` re-sends the
+  request of every op of this node on the inode with none in flight
+  (`lock_asks_answered`), as its retry timer would; it never touches an op
+  with a request in flight.
+- Status and schema (append-only; the schema blessed): `asked_again`,
+  `ask_again_passed_over`, `reserved_waits`, `asks_answered`, `covered_woken`,
+  `cancels_sent`, `cancelled`.
+- **The daemon's delegation TTL** (the recommendation of the review):
+  `Config::default_delegation_ttl_ms(lock_ttl_ms)` (the lock TTL, at least 5 s)
+  is the single place; `load_config` uses it. The docs and the
+  harness describe configurations as "production lock TTL, short delegation"
+  (the core's own 5 s) or the daemon default, which caps a delegate's grants
+  at 13 to 18 s so that the rule asks less.
+
+Invariants (stated in the code and checked by the tests): mutual exclusion is
+that of the grants made, none of which changes (the ask returns before
+`lock_need_horizon` and `LockTables::grant`); 11ff444's rule, that a node's
+record never ends sooner than the grant it replaces, is untouched; the ask only
+withholds grants; `waited_ms` only orders the queue (a duration the sender
+measured with its own clock, capped; a lie moves a waiter in the queue and
+nothing else); `LockCancel` only removes waiters that nothing waits for (a
+lost one leaves the waiter to be asked in vain, as before).
+
+### Tests
+
+New tests do not compile on 63da672 (new fields and statistics), so the
+fail-before evidence is mutation: each behaviour reverted on its own, the
+tests that then fail (authority lib, debug):
+
+- no freshness rule: ten tests (`a_capped_grant_for_a_stale_waiter_asks_it_to_ask_again`,
+  `a_delegates_capped_grant_asks_a_stale_waiter_and_grants_over_its_re_send`,
+  `a_local_op_does_not_overtake_an_asked_waiter`, `a_request_after_the_pass_over_is_heard`,
+  `a_second_waiter_of_a_node_whose_re_send_was_lost_is_asked_not_pushed`,
+  `a_waiter_asked_again_answers_and_is_heard`, `an_asked_waiters_hold_grows_with_its_round_trip`,
+  `an_unanswered_ask_passes_the_waiter_over_and_its_next_request_keeps_its_place`,
+  `the_queue_waits_behind_an_asked_waiters_turn`, `two_unanswered_asks_in_a_row_mark_the_waiters_node_unreachable`);
+- no reservation: three (the first, `a_local_op_does_not_overtake...` and the hold);
+- `waited_ms` not used: `a_request_that_has_waited_queues_from_when_its_wait_began`,
+  `a_local_op_that_has_waited_queues_from_when_its_wait_began`; the engine not
+  sending it: `every_round_of_a_blocking_lock_call_carries_how_long_it_has_waited`
+  (engine, `view::owner_fence_tests`);
+- no covered wake: `a_grant_answers_the_ops_of_its_node_that_it_covers`; the
+  wake after a recalled grant: `a_grant_that_arrives_recalled_answers_only_its_op`;
+  no `lock_resend_idle`: the same test;
+- no ghost cancel (the ask that finds no op): `an_ask_nothing_waits_for_cancels_the_waiter`;
+  the cancel that drops nothing: `a_cancel_drops_the_nodes_waiters_and_serves_those_behind`;
+- no round-trip scaling of the hold: `an_asked_waiters_hold_grows_with_its_round_trip`;
+- round 2 (each fails with its mutation, all of them pass with the code):
+  the deadline counted from the back-dated time again:
+  `a_resuming_owners_own_op_that_has_waited_long_still_waits_for_it`; a grant
+  covering any mode: `a_shared_grant_does_not_answer_an_exclusive_op`; no cap
+  on `waited_ms`: `a_claimed_wait_is_capped_at_four_lock_ttls`; a cancel that
+  ignores `sent`: `a_request_sent_after_a_cancel_was_decided_is_kept` (and
+  the first cancel test); the engine's back-off reset on every `Granted`:
+  `a_grant_the_local_tables_refuse_keeps_the_back_off` (engine);
+  `lock_peer_heard` only in the hold: `a_request_after_the_pass_over_is_heard`.
+
+Core, from stage 0 (kept, adapted where a push was served from a request older
+than the new window): the ask, the hold, the pass-over, the unreachable count,
+the 11ff444 tests (`a_grant_reaffirmed_in_place_from_an_older_request_keeps_the_later_window`,
+`an_upgrade_served_in_place_keeps_the_window_a_renewal_gave`),
+`an_ask_re_sends_idle_requests_and_leaves_one_in_flight`.  The wire round
+trip test covers the new field and variant.
+
+Sim: configs at the production lock TTL (20 s, margin 1 s, delegation 5 s):
+`locks-delegated-production-ttl` (+`-heavy`), `locks-production-ttl`
+(+`-heavy`), `locks-long-grants` (+`-seal`; nine ops on one file, the owner
+node's clients among them); variants `+nomove` (no rename across subtrees) and
+`+solo` (one lock client per node); the counters of the owner node's longest
+wait apart from the other nodes' (`max_wait_owner_ms`, `max_wait_rest_ms`;
+`SWEEP-LOCKS` prints the seeds over 45 s and 50 s of each), the handoff gap,
+the asks. The CI test `capped_grants_hand_a_lock_over_within_a_round_trip`
+(the +nomove/+solo configs at a gap bound of 6 s; the delegated one with renames
+for liveness; six pinned seeds of the owner-starvation) fails with 63da672's
+`core/locks.rs` at seed 0 of the `+nomove` delegated config (a wait of 11.2 s).
+Pinned control seeds, which the new traffic moved, were found again by
+sweep: `a_credited_arrival_cap_splits` (193262, 197625, 198196: 1 of 2000 in
+193000..195000, 7 of 8000 in 195000..203000 with the credited cap, none with the
+real one) and `locks_writer_hold_delegated_without_the_settle_is_caught` (745,
+1081, 2045, 2369 of 3000). Round 2 hardened both: the credited control also
+requires the violation inside the first failover's floor window (before 6 s
+of simulated time; its three seeds at 3.06 to 3.34 s), the unsettled one
+requires "held write" and "inside" in the message, not any error.
+
+Known gap, not this patch's (round 2, R2-1): the *real* cap of
+`fast-takeover-skewed-successor` violates mutual exclusion at its second
+failover (t about 15 to 16 s, nodes 2 and 3 four seconds ahead: a clock
+offset beyond the envelope, plan 43's C7b class) about once in 15000 seeds on
+63da672 (11087, 18138) and with this patch (5570, 11942, 202261), so "none
+with the real cap" holds for the seeds swept only. Pinned as the `#[ignore]`d
+`fast_takeover_skewed_successor_known_gaps` (5570, 11942, 202261; the two of
+63da672 pass here, the trajectories moved) and added to C7b's evidence in the
+plan.
+
+Harness: `lock-contention-delegated` (k8s parity: local). Rounds of a 4 s
+holder with two waiters, an explicit 5 s delegation TTL (or the daemon default
+with `CONSTELLATION_HARNESS_DELEGATION_TTL_MS=default`), the handoff gaps judged
+against the host's measured lag (`hostlag`): `recalls_expired` is excused only
+by a stall of 250 ms or more of the host; it fails on an ask never answered, on
+the count, on a median or longest gap past the lag bound, and (when it is the
+short delegation) on no ask at all.
+
+### Measurements
+
+Sims are release, 8 to 24 threads, `TMPDIR` on tmpfs; before = 63da672.
+
+Failing seeds (60 s) and the owner node's / the other nodes' longest waits
+over 45 s and 50 s, before → after, of 2000 seeds unless noted:
+
+| config | failing | owner node >45 / >50 s | others >45 / >50 s | wait p50/p90/max (ms) |
+|---|---|---|---|---|
+| `locks-long-grants` 0..3000 | 0 → 0 | 3 / 0 → 0 / 0 | 7 / 0 → 0 / 0 | 23297/31691/48755 → 16903/21966/43461 |
+| `locks-long-grants` 15000..45000 | 1 → 0 | 103 / 28 → 0 / 0 | 42 / 7 → 1 / 0 | 23170/31986/59170 → 16716/21733/45404 |
+| `locks-production-ttl-heavy` 0..12000 | 90 → 0 | 372 / 142 → 0 / 0 | 919 / 333 → 0 / 0 | 33822/45173/59970 → 16980/22375/44723 |
+| `locks-delegated-production-ttl` | 122 → 2 | 259 / 146 → 18 / 2 | 309 / 169 → 28 / 4 | 29825/50288/59961 → 21044/26547/50746 |
+| `locks-delegated-production-ttl-heavy` | 1779 → 729 | passing seeds only: 19 / 14 of 221 → 479 / 270 of 1271 | 37 / 20 → 646 / 398 | not comparable |
+| `locks-production-ttl` | 0 → 0 | 0 / 0 | 0 / 0 | p90 9777 → 798 |
+
+The stage-0 patch alone (the ask, no `waited_ms`) on the same long-grants
+seeds: the owner node over 45 s / 50 s in 211 / 71 of 30000 (103 / 28 before),
+and 3 failing seeds; production-ttl-heavy 4 failing of 12000 (90 before). The
+two heavy delegated rows count passing seeds only (a failing seed has no
+measures), so before and after are not the same population: what is left of
+them is the restamp below. The same artifact makes the raw fenced-I/O column
+of the delegated-heavy row read like a regression (240 → 14799): on the 215
+seeds that pass on both trees it is 169 → 159 fenced I/Os, 23 → 26 seeds with
+any. Fencing with no fault under a short delegation is older than this
+patch (seed 10 fences its first section at t=2311 identically on both: the
+delegate's renewals answer shrinking ttls, 1738 … 1003 ms, and the 4 to 12
+I/O section outlives the grant): a separate task.
+
+Every other `locks-*` config, 2000 seeds each (`locks-blips-tight-faults`
+0..2000 and 5000..6000, `double-seal-inside-the-grace` 8000,
+`fast-takeover-skewed-successor`): 0 failing, the longest acquisition lower or
+equal at the median in all (`locks-blips*` 7.9 → 6.7 s, 9.9 → 8.8 s with
+faults), handoff gaps equal (the fault configs' are the faults': 4 to 15 s).
+Overtakes 1253 → 104 (`double-seal-inside-the-grace`), 211 → 32
+(`locks-blips-tight-faults`). Non-vacuity controls fail as designed:
+`locks-writer-hold-unchecked` 1974 of 2000, `locks-writer-hold-delegated-unsettled`
+4 of 3000, the credited arrival cap 1 + 7 of 10000.
+
+Fenced I/Os and grants lost on seeds that passed in both, before → after, move
+by under 3 % in the fault configs (`-partition` 3309 → 3321, `-stall-step`
+1810 → 1897, delegated partition 3646 → 3714, `locks-writer-hold` 7794 →
+7816) with equal locks and I/Os done: fenced I/O is what those faults are for.
+No mutual-exclusion violation anywhere. I did not find the cause of the small
+shift (a seed traced: a delegate's 1.5 s grants, cut from its root, lapse under
+sections whose timing the grants moved).
+
+Harness (box, release, seed 42, the nodes in docker, S3 by versitygw):
+`lock-contention-delegated` at a 5 s delegation, three runs: median handoff gap
+4.2 to 6.1 ms, longest 58 to 66 ms (the rounds that needed an ask), the
+delegate asked 8 waiters, the requesters answered 8, none outwaited, count 18;
+on 63da672: median 54 ms, longest 300 ms, three recalls expired, no ask, and the
+scenario fails. At the daemon default delegation TTL: after median 2.9 ms,
+longest 10.7 ms, 2 asks answered; 63da672 median 1.7 ms, longest 7.1 ms,
+no ask: no regression (the daemon default rarely asks). Regression set, once
+each on the final tree, pass: `flock-cross-node`, `lock-failover`,
+`lock-holder-killed-contention`, `lock-holder-partitioned`,
+`lock-contention-stalled-owner`, `lock-contention-paused-holder`,
+`transport-lock-grace`. `lock-grace-wait` (round 2): a pre-existing knife
+edge, not caused by this change. Its check `EINTR + 2 s < non-blocking`
+compared the end of the interrupted probe (its start, 2 s or 4 s, bimodal,
+plus the alarm's 8 s) with the grace's end (about 14.1 s after the spawn): at
+a 4 s start 12.08 + 2 against 14.1, with a margin of 6 ms on 63da672 in two
+of four interleaved runs on a quiet box (the slack was 2.07, 0.006, 0.006 and
+0.23 s on 63da672; 0.27, 0.27, 2.07 and 2.31 s with this patch), and it failed on
+this tree while the box was busy. The scenario now compares the ends with a margin of
+500 ms (the ends are 1.95 s apart in practice), requires the probe's own
+"EINTR after" to be at least 8 s, prints the probes' start (4.0 s each time),
+and still checks the contender's `grace_waits` and the successor's
+`grace_wait_answers` and `grace_end_serves`. Three runs on the final tree
+pass (the two ends 1.96, 1.98 and 2.04 s apart); `lock-contention-delegated` twice
+(median gap 2.0 and 2.3 ms, longest 64 and 65 ms, 8 asks answered, none
+outwaited, count 18).
+
+Perf gate (`lock-latency`, release, pinned to four CPUs, base and after in
+ABBA order, each pair started when the box was quiet: one-minute load under
+2; tmpfs 6 pairs, loopback ext4 6, xfs 12, btrfs 24; the review's numbers,
+which replace my own from a shared box, where the medians swung from −11.7 % to
++19.3 % with the load). Medians of the per-run p50, 63da672 → this patch: the
+contended handoff 1503 → 1478 µs (−1.7 %) on tmpfs, 1577 → 1556 (−1.3 %) on
+ext4, 1522 → 1516 (−0.4 %) on xfs, 1456 → 1442 (−0.9 %) on btrfs: neutral on
+all four (the p90 −2.2, +0.4, +0.3, +0.1 %). The first lock of a
+non-sequencer +1.0, +0.6, +1.1 and +2.9 % (btrfs: about 8 µs, 8 of 24 pairs
+faster, p about 0.15: not significant; a watch item, and the first lock adds
+only `waited_ms` and empty scans, no file-system path); the sequencer's
+`LOCK_EX` +1.8 % (+0.4 µs), +0.1, −0.9, +0.3 %; the cached re-lock and
+`fcntl` within ±1.9 % and 0.4 µs; the lone-node cluster `flock` and write
+within ±2 %. Everything is within 3 % or 1 µs: the no-regression rule holds
+on all four.
+
+### Not done
+
+- **The restamp on a delegation's move (4(b))**: a grant moved with its subtree
+  is restamped to a full lock TTL and margin (21 s), so a grant that lapsed at
+  its holder meanwhile is outwaited that long: two seeds of 2000 of
+  `locks-delegated-production-ttl` still wait more than a minute, and the
+  heavy delegated config still fails in 729 of 2000. A separate,
+  safety-sensitive follow-up (a model check first: two ops per node, a move
+  between a push and the first renewal; plan 43's C4 note records it).
+- A push that arrives with less than `margin / 4` left (slow transit) still
+  lapses; the model (`crates/model/src/locks.rs`) with two ops per node and the
+  holder's max-merge is not extended.
+- A delegate's own idle grant lapsing under its short authority and a
+  non-blocking wait that gave up with its request in flight leave grants that
+  are outwaited (3 to 4.5 s; the CI test's 6 s bound).
+- The cost of an ask, one round trip per handoff to a stale waiter, is within
+  the sims' noise (`locks-long-grants`: the p50 of the longest wait −27 %).
+- Plan 43's C4 rewrite of `core/locks.rs` must keep the rule, the ask, the hold,
+  `waited_ms`, the wake and the cancel (noted there).
+
+### Gates
+
+`cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`
+clean. `cargo test --workspace --no-fail-fast` (workstation, debug, the model crate apart):
+all pass but two tests of `constellation-csi` that this change does not touch
+(`engine_pods::tests::unit_dirs_are_made_for_the_engine_and_never_through_a_link`,
+`the_policy_writer_never_follows_a_planted_link`: the workstation's umask makes
+the test's temporary directory mode 775, which the code under test refuses).
+`cargo test -p constellation-model`: passes (92 s in debug), run on stage 2's
+tree. Round 2: `cargo test --release -p constellation-authority`: lib 465,
+meta_repro 4, sim 167 passed (12 ignored, 135 s); engine lib 780 and harness
+lib 140 passed; the sweeps of `locks`, `locks-delegated`, `locks-long-grants`,
+the production-ttl configs, `locks-failover-backup-renew` and
+`locks-blips-tight-faults` unchanged to the digit (the L1 field and the
+engine's back-off touch no path of them).
