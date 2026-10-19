@@ -8,7 +8,7 @@
 //! simulation's paused clock governs expiry end to end.
 
 use super::Config;
-use crate::ids::{Epoch, Ms, NodeId};
+use crate::ids::{Epoch, Ms, NodeId, Now};
 use constellation_store_s3::lease::LEASE_VERSION;
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 
@@ -140,12 +140,12 @@ impl LeaseState {
 
     /// `LeaseKeeper::adopt_epoch_hold`: epoch-local authority without an
     /// S3 CAS.
-    pub fn adopt_epoch_hold(&mut self, now: Ms, epoch: Epoch) {
+    pub fn adopt_epoch_hold(&mut self, now: Now, epoch: Epoch) {
         self.lost = false;
         self.lost_floor = 0;
         self.epoch_hold = Some(epoch.max(1));
         self.cached_holder = None;
-        self.last_write = now;
+        self.last_write = now.wall;
     }
 
     /// `LeaseKeeper::release_local`: the epoch closed; whatever S3 lease
@@ -160,7 +160,7 @@ impl LeaseState {
     }
 
     /// `LeaseView::usable`: held, not lost, and enough margin left.
-    pub fn usable(&self, now: Ms, cfg: &Config) -> bool {
+    pub fn usable(&self, now: Now, cfg: &Config) -> bool {
         if self.lost {
             return false;
         }
@@ -169,7 +169,7 @@ impl LeaseState {
         }
         match &self.held {
             Some((lease, _)) => {
-                lease.expires_in_ms(now.0) > cfg.expiry_margin_ms as i64
+                lease.expires_in_ms(now.wall.0) > cfg.expiry_margin_ms as i64
                     && lease.holder == cfg.node_id
             }
             None => false,
@@ -180,11 +180,11 @@ impl LeaseState {
     /// expired — though it may be inside its expiry margin (a renewal in
     /// flight on a slow S3), where nothing new is admitted. Its backups
     /// keep hearing from it meanwhile.
-    pub fn holds_unexpired(&self, now: Ms, cfg: &Config) -> bool {
+    pub fn holds_unexpired(&self, now: Now, cfg: &Config) -> bool {
         !self.lost
             && self.epoch_hold.is_none()
             && self.held.as_ref().is_some_and(|(lease, _)| {
-                lease.holder == cfg.node_id && lease.expires_in_ms(now.0) > 0
+                lease.holder == cfg.node_id && lease.expires_in_ms(now.wall.0) > 0
             })
     }
 
@@ -195,19 +195,19 @@ impl LeaseState {
     }
 
     /// `LeaseView::open_for_new_mutation`.
-    pub fn open_for_new_mutation(&self, now: Ms, cfg: &Config) -> bool {
+    pub fn open_for_new_mutation(&self, now: Now, cfg: &Config) -> bool {
         if self.fenced() {
             return false;
         }
         if self.epoch_hold.is_some() {
             return self.usable(now, cfg);
         }
-        now >= self.pause_until && self.usable(now, cfg)
+        now.wall >= self.pause_until && self.usable(now, cfg)
     }
 
     /// `LeaseView::new_mutation_epoch`: the epoch a new local mutation
     /// admitted right now executes under.
-    pub fn new_mutation_epoch(&self, now: Ms, cfg: &Config) -> Option<Epoch> {
+    pub fn new_mutation_epoch(&self, now: Now, cfg: &Config) -> Option<Epoch> {
         self.open_for_new_mutation(now, cfg)
             .then(|| self.epoch())
             .flatten()
@@ -217,7 +217,7 @@ impl LeaseState {
     /// none when this node may not ship (no lease, expired, deposed, gate
     /// pending). Deliberately blind to the handoff pause and the releasing
     /// flag: the drain those exist for must still ship.
-    pub fn ship_epoch(&self, now: Ms, cfg: &Config) -> Option<Epoch> {
+    pub fn ship_epoch(&self, now: Now, cfg: &Config) -> Option<Epoch> {
         if self.lost || self.gate.is_some() {
             return None;
         }
@@ -228,23 +228,23 @@ impl LeaseState {
     /// gate whose journal work is done waits out the read-delegation
     /// quarantine (`PendingGate::shippable`). Nothing else (forwards,
     /// handoffs, the inbox, backups, streams) opens before the gate.
-    pub fn journal_ship_epoch(&self, now: Ms, cfg: &Config) -> Option<Epoch> {
+    pub fn journal_ship_epoch(&self, now: Now, cfg: &Config) -> Option<Epoch> {
         if self.lost || self.gate.as_ref().is_some_and(|g| !g.shippable) {
             return None;
         }
         self.usable(now, cfg).then(|| self.epoch()).flatten()
     }
 
-    pub fn is_paused_for_handoff(&self, now: Ms) -> bool {
-        self.pause_until > now
+    pub fn is_paused_for_handoff(&self, now: Now) -> bool {
+        self.pause_until > now.wall
     }
 
-    pub fn begin_handoff_pause(&mut self, now: Ms, cfg: &Config) {
-        self.pause_until = now.plus(cfg.handoff_pause_ms);
+    pub fn begin_handoff_pause(&mut self, now: Now, cfg: &Config) {
+        self.pause_until = now.wall.plus(cfg.handoff_pause_ms);
     }
 
-    pub fn touch(&mut self, now: Ms) {
-        self.last_write = now;
+    pub fn touch(&mut self, now: Now) {
+        self.last_write = now.wall;
     }
 
     /// `LeaseKeeper::wants_handoff`: dwell and wanted timers alone justify
@@ -253,25 +253,25 @@ impl LeaseState {
     /// Plan 31 C8: a forward-only node needs nobody to ask — it hands the
     /// lease back once it has held it for the dwell and written nothing
     /// for as long (`release_when_idle`).
-    pub fn wants_handoff(&self, now: Ms, cfg: &Config) -> bool {
+    pub fn wants_handoff(&self, now: Now, cfg: &Config) -> bool {
         let dwelt = self
             .held_since
-            .is_some_and(|since| now.since(since) >= cfg.dwell_ms as i64);
+            .is_some_and(|since| now.wall.since(since) >= cfg.dwell_ms as i64);
         if self.epoch_hold.is_some() || self.held.is_none() || !dwelt {
             return false;
         }
-        if self.release_when_idle && now.since(self.last_write) >= cfg.dwell_ms as i64 {
+        if self.release_when_idle && now.wall.since(self.last_write) >= cfg.dwell_ms as i64 {
             return true;
         }
         !self.wanted.is_empty()
-            && (now.since(self.last_write) >= cfg.idle_release_ms as i64
+            && (now.wall.since(self.last_write) >= cfg.idle_release_ms as i64
                 || self
                     .wanted_since
-                    .is_some_and(|since| now.since(since) >= cfg.wanted_grace_ms as i64))
+                    .is_some_and(|since| now.wall.since(since) >= cfg.wanted_grace_ms as i64))
     }
 
     /// `LeaseKeeper::idle_release_due`.
-    pub fn idle_release_due(&self, now: Ms, cfg: &Config, backlog: u64, held_back: u64) -> bool {
+    pub fn idle_release_due(&self, now: Now, cfg: &Config, backlog: u64, held_back: u64) -> bool {
         backlog == 0
             && !(cfg.keep_lease_while_held && held_back > 0)
             && self.wants_handoff(now, cfg)
@@ -283,7 +283,7 @@ impl LeaseState {
     /// has not renewed for `backup_takeover_ms` (a renewal within that
     /// window is proof of S3 liveness, and a merely P2P-partitioned
     /// holder keeps its lease).
-    fn permit_allows(&self, now: Ms, cfg: &Config, prev: &Lease, sealed_epoch: Epoch) -> bool {
+    fn permit_allows(&self, now: Now, cfg: &Config, prev: &Lease, sealed_epoch: Epoch) -> bool {
         let Some((epoch, holder)) = self.takeover_permit else {
             return false;
         };
@@ -294,7 +294,7 @@ impl LeaseState {
             AckPolicy::Backup => prev.backups.contains(&cfg.node_id) && sealed_epoch >= prev.epoch,
             AckPolicy::S3 => {
                 let renewed_at = prev.expires_unix_ms - cfg.ttl_ms as i64;
-                now.0 - renewed_at >= cfg.backup_takeover_ms as i64
+                now.wall.0 - renewed_at >= cfg.backup_takeover_ms as i64
             }
             AckPolicy::Local => false,
         }
@@ -305,7 +305,7 @@ impl LeaseState {
     /// (plan 30 §M9), 0 when none.
     pub fn classify(
         &self,
-        now: Ms,
+        now: Now,
         cfg: &Config,
         object: Option<(Lease, LeaseTag)>,
         sealed_epoch: Epoch,
@@ -321,7 +321,7 @@ impl LeaseState {
             // against this node; it never holds it again.
             return Plan::Refused("retired by an admin leave (the lease is fenced against us)");
         }
-        if prev.holder == cfg.node_id && !prev.released && !prev.is_expired(now.0) {
+        if prev.holder == cfg.node_id && !prev.released && !prev.is_expired(now.wall.0) {
             if self.held.is_some() {
                 return Plan::Held;
             }
@@ -335,7 +335,7 @@ impl LeaseState {
             };
         }
         let permitted = self.permit_allows(now, cfg, &prev, sealed_epoch);
-        if !prev.is_claimable(now.0) && !permitted {
+        if !prev.is_claimable(now.wall.0) && !permitted {
             return Plan::Busy {
                 holder: prev.holder,
                 epoch: prev.epoch,
@@ -361,7 +361,7 @@ impl LeaseState {
             && !prev.backups.is_empty()
             && !prev.backups.contains(&cfg.node_id)
             && !permitted
-            && !prev.is_expired(now.0 - backup_claim_grace_ms(cfg))
+            && !prev.is_expired(now.wall.0 - backup_claim_grace_ms(cfg))
         {
             return Plan::Busy {
                 holder: prev.holder,
@@ -403,7 +403,7 @@ impl LeaseState {
     /// this tenure's floor protected open to conflicting ones.
     pub fn granted_lease(
         &self,
-        now: Ms,
+        now: Now,
         cfg: &Config,
         prev: Option<&Lease>,
         inherits_duty: bool,
@@ -419,7 +419,7 @@ impl LeaseState {
             partition: cfg.partition.clone(),
             holder: cfg.node_id,
             epoch,
-            expires_unix_ms: now.plus(cfg.ttl_ms).0,
+            expires_unix_ms: now.wall.plus(cfg.ttl_ms).0,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),
@@ -463,9 +463,9 @@ impl LeaseState {
         }
     }
 
-    pub fn renewed_lease(&self, now: Ms, cfg: &Config, mine: &Lease) -> Lease {
+    pub fn renewed_lease(&self, now: Now, cfg: &Config, mine: &Lease) -> Lease {
         Lease {
-            expires_unix_ms: now.plus(cfg.ttl_ms).0,
+            expires_unix_ms: now.wall.plus(cfg.ttl_ms).0,
             released: false,
             ..mine.clone()
         }
@@ -474,7 +474,7 @@ impl LeaseState {
     /// A requester's inbox batch said it wants the lease (M13, M5): the
     /// same as finding it in `wanted_by` at a renewal, learned at the
     /// next poll instead of the next half-TTL.
-    pub fn note_wanted(&mut self, now: Ms, node: NodeId) {
+    pub fn note_wanted(&mut self, now: Now, node: NodeId) {
         if node == 0 || self.held.is_none() {
             return;
         }
@@ -483,24 +483,24 @@ impl LeaseState {
             self.wanted.sort_unstable();
         }
         if self.wanted_since.is_none() {
-            self.wanted_since = Some(now);
+            self.wanted_since = Some(now.wall);
         }
     }
 
     /// `LeaseKeeper::open_won`: take ownership of a won lease.
-    pub fn adopt(&mut self, now: Ms, lease: Lease, tag: LeaseTag, gate: Option<PendingGate>) {
+    pub fn adopt(&mut self, now: Now, lease: Lease, tag: LeaseTag, gate: Option<PendingGate>) {
         self.gate = gate;
         self.wanted.clear();
         self.wanted_since = None;
-        self.held_since = Some(now);
-        self.last_write = now;
+        self.held_since = Some(now.wall);
+        self.last_write = now.wall;
         self.last_seen = Some(lease.clone());
         self.cached_holder = Some(lease.holder);
         self.held = Some((lease, tag));
     }
 
     /// `LeaseKeeper::apply_renew`'s `Renewed` arm.
-    pub fn renewed(&mut self, now: Ms, lease: Lease, tag: LeaseTag) {
+    pub fn renewed(&mut self, now: Now, lease: Lease, tag: LeaseTag) {
         // Union with what inbox batches already told us (M5): a renewal
         // object that predates a batch's flag must not forget it.
         let mut wanted = lease.wanted_by.clone();
@@ -514,7 +514,7 @@ impl LeaseState {
         if self.wanted.is_empty() {
             self.wanted_since = None;
         } else if self.wanted_since.is_none() {
-            self.wanted_since = Some(now);
+            self.wanted_since = Some(now.wall);
         }
         self.last_seen = Some(lease.clone());
         self.held = Some((lease, tag));
@@ -557,12 +557,12 @@ impl LeaseState {
     }
 
     /// Remember what a lease read said about who holds it.
-    pub fn note_object(&mut self, now: Ms, lease: &Lease) {
+    pub fn note_object(&mut self, now: Now, lease: &Lease) {
         if lease.holder != 0 {
             self.cached_holder = Some(lease.holder);
         }
         self.last_seen = Some(lease.clone());
-        self.last_seen_at = Some(now);
+        self.last_seen_at = Some(now.wall);
     }
 }
 
@@ -607,7 +607,7 @@ mod tests {
     fn classify_mirrors_the_keeper() {
         let cfg = cfg();
         let st = LeaseState::default();
-        let now = Ms(1_000_000);
+        let now = Now::same(1_000_000);
         assert_eq!(st.classify(now, &cfg, None, 0), Plan::Create);
         // A live foreign holder is busy.
         let mut foreign = st.granted_lease(now, &cfg, None, false);
@@ -618,7 +618,7 @@ mod tests {
         }
         // Expired and unreleased: a takeover with a marker.
         let expired = Lease {
-            expires_unix_ms: now.0 - 1,
+            expires_unix_ms: now.wall.0 - 1,
             ..foreign.clone()
         };
         match st.classify(now, &cfg, Some((expired, tag())), 0) {
@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn the_view_gates_match_lease_view() {
         let cfg = cfg();
-        let now = Ms(5_000_000);
+        let now = Now::same(5_000_000);
         let mut st = LeaseState::default();
         assert_eq!(st.new_mutation_epoch(now, &cfg), None);
         let lease = st.granted_lease(now, &cfg, None, false);
@@ -706,7 +706,7 @@ mod tests {
         assert_eq!(st.ship_epoch(later, &cfg), Some(1));
         st.releasing = false;
         // Past the margin: unusable.
-        let near_expiry = Ms(st.held.as_ref().unwrap().0.expires_unix_ms - 500);
+        let near_expiry = Now::same(st.held.as_ref().unwrap().0.expires_unix_ms - 500);
         assert_eq!(st.ship_epoch(near_expiry, &cfg), None);
     }
 
@@ -715,7 +715,7 @@ mod tests {
         let mut cfg = cfg();
         cfg.dwell_ms = 1_000;
         cfg.idle_release_ms = 30_000;
-        let t0 = Ms(1_000_000);
+        let t0 = Now::same(1_000_000);
         let mut st = LeaseState {
             release_when_idle: true,
             ..LeaseState::default()
@@ -741,7 +741,7 @@ mod tests {
         cfg.dwell_ms = 1_000;
         cfg.idle_release_ms = 5_000;
         cfg.wanted_grace_ms = 2_000;
-        let t0 = Ms(1_000_000);
+        let t0 = Now::same(1_000_000);
         let mut st = LeaseState::default();
         let lease = st.granted_lease(t0, &cfg, None, false);
         st.adopt(t0, lease.clone(), tag(), None);

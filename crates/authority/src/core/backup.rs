@@ -196,7 +196,7 @@
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{PeerMsg, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
+use crate::ids::{Epoch, Ms, NodeId, Now, OpId, Seq, TimerId};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
 use constellation_store_s3::{AckPolicy, Lease};
@@ -264,9 +264,9 @@ pub(crate) enum FreshVerdict {
 /// ended (not timed out again in that time), when it starts over at 1. A
 /// node that timed out once an hour ago is not still on its second
 /// strike.
-pub(crate) fn candidate_strikes_after(prev: Option<(u32, Ms)>, now: Ms) -> u32 {
+pub(crate) fn candidate_strikes_after(prev: Option<(u32, Ms)>, now: Now) -> u32 {
     match prev {
-        Some((strikes, until)) if now.since(until) < CANDIDATE_BACKOFF_MAX_MS as i64 => {
+        Some((strikes, until)) if now.wall.since(until) < CANDIDATE_BACKOFF_MAX_MS as i64 => {
             strikes.saturating_add(1)
         }
         _ => 1,
@@ -691,12 +691,12 @@ impl Core {
 
     /// At start: a persisted backup role (this node backed someone
     /// before it restarted) and a persisted seal are honoured.
-    pub(crate) fn backup_start(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn backup_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.bk.sealed = replica.backup_sealed_epoch();
         if let Some(role) = replica.backup_role() {
             self.bk.role = Some(role);
             self.bk.acked = replica.backup_acked(role.epoch);
-            self.bk.last_heard = now;
+            self.bk.last_heard = now.wall;
             self.bk.restarted = true;
             self.lease.cached_holder = Some(role.holder);
             self.arm_backup_watch(now, out);
@@ -835,11 +835,11 @@ impl Core {
 
     /// A successful S3 result proves liveness as of the request's send
     /// time — unless it revealed a deposition (a foreign lease object).
-    pub(crate) fn note_s3_liveness(&mut self, now: Ms, op: OpId, result: &S3Result) {
+    pub(crate) fn note_s3_liveness(&mut self, now: Now, op: OpId, result: &S3Result) {
         let Some(sent) = self.ack.s3_sent.remove(&op) else {
             return;
         };
-        let rtt = now.since(sent).max(0) as u64;
+        let rtt = now.wall.since(sent).max(0) as u64;
         self.ack.s3_rtt_ms = if self.ack.s3_rtt_ms == 0 {
             rtt
         } else {
@@ -863,8 +863,8 @@ impl Core {
     /// doc): under `Local` always (the lease cap is the argument); else
     /// only with fresh S3 liveness ([`Core::renew_fresh`]). `false`
     /// starts a probe.
-    pub(crate) fn strict_answer_allowed(&mut self, now: Ms, out: &mut Vec<Action>) -> bool {
-        if self.renew_fresh(now) {
+    pub(crate) fn strict_answer_allowed(&mut self, now: Now, out: &mut Vec<Action>) -> bool {
+        if self.renew_fresh(now.wall) {
             return true;
         }
         self.stats.stale_liveness_refusals += 1;
@@ -909,12 +909,12 @@ impl Core {
     /// or a delegation, as the root) may answer now: fresh liveness and
     /// a marked tenure, as a new grant needs (`lock_serve`). `Some`: the
     /// answer is held ([`Core::renew_verdict`]) under this tag.
-    pub(crate) fn renew_hold(&self, now: Ms) -> Option<FreshHold> {
-        if self.renew_fresh(now) && self.tenure_marked() {
+    pub(crate) fn renew_hold(&self, now: Now) -> Option<FreshHold> {
+        if self.renew_fresh(now.wall) && self.tenure_marked() {
             return None;
         }
         Some(FreshHold {
-            at: now,
+            at: now.wall,
             epoch: self.lease.epoch().unwrap_or(0),
         })
     }
@@ -924,14 +924,16 @@ impl Core {
     /// any more) and is marked; `Refuse` once that tenure is gone, the
     /// lease read that should have proven it failed, or it waited a lock
     /// TTL (no holder still counts on it); `Wait` otherwise.
-    pub(crate) fn renew_verdict(&self, now: Ms, h: FreshHold) -> FreshVerdict {
+    pub(crate) fn renew_verdict(&self, now: Now, h: FreshHold) -> FreshVerdict {
         if self.lease.lost || self.lease.epoch() != Some(h.epoch) {
             return FreshVerdict::Refuse;
         }
         if self.renew_fresh(h.at) && self.tenure_marked() {
             return FreshVerdict::Ready;
         }
-        if h.at <= self.ack.renew_refuse_through || now.since(h.at) >= self.cfg.lock_ttl_ms as i64 {
+        if h.at <= self.ack.renew_refuse_through
+            || now.wall.since(h.at) >= self.cfg.lock_ttl_ms as i64
+        {
             return FreshVerdict::Refuse;
         }
         FreshVerdict::Wait
@@ -945,7 +947,7 @@ impl Core {
             return;
         }
         if self.ack.renew_probe.is_none() && holds.iter().any(|h| !self.renew_fresh(h.at)) {
-            let sent = self.last_now;
+            let sent = self.clk.wall;
             let op = self.issue_s3(S3Op::LeaseGet, S3For::RenewProbe, out);
             self.ack.renew_probe = Some((op, sent));
             self.stats.renew_probes += 1;
@@ -962,7 +964,7 @@ impl Core {
     /// answers go (or are refused) after the event (`renew_after_event`).
     pub(crate) fn on_renew_probe(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1022,7 +1024,7 @@ impl Core {
 
     pub(crate) fn on_mark_granting_put(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1046,7 +1048,7 @@ impl Core {
 
     pub(crate) fn on_mark_granting_reread(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1181,8 +1183,8 @@ impl Core {
     /// continuation epoch's flush. (An operator's flush or stop waits for
     /// it too, parked: `service_pending_flushes`; one that gives up on a
     /// stuck gate releases nothing and leaves the lease to lapse.)
-    pub(crate) fn in_takeover_floor(&self, now: Ms) -> bool {
-        now.0 < self.ack.floor_until
+    pub(crate) fn in_takeover_floor(&self, now: Now) -> bool {
+        now.wall.0 < self.ack.floor_until
     }
 
     /// Where this tenure's takeover floor ends, in unix ms (0: none): the
@@ -1210,7 +1212,7 @@ impl Core {
     /// The takeover's marker landed at `now`.
     pub(crate) fn note_marker_landed(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1235,7 +1237,7 @@ impl Core {
             self.reclaim_horizon_ms() as i64
         };
         let bound = |ttl: u64| {
-            now.0
+            now.wall.0
                 + self.cfg.backup_takeover_ms as i64
                 + ttl as i64
                 + deleg
@@ -1261,7 +1263,7 @@ impl Core {
         } else {
             until
         };
-        if floor_end <= now.0 {
+        if floor_end <= now.wall.0 {
             // The predecessor's lease, as its beats placed it, ended
             // before this marker landed: everything it granted is
             // lapsed, and no floor remains.
@@ -1269,14 +1271,14 @@ impl Core {
             self.stats.ack_floor_capped_out += 1;
             tracing::info!(
                 node = self.cfg.node_id,
-                bound_ms = floor_bound - now.0,
-                cap_ms = floor_end - now.0,
+                bound_ms = floor_bound - now.wall.0,
+                cap_ms = floor_end - now.wall.0,
                 "took a lease over by seal or ack=s3 from a tenure that served strict \
                  reads or locks; its lease, as its beats placed it, has ended: no floor"
             );
             return;
         }
-        if self.cfg.locks && locks_until > now.0 {
+        if self.cfg.locks && locks_until > now.wall.0 {
             replica.locks().set_quarantine(locks_until);
         }
         self.ack.floor_until = floor_end;
@@ -1288,15 +1290,15 @@ impl Core {
         }
         tracing::info!(
             node = self.cfg.node_id,
-            wait_ms = until.max(now.0) - now.0,
-            lock_wait_ms = locks_until.max(now.0) - now.0,
-            bound_ms = bound_until - now.0,
+            wait_ms = until.max(now.wall.0) - now.wall.0,
+            lock_wait_ms = locks_until.max(now.wall.0) - now.wall.0,
+            bound_ms = bound_until - now.wall.0,
             capped = capped_by > 0,
             "took a lease over by seal or ack=s3 from a tenure that served strict \
              reads or locks; acknowledging no mutation until its delegation \
              horizon has passed"
         );
-        if until > now.0 {
+        if until > now.wall.0 {
             replica.read_delegations().set_quarantine(until);
             self.arm_grant_quarantine(Ms(until), out);
         }
@@ -1309,7 +1311,7 @@ impl Core {
     /// non-holder, watch an `ack=s3` holder for silence.
     pub(crate) fn backup_after_event(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1381,11 +1383,11 @@ impl Core {
             // The append goes out on every event (a row journaled, an
             // ack that freed a slot); the bookkeeping runs on the tick
             // and a few times a second in between.
-            let housekeeping =
-                self.ack.tick_fired || now.since(self.ack.last_housekeeping) >= HOUSEKEEPING_MS;
+            let housekeeping = self.ack.tick_fired
+                || now.wall.since(self.ack.last_housekeeping) >= HOUSEKEEPING_MS;
             if housekeeping {
                 self.ack.tick_fired = false;
-                self.ack.last_housekeeping = now;
+                self.ack.last_housekeeping = now.wall;
                 self.backup_select(now, replica, out);
             }
             self.backup_stream(now, replica, out);
@@ -1430,7 +1432,7 @@ impl Core {
 
     /// Eligible peers, best first: in the roster, connected, within the
     /// RTT budget, stable, not us, not already a backup.
-    pub(crate) fn backup_candidates(&self, now: Ms) -> Vec<NodeId> {
+    pub(crate) fn backup_candidates(&self, now: Now) -> Vec<NodeId> {
         if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
             return Vec::new();
         }
@@ -1446,15 +1448,15 @@ impl Core {
             })
             .filter(|l| {
                 l.since
-                    .is_some_and(|since| now.since(since) >= self.cfg.backup_stable_ms as i64)
+                    .is_some_and(|since| now.wall.since(since) >= self.cfg.backup_stable_ms as i64)
             })
-            .map(|l| (l.since.unwrap_or(now), l.node))
+            .map(|l| (l.since.unwrap_or(now.wall), l.node))
             .collect();
         eligible.sort();
         eligible.into_iter().map(|(_, n)| n).collect()
     }
 
-    fn backup_select(&mut self, now: Ms, _replica: &dyn Replica, _out: &mut Vec<Action>) {
+    fn backup_select(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
         // EC2 follow-up (e): a node that sealed the epoch held can never
         // back it: neither a candidate nor a reason to hold
         // acknowledgements back waiting for one.
@@ -1475,7 +1477,7 @@ impl Core {
         // The rate limit is for churn (the same node in and out); a set
         // that is empty is filled at once — acknowledgements wait for it.
         if !self.lease.backups().is_empty()
-            && now.since(self.ack.last_reconfig) < self.cfg.backup_reconfig_min_ms as i64
+            && now.wall.since(self.ack.last_reconfig) < self.cfg.backup_reconfig_min_ms as i64
         {
             return;
         }
@@ -1488,12 +1490,12 @@ impl Core {
             self.ack
                 .last_dropped
                 .get(n)
-                .is_none_or(|at| now.since(*at) >= self.cfg.backup_reconfig_min_ms as i64)
+                .is_none_or(|at| now.wall.since(*at) >= self.cfg.backup_reconfig_min_ms as i64)
                 && self
                     .ack
                     .candidate_strikes
                     .get(n)
-                    .is_none_or(|(_, until)| now >= *until)
+                    .is_none_or(|(_, until)| now.wall >= *until)
         }) else {
             return;
         };
@@ -1505,7 +1507,7 @@ impl Core {
         self.ack.candidate = Some(n);
         // Unique per holder across its restarts too (time-based), so a
         // dismissal of an earlier bring-up never matches this one.
-        let candidacy = (now.0.max(0) as u64).max(self.ack.last_candidacy + 1);
+        let candidacy = (now.wall.0.max(0) as u64).max(self.ack.last_candidacy + 1);
         self.ack.last_candidacy = candidacy;
         self.ack.peers.insert(
             n,
@@ -1514,12 +1516,12 @@ impl Core {
                 sent_through: 0,
                 inflight: std::collections::VecDeque::new(),
                 last_sent: Ms(0),
-                last_progress: now,
+                last_progress: now.wall,
                 committed: false,
                 candidacy,
-                alive_at: now,
+                alive_at: now.wall,
                 short_since_progress: false,
-                short_since: now,
+                short_since: now.wall,
                 unreachable: false,
                 answers_beats: false,
             },
@@ -1531,7 +1533,7 @@ impl Core {
     /// caught up and idle. Appends are acknowledged cumulatively by
     /// journal position, so several may be in flight; rows journaled
     /// while every slot is taken ride the next one (the group commit).
-    fn backup_stream(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn backup_stream(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some((lease, _)) = self.lease.held.clone() else {
             return;
         };
@@ -1551,7 +1553,7 @@ impl Core {
             .filter(|(_, p)| p.inflight.len() < max_inflight)
             .filter(|(_, p)| {
                 p.sent_through.max(p.acked).max(through) < tip
-                    || (p.inflight.is_empty() && now.since(p.last_sent) >= heartbeat)
+                    || (p.inflight.is_empty() && now.wall.since(p.last_sent) >= heartbeat)
             })
             .map(|(n, _)| *n)
             .collect();
@@ -1597,10 +1599,10 @@ impl Core {
             }
             p.inflight.push_back(Inflight {
                 req,
-                sent: now,
+                sent: now.wall,
                 last: last.unwrap_or(start - 1),
             });
-            p.last_sent = now;
+            p.last_sent = now.wall;
             self.stats.backup_appends += 1;
             tracing::trace!(
                 target: "constellation_authority::ack_wait",
@@ -1632,21 +1634,21 @@ impl Core {
         self.arm_backup_tick(now, out);
     }
 
-    fn arm_backup_tick(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn arm_backup_tick(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.ack.tick_timer.is_some()
             || (self.ack.peers.is_empty() && self.ack.reconfig_wanted.is_none())
         {
             return;
         }
-        let id = self.set_timer(
-            now.plus(self.cfg.backup_heartbeat_ms.max(1)),
+        let id = self.set_timer_wall(
+            now.wall.plus(self.cfg.backup_heartbeat_ms.max(1)),
             Timer::BackupTick,
             out,
         );
         self.ack.tick_timer = Some(id);
     }
 
-    pub(crate) fn backup_tick(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn backup_tick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         // Everything runs in `backup_after_event`, which follows.
         self.ack.tick_fired = true;
         let _ = (now, replica, out);
@@ -1663,7 +1665,7 @@ impl Core {
     /// `backup_slow_max_ms` without progress; a dead or cut-off one stops
     /// answering the heartbeat and goes after `backup_ack_timeout_ms` as
     /// before.
-    fn backup_timeouts(&mut self, now: Ms, _replica: &dyn Replica, _out: &mut Vec<Action>) {
+    fn backup_timeouts(&mut self, now: Now, _replica: &dyn Replica, _out: &mut Vec<Action>) {
         let timeout = self.cfg.backup_ack_timeout_ms as i64;
         let slow_max = (self.cfg.backup_slow_max_ms as i64).max(timeout);
         let tip_behind = |p: &BackupPeer| !p.inflight.is_empty();
@@ -1697,16 +1699,16 @@ impl Core {
         // off as the answers resumed, `on_backup_alive`).
         let interval = self.cfg.backup_heartbeat_ms as i64;
         let short_answering = |p: &BackupPeer| {
-            let quiet = now.since(p.alive_at.max(p.short_since)) - interval;
-            now.since(p.short_since) - if aware { quiet.max(0) } else { 0 }
+            let quiet = now.wall.since(p.alive_at.max(p.short_since)) - interval;
+            now.wall.since(p.short_since) - if aware { quiet.max(0) } else { 0 }
         };
         let stale: Vec<NodeId> = self
             .ack
             .peers
             .iter()
             .filter(|(_, p)| {
-                let silent = now.since(since(self, p.last_progress));
-                let unheard = now.since(since(self, p.alive_at));
+                let silent = now.wall.since(since(self, p.last_progress));
+                let unheard = now.wall.since(since(self, p.alive_at));
                 tip_behind(p)
                     && silent >= timeout
                     && (unheard >= timeout + if p.answers_beats { grace } else { 0 }
@@ -1728,8 +1730,8 @@ impl Core {
                 tracing::debug!(
                     node = self.cfg.node_id,
                     backup = n,
-                    silent_ms = now.since(since(self, p.last_progress)),
-                    unheard_ms = now.since(since(self, p.alive_at)),
+                    silent_ms = now.wall.since(since(self, p.last_progress)),
+                    unheard_ms = now.wall.since(since(self, p.alive_at)),
                     short = p.short_since_progress,
                     unreachable = p.unreachable,
                     "backup acknowledgement timeout"
@@ -1743,10 +1745,10 @@ impl Core {
                 );
                 self.ack.candidate = None;
                 self.ack.peers.remove(&n);
-                self.ack.last_dropped.insert(n, now);
+                self.ack.last_dropped.insert(n, now.wall);
                 let strikes =
                     candidate_strikes_after(self.ack.candidate_strikes.get(&n).copied(), now);
-                let until = now.plus(candidate_backoff_ms(
+                let until = now.wall.plus(candidate_backoff_ms(
                     self.cfg.backup_reconfig_min_ms,
                     strikes,
                 ));
@@ -1754,7 +1756,7 @@ impl Core {
                 // (a node that left the cluster keeps none).
                 self.ack
                     .candidate_strikes
-                    .retain(|_, (_, u)| now.since(*u) < CANDIDATE_BACKOFF_MAX_MS as i64);
+                    .retain(|_, (_, u)| now.wall.since(*u) < CANDIDATE_BACKOFF_MAX_MS as i64);
                 self.ack.candidate_strikes.insert(n, (strikes, until));
                 continue;
             }
@@ -1775,7 +1777,7 @@ impl Core {
     }
 
     /// Reconfigure `n` out of the committed set.
-    fn drop_backup(&mut self, now: Ms, n: NodeId, why: &'static str) {
+    fn drop_backup(&mut self, now: Now, n: NodeId, why: &'static str) {
         if !self.lease.backups().contains(&n) {
             return;
         }
@@ -1801,11 +1803,11 @@ impl Core {
             .filter(|b| *b != n)
             .collect();
         self.ack.reconfig_wanted = Some(backups);
-        self.ack.last_dropped.insert(n, now);
+        self.ack.last_dropped.insert(n, now.wall);
     }
 
     /// A candidate that has caught up joins the lease.
-    fn backup_promote(&mut self, now: Ms, replica: &dyn Replica, _out: &mut Vec<Action>) {
+    fn backup_promote(&mut self, now: Now, replica: &dyn Replica, _out: &mut Vec<Action>) {
         let Some(n) = self.ack.candidate else {
             return;
         };
@@ -1829,7 +1831,7 @@ impl Core {
 
     fn issue_reconfig(
         &mut self,
-        now: Ms,
+        now: Now,
         backups: Vec<NodeId>,
         _replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1838,7 +1840,8 @@ impl Core {
             return;
         }
         if self.lease_cas_in_flight()
-            || now.since(self.ack.last_reconfig_try) < (self.cfg.backup_heartbeat_ms as i64).max(1)
+            || now.wall.since(self.ack.last_reconfig_try)
+                < (self.cfg.backup_heartbeat_ms as i64).max(1)
         {
             self.ack.reconfig_wanted = Some(backups);
             return;
@@ -1852,7 +1855,7 @@ impl Core {
             self.ack.reconfig_wanted = Some(backups);
             return;
         }
-        self.ack.last_reconfig_try = now;
+        self.ack.last_reconfig_try = now.wall;
         let policy = if backups.is_empty() {
             AckPolicy::Local
         } else {
@@ -1895,7 +1898,7 @@ impl Core {
 
     pub(crate) fn on_reconfig_put(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1913,7 +1916,7 @@ impl Core {
                     "backup set reconfigured"
                 );
                 self.lease.renewed(now, r.lease, tag);
-                self.ack.last_reconfig = now;
+                self.ack.last_reconfig = now.wall;
                 if let Some(n) = r.add {
                     self.stats.backups_added += 1;
                     if self.ack.candidate == Some(n) {
@@ -1943,7 +1946,7 @@ impl Core {
 
     pub(crate) fn on_reconfig_reread(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1995,7 +1998,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_backup_ack(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         epoch: Epoch,
@@ -2046,16 +2049,16 @@ impl Core {
         // for the same rows is stuck, and the timeout rule drops it
         // rather than the two of them resending forever (round 2).
         if acked > p.acked || acked >= entry.last {
-            p.last_progress = now;
+            p.last_progress = now.wall;
             p.short_since_progress = false;
         } else if !p.short_since_progress {
             p.short_since_progress = true;
-            p.short_since = now;
+            p.short_since = now.wall;
         }
         tracing::trace!(
             node = self.cfg.node_id,
             backup = from,
-            rtt_ms = now.since(entry.sent),
+            rtt_ms = now.wall.since(entry.sent),
             acked,
             inflight = p.inflight.len(),
             "backup append acknowledged"
@@ -2130,7 +2133,7 @@ impl Core {
     /// Rows became durable: stream them ahead now, unless a send went
     /// out within the hold-off — then once it elapses, all at once. One
     /// request per subscriber per hold-off, not per acknowledgement.
-    fn stream_ahead_soon(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn stream_ahead_soon(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.ack.stream_ahead_timer.is_some() {
             self.ack.stream_ahead_pending = true;
             return;
@@ -2142,8 +2145,8 @@ impl Core {
             self.durable_jseq()
         };
         self.stream_ahead(now, from, to, replica, out);
-        let id = self.set_timer(
-            now.plus(self.cfg.stream_ahead_holdoff_ms.max(1)),
+        let id = self.set_timer_wall(
+            now.wall.plus(self.cfg.stream_ahead_holdoff_ms.max(1)),
             Timer::StreamAhead,
             out,
         );
@@ -2152,7 +2155,7 @@ impl Core {
 
     pub(crate) fn on_stream_ahead_timer(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2234,7 +2237,7 @@ impl Core {
     /// a transaction of its own ([`AckState::ahead_of`]).
     pub(crate) fn stream_ahead(
         &mut self,
-        now: Ms,
+        now: Now,
         from: u64,
         to: u64,
         replica: &dyn Replica,
@@ -2353,7 +2356,7 @@ impl Core {
     /// §M3b's recovery; nothing is lost and nothing runs twice.
     pub(crate) fn ack_abort_parked(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2369,7 +2372,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_backup_append(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         (epoch, holder, config_version, candidacy): (Epoch, NodeId, u64, u64),
@@ -2441,11 +2444,11 @@ impl Core {
                 self.bk.candidacy = candidacy;
             }
         }
-        self.bk.last_heard = now;
+        self.bk.last_heard = now.wall;
         self.bk.restarted = false;
         self.lease.cached_holder = Some(holder);
         self.bk.holder_silent_since = None;
-        self.note_named_expiry(holder, epoch, now, expires);
+        self.note_named_expiry(holder, epoch, now.wall, expires);
         // What is acknowledged is held *contiguously* (or is in the log:
         // rows through the holder's shipped-through seq, `through`, are
         // durable in S3, so a batch may start past them). The holder
@@ -2492,7 +2495,7 @@ impl Core {
     /// only, like every timeout here: a hold delays a seal and never
     /// acknowledges anything, so a holder that never comes back is still
     /// sealed and taken over, `for_ms` later.
-    pub(crate) fn on_backup_hold(&mut self, now: Ms, from: NodeId, epoch: Epoch, for_ms: u64) {
+    pub(crate) fn on_backup_hold(&mut self, now: Now, from: NodeId, epoch: Epoch, for_ms: u64) {
         let ours = self
             .bk
             .role
@@ -2507,7 +2510,7 @@ impl Core {
             );
             return;
         }
-        let until = now.plus(for_ms.min(BACKUP_HOLD_MAX_MS));
+        let until = now.wall.plus(for_ms.min(BACKUP_HOLD_MAX_MS));
         self.bk.last_heard = self.bk.last_heard.max(until);
         self.stats.backup_holds += 1;
         tracing::info!(
@@ -2823,14 +2826,14 @@ impl Core {
     ///   it could not know of; for `ack=s3`'s watch, which has no such
     ///   grace to keep (every acknowledged record is in S3), a window plus
     ///   the lapses.
-    fn lag_discount(&self, (holder, epoch, seal): Watched, now: Ms) -> Option<Reach> {
+    fn lag_discount(&self, (holder, epoch, seal): Watched, now: Now) -> Option<Reach> {
         if !self.cfg.liveness_lag_aware {
             return None;
         }
         let t = self.cfg.backup_takeover_ms.max(1) as i64;
         let margin = self.cfg.expiry_margin_ms as i64;
         match self.known_expiry(holder, epoch) {
-            Some(expires) => (expires.since(now) > margin).then_some(Reach::PlusLapses(t)),
+            Some(expires) => (expires.since(now.wall) > margin).then_some(Reach::PlusLapses(t)),
             None if seal => Some(Reach::Flat(t / 2)),
             None => Some(Reach::PlusLapses(t)),
         }
@@ -2866,7 +2869,7 @@ impl Core {
     }
 
     /// Whether a watch discounts lag at all ([`Self::lag_discount`]).
-    fn lag_aware(&self, watched: Watched, now: Ms) -> bool {
+    fn lag_aware(&self, watched: Watched, now: Now) -> bool {
         self.lag_discount(watched, now).is_some()
     }
 
@@ -2880,7 +2883,7 @@ impl Core {
     /// can only delay a failover — by at most 3T, only within a minute of
     /// a late beat, and never past the lease's expiry margin
     /// ([`Self::lag_aware`]).
-    pub(crate) fn silence_window(&self, watched: Watched, now: Ms) -> i64 {
+    pub(crate) fn silence_window(&self, watched: Watched, now: Now) -> i64 {
         let t = self.cfg.backup_takeover_ms.max(1) as i64;
         if !self.lag_aware(watched, now) {
             return t;
@@ -2889,7 +2892,7 @@ impl Core {
         let late = self.bk.beats.get(&holder).map_or(0, |b| {
             b.late
                 .iter()
-                .filter(|(at, _)| now.since(*at) < LATE_BEATS_MEMORY_MS)
+                .filter(|(at, _)| now.wall.since(*at) < LATE_BEATS_MEMORY_MS)
                 .map(|(_, ms)| *ms)
                 .max()
                 .unwrap_or(0)
@@ -2905,7 +2908,7 @@ impl Core {
     /// since `last` after `last`, so a node that lags again and again
     /// still acts on a dead holder: within a window plus one of its own
     /// attentive time (the time it was not held up) of the silence.
-    pub(crate) fn attentive_since(&self, watched: Watched, last: Ms, now: Ms) -> Ms {
+    pub(crate) fn attentive_since(&self, watched: Watched, last: Ms, now: Now) -> Ms {
         match self.lag_discount(watched, now) {
             None => last,
             Some(Reach::PlusLapses(beyond)) => self.after_own_lapses(last, beyond, true),
@@ -2935,25 +2938,25 @@ impl Core {
     /// the holder given a full silence window (its re-acquisition after
     /// the close keeps the epoch, and a stale `last_heard` would seal it
     /// at once).
-    pub(crate) fn backup_watch_after_epoch(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn backup_watch_after_epoch(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.bk.role.is_none() {
             return;
         }
-        self.bk.last_heard = now;
+        self.bk.last_heard = now.wall;
         self.arm_backup_watch(now, out);
     }
 
-    fn arm_backup_watch(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn arm_backup_watch(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.bk.watch_timer.is_some() || !self.cfg.p2p || self.epoch.open {
             // Rule (b): no seal watch while a continuation epoch is
             // open (re-armed by `backup_watch_after_epoch`).
             return;
         }
-        let mut due = now.plus(self.cfg.backup_takeover_ms.max(1));
+        let mut due = now.wall.plus(self.cfg.backup_takeover_ms.max(1));
         if let Some(role) = self.bk.role {
             due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
         }
-        let id = self.set_timer(due, Timer::BackupWatch, out);
+        let id = self.set_timer_wall(due, Timer::BackupWatch, out);
         self.bk.watch_timer = Some(id);
     }
 
@@ -2961,9 +2964,9 @@ impl Core {
     /// as this node knows it, if that is still ahead: the watch looks at
     /// the expiry itself, whatever it has credited since
     /// (`on_backup_watch`).
-    fn watch_due_by_expiry(&self, holder: NodeId, epoch: Epoch, now: Ms, due: Ms) -> Ms {
+    fn watch_due_by_expiry(&self, holder: NodeId, epoch: Epoch, now: Now, due: Ms) -> Ms {
         match self.known_expiry(holder, epoch) {
-            Some(expires) if expires > now => due.min(expires),
+            Some(expires) if expires > now.wall => due.min(expires),
             _ => due,
         }
     }
@@ -2987,7 +2990,7 @@ impl Core {
     /// measured in this node's attentive time (its own lapses
     /// discounted), is still a window or more — also when the watch,
     /// inside the lease's expiry margin, counted plain silence to read.
-    pub(crate) fn on_backup_watch(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn on_backup_watch(&mut self, now: Now, out: &mut Vec<Action>) {
         let Some(role) = self.bk.role else {
             return;
         };
@@ -3004,7 +3007,7 @@ impl Core {
         if self.bk.restarted && self.bk.sealed < role.epoch {
             if self.links.get(&role.holder).is_some_and(|l| l.connected) {
                 self.bk.restarted = false;
-                self.bk.last_heard = self.bk.last_heard.max(now);
+                self.bk.last_heard = self.bk.last_heard.max(now.wall);
             } else {
                 let op = self.issue_s3(S3Op::LeaseGet, S3For::TakeoverGet, out);
                 self.bk.takeover_get = Some(op);
@@ -3020,7 +3023,7 @@ impl Core {
         let watched = (role.holder, role.epoch, true);
         let window = self.silence_window(watched, now);
         let since = self.attentive_since(watched, self.bk.last_heard, now);
-        let silent = now.since(since);
+        let silent = now.wall.since(since);
         // Past the expiry of the holder's lease as this node knows it (its
         // beats named it, or this node read it), its silence is not the
         // question; the lease ending is. What this node
@@ -3039,7 +3042,7 @@ impl Core {
         // seals early.
         let expired = self
             .known_expiry(role.holder, role.epoch)
-            .is_some_and(|expires| now >= expires);
+            .is_some_and(|expires| now.wall >= expires);
         if silent < window && !expired {
             // Looked at again no later than where the discount ends (the
             // lease's expiry margin, `lag_aware`): from there the plain
@@ -3048,12 +3051,12 @@ impl Core {
             let mut due = since.plus(window as u64);
             if let Some(expires) = self.known_expiry(role.holder, role.epoch) {
                 let aware_until = Ms(expires.0 - self.cfg.expiry_margin_ms as i64);
-                if aware_until > now {
+                if aware_until > now.wall {
                     due = due.min(aware_until);
                 }
             }
             let due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
-            let id = self.set_timer(due, Timer::BackupWatch, out);
+            let id = self.set_timer_wall(due, Timer::BackupWatch, out);
             self.bk.watch_timer = Some(id);
             return;
         }
@@ -3061,7 +3064,7 @@ impl Core {
             node = self.cfg.node_id,
             holder = role.holder,
             epoch = role.epoch,
-            silent_ms = now.since(self.bk.last_heard),
+            silent_ms = now.wall.since(self.bk.last_heard),
             attentive_ms = silent,
             window_ms = window,
             at_expiry = silent < window,
@@ -3071,20 +3074,20 @@ impl Core {
         self.bk.watch_read = Some(SealRecord {
             holder: role.holder,
             epoch: role.epoch,
-            silent_ms: now.since(self.bk.last_heard),
+            silent_ms: now.wall.since(self.bk.last_heard),
             attentive_ms: silent,
             window_ms: window,
-            at: now,
+            at: now.wall,
         });
         let op = self.issue_s3(S3Op::LeaseGet, S3For::TakeoverGet, out);
         self.bk.takeover_get = Some(op);
-        self.bk.takeover_read_at = now;
+        self.bk.takeover_read_at = now.wall;
         self.bk.takeover_read_for_expiry = silent < window;
     }
 
     pub(crate) fn on_takeover_get(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3106,7 +3109,7 @@ impl Core {
                     && !lease.released
                     && lease.backups.contains(&self.cfg.node_id) =>
             {
-                if probe && !lease.is_expired(now.0) {
+                if probe && !lease.is_expired(now.wall.0) {
                     // A restarted backup's probe (3b): the holder is
                     // renewing — alive; wait for its link. An expired
                     // lease is a holder gone: seal and take over now.
@@ -3114,7 +3117,7 @@ impl Core {
                     self.arm_backup_watch(now, out);
                     return;
                 }
-                if !lease.is_expired(now.0) {
+                if !lease.is_expired(now.wall.0) {
                     // The object is unexpired and lists this node. Whether
                     // the holder is silent is judged in this node's
                     // attentive time (`after_own_lapses`: its own lapses
@@ -3142,7 +3145,7 @@ impl Core {
                         self.bk.last_heard
                     };
                     let window = self.silence_window((role.holder, role.epoch, true), now);
-                    if for_expiry || now.since(since) < window {
+                    if for_expiry || now.wall.since(since) < window {
                         if let Some(b) = self.bk.beats.get_mut(&role.holder) {
                             if b.epoch == role.epoch {
                                 b.expires = b.expires.max(Ms(lease.expires_unix_ms));
@@ -3155,7 +3158,7 @@ impl Core {
                 }
                 if !probe
                     && self.bk.last_heard >= self.bk.takeover_read_at
-                    && !lease.is_expired(now.0)
+                    && !lease.is_expired(now.wall.0)
                 {
                     // The holder spoke while the lease was read: alive.
                     // Not once the lease it holds has expired: a holder
@@ -3193,7 +3196,7 @@ impl Core {
                             .unwrap_or(SealRecord {
                                 holder: role.holder,
                                 epoch: role.epoch,
-                                at: now,
+                                at: now.wall,
                                 ..Default::default()
                             }),
                     );
@@ -3383,7 +3386,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_stream_ahead(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         epoch: Epoch,
         base: Seq,
@@ -3562,7 +3565,7 @@ impl Core {
     /// order; those still ahead of the log keep waiting.
     pub(crate) fn retry_stream_ahead(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -3603,7 +3606,7 @@ impl Core {
     /// A non-holder under `ack_policy = S3`: the known holder silent on
     /// P2P for `backup_takeover_ms` is a takeover trigger (the lease's
     /// renewal time is checked at classification).
-    fn watch_s3_holder(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn watch_s3_holder(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if !self.cfg.fast_takeover || !self.cfg.p2p || self.lease.lost || self.epoch.open {
             return;
         }
@@ -3614,7 +3617,7 @@ impl Core {
             self.bk.holder_silent_since = None;
             return;
         }
-        if seen.is_claimable(now.0) {
+        if seen.is_claimable(now.wall.0) {
             return;
         }
         // Silence is measured on the holder's log stream when this node
@@ -3644,7 +3647,7 @@ impl Core {
         let silent = match self.stream_last_frame_from(seen.holder) {
             Some(frame) => {
                 let last = heard.map_or(frame, |h| h.max(frame));
-                now.since(self.attentive_since(who, last, now)) >= window
+                now.wall.since(self.attentive_since(who, last, now)) >= window
             }
             None => {
                 let up = self.links.get(&seen.holder).is_some_and(|l| l.connected)
@@ -3653,8 +3656,8 @@ impl Core {
                     self.bk.holder_silent_since = None;
                     return;
                 }
-                let since = *self.bk.holder_silent_since.get_or_insert(now);
-                now.since(self.attentive_since(who, since, now)) >= window
+                let since = *self.bk.holder_silent_since.get_or_insert(now.wall);
+                now.wall.since(self.attentive_since(who, since, now)) >= window
             }
         };
         if !silent {

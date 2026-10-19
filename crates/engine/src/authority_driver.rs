@@ -31,8 +31,8 @@ use constellation_authority::action::ControlOk;
 use constellation_authority::core::JobKind;
 use constellation_authority::{
     Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, InboxView,
-    LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, Ms, NodeId, OpId,
-    PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
+    LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, Ms, NodeId, Now,
+    OpId, PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
     S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult,
 };
 use constellation_fs_core::cache::DiskCache;
@@ -580,6 +580,7 @@ pub fn load_config(
 ) -> Config {
     let ttl_ms = crate::lease::lease_ttl_ms();
     let mut c = Config::defaults(node_id, incarnation);
+    c.clock_id = constellation_platform::clock::protocol().id();
     c.single_writer = lease_mode == LeaseMode::SingleWriter;
     c.ttl_ms = ttl_ms;
     c.expiry_margin_ms = crate::lease::expiry_margin_ms() as u64;
@@ -801,8 +802,8 @@ pub fn ack_s3_of(fs_policy: Option<&str>) -> bool {
     fs_policy.is_some_and(|p| p.trim().eq_ignore_ascii_case("s3"))
 }
 
-fn now() -> Ms {
-    Ms(now_unix_ms())
+fn now() -> Now {
+    constellation_platform::clock::protocol().now()
 }
 
 fn cas_failure(e: StoreError) -> CasFailure {
@@ -918,6 +919,15 @@ pub struct Driver {
     /// when both have stayed the same (the stuck-job report,
     /// [`STUCK_JOB`]).
     job_since: Option<(JobKind, u64, std::time::Instant, bool)>,
+    /// The protocol clock's step count already logged (`note_clock_steps`).
+    clock_steps_logged: u64,
+    /// When the step being handled took its `Now` (taken just before it):
+    /// the anchor of the relative timers it arms. `SetTimer { after_ms }`
+    /// counts from the reading, not from the dispatch, so a step that waited
+    /// between its clock read and its actions (a store stall, a stopped
+    /// process) still fires the timers it armed when the reading says, as
+    /// the absolute deadlines it used to arm did.
+    now_at: std::time::Instant,
 }
 
 /// A core job (a round, an acquisition, a flush, ...) in progress this
@@ -2038,7 +2048,35 @@ impl Driver {
             profile: StepProfile::default(),
             step_tail: StepTail::new(),
             job_since: None,
+            clock_steps_logged: 0,
+            now_at: std::time::Instant::now(),
         }
+    }
+
+    /// Plan 43 C7-H1: say so when the node's wall clock stepped. The
+    /// protocol clock counts the steps it sees (`types::clock`); nothing
+    /// in the protocol acts on them: the honour clock follows a forward
+    /// step once and neither it nor the wait clock moves for a backward
+    /// one. The log line is the operator's trace of why a held window
+    /// ended early.
+    fn note_clock_steps(&mut self) {
+        let clock = constellation_platform::clock::protocol();
+        let seen = clock.step_count();
+        if seen == self.clock_steps_logged {
+            return;
+        }
+        self.clock_steps_logged = seen;
+        let stats = clock.step_stats();
+        let (at, delta) = stats.last_step.unwrap_or((0, 0));
+        tracing::warn!(
+            node = self.node_id,
+            delta_ms = delta,
+            wall_ms = at,
+            steps_forward = stats.steps_forward,
+            steps_backward = stats.steps_backward,
+            "the wall clock stepped; honour and wait clocks unaffected (a forward step ends \
+             held windows early; plan 43 C7-H1)"
+        );
     }
 
     /// The driver's own event sender (tickers spawned by `run`).
@@ -2048,6 +2086,7 @@ impl Driver {
 
     pub async fn run(mut self) {
         let mut out = Vec::new();
+        self.now_at = std::time::Instant::now();
         let start = now();
         self.core.start(start, &*self.deps.meta, &mut out);
         self.refresh();
@@ -2089,6 +2128,7 @@ impl Driver {
             )
         });
         crate::fault::start_runtime_hog_file(self.node_id);
+        crate::fault::start_clock_faults();
         self.step_end = std::time::Instant::now();
         enum Wake {
             Internal(Internal),
@@ -2138,6 +2178,7 @@ impl Driver {
                 },
             };
             self.deps.off_core.loop_woke(now_unix_ms());
+            self.note_clock_steps();
             *self.loop_thread.lock().unwrap() =
                 constellation_platform::native().process.current_thread();
             self.hand_lag();
@@ -2326,6 +2367,7 @@ impl Driver {
         // waits for the step.
         let ((action_kinds, handled_us, refreshed_us, dispatched_us), store) =
             constellation_meta::priority_writes(|| {
+                self.now_at = std::time::Instant::now();
                 let actions = self.core.handle(now(), event, &*self.deps.meta);
                 if applies_segments {
                     if let Some(holds) = &self.deps.holds {
@@ -2406,7 +2448,7 @@ impl Driver {
     /// status snapshot.
     fn refresh(&mut self) {
         let now = now();
-        self.publish_alive_targets(now);
+        self.publish_alive_targets(now.wall);
         {
             // Compared in place: nothing is allocated on a step that
             // changed no certificate (the lock and the walk over the
@@ -2437,7 +2479,7 @@ impl Driver {
         let lease = self.core.lease();
         self.deps
             .view
-            .mirror(lease, now, cfg, self.core.ack_gated());
+            .mirror(lease, now.wall, cfg, self.core.ack_gated());
         self.deps
             .view
             .set_liveness(self.core.fast_tenure(), self.core.last_s3_fresh().0);
@@ -3487,13 +3529,15 @@ impl Driver {
                 }
                 Action::Send { to, msg } => self.send(to, msg),
                 Action::S3 { op, req } => self.spawn_s3(op, req),
-                Action::SetTimer { id, at, kind } => {
+                Action::SetTimer { id, after_ms, kind } => {
                     let tx = if prompt_timer(kind) {
                         self.prompt_tx.clone()
                     } else {
                         self.int_tx.clone()
                     };
-                    let delay = Duration::from_millis((at.0 - now_unix_ms()).max(0) as u64);
+                    // From the step's reading (`now_at`), not from here.
+                    let delay =
+                        Duration::from_millis(after_ms).saturating_sub(self.now_at.elapsed());
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
                         let _ = tx.send(Internal::Timer {
@@ -6301,6 +6345,10 @@ pub struct Standalone {
     holds: Option<Arc<crate::holds::Holds>>,
     /// Timers due now, fired in order.
     due: std::collections::VecDeque<constellation_authority::TimerId>,
+    /// When the step being absorbed took its `Now`: a timer is due when the
+    /// time since then has reached its `after_ms` (the old test was
+    /// `at <= now()` at the absorb).
+    now_at: Instant,
 }
 
 #[allow(dead_code)] // the tools' and tests' driver; not every entry point has a caller yet
@@ -6324,6 +6372,7 @@ impl Standalone {
         publisher: Option<crate::mtree_publish::TreePublisher>,
     ) -> Self {
         let mut cfg = Config::defaults(node_id, 0);
+        cfg.clock_id = constellation_platform::clock::protocol().id();
         cfg.single_writer = lease_mode == LeaseMode::SingleWriter;
         cfg.p2p = false;
         cfg.inbox = false;
@@ -6333,6 +6382,7 @@ impl Standalone {
         cfg.ttl_ms = crate::lease::lease_ttl_ms();
         let mut core = Core::new(cfg);
         let mut out = Vec::new();
+        let now_at = Instant::now();
         core.start(now(), &*meta, &mut out);
         let mut this = Self {
             core,
@@ -6349,6 +6399,7 @@ impl Standalone {
             pending_rebuild: Default::default(),
             holds: None,
             due: Default::default(),
+            now_at,
         };
         this.absorb(out);
         this
@@ -6417,7 +6468,7 @@ impl Standalone {
     /// Copy the core's lease state into `view`, as the daemon's driver
     /// does after every event (tests that need the fast path's gate).
     pub fn mirror(&self, view: &crate::lease::LeaseView) {
-        view.mirror(self.core.lease(), now(), self.core.config(), false);
+        view.mirror(self.core.lease(), now().wall, self.core.config(), false);
     }
 
     /// Run every queued event and pending IO to completion (no timers).
@@ -6530,6 +6581,7 @@ impl Standalone {
     /// One event, S3 request or publish; `false` when nothing is pending.
     async fn step(&mut self) -> Result<bool> {
         if let Some(event) = self.queue.pop_front() {
+            self.now_at = Instant::now();
             let out = self.core.handle(now(), event, &*self.meta);
             self.absorb(out);
         } else if let Some((op, req)) = self.pending_s3.pop_front() {
@@ -6618,8 +6670,8 @@ impl Standalone {
                 Action::ControlDone { op, result } => {
                     self.controls.insert(op, result);
                 }
-                Action::SetTimer { id, at, .. } => {
-                    if at <= now() {
+                Action::SetTimer { id, after_ms, .. } => {
+                    if u128::from(after_ms) <= self.now_at.elapsed().as_millis() {
                         self.due.push_back(id);
                     }
                 }

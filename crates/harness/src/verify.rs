@@ -1346,12 +1346,59 @@ pub struct Acquired {
     pub log: String,
 }
 
-/// Parse logs: `(log label, text, the protocol-clock offset its daemon
+/// How far a daemon's protocol wall clock ran from the host's: the
+/// constant offset it was given (`clock:<ms>`) plus its steps (`clock:step`,
+/// plan 43 C7-H1), which change it at the time they were applied. The logs'
+/// own timestamps are the host's, so the error in force at a log line is
+/// looked up by the line's time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClockSkew {
+    pub offset: i64,
+    /// `(host unix µs the step was applied at, cumulative step in ms from
+    /// then on)`, oldest first.
+    pub steps: Vec<(i64, i64)>,
+}
+
+impl ClockSkew {
+    pub fn constant(offset: i64) -> Self {
+        Self {
+            offset,
+            steps: Vec::new(),
+        }
+    }
+
+    /// The error (ms) at host time `host_us` (unix µs).
+    pub fn at(&self, host_us: i64) -> i64 {
+        self.offset
+            + self
+                .steps
+                .iter()
+                .rev()
+                .find(|(t, _)| *t <= host_us)
+                .map_or(0, |(_, cumulative)| *cumulative)
+    }
+}
+
+/// Each daemon of `scenario`'s clock error, by node name.
+fn clock_skews(scenario: &str) -> HashMap<String, ClockSkew> {
+    crate::load::daemons_of(scenario)
+        .into_iter()
+        .map(|d| {
+            let skew = ClockSkew {
+                offset: d.clock_offset,
+                steps: crate::load::clock_steps_of(scenario, &d.node),
+            };
+            (d.node, skew)
+        })
+        .collect()
+}
+
+/// Parse logs: `(log label, text, the protocol-clock error its daemon
 /// ran with)`.
-pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired>) {
+pub fn parse_logs(logs: &[(String, String, ClockSkew)]) -> (LockEvidence, Vec<Acquired>) {
     let mut ev = LockEvidence::default();
     let mut acquired = Vec::new();
-    for (label, text, offset) in logs {
+    for (label, text, skew) in logs {
         for raw in text.lines() {
             let kind = if raw.contains("tagged op executed") {
                 1
@@ -1372,11 +1419,17 @@ pub fn parse_logs(logs: &[(String, String, i64)]) -> (LockEvidence, Vec<Acquired
             match kind {
                 1 | 2 => {
                     // In µs. `executed`: the protocol clock at the check, to
-                    // the ms (the daemon's offset removed); `landed`: the
-                    // host clock after the write committed, to the µs.
+                    // the ms (the daemon's offset and the steps in force
+                    // at the line's time removed); `landed`: the host
+                    // clock after the write committed, to the µs.
                     let at = if kind == 1 {
                         ev.raw.executed += 1;
-                        int("at_ms").map(|a| (a - offset) * 1_000)
+                        // The host clock at the check when the line says
+                        // (`host_us`), else the line's own time.
+                        let error = int("host_us")
+                            .or_else(|| line_unix_us(&line))
+                            .map_or(skew.offset, |t| skew.at(t));
+                        int("at_ms").map(|a| (a - error) * 1_000)
                     } else {
                         ev.raw.landed += 1;
                         int("host_us")
@@ -1574,12 +1627,9 @@ pub fn check_lease_epochs(acquired: &[Acquired]) -> Vec<String> {
 }
 
 /// The log checks over `logs` (name, path) of a scenario's clients, with
-/// each daemon's clock offset.
+/// each daemon's clock error.
 fn log_violations(scenario: &str, logs: &[(String, PathBuf)]) -> Vec<String> {
-    let offsets: HashMap<String, i64> = crate::load::daemons_of(scenario)
-        .into_iter()
-        .map(|d| (d.node, d.clock_offset))
-        .collect();
+    let skews = clock_skews(scenario);
     let mut texts = Vec::new();
     let mut v = Vec::new();
     for (name, log) in logs {
@@ -1598,7 +1648,7 @@ fn log_violations(scenario: &str, logs: &[(String, PathBuf)]) -> Vec<String> {
                         f.file_name().unwrap_or_default().to_string_lossy()
                     ),
                     t,
-                    offsets.get(name).copied().unwrap_or(0),
+                    skews.get(name).cloned().unwrap_or_default(),
                 ));
             }
         }
@@ -1646,18 +1696,15 @@ pub fn check_logs(clients: &[&crate::client::Client]) -> Result<LogCounts> {
         "log missing: no log of {missing:?} to check"
     );
     // `log_files` already lists every incarnation.
-    let offsets: HashMap<String, i64> = crate::load::daemons_of(&scenario)
-        .into_iter()
-        .map(|d| (d.node, d.clock_offset))
-        .collect();
-    let texts: Vec<(String, String, i64)> = logs
+    let skews = clock_skews(&scenario);
+    let texts: Vec<(String, String, ClockSkew)> = logs
         .iter()
         .filter_map(|(n, p)| {
             std::fs::read_to_string(p).ok().map(|t| {
                 (
                     format!("{n}:{}", p.display()),
                     t,
-                    offsets.get(n).copied().unwrap_or(0),
+                    skews.get(n).cloned().unwrap_or_default(),
                 )
             })
         })
@@ -2173,7 +2220,7 @@ pub fn toxic_timeline(since: Instant) -> Vec<String> {
 /// Pick a conflicting pair of grants to two nodes from `logs` (for a
 /// workload that proves the token check catches a violation): the later
 /// grant, and the earlier one's id.
-pub fn conflicting_grants(texts: &[(String, String, i64)]) -> Option<(GrantRec, GrantRec)> {
+pub fn conflicting_grants(texts: &[(String, String, ClockSkew)]) -> Option<(GrantRec, GrantRec)> {
     let (ev, _) = parse_logs(texts);
     for (i, a) in ev.grants.iter().enumerate() {
         if let Some(b) = ev.grants[i + 1..]
@@ -2187,17 +2234,57 @@ pub fn conflicting_grants(texts: &[(String, String, i64)]) -> Option<(GrantRec, 
 }
 
 /// Read a log for [`conflicting_grants`].
-pub fn read_log(name: &str, path: &Path) -> Result<(String, String, i64)> {
+pub fn read_log(name: &str, path: &Path) -> Result<(String, String, ClockSkew)> {
     Ok((
         name.to_string(),
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
-        0,
+        ClockSkew::default(),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expectation: the clock error in force at a log line is the offset
+    /// plus the last step applied at or before the line's time, and the
+    /// token-order checker reads a post-step `at_ms` with it removed.
+    #[test]
+    fn a_clock_step_is_removed_from_the_lines_after_it() {
+        let skew = ClockSkew {
+            offset: 100,
+            steps: vec![(5_000_000, 3_000), (9_000_000, 0)],
+        };
+        assert_eq!(skew.at(4_999_999), 100);
+        assert_eq!(skew.at(5_000_000), 3_100);
+        assert_eq!(skew.at(8_999_999), 3_100);
+        assert_eq!(skew.at(9_000_000), 100);
+        // An `executed` line at host time 6 s whose daemon clock was 3.1 s
+        // ahead of the host's reads host time 6.0 s once de-skewed.
+        let t = "2026-10-15T00:00:06.000Z";
+        let base = line_unix_us("2026-10-15T00:00:00.000Z").unwrap();
+        let skew = ClockSkew {
+            offset: 100,
+            steps: vec![(base + 5_000_000, 3_000)],
+        };
+        let at_ms = base / 1_000 + 6_000 + 3_100;
+        let line = format!(
+            "{t} DEBUG constellation::token_exec: tagged op executed minter=1 seq=1 at_ms={at_ms}"
+        );
+        let (ev, _) = parse_logs(&[("x".into(), line, skew.clone())]);
+        assert_eq!(ev.execs[&(1, 1)].0, base + 6_000_000);
+        // A line logged just after a step whose `at_ms` was read just before
+        // it: `host_us` names the clock in force at the read, the line's own
+        // time would de-skew it by the step it did not have.
+        let step_at = base + 5_000_000;
+        let read_us = step_at - 2_000;
+        let at_ms = (read_us / 1_000) + 100; // the daemon's clock was 100 ms off
+        let line = format!(
+            "2026-10-15T00:00:05.000500Z DEBUG constellation::token_exec: tagged op executed minter=1 seq=2 at_ms={at_ms} host_us={read_us}"
+        );
+        let (ev, _) = parse_logs(&[("x".into(), line, skew)]);
+        assert_eq!(ev.execs[&(1, 2)].0, (read_us / 1_000) * 1_000);
+    }
 
     #[test]
     fn payloads_prove_themselves() {
@@ -2528,8 +2615,8 @@ mod tests {
         ]
         .join("\n");
         let logs = vec![
-            ("owner".to_string(), owner.clone(), 0),
-            ("exec".to_string(), good, 0),
+            ("owner".to_string(), owner.clone(), ClockSkew::constant(0)),
+            ("exec".to_string(), good, ClockSkew::constant(0)),
         ];
         let (ev, _) = parse_logs(&logs);
         assert_eq!(ev.grants.len(), 4);
@@ -2540,14 +2627,20 @@ mod tests {
         );
         // Grant 1/1's op lands after 1/2 went to node 3.
         let bad = [exec(1, 2_000), exec(1, 5_200)].join("\n");
-        let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("exec".into(), bad, 0)]);
+        let (ev, _) = parse_logs(&[
+            ("owner".into(), owner.clone(), ClockSkew::constant(0)),
+            ("exec".into(), bad, ClockSkew::constant(0)),
+        ]);
         let v = check_token_order(&ev);
         assert_eq!(v.len(), 1, "{v:?}");
         assert!(v[0].contains("200.000 ms after grant 1/2"), "{v:?}");
         // The grant line's own millisecond is no evidence of an overlap
         // (both clocks read whole ms).
         let tie = exec(1, 5_000);
-        let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("exec".into(), tie, 0)]);
+        let (ev, _) = parse_logs(&[
+            ("owner".into(), owner.clone(), ClockSkew::constant(0)),
+            ("exec".into(), tie, ClockSkew::constant(0)),
+        ]);
         assert!(
             check_token_order(&ev).is_empty(),
             "{:?}",
@@ -2557,11 +2650,11 @@ mod tests {
         // happened at 4.8 s: in order.
         let ahead = exec(1, 5_200);
         let (ev, _) = parse_logs(&[
-            ("owner".into(), owner.clone(), 0),
-            ("exec".into(), ahead, 400),
+            ("owner".into(), owner.clone(), ClockSkew::constant(0)),
+            ("exec".into(), ahead, ClockSkew::constant(400)),
         ]);
         assert!(check_token_order(&ev).is_empty());
-        assert!(conflicting_grants(&[("owner".into(), owner, 0)]).is_some());
+        assert!(conflicting_grants(&[("owner".into(), owner, ClockSkew::constant(0))]).is_some());
     }
 
     #[test]
@@ -2591,7 +2684,10 @@ mod tests {
             line("landed", "host_us", 2, 6_001_000),
         ]
         .join("\n");
-        let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("x".into(), f1, 400)]);
+        let (ev, _) = parse_logs(&[
+            ("owner".into(), owner.clone(), ClockSkew::constant(0)),
+            ("x".into(), f1, ClockSkew::constant(400)),
+        ]);
         let v = check_token_order(&ev);
         assert_eq!(v.len(), 1, "{v:?}");
         assert!(v[0].contains("300.000 ms after grant 1/2"), "{v:?}");
@@ -2602,8 +2698,16 @@ mod tests {
         let first = grant_line("2026-10-15T00:00:01.000Z", 1, 1, 2, "Exclusive");
         for (landed, caught) in [(5_000_800, true), (5_000_200, false)] {
             let (ev, _) = parse_logs(&[
-                ("owner".into(), format!("{first}\n{owner_us}"), 0),
-                ("x".into(), line("landed", "host_us", 1, landed), 0),
+                (
+                    "owner".into(),
+                    format!("{first}\n{owner_us}"),
+                    ClockSkew::constant(0),
+                ),
+                (
+                    "x".into(),
+                    line("landed", "host_us", 1, landed),
+                    ClockSkew::constant(0),
+                ),
             ]);
             assert_eq!(
                 !check_token_order(&ev).is_empty(),
@@ -2613,11 +2717,14 @@ mod tests {
         }
         // Executed lines without any landed one: blind to F1.
         let old = line("executed", "at_ms", 1, 4_000);
-        let (ev, _) = parse_logs(&[("owner".into(), owner.clone(), 0), ("x".into(), old, 0)]);
+        let (ev, _) = parse_logs(&[
+            ("owner".into(), owner.clone(), ClockSkew::constant(0)),
+            ("x".into(), old, ClockSkew::constant(0)),
+        ]);
         assert!(check_blind(&ev)[0].contains("no `tagged op landed`"));
         // A grant line whose fields drifted is counted, not parsed: blind.
         let drifted = "2026-10-15T00:00:07.000Z DEBUG x: granted a lock node=1 to=2 inode=42 mode=Exclusive id=1/9";
-        let (ev, _) = parse_logs(&[("owner".into(), drifted.into(), 0)]);
+        let (ev, _) = parse_logs(&[("owner".into(), drifted.into(), ClockSkew::constant(0))]);
         let b = check_blind(&ev);
         assert!(
             b[0].contains("1 `granted a lock` line(s) in the logs, 0 parsed"),
@@ -2630,12 +2737,15 @@ mod tests {
         let a = "2026-10-15T00:00:01Z INFO x: acquired the lease node=1 epoch=3 takeover=false";
         let b = "2026-10-15T00:00:02Z INFO x: acquired the lease node=2 epoch=4 takeover=true";
         let c = "2026-10-15T00:00:03Z INFO x: acquired the lease node=3 epoch=4 takeover=true";
-        let (_, acq) = parse_logs(&[("a".into(), a.into(), 0), ("b".into(), b.into(), 0)]);
+        let (_, acq) = parse_logs(&[
+            ("a".into(), a.into(), ClockSkew::constant(0)),
+            ("b".into(), b.into(), ClockSkew::constant(0)),
+        ]);
         assert!(check_lease_epochs(&acq).is_empty());
         let (_, acq) = parse_logs(&[
-            ("a".into(), a.into(), 0),
-            ("b".into(), b.into(), 0),
-            ("c".into(), c.into(), 0),
+            ("a".into(), a.into(), ClockSkew::constant(0)),
+            ("b".into(), b.into(), ClockSkew::constant(0)),
+            ("c".into(), c.into(), ClockSkew::constant(0)),
         ]);
         let v = check_lease_epochs(&acq);
         assert_eq!(v.len(), 1);
@@ -2810,7 +2920,11 @@ mod tests {
         // A grant whose mode is neither variant is counted, not parsed.
         let odd = grant_line("2026-10-15T00:00:01.000Z", 1, 1, 2, "Upgradable");
         let ok = grant_line("2026-10-15T00:00:02.000Z", 1, 2, 3, "Shared");
-        let (ev, _) = parse_logs(&[("owner".into(), format!("{odd}\n{ok}"), 0)]);
+        let (ev, _) = parse_logs(&[(
+            "owner".into(),
+            format!("{odd}\n{ok}"),
+            ClockSkew::constant(0),
+        )]);
         assert_eq!(ev.grants.len(), 1);
         let b = check_blind(&ev);
         assert!(
@@ -2849,7 +2963,7 @@ mod tests {
     fn a_dropped_log_line_summary_is_a_blind_spot() {
         let grant = grant_line("2026-10-15T00:00:02.000Z", 1, 2, 3, "Shared");
         let text = format!("{grant}\n{}\n", summary_line(1834));
-        let (mut ev, _) = parse_logs(&[("a:mount.log.1".into(), text, 0)]);
+        let (mut ev, _) = parse_logs(&[("a:mount.log.1".into(), text, ClockSkew::constant(0))]);
         assert_eq!((ev.raw.dropped, ev.parsed.dropped), (1, 1));
         assert_eq!(ev.dropped, [("a:mount.log.1".to_string(), 1834)]);
         let b = check_blind(&ev);
@@ -2864,12 +2978,16 @@ mod tests {
         ev.declared_drops.insert("a".into());
         assert!(check_blind(&ev).is_empty());
         // Another client's drops are still a violation.
-        let (mut ev, _) = parse_logs(&[("b:mount.log".into(), summary_line(7), 0)]);
+        let (mut ev, _) = parse_logs(&[(
+            "b:mount.log".into(),
+            summary_line(7),
+            ClockSkew::constant(0),
+        )]);
         ev.declared_drops.insert("a".into());
         assert_eq!(check_blind(&ev).len(), 1);
         // A summary line whose field cannot be read is format drift.
         let drifted = summary_line(5).replace("dropped_lines=5", "dropped=5");
-        let (ev, _) = parse_logs(&[("a".into(), drifted, 0)]);
+        let (ev, _) = parse_logs(&[("a".into(), drifted, ClockSkew::constant(0))]);
         assert_eq!((ev.raw.dropped, ev.parsed.dropped), (1, 0));
         let b = check_blind(&ev);
         assert!(
@@ -2878,7 +2996,7 @@ mod tests {
             "{b:?}"
         );
         // A log without a summary line is as clean as before.
-        let (ev, _) = parse_logs(&[("a".into(), grant, 0)]);
+        let (ev, _) = parse_logs(&[("a".into(), grant, ClockSkew::constant(0))]);
         assert!(check_blind(&ev).is_empty());
     }
 
@@ -2892,7 +3010,7 @@ mod tests {
             "writes to the log sink failed",
         ] {
             let line = summary_line(11).replace("the log sink did not keep up", words);
-            let (ev, _) = parse_logs(&[("b:mount.log".into(), line, 0)]);
+            let (ev, _) = parse_logs(&[("b:mount.log".into(), line, ClockSkew::constant(0))]);
             assert_eq!((ev.raw.dropped, ev.parsed.dropped), (1, 1), "{words}");
             assert_eq!(ev.dropped, [("b:mount.log".to_string(), 11)]);
             assert_eq!(check_blind(&ev).len(), 1);

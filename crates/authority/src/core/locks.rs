@@ -81,7 +81,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk, LockAnswer, LockTestAnswer, S3Op};
 use crate::event::{LockOutcome, LockRenewEntry, LockRenewResult, LockTestOutcome, PeerMsg};
-use crate::ids::{Ms, NodeId, OpId, TimerId};
+use crate::ids::{Ms, NodeId, Now, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::locks::{Grant, GrantId, HeldGrant, Installed, LockMode};
@@ -642,8 +642,8 @@ impl Core {
     /// A restamp for a grant that changed owner (a move, a reclaim, a
     /// mirror installed): as if renewed now, which is never sooner than
     /// what its holder measured.
-    fn restamp(&self, now: Ms) -> i64 {
-        now.0 + self.lock_ttl_ms() + self.lock_margin_ms()
+    fn restamp(&self, now: Now) -> i64 {
+        now.wall.0 + self.lock_ttl_ms() + self.lock_margin_ms()
     }
 
     /// The record of a moved grant that carried what was left of its
@@ -670,7 +670,7 @@ impl Core {
         now.0
             .saturating_add(left_ms.min(i64::MAX as u64) as i64)
             .saturating_add(self.lock_margin_ms())
-            .min(self.restamp(now))
+            .min(self.restamp(Now::same(now.0)))
     }
 
     /// What is left of `g`'s record on the sender's clock at `now`, in
@@ -683,7 +683,7 @@ impl Core {
 
     // ------------------------------------------------------------ routing
 
-    fn lock_route(&self, now: Ms, ino: Ino, replica: &dyn Replica) -> Route {
+    fn lock_route(&self, now: Now, ino: Ino, replica: &dyn Replica) -> Route {
         self.lock_route_for(now, ino, replica, false)
     }
 
@@ -697,7 +697,7 @@ impl Core {
     /// `NotOwner { 0 }` sends it to the lease instead.
     fn lock_route_answering(
         &self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         replica: &dyn Replica,
         from: NodeId,
@@ -714,7 +714,7 @@ impl Core {
     /// that is what the floor is for; only new grants wait (the
     /// harness's lock-failover found the successor answering `NotOwner`
     /// until the locker's grant lapsed).
-    fn lock_route_for(&self, now: Ms, ino: Ino, replica: &dyn Replica, renewal: bool) -> Route {
+    fn lock_route_for(&self, now: Now, ino: Ino, replica: &dyn Replica, renewal: bool) -> Route {
         if self.cfg.delegation && !replica.delegation_table().is_empty() {
             let keys = Self::read_keys(ino, None);
             if let constellation_meta::delegation::Ownership::Delegated(d) =
@@ -722,8 +722,8 @@ impl Core {
             {
                 if d.node == self.cfg.node_id {
                     return match self.deleg_mine_until(d.gen) {
-                        Some(until) if now < until => Route::Me {
-                            cap_ms: until.0 - self.lock_margin_ms() - now.0,
+                        Some(until) if now.wall < until => Route::Me {
+                            cap_ms: until.0 - self.lock_margin_ms() - now.wall.0,
                             gen: d.gen,
                         },
                         // Recalled: the subtree's grants went back to the
@@ -762,7 +762,7 @@ impl Core {
         if renewal {
             if let Some(expires) = self.epoch_reclaim_expires(now) {
                 return Route::Me {
-                    cap_ms: expires - self.lock_margin_ms() - now.0,
+                    cap_ms: expires - self.lock_margin_ms() - now.wall.0,
                     gen: 0,
                 };
             }
@@ -823,23 +823,23 @@ impl Core {
     /// grants nothing, so a table that is not the whole truth yet (a
     /// takeover's, whose predecessor's grants are still being learned)
     /// only refuses early what would have waited.
-    fn lock_owner_resuming(&self, now: Ms) -> bool {
+    fn lock_owner_resuming(&self, now: Now) -> bool {
         self.epoch_reclaim_pending(now)
             || (self.lease.usable(now, &self.cfg) && self.lease.fenced() && !self.lease.releasing)
     }
 
     /// The root's grants never outlive its lease's usable end (under a
     /// continuation epoch the lease has no expiry; the ttl stands).
-    pub(crate) fn lock_cap_ms(&self, now: Ms) -> i64 {
+    pub(crate) fn lock_cap_ms(&self, now: Now) -> i64 {
         let Some((lease, _)) = &self.lease.held else {
             return 0;
         };
         if self.lease.epoch_held() {
             let ttl = self.lock_ttl_ms();
-            self.ack.note_hold_grant(now.0 + ttl);
+            self.ack.note_hold_grant(now.wall.0 + ttl);
             return ttl;
         }
-        lease.expires_unix_ms - self.lock_margin_ms() - now.0
+        lease.expires_unix_ms - self.lock_margin_ms() - now.wall.0
     }
 
     /// The latest end of a subtree grace on this tenure (an outwaited
@@ -857,9 +857,9 @@ impl Core {
     /// such an inode is under no directory any more. Which subtree it
     /// left is not recorded, so any grace covers every unlinked inode
     /// (reclaims admitted, as under any grace).
-    fn lock_in_grace(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> bool {
+    fn lock_in_grace(&mut self, now: Now, ino: Ino, replica: &dyn Replica) -> bool {
         use constellation_fs_core::types::ROOT_INO;
-        self.lk.grace.retain(|(_, until)| *until > now);
+        self.lk.grace.retain(|(_, until)| *until > now.wall);
         if self.lk.grace.is_empty() {
             return false;
         }
@@ -870,8 +870,8 @@ impl Core {
     }
 
     /// Whether new grants are refused now (reclaims still accepted).
-    fn lock_grace_active(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> bool {
-        Self::lock_quarantine_until(replica) > now.0 || self.lock_in_grace(now, ino, replica)
+    fn lock_grace_active(&mut self, now: Now, ino: Ino, replica: &dyn Replica) -> bool {
+        Self::lock_quarantine_until(replica) > now.wall.0 || self.lock_in_grace(now, ino, replica)
     }
 
     /// The whole-namespace grace: the restart or takeover quarantine of
@@ -889,7 +889,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_request(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         ino: Ino,
@@ -925,11 +925,11 @@ impl Core {
         {
             let hold = self.cfg.recall_hold_ms;
             let wid = self.lk.waiters[i].id;
-            let timer = self.set_timer(now.plus(hold), Timer::LockHeldReply(wid), out);
-            let queued = self.lock_waited_since(now, waited_ms);
+            let timer = self.set_timer_wall(now.wall.plus(hold), Timer::LockHeldReply(wid), out);
+            let queued = self.lock_waited_since(now.wall, waited_ms);
             let w = &mut self.lk.waiters[i];
             w.sent = sent;
-            w.recv = now;
+            w.recv = now.wall;
             w.req = Some(req);
             // A client that lost a round keeps its place (`waited_ms`).
             w.since = w.since.min(queued);
@@ -990,7 +990,7 @@ impl Core {
     /// of 8 reader restarts, once the 35-minute livelock was gone).
     fn lock_note_incarnation(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         incarnation: u32,
         replica: &dyn Replica,
@@ -1115,7 +1115,7 @@ impl Core {
     /// refused (`NotOwner { 0 }`) if it shows a deposition. Holding
     /// rather than refusing at once: a refusal makes the holder re-read
     /// the lease and send again, a round trip to S3 either way.
-    fn lock_answer(&mut self, now: Ms, to: NodeId, msg: PeerMsg, out: &mut Vec<Action>) {
+    fn lock_answer(&mut self, now: Now, to: NodeId, msg: PeerMsg, out: &mut Vec<Action>) {
         let need = std::mem::take(&mut self.lk.horizon_need);
         let fresh = self.lk.fresh_need.take();
         // An answer that grants and extends nothing (a refusal, a request
@@ -1153,7 +1153,7 @@ impl Core {
                 tracing::debug!(
                     node = self.cfg.node_id,
                     to,
-                    held_ms = now.0 - since.0,
+                    held_ms = now.wall.0 - since.0,
                     "an answer that grants nothing goes ahead of a held answer to the same peer"
                 );
             }
@@ -1188,7 +1188,7 @@ impl Core {
             fresh,
             to,
             msg,
-            since: now,
+            since: now.wall,
             order_only,
         });
         self.lock_horizon_write(out);
@@ -1212,7 +1212,7 @@ impl Core {
     /// `NotOwner { 0 }` (the holder retries).
     pub(crate) fn on_lock_horizon_persisted(
         &mut self,
-        now: Ms,
+        now: Now,
         until: i64,
         durable: Option<i64>,
         replica: &dyn Replica,
@@ -1245,7 +1245,7 @@ impl Core {
     /// same way once that tenure is gone (`Core::renew_verdict`).
     fn lock_flush_held(
         &mut self,
-        now: Ms,
+        now: Now,
         horizon_failed: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1278,7 +1278,7 @@ impl Core {
                 h.fresh = None;
             }
             if h.need <= durable && h.fresh.is_none() && !keep.iter().any(|k| k.to == h.to) {
-                if h.order_only || h.since != now {
+                if h.order_only || h.since != now.wall {
                     // Held for the order of the answers to its peer alone
                     // (or released later than it was held): how long.
                     if h.order_only {
@@ -1287,7 +1287,7 @@ impl Core {
                     tracing::debug!(
                         node = self.cfg.node_id,
                         to = h.to,
-                        held_ms = now.0 - h.since.0,
+                        held_ms = now.wall.0 - h.since.0,
                         order_only = h.order_only,
                         "a held lock answer goes"
                     );
@@ -1323,7 +1323,7 @@ impl Core {
     /// timer too.
     pub(crate) fn renew_after_event(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1407,7 +1407,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lock_serve(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         mode: LockMode,
@@ -1497,9 +1497,9 @@ impl Core {
                 },
             );
         }
-        let blocked = match self
-            .lock_try_grant(now, now, from, ino, mode, cap_ms, gen, false, out, replica)
-        {
+        let blocked = match self.lock_try_grant(
+            now, now.wall, from, ino, mode, cap_ms, gen, false, out, replica,
+        ) {
             Ok(outcome) => return Served::Outcome(outcome),
             Err(blocked) => blocked,
         };
@@ -1550,16 +1550,16 @@ impl Core {
     /// the grace's remainder (a difference on this owner's clock), at
     /// most a second, so that it is routed afresh promptly should the
     /// ownership move meanwhile.
-    fn lock_grace_retry_ms(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> u64 {
-        let left = self.lock_grace_end(now, ino, replica) - now.0;
+    fn lock_grace_retry_ms(&mut self, now: Now, ino: Ino, replica: &dyn Replica) -> u64 {
+        let left = self.lock_grace_end(now, ino, replica) - now.wall.0;
         (left + 1).clamp(10, 1_000) as u64
     }
 
     /// When the grace on `ino` ends: the whole-namespace quarantine or
     /// the latest subtree grace covering it (see `lock_in_grace`).
-    fn lock_grace_end(&mut self, now: Ms, ino: Ino, replica: &dyn Replica) -> i64 {
+    fn lock_grace_end(&mut self, now: Now, ino: Ino, replica: &dyn Replica) -> i64 {
         use constellation_fs_core::types::ROOT_INO;
-        self.lk.grace.retain(|(_, until)| *until > now);
+        self.lk.grace.retain(|(_, until)| *until > now.wall);
         let unlinked = ino != ROOT_INO && !replica.is_under(ino, ROOT_INO);
         let mut end = Self::lock_quarantine_until(replica);
         for (d, until) in &self.lk.grace {
@@ -1576,18 +1576,18 @@ impl Core {
     /// grace is set, and by what parks a waiter.
     pub(crate) fn lock_arm_grace_end(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.lk.grace.retain(|(_, until)| *until > now);
+        self.lk.grace.retain(|(_, until)| *until > now.wall);
         let quarantine = Self::lock_quarantine_until(replica);
         let next = self
             .lk
             .grace
             .iter()
             .map(|(_, until)| until.0)
-            .chain((quarantine > now.0).then_some(quarantine))
+            .chain((quarantine > now.wall.0).then_some(quarantine))
             .min();
         let Some(next) = next else {
             return;
@@ -1598,7 +1598,7 @@ impl Core {
             }
             self.cancel_timer(id, out);
         }
-        let id = self.set_timer(Ms(next), Timer::LockGraceEnd, out);
+        let id = self.set_timer_wall(Ms(next), Timer::LockGraceEnd, out);
         self.lk.grace_end_timer = Some((id, Ms(next)));
     }
 
@@ -1606,7 +1606,7 @@ impl Core {
     /// next end.
     pub(crate) fn on_lock_grace_end(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1625,7 +1625,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lock_conflict_refusal(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         mode: LockMode,
@@ -1635,7 +1635,7 @@ impl Core {
         if blocking
             || replica
                 .locks()
-                .conflicting(ino, from, mode, now.0)
+                .conflicting(ino, from, mode, now.wall.0)
                 .is_empty()
         {
             return None;
@@ -1650,13 +1650,13 @@ impl Core {
     /// (`lock_try_grant`'s own tests, without its effects).
     fn lock_known_refusal(
         &self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         mode: LockMode,
         replica: &dyn Replica,
     ) -> bool {
-        let own = replica.locks().own_grant(ino, from, now.0);
+        let own = replica.locks().own_grant(ino, from, now.wall.0);
         if own.is_some_and(|g| g.recalled) {
             return true;
         }
@@ -1665,7 +1665,7 @@ impl Core {
         !reaffirm
             && !replica
                 .locks()
-                .conflicting(ino, from, mode, now.0)
+                .conflicting(ino, from, mode, now.wall.0)
                 .is_empty()
     }
 
@@ -1727,7 +1727,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lock_try_grant(
         &mut self,
-        now: Ms,
+        now: Now,
         base: Ms,
         from: NodeId,
         ino: Ino,
@@ -1745,7 +1745,7 @@ impl Core {
             self.stats.lock_tenure_waits += 1;
             return Err(Blocked::NotYet(NotYet::TenureFloor));
         }
-        let own = replica.locks().own_grant(ino, from, now.0);
+        let own = replica.locks().own_grant(ino, from, now.wall.0);
         if own.is_some_and(|g| g.recalled) {
             // Recalled: the node gives it up once its local locks are
             // gone; nothing is granted meanwhile (a re-affirmation kept
@@ -1759,7 +1759,7 @@ impl Core {
         let conflicting = if reaffirm {
             Vec::new()
         } else {
-            replica.locks().conflicting(ino, from, mode, now.0)
+            replica.locks().conflicting(ino, from, mode, now.wall.0)
         };
         self.lock_take_outwaited(replica);
         if !conflicting.is_empty() {
@@ -1773,7 +1773,7 @@ impl Core {
         // request parks behind it, a non-blocking one is refused (the lock
         // is promised and in flight: a known conflict). The asked node's
         // own requests are never held back by it.
-        if !reaffirm && self.lock_reserved_against(now, ino, from, mode) {
+        if !reaffirm && self.lock_reserved_against(now.wall, ino, from, mode) {
             self.stats.lock_reserved_waits += 1;
             return Err(Blocked::Conflict(Vec::new()));
         }
@@ -1824,7 +1824,7 @@ impl Core {
         // extended here, so mutual exclusion, and the rule that a node's
         // record never ends sooner than the window of the grant it
         // replaces (below, `until`), are those of the grants made after it.
-        if push && now.0 - base.0 > (ttl - self.lock_margin_ms()) / 2 {
+        if push && now.wall.0 - base.0 > (ttl - self.lock_margin_ms()) / 2 {
             return Err(Blocked::AskAgain);
         }
         // Never sooner than the record it replaces (`LockTables::grant`
@@ -1839,7 +1839,7 @@ impl Core {
         // `double-seal-inside-the-grace` seed 4796: two exclusive holders,
         // a second waiter of the node served after the first in one pass,
         // from a request 2.4 s older).
-        let until = (base.0.min(now.0) + ttl + self.lock_margin_ms())
+        let until = (base.0.min(now.wall.0) + ttl + self.lock_margin_ms())
             .max(own.map_or(i64::MIN, |g| g.until_ms));
         // The horizon is what this node's restart waits out, for grants
         // honoured elsewhere. A grant to itself dies with the process (its
@@ -1908,7 +1908,7 @@ impl Core {
         })
     }
 
-    fn lock_route_is_root(&self, now: Ms, ino: Ino, replica: &dyn Replica) -> bool {
+    fn lock_route_is_root(&self, now: Now, ino: Ino, replica: &dyn Replica) -> bool {
         if self.cfg.delegation && !replica.delegation_table().is_empty() {
             let keys = Self::read_keys(ino, None);
             if let constellation_meta::delegation::Ownership::Delegated(_) =
@@ -2097,7 +2097,7 @@ impl Core {
     /// by `at` on its clock; the renewal arrived `now`.
     pub(crate) fn lock_note_delegate_head(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         gen: u64,
         head: u64,
@@ -2111,8 +2111,8 @@ impl Core {
                 self.lk.tenure_heads.push((gen, head));
             }
         }
-        let e = self.lk.heads.entry(gen).or_insert((at, head, now));
-        e.2 = e.2.max(now);
+        let e = self.lk.heads.entry(gen).or_insert((at, head, now.wall));
+        e.2 = e.2.max(now.wall);
         if at >= e.0 {
             *e = (at, e.1.max(head), e.2);
         }
@@ -2269,14 +2269,14 @@ impl Core {
     /// is then not under the cut (`cluster-locks.md`, "After an outwait").
     /// A cut names at most `STREAMS_CAP` streams, as every floor does
     /// (`floor_join` keeps the newest): `Stats::lock_cut_truncated`.
-    pub(crate) fn lock_cut_here(&mut self, now: Ms, replica: &dyn Replica) -> (i64, Position) {
+    pub(crate) fn lock_cut_here(&mut self, now: Now, replica: &dyn Replica) -> (i64, Position) {
         let me = self.cfg.node_id;
         let online_ms = self.cfg.delegation_ttl_ms as i64;
         let gens = &self.dl.gens;
         self.lk
             .heads
             .retain(|gen, _| gens.get(gen).is_some_and(|g| !g.ended));
-        let mut at = now.0;
+        let mut at = now.wall.0;
         let mut pos = self.lock_release_floor(replica);
         for (gen, g) in &self.dl.gens {
             if g.ended || g.node == me {
@@ -2285,7 +2285,7 @@ impl Core {
             let designated = g.kind == super::delegate::DelegKind::Designated;
             match self.lk.heads.get(gen) {
                 Some((sent, head, heard)) => {
-                    if !designated || now.0 - heard.0 < online_ms {
+                    if !designated || now.wall.0 - heard.0 < online_ms {
                         at = at.min(*sent);
                     }
                     let mut p = Position::ZERO;
@@ -2293,7 +2293,7 @@ impl Core {
                         pos = constellation_meta::locks::floor_join(&pos, &p);
                     }
                 }
-                None if designated && now.0 - g.granted.0 >= online_ms => {}
+                None if designated && now.wall.0 - g.granted.0 >= online_ms => {}
                 None => at = i64::MIN,
             }
         }
@@ -2371,7 +2371,7 @@ impl Core {
     /// one (a renewal) when it is too old.
     fn lock_barrier_ready(
         &mut self,
-        now: Ms,
+        now: Now,
         to: NodeId,
         ino: Ino,
         gen: u64,
@@ -2405,7 +2405,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn lock_take_cut(
         &mut self,
-        now: Ms,
+        now: Now,
         root: NodeId,
         gen: u64,
         (cut_at, cut): (i64, Position),
@@ -2443,7 +2443,7 @@ impl Core {
     /// own barriers that the cut covers settle here too.
     pub(crate) fn lock_cut_for_generation(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         replica: &dyn Replica,
     ) -> (i64, Position, i64) {
@@ -2541,11 +2541,11 @@ impl Core {
         p
     }
 
-    fn lock_recall(&mut self, now: Ms, g: Grant, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn lock_recall(&mut self, now: Now, g: Grant, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.lk.recalls.contains_key(&g.id) {
             return;
         }
-        let timer = self.set_timer(Ms(g.until_ms), Timer::LockGrantExpiry(g.id), out);
+        let timer = self.set_timer_wall(Ms(g.until_ms), Timer::LockGrantExpiry(g.id), out);
         let req = if g.node == self.cfg.node_id {
             None
         } else {
@@ -2596,7 +2596,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lock_park(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         mode: LockMode,
@@ -2613,12 +2613,12 @@ impl Core {
         // in the queue (see `LockState::served`); its request never
         // stopped waiting from its point of view.
         let keep = 4 * self.lock_ttl_ms();
-        self.lk.served.retain(|_, s| now.since(*s) < keep);
+        self.lk.served.retain(|_, s| now.wall.since(*s) < keep);
         // ... and so does a client whose application has waited already
         // (`waited_ms`: it lost a round, or this request is a re-send of
         // its call): queued from when the wait began, as the sim's clients
         // and the engine's lock calls tell it.
-        let queued = self.lock_waited_since(now, waited_ms);
+        let queued = self.lock_waited_since(now.wall, waited_ms);
         let since = match self.lk.served.remove(&(from, ino)) {
             Some(s) => {
                 self.stats.lock_requeued_in_place += 1;
@@ -2628,8 +2628,8 @@ impl Core {
         };
         self.lock_arm_waiter_tick(now, out);
         let held_timer = req.map(|_| {
-            self.set_timer(
-                now.plus(self.cfg.recall_hold_ms),
+            self.set_timer_wall(
+                now.wall.plus(self.cfg.recall_hold_ms),
                 Timer::LockHeldReply(id),
                 out,
             )
@@ -2641,7 +2641,7 @@ impl Core {
             mode,
             req,
             sent,
-            recv: now,
+            recv: now.wall,
             op,
             held_timer,
             since,
@@ -2654,18 +2654,18 @@ impl Core {
         }
     }
 
-    fn lock_arm_waiter_tick(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn lock_arm_waiter_tick(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.lk.waiter_tick.is_some() {
             return;
         }
-        let at = now.plus(self.cfg.recall_hold_ms.max(50));
-        let t = self.set_timer(at, Timer::LockWaiterTick, out);
+        let at = now.wall.plus(self.cfg.recall_hold_ms.max(50));
+        let t = self.set_timer_wall(at, Timer::LockWaiterTick, out);
         self.lk.waiter_tick = Some(t);
     }
 
     pub(crate) fn on_lock_waiter_tick(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2723,7 +2723,7 @@ impl Core {
     /// Something on `ino` changed hands: serve its waiters in order.
     fn lock_serve_waiters(
         &mut self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2751,11 +2751,11 @@ impl Core {
             // not granted; a re-send re-attaches it in place, and one
             // silent for long is dropped (it re-parks if it ever asks).
             if op.is_none() && req.is_none() {
-                if now.0 >= recv.0 + 4 * ttl {
+                if now.wall.0 >= recv.0 + 4 * ttl {
                     gone.push(i);
                     continue;
                 }
-                if now.0 >= recv.0 + ttl - margin {
+                if now.wall.0 >= recv.0 + ttl - margin {
                     continue;
                 }
                 // A push would be lost; its next request carries its
@@ -2768,14 +2768,14 @@ impl Core {
                 // behind it waited out a lost push's grant otherwise,
                 // once per push.
                 if self.lk.unreachable.contains(&node) {
-                    if now.0 < recv.0 + self.lock_unreachable_wait_ms() {
+                    if now.wall.0 < recv.0 + self.lock_unreachable_wait_ms() {
                         break;
                     }
                     self.stats.lock_unreachable_passed_over += 1;
                     continue;
                 }
             }
-            let base = if op.is_some() { now } else { recv };
+            let base = if op.is_some() { now.wall } else { recv };
             // A grant pushed (the waiter's RPC is gone), not one answering
             // a request or a local op's: the only one that can arrive old.
             let push = op.is_none() && req.is_none();
@@ -2814,14 +2814,14 @@ impl Core {
                         None => {
                             self.stats.lock_asked_again += 1;
                             self.lk.waiters[i].ask = Some(Ask {
-                                at: now,
+                                at: now.wall,
                                 passed: false,
                             });
                             tracing::debug!(
                                 node = self.cfg.node_id,
                                 to = node,
                                 ino,
-                                age_ms = now.0 - recv.0,
+                                age_ms = now.wall.0 - recv.0,
                                 "asked a lock waiter to ask again: its last request is too old \
                                  for a pushed grant"
                             );
@@ -2841,7 +2841,7 @@ impl Core {
                             self.lock_arm_waiter_tick(now, out);
                             break;
                         }
-                        Some(a) if !a.passed && now.0 < a.at.0 + wait => break,
+                        Some(a) if !a.passed && now.wall.0 < a.at.0 + wait => break,
                         Some(a) if !a.passed => {
                             self.lk.waiters[i].ask = Some(Ask { passed: true, ..a });
                             self.stats.lock_ask_again_passed_over += 1;
@@ -2879,7 +2879,7 @@ impl Core {
             if let Some(t) = w.held_timer {
                 self.cancel_timer(t, out);
             }
-            let waited = now.since(w.since).max(0) as u64;
+            let waited = now.wall.since(w.since).max(0) as u64;
             self.stats.lock_wait_ms_total += waited;
         }
     }
@@ -2889,7 +2889,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lock_serve_again(
         &mut self,
-        now: Ms,
+        now: Now,
         base: Ms,
         from: NodeId,
         ino: Ino,
@@ -2930,7 +2930,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lock_deliver(
         &mut self,
-        now: Ms,
+        now: Now,
         node: NodeId,
         ino: Ino,
         req: Option<OpId>,
@@ -2945,7 +2945,7 @@ impl Core {
             // grant's window starts now (sim seed 90017: stamped from a
             // request made seconds ago, it arrived lapsed).
             if let Some(o) = self.lk.ops.get_mut(&op) {
-                o.sent_at = now;
+                o.sent_at = now.wall;
             }
             let me = self.cfg.node_id;
             self.lock_op_outcome(now, op, me, outcome, replica, out);
@@ -2961,7 +2961,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_released(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         grant: GrantId,
@@ -3013,7 +3013,7 @@ impl Core {
         // round trip later, not outwaited (`ttl + margin`). This node's
         // own release is never overtaken by its own next request: it
         // ends the grant at once.
-        if let Some(g) = replica.locks().own_grant(ino, from, now.0) {
+        if let Some(g) = replica.locks().own_grant(ino, from, now.wall.0) {
             if g.id.node == grant.node && g.id.seq > grant.seq {
                 self.stats.lock_released_superseded += 1;
                 if from == self.cfg.node_id {
@@ -3039,7 +3039,7 @@ impl Core {
 
     pub(crate) fn on_lock_grant_expiry(
         &mut self,
-        now: Ms,
+        now: Now,
         id: GrantId,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3055,9 +3055,9 @@ impl Core {
             }
             return;
         };
-        if g.until_ms > now.0 {
+        if g.until_ms > now.wall.0 {
             // Renewed since: wait again.
-            let timer = self.set_timer(Ms(g.until_ms), Timer::LockGrantExpiry(id), out);
+            let timer = self.set_timer_wall(Ms(g.until_ms), Timer::LockGrantExpiry(id), out);
             if let Some(r) = self.lk.recalls.get_mut(&id) {
                 r.timer = timer;
             }
@@ -3095,7 +3095,7 @@ impl Core {
 
     fn lock_grant_done(
         &mut self,
-        now: Ms,
+        now: Now,
         id: GrantId,
         ino: Ino,
         replica: &dyn Replica,
@@ -3116,7 +3116,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_renew(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         entries: Vec<LockRenewEntry>,
@@ -3129,23 +3129,23 @@ impl Core {
             results.push((e.ino, e.grant, r));
         }
         self.lock_answer(now, from, PeerMsg::LockRenewed { req, results }, out);
-        self.lock_renew_authority(now, out);
+        self.lock_renew_authority(now.wall, out);
     }
 
     /// Renewals answered short of authority ask for more of it: a
     /// delegate's renewal of its delegation, the root's of its lease.
     fn lock_renew_authority(&mut self, now: Ms, out: &mut Vec<Action>) {
         for gen in std::mem::take(&mut self.lk.deleg_renew_wanted) {
-            self.deleg_renew_now(now, gen, out);
+            self.deleg_renew_now(Now::same(now.0), gen, out);
         }
         if std::mem::take(&mut self.lk.lease_renew_wanted) {
-            self.lease_renew_for_grants(now, out);
+            self.lease_renew_for_grants(Now::same(now.0), out);
         }
     }
 
     fn lock_renew_one(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         id: GrantId,
@@ -3188,7 +3188,7 @@ impl Core {
             // The root, short of lease: renew it now (the caller does).
             self.lk.lease_renew_wanted = true;
         }
-        let until = now.0 + ttl + self.lock_margin_ms();
+        let until = now.wall.0 + ttl + self.lock_margin_ms();
         // The grant renewed: that id, or this node's newer grant here (a
         // reply that never arrived replaced it: renew that one and say so
         // — sim seed 90013 fenced a healthy node otherwise). Only a record
@@ -3207,7 +3207,7 @@ impl Core {
         // inode (`LockTables::install` replaces it).
         let target = match replica.locks().get(id) {
             Some(g) if g.node == from => Some(g),
-            _ => replica.locks().own_grant(ino, from, now.0),
+            _ => replica.locks().own_grant(ino, from, now.wall.0),
         }
         .filter(|g| g.mode >= mode)
         .map(|g| g.id);
@@ -3229,7 +3229,8 @@ impl Core {
             // durable; a failed write only makes the owner wait longer
             // (it refuses the answer, the table keeps the later expiry).
             self.lk.unproven.remove(&target);
-            if let Some((mode, recalled)) = replica.locks().extend(target, from, until, now.0) {
+            if let Some((mode, recalled)) = replica.locks().extend(target, from, until, now.wall.0)
+            {
                 if from != self.cfg.node_id {
                     self.lock_need_horizon(until, until + ttl / 4);
                 }
@@ -3247,7 +3248,7 @@ impl Core {
         }
         // Unknown: a reclaim during a grace period, if nothing conflicts.
         let grace = self.lock_grace_active(now, ino, replica);
-        let conflicting = replica.locks().conflicting(ino, from, mode, now.0);
+        let conflicting = replica.locks().conflicting(ino, from, mode, now.wall.0);
         if grace && conflicting.is_empty() {
             if from != self.cfg.node_id {
                 self.lock_need_horizon(until, until);
@@ -3264,7 +3265,7 @@ impl Core {
                 until_ms: until,
                 recalled: false,
                 gen,
-                confirmed_ms: now.0,
+                confirmed_ms: now.wall.0,
             });
             self.stats.lock_reclaimed += 1;
             self.lk.mirror_dirty = true;
@@ -3284,7 +3285,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_test(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         ino: Ino,
@@ -3293,7 +3294,10 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let outcome = match self.lock_route_answering(now, ino, replica, from, false) {
-            Route::Me { .. } => match replica.locks().first_conflicting(ino, from, mode, now.0) {
+            Route::Me { .. } => match replica
+                .locks()
+                .first_conflicting(ino, from, mode, now.wall.0)
+            {
                 Some(g) => LockTestOutcome::Held {
                     node: g.node,
                     mode: g.mode,
@@ -3312,7 +3316,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_test_control(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         ino: Ino,
         mode: LockMode,
@@ -3324,7 +3328,7 @@ impl Core {
                 let answer =
                     match replica
                         .locks()
-                        .first_conflicting(ino, self.cfg.node_id, mode, now.0)
+                        .first_conflicting(ino, self.cfg.node_id, mode, now.wall.0)
                     {
                         Some(g) => LockTestAnswer::Held {
                             node: g.node,
@@ -3341,8 +3345,8 @@ impl Core {
                 let req = self.op_id();
                 self.lk.tests.insert(op, req);
                 self.lk.test_by_req.insert(req, op);
-                self.set_timer(
-                    now.plus(self.cfg.forward_timeout_ms),
+                self.set_timer_wall(
+                    now.wall.plus(self.cfg.forward_timeout_ms),
                     Timer::LockTestTimeout(req),
                     out,
                 );
@@ -3390,7 +3394,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_control(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         ino: Ino,
         mode: LockMode,
@@ -3400,7 +3404,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         self.stats.lock_requests += 1;
-        let since = self.lock_waited_since(now, waited_ms);
+        let since = self.lock_waited_since(now.wall, waited_ms);
         self.lk.ops.insert(
             op,
             LockOp {
@@ -3409,9 +3413,9 @@ impl Core {
                 blocking,
                 req: None,
                 owner: 0,
-                sent_at: now,
+                sent_at: now.wall,
                 attempts: 0,
-                created: now,
+                created: now.wall,
                 since,
                 local_wait: false,
                 reread: false,
@@ -3420,19 +3424,19 @@ impl Core {
         self.lock_route_op(now, op, replica, out);
     }
 
-    fn lock_route_op(&mut self, now: Ms, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn lock_route_op(&mut self, now: Now, op: OpId, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
         };
         let (ino, mode, blocking) = (o.ino, o.mode, o.blocking);
-        let waited_ms = now.since(o.since).max(0) as u64;
+        let waited_ms = now.wall.since(o.since).max(0) as u64;
         // A grant this node holds that is recalled or being released:
         // no request leaves until it is gone (a reply for it could cross
         // its own `LockReleased` and reinstall a forgotten grant — sim
         // seeds 90000/90004). A non-blocking request while local locks
         // still pin the recalled grant would block: say so.
         if let Some(h) = replica.locks().held(ino) {
-            if h.until_ms <= now.0 {
+            if h.until_ms <= now.wall.0 {
                 // Lapsed: it is fenced already and cannot be renewed;
                 // drop it (the owner outwaits it) and ask afresh.
                 replica.locks().drop_held(ino, h.id);
@@ -3446,7 +3450,7 @@ impl Core {
                     });
                     return;
                 }
-                self.set_timer(now.plus(10), Timer::LockRetry(op), out);
+                self.set_timer_wall(now.wall.plus(10), Timer::LockRetry(op), out);
                 return;
             }
         }
@@ -3454,7 +3458,7 @@ impl Core {
             Route::Me { .. } => {
                 let me = self.cfg.node_id;
                 if let Some(o) = self.lk.ops.get_mut(&op) {
-                    o.sent_at = now;
+                    o.sent_at = now.wall;
                     o.owner = me;
                 }
                 match self.lock_serve(
@@ -3465,7 +3469,7 @@ impl Core {
                     blocking,
                     None,
                     Some(op),
-                    now,
+                    now.wall,
                     waited_ms,
                     replica,
                     out,
@@ -3489,11 +3493,11 @@ impl Core {
                 };
                 o.req = Some(req);
                 o.owner = n;
-                o.sent_at = now;
+                o.sent_at = now.wall;
                 o.attempts += 1;
                 self.lk.by_req.insert(req, op);
-                self.set_timer(
-                    now.plus(self.cfg.forward_timeout_ms),
+                self.set_timer_wall(
+                    now.wall.plus(self.cfg.forward_timeout_ms),
                     Timer::LockRequestTimeout(req),
                     out,
                 );
@@ -3504,7 +3508,7 @@ impl Core {
                         ino,
                         mode,
                         blocking,
-                        sent: now,
+                        sent: now.wall,
                         incarnation: self.cfg.incarnation,
                         waited_ms,
                     },
@@ -3535,7 +3539,7 @@ impl Core {
     /// again as a fresh request (fresh attempts, a fresh lease read,
     /// routed to the successor as soon as the lease names it), up to its
     /// bound. Without P2P there is no path at all: `ENOLCK`, as documented.
-    fn lock_op_unreachable(&mut self, now: Ms, op: OpId, out: &mut Vec<Action>) {
+    fn lock_op_unreachable(&mut self, now: Now, op: OpId, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
         };
@@ -3592,7 +3596,7 @@ impl Core {
         true
     }
 
-    fn lock_retry(&mut self, now: Ms, op: OpId, out: &mut Vec<Action>) {
+    fn lock_retry(&mut self, now: Now, op: OpId, out: &mut Vec<Action>) {
         let Some(o) = self.lk.ops.get(&op) else {
             return;
         };
@@ -3606,12 +3610,12 @@ impl Core {
             return;
         }
         let delay = (self.cfg.forward_backoff_ms / 4).max(10) * u64::from(o.attempts.clamp(1, 8));
-        self.set_timer(now.plus(delay), Timer::LockRetry(op), out);
+        self.set_timer_wall(now.wall.plus(delay), Timer::LockRetry(op), out);
     }
 
     pub(crate) fn on_lock_retry(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3629,7 +3633,7 @@ impl Core {
 
     pub(crate) fn on_lock_holder_learned(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         result: crate::event::S3Result,
         replica: &dyn Replica,
@@ -3640,7 +3644,10 @@ impl Core {
         }
         if let crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) = &result {
             self.lease.note_object(now, lease);
-            if lease.holder != 0 && !lease.is_claimable(now.0) && lease.holder != self.cfg.node_id {
+            if lease.holder != 0
+                && !lease.is_claimable(now.wall.0)
+                && lease.holder != self.cfg.node_id
+            {
                 self.lease.cached_holder = Some(lease.holder);
                 self.lock_route_op(now, op, replica, out);
                 return;
@@ -3663,7 +3670,7 @@ impl Core {
         // does — acquire (the sim found blocked lockers with nobody
         // taking the lease). Non-blocking: unavailable after the retries.
         let claimable = matches!(&result, crate::event::S3Result::LeaseGet(Ok(l))
-            if l.as_ref().is_none_or(|(l, _)| l.holder == 0 || l.is_claimable(now.0)));
+            if l.as_ref().is_none_or(|(l, _)| l.holder == 0 || l.is_claimable(now.wall.0)));
         if claimable && !self.lease.lost {
             self.enqueue_job(
                 now,
@@ -3690,7 +3697,7 @@ impl Core {
     /// resuming, or past the bound — route it as any other.
     fn lock_op_while_resuming(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3701,7 +3708,7 @@ impl Core {
         let Some(o) = self.lk.ops.get(&op) else {
             return true;
         };
-        if now.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64 {
+        if now.wall.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64 {
             return false;
         }
         let (ino, mode, blocking) = (o.ino, o.mode, o.blocking);
@@ -3722,14 +3729,14 @@ impl Core {
             );
         }
         let retry = self.lock_resume_retry_ms();
-        self.set_timer(now.plus(retry), Timer::LockRetry(op), out);
+        self.set_timer_wall(now.wall.plus(retry), Timer::LockRetry(op), out);
         true
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_reply(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         outcome: LockOutcome,
@@ -3759,7 +3766,7 @@ impl Core {
     /// here and the grant was outwaited.
     fn lock_late_reply(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         outcome: LockOutcome,
@@ -3791,7 +3798,7 @@ impl Core {
         // past the owner's record of it — the owner outwaited it and
         // granted another node while this one still did I/O under it
         // (sim `locks-stall-step` seed 1934: two exclusive holders).
-        if sent.0 + ttl - margin <= now.0 {
+        if sent.0 + ttl - margin <= now.wall.0 {
             return;
         }
         if cur.id == id {
@@ -3821,7 +3828,7 @@ impl Core {
             releasing: false,
             first_use: false,
             idle_since_ms: None,
-            installed_ms: now.0,
+            installed_ms: now.wall.0,
         };
         if matches!(
             replica.locks().install_held(ino, held),
@@ -3835,7 +3842,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_granted_push(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         sent: Ms,
@@ -3868,7 +3875,7 @@ impl Core {
                 // waiter there is a ghost (an op another op's grant
                 // covered, or that left): say so, so that the owner does
                 // not hold its queue for it.
-                self.lock_send_cancel(now, from, ino, true, true, out);
+                self.lock_send_cancel(now.wall, from, ino, true, true, out);
                 return;
             }
             for op in ops {
@@ -4027,7 +4034,7 @@ impl Core {
             .map(|(op, _)| *op)
             .collect();
         for op in ops {
-            self.lock_route_op(now, op, replica, out);
+            self.lock_route_op(Now::same(now.0), op, replica, out);
         }
     }
 
@@ -4089,7 +4096,12 @@ impl Core {
                         retry_ms: self.lock_resume_retry_ms(),
                         grace: false,
                     };
-                    self.lock_answer(now, from, PeerMsg::LockReply { req, outcome }, out);
+                    self.lock_answer(
+                        Now::same(now.0),
+                        from,
+                        PeerMsg::LockReply { req, outcome },
+                        out,
+                    );
                 }
                 dropped += 1;
             } else {
@@ -4106,13 +4118,13 @@ impl Core {
                 dropped,
                 "a node cancelled its waiters: nothing there waits for the lock any more"
             );
-            self.lock_serve_waiters(now, ino, replica, out);
+            self.lock_serve_waiters(Now::same(now.0), ino, replica, out);
         }
     }
 
     fn lock_op_outcome(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         from: NodeId,
         outcome: LockOutcome,
@@ -4132,7 +4144,7 @@ impl Core {
                 position,
             } => {
                 let ttl = ttl_ms as i64;
-                if o.sent_at.0 + ttl - margin <= now.0 + margin / 4 {
+                if o.sent_at.0 + ttl - margin <= now.wall.0 + margin / 4 {
                     // Lapsed on arrival (a request held longer than the
                     // window), or all but: ask again rather than install
                     // a fence. A grant whose window ends before a renewal
@@ -4159,10 +4171,10 @@ impl Core {
                     releasing: false,
                     first_use: false,
                     idle_since_ms: None,
-                    installed_ms: now.0,
+                    installed_ms: now.wall.0,
                 };
                 let ino = o.ino;
-                let waited = now.since(o.created).max(0) as u64;
+                let waited = now.wall.since(o.created).max(0) as u64;
                 let recalled = match replica.locks().install_held(ino, held) {
                     Installed::Ok { recalled } => recalled,
                     Installed::Released => {
@@ -4177,16 +4189,16 @@ impl Core {
                 self.stats.lock_grant_ms_total += waited;
                 let b = (64 - waited.max(1).leading_zeros()).min(13) as usize;
                 self.stats.lock_grant_ms[b] += 1;
-                if held.renew_at_ms <= now.0 {
+                if held.renew_at_ms <= now.wall.0 {
                     // Served late in its window (a push to a request
                     // parked a while): renew now, not at the next tick,
                     // which may come after the window.
                     if let Some(t) = self.lk.renew_timer.take() {
                         self.cancel_timer(t, out);
                     }
-                    let t = self.set_timer(now.plus(1), Timer::LockRenewTick, out);
+                    let t = self.set_timer_wall(now.wall.plus(1), Timer::LockRenewTick, out);
                     self.lk.renew_timer = Some(t);
-                    self.lk.renew_at = Some(now.plus(1));
+                    self.lk.renew_at = Some(now.wall.plus(1));
                 } else {
                     self.lock_arm_renew_tick(now, replica, out);
                 }
@@ -4199,9 +4211,9 @@ impl Core {
                     // its local lock first (the grant covers it until the
                     // last local lock leaves), then `LockIdle` releases.
                     self.stats.lock_granted_recalled += 1;
-                    self.lock_resend_idle(now, ino, replica, out);
+                    self.lock_resend_idle(now.wall, ino, replica, out);
                 } else {
-                    self.lock_wake_covered(now, ino, &position, replica, out);
+                    self.lock_wake_covered(now.wall, ino, &position, replica, out);
                 }
             }
             LockOutcome::Waiting {
@@ -4214,7 +4226,7 @@ impl Core {
                 // its bound, without spending an attempt; a blocking one
                 // (the owner parks those: a race) asks again.
                 if o.blocking {
-                    self.set_timer(now.plus(retry_ms), Timer::LockRetry(op), out);
+                    self.set_timer_wall(now.wall.plus(retry_ms), Timer::LockRetry(op), out);
                 } else {
                     self.lk.ops.remove(&op);
                     out.push(Action::ControlDone {
@@ -4232,11 +4244,11 @@ impl Core {
                 // within the bound an op without its sequencer has; past
                 // it, as `Busy`.
                 let late =
-                    !o.blocking && now.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64;
+                    !o.blocking && now.wall.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64;
                 if late {
                     self.lock_retry(now, op, out);
                 } else {
-                    self.set_timer(now.plus(retry_ms), Timer::LockRetry(op), out);
+                    self.set_timer_wall(now.wall.plus(retry_ms), Timer::LockRetry(op), out);
                 }
             }
             LockOutcome::WouldBlock => {
@@ -4269,7 +4281,7 @@ impl Core {
         }
     }
 
-    pub(crate) fn on_lock_request_timeout(&mut self, now: Ms, req: OpId, out: &mut Vec<Action>) {
+    pub(crate) fn on_lock_request_timeout(&mut self, now: Now, req: OpId, out: &mut Vec<Action>) {
         let Some(op) = self.lk.by_req.remove(&req) else {
             return;
         };
@@ -4285,7 +4297,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_request_failed(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         to: NodeId,
         outage: bool,
@@ -4348,10 +4360,10 @@ impl Core {
     /// short (capped by what is left of its delegation), with a window
     /// under the cadence: a tick at the cadence alone came after it
     /// closed, and the grant lapsed under the application's lock.
-    fn lock_arm_renew_tick(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
-        let mut at = now.plus((self.cfg.lock_ttl_ms / 4).max(50));
-        if let Some(first) = replica.locks().next_renewal_ms(now.0) {
-            at = at.min(Ms(first.max(now.0 + 1)));
+    fn lock_arm_renew_tick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        let mut at = now.wall.plus((self.cfg.lock_ttl_ms / 4).max(50));
+        if let Some(first) = replica.locks().next_renewal_ms(now.wall.0) {
+            at = at.min(Ms(first.max(now.wall.0 + 1)));
         }
         at = at.max(self.lock_relearn_floor(now));
         if let Some((t, armed)) = self.lk.renew_timer.zip(self.lk.renew_at) {
@@ -4360,14 +4372,14 @@ impl Core {
             }
             self.cancel_timer(t, out);
         }
-        let t = self.set_timer(at, Timer::LockRenewTick, out);
+        let t = self.set_timer_wall(at, Timer::LockRenewTick, out);
         self.lk.renew_timer = Some(t);
         self.lk.renew_at = Some(at);
     }
 
     pub(crate) fn on_lock_renew_tick(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -4384,7 +4396,7 @@ impl Core {
         // would otherwise go on forever).
         let idle = replica
             .locks()
-            .idle_before(now.0 - self.cfg.lock_cache_idle_ms as i64);
+            .idle_before(now.wall.0 - self.cfg.lock_cache_idle_ms as i64);
         for (ino, _) in idle {
             self.stats.lock_idle_released += 1;
             self.lock_release_begin(now, ino, replica, out);
@@ -4392,7 +4404,7 @@ impl Core {
         // A recalled grant whose first local lock never came (the
         // requester gave up, or is gone) stops being pinned by it: it is
         // released below, not renewed for ever under the waiters.
-        for ino in replica.locks().expire_first_use(now.0) {
+        for ino in replica.locks().expire_first_use(now.wall.0) {
             tracing::info!(
                 node = self.cfg.node_id,
                 ino,
@@ -4403,13 +4415,13 @@ impl Core {
         // renewed; a lapsed one is dropped (sim seed 90010: a grant that
         // answered an op it did not cover was neither used nor released).
         for (ino, h) in replica.locks().held_all() {
-            if h.until_ms <= now.0 {
+            if h.until_ms <= now.wall.0 {
                 replica.locks().drop_held(ino, h.id);
             } else if h.recalled && !h.releasing && replica.locks().local_idle(ino) {
                 self.lock_release_begin(now, ino, replica, out);
             }
         }
-        let due = replica.locks().due_renewals(now.0);
+        let due = replica.locks().due_renewals(now.wall.0);
         if !due.is_empty() {
             tracing::debug!(
                 node = self.cfg.node_id,
@@ -4437,9 +4449,9 @@ impl Core {
                         self.lk.own_held.push((f, ino, h.id, r));
                         self.renew_kick(&[f], out);
                     } else {
-                        self.lock_apply_renew_result(now, me, ino, h.id, now, r, replica, out);
+                        self.lock_apply_renew_result(now, me, ino, h.id, now.wall, r, replica, out);
                     }
-                    self.lock_renew_authority(now, out);
+                    self.lock_renew_authority(now.wall, out);
                 }
                 Route::Node(n) if self.cfg.p2p && self.reaches(now, n) => {
                     by_owner.entry(n).or_default().push((ino, h));
@@ -4466,8 +4478,8 @@ impl Core {
         }
         for (to, entries) in by_owner {
             let req = self.op_id();
-            let timer = self.set_timer(
-                now.plus(self.cfg.forward_timeout_ms),
+            let timer = self.set_timer_wall(
+                now.wall.plus(self.cfg.forward_timeout_ms),
                 Timer::LockRenewTimeout(req),
                 out,
             );
@@ -4475,7 +4487,7 @@ impl Core {
                 req,
                 RenewInFlight {
                     entries: entries.iter().map(|(i, h)| (*i, h.id)).collect(),
-                    sent: now,
+                    sent: now.wall,
                     timer,
                     to,
                 },
@@ -4520,11 +4532,11 @@ impl Core {
     /// request: an owner learned meanwhile otherwise (a push, a hint, a
     /// lock reply) is used at the next tick; the read's answer re-ticks at
     /// once.
-    fn lock_relearn_floor(&self, now: Ms) -> Ms {
+    fn lock_relearn_floor(&self, now: Now) -> Ms {
         if self.lk.relearning {
-            now.plus(self.lock_resume_retry_ms())
+            now.wall.plus(self.lock_resume_retry_ms())
         } else {
-            now
+            now.wall
         }
     }
 
@@ -4538,7 +4550,7 @@ impl Core {
     /// holder whose stale delegate answered `NotOwner { 0 }` and whose
     /// table no longer named a delegate: `locks-blips-tight-delegated`
     /// seed 157, chunk delegate-fenced-io).
-    pub(crate) fn lock_owner_without_s3(&self, now: Ms) -> Option<NodeId> {
+    pub(crate) fn lock_owner_without_s3(&self, now: Now) -> Option<NodeId> {
         let me = self.cfg.node_id;
         let carrier = self
             .pr
@@ -4549,7 +4561,7 @@ impl Core {
             .lease
             .last_seen
             .as_ref()
-            .filter(|l| !l.is_claimable(now.0))
+            .filter(|l| !l.is_claimable(now.wall.0))
             .map(|l| l.holder);
         carrier.or(seen).filter(|n| *n != 0 && *n != me)
     }
@@ -4565,7 +4577,7 @@ impl Core {
     /// The lease read a renewal tick asked for: the holder to renew with.
     pub(crate) fn on_lock_renew_holder(
         &mut self,
-        now: Ms,
+        now: Now,
         result: crate::event::S3Result,
         out: &mut Vec<Action>,
     ) {
@@ -4577,7 +4589,10 @@ impl Core {
         );
         if let crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) = &result {
             self.lease.note_object(now, lease);
-            if lease.holder != 0 && !lease.is_claimable(now.0) && lease.holder != self.cfg.node_id {
+            if lease.holder != 0
+                && !lease.is_claimable(now.wall.0)
+                && lease.holder != self.cfg.node_id
+            {
                 self.lease.cached_holder = Some(lease.holder);
             }
         } else if matches!(&result, crate::event::S3Result::LeaseGet(Err(_))) {
@@ -4589,14 +4604,14 @@ impl Core {
         if let Some(t) = self.lk.renew_timer.take() {
             self.cancel_timer(t, out);
         }
-        let t = self.set_timer(now.plus(1), Timer::LockRenewTick, out);
+        let t = self.set_timer_wall(now.wall.plus(1), Timer::LockRenewTick, out);
         self.lk.renew_timer = Some(t);
-        self.lk.renew_at = Some(now.plus(1));
+        self.lk.renew_at = Some(now.wall.plus(1));
     }
 
     pub(crate) fn on_lock_renewed(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         results: Vec<(Ino, GrantId, LockRenewResult)>,
@@ -4628,7 +4643,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn lock_apply_renew_result(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         id: GrantId,
@@ -4721,7 +4736,7 @@ impl Core {
     /// dropped that its successor renewed meanwhile.
     fn lock_late_renewed(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         results: Vec<(Ino, GrantId, LockRenewResult)>,
@@ -4742,7 +4757,7 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             from,
-            late_ms = now.since(late.sent),
+            late_ms = now.wall.since(late.sent),
             granted = granted.len(),
             "late lock renewals answered"
         );
@@ -4759,7 +4774,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_recall(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         ino: Ino,
@@ -4808,7 +4823,7 @@ impl Core {
 
     fn lock_recall_here(
         &mut self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         grant: GrantId,
         replica: &dyn Replica,
@@ -4832,7 +4847,7 @@ impl Core {
     /// The last local lock under a recalled grant left.
     pub(crate) fn on_lock_idle_control(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         ino: Ino,
         replica: &dyn Replica,
@@ -4848,13 +4863,13 @@ impl Core {
     /// Phase 2: the end of the latest token window naming `grant` among
     /// this node's own queued replays (stranded ops not resolved yet), if
     /// one is still open at `now`.
-    fn replay_blocks_release(grant: GrantId, now: Ms, replica: &dyn Replica) -> Option<i64> {
+    fn replay_blocks_release(grant: GrantId, now: Now, replica: &dyn Replica) -> Option<i64> {
         let queued = replica.pending_replays().ok()?;
         queued
             .iter()
             .filter(|q| q.refused.is_none() && !q.foreign)
             .flat_map(|q| q.lock_tag.0.iter())
-            .filter(|t| t.grant == grant && t.until_ms > now.0)
+            .filter(|t| t.grant == grant && t.until_ms > now.wall.0)
             .map(|t| t.until_ms)
             .max()
     }
@@ -4893,7 +4908,7 @@ impl Core {
     /// waiting for it looks again now, not at its next poll.
     pub(crate) fn on_lock_release_wake(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         ino: Ino,
         replica: &dyn Replica,
@@ -4911,7 +4926,7 @@ impl Core {
     /// Start releasing `ino`'s grant: flush its dirty data first.
     fn lock_release_begin(
         &mut self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4927,7 +4942,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lock_flushed(
         &mut self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         grant: GrantId,
         ok: bool,
@@ -4961,10 +4976,13 @@ impl Core {
             // would let it land, at an executor that only checks the
             // window, after the next holder's writes. Waited for until it
             // is resolved or its token's window is over.
-            let blocked = replica.locks().release_blocked(grant, now.0).or_else(|| {
-                Self::replay_blocks_release(grant, now, replica)
-                    .map(|until| Some(until.min(now.0 + RELEASE_WAIT_POLL_MS)))
-            });
+            let blocked = replica
+                .locks()
+                .release_blocked(grant, now.wall.0)
+                .or_else(|| {
+                    Self::replay_blocks_release(grant, now, replica)
+                        .map(|until| Some(until.min(now.wall.0 + RELEASE_WAIT_POLL_MS)))
+                });
             if let Some(until) = blocked {
                 tracing::debug!(
                     node = self.cfg.node_id,
@@ -4973,9 +4991,9 @@ impl Core {
                     ?until,
                     "a recalled grant's release waits for mutations tagged with it"
                 );
-                let at = until.unwrap_or(now.0 + RELEASE_WAIT_POLL_MS);
-                let timer = self.set_timer(
-                    Ms(at.max(now.0 + 1)),
+                let at = until.unwrap_or(now.wall.0 + RELEASE_WAIT_POLL_MS);
+                let timer = self.set_timer_wall(
+                    Ms(at.max(now.wall.0 + 1)),
                     Timer::LockReleaseWait(ino, grant),
                     out,
                 );
@@ -5075,7 +5093,7 @@ impl Core {
 
     /// A fast takeover (this node was the backup): the mirror is this
     /// tenure's table, restamped; M9's floor covers what it misses.
-    pub(crate) fn lock_install_mirror(&mut self, now: Ms, replica: &dyn Replica) {
+    pub(crate) fn lock_install_mirror(&mut self, now: Now, replica: &dyn Replica) {
         let floor = std::mem::take(&mut self.lk.bk_floor);
         self.lock_note_dir_floor(constellation_fs_core::types::ROOT_INO, &floor);
         let Some((_, grants)) = self.lk.bk_mirror.take() else {
@@ -5158,7 +5176,7 @@ impl Core {
     /// meanwhile but a lapse.
     pub(crate) fn deleg_leaving_grants(
         &self,
-        now: Ms,
+        now: Now,
         gen: u64,
         replica: &dyn Replica,
     ) -> Vec<Grant> {
@@ -5171,7 +5189,7 @@ impl Core {
             .into_iter()
             .filter(|g| {
                 g.gen == gen
-                    && g.until_ms > now.0
+                    && g.until_ms > now.wall.0
                     && matches!(
                         replica.resolve_ownership(&Self::read_keys(g.ino, None)),
                         constellation_meta::delegation::Ownership::Root
@@ -5190,14 +5208,14 @@ impl Core {
     /// (sim `locks-unlinked-delegated-partition` seed 4067).
     pub(crate) fn deleg_leaving_barriers(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         leaving: &[Grant],
         replica: &dyn Replica,
     ) -> Vec<(Ino, i64)> {
         self.lock_take_outwaited(replica);
         let me = self.cfg.node_id;
-        for g in replica.locks().expired(now.0) {
+        for g in replica.locks().expired(now.wall.0) {
             if g.gen == gen && g.node != me {
                 self.lock_barrier(g.ino, g.until_ms, Some(g.node));
             }
@@ -5296,7 +5314,7 @@ impl Core {
     /// or one next to a conflicting grant stays out.
     pub(crate) fn lock_install_leaving(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         leaving: Vec<Grant>,
         replica: &dyn Replica,
@@ -5326,7 +5344,7 @@ impl Core {
                 gen: 0,
                 ..g
             };
-            if replica.locks().install_if_consistent(g, now.0) {
+            if replica.locks().install_if_consistent(g, now.wall.0) {
                 n += 1;
             }
         }
@@ -5357,7 +5375,7 @@ impl Core {
     /// did install and renew comes with its batch and extends this copy
     /// ([`Core::lock_install_leaving`]). Nor are they handed to the
     /// delegate after this: it no longer serves the inode.
-    pub(crate) fn lock_take_back_left(&mut self, now: Ms, gen: u64, replica: &dyn Replica) {
+    pub(crate) fn lock_take_back_left(&mut self, now: Now, gen: u64, replica: &dyn Replica) {
         let left = |g: &Grant| {
             matches!(
                 replica.resolve_ownership(&Self::read_keys(g.ino, None)),
@@ -5385,9 +5403,9 @@ impl Core {
                 confirmed_ms: Grant::UNCONFIRMED,
                 ..g
             };
-            if g.until_ms > now.0
+            if g.until_ms > now.wall.0
                 && !replica.locks().was_ended(g.id)
-                && replica.locks().install_if_consistent(g, now.0)
+                && replica.locks().install_if_consistent(g, now.wall.0)
             {
                 n += 1;
             }
@@ -5468,20 +5486,20 @@ impl Core {
     /// renews it.
     pub(crate) fn lock_take_handoff(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
     ) -> (Vec<Grant>, Vec<(GrantId, u64)>) {
         let pending = self.lk.handoff.remove(&gen).unwrap_or_default();
         let handed = self.lk.handed.entry(gen).or_default();
         handed.extend(pending);
-        handed.retain(|g| g.until_ms > now.0);
+        handed.retain(|g| g.until_ms > now.wall.0);
         let grants = handed.clone();
         if grants.is_empty() {
             self.lk.handed.remove(&gen);
         }
         let carry = grants
             .iter()
-            .map(|g| (g.id, Self::lock_left(now, g)))
+            .map(|g| (g.id, Self::lock_left(now.wall, g)))
             .collect();
         (grants, carry)
     }
@@ -5495,7 +5513,7 @@ impl Core {
     /// tenure, which an outwait waited out). A grant here of the same node
     /// on the same inode, or a conflicting one, is newer and stays (see
     /// `LockTables::install_if_consistent`).
-    pub(crate) fn lock_on_generation_ended(&mut self, now: Ms, gen: u64, replica: &dyn Replica) {
+    pub(crate) fn lock_on_generation_ended(&mut self, now: Now, gen: u64, replica: &dyn Replica) {
         let mut back = self.lk.handoff.remove(&gen).unwrap_or_default();
         back.extend(self.lk.handed.remove(&gen).unwrap_or_default());
         let mut n = 0;
@@ -5507,7 +5525,7 @@ impl Core {
                 confirmed_ms: Grant::UNCONFIRMED,
                 ..g
             };
-            if g.until_ms > now.0 && replica.locks().install_if_consistent(g, now.0) {
+            if g.until_ms > now.wall.0 && replica.locks().install_if_consistent(g, now.wall.0) {
                 n += 1;
             }
         }
@@ -5529,7 +5547,7 @@ impl Core {
     /// sealing, or ended) here brings no grants back.
     pub(crate) fn lock_install_returned(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         back: constellation_meta::locks::LockHandback,
         replica: &dyn Replica,
@@ -5546,8 +5564,9 @@ impl Core {
                 // their holders and the outwait's grace stands (or is
                 // about to: an expiry retry, `!root_usable`); a seal
                 // pushed `until` on but began after the outwait.
-                let outwaited =
-                    g.ended || now >= g.until || g.recall == super::delegate::RecallPhase::Sealing;
+                let outwaited = g.ended
+                    || now.wall >= g.until
+                    || g.recall == super::delegate::RecallPhase::Sealing;
                 let dir = g.dir;
                 self.lock_note_dir_floor(dir, &floor);
                 self.lock_dir_barrier(dir, barrier);
@@ -5619,7 +5638,7 @@ impl Core {
     /// - never later than a restamp.
     pub(crate) fn lock_install_moved(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         grants: Vec<Grant>,
         carry: &[(GrantId, u64)],
@@ -5645,7 +5664,7 @@ impl Core {
         let mut n = 0;
         for g in grants {
             let left = carry.iter().find(|(id, _)| *id == g.id).map(|(_, l)| *l);
-            let until = left.map_or(restamp, |l| self.carried_until(now, l));
+            let until = left.map_or(restamp, |l| self.carried_until(now.wall, l));
             // Tagged with the generation the move names (0: the root's
             // table) — never resolved from the delegation table, which
             // may not say yet (a handoff arrives with the renewal that
@@ -5669,7 +5688,7 @@ impl Core {
                 if !self.lk.moved_seen.entry(gen).or_default().insert(g.id) {
                     continue;
                 }
-                if !replica.locks().install_if_consistent(g, now.0) {
+                if !replica.locks().install_if_consistent(g, now.wall.0) {
                     continue;
                 }
             }
@@ -5732,7 +5751,7 @@ impl Core {
     /// whose owner is elsewhere now.
     pub(crate) fn lock_reserve_all(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -5748,7 +5767,7 @@ impl Core {
     /// grants moved to it may still be honoured with the windows this
     /// root gave them — a grace on the subtree until they lapse or
     /// reclaim.
-    pub(crate) fn lock_on_generation_outwaited(&mut self, now: Ms, dir: Ino) {
+    pub(crate) fn lock_on_generation_outwaited(&mut self, now: Now, dir: Ino) {
         let until = Ms(self.restamp(now));
         self.lk.grace.push((dir, until));
         // Its holders' releases are lost with it: what they could have
@@ -5757,7 +5776,7 @@ impl Core {
         self.lk.pending_dir_floors.push(dir);
         // Nor did they say what they were acknowledged in other
         // generations' streams: a barrier on the subtree.
-        self.lock_dir_barrier(dir, now.0);
+        self.lock_dir_barrier(dir, now.wall.0);
         self.stats.lock_grace_periods += 1;
         // What was not handed over yet stays the generation's until it
         // ends: [`Core::lock_on_generation_ended`] returns it to this
@@ -5782,14 +5801,14 @@ impl Core {
     /// sim's `locks-released-delegated`).
     pub(crate) fn lock_grace_for_generation(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         replica: &dyn Replica,
     ) -> u64 {
         let Some(dir) = self.dl.gens.get(&gen).map(|g| g.dir) else {
             return 0;
         };
-        self.lk.grace.retain(|(_, until)| *until > now);
+        self.lk.grace.retain(|(_, until)| *until > now.wall);
         let mut until = Self::lock_quarantine_until(replica);
         for (g, u) in &self.lk.grace {
             if *g == constellation_fs_core::types::ROOT_INO
@@ -5799,21 +5818,21 @@ impl Core {
                 until = until.max(u.0);
             }
         }
-        (until - now.0).max(0) as u64
+        (until - now.wall.0).max(0) as u64
     }
 
     /// Delegate: generation `gen`'s first granting renewal carried the
     /// root's remaining grace on the subtree: no new grant there until
     /// it passes (measured from the receipt, which is after the root's
     /// send, plus the margin), reclaims accepted meanwhile.
-    pub(crate) fn lock_take_grace(&mut self, now: Ms, gen: u64, grace_ms: u64) {
+    pub(crate) fn lock_take_grace(&mut self, now: Now, gen: u64, grace_ms: u64) {
         if grace_ms == 0 {
             return;
         }
         let Some(dir) = self.dl.mine.get(&gen).map(|d| d.dir) else {
             return;
         };
-        let until = Ms(now.0 + grace_ms as i64 + self.lock_margin_ms());
+        let until = Ms(now.wall.0 + grace_ms as i64 + self.lock_margin_ms());
         self.lk.grace.push((dir, until));
         self.stats.lock_grace_periods += 1;
         self.stats.lock_graces_inherited += 1;
@@ -5841,7 +5860,7 @@ impl Core {
     /// barrier on everything as of the quarantine's end (the tenure's
     /// floor takes the inherited delegates' *first* renewals, which may
     /// be older than those writes).
-    pub(crate) fn lock_on_released_takeover(&mut self, now: Ms, replica: &dyn Replica) {
+    pub(crate) fn lock_on_released_takeover(&mut self, now: Now, replica: &dyn Replica) {
         let until = self.restamp(now);
         replica.locks().set_quarantine(until);
         self.lock_dir_barrier(constellation_fs_core::types::ROOT_INO, until);
@@ -5857,14 +5876,14 @@ impl Core {
     /// tenure with nothing of the kind costs its successor's successor
     /// nothing, so a handoff that served nothing (a start-up's) does not
     /// make the next seal pay a floor.
-    pub(crate) fn lock_duty_live(&self, now: Ms, replica: &dyn Replica) -> bool {
+    pub(crate) fn lock_duty_live(&self, now: Now, replica: &dyn Replica) -> bool {
         self.cfg.locks
-            && (replica.locks().quarantine_until() > now.0
+            && (replica.locks().quarantine_until() > now.wall.0
                 || replica
                     .locks()
                     .grants_snapshot()
                     .iter()
-                    .any(|g| g.until_ms > now.0)
+                    .any(|g| g.until_ms > now.wall.0)
                 // Grants moved out of the table toward a delegate
                 // (`lock_on_delegated`) are honoured all the same.
                 || self
@@ -5873,8 +5892,8 @@ impl Core {
                     .values()
                     .chain(self.lk.handed.values())
                     .flatten()
-                    .any(|g| g.until_ms > now.0)
-                || self.lk.grace.iter().any(|(_, u)| u.0 > now.0))
+                    .any(|g| g.until_ms > now.wall.0)
+                || self.lk.grace.iter().any(|(_, u)| u.0 > now.wall.0))
     }
 
     /// The tenure ends and its grant table is dropped (`lock_on_lease_gone`
@@ -5887,7 +5906,7 @@ impl Core {
     /// Also on a deposal or an expiry, where no re-claim follows: harmless
     /// there, and conservative — the quarantine is node-wide, so a
     /// subtree's grace widens to the whole namespace until it lapses.
-    fn lock_quarantine_dropped_tenure(&mut self, now: Ms, replica: &dyn Replica) {
+    fn lock_quarantine_dropped_tenure(&mut self, now: Now, replica: &dyn Replica) {
         let grants = replica
             .locks()
             .grants_snapshot()
@@ -5897,7 +5916,7 @@ impl Core {
             .unwrap_or(0);
         let grace = self.lock_grace_until_ms();
         let until = grants.max(grace);
-        if until > now.0 {
+        if until > now.wall.0 {
             replica.locks().set_quarantine(until);
             // Those grants end unreleased (see `lock_on_released_takeover`).
             self.lock_dir_barrier(constellation_fs_core::types::ROOT_INO, until);
@@ -5905,7 +5924,7 @@ impl Core {
         }
     }
 
-    pub(crate) fn locks_start(&mut self, now: Ms, replica: &dyn Replica) {
+    pub(crate) fn locks_start(&mut self, now: Now, replica: &dyn Replica) {
         self.lk.tenure_floor_due = true;
         replica
             .locks()
@@ -5918,10 +5937,10 @@ impl Core {
         if !self.cfg.locks {
             return;
         }
-        if let Some(until) = replica.load_lock_quarantine(now.0) {
+        if let Some(until) = replica.load_lock_quarantine(now.wall.0) {
             tracing::info!(
                 node = self.cfg.node_id,
-                wait_ms = until - now.0,
+                wait_ms = until - now.wall.0,
                 "lock grants made before this restart may still be honoured; \
                  no new lock grant until they have expired (parked requests are \
                  served by the waiter tick then)"
@@ -5946,7 +5965,7 @@ impl Core {
     /// re-claim may continue the tenure (`lock_keep_grants_at_close`).
     pub(crate) fn lock_on_lease_gone(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -6021,7 +6040,7 @@ impl Core {
 
     pub(crate) fn locks_after_event(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {

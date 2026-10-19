@@ -397,7 +397,7 @@ fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
         if open.contains(&n.id) {
             continue;
         }
-        if n.meta.promise_join_begin(n.clock.now().0).unwrap_or(false) {
+        if n.meta.promise_join_begin(n.clock.wall().0).unwrap_or(false) {
             gated.push(n.clone());
         } else {
             for g in &gated {
@@ -475,7 +475,7 @@ pub async fn sample_authority(cluster: Arc<Cluster>) {
             }
             if let Some((epoch, expires)) = v.s3_held {
                 let margin = (cluster.env.config)(id, 1).expiry_margin_ms as i64;
-                if node.clock.now().0 < expires - margin {
+                if node.clock.wall().0 < expires - margin {
                     leases.push((id, epoch));
                 }
             }

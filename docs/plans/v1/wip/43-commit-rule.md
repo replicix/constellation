@@ -1987,11 +1987,12 @@ step cannot move; four commits) and gets its own reviews:
     pure; the host's sources and the fault hooks in
     `constellation_platform::clock`) gives:
     - WALL, unchanged;
-    - HONOUR = `wall₀ + max(BOOTTIME, RAW elapsed) + J`, where `J` is the
-      running maximum of how far the wall clock has been ahead of that
-      elapsed time. HONOUR is monotone and never under-counts. It follows a
+    - HONOUR = `wall₀ + RAW elapsed + S + J`, where `S` is the running
+      maximum of the time suspended (`BOOTTIME − MONOTONIC`, slewed
+      together, so a slew cancels) and `J` the running maximum of how far
+      the wall clock has been ahead of that elapsed time. HONOUR is monotone and never under-counts. It follows a
       forward step once and ignores a backward one.
-    - WAIT = `wall₀ + min(RAW, MONOTONIC elapsed)`. WAIT is monotone,
+    - WAIT = `wall₀ + RAW elapsed`. WAIT is monotone,
       never over-counts, and ignores every step.
 
     HONOUR ≥ WALL and HONOUR ≥ WAIT, but WAIT and WALL are unordered after
@@ -2055,7 +2056,7 @@ step cannot move; four commits) and gets its own reviews:
   The configurations:
   - `locks-root-step-forward`: the review's case;
   - `locks-locker-step-back`;
-  - `strict-holder-step-back-sealed`: the S3-cut, sealed holder of
+  - `locks-holder-step-back-sealed`: the S3-cut, sealed holder of
     `locks-failover-backup-renew` with strict reads. `backup-runtime-lag`
     cannot carry this case: it fails any seal and has no strict reads;
   - `fast-takeover-holder-step-forward`: F-a's forward step, on
@@ -2087,6 +2088,24 @@ step cannot move; four commits) and gets its own reviews:
      identity or status.
 
   1 + 2 + 3 close both measured classes.
+
+  *Commit 1 landed* (PROGRESS, "plan 43 C7-H1, commit 1 of 4"): the clocks,
+  `Now` through the core, relative timers, the sim's clock model and
+  faults, the step file and the load item; no protocol site reads a clock
+  other than WALL yet. Two things its measurements changed for the next
+  commits. (1) `fast-takeover-holder-step-forward` fails by two classes at
+  once, the old root's own grant table (the wait-side commit, 16 of its 18
+  failing seeds, 71 of 81 before plan 44's ask-again fix) and the successor's early grant after the takeover (2): the
+  honour-side commit's beat fields alone do not make it clean, and no
+  variant isolating the cap alone failed at all (the root's `LockMirror`,
+  restamped at the successor, covers most grants the cap would not).
+  (2) `locks-holder-step-back-sealed` fails on the old holder's lock grants,
+  not on a stale strict answer, and `delegated-delegate-step-back` could not
+  be made to fail: both are listed in PROGRESS with the variants tried.
+  A site found on the way: `lock_waited_since` (core/locks.rs, plan 44's
+  ask-again fix) turns a client-reported wait (measured on an `Instant`)
+  into a WALL queue key, so a step on the owner reorders the queue
+  (fairness, not exclusion): a wait-side site for commit 3.
   *Not in C7-H1:* rate (ρ), suspend in the sim, the models' clocks and
   boot-id horizons (C7a); every cross-node compare (C7b). The models have
   one clock per node and cannot express the split; C7a reworks them with
@@ -2153,7 +2172,7 @@ step cannot move; four commits) and gets its own reviews:
     whose guest clocks stopped);
   - *wait side* (a granter's outwait, a claimant's observation, the seal
     watch, quarantines, token memory) must never over-count:
-    `elapsed_w = min(RAW, MONOTONIC)`, never the wall clock.
+    `elapsed_w = RAW`, never the wall clock.
   Linux: `clock_gettime` (vDSO); macOS: `mach_continuous_time` /
   `CLOCK_UPTIME_RAW` (plans 34–36); `Instant` elsewhere.
 - **`Ms` becomes node-local protocol time.** Every value that crosses a
@@ -2706,7 +2725,7 @@ additionally fails on `non_lone_rollbacks > 0` (I5) from C1. New
 | every flex config (existing) with I5 | C5 | a retired hold owner's rows not classified operator-abandoned | ×2000 |
 | `backup-two` | C0 baseline, C6 | rows acknowledged by `{B1}` in the add window of B2 (I1, M4) | ×2000 |
 | `fast-takeover-skewed-successor` | C7-H2 | no quarantine for a successor ahead | ×2000 |
-| `locks-root-step-forward`, `locks-locker-step-back`, `strict-holder-step-back-sealed`, `fast-takeover-holder-step-forward`, `fast-takeover-successor-step-forward`, `delegated-root-step-forward`, `delegated-delegate-step-back`, `strict-reader-step-back` (+ the controls `locks-root-step-back`, `locks-holder-step-forward`) | C7-H1 | a backward step extends an honoured window; a forward step shortens a waited one or moves F-a's cap | ×2000 each |
+| `locks-root-step-forward`, `locks-locker-step-back`, `locks-holder-step-back-sealed`, `fast-takeover-holder-step-forward`, `fast-takeover-successor-step-forward`, `delegated-root-step-forward`, `delegated-delegate-step-back`, `strict-reader-step-back` (+ the controls `locks-root-step-back`, `locks-holder-step-forward`) | C7-H1 | a backward step extends an honoured window; a forward step shortens a waited one or moves F-a's cap | ×2000 each |
 | C7's seven sim tests (§7 C7) | C7a/C7b | offsets far beyond the margin | per test |
 
 Pinned regressions that must stay green throughout (they prove the

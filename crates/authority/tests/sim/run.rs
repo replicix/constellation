@@ -18,7 +18,7 @@ use constellation_types::Code;
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
 use rand::{Rng, SeedableRng};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -158,6 +158,41 @@ pub enum FaultKind {
         for_ms: (u64, u64),
         stamp_lag_ms: (u64, u64),
     },
+    /// Plan 43 C7-H1: step one node's wall clock by `ms` (an NTP or
+    /// operator step, a VM restore). Only its WALL reading moves: its
+    /// honour clock follows a forward step once and ignores a backward
+    /// one, its wait clock never moves (`sim/clock.rs`; `types::clock`'s
+    /// P4). The step is the node's, so it survives the node's restarts.
+    /// Not in `gen_faults`: the default mix is C7a's.
+    ClockStep { who: StepOf, ms: i64 },
+    /// Plan 43 C7-H1: once a node other than the lease holder is inside a
+    /// lock's critical section, step its wall clock by `step_ms` and then
+    /// cut it from every other node over P2P for `dur_ms`: the step makes
+    /// it honour its grant on (backward) or lapse it early (forward), and
+    /// the partition stops it renewing. `PartitionLocker` and
+    /// `ClockStep { Locker }` would each pick a locker, possibly
+    /// different ones; this picks one.
+    PartitionLockerStepped { step_ms: i64, dur_ms: u64 },
+}
+
+/// Whose wall clock a [`FaultKind::ClockStep`] steps, resolved at the
+/// fault's time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Backup` and `NonHolder` are there for the configurations of the later
+// commits of plan 43 C7-H1; the present ones use `Node`, `Holder` and
+// `Locker`.
+#[allow(dead_code)]
+pub enum StepOf {
+    Node(NodeId),
+    /// The lease holder (the lock owner, the root).
+    Holder,
+    /// The first listed backup.
+    Backup,
+    /// A node other than the holder that is inside a lock's critical
+    /// section (waiting up to 5 s for one: `wait_for_locker`).
+    Locker,
+    /// The lowest live node that is not the holder.
+    NonHolder,
 }
 
 /// Whose runtime a [`FaultKind::RuntimeLag`] holds up, as the lease
@@ -814,7 +849,7 @@ impl Cluster {
         if !self.ids().contains(&node) {
             return;
         }
-        let now = self.env.clock.now().0;
+        let now = self.env.clock.wall().0;
         let back = back.unwrap_or(i64::MAX);
         self.down.lock().unwrap().insert(node, back);
         let Some(lease) = read_lease(&self.env.bucket).await else {
@@ -944,7 +979,7 @@ impl Cluster {
         node.crash(&self.env.bus);
         // Plan 30 §M14: the process's lock state dies with it.
         self.locks.drop_node(id, self.env.clock.elapsed_ms());
-        super::locks::reset_node(&node.meta, &self.locks.inos(), node.clock.now().0);
+        super::locks::reset_node(&node.meta, &self.locks.inos(), node.clock.wall().0);
         node.meta.clone()
     }
 
@@ -1124,7 +1159,7 @@ async fn client_read(
     // the sequencer) — then the session wait at the answer's position.
     let mut floor = constellation_meta::Position::ZERO;
     if strict {
-        let now = handle.clock.now().0;
+        let now = handle.clock.wall().0;
         let ask = |handle: &NodeHandle| {
             handle.control(constellation_authority::Control::ReadIndex {
                 ino: parent,
@@ -1173,12 +1208,12 @@ async fn client_read(
         .is_some();
     tracing::debug!(
         node = handle.id,
-        now = handle.clock.now().0,
+        now = handle.clock.wall().0,
         name,
         present,
         timed_out,
         ?floor,
-        held = handle.meta.read_delegations().valid(parent, handle.clock.now().0).is_some(),
+        held = handle.meta.read_delegations().valid(parent, handle.clock.wall().0).is_some(),
         replays = handle.meta.pending_replays().map(|q| q.len()).unwrap_or(0),
         speculation = ?handle.meta.speculation_counts().ok(),
         "client read"
@@ -1692,7 +1727,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             if !h.alive() {
                 return;
             }
-            let now = cluster.env.clock.now().0;
+            let now = cluster.env.clock.wall().0;
             cluster
                 .note_takedown(holder, Some(now + restart_ms as i64), fault.at_ms)
                 .await;
@@ -1762,7 +1797,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 .lock()
                 .unwrap()
                 .push((cluster.env.clock.elapsed_ms(), None));
-            let now = cluster.env.clock.now().0;
+            let now = cluster.env.clock.wall().0;
             cluster
                 .note_takedown(holder, restart_ms.map(|r| now + r as i64), fault.at_ms)
                 .await;
@@ -1784,7 +1819,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} crash node {node} (restart {restart_ms:?}, keep_journal {keep_journal})",
                 fault.at_ms
             ));
-            let now = cluster.env.clock.now().0;
+            let now = cluster.env.clock.wall().0;
             cluster
                 .note_takedown(node, restart_ms.map(|r| now + r as i64), fault.at_ms)
                 .await;
@@ -1863,7 +1898,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} pause node {node} for {for_ms}ms",
                 fault.at_ms
             ));
-            let now = cluster.env.clock.now().0;
+            let now = cluster.env.clock.wall().0;
             cluster
                 .note_takedown(node, Some(now + for_ms as i64), fault.at_ms)
                 .await;
@@ -1885,7 +1920,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} stall node {node}'s next step for {for_ms}ms",
                 fault.at_ms
             ));
-            let now = cluster.env.clock.now().0;
+            let now = cluster.env.clock.wall().0;
             cluster
                 .note_takedown(node, Some(now + for_ms as i64), fault.at_ms)
                 .await;
@@ -1911,7 +1946,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 fault.at_ms,
                 core_ms + after_ms
             ));
-            let now = cluster.env.clock.now().0;
+            let now = cluster.env.clock.wall().0;
             cluster
                 .note_takedown(
                     node,
@@ -1983,7 +2018,7 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
                 "t={} crash backup {backup} of holder {} (restart {restart_ms:?})",
                 fault.at_ms, lease.holder
             ));
-            let now = cluster.env.clock.now().0;
+            let now = cluster.env.clock.wall().0;
             cluster
                 .note_takedown(backup, restart_ms.map(|r| now + r as i64), fault.at_ms)
                 .await;
@@ -2004,6 +2039,63 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             cluster.env.bucket.set_cut(lease.holder, true);
             tokio::time::sleep(Duration::from_millis(for_ms)).await;
             cluster.env.bucket.set_cut(lease.holder, false);
+        }
+        FaultKind::ClockStep { who, ms } => {
+            let node = match who {
+                StepOf::Node(n) => Some(n).filter(|n| cluster.ids().contains(n)),
+                StepOf::Locker => wait_for_locker(&cluster).await,
+                StepOf::Holder | StepOf::Backup | StepOf::NonHolder => {
+                    let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                        note(format!("t={} clock step: no lease yet", fault.at_ms));
+                        return;
+                    };
+                    let ids = cluster.ids();
+                    let live = |n: &NodeId| ids.contains(n) && cluster.get(*n).alive();
+                    match who {
+                        StepOf::Holder => Some(lease.holder).filter(live),
+                        StepOf::Backup => lease.backups.first().copied().filter(live),
+                        _ => ids.iter().copied().find(|n| *n != lease.holder && live(n)),
+                    }
+                }
+            };
+            let Some(node) = node else {
+                note(format!("t={} clock step {who:?}: nobody", fault.at_ms));
+                return;
+            };
+            note(format!(
+                "t={} clock step node {node} ({who:?}) by {ms}ms (wall)",
+                cluster.env.clock.elapsed_ms()
+            ));
+            cluster
+                .env
+                .step_of(node)
+                .fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+        FaultKind::PartitionLockerStepped { step_ms, dur_ms } => {
+            let Some(node) = wait_for_locker(&cluster).await else {
+                note(format!(
+                    "t={} partition-locker-stepped: no locker",
+                    fault.at_ms
+                ));
+                return;
+            };
+            let others: Vec<NodeId> = cluster.ids().into_iter().filter(|n| *n != node).collect();
+            note(format!(
+                "t={} clock step locker {node} by {step_ms}ms (wall), then partition it from \
+                 {others:?} for {dur_ms}ms",
+                cluster.env.clock.elapsed_ms()
+            ));
+            cluster
+                .env
+                .step_of(node)
+                .fetch_add(step_ms, std::sync::atomic::Ordering::SeqCst);
+            for o in &others {
+                cluster.env.bus.set_partition(node, *o, true);
+            }
+            tokio::time::sleep(Duration::from_millis(dur_ms)).await;
+            for o in &others {
+                cluster.env.bus.set_partition(node, *o, false);
+            }
         }
         FaultKind::PartitionLocker { for_ms } => {
             let Some(node) = wait_for_locker(&cluster).await else {
@@ -2202,7 +2294,7 @@ async fn crash_epoch_member(
         "t={} crash epoch member {node} ({why}; hold owner {owner}; restart {restart_ms:?})",
         cluster.env.clock.elapsed_ms()
     ));
-    let now = cluster.env.clock.now().0;
+    let now = cluster.env.clock.wall().0;
     cluster
         .note_takedown(node, restart_ms.map(|r| now + r as i64), at_ms)
         .await;
@@ -2283,7 +2375,7 @@ fn operator_drop_hopeless(
             if after_ms.is_some_and(|after| now_ms < since + after) {
                 continue;
             }
-            let now_unix = n.clock.now().0 / 1000;
+            let now_unix = n.clock.wall().0 / 1000;
             let dropped = if remote {
                 n.meta.drop_held_remote(ino, now_unix)
             } else {
@@ -2393,7 +2485,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     let env = NodeEnv {
         bucket: bucket.clone(),
         bus: bus.clone(),
-        clock,
+        clock: clock.clone(),
         commits: commits.clone(),
         in_doubt: in_doubt.clone(),
         config: cfg.core.clone(),
@@ -2401,6 +2493,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         fast_path: cfg.fast_path,
         clock_skew_ms: cfg.clock_skew_ms,
         clock_offsets: cfg.clock_offsets.clone(),
+        steps: Mutex::new(HashMap::new()),
         seed,
         world: ChunkWorld::new(),
         tag_check_at_write: cfg.tag_check_at_write,

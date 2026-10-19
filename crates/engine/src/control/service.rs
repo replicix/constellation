@@ -820,10 +820,20 @@ impl EngineControl {
             s3: backend::s3_request_counts(),
             vfs_ops: super::ops::vfs_ops_status(),
             fuse,
-            clock: api::ClockStatus {
-                hlc_last_ns: constellation_meta::hlc::last_ns(),
-                skew_tolerance_s: constellation_meta::hlc::skew_tolerance_ns() / 1_000_000_000,
-                rejected_stamps: constellation_meta::hlc::rejected_stamps(),
+            clock: {
+                let now = constellation_platform::clock::protocol().now();
+                let steps = constellation_platform::clock::protocol().step_stats();
+                api::ClockStatus {
+                    hlc_last_ns: constellation_meta::hlc::last_ns(),
+                    skew_tolerance_s: constellation_meta::hlc::skew_tolerance_ns() / 1_000_000_000,
+                    rejected_stamps: constellation_meta::hlc::rejected_stamps(),
+                    steps_forward: steps.steps_forward,
+                    steps_backward: steps.steps_backward,
+                    stepped_ms_total: steps.stepped_ms_total,
+                    last_step_ms: steps.last_step.map_or(0, |(_, delta)| delta),
+                    honour_ahead_ms: now.honour.0 - now.wall.0,
+                    wait_behind_ms: now.wall.0 - now.wait.0,
+                }
             },
             log: log_status(&self.log_buffer.stats()),
         }

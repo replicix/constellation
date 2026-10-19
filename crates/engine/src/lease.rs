@@ -323,6 +323,7 @@ impl LeaseView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use constellation_authority::Now;
     use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
 
     fn tag() -> constellation_store_s3::LeaseTag {
@@ -375,8 +376,8 @@ mod tests {
         assert!(!view.usable());
         assert!(view.admit().is_none());
 
-        let lease = state.granted_lease(now, &cfg, None, false);
-        state.adopt(now, lease, tag(), None);
+        let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
+        state.adopt(Now::same(now.0), lease, tag(), None);
         view.mirror(&state, now, &cfg, false);
         assert!(view.usable());
         assert!(view.open_for_new_mutation());
@@ -388,7 +389,7 @@ mod tests {
         assert!(view.admit().is_none(), "releasing closes new mutations");
         state.releasing = false;
 
-        state.begin_handoff_pause(now, &cfg);
+        state.begin_handoff_pause(Now::same(now.0), &cfg);
         view.mirror(&state, now, &cfg, false);
         assert!(view.usable());
         assert!(!view.open_for_new_mutation(), "paused for a handoff");
@@ -409,7 +410,7 @@ mod tests {
         state.gate = None;
 
         state.released();
-        state.adopt_epoch_hold(now, 3);
+        state.adopt_epoch_hold(Now::same(now.0), 3);
         view.mirror(&state, now, &cfg, false);
         assert!(view.usable() && view.open_for_new_mutation());
         assert_eq!(view.status().epoch, 3);
@@ -423,8 +424,8 @@ mod tests {
         let now = Ms(now_unix_ms());
         let view = std::sync::Arc::new(LeaseView::default());
         let mut state = LeaseState::default();
-        let lease = state.granted_lease(now, &cfg, None, false);
-        state.adopt(now, lease, tag(), None);
+        let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
+        state.adopt(Now::same(now.0), lease, tag(), None);
         view.mirror(&state, now, &cfg, false);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

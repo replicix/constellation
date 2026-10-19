@@ -797,7 +797,7 @@ pub async fn client_lock(
     failures: Arc<Mutex<Vec<String>>>,
 ) {
     let ghost = cluster.locks.clone();
-    let clock = cluster.env.clock;
+    let clock = cluster.env.clock.clone();
     let handle = cluster.get(node);
     if !handle.alive() {
         return;
@@ -878,7 +878,7 @@ pub async fn client_lock(
             failures.lock().unwrap().push(stuck(&h));
             return;
         }
-        let now = h.clock.now().0;
+        let now = h.clock.wall().0;
         match h.meta.locks().local_set(ino, lock, now) {
             LocalOutcome::Done => break,
             LocalOutcome::Conflict(_) | LocalOutcome::Predecessor => {
@@ -901,7 +901,7 @@ pub async fn client_lock(
                         ino,
                         node,
                         thread,
-                        clock,
+                        clock: clock.clone(),
                         done: false,
                     });
                 }
@@ -1057,7 +1057,7 @@ pub async fn client_lock(
             ghost.count(|c| c.abandoned += 1);
             return;
         };
-        let now = h.clock.now().0;
+        let now = h.clock.wall().0;
         let ino_fenced = h.meta.locks().fenced(ino, now);
         let owner_fenced = h
             .meta
@@ -1122,7 +1122,7 @@ pub async fn client_lock(
                 // Plan 30 §M14 phase 2: the write carries the fencing
                 // token of the client's locks, as a FUSE thread's does,
                 // and counts in flight for their release.
-                let tag = match h.meta.locks().owner_tag(&[thread], h.clock.now().0) {
+                let tag = match h.meta.locks().owner_tag(&[thread], h.clock.wall().0) {
                     Ok(tag) => tag,
                     Err(_) => {
                         // Lapsed since the fence check above: fenced.
@@ -1133,7 +1133,7 @@ pub async fn client_lock(
                         break;
                     }
                 };
-                h.meta.locks().tag_begin(&tag, h.clock.now().0);
+                h.meta.locks().tag_begin(&tag, h.clock.wall().0);
                 let turn = ghost.take_turn(rid);
                 ghost.turn_lock(rid, ino, node, data, turn);
                 // The holder is in I/O while the write is awaited, for as
@@ -1155,14 +1155,14 @@ pub async fn client_lock(
                     tag.clone(),
                 );
                 let t_write = clock.elapsed_ms();
-                let under = h.meta.locks().honoured(ino, h.clock.now().0).map(|g| g.id);
+                let under = h.meta.locks().honoured(ino, h.clock.wall().0).map(|g| g.id);
                 let mut lapsed_once = false;
                 let reply = loop {
                     match tokio::time::timeout(Duration::from_millis(5), &mut rx).await {
                         Ok(r) => break Some(r),
                         Err(_) => {
                             let lapsed = same(&cluster, node, inc)
-                                .is_none_or(|h| h.meta.locks().fenced(ino, h.clock.now().0));
+                                .is_none_or(|h| h.meta.locks().fenced(ino, h.clock.wall().0));
                             lapsed_once |= lapsed;
                             if lapsed && entered {
                                 ghost.leave(
@@ -1210,7 +1210,7 @@ pub async fn client_lock(
                     ghost.count(|c| c.token_refused += 1);
                 }
                 if let Some(h) = same(&cluster, node, inc) {
-                    h.meta.locks().tag_end(&tag, !settled, h.clock.now().0);
+                    h.meta.locks().tag_end(&tag, !settled, h.clock.wall().0);
                 }
                 // Acknowledged while the grant it was written under is
                 // still honoured (not another thread's later one): the
@@ -1219,7 +1219,7 @@ pub async fn client_lock(
                     && !lapsed_once
                     && under.is_some()
                     && same(&cluster, node, inc).is_some_and(|h| {
-                        h.meta.locks().honoured(ino, h.clock.now().0).map(|g| g.id) == under
+                        h.meta.locks().honoured(ino, h.clock.wall().0).map(|g| g.id) == under
                     })
                 {
                     ghost.turn_acked(data, turn, node, clock.elapsed_ms(), rid);
@@ -1246,7 +1246,7 @@ pub async fn client_lock(
     let idle = h
         .meta
         .locks()
-        .local_unlock(ino, thread, 0, u64::MAX, h.clock.now().0);
+        .local_unlock(ino, thread, 0, u64::MAX, h.clock.wall().0);
     if idle && h.meta.locks().held(ino).is_some_and(|g| g.recalled) {
         ghost.count(|c| c.idle_sent += 1);
         let rx = h.control(Control::LockIdle { ino });

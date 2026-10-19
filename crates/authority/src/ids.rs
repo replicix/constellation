@@ -1,8 +1,24 @@
-//! Identifiers and the logical clock the core reasons with.
+//! Identifiers and the logical clocks the core reasons with.
 //!
 //! Nothing in this module reads a clock or mints anything non-deterministic:
 //! [`OpId`]s and [`TimerId`]s come from the core's own counters, and every
-//! [`Ms`] the core sees arrives as an input (`Core::handle`'s `now`).
+//! time the core sees arrives as an input: `Core::handle`'s `now` is a
+//! [`Now`], one sample of the node's three protocol clocks
+//! (`constellation_types::clock`, plan 43 C7-H1).
+//!
+//! - [`Ms`] is WALL: unix milliseconds on the host's wall clock (in the
+//!   simulation, the paused tokio clock offset from a fixed base plus the
+//!   node's skew and steps). What is compared across nodes, written to S3,
+//!   persisted, used as an identity key or shown in status.
+//! - [`HonourMs`] is HONOUR: monotone, never under-counts, follows forward
+//!   wall steps and ignores backward ones. A holder's stamps and the checks
+//!   of its own rights.
+//! - [`WaitMs`] is WAIT: monotone, never over-counts, ignores every wall
+//!   step. A waiter's stamps and liveness timers.
+//!
+//! The core's own code does not use the second and third yet: every site
+//! reads `now.wall` until the commits that convert them (plan 43 C7-H1,
+//! 2/4 to 4/4), so the plumbing changes no behaviour without a step.
 
 /// A node id, as in `nodes/<id>` and `Lease::holder`.
 pub type NodeId = u64;
@@ -11,23 +27,7 @@ pub type Epoch = u64;
 /// A log sequence number (`log/<part>/<seq>`).
 pub type Seq = u64;
 
-/// Unix milliseconds, as `Lease::expires_unix_ms` and the lease helpers
-/// (`Lease::is_expired`, `is_claimable`) use them. Wall-clock in
-/// production; the simulation's paused tokio clock offset from a fixed
-/// base in tests. The core never calls `now_unix_ms()` itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Ms(pub i64);
-
-impl Ms {
-    pub fn plus(self, ms: u64) -> Ms {
-        Ms(self.0.saturating_add(ms as i64))
-    }
-
-    /// `self - earlier`, in ms (negative when `earlier` is later).
-    pub fn since(self, earlier: Ms) -> i64 {
-        self.0 - earlier.0
-    }
-}
+pub use constellation_types::clock::{HonourMs, Ms, Now, WaitMs};
 
 /// Correlates an issued action with its result: an S3 request with its
 /// `Event::S3`, a peer request with the `PeerMsg` reply that echoes it (or

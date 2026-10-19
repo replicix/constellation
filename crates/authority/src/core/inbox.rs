@@ -33,7 +33,7 @@ use super::client::Phase;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{CasFailure, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, OpId, TimerId};
+use crate::ids::{Epoch, Ms, NodeId, Now, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_meta::{InboxAck, MetaError, MutateOp, Rid};
 use constellation_store_s3::inbox::{
@@ -157,7 +157,7 @@ pub struct InboxView {
 }
 
 impl InboxState {
-    pub(crate) fn view(&self, now: Ms, cfg: &super::Config, roster: &[NodeId]) -> InboxView {
+    pub(crate) fn view(&self, now: Now, cfg: &super::Config, roster: &[NodeId]) -> InboxView {
         let _ = now;
         InboxView {
             roster: roster.to_vec(),
@@ -172,11 +172,11 @@ impl InboxState {
         }
     }
 
-    fn prune_window(&mut self, now: Ms, window_ms: u64) {
+    fn prune_window(&mut self, now: Now, window_ms: u64) {
         while self
             .window
             .front()
-            .is_some_and(|(at, _)| now.since(*at) > window_ms as i64)
+            .is_some_and(|(at, _)| now.wall.since(*at) > window_ms as i64)
         {
             self.window.pop_front();
         }
@@ -257,7 +257,7 @@ impl Core {
     /// grace with nothing heard from it since. "Not yet talked to" means
     /// reachable: the first forward dials. A slow or timing-out reply on
     /// an open connection is never an outage.
-    pub(crate) fn reaches(&mut self, now: Ms, holder: NodeId) -> bool {
+    pub(crate) fn reaches(&mut self, now: Now, holder: NodeId) -> bool {
         if !self.cfg.p2p {
             return false;
         }
@@ -279,18 +279,18 @@ impl Core {
             self.inbox.down_since.remove(&holder);
             return true;
         }
-        now.since(since) < self.cfg.inbox_p2p_grace_ms as i64
+        now.wall.since(since) < self.cfg.inbox_p2p_grace_ms as i64
     }
 
     /// EC2 finding 2: a mutation of `node`'s executed here, over P2P
     /// (`p2p`) or through the S3 inbox.
-    pub(crate) fn note_demand(&mut self, now: Ms, node: NodeId, p2p: bool) {
+    pub(crate) fn note_demand(&mut self, now: Now, node: NodeId, p2p: bool) {
         let map = if p2p {
             &mut self.demand_p2p
         } else {
             &mut self.demand_inbox
         };
-        map.insert(node, now);
+        map.insert(node, now.wall);
     }
 
     /// EC2 finding 2: whether this holder keeps the lease its wanters
@@ -311,7 +311,7 @@ impl Core {
     /// its own side). A holder nobody reaches over P2P (an isolated
     /// holder) has no P2P demand and still hands over. Availability only:
     /// who holds the lease is still decided by CAS and TTL alone.
-    pub(crate) fn keeps_lease_for_p2p_side(&mut self, now: Ms) -> bool {
+    pub(crate) fn keeps_lease_for_p2p_side(&mut self, now: Now) -> bool {
         if !self.cfg.p2p || self.lease.wanted.is_empty() {
             return false;
         }
@@ -324,8 +324,10 @@ impl Core {
             return false;
         }
         let me = self.cfg.node_id;
-        self.demand_p2p.retain(|_, at| now.since(*at) <= window);
-        self.demand_inbox.retain(|_, at| now.since(*at) <= window);
+        self.demand_p2p
+            .retain(|_, at| now.wall.since(*at) <= window);
+        self.demand_inbox
+            .retain(|_, at| now.wall.since(*at) <= window);
         let recent: Vec<NodeId> = self.demand_p2p.keys().copied().collect();
         let mut near = 1usize;
         for node in recent {
@@ -355,13 +357,13 @@ impl Core {
     }
 
     /// Rate-limits `keeps_lease_for_p2p_side`'s log line.
-    fn demand_note_due(&mut self, now: Ms) -> bool {
+    fn demand_note_due(&mut self, now: Now) -> bool {
         let due = self
             .inbox
             .kept_logged_at
-            .is_none_or(|at| now.since(at) >= 10_000);
+            .is_none_or(|at| now.wall.since(at) >= 10_000);
         if due {
-            self.inbox.kept_logged_at = Some(now);
+            self.inbox.kept_logged_at = Some(now.wall);
         }
         due
     }
@@ -369,11 +371,11 @@ impl Core {
     /// What a P2P exchange with `holder` just said: anything heard ends
     /// an outage; a transport failure starts the grace, if none is
     /// running.
-    pub(crate) fn note_p2p_result(&mut self, now: Ms, holder: NodeId, heard: bool) {
+    pub(crate) fn note_p2p_result(&mut self, now: Now, holder: NodeId, heard: bool) {
         if heard {
             self.inbox.down_since.remove(&holder);
         } else {
-            self.inbox.down_since.entry(holder).or_insert(now);
+            self.inbox.down_since.entry(holder).or_insert(now.wall);
         }
     }
 
@@ -382,7 +384,7 @@ impl Core {
     /// Queue `rid` for the holder's inbox under `epoch`.
     pub(crate) fn inbox_enqueue(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         epoch: Epoch,
         replica: &dyn Replica,
@@ -400,14 +402,14 @@ impl Core {
         c.phase = Phase::InboxQueued { epoch };
         c.forwarded = true;
         if c.inbox_since.is_none() {
-            c.inbox_since = Some(now);
+            c.inbox_since = Some(now.wall);
             // The inbox wait has its own deadline (`min(2×TTL,
             // retention/2)`); the lease path afterwards gets the
             // ordinary one.
             let old = c.deadline;
             self.cancel_timer(old, out);
-            let deadline = self.set_timer(
-                now.plus(self.cfg.inbox_deadline_ms),
+            let deadline = self.set_timer_wall(
+                now.wall.plus(self.cfg.inbox_deadline_ms),
                 Timer::ClientDeadline(rid),
                 out,
             );
@@ -423,7 +425,7 @@ impl Core {
     /// Start the next batch PUT if none is in flight: everything queued
     /// under the highest queued epoch goes into it (ops queued under an
     /// older epoch re-read the lease).
-    pub(crate) fn inbox_kick(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn inbox_kick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.inbox.submitting.is_some() || self.inbox.resync.is_some() {
             return;
         }
@@ -497,7 +499,7 @@ impl Core {
             node: self.cfg.node_id,
             incarnation: self.cfg.incarnation,
             n,
-            submitted_unix_ms: now.0,
+            submitted_unix_ms: now.wall.0,
             ops,
             wants_lease,
         };
@@ -513,7 +515,7 @@ impl Core {
 
     pub(crate) fn on_inbox_last_n(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -542,7 +544,7 @@ impl Core {
 
     pub(crate) fn on_inbox_put(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -575,7 +577,7 @@ impl Core {
                     if let Some(c) = self.clients.get_mut(&rid) {
                         if matches!(c.phase, Phase::InboxQueued { .. }) {
                             c.phase = Phase::InboxWaiting { epoch: sub.epoch };
-                            c.inbox_durable_at = Some(now);
+                            c.inbox_durable_at = Some(now.wall);
                             if !c.inbox_keys.contains(&key) {
                                 c.inbox_keys.push(key);
                             }
@@ -625,13 +627,19 @@ impl Core {
         }
     }
 
-    fn inbox_retry(&mut self, now: Ms, attempt: u32, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn inbox_retry(
+        &mut self,
+        now: Now,
+        attempt: u32,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         let _ = replica;
         if self.inbox.retry_timer.is_some() {
             return;
         }
         let delay = 200 * u64::from(attempt);
-        let id = self.set_timer(now.plus(delay), Timer::InboxSubmitRetry, out);
+        let id = self.set_timer_wall(now.wall.plus(delay), Timer::InboxSubmitRetry, out);
         self.inbox.retry_timer = Some(id);
         // The attempt count carries into the next PUT.
         if let Some(sub) = self.inbox.submitting.as_mut() {
@@ -639,12 +647,12 @@ impl Core {
         }
     }
 
-    fn arm_inbox_recheck(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn arm_inbox_recheck(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.inbox.recheck_timer.is_some() || self.inbox.pending.is_empty() {
             return;
         }
-        let id = self.set_timer(
-            now.plus(self.cfg.inbox_recheck_ms.max(100)),
+        let id = self.set_timer_wall(
+            now.wall.plus(self.cfg.inbox_recheck_ms.max(100)),
             Timer::InboxRecheck,
             out,
         );
@@ -654,7 +662,7 @@ impl Core {
     /// The recheck timer: re-read the lease for the waiting ops.
     pub(crate) fn on_inbox_recheck_tick(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -668,7 +676,7 @@ impl Core {
 
     pub(crate) fn on_inbox_recheck(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -690,7 +698,7 @@ impl Core {
             let Phase::InboxWaiting { epoch } = c.phase else {
                 continue;
             };
-            let since = c.inbox_since.unwrap_or(now);
+            let since = c.inbox_since.unwrap_or(now.wall);
             match &lease {
                 Some(l) if l.holder == self.cfg.node_id => {
                     // Round 3b: this node took the lease (an escalation
@@ -718,7 +726,7 @@ impl Core {
                         "inbox: a takeover stranded a submitted op; re-submitting by rid"
                     );
                     let new_epoch = l.epoch;
-                    if l.is_claimable(now.0) {
+                    if l.is_claimable(now.wall.0) {
                         self.stats.inbox_unavailable += 1;
                         self.lease_path(now, rid, replica, out);
                     } else {
@@ -730,7 +738,7 @@ impl Core {
                         && l.holder != self.cfg.node_id
                         && l.holder != 0
                         && l.epoch == epoch
-                        && !l.is_claimable(now.0)
+                        && !l.is_claimable(now.wall.0)
                         && self.links.get(&l.holder).is_some_and(|k| k.connected)
                         && self.reaches(now, l.holder) =>
                 {
@@ -759,7 +767,7 @@ impl Core {
                     }
                     self.send_forward(now, rid, l.holder, replica, out);
                 }
-                Some(l) if l.is_claimable(now.0) => {
+                Some(l) if l.is_claimable(now.wall.0) => {
                     // The holder is gone; whoever takes over drains the
                     // batch. The lease path resolves the rid.
                     self.inbox.pending.remove(&rid);
@@ -767,7 +775,7 @@ impl Core {
                     self.lease_path(now, rid, replica, out);
                 }
                 _ => {
-                    if now.since(since) >= self.cfg.inbox_deadline_ms as i64 {
+                    if now.wall.since(since) >= self.cfg.inbox_deadline_ms as i64 {
                         tracing::warn!(
                             node = self.cfg.node_id,
                             ?rid,
@@ -787,14 +795,14 @@ impl Core {
 
     /// An inbox op's outcome arrived through the log: feed the demand
     /// window (`finish` follows).
-    pub(crate) fn inbox_answered(&mut self, now: Ms, rid: Rid) {
+    pub(crate) fn inbox_answered(&mut self, now: Now, rid: Rid) {
         let Some(c) = self.clients.get(&rid) else {
             return;
         };
-        let queued_at = c.inbox_since.unwrap_or(now);
-        let durable_at = c.inbox_durable_at.unwrap_or(now);
+        let queued_at = c.inbox_since.unwrap_or(now.wall);
+        let durable_at = c.inbox_durable_at.unwrap_or(now.wall);
         let queue_wait = durable_at.since(queued_at).max(0) as u64;
-        let outcome_wait = now.since(durable_at).max(0) as u64;
+        let outcome_wait = now.wall.since(durable_at).max(0) as u64;
         self.stats.inbox_queue_wait_ms_total += queue_wait;
         self.stats.inbox_outcome_wait_ms_total += outcome_wait;
         self.stats.inbox_round_trip_ms_total += queue_wait + outcome_wait;
@@ -818,12 +826,12 @@ impl Core {
 
     // ----------------------------------------------------- escalation
 
-    fn note_inbox_op(&mut self, now: Ms, round_trip_ms: u64) {
-        self.inbox.window.push_back((now, round_trip_ms));
+    fn note_inbox_op(&mut self, now: Now, round_trip_ms: u64) {
+        self.inbox.window.push_back((now.wall, round_trip_ms));
         self.evaluate_escalation(now);
     }
 
-    fn evaluate_escalation(&mut self, now: Ms) {
+    fn evaluate_escalation(&mut self, now: Now) {
         self.inbox.prune_window(now, self.cfg.escalate_window_ms);
         if !self.cfg.escalation {
             self.inbox.escalated_since = None;
@@ -836,7 +844,7 @@ impl Core {
             && (wait_ms as f64) < self.cfg.escalate_wait_ms as f64 * DEESCALATE_FRACTION;
         match (self.inbox.escalated_since, sustained, quiet) {
             (None, true, _) => {
-                self.inbox.escalated_since = Some(now);
+                self.inbox.escalated_since = Some(now.wall);
                 self.inbox.escalate_attempts = 0;
                 self.inbox.escalate_last_request = None;
                 self.stats.inbox_escalations += 1;
@@ -851,7 +859,7 @@ impl Core {
             (Some(since), _, true) => {
                 tracing::info!(
                     node = self.cfg.node_id,
-                    escalated_for_ms = now.since(since),
+                    escalated_for_ms = now.wall.since(since),
                     "inbox: demand fell off; no longer asking for the lease"
                 );
                 self.inbox.escalated_since = None;
@@ -864,18 +872,18 @@ impl Core {
     /// be, asking for the lease). Re-evaluated on read so an escalation
     /// with no further ops still expires with its window. While
     /// escalated the tick that asks is armed.
-    pub(crate) fn escalated(&mut self, now: Ms) -> bool {
+    pub(crate) fn escalated(&mut self, now: Now) -> bool {
         self.evaluate_escalation(now);
         // Plan 31 C8: a forward-only node never asks for the lease.
         self.inbox.escalated_since.is_some() && !self.mode.forwards()
     }
 
     /// Arm the escalator's tick (from wherever an escalation can begin).
-    fn arm_escalate_tick(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn arm_escalate_tick(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.inbox.escalate_timer.is_some() || self.inbox.escalated_since.is_none() {
             return;
         }
-        let id = self.set_timer(now.plus(ESCALATE_TICK_MS), Timer::EscalateTick, out);
+        let id = self.set_timer_wall(now.wall.plus(ESCALATE_TICK_MS), Timer::EscalateTick, out);
         self.inbox.escalate_timer = Some(id);
     }
 
@@ -885,7 +893,7 @@ impl Core {
     /// through the inbox meanwhile, and the batches carry `wants_lease`.
     pub(crate) fn on_escalate_tick(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -919,9 +927,9 @@ impl Core {
             let due = self
                 .inbox
                 .escalate_last_request
-                .is_none_or(|at| now.since(at) >= backoff as i64);
+                .is_none_or(|at| now.wall.since(at) >= backoff as i64);
             if due {
-                self.inbox.escalate_last_request = Some(now);
+                self.inbox.escalate_last_request = Some(now.wall);
                 self.inbox.escalate_attempts = self.inbox.escalate_attempts.saturating_add(1);
                 self.stats.inbox_lease_requests += 1;
                 self.enqueue_job(
@@ -939,7 +947,7 @@ impl Core {
     }
 
     /// Called after every event that could have started an escalation.
-    pub(crate) fn inbox_after_event(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn inbox_after_event(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.inbox.escalated_since.is_some() {
             self.arm_escalate_tick(now, out);
         }
@@ -971,7 +979,7 @@ impl Core {
     /// have gone cold anyway), or it wants the lease. With P2P off the
     /// inbox is every requester's only path and each is tracked once per
     /// tenure, so all start warm as before.
-    fn inbox_recent_demand(&self, now: Ms, node: NodeId) -> bool {
+    fn inbox_recent_demand(&self, now: Now, node: NodeId) -> bool {
         if !self.cfg.p2p {
             return true;
         }
@@ -981,7 +989,7 @@ impl Core {
             .saturating_mul(constellation_store_s3::inbox::COLD_AFTER_ROUNDS as u64)
             as i64;
         let recent =
-            |m: &BTreeMap<NodeId, Ms>| m.get(&node).is_some_and(|at| now.since(*at) <= span);
+            |m: &BTreeMap<NodeId, Ms>| m.get(&node).is_some_and(|at| now.wall.since(*at) <= span);
         recent(&self.demand_p2p) || recent(&self.demand_inbox) || self.lease.wanted.contains(&node)
     }
 
@@ -989,7 +997,7 @@ impl Core {
     /// poll timer: GC what shipped, then GET-next every due requester.
     pub(crate) fn inbox_holder_tick(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1057,7 +1065,7 @@ impl Core {
                         backoff.gone_cold()
                     },
                     next_n: 0,
-                    due_at: now,
+                    due_at: now.wall,
                     in_flight: None,
                     width: 1,
                     full: false,
@@ -1097,13 +1105,13 @@ impl Core {
         let mut polls = Vec::new();
         let mut next_due: Option<Ms> = None;
         if !self.inbox.leftover.is_empty() {
-            next_due = Some(now.plus(base));
+            next_due = Some(now.wall.plus(base));
         }
         for (node, rp) in holder.requesters.iter_mut() {
             if !rp.active || rp.in_flight.is_some() || waiting.contains(node) {
                 continue;
             }
-            if rp.due_at <= now {
+            if rp.due_at <= now.wall {
                 rp.width = if rp.full || rp.backoff.is_hot() {
                     width
                 } else {
@@ -1144,13 +1152,13 @@ impl Core {
         if let Some(id) = self.inbox.poll_timer.take() {
             self.cancel_timer(id, out);
         }
-        let id = self.set_timer(at, Timer::InboxPoll, out);
+        let id = self.set_timer_wall(at, Timer::InboxPoll, out);
         self.inbox.poll_timer = Some(id);
     }
 
     pub(crate) fn on_inbox_polled(
         &mut self,
-        now: Ms,
+        now: Now,
         node: NodeId,
         result: S3Result,
         replica: &dyn Replica,
@@ -1173,7 +1181,7 @@ impl Core {
                     "inbox poll failed"
                 );
                 rp.backoff.miss();
-                rp.due_at = now.plus(rp.backoff.delay_ms());
+                rp.due_at = now.wall.plus(rp.backoff.delay_ms());
                 let at = rp.due_at;
                 self.arm_inbox_poll_min(at, out);
                 return;
@@ -1185,7 +1193,7 @@ impl Core {
         if run.is_empty() {
             rp.full = false;
             rp.backoff.miss();
-            rp.due_at = now.plus(rp.backoff.delay_ms());
+            rp.due_at = now.wall.plus(rp.backoff.delay_ms());
             let at = rp.due_at;
             self.arm_inbox_poll_min(at, out);
             return;
@@ -1199,7 +1207,7 @@ impl Core {
             batches = run.len(),
             oldest_ms = run
                 .iter()
-                .map(|b| now.0.saturating_sub(b.submitted_unix_ms))
+                .map(|b| now.wall.0.saturating_sub(b.submitted_unix_ms))
                 .max()
                 .unwrap_or(0),
             idle_rounds_before = rp.backoff.idle_rounds(),
@@ -1207,7 +1215,7 @@ impl Core {
         );
         for batch in &run {
             self.stats.inbox_pickup_ms_total +=
-                now.0.saturating_sub(batch.submitted_unix_ms).max(0) as u64;
+                now.wall.0.saturating_sub(batch.submitted_unix_ms).max(0) as u64;
             self.stats.inbox_pickup_samples += 1;
         }
         let saturated = run.len() >= width;
@@ -1259,11 +1267,11 @@ impl Core {
             .and_then(|h| h.requesters.get_mut(&node))
         {
             rp.due_at = if halted {
-                now.plus(base)
+                now.wall.plus(base)
             } else if saturated {
-                now
+                now.wall
             } else {
-                now.plus(rp.backoff.delay_ms())
+                now.wall.plus(rp.backoff.delay_ms())
             };
             let at = rp.due_at;
             self.arm_inbox_poll_min(at, out);
@@ -1272,7 +1280,7 @@ impl Core {
 
     /// Plan 30 §M8: the recalls an inbox op waited for are done: poll its
     /// requester again now.
-    pub(crate) fn inbox_repoll(&mut self, now: Ms, node: NodeId, out: &mut Vec<Action>) {
+    pub(crate) fn inbox_repoll(&mut self, now: Now, node: NodeId, out: &mut Vec<Action>) {
         let Some(rp) = self
             .inbox
             .holder
@@ -1281,13 +1289,18 @@ impl Core {
         else {
             return;
         };
-        rp.due_at = now;
-        self.arm_inbox_poll_min(now, out);
+        rp.due_at = now.wall;
+        self.arm_inbox_poll_min(now.wall, out);
     }
 
     fn arm_inbox_poll_min(&mut self, at: Ms, out: &mut Vec<Action>) {
         let sooner = match self.inbox.poll_timer {
-            Some(id) => self.timer_at(id).is_none_or(|t| at < t),
+            Some(id) => self.timer_at(id).is_none_or(|t| {
+                t.later_than_wall(at).unwrap_or_else(|| {
+                    debug_assert!(false, "the inbox poll timer left the wall clock");
+                    false
+                })
+            }),
             None => true,
         };
         if sooner {
@@ -1309,7 +1322,7 @@ impl Core {
     /// rid; one that reads the tombstone runs them from the new batch.
     pub(crate) fn on_inbox_withdrawn(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         result: S3Result,
         replica: &dyn Replica,
@@ -1350,7 +1363,7 @@ impl Core {
     /// a later batch too, only forgets the key.
     fn inbox_resubmit_cobatched(
         &mut self,
-        now: Ms,
+        now: Now,
         key: InboxKey,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1387,7 +1400,7 @@ impl Core {
         self.inbox_kick(now, replica, out);
     }
 
-    pub(crate) fn on_inbox_gc(&mut self, now: Ms, key: InboxKey, result: S3Result) {
+    pub(crate) fn on_inbox_gc(&mut self, now: Now, key: InboxKey, result: S3Result) {
         let _ = now;
         match result {
             S3Result::InboxDelete(Ok(())) => self.stats.inbox_gc_deleted += 1,
@@ -1412,7 +1425,7 @@ impl Core {
     /// deliberately closed and the gate itself is the authority).
     fn execute_inbox_batch(
         &mut self,
-        now: Ms,
+        now: Now,
         batch: &InboxBatch,
         admitted: bool,
         replica: &dyn Replica,
@@ -1515,7 +1528,7 @@ impl Core {
                     match self.deleg_recall_plan(now, &keys, replica, out) {
                         super::delegate::RecallPlan::None => {}
                         super::delegate::RecallPlan::Wait(wait) => {
-                            self.inbox.recall_waiters.insert(batch.node, now);
+                            self.inbox.recall_waiters.insert(batch.node, now.wall);
                             self.park(
                                 now,
                                 (wait, None),
@@ -1539,7 +1552,7 @@ impl Core {
                     decoded_op,
                     rid,
                     &constellation_meta::locks::LockTag::from_wire(&op.lock_tag),
-                    now.0,
+                    now.wall.0,
                 ),
                 Err(_) => Err(MetaError::Invalid("undecodable inbox op".into())),
             };
@@ -1587,11 +1600,11 @@ impl Core {
     /// (see `InboxState::recall_waiters`); a waiter older than the
     /// requester's own in-doubt deadline no longer counts (it has taken
     /// the lease path, or is gone).
-    pub(crate) fn inbox_holds_redelegation(&mut self, now: Ms) -> bool {
+    pub(crate) fn inbox_holds_redelegation(&mut self, now: Now) -> bool {
         let horizon = self.cfg.inbox_deadline_ms as i64;
         self.inbox
             .recall_waiters
-            .retain(|_, since| now.since(*since) < horizon);
+            .retain(|_, since| now.wall.since(*since) < horizon);
         !self.inbox.recall_waiters.is_empty()
     }
 
@@ -1611,7 +1624,7 @@ impl Core {
     /// after its incarnation ended).
     pub(crate) fn inbox_drain(
         &mut self,
-        now: Ms,
+        now: Now,
         batches: Vec<InboxBatch>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1674,7 +1687,7 @@ impl Core {
     /// polled under the new epoch until these ran.
     fn inbox_run_leftovers(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> std::collections::BTreeSet<NodeId> {

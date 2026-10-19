@@ -170,6 +170,7 @@ pub fn refuse_open_epoch(epochs: &EpochManager) -> Result<(), LeaveError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use constellation_authority::Now;
     use constellation_meta::MetaStore;
     use constellation_net::Peers;
     use constellation_store_s3::designation::{DesignationMode, DesignationStore};
@@ -290,7 +291,7 @@ mod tests {
         let now = constellation_authority::Ms(constellation_store_s3::lease::now_unix_ms());
         let as_b = constellation_authority::Config::defaults(b, 1);
         let plan = constellation_authority::core::LeaseState::default().classify(
-            now,
+            Now::same(now.0),
             &as_b,
             Some((fenced.clone(), tag.clone())),
             0,
@@ -301,7 +302,7 @@ mod tests {
         );
         let as_a = constellation_authority::Config::defaults(a, 1);
         let plan = constellation_authority::core::LeaseState::default().classify(
-            now,
+            Now::same(now.0),
             &as_a,
             Some((fenced, tag)),
             0,

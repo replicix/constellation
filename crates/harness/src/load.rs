@@ -18,6 +18,7 @@
 //! | `s3:latency:<ms>:<jitter>` / `s3:bandwidth:<kBps>` / `s3:slicer:<bytes>:<delay_us>` / `s3:blackhole:<ms>[:<at_ms>]` | toxics on the S3 path of every client |
 //! | `net:<netem args...>` / `net:flap[:<netem args...>]` | `tc netem` on the daemon's own P2P (UDP) ports on `lo`; flap: loss 100 % for 2 s every 10 s |
 //! | `clock:<±ms>` / `clock:spread:<ms>` | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (within ±500 ms); spread alternates `+ms`, `-ms` across nodes |
+//! | `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, the daemon's protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`; plan 43 C7-H1): the honour clock follows a forward step, a backward one and the wait clock move nothing; the steps are cumulative per node, armed once per node and kept across a daemon restart (a restarted daemon starts stepped; the step is not applied again) |
 //!
 //! `<dur>` is milliseconds or a protocol boundary with an optional offset
 //! (`lock-lapse+500`, `takeover-300`, `lease-ttl+1000`: see
@@ -158,6 +159,12 @@ pub enum Kind {
     },
     ClockSpread {
         ms: i64,
+    },
+    /// Step the daemon's wall clock by `ms` at `at` after it spawned
+    /// (plan 43 C7-H1).
+    ClockStep {
+        ms: i64,
+        at: Duration,
     },
 }
 
@@ -358,6 +365,16 @@ fn parse_item(body: &str, target: Target, spec: &str) -> Result<Item> {
             Some("spread") => Kind::ClockSpread {
                 ms: num(arg(1), "clock:spread ms")?,
             },
+            // The node is the item's `@node` (the last `@`), not part of
+            // the step's own fields.
+            Some("step") => {
+                let ms: i64 = num(arg(1), "clock:step:<ms>")?;
+                anyhow::ensure!(ms != 0, "clock:step:0 steps nothing");
+                Kind::ClockStep {
+                    ms,
+                    at: ms_arg(arg(2), 0, "clock:step:<ms>:<at_ms>")?,
+                }
+            }
             v => {
                 let offset: i64 = num(v, "clock:<ms>")?;
                 Kind::Clock { offset }
@@ -710,7 +727,180 @@ pub fn daemon_env(node: &str, work: &Path, env: &[(String, String)], cmd: &mut C
     if offset != 0 {
         cmd.env("CONSTELLATION_FAULT_CLOCK_OFFSET_MS", offset.to_string());
     }
+    // Every daemon can have its wall clock stepped (a scenario's
+    // [`step_clock`], or a `clock:step` item); unused it is one poll of a
+    // missing file every 100 ms. The file keeps the node's cumulative step,
+    // so a restarted daemon starts where the host clock is.
+    cmd.env(
+        "CONSTELLATION_FAULT_CLOCK_STEP_FILE",
+        clock_step_file(work, node),
+    );
     crate::verify::daemon_env(env, cmd);
+}
+
+/// The file `node`'s daemon polls for its cumulative wall-clock step.
+fn clock_step_file(work: &Path, node: &str) -> PathBuf {
+    load_dir(work).join(format!("clock-step-{node}"))
+}
+
+/// One applied wall-clock step of a node's daemon: when the daemon applied
+/// it (host unix µs, from the marker file's mtime) and the node's
+/// cumulative step from then on.
+#[derive(Debug, Clone)]
+struct StepRec {
+    scenario: String,
+    node: String,
+    at_us: i64,
+    cumulative_ms: i64,
+}
+
+/// The steps applied so far, in order (the load's ledger of clock steps).
+static CLOCK_STEPS: Mutex<Vec<StepRec>> = Mutex::new(Vec::new());
+
+/// The node's cumulative step now (ms): what its daemon's protocol clock
+/// reads above the host's, apart from the constant offset.
+pub fn clock_step_now(node: &str) -> i64 {
+    CLOCK_STEPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .find(|r| r.node == node && r.scenario == crate::client::scenario())
+        .map_or(0, |r| r.cumulative_ms)
+}
+
+/// The steps of `node`'s daemon in `scenario`, oldest first: `(applied at
+/// host unix µs, cumulative ms from then on)`.
+pub fn clock_steps_of(scenario: &str, node: &str) -> Vec<(i64, i64)> {
+    CLOCK_STEPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|r| r.scenario == scenario && r.node == node)
+        .map(|r| (r.at_us, r.cumulative_ms))
+        .collect()
+}
+
+/// After a step: the daemon's `status.clock` counts it (plan 43 C7-H1). A
+/// step the protocol clock did not see (the file applied, the clock not
+/// moved) would make every scenario that relies on it vacuous, so this is
+/// part of the injector: it reads `node.status` until the daemon's
+/// `steps_forward` or `steps_backward` has grown by this step (a step under
+/// the detection threshold of 100 ms is not counted by the clock and not
+/// waited for) and prints the counters.
+fn check_step_counted(d: &Daemon, delta_ms: i64) -> Result<()> {
+    // Per daemon process: how many steps of each direction it was given.
+    static GIVEN: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
+    let (fwd, bwd) = {
+        let mut g = GIVEN.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match g.iter().position(|(pid, _, _)| *pid == d.pid) {
+            Some(i) => i,
+            None => {
+                g.push((d.pid, 0, 0));
+                g.len() - 1
+            }
+        };
+        if delta_ms.abs() >= 100 {
+            if delta_ms > 0 {
+                g[slot].1 += 1;
+            } else {
+                g[slot].2 += 1;
+            }
+        }
+        (g[slot].1, g[slot].2)
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = crate::client::control_call_at(
+            &d.state,
+            "node.status",
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )?;
+        let clock = &status["clock"];
+        let n = |k: &str| clock[k].as_u64().unwrap_or(0);
+        if n("steps_forward") >= fwd && n("steps_backward") >= bwd {
+            eprintln!(
+                "    load: {} (pid {}) wall clock stepped by {delta_ms} ms: status.clock steps_forward {} \
+                 steps_backward {} stepped_ms_total {} last_step_ms {} honour_ahead_ms {} wait_behind_ms {}",
+                d.node,
+                d.pid,
+                n("steps_forward"),
+                n("steps_backward"),
+                n("stepped_ms_total"),
+                clock["last_step_ms"].as_i64().unwrap_or(0),
+                clock["honour_ahead_ms"].as_i64().unwrap_or(0),
+                clock["wait_behind_ms"].as_i64().unwrap_or(0),
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < until,
+            "{}'s status.clock did not count the {delta_ms} ms step within 10 s (wanted {fwd} \
+             forward and {bwd} backward): {clock}",
+            d.node
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Step `node`'s daemon's wall clock by `delta_ms` now and wait until the
+/// daemon has applied it (its `.applied` marker names the new cumulative
+/// step); the step goes in the ledger [`clock_steps_of`] reads. For a
+/// scenario that steps a clock by hand; the `clock:step` item does the same
+/// at its time. `file` is the daemon's `CONSTELLATION_FAULT_CLOCK_STEP_FILE`
+/// ([`clock_step_file`], under the scenario's work directory).
+fn apply_clock_step(scenario: &str, node: &str, file: &Path, delta_ms: i64) -> Result<()> {
+    // Cumulative across the node's items, and across its restarts.
+    static CUMULATIVE: Mutex<Vec<(String, String, i64)>> = Mutex::new(Vec::new());
+    let total = {
+        let mut c = CUMULATIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match c.iter().position(|(sc, n, _)| sc == scenario && n == node) {
+            Some(i) => i,
+            None => {
+                c.push((scenario.to_string(), node.to_string(), 0));
+                c.len() - 1
+            }
+        };
+        c[slot].2 += delta_ms;
+        c[slot].2
+    };
+    // Whole, by a rename: a daemon reading a prefix would step wrongly.
+    let tmp = file.with_extension("tmp");
+    std::fs::write(&tmp, total.to_string()).context("writing the clock step")?;
+    std::fs::rename(&tmp, file).context("publishing the clock step")?;
+    let mut marker = file.as_os_str().to_os_string();
+    marker.push(".applied");
+    let marker = PathBuf::from(marker);
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let applied = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|t| t.trim().parse::<i64>().ok());
+        if applied == Some(total) {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < until,
+            "{node}'s daemon did not apply the clock step to {total} ms within 10 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let at_us = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_micros() as i64);
+    CLOCK_STEPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(StepRec {
+            scenario: scenario.to_string(),
+            node: node.to_string(),
+            at_us,
+            cumulative_ms: total,
+        });
+    Ok(())
 }
 
 /// The S3 endpoint a client given `endpoint` uses: a direct (proxy-less)
@@ -793,6 +983,20 @@ pub fn daemon_spawned(
                 Ok(())
             }
             Kind::Net { netem, flap } => session.place_net(&d, netem, *flap),
+            Kind::ClockStep { ms, at } => {
+                // Once per node and scenario: the step is cumulative and
+                // the file keeps it across the node's restarts (a restarted
+                // daemon starts stepped), so a later incarnation must not
+                // add it again.
+                static ARMED: Mutex<Vec<(String, String, i64, u128)>> = Mutex::new(Vec::new());
+                let key = (d.scenario.clone(), node.to_string(), *ms, at.as_millis());
+                let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+                if !armed.contains(&key) {
+                    armed.push(key);
+                    session.spawn_clock_step(&d, *ms, *at, clock_step_file(work, node));
+                }
+                Ok(())
+            }
             _ => Ok(()),
         };
         if let Err(e) = r {
@@ -1335,6 +1539,38 @@ impl Session {
         }));
     }
 
+    /// `clock:step:<ms>:<at_ms>`: at `at` after the daemon spawned, step
+    /// its protocol wall clock by `ms` (the daemon applies it within
+    /// 100 ms and says so in `<file>.applied`). The interval is marked
+    /// probe-blind: a step is not latency the host-lag probes can see.
+    fn spawn_clock_step(&mut self, d: &Daemon, ms: i64, at: Duration, file: PathBuf) {
+        let stop = self.stop.clone();
+        let errors = self.errors.clone();
+        let applied = self.applied.clone();
+        let d = d.clone();
+        self.threads.push(std::thread::spawn(move || {
+            if !sleep_unless(&stop, at) || !alive(d.pid) {
+                return;
+            }
+            let what = format!("clock:step:{ms}:{}@{}", at.as_millis(), d.node);
+            match apply_clock_step(&d.scenario, &d.node, &file, ms)
+                .and_then(|()| check_step_counted(&d, ms))
+            {
+                Ok(()) => {
+                    let mut a = applied.lock().unwrap_or_else(|e| e.into_inner());
+                    if !a.contains(&what) {
+                        a.push(what);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("clock step on {}: {e:#}", d.node);
+                    eprintln!("!!! load: {msg}");
+                    errors.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
+                }
+            }
+        }));
+    }
+
     fn place_net(&mut self, d: &Daemon, netem: &[String], flap: bool) -> Result<()> {
         if self.netem.is_none() {
             self.netem = Some(Netem::install()?);
@@ -1813,6 +2049,51 @@ mod tests {
             parse("log-stall:12000:20000@b").unwrap().items
         );
         assert!(parse("log-stall:fast").is_err());
+    }
+
+    /// Expectation: `clock:step:<ms>:<at_ms>[@node]` parses with its sign
+    /// and its node, `@` is only the node separator, and a step of 0 or
+    /// without a time is refused.
+    #[test]
+    fn clock_steps_parse() {
+        let p =
+            parse("clock:step:+3000:30000@a,clock:step:-3000:60000@b,clock:step:500:0").unwrap();
+        assert_eq!(
+            p.items,
+            vec![
+                Item {
+                    kind: Kind::ClockStep {
+                        ms: 3_000,
+                        at: Duration::from_secs(30)
+                    },
+                    target: Target::Node("a".into())
+                },
+                Item {
+                    kind: Kind::ClockStep {
+                        ms: -3_000,
+                        at: Duration::from_secs(60)
+                    },
+                    target: Target::Node("b".into())
+                },
+                Item {
+                    kind: Kind::ClockStep {
+                        ms: 500,
+                        at: Duration::ZERO
+                    },
+                    target: Target::All
+                },
+            ]
+        );
+        // The constant offset's cap (±500 ms) does not apply to a step.
+        assert!(parse("clock:step:-8000:1000@a").is_ok());
+        for bad in [
+            "clock:step:0:1000",
+            "clock:step",
+            "clock:step:x:1",
+            "clock:step:5:y",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} parsed");
+        }
     }
 
     #[test]

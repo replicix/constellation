@@ -3471,6 +3471,7 @@ scenario spawns; an item is a preset or `kind[:arg...][@node]`:
 | `s3:latency:<ms>:<jitter>`, `s3:bandwidth:<kBps>`, `s3:slicer:<bytes>:<delay_us>`, `s3:blackhole:<ms>[:at_ms]` (`s3-jitter`, `s3-jitter-high`, `s3-blackhole`, `s3-slow`) | toxiproxy toxics named `load-*` (a scenario's `heal` keeps them) on its `s3` proxy, and on a `load-s3` proxy that clients given the direct endpoint are routed through, so every client gets them without the scenario's own cuts reaching more clients |
 | `net:<netem args...>`, `net:flap` (`net-lan`, `net-wan`, `net-lossy`, `net-flap`) | `tc netem` on `lo` for the daemon's own UDP (P2P) ports, found from `/proc/<pid>/fd`: a `prio` root with one netem band per node; flap drops everything 2 s in 10 |
 | `clock:<±ms>`, `clock:spread:<ms>` (`clock-skew`) | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` on the protocol clock (`store_s3::lease::now_unix_ms`, which leases, grants, tokens and the core's `now` read), within ±500 ms |
+| `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, its protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`, plan 43 C7-H1; the item's `@node` is its last `@`, so the plan's `clock:step:<ms>@<s>` form is not used). Only the wall reading moves (stepping the host clock would move every container's): the honour clock follows a forward step once, a backward one and the wait clock move nothing. The file holds the node's **cumulative** step, written whole by a rename; a daemon polls it every 100 ms on a thread of its own and writes `<file>.applied` once the step is in force, which the harness waits for. Steps are not capped at ±500 ms (constant offsets are), they are kept across a restart of the daemon (armed once per node: the restarted daemon starts stepped and the step is not applied again), and `status.clock` counts them (`steps_forward`, `steps_backward`, `stepped_ms_total`, `last_step_ms`, `honour_ahead_ms`, `wait_behind_ms`). The harness keeps each node's step history; the log checkers read a daemon's `at_ms` with the offset **and the steps in force at the log line's time** removed, and `campaign_load`'s stale-generation watch adds the node's step to its skew term |
 
 `cpu` and `net` need root (`sudo -n`; the run fails at its start without
 it, and without `tc`/stress-ng for the items that need them). Per-daemon
@@ -4287,6 +4288,42 @@ the floor length distribution and the beat guards that rose after being
 published (those whose *base* rose are failures: `run_seed` fails the seed).
 `AUTHORITY_SIM_CONFIG=fast-takeover-skewed-holder`, `locks-s3-cut-holder-alive`
 and `-successor-nobeats` also run in `long_locks`.
+
+**Clock steps** (plan 43 C7-H1). The simulator gives each node a
+`ProtocolClock` over its own sources (`tests/sim/clock.rs`), as the daemon
+has one over the host's (`constellation_types::clock`,
+`constellation_platform::clock`): WALL (the paused clock plus the node's
+constant offset and its step), HONOUR (never under-counts; follows a
+forward wall step once, ignores a backward one) and WAIT (never
+over-counts; ignores every step). A fresh clock per incarnation (HONOUR and
+WAIT start at the node's wall, the id is `node << 32 | incarnation`) over a
+step that belongs to the node and survives its restarts.
+`FaultKind::ClockStep { who, ms }` (`StepOf`: `Node(n)`, `Holder`, `Backup`,
+`Locker`, `NonHolder`, resolved when the fault runs: `Backup` is the first
+backup the lease lists *then*, so after a seal it is not the successor, and
+`Holder` is) steps one node's WALL reading, and
+`FaultKind::PartitionLockerStepped { step_ms, dur_ms }` steps one locker and
+cuts that same locker off. Neither is in `gen_faults`. The core's `Now`
+carries the three readings, but until the commits of C7-H1 that move a site
+(2/4 honour, 3/4 wait, 4/4 liveness) every protocol decision still reads
+WALL, so a configuration below that targets a site fails here at the rate
+PROGRESS records (the fail-before of the commit that fixes it), and the
+no-step sweeps are identical to the commit before the clocks: `sweep_config`'s
+summary line, floors and fenced seeds, for every configuration in its table
+(the list is in PROGRESS). The configurations (`AUTHORITY_SIM_CONFIG=<name>`,
+`sweep_config`; not in `long_locks` or the CI tests until the commit that
+fixes each): `locks-root-step-forward` (the lock owner stepped forward 2.5 s,
+twice, grants held across: it outwaits early), `locks-locker-step-back` (a
+locker stepped back 3 s and cut off: it honours its grant past the owner's
+outwait), `locks-holder-step-back-sealed` (the S3-cut holder, sealed, stepped
+back), `fast-takeover-holder-step-forward` (F-a's cap and the root's own
+table after a forward step of the holder), `fast-takeover-successor-step-
+forward` (the successor stepped forward inside its floor, long grants and
+long critical sections), `delegated-root-step-forward`,
+`delegated-delegate-step-back`, `strict-reader-step-back`, and the controls
+`locks-root-step-back` (only longer waits: clean) and
+`locks-holder-step-forward` (a stepped-forward locker's grants lapse early:
+its I/O is fenced, counted in `SWEEP-FENCED`, no violation).
 Every
 run checks close-to-open across nodes (`tests/sim/cto.rs`: a read
 invoked after another node's write returned `Ok` must be explained by

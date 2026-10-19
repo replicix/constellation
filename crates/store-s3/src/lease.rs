@@ -51,42 +51,16 @@ pub fn lease_ttl_ms() -> u64 {
         .unwrap_or(DEFAULT_LEASE_TTL_MS)
 }
 
-/// The protocol clock (unix ms): lease expiries, lock grant windows and
-/// fencing tokens, delegation windows, the authority core's `now`.
+/// The protocol clock's WALL reading (unix ms): lease expiries, the
+/// values compared across nodes, written to S3, persisted or shown in
+/// status, and (until plan 43 C7-H1's later commits) the local windows.
 ///
-/// `CONSTELLATION_FAULT_CLOCK_OFFSET_MS=<ms>` (load campaign, testing
-/// only) adds a constant offset, so one daemon's clock runs ahead of or
-/// behind its peers' by up to what the margins assume (`cto-modes.md`,
-/// "Clocks and margins": ±500 ms at the defaults). It moves this clock
-/// and what reads it (the engine's epoch promises, `prune::now_unix_ms`:
-/// the snapshot paths, the scheduler and the prune audit's `ts`); the
-/// registry's and commits' timestamps, the S3 objects' own and the log
-/// lines keep the host's clock, so one daemon mixes the two by the offset
-/// (within the margins the design tolerates across nodes anyway). Unset,
-/// one cached lookup.
+/// It is `constellation_platform::clock::protocol().wall()`: `SystemTime`
+/// plus the testing-only fault offset and step (see that module for the
+/// honour and wait readings, which a local duration uses instead of this
+/// one).
 pub fn now_unix_ms() -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    now + clock_offset_ms()
-}
-
-fn clock_offset_ms() -> i64 {
-    static OFFSET: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        let offset = std::env::var("CONSTELLATION_FAULT_CLOCK_OFFSET_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .unwrap_or(0);
-        if offset != 0 {
-            tracing::warn!(
-                offset_ms = offset,
-                "fault injection: the protocol clock is offset (testing only)"
-            );
-        }
-        offset
-    })
+    constellation_platform::clock::protocol().wall().0
 }
 
 /// Write authority over one partition.

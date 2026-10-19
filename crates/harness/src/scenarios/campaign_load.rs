@@ -756,7 +756,8 @@ pub(super) fn endpoint_wedge_probe(_seed: u64) -> Result<()> {
 /// reported ended, across calls): a recalled or reclaimed generation's
 /// late answer never installs it again (cluster-locks.md, delegations).
 /// `until_ms` is on `b`'s protocol clock, which may run up to `skew` off
-/// the harness's: see [`StaleWatch`].
+/// the harness's, and further by the wall-clock step the load applied to
+/// `b` (`clock:step`): see [`StaleWatch`].
 fn no_stale_generation(
     a: &Client,
     b: &Client,
@@ -774,6 +775,9 @@ fn no_stale_generation(
             }
         }
         let mine = b.control_status()?["delegation"]["mine"].clone();
+        // The step the load applied to `b`'s wall clock moves `until_ms`
+        // with it (plan 43 C7-H1).
+        watch.step_ms = crate::load::clock_step_now(&b.name);
         if let Some((gen, until_ms, now)) = watch.sample(&mine, ended, super::snapsched::now_ms()) {
             bail!(
                 "b holds generation {gen} live (until {until_ms}, harness clock {now}) that the \
@@ -790,11 +794,15 @@ fn no_stale_generation(
 /// [`no_stale_generation`]'s rule over `delegation.mine` samples. A
 /// generation is suspect when the root ended it and `b` holds it neither
 /// stopped nor lapsed even if `b`'s clock runs `skew` ahead of the
-/// harness's (`until_ms > now + skew`); it is a stale grant once suspect
+/// harness's (`until_ms > now + skew + step`); it is a stale grant once suspect
 /// in two samples in a row, so neither a clock-skew transient nor one
 /// sample racing the stop is called one.
 struct StaleWatch {
     skew_ms: i64,
+    /// The wall-clock step applied to the node being watched (ms): its
+    /// `until_ms` values run that far ahead (behind, if negative) of the
+    /// harness's clock on top of `skew_ms`.
+    step_ms: i64,
     suspect: std::collections::BTreeSet<u64>,
 }
 
@@ -802,6 +810,7 @@ impl StaleWatch {
     fn new(skew: Duration) -> StaleWatch {
         StaleWatch {
             skew_ms: skew.as_millis() as i64,
+            step_ms: 0,
             suspect: Default::default(),
         }
     }
@@ -823,7 +832,7 @@ impl StaleWatch {
                 m[2].as_i64().unwrap_or(0),
                 m[3] == true,
             );
-            if !stopped && until_ms > now + self.skew_ms && ended.contains(&gen) {
+            if !stopped && until_ms > now + self.skew_ms + self.step_ms && ended.contains(&gen) {
                 suspect.insert(gen);
                 if stale.is_none() && self.suspect.contains(&gen) {
                     stale = Some((gen, until_ms, now));
@@ -1015,6 +1024,32 @@ mod tests {
             t.duration_of("deleg-outwait+1000"),
             Some(Duration::from_millis(7_000))
         );
+    }
+
+    /// Expectation (plan 43 C7-H1): a node whose wall clock the load stepped
+    /// forward by 3 s reports `until_ms` 3 s ahead of the harness's clock; a
+    /// generation held live on its own clock is not suspect for that, but
+    /// one held 3 s past it is. A backward step lowers the threshold the
+    /// same amount.
+    #[test]
+    fn a_stepped_node_is_judged_on_its_own_clock() {
+        let ended: std::collections::BTreeSet<u64> = [3].into();
+        let row = |until: i64| serde_json::json!([[7, 3, until, false, 0, 0, 0]]);
+        let now = 1_000_000;
+        let mut w = StaleWatch::new(Duration::from_millis(1_000));
+        w.step_ms = 3_000;
+        for at in [now, now + 500] {
+            assert_eq!(w.sample(&row(now + 3_900), &ended, at), None);
+        }
+        assert_eq!(w.sample(&row(now + 8_000), &ended, now), None);
+        assert!(w.sample(&row(now + 8_000), &ended, now + 500).is_some());
+        let mut w = StaleWatch::new(Duration::from_millis(1_000));
+        w.step_ms = -3_000;
+        // Its clock is 3 s behind: the threshold is now - 2 s.
+        assert_eq!(w.sample(&row(now - 2_500), &ended, now), None);
+        assert_eq!(w.sample(&row(now - 2_500), &ended, now + 500), None);
+        assert_eq!(w.sample(&row(now - 900), &ended, now), None);
+        assert!(w.sample(&row(now - 900), &ended, now + 500).is_some());
     }
 
     #[test]

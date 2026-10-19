@@ -50,7 +50,7 @@
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{Carrier, PeerMsg, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, OpId, TimerId};
+use crate::ids::{Epoch, NodeId, Now, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_store_s3::heartbeat::{
     effective_slack, takeover_check, Promise, PromiseConfig, PROMISE_TTL_LEASE_DIVISOR,
@@ -256,7 +256,7 @@ pub(crate) struct Check {
 }
 
 impl Core {
-    pub(crate) fn promise_start(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn promise_start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.pr.issued = replica.promise_issued();
         self.pr.restored_hold = replica.epoch_hold_persisted();
         self.pr.persisted_hold = self.pr.restored_hold;
@@ -272,7 +272,7 @@ impl Core {
     /// `Event::Slack`: `meta.json`'s `epoch_slack` changed.
     pub(crate) fn on_slack(
         &mut self,
-        now: Ms,
+        now: Now,
         epoch_slack: u32,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -322,7 +322,7 @@ impl Core {
     /// Publish it when it differs from what last landed (f > 0, or a
     /// withdrawal after f dropped to 0); f = 0 on a node that never
     /// advertised writes nothing (today's cost).
-    fn advertise_slack(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn advertise_slack(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         let f = self.cfg.epoch_slack;
         if self.pr.retired || self.pr.advertising.is_some() || self.pr.advertised == Some(f) {
             return;
@@ -332,7 +332,7 @@ impl Core {
         }
         // Same promise as last issued: only the slack changes. Nothing to
         // persist first (the promise is not extended).
-        let promise = Promise::new(self.cfg.node_id, self.pr.issued, f, now.0);
+        let promise = Promise::new(self.cfg.node_id, self.pr.issued, f, now.wall.0);
         self.pr.advertising = Some(f);
         self.stats.promise_puts += 1;
         self.issue_s3(S3Op::HeartbeatPut { promise }, S3For::HeartbeatPut(f), out);
@@ -355,7 +355,7 @@ impl Core {
     /// Persist, then publish, a promise binding this node until
     /// `now + promise_ttl` (never shortening one already issued). `false`
     /// when refused: in an open epoch (or joining one), or retired.
-    fn promise_now(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) -> bool {
+    fn promise_now(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) -> bool {
         // An epoch's hold owner stays silent through its flush too (found
         // by the simulation, flex-crash seed 30002): it closed its epoch,
         // but until its journal is in the log it is still the epoch's
@@ -363,7 +363,7 @@ impl Core {
         if self.pr.retired || self.epoch.open || self.pr.flush_pending {
             return false;
         }
-        let until = now.0 + self.cfg.promise_ttl_ms as i64;
+        let until = now.wall.0 + self.cfg.promise_ttl_ms as i64;
         if until <= self.pr.issued {
             return true;
         }
@@ -378,7 +378,7 @@ impl Core {
         self.pr.issued = until;
         self.stats.promise_puts += 1;
         let f = self.cfg.epoch_slack;
-        let promise = Promise::new(self.cfg.node_id, until, f, now.0);
+        let promise = Promise::new(self.cfg.node_id, until, f, now.wall.0);
         self.issue_s3(S3Op::HeartbeatPut { promise }, S3For::HeartbeatPut(f), out);
         true
     }
@@ -388,7 +388,7 @@ impl Core {
     /// unavailable.
     pub(crate) fn promise_after_event(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -425,15 +425,15 @@ impl Core {
             if seen.holder != 0
                 && seen.holder != self.cfg.node_id
                 && !seen.released
-                && seen.is_expired(now.0)
+                && seen.is_expired(now.wall.0)
                 && self.pr.issued <= seen.expires_unix_ms
             {
                 self.promise_now(now, replica, out);
             }
         }
         if p2p_down && self.pr.watch_timer.is_none() && !self.lease.usable(now, &self.cfg) {
-            let id = self.set_timer(
-                now.plus(self.cfg.promise_watch_ms),
+            let id = self.set_timer_wall(
+                now.wall.plus(self.cfg.promise_watch_ms),
                 Timer::PromiseWatch,
                 out,
             );
@@ -443,7 +443,7 @@ impl Core {
 
     /// The idle watch: re-read the lease (its result lands in
     /// `last_seen`, and `promise_after_event` promises if it expired).
-    pub(crate) fn on_promise_watch(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn on_promise_watch(&mut self, now: Now, out: &mut Vec<Action>) {
         let p2p_down = !self.cfg.p2p || !self.links.values().any(|l| l.connected);
         if self.cfg.epoch_slack == 0
             || self.pr.retired
@@ -458,7 +458,7 @@ impl Core {
 
     pub(crate) fn on_promise_request(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         expires_unix_ms: i64,
@@ -493,7 +493,7 @@ impl Core {
     }
 
     /// `Control::Retire`: never acquire, promise or acknowledge again.
-    pub(crate) fn on_retire(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn on_retire(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.pr.retired {
             return;
         }
@@ -514,7 +514,7 @@ impl Core {
 
     // ---- the claim, for the driver's epoch coordinator ----
 
-    pub fn epoch_claim_view(&self, now: Ms) -> EpochClaimView {
+    pub fn epoch_claim_view(&self, now: Now) -> EpochClaimView {
         // A lease being released is claimed too: the activation then
         // owes the move (`owes_move`) and adopts the hold only if the
         // release ends with the lease kept (`epoch_hold_after_kept_release`).
@@ -581,7 +581,7 @@ impl Core {
     /// earliest of those objects is. The tag is the closed object's:
     /// nothing CASes on it under a hold (`renew_due`), and the re-claim
     /// reads the object first.
-    pub(crate) fn epoch_closed_claim(&self, now: Ms) -> Option<(Lease, LeaseTag)> {
+    pub(crate) fn epoch_closed_claim(&self, now: Now) -> Option<(Lease, LeaseTag)> {
         if !self.epoch_reclaim_pending(now) {
             return None;
         }
@@ -601,7 +601,7 @@ impl Core {
             .filter(|(holder, epoch, _)| *holder == me && *epoch == l.epoch)
             .map(|(_, _, expires)| *expires)
             .min()?;
-        (earliest - now.0 > self.cfg.expiry_margin_ms as i64).then_some((l, tag))
+        (earliest - now.wall.0 > self.cfg.expiry_margin_ms as i64).then_some((l, tag))
     }
 
     /// [`Self::epoch_closed_claim`] without its clock: the latest object
@@ -663,7 +663,7 @@ impl Core {
     /// CASes: if the re-claim lands, nobody held it in between.
     pub(crate) fn epoch_close_release(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -815,7 +815,7 @@ impl Core {
     /// far as it knows: unexpired past the margin) and has not acquired
     /// since: its re-claim is pending (meanwhile it claims that lease for
     /// a continuation epoch: [`Self::epoch_closed_claim`]).
-    pub(crate) fn epoch_reclaim_pending(&self, now: Ms) -> bool {
+    pub(crate) fn epoch_reclaim_pending(&self, now: Now) -> bool {
         !self.lease.lost
             && self.lease.held.is_none()
             && !self.lease.epoch_held()
@@ -823,7 +823,7 @@ impl Core {
                 .pr
                 .closed_tenure
                 .iter()
-                .any(|(_, _, expires)| *expires - self.cfg.expiry_margin_ms as i64 > now.0)
+                .any(|(_, _, expires)| *expires - self.cfg.expiry_margin_ms as i64 > now.wall.0)
     }
 
     /// While the re-claim is pending, the end of the authority the close
@@ -834,7 +834,7 @@ impl Core {
     /// the epoch acquires nothing while it is open, anyone else only
     /// past the expiry. `None` with a hold handed over in the epoch among
     /// them (another node's lease object).
-    pub(crate) fn epoch_reclaim_expires(&self, now: Ms) -> Option<i64> {
+    pub(crate) fn epoch_reclaim_expires(&self, now: Now) -> Option<i64> {
         if !self.epoch_reclaim_pending(now)
             || self
                 .pr
@@ -1024,7 +1024,7 @@ impl Core {
     /// is the epoch's holder after all and adopts the hold. Leaving the
     /// obligation, nobody held the epoch, and writes stopped at the
     /// lease's expiry until the heal.
-    pub(crate) fn epoch_hold_after_kept_release(&mut self, now: Ms, replica: &dyn Replica) {
+    pub(crate) fn epoch_hold_after_kept_release(&mut self, now: Now, replica: &dyn Replica) {
         if !self.lease.releasing && self.lease.held.is_some() {
             self.release_superseded(false, replica);
         }
@@ -1116,7 +1116,7 @@ impl Core {
     /// (`strand_for_takeover(gate.epoch)`), and a member's position
     /// `(epoch, jseq)` is reached by the flush's segments and by nothing
     /// earlier: see [`Self::epoch_hold_epoch_for`].
-    pub(crate) fn adopt_epoch_hold(&mut self, now: Ms, epoch: Epoch, replica: &dyn Replica) {
+    pub(crate) fn adopt_epoch_hold(&mut self, now: Now, epoch: Epoch, replica: &dyn Replica) {
         let carried = self
             .pr
             .carried
@@ -1147,7 +1147,7 @@ impl Core {
     /// A restarted hold owner: its epoch is still open, so it re-adopts
     /// the hold it persisted (it alone journaled under it; the flush its
     /// members wait for is its to do).
-    pub(crate) fn restore_epoch_hold(&mut self, now: Ms, replica: &dyn Replica) {
+    pub(crate) fn restore_epoch_hold(&mut self, now: Now, replica: &dyn Replica) {
         let Some(epoch) = self.pr.restored_hold else {
             return;
         };
@@ -1216,14 +1216,14 @@ impl Core {
     // ---- the takeover check ----
 
     /// Whether claiming `prev` needs the promise check.
-    pub(crate) fn promise_check_needed(&mut self, now: Ms, prev: &Lease) -> bool {
+    pub(crate) fn promise_check_needed(&mut self, now: Now, prev: &Lease) -> bool {
         if !self.cfg.takeover_promise_check {
             return false;
         }
         if prev.holder == 0 || prev.holder == self.cfg.node_id || prev.released {
             return false;
         }
-        if !prev.is_expired(now.0) {
+        if !prev.is_expired(now.wall.0) {
             // M9's permit paths (a sealed backup, `ack=s3`): the claim
             // rule keeps them apart from epochs.
             return false;
@@ -1240,7 +1240,7 @@ impl Core {
     }
 
     /// Begin the check for `prev` (the job is in `Phase::PromiseCheck`).
-    pub(crate) fn promise_check_begin(&mut self, now: Ms, prev: &Lease, out: &mut Vec<Action>) {
+    pub(crate) fn promise_check_begin(&mut self, now: Now, prev: &Lease, out: &mut Vec<Action>) {
         self.stats.promise_checks += 1;
         tracing::debug!(
             node = self.cfg.node_id,
@@ -1266,8 +1266,11 @@ impl Core {
         if self.cfg.epoch_slack > 0 {
             self.ask_for_promises(&mut check, out);
         }
-        check.timer =
-            Some(self.set_timer(now.plus(self.cfg.promise_wait_ms), Timer::PromiseWait, out));
+        check.timer = Some(self.set_timer_wall(
+            now.wall.plus(self.cfg.promise_wait_ms),
+            Timer::PromiseWait,
+            out,
+        ));
         tracing::debug!(
             node = self.cfg.node_id,
             holder = prev.holder,
@@ -1305,7 +1308,7 @@ impl Core {
 
     pub(crate) fn on_heartbeats(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1324,7 +1327,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_promise_reply(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         until: Option<i64>,
@@ -1350,7 +1353,7 @@ impl Core {
 
     pub(crate) fn on_promise_request_failed(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1367,7 +1370,7 @@ impl Core {
 
     pub(crate) fn on_promise_wait(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1382,7 +1385,7 @@ impl Core {
     /// Decide once the heartbeats are read: allowed as soon as enough
     /// promises outlast the expiry; refused once nothing else can arrive
     /// (every request answered or failed, or the wait ran out).
-    fn promise_check_evaluate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn promise_check_evaluate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(check) = self.pr.check.as_ref() else {
             return;
         };
@@ -1442,7 +1445,7 @@ impl Core {
 
     fn promise_check_finish(
         &mut self,
-        now: Ms,
+        now: Now,
         allowed: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,

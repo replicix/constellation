@@ -17,7 +17,7 @@
 //! wait on, because a round is just core state advanced by events.
 
 use crate::event::PeerMsg;
-use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
+use crate::ids::{Epoch, NodeId, OpId, Seq, TimerId};
 use constellation_fs_core::Ino;
 use constellation_meta::{MutateOp, MutateOutcome, Rid};
 use constellation_store_s3::heartbeat::Promise;
@@ -35,11 +35,13 @@ pub enum Action {
     Send { to: NodeId, msg: PeerMsg },
     /// Run one S3 request and report `Event::S3 { op, .. }`.
     S3 { op: OpId, req: S3Op },
-    /// Fire `Event::Timer { id }` at `at` (logical ms). Setting an id that
-    /// is already pending moves it.
+    /// Fire `Event::Timer { id }` `after_ms` from now (plan 43 C7-H1: a
+    /// duration, so the driver sleeps it on the monotonic clock and a wall
+    /// step moves nothing; the core computed it from the clock the
+    /// deadline is on). Setting an id that is already pending moves it.
     SetTimer {
         id: TimerId,
-        at: Ms,
+        after_ms: u64,
         kind: TimerKind,
     },
     /// The core no longer wants this timer (a stale fire is ignored

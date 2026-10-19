@@ -1276,6 +1276,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::authority_driver::Standalone;
     use crate::lease::LeaseView;
+    use constellation_authority::Now;
     use constellation_fs_core::cache::DiskCache;
     use constellation_meta::MetaStore;
     use constellation_mtree::{record, Hasher};
@@ -2324,7 +2325,7 @@ pub(crate) mod tests {
         let cfg = Config::defaults(2, 1);
         let now = Ms(crate::prune::now_unix_ms() as i64);
         let mut state = LeaseState::default();
-        state.adopt_epoch_hold(now, 3);
+        state.adopt_epoch_hold(Now::same(now.0), 3);
         let lease = Arc::new(LeaseView::default());
         lease.mirror(&state, now, &cfg, false);
         let (sync_tx, _sync_rx) = tokio::sync::mpsc::unbounded_channel();

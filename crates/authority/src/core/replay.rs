@@ -6,7 +6,7 @@ use super::client::{completed_as_outcome, Origin};
 use super::Core;
 use crate::action::Action;
 use crate::event::Policy;
-use crate::ids::Ms;
+use crate::ids::{Ms, Now};
 use crate::replica::Replica;
 use constellation_meta::{MutateOp, MutateOutcome, Position, Rid, StrandedOp};
 use constellation_types::Code;
@@ -50,11 +50,11 @@ pub(crate) struct ReplayState {
 impl ReplayState {
     /// `(pending, stalled)`: copies that failed at least once, and those
     /// failing for at least the lease-fallback interval.
-    pub fn copy_counts(&self, now: Ms, fallback_ms: u64) -> (u64, u64) {
+    pub fn copy_counts(&self, now: Now, fallback_ms: u64) -> (u64, u64) {
         let stalled = self
             .copies
             .values()
-            .filter(|c| now.since(c.since) >= fallback_ms as i64)
+            .filter(|c| now.wall.since(c.since) >= fallback_ms as i64)
             .count();
         (self.copies.len() as u64, stalled as u64)
     }
@@ -148,7 +148,7 @@ impl Core {
     /// the forward path (holder-local, or forwarded with M2's retries);
     /// after `replay_lease_fallback_ms` without progress this node asks
     /// for the lease itself, whose gate replays locally.
-    pub(crate) fn on_drain_tick(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn on_drain_tick(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         // A holder never tails the later-epoch segment that would strand
         // speculation from an older tenure left on it: strand it here.
         if let Some(epoch) = self.lease.ship_epoch(now, &self.cfg) {
@@ -273,12 +273,12 @@ impl Core {
                 self.replay.stuck_since = None;
                 return;
             }
-            let stuck_for = self.replay.stuck_since.get_or_insert(now).to_owned();
-            if now.since(stuck_for) >= self.cfg.replay_lease_fallback_ms as i64
+            let stuck_for = self.replay.stuck_since.get_or_insert(now.wall).to_owned();
+            if now.wall.since(stuck_for) >= self.cfg.replay_lease_fallback_ms as i64
                 && self.lease.ship_epoch(now, &self.cfg).is_none()
             {
                 tracing::warn!(node = self.cfg.node_id, rid = ?head.rid, "replay stuck; asking for the lease");
-                self.replay.stuck_since = Some(now);
+                self.replay.stuck_since = Some(now.wall);
                 // The cached holder may be the dead one that stranded the
                 // op: make the next attempt read the lease object.
                 self.lease.cached_holder = None;
@@ -390,7 +390,7 @@ impl Core {
 
     fn refuse_replay(
         &mut self,
-        now: Ms,
+        now: Now,
         queued: &StrandedOp,
         reason: String,
         replica: &dyn Replica,
@@ -414,7 +414,7 @@ impl Core {
     /// lease object with its view closed is what stalls it).
     fn try_copy(
         &mut self,
-        now: Ms,
+        now: Now,
         queued: &StrandedOp,
         reason: String,
         replica: &dyn Replica,
@@ -427,13 +427,13 @@ impl Core {
             .replay
             .copies
             .get(&queued.queue_seq)
-            .is_some_and(|retry| now < retry.next_at)
+            .is_some_and(|retry| now.wall < retry.next_at)
         {
-            let stalled_for = now.since(self.replay.copies[&queued.queue_seq].since);
+            let stalled_for = now.wall.since(self.replay.copies[&queued.queue_seq].since);
             let asked_recently = self
                 .replay
                 .copy_lease_asked_at
-                .is_some_and(|at| now.since(at) < self.cfg.replay_lease_fallback_ms as i64);
+                .is_some_and(|at| now.wall.since(at) < self.cfg.replay_lease_fallback_ms as i64);
             // Not in an epoch that refuses writes: no lease can be had
             // there (see `on_drain_tick`).
             if stalled_for >= self.cfg.replay_lease_fallback_ms as i64
@@ -447,7 +447,7 @@ impl Core {
                     stalled_ms = stalled_for,
                     "a conflict copy has been stalled; acquiring the lease to make it locally"
                 );
-                self.replay.copy_lease_asked_at = Some(now);
+                self.replay.copy_lease_asked_at = Some(now.wall);
                 self.enqueue_job(
                     now,
                     super::jobs::JobReq::Acquire {
@@ -472,7 +472,7 @@ impl Core {
 
     pub(crate) fn on_conflict_copy_done(
         &mut self,
-        now: Ms,
+        now: Now,
         queue_seq: u64,
         ok: bool,
         replica: &dyn Replica,
@@ -489,11 +489,11 @@ impl Core {
         }
         let retry = self.replay.copies.entry(queue_seq).or_insert(CopyRetry {
             attempts: 0,
-            since: now,
-            next_at: now,
+            since: now.wall,
+            next_at: now.wall,
         });
         retry.attempts += 1;
-        retry.next_at = now.plus(copy_backoff_ms(retry.attempts));
+        retry.next_at = now.wall.plus(copy_backoff_ms(retry.attempts));
         if retry.attempts == 1 || retry.attempts.is_multiple_of(10) {
             tracing::warn!(
                 node = self.cfg.node_id,
@@ -507,7 +507,7 @@ impl Core {
     /// The forward path answered (or gave up on) a replayed op.
     pub(crate) fn on_replay_outcome(
         &mut self,
-        now: Ms,
+        now: Now,
         queue_seq: u64,
         rid: Rid,
         outcome: Option<MutateOutcome>,
@@ -583,7 +583,7 @@ impl Core {
     /// one stays queued for its conflict copy (the drain makes it).
     pub(crate) fn replay_queue_locally(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> Result<(), constellation_meta::MetaError> {
@@ -658,7 +658,7 @@ impl Core {
     /// of its own (the commit after it decides).
     fn replay_locally(
         &mut self,
-        now: Ms,
+        now: Now,
         queued: &StrandedOp,
         folded: bool,
         replica: &dyn Replica,
@@ -756,7 +756,7 @@ impl Core {
         // Plan 30 §M14 phase 2: with the op's fencing token — a replay
         // under a grant that has ended is refused (`LockLapsed`) and
         // becomes a conflict copy below, as any refusal does.
-        match replica.execute(&queued.op, Some(queued.rid), &queued.lock_tag, now.0) {
+        match replica.execute(&queued.op, Some(queued.rid), &queued.lock_tag, now.wall.0) {
             Ok(_) => {
                 tracing::info!(node = self.cfg.node_id, rid = ?queued.rid, "stranded op replayed locally");
                 self.stats.stranded_replayed += 1;

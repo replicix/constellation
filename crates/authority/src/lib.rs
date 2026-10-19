@@ -48,5 +48,5 @@ pub use event::{
     LockTestOutcome, PeerLink, PeerMsg, Policy, ReadGrantMsg, ReadIndexOutcome, S3Failure,
     S3Result, UploadResult,
 };
-pub use ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
+pub use ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 pub use replica::Replica;

@@ -57,7 +57,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk};
 use crate::event::PeerMsg;
-use crate::ids::{Ms, NodeId, OpId, TimerId};
+use crate::ids::{Ms, NodeId, Now, OpId, TimerId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
@@ -492,7 +492,7 @@ impl Core {
     }
 
     /// This node holds the root lease usably (may append, recall, grant).
-    pub(crate) fn root_usable(&self, now: Ms) -> bool {
+    pub(crate) fn root_usable(&self, now: Now) -> bool {
         self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.fenced()
     }
 
@@ -504,7 +504,7 @@ impl Core {
     /// generations a predecessor left live.
     pub(crate) fn delegation_sync(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -534,7 +534,7 @@ impl Core {
                 *seen = true;
                 return true;
             }
-            !*seen && now.since(*at) < HANDED_BACK_UNSEEN_MS
+            !*seen && now.wall.since(*at) < HANDED_BACK_UNSEEN_MS
         });
         for d in table.iter().filter(|d| d.node == me) {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
@@ -569,7 +569,7 @@ impl Core {
                     inflight: None,
                     renew: None,
                     renew_timer: None,
-                    installed: now,
+                    installed: now.wall,
                     last_renew_sent: Ms(0),
                     answered_sent: Ms(0),
                     renew_period_ms: 0,
@@ -651,12 +651,15 @@ impl Core {
                         },
                         backup: None,
                         redelegate: false,
-                        granted: now,
+                        granted: now.wall,
                         below_since: None,
                         seal_attempts: 0,
                         cursor,
-                        until: now.plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
+                        until: now
+                            .wall
+                            .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
                         renewed_until: now
+                            .wall
                             .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
@@ -706,7 +709,7 @@ impl Core {
 
     pub(crate) fn drop_delegate_state(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -717,7 +720,7 @@ impl Core {
         // if one explains it. A recalled or refused generation (`stopped`),
         // and one already counted at its lapse (`lapsed`), are not.
         if self.dl.mine.get(&gen).is_some_and(|d| {
-            !d.lapsed && !d.stopped && !d.designated && now >= self.deleg_lapse_at(d)
+            !d.lapsed && !d.stopped && !d.designated && now.wall >= self.deleg_lapse_at(d)
         }) {
             self.deleg_note_loss(gen, true);
         }
@@ -755,7 +758,7 @@ impl Core {
         let mut dropped = self.lock_take_generation(gen, replica);
         if self.lease.held.is_some() && !self.lease.lost {
             let (kept, rest): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|g| {
-                g.until_ms > now.0
+                g.until_ms > now.wall.0
                     && matches!(
                         replica.resolve_ownership(&Self::read_keys(g.ino, None)),
                         constellation_meta::delegation::Ownership::Root
@@ -781,7 +784,7 @@ impl Core {
     /// re-resolves (a redirect to the root, which recalls if it must).
     fn answer_not_owner(
         &mut self,
-        now: Ms,
+        now: Now,
         p: ParkedDeleg,
         holder: NodeId,
         replica: &dyn Replica,
@@ -859,7 +862,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn delegate_try_execute(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: Option<OpId>,
         rid: Rid,
@@ -878,7 +881,7 @@ impl Core {
             .dl
             .mine
             .get(&gen)
-            .is_some_and(|d| now < d.until || d.designated);
+            .is_some_and(|d| now.wall < d.until || d.designated);
         // The model's rule 1: the delegate waits for `deps` too.
         let reaches = replica.reaches(&deps);
         // Phase 2b (M8): the read delegations this delegate granted on
@@ -935,7 +938,7 @@ impl Core {
     /// recall is in flight (started here, once).
     fn deleg_read_recall_pending(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         op: &MutateOp,
         replica: &dyn Replica,
@@ -956,7 +959,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn delegate_execute_now(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         from: NodeId,
         req: Option<OpId>,
@@ -1046,7 +1049,7 @@ impl Core {
                 }
             }
         } else {
-            match replica.delegate_execute(op, Some(rid), gen, deps, tag, now.0) {
+            match replica.delegate_execute(op, Some(rid), gen, deps, tag, now.wall.0) {
                 Ok((records, idx)) => {
                     replica.remember_outcome(rid, &records);
                     if rid.node != self.cfg.node_id {
@@ -1237,7 +1240,7 @@ impl Core {
     /// Phase 2b: pick a backup for each generation held here (M9's
     /// candidate rule: a write-eligible peer within the RTT budget,
     /// connected the longest), never the root itself.
-    fn deleg_backup_select(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn deleg_backup_select(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.cfg.backup_rtt_budget_ms == 0 {
             return;
         }
@@ -1281,7 +1284,7 @@ impl Core {
     /// Phase 2b: append what the backup lacks, one batch in flight.
     pub(crate) fn deleg_backup_stream(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1289,7 +1292,7 @@ impl Core {
         for gen in gens {
             let d = self.dl.mine.get(&gen).expect("present");
             let Some(backup) = d.backup else { continue };
-            if d.backup_inflight.is_some() || d.backup_after.is_some_and(|t| now < t) {
+            if d.backup_inflight.is_some() || d.backup_after.is_some_and(|t| now.wall < t) {
                 continue;
             }
             let from = d.backup_sent_through + 1;
@@ -1303,7 +1306,7 @@ impl Core {
             self.stats.deleg_backup_appends += 1;
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.backup_inflight = Some((req, last));
-            d.backup_inflight_at = now;
+            d.backup_inflight_at = now.wall;
             out.push(Action::Send {
                 to: backup,
                 msg: PeerMsg::DelegBackupAppend { req, gen, txs },
@@ -1316,7 +1319,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_backup_ack(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -1399,7 +1402,7 @@ impl Core {
                 if first.is_some_and(|f| f > acked + 1) {
                     let wait = self.cfg.delegation_stream_tick_ms.max(1) * 4;
                     let d = self.dl.mine.get_mut(&gen).expect("present");
-                    d.backup_after = Some(now.plus(wait));
+                    d.backup_after = Some(now.wall.plus(wait));
                     paced = true;
                     tracing::debug!(
                         node = self.cfg.node_id,
@@ -1426,7 +1429,7 @@ impl Core {
     /// client) retries by rid, which the root answers from the drain.
     fn deleg_abort_stream_parks(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1443,7 +1446,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_backup_append(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -1476,7 +1479,7 @@ impl Core {
     /// its tail (the delegate is silent).
     pub(crate) fn on_deleg_seal(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -1520,7 +1523,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_sealed(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -1622,7 +1625,7 @@ impl Core {
     /// event, after it, and before the root executes anything itself.
     pub(crate) fn deleg_root_sync_due(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1635,7 +1638,7 @@ impl Core {
     /// Retry every parked op whose wait is over, then stream and renew.
     pub(crate) fn deleg_after_event(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1719,7 +1722,7 @@ impl Core {
             if d.parked.is_empty() {
                 continue;
             }
-            let honoured = now < d.until && !d.stopped;
+            let honoured = now.wall < d.until && !d.stopped;
             if !honoured {
                 continue;
             }
@@ -1765,10 +1768,10 @@ impl Core {
         }
     }
 
-    fn arm_stream_tick(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn arm_stream_tick(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.dl.stream_timer.is_none() {
-            let t = self.set_timer(
-                now.plus(self.cfg.delegation_stream_tick_ms),
+            let t = self.set_timer_wall(
+                now.wall.plus(self.cfg.delegation_stream_tick_ms),
                 Timer::DelegStream,
                 out,
             );
@@ -1778,7 +1781,7 @@ impl Core {
 
     pub(crate) fn on_deleg_stream_timer(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -1818,7 +1821,7 @@ impl Core {
     /// caller). A stream batch is re-sent from the acknowledged cursor
     /// after a backoff, as after a transport failure: the root is slow,
     /// and the same batch every timeout only adds to what it is slow with.
-    fn deleg_expire_inflight(&mut self, now: Ms) -> Vec<u64> {
+    fn deleg_expire_inflight(&mut self, now: Now) -> Vec<u64> {
         let timeout = self.deleg_request_timeout_ms() as i64;
         let tick = self.cfg.delegation_stream_tick_ms.max(1);
         let root = self.root_node();
@@ -1827,23 +1830,23 @@ impl Core {
         let mut renew_again = Vec::new();
         for d in self.dl.mine.values_mut() {
             if let Some((req, _)) = d.inflight {
-                if now.since(d.inflight_at) >= timeout {
+                if now.wall.since(d.inflight_at) >= timeout {
                     given_up.push(req);
                     d.inflight = None;
                     d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-                    d.stream_after = Some(now.plus(d.stream_backoff_ms));
+                    d.stream_after = Some(now.wall.plus(d.stream_backoff_ms));
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, _)) = d.backup_inflight {
-                if now.since(d.backup_inflight_at) >= timeout {
+                if now.wall.since(d.backup_inflight_at) >= timeout {
                     late.push((req, d.backup, d.backup_inflight_at));
                     d.backup_inflight = None;
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, sent)) = d.renew {
-                if now.since(sent) >= timeout {
+                if now.wall.since(sent) >= timeout {
                     late.push((req, root, sent));
                     d.renew = None;
                     if d.renew_timer.is_none() && !d.stopped {
@@ -1854,7 +1857,7 @@ impl Core {
         }
         self.dl
             .late
-            .retain(|_, l| now.since(l.sent) < LATE_ANSWER_MS);
+            .retain(|_, l| now.wall.since(l.sent) < LATE_ANSWER_MS);
         for req in given_up {
             self.dl.by_req.remove(&req);
         }
@@ -1891,7 +1894,7 @@ impl Core {
     }
 
     /// Send the next batch of every generation without one in flight.
-    fn deleg_stream(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn deleg_stream(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.dl.mine.is_empty() {
             return;
         }
@@ -1914,7 +1917,7 @@ impl Core {
         let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
         for gen in gens {
             let d = self.dl.mine.get(&gen).expect("present");
-            if d.inflight.is_some() || d.refused || d.stream_after.is_some_and(|t| now < t) {
+            if d.inflight.is_some() || d.refused || d.stream_after.is_some_and(|t| now.wall < t) {
                 continue;
             }
             let from = d.streamed_through + 1;
@@ -1952,7 +1955,7 @@ impl Core {
             let d = self.dl.mine.get_mut(&gen).expect("present");
             let round = d.stream_round;
             d.inflight = Some((req, last));
-            d.inflight_at = now;
+            d.inflight_at = now.wall;
             d.leaving = (!leaving.is_empty() || !leaving_barriers.is_empty()).then(|| {
                 let mut inos: Vec<Ino> = leaving.iter().map(|g| g.ino).collect();
                 inos.extend(leaving_barriers.iter().map(|(ino, _)| *ino));
@@ -1986,8 +1989,8 @@ impl Core {
         // the tick retries.
         if self.dl.mine.values().any(|d| {
             d.inflight.is_some()
-                || d.stream_after.is_some_and(|t| now < t)
-                || d.backup_after.is_some_and(|t| now < t)
+                || d.stream_after.is_some_and(|t| now.wall < t)
+                || d.backup_after.is_some_and(|t| now.wall < t)
                 || (!d.stopped && replica.delegate_idx(d.gen) > d.streamed_through)
         }) {
             self.arm_stream_tick(now, out);
@@ -2011,7 +2014,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_delegate_stream_ack(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -2065,7 +2068,7 @@ impl Core {
             self.stats.deleg_stream_refused += 1;
             let tick = self.cfg.delegation_stream_tick_ms.max(1);
             d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-            d.stream_after = Some(now.plus(d.stream_backoff_ms));
+            d.stream_after = Some(now.wall.plus(d.stream_backoff_ms));
             self.arm_stream_tick(now, out);
             return;
         }
@@ -2098,7 +2101,7 @@ impl Core {
     /// the tick retry it.
     pub(crate) fn on_deleg_request_failed(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -2121,7 +2124,7 @@ impl Core {
                     // stream is retried on the tick, not per event
                     // (harness `delegate-partition`: 440k sends in a cut).
                     d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-                    d.stream_after = Some(now.plus(d.stream_backoff_ms));
+                    d.stream_after = Some(now.wall.plus(d.stream_backoff_ms));
                 }
                 self.arm_stream_tick(now, out);
             }
@@ -2135,7 +2138,8 @@ impl Core {
                 if let Some(d) = self.dl.mine.get_mut(&gen) {
                     d.renew = None;
                     if d.renew_timer.is_none() {
-                        let t = self.set_timer(now.plus(retry), Timer::DelegRenew(gen), out);
+                        let t =
+                            self.set_timer_wall(now.wall.plus(retry), Timer::DelegRenew(gen), out);
                         self.dl.mine.get_mut(&gen).expect("present").renew_timer = Some(t);
                     }
                 }
@@ -2195,7 +2199,7 @@ impl Core {
 
     // ----------------------------------------------------- renewals
 
-    pub(crate) fn deleg_renew_now(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    pub(crate) fn deleg_renew_now(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(root) = self.root_node() else {
             // Learn the holder, and try again after a tick: the first
             // renewal of a grant installed from an S3 tail (no P2P
@@ -2208,8 +2212,8 @@ impl Core {
             );
             if let Some(d) = self.dl.mine.get_mut(&gen) {
                 if d.renew_timer.is_none() && !d.stopped {
-                    let t = self.set_timer(
-                        now.plus(self.cfg.delegation_stream_tick_ms.max(1)),
+                    let t = self.set_timer_wall(
+                        now.wall.plus(self.cfg.delegation_stream_tick_ms.max(1)),
                         Timer::DelegRenew(gen),
                         out,
                     );
@@ -2227,7 +2231,7 @@ impl Core {
         }
         let req = self.op_id();
         let d = self.dl.mine.get_mut(&gen).expect("present");
-        d.renew = Some((req, now));
+        d.renew = Some((req, now.wall));
         if let Some(t) = d.renew_timer.take() {
             self.cancel_timer(t, out);
         }
@@ -2251,12 +2255,12 @@ impl Core {
                 round,
                 backup,
                 stream_head: 0,
-                stream_head_at: now.0,
+                stream_head_at: now.wall.0,
             },
         });
     }
 
-    pub(crate) fn on_deleg_renew_timer(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    pub(crate) fn on_deleg_renew_timer(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.renew_timer = None;
         }
@@ -2271,7 +2275,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_renew(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -2302,7 +2306,7 @@ impl Core {
                 if g.node == from && !g.ended && g.recall == RecallPhase::None {
                     ttl_ms = self.cfg.delegation_ttl_ms.min(cap);
                     if ttl_ms > 0 {
-                        let until = now.plus(ttl_ms + extra);
+                        let until = now.wall.plus(ttl_ms + extra);
                         if until > g.until {
                             g.until = until;
                         }
@@ -2357,7 +2361,7 @@ impl Core {
         // they may be live (the reply can be lost).
         // So does what is left of a lock grace here that covers it.
         let (locks, lock_carry, lock_grace_ms) = if ttl_ms > 0 {
-            let (locks, carry) = self.lock_take_handoff(now, gen);
+            let (locks, carry) = self.lock_take_handoff(Now::same(now.wall.0), gen);
             (
                 locks,
                 carry,
@@ -2399,7 +2403,7 @@ impl Core {
     /// keep their order: one made behind a held one waits with it.
     fn deleg_answer_renewal(
         &mut self,
-        now: Ms,
+        now: Now,
         to: NodeId,
         hold: Option<FreshHold>,
         msg: PeerMsg,
@@ -2430,7 +2434,7 @@ impl Core {
     /// at its delegate, while a delegate whose renewal goes unanswered
     /// asks again when it times out — at whichever root is then the
     /// holder.
-    pub(crate) fn deleg_flush_held(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn deleg_flush_held(&mut self, now: Now, out: &mut Vec<Action>) {
         let held = std::mem::take(&mut self.ack.renew_held_deleg);
         let mut keep: Vec<(FreshHold, NodeId, PeerMsg)> = Vec::new();
         for (f, to, msg) in held {
@@ -2466,7 +2470,7 @@ impl Core {
         renewed.max(d.installed.plus(self.reclaim_horizon_ms()))
     }
 
-    fn arm_deleg_lapse(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    fn arm_deleg_lapse(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(d) = self.dl.mine.get_mut(&gen) else {
             return;
         };
@@ -2478,8 +2482,8 @@ impl Core {
         if d.designated || d.stopped || d.lapsed {
             return;
         }
-        let at = self.deleg_lapse_at(d).max(now.plus(1));
-        let t = self.set_timer(at, Timer::DelegLapse(gen), out);
+        let at = self.deleg_lapse_at(d).max(now.wall.plus(1));
+        let t = self.set_timer_wall(at, Timer::DelegLapse(gen), out);
         self.dl.mine.get_mut(&gen).expect("present").lapse_timer = Some(t);
     }
 
@@ -2501,7 +2505,7 @@ impl Core {
     /// it only gives up execution while the grant is not honoured anyway.
     pub(crate) fn on_deleg_lapse(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2514,7 +2518,7 @@ impl Core {
             return;
         }
         let d = self.dl.mine.get(&gen).expect("present");
-        if now < d.until || now < self.deleg_lapse_at(d) {
+        if now.wall < d.until || now.wall < self.deleg_lapse_at(d) {
             self.arm_deleg_lapse(now, gen, out);
             return;
         }
@@ -2547,15 +2551,15 @@ impl Core {
     /// A lapsed generation asks for a renewal again every request
     /// timeout: an unanswered one (a dead root never answers, nor fails
     /// at the transport) has nothing else to bring it back.
-    fn deleg_lapsed_retry(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    fn deleg_lapsed_retry(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(d) = self.dl.mine.get(&gen) else {
             return;
         };
         if !d.lapsed || d.stopped || d.renew_timer.is_some() {
             return;
         }
-        let t = self.set_timer(
-            now.plus(self.deleg_request_timeout_ms()),
+        let t = self.set_timer_wall(
+            now.wall.plus(self.deleg_request_timeout_ms()),
             Timer::DelegRenew(gen),
             out,
         );
@@ -2814,17 +2818,17 @@ impl Core {
     }
 
     /// A grant never outlives the root lease's usable end (the cap).
-    pub(crate) fn grant_cap_ms(&self, now: Ms) -> u64 {
+    pub(crate) fn grant_cap_ms(&self, now: Now) -> u64 {
         let Some((lease, _)) = &self.lease.held else {
             return 0;
         };
         if self.lease.epoch_held() {
             let ttl = self.cfg.delegation_ttl_ms;
-            self.ack.note_hold_grant(now.0 + ttl as i64);
+            self.ack.note_hold_grant(now.wall.0 + ttl as i64);
             return ttl;
         }
         let end = lease.expires_unix_ms - self.cfg.expiry_margin_ms as i64;
-        (end - now.0).max(0) as u64
+        (end - now.wall.0).max(0) as u64
     }
 
     /// The root's answer to a renewal. `false`: it is not from the root
@@ -2837,7 +2841,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_deleg_renewed(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -2896,7 +2900,7 @@ impl Core {
             // renew refuses the renewal it sends on thawing, before the
             // lapse watch is handled: counted as a loss in a freeze too.
             self.stats.deleg_renewals_refused += 1;
-            let ran_out = !d.lapsed && now >= self.deleg_lapse_at(d);
+            let ran_out = !d.lapsed && now.wall >= self.deleg_lapse_at(d);
             if ran_out {
                 // (The root answered: it cannot have been silent.)
                 self.deleg_note_loss(gen, false);
@@ -2919,7 +2923,7 @@ impl Core {
         }
         d.last_renew_sent = d.last_renew_sent.max(sent);
         d.answered_sent = d.answered_sent.max(sent);
-        if d.lapsed && now < d.until {
+        if d.lapsed && now.wall < d.until {
             // The link came back before the root reclaimed: the grant is
             // honoured again.
             tracing::info!(
@@ -2937,7 +2941,7 @@ impl Core {
         } else {
             sent.plus(ttl_ms / 2)
         };
-        let t = self.set_timer(at.max(now.plus(1)), Timer::DelegRenew(gen), out);
+        let t = self.set_timer_wall(at.max(now.wall.plus(1)), Timer::DelegRenew(gen), out);
         {
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.renew_timer = Some(t);
@@ -2961,7 +2965,7 @@ impl Core {
     /// renewal in flight, or the next: the log ends a generation.
     fn deleg_late_renewed(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         gen: u64,
         ttl_ms: u64,
@@ -2989,13 +2993,13 @@ impl Core {
         tracing::debug!(
             node = self.cfg.node_id,
             gen,
-            late_ms = now.since(late.sent),
+            late_ms = now.wall.since(late.sent),
             "a late delegation renewal counted"
         );
         d.until = until;
         d.last_renew_sent = d.last_renew_sent.max(late.sent);
         d.answered_sent = d.answered_sent.max(late.sent);
-        if d.lapsed && now < d.until {
+        if d.lapsed && now.wall < d.until {
             tracing::info!(
                 node = self.cfg.node_id,
                 gen,
@@ -3011,7 +3015,7 @@ impl Core {
 
     pub(crate) fn on_deleg_recall(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -3027,12 +3031,12 @@ impl Core {
         };
         // Plan 30 §M14: the subtree's lock grants go back with the answer;
         // its waiters are told to ask the root.
-        let locks = self.lock_hand_back(now, gen, replica);
+        let locks = self.lock_hand_back(now.wall, gen, replica);
         let seen = replica
             .delegation_table()
             .iter()
             .any(|d| d.gen == gen && d.node == self.me());
-        self.dl.handed_back.insert(gen, (from, now, seen));
+        self.dl.handed_back.insert(gen, (from, now.wall, seen));
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.stopped = true;
             self.stats.deleg_recalls_received += 1;
@@ -3048,7 +3052,7 @@ impl Core {
         // recalled first; the root executes under the subtree only once
         // they are gone (or, past the horizon, expired).
         if self.cfg.read_delegations {
-            let need = replica.read_delegations().all_live(now.0);
+            let need = replica.read_delegations().all_live(now.wall.0);
             if let Some(wait) = self.start_recalls(now, need, out) {
                 self.park(
                     now,
@@ -3104,7 +3108,7 @@ impl Core {
     /// read delegation capped by the grant.
     pub(crate) fn deleg_read_index(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         ino: Ino,
         name: Option<&str>,
@@ -3116,16 +3120,22 @@ impl Core {
         let keys = Self::read_keys(ino, name);
         let gen = self.my_generation_for(&keys, replica)?;
         let d = self.dl.mine.get(&gen)?;
-        if now >= d.until {
+        if now.wall >= d.until {
             return None;
         }
         let epoch = super::DELEG_READ_EPOCH_BASE + gen;
         let grant = if self.cfg.read_delegations && from != self.cfg.node_id {
             let margin = self.cfg.expiry_margin_ms as i64;
-            let cap = d.until.0 - margin - now.0;
+            let cap = d.until.0 - margin - now.wall.0;
             let ttl = (self.cfg.read_delegation_ttl_ms as i64).min(cap);
-            if ttl > 0 && !self.rd.blocked.get(&ino).is_some_and(|until| *until > now) {
-                let until = now.0 + ttl + margin;
+            if ttl > 0
+                && !self
+                    .rd
+                    .blocked
+                    .get(&ino)
+                    .is_some_and(|until| *until > now.wall)
+            {
+                let until = now.wall.0 + ttl + margin;
                 let id = replica.read_delegations().grant(from, ino, until);
                 self.stats.deleg_read_grants += 1;
                 Some(crate::event::ReadGrantMsg {
@@ -3159,7 +3169,7 @@ impl Core {
     /// or the holder (`None`).
     pub(crate) fn deleg_read_owner(
         &self,
-        now: Ms,
+        now: Now,
         ino: Ino,
         name: Option<&str>,
         replica: &dyn Replica,
@@ -3175,7 +3185,7 @@ impl Core {
                         .dl
                         .mine
                         .get(&d.gen)
-                        .is_some_and(|m| now < m.until && !m.stopped);
+                        .is_some_and(|m| now.wall < m.until && !m.stopped);
                     honoured.then_some(d.node)
                 } else {
                     Some(d.node)
@@ -3194,7 +3204,7 @@ impl Core {
     /// (phase 2b: a designation is never recalled — the op is refused).
     pub(crate) fn deleg_recall_plan(
         &mut self,
-        now: Ms,
+        now: Now,
         keys: &TouchSet,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3270,7 +3280,7 @@ impl Core {
     /// ended are granted again to their nodes (a new generation each).
     pub(crate) fn deleg_redelegate_after_cross(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -3330,7 +3340,7 @@ impl Core {
         }
     }
 
-    pub(crate) fn start_recall(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    pub(crate) fn start_recall(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -3357,7 +3367,7 @@ impl Core {
         self.arm_gen_expiry(now, gen, out);
     }
 
-    fn recall_all(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn recall_all(&mut self, now: Now, out: &mut Vec<Action>) {
         let gens: Vec<u64> = self
             .dl
             .gens
@@ -3370,7 +3380,7 @@ impl Core {
         }
     }
 
-    fn arm_gen_expiry(&mut self, now: Ms, gen: u64, out: &mut Vec<Action>) {
+    fn arm_gen_expiry(&mut self, now: Now, gen: u64, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get(&gen) else {
             return;
         };
@@ -3380,17 +3390,17 @@ impl Core {
             // §5.2).
             return;
         }
-        let at = g.until.max(now);
+        let at = g.until.max(now.wall);
         if let Some(t) = g.expiry {
             self.cancel_timer(t, out);
         }
-        let t = self.set_timer(at, Timer::DelegExpiry(gen), out);
+        let t = self.set_timer_wall(at, Timer::DelegExpiry(gen), out);
         self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
     }
 
     pub(crate) fn on_deleg_expiry(
         &mut self,
-        now: Ms,
+        now: Now,
         gen: u64,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3409,13 +3419,13 @@ impl Core {
             // shortly, or a recall in flight is never outwaited — an
             // execution parked on it waits forever (long-delegated seed
             // 70051: 85 000 simulated seconds of timers).
-            let again = now.plus(self.cfg.delegation_stream_tick_ms.max(100));
-            let t = self.set_timer(again, Timer::DelegExpiry(gen), out);
+            let again = now.wall.plus(self.cfg.delegation_stream_tick_ms.max(100));
+            let t = self.set_timer_wall(again, Timer::DelegExpiry(gen), out);
             self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
             return;
         }
         let g = self.dl.gens.get(&gen).expect("present").clone();
-        if now < g.until {
+        if now.wall < g.until {
             self.arm_gen_expiry(now, gen, out);
             return;
         }
@@ -3447,7 +3457,7 @@ impl Core {
             g.seal_attempts = 1;
             g.recall_before_seal = g.recall;
             g.recall = RecallPhase::Sealing;
-            g.until = now.plus(self.cfg.forward_timeout_ms * 2);
+            g.until = now.wall.plus(self.cfg.forward_timeout_ms * 2);
             self.dl.by_req.insert(req, (gen, ReqKind::Seal));
             self.stats.deleg_seals_sent += 1;
             tracing::info!(
@@ -3475,7 +3485,7 @@ impl Core {
                     node = self.me(),
                     gen,
                     until = g.until.0,
-                    now = now.0,
+                    now = now.wall.0,
                     "reclaiming an unrenewed delegation"
                 );
             }
@@ -3499,7 +3509,7 @@ impl Core {
 
     pub(crate) fn on_deleg_recalled(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         gen: u64,
         through: u64,
@@ -3523,7 +3533,7 @@ impl Core {
     }
 
     /// A drained recall whose stream caught up ends the generation.
-    fn root_progress(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn root_progress(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         let done: Vec<u64> = self
             .dl
             .gens
@@ -3542,7 +3552,7 @@ impl Core {
     /// End `gen` here and now: the `Recall` record journaled (the table
     /// row changes with it), later stream records of it refused, every
     /// parked execution waiting on it released.
-    fn end_generation(&mut self, now: Ms, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn end_generation(&mut self, now: Now, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get(&gen) else {
             return;
         };
@@ -3618,7 +3628,7 @@ impl Core {
         }
     }
 
-    fn mark_ended(&mut self, now: Ms, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn mark_ended(&mut self, now: Now, gen: u64, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some(g) = self.dl.gens.get_mut(&gen) else {
             return;
         };
@@ -3654,7 +3664,7 @@ impl Core {
     /// delegate honours its grant from its renewals alone, so a later
     /// `until` here is never less safe. Not during a recall (no renewal is
     /// granted then either: the recall's outwait stands).
-    fn deleg_live_by_stream(&mut self, now: Ms, gen: u64) {
+    fn deleg_live_by_stream(&mut self, now: Now, gen: u64) {
         let ttl = self.cfg.delegation_ttl_ms.min(self.grant_cap_ms(now));
         if ttl == 0 || self.dl.epoch_active {
             return;
@@ -3667,11 +3677,11 @@ impl Core {
             return;
         }
         // (The expiry timer re-arms itself when it fires before `until`.)
-        if now >= g.renewed_until {
+        if now.wall >= g.renewed_until {
             // The renewals alone would have let it be outwaited.
             self.stats.deleg_live_by_stream += 1;
         }
-        g.until = g.until.max(now.plus(ttl + extra));
+        g.until = g.until.max(now.wall.plus(ttl + extra));
     }
 
     /// The root appends a delegate's batch, and acknowledges the stream
@@ -3681,7 +3691,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_delegate_stream(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         gen: u64,
@@ -3824,7 +3834,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_control_delegate(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         dir: Ino,
         node: NodeId,
@@ -3856,7 +3866,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn delegate_dir(
         &mut self,
-        now: Ms,
+        now: Now,
         dir: Ino,
         node: NodeId,
         kind: DelegKind,
@@ -3960,12 +3970,12 @@ impl Core {
                 kind,
                 backup: None,
                 redelegate: false,
-                granted: now,
+                granted: now.wall,
                 below_since: None,
                 seal_attempts: 0,
                 cursor: 0,
-                until: now.plus(self.reclaim_horizon_ms()),
-                renewed_until: now.plus(self.reclaim_horizon_ms()),
+                until: now.wall.plus(self.reclaim_horizon_ms()),
+                renewed_until: now.wall.plus(self.reclaim_horizon_ms()),
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,
                 ended: false,
@@ -4014,7 +4024,7 @@ impl Core {
     /// another delegation waits for that generation to end first.
     pub(crate) fn on_control_sync_designations(
         &mut self,
-        now: Ms,
+        now: Now,
         entries: &[(Ino, NodeId)],
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4093,7 +4103,7 @@ impl Core {
 
     pub(crate) fn on_control_undelegate(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         dir: Ino,
         replica: &dyn Replica,
@@ -4158,7 +4168,7 @@ impl Core {
     /// Plan 30 §M10: an epoch became active (or closed).
     pub(crate) fn deleg_on_epoch(
         &mut self,
-        now: Ms,
+        now: Now,
         active: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4191,7 +4201,7 @@ impl Core {
     /// end any more (a successor learns them from the log).
     pub(crate) fn deleg_on_lease_gone(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {

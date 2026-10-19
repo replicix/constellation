@@ -57,6 +57,7 @@
 //! ([`linux::fuse_mount_fd`]), and the `/proc` text parsers — are free
 //! functions in [`linux`].
 
+pub mod clock;
 pub mod daemon;
 pub mod dirs;
 pub mod drain;

@@ -1401,9 +1401,15 @@ impl LockTables {
                     // from logs that style field names.
                     tracing::debug!(
                         target: "constellation::token_exec",
-                        "tagged op executed minter={} seq={} at_ms={now_ms}",
+                        "tagged op executed minter={} seq={} at_ms={now_ms} host_us={host_us}",
                         t.grant.node,
                         t.grant.seq,
+                        // The host clock at the check, so a harness can tell
+                        // which clock step (plan 43 C7-H1) was in force for
+                        // `at_ms` instead of guessing from the line's time.
+                        host_us = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_micros() as i64),
                     );
                 }
                 Ok(())

@@ -47,7 +47,7 @@
 use super::delegate::DelegKind;
 use super::{Core, Timer};
 use crate::action::Action;
-use crate::ids::{Ms, NodeId};
+use crate::ids::{Ms, NodeId, Now};
 use crate::replica::Replica;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;
@@ -254,18 +254,22 @@ impl Core {
     }
 
     /// Arm the placement tick while this node is the root.
-    pub(crate) fn place_arm(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn place_arm(&mut self, now: Now, out: &mut Vec<Action>) {
         if !self.cfg.placement || !self.cfg.delegation || self.pl.timer.is_some() {
             return;
         }
-        let t = self.set_timer(now.plus(self.placement_tick_ms()), Timer::Placement, out);
+        let t = self.set_timer_wall(
+            now.wall.plus(self.placement_tick_ms()),
+            Timer::Placement,
+            out,
+        );
         self.pl.timer = Some(t);
     }
 
     /// The tick: roll the window and decide.
     pub(crate) fn on_placement_timer(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -290,7 +294,7 @@ impl Core {
     /// lease placement to hand it the lease first (harness
     /// `auto-placement`, 2 in 11: `place_skipped_unreachable` 9, the
     /// lease on b at the 5 s evaluation, `d1` never delegated).
-    fn place_eligible(&mut self, now: Ms, node: NodeId, out: &mut Vec<Action>) -> bool {
+    fn place_eligible(&mut self, now: Now, node: NodeId, out: &mut Vec<Action>) -> bool {
         if !self.links.get(&node).is_some_and(|l| l.connected) {
             return false;
         }
@@ -300,9 +304,9 @@ impl Core {
         if self
             .pl
             .roster_refreshed
-            .is_none_or(|at| now.since(at) >= ROSTER_REFRESH_MS)
+            .is_none_or(|at| now.wall.since(at) >= ROSTER_REFRESH_MS)
         {
-            self.pl.roster_refreshed = Some(now);
+            self.pl.roster_refreshed = Some(now.wall);
             tracing::debug!(
                 node = self.cfg.node_id,
                 candidate = node,
@@ -313,7 +317,7 @@ impl Core {
         false
     }
 
-    fn place_evaluate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn place_evaluate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.stats.place_evaluations += 1;
         let per_dir = self.pl.per_dir();
         if per_dir.is_empty() && self.dl.gens.values().all(|g| g.ended) {
@@ -376,12 +380,12 @@ impl Core {
                 g.below_since = None;
                 continue;
             }
-            let since = *g.below_since.get_or_insert(now);
+            let since = *g.below_since.get_or_insert(now.wall);
             let dwell = self.cfg.placement_dwell_ms as i64;
-            if now.since(since) >= dwell && now.since(g.granted) >= dwell {
+            if now.wall.since(since) >= dwell && now.wall.since(g.granted) >= dwell {
                 self.pl
                     .cooldown
-                    .insert(dir, now.plus(self.cfg.placement_cooldown_ms));
+                    .insert(dir, now.wall.plus(self.cfg.placement_cooldown_ms));
                 if range.is_whole() {
                     self.stats.place_recalled += 1;
                 } else {
@@ -448,7 +452,12 @@ impl Core {
             {
                 continue;
             }
-            if self.pl.cooldown.get(&dir).is_some_and(|until| *until > now) {
+            if self
+                .pl
+                .cooldown
+                .get(&dir)
+                .is_some_and(|until| *until > now.wall)
+            {
                 self.stats.place_skipped_cooldown += 1;
                 continue;
             }
@@ -497,7 +506,11 @@ impl Core {
                         && by_node.values().all(|c| c.total * 100 < total * dominance)
                         && !table.is_split(*dir)
                         && table.covering(ns, *dir).is_none()
-                        && !self.pl.cooldown.get(dir).is_some_and(|until| *until > now)
+                        && !self
+                            .pl
+                            .cooldown
+                            .get(dir)
+                            .is_some_and(|until| *until > now.wall)
                 })
                 .collect();
             hot.sort_by_key(|(dir, _)| *dir);
@@ -601,6 +614,6 @@ impl Core {
                 }
             }
         }
-        self.pl.cooldown.retain(|_, until| *until > now);
+        self.pl.cooldown.retain(|_, until| *until > now.wall);
     }
 }

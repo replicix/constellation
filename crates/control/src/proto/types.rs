@@ -629,8 +629,10 @@ pub struct LogFlushReport {
     pub dropped_lines: u64,
 }
 
-/// The hybrid logical clock every inode time comes from (plan 30 §M12,
-/// `constellation_meta::hlc`).
+/// The clocks of this node: the hybrid logical clock every inode time comes
+/// from (plan 30 §M12, `constellation_meta::hlc`), and the protocol clocks
+/// every lease, grant and delegation window is measured on (plan 43 C7-H1,
+/// `constellation_types::clock`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClockStatus {
     /// The last stamp this node issued or observed (ns since the epoch);
@@ -644,6 +646,24 @@ pub struct ClockStatus {
     /// client's). Not zero: some node's clock is that far ahead (the
     /// daemon log's one warning names the stamp); fix its clock.
     pub rejected_stamps: u64,
+    /// Plan 43 C7-H1: forward steps of this node's wall clock the protocol
+    /// clock saw since the daemon started (an NTP or operator step, a VM
+    /// restore). Counted, never acted on: the honour clock follows a
+    /// forward step (a window a holder honours ends that much early) and
+    /// the wait clock ignores it.
+    pub steps_forward: u64,
+    /// Backward steps: neither the honour nor the wait clock moves.
+    pub steps_backward: u64,
+    /// The sum of the steps' sizes (ms).
+    pub stepped_ms_total: u64,
+    /// The last step, signed (ms); 0 when none was seen.
+    pub last_step_ms: i64,
+    /// How far the honour clock runs ahead of the wall clock (ms): what
+    /// forward steps and wall slewing added. Never negative.
+    pub honour_ahead_ms: i64,
+    /// How far the wait clock runs behind the wall clock (ms; negative if
+    /// it is ahead): what steps and wall slewing left between them.
+    pub wait_behind_ms: i64,
 }
 
 /// Plan 38 §5's `fuse` section: what each FUSE mount's connection is

@@ -65,7 +65,7 @@ mod tests;
 
 use crate::action::{Action, ControlOk, TimerKind};
 use crate::event::{CasFailure, Control, Event, PeerLink, PeerMsg, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, OpId, Seq, TimerId};
+use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::Rid;
 use constellation_store_s3::inbox::InboxKey;
@@ -95,6 +95,13 @@ pub use stream::StreamView;
 pub struct Config {
     pub node_id: NodeId,
     pub incarnation: u32,
+    /// Plan 43 C7-H1: the id of the protocol clock this core's `Now`
+    /// readings come from (`ProtocolClock::id`; never 0). It names the
+    /// clock a stamp that outlives one process is on (the lease body's
+    /// honour end, the heartbeat), so a reader knows whether it may compare
+    /// it with its own readings. The engine sets it from the process's
+    /// clock, the simulation from the node incarnation's.
+    pub clock_id: u64,
     pub partition: String,
     /// `LeaseMode::SingleWriter`: no `If-Match`; takeover from another
     /// node is refused.
@@ -452,6 +459,7 @@ impl Config {
         Self {
             node_id,
             incarnation,
+            clock_id: 1,
             partition: constellation_store_s3::log::PARTITION.to_string(),
             single_writer: false,
             ttl_ms,
@@ -1272,6 +1280,38 @@ pub(crate) enum S3For {
     RenewProbe,
 }
 
+/// A pending timer's deadline, on the clock it was set against (plan 43
+/// C7-H1). Two deadlines are only compared when they are on the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimerAt {
+    Wall(Ms),
+    Honour(HonourMs),
+    Wait(WaitMs),
+}
+
+impl TimerAt {
+    /// The deadline of a WALL timer (tests; every timer is WALL until the
+    /// later commits of plan 43 C7-H1).
+    #[cfg(test)]
+    pub(crate) fn wall(self) -> Ms {
+        match self {
+            TimerAt::Wall(ms) => ms,
+            other => panic!("not a wall timer: {other:?}"),
+        }
+    }
+
+    /// Whether this timer fires after the WALL deadline `at`; `None` when
+    /// it is on another clock: two deadlines of different clocks have no
+    /// order, so a caller that gets `None` has moved its timer off the
+    /// wall clock and must compare on that clock instead.
+    pub(crate) fn later_than_wall(self, at: Ms) -> Option<bool> {
+        match self {
+            TimerAt::Wall(t) => Some(at < t),
+            TimerAt::Honour(_) | TimerAt::Wait(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Timer {
     Poll,
@@ -1422,7 +1462,7 @@ pub struct Core {
     /// Outstanding peer requests → the client op waiting on them.
     by_req: BTreeMap<OpId, Rid>,
     s3: BTreeMap<OpId, S3For>,
-    timers: BTreeMap<TimerId, (Timer, Ms)>,
+    timers: BTreeMap<TimerId, (Timer, TimerAt)>,
     poll_timer: Option<TimerId>,
     drain_timer: Option<TimerId>,
     idle_rounds: u32,
@@ -1508,7 +1548,7 @@ pub struct Core {
     /// Plan 31 C8: forward-only and suspended (`mode.rs`).
     pub(crate) mode: AuthorityMode,
     /// The `now` of the event being handled (for `issue_s3`'s send time).
-    last_now: Ms,
+    clk: Now,
     stopped: bool,
     pub stats: Stats,
 }
@@ -1581,7 +1621,7 @@ impl Core {
                 forward_only: cfg.forward_only,
                 suspended: false,
             },
-            last_now: Ms(0),
+            clk: Now::same(0),
             stopped: false,
             stats: Stats::default(),
             cfg,
@@ -1671,13 +1711,13 @@ impl Core {
     }
 
     /// M13: the inbox's observable state, for `status`.
-    pub fn inbox_view(&self, now: Ms) -> InboxView {
+    pub fn inbox_view(&self, now: Now) -> InboxView {
         self.inbox.view(now, &self.cfg, &self.roster)
     }
 
     /// Refused replays whose conflict copy is pending / stalled
     /// (`SpoolInfo::replay_copies_*`).
-    pub fn replay_copies(&self, now: Ms) -> (u64, u64) {
+    pub fn replay_copies(&self, now: Now) -> (u64, u64) {
         self.replay
             .copy_counts(now, self.cfg.replay_lease_fallback_ms)
     }
@@ -1690,10 +1730,10 @@ impl Core {
     /// The first call after construction (mount): the periodic poll and
     /// the replay drain start; the replica's persisted deposition flag
     /// is honoured (`recover_deposed` at mount).
-    pub fn start(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
-        self.last_now = now;
+    pub fn start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
+        self.clk = now;
         replica.set_holder_epoch(0);
-        self.ship.last_publish = now;
+        self.ship.last_publish = now.wall;
         let applied = replica.applied_seq().unwrap_or(0);
         self.ship.next_seq = applied + 1;
         self.ship.head_seq = applied;
@@ -1725,12 +1765,12 @@ impl Core {
 
     /// Handle one event. Every action returned must be carried out by the
     /// driver after this returns; none of them may be waited on before.
-    pub fn handle(&mut self, now: Ms, event: Event, replica: &dyn Replica) -> Vec<Action> {
+    pub fn handle(&mut self, now: Now, event: Event, replica: &dyn Replica) -> Vec<Action> {
         let mut out = Vec::new();
         if self.stopped {
             return out;
         }
-        self.last_now = now;
+        self.clk = now;
         self.deleg_root_sync_due(now, replica, &mut out);
         match event {
             Event::Submit {
@@ -1863,16 +1903,23 @@ impl Core {
         out
     }
 
-    /// When a pending timer fires.
-    pub(crate) fn timer_at(&self, id: TimerId) -> Option<Ms> {
+    /// When a pending timer fires, on the clock it was set against.
+    pub(crate) fn timer_at(&self, id: TimerId) -> Option<TimerAt> {
         self.timers.get(&id).map(|(_, at)| *at)
+    }
+
+    /// A pending WALL timer's deadline (tests; every timer is WALL until
+    /// plan 43 C7-H1's later commits convert the sites).
+    #[cfg(test)]
+    pub(crate) fn timer_wall(&self, id: TimerId) -> Option<Ms> {
+        self.timer_at(id).map(TimerAt::wall)
     }
 
     // ---- dispatch ----
 
     fn on_peer(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         msg: PeerMsg,
         replica: &dyn Replica,
@@ -2163,7 +2210,7 @@ impl Core {
                 exclusive,
                 shared,
                 upto,
-            } => self.on_lock_cancel(now, from, ino, exclusive, shared, upto, replica, out),
+            } => self.on_lock_cancel(now.wall, from, ino, exclusive, shared, upto, replica, out),
             PeerMsg::LockRecall { req, ino, grant } => {
                 self.on_lock_recall(now, from, req, ino, grant, replica, out)
             }
@@ -2191,7 +2238,7 @@ impl Core {
 
     fn on_peer_failed(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         to: NodeId,
         outage: bool,
@@ -2204,7 +2251,7 @@ impl Core {
         if self.on_read_request_failed(now, req, to, outage, out) {
             return;
         }
-        if self.on_backup_request_failed(now, req, to) {
+        if self.on_backup_request_failed(now.wall, req, to) {
             return;
         }
         if self.on_promise_request_failed(now, req, replica, out) {
@@ -2227,7 +2274,7 @@ impl Core {
 
     fn on_s3(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         result: S3Result,
         replica: &dyn Replica,
@@ -2274,7 +2321,7 @@ impl Core {
         }
     }
 
-    fn on_timer(&mut self, now: Ms, id: TimerId, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn on_timer(&mut self, now: Now, id: TimerId, replica: &dyn Replica, out: &mut Vec<Action>) {
         let Some((timer, _)) = self.timers.remove(&id) else {
             return;
         };
@@ -2363,7 +2410,7 @@ impl Core {
 
     fn on_control(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         req: Control,
         replica: &dyn Replica,
@@ -2564,7 +2611,7 @@ impl Core {
     /// Plan 31 C8 (`mode.rs`): a forward-only holder gives the lease back
     /// once idle (the round's release check, `LeaseState::wants_handoff`);
     /// a round soon lets it do so without waiting for the next poll.
-    fn set_authority_mode(&mut self, now: Ms, mode: AuthorityMode, out: &mut Vec<Action>) {
+    fn set_authority_mode(&mut self, now: Now, mode: AuthorityMode, out: &mut Vec<Action>) {
         if mode == self.mode {
             return;
         }
@@ -2597,7 +2644,7 @@ impl Core {
     /// S3 back the S3 holder closes the epoch like an epoch holder would.
     fn on_epoch_state(
         &mut self,
-        now: Ms,
+        now: Now,
         state: EpochState,
         members: &[NodeId],
         stale_below: Epoch,
@@ -2835,16 +2882,53 @@ impl Core {
         id
     }
 
-    fn set_timer(&mut self, at: Ms, timer: Timer, out: &mut Vec<Action>) -> TimerId {
+    /// Plan 43 C7-H1: a timer is relative. The core computes the time
+    /// left on the clock its deadline is on, against the same clock's
+    /// reading of this step, and the driver sleeps that long on the
+    /// monotonic clock: a wall step between now and the firing moves
+    /// neither a wait nor an honour window. A handler re-checks its
+    /// deadline against the step's reading and re-arms (the sleep ends at
+    /// or after the deadline up to the rate error, never by a step).
+    fn arm_timer(
+        &mut self,
+        at: TimerAt,
+        remaining_ms: i64,
+        timer: Timer,
+        out: &mut Vec<Action>,
+    ) -> TimerId {
         let id = TimerId(self.next_timer);
         self.next_timer += 1;
         self.timers.insert(id, (timer, at));
         out.push(Action::SetTimer {
             id,
-            at,
+            after_ms: remaining_ms.max(0) as u64,
             kind: timer.kind(),
         });
         id
+    }
+
+    /// A timer at a WALL deadline: every timer in this commit (plan 43
+    /// C7-H1 1/4); 2/4 to 4/4 move each to the clock of its stamp.
+    fn set_timer_wall(&mut self, at: Ms, timer: Timer, out: &mut Vec<Action>) -> TimerId {
+        let remaining = at.since(self.clk.wall);
+        self.arm_timer(TimerAt::Wall(at), remaining, timer, out)
+    }
+
+    /// A timer at a WAIT deadline: a wait-side or liveness stamp's end.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn set_timer_wait(&mut self, at: WaitMs, timer: Timer, out: &mut Vec<Action>) -> TimerId {
+        let remaining = at.since(self.clk.wait);
+        self.arm_timer(TimerAt::Wait(at), remaining, timer, out)
+    }
+
+    /// A timer at a HONOUR deadline: a holder's own window (a renewal
+    /// tick, a delegation's lapse). It can fire late after a forward step
+    /// or a suspend, which costs liveness only: every honour check is made
+    /// where the right is used, not by the timer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn set_timer_honour(&mut self, at: HonourMs, timer: Timer, out: &mut Vec<Action>) -> TimerId {
+        let remaining = at.since(self.clk.honour);
+        self.arm_timer(TimerAt::Honour(at), remaining, timer, out)
     }
 
     fn cancel_timer(&mut self, id: TimerId, out: &mut Vec<Action>) {
@@ -2863,33 +2947,37 @@ impl Core {
         self.s3.insert(op, purpose);
         // Plan 30 §M9: the *send* time bounds the S3 liveness a
         // successful result proves (see `backup::note_s3_liveness`).
-        self.ack.s3_sent.insert(op, self.last_now);
+        self.ack.s3_sent.insert(op, self.clk.wall);
         out.push(Action::S3 { op, req });
         op
     }
 
     /// (Re)arm the periodic poll `delay_ms` from now, replacing a pending
     /// one (`poll.as_mut().reset(..)`).
-    fn arm_poll(&mut self, now: Ms, delay_ms: u64, out: &mut Vec<Action>) {
+    fn arm_poll(&mut self, now: Now, delay_ms: u64, out: &mut Vec<Action>) {
         if let Some(id) = self.poll_timer.take() {
             self.cancel_timer(id, out);
         }
-        let id = self.set_timer(now.plus(delay_ms), Timer::Poll, out);
+        let id = self.set_timer_wall(now.wall.plus(delay_ms), Timer::Poll, out);
         self.poll_timer = Some(id);
     }
 
-    fn arm_drain(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn arm_drain(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.drain_timer.is_some() {
             return;
         }
-        let id = self.set_timer(now.plus(self.cfg.replay_drain_ms), Timer::ReplayDrain, out);
+        let id = self.set_timer_wall(
+            now.wall.plus(self.cfg.replay_drain_ms),
+            Timer::ReplayDrain,
+            out,
+        );
         self.drain_timer = Some(id);
     }
 
     /// Run a round as soon as possible (`SyncRequest::Nudge`). A round
     /// already in flight is not cancelled — the M2b rule — it is followed
     /// by another.
-    pub(crate) fn nudge(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn nudge(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.job.is_some() {
             self.nudged = true;
             return;
@@ -2900,7 +2988,7 @@ impl Core {
 
     /// The periodic poll fired: run a round unless a job holds the slot,
     /// in which case the round follows it.
-    fn on_poll(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn on_poll(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.epoch.open {
             self.epoch_probes = self.epoch_probes.saturating_add(1);
         }
@@ -2932,7 +3020,7 @@ impl Core {
     /// grant, by that short remainder (`locks-delegated` seed 1432: a
     /// grant renewed for 501 ms with a 500 ms margin lapsed under its
     /// holder's I/O).
-    pub(crate) fn next_poll_ms(&self, now: Ms) -> u64 {
+    pub(crate) fn next_poll_ms(&self, now: Now) -> u64 {
         let base = self.cfg.sync_interval_ms.max(1);
         let mut next = base
             .saturating_mul(1u64 << self.idle_rounds.min(20))

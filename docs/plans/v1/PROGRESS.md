@@ -52595,3 +52595,325 @@ The `umount_drain` test alone under a CPU load (load average 27 to 35): 2 of
 200 failing before, 200 of 200 passing after. With `view.list`'s answer
 delayed 500 ms in the daemon (a diagnostic build only): 2 of 20 failing
 before, 20 of 20 passing after, on the same host without the extra load.
+
+## Plan 43 C7-H1, commit 1 of 4: the protocol clocks, `Now` through the core, relative timers, the step fault and the step file
+
+C7-H1 (plan 43 §7 C7, §11 Q19, answered 2026-10-19: every local duration,
+the honour clock follows a forward wall step) puts every local window on a
+clock a wall-clock step cannot move: a holder's windows on an honour clock
+(never under-counts), a waiter's and the liveness timers on a wait clock
+(never over-counts), and wall time only where a value crosses a node, a
+restart or the status. It lands in four commits. This is the first: the
+clocks, the types, the plumbing, the simulator's clock model and the step
+faults, the step file for the harness, the fail-before configurations. **No
+protocol site reads a clock other than WALL yet**: every `now.wall` in the
+core is the old `now`, so nothing changes without a step, which the sweeps
+below prove, and the step configurations fail here exactly because of it.
+
+### What landed
+
+- `constellation_types::clock` (pure, std only): the newtypes `Ms` (WALL,
+  moved from `authority::ids`, which re-exports it), `HonourMs`, `WaitMs`
+  (no `From`, no cross-type arithmetic), `Now { wall, honour, wait }` with
+  the four named crossings (`wall_of_wait`, `wall_of_honour`, `wait_of_wall`,
+  `honour_of_wait`: each maps a remaining duration onto the target clock
+  now, `i64::MAX` stays `MAX`, 0 and `MIN` become 0), `ClockSources`
+  (wall, boot, raw and monotonic reads) and `ProtocolClock`:
+  `HONOUR = wall0 + RAW elapsed + S + J` with `S` the running maximum of the
+  time suspended (`BOOTTIME − MONOTONIC`: slewed together, so a slew
+  cancels) and `J` the running maximum of how far the wall has run ahead of
+  that, `WAIT = wall0 + RAW elapsed`, WALL as the host says. (A first
+  version took the max and min of the absolute elapsed values of the three
+  clocks; the review showed that is wrong per interval once they have
+  drifted apart: after a day a suspend of 30 s advanced HONOUR by 25 s and a
+  mono slewed fast made WAIT over-count; `pairwise_after_the_clocks_have_
+  diverged` and the random-history test pin the per-interval properties.) The
+  module doc holds the properties P1-P6 with their arguments. Reads take the
+  wall first and the elapsed clocks after it, so a thread descheduled
+  between the reads can only make `J` smaller (the reverse order could raise
+  it for good). Step detection (observability only): `wall - boot elapsed`
+  changing by 100 ms or more, confirmed by a second sample (a preemption
+  between the two reads of the first would look like a backward step).
+- `constellation_platform::clock`: `HostSources` per OS (Linux/Android:
+  BOOTTIME, MONOTONIC_RAW, MONOTONIC; Darwin: MONOTONIC for boot, UPTIME_RAW;
+  FreeBSD: MONOTONIC for boot, UPTIME, written from the man page and not run
+  on a FreeBSD host; Windows and the rest: one `Instant`, suspend not
+  counted), the process-wide `protocol()`, and the fault terms moved from
+  `store_s3::lease`: the constant `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` and
+  the new runtime step `set_fault_step_ms` (WALL only). `now_unix_ms()` is
+  `protocol().wall()`; its WARN for the offset moved to the engine's start-up.
+  `types`, `platform` and `store-s3` type-check for aarch64-apple-darwin and
+  x86_64-pc-windows-gnu (`tools/zcc`, `zar`).
+- The core: `Core::handle` and `start` take a `Now`; every internal `now:
+  Ms` became `now: Now` and every use `now.wall` (mechanical, compiler-guided;
+  a few helpers that are handed a *stamp* named `now`, such as
+  `renew_fresh(f.at)`, keep taking a `Ms`). `Config::clock_id` (the engine
+  sets `protocol().id()`, the simulator the incarnation's). Timers are
+  relative: `Action::SetTimer { id, after_ms, kind }`; `set_timer_wall`,
+  `set_timer_wait`, `set_timer_honour` compute `after_ms` from the same
+  clock's reading of the step, the table remembers the clock
+  (`TimerAt`; two deadlines of different clocks are never compared). Every
+  call site still uses `set_timer_wall`. The engine's driver sleeps `after_ms`
+  counted from the instant it took the step's `Now` (not from the dispatch:
+  a step that waited between its clock read and its actions, behind a store
+  stall or in a stopped process, fires the timers it armed when the reading
+  says, as its absolute deadlines did); the test driver treats 0 as due.
+- The engine: `authority_driver::now()` is `protocol().now()`; the driver
+  logs a WARN when the clock saw a step (`delta_ms`, counts);
+  `status.clock` gains `steps_forward`, `steps_backward`, `stepped_ms_total`,
+  `last_step_ms`, `honour_ahead_ms`, `wait_behind_ms` (schema re-blessed);
+  `fault::start_clock_faults` (called with the runtime-hog poller): the
+  offset WARN, and the poller of `CONSTELLATION_FAULT_CLOCK_STEP_FILE`: a
+  thread of its own reads the file every 100 ms, a cumulative signed step
+  written whole by a rename, applies it, logs, and writes `<file>.applied`.
+- The simulator (`tests/sim/clock.rs`): per-node `SimSources` (wall = base +
+  offset + the node's step + elapsed; boot, raw, mono = the paused clock's
+  whole milliseconds), a fresh `ProtocolClock` per incarnation (id `node << 32
+  | incarnation`) over the node's step, which `NodeEnv::steps` keeps across
+  restarts; `env.clock` (true time) has no offset and no step.
+  `FaultKind::ClockStep { who: StepOf, ms }` (`Node`, `Holder`, `Backup`,
+  `Locker`, `NonHolder`, resolved when the fault runs) and
+  `PartitionLockerStepped { step_ms, dur_ms }` (one locker, stepped and then
+  cut off); both in the name tables of `replay_seed` and `sweep_config`, not
+  in `gen_faults`. The delegation lane's freeze detection runs on tokio's
+  clock, as the daemon's heartbeat thread does (a wall step would invent or
+  hide a freeze). A timer sleeps until the reading of the step that armed it
+  (`Clock::instant_of`) plus `after_ms`.
+- The harness: `clock:step:<±ms>:<at_ms>[@node]` (no ±500 ms cap); every
+  daemon gets `CONSTELLATION_FAULT_CLOCK_STEP_FILE`; the session thread
+  writes the node's cumulative step at `<at_ms>`, waits for `.applied`,
+  records `(applied at, cumulative)` in the load's ledger and checks through
+  `node.status` that `status.clock` counted it. `verify.rs` reads a daemon's
+  `at_ms` with the offset *and the steps in force at the log line's time*
+  removed (`ClockSkew`); the campaign's stale-generation watch adds the
+  node's step to its skew term. TESTING.md documents the item and the
+  simulator's clocks, faults and configurations.
+
+### The step configurations on this tree (the fail-before)
+
+Measured here, where the protocol still reads WALL: this tree is the first
+with the fault, and the parent of the commits that move the sites. 2 000 seeds
+each (`AUTHORITY_SIM_CONFIG=<name> AUTHORITY_SIM_SEEDS=2000`, `sweep_config`);
+none is a `#[test]` or in `long_locks` yet (commits 2 and 3 add the pinned
+seeds and the long-sweep rows for the ones they fix).
+
+| configuration | step | failing of 2 000 | first seeds | what fails | fixed by |
+|---|---|---|---|---|---|
+| `locks-root-step-forward` | holder +2.5 s at 3 s and 7 s | 1 821 | 0, 1, 2 | mutual exclusion: the owner drops its records 2.5 s early | 3/4 |
+| `locks-locker-step-back` | locker −3 s then cut 4 s (`PartitionLockerStepped`) | 479 | 0, 4, 5 | mutual exclusion: the locker honours a lapsed grant | 2/4 |
+| `locks-holder-step-back-sealed` | holder −8 s as it is cut (−3 s: 6 of 2 000 on 3d2a034) | 430 | 0, 6, 12 | mutual exclusion on the old holder's own grants (see below) | 2/4 |
+| `fast-takeover-holder-step-forward` | holder +3 s before the cut | 18 (81 before plan 44's ask-again fix) | 34, 303, 399 | mutual exclusion: 16 within 0.35 s of the step (the root's own table), 2 after the takeover (the cap, or the old root granting) | 3/4 and 2/4 |
+| `fast-takeover-successor-step-forward` | successor +4 s at 3 s | 21 | 0, 39, 231 | mutual exclusion about 5.4 s in: the floor ends 4 s early | 3/4 |
+| `delegated-root-step-forward` | root +3 s at 1 s | 4 | 401, 954, 1230 | ordering, a refused rid, no quiescence | 3/4 |
+| `delegated-delegate-step-back` | delegate −3 s, cut 12 s | 0 | | none (see below): a regression configuration | |
+| `strict-reader-step-back` | reader −3 s, cut off | 91 | 9, 40, 54 | close-to-open: a stale strict read | 2/4 |
+| `locks-root-step-back` (control) | holder −3 s | 0 | | nothing: a backward step only lengthens waits | |
+| `locks-holder-step-forward` (control) | locker +3 s | 0 | | its grants lapse early: 2 140 I/Os fenced in 1 885 seeds, 0 failures | |
+
+What the measurements changed (also in the plan):
+
+- The spec's sizes held for the lock configurations (the review's +2.5 s root
+  step is 1 821 of 2 000 here, not 73: the step lands while grants are
+  held, by construction). The other classes needed work:
+  - `fast-takeover-successor-step-forward`: with the spec's base and
+    `StepOf::Backup` it failed 0 of 2 000 in four variants. `Backup` is
+    resolved from the lease *when the fault runs*, and after the seal the
+    lease lists the successor's own new backup. The configuration steps the
+    new holder (`StepOf::Holder`) at 3 s and uses long critical sections
+    (8 to 12 steps of 300 to 600 ms: a section has to outlive the old root's
+    window). The first long-section variants (with `Backup`) failed 5 and 2 of
+    2 000, all of them a lock nobody grants for 60 s; the same sections with a
+    step of 0 failed 2: not the step.
+  - `fast-takeover-holder-step-forward` fails by two classes at once (above),
+    so commit 2 alone leaves it failing at about 16 of 2 000 (71 before plan 44's ask-again fix, which made waiters re-ask instead of being pushed a lapsed grant). No variant that
+    isolated the cap failed: with the old root's own clients idle and long
+    critical sections, with a step of 4.5 s, with the holder crashed 0.1 s after
+    the step, 0 of 2 000 in six variants (the crash variants that kept short
+    sections failed 13 and 84, within 0.1 s of the step: the root's table).
+    The old root's grants are mirrored at the backup (`LockMirror`, restamped
+    at the successor), which covers most of what a cap ending early would
+    not.
+  - `locks-holder-step-back-sealed` fails on lock grants, not stale strict
+    answers. Every variant that isolated the strict path found none: no
+    locks, the holder's clients only reading, the holder isolated from every
+    node, steps of −3, −8 and −12 s, cuts of 6 and 25 s. A holder that is
+    only cut from S3 and its backup keeps catching up through its other
+    peers (its replica's floor keeps moving), so its reads are not stale; a
+    holder isolated from every node blocks its strict reads (none returned
+    from 2.5 s to 9.4 s in the seed traced, then they timed out), so a
+    stepped clock does not extend them. The row 12 liveness site
+    (`liveness_fresh`) is covered by the core test of commit 2 only.
+  - `delegated-delegate-step-back` could not be made to fail: delegate −3, −6
+    and −8 s, cut for 6 and 12 s, 30 and 100 ops per client, on the
+    holder-cut tree and on the plain delegated one. Kept as a regression
+    configuration for commit 2, not as its fail-before.
+
+### Without a step, the sweeps are identical
+
+`sweep_config` over 2 000 seeds (500 for the `long-*` ones) of every
+configuration in its table (97) and of 15 of them with
+`AUTHORITY_SIM_BEATS=thread`, parent `3d2a034` against this tree (before the rebase): **112 of
+112 are identical**, line for line, on the summary line (failing seeds, every
+counter, the seeds with fenced I/Os or lost grants) and on `SWEEP-FLOORS`
+(takeovers, floors armed, capped, saved ms, the floor-length distribution,
+beat guards that rose). Eight of them fail by design (the `-unaware`,
+`-credited`, `-unchecked` and `-unlaned` controls, `-unsettled`) and fail on
+the same seeds. The spec's list (`backup`, `backup-strict`, `long-backup`,
+`locks-failover-backup-renew`, `fast-takeover-skewed-successor`,
+`double-seal-inside-the-grace`, `delegated-holder-cut`) is among them.
+
+Rebased onto `62b04bd` (plan 44's ask-again fix `7780c8e` rewrote the lock
+queue, new `now: Ms` functions, four new `locks-production-ttl*`
+configurations): the identity was re-run against that parent for the 64
+configurations and variants the rebase can touch (every `locks-*`,
+`fast-takeover-*`, `double-seal-*` and `strict-isolated-*` one, 6 of them with
+beats on a thread, and the spec's seven): 62 identical; the other two
+(`locks-failover-backup-writes`, `locks-unlinked-delegated-hcrash-backup`)
+differ in the counter "answered from the stream" by 1 (433/434 and 4757/4756),
+which also varies between runs of the parent itself (433, 433, 434). The step
+configurations were re-measured on it (the table below).
+
+A first version slept `after_ms` from the dispatch, and four configurations
+differed (`locks-stall-step`, `locks-stall-step-delegated`,
+`locks-writer-hold`, `locks-writer-hold-unchecked`: a step that waits
+between its clock read and its actions armed its timers late; in
+`locks-stall-step` 1 810 fenced I/Os and 0 lost grants became 1 825 and 11,
+no seed changed from pass to fail). A timer now counts from the reading of
+the step that armed it (the simulator through `Clock::instant_of`, the daemon
+through the instant it took the step's `Now`), which is what the absolute
+deadlines it used to arm did, and they are identical too. The daemon needs the
+same anchor for safety, not only for the sweeps: a core step stuck behind a
+store stall for seconds must still fire the renewal tick it armed when its
+reading says.
+
+### Tests
+
+- `types::clock`: 13 tests. A backward step of 3 s moves WALL only; a forward
+  one advances HONOUR by exactly the step and WAIT by nothing; back then
+  forward counts the restore once and HONOUR is never non-monotone; forward
+  then back leaves HONOUR 3 s ahead; a suspend (boot ahead of raw) counts for
+  HONOUR and not WAIT; slewed boot and mono (0.92 of raw): HONOUR follows
+  raw, WAIT the slower clock; `HONOUR >= WALL`, `HONOUR >= WAIT` after any mix;
+  8 threads reading across a step see monotone readings and none below an
+  earlier reading on another thread; the conversions and their sentinels; ids;
+  a preempted sample (the boot read 400 ms after the wall read) raises neither
+  `J` nor the step count.
+- `platform::clock`: every host source advances and boot is not behind mono;
+  `set_fault_step_ms` moves WALL only (HONOUR follows, WAIT does not, the
+  counts); `protocol()` is a singleton; `clock_read_costs` (ignored) is the
+  microbenchmark below.
+- Core: `timers_are_relative_to_the_step_reading` (`after_ms` equals the
+  deadline minus the same-clock reading for one timer of each clock, a past
+  deadline is due at once, a deadline on another clock is not compared).
+- Simulator: `a_simulated_clock_step_moves_wall_only_and_outlives_the_incarnation`.
+- Engine: the step file is cumulative, applied once per change, acknowledged,
+  and a missing, empty or malformed file changes nothing.
+- Harness: `clock:step` parses (sign, node, no cap), a step is removed from the
+  lines after it (`ClockSkew`), and a stepped node is judged on its own clock
+  by the stale-generation watch.
+- Harness run with the item: `lock-failover` with
+  `clock:step:+3000:6000,clock:step:-3000:12000` on every node: each daemon
+  logged the step and the harness read `status.clock` back: after +3 s
+  `steps_forward 1 stepped_ms_total 3001 honour_ahead_ms 0 wait_behind_ms
+  3001` (HONOUR followed the step, WAIT did not); after −3 s `steps_forward 1
+  steps_backward 1 stepped_ms_total 6001 last_step_ms -3000 honour_ahead_ms
+  3000 wait_behind_ms 0` (HONOUR kept the forward step and ignored the
+  backward one).
+
+### Performance
+
+- The clock reads, `cargo test --release -p constellation-platform
+  clock_read_costs -- --ignored` on the box (4 cores pinned, a loaded host):
+  the old `now_unix_ms` 21.7 ns, WALL 22.5 ns (+0.8 ns: a `OnceLock` read and
+  a virtual call), WAIT 42.8 ns, HONOUR 67.0 ns, `Now` 84.8 ns, one
+  `CLOCK_MONOTONIC_RAW` read 19.6 ns. The FUSE path still reads WALL only.
+- `make vfs-bench` (`cargo bench -p constellation-engine --bench vfs_bench`),
+  parent against this tree, three runs each, median: every row within ±1.7 %
+  (`view/getattr/direct` 1 054 ns against 1 053 ns, `view/lookup/direct`
+  2 408 against 2 404, `view/read/direct` 1 744 against 1 732; the mock rows,
+  which never read a clock, move +0.2 to +1.7 %). The bench is in process, so
+  the host file system is not in it; the clock reads do not touch one.
+- `harness meta-bench` (the `1node-*` rows are what the FUSE path pays),
+  parent against this tree, on tmpfs, btrfs, and ext4 and xfs on loop images:
+  it cannot resolve 3 % on this host. One run per tree and file system moves
+  the `1node-*` throughput from −57 % to +147 % either way (the ops are
+  fsync- or S3-latency-bound; two runs of one tree differ by up to 4×).
+  Seven interleaved runs on tmpfs, median throughput and p50 (parent → this
+  tree): create 8 064 → 8 788 ops/s, p50 0.093 → 0.099 ms; write4k 3 457 →
+  3 426, 0.276 → 0.285 ms; create at 20 ms S3 latency 10 992 → 9 867, 0.076 →
+  0.084 ms; write4k at 20 ms 5 176 → 4 174, 0.155 → 0.207 ms; four-way
+  concurrent create 8 510 → 8 334, 0.453 → 0.415 ms; the spread inside one
+  tree (4 516 to 9 928 for the first row) is larger than any of these
+  differences, and a second series with the parent's harness and the two
+  daemons (five interleaved runs; the host was slower and noisier, 2 to 3×)
+  has the p50s within ±10 % either way (0.095 → 0.105, 0.366 → 0.348, 0.079 →
+  0.083, 0.195 → 0.212, 0.386 → 0.371 ms). What the change adds per core step is
+  two more clock reads for `Now` (about 65 ns) and one `Instant`, per timer
+  armed, about 25 ns: tens of ns in a 100 to 200 µs operation, and below
+  what this benchmark can see. The host's disks (ext4, xfs, btrfs) are not in
+  that path at all.
+- Harness, parent against this tree on the box (a quiet host): `backup-failover`
+  p50 1.495 s and 1.488 s against 1.493 s and 1.490 s (three rounds each, two
+  runs each); `upgrade-under-load` passes both ways (9 to 10 s);
+  `lock-failover` passes in 10 runs of each: the contender is granted
+  0.5 to 0.7 ms after the locker's unlock, except in a run in which the
+  scenario's roles make it wait for the successor's grace, about 16 s: 3 of
+  5 parent runs and none of 5 of this tree here, and in an earlier batch on a
+  loaded host (the daemon built before the timer anchor above) 1 of 5 parent
+  runs and 2 of 5 of this tree. The same outlier is in the parent; it is the
+  scenario, not the commit.
+
+### Unchanged on purpose
+
+- Every protocol site reads `now.wall`; every timer is `set_timer_wall`.
+  Commits 2 to 4 move them (spec §5: the honour sites, the wait sites, the
+  liveness sites) with the audit at the end of commit 4.
+- Meta, the replica trait, `LeaseView`, `DelegView`, the engine's locks and
+  the beat keep their wall `i64`/`Ms`; the lease body and `Beat` are not
+  changed (commit 2).
+- `ClusterLocks::fenced`/`take_discard` reading the clock before the
+  "no local lockers" check and the fast path's six clock reads are commit 2's
+  (spec §12), not done here.
+- The clocks' rate (ρ), suspend in the simulator, the models, boot-id restart
+  horizons (C7a); every cross-node compare (C7b); GC, holds, singletons, HLC
+  and status stamps (rows 16 to 19).
+- The `tools/load-campaign/run.py` `clock-step` preset and the scenario
+  `clock-step-lock-holder` wait for commit 3 (they must be green after it).
+
+### Open
+
+- `lock_waited_since` (plan 44's ask-again fix, `core/locks.rs`) makes a
+  client-reported wait (an `Instant` measurement) a WALL queue key: a wait-side
+  site for commit 3 (a step on the owner reorders the queue: fairness, not
+  exclusion).
+- `fast-takeover-holder-step-forward` after commit 2 alone will still fail on
+  the old root's own grant table (16 of its 18 seeds here) until the wait-side
+  commit; the commit that fixes the honour side should not claim it clean. A
+  fail-before for the cap alone does not exist in this simulator (above).
+- `locks-holder-step-back-sealed` and `delegated-delegate-step-back` do not
+  isolate the sites they were written for (a stale strict answer at the
+  holder; a delegate executing past the root's reclaim). Commit 2's core
+  tests carry `liveness_fresh` and the delegate's `until`; whether the
+  simulator can reach either needs a different scenario (the holder's reads
+  block once it is cut off).
+- The FreeBSD source table (`CLOCK_MONOTONIC` for boot, `CLOCK_UPTIME` for the
+  rest) is from the man page and has not run on FreeBSD.
+
+### Gates
+
+On the box (kernel 7.3, 16 cores; the work on `btrfs`, `/tmp` on tmpfs; a
+loaded host for the sweeps, a quiet one for the harness and benchmarks),
+every job under `timeout --kill-after=30s`, none hit it:
+
+- `cargo fmt --check`; `cargo clippy --workspace --all-targets -D warnings`
+  clean.
+- `cargo test --workspace --release --no-fail-fast` without `constellation-
+  model`: 3 191 passed, 0 failed, 42 ignored (authority lib 443, sim 166,
+  engine lib 779, harness lib 143, control 159); `cargo test --release -p
+  constellation-model`: 154 passed, 0 failed, 18 ignored (its binary alone,
+  as the memory of the whole run has killed it before). The engine lib three
+  times: 779 passed each.
+- The sweeps above; the harness runs above; `make vfs-bench` and the clock
+  microbenchmark above.
+- `types`, `platform` and `store-s3` type-check for aarch64-apple-darwin and
+  x86_64-pc-windows-gnu.

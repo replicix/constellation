@@ -7,7 +7,7 @@ use super::client::named_child;
 use super::{Core, S3For};
 use crate::action::{Action, S3Op};
 use crate::event::PeerMsg;
-use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
+use crate::ids::{Epoch, NodeId, Now, OpId, Seq};
 use crate::replica::Replica;
 use constellation_meta::delegation::Ownership;
 use constellation_meta::locks::LockTag;
@@ -48,7 +48,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_mutate_request(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         rid: Rid,
@@ -185,7 +185,7 @@ impl Core {
                             .dl
                             .gens
                             .get(&d.gen)
-                            .is_some_and(|g| !g.ended && now < g.until)
+                            .is_some_and(|g| !g.ended && now.wall < g.until)
                         && self.links.get(&d.node).is_some_and(|l| l.connected)
                     {
                         // Wholly a live delegate's: the requester's table
@@ -415,7 +415,7 @@ impl Core {
     /// requester is answered `NotHolder` and may take the lease itself).
     fn readopt_own_lease_for_forward(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -428,7 +428,7 @@ impl Core {
             || self.epoch.open
             || self.retired()
             || self.mode.forwards()
-            || now < self.readopt_refused_until
+            || now.wall < self.readopt_refused_until
         {
             return false;
         }
@@ -622,7 +622,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn holder_execute(
         &mut self,
-        now: Ms,
+        now: Now,
         epoch: Epoch,
         rid: Rid,
         op: &MutateOp,
@@ -657,7 +657,7 @@ impl Core {
             rseq = rid.seq,
             "holder: executing a forwarded op"
         );
-        let outcome = match replica.execute(op, Some(rid), tag, now.0) {
+        let outcome = match replica.execute(op, Some(rid), tag, now.wall.0) {
             Ok(records) => {
                 replica.remember_outcome(rid, &records);
                 if rid.node != self.cfg.node_id {
@@ -763,7 +763,7 @@ impl Core {
     /// S3 request only by the handoff job.
     pub(crate) fn on_lease_request(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         epoch_applied: Option<Seq>,
@@ -870,7 +870,11 @@ impl Core {
         }
         self.enqueue_job(
             now,
-            super::jobs::JobReq::Handoff { req, from, at: now },
+            super::jobs::JobReq::Handoff {
+                req,
+                from,
+                at: now.wall,
+            },
             replica,
             out,
         );
@@ -881,7 +885,7 @@ impl Core {
     /// a round tails it now rather than at the next poll.
     pub(crate) fn on_segment_pushed(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         seq: Seq,
         epoch: Epoch,

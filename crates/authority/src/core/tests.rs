@@ -40,10 +40,10 @@ impl Harness {
         let mut core = Core::new(cfg);
         let now = Ms(1_000_000);
         let mut out = Vec::new();
-        core.start(now, &meta, &mut out);
+        core.start(Now::same(now.0), &meta, &mut out);
         // The peer directory knows nodes 2..=4 (never talked to: reachable).
         core.handle(
-            now,
+            Now::same(now.0),
             Event::Peers {
                 links: (2..=4)
                     .map(|node| crate::event::PeerLink {
@@ -66,7 +66,7 @@ impl Harness {
     }
 
     fn step(&mut self, event: Event) -> Vec<Action> {
-        let mut out = self.core.handle(self.now, event, &self.meta);
+        let mut out = self.core.handle(self.clk(), event, &self.meta);
         if self.manual_horizon {
             return out;
         }
@@ -77,7 +77,7 @@ impl Harness {
             if let Action::PersistLockHorizon { until } = out[i] {
                 let durable = self.meta.note_lock_grant_horizon(until).ok();
                 let more = self.core.handle(
-                    self.now,
+                    Now::same(self.now.0),
                     Event::LockHorizonPersisted { until, durable },
                     &self.meta,
                 );
@@ -90,6 +90,14 @@ impl Harness {
 
     fn advance(&mut self, ms: u64) {
         self.now = self.now.plus(ms);
+    }
+
+    /// The core's reading at `self.now`: the three clocks agree (no step
+    /// in these tests; plan 43 C7-H1 1/4 plumbs `Now` and changes no
+    /// behaviour, the step tests come with the commits that use the
+    /// honour and wait readings).
+    fn clk(&self) -> Now {
+        Now::same(self.now.0)
     }
 
     fn rid(&self, seq: u64) -> Rid {
@@ -131,7 +139,9 @@ impl Harness {
             granted_delegations: true,
             retired: Vec::new(),
         };
-        self.core.lease.adopt(self.now, lease, tag(), gate);
+        self.core
+            .lease
+            .adopt(Now::same(self.now.0), lease, tag(), gate);
         self.meta.set_holder_epoch(epoch);
     }
 }
@@ -211,10 +221,80 @@ fn start_arms_the_poll_and_the_replay_drain() {
     let meta = Meta::open_in_memory().unwrap();
     let mut core = Core::new(Config::defaults(1, 1));
     let mut out = Vec::new();
-    core.start(Ms(0), &meta, &mut out);
+    core.start(Now::same(0), &meta, &mut out);
     assert_eq!(timers(&out, TimerKind::Poll).len(), 1);
     assert_eq!(timers(&out, TimerKind::ReplayDrain).len(), 1);
     assert!(core.job().is_none());
+}
+
+/// Plan 43 C7-H1 (R3): a timer is relative. The core computes the time left
+/// on the clock its deadline is on against that clock's reading of this
+/// step (the three readings here are far apart on purpose), the driver
+/// sleeps that long, and the core remembers which clock the deadline is
+/// on. A deadline already past is due at once.
+#[test]
+fn timers_are_relative_to_the_step_reading() {
+    let meta = Meta::open_in_memory().unwrap();
+    let mut core = Core::new(Config::defaults(1, 1));
+    let now = Now {
+        wall: Ms(1_000_000),
+        honour: HonourMs(5_000_000),
+        wait: WaitMs(9_000_000),
+    };
+    let mut out = Vec::new();
+    core.start(now, &meta, &mut out);
+    // `start` arms its timers from the wall reading.
+    let after = |out: &[Action], id: TimerId| {
+        out.iter()
+            .find_map(|a| match a {
+                Action::SetTimer {
+                    id: i, after_ms, ..
+                } if *i == id => Some(*after_ms),
+                _ => None,
+            })
+            .expect("a SetTimer for the id")
+    };
+    let drain = timers(&out, TimerKind::ReplayDrain)[0];
+    assert_eq!(after(&out, drain), core.cfg.replay_drain_ms);
+    assert_eq!(
+        core.timer_at(drain),
+        Some(TimerAt::Wall(now.wall.plus(core.cfg.replay_drain_ms)))
+    );
+    out.clear();
+    let wall = core.set_timer_wall(Ms(1_000_700), Timer::Poll, &mut out);
+    let honour = core.set_timer_honour(HonourMs(5_000_300), Timer::Poll, &mut out);
+    let wait = core.set_timer_wait(WaitMs(9_000_900), Timer::Poll, &mut out);
+    assert_eq!(
+        after(&out, wall),
+        700,
+        "wall deadline minus the wall reading"
+    );
+    assert_eq!(
+        after(&out, honour),
+        300,
+        "honour deadline minus the honour reading"
+    );
+    assert_eq!(
+        after(&out, wait),
+        900,
+        "wait deadline minus the wait reading"
+    );
+    assert_eq!(core.timer_at(wall), Some(TimerAt::Wall(Ms(1_000_700))));
+    assert_eq!(
+        core.timer_at(honour),
+        Some(TimerAt::Honour(HonourMs(5_000_300)))
+    );
+    assert_eq!(core.timer_at(wait), Some(TimerAt::Wait(WaitMs(9_000_900))));
+    // Past deadlines are due now; a deadline on the wrong clock is not read
+    // as on this one: wall 1_000_700 on the honour clock would be 4 s past.
+    out.clear();
+    let past = core.set_timer_wait(WaitMs(8_000_000), Timer::Poll, &mut out);
+    assert_eq!(after(&out, past), 0);
+    // Timers of different clocks are never compared with each other.
+    assert_eq!(TimerAt::Wall(Ms(10)).later_than_wall(Ms(5)), Some(true));
+    assert_eq!(TimerAt::Wall(Ms(10)).later_than_wall(Ms(15)), Some(false));
+    assert_eq!(TimerAt::Wait(WaitMs(10)).later_than_wall(Ms(5)), None);
+    assert_eq!(TimerAt::Honour(HonourMs(10)).later_than_wall(Ms(5)), None);
 }
 
 #[test]
@@ -350,7 +430,7 @@ fn an_acquisition_cas_in_doubt_is_reread_and_won_if_it_landed() {
         let mut h = Harness::new(1);
         let mut out = Vec::new();
         h.core.enqueue_job(
-            h.now,
+            Now::same(h.now.0),
             super::jobs::JobReq::Acquire {
                 reason: "test",
                 ask_handoff: false,
@@ -567,7 +647,7 @@ fn a_holders_handoff_queues_behind_the_round_then_flushes_and_releases() {
     h.hold(1, None);
     // The poll fires: a round starts with the upload pass.
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
     let out = h.step(Event::Timer { id: poll });
     let upload = out
@@ -615,7 +695,7 @@ fn a_holders_handoff_queues_behind_the_round_then_flushes_and_releases() {
     assert!(h
         .core
         .lease
-        .new_mutation_epoch(h.now, h.core.config())
+        .new_mutation_epoch(Now::same(h.now.0), h.core.config())
         .is_none());
     let (release, req) = s3_ops(&out)[0];
     assert!(matches!(req, S3Op::LeaseSwap { lease, .. } if lease.released));
@@ -683,7 +763,7 @@ fn a_release_in_doubt_is_reread_before_anything_is_admitted() {
         assert!(
             h.core
                 .lease
-                .new_mutation_epoch(h.now, h.core.config())
+                .new_mutation_epoch(Now::same(h.now.0), h.core.config())
                 .is_none(),
             "a release in doubt admitted a new local mutation"
         );
@@ -713,7 +793,7 @@ fn a_release_in_doubt_is_reread_before_anything_is_admitted() {
         assert!(h
             .core
             .lease
-            .new_mutation_epoch(h.now, h.core.config())
+            .new_mutation_epoch(Now::same(h.now.0), h.core.config())
             .is_none());
         assert!(h.core.job().is_none());
     }
@@ -743,7 +823,7 @@ fn a_renewal_due_mid_ship_goes_out_between_two_segments() {
     };
     submit(&mut h, 1, "a");
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
     let out = h.step(Event::Timer { id: poll });
     let upload = out
@@ -857,10 +937,13 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
     h.core.lease.wanted_since = Some(long_ago);
     h.core.lease.held_since = Some(long_ago);
     h.core.lease.last_write = long_ago;
-    assert!(h.core.lease.wants_handoff(h.now, h.core.config()));
+    assert!(h
+        .core
+        .lease
+        .wants_handoff(Now::same(h.now.0), h.core.config()));
 
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let mut poll = timers(&out, TimerKind::Poll)[0];
     let mut delayed = None;
     for round in 0..6 {
@@ -872,9 +955,9 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
             polls.extend(acts.iter().filter_map(|a| match a {
                 Action::SetTimer {
                     id,
-                    at,
+                    after_ms,
                     kind: TimerKind::Poll,
-                } => Some((*id, *at)),
+                } => Some((*id, h.now.plus(*after_ms))),
                 _ => None,
             }));
             if let Some(upload) = acts.iter().find_map(|a| match a {
@@ -938,7 +1021,7 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
     // answered; whether a release CAS (a released lease) was sent.
     fn releases(h: &mut Harness) -> bool {
         let mut out = Vec::new();
-        h.core.start(h.now, &h.meta, &mut out);
+        h.core.start(Now::same(h.now.0), &h.meta, &mut out);
         let poll = timers(&out, TimerKind::Poll)[0];
         let mut acts = h.step(Event::Timer { id: poll });
         let mut released = h.core.lease.releasing;
@@ -979,7 +1062,10 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         h.core.lease.wanted_since = Some(long_ago);
         h.core.lease.held_since = Some(long_ago);
         h.core.lease.last_write = long_ago;
-        assert!(h.core.lease.wants_handoff(h.now, h.core.config()));
+        assert!(h
+            .core
+            .lease
+            .wants_handoff(Now::same(h.now.0), h.core.config()));
     };
     // Control: nothing pending, the idle holder hands the lease over.
     let mut h = Harness::new(1);
@@ -999,11 +1085,12 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         h.core.note_fast_takeover(&prev, None);
         let mut out = Vec::new();
         let landed = h.now;
-        h.core.note_marker_landed(landed, &h.meta, &mut out);
+        h.core
+            .note_marker_landed(Now::same(landed.0), &h.meta, &mut out);
         let margins = 2 * h.core.cfg.expiry_margin_ms as i64 + h.core.cfg.backup_takeover_ms as i64;
         let until = landed.0 + margins + if locks { 20_000 } else { 5_000 };
-        assert!(h.core.in_takeover_floor(Ms(until - 1)));
-        assert!(!h.core.in_takeover_floor(Ms(until)));
+        assert!(h.core.in_takeover_floor(Now::same(until - 1)));
+        assert!(!h.core.in_takeover_floor(Now::same(until)));
         idle(&mut h);
         assert!(
             !releases(&mut h),
@@ -1033,7 +1120,7 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         h.hold(1, gate);
         idle(&mut h);
         let mut out = Vec::new();
-        h.core.round_release(h.now, &h.meta, &mut out);
+        h.core.round_release(Now::same(h.now.0), &h.meta, &mut out);
         assert_eq!(
             h.core.lease.releasing, !pending,
             "idle release with the takeover gate pending: {pending}"
@@ -1047,11 +1134,13 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         None,
     );
     let mut out = Vec::new();
-    h.core.note_marker_landed(h.now, &h.meta, &mut out);
-    assert!(h.core.in_takeover_floor(h.now));
-    h.core.lock_on_lease_gone(h.now, &h.meta, &mut out);
+    h.core
+        .note_marker_landed(Now::same(h.now.0), &h.meta, &mut out);
+    assert!(h.core.in_takeover_floor(Now::same(h.now.0)));
+    h.core
+        .lock_on_lease_gone(Now::same(h.now.0), &h.meta, &mut out);
     assert!(
-        !h.core.in_takeover_floor(h.now),
+        !h.core.in_takeover_floor(Now::same(h.now.0)),
         "the floor outlived its tenure"
     );
 }
@@ -1159,8 +1248,9 @@ fn a_flush_or_shutdown_inside_the_takeover_floor_waits_for_it() {
         );
         let mut out = Vec::new();
         let now = h.now;
-        h.core.note_marker_landed(now, &h.meta, &mut out);
-        assert!(h.core.in_takeover_floor(h.now));
+        h.core
+            .note_marker_landed(Now::same(now.0), &h.meta, &mut out);
+        assert!(h.core.in_takeover_floor(Now::same(h.now.0)));
     };
     let gate = || PendingGate {
         epoch: 1,
@@ -1280,7 +1370,7 @@ fn a_queued_handoff_that_meets_the_takeover_floor_is_declined() {
     let mut h = Harness::new(1);
     h.hold(1, None);
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
     let round = h.step(Event::Timer { id: poll });
     assert_eq!(h.core.job(), Some(JobKind::Round));
@@ -1297,7 +1387,8 @@ fn a_queued_handoff_that_meets_the_takeover_floor_is_declined() {
         None,
     );
     let now = h.now;
-    h.core.note_marker_landed(now, &h.meta, &mut out);
+    h.core
+        .note_marker_landed(Now::same(now.0), &h.meta, &mut out);
     let d = drive_job(&mut h, round);
     assert!(!d.released, "released inside the floor");
     assert_eq!(
@@ -1341,8 +1432,9 @@ fn a_flush_that_meets_the_floor_at_its_release_step_parks_there() {
     );
     let mut none = Vec::new();
     let now = h.now;
-    h.core.note_marker_landed(now, &h.meta, &mut none);
-    assert!(h.core.in_takeover_floor(h.now));
+    h.core
+        .note_marker_landed(Now::same(now.0), &h.meta, &mut none);
+    assert!(h.core.in_takeover_floor(Now::same(h.now.0)));
     let d = drive_job(&mut h, out);
     assert!(!d.released, "released at the release step inside the floor");
     assert!(d.done.is_empty(), "answered inside the floor");
@@ -1375,7 +1467,8 @@ fn a_flush_waits_out_a_floor_longer_than_its_cap() {
     );
     let mut none = Vec::new();
     let landed = h.now;
-    h.core.note_marker_landed(landed, &h.meta, &mut none);
+    h.core
+        .note_marker_landed(Now::same(landed.0), &h.meta, &mut none);
     let floor_end = h.meta.locks().quarantine_until();
     assert!(floor_end > landed.0 + 90_000, "the floor is not long");
     let flush = OpId(9);
@@ -1437,7 +1530,7 @@ fn an_epoch_flush_holds_for_a_fast_takeovers_gate_only() {
             },
         });
         let mut out = Vec::new();
-        h.core.round_release(h.now, &h.meta, &mut out);
+        h.core.round_release(Now::same(h.now.0), &h.meta, &mut out);
         assert_eq!(
             h.core.lease.releasing, !fast,
             "the epoch's flush release with a gate pending (fast takeover: {fast})"
@@ -1475,7 +1568,8 @@ fn a_handoff_inside_the_takeover_floor_is_declined() {
         );
         let mut out = Vec::new();
         let landed = h.now;
-        h.core.note_marker_landed(landed, &h.meta, &mut out);
+        h.core
+            .note_marker_landed(Now::same(landed.0), &h.meta, &mut out);
         let out = request(&mut h);
         let d = drive_job(&mut h, out);
         assert_eq!(
@@ -1646,7 +1740,7 @@ fn a_handoff_request_that_waited_past_its_timeout_is_declined() {
     let mut h = Harness::new(1);
     h.hold(1, None);
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
     let out = h.step(Event::Timer { id: poll });
     let upload = out
@@ -1735,7 +1829,7 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
     // Past half-TTL the round renews; the CAS is lost to a takeover.
     h.advance(6_000);
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
     let out = h.step(Event::Timer { id: poll });
     let upload = out
@@ -2557,7 +2651,7 @@ fn the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit() {
     h.hold(2, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
 
     let attr = h.meta.getattr(file.ino).unwrap().unwrap();
@@ -2715,7 +2809,7 @@ fn a_folded_truncates_rid_is_settled_so_a_queued_copy_never_empties_the_file() {
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     let written = (Some(manifest_of(b"payload-two")), 11);
     assert_eq!(content(&h.meta, file.ino), written, "the gate's replay");
@@ -2797,7 +2891,7 @@ fn the_drains_fold_settles_the_truncates_rid_at_the_holder() {
         let mut out = Vec::new();
         requester
             .core
-            .on_drain_tick(requester.now, &requester.meta, &mut out);
+            .on_drain_tick(Now::same(requester.now.0), &requester.meta, &mut out);
         for (to, msg) in sends(&out) {
             let PeerMsg::MutateRequest { rid, op, .. } = msg else {
                 continue;
@@ -2897,7 +2991,7 @@ fn a_truncate_the_tail_carried_leaves_its_commit_on_the_cut_base() {
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert_eq!(
         content(&h.meta, file.ino),
@@ -2953,7 +3047,7 @@ fn a_folded_truncate_replays_as_the_base_checked_cut() {
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     let written = (Some(manifest_of(b"payload-two")), 11);
     assert_eq!(content(&h.meta, ino), written);
@@ -2979,7 +3073,7 @@ fn a_folded_truncate_replays_as_the_base_checked_cut() {
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     let winner = (Some(manifest_of(b"winner-from-c")), 13);
     assert_eq!(content(&h.meta, ino), winner);
@@ -3106,7 +3200,7 @@ fn a_delegates_own_write_between_the_takeovers_strand_and_its_replay_lands_after
     h.hold(2, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert!(h.meta.pending_replays().unwrap().is_empty());
     assert_eq!(h.core.stats.replay_conflicts, 0);
@@ -3177,7 +3271,7 @@ fn a_no_op_completion_is_not_the_truncates_effect() {
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert_eq!(
         content(&h.meta, file.ino),
@@ -3226,7 +3320,7 @@ fn two_folded_truncates_and_their_commit_all_land() {
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert_eq!(
         content(&h.meta, file.ino),
@@ -3270,7 +3364,7 @@ fn the_drain_leaves_a_folded_truncates_row_as_it_was() {
     let mut out = Vec::new();
     requester
         .core
-        .on_drain_tick(requester.now, &requester.meta, &mut out);
+        .on_drain_tick(Now::same(requester.now.0), &requester.meta, &mut out);
     let sent: Vec<_> = sends(&out)
         .into_iter()
         .filter_map(|(_, m)| match m {
@@ -3328,7 +3422,7 @@ fn a_remote_refusal_of_a_replay_is_its_rids_outcome() {
         let mut out = Vec::new();
         requester
             .core
-            .on_drain_tick(requester.now, &requester.meta, &mut out);
+            .on_drain_tick(Now::same(requester.now.0), &requester.meta, &mut out);
         for (to, msg) in sends(&out) {
             let PeerMsg::MutateRequest { .. } = msg else {
                 continue;
@@ -3459,7 +3553,7 @@ fn a_folded_truncate_refused_elsewhere_leaves_without_a_copy() {
     h.hold(2, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert!(
         !out.iter()
@@ -3505,7 +3599,7 @@ fn the_gates_refused_replay_is_the_rids_outcome_for_every_copy() {
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     let winner = (Some(manifest_of(b"winner-from-c")), 13);
     assert_eq!(content(&h.meta, file.ino), winner);
@@ -3569,7 +3663,7 @@ fn a_holders_drain_journals_a_refused_replay() {
         .unwrap();
     h.hold(1, None);
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert_eq!(
         h.meta.completed_outcome(a(5)).unwrap(),
         Some(constellation_meta::CompletedOutcome::Refused {
@@ -3638,7 +3732,7 @@ fn a_deposed_holders_adopted_manifest_commit_is_not_replayed() {
     // B adopted it from its backup tail and shipped it under epoch 2.
     crate::replica::Replica::apply_segment(&h.meta, 2, 2, 0, &[], &[], &adopted).unwrap();
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(
         h.meta.pending_replays().unwrap().is_empty(),
         "the replay found its completion in the log"
@@ -3698,9 +3792,9 @@ fn a_retired_nodes_stranded_journal_is_not_replayed() {
         let mut lease = lease_of(3, 3, h.now.plus(10_000).0);
         lease.retired = retired.into_iter().collect();
         let now = h.now;
-        h.core.lease.note_object(now, &lease);
+        h.core.lease.note_object(Now::same(now.0), &lease);
         let mut out = Vec::new();
-        h.core.on_drain_tick(now, &h.meta, &mut out);
+        h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
         let case = (requester, source, retired);
         if dropped {
             assert!(h.meta.pending_replays().unwrap().is_empty(), "{case:?}");
@@ -3933,7 +4027,9 @@ fn a_stranded_replay_is_not_gated_behind_an_op_awaiting_a_dead_epochs_log() {
     );
     let mut out = Vec::new();
     let now = requester.now;
-    requester.core.on_drain_tick(now, &requester.meta, &mut out);
+    requester
+        .core
+        .on_drain_tick(Now::same(now.0), &requester.meta, &mut out);
     let sent = sends(&out);
     let [(3, PeerMsg::MutateRequest { req, .. })] = sent.as_slice() else {
         panic!(
@@ -4031,7 +4127,10 @@ fn an_awaiting_log_forward_under_the_held_epoch_or_a_continuation_hold_keeps_wai
     );
 
     let (mut requester, rid, _) = awaiting_log_forward("d");
-    requester.core.lease.adopt_epoch_hold(requester.now, 5);
+    requester
+        .core
+        .lease
+        .adopt_epoch_hold(Now::same(requester.now.0), 5);
     let out = activity(&mut requester);
     assert!(replies(&out).is_empty());
     assert_eq!(
@@ -4082,7 +4181,10 @@ mod own_chunks {
             backups,
             ..lease_of(1, 1, holder.now.plus(10_000).0)
         };
-        holder.core.lease.adopt(holder.now, lease, tag(), None);
+        holder
+            .core
+            .lease
+            .adopt(Now::same(holder.now.0), lease, tag(), None);
         holder.core.ack.eligible = Some(false);
         (holder, requester)
     }
@@ -4418,7 +4520,7 @@ mod own_chunks {
                 backups,
                 ..lease_of(1, 1, h.now.plus(10_000).0)
             };
-            h.core.lease.adopt(h.now, lease, tag(), None);
+            h.core.lease.adopt(Now::same(h.now.0), lease, tag(), None);
         };
         backed(&mut holder, AckPolicy::Backup, vec![3]);
         assert_eq!(ask(&holder, 2, 0), OwnChunks::Streamed(vec![ino]));
@@ -4470,7 +4572,7 @@ mod own_chunks {
         let now = requester.now;
         requester
             .core
-            .answer_awaiting_log(now, &requester.meta, &mut out);
+            .answer_awaiting_log(Now::same(now.0), &requester.meta, &mut out);
         assert_eq!(requester.core.clients().count(), 0, "finished: {out:?}");
         assert_eq!(replies(&out).len(), 1);
         assert!(
@@ -4606,7 +4708,10 @@ mod own_chunks {
                 backups: vec![3],
                 ..lease_of(1, 1, holder.now.plus(10_000).0)
             };
-            holder.core.lease.adopt(holder.now, lease, tag(), None);
+            holder
+                .core
+                .lease
+                .adopt(Now::same(holder.now.0), lease, tag(), None);
             if blocked {
                 let own = ChunkHash::of(b"node 1's own write-back");
                 let g = holder.meta.create(ROOT_INO, "g", 0o644, 0, 0).unwrap().ino;
@@ -5208,7 +5313,7 @@ mod own_chunks {
                 let mut out = Vec::new();
                 requester
                     .core
-                    .start(requester.now, &requester.meta, &mut out);
+                    .start(Now::same(requester.now.0), &requester.meta, &mut out);
                 requester.step(Event::Peers {
                     links: [1, 3]
                         .into_iter()
@@ -5638,7 +5743,7 @@ fn a_streamed_segment_is_applied_through_the_tail_path() {
     let mut out = Vec::new();
     holder
         .core
-        .stream_passed(holder.now, 1, 1, &payload, &mut out);
+        .stream_passed(Now::same(holder.now.0), 1, 1, &payload, &mut out);
     let frames = stream_frames(&out);
     assert_eq!(frames.len(), 1);
     assert!(matches!(
@@ -6007,14 +6112,14 @@ fn stream_ahead_gives_a_pending_manifest_only_to_its_forwarder() {
     let mut out = Vec::new();
     holder
         .core
-        .stream_ahead(holder.now, 0, tip, &holder.meta, &mut out);
+        .stream_ahead(Now::same(holder.now.0), 0, tip, &holder.meta, &mut out);
     assert_eq!(manifest_to(&out), vec![2], "only the forwarder: {out:?}");
     // Reported up: everyone else gets it now, the forwarder not twice.
     holder.meta.ack_remote_chunks(&[chunk]).unwrap();
     let mut out = Vec::new();
     holder
         .core
-        .stream_ahead(holder.now, 0, tip, &holder.meta, &mut out);
+        .stream_ahead(Now::same(holder.now.0), 0, tip, &holder.meta, &mut out);
     assert_eq!(manifest_to(&out), vec![3], "{out:?}");
 }
 
@@ -6086,7 +6191,7 @@ fn a_segment_ahead_of_the_cursor_waits_for_it() {
 fn a_caught_up_stream_skips_the_tail_until_the_backstop() {
     let (_holder, mut sub, req) = stream_pair();
     let run_round = |sub: &mut Harness| -> Vec<Action> {
-        sub.core.nudge(sub.now, &mut Vec::new());
+        sub.core.nudge(Now::same(sub.now.0), &mut Vec::new());
         let mut all = Vec::new();
         let poll = sub
             .core
@@ -6162,7 +6267,7 @@ fn a_dropped_caught_up_stream_tails_one_get_wide() {
     let full = sub.core.cfg.tail_width;
     assert!(full > 1, "the test needs a full width above one: {full}");
     let run_round = |sub: &mut Harness| -> Vec<(OpId, usize)> {
-        sub.core.nudge(sub.now, &mut Vec::new());
+        sub.core.nudge(Now::same(sub.now.0), &mut Vec::new());
         let poll = sub
             .core
             .timers
@@ -6259,7 +6364,7 @@ fn a_dropped_caught_up_stream_tails_one_get_wide() {
 fn a_probe_the_stream_overtook_is_not_saturated() {
     let (mut holder, mut sub, req) = stream_pair();
     let poll_round = |sub: &mut Harness| -> Vec<Action> {
-        sub.core.nudge(sub.now, &mut Vec::new());
+        sub.core.nudge(Now::same(sub.now.0), &mut Vec::new());
         let poll = sub
             .core
             .timers
@@ -6327,7 +6432,7 @@ fn a_probe_that_beats_a_live_stream_is_followed_by_one_get() {
     let (mut holder, mut sub, req) = stream_pair();
     let full = sub.core.cfg.tail_width;
     assert!(full > 1, "the test needs a full width above one: {full}");
-    sub.core.nudge(sub.now, &mut Vec::new());
+    sub.core.nudge(Now::same(sub.now.0), &mut Vec::new());
     let poll = sub
         .core
         .timers
@@ -6706,7 +6811,7 @@ mod cto {
         let held = timer_of(&out, TimerKind::HeldReply);
         let expiry = timer_of(&out, TimerKind::GrantExpiry);
         assert_eq!(
-            h.core.timer_at(expiry),
+            h.core.timer_wall(expiry),
             Some(granted_at.plus(5_000 + 1_000)),
             "live until granted + ttl + margin"
         );
@@ -6850,7 +6955,7 @@ mod cto {
         let meta = h0.meta;
         let mut core = Core::new(h0.core.cfg.clone());
         let mut out = Vec::new();
-        core.start(now, &meta, &mut out);
+        core.start(Now::same(now.0), &meta, &mut out);
         let quarantine = timer_of(&out, TimerKind::GrantQuarantine);
         let mut h = Harness {
             core,
@@ -6879,7 +6984,7 @@ mod cto {
         assert!(mutate_replies(&out).is_empty(), "{out:?}");
         assert!(!h.meta.read_delegations().is_alone());
         let drain = timer_of(&out, TimerKind::GrantQuarantine);
-        assert_eq!(h.core.timer_at(drain), Some(flipped_at.plus(1_000)));
+        assert_eq!(h.core.timer_wall(drain), Some(flipped_at.plus(1_000)));
         h.advance(1_000);
         let out = h.step(Event::Timer { id: drain });
         assert_eq!(mutate_replies(&out).len(), 1, "{out:?}");
@@ -7228,7 +7333,7 @@ mod epoch_rules {
                 h.advance(h.core.cfg.replay_drain_ms);
                 let mut out = Vec::new();
                 let now = h.now;
-                h.core.on_drain_tick(now, &h.meta, &mut out);
+                h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
                 assert!(out.is_empty(), "frozen {frozen}: {out:?}");
                 assert!(h.core.job.is_none(), "no lease asked for");
                 assert!(!h.core.clients.contains_key(&rid));
@@ -7250,7 +7355,7 @@ mod epoch_rules {
             h.advance(h.core.cfg.replay_drain_ms);
             let mut out = Vec::new();
             let now = h.now;
-            h.core.on_drain_tick(now, &h.meta, &mut out);
+            h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
             assert!(
                 matches!(sends(&out)[..], [(1, PeerMsg::MutateRequest { rid: r, .. })] if *r == rid),
                 "resent once the epoch is over: {out:?}"
@@ -7298,7 +7403,7 @@ mod epoch_rules {
         let mut h = holder_with(AckPolicy::Local, vec![]);
         h.advance(9_300);
         assert!(
-            !h.core.lease.usable(h.now, h.core.config()),
+            !h.core.lease.usable(Now::same(h.now.0), h.core.config()),
             "inside the margin"
         );
         h.step(epoch(true, true, vec![1, 2]));
@@ -7663,7 +7768,7 @@ mod epoch_rules {
             );
             let watch = timers(&out, TimerKind::BackupWatch)[0];
             assert_eq!(
-                h.core.timer_at(watch),
+                h.core.timer_wall(watch),
                 Some(end.plus(1_500)),
                 "a full window from the lapse's end"
             );
@@ -7673,7 +7778,7 @@ mod epoch_rules {
                 let at = h.now;
                 beat(&mut h, i, t0.plus(300 * (i - 1)), at);
             }
-            h.now = h.core.timer_at(watch).expect("armed");
+            h.now = h.core.timer_wall(watch).expect("armed");
             let out = h.step(Event::Timer { id: watch });
             assert!(
                 s3_ops(&out).is_empty(),
@@ -7700,7 +7805,7 @@ mod epoch_rules {
                 let mut lease = root_lease(1, 1, t0.plus(30_000));
                 lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
                 lease.backups = vec![2];
-                h.core.lease.note_object(t0, &lease);
+                h.core.lease.note_object(Now::same(t0.0), &lease);
             }
             h.advance(1_500);
             h.step(Event::OwnLag {
@@ -7719,7 +7824,7 @@ mod epoch_rules {
                 t0.plus(750)
             };
             assert_eq!(
-                h.core.timer_at(watch),
+                h.core.timer_wall(watch),
                 Some(from.plus(1_500)),
                 "read {read}"
             );
@@ -7748,7 +7853,7 @@ mod epoch_rules {
                 let mut lease = root_lease(1, 1, expires);
                 lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
                 lease.backups = vec![2];
-                h.core.lease.note_object(t0, &lease);
+                h.core.lease.note_object(Now::same(t0.0), &lease);
             } else {
                 h.step(Event::HolderAlive {
                     from: 1,
@@ -7798,7 +7903,7 @@ mod epoch_rules {
                 assert!(h.core.bk.role.is_some());
                 let watch = timers(&out, TimerKind::BackupWatch);
                 assert_eq!(watch.len(), 1, "{out:?}");
-                assert_eq!(h.core.timer_at(watch[0]), Some(h.now.plus(1_500)));
+                assert_eq!(h.core.timer_wall(watch[0]), Some(h.now.plus(1_500)));
             } else {
                 assert_eq!(h.core.bk.sealed, 1, "did not seal past the expiry: {out:?}");
             }
@@ -7902,7 +8007,7 @@ mod epoch_rules {
             h.advance(200);
             let until = h.now;
             h.step(Event::OwnLag { from, until });
-            if h.core.timer_at(watch).is_some_and(|due| due <= h.now) {
+            if h.core.timer_wall(watch).is_some_and(|due| due <= h.now) {
                 let out = h.step(Event::Timer { id: watch });
                 if let [(_, S3Op::LeaseGet)] = s3_ops(&out).as_slice() {
                     read_at = Some(h.now);
@@ -7935,7 +8040,7 @@ mod epoch_rules {
         let out = h.step(Event::Timer { id: watch });
         assert!(s3_ops(&out).is_empty(), "read at the lapse's end: {out:?}");
         let watch = timers(&out, TimerKind::BackupWatch)[0];
-        assert_eq!(h.core.timer_at(watch), Some(end.plus(1_500)));
+        assert_eq!(h.core.timer_wall(watch), Some(end.plus(1_500)));
     }
 
     /// The holder's beats came late lately — sent late (its process was
@@ -7948,7 +8053,7 @@ mod epoch_rules {
         let mut h = Harness::new(2);
         let watch = backing(&mut h);
         let t0 = h.now;
-        let window = |h: &Harness| h.core.silence_window((1, 1, true), h.now);
+        let window = |h: &Harness| h.core.silence_window((1, 1, true), Now::same(h.now.0));
         assert_eq!(window(&h), 1_500, "no beats: the window");
         beat(&mut h, 1, t0, t0);
         beat(&mut h, 2, t0.plus(300), t0.plus(300));
@@ -7968,7 +8073,7 @@ mod epoch_rules {
             "one window: sealed a stalling holder"
         );
         let watch = timers(&out, TimerKind::BackupWatch)[0];
-        assert_eq!(h.core.timer_at(watch), Some(t0.plus(1_905 + 2_900)));
+        assert_eq!(h.core.timer_wall(watch), Some(t0.plus(1_905 + 2_900)));
         // Heard 9 s late: at most four windows.
         let late = t0.plus(1_905 + 9_200);
         beat(&mut h, 6, t0.plus(2_200), late);
@@ -7997,7 +8102,7 @@ mod epoch_rules {
         let mut h = Harness::new(2);
         let _watch = backing(&mut h);
         let t0 = h.now;
-        let window = |h: &Harness| h.core.silence_window((1, 1, true), h.now);
+        let window = |h: &Harness| h.core.silence_window((1, 1, true), Now::same(h.now.0));
         beat(&mut h, 1, t0, t0);
         // Beat 2 lost: 3 arrives two intervals on.
         beat(&mut h, 3, t0.plus(600), t0.plus(605));
@@ -8033,7 +8138,10 @@ mod epoch_rules {
             (b.epoch, b.last.map(|l| l.0), b.expires),
             (2, Some(1), t0.plus(60_000))
         );
-        assert_eq!(h.core.silence_window((1, 2, true), h.now), 1_500 + 2 * 700);
+        assert_eq!(
+            h.core.silence_window((1, 2, true), Now::same(h.now.0)),
+            1_500 + 2 * 700
+        );
     }
 
     /// F2b at the unit level: an `ack=s3` subscriber whose holder's stream
@@ -8046,7 +8154,7 @@ mod epoch_rules {
         let mut lease = root_lease(1, 1, sub.now.plus(60_000));
         lease.ack_policy = constellation_store_s3::AckPolicy::S3;
         let now = sub.now;
-        sub.core.lease.note_object(now, &lease);
+        sub.core.lease.note_object(Now::same(now.0), &lease);
         let poke = |h: &mut Harness| {
             h.step(Event::Activity {
                 last_write: Ms(0),
@@ -8113,14 +8221,20 @@ mod epoch_rules {
         // A beat 900 ms late: a longer window while the lease runs.
         at_expiry(&mut h, 1, t0);
         at_expiry(&mut h, 2, t0.plus(1_200));
-        assert_eq!(h.core.silence_window((1, 1, true), h.now), 1_500 + 2 * 900);
+        assert_eq!(
+            h.core.silence_window((1, 1, true), Now::same(h.now.0)),
+            1_500 + 2 * 900
+        );
         // A look while the discount holds is re-armed no later than the
         // expiry margin, where it ends.
         h.now = t0.plus(1_500);
         let out = h.step(Event::Timer { id: watch });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
         let watch = timers(&out, TimerKind::BackupWatch)[0];
-        assert_eq!(h.core.timer_at(watch), Some(Ms(expires.0 - margin as i64)));
+        assert_eq!(
+            h.core.timer_wall(watch),
+            Some(Ms(expires.0 - margin as i64))
+        );
         // Beats on time up to the expiry, then none (they stop there); a
         // lapse of the backup's own after it. The watch looks when due.
         let (mut watch, mut seq, mut beat_at, mut read) = (watch, 2, t0.plus(1_500), None);
@@ -8141,7 +8255,7 @@ mod epoch_rules {
                     until: t,
                 });
             }
-            if h.core.timer_at(watch).is_some_and(|due| due <= t) {
+            if h.core.timer_wall(watch).is_some_and(|due| due <= t) {
                 let out = h.step(Event::Timer { id: watch });
                 match s3_ops(&out).as_slice() {
                     [(_, S3Op::LeaseGet)] => read = Some(t),
@@ -8149,7 +8263,10 @@ mod epoch_rules {
                 }
             }
         }
-        assert_eq!(h.core.silence_window((1, 1, true), h.now), 1_500);
+        assert_eq!(
+            h.core.silence_window((1, 1, true), Now::same(h.now.0)),
+            1_500
+        );
         assert!(last_beat.plus(1_500) > expires);
         assert_eq!(read, Some(expires), "not at the expiry the beats named");
         assert!(
@@ -8237,7 +8354,7 @@ mod epoch_rules {
             assert!(s3_ops(&out).is_empty(), "renewed {renewed}: {out:?}");
             let watch = timers(&out, TimerKind::BackupWatch);
             assert_eq!(watch.len(), 1, "renewed {renewed}: not re-armed: {out:?}");
-            let due = h.core.timer_at(watch[0]).expect("armed");
+            let due = h.core.timer_wall(watch[0]).expect("armed");
             assert!(
                 due <= obj_expires && due <= h.now.plus(1_500),
                 "renewed {renewed}: re-armed at {due:?} (now {:?}, expiry {obj_expires:?})",
@@ -8918,17 +9035,23 @@ mod pipelined_appends {
         // Strikes decay: one more while the last backoff is recent, from 1
         // again after a quiet minute past it.
         use crate::core::backup::candidate_strikes_after;
-        assert_eq!(candidate_strikes_after(None, Ms(1_000)), 1);
-        assert_eq!(candidate_strikes_after(Some((3, Ms(10_000))), Ms(5_000)), 4);
+        assert_eq!(candidate_strikes_after(None, Now::same(1_000)), 1);
         assert_eq!(
-            candidate_strikes_after(Some((3, Ms(10_000))), Ms(69_999)),
+            candidate_strikes_after(Some((3, Ms(10_000))), Now::same(5_000)),
             4
         );
         assert_eq!(
-            candidate_strikes_after(Some((3, Ms(10_000))), Ms(70_000)),
+            candidate_strikes_after(Some((3, Ms(10_000))), Now::same(69_999)),
+            4
+        );
+        assert_eq!(
+            candidate_strikes_after(Some((3, Ms(10_000))), Now::same(70_000)),
             1
         );
-        assert_eq!(candidate_strikes_after(Some((1, Ms(0))), Ms(3_600_000)), 1);
+        assert_eq!(
+            candidate_strikes_after(Some((1, Ms(0))), Now::same(3_600_000)),
+            1
+        );
     }
 
     /// overload-cascade: a backup that answers the holder's heartbeat
@@ -9236,7 +9359,11 @@ mod pipelined_appends {
         ack(&mut h, sent[0].0, tip);
         // 9.3 s of a 10 s lease: inside the 1 s margin, not expired.
         h.advance(9_300);
-        assert!(h.core.lease.ship_epoch(h.now, h.core.config()).is_none());
+        assert!(h
+            .core
+            .lease
+            .ship_epoch(Now::same(h.now.0), h.core.config())
+            .is_none());
         let out = journaled(&mut h, 901);
         assert!(
             h.core.ack.peers.contains_key(&2),
@@ -9501,7 +9628,7 @@ mod m10 {
         // An observed expiry does not make it promise either.
         h.core
             .lease
-            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+            .note_object(Now::same(h.now.0), &lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -9513,7 +9640,7 @@ mod m10 {
         let mut h = flex(1);
         h.core
             .lease
-            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+            .note_object(Now::same(h.now.0), &lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         let puts = s3_ops(&out)
             .iter()
@@ -9540,7 +9667,7 @@ mod m10 {
         });
         h.core
             .lease
-            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+            .note_object(Now::same(h.now.0), &lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
             links: vec![crate::event::PeerLink {
                 node: 2,
@@ -9555,7 +9682,7 @@ mod m10 {
         let mut h = flex(0);
         h.core
             .lease
-            .note_object(h.now, &lease_of(2, 3, h.now.0 - 1));
+            .note_object(Now::same(h.now.0), &lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -9774,7 +9901,7 @@ mod m10 {
         assert_eq!(h.meta.holder_epoch(), 5, "captures under the hold's epoch");
         let now = h.now;
         let granted = h.core.lease.granted_lease(
-            now,
+            Now::same(now.0),
             h.core.config(),
             Some(&Lease::granted("p0", 1, 4, 10_000)),
             false,
@@ -9806,7 +9933,7 @@ mod m10 {
         let mut h = Harness::new(1);
         h.hold(4, None);
         h.core.bk.sealed = 6;
-        let view = h.core.epoch_claim_view(h.now);
+        let view = h.core.epoch_claim_view(Now::same(h.now.0));
         assert_eq!(view.held.as_ref().map(|l| l.epoch), Some(4));
         assert_eq!(view.known, 7, "the successor of the epoch it sealed");
         assert_eq!(view.claim(&[1, 2]).map(|c| c.2), Some(true));
@@ -9961,7 +10088,8 @@ fn a_held_forward_executes_locally_once_the_delegation_installs() {
     )
     .unwrap();
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     assert_eq!(
         h.core.deleg_view().mine.len(),
         1,
@@ -10026,7 +10154,7 @@ fn a_takeover_deposed_while_retrying_its_marker_finishes_the_acquisition() {
     h.core.cfg.takeover_promise_check = false;
     let mut out = Vec::new();
     h.core.enqueue_job(
-        h.now,
+        Now::same(h.now.0),
         super::jobs::JobReq::Acquire {
             reason: "test",
             ask_handoff: false,
@@ -10090,7 +10218,7 @@ mod retention_gap {
 
     /// Run one round on a follower: poll timer, then the upload step.
     fn round(h: &mut Harness) -> Vec<Action> {
-        h.core.nudge(h.now, &mut Vec::new());
+        h.core.nudge(Now::same(h.now.0), &mut Vec::new());
         let poll = h
             .core
             .timers
@@ -10138,7 +10266,7 @@ mod retention_gap {
         h.core.cfg.takeover_promise_check = false;
         let mut out = Vec::new();
         h.core.enqueue_job(
-            h.now,
+            Now::same(h.now.0),
             super::super::jobs::JobReq::Acquire {
                 reason: "test",
                 ask_handoff: false,
@@ -10190,7 +10318,7 @@ mod retention_gap {
         h.core.cfg.takeover_promise_check = false;
         let mut out = Vec::new();
         h.core.enqueue_job(
-            h.now,
+            Now::same(h.now.0),
             super::super::jobs::JobReq::Acquire {
                 reason: "test",
                 ask_handoff: false,
@@ -10227,7 +10355,7 @@ mod retention_gap {
         h.core.cfg.takeover_promise_check = false;
         let mut out = Vec::new();
         h.core.enqueue_job(
-            h.now,
+            Now::same(h.now.0),
             super::super::jobs::JobReq::Acquire {
                 reason: "test",
                 ask_handoff: false,
@@ -10712,11 +10840,11 @@ mod backup_crash {
         cfg.takeover_promise_check = false;
         h.core = Core::new(cfg);
         let mut out = Vec::new();
-        h.core.start(h.now, &h.meta, &mut out);
+        h.core.start(Now::same(h.now.0), &h.meta, &mut out);
         assert!(h.core.bk.role.is_some(), "the role survived the restart");
         let mut out = Vec::new();
         h.core.enqueue_job(
-            h.now,
+            Now::same(h.now.0),
             super::super::jobs::JobReq::Acquire {
                 reason: "test",
                 ask_handoff: false,
@@ -10774,7 +10902,7 @@ mod backup_crash {
         let mut out = Vec::new();
         requester
             .core
-            .start(requester.now, &requester.meta, &mut out);
+            .start(Now::same(requester.now.0), &requester.meta, &mut out);
         requester.step(Event::Peers {
             links: [1, 3]
                 .into_iter()
@@ -10919,7 +11047,8 @@ mod backup_crash {
             "the refusal is journaled"
         );
         let mut out = Vec::new();
-        h.core.deposed(h.now, 2, 2, 1, &h.meta, &mut out);
+        h.core
+            .deposed(Now::same(h.now.0), 2, 2, 1, &h.meta, &mut out);
         h.advance(60_000);
         let out = h.step(Event::Timer { id: deadline });
         let r = replies(&out);
@@ -10946,7 +11075,7 @@ mod backup_crash {
             let cfg = h.core.cfg.clone();
             h.core
                 .lease
-                .classify(at, &cfg, Some((lease.clone(), tag())), 0)
+                .classify(Now::same(at.0), &cfg, Some((lease.clone(), tag())), 0)
         };
         assert!(
             matches!(classify(3, now), Plan::Busy { .. }),
@@ -10966,7 +11095,9 @@ mod backup_crash {
         let h = Harness::new(3);
         let cfg = h.core.cfg.clone();
         assert!(matches!(
-            h.core.lease.classify(now, &cfg, Some((local, tag())), 0),
+            h.core
+                .lease
+                .classify(Now::same(now.0), &cfg, Some((local, tag())), 0),
             Plan::Claim { .. }
         ));
     }
@@ -11000,7 +11131,7 @@ mod backup_crash {
                 manual_horizon: false,
             };
             let mut out = Vec::new();
-            core.start(h.now, &h.meta, &mut out);
+            core.start(Now::same(h.now.0), &h.meta, &mut out);
             h.core = core;
             let links = |connected: bool| Event::Peers {
                 links: vec![crate::event::PeerLink {
@@ -11122,7 +11253,8 @@ mod locks {
         )
         .unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let d = h.core.dl.mine.get_mut(&7).expect("installed");
         // 1.5 s of the delegation left: a 0.5 s lock at most.
         d.until = h.now.plus(1_500);
@@ -11243,7 +11375,8 @@ mod locks {
         h.core.cfg.p2p = true;
         let (dir, _) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         assert!(!h.core.dl.mine[&7].stopped);
         two_delegate_rows(&h, dir);
         h.meta.strand_for_takeover(2, &[7]).unwrap();
@@ -11251,7 +11384,8 @@ mod locks {
         // The restart.
         h.core = Core::new(h.core.cfg.clone());
         h.core.lease.cached_holder = Some(1);
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         assert!(h.core.dl.mine[&7].stopped, "re-adopted live");
         let out = h.step(Event::Peer {
             from: 1,
@@ -11278,7 +11412,8 @@ mod locks {
         h.core.cfg.p2p = true;
         let (dir, _) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         two_delegate_rows(&h, dir);
         h.hold(
             2,
@@ -11293,7 +11428,7 @@ mod locks {
             }),
         );
         assert!(!h.core.dl.mine[&7].stopped);
-        h.core.complete_gate(h.now, &h.meta, &mut out);
+        h.core.complete_gate(Now::same(h.now.0), &h.meta, &mut out);
         assert!(h.meta.delegate_stranded(7).unwrap());
         assert!(h.core.dl.mine[&7].stopped, "the gate left it running");
     }
@@ -11341,7 +11476,8 @@ mod locks {
             h.hold(1, None);
             let (dir, f) = delegated_file(&h.meta);
             let mut out = Vec::new();
-            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            h.core
+                .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
             assert!(h.core.dl.gens.contains_key(&7), "gen 7 not learned");
             // The tenure's lock floor: it waits for the delegate's stream
             // head (its renewal) before the root grants anything.
@@ -11518,7 +11654,8 @@ mod locks {
         h.core.lease.cached_holder = Some(1);
         let dir = delegated_to_me(&h.meta, 3);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let req = renew_req(&out, 7).expect("no renewal on install");
         h.step(super::renewed(&h, req, 7, 5_000));
         let f = h.meta.allocate_ino(dir).unwrap();
@@ -11628,7 +11765,8 @@ mod locks {
         h.core.lease.cached_holder = Some(1);
         let dir = delegated_to_me(&h.meta, 3);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let req = renew_req(&out, 7).expect("no renewal on install");
         h.step(super::renewed(&h, req, 7, 5_000));
         let f = h.meta.allocate_ino(dir).unwrap();
@@ -11669,7 +11807,8 @@ mod locks {
         h.core.lease.cached_holder = None;
         h.hold(2, None);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         assert!(
             !h.core.dl.mine.contains_key(&7),
             "the root's own generation not ended: {out:?}"
@@ -11737,7 +11876,8 @@ mod locks {
         )
         .unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         // The tenure's floor: it waits for the delegate's renewal.
         request(&mut h, 5, 99, ROOT_INO, X, false);
         h.step(Event::Peer {
@@ -11773,7 +11913,7 @@ mod locks {
                 leaving_barriers: Vec::new(),
             },
         });
-        h.core.lock_on_generation_outwaited(h.now, dir);
+        h.core.lock_on_generation_outwaited(Now::same(h.now.0), dir);
         // (`end_generation` marks it ended in the same step.)
         h.core.dl.gens.get_mut(&7).unwrap().ended = true;
         let granted = |out: &[Action]| {
@@ -11851,8 +11991,9 @@ mod locks {
         h.advance(200);
         let now = h.now;
         // One step: outwaited, ended, re-delegated as gen 8.
-        h.core.lock_on_generation_outwaited(now, dir);
-        h.core.lock_on_generation_ended(now, 7, &h.meta);
+        h.core.lock_on_generation_outwaited(Now::same(now.0), dir);
+        h.core
+            .lock_on_generation_ended(Now::same(now.0), 7, &h.meta);
         crate::replica::Replica::apply_segment(
             &h.meta,
             3,
@@ -11874,13 +12015,14 @@ mod locks {
         .unwrap();
         h.core.lock_on_delegated(8, &h.meta);
         let mut out = Vec::new();
-        h.core.locks_after_event(now, &h.meta, &mut out);
+        h.core
+            .locks_after_event(Now::same(now.0), &h.meta, &mut out);
         assert!(
             h.meta.locks().grants_snapshot().is_empty(),
             "left in the root's table under gen 8: {:?}",
             h.meta.locks().grants_snapshot()
         );
-        let (handed, _) = h.core.lock_take_handoff(now, 8);
+        let (handed, _) = h.core.lock_take_handoff(Now::same(now.0), 8);
         assert_eq!(handed.len(), 1, "{handed:?}");
         assert_eq!(handed[0].id, live.id);
         assert_eq!(handed[0].until_ms, live.until_ms, "restamped: {handed:?}");
@@ -11904,7 +12046,8 @@ mod locks {
         h.hold(1, None);
         let (dir, f) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let out = h.step(Event::Control {
             op: OpId(1 << 50),
             req: Control::Undelegate { dir },
@@ -11920,7 +12063,8 @@ mod locks {
         // generation ends.
         h.core.dl.gens.get_mut(&7).unwrap().until = h.now;
         let mut out = Vec::new();
-        h.core.on_deleg_expiry(h.now, 7, &h.meta, &mut out);
+        h.core
+            .on_deleg_expiry(Now::same(h.now.0), 7, &h.meta, &mut out);
         assert!(h.core.dl.gens[&7].ended, "not ended: {out:?}");
         // Past the outwait's grace on the subtree.
         h.advance(h.core.lock_ttl_ms() as u64 + 2 * h.core.lock_margin_ms() as u64);
@@ -11985,7 +12129,8 @@ mod locks {
         h.hold(1, None);
         let (dir, f) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let out = h.step(Event::Control {
             op: OpId(1 << 50),
             req: Control::Undelegate { dir },
@@ -13172,7 +13317,7 @@ mod locks {
             .any(|(_, m)| matches!(m, PeerMsg::LockRequest { .. }))
         {
             let retry = timer_of(&out, TimerKind::LockRetry);
-            r.now = r.core.timer_at(retry).unwrap();
+            r.now = r.core.timer_wall(retry).unwrap();
             out = r.step(Event::Timer { id: retry });
         }
         let retried = r.now;
@@ -13358,7 +13503,7 @@ mod locks {
         assert_eq!(h.meta.load_lock_quarantine(h.now.0), None);
         let restart = |h: Harness| {
             let mut core = Core::new(h.core.cfg.clone());
-            core.start(h.now, &h.meta, &mut Vec::new());
+            core.start(Now::same(h.now.0), &h.meta, &mut Vec::new());
             let mut h = Harness {
                 core,
                 meta: h.meta,
@@ -13445,7 +13590,7 @@ mod locks {
         assert!(h.now.0 > granted_horizon, "the grant's own horizon passed");
         // Restart inside the lease (the holder's table is in memory).
         let mut core = Core::new(h.core.cfg.clone());
-        core.start(h.now, &h.meta, &mut Vec::new());
+        core.start(Now::same(h.now.0), &h.meta, &mut Vec::new());
         let mut h = Harness {
             core,
             meta: h.meta,
@@ -13898,7 +14043,7 @@ mod locks {
         });
         h2.hold(2, None);
         let now = h2.now;
-        h2.core.lock_install_mirror(now, &h2.meta);
+        h2.core.lock_install_mirror(Now::same(now.0), &h2.meta);
         let out = request(&mut h2, 3, 72, ino2, X, true);
         let rs = lock_replies(&out);
         let [(3, _, LockOutcome::Granted { position, .. })] = rs.as_slice() else {
@@ -13966,7 +14111,8 @@ mod locks {
         grant_and_release(&mut h, ino, released);
         let now = h.now;
         let mut out = Vec::new();
-        h.core.lock_on_lease_gone(now, &h.meta, &mut out);
+        h.core
+            .lock_on_lease_gone(Now::same(now.0), &h.meta, &mut out);
         h.hold(2, None);
         let out = request(&mut h, 3, 73, ino, X, true);
         let rs = lock_replies(&out);
@@ -13989,7 +14135,7 @@ mod locks {
         let journal = h.meta.journal_position(1).expect("unshipped");
         let now = h.now;
         h.core
-            .lock_on_generation_outwaited(now, constellation_fs_core::types::ROOT_INO);
+            .lock_on_generation_outwaited(Now::same(now.0), constellation_fs_core::types::ROOT_INO);
         // (The subtree grace is not what this test is about.)
         h.core.lk.grace.clear();
         // The next event notes the floor.
@@ -14079,7 +14225,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         // The tenure's floor waits for the inherited delegate's renewal.
         request(&mut h, 5, 99, ROOT_INO, X, false);
         let now = h.now.0;
@@ -14090,7 +14237,7 @@ mod locks {
         let out = request(&mut h, 4, 8, ino, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
         let end = t0.plus(6_000);
-        assert_eq!(h.core.timer_at(expiry), Some(end));
+        assert_eq!(h.core.timer_wall(expiry), Some(end));
         // Node 2 never answers: outwaited, but not granted on.
         h.now = end;
         let out = h.step(Event::Timer { id: expiry });
@@ -14173,7 +14320,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         request(&mut h, 5, 99, ROOT_INO, X, false);
         let now = h.now.0;
         // The delegate's core renews at head 2.
@@ -14227,7 +14375,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         // The tenure's first grant collects the inherited generation 7.
         let out = request(&mut h, 5, 99, ROOT_INO, X, false);
         assert!(grant_to(&out, 5).is_none(), "{out:?}");
@@ -14292,7 +14441,7 @@ mod locks {
         assert_eq!(h.meta.locks().stats().settle_waits, 0);
         let out = request(&mut h, 4, 8, ino, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
-        h.now = h.core.timer_at(expiry).unwrap();
+        h.now = h.core.timer_wall(expiry).unwrap();
         let out = h.step(Event::Timer { id: expiry });
         assert_eq!(h.core.stats.lock_recalls_expired, 1);
         assert!(grant_to(&out, 4).is_some(), "{out:?}");
@@ -14377,7 +14526,8 @@ mod locks {
             h.core.lease.cached_holder = Some(1);
             let (dir, f) = delegated_file(&h.meta);
             let mut out = Vec::new();
-            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            h.core
+                .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
             let clock = Arc::new(AtomicI64::new(h.now.0));
             {
                 let c = clock.clone();
@@ -14448,7 +14598,7 @@ mod locks {
                 d.until = h.now.plus(1_500);
                 d.renew = None;
                 let out = h.core.handle(
-                    h.now,
+                    Now::same(h.now.0),
                     Event::Peer {
                         from: 2,
                         msg: PeerMsg::LockRequest {
@@ -14552,14 +14702,15 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         request(&mut h, 5, 99, ROOT_INO, X, false);
         let now = h.now.0;
         renew_gen7(&mut h, 90, 2, now);
         request(&mut h, 2, 7, ino, X, true);
         let out = request(&mut h, 4, 8, ino, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
-        h.now = h.core.timer_at(expiry).unwrap();
+        h.now = h.core.timer_wall(expiry).unwrap();
         let out = h.step(Event::Timer { id: expiry });
         assert!(grant_to(&out, 4).is_none(), "{out:?}");
         (h, ino)
@@ -14583,7 +14734,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         request(&mut h, 5, 99, ROOT_INO, X, false);
         let now = h.now.0;
         renew_gen7(&mut h, 90, 2, now);
@@ -14647,7 +14799,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         request(&mut h, 5, 99, ROOT_INO, X, false);
         let now = h.now.0;
         renew_gen7(&mut h, 90, 2, now);
@@ -14734,9 +14887,10 @@ mod locks {
         h.meta.note_lock_grant_horizon(h.now.0 + 3_000).unwrap();
         let until = h.meta.load_lock_quarantine(h.now.0).expect("quarantined");
         let now = h.now;
-        h.core.locks_start(now, &h.meta);
+        h.core.locks_start(Now::same(now.0), &h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         // Past the quarantine, the tenure's floor is taken (the delegate's
         // renewal, sent before the horizon, arrives now).
         h.now = Ms(until + 10);
@@ -14778,11 +14932,12 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let now = h.now;
-        h.core.lock_on_released_takeover(now, &h.meta);
+        h.core.lock_on_released_takeover(Now::same(now.0), &h.meta);
         let until = h.meta.locks().quarantine_until();
         assert!(until > now.0);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         h.now = Ms(until + 10);
         request(&mut h, 5, 99, ROOT_INO, X, false);
         renew_gen7(&mut h, 90, 2, until - 1);
@@ -14816,7 +14971,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         request(&mut h, 5, 99, ROOT_INO, X, false);
         let now = h.now.0;
         renew_gen7(&mut h, 90, 2, now);
@@ -14825,12 +14981,14 @@ mod locks {
         let end = h.meta.locks().own_grant(ino, 2, h.now.0).unwrap().until_ms;
         h.core.lease.released();
         let now = h.now;
-        h.core.lock_on_lease_gone(now, &h.meta, &mut Vec::new());
+        h.core
+            .lock_on_lease_gone(Now::same(now.0), &h.meta, &mut Vec::new());
         assert_eq!(h.meta.locks().quarantine_until(), end);
         h.advance(100);
         h.hold(2, None);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         h.now = Ms(end + 10);
         request(&mut h, 5, 98, ROOT_INO, X, false);
         renew_gen7(&mut h, 91, 3, end - 1);
@@ -14859,7 +15017,8 @@ mod locks {
         h.core.lease.cached_holder = Some(1);
         let (_, f) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let d = h.core.dl.mine.get_mut(&7).expect("installed");
         d.until = h.now.plus(60_000);
         d.renew = None;
@@ -14867,7 +15026,7 @@ mod locks {
         assert!(grant_to(&out, 2).is_some(), "{out:?}");
         let out = request(&mut h, 4, 8, f, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
-        let end = h.core.timer_at(expiry).unwrap();
+        let end = h.core.timer_wall(expiry).unwrap();
         h.now = end;
         let out = h.step(Event::Timer { id: expiry });
         assert!(
@@ -14938,7 +15097,8 @@ mod locks {
         h.core.lease.cached_holder = Some(1);
         let (dir, f) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let d = h.core.dl.mine.get_mut(&7).expect("installed");
         d.until = h.now.plus(60_000);
         d.renew = None;
@@ -14953,7 +15113,9 @@ mod locks {
         };
         crate::replica::Replica::apply_segment(&h.meta, 2, 1, 0, &[], &[], &[unlink]).unwrap();
         let now = h.now;
-        let carried = h.core.deleg_leaving_barriers(now, 7, &[], &h.meta);
+        let carried = h
+            .core
+            .deleg_leaving_barriers(Now::same(now.0), 7, &[], &h.meta);
         assert_eq!(carried, vec![(f, end)]);
         // Root side.
         let mut r = Harness::new(1);
@@ -14962,7 +15124,8 @@ mod locks {
         r.hold(1, None);
         let (dir, f) = delegated_file(&r.meta);
         let mut out = Vec::new();
-        r.core.delegation_sync(r.now, &r.meta, &mut out);
+        r.core
+            .delegation_sync(Now::same(r.now.0), &r.meta, &mut out);
         request(&mut r, 5, 99, ROOT_INO, X, false);
         let now = r.now.0;
         renew_gen7(&mut r, 90, 0, now);
@@ -15024,7 +15187,7 @@ mod locks {
         let expiry = timers(&out, TimerKind::LockGrantExpiry);
         assert_eq!(expiry.len(), 2);
         assert_eq!(
-            h.core.timer_at(expiry[0]),
+            h.core.timer_wall(expiry[0]),
             Some(granted_at.plus(5_000 + 1_000)),
             "live until granted + ttl + margin"
         );
@@ -15176,7 +15339,7 @@ mod locks {
             "live from its request's arrival, not from now"
         );
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
-        assert_eq!(h.core.timer_at(expiry), Some(t0.plus(6_000)));
+        assert_eq!(h.core.timer_wall(expiry), Some(t0.plus(6_000)));
         // Node 4 keeps re-sending (every 2.25 s); the last one is 1.4 s old
         // when node 3's grant is outwaited (the lease out of the way: a
         // grant capped by it would be one for a request that young to be
@@ -15486,7 +15649,8 @@ mod locks {
         h.core.lease.cached_holder = Some(1);
         let (_, f) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         (h, f)
     }
 
@@ -16244,7 +16408,7 @@ mod locks {
         // 10 ms polls), not at its 9.5 s retry.
         let retry = timers(&out, TimerKind::LockRetry);
         assert_eq!(retry.len(), 1, "{out:?}");
-        assert_eq!(r.core.timer_at(retry[0]), Some(r.now.plus(10)));
+        assert_eq!(r.core.timer_wall(retry[0]), Some(r.now.plus(10)));
     }
 
     /// A shared grant does not answer an exclusive op of its node: it does
@@ -16801,7 +16965,7 @@ mod locks {
         assert_eq!(h.meta.locks().grants_len(), 1);
         let mut out = Vec::new();
         let now = h.now;
-        h.core.deposed(now, 5, 2, 1, &h.meta, &mut out);
+        h.core.deposed(Now::same(now.0), 5, 2, 1, &h.meta, &mut out);
         assert_eq!(h.meta.locks().grants_len(), 0);
         let [(3, OpId(8), LockOutcome::NotOwner { .. })] = lock_replies(&out).as_slice() else {
             panic!("{out:?}")
@@ -16883,9 +17047,10 @@ mod locks {
         h.meta.note_lock_grant_horizon(h.now.0 + 3_000).unwrap();
         let until = h.meta.load_lock_quarantine(h.now.0).expect("quarantined");
         let now = h.now;
-        h.core.locks_start(now, &h.meta);
+        h.core.locks_start(Now::same(now.0), &h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         h.now = Ms(until + 10);
         (h, ino, until)
     }
@@ -17000,7 +17165,8 @@ mod locks {
         };
         constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         request(&mut h, 5, 99, ROOT_INO, X, false);
         let now = h.now.0;
         renew_gen7(&mut h, 90, 2, now);
@@ -17070,7 +17236,8 @@ mod locks {
             (dir, f)
         };
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let d = h.core.dl.mine.get_mut(&7).expect("installed");
         d.until = h.now.plus(1_500);
         d.renew = None;
@@ -17137,7 +17304,7 @@ mod locks {
             },
         });
         let retry = timer_of(&out, TimerKind::LockRetry);
-        assert_eq!(r.core.timer_at(retry), Some(sent.plus(700)));
+        assert_eq!(r.core.timer_wall(retry), Some(sent.plus(700)));
         assert!(
             !out.iter()
                 .any(|a| matches!(a, Action::ControlDone { op: OpId(70), .. })),
@@ -17176,7 +17343,7 @@ mod locks {
         let out = request(&mut h, 3, 8, ino, X, true);
         assert!(lock_replies(&out).is_empty(), "parked: {out:?}");
         let end = timer_of(&out, TimerKind::LockGraceEnd);
-        assert_eq!(h.core.timer_at(end), Some(Ms(until)));
+        assert_eq!(h.core.timer_wall(end), Some(Ms(until)));
         // The grace ends: the held request is answered with the grant at
         // the timer, before the waiter tick or the held-reply timer.
         h.now = Ms(until);
@@ -17198,7 +17365,7 @@ mod locks {
         h.meta.locks().set_quarantine(now + 4_000);
         let out = request(&mut h, 3, 8, ino, X, true);
         let first = timer_of(&out, TimerKind::LockGraceEnd);
-        assert_eq!(h.core.timer_at(first), Some(Ms(now + 4_000)));
+        assert_eq!(h.core.timer_wall(first), Some(Ms(now + 4_000)));
         // A subtree grace that ends sooner.
         h.core.lk.grace.push((ROOT_INO, Ms(now + 1_000)));
         let out = request(&mut h, 4, 9, ino, X, true);
@@ -17207,12 +17374,12 @@ mod locks {
             .any(|a| matches!(a, Action::CancelTimer { id } if *id == first));
         assert!(cancelled, "the later timer stays armed: {out:?}");
         let second = timer_of(&out, TimerKind::LockGraceEnd);
-        assert_eq!(h.core.timer_at(second), Some(Ms(now + 1_000)));
+        assert_eq!(h.core.timer_wall(second), Some(Ms(now + 1_000)));
         // At the earlier end the next is armed.
         h.now = Ms(now + 1_000);
         let out = h.step(Event::Timer { id: second });
         let third = timer_of(&out, TimerKind::LockGraceEnd);
-        assert_eq!(h.core.timer_at(third), Some(Ms(now + 4_000)));
+        assert_eq!(h.core.timer_wall(third), Some(Ms(now + 4_000)));
     }
 
     // ---- the node side ----
@@ -17375,7 +17542,7 @@ mod locks {
         assert_eq!(held.until_ms, sent.0 + 1_000);
         assert_eq!(held.renew_at_ms, sent.0 + 500);
         let tick = timer_of(&out, TimerKind::LockRenewTick);
-        assert_eq!(r.core.timer_at(tick), Some(sent.plus(500)));
+        assert_eq!(r.core.timer_wall(tick), Some(sent.plus(500)));
         r.now = sent.plus(500);
         let out = r.step(Event::Timer { id: tick });
         assert!(
@@ -17416,14 +17583,14 @@ mod locks {
                 break;
             }
             tick = timer_of(&out, TimerKind::LockRenewTick);
-            r.now = r.core.timer_at(tick).unwrap().max(r.now);
+            r.now = r.core.timer_wall(tick).unwrap().max(r.now);
         }
         let out = found.expect("no lease read for the owner");
         let [(read, S3Op::LeaseGet)] = s3_ops(&out)[..] else {
             panic!("expected the owner's lease read: {out:?}")
         };
         let tick = timer_of(&out, TimerKind::LockRenewTick);
-        let at = r.core.timer_at(tick).unwrap();
+        let at = r.core.timer_wall(tick).unwrap();
         assert!(
             at.0 >= r.now.0 + 10,
             "re-ticks {} ms later with the read outstanding",
@@ -17434,14 +17601,14 @@ mod locks {
         let out = r.step(Event::Timer { id: tick });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
         let tick = timer_of(&out, TimerKind::LockRenewTick);
-        assert!(r.core.timer_at(tick).unwrap().0 >= r.now.0 + 10);
+        assert!(r.core.timer_wall(tick).unwrap().0 >= r.now.0 + 10);
         // The read answers (S3 still away): the tick comes again soon.
         let out = r.step(Event::S3 {
             op: read,
             result: S3Result::LeaseGet(Err(crate::event::S3Failure("cut".into()))),
         });
         let tick = timer_of(&out, TimerKind::LockRenewTick);
-        assert!(r.core.timer_at(tick).unwrap().0 <= r.now.0 + 1_000);
+        assert!(r.core.timer_wall(tick).unwrap().0 <= r.now.0 + 1_000);
     }
 
     /// delegate-fenced-io (`locks-blips-tight-delegated` seed 157): a
@@ -17480,7 +17647,7 @@ mod locks {
                 break;
             }
             tick = timer_of(&out, TimerKind::LockRenewTick);
-            r.now = r.core.timer_at(tick).unwrap().max(r.now);
+            r.now = r.core.timer_wall(tick).unwrap().max(r.now);
         }
         let read = read.expect("no lease read for the owner");
         let out = r.step(Event::S3 {
@@ -17489,7 +17656,7 @@ mod locks {
         });
         assert_eq!(r.core.lease.cached_holder, Some(1), "{out:?}");
         let tick = timer_of(&out, TimerKind::LockRenewTick);
-        r.now = r.core.timer_at(tick).unwrap();
+        r.now = r.core.timer_wall(tick).unwrap();
         let out = r.step(Event::Timer { id: tick });
         assert!(
             sends(&out)
@@ -17501,7 +17668,7 @@ mod locks {
         // seen here is none).
         let mut r = requester();
         r.core.lease.cached_holder = None;
-        assert_eq!(r.core.lock_owner_without_s3(r.now), None);
+        assert_eq!(r.core.lock_owner_without_s3(Now::same(r.now.0)), None);
     }
 
     /// delegate-fenced-io (`locks-blips-tight-delegated` seed 1): a
@@ -17524,7 +17691,8 @@ mod locks {
             let (dir, f) = delegated_file(&h.meta);
             if installed {
                 let mut out = Vec::new();
-                h.core.delegation_sync(h.now, &h.meta, &mut out);
+                h.core
+                    .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
                 let req = renew_req(&out, 7).expect("no renewal on install");
                 h.step(super::renewed(&h, req, 7, 5_000));
             }
@@ -17582,7 +17750,8 @@ mod locks {
             )
             .unwrap();
             let mut out = Vec::new();
-            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            h.core
+                .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
             assert!(h.core.dl.handed_back.is_empty(), "installed {installed}");
         }
     }
@@ -17630,7 +17799,7 @@ mod locks {
         let renew_at = |r: &mut Harness, mut tick: TimerId, to: NodeId, result| {
             let mut renewal = None;
             for _ in 0..8 {
-                r.now = r.core.timer_at(tick).unwrap().max(r.now);
+                r.now = r.core.timer_wall(tick).unwrap().max(r.now);
                 let out = r.step(Event::Timer { id: tick });
                 renewal = sends(&out).into_iter().find_map(|(t, m)| match m {
                     PeerMsg::LockRenew { req, .. } => Some((t, *req)),
@@ -17706,7 +17875,7 @@ mod locks {
             assert_eq!(r.meta.locks().held(42).is_some(), installed);
             if !installed {
                 let retry = timer_of(&out, TimerKind::LockRetry);
-                r.now = r.core.timer_at(retry).unwrap();
+                r.now = r.core.timer_wall(retry).unwrap();
                 let out = r.step(Event::Timer { id: retry });
                 assert!(
                     matches!(sends(&out).as_slice(), [(1, PeerMsg::LockRequest { .. })]),
@@ -18044,7 +18213,7 @@ mod locks {
         let mut ticks = 0;
         let mut renewed = None;
         while renewed.is_none() {
-            let at = r.core.timer_at(tick).expect("the renewal tick is armed");
+            let at = r.core.timer_wall(tick).expect("the renewal tick is armed");
             assert!(
                 at.0 < sent.0 + 4_000,
                 "no renewal tick inside the window: next at {at:?}"
@@ -18205,7 +18374,7 @@ mod locks {
         let (mut h, ino) = holder_with_file();
         let mut out = Vec::new();
         let now = h.now;
-        h.core.lock_on_released_takeover(now, &h.meta);
+        h.core.lock_on_released_takeover(Now::same(now.0), &h.meta);
         assert!(h.meta.locks().quarantine_until() > now.0);
         let out1 = request(&mut h, 3, 8, ino, X, false);
         let [(3, OpId(8), LockOutcome::Waiting { grace: true, .. })] =
@@ -18216,7 +18385,8 @@ mod locks {
         // The tenure ends (released, no grant of its own) and the same
         // node holds the lease again, no takeover.
         h.core.lease.released();
-        h.core.lock_on_lease_gone(now, &h.meta, &mut out);
+        h.core
+            .lock_on_lease_gone(Now::same(now.0), &h.meta, &mut out);
         h.advance(100);
         h.hold(2, None);
         let out2 = request(&mut h, 3, 9, ino, X, false);
@@ -18248,7 +18418,8 @@ mod locks {
         h.core.note_fast_takeover(&prev, None);
         let mut out = Vec::new();
         let now = h.now;
-        h.core.note_marker_landed(now, &h.meta, &mut out);
+        h.core
+            .note_marker_landed(Now::same(now.0), &h.meta, &mut out);
         let margins = 2 * h.core.cfg.expiry_margin_ms as i64 + h.core.cfg.backup_takeover_ms as i64;
         assert_eq!(
             h.meta.read_delegations().quarantine_until(),
@@ -18279,7 +18450,8 @@ mod locks {
             h.core.note_fast_takeover(&prev, None);
             let mut out = Vec::new();
             let now = h.now;
-            h.core.note_marker_landed(now, &h.meta, &mut out);
+            h.core
+                .note_marker_landed(Now::same(now.0), &h.meta, &mut out);
             let margins =
                 2 * h.core.cfg.expiry_margin_ms as i64 + h.core.cfg.backup_takeover_ms as i64;
             assert_eq!(
@@ -18329,9 +18501,9 @@ mod locks {
                 h.now = Ms(until + 1);
             }
             h.core.lease.held.as_mut().unwrap().0.granted_delegations = held_marked;
-            assert_eq!(h.core.lock_duty_live(h.now, &h.meta), live);
+            assert_eq!(h.core.lock_duty_live(Now::same(h.now.0), &h.meta), live);
             out.clear();
-            h.core.issue_release(h.now, &h.meta, &mut out);
+            h.core.issue_release(Now::same(h.now.0), &h.meta, &mut out);
             s3_ops(&out)
                 .into_iter()
                 .find_map(|(_, r)| match r {
@@ -18363,7 +18535,7 @@ mod locks {
         h.core.cfg.p2p = true;
         h.hold(1, None);
         let (_dir, f) = delegated_file(&h.meta);
-        assert!(!h.core.lock_duty_live(h.now, &h.meta));
+        assert!(!h.core.lock_duty_live(Now::same(h.now.0), &h.meta));
         let until = h.now.0 + 5_000;
         h.meta.locks().install(constellation_meta::locks::Grant {
             id: GrantId { node: 1, seq: 1 },
@@ -18375,21 +18547,24 @@ mod locks {
             gen: 0,
             confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
         });
-        assert!(h.core.lock_duty_live(h.now, &h.meta));
+        assert!(h.core.lock_duty_live(Now::same(h.now.0), &h.meta));
         h.core.lock_on_delegated(7, &h.meta);
         assert_eq!(h.meta.locks().grants_len(), 0);
         assert!(
-            h.core.lock_duty_live(h.now, &h.meta),
+            h.core.lock_duty_live(Now::same(h.now.0), &h.meta),
             "moved out of the table, to hand over with the first renewal"
         );
         // Handed over: the root keeps its copy.
         let now = h.now;
-        assert_eq!(h.core.lock_take_handoff(now, 7).0.len(), 1);
+        assert_eq!(h.core.lock_take_handoff(Now::same(now.0), 7).0.len(), 1);
         assert!(
-            h.core.lock_duty_live(now, &h.meta),
+            h.core.lock_duty_live(Now::same(now.0), &h.meta),
             "handed, not handed back"
         );
-        assert!(!h.core.lock_duty_live(Ms(until + 1), &h.meta), "lapsed");
+        assert!(
+            !h.core.lock_duty_live(Now::same(until + 1), &h.meta),
+            "lapsed"
+        );
     }
 
     /// Drives `h` (a node that was handed a takeover permit by its seal)
@@ -18416,7 +18591,7 @@ mod locks {
         }
         let mut out = Vec::new();
         h.core.enqueue_job(
-            h.now,
+            Now::same(h.now.0),
             super::super::jobs::JobReq::Acquire {
                 reason: "test",
                 ask_handoff: false,
@@ -18590,7 +18765,7 @@ mod locks {
         // Nobody takes the local lock: the ticks run on.
         let mut released_at = None;
         for _ in 0..20 {
-            let at = r.core.timer_at(tick).expect("the renewal tick is armed");
+            let at = r.core.timer_wall(tick).expect("the renewal tick is armed");
             r.now = at;
             let out = r.step(Event::Timer { id: tick });
             if out.iter().any(|a| matches!(a, Action::LockFlush { .. })) {
@@ -18694,7 +18869,7 @@ mod locks {
             },
         });
         let retry = timer_of(&out, TimerKind::LockRetry);
-        assert_eq!(r.core.timer_at(retry), Some(sent.plus(2_500)));
+        assert_eq!(r.core.timer_wall(retry), Some(sent.plus(2_500)));
         // The push comes first, echoing the send time.
         r.advance(100);
         let out = r.step(Event::Peer {
@@ -19133,7 +19308,7 @@ mod locks {
                 return answers;
             }
             let last = !h.core.epoch.open
-                && h.core.lease.usable(h.now, &h.core.cfg)
+                && h.core.lease.usable(Now::same(h.now.0), &h.core.cfg)
                 && !h.core.lease.fenced();
             if last {
                 after += 1;
@@ -19244,7 +19419,7 @@ mod locks {
     fn holder_with_grants_in_an_epoch() -> (Harness, Ino, Ino, GrantId, Lease) {
         let (mut h, ino) = holder_with_file();
         h.core.cfg.p2p = true;
-        h.core.start(h.now, &h.meta, &mut Vec::new());
+        h.core.start(Now::same(h.now.0), &h.meta, &mut Vec::new());
         let op = h.create("peer");
         let MutateOp::Create { ino: peer_ino, .. } = op else {
             unreachable!()
@@ -19326,7 +19501,8 @@ mod locks {
         assert!(held.until_ms > h.now.0, "lapsed during the re-claim");
         h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
         let mut out = Vec::new();
-        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        h.core
+            .on_lock_renew_tick(Now::same(h.now.0), &h.meta, &mut out);
         assert_eq!(h.core.stats.lock_lost, 0, "fenced: {out:?}");
         assert!(h.core.stats.lock_renewals > 0, "{out:?}");
         assert!(h
@@ -19379,7 +19555,7 @@ mod locks {
             h.core.pr.carried,
         ));
         assert!(h.core.lease.held.is_none());
-        assert!(h.core.epoch_reclaim_pending(h.now));
+        assert!(h.core.epoch_reclaim_pending(Now::same(h.now.0)));
         let margin = h.core.cfg.expiry_margin_ms as i64;
         let renew = |h: &mut Harness, req: u64| {
             let out = h.step(Event::Peer {
@@ -19412,7 +19588,8 @@ mod locks {
         let held = h.meta.locks().held(ino).expect("still held");
         h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
         let mut out = Vec::new();
-        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        h.core
+            .on_lock_renew_tick(Now::same(h.now.0), &h.meta, &mut out);
         assert_eq!(h.core.stats.lock_lost, 0, "fenced: {out:?}");
         assert!(h
             .meta
@@ -19449,7 +19626,7 @@ mod locks {
         ));
         assert!(h.core.lease.held.is_none());
         assert_eq!(h.meta.locks().grants_len(), 2, "kept for the re-claim");
-        assert!(h.core.epoch_reclaim_pending(h.now));
+        assert!(h.core.epoch_reclaim_pending(Now::same(h.now.0)));
         // Node 2 took the lease over meanwhile, and released it later:
         // this node's acquisition replaces node 2's object.
         let mut other = lease_of(2, object.epoch + 1, h.now.0 + 5_000);
@@ -19490,15 +19667,15 @@ mod locks {
             &[1, 2],
             h.core.pr.carried,
         ));
-        assert!(h.core.epoch_reclaim_pending(h.now));
-        let view = h.core.epoch_claim_view(h.now);
+        assert!(h.core.epoch_reclaim_pending(Now::same(h.now.0)));
+        let view = h.core.epoch_claim_view(Now::same(h.now.0));
         assert_eq!(view.held.as_ref(), Some(&object), "{view:?}");
         let claim = view.claim(&[1, 2]).expect("claims the lease");
         assert_eq!(claim, (object.epoch, object.expires_unix_ms, true));
         // Bounded by the lease it let go: past its expiry (less the
         // margin) it claims nothing.
         let late = Ms(object.expires_unix_ms - h.core.cfg.expiry_margin_ms as i64);
-        assert!(h.core.epoch_claim_view(late).held.is_none());
+        assert!(h.core.epoch_claim_view(Now::same(late.0)).held.is_none());
         // S3 is cut again before the re-claim: the epoch carries it.
         let (carrier, stale_below) =
             crate::core::resolve_epoch_claims(&[(1, Some(claim), view.known), (2, None, 0)]);
@@ -19554,7 +19731,7 @@ mod locks {
             &[1, 2],
             h.core.pr.carried,
         ));
-        let view = h.core.epoch_claim_view(h.now);
+        let view = h.core.epoch_claim_view(Now::same(h.now.0));
         let claim = view.claim(&[1, 2]);
         let (carrier, stale_below) = crate::core::resolve_epoch_claims(&[
             (1, claim, view.known),
@@ -19577,7 +19754,7 @@ mod locks {
         assert!(!h.core.lease.epoch_held());
         assert_eq!(h.meta.locks().grants_len(), 0);
         assert!(h.core.pr.closed_tenure.is_empty());
-        assert!(!h.core.epoch_reclaim_pending(h.now));
+        assert!(!h.core.epoch_reclaim_pending(Now::same(h.now.0)));
     }
 
     /// Chunk epoch-liveness-gap, a member's side: node 2, in an epoch
@@ -19591,7 +19768,7 @@ mod locks {
         let mut h = Harness::new(2);
         h.core.cfg.p2p = true;
         h.core.cfg.epoch_slack = 1;
-        h.core.start(h.now, &h.meta, &mut Vec::new());
+        h.core.start(Now::same(h.now.0), &h.meta, &mut Vec::new());
         let carrier = crate::event::Carrier {
             node: 1,
             epoch: 1,
@@ -19621,7 +19798,7 @@ mod locks {
             })
             .collect();
         assert!(writes.is_empty(), "{writes:?}");
-        assert!(!h.core.epoch_reclaim_pending(h.now));
+        assert!(!h.core.epoch_reclaim_pending(Now::same(h.now.0)));
     }
 
     /// Review of chunk epoch-liveness-gap (should-fix 4): the member's
@@ -19637,7 +19814,7 @@ mod locks {
             let mut h = Harness::new(2);
             h.core.cfg.p2p = true;
             h.core.cfg.epoch_slack = 1;
-            h.core.start(h.now, &h.meta, &mut Vec::new());
+            h.core.start(Now::same(h.now.0), &h.meta, &mut Vec::new());
             let carrier = crate::event::Carrier {
                 node: 1,
                 epoch: 1,
@@ -19652,7 +19829,7 @@ mod locks {
                 h.core.nudged
                     || out
                         .iter()
-                        .any(|a| matches!(a, Action::SetTimer { at, .. } if *at == h.now))
+                        .any(|a| matches!(a, Action::SetTimer { after_ms: 0, .. }))
             };
             let out = h.step(epoch_report(true, false, false, &members, Some(carrier)));
             assert!(h.core.epoch_replacing);
@@ -19701,7 +19878,8 @@ mod locks {
         let held = h.meta.locks().held(ino).expect("still held");
         h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
         let mut out = Vec::new();
-        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        h.core
+            .on_lock_renew_tick(Now::same(h.now.0), &h.meta, &mut out);
         assert_eq!(h.core.stats.lock_lost, 0, "fenced: {out:?}");
     }
 
@@ -19752,7 +19930,7 @@ mod locks {
         ));
         let next = lease_of(1, object.epoch, object.expires_unix_ms + 3_000);
         h.core.epoch_tenure_cas_in_doubt(&object, &next);
-        let view = h.core.epoch_claim_view(h.now);
+        let view = h.core.epoch_claim_view(Now::same(h.now.0));
         let claimed = view.held.as_ref().expect("the closed lease is claimed");
         assert_eq!(
             (claimed.holder, claimed.epoch, claimed.expires_unix_ms),
@@ -19767,7 +19945,7 @@ mod locks {
         // the later one is unexpired.
         let margin = h.core.cfg.expiry_margin_ms as i64;
         let at = Ms(object.expires_unix_ms - margin + 1);
-        assert!(h.core.epoch_claim_view(at).held.is_none());
+        assert!(h.core.epoch_claim_view(Now::same(at.0)).held.is_none());
         let carrier = crate::event::Carrier {
             node: 1,
             epoch: next.epoch,
@@ -19796,11 +19974,14 @@ mod locks {
         let (mut h, _ino, _peer_ino, _peer_grant, object) = holder_with_grants_in_an_epoch();
         let carrier = h.core.pr.carried;
         h.step(epoch_report(false, false, false, &[1, 2], carrier));
-        assert!(h.core.epoch_claim_view(h.now).held.is_some());
+        assert!(h.core.epoch_claim_view(Now::same(h.now.0)).held.is_some());
         h.step(epoch_report(true, false, false, &[1, 2], carrier));
         assert!(!h.core.lease.epoch_held());
         h.advance((object.expires_unix_ms - h.now.0 + 100) as u64);
-        assert!(h.core.epoch_claim_view(h.now).held.is_none(), "expired");
+        assert!(
+            h.core.epoch_claim_view(Now::same(h.now.0)).held.is_none(),
+            "expired"
+        );
         h.step(epoch_report(true, true, false, &[1, 2], carrier));
         assert!(h.core.lease.epoch_held(), "the late activation holds it");
         assert_eq!(h.core.stats.epoch_closed_leases_reheld, 1);
@@ -19818,7 +19999,7 @@ mod locks {
         h.step(epoch_report(false, false, false, &[1, 2], carrier));
         let other = lease_of(1, object.epoch + 1, object.expires_unix_ms + 3_000);
         h.core.epoch_tenure_cas_in_doubt(&object, &other);
-        let view = h.core.epoch_claim_view(h.now);
+        let view = h.core.epoch_claim_view(Now::same(h.now.0));
         assert!(view.in_doubt);
         let claim = |members: &[NodeId]| view.claim(members).map(|c| c.2);
         assert_eq!(claim(&[1, 2]), Some(false));
@@ -19845,7 +20026,7 @@ mod locks {
             &[1, 2],
             h.core.pr.carried,
         ));
-        assert!(h.core.epoch_reclaim_pending(h.now));
+        assert!(h.core.epoch_reclaim_pending(Now::same(h.now.0)));
         let out = h.step(Event::Control {
             op: OpId(10),
             req: Control::Lock {
@@ -20199,7 +20380,8 @@ mod locks {
         h.advance((held.renew_at_ms - h.now.0).max(0) as u64);
         let renewals = h.core.stats.lock_renewals;
         let mut out = Vec::new();
-        h.core.on_lock_renew_tick(h.now, &h.meta, &mut out);
+        h.core
+            .on_lock_renew_tick(Now::same(h.now.0), &h.meta, &mut out);
         assert!(h.core.stats.lock_renewals > renewals, "{out:?}");
         assert!(
             s3_ops(&out).is_empty(),
@@ -20223,7 +20405,7 @@ mod locks {
         let next = h
             .core
             .lease
-            .granted_lease(h.now, &h.core.cfg, Some(&own), false);
+            .granted_lease(Now::same(h.now.0), &h.core.cfg, Some(&own), false);
         assert_eq!(next.epoch, 4);
         assert!(next.granted_delegations);
         let mut other = lease_of(2, 4, h.now.0 + 5_000);
@@ -20231,14 +20413,14 @@ mod locks {
         let next = h
             .core
             .lease
-            .granted_lease(h.now, &h.core.cfg, Some(&other), false);
+            .granted_lease(Now::same(h.now.0), &h.core.cfg, Some(&other), false);
         assert_eq!(next.epoch, 5);
         assert!(!next.granted_delegations);
         own.released = true;
         let next = h
             .core
             .lease
-            .granted_lease(h.now, &h.core.cfg, Some(&own), false);
+            .granted_lease(Now::same(h.now.0), &h.core.cfg, Some(&own), false);
         assert!(
             !next.granted_delegations,
             "a released lease ended its tenure"
@@ -20310,41 +20492,44 @@ mod locks {
         let mut h = Harness::new(2);
         h.core.idle_rounds = 10;
         let base = h.core.cfg.sync_interval_ms;
-        assert_eq!(h.core.next_poll_ms(h.now), h.core.cfg.idle_max_ms);
+        assert_eq!(
+            h.core.next_poll_ms(Now::same(h.now.0)),
+            h.core.cfg.idle_max_ms
+        );
         h.step(epoch_report(true, true, false, &[1, 2], None));
         assert!(h.core.epoch_refuses_writes());
         let mut seen = Vec::new();
         let poll = |h: &mut Harness| {
             let now = h.now;
-            h.core.on_poll(now, &h.meta, &mut Vec::new());
+            h.core.on_poll(Now::same(now.0), &h.meta, &mut Vec::new());
         };
         for _ in 0..5 {
-            seen.push(h.core.next_poll_ms(h.now));
+            seen.push(h.core.next_poll_ms(Now::same(h.now.0)));
             poll(&mut h);
         }
         assert_eq!(seen, vec![base, base, 2 * base, 4 * base, 4 * base]);
         let down = S3Result::SegmentRun(Err(crate::event::S3Failure("cut".into())));
         h.core.note_epoch_probe(&down);
         assert_eq!(
-            h.core.next_poll_ms(h.now),
+            h.core.next_poll_ms(Now::same(h.now.0)),
             4 * base,
             "a failure changes nothing"
         );
         h.core
             .note_epoch_probe(&S3Result::SegmentRun(Ok(Vec::new())));
-        assert_eq!(h.core.next_poll_ms(h.now), base, "S3 is back");
+        assert_eq!(h.core.next_poll_ms(Now::same(h.now.0)), base, "S3 is back");
         h.core
             .note_epoch_probe(&S3Result::SegmentRun(Ok(Vec::new())));
         poll(&mut h);
         poll(&mut h);
         assert_eq!(
-            h.core.next_poll_ms(h.now),
+            h.core.next_poll_ms(Now::same(h.now.0)),
             2 * base,
             "only a return after a failure resets"
         );
         // Closed: the idle backoff again.
         h.step(epoch_report(false, false, false, &[1, 2], None));
-        assert_ne!(h.core.next_poll_ms(h.now), 4 * base);
+        assert_ne!(h.core.next_poll_ms(Now::same(h.now.0)), 4 * base);
     }
 
     /// A held lease's poll fires when its renewal falls due (half its
@@ -20359,16 +20544,22 @@ mod locks {
         h.core.idle_rounds = 10;
         let half = (h.core.cfg.ttl_ms / 2) as i64;
         let lease = lease_of(1, 1, h.now.0 + half + 300);
-        h.core.lease.adopt(h.now, lease, tag(), None);
-        assert_eq!(h.core.next_poll_ms(h.now), 300);
+        h.core.lease.adopt(Now::same(h.now.0), lease, tag(), None);
+        assert_eq!(h.core.next_poll_ms(Now::same(h.now.0)), 300);
         // Due already (a renewal that failed): the quarter-TTL cap.
         let lease = lease_of(1, 1, h.now.0 + half - 10);
-        h.core.lease.adopt(h.now, lease, tag(), None);
-        assert_eq!(h.core.next_poll_ms(h.now), h.core.cfg.ttl_ms / 4);
+        h.core.lease.adopt(Now::same(h.now.0), lease, tag(), None);
+        assert_eq!(
+            h.core.next_poll_ms(Now::same(h.now.0)),
+            h.core.cfg.ttl_ms / 4
+        );
         // Far from due: the quarter-TTL cap as before.
         let lease = lease_of(1, 1, h.now.0 + 2 * half);
-        h.core.lease.adopt(h.now, lease, tag(), None);
-        assert_eq!(h.core.next_poll_ms(h.now), h.core.cfg.ttl_ms / 4);
+        h.core.lease.adopt(Now::same(h.now.0), lease, tag(), None);
+        assert_eq!(
+            h.core.next_poll_ms(Now::same(h.now.0)),
+            h.core.cfg.ttl_ms / 4
+        );
     }
 
     fn mutate_reply(out: &[Action], to: NodeId, req: u64) -> MutateOutcome {
@@ -20667,7 +20858,7 @@ mod locks {
         let dead = token(GrantId { node: 1, seq: 5 }, r.now.0 - 10);
         r.meta.queue_replay(rid, &op, &dead).unwrap();
         let mut out = Vec::new();
-        r.core.on_drain_tick(r.now, &r.meta, &mut out);
+        r.core.on_drain_tick(Now::same(r.now.0), &r.meta, &mut out);
         let req = match sends(&out).as_slice() {
             [(
                 1,
@@ -20707,7 +20898,7 @@ mod locks {
         for _ in 0..3 {
             r.advance(500);
             let mut out = Vec::new();
-            r.core.on_drain_tick(r.now, &r.meta, &mut out);
+            r.core.on_drain_tick(Now::same(r.now.0), &r.meta, &mut out);
             assert!(
                 !sends(&out)
                     .iter()
@@ -20731,7 +20922,7 @@ mod locks {
             .unwrap();
         let mut out = Vec::new();
         h.core
-            .replay_queue_locally(h.now, &h.meta, &mut out)
+            .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
             .unwrap();
         assert_ne!(mtime(&h, ino), 5, "not executed");
         let queued = h.meta.pending_replays().unwrap();
@@ -20944,7 +21135,7 @@ mod locks {
             r.meta.locks().tag_begin(&token(g, until), r.now.0);
         });
         let wait = timer_of(&out, TimerKind::LockReleaseWait);
-        let at = r.core.timers.get(&wait).map(|t| t.1).unwrap();
+        let at = r.core.timer_wall(wait).unwrap();
         assert!(at.0 >= r.now.0 + 200, "a slow fallback poll: {at:?}");
         let until = r.meta.locks().held(42).unwrap().until_ms;
         r.meta.locks().tag_end(&token(g, until), false, r.now.0);
@@ -21024,7 +21215,7 @@ mod locks {
     }
 
     fn reclaim(h: &mut Harness, members: &[NodeId], object: &mut Lease) {
-        assert!(h.core.epoch_reclaim_pending(h.now));
+        assert!(h.core.epoch_reclaim_pending(Now::same(h.now.0)));
         let fresh = h.meta.allocate_ino(ROOT_INO).unwrap();
         let out = h.step(Event::Control {
             op: OpId(1 << 30),
@@ -21215,7 +21406,8 @@ mod locks {
         // The keep was the close's alone: a real loss drops the table.
         h.core.lease.force_lost();
         let now = h.now;
-        h.core.deleg_on_lease_gone(now, &h.meta, &mut Vec::new());
+        h.core
+            .deleg_on_lease_gone(Now::same(now.0), &h.meta, &mut Vec::new());
         assert_eq!(h.meta.locks().grants_len(), 0, "the keep leaked");
     }
 
@@ -21235,7 +21427,7 @@ mod locks {
         let tag = token(peer_grant, h.now.0 + 100);
         let carried = h.core.pr.carried;
         h.step(epoch_report(false, false, false, &[1, 2, 3], carried));
-        assert!(h.core.epoch_reclaim_pending(h.now));
+        assert!(h.core.epoch_reclaim_pending(Now::same(h.now.0)));
         let out = request(&mut h, 3, 30, peer_ino, X, false);
         assert!(
             matches!(
@@ -21335,7 +21527,7 @@ mod locks {
         let cfg = h.core.cfg.clone();
         h.core = Core::new(cfg);
         let now = h.now;
-        h.core.start(now, &h.meta, &mut Vec::new());
+        h.core.start(Now::same(now.0), &h.meta, &mut Vec::new());
         let horizon = h
             .meta
             .load_lock_quarantine(h.now.0)
@@ -21365,7 +21557,7 @@ mod locks {
         let tag = token(peer_grant, h.now.0 + 100);
         let carried = h.core.pr.carried;
         h.step(epoch_report(false, false, false, &[1, 2, 3], carried));
-        assert!(h.core.epoch_reclaim_pending(h.now));
+        assert!(h.core.epoch_reclaim_pending(Now::same(h.now.0)));
         let rid = peer_rid(2, 1);
         // The forward brings the re-claim.
         let mut out = forward_tagged(&mut h, 2, 40, rid, setattr_mtime(peer_ino, 2), tag.clone());
@@ -21503,7 +21695,7 @@ mod locks {
         h.now = Ms(window2 + 500);
         h.hold(2, None);
         let now = h.now;
-        h.core.lock_install_mirror(now, &h.meta);
+        h.core.lock_install_mirror(Now::same(now.0), &h.meta);
         assert!(
             h.meta.locks().get(g2).is_some(),
             "installed from the mirror"
@@ -21513,7 +21705,7 @@ mod locks {
         batch.ops[0].lock_tag = token(g2, window2).to_wire();
         let mut out = Vec::new();
         h.core
-            .inbox_drain(h.now, vec![batch], &h.meta, &mut out)
+            .inbox_drain(Now::same(h.now.0), vec![batch], &h.meta, &mut out)
             .unwrap();
         assert_eq!(mtime(&h, ino), before, "the stale op did not execute");
         assert_eq!(h.meta.locks().stats().token_rejections, 1);
@@ -21657,7 +21849,7 @@ mod locks {
         assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
         let mut tick = timer_of(&out, TimerKind::LockRenewTick);
         let renew = loop {
-            r.now = r.core.timer_at(tick).expect("armed");
+            r.now = r.core.timer_wall(tick).expect("armed");
             let out = r.step(Event::Timer { id: tick });
             if let Some(req) = sends(&out).into_iter().find_map(|(to, m)| match m {
                 PeerMsg::LockRenew { req, .. } if to == 1 => Some(*req),
@@ -21681,7 +21873,7 @@ mod locks {
         });
         assert_eq!(r.core.lease.cached_holder, None, "{out:?}");
         let tick = timer_of(&out, TimerKind::LockRenewTick);
-        r.now = r.core.timer_at(tick).expect("armed");
+        r.now = r.core.timer_wall(tick).expect("armed");
         let out = r.step(Event::Timer { id: tick });
         assert!(
             !sends(&out)
@@ -21718,7 +21910,8 @@ mod locks {
         delegated_file(&h.meta);
         let mut out = Vec::new();
         let inherited = h.now;
-        h.core.delegation_sync(inherited, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(inherited.0), &h.meta, &mut out);
         let expiry = timer_of(&out, TimerKind::DelegExpiry);
         let w = h.core.cfg.backup_takeover_ms as i64;
         let ttl = h.core.cfg.delegation_ttl_ms as i64;
@@ -21727,7 +21920,7 @@ mod locks {
         // of the window the delegate honours for it (its send no later).
         let last = inherited.0 + w - 1;
         let honoured = last + ttl - margin;
-        let at = h.core.timer_at(expiry).expect("armed").0;
+        let at = h.core.timer_wall(expiry).expect("armed").0;
         assert!(
             at >= honoured + 2 * margin,
             "outwaited at {at}, the delegate may honour until {honoured}"
@@ -21739,10 +21932,11 @@ mod locks {
         h.hold(2, None);
         delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let expiry = timer_of(&out, TimerKind::DelegExpiry);
         assert_eq!(
-            h.core.timer_at(expiry),
+            h.core.timer_wall(expiry),
             Some(h.now.plus(h.core.reclaim_horizon_ms()))
         );
     }
@@ -21755,7 +21949,7 @@ mod locks {
         let (mut lease, tag) = h.core.lease.held.clone().expect("held");
         lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
         lease.backups = vec![4];
-        h.core.lease.adopt(h.now, lease, tag, None);
+        h.core.lease.adopt(Now::same(h.now.0), lease, tag, None);
         h.core.ack.last_s3_fresh = h.now;
         assert!(h.core.fast_tenure());
     }
@@ -21801,7 +21995,7 @@ mod locks {
         let held = h.meta.locks().held(ino).expect("installed");
         let mut tick = timer_of(&out, TimerKind::LockRenewTick);
         loop {
-            let at = h.core.timer_at(tick).expect("armed");
+            let at = h.core.timer_wall(tick).expect("armed");
             h.now = at;
             let out = h.step(Event::Timer { id: tick });
             if at.0 >= held.renew_at_ms {
@@ -21983,7 +22177,9 @@ mod locks {
         let (mut h, ino) = fast_holder_with_file();
         let (mut lease, held_tag) = h.core.lease.held.clone().unwrap();
         lease.granted_delegations = false;
-        h.core.lease.adopt(h.now, lease, held_tag, None);
+        h.core
+            .lease
+            .adopt(Now::same(h.now.0), lease, held_tag, None);
         h.meta.read_delegations().set_quarantine(h.now.0 + 3_000);
         let ghost = GrantId { node: 9, seq: 1 };
         let out = peer_renew(&mut h, 20, ino, ghost);
@@ -22058,7 +22254,8 @@ mod locks {
             hold_fast(&mut h);
             delegated_file(&h.meta);
             let mut out = Vec::new();
-            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            h.core
+                .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
             h.advance(2_000);
             let now = h.now.0;
             let out = renew_gen7(&mut h, 90, 0, now);
@@ -22145,7 +22342,8 @@ mod locks {
             h.hold(1, None);
             delegated_file(&h.meta);
             let mut out = Vec::new();
-            h.core.delegation_sync(h.now, &h.meta, &mut out);
+            h.core
+                .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
             h
         };
         // 4.7 s of the lease left (its renewal is due at 3 s): the answer
@@ -22153,7 +22351,10 @@ mod locks {
         // at 1.7 s, under the 2 s a grant needs.
         let mut h = root();
         lease_left(&mut h, 4_700);
-        assert!(h.core.renew_due_in_ms(h.now).is_some(), "due by the clock");
+        assert!(
+            h.core.renew_due_in_ms(Now::same(h.now.0)).is_some(),
+            "due by the clock"
+        );
         let now = h.now.0;
         let out = renew_gen7(&mut h, 90, 0, now);
         assert_eq!(deleg_answer(&out), Some(3_700), "{out:?}");
@@ -22231,11 +22432,14 @@ mod locks {
         h.core.cfg.lock_ttl_ms = 20_000;
         lease_left(&mut h, 1_900);
         let out = request(&mut h, 2, 7, ino, X, true);
-        let now = h.now;
         assert!(
             out.iter().any(|a| matches!(
                 a,
-                Action::SetTimer { kind: TimerKind::Poll, at, .. } if *at == now
+                Action::SetTimer {
+                    kind: TimerKind::Poll,
+                    after_ms: 0,
+                    ..
+                }
             )),
             "a due renewal a capped grant needs waits for the idle poll: {out:?}"
         );
@@ -22344,7 +22548,8 @@ mod locks {
         h.meta.set_node_prefix(1).unwrap();
         let (dir, f) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let req = renew_req(&out, 7).expect("the first renewal");
         (h, dir, f, req)
     }
@@ -22359,7 +22564,8 @@ mod locks {
         h.hold(1, None);
         let (dir, f) = delegated_file(&h.meta);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let out = h.step(Event::Control {
             op: OpId(1 << 50),
             req: Control::Undelegate { dir },
@@ -22506,7 +22712,7 @@ mod locks {
         delegate_to_3(&r.meta, dir, 7);
         r.core.lock_on_delegated(7, &r.meta);
         assert_eq!(r.meta.locks().grants_len(), 0, "moved out of the table");
-        let (grants, carry) = r.core.lock_take_handoff(r.now, 7);
+        let (grants, carry) = r.core.lock_take_handoff(Now::same(r.now.0), 7);
         let left = (until - r.now.0) as u64;
         assert_eq!(grants.len(), 1);
         assert_eq!(carry, vec![(g, left)]);
@@ -22565,7 +22771,7 @@ mod locks {
         )
         .unwrap();
         r.core.lock_on_delegated(8, &r.meta);
-        let (grants, carry) = r.core.lock_take_handoff(t2, 8);
+        let (grants, carry) = r.core.lock_take_handoff(Now::same(t2.0), 8);
         assert_eq!(carry.len(), 1, "carried again: {carry:?}");
         let (mut d2, _, _, req) = carry_delegate(TTL);
         d2.now = t2;
@@ -22574,7 +22780,7 @@ mod locks {
         // A waiter behind it: the grant is outwaited at its record's end.
         let out = request(&mut d2, 5, 30, f, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
-        let end = d2.core.timer_at(expiry).unwrap();
+        let end = d2.core.timer_wall(expiry).unwrap();
         assert_eq!(end.0, until + 2 * margin, "outwaited at its record's end");
         assert!(
             end.0 < t2.0 + TTL as i64 + margin,
@@ -22713,7 +22919,7 @@ mod locks {
         // A waiter behind it: recalled, outwaited at the record's end.
         let out = request(&mut r, 5, 30, f, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
-        assert_eq!(r.core.timer_at(expiry), Some(Ms(r.now.0 + margin)));
+        assert_eq!(r.core.timer_wall(expiry), Some(Ms(r.now.0 + margin)));
         r.advance(margin as u64);
         let out = r.step(Event::Timer { id: expiry });
         assert_eq!(r.core.stats.lock_recalls_expired, 1);
@@ -22734,11 +22940,11 @@ mod locks {
         r.advance(2_000);
         delegate_to_3(&r.meta, dir, 7);
         r.core.lock_on_delegated(7, &r.meta);
-        let (grants1, carry1) = r.core.lock_take_handoff(r.now, 7);
+        let (grants1, carry1) = r.core.lock_take_handoff(Now::same(r.now.0), 7);
         assert_eq!(carry1, vec![(g, (until - r.now.0) as u64)]);
         let t1 = r.now;
         r.advance(1_000);
-        let (grants2, carry2) = r.core.lock_take_handoff(r.now, 7);
+        let (grants2, carry2) = r.core.lock_take_handoff(Now::same(r.now.0), 7);
         assert_eq!(grants2.len(), 1);
         assert_eq!(carry2, vec![(g, (until - r.now.0) as u64)]);
         assert_eq!(carry2[0].1 + 1_000, carry1[0].1, "one second less");
@@ -22752,13 +22958,13 @@ mod locks {
         assert_eq!(first, t1.0 + (until - t1.0) + margin);
         d.now = r.now;
         d.core
-            .lock_install_moved(d.now, 7, grants2, &carry2, &d.meta);
+            .lock_install_moved(Now::same(d.now.0), 7, grants2, &carry2, &d.meta);
         assert_eq!(record_end(&d, g), first, "installed twice");
         assert_eq!(d.core.stats.lock_moved_carried, 1);
         // A copy that is gone from the root's table and from its
         // handed copies carries nothing: past its end it is not sent.
         r.now = Ms(until + 1);
-        let (grants3, carry3) = r.core.lock_take_handoff(r.now, 7);
+        let (grants3, carry3) = r.core.lock_take_handoff(Now::same(r.now.0), 7);
         assert!(grants3.is_empty() && carry3.is_empty());
     }
 
@@ -22771,7 +22977,7 @@ mod locks {
         r.advance(3_000);
         delegate_to_3(&r.meta, dir, 7);
         r.core.lock_on_delegated(7, &r.meta);
-        let (grants, carry) = r.core.lock_take_handoff(r.now, 7);
+        let (grants, carry) = r.core.lock_take_handoff(Now::same(r.now.0), 7);
         let (mut d, ddir, df, req) = carry_delegate(5_000);
         d.now = r.now;
         handoff_to(&mut d, req, grants, carry);
@@ -22821,14 +23027,14 @@ mod locks {
         r.advance(3_000);
         delegate_to_3(&r.meta, dir, 7);
         r.core.lock_on_delegated(7, &r.meta);
-        let (grants, carry) = r.core.lock_take_handoff(r.now, 7);
+        let (grants, carry) = r.core.lock_take_handoff(Now::same(r.now.0), 7);
         let (mut d, _, df, req) = carry_delegate(5_000);
         d.now = r.now;
         handoff_to(&mut d, req, grants, carry);
         // A waiter behind it recalls it; nobody answers: outwaited.
         let out = request(&mut d, 5, 30, df, X, true);
         let expiry = timer_of(&out, TimerKind::LockGrantExpiry);
-        d.now = d.core.timer_at(expiry).unwrap();
+        d.now = d.core.timer_wall(expiry).unwrap();
         d.step(Event::Timer { id: expiry });
         assert_eq!(d.core.stats.lock_recalls_expired, 1);
         assert_eq!(d.core.lock_unused_grants(4), 0, "counted unused: {g:?}");
@@ -22887,7 +23093,8 @@ fn undelegate_refuses_a_designation() {
     )
     .unwrap();
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let out = h.step(Event::Control {
         op: OpId(1 << 50),
         req: Control::Undelegate { dir },
@@ -23111,7 +23318,7 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
     ];
     let mut out = Vec::new();
     h.core
-        .inbox_drain(h.now, batches, &h.meta, &mut out)
+        .inbox_drain(Now::same(h.now.0), batches, &h.meta, &mut out)
         .unwrap();
     assert!(
         h.meta.child_ino(ROOT_INO, "c").unwrap().is_some(),
@@ -23138,9 +23345,11 @@ fn the_takeover_drain_defers_only_the_delegated_requester() {
     )
     .unwrap();
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let mut out = Vec::new();
-    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    h.core
+        .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(h.meta.child_ino(dir, "a").unwrap().is_some());
     assert!(h.meta.child_ino(ROOT_INO, "b").unwrap().is_some());
     assert_eq!(inbox_deletes(&out), vec![(1, 2, 0), (1, 2, 1)]);
@@ -23182,14 +23391,16 @@ fn an_inbox_op_waits_for_its_deps() {
         .to_postcard();
     let mut out = Vec::new();
     h.core
-        .inbox_drain(h.now, vec![batch], &h.meta, &mut out)
+        .inbox_drain(Now::same(h.now.0), vec![batch], &h.meta, &mut out)
         .unwrap();
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none());
     assert_eq!(h.core.inbox.leftover.len(), 1, "deferred by the drain");
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let mut out = Vec::new();
-    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    h.core
+        .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(
         h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none(),
         "still waiting for the delegate's stream"
@@ -23197,7 +23408,8 @@ fn an_inbox_op_waits_for_its_deps() {
     // The delegate's stream through index 5 is here: it runs.
     crate::replica::Replica::note_stream(&h.meta, 1, 5);
     let mut out = Vec::new();
-    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    h.core
+        .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
     assert_eq!(inbox_deletes(&out), vec![(1, 2, 0)]);
 }
@@ -23266,7 +23478,8 @@ fn a_delegate_reply_base_covers_what_it_applied_before_the_grant_and_streamed_st
         }],
     );
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     assert_eq!(h.core.deleg_view().mine.len(), 1);
     // The root's stream carries a create of `d1/g` ahead of the log.
     let g = (1u64 << 40) | 78;
@@ -23352,7 +23565,7 @@ fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
     /// Run one round from the poll timer; whether it released the lease.
     fn round_releases(h: &mut Harness) -> bool {
         let mut out = Vec::new();
-        h.core.start(h.now, &h.meta, &mut out);
+        h.core.start(Now::same(h.now.0), &h.meta, &mut out);
         let Some(poll) = timers(&out, TimerKind::Poll).first().copied() else {
             return false;
         };
@@ -23404,11 +23617,11 @@ fn a_wanter_across_a_p2p_partition_does_not_take_the_lease_from_its_users() {
         // `wants_lease`), and the near side forwarded, within the window.
         h.advance(6_000);
         for w in &wanters {
-            h.core.note_demand(h.now, *w, false);
-            h.core.lease.note_wanted(h.now, *w);
+            h.core.note_demand(Now::same(h.now.0), *w, false);
+            h.core.lease.note_wanted(Now::same(h.now.0), *w);
         }
         for u in p2p_users {
-            h.core.note_demand(h.now, *u, true);
+            h.core.note_demand(Now::same(h.now.0), *u, true);
         }
         h.advance(h.core.config().wanted_grace_ms + 100);
         let released = round_releases(&mut h);
@@ -23442,7 +23655,7 @@ fn a_frozen_epoch_carrying_no_lease_is_closed_once_s3_is_back() {
         },
     });
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
     let out = h.step(Event::Timer { id: poll });
     let probe = s3_ops(&out)
@@ -23503,7 +23716,7 @@ fn a_hold_owner_with_nothing_to_flush_reclaims_the_carried_lease_at_the_close() 
     h.step(state(true, true, false));
     assert!(h.core.lease.epoch_held());
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let (mut closed, mut reclaimed) = (false, None);
     for _ in 0..200 {
         if reclaimed.is_some() {
@@ -23610,7 +23823,7 @@ fn an_epoch_carrying_a_lease_being_released_is_closed_and_reclaimed_by_its_carri
     h.step(state(true, true, false, false));
     assert!(!h.core.lease.epoch_held(), "the given-up lease re-adopted");
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let (mut closed, mut reclaimed) = (false, None);
     for _ in 0..200 {
         if reclaimed.is_some() {
@@ -23728,7 +23941,7 @@ fn epoch_probe_until_close(
     object: Lease,
 ) -> (bool, Option<Lease>) {
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let (mut closed, mut reclaimed) = (false, None);
     for _ in 0..200 {
         if reclaimed.is_some() {
@@ -23925,7 +24138,7 @@ fn an_activation_carrying_a_released_lease_owes_the_move_and_adopts_nothing() {
     let cfg = h.core.config().clone();
     h.core = Core::new(cfg);
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     h.step(epoch_report(carrier, true, true, false, false));
     assert!(
         !h.core.lease.epoch_held(),
@@ -23963,7 +24176,7 @@ fn a_restart_after_the_release_cas_went_out_owes_the_move_instead_of_holding() {
     let cfg = h.core.config().clone();
     h.core = Core::new(cfg);
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     h.step(epoch_report(carrier, true, true, false, false));
     assert!(
         !h.core.lease.epoch_held(),
@@ -24022,7 +24235,7 @@ fn the_release_record_is_cleared_by_a_kept_release_and_by_an_acquisition() {
     let cfg = h.core.config().clone();
     h.core = Core::new(cfg);
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     assert_eq!(
         h.core.pr.released,
         Some((carried.epoch, carried.expires_unix_ms))
@@ -24158,7 +24371,7 @@ fn an_outage_during_a_release_that_ends_kept_serves_writes() {
     let carried = h.core.lease.held.as_ref().unwrap().0.clone();
     let carrier = carrier_of(&carried);
     let release = handoff_release_in_flight(&mut h);
-    let claim = h.core.epoch_claim_view(h.now).held;
+    let claim = h.core.epoch_claim_view(Now::same(h.now.0)).held;
     assert_eq!(
         claim.map(|l| (l.epoch, l.expires_unix_ms)),
         Some((carried.epoch, carried.expires_unix_ms)),
@@ -24232,7 +24445,7 @@ fn a_member_closes_once_the_carried_lease_has_moved_and_uploads_meanwhile() {
             });
             assert!(!h.core.lease.epoch_held(), "node 1 carries the epoch");
             let mut out = Vec::new();
-            h.core.start(h.now, &h.meta, &mut out);
+            h.core.start(Now::same(h.now.0), &h.meta, &mut out);
             let poll = timers(&out, TimerKind::Poll)[0];
             let out = h.step(Event::Timer { id: poll });
             let probe = s3_ops(&out)
@@ -24414,7 +24627,8 @@ fn an_inbox_op_is_forwarded_once_the_holder_is_reachable() {
         tag: Default::default(),
     });
     // Into the inbox (as when the forward could not be sent).
-    h.core.inbox_enqueue(h.now, rid, 1, &h.meta, &mut out);
+    h.core
+        .inbox_enqueue(Now::same(h.now.0), rid, 1, &h.meta, &mut out);
     for _ in 0..6 {
         let ops: Vec<(OpId, S3Op)> = s3_ops(&out)
             .into_iter()
@@ -24538,7 +24752,8 @@ fn a_flapping_p2p_link_never_polls_an_idle_requester_faster_than_its_backoff() {
                 links(h, (t / 5_000) % 2 == 1);
             }
             let mut out = Vec::new();
-            h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+            h.core
+                .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
             while let Some((op, node)) = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
                 S3Op::InboxRun {
                     node, from, width, ..
@@ -24596,7 +24811,7 @@ fn a_flapping_p2p_link_never_polls_an_idle_requester_faster_than_its_backoff() {
     // and still never polls faster than one that stayed down all along.
     let mut h = Harness::new(1);
     h.hold(1, None);
-    h.core.note_demand(h.now, 2, true);
+    h.core.note_demand(Now::same(h.now.0), 2, true);
     let polls = flap(&mut h);
     let continuous = {
         let mut b = constellation_store_s3::inbox::PollBackoff::two_tier(
@@ -24641,7 +24856,7 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
     let mut h = Harness::new(1);
     h.hold(1, None);
     // Node 2 wrote over P2P a moment ago, and its link is down now.
-    h.core.note_demand(h.now, 2, true);
+    h.core.note_demand(Now::same(h.now.0), 2, true);
     h.step(Event::Peers {
         links: vec![crate::event::PeerLink {
             node: 2,
@@ -24665,7 +24880,8 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
         })
     };
     let mut out = Vec::new();
-    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    h.core
+        .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     let (op, from, width) = poll(&out).expect("polled at once");
     assert_eq!((from, width), (0, 1));
     let a = h.create("a");
@@ -24677,7 +24893,8 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
     // Saturated at width 1: polled again at once, at full width.
     let mut out = out;
     if poll(&out).is_none() {
-        h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+        h.core
+            .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     }
     let (op, from, width) = poll(&out).expect("a one-GET hit is followed at once");
     assert_eq!((from, width), (1, full));
@@ -24688,7 +24905,8 @@ fn an_inbox_poll_is_one_get_until_it_hits() {
     // Hot: the next poll is soon and still full width.
     h.advance(h.core.cfg.inbox_hot_ms);
     let mut out = Vec::new();
-    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    h.core
+        .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     let (_, from, width) = poll(&out).expect("hot after a hit");
     assert_eq!((from, width), (1, full));
 }
@@ -24756,7 +24974,8 @@ fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted(
             tag: Default::default(),
         }));
         // Into the inbox (as when the forward could not be sent).
-        h.core.inbox_enqueue(h.now, rid, 1, &h.meta, &mut out);
+        h.core
+            .inbox_enqueue(Now::same(h.now.0), rid, 1, &h.meta, &mut out);
     }
     let (_, puts) = land_inbox_puts(&mut h, out);
     assert_eq!(puts.len(), 1, "a and b share one batch: {puts:?}");
@@ -24765,7 +24984,8 @@ fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted(
 
     // a finds a P2P path (or must be held back): withdrawn first.
     let mut out = Vec::new();
-    h.core.send_forward(h.now, a, 2, &h.meta, &mut out);
+    h.core
+        .send_forward(Now::same(h.now.0), a, 2, &h.meta, &mut out);
     let (op, req) = s3_ops(&out)[0];
     match req {
         S3Op::InboxTombstone { batch } => {
@@ -24796,7 +25016,8 @@ fn a_withdrawn_inbox_batch_leaves_a_tombstone_and_its_other_ops_are_resubmitted(
         op: h.create("c"),
         tag: Default::default(),
     }));
-    h.core.inbox_enqueue(h.now, c, 1, &h.meta, &mut out);
+    h.core
+        .inbox_enqueue(Now::same(h.now.0), c, 1, &h.meta, &mut out);
     let (_, puts) = land_inbox_puts(&mut h, out);
     let rids: Vec<Vec<u64>> = puts
         .iter()
@@ -24831,7 +25052,7 @@ fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
     use constellation_store_s3::inbox::{InboxBatch, InboxKey};
     let mut h = Harness::new(1);
     h.hold(1, None);
-    h.core.note_demand(h.now, 2, true);
+    h.core.note_demand(Now::same(h.now.0), 2, true);
     h.step(Event::Peers {
         links: vec![crate::event::PeerLink {
             node: 2,
@@ -24848,7 +25069,8 @@ fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
         })
     };
     let mut out = Vec::new();
-    h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+    h.core
+        .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     let (op, from) = poll(&out).expect("polled");
     assert_eq!(from, 0);
     let tombstone = InboxBatch::tombstone(
@@ -24865,7 +25087,8 @@ fn a_holder_steps_past_a_withdrawn_batch_to_the_requesters_next_one() {
         result: S3Result::InboxRun(Ok(vec![tombstone])),
     });
     if poll(&out).is_none() {
-        h.core.inbox_holder_tick(h.now, &h.meta, &mut out);
+        h.core
+            .inbox_holder_tick(Now::same(h.now.0), &h.meta, &mut out);
     }
     let (op, from) = poll(&out).expect("polled again at once past the tombstone");
     assert_eq!(from, 1, "the cursor steps past the withdrawn batch");
@@ -25043,7 +25266,7 @@ fn a_continuation_epoch_is_not_a_stall() {
 fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
     let mut h = Harness::new(1);
     let own = lease_of(1, 3, h.now.plus(30_000).0);
-    h.core.lease.note_object(h.now, &own);
+    h.core.lease.note_object(Now::same(h.now.0), &own);
     let op = h.create("a");
     let request = |req: u64| PeerMsg::MutateRequest {
         req: OpId(req),
@@ -25123,7 +25346,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
         let mut h = Harness::new(1);
         h.core
             .lease
-            .note_object(h.now, &lease_of(1, 3, h.now.plus(30_000).0));
+            .note_object(Now::same(h.now.0), &lease_of(1, 3, h.now.plus(30_000).0));
         let op = h.create("a");
         let out = h.step(Event::Peer {
             from: 2,
@@ -25200,7 +25423,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
 fn a_released_lease_is_not_readopted_for_a_forward() {
     let mut h = Harness::new(1);
     h.core.lease.note_object(
-        h.now,
+        Now::same(h.now.0),
         &Lease {
             released: true,
             ..lease_of(1, 3, h.now.plus(30_000).0)
@@ -25246,7 +25469,7 @@ fn a_node_reads_the_lease_at_start() {
     let meta = Meta::open_in_memory().unwrap();
     let mut core = Core::new(Config::defaults(1, 1));
     let mut out = Vec::new();
-    core.start(Ms(0), &meta, &mut out);
+    core.start(Now::same(0), &meta, &mut out);
     assert!(
         s3_ops(&out)
             .iter()
@@ -25489,7 +25712,8 @@ fn a_barrier_inside_a_delegated_subtree_does_not_reach_the_delegate() {
     )
     .unwrap();
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     assert!(
         h.core
             .deleg_view()
@@ -25782,7 +26006,7 @@ fn a_barrier_around_a_deposition_waits_for_the_replay_not_the_strand() {
     // The round renews past half-TTL and loses the CAS to a takeover.
     h.advance(6_000);
     let mut out = Vec::new();
-    h.core.start(h.now, &h.meta, &mut out);
+    h.core.start(Now::same(h.now.0), &h.meta, &mut out);
     let poll = timers(&out, TimerKind::Poll)[0];
     let out = h.step(Event::Timer { id: poll });
     let upload = out
@@ -25918,7 +26142,8 @@ fn placement_re_reads_the_roster_for_a_connected_writer_it_does_not_list() {
     }
     let tick = |h: &mut Harness| {
         let (now, mut out) = (h.now, Vec::new());
-        h.core.on_placement_timer(now, &h.meta, &mut out);
+        h.core
+            .on_placement_timer(Now::same(now.0), &h.meta, &mut out);
         out
     };
     let refreshes = |out: &[Action]| {
@@ -26094,7 +26319,7 @@ fn a_restarted_delegate_readopts_its_delegation_at_start() {
     core.lease.cached_holder = Some(1);
     let now = Ms(1_000_000);
     let mut out = Vec::new();
-    core.start(now, &meta, &mut out);
+    core.start(Now::same(now.0), &meta, &mut out);
     assert!(core.dl.mine.contains_key(&7), "not re-adopted at start");
     let req = renew_req(&out, 7).expect("no renewal sent at start");
     assert!(
@@ -26160,7 +26385,8 @@ fn a_delegates_late_answers_still_count() {
     h.core.lease.cached_holder = Some(1);
     let dir = delegated_to_me(&h.meta, 3);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
     let ttl = 5_000;
     let margin = h.core.cfg.expiry_margin_ms;
@@ -26257,7 +26483,8 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
     h.core.lease.cached_holder = Some(1);
     let dir = delegated_to_me(&h.meta, 3);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
     h.step(renewed(&h, req, 7, 5_000));
     let batch_to = |out: &[Action], root: NodeId| {
@@ -26350,7 +26577,8 @@ fn streaming_delegate() -> (Harness, constellation_fs_core::Ino) {
     h.core.lease.cached_holder = Some(1);
     let dir = delegated_to_me(&h.meta, 3);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
     h.step(renewed(&h, req, 7, 5_000));
     (h, dir)
@@ -26651,7 +26879,8 @@ fn an_answer_to_a_previous_incarnation_does_not_count() {
         h.core.lease.cached_holder = Some(1);
         delegated_to_me(&h.meta, 3);
         let mut out = Vec::new();
-        h.core.delegation_sync(h.now, &h.meta, &mut out);
+        h.core
+            .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
         let req = renew_req(&out, 7).expect("no renewal on install");
         (h, req)
     };
@@ -26697,7 +26926,8 @@ fn a_root_seals_a_delegate_only_on_real_silence() {
     h.hold(1, None);
     let (dir, _) = locks::delegated_file(&h.meta);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     assert!(h.core.dl.gens.contains_key(&7));
     h.step(Event::Peer {
         from: 3,
@@ -26741,7 +26971,7 @@ fn a_root_seals_a_delegate_only_on_real_silence() {
             .core
             .timers
             .iter()
-            .filter(|(_, (t, at))| matches!(t, Timer::DelegExpiry(7)) && *at <= h.now)
+            .filter(|(_, (t, at))| matches!(t, Timer::DelegExpiry(7)) && at.wall() <= h.now)
             .map(|(id, _)| *id)
             .collect();
         let mut sealed = false;
@@ -26797,7 +27027,8 @@ fn delegate_parked_on_a_silent_root() -> (Harness, constellation_fs_core::Ino, R
     h.core.lease.cached_holder = Some(1);
     let dir = delegated_to_me(&h.meta, 3);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
     let ttl = 5_000;
     let margin = h.core.cfg.expiry_margin_ms;
@@ -26974,7 +27205,8 @@ fn delegate_renewed_once() -> (Harness, constellation_fs_core::Ino, Ms, TimerId)
     h.core.lease.cached_holder = Some(1);
     let dir = delegated_to_me(&h.meta, 3);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
     let t0 = h.now;
     let out = h.step(renewed(&h, req, 7, 5_000));
@@ -27237,7 +27469,8 @@ fn a_generation_the_log_ended_after_its_grant_ran_out_under_a_freeze_is_counted(
         until: t0.plus(6_100),
     });
     let mut out = Vec::new();
-    h.core.drop_delegate_state(h.now, 7, &h.meta, &mut out);
+    h.core
+        .drop_delegate_state(Now::same(h.now.0), 7, &h.meta, &mut out);
     assert_eq!(h.core.stats.deleg_lapses_frozen, 1);
     assert_eq!(h.core.stats.deleg_last_freeze_gen, 7);
     // Recalled before: not a loss.
@@ -27248,7 +27481,8 @@ fn a_generation_the_log_ended_after_its_grant_ran_out_under_a_freeze_is_counted(
         until: t0.plus(6_100),
     });
     h.core.dl.mine.get_mut(&7).unwrap().stopped = true;
-    h.core.drop_delegate_state(h.now, 7, &h.meta, &mut out);
+    h.core
+        .drop_delegate_state(Now::same(h.now.0), 7, &h.meta, &mut out);
     assert_eq!(h.core.stats.deleg_lapses_frozen, 0);
     // Grant still honoured: not a loss.
     let (mut h, _dir, t0, _lapse) = delegate_renewed_once();
@@ -27257,7 +27491,8 @@ fn a_generation_the_log_ended_after_its_grant_ran_out_under_a_freeze_is_counted(
         from: t0.plus(100),
         until: t0.plus(2_900),
     });
-    h.core.drop_delegate_state(h.now, 7, &h.meta, &mut out);
+    h.core
+        .drop_delegate_state(Now::same(h.now.0), 7, &h.meta, &mut out);
     assert_eq!(h.core.stats.deleg_lapses_frozen, 0);
 }
 
@@ -27385,7 +27620,8 @@ fn deleg_renew_cert_before_the_first_answer_and_after_a_core_renewal() {
     h.core.lease.cached_holder = Some(1);
     let _dir = delegated_to_me(&h.meta, 3);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     let req = renew_req(&out, 7).expect("no renewal on install");
     let t0 = h.now;
     let timeout = h.core.deleg_request_timeout_ms();
@@ -27422,7 +27658,8 @@ fn root_with_delegate_backed_by(backup: NodeId) -> Harness {
     h.hold(1, None);
     let _ = delegated_to_me(&h.meta, 3);
     let mut out = Vec::new();
-    h.core.delegation_sync(h.now, &h.meta, &mut out);
+    h.core
+        .delegation_sync(Now::same(h.now.0), &h.meta, &mut out);
     assert!(h.core.dl.gens.contains_key(&7));
     h.step(Event::Peer {
         from: 3,
@@ -27558,11 +27795,11 @@ fn root_lease(holder: NodeId, epoch: Epoch, expires: Ms) -> Lease {
 fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_out() {
     let (mut h, _rid, _) = awaiting_log_forward("dr");
     let mut out = Vec::new();
-    h.core.dead_root_check(h.now, &mut out);
+    h.core.dead_root_check(Now::same(h.now.0), &mut out);
     assert!(s3_ops(&out).is_empty(), "read within the grace: {out:?}");
     h.advance(h.core.cfg.inbox_p2p_grace_ms);
     let mut out = Vec::new();
-    h.core.dead_root_check(h.now, &mut out);
+    h.core.dead_root_check(Now::same(h.now.0), &mut out);
     let read = s3_ops(&out);
     assert!(
         matches!(read.as_slice(), [(_, S3Op::LeaseGet)]),
@@ -27571,7 +27808,7 @@ fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_
     let op = read[0].0;
     // One read at a time.
     let mut again = Vec::new();
-    h.core.dead_root_check(h.now, &mut again);
+    h.core.dead_root_check(Now::same(h.now.0), &mut again);
     assert!(s3_ops(&again).is_empty(), "{again:?}");
     // A live root: nothing is asked of it.
     let live = root_lease(1, 1, h.now.plus(5_000));
@@ -27590,7 +27827,7 @@ fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_
     // Seen live, the lease is not read again before the expiry it showed.
     h.advance(4_999);
     let mut out = Vec::new();
-    h.core.dead_root_check(h.now, &mut out);
+    h.core.dead_root_check(Now::same(h.now.0), &mut out);
     assert!(
         s3_ops(&out).is_empty(),
         "re-read a lease seen live: {out:?}"
@@ -27598,7 +27835,7 @@ fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_
     // A released lease is no dead root's (it shipped everything).
     h.advance(1);
     let mut out = Vec::new();
-    h.core.dead_root_check(h.now, &mut out);
+    h.core.dead_root_check(Now::same(h.now.0), &mut out);
     let op = s3_ops(&out)[0].0;
     let mut released = root_lease(1, 1, Ms(h.now.0 - 1));
     released.released = true;
@@ -27611,7 +27848,7 @@ fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_
     // The root's lease ran out: the next round's read takes it over.
     h.advance(6_000);
     let mut out = Vec::new();
-    h.core.dead_root_check(h.now, &mut out);
+    h.core.dead_root_check(Now::same(h.now.0), &mut out);
     let op = s3_ops(&out)[0].0;
     let expired = root_lease(1, 1, Ms(h.now.0 - 1));
     let out = h.step(Event::S3 {
@@ -27632,7 +27869,7 @@ fn an_op_waiting_for_a_dead_roots_append_takes_the_root_over_once_its_lease_ran_
 fn dead_root_acquisition(h: &mut Harness) -> Vec<Action> {
     h.advance(h.core.cfg.inbox_p2p_grace_ms);
     let mut out = Vec::new();
-    h.core.dead_root_check(h.now, &mut out);
+    h.core.dead_root_check(Now::same(h.now.0), &mut out);
     let op = s3_ops(&out)[0].0;
     let expired = root_lease(1, 1, Ms(h.now.0 - 1));
     let out = h.step(Event::S3 {
@@ -27721,7 +27958,7 @@ fn the_dead_root_check_reads_a_slow_live_roots_lease_once_per_renewal() {
     let mut reads = 0;
     while h.now.since(start) < 60_000 {
         let mut out = Vec::new();
-        h.core.dead_root_check(h.now, &mut out);
+        h.core.dead_root_check(Now::same(h.now.0), &mut out);
         if let [(op, S3Op::LeaseGet)] = s3_ops(&out).as_slice() {
             reads += 1;
             // The root's last renewal, on its 5 s cadence.
@@ -27747,7 +27984,7 @@ fn the_dead_root_check_reads_a_slow_live_roots_lease_once_per_renewal() {
     h.advance(ttl);
     h.core.mode.suspended = true;
     let mut out = Vec::new();
-    h.core.dead_root_check(h.now, &mut out);
+    h.core.dead_root_check(Now::same(h.now.0), &mut out);
     assert!(s3_ops(&out).is_empty(), "read while suspended: {out:?}");
 }
 
@@ -28044,7 +28281,7 @@ fn a_deposed_nodes_op_waits_for_its_own_earlier_write_then_forwards() {
         .apply_segment(2, 2, &seg, &constellation_meta::TouchSet::default())
         .unwrap();
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(h.meta.pending_replays().unwrap().is_empty(), "{out:?}");
     h.advance(1_000);
     let out = h.step(Event::Timer { id: backoff[0] });
@@ -28148,7 +28385,7 @@ fn the_gate_leaves_a_replay_to_the_drain_until_its_delegate_rows_are_here() {
     let (mut h, _rid, _q) = deposed_root_with_a_marker_replay();
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_none());
     assert_eq!(h.meta.pending_replays().unwrap().len(), 1, "held");
@@ -28157,7 +28394,7 @@ fn the_gate_leaves_a_replay_to_the_drain_until_its_delegate_rows_are_here() {
     crate::replica::Replica::note_stream(&h.meta, 4, 7);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
     assert!(h.meta.pending_replays().unwrap().is_empty());
@@ -28189,7 +28426,7 @@ fn the_gate_forgets_a_replay_the_log_already_settled_whatever_its_deps() {
     assert_eq!(h.meta.pending_replays().unwrap().len(), 1);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert!(
         h.meta.pending_replays().unwrap().is_empty(),
@@ -28222,7 +28459,7 @@ fn submit_the_replay(
 ) {
     let mut out = Vec::new();
     h.core.submit(
-        h.now,
+        Now::same(h.now.0),
         rid,
         q.op.clone(),
         Policy::Client,
@@ -28255,7 +28492,8 @@ fn a_replay_with_one_lost_generation_keeps_the_rows_of_the_live_one() {
     crate::replica::Replica::void_stream(&h.meta, 4, 0);
     submit_the_replay(&mut h, rid, &q, deps);
     let mut out = Vec::new();
-    h.core.hold_for_lost_deps(h.now, rid, &h.meta, &mut out);
+    h.core
+        .hold_for_lost_deps(Now::same(h.now.0), rid, &h.meta, &mut out);
     let kept = kept_deps(&h, rid);
     assert!(
         kept.contains(&(5, 3)),
@@ -28343,7 +28581,7 @@ fn a_replay_does_not_wait_on_the_successors_stream_of_an_undone_grants_number() 
     assert!(replay.deps.iter().next().is_none(), "{:?}", replay.deps);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert_eq!(h.core.stats.replays_held_for_stream, 0);
     assert!(h.meta.child_ino(ROOT_INO, "marker").unwrap().is_some());
@@ -28396,7 +28634,8 @@ fn a_replay_does_not_keep_rows_of_a_generation_the_log_ended_below_its_own_cut()
         .apply_records_journaled(&[LogRecord::Recall { dir, gen: 5 }])
         .unwrap();
     let mut out = Vec::new();
-    h.core.hold_for_lost_deps(h.now, rid, &h.meta, &mut out);
+    h.core
+        .hold_for_lost_deps(Now::same(h.now.0), rid, &h.meta, &mut out);
     let kept = kept_deps(&h, rid);
     assert!(
         !kept.iter().any(|(g, _)| *g == 4 || *g == 5),
@@ -28506,10 +28745,12 @@ fn a_deposed_nodes_own_op_at_the_head_of_its_replay_queue_is_not_held_behind_the
     assert_eq!(h.core.stats.deps_lost_holds, 0);
     assert_ne!(h.core.clients[&rx].phase_kind(), ClientPhase::Backoff);
     let mut out = Vec::new();
-    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(!h
+        .core
+        .hold_for_lost_deps(Now::same(h.now.0), rx, &h.meta, &mut out));
     // The drain does not take the head's place, and keeps the order.
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(sends(&out).is_empty(), "nothing submitted: {out:?}");
     assert!(!h.core.clients.contains_key(&ry), "ry waits behind rx");
     assert_eq!(h.core.stats.replays_waiting_on_client, 1);
@@ -28519,7 +28760,7 @@ fn a_deposed_nodes_own_op_at_the_head_of_its_replay_queue_is_not_held_behind_the
     h.core.clients.remove(&rx);
     settle_in_the_log(&mut h, rx, &x);
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(forwards_of(&out, ry), "ry goes to the holder: {out:?}");
 }
 
@@ -28535,20 +28776,24 @@ fn a_deposed_nodes_own_op_behind_another_replay_is_held_until_it_settles() {
     assert!(h.core.stats.deps_lost_holds >= 1);
     // The drain replays the entry ahead of it.
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(forwards_of(&out, ry), "ry goes to the holder: {out:?}");
     assert_eq!(h.core.stats.replays_waiting_on_client, 0);
     // Held while ry is in flight.
     let mut out = Vec::new();
-    assert!(h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(h
+        .core
+        .hold_for_lost_deps(Now::same(h.now.0), rx, &h.meta, &mut out));
     // ry settles: rx proceeds.
     h.core.clients.remove(&ry);
     h.core.replay.in_flight = None;
     settle_in_the_log(&mut h, ry, &y);
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     let mut out = Vec::new();
-    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(!h
+        .core
+        .hold_for_lost_deps(Now::same(h.now.0), rx, &h.meta, &mut out));
 }
 
 /// The middle of three: held for the entry ahead of it, not for the one
@@ -28559,16 +28804,18 @@ fn a_deposed_nodes_own_op_in_the_middle_of_its_queue_is_held_for_the_one_ahead_o
     let out = resubmit_in_doubt(&mut h, rx, &x);
     assert!(!forwards_of(&out, rx), "held for ry: {out:?}");
     let mut out = Vec::new();
-    assert!(h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(h
+        .core
+        .hold_for_lost_deps(Now::same(h.now.0), rx, &h.meta, &mut out));
     // ry goes, lands in the log, its entry is forgotten.
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(forwards_of(&out, ry), "{out:?}");
     h.core.clients.remove(&ry);
     h.core.replay.in_flight = None;
     settle_in_the_log(&mut h, ry, &y);
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert_eq!(
         queued_rids(&h),
         vec![rx, rz],
@@ -28576,7 +28823,9 @@ fn a_deposed_nodes_own_op_in_the_middle_of_its_queue_is_held_for_the_one_ahead_o
     );
     // rz is unsettled, yet rx proceeds (it is the head now).
     let mut out = Vec::new();
-    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(!h
+        .core
+        .hold_for_lost_deps(Now::same(h.now.0), rx, &h.meta, &mut out));
     assert!(
         h.core.own_replays_unsettled(&h.meta),
         "a barrier still waits"
@@ -28632,7 +28881,9 @@ fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
     resubmit_in_doubt(&mut h, rx, &x);
     h.core.clients.get_mut(&rx).unwrap().deps.streams = constellation_meta::Streams::NONE;
     let mut out = Vec::new();
-    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(!h
+        .core
+        .hold_for_lost_deps(Now::same(h.now.0), rx, &h.meta, &mut out));
     assert_eq!(kept_deps(&h, rx), vec![(4, 7)]);
     // An ended generation's rows are not owed.
     crate::replica::Replica::void_stream(&h.meta, 4, 0);
@@ -28644,7 +28895,9 @@ fn a_deposed_nodes_own_op_keeps_the_live_rows_its_queue_entry_recorded() {
         }])
         .unwrap();
     let mut out = Vec::new();
-    assert!(!h.core.hold_for_lost_deps(h.now, rx, &h.meta, &mut out));
+    assert!(!h
+        .core
+        .hold_for_lost_deps(Now::same(h.now.0), rx, &h.meta, &mut out));
     assert_eq!(kept_deps(&h, rx), Vec::<(u64, u64)>::new());
 }
 
@@ -28720,7 +28973,7 @@ fn a_lost_fast_path_write_resubmitted_in_doubt_is_decided_once_across_a_takeover
     h.hold(3, None);
     let mut out = Vec::new();
     h.core
-        .replay_queue_locally(h.now, &h.meta, &mut out)
+        .replay_queue_locally(Now::same(h.now.0), &h.meta, &mut out)
         .unwrap();
     assert!(queued_rids(&h).is_empty(), "replayed");
     assert_eq!(journaled_outcomes(&h, rx), vec![false]);
@@ -28795,7 +29048,7 @@ fn a_resubmission_in_doubt_merges_into_the_live_replay_of_its_rid() {
     recover_deposed_node(&mut h);
     assert_eq!(queued_rids(&h), vec![rx]);
     let mut out = Vec::new();
-    h.core.on_drain_tick(h.now, &h.meta, &mut out);
+    h.core.on_drain_tick(Now::same(h.now.0), &h.meta, &mut out);
     assert!(matches!(
         h.core.clients.get(&rx).map(|c| &c.origin),
         Some(crate::core::client::Origin::Replay { .. })
@@ -28927,7 +29180,8 @@ mod beat_cap {
         h.core.note_fast_takeover(prev, cap);
         let mut out = Vec::new();
         let now = h.now;
-        h.core.note_marker_landed(now, &h.meta, &mut out);
+        h.core
+            .note_marker_landed(Now::same(now.0), &h.meta, &mut out);
     }
 
     /// The bound of the floor on acknowledgements and on lock grants at the
@@ -28970,7 +29224,7 @@ mod beat_cap {
             assert_eq!(h.meta.locks().quarantine_until(), x + 10 + m);
             assert!(lock_bound > read_bound);
             assert_eq!(h.core.takeover_floor_until_ms(), x + 10 + m);
-            assert!(h.core.in_takeover_floor(h.now));
+            assert!(h.core.in_takeover_floor(Now::same(h.now.0)));
             let s = h.core.stats;
             assert_eq!((s.ack_floor_waits, s.ack_floor_capped), (1, 1));
             assert_eq!(s.ack_floor_capped_out, 0);
@@ -28996,7 +29250,7 @@ mod beat_cap {
             assert_eq!(h.meta.read_delegations().quarantine_until(), 0);
             assert_eq!(h.meta.locks().quarantine_until(), 0);
             assert_eq!(h.core.takeover_floor_until_ms(), 0);
-            assert!(!h.core.in_takeover_floor(h.now));
+            assert!(!h.core.in_takeover_floor(Now::same(h.now.0)));
             let s = h.core.stats;
             assert_eq!((s.ack_floor_capped_out, s.ack_floor_waits), (1, 0));
             assert_eq!(s.ack_floor_capped, 0);
@@ -29356,7 +29610,8 @@ mod beat_cap {
         );
         let mut out = Vec::new();
         let now = h.now;
-        h.core.note_marker_landed(now, &h.meta, &mut out);
+        h.core
+            .note_marker_landed(Now::same(now.0), &h.meta, &mut out);
         let (_, lock_bound) = bounds(&h, h.now);
         assert_eq!(h.core.takeover_floor_until_ms(), lock_bound);
         assert_eq!(h.core.beat_guard_unix_ms(&h.meta), lock_bound);
@@ -29385,14 +29640,22 @@ mod beat_cap {
         let t0 = h.now.0;
         assert_eq!(h.core.beat_guard_unix_ms(&h.meta), 0, "nothing granted yet");
         // Outside a hold the cap is the lease's: nothing recorded.
-        assert!(h.core.lock_cap_ms(h.now) <= 10_000);
+        assert!(h.core.lock_cap_ms(Now::same(h.now.0)) <= 10_000);
         assert_eq!(h.core.beat_guard_unix_ms(&h.meta), 0, "capped by the lease");
         let now = h.now;
-        h.core.lease.adopt_epoch_hold(now, 2);
-        assert_eq!(h.core.lock_cap_ms(h.now), 30_000, "the ttl alone");
+        h.core.lease.adopt_epoch_hold(Now::same(now.0), 2);
+        assert_eq!(
+            h.core.lock_cap_ms(Now::same(h.now.0)),
+            30_000,
+            "the ttl alone"
+        );
         assert_eq!(h.core.beat_guard_unix_ms(&h.meta), t0 + 30_000);
         h.advance(1_000);
-        assert_eq!(h.core.grant_cap_ms(h.now), 20_000, "the ttl alone");
+        assert_eq!(
+            h.core.grant_cap_ms(Now::same(h.now.0)),
+            20_000,
+            "the ttl alone"
+        );
         assert_eq!(
             h.core.beat_guard_unix_ms(&h.meta),
             t0 + 30_000,

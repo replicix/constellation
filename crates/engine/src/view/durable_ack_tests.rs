@@ -6,7 +6,7 @@
 //! `Meta::durability_pending` instead).
 use super::*;
 use constellation_authority::core::LeaseState;
-use constellation_authority::{Config, Ms};
+use constellation_authority::{Config, Ms, Now};
 use constellation_fs_core::types::ROOT_INO;
 use constellation_meta::{ReadKey, SessionWait};
 use constellation_store_s3::lease::now_unix_ms;
@@ -47,8 +47,8 @@ pub(super) fn holder_fs(
     let cfg = Config::defaults(1, 1);
     let now = Ms(now_unix_ms());
     let mut state = LeaseState::default();
-    let lease = state.granted_lease(now, &cfg, None, false);
-    state.adopt(now, lease, tag, None);
+    let lease = state.granted_lease(Now::same(now.0), &cfg, None, false);
+    state.adopt(Now::same(now.0), lease, tag, None);
     let view = Arc::new(crate::lease::LeaseView::default());
     view.mirror(&state, now, &cfg, gated);
     assert!(

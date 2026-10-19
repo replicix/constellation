@@ -16,7 +16,7 @@ use super::lease::{PendingGate, Plan};
 use super::{Core, S3For};
 use crate::action::{Action, ControlOk, S3Op};
 use crate::event::{CasFailure, Control, PeerMsg, S3Failure, S3Result, UploadResult};
-use crate::ids::{Epoch, Ms, NodeId, OpId, Seq};
+use crate::ids::{Epoch, Ms, NodeId, Now, OpId, Seq};
 use crate::replica::Replica;
 use crate::segment;
 use constellation_fs_core::Ino;
@@ -337,7 +337,7 @@ impl Core {
     /// coalesces with a queued one; a `Round` with a queued round.
     pub(crate) fn enqueue_job(
         &mut self,
-        now: Ms,
+        now: Now,
         req: JobReq,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -408,7 +408,7 @@ impl Core {
         )
     }
 
-    fn start_next_job(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn start_next_job(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         // M7: streamed segments that arrived while the job owned the
         // cursor go in first.
         if self.job.is_none() {
@@ -481,7 +481,7 @@ impl Core {
         }
     }
 
-    pub(crate) fn start_round(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn start_round(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.enqueue_job(
             now,
             JobReq::Round {
@@ -532,7 +532,7 @@ impl Core {
 
     /// Whether the empty tail just applied should be followed by a LIST
     /// before `then` proceeds.
-    fn gap_check_due(&self, now: Ms, then: TailThen) -> bool {
+    fn gap_check_due(&self, now: Now, then: TailThen) -> bool {
         if self.lease.ship_epoch(now, &self.cfg).is_some() && !self.lease.lost {
             return false;
         }
@@ -544,7 +544,7 @@ impl Core {
             TailThen::Round | TailThen::Control | TailThen::Recover => {
                 let since = self
                     .gap_checked_at
-                    .map(|at| now.since(at))
+                    .map(|at| now.wall.since(at))
                     .unwrap_or(i64::MAX);
                 let hinted = self.stream_hinted() >= next
                     || self.stream_head().is_some_and(|head| head >= next);
@@ -587,13 +587,13 @@ impl Core {
 
     fn after_gap_check(
         &mut self,
-        now: Ms,
+        now: Now,
         then: TailThen,
         first: Option<Seq>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.gap_checked_at = Some(now);
+        self.gap_checked_at = Some(now.wall);
         let next = self.ship.next_seq;
         match first {
             None => {
@@ -639,7 +639,7 @@ impl Core {
     /// tail-to-head answered.
     fn retention_rebuild_done(
         &mut self,
-        now: Ms,
+        now: Now,
         ok: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -697,7 +697,7 @@ impl Core {
     /// it must reach the head before its CAS.
     fn apply_run(
         &mut self,
-        now: Ms,
+        now: Now,
         run: Vec<(Seq, Vec<u8>)>,
         round: bool,
         replica: &dyn Replica,
@@ -722,7 +722,7 @@ impl Core {
     /// fencing, or a foreign apply that strands what it supersedes.
     pub(crate) fn apply_incoming(
         &mut self,
-        now: Ms,
+        now: Now,
         seq: Seq,
         payload: &[u8],
         replica: &dyn Replica,
@@ -873,7 +873,7 @@ impl Core {
     /// when the journal is empty (or this node may not ship).
     fn issue_ship(
         &mut self,
-        now: Ms,
+        now: Now,
         attempts: u32,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -979,7 +979,7 @@ impl Core {
     /// is nothing pending or this node may not ship.
     fn issue_atime_ship(
         &mut self,
-        now: Ms,
+        now: Now,
         attempts: u32,
         purpose: ShipPurpose,
         replica: &dyn Replica,
@@ -1043,7 +1043,7 @@ impl Core {
 
     /// Whether the oldest pending atime row is older than the standalone
     /// ship ceiling.
-    fn atime_stale(&self, now: Ms, replica: &dyn Replica) -> bool {
+    fn atime_stale(&self, now: Now, replica: &dyn Replica) -> bool {
         let _ = now;
         let Ok(Some(oldest_ns)) = replica.atime_oldest_pending_ns() else {
             return false;
@@ -1069,7 +1069,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     fn ship_landed(
         &mut self,
-        now: Ms,
+        now: Now,
         seqs: &[u64],
         seq: Seq,
         (epoch, through): (Epoch, u64),
@@ -1134,7 +1134,7 @@ impl Core {
             let op = self.op_id();
             self.publishing = Some(op);
             self.ship.shipped_since_publish = 0;
-            self.ship.last_publish = now;
+            self.ship.last_publish = now.wall;
             out.push(Action::Publish {
                 op,
                 epoch: self.ship.last_ship_epoch,
@@ -1190,7 +1190,7 @@ impl Core {
     /// drain the older epochs' inbox, open the view.
     pub(super) fn complete_gate(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> GateStep {
@@ -1267,7 +1267,7 @@ impl Core {
             g.shippable = true;
         }
         if !gate.drained {
-            if replica.read_delegations().quarantine_until() > now.0 {
+            if replica.read_delegations().quarantine_until() > now.wall.0 {
                 return GateStep::Wait;
             }
             return GateStep::NeedDrain;
@@ -1278,7 +1278,7 @@ impl Core {
 
     fn marker_landed(
         &mut self,
-        now: Ms,
+        now: Now,
         seq: Seq,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1345,7 +1345,7 @@ impl Core {
     /// answered as not given (the requester retries by rid).
     pub(crate) fn deposed(
         &mut self,
-        now: Ms,
+        now: Now,
         holder: NodeId,
         epoch: Epoch,
         my_epoch: Epoch,
@@ -1446,7 +1446,7 @@ impl Core {
 
     pub(crate) fn on_rebuild_done(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         ok: bool,
         replica: &dyn Replica,
@@ -1488,24 +1488,24 @@ impl Core {
 
     /// Whether this holder may skip reading its own stream this round
     /// (`Shipper::held_partitions`).
-    fn skip_tail_as_holder(&mut self, now: Ms) -> bool {
+    fn skip_tail_as_holder(&mut self, now: Now) -> bool {
         if self.lease.ship_epoch(now, &self.cfg).is_none() || self.lease.epoch_held() {
             return false;
         }
         if self.ship.probe_now {
             // Plan 30 §M9: a strict read waits for proof of S3 liveness.
             self.ship.probe_now = false;
-            self.ship.held_tail_at = Some(now);
+            self.ship.held_tail_at = Some(now.wall);
             return false;
         }
         match self.ship.held_tail_at {
-            Some(at) if now.since(at) < self.cfg.held_tail_staleness_ms as i64 => true,
+            Some(at) if now.wall.since(at) < self.cfg.held_tail_staleness_ms as i64 => true,
             Some(_) => {
-                self.ship.held_tail_at = Some(now);
+                self.ship.held_tail_at = Some(now.wall);
                 false
             }
             None => {
-                self.ship.held_tail_at = Some(now);
+                self.ship.held_tail_at = Some(now.wall);
                 true
             }
         }
@@ -1574,7 +1574,7 @@ impl Core {
 
     pub(crate) fn on_uploads_done(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         result: UploadResult,
         replica: &dyn Replica,
@@ -1659,7 +1659,7 @@ impl Core {
         }
     }
 
-    fn round_after_upload(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn round_after_upload(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.lease.lost {
             self.set_phase(
                 Phase::Tail {
@@ -1686,14 +1686,14 @@ impl Core {
     /// crashed, and the members closed and took the lease over at its
     /// expiry beside the hold it re-adopted at its restart). The hold
     /// needs no S3 lease; the flush's re-claim after the close renews it.
-    fn renew_due(&self, now: Ms) -> bool {
+    fn renew_due(&self, now: Now) -> bool {
         !self.lease.lost
             && !self.lease.epoch_held()
             && match &self.lease.held {
                 Some((lease, _)) => {
                     self.ship.renew_now
                         || self.ship.renew_early_of == Some(lease.expires_unix_ms)
-                        || lease.expires_in_ms(now.0) <= (self.cfg.ttl_ms / 2) as i64
+                        || lease.expires_in_ms(now.wall.0) <= (self.cfg.ttl_ms / 2) as i64
                 }
                 None => false,
             }
@@ -1702,7 +1702,7 @@ impl Core {
     /// How long until [`Self::renew_due`] turns true by the clock alone
     /// (`None`: it never will, or it is due already). The poll is armed
     /// for that moment (`next_poll_ms`).
-    pub(crate) fn renew_due_in_ms(&self, now: Ms) -> Option<u64> {
+    pub(crate) fn renew_due_in_ms(&self, now: Now) -> Option<u64> {
         if self.lease.lost || self.lease.epoch_held() || self.ship.renew_now {
             return None;
         }
@@ -1710,7 +1710,7 @@ impl Core {
         if self.ship.renew_early_of == Some(lease.expires_unix_ms) {
             return None;
         }
-        let left = lease.expires_in_ms(now.0) - (self.cfg.ttl_ms / 2) as i64;
+        let left = lease.expires_in_ms(now.wall.0) - (self.cfg.ttl_ms / 2) as i64;
         (left > 0).then_some(left as u64)
     }
 
@@ -1729,7 +1729,7 @@ impl Core {
     /// it, and the next one came at the idle poll (up to a quarter ttl
     /// later: `-heavy` seed 1656, the root's own grant lapsed 1.2 s
     /// before its lease was renewed).
-    pub(crate) fn lease_renew_for_grants(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn lease_renew_for_grants(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.lease.lost || self.lease.epoch_held() || self.lease.releasing {
             return;
         }
@@ -1737,7 +1737,7 @@ impl Core {
             return;
         };
         let expires = lease.expires_unix_ms;
-        let gain = self.cfg.ttl_ms as i64 - lease.expires_in_ms(now.0);
+        let gain = self.cfg.ttl_ms as i64 - lease.expires_in_ms(now.wall.0);
         if self.ship.renew_early_of == Some(expires) || gain < self.cfg.expiry_margin_ms as i64 {
             return;
         }
@@ -1746,7 +1746,7 @@ impl Core {
         self.nudge(now, out);
     }
 
-    fn issue_renew(&mut self, now: Ms, mid_ship: bool, out: &mut Vec<Action>) {
+    fn issue_renew(&mut self, now: Now, mid_ship: bool, out: &mut Vec<Action>) {
         let (mine, tag) = self.lease.held.clone().expect("held");
         let renewed = self.lease.renewed_lease(now, &self.cfg, &mine);
         let op = self.issue_s3(
@@ -1767,7 +1767,7 @@ impl Core {
         );
     }
 
-    fn round_renew(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn round_renew(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.renew_due(now) {
             self.issue_renew(now, false, out);
             return;
@@ -1779,7 +1779,7 @@ impl Core {
     /// opened the round), or back into the ship loop it interrupted.
     fn round_after_renew(
         &mut self,
-        now: Ms,
+        now: Now,
         mid_ship: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1791,7 +1791,7 @@ impl Core {
         }
     }
 
-    fn round_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn round_gate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.lease.gate.is_some() && !self.lease.lost {
             match self.complete_gate(now, replica, out) {
                 GateStep::Done => {
@@ -1827,7 +1827,7 @@ impl Core {
         self.round_tail(now, replica, out);
     }
 
-    fn round_tail(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn round_tail(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.skip_tail_as_holder(now) {
             self.round_ship(now, 0, replica, out);
             return;
@@ -1864,7 +1864,13 @@ impl Core {
         self.issue_tail_width(width, out);
     }
 
-    fn round_ship(&mut self, now: Ms, attempts: u32, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn round_ship(
+        &mut self,
+        now: Now,
+        attempts: u32,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         match self.issue_ship(now, attempts, replica, out) {
             Ok(true) => {}
             Ok(false) => {
@@ -1885,7 +1891,7 @@ impl Core {
                     && (self.epoch_reclaim_due()
                         || (!self.epoch.open
                             && self.epoch_reclaim_pending(now)
-                            && replica.locks().live_grants_len(now.0) > 0))
+                            && replica.locks().live_grants_len(now.wall.0) > 0))
                     && !self
                         .queued_jobs
                         .iter()
@@ -1930,14 +1936,14 @@ impl Core {
     /// slow renews before then), so the check costs about one read per
     /// renewal period, not one per round; nor while suspended, where the
     /// acquisition is refused anyway.
-    pub(crate) fn dead_root_check(&mut self, now: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn dead_root_check(&mut self, now: Now, out: &mut Vec<Action>) {
         // (This node's own unexpired lease, an epoch close's pending
         // re-claim, is no dead root's either.)
         let seen_live = self
             .lease
             .last_seen
             .as_ref()
-            .is_some_and(|l| l.holder != 0 && !l.released && !l.is_expired(now.0));
+            .is_some_and(|l| l.holder != 0 && !l.released && !l.is_expired(now.wall.0));
         if self.dead_root_get
             || seen_live
             || self.mode.suspended
@@ -1958,17 +1964,17 @@ impl Core {
         self.issue_s3(S3Op::LeaseGet, S3For::DeadRoot, out);
     }
 
-    fn awaits_dead_root(&self, now: Ms) -> bool {
+    fn awaits_dead_root(&self, now: Now) -> bool {
         let grace = self.cfg.inbox_p2p_grace_ms as i64;
         self.clients.values().any(|c| {
             matches!(c.phase, super::client::Phase::AwaitingLog { .. })
-                && now.since(c.submitted) >= grace
+                && now.wall.since(c.submitted) >= grace
         })
     }
 
     pub(crate) fn on_dead_root_get(
         &mut self,
-        now: Ms,
+        now: Now,
         result: S3Result,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1984,7 +1990,7 @@ impl Core {
         if lease.holder == 0
             || lease.holder == self.cfg.node_id
             || lease.released
-            || !lease.is_expired(now.0)
+            || !lease.is_expired(now.wall.0)
             || self.lease.held.is_some()
             || !self.awaits_dead_root(now)
         {
@@ -2008,13 +2014,13 @@ impl Core {
         );
     }
 
-    fn round_publish(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn round_publish(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         let holder_epoch = self.lease.ship_epoch(now, &self.cfg);
         let cadence_due =
             self.publish_forced || self.ship.shipped_since_publish >= self.cfg.publish_every;
         let idle_due = self.cfg.publisher
             && replica.has_dirty()
-            && now.since(self.ship.last_publish) >= self.cfg.publish_idle_ms as i64;
+            && now.wall.since(self.ship.last_publish) >= self.cfg.publish_idle_ms as i64;
         if !self.cfg.publisher || self.publishing.is_some() || self.skip_ship {
             self.round_release(now, replica, out);
             return;
@@ -2025,7 +2031,7 @@ impl Core {
                 self.publishing = Some(op);
                 self.publish_forced = false;
                 self.ship.shipped_since_publish = 0;
-                self.ship.last_publish = now;
+                self.ship.last_publish = now.wall;
                 out.push(Action::Publish {
                     op,
                     epoch: self.ship.last_ship_epoch.max(epoch),
@@ -2043,7 +2049,7 @@ impl Core {
             None if idle_due => {
                 let op = self.op_id();
                 self.publishing = Some(op);
-                self.ship.last_publish = now;
+                self.ship.last_publish = now.wall;
                 out.push(Action::FollowHead { op });
             }
             _ => {}
@@ -2051,7 +2057,7 @@ impl Core {
         self.round_release(now, replica, out);
     }
 
-    pub(crate) fn round_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(crate) fn round_release(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         let backlog = replica.journal_len().unwrap_or(0);
         // The continuation epoch's flush: its journal is in S3 and the
         // lease taken for it can go — unless lock grants are live under
@@ -2071,7 +2077,7 @@ impl Core {
         // there the release is the epoch's design.
         let fast_gate = self.lease.gate.as_ref().is_some_and(|g| g.fast_prev);
         if flushed
-            && (replica.locks().live_grants_len(now.0) > 0
+            && (replica.locks().live_grants_len(now.wall.0) > 0
                 || self.in_takeover_floor(now)
                 || fast_gate)
         {
@@ -2171,7 +2177,7 @@ impl Core {
 
     /// Ship-then-release (plan 20): pending read-time atime goes out in
     /// one last segment before the lease does.
-    fn release_after_atime(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn release_after_atime(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.issue_atime_ship(now, 0, ShipPurpose::AtimeBeforeRelease, replica, out) {
             return;
         }
@@ -2182,7 +2188,7 @@ impl Core {
     /// so plan 30 §M8's read delegations must all be recalled (or
     /// outwaited) first. `releasing` is up by now: no new grant is made
     /// while the recalls run or the CAS is in flight.
-    pub(super) fn issue_release(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    pub(super) fn issue_release(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.lease.held.is_none() {
             return;
         }
@@ -2223,7 +2229,7 @@ impl Core {
     /// Plan 30 §M8: the recalls a release waited for are done.
     pub(crate) fn release_after_recalls(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2248,7 +2254,7 @@ impl Core {
 
     fn finish_round(
         &mut self,
-        now: Ms,
+        now: Now,
         failed: Option<String>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2398,7 +2404,7 @@ impl Core {
     /// pass, or a queued job cut the round short).
     fn finish_barriers(
         &mut self,
-        now: Ms,
+        now: Now,
         failed: Option<&str>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2459,17 +2465,17 @@ impl Core {
     /// straight back through S3 at slow S3 (a flip and a flop, several
     /// seconds of stalled writes on both nodes). So the pause is at least
     /// `handoff_pause_ms` and eight observed S3 round trips.
-    pub(crate) fn begin_handoff_pause(&mut self, now: Ms) {
+    pub(crate) fn begin_handoff_pause(&mut self, now: Now) {
         let ms = self
             .cfg
             .handoff_pause_ms
             .max(self.ack.s3_rtt_ms.saturating_mul(8));
-        self.lease.pause_until = now.plus(ms);
+        self.lease.pause_until = now.wall.plus(ms);
     }
 
     fn begin_acquire(
         &mut self,
-        now: Ms,
+        now: Now,
         reason: &'static str,
         ask_handoff: bool,
         replica: &dyn Replica,
@@ -2542,8 +2548,8 @@ impl Core {
                         },
                         None,
                     );
-                    self.set_timer(
-                        now.plus(self.cfg.handoff_request_timeout_ms),
+                    self.set_timer_wall(
+                        now.wall.plus(self.cfg.handoff_request_timeout_ms),
                         super::Timer::JobRequestTimeout(req),
                         out,
                     );
@@ -2585,8 +2591,8 @@ impl Core {
                 },
                 None,
             );
-            self.set_timer(
-                now.plus(self.cfg.handoff_request_timeout_ms),
+            self.set_timer_wall(
+                now.wall.plus(self.cfg.handoff_request_timeout_ms),
                 super::Timer::JobRequestTimeout(req),
                 out,
             );
@@ -2605,7 +2611,7 @@ impl Core {
 
     fn acquire_classified(
         &mut self,
-        now: Ms,
+        now: Now,
         object: Option<(Lease, LeaseTag)>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2734,8 +2740,8 @@ impl Core {
                         },
                         None,
                     );
-                    self.set_timer(
-                        now.plus(self.cfg.handoff_request_timeout_ms),
+                    self.set_timer_wall(
+                        now.wall.plus(self.cfg.handoff_request_timeout_ms),
                         super::Timer::JobRequestTimeout(req),
                         out,
                     );
@@ -2783,7 +2789,7 @@ impl Core {
     /// op retries on its backoff and asks again.
     pub(crate) fn promise_check_resolved(
         &mut self,
-        now: Ms,
+        now: Now,
         allowed: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2821,7 +2827,7 @@ impl Core {
     /// expiry beside the hold it re-adopted after a crash.
     fn acquire_overtaken_by_epoch(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) -> bool {
@@ -2836,7 +2842,7 @@ impl Core {
         true
     }
 
-    fn acquire_cas(&mut self, now: Ms, plan: Plan, out: &mut Vec<Action>) {
+    fn acquire_cas(&mut self, now: Now, plan: Plan, out: &mut Vec<Action>) {
         let Plan::Claim { prev, tag, .. } = &plan else {
             return;
         };
@@ -2879,7 +2885,7 @@ impl Core {
 
     fn acquire_won(
         &mut self,
-        now: Ms,
+        now: Now,
         plan: Plan,
         sent: Lease,
         tag: LeaseTag,
@@ -2948,7 +2954,7 @@ impl Core {
         let fast_prev = prev.as_ref().is_some_and(|p| {
             takeover
                 && !p.released
-                && (permitted || !p.is_expired(now.0))
+                && (permitted || !p.is_expired(now.wall.0))
                 && p.holder != self.cfg.node_id
         });
         self.dl.inherit_slack_ms = 0;
@@ -2974,7 +2980,7 @@ impl Core {
         // Plan 30 §M14: a released (unexpired) lease's lock grants may
         // still be honoured: a grace before any new grant.
         if prev.as_ref().is_some_and(|p| {
-            takeover && p.released && !p.is_expired(now.0) && p.holder != self.cfg.node_id
+            takeover && p.released && !p.is_expired(now.wall.0) && p.holder != self.cfg.node_id
         }) {
             self.lock_on_released_takeover(now, replica);
         }
@@ -3008,7 +3014,7 @@ impl Core {
         self.release_superseded(true, replica);
         self.shipped_touches.clear();
         self.shipped_floor = self.ship.head_seq;
-        self.ship.held_tail_at = Some(now);
+        self.ship.held_tail_at = Some(now.wall);
         self.acquire_gate(now, replica, out);
         // Plan 43 C7-F F-a0: a floor armed (`note_fast_takeover`) means a
         // lease that says so. The claim CAS wrote it so when the permit was
@@ -3022,7 +3028,7 @@ impl Core {
         }
     }
 
-    fn acquire_gate(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn acquire_gate(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         if self.lease.lost {
             // Deposed while the gate's marker or drain was in flight: the
             // gate is void (`mark_lost`), and "no gate" is not "open".
@@ -3049,7 +3055,7 @@ impl Core {
 
     fn finish_acquire(
         &mut self,
-        now: Ms,
+        now: Now,
         acquired: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3071,7 +3077,7 @@ impl Core {
                 // this node could not claim it): forwards hear `NotHolder`
                 // again for a TTL, so a requester that can reach S3 takes
                 // its own lease path instead of being held on and on.
-                self.readopt_refused_until = now.plus(self.cfg.ttl_ms);
+                self.readopt_refused_until = now.wall.plus(self.cfg.ttl_ms);
             }
         }
         if acquired {
@@ -3085,7 +3091,7 @@ impl Core {
                 self.lease
                     .last_seen
                     .as_ref()
-                    .filter(|l| !l.is_claimable(now.0))
+                    .filter(|l| !l.is_claimable(now.wall.0))
                     .map(|l| (l.holder, l.epoch))
                     .unwrap_or((0, 0))
             };
@@ -3120,7 +3126,7 @@ impl Core {
 
     fn begin_handoff(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         from: NodeId,
         at: Ms,
@@ -3134,12 +3140,12 @@ impl Core {
         // back through S3 once its pause ran out (`visibility-s3-
         // latency`: a claim queued 12 s behind a round's ship loop under
         // slow S3, served while this node was the one writing).
-        let stale = now.since(at) >= self.cfg.handoff_request_timeout_ms as i64;
+        let stale = now.wall.since(at) >= self.cfg.handoff_request_timeout_ms as i64;
         if stale {
             tracing::info!(
                 node = self.cfg.node_id,
                 requester = from,
-                waited_ms = now.since(at),
+                waited_ms = now.wall.since(at),
                 "declining a stale lease request: its requester stopped waiting"
             );
         }
@@ -3183,7 +3189,7 @@ impl Core {
     /// would start without them (`fast_prev` is false for a released
     /// lease) and the delegations and locks of the sealed tenure are still
     /// honoured elsewhere.
-    fn release_held_back(&self, now: Ms) -> bool {
+    fn release_held_back(&self, now: Now) -> bool {
         self.lease.held.is_some()
             && !self.lease.lost
             && (self.lease.gate.is_some() || self.in_takeover_floor(now))
@@ -3192,7 +3198,14 @@ impl Core {
     /// Hold a flush or shutdown back until the takeover gate and floor are
     /// over (`service_pending_flushes`). It leaves the job slot free: the
     /// gate completes in rounds.
-    fn park_flush(&mut self, now: Ms, control: OpId, stop: bool, since: Ms, out: &mut Vec<Action>) {
+    fn park_flush(
+        &mut self,
+        now: Now,
+        control: OpId,
+        stop: bool,
+        since: Ms,
+        out: &mut Vec<Action>,
+    ) {
         tracing::info!(
             node = self.cfg.node_id,
             stop,
@@ -3206,9 +3219,13 @@ impl Core {
         self.arm_flush_floor(now, out);
     }
 
-    fn arm_flush_floor(&mut self, now: Ms, out: &mut Vec<Action>) {
+    fn arm_flush_floor(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.flush_floor_timer.is_none() && !self.pending_flushes.is_empty() {
-            let id = self.set_timer(now.plus(FLUSH_FLOOR_LOOK_MS), super::Timer::FlushFloor, out);
+            let id = self.set_timer_wall(
+                now.wall.plus(FLUSH_FLOOR_LOOK_MS),
+                super::Timer::FlushFloor,
+                out,
+            );
             self.flush_floor_timer = Some(id);
         }
     }
@@ -3224,7 +3241,7 @@ impl Core {
     /// the next round releases it when it is idle.
     pub(crate) fn service_pending_flushes(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -3249,12 +3266,12 @@ impl Core {
         let floor = self.in_takeover_floor(now);
         let (expired, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_flushes)
             .into_iter()
-            .partition(|p| !floor && now.since(p.since) >= cap);
+            .partition(|p| !floor && now.wall.since(p.since) >= cap);
         self.pending_flushes = waiting;
         for p in expired {
             tracing::warn!(
                 node = self.cfg.node_id,
-                waited_ms = now.since(p.since),
+                waited_ms = now.wall.since(p.since),
                 "a flush gave up waiting for the takeover floor: the lease is not released and lapses"
             );
             out.push(Action::ControlDone {
@@ -3270,9 +3287,9 @@ impl Core {
         self.arm_flush_floor(now, out);
     }
 
-    fn begin_flush(&mut self, now: Ms, control: OpId, stop: bool, out: &mut Vec<Action>) {
+    fn begin_flush(&mut self, now: Now, control: OpId, stop: bool, out: &mut Vec<Action>) {
         if self.release_held_back(now) {
-            self.park_flush(now, control, stop, now, out);
+            self.park_flush(now, control, stop, now.wall, out);
             return;
         }
         let op = self.op_id();
@@ -3298,7 +3315,7 @@ impl Core {
     /// with dirty keys), then release.
     fn flush_continue(
         &mut self,
-        now: Ms,
+        now: Now,
         attempts: u32,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3330,7 +3347,7 @@ impl Core {
                         let op = self.op_id();
                         self.publishing = Some(op);
                         self.ship.shipped_since_publish = 0;
-                        self.ship.last_publish = now;
+                        self.ship.last_publish = now.wall;
                         let epoch = self.ship.last_ship_epoch.max(holder.unwrap_or(0));
                         out.push(Action::Publish { op, epoch });
                         self.set_phase(Phase::FlushPublish { op }, Some(op));
@@ -3385,7 +3402,7 @@ impl Core {
                         Some(What::Flush { control, stop, .. }) => {
                             let (control, stop) = (*control, *stop);
                             self.job = None;
-                            self.park_flush(now, control, stop, now, out);
+                            self.park_flush(now, control, stop, now.wall, out);
                             self.start_next_job(now, replica, out);
                         }
                         _ => self.finish_flush_job(now, false, replica, out),
@@ -3412,7 +3429,7 @@ impl Core {
 
     pub(crate) fn on_flush_publish_done(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3428,7 +3445,7 @@ impl Core {
 
     fn finish_flush_job(
         &mut self,
-        now: Ms,
+        now: Now,
         released: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3477,7 +3494,7 @@ impl Core {
 
     pub(crate) fn on_job_s3(
         &mut self,
-        now: Ms,
+        now: Now,
         op: OpId,
         result: S3Result,
         replica: &dyn Replica,
@@ -3590,7 +3607,7 @@ impl Core {
                     Some((cur, tag))
                         if cur.holder == self.cfg.node_id && cur.epoch == mine.epoch =>
                     {
-                        if final_probe || cur.released || cur.is_expired(now.0) {
+                        if final_probe || cur.released || cur.is_expired(now.wall.0) {
                             // Only the tag was stale (a retried PUT landing
                             // twice): adopt it and carry on.
                             self.lease.renewed(now, cur, tag);
@@ -3964,7 +3981,7 @@ impl Core {
     /// exactly the object the CAS wrote).
     fn acquire_cas_reread(
         &mut self,
-        now: Ms,
+        now: Now,
         plan: Plan,
         sent: Lease,
         result: Result<Option<(Lease, LeaseTag)>, S3Failure>,
@@ -4013,7 +4030,7 @@ impl Core {
 
     fn after_tail(
         &mut self,
-        now: Ms,
+        now: Now,
         then: TailThen,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4134,7 +4151,7 @@ impl Core {
     /// The release CAS landed (its answer, or a re-read after none).
     fn release_landed(
         &mut self,
-        now: Ms,
+        now: Now,
         kind: JobKind,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4176,7 +4193,7 @@ impl Core {
     /// path would); otherwise the job just ends.
     fn lease_gone_mid_job(
         &mut self,
-        now: Ms,
+        now: Now,
         kind: JobKind,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4202,7 +4219,13 @@ impl Core {
         }
     }
 
-    fn job_failed(&mut self, now: Ms, error: String, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn job_failed(
+        &mut self,
+        now: Now,
+        error: String,
+        replica: &dyn Replica,
+        out: &mut Vec<Action>,
+    ) {
         match self.job.as_ref().map(|j| j.kind()) {
             Some(JobKind::Round) => self.finish_round(now, Some(error), replica, out),
             Some(JobKind::Acquire) => {
@@ -4281,7 +4304,7 @@ impl Core {
     /// writes).
     fn epoch_carrier_checked(
         &mut self,
-        now: Ms,
+        now: Now,
         object: Option<Lease>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -4334,7 +4357,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_lease_handoff(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         released: bool,
@@ -4457,7 +4480,7 @@ impl Core {
 
     pub(crate) fn on_job_peer_failed(
         &mut self,
-        now: Ms,
+        now: Now,
         req: OpId,
         to: NodeId,
         replica: &dyn Replica,

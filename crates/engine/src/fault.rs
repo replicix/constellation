@@ -5,7 +5,7 @@
 
 use constellation_fs_core::ChunkHash;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// `CONSTELLATION_FAULT_LOSE_CHUNKS=<hex>[,<hex>...]`: the upload pass
@@ -263,10 +263,115 @@ pub fn start_runtime_hog_file(node: u64) {
     });
 }
 
+/// `CONSTELLATION_FAULT_CLOCK_STEP_FILE=<path>`: the harness's wall-clock
+/// step (plan 43 C7-H1, the load item `clock:step:<ms>:<at_ms>[@node]`).
+/// The file holds the **cumulative** step of this daemon's wall clock in
+/// ms, a signed integer, written write-then-rename like the other `*_FILE`
+/// hooks, so reading it again is idempotent. A plain thread (not tokio, so
+/// a runtime hog does not delay it) polls it every 100 ms; on a change it
+/// sets `constellation_platform::clock::set_fault_step_ms`, logs a
+/// warning, and writes `<path>.applied` with the value in force. Only the
+/// protocol clock's WALL reading moves: stepping the host clock would move
+/// every container's. Also logs the constant `CONSTELLATION_FAULT_CLOCK_
+/// OFFSET_MS` once (the platform crate has no logger). Started once per
+/// process from the authority driver; a no-op without either variable. (The
+/// step already in the file when the daemon starts is applied earlier, by
+/// `platform::clock::protocol()` before its first reading: this poller only
+/// follows later changes.)
+pub fn start_clock_faults() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let offset = constellation_platform::clock::fault_offset_ms();
+    if offset != 0 {
+        tracing::warn!(
+            offset_ms = offset,
+            "fault injection: the protocol clock is offset (testing only)"
+        );
+    }
+    let Some(path) = std::env::var_os("CONSTELLATION_FAULT_CLOCK_STEP_FILE").map(PathBuf::from)
+    else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("fault-clock-step".into())
+        .spawn(move || {
+            let mut applied = constellation_platform::clock::fault_step_ms();
+            loop {
+                poll_clock_step(
+                    &path,
+                    &mut applied,
+                    constellation_platform::clock::set_fault_step_ms,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "could not start the clock-step fault poller");
+    }
+}
+
+/// One poll of the step file (see [`start_clock_faults`]): when it holds a
+/// cumulative step other than `applied`, call `set` with it, log, remember
+/// it and write `<path>.applied`. A missing file, an unreadable one or one
+/// that does not hold an integer changes nothing. Returns whether a step
+/// was applied.
+fn poll_clock_step(path: &Path, applied: &mut i64, set: impl FnOnce(i64)) -> bool {
+    let Some(want) = constellation_platform::clock::read_step_file(path) else {
+        return false;
+    };
+    if want == *applied {
+        return false;
+    }
+    set(want);
+    tracing::warn!(
+        delta_ms = want - *applied,
+        total_ms = want,
+        "fault injection: the protocol wall clock stepped (testing only)"
+    );
+    *applied = want;
+    let mut marker = path.as_os_str().to_os_string();
+    marker.push(".applied");
+    let _ = std::fs::write(PathBuf::from(marker), want.to_string());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Expectation: the step file is read as a cumulative value, applied once
+    /// per change (reading it again does nothing), acknowledged in
+    /// `<file>.applied`, and a missing or malformed file changes nothing.
+    #[test]
+    fn the_clock_step_file_is_cumulative_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("clock-step");
+        let marker = dir.path().join("clock-step.applied");
+        let mut applied = 0;
+        let mut seen = Vec::new();
+        assert!(!poll_clock_step(&file, &mut applied, |v| seen.push(v)));
+        std::fs::write(&file, "3000\n").unwrap();
+        assert!(poll_clock_step(&file, &mut applied, |v| seen.push(v)));
+        assert_eq!((applied, seen.clone()), (3_000, vec![3_000]));
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "3000");
+        // Again, unchanged: nothing.
+        assert!(!poll_clock_step(&file, &mut applied, |v| seen.push(v)));
+        // Garbage and an empty file (a torn write) change nothing.
+        std::fs::write(&file, "soon").unwrap();
+        assert!(!poll_clock_step(&file, &mut applied, |v| seen.push(v)));
+        std::fs::write(&file, "").unwrap();
+        assert!(!poll_clock_step(&file, &mut applied, |v| seen.push(v)));
+        // The value is the cumulative step: back to 0 is a change.
+        std::fs::write(&file, "-1500").unwrap();
+        assert!(poll_clock_step(&file, &mut applied, |v| seen.push(v)));
+        std::fs::write(&file, "0").unwrap();
+        assert!(poll_clock_step(&file, &mut applied, |v| seen.push(v)));
+        assert_eq!(seen, vec![3_000, -1_500, 0]);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "0");
+    }
 
     #[test]
     fn runtime_hog_spec() {

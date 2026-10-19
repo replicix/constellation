@@ -295,6 +295,11 @@ pub struct NodeEnv {
     pub clock_skew_ms: i64,
     /// See `SimConfig::clock_offsets`.
     pub clock_offsets: Vec<(NodeId, i64)>,
+    /// Plan 43 C7-H1: each node's cumulative wall step (ms), created on
+    /// first use. It outlives the node's incarnations: a host's clock does
+    /// not reset when the process restarts. `FaultKind::ClockStep` adds to
+    /// it; only the node's WALL reading moves (see `sim/clock.rs`).
+    pub steps: Mutex<HashMap<NodeId, Arc<AtomicI64>>>,
     pub seed: u64,
     /// Fix "capture under an epoch hold": the modelled chunks.
     pub world: Arc<ChunkWorld>,
@@ -315,9 +320,25 @@ pub struct NodeEnv {
 }
 
 impl NodeEnv {
-    /// Node `id`'s clock: the shared one, off by a seeded constant within
-    /// `±clock_skew_ms`, and by its `clock_offsets` entry if it has one.
-    pub fn clock_of(&self, id: NodeId) -> Clock {
+    /// Node `id`'s step atomic (cumulative ms; shared by its incarnations).
+    pub fn step_of(&self, id: NodeId) -> Arc<AtomicI64> {
+        self.steps.lock().unwrap().entry(id).or_default().clone()
+    }
+
+    /// Node `id`'s clock for incarnation `incarnation`: true time, off by a
+    /// seeded constant within `±clock_skew_ms` and by its `clock_offsets`
+    /// entry if it has one, and by the node's step. A new `ProtocolClock`
+    /// per incarnation (plan 43 C7-H1: its id is `node << 32 |
+    /// incarnation`; HONOUR and WAIT restart at its wall).
+    pub fn clock_of(&self, id: NodeId, incarnation: u32) -> Clock {
+        let offset = self.clock_offset_of(id);
+        self.clock
+            .for_node(offset, self.step_of(id), (id << 32) | incarnation as u64)
+    }
+
+    /// Node `id`'s constant clock error: a seeded draw within
+    /// `±clock_skew_ms`, plus its `clock_offsets` entry if it has one.
+    fn clock_offset_of(&self, id: NodeId) -> i64 {
         let fixed: i64 = self
             .clock_offsets
             .iter()
@@ -325,13 +346,12 @@ impl NodeEnv {
             .map(|(_, ms)| ms)
             .sum();
         if self.clock_skew_ms == 0 {
-            return self.clock.skewed(fixed);
+            return fixed;
         }
         let h = (self.seed ^ id.wrapping_mul(0x9e37_79b9_7f4a_7c15))
             .wrapping_mul(0xbf58_476d_1ce4_e5b9);
         let span = 2 * self.clock_skew_ms + 1;
-        self.clock
-            .skewed((h % span as u64) as i64 - self.clock_skew_ms + fixed)
+        (h % span as u64) as i64 - self.clock_skew_ms + fixed
     }
 }
 
@@ -356,6 +376,9 @@ impl NodeHandle {
             }
         };
         let incarnation = meta.bump_incarnation().expect("incarnation");
+        // One clock for the incarnation: the driver, the meta's token check,
+        // the beat and lane threads and the handle all read it.
+        let clock = env.clock_of(id, incarnation);
         // Plan 30 §M6: the session state is the process's; a restart is a
         // new FUSE session.
         meta.session().reset();
@@ -408,8 +431,8 @@ impl NodeHandle {
         // F1: the token check at the write reads this node's clock, as
         // the daemon's reads its wall clock.
         {
-            let clock = env.clock_of(id);
-            meta.locks().set_clock(Arc::new(move || clock.now().0));
+            let clock = clock.clone();
+            meta.locks().set_clock(Arc::new(move || clock.wall().0));
             meta.locks()
                 .set_tag_check_at_write_for_tests(env.tag_check_at_write);
             meta.locks().set_settle_for_tests(env.settle_tagged_writes);
@@ -436,7 +459,8 @@ impl NodeHandle {
             );
         }
         env.world.register(id, meta.clone());
-        let cfg = (env.config)(id, incarnation);
+        let mut cfg = (env.config)(id, incarnation);
+        cfg.clock_id = clock.id();
         let beat_every_ms = cfg.backup_heartbeat_ms.max(1);
         let lane = env.deleg_lane && cfg.delegation && cfg.p2p;
         let driver = Driver {
@@ -447,7 +471,8 @@ impl NodeHandle {
             bucket: env.bucket.clone(),
             world: env.world.clone(),
             bus: env.bus.clone(),
-            clock: env.clock_of(id),
+            step_now: clock.now(),
+            clock: clock.clone(),
             tx: tx.clone(),
             rx,
             urgent_rx,
@@ -480,7 +505,7 @@ impl NodeHandle {
                 id,
                 shared.clone(),
                 env.bus.clone(),
-                env.clock_of(id),
+                clock.clone(),
                 beat_every_ms,
             ));
         }
@@ -489,7 +514,7 @@ impl NodeHandle {
                 id,
                 shared.clone(),
                 env.bus.clone(),
-                env.clock_of(id),
+                clock.clone(),
                 beat_every_ms,
                 env.holder_beats == super::run::HolderBeats::Runtime,
             ));
@@ -498,7 +523,7 @@ impl NodeHandle {
             id,
             meta,
             shared,
-            clock: env.clock_of(id),
+            clock,
             tx,
             task,
         }
@@ -637,6 +662,12 @@ struct Driver {
     world: Arc<ChunkWorld>,
     bus: Arc<Bus>,
     clock: Clock,
+    /// The `Now` the core was last stepped with: the anchor of the
+    /// relative timers the step arms (`Action::SetTimer { after_ms }` counts
+    /// from the reading, not from the dispatch: a step that waited between
+    /// its clock read and its actions, `StallStep`, still fires its timers
+    /// when the reading says).
+    step_now: constellation_authority::Now,
     tx: mpsc::UnboundedSender<Event>,
     rx: mpsc::UnboundedReceiver<Event>,
     /// The daemon's urgent lane, as far as the delegation renewal lane
@@ -824,7 +855,7 @@ async fn beat_loop(
         else {
             continue;
         };
-        let at = clock.now().0;
+        let at = clock.wall().0;
         if at >= until_ms {
             continue;
         }
@@ -854,6 +885,8 @@ async fn deleg_lane_loop(
     use constellation_authority::deleg_lane::{due, with_granted_ttl, FREEZE_MIN_MS, LANE_REQ_BIT};
     let mut seq = 0u64;
     let mut sent: HashMap<(u64, u64), constellation_authority::Ms> = HashMap::new();
+    // When the previous tick expected this one (tokio's clock).
+    let mut due_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(every_ms)).await;
         if !shared.alive.load(Ordering::SeqCst) {
@@ -867,20 +900,27 @@ async fn deleg_lane_loop(
         {
             continue;
         }
+        let woke = tokio::time::Instant::now();
         let now = clock.now();
         // This tick ran; if it ran late, the process was frozen meanwhile.
-        let due_was = shared.beat_due.load(Ordering::SeqCst);
-        if due_was > 0 && now.0 - due_was >= FREEZE_MIN_MS {
-            shared.beat_freeze.store(
-                constellation_authority::deleg_lane::pack_freeze(due_was, now.0 - due_was),
-                Ordering::SeqCst,
-            );
+        // Measured on the runtime's monotonic clock, as the daemon's
+        // heartbeat thread does (`holder_alive_loop`): a wall step between
+        // two ticks would invent or hide a freeze (plan 43 C7-H1).
+        if let Some(due) = due_at {
+            let late = woke.saturating_duration_since(due).as_millis() as i64;
+            if late >= FREEZE_MIN_MS {
+                shared.beat_freeze.store(
+                    constellation_authority::deleg_lane::pack_freeze(now.wall.0 - late, late),
+                    Ordering::SeqCst,
+                );
+            }
         }
+        due_at = Some(woke + std::time::Duration::from_millis(every_ms));
         shared
             .beat_due
-            .store(now.0 + every_ms as i64, Ordering::SeqCst);
+            .store(now.wall.0 + every_ms as i64, Ordering::SeqCst);
         let busy = shared.busy_since.load(Ordering::SeqCst);
-        let stuck_ms = if busy != 0 { now.0 - busy } else { 0 };
+        let stuck_ms = if busy != 0 { now.wall.0 - busy } else { 0 };
         let mut certs = shared.deleg_certs.lock().unwrap().clone();
         for c in certs.iter_mut() {
             if let Some((from, ttl)) = shared.granted_ttl.lock().unwrap().get(&(c.gen, c.round)) {
@@ -890,7 +930,7 @@ async fn deleg_lane_loop(
             }
         }
         sent.retain(|k, _| certs.iter().any(|c| (c.gen, c.round) == *k));
-        for c in due(&certs, now, stuck_ms, SIM_HOLDER_STALL_MS, &sent) {
+        for c in due(&certs, now.wall, stuck_ms, SIM_HOLDER_STALL_MS, &sent) {
             seq += 1;
             let req = OpId(LANE_REQ_BIT | seq);
             if shared
@@ -900,13 +940,13 @@ async fn deleg_lane_loop(
                     round: c.round,
                     to: c.root,
                     req,
-                    sent: now,
+                    sent: now.wall,
                 })
                 .is_err()
             {
                 return;
             }
-            sent.insert((c.gen, c.round), now);
+            sent.insert((c.gen, c.round), now.wall);
             bus.send(
                 id,
                 c.root,
@@ -928,10 +968,12 @@ impl Driver {
     async fn run(mut self) {
         let now = self.clock.now();
         let mut out = Vec::new();
+        self.step_now = now;
         self.core.start(now, &*self.meta, &mut out);
         self.dispatch(out);
         let bootstrap = OpId(u64::MAX);
         self.bootstrap = Some(bootstrap);
+        self.step_now = now;
         let out = self.core.handle(
             now,
             Event::Control {
@@ -944,6 +986,7 @@ impl Driver {
         // Plan 30 §M10: a restarted member reports its persisted epoch.
         let epoch = self.shared.epoch.lock().unwrap().clone();
         if epoch.open || epoch.flushing {
+            self.step_now = now;
             let out = self.core.handle(
                 now,
                 Event::Control {
@@ -960,7 +1003,7 @@ impl Driver {
         {
             let (tx, bus, id) = (self.tx.clone(), self.bus.clone(), self.id);
             let p2p = self.core.config().p2p;
-            let clock = self.clock;
+            let clock = self.clock.clone();
             tokio::spawn(async move {
                 // Plan 30 §M9: since when each link has been up without a
                 // break (the directory's `since`).
@@ -983,7 +1026,7 @@ impl Driver {
                         .map(|n| {
                             let connected = bus.linked(id, n);
                             let since = if connected {
-                                Some(*up_since.entry(n).or_insert(now))
+                                Some(*up_since.entry(n).or_insert(now.wall))
                             } else {
                                 up_since.remove(&n);
                                 None
@@ -1027,12 +1070,13 @@ impl Driver {
             for (from, until) in constellation_authority::deleg_lane::freezes(
                 self.shared.beat_freeze.load(Ordering::SeqCst),
                 self.shared.beat_due.load(Ordering::SeqCst),
-                now.0,
+                now.wall.0,
             ) {
                 let (hf, hu) = self.freeze_handed;
                 if from != hf || until > hu + 200 {
                     self.freeze_handed = (from, until);
                     // (A step like any other: `handle` may emit actions.)
+                    self.step_now = now;
                     let actions = self.core.handle(
                         now,
                         Event::OwnFreeze {
@@ -1050,13 +1094,13 @@ impl Driver {
             if let Some(ms) = stall {
                 tracing::debug!(
                     node = self.id,
-                    now = now.0,
+                    now = now.wall.0,
                     ms,
                     "sim: step stalled after its clock read"
                 );
                 // The step is stuck: the delegation renewal lane sees it
                 // (`deleg_lane_loop`) from here.
-                self.shared.busy_since.store(now.0, Ordering::SeqCst);
+                self.shared.busy_since.store(now.wall.0, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 self.shared.busy_since.store(0, Ordering::SeqCst);
             }
@@ -1072,7 +1116,7 @@ impl Driver {
             } = &mut event
             {
                 if at.0 == 0 {
-                    *at = now;
+                    *at = now.wall;
                 }
                 if let (Some(margin), true) = (self.credit_margin, *seq != 0 && sent.0 != 0) {
                     *at = (*at).min(constellation_authority::Ms(sent.0 + margin));
@@ -1107,19 +1151,21 @@ impl Driver {
                 };
                 let mut h = EVENT_HISTOGRAM.lock().unwrap();
                 let (clock, hist) = h.get_or_insert_with(|| (0, BTreeMap::new()));
-                *clock = now.0 as u64;
+                *clock = now.wall.0 as u64;
                 *hist.entry(format!("node{}:{kind}", self.id)).or_default() += 1;
                 drop(h);
                 if let Event::Timer { .. } = &event {
                     let mut g = TIMER_GAPS.lock().unwrap();
                     let m = g.get_or_insert_with(BTreeMap::new);
-                    let e =
-                        m.entry(format!("node{}:{kind}", self.id))
-                            .or_insert((now.0, 0, i64::MAX));
+                    let e = m.entry(format!("node{}:{kind}", self.id)).or_insert((
+                        now.wall.0,
+                        0,
+                        i64::MAX,
+                    ));
                     if e.1 > 0 {
-                        e.2 = e.2.min(now.0 - e.0);
+                        e.2 = e.2.min(now.wall.0 - e.0);
                     }
-                    e.0 = now.0;
+                    e.0 = now.wall.0;
                     e.1 += 1;
                 }
                 *IN_FLIGHT.lock().unwrap() = Some((self.id, text, std::time::Instant::now()));
@@ -1144,6 +1190,7 @@ impl Driver {
                 _ => None,
             };
             self.before_core(&event);
+            self.step_now = now;
             let actions = self.core.handle(now, event, &*self.meta);
             if debug && (debug_event.contains("Lock") || lock_timer.is_some()) {
                 let debug_event = match &lock_timer {
@@ -1160,7 +1207,7 @@ impl Driver {
                     .collect();
                 tracing::debug!(
                     node = self.id,
-                    now = now.0,
+                    now = now.wall.0,
                     event = %debug_event,
                     ?sent,
                     held = ?self.meta.locks().held_all(),
@@ -1239,7 +1286,7 @@ impl Driver {
                 .unwrap_or_default();
                 tracing::debug!(
                     node = self.id,
-                    now = now.0,
+                    now = now.wall.0,
                     event = %debug_event,
                     applied = Replica::applied_seq(&*self.meta).unwrap_or(0),
                     ?listing,
@@ -1374,8 +1421,8 @@ impl Driver {
             tokio::time::Instant::now().duration_since(t).as_millis() as i64
         });
         self.ready.push_back(Event::OwnLag {
-            from: constellation_authority::Ms(now.0 - lapsed),
-            until: now,
+            from: constellation_authority::Ms(now.wall.0 - lapsed),
+            until: now.wall,
         });
         if self.stamps_first {
             // The daemon's P2P handlers stamp the holder's beats and
@@ -1422,7 +1469,7 @@ impl Driver {
                     epoch,
                     candidacy: 0,
                     listed: true,
-                    at: now,
+                    at: now.wall,
                     seq: 0,
                     sent: constellation_authority::Ms(0),
                     expires: constellation_authority::Ms(expires),
@@ -1470,7 +1517,7 @@ impl Driver {
                 .floor_ms
                 .lock()
                 .unwrap()
-                .push((floor - now.0).max(0) as u64);
+                .push((floor - now.wall.0).max(0) as u64);
         } else if floor == 0 {
             self.shared.floor_seen.store(0, Ordering::SeqCst);
         }
@@ -1570,7 +1617,7 @@ impl Driver {
     /// fast-path op; the core handles the event.
     fn fast_path(
         &mut self,
-        now: constellation_authority::Ms,
+        now: constellation_authority::Now,
         event: &Event,
     ) -> Option<Vec<Action>> {
         use super::run::FastPath;
@@ -1623,7 +1670,7 @@ impl Driver {
             }
         }
         let outcome = outcome_of(
-            constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now.0),
+            constellation_meta::execute_tagged(&self.meta, op, Some(*rid), tag, now.wall.0),
             epoch,
         );
         drop(admission);
@@ -1636,7 +1683,7 @@ impl Driver {
     #[allow(clippy::too_many_arguments)]
     fn hold_write(
         &mut self,
-        now: constellation_authority::Ms,
+        now: constellation_authority::Now,
         rid: Rid,
         op: &MutateOp,
         tag: &LockTag,
@@ -1650,7 +1697,7 @@ impl Driver {
         let thread = {
             let (meta, op, tag) = (self.meta.clone(), op.clone(), tag.clone());
             let checked = phase_tx.clone();
-            let clock = self.clock;
+            let clock = self.clock.clone();
             std::thread::spawn(move || {
                 // The node's clock is the runtime's paused one.
                 let _rt = rt.enter();
@@ -1658,7 +1705,7 @@ impl Driver {
                     let _ = checked.send(HeldPhase::Checked);
                     go_rx.recv().unwrap_or(false)
                 })));
-                let r = constellation_meta::execute_tagged(&meta, &op, Some(rid), &tag, now.0);
+                let r = constellation_meta::execute_tagged(&meta, &op, Some(rid), &tag, now.wall.0);
                 constellation_meta::set_before_write_hook_for_tests(None);
                 let _ = phase_tx.send(HeldPhase::Done(
                     outcome_of(r, epoch),
@@ -1713,7 +1760,7 @@ impl Driver {
     /// not this delegate's to execute here.
     fn delegate_hold(
         &mut self,
-        now: constellation_authority::Ms,
+        now: constellation_authority::Now,
         rid: Rid,
         op: &MutateOp,
         tag: &LockTag,
@@ -1731,7 +1778,11 @@ impl Driver {
         }
         let gen = d.gen;
         let view = self.core.deleg_view();
-        if !view.mine.iter().any(|m| m.1 == gen && !m.3 && now.0 < m.2) {
+        if !view
+            .mine
+            .iter()
+            .any(|m| m.1 == gen && !m.3 && now.wall.0 < m.2)
+        {
             return None;
         }
         let session = self.meta.session();
@@ -1746,7 +1797,7 @@ impl Driver {
             let (meta, op, tag) = (self.meta.clone(), op.clone(), tag.clone());
             let checked = phase_tx.clone();
             let mut go_rx = Some(go_rx);
-            let clock = self.clock;
+            let clock = self.clock.clone();
             std::thread::spawn(move || {
                 let _rt = rt.enter();
                 constellation_meta::write_check_hook::set(Some(Box::new(move |at| {
@@ -1756,7 +1807,7 @@ impl Driver {
                     let _ = checked.send(HeldPhase::Checked);
                     go_rx.take().is_none_or(|rx| rx.recv().unwrap_or(false))
                 })));
-                let r = meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now.0);
+                let r = meta.delegate_execute(&op, Some(rid), gen, deps, &tag, now.wall.0);
                 constellation_meta::write_check_hook::set(None);
                 let at = clock.elapsed_ms();
                 let _ = committed_tx.send(());
@@ -1864,7 +1915,7 @@ impl Driver {
     /// to the core and the reply.
     fn fast_path_done(
         &mut self,
-        now: constellation_authority::Ms,
+        now: constellation_authority::Now,
         rid: Rid,
         op: &MutateOp,
         outcome: MutateOutcome,
@@ -1874,10 +1925,11 @@ impl Driver {
             .fetch_add(1, Ordering::Relaxed);
         self.core
             .place_note_local(&[TouchSet::from_op(op)], &*self.meta);
+        self.step_now = now;
         let mut actions = self.core.handle(
             now,
             Event::Activity {
-                last_write: now,
+                last_write: now.wall,
                 acked_seqs: vec![rid.seq],
             },
             &*self.meta,
@@ -1907,11 +1959,14 @@ impl Driver {
                 }
                 Action::Send { to, msg } => self.bus.send(self.id, to, msg),
                 Action::S3 { op, req } => self.spawn_s3(op, req),
-                Action::SetTimer { id, at, kind } => {
+                Action::SetTimer { id, after_ms, kind } => {
                     self.timers.insert(id);
                     self.timer_kinds.insert(id, kind);
                     let tx = self.tx.clone();
-                    let when = self.clock.at(at);
+                    // Counted from the reading of the step that armed it
+                    // (see `step_now`), on the runtime's monotonic clock.
+                    let when = self.clock.instant_of(self.step_now)
+                        + std::time::Duration::from_millis(after_ms);
                     tokio::spawn(async move {
                         tokio::time::sleep_until(when).await;
                         let _ = tx.send(Event::Timer { id });
@@ -2252,7 +2307,7 @@ impl Driver {
                     CommitPayload::single_root(constellation_mtree::NodeHash(root), Vec::new())
                         .with_author(node, epoch)
                         .with_applied(applied);
-                let commit = payload.at(head + 1, now.0);
+                let commit = payload.at(head + 1, now.wall.0);
                 match chain.create(&commit).await {
                     Ok(()) => {
                         shared.commits.lock().unwrap().push(CommitRecord {

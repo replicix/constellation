@@ -13,7 +13,7 @@
 use super::{Core, S3For, Timer};
 use crate::action::{Action, ClientReply, S3Op};
 use crate::event::{PeerMsg, Policy, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, OpId};
+use crate::ids::{Epoch, Ms, NodeId, Now, OpId};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
@@ -218,7 +218,7 @@ impl ClientOp {
 impl super::Core {
     /// Note every in-flight client op's state if it changed (run after
     /// each event): what [`Self::log_if_slow`] logs for a slow op.
-    pub(crate) fn note_client_states(&mut self, now: Ms) {
+    pub(crate) fn note_client_states(&mut self, now: Now) {
         if slow_op_ms() <= 0 || self.clients.is_empty() {
             return;
         }
@@ -239,15 +239,15 @@ impl super::Core {
                 state.push_str("+held-for-replays");
             }
             if c.history.last().is_none_or(|(_, s)| *s != state) && c.history.len() < HISTORY_CAP {
-                c.history.push((now.since(c.submitted), state));
+                c.history.push((now.wall.since(c.submitted), state));
             }
         }
     }
 
     /// A client op that took longer than `CONSTELLATION_SLOW_OP_MS` is
     /// logged with the states it went through.
-    fn log_if_slow(&self, now: Ms, rid: Rid, c: &ClientOp, outcome: &str, replica: &dyn Replica) {
-        let took = now.since(c.submitted);
+    fn log_if_slow(&self, now: Now, rid: Rid, c: &ClientOp, outcome: &str, replica: &dyn Replica) {
+        let took = now.wall.since(c.submitted);
         if slow_op_ms() <= 0 || took < slow_op_ms() {
             return;
         }
@@ -385,7 +385,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_submit(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         op: MutateOp,
         policy: Policy,
@@ -425,7 +425,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         op: MutateOp,
         policy: Policy,
@@ -451,8 +451,8 @@ impl Core {
             tracing::warn!(node = self.cfg.node_id, ?rid, "duplicate submit ignored");
             return;
         }
-        let deadline = self.set_timer(
-            now.plus(self.cfg.acquire_deadline_ms),
+        let deadline = self.set_timer_wall(
+            now.wall.plus(self.cfg.acquire_deadline_ms),
             Timer::ClientDeadline(rid),
             out,
         );
@@ -496,7 +496,7 @@ impl Core {
                 deps,
                 also_client: false,
                 deps_held: false,
-                submitted: now,
+                submitted: now.wall,
                 history: Vec::new(),
                 own_record_timer: None,
                 own_record_inos: BTreeSet::new(),
@@ -590,7 +590,7 @@ impl Core {
 
     /// An op finished: release the gated ops it was holding back, in
     /// submission order.
-    fn release_gated(&mut self, now: Ms, replica: &dyn Replica, out: &mut Vec<Action>) {
+    fn release_gated(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         let mut ready: Vec<(u64, Rid)> = self
             .clients
             .iter()
@@ -628,7 +628,7 @@ impl Core {
 
     /// The `deps` a write submitted now carries: the session's (see
     /// `SessionState::deps`), plus, on the root, its own journal.
-    pub(crate) fn fresh_deps(&mut self, now: Ms, replica: &dyn Replica) -> Position {
+    pub(crate) fn fresh_deps(&mut self, now: Now, replica: &dyn Replica) -> Position {
         // Plan 30 §M11: `None` (the streams overflow) is a root-only op:
         // the root orders after everything it appended.
         let (mut deps, overflow) = match replica.deps() {
@@ -681,7 +681,7 @@ impl Core {
     /// a generation the log has ended (see `live_rows`).
     pub(crate) fn hold_for_lost_deps(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -751,8 +751,8 @@ impl Core {
             if let Some(t) = old {
                 self.cancel_timer(t, out);
             }
-            let timer = self.set_timer(
-                now.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+            let timer = self.set_timer_wall(
+                now.wall.plus(self.cfg.delegation_stream_tick_ms.max(10)),
                 Timer::ForwardBackoff(rid),
                 out,
             );
@@ -888,7 +888,7 @@ impl Core {
     /// and held here (`send_forward` to node 0 = withdraw, then back off).
     pub(crate) fn withdraw_lost_deps_inbox_ops(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -921,7 +921,7 @@ impl Core {
     /// take the lease path when forwarding is off.
     pub(crate) fn route(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -987,7 +987,7 @@ impl Core {
 
     pub(crate) fn on_holder_learned(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         result: S3Result,
         replica: &dyn Replica,
@@ -1005,7 +1005,7 @@ impl Core {
         };
         let live = object
             .as_ref()
-            .filter(|lease| lease.holder != 0 && !lease.is_claimable(now.0));
+            .filter(|lease| lease.holder != 0 && !lease.is_claimable(now.wall.0));
         match live {
             Some(lease) if lease.holder != self.cfg.node_id => {
                 let holder = lease.holder;
@@ -1038,15 +1038,15 @@ impl Core {
 
     pub(crate) fn send_forward(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         holder: NodeId,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         let req = self.op_id();
-        let timer = self.set_timer(
-            now.plus(self.cfg.forward_timeout_ms),
+        let timer = self.set_timer_wall(
+            now.wall.plus(self.cfg.forward_timeout_ms),
             Timer::ForwardTimeout(rid),
             out,
         );
@@ -1073,7 +1073,7 @@ impl Core {
             let batch = constellation_store_s3::inbox::InboxBatch::tombstone(
                 key,
                 self.cfg.incarnation,
-                now.0,
+                now.wall.0,
             );
             self.issue_s3(
                 S3Op::InboxTombstone { batch },
@@ -1087,8 +1087,8 @@ impl Core {
             // `hold_for_lost_deps` decides.
             c.phase = Phase::Backoff;
             self.cancel_timer(timer, out);
-            let t = self.set_timer(
-                now.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+            let t = self.set_timer_wall(
+                now.wall.plus(self.cfg.delegation_stream_tick_ms.max(10)),
                 Timer::ForwardBackoff(rid),
                 out,
             );
@@ -1119,7 +1119,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_mutate_reply(
         &mut self,
-        now: Ms,
+        now: Now,
         from: NodeId,
         req: OpId,
         outcome: MutateOutcome,
@@ -1295,7 +1295,8 @@ impl Core {
                 // rid, no attempt spent) — the holder answers from its
                 // dedup, or holds the retry until the recalls are done.
                 self.stats.held_retries += 1;
-                let timer = self.set_timer(now.plus(retry_ms), Timer::ForwardBackoff(rid), out);
+                let timer =
+                    self.set_timer_wall(now.wall.plus(retry_ms), Timer::ForwardBackoff(rid), out);
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = Phase::Backoff;
                     c.timer = Some(timer);
@@ -1336,8 +1337,8 @@ impl Core {
                     });
                 if grant_lags {
                     self.stats.deleg_grant_lag_retries += 1;
-                    let timer = self.set_timer(
-                        now.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+                    let timer = self.set_timer_wall(
+                        now.wall.plus(self.cfg.delegation_stream_tick_ms.max(10)),
                         Timer::ForwardBackoff(rid),
                         out,
                     );
@@ -1404,7 +1405,7 @@ impl Core {
 
     pub(crate) fn on_forward_timeout(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1422,7 +1423,7 @@ impl Core {
 
     pub(crate) fn on_forward_failed(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1443,7 +1444,7 @@ impl Core {
     /// (a system op gets no retries; a best-effort one is dropped).
     pub(crate) fn retry_or_lease(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1475,7 +1476,8 @@ impl Core {
                 let delay = (self.cfg.forward_backoff_ms * u64::from(c.attempts))
                     .min(self.cfg.s3_less_retry_ms.max(self.cfg.forward_backoff_ms));
                 c.phase = Phase::Backoff;
-                let timer = self.set_timer(now.plus(delay), Timer::ForwardBackoff(rid), out);
+                let timer =
+                    self.set_timer_wall(now.wall.plus(delay), Timer::ForwardBackoff(rid), out);
                 self.clients.get_mut(&rid).expect("present").timer = Some(timer);
             }
             _ => {
@@ -1492,7 +1494,7 @@ impl Core {
 
     pub(crate) fn on_forward_backoff(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1568,7 +1570,7 @@ impl Core {
     ///   outage, which the continuation epoch serves).
     pub(crate) fn on_own_s3(
         &mut self,
-        now: Ms,
+        now: Now,
         stalled: bool,
         peers_reach_s3: Option<bool>,
         replica: &dyn Replica,
@@ -1589,7 +1591,7 @@ impl Core {
             stalled,
             peers_reach_s3: if stalled { peers_reach_s3 } else { None },
             since: if stalled {
-                self.own_s3.since.or(Some(now))
+                self.own_s3.since.or(Some(now.wall))
             } else {
                 None
             },
@@ -1604,7 +1606,7 @@ impl Core {
                 .filter(|(_, c)| {
                     c.origin == Origin::Client
                         && c.policy == Policy::Client
-                        && now.since(c.submitted) >= self.cfg.s3_less_deadline_ms as i64
+                        && now.wall.since(c.submitted) >= self.cfg.s3_less_deadline_ms as i64
                 })
                 .map(|(rid, _)| *rid)
                 .collect();
@@ -1615,7 +1617,7 @@ impl Core {
                         ?rid,
                         op = ?c.op,
                         phase = ?c.phase_kind(),
-                        age_ms = now.since(c.submitted),
+                        age_ms = now.wall.since(c.submitted),
                         "no answer while this node's S3 is stalled: the op fails (in doubt)"
                     );
                 }
@@ -1683,7 +1685,7 @@ impl Core {
     /// and, once held, execute here — unless the rid already completed.
     pub(crate) fn lease_path(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1719,8 +1721,8 @@ impl Core {
             // The inbox wait had its own deadline; the lease path gets
             // the ordinary one from here.
             self.cancel_timer(old_deadline, out);
-            let deadline = self.set_timer(
-                now.plus(self.cfg.acquire_deadline_ms),
+            let deadline = self.set_timer_wall(
+                now.wall.plus(self.cfg.acquire_deadline_ms),
                 Timer::ClientDeadline(rid),
                 out,
             );
@@ -1742,7 +1744,7 @@ impl Core {
     /// and asks again (a system op gives up instead).
     pub(crate) fn on_acquire_finished(
         &mut self,
-        now: Ms,
+        now: Now,
         acquired: bool,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1783,7 +1785,7 @@ impl Core {
     /// read's late answer finds no op.
     pub(crate) fn refuse_waiting_for_lease(
         &mut self,
-        now: Ms,
+        now: Now,
         code: Code,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1844,7 +1846,7 @@ impl Core {
     /// and the drain resends it once the epoch is over.
     fn refuse_on_lease_path(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         code: Code,
         replica: &dyn Replica,
@@ -1870,7 +1872,7 @@ impl Core {
         self.finish_in_doubt(now, rid, replica, out);
     }
 
-    fn schedule_acquire_retry(&mut self, now: Ms, rid: Rid, out: &mut Vec<Action>) {
+    fn schedule_acquire_retry(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -1878,13 +1880,13 @@ impl Core {
         let delay = (self.cfg.acquire_retry_min_ms << c.acquire_retries.min(10))
             .min(self.cfg.acquire_retry_max_ms);
         c.phase = Phase::AcquireRetry;
-        let timer = self.set_timer(now.plus(delay), Timer::AcquireRetry(rid), out);
+        let timer = self.set_timer_wall(now.wall.plus(delay), Timer::AcquireRetry(rid), out);
         self.clients.get_mut(&rid).expect("present").timer = Some(timer);
     }
 
     pub(crate) fn on_acquire_retry(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -1962,7 +1964,7 @@ impl Core {
     /// taken effect and skips the read (the fast path's cost).
     pub(crate) fn resolve_in_doubt_then_execute(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         epoch: Epoch,
         replica: &dyn Replica,
@@ -2003,7 +2005,7 @@ impl Core {
     /// local branch).
     pub(crate) fn execute_local(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         epoch: Epoch,
         replica: &dyn Replica,
@@ -2063,7 +2065,7 @@ impl Core {
             let dirs = Core::dirs_of_keys(&super::holder::keys_of_op(&op), replica);
             self.place_note(self.cfg.node_id, dirs);
         }
-        let outcome = match replica.execute(&op, Some(rid), &tag, now.0) {
+        let outcome = match replica.execute(&op, Some(rid), &tag, now.wall.0) {
             Ok(records) => {
                 if policy == Policy::Client {
                     self.lease.touch(now);
@@ -2207,7 +2209,7 @@ impl Core {
     /// (`Core::on_observed_upload`: a pass that failed).
     fn observe_reply(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         position: Position,
         own_chunks: &OwnChunks,
@@ -2240,13 +2242,13 @@ impl Core {
     /// (S3 away a moment) left the reads waiting out the watermark's TTL.
     /// A pass with nothing left to upload costs an index lookup per
     /// inode. At most [`OBSERVED_UPLOAD_REPEATS`] times per raise.
-    fn repeat_observed_upload(&mut self, now: Ms, inos: &[Ino], out: &mut Vec<Action>) {
+    fn repeat_observed_upload(&mut self, now: Now, inos: &[Ino], out: &mut Vec<Action>) {
         let u = &mut self.observed_upload;
         u.inos.extend(inos.iter().copied());
         u.repeats = 0;
         if u.timer.is_none() {
-            let t = self.set_timer(
-                now.plus(self.cfg.own_record_wait_ms),
+            let t = self.set_timer_wall(
+                now.wall.plus(self.cfg.own_record_wait_ms),
                 Timer::ObservedUpload,
                 out,
             );
@@ -2257,7 +2259,7 @@ impl Core {
     /// `Timer::ObservedUpload` (see [`Self::repeat_observed_upload`]).
     pub(crate) fn on_observed_upload(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2276,8 +2278,8 @@ impl Core {
             "an observed position still waits for this node's pending chunks: uploading again"
         );
         out.push(Action::UploadAwaited { inos });
-        let t = self.set_timer(
-            now.plus(self.cfg.own_record_wait_ms),
+        let t = self.set_timer_wall(
+            now.wall.plus(self.cfg.own_record_wait_ms),
             Timer::ObservedUpload,
             out,
         );
@@ -2335,7 +2337,7 @@ impl Core {
     /// driver. The timer is cancelled when the op finishes.
     pub(crate) fn await_own_records(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         own_chunks: OwnChunks,
         out: &mut Vec<Action>,
@@ -2364,7 +2366,7 @@ impl Core {
                 self.upload_own_records(now, rid, out);
             }
         } else if c.own_record_timer.is_none() {
-            let t = self.set_timer(now.plus(wait), Timer::OwnRecordWait(rid), out);
+            let t = self.set_timer_wall(now.wall.plus(wait), Timer::OwnRecordWait(rid), out);
             self.clients
                 .get_mut(&rid)
                 .expect("present")
@@ -2374,7 +2376,7 @@ impl Core {
 
     /// `Timer::OwnRecordWait`: the op still waits (a stale fire finds no
     /// op: the timer is cancelled when it finishes).
-    pub(crate) fn on_own_record_wait(&mut self, now: Ms, rid: Rid, out: &mut Vec<Action>) {
+    pub(crate) fn on_own_record_wait(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -2382,7 +2384,7 @@ impl Core {
         self.upload_own_records(now, rid, out);
     }
 
-    fn upload_own_records(&mut self, now: Ms, rid: Rid, out: &mut Vec<Action>) {
+    fn upload_own_records(&mut self, now: Now, rid: Rid, out: &mut Vec<Action>) {
         let Some(c) = self.clients.get_mut(&rid) else {
             return;
         };
@@ -2405,7 +2407,7 @@ impl Core {
         out.push(Action::UploadAwaited { inos });
         let wait = self.cfg.own_record_wait_ms;
         if wait > 0 {
-            let t = self.set_timer(now.plus(wait), Timer::OwnRecordWait(rid), out);
+            let t = self.set_timer_wall(now.wall.plus(wait), Timer::OwnRecordWait(rid), out);
             self.clients
                 .get_mut(&rid)
                 .expect("present")
@@ -2476,7 +2478,7 @@ impl Core {
     /// trip per such op although the stream had delivered it.
     pub(crate) fn answer_awaiting_streamed(
         &mut self,
-        now: Ms,
+        now: Now,
         installed: &[(Rid, KeySet)],
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2510,7 +2512,7 @@ impl Core {
     /// or an inbox op whose outcome the holder shipped.
     pub(crate) fn answer_awaiting_log(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2566,7 +2568,7 @@ impl Core {
     /// (its own short timer checks the view first).
     pub(crate) fn resolve_moot_waits(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2646,7 +2648,7 @@ impl Core {
     /// are replayed: those came first, and the op may depend on them.
     pub(crate) fn reroute_ended_epoch_waits(
         &mut self,
-        now: Ms,
+        now: Now,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -2706,7 +2708,7 @@ impl Core {
 
     pub(crate) fn on_client_deadline(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2828,7 +2830,7 @@ impl Core {
     /// drain leaves it queued.
     pub(crate) fn finish_in_doubt(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -2882,7 +2884,7 @@ impl Core {
     /// Deliver the op's outcome to whoever submitted it.
     pub(crate) fn finish(
         &mut self,
-        now: Ms,
+        now: Now,
         rid: Rid,
         outcome: MutateOutcome,
         replica: &dyn Replica,

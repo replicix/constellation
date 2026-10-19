@@ -427,6 +427,16 @@ fn replay_seed() {
         Ok("locks-writer-hold-delegated-doubt") => locks_writer_hold_delegated_doubt_config(),
         Ok("locks-stall-step") => locks_stall_step_config(),
         Ok("locks-stall-step-delegated") => locks_stall_step_delegated_config(),
+        Ok("locks-root-step-forward") => locks_root_step_forward_config(),
+        Ok("locks-locker-step-back") => locks_locker_step_back_config(),
+        Ok("locks-holder-step-back-sealed") => locks_holder_step_back_sealed_config(),
+        Ok("fast-takeover-holder-step-forward") => fast_takeover_holder_step_forward_config(),
+        Ok("fast-takeover-successor-step-forward") => fast_takeover_successor_step_forward_config(),
+        Ok("delegated-root-step-forward") => delegated_root_step_forward_config(),
+        Ok("delegated-delegate-step-back") => delegated_delegate_step_back_config(),
+        Ok("strict-reader-step-back") => strict_reader_step_back_config(),
+        Ok("locks-root-step-back") => locks_root_step_back_config(),
+        Ok("locks-holder-step-forward") => locks_holder_step_forward_config(),
         Ok("locks-nofence") => SimConfig {
             lock_ignore_fence: true,
             ..locks_partition_config()
@@ -1626,6 +1636,263 @@ fn strict_isolated_reader_skewed_credited_config() -> SimConfig {
     SimConfig {
         beats_credited: true,
         ..strict_isolated_reader_skewed_config()
+    }
+}
+
+// ---- Plan 43 C7-H1: a wall-clock step of one node (`FaultKind::ClockStep`).
+//
+// The step moves one node's WALL reading only; its honour clock follows a
+// forward step once and ignores a backward one, its wait clock never moves
+// (`sim/clock.rs`). Until the commits that move a protocol site onto the
+// honour or the wait clock, every site reads WALL, so each configuration
+// below that targets a site fails here at the rate PROGRESS records (the
+// "fail-before" of the commit that fixes it). They are not in `long_locks`
+// or the CI tests until then.
+
+fn step_fault(at_ms: u64, who: sim::run::StepOf, ms: i64) -> ScheduledFault {
+    ScheduledFault {
+        at_ms,
+        kind: FaultKind::ClockStep { who, ms },
+    }
+}
+
+/// Plan 43 C7-H1: the simulated clock model. A step moves one node's WALL
+/// reading only, as the daemon's does (`types::clock`'s P4): HONOUR follows
+/// a forward step once, a backward step moves neither HONOUR nor WAIT, and
+/// no other node's clock moves. The step belongs to the node, so a new
+/// incarnation (a new `ProtocolClock` with a new id) starts all three
+/// readings at the stepped wall.
+#[tokio::test(start_paused = true)]
+async fn a_simulated_clock_step_moves_wall_only_and_outlives_the_incarnation() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    let truth = sim::clock::Clock::start();
+    let step = std::sync::Arc::new(AtomicI64::new(0));
+    let node = truth.for_node(0, step.clone(), (3 << 32) | 1);
+    let other = truth.for_node(0, std::sync::Arc::new(AtomicI64::new(0)), (2 << 32) | 1);
+    tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
+    let (n0, o0) = (node.now(), other.now());
+    assert_eq!(
+        (n0.wall.0, n0.honour.0, n0.wait.0),
+        (o0.wall.0, o0.honour.0, o0.wait.0)
+    );
+    // Backward: wall drops by 3 s; honour and wait go on with time.
+    step.fetch_add(-3_000, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    let n1 = node.now();
+    assert_eq!(n1.wall.0, n0.wall.0 - 3_000 + 500);
+    assert_eq!(n1.honour.0, n0.honour.0 + 500);
+    assert_eq!(n1.wait.0, n0.wait.0 + 500);
+    // Forward by 5 s: honour jumps 2 s past where time alone put it (the
+    // 3 s back-step is undone first), and wait never moves.
+    step.fetch_add(5_000, Ordering::SeqCst);
+    let n2 = node.now();
+    assert_eq!(n2.wall.0, n1.wall.0 + 5_000);
+    assert_eq!(n2.honour.0, n1.honour.0 + 2_000);
+    assert_eq!(n2.wait.0, n1.wait.0);
+    let st = node.step_stats();
+    assert_eq!((st.steps_backward, st.steps_forward), (1, 1));
+    // Nobody else moved.
+    let o1 = other.now();
+    assert_eq!(o1.wall.0, o0.wall.0 + 500);
+    assert_eq!(other.step_stats(), Default::default());
+    // A restart: a new clock over the same step. All three start at the
+    // node's wall; its id is new.
+    let reborn = truth.for_node(0, step.clone(), (3 << 32) | 2);
+    assert_ne!(reborn.id(), node.id());
+    let r = reborn.now();
+    assert_eq!(r.wall, node.wall());
+    assert_eq!((r.honour.0, r.wait.0), (r.wall.0, r.wall.0));
+}
+
+/// The review's case (plan 43 C7-F F-a review F2): the lease holder, which
+/// owns every lock grant, has its wall clock stepped forward 2.5 s, twice,
+/// while grants are held across the steps. It outwaits a grant by its wall
+/// clock (`LockGrantExpiry`, `conflicting`'s `drop_expired`), so a step
+/// ends the wait 2.5 s early: it grants the lock again while the first
+/// holder, whose own clock did not step, still honours its grant (mutual
+/// exclusion). Fails on 1 821 of 2 000 seeds before plan 43 C7-H1's
+/// wait-side commit.
+fn locks_root_step_forward_config() -> SimConfig {
+    SimConfig {
+        lock_ios: (6, 20),
+        lock_io_ms: (40, 200),
+        faults: vec![
+            step_fault(3_000, sim::run::StepOf::Holder, 2_500),
+            step_fault(7_000, sim::run::StepOf::Holder, 2_500),
+        ],
+        ..locks_config()
+    }
+}
+
+/// A locker is stepped back 3 s and then cut from every other node for
+/// 4 s inside its critical section (`PartitionLockerStepped`): its grant
+/// lapses at the owner, which outwaits it and grants the next node, while
+/// the locker, whose clock is 3 s behind, still honours it
+/// (`HeldGrant.until` on the wall clock): two holders of one lock. Fails on
+/// 479 of 2 000 seeds before the honour-side commit.
+fn locks_locker_step_back_config() -> SimConfig {
+    SimConfig {
+        random_faults: 0,
+        faults: vec![ScheduledFault {
+            at_ms: 2_000,
+            kind: FaultKind::PartitionLockerStepped {
+                step_ms: -3_000,
+                dur_ms: 4_000,
+            },
+        }],
+        ..locks_partition_config()
+    }
+}
+
+/// Plan 41 L0 under a backward step: the holder is cut from S3 and from its
+/// backup at 1.2 s (`locks-failover-backup-renew`), strict reads on, and
+/// its clock is stepped back 8 s as it is cut (the step has to outlast what
+/// the successor's floor leaves: at 3 s, 6 of 2 000 seeds fail). The
+/// holder's last S3 liveness stamp is a pre-step wall value and its lease
+/// is read on the stepped wall, so it keeps honouring both long after its
+/// successor has taken over: its own clients' lock grants are honoured past
+/// the successor's (the failures seen are mutual exclusion), and so should
+/// its strict answers be. No variant that isolated the strict read path
+/// (no locks; the holder's clients only reading; the holder isolated from
+/// every node) produced a stale read: the holder's reads block once it is
+/// cut (PROGRESS has the variants).
+fn locks_holder_step_back_sealed_config() -> SimConfig {
+    SimConfig {
+        strict: true,
+        read_ratio: 0.6,
+        holder_beats: sim::run::HolderBeats::Thread,
+        faults: [step_fault(1_200, sim::run::StepOf::Holder, -8_000)]
+            .into_iter()
+            .chain(locks_failover_backup_renew_config().faults)
+            .collect(),
+        ..locks_failover_backup_renew_config()
+    }
+}
+
+/// Plan 43 C7-F F-a's forward step (the review's F2): `locks-long-grants-
+/// seal` (5 s grants, the inbox off, the holder cut from S3 and its backup
+/// at 1.2 s, beats on a thread), with the holder's wall clock stepped
+/// forward 3 s shortly before the cut. The beats' `sent` is on the stepped
+/// wall and the expiry they name is not: the cap counts `X - sent`, 3 s
+/// early, and the successor's floor ends early. Two classes fail here, 18 of
+/// 2 000 seeds in all (81 before plan 44's ask-again fix): the old root's own
+/// grant table, which a forward step of 3 s makes drop records early (16 of
+/// them, between 1.2 and 1.55 s, within 0.35 s of the step: the wait-side
+/// commit), and, after the takeover, the successor's grant (2: the cap, or the old root still
+/// granting). The mirror of the old root's grants (`LockMirror`, restamped
+/// at the successor) covers most of what the cap alone would not.
+fn fast_takeover_holder_step_forward_config() -> SimConfig {
+    SimConfig {
+        faults: [step_fault(1_000, sim::run::StepOf::Holder, 3_000)]
+            .into_iter()
+            .chain(locks_long_grants_seal_config().faults)
+            .collect(),
+        holder_beats: sim::run::HolderBeats::Thread,
+        ..locks_long_grants_seal_config()
+    }
+}
+
+/// A successor stepped forward inside its own floor: `locks-long-grants-
+/// seal` (5 s grants, one seal at 1.2 s) with long critical sections (8 to
+/// 12 steps of 300 to 600 ms, so a section outlives the old root's window)
+/// and the successor's wall clock stepped forward 4 s at 3 s. By then the
+/// backup has sealed and is the lease holder, so the step is `StepOf::Holder`
+/// (`StepOf::Backup` reads the lease at the fault's time, where it names the
+/// *new* backup). The floor (`floor_until`, a wall deadline) ends 4 s early
+/// and the successor grants a lock inside the old root's window: mutual
+/// exclusion, about 5.4 s in. Fails on 20 of 2 000 seeds before the wait-side
+/// commit.
+fn fast_takeover_successor_step_forward_config() -> SimConfig {
+    SimConfig {
+        lock_ios: (8, 12),
+        lock_io_ms: (300, 600),
+        faults: locks_long_grants_seal_config()
+            .faults
+            .into_iter()
+            .chain([step_fault(3_000, sim::run::StepOf::Holder, 4_000)])
+            .collect(),
+        ..locks_long_grants_seal_config()
+    }
+}
+
+/// The root of a delegated tree stepped forward 3 s mid-run
+/// (`delegated-holder-cut`'s tree): it outwaits a generation by its wall
+/// clock (`GenState.until`), reclaims 3 s early and serves the directory
+/// while the delegate still honours the generation. Fails on 4 of 2 000
+/// seeds (an ordering violation, a rid the log refuses, a run that does not
+/// reach quiescence) before the wait-side commit.
+fn delegated_root_step_forward_config() -> SimConfig {
+    SimConfig {
+        faults: delegated_holder_cut_config()
+            .faults
+            .into_iter()
+            .chain([step_fault(1_000, sim::run::StepOf::Holder, 3_000)])
+            .collect(),
+        ..delegated_holder_cut_config()
+    }
+}
+
+/// A delegate stepped back 3 s while cut from its root for 12 s: it should
+/// keep executing under its generation's `until` (its wall clock) past the
+/// root's reclaim. Clean on this tree (0 of 2 000 seeds, and none of the
+/// stronger variants PROGRESS lists): kept as a regression configuration
+/// for the honour-side commit, not a fail-before.
+fn delegated_delegate_step_back_config() -> SimConfig {
+    SimConfig {
+        ops_per_client: 30,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::Partition {
+                    a: 1,
+                    b: 2,
+                    for_ms: 12_000,
+                },
+            },
+            step_fault(1_000, sim::run::StepOf::Node(2), -3_000),
+        ],
+        ..delegated_config()
+    }
+}
+
+/// The isolated strict reader (`strict-isolated-reader-skewed` without the
+/// constant offset) stepped back 3 s while it holds a read delegation and
+/// is cut off: it honours `HeldDelegation.until` on its wall clock, 3 s
+/// past the root's outwait, and serves a stale strict read
+/// (close-to-open). Fails on 91 of 2 000 seeds before the honour-side
+/// commit.
+fn strict_reader_step_back_config() -> SimConfig {
+    SimConfig {
+        clock_offsets: Vec::new(),
+        faults: strict_isolated_reader_beats_config()
+            .faults
+            .into_iter()
+            .chain([step_fault(1_400, sim::run::StepOf::Node(3), -3_000)])
+            .collect(),
+        ..strict_isolated_reader_beats_config()
+    }
+}
+
+/// Control: the root stepped back 3 s. Only longer waits on the wait side
+/// (the owner's outwait counts from a wall stamp that is now 3 s behind);
+/// nothing breaks, nothing hangs, no `EIO`. Guards "a backward step only
+/// lengthens waits".
+fn locks_root_step_back_config() -> SimConfig {
+    SimConfig {
+        faults: vec![step_fault(3_000, sim::run::StepOf::Holder, -3_000)],
+        ..locks_config()
+    }
+}
+
+/// Control: a locker stepped forward 3 s inside its section. A forward step
+/// ends the honour windows early (D2): its grant lapses, so its I/O can be
+/// fenced (`EIO` from the owner fence), counted and not a violation (2 140
+/// I/Os fenced in 1 885 of 2 000 seeds, no failure).
+fn locks_holder_step_forward_config() -> SimConfig {
+    SimConfig {
+        random_faults: 0,
+        faults: vec![step_fault(2_000, sim::run::StepOf::Locker, 3_000)],
+        ..locks_partition_config()
     }
 }
 
@@ -3383,6 +3650,16 @@ fn sweep_config() {
         "locks-writer-hold-delegated-doubt" => locks_writer_hold_delegated_doubt_config(),
         "locks-stall-step" => locks_stall_step_config(),
         "locks-stall-step-delegated" => locks_stall_step_delegated_config(),
+        "locks-root-step-forward" => locks_root_step_forward_config(),
+        "locks-locker-step-back" => locks_locker_step_back_config(),
+        "locks-holder-step-back-sealed" => locks_holder_step_back_sealed_config(),
+        "fast-takeover-holder-step-forward" => fast_takeover_holder_step_forward_config(),
+        "fast-takeover-successor-step-forward" => fast_takeover_successor_step_forward_config(),
+        "delegated-root-step-forward" => delegated_root_step_forward_config(),
+        "delegated-delegate-step-back" => delegated_delegate_step_back_config(),
+        "strict-reader-step-back" => strict_reader_step_back_config(),
+        "locks-root-step-back" => locks_root_step_back_config(),
+        "locks-holder-step-forward" => locks_holder_step_forward_config(),
         other => panic!("sweep_config: unknown config {other}"),
     };
     // `<config>+nomove+solo`: see `config_variant`.
