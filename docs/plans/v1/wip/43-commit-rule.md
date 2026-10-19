@@ -2944,6 +2944,10 @@ to land before C0.
   reading through a step file (stepping the host clock would move every
   container's). The item is `clock:step:<ms>:<at_ms>[@node]`, because
   `@<s>` collides with node targeting. *Recommended.*
+  **Answered 2026-10-19:** (a) every local duration — honour, wait and
+  liveness — in the four commits; (b) yes, the honour clock follows a
+  forward wall step, and an early end is counted and documented; (c)–(g)
+  as recommended.
 
 ### 11.1 Deferred (not in this plan)
 
