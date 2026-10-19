@@ -594,6 +594,33 @@ is a unit test in `crates/control`
 (`a_server_on_the_blocked_runtime_misses_its_handshake` against
 `the_control_plane_answers_while_the_engines_runtime_is_blocked`).
 
+### Control calls that get no answer (thread snapshots)
+
+A harness control call (`Client::control_call`, `control_status`,
+`control_call_at`) that gets no answer inside its bound, or whose
+handshake times out ("the daemon did not answer Hello"), names the node
+and the socket in its error, and keeps what the daemon's threads were
+doing: `/proc/<pid>/task/*/{comm,wchan,stat,syscall}`
+(`crates/harness/src/procsnap.rs`; the pid is the socket's peer, so a
+daemon that is not accepting is found too) in
+`control-timeout-<method>-<unix ms>.tasks`, beside the node's `mount.log`
+(under `CONSTELLATION_HARNESS_LOG_DIR/<scenario>/<node>/` when that is
+set, else next to the node's work directory, which goes with the
+scenario's temp dir: the error carries the summary line too). The summary
+counts the threads by what they were in: `42 threads: 3 runnable, 2 write,
+30 futex, 7 idle [2 tokio-rt-worker runnable, ...]`. Read it as: every
+runtime worker runnable or in one call (a blocked runtime or a starved
+host); threads in `write`/`fsync` or `disk-wait` (a stalled device); all
+idle (the daemon was frozen with its host, or its socket is not served).
+Any other failure of a control call names the node and the socket as well.
+Under Yama `ptrace_scope=1` (Ubuntu's default) the harness is not an ancestor
+of the daemonized daemon and cannot read `/proc/<pid>/task/*/syscall`: the
+snapshot then classifies by `wchan` and the state alone, and cannot tell
+`write` from `futex` (it still counts runnable, `sleep`, `disk-wait` and
+idle threads). The pid lookup never blocks: the connect that reads
+`SO_PEERCRED` is non-blocking, and a daemon whose listen backlog is full
+(it does not accept) is looked up by its `daemon.pid`.
+
 ### Running the lanes as root
 
 The passthrough and zero-copy scenarios need root, so a full lane is
@@ -2396,11 +2423,24 @@ relay of its own so requests can be attributed per role):
         than the renewal slack. The off-core renewal lane renews meanwhile:
         the same generation before and after, nothing reclaimed, recalled
         or lapsed, no write fails, the lane sent (`renewals_off_core`), and
-        the create + close after the stall is back to the control's. A
+        the writes after the stall still run on the delegate. That is read
+        from the delegation counters over the window after the stall
+        (`delegation.executed` + `fast_path_executed` at `b` against
+        `forwarded_ok` + `forwarded_err`: a lost delegation executes nothing
+        at `b` and forwards every write), never from how long they took.
+        How long they took (the create + close median against twice the
+        control's p90 plus 5 ms) goes through
+        `hostlag::latency_bound_over`, so a slow disk after the stall is
+        INCONCLUSIVE (the disk probe, below) and a regression with an
+        attentive host is a failure. A
         25 s stall, past the 15 s hung bound, is reclaimed by the root and
         nothing fails. `CONSTELLATION_DELEG_LANE=off` is the fail-before:
         the 9 and 12 s stalls then lose the delegation, which no
         classification excuses.
+        `CONSTELLATION_HARNESS_DELEG_AFTER_STALL_MS=150` keeps the store slow
+        after each stall (every ordinary write holds the writer lock that
+        long, until the iteration ends): the delegation is intact, so
+        nothing may fail, and the latency is not judged.
         `CONSTELLATION_HARNESS_DELEG_STALLS_MS=9000,12000` runs only those.
       - `delegate-backup-handoff-failover`: `b` (the backup) runs
         `daemon --upgrade` first. `a` drops it across the restart gap;
@@ -3320,6 +3360,25 @@ when:
    stall, S3 or link fault actually applied to a daemon of the scenario
    (CPU throttling and pauses are measured by the probes, a clock offset
    adds no latency: they never excuse by themselves).
+
+The probes are the harness's own sleeping thread, one in each throttled
+daemon's cgroup under a load profile, and a **disk-write probe**: every
+50 ms a thread overwrites 4 KiB of a hidden file in each client's work
+directory with a buffered `write(2)` (no sync) and records how long the call
+took, one thread per device (`hostlag::add_disk_probe`, started by
+`Client::new`; `CONSTELLATION_HARNESS_NO_DISK_PROBE=1` turns it off). A
+buffered write returns at once unless the filesystem throttles writers or is
+held up (dirty-page throttling behind a stalled device, a journal commit, a
+btrfs transaction), which is what makes a daemon's metadata writes slow
+without taking a CPU; its summary is the `disk` source of `host_lag`. It excuses a latency
+bound **only in a run with a load profile** (`CONSTELLATION_HARNESS_LOAD`
+set: a load campaign): in an ordinary run it is recorded in the summary and
+named in a failure's message, and excuses nothing, since a buffered write
+also stalls on the daemon's own sync traffic and a daemon-caused I/O
+regression must still fail. A
+bound over a median or another quantile of many operations uses
+`hostlag::latency_bound_over(what, (from, to), measured, protocol, bound)`,
+the window being the whole span the operations were taken over.
 
 Nothing excuses a measurement past 3 × the bound (or the bound plus all
 the lost time): that is a failure ("latency may degrade" is not "may

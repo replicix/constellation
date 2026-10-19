@@ -56,6 +56,64 @@ impl PriorityStats {
     };
 }
 
+/// The store gate's totals since the process started: what the writer
+/// lock and the syncs cost, for the node's status. A priority writer is
+/// the authority core's step ([`priority_writes`]); an ordinary one is a
+/// FUSE worker or a background pass. Process-wide (a node has one store).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GateTotals {
+    /// Priority write transactions that took the lock, the time they
+    /// waited for it in total (µs) and the longest wait.
+    pub priority_lock_waits: u64,
+    pub priority_lock_wait_us: u64,
+    pub priority_lock_wait_max_us: u64,
+    /// Syncs to stable storage inside a priority scope, and their time.
+    pub priority_syncs: u64,
+    pub priority_sync_us: u64,
+    /// The same for ordinary writers' lock waits.
+    pub writer_lock_waits: u64,
+    pub writer_lock_wait_us: u64,
+    pub writer_lock_wait_max_us: u64,
+}
+
+mod totals {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) static PRIORITY_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PRIORITY_WAIT_US: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PRIORITY_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PRIORITY_SYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PRIORITY_SYNC_US: AtomicU64 = AtomicU64::new(0);
+    pub(super) static WRITER_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static WRITER_WAIT_US: AtomicU64 = AtomicU64::new(0);
+    pub(super) static WRITER_WAIT_MAX_US: AtomicU64 = AtomicU64::new(0);
+
+    /// Count one wait; the maximum is written only when it is beaten (a
+    /// load, not a read-modify-write, in the common case).
+    pub(super) fn wait(count: &AtomicU64, total: &AtomicU64, max: &AtomicU64, us: u64) {
+        count.fetch_add(1, Relaxed);
+        total.fetch_add(us, Relaxed);
+        if us > max.load(Relaxed) {
+            max.fetch_max(us, Relaxed);
+        }
+    }
+}
+
+/// [`GateTotals`] now.
+pub fn gate_totals() -> GateTotals {
+    use std::sync::atomic::Ordering::Relaxed;
+    GateTotals {
+        priority_lock_waits: totals::PRIORITY_WAITS.load(Relaxed),
+        priority_lock_wait_us: totals::PRIORITY_WAIT_US.load(Relaxed),
+        priority_lock_wait_max_us: totals::PRIORITY_WAIT_MAX_US.load(Relaxed),
+        priority_syncs: totals::PRIORITY_SYNCS.load(Relaxed),
+        priority_sync_us: totals::PRIORITY_SYNC_US.load(Relaxed),
+        writer_lock_waits: totals::WRITER_WAITS.load(Relaxed),
+        writer_lock_wait_us: totals::WRITER_WAIT_US.load(Relaxed),
+        writer_lock_wait_max_us: totals::WRITER_WAIT_MAX_US.load(Relaxed),
+    }
+}
+
 /// A priority wait this long for the writer lock is reported with the
 /// transaction it waited behind ([`GatedDb::write_tx`]).
 const SLOW_PRIORITY_WAIT: Duration = Duration::from_millis(100);
@@ -82,8 +140,11 @@ fn note(f: impl FnOnce(&mut PriorityStats)) {
 /// A sync to stable storage, counted inside a [`priority_writes`] scope.
 pub(crate) fn note_sync(took: Duration) {
     note(|s| {
+        use std::sync::atomic::Ordering::Relaxed;
         s.syncs += 1;
         s.sync_us += took.as_micros() as u64;
+        totals::PRIORITY_SYNCS.fetch_add(1, Relaxed);
+        totals::PRIORITY_SYNC_US.fetch_add(took.as_micros() as u64, Relaxed);
     });
 }
 
@@ -201,6 +262,21 @@ impl GatedDb {
                     "a priority metadata write waited for the writer lock"
                 );
             }
+        }
+        if priority {
+            totals::wait(
+                &totals::PRIORITY_WAITS,
+                &totals::PRIORITY_WAIT_US,
+                &totals::PRIORITY_WAIT_MAX_US,
+                waited_us,
+            );
+        } else {
+            totals::wait(
+                &totals::WRITER_WAITS,
+                &totals::WRITER_WAIT_US,
+                &totals::WRITER_WAIT_MAX_US,
+                waited_us,
+            );
         }
         note(|s| {
             s.lock_waits += 1;
@@ -479,5 +555,45 @@ mod tests {
         // Unrelated to the wait: an uncontended write names nobody slow.
         let ((), stats) = priority_writes(|| drop(meta.db.write_tx()));
         assert!(stats.lock_wait_max_us < 100_000);
+    }
+
+    /// The totals `node.status` reports: priority and ordinary lock waits
+    /// and the core's syncs, cumulative. Process-wide, so tests of one
+    /// binary that write at the same time add to them too: deltas, `>=`.
+    #[test]
+    fn gate_totals_count_priority_and_ordinary_waits_and_syncs() {
+        let meta = Arc::new(Meta::open_in_memory().unwrap());
+        let before = gate_totals();
+        // An ordinary write (no wait to speak of), then a priority write
+        // that waits behind a 150 ms holder, then a priority sync.
+        drop(meta.db.write_tx());
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let slow = {
+            let meta = meta.clone();
+            std::thread::spawn(move || {
+                let tx = meta.db.write_tx();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(150));
+                drop(tx);
+            })
+        };
+        held_rx.recv().unwrap();
+        let ((), stats) = priority_writes(|| {
+            drop(meta.db.write_tx());
+            note_sync(Duration::from_millis(3));
+        });
+        slow.join().unwrap();
+        assert!(stats.lock_wait_us >= 100_000, "{stats:?}");
+        let after = gate_totals();
+        // The slow holder's own write is an ordinary one too.
+        assert!(after.writer_lock_waits >= before.writer_lock_waits + 2);
+        assert!(after.priority_lock_waits > before.priority_lock_waits);
+        assert!(
+            after.priority_lock_wait_us >= before.priority_lock_wait_us + 100_000,
+            "{before:?} -> {after:?}"
+        );
+        assert!(after.priority_lock_wait_max_us >= 100_000, "{after:?}");
+        assert!(after.priority_syncs > before.priority_syncs);
+        assert!(after.priority_sync_us >= before.priority_sync_us + 3_000);
     }
 }

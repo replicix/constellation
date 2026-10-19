@@ -195,6 +195,15 @@ impl Writer {
         (took, errs)
     }
 
+    /// How many ops started at or after `from` and were done by `to` (writer
+    /// clock): the ops of a window whose edges are counter reads.
+    fn count_within(&self, from: Duration, to: Duration) -> u64 {
+        let ops = self.ops.lock().unwrap();
+        ops.iter()
+            .filter(|o| o.at >= from && o.at + o.took <= to)
+            .count() as u64
+    }
+
     /// The metadata parts of the ops [`Self::after`] returns.
     fn meta_after(&self, since: Duration) -> Vec<Duration> {
         let ops = self.ops.lock().unwrap();
@@ -1244,6 +1253,55 @@ fn quantile(v: &[Duration], p: f64) -> Duration {
     s[((s.len() - 1) as f64 * p) as usize]
 }
 
+/// What the delegation counters of a node say about where its writes ran
+/// (status `delegation.executed` + `delegation.fast_path_executed`: ops
+/// executed here as the delegate, by the core and by the FUSE fast path;
+/// `forwarded_ok` + `forwarded_err`: ops it sent to another node, the
+/// root, to execute).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Routing {
+    executed: u64,
+    forwarded: u64,
+}
+
+impl Routing {
+    fn of(c: &Client) -> Result<Routing> {
+        let s = c.control_status()?;
+        Ok(Routing {
+            executed: n(&s["delegation"], "executed") + n(&s["delegation"], "fast_path_executed"),
+            forwarded: n(&s, "forwarded_ok") + n(&s, "forwarded_err"),
+        })
+    }
+
+    fn since(self, before: Routing) -> Routing {
+        Routing {
+            executed: self.executed.saturating_sub(before.executed),
+            forwarded: self.forwarded.saturating_sub(before.forwarded),
+        }
+    }
+}
+
+/// Did the `ops` writes of a window run on the delegate? `window` is the
+/// delegate's counters over it. A delegation that was lost sends every
+/// write through the root: nothing executes at the delegate and the
+/// forwards climb with the writes. A slow disk or queue changes how long
+/// they take, never where they run, so this is the check for "the writes
+/// still run on the delegate", and latency is judged apart
+/// ([`crate::hostlag::latency_bound_over`]).
+fn writes_ran_on_delegate(ops: u64, window: Routing) -> Result<(), String> {
+    // Each write's create is an op executed at the delegate (a window edge
+    // may split a few: half is generous); a handful of stray forwards (a
+    // lookup past the delegated range, a retry) is not a lost delegation,
+    // a tenth of the writes is.
+    if window.executed * 2 >= ops && window.forwarded * 10 <= ops {
+        return Ok(());
+    }
+    Err(format!(
+        "{ops} writes after the stall: {} executed on the delegate, {} forwarded to the root",
+        window.executed, window.forwarded
+    ))
+}
+
 /// Arm the store-stall hook of the daemon `pid` (`CONSTELLATION_FAULT_STORE_STALL_FILE`):
 /// the first ordinary metadata write it makes holds the store's writer
 /// lock for `ms`. Written whole (a reader that sees a prefix stalls for
@@ -1251,6 +1309,15 @@ fn quantile(v: &[Duration], p: f64) -> Duration {
 fn arm_store_stall(file: &std::path::Path, ms: u64, pid: u32) -> Result<()> {
     let tmp = file.with_extension("tmp");
     std::fs::write(&tmp, format!("{ms} once pid={pid}\n"))?;
+    std::fs::rename(&tmp, file)?;
+    Ok(())
+}
+
+/// [`arm_store_stall`], but for every ordinary write of the daemon until
+/// the file is removed: a store that stays slow.
+fn arm_repeating_store_stall(file: &std::path::Path, ms: u64, pid: u32) -> Result<()> {
+    let tmp = file.with_extension("tmp");
+    std::fs::write(&tmp, format!("{ms} pid={pid}\n"))?;
     std::fs::rename(&tmp, file)?;
     Ok(())
 }
@@ -1267,14 +1334,23 @@ fn arm_store_stall(file: &std::path::Path, ms: u64, pid: u32) -> Result<()> {
 /// bound. Asserted: the same generation before and after, none reclaimed or
 /// recalled at `a`, none lapsed at `b`, no write failed, the lane sent
 /// (`renewals_off_core`; for the stalls longer than the slack) and the
-/// writes after the stall are back to the control's create + close
-/// latency (the median within twice the control's p90 plus 5 ms: a lost
-/// delegation sends every write through the root, 4 to 12 times slower).
+/// writes after the stall still run on the delegate (judged from the
+/// delegation counters over the window after it: ops executed at `b` as
+/// the delegate, none or few forwarded to the root; a lost delegation
+/// sends every write through the root). Their latency is judged apart,
+/// against the control's create + close (the median within twice the
+/// control's p90 plus 5 ms) by [`crate::hostlag::latency_bound_over`]:
+/// a window in which the host's disk probe lost the time is inconclusive,
+/// not a lost delegation (the 2026-10 flake: a loaded disk after the
+/// stall).
 /// Then one 25 s stall, past the hung bound: the lane stops at 15 s, its
 /// last grant runs out, the root reclaims (a hung delegate is a dead one,
 /// as it always was), no write fails and `b`'s writes go on through the
 /// root. `CONSTELLATION_DELEG_LANE=off` is the fail-before: the 9 and 12 s
-/// stalls then lose the delegation.
+/// stalls then lose the delegation. `CONSTELLATION_HARNESS_DELEG_AFTER_STALL_MS=150`
+/// keeps the store slow after each stall (every ordinary write holds the
+/// writer lock for that long): the delegation is intact and must not be
+/// reported lost, whatever the latency (not judged then).
 pub fn delegate_store_stall(_seed: u64) -> Result<()> {
     const NAME: &str = "delegate-store-stall";
     // `CONSTELLATION_HARNESS_DELEG_STALLS_MS=9000,12000` runs those stalls
@@ -1284,6 +1360,12 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .filter(|v: &Vec<u64>| !v.is_empty())
         .unwrap_or_else(|| vec![5_000, 9_000, 12_000, 25_000]);
+    // A store that stays slow after the stall (the fail-before of the
+    // latency check that read a slow disk as a lost delegation).
+    let after_stall_ms: Option<u64> = std::env::var("CONSTELLATION_HARNESS_DELEG_AFTER_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0);
     let stall_dir = tempfile::tempdir()?;
     let file = stall_dir.path().join("store-stall");
     let file_str = file.display().to_string();
@@ -1319,14 +1401,31 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
             let (da0, db0) = (deleg_of(a)?, deleg_of(b)?);
             let armed_at = w.now();
             arm_store_stall(&file, ms, pid)?;
-            std::thread::sleep(Duration::from_millis(ms) + Duration::from_secs(3));
             // The writes after the stall: the longest wait of the writer
             // is the stall itself; then back to normal.
             let back_from = armed_at + Duration::from_millis(ms) + Duration::from_secs(1);
+            std::thread::sleep(Duration::from_millis(ms) + Duration::from_secs(1));
+            // Where the writes after the stall run, from the counters
+            // over that window (`writes_ran_on_delegate`).
+            let route0 = Routing::of(b)?;
+            let counted_from = w.now();
+            if let Some(after) = after_stall_ms {
+                arm_repeating_store_stall(&file, after, pid)?;
+            }
+            std::thread::sleep(Duration::from_secs(2));
             w.wait_ops_after(back_from, 20, Duration::from_secs(60))?;
+            let window_end = Instant::now();
             let (ops, errs) = w.after(armed_at);
             let after_meta = w.meta_after(back_from);
             let after_p50 = quantile(&after_meta, 0.5);
+            let counted_to = w.now();
+            let route = Routing::of(b)?.since(route0);
+            // The writes the counters' window saw, and no others: started
+            // after the first read, done before the second.
+            let window_ops = w.count_within(counted_from, counted_to);
+            if after_stall_ms.is_some() {
+                let _ = std::fs::remove_file(&file);
+            }
             let (da, db) = (deleg_of(a)?, deleg_of(b)?);
             let gen_after = held_generation(&db);
             let (_, recent_step) = core_steps(b)?;
@@ -1338,7 +1437,7 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                  the lane sent {lane} renewals; generation {gen} -> {gen_after:?}; at a: \
                  reclaimed +{reclaimed} recalls +{recalls}; at b: lapsed {}; writes across it: \
                  {}; create + close before: p50 {:?} p90 {control_p90:?}, after: p50 \
-                 {after_p50:?}",
+                 {after_p50:?}; b's writes after it: {} executed on b, {} forwarded",
                 if past_bound {
                     " (past the hung bound)"
                 } else {
@@ -1347,6 +1446,8 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                 n(&db, "lapsed"),
                 dist(&ops),
                 quantile(&control_meta, 0.5),
+                route.executed,
+                route.forwarded,
             );
             anyhow::ensure!(errs.is_empty(), "writes failed across the stall: {errs:?}");
             if past_bound {
@@ -1397,11 +1498,30 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
                     "b's core was stuck {recent_step:?} and the off-core lane sent no renewal"
                 );
             }
-            anyhow::ensure!(
-                after_p50 <= control_p90 * 2 + Duration::from_millis(5),
-                "after a {ms} ms store stall b's create + close p50 is {after_p50:?}, against \
-                 the control's p90 {control_p90:?}: the writes no longer run on the delegate"
-            );
+            // Where the writes ran: the delegation counters, not how long
+            // they took.
+            writes_ran_on_delegate(window_ops, route).map_err(|e| {
+                anyhow::anyhow!(
+                    "after a {ms} ms store stall b's writes no longer run on the delegate: {e}"
+                )
+            })?;
+            // How long they took, judged against the host (a loaded disk
+            // slows a delegate's writes as it slows everyone's): inconclusive
+            // when the host's probes lost the time. Not judged while this
+            // scenario keeps the store slow itself.
+            if after_stall_ms.is_none() {
+                let protocol = control_p90 * 2 + Duration::from_millis(5);
+                crate::hostlag::latency_bound_over(
+                    &format!(
+                        "{NAME}: b's create + close p50 after a {ms} ms store stall \
+                         (control p90 {control_p90:?})"
+                    ),
+                    (w.started + back_from, window_end),
+                    after_p50,
+                    protocol,
+                    protocol + Duration::from_millis(25),
+                )?;
+            }
         }
         w.finish();
         print_deleg(NAME, "a", &deleg_of(a)?);
@@ -1417,6 +1537,27 @@ pub fn delegate_store_stall(_seed: u64) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn writes_that_ran_on_the_delegate_are_told_from_those_that_went_to_the_root() {
+        let r = |executed, forwarded| Routing {
+            executed,
+            forwarded,
+        };
+        // Intact: every write executed at b, however slowly.
+        assert!(writes_ran_on_delegate(40, r(44, 0)).is_ok());
+        assert!(writes_ran_on_delegate(40, r(44, 2)).is_ok());
+        // Lost: nothing executes at b, the forwards climb with the writes.
+        let e = writes_ran_on_delegate(40, r(0, 40)).unwrap_err();
+        assert!(
+            e.contains("0 executed") && e.contains("40 forwarded"),
+            "{e}"
+        );
+        // Mostly lost, a few still local.
+        assert!(writes_ran_on_delegate(40, r(5, 35)).is_err());
+        // Half through the root is a loss too.
+        assert!(writes_ran_on_delegate(40, r(20, 20)).is_err());
+    }
 
     fn losses(
         reclaimed: u64,

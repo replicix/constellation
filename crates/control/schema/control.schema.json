@@ -248,6 +248,57 @@
           "minimum": 0,
           "type": "integer"
         },
+        "store_priority_lock_wait_max_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store_priority_lock_wait_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store_priority_lock_waits": {
+          "default": 0,
+          "description": "The authority core's own metadata writes (its step runs them with\npriority over every other writer): how many took the store's\nsingle writer lock, the time they waited for it in total and the\nlongest wait (µs). A core step that took seconds with these small\nspent them elsewhere (syncs, the runtime).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store_priority_sync_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store_priority_syncs": {
+          "default": 0,
+          "description": "The core's syncs of the store to stable storage, and their time in\ntotal (µs).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store_writer_lock_wait_max_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store_writer_lock_wait_us": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "store_writer_lock_waits": {
+          "default": 0,
+          "description": "The same waits for the writer lock of every ordinary writer (FUSE\nworkers, background passes): a lock held through a stalled disk\nshows here and in the core's.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "streamed_ahead": {
           "format": "uint64",
           "minimum": 0,

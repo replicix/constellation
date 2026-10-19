@@ -10,6 +10,16 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// A control call on the daemon of `state_dir` (see [`Client::control_call`]).
+///
+/// A call that gets no answer (the bound, or the handshake's, runs out)
+/// names the node and the socket in its error, and keeps the daemon's
+/// threads as they were ([`crate::procsnap`]: `comm`, `wchan`, `stat` of
+/// every task) in a `control-timeout-*.tasks` file beside the node's log
+/// (under the kept log directory when there is one), with the
+/// classification in the error: threads runnable, in `futex`, in `write`,
+/// tell a runtime whose workers are all busy from a daemon frozen with
+/// its host or one waiting on a disk. Every other failure names the node
+/// and the socket too.
 pub fn control_call_at(
     state_dir: &Path,
     method: &str,
@@ -22,7 +32,8 @@ pub fn control_call_at(
             state_dir.display()
         )
     })?;
-    control_runtime().block_on(async {
+    let node = node_name_of(state_dir);
+    let outcome = control_runtime().block_on(async {
         let call = async {
             // The caller's bound covers the handshake too: a daemon frozen
             // with its host (a stalled core step, seen for 17 s on the
@@ -36,13 +47,167 @@ pub fn control_call_at(
         };
         match tokio::time::timeout(within, call).await {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(e)) => Err(anyhow::anyhow!("{method}: {}", e.message)),
-            Err(_) => bail!(
-                "{method}: no answer from {} within {within:?}",
-                sock.display()
-            ),
+            Ok(Err(e)) => Err(CallFailure::Daemon(e)),
+            Err(_) => Err(CallFailure::Bound),
         }
-    })
+    });
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(CallFailure::Daemon(e)) if e.kind != constellation_control::ErrorKind::Timeout => Err(
+            anyhow::anyhow!("{method} on {node} ({}): {}", sock.display(), e.message),
+        ),
+        Err(failure) => {
+            let what = match failure {
+                CallFailure::Daemon(e) => e.message,
+                CallFailure::Bound => format!("no answer within {within:?}"),
+            };
+            let kept = keep_task_snapshot(state_dir, &sock, &node, method);
+            bail!("{method} on {node} ({}): {what}; {kept}", sock.display())
+        }
+    }
+}
+
+enum CallFailure {
+    /// The daemon (or the client's handshake) failed the call.
+    Daemon(constellation_control::ControlError),
+    /// The caller's bound ran out.
+    Bound,
+}
+
+/// The node a state dir belongs to (`<root>/<node>/state`).
+fn node_name_of(state_dir: &Path) -> String {
+    state_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| state_dir.display().to_string())
+}
+
+/// The pid of the process that listens on `sock`: what a connection to it
+/// reports as its peer (a daemon that is not accepting still has it),
+/// else the pid file of the state dir. The connect never blocks: a
+/// daemon that does not accept fills its listen backlog with the harness's
+/// own failed attempts, and a blocking connect to a full backlog waits for
+/// ever (it is refused at once, `EAGAIN`, and the pid file answers).
+fn daemon_pid_of(state_dir: &Path, sock: &Path) -> Option<u32> {
+    connect_nonblocking(sock)
+        .and_then(|s| peer_pid(&s))
+        .or_else(|| {
+            std::fs::read_to_string(state_dir.join("daemon.pid"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        })
+}
+
+/// A connected unix stream to `path`, or `None` at once if the connect
+/// would block (a full backlog) or fails.
+#[cfg(target_os = "linux")]
+fn connect_nonblocking(path: &Path) -> Option<std::os::unix::net::UnixStream> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: a zeroed `sockaddr_un` is a valid (empty) one.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() {
+        return None;
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    // SAFETY: plain syscalls; the descriptor is owned by `fd` from here on
+    // and closed on every path.
+    let fd = unsafe {
+        let raw = libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        );
+        if raw < 0 {
+            return None;
+        }
+        OwnedFd::from_raw_fd(raw)
+    };
+    use std::os::fd::AsRawFd;
+    // SAFETY: `addr` is a valid `sockaddr_un` of the size passed.
+    let rc = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_un).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    (rc == 0).then(|| std::os::unix::net::UnixStream::from(fd))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_nonblocking(_path: &Path) -> Option<std::os::unix::net::UnixStream> {
+    None
+}
+
+/// `SO_PEERCRED`'s pid of a connected unix socket.
+#[cfg(not(target_os = "linux"))]
+fn peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    None
+}
+
+/// `SO_PEERCRED`'s pid of a connected unix socket.
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: a connected socket, and an out-parameter of the size passed.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+/// Keep the daemon's threads (module docs of [`crate::procsnap`]); the
+/// words the error carries: what they were doing and where the file is.
+fn keep_task_snapshot(state_dir: &Path, sock: &Path, node: &str, method: &str) -> String {
+    let Some(pid) = daemon_pid_of(state_dir, sock) else {
+        return "the daemon's pid is unknown, no thread snapshot".to_string();
+    };
+    let dir = match crate::verify::log_dir() {
+        Some(logs) => {
+            let scenario = scenario();
+            logs.join(if scenario.is_empty() {
+                "unnamed"
+            } else {
+                &scenario
+            })
+            .join(node)
+        }
+        None => state_dir.parent().unwrap_or(state_dir).to_path_buf(),
+    };
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let label = format!("control-timeout-{}-{at}", method.replace('.', "-"));
+    let why = format!("{method} on {node}: no answer");
+    let summary = crate::procsnap::classify(&crate::procsnap::threads(pid));
+    match crate::procsnap::save(pid, &dir, &label, &why) {
+        Ok(path) => format!(
+            "daemon pid {pid}: {summary}; tasks kept in {}",
+            path.display()
+        ),
+        Err(e) => format!("daemon pid {pid}: {summary}; tasks not kept ({e})"),
+    }
 }
 
 /// The runtime every control call of the (synchronous) harness runs on.
@@ -152,6 +317,9 @@ impl Client {
         let state = work.join("state");
         std::fs::create_dir_all(&mnt)?;
         std::fs::create_dir_all(&state)?;
+        // The daemon's filesystem, watched for write stalls while the
+        // scenario runs (`hostlag::add_disk_probe`).
+        crate::hostlag::add_disk_probe(&work);
         crate::sweep::claim(root);
         // Under verification (`crate::verify`) the logs outlive the
         // scenario's temp dir: its checks read them afterwards.
@@ -1458,4 +1626,116 @@ pub(crate) fn is_mountpoint(p: &Path) -> bool {
             .mounts
             .is_mountpoint(p)
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A daemon that accepts and never answers (a frozen one looks the
+    /// same from outside): the error names the node and the socket, and
+    /// the daemon's threads are kept for the next look.
+    #[test]
+    fn a_control_call_that_gets_no_answer_names_the_node_and_keeps_the_threads() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("node-b").join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sock = root.path().join("c.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        constellation_control::transport::record_socket(&state, &sock).unwrap();
+        let mute = std::thread::spawn(move || {
+            // Accept and hold: nobody answers a Hello.
+            let held = listener.accept().map(|(s, _)| s);
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(held);
+        });
+        let err = control_call_at(
+            &state,
+            "node.status",
+            serde_json::json!({}),
+            Duration::from_millis(400),
+        )
+        .unwrap_err()
+        .to_string();
+        mute.join().unwrap();
+        assert!(err.contains("node.status on node-b"), "{err}");
+        assert!(err.contains(&sock.display().to_string()), "{err}");
+        assert!(err.contains("threads:"), "{err}");
+        let kept: Vec<_> = std::fs::read_dir(root.path().join("node-b"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("control-timeout-node-status-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "{err}");
+        let text = std::fs::read_to_string(kept[0].path()).unwrap();
+        assert!(text.contains("# raw") && text.contains("comm:"), "{text}");
+        assert!(err.contains(&kept[0].path().display().to_string()), "{err}");
+    }
+
+    /// The pid lookup of a daemon that does not accept never blocks: with
+    /// the listener's backlog full a blocking connect waits for ever; the
+    /// pid file answers instead.
+    #[test]
+    fn the_daemons_pid_is_found_without_waiting_on_a_full_backlog() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("node-c").join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let sock = root.path().join("full.sock");
+        // A listener whose backlog (of 0, so one queued connection) is
+        // full and never drained.
+        // SAFETY: plain syscalls on a fresh socket we own.
+        let listener = unsafe {
+            use std::os::fd::FromRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0);
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (d, b) in addr.sun_path.iter_mut().zip(sock.as_os_str().as_bytes()) {
+                *d = *b as libc::c_char;
+            }
+            assert_eq!(
+                libc::bind(
+                    fd,
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t
+                ),
+                0
+            );
+            assert_eq!(libc::listen(fd, 0), 0);
+            std::os::fd::OwnedFd::from_raw_fd(fd)
+        };
+        let mut held = Vec::new();
+        // Fill the backlog (non-blocking, so this loop ends).
+        while let Some(s) = connect_nonblocking(&sock) {
+            held.push(s);
+            assert!(held.len() < 64, "the backlog never filled");
+        }
+        std::fs::write(state.join("daemon.pid"), "4242\n").unwrap();
+        let started = Instant::now();
+        assert_eq!(daemon_pid_of(&state, &sock), Some(4242));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the lookup waited on a full backlog"
+        );
+        drop((held, listener));
+    }
+
+    /// No recorded socket: the error says which state dir was looked in.
+    #[test]
+    fn a_state_dir_without_a_recorded_socket_is_named() {
+        let root = tempfile::tempdir().unwrap();
+        let err = control_call_at(
+            root.path(),
+            "node.status",
+            serde_json::json!({}),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains(&root.path().display().to_string()));
+    }
 }

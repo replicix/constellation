@@ -1772,6 +1772,35 @@ pub struct AckStatus {
     /// Holder-local reads that waited for durability of the unshipped
     /// rows they would have observed.
     pub reads_durability_blocked: u64,
+    // ---- the store's writer lock and syncs (since the process started) ----
+    // Process-wide counters of the store gate, not per node: tests and
+    // simulations that run several nodes in one process mix their numbers.
+    /// The authority core's own metadata writes (its step runs them with
+    /// priority over every other writer): how many took the store's
+    /// single writer lock, the time they waited for it in total and the
+    /// longest wait (µs). A core step that took seconds with these small
+    /// spent them elsewhere (syncs, the runtime).
+    #[serde(default)]
+    pub store_priority_lock_waits: u64,
+    #[serde(default)]
+    pub store_priority_lock_wait_us: u64,
+    #[serde(default)]
+    pub store_priority_lock_wait_max_us: u64,
+    /// The core's syncs of the store to stable storage, and their time in
+    /// total (µs).
+    #[serde(default)]
+    pub store_priority_syncs: u64,
+    #[serde(default)]
+    pub store_priority_sync_us: u64,
+    /// The same waits for the writer lock of every ordinary writer (FUSE
+    /// workers, background passes): a lock held through a stalled disk
+    /// shows here and in the core's.
+    #[serde(default)]
+    pub store_writer_lock_waits: u64,
+    #[serde(default)]
+    pub store_writer_lock_wait_us: u64,
+    #[serde(default)]
+    pub store_writer_lock_wait_max_us: u64,
 }
 
 /// Partition lease state (DESIGN.md §4). `held` is this node's own

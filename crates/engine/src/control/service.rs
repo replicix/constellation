@@ -327,6 +327,7 @@ impl EngineControl {
             ack: {
                 let a = &core.ack;
                 let s = self.meta.session().stats();
+                let gate = constellation_meta::gate_totals();
                 api::AckStatus {
                     ack_s3: core.ack_s3,
                     policy: a.policy.to_string(),
@@ -381,6 +382,14 @@ impl EngineControl {
                     refusals_journaled: stats.refusals_journaled,
                     unacked_replays_refused: stats.unacked_replays_refused,
                     reads_durability_blocked: s.durability_blocked,
+                    store_priority_lock_waits: gate.priority_lock_waits,
+                    store_priority_lock_wait_us: gate.priority_lock_wait_us,
+                    store_priority_lock_wait_max_us: gate.priority_lock_wait_max_us,
+                    store_priority_syncs: gate.priority_syncs,
+                    store_priority_sync_us: gate.priority_sync_us,
+                    store_writer_lock_waits: gate.writer_lock_waits,
+                    store_writer_lock_wait_us: gate.writer_lock_wait_us,
+                    store_writer_lock_wait_max_us: gate.writer_lock_wait_max_us,
                 }
             },
             delegation: {

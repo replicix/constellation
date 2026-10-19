@@ -100,7 +100,9 @@ pub(crate) mod atime;
 pub mod backup;
 mod bootstrap;
 pub(crate) mod gate;
-pub use gate::{fault_caller_scope, priority_writes, FaultCallerScope, PriorityStats};
+pub use gate::{
+    fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,
+};
 pub mod held;
 pub mod inbox;
 pub(crate) mod journal;

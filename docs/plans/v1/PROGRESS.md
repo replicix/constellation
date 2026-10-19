@@ -50758,3 +50758,105 @@ threads as before.
 ### Gates
 
 See the end of the second entry.
+
+## Fix: harness diagnostics for a control call that gets no answer, and `delegate-store-stall`'s misattributed check (2026-10-19)
+
+### Finding
+
+The same flake (`node.status: the daemon did not answer Hello`) dropped the node and the
+socket from its error (the handshake error won the race with the call's bound), and left
+nothing to say whether the daemon was frozen, its runtime blocked or its disk stalled.
+Separately, `delegate-store-stall` failed one run on "after a 9000 ms store stall b's
+create + close p50 is 445 ms, against the control's p90 of 3.6 ms: the writes no longer
+run on the delegate": a disk or queue latency read as a lost delegation (the delegation
+had survived: same generation, nothing reclaimed).
+
+### What changed
+
+- `control_call_at` (every `Client::control_call`, `control_status` and the scenarios'
+  own status reads): every failure names the method, the node and the socket; one that gets
+  no answer (the bound, or the client's handshake timeout) also keeps the daemon's
+  threads, `/proc/<pid>/task/*/{comm,wchan,stat,syscall}`, in
+  `control-timeout-<method>-<ms>.tasks` beside the node's log (under
+  `CONSTELLATION_HARNESS_LOG_DIR/<scenario>/<node>/` when set) and puts the classification
+  in the error (`35 threads: 20 futex, 10 idle, 5 sleep [2 tokio-rt-worker sleep, ...]`).
+  The pid is the socket's `SO_PEERCRED` peer, so a daemon that is not accepting is found
+  too: by a non-blocking connect (a listener with a full backlog refuses it at once and
+  the state dir's `daemon.pid` answers instead; a blocking connect waited for ever, which
+  the review reproduced). Under Yama `ptrace_scope=1` the `syscall` files are unreadable
+  and the classification falls back to `wchan` (TESTING.md says so).
+- `delegate-store-stall` judges "the writes run on the delegate" from the delegation
+  counters over the window after the stall (`delegation.executed` +
+  `fast_path_executed` at `b`, against `forwarded_ok` + `forwarded_err`: a lost
+  delegation executes nothing at `b` and forwards every write), and its latency through
+  the new `hostlag::latency_bound_over` (the sister scenarios' judge, for a median over a
+  window): inconclusive when the host's probes lost the time, a failure with an attentive
+  host. The writes counted are those the counters' window saw (started after the first
+  counter read, done before the second), not the ops since the stall.
+- `hostlag::add_disk_probe`, started by `Client::new` for each device of a scenario: every
+  50 ms a buffered 4 KiB `write(2)` (no sync) into a hidden file of the node's work
+  directory, timed; its lateness is a `disk` source of the host-lag summary. It excuses a
+  latency bound only in a run with a load profile (`CONSTELLATION_HARNESS_LOAD`): there, a
+  window in which the disk throttled or held up writers is explained as a starved CPU is.
+  In an ordinary run it is recorded in the summary and named in a failure's message but
+  excuses nothing, so a daemon-caused I/O regression (a buffered write also stalls on the
+  daemon's own sync traffic) still fails. `CONSTELLATION_HARNESS_NO_DISK_PROBE=1` turns it off.
+- `node.status`'s `ack` block gains `store_priority_lock_waits` / `_lock_wait_us` /
+  `_lock_wait_max_us`, `store_priority_syncs` / `_sync_us` (the core's own writes: the
+  `PriorityStats` a slow step already logs, now cumulative) and `store_writer_lock_waits` /
+  `_wait_us` / `_wait_max_us` (every ordinary writer: FUSE workers, background passes).
+  Process-wide atomics in the store gate (`constellation_meta::gate_totals`; in-process
+  multi-node tests and simulations mix their nodes' numbers, as the field docs say): a
+  relaxed add per write transaction, no lock, after the writer lock is held. The control schema is re-blessed.
+- Docs: `TESTING.md` (the diagnostics, the routing check, the disk probe).
+
+### Fail-before and checks
+
+- Without the fix, the first `control-runtime-hog` run on the previous daemon names the
+  node, the socket and both blocked workers (see the first entry). `delegate-store-stall`
+  with `CONSTELLATION_DELEG_LANE=off` at a 9 s stall: FAILED, unexcused ("b's
+  delegation did not survive a 9000 ms store stall (generation 1 -> None)", reclaimed +1,
+  lapsed 1), and the routing counters show the loss the new check reads: 0 executed on
+  `b`, 67 forwarded to the root.
+- A store that stays slow after the stall with the delegation intact
+  (`CONSTELLATION_HARNESS_DELEG_AFTER_STALL_MS=150`: every ordinary write holds the writer
+  lock 150 ms until the iteration ends; stalls 5 and 9 s): PASSED. The writes after the stall
+  took a median of 302 ms against the old bound of twice the control's p90 plus 5 ms
+  (about 11 ms), which the old check read as "no longer run on the delegate"; the counters
+  say 40 executed on `b`, 0 forwarded, same generation, nothing reclaimed.
+- Unit tests: `writes_that_ran_on_the_delegate_are_told_from_those_that_went_to_the_root`,
+  the disk probe, `procsnap`'s classifier, and `a_control_call_that_gets_no_answer_names_the_node_and_keeps_the_threads`
+  (a daemon that accepts and never answers).
+
+### Gates
+
+On the build box (load 10-70 from other jobs, `-j 8`, every job under `timeout`):
+`cargo fmt --check`; `clippy --workspace --all-targets -D warnings`; `cargo test
+--workspace --no-fail-fast` on the tree after the review's fixes: 3267 passed, 1 failed
+(`a_listener_that_cannot_be_registered_is_an_error_of_serve_router`: `serve_router`'s error
+path dropped its new runtime inside the caller's async context; the runtime is now shut
+down in the background on every path), then the affected crates on the final tree (control
+x3: 146, engine `control::`: 35 with the ping tests, `constellation` bin: 74 with the
+upgrade/umount/serve tests, csi: 172, harness lib: 140, meta: 266) and clippy again, all
+green. The first full run, before the review, had found three `cli` tests (`umount`/
+`upgrade` stand-in daemons), a control test (`reusing_an_in_flight_request_id_is_rejected`)
+and the harness catalog parity test; the fixes are in the first entry's server (a runtime
+dropped under a call closes the connection instead of answering "handler panicked"; a
+shutting-down server aborts its calls' answers, a connection that ends otherwise still
+answers each) and `k8s/parity.rs`. Harness (`linux-fuse-process`, seed 42, release build,
+verification on, load 14-27): `control-runtime-hog` x3 (with a `node.ping` in each round): 3
+of 3; `delegate-store-stall` x3: 3 of 3, 0 inconclusive, 0 `KNOWN-GAP` (x5 before the
+review: 5 of 5); the two fail-before variants again on the review's window change (lane off
+9 s: FAILED unexcused; `DELEG_AFTER_STALL_MS=150`: PASSED); `session-handover-idle`,
+`upgrade-under-load`, `kill9-remount`, `load-probe`: passed. Failing runs kept on the box
+(`cst-ctlthread-keep/hog-base*` is the previous daemon's `did not answer Hello`;
+`hog-after.<ts>` two runs of an intermediate build with the accept race; `lane-off`).
+
+### Open
+
+- The disk probe writes a buffered page and so sees throttling and journal stalls, not a
+  slow device that only an `fsync` meets; an `O_DSYNC` probe would, at the cost of IO
+  of its own. Not added.
+- The control thread is one thread for all connections: it encodes and writes the final
+  `Response` of every call (a very large `status` is encoded there). Measured idle at 0
+  ticks and `node.status` unchanged; a per-connection thread is not needed so far.

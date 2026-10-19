@@ -106,6 +106,8 @@ struct Probe {
     injected: Mutex<Vec<Injected>>,
     psi_start: Psi,
     stop: AtomicBool,
+    /// The devices a disk probe already writes to.
+    disks: Mutex<Vec<u64>>,
 }
 
 static CURRENT: Mutex<Option<Arc<Probe>>> = Mutex::new(None);
@@ -156,6 +158,78 @@ pub fn probe_loop(stop: &AtomicBool, mut sample: impl FnMut(u64, Duration)) {
     }
 }
 
+/// The name of the disk-write probe's source.
+const DISK_SOURCE: &str = "disk";
+
+/// The disk-write probe: every [`PERIOD`] it overwrites 4 KiB of a file in
+/// `dir` with a buffered `write(2)` (no sync) and records how long the call
+/// took. A buffered write returns at once unless the filesystem is
+/// throttling writers or is held up (dirty-page throttling behind a
+/// stalled device, a journal commit, a btrfs transaction): the same
+/// conditions that make a daemon's metadata writes and journal appends
+/// slow without taking a CPU. A window in which this probe lost time is
+/// one in which the disk, not the daemon, was slow, so a latency bound
+/// exceeded there is inconclusive ([`latency_bound`]) **in a run with a
+/// load profile only** (a load campaign: `CONSTELLATION_HARNESS_LOAD`); in
+/// an ordinary run it is recorded in the summary and the failure message
+/// but excuses nothing, as a buffered write also stalls on the daemon's own
+/// sync traffic, and a daemon-caused I/O regression must still fail. One thread per
+/// device of the current scenario's probe; none outside a scenario or with
+/// `CONSTELLATION_HARNESS_NO_DISK_PROBE` set.
+pub fn add_disk_probe(dir: &std::path::Path) {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+    if std::env::var_os("CONSTELLATION_HARNESS_NO_DISK_PROBE").is_some() {
+        return;
+    }
+    let Some(probe) = current() else {
+        return;
+    };
+    let Ok(dev) = std::fs::metadata(dir).map(|m| m.dev()) else {
+        return;
+    };
+    {
+        let mut disks = probe.disks.lock().unwrap_or_else(|e| e.into_inner());
+        if disks.contains(&dev) {
+            return;
+        }
+        disks.push(dev);
+    }
+    let path = dir.join(".hostlag-disk-probe");
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let Some(handle) = add_source(DISK_SOURCE) else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("host-lag-disk".into())
+        .spawn(move || {
+            let block = [0x5au8; 4096];
+            let mut i = 0u64;
+            while !probe.stop.load(Ordering::Relaxed) {
+                std::thread::sleep(PERIOD);
+                let at = mono_ns();
+                let t = Instant::now();
+                // Eight blocks, round and round: dirty pages are replaced,
+                // not accumulated.
+                let wrote = file.write_all_at(&block, (i % 8) * 4096);
+                let took = t.elapsed();
+                i += 1;
+                if wrote.is_err() {
+                    break;
+                }
+                handle.push(at, took);
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+}
+
 /// Start the probe for `scenario` (and forget the previous scenario's
 /// inconclusive notes).
 pub fn begin(scenario: &str) {
@@ -167,6 +241,7 @@ pub fn begin(scenario: &str) {
         injected: Mutex::new(Vec::new()),
         psi_start: Psi::read(),
         stop: AtomicBool::new(false),
+        disks: Mutex::new(Vec::new()),
     });
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(probe.clone());
     if let Some(h) = add_source("harness") {
@@ -221,9 +296,25 @@ pub struct Lag {
     pub injected: Duration,
     /// The source that lost the most.
     pub worst: String,
+    /// What the disk-write probe lost in the window ([`add_disk_probe`]).
+    /// Not part of `stolen`: it excuses a bound only under a load profile
+    /// ([`Lag::excusing_disk`]); elsewhere it is reported and excuses
+    /// nothing, so a daemon-caused I/O regression still fails.
+    pub disk: Duration,
 }
 
 impl Lag {
+    /// This lag with the disk probe counted as a source (a load campaign:
+    /// the harness put the disk under load itself, or a profile's
+    /// injectors did).
+    pub fn excusing_disk(mut self) -> Lag {
+        if self.disk > self.stolen {
+            self.stolen = self.disk;
+            self.worst = DISK_SOURCE.to_string();
+        }
+        self
+    }
+
     /// Time the window lost to the host, all told.
     pub fn explained(&self) -> Duration {
         self.stolen + self.injected
@@ -234,11 +325,13 @@ impl std::fmt::Display for Lag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "host lag {:?} (worst probe {:?}: longest stall {:?}; injected pauses {:?})",
+            "host lag {:?} (worst probe {:?}: longest stall {:?}; injected pauses {:?}; \
+             disk-write probe lost {:?}, which excuses a bound only under a load profile)",
             self.explained(),
             self.worst,
             self.max,
-            self.injected
+            self.injected,
+            self.disk
         )
     }
 }
@@ -268,7 +361,9 @@ fn lag_in(p: &Probe, w0: u64, w1: u64) -> Lag {
                 max = max.max(late);
             }
         }
-        if Duration::from_nanos(stolen) >= lag.stolen {
+        if s.name == DISK_SOURCE {
+            lag.disk = Duration::from_nanos(stolen);
+        } else if Duration::from_nanos(stolen) >= lag.stolen {
             lag.stolen = Duration::from_nanos(stolen);
             lag.worst = s.name.clone();
         }
@@ -394,9 +489,30 @@ pub fn latency_bound(
     protocol: Duration,
     bound: Duration,
 ) -> Result<()> {
-    let lag = lag_between(started, started + measured);
+    latency_bound_over(
+        what,
+        (started, started + measured),
+        measured,
+        protocol,
+        bound,
+    )
+}
+
+/// [`latency_bound`] for a `measured` that is not the length of one
+/// window: a median or another quantile of many operations, taken over
+/// `window` (what the host took from the whole of it is what could have
+/// slowed them).
+pub fn latency_bound_over(
+    what: &str,
+    window: (Instant, Instant),
+    measured: Duration,
+    protocol: Duration,
+    bound: Duration,
+) -> Result<()> {
     let injecting = crate::load::injecting();
     let profile = crate::load::profile().is_some();
+    let lag = lag_between(window.0, window.1);
+    let lag = if profile { lag.excusing_disk() } else { lag };
     match judge(
         what,
         measured,
@@ -561,6 +677,7 @@ pub fn host_lag_cmd(seconds: u64, stream: bool) -> Result<()> {
         injected: Mutex::new(Vec::new()),
         psi_start: Psi::read(),
         stop: AtomicBool::new(false),
+        disks: Mutex::new(Vec::new()),
     };
     let until = Instant::now() + Duration::from_secs(seconds.max(1));
     probe_loop(&stop, |due, late| {
@@ -608,6 +725,7 @@ mod tests {
             injected: Mutex::new(injected),
             psi_start: Psi::default(),
             stop: AtomicBool::new(false),
+            disks: Mutex::new(Vec::new()),
         }
     }
 
@@ -663,6 +781,7 @@ mod tests {
             max,
             injected: Duration::ZERO,
             worst: "harness".into(),
+            disk: Duration::ZERO,
         };
         let quiet = Lag::default();
         let is_in =
@@ -752,8 +871,47 @@ mod tests {
         assert_eq!(parse_stream_line("x"), None);
     }
 
+    /// The disk-write probe's lost time is reported always and excuses a
+    /// bound only when the lag is taken `excusing_disk` (under a load
+    /// profile): a daemon-caused I/O regression still fails a plain run.
+    #[test]
+    fn the_disk_probe_excuses_only_under_a_load_profile() {
+        const S: u64 = 1_000_000_000;
+        let sample = |due: u64, late_us: u32| Sample { due, late_us };
+        let p = probe_with(Vec::new(), Vec::new());
+        {
+            let mut sources = p.sources.lock().unwrap();
+            sources.push(Source {
+                name: DISK_SOURCE.into(),
+                samples: vec![sample(2 * S, 1_000_000), sample(4 * S, 1_000_000)],
+            });
+        }
+        let lag = lag_in(&p, 0, 10 * S);
+        assert_eq!(lag.disk, Duration::from_secs(2));
+        assert_ne!(lag.worst, DISK_SOURCE);
+        let (measured, protocol, bound) = (
+            Duration::from_millis(2_200),
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+        );
+        let verdict =
+            |lag: &Lag, profile| judge("w", measured, protocol, bound, lag, profile, None);
+        // A plain run: the 2 s the disk lost explain nothing.
+        assert!(matches!(verdict(&lag, false), Verdict::Exceeded(_)));
+        // A load campaign: the 2 s cover the 1.7 s excess (lost time).
+        assert!(matches!(
+            verdict(&lag.clone().excusing_disk(), true),
+            Verdict::Inconclusive(_)
+        ));
+        assert_eq!(lag.clone().excusing_disk().worst, DISK_SOURCE);
+    }
+
+    /// The probe is process-global: the tests that run one take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn the_probe_measures_its_own_sleep() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         begin("probe-test");
         std::thread::sleep(Duration::from_millis(300));
         let lag = lag_between(Instant::now() - Duration::from_millis(250), Instant::now());
@@ -768,5 +926,24 @@ mod tests {
         // What a window lost is clipped to it.
         assert!(lag.stolen <= Duration::from_millis(250), "{lag:?}");
         assert_eq!(lag.injected, Duration::ZERO);
+    }
+
+    #[test]
+    fn the_disk_probe_samples_writes_and_stops_with_the_scenario() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        begin("disk-probe-test");
+        add_disk_probe(dir.path());
+        // The same device again: one probe.
+        add_disk_probe(dir.path());
+        std::thread::sleep(PERIOD * 6);
+        let probe = current().expect("a probe");
+        let sources = probe.sources.lock().unwrap();
+        let disks: Vec<_> = sources.iter().filter(|s| s.name == "disk").collect();
+        assert_eq!(disks.len(), 1, "one disk source per device");
+        assert!(!disks[0].samples.is_empty(), "no write was timed");
+        drop(sources);
+        drop(probe);
+        let _ = end();
     }
 }

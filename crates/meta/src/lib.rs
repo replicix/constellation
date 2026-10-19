@@ -49,7 +49,9 @@ pub use store::spec::{
     Refusal, SegmentApplied, SpecKind, SpeculationCounts, Stranded, StrandedOp,
     LOCAL_REPLAY_INCARNATION,
 };
-pub use store::{fault_caller_scope, priority_writes, FaultCallerScope, PriorityStats};
+pub use store::{
+    fault_caller_scope, gate_totals, priority_writes, FaultCallerScope, GateTotals, PriorityStats,
+};
 pub use store::{
     BootstrapIndexBuilder, DelegateTx, ForeignApplyHook, JournalBatch, LogPrefixView, Meta,
     PublishBasis, SnapshotChangeHook, SCRATCH_XATTR,
