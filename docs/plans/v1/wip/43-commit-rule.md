@@ -3140,7 +3140,8 @@ to land before C0.
   as recommended.
 
 - **Q20 — C7a's design (specified 2026-10-20).** *Blocks C7a's commits
-  2–4.* (a) *ρ in the clocks* (WAIT scaled by `1/(1+ρ)`, the honour
+  2–4.* 
+  (a) *ρ in the clocks* (WAIT scaled by `1/(1+ρ)`, the honour
   elapsed by `1/(1−ρ)`), not `2ρ·T` added at the ~60 margin sites:
   *recommended* (one place, exact for chained floors; WAIT and HONOUR then
   drift from WALL by ρ·uptime, status only). (b) ρ per node, 1 000 ppm
@@ -3160,6 +3161,7 @@ to land before C0.
   *recommended*. (h) Seeding `ship.max_epoch` from the applied position
   (and `replay_from` setting it) is not a clock item: *recommended* in C0,
   where "applied, unfenced" gets one meaning for every reader.
+  **Answered 2026-10-20:** every recommendation taken.
 
 ### 11.1 Deferred (not in this plan)
 
