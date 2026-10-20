@@ -2392,6 +2392,43 @@ first part of C7a, landed early):
   half): no overlap with C1–C5; recommended right after C0, so every
   later milestone's sweeps run with rate faults and large constant
   offsets.
+  *Specified 2026-10-20* (the coder spec is kept with the reviews; the
+  decisions are §11 Q20).
+  - *ρ in the clocks.* Each node's WAIT runs slow by its budget ρ and its
+    honour elapsed fast by it (`WAIT = wall₀ + e_raw/(1+ρ)`, `e_h =
+    e_raw/(1−ρ) + S`), so P2 and P3 hold exactly for any oscillator within
+    the budget and every honour/wait pair is safe for any span with the
+    margins it has: per window that is `ρ·T` on each side (production:
+    lease 60 ms, lock 20 ms, read delegation 5 ms, the lock floor 23.5 ms),
+    and `M` stays transit slack. ρ is a property of one node's clock
+    (1 000 ppm where the rate source is unslewed). The beat cap's span
+    stays, derived from ρ (`M/(4ρ)`, 250·M at the defaults): a beat sent
+    before the renewal that set `X` measures a past interval on the
+    holder's wait clock, which under-counts it by up to `2ρ`. Wait timers
+    sleep `after·(1+ρ)`.
+  - *Restart horizons by boot.* The lock and read horizons and the
+    promise's `issued` are persisted as `<wall> <span> <boot id> <raw
+    until>` (append-only tokens; a value with only the wall is read as
+    unstamped): on the same boot the remaining time is read on
+    `CLOCK_MONOTONIC_RAW` (not BOOTTIME, which is slewed), immune to steps
+    while up or down; on another boot, or unstamped, the recorded span is
+    waited from start (≈ 22 s for locks, ≈ 7 s for acknowledgements, only
+    after an ungraceful stop: a graceful shutdown clears a passed horizon).
+    Re-persisting on a forward jump is then not needed.
+  - *Also:* the takeover floor persisted (the horizons at arming, a
+    pending-floor key before the fast claim CAS); M4's own-lease arm gated
+    whatever the wall clock says of the lease's expiry (33adc8e's rule,
+    which the sans-IO port narrowed); the models' per-node rate and the
+    honour/wait/wall split in `cto` and `locks` (`flex` is C7b's); the
+    sim's `RateSkew`, `Suspend`, `RebootNode` faults, and clock faults in
+    the default mix with steps bounded to ±200 ms until C7b.
+  - *Six commits:* (1) the sim's clock model, faults and fail-before
+    configurations; (2) rate-budgeted readings (fable review); (3)
+    boot-stamped horizons and M4's arm (fable review); (4) the floor
+    persisted (fable review); (5) the models; (6) the default mix, the
+    harness's `clock:rate:` and reboot items, the campaign preset and the
+    docs. 1 and 5 land on their own at any time; 2 and 3 each need 1; 4
+    needs 3; 6 needs 2 and 3.
 - **C7b — the cross-node compares** (rows 2, 3, 6, 9, 11, and the sites
   C7-H2 found and left: 23 the released-takeover lock grace, 24 the seal
   watch's expiry compares, 25 `promise_check_needed`; and those C7-H1's
@@ -2786,6 +2823,7 @@ additionally fails on `non_lone_rollbacks > 0` (I5) from C1. New
 | `fast-takeover-skewed-successor` | C7-H2 | no quarantine for a successor ahead | ×2000 |
 | `locks-root-step-forward`, `locks-locker-step-back`, `locks-holder-step-back-sealed`, `fast-takeover-holder-step-forward`, `fast-takeover-successor-step-forward`, `delegated-root-step-forward`, `delegated-delegate-step-back`, `strict-reader-step-back` (+ the controls `locks-root-step-back`, `locks-holder-step-forward`) | C7-H1 | a backward step extends an honoured window; a forward step shortens a waited one or moves F-a's cap | ×2000 each |
 | C7's seven sim tests (§7 C7) | C7a/C7b | offsets far beyond the margin | per test |
+| `locks-root-rate-fast`, `fast-takeover-successor-rate-fast`, `fast-takeover-holder-rate-fast`, `delegated-root-rate-fast`, `strict-reader-rate-fast` (+ the control `locks-rate-within-budget`); `locks-locker-suspend`, `strict-holder-suspend` (mutant fail-before); `locks-root-restart-step-forward`, `locks-root-step-forward-then-restart`, `locks-root-reboot-step-forward`, `strict-holder-restart-step-forward`, `flex-promiser-restart-step-forward` (+ `locks-root-reboot`); `fast-takeover-successor-restart-in-floor`, `-before-marker`; `holder-restart-step-forward-readopt` | C7a | a waiter's oscillator beyond the unbudgeted clock; a persisted horizon shortened by a step while down or after the last write; a forgotten floor | ×2000 each |
 
 Pinned regressions that must stay green throughout (they prove the
 deleted machinery's classes stay closed): the 9287 and 2945 seeds,
@@ -2807,7 +2845,8 @@ delegated-holder-cut test); none is deleted.
 | `protocol.rs` | `eio_never_lands_late`; `abandon`; `Protocol::Commit` | `today_an_in_doubt_op_lands_after_its_eio` | `commit_protocol_is_clean` | C0 / C2 / C3 |
 | `flex.rs` | `hold_owner_never_deposed_except_by_retire` | (checks Q3's decision; a counterexample stops C0) | `full_rule_is_clean` with it | C0 |
 | `locks.rs` | `lock_state_in_log` | `a_late_recall_answer_revives_a_grant_without_log_state` | `lock_state_in_log_is_clean`; `lock_state_in_log_needs_the_grace` violates | C4 |
-| `cto.rs`, `locks.rs`, `flex.rs` | `rate_ppm` | offsets beyond the margin with the old rules | ρ = 1 000 ppm, offsets up to a TTL | C7 |
+| `cto.rs`, `locks.rs` | per-node rate, `rate_budget`, the honour/wait/wall split, `beat_span` | a rate beyond the budget; a beat before the renewal without the span; a step judged on the wall clock | rate within the budget; the span; the split | C7a |
+| `cto.rs`, `locks.rs`, `flex.rs` | offsets up to a TTL | offsets beyond the margin with the old rules | ρ = 1 000 ppm, offsets up to a TTL | C7b |
 
 Every new test carries an explicit state-count / depth / time cap
 (`today_bugs.rs`'s convention) and finishes under ~60 s in release;
@@ -2923,7 +2962,7 @@ answered is marked **decided** (the plan implements the decision; the
 maintainer may still overturn it). Blocking before C0: Q7, Q10a.
 Before C1: Q1, Q13. Before C2: Q2, Q4, Q9, Q14, Q15, Q16. Before C4:
 Q6. Before C6: Q5. Before C7b: Q10b, Q10c. Before C7-F: Q17 (F-a),
-Q18 (F-b). Before C7-H1: Q19.
+Q18 (F-b). Before C7-H1: Q19. Before C7a's commits 2–4: Q20.
 
 **Answered by the maintainer (2026-10-17): every recommendation below
 is accepted** — Q1 (a) strict, Q2 yes, Q4 yes, Q6 yes, Q7 the
@@ -3099,6 +3138,28 @@ to land before C0.
   liveness — in the four commits; (b) yes, the honour clock follows a
   forward wall step, and an early end is counted and documented; (c)–(g)
   as recommended.
+
+- **Q20 — C7a's design (specified 2026-10-20).** *Blocks C7a's commits
+  2–4.* (a) *ρ in the clocks* (WAIT scaled by `1/(1+ρ)`, the honour
+  elapsed by `1/(1−ρ)`), not `2ρ·T` added at the ~60 margin sites:
+  *recommended* (one place, exact for chained floors; WAIT and HONOUR then
+  drift from WALL by ρ·uptime, status only). (b) ρ per node, 1 000 ppm
+  (2 000 where the rate source is slewed or unknown), an environment
+  override for testing only: *recommended*. (c) Restart horizons on
+  `CLOCK_MONOTONIC_RAW` with the boot id, no wall term, the recorded span
+  on another boot; a graceful shutdown clears a passed horizon:
+  *recommended* (the text above said BOOTTIME and "the longer of the
+  two"). (d) No re-persisting on a forward jump: *recommended* (the boot
+  stamp makes it moot). (e) M4's own-lease arm always gated: *recommended*
+  (a tail before re-adopting an own lease the wall clock reads as
+  expired). (f) The takeover floor persisted through the horizon keys and
+  a pending-floor key before the fast claim CAS (one fsync before such a
+  CAS): *recommended* over a lease-body field. (g) Clock faults in the
+  sim's default mix: rates within the budget, steps bounded to ±200 ms
+  per node until C7b, suspends of 0.3–3 s, an occasional reboot:
+  *recommended*. (h) Seeding `ship.max_epoch` from the applied position
+  (and `replay_from` setting it) is not a clock item: *recommended* in C0,
+  where "applied, unfenced" gets one meaning for every reader.
 
 ### 11.1 Deferred (not in this plan)
 
