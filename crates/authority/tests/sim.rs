@@ -442,6 +442,36 @@ fn replay_seed() {
         Ok("strict-reader-step-back") => strict_reader_step_back_config(),
         Ok("locks-root-step-back") => locks_root_step_back_config(),
         Ok("locks-holder-step-forward") => locks_holder_step_forward_config(),
+        Ok("locks-root-rate-fast") => locks_root_rate_fast_config(),
+        Ok("locks-root-rate-skew") => locks_root_rate_skew_config(),
+        Ok("locks-partition-long-grants") => locks_partition_long_grants_config(),
+        Ok("fast-takeover-long-grants") => fast_takeover_long_grants_config(),
+        Ok("fast-takeover-capped-grants") => fast_takeover_capped_grants_config(),
+        Ok("delegated-long-delegation") => delegated_long_delegation_config(),
+        Ok("strict-isolated-reader-long") => strict_isolated_reader_long_config(),
+        Ok("fast-takeover-successor-rate-fast") => fast_takeover_successor_rate_fast_config(),
+        Ok("fast-takeover-holder-rate-fast") => fast_takeover_holder_rate_fast_config(),
+        Ok("delegated-root-rate-fast") => delegated_root_rate_fast_config(),
+        Ok("strict-reader-rate-fast") => strict_reader_rate_fast_config(),
+        Ok("locks-rate-within-budget") => locks_rate_within_budget_config(),
+        Ok("locks-locker-suspend") => locks_locker_suspend_config(),
+        Ok("strict-holder-suspend") => strict_holder_suspend_config(),
+        Ok("locks-root-restart-step-forward") => locks_root_restart_step_forward_config(),
+        Ok("locks-root-step-forward-then-restart") => locks_root_step_forward_then_restart_config(),
+        Ok("locks-root-reboot-step-forward") => locks_root_reboot_step_forward_config(),
+        Ok("locks-root-reboot") => locks_root_reboot_config(),
+        Ok("strict-holder-restart-step-forward") => strict_holder_restart_step_forward_config(),
+        Ok("flex-promiser-restart-step-forward") => flex_promiser_restart_step_forward_config(),
+        Ok("fast-takeover-successor-restart-in-floor") => {
+            fast_takeover_successor_restart_in_floor_config()
+        }
+        Ok("fast-takeover-successor-restart-in-floor-strict") => {
+            fast_takeover_successor_restart_in_floor_strict_config()
+        }
+        Ok("fast-takeover-successor-restart-before-marker") => {
+            fast_takeover_successor_restart_before_marker_config()
+        }
+        Ok("holder-restart-step-forward-readopt") => holder_restart_step_forward_readopt_config(),
         Ok("locks-nofence") => SimConfig {
             lock_ignore_fence: true,
             ..locks_partition_config()
@@ -1684,11 +1714,17 @@ fn step_fault(at_ms: u64, who: sim::run::StepOf, ms: i64) -> ScheduledFault {
 /// readings at the stepped wall.
 #[tokio::test(start_paused = true)]
 async fn a_simulated_clock_step_moves_wall_only_and_outlives_the_incarnation() {
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::Ordering;
     let truth = sim::clock::Clock::start();
-    let step = std::sync::Arc::new(AtomicI64::new(0));
-    let node = truth.for_node(0, step.clone(), (3 << 32) | 1);
-    let other = truth.for_node(0, std::sync::Arc::new(AtomicI64::new(0)), (2 << 32) | 1);
+    let state = sim::clock::NodeClockState::new(3, 0, false);
+    let step = state.step();
+    let node = truth.for_node(0, state.clone(), (3 << 32) | 1, 0);
+    let other = truth.for_node(
+        0,
+        sim::clock::NodeClockState::new(2, 0, false),
+        (2 << 32) | 1,
+        0,
+    );
     tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
     let (n0, o0) = (node.now(), other.now());
     assert_eq!(
@@ -1717,7 +1753,7 @@ async fn a_simulated_clock_step_moves_wall_only_and_outlives_the_incarnation() {
     assert_eq!(other.step_stats(), Default::default());
     // A restart: a new clock over the same step. All three start at the
     // node's wall; its id is new.
-    let reborn = truth.for_node(0, step.clone(), (3 << 32) | 2);
+    let reborn = truth.for_node(0, state.clone(), (3 << 32) | 2, 0);
     assert_ne!(reborn.id(), node.id());
     let r = reborn.now();
     assert_eq!(r.wall, node.wall());
@@ -1945,6 +1981,694 @@ fn locks_holder_step_forward_config() -> SimConfig {
         faults: vec![step_fault(2_000, sim::run::StepOf::Locker, 3_000)],
         ..locks_partition_config()
     }
+}
+
+// ---- Plan 43 C7a (commit 1): rate, suspend and reboot of one node
+// (`FaultKind::RateSkew`, `Suspend`, `RebootNode`, `CrashHolderStepped`,
+// `CrashSuccessorInFloor`, `SimConfig::node_rates`).
+//
+// The rate configurations budget the rate they inject
+// (`SimConfig::rate_budget_ppm`), which the readings do not use until C7a's
+// second commit: each fails here, at the rate PROGRESS records (the
+// "fail-before"), and is clean once the clocks scale by the budget. The
+// restart configurations fail until the boot-stamped horizons (third commit)
+// and the persisted floor (fourth). They are not in `long_locks` or the CI
+// tests until the commit that fixes them.
+
+/// `lock_ttl_ms` 20 s grants under a 30 s lease: a grant is not capped by
+/// the lease (the rate configurations' arithmetic wants whole grants).
+fn long_grants_core(
+    base: fn(u64, u32) -> constellation_authority::core::Config,
+) -> std::sync::Arc<dyn Fn(u64, u32) -> constellation_authority::core::Config + Send + Sync> {
+    std::sync::Arc::new(move |id, inc| {
+        let mut c = base(id, inc);
+        c.ttl_ms = 30_000;
+        c.lock_ttl_ms = 20_000;
+        c
+    })
+}
+
+/// A few long lockers (`plan`: `(node, start_ms)`, one exclusive lock each on
+/// one file, `ios` steps of `io_ms` under it) and no other client: the rate
+/// and restart configurations' workload. A section outlives a 20 s grant,
+/// and the one that waits is granted only once the other's window is over,
+/// so the overlap of two windows that a clock error opens is what the
+/// checker sees.
+fn long_lockers(
+    cfg: SimConfig,
+    plan: &[(u64, u64)],
+    ios: (u32, u32),
+    io_ms: (u64, u64),
+) -> SimConfig {
+    let mut client_plan: Vec<(u64, u64, usize)> = (1..=cfg.nodes)
+        .map(|n| match plan.iter().find(|(node, _)| *node == n) {
+            Some((_, start)) => (n, *start, 1),
+            None => (n, 0, 0),
+        })
+        .collect();
+    client_plan.sort();
+    SimConfig {
+        clients_per_node: 1,
+        ops_per_client: 1,
+        lock_files: 1,
+        lock_ratio: 1.0,
+        lock_shared_ratio: 0.0,
+        lock_nonblocking_ratio: 0.0,
+        client_plan,
+        lock_ios: ios,
+        lock_io_ms: io_ms,
+        ..cfg
+    }
+}
+
+/// The workload of the lock-rate configurations: two lockers with critical
+/// sections of 11 to 37 s (a grant is 20 s), one of them cut from every other
+/// node for 25 s at 2 s. The control (no rate) is `locks-partition-long-grants`.
+fn locks_partition_long_grants_config() -> SimConfig {
+    long_lockers(
+        SimConfig {
+            core: long_grants_core(sim::run::sim_core_config),
+            random_faults: 0,
+            faults: vec![ScheduledFault {
+                at_ms: 2_000,
+                kind: FaultKind::PartitionLocker { for_ms: 25_000 },
+            }],
+            ..locks_partition_config()
+        },
+        &[(2, 0), (3, 0)],
+        (110, 150),
+        (100, 250),
+    )
+}
+
+/// The root (node 1) runs 8 % fast, budgeted for it, and a locker inside a
+/// critical section is cut from every other node for 25 s: its grant (20 s)
+/// is honoured until 19.5 s after it was sent, while the owner outwaits it
+/// by its own wait clock, which over-counts by 8 %: `(20 000 + 500) / 1.08 =
+/// 18 981` ms of real time. The overlap (about 0.5 s) is a second holder of
+/// the lock. It needs a rate beyond `2M / (T - M) = 5.1 %`, hence the
+/// budget of 80 000 ppm (no real oscillator is that far off; the budget is
+/// what the clocks must scale by). Clean once the wait clock runs slow by
+/// the budget.
+fn locks_root_rate_fast_config() -> SimConfig {
+    SimConfig {
+        rate_budget_ppm: 80_000,
+        node_rates: vec![(1, 80_000)],
+        ..locks_partition_long_grants_config()
+    }
+}
+
+/// The workload of the successor configurations: `locks-failover-backup-
+/// renew`'s first cut (the holder is cut from S3 and from its backup at 1.2 s
+/// and sealed at about 2 s), 20 s lock grants under a 30 s lease, two lockers
+/// (node 3 first, then the backup, node 2, which is the successor) with
+/// critical sections of 18 to 40 s, and the first locker cut from every other
+/// node for 25 s at 3 s, after the takeover: its grant can no longer be
+/// renewed, and the successor (which grants its own request) outwaits it.
+fn fast_takeover_long_grants_config() -> SimConfig {
+    long_lockers(
+        SimConfig {
+            core: long_grants_core(sim::run::backup_core_config),
+            faults: locks_failover_backup_renew_config().faults[..2]
+                .iter()
+                .cloned()
+                .chain([ScheduledFault {
+                    at_ms: 3_000,
+                    kind: FaultKind::PartitionLocker { for_ms: 25_000 },
+                }])
+                .collect(),
+            ..locks_failover_backup_renew_config()
+        },
+        &[(3, 0), (2, 600)],
+        (180, 200),
+        (100, 200),
+    )
+}
+
+/// `locks-root-rate-fast` with the rate arriving mid-run (`RateSkew`, from
+/// 1 s) instead of from the start: the same failure.
+fn locks_root_rate_skew_config() -> SimConfig {
+    let mut faults = locks_partition_long_grants_config().faults;
+    faults.push(ScheduledFault {
+        at_ms: 1_000,
+        kind: FaultKind::RateSkew {
+            who: sim::run::StepOf::Holder,
+            ppm: 80_000,
+        },
+    });
+    SimConfig {
+        rate_budget_ppm: 80_000,
+        faults,
+        ..locks_partition_long_grants_config()
+    }
+}
+
+/// `fast-takeover-long-grants` with the first backup's oscillator 30 % fast:
+/// the successor's lock floor `W + lock + 2M = 22 000` ms on its wait clock
+/// ends after 16 900 ms of real time from its marker (about 19 000 ms), and
+/// the table it installed from its backup's mirror (restamped `lock + M`
+/// at the takeover) after 15 800 ms (about 17 900 ms), while the cut locker
+/// honours the grant it was sent at 0.1 s to 19 600 ms. It needs a rate of
+/// about 25 %: at the plan's 10 % the floor ends at about 22 100 ms, past
+/// every grant of the old tenure.
+fn fast_takeover_successor_rate_fast_config() -> SimConfig {
+    SimConfig {
+        rate_budget_ppm: 300_000,
+        node_rates: vec![(2, 300_000)],
+        ..fast_takeover_long_grants_config()
+    }
+}
+
+/// The workload of the cap configurations: `fast-takeover-long-grants` with a
+/// 10 s lease (the grants of 20 s are capped by it: what the successor's
+/// floor protects ends with the old lease) and the holder's beats on a
+/// thread, so the floor is capped by what the beats say of that lease. The
+/// control (no rate) of `fast-takeover-holder-rate-fast`.
+fn fast_takeover_capped_grants_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.ttl_ms = 10_000;
+            c.lock_ttl_ms = 20_000;
+            c
+        }),
+        holder_beats: sim::run::HolderBeats::Thread,
+        ..fast_takeover_long_grants_config()
+    }
+}
+
+/// `fast-takeover-capped-grants` with the holder 25 % slow and its backup 25 %
+/// fast: the cap counts `X - sent` on the holder's wait clock and puts it on
+/// the successor's, so it ends early by `(1 - c_h/c_b)(X - sent)`, 40 % of
+/// the lease's 10 s: more than `M`. (Both nodes fast by the same rate, as the
+/// plan's table has it, cancels: the two wait clocks keep one ratio.)
+fn fast_takeover_holder_rate_fast_config() -> SimConfig {
+    SimConfig {
+        rate_budget_ppm: 250_000,
+        node_rates: vec![(1, -250_000), (2, 250_000)],
+        ..fast_takeover_capped_grants_config()
+    }
+}
+
+/// `delegated-delegate-step-back`'s shape with 20 s delegations: the delegate
+/// of `d1` (node 2) is cut from the root for 25 s while its clients keep
+/// working, and the root (node 1) is 10 % fast: its generation outwait
+/// (`GenState.until`) ends after `(20 000 + 500) / 1.1 = 18 636` ms of real
+/// time while the cut delegate honours its `until` to 19 500 ms. The control
+/// (no rate) is `delegated-long-delegation`.
+fn delegated_long_delegation_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::sim_core_config(id, inc);
+            c.ttl_ms = 30_000;
+            c.delegation_ttl_ms = 20_000;
+            c
+        }),
+        ops_per_client: 60,
+        faults: vec![ScheduledFault {
+            at_ms: 1_000,
+            kind: FaultKind::Partition {
+                a: 1,
+                b: 2,
+                for_ms: 25_000,
+            },
+        }],
+        ..delegated_config()
+    }
+}
+
+/// `delegated-holder-cut` with 20 s delegations and the root (node 1) 10 %
+/// fast: its generation outwait (`GenState.until`) ends after `(20 000 +
+/// 500) / 1.1 = 18 636` ms of real time while a cut delegate honours its
+/// `until` to 19 500 ms. Measured clean on the parent (the root is crashed
+/// in this configuration, so no delegate outlives its generation: see
+/// PROGRESS).
+fn delegated_root_rate_fast_config() -> SimConfig {
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.delegation_ttl_ms = 20_000;
+            c
+        }),
+        rate_budget_ppm: 100_000,
+        node_rates: vec![(1, 100_000)],
+        ..delegated_holder_cut_config()
+    }
+}
+
+/// `strict-isolated-reader-beats` without its offset, with a 30 s lease and
+/// 30 s read delegations, the reader isolated for 40 s and reading on (the
+/// workload of the strict-reader rate configuration, without a rate).
+fn strict_isolated_reader_long_config() -> SimConfig {
+    let base = strict_isolated_reader_beats_config();
+    let mut faults: Vec<ScheduledFault> = Vec::new();
+    for f in base.faults {
+        faults.push(match f.kind {
+            FaultKind::IsolateReader { node, .. } => ScheduledFault {
+                at_ms: f.at_ms,
+                kind: FaultKind::IsolateReader {
+                    node,
+                    for_ms: 40_000,
+                },
+            },
+            FaultKind::CutS3 { node, .. } => ScheduledFault {
+                at_ms: f.at_ms,
+                kind: FaultKind::CutS3 {
+                    node,
+                    for_ms: 40_000,
+                },
+            },
+            _ => f,
+        });
+    }
+    SimConfig {
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.inbox = false;
+            c.ttl_ms = 30_000;
+            c.read_delegation_ttl_ms = 30_000;
+            c
+        }),
+        clock_offsets: Vec::new(),
+        faults,
+        client_plan: vec![(1, 0, 2), (2, 1_600, 25), (3, 600, 400)],
+        ops_per_client: 400,
+        ..base
+    }
+}
+
+/// `strict-isolated-reader-long` with the node that acknowledges the write
+/// after the seal (node 2, the successor) 20 % fast: its floor `W + read +
+/// 2M = 32 000` ms ends after 26 700 ms of real time from its marker, while
+/// the isolated reader honours the delegation it last sent (before the
+/// crash) to 30 000 - 500 ms after that.
+fn strict_reader_rate_fast_config() -> SimConfig {
+    SimConfig {
+        rate_budget_ppm: 200_000,
+        node_rates: vec![(2, 200_000)],
+        ..strict_isolated_reader_long_config()
+    }
+}
+
+/// Control: every node's rate within a 1 000 ppm budget (alternating signs).
+/// Clean before and after: the rates are below the sim's resolution.
+fn locks_rate_within_budget_config() -> SimConfig {
+    SimConfig {
+        rate_budget_ppm: 1_000,
+        node_rates: vec![(1, 1_000), (2, -1_000), (3, 1_000)],
+        ..locks_config()
+    }
+}
+
+/// A locker inside a critical section is suspended for 3 s (its raw and
+/// monotonic clocks stop, its wall and boot clocks run on). Clean on the
+/// parent: the honour clock counts the suspend (`S`) and the grant lapses
+/// under it. With `S` left out of the honour reading (a mutant) the locker
+/// honours its grant across the suspend while the owner has outwaited it.
+fn locks_locker_suspend_config() -> SimConfig {
+    SimConfig {
+        random_faults: 0,
+        lock_ios: (20, 40),
+        lock_io_ms: (40, 200),
+        faults: vec![ScheduledFault {
+            at_ms: 2_000,
+            kind: FaultKind::Suspend {
+                who: sim::run::StepOf::Locker,
+                ms: 3_000,
+            },
+        }],
+        ..locks_partition_config()
+    }
+}
+
+/// The strict holder is suspended for 2.5 s, beats on a thread: its beats
+/// and answers stop, a backup seals it, and on resume its liveness window
+/// (`liveness_fresh`, honour clock, counting the suspend) must not answer a
+/// strict read after the seal. Clean on the parent; a mutant that drops `S`
+/// answers (close-to-open).
+fn strict_holder_suspend_config() -> SimConfig {
+    SimConfig {
+        holder_beats: sim::run::HolderBeats::Thread,
+        random_faults: 0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::Suspend {
+                who: sim::run::StepOf::Holder,
+                ms: 2_500,
+            },
+        }],
+        ..backup_strict_config()
+    }
+}
+
+/// `locks-root-step-forward`'s workload with the root restarted (300 ms, its
+/// disk) and its wall stepped forward 3 s while it is down, twice: the
+/// restarted root re-adopts its lease and loads its lock quarantine from a
+/// persisted wall deadline, which the step shortens (the horizon is at most
+/// `lock + M + 1 s` ahead): it grants over a grant still honoured.
+fn locks_root_restart_step_forward_config() -> SimConfig {
+    let restart = |at_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::CrashHolderStepped {
+            restart_ms: 300,
+            step_ms: 3_000,
+        },
+    };
+    SimConfig {
+        lock_ios: (6, 20),
+        lock_io_ms: (40, 200),
+        faults: vec![restart(3_000), restart(7_000)],
+        ..locks_config()
+    }
+}
+
+/// The same through a step while the root is up, after its last horizon
+/// write, followed by a restart.
+fn locks_root_step_forward_then_restart_config() -> SimConfig {
+    let step_then_restart = |at_ms| {
+        [
+            step_fault(at_ms, sim::run::StepOf::Holder, 3_000),
+            ScheduledFault {
+                at_ms: at_ms + 600,
+                kind: FaultKind::CrashHolder {
+                    restart_ms: Some(300),
+                    keep_journal: true,
+                },
+            },
+        ]
+    };
+    SimConfig {
+        lock_ios: (6, 20),
+        lock_io_ms: (40, 200),
+        faults: step_then_restart(3_000)
+            .into_iter()
+            .chain(step_then_restart(7_000))
+            .collect(),
+        ..locks_config()
+    }
+}
+
+/// The same across a reboot of the root (a new boot id, the elapsed clocks
+/// from 0) with the wall stepped forward 3 s while it is down.
+fn locks_root_reboot_step_forward_config() -> SimConfig {
+    let reboot = |at_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::RebootNode {
+            node: 0,
+            restart_ms: 300,
+            step_ms: 3_000,
+        },
+    };
+    SimConfig {
+        lock_ios: (6, 20),
+        lock_io_ms: (40, 200),
+        faults: vec![reboot(3_000), reboot(7_000)],
+        ..locks_config()
+    }
+}
+
+/// Cost control: the root rebooted with no step. Clean before and after;
+/// after the boot-stamped horizons the first grant after the reboot waits
+/// about the lock span (a persisted horizon of another boot is waited out
+/// whole).
+fn locks_root_reboot_config() -> SimConfig {
+    let reboot = |at_ms| ScheduledFault {
+        at_ms,
+        kind: FaultKind::RebootNode {
+            node: 0,
+            restart_ms: 300,
+            step_ms: 0,
+        },
+    };
+    SimConfig {
+        lock_ios: (6, 20),
+        lock_io_ms: (40, 200),
+        faults: vec![reboot(3_000), reboot(7_000)],
+        ..locks_config()
+    }
+}
+
+/// `strict-isolated-reader`'s reader (node 3, reading only, cut from the others
+/// and from S3 for 8 s, holding a read delegation) and the holder restarted
+/// (300 ms) with its wall stepped forward 7 s while it is down: the read
+/// horizon it persisted (`read_ttl + M + 1 s`, about 6.5 s ahead) is
+/// shortened by the step, the restarted holder acknowledges a write while the
+/// isolated reader still serves from its delegation.
+fn strict_holder_restart_step_forward_config() -> SimConfig {
+    let base = strict_isolated_reader_config();
+    SimConfig {
+        faults: base
+            .faults
+            .iter()
+            .filter(|f| !matches!(f.kind, FaultKind::CrashHolder { .. }))
+            .cloned()
+            .chain([ScheduledFault {
+                at_ms: 1_500,
+                kind: FaultKind::CrashHolderStepped {
+                    restart_ms: 300,
+                    step_ms: 7_000,
+                },
+            }])
+            .collect(),
+        ..base
+    }
+}
+
+/// A promiser (flex configuration, `epoch_slack 1`) crashed with its wall
+/// stepped forward by the promise's TTL while it is down, restarted, then an
+/// epoch outage: it joins an epoch before its persisted promise ran out
+/// (`promise_join_begin`'s wall fallback). Hard to reach; the meta unit test
+/// of C7a's third commit is its fail-before.
+fn flex_promiser_restart_step_forward_config() -> SimConfig {
+    let promise_ttl = sim::run::flex_core_config(1, 1).promise_ttl_ms as i64;
+    SimConfig {
+        random_faults: 0,
+        faults: vec![
+            ScheduledFault {
+                at_ms: 1_000,
+                kind: FaultKind::RebootNode {
+                    node: 2,
+                    restart_ms: 300,
+                    step_ms: promise_ttl,
+                },
+            },
+            ScheduledFault {
+                at_ms: 1_700,
+                kind: FaultKind::EpochOutage {
+                    members: 2,
+                    for_ms: 3_000,
+                },
+            },
+        ],
+        ..flex_config()
+    }
+}
+
+/// `locks-failover-backup-renew`; the first node to arm a takeover floor (the
+/// successor, after its marker) is killed, restarted 300 ms later with its
+/// disk, re-adopts its own lease and (the floor is in memory only) may grant
+/// inside the predecessor's window. Measured clean on the parent: the lock
+/// mirror the successor installed (and persisted as a lock horizon) covers
+/// the grants of this geometry (see PROGRESS), so it stays a regression
+/// configuration until the floor is persisted.
+fn fast_takeover_successor_restart_in_floor_config() -> SimConfig {
+    SimConfig {
+        faults: locks_failover_backup_renew_config()
+            .faults
+            .into_iter()
+            .chain([ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::CrashSuccessorInFloor {
+                    restart_ms: 300,
+                    after_marker: true,
+                },
+            }])
+            .collect(),
+        ..locks_failover_backup_renew_config()
+    }
+}
+
+/// The strict variant: acknowledgements instead of grants. The isolated
+/// reader (`strict-isolated-reader`) holds a read delegation from the
+/// crashed holder; the successor, killed inside its floor and restarted,
+/// acknowledges a write the reader then misses.
+fn fast_takeover_successor_restart_in_floor_strict_config() -> SimConfig {
+    SimConfig {
+        faults: strict_isolated_reader_config()
+            .faults
+            .into_iter()
+            .chain([ScheduledFault {
+                at_ms: 1_600,
+                kind: FaultKind::CrashSuccessorInFloor {
+                    restart_ms: 300,
+                    after_marker: true,
+                },
+            }])
+            .collect(),
+        ..strict_isolated_reader_config()
+    }
+}
+
+/// The same through the window between the claim CAS (the gate, the marker
+/// not landed) and the marker.
+fn fast_takeover_successor_restart_before_marker_config() -> SimConfig {
+    SimConfig {
+        faults: locks_failover_backup_renew_config()
+            .faults
+            .into_iter()
+            .chain([ScheduledFault {
+                at_ms: 1_200,
+                kind: FaultKind::CrashSuccessorInFloor {
+                    restart_ms: 300,
+                    after_marker: false,
+                },
+            }])
+            .collect(),
+        ..locks_failover_backup_renew_config()
+    }
+}
+
+/// M4's own-lease arm (plan 43 C7a, third commit): `backup` with the holder
+/// restarted (300 ms) and its wall stepped forward 7 s (the lease's 6 s TTL
+/// passes on the stepped wall).
+fn holder_restart_step_forward_readopt_config() -> SimConfig {
+    SimConfig {
+        random_faults: 0,
+        faults: vec![ScheduledFault {
+            at_ms: 1_500,
+            kind: FaultKind::CrashHolderStepped {
+                restart_ms: 300,
+                step_ms: 7_000,
+            },
+        }],
+        ..backup_config()
+    }
+}
+
+/// Plan 43 C7a: the simulated clock model. A rate moves a node's boot, raw
+/// and monotonic clocks and not its wall; the budget is carried and read
+/// by nothing yet. A node at +50 000 ppm for a second reads 1 050 ms on
+/// WAIT and HONOUR and 1 000 ms on the wall; set to -100 000 ppm it reads
+/// 900 ms for the next second.
+#[tokio::test(start_paused = true)]
+async fn a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall() {
+    let truth = sim::clock::Clock::start();
+    let state = sim::clock::NodeClockState::new(2, 50_000, false);
+    let node = truth.for_node(0, state.clone(), (2 << 32) | 1, 1_000);
+    let n0 = node.now();
+    tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
+    let n1 = node.now();
+    assert_eq!(n1.wall.0 - n0.wall.0, 1_000);
+    assert_eq!(n1.wait.0 - n0.wait.0, 1_050);
+    assert_eq!(n1.honour.0 - n0.honour.0, 1_050);
+    state.set_rate(-100_000, truth.elapsed_ns());
+    tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
+    let n2 = node.now();
+    assert_eq!(n2.wall.0 - n1.wall.0, 1_000);
+    assert_eq!(n2.wait.0 - n1.wait.0, 900);
+    // HONOUR follows a wall that runs ahead of the slow oscillator (P5:
+    // HONOUR >= WALL), by the 50 ms it lagged in the first second and no
+    // more: 900 + 50.
+    assert_eq!(n2.honour.0 - n1.honour.0, 950);
+    assert!(n2.honour.0 >= n2.wall.0);
+    assert_eq!(state.ppm_at(truth.elapsed_ns()), -100_000);
+    // The rate is the host's: a new incarnation reads it too.
+    let reborn = truth.for_node(0, state.clone(), (2 << 32) | 2, 1_000);
+    let (r0, t0) = (reborn.now(), truth.elapsed_ms());
+    tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
+    let r1 = reborn.now();
+    assert_eq!(truth.elapsed_ms() - t0, 1_000);
+    assert_eq!(r1.wait.0 - r0.wait.0, 900);
+}
+
+/// Plan 43 C7a: a suspended host's raw and monotonic clocks stop while its
+/// boot clock and wall run on: WAIT does not count the suspend, HONOUR does
+/// (through `S`), and a timer armed across it fires after the node resumes.
+#[tokio::test(start_paused = true)]
+async fn a_simulated_suspend_stops_wait_and_not_honour_or_the_wall() {
+    let truth = sim::clock::Clock::start();
+    let state = sim::clock::NodeClockState::new(2, 0, false);
+    let node = truth.for_node(0, state.clone(), (2 << 32) | 1, 0);
+    tokio::time::advance(std::time::Duration::from_millis(500)).await;
+    let n0 = node.now();
+    state.suspend(truth.elapsed_ns(), 3_000);
+    // A timer for 1 s of wait time, armed as the suspend begins: it is due
+    // 3 s late.
+    let due = node.instant_at_wait(n0.wait.plus(1_000));
+    assert_eq!(
+        due - tokio::time::Instant::now(),
+        std::time::Duration::from_millis(4_000)
+    );
+    tokio::time::advance(std::time::Duration::from_millis(5_000)).await;
+    let n1 = node.now();
+    assert_eq!(n1.wall.0 - n0.wall.0, 5_000);
+    assert_eq!(n1.honour.0 - n0.honour.0, 5_000);
+    assert_eq!(n1.wait.0 - n0.wait.0, 2_000);
+}
+
+/// Plan 43 C7a: a reboot restarts boot, raw and monotonic from 0 and
+/// changes the boot id; a restart of the process on the same boot does not.
+#[tokio::test(start_paused = true)]
+async fn a_simulated_reboot_changes_the_boot_id_and_restarts_the_elapsed_clocks() {
+    let truth = sim::clock::Clock::start();
+    let state = sim::clock::NodeClockState::new(3, 0, false);
+    tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+    let a = truth.for_node(0, state.clone(), (3 << 32) | 1, 0);
+    let again = truth.for_node(0, state.clone(), (3 << 32) | 2, 0);
+    assert_eq!(a.boot_id(), again.boot_id());
+    assert_ne!(a.boot_id(), 0);
+    state.reboot(truth.elapsed_ns());
+    tokio::time::advance(std::time::Duration::from_millis(700)).await;
+    let b = truth.for_node(0, state.clone(), (3 << 32) | 3, 0);
+    assert_ne!(a.boot_id(), b.boot_id());
+    assert_eq!(b.boot_id() >> 32 & 0x7fff_ffff, 3);
+    // The elapsed sources restart: the new boot's raw clock reads the 700
+    // ms since it began (a timer for 1 s of its wait clock is due after 1 s).
+    let n = b.now();
+    let due = b.instant_at_wait(n.wait.plus(1_000));
+    assert_eq!(
+        due - tokio::time::Instant::now(),
+        std::time::Duration::from_millis(1_000)
+    );
+    // The wall runs on through the reboot.
+    assert_eq!(b.wall(), truth.wall());
+}
+
+/// Plan 43 C7a: a node's WAIT inverts through its rate (a timer for 1 100
+/// ms of wait time on an oscillator 10 % fast is due after 1 000 ms), and a
+/// node with no fault reads exactly the paused clock's whole milliseconds, as
+/// before C7a.
+#[tokio::test(start_paused = true)]
+async fn a_simulated_timer_inverts_the_rate_and_a_plain_clock_is_the_paused_one() {
+    let truth = sim::clock::Clock::start();
+    let fast = truth.for_node(
+        0,
+        sim::clock::NodeClockState::new(2, 100_000, false),
+        (2 << 32) | 1,
+        0,
+    );
+    let plain = truth.for_node(
+        0,
+        sim::clock::NodeClockState::new(3, 0, false),
+        (3 << 32) | 1,
+        0,
+    );
+    tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
+    let (f, p) = (fast.now(), plain.now());
+    let t0 = tokio::time::Instant::now();
+    assert_eq!(
+        fast.instant_at_wait(f.wait.plus(1_100)) - t0,
+        std::time::Duration::from_millis(1_000)
+    );
+    assert_eq!(
+        plain.instant_at_wait(p.wait.plus(1_100)) - t0,
+        std::time::Duration::from_millis(1_100)
+    );
+    // Whole milliseconds of true time, wall included.
+    let base_ms = truth.wall().0 - truth.elapsed_ms() as i64;
+    assert_eq!(p.wait.0, base_ms + 1_000);
+    assert_eq!(p.honour.0, p.wait.0);
+    assert_eq!(p.wall.0, base_ms + 1_000);
 }
 
 /// Runs the seeds on up to 8 threads (the backup ranges are a few
@@ -3719,6 +4443,36 @@ fn sweep_config() {
         "strict-reader-step-back" => strict_reader_step_back_config(),
         "locks-root-step-back" => locks_root_step_back_config(),
         "locks-holder-step-forward" => locks_holder_step_forward_config(),
+        "locks-root-rate-fast" => locks_root_rate_fast_config(),
+        "locks-root-rate-skew" => locks_root_rate_skew_config(),
+        "locks-partition-long-grants" => locks_partition_long_grants_config(),
+        "fast-takeover-long-grants" => fast_takeover_long_grants_config(),
+        "fast-takeover-capped-grants" => fast_takeover_capped_grants_config(),
+        "delegated-long-delegation" => delegated_long_delegation_config(),
+        "strict-isolated-reader-long" => strict_isolated_reader_long_config(),
+        "fast-takeover-successor-rate-fast" => fast_takeover_successor_rate_fast_config(),
+        "fast-takeover-holder-rate-fast" => fast_takeover_holder_rate_fast_config(),
+        "delegated-root-rate-fast" => delegated_root_rate_fast_config(),
+        "strict-reader-rate-fast" => strict_reader_rate_fast_config(),
+        "locks-rate-within-budget" => locks_rate_within_budget_config(),
+        "locks-locker-suspend" => locks_locker_suspend_config(),
+        "strict-holder-suspend" => strict_holder_suspend_config(),
+        "locks-root-restart-step-forward" => locks_root_restart_step_forward_config(),
+        "locks-root-step-forward-then-restart" => locks_root_step_forward_then_restart_config(),
+        "locks-root-reboot-step-forward" => locks_root_reboot_step_forward_config(),
+        "locks-root-reboot" => locks_root_reboot_config(),
+        "strict-holder-restart-step-forward" => strict_holder_restart_step_forward_config(),
+        "flex-promiser-restart-step-forward" => flex_promiser_restart_step_forward_config(),
+        "fast-takeover-successor-restart-in-floor" => {
+            fast_takeover_successor_restart_in_floor_config()
+        }
+        "fast-takeover-successor-restart-in-floor-strict" => {
+            fast_takeover_successor_restart_in_floor_strict_config()
+        }
+        "fast-takeover-successor-restart-before-marker" => {
+            fast_takeover_successor_restart_before_marker_config()
+        }
+        "holder-restart-step-forward-readopt" => holder_restart_step_forward_readopt_config(),
         other => panic!("sweep_config: unknown config {other}"),
     };
     // `<config>+nomove+solo`: see `config_variant`.
@@ -3739,6 +4493,30 @@ fn sweep_config() {
             && c.holder_beats == sim::run::HolderBeats::Off
         {
             c.holder_beats = sim::run::HolderBeats::Thread;
+        }
+        // Plan 43 C7a: `AUTHORITY_SIM_RATES=1:-250000,2:250000` sets the
+        // nodes' oscillator rates (ppm) of any configuration, and the
+        // budget to the largest of them (`AUTHORITY_SIM_BUDGET=<ppm>`
+        // overrides it): for tuning a rate configuration without
+        // rebuilding.
+        if let Ok(rates) = std::env::var("AUTHORITY_SIM_RATES") {
+            c.node_rates = rates
+                .split(',')
+                .filter_map(|p| p.split_once(':'))
+                .map(|(n, ppm)| (n.parse().expect("node"), ppm.parse().expect("ppm")))
+                .collect();
+            c.rate_budget_ppm = c
+                .node_rates
+                .iter()
+                .map(|(_, p)| p.unsigned_abs() as u32)
+                .max()
+                .unwrap_or(0);
+        }
+        if let Some(b) = std::env::var("AUTHORITY_SIM_BUDGET")
+            .ok()
+            .and_then(|b| b.parse().ok())
+        {
+            c.rate_budget_ppm = b;
         }
         c
     };

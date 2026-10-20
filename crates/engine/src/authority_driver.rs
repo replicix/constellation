@@ -580,6 +580,7 @@ pub fn load_config(
     let ttl_ms = crate::lease::lease_ttl_ms();
     let mut c = Config::defaults(node_id, incarnation);
     c.clock_id = constellation_platform::clock::protocol().id();
+    c.clock_rate_budget_ppm = constellation_platform::clock::protocol().rate_budget_ppm();
     c.single_writer = lease_mode == LeaseMode::SingleWriter;
     c.ttl_ms = ttl_ms;
     c.expiry_margin_ms = crate::lease::expiry_margin_ms() as u64;
@@ -6422,6 +6423,7 @@ impl Standalone {
     ) -> Self {
         let mut cfg = Config::defaults(node_id, 0);
         cfg.clock_id = constellation_platform::clock::protocol().id();
+        cfg.clock_rate_budget_ppm = constellation_platform::clock::protocol().rate_budget_ppm();
         cfg.single_writer = lease_mode == LeaseMode::SingleWriter;
         cfg.p2p = false;
         cfg.inbox = false;

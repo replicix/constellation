@@ -2470,6 +2470,34 @@ first part of C7a, landed early):
     harness's `clock:rate:` and reboot items, the campaign preset and the
     docs. 1 and 5 land on their own at any time; 2 and 3 each need 1; 4
     needs 3; 6 needs 2 and 3.
+  - *Commit 1 landed (2026-10-20; PROGRESS "Plan 43 C7a, commit 1 of 6"):*
+    the simulator's oscillator (`NodeClockState`: rate, suspends, boots, the
+    boot id; timers count through its inverse), `RateSkew`, `Suspend`,
+    `RebootNode`, `CrashHolderStepped`, `CrashSuccessorInFloor`,
+    `SimConfig::{rate_budget_ppm, node_rates, wall_follows_rate}`,
+    `ProtocolClock::new/with_id(.., budget_ppm)` and
+    `Config::clock_rate_budget_ppm` carried unused, the platform's
+    `CONSTELLATION_FAULT_CLOCK_RATE_PPM` and
+    `CONSTELLATION_CLOCK_RATE_BUDGET_PPM`, the harness's `clock:rate:`. No
+    protocol site reads the budget: the sweeps of every configuration without
+    a rate, a suspend or a reboot are identical to the parent's. Fail-before
+    (2 000 seeds): `locks-root-rate-fast` 1 364, `fast-takeover-successor-rate-
+    fast` 1 984 (the rate it needs is about 25 %, not the table's 10 %),
+    `fast-takeover-holder-rate-fast` 224 (holder slow, backup fast: both fast
+    cancels), `strict-reader-rate-fast` 613, `locks-root-restart-step-forward`
+    1 143, `locks-root-step-forward-then-restart` 774, `locks-root-reboot-step-
+    forward` 1 143, `strict-holder-restart-step-forward` 212, `fast-takeover-
+    successor-restart-before-marker` 57; clean on the parent and kept as
+    regressions: `delegated-root-rate-fast`, `flex-promiser-restart-step-
+    forward`, `holder-restart-step-forward-readopt`, `fast-takeover-successor-
+    restart-in-floor` (the lock mirror's persisted horizon covers the grants
+    of its geometry), and the suspend pair (dropping `S` alone fails nothing:
+    HONOUR follows a disciplined wall through `J` across the suspend; dropping
+    both fails `locks-locker-suspend` 557 of 1 000). Found: a delegate
+    partitioned from its root for longer than a 20 s delegation (no clock
+    fault, `delegated-long-delegation`) fails 16 of 300 seeds on the parent
+    ("a rid refused with Eexist completed once in the log"): not
+    clock-related, to be looked at.
 - **C7b — the cross-node compares** (rows 2, 3, 6, 9, 11, and the sites
   C7-H2 found and left: 23 the released-takeover lock grace, 24 the seal
   watch's expiry compares, 25 `promise_check_needed`; and those C7-H1's

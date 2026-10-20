@@ -54098,3 +54098,153 @@ rename at 81 us.)
   file systems mounted, before C1 (D4); `bench/commit-rule/RESULTS.md` is a skeleton.
 - The fable review of C0.
 - C1 turns `strict_lone` on in the `strict_durability` configs and carries D1 (the operator escape).
+
+## Plan 43 C7a, commit 1 of 6: the simulator's oscillator, suspend, reboot and the fail-before configurations
+
+C7a (plan 43 §7 C7, §11 Q20, answered 2026-10-20) puts the rate bound ρ in the
+clocks. This is its first commit: the simulator's clock model, the faults, the
+fail-before configurations, the budget carried (unused) through the clock and
+the core's configuration, the platform's two environment hooks and the
+harness's `clock:rate:` item. **No protocol site reads the budget yet**
+(commit 2 does): nothing changes without a rate, a suspend or a reboot, which
+the identity sweeps below show.
+
+### What landed
+
+- `tests/sim/clock.rs`: `NodeClockState` (one per node for the run, shared by
+  its incarnations): the wall step, and the node's **oscillator** as a
+  function of true time: piecewise-linear rate (`SimConfig::node_rates` from
+  the start, `FaultKind::RateSkew` from the fault on), announced suspends
+  (raw and monotonic stand still, boot and the wall run on) and boots
+  (`RebootNode`: boot, raw and monotonic restart from 0; the boot id
+  `node << 32 | boot | 1 << 63` changes). The wall follows true time (a
+  disciplined host) unless `SimConfig::wall_follows_rate`. Without a fault
+  the sources are the paused clock's whole milliseconds, as before. A
+  `SetTimer` counts to the node's wait clock reaching the step's reading plus
+  `after_ms`: `Clock::instant_at_wait` inverts the oscillator (exactly, with
+  a closed form for the plain clock) and the timer's task checks again when
+  its sleep ends, so a timer armed across a suspend, or before a rate
+  change, fires when its node's clock says.
+- `FaultKind`: `RateSkew { who, ppm }`, `Suspend { who, ms }` (the node's
+  process stands as for `Pause`: the beat and delegation-lane loops already
+  skip while paused), `RebootNode { node, restart_ms, step_ms }`,
+  `CrashHolderStepped { restart_ms, step_ms }` (the step applied while the
+  node is down), `CrashSuccessorInFloor { restart_ms, after_marker }`.
+  `SimConfig::{rate_budget_ppm, node_rates, wall_follows_rate}`;
+  `AUTHORITY_SIM_RATES=<node>:<ppm>,..` and `AUTHORITY_SIM_BUDGET` set the
+  rates of any configuration under `sweep_config` (tuning).
+- Carried, unused: `ProtocolClock::new/with_id(.., budget_ppm)` and
+  `rate_budget_ppm()`, `ClockSources::boot_id()` (default 0; the simulator's
+  implements it), `Config::clock_rate_budget_ppm` (the engine sets it from the
+  clock, the simulator from `rate_budget_ppm`), `platform::clock::
+  {rate_budget_ppm, fault_rate_ppm}`: `CONSTELLATION_CLOCK_RATE_BUDGET_PPM`
+  (1 000 on Linux/Android/macOS/iOS, 2 000 elsewhere; refused from 500 000)
+  and `CONSTELLATION_FAULT_CLOCK_RATE_PPM` (boot, raw and monotonic run at
+  `1 + ppm/1e6` from the first reading, the wall does not; a separate source
+  type, so an unskewed daemon pays nothing); the engine logs both once.
+- The harness: `clock:rate:<±ppm>[:unbudgeted][@node]` (parse test; sets the
+  two variables at spawn, the budget `max(1000, |ppm|)` unless unbudgeted).
+- Tests: `a_simulated_rate_moves_the_elapsed_clocks_and_not_the_wall`,
+  `a_simulated_suspend_stops_wait_and_not_honour_or_the_wall`,
+  `a_simulated_reboot_changes_the_boot_id_and_restarts_the_elapsed_clocks`,
+  `a_simulated_timer_inverts_the_rate_and_a_plain_clock_is_the_paused_one`
+  (sim), `the_rate_budget_is_stored_and_not_yet_read` (types),
+  `rate_faults_and_budgets_are_bounded` and
+  `a_skewed_source_runs_at_the_injected_rate` (platform), `clock_rates_parse`
+  (harness).
+
+### The configurations, measured on this tree (the protocol still ignores the budget)
+
+2 000 seeds each, `AUTHORITY_SIM_CONFIG=<name> AUTHORITY_SIM_SEEDS=2000`; the
+first three failing seeds; "kind" is the checker. None is in `long_locks` or
+the CI tests (the controls and the clean ones are listed too).
+
+| Configuration | Fails | First seeds | What fails |
+|---|---|---|---|
+| `locks-root-rate-fast` (root +8 %, budget 80 000, 20 s grants, a locker cut 25 s) | 1 364 | 0 1 4 | mutual exclusion (≈ 19.4 s: the owner outwaited at `(20 000 + 500)/1.08`, the locker honours to 19 500) |
+| `locks-root-rate-skew` (the same through `RateSkew` at 1 s) | 1 356 | 0 1 4 | the same |
+| `fast-takeover-successor-rate-fast` (first backup +30 %, budget 300 000) | 1 984 | 0 1 2 | mutual exclusion |
+| `fast-takeover-holder-rate-fast` (holder −25 %, its backup +25 %, beats on a thread) | 224 | 24 27 44 | mutual exclusion (the beat cap's drift) |
+| `strict-reader-rate-fast` (successor +20 %, 30 s read delegations, reader isolated 40 s) | 613 | 3 4 16 | close-to-open |
+| `delegated-root-rate-fast` (spec's base, 300 seeds) | 0 | | clean on the parent (the root is crashed in this configuration) |
+| `locks-root-restart-step-forward` | 1 143 | 0 1 2 | mutual exclusion (the restarted root grants over a grant still honoured) |
+| `locks-root-step-forward-then-restart` | 774 | 3 4 6 | mutual exclusion |
+| `locks-root-reboot-step-forward` | 1 143 | 0 1 2 | mutual exclusion |
+| `strict-holder-restart-step-forward` (the isolated reader's base) | 212 | 9 40 47 | close-to-open |
+| `fast-takeover-successor-restart-before-marker` | 57 | 20 35 39 | mutual exclusion |
+| controls and clean: `locks-rate-within-budget`, `locks-partition-long-grants`, `fast-takeover-long-grants`, `fast-takeover-capped-grants`, `strict-isolated-reader-long`, `locks-root-reboot`, `locks-locker-suspend`, `strict-holder-suspend`, `flex-promiser-restart-step-forward`, `fast-takeover-successor-restart-in-floor`, `-in-floor-strict`, `holder-restart-step-forward-readopt` | 0 | | clean |
+
+What did not fail where the spec said it would, and what it took to make the
+others fail (the knobs are in the doc comments):
+
+- **The spec's rates were too small for its geometry.** At the table's rates
+  `fast-takeover-successor-rate-fast` fails 0 of 300 at 10 % and 15 %, 1 at
+  20 %, 297 at 30 %: the old tenure's grants are sent before the marker, so
+  the successor's floor `(W + lock + 2M)/(1 + r)` must end before the last
+  one, which needs `r` of about 25 %. `fast-takeover-holder-rate-fast` with
+  both nodes fast cancels (the cap's error is `(1 - c_h/c_b)·(X - sent)`: the
+  two wait clocks keep one ratio); the holder slow and its backup fast fails
+  0 of 300 at ±10 % and ±15 %, 26 at ±20 %, 32 at ±25 %.
+  `strict-reader-rate-fast` needs a lease and a read delegation of 30 s and a
+  reader that keeps reading to the end of them (4 of 100 at 10 %, 13 at 15 %,
+  31 at 20 %). `locks-root-rate-fast` fails from 5 % (141 of 300) as the
+  arithmetic says. The lock workloads use two lockers with critical sections
+  of 11 to 40 s and one fault (the cut), so that no seed fails by the
+  60-second lock wait cap instead (the controls are clean).
+- **`delegated-root-rate-fast` stays clean** (0 of 300 on the spec's base,
+  `delegated-holder-cut`; C7-H1 could not make its step analogue fail
+  either). A variant on `delegated` with a 25 s partition of the delegate
+  (`delegated-long-delegation`) *fails with no clock fault*: 16 of 300
+  (seeds 11, 16, 60), "rid refused (Eexist) but completed once in the log".
+  It is a control that is not clean, so it is not used as one: **a finding for
+  someone to look at** (a delegate partitioned from its root for longer than
+  its 20 s delegation, its acknowledged ops replayed through the root),
+  unrelated to clocks.
+- **The suspend configurations are clean on the parent and their mutant
+  needs more than the spec's.** HONOUR counts a suspend through `S`, but with
+  a disciplined wall it also follows the wall through `J`, which runs on
+  through the suspend: dropping `S` alone fails nothing (0 of 1 000 on
+  either configuration). Dropping `S` and `J` (HONOUR = WAIT) fails
+  `locks-locker-suspend` 557 of 1 000 (mutual exclusion); `strict-holder-
+  suspend` stays clean under that mutant too (0 of 1 000): kept as a
+  regression configuration. The same fact is why the honour side of a
+  slow oscillator needs an undisciplined wall (the models').
+- `fast-takeover-successor-restart-in-floor` (and the strict variant) fails 0
+  of 2 000 on the parent: the lock mirror the successor installs from its
+  backup is persisted as a lock horizon (restamped `lock + M` from the
+  takeover), which covers the grants of the geometry the spec names; kept as
+  a regression configuration until the floor is persisted. The window
+  before the marker (`-before-marker`) fails 57 of 2 000.
+- `flex-promiser-restart-step-forward` and `holder-restart-step-forward-
+  readopt` are clean on the parent (the spec allowed both); kept.
+- The restart configurations' steps are 600 ms apart from their restart:
+  a `ClockStep` and a `CrashHolder` scheduled 200 ms apart ran in the
+  reverse order in some seeds, the lease read each does first taking up to
+  250 ms of simulated S3 time.
+
+### Verification
+
+On the build box (release, `-j 4`, one job at a time, `TMPDIR` on tmpfs):
+
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`: clean.
+- `cargo test --release -p constellation-types -p constellation-platform`:
+  59, 34 and 8 passed (the three test binaries). `-p constellation-authority
+  --lib`: 514 passed, 2 ignored. `--test sim`: 184 passed, 12 ignored (the
+  parent's 180 and the four new unit tests). `-p constellation-harness`: 149
+  passed (the parse test among them). `-p constellation-engine --lib fault`:
+  6 passed.
+- Identity, `sweep_config` over 122 configurations (the 78 of C7-H1's list,
+  step configurations and beats-on-a-thread variants included, at 2 000 seeds
+  (long-* 500), and the 44 other configurations of the table at 300 (long-*
+  100)), parent e5e7c20 against this tree: the summary line (failing seeds
+  and every counter), `SWEEP-FLOORS` and the fenced seeds are identical for
+  119; the other three differ by one in a counter that varies between runs of
+  the parent itself (`flex-tight`: takeovers 1 147 or 1 148, remote chunks 744
+  or 745: the parent gave both in three reruns, so did this tree;
+  `backup-crash-slow`: answered from the stream 2 436 or 2 437, parent
+  against parent;
+  `locks-unlinked-delegated-hcrash-backup`: 4 771 or 4 772).
+- `delegated-long-delegation` on the parent: the configuration added to an
+  unmodified e5e7c20 tree fails the same 16 of 300 seeds (11, 16, 60 first),
+  so it is not the simulator's change.

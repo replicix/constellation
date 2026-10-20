@@ -10,7 +10,7 @@
 
 use super::bus::Bus;
 use super::chunks::ChunkWorld;
-use super::clock::Clock;
+use super::clock::{Clock, NodeClockState};
 use super::store::Bucket;
 use constellation_authority::action::ControlOk;
 use constellation_authority::{
@@ -309,11 +309,19 @@ pub struct NodeEnv {
     pub clock_skew_ms: i64,
     /// See `SimConfig::clock_offsets`.
     pub clock_offsets: Vec<(NodeId, i64)>,
-    /// Plan 43 C7-H1: each node's cumulative wall step (ms), created on
+    /// Plan 43 C7-H1, C7a: each node's host clock state (its cumulative
+    /// wall step, its oscillator's rate, suspends and boots), created on
     /// first use. It outlives the node's incarnations: a host's clock does
     /// not reset when the process restarts. `FaultKind::ClockStep` adds to
-    /// it; only the node's WALL reading moves (see `sim/clock.rs`).
-    pub steps: Mutex<HashMap<NodeId, Arc<AtomicI64>>>,
+    /// its step (only the node's WALL reading moves), `RateSkew`, `Suspend`
+    /// and `RebootNode` change the oscillator (see `sim/clock.rs`).
+    pub clocks: Mutex<HashMap<NodeId, Arc<NodeClockState>>>,
+    /// See `SimConfig::rate_budget_ppm`.
+    pub rate_budget_ppm: u32,
+    /// See `SimConfig::node_rates`.
+    pub node_rates: Vec<(NodeId, i64)>,
+    /// See `SimConfig::wall_follows_rate`.
+    pub wall_follows_rate: bool,
     pub seed: u64,
     /// Fix "capture under an epoch hold": the modelled chunks.
     pub world: Arc<ChunkWorld>,
@@ -340,9 +348,23 @@ pub struct NodeEnv {
 }
 
 impl NodeEnv {
-    /// Node `id`'s step atomic (cumulative ms; shared by its incarnations).
-    pub fn step_of(&self, id: NodeId) -> Arc<AtomicI64> {
-        self.steps.lock().unwrap().entry(id).or_default().clone()
+    /// Node `id`'s host clock state (shared by its incarnations): its wall
+    /// step, rate, suspends and boots.
+    pub fn clock_state_of(&self, id: NodeId) -> Arc<NodeClockState> {
+        self.clocks
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_insert_with(|| {
+                let ppm = self
+                    .node_rates
+                    .iter()
+                    .filter(|(n, _)| *n == id)
+                    .map(|(_, ppm)| ppm)
+                    .sum();
+                NodeClockState::new(id, ppm, self.wall_follows_rate)
+            })
+            .clone()
     }
 
     /// Node `id`'s clock for incarnation `incarnation`: true time, off by a
@@ -352,8 +374,12 @@ impl NodeEnv {
     /// incarnation`; HONOUR and WAIT restart at its wall).
     pub fn clock_of(&self, id: NodeId, incarnation: u32) -> Clock {
         let offset = self.clock_offset_of(id);
-        self.clock
-            .for_node(offset, self.step_of(id), (id << 32) | incarnation as u64)
+        self.clock.for_node(
+            offset,
+            self.clock_state_of(id),
+            (id << 32) | incarnation as u64,
+            self.rate_budget_ppm,
+        )
     }
 
     /// Node `id`'s constant clock error: a seeded draw within
@@ -486,6 +512,7 @@ impl NodeHandle {
         env.world.register(id, meta.clone());
         let mut cfg = (env.config)(id, incarnation);
         cfg.clock_id = clock.id();
+        cfg.clock_rate_budget_ppm = env.rate_budget_ppm;
         env.oracles.register(
             id,
             meta.clone(),
@@ -649,6 +676,13 @@ impl NodeHandle {
             .lock()
             .unwrap()
             .is_some_and(|until| tokio::time::Instant::now() < until)
+    }
+
+    /// Plan 43 C7a: this node's core holds a takeover floor that has not
+    /// ended on its wait clock (as of its last event).
+    pub fn in_takeover_floor(&self) -> bool {
+        let floor = self.shared.floor_seen.load(Ordering::SeqCst);
+        floor != 0 && floor > self.clock.wait().0
     }
 
     /// F1 (`StallStep`): see `Shared::stall_next`.
@@ -2180,11 +2214,26 @@ impl Driver {
                     self.timer_kinds.insert(id, kind);
                     let tx = self.tx.clone();
                     // Counted from the reading of the step that armed it
-                    // (see `step_now`), on the runtime's monotonic clock.
-                    let when = self.clock.instant_of(self.step_now)
-                        + std::time::Duration::from_millis(after_ms);
+                    // (see `step_now`): it fires when the node's wait clock
+                    // reads that plus `after_ms`. The runtime's clock is
+                    // true time; the node's oscillator may run off it
+                    // (`RateSkew`) or stand still (`Suspend`), so the
+                    // deadline is the inverse of the oscillator and is
+                    // checked again when the sleep ends (a rate or a
+                    // suspend announced after the timer was set).
+                    let target = self.step_now.wait.plus(after_ms);
+                    let clock = self.clock.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep_until(when).await;
+                        loop {
+                            let when = clock.instant_at_wait(target);
+                            tokio::time::sleep_until(when).await;
+                            if clock.wait() >= target {
+                                break;
+                            }
+                            // Not there yet (never with a steady clock):
+                            // never spin at one instant.
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
                         let _ = tx.send(Event::Timer { id });
                     });
                 }

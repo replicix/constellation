@@ -102,6 +102,12 @@ pub struct Config {
     /// it with its own readings. The engine sets it from the process's
     /// clock, the simulation from the node incarnation's.
     pub clock_id: u64,
+    /// Plan 43 C7a: the bound on this node's oscillator rate error, in ppm
+    /// (the protocol clock's `rate_budget_ppm`; 0: none budgeted). The
+    /// engine sets it from the process's clock, the simulation from
+    /// `SimConfig::rate_budget_ppm`. Commit 1 of C7a only carries it; the
+    /// beat cap's span and the status read it from commit 2.
+    pub clock_rate_budget_ppm: u32,
     pub partition: String,
     /// `LeaseMode::SingleWriter`: no `If-Match`; takeover from another
     /// node is refused.
@@ -460,6 +466,7 @@ impl Config {
             node_id,
             incarnation,
             clock_id: 1,
+            clock_rate_budget_ppm: 1_000,
             partition: constellation_store_s3::log::PARTITION.to_string(),
             single_writer: false,
             ttl_ms,

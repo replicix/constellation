@@ -19,6 +19,7 @@
 //! | `net:<netem args...>` / `net:flap[:<netem args...>]` | `tc netem` on the daemon's own P2P (UDP) ports on `lo`; flap: loss 100 % for 2 s every 10 s |
 //! | `clock:<±ms>` / `clock:spread:<ms>` | `CONSTELLATION_FAULT_CLOCK_OFFSET_MS` (within ±500 ms); spread alternates `+ms`, `-ms` across nodes |
 //! | `clock:step:<±ms>:<at_ms>[@node]` | at `<at_ms>` after the daemon spawned, the daemon's protocol wall clock steps by `<ms>` (`CONSTELLATION_FAULT_CLOCK_STEP_FILE`; plan 43 C7-H1): the honour clock follows a forward step, a backward one and the wait clock move nothing; the steps are cumulative per node, armed once per node and kept across a daemon restart (a restarted daemon starts stepped; the step is not applied again) |
+//! | `clock:rate:<±ppm>[:unbudgeted][@node]` | the daemon's boot, raw and monotonic clocks run at `1 + ppm/1e6` of the host's rate from its start, its wall does not (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`; plan 43 C7a): an oscillator off by `ppm` under a disciplined wall. Unless `:unbudgeted`, the node's rate budget is raised to cover it (`CONSTELLATION_CLOCK_RATE_BUDGET_PPM = max(1000, |ppm|)`; each node budgets its own oscillator); `|ppm| < 500000`. The budget is carried from C7a's first commit and read by the clocks from its second |
 //!
 //! `<dur>` is milliseconds or a protocol boundary with an optional offset
 //! (`lock-lapse+500`, `takeover-300`, `lease-ttl+1000`: see
@@ -166,7 +167,17 @@ pub enum Kind {
         ms: i64,
         at: Duration,
     },
+    /// The daemon's elapsed clocks run `ppm` fast (plan 43 C7a), budgeted
+    /// for it unless `budgeted` is false.
+    ClockRate {
+        ppm: i64,
+        budgeted: bool,
+    },
 }
+
+/// The rate budget a daemon has without `clock:rate` (ppm): the platform's
+/// default where the rate source is not slewed.
+const DEFAULT_RATE_BUDGET_PPM: i64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -374,6 +385,20 @@ fn parse_item(body: &str, target: Target, spec: &str) -> Result<Item> {
                     ms,
                     at: ms_arg(arg(2), 0, "clock:step:<ms>:<at_ms>")?,
                 }
+            }
+            Some("rate") => {
+                let ppm: i64 = num(arg(1), "clock:rate:<ppm>")?;
+                anyhow::ensure!(ppm != 0, "clock:rate:0 skews nothing");
+                anyhow::ensure!(
+                    ppm.abs() < 500_000,
+                    "clock:rate:{ppm}: the rate fault is refused from 500000 ppm"
+                );
+                let budgeted = match arg(2) {
+                    None => true,
+                    Some("unbudgeted") => false,
+                    Some(other) => bail!("clock:rate:{ppm}:{other}: expected `unbudgeted`"),
+                };
+                Kind::ClockRate { ppm, budgeted }
             }
             v => {
                 let offset: i64 = num(v, "clock:<ms>")?;
@@ -719,6 +744,15 @@ pub fn daemon_env(node: &str, work: &Path, env: &[(String, String)], cmd: &mut C
                     "CONSTELLATION_FAULT_LOG_STALL_FILE",
                     load_dir(work).join("log-stall"),
                 );
+            }
+            Kind::ClockRate { ppm, budgeted } => {
+                cmd.env("CONSTELLATION_FAULT_CLOCK_RATE_PPM", ppm.to_string());
+                if *budgeted {
+                    cmd.env(
+                        "CONSTELLATION_CLOCK_RATE_BUDGET_PPM",
+                        DEFAULT_RATE_BUDGET_PPM.max(ppm.abs()).to_string(),
+                    );
+                }
             }
             _ => {}
         }
@@ -2091,6 +2125,51 @@ mod tests {
             "clock:step",
             "clock:step:x:1",
             "clock:step:5:y",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    /// Expectation: `clock:rate:<±ppm>[:unbudgeted][@node]` parses with its
+    /// sign, its flag and its node; a zero rate, one from 500 000 ppm and
+    /// an unknown flag are refused.
+    #[test]
+    fn clock_rates_parse() {
+        let p = parse("clock:rate:+800@a,clock:rate:-50000:unbudgeted@b,clock:rate:1000").unwrap();
+        assert_eq!(
+            p.items,
+            vec![
+                Item {
+                    kind: Kind::ClockRate {
+                        ppm: 800,
+                        budgeted: true
+                    },
+                    target: Target::Node("a".into())
+                },
+                Item {
+                    kind: Kind::ClockRate {
+                        ppm: -50_000,
+                        budgeted: false
+                    },
+                    target: Target::Node("b".into())
+                },
+                Item {
+                    kind: Kind::ClockRate {
+                        ppm: 1_000,
+                        budgeted: true
+                    },
+                    target: Target::All
+                },
+            ]
+        );
+        assert!(parse("clock:rate:499999").is_ok());
+        for bad in [
+            "clock:rate",
+            "clock:rate:0",
+            "clock:rate:x",
+            "clock:rate:500000",
+            "clock:rate:-500000",
+            "clock:rate:100:budgeted",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} parsed");
         }

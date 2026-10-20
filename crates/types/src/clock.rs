@@ -255,6 +255,15 @@ pub trait ClockSources: Send + Sync {
     fn raw_ns(&self) -> u64;
     fn mono_ns(&self) -> u64;
 
+    /// This boot's identity (plan 43 C7a: what a deadline persisted across
+    /// a restart is stamped with, so that a restart on the same boot reads
+    /// it on the raw clock and one after a reboot waits the recorded
+    /// span). 0: unknown, which no stamp matches. Nothing reads it before
+    /// C7a's boot-stamped horizons; the simulator models it for them.
+    fn boot_id(&self) -> u64 {
+        0
+    }
+
     fn read(&self) -> RawReading {
         let wall_ms = self.wall_ms();
         let boot_ns = self.boot_ns();
@@ -286,6 +295,9 @@ pub struct StepStats {
 pub struct ProtocolClock {
     sources: Arc<dyn ClockSources>,
     id: u64,
+    /// The oscillator's rate budget, ppm (plan 43 C7a). Stored here by
+    /// commit 1 of C7a; the readings do not use it yet.
+    budget_ppm: u32,
     wall0: i64,
     boot0: u64,
     raw0: u64,
@@ -316,19 +328,22 @@ fn ns_to_ms(ns: u64) -> i64 {
 }
 
 impl ProtocolClock {
-    /// A clock over `sources` with a random non-zero id.
-    pub fn new(sources: Arc<dyn ClockSources>) -> Self {
+    /// A clock over `sources` with a random non-zero id, whose node's
+    /// oscillator is budgeted `budget_ppm` (plan 43 C7a: the bound on its
+    /// rate error; 0 reads exactly as C7-H1's clock did).
+    pub fn new(sources: Arc<dyn ClockSources>, budget_ppm: u32) -> Self {
         let id = RandomState::new().hash_one(std::process::id());
-        Self::with_id(sources, if id == 0 { 1 } else { id })
+        Self::with_id(sources, if id == 0 { 1 } else { id }, budget_ppm)
     }
 
     /// A clock with a chosen id (the simulator's deterministic ones).
     /// `id` must be non-zero: 0 means "no clock" in stamps that carry one.
-    pub fn with_id(sources: Arc<dyn ClockSources>, id: u64) -> Self {
+    pub fn with_id(sources: Arc<dyn ClockSources>, id: u64, budget_ppm: u32) -> Self {
         assert_ne!(id, 0, "a protocol clock id is never 0");
         let s = sources.read();
         Self {
             id,
+            budget_ppm,
             wall0: s.wall_ms,
             boot0: s.boot_ns,
             raw0: s.raw_ns,
@@ -348,6 +363,11 @@ impl ProtocolClock {
     /// knows which clock the value is on (P6). Never 0.
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The oscillator rate budget this clock was built with, ppm.
+    pub fn rate_budget_ppm(&self) -> u32 {
+        self.budget_ppm
     }
 
     /// All three readings from one sample.
@@ -507,7 +527,7 @@ mod tests {
         s.boot.store(5_000 * MS, Ordering::SeqCst);
         s.raw.store(7_000 * MS, Ordering::SeqCst);
         s.mono.store(9_000 * MS, Ordering::SeqCst);
-        let c = ProtocolClock::with_id(s.clone(), 7);
+        let c = ProtocolClock::with_id(s.clone(), 7, 0);
         (s, c)
     }
 
@@ -896,11 +916,32 @@ mod tests {
     fn ids() {
         let (s, c) = stub();
         assert_eq!(c.id(), 7);
-        let a = ProtocolClock::new(s.clone());
-        let b = ProtocolClock::new(s);
+        let a = ProtocolClock::new(s.clone(), 0);
+        let b = ProtocolClock::new(s, 0);
         assert_ne!(a.id(), 0);
         assert_ne!(b.id(), 0);
         assert_ne!(a.id(), b.id());
+    }
+
+    /// Expectation: the rate budget is kept as given and, in this commit,
+    /// changes no reading: a budgeted clock reads exactly as an unbudgeted
+    /// one (plan 43 C7a commit 1; the readings use it from commit 2).
+    #[test]
+    fn the_rate_budget_is_stored_and_not_yet_read() {
+        let (s, c) = stub();
+        assert_eq!(c.rate_budget_ppm(), 0);
+        let budgeted = ProtocolClock::with_id(s.clone(), 8, 1_000);
+        assert_eq!(budgeted.rate_budget_ppm(), 1_000);
+        assert_eq!(
+            ProtocolClock::new(s.clone(), 2_000).rate_budget_ppm(),
+            2_000
+        );
+        let (a, b) = (c.now(), budgeted.now());
+        tick(&s, 5_000);
+        let (a2, b2) = (c.now(), budgeted.now());
+        assert_eq!(a2.wait.0 - a.wait.0, b2.wait.0 - b.wait.0);
+        assert_eq!(a2.honour.0 - a.honour.0, b2.honour.0 - b.honour.0);
+        assert_eq!(s.boot_id(), 0);
     }
 
     /// Expectation: a thread descheduled between the wall read and the
@@ -934,7 +975,7 @@ mod tests {
         let inner = Stub::default();
         inner.wall.store(START, Ordering::SeqCst);
         let late = Arc::new(Late(inner, AtomicUsize::new(1)));
-        let c = ProtocolClock::with_id(late.clone(), 3);
+        let c = ProtocolClock::with_id(late.clone(), 3, 0);
         late.1.store(0, Ordering::SeqCst);
         let n = c.now();
         // The wall was read 400 ms before boot and raw; the later honour

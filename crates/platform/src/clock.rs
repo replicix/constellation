@@ -48,6 +48,23 @@
 //! - [`set_fault_step_ms`]: a runtime step, cumulative, set by the engine's
 //!   `CONSTELLATION_FAULT_CLOCK_STEP_FILE` poller (the harness's
 //!   `clock:step:<ms>:<at_ms>[@node]` load item) and by engine tests.
+//! - `CONSTELLATION_FAULT_CLOCK_RATE_PPM=<signed ppm>` (plan 43 C7a, the
+//!   harness's `clock:rate:<ppm>[@node]` item): the host's boot, raw and
+//!   monotonic clocks run at `1 + ppm/1e6` of their real rate, read once
+//!   from the process start; the wall does not (a host whose time service
+//!   disciplines the wall while its oscillator is off). Values of 500 000
+//!   ppm and beyond are refused (no fault). The engine logs it once at
+//!   start-up.
+//!
+//! # The rate budget
+//!
+//! [`rate_budget_ppm`] is the bound the protocol clock budgets for this
+//! host's oscillator (plan 43 C7a): 1 000 ppm where the rate source is
+//! never slewed (Linux, Android, macOS, iOS), 2 000 elsewhere (FreeBSD's
+//! slewed `CLOCK_UPTIME`, the `Instant` fallback).
+//! `CONSTELLATION_CLOCK_RATE_BUDGET_PPM=<ppm>` overrides it (testing only;
+//! refused from 500 000 ppm). Commit 1 of C7a hands it to the clock and the
+//! core's configuration; no reading uses it yet.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -78,6 +95,64 @@ pub fn set_fault_step_ms(ms: i64) {
 /// The cumulative runtime step set so far.
 pub fn fault_step_ms() -> i64 {
     FAULT_STEP_MS.load(Ordering::SeqCst)
+}
+
+/// The rate error the harness injects (`CONSTELLATION_FAULT_CLOCK_RATE_PPM`,
+/// signed ppm), read once; 0 when unset, malformed or not under 500 000 in
+/// magnitude.
+pub fn fault_rate_ppm() -> i64 {
+    static RATE: OnceLock<i64> = OnceLock::new();
+    *RATE.get_or_init(|| {
+        parse_rate_fault(
+            std::env::var("CONSTELLATION_FAULT_CLOCK_RATE_PPM")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_rate_fault(v: Option<&str>) -> i64 {
+    v.and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|ppm| ppm.abs() < MAX_RATE_PPM)
+        .unwrap_or(0)
+}
+
+/// Rates (and budgets) of this many ppm or more are refused.
+const MAX_RATE_PPM: i64 = 500_000;
+
+/// The per-OS default of the rate budget, ppm (see the module doc).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+const DEFAULT_RATE_BUDGET_PPM: u32 = 1_000;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+const DEFAULT_RATE_BUDGET_PPM: u32 = 2_000;
+
+/// The bound on this host's oscillator rate error, in ppm, that the
+/// protocol clock budgets (the module doc's "rate budget"), read once.
+pub fn rate_budget_ppm() -> u32 {
+    static BUDGET: OnceLock<u32> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        parse_rate_budget(
+            std::env::var("CONSTELLATION_CLOCK_RATE_BUDGET_PPM")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn parse_rate_budget(v: Option<&str>) -> u32 {
+    v.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|ppm| (*ppm as i64) < MAX_RATE_PPM)
+        .unwrap_or(DEFAULT_RATE_BUDGET_PPM)
 }
 
 /// The three elapsed clocks of the host, in ns, per OS.
@@ -210,6 +285,47 @@ impl ClockSources for HostSources {
     }
 }
 
+/// The host's sources with a rate fault: boot, raw and monotonic run at
+/// `1 + ppm/1e6` of the host's rate, counted from the first reading of each
+/// (the wall is the host's, unchanged).
+struct SkewedSources {
+    ppm: i64,
+    boot0: u64,
+    raw0: u64,
+    mono0: u64,
+}
+
+impl SkewedSources {
+    fn new(ppm: i64) -> Self {
+        Self {
+            ppm,
+            boot0: elapsed::boot_ns(),
+            raw0: elapsed::raw_ns(),
+            mono0: elapsed::mono_ns(),
+        }
+    }
+
+    fn skew(&self, base: u64, now: u64) -> u64 {
+        let d = now.saturating_sub(base) as i128;
+        (base as i128 + d * (1_000_000 + self.ppm as i128) / 1_000_000).max(0) as u64
+    }
+}
+
+impl ClockSources for SkewedSources {
+    fn wall_ms(&self) -> i64 {
+        wall_ms()
+    }
+    fn boot_ns(&self) -> u64 {
+        self.skew(self.boot0, elapsed::boot_ns())
+    }
+    fn raw_ns(&self) -> u64 {
+        self.skew(self.raw0, elapsed::raw_ns())
+    }
+    fn mono_ns(&self) -> u64 {
+        self.skew(self.mono0, elapsed::mono_ns())
+    }
+}
+
 /// `SystemTime` plus the fault terms, in unix ms.
 #[inline]
 fn wall_ms() -> i64 {
@@ -238,7 +354,11 @@ pub fn protocol() -> &'static ProtocolClock {
         {
             set_fault_step_ms(step);
         }
-        ProtocolClock::new(Arc::new(HostSources::new()))
+        let sources: Arc<dyn ClockSources> = match fault_rate_ppm() {
+            0 => Arc::new(HostSources::new()),
+            ppm => Arc::new(SkewedSources::new(ppm)),
+        };
+        ProtocolClock::new(sources, rate_budget_ppm())
     })
 }
 
@@ -357,6 +477,51 @@ mod tests {
             std::fs::write(&f, bad).unwrap();
             assert_eq!(read_step_file(&f), None, "{bad:?}");
         }
+    }
+
+    /// Expectation: a rate fault or a budget is taken only as a number
+    /// under 500 000 ppm in magnitude; anything else is no fault and the
+    /// per-OS default budget.
+    #[test]
+    fn rate_faults_and_budgets_are_bounded() {
+        assert_eq!(parse_rate_fault(None), 0);
+        assert_eq!(parse_rate_fault(Some("+80000")), 80_000);
+        assert_eq!(parse_rate_fault(Some("-1000\n")), -1_000);
+        for bad in ["", "fast", "500000", "-500000", "1.5", "99999999999"] {
+            assert_eq!(parse_rate_fault(Some(bad)), 0, "{bad:?}");
+        }
+        assert_eq!(parse_rate_budget(None), DEFAULT_RATE_BUDGET_PPM);
+        assert_eq!(parse_rate_budget(Some("50000")), 50_000);
+        for bad in ["", "-5", "500000", "x"] {
+            assert_eq!(
+                parse_rate_budget(Some(bad)),
+                DEFAULT_RATE_BUDGET_PPM,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Expectation: under a rate fault the elapsed sources advance at the
+    /// injected rate from their first reading and the wall does not.
+    #[test]
+    fn a_skewed_source_runs_at_the_injected_rate() {
+        let fast = SkewedSources::new(100_000);
+        let slow = SkewedSources::new(-100_000);
+        let (f0, s0, r0) = (fast.read(), slow.read(), elapsed::raw_ns());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (f1, s1, r1) = (fast.read(), slow.read(), elapsed::raw_ns());
+        // (The host's own elapsed time bounds the reading to within the
+        // gaps between the reads: a few ms at most on a busy box, hence the 10 ms.)
+        let real = (r1 - r0) as f64;
+        let near = |got: u64, want: f64| (got as f64 - want).abs() < 0.03 * real + 10_000_000.0;
+        assert!(near(f1.raw_ns - f0.raw_ns, real * 1.1), "{f0:?} {f1:?}");
+        assert!(near(s1.raw_ns - s0.raw_ns, real * 0.9), "{s0:?} {s1:?}");
+        assert!(near(f1.boot_ns - f0.boot_ns, real * 1.1), "{f0:?} {f1:?}");
+        assert!(near(s1.mono_ns - s0.mono_ns, real * 0.9), "{s0:?} {s1:?}");
+        assert!(
+            (f1.wall_ms - f0.wall_ms) as f64 * 1e6 < real * 1.05 + 10e6,
+            "the wall is not skewed"
+        );
     }
 
     /// Expectation: `protocol()` is one instance.

@@ -173,6 +173,39 @@ pub enum FaultKind {
     /// `ClockStep { Locker }` would each pick a locker, possibly
     /// different ones; this picks one.
     PartitionLockerStepped { step_ms: i64, dur_ms: u64 },
+    /// Plan 43 C7a: set `who`'s oscillator rate (ppm, signed) from now on: its
+    /// boot, raw and monotonic clocks run at `1 + ppm/1e6` of true time; its
+    /// wall clock does not (an NTP-disciplined host) unless
+    /// `SimConfig::wall_follows_rate`. The rate is the host's, so it
+    /// survives the node's restarts (`sim/clock.rs`).
+    RateSkew { who: StepOf, ppm: i64 },
+    /// Plan 43 C7a: `who`'s host suspends for `ms`: its core, its beat loop
+    /// and its delegation lane loop handle nothing (they stand as for
+    /// `Pause`, which models a stopped process whose clocks run on), its
+    /// timers fire only after it resumes, and its raw and monotonic clocks
+    /// stop while its boot clock and its wall run on: HONOUR counts the
+    /// suspend (through `S`), WAIT does not.
+    Suspend { who: StepOf, ms: u64 },
+    /// Plan 43 C7a: kill `node` (0: the lease holder) and restart it after
+    /// `restart_ms` on a new boot, with its disk: the elapsed clocks start
+    /// again from 0, the boot id changes, and its wall is stepped by
+    /// `step_ms` meanwhile.
+    RebootNode {
+        node: NodeId,
+        restart_ms: u64,
+        step_ms: i64,
+    },
+    /// Plan 43 C7a: kill the lease holder, step its wall by `step_ms` while it
+    /// is down, and restart it after `restart_ms` on the same boot, with
+    /// its disk (what a persisted wall deadline does not survive).
+    CrashHolderStepped { restart_ms: u64, step_ms: i64 },
+    /// Plan 43 C7a (Appendix B row 14's floor note): kill the first node
+    /// (within 10 s) that is a fast successor inside its takeover floor
+    /// (`after_marker`: its marker has landed, the floor is armed) or that
+    /// has claimed the lease and not yet finished its gate (the marker, the
+    /// tail, the quarantine), and restart it after `restart_ms` with its
+    /// disk, on the same boot.
+    CrashSuccessorInFloor { restart_ms: u64, after_marker: bool },
 }
 
 /// Whose wall clock a [`FaultKind::ClockStep`] steps, resolved at the
@@ -274,6 +307,19 @@ pub struct SimConfig {
     /// (on top of any `clock_skew_ms` draw): a node ahead of its
     /// predecessor by more than the lease it takes over has left.
     pub clock_offsets: Vec<(NodeId, i64)>,
+    /// Plan 43 C7a: the bound on every node's oscillator rate error that its
+    /// protocol clock budgets, ppm (`Config::clock_rate_budget_ppm`). 0 until
+    /// the readings use it (C7a's second commit); the rate configurations
+    /// set the budget they will be fixed with, and fail on the tree where
+    /// it is not read.
+    pub rate_budget_ppm: u32,
+    /// Plan 43 C7a: `(node, ppm)`: that node's oscillator runs at
+    /// `1 + ppm/1e6` of true time from the start (its wall does not).
+    pub node_rates: Vec<(NodeId, i64)>,
+    /// Plan 43 C7a: every node's wall follows its oscillator too (a host
+    /// with no time service). Offsets then grow with the rate, which the
+    /// cross-node compares (C7b) cannot take: not for sweeps.
+    pub wall_follows_rate: bool,
     /// Plan 30 §M9: the run's acknowledgements are durable (a backup
     /// within budget, or `ack=s3`): an acknowledged op is never
     /// tentative — its rollback is a failure, not an exemption — and a
@@ -665,6 +711,9 @@ impl Default for SimConfig {
             strict: false,
             clock_skew_ms: 0,
             clock_offsets: Vec::new(),
+            rate_budget_ppm: 0,
+            node_rates: Vec::new(),
+            wall_follows_rate: false,
             strict_durability: false,
             rtts: Vec::new(),
             epoch_slack: 0,
@@ -2115,25 +2164,8 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             cluster.env.bucket.set_cut(lease.holder, false);
         }
         FaultKind::ClockStep { who, ms } => {
-            let node = match who {
-                StepOf::Node(n) => Some(n).filter(|n| cluster.ids().contains(n)),
-                StepOf::Locker => wait_for_locker(&cluster).await,
-                StepOf::Holder | StepOf::Backup | StepOf::NonHolder => {
-                    let Some(lease) = read_lease(&cluster.env.bucket).await else {
-                        note(format!("t={} clock step: no lease yet", fault.at_ms));
-                        return;
-                    };
-                    let ids = cluster.ids();
-                    let live = |n: &NodeId| ids.contains(n) && cluster.get(*n).alive();
-                    match who {
-                        StepOf::Holder => Some(lease.holder).filter(live),
-                        StepOf::Backup => lease.backups.first().copied().filter(live),
-                        _ => ids.iter().copied().find(|n| *n != lease.holder && live(n)),
-                    }
-                }
-            };
-            let Some(node) = node else {
-                note(format!("t={} clock step {who:?}: nobody", fault.at_ms));
+            let Some(node) = resolve_step_of(&cluster, who, fault.at_ms, "clock step", &note).await
+            else {
                 return;
             };
             note(format!(
@@ -2142,8 +2174,166 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             ));
             cluster
                 .env
-                .step_of(node)
+                .clock_state_of(node)
+                .step()
                 .fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+        }
+        FaultKind::RateSkew { who, ppm } => {
+            let Some(node) = resolve_step_of(&cluster, who, fault.at_ms, "rate skew", &note).await
+            else {
+                return;
+            };
+            note(format!(
+                "t={} rate skew node {node} ({who:?}) to {ppm:+} ppm",
+                cluster.env.clock.elapsed_ms()
+            ));
+            cluster
+                .env
+                .clock_state_of(node)
+                .set_rate(ppm, cluster.env.clock.elapsed_ns());
+        }
+        FaultKind::Suspend { who, ms } => {
+            let Some(node) = resolve_step_of(&cluster, who, fault.at_ms, "suspend", &note).await
+            else {
+                return;
+            };
+            note(format!(
+                "t={} suspend node {node} ({who:?}) for {ms}ms",
+                cluster.env.clock.elapsed_ms()
+            ));
+            let now = cluster.env.clock.wall().0;
+            cluster
+                .note_takedown(node, Some(now + ms as i64), fault.at_ms)
+                .await;
+            // The oscillator's raw and mono clocks stand still for the
+            // interval; the process is held as for a `Pause`.
+            cluster
+                .env
+                .clock_state_of(node)
+                .suspend(cluster.env.clock.elapsed_ns(), ms);
+            let until = tokio::time::Instant::now() + Duration::from_millis(ms);
+            cluster.get(node).pause_until(until);
+        }
+        FaultKind::RebootNode {
+            node,
+            restart_ms,
+            step_ms,
+        } => {
+            let node = match node {
+                0 => match read_lease(&cluster.env.bucket).await {
+                    Some(lease) => lease.holder,
+                    None => {
+                        note(format!("t={} reboot: no lease yet", fault.at_ms));
+                        return;
+                    }
+                },
+                n => n,
+            };
+            if node == 0 || !cluster.ids().contains(&node) || !cluster.get(node).alive() {
+                note(format!("t={} reboot: node {node} not alive", fault.at_ms));
+                return;
+            }
+            note(format!(
+                "t={} reboot node {node} (back after {restart_ms}ms, wall stepped {step_ms}ms)",
+                fault.at_ms
+            ));
+            let now = cluster.env.clock.wall().0;
+            cluster
+                .note_takedown(node, Some(now + restart_ms as i64), fault.at_ms)
+                .await;
+            let meta = cluster.crash(node);
+            tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            let state = cluster.env.clock_state_of(node);
+            state
+                .step()
+                .fetch_add(step_ms, std::sync::atomic::Ordering::SeqCst);
+            state.reboot(cluster.env.clock.elapsed_ns());
+            cluster.restart(node, Some(meta));
+        }
+        FaultKind::CrashHolderStepped {
+            restart_ms,
+            step_ms,
+        } => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                note(format!(
+                    "t={} crash-holder-stepped: no lease yet",
+                    fault.at_ms
+                ));
+                return;
+            };
+            let holder = lease.holder;
+            if holder == 0 || !cluster.ids().contains(&holder) || !cluster.get(holder).alive() {
+                note(format!(
+                    "t={} crash-holder-stepped: holder {holder} not alive",
+                    fault.at_ms
+                ));
+                return;
+            }
+            note(format!(
+                "t={} crash holder {holder} (back after {restart_ms}ms with its journal, wall stepped {step_ms}ms meanwhile)",
+                fault.at_ms
+            ));
+            cluster
+                .failovers
+                .lock()
+                .unwrap()
+                .push((cluster.env.clock.elapsed_ms(), None));
+            let now = cluster.env.clock.wall().0;
+            cluster
+                .note_takedown(holder, Some(now + restart_ms as i64), fault.at_ms)
+                .await;
+            let meta = cluster.crash(holder);
+            tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            cluster
+                .env
+                .clock_state_of(holder)
+                .step()
+                .fetch_add(step_ms, std::sync::atomic::Ordering::SeqCst);
+            cluster.restart(holder, Some(meta));
+        }
+        FaultKind::CrashSuccessorInFloor {
+            restart_ms,
+            after_marker,
+        } => {
+            // The first live node that has armed a takeover floor
+            // (`after_marker`) or has claimed the lease and not finished its
+            // gate (the marker, the tail, the quarantine). Polled up to
+            // 10 s, as `wait_for_locker` does.
+            let mut victim = None;
+            for _ in 0..2_000 {
+                victim = cluster.ids().into_iter().find(|n| {
+                    let h = cluster.get(*n);
+                    let v = h.view();
+                    h.alive()
+                        && if after_marker {
+                            h.in_takeover_floor()
+                        } else {
+                            v.gate_pending && v.held_epoch.is_some()
+                        }
+                });
+                if victim.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let Some(node) = victim else {
+                note(format!(
+                    "t={} crash-successor-in-floor (after_marker {after_marker}): nobody",
+                    fault.at_ms
+                ));
+                return;
+            };
+            note(format!(
+                "t={} crash successor {node} (after_marker {after_marker}; back after {restart_ms}ms with its journal)",
+                cluster.env.clock.elapsed_ms()
+            ));
+            let now = cluster.env.clock.wall().0;
+            cluster
+                .note_takedown(node, Some(now + restart_ms as i64), fault.at_ms)
+                .await;
+            let meta = cluster.crash(node);
+            tokio::time::sleep(Duration::from_millis(restart_ms)).await;
+            cluster.restart(node, Some(meta));
         }
         FaultKind::PartitionLockerStepped { step_ms, dur_ms } => {
             let Some(node) = wait_for_locker(&cluster).await else {
@@ -2161,7 +2351,8 @@ async fn run_fault(cluster: Arc<Cluster>, fault: ScheduledFault, log: Arc<Mutex<
             ));
             cluster
                 .env
-                .step_of(node)
+                .clock_state_of(node)
+                .step()
                 .fetch_add(step_ms, std::sync::atomic::Ordering::SeqCst);
             for o in &others {
                 cluster.env.bus.set_partition(node, *o, true);
@@ -2388,6 +2579,38 @@ async fn crash_epoch_member(
     }
 }
 
+/// Resolves a [`StepOf`] at the fault's time to a live node (`what` names the
+/// fault in the log lines); `None` (noted) if there is nobody.
+async fn resolve_step_of(
+    cluster: &Arc<Cluster>,
+    who: StepOf,
+    at_ms: u64,
+    what: &str,
+    note: &impl Fn(String),
+) -> Option<NodeId> {
+    let node = match who {
+        StepOf::Node(n) => Some(n).filter(|n| cluster.ids().contains(n)),
+        StepOf::Locker => wait_for_locker(cluster).await,
+        StepOf::Holder | StepOf::Backup | StepOf::NonHolder => {
+            let Some(lease) = read_lease(&cluster.env.bucket).await else {
+                note(format!("t={at_ms} {what}: no lease yet"));
+                return None;
+            };
+            let ids = cluster.ids();
+            let live = |n: &NodeId| ids.contains(n) && cluster.get(*n).alive();
+            match who {
+                StepOf::Holder => Some(lease.holder).filter(live),
+                StepOf::Backup => lease.backups.first().copied().filter(live),
+                _ => ids.iter().copied().find(|n| *n != lease.holder && live(n)),
+            }
+        }
+    };
+    if node.is_none() {
+        note(format!("t={at_ms} {what} {who:?}: nobody"));
+    }
+    node
+}
+
 /// Plan 30 §M14: a live node other than the lease holder inside a
 /// critical section, waited for up to 5 s.
 async fn wait_for_locker(cluster: &Arc<Cluster>) -> Option<NodeId> {
@@ -2568,7 +2791,10 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         fast_path: cfg.fast_path,
         clock_skew_ms: cfg.clock_skew_ms,
         clock_offsets: cfg.clock_offsets.clone(),
-        steps: Mutex::new(HashMap::new()),
+        clocks: Mutex::new(HashMap::new()),
+        rate_budget_ppm: cfg.rate_budget_ppm,
+        node_rates: cfg.node_rates.clone(),
+        wall_follows_rate: cfg.wall_follows_rate,
         seed,
         world: ChunkWorld::new(),
         tag_check_at_write: cfg.tag_check_at_write,
