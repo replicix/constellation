@@ -53584,3 +53584,51 @@ segment after a higher one (the slot CAS, ship-at-`next_seq` only, and
 deposition on applying a higher epoch; an epoch hold is non-stealable), and
 the core's own `max_epoch` restarts at 0 on every mount, so the skip is
 defence in depth today, not an invariant replicas rely on.
+
+## Plan 44 W5: measurements and the campaign (2026-10-20, on 5f3a0e8)
+
+Run on the build box (16 vCPU, 30 GiB); ext4, xfs and btrfs on real
+partitions of a separate gp3 volume, tmpfs in memory. Other jobs shared
+the host (load 8-30), so absolute latencies are high-side.
+
+**Micro-bench** (`log_writer`, ns per event, sync writer -> queue, medians
+of 3; 1 thread / 8 threads flat out / 8 threads at 80k/s):
+
+| fs | 1 thread | 8 flat out | 8 @ 80k/s |
+|---|---|---|---|
+| tmpfs | 1306 -> 1189 | 4424 -> 3006 | 2452 -> 1903 |
+| ext4 | 1924 -> 1170 | 6013 -> 3007 | 21619 -> 1843 |
+| xfs | 1468 -> 1260 | 4967 -> 3034 | 2573 -> 2101 |
+| btrfs | 2002 -> 994 | 16573 -> 3046 | 4845 -> 1983 |
+
+1.001 allocations per event for both writers; the queue is at or below
+the synchronous writer in all twelve cells. `vfs_bench` unchanged.
+
+**Handover gap** (`upgrade-under-load`, 3 upgrades each): idle, upgrades
+239-313 ms, longest application syscall 278-289 ms; under
+`log-stall:3000:4000`, longest syscall 366-399 ms (within the +250 ms
+bound). The gap grows with the unwritten backlog the exec carries:
+~0.3 s idle, 0.55 s at 37 MB, ~1.3 s with the queue full (117 MB, the
+7/8 limit of the harness's 128 MiB). The full-queue runs failed their
+verification on the injected load (undeclared drops under
+`RUST_LOG=trace` and a stall re-armed every second, the log not
+written 120 s after the end), not on the product.
+
+**Gates**: pjdfstest 8798/8798 (io_uring transport); `smoke.sh`,
+`integration.sh` (with the compose services started by hand: the box has
+no `docker compose`) and `perf-gate.sh` passed
+(`writeback_import_files_per_sec` 1574.2 against a floor of 1573.2: at
+the edge). The harness matrix's lock, failover, delegation and handover
+scenarios, 32 of 32, and `lock-failover` / `backup-failover` with
+`clock:step:+3000:6000,clock:step:-3000:12000`, passed.
+
+**Campaign cells** (verification on, logs kept): `load-probe-takeover`
+with `pause:lock-lapse+500:10000@b`, seeds 42..61: 20 inconclusive (the
+injected pauses explain the write bound), 0 failed, 0 `[bug]`, 0 lines
+dropped, queue peak 22 KB; the same with `log-stall:12000:20000@b`: 17
+inconclusive, 3 passed, 0 failed, 0 dropped, peak 37 KB.
+`delegate-handoff-renewal` x20 under `log-stall:12000:15000@b`: 20 passed;
+x20 beside a co-tenant writer (a 3 GiB write+fsync loop on the btrfs
+partition): 20 passed, no slow core step, no seal of the holder.
+`load-probe` with the `log-drop` break failed as required, naming the
+three dropped lines.

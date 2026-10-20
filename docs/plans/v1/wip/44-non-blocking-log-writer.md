@@ -1064,9 +1064,10 @@ tail is a note, not a violation; no logger process for now.
       ADR-32, PROGRESS.
 - [x] W6: the handover's `exec` hands the unwritten log to the next image
       (memfd), lossless under `log-stall:6000:2500`, with the fallback.
-- [ ] W5: §8's measurements on four file systems, every gate of §9, the
-      peak queue occupancy per campaign cell recorded.
-- [ ] Independent review of W1-W3 before W5's campaign.
+- [x] W5: §8's measurements on four file systems, every gate of §9, the
+      peak queue occupancy per campaign cell recorded (PROGRESS, "Plan 44
+      W5", 2026-10-20, on 5f3a0e8).
+- [x] Independent review of W1-W3 before W5's campaign (three rounds).
 
 ## 14. PROGRESS.md
 
