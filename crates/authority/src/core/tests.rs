@@ -1851,9 +1851,10 @@ fn a_handoff_request_that_waited_past_its_timeout_is_declined() {
     assert!(!h.core.lease().releasing);
 }
 
-#[test]
-fn a_lost_renewal_deposes_and_the_round_recovers() {
-    let mut h = Harness::new(1);
+/// Hold the lease with one unshipped create, then lose the renewal to
+/// node 2's takeover at epoch 2: the core is deposed and its recovery
+/// round's tail to head is outstanding in the returned actions.
+fn lose_renewal_with_an_unshipped_create(h: &mut Harness) -> Vec<Action> {
     h.hold(1, None);
     // Something unshipped, so the deposition has work to roll back.
     let out = h.step(Event::Submit {
@@ -1908,10 +1909,16 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
         granted_delegations: false,
         retired: Vec::new(),
     };
-    let out = h.step(Event::S3 {
+    h.step(Event::S3 {
         op: reread,
         result: S3Result::LeaseGet(Ok(Some((theirs, tag())))),
-    });
+    })
+}
+
+#[test]
+fn a_lost_renewal_deposes_and_the_round_recovers() {
+    let mut h = Harness::new(1);
+    let out = lose_renewal_with_an_unshipped_create(&mut h);
     assert!(h.core.lease().lost);
     assert_eq!(h.core.lease().lost_floor, 2);
     assert_eq!(h.meta.holder_epoch(), 0);
@@ -1933,6 +1940,53 @@ fn a_lost_renewal_deposes_and_the_round_recovers() {
         0,
         "the stranded transaction left the journal"
     );
+}
+
+/// Holder capture off: the deposition recovery rebuilds the namespace
+/// from the shared log (`Action::RebuildReplica`), and the rebuilt
+/// replica holds whatever the log had when the rebuild read it — here
+/// segments 1..=3, which the new holder shipped after the recovery's
+/// tail to head. The cursor must restart from the rebuilt replica's
+/// position, as after a retention rebuild: left at 1, the next tail
+/// applied segments 1..=3 a second time over a namespace that already
+/// held them (their op records are not idempotent: a rename or unlink
+/// re-applied moves or removes a name a later segment reused).
+#[test]
+fn a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position() {
+    let mut h = Harness::new(1);
+    h.meta.set_holder_capture(false);
+    let out = lose_renewal_with_an_unshipped_create(&mut h);
+    assert!(h.core.lease().lost);
+    let (tail, req) = s3_ops(&out)[0];
+    assert!(matches!(req, S3Op::SegmentRun { from: 1, .. }), "{req:?}");
+    let out = h.step(Event::S3 {
+        op: tail,
+        result: S3Result::SegmentRun(Ok(Vec::new())),
+    });
+    let out = at_head(&mut h, out);
+    let rebuild = out
+        .iter()
+        .find_map(|a| match a {
+            Action::RebuildReplica { op } => Some(*op),
+            _ => None,
+        })
+        .expect("an uncaptured journal row is rebuilt from the log");
+    assert_eq!(h.core.ship.next_seq, 1);
+    // The driver's swap (`Meta::replace_ns_from_rebuilt`) adopts the side
+    // replica's applied position: three segments landed meanwhile.
+    h.meta.set_applied_seq(3).unwrap();
+    let _ = h.step(Event::RebuildDone {
+        op: rebuild,
+        ok: true,
+    });
+    assert!(!h.core.lease().lost);
+    assert_eq!(h.core.stats.depositions, 1);
+    assert_eq!(h.meta.applied_seq().unwrap(), 3);
+    assert_eq!(
+        h.core.ship.next_seq, 4,
+        "the cursor follows the rebuilt replica, not the pre-rebuild head"
+    );
+    assert!(h.core.ship.head_seq >= 3);
 }
 
 #[test]

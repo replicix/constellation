@@ -53539,3 +53539,48 @@ On the box (kernel 7.3, 16 cores; `/tmp` on tmpfs), every job under `timeout
 - `cargo test --release -p constellation-model -- --test-threads=2`: 167
   passed, 0 failed.
 - The sweeps and harness runs above.
+
+## Fix: a deposition rebuild moves the log cursor to the rebuilt position (2026-10-20)
+
+Found while specifying plan 43 C0 and checked against the code: a deposed
+holder with uncaptured journal rows (holder capture off, or rows from before
+it was switched on) recovers by rebuilding its namespace from the shared log
+(`Action::RebuildReplica`, `rebuild_replica`: a side replica bootstrapped
+from the head commit and the log as it stands, swapped in by
+`Meta::replace_ns_from_rebuilt`, which adopts its `applied_seq`).
+
+### Cause
+
+`on_rebuild_done`'s Recover branch left `ship.next_seq` where the
+recovery's tail to head had put it. Every segment the new holder shipped
+between that tail and the rebuild's LIST was already in the rebuilt
+namespace, and the next tail (or stream drain) applied it a second time:
+`apply_segment_rows` has no `applied_seq` guard, and only creates are
+idempotent on re-application (`apply_one`'s existing-ino check). A
+re-applied rename or unlink moves or removes a name a later segment reused,
+and the replica diverges for good. The retention rebuild (`acc977a`)
+restarts the cursor from the rebuilt replica; the deposition path, ported
+from M3b's `recovery::recover_deposed` (`5e18214`) in M5 (`617499b`), never
+did. The simulation does not reach it: its nodes keep holder capture on and
+answer `RebuildReplica` with `ok: false`.
+
+### What changed
+
+The Recover branch sets `next_seq` from the replica's `applied_seq` and
+raises `head_seq` to it before finishing the recovery.
+
+### Verification
+
+Core test `a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position`
+fails before (`next_seq` 1, expected 4). The deposition prelude of
+`a_lost_renewal_deposes_and_the_round_recovers` is factored into
+`lose_renewal_with_an_unshipped_create`. Authority lib 503 passed; clippy
+clean; the engine's rebuild, deposition and retention tests pass.
+
+Checked in the same pass and not changed: `shipper::replay_from` (bootstrap
+and both rebuilds) applies segments without the epoch fence the running
+core and the simulation's oracle apply. No path writes a lower-epoch
+segment after a higher one (the slot CAS, ship-at-`next_seq` only, and
+deposition on applying a higher epoch; an epoch hold is non-stealable), and
+the core's own `max_epoch` restarts at 0 on every mount, so the skip is
+defence in depth today, not an invariant replicas rely on.

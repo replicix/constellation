@@ -1478,6 +1478,14 @@ impl Core {
             What::Round { recover_rolled, .. } => *recover_rolled,
             _ => 0,
         };
+        // The swap adopted the side replica's applied position: the log as
+        // the rebuild read it, which segments shipped after this round's
+        // tail to head extend. The cursor restarts there, as after a
+        // retention rebuild — left behind, the next tail applied those
+        // segments a second time over a namespace that already held them.
+        let applied = replica.applied_seq().unwrap_or(0);
+        self.ship.next_seq = applied + 1;
+        self.ship.head_seq = self.ship.head_seq.max(applied);
         let uncaptured = replica.journal_len().unwrap_or(0);
         match self.finish_recovery(
             rolled + uncaptured,
