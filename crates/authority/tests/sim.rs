@@ -6207,6 +6207,47 @@ fn production_margin_lease_cap_seeds_keep_their_grants() {
     }
 }
 
+/// `locks-delegated-production-ttl-heavy`, no fault: a cross-subtree
+/// rename recalls a delegate's generation and the root re-delegates the
+/// subtree to the same node (seed 1434: `d1`, gen 3 then gen 5, node 2).
+/// The delegate's lock grant under it still renews with the root, whose
+/// table names the requester as the subtree's owner and so answers
+/// `NotOwner { 0 }`; the delegate read that as a deposed root, forgot its
+/// cached root, started a new stream round and dropped the answer to its
+/// new generation's first renewal as stale, while the renewal in flight
+/// kept any other from going out until the forward timeout: the
+/// generation was never renewed for 400 ms, the node answered the whole
+/// subtree `NotOwner { 0 }` (or "no reachable owner", seed 1155, which
+/// lost the renewal the same way) and the holders' windows lapsed: I/O
+/// fenced with no fault. A subtree delegated here keeps the cached root
+/// (`Core::lock_delegated_here`), and a root change re-sends the renewal
+/// in flight at once (`delegation_sync`). Seed 3850, once those were
+/// fixed: a grant capped at 2.1 s whose renewal was in flight (the tick
+/// armed at the 5 s cadence) was extended by a late reply
+/// (`Core::lock_late_reply`) to a renewal point no tick was armed for,
+/// and lapsed under the application's I/O; the late reply re-arms it.
+#[test]
+fn a_redelegation_to_the_same_node_keeps_its_first_renewal() {
+    for seed in [1434, 691, 1683, 604, 1155, 3850] {
+        let report = run_seed(seed, production_ttl(true, true)).unwrap_or_else(|e| {
+            panic!(
+                "locks-delegated-production-ttl-heavy seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=locks-delegated-production-ttl-heavy"
+            )
+        });
+        let mut t = M14Totals::default();
+        t.add(&report);
+        assert_eq!(
+            t.lost, 0,
+            "locks-delegated-production-ttl-heavy seed {seed}: grants lost: {t:?}"
+        );
+        assert_eq!(
+            t.clients.fenced_ios, 0,
+            "locks-delegated-production-ttl-heavy seed {seed}: I/O fenced: {t:?}"
+        );
+    }
+}
+
 /// `locks-blips-tight` with `locks-blips`' in-doubt lease PUTs back:
 /// back-to-back cuts with acquisition and release CASes that land but
 /// answer a timeout. On main before chunk lock-release-drop it failed

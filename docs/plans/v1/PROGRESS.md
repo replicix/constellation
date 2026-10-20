@@ -53632,3 +53632,107 @@ x20 beside a co-tenant writer (a 3 GiB write+fsync loop on the btrfs
 partition): 20 passed, no slow core step, no seal of the holder.
 `load-probe` with the `log-drop` break failed as required, naming the
 three dropped lines.
+
+## Fix: lock follow-ups — re-delegation renewal, released takeover grace, late reply tick (2026-10-20)
+
+Follow-ups to plan 43 C7-H1 found in `locks-delegated-production-ttl-heavy`
+(fenced I/O with no fault) and in the harness's `lock-failover` (a contender
+granted 16 s after the locker's unlock, once in a few runs).
+
+### A: a re-delegation to the same node lost its first renewal
+
+A cross-subtree rename recalled a delegate's generation and the root
+re-delegated the subtree to the same node (seed 1434: `d1`, gen 3 then gen
+5, node 2). The delegate's lock renewals still went to the root, whose
+table names the requester as the owner and answers `NotOwner { 0 }`
+(`lock_route_answering`). The delegate read that as a deposed root, cleared
+its cached root, started a new stream round and dropped its new
+generation's first renewal answer as stale, while the renewal in flight
+kept any other from going out until the forward timeout: the subtree was
+answered `NotOwner { 0 }` and the holders' windows lapsed.
+`lock_delegated_here` keeps the cached root when this node's own table
+delegates the inode to itself under a generation it has not handed back
+(renewals and lock requests); `delegation_sync` re-sends the renewal in
+flight at once when the stream round changes. `-heavy` 0..10 000: fenced
+I/O 83 -> 1 (seed 3850, C below).
+
+### B: the takeover of a released lease waited even when nothing was left
+
+Every takeover of an unexpired released lease quarantined the whole
+namespace for `ttl + margin` (`lock_on_released_takeover`). Since F-a0 a
+release marks its lease (`granted_delegations`) when it leaves lock duty
+behind; the grace now runs only for a marked released lease. The mark also
+counts any grant record left in the table, expired ones included (a
+renewal served while the release is under way extends a known record,
+expired or not). From an unmarked mark on, the root serves no lock renewal
+until the release CAS is settled (`release_unmarked_in_flight`, found in
+review): the table could still take a record while the CAS was out — a
+reclaim under a read delegation's quarantine, which `lock_grace_active`
+admits and the mark does not count, or the grants a delegate's recall
+answer hands back (`lock_install_returned`, not gated on releasing) — and a
+renewal served from it gave its holder a window past the release, beside
+the grants of a taker that grants at once. (Counting the read delegation's
+quarantine in the mark instead would mark nearly every release where the
+kernel cache is on: `park_release_for_recalls` arms the kernel drain at the
+release.) Harness `lock-failover` asserts the contender is granted within
+half the lock TTL of the unlock.
+
+### C: a late reply moved the renewal point without re-arming the tick
+
+`lock_late_reply` extended (or replaced) a held grant and cleared its
+renewal in flight without re-arming the renewal tick, which stayed at the
+cadence it was armed at while the renewal was out (a grant with a renewal
+in flight has no renewal point of its own). Seed 3850: a 2.1 s grant, the
+tick 5 s out, lapsed under the application's I/O. The late reply re-arms
+the tick. The defect predates A and B; on base the seed does not reach this
+interleaving (0 fenced), the core test fails on it.
+
+Open (not fixed): a renewal answer for an older id that arrives after
+`recall_held` adopted a newer one, with no late reply after it, leaves the
+held grant's `renewing` set; `due_renewals` and `next_renewal` then skip it
+until it lapses (`LockTables::renewed` matches neither id).
+
+### Tests
+
+Core, failing before C and the B hardening:
+`a_late_reply_rearms_the_renewal_tick_for_its_renewal_point`,
+`an_unmarked_release_in_flight_renews_and_reclaims_nothing`. A and B:
+`a_root_change_resends_the_renewal_in_flight_at_once`,
+`a_not_owner_from_the_root_for_a_subtree_delegated_here_keeps_the_root`,
+`a_not_owner_answer_to_a_lock_request_for_a_subtree_delegated_here_keeps_the_root`,
+`a_takeover_of_an_unmarked_released_lease_grants_at_once`,
+`a_lock_request_after_an_unmarked_released_takeover_is_granted_at_once`,
+`a_release_with_an_expired_grant_record_left_is_marked`,
+`a_successors_idle_release_after_the_last_unlock_leaves_its_taker_no_grace`;
+`a_release_marks_the_lease_only_when_lock_grants_are_left_behind` now
+expects a lapsed record to mark and covers an emptied table. Sim pin:
+`a_redelegation_to_the_same_node_keeps_its_first_renewal` (seeds 1434, 691,
+1683, 604, 1155, 3850).
+
+### Verification
+
+On the box (16 cores, `/tmp` on tmpfs), every job under `timeout
+--kill-after=30s`, `-j 4`:
+
+- `cargo fmt --all -- --check`; `cargo clippy -p constellation-authority -p
+  constellation-harness --all-targets -- -D warnings`: clean.
+- `cargo test --release -p constellation-authority --lib`: 513 passed, 0
+  failed. The two new core tests fail on the tree without C and the B
+  hardening (the tick at 1 005 601, past the window's 1 001 100; the
+  renewal reclaimed `Ok` under an unmarked release).
+- `cargo test --release -p constellation-authority --test sim`: 180 passed.
+- Every sweepable `locks-*` config and `double-seal-inside-the-grace`,
+  seeds 0..2 000, this tree against 1e107f0: identical failing sets
+  everywhere (the controls `locks-writer-hold-unchecked` and
+  `locks-writer-hold-delegated-unsettled` fail on both) except
+  `locks-holder-step-back-sealed` seed 818 (this tree only): node 1, stepped
+  back 8 s, wrote its epoch-4 lease with a wall expiry 8 s short; node 2
+  took it over by expiry while node 1 still renewed a grant node 2 itself
+  held, and granted node 1 the same inode — the C7b class of seed 1892 (a
+  stepped-back holder's wall expiry, which claimants read), reached through
+  a trajectory B changed (a released takeover at t=6821 granted at once),
+  not a release path. Fenced I/O: `locks-delegated-production-ttl-heavy`
+  25 -> 0, `locks-delegated-production-ttl` 1 -> 0, the others within a few
+  of base.
+- Harness `lock-failover` x5: all pass, the contender granted 1.4–6.7 ms
+  after the locker's unlock.

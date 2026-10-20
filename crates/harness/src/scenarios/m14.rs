@@ -1022,7 +1022,8 @@ pub fn lock_fence_at_close(_seed: u64) -> Result<()> {
 /// under it while the holder is killed. The backup takes over by seal; B's
 /// renewals reclaim (or the mirror carries) its grant so its writes never
 /// see `EIO`; C's non-blocking attempts are refused throughout, and C is
-/// granted once B unlocks.
+/// granted once B unlocks — promptly, not after a released takeover's
+/// grace (the successor's idle release can win the race with C's request).
 pub fn lock_failover(_seed: u64) -> Result<()> {
     const NAME: &str = "lock-failover";
     // Long enough that B's window outlives the failover.
@@ -1116,12 +1117,26 @@ pub fn lock_failover(_seed: u64) -> Result<()> {
             );
         }
         held.release();
+        let unlocked = Instant::now();
         let (r, took) = flock_timed(&fc, libc::LOCK_EX);
         r.map_err(|e| anyhow::anyhow!("contender after unlock: {e}"))?;
         eprintln!("    {NAME}: contender granted {took:?} after the locker's unlock");
         let _ = flock(&fc, libc::LOCK_UN);
         print_locks(NAME, &clients[backup_idx]);
         print_locks(NAME, &clients[locker_idx]);
+        // Nobody holds the lock once the locker unlocked: the contender is
+        // granted at once (sub-millisecond), or after a lease handoff when
+        // the successor's idle release won the race with its request. Not
+        // after the grace of a released takeover (`ttl + margin`, 16 s
+        // here): the successor's release left no grant behind, and its
+        // lease says so. Half the lock TTL tells that grace from any
+        // handoff a loaded host slows down.
+        anyhow::ensure!(
+            took < Duration::from_millis(7_500),
+            "the contender waited {took:?} for a lock nobody held (a released takeover's \
+             grace after a release that left no grant?); {}",
+            crate::hostlag::lag_between(unlocked, Instant::now())
+        );
         clients[holder].mount()?;
         let refs: Vec<&Client> = clients.iter().collect();
         wait_for_p2p(&refs)?;

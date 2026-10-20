@@ -1372,6 +1372,17 @@ impl Core {
     /// Plan 30 §M9: whether the job in the slot has a lease CAS (or its
     /// re-read) in flight — a reconfiguration waits for it rather than
     /// racing our own renewal or release on the object's version.
+    /// A release CAS that lets the lease go unmarked is out, or its
+    /// outcome is still being read back: from its mark on, the root
+    /// extends no lock grant (`lock_renew_one`).
+    pub(crate) fn release_unmarked_in_flight(&self) -> bool {
+        self.lk.release_unmarked
+            && self.lease.releasing
+            && self.job.as_ref().is_some_and(|job| {
+                matches!(job.phase, Phase::Release | Phase::ReleaseReread { .. })
+            })
+    }
+
     pub(crate) fn lease_cas_in_flight(&self) -> bool {
         match &self.job {
             None => false,
@@ -2238,7 +2249,19 @@ impl Core {
         // lease does: whoever takes it over inherits the duty. The mark is
         // exactly that: the held lease's own is not carried over, or it
         // would pass down every chain of releases whatever they left.
-        let released = lease.released_granting(self.lock_duty_live(now, replica));
+        // A record that expired but is still in the table counts too: a
+        // renewal is still served while the release is under way and
+        // extends a known record, expired or not (`LockTables::extend`),
+        // and the taker of an unmarked released lease grants at once
+        // (`acquire_won`). An idle release and a handoff wait for an empty
+        // table; an operator's flush or stop, or a continuation epoch's
+        // flush (which waits for no live grant only), may leave one.
+        let duty = self.lock_duty_live(now, replica)
+            || (self.cfg.locks && replica.locks().grants_len() > 0);
+        // Unmarked, nothing may be left behind after all: no renewal is
+        // served until the CAS is settled (`release_unmarked_in_flight`).
+        self.lk.release_unmarked = !duty;
+        let released = lease.released_granting(duty);
         let op = self.issue_s3(
             S3Op::LeaseSwap {
                 lease: released,
@@ -3002,9 +3025,27 @@ impl Core {
             .map(|p| (p.holder, p.epoch, p.expires_unix_ms));
         self.epoch_tenure_resumed(replaced, false, replica);
         // Plan 30 §M14: a released (unexpired) lease's lock grants may
-        // still be honoured: a grace before any new grant.
+        // still be honoured: a grace before any new grant — when the
+        // release says its tenure left any behind. Since plan 43 C7-F
+        // F-a0 a release marks its lease (`granted_delegations`) when its
+        // lock table held a live grant, a grant moved toward a delegate, a
+        // subtree grace or a quarantine (`lock_duty_live`), or any grant
+        // record at all (`issue_release`); no new grant is made while the
+        // release is under way (`releasing`), a renewal finds no record to
+        // extend, and a reclaim needs a grace, which would have marked it.
+        // An unmarked release left nothing to wait out. An idle
+        // release or a handoff never leaves a grant (both wait for an
+        // empty table), yet the grace was waited after every one: in the
+        // harness's `lock-failover` the successor's idle release raced
+        // the locker's unlock and the contender's request behind it, and
+        // the node that took the lease over granted the contender only
+        // after `ttl + margin` (16 s) instead of at once.
         if prev.as_ref().is_some_and(|p| {
-            takeover && p.released && !p.is_expired(now.wall.0) && p.holder != self.cfg.node_id
+            takeover
+                && p.released
+                && p.granted_delegations
+                && !p.is_expired(now.wall.0)
+                && p.holder != self.cfg.node_id
         }) {
             self.lock_on_released_takeover(now, replica);
         }

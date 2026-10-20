@@ -549,10 +549,11 @@ must wait out, even if it serves nothing first. The claim CAS of a
 takeover that arms a floor (a seal or an `ack=s3` takeover of a marked
 tenure) therefore writes the new lease already marked, and so does the
 claim of a released lease that says its tenure left lock grants behind (a
-release marks its lease exactly when the lock table holds a live grant, a
-grant moved toward a delegate or a grace; the taker of a released lease
-grants no lock for a grace of its own, and the mark of the lease being
-released is not carried over). A
+release marks its lease exactly when the lock table holds a grant record,
+live or expired but still renewable, a grant moved toward a delegate or a
+grace; the taker of a released lease so marked grants no lock for a grace
+of its own, the taker of an unmarked one grants at once, and the mark of
+the lease being released is not carried over). A
 second seal inside the first successor's floor, before it had granted
 anything itself, found an unmarked lease and armed no floor, and the grants
 the first floor protected (those of the tenure before, which the lock

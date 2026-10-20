@@ -233,7 +233,11 @@ A grant is renewed half-way through the window the node honours it for
 (`(ttl − margin) / 2` after the send: 9.5 s at the defaults), one
 `LockRenew` message per owning sequencer carrying every grant that is
 due; the renewal tick is armed for the earliest renewal point, so a
-short grant is renewed inside its window too. A grant is renewed only
+short grant is renewed inside its window too — re-armed whenever a held
+grant's renewal point moves, a late reply's included (sim
+`locks-delegated-production-ttl-heavy` seed 3850: a 2.1 s grant
+extended by the reply to a request its push had answered, with the
+tick still at the 5 s cadence, lapsed under its I/O). A grant is renewed only
 while it is still honoured; a lapsed grant is never renewed. A recalled
 grant is renewed while something still pins it: local locks under it,
 or the one local lock it was granted for and has not served yet. That
@@ -1091,7 +1095,7 @@ floor:
   leaves a barrier on everything as of the persisted horizon, which its
   holders may write until (a new tenure's floor, below, is a cut taken
   when the tenure begins, before those holders stop). The same holds
-  for a takeover of a released lease (a barrier as of the end of its
+  for a takeover of a marked released lease (a barrier as of the end of its
   quarantine) and for a node that drops its tenure's grant table and may
   claim the lease again (as of the end of the grants it dropped).
 - The holder itself is not asked: its frontier would be the exact
@@ -1284,6 +1288,25 @@ expired. Both waits are kept on the node, not with the tenure, so they
 survive that tenure's own release: a successor whose next epoch flush
 released the lease a moment later, then claimed it back, granted over
 its predecessor's live exclusive grant (`locks-blips-tight` seed 2723).
+
+The released lease says whether there is anything to wait out: a
+release marks it (`granted_delegations`) when the lock table holds any
+grant record (live, or expired but still renewable: a renewal is served
+while the release is under way), a grant moved toward a delegate, a
+subtree grace or a quarantine. A successor that takes over an unmarked
+released lease grants at once. An idle release and a handoff wait for an
+empty table, so they are never marked by a grant; before this rule their
+taker waited `ttl + margin` all the same (harness `lock-failover`: the
+successor's idle release raced the locker's unlock, and the contender
+waited 16 s for a lock nobody held).
+
+From the mark on, an unmarked release extends nothing: while its CAS is
+out (or being read back) the root answers every renewal `NotOwner { 0 }`
+and the holder relearns the owner. The table can still take a record
+then — a reclaim under a read delegation's quarantine, which the mark
+does not count, or the grants a delegate's recall answer hands back —
+and a renewal served from it would give its holder a window past the
+release, beside the grants of a taker that grants at once.
 
 ### Delegations
 

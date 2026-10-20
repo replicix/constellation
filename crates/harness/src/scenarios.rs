@@ -1395,7 +1395,7 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "lock-failover",
-        desc: "plan 30 M14: four nodes with an M9 backup; B holds LOCK_EX and writes under it while the holder is killed; the backup takes over by seal, B's grant is reclaimed (no EIO), the contender's non-blocking attempts are refused throughout and it is granted once B unlocks",
+        desc: "plan 30 M14: four nodes with an M9 backup; B holds LOCK_EX and writes under it while the holder is killed; the backup takes over by seal, B's grant is reclaimed (no EIO), the contender's non-blocking attempts are refused throughout and it is granted once B unlocks, within half the lock TTL (no released takeover's grace after the successor's idle release)",
         requires: &[],
         caps: &[Cap::ClusterLocks],
         run: m14::lock_failover,

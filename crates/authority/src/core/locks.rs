@@ -258,6 +258,10 @@ pub(crate) struct LockState {
     /// Root: a lock renewal it answered was capped by its lease below a
     /// grant worth holding (`Core::lease_renew_for_grants`).
     lease_renew_wanted: bool,
+    /// The release CAS last issued lets the lease go unmarked
+    /// (`issue_release`): read while that CAS is out or in doubt
+    /// ([`Core::release_unmarked_in_flight`]).
+    pub(crate) release_unmarked: bool,
     /// A lease read to relearn the owner for renewals is in flight.
     relearning: bool,
     /// Node side, per generation this node's table still delegates: the
@@ -729,6 +733,35 @@ impl Core {
             Route::Node(n) if n == from => Route::Unknown,
             route => route,
         }
+    }
+
+    /// This node's own table delegates `ino` to this node, under a
+    /// generation it has not handed back to a root (a recall's
+    /// `deleg_handed_back_to`, which routes the subtree's renewals to that
+    /// root). A `NotOwner { 0 }` for it from the root this node caches is
+    /// then that root declining to name the requester
+    /// (`lock_route_answering`): its table has re-delegated the subtree to
+    /// this very node, whose own generation serves the inode once it is
+    /// renewed — not a root that found itself deposed, so the cached root
+    /// stays. (A handed-back generation's root that answers so may well
+    /// be deposed: the cached root is cleared as before.) Cleared, the
+    /// delegate lost its root (`root_node`), started a new stream round,
+    /// and dropped its new generation's first renewal answer as stale
+    /// (`on_deleg_renewed`): every lock renewal in the subtree was
+    /// answered `NotOwner { 0 }` until that renewal timed out (sim
+    /// `locks-delegated-production-ttl-heavy` seed 1434: a cross-subtree
+    /// rename re-delegated `d1` to its delegate, 45 such answers in
+    /// 0.46 s, five I/Os fenced).
+    fn lock_delegated_here(&self, ino: Ino, replica: &dyn Replica) -> bool {
+        if !self.cfg.delegation || replica.delegation_table().is_empty() {
+            return false;
+        }
+        let keys = Self::read_keys(ino, None);
+        matches!(
+            replica.resolve_ownership(&keys),
+            constellation_meta::delegation::Ownership::Delegated(d)
+                if d.node == self.cfg.node_id && self.deleg_handed_back_to(d.gen).is_none()
+        )
     }
 
     /// `renewal`: a held lease whose takeover gate is still pending (the
@@ -3217,6 +3250,18 @@ impl Core {
         if ttl <= 0 {
             return LockRenewResult::NotOwner { owner: 0 };
         }
+        // A release that let the lease go unmarked told its taker that
+        // this tenure leaves no grant behind, and the taker grants at once
+        // (`acquire_won`): from the mark on, the root extends nothing. Its
+        // table can still take a record while the CAS is out — a reclaim
+        // under a read delegation's quarantine, which the mark does not
+        // count, or the grants a delegate's recall answer hands back — and
+        // a renewal served from it gave its holder a window past the
+        // release, beside the taker's grants. The holder relearns the
+        // owner.
+        if gen == 0 && self.release_unmarked_in_flight() {
+            return LockRenewResult::NotOwner { owner: 0 };
+        }
         // Plan 41 L0: the root extends a window only as far as a fresh
         // owner may promise one. A tenure that can be taken over before
         // its lease expires (a backup's seal, `ack=s3`) answers with fresh
@@ -3799,7 +3844,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let Some(op) = self.lk.by_req.remove(&req) else {
-            self.lock_late_reply(now, from, req, outcome, replica);
+            self.lock_late_reply(now, from, req, outcome, replica, out);
             return;
         };
         if !self.lk.ops.get(&op).is_some_and(|o| o.req == Some(req)) {
@@ -3826,6 +3871,7 @@ impl Core {
         req: OpId,
         outcome: LockOutcome,
         replica: &dyn Replica,
+        out: &mut Vec<Action>,
     ) {
         let Some((ino, sent)) = self.lk.done_reqs.remove(&req) else {
             return;
@@ -3869,6 +3915,13 @@ impl Core {
                 .locks()
                 .renewed(ino, id, id, mode, sent, ttl, margin, false);
             self.stats.lock_late_replies_installed += 1;
+            // The grant has a new renewal point and no renewal in flight
+            // (`renewed` clears it): the tick must come by then. Armed at
+            // the cadence while the renewal was out, it came after the
+            // window and the grant lapsed under the application's I/O (sim
+            // `locks-delegated-production-ttl-heavy` seed 3850: a grant
+            // capped at 2.1 s, the tick 5 s out).
+            self.lock_arm_renew_tick(now, replica, out);
             return;
         }
         let held = HeldGrant {
@@ -3890,6 +3943,8 @@ impl Core {
             Installed::Ok { .. }
         ) {
             self.stats.lock_late_replies_installed += 1;
+            // A new grant, with its own renewal point (see above).
+            self.lock_arm_renew_tick(now, replica, out);
         }
     }
 
@@ -4319,11 +4374,14 @@ impl Core {
                     }
                 } else if from != self.cfg.node_id
                     && (owner == 0 || self.lease.cached_holder == Some(from))
+                    && !(owner == 0 && self.lock_delegated_here(ino, replica))
                 {
                     // The node asked as the owner names no other one (or
                     // names this node, or itself): what this node cached
                     // is stale; the next attempt reads the lease rather
-                    // than ask it again.
+                    // than ask it again. (Not when this node's table
+                    // delegates the inode to this node: see
+                    // `lock_delegated_here`.)
                     self.lease.cached_holder = None;
                 }
                 self.lock_retry(now, op, out);
@@ -4752,6 +4810,7 @@ impl Core {
                 } else if owner == 0
                     && from != self.cfg.node_id
                     && self.lease.cached_holder == Some(from)
+                    && !self.lock_delegated_here(ino, replica)
                 {
                     // The owner this node cached names no other one (a
                     // root that found itself deposed, plan 41 L0): the next
@@ -5952,13 +6011,14 @@ impl Core {
     /// A takeover of a lease its holder *released* (not expired): its
     /// grants were capped by a lease still live, so they may be honoured
     /// for up to `ttl` more — a grace on everything, reclaims admitted
-    /// (the sim found a successor granting at once). The whole-namespace
-    /// quarantine, not this tenure's `grace`: the grants are not this
-    /// tenure's, so they do not end with it. Kept per tenure, the grace
-    /// went with the successor's own release a moment later (an epoch's
-    /// flush), and its re-claim of the lease it had released — no
-    /// takeover — granted over the predecessor's live exclusive grant
-    /// (`locks-blips-tight` seed 2723).
+    /// (the sim found a successor granting at once). Only when the
+    /// release says it left any: its mark (`acquire_won`). The
+    /// whole-namespace quarantine, not this tenure's `grace`: the grants
+    /// are not this tenure's, so they do not end with it. Kept per
+    /// tenure, the grace went with the successor's own release a moment
+    /// later (an epoch's flush), and its re-claim of the lease it had
+    /// released — no takeover — granted over the predecessor's live
+    /// exclusive grant (`locks-blips-tight` seed 2723).
     /// The predecessor's grants end unreleased, as an outwait does, and
     /// their holders may write into delegates' streams until then: a
     /// barrier on everything as of the quarantine's end (the tenure's
@@ -5978,9 +6038,11 @@ impl Core {
 
     /// Plan 43 C7-F F-a0: this tenure may have lock grants that are still
     /// honoured, or waits out some of an earlier tenure's: a lease released
-    /// now says so (`granted_delegations`), because the node that takes a
-    /// released lease over grants no lock for a grace
-    /// ([`Core::lock_on_released_takeover`]) and is then a tenure its own
+    /// now says so (`granted_delegations`, with any grant record left in
+    /// the table: `issue_release`), because the node that takes a
+    /// released lease so marked over grants no lock for a grace
+    /// ([`Core::lock_on_released_takeover`]; one that takes an unmarked
+    /// one over grants at once: `acquire_won`) and is then a tenure its own
     /// successor must wait out too (`acquire_cas`'s `inherits_duty`). A
     /// tenure with nothing of the kind costs its successor's successor
     /// nothing, so a handoff that served nothing (a start-up's) does not

@@ -1683,6 +1683,7 @@ impl Core {
         // behind (4, 18); every op parked on the new root for 120 s).
         let root = self.root_node();
         let mut stale_reqs = Vec::new();
+        let mut renew_again = Vec::new();
         let rounds: BTreeMap<u64, u64> = self
             .dl
             .mine
@@ -1710,6 +1711,23 @@ impl Core {
                     d.stream_after = None;
                     d.stream_backoff_ms = 0;
                 }
+                // So is the renewal in flight: its answer is dropped as
+                // stale (`on_deleg_renewed`), and while `renew` named it
+                // no renewal went out until it timed out
+                // (`deleg_expire_inflight`, the forward timeout). A
+                // delegate whose cached root was cleared and found again
+                // right after a re-delegation to itself sat out that
+                // timeout with its new generation never renewed, answering
+                // every lock renewal in the subtree `NotOwner { 0 }` while
+                // the holders' windows ran out (sim
+                // `locks-delegated-production-ttl-heavy`, R2-3b). It goes
+                // again now, in the new round.
+                if let Some((req, _)) = d.renew.take() {
+                    stale_reqs.push(req);
+                    if !d.stopped {
+                        renew_again.push(d.gen);
+                    }
+                }
                 if d.last_root.is_some() && root.is_some() {
                     d.streamed_through = replica.log_stream_idx(d.gen);
                     d.refused = false;
@@ -1728,6 +1746,9 @@ impl Core {
         }
         for req in stale_reqs {
             self.dl.by_req.remove(&req);
+        }
+        for gen in renew_again {
+            self.deleg_renew_now(now, gen, out);
         }
         // Parked delegate ops.
         let gens: Vec<u64> = self.dl.mine.keys().copied().collect();

@@ -13391,6 +13391,121 @@ mod locks {
         assert_eq!(flush, GrantId { node: 1, seq: 3 });
     }
 
+    /// Sim `locks-delegated-production-ttl-heavy` seed 3850: a short grant
+    /// (a delegate's, capped by its delegation) was pushed past its
+    /// renewal point, its renewal went out at once and the renewal tick
+    /// was armed at the cadence (`lock_ttl / 4`, 5 s), past the window: a
+    /// grant with a renewal in flight has no renewal point of its own. The
+    /// owner's recall of its new id adopted the grant here, and the reply
+    /// to the request the push had answered extended it as a renewal
+    /// answer does (`lock_late_reply`), leaving nothing in flight and a
+    /// renewal point due — with no tick armed for it. The grant lapsed
+    /// under the application's I/O (fenced) 4 s before the tick.
+    #[test]
+    fn a_late_reply_rearms_the_renewal_tick_for_its_renewal_point() {
+        let tick_of = |out: &[Action]| {
+            out.iter().rev().find_map(|a| match a {
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::LockRenewTick,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+        };
+        let short = |seq| LockOutcome::Granted {
+            id: GrantId { node: 1, seq },
+            mode: X,
+            ttl_ms: 2_100,
+            position: Position::ZERO,
+        };
+        let renews = |out: &[Action], seq: u64| {
+            sends(out).iter().any(|(to, m)| {
+                *to == 1
+                    && matches!(m, PeerMsg::LockRenew { entries, .. }
+                        if entries.iter().any(|e| e.grant == GrantId { node: 1, seq }))
+            })
+        };
+        let mut r = requester();
+        // The tick's cadence: 5 s.
+        r.core.cfg.lock_ttl_ms = 20_000;
+        let sent = r.honour();
+        let req = lock_control(&mut r, 50, 42, true);
+        // Pushed past its renewal point (ttl 2.1 s, margin 1 s: renewed
+        // from `sent + 550`, honoured until `sent + 1100`).
+        r.advance(600);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockGranted {
+                ino: 42,
+                sent,
+                outcome: short(2),
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        assert_eq!(
+            r.meta.locks().local_set(
+                42,
+                LocalLock {
+                    owner: 9,
+                    pid: 1,
+                    pid_start: 0,
+                    write: true,
+                    start: 0,
+                    end: u64::MAX
+                },
+                r.clk()
+            ),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        let tick = tick_of(&out).expect("no renewal tick");
+        r.now = r.core.timer_ms(tick).unwrap();
+        let out = r.step(Event::Timer { id: tick });
+        assert!(renews(&out, 2), "no renewal: {out:?}");
+        let mut tick = tick_of(&out).expect("no renewal tick re-armed");
+        let until = r.meta.locks().held(42).unwrap().until.0;
+        assert!(
+            r.core.timer_ms(tick).unwrap().0 >= until,
+            "the tick is at the cadence, past the window"
+        );
+        // The owner recalls its new id: adopted, the renewal still out.
+        r.advance(5);
+        r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 3 },
+            },
+        });
+        // The reply to the pushed request extends the adopted grant.
+        r.advance(5);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: short(3),
+            },
+        });
+        assert_eq!(r.core.stats.lock_late_replies_installed, 1);
+        let held = r.meta.locks().held(42).unwrap();
+        assert_eq!(held.id, GrantId { node: 1, seq: 3 });
+        assert!(held.renewing.is_none());
+        if let Some(t) = tick_of(&out) {
+            tick = t;
+        }
+        let at = r.core.timer_ms(tick).unwrap();
+        assert!(
+            at.0 < held.until.0,
+            "the renewal tick fires at {}, after the grant's window ({})",
+            at.0,
+            held.until.0
+        );
+        r.now = at;
+        let out = r.step(Event::Timer { id: tick });
+        assert!(renews(&out, 3), "the adopted grant not renewed: {out:?}");
+    }
+
     /// Sim `locks-stall-step` seed 1934: the reply to a request a push
     /// already answered is handled long after the request's send (the
     /// node's step stalled; a reply slow in transit is the same). Its
@@ -18663,25 +18778,64 @@ mod locks {
     /// tenure leaves lock grants (or a grace) behind, so the taker of the
     /// released lease, which waits them out, is a tenure its own successor
     /// must wait out too. The mark is exactly that: the held lease's own is
-    /// no part of it (a marked tenure that has nothing live at its release
+    /// no part of it (a marked tenure that has nothing behind at its release
     /// releases an unmarked lease, or the mark would pass down every chain
     /// of releases and seals, each paying a floor for nothing).
+    ///
+    /// A grant record that has lapsed but is still in the table is behind
+    /// too: a renewal is still served while the release is under way and
+    /// revives it (`a_release_with_an_expired_grant_record_left_is_marked`),
+    /// and the taker of an unmarked released lease grants at once
+    /// (`a_takeover_of_an_unmarked_released_lease_grants_at_once`). Only a
+    /// table with no record at all (here: the grant was released by its
+    /// holder) leaves nothing to wait out.
     #[test]
     fn a_release_marks_the_lease_only_when_lock_grants_are_left_behind() {
         // `held_marked` is the held lease's own mark when it is let go;
-        // `live`: a lock grant, still honoured at the release.
-        let released_lease = |held_marked: bool, live: bool| {
+        // `state`: the one lock grant, still honoured at the release
+        // (`Live`), lapsed but with its record in the table (`Lapsed`), or
+        // released by its holder (`Gone`).
+        #[derive(Clone, Copy, Debug)]
+        enum State {
+            Live,
+            Lapsed,
+            Gone,
+        }
+        let released_lease = |held_marked: bool, state: State| {
             let (mut h, ino) = holder_with_file();
             let mut out = request(&mut h, 2, 7, ino, X, true);
-            granted(&lock_replies(&out)[0].2);
-            if !live {
-                // The grant lapsed (the tenure's own mark, set by the
-                // grant, stays: a tenure that granted once is marked).
-                let until = h.meta.locks().grants_snapshot()[0].until.0;
-                h.now = Ms(until + 1);
+            let (grant, _) = granted(&lock_replies(&out)[0].2);
+            match state {
+                State::Live => {}
+                State::Lapsed => {
+                    // The grant lapsed (the tenure's own mark, set by the
+                    // grant, stays: a tenure that granted once is marked).
+                    let until = h.meta.locks().grants_snapshot()[0].until.0;
+                    h.now = Ms(until + 1);
+                }
+                State::Gone => {
+                    h.advance(10);
+                    h.step(Event::Peer {
+                        from: 2,
+                        msg: PeerMsg::LockReleased {
+                            ino,
+                            grant,
+                            position: constellation_meta::Position::ZERO,
+                        },
+                    });
+                }
             }
             h.core.lease.held.as_mut().unwrap().0.granted_delegations = held_marked;
-            assert_eq!(h.core.lock_duty_live(h.clk(), &h.meta), live);
+            assert_eq!(
+                h.core.lock_duty_live(h.clk(), &h.meta),
+                matches!(state, State::Live),
+                "{state:?}"
+            );
+            assert_eq!(
+                h.meta.locks().grants_len(),
+                usize::from(!matches!(state, State::Gone)),
+                "{state:?}"
+            );
             out.clear();
             h.core.issue_release(h.clk(), &h.meta, &mut out);
             s3_ops(&out)
@@ -18693,15 +18847,328 @@ mod locks {
                 .unwrap_or_else(|| panic!("no release CAS: {out:?}"))
         };
         for held_marked in [false, true] {
+            for state in [State::Live, State::Lapsed] {
+                assert!(
+                    released_lease(held_marked, state).granted_delegations,
+                    "{state:?}, held lease marked: {held_marked}"
+                );
+            }
             assert!(
-                released_lease(held_marked, true).granted_delegations,
-                "live grants, held lease marked: {held_marked}"
-            );
-            assert!(
-                !released_lease(held_marked, false).granted_delegations,
-                "nothing live, held lease marked: {held_marked}"
+                !released_lease(held_marked, State::Gone).granted_delegations,
+                "nothing left, held lease marked: {held_marked}"
             );
         }
+    }
+
+    /// Harness `lock-failover` (a contender granted 16 s after the
+    /// locker's unlock, once in a few runs): the node that takes over a
+    /// released lease that left nothing behind grants at once; one that
+    /// takes over a lease marked as granting waits out the grants its
+    /// predecessor may still honour (`lock_on_released_takeover`, the lock
+    /// TTL plus the margin on everything). Before, every takeover of an
+    /// unexpired released lease waited, the release's mark not consulted.
+    #[test]
+    fn a_takeover_of_an_unmarked_released_lease_grants_at_once() {
+        let released = |h: &Harness, marked: bool| {
+            let mut prev = lease_of(1, 1, h.now.0 + 5_000);
+            prev.released = true;
+            prev.granted_delegations = marked;
+            prev
+        };
+        // The lease's last holder, released: node 2 takes it over.
+        let takeover = |marked: bool| {
+            let mut h = Harness::new(2);
+            let prev = released(&h, marked);
+            let before = h.core.stats.lock_grace_periods;
+            let claimed = claim_over(&mut h, &prev, false);
+            assert_eq!((claimed.holder, claimed.epoch), (2, 2));
+            assert!(!claimed.released);
+            assert_eq!(h.core.lease.held.as_ref().map(|(l, _)| l.holder), Some(2));
+            let grace = h.core.stats.lock_grace_periods - before;
+            (h, grace)
+        };
+        let (h, grace) = takeover(false);
+        assert!(
+            h.meta.locks().quarantine_until() <= h.clk().wait,
+            "a quarantine until {:?} (now {:?}) after an unmarked release",
+            h.meta.locks().quarantine_until(),
+            h.clk().wait
+        );
+        assert_eq!(grace, 0, "a grace period counted");
+        let (h, grace) = takeover(true);
+        let ttl = h.core.cfg.lock_ttl_ms as i64;
+        let until = h.meta.locks().quarantine_until();
+        assert!(
+            until.0 >= h.clk().wait.0 + ttl,
+            "quarantined until {until:?} (now {:?}) after a marked release",
+            h.clk().wait
+        );
+        assert_eq!(grace, 1);
+    }
+
+    /// The same at the lock request: a file under the tenure that took an
+    /// unmarked released lease over is granted at once (the takeover's
+    /// gate opened), the marked twin is told `Waiting { grace: true }`.
+    #[test]
+    fn a_lock_request_after_an_unmarked_released_takeover_is_granted_at_once() {
+        let answer = |marked: bool| {
+            let mut h = Harness::new(2);
+            let mut prev = lease_of(1, 1, h.now.0 + 5_000);
+            prev.released = true;
+            prev.granted_delegations = marked;
+            claim_over(&mut h, &prev, false);
+            // The takeover's gate (the marker's landing, the drain) is
+            // open: what the answer depends on is the lock table's grace.
+            h.core.lease.gate = None;
+            let op = h.create("f");
+            let MutateOp::Create { ino, .. } = op else {
+                unreachable!()
+            };
+            constellation_meta::execute_mutate(&h.meta, &op, None).unwrap();
+            h.advance(50);
+            // The tenure marks its lease before its first grant (the
+            // request waits for that CAS): answered, the request goes again.
+            let out = request(&mut h, 3, 7, ino, X, false);
+            let mark = s3_ops(&out).into_iter().find_map(|(op, r)| match r {
+                S3Op::LeaseSwap { .. } => Some(op),
+                _ => None,
+            });
+            if let Some(op) = mark {
+                h.step(Event::S3 {
+                    op,
+                    result: S3Result::LeasePut(Ok(tag())),
+                });
+            }
+            h.advance(50);
+            let out = request(&mut h, 3, 8, ino, X, false);
+            let rs = lock_replies(&out);
+            let [(3, OpId(8), outcome)] = rs.as_slice() else {
+                panic!("no single answer (marked {marked}): {out:?}")
+            };
+            outcome.clone()
+        };
+        assert!(
+            matches!(answer(false), LockOutcome::Granted { .. }),
+            "not granted after an unmarked release: {:?}",
+            answer(false)
+        );
+        assert!(
+            matches!(answer(true), LockOutcome::Waiting { grace: true, .. }),
+            "not in grace after a marked release: {:?}",
+            answer(true)
+        );
+    }
+
+    /// A release leaves its successor a duty to wait out when the table
+    /// still holds a grant record, an expired one too: a renewal is served
+    /// while the release is under way, and it extends a known record,
+    /// expired or not (`LockTables::extend`), so the holder of a grant that
+    /// lapsed a moment before the release may be honouring it again after
+    /// it. Its release lease must say so, or its taker grants at once over
+    /// a grant its holder uses. (An operator's flush or stop, or a
+    /// continuation epoch's flush, may release with such a record left:
+    /// only an idle release and a handoff wait for an empty table.)
+    #[test]
+    fn a_release_with_an_expired_grant_record_left_is_marked() {
+        let (mut h, ino) = holder_with_file();
+        let out = request(&mut h, 2, 7, ino, X, true);
+        let (grant, _) = granted(&lock_replies(&out)[0].2);
+        let until = h.meta.locks().grants_snapshot()[0].until.0;
+        h.now = Ms(until + 1);
+        // Nothing live: the mark is the record's alone.
+        h.core.lease.held.as_mut().unwrap().0.granted_delegations = false;
+        assert!(!h.core.lock_duty_live(h.clk(), &h.meta));
+        assert_eq!(h.meta.locks().grants_len(), 1, "the record was purged");
+        let mut out = Vec::new();
+        h.core.issue_release(h.clk(), &h.meta, &mut out);
+        assert!(h.core.lease.releasing);
+        let released = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } if lease.released => Some(lease.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no release CAS: {out:?}"));
+        assert!(
+            released.granted_delegations,
+            "an expired record left in the table: the release is unmarked"
+        );
+        // The duty is real: the holder's renewal, while the release is
+        // under way, is answered `Ok` and the record is live again.
+        h.advance(10);
+        let out = renew(&mut h, 2, 20, ino, grant);
+        let results = renewed(&out, 2).expect("no answer");
+        let [LockRenewResult::Ok { id, .. }] = results.as_slice() else {
+            panic!("the renewal of the lapsed record was not served: {out:?}")
+        };
+        assert_eq!(*id, grant);
+        assert!(h.meta.locks().live_grants_len(h.clk().wait) > 0);
+    }
+
+    /// The other half of the mark: once a release has let its lease go
+    /// unmarked (nothing left behind), nothing may be left behind after
+    /// all. The table can still take a record while the CAS is out — a
+    /// reclaim under a grace the mark does not count (a read
+    /// delegation's restart or takeover quarantine, `lock_grace_active`),
+    /// or the grants a delegate's recall answer hands back
+    /// (`lock_install_returned`) — and a renewal served from it then gave
+    /// its holder a window past the release, while the node that takes
+    /// the unmarked lease over grants at once (`acquire_won`): two
+    /// holders. Such a release answers renewals `NotOwner { 0 }` until
+    /// its CAS is settled; the holder relearns the owner.
+    #[test]
+    fn an_unmarked_release_in_flight_renews_and_reclaims_nothing() {
+        // Node 1's tenure, its journal drained (a file that came with a
+        // segment): a handoff lets the lease go at once.
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: "f".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+        )
+        .unwrap();
+        // Reclaims are admitted (a read delegation's quarantine), yet
+        // nothing of the lock table's is live: the release is unmarked.
+        let until = h.clk().wait.plus(10_000);
+        h.meta.read_delegations().set_quarantine(until);
+        assert!(!h.core.lock_duty_live(h.clk(), &h.meta));
+        assert_eq!(h.meta.locks().grants_len(), 0);
+        // Node 3 asks for the lease: the handoff job uploads, then lets
+        // the lease go.
+        let out = h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LeaseRequest {
+                req: OpId(5),
+                epoch_applied: None,
+            },
+        });
+        let upload = out
+            .iter()
+            .find_map(|a| match a {
+                Action::UploadDirtyChunks { op, .. } => Some(*op),
+                _ => None,
+            })
+            .expect("the handoff uploads first");
+        let out = h.step(Event::UploadsDone {
+            op: upload,
+            result: UploadResult::Done { held: 0 },
+        });
+        assert!(h.core.lease.releasing);
+        let released = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } if lease.released => Some(lease.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no release CAS: {out:?}"));
+        assert!(!released.granted_delegations, "marked: nothing was left");
+        // A holder this table does not know renews while the CAS is out:
+        // not reclaimed.
+        h.advance(10);
+        let out = renew(&mut h, 2, 20, ino, GrantId { node: 5, seq: 9 });
+        let results = renewed(&out, 2).expect("no answer");
+        assert!(
+            matches!(results.as_slice(), [LockRenewResult::NotOwner { owner: 0 }]),
+            "renewed under an unmarked release: {results:?}"
+        );
+        assert_eq!(h.meta.locks().grants_len(), 0, "reclaimed");
+    }
+
+    /// Harness `lock-failover`, deterministically: node 4 wants the lease
+    /// while node 3 holds a lock grant under node 1's tenure; node 3
+    /// unlocks and the tenure's next round idle-releases (the table is
+    /// empty, a node wants the lease): the lease it releases is unmarked,
+    /// since nothing is left behind, and node 4, which takes it over, grants
+    /// at once. Before, node 4 took over an unexpired released lease and
+    /// quarantined the whole namespace for the lock TTL plus the margin: the
+    /// contender waited 16 s for a lock nobody held.
+    #[test]
+    fn a_successors_idle_release_after_the_last_unlock_leaves_its_taker_no_grace() {
+        // The tenure is node 1's, its journal drained (a file that came
+        // with a segment); node 3 holds a grant under it.
+        let mut h = Harness::new(1);
+        h.hold(1, None);
+        let ino = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Create {
+                parent: ROOT_INO,
+                name: "f".into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                time_ns: 1,
+            }],
+        )
+        .unwrap();
+        let out = request(&mut h, 3, 7, ino, X, true);
+        let (grant, _) = granted(&lock_replies(&out)[0].2);
+        // Node 4 has asked for the lease, long ago; the tenure is idle.
+        let long_ago = WaitMs(h.now.0 - 1_000_000);
+        h.core.lease.wanted = vec![4];
+        h.core.lease.wanted_since = Some(long_ago);
+        h.core.lease.held_since = Some(long_ago);
+        h.core.lease.last_write = long_ago;
+        assert!(h.core.lease.wants_handoff(h.clk(), h.core.config()));
+        // While node 3 holds its grant the lease stays.
+        let mut out = Vec::new();
+        h.core.round_release(h.clk(), &h.meta, &mut out);
+        assert!(!h.core.lease.releasing, "released over a grant: {out:?}");
+        // Node 3 unlocks; the next round idle-releases.
+        h.advance(100);
+        h.step(Event::Peer {
+            from: 3,
+            msg: PeerMsg::LockReleased {
+                ino,
+                grant,
+                position: constellation_meta::Position::ZERO,
+            },
+        });
+        assert_eq!(h.meta.locks().grants_len(), 0);
+        h.core.lease.last_write = long_ago;
+        let mut out = Vec::new();
+        h.core.round_release(h.clk(), &h.meta, &mut out);
+        assert!(h.core.lease.releasing, "no idle release: {out:?}");
+        let released = s3_ops(&out)
+            .into_iter()
+            .find_map(|(_, r)| match r {
+                S3Op::LeaseSwap { lease, .. } if lease.released => Some(lease.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no release CAS: {out:?}"));
+        assert!(!released.granted_delegations, "marked: nothing was left");
+        assert!(!released.is_expired(h.now.0));
+        // Node 4 takes the lease over: no quarantine, no grace counted.
+        let mut taker = Harness::new(4);
+        let claimed = claim_over(&mut taker, &released, false);
+        assert_eq!(claimed.holder, 4);
+        assert_eq!(taker.core.stats.lock_grace_periods, 0);
+        assert!(
+            taker.meta.locks().quarantine_until() <= taker.clk().wait,
+            "the contender's tenure quarantines locks until {:?} (now {:?})",
+            taker.meta.locks().quarantine_until(),
+            taker.clk().wait
+        );
     }
 
     /// Plan 43 C7-F F-a0: grants moved toward a delegate
@@ -27359,6 +27826,449 @@ fn a_root_lost_from_view_restarts_the_batch_in_flight_at_once() {
     );
     h.step(stream_ack(1, again, round2, last));
     assert_eq!(h.core.dl.mine[&7].streamed_through, last);
+}
+
+/// The answer of node `from`, as the root, to a delegate's renewal `req`
+/// of `gen` sent in stream round `round`.
+fn renewed_by(from: NodeId, req: OpId, gen: u64, round: u64, ttl_ms: u64) -> Event {
+    Event::Peer {
+        from,
+        msg: PeerMsg::DelegRenewed {
+            req,
+            gen,
+            round,
+            ttl_ms,
+            locks: Vec::new(),
+            lock_grace_ms: 0,
+            lock_floor: Default::default(),
+            lock_cut_at: 0,
+            lock_cut: Box::default(),
+            lock_barrier: 0,
+            lock_carry: Vec::new(),
+        },
+    }
+}
+
+/// The renewal of generation 7 in `out`, and where it went: `(to, req,
+/// round)`.
+fn renewal_sent(out: &[Action]) -> Option<(NodeId, OpId, u64)> {
+    sends(out).into_iter().find_map(|(to, m)| match m {
+        PeerMsg::DelegRenew {
+            req, gen: 7, round, ..
+        } => Some((to, *req, *round)),
+        _ => None,
+    })
+}
+
+/// A delegate (node 3, generation 7 of `/d`, root node 1) that installed
+/// and sent its first renewal, unanswered: the harness, the renewal's
+/// request and the round it went out in.
+fn delegate_with_first_renewal_out() -> (Harness, OpId, u64) {
+    let mut h = Harness::new(3);
+    h.core.cfg.delegation = true;
+    h.core.cfg.p2p = true;
+    h.core.lease.cached_holder = Some(1);
+    delegated_to_me(&h.meta, 3);
+    let mut out = Vec::new();
+    h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+    let (to, req, round) = renewal_sent(&out).expect("no renewal on install");
+    assert_eq!(to, 1);
+    assert_eq!(round, round_of(&h, 7));
+    (h, req, round)
+}
+
+/// Sim `locks-delegated-production-ttl-heavy` seed 1434 (R2-3b): a root
+/// that changes (or is lost from view and found again) while the first
+/// renewal of a delegate's generation is in flight. The answer to that
+/// renewal comes in the old round and counts for nothing
+/// (`on_deleg_renewed`), and while `renew` named it no renewal went out
+/// until it timed out (`deleg_expire_inflight`, the forward timeout): the
+/// delegate sat there with a generation it never renewed, answering every
+/// lock renewal in its subtree `NotOwner { 0 }` while the holders' windows
+/// ran out. The renewal goes again at once, in the new round, as the batch
+/// in flight does (`a_root_lost_from_view_restarts_the_batch_in_flight_at_once`).
+#[test]
+fn a_root_change_resends_the_renewal_in_flight_at_once() {
+    // (i) The root changes to another node: its renewal goes to it in the
+    // same step, in the new round.
+    let (mut h, first, round0) = delegate_with_first_renewal_out();
+    h.advance(20);
+    h.core.lease.cached_holder = Some(2);
+    let out = poke(&mut h);
+    let (to, second, round1) =
+        renewal_sent(&out).unwrap_or_else(|| panic!("no renewal to the new root: {out:?}"));
+    assert_eq!(to, 2);
+    assert_ne!(round1, round0, "the round did not change");
+    assert_eq!(round1, round_of(&h, 7));
+    assert_ne!(second, first);
+    // The old root's answer, in the old round, counts for nothing.
+    let stale = h.core.stats.deleg_renewed_stale;
+    h.step(renewed_by(1, first, 7, round0, 5_000));
+    assert_eq!(h.core.stats.deleg_renewed_stale, stale + 1);
+    assert_eq!(
+        h.core.dl.mine[&7].until,
+        HonourMs(0),
+        "renewed by the old root's answer"
+    );
+    // The new root's, to the new request, in the new round, renews.
+    h.advance(5);
+    h.step(renewed_by(2, second, 7, round1, 5_000));
+    assert!(h.core.dl.mine[&7].until > h.honour(), "not renewed");
+
+    // (ii) The root is lost from view and found again (the same node):
+    // the renewal in flight is given up at the loss (a lease read and a
+    // retry are armed), and goes to the root once it is back, long before
+    // the first one would have timed out.
+    let (mut h, first, round0) = delegate_with_first_renewal_out();
+    let started = h.now;
+    h.advance(20);
+    h.core.lease.cached_holder = None;
+    h.core.lease.last_seen = None;
+    let out = poke(&mut h);
+    assert!(renewal_sent(&out).is_none(), "{out:?}");
+    assert!(
+        h.core.dl.mine[&7].renew.is_none(),
+        "the renewal in flight outlives the root it went to"
+    );
+    assert!(
+        h.core.dl.mine[&7].renew_timer.is_some(),
+        "no retry armed for the renewal"
+    );
+    assert!(
+        s3_ops(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, S3Op::LeaseGet)),
+        "no lease read for the root: {out:?}"
+    );
+    h.advance(10);
+    h.core.lease.cached_holder = Some(1);
+    let out = poke(&mut h);
+    assert_ne!(round_of(&h, 7), round0, "the round did not change");
+    // The retry timer sends it, in the round the root is now known in.
+    let retry = h.core.dl.mine[&7].renew_timer.unwrap_or_else(|| {
+        panic!("the retry timer is gone: {out:?}");
+    });
+    h.now = h.core.timer_ms(retry).expect("armed");
+    let out = h.step(Event::Timer { id: retry });
+    let (to, second, round1) =
+        renewal_sent(&out).unwrap_or_else(|| panic!("no renewal once the root is back: {out:?}"));
+    assert_eq!(to, 1);
+    assert_ne!(second, first);
+    assert_ne!(round1, round0);
+    assert_eq!(round1, round_of(&h, 7));
+    assert!(
+        ((h.now.0 - started.0) as u64) < h.core.deleg_request_timeout_ms(),
+        "not before the first renewal would have timed out"
+    );
+    // The first request's answer, in its round, counts for nothing; the
+    // second's does.
+    h.step(renewed_by(1, first, 7, round0, 5_000));
+    assert_eq!(h.core.dl.mine[&7].until, HonourMs(0));
+    h.step(renewed_by(1, second, 7, round1, 5_000));
+    assert!(h.core.dl.mine[&7].until > h.honour(), "not renewed");
+}
+
+/// Sim `locks-delegated-production-ttl-heavy` seed 1434 (R2-3b): the root
+/// answering a delegate's lock traffic `NotOwner { 0 }` for a subtree its
+/// own table delegates to that very delegate. A cross-subtree rename
+/// recalled `d1` and the root re-delegated it to the same node (gen 3,
+/// then gen 5); that delegate's own lock grant under `d1` still renewed
+/// with the root, whose table names the requester as the subtree's owner
+/// and so names nobody (`lock_route_answering`). Read as a root that found
+/// itself deposed (plan 41 L0), it cleared the delegate's cached root: the
+/// delegate lost its root, started a new stream round, and dropped the
+/// answer to its new generation's first renewal as stale, so the
+/// generation was never renewed and answered the subtree's renewals
+/// `NotOwner { 0 }` until a forward timeout (five I/Os fenced). A subtree
+/// delegated here keeps the cached root; any other inode (and a generation
+/// handed back to a root) clears it as before.
+mod redelegated_to_the_requester {
+    use super::*;
+    use crate::event::{Control, LockOutcome, LockRenewResult};
+    use constellation_fs_core::Ino;
+    use constellation_meta::locks::{GrantId, LockMode};
+    use constellation_meta::Position;
+
+    const X: LockMode = LockMode::Exclusive;
+    const GRANT: GrantId = GrantId { node: 1, seq: 1 };
+
+    /// Node 3 with root 1 cached, `/d/f` and `/g` in its replica, and a
+    /// lock on `target` (`/d/f` for a delegated one, `/g` for one that is
+    /// not) of node 1's, still being asked for (`granted: false`: the
+    /// `LockRequest` is in flight, its `req` returned) or granted and due
+    /// its renewal (the `LockRenew` in flight, its `req` returned). The
+    /// table delegating `/d` to node 3 as generation 7 reaches the
+    /// replica afterwards, and the delegate installs it: its first
+    /// renewal of the generation (request and round) is in flight too.
+    struct Setup {
+        h: Harness,
+        dir: Ino,
+        target: Ino,
+        lock_req: OpId,
+        renew: OpId,
+        round0: u64,
+    }
+
+    fn setup(delegated: bool, granted: bool) -> Setup {
+        let mut h = Harness::new(3);
+        h.core.cfg.delegation = true;
+        h.core.cfg.p2p = true;
+        h.core.lease.cached_holder = Some(1);
+        h.step(Event::Peers {
+            links: (1..=4)
+                .map(|node| crate::event::PeerLink {
+                    node,
+                    connected: true,
+                    last_seen: None,
+                    rtt_ms: Some(1),
+                    since: None,
+                })
+                .collect(),
+        });
+        let dir = h.meta.allocate_ino(ROOT_INO).unwrap();
+        let f = h.meta.allocate_ino(dir).unwrap();
+        let g = h.meta.allocate_ino(ROOT_INO).unwrap();
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+            &[
+                LogRecord::Mkdir {
+                    parent: ROOT_INO,
+                    name: "d".into(),
+                    ino: dir,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 1,
+                },
+                LogRecord::Create {
+                    parent: dir,
+                    name: "f".into(),
+                    ino: f,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 2,
+                },
+                LogRecord::Create {
+                    parent: ROOT_INO,
+                    name: "g".into(),
+                    ino: g,
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    time_ns: 3,
+                },
+            ],
+        )
+        .unwrap();
+        let target = if delegated { f } else { g };
+        let out = h.step(Event::Control {
+            op: OpId(50),
+            req: Control::Lock {
+                ino: target,
+                mode: X,
+                blocking: true,
+                waited_ms: 0,
+            },
+        });
+        let lock_req = match sends(&out).as_slice() {
+            [(1, PeerMsg::LockRequest { req, .. })] => *req,
+            other => panic!("expected a LockRequest to node 1: {other:?}"),
+        };
+        let mut renew = OpId(0);
+        if granted {
+            h.advance(10);
+            let out = h.step(Event::Peer {
+                from: 1,
+                msg: PeerMsg::LockReply {
+                    req: lock_req,
+                    outcome: LockOutcome::Granted {
+                        id: GRANT,
+                        mode: X,
+                        ttl_ms: 5_000,
+                        position: Position {
+                            seq: 3,
+                            pending: None,
+                            streams: Default::default(),
+                        },
+                    },
+                },
+            });
+            let mut tick = timers(&out, TimerKind::LockRenewTick)[0];
+            renew = loop {
+                h.now = h.core.timer_ms(tick).expect("armed");
+                let out = h.step(Event::Timer { id: tick });
+                if let Some(req) = sends(&out).into_iter().find_map(|(to, m)| match m {
+                    PeerMsg::LockRenew { req, .. } if to == 1 => Some(*req),
+                    _ => None,
+                }) {
+                    break req;
+                }
+                tick = timers(&out, TimerKind::LockRenewTick)[0];
+            };
+        }
+        // The delegation reaches the replica (the log's next segment).
+        crate::replica::Replica::apply_segment(
+            &h.meta,
+            2,
+            1,
+            0,
+            &[],
+            &[],
+            &[LogRecord::Delegate {
+                dir,
+                node: 3,
+                gen: 7,
+                designated: false,
+                range: (0, 0),
+            }],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        h.core.delegation_sync(h.clk(), &h.meta, &mut out);
+        let (to, _, round0) = renewal_sent(&out).expect("no renewal on install");
+        assert_eq!(to, 1);
+        Setup {
+            h,
+            dir,
+            target,
+            lock_req,
+            renew,
+            round0,
+        }
+    }
+
+    /// The root's answer `NotOwner { 0 }` to the lock renewal.
+    fn renewal_refused(s: &mut Setup) -> Vec<Action> {
+        s.h.advance(5);
+        s.h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req: s.renew,
+                results: vec![(s.target, GRANT, LockRenewResult::NotOwner { owner: 0 })],
+            },
+        })
+    }
+
+    /// The root's answer `NotOwner { 0 }` to the lock request.
+    fn request_refused(s: &mut Setup) -> Vec<Action> {
+        s.h.advance(5);
+        s.h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req: s.lock_req,
+                outcome: LockOutcome::NotOwner { owner: 0 },
+            },
+        })
+    }
+
+    /// Node 1 recalled generation 7: it hands the subtree's locks back.
+    fn recalled(s: &mut Setup) {
+        s.h.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::DelegRecall {
+                req: OpId(5),
+                dir: s.dir,
+                gen: 7,
+            },
+        });
+        assert_eq!(s.h.core.deleg_handed_back_to(7), Some(1));
+        assert_eq!(s.h.core.lease.cached_holder, Some(1));
+    }
+
+    /// The renewal path: a root that answers a delegate's renewal of its
+    /// lock grant under the subtree delegated to it `NotOwner { 0 }` is
+    /// still its root; one that does so for an inode delegated elsewhere
+    /// (here: nowhere) is not (plan 41 L0), and neither is one whose
+    /// generation was handed back to it.
+    #[test]
+    fn a_not_owner_from_the_root_for_a_subtree_delegated_here_keeps_the_root() {
+        let mut s = setup(true, true);
+        let out = renewal_refused(&mut s);
+        assert_eq!(
+            s.h.core.lease.cached_holder,
+            Some(1),
+            "the root was forgotten: {out:?}"
+        );
+        assert_eq!(s.h.core.root_node(), Some(1));
+        // Nothing changed for the delegation: no new round, no new
+        // renewal, nothing to re-learn.
+        let out = poke(&mut s.h);
+        assert_eq!(round_of(&s.h, 7), s.round0, "the stream round changed");
+        assert!(renewal_sent(&out).is_none(), "{out:?}");
+        assert!(s3_ops(&out).is_empty(), "{out:?}");
+
+        // Control: the inode is not delegated here: the cached root is
+        // forgotten (plan 41 L0).
+        let mut s = setup(false, true);
+        renewal_refused(&mut s);
+        assert_eq!(s.h.core.lease.cached_holder, None);
+
+        // Control: the generation delegated here was recalled and handed
+        // back to the root: its `NotOwner { 0 }` is the L0 case again.
+        let mut s = setup(true, true);
+        recalled(&mut s);
+        renewal_refused(&mut s);
+        assert_eq!(s.h.core.lease.cached_holder, None);
+    }
+
+    /// The request path of the same: a lock request answered `NotOwner {
+    /// 0 }` by the root for a subtree delegated to the requester keeps the
+    /// cached root, and is retried.
+    #[test]
+    fn a_not_owner_answer_to_a_lock_request_for_a_subtree_delegated_here_keeps_the_root() {
+        let mut s = setup(true, false);
+        let out = request_refused(&mut s);
+        assert_eq!(
+            s.h.core.lease.cached_holder,
+            Some(1),
+            "the root was forgotten: {out:?}"
+        );
+        assert_eq!(s.h.core.root_node(), Some(1));
+        let out = poke(&mut s.h);
+        assert_eq!(round_of(&s.h, 7), s.round0, "the stream round changed");
+        assert!(renewal_sent(&out).is_none(), "{out:?}");
+
+        // Controls: not delegated here; handed back to the root.
+        let mut s = setup(false, false);
+        request_refused(&mut s);
+        assert_eq!(s.h.core.lease.cached_holder, None);
+        let mut s = setup(true, false);
+        recalled(&mut s);
+        request_refused(&mut s);
+        assert_eq!(s.h.core.lease.cached_holder, None);
+    }
+
+    /// Seed 1434 end to end: the delegate's renewal of its own lock grant
+    /// under the re-delegated subtree is answered `NotOwner { 0 }` by the
+    /// root while the first renewal of its new generation is in flight;
+    /// that renewal's answer, in the round it went out in, is accepted:
+    /// the generation is renewed (before: the answer was dropped as stale,
+    /// the generation never renewed, its subtree answered `NotOwner { 0 }`).
+    #[test]
+    fn a_redelegation_to_the_same_node_keeps_its_first_renewal() {
+        let mut s = setup(true, true);
+        // The delegation's first renewal is in flight (setup's).
+        let (first, _) = s.h.core.dl.mine[&7].renew.expect("no renewal in flight");
+        renewal_refused(&mut s);
+        poke(&mut s.h);
+        s.h.advance(5);
+        let stale = s.h.core.stats.deleg_renewed_stale;
+        s.h.step(renewed_by(1, first, 7, s.round0, 5_000));
+        assert_eq!(
+            s.h.core.stats.deleg_renewed_stale, stale,
+            "the first renewal's answer was dropped as stale"
+        );
+        assert!(
+            s.h.core.dl.mine[&7].until > s.h.honour(),
+            "the generation was never renewed"
+        );
+    }
 }
 
 /// delegate-stream-acks: a late renewal answer for a generation this
