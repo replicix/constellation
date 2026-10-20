@@ -2498,6 +2498,21 @@ first part of C7a, landed early):
     fault, `delegated-long-delegation`) fails 16 of 300 seeds on the parent
     ("a rid refused with Eexist completed once in the log"): not
     clock-related, to be looked at.
+  - *Commit 5 landed (2026-10-20; PROGRESS "Plan 43 C7a, commit 5 of 6"):*
+    `crates/model/src/clk.rs` (a node's oscillator with a rate, and its wall,
+    honour and wait readings), per-node rate, `rate_budget`, `clock_split`,
+    `wall_follows_rate`, `beat_span` and `step_node`/`step_dir` in `cto` and
+    `locks`, every `local(i)` of both on one of the readings (the modules'
+    "Plan 43 C7a: the readings" tables), and the violate/clean pairs of §8.2.
+    Found: a disciplined wall catches a slow oscillator up (`J`), so the honour
+    side of rate needs an undisciplined host in the model as in the
+    simulator; a staircase oscillator at one-tick resolution leaves the budget
+    one tick of rounding, which the violating variants' margins of 0 or 1
+    and the clean ones' keep apart (the spec's `deleg_ttl 6` with margins 1 has
+    no budget-0 violation at that resolution); the beat cap's end-to-end
+    search finds nothing in 144 cells, so its pair is a trace over the
+    renewal tick (the floor ends up to one tick inside the holder's renewed
+    window without the span, never with it).
 - **C7b — the cross-node compares** (rows 2, 3, 6, 9, 11, and the sites
   C7-H2 found and left: 23 the released-takeover lock grace, 24 the seal
   watch's expiry compares, 25 `promise_check_needed`; and those C7-H1's

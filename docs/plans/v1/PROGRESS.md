@@ -54248,3 +54248,146 @@ On the build box (release, `-j 4`, one job at a time, `TMPDIR` on tmpfs):
 - `delegated-long-delegation` on the parent: the configuration added to an
   unmodified e5e7c20 tree fails the same 16 of 300 seeds (11, 16, 60 first),
   so it is not the simulator's change.
+
+## Plan 43 C7a, commit 5 of 6: per-node rate and the honour/wait/wall split in the `cto` and `locks` models
+
+C7a (plan 43 §7 C7, §11 Q20, answered 2026-10-20) puts the rate bound ρ in the
+clocks. This is its fifth commit and it stands alone: the models, with no
+product change, the first of the C7a commits that can land before C0.
+
+### What landed
+
+- `crates/model/src/clk.rs`: a node's clock, `Clk { off, off0, rate, jump }`
+  and `ClockSpec { rate_period, rate_budget, clock_split, wall_follows_rate }`.
+  The oscillator gains or loses `rate` ticks every `rate_period` real ticks
+  (`osc = t + rate·⌊t/period⌋`); the readings are WALL (`off` plus `t`, or plus
+  `osc` on an undisciplined host: `wall_follows_rate`), WAIT (`off0 +
+  ⌊osc·period/(period+budget)⌋`: runs slow by the budget), HONOUR (`off0 +
+  ⌈osc·period/(period−budget)⌉ + jump`: runs fast by it; `jump` is the running
+  maximum of how far the wall has run ahead of the honour clock's elapsed time,
+  the code's `J`, updated after every `Tick` and `Jump`), and with
+  `clock_split` off all three are the wall reading, which with no rate is the
+  `local = t + off[i]` the models had (the defaults reproduce them exactly:
+  the readings are equal, the new fields constant).
+- `cto.rs` and `locks.rs`: the new knobs `rate_period`, `max_rate`,
+  `explore_rates`, `init_rates`, `rate_budget`, `clock_split`,
+  `wall_follows_rate`, `beat_span`, and `step_node`/`step_dir` (which node
+  steps, which way). Every former `local(i)` is one of the three readings
+  (the "Plan 43 C7a: the readings" section of each module doc has the
+  table): HONOUR for a node's lease use, probe freshness, a delegate's
+  window and the `sent` it stamps, a locker's cache, the grant's cap by the
+  lease; WAIT for the sequencer's records and recall-by-expiry, the floor and
+  graces, a release's live-grant test, the owner's table, a beat's `sent`
+  and arrival, the lease end the beat names and the cap's `X`; WALL for the
+  claimant's compare with the register's expiry and the expiry written to it
+  (cross-node: C7b's). The register gains `expires_w` (the lease body's
+  `holder_wait_ms`) and a node's lease its honour and wait ends. The beat cap's
+  span filter (the code's `M/(4ρ)`) keeps the beats on the Pareto frontier
+  (`State::beat_lags`: a later beat with a lag at most an earlier one's
+  leaves it out, since it is in every window the earlier one is) and takes
+  the least lag among those within `beat_span` of `X`.
+- State size: the clock is one `Vec<Clk>` of 8 bytes per node where `off` was
+  2 (a 24-byte allocation for three nodes, the same allocator class); `Reg`
+  and the lease tuple grow by two bytes, `State` by one empty `Vec` (24
+  bytes). No test's cap or budget changed.
+
+### Tests
+
+Each pair is a violating variant and its clean one (the clean ones witness
+their `sometimes` properties and finish their searches; 1 to 4 M states, 5 to
+15 s in release):
+
+- `cto`: `strict_rate_beyond_the_budget_violates` /
+  `strict_rate_within_the_budget_is_clean` (every oscillator within a quarter
+  of its rate, explored; 8-tick delegations, the delegate's margin 0 and the
+  holder's 1: a fast holder ends its outwait of a lost recall `(8 + 1) / 1.25`
+  ticks after the grant, the delegate honours until 8); `fast_takeover_floor_
+  rate_beyond_the_budget_violates` / `..._within_the_budget_is_clean` (a fast
+  successor at the models' coarsest resolution, a tick every two, margins 0,
+  5-tick delegations: the floor passes while the old holder's delegation is
+  honoured); `beat_cap_rate_before_the_renewal_violates_without_the_span` /
+  `beat_cap_rate_with_the_span_is_clean`; `a_delegate_stepped_back_on_the_wall_
+  clock_violates` / `..._on_its_honour_clock_is_clean`.
+- `locks`: `locks_rate_beyond_the_budget_violates` / `locks_rate_within_the_
+  budget_is_clean` (a fast owner, 8-tick grants, the locker's margin 0 and the
+  owner's 1); `locks_holder_rate_on_an_undisciplined_host_beyond_the_budget_
+  violates` / `..._within_the_budget_is_clean` (the locker slow, its wall
+  following its oscillator); `beat_cap_rate_*` as in `cto`; `a_locker_stepped_
+  back_on_the_wall_clock_violates` / `a_locker_stepped_back_on_the_split_
+  clocks_is_clean` and `a_root_stepped_forward_on_the_wall_clock_violates` /
+  `a_root_stepped_forward_on_the_split_clocks_is_clean` (the model
+  counterparts of C7-H1's `locks-locker-step-back` and
+  `locks-root-step-forward`; one step of up to 3 ticks of exactly that node
+  and direction, margins 1).
+
+What the spec's table says and what the checker found, so the next reader does
+not look again:
+
+- A disciplined wall catches a slow oscillator up: the honour reading's `jump`
+  follows the wall, so HONOUR is safe against a slow oscillator whatever the
+  budget, and the rate pairs on the honour side need an undisciplined host
+  (`wall_follows_rate`: the `locks` pair above). The waiter's side shows a rate
+  with a disciplined wall (a fast oscillator makes WAIT over-count): the
+  `cto` and the first `locks` pair. (The simulator found the same: its `Suspend`
+  and drift configurations are in the first C7a commit.)
+- A staircase oscillator gains its ticks all at once, so no budget makes the
+  readings exact at one-tick resolution: the budget covers the rate up to a
+  tick of rounding. The violating variants therefore run with margins of 0 or
+  1 where the spec's text has 1, and the clean variants hold at those same
+  margins; `deleg_ttl 8` and the delegate's margin 0 instead of `deleg_ttl 6`
+  and 1 (at the spec's numbers no budget-0 violation exists at one-tick
+  resolution: the holder's outwait still ends with the delegate's window).
+- The beat cap's end-to-end search finds no violation: three grids of 12, 72
+  and 60 cells (periods 2 and 4, rates fixed per node, leases 4 to 10,
+  delegation TTLs 2 to 5, margins 0 and 1, with no span and with spans 0 to
+  3), each cell a complete search of up to 12 M states, all clean, with the
+  cap computed and capping in them (`floor_capped`, `cap_computed`); the
+  violation needs a renewal about 5 ticks after the beat, a takeover near the
+  renewed lease's end and a floor that passes about 10 ticks later, beyond
+  what the search reaches. The pair is a trace over every renewal tick
+  instead (as the naive cap's tests are): with rates and no span the
+  successor's floor ends up to 1 tick before the old holder stops using its
+  renewed lease (`floor_shortfall`, `grace_shortfall`), with the span never.
+  That is the model evidence for §1.3.1 at its resolution; the simulator's
+  `fast-takeover-holder-rate-fast` is the end-to-end one.
+
+### Verification
+
+On the build box (release, `-j 2`, one job at a time, the machine otherwise
+idle for the model runs):
+
+- `cargo fmt --all -- --check`; `cargo clippy -p constellation-model
+  --all-targets -- -D warnings`: clean.
+- The whole model suite, `--test-threads=2`, before (e5e7c20) and after, per
+  test binary: passed/ignored, peak RSS (GB), seconds.
+
+  | binary | before | after |
+  |---|---|---|
+  | lib | 5 / 0, 0.01, 0 | 5 / 0, 0.01, 0 |
+  | backup | 7 / 1, 7.33, 24 | 7 / 1, 7.33, 28 |
+  | `cto` | 24 / 4, 8.15 (8.11, 8.13, 8.27 again), 112 | 32 / 4, 8.32 (8.35, 8.54, 8.54, 8.73 on earlier builds of the same code), 162 |
+  | delegation | 20 / 1, 0.68, 10 | 20 / 1, 0.70, 10 |
+  | flex_epochs | 21 / 3, 1.30, 34 | 21 / 3, 1.22, 31 |
+  | holder_side | 4 / 2, 0.52, 9 | 4 / 2, 0.52, 8 |
+  | hotdir | 9 / 0, 0.76, 4 | 9 / 0, 0.76, 4 |
+  | inbox | 9 / 2, 0.27, 4 | 9 / 2, 0.27, 4 |
+  | `locks` | 52 / 3, 5.98, 363 | 62 / 3, 5.49, 387 |
+  | positions | 9 / 1, 1.12, 32 | 9 / 1, 1.12, 28 |
+  | today_bugs | 7 / 1, 2.10, 37 | 7 / 1, 2.10, 34 |
+
+  Every old test keeps its verdict; the 8 new `cto` tests and the 10 new `locks` tests
+  are the pairs above. The
+  peak memory of the whole run is `cto`'s, and it is what the budgets
+  protect: the searches' budgets are unchanged (`CAP`, the beat-cap
+  budgets), the new ones finish at 1 to 4 M states. Each heavy search's own
+  peak (run alone) is 0.9 to 3 % higher than before (`State` is 24 bytes
+  bigger for `cto`, 32 for `locks`: the clocks' `Vec<Clk>` is the same
+  allocation class as the offsets', the rest is the beat frontier and two
+  bytes each of `Reg` and the lease), the single-threaded run of the whole
+  binary peaks at 5.69 GB against 5.77 before, and the two-thread peak,
+  which is the two largest searches the scheduler pairs, moved from 8.1–8.3 to
+  8.3–8.7 GB (3 to 7 %). Putting the frontier behind an `Option<Box<..>>`
+  (one word) made the two-thread peak worse (9.8–10.2 GB, a different
+  pairing), as did serialising the big searches with a mutex (9.2–10.4); the
+  measured best is the plain `Vec`. Nothing near the 20–29 GB the older
+  notes quote: that was before the beat-cap budgets were cut.

@@ -1323,3 +1323,251 @@ fn deep_fast_takeover_under_drift() {
 fn none_is_no_node() {
     assert_eq!(NONE, u8::MAX);
 }
+
+// ---- plan 43 C7a: rate, and the honour/wait/wall split ----
+//
+// The models' clocks (`constellation_model::clk`): a node's oscillator gains
+// or loses `rate` ticks every `rate_period` real ticks; its wait reading
+// runs slow, and its honour reading fast, by the design's `rate_budget`
+// (the code's rho); `clock_split` puts each check on the reading the code
+// takes it on. The budget covers the staircase's rounding up to a tick, so
+// the clean variants keep a margin where the violating ones have none.
+
+/// The owner (root, node 0) records and outwaits grants on its wait clock:
+/// with every oscillator within a quarter of its rate and no budget, a fast
+/// owner ends its outwait of a locker it cannot reach `(8 + 1) / 1.25 = 7.2`
+/// ticks after the grant, while the locker honours its grant (margin 0) for 8:
+/// the next node is granted the lock under the first one's I/O. One
+/// message may be lost.
+fn rated_owner(budget: i16) -> LockModel {
+    LockModel {
+        rate_period: 4,
+        max_rate: 1,
+        init_rates: Some(vec![1, 0, 0]),
+        rate_budget: budget,
+        clock_split: true,
+        seq_margin: 1,
+        node_margin: 0,
+        lease_margin: 3,
+        lease_ttl: 30,
+        lock_ttl: 8,
+        max_drops: 1,
+        max_tick: 11,
+        max_renews: 0,
+        ..LockModel::design(contend())
+    }
+}
+
+#[test]
+fn locks_rate_beyond_the_budget_violates() {
+    assert_violates("locks-rate-no-budget", &rated_owner(0));
+}
+
+/// The same with the budget: the owner's wait reading runs slow by it.
+#[test]
+fn locks_rate_within_the_budget_is_clean() {
+    assert_clean(
+        "locks-rate-within-budget",
+        &rated_owner(1),
+        &["all_ops_done", "recall_expired"],
+    );
+}
+
+/// An undisciplined host: its wall follows its oscillator, so nothing
+/// catches a slow oscillator up. The locker (node 1) is slow by a quarter,
+/// its margin 1 and the owner's 0: with no budget its honour reading
+/// under-counts and it honours its grant `(8 - 1) / 0.75 = 9.3` ticks, past the
+/// owner's outwait of 8, and writes under the next grant. No takeover, so no
+/// compare across nodes.
+fn undisciplined_locker(budget: i16) -> LockModel {
+    LockModel {
+        rate_period: 4,
+        max_rate: 1,
+        init_rates: Some(vec![0, -1, 0]),
+        rate_budget: budget,
+        clock_split: true,
+        wall_follows_rate: true,
+        seq_margin: 0,
+        node_margin: 1,
+        lease_margin: 3,
+        lease_ttl: 30,
+        lock_ttl: 8,
+        max_drops: 1,
+        max_tick: 11,
+        max_renews: 0,
+        ..LockModel::design(contend())
+    }
+}
+
+#[test]
+fn locks_holder_rate_on_an_undisciplined_host_beyond_the_budget_violates() {
+    assert_violates("locks-undisciplined-no-budget", &undisciplined_locker(0));
+}
+
+/// With the budget the honour reading runs fast by it: it never
+/// under-counts, and the window ends in time.
+#[test]
+fn locks_holder_rate_on_an_undisciplined_host_within_the_budget_is_clean() {
+    assert_clean(
+        "locks-undisciplined-within-budget",
+        &undisciplined_locker(1),
+        &["all_ops_done", "recall_expired"],
+    );
+}
+
+/// How many ticks before the old root stops using its lease the backup's
+/// grace ends, when the root (node 0, slow oscillator) beat to the backup
+/// (node 2, fast) at t = 0 and renewed its lease at tick `t_r`, and the
+/// backup took the lease over two ticks before the root's own window ended.
+/// Positive: the cap ended the grace inside the root's window (see
+/// `cto.rs`'s `floor_shortfall`). `None` if the trace does not exist.
+fn grace_shortfall(m: &LockModel, t_r: u8) -> Option<i16> {
+    fn enabled(m: &LockModel, s: &State, a: &Action) -> bool {
+        let mut e = Vec::new();
+        m.actions(s, &mut e);
+        e.contains(a)
+    }
+    fn to_tick(m: &LockModel, mut s: State, t: u8) -> Option<State> {
+        while s.t < t {
+            if !enabled(m, &s, &Action::Tick) {
+                return None;
+            }
+            s = step(m, &s, Action::Tick);
+        }
+        Some(s)
+    }
+    let mut s = m.init_states().remove(0);
+    s = step(m, &s, Action::Beat(0));
+    s = to_tick(m, s, t_r)?;
+    if !enabled(m, &s, &Action::RenewLease(0)) {
+        return None;
+    }
+    s = step(m, &s, Action::RenewLease(0));
+    // The root stops using its lease when `RenewLease` is no longer offered.
+    let mut probe = s.clone();
+    while enabled(m, &probe, &Action::RenewLease(0)) {
+        probe = step(m, &probe, Action::Tick);
+    }
+    let root_end = probe.t;
+    s = to_tick(m, s, root_end.saturating_sub(2))?;
+    s = step(m, &s, Action::Takeover(2));
+    s.nodes[2].floor?;
+    while !enabled(m, &s, &Action::FloorPassed(2)) {
+        if !enabled(m, &s, &Action::Tick) {
+            return None;
+        }
+        s = step(m, &s, Action::Tick);
+    }
+    Some(root_end as i16 - s.t as i16)
+}
+
+fn capped_by_beats(span: Option<i16>) -> LockModel {
+    LockModel {
+        backup: 2,
+        replicate: false,
+        grace: true,
+        beat_cap: true,
+        allow_renew: true,
+        rate_period: 4,
+        max_rate: 1,
+        init_rates: Some(vec![-1, 0, 1]),
+        rate_budget: 1,
+        clock_split: true,
+        beat_span: span,
+        lease_ttl: 10,
+        lock_ttl: 4,
+        takeover_window: 2,
+        max_drops: 0,
+        max_tick: 40,
+        ..LockModel::design(two_lockers())
+    }
+}
+
+/// As `cto.rs`'s pair: a beat sent before the renewal that set `X` measures an
+/// interval the root's slow wait clock under-counts; with no span the cap
+/// (the least lag of all the beats) ends the grace before the root's renewed
+/// window ends.
+#[test]
+fn beat_cap_rate_before_the_renewal_violates_without_the_span() {
+    let m = capped_by_beats(None);
+    let worst = (2..=9u8)
+        .filter_map(|t_r| grace_shortfall(&m, t_r))
+        .max()
+        .expect("a trace");
+    println!("beat cap, no span: the grace ends up to {worst} tick(s) before the root's window");
+    assert!(
+        worst > 0,
+        "the cap never ended the grace inside the root's window (worst {worst})"
+    );
+}
+
+/// With the span the early beats are left out: the grace is the bound.
+#[test]
+fn beat_cap_rate_with_the_span_is_clean() {
+    let m = capped_by_beats(Some(1));
+    let worst = (2..=9u8)
+        .filter_map(|t_r| grace_shortfall(&m, t_r))
+        .max()
+        .expect("a trace");
+    assert!(
+        worst <= 0,
+        "the grace ended {worst} tick(s) inside the root's window"
+    );
+}
+
+/// One step of up to 3 ticks of one node's wall clock, the design's margins
+/// of 1 and no takeover (no wall compare across nodes).
+fn stepped(split: bool, node: u8, dir: i8) -> LockModel {
+    LockModel {
+        clock_split: split,
+        max_offset: 3,
+        max_jumps: 1,
+        step_node: Some(node),
+        step_dir: dir,
+        seq_margin: 1,
+        node_margin: 1,
+        lease_margin: 3,
+        lease_ttl: 30,
+        lock_ttl: 4,
+        max_drops: 1,
+        max_tick: 9,
+        max_renews: 0,
+        ..LockModel::design(contend())
+    }
+}
+
+/// The locker (node 1) stepped back: on the wall clock it honours its grant 3
+/// ticks past the owner's outwait and writes under the next grant (the model
+/// of `locks-locker-step-back`).
+#[test]
+fn a_locker_stepped_back_on_the_wall_clock_violates() {
+    assert_violates("locker-step-back-wall", &stepped(false, 1, -1));
+}
+
+/// On its honour clock a backward step moves nothing: clean.
+#[test]
+fn a_locker_stepped_back_on_the_split_clocks_is_clean() {
+    assert_clean(
+        "locker-step-back-split",
+        &stepped(true, 1, -1),
+        &["all_ops_done", "recall_expired"],
+    );
+}
+
+/// The root (node 0) stepped forward: on the wall clock it ends its outwait of
+/// a grant 3 ticks early and grants the next node under the locker's I/O
+/// (the model of `locks-root-step-forward`).
+#[test]
+fn a_root_stepped_forward_on_the_wall_clock_violates() {
+    assert_violates("root-step-forward-wall", &stepped(false, 0, 1));
+}
+
+/// On its wait clock no step moves anything: clean.
+#[test]
+fn a_root_stepped_forward_on_the_split_clocks_is_clean() {
+    assert_clean(
+        "root-step-forward-split",
+        &stepped(true, 0, 1),
+        &["all_ops_done", "recall_expired"],
+    );
+}

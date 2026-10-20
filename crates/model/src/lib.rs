@@ -336,6 +336,7 @@
 //!     history events and are not linearizability-checked.
 
 pub mod backup;
+pub mod clk;
 pub mod cto;
 pub mod delegation;
 pub mod flex;

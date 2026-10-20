@@ -123,20 +123,36 @@
 //! model's root has no takeover gate, so the unknown guard never arises
 //! here). The backup's fast takeover of that root and epoch ends its
 //! grace at `min(bound, X + lag + seq_margin)`, `X = max(old expiry,
-//! named, guard)`; none if that has passed. No span filter: see
-//! `cto.rs`. `beat_cap_from_named_expiry` is the naive variant (`X` =
+//! named, guard)`; none if that has passed. The span filter on the beats
+//! (`beat_span`) is the code's (`M/(4ρ)`, see `cto.rs`). `beat_cap_from_named_expiry` is the naive variant (`X` =
 //! what the beats named), which must be found violating: a root that
 //! renews after its last beat.
 //!
-//! Plan 43 C7-H1: a wall-clock *step* of a node (a jump past `D` that
-//! stays) is outside this model, whose clocks move only within the
-//! modelled bound. The implementation does not rely on the model for it: a
-//! holder measures its windows (its lease, its grants, its delegations)
-//! on an honour clock that a backward step cannot move and a forward step
-//! only advances (so a window ends early, never late), and the code's beat
-//! carries that clock's readings with its id (`Beat::guard_ms` and the
-//! other values are of one holder clock); the simulator's `ClockStep`
-//! faults and the core's unit tests carry that evidence.
+//! # Plan 43 C7a: the readings
+//!
+//! Each node reads three clocks of its one oscillator ([`crate::clk`]): WALL
+//! (what a step moves, what crosses nodes), HONOUR (a holder's rights: its
+//! lease, its grants, its delegation; never under-counts; follows a forward
+//! step once, ignores a backward one) and WAIT (an owner's table, outwaits
+//! and graces, the liveness timers; never over-counts; ignores every
+//! step), the last two scaled by the design's `rate_budget`. With
+//! `clock_split` off every check is on the wall reading (the design before
+//! C7-H1, so a step of a node moves every check it makes). Each former
+//! `local(i)` is now one of them:
+//!
+//! | Reading | Where (the code's) |
+//! |---|---|
+//! | HONOUR | a node's lease use (`usable_root`, `believes_root`), the probe freshness, the cap of a grant by the lease or the delegation (`ttl_at`), a node's cache (`honoured`, `Cache.until`, `renew_at`) and the `sent` it stamps, a delegate's tenure (`dtenure`), the holder's beats' end |
+//! | WAIT | the owner's table (`Grant.until`, `Park.recv`, `try_grant`, `Expire`, `Land`), graces (`floor`, `FloorPassed`, `grace_left`), the root's record of a delegation (`dgen`, `RecallByTtl`), the carried and restamped records at a move, a beat's `sent` and arrival (the lag) and the lease end it names (`expires_w`) |
+//! | WALL | a TTL claimant's compare with the register's expiry (`ttl_claimable`, `fast`: a stamp of another node's clock, plan 43 C7b's), the expiry written to the register (`Reg::expires`) |
+//!
+//! `Jump(i, d)` replaces `off[i]` (a wall step); under the split it moves
+//! WALL alone. `step_node` and `step_dir` restrict which node steps and which
+//! way (the locker back, the root forward). A wall-clock step is no longer
+//! outside this model: `tests/locks.rs` has the model counterparts of the
+//! simulator's `locks-locker-step-back` and `locks-root-step-forward`. The
+//! code's beat carries the holder's wait-clock readings with its clock id
+//! (`Beat::guard_ms` and the other values are of one holder clock).
 //!
 //! # The property
 //!
@@ -152,8 +168,11 @@
 //!
 //! # The drift margin (as in `cto`)
 //!
-//! Every clock is within `D` of real time, so a duration measured on one
-//! clock is off by at most `2D`. A node honours until real time
+//! *Offsets* (cross-node compares, plan 43 C7b's): every clock is within `D`
+//! of real time, so a duration measured on one clock is off by at most `2D`.
+//! *Rate* (plan 43 C7a): the budget makes each local window exact (up to a
+//! tick of the staircase's rounding), and the margin is slack; see
+//! `cto`'s "Plan 43 C7a: the readings". The offsets' arguments: A node honours until real time
 //! `≤ s + ttl − node_margin + 2D`; the owner considers the grant gone
 //! from `≥ g + ttl + seq_margin − 2D` with `g ≥ s`: safe when
 //! `node_margin + seq_margin > 4D`. A restamp at a move or takeover is
@@ -351,6 +370,36 @@ pub struct LockModel {
     pub beat_cap_from_named_expiry: bool,
     /// How a moved grant is stamped at its receiver.
     pub move_stamp: MoveStamp,
+    // ---- plan 43 C7a: rate and the honour/wait/wall split (see `clk`) ----
+    /// A node's oscillator gains or loses `rate[i]` ticks every
+    /// `rate_period` real ticks (`rate[i]` in `[-max_rate, max_rate]`,
+    /// chosen at start; every combination when `explore_rates`). 0: no
+    /// rate error.
+    pub rate_period: i16,
+    pub max_rate: i16,
+    pub explore_rates: bool,
+    pub init_rates: Option<Vec<i16>>,
+    /// The design's rate budget, in ticks per `rate_period` (the code's
+    /// rho): the wait reading runs slow, and the honour reading fast, by it.
+    pub rate_budget: i16,
+    /// Plan 43 C7-H1's split: a holder judges its rights on its honour
+    /// reading (its lease, its grants, its delegation), an owner its table,
+    /// outwaits and graces on its wait reading, cross-node values on the
+    /// wall reading. `false`: every check on the wall reading (the design
+    /// before C7-H1).
+    pub clock_split: bool,
+    /// An undisciplined host: the wall follows the oscillator too.
+    pub wall_follows_rate: bool,
+    /// Which node steps, and which way (plan 43 C7a): `Jump` is offered only
+    /// for `step_node` (`None`: any node) and only backwards (`step_dir <
+    /// 0`) or forwards (`step_dir > 0`) of the node's present offset (`0`:
+    /// either).
+    pub step_node: Option<u8>,
+    pub step_dir: i8,
+    /// The span filter of the beat cap: only beats sent at most this many
+    /// ticks before the end `X` the cap counts to are used. `None`: no
+    /// filter.
+    pub beat_span: Option<i16>,
 }
 
 impl LockModel {
@@ -400,6 +449,16 @@ impl LockModel {
             beat_cap: false,
             beat_cap_from_named_expiry: false,
             move_stamp: MoveStamp::Restamp,
+            rate_period: 0,
+            max_rate: 0,
+            explore_rates: false,
+            init_rates: None,
+            rate_budget: 0,
+            clock_split: false,
+            wall_follows_rate: false,
+            step_node: None,
+            step_dir: 0,
+            beat_span: None,
         }
     }
 
@@ -423,13 +482,27 @@ impl LockModel {
     fn n(&self) -> usize {
         self.scripts.len()
     }
+
+    fn spec(&self) -> crate::clk::ClockSpec {
+        crate::clk::ClockSpec {
+            rate_period: self.rate_period,
+            rate_budget: self.rate_budget,
+            clock_split: self.clock_split,
+            wall_follows_rate: self.wall_follows_rate,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Reg {
     pub holder: u8,
     pub epoch: u8,
+    /// The lease's end on the writer's wall clock (what a claimant compares
+    /// its own wall reading with).
     pub expires: i16,
+    /// Plan 43 C7a: the same end on the holder's wait clock (the lease
+    /// body's `holder_wait_ms`: what the beat cap counts to).
+    pub expires_w: i16,
     /// The holder released it (a graceful shutdown): any node may take
     /// it over at once.
     pub released: bool,
@@ -494,7 +567,9 @@ pub enum NodeOp {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Node {
-    pub lease: Option<(u8, i16)>,
+    /// `(epoch, the lease's end on this node's honour clock, on its wait
+    /// clock)`; with no split the one end of the one clock.
+    pub lease: Option<(u8, i16, i16)>,
     pub pc: u8,
     pub op: NodeOp,
     // ---- application / node side ----
@@ -653,10 +728,15 @@ pub const SAW_CARRIED_OUTWAITED: u32 = 1 << 20;
 /// Carried over two moves (the sim's seed 15: delegate → root → delegate).
 pub const SAW_CARRIED_TWICE: u32 = 1 << 21;
 
+/// A beat the backup heard: `(holder, epoch, sent, lag)`.
+pub type BeatLag = (u8, u8, i16, i16);
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
     pub t: u8,
-    pub off: Vec<i16>,
+    /// Each node's clock (plan 43 C7a: wall offset, initial offset, rate,
+    /// honour jump).
+    pub clk: Vec<crate::clk::Clk>,
     pub jumps: u8,
     pub drops: u8,
     pub reg: Reg,
@@ -673,30 +753,48 @@ pub struct State {
     /// `(node, its grant id, the conflicting later grant id)`.
     pub violation: Option<(u8, u8, u8)>,
     pub saw: u32,
+    /// Plan 43 C7a (`beat_span`): the beats the backup heard, `(holder,
+    /// epoch, sent, lag)`, on the Pareto frontier (a later beat with a lag
+    /// at most an earlier one's leaves the earlier one out: it is in every
+    /// window the earlier one is). Empty without a span.
+    pub beat_lags: Vec<BeatLag>,
 }
 
 impl State {
-    fn local(&self, i: usize) -> i16 {
-        self.t as i16 + self.off[i]
+    fn wall(&self, cfg: &LockModel, i: usize) -> i16 {
+        cfg.spec().wall(self.t, &self.clk[i])
+    }
+
+    /// A holder's rights (its lease, its grants, its delegation) are judged
+    /// on this reading.
+    fn honour(&self, cfg: &LockModel, i: usize) -> i16 {
+        cfg.spec().honour(self.t, &self.clk[i])
+    }
+
+    /// An owner's table and outwaits, its graces and the liveness timers are
+    /// on this one.
+    fn wait(&self, cfg: &LockModel, i: usize) -> i16 {
+        cfg.spec().wait(self.t, &self.clk[i])
     }
 
     fn usable_root(&self, cfg: &LockModel, i: usize) -> bool {
-        let Some((epoch, expires)) = self.nodes[i].lease else {
+        let Some((epoch, expires_h, _)) = self.nodes[i].lease else {
             return false;
         };
-        self.local(i) < expires - cfg.lease_margin
+        self.honour(cfg, i) < expires_h - cfg.lease_margin
             && self.reg.holder == i as u8
             && self.reg.epoch == epoch
     }
 
-    /// Node `i` believes it holds a usable root lease (its own clock, no
-    /// look at the register: a lock grant is not a log append, so nothing
-    /// but the lease discipline and the probe fences a deposed root).
+    /// Node `i` believes it holds a usable root lease (its own honour
+    /// clock, no look at the register: a lock grant is not a log append, so
+    /// nothing but the lease discipline and the probe fences a deposed
+    /// root).
     fn believes_root(&self, cfg: &LockModel, i: usize) -> bool {
-        let Some((_, expires)) = self.nodes[i].lease else {
+        let Some((_, expires_h, _)) = self.nodes[i].lease else {
             return false;
         };
-        self.local(i) < expires - cfg.lease_margin
+        self.honour(cfg, i) < expires_h - cfg.lease_margin
     }
 
     /// The usable end of node `i`'s authority over `X`'s table, in its
@@ -717,16 +815,16 @@ impl State {
                 if cfg.backup != NONE
                     && cfg.probe_freshness
                     && (!renewal || cfg.renew_probe_freshness)
-                    && self.local(i) - self.nodes[i].last_probe >= cfg.takeover_window
+                    && self.honour(cfg, i) - self.nodes[i].last_probe >= cfg.takeover_window
                 {
                     return None;
                 }
-                let (_, expires) = self.nodes[i].lease?;
-                Some(expires - cfg.lease_margin)
+                let (_, expires_h, _) = self.nodes[i].lease?;
+                Some(expires_h - cfg.lease_margin)
             }
             Owner::Delegate(d) if d as usize == i => {
                 let until = self.nodes[i].dtenure?;
-                (self.local(i) < until).then_some(until)
+                (self.honour(cfg, i) < until).then_some(until)
             }
             _ => None,
         }
@@ -779,9 +877,9 @@ impl State {
         self.nodes[i].op = NodeOp::Idle;
     }
 
-    fn honoured(&self, i: usize) -> Option<Cache> {
+    fn honoured(&self, cfg: &LockModel, i: usize) -> Option<Cache> {
         let c = self.nodes[i].cache?;
-        (self.local(i) < c.until).then_some(c)
+        (self.honour(cfg, i) < c.until).then_some(c)
     }
 
     fn mirror_push(&mut self, cfg: &LockModel, h: usize) {
@@ -809,7 +907,9 @@ impl State {
         ttl: i16,
         base: i16,
     ) -> u8 {
-        let now = self.local(h);
+        // The table is the owner's wait clock's (`base` is a wait stamp of
+        // the request's arrival).
+        let now = self.wait(cfg, h);
         let id = self.fresh_id();
         self.nodes[h].table.retain(|g| g.node != node);
         self.nodes[h].table.push(Grant {
@@ -830,7 +930,9 @@ impl State {
     fn ttl_at(&self, cfg: &LockModel, h: usize, until: i16) -> i16 {
         let mut ttl = cfg.lock_ttl;
         if cfg.cap_by_lease {
-            ttl = ttl.min(until - self.local(h));
+            // `until` is the end of the owner's authority on its honour
+            // clock (its lease, its delegation).
+            ttl = ttl.min(until - self.honour(cfg, h));
         }
         ttl
     }
@@ -846,7 +948,7 @@ impl State {
         sent: i16,
         base: i16,
     ) -> bool {
-        let now = self.local(h);
+        let now = self.wait(cfg, h);
         self.nodes[h].table.retain(|g| g.until > now);
         if self.nodes[h].floor.is_some_and(|f| now < f) {
             return false;
@@ -958,7 +1060,7 @@ impl State {
         }
         self.nodes[r]
             .floor
-            .map_or(0, |f| (f - self.local(r)).max(0))
+            .map_or(0, |f| (f - self.wait(cfg, r)).max(0))
     }
 
     /// Root `r`: the generation ended; its copies of what it handed come
@@ -971,7 +1073,7 @@ impl State {
         if !cfg.reinstate_handed {
             return;
         }
-        let now = self.local(r);
+        let now = self.wait(cfg, r);
         for h in handed {
             // A grant here of the same node, or a conflicting one, is
             // newer: whoever made it knew the copy (the delegate serves
@@ -994,7 +1096,7 @@ impl State {
     /// Notes what the move found of each carried grant at its holder and
     /// in flight.
     fn carry_of(&mut self, cfg: &LockModel, h: usize, table: &[Grant]) -> Vec<(u8, i16)> {
-        let now = self.local(h);
+        let now = self.wait(cfg, h);
         let mut carry = Vec::new();
         for g in table.iter().filter(|g| cfg.carries(g)) {
             let left = match cfg.move_stamp {
@@ -1037,7 +1139,7 @@ impl State {
         table: Vec<Grant>,
         carry: &[(u8, i16)],
     ) -> Vec<(Grant, u32)> {
-        let now = self.local(h);
+        let now = self.wait(cfg, h);
         let restamp = now + cfg.lock_ttl + cfg.seq_margin;
         let mut out = Vec::with_capacity(table.len());
         for g in table {
@@ -1131,6 +1233,32 @@ impl Model for LockModel {
     fn init_states(&self) -> Vec<State> {
         let n = self.n();
         let off = self.init_offsets.clone().unwrap_or(vec![0; n]);
+        crate::clk::initial_rates(n, self.max_rate, self.explore_rates, &self.init_rates)
+            .into_iter()
+            .map(|rate| self.init_state(&off, &rate))
+            .collect()
+    }
+
+    fn actions(&self, s: &State, actions: &mut Vec<Action>) {
+        self.actions_of(s, actions)
+    }
+
+    fn next_state(&self, last: &State, action: Action) -> Option<State> {
+        self.next_state_of(last, action)
+    }
+
+    fn properties(&self) -> Vec<Property<Self>> {
+        self.properties_of()
+    }
+
+    fn within_boundary(&self, s: &State) -> bool {
+        s.t <= self.max_tick
+    }
+}
+
+impl LockModel {
+    fn init_state(&self, off: &[i16], rate: &[i16]) -> State {
+        let n = self.n();
         let mut nodes: Vec<Node> = (0..n)
             .map(|_| Node {
                 lease: None,
@@ -1158,17 +1286,18 @@ impl Model for LockModel {
             .collect();
         let h = self.initial_holder as usize;
         let expires = off[h] + self.lease_ttl;
-        nodes[h].lease = Some((1, expires));
+        nodes[h].lease = Some((1, expires, expires));
         nodes[h].last_probe = off[h];
-        vec![State {
+        State {
             t: 0,
-            off,
+            clk: crate::clk::initial_clocks(off, rate),
             jumps: 0,
             drops: 0,
             reg: Reg {
                 holder: h as u8,
                 epoch: 1,
                 expires,
+                expires_w: expires,
                 released: false,
             },
             owner: Owner::Root,
@@ -1181,10 +1310,11 @@ impl Model for LockModel {
             issued: Vec::new(),
             violation: None,
             saw: 0,
-        }]
+            beat_lags: Vec::new(),
+        }
     }
 
-    fn actions(&self, s: &State, actions: &mut Vec<Action>) {
+    fn actions_of(&self, s: &State, actions: &mut Vec<Action>) {
         if s.violation.is_some() {
             return;
         }
@@ -1194,8 +1324,16 @@ impl Model for LockModel {
         }
         if s.jumps < self.max_jumps {
             for i in 0..n {
+                if self.step_node.is_some_and(|n| n as usize != i) {
+                    continue;
+                }
                 for d in -self.max_offset..=self.max_offset {
-                    if d != s.off[i] {
+                    let dir_ok = match self.step_dir {
+                        0 => true,
+                        x if x < 0 => d < s.clk[i].off,
+                        _ => d > s.clk[i].off,
+                    };
+                    if d != s.clk[i].off && dir_ok {
                         actions.push(Action::Jump(i as u8, d));
                     }
                 }
@@ -1220,12 +1358,17 @@ impl Model for LockModel {
         for i in 0..n {
             let node = &s.nodes[i];
             let iu = i as u8;
-            let now = s.local(i);
+            // A holder's liveness (its probe, its lease, its renewals) is on
+            // its honour clock, an owner's table, outwaits and graces on its
+            // wait clock, a claimant's compare with the register on its wall.
+            let now_h = s.honour(self, i);
+            let now = s.wait(self, i);
+            let now_wall = s.wall(self, i);
             if s.usable_root(self, i) {
                 if self.allow_renew {
                     actions.push(Action::RenewLease(iu));
                 }
-                if self.backup != NONE && now - node.last_probe >= self.takeover_window {
+                if self.backup != NONE && now_h - node.last_probe >= self.takeover_window {
                     actions.push(Action::Probe(iu));
                 }
                 if self.delegate != NONE
@@ -1259,13 +1402,13 @@ impl Model for LockModel {
                 actions.push(Action::Probe(iu));
             }
             if self.beat_cap && self.backup != NONE && self.backup != iu {
-                if let Some((_, expires)) = node.lease {
-                    if now < expires {
+                if let Some((_, expires_h, _)) = node.lease {
+                    if now_h < expires_h {
                         actions.push(Action::Beat(iu));
                     }
                 }
             }
-            let ttl_claimable = self.ttl_takeover && now >= s.reg.expires;
+            let ttl_claimable = self.ttl_takeover && now_wall >= s.reg.expires;
             let fast = self.backup == iu && s.reg.holder != iu;
             let released = self.released_takeover && s.reg.released;
             if (ttl_claimable || fast || released) && anyone_wants && s.reg.epoch <= self.max_epoch
@@ -1305,7 +1448,9 @@ impl Model for LockModel {
             // acquires afresh. (A late reclaim of a lapsed grant during a
             // successor's grace is the counterexample the checker found:
             // the old owner had expired it and granted another node.)
-            if s.honoured(i).is_some_and(|c| now >= c.renew_at) && node.renews < self.max_renews {
+            if s.honoured(self, i).is_some_and(|c| now_h >= c.renew_at)
+                && node.renews < self.max_renews
+            {
                 let in_flight = s.net.iter().any(|m| {
                     matches!(m, Msg::Renew { from, .. } if *from == iu)
                         || matches!(m, Msg::RenewAck { to, .. } if *to == iu)
@@ -1321,7 +1466,8 @@ impl Model for LockModel {
                         let ok = match op {
                             Op::Lock(_) => node.held.is_none(),
                             Op::Io => {
-                                node.held.is_some() && (!self.fencing || s.honoured(i).is_some())
+                                node.held.is_some()
+                                    && (!self.fencing || s.honoured(self, i).is_some())
                             }
                             Op::Unlock => node.held.is_some(),
                         };
@@ -1345,13 +1491,19 @@ impl Model for LockModel {
         }
     }
 
-    fn next_state(&self, last: &State, action: Action) -> Option<State> {
+    fn next_state_of(&self, last: &State, action: Action) -> Option<State> {
         let mut s = last.clone();
         match action {
-            Action::Tick => s.t += 1,
+            Action::Tick => {
+                s.t += 1;
+                let (t, spec) = (s.t, self.spec());
+                spec.follow_wall(t, &mut s.clk);
+            }
             Action::Jump(i, d) => {
-                s.off[i as usize] = d;
+                s.clk[i as usize].off = d;
                 s.jumps += 1;
+                let (t, spec) = (s.t, self.spec());
+                spec.follow_wall(t, &mut s.clk);
             }
             Action::Drop(k) => {
                 s.net.remove(k);
@@ -1363,14 +1515,24 @@ impl Model for LockModel {
             }
             Action::RenewLease(i) => {
                 let i = i as usize;
-                let expires = s.local(i) + self.lease_ttl;
-                s.reg.expires = expires;
-                s.nodes[i].lease = Some((s.reg.epoch, expires));
-                s.nodes[i].last_probe = s.local(i);
+                // Three stamps of one instant: the register's (wall), the
+                // holder's own (honour: what it honours the lease until;
+                // wait: what its beats name).
+                s.reg.expires = s.wall(self, i) + self.lease_ttl;
+                s.reg.expires_w = s.wait(self, i) + self.lease_ttl;
+                s.nodes[i].lease = Some((
+                    s.reg.epoch,
+                    s.honour(self, i) + self.lease_ttl,
+                    s.wait(self, i) + self.lease_ttl,
+                ));
+                s.nodes[i].last_probe = s.honour(self, i);
             }
             Action::Takeover(i) => {
                 let i = i as usize;
-                let now = s.local(i);
+                // The claimant's wall (the compare with the old expiry, the
+                // register's stamp), honour (its own lease window, its
+                // probe) and wait (its table, its graces) readings.
+                let (now_wall, now_h, now) = (s.wall(self, i), s.honour(self, i), s.wait(self, i));
                 let prev = s.reg;
                 // A takeover the backup's permit allowed is a fast one,
                 // whatever its clock says of the old expiry (a stamp of
@@ -1381,17 +1543,17 @@ impl Model for LockModel {
                 // takeovers explore no path without the grace (the code's
                 // floor-less TTL path of a backup is the sim's).
                 let permitted = self.backup == i as u8 && prev.holder != i as u8;
-                let fast = permitted || now < prev.expires;
+                let fast = permitted || now_wall < prev.expires;
                 let epoch = prev.epoch + 1;
-                let expires = now + self.lease_ttl;
                 s.reg = Reg {
                     holder: i as u8,
                     epoch,
-                    expires,
+                    expires: now_wall + self.lease_ttl,
+                    expires_w: now + self.lease_ttl,
                     released: false,
                 };
-                s.nodes[i].lease = Some((epoch, expires));
-                s.nodes[i].last_probe = now;
+                s.nodes[i].lease = Some((epoch, now_h + self.lease_ttl, now + self.lease_ttl));
+                s.nodes[i].last_probe = now_h;
                 s.nodes[i].parks.clear();
                 s.nodes[i].floor = None;
                 // The delegation, if any, is inherited as is (M11): the
@@ -1438,13 +1600,32 @@ impl Model for LockModel {
                             s.nodes[i]
                                 .heard
                                 .filter(|h| h.0 == prev.holder && h.1 == prev.epoch)
-                                .map(|(_, _, lag, named, guard)| {
+                                .and_then(|(_, _, lag, named, guard)| {
+                                    // `X`, the holder's wait-clock end, all
+                                    // of one clock.
                                     let x = if self.beat_cap_from_named_expiry {
                                         named
                                     } else {
-                                        prev.expires.max(named).max(guard)
+                                        prev.expires_w.max(named).max(guard)
                                     };
-                                    x + lag + self.seq_margin
+                                    // The beats' lag, over those sent within
+                                    // `beat_span` of `X` when there is a
+                                    // span (the earliest in the window has
+                                    // the least lag on the frontier).
+                                    let lag = match self.beat_span {
+                                        None => Some(lag),
+                                        Some(span) => s
+                                            .beat_lags
+                                            .iter()
+                                            .filter(|(holder, epoch, sent, _)| {
+                                                *holder == prev.holder
+                                                    && *epoch == prev.epoch
+                                                    && (0..=span).contains(&(x - sent))
+                                            })
+                                            .map(|(.., lag)| *lag)
+                                            .min(),
+                                    };
+                                    lag.map(|lag| x + lag + self.seq_margin)
                                 })
                         } else {
                             None
@@ -1463,9 +1644,21 @@ impl Model for LockModel {
             Action::Beat(h) => {
                 let h = h as usize;
                 let b = self.backup as usize;
-                let (epoch, expires) = s.nodes[h].lease?;
-                let lag = s.local(b) - s.local(h);
+                // Sent on the holder's wait clock, arriving on the backup's:
+                // `at - sent`, the code's lag; it names the holder's
+                // wait-clock end and its grace (also wait).
+                let (epoch, _, expires) = s.nodes[h].lease?;
+                let (sent, at) = (s.wait(self, h), s.wait(self, b));
+                let lag = at - sent;
                 let guard = s.nodes[h].floor.unwrap_or(0);
+                if self.beat_span.is_some() {
+                    // The frontier of this holder's beats (a new epoch
+                    // starts the book over; a beat whose lag is at most an
+                    // earlier one's leaves that one out).
+                    let lags = &mut s.beat_lags;
+                    lags.retain(|(hh, e, _, l)| *hh == h as u8 && *e == epoch && *l < lag);
+                    lags.push((h as u8, epoch, sent, lag));
+                }
                 s.nodes[b].heard = Some(match s.nodes[b].heard {
                     Some((o, e, l, n, g)) if o == h as u8 && e == epoch => {
                         (o, e, l.min(lag), n.max(expires), g.max(guard))
@@ -1475,13 +1668,13 @@ impl Model for LockModel {
             }
             Action::Probe(i) => {
                 let i = i as usize;
-                let (mine, _) = s.nodes[i].lease?;
+                let (mine, ..) = s.nodes[i].lease?;
                 if s.reg.holder != i as u8 || s.reg.epoch != mine {
                     s.nodes[i].lease = None;
                     s.nodes[i].dgen = None;
                     s.depose_owner(i);
                 } else {
-                    s.nodes[i].last_probe = s.local(i);
+                    s.nodes[i].last_probe = s.honour(self, i);
                 }
             }
             Action::Start(i) => {
@@ -1489,7 +1682,7 @@ impl Model for LockModel {
                 let op = self.scripts[i][s.nodes[i].pc as usize];
                 match op {
                     Op::Lock(mode) => {
-                        if let Some(c) = s.honoured(i) {
+                        if let Some(c) = s.honoured(self, i) {
                             if c.mode.covers(mode) && !c.recalled {
                                 s.nodes[i].held = Some(mode);
                                 s.saw |= SAW_LOCAL_RELOCK;
@@ -1497,7 +1690,7 @@ impl Model for LockModel {
                                 return Some(s);
                             }
                         }
-                        let sent = s.local(i);
+                        let sent = s.honour(self, i);
                         s.nodes[i].op = NodeOp::Locking { mode, sent };
                         send_lock(self, &mut s, i);
                     }
@@ -1533,7 +1726,7 @@ impl Model for LockModel {
                 // refused (the application sees `EIO`), nothing written.
                 let o = s.current_owner();
                 let live = o != NONE && {
-                    let now = s.local(o as usize);
+                    let now = s.wait(self, o as usize);
                     s.nodes[o as usize]
                         .table
                         .iter()
@@ -1555,7 +1748,7 @@ impl Model for LockModel {
                 let NodeOp::Locking { mode, .. } = s.nodes[i].op else {
                     return None;
                 };
-                let sent = s.local(i);
+                let sent = s.honour(self, i);
                 s.nodes[i].op = NodeOp::Locking { mode, sent };
                 send_lock(self, &mut s, i);
             }
@@ -1564,7 +1757,7 @@ impl Model for LockModel {
                 let c = s.nodes[i].cache?;
                 let to = s.renew_target(self, i);
                 s.nodes[i].renews += 1;
-                let sent = s.local(i);
+                let sent = s.honour(self, i);
                 s.send(Msg::Renew {
                     from: i as u8,
                     to,
@@ -1580,7 +1773,7 @@ impl Model for LockModel {
             }
             Action::Expire(h) => {
                 let h = h as usize;
-                let now = s.local(h);
+                let now = s.wait(self, h);
                 let expired: Vec<Grant> = s.nodes[h]
                     .table
                     .iter()
@@ -1604,7 +1797,7 @@ impl Model for LockModel {
                 s.saw |= SAW_MOVE;
                 let table = std::mem::take(&mut s.nodes[r].table);
                 s.nodes[r].parks.clear();
-                s.nodes[r].dgen = Some(s.local(r) + self.deleg_ttl + self.seq_margin);
+                s.nodes[r].dgen = Some(s.wait(self, r) + self.deleg_ttl + self.seq_margin);
                 s.owner = Owner::Delegate(d as u8);
                 s.gen += 1;
                 if self.handoff_in_flight {
@@ -1620,7 +1813,7 @@ impl Model for LockModel {
                             Vec::new()
                         };
                     s.nodes[r].handoff_sent = self.move_state && !table.is_empty();
-                    let sent = s.local(d);
+                    let sent = s.honour(self, d);
                     let gen = s.gen;
                     let grace = s.grace_left(self, r);
                     let table = if self.move_state { table } else { Vec::new() };
@@ -1637,10 +1830,11 @@ impl Model for LockModel {
                 } else {
                     let grace = s.grace_left(self, r);
                     if grace > 0 {
-                        s.nodes[d].floor = Some(s.local(d) + grace + self.seq_margin);
+                        s.nodes[d].floor = Some(s.wait(self, d) + grace + self.seq_margin);
                         s.saw |= SAW_GRACE_INHERITED;
                     }
-                    s.nodes[d].dtenure = Some(s.local(d) + self.deleg_ttl - self.node_margin);
+                    s.nodes[d].dtenure =
+                        Some(s.honour(self, d) + self.deleg_ttl - self.node_margin);
                     if self.move_state {
                         let carry = s.carry_of(self, r, &table);
                         s.install_moved(self, d, table, &carry);
@@ -1679,7 +1873,7 @@ impl Model for LockModel {
                 // period, as after a fast takeover, lets them lapse or
                 // reclaim.
                 if self.grace {
-                    s.nodes[r].floor = Some(s.local(r) + self.lock_ttl + self.seq_margin);
+                    s.nodes[r].floor = Some(s.wait(self, r) + self.lock_ttl + self.seq_margin);
                 }
             }
             Action::Release(i) => {
@@ -1698,16 +1892,16 @@ impl Model for LockModel {
                 s.deleg_renews += 1;
                 // A renewal extends the root's record of the generation
                 // (measured from now, as the code's `until = now + ttl`).
-                let dgen = s.local(r) + self.deleg_ttl + self.seq_margin;
+                let dgen = s.wait(self, r) + self.deleg_ttl + self.seq_margin;
                 s.nodes[r].dgen = Some(s.nodes[r].dgen.map_or(dgen, |u| u.max(dgen)));
-                let now = s.local(r);
+                let now = s.wait(self, r);
                 s.nodes[r].handed.retain(|g| g.until > now);
                 let table = if self.resend_handoff {
                     s.nodes[r].handed.clone()
                 } else {
                     Vec::new()
                 };
-                let sent = s.local(d as usize);
+                let sent = s.honour(self, d as usize);
                 let gen = s.gen;
                 let grace = s.grace_left(self, r);
                 let carry = s.carry_of(self, r, &table);
@@ -1725,15 +1919,15 @@ impl Model for LockModel {
         Some(s)
     }
 
-    fn properties(&self) -> Vec<Property<Self>> {
+    fn properties_of(&self) -> Vec<Property<Self>> {
         vec![
             Property::always("mutual_exclusion", |_, s: &State| s.violation.is_none()),
             // The owner's shortcuts (a node's own grant re-affirmed
             // without a conflict check) rely on this: no table holds two
             // live conflicting grants to different nodes.
-            Property::always("table_consistent", |_, s: &State| {
+            Property::always("table_consistent", |m: &LockModel, s: &State| {
                 (0..s.nodes.len()).all(|h| {
-                    let now = s.local(h);
+                    let now = s.wait(m, h);
                     let live: Vec<&Grant> =
                         s.nodes[h].table.iter().filter(|g| g.until > now).collect();
                     live.iter().all(|a| {
@@ -1761,10 +1955,10 @@ impl Model for LockModel {
                 s.saw & SAW_FAST_TAKEOVER != 0
             }),
             Property::sometimes("ttl_takeover", |_, s: &State| s.saw & SAW_TTL_TAKEOVER != 0),
-            Property::sometimes("fenced", |_, s: &State| {
+            Property::sometimes("fenced", |m: &LockModel, s: &State| {
                 s.saw & SAW_FENCED != 0
                     || (0..s.nodes.len())
-                        .any(|i| s.nodes[i].held.is_some() && s.honoured(i).is_none())
+                        .any(|i| s.nodes[i].held.is_some() && s.honoured(m, i).is_none())
             }),
             Property::sometimes("recall_by_ttl", |_, s: &State| {
                 s.saw & SAW_RECALL_BY_TTL != 0
@@ -1797,10 +1991,6 @@ impl Model for LockModel {
                 s.saw & SAW_CARRIED_TWICE != 0
             }),
         ]
-    }
-
-    fn within_boundary(&self, s: &State) -> bool {
-        s.t <= self.max_tick
     }
 }
 
@@ -1840,7 +2030,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             }
             // A re-sent request of a parked node refreshes its `sent`.
             s.nodes[h].parks.retain(|p| p.node != from);
-            let recv = s.local(h);
+            let recv = s.wait(cfg, h);
             if !s.try_grant(cfg, h, from, mode, sent, recv) {
                 s.nodes[h].parks.push(Park {
                     node: from,
@@ -1936,7 +2126,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
                 });
                 return;
             };
-            let now = s.local(h);
+            let now = s.wait(cfg, h);
             s.nodes[h].table.retain(|g| g.until > now);
             let ttl = s.ttl_at(cfg, h, until);
             let known = s.nodes[h]
@@ -2052,7 +2242,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             // The renewal it starts serving with carries the root's grace
             // (measured from the receipt, plus the margin).
             if s.nodes[d].dtenure.is_none() && grace > 0 {
-                let f = s.local(d) + grace + cfg.seq_margin;
+                let f = s.wait(cfg, d) + grace + cfg.seq_margin;
                 s.nodes[d].floor = Some(s.nodes[d].floor.map_or(f, |x| x.max(f)));
                 s.saw |= SAW_GRACE_INHERITED;
             }
@@ -2105,7 +2295,7 @@ fn deliver(cfg: &LockModel, s: &mut State, m: Msg) {
             s.install_moved(cfg, r, table.clone(), &carry);
             s.reinstate_handed(cfg, r, &table);
             if cfg.handoff_grace && std::mem::take(&mut s.nodes[r].handoff_sent) {
-                s.nodes[r].floor = Some(s.local(r) + cfg.lock_ttl + cfg.seq_margin);
+                s.nodes[r].floor = Some(s.wait(cfg, r) + cfg.lock_ttl + cfg.seq_margin);
             }
             s.owner = Owner::Root;
             s.mirror_push(cfg, r);

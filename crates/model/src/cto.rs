@@ -22,10 +22,12 @@
 //!   `local < expires − lease_margin`; anyone may take over once its own
 //!   `local ≥ expires`);
 //! - a global real time `t` (a bounded [`Action::Tick`]) and, per node, a
-//!   clock `local = t + off[i]` with `|off[i]| ≤ max_offset` chosen
-//!   nondeterministically at start, and optionally stepping within that
-//!   bound ([`Action::Jump`]: an NTP step, or a rate error accumulated
-//!   over a delegation's lifetime);
+//!   clock with a wall offset `|off[i]| ≤ max_offset` chosen
+//!   nondeterministically at start, optionally stepping within that bound
+//!   ([`Action::Jump`]: an NTP step), and, plan 43 C7a, an oscillator rate
+//!   (`rate_period`, `max_rate`) read through the honour, wait and wall
+//!   readings of [`crate::clk`] (below; with `clock_split` off and no rate
+//!   it is the one clock `local = t + off[i]` the model had);
 //! - a lossy, reordering network (an unreachable delegate is a dropped
 //!   recall or recall ack).
 //!
@@ -103,11 +105,38 @@
 //! at its return. A node's own writes are read-your-writes (M6), so the
 //! scripts here always read on a different node than they write.
 //!
+//! # Plan 43 C7a: the readings
+//!
+//! Each node reads three clocks of its one oscillator ([`crate::clk`]): WALL
+//! (what a step moves, what crosses nodes), HONOUR (a holder's rights; never
+//! under-counts; follows a forward step once, ignores a backward one) and WAIT
+//! (a waiter's outwaits and the liveness timers; never over-counts; ignores
+//! every step), the last two scaled by the design's `rate_budget`. With
+//! `clock_split` off every check is on the wall reading (the design before
+//! C7-H1). Each former `local(i)` is now one of them:
+//!
+//! | Reading | Where (the code's) |
+//! |---|---|
+//! | HONOUR | a node's lease use (`usable`: `expires_h`, `LeaseView::usable`), its probe freshness (`last_probe`, `liveness_fresh`), a delegate's `Deleg.until` and the `sent` it stamps (`ReadIndex`), the cap of a grant by the lease, the holder's beats' end |
+//! | WAIT | the sequencer's grant records and recall-by-expiry (`Grant.until`), the floor (`ack_floor`, `FloorPassed`), a release's live-grant test, a beat's `sent` and arrival (the lag) and the lease end it names (`expires_w`, the code's `holder_wait_ms`), the cap's `X` |
+//! | WALL | a claimant's compare with the register's expiry (`claimable`, `unexpired`: a stamp of another node's clock, plan 43 C7b's), the expiry written to the register (`Reg::expires`) |
+//!
+//! `Jump(i, d)` replaces `off[i]` (a wall step); under the split it moves
+//! WALL alone. [`CtoModel::step_node`] and `step_dir` restrict which node
+//! steps and which way (a backward step of the delegate, a forward one of
+//! the holder). `beat_span` is the code's span filter on the cap (`M·period
+//! / (4·budget)` ticks): only beats sent within it of `X` count.
+//!
 //! # The drift margin
 //!
-//! Let every clock be within `D` of real time. A duration measured on one
-//! clock is then off by at most `2D` (the offset can move by that much
-//! between the two readings).
+//! *Offsets* (cross-node compares: the claimant against the register's
+//! expiry, plan 43 C7b replaces them): let every clock be within `D` of real
+//! time. A duration measured on one clock is then off by at most `2D` (the
+//! offset can move by that much between the two readings). *Rate* (plan 43
+//! C7a): the budget makes each local window exact (WAIT never over-counts,
+//! HONOUR never under-counts, for an oscillator within it, up to a tick of
+//! the staircase's rounding), and the margin is slack. The offsets'
+//! arguments follow.
 //! - *Recall override.* The delegate honours until real time `≤ s + ttl −
 //!   deleg_margin + 2D` (`s` = when it sent the request); the holder
 //!   overrides from real time `≥ g + ttl + seq_margin − 2D` (`g ≥ s` =
@@ -172,10 +201,13 @@
 //! beats `b` heard (same holder and epoch) ends its floor at
 //! `min(bound, X + lag + seq_margin)`, `X = max(old expiry, named,
 //! guard)`; none if that has passed. The code takes only beats sent
-//! within `250·M` of `X`, so that the rate error stays under `M/2`; the
-//! model has no rates, only offsets and steps within `max_offset`, and
-//! margins above `2D`, so it needs no span. A beat is delivered at once
-//! here: a later delivery makes the lag larger, hence the floor longer.
+//! within `M/(4ρ)` of `X` (250·M at the defaults), so that the rate error
+//! `2ρ·(X − sent)` stays under `M/2`: a beat sent before the renewal that
+//! set `X` measures an interval the holder's wait clock under-counts.
+//! `beat_span` is that filter; without it and with rates (`tests/cto.rs`,
+//! `beat_cap_rate_*`) the cap ends the floor inside the holder's window. A
+//! beat is delivered at once here: a later delivery makes the lag larger,
+//! hence the floor longer.
 //! `beat_cap_from_named_expiry` is the naive variant (`X` = what the
 //! beats named, ignoring the lease the takeover replaced: a holder that
 //! renews after its last beat is then outlived), and must be found
@@ -266,6 +298,35 @@ pub struct CtoModel {
     pub beat_cap: bool,
     /// The naive cap: `X` is only what the beats named. Must violate.
     pub beat_cap_from_named_expiry: bool,
+    // ---- plan 43 C7a: rate and the honour/wait/wall split ----
+    /// A node's oscillator gains or loses `rate[i]` ticks every
+    /// `rate_period` real ticks (`rate[i]` in `[-max_rate, max_rate]`,
+    /// chosen at start; every combination when `explore_rates`). 0: no
+    /// rate error.
+    pub rate_period: i16,
+    pub max_rate: i16,
+    pub explore_rates: bool,
+    pub init_rates: Option<Vec<i16>>,
+    /// The design's rate budget, in ticks per `rate_period` (the code's
+    /// rho): the wait reading runs slow, and the honour reading fast, by it.
+    pub rate_budget: i16,
+    /// Plan 43 C7-H1's split: a holder judges its rights on its honour
+    /// reading, a waiter on its wait reading, cross-node values on the wall
+    /// reading. `false`: every check on the wall reading (the design before
+    /// C7-H1).
+    pub clock_split: bool,
+    /// An undisciplined host: the wall follows the oscillator too.
+    pub wall_follows_rate: bool,
+    /// Which node steps, and which way (plan 43 C7a): `Jump` is offered only
+    /// for `step_node` (`None`: any node) and only backwards (`step_dir <
+    /// 0`) or forwards (`step_dir > 0`) of the node's present offset (`0`:
+    /// either).
+    pub step_node: Option<u8>,
+    pub step_dir: i8,
+    /// The span filter of the beat cap (the code's `beat_cap_span_ms`): only
+    /// beats sent at most this many ticks before the end `X` the cap counts
+    /// to are used. `None`: no filter.
+    pub beat_span: Option<i16>,
 }
 
 impl CtoModel {
@@ -304,6 +365,16 @@ impl CtoModel {
             inherit_mark: true,
             beat_cap: false,
             beat_cap_from_named_expiry: false,
+            rate_period: 0,
+            max_rate: 0,
+            explore_rates: false,
+            init_rates: None,
+            rate_budget: 0,
+            clock_split: false,
+            wall_follows_rate: false,
+            step_node: None,
+            step_dir: 0,
+            beat_span: None,
         }
     }
 
@@ -327,6 +398,15 @@ impl CtoModel {
     fn n(&self) -> usize {
         self.scripts.len()
     }
+
+    fn spec(&self) -> crate::clk::ClockSpec {
+        crate::clk::ClockSpec {
+            rate_period: self.rate_period,
+            rate_budget: self.rate_budget,
+            clock_split: self.clock_split,
+            wall_follows_rate: self.wall_follows_rate,
+        }
+    }
 }
 
 /// The lease object in the bucket. `expires` is in the writer's clock.
@@ -334,7 +414,12 @@ impl CtoModel {
 pub struct Reg {
     pub holder: u8,
     pub epoch: u8,
+    /// The lease's end on the writer's wall clock (what a claimant compares
+    /// its own wall reading with).
     pub expires: i16,
+    /// Plan 43 C7a: the same end on the holder's wait clock (the lease
+    /// body's `holder_wait_ms`: what the beat cap counts to).
+    pub expires_w: i16,
     pub released: bool,
     /// Plan 30 §M9: this tenure has served a strict read (the
     /// `granted_delegations` flag, set by one CAS before the first).
@@ -392,8 +477,10 @@ pub enum NodeOp {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Node {
-    /// The lease this node believes it holds: `(epoch, expires)`.
-    pub lease: Option<(u8, i16)>,
+    /// The lease this node believes it holds: `(epoch, its end on this
+    /// node's honour clock, its end on its wait clock)`. (With no split
+    /// the two are the one end of the one clock.)
+    pub lease: Option<(u8, i16, i16)>,
     pub applied: u8,
     pub pc: u8,
     pub op: NodeOp,
@@ -480,7 +567,9 @@ pub const SAW_CAP_COMPUTED: u16 = 256;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
     pub t: u8,
-    pub off: Vec<i16>,
+    /// Each node's clock (plan 43 C7a: wall offset, initial offset, rate,
+    /// honour jump).
+    pub clk: Vec<Clk>,
     pub jumps: u8,
     pub drops: u8,
     pub reg: Reg,
@@ -494,11 +583,31 @@ pub struct State {
     pub violation: Option<(u8, u8, u8)>,
     pub next_id: u8,
     pub saw: u16,
+    /// Plan 43 C7a (`beat_span`): the beats each node heard, `(heard by,
+    /// holder, epoch, sent, lag)`, on the Pareto frontier (a later beat
+    /// with a lag at most an earlier one's leaves the earlier one out: it
+    /// is in every window the earlier one is). Empty without a span.
+    pub beat_lags: Vec<BeatLag>,
 }
 
+pub use crate::clk::Clk;
+
+/// A beat the backup heard: `(heard by, holder, epoch, sent, lag)`.
+pub type BeatLag = (u8, u8, u8, i16, i16);
+
 impl State {
-    fn local(&self, i: usize) -> i16 {
-        self.t as i16 + self.off[i]
+    fn wall(&self, cfg: &CtoModel, i: usize) -> i16 {
+        cfg.spec().wall(self.t, &self.clk[i])
+    }
+
+    /// A holder's rights are judged on this reading.
+    fn honour(&self, cfg: &CtoModel, i: usize) -> i16 {
+        cfg.spec().honour(self.t, &self.clk[i])
+    }
+
+    /// A waiter's outwaits and the liveness timers are on this one.
+    fn wait(&self, cfg: &CtoModel, i: usize) -> i16 {
+        cfg.spec().wait(self.t, &self.clk[i])
     }
 
     /// The version a replica at prefix `n` holds (writes in the prefix).
@@ -511,8 +620,8 @@ impl State {
     }
 
     fn usable(&self, cfg: &CtoModel, i: usize) -> Option<u8> {
-        let (epoch, expires) = self.nodes[i].lease?;
-        (self.local(i) < expires - cfg.lease_margin).then_some(epoch)
+        let (epoch, expires_h, _) = self.nodes[i].lease?;
+        (self.honour(cfg, i) < expires_h - cfg.lease_margin).then_some(epoch)
     }
 
     /// A usable holder whose epoch is the register's: may execute and
@@ -559,7 +668,8 @@ impl State {
         let len = self.log.len() as u8;
         self.nodes[h].applied = len;
         let version = self.versions();
-        let now = self.local(h);
+        // The sequencer's table and its floor are on its wait clock.
+        let now = self.wait(cfg, h);
         self.nodes[h].grants.retain(|g| g.until > now);
         let waiting: Vec<u8> = if cfg.recall {
             self.nodes[h]
@@ -608,7 +718,7 @@ impl State {
     }
 
     /// Grant `id` is gone (acked or expired): release held writes.
-    fn grant_done(&mut self, h: usize, id: u8) {
+    fn grant_done(&mut self, cfg: &CtoModel, h: usize, id: u8) {
         self.nodes[h].grants.retain(|g| g.id != id);
         let mut done = Vec::new();
         for held in self.nodes[h].held.iter_mut() {
@@ -618,7 +728,7 @@ impl State {
             }
         }
         self.nodes[h].held.retain(|x| !x.waiting.is_empty());
-        let now = self.local(h);
+        let now = self.wait(cfg, h);
         for (writer, version) in done {
             if self.nodes[h].ack_floor.is_some_and(|f| now < f) {
                 self.nodes[h].floor_held.push((writer, version));
@@ -683,6 +793,8 @@ impl Model for CtoModel {
 
     fn init_states(&self) -> Vec<State> {
         let n = self.n();
+        let rates =
+            crate::clk::initial_rates(n, self.max_rate, self.explore_rates, &self.init_rates);
         let mut offs: Vec<Vec<i16>> = vec![self.init_offsets.clone().unwrap_or(vec![0; n])];
         if self.explore_offsets && self.max_offset > 0 {
             offs = vec![vec![]];
@@ -699,7 +811,8 @@ impl Model for CtoModel {
             }
         }
         offs.into_iter()
-            .map(|off| {
+            .flat_map(|off| rates.iter().map(move |r| (off.clone(), r.clone())))
+            .map(|(off, rate)| {
                 let mut nodes: Vec<Node> = (0..n)
                     .map(|_| Node {
                         lease: None,
@@ -720,6 +833,7 @@ impl Model for CtoModel {
                     holder: NONE,
                     epoch: 0,
                     expires: 0,
+                    expires_w: 0,
                     released: false,
                     marked: false,
                 };
@@ -731,6 +845,7 @@ impl Model for CtoModel {
                         holder: h as u8,
                         epoch: 1,
                         expires,
+                        expires_w: expires,
                         released: false,
                         // A tenure with strict mounts serves strict reads
                         // from the start (the code marks the lease at
@@ -741,12 +856,12 @@ impl Model for CtoModel {
                     for node in nodes.iter_mut() {
                         node.applied = 1;
                     }
-                    nodes[h].lease = Some((1, expires));
+                    nodes[h].lease = Some((1, expires, expires));
                     nodes[h].last_probe = off[h];
                 }
                 State {
                     t: 0,
-                    off,
+                    clk: crate::clk::initial_clocks(&off, &rate),
                     jumps: 0,
                     drops: 0,
                     reg,
@@ -757,6 +872,7 @@ impl Model for CtoModel {
                     violation: None,
                     next_id: 0,
                     saw: 0,
+                    beat_lags: Vec::new(),
                 }
             })
             .collect()
@@ -772,8 +888,16 @@ impl Model for CtoModel {
         }
         if s.jumps < self.max_jumps {
             for i in 0..n {
+                if self.step_node.is_some_and(|n| n as usize != i) {
+                    continue;
+                }
                 for d in -self.max_offset..=self.max_offset {
-                    if d != s.off[i] {
+                    let dir_ok = match self.step_dir {
+                        0 => true,
+                        x if x < 0 => d < s.clk[i].off,
+                        _ => d > s.clk[i].off,
+                    };
+                    if d != s.clk[i].off && dir_ok {
                         actions.push(Action::Jump(i as u8, d));
                     }
                 }
@@ -800,7 +924,10 @@ impl Model for CtoModel {
             if self.allow_renew && s.may_execute(self, i) && !s.reg.released {
                 actions.push(Action::Renew(iu));
             }
-            let claimable = s.reg.holder == NONE || s.reg.released || s.local(i) >= s.reg.expires;
+            // (A claimant compares its wall reading with the register's expiry: a
+            // value of another node's clock, plan 43 C7b's.)
+            let claimable =
+                s.reg.holder == NONE || s.reg.released || s.wall(self, i) >= s.reg.expires;
             // Plan 30 §M9: on a `fast` tenure the detection of the
             // holder's silence is nondeterministic (safety must hold for
             // any timing), so a live lease is claimable by a peer at any
@@ -819,8 +946,8 @@ impl Model for CtoModel {
             }
             // Plan 43 C7-F F-a: the holder's beats stop at its expiry.
             if self.beat_cap {
-                if let Some((_, expires)) = node.lease {
-                    if s.local(i) < expires {
+                if let Some((_, expires_h, _)) = node.lease {
+                    if s.honour(self, i) < expires_h {
                         for b in 0..n {
                             if b != i {
                                 actions.push(Action::Beat(iu, b as u8));
@@ -831,19 +958,19 @@ impl Model for CtoModel {
             }
             if node
                 .ack_floor
-                .is_some_and(|f| s.local(i) >= f && !node.floor_held.is_empty())
+                .is_some_and(|f| s.wait(self, i) >= f && !node.floor_held.is_empty())
             {
                 actions.push(Action::FloorPassed(iu));
             }
             if self.allow_release && s.may_execute(self, i) && node.held.is_empty() {
-                let now = s.local(i);
+                let now = s.wait(self, i);
                 let live = node.grants.iter().any(|g| g.until > now);
                 if !(self.recall_before_release && live) {
                     actions.push(Action::Release(iu));
                 }
             }
             if !node.grants.is_empty() {
-                let now = s.local(i);
+                let now = s.wait(self, i);
                 if node.grants.iter().any(|g| g.until <= now) {
                     actions.push(Action::Expire(iu));
                 }
@@ -853,7 +980,7 @@ impl Model for CtoModel {
             // holder that has not noticed would read stale state).
             let fresh = !self.fast_takeover
                 || !self.probe_freshness
-                || s.local(i) - node.last_probe < self.takeover_window;
+                || s.honour(self, i) - node.last_probe < self.takeover_window;
             match node.op {
                 NodeOp::Idle => {
                     if (node.pc as usize) < self.scripts[i].len() {
@@ -881,9 +1008,13 @@ impl Model for CtoModel {
                             actions.push(Action::ReadLocal(iu));
                         }
                         // Else: `Probe(i)` first (offered above).
-                    } else if self.delegations && node.deleg.is_some_and(|d| s.local(i) < d.until) {
+                    } else if self.delegations
+                        && node.deleg.is_some_and(|d| s.honour(self, i) < d.until)
+                    {
                         actions.push(Action::ReadUnderDelegation(iu));
-                    } else if s.reg.holder == NONE || s.reg.released || s.local(i) >= s.reg.expires
+                    } else if s.reg.holder == NONE
+                        || s.reg.released
+                        || s.wall(self, i) >= s.reg.expires
                     {
                         actions.push(Action::ReadLocal(iu));
                     } else {
@@ -914,10 +1045,20 @@ impl Model for CtoModel {
     fn next_state(&self, last: &State, action: Action) -> Option<State> {
         let mut s = last.clone();
         match action {
-            Action::Tick => s.t += 1,
+            Action::Tick => {
+                s.t += 1;
+                {
+                    let (t, spec) = (s.t, self.spec());
+                    spec.follow_wall(t, &mut s.clk);
+                }
+            }
             Action::Jump(i, d) => {
-                s.off[i as usize] = d;
+                s.clk[i as usize].off = d;
                 s.jumps += 1;
+                {
+                    let (t, spec) = (s.t, self.spec());
+                    spec.follow_wall(t, &mut s.clk);
+                }
             }
             Action::Drop(k) => {
                 s.net.remove(k);
@@ -926,17 +1067,28 @@ impl Model for CtoModel {
             Action::Tail(i) => s.apply_next(self, i as usize),
             Action::Renew(i) => {
                 let i = i as usize;
-                let expires = s.local(i) + self.lease_ttl;
-                s.reg.expires = expires;
+                // Three stamps of one instant: the register's (wall), the
+                // holder's own (honour: what it honours the lease until;
+                // wait: what its beats name).
+                s.reg.expires = s.wall(self, i) + self.lease_ttl;
+                s.reg.expires_w = s.wait(self, i) + self.lease_ttl;
                 let epoch = s.reg.epoch;
-                s.nodes[i].lease = Some((epoch, expires));
-                s.nodes[i].last_probe = s.local(i);
+                s.nodes[i].lease = Some((
+                    epoch,
+                    s.honour(self, i) + self.lease_ttl,
+                    s.wait(self, i) + self.lease_ttl,
+                ));
+                s.nodes[i].last_probe = s.honour(self, i);
             }
             Action::Takeover(i) => {
                 let i = i as usize;
                 let epoch = s.reg.epoch + 1;
-                let now = s.local(i);
-                let expires = now + self.lease_ttl;
+                // The claimant's wall (the register's stamp, the compare
+                // with the old expiry), honour (its own lease window, its
+                // probe) and wait (its floor) readings.
+                let (now_wall, now_honour, now_wait) =
+                    (s.wall(self, i), s.honour(self, i), s.wait(self, i));
+                let expires = now_wall + self.lease_ttl;
                 let prev = s.reg;
                 // Plan 30 §M9: an unexpired predecessor that served strict
                 // reads: hold every acknowledgement until its horizon.
@@ -950,7 +1102,7 @@ impl Model for CtoModel {
                 // no floor; the code's no-floor TTL path is the sim's.
                 let permitted = self.fast_takeover && prev.holder != NONE && prev.holder != i as u8;
                 let unexpired =
-                    prev.holder != NONE && !prev.released && (permitted || now < prev.expires);
+                    prev.holder != NONE && !prev.released && (permitted || now_wall < prev.expires);
                 // Plan 43 C7-F F-a0: a tenure that inherits a floor is
                 // marked from its first CAS.
                 let inherits = self.inherit_mark && self.horizon_wait && unexpired && prev.marked;
@@ -958,6 +1110,7 @@ impl Model for CtoModel {
                     holder: i as u8,
                     epoch,
                     expires,
+                    expires_w: now_wait + self.lease_ttl,
                     released: false,
                     marked: (self.strict && self.mark_at_takeover) || inherits,
                 };
@@ -967,8 +1120,12 @@ impl Model for CtoModel {
                 }
                 s.log.push(epoch);
                 s.nodes[i].applied = s.log.len() as u8;
-                s.nodes[i].lease = Some((epoch, expires));
-                s.nodes[i].last_probe = now;
+                s.nodes[i].lease = Some((
+                    epoch,
+                    now_honour + self.lease_ttl,
+                    now_wait + self.lease_ttl,
+                ));
+                s.nodes[i].last_probe = now_honour;
                 // A new tenure's table is empty.
                 s.nodes[i].grants.clear();
                 s.nodes[i].held.clear();
@@ -978,7 +1135,9 @@ impl Model for CtoModel {
                 }
                 s.nodes[i].ack_floor = None;
                 if self.horizon_wait && unexpired && prev.marked {
-                    let bound = now + self.takeover_window + self.deleg_ttl + 2 * self.seq_margin;
+                    // The floor is a wait on the successor's wait clock.
+                    let bound =
+                        now_wait + self.takeover_window + self.deleg_ttl + 2 * self.seq_margin;
                     // Not `min(prev.expires, bound)`: the old expiry is the
                     // old holder's clock (the code's floor is the bound).
                     //
@@ -989,13 +1148,34 @@ impl Model for CtoModel {
                         s.nodes[i]
                             .heard
                             .filter(|h| h.holder == prev.holder && h.epoch == prev.epoch)
-                            .map(|h| {
+                            .and_then(|h| {
+                                // `X`, the holder's wait-clock end, all of
+                                // one clock: the lease the takeover
+                                // replaced, what the beats named, the guard.
                                 let x = if self.beat_cap_from_named_expiry {
                                     h.named
                                 } else {
-                                    prev.expires.max(h.named).max(h.guard)
+                                    prev.expires_w.max(h.named).max(h.guard)
                                 };
-                                x + h.lag + self.seq_margin
+                                // The beats' lag, over those sent within
+                                // `beat_span` of `X` when there is a span:
+                                // on the frontier the earliest in the
+                                // window has the least lag.
+                                let lag = match self.beat_span {
+                                    None => Some(h.lag),
+                                    Some(span) => s
+                                        .beat_lags
+                                        .iter()
+                                        .filter(|(by, holder, epoch, sent, _)| {
+                                            *by == i as u8
+                                                && *holder == prev.holder
+                                                && *epoch == prev.epoch
+                                                && (0..=span).contains(&(x - sent))
+                                        })
+                                        .map(|(.., lag)| *lag)
+                                        .min(),
+                                };
+                                lag.map(|lag| x + lag + self.seq_margin)
                             })
                     } else {
                         None
@@ -1007,7 +1187,7 @@ impl Model for CtoModel {
                     if end < bound {
                         s.saw |= SAW_FLOOR_CAPPED;
                     }
-                    if end > now {
+                    if end > now_wait {
                         s.nodes[i].ack_floor = Some(end);
                         s.saw |= SAW_FLOOR_WAIT;
                     }
@@ -1015,9 +1195,23 @@ impl Model for CtoModel {
             }
             Action::Beat(h, b) => {
                 let (h, b) = (h as usize, b as usize);
-                let (epoch, expires) = s.nodes[h].lease?;
-                let lag = s.local(b) - s.local(h);
+                // The beat is sent on the holder's wait clock and arrives
+                // on the backup's: `at - sent`, the code's lag; it names
+                // the holder's wait-clock end and its floor (also wait).
+                let (epoch, _, expires) = s.nodes[h].lease?;
+                let (sent, at) = (s.wait(self, h), s.wait(self, b));
+                let lag = at - sent;
                 let guard = s.nodes[h].ack_floor.unwrap_or(0);
+                if self.beat_span.is_some() {
+                    // The frontier of this holder's beats at `b` (a new
+                    // epoch starts the book over; a beat whose lag is at
+                    // most an earlier one's leaves that one out).
+                    let lags = &mut s.beat_lags;
+                    lags.retain(|(by, hh, e, _, l)| {
+                        (*by, *hh) != (b as u8, h as u8) || (*e == epoch && *l < lag)
+                    });
+                    lags.push((b as u8, h as u8, epoch, sent, lag));
+                }
                 s.nodes[b].heard = Some(match s.nodes[b].heard {
                     Some(o) if o.holder == h as u8 && o.epoch == epoch => Heard {
                         lag: o.lag.min(lag),
@@ -1036,14 +1230,14 @@ impl Model for CtoModel {
             }
             Action::Probe(i) => {
                 let i = i as usize;
-                let (mine, _) = s.nodes[i].lease?;
+                let (mine, ..) = s.nodes[i].lease?;
                 if s.reg.holder != i as u8 || s.reg.epoch != mine {
                     // Deposed: stop everything at once.
                     s.nodes[i].lease = None;
                     s.nodes[i].grants.clear();
                     s.nodes[i].held.clear();
                 } else {
-                    s.nodes[i].last_probe = s.local(i);
+                    s.nodes[i].last_probe = s.honour(self, i);
                 }
             }
             Action::FloorPassed(i) => {
@@ -1103,7 +1297,7 @@ impl Model for CtoModel {
                 let NodeOp::ReadStart { must } = s.nodes[i].op else {
                     return None;
                 };
-                let sent = s.local(i);
+                let sent = s.honour(self, i);
                 let to = s.reg.holder;
                 s.send(Msg::ReadIndex { from: i as u8, to });
                 let gen = s.nodes[i].recall_gen;
@@ -1127,7 +1321,7 @@ impl Model for CtoModel {
             }
             Action::Expire(h) => {
                 let h = h as usize;
-                let now = s.local(h);
+                let now = s.wait(self, h);
                 let expired: Vec<u8> = s.nodes[h]
                     .grants
                     .iter()
@@ -1138,7 +1332,7 @@ impl Model for CtoModel {
                     if s.nodes[h].held.iter().any(|x| x.waiting.contains(&id)) {
                         s.saw |= SAW_RECALL_EXPIRED;
                     }
-                    s.grant_done(h, id);
+                    s.grant_done(self, h, id);
                 }
             }
             Action::Deliver(k) => {
@@ -1235,7 +1429,11 @@ fn deliver(cfg: &CtoModel, s: &mut State, m: Msg) {
         }
         Msg::ReadIndex { from, to } => {
             let h = to as usize;
-            let now = s.local(h);
+            // The holder's rights (its probe, the lease it caps the grant
+            // by) are on its honour clock; the table it records the grant
+            // in is on its wait clock.
+            let now = s.honour(cfg, h);
+            let now_wait = s.wait(cfg, h);
             // Plan 30 §M9: on a `fast` tenure, only with a fresh probe.
             let stale = cfg.fast_takeover
                 && cfg.probe_freshness
@@ -1272,14 +1470,14 @@ fn deliver(cfg: &CtoModel, s: &mut State, m: Msg) {
             if cfg.delegations {
                 let mut ttl = cfg.deleg_ttl;
                 if cfg.cap_by_lease {
-                    let (_, expires) = s.nodes[h].lease.expect("usable");
-                    ttl = ttl.min(expires - cfg.lease_margin - now);
+                    let (_, expires_h, _) = s.nodes[h].lease.expect("usable");
+                    ttl = ttl.min(expires_h - cfg.lease_margin - now);
                 }
                 if ttl > 0 {
                     let id = s.fresh_id();
                     s.nodes[h].grants.push(Grant {
                         to: from,
-                        until: now + ttl + cfg.seq_margin,
+                        until: now_wait + ttl + cfg.seq_margin,
                         id,
                     });
                     s.nodes[h].grants.sort();
@@ -1331,7 +1529,7 @@ fn deliver(cfg: &CtoModel, s: &mut State, m: Msg) {
                 if s.nodes[h].held.iter().any(|x| x.waiting.contains(&id)) {
                     s.saw |= SAW_RECALL_ACK;
                 }
-                s.grant_done(h, id);
+                s.grant_done(cfg, h, id);
             }
         }
     }

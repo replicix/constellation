@@ -651,3 +651,237 @@ fn a_tenure_that_inherits_a_floor_marks_its_register_and_the_double_seal_is_clea
         &["fast_takeover", "floor_waited"],
     );
 }
+
+// ---- plan 43 C7a: rate, and the honour/wait/wall split ----
+//
+// The models' clocks (`constellation_model::clk`): a node's oscillator gains
+// or loses `rate` ticks every `rate_period` real ticks; its wait reading
+// runs slow, and its honour reading fast, by the design's `rate_budget`
+// (the code's rho); `clock_split` puts each check on the reading the code
+// takes it on. A disciplined wall (`wall_follows_rate` off) makes a slow
+// oscillator's honour reading follow the wall, so the honour side needs an
+// undisciplined host to show a rate (`tests/locks.rs`); here the waiter's
+// side does. The budget covers the staircase's rounding up to a tick, so
+// the clean variants keep a margin where the violating ones have none.
+
+/// The holder (node 0) writes, the delegate (node 1) reads twice; the holder
+/// outwaits a lost recall (one message may be dropped). Every oscillator
+/// within a quarter of its rate; 8-tick delegations, the delegate's margin 0
+/// and the holder's 1. With no budget the holder's wait reading runs fast
+/// (a quarter) and ends its outwait `(8 + 1) / 1.25 = 7.2` ticks after the
+/// grant, while the delegate honours until 8: the delegate reads its old
+/// version after the write was acknowledged.
+fn rated_delegation(budget: i16) -> CtoModel {
+    CtoModel {
+        rate_period: 4,
+        max_rate: 1,
+        explore_rates: true,
+        rate_budget: budget,
+        clock_split: true,
+        seq_margin: 1,
+        deleg_margin: 0,
+        lease_margin: 3,
+        lease_ttl: 30,
+        deleg_ttl: 8,
+        max_tick: 11,
+        max_drops: 1,
+        ..CtoModel::strict(vec![vec![W], vec![R, R]])
+    }
+}
+
+#[test]
+fn strict_rate_beyond_the_budget_violates() {
+    assert_violates("rate-no-budget", &rated_delegation(0));
+}
+
+/// The same with the budget the oscillators are within: the wait reading
+/// runs slow by it, so the holder's outwait ends no sooner than the
+/// delegate's window, whatever the rates. Clean, the delegation used.
+#[test]
+fn strict_rate_within_the_budget_is_clean() {
+    assert_clean(
+        "rate-within-budget",
+        &rated_delegation(1),
+        &["all_ops_done", "read_under_delegation"],
+    );
+}
+
+/// A fast takeover whose successor's oscillator is fast (node 2, half its
+/// rate again every two ticks: the models' coarsest resolution) and whose
+/// delegate is node 1: the floor is counted on the successor's wait clock.
+/// With no budget it passes while the old holder's delegation is still
+/// honoured.
+fn rated_floor(budget: i16) -> CtoModel {
+    CtoModel {
+        rate_period: 2,
+        max_rate: 1,
+        init_rates: Some(vec![0, 0, 1]),
+        rate_budget: budget,
+        clock_split: true,
+        seq_margin: 0,
+        deleg_margin: 0,
+        takeover_window: 1,
+        lease_ttl: 30,
+        deleg_ttl: 5,
+        max_tick: 9,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![], vec![R, R], vec![W]])
+    }
+}
+
+#[test]
+fn fast_takeover_floor_rate_beyond_the_budget_violates() {
+    assert_violates("floor-rate-no-budget", &rated_floor(0));
+}
+
+#[test]
+fn fast_takeover_floor_rate_within_the_budget_is_clean() {
+    assert_clean(
+        "floor-rate-within-budget",
+        &rated_floor(1),
+        &["fast_takeover", "floor_waited", "read_under_delegation"],
+    );
+}
+
+/// How many ticks before the old holder stops using its lease the
+/// successor's floor ends, when the holder (node 0, slow oscillator) beat to
+/// the successor (node 2, fast) at t = 0 and renewed its lease at tick
+/// `t_r`, and the successor took the lease over two ticks before the
+/// holder's own window ended. Positive: the cap ended the floor inside the
+/// holder's window (the search for the end-to-end violation is too deep, as
+/// for the naive cap below). `None` if the trace does not exist.
+fn floor_shortfall(m: &CtoModel, t_r: u8) -> Option<i16> {
+    fn enabled(m: &CtoModel, s: &State, a: &Action) -> bool {
+        let mut e = Vec::new();
+        m.actions(s, &mut e);
+        e.contains(a)
+    }
+    fn to_tick(m: &CtoModel, mut s: State, t: u8) -> Option<State> {
+        while s.t < t {
+            if !enabled(m, &s, &Action::Tick) {
+                return None;
+            }
+            s = step(m, &s, Action::Tick);
+        }
+        Some(s)
+    }
+    let mut s = m.init_states().remove(0);
+    s = step(m, &s, Action::Beat(0, 2));
+    s = to_tick(m, s, t_r)?;
+    if !enabled(m, &s, &Action::Renew(0)) {
+        return None;
+    }
+    s = step(m, &s, Action::Renew(0));
+    // The holder stops using its lease when `Renew` is no longer offered.
+    let mut probe = s.clone();
+    while enabled(m, &probe, &Action::Renew(0)) {
+        probe = step(m, &probe, Action::Tick);
+    }
+    let holder_end = probe.t;
+    s = to_tick(m, s, holder_end.saturating_sub(2))?;
+    s = step(m, &s, Action::Takeover(2));
+    s.nodes[2].ack_floor?;
+    s = step(m, &s, Action::Start(2));
+    while !enabled(m, &s, &Action::FloorPassed(2)) {
+        if !enabled(m, &s, &Action::Tick) {
+            return None;
+        }
+        s = step(m, &s, Action::Tick);
+    }
+    Some(holder_end as i16 - s.t as i16)
+}
+
+fn capped_by_beats(span: Option<i16>) -> CtoModel {
+    CtoModel {
+        rate_period: 4,
+        max_rate: 1,
+        init_rates: Some(vec![-1, 0, 1]),
+        rate_budget: 1,
+        clock_split: true,
+        lease_ttl: 10,
+        deleg_ttl: 4,
+        takeover_window: 2,
+        allow_renew: true,
+        beat_cap: true,
+        beat_span: span,
+        max_tick: 40,
+        max_drops: 0,
+        ..CtoModel::strict_fast(vec![vec![], vec![R, R], vec![W]])
+    }
+}
+
+/// The beat cap counts `X - sent`, a difference of the holder's wait clock,
+/// onto the successor's: a beat sent before the renewal that set `X`
+/// measures an interval the holder's slow wait clock under-counts, which the
+/// successor's fast one does not. With no span the cap, which takes the
+/// least lag of all the beats, ends the floor before the holder's renewed
+/// window ends, for some renewal tick, by the drift over the interval
+/// (more than the margin pays for).
+#[test]
+fn beat_cap_rate_before_the_renewal_violates_without_the_span() {
+    let m = capped_by_beats(None);
+    let worst = (2..=9u8)
+        .filter_map(|t_r| floor_shortfall(&m, t_r))
+        .max()
+        .expect("a trace");
+    println!("beat cap, no span: the floor ends up to {worst} tick(s) before the holder's window");
+    assert!(
+        worst > 0,
+        "the cap never ended the floor inside the holder's window (worst {worst})"
+    );
+}
+
+/// With the span (`M * period / (4 * budget)` ticks at the design's margin
+/// of 1: one tick) only a beat sent within it of `X` counts: the beats
+/// sent before the renewal are left out, the cap is none for them and the
+/// floor is the bound: it never ends inside the holder's window.
+#[test]
+fn beat_cap_rate_with_the_span_is_clean() {
+    let m = capped_by_beats(Some(1));
+    let worst = (2..=9u8)
+        .filter_map(|t_r| floor_shortfall(&m, t_r))
+        .max()
+        .expect("a trace");
+    assert!(
+        worst <= 0,
+        "the floor ended {worst} tick(s) inside the holder's window"
+    );
+}
+
+/// The delegate's wall clock stepped back (one step of up to 3 ticks, the
+/// design's margins of 1): with every check on the wall reading it honours
+/// its delegation 3 ticks past the holder's outwait, and reads a stale
+/// version. No takeover, so no wall compare across nodes is involved.
+fn stepped(split: bool, node: u8, dir: i8) -> CtoModel {
+    CtoModel {
+        clock_split: split,
+        max_offset: 3,
+        max_jumps: 1,
+        step_node: Some(node),
+        step_dir: dir,
+        seq_margin: 1,
+        deleg_margin: 1,
+        lease_margin: 3,
+        lease_ttl: 30,
+        deleg_ttl: 3,
+        max_tick: 8,
+        max_drops: 1,
+        ..CtoModel::strict(vec![vec![W], vec![R, R]])
+    }
+}
+
+#[test]
+fn a_delegate_stepped_back_on_the_wall_clock_violates() {
+    assert_violates("delegate-step-back-wall", &stepped(false, 1, -1));
+}
+
+/// On its honour clock the step moves nothing (HONOUR ignores a backward
+/// step, WAIT every step): clean, with the same margins, the delegation used.
+#[test]
+fn a_delegate_stepped_back_on_its_honour_clock_is_clean() {
+    assert_clean(
+        "delegate-step-back-honour",
+        &stepped(true, 1, -1),
+        &["all_ops_done", "read_under_delegation"],
+    );
+}

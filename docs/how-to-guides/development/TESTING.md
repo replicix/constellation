@@ -3199,6 +3199,34 @@ and 20-40 s each; the whole `cto` binary already peaks near 23 GB) are
 beat_cap --test-threads=1`. The naive cap's violating traces are cheap and
 always run.
 
+Both models also carry plan 43 C7a's clocks (`crates/model/src/clk.rs`): a
+node's oscillator gains or loses `rate` ticks every `rate_period` real ticks
+(`max_rate`, `explore_rates`, `init_rates`), and its honour, wait and wall
+readings are taken of it (`clock_split`; `rate_budget`, the code's rho, makes
+the wait reading run slow and the honour reading fast by it;
+`wall_follows_rate`, an undisciplined host; `step_node`/`step_dir`, which
+node steps and which way; `beat_span`, the beat cap's span filter). Each pair
+below is a violating variant and its clean one, cheap (1 to 4 M states, 5 to
+15 s in release, within the default suite's budgets):
+`cto`: `strict_rate_{beyond,within}_the_budget`,
+`fast_takeover_floor_rate_{beyond,within}_the_budget`,
+`beat_cap_rate_{before_the_renewal_violates_without,with}_the_span`,
+`a_delegate_stepped_back_on_{the_wall,its_honour}_clock`; `locks`:
+`locks_rate_{beyond,within}_the_budget`,
+`locks_holder_rate_on_an_undisciplined_host_{beyond,within}_the_budget`,
+`beat_cap_rate_*`, `a_locker_stepped_back_on_the_{wall_clock,split_clocks}`
+and `a_root_stepped_forward_on_the_{wall_clock,split_clocks}` (the model
+counterparts of the simulator's `locks-locker-step-back` and
+`locks-root-step-forward`). A staircase oscillator gains its ticks at once,
+so the budget covers the rate up to a tick of rounding: the violating
+variants run with margins of 0 or 1, the margins the rounding needs are
+the clean ones'. The beat cap's pair is a trace over every renewal tick (the
+end-to-end search is too deep): with rates, no span ends the floor (grace)
+before the old holder's renewed window ends, the span does not. Margins of
+the default `design` are unchanged and every existing test keeps its
+verdict (the readings are all the one clock with `clock_split` off and no
+rate).
+
 Simulation: `cargo test -p constellation-authority --release` runs the
 lock configurations (`locks`, `locks-partition`, `locks-skew`,
 `locks-failover`, `locks-failover-backup`, `locks-faults`,
