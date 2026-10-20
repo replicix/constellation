@@ -399,6 +399,20 @@ impl Meta {
             &self.chunk_ref_by_ino,
             &self.xattr_by_name,
         )?;
+        // The outcomes the rebuilt range of the log carries: the dedup
+        // (`completed_outcome`) must know them as a tail would have. The
+        // strand below then keeps the `completed` row of a stranded
+        // transaction whose rid the log completed (a successor re-shipped
+        // it from its backup tail) — left out, the rid's replay found no
+        // row here and executed a second time once this node held the
+        // lease (the C0 simulation's real rebuild, `long-delegated-late-
+        // answers` seeds 403 and 900 at 5f3a0e8). A row this node holds
+        // already is overwritten by the log's (position 0: "the log
+        // carries it"), as applying the segment would have.
+        for guard in side_snap.iter(&side.completed) {
+            let (k, v) = guard.into_inner()?;
+            tx.insert(&self.completed, k.to_vec(), v.to_vec());
+        }
         crate::store::spec::reset_for_rebuilt_ns_tx(&mut tx, self)?;
         if let Some(v) = side_snap.get(&side.local, KV_APPLIED_SEQ.as_bytes())? {
             tx.insert(&self.local, KV_APPLIED_SEQ.as_bytes().to_vec(), v.to_vec());

@@ -899,6 +899,46 @@ fn with_capture_off_a_holder_defers_publishing_and_rebuilds_on_deposition() {
     assert_eq!(queued[0].rid, rid(1));
 }
 
+/// A rebuild carries the log's outcomes into `completed`, as a tail
+/// would. The deposed holder's uncaptured transaction was re-shipped by
+/// its successor (from the backup tail), so the rebuilt range of the log
+/// completes its rid: the swap keeps that knowledge, and the rid's
+/// replay dedups instead of executing a second time. Before, the strand
+/// dropped the row (its journal position) and nothing put the log's back.
+#[test]
+fn a_rebuild_keeps_the_outcomes_the_rebuilt_log_carries() {
+    let meta = Meta::open_in_memory().unwrap();
+    meta.set_holder_capture(false);
+    meta.set_holder_epoch(1);
+    let op = MutateOp::Mkdir {
+        parent: ROOT_INO,
+        name: "reshipped".into(),
+        ino: (3 << 40) | 1,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+    };
+    let records = execute_mutate(&meta, &op, Some(rid(1))).unwrap();
+    assert!(meta
+        .completed_position(rid(1))
+        .unwrap()
+        .is_some_and(|p| p > 0));
+
+    // The successor's segment carries the same transaction.
+    let side = Meta::open_in_memory().unwrap();
+    side.apply_records(&records).unwrap();
+    assert_eq!(side.completed_position(rid(1)).unwrap(), Some(0));
+    meta.replace_ns_from_rebuilt(&side, &Default::default())
+        .unwrap();
+    assert!(meta.lookup(ROOT_INO, "reshipped").unwrap().is_some());
+    assert_eq!(meta.journal_len().unwrap(), 0);
+    assert_eq!(
+        meta.completed_position(rid(1)).unwrap(),
+        Some(0),
+        "the log completed the rid: its replay must dedup"
+    );
+}
+
 /// A one-chunk manifest of `len` bytes whose chunk hashes `tag`.
 fn one_chunk_manifest(tag: &[u8], len: u64) -> Vec<u8> {
     use constellation_fs_core::{ChunkHash, Manifest};
