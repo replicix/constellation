@@ -428,7 +428,7 @@ impl Core {
             || self.epoch.open
             || self.retired()
             || self.mode.forwards()
-            || now.wall < self.readopt_refused_until
+            || now.wait < self.readopt_refused_until
         {
             return false;
         }
@@ -873,7 +873,7 @@ impl Core {
             super::jobs::JobReq::Handoff {
                 req,
                 from,
-                at: now.wall,
+                at: now.wait,
             },
             replica,
             out,

@@ -291,11 +291,29 @@ fn count(kind: &'static str, location: Option<&object_store::path::Path>) {
 /// sync rounds keep completing around it) is not mistaken for an outage.
 static LAST_COMPLETED_MS: AtomicI64 = AtomicI64::new(0);
 
+/// This node's wait clock (`ProtocolClock::wait`) in ms: what the S3 path's
+/// stamps and the stall rule over them count on (plan 43 C7-H1). The
+/// stall verdict is liveness, decided from this node's own elapsed time: a
+/// wall step neither makes a healthy path look stalled (a forward one,
+/// which would send the node's ops down the S3-less path and fail them at
+/// its deadline) nor hides a stalled one (a backward one).
+pub fn wait_ms() -> i64 {
+    constellation_platform::clock::protocol().wait().0
+}
+
+/// A wait-clock stamp as unix ms for status (0, "never", stays 0).
+fn status_unix_ms(wait_stamp: i64) -> i64 {
+    if wait_stamp == 0 {
+        0
+    } else {
+        let now = constellation_platform::clock::protocol().now();
+        now.wall_of_wait(constellation_authority::WaitMs(wait_stamp))
+            .0
+    }
+}
+
 fn completed() {
-    LAST_COMPLETED_MS.store(
-        constellation_store_s3::lease::now_unix_ms(),
-        Ordering::Relaxed,
-    );
+    LAST_COMPLETED_MS.store(wait_ms(), Ordering::Relaxed);
 }
 
 /// Requests S3 did not answer, and the last one's time and error
@@ -318,10 +336,7 @@ fn note<T>(r: &object_store::Result<T>) {
         | Err(E::NotModified { .. }) => completed(),
         Err(e) => {
             UNANSWERED.fetch_add(1, Ordering::Relaxed);
-            LAST_UNANSWERED_MS.store(
-                constellation_store_s3::lease::now_unix_ms(),
-                Ordering::Relaxed,
-            );
+            LAST_UNANSWERED_MS.store(wait_ms(), Ordering::Relaxed);
             let mut text = e.to_string();
             text.truncate(400);
             *LAST_UNANSWERED_ERROR.lock().unwrap() = Some(text);
@@ -370,7 +385,7 @@ impl Outstanding {
     }
 
     fn issued() -> Self {
-        Self::issued_at(constellation_store_s3::lease::now_unix_ms())
+        Self::issued_at(wait_ms())
     }
 
     /// Record the request's outcome ([`note`]) and take it off the map.
@@ -390,10 +405,7 @@ impl Drop for Outstanding {
     fn drop(&mut self) {
         outstanding_requests().remove(&self.id);
         if !self.settled {
-            LAST_UNANSWERED_MS.store(
-                constellation_store_s3::lease::now_unix_ms(),
-                Ordering::Relaxed,
-            );
+            LAST_UNANSWERED_MS.store(wait_ms(), Ordering::Relaxed);
             *LAST_UNANSWERED_ERROR.lock().unwrap() =
                 Some("given up by its caller before S3 answered".to_string());
         }
@@ -582,12 +594,11 @@ pub fn s3_request_counts() -> constellation_control::proto::types::S3RequestStat
         copy: c.copy.load(Ordering::Relaxed),
         by_area: c.by_area.lock().unwrap().clone(),
         unanswered: UNANSWERED.load(Ordering::Relaxed),
-        last_answered_unix_ms: LAST_COMPLETED_MS.load(Ordering::Relaxed),
-        last_unanswered_unix_ms: LAST_UNANSWERED_MS.load(Ordering::Relaxed),
+        last_answered_unix_ms: status_unix_ms(LAST_COMPLETED_MS.load(Ordering::Relaxed)),
+        last_unanswered_unix_ms: status_unix_ms(LAST_UNANSWERED_MS.load(Ordering::Relaxed)),
         last_unanswered_error: LAST_UNANSWERED_ERROR.lock().unwrap().clone(),
         outstanding: outstanding as u64,
-        oldest_outstanding_ms: oldest
-            .map(|issued| (constellation_store_s3::lease::now_unix_ms() - issued).max(0) as u64),
+        oldest_outstanding_ms: oldest.map(|issued| (wait_ms() - issued).max(0) as u64),
     }
 }
 
@@ -752,7 +763,7 @@ mod tests {
     /// as one that failed.
     #[test]
     fn the_outstanding_requests_decide_the_stall() {
-        let now = constellation_store_s3::lease::now_unix_ms();
+        let now = wait_ms();
         let _path = s3_path_for_test(now - 60_000);
         assert_eq!(s3_stall_in_ms(now, 6_000, 0), None, "nothing asked");
         {
@@ -779,7 +790,7 @@ mod tests {
     #[test]
     fn a_listing_is_answered_by_its_first_item_or_its_end() {
         use futures::StreamExt;
-        let now = constellation_store_s3::lease::now_unix_ms();
+        let now = wait_ms();
         let _path = s3_path_for_test(now - 60_000);
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()

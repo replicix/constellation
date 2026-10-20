@@ -16,7 +16,7 @@ use super::lease::{PendingGate, Plan};
 use super::{Core, S3For};
 use crate::action::{Action, ControlOk, S3Op};
 use crate::event::{CasFailure, Control, PeerMsg, S3Failure, S3Result, UploadResult};
-use crate::ids::{Epoch, Ms, NodeId, Now, OpId, Seq};
+use crate::ids::{Epoch, NodeId, Now, OpId, Seq, WaitMs};
 use crate::replica::Replica;
 use crate::segment;
 use constellation_fs_core::Ino;
@@ -85,7 +85,7 @@ pub(crate) enum JobReq {
         req: OpId,
         from: NodeId,
         /// When the request arrived (see `begin_handoff`'s staleness rule).
-        at: Ms,
+        at: WaitMs,
     },
     TailToHead {
         control: OpId,
@@ -107,7 +107,7 @@ const FLUSH_FLOOR_LOOK_MS: u64 = 200;
 pub(crate) struct PendingFlush {
     control: OpId,
     stop: bool,
-    since: Ms,
+    since: WaitMs,
 }
 
 /// The kind of the job in the slot (`status`, tests).
@@ -544,7 +544,7 @@ impl Core {
             TailThen::Round | TailThen::Control | TailThen::Recover => {
                 let since = self
                     .gap_checked_at
-                    .map(|at| now.wall.since(at))
+                    .map(|at| now.wait.since(at))
                     .unwrap_or(i64::MAX);
                 let hinted = self.stream_hinted() >= next
                     || self.stream_head().is_some_and(|head| head >= next);
@@ -593,7 +593,7 @@ impl Core {
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
-        self.gap_checked_at = Some(now.wall);
+        self.gap_checked_at = Some(now.wait);
         let next = self.ship.next_seq;
         match first {
             None => {
@@ -1134,7 +1134,7 @@ impl Core {
             let op = self.op_id();
             self.publishing = Some(op);
             self.ship.shipped_since_publish = 0;
-            self.ship.last_publish = now.wall;
+            self.ship.last_publish = now.wait;
             out.push(Action::Publish {
                 op,
                 epoch: self.ship.last_ship_epoch,
@@ -1498,17 +1498,17 @@ impl Core {
         if self.ship.probe_now {
             // Plan 30 §M9: a strict read waits for proof of S3 liveness.
             self.ship.probe_now = false;
-            self.ship.held_tail_at = Some(now.wall);
+            self.ship.held_tail_at = Some(now.wait);
             return false;
         }
         match self.ship.held_tail_at {
-            Some(at) if now.wall.since(at) < self.cfg.held_tail_staleness_ms as i64 => true,
+            Some(at) if now.wait.since(at) < self.cfg.held_tail_staleness_ms as i64 => true,
             Some(_) => {
-                self.ship.held_tail_at = Some(now.wall);
+                self.ship.held_tail_at = Some(now.wait);
                 false
             }
             None => {
-                self.ship.held_tail_at = Some(now.wall);
+                self.ship.held_tail_at = Some(now.wait);
                 true
             }
         }
@@ -1984,7 +1984,7 @@ impl Core {
         let grace = self.cfg.inbox_p2p_grace_ms as i64;
         self.clients.values().any(|c| {
             matches!(c.phase, super::client::Phase::AwaitingLog { .. })
-                && now.wall.since(c.submitted) >= grace
+                && now.wait.since(c.submitted) >= grace
         })
     }
 
@@ -1999,7 +1999,7 @@ impl Core {
         let S3Result::LeaseGet(Ok(Some((lease, _)))) = result else {
             return;
         };
-        self.lease.note_object(now, &lease);
+        self.lease.note_object(&lease);
         // Only a lease that ran out unrenewed is a dead root's: a released
         // one was let go with everything shipped (the op's records come
         // with the next tail), and taking it would only move it.
@@ -2036,7 +2036,7 @@ impl Core {
             self.publish_forced || self.ship.shipped_since_publish >= self.cfg.publish_every;
         let idle_due = self.cfg.publisher
             && replica.has_dirty()
-            && now.wall.since(self.ship.last_publish) >= self.cfg.publish_idle_ms as i64;
+            && now.wait.since(self.ship.last_publish) >= self.cfg.publish_idle_ms as i64;
         if !self.cfg.publisher || self.publishing.is_some() || self.skip_ship {
             self.round_release(now, replica, out);
             return;
@@ -2047,7 +2047,7 @@ impl Core {
                 self.publishing = Some(op);
                 self.publish_forced = false;
                 self.ship.shipped_since_publish = 0;
-                self.ship.last_publish = now.wall;
+                self.ship.last_publish = now.wait;
                 out.push(Action::Publish {
                     op,
                     epoch: self.ship.last_ship_epoch.max(epoch),
@@ -2065,7 +2065,7 @@ impl Core {
             None if idle_due => {
                 let op = self.op_id();
                 self.publishing = Some(op);
-                self.ship.last_publish = now.wall;
+                self.ship.last_publish = now.wait;
                 out.push(Action::FollowHead { op });
             }
             _ => {}
@@ -2486,7 +2486,7 @@ impl Core {
             .cfg
             .handoff_pause_ms
             .max(self.ack.s3_rtt_ms.saturating_mul(8));
-        self.lease.pause_until = now.wall.plus(ms);
+        self.lease.pause_until = now.wait.plus(ms);
     }
 
     fn begin_acquire(
@@ -2564,8 +2564,8 @@ impl Core {
                         },
                         None,
                     );
-                    self.set_timer_wall(
-                        now.wall.plus(self.cfg.handoff_request_timeout_ms),
+                    self.set_timer_wait(
+                        now.wait.plus(self.cfg.handoff_request_timeout_ms),
                         super::Timer::JobRequestTimeout(req),
                         out,
                     );
@@ -2607,8 +2607,8 @@ impl Core {
                 },
                 None,
             );
-            self.set_timer_wall(
-                now.wall.plus(self.cfg.handoff_request_timeout_ms),
+            self.set_timer_wait(
+                now.wait.plus(self.cfg.handoff_request_timeout_ms),
                 super::Timer::JobRequestTimeout(req),
                 out,
             );
@@ -2633,7 +2633,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         if let Some((lease, _)) = &object {
-            self.lease.note_object(now, lease);
+            self.lease.note_object(lease);
         }
         if self.acquire_overtaken_by_epoch(now, replica, out) {
             return;
@@ -2756,8 +2756,8 @@ impl Core {
                         },
                         None,
                     );
-                    self.set_timer_wall(
-                        now.wall.plus(self.cfg.handoff_request_timeout_ms),
+                    self.set_timer_wait(
+                        now.wait.plus(self.cfg.handoff_request_timeout_ms),
                         super::Timer::JobRequestTimeout(req),
                         out,
                     );
@@ -3030,7 +3030,7 @@ impl Core {
         self.release_superseded(true, replica);
         self.shipped_touches.clear();
         self.shipped_floor = self.ship.head_seq;
-        self.ship.held_tail_at = Some(now.wall);
+        self.ship.held_tail_at = Some(now.wait);
         self.acquire_gate(now, replica, out);
         // Plan 43 C7-F F-a0: a floor armed (`note_fast_takeover`) means a
         // lease that says so. The claim CAS wrote it so when the permit was
@@ -3093,7 +3093,7 @@ impl Core {
                 // this node could not claim it): forwards hear `NotHolder`
                 // again for a TTL, so a requester that can reach S3 takes
                 // its own lease path instead of being held on and on.
-                self.readopt_refused_until = now.wall.plus(self.cfg.ttl_ms);
+                self.readopt_refused_until = now.wait.plus(self.cfg.ttl_ms);
             }
         }
         if acquired {
@@ -3145,7 +3145,7 @@ impl Core {
         now: Now,
         req: OpId,
         from: NodeId,
-        at: Ms,
+        at: WaitMs,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
@@ -3156,12 +3156,12 @@ impl Core {
         // back through S3 once its pause ran out (`visibility-s3-
         // latency`: a claim queued 12 s behind a round's ship loop under
         // slow S3, served while this node was the one writing).
-        let stale = now.wall.since(at) >= self.cfg.handoff_request_timeout_ms as i64;
+        let stale = now.wait.since(at) >= self.cfg.handoff_request_timeout_ms as i64;
         if stale {
             tracing::info!(
                 node = self.cfg.node_id,
                 requester = from,
-                waited_ms = now.wall.since(at),
+                waited_ms = now.wait.since(at),
                 "declining a stale lease request: its requester stopped waiting"
             );
         }
@@ -3219,7 +3219,7 @@ impl Core {
         now: Now,
         control: OpId,
         stop: bool,
-        since: Ms,
+        since: WaitMs,
         out: &mut Vec<Action>,
     ) {
         tracing::info!(
@@ -3237,8 +3237,8 @@ impl Core {
 
     fn arm_flush_floor(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.flush_floor_timer.is_none() && !self.pending_flushes.is_empty() {
-            let id = self.set_timer_wall(
-                now.wall.plus(FLUSH_FLOOR_LOOK_MS),
+            let id = self.set_timer_wait(
+                now.wait.plus(FLUSH_FLOOR_LOOK_MS),
                 super::Timer::FlushFloor,
                 out,
             );
@@ -3282,12 +3282,12 @@ impl Core {
         let floor = self.in_takeover_floor(now);
         let (expired, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_flushes)
             .into_iter()
-            .partition(|p| !floor && now.wall.since(p.since) >= cap);
+            .partition(|p| !floor && now.wait.since(p.since) >= cap);
         self.pending_flushes = waiting;
         for p in expired {
             tracing::warn!(
                 node = self.cfg.node_id,
-                waited_ms = now.wall.since(p.since),
+                waited_ms = now.wait.since(p.since),
                 "a flush gave up waiting for the takeover floor: the lease is not released and lapses"
             );
             out.push(Action::ControlDone {
@@ -3305,7 +3305,7 @@ impl Core {
 
     fn begin_flush(&mut self, now: Now, control: OpId, stop: bool, out: &mut Vec<Action>) {
         if self.release_held_back(now) {
-            self.park_flush(now, control, stop, now.wall, out);
+            self.park_flush(now, control, stop, now.wait, out);
             return;
         }
         let op = self.op_id();
@@ -3363,7 +3363,7 @@ impl Core {
                         let op = self.op_id();
                         self.publishing = Some(op);
                         self.ship.shipped_since_publish = 0;
-                        self.ship.last_publish = now.wall;
+                        self.ship.last_publish = now.wait;
                         let epoch = self.ship.last_ship_epoch.max(holder.unwrap_or(0));
                         out.push(Action::Publish { op, epoch });
                         self.set_phase(Phase::FlushPublish { op }, Some(op));
@@ -3418,7 +3418,7 @@ impl Core {
                         Some(What::Flush { control, stop, .. }) => {
                             let (control, stop) = (*control, *stop);
                             self.job = None;
-                            self.park_flush(now, control, stop, now.wall, out);
+                            self.park_flush(now, control, stop, now.wait, out);
                             self.start_next_job(now, replica, out);
                         }
                         _ => self.finish_flush_job(now, false, replica, out),
@@ -3951,7 +3951,7 @@ impl Core {
                 self.acquire_classified(now, object, replica, out)
             }
             (Phase::EpochCarrierCheck, S3Result::LeaseGet(Ok(object))) => {
-                self.epoch_carrier_checked(now, object.map(|(l, _)| l), replica, out)
+                self.epoch_carrier_checked(object.map(|(l, _)| l), replica, out)
             }
             (Phase::EpochCarrierCheck, S3Result::LeaseGet(Err(_))) => {
                 // S3 is away again: the epoch stays open.
@@ -4325,13 +4325,12 @@ impl Core {
     /// writes).
     fn epoch_carrier_checked(
         &mut self,
-        now: Now,
         object: Option<Lease>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
     ) {
         if let Some(l) = &object {
-            self.lease.note_object(now, l);
+            self.lease.note_object(l);
         }
         let carried = self.pr.carried;
         let still_carried = match (&object, carried) {

@@ -80,7 +80,7 @@
 use super::{Core, Timer};
 use crate::action::Action;
 use crate::event::PeerMsg;
-use crate::ids::{Epoch, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
+use crate::ids::{Epoch, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -90,7 +90,7 @@ struct Served {
     req: OpId,
     /// The next frame number.
     n: u64,
-    last_sent: Ms,
+    last_sent: WaitMs,
 }
 
 /// This node's subscription to a holder.
@@ -137,10 +137,10 @@ pub(crate) struct StreamState {
     heartbeat_timer: Option<TimerId>,
     // ---- subscriber ----
     sub: Option<Subscription>,
-    retry_at: Ms,
+    retry_at: WaitMs,
     retry_ms: u64,
     watchdog_timer: Option<TimerId>,
-    last_s3_tail: Ms,
+    last_s3_tail: WaitMs,
     /// Whether the peer directory last said the known holder is
     /// reachable: a subscriber that backed off while the holder was not
     /// (a fresh mount, before the registry enrolled both keys) retries at
@@ -289,7 +289,7 @@ impl Core {
         };
         let n = s.n;
         s.n += 1;
-        s.last_sent = now.wall;
+        s.last_sent = now.wait;
         self.stats.stream_frames_sent += 1;
         if let Some((seq, _)) = &segment {
             tracing::debug!(
@@ -345,7 +345,7 @@ impl Core {
             Served {
                 req,
                 n: 0,
-                last_sent: now.wall,
+                last_sent: now.wait,
             },
         );
         if self.epoch_streams_ahead() {
@@ -369,8 +369,8 @@ impl Core {
         // the stream is up) even when nothing is pending.
         self.stream_frame(now, from, None, out);
         if self.stream.heartbeat_timer.is_none() {
-            let id = self.set_timer_wall(
-                now.wall.plus(self.stream_heartbeat_every()),
+            let id = self.set_timer_wait(
+                now.wait.plus(self.stream_heartbeat_every()),
                 Timer::StreamHeartbeat,
                 out,
             );
@@ -417,13 +417,13 @@ impl Core {
             .stream
             .served
             .iter()
-            .filter(|(_, s)| now.wall.since(s.last_sent) >= every as i64)
+            .filter(|(_, s)| now.wait.since(s.last_sent) >= every as i64)
             .map(|(n, _)| *n)
             .collect();
         for node in idle {
             self.stream_frame(now, node, None, out);
         }
-        let id = self.set_timer_wall(now.wall.plus(every), Timer::StreamHeartbeat, out);
+        let id = self.set_timer_wait(now.wait.plus(every), Timer::StreamHeartbeat, out);
         self.stream.heartbeat_timer = Some(id);
     }
 
@@ -487,8 +487,8 @@ impl Core {
             msg: PeerMsg::LogSubscribe { req, from },
         });
         if self.stream.watchdog_timer.is_none() {
-            let id = self.set_timer_wall(
-                now.wall.plus(self.stream_watchdog_every()),
+            let id = self.set_timer_wait(
+                now.wait.plus(self.stream_watchdog_every()),
                 Timer::StreamWatchdog,
                 out,
             );
@@ -537,7 +537,7 @@ impl Core {
                 .stream
                 .retry_ms
                 .clamp(min, self.cfg.stream_retry_max_ms.max(min));
-            self.stream.retry_at = now.wall.plus(wait);
+            self.stream.retry_at = now.wait.plus(wait);
             self.stream.retry_ms = wait.saturating_mul(2);
         }
         self.nudge(now, out);
@@ -670,8 +670,8 @@ impl Core {
             self.drop_subscription(now, "silent", true, true, out);
             return;
         }
-        let id = self.set_timer_wall(
-            now.wall.plus(self.stream_watchdog_every()),
+        let id = self.set_timer_wait(
+            now.wait.plus(self.stream_watchdog_every()),
             Timer::StreamWatchdog,
             out,
         );
@@ -751,7 +751,7 @@ impl Core {
     /// probe is not due.
     pub(crate) fn stream_covers_tail(&self, now: Now) -> bool {
         self.stream_caught_up(now)
-            && now.wall.since(self.stream.last_s3_tail) < self.cfg.stream_backstop_ms as i64
+            && now.wait.since(self.stream.last_s3_tail) < self.cfg.stream_backstop_ms as i64
     }
 
     fn stream_caught_up(&self, now: Now) -> bool {
@@ -773,7 +773,7 @@ impl Core {
     /// one-GET probe of a stream still caught up (`stream_followup_width`),
     /// so a narrow probe never stops short of the head.
     pub(crate) fn stream_tail_width(&mut self, now: Now) -> usize {
-        self.stream.last_s3_tail = now.wall;
+        self.stream.last_s3_tail = now.wait;
         let full = self.cfg.tail_width.max(1);
         if self.stream_caught_up(now) {
             1
@@ -839,7 +839,7 @@ impl Core {
             .and_then(|h| self.links.get(&h))
             .is_some_and(|l| l.connected);
         if up && !self.stream.holder_link_up && self.stream.sub.is_none() {
-            self.stream.retry_at = now.wall;
+            self.stream.retry_at = now.wait;
             self.stream.retry_ms = self.cfg.stream_retry_min_ms;
         }
         self.stream.holder_link_up = up;
@@ -880,12 +880,12 @@ impl Core {
                 };
                 self.drop_subscription(now, why, true, false, out);
                 if let Some(want) = want {
-                    if now.wall >= self.stream.retry_at {
+                    if now.wait >= self.stream.retry_at {
                         self.subscribe(now, want, out);
                     }
                 }
             }
-            (None, Some(want)) if now.wall >= self.stream.retry_at => {
+            (None, Some(want)) if now.wait >= self.stream.retry_at => {
                 self.subscribe(now, want, out)
             }
             _ => {}

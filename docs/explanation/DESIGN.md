@@ -890,6 +890,16 @@ never ends a wait early and a backward one never lengthens it. A holder's
 heartbeat names its lease's end on that clock too, so a successor's cap on its
 floor is a difference on a clock no wall step moves.
 
+Liveness is on the wait clock as well: every timer, a client op's deadlines
+(the forward and acquire timeouts, the S3-less bound, the inbox deadline), the
+age of a queue or a retry, the idle and dwell times that release a lease, and
+the stamps of the S3 path's stall test. A wall-clock step therefore neither
+fails an operation early (a forward step) nor keeps one waiting past its bound
+(a backward step), and does not make a healthy S3 path look stalled. What
+still reads the wall clock is exactly what crosses nodes (the expiry in a lease
+or promise body, a batch's submission time, the root's lock cut), what is
+persisted, what is an identity key, and what is shown in status and logs.
+
 All transitions between roots are explicit and persisted before they take
 effect. Heartbeats and silence now drive liveness decisions — a backup
 seals a silent holder, an `ack=s3` peer takes one over, a node publishes a

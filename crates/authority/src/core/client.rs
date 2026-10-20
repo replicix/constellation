@@ -13,7 +13,7 @@
 use super::{Core, S3For, Timer};
 use crate::action::{Action, ClientReply, S3Op};
 use crate::event::{PeerMsg, Policy, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, Now, OpId};
+use crate::ids::{Epoch, NodeId, Now, OpId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::Ownership;
@@ -116,8 +116,8 @@ pub(crate) struct ClientOp {
     pub timer: Option<crate::ids::TimerId>,
     /// M13: when the op entered the inbox path (its in-doubt deadline
     /// counts from here) and when its batch became durable.
-    pub inbox_since: Option<Ms>,
-    pub inbox_durable_at: Option<Ms>,
+    pub inbox_since: Option<WaitMs>,
+    pub inbox_durable_at: Option<WaitMs>,
     /// Every durable batch this rid was submitted in and may still sit
     /// in (plan 30 M5 round 4; seed 10476 of the long configuration,
     /// found by the M8 coder and bisected by the M7 coder). One op can
@@ -147,7 +147,7 @@ pub(crate) struct ClientOp {
     /// When the op was submitted, and the states it went through since
     /// (`(ms after submission, state)`, at most [`HISTORY_CAP`]): a slow
     /// op is logged with them when it finishes (`finish`).
-    pub submitted: Ms,
+    pub submitted: WaitMs,
     pub history: Vec<(i64, String)>,
     /// Chunk close-stall-metered: the safety timer of
     /// `Core::await_own_records` (cancelled when the op finishes), the
@@ -239,7 +239,7 @@ impl super::Core {
                 state.push_str("+held-for-replays");
             }
             if c.history.last().is_none_or(|(_, s)| *s != state) && c.history.len() < HISTORY_CAP {
-                c.history.push((now.wall.since(c.submitted), state));
+                c.history.push((now.wait.since(c.submitted), state));
             }
         }
     }
@@ -247,7 +247,7 @@ impl super::Core {
     /// A client op that took longer than `CONSTELLATION_SLOW_OP_MS` is
     /// logged with the states it went through.
     fn log_if_slow(&self, now: Now, rid: Rid, c: &ClientOp, outcome: &str, replica: &dyn Replica) {
-        let took = now.wall.since(c.submitted);
+        let took = now.wait.since(c.submitted);
         if slow_op_ms() <= 0 || took < slow_op_ms() {
             return;
         }
@@ -451,8 +451,8 @@ impl Core {
             tracing::warn!(node = self.cfg.node_id, ?rid, "duplicate submit ignored");
             return;
         }
-        let deadline = self.set_timer_wall(
-            now.wall.plus(self.cfg.acquire_deadline_ms),
+        let deadline = self.set_timer_wait(
+            now.wait.plus(self.cfg.acquire_deadline_ms),
             Timer::ClientDeadline(rid),
             out,
         );
@@ -496,7 +496,7 @@ impl Core {
                 deps,
                 also_client: false,
                 deps_held: false,
-                submitted: now.wall,
+                submitted: now.wait,
                 history: Vec::new(),
                 own_record_timer: None,
                 own_record_inos: BTreeSet::new(),
@@ -751,8 +751,8 @@ impl Core {
             if let Some(t) = old {
                 self.cancel_timer(t, out);
             }
-            let timer = self.set_timer_wall(
-                now.wall.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+            let timer = self.set_timer_wait(
+                now.wait.plus(self.cfg.delegation_stream_tick_ms.max(10)),
                 Timer::ForwardBackoff(rid),
                 out,
             );
@@ -998,7 +998,7 @@ impl Core {
         }
         let object = match result {
             S3Result::LeaseGet(Ok(Some((lease, _)))) => {
-                self.lease.note_object(now, &lease);
+                self.lease.note_object(&lease);
                 Some(lease)
             }
             _ => None,
@@ -1045,8 +1045,8 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let req = self.op_id();
-        let timer = self.set_timer_wall(
-            now.wall.plus(self.cfg.forward_timeout_ms),
+        let timer = self.set_timer_wait(
+            now.wait.plus(self.cfg.forward_timeout_ms),
             Timer::ForwardTimeout(rid),
             out,
         );
@@ -1087,8 +1087,8 @@ impl Core {
             // `hold_for_lost_deps` decides.
             c.phase = Phase::Backoff;
             self.cancel_timer(timer, out);
-            let t = self.set_timer_wall(
-                now.wall.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+            let t = self.set_timer_wait(
+                now.wait.plus(self.cfg.delegation_stream_tick_ms.max(10)),
                 Timer::ForwardBackoff(rid),
                 out,
             );
@@ -1296,7 +1296,7 @@ impl Core {
                 // dedup, or holds the retry until the recalls are done.
                 self.stats.held_retries += 1;
                 let timer =
-                    self.set_timer_wall(now.wall.plus(retry_ms), Timer::ForwardBackoff(rid), out);
+                    self.set_timer_wait(now.wait.plus(retry_ms), Timer::ForwardBackoff(rid), out);
                 if let Some(c) = self.clients.get_mut(&rid) {
                     c.phase = Phase::Backoff;
                     c.timer = Some(timer);
@@ -1337,8 +1337,8 @@ impl Core {
                     });
                 if grant_lags {
                     self.stats.deleg_grant_lag_retries += 1;
-                    let timer = self.set_timer_wall(
-                        now.wall.plus(self.cfg.delegation_stream_tick_ms.max(10)),
+                    let timer = self.set_timer_wait(
+                        now.wait.plus(self.cfg.delegation_stream_tick_ms.max(10)),
                         Timer::ForwardBackoff(rid),
                         out,
                     );
@@ -1477,7 +1477,7 @@ impl Core {
                     .min(self.cfg.s3_less_retry_ms.max(self.cfg.forward_backoff_ms));
                 c.phase = Phase::Backoff;
                 let timer =
-                    self.set_timer_wall(now.wall.plus(delay), Timer::ForwardBackoff(rid), out);
+                    self.set_timer_wait(now.wait.plus(delay), Timer::ForwardBackoff(rid), out);
                 self.clients.get_mut(&rid).expect("present").timer = Some(timer);
             }
             _ => {
@@ -1591,7 +1591,7 @@ impl Core {
             stalled,
             peers_reach_s3: if stalled { peers_reach_s3 } else { None },
             since: if stalled {
-                self.own_s3.since.or(Some(now.wall))
+                self.own_s3.since.or(Some(now.wait))
             } else {
                 None
             },
@@ -1606,7 +1606,7 @@ impl Core {
                 .filter(|(_, c)| {
                     c.origin == Origin::Client
                         && c.policy == Policy::Client
-                        && now.wall.since(c.submitted) >= self.cfg.s3_less_deadline_ms as i64
+                        && now.wait.since(c.submitted) >= self.cfg.s3_less_deadline_ms as i64
                 })
                 .map(|(rid, _)| *rid)
                 .collect();
@@ -1617,7 +1617,7 @@ impl Core {
                         ?rid,
                         op = ?c.op,
                         phase = ?c.phase_kind(),
-                        age_ms = now.wall.since(c.submitted),
+                        age_ms = now.wait.since(c.submitted),
                         "no answer while this node's S3 is stalled: the op fails (in doubt)"
                     );
                 }
@@ -1721,8 +1721,8 @@ impl Core {
             // The inbox wait had its own deadline; the lease path gets
             // the ordinary one from here.
             self.cancel_timer(old_deadline, out);
-            let deadline = self.set_timer_wall(
-                now.wall.plus(self.cfg.acquire_deadline_ms),
+            let deadline = self.set_timer_wait(
+                now.wait.plus(self.cfg.acquire_deadline_ms),
                 Timer::ClientDeadline(rid),
                 out,
             );
@@ -1880,7 +1880,7 @@ impl Core {
         let delay = (self.cfg.acquire_retry_min_ms << c.acquire_retries.min(10))
             .min(self.cfg.acquire_retry_max_ms);
         c.phase = Phase::AcquireRetry;
-        let timer = self.set_timer_wall(now.wall.plus(delay), Timer::AcquireRetry(rid), out);
+        let timer = self.set_timer_wait(now.wait.plus(delay), Timer::AcquireRetry(rid), out);
         self.clients.get_mut(&rid).expect("present").timer = Some(timer);
     }
 
@@ -2247,8 +2247,8 @@ impl Core {
         u.inos.extend(inos.iter().copied());
         u.repeats = 0;
         if u.timer.is_none() {
-            let t = self.set_timer_wall(
-                now.wall.plus(self.cfg.own_record_wait_ms),
+            let t = self.set_timer_wait(
+                now.wait.plus(self.cfg.own_record_wait_ms),
                 Timer::ObservedUpload,
                 out,
             );
@@ -2278,8 +2278,8 @@ impl Core {
             "an observed position still waits for this node's pending chunks: uploading again"
         );
         out.push(Action::UploadAwaited { inos });
-        let t = self.set_timer_wall(
-            now.wall.plus(self.cfg.own_record_wait_ms),
+        let t = self.set_timer_wait(
+            now.wait.plus(self.cfg.own_record_wait_ms),
             Timer::ObservedUpload,
             out,
         );
@@ -2366,7 +2366,7 @@ impl Core {
                 self.upload_own_records(now, rid, out);
             }
         } else if c.own_record_timer.is_none() {
-            let t = self.set_timer_wall(now.wall.plus(wait), Timer::OwnRecordWait(rid), out);
+            let t = self.set_timer_wait(now.wait.plus(wait), Timer::OwnRecordWait(rid), out);
             self.clients
                 .get_mut(&rid)
                 .expect("present")
@@ -2407,7 +2407,7 @@ impl Core {
         out.push(Action::UploadAwaited { inos });
         let wait = self.cfg.own_record_wait_ms;
         if wait > 0 {
-            let t = self.set_timer_wall(now.wall.plus(wait), Timer::OwnRecordWait(rid), out);
+            let t = self.set_timer_wait(now.wait.plus(wait), Timer::OwnRecordWait(rid), out);
             self.clients
                 .get_mut(&rid)
                 .expect("present")

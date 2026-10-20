@@ -8,7 +8,7 @@
 //! simulation's paused clock governs expiry end to end.
 
 use super::Config;
-use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, WaitMs};
+use crate::ids::{Epoch, HonourMs, NodeId, Now, WaitMs};
 use constellation_store_s3::lease::LEASE_VERSION;
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 
@@ -78,27 +78,26 @@ pub enum Plan {
 pub struct LeaseState {
     /// The lease we believe we hold, with the tag to swap it.
     pub held: Option<(Lease, LeaseTag)>,
-    pub held_since: Option<Ms>,
+    pub held_since: Option<WaitMs>,
     pub wanted: Vec<NodeId>,
-    pub wanted_since: Option<Ms>,
+    pub wanted_since: Option<WaitMs>,
     /// Deposed: never ship under the old epoch again until recovered.
     pub lost: bool,
     /// After a deposition, the epoch below which own unshipped work is
     /// stranded (`u64::MAX` when unknown: a persisted deposition).
     pub lost_floor: Epoch,
-    /// `begin_handoff_pause`: new local mutations closed until here.
-    pub pause_until: Ms,
+    /// `Core::begin_handoff_pause`: new local mutations closed until here (wait clock).
+    pub pause_until: WaitMs,
     /// A release/handoff is in its final flush + CAS section.
     pub releasing: bool,
     pub gate: Option<PendingGate>,
-    pub last_write: Ms,
+    pub last_write: WaitMs,
     /// `ForwardState::cached_holder` (from `NotHolder` redirects and
     /// lease reads).
     pub cached_holder: Option<NodeId>,
     /// The last lease object read from S3, for `AcquireProgress`-style
     /// progress detection and the cached holder, and when it was read.
     pub last_seen: Option<Lease>,
-    pub last_seen_at: Option<Ms>,
     /// Continuation-epoch local authority (DESIGN.md §5.3): no S3 lease
     /// object, writes journal locally, nothing ships until the epoch
     /// closes.
@@ -145,7 +144,7 @@ impl LeaseState {
         self.lost_floor = 0;
         self.epoch_hold = Some(epoch.max(1));
         self.cached_holder = None;
-        self.last_write = now.wall;
+        self.last_write = now.wait;
     }
 
     /// `LeaseKeeper::release_local`: the epoch closed; whatever S3 lease
@@ -230,7 +229,7 @@ impl LeaseState {
         if self.epoch_hold.is_some() {
             return self.usable(now, cfg);
         }
-        now.wall >= self.pause_until && self.usable(now, cfg)
+        now.wait >= self.pause_until && self.usable(now, cfg)
     }
 
     /// `LeaseView::new_mutation_epoch`: the epoch a new local mutation
@@ -264,15 +263,11 @@ impl LeaseState {
     }
 
     pub fn is_paused_for_handoff(&self, now: Now) -> bool {
-        self.pause_until > now.wall
-    }
-
-    pub fn begin_handoff_pause(&mut self, now: Now, cfg: &Config) {
-        self.pause_until = now.wall.plus(cfg.handoff_pause_ms);
+        self.pause_until > now.wait
     }
 
     pub fn touch(&mut self, now: Now) {
-        self.last_write = now.wall;
+        self.last_write = now.wait;
     }
 
     /// `LeaseKeeper::wants_handoff`: dwell and wanted timers alone justify
@@ -284,18 +279,18 @@ impl LeaseState {
     pub fn wants_handoff(&self, now: Now, cfg: &Config) -> bool {
         let dwelt = self
             .held_since
-            .is_some_and(|since| now.wall.since(since) >= cfg.dwell_ms as i64);
+            .is_some_and(|since| now.wait.since(since) >= cfg.dwell_ms as i64);
         if self.epoch_hold.is_some() || self.held.is_none() || !dwelt {
             return false;
         }
-        if self.release_when_idle && now.wall.since(self.last_write) >= cfg.dwell_ms as i64 {
+        if self.release_when_idle && now.wait.since(self.last_write) >= cfg.dwell_ms as i64 {
             return true;
         }
         !self.wanted.is_empty()
-            && (now.wall.since(self.last_write) >= cfg.idle_release_ms as i64
+            && (now.wait.since(self.last_write) >= cfg.idle_release_ms as i64
                 || self
                     .wanted_since
-                    .is_some_and(|since| now.wall.since(since) >= cfg.wanted_grace_ms as i64))
+                    .is_some_and(|since| now.wait.since(since) >= cfg.wanted_grace_ms as i64))
     }
 
     /// `LeaseKeeper::idle_release_due`.
@@ -519,7 +514,7 @@ impl LeaseState {
             self.wanted.sort_unstable();
         }
         if self.wanted_since.is_none() {
-            self.wanted_since = Some(now.wall);
+            self.wanted_since = Some(now.wait);
         }
     }
 
@@ -528,8 +523,8 @@ impl LeaseState {
         self.gate = gate;
         self.wanted.clear();
         self.wanted_since = None;
-        self.held_since = Some(now.wall);
-        self.last_write = now.wall;
+        self.held_since = Some(now.wait);
+        self.last_write = now.wait;
         self.last_seen = Some(lease.clone());
         self.cached_holder = Some(lease.holder);
         self.held = Some((lease, tag));
@@ -550,7 +545,7 @@ impl LeaseState {
         if self.wanted.is_empty() {
             self.wanted_since = None;
         } else if self.wanted_since.is_none() {
-            self.wanted_since = Some(now.wall);
+            self.wanted_since = Some(now.wait);
         }
         self.last_seen = Some(lease.clone());
         self.held = Some((lease, tag));
@@ -593,12 +588,11 @@ impl LeaseState {
     }
 
     /// Remember what a lease read said about who holds it.
-    pub fn note_object(&mut self, now: Now, lease: &Lease) {
+    pub fn note_object(&mut self, lease: &Lease) {
         if lease.holder != 0 {
             self.cached_holder = Some(lease.holder);
         }
         self.last_seen = Some(lease.clone());
-        self.last_seen_at = Some(now.wall);
     }
 }
 
@@ -629,6 +623,7 @@ pub fn backup_claim_grace_ms(cfg: &Config) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::Ms;
 
     fn cfg() -> Config {
         let mut c = Config::defaults(7, 1);
@@ -748,7 +743,7 @@ mod tests {
         assert_eq!(st.new_mutation_epoch(now, &cfg), Some(1));
         assert_eq!(st.ship_epoch(now, &cfg), Some(1));
         // The handoff pause closes new mutations but not shipping.
-        st.begin_handoff_pause(now, &cfg);
+        st.pause_until = now.wait.plus(cfg.handoff_pause_ms);
         assert_eq!(st.new_mutation_epoch(now, &cfg), None);
         assert_eq!(st.ship_epoch(now, &cfg), Some(1));
         let later = now.plus(cfg.handoff_pause_ms);
@@ -785,6 +780,43 @@ mod tests {
         assert!(
             !st.wants_handoff(t0.plus(9_000), &cfg),
             "hold: nobody asked"
+        );
+    }
+
+    /// Plan 43 C7-H1 (4/4): the idle release counts on the wait clock. A
+    /// forward wall step does not make a lease that was just written look
+    /// idle (a release the workload then pays for), and a backward one does
+    /// not hold an idle lease past its dwell. Fails on the parent: the
+    /// stamps were wall.
+    #[test]
+    fn a_forward_step_does_not_release_an_idle_lease_early() {
+        let mut cfg = cfg();
+        cfg.dwell_ms = 1_000;
+        cfg.idle_release_ms = 30_000;
+        let t0 = Now::same(1_000_000);
+        let mut st = LeaseState {
+            release_when_idle: true,
+            ..LeaseState::default()
+        };
+        let lease = st.granted_lease(t0, &cfg, None, false);
+        st.adopt(t0, lease, tag(), None);
+        st.touch(t0.plus(800));
+        // 700 ms later on every clock but the wall clock, which stepped
+        // 60 s forward (and the honour clock with it).
+        let stepped = |wall_step: i64, honour_step: i64, ms: u64| Now {
+            wall: Ms(t0.wall.0 + wall_step + ms as i64),
+            honour: HonourMs(t0.honour.0 + honour_step + ms as i64),
+            wait: WaitMs(t0.wait.0 + ms as i64),
+        };
+        assert!(
+            !st.wants_handoff(stepped(60_000, 60_000, 1_500), &cfg),
+            "written 700 ms ago: a forward step is not idle time"
+        );
+        // A backward step: the wall clock reads 60 s behind, the idle time
+        // is the elapsed time.
+        assert!(
+            st.wants_handoff(stepped(-60_000, 0, 1_900), &cfg),
+            "idle for the dwell, whatever the wall clock says"
         );
     }
 

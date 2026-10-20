@@ -47,7 +47,7 @@
 use super::delegate::DelegKind;
 use super::{Core, Timer};
 use crate::action::Action;
-use crate::ids::{Ms, NodeId, Now};
+use crate::ids::{NodeId, Now, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::types::ROOT_INO;
 use constellation_fs_core::Ino;
@@ -103,13 +103,13 @@ pub(crate) struct PlacementState {
     buckets: VecDeque<Bucket>,
     cur: Bucket,
     /// Directories recalled by placement: not placed again before this.
-    cooldown: BTreeMap<Ino, Ms>,
+    cooldown: BTreeMap<Ino, WaitMs>,
     pub timer: Option<crate::ids::TimerId>,
     /// The last evaluation's top subtrees, `(dir, node, node_ops,
     /// subtree_ops)`, for `status` (and M12's split decision).
     pub top: Vec<(Ino, NodeId, u64, u64)>,
     /// When a candidate outside the roster last had it re-read.
-    roster_refreshed: Option<Ms>,
+    roster_refreshed: Option<WaitMs>,
 }
 
 /// How often a candidate the roster does not list has it re-read.
@@ -258,8 +258,8 @@ impl Core {
         if !self.cfg.placement || !self.cfg.delegation || self.pl.timer.is_some() {
             return;
         }
-        let t = self.set_timer_wall(
-            now.wall.plus(self.placement_tick_ms()),
+        let t = self.set_timer_wait(
+            now.wait.plus(self.placement_tick_ms()),
             Timer::Placement,
             out,
         );
@@ -304,9 +304,9 @@ impl Core {
         if self
             .pl
             .roster_refreshed
-            .is_none_or(|at| now.wall.since(at) >= ROSTER_REFRESH_MS)
+            .is_none_or(|at| now.wait.since(at) >= ROSTER_REFRESH_MS)
         {
-            self.pl.roster_refreshed = Some(now.wall);
+            self.pl.roster_refreshed = Some(now.wait);
             tracing::debug!(
                 node = self.cfg.node_id,
                 candidate = node,
@@ -380,12 +380,12 @@ impl Core {
                 g.below_since = None;
                 continue;
             }
-            let since = *g.below_since.get_or_insert(now.wall);
+            let since = *g.below_since.get_or_insert(now.wait);
             let dwell = self.cfg.placement_dwell_ms as i64;
-            if now.wall.since(since) >= dwell && now.wait.since(g.granted) >= dwell {
+            if now.wait.since(since) >= dwell && now.wait.since(g.granted) >= dwell {
                 self.pl
                     .cooldown
-                    .insert(dir, now.wall.plus(self.cfg.placement_cooldown_ms));
+                    .insert(dir, now.wait.plus(self.cfg.placement_cooldown_ms));
                 if range.is_whole() {
                     self.stats.place_recalled += 1;
                 } else {
@@ -456,7 +456,7 @@ impl Core {
                 .pl
                 .cooldown
                 .get(&dir)
-                .is_some_and(|until| *until > now.wall)
+                .is_some_and(|until| *until > now.wait)
             {
                 self.stats.place_skipped_cooldown += 1;
                 continue;
@@ -510,7 +510,7 @@ impl Core {
                             .pl
                             .cooldown
                             .get(dir)
-                            .is_some_and(|until| *until > now.wall)
+                            .is_some_and(|until| *until > now.wait)
                 })
                 .collect();
             hot.sort_by_key(|(dir, _)| *dir);
@@ -614,6 +614,6 @@ impl Core {
                 }
             }
         }
-        self.pl.cooldown.retain(|_, until| *until > now.wall);
+        self.pl.cooldown.retain(|_, until| *until > now.wait);
     }
 }

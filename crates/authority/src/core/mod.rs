@@ -1160,9 +1160,9 @@ pub struct ShipState {
     /// The highest sequence applied or shipped.
     pub head_seq: Seq,
     pub shipped_since_publish: u64,
-    pub last_publish: Ms,
+    pub last_publish: WaitMs,
     /// When this node last read its own held stream (`held_tail_at`).
-    pub held_tail_at: Option<Ms>,
+    pub held_tail_at: Option<WaitMs>,
     /// A tailed segment carried an epoch above the one this node holds:
     /// renew now, not at half-TTL (`prepare_renew_now`).
     pub renew_now: bool,
@@ -1188,7 +1188,7 @@ impl Default for ShipState {
             max_epoch: 0,
             head_seq: 0,
             shipped_since_publish: 0,
-            last_publish: Ms(0),
+            last_publish: WaitMs(0),
             held_tail_at: None,
             renew_now: false,
             renew_early_of: None,
@@ -1211,8 +1211,9 @@ pub struct OwnS3 {
     /// (`Some(false)`: a bucket outage, the continuation epoch's), or
     /// nobody answered (`None`).
     pub peers_reach_s3: Option<bool>,
-    /// When the stall was first reported.
-    pub since: Option<Ms>,
+    /// When the stall was first reported (wait clock; status shows the
+    /// elapsed time).
+    pub since: Option<WaitMs>,
 }
 
 /// The driver's continuation-epoch state as last reported
@@ -1284,22 +1285,8 @@ pub(crate) enum S3For {
 /// C7-H1). Two deadlines are only compared when they are on the same one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimerAt {
-    Wall(Ms),
     Honour(HonourMs),
     Wait(WaitMs),
-}
-
-impl TimerAt {
-    /// Whether this timer fires after the WALL deadline `at`; `None` when
-    /// it is on another clock: two deadlines of different clocks have no
-    /// order, so a caller that gets `None` has moved its timer off the
-    /// wall clock and must compare on that clock instead.
-    pub(crate) fn later_than_wall(self, at: Ms) -> Option<bool> {
-        match self {
-            TimerAt::Wall(t) => Some(at < t),
-            TimerAt::Honour(_) | TimerAt::Wait(_) => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1487,7 +1474,7 @@ pub struct Core {
     pending_plan: Option<Plan>,
     /// When the last retention gap check ran (`None`: never since start,
     /// so the first empty probe after a mount runs one).
-    gap_checked_at: Option<Ms>,
+    gap_checked_at: Option<WaitMs>,
     marker_attempts: u32,
     ship_attempts: u32,
     ship_purpose: jobs::ShipPurpose,
@@ -1512,13 +1499,13 @@ pub struct Core {
     pub(crate) own_s3: OwnS3,
     /// A-1: no re-adoption of this node's own lease for a forward before
     /// this (a failed one backs off for a TTL).
-    pub(crate) readopt_refused_until: Ms,
+    pub(crate) readopt_refused_until: WaitMs,
     /// EC2 finding 2: as the holder, when each other node last had a
     /// mutation executed here over P2P (a forward), and when each last
     /// had one executed through the S3 inbox — which side of a P2P
     /// partition uses the lease (`Core::keeps_lease_for_p2p_side`).
-    demand_p2p: BTreeMap<NodeId, Ms>,
-    demand_inbox: BTreeMap<NodeId, Ms>,
+    demand_p2p: BTreeMap<NodeId, WaitMs>,
+    demand_inbox: BTreeMap<NodeId, WaitMs>,
     pub(crate) inbox: inbox::InboxState,
     stream: stream::StreamState,
     /// M8: ReadIndex requests, grants being recalled, parked acks.
@@ -1595,7 +1582,7 @@ impl Core {
             roster: Vec::new(),
             links: BTreeMap::new(),
             own_s3: OwnS3::default(),
-            readopt_refused_until: Ms(0),
+            readopt_refused_until: WaitMs(0),
             demand_p2p: BTreeMap::new(),
             demand_inbox: BTreeMap::new(),
             inbox: inbox::InboxState::default(),
@@ -1723,7 +1710,7 @@ impl Core {
     pub fn start(&mut self, now: Now, replica: &dyn Replica, out: &mut Vec<Action>) {
         self.clk = now;
         replica.set_holder_epoch(0);
-        self.ship.last_publish = now.wall;
+        self.ship.last_publish = now.wait;
         let applied = replica.applied_seq().unwrap_or(0);
         self.ship.next_seq = applied + 1;
         self.ship.head_seq = applied;
@@ -1906,7 +1893,6 @@ impl Core {
     #[cfg(test)]
     pub(crate) fn timer_ms(&self, id: TimerId) -> Option<Ms> {
         Some(match self.timer_at(id)? {
-            TimerAt::Wall(at) => at,
             TimerAt::Honour(at) => Ms(at.0),
             TimerAt::Wait(at) => Ms(at.0),
         })
@@ -2257,7 +2243,7 @@ impl Core {
         if self.on_read_request_failed(now, req, to, outage, out) {
             return;
         }
-        if self.on_backup_request_failed(now.wall, req, to) {
+        if self.on_backup_request_failed(now.wait, req, to) {
             return;
         }
         if self.on_promise_request_failed(now, req, replica, out) {
@@ -2297,7 +2283,7 @@ impl Core {
             S3For::LearnHolder(rid) => self.on_holder_learned(now, rid, result, replica, out),
             S3For::RefreshHolder => {
                 if let S3Result::LeaseGet(Ok(Some((lease, _)))) = result {
-                    self.lease.note_object(now, &lease);
+                    self.lease.note_object(&lease);
                 }
             }
             S3For::RegisterWanted => {}
@@ -2319,7 +2305,7 @@ impl Core {
             S3For::HeartbeatPut(slack) => self.on_heartbeat_put(slack, result),
             S3For::PromiseWatch => {
                 if let S3Result::LeaseGet(Ok(Some((lease, _)))) = result {
-                    self.lease.note_object(now, &lease);
+                    self.lease.note_object(&lease);
                 }
             }
             S3For::DeadRoot => self.on_dead_root_get(now, result, replica, out),
@@ -2913,14 +2899,6 @@ impl Core {
         id
     }
 
-    /// A timer at a WALL deadline (plan 43 C7-H1): what is wall by its
-    /// stamp; the others are on the clock of theirs (`set_timer_honour`,
-    /// `set_timer_wait`).
-    fn set_timer_wall(&mut self, at: Ms, timer: Timer, out: &mut Vec<Action>) -> TimerId {
-        let remaining = at.since(self.clk.wall);
-        self.arm_timer(TimerAt::Wall(at), remaining, timer, out)
-    }
-
     /// A timer at a WAIT deadline: a wait-side or liveness stamp's end.
     fn set_timer_wait(&mut self, at: WaitMs, timer: Timer, out: &mut Vec<Action>) -> TimerId {
         let remaining = at.since(self.clk.wait);
@@ -2963,7 +2941,7 @@ impl Core {
         if let Some(id) = self.poll_timer.take() {
             self.cancel_timer(id, out);
         }
-        let id = self.set_timer_wall(now.wall.plus(delay_ms), Timer::Poll, out);
+        let id = self.set_timer_wait(now.wait.plus(delay_ms), Timer::Poll, out);
         self.poll_timer = Some(id);
     }
 
@@ -2971,8 +2949,8 @@ impl Core {
         if self.drain_timer.is_some() {
             return;
         }
-        let id = self.set_timer_wall(
-            now.wall.plus(self.cfg.replay_drain_ms),
+        let id = self.set_timer_wait(
+            now.wait.plus(self.cfg.replay_drain_ms),
             Timer::ReplayDrain,
             out,
         );

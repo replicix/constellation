@@ -57,7 +57,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk};
 use crate::event::PeerMsg;
-use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, TimerId, WaitMs};
+use crate::ids::{HonourMs, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
@@ -120,7 +120,7 @@ pub(crate) struct GenState {
     pub granted: WaitMs,
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
-    pub below_since: Option<Ms>,
+    pub below_since: Option<WaitMs>,
     /// Phase 2b: seals asked of the backup (one; then the plain reclaim).
     pub seal_attempts: u8,
     /// Appended through this stream index.
@@ -171,7 +171,7 @@ pub(crate) struct DelegateState {
     pub stopped: bool,
     /// The stream's next attempt is not before this (a failed send backs
     /// off; the root unreachable must not mean a send per event).
-    pub stream_after: Option<Ms>,
+    pub stream_after: Option<WaitMs>,
     /// The current backoff, doubled per failure up to a bound.
     pub stream_backoff_ms: u64,
     /// The root refused the stream (the generation is ending or unknown
@@ -184,6 +184,9 @@ pub(crate) struct DelegateState {
     /// A renewal in flight: its request id and this node's honour clock
     /// when it was sent.
     pub renew: Option<(OpId, HonourMs)>,
+    /// When `renew` was sent, on the wait clock: its give-up timeout is
+    /// liveness, and a forward step must not fire it early.
+    pub renew_sent_wait: WaitMs,
     pub renew_timer: Option<TimerId>,
     /// When this node installed the generation: a grant it never got
     /// renewed lapses counting from here (`deleg_lapse_at`); honour clock.
@@ -198,7 +201,7 @@ pub(crate) struct DelegateState {
     pub last_renew_sent: HonourMs,
     /// The send time of the latest renewal of this generation that was
     /// *answered* with a grant (the core's, or a lane's counted as a late
-    /// answer): `Ms(0)`: none. The renewal after it falls due a period on,
+    /// answer): `WaitMs(0)`: none. The renewal after it falls due a period on,
     /// and that is the due time a loss is judged from
     /// ([`Core::deleg_loss_due`]); `last_renew_sent` also moves with the
     /// lane's unanswered registrations, which postpone only the lane.
@@ -233,7 +236,7 @@ pub(crate) struct DelegateState {
     /// rows this delegate has already retired (they are in the log, the
     /// backup has not applied them yet), so a re-send now would be
     /// answered the same.
-    pub backup_after: Option<Ms>,
+    pub backup_after: Option<WaitMs>,
     /// The backup the in-flight renewal named (the root must learn a
     /// newly chosen backup before the next timer).
     pub renew_backup: Option<NodeId>,
@@ -241,10 +244,12 @@ pub(crate) struct DelegateState {
     /// lost in a partition (no transport failure), or answered late, is
     /// re-sent after `deleg_request_timeout_ms` (and a backoff), not
     /// waited for forever.
-    pub inflight_at: Ms,
+    pub inflight_at: WaitMs,
     /// (The backup append's send, on the honour clock: a late answer is
     /// kept as a [`LateReq`], whose `sent` is.)
     pub backup_inflight_at: HonourMs,
+    /// `backup_inflight_at` on the wait clock (the give-up timeout).
+    pub backup_inflight_wait: WaitMs,
     /// The stream round: this node's incarnation and a fresh id at the
     /// install and at every re-stream to a new root
     /// ([`Core::deleg_new_round`]). Every batch and renewal carries it and
@@ -397,7 +402,7 @@ pub(crate) struct DelegationState {
     /// generation's table row was seen here and is gone, or — a row
     /// never seen (the recall overtook the record naming this node) —
     /// after [`HANDED_BACK_UNSEEN_MS`].
-    pub handed_back: BTreeMap<u64, (NodeId, Ms, bool)>,
+    pub handed_back: BTreeMap<u64, (NodeId, WaitMs, bool)>,
 }
 
 /// Plan 30 §M11's view for `status`.
@@ -541,7 +546,7 @@ impl Core {
                 *seen = true;
                 return true;
             }
-            !*seen && now.wall.since(*at) < HANDED_BACK_UNSEEN_MS
+            !*seen && now.wait.since(*at) < HANDED_BACK_UNSEEN_MS
         });
         for d in table.iter().filter(|d| d.node == me) {
             if self.dl.mine.contains_key(&d.gen) || self.dl.epoch_active {
@@ -575,6 +580,7 @@ impl Core {
                     streamed_through: replica.log_stream_idx(d.gen),
                     inflight: None,
                     renew: None,
+                    renew_sent_wait: WaitMs(0),
                     renew_timer: None,
                     installed: now.honour,
                     last_renew_sent: HonourMs(0),
@@ -594,8 +600,9 @@ impl Core {
                     backup_failures: 0,
                     backup_after: None,
                     renew_backup: None,
-                    inflight_at: Ms(0),
+                    inflight_at: WaitMs(0),
                     backup_inflight_at: HonourMs(0),
+                    backup_inflight_wait: WaitMs(0),
                     stream_round,
                     leaving: None,
                 },
@@ -1300,7 +1307,7 @@ impl Core {
         for gen in gens {
             let d = self.dl.mine.get(&gen).expect("present");
             let Some(backup) = d.backup else { continue };
-            if d.backup_inflight.is_some() || d.backup_after.is_some_and(|t| now.wall < t) {
+            if d.backup_inflight.is_some() || d.backup_after.is_some_and(|t| now.wait < t) {
                 continue;
             }
             let from = d.backup_sent_through + 1;
@@ -1315,6 +1322,7 @@ impl Core {
             let d = self.dl.mine.get_mut(&gen).expect("present");
             d.backup_inflight = Some((req, last));
             d.backup_inflight_at = now.honour;
+            d.backup_inflight_wait = now.wait;
             out.push(Action::Send {
                 to: backup,
                 msg: PeerMsg::DelegBackupAppend { req, gen, txs },
@@ -1410,7 +1418,7 @@ impl Core {
                 if first.is_some_and(|f| f > acked + 1) {
                     let wait = self.cfg.delegation_stream_tick_ms.max(1) * 4;
                     let d = self.dl.mine.get_mut(&gen).expect("present");
-                    d.backup_after = Some(now.wall.plus(wait));
+                    d.backup_after = Some(now.wait.plus(wait));
                     paced = true;
                     tracing::debug!(
                         node = self.cfg.node_id,
@@ -1778,8 +1786,8 @@ impl Core {
 
     fn arm_stream_tick(&mut self, now: Now, out: &mut Vec<Action>) {
         if self.dl.stream_timer.is_none() {
-            let t = self.set_timer_wall(
-                now.wall.plus(self.cfg.delegation_stream_tick_ms),
+            let t = self.set_timer_wait(
+                now.wait.plus(self.cfg.delegation_stream_tick_ms),
                 Timer::DelegStream,
                 out,
             );
@@ -1838,23 +1846,23 @@ impl Core {
         let mut renew_again = Vec::new();
         for d in self.dl.mine.values_mut() {
             if let Some((req, _)) = d.inflight {
-                if now.wall.since(d.inflight_at) >= timeout {
+                if now.wait.since(d.inflight_at) >= timeout {
                     given_up.push(req);
                     d.inflight = None;
                     d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-                    d.stream_after = Some(now.wall.plus(d.stream_backoff_ms));
+                    d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, _)) = d.backup_inflight {
-                if now.honour.since(d.backup_inflight_at) >= timeout {
+                if now.wait.since(d.backup_inflight_wait) >= timeout {
                     late.push((req, d.backup, d.backup_inflight_at));
                     d.backup_inflight = None;
                     self.stats.deleg_stream_timeouts += 1;
                 }
             }
             if let Some((req, sent)) = d.renew {
-                if now.honour.since(sent) >= timeout {
+                if now.wait.since(d.renew_sent_wait) >= timeout {
                     late.push((req, root, sent));
                     d.renew = None;
                     if d.renew_timer.is_none() && !d.stopped {
@@ -1925,7 +1933,7 @@ impl Core {
         let gens: Vec<u64> = self.dl.mine.keys().copied().collect();
         for gen in gens {
             let d = self.dl.mine.get(&gen).expect("present");
-            if d.inflight.is_some() || d.refused || d.stream_after.is_some_and(|t| now.wall < t) {
+            if d.inflight.is_some() || d.refused || d.stream_after.is_some_and(|t| now.wait < t) {
                 continue;
             }
             let from = d.streamed_through + 1;
@@ -1963,7 +1971,7 @@ impl Core {
             let d = self.dl.mine.get_mut(&gen).expect("present");
             let round = d.stream_round;
             d.inflight = Some((req, last));
-            d.inflight_at = now.wall;
+            d.inflight_at = now.wait;
             d.leaving = (!leaving.is_empty() || !leaving_barriers.is_empty()).then(|| {
                 let mut inos: Vec<Ino> = leaving.iter().map(|g| g.ino).collect();
                 inos.extend(leaving_barriers.iter().map(|(ino, _)| *ino));
@@ -1997,8 +2005,8 @@ impl Core {
         // the tick retries.
         if self.dl.mine.values().any(|d| {
             d.inflight.is_some()
-                || d.stream_after.is_some_and(|t| now.wall < t)
-                || d.backup_after.is_some_and(|t| now.wall < t)
+                || d.stream_after.is_some_and(|t| now.wait < t)
+                || d.backup_after.is_some_and(|t| now.wait < t)
                 || (!d.stopped && replica.delegate_idx(d.gen) > d.streamed_through)
         }) {
             self.arm_stream_tick(now, out);
@@ -2076,7 +2084,7 @@ impl Core {
             self.stats.deleg_stream_refused += 1;
             let tick = self.cfg.delegation_stream_tick_ms.max(1);
             d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-            d.stream_after = Some(now.wall.plus(d.stream_backoff_ms));
+            d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
             self.arm_stream_tick(now, out);
             return;
         }
@@ -2132,7 +2140,7 @@ impl Core {
                     // stream is retried on the tick, not per event
                     // (harness `delegate-partition`: 440k sends in a cut).
                     d.stream_backoff_ms = (d.stream_backoff_ms * 2).clamp(tick * 4, 2_000);
-                    d.stream_after = Some(now.wall.plus(d.stream_backoff_ms));
+                    d.stream_after = Some(now.wait.plus(d.stream_backoff_ms));
                 }
                 self.arm_stream_tick(now, out);
             }
@@ -2243,6 +2251,7 @@ impl Core {
         let req = self.op_id();
         let d = self.dl.mine.get_mut(&gen).expect("present");
         d.renew = Some((req, now.honour));
+        d.renew_sent_wait = now.wait;
         if let Some(t) = d.renew_timer.take() {
             self.cancel_timer(t, out);
         }
@@ -3059,7 +3068,7 @@ impl Core {
             .delegation_table()
             .iter()
             .any(|d| d.gen == gen && d.node == self.me());
-        self.dl.handed_back.insert(gen, (from, now.wall, seen));
+        self.dl.handed_back.insert(gen, (from, now.wait, seen));
         if let Some(d) = self.dl.mine.get_mut(&gen) {
             d.stopped = true;
             self.stats.deleg_recalls_received += 1;

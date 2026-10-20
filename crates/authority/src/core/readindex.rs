@@ -75,7 +75,7 @@ use super::client::Phase as ClientPhase;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, ControlOk, ReadAnswer, S3Op};
 use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
-use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
+use crate::ids::{HonourMs, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::{
@@ -127,7 +127,7 @@ pub(crate) enum ParkedWhat {
         /// for from `to` (`Core::own_record_blockers`), and when that was
         /// worked out. Kept while the acknowledgement waits: see
         /// `Core::on_held_reply_timer`.
-        blockers: Option<(Ms, constellation_meta::RemoteBlockers)>,
+        blockers: Option<(WaitMs, constellation_meta::RemoteBlockers)>,
     },
     /// A local client op's `finish`.
     Finish { rid: Rid, outcome: MutateOutcome },
@@ -178,7 +178,7 @@ struct Parked {
     /// Phase 2b: a delegate's `(gen, idx)` that must be on its backup or
     /// in an applied segment first.
     stream_need: Option<(u64, u64)>,
-    since: Ms,
+    since: WaitMs,
     what: ParkedWhat,
 }
 
@@ -519,7 +519,7 @@ impl Core {
                 durable,
                 deps,
                 stream_need: None,
-                since: now.wall,
+                since: now.wait,
                 what,
             },
         );
@@ -549,7 +549,7 @@ impl Core {
                 durable: None,
                 deps: None,
                 stream_need: Some((gen, idx)),
-                since: now.wall,
+                since: now.wait,
                 what,
             },
         );
@@ -694,8 +694,8 @@ impl Core {
             },
         );
         self.rd.parked_rids.insert(rid, id);
-        let timer = self.set_timer_wall(
-            now.wall.plus(self.cfg.recall_hold_ms),
+        let timer = self.set_timer_wait(
+            now.wait.plus(self.cfg.recall_hold_ms),
             Timer::HeldReply(id),
             out,
         );
@@ -1033,8 +1033,8 @@ impl Core {
             },
         );
         self.rd.parked_rids.insert(rid, id);
-        let timer = self.set_timer_wall(
-            now.wall.plus(self.cfg.recall_hold_ms),
+        let timer = self.set_timer_wait(
+            now.wait.plus(self.cfg.recall_hold_ms),
             Timer::HeldReply(id),
             out,
         );
@@ -1063,7 +1063,7 @@ impl Core {
             ..
         }) = self.rd.parked.get_mut(id)
         {
-            *blockers = Some((now.wall, b));
+            *blockers = Some((now.wait, b));
         }
     }
 
@@ -1080,7 +1080,7 @@ impl Core {
             return false;
         };
         let hold = self.cfg.recall_hold_ms;
-        let timer = self.set_timer_wall(now.wall.plus(hold), Timer::HeldReply(id), out);
+        let timer = self.set_timer_wait(now.wait.plus(hold), Timer::HeldReply(id), out);
         let (to, r, held_timer) = match self.rd.parked.get_mut(&id) {
             Some(Parked {
                 what:
@@ -1208,7 +1208,7 @@ impl Core {
                 ..
             }) if durable.is_some() || stream_need.is_some() => {
                 let blockers = match blockers {
-                    Some((at, kept)) if now.wall < at.plus(refresh) => kept.clone(),
+                    Some((at, kept)) if now.wait < at.plus(refresh) => kept.clone(),
                     _ => {
                         let upto = position.pending.map(|p| p.jseq);
                         let b = self.own_record_blockers(*to, *rid, outcome, *gen, upto, replica);
@@ -1229,7 +1229,7 @@ impl Core {
                 ..
             }) = self.rd.parked.get_mut(&id)
             {
-                *blockers = Some((now.wall, b));
+                *blockers = Some((now.wait, b));
             }
         }
         let (to, req, held_timer, durable) = match self.rd.parked.get_mut(&id) {
@@ -1466,7 +1466,7 @@ impl Core {
             let Some(p) = self.rd.parked.remove(&id) else {
                 continue;
             };
-            let waited = now.wall.since(p.since).max(0) as u64;
+            let waited = now.wait.since(p.since).max(0) as u64;
             if p.durable.is_some() {
                 self.stats.ack_wait_ms_total += waited;
                 let req = match &p.what {
@@ -1671,8 +1671,8 @@ impl Core {
             self.read_tail(now, op, replica, out);
             return;
         }
-        let deadline = self.set_timer_wall(
-            now.wall.plus(self.cfg.read_index_deadline_ms),
+        let deadline = self.set_timer_wait(
+            now.wait.plus(self.cfg.read_index_deadline_ms),
             Timer::ReadIndexDeadline(op),
             out,
         );
@@ -1735,7 +1735,7 @@ impl Core {
         out: &mut Vec<Action>,
     ) {
         let req = self.op_id();
-        let timer_at = now.wall.plus(self.cfg.forward_timeout_ms);
+        let timer_at = now.wait.plus(self.cfg.forward_timeout_ms);
         let Some(r) = self.rd.reads.get_mut(&op) else {
             return;
         };
@@ -1750,7 +1750,7 @@ impl Core {
             name: r.name.clone(),
         };
         self.rd.by_req.insert(req, op);
-        self.set_timer_wall(timer_at, Timer::ReadIndexTimeout(req), out);
+        self.set_timer_wait(timer_at, Timer::ReadIndexTimeout(req), out);
         self.stats.read_index_sent += 1;
         out.push(Action::Send { to: holder, msg });
     }
@@ -1768,7 +1768,7 @@ impl Core {
         }
         let object = match result {
             S3Result::LeaseGet(Ok(Some((lease, _)))) => {
-                self.lease.note_object(now, &lease);
+                self.lease.note_object(&lease);
                 Some(lease)
             }
             S3Result::LeaseGet(Ok(None)) => None,
@@ -1930,7 +1930,7 @@ impl Core {
         };
         r.attempts += 1;
         let delay = (self.cfg.forward_backoff_ms / 4).max(10) * u64::from(r.attempts.min(8));
-        self.set_timer_wall(now.wall.plus(delay), Timer::ReadIndexRetry(op), out);
+        self.set_timer_wait(now.wait.plus(delay), Timer::ReadIndexRetry(op), out);
     }
 
     pub(crate) fn on_read_index_retry(

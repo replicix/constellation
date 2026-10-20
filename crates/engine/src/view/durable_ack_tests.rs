@@ -541,7 +541,7 @@ fn a_lapsed_grants_discard_is_eio_once_on_every_descriptor_open_at_the_time() {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: now,
         },
     );

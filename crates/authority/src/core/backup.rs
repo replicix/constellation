@@ -297,9 +297,9 @@ pub(crate) enum FreshVerdict {
 /// ended (not timed out again in that time), when it starts over at 1. A
 /// node that timed out once an hour ago is not still on its second
 /// strike.
-pub(crate) fn candidate_strikes_after(prev: Option<(u32, Ms)>, now: Now) -> u32 {
+pub(crate) fn candidate_strikes_after(prev: Option<(u32, WaitMs)>, now: Now) -> u32 {
     match prev {
-        Some((strikes, until)) if now.wall.since(until) < CANDIDATE_BACKOFF_MAX_MS as i64 => {
+        Some((strikes, until)) if now.wait.since(until) < CANDIDATE_BACKOFF_MAX_MS as i64 => {
             strikes.saturating_add(1)
         }
         _ => 1,
@@ -317,7 +317,7 @@ pub(crate) struct BackupPeer {
     pub sent_through: u64,
     /// The appends in flight, oldest first.
     pub inflight: std::collections::VecDeque<Inflight>,
-    pub last_sent: Ms,
+    pub last_sent: WaitMs,
     /// When it last acknowledged something new (or was added), on the
     /// wait clock (as are `alive_at` and `short_since`: they are compared
     /// with the heartbeat answers' stamps and the node's own lapses).
@@ -352,7 +352,7 @@ pub(crate) struct BackupPeer {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Inflight {
     pub req: OpId,
-    pub sent: Ms,
+    pub sent: WaitMs,
     pub last: u64,
 }
 
@@ -384,10 +384,10 @@ pub(crate) struct AckState {
     pub shipped_through: u64,
     pub shipped_rows: BTreeSet<u64>,
     pub tick_timer: Option<TimerId>,
-    last_reconfig: Ms,
+    last_reconfig: WaitMs,
     /// The last reconfiguration attempt (a failed CAS is not retried on
     /// every event).
-    last_reconfig_try: Ms,
+    last_reconfig_try: WaitMs,
     /// Send times of outstanding S3 requests, and the send time of the
     /// latest one that succeeded without revealing a deposition.
     /// On the honour clock (plan 43 C7-H1): the holder's stamp bounding
@@ -453,7 +453,7 @@ pub(crate) struct AckState {
     /// The last run of the periodic backup bookkeeping (selection,
     /// timeouts, promotion): a few times per second is plenty, and the
     /// per-event path stays the append and the release.
-    last_housekeeping: Ms,
+    last_housekeeping: WaitMs,
     /// The tick fired since the last bookkeeping run.
     tick_fired: bool,
     /// Whether a peer in budget is eligible as a backup right now (the
@@ -463,11 +463,11 @@ pub(crate) struct AckState {
     pub eligible: Option<bool>,
     /// When each node was last dropped or removed (not re-added within
     /// `backup_reconfig_min_ms`).
-    last_dropped: BTreeMap<NodeId, Ms>,
+    last_dropped: BTreeMap<NodeId, WaitMs>,
     /// Candidates that timed out lately: how many times in a row, and
     /// until when they are not brought up again ([`candidate_backoff_ms`];
     /// the count decays, [`candidate_strikes_after`]).
-    candidate_strikes: BTreeMap<NodeId, (u32, Ms)>,
+    candidate_strikes: BTreeMap<NodeId, (u32, WaitMs)>,
     /// The highest journal seq any acknowledgement of this tenure may
     /// have rested on (the durable seq's high-water mark). A backup is
     /// removed from the lease only once everything up to here is in the
@@ -1494,10 +1494,10 @@ impl Core {
             // ack that freed a slot); the bookkeeping runs on the tick
             // and a few times a second in between.
             let housekeeping = self.ack.tick_fired
-                || now.wall.since(self.ack.last_housekeeping) >= HOUSEKEEPING_MS;
+                || now.wait.since(self.ack.last_housekeeping) >= HOUSEKEEPING_MS;
             if housekeeping {
                 self.ack.tick_fired = false;
-                self.ack.last_housekeeping = now.wall;
+                self.ack.last_housekeeping = now.wait;
                 self.backup_select(now, replica, out);
             }
             self.backup_stream(now, replica, out);
@@ -1587,7 +1587,7 @@ impl Core {
         // The rate limit is for churn (the same node in and out); a set
         // that is empty is filled at once — acknowledgements wait for it.
         if !self.lease.backups().is_empty()
-            && now.wall.since(self.ack.last_reconfig) < self.cfg.backup_reconfig_min_ms as i64
+            && now.wait.since(self.ack.last_reconfig) < self.cfg.backup_reconfig_min_ms as i64
         {
             return;
         }
@@ -1600,12 +1600,12 @@ impl Core {
             self.ack
                 .last_dropped
                 .get(n)
-                .is_none_or(|at| now.wall.since(*at) >= self.cfg.backup_reconfig_min_ms as i64)
+                .is_none_or(|at| now.wait.since(*at) >= self.cfg.backup_reconfig_min_ms as i64)
                 && self
                     .ack
                     .candidate_strikes
                     .get(n)
-                    .is_none_or(|(_, until)| now.wall >= *until)
+                    .is_none_or(|(_, until)| now.wait >= *until)
         }) else {
             return;
         };
@@ -1625,7 +1625,7 @@ impl Core {
                 acked: 0,
                 sent_through: 0,
                 inflight: std::collections::VecDeque::new(),
-                last_sent: Ms(0),
+                last_sent: WaitMs(0),
                 last_progress: now.wait,
                 committed: false,
                 candidacy,
@@ -1663,7 +1663,7 @@ impl Core {
             .filter(|(_, p)| p.inflight.len() < max_inflight)
             .filter(|(_, p)| {
                 p.sent_through.max(p.acked).max(through) < tip
-                    || (p.inflight.is_empty() && now.wall.since(p.last_sent) >= heartbeat)
+                    || (p.inflight.is_empty() && now.wait.since(p.last_sent) >= heartbeat)
             })
             .map(|(n, _)| *n)
             .collect();
@@ -1709,10 +1709,10 @@ impl Core {
             }
             p.inflight.push_back(Inflight {
                 req,
-                sent: now.wall,
+                sent: now.wait,
                 last: last.unwrap_or(start - 1),
             });
-            p.last_sent = now.wall;
+            p.last_sent = now.wait;
             self.stats.backup_appends += 1;
             tracing::trace!(
                 target: "constellation_authority::ack_wait",
@@ -1750,8 +1750,8 @@ impl Core {
         {
             return;
         }
-        let id = self.set_timer_wall(
-            now.wall.plus(self.cfg.backup_heartbeat_ms.max(1)),
+        let id = self.set_timer_wait(
+            now.wait.plus(self.cfg.backup_heartbeat_ms.max(1)),
             Timer::BackupTick,
             out,
         );
@@ -1855,10 +1855,10 @@ impl Core {
                 );
                 self.ack.candidate = None;
                 self.ack.peers.remove(&n);
-                self.ack.last_dropped.insert(n, now.wall);
+                self.ack.last_dropped.insert(n, now.wait);
                 let strikes =
                     candidate_strikes_after(self.ack.candidate_strikes.get(&n).copied(), now);
-                let until = now.wall.plus(candidate_backoff_ms(
+                let until = now.wait.plus(candidate_backoff_ms(
                     self.cfg.backup_reconfig_min_ms,
                     strikes,
                 ));
@@ -1866,7 +1866,7 @@ impl Core {
                 // (a node that left the cluster keeps none).
                 self.ack
                     .candidate_strikes
-                    .retain(|_, (_, u)| now.wall.since(*u) < CANDIDATE_BACKOFF_MAX_MS as i64);
+                    .retain(|_, (_, u)| now.wait.since(*u) < CANDIDATE_BACKOFF_MAX_MS as i64);
                 self.ack.candidate_strikes.insert(n, (strikes, until));
                 continue;
             }
@@ -1913,7 +1913,7 @@ impl Core {
             .filter(|b| *b != n)
             .collect();
         self.ack.reconfig_wanted = Some(backups);
-        self.ack.last_dropped.insert(n, now.wall);
+        self.ack.last_dropped.insert(n, now.wait);
     }
 
     /// A candidate that has caught up joins the lease.
@@ -1950,7 +1950,7 @@ impl Core {
             return;
         }
         if self.lease_cas_in_flight()
-            || now.wall.since(self.ack.last_reconfig_try)
+            || now.wait.since(self.ack.last_reconfig_try)
                 < (self.cfg.backup_heartbeat_ms as i64).max(1)
         {
             self.ack.reconfig_wanted = Some(backups);
@@ -1965,7 +1965,7 @@ impl Core {
             self.ack.reconfig_wanted = Some(backups);
             return;
         }
-        self.ack.last_reconfig_try = now.wall;
+        self.ack.last_reconfig_try = now.wait;
         let policy = if backups.is_empty() {
             AckPolicy::Local
         } else {
@@ -2026,7 +2026,7 @@ impl Core {
                     "backup set reconfigured"
                 );
                 self.lease.renewed(now, r.lease, tag);
-                self.ack.last_reconfig = now.wall;
+                self.ack.last_reconfig = now.wait;
                 if let Some(n) = r.add {
                     self.stats.backups_added += 1;
                     if self.ack.candidate == Some(n) {
@@ -2168,7 +2168,7 @@ impl Core {
         tracing::trace!(
             node = self.cfg.node_id,
             backup = from,
-            rtt_ms = now.wall.since(entry.sent),
+            rtt_ms = now.wait.since(entry.sent),
             acked,
             inflight = p.inflight.len(),
             "backup append acknowledged"
@@ -2218,7 +2218,7 @@ impl Core {
 
     /// `Event::PeerFailed` for an append: the ack will not come; the
     /// timeout rule decides the rest.
-    pub(crate) fn on_backup_request_failed(&mut self, _now: Ms, req: OpId, to: NodeId) -> bool {
+    pub(crate) fn on_backup_request_failed(&mut self, _now: WaitMs, req: OpId, to: NodeId) -> bool {
         let Some(p) = self.ack.peers.get_mut(&to) else {
             return false;
         };
@@ -2236,7 +2236,7 @@ impl Core {
         // Resend from what the backup holds (the timeout counts from
         // `last_progress`); the inserts are idempotent.
         p.sent_through = p.acked;
-        p.last_sent = Ms(0);
+        p.last_sent = WaitMs(0);
         true
     }
 
@@ -2255,8 +2255,8 @@ impl Core {
             self.durable_jseq()
         };
         self.stream_ahead(now, from, to, replica, out);
-        let id = self.set_timer_wall(
-            now.wall.plus(self.cfg.stream_ahead_holdoff_ms.max(1)),
+        let id = self.set_timer_wait(
+            now.wait.plus(self.cfg.stream_ahead_holdoff_ms.max(1)),
             Timer::StreamAhead,
             out,
         );
@@ -3232,7 +3232,7 @@ impl Core {
                     // A restarted backup's probe (3b): the holder is
                     // renewing — alive; wait for its link. An expired
                     // lease is a holder gone: seal and take over now.
-                    self.lease.note_object(now, &lease);
+                    self.lease.note_object(&lease);
                     self.arm_backup_watch(now, out);
                     return;
                 }
@@ -3270,7 +3270,7 @@ impl Core {
                                 b.expires = b.expires.max(Ms(lease.expires_unix_ms));
                             }
                         }
-                        self.lease.note_object(now, &lease);
+                        self.lease.note_object(&lease);
                         self.arm_backup_watch(now, out);
                         return;
                     }
@@ -3288,7 +3288,7 @@ impl Core {
                     // again then missed the 2T claim grace past the
                     // expiry, and another node took the lease over from
                     // a log without this node's tail.
-                    self.lease.note_object(now, &lease);
+                    self.lease.note_object(&lease);
                     self.arm_backup_watch(now, out);
                     return;
                 }
@@ -3328,7 +3328,7 @@ impl Core {
                          its epoch to take over"
                     );
                 }
-                self.lease.note_object(now, &lease);
+                self.lease.note_object(&lease);
                 self.lease.takeover_permit = Some((role.epoch, role.holder));
                 self.permit_interrupts_handoff_wait(out);
                 self.enqueue_job(
@@ -3351,7 +3351,7 @@ impl Core {
                 // (applied, then timed out): the tail is ours to re-ship;
                 // finish the acquisition (backup-crash-slow seed 603631
                 // discarded it here).
-                self.lease.note_object(now, &lease);
+                self.lease.note_object(&lease);
                 self.enqueue_job(
                     now,
                     super::jobs::JobReq::Acquire {
@@ -3368,7 +3368,7 @@ impl Core {
                 // void (a listed successor re-shipped what mattered). Not
                 // sealed: a live holder that removed this node may invite
                 // it back as a candidate in the same epoch.
-                self.lease.note_object(now, &lease);
+                self.lease.note_object(&lease);
                 tracing::info!(
                     node = self.cfg.node_id,
                     holder = lease.holder,

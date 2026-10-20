@@ -321,7 +321,7 @@ pub struct Engine {
     snapsched_stats: Arc<crate::snapsched::SnapSchedStats>,
     /// Plan 32 §6.3: this filesystem's space-accounting index.
     snapacct: Arc<crate::snapacct::SnapAcctService>,
-    /// Unix-ms heartbeat of the sync task's last loop pass.
+    /// Wait-clock-ms heartbeat of the sync task's last loop pass.
     last_sync_ms: Arc<AtomicU64>,
     read_only_member: bool,
     fsync_s3: bool,
@@ -1010,7 +1010,7 @@ impl Engine {
         let atime = Arc::new(crate::atime::AtimeAccumulator::new(atime_mode, atime_stats));
         let prune_stats = crate::prune::PruneStats::new();
         let snapsched_stats = crate::snapsched::SnapSchedStats::new();
-        let last_sync_ms = Arc::new(AtomicU64::new(crate::prune::now_unix_ms()));
+        let last_sync_ms = Arc::new(AtomicU64::new(crate::prune::wait_ms()));
 
         // Background metadata sync: tail foreign segments + ship the
         // journal, every interval or on demand (close/fsync nudges).
@@ -1604,7 +1604,7 @@ impl Engine {
                         continue;
                     }
                     let lag = std::time::Duration::from_millis(
-                        crate::prune::now_unix_ms()
+                        crate::prune::wait_ms()
                             .saturating_sub(last_sync_ms.load(Ordering::Relaxed)),
                     );
                     let deps = crate::prune::PruneDeps {

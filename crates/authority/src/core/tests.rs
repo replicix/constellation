@@ -300,7 +300,7 @@ fn timers_are_relative_to_the_step_reading() {
     };
     let mut out = Vec::new();
     core.start(now, &meta, &mut out);
-    // `start` arms its timers from the wall reading.
+    // `start` arms its timers from the wait reading.
     let after = |out: &[Action], id: TimerId| {
         out.iter()
             .find_map(|a| match a {
@@ -315,17 +315,11 @@ fn timers_are_relative_to_the_step_reading() {
     assert_eq!(after(&out, drain), core.cfg.replay_drain_ms);
     assert_eq!(
         core.timer_at(drain),
-        Some(TimerAt::Wall(now.wall.plus(core.cfg.replay_drain_ms)))
+        Some(TimerAt::Wait(now.wait.plus(core.cfg.replay_drain_ms)))
     );
     out.clear();
-    let wall = core.set_timer_wall(Ms(1_000_700), Timer::Poll, &mut out);
     let honour = core.set_timer_honour(HonourMs(5_000_300), Timer::Poll, &mut out);
     let wait = core.set_timer_wait(WaitMs(9_000_900), Timer::Poll, &mut out);
-    assert_eq!(
-        after(&out, wall),
-        700,
-        "wall deadline minus the wall reading"
-    );
     assert_eq!(
         after(&out, honour),
         300,
@@ -336,7 +330,6 @@ fn timers_are_relative_to_the_step_reading() {
         900,
         "wait deadline minus the wait reading"
     );
-    assert_eq!(core.timer_at(wall), Some(TimerAt::Wall(Ms(1_000_700))));
     assert_eq!(
         core.timer_at(honour),
         Some(TimerAt::Honour(HonourMs(5_000_300)))
@@ -347,11 +340,6 @@ fn timers_are_relative_to_the_step_reading() {
     out.clear();
     let past = core.set_timer_wait(WaitMs(8_000_000), Timer::Poll, &mut out);
     assert_eq!(after(&out, past), 0);
-    // Timers of different clocks are never compared with each other.
-    assert_eq!(TimerAt::Wall(Ms(10)).later_than_wall(Ms(5)), Some(true));
-    assert_eq!(TimerAt::Wall(Ms(10)).later_than_wall(Ms(15)), Some(false));
-    assert_eq!(TimerAt::Wait(WaitMs(10)).later_than_wall(Ms(5)), None);
-    assert_eq!(TimerAt::Honour(HonourMs(10)).later_than_wall(Ms(5)), None);
 }
 
 #[test]
@@ -989,7 +977,7 @@ fn a_backlog_that_cannot_ship_does_not_spin_the_rounds() {
         ClientReply::Outcome(MutateOutcome::Accepted { .. })
     ));
     // Node 2 wants the lease, and the dwell and grace have passed.
-    let long_ago = Ms(h.now.0 - 1_000_000);
+    let long_ago = WaitMs(h.now.0 - 1_000_000);
     h.core.lease.wanted = vec![2];
     h.core.lease.wanted_since = Some(long_ago);
     h.core.lease.held_since = Some(long_ago);
@@ -1111,7 +1099,7 @@ fn a_tenure_inside_its_takeover_floor_is_not_idle_released() {
         released
     }
     let idle = |h: &mut Harness| {
-        let long_ago = Ms(h.now.0 - 1_000_000);
+        let long_ago = WaitMs(h.now.0 - 1_000_000);
         h.core.lease.wanted = vec![2];
         h.core.lease.wanted_since = Some(long_ago);
         h.core.lease.held_since = Some(long_ago);
@@ -3859,7 +3847,7 @@ fn a_retired_nodes_stranded_journal_is_not_replayed() {
         let mut lease = lease_of(3, 3, h.now.plus(10_000).0);
         lease.retired = retired.into_iter().collect();
         let now = h.now;
-        h.core.lease.note_object(Now::same(now.0), &lease);
+        h.core.lease.note_object(&lease);
         let mut out = Vec::new();
         h.core.on_drain_tick(Now::same(now.0), &h.meta, &mut out);
         let case = (requester, source, retired);
@@ -3971,7 +3959,7 @@ fn awaiting_log_forward(name: &str) -> (Harness, Rid, Vec<LogRecord>) {
 }
 
 fn activity(h: &mut Harness) -> Vec<Action> {
-    let now = h.now;
+    let now = h.clk().wait;
     h.step(Event::Activity {
         last_write: now,
         acked_seqs: Vec::new(),
@@ -7892,7 +7880,7 @@ mod epoch_rules {
                 let mut lease = root_lease(1, 1, t0.plus(30_000));
                 lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
                 lease.backups = vec![2];
-                h.core.lease.note_object(Now::same(t0.0), &lease);
+                h.core.lease.note_object(&lease);
             }
             h.advance(1_500);
             h.step(Event::OwnLag {
@@ -7940,7 +7928,7 @@ mod epoch_rules {
                 let mut lease = root_lease(1, 1, expires);
                 lease.ack_policy = constellation_store_s3::AckPolicy::Backup;
                 lease.backups = vec![2];
-                h.core.lease.note_object(Now::same(t0.0), &lease);
+                h.core.lease.note_object(&lease);
             } else {
                 h.step(Event::HolderAlive {
                     from: 1,
@@ -8247,11 +8235,10 @@ mod epoch_rules {
         let (_holder, mut sub, _req) = stream_pair();
         let mut lease = root_lease(1, 1, sub.now.plus(60_000));
         lease.ack_policy = constellation_store_s3::AckPolicy::S3;
-        let now = sub.now;
-        sub.core.lease.note_object(Now::same(now.0), &lease);
+        sub.core.lease.note_object(&lease);
         let poke = |h: &mut Harness| {
             h.step(Event::Activity {
-                last_write: Ms(0),
+                last_write: WaitMs(0),
                 acked_seqs: Vec::new(),
             })
         };
@@ -8858,7 +8845,7 @@ mod pipelined_appends {
                 acked: 0,
                 sent_through: 0,
                 inflight: Default::default(),
-                last_sent: Ms(0),
+                last_sent: WaitMs(0),
                 last_progress: w(h.now),
                 committed: false,
             },
@@ -9147,19 +9134,19 @@ mod pipelined_appends {
         use crate::core::backup::candidate_strikes_after;
         assert_eq!(candidate_strikes_after(None, Now::same(1_000)), 1);
         assert_eq!(
-            candidate_strikes_after(Some((3, Ms(10_000))), Now::same(5_000)),
+            candidate_strikes_after(Some((3, WaitMs(10_000))), Now::same(5_000)),
             4
         );
         assert_eq!(
-            candidate_strikes_after(Some((3, Ms(10_000))), Now::same(69_999)),
+            candidate_strikes_after(Some((3, WaitMs(10_000))), Now::same(69_999)),
             4
         );
         assert_eq!(
-            candidate_strikes_after(Some((3, Ms(10_000))), Now::same(70_000)),
+            candidate_strikes_after(Some((3, WaitMs(10_000))), Now::same(70_000)),
             1
         );
         assert_eq!(
-            candidate_strikes_after(Some((1, Ms(0))), Now::same(3_600_000)),
+            candidate_strikes_after(Some((1, WaitMs(0))), Now::same(3_600_000)),
             1
         );
     }
@@ -9740,9 +9727,7 @@ mod m10 {
         ));
         assert_eq!(h.meta.promise_issued().unwrap(), 0);
         // An observed expiry does not make it promise either.
-        h.core
-            .lease
-            .note_object(h.clk(), &lease_of(2, 3, h.now.0 - 1));
+        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -9752,9 +9737,7 @@ mod m10 {
         // P2P down (the harness's peers are all unconnected): nobody can
         // ask, so the node promises on what it observes.
         let mut h = flex(1);
-        h.core
-            .lease
-            .note_object(h.clk(), &lease_of(2, 3, h.now.0 - 1));
+        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         let puts = s3_ops(&out)
             .iter()
@@ -9779,9 +9762,7 @@ mod m10 {
                 since: None,
             }],
         });
-        h.core
-            .lease
-            .note_object(h.clk(), &lease_of(2, 3, h.now.0 - 1));
+        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers {
             links: vec![crate::event::PeerLink {
                 node: 2,
@@ -9794,9 +9775,7 @@ mod m10 {
         assert!(s3_ops(&out).is_empty(), "{out:?}");
         // f = 0: never on its own.
         let mut h = flex(0);
-        h.core
-            .lease
-            .note_object(h.clk(), &lease_of(2, 3, h.now.0 - 1));
+        h.core.lease.note_object(&lease_of(2, 3, h.now.0 - 1));
         let out = h.step(Event::Peers { links: Vec::new() });
         assert!(s3_ops(&out).is_empty(), "{out:?}");
     }
@@ -25676,6 +25655,77 @@ fn a_stalled_node_fails_an_unanswered_op_at_the_bound_unless_the_bucket_is_down(
     assert_eq!(h.core.clients().count(), 0);
 }
 
+// ---- Plan 43 C7-H1 (4/4): client deadlines count on the wait clock ----
+
+/// An op's S3-less bound (`s3_less_deadline_ms`) is the time the op has
+/// waited on this node, not the wall clock's reading of it: a forward step
+/// of the wall clock past the bound does not fail an op that has waited
+/// a second, and a backward one does not hold a failed one past the bound.
+/// Fails on the parent: `submitted` was a wall stamp, and the op failed
+/// in doubt at once after the step.
+#[test]
+fn a_forward_step_does_not_fail_a_client_op_early() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let first = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    exhaust_forward_retries(&mut h, &first);
+    let bound = h.core.cfg.s3_less_deadline_ms;
+    h.advance(1_000);
+    // The wall clock (and the honour clock with it) steps past the bound.
+    h.step_wall(bound as i64 + 10_000);
+    let out = stalled(&mut h, Some(true));
+    assert!(
+        !replies(&out)
+            .iter()
+            .any(|(_, r)| matches!(r, ClientReply::InDoubt)),
+        "failed in doubt on a step, after 1 s: {out:?}"
+    );
+    assert_eq!(h.core.stats.s3_less_deadlines, 0);
+    assert_eq!(h.core.clients().count(), 1);
+    // On its own bound it fails.
+    h.advance(bound);
+    let out = stalled(&mut h, Some(true));
+    assert!(
+        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.s3_less_deadlines, 1);
+}
+
+/// The control: a backward step does not extend the bound.
+#[test]
+fn a_backward_step_does_not_extend_a_client_ops_deadline() {
+    let mut h = Harness::new(1);
+    h.core.lease.cached_holder = Some(2);
+    let rid = h.rid(1);
+    let op = h.create("a");
+    let first = h.step(Event::Submit {
+        policy: Policy::Client,
+        rid,
+        op,
+        tag: Default::default(),
+    });
+    exhaust_forward_retries(&mut h, &first);
+    let bound = h.core.cfg.s3_less_deadline_ms;
+    h.advance(1_000);
+    h.step_wall(-(bound as i64) - 10_000);
+    // The bound has run on this node's clock, whatever the wall says.
+    h.advance(bound);
+    let out = stalled(&mut h, Some(true));
+    assert!(
+        matches!(replies(&out).as_slice(), [(r, ClientReply::InDoubt)] if *r == rid),
+        "{out:?}"
+    );
+    assert_eq!(h.core.stats.s3_less_deadlines, 1);
+}
+
 #[test]
 fn a_continuation_epoch_is_not_a_stall() {
     let mut h = Harness::new(1);
@@ -25694,7 +25744,7 @@ fn a_continuation_epoch_is_not_a_stall() {
 fn a_forward_to_a_restarted_holder_readopts_its_own_lease() {
     let mut h = Harness::new(1);
     let own = lease_of(1, 3, h.now.plus(30_000).0);
-    h.core.lease.note_object(h.clk(), &own);
+    h.core.lease.note_object(&own);
     let op = h.create("a");
     let request = |req: u64| PeerMsg::MutateRequest {
         req: OpId(req),
@@ -25774,7 +25824,7 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
         let mut h = Harness::new(1);
         h.core
             .lease
-            .note_object(h.clk(), &lease_of(1, 3, h.now.plus(30_000).0));
+            .note_object(&lease_of(1, 3, h.now.plus(30_000).0));
         let op = h.create("a");
         let out = h.step(Event::Peer {
             from: 2,
@@ -25850,13 +25900,10 @@ fn a_readoption_claims_nothing_but_its_own_unreleased_lease() {
 #[test]
 fn a_released_lease_is_not_readopted_for_a_forward() {
     let mut h = Harness::new(1);
-    h.core.lease.note_object(
-        h.clk(),
-        &Lease {
-            released: true,
-            ..lease_of(1, 3, h.now.plus(30_000).0)
-        },
-    );
+    h.core.lease.note_object(&Lease {
+        released: true,
+        ..lease_of(1, 3, h.now.plus(30_000).0)
+    });
     let op = h.create("a");
     let out = h.step(Event::Peer {
         from: 2,
@@ -26851,7 +26898,7 @@ fn a_delegates_late_answers_still_count() {
     assert!(last > 0);
     let poke = |h: &mut Harness| {
         h.step(Event::Activity {
-            last_write: Ms(0),
+            last_write: WaitMs(0),
             acked_seqs: Vec::new(),
         })
     };
@@ -26947,7 +26994,7 @@ fn a_late_stream_ack_from_an_earlier_tenure_of_the_same_root_is_not_credited() {
     assert!(last > 0);
     let poke = |h: &mut Harness| {
         h.step(Event::Activity {
-            last_write: Ms(0),
+            last_write: WaitMs(0),
             acked_seqs: Vec::new(),
         })
     };
@@ -27053,7 +27100,7 @@ fn create_in(h: &mut Harness, dir: constellation_fs_core::Ino, seq: u64) -> Vec<
 
 fn poke(h: &mut Harness) -> Vec<Action> {
     h.step(Event::Activity {
-        last_write: Ms(0),
+        last_write: WaitMs(0),
         acked_seqs: Vec::new(),
     })
 }
@@ -27405,7 +27452,6 @@ fn a_root_seals_a_delegate_only_on_real_silence() {
             .filter(|(_, (t, at))| {
                 matches!(t, Timer::DelegExpiry(7))
                     && match at {
-                        TimerAt::Wall(m) => m.0,
                         TimerAt::Honour(m) => m.0,
                         TimerAt::Wait(m) => m.0,
                     } <= h.now.0

@@ -2088,9 +2088,10 @@ step cannot move; four commits) and gets its own reviews:
      and guard, and the persistence conversions. Fable review.
   4. The liveness sites (client deadlines first: they fail ops), then an
      audit that every remaining wall read is cross-node, persisted,
-     identity or status.
+     identity or status. **Landed.**
 
-  1 + 2 + 3 close both measured classes.
+  1 + 2 + 3 close both measured classes; 4 closes the error-producing
+  liveness sites.
 
   *Commit 1 landed* (PROGRESS, "plan 43 C7-H1, commit 1 of 4"): the clocks,
   `Now` through the core, relative timers, the sim's clock model and
@@ -2143,6 +2144,27 @@ step cannot move; four commits) and gets its own reviews:
   forward 4 s: 3 of 2 000 seeds failed before). Appendix B rows 5, 13, 14 and
   27 are fixed locally by this commit (the rate half and a step while the node
   is down stay with C7a).
+  *Commit 4 landed* (PROGRESS, "plan 43 C7-H1, commit 4 of 4"): the
+  liveness sites. Every timer is a wait timer (`set_timer_wall`,
+  `TimerAt::Wall` and `later_than_wall` are gone); the client ops' deadlines
+  and `submitted` stamps (the S3-less bound, the inbox deadline, the forward,
+  acquire and own-record waits), the inbox, stream, replay, placement,
+  handoff and read-index housekeeping, the lease's dwell, idle and handoff
+  pause stamps, `HeldGrant.idle_since`, the two delegation timeouts commit 2
+  left on the honour clock, and the engine's S3-path stall stamps (a forward
+  step made a healthy path look stalled, which sends ops down the S3-less path
+  and fails them at its deadline), the alive book's dismissals and the sync
+  heartbeat are on the wait clock. The audit of every remaining wall read in
+  `authority`, `engine`, `meta`, `net` and `store-s3` (PROGRESS) classifies
+  each as cross-node, persisted, an identity key, status or an external
+  credential. **C7-H1 is done** (its code; pjdfstest, the spec's end-of-commit-4 gate, has not been run yet and goes with the next measurement campaign). Handed to C7a: rate (ρ) in the margins and in
+  the sim, suspend in the sim, the models' per-node clocks, boot-id horizons
+  (row 14, the step *while the node is down* and a forward step after the last
+  horizon write followed by a restart), and the re-persisting of a horizon
+  when a forward jump is observed. Handed to C7b: every cross-node compare
+  (rows 2, 6, 9, 24, 25: lease and promise expiries, the token window, the
+  root's lock cut, `stream_head_at`, the seal watch's `known_expiry`),
+  including the stepped-back claimant of seed 1892.
   *Not in C7-H1:* rate (ρ), suspend in the sim, the models' clocks and
   boot-id horizons (C7a); every cross-node compare (C7b). The models have
   one clock per node and cannot express the split; C7a reworks them with
@@ -3139,7 +3161,8 @@ to land before C0.
 
 - [ ] Interim work landed or explicitly deferred by the maintainer (Q7):
       the F2 fix, the takeover-loss fix, the 9287 and 2945 fixes, C7-H2,
-      C7-H1 — each with its fail-before evidence in PROGRESS.
+      C7-H1 (landed in four commits) — each with its fail-before evidence
+      in PROGRESS.
 - [ ] The maintainer's acceptance of each latency gate (§10, G1–G6)
       recorded before its milestone started.
 - [ ] C0: oracles I1–I5 in the sim with their flags, evaluated at the
@@ -3243,19 +3266,19 @@ L = liveness only.
 
 | # | Site | Compared | Clock | If offset > margin | Rate-only re-expression |
 |---|---|---|---|---|---|
-| 1 | Root lease, holder side — `engine/lease.rs` `usable`, `core/lease.rs` `usable`, `store-s3/lease.rs` `granted`/`renewed` | own stamp vs own clock | W | L (a backward step on the holder: honours longer = S) | honour until `renew_sent + ttl − M` on the honour clock; `expires_unix_ms` for status |
+| 1 | Root lease, holder side — `engine/lease.rs` `usable`, `core/lease.rs` `usable`, `store-s3/lease.rs` `granted`/`renewed` | own stamp vs own clock | W | L (a backward step on the holder: honours longer = S) | honour until `renew_sent + ttl − M` on the honour clock; `expires_unix_ms` for status **C7-H1 landed** (the local half; the rate half is C7a) |
 | 2 | Root lease, claimant — `Lease::is_claimable(now)` in `classify`/jobs, `live_leases_held_by`, `fence_retired` | holder's `expires_unix_ms` vs claimant's W | W↔W | **S** (a claimant ahead takes over while the holder writes) | ETag-observation rule; `released` unchanged; `fenced` flag; `ttl_ms` in the body |
 | 3 | Heartbeat promise — `heartbeat.rs` `Promise::outlasts`, `takeover_check`; `promise.rs` | promiser's `no_epoch_until` vs holder's `expires`, read by a third node | W↔W | **S** (split brain through an epoch) | request-anchored promises ("d from receipt"); `ask-<taker>` nonce without P2P |
-| 4 | Lock grant, holder side — `core/locks.rs` (`sent + ttl − margin`), `HeldGrant::until_ms`, `renew_point`, `due_renewals`, `fenced` | own send stamp vs own clock | W | L for offset; **S** for a backward step / suspend | honour clock (C7-H1 first) |
-| 5 | Lock grant, owner side — `until = recv + ttl + margin`, `restamp`, expiry timers, `drop_expired`, quarantines, graces | own receipt stamp vs own clock | W | L (a forward step on the owner: early outwait = S; 73 of 2 000 seeds at +2.5 s, the F-a review) | wait clock (C7-H1); margin `2ρ·ttl` + transit (C7a) |
+| 4 | Lock grant, holder side — `core/locks.rs` (`sent + ttl − margin`), `HeldGrant::until_ms`, `renew_point`, `due_renewals`, `fenced` | own send stamp vs own clock | W | L for offset; **S** for a backward step / suspend | honour clock (C7-H1 first) **C7-H1 landed** (the local half; the rate half is C7a) |
+| 5 | Lock grant, owner side — `until = recv + ttl + margin`, `restamp`, expiry timers, `drop_expired`, quarantines, graces | own receipt stamp vs own clock | W | L (a forward step on the owner: early outwait = S; 73 of 2 000 seeds at +2.5 s, the F-a review) | wait clock (C7-H1); margin `2ρ·ttl` + transit (C7a) **C7-H1 landed** (the local half; the rate half is C7a) |
 | 6 | Fencing token at a non-minting executor — `LockToken::until_ms` judged by `check_tag`/`check_tag_at_write`; `unsettled_writes`; token memory | holder's absolute window end vs executor's clock | W↔W | **S** (an executor behind runs a stale op after the next grant) | `remaining_ms` judged from receipt; `min` with the absolute stamp in phase 1 |
-| 7 | Read delegations — `readdeleg.rs`, `write_gate.rs` `deleg.valid`, `model/cto.rs` | own stamps vs own clock | W | L / a step = S as 4–5 | clock change only; the cto model gains a rate knob |
-| 8 | Write delegations — `delegate.rs` `until = sent + ttl − margin`, `deleg_lapse_at`, `reclaim_horizon`, `grant_cap_ms` | own stamps vs own clock | W | as 4–5 | clock change only; `until + 2M` becomes `until + 2ρ·ttl + transit` |
+| 7 | Read delegations — `readdeleg.rs`, `write_gate.rs` `deleg.valid`, `model/cto.rs` | own stamps vs own clock | W | L / a step = S as 4–5 | clock change only; the cto model gains a rate knob **C7-H1 landed** (the local half; the rate half is C7a) |
+| 8 | Write delegations — `delegate.rs` `until = sent + ttl − margin`, `deleg_lapse_at`, `reclaim_horizon`, `grant_cap_ms` | own stamps vs own clock | W | as 4–5 | clock change only; `until + 2M` becomes `until + 2ρ·ttl + transit` **C7-H1 landed** (the local half; the rate half is C7a) |
 | 9 | Lock cut / barriers — `DelegRenew::stream_head_at` folded into `lock_cut_here`, `lock_barrier_ready` | delegate's W vs root's W | W↔W | **S** (a delegate ahead: the floor misses a row) | root-anchored (send time of reply k − 1) |
 | 10 | Fast-takeover floor — `note_fast_takeover`, `note_marker_landed` `prev_expires.min(..)` | predecessor's `expires` vs successor's W | W↔W | **S** (a successor ahead gets no quarantine) | the bound alone (C7-H2 first; **landed**: the floor is the bound alone, `acquire_won` and the models classify fast by the permit, row 26) |
 | 11 | `ack=s3` fast takeover timing — `core/lease.rs:296` | holder's renewal stamp vs taker's W | W↔W | L (the slot CAS fences) | ETag unchanged for `backup_takeover_ms` |
-| 12 | Holder liveness (plan 41 L0) — `liveness_fresh`, `note_s3_liveness`, `strict_answer_allowed`, `LeaseView::reads_locally` | own send stamp vs own clock | W | **S on a backward step > 1.5 s** | honour clock (C7-H1 first) |
-| 13 | Backup seal watch, holder heartbeat, `OffCore::core_responsive`, `note_holder_heard` | own arrival stamps vs own clock | W | L | wait clock (C7-H1) |
+| 12 | Holder liveness (plan 41 L0) — `liveness_fresh`, `note_s3_liveness`, `strict_answer_allowed`, `LeaseView::reads_locally` | own send stamp vs own clock | W | **S on a backward step > 1.5 s** | honour clock (C7-H1 first) **C7-H1 landed** (the local half; the rate half is C7a) |
+| 13 | Backup seal watch, holder heartbeat, `OffCore::core_responsive`, `note_holder_heard` | own arrival stamps vs own clock | W | L | wait clock (C7-H1) **C7-H1 landed** (the local half; the rate half is C7a) |
 | 14 | Restart horizons — `KV_READ_GRANT_HORIZON`/`KV_LOCK_GRANT_HORIZON`, `load_*_quarantine` | own earlier W vs own later W across a restart | W (persisted) | **S on a forward step across the restart** | `(boot_id, BOOTTIME until)`, else the full horizon (C7a; C7-H1 writes them as wall and reads them back onto the wait clock, so only a step while the node is down, or a forward step while it is up after the last write followed by a restart, remains). The promise's `issued` (`promise.rs:366-378`, the KV `epoch_promise_issued_ms`, judged by `promise_join_begin`) is the same kind of horizon. Also: a successor's takeover floor (C7-H2) is not persisted at all (`set_quarantine` in memory), so a successor that restarts inside it, or whose upgrade handover gives up its release, forgets it: persist it under these keys |
 | 15 | Epoch claim views — `epoch_closed_claim`, `epoch_reclaim_pending`, `resolve_epoch_claims` | own lease stamp vs own clock; resolution by epoch | W | L | clock change only |
 | 16 | Singleton leases (`_snapsched`, GC) — `singleton.rs`, `snapsched.rs` | holder: own; claimant: holder's W vs own W | W↔W | L (the CAS on the holder's ETag is the safety) | observation rule if wanted; not required |
@@ -3269,7 +3292,7 @@ L = liveness only.
 | 24 | Seal watch's expiry compares — `on_takeover_get`, `known_expiry`/`lag_discount`, `watch_due_by_expiry` (`backup.rs`) | the holder's `expires` (its W) vs the backup's W | W↔W | L (after C7-H2 an early seal is safe: it gets the whole floor; a late one is latency) | wait clock plus the ETag observation: C7b, with row 13 |
 | 25 | `promise_check_needed` — `!prev.is_expired(now)` (`promise.rs`) | predecessor's `expires` vs the taker's W | W↔W | L (a sealed taker ahead does a promise check it would skip; only conservative) | with row 3's anchored promises: C7b |
 | 26 | `acquire_won`'s fast classification — `fast_prev` (`!p.is_expired(now)`) | predecessor's `expires` vs the successor's W | W↔W | was **S** (a sealed backup ahead by more than the lease's remainder took a TTL takeover: no floor) | **fixed (C7-H2)**: a takeover the permit allowed is fast whatever the clock says; the expiry is no longer kept |
-| 27 | Fast-takeover floor's beat cap (C7-F F-a) — `HolderBeats` (`note_beat`), `note_fast_takeover`, `note_marker_landed` | the predecessor's `expires`/`guard` minus its beat's `sent` (one clock), added to the beat's arrival `at` (the successor's) | W−W (holder), W (successor) | none for offset (a difference on one clock plus a stamp on the other); a backward step on the holder lengthens its honour (C7-H1); a forward step on the successor shortens every wait-side window alike; **a forward step `J` on the holder moves the cap early by `J` (unsafe when `J > 3M + δ`, the holder beating on and sealed mid-lease): the same class as the root's own grant table (C7-H1), which breaks exclusion with or without the cap** | already rate-only: `2ρ·(X − sent) ≤ M/2` for beats within `250·M`. C7-H1: `sent`, the named expiry and the guard on the holder's honour clock with its clock id; the lease body's `holder_expires_ms` replaces `expires_unix_ms` in `X`; `at` and the floor on the successor's wait clock; lags combined within one clock id: closes the forward step |
+| 27 | Fast-takeover floor's beat cap (C7-F F-a) — `HolderBeats` (`note_beat`), `note_fast_takeover`, `note_marker_landed` | the predecessor's `expires`/`guard` minus its beat's `sent` (one clock), added to the beat's arrival `at` (the successor's) | W−W (holder), W (successor) | none for offset (a difference on one clock plus a stamp on the other); a backward step on the holder lengthens its honour (C7-H1); a forward step on the successor shortens every wait-side window alike; **a forward step `J` on the holder moves the cap early by `J` (unsafe when `J > 3M + δ`, the holder beating on and sealed mid-lease): the same class as the root's own grant table (C7-H1), which breaks exclusion with or without the cap** | already rate-only: `2ρ·(X − sent) ≤ M/2` for beats within `250·M`. C7-H1: `sent`, the named expiry and the guard on the holder's honour clock with its clock id; the lease body's `holder_expires_ms` replaces `expires_unix_ms` in `X`; `at` and the floor on the successor's wait clock; lags combined within one clock id: closes the forward step **C7-H1 landed** (the local half; the rate half is C7a) |
 | 28 | A reader's `on_read_holder_learned` — `!l.is_claimable(now)` (`readindex.rs:1754`) | the holder's `expires_unix_ms` vs the reader's W | W↔W | **S** (a reader ahead takes a live holder for gone and answers a strict read with a tail to head, missing the holder's unshipped acknowledged writes) | with row 2: C7b |
 | 29 | `Grant.confirmed_ms` across a move (`core/locks.rs:4806, 5093` keep it; `meta/src/locks.rs:1357` compares it with a token's `until_ms`) | one sequencer's receipt stamp vs the holder's window, on a third node | W↔W | S at offsets (row 6's class) | with row 6: C7b |
 | 30 | Lock barriers across nodes, both ways (`DelegateStream.leaving_barriers`, `LockHandback.barrier`, `DelegRenewed.lock_barrier`/`lock_cut_at`; `core/locks.rs:4711-4737, 4916/5006, 2212-2248`) | one node's record end vs another's cut as-of | W↔W | S (row 9's class) | with row 9: root-anchored, C7b |

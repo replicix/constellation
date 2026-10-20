@@ -495,7 +495,7 @@ impl View {
                 .note_fast_path(constellation_meta::TouchSet::from_op(op));
             return match result {
                 Ok(records) => {
-                    h.lease.touch(now.wall);
+                    h.lease.touch(now.wait);
                     if let Some(jseq) = jseq {
                         if let Some(outcome) = self.ack_when_durable(h, rid, op, &tag, jseq) {
                             return outcome;

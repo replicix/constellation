@@ -25,7 +25,13 @@
 //! the holder's beat (`sent`, the lease's end and the guard are readings of
 //! its wait clock), the seal watch, and the persisted horizons (written as
 //! wall values, read back as time left on the wait clock). The liveness
-//! timers' sites still read `now.wall` until the last commit (4/4).
+//! sites (4/4) read `now.wait` as well: every timer (`set_timer_wait`), the
+//! client ops' deadlines and their `submitted` stamps, the inbox, stream,
+//! replay, placement and handoff housekeeping, the lease's dwell and idle
+//! stamps, and the engine's S3-path stall stamps. What still reads
+//! `now.wall` is cross-node (a lease's or promise's expiry, a batch's
+//! submission time, the root's lock cut), persisted, an identity key or
+//! status: the audit is in PROGRESS.
 
 /// A node id, as in `nodes/<id>` and `Lease::holder`.
 pub type NodeId = u64;

@@ -387,7 +387,7 @@ pub struct SchedDeps {
     /// The continuation epoch's "writes refused" (frozen, or offline with
     /// no lease to write under).
     pub epoch_frozen: Option<Arc<AtomicBool>>,
-    /// Unix ms of the sync task's last pass: the replica's freshness.
+    /// Wait-clock ms of the sync task's last pass: the replica's freshness.
     pub last_sync_ms: Arc<AtomicU64>,
     pub stats: Arc<SnapSchedStats>,
     pub config: SchedConfig,
@@ -821,7 +821,7 @@ impl Scheduler {
             return Some((false, "node is a read-only member".into()));
         }
         let lag = Duration::from_millis(
-            crate::prune::now_unix_ms().saturating_sub(d.last_sync_ms.load(Ordering::Relaxed)),
+            crate::prune::wait_ms().saturating_sub(d.last_sync_ms.load(Ordering::Relaxed)),
         );
         if lag > d.config.max_lag {
             return Some((
@@ -2017,7 +2017,7 @@ mod tests {
             read_only_member: false,
             departed: Arc::new(AtomicBool::new(false)),
             epoch_frozen: Some(Arc::new(AtomicBool::new(false))),
-            last_sync_ms: Arc::new(AtomicU64::new(crate::prune::now_unix_ms())),
+            last_sync_ms: Arc::new(AtomicU64::new(crate::prune::wait_ms())),
             stats: SnapSchedStats::new(),
             config,
             clock: Arc::new(move || now.load(Ordering::Relaxed)),
@@ -2438,7 +2438,7 @@ mod tests {
         sched
             .deps
             .last_sync_ms
-            .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
+            .store(crate::prune::wait_ms(), Ordering::Relaxed);
         sched.deps.departed.store(true, Ordering::Relaxed);
         assert!(sched.tick(Run::Periodic).await.refused.is_some());
         sched.deps.departed.store(false, Ordering::Relaxed);
@@ -2495,7 +2495,7 @@ mod tests {
             read_only_member: false,
             departed: Arc::new(AtomicBool::new(false)),
             epoch_frozen: None,
-            last_sync_ms: Arc::new(AtomicU64::new(crate::prune::now_unix_ms())),
+            last_sync_ms: Arc::new(AtomicU64::new(crate::prune::wait_ms())),
             stats: SnapSchedStats::new(),
             config: config(),
             clock: Arc::new(move || now.load(Ordering::Relaxed)),

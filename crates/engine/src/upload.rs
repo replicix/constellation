@@ -176,7 +176,7 @@ pub struct UploadRuntime {
     /// the rest ignore the report.
     inherited: std::sync::Mutex<std::collections::HashSet<constellation_fs_core::ChunkHash>>,
     /// EC2 finding 1: when a chunk PUT (or existence probe) last
-    /// completed on this node, unix ms — how a drain that is taking long
+    /// completed on this node, wait-clock ms — how a drain that is taking long
     /// tells a slow upload (progress) from an unreachable S3 (none), and
     /// only the latter hands its chunks to a peer.
     last_put_ms: std::sync::atomic::AtomicI64,
@@ -376,7 +376,7 @@ impl UploadRuntime {
     /// (`backend::last_s3_completion_ms`) in that long, while a request
     /// waited on it (`backend::s3_stall_in_ms`, finding 14).
     pub(crate) fn uploads_stalled(&self, for_ms: i64) -> bool {
-        self.uploads_stall_in(constellation_store_s3::lease::now_unix_ms(), for_ms) == Some(0)
+        self.uploads_stall_in(backend::wait_ms(), for_ms) == Some(0)
     }
 
     /// [`Self::uploads_stalled`] at `now_ms`: `Some(0)` stalled, `Some(ms)`
@@ -1016,10 +1016,9 @@ async fn upload_dirty_chunks_pass(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match store.put_chunk_mode(&hash, &data, compression, mode).await {
                     Ok(result) => {
-                        upload.last_put_ms.store(
-                            constellation_store_s3::lease::now_unix_ms(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        upload
+                            .last_put_ms
+                            .store(backend::wait_ms(), std::sync::atomic::Ordering::Relaxed);
                         let now = std::time::Instant::now();
                         // A Probe hit only performed HEAD; counting the
                         // chunk's logical bytes as uploaded would report

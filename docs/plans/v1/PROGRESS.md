@@ -53299,3 +53299,243 @@ On the box (kernel 7.3, 16 cores; `/tmp` on tmpfs), every job under `timeout
 - `cargo test --release -p constellation-model -- --test-threads=2`: 167
   passed, 0 failed.
 - The sweeps and harness runs above.
+
+## Plan 43 C7-H1, commit 4 of 4: liveness timers and deadlines on the wait clock, and the wall-read audit
+
+The last commit of C7-H1 (plan 43 §7 C7, §11 Q19). Every duration a node
+measures on itself alone is on its **wait clock** (`ProtocolClock::wait`:
+monotone, never over-counts, ignores every wall step): the timers, the client
+ops' deadlines (the ones that fail an operation come first: the S3-less bound,
+the inbox deadline, the forward, acquire and own-record waits), the
+housekeeping stamps, the lease's dwell and idle times, the S3 path's stall
+test. A forward wall step no longer fails an operation or releases a lease
+early, a backward one no longer keeps an operation waiting past its bound, and
+neither makes a healthy S3 path look stalled. C7-H1 is done; what it hands to
+C7a and C7b is listed at the end.
+
+### What landed
+
+- **Timers.** `set_timer_wall`, `TimerAt::Wall` and `TimerAt::later_than_wall`
+  (commit 1's review, L3) are gone: every timer is `set_timer_wait` or
+  `set_timer_honour`. `arm_inbox_poll_min` compares two wait timers.
+- **Client deadlines first.** `ClientOp.submitted`, `inbox_since`,
+  `inbox_durable_at` are `WaitMs`; the `s3_less_deadline` compare (client ops
+  and lock ops: `ENOLCK`/`EIO` after it), the inbox deadline (`inbox.rs`), the
+  `ClientDeadline`, forward, acquire and own-record timers, `OwnS3.since`.
+- **The rest of the core.** The inbox (`due_at`, the escalation window,
+  `demand_*`, `recall_waiters`, the poll/recheck/retry timers), the stream
+  (`last_sent`, `retry_at`, `last_s3_tail`, the heartbeat and watchdog), the
+  replay copy retries and `stuck_since`, placement (`cooldown`,
+  `roster_refreshed`, `below_since`), the delegation stream backoffs
+  (`stream_after`, `backup_after`, `inflight_at`), the backup's append and
+  reconfiguration stamps, the candidate backoff, the handoff request's
+  staleness, the flush floor and the parked flushes, `ship.last_publish`,
+  `held_tail_at`, `gap_checked_at`, `readopt_refused_until`, the read-index
+  hold and timeouts, the lock op's `created`, `Ask.at`, `HeldAnswer.since`.
+- **The two delegation timeouts commit 2's review noted.** `renew` and
+  `backup_inflight` gave up after `delegation_request_timeout` on the honour
+  clock, so a forward step fired them early (the renewal was resent, the first
+  kept as a late answer). They carry a wait stamp beside the honour `sent`
+  (`renew_sent_wait`, `backup_inflight_wait`); what the answer proves is still
+  judged on `sent`.
+- **The lease.** `held_since`, `wanted_since`, `last_write`, `pause_until` are
+  `WaitMs` (dwell, idle release, handoff pause); `LeaseState::last_seen_at` and
+  `LeaseState::begin_handoff_pause` (no reader) are deleted;
+  `LeaseState::note_object` and `epoch_carrier_checked` lose their unused `now`.
+  The FUSE path's `LeaseView::touch`/`last_write_ms` and `Event::Activity.last_write`
+  carry the wait reading.
+- **Meta.** `HeldGrant.idle_since` (was `idle_since_ms`, wall) is `Option<WaitMs>`
+  and `idle_before` takes a `WaitMs` (the lock cache's idle release).
+- **Engine, found by the audit.** The S3 path's stall test (`backend`'s
+  last-answered, last-unanswered and outstanding stamps, `upload.last_put_ms`,
+  the handoff's `last_needed_ms`, `StallWatch`) was wall: a forward step made a
+  healthy path with one request in flight look stalled, which moves the node's
+  ops to the S3-less path and fails them at its deadline. It is on the wait
+  clock (`backend::wait_ms`), `status.s3` reports its stamps as
+  `wall_of_wait`. The alive book's dismissals and the sync task's heartbeat
+  (`last_sync_ms`, read by the replica-lag checks and the prune) are on it too.
+- **The audit** is in the section below.
+
+### The audit of every remaining wall read
+
+Every hit of `now.wall`, `now_unix_ms`, `SystemTime`, `wall()` in
+`crates/{authority,engine,meta,net,store-s3}/src` (tests excluded) was read at
+its site. The residual list, `file:line` to class, is the table below; what the
+audit moved is the list of "What landed" above.
+
+Class codes:
+
+- **X**: cross-node. Compared with, or written for, another node's stamp (a lease or promise body, a peer's
+  `submitted`, the root's lock cut, a token's minter window). The offset bound applies until C7b.
+- **P**: persisted. Written to S3 or to the local store, or read back from there (a restart horizon, a batch, a
+  GC record). The loader converts to WAIT where it is a horizon (R9).
+- **I**: identity key or ordering id (a candidacy, a request id, a unique name).
+- **S**: status or log only. Nothing decides on it.
+- **E**: external wall (a cloud credential's expiry).
+- **W**: a local duration. These were moved in this commit ("What landed").
+
+Line numbers are those of this commit.
+
+#### `crates/authority/src/core` (remaining `now.wall`)
+
+| file:line | what | class |
+|---|---|---|
+| backup.rs:1620 | `candidacy = wall.max(last_candidacy + 1)`: the number a backup is told it was dropped under; compared across nodes | I |
+| backup.rs:2951 | `lag_discount`: the holder's named expiry (from its beat) minus the margin against this node's wall (row 24) | X |
+| backup.rs:3088 | `watch_due_by_expiry`: the holder's named expiry, mapped onto the wait clock for the timer | X |
+| backup.rs:3164, 3173 | the seal watch's `expires` / `aware_until` compares (row 24) | X |
+| backup.rs:3199, 3318 | `SealRecord.at`, shown in `status.ack` | S |
+| backup.rs:3231, 3239, 3280, 3739 | `lease.is_expired` / `is_claimable` on a lease object just read | X |
+| client.rs:1008 | `is_claimable` of the lease object (routing) | X |
+| client.rs:1076 | the withdrawal tombstone's `submitted_unix_ms`, an S3 object the holder reads | P |
+| delegate.rs:2280 | `DelegRenew.stream_head_at`, compared by the root with its own clock (row 9) | X |
+| inbox.rs:502 | `submitted_unix_ms` of a batch written to S3 | P |
+| inbox.rs:729, 741, 770 | `is_claimable` of the lease object | X |
+| inbox.rs:1211, 1219 | age of a batch another node wrote (`submitted_unix_ms`), for the round-trip statistic | X |
+| jobs.rs:1962, 2009, 2973, 2999, 3110 | `is_expired` / `is_claimable` on a lease or promise object | X |
+| lease.rs:320 | `ack=s3` permit: the holder's last renewal (its lease stamp) against this wall | X |
+| lease.rs:347, 361, 387 | `classify`: `is_expired` / `is_claimable` of the object | X |
+| lease.rs:447, 496 | the lease being written: `expires_unix_ms = wall + ttl` | P |
+| locks.rs:2325 | `lock_cut_here`: the cut's `at` (row 9, C7b) | X |
+| locks.rs:3320 | `Grant.confirmed_ms` crosses nodes unchanged (row 6) | X |
+| locks.rs:3703, 3728, 4625, 4654 | `is_claimable` of the lease object | X |
+| locks.rs:5881 | `lock_dir_barrier(dir, wall)`: compared with the root's cut | X |
+| locks.rs:1236, 2182, 2200, 3136, 5324, 5974, 6033, 6065 | `wall_of_wait(until)`: a WAIT end converted at the moment it leaves the process (barrier, persisted horizon) | X / P |
+| promise.rs:341, 372, 387 | the promise being issued: `until`, `issued` (S3 object, KV) | P |
+| promise.rs:434, 1285 | `is_expired` of the promise object read | X |
+| readindex.rs:413 | `note_grant_horizon(wall_of_wait(until))`: a persisted restart horizon (R9) | P |
+| readindex.rs:1780 | `is_claimable` of the lease object | X |
+
+#### `crates/meta/src`
+
+| file:line | what | class |
+|---|---|---|
+| locks.rs:1208 | `Grant.confirmed_ms = min(…, wall)` (R8, crosses nodes) | X |
+| locks.rs:1297, 1475, 1372 | a token is judged on this wall clock against the minter's wall window (row 6); `pins` hold a token's `until` | X |
+| locks.rs:1515, mutate.rs:512 | `host_us` in a debug line | S |
+| readdeleg.rs:585, 602 | `load_*_quarantine`: the persisted horizon read on the wall clock, then converted with `wait_of_wall` (R9) | P |
+| store/misc.rs:770 | `promise_join_begin`: a persisted `issued` of an earlier process read on the wall clock (row 14) | P |
+| snapsched/retention.rs:507, 612 | the retention policy's `now`: compared with persisted snapshot times | P |
+
+Moved in this commit: `HeldGrant.idle_since` (was `idle_since_ms`, `Option<i64>` wall) is `Option<WaitMs>`;
+`idle_before(WaitMs)`.
+
+#### `crates/engine/src`
+
+| file:line | what | class |
+|---|---|---|
+| authority_driver.rs:6181 | `req_id = now_unix_ms` (a request id) | I |
+| epoch.rs:37, 399, 590 | epoch promise windows and ids: compared across nodes | X / I |
+| fsck.rs:445, gc.rs:382, 484, 526, 631, 672, 763, mtree_gc.rs:222, 305, holds.rs:428 | GC leases, holds, roots, journal records and ages of persisted objects | P / X |
+| held.rs:23 | `age_s` of `enrolled_ms`, a persisted stamp | S |
+| singleton.rs:82 | a lease object's `is_claimable` and the holder nonce | X / I |
+| snapsched.rs:231-266, 374, 2000 | `leading_at`: the scheduler's lease stamp (an S3 lease body) against this wall; its only caller is `status()` | S |
+| snapshot_batch.rs:1140, 2326, 2821 | the lease object's expiry; a batch's names | X / I |
+| snapacct/service.rs:1038, 2185, 2456 | `as_of_ms` is persisted; its age against this wall | P |
+| control/streams.rs:36-59, 290, 335 | `unix_ms` in a status record | S |
+| control/service.rs:675 | `remote_chunks_oldest_s`: the age of a persisted `enrolled_ms` | S |
+| control/service.rs:838-839 | `honour_ahead_ms`, `wait_behind_ms` in `status.clock` | S |
+| control/snapsched.rs:89, 92 | `policy_check` / `policy_simulate` with the wall `now` | P |
+| backend.rs:150 | the credential provider's `SystemTime::now()` against the credential's own expiry | E |
+| coop/exact.rs:90, node.rs:1833 | a nonce / an ephemeral snapshot's name | I |
+| node.rs:931 | `prune_completed(now, retention)`: compared with persisted completion stamps | P |
+| prune.rs:419, 790, 809 | the audit record's `ts` and `last_run_unix_ms` | P / S |
+| log_buffer.rs:656, 722 | `first_unix_ms`, a log header's stamp | S |
+| view/write_gate.rs, view/*.rs | take `Now` once per mutation; the lease's `touch` is WAIT (moved) | (n/a) |
+| locks.rs:196-228 | `cfg(test)` test clock | (test) |
+
+#### `crates/store-s3/src`
+
+| file:line | what | class |
+|---|---|---|
+| lease.rs:64-65 | `now_unix_ms()` = `protocol().wall()`; the lease body (`expires_unix_ms`), `is_expired`, `is_claimable`, `fenced_for_retirement` | X / P |
+| lease.rs:184, 278, 493, 515 | the lease objects written and judged | X / P |
+| inbox.rs:190-196, 632-645 | `submitted_unix_ms` in a batch | P |
+| commits.rs:495, 529 | a commit's timestamp | P |
+| designation.rs:58, snapshot.rs:71, 99, store.rs:136, nodes.rs:93 | `created_unix_ms` / registry stamps of persisted objects | P |
+| aws_auth.rs:50 | credential expiry | E |
+
+#### `crates/net/src`
+
+No clock read. The `expires_unix_ms` and `created_unix_ms` fields in `message.rs` and `peers.rs` are wire and
+persisted values (X / P).
+
+### Tests
+
+- Core: `a_forward_step_does_not_fail_a_client_op_early` (a stalled node with
+  an op that has waited 1 s, the wall stepped past the S3-less bound: the op
+  waits, and fails on its own bound), `a_backward_step_does_not_extend_a_client_ops_deadline`,
+  and in `core::lease` `a_forward_step_does_not_release_an_idle_lease_early`
+  (and a backward step does not hold an idle one). Fail-before, shown with the
+  compare put back on the wall reading in a scratch copy: all three fail at their
+  assertions (the op failed in doubt 1 s after submission; the lease released
+  after 700 ms of idleness).
+- Sim: no wrapper is added. The sim's step configurations do not reach the
+  S3-less bound or the other client deadlines (a client answered `EIO` after a
+  step would fail the ledger checks, and none does); the evidence for the
+  deadline sites is the core tests above and the harness runs below.
+
+### Fail-before and after
+
+The step configurations (2 000 seeds each) stay at 0, as on b752452:
+`locks-root-step-forward`, `fast-takeover-holder-step-forward`,
+`fast-takeover-successor-step-forward`, `delegated-root-step-forward`,
+`strict-isolated-reader-holder-step-forward`, `locks-holder-step-back-sealed`,
+`locks-locker-step-back`, `strict-reader-step-back`,
+`delegated-delegate-step-back` and the controls `locks-root-step-back` and
+`locks-holder-step-forward`: 0 of 2 000 in every one.
+
+No-step sweeps, b752452 against this tree (the 64 configurations of commit 3's
+list: the seven of the spec, every `locks-*`, the thread-mode ones, the strict
+and delegated ones; 2 000 seeds each, `long-backup` 500): the failing seeds are
+identical in every one (the negative control `locks-writer-hold-unchecked`
+fails 1 973 seeds on both; one of its `SWEEP-FAIL` lines is garbled by
+interleaved logging in the base log, the same seed set) and the floor counters
+are identical in every configuration.
+
+### Harness
+
+Daemons built from this tree, no load but the scenario, seed 42:
+
+- `lock-failover` with `clock:step:+3000:6000,clock:step:-3000:12000` (b, c and
+  d step forward and back; `status.clock` counts both): passes, 0 locker `EIO`,
+  contender refusals 120 (120 without the steps), contender granted 0.58 ms after
+  the unlock. `backup-failover` with the same steps: passes, failover p50 1.490 s
+  (1.496 s without).
+- `load-probe` with `clock:step:+5000:8000` (every daemon: a forward step of 5 s
+  under the load profile's workload) and with `clock:step:-5000:8000`: passes
+  both, `errors by class {}` in both and in the run without a step: the errno
+  checker saw no `EIO`, `ENOLCK` or timeout.
+
+### Unchanged on purpose
+
+- Wall by design: the table above. Cross-node offsets (C7b) and rate (C7a) are
+  unchanged.
+- Honour clock: the late-answer retention (`LATE_ANSWER_MS`) and `LockCancel`,
+  `LockRequest.sent`, the renewal's `sent`: they judge what an answer proves and
+  are compared with honour readings only.
+- Handed to **C7a**: rate (rho) in the margins and in the simulator; suspend in
+  the simulator; the models' per-node clocks (`rate_ppm`); boot-id horizons
+  (row 14: a step while the node is down, and a forward step after the last
+  horizon write followed by a restart; optionally re-persist a horizon when a
+  forward jump of the honour clock is observed); a read delegation a delegate
+  never persists (`delegate.rs`: no `note_grant_horizon`, not a clock issue).
+- Handed to **C7b**: every cross-node compare, rows 2, 6, 9, 24, 25 (lease and
+  promise expiries, the token window, the root's lock cut, `stream_head_at`, the
+  seal watch's `known_expiry`), including seed 1892 of
+  `locks-holder-step-back-sealed` (a stepped-back claimant's wall expiry).
+- pjdfstest (plan 43 §11 gate 8, 8 798 of 8 798) was not run in this pass.
+
+### Gates
+
+On the box (kernel 7.3, 16 cores; `/tmp` on tmpfs), every job under `timeout
+--kill-after=30s`:
+
+- `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D
+  warnings` clean.
+- `cargo test --release --workspace --exclude constellation-model
+  --no-fail-fast`: 3 325 passed, 0 failed, 43 ignored over 88 targets (the
+  authority lib 502, the engine lib 816, the meta lib 269, the sim included).
+- `cargo test --release -p constellation-model -- --test-threads=2`: 167
+  passed, 0 failed.
+- The sweeps and harness runs above.

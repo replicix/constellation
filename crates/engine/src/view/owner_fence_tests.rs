@@ -193,7 +193,7 @@ impl Fenced {
                 renewing: None,
                 releasing: false,
                 first_use: false,
-                idle_since_ms: None,
+                idle_since: None,
                 installed: now,
             },
         );
@@ -1198,7 +1198,7 @@ fn releasing_a_handle_drops_the_locks_taken_through_it() {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: crate::locks::now().honour,
         },
     );
@@ -1268,7 +1268,7 @@ fn a_late_release_spares_a_reused_owners_new_lock() {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: crate::locks::now().honour,
         },
     );
@@ -1342,7 +1342,7 @@ fn two_descriptions(f: &Fenced, caller: &Caller, name: &str) -> (Ino, Fh, Fh) {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: crate::locks::now().honour,
         },
     );
@@ -2377,7 +2377,7 @@ fn script_core_waits(f: &mut Fenced, ino: Ino, script: Vec<Scripted>) -> Seen {
                             renewing: None,
                             releasing: false,
                             first_use: false,
-                            idle_since_ms: None,
+                            idle_since: None,
                             installed: now,
                         },
                     );

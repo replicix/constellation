@@ -800,6 +800,14 @@ pub fn now_unix_ms() -> u64 {
     constellation_store_s3::lease::now_unix_ms().max(0) as u64
 }
 
+/// This node's wait clock (`ProtocolClock::wait`) in ms: what an interval
+/// measured on this node alone (the age of the last sync) counts on, so
+/// that a wall step neither makes the replica look behind nor hides that
+/// it is (plan 43 C7-H1).
+pub fn wait_ms() -> u64 {
+    constellation_platform::clock::protocol().wait().0.max(0) as u64
+}
+
 /// One audit record per run under `prune/journal/`, mirroring the GC
 /// journal. A dry run writes the same shape with zero deletes.
 async fn write_audit(deps: &PruneDeps, report: &PruneReport) {

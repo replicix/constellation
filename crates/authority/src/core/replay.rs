@@ -6,7 +6,7 @@ use super::client::{completed_as_outcome, Origin};
 use super::Core;
 use crate::action::Action;
 use crate::event::Policy;
-use crate::ids::{Ms, Now};
+use crate::ids::{Now, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::{MutateOp, MutateOutcome, Position, Rid, StrandedOp};
 use constellation_types::Code;
@@ -21,9 +21,9 @@ const COPY_BACKOFF_MAX_MS: u64 = 10_000;
 struct CopyRetry {
     attempts: u32,
     /// When the first attempt failed: how long the copy has been stalled.
-    since: Ms,
+    since: WaitMs,
     /// Not before this.
-    next_at: Ms,
+    next_at: WaitMs,
 }
 
 #[derive(Debug, Default)]
@@ -31,13 +31,13 @@ pub(crate) struct ReplayState {
     /// The queued op currently in flight through the forward path.
     pub in_flight: Option<u64>,
     /// When the head of the queue last stopped making progress.
-    pub stuck_since: Option<Ms>,
+    pub stuck_since: Option<WaitMs>,
     /// Refused replays whose conflict copy failed at least once.
     copies: BTreeMap<u64, CopyRetry>,
     /// The conflict copy the driver is making right now.
     copy_in_flight: Option<u64>,
     /// When a stalled copy last asked for the lease.
-    copy_lease_asked_at: Option<Ms>,
+    copy_lease_asked_at: Option<WaitMs>,
     /// Plan 30 §M9: rids executed here whose reply was still waiting for
     /// durability when the tenure ended (`abort_durable_parks`). The
     /// recovery that follows queues their rows for replay by rid; those
@@ -54,7 +54,7 @@ impl ReplayState {
         let stalled = self
             .copies
             .values()
-            .filter(|c| now.wall.since(c.since) >= fallback_ms as i64)
+            .filter(|c| now.wait.since(c.since) >= fallback_ms as i64)
             .count();
         (self.copies.len() as u64, stalled as u64)
     }
@@ -274,12 +274,12 @@ impl Core {
                 self.replay.stuck_since = None;
                 return;
             }
-            let stuck_for = self.replay.stuck_since.get_or_insert(now.wall).to_owned();
-            if now.wall.since(stuck_for) >= self.cfg.replay_lease_fallback_ms as i64
+            let stuck_for = self.replay.stuck_since.get_or_insert(now.wait).to_owned();
+            if now.wait.since(stuck_for) >= self.cfg.replay_lease_fallback_ms as i64
                 && self.lease.ship_epoch(now, &self.cfg).is_none()
             {
                 tracing::warn!(node = self.cfg.node_id, rid = ?head.rid, "replay stuck; asking for the lease");
-                self.replay.stuck_since = Some(now.wall);
+                self.replay.stuck_since = Some(now.wait);
                 // The cached holder may be the dead one that stranded the
                 // op: make the next attempt read the lease object.
                 self.lease.cached_holder = None;
@@ -428,13 +428,13 @@ impl Core {
             .replay
             .copies
             .get(&queued.queue_seq)
-            .is_some_and(|retry| now.wall < retry.next_at)
+            .is_some_and(|retry| now.wait < retry.next_at)
         {
-            let stalled_for = now.wall.since(self.replay.copies[&queued.queue_seq].since);
+            let stalled_for = now.wait.since(self.replay.copies[&queued.queue_seq].since);
             let asked_recently = self
                 .replay
                 .copy_lease_asked_at
-                .is_some_and(|at| now.wall.since(at) < self.cfg.replay_lease_fallback_ms as i64);
+                .is_some_and(|at| now.wait.since(at) < self.cfg.replay_lease_fallback_ms as i64);
             // Not in an epoch that refuses writes: no lease can be had
             // there (see `on_drain_tick`).
             if stalled_for >= self.cfg.replay_lease_fallback_ms as i64
@@ -448,7 +448,7 @@ impl Core {
                     stalled_ms = stalled_for,
                     "a conflict copy has been stalled; acquiring the lease to make it locally"
                 );
-                self.replay.copy_lease_asked_at = Some(now.wall);
+                self.replay.copy_lease_asked_at = Some(now.wait);
                 self.enqueue_job(
                     now,
                     super::jobs::JobReq::Acquire {
@@ -490,11 +490,11 @@ impl Core {
         }
         let retry = self.replay.copies.entry(queue_seq).or_insert(CopyRetry {
             attempts: 0,
-            since: now.wall,
-            next_at: now.wall,
+            since: now.wait,
+            next_at: now.wait,
         });
         retry.attempts += 1;
-        retry.next_at = now.wall.plus(copy_backoff_ms(retry.attempts));
+        retry.next_at = now.wait.plus(copy_backoff_ms(retry.attempts));
         if retry.attempts == 1 || retry.attempts.is_multiple_of(10) {
             tracing::warn!(
                 node = self.cfg.node_id,

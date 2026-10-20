@@ -438,8 +438,8 @@ impl Core {
             }
         }
         if p2p_down && self.pr.watch_timer.is_none() && !self.lease.usable(now, &self.cfg) {
-            let id = self.set_timer_wall(
-                now.wall.plus(self.cfg.promise_watch_ms),
+            let id = self.set_timer_wait(
+                now.wait.plus(self.cfg.promise_watch_ms),
                 Timer::PromiseWatch,
                 out,
             );
@@ -1325,8 +1325,8 @@ impl Core {
         if self.cfg.epoch_slack > 0 {
             self.ask_for_promises(&mut check, out);
         }
-        check.timer = Some(self.set_timer_wall(
-            now.wall.plus(self.cfg.promise_wait_ms),
+        check.timer = Some(self.set_timer_wait(
+            now.wait.plus(self.cfg.promise_wait_ms),
             Timer::PromiseWait,
             out,
         ));

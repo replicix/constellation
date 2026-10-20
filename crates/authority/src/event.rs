@@ -183,11 +183,11 @@ pub enum Event {
     /// `backup_ack_timeout_ms`, to make acknowledgement progress.
     BackupAlive { from: NodeId, at: WaitMs },
     /// Local writes the driver's fast path executed without the core
-    /// (the FUSE lease view's `admit`): the time of the last one, for the
+    /// (the FUSE lease view's `admit`): the wait-clock time of the last one, for the
     /// idle-release clock, and their rid seqs, for the ack tracker
     /// (`acked_through`).
     Activity {
-        last_write: Ms,
+        last_write: WaitMs,
         acked_seqs: Vec<u64>,
     },
     /// A control-plane request from the daemon (unmount, `fsync`,

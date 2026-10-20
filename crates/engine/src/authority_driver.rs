@@ -40,7 +40,6 @@ use constellation_meta::locks::GrantId;
 use constellation_meta::{JournalPos, Meta, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
 use constellation_net::{LogEvent, Payload};
 use constellation_store_s3::inbox::InboxStore;
-use constellation_store_s3::lease::now_unix_ms;
 use constellation_store_s3::log::PARTITION;
 use constellation_store_s3::{
     ChunkStore, CompressionSetting, LeaseMode, LeaseStore, LogStore, StoreError,
@@ -984,7 +983,7 @@ const DISMISS_FOR_MS: i64 = 10_000;
 /// only to the candidacy it names, so one still in flight is harmless.
 #[derive(Debug, Default)]
 struct AliveBook {
-    /// node → (epoch, told until (unix ms), candidacy).
+    /// node → (epoch, told until (wait-clock ms), candidacy).
     dismissed: HashMap<NodeId, (u64, i64, u64)>,
     /// The last targets' epoch and listed backups.
     prev: Option<(u64, Vec<(NodeId, u64)>)>,
@@ -997,7 +996,7 @@ impl AliveBook {
     /// `listed` its backups.
     fn update(
         &mut self,
-        now_unix_ms: i64,
+        now_wait_ms: i64,
         held: Option<(u64, i64, i64, i64, i64)>,
         listed: Vec<(NodeId, u64)>,
     ) -> Option<AliveTargets> {
@@ -1007,7 +1006,7 @@ impl AliveBook {
             return None;
         };
         self.dismissed
-            .retain(|_, (e, until, _)| *e == epoch && *until > now_unix_ms);
+            .retain(|_, (e, until, _)| *e == epoch && *until > now_wait_ms);
         for (n, _) in &listed {
             self.dismissed.remove(n);
         }
@@ -1016,7 +1015,7 @@ impl AliveBook {
                 for &(n, candidacy) in prev {
                     if candidacy != 0 && !listed.iter().any(|(l, _)| *l == n) {
                         self.dismissed
-                            .insert(n, (epoch, now_unix_ms + DISMISS_FOR_MS, candidacy));
+                            .insert(n, (epoch, now_wait_ms + DISMISS_FOR_MS, candidacy));
                     }
                 }
             }
@@ -1704,13 +1703,13 @@ impl OffCore {
         );
     }
 
-    /// The freezes of the heartbeat thread as of `now_unix_ms`, oldest
+    /// The freezes of the heartbeat thread as of `now_wait_ms`, oldest
     /// first (`deleg_lane::freezes`).
-    pub(crate) fn beat_freezes(&self, now_unix_ms: i64) -> Vec<(i64, i64)> {
+    pub(crate) fn beat_freezes(&self, now_wait_ms: i64) -> Vec<(i64, i64)> {
         constellation_authority::deleg_lane::freezes(
             self.beat_freeze.load(Ordering::Relaxed),
             self.beat_due.load(Ordering::Relaxed),
-            now_unix_ms,
+            now_wait_ms,
         )
     }
 
@@ -1738,12 +1737,12 @@ impl OffCore {
     /// interval ([`deleg_lane::whole_process`]). A heartbeat thread held up
     /// alone, in a log line or on a mutex, is not handed to the core as a
     /// freeze: the lane's thread failed, the loss is not excused.
-    pub(crate) fn whole_process_freezes(&self, now_unix_ms: i64) -> Vec<(i64, i64)> {
-        let freezes = self.beat_freezes(now_unix_ms);
+    pub(crate) fn whole_process_freezes(&self, now_wait_ms: i64) -> Vec<(i64, i64)> {
+        let freezes = self.beat_freezes(now_wait_ms);
         if freezes.is_empty() {
             return freezes;
         }
-        let runtime = self.lapse(now_unix_ms);
+        let runtime = self.lapse(now_wait_ms);
         freezes
             .into_iter()
             .filter(|f| constellation_authority::deleg_lane::whole_process(*f, runtime))
@@ -1764,13 +1763,13 @@ impl OffCore {
         }
     }
 
-    /// One tick of the lag probe at `now_unix_ms`, `late_ms` after it
+    /// One tick of the lag probe at `now_wait_ms`, `late_ms` after it
     /// was due.
-    pub(crate) fn note_probe(&self, now_unix_ms: i64, late_ms: i64) {
+    pub(crate) fn note_probe(&self, now_wait_ms: i64, late_ms: i64) {
         if late_ms >= self.lag_threshold_ms {
-            *self.lapse.lock().unwrap() = (now_unix_ms - late_ms, now_unix_ms);
+            *self.lapse.lock().unwrap() = (now_wait_ms - late_ms, now_wait_ms);
         }
-        self.probe_tick.store(now_unix_ms, Ordering::Relaxed);
+        self.probe_tick.store(now_wait_ms, Ordering::Relaxed);
     }
 
     /// Only the latest lapse is kept: two the probe records while the
@@ -1780,27 +1779,27 @@ impl OffCore {
     /// window, never a later one than the stated bound. A queue would need
     /// that bound re-derived.
     ///
-    /// This node's latest lapse as of `now_unix_ms`, `(from, until)`
+    /// This node's latest lapse as of `now_wait_ms`, `(from, until)`
     /// (`(0, 0)`: none): the probe's latest, or the one in progress if
     /// the probe itself is overdue by the threshold — the runtime is
     /// being held up right now, and the probe cannot say so before it
     /// runs (it says so with the same start once it does).
-    pub(crate) fn lapse(&self, now_unix_ms: i64) -> (i64, i64) {
+    pub(crate) fn lapse(&self, now_wait_ms: i64) -> (i64, i64) {
         let tick = self.probe_tick.load(Ordering::Relaxed);
-        if tick != 0 && now_unix_ms - tick >= PROBE_EVERY_MS + self.lag_threshold_ms {
-            return (tick + PROBE_EVERY_MS, now_unix_ms);
+        if tick != 0 && now_wait_ms - tick >= PROBE_EVERY_MS + self.lag_threshold_ms {
+            return (tick + PROBE_EVERY_MS, now_wait_ms);
         }
         *self.lapse.lock().unwrap()
     }
 
     /// How long past its period the lag probe has not ticked (0: it is
     /// ticking, or not started).
-    pub(crate) fn runtime_stalled_ms(&self, now_unix_ms: i64) -> i64 {
+    pub(crate) fn runtime_stalled_ms(&self, now_wait_ms: i64) -> i64 {
         let tick = self.probe_tick.load(Ordering::Relaxed);
         if tick == 0 {
             return 0;
         }
-        (now_unix_ms - tick - PROBE_EVERY_MS).max(0)
+        (now_wait_ms - tick - PROBE_EVERY_MS).max(0)
     }
 
     /// How long the lag probe has not ticked past its period: the shared
@@ -1839,9 +1838,9 @@ impl OffCore {
 
     /// Whether the driver loop is waiting for work or has progressed
     /// within `responsive_ms`.
-    pub(crate) fn core_responsive(&self, now_unix_ms: i64) -> bool {
+    pub(crate) fn core_responsive(&self, now_wait_ms: i64) -> bool {
         let busy = self.busy_since();
-        busy == 0 || now_unix_ms - busy <= self.responsive_ms
+        busy == 0 || now_wait_ms - busy <= self.responsive_ms
     }
 
     /// The holder `holder` was heard from at `epoch` (a heartbeat or an
@@ -2382,7 +2381,7 @@ impl Driver {
         };
         self.deps
             .last_sync_ms
-            .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
+            .store(crate::prune::wait_ms(), Ordering::Relaxed);
         let kind = event_kind(&event);
         // Progress (a wake-up may run several steps).
         self.deps.off_core.set_busy(wait_now_ms());
@@ -2492,7 +2491,7 @@ impl Driver {
     /// status snapshot.
     fn refresh(&mut self) {
         let now = now();
-        self.publish_alive_targets(now.wall);
+        self.publish_alive_targets(now.wait);
         {
             // Compared in place: nothing is allocated on a step that
             // changed no certificate (the lock and the walk over the
@@ -2595,7 +2594,7 @@ impl Driver {
     /// What [`holder_alive_loop`] beats to: the lease this node holds,
     /// its committed backups and candidate, and the candidacies it
     /// dropped lately ([`AliveBook`]).
-    fn publish_alive_targets(&mut self, now: Ms) {
+    fn publish_alive_targets(&mut self, now: WaitMs) {
         let lease = self.core.lease();
         let held = match &lease.held {
             Some((l, _)) if !lease.epoch_held() => Some((
@@ -3094,7 +3093,7 @@ impl Driver {
                 let acked = self.drain_acks();
                 if !acked.is_empty() {
                     let _ = self.int_tx.send(Internal::Event(Event::Activity {
-                        last_write: Ms(self.deps.view.last_write_ms()),
+                        last_write: WaitMs(self.deps.view.last_write_ms()),
                         acked_seqs: acked,
                     }));
                 }
@@ -3646,7 +3645,7 @@ impl Driver {
                     let upload = self.uploader();
                     let epochs = self.deps.epochs.clone();
                     let acked = self.drain_acks();
-                    let last_write = Ms(self.deps.view.last_write_ms());
+                    let last_write = WaitMs(self.deps.view.last_write_ms());
                     if round {
                         let _ = tx.send(Internal::Event(Event::Activity {
                             last_write,
@@ -5857,7 +5856,7 @@ impl OwnS3Watch {
     }
 
     fn tick(&mut self) -> (bool, Option<bool>) {
-        self.tick_at(std::time::Instant::now(), now_unix_ms())
+        self.tick_at(std::time::Instant::now(), wait_now_ms())
     }
 
     fn tick_at(&mut self, now: std::time::Instant, now_ms: i64) -> (bool, Option<bool>) {
@@ -6002,7 +6001,7 @@ async fn drain_with_handoff(
         return done.await.unwrap_or_else(|_| Err(stopped()));
     };
     let after = std::time::Duration::from_millis(after_ms);
-    let now = constellation_store_s3::lease::now_unix_ms();
+    let now = wait_now_ms();
     let sticky = now
         - stats
             .handoff
@@ -6034,7 +6033,7 @@ async fn drain_with_handoff(
                 }
                 return result;
             }
-            Err(_) if !tried => match handoff_recheck(&stats, after, now_unix_ms()) {
+            Err(_) if !tried => match handoff_recheck(&stats, after, wait_now_ms()) {
                 None => {
                     tried = true;
                     tracing::info!(
@@ -6163,7 +6162,7 @@ impl ChunkHandoff {
         self.upload
             .handoff
             .last_needed_ms
-            .store(constellation_store_s3::lease::now_unix_ms(), Relaxed);
+            .store(wait_now_ms(), Relaxed);
         self.upload.handoff.sent.fetch_add(1, Relaxed);
         let _offer = coop.offer(&hashes);
         let holder = self.view.status().holder;
@@ -6790,7 +6789,7 @@ mod tests {
     fn the_own_s3_watch_needs_a_request_left_waiting() {
         use super::{own_s3_late_ticks, OwnS3Watch};
         use std::time::{Duration, Instant};
-        let t0_ms = constellation_store_s3::lease::now_unix_ms();
+        let t0_ms = super::wait_now_ms();
         let t0 = Instant::now();
         let at = |s: f64| (t0 + Duration::from_secs_f64(s), t0_ms + (s * 1000.0) as i64);
         let upload = std::sync::Arc::new(crate::upload::UploadRuntime::for_test(false));
@@ -6862,7 +6861,7 @@ mod tests {
     fn a_drain_rechecks_when_its_first_upload_has_waited_the_window() {
         use std::time::Duration;
         let after = Duration::from_millis(6_000);
-        let now = constellation_store_s3::lease::now_unix_ms();
+        let now = super::wait_now_ms();
         let _path = crate::backend::s3_path_for_test(now - 60_000);
         let upload = crate::upload::UploadRuntime::for_test(false);
         // Nothing asked: the full `after`.
@@ -8123,7 +8122,7 @@ mod tests {
             rig.rt_a.spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    off.loop_woke(super::now_unix_ms());
+                    off.loop_woke(super::wait_now_ms());
                     off.set_busy(0);
                 }
             })

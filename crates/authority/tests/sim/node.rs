@@ -1972,7 +1972,7 @@ impl Driver {
         let mut actions = self.core.handle(
             now,
             Event::Activity {
-                last_write: now.wall,
+                last_write: now.wait,
                 acked_seqs: vec![rid.seq],
             },
             &*self.meta,

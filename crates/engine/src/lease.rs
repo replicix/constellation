@@ -23,7 +23,7 @@
 //! (the next round ships it) rather than being stranded behind it.
 
 use constellation_authority::core::LeaseState;
-use constellation_authority::{Config, HonourMs, Ms, Now, WaitMs};
+use constellation_authority::{Config, HonourMs, Now, WaitMs};
 use constellation_platform::clock::protocol;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
@@ -73,7 +73,7 @@ pub struct LeaseView {
     holder: AtomicU64,
     epoch: AtomicU64,
     lost: AtomicBool,
-    /// Unix ms of the last gated mutation, for idle release.
+    /// Wait-clock ms of the last gated mutation, for idle release.
     last_write_ms: AtomicI64,
     /// Gated local mutations since start (`status.inbox.local_ops`).
     touches: AtomicU64,
@@ -258,8 +258,8 @@ impl LeaseView {
     }
 
     /// [`Self::open_for_new_mutation`] at a reading already taken: the
-    /// lease on its honour clock, the handoff pause on the wall clock
-    /// (liveness; the next commits of plan 43 C7-H1 move it).
+    /// lease on its honour clock, the handoff pause on the wait clock
+    /// (liveness: a forward step must not end the pause early).
     pub fn open_for_new_mutation_at(&self, now: Now) -> bool {
         if self.releasing.load(Ordering::SeqCst) || self.gate_pending.load(Ordering::SeqCst) {
             return false;
@@ -267,7 +267,7 @@ impl LeaseView {
         if self.epoch_held.load(Ordering::Relaxed) {
             return self.usable_at(now.honour);
         }
-        if self.handoff_pause_until_ms.load(Ordering::Relaxed) > now.wall.0 {
+        if self.handoff_pause_until_ms.load(Ordering::Relaxed) > now.wait.0 {
             return false;
         }
         self.usable_at(now.honour)
@@ -330,7 +330,7 @@ impl LeaseView {
 
     /// Record write activity; keeps the idle-release timer from firing
     /// under a running workload.
-    pub fn touch(&self, now: Ms) {
+    pub fn touch(&self, now: WaitMs) {
         self.last_write_ms.store(now.0, Ordering::Relaxed);
         self.touches.fetch_add(1, Ordering::Relaxed);
     }
@@ -340,7 +340,7 @@ impl LeaseView {
         self.touches.load(Ordering::Relaxed)
     }
 
-    /// Unix ms of the last fast-path write (0 if none).
+    /// Wait-clock ms of the last fast-path write (0 if none).
     pub fn last_write_ms(&self) -> i64 {
         self.last_write_ms.load(Ordering::Relaxed)
     }
@@ -363,7 +363,7 @@ impl LeaseView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use constellation_authority::Now;
+    use constellation_authority::{Ms, Now};
     use constellation_store_s3::lease::now_unix_ms;
     use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
 
@@ -511,11 +511,11 @@ mod tests {
         assert!(view.admit().is_none(), "releasing closes new mutations");
         state.releasing = false;
 
-        state.begin_handoff_pause(Now::same(now.0), &cfg);
+        state.pause_until = WaitMs(now.0 + cfg.handoff_pause_ms as i64);
         view.mirror(&state, Now::same(now.0), &cfg, false);
         assert!(view.usable());
         assert!(!view.open_for_new_mutation(), "paused for a handoff");
-        state.pause_until = Ms(0);
+        state.pause_until = WaitMs(0);
 
         state.gate = Some(constellation_authority::core::PendingGate {
             epoch: 1,

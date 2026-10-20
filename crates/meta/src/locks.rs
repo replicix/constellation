@@ -378,7 +378,7 @@ pub struct HeldGrant {
     /// Since when no local lock has been under it (`None`: one is, or it
     /// was never used): an idle cache is released after a while so its
     /// renewals stop.
-    pub idle_since_ms: Option<i64>,
+    pub idle_since: Option<WaitMs>,
     /// When this node installed it (its honour clock): a recalled grant
     /// waiting for its first local lock is renewed only for
     /// [`LockTables::first_use_budget_ms`] from here.
@@ -1676,7 +1676,7 @@ impl LockTables {
             held.renew_at = old.renew_at.max(held.renew_at);
             held.recalled |= old.recalled;
             held.releasing = old.releasing;
-            held.idle_since_ms = old.idle_since_ms;
+            held.idle_since = old.idle_since;
         } else if let Some(old) = g.held.get(&ino).copied().filter(|o| {
             o.id.node == held.id.node
                 && o.id.seq < held.id.seq
@@ -1697,7 +1697,7 @@ impl LockTables {
             held.recalled |= old.recalled;
             held.releasing = old.releasing;
             held.first_use = old.first_use;
-            held.idle_since_ms = old.idle_since_ms;
+            held.idle_since = old.idle_since;
             held.installed = old.installed;
         }
         let recalled = held.recalled;
@@ -1900,10 +1900,10 @@ impl LockTables {
             return false;
         };
         h.first_use = false;
-        if idle && h.idle_since_ms.is_none() {
+        if idle && h.idle_since.is_none() {
             // Idle time is a liveness stamp (the cache's idle release): it
             // moves to the wait clock with the other housekeeping.
-            h.idle_since_ms = Some(now.wall.0);
+            h.idle_since = Some(now.wait);
         }
         let recalled = h.recalled;
         g.stats.first_use_abandoned += 1;
@@ -2604,7 +2604,7 @@ impl LockTables {
         }
         if let Some(h) = g.held.get_mut(&ino) {
             h.first_use = false;
-            h.idle_since_ms = None;
+            h.idle_since = None;
         }
         let was_empty = g.local.get(&ino).is_none_or(|v| v.is_empty());
         let v = g.local.entry(ino).or_default();
@@ -2652,7 +2652,7 @@ impl LockTables {
             g.local.remove(&ino);
             self.local_inos.fetch_sub(1, Ordering::Relaxed);
             if let Some(h) = g.held.get_mut(&ino) {
-                h.idle_since_ms = Some(now.wall.0);
+                h.idle_since = Some(now.wait);
             }
         }
         if fenced && touched {
@@ -2691,7 +2691,7 @@ impl LockTables {
             g.local.remove(&ino);
             self.local_inos.fetch_sub(1, Ordering::Relaxed);
             if let Some(h) = g.held.get_mut(&ino) {
-                h.idle_since_ms = Some(now.wall.0);
+                h.idle_since = Some(now.wait);
             }
         }
         g.lift_if_unlocked(owner);
@@ -2699,13 +2699,13 @@ impl LockTables {
         (idle, dropped)
     }
 
-    /// Grants idle (no local lock under them) since before `before_ms`,
+    /// Grants idle (no local lock under them) since before `before`,
     /// marked recalled so their release proceeds like a recall's.
-    pub fn idle_before(&self, before_ms: i64) -> Vec<(u64, HeldGrant)> {
+    pub fn idle_before(&self, before: WaitMs) -> Vec<(u64, HeldGrant)> {
         let mut g = self.lock();
         let mut out = Vec::new();
         for (ino, h) in g.held.iter_mut() {
-            if h.idle_since_ms.is_some_and(|t| t < before_ms) && !h.recalled && !h.releasing {
+            if h.idle_since.is_some_and(|t| t < before) && !h.recalled && !h.releasing {
                 h.recalled = true;
                 out.push((*ino, *h));
             }
@@ -2844,7 +2844,7 @@ mod tests {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: HonourMs(0),
         }
     }
@@ -3669,9 +3669,9 @@ mod tests {
         assert!(!t.abandon_first_use(9, Now::same(60)));
         assert!(!t.held(9).unwrap().first_use);
         // ... and idle from the give-up: the idle sweep reclaims it.
-        assert_eq!(t.held(9).unwrap().idle_since_ms, Some(60));
-        assert!(t.idle_before(60).iter().all(|(ino, _)| *ino != 9));
-        assert!(t.idle_before(61).iter().any(|(ino, _)| *ino == 9));
+        assert_eq!(t.held(9).unwrap().idle_since, Some(WaitMs(60)));
+        assert!(t.idle_before(WaitMs(60)).iter().all(|(ino, _)| *ino != 9));
+        assert!(t.idle_before(WaitMs(61)).iter().any(|(ino, _)| *ino == 9));
     }
 
     #[test]
@@ -3866,11 +3866,14 @@ mod idle_tests {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: HonourMs(0),
         };
         t.install_held(7, h);
-        assert!(t.idle_before(100).is_empty(), "never used: not idle");
+        assert!(
+            t.idle_before(WaitMs(100)).is_empty(),
+            "never used: not idle"
+        );
         let l = LocalLock {
             owner: 1,
             pid: 1,
@@ -3881,8 +3884,8 @@ mod idle_tests {
         };
         assert_eq!(t.local_set(7, l, Now::same(0)), LocalOutcome::Done);
         assert!(t.local_unlock(7, 1, 0, 10, Now::same(10)));
-        assert!(t.idle_before(10).is_empty());
-        assert_eq!(t.idle_before(11).len(), 1);
+        assert!(t.idle_before(WaitMs(10)).is_empty());
+        assert_eq!(t.idle_before(WaitMs(11)).len(), 1);
         assert!(t.held(7).unwrap().recalled);
         assert!(t.begin_release(7).is_some());
     }
@@ -3904,7 +3907,7 @@ mod supersede_tests {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: HonourMs(0),
         }
     }
@@ -4035,7 +4038,7 @@ mod token_tests {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: HonourMs(0),
         }
     }

@@ -4309,10 +4309,9 @@ lock grants, delegation, read delegations, liveness proof and heartbeat
 stamps read `now.honour`); the waiter's sites landed in 3/4 (an owner's
 records, a root's outwaits, quarantines, graces, the takeover floor, beat
 arrival, the seal watch and the persisted horizons read `now.wait`; the
-holder's beat names its lease's end on its wait clock); the liveness timers
-(4/4) still read WALL, so a configuration below that targets one of those
-fails here at the rate PROGRESS records (the fail-before of the commit that
-fixes it). Without a step the sweeps do not move from commit to commit:
+holder's beat names its lease's end on its wait clock); the liveness timers,
+client deadlines and housekeeping stamps landed in 4/4 (`now.wait`, and the
+engine's S3-path stall stamps). Without a step the sweeps do not move from commit to commit:
 `sweep_config`'s summary line, floors and fenced seeds, for every
 configuration in its table (the list is in PROGRESS; the beat's arrival
 credit is the one deliberate exception of 2/4). Tests for the configurations

@@ -141,7 +141,7 @@ impl EngineControl {
     pub(crate) fn prune_deps(&self) -> crate::prune::PruneDeps {
         use std::sync::atomic::Ordering;
         let lag = std::time::Duration::from_millis(
-            crate::prune::now_unix_ms().saturating_sub(self.last_sync_ms.load(Ordering::Relaxed)),
+            crate::prune::wait_ms().saturating_sub(self.last_sync_ms.load(Ordering::Relaxed)),
         );
         crate::prune::PruneDeps {
             store: self.store.clone(),
@@ -734,7 +734,10 @@ impl EngineControl {
                 stalled: core.own_s3.stalled,
                 peers_reach_s3: core.own_s3.peers_reach_s3,
                 stalled_for_ms: core.own_s3.since.map(|since| {
-                    (constellation_store_s3::lease::now_unix_ms() - since.0).max(0) as u64
+                    constellation_platform::clock::protocol()
+                        .wait()
+                        .since(since)
+                        .max(0) as u64
                 }),
                 retries: stats.s3_less_retries,
                 forwards: stats.s3_less_forwards,

@@ -103,7 +103,7 @@ struct LockOp {
     attempts: u32,
     /// When this node's op was created (the lock call reached the core):
     /// the S3-less deadline and the grant-time statistics count from here.
-    created: Ms,
+    created: WaitMs,
     /// Where the application's wait began (`created`, or earlier by the
     /// `waited_ms` the call carried): the place in the owner's queue and
     /// the `waited_ms` sent on, nothing else. On the wait clock (plan 43
@@ -198,7 +198,7 @@ struct Waiter {
 #[derive(Debug, Clone, Copy)]
 struct Ask {
     /// When the ask was sent (this owner's clock).
-    at: Ms,
+    at: WaitMs,
     /// The hold ran out unanswered: passed over, never asked or held
     /// again until a request of the waiter's own re-attaches.
     passed: bool,
@@ -526,7 +526,7 @@ pub(crate) struct HeldAnswer {
     msg: PeerMsg,
     /// When it was held (the debug line of an answer that waited only for
     /// the order of the answers to its peer says for how long).
-    since: Ms,
+    since: WaitMs,
     /// What it waits for is nothing but an earlier held answer to the same
     /// peer (its own window is durable and its tenure proven): counted in
     /// `lock_order_holds` when it goes.
@@ -957,7 +957,7 @@ impl Core {
         {
             let hold = self.cfg.recall_hold_ms;
             let wid = self.lk.waiters[i].id;
-            let timer = self.set_timer_wall(now.wall.plus(hold), Timer::LockHeldReply(wid), out);
+            let timer = self.set_timer_wait(now.wait.plus(hold), Timer::LockHeldReply(wid), out);
             let queued = self.lock_waited_since(now.wait, waited_ms);
             let w = &mut self.lk.waiters[i];
             w.sent = sent;
@@ -1185,7 +1185,7 @@ impl Core {
                 tracing::debug!(
                     node = self.cfg.node_id,
                     to,
-                    held_ms = now.wall.0 - since.0,
+                    held_ms = now.wait.0 - since.0,
                     "an answer that grants nothing goes ahead of a held answer to the same peer"
                 );
             }
@@ -1220,7 +1220,7 @@ impl Core {
             fresh,
             to,
             msg,
-            since: now.wall,
+            since: now.wait,
             order_only,
         });
         self.lock_horizon_write(now, out);
@@ -1320,7 +1320,7 @@ impl Core {
                 h.fresh = None;
             }
             if h.need <= durable && h.fresh.is_none() && !keep.iter().any(|k| k.to == h.to) {
-                if h.order_only || h.since != now.wall {
+                if h.order_only || h.since != now.wait {
                     // Held for the order of the answers to its peer alone
                     // (or released later than it was held): how long.
                     if h.order_only {
@@ -1329,7 +1329,7 @@ impl Core {
                     tracing::debug!(
                         node = self.cfg.node_id,
                         to = h.to,
-                        held_ms = now.wall.0 - h.since.0,
+                        held_ms = now.wait.0 - h.since.0,
                         order_only = h.order_only,
                         "a held lock answer goes"
                     );
@@ -1746,7 +1746,7 @@ impl Core {
     /// Whether a waiter of another node that was asked to ask again is
     /// still held a turn that a grant of `mode` to `from` would take
     /// (`Waiter::ask`, `lock_try_grant`).
-    fn lock_reserved_against(&self, now: Ms, ino: Ino, from: NodeId, mode: LockMode) -> bool {
+    fn lock_reserved_against(&self, now: WaitMs, ino: Ino, from: NodeId, mode: LockMode) -> bool {
         self.lk.waiters.iter().any(|w| {
             w.ino == ino
                 && w.node != from
@@ -1815,7 +1815,7 @@ impl Core {
         // request parks behind it, a non-blocking one is refused (the lock
         // is promised and in flight: a known conflict). The asked node's
         // own requests are never held back by it.
-        if !reaffirm && self.lock_reserved_against(now.wall, ino, from, mode) {
+        if !reaffirm && self.lock_reserved_against(now.wait, ino, from, mode) {
             self.stats.lock_reserved_waits += 1;
             return Err(Blocked::Conflict(Vec::new()));
         }
@@ -2680,8 +2680,8 @@ impl Core {
         };
         self.lock_arm_waiter_tick(now, out);
         let held_timer = req.map(|_| {
-            self.set_timer_wall(
-                now.wall.plus(self.cfg.recall_hold_ms),
+            self.set_timer_wait(
+                now.wait.plus(self.cfg.recall_hold_ms),
                 Timer::LockHeldReply(id),
                 out,
             )
@@ -2710,8 +2710,8 @@ impl Core {
         if self.lk.waiter_tick.is_some() {
             return;
         }
-        let at = now.wall.plus(self.cfg.recall_hold_ms.max(50));
-        let t = self.set_timer_wall(at, Timer::LockWaiterTick, out);
+        let at = now.wait.plus(self.cfg.recall_hold_ms.max(50));
+        let t = self.set_timer_wait(at, Timer::LockWaiterTick, out);
         self.lk.waiter_tick = Some(t);
     }
 
@@ -2866,7 +2866,7 @@ impl Core {
                         None => {
                             self.stats.lock_asked_again += 1;
                             self.lk.waiters[i].ask = Some(Ask {
-                                at: now.wall,
+                                at: now.wait,
                                 passed: false,
                             });
                             tracing::debug!(
@@ -2893,7 +2893,7 @@ impl Core {
                             self.lock_arm_waiter_tick(now, out);
                             break;
                         }
-                        Some(a) if !a.passed && now.wall.0 < a.at.0 + wait => break,
+                        Some(a) if !a.passed && now.wait.0 < a.at.0 + wait => break,
                         Some(a) if !a.passed => {
                             self.lk.waiters[i].ask = Some(Ask { passed: true, ..a });
                             self.stats.lock_ask_again_passed_over += 1;
@@ -3396,8 +3396,8 @@ impl Core {
                 let req = self.op_id();
                 self.lk.tests.insert(op, req);
                 self.lk.test_by_req.insert(req, op);
-                self.set_timer_wall(
-                    now.wall.plus(self.cfg.forward_timeout_ms),
+                self.set_timer_wait(
+                    now.wait.plus(self.cfg.forward_timeout_ms),
                     Timer::LockTestTimeout(req),
                     out,
                 );
@@ -3466,7 +3466,7 @@ impl Core {
                 owner: 0,
                 sent_at: now.honour,
                 attempts: 0,
-                created: now.wall,
+                created: now.wait,
                 since,
                 local_wait: false,
                 reread: false,
@@ -3501,7 +3501,7 @@ impl Core {
                     });
                     return;
                 }
-                self.set_timer_wall(now.wall.plus(10), Timer::LockRetry(op), out);
+                self.set_timer_wait(now.wait.plus(10), Timer::LockRetry(op), out);
                 return;
             }
         }
@@ -3551,8 +3551,8 @@ impl Core {
                 o.sent_at = now.honour;
                 o.attempts += 1;
                 self.lk.by_req.insert(req, op);
-                self.set_timer_wall(
-                    now.wall.plus(self.cfg.forward_timeout_ms),
+                self.set_timer_wait(
+                    now.wait.plus(self.cfg.forward_timeout_ms),
                     Timer::LockRequestTimeout(req),
                     out,
                 );
@@ -3665,7 +3665,7 @@ impl Core {
             return;
         }
         let delay = (self.cfg.forward_backoff_ms / 4).max(10) * u64::from(o.attempts.clamp(1, 8));
-        self.set_timer_wall(now.wall.plus(delay), Timer::LockRetry(op), out);
+        self.set_timer_wait(now.wait.plus(delay), Timer::LockRetry(op), out);
     }
 
     pub(crate) fn on_lock_retry(
@@ -3698,7 +3698,7 @@ impl Core {
             return;
         }
         if let crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) = &result {
-            self.lease.note_object(now, lease);
+            self.lease.note_object(lease);
             if lease.holder != 0
                 && !lease.is_claimable(now.wall.0)
                 && lease.holder != self.cfg.node_id
@@ -3763,7 +3763,7 @@ impl Core {
         let Some(o) = self.lk.ops.get(&op) else {
             return true;
         };
-        if now.wall.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64 {
+        if now.wait.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64 {
             return false;
         }
         let (ino, mode, blocking) = (o.ino, o.mode, o.blocking);
@@ -3784,7 +3784,7 @@ impl Core {
             );
         }
         let retry = self.lock_resume_retry_ms();
-        self.set_timer_wall(now.wall.plus(retry), Timer::LockRetry(op), out);
+        self.set_timer_wait(now.wait.plus(retry), Timer::LockRetry(op), out);
         true
     }
 
@@ -3882,7 +3882,7 @@ impl Core {
             renewing: None,
             releasing: false,
             first_use: false,
-            idle_since_ms: None,
+            idle_since: None,
             installed: now.honour,
         };
         if matches!(
@@ -4221,11 +4221,11 @@ impl Core {
                     renewing: None,
                     releasing: false,
                     first_use: false,
-                    idle_since_ms: None,
+                    idle_since: None,
                     installed: now.honour,
                 };
                 let ino = o.ino;
-                let waited = now.wall.since(o.created).max(0) as u64;
+                let waited = now.wait.since(o.created).max(0) as u64;
                 let recalled = match replica.locks().install_held(ino, held) {
                     Installed::Ok { recalled } => recalled,
                     Installed::Released => {
@@ -4277,7 +4277,7 @@ impl Core {
                 // its bound, without spending an attempt; a blocking one
                 // (the owner parks those: a race) asks again.
                 if o.blocking {
-                    self.set_timer_wall(now.wall.plus(retry_ms), Timer::LockRetry(op), out);
+                    self.set_timer_wait(now.wait.plus(retry_ms), Timer::LockRetry(op), out);
                 } else {
                     self.lk.ops.remove(&op);
                     out.push(Action::ControlDone {
@@ -4295,11 +4295,11 @@ impl Core {
                 // within the bound an op without its sequencer has; past
                 // it, as `Busy`.
                 let late =
-                    !o.blocking && now.wall.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64;
+                    !o.blocking && now.wait.0 - o.created.0 >= self.cfg.s3_less_deadline_ms as i64;
                 if late {
                     self.lock_retry(now, op, out);
                 } else {
-                    self.set_timer_wall(now.wall.plus(retry_ms), Timer::LockRetry(op), out);
+                    self.set_timer_wait(now.wait.plus(retry_ms), Timer::LockRetry(op), out);
                 }
             }
             LockOutcome::WouldBlock => {
@@ -4451,7 +4451,7 @@ impl Core {
         // would otherwise go on forever).
         let idle = replica
             .locks()
-            .idle_before(now.wall.0 - self.cfg.lock_cache_idle_ms as i64);
+            .idle_before(now.wait.minus(self.cfg.lock_cache_idle_ms));
         for (ino, _) in idle {
             self.stats.lock_idle_released += 1;
             self.lock_release_begin(now, ino, replica, out);
@@ -4649,7 +4649,7 @@ impl Core {
             "lock renewal: lease read"
         );
         if let crate::event::S3Result::LeaseGet(Ok(Some((lease, _)))) = &result {
-            self.lease.note_object(now, lease);
+            self.lease.note_object(lease);
             if lease.holder != 0
                 && !lease.is_claimable(now.wall.0)
                 && lease.holder != self.cfg.node_id
