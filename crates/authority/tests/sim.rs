@@ -9356,6 +9356,27 @@ fn regression_locks_faults_dropped_refusals_are_tentative() {
     }
 }
 
+/// `delegated-long-delegation` seeds 11, 86 and 200 (fix "a refusal whose rid
+/// the log carries executed is tentative", PROGRESS.md; a simulation fix):
+/// the delegate of `d1` is cut from the root past its delegation. A
+/// requester forwarded an op to the root, which parked it behind the
+/// generation's recall; the client's call went in doubt and its
+/// resubmission reached the delegate, which refused it (`EEXIST`/`ENOENT`)
+/// in a stream position the generation never carried. When the generation
+/// ended the root ran the parked copy: the log carries the rid executed,
+/// so the rolled-back refusal kept a `completed` row and was not tentative.
+#[test]
+fn regression_delegated_long_delegation_rolled_back_refusals_are_tentative() {
+    for seed in [11, 86, 200] {
+        run_seed(seed, delegated_long_delegation_config()).unwrap_or_else(|e| {
+            panic!(
+                "delegated-long-delegation seed {seed}: {e}\n  replay with \
+                 AUTHORITY_SIM_CONFIG=delegated-long-delegation"
+            )
+        });
+    }
+}
+
 /// `cargo test -p constellation-authority --release --test sim -- --ignored long_locks`
 #[test]
 #[ignore]

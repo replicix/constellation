@@ -54391,3 +54391,66 @@ idle for the model runs):
   pairing), as did serialising the big searches with a mutex (9.2–10.4); the
   measured best is the plain `Vec`. Nothing near the 20–29 GB the older
   notes quote: that was before the beat-cap budgets were cut.
+
+## `delegated-long-delegation`: a refusal whose rid the log carries executed is tentative (simulation)
+
+C7a commit 1 found the configuration (a 25 s partition of `d1`'s delegate
+from the root, 20 s delegations, no clock fault) failing 16 of 300 seeds on
+its parent: "rid refused (Eexist) but completed 1 times in the log". On
+d62f077: the same 16 (11, 16, 60, 86, 89, 104, 140, 146, 151, 200, 201, 218,
+220, 242, 252, 299), 10 with `EEXIST`, 6 with `ENOENT`, every one the same
+trace.
+
+**Trace** (seed 200, rid (3,1,5) `Create d1/f1` of node 3).
+- t=1.4 s: node 3 sends the op to `d1`'s delegate, node 2 (cut from the root
+  since t=1 s), which parks it (its deps are not in its replica). From t=1.9 s
+  node 3 sends it to the root, which answers `Held` while it recalls the
+  generation; the last copy (t=13.2 s) stays parked at the root behind the
+  recall.
+- t=13.4 s: the client's call goes in doubt (12 s); it resubmits the rid.
+  Node 3 sends it to node 2, which still honours its grant and refuses it
+  (`EEXIST`: `d1/f1` exists in the generation's own unstreamed rows), at
+  stream position (1, 14).
+- t=21.8 s: the root reclaims the generation at cursor 9 and runs the parked
+  copy: `Create d1/f1` executes, `Completed(3,1,5)`. The refusal is in no
+  segment.
+- Node 2 learns of the recall and strands its rows: its own client's create
+  of `d1/f1` is replayed, refused and becomes a conflict copy (tentative, as
+  before); the refusal of (3,1,5) is dropped.
+
+**Why a simulation bug.** A delegate's journal rows are speculation like a
+`Local` holder's: an acknowledgement from an ended stream is tentative (the
+module doc of `core::delegate`), and the configuration has no backup, so
+nothing makes it durable. The refusal was answered from a decision the log
+never carries, which is the case of `locks-faults` seeds 196041 and 204913
+(PROGRESS, "a dropped refusal was not tentative"). That fix marks a dropped
+refusal tentative when its rid's `completed` row is gone after a rollback.
+Here the row is not gone: the segment that ends the generation also carries
+the parked copy's execution, so `completed_outcome` is `Executed` and the
+refusal stayed a definitive answer. The log carries the rid once; nothing was
+executed twice.
+
+**Fix** (`crates/authority/tests/sim/node.rs`). A journaled refusal whose rid
+has no `completed` row, or one that says executed, after a rollback is
+tentative (`note_rollbacks`). Under `strict_durability` the tentative set is
+not used, so a rolled-back refusal still fails those runs.
+
+**Regression test:**
+`regression_delegated_long_delegation_rolled_back_refusals_are_tentative`
+(seeds 11, 86 and 200; fails without the fix at seed 11).
+
+### Verification
+
+On the build box (release, `-j 4`, `TMPDIR` on tmpfs):
+- `sweep_config` `delegated-long-delegation` 0..2000: 0 failing (16 of the
+  first 300 before).
+- The same 14 configurations with and without the fix, identical (0 failing
+  each): 300 seeds of `delegated-holder-cut`, `-root-gone`,
+  `-delegate-restart`, `-core-stall`, `-two-gens-root-crash`,
+  `-delegate-step-back`, `-root-step-forward`, `locks-faults`,
+  `locks-partition`, `locks-delegated-partition`,
+  `locks-unlinked-delegated-partition`, `locks-unlinked-delegated-random`;
+  100 of `long-delegated` and `long-delegated-late-answers`.
+- `--test sim`: 208 passed, 12 ignored. `cargo fmt --all -- --check` and
+  `cargo clippy -p constellation-authority --all-targets -- -D warnings`
+  clean.

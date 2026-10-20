@@ -18,7 +18,9 @@ use constellation_authority::{
     OpId, PeerLink, PeerMsg, Policy, Replica, S3Failure, S3Op, S3Result, Seq, Stats, UploadResult,
 };
 use constellation_meta::locks::LockTag;
-use constellation_meta::{Meta, MutateOp, MutateOutcome, PublishBasis, Rid, TouchSet};
+use constellation_meta::{
+    CompletedOutcome, Meta, MutateOp, MutateOutcome, PublishBasis, Rid, TouchSet,
+};
 use constellation_store_s3::commits::{CommitChain, CommitPayload};
 use constellation_store_s3::heartbeat::HeartbeatStore;
 use constellation_store_s3::inbox::InboxStore;
@@ -183,6 +185,11 @@ pub struct Shared {
     /// never carried — tentative, like a rolled-back write (`locks-faults`
     /// seeds 196041, 204913: `Local` holders cut off or crashed past
     /// their lease; the generic tester could not place their refusals).
+    /// So is one whose rid the log carries executed after the rollback:
+    /// the same rid, forwarded to the root earlier and parked there, ran
+    /// once the generation that refused it ended (`delegated-long-
+    /// delegation`: a delegate cut from its root past its delegation
+    /// refused a requester's resubmission).
     pub journaled_refusals: Mutex<BTreeSet<Rid>>,
     pub commits: Arc<Mutex<Vec<CommitRecord>>>,
     /// Plan 30 §M10.
@@ -1714,7 +1721,9 @@ impl Driver {
             .lock()
             .unwrap()
             .retain(|rid| match self.meta.completed_outcome(*rid) {
-                Ok(None) => {
+                // The refusal's row is gone, or the log now carries the rid
+                // executed: the refusal was rolled back either way.
+                Ok(None | Some(CompletedOutcome::Executed { .. })) => {
                     t.insert(*rid);
                     false
                 }

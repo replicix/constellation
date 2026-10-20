@@ -1483,6 +1483,14 @@ accepted with C1's decision; PROGRESS.
 
 ### C2 — No acknowledgement outside a group where one exists; settle before `EIO`
 
+*Evidence (2026-10-20):* `delegated-long-delegation` seeds 11, 86, 200
+(and 13 more of 300): a delegate cut off from the root but still inside
+its grant refuses a resubmitted rid (`EEXIST`/`ENOENT`) from rows the
+root never received; the root later ends the generation and executes the
+parked copy of the same rid. The application saw a refusal for an op
+that took effect. The simulation's oracle counts the lone delegate's
+refusal as tentative (no backup); C2's rule removes the answer itself.
+
 **Code** (§5.3): `Recall.through` and the recorded void cut (§5.3
 item 7: `record.rs:243`, `end_generation` `delegate.rs:3164-3238`,
 `replay.rs:782-826`, `session.rs` `void_stream`, `note_void_cut`,
