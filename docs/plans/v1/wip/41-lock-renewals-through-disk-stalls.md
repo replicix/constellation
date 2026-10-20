@@ -102,7 +102,7 @@ new evidence (core steps blocked 0.7-12.6 s in `LogWriter::write`, one of
 them losing a delegation by itself, and the F2 heartbeat thread blocked
 1.6 s and 7.3 s in stderr writes): **logging never blocks a daemon
 thread; lines that cannot be queued are dropped and counted** — plan 44
-(`wip/44-non-blocking-log-writer.md`). The host mitigations stay useful as
+(`done/44-non-blocking-log-writer.md`). The host mitigations stay useful as
 general guidance (fewer stalls of the store's journal, fewer dropped log
 lines), no longer as the answer to a blocked log writer; L7 writes them
 as such.

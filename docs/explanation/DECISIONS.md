@@ -1333,5 +1333,5 @@ CSI driver, `chaos` and the harness's own logging are untouched.
 **See**: `crates/engine/src/log_buffer.rs`; `log-sink-stall` and its control
 arm ([TESTING.md](../how-to-guides/development/TESTING.md)); PROGRESS, "Fix:
 logging never blocks a daemon thread (plan 44)";
-[plan 44](../plans/v1/wip/44-non-blocking-log-writer.md). Supersedes plan 41
+[plan 44](../plans/v1/done/44-non-blocking-log-writer.md). Supersedes plan 41
 §1's interim guidance.
