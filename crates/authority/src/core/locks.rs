@@ -4953,7 +4953,10 @@ impl Core {
             Some(false) => self.lock_release_begin(now, ino, replica, out),
             Some(true) => {
                 // Local locks under it: released when the last one
-                // leaves (`Control::LockIdle`).
+                // leaves (`Control::LockIdle`), renewed until then. An
+                // adopted newer id has no renewal in flight any more
+                // (`LockTables::recall_held`): the tick is armed for it.
+                self.lock_arm_renew_tick(now, replica, out);
             }
             None => {
                 // Not held (yet): the reply that brings it installs it

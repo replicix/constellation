@@ -13468,9 +13468,10 @@ mod locks {
             r.core.timer_ms(tick).unwrap().0 >= until,
             "the tick is at the cadence, past the window"
         );
-        // The owner recalls its new id: adopted, the renewal still out.
+        // The owner recalls its new id: adopted, the renewal of the old
+        // one counts no more (`recall_held`), and the tick is re-armed.
         r.advance(5);
-        r.step(Event::Peer {
+        let out = r.step(Event::Peer {
             from: 1,
             msg: PeerMsg::LockRecall {
                 req: OpId(77),
@@ -13478,6 +13479,9 @@ mod locks {
                 grant: GrantId { node: 1, seq: 3 },
             },
         });
+        if let Some(t) = tick_of(&out) {
+            tick = t;
+        }
         // The reply to the pushed request extends the adopted grant.
         r.advance(5);
         let out = r.step(Event::Peer {
@@ -13504,6 +13508,134 @@ mod locks {
         r.now = at;
         let out = r.step(Event::Timer { id: tick });
         assert!(renews(&out, 3), "the adopted grant not renewed: {out:?}");
+    }
+
+    /// The renewal of a grant's old id is out when the owner's recall of
+    /// its newer id adopts the grant here (`recall_held`); the owner had
+    /// answered the renewal before it minted the newer id, so the answer
+    /// names the old id, which the grant no longer has: it matched
+    /// nothing, the grant stayed `renewing` and was never due again — no
+    /// late reply followed to clear it, and the recalled grant, still
+    /// pinned by the application's lock, lapsed under its I/O.
+    #[test]
+    fn a_recall_adopting_a_newer_id_leaves_no_renewal_in_flight() {
+        let tick_of = |out: &[Action]| {
+            out.iter().rev().find_map(|a| match a {
+                Action::SetTimer {
+                    id,
+                    kind: TimerKind::LockRenewTick,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+        };
+        let renew_of = |out: &[Action], seq: u64| {
+            sends(out).iter().find_map(|(to, m)| match m {
+                PeerMsg::LockRenew { req, entries }
+                    if *to == 1 && entries.iter().any(|e| e.grant == GrantId { node: 1, seq }) =>
+                {
+                    Some(*req)
+                }
+                _ => None,
+            })
+        };
+        let mut r = requester();
+        // The tick's cadence: 5 s.
+        r.core.cfg.lock_ttl_ms = 20_000;
+        let sent = r.honour();
+        let req = lock_control(&mut r, 50, 42, true);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockReply {
+                req,
+                outcome: LockOutcome::Granted {
+                    id: GrantId { node: 1, seq: 2 },
+                    mode: X,
+                    ttl_ms: 2_100,
+                    position: Position::ZERO,
+                },
+            },
+        });
+        assert!(matches!(lock_answer(&out, 50), LockAnswer::Granted { .. }));
+        assert_eq!(
+            r.meta.locks().local_set(
+                42,
+                LocalLock {
+                    owner: 9,
+                    pid: 1,
+                    pid_start: 0,
+                    write: true,
+                    start: 0,
+                    end: u64::MAX
+                },
+                r.clk()
+            ),
+            constellation_meta::locks::LocalOutcome::Done
+        );
+        // Renewed from `sent + 550`, honoured until `sent + 1100`.
+        let tick = tick_of(&out).expect("no renewal tick");
+        r.now = r.core.timer_ms(tick).unwrap();
+        let out = r.step(Event::Timer { id: tick });
+        let renew = renew_of(&out, 2).expect("no renewal of the grant");
+        let mut tick = tick_of(&out).expect("no renewal tick re-armed");
+        // The owner extends id 2, then mints 3 for a crossing request and
+        // recalls it; the recall overtakes the renewal's answer.
+        r.advance(5);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRecall {
+                req: OpId(77),
+                ino: 42,
+                grant: GrantId { node: 1, seq: 3 },
+            },
+        });
+        if let Some(t) = tick_of(&out) {
+            tick = t;
+        }
+        assert_eq!(
+            r.meta.locks().held(42).unwrap().id,
+            GrantId { node: 1, seq: 3 }
+        );
+        r.advance(5);
+        let out = r.step(Event::Peer {
+            from: 1,
+            msg: PeerMsg::LockRenewed {
+                req: renew,
+                results: vec![(
+                    42,
+                    GrantId { node: 1, seq: 2 },
+                    LockRenewResult::Ok {
+                        ttl_ms: 2_100,
+                        recalled: false,
+                        id: GrantId { node: 1, seq: 2 },
+                        mode: X,
+                    },
+                )],
+            },
+        });
+        if let Some(t) = tick_of(&out) {
+            tick = t;
+        }
+        let held = r.meta.locks().held(42).unwrap();
+        assert!(held.recalled);
+        assert!(
+            held.renewing.is_none(),
+            "a renewal of the dead id 2 is still counted in flight"
+        );
+        let at = r.core.timer_ms(tick).unwrap();
+        assert!(
+            at.0 < held.until.0,
+            "the renewal tick fires at {}, after the grant's window ({}; sent {})",
+            at.0,
+            held.until.0,
+            sent.0
+        );
+        r.now = at;
+        let out = r.step(Event::Timer { id: tick });
+        assert!(
+            renew_of(&out, 3).is_some(),
+            "the adopted grant not renewed: {out:?}"
+        );
     }
 
     /// Sim `locks-stall-step` seed 1934: the reply to a request a push

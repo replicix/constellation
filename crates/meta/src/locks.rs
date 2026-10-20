@@ -1798,6 +1798,14 @@ impl LockTables {
         h.id = id;
         h.recalled = true;
         if old != id {
+            // A renewal of the old id still out answers for a dead id:
+            // `renewed` and `renewal_failed` match it no more, and left
+            // `renewing`, the grant was never due again — a recalled grant
+            // still pinned by a local lock lapsed under it unless a late
+            // reply happened to extend it. Due again at its renewal point
+            // (an answer naming the adopted id still extends it; the
+            // duplicate renewal is harmless).
+            h.renewing = None;
             g.tombstone(old);
             g.stats.recalled_superseded += 1;
             // The owner keeps one record per node and inode and mints a

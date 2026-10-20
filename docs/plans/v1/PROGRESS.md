@@ -53736,3 +53736,76 @@ On the box (16 cores, `/tmp` on tmpfs), every job under `timeout
   of base.
 - Harness `lock-failover` x5: all pass, the contender granted 1.4–6.7 ms
   after the locker's unlock.
+
+## Fix: a recall that adopts a newer id leaves no renewal in flight (2026-10-20)
+
+Residual of the lock follow-ups above (found in their review), and a second
+review of their B hardening.
+
+### The renewal of a superseded id
+
+A holder's renewal of a grant's id is out when the owner's recall of a newer
+id of the same grant adopts it (`LockTables::recall_held`: the owner keeps
+one record per node and inode and mints a fresh id per answer). The answer
+names the old id when the owner answered before it minted the newer one, and
+a timeout names the old id too. Neither `renewed` (which matches the held
+id or the answer's) nor `renewal_failed` (the held id) matches the adopted
+id, so the grant stayed `renewing`: `due_renewals` and `next_renewal` skip
+it, and nothing renewed it again. A recalled grant still pinned by an
+application's lock then lapsed under its I/O, unless a late reply happened to
+extend it — what saved seed 3850 of `locks-delegated-production-ttl-heavy`;
+with that reply lost the grant lapses the same way.
+
+`recall_held` clears `renewing` when it adopts a newer id, and the recall
+handler re-arms the renewal tick for a grant it keeps (local locks under
+it). An answer naming the adopted id still extends the grant; the renewal
+sent since is a duplicate, harmless.
+
+Test (core, fails before: the renewal of the dead id still counted in
+flight): `a_recall_adopting_a_newer_id_leaves_no_renewal_in_flight`.
+`a_late_reply_rearms_the_renewal_tick_for_its_renewal_point` follows the
+tick the adoption now re-arms.
+
+### Second review: no lock renewal while an unmarked release is settled
+
+`release_unmarked_in_flight` (the release's mark computed unmarked, the
+lease releasing, the job in `Release` or `ReleaseReread`) holds in every
+interleaving looked at:
+
+- A renewal decided before the mark extended (or reclaimed) a record in the
+  root's table, so the mark counts it (`grants_len() > 0`) and the release is
+  marked; its answer, held behind a horizon write or a lease read, changes
+  nothing.
+- `Phase::Release` is set only by `issue_release`, which recomputes the flag
+  every time; a failed or conflicting CAS goes to `ReleaseReread`, which
+  ends in landed, kept (`releasing` cleared), deposed or given up. A release
+  that is kept serves renewals again at once; the next release recomputes
+  the mark, counting whatever was renewed meanwhile. The flag is never reset
+  but is read only with `releasing` and those phases.
+- Delegation renewals are refused while releasing (`root_usable`); the root's
+  own grants renew through `lock_renew_one` as a peer's do.
+- What it refuses would otherwise have been `Lost` (no record), a reclaim
+  under a grace the mark does not count, or a record installed after the
+  mark (a recall answer). Only the last has a live holder; it retries
+  (`NotOwner { 0 }`) and gets the root again if the release is kept, or the
+  taker, which outwaits the delegation the grant came from. A lapse needs
+  the CAS and its re-read to outlast the holder's slack to its window's end,
+  so S3 trouble; no fault-free path reaches it.
+
+### Verification
+
+On the box (`/tmp` on tmpfs), every job under `timeout --kill-after=30s`,
+`-j 4`:
+
+- `cargo fmt --all -- --check`; `cargo clippy -p constellation-authority -p
+  constellation-meta --all-targets -- -D warnings`: clean.
+- `cargo test --release -p constellation-authority --lib`: 514 passed, 0
+  failed; the new test fails on 97e806b's code. `cargo test --release -p
+  constellation-meta --lib`: 269 passed.
+- `cargo test --release -p constellation-authority --test sim`: 180 passed.
+- Every sweepable `locks-*` config and `double-seal-inside-the-grace`, seeds
+  0..2 000, against 97e806b: identical failing sets (the known
+  `locks-holder-step-back-sealed` 818 and the controls
+  `locks-writer-hold-unchecked`, `locks-writer-hold-delegated-unsettled`);
+  fenced I/O and lost grants equal everywhere but `locks-stall-step` (+1)
+  and `locks-stall-step-delegated` (-1).
