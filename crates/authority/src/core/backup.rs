@@ -684,6 +684,39 @@ const BEAT_CAP_SPAN_MARGINS: i64 = 250;
 /// How many early `StreamAhead` batches a subscriber keeps.
 const AHEAD_WAITING_MAX: usize = 32;
 
+/// Plan 43 §5.1: what an answer waits for — the commit point of the
+/// sequencer that gives it. C0 names it (the simulation's I1 oracle
+/// classifies every answer by it); C1/C2 make the core decide it at
+/// journal time (`Core::ack_class`). Nothing in the core uses it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AckClass {
+    /// An applied, unfenced log segment carries the outcome.
+    Archive,
+    /// The root group: the holder's journal and every backup the lease
+    /// object lists hold the transaction.
+    RootGroup,
+    /// The delegation's group: the delegate's journal and each recorded
+    /// backup's delegate tail, or the root's appended row `(gen, idx)`.
+    DelegGroup { gen: u64 },
+    /// A designee or an epoch's hold owner (§11 Q3): not stealable.
+    NonStealable,
+    /// A lone sequencer answering its own node's client (Layer A).
+    Lone,
+}
+
+impl AckClass {
+    /// The class's name in reports and counters.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AckClass::Archive => "archive",
+            AckClass::RootGroup => "root-group",
+            AckClass::DelegGroup { .. } => "deleg-group",
+            AckClass::NonStealable => "non-stealable",
+            AckClass::Lone => "lone",
+        }
+    }
+}
+
 /// Plan 30 §M9's view for `status`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AckView {

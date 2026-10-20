@@ -414,6 +414,10 @@ pub struct State {
     /// [`State::inbox`], written through [`State::inbox_mut`] and
     /// normalized afterwards.
     pub inbox: Option<Box<Vec<crate::inbox::InboxBatch>>>,
+    /// Plan 43 C0 (`deadlines` only), ghost: the ops whose client was
+    /// answered in doubt, `(rid, the history index of that answer)`.
+    /// `None` while empty (one word per state without deadlines).
+    pub eio: Option<Box<Vec<(Rid, u8)>>>,
     /// Ghost: which session properties a read has violated
     /// (`positions::RYW_VIOLATED`/`positions::MR_VIOLATED`). Sticky.
     pub session_violations: u8,
@@ -478,6 +482,13 @@ pub enum Action {
     /// readdir of all) from its local replica. Offered under `Positions`
     /// only once the session wait allows it (`positions::read_allowed`).
     Read(NodeId),
+    /// Plan 43 C0 (`deadlines` only): the acquire deadline passes with the
+    /// node's client op neither executed here nor answered by a holder —
+    /// the client is answered in doubt (`EIO`), recorded as a
+    /// [`NsRet::Tentative`] return, and the node moves on to its next op.
+    /// What the op left behind (a forward in flight, a holder's journal
+    /// row) may still take effect.
+    Deadline(NodeId),
 }
 
 /// Selects the modeled protocol variant. `Today` (M1) and `ExactlyOnce`
@@ -672,6 +683,15 @@ pub struct AuthorityModel {
     /// session ghost state (`Node::seen`, `MutateRep::at`) is maintained.
     /// Configurations without reads keep their state spaces unchanged.
     pub tracks_sessions: bool,
+    /// Plan 43 C0: a client op whose acquire deadline passes is answered in
+    /// doubt (`EIO`) and the node moves on ([`Action::Deadline`]), while
+    /// what the op left behind may still land. Default `false`: the
+    /// existing configurations are unchanged. With it on, the property
+    /// `eio_never_lands_late` is checked.
+    pub deadlines: bool,
+    /// Plan 43 C2: an in-doubt answer waits until the rid is *settled*
+    /// (`Abandon`). Not implemented before C2: the model refuses `true`.
+    pub abandon: bool,
 }
 
 impl AuthorityModel {
@@ -699,7 +719,20 @@ impl AuthorityModel {
             session_wait: true,
             stale_base_shadows: false,
             tracks_sessions: false,
+            deadlines: false,
+            abandon: false,
         }
+    }
+
+    pub fn with_deadlines(mut self, b: bool) -> Self {
+        self.deadlines = b;
+        self
+    }
+
+    /// Plan 43 C2's knob; the model asserts it is `false` until then.
+    pub fn with_abandon(mut self, b: bool) -> Self {
+        self.abandon = b;
+        self
     }
 
     pub fn with_protocol(mut self, p: Protocol) -> Self {
@@ -1434,6 +1467,10 @@ impl Model for AuthorityModel {
 
     fn init_states(&self) -> Vec<State> {
         assert!(
+            !self.abandon,
+            "AuthorityModel::abandon is plan 43 C2's: not implemented before it"
+        );
+        assert!(
             self.n_nodes as usize <= MAX_NODES,
             "at most {MAX_NODES} nodes (protocol::MAX_NODES)"
         );
@@ -1502,6 +1539,7 @@ impl Model for AuthorityModel {
             next_id: 0,
             crashes_used: 0,
             inbox: None,
+            eio: None,
             session_violations: 0,
         }]
     }
@@ -1532,6 +1570,16 @@ impl Model for AuthorityModel {
                 }
             }
             if let Some(cop) = &node.client_op {
+                if self.deadlines
+                    && matches!(
+                        cop.phase,
+                        Phase::WaitingReply { .. }
+                            | Phase::NeedsLease
+                            | Phase::WaitingHandoff { .. }
+                    )
+                {
+                    actions.push(Action::Deadline(id));
+                }
                 match &cop.phase {
                     Phase::WaitingReply { .. } => actions.push(Action::ForwardTimeout(id)),
                     Phase::NeedsLease => {
@@ -2420,6 +2468,15 @@ impl Model for AuthorityModel {
             Action::DropMessage(mid) => {
                 s.network.retain(|e| e.id != mid);
             }
+            Action::Deadline(id) => {
+                let cop = s.nodes[id as usize].client_op.take()?;
+                let at = s.history.len() as u8;
+                s.history
+                    .push(HistEvt::Return(id, NsRet::Tentative, cop.rid));
+                s.eio
+                    .get_or_insert_with(Default::default)
+                    .push((cop.rid, at));
+            }
         }
         Some(s)
     }
@@ -2441,6 +2498,14 @@ impl Model for AuthorityModel {
         // ending early: the checker stops once *every* property has a
         // discovery, and `today_finds_bug_b` went from 106K states to its
         // 60M cap when these two were always registered.
+        // Plan 43 C0: only with deadlines (the rule is about an in-doubt
+        // answer; registering it elsewhere would stop searches early).
+        if self.deadlines {
+            props.push(Property::always(
+                "eio_never_lands_late",
+                prop_eio_never_lands_late,
+            ));
+        }
         if self.tracks_sessions {
             props.push(Property::always(
                 "read_your_writes",
@@ -2511,6 +2576,34 @@ fn prop_linearizable(m: &AuthorityModel, s: &State) -> bool {
         }
     }
     tester.is_consistent()
+}
+
+/// Plan 43 I4 `unacked_fails_never_lands_late`, in the model: an op whose
+/// client was answered `EIO` may land in the log later, but never after an
+/// op the same node's client invoked once it had that answer — "failed"
+/// must not turn out to mean "not yet". A pure state predicate: for each
+/// EIO'd rid `r` that is in the log at position `p` (its place in the
+/// unfenced log's completions), no op `r'` of the same node, invoked after
+/// the answer's history index, completes at a position before `p`.
+fn prop_eio_never_lands_late(_m: &AuthorityModel, s: &State) -> bool {
+    let Some(eio) = s.eio.as_deref() else {
+        return true;
+    };
+    let (_, _, completions) = log_fold(&s.log, log_head(&s.log));
+    let position = |rid: Rid| completions.iter().position(|(r, _, _)| *r == rid);
+    eio.iter().all(|(rid, at)| {
+        let Some(p) = position(*rid) else {
+            return true;
+        };
+        s.history.iter().enumerate().all(|(idx, e)| match e {
+            HistEvt::Invoke(n, _, later)
+                if *n == rid.node && idx > *at as usize && later != rid =>
+            {
+                position(*later).is_none_or(|q| q > p)
+            }
+            _ => true,
+        })
+    })
 }
 
 /// Thread ids for tentative ops in `prop_linearizable`: above any node

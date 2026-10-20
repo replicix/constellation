@@ -18,6 +18,7 @@ mod sim {
     pub mod history;
     pub mod locks;
     pub mod node;
+    pub mod oracle;
     pub mod run;
     pub mod session;
     pub mod store;
@@ -281,7 +282,8 @@ fn replay_seed() {
         // Plan 30 §M9.
         Ok("backup") => backup_config(),
         Ok("acks3") => ack_s3_config(),
-        Ok("backup-far") => far_config(),
+        Ok("backup-far") | Ok("far") => far_config(),
+        Ok("backup-two") => backup_two_config(),
         Ok("backup-strict") => backup_strict_config(),
         Ok("backup-strict-inbox-off") => backup_strict_inbox_off_config(),
         Ok("backup-crash") => backup_crash_config(),
@@ -1458,6 +1460,21 @@ fn backup_config() -> SimConfig {
 fn ack_s3_config() -> SimConfig {
     SimConfig {
         core: std::sync::Arc::new(sim::run::ack_s3_core_config),
+        ..backup_config()
+    }
+}
+
+/// Plan 43 C6's baseline: `CONSTELLATION_BACKUPS=2` on three LAN nodes — the
+/// holder lists up to two backups, so a second one is added while the
+/// first holds the acknowledged rows (the add window of plan 43 §4's I1).
+fn backup_two_config() -> SimConfig {
+    SimConfig {
+        nodes: 3,
+        core: std::sync::Arc::new(|id, inc| {
+            let mut c = sim::run::backup_core_config(id, inc);
+            c.backups_max = 2;
+            c
+        }),
         ..backup_config()
     }
 }
@@ -3593,6 +3610,11 @@ fn sweep_config() {
         "backup-runtime-lag-timers-first" => timers_first(backup_runtime_lag_config()),
         "acks3-runtime-lag-timers-first" => timers_first(acks3_runtime_lag_config()),
         "backup" => backup_config(),
+        "acks3" => ack_s3_config(),
+        "far" | "backup-far" => far_config(),
+        "backup-departs" => backup_departs_config(),
+        "backup-partition" => backup_partition_config(),
+        "backup-two" => backup_two_config(),
         "backup-strict" => backup_strict_config(),
         "backup-strict-inbox-off" => backup_strict_inbox_off_config(),
         "backup-crash" => backup_crash_config(),
@@ -3765,6 +3787,11 @@ fn sweep_config() {
     let superseded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let next = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start));
     let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // Plan 43 C0: the commit-rule oracles' counters over the sweep
+    // (`SWEEP-ORACLES` per seed, `SWEEP-ORACLE-TOTALS` at the end), and
+    // `AUTHORITY_SIM_FINGERPRINT=1`'s `SWEEP-FP` line per seed.
+    let oracle_totals: std::sync::Arc<std::sync::Mutex<OracleTotals>> = Default::default();
+    let fingerprint_on = std::env::var("AUTHORITY_SIM_FINGERPRINT").as_deref() == Ok("1");
     let mut handles = Vec::new();
     for _ in 0..threads {
         let (next, failures, label) = (next.clone(), failures.clone(), label.clone());
@@ -3777,12 +3804,17 @@ fn sweep_config() {
         let guard_base_rises = guard_base_rises.clone();
         let superseded = superseded.clone();
         let lock_seeds = lock_seeds.clone();
+        let oracle_totals = oracle_totals.clone();
         handles.push(std::thread::spawn(move || loop {
             let seed = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if seed >= start + seeds {
                 break;
             }
-            match run_seed(seed, config(&label)) {
+            let result = run_seed(seed, config(&label));
+            if fingerprint_on {
+                eprintln!("SWEEP-FP {label} seed {seed}: {}", fingerprint(&result));
+            }
+            match result {
                 Ok(report) if core_stall_check(&label, &report).is_err() => {
                     let e = core_stall_check(&label, &report).unwrap_err();
                     eprintln!("SWEEP-FAIL {label} seed {seed}: {e}");
@@ -3790,6 +3822,7 @@ fn sweep_config() {
                 }
                 Ok(report) => {
                     let ord = std::sync::atomic::Ordering::Relaxed;
+                    oracle_totals.lock().unwrap().add(&label, seed, &report);
                     for s in report.stats.values() {
                         streamed.fetch_add(s.awaited_log_streamed, ord);
                         streamed_deleg.fetch_add(s.awaited_log_streamed_deleg, ord);
@@ -3964,6 +3997,7 @@ fn sweep_config() {
             );
         }
     }
+    oracle_totals.lock().unwrap().print(&label, seeds);
     eprintln!(
         "SWEEP-FLOORS {label}: takeovers {}, by a seal {}, floors armed {} (capped {}, saved {} ms \
          in all), cap already past {}; floor ms p50 {:?} p90 {:?} max {:?} over {} floors; \
@@ -4495,6 +4529,142 @@ fn delegated_core_hang_config() -> SimConfig {
         }],
         settle_ms: 60_000,
         ..delegated_core_stall_config()
+    }
+}
+
+/// Plan 43 C0 (`AUTHORITY_SIM_FINGERPRINT=1`): a hash of what a run did, over
+/// the fields that predate the commit-rule oracles and the run's text — two
+/// trees whose runs are the same have the same fingerprint seed by seed (the
+/// identity sweep: the oracles' plumbing must not change a schedule).
+fn fingerprint(result: &Result<Report, String>) -> String {
+    let text = match result {
+        Ok(r) => format!(
+            "ok {} {} {} {} {} {} {} {} {} {:?} {:?}",
+            r.ops_invoked,
+            r.ops_returned,
+            r.tentative,
+            r.segments,
+            r.fenced,
+            r.commits,
+            r.simulated_ms,
+            r.acked_rolled_back,
+            r.in_doubt_answers,
+            r.failover_ms,
+            r.stats
+        ),
+        Err(e) => format!("err {e}"),
+    };
+    blake3::hash(text.as_bytes()).to_hex().to_string()[..16].to_string()
+}
+
+/// Plan 43 C0: the oracles' counters summed over a sweep.
+#[derive(Debug, Default)]
+struct OracleTotals {
+    seeds: u64,
+    acks_by_class: std::collections::BTreeMap<String, usize>,
+    uncommitted: std::collections::BTreeMap<String, usize>,
+    unjournaled: std::collections::BTreeMap<String, usize>,
+    i2: usize,
+    i2c: usize,
+    i4: usize,
+    i5: usize,
+    seeds_with: [u64; 5],
+    unmapped: usize,
+    rebuilds: (u64, u64),
+    rebuild_seeds: u64,
+    max_backups: usize,
+}
+
+impl OracleTotals {
+    fn add(&mut self, label: &str, seed: u64, r: &Report) {
+        self.seeds += 1;
+        let uncommitted: usize = r.uncommitted_acks.values().sum();
+        let unjournaled: usize = r.unjournaled_refusals.values().sum();
+        for (k, v) in &r.acks_by_class {
+            *self.acks_by_class.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &r.uncommitted_acks {
+            *self.uncommitted.entry(k.clone()).or_default() += v;
+        }
+        for (k, v) in &r.unjournaled_refusals {
+            *self.unjournaled.entry(k.clone()).or_default() += v;
+        }
+        self.i2 += r.identity_copies;
+        self.i2c += r.non_verbatim;
+        self.i4 += r.late_landings;
+        self.i5 += r.non_lone_rollbacks;
+        for (i, n) in [
+            uncommitted,
+            r.identity_copies,
+            r.non_verbatim,
+            r.late_landings,
+            r.non_lone_rollbacks,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.seeds_with[i] += u64::from(n > 0);
+        }
+        self.unmapped += r.acks_unmapped;
+        self.rebuilds.0 += r.rebuilds.0;
+        self.rebuilds.1 += r.rebuilds.1;
+        self.max_backups = self.max_backups.max(r.max_backups);
+        if r.rebuilds.0 + r.rebuilds.1 > 0 {
+            self.rebuild_seeds += 1;
+            eprintln!(
+                "SWEEP-REBUILD {label} seed {seed}: rebuilds {}/{} (ok/failed)",
+                r.rebuilds.0, r.rebuilds.1
+            );
+        }
+        if uncommitted
+            + r.identity_copies
+            + r.non_verbatim
+            + r.late_landings
+            + r.non_lone_rollbacks
+            + unjournaled
+            > 0
+        {
+            eprintln!(
+                "SWEEP-ORACLES {label} seed {seed}: i1={uncommitted} {:?} i2={} i2c={} i4={} i5={} \
+                 unjournaled={unjournaled} {:?} rebuilds={}/{}",
+                r.uncommitted_acks,
+                r.identity_copies,
+                r.non_verbatim,
+                r.late_landings,
+                r.non_lone_rollbacks,
+                r.unjournaled_refusals,
+                r.rebuilds.0,
+                r.rebuilds.1
+            );
+        }
+    }
+
+    fn print(&self, label: &str, seeds: u64) {
+        let i1: usize = self.uncommitted.values().sum();
+        let unjournaled: usize = self.unjournaled.values().sum();
+        eprintln!(
+            "SWEEP-ORACLE-TOTALS {label} seeds {}/{seeds}: i1={i1} {:?} (in {} seeds) i2={} (in {}) \
+             i2c={} (in {}) i4={} (in {}) i5={} (in {}) unjournaled={unjournaled} {:?} unmapped={} \
+             rebuilds={}/{} (in {} seeds) max-backups={}; acks by class {:?}",
+            self.seeds,
+            self.uncommitted,
+            self.seeds_with[0],
+            self.i2,
+            self.seeds_with[1],
+            self.i2c,
+            self.seeds_with[2],
+            self.i4,
+            self.seeds_with[3],
+            self.i5,
+            self.seeds_with[4],
+            self.unjournaled,
+            self.unmapped,
+            self.rebuilds.0,
+            self.rebuilds.1,
+            self.rebuild_seeds,
+            self.max_backups,
+            self.acks_by_class
+        );
     }
 }
 
@@ -6325,6 +6495,37 @@ fn config_variant(cfg: SimConfig, variant: &str) -> SimConfig {
         "solo" => SimConfig {
             clients_per_node: 1,
             ops_per_client: cfg.ops_per_client * 3,
+            ..cfg
+        },
+        // Plan 43 C0: the commit-rule oracles' strict flags (they always
+        // count; these make a count fail the run).
+        "commit" => SimConfig {
+            strict_commit: true,
+            ..cfg
+        },
+        "identity" => SimConfig {
+            strict_identity: true,
+            ..cfg
+        },
+        "settle" => SimConfig {
+            strict_settle: true,
+            ..cfg
+        },
+        "lone" => SimConfig {
+            strict_lone: true,
+            ..cfg
+        },
+        "oracles" => SimConfig {
+            strict_commit: true,
+            strict_identity: true,
+            strict_settle: true,
+            strict_lone: true,
+            ..cfg
+        },
+        // The negative control of the sim's rebuild (plan 43 C0): the
+        // stub that fails every deposition rebuild.
+        "rebuild-stub" => SimConfig {
+            rebuild_stub: true,
             ..cfg
         },
         other => panic!("unknown configuration variant +{other}"),
@@ -8491,3 +8692,400 @@ fn long_locks() {
         202_000..202_000 + n,
     );
 }
+
+// ===================================================================
+// Plan 43 C0: the commit-rule oracles (`sim/oracle.rs`) — fail-before
+// evidence on today's code, positive controls, a planted violation, the
+// sim's rebuild. The strict flags are off by default; a test that needs
+// one turns it on with `strict` (the `+commit` … `+oracles` variants).
+
+/// `cfg` with the strict flags the `+`-joined `variants` name.
+fn strict(cfg: SimConfig, variants: &str) -> SimConfig {
+    variants
+        .split('+')
+        .filter(|v| !v.is_empty())
+        .fold(cfg, config_variant)
+}
+
+/// A seed that must pass, with the oracle plumbing checked: every answer
+/// the sequencers gave was matched to its request.
+fn c0_run(label: &str, seed: u64, cfg: SimConfig) -> Report {
+    let r = run_seed(seed, cfg).unwrap_or_else(|e| {
+        panic!("{label} seed {seed}: {e}\n  replay with AUTHORITY_SIM_CONFIG={label}")
+    });
+    assert_eq!(
+        r.acks_unmapped, 0,
+        "{label} seed {seed}: answers with no recorded request"
+    );
+    r
+}
+
+fn c0_count(map: &std::collections::BTreeMap<String, usize>, key: &str) -> usize {
+    map.get(key).copied().unwrap_or(0)
+}
+
+/// The replay-seed names the strict variants attach to.
+#[test]
+fn c0_variants_set_their_flags() {
+    let c = strict(SimConfig::default(), "commit");
+    assert!(c.strict_commit && !c.strict_identity && !c.strict_settle && !c.strict_lone);
+    let c = strict(SimConfig::default(), "identity+settle+lone");
+    assert!(!c.strict_commit && c.strict_identity && c.strict_settle && c.strict_lone);
+    let c = strict(SimConfig::default(), "oracles");
+    assert!(c.strict_commit && c.strict_identity && c.strict_settle && c.strict_lone);
+    assert!(strict(SimConfig::default(), "rebuild-stub").rebuild_stub);
+}
+
+/// Plan 43 C0 §10.3, positive control: where every answer waits for the
+/// archive (`ack=s3`) the I1 oracle finds nothing — it does not cry wolf.
+#[test]
+fn c0_i1_is_clean_where_every_answer_waits_for_the_archive() {
+    for seed in 940..960 {
+        let r = c0_run("acks3", seed, strict(ack_s3_config(), "commit"));
+        assert!(
+            r.uncommitted_acks.is_empty(),
+            "acks3 seed {seed}: {:?}",
+            r.uncommitted_acks
+        );
+    }
+    for seed in 900..915 {
+        let r = c0_run("acks3-crash", seed, strict(ack_s3_crash_config(), "commit"));
+        assert!(
+            r.uncommitted_acks.is_empty(),
+            "acks3-crash seed {seed}: {:?}",
+            r.uncommitted_acks
+        );
+    }
+}
+
+/// Plan 43 C0 §10.3, positive control: under `backup` an answer the core
+/// gave on a backup's acknowledgement is committed in fact — no
+/// `root-group` or `deleg-group` answer is ever uncommitted. (What the
+/// oracle does find, and what the baseline counts, are answers of a fresh
+/// tenure that has no backup yet — a holder's first 200 ms, or after a
+/// takeover — to *another node's* forward: a lone root's Layer-A answer,
+/// plan 43 C2's `Archive` class, `uncommitted_acks["archive/…"]`.)
+#[test]
+fn c0_i1_finds_no_uncommitted_group_answer_under_backup() {
+    let (mut seen, mut groups) = (0usize, 0usize);
+    for seed in 700..760 {
+        let r = c0_run("backup", seed, backup_config());
+        groups += c0_count(&r.acks_by_class, "root-group");
+        for (k, n) in &r.uncommitted_acks {
+            assert!(
+                k.starts_with("archive/"),
+                "backup seed {seed}: an answer expected under {k} was uncommitted ({n}): {:?}",
+                r.oracle_examples
+            );
+            seen += n;
+        }
+    }
+    assert!(
+        groups > 100,
+        "the control never judged a root-group answer: {groups}"
+    );
+    println!("backup 700..760: {seen} archive-class answers uncommitted, {groups} root-group answers judged");
+}
+
+/// A single node answers its own clients: Lone (or Archive), never a
+/// violation; every counter of every oracle is zero.
+#[test]
+fn c0_the_oracles_are_clean_on_one_node() {
+    let cfg = || SimConfig {
+        nodes: 1,
+        clients_per_node: 2,
+        ops_per_client: 10,
+        random_faults: 0,
+        ..SimConfig::default()
+    };
+    for seed in 0..20 {
+        let r = c0_run("single", seed, strict(cfg(), "oracles"));
+        assert!(
+            r.uncommitted_acks.is_empty()
+                && r.unjournaled_refusals.is_empty()
+                && r.identity_copies == 0
+                && r.non_verbatim == 0
+                && r.late_landings == 0
+                && r.non_lone_rollbacks == 0,
+            "single seed {seed}: {r:?}"
+        );
+        assert!(
+            c0_count(&r.acks_by_class, "lone") > 0,
+            "single seed {seed}: no lone answer judged"
+        );
+    }
+}
+
+/// Plan 43 C0 §10.3: the F1 hold configurations (a write parked behind a
+/// slow writer while the node's core steps; the oracles read other nodes'
+/// stores from inside a driver) still pass (`-unchecked`, the non-vacuity
+/// knob, fails by design and is left out) — no deadlock between the
+/// oracle's snapshot reads and a held write's transaction.
+#[test]
+fn c0_the_oracles_do_not_deadlock_with_held_writes() {
+    for (label, cfg) in [
+        ("locks-writer-hold", locks_writer_hold_config()),
+        (
+            "locks-writer-hold-delegated",
+            locks_writer_hold_delegated_config(),
+        ),
+        ("locks-delegated", locks_delegated_config()),
+    ] {
+        for seed in 0..3 {
+            c0_run(label, seed, cfg.clone());
+        }
+    }
+}
+
+/// Plan 43 C0 §10.5, checker strength: the sim's fast path with
+/// `Core::ack_gated` ignored answers a holder's own op from its local disk
+/// while a backup is committed. The I1 oracle must see it (a `root-group`
+/// answer no backup holds) and fail under `+commit`.
+#[test]
+fn c0_i1_catches_a_planted_ungated_fast_path() {
+    let planted = || SimConfig {
+        fast_path: sim::run::FastPath::Checked,
+        plant_ungated_fast_path: true,
+        ..backup_config()
+    };
+    let mut caught = 0usize;
+    for seed in 700..712 {
+        // (Not `strict_durability`: the planted holder is allowed to lose
+        // what it acknowledged; only the oracle is under test.)
+        let cfg = SimConfig {
+            strict_durability: false,
+            ..planted()
+        };
+        let r = c0_run("backup+planted", seed, cfg.clone());
+        let n = c0_count(&r.uncommitted_acks, "root-group/ok");
+        if n > 0 {
+            caught += 1;
+            let e = run_seed(seed, strict(cfg, "commit"))
+                .expect_err("the planted answer must fail +commit");
+            assert!(e.contains("I1 acked_implies_committed"), "seed {seed}: {e}");
+        }
+    }
+    assert!(
+        caught >= 6,
+        "the planted ungated fast path was caught on only {caught} of 12 seeds"
+    );
+    // Without the plant the same seeds are clean of root-group violations.
+    for seed in 700..712 {
+        let cfg = SimConfig {
+            fast_path: sim::run::FastPath::Checked,
+            strict_durability: false,
+            ..backup_config()
+        };
+        let r = c0_run("backup+fast-path", seed, cfg);
+        assert_eq!(
+            c0_count(&r.uncommitted_acks, "root-group/ok"),
+            0,
+            "seed {seed}"
+        );
+    }
+}
+
+/// Plan 43 C0 (C6's baseline): `CONSTELLATION_BACKUPS=2` on three LAN nodes
+/// runs today's checks, and a second backup is listed at least once.
+#[test]
+fn backup_two_config_runs() {
+    let mut two = 0usize;
+    for seed in 700..716 {
+        let r = c0_run("backup-two", seed, backup_two_config());
+        two += usize::from(r.max_backups >= 2);
+    }
+    assert!(two > 0, "no run ever listed a second backup");
+}
+
+/// Plan 43 C0, the sim's rebuild: a deposed root whose journal rows were
+/// not captured rebuilds its replica from the log. With the old stub (every
+/// rebuild failed: "rebuilding the deposed replica from the log failed") the
+/// recovery never finished; with the real rebuild it does, and every
+/// existing check still holds. The seeds are the paused configurations of
+/// `long-delegated-late-answers` that were fixed on main (9287, 2945).
+#[test]
+fn c0_the_real_rebuild_recovers_a_deposed_root() {
+    let cfg = long_delegated_late_answers_config;
+    for seed in REBUILD_SEEDS {
+        let real = c0_run("long-delegated-late-answers", seed, cfg());
+        assert!(
+            real.rebuilds.0 > 0,
+            "seed {seed}: no rebuild ran: {:?}",
+            real.rebuilds
+        );
+        assert_eq!(real.rebuilds.1, 0, "seed {seed}: a rebuild failed");
+        let stub = c0_run(
+            "long-delegated-late-answers+rebuild-stub",
+            seed,
+            strict(cfg(), "rebuild-stub"),
+        );
+        assert!(
+            stub.rebuilds.1 > 0,
+            "seed {seed}: the stub never answered: {:?}",
+            stub.rebuilds
+        );
+        assert_eq!(stub.rebuilds.0, 0);
+        // The recovery the stub kept failing (every retry of the round
+        // asks again) ends after the real rebuild's first success.
+        assert!(
+            stub.rebuilds.1 > 5 * real.rebuilds.0,
+            "seed {seed}: the stub failed {} times, the real rebuild ran {}",
+            stub.rebuilds.1,
+            real.rebuilds.0
+        );
+    }
+}
+
+// ---- fail-before: each oracle finds today's states (plan 43 C0 §10.2) ----
+// Each pinned seed names the configuration and the counter it was found by.
+
+/// I1, `long-delegated`: a delegate with no backup acknowledges alone
+/// (`uncommitted_acks["deleg-group/ok"] > 0`); `+commit` fails with the I1
+/// text. (Not `delegated-backup`, which the plan names too: every delegate
+/// there has a backup, and ×2000 seeds give no such answer — PROGRESS,
+/// plan 43 C0, "Found, not fixed here".)
+#[test]
+fn c0_i1_finds_a_delegate_acknowledging_alone() {
+    {
+        let (label, cfg, seeds) = ("long-delegated", long_delegated_config(), I1_LONG_DELEGATED);
+        for &seed in seeds {
+            let r = c0_run(label, seed, cfg.clone());
+            assert!(
+                c0_count(&r.uncommitted_acks, "deleg-group/ok") > 0,
+                "{label} seed {seed}: {:?}",
+                r.uncommitted_acks
+            );
+            let e = run_seed(seed, strict(cfg.clone(), "commit")).expect_err("+commit must fail");
+            assert!(
+                e.contains("I1 acked_implies_committed"),
+                "{label} seed {seed}: {e}"
+            );
+        }
+    }
+}
+
+/// I1, `far_config` (`no_peer_in_budget_is_todays_behaviour`'s 1000..1020):
+/// a lone root answers another node's forward (`archive/ok`).
+#[test]
+fn c0_i1_finds_lone_answers_to_remote_requesters() {
+    let cfg = || SimConfig {
+        faults: backup_crash_config().faults,
+        ops_per_client: 8,
+        random_faults: 0,
+        ..far_config()
+    };
+    let mut found = 0;
+    for seed in 1000..1004 {
+        let r = c0_run("far", seed, cfg());
+        found += c0_count(&r.uncommitted_acks, "archive/ok");
+        let e = run_seed(seed, strict(cfg(), "commit")).expect_err("+commit must fail");
+        assert!(
+            e.contains("I1 acked_implies_committed"),
+            "far seed {seed}: {e}"
+        );
+    }
+    assert!(found > 0);
+}
+
+/// I2 (b): a rid queued on two nodes — a deposed holder's queue and the
+/// requester's retry, or a successor's replay of stranded delegate rows.
+#[test]
+fn c0_i2_finds_a_rid_queued_twice() {
+    for (label, cfg, seeds) in [
+        ("backup-crash", backup_crash_config(), I2_BACKUP_CRASH),
+        (
+            "delegated-holder-cut",
+            delegated_holder_cut_config(),
+            I2_DELEGATED_HOLDER_CUT,
+        ),
+    ] {
+        for &seed in seeds {
+            let r = c0_run(label, seed, cfg.clone());
+            assert!(
+                r.identity_copies > 0,
+                "{label} seed {seed}: {:?}",
+                r.oracle_examples
+            );
+            let e =
+                run_seed(seed, strict(cfg.clone(), "identity")).expect_err("+identity must fail");
+            assert!(e.contains("I2"), "{label} seed {seed}: {e}");
+        }
+    }
+}
+
+/// I2 (c): a successor re-journals a re-shipped tail under its own epoch and
+/// new journal rows, so the log does not carry what the client was told
+/// verbatim (`backup_failover_reships_the_tail`'s configuration).
+#[test]
+fn c0_i2c_finds_a_re_shipped_tail() {
+    for &seed in I2C_BACKUP_CRASH {
+        let r = c0_run("backup-crash", seed, backup_crash_config());
+        assert!(
+            r.non_verbatim > 0,
+            "backup-crash seed {seed}: {:?}",
+            r.oracle_examples
+        );
+        let e = run_seed(seed, strict(backup_crash_config(), "identity")).expect_err("+identity");
+        assert!(e.contains("I2c verbatim"), "seed {seed}: {e}");
+    }
+}
+
+/// I4: an op answered in doubt lands after an op its node invoked later.
+#[test]
+fn c0_i4_finds_a_late_landing() {
+    for &(label, cfg, seeds) in I4_SEEDS {
+        for &seed in seeds {
+            let r = c0_run(label, seed, cfg());
+            assert!(
+                r.late_landings > 0,
+                "{label} seed {seed}: {:?}",
+                r.oracle_examples
+            );
+            let e = run_seed(seed, strict(cfg(), "settle")).expect_err("+settle must fail");
+            assert!(
+                e.contains("I4 unacked_fails_never_lands_late"),
+                "{label} seed {seed}: {e}"
+            );
+        }
+    }
+}
+
+/// I5: under `backup` an acknowledged op is rolled back (the transient
+/// shadow rollbacks `backup_no_acked_op_lost`'s comment describes) and its
+/// answer was not Lone.
+#[test]
+fn c0_i5_finds_a_non_lone_rollback() {
+    for &seed in I5_BACKUP {
+        let r = c0_run("backup", seed, backup_config());
+        assert!(
+            r.non_lone_rollbacks > 0,
+            "backup seed {seed}: {:?}",
+            r.oracle_examples
+        );
+        let e = run_seed(seed, strict(backup_config(), "lone")).expect_err("+lone must fail");
+        assert!(e.contains("I5 speculation_only_lone"), "seed {seed}: {e}");
+    }
+}
+
+// Pinned seeds, each found by the sweep of its configuration with the counter
+// the test asserts (plan 43 C0 §10.2).
+/// `long-delegated` (no backup anywhere): `uncommitted_acks["deleg-group/ok"]`.
+const I1_LONG_DELEGATED: &[u64] = &[0, 1, 2];
+/// `backup-crash`: `identity_copies`.
+const I2_BACKUP_CRASH: &[u64] = &[815, 858, 889, 892];
+/// `delegated-holder-cut`: `identity_copies`.
+const I2_DELEGATED_HOLDER_CUT: &[u64] = &[0, 4, 22];
+/// `backup-crash`: `non_verbatim`.
+const I2C_BACKUP_CRASH: &[u64] = &[800, 802, 803];
+/// `backup`: `non_lone_rollbacks`.
+const I5_BACKUP: &[u64] = &[703, 746, 819, 931];
+/// The paused configurations of `long-delegated-late-answers` where the
+/// sim's `RebuildReplica` fires (9287 and 2945 still do).
+const REBUILD_SEEDS: [u64; 2] = [9287, 2945];
+type I4Seeds = (&'static str, fn() -> SimConfig, &'static [u64]);
+/// `long-delegated-late-answers`: `late_landings`.
+const I4_SEEDS: &[I4Seeds] = &[(
+    "long-delegated-late-answers",
+    long_delegated_late_answers_config,
+    &[1, 6, 8],
+)];

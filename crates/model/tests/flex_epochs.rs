@@ -94,12 +94,24 @@ fn assert_clean_capped(
     sometimes: &[&'static str],
     cap: (usize, Duration),
 ) {
+    assert_clean_checking(label, model, sometimes, cap, &[]);
+}
+
+/// [`assert_clean_capped`], also asserting `extra` always-properties that
+/// are not in the shared [`ALWAYS`] list.
+fn assert_clean_checking(
+    label: &str,
+    model: &FlexEpochs,
+    sometimes: &[&'static str],
+    cap: (usize, Duration),
+    extra: &[&'static str],
+) {
     let checker = run_capped(label, model, false, cap);
     assert!(
         checker.is_done() && checker.state_count() < cap.0,
         "{label}: expected exhaustive exploration within budget"
     );
-    for p in ALWAYS {
+    for p in ALWAYS.iter().chain(extra.iter()) {
         if let Some(d) = checker.discovery(p) {
             let last = d.last_state();
             panic!(
@@ -305,15 +317,22 @@ fn m9_ack_s3_with_the_claim_rule_is_clean() {
 /// the promise check, an epoch flushes its journal.
 #[test]
 fn full_rule_is_clean() {
-    assert_clean(
+    // Plan 43 C0 (§11 Q3): also the hold owner is never deposed (the model
+    // has no operator retire, and every epoch carries a lease).
+    assert_clean_checking(
         "full",
-        &full(),
+        &FlexEpochs {
+            check_hold_owner: true,
+            ..full()
+        },
         &[
             "epoch_with_missing_node",
             "checked_takeover",
             "epoch_flushed",
             "all_ops_done",
         ],
+        CAP,
+        &["hold_owner_never_deposed_except_by_retire"],
     );
 }
 
@@ -540,4 +559,28 @@ fn full_rule_is_clean_under_drift_with_inflight_puts() {
         ],
         BIG_CAP,
     );
+}
+
+/// Plan 43 C0 (non-vacuity of `hold_owner_never_deposed_except_by_retire`):
+/// with the claim rule off, a listed backup seals and takes the register
+/// over while an epoch writes; the hold owner's close finds the register
+/// moved and loses its epoch journal — the bit the property is about is
+/// reachable, so its being clean under the full rule means something.
+#[test]
+fn an_unguarded_seal_takeover_deposes_the_hold_owner() {
+    let m = FlexEpochs {
+        policy: Policy::Backup(2),
+        fast_takeover: true,
+        claim_rule: false,
+        check_hold_owner: true,
+        ..full()
+    };
+    let checker = run_capped("hold-owner-deposed", &m, false, CAP);
+    let d = checker
+        .discovery("hold_owner_never_deposed_except_by_retire")
+        .expect("expected the hold owner to be deposed without the claim rule");
+    println!("hold owner deposed:");
+    for (k, a) in d.clone().into_actions().into_iter().enumerate() {
+        println!("  {k:2}: {a:?}");
+    }
 }

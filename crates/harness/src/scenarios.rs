@@ -23,6 +23,7 @@ mod campaign;
 mod campaign_load;
 /// A P2P cluster's nodes `kill -9`ed and restarted together.
 mod cluster_restart;
+mod commit;
 /// Plan 31 §6.12: subtree confinement through the kernel.
 mod confinement;
 mod coop_churn;
@@ -1942,6 +1943,13 @@ pub const CAMPAIGN: &[Scenario] = &[
         requires: &[],
         caps: &[],
         run: snapsched::snapshot_takeover_idle,
+    },
+    Scenario {
+        name: "ack-latency",
+        desc: "plan 43 C0 (measure-only; bench/commit-rule/run.sh): p50/p90/p99 over ACK_LATENCY_SAMPLES (300) of create, 4 KiB write+fsync, rename, unlink, chmod and the first flock from a non-sequencer, per topology (one node; two nodes with a backup, holder's own and forwarded; two nodes with a directory delegated to a (no delegate backup); three nodes with a delegate that has a backup; two nodes under CONSTELLATION_HARNESS_LOAD=net-wan with a lone root (runs only then); ack=s3), as one JSON document on stdout; fails only when a topology is not the acknowledgement mode it claims",
+        requires: &[],
+        caps: &[Cap::ClusterLocks],
+        run: commit::ack_latency,
     },
     Scenario {
         name: "endpoint-wedge-probe",

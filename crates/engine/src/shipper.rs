@@ -92,11 +92,23 @@ fn remove_db(db_path: &std::path::Path) {
 }
 
 /// Apply `part`'s contiguous log run after `start` and record where it
-/// stopped. Shared by both bootstrap paths (from a commit, and genesis).
+/// stopped. Shared by both bootstrap paths (from a commit, and genesis),
+/// and so by every rebuild (`authority_driver::rebuild_replica`).
+///
+/// Plan 43 §11 Q20 (h): "applied, unfenced" means here what it means to
+/// the running core's tail (`Core::apply_incoming`) and to its start: a
+/// segment of a superseded epoch (`0 < epoch <` the highest applied so
+/// far, seeded from the replica's recorded applied position) is skipped,
+/// and the applied segments' journal position is recorded
+/// (`KV_APPLIED_POS`, as `Meta::apply_segment_rows` records it): its
+/// epoch is the floor a core started on this replica fences from
+/// (`Replica::applied_epoch`).
 async fn replay_from(meta: &Meta, log: &LogStore, part: &str, start: u64) -> Result<usize> {
     let part_log = log.with_partition(part);
     let mut applied = start;
     let mut replayed = 0usize;
+    let mut pos = meta.applied_pos();
+    let mut max_epoch = pos.map_or(0, |pos| pos.epoch);
     let seqs = part_log.list_segments_from(start + 1).await?;
     // A first segment past `start + 1` means retention already pruned the
     // records this base needs. Stopping at the gap would hand back a
@@ -114,10 +126,25 @@ async fn replay_from(meta: &Meta, log: &LogStore, part: &str, start: u64) -> Res
             break;
         }
         let seg = decode(&part_log.get_segment(seq).await?)?;
+        if seg.epoch > 0 && seg.epoch < max_epoch {
+            tracing::error!(
+                seq,
+                epoch = seg.epoch,
+                max_epoch,
+                "FENCING VIOLATION: segment from a superseded lease epoch; skipping"
+            );
+            applied = seq;
+            continue;
+        }
         replayed += seg.records.len();
         meta.apply_records(&seg.records)
             .with_context(|| format!("replaying {part} log segment {seq}"))?;
+        pos = pos.max(Some(seg.journal_pos()));
+        max_epoch = max_epoch.max(seg.epoch);
         applied = seq;
+    }
+    if let Some(pos) = pos {
+        meta.note_applied_pos(pos)?;
     }
     meta.set_applied_seq(applied)?;
     Ok(replayed)
@@ -641,6 +668,55 @@ mod tests {
         // From a base the log still covers, the same replay succeeds.
         let covered = Meta::open_in_memory().unwrap();
         assert!(replay_from(&covered, &log, PARTITION, 1).await.unwrap() > 0);
+    }
+
+    /// Plan 43 §11 Q20 (h): a bootstrap (and so every rebuild) applies the
+    /// log as the running core's tail does — a segment of a superseded
+    /// epoch behind a newer one is skipped — and records the applied
+    /// journal position, whose epoch a core started on the replica fences
+    /// from. Before, every segment was applied and no position recorded.
+    #[tokio::test]
+    async fn replay_fences_a_superseded_epoch_and_records_the_position() {
+        use constellation_authority::segment::encode;
+        use constellation_meta::LogRecord;
+        let store = StdArc::new(InMemory::new());
+        let log = LogStore::new(store.clone());
+        let mkdir = |name: &str, ino| LogRecord::Mkdir {
+            parent: constellation_fs_core::types::ROOT_INO,
+            name: name.into(),
+            ino,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            time_ns: 0,
+        };
+        let part = log.with_partition(PARTITION);
+        let seg =
+            |node, epoch, through, rec| encode(node, epoch, through, &[], &[], &[rec]).unwrap();
+        part.put_segment(1, &seg(2, 3, 7, mkdir("new", 1_000)))
+            .await
+            .unwrap();
+        // A deposed epoch-2 holder's segment behind the epoch-3 one.
+        part.put_segment(2, &seg(1, 2, 9, mkdir("late", 1_001)))
+            .await
+            .unwrap();
+        part.put_segment(3, &seg(2, 3, 8, mkdir("after", 1_002)))
+            .await
+            .unwrap();
+        let fresh = Meta::open_in_memory().unwrap();
+        replay_from(&fresh, &log, PARTITION, 0).await.unwrap();
+        let root = constellation_fs_core::types::ROOT_INO;
+        assert!(fresh.lookup(root, "new").unwrap().is_some());
+        assert!(
+            fresh.lookup(root, "late").unwrap().is_none(),
+            "a superseded epoch's segment was applied"
+        );
+        assert!(fresh.lookup(root, "after").unwrap().is_some());
+        assert_eq!(fresh.applied_seq().unwrap(), 3);
+        assert_eq!(
+            fresh.applied_pos(),
+            Some(constellation_meta::JournalPos { epoch: 3, jseq: 8 })
+        );
     }
 
     /// Table-by-table equality of two replicas' shared state, reporting

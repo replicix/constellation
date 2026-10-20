@@ -648,6 +648,8 @@ impl Core {
             let applied = replica.applied_seq().unwrap_or(0);
             self.ship.next_seq = applied + 1;
             self.ship.head_seq = applied;
+            // The fencing floor follows the rebuilt position too (Q20 (h)).
+            self.ship.max_epoch = self.ship.max_epoch.max(replica.applied_epoch());
             replica.clear_streamed();
             tracing::warn!(
                 node = self.cfg.node_id,
@@ -1497,6 +1499,7 @@ impl Core {
         let applied = replica.applied_seq().unwrap_or(0);
         self.ship.next_seq = applied + 1;
         self.ship.head_seq = self.ship.head_seq.max(applied);
+        self.ship.max_epoch = self.ship.max_epoch.max(replica.applied_epoch());
         let uncaptured = replica.journal_len().unwrap_or(0);
         match self.finish_recovery(
             rolled + uncaptured,

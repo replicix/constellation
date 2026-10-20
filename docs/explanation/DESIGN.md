@@ -586,6 +586,30 @@ appends to it, and a full replica on every node. Everything else in this
 section exists to make that simple shape fast (forwarding, delegation,
 streaming) and safe to fail over (request ids, speculation, positions).
 
+The sections below and the code use the vocabulary of Vertical Paxos and Delos
+(plan 43). The **configuration master** is the versioned register that decides
+who may order writes and with which group: for the root, the lease object
+(`Lease`: holder, epoch, `backups`, `config_version`, `ack_policy`) with
+`nodes/` and `designations/`; for a delegation, the root's log (`Delegate`,
+`Recall`; `DelegationTable`). A **configuration** is one version of it, and its
+**group** is the nodes that hold the sequencer's rows under it: the holder and
+its listed backups, or a delegate and its recorded backup (`durable_jseq`,
+`deleg_stream_durable`). A row is **committed** when every member of the group
+in force when it was journaled holds it, or when a log segment carrying it
+landed. A **seal** is a member's persisted refusal of any further row of a
+configuration, which fences the old sequencer before a reconfiguration
+(`Meta::backup_seal`, `PeerMsg::DelegSeal`); the rows a sealed member holds
+past the **archive** (the S3 log and its slot CAS, which fences a deposed
+sequencer's late segment a second time) are the **sealed tail**, re-shipped by
+the reconfigurer (`backup_tail`, `apply_backup_tail`). A **lone sequencer** is a
+holder or delegate whose group is itself because no peer is within the RTT
+budget; its answers to its own node's clients are the one speculation the
+design keeps. A **non-stealable** authority (an offline designation, a
+continuation epoch's hold) is never replaced while its holder lives. The rows a
+node keeps as a **member copy** of a group it no longer sequences for stay in
+the `backup_tail` keyspace until the archive carries them. No type is renamed
+for the vocabulary.
+
 ### Local store
 
 Every node keeps a **full metadata replica** in [fjall](https://github.com/fjall-rs/fjall)

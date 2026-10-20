@@ -181,6 +181,13 @@ pub trait Replica {
     // ---- the journal and the applied position (ship / tail) ----
 
     fn applied_seq(&self) -> Result<Seq, MetaError>;
+    /// The highest epoch of a segment this replica applied or shipped (the
+    /// epoch of its recorded applied journal position, `KV_APPLIED_POS`;
+    /// a fenced segment does not move it), 0 when none is recorded. The
+    /// fencing floor a core starts from (plan 43 §11 Q20 (h)): "applied,
+    /// unfenced" means the same after a restart or a rebuild as for a
+    /// replica that tailed every segment.
+    fn applied_epoch(&self) -> Epoch;
     fn journal_len(&self) -> Result<u64, MetaError>;
     /// The next unshipped journal rows, whole transactions only, at most
     /// `max` rows (plan 30 §M3b: an op's records and its `Completed`
@@ -752,6 +759,10 @@ impl Replica for Meta {
 
     fn applied_seq(&self) -> Result<Seq, MetaError> {
         Meta::applied_seq(self)
+    }
+
+    fn applied_epoch(&self) -> Epoch {
+        Meta::applied_pos(self).map_or(0, |pos| pos.epoch)
     }
 
     fn journal_len(&self) -> Result<u64, MetaError> {

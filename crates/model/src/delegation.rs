@@ -577,6 +577,10 @@ pub struct DelegModel {
     pub max_tick: u8,
     pub max_epoch: u8,
     pub max_history: usize,
+    /// Plan 43 C0: check `acked_ops_are_never_replayed`. Off by default so
+    /// a counterexample search that stops at the first failed property still
+    /// ends on the property a test is about (C2 turns it on everywhere).
+    pub check_acked_replay: bool,
 }
 
 impl DelegModel {
@@ -615,6 +619,7 @@ impl DelegModel {
             max_tick: 6,
             max_epoch: 1,
             max_history: 40,
+            check_acked_replay: false,
         }
     }
 
@@ -883,6 +888,11 @@ pub const SAW_RESTREAM: u16 = 256;
 pub const SAW_DEPS_WAIT: u16 = 512;
 pub const SAW_REDELEGATED: u16 = 1024;
 pub const SAW_TENTATIVE: u16 = 2048;
+/// Plan 43 C0: an op that was *acknowledged* entered a replay queue, or was
+/// lost with its stream (a delegate that acknowledged without a backup, and
+/// died or was recalled). `acked_ops_are_never_replayed` is this bit never
+/// set — C2 makes it hold; today it does not.
+pub const SAW_ACKED_REPLAYED: u16 = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -1697,6 +1707,16 @@ impl Model for DelegModel {
                     && quiescent(s)
             }),
         ];
+        // Plan 43 C0: an acknowledged op is never replayed by rid (a
+        // sequencer that acknowledged it had committed it). Violated today
+        // by a delegate without a backup; not in the clean tests' lists
+        // until C2 (`today_a_delegate_without_a_backup_acks_alone`).
+        if self.check_acked_replay {
+            props.push(Property::always(
+                "acked_ops_are_never_replayed",
+                |_, s: &State| s.saw & SAW_ACKED_REPLAYED == 0,
+            ));
+        }
         macro_rules! witness {
             ($name:literal, $bit:expr) => {
                 props.push(Property::sometimes($name, |_, s: &State| s.saw & $bit != 0));
@@ -2084,6 +2104,9 @@ fn strand_stream(s: &mut State, stream: u8, cut: u8) {
         s.violation = Some(Violation::DesignationStranded(stream - GEN_BASE));
     }
     let _ = &lost;
+    if !lost.is_empty() {
+        s.saw |= SAW_ACKED_REPLAYED;
+    }
     for (rid, _) in lost {
         s.mark(rid, Ret::Tentative);
     }
@@ -2405,6 +2428,7 @@ fn tail(cfg: &DelegModel, s: &mut State, i: usize) {
                 s.nodes[i].own_last[k as usize] = None;
             }
             s.nodes[i].replays.push((a.rid, a.op));
+            s.saw |= SAW_ACKED_REPLAYED;
         }
         if let Some(d) = s.nodes[i].deleg.clone() {
             if gen_stream(d.gen) == st {
@@ -2498,7 +2522,7 @@ fn deliver(cfg: &DelegModel, s: &mut State, m: Msg) {
                 });
             if stale && matches!(ret, Ret::Ok | Ret::Tentative) {
                 s.returned(i as u8, rid, op, Ret::Tentative);
-                s.saw |= SAW_TENTATIVE;
+                s.saw |= SAW_TENTATIVE | SAW_ACKED_REPLAYED;
                 s.nodes[i].replays.push((rid, op));
                 s.nodes[i].op = NodeOp::Idle;
                 s.nodes[i].pc += 1;

@@ -72,7 +72,7 @@ use constellation_store_s3::inbox::InboxKey;
 use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
-pub use backup::{beat_sent_ms, liveness_fresh, AckView, SealRecord};
+pub use backup::{beat_sent_ms, liveness_fresh, AckClass, AckView, SealRecord};
 pub use client::ClientPhase;
 pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 
@@ -1714,6 +1714,10 @@ impl Core {
         let applied = replica.applied_seq().unwrap_or(0);
         self.ship.next_seq = applied + 1;
         self.ship.head_seq = applied;
+        // Plan 43 §11 Q20 (h): the fencing floor is the replica's, not 0 —
+        // a restarted node skips a superseded-epoch segment exactly as the
+        // incarnation that applied the earlier ones would have.
+        self.ship.max_epoch = self.ship.max_epoch.max(replica.applied_epoch());
         if replica.lost_persisted() {
             self.lease.force_lost();
         }

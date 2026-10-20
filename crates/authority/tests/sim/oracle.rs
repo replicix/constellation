@@ -1,0 +1,1392 @@
+//! Plan 43 C0: the commit-rule oracles' plumbing (the invariants I1, I2, I4
+//! and I5 of the plan's §4), judged by the simulation and the models only —
+//! the core carries no assert (C0 changes no behaviour).
+//!
+//! * I1 `acked_implies_committed`: every definitive answer is classified,
+//!   **at the answering sequencer's emission**, by reading every node's
+//!   store and the bucket's lease and log at that instant, independently of
+//!   what the core claims ([`committed_at_answer`]).
+//! * I2 `one_identity_per_op`: (b) no rid queued for execution on two nodes
+//!   at once ([`IdentityLedger`]); (c) verbatim, at the end of the run
+//!   (`run.rs`).
+//! * I4 `unacked_fails_never_lands_late` and I5 `speculation_only_lone`: at
+//!   the end of the run, from the logs this module keeps.
+//!
+//! Each oracle always counts; its strict flag (`SimConfig::strict_*`) only
+//! decides whether a count fails the run.
+
+use super::bus::Bus;
+use super::store::Bucket;
+use constellation_authority::core::AckClass;
+use constellation_authority::segment::{self, Segment};
+use constellation_authority::{NodeId, Replica, Seq};
+use constellation_meta::{BackupTx, LogRecord, Meta, MutateOutcome, Rid};
+use constellation_store_s3::{AckPolicy, Lease, LogStore};
+use constellation_types::Code;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Everything the oracles share in one run (`NodeEnv::oracles`).
+pub struct Oracles {
+    pub bucket: Arc<Bucket>,
+    /// Node id -> the node's current `Meta`, updated by every
+    /// `NodeHandle::start_with` (a restart, with or without its journal).
+    pub stores: Mutex<BTreeMap<NodeId, Arc<Meta>>>,
+    /// Node id -> the core's backup RTT budget and link-stability window
+    /// (ms), for the lone check.
+    pub budgets: Mutex<BTreeMap<NodeId, (u64, u64)>>,
+    /// Node id -> since when (on its wait clock) each peer link has been up
+    /// without a break, as the driver's directory last told its core
+    /// (`Event::Peers`): the stability window of a backup candidate.
+    pub directory: Mutex<BTreeMap<NodeId, BTreeMap<NodeId, i64>>>,
+    /// Every answer, in emission order (the `AckLog`).
+    pub acks: Mutex<Vec<AckEntry>>,
+    pub identity: Mutex<IdentityLedger>,
+    /// The first submission of each rid, with its tick.
+    pub invokes: Mutex<Vec<(Rid, u64)>>,
+    invoked: Mutex<HashSet<Rid>>,
+    /// One global, strictly increasing event counter: every emission
+    /// judged, every in-doubt answer and every client invocation takes the
+    /// next value, so "after" is exact on the single-threaded runtime.
+    pub tick: AtomicU64,
+    /// Answers whose requester-side mapping `(sequencer, req) -> rid` was
+    /// missing (must be 0).
+    pub acks_unmapped: AtomicU64,
+    /// Descriptions of I1 violations, in order (judged at emission, failed
+    /// at the end of the run).
+    pub i1_violations: Mutex<Vec<String>>,
+    /// Who sent a `MutateReply` for each rid, and of what kind: a
+    /// requester passing it on to its client is a relay, not judged.
+    pub reply_kinds: Mutex<HashMap<Rid, Vec<(NodeId, OutcomeKind)>>>,
+}
+
+impl Oracles {
+    pub fn new(bucket: Arc<Bucket>) -> Arc<Self> {
+        Arc::new(Self {
+            bucket,
+            stores: Mutex::new(BTreeMap::new()),
+            budgets: Mutex::new(BTreeMap::new()),
+            directory: Mutex::new(BTreeMap::new()),
+            acks: Mutex::new(Vec::new()),
+            identity: Mutex::new(IdentityLedger::default()),
+            invokes: Mutex::new(Vec::new()),
+            invoked: Mutex::new(HashSet::new()),
+            tick: AtomicU64::new(1),
+            acks_unmapped: AtomicU64::new(0),
+            i1_violations: Mutex::new(Vec::new()),
+            reply_kinds: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn next_tick(&self) -> u64 {
+        self.tick.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// A client's first submission of `rid` (a resubmission adds nothing).
+    pub fn note_invoke(&self, rid: Rid) {
+        if self.invoked.lock().unwrap().insert(rid) {
+            let t = self.next_tick();
+            self.invokes.lock().unwrap().push((rid, t));
+        }
+    }
+
+    pub fn register(&self, id: NodeId, meta: Arc<Meta>, budget_ms: u64, stable_ms: u64) {
+        self.stores.lock().unwrap().insert(id, meta);
+        self.budgets
+            .lock()
+            .unwrap()
+            .insert(id, (budget_ms, stable_ms));
+    }
+
+    /// The links `id`'s directory reported up, with their `since` (wait ms).
+    pub fn note_directory(&self, id: NodeId, up: BTreeMap<NodeId, i64>) {
+        self.directory.lock().unwrap().insert(id, up);
+    }
+
+    fn store(&self, id: NodeId) -> Option<Arc<Meta>> {
+        self.stores.lock().unwrap().get(&id).cloned()
+    }
+}
+
+// ---------------------------------------------------------------------
+// The archive index.
+// ---------------------------------------------------------------------
+
+/// What the bucket's log carries, kept synchronously: `Bucket` notes each
+/// segment as it lands (`NodeStore::put_opts`), and the index answers over
+/// the contiguous prefix from 1 with epoch fencing exactly as
+/// `check::replay_log` applies it (a segment with `0 < epoch < max_epoch
+/// so far` is fenced and carries nothing).
+pub struct ArchiveIndex {
+    log: LogStore,
+    inner: Mutex<ArchiveInner>,
+}
+
+#[derive(Default)]
+struct ArchiveInner {
+    segments: BTreeMap<Seq, Arc<Segment>>,
+    /// The contiguous prefix from 1 that has been judged.
+    prefix: Seq,
+    max_epoch: u64,
+    fenced: BTreeSet<Seq>,
+    /// The first outcome (`Completed` or `Refused`) of each rid in an
+    /// applied, unfenced segment: (seq, record index).
+    outcomes: HashMap<Rid, (Seq, usize)>,
+}
+
+impl Default for ArchiveIndex {
+    fn default() -> Self {
+        Self {
+            log: LogStore::new(Arc::new(object_store::memory::InMemory::new())),
+            inner: Mutex::new(ArchiveInner::default()),
+        }
+    }
+}
+
+impl ArchiveIndex {
+    /// Segment `seq` landed with this (sealed, compressed) body.
+    pub fn note(&self, seq: Seq, body: &[u8]) {
+        let Ok(plain) = self.log.open_segment(seq, body) else {
+            return;
+        };
+        let Ok(seg) = segment::decode(&plain) else {
+            return;
+        };
+        self.note_segment(seq, seg);
+    }
+
+    /// As [`Self::note`], for a decoded segment (the unit tests').
+    pub fn note_segment(&self, seq: Seq, seg: Segment) {
+        let mut g = self.inner.lock().unwrap();
+        g.segments.entry(seq).or_insert_with(|| Arc::new(seg));
+        // Tolerate out-of-order arrival: only extend the prefix while the
+        // next segment is here.
+        while let Some(seg) = g.segments.get(&(g.prefix + 1)).cloned() {
+            let seq = g.prefix + 1;
+            if seg.epoch > 0 && seg.epoch < g.max_epoch {
+                g.fenced.insert(seq);
+            } else {
+                for (i, rec) in seg.records.iter().enumerate() {
+                    if let Some(rid) = outcome_rid(rec) {
+                        g.outcomes.entry(rid).or_insert((seq, i));
+                    }
+                }
+                g.max_epoch = g.max_epoch.max(seg.epoch);
+            }
+            g.prefix = seq;
+        }
+    }
+
+    /// Where the rid's outcome (`Completed { rid }` or `Refused { rid, .. }`)
+    /// is in the applied unfenced prefix: (seq, record index, the segment).
+    pub fn outcome_of(&self, rid: Rid) -> Option<(Seq, usize, Arc<Segment>)> {
+        let g = self.inner.lock().unwrap();
+        let (seq, i) = *g.outcomes.get(&rid)?;
+        Some((seq, i, g.segments.get(&seq)?.clone()))
+    }
+
+    /// Whether segment `seq` is in the applied prefix and was fenced.
+    pub fn is_fenced(&self, seq: Seq) -> bool {
+        self.inner.lock().unwrap().fenced.contains(&seq)
+    }
+}
+
+fn outcome_rid(rec: &LogRecord) -> Option<Rid> {
+    match rec {
+        LogRecord::Completed { rid } | LogRecord::Refused { rid, .. } => Some(*rid),
+        _ => None,
+    }
+}
+
+fn carries(records: &[LogRecord], rid: Rid) -> bool {
+    records.iter().any(|r| outcome_rid(r) == Some(rid))
+}
+
+// ---------------------------------------------------------------------
+// I1.
+// ---------------------------------------------------------------------
+
+/// What an answer's judgement expected, from the answerer's state (plan §5.1's
+/// table), for the per-class counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expected {
+    Class(AckClass),
+    /// No transaction of the rid anywhere (a refusal that journaled no
+    /// `Refused`, or an acceptance with nothing behind it).
+    Unjournaled,
+}
+
+impl Expected {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Expected::Class(c) => c.name(),
+            Expected::Unjournaled => "unjournaled",
+        }
+    }
+}
+
+/// The transaction `T` carrying the rid's outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxRef {
+    pub node: NodeId,
+    pub first: u64,
+    pub last: u64,
+    pub origin: (u64, u64),
+    pub epoch: u64,
+    pub records: Vec<LogRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Judgement {
+    /// The first class that holds.
+    pub class: Option<AckClass>,
+    pub expected: Expected,
+    pub tx: Option<TxRef>,
+    /// What each class check saw (for failures).
+    pub detail: String,
+}
+
+/// What the answering node's core says about itself at the answer: the
+/// parts of the judgement that are the answerer's own state.
+#[derive(Debug, Clone, Default)]
+pub struct AnswererState {
+    /// The lease epoch the answerer holds (an epoch hold's included).
+    pub epoch: Option<u64>,
+    /// A continuation epoch's hold is in force.
+    pub epoch_held: bool,
+    /// Per generation this node holds as a delegate: its recorded backup.
+    pub deleg_backups: Vec<(u64, NodeId)>,
+    /// The generations this node holds as a delegate.
+    pub holds_gens: Vec<u64>,
+    /// The generations of the delegation table that are designations of
+    /// this node (never stolen by the root).
+    pub designated_gens: Vec<u64>,
+    /// The answerer's wait clock at the answer (ms): a link counts as a
+    /// candidate once it has been up for the stability window.
+    pub now_wait: i64,
+}
+
+impl AnswererState {
+    pub fn of(
+        core: &constellation_authority::Core,
+        meta: &Meta,
+        id: NodeId,
+        now_wait: i64,
+    ) -> Self {
+        let view = core.deleg_view();
+        Self {
+            epoch: core.lease().epoch(),
+            epoch_held: core.lease().epoch_held(),
+            deleg_backups: view.backups.iter().map(|(g, b, _)| (*g, *b)).collect(),
+            holds_gens: view.mine.iter().map(|m| m.1).collect(),
+            designated_gens: meta
+                .delegation_table()
+                .iter()
+                .filter(|d| d.node == id && d.designated)
+                .map(|d| d.gen)
+                .collect(),
+            now_wait,
+        }
+    }
+}
+
+/// How an answer reads in the report: `ok`, `refused:<code>`, `exists`, ….
+pub fn outcome_kind(outcome: &MutateOutcome) -> Option<OutcomeKind> {
+    match outcome {
+        MutateOutcome::Accepted { .. } => Some(OutcomeKind::Ok),
+        MutateOutcome::Errno(c) => Some(OutcomeKind::Refused(*c)),
+        MutateOutcome::Exists { .. } => Some(OutcomeKind::Exists),
+        MutateOutcome::Conflict { .. } => Some(OutcomeKind::Conflict),
+        MutateOutcome::LockLapsed => Some(OutcomeKind::LockLapsed),
+        // `Busy`, `NotHolder`, `Held`: not an answer.
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeKind {
+    Ok,
+    Refused(Code),
+    Exists,
+    Conflict,
+    LockLapsed,
+}
+
+impl OutcomeKind {
+    pub fn name(&self) -> String {
+        match self {
+            OutcomeKind::Ok => "ok".into(),
+            OutcomeKind::Refused(c) => format!("refused:{}", c.posix_name()),
+            OutcomeKind::Exists => "exists".into(),
+            OutcomeKind::Conflict => "conflict".into(),
+            OutcomeKind::LockLapsed => "lock-lapsed".into(),
+        }
+    }
+
+    /// A refusal journals a `Refused` row, or none (D6).
+    pub fn is_refusal(&self) -> bool {
+        !matches!(self, OutcomeKind::Ok)
+    }
+
+    /// The code a refusal is counted under (`unjournaled_refusals`).
+    pub fn refusal_name(&self) -> String {
+        match self {
+            OutcomeKind::Ok => "ok".into(),
+            OutcomeKind::Refused(c) => c.posix_name().to_string(),
+            OutcomeKind::Exists => "exists-hint".into(),
+            OutcomeKind::Conflict => "conflict".into(),
+            OutcomeKind::LockLapsed => "lock-lapsed".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AckEntry {
+    pub node: NodeId,
+    pub rid: Rid,
+    pub tick: u64,
+    pub at_ms: u64,
+    pub kind: OutcomeKind,
+    /// The answer left the node as a `MutateReply` to a requester (the
+    /// sequencer's answer), as opposed to its own client's reply.
+    pub reply: bool,
+    /// The requester passing on a sequencer's answer: not judged.
+    pub relay: bool,
+    pub judged: Option<Judgement>,
+}
+
+/// The transaction in `txs` carrying `rid`'s outcome.
+fn find_tx(txs: &[BackupTx], rid: Rid) -> Option<&BackupTx> {
+    txs.iter().find(|t| carries(&t.records, rid))
+}
+
+fn journal_of(meta: &Meta) -> Vec<BackupTx> {
+    Replica::journal_txs_from(meta, 0, usize::MAX)
+}
+
+/// The class an answer by `answerer` (in state `st`) of `rid`'s `outcome`
+/// belongs to, judged against every node's store, the bucket's lease and
+/// log **as they are now**, independently of the core's claim.
+pub fn committed_at_answer(
+    o: &Oracles,
+    bus: &Bus,
+    answerer: NodeId,
+    st: &AnswererState,
+    rid: Rid,
+    outcome: &MutateOutcome,
+) -> Judgement {
+    let _ = outcome;
+    let mut detail: Vec<String> = Vec::new();
+    let lease = o.bucket.peek_lease();
+    let own = o.store(answerer);
+    let own_txs = own.as_deref().map(journal_of).unwrap_or_default();
+    // The lease holder's journal (a successor that re-shipped the row, or
+    // the root that appended a delegate's row).
+    let holder = lease.as_ref().map(|l| l.holder).filter(|h| *h != 0);
+    let holder_txs: Vec<BackupTx> = match holder {
+        Some(h) if h == answerer => own_txs.clone(),
+        Some(h) => o.store(h).as_deref().map(journal_of).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    // T: the answerer's own transaction, else the holder's.
+    let tx: Option<TxRef> = if let Some(t) = find_tx(&own_txs, rid) {
+        Some(TxRef {
+            node: answerer,
+            first: t.first,
+            last: t.last,
+            origin: t.origin,
+            epoch: st.epoch.unwrap_or(0),
+            records: t.records.clone(),
+        })
+    } else {
+        find_tx(&holder_txs, rid).map(|t| TxRef {
+            node: holder.unwrap_or(0),
+            first: t.first,
+            last: t.last,
+            origin: t.origin,
+            epoch: lease.as_ref().map_or(0, |l| l.epoch),
+            records: t.records.clone(),
+        })
+    };
+
+    let class = classify(
+        o,
+        bus,
+        answerer,
+        st,
+        rid,
+        lease.as_ref(),
+        tx.as_ref(),
+        &own_txs,
+        &holder_txs,
+        &mut detail,
+    );
+    let expected = if tx.is_none() && class.is_none() {
+        Expected::Unjournaled
+    } else {
+        expected_class(o, bus, answerer, st, rid, lease.as_ref(), tx.as_ref())
+    };
+    Judgement {
+        class,
+        expected,
+        tx,
+        detail: detail.join("; "),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify(
+    o: &Oracles,
+    bus: &Bus,
+    answerer: NodeId,
+    st: &AnswererState,
+    rid: Rid,
+    lease: Option<&Lease>,
+    tx: Option<&TxRef>,
+    own_txs: &[BackupTx],
+    holder_txs: &[BackupTx],
+    detail: &mut Vec<String>,
+) -> Option<AckClass> {
+    // 1. Archive.
+    if let Some((seq, _, _)) = o.bucket.archive.outcome_of(rid) {
+        detail.push(format!("archive: in applied segment {seq}"));
+        return Some(AckClass::Archive);
+    }
+    detail.push("archive: not in an applied unfenced segment".into());
+
+    // 2. RootGroup: the lease object's holder and every listed backup.
+    match (lease, tx) {
+        (Some(l), Some(t)) if t.origin == (0, 0) && !l.backups.is_empty() => {
+            match root_group(o, l, rid, holder_txs) {
+                Ok(()) => {
+                    detail.push("root-group: holder and every listed backup hold it".into());
+                    return Some(AckClass::RootGroup);
+                }
+                Err(why) => detail.push(format!("root-group: {why}")),
+            }
+        }
+        (Some(l), Some(t)) if t.origin == (0, 0) => detail.push(format!(
+            "root-group: the lease at epoch {} (holder {}) lists no backup",
+            l.epoch, l.holder
+        )),
+        (None, _) => detail.push("root-group: no lease object".into()),
+        (_, None) => detail.push("root-group: no transaction of the rid".into()),
+        _ => detail.push("root-group: not a root row".into()),
+    }
+
+    // 3. DelegGroup.
+    if let Some(t) = tx {
+        let (g, i) = t.origin;
+        if g != 0 {
+            match deleg_group(o, answerer, st, rid, g, i, t, holder_txs) {
+                Ok(why) => {
+                    detail.push(format!("deleg-group: {why}"));
+                    return Some(AckClass::DelegGroup { gen: g });
+                }
+                Err(why) => detail.push(format!("deleg-group: {why}")),
+            }
+        }
+    }
+
+    // 4. NonStealable: a designee, or an epoch's hold owner on a root row.
+    if let Some(t) = tx {
+        let (g, _) = t.origin;
+        if g != 0 && st.designated_gens.contains(&g) {
+            detail.push(format!("non-stealable: designee of generation {g}"));
+            return Some(AckClass::NonStealable);
+        }
+        if g == 0 && st.epoch_held {
+            detail.push("non-stealable: epoch hold owner".into());
+            return Some(AckClass::NonStealable);
+        }
+    }
+
+    // 5. Lone.
+    if rid.node != answerer {
+        detail.push(format!(
+            "lone: rid is node {}'s, not the answerer's",
+            rid.node
+        ));
+        return None;
+    }
+    let group_is_itself = match tx {
+        Some(t) if t.origin.0 != 0 => {
+            let backed = st.deleg_backups.iter().any(|(g, _)| *g == t.origin.0);
+            if backed {
+                detail.push(format!("lone: generation {} records a backup", t.origin.0));
+            }
+            !backed
+        }
+        Some(_) | None => match lease {
+            Some(l) if l.holder == answerer && l.backups.is_empty() => true,
+            Some(l) => {
+                detail.push(format!(
+                    "lone: lease holder {} lists backups {:?}",
+                    l.holder, l.backups
+                ));
+                false
+            }
+            None => {
+                detail.push("lone: no lease object".into());
+                false
+            }
+        },
+    };
+    if !group_is_itself {
+        return None;
+    }
+    if let Some(n) = peer_in_budget(o, bus, answerer, st.now_wait) {
+        detail.push(format!("lone: peer {n} is linked within the budget"));
+        return None;
+    }
+    // (`own_txs` only feeds T; a Lone answer needs no copy elsewhere.)
+    let _ = own_txs;
+    detail.push("lone: its group is itself and no peer is within the budget".into());
+    Some(AckClass::Lone)
+}
+
+/// A live node `answerer` is linked to within its RTT budget, if any — a
+/// link that has been up for the stability window, as the core's candidate
+/// selection requires (`Core::backup_candidates`): a peer that has only just
+/// come up is not yet one a backup could be had from, and until it is the
+/// node is alone in the plan's sense.
+fn peer_in_budget(o: &Oracles, bus: &Bus, answerer: NodeId, now_wait: i64) -> Option<NodeId> {
+    let (budget, stable) = o
+        .budgets
+        .lock()
+        .unwrap()
+        .get(&answerer)
+        .copied()
+        .unwrap_or((0, 0));
+    let directory = o.directory.lock().unwrap();
+    let up = directory.get(&answerer);
+    bus.nodes().into_iter().find(|n| {
+        *n != answerer
+            && bus.linked(answerer, *n)
+            && bus.rtt(answerer, *n) <= budget
+            && up
+                .and_then(|m| m.get(n))
+                .is_none_or(|since| now_wait - *since >= stable as i64)
+    })
+}
+
+/// RootGroup: the lease object's holder's journal and every listed
+/// backup's tail hold the transaction (`Ok`), or why not.
+fn root_group(o: &Oracles, l: &Lease, rid: Rid, holder_txs: &[BackupTx]) -> Result<(), String> {
+    let Some(ht) = find_tx(holder_txs, rid) else {
+        return Err(format!(
+            "the lease holder {} (epoch {}) has no journal row of the rid",
+            l.holder, l.epoch
+        ));
+    };
+    for b in &l.backups {
+        let Some(store) = o.store(*b) else {
+            return Err(format!("listed backup {b} has no registered store"));
+        };
+        let mut epochs = vec![l.epoch];
+        if let Ok(Some(role)) = store.backup_role() {
+            if role.epoch != l.epoch {
+                epochs.insert(0, role.epoch);
+            }
+        }
+        let held = epochs.iter().any(|e| {
+            store
+                .backup_tail(*e)
+                .map(|tail| {
+                    tail.iter()
+                        .any(|t| carries(&t.records, rid) && t.records == ht.records)
+                })
+                .unwrap_or(false)
+        });
+        if !held {
+            return Err(format!(
+                "listed backup {b}'s tail (epochs {epochs:?}) lacks the row"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// DelegGroup: the delegate holds `(g, i)`; each recorded backup's delegate
+/// tail holds it, or, with none recorded, the root's journal does.
+#[allow(clippy::too_many_arguments)]
+fn deleg_group(
+    o: &Oracles,
+    answerer: NodeId,
+    st: &AnswererState,
+    rid: Rid,
+    g: u64,
+    i: u64,
+    t: &TxRef,
+    holder_txs: &[BackupTx],
+) -> Result<String, String> {
+    // The delegate's journal holds it — or the root appended it and the
+    // delegate retired its row by that (`t` was found at the root then).
+    let root_has = holder_txs
+        .iter()
+        .any(|x| x.origin == (g, i) && carries(&x.records, rid));
+    if t.node != answerer && !root_has {
+        return Err(format!("the row ({g},{i}) is not the answerer's"));
+    }
+    if t.node == answerer && !st.holds_gens.contains(&g) && !root_has {
+        return Err(format!("the answerer holds no generation {g}"));
+    }
+    let backups: Vec<NodeId> = st
+        .deleg_backups
+        .iter()
+        .filter(|(gen, _)| *gen == g)
+        .map(|(_, b)| *b)
+        .collect();
+    if !backups.is_empty() {
+        for b in &backups {
+            let Some(store) = o.store(*b) else {
+                return Err(format!("recorded backup {b} has no registered store"));
+            };
+            let held = store
+                .deleg_backup_tail(g)
+                .map(|tail| tail.iter().any(|d| d.idx == i && carries(&d.records, rid)))
+                .unwrap_or(false);
+            if !held {
+                return Err(format!(
+                    "recorded backup {b}'s delegate tail of generation {g} lacks index {i}"
+                ));
+            }
+        }
+        return Ok(format!("every recorded backup {backups:?} holds ({g},{i})"));
+    }
+    if root_has {
+        Ok(format!(
+            "no backup recorded; the root journal holds ({g},{i})"
+        ))
+    } else {
+        Err(format!(
+            "no backup recorded and the root's journal lacks the appended row ({g},{i})"
+        ))
+    }
+}
+
+/// The class the core would be expected to give the answer (plan §5.1's
+/// table), from the answerer's state.
+fn expected_class(
+    o: &Oracles,
+    bus: &Bus,
+    answerer: NodeId,
+    st: &AnswererState,
+    rid: Rid,
+    lease: Option<&Lease>,
+    tx: Option<&TxRef>,
+) -> Expected {
+    let g = tx.map_or(0, |t| t.origin.0);
+    if g != 0 {
+        return Expected::Class(if st.designated_gens.contains(&g) {
+            AckClass::NonStealable
+        } else {
+            AckClass::DelegGroup { gen: g }
+        });
+    }
+    if st.epoch_held {
+        return Expected::Class(AckClass::NonStealable);
+    }
+    let Some(l) = lease else {
+        return Expected::Class(AckClass::Archive);
+    };
+    if l.ack_policy == AckPolicy::S3 {
+        return Expected::Class(AckClass::Archive);
+    }
+    if !l.backups.is_empty() {
+        return Expected::Class(AckClass::RootGroup);
+    }
+    if peer_in_budget(o, bus, answerer, st.now_wait).is_some() {
+        // The bring-up rule: while a backup could be had, wait for the
+        // archive.
+        return Expected::Class(AckClass::Archive);
+    }
+    if rid.node == answerer {
+        Expected::Class(AckClass::Lone)
+    } else {
+        // Plan 43 C2's rule: a lone root answers another node's forward
+        // from the archive (today such an answer is a violation).
+        Expected::Class(AckClass::Archive)
+    }
+}
+
+// ---------------------------------------------------------------------
+// I2 (b): one copy of a rid in the cluster.
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone)]
+pub struct NodeCopies {
+    pub queued: BTreeSet<Rid>,
+    pub executing: BTreeSet<Rid>,
+}
+
+/// Where each rid is queued for execution, per node, and the rids that were
+/// ever queued on two nodes at once.
+#[derive(Debug, Default)]
+pub struct IdentityLedger {
+    per_node: BTreeMap<NodeId, NodeCopies>,
+    pub violations: BTreeMap<Rid, String>,
+}
+
+impl IdentityLedger {
+    /// Node `node`'s replay queue and executing set after an event.
+    pub fn update(
+        &mut self,
+        node: NodeId,
+        queued: BTreeSet<Rid>,
+        executing: BTreeSet<Rid>,
+        tick: u64,
+    ) {
+        let copies = self.per_node.entry(node).or_default();
+        if copies.queued == queued && copies.executing == executing {
+            return;
+        }
+        copies.queued = queued;
+        copies.executing = executing;
+        let mine = copies.clone();
+        let rids: BTreeSet<Rid> = mine.queued.union(&mine.executing).copied().collect();
+        for rid in rids {
+            if self.violations.contains_key(&rid) {
+                continue;
+            }
+            for (other, c) in &self.per_node {
+                if *other == node || !(c.queued.contains(&rid) || c.executing.contains(&rid)) {
+                    continue;
+                }
+                let kinds = |c: &NodeCopies| {
+                    let mut k = Vec::new();
+                    if c.queued.contains(&rid) {
+                        k.push("queued");
+                    }
+                    if c.executing.contains(&rid) {
+                        k.push("executing");
+                    }
+                    k.join("+")
+                };
+                self.violations.insert(
+                    rid,
+                    format!(
+                        "I2 one_identity_per_op: rid {rid:?} queued on {node} ({}) and {other} ({}) at tick {tick}",
+                        kinds(&mine),
+                        kinds(c)
+                    ),
+                );
+                break;
+            }
+        }
+    }
+
+    /// The process died: what it was executing is gone; its persisted
+    /// queue runs again at restart.
+    pub fn crash(&mut self, node: NodeId) {
+        if let Some(c) = self.per_node.get_mut(&node) {
+            c.executing.clear();
+        }
+    }
+
+    /// A restart without the journal: nothing is kept.
+    pub fn wipe(&mut self, node: NodeId) {
+        self.per_node.remove(&node);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The end of a run: what the oracles counted.
+// ---------------------------------------------------------------------
+
+/// What the oracles found in one run (the strict flags decide which of
+/// them fail it).
+#[derive(Debug, Default)]
+pub struct Findings {
+    pub acks_by_class: BTreeMap<String, usize>,
+    pub uncommitted_acks: BTreeMap<String, usize>,
+    pub unjournaled_refusals: BTreeMap<String, usize>,
+    /// I1: the descriptions, in emission order.
+    pub i1: Vec<String>,
+    /// I2 (b): one description per rid queued on two nodes.
+    pub i2: Vec<String>,
+    /// I2 (c): one description per rid not completed verbatim.
+    pub i2c: Vec<String>,
+    pub i4: Vec<String>,
+    pub i5: Vec<String>,
+}
+
+impl Findings {
+    /// The first five violations of each oracle.
+    pub fn examples(&self) -> Vec<String> {
+        [&self.i1, &self.i2, &self.i2c, &self.i4, &self.i5]
+            .into_iter()
+            .flat_map(|v| v.iter().take(5).cloned())
+            .collect()
+    }
+}
+
+/// Tally the run's answers and run the end-of-run oracles: I2 (c) over the
+/// answers' transactions and the log, I4 over the in-doubt answers and the
+/// invocations, I5 over the rolled-back set. `converged`: the run reached
+/// quiescence, so a group-answered rid the log never completed is absent
+/// for good.
+pub fn end_of_run(
+    o: &Oracles,
+    log: &super::check::Oracle,
+    in_doubt: &[(NodeId, Rid, u64, u64)],
+    rolled_back: &HashSet<Rid>,
+    converged: bool,
+) -> Findings {
+    let mut f = Findings {
+        i1: o.i1_violations.lock().unwrap().clone(),
+        i2: o
+            .identity
+            .lock()
+            .unwrap()
+            .violations
+            .values()
+            .cloned()
+            .collect(),
+        ..Findings::default()
+    };
+    let acks = o.acks.lock().unwrap();
+    let mut non_lone_ok: BTreeSet<Rid> = BTreeSet::new();
+    let mut verbatim: BTreeMap<Rid, String> = BTreeMap::new();
+    for a in acks.iter().filter(|a| !a.relay) {
+        let Some(j) = &a.judged else { continue };
+        let class = j.class.map_or("none", |c| c.name());
+        *f.acks_by_class.entry(class.to_string()).or_default() += 1;
+        if j.class.is_none() {
+            if j.expected == Expected::Unjournaled && a.kind.is_refusal() {
+                *f.unjournaled_refusals
+                    .entry(a.kind.refusal_name())
+                    .or_default() += 1;
+            } else {
+                *f.uncommitted_acks
+                    .entry(format!("{}/{}", j.expected.name(), a.kind.name()))
+                    .or_default() += 1;
+            }
+        }
+        if a.kind == OutcomeKind::Ok && j.class != Some(AckClass::Lone) {
+            non_lone_ok.insert(a.rid);
+        }
+        // I2 (c): an OK answered under a group class names a transaction
+        // the log must carry as it was committed.
+        if a.kind == OutcomeKind::Ok
+            && matches!(
+                j.class,
+                Some(AckClass::RootGroup) | Some(AckClass::DelegGroup { .. })
+            )
+        {
+            if let Some(t) = &j.tx {
+                if let Some(why) = not_verbatim(log, a.rid, t, converged) {
+                    verbatim.entry(a.rid).or_insert_with(|| {
+                        format!(
+                            "I2c verbatim: rid {:?} answered OK by node {} at t={} ms (tick {}) \
+                             under {} (T = node {} epoch {} rows {}..={} origin {:?}): {why}",
+                            a.rid,
+                            a.node,
+                            a.at_ms,
+                            a.tick,
+                            class,
+                            t.node,
+                            t.epoch,
+                            t.first,
+                            t.last,
+                            t.origin
+                        )
+                    });
+                }
+            }
+        }
+    }
+    f.i2c = verbatim.into_values().collect();
+    // I4.
+    let invokes = o.invokes.lock().unwrap().clone();
+    f.i4 = super::check::no_late_landing(in_doubt, &invokes, log).1;
+    // I5: acknowledged OK, rolled back, and not a Lone answer.
+    for rid in rolled_back {
+        if non_lone_ok.contains(rid) {
+            let Some(a) = acks
+                .iter()
+                .rev()
+                .find(|a| a.rid == *rid && !a.relay && a.kind == OutcomeKind::Ok)
+            else {
+                continue;
+            };
+            let class = a
+                .judged
+                .as_ref()
+                .map_or("none", |j| j.class.map_or("none", |c| c.name()));
+            f.i5.push(format!(
+                "I5 speculation_only_lone: rid {rid:?} was acknowledged by node {} at t={} ms \
+                 (tick {}, {}; class {class}) and rolled back",
+                a.node,
+                a.at_ms,
+                a.tick,
+                if a.reply {
+                    "a forward's reply"
+                } else {
+                    "its own client's"
+                },
+            ));
+        }
+    }
+    f.i5.sort();
+    f
+}
+
+/// Why the log does not carry `t` as it was committed (`None`: it does).
+fn not_verbatim(
+    log: &super::check::Oracle,
+    rid: Rid,
+    t: &TxRef,
+    converged: bool,
+) -> Option<String> {
+    let Some((seq, i)) = log.completed_at.get(&rid).copied() else {
+        return converged.then(|| "absent: the log never completed it".to_string());
+    };
+    let seg = log.unfenced.get(&seq)?;
+    let identity = if t.origin.0 == 0 {
+        seg.epoch == t.epoch && seg.node == t.node && seg.rows.contains(&t.first)
+    } else {
+        seg.origins.contains(&t.origin)
+    };
+    if !identity {
+        return Some(format!(
+            "its completion is in segment {seq} (epoch {}, node {}, rows {:?}, origins {:?}): \
+             not under the identity it was committed with",
+            seg.epoch, seg.node, seg.rows, seg.origins
+        ));
+    }
+    if !t.records.is_empty() {
+        // The records it was committed with, contiguous, around the
+        // completing record.
+        let n = t.records.len();
+        let start_lo = (i + 1).saturating_sub(n);
+        let found = (start_lo..=i).any(|st| {
+            seg.records
+                .get(st..st + n)
+                .is_some_and(|w| w == t.records.as_slice())
+        });
+        if !found {
+            return Some(format!(
+                "its completion is in segment {seq} at record {i}, which does not carry the \
+                 {n} record(s) it was committed with as one run"
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use constellation_fs_core::types::ROOT_INO;
+    use constellation_meta::{DelegateTx, MutateOp, Position};
+    use constellation_store_s3::{LeaseMode, LeaseStore};
+    use constellation_types::clock::Now;
+
+    fn rid(n: u64, seq: u64) -> Rid {
+        Rid {
+            node: n,
+            incarnation: 1,
+            seq,
+        }
+    }
+
+    fn seg(epoch: u64, rids: &[Rid]) -> Segment {
+        Segment {
+            node: 1,
+            epoch,
+            records: rids
+                .iter()
+                .map(|r| LogRecord::Completed { rid: *r })
+                .collect(),
+            through: 0,
+            rows: Vec::new(),
+            origins: Vec::new(),
+        }
+    }
+
+    /// A small world: stores for nodes 1..=3 (all with a 50 ms budget and
+    /// no stability window), an empty bus and bucket.
+    struct World {
+        o: Arc<Oracles>,
+        bus: Arc<Bus>,
+        metas: BTreeMap<NodeId, Arc<Meta>>,
+    }
+
+    fn world() -> World {
+        let o = Oracles::new(Bucket::new(1, (0, 0)));
+        let bus = Bus::new(1, (1, 15), 0.0);
+        let mut metas = BTreeMap::new();
+        for id in 1..=3u64 {
+            let m = Meta::open_in_memory().expect("meta");
+            m.set_node_prefix(id).expect("prefix");
+            let m = Arc::new(m);
+            o.register(id, m.clone(), 50, 0);
+            metas.insert(id, m);
+        }
+        World { o, bus, metas }
+    }
+
+    impl World {
+        fn lease(&self, holder: u64, epoch: u64, backups: &[u64]) {
+            let l = Lease::granted("p0", holder, epoch, 60_000)
+                .reconfigured(backups.to_vec(), AckPolicy::Backup);
+            let leases = LeaseStore::new(self.o.bucket.raw(), "p0", LeaseMode::Cas);
+            futures::executor::block_on(leases.try_create(&l)).expect("lease");
+        }
+
+        /// `node` executes a create of `name` under `rid` into its journal.
+        fn create(&self, node: u64, rid: Rid, name: &str) -> BackupTx {
+            let m = &self.metas[&node];
+            let ino = m.allocate_ino(ROOT_INO).expect("ino");
+            let op = MutateOp::Create {
+                parent: ROOT_INO,
+                name: name.into(),
+                ino,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+            };
+            constellation_meta::execute_mutate(m, &op, Some(rid)).expect("execute");
+            Replica::journal_txs_from(&**m, 0, usize::MAX)
+                .into_iter()
+                .find(|t| carries(&t.records, rid))
+                .expect("journaled")
+        }
+
+        fn judge(&self, answerer: u64, st: &AnswererState, rid: Rid) -> Judgement {
+            let outcome = MutateOutcome::Accepted {
+                epoch: 1,
+                records: Vec::new(),
+            };
+            committed_at_answer(&self.o, &self.bus, answerer, st, rid, &outcome)
+        }
+    }
+
+    fn holder_state(epoch: u64) -> AnswererState {
+        AnswererState {
+            epoch: Some(epoch),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn archive_index_fences_a_superseded_epoch() {
+        let a = ArchiveIndex::default();
+        a.note_segment(1, seg(2, &[rid(1, 1)]));
+        // A lower-epoch segment after a higher one is fenced: not archived.
+        a.note_segment(2, seg(1, &[rid(1, 2)]));
+        a.note_segment(3, seg(2, &[rid(1, 3)]));
+        assert!(a.outcome_of(rid(1, 1)).is_some());
+        assert!(
+            a.outcome_of(rid(1, 2)).is_none(),
+            "a fenced segment carries nothing"
+        );
+        assert!(a.is_fenced(2));
+        assert_eq!(a.outcome_of(rid(1, 3)).map(|(s, _, _)| s), Some(3));
+    }
+
+    #[test]
+    fn archive_index_waits_for_a_gap() {
+        let a = ArchiveIndex::default();
+        a.note_segment(2, seg(1, &[rid(1, 2)]));
+        assert!(
+            a.outcome_of(rid(1, 2)).is_none(),
+            "past a gap the prefix has not reached it"
+        );
+        a.note_segment(1, seg(1, &[rid(1, 1)]));
+        assert!(a.outcome_of(rid(1, 2)).is_some());
+    }
+
+    #[test]
+    fn i1_root_group_needs_every_listed_backup() {
+        let w = world();
+        let r = rid(3, 1);
+        let tx = w.create(1, r, "a");
+        w.lease(1, 1, &[2]);
+        let st = holder_state(1);
+        // The holder's journal holds it, the listed backup's tail does not.
+        let j = w.judge(1, &st, r);
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.detail.contains("listed backup 2"), "{}", j.detail);
+        assert_eq!(j.expected, Expected::Class(AckClass::RootGroup));
+        // The backup holds it (as the row was shipped to it).
+        w.metas[&2]
+            .backup_append(1, std::slice::from_ref(&tx))
+            .unwrap();
+        let j = w.judge(1, &st, r);
+        assert_eq!(j.class, Some(AckClass::RootGroup), "{}", j.detail);
+        // Records that differ are not the same row.
+        let other = BackupTx {
+            records: vec![LogRecord::Completed { rid: r }],
+            ..tx.clone()
+        };
+        w.metas[&2].backup_trim(1, u64::MAX, &[]).unwrap();
+        w.metas[&2].backup_append(1, &[other]).unwrap();
+        assert_eq!(w.judge(1, &st, r).class, None);
+        // The tail is trimmed once the segment lands: the archive holds it.
+        w.metas[&2].backup_trim(1, u64::MAX, &[]).unwrap();
+        w.o.bucket.archive.note_segment(1, seg(1, &[r]));
+        assert_eq!(w.judge(1, &st, r).class, Some(AckClass::Archive));
+    }
+
+    #[test]
+    fn i1_deleg_group_needs_the_root_append_when_no_backup() {
+        let w = world();
+        let r = rid(3, 1);
+        // Node 2 is the delegate of generation 1: its own journal row (1, 1).
+        let m = &w.metas[&2];
+        let ino = m.allocate_ino(ROOT_INO).unwrap();
+        let op = MutateOp::Create {
+            parent: ROOT_INO,
+            name: "x".into(),
+            ino,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        };
+        let (records, idx) = m
+            .delegate_execute(
+                &op,
+                Some(r),
+                1,
+                Position::ZERO,
+                &constellation_meta::locks::LockTag::NONE,
+                Now::same(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+        w.lease(1, 1, &[]);
+        let st = AnswererState {
+            holds_gens: vec![1],
+            ..Default::default()
+        };
+        let j = w.judge(2, &st, r);
+        assert_eq!(j.tx.as_ref().map(|t| t.origin), Some((1, 1)));
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert_eq!(j.expected, Expected::Class(AckClass::DelegGroup { gen: 1 }));
+        // The root appends the row (origin (1, 1)) to its journal.
+        w.metas[&1]
+            .apply_delegate_tx(&records, Some(r), 1, 1, Position::ZERO)
+            .unwrap();
+        let j = w.judge(2, &st, r);
+        assert_eq!(
+            j.class,
+            Some(AckClass::DelegGroup { gen: 1 }),
+            "{}",
+            j.detail
+        );
+        // With a recorded backup it is the backup's tail that must hold it.
+        let st = AnswererState {
+            holds_gens: vec![1],
+            deleg_backups: vec![(1, 3)],
+            ..Default::default()
+        };
+        let j = w.judge(2, &st, r);
+        assert_eq!(j.class, None, "{}", j.detail);
+        let dtx = DelegateTx {
+            idx: 1,
+            rid: Some(r),
+            records,
+            deps: Position::ZERO,
+        };
+        w.metas[&3].deleg_backup_append(1, 0, &[dtx]).unwrap();
+        let j = w.judge(2, &st, r);
+        assert_eq!(
+            j.class,
+            Some(AckClass::DelegGroup { gen: 1 }),
+            "{}",
+            j.detail
+        );
+    }
+
+    #[test]
+    fn i1_lone_needs_an_empty_group_and_no_peer_in_budget() {
+        let w = world();
+        let own = rid(1, 1);
+        w.create(1, own, "a");
+        w.lease(1, 1, &[]);
+        let st = holder_state(1);
+        // Its own client, a group of itself, nobody near: Lone.
+        let j = w.judge(1, &st, own);
+        assert_eq!(j.class, Some(AckClass::Lone), "{}", j.detail);
+        // Another node's client is not answered Lone.
+        let remote = rid(3, 1);
+        w.create(1, remote, "b");
+        let j = w.judge(1, &st, remote);
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert_eq!(j.expected, Expected::Class(AckClass::Archive));
+        // A peer linked within the budget (the node could have had a backup).
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        w.bus.attach(2, tx);
+        w.bus.set_rtt(1, 2, 5);
+        let j = w.judge(1, &st, own);
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.detail.contains("peer 2 is linked"), "{}", j.detail);
+        // ... unless its link is too young to be a candidate (the stability
+        // window), or it is out of budget, or the link is cut.
+        w.o.note_directory(1, [(2u64, 9_990i64)].into());
+        w.o.budgets.lock().unwrap().insert(1, (50, 200));
+        let young = AnswererState {
+            now_wait: 10_000,
+            ..holder_state(1)
+        };
+        assert_eq!(w.judge(1, &young, own).class, Some(AckClass::Lone));
+        w.o.budgets.lock().unwrap().insert(1, (50, 0));
+        w.bus.set_rtt(1, 2, 120);
+        assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
+        w.bus.set_rtt(1, 2, 5);
+        w.bus.set_partition(1, 2, true);
+        assert_eq!(w.judge(1, &st, own).class, Some(AckClass::Lone));
+        w.bus.set_partition(1, 2, false);
+        // A listed backup (even one nobody can reach) makes it a group of two.
+        let w2 = world();
+        w2.create(1, own, "a");
+        w2.lease(1, 1, &[2]);
+        let j = w2.judge(1, &st, own);
+        assert_eq!(j.class, None, "{}", j.detail);
+        assert!(j.detail.contains("listed backup 2"), "{}", j.detail);
+    }
+
+    #[test]
+    fn i1_non_stealable_is_a_designee_or_an_epoch_hold() {
+        let w = world();
+        let r = rid(3, 1);
+        w.create(1, r, "a");
+        w.lease(2, 3, &[]);
+        let hold = AnswererState {
+            epoch: Some(3),
+            epoch_held: true,
+            ..Default::default()
+        };
+        let j = w.judge(1, &hold, r);
+        assert_eq!(j.class, Some(AckClass::NonStealable), "{}", j.detail);
+    }
+
+    /// A log with one applied segment whose completion of `r` is at record
+    /// `i`, for the verbatim and late-landing checks.
+    fn log_with(seg: Segment, completed: &[(Rid, (u64, usize))]) -> super::super::check::Oracle {
+        let mut unfenced = BTreeMap::new();
+        unfenced.insert(1, Arc::new(seg));
+        super::super::check::Oracle {
+            head: 1,
+            final_dump: Vec::new(),
+            at: BTreeMap::new(),
+            completed: completed.iter().map(|(r, _)| (*r, 1)).collect(),
+            completed_at: completed.iter().copied().collect(),
+            segments: 1,
+            fenced: 0,
+            unfenced,
+            describe: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn i2c_an_adopted_tail_is_not_verbatim() {
+        let r = rid(1, 1);
+        let rec = vec![LogRecord::Completed { rid: r }];
+        let committed = TxRef {
+            node: 1,
+            first: 5,
+            last: 5,
+            origin: (0, 0),
+            epoch: 1,
+            records: rec.clone(),
+        };
+        let shipped = |epoch: u64, node: u64, rows: Vec<u64>| Segment {
+            node,
+            epoch,
+            records: rec.clone(),
+            through: 5,
+            rows,
+            origins: vec![(0, 0)],
+        };
+        let log = log_with(shipped(1, 1, vec![5]), &[(r, (1, 0))]);
+        assert_eq!(not_verbatim(&log, r, &committed, true), None);
+        // The successor re-journaled it under its own epoch (and jseq).
+        let log = log_with(shipped(2, 2, vec![1]), &[(r, (1, 0))]);
+        let why = not_verbatim(&log, r, &committed, true).expect("not verbatim");
+        assert!(why.contains("not under the identity"), "{why}");
+        // Never completed while the run converged: absent.
+        let log = log_with(shipped(1, 1, vec![5]), &[]);
+        assert!(not_verbatim(&log, r, &committed, true)
+            .unwrap()
+            .contains("absent"));
+        assert_eq!(not_verbatim(&log, r, &committed, false), None);
+        // A delegate's row is verbatim by its origin.
+        let deleg = TxRef {
+            origin: (2, 7),
+            ..committed.clone()
+        };
+        let mut s = shipped(1, 1, vec![5]);
+        s.origins = vec![(2, 7)];
+        let log = log_with(s, &[(r, (1, 0))]);
+        assert_eq!(not_verbatim(&log, r, &deleg, true), None);
+        let mut s = shipped(1, 1, vec![5]);
+        s.origins = vec![(2, 8)];
+        let log = log_with(s, &[(r, (1, 0))]);
+        assert!(not_verbatim(&log, r, &deleg, true).is_some());
+    }
+
+    #[test]
+    fn i4_an_in_doubt_rid_landing_after_a_later_op_is_late() {
+        let (r1, r2) = (rid(1, 1), rid(1, 2));
+        let in_doubt = [(1u64, r1, 0u64, 10u64), (1, r1, 0, 30)];
+        let invokes = [(r1, 5u64), (r2, 11)];
+        // r1 (answered in doubt at tick 10) lands at (5, 0); r2, invoked
+        // afterwards by the same node, landed first at (3, 0): late.
+        let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (r2, (3, 0))]);
+        let (n, why) = super::super::check::no_late_landing(&in_doubt, &invokes, &log);
+        assert_eq!(n, 1, "{why:?}");
+        assert!(
+            why[0].contains("I4 unacked_fails_never_lands_late"),
+            "{why:?}"
+        );
+        // r1 landing before the later op is clean.
+        let log = log_with(seg(1, &[]), &[(r1, (2, 0)), (r2, (3, 0))]);
+        assert_eq!(
+            super::super::check::no_late_landing(&in_doubt, &invokes, &log).0,
+            0
+        );
+        // An op another node invoked is not this node's client's.
+        let invokes = [(r1, 5u64), (rid(2, 1), 11)];
+        let log = log_with(seg(1, &[]), &[(r1, (5, 0)), (rid(2, 1), (3, 0))]);
+        assert_eq!(
+            super::super::check::no_late_landing(&in_doubt, &invokes, &log).0,
+            0
+        );
+    }
+
+    #[test]
+    fn i2_two_nodes_queue_one_rid() {
+        let mut l = IdentityLedger::default();
+        let r = rid(2, 5);
+        l.update(1, [r].into(), BTreeSet::new(), 1);
+        assert!(l.violations.is_empty(), "one copy is fine");
+        // The same node holding the rid queued and executing is one copy
+        // (the client's retry merged with its queue entry).
+        l.update(1, [r].into(), [r].into(), 2);
+        assert!(l.violations.is_empty());
+        l.update(2, BTreeSet::new(), [r].into(), 3);
+        assert_eq!(l.violations.len(), 1, "{:?}", l.violations);
+        let text = &l.violations[&r];
+        assert!(text.contains("queued on 2 (executing) and 1"), "{text}");
+        // A crash drops the executing copy but keeps the queue.
+        let mut l = IdentityLedger::default();
+        l.update(2, BTreeSet::new(), [r].into(), 1);
+        l.crash(2);
+        l.update(1, [r].into(), BTreeSet::new(), 2);
+        assert!(l.violations.is_empty());
+        let mut l = IdentityLedger::default();
+        l.update(1, [r].into(), BTreeSet::new(), 1);
+        l.crash(1);
+        l.update(2, BTreeSet::new(), [r].into(), 2);
+        assert_eq!(l.violations.len(), 1, "the queue survives a crash");
+        let mut l = IdentityLedger::default();
+        l.update(1, [r].into(), BTreeSet::new(), 1);
+        l.wipe(1);
+        l.update(2, BTreeSet::new(), [r].into(), 2);
+        assert!(l.violations.is_empty(), "a restart without the journal");
+    }
+}

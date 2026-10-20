@@ -176,6 +176,9 @@ pub struct Counts {
 
 pub struct Bucket {
     inner: Arc<InMemory>,
+    /// Plan 43 C0: what the log's segments carry, noted as they land (the
+    /// I1 oracle judges an answer synchronously and cannot await the bucket).
+    pub archive: super::oracle::ArchiveIndex,
     rng: Mutex<StdRng>,
     /// Per-request latency range, ms.
     latency: (u64, u64),
@@ -188,6 +191,7 @@ impl Bucket {
     pub fn new(seed: u64, latency: (u64, u64)) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(InMemory::new()),
+            archive: super::oracle::ArchiveIndex::default(),
             rng: Mutex::new(StdRng::seed_from_u64(seed ^ 0x5335_5335)),
             latency,
             rules: Mutex::new(Vec::new()),
@@ -199,6 +203,34 @@ impl Bucket {
     /// The backing store, for the checkers (never faulted).
     pub fn raw(&self) -> Arc<dyn ObjectStore> {
         self.inner.clone()
+    }
+
+    /// The lease object as it is in the bucket this instant, read
+    /// synchronously (plan 43 C0's I1 oracle: the configuration a
+    /// reconfigurer would read). The backing store never waits.
+    pub fn peek_lease(&self) -> Option<constellation_store_s3::Lease> {
+        let leases = constellation_store_s3::LeaseStore::new(
+            self.raw(),
+            "p0",
+            constellation_store_s3::LeaseMode::Cas,
+        );
+        futures::executor::block_on(leases.get())
+            .ok()
+            .flatten()
+            .map(|(l, _)| l)
+    }
+
+    /// A put that took effect: a log segment goes to the archive index.
+    fn put_landed(&self, location: &Path, payload: &PutPayload) {
+        let name = location.as_ref();
+        if let Some(seq) = name
+            .strip_prefix("log/p0/")
+            .and_then(|n| n.strip_suffix(".zst"))
+            .and_then(|n| u64::from_str_radix(n, 16).ok())
+        {
+            let body: bytes::Bytes = payload.clone().into();
+            self.archive.note(seq, &body);
+        }
     }
 
     pub fn handle(self: &Arc<Self>, node: u64) -> Arc<dyn ObjectStore> {
@@ -314,15 +346,24 @@ impl ObjectStore for NodeStore {
     ) -> object_store::Result<PutResult> {
         let mode = opts.mode.clone();
         match self.admit(OpKind::Put, location).await? {
-            None => self.bucket.inner.put_opts(location, payload, opts).await,
+            None => {
+                let landed = payload.clone();
+                let r = self.bucket.inner.put_opts(location, payload, opts).await?;
+                self.bucket.put_landed(location, &landed);
+                Ok(r)
+            }
             Some(Fault::Status(status)) => Err(s3_error(location.as_ref(), status, &mode)),
             Some(Fault::Timeout) => Err(timeout_error()),
             Some(Fault::AppliedThen(status)) => {
+                let landed = payload.clone();
                 self.bucket.inner.put_opts(location, payload, opts).await?;
+                self.bucket.put_landed(location, &landed);
                 Err(s3_error(location.as_ref(), status, &mode))
             }
             Some(Fault::AppliedThenTimeout) => {
+                let landed = payload.clone();
                 self.bucket.inner.put_opts(location, payload, opts).await?;
+                self.bucket.put_landed(location, &landed);
                 Err(timeout_error())
             }
         }

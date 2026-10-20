@@ -1335,3 +1335,30 @@ arm ([TESTING.md](../how-to-guides/development/TESTING.md)); PROGRESS, "Fix:
 logging never blocks a daemon thread (plan 44)";
 [plan 44](../plans/v1/done/44-non-blocking-log-writer.md). Supersedes plan 41
 §1's interim guidance.
+
+## ADR-33: Commit is the configured group's acknowledgement (Vertical Paxos over S3)
+
+**Status**: proposed (plan 43 C0 drafts the decision; each milestone amends
+it, and C1 adds the rejected options).
+
+**Decision**: an acknowledgement is given only for a **committed** row. A row
+is committed when every member of the group in force when it was journaled
+holds it (the root's holder and every backup the lease object lists; a
+delegate and each recorded backup, or the root's appended row when none is
+recorded), or when a log segment carrying it landed in S3 (the archive). The
+lease object and the root's log are the configuration master, and the S3 slot
+CAS is the second fence. A sequencer answers a client without its group only
+when it is **lone** (no peer within the RTT budget) and answers its own node's
+client: that answer is the one speculation the design keeps, counted, and the
+only one a deposition may roll back. A non-stealable authority (an offline
+designation, a continuation epoch's hold) acknowledges as final. A client is
+answered `EIO` only for a request that is settled (committed, or abandoned by
+the sequencer in force), and a committed row is re-shipped verbatim, under the
+identity it was committed with, never executed again by rid.
+
+**See**: [plan 43](../plans/v1/wip/43-commit-rule.md) §3-§5 (the terms, the
+invariants I1-I5 and the acknowledgement classes); the simulation's oracles
+that check them ([TESTING.md](../how-to-guides/development/TESTING.md),
+"Commit-rule oracles"); PROGRESS, "Plan 43 C0 — The commit point, named and
+checked". Amends nothing yet; C1-C5 amend ADR-2, ADR-14, ADR-18, ADR-19,
+ADR-21, ADR-22, ADR-23 and ADR-25 as plan 43 §6 lists.

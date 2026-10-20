@@ -60,7 +60,7 @@ fn print_cto(scenario: &str, who: &str, s: &serde_json::Value) {
     );
 }
 
-fn pct(sorted: &[Duration], p: f64) -> Duration {
+pub(super) fn pct(sorted: &[Duration], p: f64) -> Duration {
     if sorted.is_empty() {
         return Duration::ZERO;
     }

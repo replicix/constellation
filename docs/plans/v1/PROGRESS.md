@@ -53809,3 +53809,292 @@ On the box (`/tmp` on tmpfs), every job under `timeout --kill-after=30s`,
   `locks-writer-hold-unchecked`, `locks-writer-hold-delegated-unsettled`);
   fenced I/O and lost grants equal everywhere but `locks-stall-step` (+1)
   and `locks-stall-step-delegated` (-1).
+
+## Plan 43 C0 — The commit point, named and checked
+
+The first milestone of plan 43 ([the commit rule](wip/43-commit-rule.md)): no
+behaviour change, but the commit point of every acknowledgement gets a name
+(`AckClass`) and the simulation and the models get the oracles that check it,
+so that each later milestone starts from a table of what today's code does and
+ends with the same table at zero. The oracles read every node's store, the
+bucket's lease and its log at the instant an answer leaves the sequencer; the
+core carries no assert (it violates I1, I2, I4 and I5 by design today), and
+nothing in it uses the new type. The sim's `RebuildReplica`, which answered
+`ok: false` since plan 30 M5, now runs a real rebuild. One behaviour change is
+folded in by decision (plan 43 §11 Q20 (h)): a restarted or rebuilt replica
+fences superseded-epoch segments from its applied position, not from 0.
+
+### What landed
+
+| Item | State | Where |
+|---|---|---|
+| `AckClass` (`Archive`, `RootGroup`, `DelegGroup { gen }`, `NonStealable`, `Lone`) | done; a pure type, unused by the core | `crates/authority/src/core/backup.rs`, re-exported as `core::AckClass` |
+| The oracles' plumbing: `Oracles` (store registry, archive index over the bucket's log as segments land, `AckLog`, `IdentityLedger`, `InvokeLog`), carried in `NodeEnv` | done | `tests/sim/oracle.rs`, `tests/sim/store.rs` (`Bucket::archive`, `peek_lease`), `tests/sim/node.rs` |
+| I1 `acked_implies_committed`, judged at the answering sequencer's emission (a `MutateReply` send or a node's own client reply; a requester passing an answer on is a relay, not judged), classifying by what the other stores hold, independently of the core | done; `strict_commit` | `committed_at_answer`, `Driver::note_answer` |
+| I2 `one_identity_per_op`: (b) no rid queued for execution on two nodes (after every event); (c) verbatim (end of run: the log completed an OK answered under a group class under its committed identity and records) | done; `strict_identity` | `IdentityLedger`, `end_of_run`, `check::Oracle::unfenced` |
+| I4 `unacked_fails_never_lands_late` | done; `strict_settle` | `check::no_late_landing`, `InvokeLog` |
+| I5 `speculation_only_lone` | done; counted always, `strict_lone` (D2: C1 turns it on in `strict_durability`) | `oracle::end_of_run` |
+| Config variants `+commit`, `+identity`, `+settle`, `+lone`, `+oracles`, `+rebuild-stub`; `SWEEP-ORACLES`, `SWEEP-ORACLE-TOTALS`, `SWEEP-REBUILD`, `AUTHORITY_SIM_FINGERPRINT` (`SWEEP-FP`), `AUTHORITY_SIM_ORACLE_DEBUG`; sweep and replay names `far`, `acks3`, `backup-departs`, `backup-partition`, `backup-two` | done | `tests/sim.rs` |
+| `backup-two` (`CONSTELLATION_BACKUPS=2`, C6's baseline) | done | `backup_two_config`, `backup_two_config_runs` |
+| The sim's rebuild: a side `Meta` from the log through the node's faulted store handle, epoch fencing, `Meta::replace_ns_from_rebuilt` (the stub is `rebuild_stub`, the negative control) | done | `Driver::spawn_rebuild`, `c0_the_real_rebuild_recovers_a_deposed_root` |
+| Fail-before tests, positive controls, a planted violation (`plant_ungated_fast_path`) | done | `tests/sim.rs`, "Plan 43 C0" |
+| Models: `acked_never_rolled_back` + `commit_rule` (`backup.rs`), `acked_ops_are_never_replayed` (`delegation.rs`), `hold_owner_never_deposed_except_by_retire` (`flex.rs`), `eio_never_lands_late` + `deadlines`/`abandon` (`protocol.rs`) with the tests `today_a_deposed_holder_replays_committed_rows`, `today_a_delegate_without_a_backup_acks_alone`, `today_an_in_doubt_op_lands_after_its_eio` (violate) and `full_rule_is_clean` (clean; Q3's property) | done | `crates/model` |
+| `ack-latency` (measure-only harness scenario, `CAMPAIGN`) and `bench/commit-rule/run.sh`, `RESULTS.md` skeleton | done; the four-file-system baseline is a separate measurement job (D4) | `crates/harness/src/scenarios/commit.rs`, `bench/commit-rule/` |
+| Q20 (h): `ship.max_epoch` seeded from the replica's applied position (`Replica::applied_epoch`, the epoch of `KV_APPLIED_POS`) at `Core::start` and after either rebuild; `shipper::replay_from` (every bootstrap and rebuild) skips a superseded-epoch segment and records the applied position | done | `core/mod.rs`, `core/jobs.rs`, `replica.rs`, `engine/src/shipper.rs`; `a_restarted_core_fences_from_the_replicas_applied_epoch`, `replay_fences_a_superseded_epoch_and_records_the_position` (both fail before: floor 0, segment applied) |
+| Docs: DESIGN §4's vocabulary paragraph, TESTING.md ("Commit-rule oracles", `ack-latency`), ADR-33 (proposed), the plan's ADR references (32 is plan 44's) | done | `docs/` |
+
+### Deviations from the plan text (decided in the coder spec)
+
+- **D1, the operator escape is deferred to C1** (`FaultKind::Operator(AbandonGroup)`,
+  `SimConfig::abandon_after_ms`, the run classification `waiting_for_group`): its
+  control path (`constellation repair abandon-group`, §5.8) and the wait it escapes
+  (Q1's strict claim) both land in C1; at C0 nothing waits for a group, so the fault
+  and the classification could only be vacuous.
+- **D2, I5 counts, and fails only under `strict_lone`** (C1 turns it on in the
+  `strict_durability` configs): `backup_no_acked_op_lost` reports transient rollbacks
+  today, and C0's exit is that every existing test stays green.
+- **D3, the ADR is ADR-33** (ADR-32 is plan 44's logging decision); the plan's references
+  are fixed.
+- **D4, the baselines on four file systems are a separate measurement job** before C1
+  (a quiet host, mounts of xfs and btrfs, hours); C0 carries the scenario, the script
+  and a `RESULTS.md` skeleton and one smoke run.
+- **D5, the sim re-implements the engine's rebuild** (the engine is not a dependency of
+  `authority`): a side `Meta` from the log with epoch fencing, then the production
+  `replace_ns_from_rebuilt`; see "Found, not fixed here" for what that showed.
+- **D6, refusals that journal no `Refused`** (a frozen epoch's `EROFS`, a `Conflict`, a
+  `LockLapsed`: nothing executed, the client retries the same rid) are counted per code
+  in `unjournaled_refusals` and are not an I1 violation at C0. Whether I1 must cover them
+  is a C2 question (`Abandon` and settling).
+- **D7, no production asserts.**
+- **The Lone class waits for the link's stability window.** The spec's Lone check is "no
+  live node linked within the RTT budget". The core selects a backup candidate only from
+  a link that has been up for `backup_stable_ms`; for that window a fresh node acknowledges
+  under `Local` though a peer is physically near. The oracle counts a peer only once its
+  link (as the node's directory reports it) has been up that long, so the first 200 ms of
+  a node's life are not a Lone violation. A *remote* node's forward answered in that
+  window (or after a takeover, before the new holder has a backup) is still uncommitted
+  (class `archive`, the plan's C2 rule) and is the whole of what `backup` reports; see the
+  baseline.
+
+### Unchanged on purpose
+
+The core (the production additions are the `AckClass` type, which nothing uses, and Q20 (h)'s fencing floor), the
+wire, the records, every existing assertion of every existing test, the strict flags'
+defaults (all off), and the requester-side behaviour of every sim configuration except the
+ones that run a rebuild (the rebuild only runs where the deposed node's journal rows were
+uncaptured).
+
+### Deferred to C1
+
+The operator escape in the sim (`Operator(AbandonGroup)`, `abandon_after_ms`, `waiting_for_group`; D1);
+`strict_lone` in the `strict_durability` configs (D2); the strict flags on any config.
+
+### Found, not fixed here
+
+- **`shipper::replay_from` applied no epoch fencing** (`crates/engine/src/shipper.rs`; used by `bootstrap`
+  and `rebuild_replica`), while the core's tail and the sim's log oracle skip a superseded-epoch segment, and the
+  core restarted its own fencing floor at 0. Not a live bug (the log-slot CAS and deposition-on-apply keep such a
+  segment out of the log), an inconsistency between readers: fixed here by Q20 (h).
+- **`on_rebuild_done`'s `Recover` arm did not adopt the rebuilt applied sequence**: fixed on main by `1e107f0`
+  (before this patch was rebased onto it). It is not what failed seeds 403 and 900 (below).
+- **`delegated-backup` does not give the plan's I1 fail-before.** Plan 43 §C0 expects
+  `long-delegated` *and* `delegated-backup` to report uncommitted `DelegGroup` answers ("a
+  delegate with no backup acks alone"). `long-delegated` does (3043 `deleg-group/ok` in 200
+  seeds: no peer in budget, so a delegate answers another node's forward alone). `delegated-backup`
+  does not: ×2000 reports 0 uncommitted `DelegGroup` answers (13 `archive/ok`, a lone root's answers to
+  other nodes), because every delegate there has a backup and acknowledges only after it holds the row
+  (59160 answers classed `deleg-group`, each checked against the backup's delegate tail or the root's
+  appended row). The oracle was checked against hand-built stores (`i1_deleg_group_needs_the_root_append_when_no_backup`)
+  and finds the backup-less case where it exists; the config simply has no such window. The pinned test
+  uses `long-delegated`.
+- **The pinned `delegated-holder-cut` seeds (330, 772, 1039, 1719) report no I2 (b) copy today** (they
+  pin other bugs, since fixed); I2 (b) is found on `delegated-holder-cut` 0..300 (119 copies in 62
+  seeds; pinned: 0, 4, 22) and `backup-crash` (46 in 25 seeds; pinned: 815, 858, 889, 892).
+- **Fresh tenures answer other nodes' forwards before they have a backup.** Every `archive/…` count under
+  `backup`, `backup-crash`, `long-backup`, … is a holder in its first moments (a mount's first 200 ms, or a
+  successor before its first backup is chosen) answering another node's forward under `Local`: no segment
+  landed, no backup listed. 154 of the 156 answers of `backup` 700..800 are in the first 400 ms of the run, the
+  other two follow a takeover (`AUTHORITY_SIM_ORACLE_DEBUG=1`). It is the plan's own "lone root, another
+  node's forward" row (C2's `Archive` rule) in a window the plan's table calls the bring-up rule; no
+  `root-group` answer is ever uncommitted (`c0_i1_finds_no_uncommitted_group_answer_under_backup`).
+- **`backup-two` shows no add-window violation** (C6's M4): ×2000 reports no uncommitted `root-group` answer
+  with two backups listed (`max-backups` = 2); nothing is pinned as `c0_backup_two_add_window_baseline`.
+- **Some rebuilds fail under the real rebuild** (`long-delegated-late-answers` 0..1000: 19 ok, 103 failed;
+  `long-delegated-backup` 0..500: 9 ok, 41 failed): the rebuild reads the log through the node's faulted
+  store handle, and a failure (an S3 error, or an error of the swap; a node that restarted meanwhile counts nothing) leaves the recovery to retry,
+  as production does. The causes were not examined seed by seed; every such seed passes every check.
+
+- **A candidate's tail discarded under the holder's listing CAS** (`long-backup` seed 892, the one `root-group`
+  answer of ×1000 no group held; same at `e5e7c20`). Traced: holder 3 brings node 1 up as a candidate (t=8200) and
+  counts its acknowledgements; node 1, resuming from a stall with its old backup role and holder 3's lease past the
+  expiry it knew, reads the lease before the CAS listing it lands, finds itself unlisted and discards its tail
+  (t=8394, "no longer a listed backup"; that branch deliberately does not seal, so the holder may invite it back);
+  node 3 executes node 1's forward (t=8364, journal row 78, `Refused ENOENT`), parks the reply for durability, and
+  at t=8439 the CAS listing `[1]` lands: `durable_jseq` is now `peers[1].acked`, counted before the discard, and the
+  reply leaves while backup 1's tail lacks the row. An `OK` takes the same path. A holder crash there loses an
+  acknowledged row: a durability hole of today's protocol (M9), not an oracle artifact. Classified for **C1** (the
+  root group's commit; recorded in the plan's C1 fail-before list with seed 892 under `+commit`), not fixed in C0.
+- **A rebuild drops the log's outcomes from `completed`** (review finding, separate patch): `Meta::replace_ns_from_rebuilt`
+  copies `ns`, orphans, atime and blobs from the side replica but not `completed`, although the side's tail filled it
+  from the log's `Completed`/`Refused` records; the strand that follows then drops a stranded transaction's own
+  `completed` row even when the log carries its rid, so this node's dedup misses it until a replay re-learns it. Not
+  shown to fail a sim seed (it is not what failed 403/900: carried over, both still fail at `5f3a0e8`); a meta test
+  fails before.
+
+### Evidence: the oracles find today's states (fail-before)
+
+Counting runs (flags off) of the C0 tree on the build host, debug build; each count is over the seeds named.
+`+commit`, `+identity`, `+settle`, `+lone` make the same seeds fail with the oracle's text; the pinned seeds are
+tests (`c0_*` in `tests/sim.rs`).
+
+| Oracle | Config, seeds | Finds | Pinned |
+|---|---|---|---|
+| I1 | `long-delegated` 0..200 | 4867 uncommitted answers expected `deleg-group` (3043 OK): a delegate with no backup answers another node's forward alone | 0, 1, 2 |
+| I1 | `far` 1000..1020 (`no_peer_in_budget_is_todays_behaviour`'s range, with its faults) and `far` 0..300 | uncommitted `archive` answers: a lone root answers other nodes' forwards (234 OK of 472 in 1000..1020; 7122 in 0..300) | 1000..1004 |
+| I1 | `delegated-backup` ×2000 | **0** `deleg-group` (every delegate has a backup; see "Found"); 13 `archive/ok` | none |
+| I1 | `backup-two` ×2000 | baseline only: 3163 uncommitted, all `archive` (fresh tenures); no `root-group` answer uncommitted, `max-backups` 2 | none |
+| I2 (b) | `backup-crash` 800..1400 | 46 copies in 25 seeds | 815, 858, 889, 892 |
+| I2 (b) | `delegated-holder-cut` 0..300 | 119 copies in 62 seeds (seeds 330, 772, 1039, 1719: none) | 0, 4, 22 |
+| I2 (c) | `backup-crash` 800..1400 | 2080 non-verbatim answers in 556 seeds | 800, 802, 803 |
+| I4 | `long-delegated-late-answers` 0..300 | 41 late landings in 32 seeds (`delegated-holder-cut` 9 in 9, `long-delegated` 1, `long-backup` 0 in 300) | 1, 6, 8 |
+| I5 | `backup` 700..1300 | 19 non-lone rollbacks in 12 seeds | 703, 746, 819, 931 |
+
+Positive controls: `ack-s3`/`acks3-crash` with `+commit` report nothing (`c0_i1_is_clean_where_every_answer_waits_for_the_archive`,
+940..960 and 900..915); `backup` 700..760 reports no `root-group` and no `deleg-group` answer uncommitted;
+one node reports zero of everything under `+oracles` (20 seeds); the F1 hold configurations (`locks-writer-hold`,
+`-delegated`, `locks-delegated`) pass (no deadlock between the oracle's reads and a held write; `-unchecked` is the
+non-vacuity knob and fails by design); `acks_unmapped` is 0 in every sweep. A planted violation
+(`plant_ungated_fast_path` on `backup` with the sim's fast path on) gives uncommitted `root-group/ok` answers and fails
+`+commit` (`c0_i1_catches_a_planted_ungated_fast_path`).
+
+The sim's rebuild: `long-delegated-late-answers` seeds 9287 and 2945 still fire `RebuildReplica`; with the real
+rebuild each runs 1 rebuild (0 failed) and passes every check; with `+rebuild-stub` the deposed root's recovery fails 147
+and 67 times (`c0_the_real_rebuild_recovers_a_deposed_root`).
+
+The models: `today_a_deposed_holder_replays_committed_rows`, `today_a_delegate_without_a_backup_acks_alone` and
+`today_an_in_doubt_op_lands_after_its_eio` find their counterexamples (the first and the last with a hand-built path
+checked by `assert_discovery`); `hold_owner_never_deposed_except_by_retire` finds **no** counterexample in
+`full_rule_is_clean` (Q3's decision stands; the model has no retire action and every epoch carries a lease, so both
+exemptions are vacuous) and is reachable without the claim rule
+(`an_unguarded_seal_takeover_deposes_the_hold_owner`). The new properties are registered only where a test turns
+them on (`check_hold_owner`, `check_acked_replay`, `deadlines`), because a search that stops at the first failed
+property would otherwise end on them in the existing counterexample tests.
+
+### No behaviour change: the identity sweep
+
+`AUTHORITY_SIM_FINGERPRINT=1`, all strict flags off, the base (`5f3a0e8` plus only the fingerprint printing) against the C0
+tree, per seed: `backup` 700..1000, `backup-crash` 800..1100, `delegated-holder-cut` 0..300, `long-delegated` 0..200,
+`long-delegated-late-answers` 0..200, `locks` 0..300, `flex-crash` 0..200, `long-backup` 0..200 (2000 seeds): **every
+fingerprint equal except the six seeds where the real rebuild fired** (`long-delegated-late-answers` 20, 44, 78, 110,
+181, 191; they pass). Wall time of the sweeps, base against C0 (the host was shared, load average 17–28 meanwhile):
+`backup` 16.5 s / 17.5 s, `backup-crash` 19.9 / 21.4, `delegated-holder-cut` 778 / 865, `long-delegated` 29.2 / 33.4,
+`long-delegated-late-answers` 241 / 277, `locks` 15.3 / 17.2, `flex-crash` 20.0 / 22.3, `long-backup` 16.9 / 19.2:
++6 % to +15 % (the spec's bound is +15 % for `long-delegated`: +14 %).
+
+### The baseline (plan 43 §15)
+
+Every oracle per configuration, flags off, the C0 tree, debug build, 4 threads. "I1 uncommitted" is the number of
+non-relay answers no class covered, by the class the core's state expected (§5.1). `I2 copies`, `I2c`, `I4`, `I5`
+are counts, with the number of seeds that had any. The last column is the number of seeds that failed an existing
+check. Seed counts are the plan's, except `long-delegated-late-answers` and `delegated-holder-cut` (×1000, not ×2000)
+and `far` (0..300; 1000..1020 in "Evidence"); the four-file-system and existing-gate baselines (D4) are not in this
+table.
+
+| Config | Seeds | I1 uncommitted (by expected class) | I2 copies | I2c non-verbatim | I4 late landings | I5 non-lone rollbacks | unjournaled refusals | rebuilds ok/failed | failing |
+|---|---|---|---|---|---|---|---|---|---|
+| `backup` | 700..1300 | 913 (archive 913) | 0 (in 0 seeds) | 8 (in 6) | 0 (in 0) | 19 (in 12) | 0 | 0/0 | 0 |
+| `backup-crash` | 800..1400 | 1003 (archive 1003) | 46 (in 25 seeds) | 2080 (in 556) | 0 (in 0) | 2145 (in 563) | 0 | 0/0 | 0 |
+| `acks3-crash` | 900..1100 | 0 (0) | 1 (in 1 seeds) | 0 (in 0) | 0 (in 0) | 300 (in 164) | 0 | 0/0 | 0 |
+| `backup-strict` | 0..300 | 528 (archive 528) | 184 (in 72 seeds) | 1042 (in 269) | 0 (in 0) | 1081 (in 276) | 0 | 0/0 | 0 |
+| `backup-hot` | 0..300 | 813 (archive 813) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 0 (in 0) | 0 | 0/0 | 0 |
+| `placement-hot` | 0..300 | 127 (archive 127) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 0 (in 0) | 0 | 0/0 | 0 |
+| `long-backup` | 0..1000 | 1967 (archive 1966, root-group 1) | 8 (in 8 seeds) | 93 (in 22) | 0 (in 0) | 160 (in 61) | 0 | 0/0 | 0 |
+| `long-acks3` | 0..300 | 0 (0) | 6 (in 5 seeds) | 0 (in 0) | 0 (in 0) | 31 (in 24) | 0 | 0/0 | 0 |
+| `far` | 0..300 | 7122 (archive 7122) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 0 (in 0) | 0 | 0/0 | 0 |
+| `delegated-backup` | 0..2000 | 13 (archive 13) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 1 (in 1) | 0 | 0/0 | 0 |
+| `long-delegated` | 0..2000 | 83193 (archive 34125, deleg-group 49068) | 27 (in 23 seeds) | 0 (in 0) | 2 (in 2) | 396 (in 301) | 0 | 0/0 | 0 |
+| `long-delegated-backup` | 0..500 | 448 (archive 54, deleg-group 394) | 21 (in 12 seeds) | 149 (in 69) | 12 (in 11) | 83 (in 52) | 6 | 9/41 | 0 |
+| `long-delegated-late-answers` | 0..1000 | 2162 (archive 156, deleg-group 2006) | 41 (in 27 seeds) | 533 (in 176) | 126 (in 101) | 916 (in 601) | 6 | 19/103 | 2 |
+| `delegated-holder-cut` | 0..1000 | 151 (archive 7, deleg-group 144) | 385 (in 191 seeds) | 2814 (in 917) | 35 (in 35) | 3757 (in 969) | 1 | 0/0 | 0 |
+| `delegated-two-gens-root-crash` | 0..500 | 32082 (archive 10269, deleg-group 21813) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 17 (in 16) | 0 | 0/0 | 0 |
+| `flex` | 0..500 | 12501 (archive 12501) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 0 (in 0) | 0 | 0/0 | 0 |
+| `flex-crash` | 0..500 | 13383 (archive 13383) | 336 (in 214 seeds) | 0 (in 0) | 1 (in 1) | 1191 (in 267) | 461 | 0/0 | 0 |
+| `locks` | 0..300 | 7200 (archive 7200) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 0 (in 0) | 0 | 0/0 | 0 |
+| `locks-delegated` | 0..300 | 7911 (archive 1163, deleg-group 6748) | 0 (in 0 seeds) | 0 (in 0) | 0 (in 0) | 3 (in 3) | 0 | 0/0 | 0 |
+| `backup-two` | 0..2000 | 3163 (archive 3163) | 1 (in 1 seeds) | 55 (in 17) | 0 (in 0) | 96 (in 42) | 0 | 0/0 | 0 |
+
+Footnotes. `acks3-crash` and `long-acks3` (`ack=s3`) report no uncommitted answer, as expected; their I2 and I5
+counts are the dead holder's stale journal copy of a row that had landed in S3, rolled back at its restart (its replay
+dedups). Every `archive` count under `backup*`, `far` and `flex*` is a lone root's (or a fresh tenure's) answer to
+another node's forward. `long-backup` ×1000 has **one uncommitted `root-group` answer** (seed 892: the holder, with
+backup 1 listed, answered node 1's forward refused `ENOENT` at t=8439 ms while backup 1's tail lacked the refusal's
+row): see "Found". `unjournaled refusals` are D6's. `rebuilds` are the real rebuild's.
+
+### The real rebuild and `long-delegated-late-answers` seeds 403 and 900
+
+On `5f3a0e8` + C0 the real rebuild failed seeds 403 (linearizability: rid `(3,1,19)` `Unlink("d2/f1")` took
+effect where the spec refuses it) and 900 (node 2 saw `d1/m3-1-marker` without `d2/m3-1-data`); the base and
+`+rebuild-stub` passed them (spec §5.3: reported, not worked around). Bisected at review:
+
+| Tree | 403 | 900 |
+|---|---|---|
+| `5f3a0e8` + C0 | fails | fails |
+| + `1e107f0` (the rebuild moves the cursor) | fails | fails |
+| + `1e107f0` + `97e806b` (lock follow-ups: re-delegation renewal, takeover grace, late reply tick) | passes | passes |
+| `e5e7c20` + C0 (this patch) | passes | passes |
+
+Neither is the cursor bug, and nothing in `97e806b` touches the rebuild or the replay: it changes the schedule. The
+traces show the mechanism: the deposed root (node 1) finishes its recovery only because the rebuild now succeeds
+(with the stub it retries for ever), queues the ops of its uncaptured journal for replay by rid (5 in 900, 8 in
+403), and the replays run seconds later, after the clients' next ops landed; in 900 the data's create is replayed by
+rid at t=11 272 after the marker was accepted at t=10 493. That is the replay-by-rid of a deposed root's rows that
+plan 43 C2/C3 remove (recorded in the plan's C3 fail-before list), exposed by the production recovery path the stub
+never let finish, not a defect of the rebuild. At `e5e7c20` + C0, `long-delegated-late-answers` 0..1000 with the
+real rebuild has no failing seed (24 rebuilds ok, 112 failed and retried); see Gates.
+
+### Gates
+
+2026-10-20, kernel 7.3.0-rc4 (Fedora 46), rustc 1.98.1, the build host's `/home` on btrfs and its test temp dir on tmpfs.
+
+- `cargo fmt --all --check`: clean. `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --no-fail-fast` (debug): everything passes except
+  `constellation-platform`'s `linux::tests::own_flock_is_found_in_proc_locks_in_the_build_tree`, which fails once under the
+  parallel load of the workspace run and passes alone (3 of 3; the crate is untouched). The authority sim target
+  (all existing tests, the CI shards' 1000 seeds, and the 14 new `c0_*`/`backup_two_*` tests) and the model
+  crate (debug) pass.
+- `cargo test -p constellation-model --release`: green (the new tests included).
+- The identity sweep and the baseline above (both on `5f3a0e8` + C0, before Q20 (h)); `ack-latency`'s smoke below.
+
+After the rebase onto `e5e7c20` and Q20 (h) (same host, debug, `-j 4`):
+
+- fmt and clippy `-D warnings` clean; `constellation-authority --lib` 515 passed (Q20 (h)'s core test included); the
+  engine's shipper, rebuild, deposition and retention tests 19 passed (Q20 (h)'s replay test included); both new
+  tests fail with the code reverted.
+  `cargo test --workspace --exclude constellation-model --exclude constellation-authority --no-fail-fast`: 2641
+  passed, 0 failed (the model crate is untouched by the rebase and Q20 (h)).
+- The sim target: 203 passed, 0 failed (every `c0_*` test's pinned seeds hold after the rebase).
+- `long-delegated-late-answers` 0..1000 with the real rebuild: no failing seed; rebuilds 21 ok, 112 failed and
+  retried, in 23 seeds; oracle totals as in the baseline (i1 2154, i4 119 in 96 seeds, i5 931).
+- Q20 (h) against the rebased tree without it (`AUTHORITY_SIM_FINGERPRINT=1`): `backup-crash` 800..1400,
+  `flex-crash` 0..300, `long-backup` 0..300, `acks3-crash` 900..1100, `delegated-holder-cut` 0..150, `backup-strict`
+  0..300 (1850 seeds): no failing seed on either tree; the fingerprint differs in 5 seeds (`backup-crash` 899,
+  `flex-crash` 6, `long-backup` 167, 198, 261), all restarts that now fence from their applied epoch.
+- `long-backup` seed 892's uncommitted `root-group` answer is unchanged (C1's, see "Found").
+
+`ack-latency` smoke (release build, one run of `harness run ack-latency`, `CONSTELLATION_HARNESS_DOCKER_PREFIX` private,
+300 samples, 551 s, topologies 1, 2, 3, 4 and 6; topology 5 needs `CONSTELLATION_HARNESS_LOAD=net-wan` and `sudo tc`
+and was not run): 39 rows, for example (p50 / p90, microseconds) `2-backup` holder create 490 / 800, forwarded create
+1246 / 2490, forwarded `flock` 916 / 1233; `3-delegated` delegate create 89 / 394 (no delegate backup), forward create
+~2160 / 2900; `4-delegated-backup` delegate create 770 / 1354; `6-ack-s3` holder rename 201789 / 202513 (an S3 round
+trip), forwarded `flock` ~760 / 1690. (Placement is off in every topology with a second node, or the dominant
+writer is handed the directory and its ops stop being forwards: the first smoke showed 2-backup's forwarded
+rename at 81 us.)
+
+### Pending after this patch (not done here)
+
+- The four-file-system baseline of `ack-latency` and the existing gates' baselines (§9: `make perf-gate`,
+  `vfs-bench`, `meta-bench`, `lock-latency`, `nonowner-op-latency`, `delegated-op-latency`, `cto-latency`,
+  `backup-failover`'s failover time, `make perf-regression`): a measurement job on a quiet host with the
+  file systems mounted, before C1 (D4); `bench/commit-rule/RESULTS.md` is a skeleton.
+- The fable review of C0.
+- C1 turns `strict_lone` on in the `strict_durability` configs and carries D1 (the operator escape).

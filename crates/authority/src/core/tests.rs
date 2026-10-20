@@ -1989,6 +1989,39 @@ fn a_deposition_rebuild_moves_the_cursor_to_the_rebuilt_position() {
     assert!(h.core.ship.head_seq >= 3);
 }
 
+/// Plan 43 §11 Q20 (h): a restarted core fences from its replica's
+/// applied position, not from 0. The earlier incarnation applied an
+/// epoch-3 segment; a deposed epoch-2 holder's segment behind it is
+/// skipped after the restart exactly as it would have been before
+/// (before: `max_epoch` restarted at 0 and the segment was applied).
+#[test]
+fn a_restarted_core_fences_from_the_replicas_applied_epoch() {
+    let mut h = Harness::new(1);
+    let now = h.clk();
+    let theirs = crate::segment::encode(2, 3, 5, &[], &[], &[]).unwrap();
+    h.core
+        .apply_incoming(now, 1, &theirs, &h.meta, &mut Vec::new())
+        .unwrap();
+    assert_eq!(h.core.ship().max_epoch, 3);
+    assert_eq!(Replica::applied_epoch(&h.meta), 3);
+    // The restart.
+    h.core = Core::new(h.core.cfg.clone());
+    h.core.start(now, &h.meta, &mut Vec::new());
+    assert_eq!(h.core.ship().next_seq, 2);
+    assert_eq!(
+        h.core.ship().max_epoch,
+        3,
+        "the fencing floor is the replica's applied epoch"
+    );
+    let late = crate::segment::encode(3, 2, 9, &[], &[], &[]).unwrap();
+    h.core
+        .apply_incoming(now, 2, &late, &h.meta, &mut Vec::new())
+        .unwrap();
+    assert_eq!(h.core.stats.fenced, 1, "the superseded segment is skipped");
+    assert_eq!(h.meta.applied_seq().unwrap(), 2);
+    assert_eq!(Replica::applied_epoch(&h.meta), 3);
+}
+
 #[test]
 fn overlapping_forwards_from_one_node_are_issued_in_order() {
     let mut h = Harness::new(1);

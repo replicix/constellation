@@ -32,6 +32,10 @@ pub struct Oracle {
     pub completed_at: HashMap<Rid, (u64, usize)>,
     pub segments: usize,
     pub fenced: usize,
+    /// Plan 43 C0: the applied (unfenced) segments, by seq: where each
+    /// rid's completion is (I2c's verbatim check reads its epoch, node,
+    /// rows, origins and records).
+    pub unfenced: BTreeMap<Seq, Arc<constellation_authority::segment::Segment>>,
     /// One line per segment, for failure reports.
     pub describe: Vec<String>,
 }
@@ -49,6 +53,7 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
     let mut fenced = 0;
     let mut head = 0;
     let mut describe = Vec::new();
+    let mut unfenced = BTreeMap::new();
     let mut expected = seqs.first().copied().unwrap_or(1);
     if snapshots_at.contains(&0) {
         at.insert(0, meta.ns_dump().expect("dump"));
@@ -117,6 +122,7 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
             )
             .expect("apply");
             max_epoch = max_epoch.max(seg.epoch);
+            unfenced.insert(*seq, Arc::new(seg));
         }
         head = *seq;
         if snapshots_at.contains(seq) {
@@ -131,6 +137,7 @@ pub async fn replay_log(raw: Arc<dyn ObjectStore>, snapshots_at: &BTreeSet<Seq>)
         completed_at,
         segments: seqs.len(),
         fenced,
+        unfenced,
         describe,
     }
 }
@@ -300,8 +307,11 @@ pub fn check_exactly_once(
 /// whose requester took the lease over, used to wait out its deadline
 /// for a log that already carried it — or carried it through the
 /// successor's own ship — and answer in doubt.)
-pub fn check_in_doubt_answers(answers: &[(u64, Rid, Seq)], oracle: &Oracle) -> Result<(), String> {
-    for (node, rid, applied) in answers {
+pub fn check_in_doubt_answers(
+    answers: &[(u64, Rid, Seq, u64)],
+    oracle: &Oracle,
+) -> Result<(), String> {
+    for (node, rid, applied, _) in answers {
         if let Some((seq, _)) = oracle.completed_at.get(rid) {
             if *seq <= *applied {
                 return Err(format!(
@@ -313,4 +323,49 @@ pub fn check_in_doubt_answers(answers: &[(u64, Rid, Seq)], oracle: &Oracle) -> R
         }
     }
     Ok(())
+}
+
+/// Plan 43 I4 `unacked_fails_never_lands_late`: a client told `EIO` (the
+/// first in-doubt answer for the rid) for an op that then lands in the log
+/// after an op its node invoked later — "failed" turned out to mean "not
+/// yet". Returns the number of distinct rids that landed late and a
+/// description of each.
+///
+/// The sim's client resubmits an in-doubt rid up to `MAX_RESUBMITS` times;
+/// production answers `EIO` at once and the application moves on. The
+/// first `InDoubt` answer is the one the application sees, so it is the
+/// one judged.
+pub fn no_late_landing(
+    in_doubt: &[(u64, Rid, Seq, u64)],
+    invokes: &[(Rid, u64)],
+    oracle: &Oracle,
+) -> (usize, Vec<String>) {
+    // The first in-doubt answer of each rid.
+    let mut first: BTreeMap<Rid, (u64, u64)> = BTreeMap::new();
+    for (node, rid, _, tick) in in_doubt {
+        let e = first.entry(*rid).or_insert((*node, *tick));
+        if *tick < e.1 {
+            *e = (*node, *tick);
+        }
+    }
+    let mut late = Vec::new();
+    for (r, (n, t)) in &first {
+        let Some(p) = oracle.completed_at.get(r) else {
+            continue;
+        };
+        let after = invokes
+            .iter()
+            .filter(|(r2, t2)| r2.node == *n && r2 != r && *t2 > *t)
+            .find_map(|(r2, t2)| {
+                let p2 = oracle.completed_at.get(r2)?;
+                (p2 < p).then_some((*r2, *t2, *p2))
+            });
+        if let Some((r2, t2, p2)) = after {
+            late.push(format!(
+                "I4 unacked_fails_never_lands_late: rid {r:?} answered in doubt on node {n} at tick {t} \
+                 completed at {p:?}, after rid {r2:?} invoked at tick {t2} and completed at {p2:?}"
+            ));
+        }
+    }
+    (late.len(), late)
 }

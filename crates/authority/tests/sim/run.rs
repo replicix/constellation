@@ -446,6 +446,29 @@ pub struct SimConfig {
     /// `deleg_lane_loop`). `false` is the code before it, the non-vacuity
     /// knob of the core-stall configurations.
     pub deleg_lane: bool,
+    /// Plan 43 C0, I1 `acked_implies_committed`: an answer that no class
+    /// of the plan's §4 covers (judged at its emission, `oracle.rs`) fails
+    /// the run. Always counted (`Report::uncommitted_acks`); the flag only
+    /// decides failure. Default off until C2 makes it hold everywhere.
+    pub strict_commit: bool,
+    /// I2 `one_identity_per_op`: a rid queued for execution on two nodes at
+    /// once (b), or answered under a group class yet not completed
+    /// verbatim in the log (c), fails the run.
+    pub strict_identity: bool,
+    /// I4 `unacked_fails_never_lands_late`: an op answered in doubt that
+    /// lands in the log after an op its node invoked later fails the run.
+    pub strict_settle: bool,
+    /// I5 `speculation_only_lone`: an answered op rolled back whose answer
+    /// was not of class Lone fails the run (`strict_durability` turns it
+    /// on from C1).
+    pub strict_lone: bool,
+    /// Negative control: the stub that answered every `RebuildReplica`
+    /// with `ok: false` (the sim's rebuild before plan 43 C0).
+    pub rebuild_stub: bool,
+    /// Test-only (`c0_i1_catches_a_planted_ungated_fast_path`): the sim's
+    /// fast path ignores `Core::ack_gated`, so a holder answers its own op
+    /// from its local disk while a backup is committed.
+    pub plant_ungated_fast_path: bool,
 }
 
 /// See `SimConfig::fast_path`.
@@ -682,6 +705,12 @@ impl Default for SimConfig {
             beats_lost_in_lag: false,
             keeps_backups: false,
             deleg_lane: true,
+            strict_commit: false,
+            strict_identity: false,
+            strict_settle: false,
+            strict_lone: false,
+            rebuild_stub: false,
+            plant_ungated_fast_path: false,
         }
     }
 }
@@ -783,6 +812,33 @@ pub struct Report {
     /// those `Action::UploadAwaited` put up past the hold.
     pub held_back: u64,
     pub awaited_uploaded: u64,
+    /// Plan 43 C0: the commit-rule oracles' counters (`oracle.rs`); each is
+    /// always counted, and fails the run only under its strict flag.
+    ///
+    /// I1: non-relay answers by the class that held at their emission
+    /// (`"none"`: none did), the answers no class covered by
+    /// `"{expected class}/{answer}"`, and refusals that journaled no
+    /// `Refused` by code (D6: nothing executed, so not an I1 violation).
+    pub acks_by_class: BTreeMap<String, usize>,
+    pub uncommitted_acks: BTreeMap<String, usize>,
+    pub unjournaled_refusals: BTreeMap<String, usize>,
+    /// Answers with no recorded request (must be 0).
+    pub acks_unmapped: usize,
+    /// I2 (b): rids queued on two nodes at once; (c): answered under a
+    /// group class but not completed verbatim in the log.
+    pub identity_copies: usize,
+    pub non_verbatim: usize,
+    /// I4: in-doubt rids that landed after an op invoked later.
+    pub late_landings: usize,
+    /// I5: acknowledged, rolled-back ops whose answer was not Lone.
+    pub non_lone_rollbacks: usize,
+    /// Deposition rebuilds run, `(succeeded, failed)`, over every
+    /// incarnation of every node.
+    pub rebuilds: (u64, u64),
+    /// The most backups any node's lease listed at once.
+    pub max_backups: usize,
+    /// The first five violations of each oracle.
+    pub oracle_examples: Vec<String>,
 }
 
 pub struct Cluster {
@@ -964,7 +1020,22 @@ impl Cluster {
                 )
             })
             .unwrap_or_default();
+        let rebuilds = self.nodes.lock().unwrap().get(&id).map(|old| {
+            (
+                old.shared
+                    .rebuilds_ok
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                old.shared
+                    .rebuilds_failed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
         let handle = NodeHandle::start_with(&self.env, id, meta, epoch);
+        if let Some((ok, failed)) = rebuilds {
+            let ord = std::sync::atomic::Ordering::Relaxed;
+            handle.shared.rebuilds_ok.store(ok, ord);
+            handle.shared.rebuilds_failed.store(failed, ord);
+        }
         handle.shared.tentative.lock().unwrap().extend(tentative);
         *handle.shared.floor_ms.lock().unwrap() = floors;
         // (Kept only with the journal: a fresh replica has none to drop.)
@@ -977,6 +1048,9 @@ impl Cluster {
     pub fn crash(&self, id: NodeId) -> Arc<Meta> {
         let node = self.get(id);
         node.crash(&self.env.bus);
+        // Plan 43 C0: the process's executing set dies with it; its
+        // persisted replay queue runs again at restart.
+        self.env.oracles.identity.lock().unwrap().crash(id);
         // Plan 30 §M14: the process's lock state dies with it.
         self.locks.drop_node(id, self.env.clock.elapsed_ms());
         super::locks::reset_node(&node.meta, &self.locks.inos(), node.clock.now());
@@ -2482,6 +2556,7 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
     bus.set_deleg_answer_delay(cfg.deleg_answer_delay);
     let commits: Arc<Mutex<Vec<CommitRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let in_doubt: super::node::InDoubtLog = Arc::new(Mutex::new(Vec::new()));
+    let oracles = super::oracle::Oracles::new(bucket.clone());
     let env = NodeEnv {
         bucket: bucket.clone(),
         bus: bus.clone(),
@@ -2503,6 +2578,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         beats_credited: cfg.beats_credited,
         beats_lost_in_lag: cfg.beats_lost_in_lag,
         deleg_lane: cfg.deleg_lane,
+        oracles: oracles.clone(),
+        rebuild_stub: cfg.rebuild_stub,
+        plant_ungated_fast_path: cfg.plant_ungated_fast_path,
     };
     env.world
         .hold_ms
@@ -3069,6 +3147,9 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
         let ls = n.meta.locks().stats();
         report.token_rejections_at_write += ls.token_rejections_at_write;
         report.settle_waits += ls.settle_waits;
+        report.max_backups = report.max_backups.max(load(&n.shared.max_backups) as usize);
+        report.rebuilds.0 += load(&n.shared.rebuilds_ok);
+        report.rebuilds.1 += load(&n.shared.rebuilds_failed);
     }
     report.acked_rolled_back = rolled_back_acked;
     if cfg.keeps_backups {
@@ -3474,6 +3555,56 @@ async fn run_inner(seed: u64, cfg: SimConfig) -> Result<Report, String> {
             report.faults, oracle.describe, report.stats
         )
     })?;
+    // Plan 43 C0: the commit-rule oracles. Always counted; each fails the
+    // run only under its strict flag (the counters of a violating seed are
+    // in the report's failure text).
+    let in_doubt_answers = in_doubt.lock().unwrap().clone();
+    let found = super::oracle::end_of_run(
+        &oracles,
+        &oracle,
+        &in_doubt_answers,
+        &rolled_back,
+        converged_checkable,
+    );
+    report.acks_by_class = found.acks_by_class.clone();
+    report.uncommitted_acks = found.uncommitted_acks.clone();
+    report.unjournaled_refusals = found.unjournaled_refusals.clone();
+    report.acks_unmapped = oracles
+        .acks_unmapped
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
+    report.identity_copies = found.i2.len();
+    report.non_verbatim = found.i2c.len();
+    report.late_landings = found.i4.len();
+    report.non_lone_rollbacks = found.i5.len();
+    report.oracle_examples = found.examples();
+    let counters = format!(
+        "oracle counters: acks by class {:?}, uncommitted {:?}, unjournaled refusals {:?}, \
+         identity copies {}, non-verbatim {}, late landings {}, non-lone rollbacks {}",
+        report.acks_by_class,
+        report.uncommitted_acks,
+        report.unjournaled_refusals,
+        report.identity_copies,
+        report.non_verbatim,
+        report.late_landings,
+        report.non_lone_rollbacks
+    );
+    for (strict, what, list) in [
+        (cfg.strict_commit, "I1", &found.i1),
+        (cfg.strict_identity, "I2", &found.i2),
+        (cfg.strict_identity, "I2c", &found.i2c),
+        (cfg.strict_settle, "I4", &found.i4),
+        (cfg.strict_lone, "I5", &found.i5),
+    ] {
+        if strict {
+            if let Some(first) = list.first() {
+                return Err(format!(
+                    "{first}\n  ({} {what} violation(s))\n  {counters}\n  faults: {:?}",
+                    list.len(),
+                    report.faults
+                ));
+            }
+        }
+    }
     Ok(report)
 }
 

@@ -1060,3 +1060,30 @@ fn design_root_failover_with_a_designation() {
         &["all_ops_done", "root_takeover", "restreamed"],
     );
 }
+
+/// Plan 43 C0 (fail-before for C2): today a delegate with no backup
+/// acknowledges alone. It crashes before the root appends the row; the root
+/// reclaims the expired grant, and the requester's *acknowledged* create is
+/// retracted and replayed by rid — an acknowledged op replayed
+/// (`acked_ops_are_never_replayed`, not in `ALWAYS` until C2 makes it hold).
+/// The configuration is `design_delegate_crash_without_backup_replays_by_rid`'s.
+#[test]
+fn today_a_delegate_without_a_backup_acks_alone() {
+    let m = DelegModel {
+        initial_delegations: vec![(1, 1)],
+        reclaim_expired: true,
+        deleg_ttl: 2,
+        max_crashes: 1,
+        max_tick: 4,
+        check_acked_replay: true,
+        ..DelegModel::design(
+            P3.to_vec(),
+            vec![vec![], vec![], vec![create(D1A), read(D1A)]],
+        )
+    };
+    assert_search_finds(
+        "deleg-no-backup-acks-alone",
+        &m,
+        "acked_ops_are_never_replayed",
+    );
+}

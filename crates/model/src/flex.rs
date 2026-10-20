@@ -223,6 +223,11 @@ pub struct FlexEpochs {
     /// the highest lease epoch's claim, and none below an epoch any member
     /// knows of (the others are stale).
     pub resolve_by_epoch: bool,
+    /// Plan 43 C0: check `hold_owner_never_deposed_except_by_retire` (Q3).
+    /// Off by default so a counterexample search that stops at the first
+    /// failed property (`HasDiscoveries::AnyFailures`) still ends on the
+    /// property a test is about.
+    pub check_hold_owner: bool,
 }
 
 impl FlexEpochs {
@@ -257,6 +262,7 @@ impl FlexEpochs {
             silent_in_epoch: true,
             claim_rule: true,
             resolve_by_epoch: true,
+            check_hold_owner: false,
         }
     }
 
@@ -352,6 +358,9 @@ pub const SAW_FLUSH: u8 = 4;
 pub const SAW_SEAL: u8 = 8;
 pub const SAW_FAST_S3: u8 = 16;
 pub const SAW_CONFLICT: u8 = 32;
+/// Plan 43 C0: an epoch's hold owner lost its epoch journal because the
+/// register moved under it (`Action::Close`'s strand branch).
+pub const SAW_HOLD_OWNER_DEPOSED: u8 = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
@@ -864,7 +873,7 @@ impl Model for FlexEpochs {
                 } else {
                     // The register moved under the epoch: its journal is
                     // a conflicting branch (replayed by rid at best).
-                    s.saw |= SAW_CONFLICT;
+                    s.saw |= SAW_CONFLICT | SAW_HOLD_OWNER_DEPOSED;
                 }
             }
             Action::Observe(i) => {
@@ -939,6 +948,18 @@ impl Model for FlexEpochs {
             }),
             Property::sometimes("epoch_flushed", |_, s: &State| s.saw & SAW_FLUSH != 0),
         ];
+        // Plan 43 C0 (§11 Q3, decided): an epoch's hold owner is not
+        // stealable. Its epoch journal is dropped only by an operator's
+        // retire, or when its epoch carried no lease; the model has no
+        // retire action and every epoch is formed over a lease
+        // (`Form` converts a member's lease), so both exemptions are
+        // vacuous here: the register never moves under a hold owner.
+        if self.check_hold_owner {
+            props.push(Property::always(
+                "hold_owner_never_deposed_except_by_retire",
+                |_, s: &State| s.saw & SAW_HOLD_OWNER_DEPOSED == 0,
+            ));
+        }
         if self.min_members < self.nodes {
             props.push(Property::sometimes(
                 "epoch_with_missing_node",

@@ -584,3 +584,78 @@ fn single_writer_is_clean() {
     );
     checker.assert_properties();
 }
+
+/// Plan 43 C0 (fail-before for C2/C3): an op whose client was answered in
+/// doubt (`EIO`) keeps a life of its own — here a deposed holder's journal
+/// row, replayed by rid — and lands in the log *after* an op the same node's
+/// client invoked once it had the answer. Node 1's first create is forwarded
+/// to the holder, which journals it and goes silent; the acquire deadline
+/// passes and the client is answered `EIO`; its next create takes the lease
+/// over and ships; the deposed holder tails the successor's marker and
+/// replays the first create by rid, which lands behind the second.
+/// (`eio_never_lands_late` is the plan's I4 (`unacked_fails_never_lands_late`)
+/// as a state predicate; C2's `Abandon` settles the first op before the
+/// answer, C3 removes the replay.)
+#[test]
+fn today_an_in_doubt_op_lands_after_its_eio() {
+    let started = Instant::now();
+    let model = AuthorityModel::new(2)
+        .with_protocol(Protocol::Recovery)
+        .with_forward_retries(0)
+        .with_initial_holder(0, 1)
+        .with_lease_ttl(1)
+        .with_max_seq(3)
+        .with_lossy(false)
+        .with_deadlines(true)
+        .with_op(1, NsOp::CreateExcl(name(0)))
+        .with_op(1, NsOp::CreateExcl(name(1)));
+    let checker = model
+        .checker()
+        .target_state_count(5_000_000)
+        .target_max_depth(40)
+        .timeout(Duration::from_secs(40))
+        .spawn_bfs()
+        .join();
+    println!(
+        "today_an_in_doubt_op_lands_after_its_eio: {} states ({} unique), max depth {}, {:?}",
+        checker.state_count(),
+        checker.unique_state_count(),
+        checker.max_depth(),
+        started.elapsed()
+    );
+    let found = checker
+        .discovery("eio_never_lands_late")
+        .expect("expected an `eio_never_lands_late` counterexample");
+    println!("the capped search's counterexample:");
+    for a in found.clone().into_actions() {
+        println!("  {a:?}");
+    }
+    // The shape by hand (message ids are allocation order: the forward 0, its
+    // reply 1, the second op's forward 2, the replay 3).
+    let path = vec![
+        Action::ClientInvoke(1),
+        Action::DeliverForwardRequest(0),
+        Action::Tick,
+        Action::Deadline(1),
+        Action::ClientInvoke(1),
+        Action::ForwardTimeout(1),
+        Action::AcquireLease(1),
+        Action::Ship(1),
+        Action::Tail(0),
+        Action::ReplayStranded(0),
+        Action::DeliverForwardRequest(3),
+        Action::Ship(1),
+    ];
+    for a in &path {
+        println!("  {a:?}");
+    }
+    checker.assert_discovery("eio_never_lands_late", path);
+}
+
+/// The knob C2 will implement is refused until then.
+#[test]
+#[should_panic(expected = "plan 43 C2")]
+fn the_abandon_knob_is_not_implemented_before_c2() {
+    let model = AuthorityModel::new(2).with_abandon(true);
+    let _ = model.init_states();
+}

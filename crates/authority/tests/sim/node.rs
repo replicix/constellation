@@ -191,6 +191,12 @@ pub struct Shared {
     pub fast_path_executed: AtomicU64,
     /// Every `InDoubt` reply of any incarnation (see `NodeEnv`).
     pub in_doubt: InDoubtLog,
+    /// Plan 43 C0: deposition rebuilds (`Action::RebuildReplica`) this
+    /// incarnation ran, and how many of them failed.
+    pub rebuilds_ok: AtomicU64,
+    pub rebuilds_failed: AtomicU64,
+    /// The most backups this node's lease listed at once (`backup-two`).
+    pub max_backups: AtomicU64,
     /// F1 (`StallStep`): the next event this node handles takes its `now`,
     /// then waits this long (ms) before the core handles it — a step that
     /// waited in the store, or a process stopped between its clock read
@@ -270,7 +276,10 @@ fn release_held_ctl(shared: &Shared) {
 /// for a rid whose completion was already in that applied prefix told a
 /// client `EIO` for a write it could have been told had landed
 /// (`check::check_in_doubt_answers`).
-pub type InDoubtLog = Arc<Mutex<Vec<(NodeId, Rid, u64)>>>;
+///
+/// Plan 43 C0: the fourth field is the oracles' tick of the answer (I4:
+/// "after" is exact against the clients' invocations).
+pub type InDoubtLog = Arc<Mutex<Vec<(NodeId, Rid, u64, u64)>>>;
 
 pub struct NodeHandle {
     pub id: NodeId,
@@ -280,6 +289,8 @@ pub struct NodeHandle {
     pub clock: Clock,
     tx: mpsc::UnboundedSender<Event>,
     task: tokio::task::JoinHandle<()>,
+    /// Plan 43 C0: where the first submission of each rid is noted (I4).
+    oracles: Arc<super::oracle::Oracles>,
 }
 
 pub struct NodeEnv {
@@ -320,6 +331,12 @@ pub struct NodeEnv {
     pub beats_lost_in_lag: bool,
     /// See `SimConfig::deleg_lane`.
     pub deleg_lane: bool,
+    /// Plan 43 C0: the commit-rule oracles' shared plumbing.
+    pub oracles: Arc<super::oracle::Oracles>,
+    /// See `SimConfig::rebuild_stub`.
+    pub rebuild_stub: bool,
+    /// See `SimConfig::plant_ungated_fast_path`.
+    pub plant_ungated_fast_path: bool,
 }
 
 impl NodeEnv {
@@ -375,6 +392,8 @@ impl NodeHandle {
             None => {
                 let m = Meta::open_in_memory().expect("meta");
                 m.set_node_prefix(id).expect("prefix");
+                // A restart without the journal keeps no queue either.
+                env.oracles.identity.lock().unwrap().wipe(id);
                 Arc::new(m)
             }
         };
@@ -412,6 +431,9 @@ impl NodeHandle {
             epoch: Mutex::new(epoch),
             fast_path_executed: AtomicU64::new(0),
             in_doubt: env.in_doubt.clone(),
+            rebuilds_ok: AtomicU64::new(0),
+            rebuilds_failed: AtomicU64::new(0),
+            max_backups: AtomicU64::new(0),
             stall_next: Mutex::new(None),
             hold_next: Mutex::new(None),
             held_writes: AtomicU64::new(0),
@@ -464,6 +486,12 @@ impl NodeHandle {
         env.world.register(id, meta.clone());
         let mut cfg = (env.config)(id, incarnation);
         cfg.clock_id = clock.id();
+        env.oracles.register(
+            id,
+            meta.clone(),
+            cfg.backup_rtt_budget_ms,
+            cfg.backup_stable_ms,
+        );
         let beat_every_ms = cfg.backup_heartbeat_ms.max(1);
         let lane = env.deleg_lane && cfg.delegation && cfg.p2p;
         let driver = Driver {
@@ -501,6 +529,10 @@ impl NodeHandle {
                 .beats_credited
                 .then(|| (env.config)(id, 1).expiry_margin_ms as i64),
             beats_lost_in_lag: env.beats_lost_in_lag,
+            oracles: env.oracles.clone(),
+            forwards: HashMap::new(),
+            rebuild_stub: env.rebuild_stub,
+            plant_ungated_fast_path: env.plant_ungated_fast_path,
         };
         let task = tokio::spawn(driver.run());
         if lane {
@@ -529,6 +561,7 @@ impl NodeHandle {
             clock,
             tx,
             task,
+            oracles: env.oracles.clone(),
         }
     }
 
@@ -562,6 +595,7 @@ impl NodeHandle {
         if !self.alive() {
             return rx;
         }
+        self.oracles.note_invoke(rid);
         self.shared.replies.lock().unwrap().insert(rid, tx);
         let _ = self.tx.send(Event::Submit {
             rid,
@@ -717,6 +751,13 @@ struct Driver {
     credit_margin: Option<i64>,
     /// See `SimConfig::beats_lost_in_lag`.
     beats_lost_in_lag: bool,
+    /// Plan 43 C0: the oracles, and the rid behind each forwarded request
+    /// this driver handed its core (`(requester, req)`), for I1 at the
+    /// `MutateReply`'s emission.
+    oracles: Arc<super::oracle::Oracles>,
+    forwards: HashMap<(NodeId, OpId), Rid>,
+    rebuild_stub: bool,
+    plant_ungated_fast_path: bool,
 }
 
 /// What the off-core heartbeat beats to: `(epoch, wall expiry, honour end,
@@ -1023,6 +1064,7 @@ impl Driver {
         // on a ticker like the daemon's registry poll and `probe_all`.
         {
             let (tx, bus, id) = (self.tx.clone(), self.bus.clone(), self.id);
+            let oracles = self.oracles.clone();
             let p2p = self.core.config().p2p;
             let clock = self.clock.clone();
             tokio::spawn(async move {
@@ -1061,6 +1103,13 @@ impl Driver {
                             }
                         })
                         .collect();
+                    oracles.note_directory(
+                        id,
+                        links
+                            .iter()
+                            .filter_map(|l| l.since.map(|s| (l.node, s.0)))
+                            .collect(),
+                    );
                     if tx.send(Event::Peers { links }).is_err() {
                         return;
                     }
@@ -1195,6 +1244,13 @@ impl Driver {
                 *IN_FLIGHT.lock().unwrap() = Some((self.id, text, std::time::Instant::now()));
             }
             self.events_handled += 1;
+            if let Event::Peer {
+                from,
+                msg: PeerMsg::MutateRequest { req, rid, .. },
+            } = &event
+            {
+                self.forwards.insert((*from, *req), *rid);
+            }
             if let Some(actions) = self.fast_path(now, &event) {
                 self.dispatch(actions);
                 continue;
@@ -1319,6 +1375,7 @@ impl Driver {
             }
             self.note_rollbacks();
             self.note_journaled_refusals();
+            self.note_identity();
             self.dispatch(actions);
             self.refresh_view();
         }
@@ -1531,6 +1588,9 @@ impl Driver {
         view.journal_len = Replica::journal_len(&*self.meta).unwrap_or(0);
         view.speculation = self.meta.speculation_counts().unwrap_or_default();
         view.ack = self.core.ack_view();
+        self.shared
+            .max_backups
+            .fetch_max(view.ack.backups.len() as u64, Ordering::Relaxed);
         view.delegation = self.core.deleg_view();
         let locks = self.core.lock_view();
         view.lock_requests = locks.requests_in_flight;
@@ -1628,6 +1688,104 @@ impl Driver {
             });
     }
 
+    /// Plan 43 C0, I2 (b): where this node holds each rid queued for
+    /// execution — its replay queue and the core's client map (its own
+    /// clients' submissions and its in-flight replays, one entry per rid).
+    fn note_identity(&self) {
+        let queued: BTreeSet<Rid> = self
+            .meta
+            .pending_replays()
+            .map(|q| q.into_iter().map(|s| s.rid).collect())
+            .unwrap_or_default();
+        let executing: BTreeSet<Rid> = self.core.clients().map(|(rid, _)| rid).collect();
+        let tick = self.oracles.tick.load(Ordering::SeqCst);
+        self.oracles
+            .identity
+            .lock()
+            .unwrap()
+            .update(self.id, queued, executing, tick);
+    }
+
+    /// Plan 43 C0, I1: an answer leaves this node (a `MutateReply` to a
+    /// requester when `reply`, else its own client's reply). Definitive
+    /// answers are judged now, against every store as it is at this
+    /// emission; a requester passing a sequencer's answer on is a relay.
+    fn note_answer(&self, rid: Rid, outcome: &MutateOutcome, reply: bool) {
+        use super::oracle::{committed_at_answer, outcome_kind, AckEntry, AnswererState, Expected};
+        let Some(kind) = outcome_kind(outcome) else {
+            return;
+        };
+        let tick = self.oracles.next_tick();
+        let at_ms = self.clock.elapsed_ms();
+        let relay = !reply
+            && self
+                .oracles
+                .reply_kinds
+                .lock()
+                .unwrap()
+                .get(&rid)
+                .is_some_and(|v| v.iter().any(|(n, k)| *n != self.id && *k == kind));
+        if reply {
+            self.oracles
+                .reply_kinds
+                .lock()
+                .unwrap()
+                .entry(rid)
+                .or_default()
+                .push((self.id, kind));
+        }
+        let judged = (!relay).then(|| {
+            let st = AnswererState::of(&self.core, &self.meta, self.id, self.clock.now().wait.0);
+            let j = committed_at_answer(&self.oracles, &self.bus, self.id, &st, rid, outcome);
+            if j.class.is_none() && !(j.expected == Expected::Unjournaled && kind.is_refusal()) {
+                let text = format!(
+                    "I1 acked_implies_committed: node {} answered rid {rid:?} ({}) at t={at_ms} ms, \
+                     expected {}, committed by none: {}",
+                    self.id,
+                    kind.name(),
+                    j.expected.name(),
+                    j.detail
+                );
+                // `AUTHORITY_SIM_ORACLE_DEBUG=1`: every violation, as judged.
+                if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
+                    eprintln!("ORACLE-I1 t={at_ms} {text}");
+                }
+                self.oracles.i1_violations.lock().unwrap().push(text);
+            }
+            j
+        });
+        self.oracles.acks.lock().unwrap().push(AckEntry {
+            node: self.id,
+            rid,
+            tick,
+            at_ms,
+            kind,
+            reply,
+            relay,
+            judged,
+        });
+    }
+
+    /// A `MutateReply` to `to` for its request `req`: judged as the answer
+    /// to the rid that request carried.
+    fn note_forward_answer(&self, to: NodeId, req: OpId, outcome: &MutateOutcome) {
+        match self.forwards.get(&(to, req)).copied() {
+            Some(rid) => self.note_answer(rid, outcome, true),
+            None => {
+                if super::oracle::outcome_kind(outcome).is_some() {
+                    self.oracles.acks_unmapped.fetch_add(1, Ordering::Relaxed);
+                    if std::env::var_os("AUTHORITY_SIM_ORACLE_DEBUG").is_some() {
+                        eprintln!(
+                            "ORACLE-UNMAPPED t={} node {} to {to} req {req:?}: {outcome:?}",
+                            self.clock.elapsed_ms(),
+                            self.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Retake `Shared::journaled_refusals` when the journal changed.
     fn note_journaled_refusals(&mut self) {
         let seen = (
@@ -1692,7 +1850,7 @@ impl Driver {
         let cfg = self.core.config();
         let epoch = self.core.lease().new_mutation_epoch(now, cfg)?;
         if self.core.lease().releasing
-            || self.core.ack_gated()
+            || (self.core.ack_gated() && !self.plant_ungated_fast_path)
             || !self.core.deleg_view().mine.is_empty()
         {
             return None;
@@ -1988,19 +2146,34 @@ impl Driver {
         for action in actions {
             match action {
                 Action::Reply { rid, reply } => {
-                    if matches!(reply, ClientReply::InDoubt) {
-                        let applied = Replica::applied_seq(&*self.meta).unwrap_or(0);
-                        self.shared
-                            .in_doubt
-                            .lock()
-                            .unwrap()
-                            .push((self.id, rid, applied));
+                    match &reply {
+                        ClientReply::InDoubt => {
+                            let applied = Replica::applied_seq(&*self.meta).unwrap_or(0);
+                            let tick = self.oracles.next_tick();
+                            self.shared
+                                .in_doubt
+                                .lock()
+                                .unwrap()
+                                .push((self.id, rid, applied, tick));
+                        }
+                        ClientReply::Outcome(outcome) => self.note_answer(rid, outcome, false),
                     }
                     if let Some(tx) = self.shared.replies.lock().unwrap().remove(&rid) {
                         let _ = tx.send(reply);
                     }
                 }
-                Action::Send { to, msg } => self.bus.send(self.id, to, msg),
+                Action::Send { to, msg } => {
+                    // (`OpId(0)`: the core re-executing a parked request whose
+                    // `Held` reply was sent already; that reply matches no
+                    // request at the requester, which gets its answer from
+                    // the dedup when it retries: not an answer.)
+                    if let PeerMsg::MutateReply { req, outcome, .. } = &msg {
+                        if *req != OpId(0) {
+                            self.note_forward_answer(to, *req, outcome);
+                        }
+                    }
+                    self.bus.send(self.id, to, msg)
+                }
                 Action::S3 { op, req } => self.spawn_s3(op, req),
                 Action::SetTimer { id, after_ms, kind } => {
                     self.timers.insert(id);
@@ -2043,10 +2216,7 @@ impl Driver {
                 Action::FollowHead { op } => {
                     let _ = self.tx.send(Event::PublishDone { op, ok: true });
                 }
-                Action::RebuildReplica { op } => {
-                    // Holder capture is on in the simulation: never asked.
-                    let _ = self.tx.send(Event::RebuildDone { op, ok: false });
-                }
+                Action::RebuildReplica { op } => self.spawn_rebuild(op),
                 Action::RoundDone { .. } => {}
                 // Chunk metered-own-rows: past the modelled metered hold
                 // (`ChunkWorld::hold_ms`); without one the round's pass
@@ -2156,6 +2326,49 @@ impl Driver {
                 }
             }
         }
+    }
+
+    /// Plan 43 C0: `Action::RebuildReplica`, as the engine runs it
+    /// (`authority_driver::rebuild_replica`): a side replica built from the
+    /// bucket's log — read through this node's faulted handle, with the
+    /// epoch fencing every replica applies — swapped in by the production
+    /// `Meta::replace_ns_from_rebuilt`. (The engine bootstraps from the head
+    /// commit and replays from there; the simulation replays from genesis,
+    /// which is the same state. `SimConfig::rebuild_stub` keeps the old stub
+    /// that always failed, as a negative control.)
+    fn spawn_rebuild(&self, op: OpId) {
+        let (tx, shared, meta) = (self.tx.clone(), self.shared.clone(), self.meta.clone());
+        let incarnation = shared.incarnation.load(Ordering::SeqCst);
+        if self.rebuild_stub {
+            shared.rebuilds_failed.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(Event::RebuildDone { op, ok: false });
+            return;
+        }
+        let (store, node) = (self.store.clone(), self.id);
+        tokio::spawn(async move {
+            let result = rebuild_from_log(store, node, &meta, &shared, incarnation).await;
+            // A process that died (or restarted) meanwhile has no rebuild
+            // to count and nobody to tell.
+            if !shared.alive.load(Ordering::SeqCst)
+                || shared.incarnation.load(Ordering::SeqCst) != incarnation
+            {
+                return;
+            }
+            let ok = match result {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(node, error, "sim: the deposition rebuild failed");
+                    false
+                }
+            };
+            let counter = if ok {
+                &shared.rebuilds_ok
+            } else {
+                &shared.rebuilds_failed
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            let _ = tx.send(Event::RebuildDone { op, ok });
+        });
     }
 
     /// What the daemon does around the core for a forwarded manifest
@@ -2372,6 +2585,58 @@ impl Driver {
             let _ = tx.send(Event::PublishDone { op, ok });
         });
     }
+}
+
+/// See `Driver::spawn_rebuild`.
+async fn rebuild_from_log(
+    store: Arc<dyn object_store::ObjectStore>,
+    node: NodeId,
+    meta: &Meta,
+    shared: &Shared,
+    incarnation: u32,
+) -> Result<(), String> {
+    let log = LogStore::new(store);
+    let side = Meta::open_in_memory().map_err(|e| e.to_string())?;
+    side.set_node_prefix(3_000_000 + node)
+        .map_err(|e| e.to_string())?;
+    let (mut next, mut max_epoch) = (1u64, 0u64);
+    loop {
+        let run = log
+            .get_run(next, 8)
+            .await
+            .map_err(|e| format!("reading segment {next}: {e}"))?;
+        if run.is_empty() {
+            break;
+        }
+        for (seq, payload) in run {
+            let seg = constellation_authority::segment::decode(&payload)
+                .map_err(|e| format!("segment {seq}: {e}"))?;
+            if seg.epoch > 0 && seg.epoch < max_epoch {
+                Replica::skip_segment(&side, seq).map_err(|e| e.to_string())?;
+            } else {
+                Replica::apply_segment(
+                    &side,
+                    seq,
+                    seg.epoch,
+                    seg.through,
+                    &seg.rows,
+                    &seg.origins,
+                    &seg.records,
+                )
+                .map_err(|e| format!("applying segment {seq}: {e}"))?;
+                max_epoch = max_epoch.max(seg.epoch);
+            }
+            next = seq + 1;
+        }
+    }
+    // The process may have died, or restarted, while the log was read.
+    if !shared.alive.load(Ordering::SeqCst)
+        || shared.incarnation.load(Ordering::SeqCst) != incarnation
+    {
+        return Err("the node restarted during its rebuild".into());
+    }
+    meta.replace_ns_from_rebuilt(&side, &HashSet::new())
+        .map_err(|e| e.to_string())
 }
 
 fn cas_failure(e: StoreError) -> CasFailure {

@@ -1125,12 +1125,12 @@ GOALS.md L17-20 ("no conflict copies in the default modes", C5:
 which `ack=s3` or an offline designation avoids") and L21-31
 (offline-first; local-FS-fast: the lone writer's contract).
 
-DECISIONS.md: a new **ADR-32 "Commit is the configured group's
+DECISIONS.md: a new **ADR-33 "Commit is the configured group's
 acknowledgement (Vertical Paxos over S3)"** (C1 writes the decision and
 the rejected options — study §4 A, B1, C, D — and each later milestone
 amends it); amendments to ADR-2 (S3 as configuration master and archive,
 not the per-write arbiter; C2), ADR-14 (the shadow; C2), ADR-18
-(settling before `EIO`; C2), ADR-19 ("superseded in part by ADR-32":
+(settling before `EIO`; C2), ADR-19 ("superseded in part by ADR-33":
 speculation only in the lone branch; C5), ADR-21 (Layer B commit; the
 tail fetch; C1), ADR-22 (Q3; C5), ADR-23 (delegation group, cut in the
 log, verbatim; C2–C3), ADR-25 (locks in the log; C4).
@@ -1298,7 +1298,7 @@ non-ignored test over a small range so CI runs it.
   `cto-latency`, `backup-failover`'s failover time, `make
   perf-regression` (full, latency250, bw50).
 - **Docs**: DESIGN §4's vocabulary paragraph (authorized); TESTING.md
-  (the oracles, the flags, `ack-latency`); ADR-32's first draft (status
+  (the oracles, the flags, `ack-latency`); ADR-33's first draft (status
   "proposed", decision text only).
 
 **Fail-before (non-vacuity of the oracles).** Each new oracle must find
@@ -1328,6 +1328,15 @@ recommended interim fixes), with the strict flags on:
   listing B2 landed).
 An oracle that finds nothing it should is a C0 bug: fix the oracle, not
 the expectation.
+
+**Also in C0 (§11 Q20 (h), decided 2026-10-20).** "Applied, unfenced"
+gets one meaning for every reader: `Core::start` and both rebuild arms
+seed `ship.max_epoch` from the replica's applied position
+(`Replica::applied_epoch`, the epoch of `KV_APPLIED_POS`; a fenced
+segment does not move it), and `shipper::replay_from` (every bootstrap
+and every rebuild) skips a superseded-epoch segment as the core's tail
+does and records the applied position. Before, a restarted or rebuilt
+replica fenced from 0. The only behaviour change of C0.
 
 **Exit criteria.** The oracles, flags and counters in; every existing
 test green (no behaviour change; the flags default off); the baseline
@@ -1395,6 +1404,26 @@ lease (`lease.rs:345-356`'s comment and the sim's corresponding
   per Q1, then fetches the tail from 1 or 2 at the heal, re-ships, no
   rollback, no conflict copy. ×2000; variants `-holder-only` (2 crashed:
   3 fetches from 1) and `-backup-only` (1 crashed: from 2).
+- **A candidate's tail discarded under the holder's listing CAS** (found
+  by C0's baseline: `long-backup` seed 892, the one `root-group` answer
+  of ×1000 that no group held; same at `e5e7c20`). The holder brings
+  node 1 up as a candidate and counts its acknowledgements; node 1,
+  resuming from a stall with its old role and the holder's lease past
+  the expiry it knew, reads the lease *before* the CAS that lists it
+  lands, finds itself unlisted and discards its tail (`backup.rs`, "no
+  longer a listed backup"; deliberately no seal, so the holder may
+  invite it back); the CAS listing `[1]` lands and `durable_jseq` counts
+  the acknowledgements given before the discard, so the parked answer
+  leaves (there a refusal, `ENOENT`; an `OK` takes the same path) while
+  the only listed backup's tail lacks the row. The holder's crash then
+  loses an acknowledged row: a durability hole of today's protocol, not
+  only an I1 classification. C1 closes it with the root group's commit:
+  a listing CAS counts only acknowledgements of the candidacy it lists
+  (a candidate that discarded its tail answers the next append so that
+  `peers[n].acked` restarts), or a candidate whose listing is pending
+  keeps its tail. Fail before: `long-backup` 892 under `+commit`
+  (`uncommitted_acks["root-group/refused:ENOENT"]`), and a core unit test
+  of the discard-then-list order.
 - Core unit tests (`crates/authority/src/core/tests.rs`):
   `a_deposed_backed_holder_queues_no_replay_for_gated_rows`,
   `a_seal_takeover_keeps_a_committed_shadow_until_the_tail_lands`,
@@ -1449,7 +1478,7 @@ synced seal at a member: reported in `holder-kill-rejoin` and
 strict flags; the new config and variants green; the model tests; the
 harness and campaign cells; the performance gate; DESIGN §4 (Local
 store, One log, Positions and log streams), §9 (Seal-based failover,
-Other failures) and the reference pages updated for C1 (§6); ADR-32
+Other failures) and the reference pages updated for C1 (§6); ADR-33
 accepted with C1's decision; PROGRESS.
 
 ### C2 — No acknowledgement outside a group where one exists; settle before `EIO`
@@ -1626,7 +1655,7 @@ measured before anything is loosened.
 **Exit criteria.** All of the above; DESIGN §1, §4 (Request ids,
 Acknowledgement and durability, Delegated sub-sequencers), §5
 availability matrix, §6 session guarantees, §9 (Nobody observes,
-Delegates), §14, GOALS untouched yet (C5); reference pages; ADR-32
+Delegates), §14, GOALS untouched yet (C5); reference pages; ADR-33
 amended, ADR-2/14/18/23 amended; PROGRESS.
 
 ### C3 — Verbatim re-ship; no re-execution of a committed row
@@ -1670,6 +1699,18 @@ never lost).
   `long-delegated-late-answers`×10000, `long-delegated-backup`×5000,
   `tloss-two-node`×5000, `long-backup`×5000 — **fail before** (re-applied
   tails with new identities, `Records` copies, own-row replays), pass after.
+- The deposed root's rebuild-then-replay, as C0's real sim rebuild first
+  ran it: at `5f3a0e8` + C0, `long-delegated-late-answers` seeds 403 and
+  900 failed (403 linearizability, a `d2` unlink; 900 a marker seen
+  without its data, the data's create replayed by rid at t=11 272 after
+  the marker was accepted at t=10 493) — the deposed root's recovery
+  finished only because the rebuild now succeeds, queued the ops of its
+  uncaptured journal for replay by rid (5 in 900, 8 in 403), and the
+  replays ran seconds later, after the clients' next ops. Not the cursor bug
+  (`1e107f0` alone leaves both failing); `97e806b` hides both by
+  changing the schedule (×1000 at `e5e7c20`: none). C3's sweep of
+  `long-delegated-late-answers`×10000 under the real rebuild is where
+  this class must be gone.
 - Core tests: `the_takeover_gates_local_replay_folds_a_truncate_into_its_manifest_commit`
   (`core/tests.rs:1931`, pins the deleted fold) is rewritten as
   `a_delegate_taking_the_root_appends_its_own_rows_under_their_generation`,
@@ -3260,7 +3301,7 @@ to land before C0.
 - [ ] C7a, C7b: every exit item of §7 C7.
 - [ ] §9's gates met at every milestone, on the four file systems where
       §9 says so; `bench/commit-rule/RESULTS.md` complete.
-- [ ] Every §6 document change made in its milestone; ADR-32 and the
+- [ ] Every §6 document change made in its milestone; ADR-33 and the
       clock ADR written; the amended ADRs marked.
 - [ ] Every milestone reviewed (fable) before the next started; the
       reviews' required changes done.

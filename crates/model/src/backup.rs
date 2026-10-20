@@ -76,6 +76,15 @@
 //! - `ack_order_is_log_order` (always): a write acknowledged before
 //!   another was invoked precedes it in the log — the log is a
 //!   linearization of the acknowledged writes.
+//! - `acked_never_rolled_back` (always; plan 43 C0): a write acknowledged
+//!   durably is never in a node's replay set — a deposed holder replays
+//!   what it journaled by rid, and a write the backup acknowledged is
+//!   committed, not speculation. **Today it is violated**
+//!   (`today_a_deposed_holder_replays_committed_rows`): the holder's journal
+//!   is stranded into the replay set whatever the acknowledgement meant.
+//!   [`BackupModel::commit_rule`] is the knob C1 implements; it is
+//!   `false` (today's protocol) in every constructor and the model
+//!   refuses `true` until then.
 //! - `sometimes` witnesses: a seal-based takeover, an `S3` fast takeover,
 //!   a removal, a tail re-shipped, every write acknowledged and in the
 //!   log (convergence).
@@ -120,6 +129,11 @@ pub struct BackupModel {
     /// Check every acknowledgement, not only the durable ones (to show
     /// what today's `Local` acknowledgement loses).
     pub check_all_acks: bool,
+    /// Plan 43 C1: a backup-acknowledged row is committed — a deposed
+    /// holder keeps it as a member copy (served to the successor), never
+    /// in its replay queue. `false` is today's protocol; `true` is not
+    /// implemented yet (C0 records the counterexample of `false`).
+    pub commit_rule: bool,
 }
 
 impl BackupModel {
@@ -140,6 +154,7 @@ impl BackupModel {
             fast_takeover: true,
             reconfig: true,
             check_all_acks: false,
+            commit_rule: false,
         }
     }
 
@@ -443,6 +458,10 @@ impl Model for BackupModel {
     type Action = Action;
 
     fn init_states(&self) -> Vec<State> {
+        assert!(
+            !self.commit_rule,
+            "BackupModel::commit_rule is plan 43 C1's: today's protocol only, until then"
+        );
         let n = self.nodes as usize;
         let nodes: Vec<Node> = (0..n)
             .map(|i| Node {
@@ -765,6 +784,14 @@ impl Model for BackupModel {
             }),
             Property::always("ack_order_is_log_order", |_, s: &State| {
                 !matches!(s.violation, Some(("ack order violated", _)))
+            }),
+            // Plan 43 C0: a pure state predicate (the `violation` ghost is
+            // first-wins). A durably acknowledged write is committed; it is
+            // never a deposed holder's replay.
+            Property::always("acked_never_rolled_back", |_, s: &State| {
+                s.acked.iter().all(|(id, _, durable)| {
+                    !durable || s.nodes.iter().all(|n| !n.replay.contains(id))
+                })
             }),
             Property::sometimes("all_acked_and_in_log", |m: &BackupModel, s: &State| {
                 s.nodes

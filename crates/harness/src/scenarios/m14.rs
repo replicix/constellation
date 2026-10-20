@@ -54,7 +54,7 @@ fn flock(f: &File, op: libc::c_int) -> std::result::Result<(), Code> {
     }
 }
 
-fn flock_timed(f: &File, op: libc::c_int) -> (std::result::Result<(), Code>, Duration) {
+pub(super) fn flock_timed(f: &File, op: libc::c_int) -> (std::result::Result<(), Code>, Duration) {
     let t = Instant::now();
     let r = flock(f, op);
     (r, t.elapsed())

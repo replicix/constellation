@@ -11,7 +11,7 @@
 //! crash and a fast takeover; every acknowledged write in the log, in
 //! acknowledgement order.
 
-use constellation_model::backup::BackupModel;
+use constellation_model::backup::{Action, BackupModel};
 use stateright::{Checker, Model};
 use std::time::{Duration, Instant};
 
@@ -187,4 +187,60 @@ fn ack_s3_with_a_crash_and_fast_takeover_is_clean() {
         ..BackupModel::s3(3, 1)
     };
     assert_clean("s3", &m, &["s3_fast_takeover", "all_acked_and_in_log"]);
+}
+
+/// Plan 43 C0 (fail-before for C1): today a deposed holder replays, by rid,
+/// the writes it journaled — including the ones its backup acknowledged,
+/// which are committed. The backup seals and takes over; the old holder
+/// tails the successor's marker and strands its journal into its replay
+/// set. Violates `acked_never_rolled_back` with `commit_rule: false`.
+#[test]
+fn today_a_deposed_holder_replays_committed_rows() {
+    let m = BackupModel::backup(2, 1);
+    // The shortest counterexample, by hand: node 0 (the holder) executes
+    // its write and sends it to its backup; the backup holds and
+    // acknowledges it; the holder acknowledges durably; the backup seals
+    // and takes over; the holder tails the marker.
+    let path = vec![
+        Action::Start(0),
+        Action::Deliver(0), // Append reaches the backup
+        Action::Deliver(0), // AppendAck reaches the holder: acknowledged
+        Action::Seal(1),
+        Action::Takeover(1),
+        Action::Tail(0), // deposed: the journal becomes its replay set
+    ];
+    // Capped: the counterexample is shallow, the search need not finish.
+    let started = Instant::now();
+    let checker = m
+        .clone()
+        .checker()
+        .target_state_count(2_000_000)
+        .timeout(Duration::from_secs(30))
+        .spawn_bfs()
+        .join();
+    println!(
+        "deposed-replay: {} states ({} unique), max depth {}, {:?}",
+        checker.state_count(),
+        checker.unique_state_count(),
+        checker.max_depth(),
+        started.elapsed()
+    );
+    let d = checker
+        .discovery("acked_never_rolled_back")
+        .expect("expected an `acked_never_rolled_back` counterexample");
+    for (n, a) in d.clone().into_actions().into_iter().enumerate() {
+        println!("  {n:2}: {a:?}");
+    }
+    checker.assert_discovery("acked_never_rolled_back", path);
+}
+
+/// The knob C1 will implement is refused until then.
+#[test]
+#[should_panic(expected = "plan 43 C1")]
+fn the_commit_rule_knob_is_not_implemented_before_c1() {
+    let m = BackupModel {
+        commit_rule: true,
+        ..BackupModel::backup(2, 1)
+    };
+    let _ = m.init_states();
 }
