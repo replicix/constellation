@@ -4306,7 +4306,10 @@ backup the lease lists *then*, so after a seal it is not the successor, and
 cuts that same locker off. Neither is in `gen_faults`. The core's `Now`
 carries the three readings. The honour side landed in 2/4 (a holder's lease,
 lock grants, delegation, read delegations, liveness proof and heartbeat
-stamps read `now.honour`); the waiter's sites (3/4) and the liveness timers
+stamps read `now.honour`); the waiter's sites landed in 3/4 (an owner's
+records, a root's outwaits, quarantines, graces, the takeover floor, beat
+arrival, the seal watch and the persisted horizons read `now.wait`; the
+holder's beat names its lease's end on its wait clock); the liveness timers
 (4/4) still read WALL, so a configuration below that targets one of those
 fails here at the rate PROGRESS records (the fail-before of the commit that
 fixes it). Without a step the sweeps do not move from commit to commit:
@@ -4323,7 +4326,11 @@ twice, grants held across: it outwaits early), `locks-locker-step-back` (a
 locker stepped back 3 s and cut off: it honours its grant past the owner's
 outwait), `locks-holder-step-back-sealed` (the S3-cut holder, sealed, stepped
 back), `fast-takeover-holder-step-forward` (F-a's cap and the root's own
-table after a forward step of the holder), `fast-takeover-successor-step-
+table after a forward step of the holder), `strict-isolated-reader-holder-step-
+forward` (the beat cap across a forward step of an S3-cut holder that keeps
+beating: its honour clock follows the step, so a cap counted from beats
+stamped on it is early by the step; 3 of 2 000 seeds before the beats and the
+lease's end moved to the wait clock), `fast-takeover-successor-step-
 forward` (the successor stepped forward inside its floor, long grants and
 long critical sections), `delegated-root-step-forward`,
 `delegated-delegate-step-back`, `strict-reader-step-back`, and the controls

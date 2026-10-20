@@ -28,9 +28,9 @@ use tokio::sync::mpsc;
 pub type Tap = Arc<dyn Fn(NodeId, &PeerMsg) + Send + Sync>;
 
 /// What a beat of the holder's off-core heartbeat carries (plan 43 C7-H1):
-/// the holder's honour clock reading when it sent it (`sent`) and its id
+/// the holder's wait clock reading when it sent it (`sent`) and its id
 /// (`clock`), the end of its lease and its guard on that clock, the lease
-/// body's wall expiry (`expires`), and the holder's wall reading `echo`,
+/// body's wall expiry (`expires`), and the holder's wait reading `echo`,
 /// which the daemon's holder keeps in the closure that waits for the answer
 /// (`Event::BackupAlive.at`): the bus keeps it here by `(holder, backup,
 /// seq)`.
@@ -46,7 +46,7 @@ pub struct BeatStamps {
 
 pub struct Bus {
     rng: Mutex<StdRng>,
-    /// The holder's wall stamp of each beat in flight, for the answer.
+    /// The holder's wait stamp of each beat in flight, for the answer.
     beat_echo: Mutex<BTreeMap<(NodeId, NodeId, u64), i64>>,
     delay: (u64, u64),
     drop_p: f64,
@@ -406,7 +406,7 @@ impl Bus {
                 epoch,
                 candidacy: 0,
                 listed: true,
-                at: constellation_authority::Ms(0),
+                at: constellation_authority::WaitMs(0),
                 seq,
                 clock: stamps.clock,
                 sent: stamps.sent,
@@ -424,7 +424,7 @@ impl Bus {
         if !self.deliverable(from, to) {
             return;
         }
-        // The holder's own stamp of that beat (its wall reading: the core
+        // The holder's own stamp of that beat (its wait reading: the core
         // compares the echo with its own stamps).
         let Some(sent) = self.beat_echo.lock().unwrap().remove(&(to, from, seq)) else {
             return;
@@ -435,7 +435,7 @@ impl Bus {
             delay,
             Event::BackupAlive {
                 from,
-                at: constellation_authority::Ms(sent),
+                at: constellation_authority::WaitMs(sent),
             },
         );
     }

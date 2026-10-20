@@ -766,12 +766,12 @@ pub enum Payload {
 
 /// One beat of the holder's off-core heartbeat ([`Payload::HolderAlive`]):
 /// `seq` numbers the beats (one per interval, from 1, per process),
-/// `sent_ms` is the holder's **honour** clock when it sent this one
-/// (`ProtocolClock::honour`) and `clock` the id of that clock
+/// `sent_ms` is the holder's **wait** clock when it sent this one
+/// (`ProtocolClock::wait`) and `clock` the id of that clock
 /// (`ProtocolClock::id`: a restarted holder is a new process with a new
 /// clock); `expires_unix_ms` is the expiry of the lease it beats for on the
-/// lease body's wall clock (the beats stop at the holder's honour end of it,
-/// `expires_ms`). A watcher tells from `seq` and `sent_ms` whether beats it
+/// lease body's wall clock (the beats stop at the holder's honour end of
+/// it). A watcher tells from `seq` and `sent_ms` whether beats it
 /// heard late were sent on time (held up on the way, or by its own runtime)
 /// or late (the holder's process itself was held up), and lengthens its
 /// silence window while either has happened lately; from `expires_unix_ms`,
@@ -783,27 +783,29 @@ pub enum Payload {
 /// has taken the lease over, place the end of what the holder's grants could
 /// still be honoured on its own clock (`Core::beat_cap`): a difference on the
 /// holder's clock added to the beat's arrival stamp on the watcher's. The
-/// holder's honour clock follows a forward wall step and ignores a backward
-/// one, so that difference is not moved by a step. The wire fields keep their
-/// positions: the three that changed meaning are in place, the new ones
-/// are appended.
+/// holder's wait clock ignores a wall step in both directions and never
+/// over-counts real time, so that difference never under-estimates the time
+/// left (a forward step moves the holder's honour clock, which is right for
+/// what it honours and wrong here: its grantees' clocks did not step). The
+/// wire fields keep their positions: the three that changed meaning are in
+/// place, the new ones are appended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Beat {
     pub seq: u64,
-    /// The holder's honour clock at send.
+    /// The holder's wait clock at send.
     pub sent_ms: i64,
     /// The lease body's wall expiry (`Lease::expires_unix_ms`): the seal
     /// watch's `known_expiry` (plan 43 Appendix B row 24, C7b). Never mixed
-    /// with the honour values.
+    /// with the wait values.
     pub expires_unix_ms: i64,
     /// What the holder waits out that its lease does not cap (its takeover
     /// floor, its lock and read quarantines, its subtree graces), as the
-    /// latest instant on the same honour clock at which grants it protects
+    /// latest instant on the same wait clock at which grants it protects
     /// may still be honoured. 0: none; `i64::MAX`: unknown (its takeover
     /// gate is pending).
     pub guard_ms: i64,
-    /// The end of the lease the holder honours, on the same honour clock
-    /// (`Lease::holder_expires_ms` of the lease it holds; 0: none).
+    /// The end of the lease the holder holds, on the same wait clock
+    /// (`Lease::holder_wait_ms` of the lease it holds; 0: none).
     pub expires_ms: i64,
     /// `ProtocolClock::id` of the clock `sent_ms`, `guard_ms` and
     /// `expires_ms` are on.
@@ -1458,8 +1460,8 @@ mod tests {
     }
 
     /// Plan 43 C7-F F-a / C7-H1: the beat's guard rides after the three
-    /// fields it was added to, and the honour end and the clock id append to
-    /// that (the earlier fields keep their positions in the encoding), and
+    /// fields it was added to, and the lease's wait-clock end and the clock id append
+    /// to that (the earlier fields keep their positions in the encoding), and
     /// all survive signing and framing, the unknown guard (`i64::MAX`)
     /// included.
     #[test]
@@ -1486,7 +1488,7 @@ mod tests {
             let back = Signed::decode(&frame[4..]).unwrap();
             assert_eq!(back.verify().unwrap().1, payload);
         }
-        // The first four fields keep their positions, the honour end and
+        // The first four fields keep their positions, the wait-clock end and
         // the clock id follow.
         let head = postcard::to_stdvec(&(7u64, 1_000i64, 7_000i64, 42i64)).unwrap();
         let whole = postcard::to_stdvec(&Beat {

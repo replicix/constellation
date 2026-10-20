@@ -881,9 +881,14 @@ a forward step ends its windows early, by the step. Values that cross nodes
 or a restart stay wall-clock (a lease body's expiry, a fencing token's
 window, a persisted horizon) and keep the offset bound above; a token is
 minted on the wall clock from the honour window at the moment it is built.
-The grantor's and the waiter's side of the rule moves to a matching
-non-jumping **wait clock** in the next commit of the item; until then it is
-still wall-clock.
+A grantor or a waiter measures what it waits out (an owner's record of a
+grant, a root's outwait of a delegation, a read-delegation grant, the
+quarantines and graces after a restart or a takeover, a successor's floor,
+the seal watch's silence) on a matching non-jumping **wait clock**: a monotone
+reading that never over-counts and ignores every wall step, so a forward step
+never ends a wait early and a backward one never lengthens it. A holder's
+heartbeat names its lease's end on that clock too, so a successor's cap on its
+floor is a difference on a clock no wall step moves.
 
 All transitions between roots are explicit and persisted before they take
 effect. Heartbeats and silence now drive liveness decisions — a backup
@@ -1475,7 +1480,7 @@ and a blocking one keeps retrying.
 | forward times out (holder slow or gone) | same-rid retries, then the inbox (no P2P path) or the lease path; resolved exactly once; `EIO` at the client deadline (2 × TTL), never a re-execution |
 | holder deposed (it lost the lease while alive) | it rolls its unshipped journal back and replays it by rid through the new holder; only true overlaps become conflict copies |
 | P2P down, S3 up | everything works through the lease path and the S3 inbox, minus backups, delegations, strict ReadIndex, cluster locks and fast takeover |
-| clock skew | lease, delegation, read-delegation and lock timing all assume `margin > 2 × drift` (±500 ms at the defaults); correctness otherwise relies on CAS ordering, never wall clocks |
+| clock skew | lease, delegation, read-delegation and lock timing all assume `margin > 2 × drift` (±500 ms at the defaults); correctness otherwise relies on CAS ordering, never wall clocks; steps: none (C7-H1: holders measure on the honour clock, waiters on the wait clock) |
 | cache disk full | evict clean → throttle → ENOSPC (reads still stream uncached) |
 | logical quota exceeded | ENOSPC on write/truncate/fallocate growth (best-effort; see above) |
 | DB disk full | read-only mode + flush-to-recover; alarms in status/UI |

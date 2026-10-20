@@ -220,7 +220,7 @@ impl View {
         &self,
         h: &SyncHandle,
         records: &[constellation_meta::LogRecord],
-        now: constellation_authority::Ms,
+        now: constellation_authority::WaitMs,
     ) {
         // (Called right after the op executed on this thread: the inodes
         // it changed that its records do not name are recalled too.)
@@ -233,12 +233,12 @@ impl View {
         &self,
         h: &SyncHandle,
         inos: Vec<Ino>,
-        now: constellation_authority::Ms,
+        now: constellation_authority::WaitMs,
     ) {
         if self
             .meta
             .read_delegations()
-            .touching(&inos, None, now.0)
+            .touching(&inos, None, now)
             .is_empty()
         {
             return;
@@ -432,7 +432,7 @@ impl View {
                         // there (harness `marker-order` under load).
                         session.note_stream(gen, idx);
                         h.delegates.note_executed();
-                        self.recall_after_local_write(h, &records, now.wall);
+                        self.recall_after_local_write(h, &records, now.wait);
                         Ok(())
                     }
                     Err(e) => Err(mutate_fail(e)),
@@ -501,7 +501,7 @@ impl View {
                             return outcome;
                         }
                     }
-                    self.recall_after_local_write(h, &records, now.wall);
+                    self.recall_after_local_write(h, &records, now.wait);
                     Ok(())
                 }
                 Err(e) => Err(mutate_fail(e)),

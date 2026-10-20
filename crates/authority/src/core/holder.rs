@@ -185,7 +185,7 @@ impl Core {
                             .dl
                             .gens
                             .get(&d.gen)
-                            .is_some_and(|g| !g.ended && now.wall < g.until)
+                            .is_some_and(|g| !g.ended && now.wait < g.until)
                         && self.links.get(&d.node).is_some_and(|l| l.connected)
                     {
                         // Wholly a live delegate's: the requester's table

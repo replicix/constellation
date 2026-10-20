@@ -266,7 +266,7 @@ pub enum SyncRequest {
         gen: u64,
         round: u64,
         txs: Vec<constellation_meta::DelegateTx>,
-        leaving: Vec<constellation_meta::locks::Grant>,
+        leaving: Vec<constellation_meta::locks::GrantWire>,
         leaving_barriers: Vec<(Ino, i64)>,
     },
     /// Plan 30 §M11, one way: the root's acknowledgement of this
@@ -329,7 +329,7 @@ pub enum SyncRequest {
         gen: u64,
         round: u64,
         ttl_ms: u64,
-        locks: Vec<constellation_meta::locks::Grant>,
+        locks: Vec<constellation_meta::locks::GrantWire>,
         lock_grace_ms: u64,
         lock_floor: constellation_meta::Position,
         lock_cut_at: i64,
@@ -431,7 +431,7 @@ pub enum SyncRequest {
         txs: Vec<constellation_meta::BackupTx>,
     },
     /// The lease holder's off-core liveness heartbeat, stamped with its
-    /// arrival (unix ms): `Event::HolderAlive`, with the beat's number
+    /// arrival (this node's wait clock, ms): `Event::HolderAlive`, with the beat's number
     /// and stamps (`constellation_net::Beat`).
     PeerHolderAlive {
         holder: u64,
@@ -600,7 +600,7 @@ pub enum SyncRequest {
     PeerLockMirror {
         from: u64,
         ver: u64,
-        grants: Vec<constellation_meta::locks::Grant>,
+        grants: Vec<constellation_meta::locks::GrantWire>,
         floor: constellation_meta::Position,
     },
     /// Final flush + release on unmount; the core stops afterwards.

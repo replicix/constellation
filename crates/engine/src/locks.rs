@@ -89,7 +89,7 @@ use constellation_authority::{
 };
 use constellation_fs_core::Ino;
 use constellation_meta::locks::{
-    Grant, GrantId, LocalLock, LocalOutcome, LockMode, LockTag, OwnerFenced,
+    GrantId, GrantWire, LocalLock, LocalOutcome, LockMode, LockTag, OwnerFenced,
 };
 use constellation_meta::{JournalPos, Meta, Position, ReadKey};
 use constellation_net::{LockOutcomeWire, LockRenewResultWire, LockRenewWire, LockTestOutcomeWire};
@@ -1959,7 +1959,7 @@ pub fn test_outcome_of(w: LockTestOutcomeWire) -> LockTestOutcome {
 /// Grants handed over with a delegation or mirrored to a backup
 /// (postcard; an undecodable batch is empty — the receiver's grace and
 /// the holders' reclaims cover what it would have carried).
-pub fn grants_wire(grants: &[Grant]) -> Vec<u8> {
+pub fn grants_wire(grants: &[GrantWire]) -> Vec<u8> {
     if grants.is_empty() {
         return Vec::new();
     }
@@ -1999,7 +1999,7 @@ pub fn floor_of(bytes: &[u8]) -> constellation_meta::Position {
     constellation_meta::Position::from_postcard(bytes)
 }
 
-pub fn grants_of(bytes: &[u8]) -> Vec<Grant> {
+pub fn grants_of(bytes: &[u8]) -> Vec<GrantWire> {
     if bytes.is_empty() {
         return Vec::new();
     }
@@ -2086,7 +2086,7 @@ mod tests {
         ] {
             assert_eq!(test_outcome_of(test_outcome_wire(o)), o);
         }
-        let grants = vec![Grant {
+        let grants = vec![GrantWire {
             id: GrantId { node: 1, seq: 2 },
             node: 3,
             ino: 4,
@@ -2094,7 +2094,7 @@ mod tests {
             until_ms: 99,
             recalled: false,
             gen: 0,
-            confirmed_ms: Grant::UNCONFIRMED,
+            confirmed_ms: constellation_meta::locks::Grant::UNCONFIRMED,
         }];
         assert_eq!(grants_of(&grants_wire(&grants)), grants);
         assert!(grants_of(&[]).is_empty());

@@ -49,7 +49,8 @@
 //!
 //! The delegate honours a grant until `sent + ttl − margin` (its honour
 //! clock, from when it sent the request: plan 43 C7-H1), the sequencer
-//! outwaits it until `granted + ttl + margin` (its clock), and a grant's
+//! outwaits it until `granted + ttl + margin` (its wait clock: a wall step
+//! cannot end the wait early), and a grant's
 //! `ttl` is capped at `lease.honour_end − margin − now` (the lease's end on
 //! the sequencer's honour clock) — `margin` being the lease's own
 //! `expiry_margin_ms` everywhere. `crates/model/src/cto.rs` has the
@@ -74,7 +75,7 @@ use super::client::Phase as ClientPhase;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, ControlOk, ReadAnswer, S3Op};
 use crate::event::{PeerMsg, ReadGrantMsg, ReadIndexOutcome, S3Result};
-use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId};
+use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::{
@@ -168,7 +169,7 @@ pub(crate) enum ParkedWhat {
 #[derive(Debug)]
 struct Parked {
     waiting: BTreeSet<u64>,
-    quarantine: Option<Ms>,
+    quarantine: Option<WaitMs>,
     /// Plan 30 §M9: the journal seq that must be durable (on every
     /// backup, or shipped) before this acknowledgement leaves.
     durable: Option<u64>,
@@ -182,7 +183,7 @@ struct Parked {
 }
 
 /// What a parked acknowledgement waits for besides durability.
-pub(crate) type RecallWait = (BTreeSet<u64>, Option<Ms>);
+pub(crate) type RecallWait = (BTreeSet<u64>, Option<WaitMs>);
 
 impl ReadState {
     pub(crate) fn container_sizes(&self) -> Vec<(&'static str, usize)> {
@@ -209,7 +210,7 @@ pub(crate) struct ReadState {
     /// `finish` parks.
     pub(crate) parked_local: BTreeMap<Rid, (RecallWait, Option<u64>)>,
     /// Inodes an inbox op waits to execute on: no new grants until then.
-    pub(crate) blocked: BTreeMap<Ino, Ms>,
+    pub(crate) blocked: BTreeMap<Ino, WaitMs>,
     /// Strict reads answered by a tail to head (no live sequencer, or no
     /// P2P): the leader's job, not yet started, that later reads join —
     /// a tail that starts after a read began covers it — and each
@@ -241,14 +242,14 @@ impl Core {
         if !self.cfg.read_delegations {
             return;
         }
-        if let Some(until) = replica.load_grant_quarantine(now.wall.0) {
+        if let Some(until) = replica.load_grant_quarantine(now) {
             tracing::info!(
                 node = self.cfg.node_id,
-                wait_ms = until - now.wall.0,
+                wait_ms = until.since(now.wait),
                 "read delegations granted before this restart may still be honoured; \
                  acknowledgements wait until they have expired"
             );
-            let id = self.set_timer_wall(Ms(until), Timer::GrantQuarantine, out);
+            let id = self.set_timer_wait(until, Timer::GrantQuarantine, out);
             self.rd.quarantine_timer = Some(id);
         }
     }
@@ -265,7 +266,7 @@ impl Core {
         }
         if let Some(until) = replica
             .read_delegations()
-            .leave_alone(now.wall.0, self.cfg.kernel_cache_ttl_ms)
+            .leave_alone(now.wait, self.cfg.kernel_cache_ttl_ms)
         {
             tracing::info!(
                 node = self.cfg.node_id,
@@ -274,7 +275,7 @@ impl Core {
                  acknowledgements wait once for the entries cached until now to expire"
             );
             if self.rd.quarantine_timer.is_none() {
-                let id = self.set_timer_wall(Ms(until), Timer::GrantQuarantine, out);
+                let id = self.set_timer_wait(until, Timer::GrantQuarantine, out);
                 self.rd.quarantine_timer = Some(id);
             }
         }
@@ -393,7 +394,7 @@ impl Core {
             .rd
             .blocked
             .get(&ino)
-            .is_some_and(|until| *until > now.wall)
+            .is_some_and(|until| *until > now.wait)
         {
             return None;
         }
@@ -406,8 +407,10 @@ impl Core {
         if ttl <= 0 {
             return None;
         }
-        let until = now.wall.0 + ttl + margin;
-        if !replica.note_grant_horizon(until) {
+        // The grant's record runs on this node's wait clock; the restart
+        // horizon is persisted as a wall value (plan 43 C7-H1, R9).
+        let until = now.wait.plus((ttl + margin) as u64);
+        if !replica.note_grant_horizon(now.wall_of_wait(until).0) {
             return None;
         }
         let id = replica.read_delegations().grant(to, ino, until);
@@ -429,13 +432,11 @@ impl Core {
         except: Option<NodeId>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
-    ) -> Option<(BTreeSet<u64>, Option<Ms>)> {
+    ) -> Option<(BTreeSet<u64>, Option<WaitMs>)> {
         if !self.cfg.recall_before_ack {
             return None;
         }
-        let need = replica
-            .read_delegations()
-            .touching(inos, except, now.wall.0);
+        let need = replica.read_delegations().touching(inos, except, now.wait);
         self.start_recalls(now, need, out)
     }
 
@@ -444,7 +445,7 @@ impl Core {
         now: Now,
         need: RecallNeed,
         out: &mut Vec<Action>,
-    ) -> Option<(BTreeSet<u64>, Option<Ms>)> {
+    ) -> Option<(BTreeSet<u64>, Option<WaitMs>)> {
         if need.is_empty() {
             return None;
         }
@@ -455,7 +456,7 @@ impl Core {
                 continue;
             }
             let req = self.op_id();
-            let timer = self.set_timer_wall(Ms(g.until_ms), Timer::GrantExpiry(g.id), out);
+            let timer = self.set_timer_wait(g.until, Timer::GrantExpiry(g.id), out);
             self.rd.recalls.insert(g.id, Recalling { req, timer });
             self.rd.recall_by_req.insert(req, g.id);
             self.stats.recalls_sent += 1;
@@ -475,9 +476,9 @@ impl Core {
                 },
             });
         }
-        let quarantine = need.quarantine_until.map(Ms);
+        let quarantine = need.quarantine_until;
         if let (Some(at), None) = (quarantine, self.rd.quarantine_timer) {
-            let id = self.set_timer_wall(at, Timer::GrantQuarantine, out);
+            let id = self.set_timer_wait(at, Timer::GrantQuarantine, out);
             self.rd.quarantine_timer = Some(id);
         }
         let _ = now;
@@ -858,9 +859,9 @@ impl Core {
 
     /// Arm the quarantine timer at `at` (plan 30 §M9's successor floor
     /// joins M8's restart quarantine).
-    pub(crate) fn arm_grant_quarantine(&mut self, at: Ms, out: &mut Vec<Action>) {
+    pub(crate) fn arm_grant_quarantine(&mut self, at: WaitMs, out: &mut Vec<Action>) {
         if self.rd.quarantine_timer.is_none() {
-            let id = self.set_timer_wall(at, Timer::GrantQuarantine, out);
+            let id = self.set_timer_wait(at, Timer::GrantQuarantine, out);
             self.rd.quarantine_timer = Some(id);
         }
     }
@@ -1318,7 +1319,7 @@ impl Core {
         // node for the kernel-cache latch too.
         self.note_foreign(now, replica, out);
         // `all_live` carries the kernel drain, not the restart quarantine.
-        let need = replica.read_delegations().all_live(now.wall.0);
+        let need = replica.read_delegations().all_live(now.wait);
         match self.start_recalls(now, need, out) {
             None => false,
             Some(wait) => {
@@ -1347,7 +1348,7 @@ impl Core {
             return false;
         };
         let until = now
-            .wall
+            .wait
             .plus(2 * (self.cfg.read_delegation_ttl_ms + self.cfg.expiry_margin_ms));
         for ino in inos {
             self.rd.blocked.insert(*ino, until);
@@ -1361,7 +1362,7 @@ impl Core {
         for ino in inos {
             self.rd.blocked.remove(ino);
         }
-        self.rd.blocked.retain(|_, until| *until > now.wall);
+        self.rd.blocked.retain(|_, until| *until > now.wait);
     }
 
     pub(crate) fn on_delegation_recalled(
@@ -1405,8 +1406,8 @@ impl Core {
     ) {
         self.rd.quarantine_timer = None;
         let q = replica.read_delegations().quarantine_until();
-        if q > now.wall.0 {
-            let id = self.set_timer_wall(Ms(q), Timer::GrantQuarantine, out);
+        if q > now.wait {
+            let id = self.set_timer_wait(q, Timer::GrantQuarantine, out);
             self.rd.quarantine_timer = Some(id);
             return;
         }
@@ -1447,7 +1448,7 @@ impl Core {
             .iter()
             .filter(|(_, p)| {
                 p.waiting.is_empty()
-                    && p.quarantine.is_none_or(|q| q <= now.wall)
+                    && p.quarantine.is_none_or(|q| q <= now.wait)
                     && p.durable
                         .is_none_or(|j| j <= shipped || self.durable_covers(j))
                     && p.deps.as_ref().is_none_or(|d| replica.reaches_streams(d))

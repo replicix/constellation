@@ -1086,7 +1086,7 @@ pub async fn client_lock(
         if !entered {
             ghost.enter(ino, node, thread, step.mode, clock.elapsed_ms());
             if fresh_grant && !wrote {
-                let own_epoch = h.view().s3_held.map(|(e, _)| e);
+                let own_epoch = h.view().s3_held.map(|(e, _, _)| e);
                 ghost.check_visible(ino, node, clock.elapsed_ms(), &h.meta, own_epoch);
                 let data = ghost.data_ino(step.file, ino);
                 // A read of the data file waits for the watermark, as a

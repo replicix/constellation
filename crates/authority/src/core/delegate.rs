@@ -57,7 +57,7 @@ use super::backup::{FreshHold, FreshVerdict};
 use super::{Core, Timer};
 use crate::action::{Action, ControlOk};
 use crate::event::PeerMsg;
-use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, TimerId};
+use crate::ids::{HonourMs, Ms, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{Ownership, Range};
@@ -115,8 +115,9 @@ pub(crate) struct GenState {
     /// Phase 2b: ended by a cross-subtree op: delegate the directory to
     /// the same node again once the op executed.
     pub redelegate: bool,
-    /// When the root granted it (placement's dwell counts from here).
-    pub granted: Ms,
+    /// When the root granted it (placement's dwell counts from here; the
+    /// cut's designation-online check), on the wait clock.
+    pub granted: WaitMs,
     /// Placement: since when the delegate's share has been below the
     /// leave threshold (`None`: it is not).
     pub below_since: Option<Ms>,
@@ -124,11 +125,12 @@ pub(crate) struct GenState {
     pub seal_attempts: u8,
     /// Appended through this stream index.
     pub cursor: u64,
-    /// The root outwaits the delegate once its clock reaches this.
-    pub until: Ms,
+    /// The root outwaits the delegate once its **wait** clock reaches this
+    /// (plan 43 C7-H1: a forward wall step must not end an outwait early).
+    pub until: WaitMs,
     /// What the renewals alone gave `until` (the rest is the delegate's
     /// stream, `Core::deleg_live_by_stream`).
-    pub renewed_until: Ms,
+    pub renewed_until: WaitMs,
     pub recall: RecallPhase,
     /// The phase a seal of the backup replaced: what an unanswered seal
     /// goes back to.
@@ -374,7 +376,7 @@ pub(crate) struct DelegationState {
     late: BTreeMap<OpId, LateReq>,
     /// The latest freezes of the heartbeat thread handed over
     /// (`Event::OwnFreeze`), oldest first, at most [`FREEZES_KEPT`].
-    freezes: Vec<(Ms, Ms)>,
+    freezes: Vec<(WaitMs, WaitMs)>,
     /// Local ops whose execution waits for a recall or for `deps` (their
     /// `finish` is deferred to the parked continuation).
     pub pending_exec: BTreeSet<Rid>,
@@ -405,7 +407,7 @@ pub struct DelegView {
     /// `until` a reading of this node's honour clock (plan 43 C7-H1; the
     /// engine's `DelegView` judges it on that clock).
     pub mine: Vec<(Ino, u64, i64, bool, u64, u64, usize)>,
-    /// `(dir, node, gen, cursor, until_ms, recall, ended)`.
+    /// `(dir, node, gen, cursor, until_ms (wall, for status), recall, ended)`.
     pub gens: Vec<(Ino, NodeId, u64, u64, i64, String, bool)>,
     pub pending_exec: usize,
     /// Phase 2b: per generation held here, `(gen, backup, backup_acked)`.
@@ -444,7 +446,8 @@ impl Core {
                         g.node,
                         gen_of(g, &self.dl.gens),
                         g.cursor,
-                        g.until.0,
+                        // Status: a wall stamp, from the wait-clock end.
+                        self.clk.wall_of_wait(g.until).0,
                         format!("{:?}", g.recall),
                         g.ended,
                     )
@@ -655,15 +658,15 @@ impl Core {
                         },
                         backup: None,
                         redelegate: false,
-                        granted: now.wall,
+                        granted: now.wait,
                         below_since: None,
                         seal_attempts: 0,
                         cursor,
                         until: now
-                            .wall
+                            .wait
                             .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
                         renewed_until: now
-                            .wall
+                            .wait
                             .plus(self.reclaim_horizon_ms() + self.dl.inherit_slack_ms),
                         recall: RecallPhase::None,
                         recall_before_seal: RecallPhase::None,
@@ -762,7 +765,7 @@ impl Core {
         let mut dropped = self.lock_take_generation(gen, replica);
         if self.lease.held.is_some() && !self.lease.lost {
             let (kept, rest): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|g| {
-                g.until_ms > now.wall.0
+                g.until > now.wait
                     && matches!(
                         replica.resolve_ownership(&Self::read_keys(g.ino, None)),
                         constellation_meta::delegation::Ownership::Root
@@ -770,6 +773,7 @@ impl Core {
             });
             dropped = rest;
             if !kept.is_empty() {
+                let kept = kept.iter().map(|g| g.to_wire(now)).collect();
                 self.lock_install_leaving(now, gen, kept, replica);
             }
         }
@@ -2315,7 +2319,7 @@ impl Core {
                 if g.node == from && !g.ended && g.recall == RecallPhase::None {
                     ttl_ms = self.cfg.delegation_ttl_ms.min(cap);
                     if ttl_ms > 0 {
-                        let until = now.wall.plus(ttl_ms + extra);
+                        let until = now.wait.plus(ttl_ms + extra);
                         if until > g.until {
                             g.until = until;
                         }
@@ -2638,7 +2642,7 @@ impl Core {
 
     /// The heartbeat thread was frozen from `from` to `until`
     /// ([`Event::OwnFreeze`]); the same freeze, grown, replaces the last.
-    pub(crate) fn on_own_freeze(&mut self, from: Ms, until: Ms) {
+    pub(crate) fn on_own_freeze(&mut self, from: WaitMs, until: WaitMs) {
         if until <= from {
             return;
         }
@@ -2695,13 +2699,13 @@ impl Core {
         self.stats.deleg_grants_lost += 1;
         let due = Self::deleg_loss_due(d, self.deleg_request_timeout_ms());
         let lapse_point = self.deleg_lapse_at(d);
-        // The freezes are stamps of the driver's wake clock (wall until the
-        // liveness commit of plan 43 C7-H1): the honour stamps here are
-        // read on it through the last step's reading, for the statistic.
+        // The freezes are stamps of the driver's wake clock (the wait
+        // clock): the honour stamps here are read on it through the last
+        // step's reading, for the statistic.
         if let Some(len) = crate::deleg_lane::freeze_explains(
             &self.dl.freezes,
-            self.clk.wall_of_honour(due),
-            self.clk.wall_of_honour(lapse_point),
+            self.clk.wait_of_honour(due),
+            self.clk.wait_of_honour(lapse_point),
         ) {
             self.stats.deleg_lapses_frozen += 1;
             self.stats.deleg_last_freeze_ms = len as u64;
@@ -2840,7 +2844,7 @@ impl Core {
         }
         if self.lease.epoch_held() {
             let ttl = self.cfg.delegation_ttl_ms;
-            self.ack.note_hold_grant(now.wall.0 + ttl as i64);
+            self.ack.note_hold_grant(now.wait.plus(ttl));
             return ttl;
         }
         // Plan 43 C7-H1 (R6): the lease's end on the honour clock; no
@@ -3050,7 +3054,7 @@ impl Core {
         };
         // Plan 30 §M14: the subtree's lock grants go back with the answer;
         // its waiters are told to ask the root.
-        let locks = self.lock_hand_back(now.wall, gen, replica);
+        let locks = self.lock_hand_back(now, gen, replica);
         let seen = replica
             .delegation_table()
             .iter()
@@ -3071,7 +3075,7 @@ impl Core {
         // recalled first; the root executes under the subtree only once
         // they are gone (or, past the horizon, expired).
         if self.cfg.read_delegations {
-            let need = replica.read_delegations().all_live(now.wall.0);
+            let need = replica.read_delegations().all_live(now.wait);
             if let Some(wait) = self.start_recalls(now, need, out) {
                 self.park(
                     now,
@@ -3153,9 +3157,9 @@ impl Core {
                     .rd
                     .blocked
                     .get(&ino)
-                    .is_some_and(|until| *until > now.wall)
+                    .is_some_and(|until| *until > now.wait)
             {
-                let until = now.wall.0 + ttl + margin;
+                let until = now.wait.plus((ttl + margin) as u64);
                 let id = replica.read_delegations().grant(from, ino, until);
                 self.stats.deleg_read_grants += 1;
                 Some(crate::event::ReadGrantMsg {
@@ -3410,11 +3414,11 @@ impl Core {
             // §5.2).
             return;
         }
-        let at = g.until.max(now.wall);
+        let at = g.until.max(now.wait);
         if let Some(t) = g.expiry {
             self.cancel_timer(t, out);
         }
-        let t = self.set_timer_wall(at, Timer::DelegExpiry(gen), out);
+        let t = self.set_timer_wait(at, Timer::DelegExpiry(gen), out);
         self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
     }
 
@@ -3439,13 +3443,13 @@ impl Core {
             // shortly, or a recall in flight is never outwaited — an
             // execution parked on it waits forever (long-delegated seed
             // 70051: 85 000 simulated seconds of timers).
-            let again = now.wall.plus(self.cfg.delegation_stream_tick_ms.max(100));
-            let t = self.set_timer_wall(again, Timer::DelegExpiry(gen), out);
+            let again = now.wait.plus(self.cfg.delegation_stream_tick_ms.max(100));
+            let t = self.set_timer_wait(again, Timer::DelegExpiry(gen), out);
             self.dl.gens.get_mut(&gen).expect("present").expiry = Some(t);
             return;
         }
         let g = self.dl.gens.get(&gen).expect("present").clone();
-        if now.wall < g.until {
+        if now.wait < g.until {
             self.arm_gen_expiry(now, gen, out);
             return;
         }
@@ -3477,7 +3481,7 @@ impl Core {
             g.seal_attempts = 1;
             g.recall_before_seal = g.recall;
             g.recall = RecallPhase::Sealing;
-            g.until = now.wall.plus(self.cfg.forward_timeout_ms * 2);
+            g.until = now.wait.plus(self.cfg.forward_timeout_ms * 2);
             self.dl.by_req.insert(req, (gen, ReqKind::Seal));
             self.stats.deleg_seals_sent += 1;
             tracing::info!(
@@ -3505,7 +3509,7 @@ impl Core {
                     node = self.me(),
                     gen,
                     until = g.until.0,
-                    now = now.wall.0,
+                    now = now.wait.0,
                     "reclaiming an unrenewed delegation"
                 );
             }
@@ -3698,11 +3702,11 @@ impl Core {
             return;
         }
         // (The expiry timer re-arms itself when it fires before `until`.)
-        if now.wall >= g.renewed_until {
+        if now.wait >= g.renewed_until {
             // The renewals alone would have let it be outwaited.
             self.stats.deleg_live_by_stream += 1;
         }
-        g.until = g.until.max(now.wall.plus(ttl + extra));
+        g.until = g.until.max(now.wait.plus(ttl + extra));
     }
 
     /// The root appends a delegate's batch, and acknowledges the stream
@@ -3718,7 +3722,7 @@ impl Core {
         gen: u64,
         round: u64,
         txs: Vec<constellation_meta::DelegateTx>,
-        leaving: Vec<constellation_meta::locks::Grant>,
+        leaving: Vec<constellation_meta::locks::GrantWire>,
         leaving_barriers: Vec<(Ino, i64)>,
         replica: &dyn Replica,
         out: &mut Vec<Action>,
@@ -3991,12 +3995,12 @@ impl Core {
                 kind,
                 backup: None,
                 redelegate: false,
-                granted: now.wall,
+                granted: now.wait,
                 below_since: None,
                 seal_attempts: 0,
                 cursor: 0,
-                until: now.wall.plus(self.reclaim_horizon_ms()),
-                renewed_until: now.wall.plus(self.reclaim_horizon_ms()),
+                until: now.wait.plus(self.reclaim_horizon_ms()),
+                renewed_until: now.wait.plus(self.reclaim_horizon_ms()),
                 recall: RecallPhase::None,
                 recall_before_seal: RecallPhase::None,
                 ended: false,

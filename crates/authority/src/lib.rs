@@ -40,8 +40,8 @@ pub use action::{
     Action, ClientReply, ControlOk, LockAnswer, LockTestAnswer, ReadAnswer, S3Op, TimerKind,
 };
 pub use core::{
-    lease_may_carry, resolve_epoch_claims, Config, Core, DelegRenewCert, EpochClaimView,
-    EpochState, InboxView, LockView, ShipState, Stats,
+    beat_sent_ms, lease_may_carry, resolve_epoch_claims, Config, Core, DelegRenewCert,
+    EpochClaimView, EpochState, InboxView, LockView, ShipState, Stats,
 };
 pub use event::{
     Carrier, CasFailure, Control, Event, LockOutcome, LockRenewEntry, LockRenewResult,

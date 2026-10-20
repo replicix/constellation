@@ -39,7 +39,7 @@
 //! The newtypes [`Ms`] (WALL), [`HonourMs`] and [`WaitMs`] each carry one
 //! reading. They share no `From` and no arithmetic; the only crossings are
 //! the four named conversions of [`Now`] (`wall_of_wait`, `wall_of_honour`,
-//! `wait_of_wall`, `honour_of_wait`), each of which maps a *remaining
+//! `wait_of_wall`, `wait_of_honour`), each of which maps a *remaining
 //! duration* onto the target clock *now*, so a step before the conversion
 //! is absorbed and only the offset at that instant matters.
 //!
@@ -223,12 +223,12 @@ impl Now {
         WaitMs(map_remaining(at.0, self.wall.0, self.wait.0))
     }
 
-    /// A WAIT deadline as a HONOUR value: the holder's beat maps its
-    /// guard of WAIT deadlines onto the honour clock it stamps its beats
-    /// with (row 27), at send, so the mapped value covers real time
-    /// (P2, P3).
-    pub fn honour_of_wait(&self, at: WaitMs) -> HonourMs {
-        HonourMs(map_remaining(at.0, self.wait.0, self.honour.0))
+    /// A HONOUR deadline as a WAIT value: the time left on a holder's
+    /// window, as a stamp of the wait clock (a statistic that relates a
+    /// holder's window to wait-clock stamps of freezes). Never used to
+    /// decide what a node honours or waits out.
+    pub fn wait_of_honour(&self, at: HonourMs) -> WaitMs {
+        WaitMs(map_remaining(at.0, self.honour.0, self.wait.0))
     }
 }
 
@@ -854,7 +854,7 @@ mod tests {
         assert_eq!(now.wall_of_wait(WaitMs(3_000_250)), Ms(1_000_250));
         assert_eq!(now.wall_of_honour(HonourMs(5_000_250)), Ms(1_000_250));
         assert_eq!(now.wait_of_wall(Ms(1_000_250)), WaitMs(3_000_250));
-        assert_eq!(now.honour_of_wait(WaitMs(3_000_250)), HonourMs(5_000_250));
+        assert_eq!(now.wait_of_honour(HonourMs(5_000_250)), WaitMs(3_000_250));
         // A deadline already past maps below now.
         assert_eq!(now.wall_of_wait(WaitMs(2_999_000)), Ms(999_000));
         // Round trips.
@@ -867,11 +867,11 @@ mod tests {
         assert_eq!(now.wall_of_wait(WaitMs(i64::MAX)), Ms(i64::MAX));
         assert_eq!(now.wall_of_honour(HonourMs(i64::MAX)), Ms(i64::MAX));
         assert_eq!(now.wait_of_wall(Ms(i64::MAX)), WaitMs(i64::MAX));
-        assert_eq!(now.honour_of_wait(WaitMs(i64::MAX)), HonourMs(i64::MAX));
+        assert_eq!(now.wait_of_honour(HonourMs(i64::MAX)), WaitMs(i64::MAX));
         assert_eq!(now.wall_of_wait(WaitMs(0)), Ms(0));
         assert_eq!(now.wall_of_honour(HonourMs(0)), Ms(0));
         assert_eq!(now.wait_of_wall(Ms(0)), WaitMs(0));
-        assert_eq!(now.honour_of_wait(WaitMs(0)), HonourMs(0));
+        assert_eq!(now.wait_of_honour(HonourMs(0)), WaitMs(0));
         assert_eq!(now.wall_of_wait(WaitMs(i64::MIN)), Ms(0));
         assert_eq!(now.wait_of_wall(Ms(i64::MIN)), WaitMs(0));
         // A remaining duration near the top saturates instead of wrapping.

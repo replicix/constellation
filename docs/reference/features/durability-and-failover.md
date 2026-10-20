@@ -489,20 +489,25 @@ margin, their holders honouring them from their own send less another
 margin), so nothing it answered is honoured once its own clock reads the
 expiry of the lease it held. Its off-core heartbeat (every
 `backup_heartbeat_ms`, to its backups, or to its stream subscribers under
-`ack=s3`) carries the holder's **honour clock** when it was sent, the end
-of the lease it honours on that clock and the guard (below) mapped onto it,
+`ack=s3`) carries the holder's **wait clock** when it was sent, the end
+of the lease it holds on that clock and the guard (below) on it too,
 with the id of that clock (a restarted holder is a new process with a new
 clock), and the lease body's wall expiry (the seal watch's). The lease
-object itself carries the holder's honour end (`holder_expires_ms`) and the
-clock id (`holder_clock`) it was written under. Each beat is stamped on
-arrival with the successor's clock: each beat says the holder's clock read
-the one value no later than the successor's read the other. The successor therefore ends its wait at the earlier of
+object itself carries the same end on the holder's wait clock
+(`holder_wait_ms`), beside the end it honours on its honour clock
+(`holder_expires_ms`) and the clock id (`holder_clock`) it was written
+under. Each beat is stamped on arrival with the successor's wait clock:
+each beat says the holder's clock read the one value no later than the
+successor's read the other. The successor therefore ends its wait at the earlier of
 the bound and `X + min(arrival − sent) + one margin`, where `X` is the
 latest of the expiry of the lease it replaced, the expiries the beats
 named, and what the beats named as the holder's *guard*, and `min` is over
 the beats sent within 250 margins of `X` (so the two clocks' rates, within
 1 000 ppm, cannot drift apart by more than half a margin over the span);
 if that has passed when its marker lands, there is no wait at all. The
+wait, and the quarantines and graces it sets, run on the successor's **wait
+clock** (plan 43 C7-H1): a forward step of its wall clock does not end them
+early and a backward one does not lengthen them. The
 guard is what the holder itself waits out and its lease does not cap: its
 own takeover floor (which can be longer than its lease: 23.5 s against a
 20 s lease at the defaults), a released takeover's lock grace, a
@@ -518,18 +523,21 @@ it needs a bounded clock *rate*, not a bounded offset. The successor keeps
 the beats' terms per holder clock id (at most two) and takes the latest
 `X + min(arrival − sent)` over the ids, so an earlier incarnation's beats
 still count and two clocks' values are never mixed; `X` takes the replaced
-lease's own honour end for the clock id that wrote it, and a replaced lease
+lease's own wait-clock end for the clock id that wrote it, and a replaced lease
 none of the beats' clocks wrote has no cap (the bound). A holder's wall
-step does not disturb the beats' differences: its honour clock ignores a
-backward step and counts a forward one once. A forward step of the holder
-between its last lease renewal and the seal is the case the honour clock
-does not close: every later beat's `sent` jumps by the step while the
-lease's honour end (written before it) does not, so the cap is early by the
-step for grants made before it, until the holder's next renewal. A step
-over about three margins can then give two nodes a conflicting lock, or a
-reader a stale strict answer (plan 43 C7-H1's open item R7, the same hole
-the wall clock had; its commit 3 closes it by stamping the beat and the
-lease body's end on the wait clock). Counting from the
+step does not disturb the beats' differences: the holder's wait clock
+ignores a wall step in both directions and never over-counts real time, so
+`end − sent` never under-estimates the time the lease has left, whatever the
+holder's wall clock did between its last lease renewal and the seal. (The
+honour clock would not do: it counts a forward step as elapsed time that
+the clocks of the holder's grantees, which did not step, never saw. The
+beats and the lease's end were on it in the first two commits of plan 43
+C7-H1, and a forward step of the holder after its last renewal made the cap
+early by the step for grants made before it, until the holder's next
+renewal: a step over about three margins gave two nodes a conflicting lock,
+or a reader a stale strict answer. Stamping them on the wait clock closed
+it.) The only cost is conservative: a holder suspended or paused between
+its last renewal and the seal leaves a later cap. Counting from the
 last renewal the successor saw instead would be unsafe: the holder's other
 proofs of S3 liveness (segment runs and puts, a lease read) are invisible
 to the successor, and the holder answers within the takeover window of

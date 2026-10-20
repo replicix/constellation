@@ -53124,3 +53124,178 @@ job under `timeout --kill-after=30s`, none hit it:
   30 GB box: the `cto` binary reached 29 GB; this commit changes comments only
   in that crate).
 - The sweeps, harness runs and benchmarks above.
+
+## Plan 43 C7-H1, commit 3 of 4: a node waits out others' rights on its wait clock
+
+The wait half of C7-H1 (plan 43 §7 C7, §11 Q19), and the close of the open
+item R7 that commit 2's review found. A node that waits out someone else's
+right measures the wait on its **wait clock** (`ProtocolClock::wait`: never
+over-counts real time, ignores every wall step), so a forward step of its wall
+clock never ends a wait early and a backward one never lengthens it. Values
+that cross a node or a restart stay wall-clock. The liveness timers and the
+error-producing deadlines are 4/4.
+
+### What landed
+
+- Owner side (`meta::locks`, `core::locks`): `Grant.until` is a `WaitMs` (the
+  owner's record of a grant, `drop_expired`, `conflicting`, `own_grant`,
+  `extend`, `install_if_consistent`, the memory of ended grants, `Doubt`), as
+  are the lock table's restart quarantine, `Waiter.recv` (the arrival a grant
+  served from the queue is live from), the subtree graces and the grace-end
+  timer, the owner's expiry timers, the waiters' silence windows, the
+  renewal's `until`, the restamp of a moved, reclaimed or mirrored grant, and
+  `lock_cut_here`'s liveness of a designee (`heads.2`, `GenState.granted`). The
+  carry's two measures of what is left of a record (`lock_left`,
+  `carried_until`, b41f472) are durations on the wait clock. `lock_waited_since`,
+  `Waiter.since`, `LockOp.since` and `served` (the queue keys, which commit 2
+  classified as wait-side) are on it too. `confirmed_ms`, the cut and the
+  barriers stay wall (rows 6 and 9, C7b); a barrier made from a record's end is
+  `wall_of_wait(until)` at the moment it is made.
+- `Grant` is the table form and no longer serializes; `GrantWire` is the wire
+  form (mirror, delegation handoff, recall answer, leaving grants): its end is
+  the sender's wall clock and informational, the receiver records its own end
+  (`GrantWire::into_grant(until)`: from its receipt or from a carried
+  remainder), so no wait-clock reading of one node is ever read by another.
+- Root side: a generation's `until`/`renewed_until` (the outwait, the
+  inherited slack, `deleg_live_by_stream`, the expiry timer and its re-arm),
+  read-delegation grants (`ReadGrant.until`, `touching`, `all_live`, the
+  quarantine, the drain after another node showed itself, a grant by a delegate)
+  and the inbox's recall block are `WaitMs`. The status view's `until_ms`
+  stays a wall stamp (`wall_of_wait`).
+- The takeover floor, `pending_cap`, the read and lock quarantines it sets, the
+  grants made under a continuation epoch's hold, and `in_takeover_floor`
+  (`takeover_floor_until() -> WaitMs`; the engine's release hold and the
+  upgrade handover wait on it).
+- Arrival and the seal watch: `HolderAlive.at`, `BackupAlive.at`, `OwnLag`,
+  `OwnFreeze`, `PeerLink.last_seen/since`, `HolderBeats.heard_at/last/late`,
+  `BackupState.last_heard`, `takeover_read_at`, `holder_silent_since`,
+  `own_lapses`, the backup liveness of the holder (`BackupPeer.last_progress`,
+  `alive_at`, `short_since`), the stream subscription's stamps (`last_frame`)
+  and the inbox's `down_since`. `known_expiry` stays the wall expiry the beats
+  and appends name (row 24, C7b); the watch's timer is `due.min(wait_of_wall(
+  expires))`. The driver's `OffCore` (lag probe, lapses, freezes, the beat
+  thread's wake stamps, busy and echo stall detection) reads the wait clock
+  throughout, as does the P2P handler's arrival stamp.
+- Persistence (R9): the restart horizons (`PersistLockHorizon`,
+  `note_grant_horizon`) are written as `now.wall_of_wait(horizon)`; the lock
+  owner's durable horizon is the persisted value converted back with
+  `wait_of_wall` when the write lands, so each comparison is wait with wait;
+  `load_*_quarantine(now)` returns the time left on the new process's wait
+  clock. The promise's join gate (`Meta::promise_join_begin(now)`) waits the
+  promise out on the wait clock of the process that issued it (a persisted
+  value of an earlier process is read on the wall clock: row 14, C7a).
+- **R7, the beat cap.** The beat's `sent_ms`, `expires_ms` and `guard_ms` are
+  readings of the holder's wait clock (`beat_sent_ms`; the guard is no longer
+  mapped onto the honour clock, `Now::honour_of_wait` is gone and
+  `wait_of_honour` remains for a statistic), and the lease body carries the
+  lease's end on that clock (`Lease::holder_wait_ms`, written with the honour
+  end at each grant and renewal; `LeaseState::wait_until`). The honour end
+  stays what the holder honours; the beat's `expires_ms` and the replaced
+  lease's term in `beat_cap` are the wait end. `end − sent` then never
+  under-estimates the time left on the lease whatever the holder's wall clock
+  did after its last renewal, where the honour clock counted a forward step
+  as elapsed time its grantees' clocks never saw.
+- Engine: the release hold, the arrival stamps, the peer-link projection, the
+  FUSE path's read-delegation recall (`touching`, from the op's `Now`).
+
+### Tests
+
+- Core: `a_forward_step_does_not_shorten_the_owners_outwait`,
+  `a_backward_step_does_not_lengthen_the_owners_outwait`,
+  `a_forward_step_does_not_shorten_a_lock_quarantine` (lock and read),
+  `a_forward_step_does_not_shorten_a_generation_outwait`,
+  `the_persisted_horizon_is_written_as_wall_and_loaded_as_wait`,
+  `a_forward_step_does_not_shorten_the_takeover_floor`,
+  `the_beat_guard_is_the_wait_value_and_a_step_does_not_move_it`, and for R7
+  `the_beat_cap_covers_grants_made_before_a_forward_step_of_the_holder` (a
+  holder renews, steps +5 s, beats; the successor's cap must be the lease's
+  real end plus a margin). Meta: `the_join_gate_waits_the_promise_out_on_the_
+  wait_clock`. Engine: `release_hold_is_not_shortened_by_a_forward_step`.
+  Fail-before, shown with the fix reverted in a scratch copy at the sites
+  (`beat_sent_ms` the honour reading; the grant-expiry handler, the floor, the
+  generation outwait and the quarantine compared with the wall reading; the
+  horizon written without the conversion): the owner, floor, generation and R7
+  tests fail at their assertions (the R7 cap is 5 s early: 1 006 000 against
+  1 011 000), the horizon and quarantine tests do not terminate (the horizon
+  is never durable, the requests loop until the harness runs out of memory).
+- Sim wrappers (9 seeds around the first failing seeds each):
+  `a_lock_owner_stepped_forward_does_not_outwait_a_grant_early`,
+  `a_successor_stepped_forward_keeps_its_takeover_floor`,
+  `a_root_stepped_forward_does_not_outwait_a_delegation_early`,
+  `a_cut_holder_stepped_forward_does_not_cap_its_successors_floor_early`; the
+  wait-side step configurations are in `long_locks`.
+- New configuration `strict-isolated-reader-holder-step-forward` reaches R7:
+  `strict-isolated-reader-beats` with the holder cut from S3 only (it keeps
+  beating) and stepped forward 4 s just after the cut, so no renewal after the
+  step lands; its honour clock follows the step, the beats' `sent` jump by 4 s
+  while the lease end they are compared with does not, and the successor's cap
+  is 4 s early for the read delegations granted before it: close-to-open fails
+  (3 of 2 000 seeds on 28f91b2: 605, 710, 1319; the cap was already past when
+  the marker landed in 1 997 floors, against 0 now).
+
+### Fail-before and after (2 000 seeds, 28f91b2 -> this tree)
+
+| configuration | before | after |
+|---|---|---|
+| `locks-root-step-forward` | 1 821 | 0 |
+| `fast-takeover-holder-step-forward` | 18 | 0 |
+| `fast-takeover-successor-step-forward` | 21 | 0 |
+| `delegated-root-step-forward` | 4 | 0 |
+| `strict-isolated-reader-holder-step-forward` (new, R7) | 3 | 0 |
+| `locks-holder-step-back-sealed` (-8 s) | 1 (seed 1892) | 0 |
+| `locks-locker-step-back`, `strict-reader-step-back`, `delegated-delegate-step-back` | 0 | 0 |
+| `locks-root-step-back`, `locks-holder-step-forward` (controls) | 0, 0 | 0, 0 |
+
+`fast-takeover-holder-step-forward` changes class, not only count: on 28f91b2
+a forward step of the holder made it drop its backup for "no acknowledgement
+progress" (`now − last_progress` on the wall clock jumped by the step), so
+only 142 of 2 000 seeds had a seal and the cap was reached in 6; now the
+backup stays (`last_progress` is on the wait clock) and every seed seals, the
+beat cap included, with no failure. Seed 1892 of `locks-holder-step-back-sealed`
+(a stepped-back claimant's wall expiry: C7b) no longer fails; the offset it
+needs is gone with the dropped backup, not fixed.
+
+No-step sweeps, 28f91b2 against this tree (64 configurations, 2 000 seeds each,
+`long-backup` 500; the seven of the spec, every `locks-*`, the thread-mode
+ones and the strict and delegated ones): the failing seeds are identical in
+every one (the four negative controls fail on the same seeds: 1, 209, 1 973 and
+2), and the floor counters (takeovers, seals, floors armed, capped, saved ms,
+p50/p90/max, guards that rose) are identical in every configuration.
+
+### Unchanged on purpose
+
+- Commit 4: the housekeeping stamps and timers (`set_timer_wall` sites), the
+  error-producing deadlines (`s3_less_deadline`, the inbox deadline, client
+  deadlines), idle release, the handoff pause, `last_write`, `Ask.at`,
+  `HeldAnswer.since`, placement.
+- Wall by design: the lease body's `expires_unix_ms` and the identity keys,
+  `known_expiry` and the seal watch's expiry compares (row 24), `pr.issued`
+  and the promises' values (rows 3, 25), `is_claimable`, `classify`, the
+  barriers and the lock cut, a token's window and `Grant.confirmed_ms`, the
+  status stamps. Cross-node offsets (C7b) and rate (C7a) are unchanged.
+- `LockCancel.sent/upto` and `LockRequest.sent` are the requester's honour
+  readings, only compared with each other; `lease_renew_for_grants` compares
+  remaining honour durations: both stay on the honour clock.
+
+### Harness
+
+Daemons built from this tree, no load but the scenario: `lock-failover` with
+`clock:step:+3000:6000,clock:step:-3000:12000` (b, c and d step forward and
+back; status.clock counts both) passes, the contender granted 0.49 ms after the
+unlock; `backup-failover` p50 1.494 s (1.492 s on commit 2's run);
+`s3-cut-holder-failover-with-locks` passes (takeover 13.65 s, 13.59 s on commit
+2); `unmount-inside-the-takeover-floor` passes (takeover after 1.20 s).
+
+### Gates
+
+On the box (kernel 7.3, 16 cores; `/tmp` on tmpfs), every job under `timeout
+--kill-after=30s`, none hit it:
+
+- `cargo fmt --check`; `cargo clippy --workspace --all-targets -- -D warnings`
+  clean.
+- `cargo test --release --workspace --exclude constellation-model
+  --no-fail-fast`: 3 322 passed, 0 failed, 43 ignored over 88 targets (the
+  authority lib 499, the engine lib 816, the sim 154 included).
+- `cargo test --release -p constellation-model -- --test-threads=2`: 167
+  passed, 0 failed.
+- The sweeps and harness runs above.

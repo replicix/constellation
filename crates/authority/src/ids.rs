@@ -19,9 +19,13 @@
 //! The holder's side (plan 43 C7-H1 2/4) reads `now.honour`: its lease
 //! (`LeaseState::honour_until`, from the body's `holder_expires_ms` and
 //! `holder_clock`), lock grants, delegation, read delegations, the S3
-//! liveness proof, the beat's stamps. The waiter's and the liveness timers'
-//! sites still read `now.wall` until the commits that convert them (3/4 and
-//! 4/4).
+//! liveness proof. The waiter's side (3/4) reads `now.wait`: an owner's grant
+//! records and lock tables, a root's generation outwaits, read-delegation
+//! grants, quarantines, graces, the takeover floor, the beats' arrival and
+//! the holder's beat (`sent`, the lease's end and the guard are readings of
+//! its wait clock), the seal watch, and the persisted horizons (written as
+//! wall values, read back as time left on the wait clock). The liveness
+//! timers' sites still read `now.wall` until the last commit (4/4).
 
 /// A node id, as in `nodes/<id>` and `Lease::holder`.
 pub type NodeId = u64;

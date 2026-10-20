@@ -33,7 +33,7 @@ use constellation_authority::{
     Action, CasFailure, ClientReply, Config, Control, Core, EpochState, Event, HonourMs, InboxView,
     LockAnswer, LockOutcome, LockRenewResult, LockTestAnswer, LockTestOutcome, Ms, NodeId, Now,
     OpId, PeerLink, PeerMsg, Policy, ReadAnswer, ReadGrantMsg, ReadIndexOutcome, S3Failure, S3Op,
-    S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult,
+    S3Result, ShipState, Stats, TimerId, TimerKind, UploadResult, WaitMs,
 };
 use constellation_fs_core::cache::DiskCache;
 use constellation_meta::locks::GrantId;
@@ -806,6 +806,14 @@ fn now() -> Now {
     constellation_platform::clock::protocol().now()
 }
 
+/// This node's wait clock (`ProtocolClock::wait`) in ms: the clock of the
+/// driver's wake and lag stamps, the beats' send stamps and every arrival
+/// stamp the core compares with them (plan 43 C7-H1): none of them moves
+/// with a wall step.
+fn wait_now_ms() -> i64 {
+    constellation_platform::clock::protocol().wait().0
+}
+
 fn cas_failure(e: StoreError) -> CasFailure {
     match e {
         StoreError::CasConflict | StoreError::AlreadyExists => CasFailure::Conflict,
@@ -952,12 +960,16 @@ struct AliveTargets {
     /// or past it (a backward wall step must not keep the holder beating
     /// past the lease it can honour).
     until_honour: i64,
+    /// Plan 43 C7-H1 (R7): the same lease's end on the holder's wait
+    /// clock (`LeaseState::wait_until`; 0: none), which the beats name:
+    /// their `sent` is on that clock too, so a successor that seals this
+    /// holder places the lease's end by a difference no wall step moves.
+    until_wait: i64,
     /// Plan 43 C7-F F-a: what this holder waits out that its lease does
-    /// not cap (`Core::beat_guard_unix_ms`, a wall value until the
-    /// wait-clock commit of C7-H1), mapped onto the honour clock at each
-    /// beat ([`guard_on_honour`]), so a successor that seals this holder
-    /// can end its own floor with the lease: 0 none, `i64::MAX` unknown.
-    guard_unix_ms: i64,
+    /// not cap (`Core::beat_guard_wait_ms`), on its wait clock, as the beat
+    /// names it, so a successor that seals this holder can end its own
+    /// floor with the lease: 0 none, `i64::MAX` unknown.
+    guard_wait: i64,
 }
 
 /// How long a dropped backup is told it was dropped (`HolderAlive` with
@@ -980,16 +992,16 @@ struct AliveBook {
 
 impl AliveBook {
     /// The targets for this refresh: `held` is the epoch, the wall expiry,
-    /// the honour end and the guard of a lease this node holds (`None`:
-    /// none, or only within an open continuation epoch), `listed` its
-    /// backups.
+    /// the honour end, the wait end and the guard of a lease this node
+    /// holds (`None`: none, or only within an open continuation epoch),
+    /// `listed` its backups.
     fn update(
         &mut self,
         now_unix_ms: i64,
-        held: Option<(u64, i64, i64, i64)>,
+        held: Option<(u64, i64, i64, i64, i64)>,
         listed: Vec<(NodeId, u64)>,
     ) -> Option<AliveTargets> {
-        let Some((epoch, until_unix_ms, until_honour, guard_unix_ms)) = held else {
+        let Some((epoch, until_unix_ms, until_honour, until_wait, guard_wait)) = held else {
             self.dismissed.clear();
             self.prev = None;
             return None;
@@ -1022,7 +1034,8 @@ impl AliveBook {
             dismissed,
             until_unix_ms,
             until_honour,
-            guard_unix_ms,
+            until_wait,
+            guard_wait,
         })
     }
 }
@@ -1035,26 +1048,6 @@ impl AliveBook {
 /// a stopped driver or a cut link stops the heartbeat at once.
 fn holder_stall_ms() -> i64 {
     env_ms("CONSTELLATION_HOLDER_STALL_MS", 15_000).max(1) as i64
-}
-
-/// The guard `g_wall`, a wall-clock instant of this holder (what it waits
-/// out that its lease does not cap), as an instant of its honour clock at
-/// `now`: `honour + (g_wall − wall)`, the time left on the wall clock added
-/// to the honour reading, so a forward or backward wall step between the
-/// guard's stamping and this beat moves the guard with it (until the
-/// wait-clock commit of plan 43 C7-H1 stamps it on the clock it is waited
-/// out on). 0 stays 0 ("none"), `i64::MAX` stays `i64::MAX` ("unknown").
-fn guard_on_honour(g_wall: i64, now: Now) -> i64 {
-    if g_wall == i64::MAX {
-        return i64::MAX;
-    }
-    if g_wall <= 0 {
-        return 0;
-    }
-    now.honour
-        .0
-        .saturating_add(g_wall.saturating_sub(now.wall.0))
-        .max(1)
 }
 
 /// What one tick of [`holder_alive_loop`] does.
@@ -1089,8 +1082,8 @@ fn alive_tick(
         return AliveTick::Idle;
     };
     // The lease ended for this holder on its honour clock (plan 43
-    // C7-H1); the stall stamps below are the driver's wake clock (wall
-    // until the liveness commit).
+    // C7-H1); the stall stamps below are the driver's wake clock (the wait
+    // clock).
     if honour.0 >= t.until_honour {
         return AliveTick::Idle;
     }
@@ -1162,7 +1155,7 @@ async fn holder_alive_loop(
     let mut seq: u64 = 0;
     let mut lane = DelegLane::from_env();
     let mut due = tokio::time::Instant::now() + every;
-    off_core.note_beat_due(now_unix_ms() + every.as_millis() as i64);
+    off_core.note_beat_due(wait_now_ms() + every.as_millis() as i64);
     while !stop.load(Ordering::Relaxed) {
         tokio::time::sleep_until(due).await;
         // On cadence; a tick this thread itself took late (the host held
@@ -1171,7 +1164,7 @@ async fn holder_alive_loop(
         // How late this thread ran its tick: the whole process (or at
         // least this thread) was frozen that long. Recorded (one atomic
         // store) only when it matters to a grant; nothing is logged.
-        let woke_ms = now_unix_ms();
+        let woke_ms = wait_now_ms();
         let late = woke.saturating_duration_since(due).as_millis() as i64;
         if late >= constellation_authority::deleg_lane::FREEZE_MIN_MS {
             off_core.note_beat_freeze(woke_ms - late, late);
@@ -1184,7 +1177,7 @@ async fn holder_alive_loop(
         // beats' send stamp and what is mapped onto it, the lease's end,
         // the lane's due times and the echo's answer stamp all come from it.
         let clk = constellation_platform::clock::protocol().now();
-        let now = clk.wall.0;
+        let now = clk.wait.0;
         let runtime_stalled = off_core.runtime_stalled_ms(now);
         // One echo outstanding at a time, on the prompt lane (served
         // after the urgent one, ahead of the internal channel's backlog:
@@ -1277,7 +1270,10 @@ async fn holder_alive_loop(
             }
             // The tick's one reading: an earlier stamp than the send only
             // lengthens `at − sent`, which lengthens the successor's cap.
-            let at = clk.wall;
+            // The beat is on the holder's wait clock (plan 43 C7-H1, R7):
+            // `constellation_authority::beat_sent_ms` is the one place that
+            // says which reading it is.
+            let at = clk.wait;
             let payload = Payload::HolderAlive {
                 holder: node_id,
                 epoch: t.epoch,
@@ -1285,10 +1281,10 @@ async fn holder_alive_loop(
                 listed,
                 beat: constellation_net::Beat {
                     seq,
-                    sent_ms: clk.honour.0,
+                    sent_ms: constellation_authority::beat_sent_ms(clk),
                     expires_unix_ms: t.until_unix_ms,
-                    guard_ms: guard_on_honour(t.guard_unix_ms, clk),
-                    expires_ms: t.until_honour,
+                    guard_ms: t.guard_wait,
+                    expires_ms: t.until_wait,
                     clock: constellation_platform::clock::protocol().id(),
                 },
             };
@@ -1471,7 +1467,7 @@ pub(crate) async fn runtime_probe_task(off_core: Arc<OffCore>) {
         tokio::time::sleep_until(due).await;
         let woke = tokio::time::Instant::now();
         let late = woke.saturating_duration_since(due).as_millis() as i64;
-        off_core.note_probe(now_unix_ms(), late);
+        off_core.note_probe(wait_now_ms(), late);
         due = woke + every;
     }
 }
@@ -1813,7 +1809,7 @@ impl OffCore {
     /// `node.ping` fails past a bound of it
     /// ([`crate::control::PING_FAILS_AFTER`]).
     pub(crate) fn runtime_stalled(&self) -> Duration {
-        Duration::from_millis(self.runtime_stalled_ms(now_unix_ms()) as u64)
+        Duration::from_millis(self.runtime_stalled_ms(wait_now_ms()) as u64)
     }
 
     /// The probe was stopped with the driver: not started, as far as
@@ -2223,7 +2219,7 @@ impl Driver {
                     None => break,
                 },
             };
-            self.deps.off_core.loop_woke(now_unix_ms());
+            self.deps.off_core.loop_woke(wait_now_ms());
             self.note_clock_steps();
             *self.loop_thread.lock().unwrap() =
                 constellation_platform::native().process.current_thread();
@@ -2312,12 +2308,12 @@ impl Driver {
     /// the probe has not run yet. Costs a core step only per lapse.
     fn hand_lag(&mut self) {
         let off = &self.deps.off_core;
-        let (from, until) = off.lapse(now_unix_ms());
+        let (from, until) = off.lapse(wait_now_ms());
         if until > self.lag_handed + off.lag_threshold_ms / 2 {
             self.lag_handed = until;
             self.step(Internal::Event(Event::OwnLag {
-                from: Ms(from),
-                until: Ms(until),
+                from: WaitMs(from),
+                until: WaitMs(until),
             }));
         }
     }
@@ -2330,13 +2326,13 @@ impl Driver {
     /// gives a grant up, whether the freeze explains the loss. The same
     /// freeze, grown by more than 200 ms or finished, is handed again.
     fn hand_freeze(&mut self) {
-        for (from, until) in self.deps.off_core.whole_process_freezes(now_unix_ms()) {
+        for (from, until) in self.deps.off_core.whole_process_freezes(wait_now_ms()) {
             let (hf, hu) = self.freeze_handed;
             if from != hf || until > hu + 200 {
                 self.freeze_handed = (from, until);
                 self.step(Internal::Event(Event::OwnFreeze {
-                    from: Ms(from),
-                    until: Ms(until),
+                    from: WaitMs(from),
+                    until: WaitMs(until),
                 }));
             }
         }
@@ -2353,7 +2349,7 @@ impl Driver {
                 epoch,
                 candidacy: 0,
                 listed: true,
-                at: Ms(at),
+                at: WaitMs(at),
                 seq: 0,
                 clock: 0,
                 sent: 0,
@@ -2389,7 +2385,7 @@ impl Driver {
             .store(crate::prune::now_unix_ms(), Ordering::Relaxed);
         let kind = event_kind(&event);
         // Progress (a wake-up may run several steps).
-        self.deps.off_core.set_busy(now_unix_ms());
+        self.deps.off_core.set_busy(wait_now_ms());
         let started = std::time::Instant::now();
         let int_pending = self.int_rx.len();
         let sync_pending = self.sync_rx.len();
@@ -2532,7 +2528,7 @@ impl Driver {
             .view
             .set_liveness(self.core.fast_tenure(), self.core.last_s3_fresh());
         self.deps.view.set_release_hold(
-            self.core.takeover_floor_until_ms(),
+            self.core.takeover_floor_until(),
             self.core.fast_gate_pending(),
         );
         let mut status = self.deps.status.lock().unwrap();
@@ -2606,7 +2602,8 @@ impl Driver {
                 l.epoch,
                 l.expires_unix_ms,
                 lease.honour_until(self.core.config()).map_or(0, |h| h.0),
-                self.core.beat_guard_unix_ms(&*self.deps.meta),
+                lease.wait_until(self.core.config()).map_or(0, |w| w.0),
+                self.core.beat_guard_wait_ms(&*self.deps.meta),
             )),
             _ => None,
         };
@@ -3264,7 +3261,7 @@ impl Driver {
                 epoch,
                 candidacy,
                 listed,
-                at: Ms(at_unix_ms),
+                at: WaitMs(at_unix_ms),
                 seq: beat.seq,
                 clock: beat.clock,
                 sent: beat.sent_ms,
@@ -5718,8 +5715,8 @@ const PEER_LINKS_TICK: Duration = Duration::from_millis(1_000);
 /// [`PeerLink`]s from the peer directory. `since`: when each peer's link
 /// came up, for the backup selection's stability requirement (plan 30
 /// §M9).
-fn peer_links(peers: &constellation_net::Peers, since: &mut HashMap<u64, Ms>) -> Vec<PeerLink> {
-    let now = Ms(now_unix_ms());
+fn peer_links(peers: &constellation_net::Peers, since: &mut HashMap<u64, WaitMs>) -> Vec<PeerLink> {
+    let now = WaitMs(wait_now_ms());
     peers
         .snapshot()
         .into_iter()
@@ -5739,7 +5736,7 @@ fn peer_links(peers: &constellation_net::Peers, since: &mut HashMap<u64, Ms>) ->
                 connected,
                 last_seen: if connected {
                     p.last_seen
-                        .map(|at| Ms(now_unix_ms() - at.elapsed().as_millis() as i64))
+                        .map(|at| WaitMs(wait_now_ms() - at.elapsed().as_millis() as i64))
                 } else {
                     None
                 },
@@ -5761,7 +5758,7 @@ async fn peer_links_task(
     mut own_s3: OwnS3Watch,
     tx: mpsc::UnboundedSender<Internal>,
 ) {
-    let mut since: HashMap<u64, Ms> = HashMap::new();
+    let mut since: HashMap<u64, WaitMs> = HashMap::new();
     let mut changed = peers.links_changed();
     let mut tick = tokio::time::Instant::now();
     loop {
@@ -6894,33 +6891,33 @@ mod tests {
     fn the_alive_book_dismisses_dropped_candidacies_until_reselected() {
         use super::{AliveBook, DISMISS_FOR_MS};
         let mut book = AliveBook::default();
-        let held = Some((4, 100_000, 100_000, 0));
+        let held = Some((4, 100_000, 100_000, 100_000, 0));
         let t = book.update(1_000, held, vec![(2, 10), (3, 11)]).unwrap();
         assert_eq!(t.listed, vec![(2, 10), (3, 11)]);
         assert!(t.dismissed.is_empty());
         // Plan 43 C7-F F-a: the holder's guard rides the targets, and a
         // change of it republishes them (the driver compares the targets).
-        assert_eq!(t.guard_unix_ms, 0);
+        assert_eq!(t.guard_wait, 0);
         let g = book
             .update(
                 1_050,
-                Some((4, 100_000, 100_000, i64::MAX)),
+                Some((4, 100_000, 100_000, 100_000, i64::MAX)),
                 vec![(2, 10), (3, 11)],
             )
             .unwrap();
-        assert_eq!(g.guard_unix_ms, i64::MAX, "unknown while a gate is pending");
+        assert_eq!(g.guard_wait, i64::MAX, "unknown while a gate is pending");
         assert_ne!(g, t);
         let g2 = book
             .update(
                 1_060,
-                Some((4, 100_000, 100_000, 9_000)),
+                Some((4, 100_000, 100_000, 100_000, 9_000)),
                 vec![(2, 10), (3, 11)],
             )
             .unwrap();
-        assert_eq!(g2.guard_unix_ms, 9_000);
+        assert_eq!(g2.guard_wait, 9_000);
         assert_ne!(g2, g);
         let t = book.update(1_070, held, vec![(2, 10), (3, 11)]).unwrap();
-        assert_eq!(t.guard_unix_ms, 0);
+        assert_eq!(t.guard_wait, 0);
         // Node 3's candidacy timed out.
         let t = book.update(1_100, held, vec![(2, 10)]).unwrap();
         assert_eq!(t.dismissed, vec![(3, 11)]);
@@ -6948,7 +6945,7 @@ mod tests {
         // A new epoch forgets the old one's dismissals; no lease, all.
         book.update(20_200, held, Vec::new());
         let t = book
-            .update(20_300, Some((5, 100_000, 100_000, 0)), Vec::new())
+            .update(20_300, Some((5, 100_000, 100_000, 100_000, 0)), Vec::new())
             .unwrap();
         assert!(
             t.dismissed.is_empty(),
@@ -6971,7 +6968,8 @@ mod tests {
             dismissed: vec![(3, 11)],
             until_unix_ms: 50_000,
             until_honour: 50_000,
-            guard_unix_ms: 0,
+            until_wait: 50_000,
+            guard_wait: 0,
         };
         assert_eq!(
             alive_tick(None, (1_000, HonourMs(1_000)), (0, 0, 0), 15_000),
@@ -7029,7 +7027,8 @@ mod tests {
             dismissed: Vec::new(),
             until_unix_ms: i64::MAX,
             until_honour: i64::MAX,
-            guard_unix_ms: 0,
+            until_wait: i64::MAX,
+            guard_wait: 0,
         };
         assert_eq!(
             alive_tick(Some(&t), (30_000, HonourMs(30_000)), (0, 15_001, 0), 15_000),
@@ -7064,7 +7063,8 @@ mod tests {
             dismissed: Vec::new(),
             until_unix_ms: i64::MAX,
             until_honour: i64::MAX,
-            guard_unix_ms: 0,
+            until_wait: i64::MAX,
+            guard_wait: 0,
         })));
         let probe = tokio::spawn(std::future::pending::<()>());
         let abort = probe.abort_handle();
@@ -7897,7 +7897,8 @@ mod tests {
                 dismissed: Vec::new(),
                 until_unix_ms: i64::MAX,
                 until_honour: i64::MAX,
-                guard_unix_ms: 0,
+                until_wait: i64::MAX,
+                guard_wait: 0,
             })));
             let (core_tx, _core_rx) = tokio::sync::mpsc::unbounded_channel();
             let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();

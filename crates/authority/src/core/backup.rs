@@ -100,8 +100,8 @@
 //! out, the successor (which seals at that expiry) waited the whole bound
 //! on top of the lease. [`Core::beat_cap`] takes that back. Notation: H
 //! the predecessor, S the successor, `E_h` the expiry of the lease H holds
-//! at a decision (H's **honour** clock, plan 43 C7-H1: the lease object
-//! carries it, `Lease::holder_expires_ms`, with the id of that clock,
+//! at a decision (H's **wait** clock, plan 43 C7-H1: the lease object
+//! carries it, `Lease::holder_wait_ms`, with the id of that clock,
 //! `Lease::holder_clock`), `M` the expiry margin.
 //! 1. *Everything S waits out is capped by H's lease.* Strict answers only
 //!    while the lease is `usable` (expiry − now > M); read delegations
@@ -110,12 +110,11 @@
 //!    less M, their holders honour them from their own send less another
 //!    M, and what a delegate grants is capped by its own `until − M`. So
 //!    (with `2ρ·ttl ≤ 2M`) nothing H answered is honoured, in real time,
-//!    after H's clock reads `E_h` — unless H's wall clock stepped forward
-//!    after it last wrote `E_h`: its honour clock then counts the step, the
-//!    beats' `sent` jump by it, and a grant made before the step outlives
-//!    the cap by the step until H's next renewal (C7-H1's open item R7,
-//!    closed in its commit 3 by stamping the beat and the body's end on the
-//!    wait clock). Exception: under a continuation epoch's
+//!    after H's wait clock reads `E_h`. Its wait clock never over-counts, so
+//!    it reaches `E_h` no earlier in real time than the grants' holders,
+//!    whose clocks did not step with H's wall clock, reach their ends
+//!    (plan 43 C7-H1, R7: the honour clock would count a forward wall step
+//!    of H as elapsed time they never saw). Exception: under a continuation epoch's
 //!    hold the lease has no expiry, and `lock_cap_ms` and `grant_cap_ms`
 //!    cap a grant by its ttl alone; the grants kept across the re-claim
 //!    (`epoch_tenure_resumed`) can then outlast the re-claimed lease (a
@@ -132,38 +131,40 @@
 //!    T.expires`; `X` also takes the highest expiry any beat named and the
 //!    highest guard. Exceptions: a restart of H within its epoch with a
 //!    shorter TTL (its earlier incarnation's grants are behind its restart
-//!    quarantine, which the guard names; and the honour end of that
+//!    quarantine, which the guard names; and the wait-clock end of that
 //!    incarnation is on another clock, kept apart by clock id). (The cap's
 //!    own dependence on the holder's clock is step 3's.)
 //!    Counting from the *last renewal S observed* instead would be unsafe:
 //!    H's other proofs of S3 liveness (segment runs and puts, a lease
 //!    read) are invisible to S, and H answers within `W` of any of them.
-//! 3. *The beat links the clocks.* A beat says H's honour clock read `sent`
-//!    no later than S's clock read `at` (its arrival stamp: `sent` < real
-//!    send < real arrival ≤ `at`). H's honour clock reaches `X` at most
-//!    `(X − sent)(1 + ρ)/(1 − ρ)` real ms after `sent` (it never
-//!    under-counts, so no more), S's runs at least `1 − ρ` per real ms, so
-//!    S's clock reading `at + (X − sent) + M` is after H's clock passed `X`
-//!    as long as `2ρ(X − sent) < M`: beats sent within `250·M` of `X` only
+//! 3. *The beat links the clocks.* A beat says H's wait clock read `sent`
+//!    no later than S's clock read `at` (its arrival stamp, on S's wait
+//!    clock: `sent` < real send < real arrival ≤ `at`). The holder's
+//!    obligations (its own grants) end in real time no later than
+//!    `(X − sent)(1 + ρ)/(1 − ρ)` real ms after `sent` — H's wait clock
+//!    never over-counts, so it takes at least that long to read `X` — and
+//!    S's wait clock runs at least `1 − ρ` per real ms, so S's clock reading
+//!    `at + (X − sent) + M` is after H's grants ended as long as
+//!    `2ρ(X − sent) < M`: beats sent within `250·M` of `X` only
 //!    (`2ρ·250·M = M/2` at ρ = 1 000 ppm). A difference on H's clock plus a
-//!    stamp of S's: rate-only, no offset, and **no wall step of H**: the
-//!    honour clock ignores a backward step (the differences are unchanged),
-//!    and `sent`, the lease's end (written after the step) and the guard all
-//!    move together by a forward one. Every term is of one holder clock: S
+//!    stamp of S's: rate-only, no offset, and **no wall step of H in either
+//!    direction**: the wait clock ignores both, so `sent`, the lease's end
+//!    (`Lease::holder_wait_ms`, written at each renewal) and the guard stay
+//!    consistent however H's wall clock moved between its last renewal and
+//!    the seal. Every term is of one holder clock: S
 //!    keeps `lags`, `named_max` and `guard_max` per clock id (a restarted H is
 //!    a new process, a new clock; at most two ids), takes the latest
-//!    `X_c + min lag_c` over them, and puts the replaced lease's own honour
+//!    `X_c + min lag_c` over them, and puts the replaced lease's own wait-clock
 //!    end in `X` of the id that wrote it (`holder_clock`), never its wall
-//!    expiry (a stamp of another clock). No beat of that clock: no cap. Open
-//!    item (plan 43 C7-H1): a forward step of H *between its last renewal
-//!    and the seal* moves `sent` by the step but not that lease's honour
-//!    end, so grants made before the step are capped by `X − sent`, early
-//!    by the step; the guard, mapped from the wall clock until the wait
-//!    commit, has the same property. Not detected here.
+//!    expiry (a stamp of another clock). No beat of that clock: no cap. (A
+//!    holder that is suspended or paused between its last renewal and the
+//!    seal leaves a later cap: its wait clock does not count the pause. The
+//!    honour clock does, and a forward wall step of H counts on it too,
+//!    which is why neither is used here.)
 //! 4. *The guard* is what H itself waits out and its lease does not cap:
 //!    its own takeover floor (which can outlast its lease), a released
 //!    takeover's lock grace, restart quarantines, subtree graces
-//!    ([`Core::beat_guard_unix_ms`]); `i64::MAX` while its takeover gate
+//!    ([`Core::beat_guard_wait_ms`], a reading of H's wait clock as it is); `i64::MAX` while its takeover gate
 //!    or a floor still to be armed is pending (the marker may be ahead,
 //!    and H's predecessor's proofs extend until then): no cap. The guard
 //!    is the *maximum* over the beats of the epoch, so one `i64::MAX` beat
@@ -179,7 +180,7 @@
 //! M would end its floor that much early (the sim's
 //! `fast-takeover-skewed-successor` is the control; since plan 43 C7-H1 the
 //! seal watch counts the plain arrival too, `sent` being a reading of H's
-//! honour clock, opaque here). And never the lease's expiry compared with S's
+//! wait clock, opaque here). And never the lease's expiry compared with S's
 //! clock. No beat, a beat of
 //! another holder or epoch, or none sent within `250·M` of `X`: the bound.
 //! The floor and the beats are in memory (plan 43 Appendix B rows 14 and
@@ -209,7 +210,7 @@
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{PeerMsg, S3Result};
-use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId};
+use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::{BackupRole, BackupTx};
 use constellation_store_s3::{AckPolicy, Lease};
@@ -259,6 +260,19 @@ pub fn liveness_fresh(
     !fast_tenure || at.since(last_s3_fresh) < window_ms
 }
 
+/// Plan 43 C7-H1 (R7): the reading a holder stamps its heartbeat's `sent`
+/// with: its **wait** clock, the clock the beat's lease end
+/// (`Lease::holder_wait_ms`) and guard are on. The successor that seals this
+/// holder reads the time left on the lease as `end - sent`, so that
+/// difference must never under-estimate real time left: the wait clock
+/// never over-counts (P3) and ignores a wall step in both directions. The
+/// honour clock would count a forward step of the holder as elapsed time
+/// that its grantees' clocks (which did not step) never saw, and the cap
+/// would be early by the step for every grant made before it.
+pub fn beat_sent_ms(now: Now) -> i64 {
+    now.wait.0
+}
+
 /// Plan 41 L0: an owner's answer that extends a window (a lock grant's
 /// renewal, a reclaim, a delegation's renewal) decided at `at` in lease
 /// epoch `epoch` while the tenure's liveness was stale or the tenure was
@@ -304,8 +318,10 @@ pub(crate) struct BackupPeer {
     /// The appends in flight, oldest first.
     pub inflight: std::collections::VecDeque<Inflight>,
     pub last_sent: Ms,
-    /// When it last acknowledged something new (or was added).
-    pub last_progress: Ms,
+    /// When it last acknowledged something new (or was added), on the
+    /// wait clock (as are `alive_at` and `short_since`: they are compared
+    /// with the heartbeat answers' stamps and the node's own lapses).
+    pub last_progress: WaitMs,
     /// Whether the last append was a resync (the backup's `acked` did not
     /// match ours: it restarted, or we did).
     pub committed: bool,
@@ -313,14 +329,14 @@ pub(crate) struct BackupPeer {
     pub candidacy: u64,
     /// When it was last known alive (`Event::BackupAlive`; its bring-up
     /// counts).
-    pub alive_at: Ms,
+    pub alive_at: WaitMs,
     /// It answered an append short since its last progress: it is
     /// processing appends but stuck, whether alive or not.
     pub short_since_progress: bool,
     /// When it first answered short since its last progress, moved on by
     /// the gaps in its heartbeat answers since (`on_backup_alive`): how
     /// long it has been answering short while answering at all.
-    pub short_since: Ms,
+    pub short_since: WaitMs,
     /// An append to it failed at the transport (`Event::PeerFailed`)
     /// since its last answer: alive or not (its heartbeat answers may
     /// come on the liveness lane), it is unreachable on the data lane,
@@ -400,10 +416,12 @@ pub(crate) struct AckState {
     /// doc); `false` after the floor was set or when none is due.
     pub(crate) pending_floor: bool,
     /// Plan 43 C7-F F-a: the cap the predecessor's beats put on the
-    /// pending floor (`Core::beat_cap`, an instant of this node's clock);
-    /// `None`: no usable beats, or the predecessor's guard was unknown.
-    pending_cap: Option<Ms>,
-    /// Plan 43 C7-F F-a (review F1): the latest end, unix ms, of a lock or
+    /// pending floor (`Core::beat_cap`, an instant of this node's wait
+    /// clock); `None`: no usable beats, or the predecessor's guard was
+    /// unknown.
+    pending_cap: Option<WaitMs>,
+    /// Plan 43 C7-F F-a (review F1): the latest end, on this node's wait
+    /// clock, of a lock or
     /// delegation grant this node answered under a continuation epoch's
     /// hold (`lock_cap_ms`, `grant_cap_ms`: capped by the ttl alone, the
     /// lease having no expiry then). `epoch_tenure_resumed` keeps those
@@ -415,9 +433,10 @@ pub(crate) struct AckState {
     pub(crate) hold_grant_until: std::sync::atomic::AtomicI64,
     /// Where this tenure's takeover floor ends (the later of its
     /// acknowledgement floor and its lock grace, `note_marker_landed`),
-    /// 0 for a tenure with none: the lease is not idle-released before it
-    /// (`in_takeover_floor`).
-    floor_until: i64,
+    /// on the wait clock (plan 43 C7-H1: a successor waits it out, and a
+    /// forward wall step must not end it early); 0 for a tenure with
+    /// none: the lease is not idle-released before it (`in_takeover_floor`).
+    floor_until: WaitMs,
     /// The journal seq the last stream-ahead covered, for every
     /// subscriber.
     streamed_through: u64,
@@ -464,9 +483,9 @@ pub(crate) struct AckState {
 
 impl AckState {
     /// A grant made under an epoch hold ends by `until` (`hold_grant_until`).
-    pub(crate) fn note_hold_grant(&self, until: i64) {
+    pub(crate) fn note_hold_grant(&self, until: WaitMs) {
         self.hold_grant_until
-            .fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(until.0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -480,14 +499,14 @@ pub(crate) struct BackupState {
     /// appends, and requests may overtake each other): `first -> last`,
     /// folded into `acked` as the gap closes.
     held: BTreeMap<u64, u64>,
-    pub last_heard: Ms,
+    pub last_heard: WaitMs,
     /// The highest epoch sealed (persisted by the replica too).
     pub sealed: Epoch,
     pub watch_timer: Option<TimerId>,
     takeover_get: Option<OpId>,
     /// When the silence watch issued `takeover_get`: the holder heard
     /// after this is alive, and the epoch is not sealed.
-    takeover_read_at: Ms,
+    takeover_read_at: WaitMs,
     /// `takeover_get` was issued because the holder's lease expiry as
     /// this node knew it had passed, not for silence: the object decides
     /// (`on_takeover_get`) — expired, sealed; renewed, a window again.
@@ -517,7 +536,7 @@ pub(crate) struct BackupState {
     ahead_gapped: std::collections::VecDeque<(NodeId, Epoch, Seq, Vec<BackupTx>)>,
     /// `ack=s3` fast takeover: since when the known holder has been
     /// silent on P2P.
-    holder_silent_since: Option<Ms>,
+    holder_silent_since: Option<WaitMs>,
     /// EC2 follow-up 3b: this node restarted holding a backup role and
     /// has not yet had a P2P link to its holder since: its downtime (and
     /// the redial) is not the holder's silence.
@@ -540,7 +559,7 @@ pub(crate) struct BackupState {
     /// This node's own recent lapses (`Event::OwnLag`), `(from, until)`,
     /// oldest first, merged where they overlap: no silence counts before
     /// the latest one ended ([`Core::attentive_since`]).
-    own_lapses: std::collections::VecDeque<(Ms, Ms)>,
+    own_lapses: std::collections::VecDeque<(WaitMs, WaitMs)>,
 }
 
 /// The most own lapses remembered (older ones than
@@ -587,11 +606,12 @@ pub(crate) type Watched = (NodeId, Epoch, bool);
 pub(crate) struct HolderBeats {
     pub(crate) epoch: Epoch,
     /// The latest arrival of a beat at `epoch` (or of an append, handed
-    /// over by the driver as an unnumbered one).
-    heard_at: Ms,
+    /// over by the driver as an unnumbered one), on this node's wait
+    /// clock.
+    heard_at: WaitMs,
     /// The latest numbered beat: `(seq, sent, arrival, clock)`; `sent` a
-    /// reading of the holder's honour clock `clock` (plan 43 C7-H1).
-    pub(crate) last: Option<(u64, i64, Ms, u64)>,
+    /// reading of the holder's wait clock `clock` (plan 43 C7-H1).
+    pub(crate) last: Option<(u64, i64, WaitMs, u64)>,
     /// The latest expiry of the holder's lease its beats at `epoch` named,
     /// on the lease body's **wall** clock (0: none heard): they stop there.
     /// The seal watch's `known_expiry` (plan 43 Appendix B row 24).
@@ -600,7 +620,7 @@ pub(crate) struct HolderBeats {
     /// where the holder's lease ends on *this* node's clock, for the cap of
     /// a fast takeover's floor ([`Core::beat_cap`]), per clock id of the
     /// holder (at most [`BEAT_CLOCKS_KEPT`], oldest first): a restarted
-    /// holder is a new process with a new honour clock, and values of two
+    /// holder is a new process with a new wait clock, and values of two
     /// clocks must never be mixed.
     pub(crate) clocks: Vec<(u64, BeatClockAgg)>,
     /// A beat at this epoch named the guard `i64::MAX`: the holder's
@@ -611,7 +631,7 @@ pub(crate) struct HolderBeats {
     /// later than one interval after the previous one, as sent (the
     /// holder's process was held up) or as heard (held up on the way, or
     /// by this node's own runtime), by at least the lag threshold.
-    late: std::collections::VecDeque<(Ms, i64)>,
+    late: std::collections::VecDeque<(WaitMs, i64)>,
 }
 
 impl HolderBeats {
@@ -637,14 +657,13 @@ impl HolderBeats {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BeatClockAgg {
     /// `(sent, at − sent)` of the latest [`BEAT_LAGS_KEPT`] beats: `sent` a
-    /// reading of the holder's honour clock, `at` the arrival as this node
+    /// reading of the holder's wait clock, `at` the arrival as this node
     /// stamped it (never a credit), so `at − sent` places that clock on
     /// this node's: a difference on the holder's clock (rate only, no
-    /// offset, no wall step: its honour clock follows a forward step in
-    /// `sent` and in every value it names alike, P4) plus a stamp of this
-    /// node's.
+    /// offset, no wall step: its wait clock ignores them in both
+    /// directions, P4) plus a stamp of this node's.
     pub(crate) lags: std::collections::VecDeque<(i64, i64)>,
-    /// The highest lease end (honour) and the highest finite guard those
+    /// The highest lease end (wait) and the highest finite guard those
     /// beats named, on that clock.
     pub(crate) named_max: i64,
     pub(crate) guard_max: i64,
@@ -757,7 +776,7 @@ impl Core {
         if let Some(role) = replica.backup_role() {
             self.bk.role = Some(role);
             self.bk.acked = replica.backup_acked(role.epoch);
-            self.bk.last_heard = now.wall;
+            self.bk.last_heard = now.wait;
             self.bk.restarted = true;
             self.lease.cached_holder = Some(role.holder);
             self.arm_backup_watch(now, out);
@@ -1146,7 +1165,7 @@ impl Core {
     /// (`note_marker_landed`); `cap` is the end of that lease as the
     /// predecessor's own heartbeat places it on this node's clock
     /// ([`Core::beat_cap`]), which ends the wait earlier when it is.
-    pub(crate) fn note_fast_takeover(&mut self, prev: &Lease, cap: Option<Ms>) {
+    pub(crate) fn note_fast_takeover(&mut self, prev: &Lease, cap: Option<WaitMs>) {
         // Plan 41 L0: a predecessor's generations are outwaited the
         // takeover window longer (`DelegationState::inherit_slack_ms`).
         self.dl.inherit_slack_ms = self.cfg.backup_takeover_ms;
@@ -1155,31 +1174,32 @@ impl Core {
     }
 
     /// Plan 43 C7-F F-a: where the lease of `prev`'s tenure ends on this
-    /// node's clock, as that tenure's beats at `prev.epoch` placed it, plus
-    /// one expiry margin (see the module doc, "The delegation horizon
+    /// node's wait clock, as that tenure's beats at `prev.epoch` placed it,
+    /// plus one expiry margin (see the module doc, "The delegation horizon
     /// across a fast failover"): `X + min(at − sent) + M`, with `X` the
-    /// latest of the replaced lease's expiry, the expiries the beats named
-    /// and the guards they named, over the beats sent within
-    /// `250·M` of `X` (so the rate error `2ρ·(X − sent)` stays under
-    /// `M/2`). `None`: no beat of that tenure heard, none that recent, or
-    /// one named an unknown guard (the holder's own takeover gate was
-    /// pending: what it waited out was not known yet).
+    /// latest of the replaced lease's end (`Lease::holder_wait_ms`), the
+    /// ends the beats named and the guards they named, all on the holder's
+    /// **wait** clock, over the beats sent within `250·M` of `X` (so the
+    /// rate error `2ρ·(X − sent)` stays under `M/2`). `None`: no beat of
+    /// that tenure heard, none that recent, or one named an unknown guard
+    /// (the holder's own takeover gate was pending: what it waited out was
+    /// not known yet).
     ///
     /// `at` is the arrival as this node stamped it. The seal watch counts
-    /// a beat's *credit*, `min(at, sent + M)`, which is an instant of the
-    /// holder's clock: used here, a holder whose clock is behind this
-    /// node's by more than M ends the floor that much early (the sim's
-    /// `fast-takeover-skewed-successor`).
-    pub(crate) fn beat_cap(&self, prev: &Lease) -> Option<Ms> {
+    /// the same plain arrival (never a beat's *credit*, `min(at, sent +
+    /// M)`, an instant of the holder's clock: a holder whose clock is
+    /// behind this node's by more than M would end the floor that much
+    /// early, the sim's `fast-takeover-skewed-successor`).
+    pub(crate) fn beat_cap(&self, prev: &Lease) -> Option<WaitMs> {
         let b = self
             .bk
             .beats
             .get(&prev.holder)
             .filter(|b| b.epoch == prev.epoch)?;
-        // No honour end of that tenure's holder (a body that predates its
-        // clock id, or a fenced one), or no beat of the clock that wrote it:
-        // `prev.holder_expires_ms` cannot be placed on any clock heard.
-        if b.guard_unknown || prev.holder_clock == 0 || prev.holder_expires_ms == 0 {
+        // No wait-clock end of that tenure's holder (a body that predates
+        // its clock id, or a fenced one), or no beat of the clock that wrote
+        // it: `prev.holder_wait_ms` cannot be placed on any clock heard.
+        if b.guard_unknown || prev.holder_clock == 0 || prev.holder_wait_ms == 0 {
             return None;
         }
         let margin = self.cfg.expiry_margin_ms as i64;
@@ -1188,10 +1208,10 @@ impl Core {
         let mut named_clock_placed = false;
         for (clock, agg) in &b.clocks {
             let own = *clock == prev.holder_clock;
-            let x =
-                agg.named_max
-                    .max(agg.guard_max)
-                    .max(if own { prev.holder_expires_ms } else { 0 });
+            let x = agg
+                .named_max
+                .max(agg.guard_max)
+                .max(if own { prev.holder_wait_ms } else { 0 });
             let lag = agg
                 .lags
                 .iter()
@@ -1216,12 +1236,14 @@ impl Core {
         if !named_clock_placed {
             return None;
         }
-        Some(Ms(cap?.saturating_add(margin)))
+        Some(WaitMs(cap?.saturating_add(margin)))
     }
 
     /// Plan 43 C7-F F-a: what this node, as the holder, waits out that its
-    /// lease does not cap, on its own clock, for its beats to name
-    /// ([`constellation_net::Beat::guard_unix_ms`]; 0: none): its takeover
+    /// lease does not cap, on its own **wait** clock (where it waits it
+    /// out; plan 43 C7-H1, R7: the beat names it as it is, never mapped onto
+    /// another clock), for its beats to name
+    /// ([`constellation_net::Beat::guard_ms`]; 0: none): its takeover
     /// floor (it can outlast the lease: the lock floor of a 20 s lease),
     /// its read and lock quarantines (a restart's, a released takeover's),
     /// its subtree graces and the grants it made under a continuation
@@ -1229,7 +1251,7 @@ impl Core {
     /// floor still to be armed is pending: the marker may be ahead of it,
     /// and its own predecessor's proofs extend until then, so the floor
     /// is not known yet and a successor must not cap its own.
-    pub fn beat_guard_unix_ms(&self, replica: &dyn Replica) -> i64 {
+    pub fn beat_guard_wait_ms(&self, replica: &dyn Replica) -> i64 {
         let (base, protecting) = self.beat_guard_parts(replica);
         base.max(protecting)
     }
@@ -1241,7 +1263,9 @@ impl Core {
     /// and the grants made under an epoch hold) may rise later, by what
     /// protects a lease-capped right: a delegate outwaited after the beat
     /// last named the guard granted under its own `until`, which the root's
-    /// lease caps. The simulator asserts the base never rises.
+    /// lease caps. Both are readings of this node's wait clock, which no
+    /// wall step moves, so the base does not rise with a step either; the
+    /// simulator asserts it never rises.
     pub fn beat_guard_parts(&self, replica: &dyn Replica) -> (i64, i64) {
         if self.lease.gate.is_some() || self.ack.pending_floor {
             return (i64::MAX, 0);
@@ -1250,12 +1274,13 @@ impl Core {
             .ack
             .floor_until
             .max(replica.read_delegations().quarantine_until())
-            .max(replica.locks().quarantine_until());
+            .max(replica.locks().quarantine_until())
+            .0;
         let protecting = self
             .ack
             .hold_grant_until
             .load(std::sync::atomic::Ordering::Relaxed)
-            .max(self.lock_grace_until_ms());
+            .max(self.lock_grace_until().0);
         (base, protecting)
     }
 
@@ -1270,13 +1295,13 @@ impl Core {
     /// it too, parked: `service_pending_flushes`; one that gives up on a
     /// stuck gate releases nothing and leaves the lease to lapse.)
     pub(crate) fn in_takeover_floor(&self, now: Now) -> bool {
-        now.wall.0 < self.ack.floor_until
+        now.wait < self.ack.floor_until
     }
 
-    /// Where this tenure's takeover floor ends, in unix ms (0: none): the
-    /// engine's upgrade handover waits for it before it detaches the views,
-    /// which keep serving meanwhile.
-    pub fn takeover_floor_until_ms(&self) -> i64 {
+    /// Where this tenure's takeover floor ends, on this node's wait clock
+    /// (0: none): the engine's upgrade handover waits for it before it
+    /// detaches the views, which keep serving meanwhile.
+    pub fn takeover_floor_until(&self) -> WaitMs {
         self.ack.floor_until
     }
 
@@ -1292,7 +1317,7 @@ impl Core {
     pub(crate) fn end_takeover_floor(&mut self) {
         self.ack.pending_floor = false;
         self.ack.pending_cap = None;
-        self.ack.floor_until = 0;
+        self.ack.floor_until = WaitMs(0);
     }
 
     /// The takeover's marker landed at `now`.
@@ -1312,7 +1337,7 @@ impl Core {
         if !std::mem::take(&mut self.ack.pending_floor) {
             return;
         }
-        let cap = self.ack.pending_cap.take().map(|c| c.0);
+        let cap = self.ack.pending_cap.take();
         // Plan 30 §M11 phase 2b: a tenure with live write delegations
         // has grants (and, under them, read grants a delegate gave)
         // that its successor cannot see renewed; one constant covers
@@ -1320,16 +1345,15 @@ impl Core {
         let deleg = if replica.delegation_table().is_empty() {
             0
         } else {
-            self.reclaim_horizon_ms() as i64
+            self.reclaim_horizon_ms()
         };
+        // Plan 43 C7-H1: the floor is a wait on this node's wait clock (a
+        // forward wall step must not end it early); the cap is on it too.
         let bound = |ttl: u64| {
-            now.wall.0
-                + self.cfg.backup_takeover_ms as i64
-                + ttl as i64
-                + deleg
-                + 2 * self.cfg.expiry_margin_ms as i64
+            now.wait
+                .plus(self.cfg.backup_takeover_ms + ttl + deleg + 2 * self.cfg.expiry_margin_ms)
         };
-        let capped = |bound: i64| cap.map_or(bound, |c| bound.min(c));
+        let capped = |bound: WaitMs| cap.map_or(bound, |c| bound.min(c));
         // Plan 30 §M14: lock grants are capped like read delegations and
         // marked the same way, but only new lock grants wait for them —
         // a lock grant still honoured elsewhere does not make an
@@ -1349,44 +1373,44 @@ impl Core {
         } else {
             until
         };
-        if floor_end <= now.wall.0 {
+        if floor_end <= now.wait {
             // The predecessor's lease, as its beats placed it, ended
             // before this marker landed: everything it granted is
             // lapsed, and no floor remains.
-            self.ack.floor_until = 0;
+            self.ack.floor_until = WaitMs(0);
             self.stats.ack_floor_capped_out += 1;
             tracing::info!(
                 node = self.cfg.node_id,
-                bound_ms = floor_bound - now.wall.0,
-                cap_ms = floor_end - now.wall.0,
+                bound_ms = floor_bound.since(now.wait),
+                cap_ms = floor_end.since(now.wait),
                 "took a lease over by seal or ack=s3 from a tenure that served strict \
                  reads or locks; its lease, as its beats placed it, has ended: no floor"
             );
             return;
         }
-        if self.cfg.locks && locks_until > now.wall.0 {
+        if self.cfg.locks && locks_until > now.wait {
             replica.locks().set_quarantine(locks_until);
         }
         self.ack.floor_until = floor_end;
         self.stats.ack_floor_waits += 1;
-        let capped_by = floor_bound - floor_end;
+        let capped_by = floor_bound.since(floor_end);
         if capped_by > 0 {
             self.stats.ack_floor_capped += 1;
             self.stats.ack_floor_cap_saved_ms += capped_by as u64;
         }
         tracing::info!(
             node = self.cfg.node_id,
-            wait_ms = until.max(now.wall.0) - now.wall.0,
-            lock_wait_ms = locks_until.max(now.wall.0) - now.wall.0,
-            bound_ms = bound_until - now.wall.0,
+            wait_ms = until.max(now.wait).since(now.wait),
+            lock_wait_ms = locks_until.max(now.wait).since(now.wait),
+            bound_ms = bound_until.since(now.wait),
             capped = capped_by > 0,
             "took a lease over by seal or ack=s3 from a tenure that served strict \
              reads or locks; acknowledging no mutation until its delegation \
              horizon has passed"
         );
-        if until > now.wall.0 {
+        if until > now.wait {
             replica.read_delegations().set_quarantine(until);
-            self.arm_grant_quarantine(Ms(until), out);
+            self.arm_grant_quarantine(until, out);
         }
     }
 
@@ -1522,7 +1546,7 @@ impl Core {
         if self.cfg.backup_rtt_budget_ms == 0 || self.cfg.backups_max == 0 {
             return Vec::new();
         }
-        let mut eligible: Vec<(Ms, NodeId)> = self
+        let mut eligible: Vec<(WaitMs, NodeId)> = self
             .links
             .values()
             .filter(|l| l.node != self.cfg.node_id && l.connected)
@@ -1534,9 +1558,9 @@ impl Core {
             })
             .filter(|l| {
                 l.since
-                    .is_some_and(|since| now.wall.since(since) >= self.cfg.backup_stable_ms as i64)
+                    .is_some_and(|since| now.wait.since(since) >= self.cfg.backup_stable_ms as i64)
             })
-            .map(|l| (l.since.unwrap_or(now.wall), l.node))
+            .map(|l| (l.since.unwrap_or(now.wait), l.node))
             .collect();
         eligible.sort();
         eligible.into_iter().map(|(_, n)| n).collect()
@@ -1602,12 +1626,12 @@ impl Core {
                 sent_through: 0,
                 inflight: std::collections::VecDeque::new(),
                 last_sent: Ms(0),
-                last_progress: now.wall,
+                last_progress: now.wait,
                 committed: false,
                 candidacy,
-                alive_at: now.wall,
+                alive_at: now.wait,
                 short_since_progress: false,
-                short_since: now.wall,
+                short_since: now.wait,
                 unreachable: false,
                 answers_beats: false,
             },
@@ -1772,7 +1796,7 @@ impl Core {
             0
         };
         let t = self.cfg.backup_takeover_ms.max(1) as i64;
-        let since = |s: &Self, at: Ms| {
+        let since = |s: &Self, at: WaitMs| {
             if aware {
                 s.after_own_lapses(at, t, true)
             } else {
@@ -1785,16 +1809,16 @@ impl Core {
         // off as the answers resumed, `on_backup_alive`).
         let interval = self.cfg.backup_heartbeat_ms as i64;
         let short_answering = |p: &BackupPeer| {
-            let quiet = now.wall.since(p.alive_at.max(p.short_since)) - interval;
-            now.wall.since(p.short_since) - if aware { quiet.max(0) } else { 0 }
+            let quiet = now.wait.since(p.alive_at.max(p.short_since)) - interval;
+            now.wait.since(p.short_since) - if aware { quiet.max(0) } else { 0 }
         };
         let stale: Vec<NodeId> = self
             .ack
             .peers
             .iter()
             .filter(|(_, p)| {
-                let silent = now.wall.since(since(self, p.last_progress));
-                let unheard = now.wall.since(since(self, p.alive_at));
+                let silent = now.wait.since(since(self, p.last_progress));
+                let unheard = now.wait.since(since(self, p.alive_at));
                 tip_behind(p)
                     && silent >= timeout
                     && (unheard >= timeout + if p.answers_beats { grace } else { 0 }
@@ -1816,8 +1840,8 @@ impl Core {
                 tracing::debug!(
                     node = self.cfg.node_id,
                     backup = n,
-                    silent_ms = now.wall.since(since(self, p.last_progress)),
-                    unheard_ms = now.wall.since(since(self, p.alive_at)),
+                    silent_ms = now.wait.since(since(self, p.last_progress)),
+                    unheard_ms = now.wait.since(since(self, p.alive_at)),
                     short = p.short_since_progress,
                     unreachable = p.unreachable,
                     "backup acknowledgement timeout"
@@ -2135,11 +2159,11 @@ impl Core {
         // for the same rows is stuck, and the timeout rule drops it
         // rather than the two of them resending forever (round 2).
         if acked > p.acked || acked >= entry.last {
-            p.last_progress = now.wall;
+            p.last_progress = now.wait;
             p.short_since_progress = false;
         } else if !p.short_since_progress {
             p.short_since_progress = true;
-            p.short_since = now.wall;
+            p.short_since = now.wait;
         }
         tracing::trace!(
             node = self.cfg.node_id,
@@ -2176,8 +2200,8 @@ impl Core {
     }
 
     /// `Event::BackupAlive`: `from` answered the holder's heartbeat sent
-    /// at `at`.
-    pub(crate) fn on_backup_alive(&mut self, from: NodeId, at: Ms) {
+    /// at `at` (this node's wait clock).
+    pub(crate) fn on_backup_alive(&mut self, from: NodeId, at: WaitMs) {
         let interval = self.cfg.backup_heartbeat_ms as i64;
         let aware = self.cfg.liveness_lag_aware;
         if let Some(p) = self.ack.peers.get_mut(&from) {
@@ -2530,11 +2554,11 @@ impl Core {
                 self.bk.candidacy = candidacy;
             }
         }
-        self.bk.last_heard = now.wall;
+        self.bk.last_heard = now.wait;
         self.bk.restarted = false;
         self.lease.cached_holder = Some(holder);
         self.bk.holder_silent_since = None;
-        self.note_named_expiry(holder, epoch, now.wall, expires);
+        self.note_named_expiry(holder, epoch, now.wait, expires);
         // What is acknowledged is held *contiguously* (or is in the log:
         // rows through the holder's shipped-through seq, `through`, are
         // durable in S3, so a batch may start past them). The holder
@@ -2596,7 +2620,7 @@ impl Core {
             );
             return;
         }
-        let until = now.wall.plus(for_ms.min(BACKUP_HOLD_MAX_MS));
+        let until = now.wait.plus(for_ms.min(BACKUP_HOLD_MAX_MS));
         self.bk.last_heard = self.bk.last_heard.max(until);
         self.stats.backup_holds += 1;
         tracing::info!(
@@ -2676,7 +2700,7 @@ impl Core {
         epoch: Epoch,
         candidacy: u64,
         listed: bool,
-        (at, expires): (Ms, Ms),
+        (at, expires): (WaitMs, Ms),
         beat: (u64, u64, i64, i64, i64),
         replica: &dyn Replica,
     ) {
@@ -2684,7 +2708,7 @@ impl Core {
         // stamped it. A numbered beat used to be credited no later than its
         // send plus the expiry margin (`min(at, sent + M)`), which compared
         // the holder's `sent` with this node's `at`; `sent` is now a reading
-        // of the holder's honour clock, opaque here (`note_beat` keeps it per
+        // of the holder's wait clock, opaque here (`note_beat` keeps it per
         // clock id), so the credit is gone. What it bought was at most one
         // margin of silence window for a beat held up in a retransmit queue.
         if listed {
@@ -2736,7 +2760,7 @@ impl Core {
         &mut self,
         from: NodeId,
         epoch: Epoch,
-        at: Ms,
+        at: WaitMs,
         expires: Ms,
         (seq, clock, sent, holder_expires, guard): (u64, u64, i64, i64, i64),
     ) {
@@ -2787,9 +2811,8 @@ impl Core {
                 // Not what this node's own lapses held up: those are
                 // discounted once, by `attentive_since`.
                 let heard_late = at.since(last_at) - steps * interval - own_lapsed;
-                // Two `sent` of one holder clock. A forward wall step of the
-                // holder moves its honour clock once, which shows as one
-                // late beat: liveness only (plan 43 C7-H1).
+                // Two `sent` of one holder clock (its wait clock: a wall step
+                // of the holder moves it neither way).
                 let sent_late = sent - last_sent - steps * interval;
                 let late = heard_late.max(sent_late);
                 if late >= threshold {
@@ -2816,7 +2839,7 @@ impl Core {
     /// the entry starts afresh, though its late beats still say how the
     /// host has been doing; `None`: `from` has since been heard at a later
     /// epoch.
-    fn beats_at(&mut self, from: NodeId, epoch: Epoch, at: Ms) -> Option<&mut HolderBeats> {
+    fn beats_at(&mut self, from: NodeId, epoch: Epoch, at: WaitMs) -> Option<&mut HolderBeats> {
         let b = self.bk.beats.entry(from).or_default();
         if epoch < b.epoch {
             return None;
@@ -2844,7 +2867,7 @@ impl Core {
     /// expired object that lists this node). Through `beats_at` it also
     /// moves `HolderBeats::heard_at` to the core's `now`, which the
     /// `ack=s3` holder watch reads: by at most one core lag, within the epoch.
-    fn note_named_expiry(&mut self, from: NodeId, epoch: Epoch, at: Ms, expires: Ms) {
+    fn note_named_expiry(&mut self, from: NodeId, epoch: Epoch, at: WaitMs, expires: Ms) {
         if expires.0 <= 0 {
             return;
         }
@@ -2854,7 +2877,7 @@ impl Core {
     }
 
     /// How much of `(from, to)` this node spent in its own lapses.
-    fn own_lapsed_between(&self, from: Ms, to: Ms) -> i64 {
+    fn own_lapsed_between(&self, from: WaitMs, to: WaitMs) -> i64 {
         self.bk
             .own_lapses
             .iter()
@@ -2863,7 +2886,7 @@ impl Core {
     }
 
     /// `Event::OwnLag`.
-    pub(crate) fn on_own_lag(&mut self, from: Ms, until: Ms) {
+    pub(crate) fn on_own_lag(&mut self, from: WaitMs, until: WaitMs) {
         if until <= from {
             return;
         }
@@ -2984,7 +3007,7 @@ impl Core {
         let late = self.bk.beats.get(&holder).map_or(0, |b| {
             b.late
                 .iter()
-                .filter(|(at, _)| now.wall.since(*at) < LATE_BEATS_MEMORY_MS)
+                .filter(|(at, _)| now.wait.since(*at) < LATE_BEATS_MEMORY_MS)
                 .map(|(_, ms)| *ms)
                 .max()
                 .unwrap_or(0)
@@ -3000,7 +3023,7 @@ impl Core {
     /// since `last` after `last`, so a node that lags again and again
     /// still acts on a dead holder: within a window plus one of its own
     /// attentive time (the time it was not held up) of the silence.
-    pub(crate) fn attentive_since(&self, watched: Watched, last: Ms, now: Now) -> Ms {
+    pub(crate) fn attentive_since(&self, watched: Watched, last: WaitMs, now: Now) -> WaitMs {
         match self.lag_discount(watched, now) {
             None => last,
             Some(Reach::PlusLapses(beyond)) => self.after_own_lapses(last, beyond, true),
@@ -3014,7 +3037,7 @@ impl Core {
     /// otherwise in wall time): [`Self::attentive_since`]'s rule, and the
     /// holder's for how long its backups have been silent
     /// (`backup_timeouts`, a window beyond, plus the lapses).
-    fn after_own_lapses(&self, last: Ms, beyond: i64, plus_lapses: bool) -> Ms {
+    fn after_own_lapses(&self, last: WaitMs, beyond: i64, plus_lapses: bool) -> WaitMs {
         let (mut latest, mut lapsed) = (last, 0i64);
         for &(from, until) in &self.bk.own_lapses {
             if until > last {
@@ -3034,7 +3057,7 @@ impl Core {
         if self.bk.role.is_none() {
             return;
         }
-        self.bk.last_heard = now.wall;
+        self.bk.last_heard = now.wait;
         self.arm_backup_watch(now, out);
     }
 
@@ -3044,11 +3067,11 @@ impl Core {
             // open (re-armed by `backup_watch_after_epoch`).
             return;
         }
-        let mut due = now.wall.plus(self.cfg.backup_takeover_ms.max(1));
+        let mut due = now.wait.plus(self.cfg.backup_takeover_ms.max(1));
         if let Some(role) = self.bk.role {
             due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
         }
-        let id = self.set_timer_wall(due, Timer::BackupWatch, out);
+        let id = self.set_timer_wait(due, Timer::BackupWatch, out);
         self.bk.watch_timer = Some(id);
     }
 
@@ -3056,9 +3079,13 @@ impl Core {
     /// as this node knows it, if that is still ahead: the watch looks at
     /// the expiry itself, whatever it has credited since
     /// (`on_backup_watch`).
-    fn watch_due_by_expiry(&self, holder: NodeId, epoch: Epoch, now: Now, due: Ms) -> Ms {
+    fn watch_due_by_expiry(&self, holder: NodeId, epoch: Epoch, now: Now, due: WaitMs) -> WaitMs {
         match self.known_expiry(holder, epoch) {
-            Some(expires) if expires > now.wall => due.min(expires),
+            // The holder's expiry is a wall stamp (row 24, C7b): the watch
+            // is due where this node's wall clock reads it, as time left
+            // on the wait clock the timer runs on (the decision itself
+            // compares the wall clock again, `on_backup_watch`).
+            Some(expires) if expires > now.wall => due.min(now.wait_of_wall(expires)),
             _ => due,
         }
     }
@@ -3099,7 +3126,7 @@ impl Core {
         if self.bk.restarted && self.bk.sealed < role.epoch {
             if self.links.get(&role.holder).is_some_and(|l| l.connected) {
                 self.bk.restarted = false;
-                self.bk.last_heard = self.bk.last_heard.max(now.wall);
+                self.bk.last_heard = self.bk.last_heard.max(now.wait);
             } else {
                 let op = self.issue_s3(S3Op::LeaseGet, S3For::TakeoverGet, out);
                 self.bk.takeover_get = Some(op);
@@ -3115,7 +3142,7 @@ impl Core {
         let watched = (role.holder, role.epoch, true);
         let window = self.silence_window(watched, now);
         let since = self.attentive_since(watched, self.bk.last_heard, now);
-        let silent = now.wall.since(since);
+        let silent = now.wait.since(since);
         // Past the expiry of the holder's lease as this node knows it (its
         // beats named it, or this node read it), its silence is not the
         // question; the lease ending is. What this node
@@ -3144,11 +3171,11 @@ impl Core {
             if let Some(expires) = self.known_expiry(role.holder, role.epoch) {
                 let aware_until = Ms(expires.0 - self.cfg.expiry_margin_ms as i64);
                 if aware_until > now.wall {
-                    due = due.min(aware_until);
+                    due = due.min(now.wait_of_wall(aware_until));
                 }
             }
             let due = self.watch_due_by_expiry(role.holder, role.epoch, now, due);
-            let id = self.set_timer_wall(due, Timer::BackupWatch, out);
+            let id = self.set_timer_wait(due, Timer::BackupWatch, out);
             self.bk.watch_timer = Some(id);
             return;
         }
@@ -3156,7 +3183,7 @@ impl Core {
             node = self.cfg.node_id,
             holder = role.holder,
             epoch = role.epoch,
-            silent_ms = now.wall.since(self.bk.last_heard),
+            silent_ms = now.wait.since(self.bk.last_heard),
             attentive_ms = silent,
             window_ms = window,
             at_expiry = silent < window,
@@ -3166,14 +3193,14 @@ impl Core {
         self.bk.watch_read = Some(SealRecord {
             holder: role.holder,
             epoch: role.epoch,
-            silent_ms: now.wall.since(self.bk.last_heard),
+            silent_ms: now.wait.since(self.bk.last_heard),
             attentive_ms: silent,
             window_ms: window,
             at: now.wall,
         });
         let op = self.issue_s3(S3Op::LeaseGet, S3For::TakeoverGet, out);
         self.bk.takeover_get = Some(op);
-        self.bk.takeover_read_at = now.wall;
+        self.bk.takeover_read_at = now.wait;
         self.bk.takeover_read_for_expiry = silent < window;
     }
 
@@ -3237,7 +3264,7 @@ impl Core {
                         self.bk.last_heard
                     };
                     let window = self.silence_window((role.holder, role.epoch, true), now);
-                    if for_expiry || now.wall.since(since) < window {
+                    if for_expiry || now.wait.since(since) < window {
                         if let Some(b) = self.bk.beats.get_mut(&role.holder) {
                             if b.epoch == role.epoch {
                                 b.expires = b.expires.max(Ms(lease.expires_unix_ms));
@@ -3739,7 +3766,7 @@ impl Core {
         let silent = match self.stream_last_frame_from(seen.holder) {
             Some(frame) => {
                 let last = heard.map_or(frame, |h| h.max(frame));
-                now.wall.since(self.attentive_since(who, last, now)) >= window
+                now.wait.since(self.attentive_since(who, last, now)) >= window
             }
             None => {
                 let up = self.links.get(&seen.holder).is_some_and(|l| l.connected)
@@ -3748,8 +3775,8 @@ impl Core {
                     self.bk.holder_silent_since = None;
                     return;
                 }
-                let since = *self.bk.holder_silent_since.get_or_insert(now.wall);
-                now.wall.since(self.attentive_since(who, since, now)) >= window
+                let since = *self.bk.holder_silent_since.get_or_insert(now.wait);
+                now.wait.since(self.attentive_since(who, since, now)) >= window
             }
         };
         if !silent {

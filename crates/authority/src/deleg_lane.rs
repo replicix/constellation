@@ -21,7 +21,7 @@
 //! grant and learns nothing about the delegate's stream or backup from it.
 
 use crate::core::DelegRenewCert;
-use crate::ids::{HonourMs, Ms};
+use crate::ids::{HonourMs, WaitMs};
 use std::collections::HashMap;
 
 /// Request ids of the lane's renewals carry this bit; the core's are
@@ -155,7 +155,11 @@ pub const FREEZE_CORROBORATION_MS: i64 = 500;
 /// FREEZE_RTT_MS`, so that no renewal could be sent and answered in
 /// between. A freeze far from the loss, one that began after the lane had
 /// its chance, and one that ended in time to renew in explain nothing.
-pub fn freeze_explains(freezes: &[(Ms, Ms)], due: Ms, lapse_point: Ms) -> Option<i64> {
+pub fn freeze_explains(
+    freezes: &[(WaitMs, WaitMs)],
+    due: WaitMs,
+    lapse_point: WaitMs,
+) -> Option<i64> {
     freezes
         .iter()
         .filter(|(from, until)| {
@@ -355,8 +359,8 @@ mod tests {
     #[test]
     fn only_a_freeze_in_the_window_of_the_loss_explains_it() {
         // Renewal due at 2_500, lapse point 6_000 (a 5 s grant, 500 ms margin).
-        let (due, lapse) = (Ms(2_500), Ms(6_000));
-        let ms = |a: i64, b: i64| (Ms(a), Ms(b));
+        let (due, lapse) = (WaitMs(2_500), WaitMs(6_000));
+        let ms = |a: i64, b: i64| (WaitMs(a), WaitMs(b));
         // Covering due -> lapse: explains it, by its length.
         assert_eq!(
             freeze_explains(&[ms(2_400, 6_100)], due, lapse),

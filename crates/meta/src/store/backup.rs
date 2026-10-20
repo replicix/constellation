@@ -775,6 +775,7 @@ mod tests {
 #[cfg(test)]
 mod durability_tests {
     use crate::store::Meta;
+    use constellation_types::clock::Now;
 
     /// M16: every write whose safety rests on being remembered across a
     /// power loss is synced before the caller acts on it — and a no-op
@@ -785,14 +786,14 @@ mod durability_tests {
         let synced = |before: u64| meta.sync_count() - before;
 
         let n = meta.sync_count();
-        assert!(meta.promise_issue(10_000).unwrap());
+        assert!(meta.promise_issue(10_000, Now::same(0)).unwrap());
         assert_eq!(synced(n), 1, "a new promise is synced before its PUT");
         let n = meta.sync_count();
-        assert!(meta.promise_issue(5_000).unwrap());
+        assert!(meta.promise_issue(5_000, Now::same(0)).unwrap());
         assert_eq!(synced(n), 0, "a promise that extends nothing");
 
         let n = meta.sync_count();
-        assert!(meta.promise_join_begin(20_000).unwrap());
+        assert!(meta.promise_join_begin(Now::same(20_000)).unwrap());
         assert_eq!(synced(n), 1, "the join gate");
 
         let n = meta.sync_count();
@@ -822,5 +823,27 @@ mod durability_tests {
         meta.persist_epoch("e1", &[1, 2], &base, 7, "active")
             .unwrap();
         assert_eq!(synced(n), 1, "an epoch state change");
+    }
+
+    /// Plan 43 C7-H1 (R9): a promiser waits its promise out on its wait
+    /// clock: a forward wall step does not let it join an epoch early.
+    /// Fails on the parent: the gate compared the wall clock with the
+    /// persisted wall value.
+    #[test]
+    fn the_join_gate_waits_the_promise_out_on_the_wait_clock() {
+        use constellation_types::clock::{HonourMs, Ms, WaitMs};
+        let meta = Meta::open_in_memory().unwrap();
+        let at = |wall: i64, wait: i64| Now {
+            wall: Ms(wall),
+            honour: HonourMs(wall),
+            wait: WaitMs(wait),
+        };
+        // Issued at wall 1_000 / wait 5_000 for 10 s.
+        assert!(meta.promise_issue(11_000, at(1_000, 5_000)).unwrap());
+        // The wall clock stepped 9 s forward: past the promise on the wall
+        // clock, 1 s into it on the wait clock.
+        assert!(!meta.promise_join_begin(at(10_000, 6_000)).unwrap());
+        assert!(!meta.promise_join_begin(at(10_000, 14_999)).unwrap());
+        assert!(meta.promise_join_begin(at(10_000, 15_000)).unwrap());
     }
 }

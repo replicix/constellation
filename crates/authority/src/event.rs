@@ -11,7 +11,7 @@
 //! stale and dropped instead of being misread as the answer to something
 //! else.
 
-use crate::ids::{Epoch, HonourMs, Ms, NodeId, OpId, Seq, TimerId};
+use crate::ids::{Epoch, HonourMs, Ms, NodeId, OpId, Seq, TimerId, WaitMs};
 use constellation_fs_core::Ino;
 use constellation_meta::locks::LockTag;
 use constellation_meta::{BackupTx, DelegateTx, MutateOp, MutateOutcome, OwnChunks, Position, Rid};
@@ -117,13 +117,14 @@ pub enum Event {
     SubscriberGone { node: NodeId, req: OpId },
     /// The lease holder `from`'s off-core liveness heartbeat (the driver
     /// sends it while its core is responsive; `Payload::HolderAlive`),
-    /// heard at `at` — its arrival, which may be well before this node's
-    /// core gets to it. `listed: false`: the holder dropped this node's
-    /// `candidacy` (`PeerMsg::BackupAppend::candidacy`) from its backups.
+    /// heard at `at` — its arrival on this node's wait clock, which may be
+    /// well before this node's core gets to it. `listed: false`: the
+    /// holder dropped this node's `candidacy`
+    /// (`PeerMsg::BackupAppend::candidacy`) from its backups.
     /// `seq`, `sent`, `holder_expires` and `guard` are the beat's number,
-    /// the holder's honour clock when it sent it, the end of the lease it
-    /// beats for on that clock and what it waits out that its lease does
-    /// not cap, mapped onto it; `clock` is the id of that clock
+    /// the holder's **wait** clock when it sent it, the end of the lease
+    /// it beats for on that clock and what it waits out that its lease
+    /// does not cap, on it too; `clock` is the id of that clock
     /// (`constellation_net::Beat`; plan 43 C7-H1: values of one holder
     /// clock, opaque on this node, never compared with its own readings:
     /// `Core::beat_cap` keeps them per clock id). `expires` is the lease
@@ -135,12 +136,12 @@ pub enum Event {
         epoch: Epoch,
         candidacy: u64,
         listed: bool,
-        at: Ms,
+        at: WaitMs,
         seq: u64,
         clock: u64,
         sent: i64,
         holder_expires: i64,
-        /// Plan 43 C7-F F-a: the latest instant on the holder's honour
+        /// Plan 43 C7-F F-a: the latest instant on the holder's wait
         /// clock at which grants it waits out but its lease does not cap
         /// may still be honoured (its takeover floor, its lock and read
         /// quarantines, its subtree graces); 0: none, or an unnumbered
@@ -156,7 +157,7 @@ pub enum Event {
     /// and what it has not stamped yet may already be here. A silence
     /// watch (the seal watch, `ack=s3`'s) counts silence only from the
     /// end of the latest lapse (`Core::attentive_since`).
-    OwnLag { from: Ms, until: Ms },
+    OwnLag { from: WaitMs, until: WaitMs },
     /// The off-core delegation renewal lane (`crate::deleg_lane`) sent a
     /// renewal of `gen` (stream round `round`) to root `to` as request `req`
     /// at `sent` (this node's honour clock, read before the send), because the
@@ -171,16 +172,16 @@ pub enum Event {
         sent: HonourMs,
     },
     /// The off-core heartbeat thread did not run from `from` to `until`
-    /// (this node's clock): the whole process was frozen, and nothing in it
+    /// (this node's wait clock): the whole process was frozen, and nothing in it
     /// could renew a delegation (`Core::on_own_freeze`). The core uses it
     /// only to say, when it gives a grant up, whether the freeze alone
     /// explains the loss (`Stats::deleg_lapses_frozen`).
-    OwnFreeze { from: Ms, until: Ms },
+    OwnFreeze { from: WaitMs, until: WaitMs },
     /// The holder's side of the same heartbeat: backup `from` answered
     /// one sent at `at` (its process and link are up, whatever its core
     /// is doing). A backup known alive is given `backup_slow_max_ms`, not
     /// `backup_ack_timeout_ms`, to make acknowledgement progress.
-    BackupAlive { from: NodeId, at: Ms },
+    BackupAlive { from: NodeId, at: WaitMs },
     /// Local writes the driver's fast path executed without the core
     /// (the FUSE lease view's `admit`): the time of the last one, for the
     /// idle-release clock, and their rid seqs, for the ack tracker
@@ -232,15 +233,16 @@ pub struct PeerLink {
     pub node: NodeId,
     /// The last RPC to it succeeded, or gossip has it as a neighbor.
     pub connected: bool,
-    /// When it was last heard from (any successful exchange).
-    pub last_seen: Option<Ms>,
+    /// When it was last heard from (any successful exchange), on this
+    /// node's wait clock.
+    pub last_seen: Option<WaitMs>,
     /// Plan 30 §M9: the measured round trip to it, when known. Backup
     /// candidates are chosen by this against the RTT budget, never by
     /// assuming a LAN.
     pub rtt_ms: Option<u64>,
     /// Plan 30 §M9: since when the link has been up without a break
     /// (the plan prefers the peer connected the longest).
-    pub since: Option<Ms>,
+    pub since: Option<WaitMs>,
 }
 
 /// Control-plane requests (`SyncRequest`'s non-mutation arms).
@@ -627,7 +629,7 @@ pub enum PeerMsg {
         /// in its subtree (unlinked under their lock): the root installs
         /// them once it has applied the batch, which takes them out of
         /// the subtree in its replica too (`Core::deleg_leaving_grants`).
-        leaving: Vec<constellation_meta::locks::Grant>,
+        leaving: Vec<constellation_meta::locks::GrantWire>,
         /// Plan 30 §M14: the delegate's outwait barriers on inodes no
         /// longer in its subtree, `(inode, as of)` on its clock: the root
         /// keeps them once it has applied the batch
@@ -686,7 +688,7 @@ pub enum PeerMsg {
         ttl_ms: u64,
         /// Plan 30 §M14: the root's lock grants under the subtree, handed
         /// over with the first renewal (restamped by the delegate).
-        locks: Vec<constellation_meta::locks::Grant>,
+        locks: Vec<constellation_meta::locks::GrantWire>,
         /// Plan 30 §M14: how much longer the root refuses new lock grants
         /// on the subtree (a grace: after a takeover of a released lease,
         /// an outwaited delegate, a restart quarantine) — grants of an
@@ -844,7 +846,7 @@ pub enum PeerMsg {
     /// way, asynchronous; the successor installs the last one it saw).
     LockMirror {
         ver: u64,
-        grants: Vec<constellation_meta::locks::Grant>,
+        grants: Vec<constellation_meta::locks::GrantWire>,
         /// Every lock floor the holder knows, joined: a fast successor
         /// puts it under the whole namespace.
         floor: constellation_meta::Position,

@@ -283,8 +283,13 @@ changes nothing; a forward step ends its delegations and read delegations
 early, by the step (a strict read then goes to the sequencer again, and a
 delegate asks for a renewal), and ends its lease's usable window early (the
 lease is renewed at once, or is unusable for a moment). The sequencer's
-side of the rule is measured on the wall clock until the matching change
-to the wait clock lands.
+side of the rule (its record of a read delegation, the restart quarantine,
+the takeover floor, a delegation it outwaits) is measured on its **wait
+clock**: a monotone reading that never over-counts and ignores every wall
+step, so a forward step of the sequencer's wall clock does not end a
+recall's wait early and a backward one does not lengthen it. A quarantine
+persisted across a restart is written as a wall value and read back as time
+left on the new process's wait clock.
 
 ### Without P2P
 

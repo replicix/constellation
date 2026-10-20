@@ -1549,9 +1549,14 @@ mod tests {
         let m = Meta::open_in_memory().unwrap();
         let tmp = m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
         let lock_file = m.create(ROOT_INO, "turn.lock", 0o644, 0, 0).unwrap();
-        let g = m
-            .locks()
-            .grant(1, 2, lock_file.ino, LockMode::Exclusive, 30_000, 0);
+        let g = m.locks().grant(
+            1,
+            2,
+            lock_file.ino,
+            LockMode::Exclusive,
+            constellation_types::clock::WaitMs(30_000),
+            0,
+        );
         let tag = LockTag(vec![LockToken {
             grant: g,
             until_ms: 28_000,
@@ -1648,9 +1653,14 @@ mod tests {
         let m = Arc::new(Meta::open_in_memory().unwrap());
         m.create(ROOT_INO, "tmp", 0o644, 0, 0).unwrap();
         let lock_file = m.create(ROOT_INO, "turn.lock", 0o644, 0, 0).unwrap();
-        let g = m
-            .locks()
-            .grant(1, 1, lock_file.ino, LockMode::Exclusive, 30_000, 0);
+        let g = m.locks().grant(
+            1,
+            1,
+            lock_file.ino,
+            LockMode::Exclusive,
+            constellation_types::clock::WaitMs(30_000),
+            0,
+        );
         let tag = LockTag(vec![LockToken {
             grant: g,
             until_ms: 28_000,
@@ -1805,7 +1815,14 @@ mod tests {
         assert!(!m.locks().unsettled_writes());
         // Minted here: settles once ended, whatever the token's window.
         let f = m.create(ROOT_INO, "turn.lock", 0o644, 0, 0).unwrap();
-        let g = m.locks().grant(1, 2, f.ino, LockMode::Exclusive, 60_000, 0);
+        let g = m.locks().grant(
+            1,
+            2,
+            f.ino,
+            LockMode::Exclusive,
+            constellation_types::clock::WaitMs(60_000),
+            0,
+        );
         let own = LockTag(vec![LockToken {
             grant: g,
             until_ms: 50_000,

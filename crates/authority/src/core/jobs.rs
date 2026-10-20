@@ -1268,7 +1268,7 @@ impl Core {
             g.shippable = true;
         }
         if !gate.drained {
-            if replica.read_delegations().quarantine_until() > now.wall.0 {
+            if replica.read_delegations().quarantine_until() > now.wait {
                 return GateStep::Wait;
             }
             return GateStep::NeedDrain;
@@ -1907,7 +1907,7 @@ impl Core {
                     && (self.epoch_reclaim_due()
                         || (!self.epoch.open
                             && self.epoch_reclaim_pending(now)
-                            && replica.locks().live_grants_len(now.wall.0) > 0))
+                            && replica.locks().live_grants_len(now.wait) > 0))
                     && !self
                         .queued_jobs
                         .iter()
@@ -2093,7 +2093,7 @@ impl Core {
         // there the release is the epoch's design.
         let fast_gate = self.lease.gate.as_ref().is_some_and(|g| g.fast_prev);
         if flushed
-            && (replica.locks().live_grants_len(now.wall.0) > 0
+            && (replica.locks().live_grants_len(now.wait) > 0
                 || self.in_takeover_floor(now)
                 || fast_gate)
         {

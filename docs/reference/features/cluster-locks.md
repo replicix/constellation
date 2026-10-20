@@ -217,9 +217,17 @@ node's wall clock therefore changes nothing: a grant lapses when its window
 ends, not later. A forward step ends the windows it covers at once: if it
 is larger than what is left of a held grant's window, the grant lapses and
 its owner is fenced (`EIO`) as for any lapse. That is the expected cost of
-a large forward step. The sequencer's own record of a grant is still
-measured on the wall clock; the matching change to a clock a step cannot
-move comes with the next commit of the item.
+a large forward step. The sequencer's own record of a grant is measured on its **wait
+clock** (plan 43 C7-H1): a monotone reading that never over-counts and
+ignores every wall step. A forward step of the owner's wall clock therefore
+does not make it drop a record early and grant to another node while the
+holder still honours its window, and a backward one does not make a waiter
+wait longer. The same holds for what an owner waits out otherwise: a
+restart's or a takeover's quarantine, a grace on a subtree, an outwaited
+delegation, a successor's takeover floor. What is persisted across a restart
+(the grant horizon) is written as a wall value and read back as time left on
+the new process's wait clock. A fencing token's window stays a wall value, so
+the executor's check of it keeps the offset bound.
 
 A grant is renewed half-way through the window the node honours it for
 (`(ttl − margin) / 2` after the send: 9.5 s at the defaults), one

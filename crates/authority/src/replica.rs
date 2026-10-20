@@ -12,7 +12,7 @@
 //! The method set is exactly what the decision logic touches, and nothing
 //! else in `Meta` is reachable from the core.
 
-use crate::ids::{Epoch, NodeId, Now, Seq};
+use crate::ids::{Epoch, NodeId, Now, Seq, WaitMs};
 use constellation_fs_core::Ino;
 use constellation_meta::delegation::{DelegationTable, Ownership};
 use constellation_meta::locks::LockTag;
@@ -400,11 +400,13 @@ pub trait Replica {
     /// victims included).
     fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino>;
     /// At start: the previous incarnation's grants may be live until the
-    /// returned time; the table is quarantined until then.
-    fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64>;
+    /// returned time (this node's wait clock, converted from the persisted
+    /// wall horizon); the table is quarantined until then.
+    fn load_grant_quarantine(&self, now: Now) -> Option<WaitMs>;
     /// At start: the previous incarnation's lock grants may be live until
-    /// the returned time; no new lock grant until then.
-    fn load_lock_quarantine(&self, now_ms: i64) -> Option<i64>;
+    /// the returned time (this node's wait clock); no new lock grant until
+    /// then.
+    fn load_lock_quarantine(&self, now: Now) -> Option<WaitMs>;
     /// Whether the unshipped journal touched what a ReadIndex for `ino`
     /// (a directory's entries with `dir`; the entry `name` → `child`)
     /// reads.
@@ -516,7 +518,7 @@ pub trait Replica {
     fn promise_issued(&self) -> i64;
     /// Persist a promise before its PUT (`Meta::promise_issue`): `false`
     /// while a continuation-epoch join holds the gate (nothing written).
-    fn issue_promise(&self, until_unix_ms: i64) -> Result<bool, MetaError>;
+    fn issue_promise(&self, until_unix_ms: i64, now: Now) -> Result<bool, MetaError>;
     /// The continuation-epoch hold this node owns (`local["epoch_hold"]`),
     /// so a restarted hold owner re-adopts it and can flush its journal.
     fn epoch_hold_persisted(&self) -> Option<Epoch>;
@@ -1116,12 +1118,12 @@ impl Replica for Meta {
         }
     }
 
-    fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64> {
-        Meta::load_grant_quarantine(self, now_ms)
+    fn load_grant_quarantine(&self, now: Now) -> Option<WaitMs> {
+        Meta::load_grant_quarantine(self, now)
     }
 
-    fn load_lock_quarantine(&self, now_ms: i64) -> Option<i64> {
-        Meta::load_lock_quarantine(self, now_ms)
+    fn load_lock_quarantine(&self, now: Now) -> Option<WaitMs> {
+        Meta::load_lock_quarantine(self, now)
     }
 
     fn recall_inos_of_op(&self, op: &MutateOp) -> Vec<Ino> {
@@ -1282,8 +1284,8 @@ impl Replica for Meta {
         Meta::promise_issued(self).unwrap_or(0)
     }
 
-    fn issue_promise(&self, until_unix_ms: i64) -> Result<bool, MetaError> {
-        Meta::promise_issue(self, until_unix_ms)
+    fn issue_promise(&self, until_unix_ms: i64, now: Now) -> Result<bool, MetaError> {
+        Meta::promise_issue(self, until_unix_ms, now)
     }
 
     fn epoch_hold_persisted(&self) -> Option<Epoch> {

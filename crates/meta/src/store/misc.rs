@@ -5,6 +5,7 @@ use crate::error::MetaError;
 use crate::store::{kv_get_tx, kv_set_tx, ns, EpochRow, Meta};
 use constellation_fs_core::{ChunkHash, Ino};
 use constellation_mtree::record::{InodeRecord, Payload};
+use constellation_types::clock::{Ms, Now};
 use fjall::{Readable, SingleWriterTxKeyspace, SingleWriterWriteTx};
 use std::collections::HashSet;
 
@@ -714,7 +715,10 @@ impl Meta {
     /// check and the write are one write transaction, and the join gate
     /// takes the same (single) writer lock, so a promise can never be
     /// issued between a join's check and its gate.
-    pub fn promise_issue(&self, until_unix_ms: i64) -> Result<bool, MetaError> {
+    ///
+    /// `now`: the promise's end is also kept on this node's wait clock
+    /// (plan 43 C7-H1, R9), where the join gate waits it out.
+    pub fn promise_issue(&self, until_unix_ms: i64, now: Now) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         if kv_get_tx(&tx, &self.local, PROMISE_JOINING)?.as_deref() == Some("1") {
             return Ok(false);
@@ -737,15 +741,23 @@ impl Meta {
         // the time it promised, which a taker counted on.
         if extends {
             self.sync()?;
+            *self.promise_issued_wait.lock().unwrap() =
+                Some((until_unix_ms, now.wait_of_wall(Ms(until_unix_ms))));
         }
         Ok(true)
     }
 
     /// A continuation-epoch join: allowed only once the last issued
-    /// promise has expired in this node's clock (`now_ms`), and from then
-    /// on no promise is issued until [`Meta::promise_join_end`].
-    /// Idempotent while the gate is held.
-    pub fn promise_join_begin(&self, now_ms: i64) -> Result<bool, MetaError> {
+    /// promise has expired in this node's clock, and from then on no
+    /// promise is issued until [`Meta::promise_join_end`]. Idempotent while
+    /// the gate is held.
+    ///
+    /// Plan 43 C7-H1 (R9): a wait, so it is measured on the wait clock when
+    /// this process issued the promise (a forward wall step cannot let the
+    /// promiser join early). A promise of an earlier process, persisted as a
+    /// wall value, is read on the wall clock (a step while the process was
+    /// down still shifts it: row 14, C7a's boot-id form).
+    pub fn promise_join_begin(&self, now: Now) -> Result<bool, MetaError> {
         let mut tx = self.db.write_tx();
         if kv_get_tx(&tx, &self.local, PROMISE_JOINING)?.as_deref() == Some("1") {
             return Ok(true);
@@ -753,7 +765,11 @@ impl Meta {
         let issued: i64 = kv_get_tx(&tx, &self.local, PROMISE_ISSUED)?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        if now_ms < issued {
+        let early = match *self.promise_issued_wait.lock().unwrap() {
+            Some((value, end)) if value == issued => now.wait < end,
+            _ => now.wall.0 < issued,
+        };
+        if early {
             return Ok(false);
         }
         kv_set_tx(&mut tx, &self.local, PROMISE_JOINING, "1");

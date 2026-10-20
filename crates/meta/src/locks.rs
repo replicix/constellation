@@ -32,8 +32,10 @@
 //! that leaves the node is on the **wall** clock, minted from the honour
 //! window at that moment (`Now::wall_of_honour`), and the holder's own
 //! wait for a token to run out is a **wait**-clock copy taken when the pin
-//! is made ([`LockTables::tag_end`]). The sequencer's records are still on
-//! the wall clock (the wait side, the next commit of C7-H1). The sequencer
+//! is made ([`LockTables::tag_end`]). The sequencer's records ([`Grant`], the
+//! restart quarantine, the memory of ended grants) are on its **wait**
+//! clock (never over-counts; a wall step moves none of them) and cross a
+//! node as a [`GrantWire`] whose end is informational wall. The sequencer
 //! records a grant as live until `granted + ttl + margin`; the node
 //! honours it until `sent + ttl − margin`, measured from when it *sent*
 //! the request or renewal — the read delegations' discipline
@@ -208,16 +210,18 @@ impl LockTag {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerFenced;
 
-/// A grant the sequencer made, as its table keeps it (and as it travels
-/// to a backup's mirror or with a delegation move).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A grant the sequencer made, as its table keeps it. On the wire (a
+/// backup's mirror, a delegation move) it travels as a [`GrantWire`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grant {
     pub id: GrantId,
     pub node: u64,
     pub ino: u64,
     pub mode: LockMode,
-    /// Live until this node's clock reaches it (`granted + ttl + margin`).
-    pub until_ms: i64,
+    /// Live until this node's **wait** clock reaches it (`granted + ttl +
+    /// margin`; plan 43 C7-H1: the owner outwaits a grant on a clock a
+    /// wall step cannot move).
+    pub until: WaitMs,
     pub recalled: bool,
     /// The M11 generation it was granted (or installed) under; 0 for the
     /// root's table. A generation's grants leave with it.
@@ -232,6 +236,9 @@ pub struct Grant {
     /// renewal sets it to the renewal's time ([`LockTables::extend`]), so
     /// only an op it sent under a window running past that passes
     /// whatever the window. A move keeps it.
+    ///
+    /// Wall clock (it is compared with tokens' `until_ms`, which are
+    /// wall: Appendix B row 6).
     pub confirmed_ms: i64,
 }
 
@@ -240,6 +247,58 @@ impl Grant {
     pub const MINTED: i64 = i64::MIN;
     /// [`Grant::confirmed_ms`] of a copy no holder has renewed here yet.
     pub const UNCONFIRMED: i64 = i64::MAX;
+
+    /// This grant as it crosses a node: `until_ms` is the end on the
+    /// sender's *wall* clock, mapped from the wait-clock record now
+    /// (`Now::wall_of_wait`; Appendix B row 9, offset-bound). A receiver
+    /// never reads it: it records its own end ([`GrantWire::into_grant`]).
+    pub fn to_wire(&self, now: Now) -> GrantWire {
+        GrantWire {
+            id: self.id,
+            node: self.node,
+            ino: self.ino,
+            mode: self.mode,
+            until_ms: now.wall_of_wait(self.until).0,
+            recalled: self.recalled,
+            gen: self.gen,
+            confirmed_ms: self.confirmed_ms,
+        }
+    }
+}
+
+/// A [`Grant`] on the wire. The end is the sender's wall clock and is
+/// informational: another node's wait-clock reading would mean nothing
+/// here, so the receiver supplies its own end
+/// ([`GrantWire::into_grant`]), from its receipt or from a carried
+/// remainder (`Core::lock_install_moved`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantWire {
+    pub id: GrantId,
+    pub node: u64,
+    pub ino: u64,
+    pub mode: LockMode,
+    /// The end on the sender's wall clock when it sent (see [`Grant::to_wire`]).
+    pub until_ms: i64,
+    pub recalled: bool,
+    pub gen: u64,
+    pub confirmed_ms: i64,
+}
+
+impl GrantWire {
+    /// The grant as the receiver records it, ending at `until` on the
+    /// receiver's wait clock.
+    pub fn into_grant(self, until: WaitMs) -> Grant {
+        Grant {
+            id: self.id,
+            node: self.node,
+            ino: self.ino,
+            mode: self.mode,
+            until,
+            recalled: self.recalled,
+            gen: self.gen,
+            confirmed_ms: self.confirmed_ms,
+        }
+    }
 }
 
 /// What a delegate hands back to the root with its recall answer: the
@@ -248,7 +307,7 @@ impl Grant {
 /// `core::locks`'s `LockState::floors`).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockHandback {
-    pub grants: Vec<Grant>,
+    pub grants: Vec<GrantWire>,
     /// What was left, in ms on the delegate's clock when it built this, of
     /// the record of each grant of `grants`: the root records it from the
     /// receipt, plus the margin, never later than a restamp
@@ -494,7 +553,7 @@ struct Inner {
     /// margin` past the end of their record (`ended_keep_ms`) — a token
     /// naming one is rejected at once ([`LockTables::check_tag`]). Moves
     /// to and from a delegate are not ends.
-    ended: BTreeMap<GrantId, i64>,
+    ended: BTreeMap<GrantId, WaitMs>,
     /// Sequencer side: the expired records [`Inner::drop_expired`]
     /// dropped (outwaited: their holders never released them) since the
     /// sequencer last took them ([`LockTables::take_outwaited`]), at most
@@ -687,19 +746,19 @@ impl Inner {
     /// Expired grant records leave the table, remembered as ended (an
     /// outwait: the next holder may be granted from now on). Whether any
     /// was dropped.
-    fn drop_expired(&mut self, now_ms: i64) -> bool {
-        if !self.grants.values().any(|e| e.until_ms <= now_ms) {
+    fn drop_expired(&mut self, now: WaitMs) -> bool {
+        if !self.grants.values().any(|e| e.until <= now) {
             return false;
         }
         let expired: Vec<Grant> = self
             .grants
             .values()
-            .filter(|e| e.until_ms <= now_ms)
+            .filter(|e| e.until <= now)
             .copied()
             .collect();
         for e in expired {
             self.grants.remove(&e.id);
-            self.note_ended(e.id, e.until_ms);
+            self.note_ended(e.id, e.until);
             self.outwaited.push(e);
         }
         if self.outwaited.len() > ENDED_KEPT {
@@ -734,9 +793,9 @@ impl Inner {
     /// (resolvable later by its outcome), else an unresolvable doubt —
     /// unless the grant already has a doubt noted (the op's scope ending
     /// after the doubt was noted with its rid).
-    fn note_doubted(&mut self, grant: GrantId, now_ms: i64, rid: Option<crate::rid::Rid>) {
+    fn note_doubted(&mut self, grant: GrantId, since: WaitMs, rid: Option<crate::rid::Rid>) {
         let e = self.doubted.entry(grant).or_insert_with(|| Doubt {
-            since_ms: now_ms,
+            since,
             rids: std::collections::BTreeSet::new(),
             anon: false,
         });
@@ -751,7 +810,7 @@ impl Inner {
             let Some(oldest) = self
                 .doubted
                 .iter()
-                .min_by_key(|(_, d)| d.since_ms)
+                .min_by_key(|(_, d)| d.since)
                 .map(|(id, _)| *id)
             else {
                 break;
@@ -760,9 +819,9 @@ impl Inner {
         }
     }
 
-    /// `id` ended here with its record running to `until_ms`.
-    fn note_ended(&mut self, id: GrantId, until_ms: i64) {
-        let keep = until_ms.saturating_add(self.ended_keep_ms);
+    /// `id` ended here with its record running to `until` (wait clock).
+    fn note_ended(&mut self, id: GrantId, until: WaitMs) {
+        let keep = WaitMs(until.0.saturating_add(self.ended_keep_ms));
         self.ended.insert(id, keep);
         while self.ended.len() > ENDED_KEPT {
             self.ended.pop_first();
@@ -850,6 +909,7 @@ pub struct LockTables {
     /// Lock grants made by an earlier tenure (a restart inside the lease,
     /// a fast takeover) may be honoured until this time: no new grant
     /// before it (reclaims are accepted).
+    /// On this node's wait clock (plan 43 C7-H1).
     quarantine_ms: AtomicI64,
     /// How long after its install a recalled grant waiting for its first
     /// local lock is still renewed (0: [`FIRST_USE_BUDGET_MS`]).
@@ -871,7 +931,8 @@ pub struct LockTables {
 /// See `Inner::doubted`.
 #[derive(Clone, Debug)]
 struct Doubt {
-    since_ms: i64,
+    /// Eviction order only (the wait clock).
+    since: WaitMs,
     rids: std::collections::BTreeSet<crate::rid::Rid>,
     /// An op whose rid is unknown ended in doubt: never resolved.
     anon: bool,
@@ -944,14 +1005,14 @@ impl LockTables {
         }
     }
 
-    /// Lock grants an earlier tenure made may be live until `until_ms`:
-    /// grant nothing new before then (never lowered).
-    pub fn set_quarantine(&self, until_ms: i64) {
-        self.quarantine_ms.fetch_max(until_ms, Ordering::Relaxed);
+    /// Lock grants an earlier tenure made may be live until `until` (this
+    /// node's wait clock): grant nothing new before then (never lowered).
+    pub fn set_quarantine(&self, until: WaitMs) {
+        self.quarantine_ms.fetch_max(until.0, Ordering::Relaxed);
     }
 
-    pub fn quarantine_until(&self) -> i64 {
-        self.quarantine_ms.load(Ordering::Relaxed)
+    pub fn quarantine_until(&self) -> WaitMs {
+        WaitMs(self.quarantine_ms.load(Ordering::Relaxed))
     }
 
     pub fn stats(&self) -> LockStats {
@@ -972,22 +1033,22 @@ impl LockTables {
     }
 
     /// `node`'s live grant on `ino`, if any.
-    pub fn own_grant(&self, ino: u64, node: u64, now_ms: i64) -> Option<Grant> {
+    pub fn own_grant(&self, ino: u64, node: u64, now: WaitMs) -> Option<Grant> {
         self.lock()
             .grants
             .values()
-            .find(|e| e.ino == ino && e.node == node && e.until_ms > now_ms)
+            .find(|e| e.ino == ino && e.node == node && e.until > now)
             .copied()
     }
 
     /// Strengthen (never weaken) a grant in place, keeping its id and its
     /// recalled flag, and extend it.
-    pub fn upgrade(&self, id: GrantId, mode: LockMode, until_ms: i64) -> bool {
+    pub fn upgrade(&self, id: GrantId, mode: LockMode, until: WaitMs) -> bool {
         let mut g = self.lock();
         match g.grants.get_mut(&id) {
             Some(e) => {
                 e.mode = e.mode.max(mode);
-                e.until_ms = e.until_ms.max(until_ms);
+                e.until = e.until.max(until);
                 true
             }
             None => false,
@@ -1002,7 +1063,7 @@ impl LockTables {
         node: u64,
         ino: u64,
         mode: LockMode,
-        until_ms: i64,
+        until: WaitMs,
         gen: u64,
     ) -> GrantId {
         let id = GrantId {
@@ -1018,7 +1079,7 @@ impl LockTables {
                 node,
                 ino,
                 mode,
-                until_ms,
+                until,
                 recalled: false,
                 gen,
                 confirmed_ms: Grant::MINTED,
@@ -1049,7 +1110,7 @@ impl LockTables {
         let mut grant = grant;
         g.grants.retain(|_, e| {
             if e.node == grant.node && e.ino == grant.ino {
-                grant.until_ms = grant.until_ms.max(e.until_ms);
+                grant.until = grant.until.max(e.until);
                 false
             } else {
                 true
@@ -1070,16 +1131,16 @@ impl LockTables {
     /// the copy's node would then be re-affirmed without a recall (sim
     /// `locks-delegated` seed 196004). `false`: not installed.
     ///
-    /// A record that expired by `now_ms` is no grant: it is dropped
+    /// A record that expired by `now` is no grant: it is dropped
     /// first, as [`Self::conflicting`] drops it before granting over it.
     /// Kept, it refused the copy while the owner already granted past it
     /// (sim `locks-unlinked-delegated-dbackup-random` seed 5681: the
     /// root's stale record of the same holder on an unlinked inode kept
     /// the grant that came with the unlink out, and the root granted the
     /// inode to another node while the holder was inside its section).
-    pub fn install_if_consistent(&self, grant: Grant, now_ms: i64) -> bool {
+    pub fn install_if_consistent(&self, grant: Grant, now: WaitMs) -> bool {
         let mut g = self.lock();
-        if g.drop_expired(now_ms) {
+        if g.drop_expired(now) {
             self.expired_dropped.store(true, Ordering::Relaxed);
         }
         if g.grants
@@ -1094,9 +1155,9 @@ impl LockTables {
 
     /// Live grants on `ino` held by nodes other than `node` that conflict
     /// with `mode`. Expired grants are dropped on the way.
-    pub fn conflicting(&self, ino: u64, node: u64, mode: LockMode, now_ms: i64) -> Vec<Grant> {
+    pub fn conflicting(&self, ino: u64, node: u64, mode: LockMode, now: WaitMs) -> Vec<Grant> {
         let mut g = self.lock();
-        if g.drop_expired(now_ms) {
+        if g.drop_expired(now) {
             self.expired_dropped.store(true, Ordering::Relaxed);
         }
         g.grants
@@ -1113,9 +1174,9 @@ impl LockTables {
         ino: u64,
         node: u64,
         mode: LockMode,
-        now_ms: i64,
+        now: WaitMs,
     ) -> Option<Grant> {
-        self.conflicting(ino, node, mode, now_ms).into_iter().next()
+        self.conflicting(ino, node, mode, now).into_iter().next()
     }
 
     pub fn get(&self, id: GrantId) -> Option<Grant> {
@@ -1129,20 +1190,22 @@ impl LockTables {
         self.lock().ended.contains_key(&id)
     }
 
-    /// Extend a known grant of `node` at its renewal (`now_ms`):
-    /// `(mode, recalled)`, or `None` when unknown. The renewal confirms an
-    /// installed copy from `now_ms` on ([`Grant::confirmed_ms`]).
+    /// Extend a known grant of `node` at its renewal (`now`): `(mode,
+    /// recalled)`, or `None` when unknown. The record ends at `until`
+    /// (wait clock); the renewal confirms an installed copy from `now`'s
+    /// wall reading on ([`Grant::confirmed_ms`], wall like the tokens it
+    /// is compared with).
     pub fn extend(
         &self,
         id: GrantId,
         node: u64,
-        until_ms: i64,
-        now_ms: i64,
+        until: WaitMs,
+        now: Now,
     ) -> Option<(LockMode, bool)> {
         let mut g = self.lock();
         let e = g.grants.get_mut(&id).filter(|e| e.node == node)?;
-        e.until_ms = e.until_ms.max(until_ms);
-        e.confirmed_ms = e.confirmed_ms.min(now_ms);
+        e.until = e.until.max(until);
+        e.confirmed_ms = e.confirmed_ms.min(now.wall.0);
         Some((e.mode, e.recalled))
     }
 
@@ -1165,7 +1228,7 @@ impl LockTables {
         let mut g = self.lock();
         let gone = g.grants.remove(&id);
         if let Some(e) = gone {
-            g.note_ended(id, e.until_ms);
+            g.note_ended(id, e.until);
         }
         gone
     }
@@ -1298,15 +1361,15 @@ impl LockTables {
             return false;
         }
         let g = self.lock();
-        // Token windows and the table's records are on the wall clock here
-        // (the sequencer's side moves to the wait clock with the next
-        // commit of plan 43 C7-H1).
-        let now_ms = g.now_or(Now::same(i64::MIN)).wall.0;
+        // One call, two readings (plan 43 C7-H1): the table's records are
+        // on this node's wait clock, a token's window (the pins' `until`)
+        // is the minter's wall window.
+        let now = g.now_or(Now::same(i64::MIN));
         g.pins
             .iter()
             .any(|(id, (_, until))| match g.grants.get(id) {
-                Some(e) => e.until_ms <= now_ms,
-                None => g.ended.contains_key(id) || now_ms >= *until,
+                Some(e) => e.until <= now.wait,
+                None => g.ended.contains_key(id) || now.wall.0 >= *until,
             })
     }
 
@@ -1356,9 +1419,9 @@ impl LockTables {
     /// released while the doubt is unresolved; its owner outwaits it,
     /// which orders the next grant after whatever lands
     /// ([`Self::doubt_of`]).
-    pub fn note_doubted(&self, grant: GrantId, now_ms: i64, rid: Option<crate::rid::Rid>) {
+    pub fn note_doubted(&self, grant: GrantId, now: WaitMs, rid: Option<crate::rid::Rid>) {
         let mut g = self.lock();
-        g.note_doubted(grant, now_ms, rid);
+        g.note_doubted(grant, now, rid);
     }
 
     /// The doubt noted on `grant`, if any: whether one of its ops is
@@ -1405,14 +1468,15 @@ impl LockTables {
     /// The token check itself (see [`Self::check_tag`]), under the
     /// table lock.
     fn judge(&self, g: &mut Inner, tag: &LockTag, now: Now) -> Result<(), LockToken> {
-        // A token is judged on this node's wall clock against the minter's
-        // wall window (Appendix B row 6), and the table's records are wall
-        // too until the sequencer's side moves (C7-H1, next commit).
+        // One call, two readings (plan 43 C7-H1): a token is judged on this
+        // node's wall clock against the minter's wall window (Appendix B
+        // row 6), the table's records (and the memory of ended grants) on
+        // its wait clock.
         let now_ms = now.wall.0;
         if g.ended.len() > 256 {
-            g.ended.retain(|_, keep| *keep > now_ms);
+            g.ended.retain(|_, keep| *keep > now.wait);
         }
-        if g.drop_expired(now_ms) {
+        if g.drop_expired(now.wait) {
             self.expired_dropped.store(true, Ordering::Relaxed);
         }
         let dead = tag
@@ -1458,12 +1522,12 @@ impl LockTables {
         }
     }
 
-    /// Grants whose `until_ms` has passed (still in the table).
-    pub fn expired(&self, now_ms: i64) -> Vec<Grant> {
+    /// Grants whose `until` has passed (still in the table).
+    pub fn expired(&self, now: WaitMs) -> Vec<Grant> {
         self.lock()
             .grants
             .values()
-            .filter(|e| e.until_ms <= now_ms)
+            .filter(|e| e.until <= now)
             .copied()
             .collect()
     }
@@ -1530,13 +1594,13 @@ impl LockTables {
         self.lock().grants.len()
     }
 
-    /// Grants still live at `now_ms` (`grants_len` counts the expired
-    /// ones too, until a `conflicting` call purges them).
-    pub fn live_grants_len(&self, now_ms: i64) -> usize {
+    /// Grants still live at `now` (`grants_len` counts the expired ones
+    /// too, until a `conflicting` call purges them).
+    pub fn live_grants_len(&self, now: WaitMs) -> usize {
         self.lock()
             .grants
             .values()
-            .filter(|g| g.until_ms > now_ms)
+            .filter(|g| g.until > now)
             .count()
     }
 
@@ -2133,7 +2197,7 @@ impl LockTables {
         let mut g = self.lock();
         for t in &tag.0 {
             if in_doubt {
-                g.note_doubted(t.grant, now.wall.0, None);
+                g.note_doubted(t.grant, now.wait, None);
             }
             if !g.inflight.contains_key(&t.grant) {
                 continue;
@@ -2181,7 +2245,7 @@ impl LockTables {
         let now = g.now_or(Now::same(0));
         for t in &tag.0 {
             g.pin(t.grant, t.until_ms, now);
-            g.note_doubted(t.grant, now.wall.0, rid);
+            g.note_doubted(t.grant, now.wait, rid);
         }
     }
 
@@ -2976,20 +3040,20 @@ mod tests {
             node,
             ino: 7,
             mode,
-            until_ms: 100,
+            until: WaitMs(100),
             recalled: false,
             gen: 0,
             confirmed_ms: Grant::UNCONFIRMED,
         };
         // Node 2 was granted again (a newer id): the old copy stays out.
         t.install(copy(2, 5, LockMode::Shared));
-        assert!(!t.install_if_consistent(copy(2, 1, LockMode::Exclusive), 0));
+        assert!(!t.install_if_consistent(copy(2, 1, LockMode::Exclusive), WaitMs(0)));
         // Node 3's exclusive copy conflicts with node 2's grant (made
         // after the copy's grant left): out.
-        assert!(!t.install_if_consistent(copy(3, 2, LockMode::Exclusive), 0));
+        assert!(!t.install_if_consistent(copy(3, 2, LockMode::Exclusive), WaitMs(0)));
         // A compatible copy goes in, once.
-        assert!(t.install_if_consistent(copy(3, 3, LockMode::Shared), 0));
-        assert!(!t.install_if_consistent(copy(3, 3, LockMode::Shared), 0));
+        assert!(t.install_if_consistent(copy(3, 3, LockMode::Shared), WaitMs(0)));
+        assert!(!t.install_if_consistent(copy(3, 3, LockMode::Shared), WaitMs(0)));
         assert_eq!(t.grants_len(), 2);
     }
 
@@ -2998,12 +3062,12 @@ mod tests {
     /// in a grace before the move arrived extended its holder's window.
     #[test]
     fn install_keeping_later_never_shortens_the_replaced_record() {
-        let at = |seq: u64, until_ms: i64| Grant {
+        let at = |seq: u64, until: i64| Grant {
             id: GrantId { node: 9, seq },
             node: 2,
             ino: 7,
             mode: LockMode::Exclusive,
-            until_ms,
+            until: WaitMs(until),
             recalled: false,
             gen: 0,
             confirmed_ms: Grant::UNCONFIRMED,
@@ -3014,11 +3078,17 @@ mod tests {
         t.install_keeping_later(at(2, 300));
         assert_eq!(t.grants_len(), 1);
         assert_eq!(t.get(GrantId { node: 9, seq: 1 }), None);
-        assert_eq!(t.get(GrantId { node: 9, seq: 2 }).unwrap().until_ms, 900);
+        assert_eq!(
+            t.get(GrantId { node: 9, seq: 2 }).unwrap().until,
+            WaitMs(900)
+        );
         // An earlier one: replaced by the new one.
         t.install_keeping_later(at(3, 1500));
         assert_eq!(t.grants_len(), 1);
-        assert_eq!(t.get(GrantId { node: 9, seq: 3 }).unwrap().until_ms, 1500);
+        assert_eq!(
+            t.get(GrantId { node: 9, seq: 3 }).unwrap().until,
+            WaitMs(1500)
+        );
         // Another node's record on the inode is left alone.
         let other = Grant {
             node: 3,
@@ -3027,8 +3097,14 @@ mod tests {
         t.install(other);
         t.install_keeping_later(at(5, 100));
         assert_eq!(t.grants_len(), 2);
-        assert_eq!(t.get(GrantId { node: 9, seq: 5 }).unwrap().until_ms, 1500);
-        assert_eq!(t.get(GrantId { node: 9, seq: 4 }).unwrap().until_ms, 5000);
+        assert_eq!(
+            t.get(GrantId { node: 9, seq: 5 }).unwrap().until,
+            WaitMs(1500)
+        );
+        assert_eq!(
+            t.get(GrantId { node: 9, seq: 4 }).unwrap().until,
+            WaitMs(5000)
+        );
     }
 
     /// An expired record is no grant: a copy of the same node, or a
@@ -3038,12 +3114,12 @@ mod tests {
     #[test]
     fn an_expired_record_does_not_keep_a_copy_out() {
         let t = LockTables::default();
-        let copy = |node: u64, seq: u64, mode: LockMode, until_ms: i64| Grant {
+        let copy = |node: u64, seq: u64, mode: LockMode, until: i64| Grant {
             id: GrantId { node: 9, seq },
             node,
             ino: 7,
             mode,
-            until_ms,
+            until: WaitMs(until),
             recalled: false,
             gen: 0,
             confirmed_ms: Grant::UNCONFIRMED,
@@ -3051,17 +3127,17 @@ mod tests {
         t.install(copy(2, 1, LockMode::Exclusive, 100));
         t.install(copy(3, 2, LockMode::Shared, 100));
         // Still live at 50: both keep the copy out.
-        assert!(!t.install_if_consistent(copy(2, 3, LockMode::Exclusive, 500), 50));
+        assert!(!t.install_if_consistent(copy(2, 3, LockMode::Exclusive, 500), WaitMs(50)));
         assert_eq!(t.grants_len(), 2);
         // Expired at 100: the copy is the inode's only grant, and the
         // dropped records are remembered as ended.
-        assert!(t.install_if_consistent(copy(2, 3, LockMode::Exclusive, 500), 100));
+        assert!(t.install_if_consistent(copy(2, 3, LockMode::Exclusive, 500), WaitMs(100)));
         assert_eq!(t.grants_len(), 1);
         assert!(t.was_ended(GrantId { node: 9, seq: 1 }));
         assert!(t.was_ended(GrantId { node: 9, seq: 2 }));
         assert!(t.take_expired_dropped(), "the backup's mirror is stale");
         assert_eq!(
-            t.conflicting(7, 4, LockMode::Shared, 200)
+            t.conflicting(7, 4, LockMode::Shared, WaitMs(200))
                 .iter()
                 .map(|g| g.id.seq)
                 .collect::<Vec<_>>(),
@@ -3075,9 +3151,9 @@ mod tests {
     #[test]
     fn expired_records_dropped_anywhere_are_reported_as_outwaited_once() {
         let t = LockTables::default();
-        let a = t.grant(1, 2, 7, LockMode::Exclusive, 100, 0);
-        let b = t.grant(1, 3, 8, LockMode::Exclusive, 300, 0);
-        let c = t.grant(1, 4, 9, LockMode::Exclusive, 100, 0);
+        let a = t.grant(1, 2, 7, LockMode::Exclusive, WaitMs(100), 0);
+        let b = t.grant(1, 3, 8, LockMode::Exclusive, WaitMs(300), 0);
+        let c = t.grant(1, 4, 9, LockMode::Exclusive, WaitMs(100), 0);
         t.forget(c);
         assert!(t.take_outwaited().is_empty(), "nothing dropped yet");
         assert!(t
@@ -3091,9 +3167,11 @@ mod tests {
             .is_ok());
         let first = t.take_outwaited();
         assert_eq!(first.iter().map(|g| g.id).collect::<Vec<_>>(), vec![a]);
-        assert_eq!(first[0].until_ms, 100);
+        assert_eq!(first[0].until, WaitMs(100));
         assert!(t.take_outwaited().is_empty(), "reported once");
-        assert!(t.conflicting(8, 5, LockMode::Exclusive, 300).is_empty());
+        assert!(t
+            .conflicting(8, 5, LockMode::Exclusive, WaitMs(300))
+            .is_empty());
         assert_eq!(
             t.take_outwaited().iter().map(|g| g.id).collect::<Vec<_>>(),
             vec![b]
@@ -3745,23 +3823,25 @@ mod tests {
     #[test]
     fn sequencer_table_conflicts_and_expiry() {
         let t = LockTables::default();
-        let a = t.grant(9, 1, 7, LockMode::Shared, 100, 0);
-        let b = t.grant(9, 2, 7, LockMode::Shared, 100, 0);
-        assert!(t.conflicting(7, 3, LockMode::Shared, 0).is_empty());
-        assert_eq!(t.conflicting(7, 3, LockMode::Exclusive, 0).len(), 2);
+        let a = t.grant(9, 1, 7, LockMode::Shared, WaitMs(100), 0);
+        let b = t.grant(9, 2, 7, LockMode::Shared, WaitMs(100), 0);
+        assert!(t.conflicting(7, 3, LockMode::Shared, WaitMs(0)).is_empty());
+        assert_eq!(t.conflicting(7, 3, LockMode::Exclusive, WaitMs(0)).len(), 2);
         // Node 1 upgrading: only node 2 is in the way.
         assert_eq!(
-            t.conflicting(7, 1, LockMode::Exclusive, 0),
+            t.conflicting(7, 1, LockMode::Exclusive, WaitMs(0)),
             vec![t.get(b).unwrap()]
         );
         assert!(t.mark_recalled(b));
         assert!(!t.mark_recalled(b));
-        assert_eq!(t.expired(100).len(), 2);
-        assert!(t.conflicting(7, 3, LockMode::Exclusive, 100).is_empty());
+        assert_eq!(t.expired(WaitMs(100)).len(), 2);
+        assert!(t
+            .conflicting(7, 3, LockMode::Exclusive, WaitMs(100))
+            .is_empty());
         assert!(t.get(a).is_none());
         // A regrant to the same node replaces its entry.
-        let c = t.grant(9, 1, 7, LockMode::Exclusive, 300, 0);
-        let d = t.grant(9, 1, 7, LockMode::Exclusive, 300, 0);
+        let c = t.grant(9, 1, 7, LockMode::Exclusive, WaitMs(300), 0);
+        let d = t.grant(9, 1, 7, LockMode::Exclusive, WaitMs(300), 0);
         assert!(t.get(c).is_none());
         assert!(t.get(d).is_some());
         assert_eq!(t.grants_len(), 1);
@@ -3985,7 +4065,7 @@ mod token_tests {
     fn a_token_dies_with_its_grant_or_its_window_where_the_grant_is_unknown() {
         let t = LockTables::default();
         t.set_token_memory_ms(3_000);
-        let id = t.grant(1, 2, 7, LockMode::Exclusive, 1_000, 0);
+        let id = t.grant(1, 2, 7, LockMode::Exclusive, WaitMs(1_000), 0);
         let tag = LockTag(vec![LockToken {
             grant: id,
             until_ms: 500,
@@ -4012,14 +4092,16 @@ mod token_tests {
         // Outwaited: the record expired (a conflicting request found it
         // so); a token whose window still runs is refused all the same,
         // through 257 other ends (the prune) and for the memory's span.
-        let out = t.grant(1, 3, 8, LockMode::Exclusive, 2_000, 0);
+        let out = t.grant(1, 3, 8, LockMode::Exclusive, WaitMs(2_000), 0);
         let late = LockTag(vec![LockToken {
             grant: out,
             until_ms: 9_000,
         }]);
-        assert!(t.conflicting(8, 4, LockMode::Exclusive, 2_000).is_empty());
+        assert!(t
+            .conflicting(8, 4, LockMode::Exclusive, WaitMs(2_000))
+            .is_empty());
         for k in 0..300 {
-            let g = t.grant(1, 10 + k, 100 + k, LockMode::Shared, 2_100, 0);
+            let g = t.grant(1, 10 + k, 100 + k, LockMode::Shared, WaitMs(2_100), 0);
             t.forget(g);
         }
         assert!(
@@ -4048,12 +4130,12 @@ mod token_tests {
             node: 2,
             ino: 7,
             mode: LockMode::Exclusive,
-            until_ms: 10_000,
+            until: WaitMs(10_000),
             recalled: false,
             gen: 0,
             confirmed_ms: Grant::UNCONFIRMED,
         };
-        assert!(t.install_if_consistent(copy, 0));
+        assert!(t.install_if_consistent(copy, WaitMs(0)));
         let old = LockTag(vec![LockToken {
             grant: id,
             until_ms: 500,
@@ -4064,7 +4146,7 @@ mod token_tests {
             "unconfirmed: the window"
         );
         assert_eq!(
-            t.extend(id, 2, 12_000, 1_000),
+            t.extend(id, 2, WaitMs(12_000), Now::same(1_000)),
             Some((LockMode::Exclusive, false))
         );
         assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
@@ -4082,10 +4164,10 @@ mod token_tests {
             "confirmed: exact"
         );
         // A later renewal never moves the confirmation forward.
-        t.extend(id, 2, 13_000, 2_000);
+        t.extend(id, 2, WaitMs(13_000), Now::same(2_000));
         assert_eq!(t.get(id).unwrap().confirmed_ms, 1_000);
         // A grant made here is confirmed from the start.
-        let made = t.grant(1, 3, 8, LockMode::Exclusive, 10_000, 0);
+        let made = t.grant(1, 3, 8, LockMode::Exclusive, WaitMs(10_000), 0);
         assert_eq!(t.get(made).unwrap().confirmed_ms, Grant::MINTED);
     }
 

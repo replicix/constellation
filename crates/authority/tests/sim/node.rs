@@ -89,10 +89,10 @@ pub struct CoreView {
     /// (epoch, expiry) it believes it holds and has not lost.
     pub claim: EpochClaimView,
     pub epoch_held: bool,
-    /// `(epoch, the lease's end on the node's honour clock)` of an S3 lease
-    /// this node holds (the end is 0 when its body is not this
-    /// incarnation's: unusable).
-    pub s3_held: Option<(u64, i64)>,
+    /// `(epoch, the lease's end on the node's honour clock, the same end on
+    /// its wait clock)` of an S3 lease this node holds (the ends are 0 when
+    /// its body is not this incarnation's: unusable).
+    pub s3_held: Option<(u64, i64, i64)>,
     /// Plan 30 §M11.
     pub delegation: constellation_authority::core::DelegView,
     /// Plan 30 §M14: lock requests in flight (node side), waiters parked
@@ -151,7 +151,7 @@ pub struct Shared {
     lag_since: Mutex<Option<tokio::time::Instant>>,
     /// What the off-core heartbeat beats to (the daemon's
     /// `AliveTargets`): the epoch and expiry of the lease this node
-    /// holds, `Core::beat_guard_unix_ms` and `Core::liveness_targets`,
+    /// holds, `Core::beat_guard_wait_ms` and `Core::liveness_targets`,
     /// after every event.
     liveness: Mutex<Option<Liveness>>,
     pub conflict_copies: AtomicU64,
@@ -719,25 +719,10 @@ struct Driver {
     beats_lost_in_lag: bool,
 }
 
-/// What the off-core heartbeat beats to: `(epoch, expiry, guard, targets)`.
-/// `(epoch, wall expiry, honour end, guard (wall), targets)`: what the beat
-/// thread reads (the daemon's `AliveTargets`, plan 43 C7-H1).
-type Liveness = (u64, i64, i64, i64, Vec<NodeId>);
-
-/// The daemon's `guard_on_honour`: a wall-clock guard mapped onto the honour
-/// clock at `now` (0 none, `i64::MAX` unknown).
-fn guard_on_honour(g_wall: i64, now: constellation_authority::Now) -> i64 {
-    if g_wall == i64::MAX {
-        return i64::MAX;
-    }
-    if g_wall <= 0 {
-        return 0;
-    }
-    now.honour
-        .0
-        .saturating_add(g_wall.saturating_sub(now.wall.0))
-        .max(1)
-}
+/// What the off-core heartbeat beats to: `(epoch, wall expiry, honour end,
+/// wait end, guard (wait), targets)`: what the beat thread reads (the
+/// daemon's `AliveTargets`, plan 43 C7-H1).
+type Liveness = (u64, i64, i64, i64, i64, Vec<NodeId>);
 
 /// F1 in the simulation (`WriterLockHold`): a fast-path write that passed
 /// its fencing-token check and waits for the store's writer lock behind a
@@ -871,14 +856,14 @@ async fn beat_loop(
                 }
             }
         }
-        let Some((epoch, until_wall, until_honour, guard, targets)) =
+        let Some((epoch, until_wall, until_honour, until_wait, guard, targets)) =
             shared.liveness.lock().unwrap().clone()
         else {
             continue;
         };
-        // One reading per beat (plan 43 C7-H1): the send stamp, the lease's
-        // end and the guard mapped onto it are all of this node's honour
-        // clock, with its id; the beats stop at the honour end.
+        // One reading per beat (plan 43 C7-H1, R7): the send stamp, the
+        // lease's end and the guard are all of this node's wait clock, with
+        // its id; the beats stop at the honour end.
         let now = clock.now();
         if now.honour.0 >= until_honour {
             continue;
@@ -891,11 +876,11 @@ async fn beat_loop(
                 seq,
                 super::bus::BeatStamps {
                     clock: clock.id(),
-                    sent: now.honour.0,
-                    holder_expires: until_honour,
-                    guard: guard_on_honour(guard, now),
+                    sent: constellation_authority::beat_sent_ms(now),
+                    holder_expires: until_wait,
+                    guard,
                     expires: until_wall,
-                    echo: now.wall.0,
+                    echo: now.wait.0,
                 },
             );
         }
@@ -946,7 +931,7 @@ async fn deleg_lane_loop(
             let late = woke.saturating_duration_since(due).as_millis() as i64;
             if late >= FREEZE_MIN_MS {
                 shared.beat_freeze.store(
-                    constellation_authority::deleg_lane::pack_freeze(now.wall.0 - late, late),
+                    constellation_authority::deleg_lane::pack_freeze(now.wait.0 - late, late),
                     Ordering::SeqCst,
                 );
             }
@@ -954,9 +939,9 @@ async fn deleg_lane_loop(
         due_at = Some(woke + std::time::Duration::from_millis(every_ms));
         shared
             .beat_due
-            .store(now.wall.0 + every_ms as i64, Ordering::SeqCst);
+            .store(now.wait.0 + every_ms as i64, Ordering::SeqCst);
         let busy = shared.busy_since.load(Ordering::SeqCst);
-        let stuck_ms = if busy != 0 { now.wall.0 - busy } else { 0 };
+        let stuck_ms = if busy != 0 { now.wait.0 - busy } else { 0 };
         let mut certs = shared.deleg_certs.lock().unwrap().clone();
         for c in certs.iter_mut() {
             if let Some((from, ttl)) = shared.granted_ttl.lock().unwrap().get(&(c.gen, c.round)) {
@@ -1043,7 +1028,7 @@ impl Driver {
             tokio::spawn(async move {
                 // Plan 30 §M9: since when each link has been up without a
                 // break (the directory's `since`).
-                let mut up_since: HashMap<NodeId, constellation_authority::Ms> = HashMap::new();
+                let mut up_since: HashMap<NodeId, constellation_authority::WaitMs> = HashMap::new();
                 loop {
                     let nodes = bus.nodes();
                     if tx
@@ -1062,7 +1047,7 @@ impl Driver {
                         .map(|n| {
                             let connected = bus.linked(id, n);
                             let since = if connected {
-                                Some(*up_since.entry(n).or_insert(now.wall))
+                                Some(*up_since.entry(n).or_insert(now.wait))
                             } else {
                                 up_since.remove(&n);
                                 None
@@ -1106,7 +1091,7 @@ impl Driver {
             for (from, until) in constellation_authority::deleg_lane::freezes(
                 self.shared.beat_freeze.load(Ordering::SeqCst),
                 self.shared.beat_due.load(Ordering::SeqCst),
-                now.wall.0,
+                now.wait.0,
             ) {
                 let (hf, hu) = self.freeze_handed;
                 if from != hf || until > hu + 200 {
@@ -1116,8 +1101,8 @@ impl Driver {
                     let actions = self.core.handle(
                         now,
                         Event::OwnFreeze {
-                            from: constellation_authority::Ms(from),
-                            until: constellation_authority::Ms(until),
+                            from: constellation_authority::WaitMs(from),
+                            until: constellation_authority::WaitMs(until),
                         },
                         &*self.meta,
                     );
@@ -1136,7 +1121,7 @@ impl Driver {
                 );
                 // The step is stuck: the delegation renewal lane sees it
                 // (`deleg_lane_loop`) from here.
-                self.shared.busy_since.store(now.wall.0, Ordering::SeqCst);
+                self.shared.busy_since.store(now.wait.0, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 self.shared.busy_since.store(0, Ordering::SeqCst);
             }
@@ -1152,13 +1137,13 @@ impl Driver {
             } = &mut event
             {
                 if at.0 == 0 {
-                    *at = now.wall;
+                    *at = now.wait;
                 }
                 // The credited negative control: the arrival replaced by the
                 // credit the daemon no longer counts (it compares the
                 // holder's clock reading with this node's).
                 if let (Some(margin), true) = (self.credit_margin, *seq != 0 && *sent != 0) {
-                    *at = (*at).min(constellation_authority::Ms(*sent + margin));
+                    *at = (*at).min(constellation_authority::WaitMs(*sent + margin));
                 }
                 // Answered as the daemon's P2P handler answers it, when
                 // this node gets to it: the holder hears the backup is
@@ -1460,8 +1445,8 @@ impl Driver {
             tokio::time::Instant::now().duration_since(t).as_millis() as i64
         });
         self.ready.push_back(Event::OwnLag {
-            from: constellation_authority::Ms(now.wall.0 - lapsed),
-            until: now.wall,
+            from: constellation_authority::WaitMs(now.wait.0 - lapsed),
+            until: now.wait,
         });
         if self.stamps_first {
             // The daemon's P2P handlers stamp the holder's beats and
@@ -1508,7 +1493,7 @@ impl Driver {
                     epoch,
                     candidacy: 0,
                     listed: true,
-                    at: now.wall,
+                    at: now.wait,
                     seq: 0,
                     clock: 0,
                     sent: 0,
@@ -1552,13 +1537,13 @@ impl Driver {
         view.lock_waiters = locks.waiters;
         view.lock_recalls = locks.recalls_in_flight;
         let now = self.clock.now();
-        let floor = self.core.takeover_floor_until_ms();
+        let floor = self.core.takeover_floor_until().0;
         if floor != 0 && floor != self.shared.floor_seen.swap(floor, Ordering::SeqCst) {
             self.shared
                 .floor_ms
                 .lock()
                 .unwrap()
-                .push((floor - now.wall.0).max(0) as u64);
+                .push((floor - now.wait.0).max(0) as u64);
         } else if floor == 0 {
             self.shared.floor_seen.store(0, Ordering::SeqCst);
         }
@@ -1571,6 +1556,7 @@ impl Driver {
                 Some((
                     l.epoch,
                     lease.honour_until(self.core.config()).map_or(0, |h| h.0),
+                    lease.wait_until(self.core.config()).map_or(0, |w| w.0),
                 ))
             }
             _ => None,
@@ -1580,7 +1566,7 @@ impl Driver {
             None => 0,
         };
         let certs = self.core.deleg_renew_certs();
-        let liveness = view.s3_held.map(|(epoch, until_honour)| {
+        let liveness = view.s3_held.map(|(epoch, until_honour, until_wait)| {
             let targets = self.core.liveness_targets().into_iter().map(|(n, _)| n);
             let (base, protecting) = self.core.beat_guard_parts(&*self.meta);
             let guard = base.max(protecting);
@@ -1600,7 +1586,14 @@ impl Driver {
                 }
                 seen.2 = base;
             }
-            (epoch, wall_expiry, until_honour, guard, targets.collect())
+            (
+                epoch,
+                wall_expiry,
+                until_honour,
+                until_wait,
+                guard,
+                targets.collect(),
+            )
         });
         drop(view);
         *self.shared.liveness.lock().unwrap() = liveness;

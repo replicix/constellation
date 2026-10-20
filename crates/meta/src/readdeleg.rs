@@ -35,16 +35,17 @@
 //! C7-H1, `constellation_types::clock`): the delegate's [`HeldDelegation`]
 //! is stamped and judged on its **honour** clock (the core's `now.honour`,
 //! `protocol().now()` on FUSE threads: a backward wall step cannot extend
-//! it, a forward one ends it with the clock); the holder's grant table is
-//! still on the wall clock (the wait side, the next commit of C7-H1). The
-//! holder records a grant as live until `granted_at + ttl + margin`; the
+//! it, a forward one ends it with the clock); the holder's grant table
+//! ([`ReadGrant`], the quarantines) is on its **wait** clock (a forward
+//! wall step cannot end the wait for a grant early; a persisted horizon
+//! is wall-clock and converted at load). The holder records a grant as live until `granted_at + ttl + margin`; the
 //! delegate honours it only until `sent_at + ttl − margin`, measured from
 //! when it *sent* the request — both margins the lease's
 //! (`crates/model/src/cto.rs` has the argument and the model that checks
 //! it).
 
 use crate::session::Position;
-use constellation_types::clock::HonourMs;
+use constellation_types::clock::{HonourMs, Ms, Now, WaitMs};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -120,8 +121,9 @@ pub struct ReadGrant {
     pub id: u64,
     pub node: u64,
     pub ino: u64,
-    /// Live until this node's clock reaches it (`granted + ttl + margin`).
-    pub until_ms: i64,
+    /// Live until this node's **wait** clock reaches it (`granted + ttl +
+    /// margin`).
+    pub until: WaitMs,
 }
 
 /// What a mutation's acknowledgement must wait for.
@@ -131,7 +133,7 @@ pub struct RecallNeed {
     pub grants: Vec<ReadGrant>,
     /// Grants this node may have made before it restarted are unknown;
     /// every acknowledgement waits until this passes.
-    pub quarantine_until: Option<i64>,
+    pub quarantine_until: Option<WaitMs>,
 }
 
 impl RecallNeed {
@@ -190,9 +192,9 @@ pub struct CtoStats {
 struct Inner {
     grants: BTreeMap<u64, ReadGrant>,
     next_grant: u64,
-    quarantine_until: i64,
+    quarantine_until: WaitMs,
     /// See [`ReadDelegations::leave_alone`].
-    kernel_drain_until: i64,
+    kernel_drain_until: WaitMs,
     held: HashMap<u64, HeldDelegation>,
     /// Bumped by every recall received: a reply whose grant a recall
     /// overtook is not installed (see [`ReadDelegations::install`]).
@@ -232,9 +234,10 @@ fn bucket(ms: u64) -> usize {
 impl ReadDelegations {
     // ---- holder side ----
 
-    /// Record a grant to `node` on `ino`, live until `until_ms`. Must be
-    /// called **before** the position the answer carries is read.
-    pub fn grant(&self, node: u64, ino: u64, until_ms: i64) -> u64 {
+    /// Record a grant to `node` on `ino`, live until `until` (this node's
+    /// wait clock). Must be called **before** the position the answer
+    /// carries is read.
+    pub fn grant(&self, node: u64, ino: u64, until: WaitMs) -> u64 {
         let mut g = self.inner.lock().unwrap();
         g.next_grant += 1;
         let id = g.next_grant;
@@ -244,7 +247,7 @@ impl ReadDelegations {
                 id,
                 node,
                 ino,
-                until_ms,
+                until,
             },
         );
         self.live_grants
@@ -255,17 +258,17 @@ impl ReadDelegations {
     }
 
     /// What acknowledging a mutation that touched `inos` must wait for,
-    /// at `now_ms`: every live grant on one of them held by a node other
+    /// at `now` (wait clock): every live grant on one of them held by a node other
     /// than `except` (the writer's own delegation is not recalled — its
     /// reads are read-your-writes), and the restart quarantine. Expired
     /// grants are pruned on the way.
-    pub fn touching(&self, inos: &[u64], except: Option<u64>, now_ms: i64) -> RecallNeed {
+    pub fn touching(&self, inos: &[u64], except: Option<u64>, now: WaitMs) -> RecallNeed {
         let mut g = self.inner.lock().unwrap();
-        g.grants.retain(|_, x| x.until_ms > now_ms);
+        g.grants.retain(|_, x| x.until > now);
         self.live_grants
             .store(g.grants.len() as u64, Ordering::Relaxed);
         let q = g.quarantine_until.max(g.kernel_drain_until);
-        let quarantine_until = (q > now_ms).then_some(q);
+        let quarantine_until = (q > now).then_some(q);
         if g.grants.is_empty() {
             return RecallNeed {
                 grants: Vec::new(),
@@ -285,9 +288,9 @@ impl ReadDelegations {
     }
 
     /// Every live grant (a release recalls them all first).
-    pub fn all_live(&self, now_ms: i64) -> RecallNeed {
+    pub fn all_live(&self, now: WaitMs) -> RecallNeed {
         let mut g = self.inner.lock().unwrap();
-        g.grants.retain(|_, x| x.until_ms > now_ms);
+        g.grants.retain(|_, x| x.until > now);
         self.live_grants
             .store(g.grants.len() as u64, Ordering::Relaxed);
         // A release waits for the kernel drain (a lone sequencer's cached
@@ -296,7 +299,7 @@ impl ReadDelegations {
         // it extends nothing.
         RecallNeed {
             grants: g.grants.values().copied().collect(),
-            quarantine_until: (g.kernel_drain_until > now_ms).then_some(g.kernel_drain_until),
+            quarantine_until: (g.kernel_drain_until > now).then_some(g.kernel_drain_until),
         }
     }
 
@@ -308,23 +311,24 @@ impl ReadDelegations {
             .store(g.grants.len() as u64, Ordering::Relaxed);
     }
 
-    pub fn is_live(&self, id: u64, now_ms: i64) -> bool {
+    pub fn is_live(&self, id: u64, now: WaitMs) -> bool {
         self.inner
             .lock()
             .unwrap()
             .grants
             .get(&id)
-            .is_some_and(|x| x.until_ms > now_ms)
+            .is_some_and(|x| x.until > now)
     }
 
-    /// Grants from before a restart may be live until `until_ms`.
-    pub fn set_quarantine(&self, until_ms: i64) {
+    /// Grants from before a restart may be live until `until` (this node's
+    /// wait clock).
+    pub fn set_quarantine(&self, until: WaitMs) {
         let mut g = self.inner.lock().unwrap();
-        g.quarantine_until = g.quarantine_until.max(until_ms);
+        g.quarantine_until = g.quarantine_until.max(until);
     }
 
     /// The later of the restart quarantine and the kernel drain.
-    pub fn quarantine_until(&self) -> i64 {
+    pub fn quarantine_until(&self) -> WaitMs {
         let g = self.inner.lock().unwrap();
         g.quarantine_until.max(g.kernel_drain_until)
     }
@@ -344,11 +348,11 @@ impl ReadDelegations {
     /// kernel cached before may live `drain_ms` longer, so every
     /// acknowledgement of a mutation (and a release) waits until then —
     /// once per mount. Returns the drain deadline when this call flipped.
-    pub fn leave_alone(&self, now_ms: i64, drain_ms: u64) -> Option<i64> {
+    pub fn leave_alone(&self, now: WaitMs, drain_ms: u64) -> Option<WaitMs> {
         if !self.alone.swap(false, Ordering::SeqCst) {
             return None;
         }
-        let until = now_ms + drain_ms as i64;
+        let until = now.plus(drain_ms);
         let mut g = self.inner.lock().unwrap();
         g.kernel_drain_until = g.kernel_drain_until.max(until);
         Some(until)
@@ -567,14 +571,19 @@ impl crate::store::Meta {
     }
 
     /// At start: grants the previous incarnation made may still be live
-    /// until the persisted horizon; quarantine until then.
-    pub fn load_grant_quarantine(&self, now_ms: i64) -> Option<i64> {
+    /// until the persisted horizon (wall clock: it crossed a restart);
+    /// quarantine until then, measured from now on this node's wait clock
+    /// (`Now::wait_of_wall`: plan 43 C7-H1, R9). A step while the process
+    /// was down still shifts it (Appendix B row 14, C7a's boot-id form).
+    pub fn load_grant_quarantine(&self, now: Now) -> Option<WaitMs> {
         let until = self
             .kv_get(KV_READ_GRANT_HORIZON)
             .ok()
             .flatten()
-            .and_then(|v| v.parse::<i64>().ok())?;
-        (until > now_ms).then(|| {
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(Ms)?;
+        (until > now.wall).then(|| {
+            let until = now.wait_of_wall(until);
             self.read_delegations.set_quarantine(until);
             until
         })
@@ -583,13 +592,15 @@ impl crate::store::Meta {
     /// At start: lock grants the previous incarnation made may still be
     /// honoured until the persisted lock horizon; no new lock grant until
     /// then.
-    pub fn load_lock_quarantine(&self, now_ms: i64) -> Option<i64> {
+    pub fn load_lock_quarantine(&self, now: Now) -> Option<WaitMs> {
         let until = self
             .kv_get(KV_LOCK_GRANT_HORIZON)
             .ok()
             .flatten()
-            .and_then(|v| v.parse::<i64>().ok())?;
-        (until > now_ms).then(|| {
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(Ms)?;
+        (until > now.wall).then(|| {
+            let until = now.wait_of_wall(until);
             self.locks.set_quarantine(until);
             until
         })
@@ -627,7 +638,7 @@ impl crate::store::Meta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use constellation_types::clock::HonourMs;
+    use constellation_types::clock::{HonourMs, Now, WaitMs};
 
     #[test]
     fn a_create_recalls_its_parent_directory() {
@@ -652,37 +663,37 @@ mod tests {
     #[test]
     fn touching_filters_by_ino_node_and_time() {
         let t = ReadDelegations::default();
-        let a = t.grant(2, 10, 1_000);
-        let _b = t.grant(3, 11, 1_000);
-        let c = t.grant(4, 10, 500);
-        let need = t.touching(&[10], Some(9), 400);
+        let a = t.grant(2, 10, WaitMs(1_000));
+        let _b = t.grant(3, 11, WaitMs(1_000));
+        let c = t.grant(4, 10, WaitMs(500));
+        let need = t.touching(&[10], Some(9), WaitMs(400));
         let ids: Vec<u64> = need.grants.iter().map(|g| g.id).collect();
         assert_eq!(ids, vec![a, c]);
         // The writer's own grant is not recalled.
-        let need = t.touching(&[10], Some(2), 400);
+        let need = t.touching(&[10], Some(2), WaitMs(400));
         assert_eq!(
             need.grants.iter().map(|g| g.id).collect::<Vec<_>>(),
             vec![c]
         );
         // Expired grants are gone.
-        let need = t.touching(&[10], None, 600);
+        let need = t.touching(&[10], None, WaitMs(600));
         assert_eq!(
             need.grants.iter().map(|g| g.id).collect::<Vec<_>>(),
             vec![a]
         );
         assert_eq!(t.live_grants(), 2);
         t.forget(a);
-        assert!(t.touching(&[10], None, 600).is_empty());
+        assert!(t.touching(&[10], None, WaitMs(600)).is_empty());
     }
 
     #[test]
     fn quarantine_blocks_every_ack_until_it_passes() {
         let t = ReadDelegations::default();
-        t.set_quarantine(2_000);
-        let need = t.touching(&[1], None, 1_000);
+        t.set_quarantine(WaitMs(2_000));
+        let need = t.touching(&[1], None, WaitMs(1_000));
         assert!(need.grants.is_empty());
-        assert_eq!(need.quarantine_until, Some(2_000));
-        assert!(t.touching(&[1], None, 2_000).is_empty());
+        assert_eq!(need.quarantine_until, Some(WaitMs(2_000)));
+        assert!(t.touching(&[1], None, WaitMs(2_000)).is_empty());
     }
 
     fn held(until: i64) -> HeldDelegation {
@@ -754,12 +765,15 @@ mod tests {
     #[test]
     fn the_grant_horizon_persists_and_quarantines() {
         let meta = crate::store::Meta::open_in_memory().unwrap();
-        assert_eq!(meta.load_grant_quarantine(0), None);
+        assert_eq!(meta.load_grant_quarantine(Now::same(0)), None);
         meta.note_grant_horizon(5_000).unwrap();
         meta.note_grant_horizon(5_500).unwrap();
-        assert_eq!(meta.load_grant_quarantine(1_000), Some(6_000));
-        assert_eq!(meta.read_delegations().quarantine_until(), 6_000);
-        assert_eq!(meta.load_grant_quarantine(7_000), None);
+        assert_eq!(
+            meta.load_grant_quarantine(Now::same(1_000)),
+            Some(WaitMs(6_000))
+        );
+        assert_eq!(meta.read_delegations().quarantine_until(), WaitMs(6_000));
+        assert_eq!(meta.load_grant_quarantine(Now::same(7_000)), None);
     }
 
     /// Lock grants keep a horizon of their own: it quarantines new lock
@@ -767,15 +781,18 @@ mod tests {
     #[test]
     fn the_lock_grant_horizon_is_kept_apart() {
         let meta = crate::store::Meta::open_in_memory().unwrap();
-        assert_eq!(meta.load_lock_quarantine(0), None);
+        assert_eq!(meta.load_lock_quarantine(Now::same(0)), None);
         // The horizon now durable: the write's (rounded up), then the
         // stored one for a lower ask.
         assert_eq!(meta.note_lock_grant_horizon(21_000).unwrap(), 22_000);
         assert_eq!(meta.note_lock_grant_horizon(21_500).unwrap(), 22_000);
-        assert_eq!(meta.load_grant_quarantine(1_000), None);
-        assert_eq!(meta.read_delegations().quarantine_until(), 0);
-        assert_eq!(meta.load_lock_quarantine(1_000), Some(22_000));
-        assert_eq!(meta.locks().quarantine_until(), 22_000);
-        assert_eq!(meta.load_lock_quarantine(23_000), None);
+        assert_eq!(meta.load_grant_quarantine(Now::same(1_000)), None);
+        assert_eq!(meta.read_delegations().quarantine_until(), WaitMs(0));
+        assert_eq!(
+            meta.load_lock_quarantine(Now::same(1_000)),
+            Some(WaitMs(22_000))
+        );
+        assert_eq!(meta.locks().quarantine_until(), WaitMs(22_000));
+        assert_eq!(meta.load_lock_quarantine(Now::same(23_000)), None);
     }
 }

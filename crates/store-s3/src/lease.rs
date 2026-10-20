@@ -86,8 +86,7 @@ pub struct Lease {
     /// honour clock (`ProtocolClock`), `holder_clock` naming that clock; 0:
     /// none (never written by the holder, or fenced). Meaningful only to
     /// the holder itself (a body it wrote in this process: it honours the
-    /// lease until this) and against its own heartbeats (`beat_cap`);
-    /// everyone else reads `expires_unix_ms`.
+    /// lease until this); everyone else reads `expires_unix_ms`.
     #[serde(default)]
     pub holder_expires_ms: i64,
     /// `ProtocolClock::id` of the clock `holder_expires_ms` is on (0: none).
@@ -95,6 +94,17 @@ pub struct Lease {
     /// of another node) is not honoured until the holder's next own CAS.
     #[serde(default)]
     pub holder_clock: u64,
+    /// Plan 43 C7-H1 (R7): the same end on the holder's **wait** clock
+    /// (`wait_send + ttl`), on the clock `holder_clock` names; 0: none.
+    /// Its heartbeats' stamps are on that clock too, and a successor that
+    /// seals the holder reads the time left on the lease as
+    /// `holder_wait_ms - sent` (`Core::beat_cap`): a difference on a clock
+    /// that never counts a wall step, so a forward step of the holder
+    /// between its last renewal and the seal cannot make the cap early
+    /// (the honour end moves with such a step, which is right for what the
+    /// holder honours and wrong for what its grantees' clocks count).
+    #[serde(default)]
+    pub holder_wait_ms: i64,
     /// Set by a clean unmount: the partition is immediately claimable,
     /// no TTL to wait out.
     pub released: bool,
@@ -176,6 +186,7 @@ impl Lease {
             // fields stay 0.
             holder_expires_ms: 0,
             holder_clock: 0,
+            holder_wait_ms: 0,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),
@@ -207,6 +218,7 @@ impl Lease {
             // The fence ends the old tenure: no honour end remains.
             holder_expires_ms: 0,
             holder_clock: 0,
+            holder_wait_ms: 0,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),

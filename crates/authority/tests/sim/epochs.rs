@@ -397,7 +397,7 @@ fn try_form(cluster: &Cluster, cut: &[NodeId]) -> Formation {
         if open.contains(&n.id) {
             continue;
         }
-        if n.meta.promise_join_begin(n.clock.wall().0).unwrap_or(false) {
+        if n.meta.promise_join_begin(n.clock.now()).unwrap_or(false) {
             gated.push(n.clone());
         } else {
             for g in &gated {
@@ -473,7 +473,7 @@ pub async fn sample_authority(cluster: Arc<Cluster>) {
             if v.epoch_held {
                 holds.push(id);
             }
-            if let Some((epoch, honour_end)) = v.s3_held {
+            if let Some((epoch, honour_end, _)) = v.s3_held {
                 let margin = (cluster.env.config)(id, 1).expiry_margin_ms as i64;
                 // `LeaseView::usable`: the honour end against the node's
                 // honour clock (plan 43 C7-H1; the one checker that reads a

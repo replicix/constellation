@@ -33,7 +33,7 @@ use super::client::Phase;
 use super::{Core, S3For, Timer};
 use crate::action::{Action, S3Op};
 use crate::event::{CasFailure, S3Result};
-use crate::ids::{Epoch, Ms, NodeId, Now, OpId, TimerId};
+use crate::ids::{Epoch, Ms, NodeId, Now, OpId, TimerId, WaitMs};
 use crate::replica::Replica;
 use constellation_meta::{InboxAck, MetaError, MutateOp, Rid};
 use constellation_store_s3::inbox::{
@@ -142,7 +142,7 @@ pub(crate) struct InboxState {
     pub(crate) recall_waiters: BTreeMap<NodeId, Ms>,
     // ---- reachability (round 3a) ----
     /// Per holder, when its P2P path first failed since it last answered.
-    down_since: BTreeMap<NodeId, Ms>,
+    down_since: BTreeMap<NodeId, WaitMs>,
 }
 
 /// What `status` shows of the inbox.
@@ -279,7 +279,7 @@ impl Core {
             self.inbox.down_since.remove(&holder);
             return true;
         }
-        now.wall.since(since) < self.cfg.inbox_p2p_grace_ms as i64
+        now.wait.since(since) < self.cfg.inbox_p2p_grace_ms as i64
     }
 
     /// EC2 finding 2: a mutation of `node`'s executed here, over P2P
@@ -375,7 +375,7 @@ impl Core {
         if heard {
             self.inbox.down_since.remove(&holder);
         } else {
-            self.inbox.down_since.entry(holder).or_insert(now.wall);
+            self.inbox.down_since.entry(holder).or_insert(now.wait);
         }
     }
 

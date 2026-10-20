@@ -8,7 +8,7 @@
 //! simulation's paused clock governs expiry end to end.
 
 use super::Config;
-use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now};
+use crate::ids::{Epoch, HonourMs, Ms, NodeId, Now, WaitMs};
 use constellation_store_s3::lease::LEASE_VERSION;
 use constellation_store_s3::{AckPolicy, Lease, LeaseTag};
 
@@ -175,6 +175,17 @@ impl LeaseState {
     pub fn honour_until(&self, cfg: &Config) -> Option<HonourMs> {
         let (lease, _) = self.held.as_ref()?;
         honour_end_of(lease, cfg)
+    }
+
+    /// Plan 43 C7-H1 (R7): the end of this node's own lease on its **wait**
+    /// clock, from the body it holds (`Lease::holder_wait_ms`; the same
+    /// conditions as [`Self::honour_until`]): what its heartbeats name, so
+    /// that a successor that seals it places the lease's end by a
+    /// difference on a clock no wall step moves. Never used to judge what
+    /// this holder honours (that is the honour end).
+    pub fn wait_until(&self, cfg: &Config) -> Option<WaitMs> {
+        let (lease, _) = self.held.as_ref()?;
+        wait_end_of(lease, cfg)
     }
 
     /// What is left of the held lease on the honour clock (`None`: no
@@ -441,6 +452,7 @@ impl LeaseState {
             expires_unix_ms: now.wall.plus(cfg.ttl_ms).0,
             holder_expires_ms: now.honour.plus(cfg.ttl_ms).0,
             holder_clock: cfg.clock_id,
+            holder_wait_ms: now.wait.plus(cfg.ttl_ms).0,
             released: false,
             wanted_by: Vec::new(),
             backups: Vec::new(),
@@ -489,6 +501,7 @@ impl LeaseState {
             expires_unix_ms: now.wall.plus(cfg.ttl_ms).0,
             holder_expires_ms: now.honour.plus(cfg.ttl_ms).0,
             holder_clock: cfg.clock_id,
+            holder_wait_ms: now.wait.plus(cfg.ttl_ms).0,
             released: false,
             ..mine.clone()
         }
@@ -597,6 +610,13 @@ pub(crate) fn honour_end_of(lease: &Lease, cfg: &Config) -> Option<HonourMs> {
         && lease.holder_clock == cfg.clock_id
         && lease.holder_expires_ms != 0)
         .then_some(HonourMs(lease.holder_expires_ms))
+}
+
+/// Plan 43 C7-H1 (R7): `lease`'s end on this node's wait clock when this
+/// process wrote it (see [`LeaseState::wait_until`]).
+pub(crate) fn wait_end_of(lease: &Lease, cfg: &Config) -> Option<WaitMs> {
+    (lease.holder == cfg.node_id && lease.holder_clock == cfg.clock_id && lease.holder_wait_ms != 0)
+        .then_some(WaitMs(lease.holder_wait_ms))
 }
 
 /// Plan 30 §M9: how long past a `Backup` lease's expiry a node that is not

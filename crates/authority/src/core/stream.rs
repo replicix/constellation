@@ -80,7 +80,7 @@
 use super::{Core, Timer};
 use crate::action::Action;
 use crate::event::PeerMsg;
-use crate::ids::{Epoch, Ms, NodeId, Now, OpId, Seq, TimerId};
+use crate::ids::{Epoch, Ms, NodeId, Now, OpId, Seq, TimerId, WaitMs};
 use crate::replica::Replica;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -104,8 +104,10 @@ struct Subscription {
     head: Seq,
     /// At least one frame arrived.
     live: bool,
-    since: Ms,
-    last_frame: Ms,
+    /// This subscription's stamps are on the wait clock (plan 43 C7-H1): the
+    /// `ack=s3` holder watch compares `last_frame` with the beats' arrivals.
+    since: WaitMs,
+    last_frame: WaitMs,
     /// Segments ahead of the cursor, waiting for it.
     buf: BTreeMap<Seq, Vec<u8>>,
     buf_bytes: usize,
@@ -223,7 +225,7 @@ impl Core {
 
     /// Plan 30 §M9: when the last frame (a heartbeat included) arrived
     /// on this node's subscription to `holder`, if it has one.
-    pub(crate) fn stream_last_frame_from(&self, holder: NodeId) -> Option<Ms> {
+    pub(crate) fn stream_last_frame_from(&self, holder: NodeId) -> Option<WaitMs> {
         self.stream
             .sub
             .as_ref()
@@ -467,8 +469,8 @@ impl Core {
             next_n: 0,
             head: 0,
             live: false,
-            since: now.wall,
-            last_frame: now.wall,
+            since: now.wait,
+            last_frame: now.wait,
             buf: BTreeMap::new(),
             buf_bytes: 0,
         });
@@ -574,7 +576,7 @@ impl Core {
             return;
         }
         sub.next_n += 1;
-        sub.last_frame = now.wall;
+        sub.last_frame = now.wait;
         sub.live = true;
         self.stream.dropped_caught_up = false;
         sub.head = sub.head.max(head);
@@ -661,7 +663,7 @@ impl Core {
             return;
         };
         let silent = now
-            .wall
+            .wait
             .since(if sub.live { sub.last_frame } else { sub.since });
         if silent >= self.cfg.stream_timeout_ms as i64 {
             self.stats.stream_timeouts += 1;
@@ -757,7 +759,7 @@ impl Core {
             s.live
                 && s.buf.is_empty()
                 && self.ship.next_seq > s.head
-                && now.wall.since(s.last_frame) < self.cfg.stream_timeout_ms as i64
+                && now.wait.since(s.last_frame) < self.cfg.stream_timeout_ms as i64
         })
     }
 

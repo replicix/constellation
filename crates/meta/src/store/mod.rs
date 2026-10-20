@@ -638,6 +638,14 @@ pub struct Meta {
     pub(crate) session: crate::session::SessionState,
     /// Plan 30 §M8: read delegations, both sides (`crate::readdeleg`).
     pub(crate) read_delegations: crate::readdeleg::ReadDelegations,
+    /// Plan 43 C7-H1 (R9): the last promise this process issued, as the
+    /// persisted wall value and its end on this node's wait clock
+    /// (`Meta::promise_issue`), for the join gate
+    /// ([`Meta::promise_join_begin`]): a promiser waits its promise out on a
+    /// clock a wall step cannot move. Empty after a restart: the gate then
+    /// reads the persisted value on the wall clock (Appendix B row 14).
+    pub(crate) promise_issued_wait:
+        std::sync::Mutex<Option<(i64, constellation_types::clock::WaitMs)>>,
     /// Plan 30 §M14: lock grants (sequencer side), grants held and local
     /// locks (node side) (`crate::locks`).
     pub(crate) locks: crate::locks::LockTables,
@@ -852,6 +860,7 @@ impl Meta {
             blame_cache: Default::default(),
             session: crate::session::SessionState::default(),
             read_delegations: crate::readdeleg::ReadDelegations::default(),
+            promise_issued_wait: std::sync::Mutex::new(None),
             locks: crate::locks::LockTables::default(),
             foreign_apply_hook: std::sync::OnceLock::new(),
             snapshot_gen: AtomicU64::new(0),

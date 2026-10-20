@@ -431,6 +431,9 @@ fn replay_seed() {
         Ok("locks-locker-step-back") => locks_locker_step_back_config(),
         Ok("locks-holder-step-back-sealed") => locks_holder_step_back_sealed_config(),
         Ok("fast-takeover-holder-step-forward") => fast_takeover_holder_step_forward_config(),
+        Ok("strict-isolated-reader-holder-step-forward") => {
+            strict_isolated_reader_holder_step_forward_config()
+        }
         Ok("fast-takeover-successor-step-forward") => fast_takeover_successor_step_forward_config(),
         Ok("delegated-root-step-forward") => delegated_root_step_forward_config(),
         Ok("delegated-delegate-step-back") => delegated_delegate_step_back_config(),
@@ -1789,6 +1792,37 @@ fn fast_takeover_holder_step_forward_config() -> SimConfig {
             .collect(),
         holder_beats: sim::run::HolderBeats::Thread,
         ..locks_long_grants_seal_config()
+    }
+}
+
+/// Plan 43 C7-H1 (R7), the beat cap across a forward step of the holder, on
+/// the strict side (`strict-isolated-reader-beats`): the holder is cut from
+/// S3 only (it keeps beating until its lease ends) instead of crashing, and
+/// its wall clock steps forward 4 s just after the cut, so no renewal after
+/// the step can land and the lease body keeps the pre-step end. Its honour
+/// clock follows the step: the stamps of its beats after the step jump by 4
+/// s while the lease end they are compared with does not, and the cap a
+/// successor counts from them (`X - sent`) is 4 s early for the read
+/// delegations granted before the step. Its backup seals when the holder
+/// stops beating (the honour end comes 4 s early), the floor is capped out
+/// before its own marker lands, and the successor acknowledges a write
+/// inside a window the isolated reader still honours: close-to-open. The
+/// beats and the lease's end on the holder's wait clock (which no step
+/// moves) close it.
+fn strict_isolated_reader_holder_step_forward_config() -> SimConfig {
+    let mut faults: Vec<ScheduledFault> = strict_isolated_reader_beats_config()
+        .faults
+        .into_iter()
+        .filter(|f| !matches!(f.kind, FaultKind::CrashHolder { .. }))
+        .collect();
+    faults.push(ScheduledFault {
+        at_ms: 1_500,
+        kind: FaultKind::CutS3Holder { for_ms: 9_000 },
+    });
+    faults.push(step_fault(1_550, sim::run::StepOf::Holder, 4_000));
+    SimConfig {
+        faults,
+        ..strict_isolated_reader_beats_config()
     }
 }
 
@@ -3654,6 +3688,9 @@ fn sweep_config() {
         "locks-locker-step-back" => locks_locker_step_back_config(),
         "locks-holder-step-back-sealed" => locks_holder_step_back_sealed_config(),
         "fast-takeover-holder-step-forward" => fast_takeover_holder_step_forward_config(),
+        "strict-isolated-reader-holder-step-forward" => {
+            strict_isolated_reader_holder_step_forward_config()
+        }
         "fast-takeover-successor-step-forward" => fast_takeover_successor_step_forward_config(),
         "delegated-root-step-forward" => delegated_root_step_forward_config(),
         "delegated-delegate-step-back" => delegated_delegate_step_back_config(),
@@ -7064,6 +7101,53 @@ fn a_reader_stepped_back_stops_serving_its_read_delegation_on_time() {
     }
 }
 
+/// Plan 43 C7-H1 (3/4): the lock owner, stepped forward 2.5 s twice, keeps
+/// its grant records on its wait clock and outwaits a grant only when the
+/// holder's window has ended. `locks-root-step-forward`: 1 821 of 2 000
+/// seeds failed before (the first at 0, 1 and 2).
+#[test]
+fn a_lock_owner_stepped_forward_does_not_outwait_a_grant_early() {
+    for seed in 0..12u64 {
+        run_seed(seed, locks_root_step_forward_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7-H1 (3/4): a successor stepped forward inside its takeover
+/// floor keeps the floor on its wait clock. `fast-takeover-successor-step-
+/// forward`: 21 of 2 000 seeds failed before (the first at 0, 39 and 231).
+#[test]
+fn a_successor_stepped_forward_keeps_its_takeover_floor() {
+    for seed in [0u64, 1, 2, 38, 39, 40, 230, 231, 232] {
+        run_seed(seed, fast_takeover_successor_step_forward_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7-H1 (3/4): a root stepped forward 3 s outwaits a delegation on
+/// its wait clock. `delegated-root-step-forward`: 4 of 2 000 seeds failed
+/// before (the first at 401, 954 and 1230).
+#[test]
+fn a_root_stepped_forward_does_not_outwait_a_delegation_early() {
+    for seed in [400u64, 401, 402, 953, 954, 955, 1229, 1230, 1231] {
+        run_seed(seed, delegated_root_step_forward_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
+/// Plan 43 C7-H1 (3/4, R7): the beat cap across a forward step of a holder
+/// cut from S3 only (it keeps beating) is counted from beats and a lease end
+/// on the holder's wait clock, so it is not early by the step for the read
+/// delegations granted before it. `strict-isolated-reader-holder-step-
+/// forward`: 3 of 2 000 seeds failed before (605, 710, 1319: close-to-open).
+#[test]
+fn a_cut_holder_stepped_forward_does_not_cap_its_successors_floor_early() {
+    for seed in [604u64, 605, 606, 709, 710, 711, 1318, 1319, 1320] {
+        run_seed(seed, strict_isolated_reader_holder_step_forward_config())
+            .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+    }
+}
+
 /// Plan 43 C7-F F-a (review F3): the strict side of the floor. A reader
 /// cut from the holder and its backup serves from its read delegation
 /// while the backup, having sealed the crashed holder, takes over: with the
@@ -8311,6 +8395,27 @@ fn long_locks() {
         "locks-s3-cut-holder-alive",
         locks_s3_cut_holder_alive_config(),
         213_000..213_000 + n,
+    );
+    // Plan 43 C7-H1 (3/4): wall steps on the wait side.
+    run_m14(
+        "locks-root-step-forward",
+        locks_root_step_forward_config(),
+        214_000..214_000 + n,
+    );
+    run_m14(
+        "fast-takeover-holder-step-forward",
+        fast_takeover_holder_step_forward_config(),
+        215_000..215_000 + n,
+    );
+    run_m14(
+        "fast-takeover-successor-step-forward",
+        fast_takeover_successor_step_forward_config(),
+        216_000..216_000 + n,
+    );
+    run_m14(
+        "strict-isolated-reader-holder-step-forward",
+        strict_isolated_reader_holder_step_forward_config(),
+        217_000..217_000 + n,
     );
     run_m14("locks-faults", locks_faults_config(), 195_000..195_000 + n);
     run_m14("locks-pause", locks_pause_config(), 197_000..197_000 + n);

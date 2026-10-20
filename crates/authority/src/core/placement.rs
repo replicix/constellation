@@ -382,7 +382,7 @@ impl Core {
             }
             let since = *g.below_since.get_or_insert(now.wall);
             let dwell = self.cfg.placement_dwell_ms as i64;
-            if now.wall.since(since) >= dwell && now.wall.since(g.granted) >= dwell {
+            if now.wall.since(since) >= dwell && now.wait.since(g.granted) >= dwell {
                 self.pl
                     .cooldown
                     .insert(dir, now.wall.plus(self.cfg.placement_cooldown_ms));

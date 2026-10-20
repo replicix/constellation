@@ -23,9 +23,8 @@
 //! (the next round ships it) rather than being stranded behind it.
 
 use constellation_authority::core::LeaseState;
-use constellation_authority::{Config, HonourMs, Ms, Now};
+use constellation_authority::{Config, HonourMs, Ms, Now, WaitMs};
 use constellation_platform::clock::protocol;
-use constellation_store_s3::lease::now_unix_ms;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -101,10 +100,11 @@ pub struct LeaseView {
     fast_tenure: AtomicBool,
     last_s3_fresh_honour: AtomicI64,
     fresh_window_ms: AtomicI64,
-    /// Plan 43 C7-H2: where the takeover floor ends (unix ms; 0: none) and
+    /// Plan 43 C7-H2: where the takeover floor ends (this node's wait clock;
+    /// 0: none) and
     /// whether a fast takeover's gate is pending: releasing the lease now
     /// would hand it on without them (`release_hold`).
-    floor_until_ms: AtomicI64,
+    floor_until_wait: AtomicI64,
     fast_gate: AtomicBool,
 }
 
@@ -224,8 +224,12 @@ impl LeaseView {
     }
 
     /// Plan 43 C7-H2: the driver mirrors what holds a release back.
-    pub fn set_release_hold(&self, floor_until_ms: i64, fast_gate: bool) {
-        self.floor_until_ms.store(floor_until_ms, Ordering::Relaxed);
+    ///
+    /// `floor_until`: the takeover floor's end on this node's wait clock
+    /// (plan 43 C7-H1: a forward wall step must not release early).
+    pub fn set_release_hold(&self, floor_until: WaitMs, fast_gate: bool) {
+        self.floor_until_wait
+            .store(floor_until.0, Ordering::Relaxed);
         self.fast_gate.store(fast_gate, Ordering::Relaxed);
     }
 
@@ -235,7 +239,7 @@ impl LeaseView {
         if self.fast_gate.load(Ordering::Relaxed) {
             return Some(ReleaseHold::Gate);
         }
-        let left = self.floor_until_ms.load(Ordering::Relaxed) - now_unix_ms();
+        let left = self.floor_until_wait.load(Ordering::Relaxed) - crate::locks::now().wait.0;
         (left > 0).then(|| ReleaseHold::Floor(std::time::Duration::from_millis(left as u64)))
     }
 
@@ -360,6 +364,7 @@ impl LeaseView {
 mod tests {
     use super::*;
     use constellation_authority::Now;
+    use constellation_store_s3::lease::now_unix_ms;
     use constellation_store_s3::{Lease, LeaseMode, LeaseStore};
 
     fn tag() -> constellation_store_s3::LeaseTag {
@@ -437,19 +442,46 @@ mod tests {
         use std::time::Duration;
         let view = LeaseView::default();
         assert_eq!(view.release_hold(), None);
-        view.set_release_hold(now_unix_ms() - 1, false);
+        let wait = |d: i64| WaitMs(crate::locks::now().wait.0 + d);
+        view.set_release_hold(wait(-1), false);
         assert_eq!(view.release_hold(), None, "a floor in the past holds");
-        view.set_release_hold(now_unix_ms() + 5_000, false);
+        view.set_release_hold(wait(5_000), false);
         match view.release_hold() {
             Some(ReleaseHold::Floor(left)) => {
                 assert!(left > Duration::from_millis(4_000) && left <= Duration::from_secs(5))
             }
             other => panic!("{other:?}"),
         }
-        view.set_release_hold(now_unix_ms() + 5_000, true);
+        view.set_release_hold(wait(5_000), true);
         assert_eq!(view.release_hold(), Some(ReleaseHold::Gate));
-        view.set_release_hold(0, false);
+        view.set_release_hold(WaitMs(0), false);
         assert_eq!(view.release_hold(), None);
+    }
+
+    /// Plan 43 C7-H1: the floor's remainder is on the wait clock, which a
+    /// forward wall step does not move: the handover that waits for the floor
+    /// is not released early by one. Fails on the parent (a wall deadline
+    /// read against the stepped wall clock: the remainder drops by the step).
+    #[test]
+    fn release_hold_is_not_shortened_by_a_forward_step() {
+        use std::time::Duration;
+        let view = LeaseView::default();
+        let wait = crate::locks::now().wait;
+        view.set_release_hold(WaitMs(wait.0 + 5_000), false);
+        crate::locks::advance_test_clock(1_000);
+        crate::locks::step_test_wall(4_500);
+        match view.release_hold() {
+            Some(ReleaseHold::Floor(left)) => assert!(
+                left > Duration::from_millis(3_900) && left <= Duration::from_millis(4_000),
+                "the floor's remainder moved with the wall step: {left:?}"
+            ),
+            other => panic!("the floor ended with the wall step: {other:?}"),
+        }
+        crate::locks::step_test_wall(-30_000);
+        match view.release_hold() {
+            Some(ReleaseHold::Floor(left)) => assert!(left <= Duration::from_millis(4_000)),
+            other => panic!("a backward step ended or lengthened the floor: {other:?}"),
+        }
     }
 
     /// The mirror follows the core's state: held opens the fast path;

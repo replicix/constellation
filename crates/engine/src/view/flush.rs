@@ -1247,7 +1247,7 @@ impl View {
                 self.recall_after_local_inos(
                     h,
                     vec![ino],
-                    constellation_authority::Ms(constellation_store_s3::lease::now_unix_ms()),
+                    constellation_platform::clock::protocol().wait(),
                 );
             }
         } else if let Err(errno) = self.commit_manifest_forwarded(

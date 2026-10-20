@@ -387,7 +387,10 @@ impl EpochManager {
         if own > 0 && self.claim.lock().unwrap().advertised_slack != Some(own) {
             return refuse("this node's slack is not advertised yet");
         }
-        match self.meta.promise_join_begin(now_ms()) {
+        match self
+            .meta
+            .promise_join_begin(constellation_platform::clock::protocol().now())
+        {
             Ok(true) => {}
             Ok(false) => return refuse("this node's own promise has not expired"),
             Err(_) => return refuse("join gate failed"),
@@ -577,7 +580,7 @@ impl EpochManager {
         }
         if !self
             .meta
-            .promise_join_begin(now_ms())
+            .promise_join_begin(constellation_platform::clock::protocol().now())
             .map_err(|e| anyhow::anyhow!("{e}"))?
         {
             tracing::debug!("not proposing an epoch: this node's promise has not expired");
@@ -919,7 +922,12 @@ mod tests {
         )));
         // f = 1 but this node's promise is still out.
         let (m, meta) = manager(1, 1);
-        assert!(meta.promise_issue(now_ms() + 60_000).unwrap());
+        assert!(meta
+            .promise_issue(
+                now_ms() + 60_000,
+                constellation_platform::clock::protocol().now()
+            )
+            .unwrap());
         assert!(!accepted(&m.handle_propose(
             "e".into(),
             vec![1, 2],
@@ -929,7 +937,12 @@ mod tests {
         )));
         // Expired: joins, and no promise can be issued while open.
         let (m, meta) = manager(1, 1);
-        assert!(meta.promise_issue(now_ms() - 1).unwrap());
+        assert!(meta
+            .promise_issue(
+                now_ms() - 1,
+                constellation_platform::clock::protocol().now()
+            )
+            .unwrap());
         assert!(accepted(&m.handle_propose(
             "e".into(),
             vec![1, 2],
@@ -938,7 +951,15 @@ mod tests {
             1
         )));
         assert!(m.is_open());
-        assert!(!meta.promise_issue(now_ms() + 60_000).unwrap(), "gated");
+        assert!(
+            !meta
+                .promise_issue(
+                    now_ms() + 60_000,
+                    constellation_platform::clock::protocol().now()
+                )
+                .unwrap(),
+            "gated"
+        );
         // Not advertised yet: refused.
         let (m, _) = manager(1, 1);
         m.set_claim_view(EpochClaimView::default());
@@ -992,7 +1013,11 @@ mod tests {
         m.set_roster(vec![1, 3]);
         assert!(!m.is_open(), "abandoned");
         assert!(
-            meta.promise_issue(now_ms() + 1_000).unwrap(),
+            meta.promise_issue(
+                now_ms() + 1_000,
+                constellation_platform::clock::protocol().now()
+            )
+            .unwrap(),
             "promises again"
         );
         // The carrier survives a restart of the coordinator.
@@ -1118,7 +1143,12 @@ mod tests {
         assert!(mgr.is_open() && !mgr.is_active(), "promised to the new one");
         assert_eq!(mgr.status().epoch_id.as_deref(), Some("1-2"));
         assert!(
-            !meta.promise_issue(now_ms() + 60_000).unwrap(),
+            !meta
+                .promise_issue(
+                    now_ms() + 60_000,
+                    constellation_platform::clock::protocol().now()
+                )
+                .unwrap(),
             "the join gate stayed held"
         );
         mgr.handle_activate(EpochActivation {
@@ -1192,7 +1222,12 @@ mod tests {
         assert!(mgr.members_open.lock().unwrap().is_empty());
         // The join gate is released: a promise is issued (one already
         // expired, so the next join is not held back by it).
-        assert!(meta.promise_issue(now_ms() - 1).unwrap());
+        assert!(meta
+            .promise_issue(
+                now_ms() - 1,
+                constellation_platform::clock::protocol().now()
+            )
+            .unwrap());
         // Closed: another proposer's epoch is taken like any node's.
         let ack = mgr.handle_propose_checked("3-3".into(), vec![1, 2, 3], vec![], 3, 0, false);
         assert!(accepted(&ack), "{ack:?}");

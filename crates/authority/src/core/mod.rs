@@ -72,7 +72,7 @@ use constellation_store_s3::inbox::InboxKey;
 use constellation_types::Code;
 use std::collections::{BTreeMap, VecDeque};
 
-pub use backup::{liveness_fresh, AckView, SealRecord};
+pub use backup::{beat_sent_ms, liveness_fresh, AckView, SealRecord};
 pub use client::ClientPhase;
 pub use delegate::{DelegKind, DelegRenewCert, DelegView, RecallPhase};
 
@@ -1290,16 +1290,6 @@ pub(crate) enum TimerAt {
 }
 
 impl TimerAt {
-    /// The deadline of a WALL timer (tests; every timer is WALL until the
-    /// later commits of plan 43 C7-H1).
-    #[cfg(test)]
-    pub(crate) fn wall(self) -> Ms {
-        match self {
-            TimerAt::Wall(ms) => ms,
-            other => panic!("not a wall timer: {other:?}"),
-        }
-    }
-
     /// Whether this timer fires after the WALL deadline `at`; `None` when
     /// it is on another clock: two deadlines of different clocks have no
     /// order, so a caller that gets `None` has moved its timer off the
@@ -1909,13 +1899,6 @@ impl Core {
     /// When a pending timer fires, on the clock it was set against.
     pub(crate) fn timer_at(&self, id: TimerId) -> Option<TimerAt> {
         self.timers.get(&id).map(|(_, at)| *at)
-    }
-
-    /// A pending WALL timer's deadline (tests; every timer is WALL until
-    /// plan 43 C7-H1's later commits convert the sites).
-    #[cfg(test)]
-    pub(crate) fn timer_wall(&self, id: TimerId) -> Option<Ms> {
-        self.timer_at(id).map(TimerAt::wall)
     }
 
     /// A pending timer's deadline as raw milliseconds, whichever clock it is

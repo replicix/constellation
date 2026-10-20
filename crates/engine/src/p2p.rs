@@ -531,7 +531,7 @@ impl constellation_net::PeerService for P2pBridge {
         }
         let (Ok(txs), Ok(leaving), Ok(leaving_barriers)) = (
             postcard::from_bytes::<Vec<constellation_meta::DelegateTx>>(&txs),
-            postcard::from_bytes::<Vec<constellation_meta::locks::Grant>>(&leaving),
+            postcard::from_bytes::<Vec<constellation_meta::locks::GrantWire>>(&leaving),
             postcard::from_bytes::<Vec<(u64, i64)>>(&leaving_barriers),
         ) else {
             tracing::warn!(
@@ -797,7 +797,9 @@ impl constellation_net::PeerService for P2pBridge {
             self.off_core.note_holder_heard(
                 holder,
                 epoch,
-                constellation_store_s3::lease::now_unix_ms(),
+                // Arrival on this node's wait clock (plan 43 C7-H1), the
+                // clock the core's seal watch counts silence on.
+                constellation_platform::clock::protocol().wait().0,
                 expires_unix_ms,
             );
             let (reply, receive) = tokio::sync::oneshot::channel();
@@ -866,7 +868,7 @@ impl constellation_net::PeerService for P2pBridge {
         listed: bool,
         beat: constellation_net::Beat,
     ) -> bool {
-        let now = constellation_store_s3::lease::now_unix_ms();
+        let now = constellation_platform::clock::protocol().wait().0;
         if crate::fault::p2p_denied(holder) {
             return false;
         }

@@ -373,7 +373,7 @@ impl Core {
         if until <= self.pr.issued {
             return true;
         }
-        match replica.issue_promise(until) {
+        match replica.issue_promise(until, now) {
             Ok(true) => {}
             Ok(false) => return false,
             Err(e) => {
@@ -800,7 +800,7 @@ impl Core {
             .locks()
             .grants_snapshot()
             .iter()
-            .map(|g| g.until_ms)
+            .map(|g| g.until)
             .max();
         let n = replica.locks().clear_grants();
         if let Some(until) = until {
